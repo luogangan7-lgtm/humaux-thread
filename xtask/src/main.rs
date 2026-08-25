@@ -5,12 +5,17 @@
 //! · config-check(G80-41) · rls-check(§48.2)。判据正文以家章为唯一真源。
 
 mod architecture_check;
+mod benchset_declaration;
 mod config_check;
 mod contract_impact;
+mod direction_table;
+mod dod_check;
+mod gate_registry;
 mod mechanism_registry;
 mod metrics_registry;
 mod migration_rehearsal;
 mod rls_check;
+mod threshold_shape;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -22,9 +27,14 @@ fn main() {
         Some("contract-impact") => contract_impact::run(&args[2..]),
         Some("config-check") => config_check::run(&args[2..]),
         Some("rls-check") => rls_check::run(&args[2..]),
+        Some("threshold-shape") => threshold_shape::run(&args[2..]),
+        Some("benchset-declaration") => benchset_declaration::run(&args[2..]),
+        Some("gate-registry") => gate_registry::run(&args[2..]),
+        Some("dod-check") => dod_check::run(&args[2..]),
+        Some("direction-table") => direction_table::run(&args[2..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check>"
+                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|direction-table>"
             );
             2
         }

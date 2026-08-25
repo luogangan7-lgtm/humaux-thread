@@ -1,0 +1,11 @@
+[package]
+name = "humaux-fail-closed-macro"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true

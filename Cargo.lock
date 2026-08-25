@@ -199,6 +199,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "humaux-fail-closed-macro"
+version = "0.1.0"
+
+[[package]]
 name = "humaux-gateway"
 version = "0.1.0"
 
