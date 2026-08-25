@@ -13,3 +13,8 @@ workspace = true
 # reservation invariants, scope normalization, cache keys, ID generation,
 # completeness aggregation, public provenance closure.
 proptest = "1.11.0"
+# T0.4 §53.4 / G52-5 注错测试需要真实的 abstain() / DegradeCode / ErrorCode
+# —— testkit 本身仍不依赖 domain/telemetry（见 src/lib.rs 顶部说明），这两
+# 条只挂在 dev-dependencies，只有 tests/fault、tests/pair 用得到。
+humaux-domain = { version = "0.1.0", path = "../domain" }
+humaux-telemetry = { version = "0.1.0", path = "../telemetry" }

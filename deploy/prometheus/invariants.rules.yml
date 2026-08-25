@@ -1,0 +1,70 @@
+# §53.5 / §41.2 / §42 运行期不变量闸（INV-1..INV-4）。
+#
+# §42 冻结：四条表达式逐字复制自 §53.5 原文块，不做任何"读作"名字替换；
+# metric 名与 label key 逐字对 §41.2 注册表（§80.2 按 §41.2 逐名对账）。
+#
+# 部署前置（§42）：Prometheus >= 2.17。INV-1 / INV-2 分母侧用了
+# absent_over_time —— 低于该版本时本文件整份加载失败（不只是这两条，
+# 本文件全部规则一起不存在，看板上什么都不会说，与 INV-3 非法 matcher
+# 同类故障形状）。G80-18 的静态校验必须在 >= 2.17 的 promtool 上跑，
+# 并把 `promtool check rules` 的非零退出直接判红。
+groups:
+  - name: humaux-invariants
+    rules:
+      # INV-1（§53.5）：degrade_total 分子在涨，但
+      # humaux_retrieval_requests_total 分母是 0 或完全没有样本
+      # （absent_over_time，覆盖"整个 retrieval 进程被杀"这类连
+      # sum(rate())==0 都测不出来的停摆），⇒ CRITICAL。
+      # metric 名核对 §41.2：degrade_total（该行"消费方"含 INV-1/2/4），
+      # humaux_retrieval_requests_total（该行标注"§53.5 INV-1 分母"）。
+      - alert: INV-1
+        expr: |
+          sum(rate(degrade_total[5m])) > 0
+                   and (sum(rate(humaux_retrieval_requests_total[5m])) == 0
+                        or absent_over_time(humaux_retrieval_requests_total[5m]))
+        labels:
+          severity: critical
+        annotations:
+          summary: "INV-1 (§53.5): degrade_total 有分子但 retrieval 分母为零/缺席，链路只走弃权分支"
+
+      # INV-2（§53.5）：Egress.* 降级在涨，但 data_disclosures_finalized_total
+      # 分母是 0 或完全没有样本（absent_over_time 覆盖 §7.4 exporter 被停掉的情形）
+      # ⇒ CRITICAL。code=~"Egress.*" 依赖 label 值是 PascalCase 变体名逐字
+      # （§53.2 冻结；§41.2 冻结的 label 取值集）。
+      # metric 名核对 §41.2：data_disclosures_finalized_total（该行标注
+      # "§53.5 INV-2 分母"）。
+      - alert: INV-2
+        expr: |
+          sum(rate(degrade_total{code=~"Egress.*"}[5m])) > 0
+                   and (sum(rate(data_disclosures_finalized_total[5m])) == 0
+                        or absent_over_time(data_disclosures_finalized_total[5m]))
+        labels:
+          severity: critical
+        annotations:
+          summary: "INV-2 (§53.5): Egress 降级有分子但 data_disclosures_finalized_total 分母为零/缺席"
+
+      # INV-3（§53.5 / §7.4）：reserved 且超 60s 未 finalize 的记录存在
+      # ⇒ CRITICAL。age_bucket="gt_60s" 是合法 label matcher（§41.2 冻结
+      # 的取值集 le_10s | le_60s | gt_60s 之一），不是原文病灶写法
+      # `{age>60s}`（那种写法 rule 文件加载即报错）。
+      # metric 名核对 §41.2：data_disclosures_reserved_unfinalized（该行
+      # 标注"§53.5 INV-3"）。
+      - alert: INV-3
+        expr: data_disclosures_reserved_unfinalized{age_bucket="gt_60s"} > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "INV-3 (§53.5/§7.4): 存在 reserved 超 60s 未 finalize 的记录"
+
+      # INV-4（§53.5）：单个 degrade code 24h 占比 > 40%，⇒ WARN。
+      # 长期占 40% 以上的降级不是降级，是新常态，必须重新定义正常路径
+      # 而不是继续 warn（§53.5）。
+      # metric 名核对 §41.2：degrade_total。
+      - alert: INV-4
+        expr: |
+          sum by (code) (rate(degrade_total[24h]))
+                   / ignoring(code) group_left sum(rate(degrade_total[24h])) > 0.4
+        labels:
+          severity: warning
+        annotations:
+          summary: "INV-4 (§53.5): 单个 degrade code 24h 占比超 40%"
