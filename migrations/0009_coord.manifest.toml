@@ -1,0 +1,20 @@
+migration_id = "0009_coord"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('coord.tasks') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('coord.tasks') is not null
+  and to_regclass('coord.task_runs') is not null
+  and to_regclass('coord.leases') is not null
+  and to_regclass('coord.locks') is not null
+  and to_regclass('coord.canvases') is not null
+  and to_regclass('coord.canvas_elements') is not null
+  and to_regclass('coord.handoffs') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS coord.handoffs, coord.canvas_elements, coord.canvases, coord.locks, coord.leases, coord.task_runs, coord.tasks CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only skeleton DDL, zero rows at risk)"

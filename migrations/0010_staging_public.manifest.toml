@@ -1,0 +1,23 @@
+migration_id = "0010_staging_public"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('staging.contribution_releases') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('staging.contribution_releases') is not null
+  and to_regclass('staging.contribution_release_sources') is not null
+  and to_regclass('public.sources') is not null
+  and to_regclass('public.knowledge_gaps') is not null
+  and to_regclass('public.claims') is not null
+  and to_regclass('public.syntheses') is not null
+  and to_regclass('public.topics') is not null
+  and to_regclass('public.relations') is not null
+  and to_regclass('public.provenance_edges') is not null
+  and to_regclass('public.source_closure') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS public.source_closure, public.provenance_edges, public.relations, public.topics, public.syntheses, public.claims, public.knowledge_gaps, public.sources, staging.contribution_release_sources, staging.contribution_releases CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

@@ -1,0 +1,27 @@
+migration_id = "0011_roles_and_grants"
+class = "EXPAND_CONTRACT"
+
+# DB roles are cluster-global, not per-database (unlike every other object this repo's
+# migrations touch) — `pg_roles where rolname = 'role_gateway'` is false the moment ANY
+# other database on the same cluster has already run this migration, even though this
+# file's own CREATE ROLE blocks are already IF-NOT-EXISTS idempotent. Precheck instead on
+# a database-local, idempotency-relevant side effect of this specific file: whether
+# `control`'s schema ownership has already been reassigned to role_migration_owner.
+precheck = "select not exists (select 1 from pg_namespace n join pg_roles r on r.oid = n.nspowner where n.nspname = 'control' and r.rolname = 'role_migration_owner') as precheck_ok"
+
+postcheck = """
+select
+  (select count(*) from pg_roles where rolname in (
+     'role_gateway','role_private_worker','role_consolidation_worker','role_public_worker',
+     'role_retrieval_worker','role_batch_issuer','role_maintenance','role_migration_owner'
+   ) and rolcanlogin and not rolsuper) = 8
+  and (select count(*) from information_schema.role_table_grants
+       where table_schema='private' and table_name='ingest_tickets'
+         and privilege_type='INSERT' and grantee <> 'role_migration_owner') = 1
+  and to_regprocedure('projection.stream_log_guard_state_transition()') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TRIGGER IF EXISTS stream_log_guard_state_transition ON projection.stream_log; DROP FUNCTION IF EXISTS projection.stream_log_guard_state_transition(); REASSIGN OWNED BY role_migration_owner TO postgres; DROP OWNED BY role_gateway, role_private_worker, role_consolidation_worker, role_public_worker, role_retrieval_worker, role_batch_issuer, role_maintenance, role_migration_owner CASCADE; DROP ROLE IF EXISTS role_gateway, role_private_worker, role_consolidation_worker, role_public_worker, role_retrieval_worker, role_batch_issuer, role_maintenance, role_migration_owner;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; role/grant DDL is metadata-only, zero table rows at risk. A restore drill IS required before production cutover of this file specifically, because it reassigns ownership of every existing table — verify a snapshot taken just before this migration restores cleanly on a staging clone before this runs against a production cluster."

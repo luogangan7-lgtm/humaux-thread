@@ -1,0 +1,5 @@
+error[E0616]: field `0` of struct `RuntimeDbPool` is private
+  --> tests/ui/fail_raw_pool_field.rs:12:23
+   |
+12 |     let _inner = pool.0;
+   |                       ^ private field

@@ -1,0 +1,24 @@
+migration_id = "0004_private_evidence_memory"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('private.evidence_objects') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('private.evidence_objects') is not null
+  and to_regclass('private.events') is not null
+  and to_regclass('private.artifacts') is not null
+  and to_regclass('private.ingest_tickets') is not null
+  and to_regclass('private.memory_records') is not null
+  and to_regclass('private.memory_evidence') is not null
+  and to_regclass('private.evidence_edges') is not null
+  and (select count(*) from information_schema.columns
+       where table_schema='private' and table_name='memory_records'
+         and column_name in ('authority_class','confidence','status','asserted_at','superseded_by')) = 5
+  and to_regprocedure('ops.i4_authority_consistency_scan()') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TRIGGER IF EXISTS memory_records_requires_evidence ON private.memory_records; DROP FUNCTION IF EXISTS private.check_memory_has_evidence(); DROP FUNCTION IF EXISTS ops.i4_authority_consistency_scan(); DROP TABLE IF EXISTS private.evidence_edges, private.memory_evidence, private.memory_records, private.ingest_tickets, private.artifacts, private.events, private.evidence_objects CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

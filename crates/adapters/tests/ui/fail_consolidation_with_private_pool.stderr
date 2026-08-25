@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/fail_consolidation_with_private_pool.rs:13:17
+   |
+13 |     consolidate(&pool);
+   |     ----------- ^^^^^ expected `&ConsolidationDbPool`, found `&PrivateWorkerDbPool`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected reference `&ConsolidationDbPool`
+              found reference `&PrivateWorkerDbPool`
+note: function defined here
+  --> tests/ui/fail_consolidation_with_private_pool.rs:5:4
+   |
+ 5 | fn consolidate(_pool: &ConsolidationDbPool) {}
+   |    ^^^^^^^^^^^ ---------------------------

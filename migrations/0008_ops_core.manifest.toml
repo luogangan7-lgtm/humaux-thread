@@ -1,0 +1,26 @@
+migration_id = "0008_ops_core"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('ops.outbox') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('ops.outbox') is not null
+  and to_regclass('ops.jobs') is not null
+  and to_regclass('ops.scheduler_leases') is not null
+  and to_regclass('ops.model_call_ledger') is not null
+  and to_regclass('ops.stage_runs') is not null
+  and to_regclass('ops.data_disclosure_sources') is not null
+  and to_regclass('ops.selection_snapshots') is not null
+  and to_regclass('ops.selection_snapshot_items') is not null
+  and to_regclass('ops.restore_drills') is not null
+  and to_regclass('ops.consistency_reports') is not null
+  and to_regclass('ops.source_acquisition_jobs') is not null
+  and exists (select 1 from information_schema.columns
+       where table_schema='ops' and table_name='jobs' and column_name='status')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS ops.source_acquisition_jobs, ops.consistency_reports, ops.restore_drills, ops.selection_snapshot_items, ops.selection_snapshots, ops.data_disclosure_sources, ops.stage_runs, ops.model_call_ledger, ops.scheduler_leases, ops.jobs, ops.outbox CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

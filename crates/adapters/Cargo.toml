@@ -6,3 +6,25 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# §6.2.3 Typed DB Pool: sole encapsulation point is postgres.rs; runtime-tokio matches the
+# workspace's async runtime (tokio, dev-dependency below drives it in tests via
+# `tokio::runtime::Runtime::block_on`). No tls-* feature enabled — dev DB (§6.2.3 test
+# fixtures) is plaintext TCP; production per-role DSNs choose TLS at the config layer.
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio"] }
+
+[dev-dependencies]
+# T1.5 crates/adapters/tests/auth_scope_rls.rs: blocking client for the §62 RLS integration
+# test (same crate/version xtask already pins for its live-DB checks, no new dependency).
+postgres = { version = "0.19", features = ["with-uuid-1"] }
+# Reuses domain's real id newtypes (TenantId/UserId) rather than raw uuid::Uuid in the test.
+humaux-domain = { path = "../domain" }
+# §79.2 three-state DB fixture skip contract (DbIntegrationFixture/run_db_fixture).
+humaux-testkit = { path = "../testkit" }
+# G6-DB1 compile-pass/compile-fail fixtures (§6.2.3): four wrapper types must not be
+# cross-constructible / Deref'able / field-accessible outside pools.rs.
+trybuild = "1"
+# Drives the async `sqlx` pool-connect fixtures (§6.2.3 assertion E, G6-DB2) from plain
+# `#[test]` functions via `Runtime::block_on`, alongside the sync `postgres` fixtures above.
+tokio = { version = "1", features = ["rt-multi-thread"] }

@@ -505,20 +505,17 @@ mod tests {
         }
     }
 
-    /// 已知真实缺口：`memory_security_lifecycle` 行的「§55 名称」列写的是
-    /// 「private memory poisoning lifecycle set」，与 §55 清单原文「memory security lifecycle
-    /// set （Write -> Recall -> Action -> Repair）」不是同一个名字 —— 判据「逐名对齐」如实标红，
-    /// 不是本 checker 的误判。据实报告，spec 文件不在本任务分配范围内不作修改。
+    /// 基线钉（ADR-0001 后）：`memory_security_lifecycle` 行的名称失配已在 spec 侧修复
+    /// （「§55 名称」列改回 §55 清单原名），逐名对齐在真实 spec 上必须干净。此前这里钉的
+    /// 是修复前的红态——spec 一修，钉过期即翻绿断言（历史见 ADR-0001）。
     #[test]
-    fn baseline_real_spec_name_alignment_finds_pre_existing_mismatch() {
+    fn baseline_real_spec_name_alignment_is_clean_after_adr_0001() {
         let spec = real_spec_md();
         let table = parse_declaration_table(&spec);
         let ch55_names = parse_ch55_set_list(&spec);
         let table_names: Vec<String> = table.iter().map(|r| normalize_ws(&r[1])).collect();
         let result = check_name_alignment(&table_names, &ch55_names);
-        assert!(result.is_err(), "expected a known pre-existing mismatch");
-        let msg = result.unwrap_err().0;
-        assert!(msg.contains("private memory poisoning lifecycle set"));
+        assert!(result.is_ok(), "unexpected mismatch: {:?}", result.err());
     }
 
     #[test]

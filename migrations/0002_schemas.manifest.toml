@@ -1,0 +1,22 @@
+# §46.1 — 新建 6 个 schema（control/private/staging/projection/coord；ops 已在 0001；public 是
+# PostgreSQL 内建 schema，本迁移只是把它记进 comment，不新建）。纯 additive，无既有数据被替换。
+
+migration_id = "0002_schemas"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regnamespace('control') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regnamespace('control') is not null
+  and to_regnamespace('private') is not null
+  and to_regnamespace('staging') is not null
+  and to_regnamespace('projection') is not null
+  and to_regnamespace('coord') is not null
+  and to_regnamespace('ops') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP SCHEMA IF EXISTS control, private, staging, projection, coord CASCADE; (ops predates this migration, not dropped)"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (empty schemas, zero rows at risk)"

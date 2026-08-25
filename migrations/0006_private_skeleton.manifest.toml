@@ -1,0 +1,25 @@
+migration_id = "0006_private_skeleton"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('private.conversations') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('private.conversations') is not null
+  and to_regclass('private.messages') is not null
+  and to_regclass('private.artifact_parts') is not null
+  and to_regclass('private.context_bindings') is not null
+  and to_regclass('private.entities') is not null
+  and to_regclass('private.relations') is not null
+  and to_regclass('private.code_snapshots') is not null
+  and to_regclass('private.code_files') is not null
+  and to_regclass('private.code_symbols') is not null
+  and to_regclass('private.code_edges') is not null
+  and to_regclass('private.worktree_overlays') is not null
+  and to_regclass('private.contribution_exports') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS private.contribution_exports, private.worktree_overlays, private.code_edges, private.code_symbols, private.code_files, private.code_snapshots, private.relations, private.entities, private.context_bindings, private.artifact_parts, private.messages, private.conversations CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only skeleton DDL, zero rows at risk)"

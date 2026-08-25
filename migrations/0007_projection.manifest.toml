@@ -1,0 +1,24 @@
+migration_id = "0007_projection"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('projection.stream_log') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('projection.stream_log') is not null
+  and to_regclass('projection.stream_checkpoints') is not null
+  and to_regclass('projection.processing_gaps') is not null
+  and to_regclass('projection.retrieval_cards') is not null
+  and to_regclass('projection.tenant_placements') is not null
+  and to_regclass('projection.index_runs') is not null
+  and (select count(*) from information_schema.columns
+       where table_schema='projection' and table_name='stream_log') = 12
+  and not exists (select 1 from information_schema.columns
+       where table_schema='projection' and table_name='stream_checkpoints'
+         and column_name='open_gap_count')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS projection.index_runs, projection.tenant_placements, projection.retrieval_cards CASCADE; DROP VIEW IF EXISTS projection.processing_gaps; DROP TRIGGER IF EXISTS stream_checkpoints_touch_updated_at ON projection.stream_checkpoints; DROP FUNCTION IF EXISTS projection.stream_checkpoints_touch_updated_at(); DROP TABLE IF EXISTS projection.stream_checkpoints, projection.stream_log CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

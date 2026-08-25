@@ -1,0 +1,7 @@
+error[E0277]: the trait bound `RuntimeDbPool: From<BatchIssuerDbPool>` is not satisfied
+  --> tests/ui/fail_pool_cross_from.rs:12:41
+   |
+12 |     let _runtime: RuntimeDbPool = batch.into();
+   |                                         ^^^^ the trait `From<BatchIssuerDbPool>` is not implemented for `RuntimeDbPool`
+   |
+   = note: required for `BatchIssuerDbPool` to implement `Into<RuntimeDbPool>`

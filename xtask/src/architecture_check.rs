@@ -911,6 +911,30 @@ pub fn scan_env_var_violations(display_path: &str, source: &str) -> Vec<String> 
         .collect()
 }
 
+/// Byte offset of the file's trailing `#[cfg(test)]`-mod region, if the next
+/// non-empty line after the attribute begins a `mod` — see the caller's ponytail note.
+fn cfg_test_mod_offset(source: &str) -> Option<usize> {
+    let mut search_from = 0usize;
+    while let Some(rel) = source[search_from..].find("#[cfg(test)]") {
+        let at = search_from + rel;
+        let after = &source[at..];
+        let mut lines = after.lines();
+        lines.next(); // the attribute line itself
+        for line in lines {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ") {
+                return Some(at);
+            }
+            break;
+        }
+        search_from = at + "#[cfg(test)]".len();
+    }
+    None
+}
+
 fn env_var_scan(root: &Path) -> Verdict {
     // Whole workspace, not just crates/: bins/* and xtask are real exemptible bootstrap
     // territory (see below), but a violation planted in evals/ (outside both) must still be
@@ -927,10 +951,24 @@ fn env_var_scan(root: &Path) -> Verdict {
         if disp.contains("crates/contracts/")
             || disp.starts_with("bins/")
             || disp.starts_with("xtask/")
+            || disp.contains("/tests/")
         {
+            // `/tests/` integration dirs: reading HUMAUX_TEST_PG_DSN there is the
+            // sanctioned three-state DB-fixture pattern, not production config
+            // (§79.2 / repo CLAUDE.md 测试规范). Production reads stay covered.
             continue;
         }
-        violations.extend(scan_env_var_violations(&disp, source));
+        // Same sanction for a file's trailing `#[cfg(test)] mod` region: this repo's
+        // convention keeps unit tests at file end; env reads after that attr are test
+        // fixture, not runtime config.
+        // ponytail: prefix-scope heuristic (everything after the first `#[cfg(test)]`
+        // line followed by `mod` is exempt); upgrade to real span parsing if a
+        // production `#[cfg(test)]`-adjacent violation ever needs catching.
+        let scan_source = match cfg_test_mod_offset(source) {
+            Some(off) => &source[..off],
+            None => source.as_str(),
+        };
+        violations.extend(scan_env_var_violations(&disp, scan_source));
     }
     if violations.is_empty() {
         Verdict::Pass
@@ -1061,6 +1099,83 @@ fn report(name: &str, verdict: &Verdict) -> bool {
     }
 }
 
+// ============================================================================
+// §6.2.3 G80-40 static side — typed DB pool topology
+// ============================================================================
+
+/// G80-40 static side (§6.2.3): raw `sqlx::PgPool` may be *named* only inside the single
+/// encapsulation point `crates/adapters/src/postgres.rs`; the four wrapper types must each
+/// be declared exactly once there. The deliberate compile-fail fixtures under
+/// `crates/adapters/tests/ui/` are this scan's positive sentinel — they contain the raw
+/// type on purpose, so zero hits there means the scanner went blind (§53.3 规则3 同款).
+/// The runtime half of G80-40 (SELECT current_user + SQL 双向夹具) lives in
+/// `crates/adapters/tests/` and is judged by `cargo test`, not here.
+pub fn g6_db_pool_topology(root: &Path) -> Verdict {
+    let postgres_rs = root.join("crates/adapters/src/postgres.rs");
+    let Ok(pool_src) = fs::read_to_string(&postgres_rs) else {
+        return Verdict::NotApplicable(
+            "crates/adapters/src/postgres.rs (§6.2.3 唯一封装点尚未交付)".to_string(),
+        );
+    };
+
+    let mut problems = Vec::new();
+
+    // Four wrappers, each declared exactly once, all in the encapsulation point.
+    for wrapper in [
+        "RuntimeDbPool",
+        "BatchIssuerDbPool",
+        "ConsolidationDbPool",
+        "PrivateWorkerDbPool",
+    ] {
+        let decl = format!("pub struct {wrapper}");
+        let n = pool_src.matches(&decl).count();
+        if n != 1 {
+            problems.push(format!(
+                "§6.2.3 wrapper `{wrapper}` 声明数 {n} != 1（唯一封装点 postgres.rs）"
+            ));
+        }
+    }
+
+    // Raw `sqlx::PgPool` naming outside the encapsulation point.
+    let mut sentinel_hits = 0usize;
+    for file in walk_files(&root.join("crates"), &["rs"]) {
+        let disp = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let Ok(src) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let hits = src.matches("sqlx::PgPool").count();
+        if hits == 0 {
+            continue;
+        }
+        if disp.ends_with("crates/adapters/src/postgres.rs") {
+            continue; // the one legal home
+        }
+        if disp.contains("/tests/ui/") {
+            sentinel_hits += hits; // deliberate compile-fail fixtures: positive control
+            continue;
+        }
+        problems.push(format!(
+            "raw sqlx::PgPool named outside encapsulation point: {disp} ({hits} hit(s))"
+        ));
+    }
+    if sentinel_hits == 0 {
+        problems.push(
+            "positive sentinel dead: no sqlx::PgPool hits in crates/adapters/tests/ui/              compile-fail fixtures (§53.3 规则3 同款——扫描器失明)"
+            .to_string(),
+        );
+    }
+
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
 pub fn run(_args: &[String]) -> i32 {
     let root = workspace_root();
     let checks: Vec<(&str, Verdict)> = vec![
@@ -1100,6 +1215,10 @@ pub fn run(_args: &[String]) -> i32 {
         (
             "§48.0① G80-22 (payload_sha256 sole construction point)",
             g80_22_payload_sha256_unique(&root),
+        ),
+        (
+            "§6.2.3 G80-40 static (typed DB pool topology)",
+            g6_db_pool_topology(&root),
         ),
     ];
 
@@ -1581,13 +1700,13 @@ mod tests {
         ));
     }
 
+    /// T1.6 delivers `evidence::payload_sha256` / `EvidencePayloadSha256` (§48.0① G80-22): the
+    /// real-repo check flips from `NotApplicable` (Phase 6 undelivered) to `Pass` (exactly one
+    /// construction site, in `crates/domain/src/evidence.rs`).
     #[test]
-    fn g80_22_real_repo_is_not_applicable() {
+    fn g80_22_real_repo_passes() {
         let root = real_root();
-        assert!(matches!(
-            g80_22_payload_sha256_unique(&root),
-            Verdict::NotApplicable(_)
-        ));
+        assert_eq!(g80_22_payload_sha256_unique(&root), Verdict::Pass);
     }
 
     fn fresh_tmp(label: &str) -> PathBuf {
@@ -1855,5 +1974,66 @@ mod tests {
     fn find_authority_struct_literals_does_not_miscount_arrow_self_as_a_literal() {
         let src = "impl Authority {\n    pub fn new(x: i32) -> Self {\n        Authority { x }\n    }\n}\n";
         assert_eq!(find_authority_struct_literals(src).len(), 1);
+    }
+    /// G80-40 static: real repo must pass (four wrappers once each, no raw pool outside,
+    /// ui fixtures keep the sentinel alive).
+    #[test]
+    fn g80_40_real_repo_is_green() {
+        assert_eq!(g6_db_pool_topology(&real_root()), Verdict::Pass);
+    }
+
+    /// 注错 a：把 raw `sqlx::PgPool` 写进封装点之外的生产文件 ⇒ 红并点名文件。
+    #[test]
+    fn g80_40_fault_raw_pool_outside_encapsulation_is_red() {
+        let tmp = fresh_tmp("g80-40-raw-pool");
+        copy_adapters_fixture(&tmp);
+        fs::write(
+            tmp.join("crates/other/src/lib.rs"),
+            "pub struct Svc { pool: sqlx::PgPool }\n",
+        )
+        .unwrap();
+        match g6_db_pool_topology(&tmp) {
+            Verdict::Fail(lines) => {
+                assert!(lines.iter().any(|l| l.contains("crates/other/src/lib.rs")))
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// 注错 b：删掉 ui 夹具（哨兵） ⇒ 红——扫描器失明必须可观察。
+    #[test]
+    fn g80_40_fault_dead_sentinel_is_red() {
+        let tmp = fresh_tmp("g80-40-sentinel");
+        copy_adapters_fixture(&tmp);
+        fs::remove_file(tmp.join("crates/adapters/tests/ui/fail_raw_pool_field.rs")).unwrap();
+        match g6_db_pool_topology(&tmp) {
+            Verdict::Fail(lines) => assert!(lines.iter().any(|l| l.contains("sentinel"))),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// fixture: minimal adapters crate shape for the two injections above.
+    fn copy_adapters_fixture(tmp: &Path) {
+        for d in [
+            "crates/adapters/src",
+            "crates/adapters/tests/ui",
+            "crates/other/src",
+        ] {
+            fs::create_dir_all(tmp.join(d)).unwrap();
+        }
+        fs::write(
+            tmp.join("crates/adapters/src/postgres.rs"),
+            "pub struct RuntimeDbPool { inner: sqlx::PgPool }\n\
+             pub struct BatchIssuerDbPool { inner: sqlx::PgPool }\n\
+             pub struct ConsolidationDbPool { inner: sqlx::PgPool }\n\
+             pub struct PrivateWorkerDbPool { inner: sqlx::PgPool }\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("crates/adapters/tests/ui/fail_raw_pool_field.rs"),
+            "struct Bad { pool: sqlx::PgPool }\nfn main() {}\n",
+        )
+        .unwrap();
+        fs::write(tmp.join("crates/other/src/lib.rs"), "\n").unwrap();
     }
 }

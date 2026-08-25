@@ -1,0 +1,22 @@
+migration_id = "0005_private_pipeline"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('private.processing_runs') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('private.processing_runs') is not null
+  and to_regclass('private.observations') is not null
+  and to_regclass('private.memory_consolidation_runs') is not null
+  and to_regclass('private.memory_consolidation_inputs') is not null
+  and to_regclass('private.memory_rollups') is not null
+  and to_regclass('private.memory_rollup_sources') is not null
+  and (select is_nullable from information_schema.columns
+       where table_schema='private' and table_name='processing_runs'
+         and column_name='context_snapshot_seq') = 'NO'
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS private.memory_rollup_sources, private.memory_rollups, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.observations, private.processing_runs CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

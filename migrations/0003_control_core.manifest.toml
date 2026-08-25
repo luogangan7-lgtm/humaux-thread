@@ -1,0 +1,19 @@
+migration_id = "0003_control_core"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('control.tenants') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.tenants') is not null
+  and to_regclass('control.users') is not null
+  and to_regclass('control.workspaces') is not null
+  and to_regclass('control.memberships') is not null
+  and to_regclass('control.private_reasoning_domains') is not null
+  and to_regclass('control.quota_windows') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS control.quota_windows, control.audit_events, control.retention_policies, control.contribution_policies, control.reasoning_domain_grants, control.private_reasoning_domains, control.credentials, control.agents, control.repository_connections, control.repositories, control.memberships, control.workspaces, control.users, control.tenants CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

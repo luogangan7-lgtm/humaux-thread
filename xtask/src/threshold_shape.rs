@@ -213,11 +213,17 @@ mod tests {
     /// 那种反例本身 —— 该行含「不劣于」但不含任何否定/作废标记，是本节冻结前遗留、
     /// 未被判据②扫描覆盖过的真实缺口，不是本 checker 的误判。据实报告，不在本任务范围内改 spec。
     #[test]
-    fn baseline_real_spec_finds_pre_existing_not_worse_than_gap() {
+    fn baseline_real_spec_not_worse_than_is_clean_after_adr_0001() {
         let spec = real_spec_md();
         let violations = scan_not_worse_than(&spec);
         let lines: Vec<usize> = violations.iter().map(|v| v.line_no).collect();
-        assert_eq!(lines, vec![3127], "unexpected §69②违规集合: {lines:?}");
+        // ADR-0001 修掉了 §16.3 的残留「不劣于」句（原行 3127）——真实 spec 上判据②
+        // 必须零违规；再出现任何行号即 spec 回潮。
+        assert_eq!(
+            lines,
+            Vec::<usize>::new(),
+            "unexpected §69②违规集合: {lines:?}"
+        );
     }
 
     /// 注错 A：把 PASS 行改回 `pass_rate >= 0.95`（裸比例、无量纲词）⇒ 判据①红。

@@ -1106,13 +1106,12 @@ mod tests {
         assert_eq!(checkboxes.len(), 5);
         let registry = parse_registry(&real_registry());
         let results = check_dod_ids(&checkboxes, &registry, 0);
-        for id in ["DOD-001", "DOD-003", "DOD-004", "DOD-005"] {
+        // DOD-002 的 verifier 已改配 test::humaux-domain::ids（ADR-0001 同批更正——
+        // 原 G80-2 映射是量错对象），五条 Phase 0 DoD 在真仓库上全 Pass。
+        for id in ["DOD-001", "DOD-002", "DOD-003", "DOD-004", "DOD-005"] {
             let r = gate(&results, id);
             assert_eq!(r.status, GateStatus::Pass, "{id}: {}", r.detail);
         }
-        let dod002 = gate(&results, "DOD-002");
-        assert_eq!(dod002.status, GateStatus::Fail, "{}", dod002.detail);
-        assert!(dod002.detail.contains("did not pass"));
     }
 
     // -- G80-17.D1/D2/D3 ---------------------------------------------------------------------
@@ -1276,9 +1275,8 @@ mod tests {
             .filter(|r| r.status == GateStatus::Fail)
             .map(|r| r.gate.as_str())
             .collect();
-        // DOD-002's verifier (§55.1 G80-2) is a real, expected fail today — see the `NB`
-        // comment on that registry entry in crates/testkit/src/dod.rs. DOD-006.. are simply
-        // not_applicable (owner phase > 0), never fail.
-        assert_eq!(fail_gates, vec!["DOD-002"], "{results:#?}");
+        // Phase 0 五条 DoD 的 verifier 全部真实通过（DOD-002 已改配 test::humaux-domain::ids，
+        // ADR-0001）；DOD-006.. 为 not_applicable（owner phase > 0），永不 fail。
+        assert_eq!(fail_gates, Vec::<&str>::new(), "{results:#?}");
     }
 }

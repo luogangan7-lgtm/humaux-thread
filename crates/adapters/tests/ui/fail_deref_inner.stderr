@@ -1,0 +1,5 @@
+error[E0614]: type `RuntimeDbPool` cannot be dereferenced
+  --> tests/ui/fail_deref_inner.rs:11:19
+   |
+11 |     let _inner = &*pool;
+   |                   ^^^^^ can't be dereferenced

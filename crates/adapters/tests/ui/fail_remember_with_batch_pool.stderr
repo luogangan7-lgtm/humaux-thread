@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/fail_remember_with_batch_pool.rs:14:14
+   |
+14 |     remember(&pool);
+   |     -------- ^^^^^ expected `&RuntimeDbPool`, found `&BatchIssuerDbPool`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected reference `&RuntimeDbPool`
+              found reference `&BatchIssuerDbPool`
+note: function defined here
+  --> tests/ui/fail_remember_with_batch_pool.rs:6:4
+   |
+ 6 | fn remember(_pool: &RuntimeDbPool) {}
+   |    ^^^^^^^^ ---------------------

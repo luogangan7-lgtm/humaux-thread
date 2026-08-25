@@ -1,0 +1,32 @@
+migration_id = "0012_rls"
+class = "EXPAND_CONTRACT"
+
+# `'private.memory_records'::regclass` raises "relation does not exist" (an exception, not
+# a boolean) when the table is absent, instead of yielding a usable false/NULL — the direct
+# cast form dependency-orders this precheck on 0004 having already run. `to_regclass`
+# returns NULL on a missing relation instead of raising; a missing dependency conservatively
+# fails the precheck (false) rather than silently reporting "ok to proceed".
+precheck = "select coalesce(not (select relrowsecurity from pg_class where oid = to_regclass('private.memory_records')), false) as precheck_ok"
+
+postcheck = """
+select
+  (select count(*) from information_schema.columns c
+     join information_schema.tables t
+       on t.table_schema = c.table_schema and t.table_name = c.table_name and t.table_type = 'BASE TABLE'
+   where c.column_name = 'tenant_id') <=
+  (select count(*) from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where c.relkind = 'r' and c.relrowsecurity and c.relforcerowsecurity
+       and exists (select 1 from information_schema.columns col
+                   where col.table_schema = n.nspname and col.table_name = c.relname
+                     and col.column_name = 'tenant_id'))
+  and (select relrowsecurity and relforcerowsecurity from pg_class where oid = 'private.memory_records'::regclass)
+  and (select relrowsecurity and relforcerowsecurity from pg_class where oid = 'private.evidence_objects'::regclass)
+  and (select relrowsecurity and relforcerowsecurity from pg_class where oid = 'private.events'::regclass)
+  and (select relrowsecurity and relforcerowsecurity from pg_class where oid = 'private.artifacts'::regclass)
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: for every table with a tenant_id column, DROP POLICY <table>_tenant_isolation and ALTER TABLE ... NO FORCE / DISABLE ROW LEVEL SECURITY; explicitly DROP POLICY evidence_objects_tenant_and_visibility ON private.evidence_objects and memory_records_tenant_and_visibility ON private.memory_records, then disable RLS on those two tables. No rows are deleted by this rollback."
+
+backup_restore_requirement = "standard pre-deploy snapshot; RLS/policy DDL does not alter row data. Restore drill recommended before production cutover: verify application connections that were relying on implicit full access (pre-RLS) still authenticate with SET LOCAL humaux.tenant_id/user_id set, or every query returns zero rows post-migration (FORCE RLS applies to the table owner too, so an unset session context is not implicitly bypassed)."

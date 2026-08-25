@@ -9,3 +9,5 @@ workspace = true
 
 [dependencies]
 uuid = { version = "1.25.0", features = ["v7"] }
+# §8.1 / §48.0①: evidence::payload_sha256 raw-byte SHA-256.
+sha2 = "0.11"

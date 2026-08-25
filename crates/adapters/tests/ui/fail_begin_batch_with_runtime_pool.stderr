@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/fail_begin_batch_with_runtime_pool.rs:14:17
+   |
+14 |     begin_batch(&pool);
+   |     ----------- ^^^^^ expected `&BatchIssuerDbPool`, found `&RuntimeDbPool`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected reference `&BatchIssuerDbPool`
+              found reference `&RuntimeDbPool`
+note: function defined here
+  --> tests/ui/fail_begin_batch_with_runtime_pool.rs:6:4
+   |
+ 6 | fn begin_batch(_pool: &BatchIssuerDbPool) {}
+   |    ^^^^^^^^^^^ -------------------------
