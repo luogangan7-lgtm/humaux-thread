@@ -14,3 +14,5 @@ toml = "1"
 humaux-contracts = { path = "../crates/contracts" }
 # Parsing `cargo metadata` output for dependency-rule checks (§78.3) and gate reports.
 serde_json = "1"
+# Phase 1: migration runner (migrate.rs) + live-DB enumerations (rls_check.rs, §48.2).
+postgres = "0.19"

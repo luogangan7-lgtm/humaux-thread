@@ -4,4 +4,5 @@
 //! Domain 永不 import HTTP / SQLx / Qdrant / Provider SDK / ENV（§3 / §78.3）。
 
 pub mod degrade;
+pub mod direction;
 pub mod metrics;

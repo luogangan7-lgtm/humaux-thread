@@ -9,5 +9,7 @@ workspace = true
 
 [dependencies]
 humaux-domain = { version = "0.1.0", path = "../domain" }
+# §53.6 fail-closed generation source (G80-9): telemetry::direction's one demo annotation.
+humaux-fail-closed-macro = { version = "0.1.0", path = "../fail-closed-macro" }
 smallvec = "1.15.2"
 tracing = "0.1.44"
