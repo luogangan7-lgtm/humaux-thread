@@ -1,0 +1,20 @@
+# §46.1 migration manifest (G46-1 / G80-37). §76 Entitlement Projector: two new `control`
+# tables, additive only, no existing table touched.
+
+migration_id = "0033_entitlement_projector"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('control.entitlement_grants') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.entitlement_grants') is not null
+  and to_regclass('control.entitlement_snapshots') is not null
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'control.entitlement_snapshots'::regclass) = true
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS control.entitlement_snapshots, control.entitlement_grants CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

@@ -1,0 +1,33 @@
+# §46.1 migration manifest (G46-1 / G80-37): one manifest per migrations/*.sql.
+# §74.7 Notification Plane — control.notifications / control.notification_preferences /
+# ops.notification_deliveries. Pure additive DDL (new tables only, no existing table
+# touched), so EXPAND_CONTRACT with only the expand sub-step, same shape as 0030.
+
+migration_id = "0036_notification_plane"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('control.notifications') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.notifications') is not null
+  and to_regclass('control.notification_preferences') is not null
+  and to_regclass('ops.notification_deliveries') is not null
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'control.notifications'::regclass)
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'ops.notification_deliveries'::regclass)
+  and (select tableowner from pg_tables
+       where schemaname = 'control' and tablename = 'notifications') = 'role_migration_owner'
+  as postcheck_ok
+"""
+
+# Pure additive DDL, zero rows at risk, no old-binary compatibility concern (§46.1
+# EXPAND_CONTRACT) — safe to drop straight back out.
+rollback_or_forward_fix = """
+rollback: DROP TABLE IF EXISTS ops.notification_deliveries;
+          DROP TABLE IF EXISTS control.notification_preferences;
+          DROP TABLE IF EXISTS control.notifications;
+"""
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

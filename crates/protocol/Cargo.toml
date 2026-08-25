@@ -9,3 +9,8 @@ workspace = true
 
 [dependencies]
 humaux-domain = { version = "0.1.0", path = "../domain" }
+# §73.5: API key keyed-hash verifier (HMAC-SHA256). Same sha2 line as `humaux-domain`
+# (§8.1/§48.0①); hmac reused from the workspace's own already-resolved dependency graph
+# (paired digest 0.11.x, see Cargo.lock) rather than introducing a second major line.
+hmac = "0.13"
+sha2 = "0.11"

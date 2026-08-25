@@ -1,0 +1,41 @@
+# §46.1 migration manifest — §74 email registration/login/reset/change identity schema
+# (T2.3/H2). Pure additive DDL: seven live tables (user_emails/email_challenges/
+# password_credentials/sessions/password_reset_challenges/email_change_requests/auth_events)
+# + four V2-reserved tables (authenticators/webauthn_credentials/recovery_codes/
+# identity_connections), all FK-ing into the already-existing control.users (0003). No
+# existing table is altered, no existing row is rewritten.
+
+migration_id = "0035_email_auth_identity"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('control.user_emails') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.user_emails') is not null
+  and to_regclass('control.email_challenges') is not null
+  and to_regclass('control.password_credentials') is not null
+  and to_regclass('control.sessions') is not null
+  and to_regclass('control.password_reset_challenges') is not null
+  and to_regclass('control.email_change_requests') is not null
+  and to_regclass('control.auth_events') is not null
+  and to_regclass('control.authenticators') is not null
+  and to_regclass('control.webauthn_credentials') is not null
+  and to_regclass('control.recovery_codes') is not null
+  and to_regclass('control.identity_connections') is not null
+  and (select tableowner from pg_tables where schemaname = 'control' and tablename = 'user_emails') = 'role_migration_owner'
+  as postcheck_ok
+"""
+
+# Old binary never reads these eleven new tables (§46.1 EXPAND_CONTRACT old/new binary
+# compatibility) — a straight DROP is safe forward-fix; rollback drops in FK-safe order
+# (children referencing control.users before... none of these reference each other, so order
+# only matters relative to control.users, which this migration never touches).
+rollback_or_forward_fix = """
+rollback: DROP TABLE IF EXISTS control.identity_connections, control.recovery_codes,
+control.webauthn_credentials, control.authenticators, control.auth_events,
+control.email_change_requests, control.password_reset_challenges, control.sessions,
+control.password_credentials, control.email_challenges, control.user_emails;
+"""
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL referencing existing control.users, zero rows at risk)."

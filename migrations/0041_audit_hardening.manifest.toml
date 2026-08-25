@@ -1,0 +1,89 @@
+# §46.1 migration manifest (G46-1 / G80-37). Fixer-review follow-up to 0034_audit: closes
+# the missing audit_seq column, the ops.audit_batches overlap/over-grant gaps, the eight
+# NULLable §77 minimum-field-set columns, the zero-write-role control.audit_events gap, and
+# the TRUNCATE bypass — without editing the already-applied 0034 (same pattern as
+# 0037_edge_security_fixes' follow-up to 0035).
+
+migration_id = "0041_audit_hardening"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'control' and table_name = 'audit_events' and column_name = 'audit_seq'
+  )
+  and to_regprocedure('control.audit_event_insert(uuid, timestamptz, uuid, text, text, text, text, text, text, text, text, inet, text, text[], text, text, jsonb)') is null
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'control' and table_name = 'audit_events' and column_name = 'audit_seq'
+      and is_nullable = 'YES'
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conrelid = 'control.audit_events'::regclass and conname = 'audit_events_audit_seq_key'
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conrelid = 'ops.audit_batches'::regclass and conname = 'audit_batches_seq_range_excl'
+  )
+  and not exists (
+    select 1 from pg_constraint
+    where conrelid = 'ops.audit_batches'::regclass and conname = 'audit_batches_seq_start_key'
+  )
+  and (
+    select count(*) from information_schema.columns
+    where table_schema = 'control' and table_name = 'audit_events'
+      and column_name in ('actor_type','actor_id','resource_type','resource_id','result',
+                           'request_id','trace_id','user_agent_hash')
+      and is_nullable = 'NO'
+  ) = 8
+  and to_regprocedure('control.audit_event_insert(uuid, timestamptz, uuid, text, text, text, text, text, text, text, text, inet, text, text[], text, text, jsonb)') is not null
+  and exists (
+    select 1 from pg_trigger
+    where tgname = 'audit_batches_restrict_insert' and not tgisinternal
+  )
+  and to_regprocedure('ops.audit_batch_insert(bigint, bigint, bytea, bytea, text)') is not null
+  and exists (
+    select 1 from pg_trigger
+    where tgname = 'audit_events_reject_truncate' and not tgisinternal
+  )
+  and exists (
+    select 1 from pg_trigger
+    where tgname = 'audit_batches_reject_truncate' and not tgisinternal
+  )
+  and exists (
+    select 1 from control.tenants
+    where tenant_id = '00000000-0000-0000-0000-000000000000'::uuid
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP TRIGGER IF EXISTS audit_batches_reject_truncate ON ops.audit_batches;
+          DROP TRIGGER IF EXISTS audit_events_reject_truncate ON control.audit_events;
+          DROP TRIGGER IF EXISTS audit_batches_restrict_insert ON ops.audit_batches;
+          DROP FUNCTION IF EXISTS ops.audit_batches_restrict_insert();
+          DROP FUNCTION IF EXISTS ops.audit_batch_insert(bigint, bigint, bytea, bytea, text);
+          DROP FUNCTION IF EXISTS control.audit_event_insert(uuid, timestamptz, uuid, text, text, text, text, text, text, text, text, inet, text, text[], text, text, jsonb);
+          ALTER TABLE control.audit_events
+            ALTER COLUMN actor_type DROP NOT NULL, ALTER COLUMN actor_id DROP NOT NULL,
+            ALTER COLUMN resource_type DROP NOT NULL, ALTER COLUMN resource_id DROP NOT NULL,
+            ALTER COLUMN result DROP NOT NULL, ALTER COLUMN request_id DROP NOT NULL,
+            ALTER COLUMN trace_id DROP NOT NULL, ALTER COLUMN user_agent_hash DROP NOT NULL,
+            DROP COLUMN IF EXISTS audit_seq;
+          ALTER TABLE ops.audit_batches DROP CONSTRAINT IF EXISTS audit_batches_seq_range_excl;
+          ALTER TABLE ops.audit_batches ADD CONSTRAINT audit_batches_seq_start_key UNIQUE (seq_start);
+          DELETE FROM control.tenants WHERE tenant_id = '00000000-0000-0000-0000-000000000000'::uuid;
+"""
+
+# ALTER COLUMN SET NOT NULL, a new IDENTITY column, a range-exclusion constraint, two new
+# functions, three new triggers, and one seed row on an otherwise-empty table — no existing
+# row is touched (0034's own comment: "audit_events 在本仓库当前阶段尚无写路径产生行"; batches
+# is new in the same migration and equally empty).
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL + one seed row, zero pre-existing rows at risk)"

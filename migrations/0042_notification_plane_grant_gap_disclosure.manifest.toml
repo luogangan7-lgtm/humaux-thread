@@ -1,0 +1,31 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# §74.7 Notification Plane grant-gap disclosure — corrects 0034_notification_plane.sql's
+# false "already covered by §6.2.1 domain default" claim (review blocker) by rewriting the
+# two table comments to disclose the real, currently-unresolved write-grant gap. Catalog
+# comment change only — no rows, no privileges, no policies touched.
+
+migration_id = "0042_notification_plane_grant_gap_disclosure"
+class = "REVERSIBLE"
+
+precheck = "SELECT obj_description('control.notifications'::regclass, 'pg_class') NOT LIKE '%KNOWN GAP%' AS precheck_ok"
+
+postcheck = """
+select
+  obj_description('control.notifications'::regclass, 'pg_class') like '%KNOWN GAP%'
+  and obj_description('control.notification_preferences'::regclass, 'pg_class') like '%KNOWN GAP%'
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: restore 0034's original (inaccurate) comment text verbatim:
+  COMMENT ON TABLE control.notifications IS
+    '§74.7: platform-authoritative user notification record; category/severity closed sets '
+    'mirror application::notify::NotificationCategory/Severity verbatim (§78.2 contract test).';
+  COMMENT ON TABLE control.notification_preferences IS
+    '§74.7: per-user per-category channel opt-in. §74.7 principle "安全关键通知可忽略用户营销'
+    '偏好" is enforced Rust-side (application::notify::resolve_channels), not by a DB CHECK — '
+    'a SECURITY-severity notification always writes email=true to ops.notification_deliveries '
+    'regardless of what this table says for that (user_id, category).';
+"""
+
+backup_restore_requirement = "none (catalog-only COMMENT change, no data or privileges touched)"

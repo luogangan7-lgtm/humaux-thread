@@ -1,0 +1,57 @@
+# §46.1 migration manifest (G46-1 / G80-37). §77 双轨审计：control.audit_events 补齐 §77
+# AuditEvent 最少字段集缺列 + append-only 触发器（0003 已建表，本迁移只 ADD COLUMN，不改
+# 旧文件）；ops.audit_batches 全新建表（Immutable Audit Sink 的 hash-chained batch 元数据）
+# 同样加 append-only 触发器。两张表均在 §6.2.2 矩阵外，GRANT 走 §6.2.1 域默认（0011 的
+# ALTER DEFAULT PRIVILEGES 自动套用，本迁移不重复写 GRANT）。
+
+migration_id = "0034_audit"
+class = "EXPAND_CONTRACT"
+
+# precheck: audit_events 尚无 metadata 列（未重跑过）且 ops.audit_batches 尚不存在（新建）。
+precheck = """
+select
+  not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'control' and table_name = 'audit_events' and column_name = 'metadata'
+  )
+  and to_regclass('ops.audit_batches') is null
+  as precheck_ok
+"""
+
+# postcheck: audit_events 达到 18 列（5 旧 + 13 新）且两张表的 append-only 触发器都已挂上；
+# ops.audit_batches 存在且不带 tenant_id（故意不落 RLS）。
+postcheck = """
+select
+  (select count(*) from information_schema.columns
+   where table_schema = 'control' and table_name = 'audit_events') = 18
+  and to_regclass('ops.audit_batches') is not null
+  and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'ops' and table_name = 'audit_batches' and column_name = 'tenant_id'
+  )
+  and exists (
+    select 1 from pg_trigger where tgname = 'audit_events_reject_mutation' and not tgisinternal
+  )
+  and exists (
+    select 1 from pg_trigger where tgname = 'audit_batches_reject_mutation' and not tgisinternal
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP TABLE IF EXISTS ops.audit_batches CASCADE;
+ALTER TABLE control.audit_events
+  DROP COLUMN IF EXISTS actor_type, DROP COLUMN IF EXISTS actor_id,
+  DROP COLUMN IF EXISTS resource_type, DROP COLUMN IF EXISTS resource_id,
+  DROP COLUMN IF EXISTS result, DROP COLUMN IF EXISTS request_id,
+  DROP COLUMN IF EXISTS trace_id, DROP COLUMN IF EXISTS client_ip,
+  DROP COLUMN IF EXISTS user_agent_hash, DROP COLUMN IF EXISTS risk_tags,
+  DROP COLUMN IF EXISTS before_fingerprint, DROP COLUMN IF EXISTS after_fingerprint,
+  DROP COLUMN IF EXISTS metadata;
+DROP TRIGGER IF EXISTS audit_events_reject_mutation ON control.audit_events;
+DROP FUNCTION IF EXISTS control.audit_events_reject_mutation();
+"""
+
+# 纯 ADD COLUMN（无 backfill，新增列均带 DEFAULT 或允许 NULL）+ 纯新建表：additive-only,
+# zero rows at risk（audit_events 在本仓库当前阶段尚无写路径产生行）。
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

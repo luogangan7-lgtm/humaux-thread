@@ -12,7 +12,11 @@ workspace = true
 humaux-domain = { path = "../domain" }
 argon2 = "0.5"
 rand = "0.9"
-sha2 = "0.10"
+# §74.2/§73.5: HMAC-SHA256 keyed hash for verification codes, same construction and version
+# pins as `crates/protocol` already resolved for `control.api_keys.key_hash` — reused, not a
+# second independent version in the dependency graph.
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -97,10 +97,6 @@ async fn connect_checked(dsn: &str, expected_role: &'static str) -> Result<PgPoo
     Ok(pool)
 }
 
-// ponytail: no Application-layer consumer yet reads `.0` (that layer is a later task) — the
-// field exists so `connect()` has somewhere to put the checked pool. Delete this allow once a
-// query method or Application port reads it.
-#[allow(dead_code)]
 /// `role_gateway`'s standing request-path pool (§6.2.1 row `role_gateway`, 连接池=`request`).
 pub struct RuntimeDbPool(PgPool);
 
@@ -108,6 +104,16 @@ impl RuntimeDbPool {
     /// §6.2.3 assertion E: connects and verifies `current_user == "role_gateway"`.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
         connect_checked(dsn, ROLE_GATEWAY).await.map(Self)
+    }
+
+    /// H3 (§74.6) `adapters::email::outbox::enqueue`'s first real reader of `.0` — the
+    /// ponytail note this replaces asked for exactly this ("delete this allow once a query
+    /// method... reads it"). `pub(crate)` on purpose: only code inside this crate may run
+    /// queries through the checked pool; nothing outside `humaux-adapters` gets a `&PgPool`
+    /// at all, so G6-DB1's closed set (no cross-role construction/`Deref`/`From`) is
+    /// unchanged — this adds a query surface, not a leak of the wrapped value itself.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.0
     }
 }
 
@@ -139,8 +145,6 @@ impl ConsolidationDbPool {
     }
 }
 
-// ponytail: no Application-layer consumer yet reads `.0` (that layer is a later task).
-#[allow(dead_code)]
 /// `role_private_worker`'s worker pool (§6.2.1 row `role_private_worker`).
 pub struct PrivateWorkerDbPool(PgPool);
 
@@ -148,6 +152,12 @@ impl PrivateWorkerDbPool {
     /// §6.2.3 assertion E: connects and verifies `current_user == "role_private_worker"`.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
         connect_checked(dsn, ROLE_PRIVATE_WORKER).await.map(Self)
+    }
+
+    /// H3 (§74.6) outbox worker's pool accessor — see [`RuntimeDbPool::pool`]'s doc for why
+    /// `pub(crate)` keeps G6-DB1's closed set intact.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.0
     }
 }
 

@@ -12,14 +12,47 @@ workspace = true
 # workspace's async runtime (tokio, dev-dependency below drives it in tests via
 # `tokio::runtime::Runtime::block_on`). No tls-* feature enabled — dev DB (§6.2.3 test
 # fixtures) is plaintext TCP; production per-role DSNs choose TLS at the config layer.
-sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio"] }
+#
+# H3 (§74.6) adds three sqlx feature flags on this same dependency, not a new crate: `uuid`/
+# `time`/`json` only turn on Encode/Decode impls sqlx already ships behind feature gates for
+# columns `email::outbox` binds (outbox_id/user_id uuid, expires_at timestamptz, payload
+# jsonb) — `sqlx::types::Uuid` is the literal `uuid::Uuid` re-export, so no separate `uuid`
+# crate entry is needed either.
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "uuid", "time", "json"] }
+# audit_sink.rs (§77): translates humaux_domain::audit::AuditBatch to/from export bytes —
+# adapters depending on domain (not the reverse) is the normal hexagonal direction, already
+# established by humaux-application; this crate previously only pulled humaux-domain in as a
+# dev-dependency (test fixtures), promoted here to a real one for the same reason.
+humaux-domain = { path = "../domain" }
+# H3 (§74.6) `EmailProvider` trait: the spec's own code block names this macro verbatim
+# (`#[async_trait::async_trait]`) — already resolved in the workspace lockfile (pulled in
+# transitively by `postgres`'s dependency tree) but not previously a direct dependency of any
+# crate; adding it here so `email::mod` can `use` it directly instead of hand-rolling a
+# boxed-future trait (which would also lose dyn-compatibility, needed so `outbox::run_once`
+# can take `&dyn EmailProvider`).
+async-trait = "0.1"
+# H3 SMTP reference adapter (task brief item 1: "SMTP adapter（lettre...)"). `rustls` over
+# `native-tls` to avoid an OpenSSL build dependency, matching this crate's existing TLS
+# posture (sqlx above also carries no tls-* feature; production TLS choice stays a config-
+# layer decision, not a compile-time default).
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "pool"] }
+# H3 `ops.email_outbox.payload` / `ops.email_delivery_events.detail` are jsonb columns bound
+# as `serde_json::Value` (sqlx's `json` feature above only enables the Encode/Decode impls,
+# it does not re-export the crate or its `json!` macro).
+serde_json = "1"
 
 [dev-dependencies]
 # T1.5 crates/adapters/tests/auth_scope_rls.rs: blocking client for the §62 RLS integration
 # test (same crate/version xtask already pins for its live-DB checks, no new dependency).
 postgres = { version = "0.19", features = ["with-uuid-1"] }
-# Reuses domain's real id newtypes (TenantId/UserId) rather than raw uuid::Uuid in the test.
-humaux-domain = { path = "../domain" }
+# H3 `tests/email_outbox.rs`: `sqlx::types::Uuid` (the crate's own production-code alias,
+# see the `sqlx` entry above) has no random-generation feature turned on by sqlx's minimal
+# `uuid` flag — this dev-only entry adds `v4` for test fixtures' throwaway ids, matching
+# `humaux-domain`'s existing `uuid = "1.25.0"` pin so cargo resolves one shared copy.
+uuid = { version = "1.25.0", features = ["v4"] }
+# humaux-domain (TenantId/UserId in auth_scope_rls.rs, humaux_domain::audit in audit_sink.rs
+# tests) is now a real [dependencies] entry above — available to tests without a separate
+# dev-dependency line.
 # §79.2 three-state DB fixture skip contract (DbIntegrationFixture/run_db_fixture).
 humaux-testkit = { path = "../testkit" }
 # G6-DB1 compile-pass/compile-fail fixtures (§6.2.3): four wrapper types must not be

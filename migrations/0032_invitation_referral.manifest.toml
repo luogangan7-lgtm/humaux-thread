@@ -1,0 +1,23 @@
+# §46.1 migration manifest (G46-1 / G80-37). §75 Team Invitation + Referral: five new
+# `control` tables, additive only, no existing table touched.
+
+migration_id = "0032_invitation_referral"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('control.team_invitations') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.team_invitations') is not null
+  and to_regclass('control.referral_codes') is not null
+  and to_regclass('control.referral_attributions') is not null
+  and to_regclass('control.referral_rewards') is not null
+  and to_regclass('control.credit_ledger') is not null
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'control.credit_ledger'::regclass) = true
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS control.credit_ledger, control.referral_rewards, control.referral_attributions, control.referral_codes, control.team_invitations CASCADE; DROP FUNCTION IF EXISTS control.credit_ledger_reject_mutation() CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

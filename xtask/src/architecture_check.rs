@@ -1103,6 +1103,35 @@ fn report(name: &str, verdict: &Verdict) -> bool {
 // §6.2.3 G80-40 static side — typed DB pool topology
 // ============================================================================
 
+/// Counts non-comment occurrences of the `PgPool` *type* in `src`: matches the word
+/// `PgPool` whether written bare (after `use sqlx::PgPool`) or qualified (`sqlx::PgPool`),
+/// but not `PgPoolOptions` (the builder is not the pool handle) and not comment mentions.
+/// This is the raw-pool-naming signal for G80-40 — the encapsulation check counts it in
+/// `postgres.rs` (must be >0, live sentinel) and everywhere else (must be 0).
+fn count_pgpool_type(src: &str) -> usize {
+    let mut n = 0usize;
+    for line in src.lines() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find("PgPool") {
+            let at = from + rel;
+            let after = at + "PgPool".len();
+            // exclude PgPoolOptions and any PgPool<ident> continuation
+            let next_is_ident = bytes
+                .get(after)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+            if !next_is_ident {
+                n += 1;
+            }
+            from = after;
+        }
+    }
+    n
+}
+
 /// G80-40 static side (§6.2.3): raw `sqlx::PgPool` may be *named* only inside the single
 /// encapsulation point `crates/adapters/src/postgres.rs`; the four wrapper types must each
 /// be declared exactly once there. The deliberate compile-fail fixtures under
@@ -1136,8 +1165,21 @@ pub fn g6_db_pool_topology(root: &Path) -> Verdict {
         }
     }
 
+    // Positive control (scanner-is-alive): the encapsulation point itself must name the
+    // raw type at least once — the four wrappers each hold a `sqlx::PgPool` inner field.
+    // If this drops to 0 the scanner (or postgres.rs) is broken; a dead scanner would
+    // otherwise report "no violations" forever. (The ui/ compile-fail fixtures test field
+    // *privacy* via `.0`, not raw-type naming, so they are not a naming sentinel.)
+    let home_hits = count_pgpool_type(&pool_src);
+    if home_hits == 0 {
+        problems.push(
+            "positive sentinel dead: postgres.rs names sqlx::PgPool 0 times (§53.3 规则3 \
+             同款——扫描器失明或封装点被掏空)"
+                .to_string(),
+        );
+    }
+
     // Raw `sqlx::PgPool` naming outside the encapsulation point.
-    let mut sentinel_hits = 0usize;
     for file in walk_files(&root.join("crates"), &["rs"]) {
         let disp = file
             .strip_prefix(root)
@@ -1147,26 +1189,16 @@ pub fn g6_db_pool_topology(root: &Path) -> Verdict {
         let Ok(src) = fs::read_to_string(&file) else {
             continue;
         };
-        let hits = src.matches("sqlx::PgPool").count();
+        let hits = count_pgpool_type(&src);
         if hits == 0 {
             continue;
         }
         if disp.ends_with("crates/adapters/src/postgres.rs") {
             continue; // the one legal home
         }
-        if disp.contains("/tests/ui/") {
-            sentinel_hits += hits; // deliberate compile-fail fixtures: positive control
-            continue;
-        }
         problems.push(format!(
-            "raw sqlx::PgPool named outside encapsulation point: {disp} ({hits} hit(s))"
+            "raw PgPool type named outside encapsulation point: {disp} ({hits} hit(s))"
         ));
-    }
-    if sentinel_hits == 0 {
-        problems.push(
-            "positive sentinel dead: no sqlx::PgPool hits in crates/adapters/tests/ui/              compile-fail fixtures (§53.3 规则3 同款——扫描器失明)"
-            .to_string(),
-        );
     }
 
     if problems.is_empty() {
@@ -2000,12 +2032,24 @@ mod tests {
         }
     }
 
-    /// 注错 b：删掉 ui 夹具（哨兵） ⇒ 红——扫描器失明必须可观察。
+    /// 注错 b：掏空封装点里 `sqlx::PgPool` 的实际命名（只留注释提及） ⇒ 红——
+    /// 扫描器失明（永远匹配 0）必须可观察。
     #[test]
     fn g80_40_fault_dead_sentinel_is_red() {
         let tmp = fresh_tmp("g80-40-sentinel");
         copy_adapters_fixture(&tmp);
-        fs::remove_file(tmp.join("crates/adapters/tests/ui/fail_raw_pool_field.rs")).unwrap();
+        // wrappers still declared (so the four-count check passes) but their inner field
+        // no longer *names* the raw type — only a comment mentions it. A live scanner
+        // must notice the naming sentinel went to 0.
+        fs::write(
+            tmp.join("crates/adapters/src/postgres.rs"),
+            "// inner is a sqlx::PgPool, morally\n\
+             pub struct RuntimeDbPool(());\n\
+             pub struct BatchIssuerDbPool(());\n\
+             pub struct ConsolidationDbPool(());\n\
+             pub struct PrivateWorkerDbPool(());\n",
+        )
+        .unwrap();
         match g6_db_pool_topology(&tmp) {
             Verdict::Fail(lines) => assert!(lines.iter().any(|l| l.contains("sentinel"))),
             other => panic!("expected Fail, got {other:?}"),

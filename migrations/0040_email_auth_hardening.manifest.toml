@@ -1,0 +1,45 @@
+# §46.1 migration manifest. Fixer-review follow-up to 0034_email_auth_identity: adds the
+# missing session bearer-token verifier column and a per-IP correlation column on
+# email_challenges, without editing the already-applied 0034.
+
+migration_id = "0040_email_auth_hardening"
+class = "EXPAND_CONTRACT"
+
+# precheck: token_hash/requested_ip don't exist yet (fresh add, not a re-run), and
+# control.sessions is empty — required for the NOT NULL ADD COLUMN to be safe without a
+# backfill strategy (see the migration file's own comment on why this is asserted, not
+# assumed).
+precheck = """
+select
+  (select count(*) from information_schema.columns
+     where table_schema = 'control' and table_name = 'sessions'
+       and column_name = 'token_hash') = 0
+  and (select count(*) from information_schema.columns
+     where table_schema = 'control' and table_name = 'email_challenges'
+       and column_name = 'requested_ip') = 0
+  and (select count(*) from control.sessions) = 0
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (select count(*) from information_schema.columns
+     where table_schema = 'control' and table_name = 'sessions'
+       and column_name = 'token_hash' and is_nullable = 'NO' and data_type = 'bytea') = 1
+  and (select count(*) from pg_constraint
+     where conrelid = 'control.sessions'::regclass and contype = 'u'
+       and conname = 'sessions_token_hash_key') = 1
+  and (select count(*) from information_schema.columns
+     where table_schema = 'control' and table_name = 'email_challenges'
+       and column_name = 'requested_ip' and data_type = 'inet') = 1
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE control.sessions DROP CONSTRAINT sessions_token_hash_key;
+          ALTER TABLE control.sessions DROP COLUMN token_hash;
+          ALTER TABLE control.email_challenges DROP COLUMN requested_ip;
+          (safe direct rollback: both are additive columns, no dependent objects created)
+"""
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive columns, precheck enforces zero rows at risk on control.sessions)"

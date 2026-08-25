@@ -1,0 +1,20 @@
+# §46.1 migration manifest (G46-1 / G80-37). §73.5 API Key + §73 Admin/Support
+# SupportAccessRequest: two new `control` tables, additive only, no existing table touched.
+
+migration_id = "0037_edge_security"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('control.api_keys') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.api_keys') is not null
+  and to_regclass('control.support_access_requests') is not null
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'control.api_keys'::regclass) = true
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS control.support_access_requests, control.api_keys CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

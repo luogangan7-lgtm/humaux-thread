@@ -1,0 +1,50 @@
+# §46.1 migration manifest — H3/T2.4 §74.6 EmailProvider + Email Deliverability Plane.
+
+migration_id = "0038_email_deliverability"
+class = "EXPAND_CONTRACT"
+
+# precheck: none of the five new tables exist yet (fresh add, not a re-run).
+precheck = """
+select
+  to_regclass('ops.email_outbox') is null
+  and to_regclass('ops.email_delivery_events') is null
+  and to_regclass('ops.email_suppressions') is null
+  and to_regclass('ops.email_domains') is null
+  and to_regclass('ops.email_provider_health') is null
+  as precheck_ok
+"""
+
+# postcheck: all five tables exist, each owned by role_migration_owner (P1 pattern) and none
+# carrying a tenant_id column (see the migration file's own header for why).
+postcheck = """
+select
+  to_regclass('ops.email_outbox') is not null
+  and to_regclass('ops.email_delivery_events') is not null
+  and to_regclass('ops.email_suppressions') is not null
+  and to_regclass('ops.email_domains') is not null
+  and to_regclass('ops.email_provider_health') is not null
+  and (select count(*) from pg_tables
+       where schemaname = 'ops'
+         and tablename in ('email_outbox', 'email_delivery_events', 'email_suppressions',
+                            'email_domains', 'email_provider_health')
+         and tableowner = 'role_migration_owner') = 5
+  and (select count(*) from information_schema.columns
+       where table_schema = 'ops'
+         and table_name in ('email_outbox', 'email_delivery_events', 'email_suppressions',
+                             'email_domains', 'email_provider_health')
+         and column_name = 'tenant_id') = 0
+  as postcheck_ok
+"""
+
+# Old binary never reads/writes these five new tables (pure additive DDL) — safe direct
+# rollback, no old/new compatibility window needed.
+rollback_or_forward_fix = """
+rollback: DROP TABLE IF EXISTS ops.email_delivery_events;
+          DROP TABLE IF EXISTS ops.email_outbox;
+          DROP TABLE IF EXISTS ops.email_suppressions;
+          DROP TABLE IF EXISTS ops.email_domains;
+          DROP TABLE IF EXISTS ops.email_provider_health;
+          (delivery_events dropped first — it FK-references email_outbox)
+"""
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

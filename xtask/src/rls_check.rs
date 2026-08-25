@@ -1628,6 +1628,61 @@ pub fn check_rls_four_item(client: &mut impl GenericClient) -> GateResult {
 // Entry point
 // ============================================================================
 
+/// §73 Admin-Plane leak scan (added after the P2 review found `control.support_access_requests`
+/// leaking cross-tenant rows to `role_gateway`): any base table in `control`/`ops`/`private`
+/// carrying a column whose name matches `%tenant_id%` — the owning `tenant_id` OR a reference
+/// like `target_tenant_id` — that a runtime role can SELECT and that has row-security *disabled*
+/// is a cross-tenant read waiting to happen. `check_rls_four_item` only enumerates the literal
+/// `tenant_id` column, so a renamed reference column slipped past it (green gate, open leak);
+/// this check closes that class. A table is clean if RLS is enabled+forced, OR no runtime role
+/// can SELECT it. NULLIF-policy content is not inspected here — this is the coarse "is it even
+/// guarded" gate; per-tenant correctness stays with `check_rls_four_item`.
+pub fn check_admin_plane_no_leak(client: &mut impl GenericClient) -> GateResult {
+    let rows = match client.query(
+        "SELECT DISTINCT c.relnamespace::regnamespace::text AS sch, c.relname,                 c.relrowsecurity, c.relforcerowsecurity          FROM pg_class c          JOIN information_schema.columns col            ON col.table_schema = c.relnamespace::regnamespace::text           AND col.table_name = c.relname          WHERE c.relkind IN ('r','p')            AND c.relnamespace::regnamespace::text IN ('control','ops','private','staging','projection','coord')            AND col.column_name LIKE '%tenant_id%'",
+        &[],
+    ) {
+        Ok(r) => r,
+        Err(e) => return fail("Admin-Plane 防泄漏", format!("enumeration query failed: {e}")),
+    };
+
+    let mut problems = Vec::new();
+    for row in &rows {
+        let sch: String = row.get(0);
+        let table: String = row.get(1);
+        let rls: bool = row.get(2);
+        let forced: bool = row.get(3);
+        if rls && forced {
+            continue; // guarded — per-tenant correctness is check_rls_four_item's job
+        }
+        // RLS off (or not forced): only a leak if a runtime role can actually SELECT it.
+        let full = format!("{sch}.{table}");
+        let can_select: bool = match client.query_one(
+            "SELECT bool_or(has_table_privilege(r, $1, 'SELECT'))              FROM unnest($2::text[]) AS r",
+            &[&full, &RUNTIME_ROLES.to_vec()],
+        ) {
+            Ok(r) => r.get(0),
+            Err(e) => {
+                problems.push(format!("{full}: privilege probe failed: {e}"));
+                continue;
+            }
+        };
+        if can_select {
+            problems.push(format!(
+                "{full}: has %tenant_id% column, SELECT-able by a runtime role, RLS not enabled+forced (rls={rls} forced={forced}) — cross-tenant leak class (§73 Admin/User plane 分离)"
+            ));
+        }
+    }
+    if problems.is_empty() {
+        pass(
+            "Admin-Plane 防泄漏",
+            "no unguarded runtime-role-readable %tenant_id% table".to_string(),
+        )
+    } else {
+        fail("Admin-Plane 防泄漏", problems.join("; "))
+    }
+}
+
 fn report(results: &[GateResult]) -> i32 {
     let mut failed = false;
     for r in results {
@@ -1664,6 +1719,7 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_forbidden_verbs(&mut client));
             results.push(check_invoice_privilege_unique(&mut client));
             results.push(check_rls_four_item(&mut client));
+            results.push(check_admin_plane_no_leak(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -1673,6 +1729,7 @@ pub fn run(_args: &[String]) -> i32 {
                 "全域禁动词",
                 "发票权唯一",
                 "RLS 四项",
+                "Admin-Plane 防泄漏",
             ] {
                 results.push(fail_for(name, &conn_err));
             }
