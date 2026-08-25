@@ -6,3 +6,9 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# §46.1 manifest parsing (migration_rehearsal.rs) — no serde derive needed, toml::Value suffices.
+toml = "1"
+# §50.1 config-check.rs: reuses contracts::feature_registry parsing, no second parser.
+humaux-contracts = { path = "../crates/contracts" }

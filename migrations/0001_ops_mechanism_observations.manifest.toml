@@ -1,0 +1,28 @@
+# §46.1 Migration Rehearsal Contract — 每个 migrations/*.sql 恰好一个 manifest（G46-1 / G80-37）。
+# 本迁移新建 ops schema + ops.mechanism_observations（§1.14.1 Runtime MechanismObservation
+# authority）；无既有数据形态被替换，因此只有 expand，没有 migrate/backfill/switch/contract
+# 子步骤 —— EXPAND_CONTRACT 判定见 §46.1，class 由发起方（T0.9 任务卡）指定。
+
+migration_id = "0001_ops_mechanism_observations"
+class = "EXPAND_CONTRACT"
+
+# precheck: 表尚不存在（新建，非重跑）。
+precheck = "select to_regclass('ops.mechanism_observations') is null as precheck_ok"
+
+# postcheck: 表存在且恰有本迁移声明的 11 列（含 observation_id 主键 + created_at 审计列）。
+postcheck = """
+select
+  to_regclass('ops.mechanism_observations') is not null
+  and (select count(*) from information_schema.columns
+       where table_schema = 'ops' and table_name = 'mechanism_observations') = 11
+  as postcheck_ok
+"""
+
+# 旧二进制不读写这张新表（§46.1 EXPAND_CONTRACT 要求 old/new binary compatibility），
+# 因此纯加表可安全直接 DROP TABLE 回滚；不删 ops schema 本身——同 schema 下会陆续落其他表
+# （§48 canonical schema：ops.jobs / outbox / scheduler_leases 等），schema 级 DROP 不是本迁移能单独决定的。
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS ops.mechanism_observations;"
+
+# 纯加表、无破坏性变更、无既有数据被改写：常规 pre-deploy snapshot 即可覆盖，
+# 不要求专门 restore drill（§46.1 backup_restore_requirement 按风险面裁定）。
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

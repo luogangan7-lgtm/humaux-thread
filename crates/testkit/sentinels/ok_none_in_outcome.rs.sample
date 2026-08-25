@@ -1,0 +1,18 @@
+// §53.3 规则3 正哨兵 · 形态 3/3：`Ok(Vec::new())` / `Ok(None)`
+//
+// 同前两个文件的角色：不参与编译，是 architecture-check 规则1 的已知正例
+// 之三。sentinels/ 下三个形态合计必须恰好被命中 3 次；本文件贡献其中 1 次。
+//
+// 违规点：Outcome 函数体内直接返回 Ok(None)（此处以 Result 包裹展示
+// 该形态；等价写法 Ok(Vec::new()) 同样命中），把「找不到结果」伪装成
+// 「查询成功、结果恰好是空」，而不是显式弃权。
+
+use domain::{Outcome, abstain};
+
+fn lookup_memory(id: &MemoryId) -> Outcome<Result<Option<MemoryRecord>, LookupError>> {
+    // 违规：不在 abstain() 调用链上，Outcome 里塞了一个看似成功的 Ok(None)。
+    if !id.is_resolvable() {
+        return Outcome::Decided(Ok(None));
+    }
+    Outcome::Decided(Ok(Some(MemoryRecord::placeholder())))
+}

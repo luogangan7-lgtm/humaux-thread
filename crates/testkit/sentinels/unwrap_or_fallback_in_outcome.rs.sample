@@ -1,0 +1,17 @@
+// §53.3 规则3 正哨兵 · 形态 2/3：`unwrap_or(`
+//
+// 同 unwrap_or_default_in_outcome.rs.sample 的角色：不参与编译，是
+// architecture-check 规则1 的已知正例之一。sentinels/ 下三个形态合计必须
+// 恰好被命中 3 次；本文件贡献其中 1 次。
+//
+// 违规点：Outcome 函数体内用 unwrap_or(<硬编码 fallback>) 顶替真实弃权，
+// 且不在 abstain() 调用链上——同一类问题的第二种拼写。
+
+use domain::{Outcome, abstain};
+
+fn resolve_quota(reservation: Option<Quota>) -> Outcome<Quota> {
+    // 违规：应 `return abstain(AbstainReason::QuotaUnavailable)`，
+    // 而不是拿一个假装安全的默认配额糊弄过去。
+    let quota = reservation.unwrap_or(Quota::ZERO);
+    Outcome::Decided(quota)
+}

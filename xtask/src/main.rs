@@ -5,11 +5,11 @@
 //! · config-check(G80-41) · rls-check(§48.2)。判据正文以家章为唯一真源。
 
 mod architecture_check;
-mod mechanism_registry;
-mod migration_rehearsal;
-mod metrics_registry;
-mod contract_impact;
 mod config_check;
+mod contract_impact;
+mod mechanism_registry;
+mod metrics_registry;
+mod migration_rehearsal;
 mod rls_check;
 
 fn main() {
@@ -23,7 +23,9 @@ fn main() {
         Some("config-check") => config_check::run(&args[2..]),
         Some("rls-check") => rls_check::run(&args[2..]),
         _ => {
-            eprintln!("usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check>");
+            eprintln!(
+                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check>"
+            );
             2
         }
     };

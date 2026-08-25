@@ -3,16 +3,16 @@
 //! 本 crate 的职责边界与依赖规则以 docs/architecture/Baseline_2.8.md 为唯一规范真源；
 //! Domain 永不 import HTTP / SQLx / Qdrant / Provider SDK / ENV（§3 / §78.3）。
 
-pub mod identity;
-pub mod evidence;
-pub mod memory;
-pub mod knowledge;
-pub mod public;
-pub mod context;
+pub mod authority;
 pub mod code;
+pub mod context;
 pub mod coordination;
 pub mod error;
+pub mod evidence;
+pub mod identity;
 pub mod ids;
-pub mod authority;
-pub mod temporal;
+pub mod knowledge;
+pub mod memory;
 pub mod policy;
+pub mod public;
+pub mod temporal;

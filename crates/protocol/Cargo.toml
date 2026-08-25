@@ -6,3 +6,6 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+humaux-domain = { version = "0.1.0", path = "../domain" }

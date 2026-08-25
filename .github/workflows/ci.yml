@@ -1,0 +1,83 @@
+name: CI
+# §46 "Repository 第一天启用" + §46.1 G46-1/G80-37 Migration Rehearsal Contract.
+# Main branch 不允许红（§46）. Tri-state semantics per §57.1:
+#   rule 2: not_applicable 必须打印缺失对象名，不许「扫不到当通过」。
+#   rule 3: 依赖运行时基础设施的项（retrieval benchmark / mutation tests /
+#           deploy smoke / container scan）Phase 0 无被测对象，输出
+#           not_applicable —— 不注释掉、不假绿。
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: fmt + check + clippy + test + gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo check --all-targets
+        run: cargo check --workspace --all-targets
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo xtask architecture-check
+        run: cargo xtask architecture-check
+
+      - name: cargo xtask mechanism-registry
+        run: cargo xtask mechanism-registry
+
+      - name: cargo xtask config-check
+        run: cargo xtask config-check
+
+      - name: cargo xtask contract-impact
+        run: cargo xtask contract-impact
+
+      - name: cargo xtask migration-rehearsal
+        run: cargo xtask migration-rehearsal
+
+      - name: cargo-deny check (§78.5)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --workspace --all-features
+
+      # §46 Day-1 list / §57.1 Phase-0 gate row require SBOM to PASS (not
+      # not_applicable): it is generated statically from Cargo.lock, no live
+      # infrastructure needed, so it does not qualify for the tri-state
+      # not_applicable exception in §57.1 rule 3.
+      - name: SBOM (cargo-sbom, §46)
+        run: |
+          cargo install cargo-sbom --locked
+          cargo sbom --output-format=spdx_json_2_3 > sbom.spdx.json
+
+      # §57.1 第3条: 依赖运行时基础设施（vector store / mutation harness / live
+      # deploy target / image registry），Phase 0 尚无被测对象。按三态输出
+      # not_applicable 并点名缺失对象，不是注释掉这些步骤、也不是假装它们通过。
+      - name: retrieval benchmark (not_applicable — Phase 0)
+        run: 'echo "not_applicable (missing object: retrieval benchmark corpus / embedding index — delivered Phase 6, §57.1 rule 3)"'
+
+      - name: mutation tests (not_applicable — Phase 0)
+        run: 'echo "not_applicable (missing object: mutation harness / testkit fault targets — delivered Phase 1, §57.1 rule 3)"'
+
+      - name: deploy smoke (not_applicable — Phase 0)
+        run: 'echo "not_applicable (missing object: live deploy target with /live /ready /status — delivered Phase 14, §57.1 rule 3)"'
+
+      - name: container scan (not_applicable — Phase 0)
+        run: 'echo "not_applicable (missing object: container image to scan — delivered Phase 14, §57.1 rule 3)"'

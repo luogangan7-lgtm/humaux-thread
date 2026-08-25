@@ -1,0 +1,20 @@
+// §53.3 规则3 正哨兵 · 形态 1/3：`unwrap_or_default()`
+//
+// 本文件是 architecture-check 规则1 的【本该命中】样本，不参与编译
+// （扩展名 .rs.sample，workspace 不会把它当 crate 成员）。它的作用只有
+// 一个：让 check 在真实代码库之外也有一个「已知答案」的正例——check 每次
+// 运行必须在 sentinels/ 下恰好命中 3 次（本文件 + 另外两个形态各 1 次），
+// 命中数 != 3 就说明 grep 本身写坏了、变成了「三次永远绿的闸」（§53.3）。
+//
+// 违规点：函数体返回 Outcome<_>，却在非 abstain() 调用链上用
+// unwrap_or_default() 把「取不到候选」悄悄变成一个看似合法的空值，而不是
+// 走 abstain() 显式弃权。真实代码里这类写法必须被 architecture-check 抓到。
+
+use domain::{Outcome, abstain};
+
+fn pick_candidate(pool: &[Candidate]) -> Outcome<Candidate> {
+    // 违规：Outcome 函数体内的 fallback 分支不在 abstain() 调用链上，
+    // 应改为 `return abstain(AbstainReason::NoCandidate)`。
+    let chosen = pool.first().cloned().unwrap_or_default();
+    Outcome::Decided(chosen)
+}

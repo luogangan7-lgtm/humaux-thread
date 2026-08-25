@@ -1,0 +1,2 @@
+# edition 2024 默认（workspace.package.edition, 根 Cargo.toml）；其余用 rustfmt 默认值。
+edition = "2024"

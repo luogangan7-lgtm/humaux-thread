@@ -1,6 +1,35 @@
-//! `humaux-admin` 进程入口（最小必要进程集见 §4.2；admin 探针契约见 §4.4）。
+//! `humaux-admin` 进程入口（最小必要进程集见 §4.2；探针契约见 §4.4）。
+//!
+//! 子命令：
+//! - `render mechanism-registry` —— 读 §1.14 canonical md 的 `mechanism-registry` 围栏并渲染
+//!   成人读表格。**这是与 `q` 平级的另一个子命令，不是探针**：不进 §4.4 冻结的 10 条探针目录，
+//!   不产出 §4.4 统一契约的 `{value, scanned_n, scope_hash, checked_at, probe_version}` JSON
+//!   （§1.14：「render 非探针」，此前 `humaux-admin q mechanism.registry --render` 的写法作废）。
+//! - `q <name>` —— §4.4 即时探针目录占位。本轮未接 DB，一律非零退出并打印缺失对象名，
+//!   禁止压成 `value = 0` 冒充（§4.4 坑5）。
+
+mod probe;
+mod render;
 
 fn main() {
-    // T 后续任务接线；进程职责与凭证边界以 §4 / §67.2 为准。
-    println!("humaux-admin: not wired yet (Phase 0 scaffold)");
+    let args: Vec<String> = std::env::args().collect();
+    let code = match args.get(1).map(String::as_str) {
+        Some("render") => match args.get(2).map(String::as_str) {
+            Some("mechanism-registry") => render::mechanism_registry(&args[3..]),
+            _ => usage(),
+        },
+        Some("q") => match args.get(2) {
+            Some(name) => probe::run(name, &args[3..]),
+            None => usage(),
+        },
+        _ => usage(),
+    };
+    std::process::exit(code);
+}
+
+fn usage() -> i32 {
+    eprintln!(
+        "usage: humaux-admin <render mechanism-registry [--deployment ID --cell ID] | q <name>>"
+    );
+    2
 }

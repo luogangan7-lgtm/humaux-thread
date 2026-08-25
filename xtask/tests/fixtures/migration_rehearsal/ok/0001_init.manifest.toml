@@ -1,0 +1,6 @@
+migration_id = "0001_init"
+class = "REVERSIBLE"
+precheck = "select to_regclass('public.example') is null"
+postcheck = "select to_regclass('public.example') is not null"
+rollback_or_forward_fix = "down migration drops table example"
+backup_restore_requirement = "none — additive, no data at risk"

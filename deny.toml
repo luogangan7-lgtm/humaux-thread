@@ -1,0 +1,34 @@
+# cargo-deny config (§78.5): unknown registry/git deny, wildcard dependency deny,
+# license allowlist (Apache-2.0/MIT/BSD/ISC/Unicode), advisory deny, duplicate warn.
+# Run via `cargo xtask` gate wiring / CI `cargo-deny check` step (§46).
+
+[graph]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# §78.5: 重复依赖必须带原因/expiry exception — 默认只 warn，收紧成 deny 需逐条登记 skip。
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = false
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -6,3 +6,10 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# §50.1: config/features.toml 解析（唯一静态真源）。
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+# §50: effective config fingerprint（规范序列化后 sha256）。
+sha2 = "0.11"

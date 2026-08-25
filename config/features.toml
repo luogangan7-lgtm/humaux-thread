@@ -1,2 +1,71 @@
 # §50.1 唯一 Enterprise Feature Activation Registry（G80-41 判据以 §50.1 为准）。
-# 内容由 T0.11 落地；本文件路径本身是 G50-1 第 0 条（必须存在且与 §58 树一致）。
+# 本文件路径本身是 G50-1 第 0 条（必须存在且与 §58 树一致）。
+# Phase 17 不维护第二份 feature list（G50-1 第6条）：evaluator 直接迭代本文件
+# owner_phase == 17 的 rows；全 repo 其它 *.toml 出现 feature_id 字段即红。
+#
+# mechanism_ref 格式 "<ch>:<mechanism>"（contracts::feature_registry::parse_features_toml 解析），
+# DenominatorGated 行必须逐字命中 §1.14 mechanism-registry 围栏块对应行；ConfigOnly 行必须留空。
+
+[[feature]]
+feature_id = "passkey"
+owner_phase = 17
+activation_kind = "ConfigOnly"
+entitlement_key = "feature.passkey"
+contract_test = "crates/contracts/tests/feature_registry_contract.rs"
+
+[[feature]]
+feature_id = "oidc"
+owner_phase = 17
+activation_kind = "ConfigOnly"
+entitlement_key = "feature.oidc"
+contract_test = "crates/contracts/tests/feature_registry_contract.rs"
+
+[[feature]]
+feature_id = "saml"
+owner_phase = 17
+activation_kind = "ConfigOnly"
+entitlement_key = "feature.saml"
+contract_test = "crates/contracts/tests/feature_registry_contract.rs"
+
+[[feature]]
+feature_id = "scim"
+owner_phase = 17
+activation_kind = "ConfigOnly"
+entitlement_key = "feature.scim"
+contract_test = "crates/contracts/tests/feature_registry_contract.rs"
+
+[[feature]]
+feature_id = "cmk"
+owner_phase = 17
+activation_kind = "ConfigOnly"
+entitlement_key = "feature.cmk"
+contract_test = "crates/contracts/tests/feature_registry_contract.rs"
+
+[[feature]]
+feature_id = "multi_cell"
+owner_phase = 17
+activation_kind = "DenominatorGated"
+mechanism_ref = "67:Cell Routing"
+entitlement_key = "feature.multi_cell"
+contract_test = "crates/contracts/tests/feature_registry_contract.rs"
+
+[[feature]]
+feature_id = "dedicated_enterprise_cell"
+owner_phase = 17
+activation_kind = "ConfigOnly"
+entitlement_key = "feature.dedicated_enterprise_cell"
+contract_test = "crates/contracts/tests/feature_registry_contract.rs"
+
+[[feature]]
+feature_id = "customer_retrieval_endpoint"
+owner_phase = 17
+activation_kind = "ConfigOnly"
+entitlement_key = "feature.customer_retrieval_endpoint"
+contract_test = "crates/contracts/tests/feature_registry_contract.rs"
+
+[[feature]]
+feature_id = "byoc"
+owner_phase = 17
+activation_kind = "ConfigOnly"
+entitlement_key = "feature.byoc"
+contract_test = "crates/contracts/tests/feature_registry_contract.rs"

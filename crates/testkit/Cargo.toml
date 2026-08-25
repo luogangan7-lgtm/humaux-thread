@@ -6,3 +6,10 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Advanced Rust Testing / Architecture Tests > Property-based (spec，紧接
+# §79.8 Coverage 之后的未编号章节，非 §79.7 Mutation Testing): quota
+# reservation invariants, scope normalization, cache keys, ID generation,
+# completeness aggregation, public provenance closure.
+proptest = "1.11.0"
