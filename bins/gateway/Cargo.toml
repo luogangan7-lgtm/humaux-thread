@@ -1,0 +1,8 @@
+[package]
+name = "humaux-gateway"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

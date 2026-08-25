@@ -1,0 +1,14 @@
+# Humaux Thread workspace — §58 是 workspace contract，不是示意图。
+# members 至少 crates/* 与 bins/*（§58 冻结）；xtask 为工程门禁工具（§78）。
+[workspace]
+resolver = "3"
+members = ["crates/*", "bins/*", "xtask"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+repository = "https://github.com/luogangan7-lgtm/humaux-thread"
+
+[workspace.lints.clippy]
+too_many_lines = "warn"

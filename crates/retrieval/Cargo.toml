@@ -1,0 +1,8 @@
+[package]
+name = "humaux-retrieval"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
