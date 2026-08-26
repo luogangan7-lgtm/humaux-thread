@@ -4,7 +4,6 @@
 //! Domain 永不 import HTTP / SQLx / Qdrant / Provider SDK / ENV（§3 / §78.3）。
 
 pub mod auth;
-pub mod batch;
 pub mod consolidate;
 pub mod continuity;
 pub mod contribute;
@@ -13,7 +12,6 @@ pub mod distill;
 pub mod entitlement;
 pub mod forget;
 pub mod ingest;
-pub mod jobs;
 pub mod notify;
 pub mod public_evolve;
 pub mod referral;
