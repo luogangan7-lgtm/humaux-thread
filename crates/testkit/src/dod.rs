@@ -75,3 +75,44 @@ pub const PHASE_0: &[DodVerifier] = &[
         verifier_ref: "architecture-check::§53.3 规则3 (sentinels positive control)",
     },
 ];
+
+/// Phase 3 registrations — §69 Scheduler / Job plane。
+///
+/// **只有一条。** 这不是「先登记一条以后再补」，是对抗验证的实际结果：Phase 3 的 14 条 DoD
+/// 里，其余 13 条要么在仓里找不到能证明它的执行体，要么候选执行体量的不是同一个对象
+/// （详见 §69 缺口清单）。宁可空着让 `dod-check` 报 fail，也不硬凑一个错的映射——
+/// 错的映射会让这条 DoD 永远打着勾却什么都没测，比空着危险得多。
+pub const PHASE_3: &[DodVerifier] = &[DodVerifier {
+    id: "DOD-090",
+    phase: 3,
+    // 判据链逐环核过：§69 ≡ §57.1 Phase 3 行 ≡ §80.1 G80-38 → §32.1#G32-1 ≡ §32.1 五步判据
+    // ≡ scheduler_exactly_once.rs:192。fault 走 §32.1 点名的第一条注错
+    // （DROP UNIQUE ⇒ ON CONFLICT 报 42P10，:360）。
+    //
+    // 这是 `kind: test` + 真库依赖，因此**必须与 DSN 同 job 且 HUMAUX_REQUIRE_DB=1**
+    // （ci.yml 已在 job 级设好，见 ADR-0005）：否则三态 skip 会被 cargo 记成 passed，
+    // dod-check 跟着判 Pass——一条空跑的绿。
+    fault: "g32_1_fault_injection_unique_constraint_is_the_final_arbiter",
+    kind: "test",
+    verifier_ref: "test::humaux-adapters::g32_1_exactly_once_enqueue_survives_concurrent_replicas_and_leader_failover",
+}];
+
+/// Phase 4 registrations —— **空 slice 是真值，不是占位**：本轮 2 条 phase 4 的 DoD
+/// 无一通过对抗验证。
+pub const PHASE_4: &[DodVerifier] = &[];
+
+/// Phase 6 registrations —— 同上，10 条无一通过（缺口集中在 §55 量具面与 Envelope 出口层）。
+pub const PHASE_6: &[DodVerifier] = &[];
+
+/// Phase 7 registrations — §69 Retrieval 量具面。
+pub const PHASE_7: &[DodVerifier] = &[DodVerifier {
+    id: "DOD-017",
+    phase: 7,
+    // 判据链：§69 ≡ §55.1（bins/*、evals/* 出现第二处构造点即红）≡ §80.1 G80-2。
+    // 该闸在真仓当前是 not_applicable 并点名了缺失对象（retrieval::build_request 尚未
+    // 交付）——登记它是为了让这条 DoD 的欠账**可见**：dod-check 会照实报出来，而不是
+    // 因为「没登记」被混在 40 条无差别的 fail 里。
+    fault: "g80_2_fails_with_second_construction_site_in_real_evals_dir",
+    kind: "gate",
+    verifier_ref: "architecture-check::§55.1 G80-2 (build_request sole construction point)",
+}];

@@ -189,8 +189,10 @@ fn cross_tenant_rls_hides_other_tenants_placement_rows() {
             let mut worker = match Client::connect(&worker_dsn, NoTls) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!(
-                        "SKIP cross_tenant_rls_hides_other_tenants_placement_rows: role_retrieval_worker connect failed: {e} (§79.2)"
+                    humaux_testkit::skip_or_fail(
+                        "cross_tenant_rls_hides_other_tenants_placement_rows",
+                        &format!("missing object: role_retrieval_worker connection ({e})"),
+                        humaux_testkit::ExternalDep::Postgres,
                     );
                     return;
                 }

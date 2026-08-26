@@ -862,11 +862,37 @@ fn dependency_rule_check(root: &Path) -> Verdict {
 /// Comment lines are skipped for both. Callers filter which `(path, source)` pairs get passed
 /// in — that's where the `contracts` config-read-point and `bins/*`/`xtask/` bootstrap
 /// exemptions live (§78: "No env::var outside config/bootstrap").
+/// 测试控制量的名字前缀。读这些**不是**本闸要管的事。
+///
+/// 本闸的判据是「不许有第二个**生产配置**读取点」（§78.1/§50.1，唯一读取点在
+/// `humaux-contracts`）。`/tests/` 目录的豁免早就写明了这层意思——「读
+/// `HUMAUX_TEST_PG_DSN` 属于三态 DB fixture 模式，不是生产配置」——但那条豁免是按
+/// **目录**给的，于是同一类读取只要挪出 `/tests/` 就会被误报。
+///
+/// 实际撞上了：`crates/testkit/src/lib.rs::skip_or_fail` 是「跳过还是失败」的唯一判定点
+/// （ADR-0005），它读 `HUMAUX_REQUIRE_DB` —— 与 `/tests/` 里那些读取同一类别，却因为住在
+/// `src/` 被判违规。把豁免从「哪个目录」改成「哪一类变量」，判据一点没松：任何名字不带
+/// 这些前缀的读取，无论在哪个文件，照旧算第二个生产配置读取点。
+const TEST_CONTROL_ENV_PREFIXES: [&str; 2] = ["HUMAUX_TEST_", "HUMAUX_REQUIRE_"];
+
+/// 命中处所在行读的是不是测试控制量。
+///
+/// 只看命中行本身：这些读取在本仓一律写成 `env::var("NAME")` 的单行形式（变量名与调用同行）。
+/// 名字由参数传入、跨行拼接的写法**不会**被豁免——那正确，因为那种写法下静态扫描无从判断
+/// 读的到底是什么，宁可误报也不放过。
+fn line_reads_test_control_var(source: &str, idx: usize) -> bool {
+    let line_start = source[..idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = source[line_start..].lines().next().unwrap_or("");
+    TEST_CONTROL_ENV_PREFIXES
+        .iter()
+        .any(|prefix| line.contains(prefix))
+}
+
 pub fn scan_env_var_violations(display_path: &str, source: &str) -> Vec<String> {
     let bytes = source.as_bytes();
     let mut hit_lines: BTreeSet<usize> = BTreeSet::new();
     let mut record = |idx: usize| {
-        if !line_is_comment_at(source, idx) {
+        if !line_is_comment_at(source, idx) && !line_reads_test_control_var(source, idx) {
             hit_lines.insert(source[..idx].matches('\n').count() + 1);
         }
     };
@@ -2998,7 +3024,15 @@ fn provider_plane_architecture_gate_checks(root: &Path) -> Vec<(&'static str, Ve
 }
 /// §80.1 `G80-43` Grounding validity / recheck debt —— 判据 §11.10#G11-2。
 ///
-/// 三条断言，各自钉一个**不同**的失效面（缺一都会让判据变成看起来在跑的空壳）：
+/// **这道闸证明结构，不证明语义。** 说清楚边界，免得有人把它当成 §11.10#G11-2 的全部：
+/// 「version 变了要判 RECHECK_REQUIRED」「resolver error 不能伪装成 Missing」这类**语义**，
+/// 由 `crates/domain/src/grounding.rs` 的夹具 A–H 在运行时证明（spec §11.10 点名的三条注错
+/// 已逐条实测红转绿）。本闸负责的是**那些夹具还在不在、派生点还是不是唯一一处、有没有人
+/// 另开一个可手改的 stale 真源**——静态可扫、运行时测不到的那一面。
+///
+/// 因此 DOD-092 的 verifier 不能只写这道闸：它得同时点名那组夹具。**本闸绿 ≠ 语义成立。**
+///
+/// 四条断言，各自钉一个**不同**的失效面（缺一都会让判据变成看起来在跑的空壳）：
 ///
 /// 1. **八条固定夹具 A–H 逐名在场**（§11.10#G11-2 逐条列了它们）。夹具被删掉时判据会静默
 ///    变弱——测试数量下降没人看得见，而 `cargo test` 照样全绿。
@@ -3032,6 +3066,12 @@ pub fn g80_43_grounding_validity(root: &Path) -> Verdict {
     /// 反过来，**读** stale 做判断不是 DOD-092 禁的事（`fn is_stale(&self) -> bool` 不含
     /// `stale: bool`，天然不命中），所以这里不会误报合法读路径——见
     /// `g80_43_reading_a_stale_field_is_not_a_violation`。
+    /// 派生点被掏空的形态。**这条是被对抗审查打出来的**：先前三条断言只看
+    /// `pub fn derive_grounding_state(` 在不在，于是函数体写成 `{ todo!() }` 照样判 Pass
+    /// ——闸绿着，而 spec §11.10 点名的注错（删掉 version compare）它一点都感觉不到。
+    /// 这里不去匹配「比较逻辑长什么样」（那是脆的，改个写法就瞎），只钉一件无歧义的事：
+    /// **唯一派生点不能是桩**。
+    const STUB_BODIES: [&str; 2] = ["todo!()", "unimplemented!()"];
     const HAND_SET_STALE_SHAPES: [&str; 5] = [
         "stale: bool",
         "stale = true",
@@ -3067,7 +3107,21 @@ pub fn g80_43_grounding_validity(root: &Path) -> Verdict {
         ));
     }
 
-    // 3. DOD-092：全 workspace 不得出现手改 stale 的写法。
+    // 3. 派生点不是桩（见 STUB_BODIES 的 doc：这是补上来的第四个失效面）。
+    if let Some(at) = home_src.find("pub fn derive_grounding_state(") {
+        // 只看这个函数往后的一小段，免得把文件别处的 todo!() 算到它头上。
+        let body = &home_src[at..(at + 600).min(home_src.len())];
+        for stub in STUB_BODIES {
+            if body.contains(stub) {
+                strays.push(format!(
+                    "{HOME}: 唯一派生点 `derive_grounding_state` 的函数体是桩（含 `{stub}`）\
+                     ——结构在场但语义空缺，§11.10#G11-2 的四态派生无从谈起"
+                ));
+            }
+        }
+    }
+
+    // 4. DOD-092：全 workspace 不得出现手改 stale 的写法。
     for (path, source) in read_files(&walk_files(root, &["rs"])) {
         let disp = display(root, &path);
         if disp.ends_with(SELF_FILE) {
@@ -3663,18 +3717,32 @@ mod tests {
     // ---- G80-43 (§11.10#G11-2) 注错族：fixture 树，不在真仓上变异 ----
 
     /// 最小合规 fixture：一个 `grounding.rs`，八条夹具齐、派生点恰一处、无手改 stale。
-    fn grounding_fixture(dir: &Path, fixtures: &[&str], derive_sites: usize) {
+    /// `stub = true` 时派生点写成 `todo!()`——那是 G80-43 第 3 条断言要抓的形态，
+    /// 不是合规 fixture 的默认长相（先前默认就是 todo!()，导致「闸对桩无感」这个洞
+    /// 被自己的绿色测试盖住了，由对抗审查打出来）。
+    fn grounding_fixture_inner(dir: &Path, fixtures: &[&str], derive_sites: usize, stub: bool) {
         fs::create_dir_all(dir).unwrap();
+        let body = if stub {
+            "{ todo!() }"
+        } else {
+            // 最小但**不是桩**的真函数体：形状够真，判据只看「不是 todo!()/unimplemented!()」。
+            "{ let _ = i; GroundingState(GroundingStateKind::Current) }"
+        };
         let mut src = String::new();
         for _ in 0..derive_sites {
-            src.push_str(
-                "pub fn derive_grounding_state(i: GroundingInputs<'_>) -> GroundingState { todo!() }\n",
-            );
+            src.push_str(&format!(
+                "pub fn derive_grounding_state(i: GroundingInputs<'_>) -> GroundingState {body}\n"
+            ));
         }
         for f in fixtures {
             src.push_str(&format!("#[test]\nfn {f}() {{}}\n"));
         }
         fs::write(dir.join("grounding.rs"), src).unwrap();
+    }
+
+    /// 合规 fixture（非桩）。
+    fn grounding_fixture(dir: &Path, fixtures: &[&str], derive_sites: usize) {
+        grounding_fixture_inner(dir, fixtures, derive_sites, false);
     }
 
     const ALL_EIGHT: [&str; 8] = [
@@ -3742,7 +3810,27 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// 注错 ④：DOD-092 —— 别处冒出一个可手改的 stale 真源 → 红并点名文件。
+    /// 注错 ④：派生点**在场但是桩** → 红。
+    ///
+    /// 这条是对抗审查的产物：先前三条断言只看 `pub fn derive_grounding_state(` 在不在，
+    /// 于是 `{ todo!() }` 也判 Pass——闸绿着，而 spec §11.10 点名的注错（删掉 version
+    /// compare）它一点感觉都没有。审查员正是拿本 fixture 当时的绿色证明了这个洞。
+    #[test]
+    fn g80_43_red_when_derivation_point_is_a_stub() {
+        let tmp = fresh_tmp("g80-43-red-stub");
+        grounding_fixture_inner(&tmp.join("crates/domain/src"), &ALL_EIGHT, 1, true);
+        match g80_43_grounding_validity(&tmp) {
+            Verdict::Fail(v) => assert!(
+                v.iter()
+                    .any(|m| m.contains("是桩") && m.contains("derive_grounding_state")),
+                "必须点名「派生点是桩」，而不是含糊报错: {v:?}"
+            ),
+            other => panic!("桩化的派生点必须红，实得 {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 ⑤：DOD-092 —— 别处冒出一个可手改的 stale 真源 → 红并点名文件。
     #[test]
     fn g80_43_red_on_hand_settable_stale_flag() {
         let tmp = fresh_tmp("g80-43-red-stale");
@@ -4095,6 +4183,32 @@ mod tests {
 
     /// §78 boundary lint: `xtask/` is bootstrap/CI-gate tooling, exempt like `bins/*` — a real
     /// call there (mirroring `contract_impact.rs`'s own `std::env::var("CI")`) must stay green.
+    /// 豁免必须是**窄**的：同一个文件里读一个不带测试前缀的变量，照旧算违规。
+    /// 没有这条，`TEST_CONTROL_ENV_PREFIXES` 就等于把 env 扫描整体关掉了。
+    #[test]
+    fn env_var_scan_test_control_exemption_does_not_cover_production_config() {
+        let src = "pub fn a() { let _ = std::env::var(\"HUMAUX_REQUIRE_DB\"); }\n\
+                   pub fn b() { let _ = std::env::var(\"DATABASE_URL\"); }\n";
+        let hits = scan_env_var_violations("crates/testkit/src/lib.rs", src);
+        assert_eq!(
+            hits.len(),
+            1,
+            "只有第 2 行（DATABASE_URL，生产配置）该被抓；第 1 行是测试控制量: {hits:?}"
+        );
+        assert!(hits[0].ends_with(":2"), "抓错行了: {hits:?}");
+    }
+
+    /// 反向：名字由变量传入、静态看不出读的是什么 —— 不豁免（宁可误报也不放过）。
+    #[test]
+    fn env_var_scan_does_not_exempt_a_dynamically_named_read() {
+        let src = "pub fn a(name: &str) { let _ = std::env::var(name); }\n";
+        assert_eq!(
+            scan_env_var_violations("crates/testkit/src/lib.rs", src).len(),
+            1,
+            "名字看不见时不得豁免"
+        );
+    }
+
     #[test]
     fn env_var_scan_exempts_xtask_dir() {
         let tmp = fresh_tmp("envvar-exempt-xtask");

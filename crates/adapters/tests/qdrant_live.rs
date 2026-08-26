@@ -28,6 +28,7 @@ use humaux_infra_cell::{
     authorize_cell_access,
 };
 use humaux_projection::card::EgressDisposition;
+use humaux_testkit::{ExternalDep, skip_or_fail};
 use sqlx::types::time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -70,8 +71,11 @@ fn registry(cell: CellId, caller: CallerId) -> IntraCellResourceRegistry {
 #[tokio::test]
 async fn upsert_then_search_visible_round_trips_over_real_qdrant() {
     if !qdrant_reachable() {
-        println!(
-            "SKIP (not_applicable): Qdrant unreachable at {QDRANT_ADDR} — missing object: live Qdrant server"
+        // 唯一判定点，见 `testkit::skip_or_fail` 的 doc。
+        skip_or_fail(
+            "upsert_then_search_visible_round_trips_over_real_qdrant",
+            &format!("missing object: live Qdrant server at {QDRANT_ADDR}"),
+            ExternalDep::Qdrant,
         );
         return;
     }

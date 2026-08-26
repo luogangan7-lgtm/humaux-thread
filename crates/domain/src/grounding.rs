@@ -295,9 +295,14 @@ mod tests {
     //! §11.10#G11-2 / G80-43 的八条固定夹具 A–H。
     //!
     //! 夹具 G（`RECHECK_REQUIRED` 的 ProjectConstraint 不得进入 Mandatory behavior context）
-    //! 的被测对象是 §25 Mandatory Context Lane，那是 Phase 8 交付、当前仓里
-    //! `domain::context` 还是占位模块——按 §57.1 第2条走 `not_applicable` 并**打印缺失对象
-    //! 名**，不静默跳过、更不假装通过。见本模块末尾 `fixture_g_*`。
+    //! 的被测对象是 §25 Mandatory Context Lane，而 `domain::context` 目前还是占位模块——按
+    //! §57.1 第2条走 `not_applicable` 并**打印缺失对象名**，不静默跳过、更不假装通过。
+    //! 见本模块末尾 `fixture_g_*`。
+    //!
+    //! 相位口径要分清（先前这里写混过）：§25 那条 lane 本身是 **DOD-020，phase=7**——
+    //! 也就是说它已经欠账了，不是「还没到时候」；而本夹具要断言的那一条（Mandatory/Pinned
+    //! 不得静默消费非 CURRENT 的 Memory、须 fail-loud + `needs_verification[]`）是
+    //! **DOD-093，phase=8**。lane 在 7 建出来，grounding 这一层的准入判定在 8 补。
 
     use super::*;
     use crate::evidence::payload_sha256;
@@ -417,9 +422,9 @@ mod tests {
         assert!(state.revokes_current_truth_assumption());
         eprintln!(
             "NOT_APPLICABLE fixture_g_recheck_required_must_not_enter_mandatory_context: \
-             missing object: §25 Mandatory Context Lane 准入判定（`domain::context` 仍是占位\
-             模块，DOD-093 phase=8 尚未交付）——本条待 Phase 8 补全 fail-loud + \
-             needs_verification[] 断言"
+             missing object: §25 Mandatory Context Lane（`domain::context` 仍是占位模块；\
+             lane 本身是 DOD-020 phase=7，**已欠账**）——本条要断言的 fail-loud + \
+             needs_verification[] 属 DOD-093 phase=8，待 lane 建成后补全"
         );
     }
 

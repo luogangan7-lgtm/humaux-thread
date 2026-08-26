@@ -59,6 +59,7 @@ use humaux_projection::stream::StreamKey;
 use humaux_retrieval::completeness::ledger::{self, LedgerReads};
 use humaux_retrieval::envelope::build_projection_block;
 use humaux_telemetry::degrade::DegradeCode;
+use humaux_testkit::{ExternalDep, skip_or_fail};
 use postgres::{Client, NoTls};
 use sqlx::types::time::OffsetDateTime;
 use uuid::Uuid;
@@ -82,22 +83,33 @@ fn qdrant_reachable() -> bool {
 /// Combined three-state skip (§57.1/§79.2): both a live Postgres and a live Qdrant are
 /// required. Returns `None` (and has already printed why) when either is missing.
 fn skip_unless_both_reachable(test_name: &str) -> Option<(String, Client)> {
+    // 跳过与失败的分界不在这里做——`testkit::skip_or_fail` 是全 workspace 唯一判定点
+    // （见它的 doc：散落的手写跳过没法统一声明，CI 里 99 个测试就是这样静默跳过的）。
+    // 两个依赖各报各的声明变量：只起了 Postgres 的环境不该被 Qdrant 的缺席拖红。
     let Ok(dsn) = std::env::var("HUMAUX_TEST_PG_DSN") else {
-        eprintln!("SKIP {test_name}: HUMAUX_TEST_PG_DSN not set — missing object: Postgres DSN");
+        skip_or_fail(
+            test_name,
+            "missing object: Postgres DSN (HUMAUX_TEST_PG_DSN not set)",
+            ExternalDep::Postgres,
+        );
         return None;
     };
     let admin = match Client::connect(&dsn, NoTls) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "SKIP {test_name}: Postgres connect failed ({e}) — missing object: live Postgres"
+            skip_or_fail(
+                test_name,
+                &format!("missing object: live Postgres (connect failed: {e})"),
+                ExternalDep::Postgres,
             );
             return None;
         }
     };
     if !qdrant_reachable() {
-        eprintln!(
-            "SKIP {test_name}: Qdrant unreachable at {QDRANT_ADDR} — missing object: live Qdrant server"
+        skip_or_fail(
+            test_name,
+            &format!("missing object: live Qdrant server at {QDRANT_ADDR}"),
+            ExternalDep::Qdrant,
         );
         return None;
     }

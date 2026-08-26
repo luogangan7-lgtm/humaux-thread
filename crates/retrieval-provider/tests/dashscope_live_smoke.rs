@@ -149,7 +149,13 @@ fn dashscope_live_smoke() {
     // while the production path treats it as absent (`read_env_var` filters empty), which used
     // to send this test into state 3 with a message that claimed state 1's condition.
     if humaux_contracts::config_registry::read_env_var("DASHSCOPE_API_KEY").is_none() {
-        println!("SKIP dashscope_live_smoke: missing object: DASHSCOPE_API_KEY");
+        // 唯一判定点。`HUMAUX_REQUIRE_DASHSCOPE=1` 把这条从「静默跳过」变成「必须真打出去」——
+        // 本会话就吃过亏：live smoke 到底跑没跑过，只能靠人翻输出确认。
+        humaux_testkit::skip_or_fail(
+            "dashscope_live_smoke",
+            "missing object: DASHSCOPE_API_KEY",
+            humaux_testkit::ExternalDep::DashScope,
+        );
         return;
     }
 

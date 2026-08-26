@@ -5,6 +5,14 @@ name: CI
 #   rule 3: 依赖运行时基础设施的项（retrieval benchmark / mutation tests /
 #           deploy smoke / container scan）Phase 0 无被测对象，输出
 #           not_applicable —— 不注释掉、不假绿。
+#
+# §79.2「跳过不等于通过」——这一条本 workflow 曾经违反过，实测：此前没有任何
+# services 段，于是全 workspace **99 个**依赖真库的测试（RLS / SKIP LOCKED 并发 /
+# fencing token / outbox 原子性 / 跨租户隔离 / read-your-writes）每次都走可见 SKIP
+# 分支，而 `cargo test --workspace` 一路绿灯 —— 绿得毫无信息量。
+# 下面的 services 段补上被测对象；`HUMAUX_REQUIRE_DB` / `HUMAUX_REQUIRE_QDRANT`
+# 则是防复发的那一半：**声明**了有依赖之后，任何一次跳过都是环境故障、当场变红。
+# 删掉 services 段的那次提交会立刻红，而不是三个月后有人发现 RLS 从没被测过。
 
 on:
   pull_request:
@@ -16,6 +24,38 @@ jobs:
   ci:
     name: fmt + check + clippy + test + gates
     runs-on: ubuntu-latest
+
+    # 被测对象。版本与本机开发环境逐一对齐（postgres:18 / qdrant v1.19.0）——
+    # 版本漂移会让 CI 证明的东西和开发机证明的东西不是同一个。
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: ci
+        ports:
+          - 5432:5432
+        # 没有 health check 的话，migrate 会在库还没起来时抢跑，红得莫名其妙。
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      qdrant:
+        image: qdrant/qdrant:v1.19.0
+        ports:
+          - 6333:6333
+          - 6334:6334
+
+    env:
+      # 8 个 DB 角色由 migrations/0011_roles_and_grants.sql 自建（CREATE ROLE
+      # IF-NOT-EXISTS 块），所以全新集群只需 migrate，无需预置角色。
+      # 已在真·全新 postgres:18 集群实测：68 迁移干净应用 + rls-check 8/8 pass。
+      HUMAUX_TEST_PG_DSN: postgres://postgres:ci@127.0.0.1:5432/postgres
+      DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres
+      # 声明「本次运行有这两个依赖」⇒ 此后任何跳过都是环境故障（见头部注释）。
+      HUMAUX_REQUIRE_DB: "1"
+      HUMAUX_REQUIRE_QDRANT: "1"
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,6 +80,11 @@ jobs:
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # 必须在 cargo test 之前：没有 schema 的话，上面声明的 HUMAUX_REQUIRE_DB
+      # 会让每一条 DB 测试都因为「表不存在」而红。
+      - name: apply migrations (§46)
+        run: cargo xtask migrate
+
       - name: cargo test
         run: cargo test --workspace
 
@@ -57,6 +102,46 @@ jobs:
 
       - name: cargo xtask migration-rehearsal
         run: cargo xtask migration-rehearsal
+
+      # 以下六道此前一道都没接进 CI —— 它们本地全绿，但「本地绿」不是判据，
+      # 没在 CI 跑过的闸等于没有人在看。rls-check 需要真库，上面的 services 已提供。
+      - name: cargo xtask metrics-registry
+        run: cargo xtask metrics-registry
+
+      - name: cargo xtask gate-registry
+        run: cargo xtask gate-registry
+
+      - name: cargo xtask threshold-shape
+        run: cargo xtask threshold-shape
+
+      - name: cargo xtask direction-table
+        run: cargo xtask direction-table
+
+      - name: cargo xtask card-version
+        run: cargo xtask card-version
+
+      - name: cargo xtask rls-check
+        run: cargo xtask rls-check
+
+      # ---------------------------------------------------------------------
+      # 还没接进来的两道，以及为什么 —— 写在这里是为了留痕，不是为了免责。
+      #
+      #   cargo xtask dod-check --phase <当前相位>
+      #   cargo xtask benchset-declaration --phase <当前相位>
+      #
+      # 两道都**带相位参数且默认 0**。默认值下它们豁免一切（0 相位没有任何条目到期），
+      # 所以即便接进来也证明不了什么；按真实相位跑则当前是红的：
+      #   · dod-check --phase 7  → 9 pass / 40 fail / 50 na，40 条全是
+      #     「no verifier registered」——§69 要求的 DoD→verifier→注错三段绑定，
+      #     94 条里只登记了 5 条（crates/testkit/src/dod.rs 模块注释自陈「Phase 0 only」）。
+      #   · benchset-declaration --phase 7 → 4 个集合 owning phase 已到期仍 NOT_DECLARED
+      #     （continuation_198_v2 / longmemeval_style / exact_completeness /
+      #     memory_security_lifecycle），缺的是**实测**数据，不能估。
+      #
+      # 接的前提是先把缺口补上，而不是把相位调低到让它们变绿——那正是 §80.1.2
+      # 批评已退休 G80-21 时说的「调松定义」。补完这两块即在此处接上，并把相位值
+      # 从一处真源读取而不是写死在这个文件里。
+      # ---------------------------------------------------------------------
 
       - name: cargo-deny check (§78.5)
         uses: EmbarkStudios/cargo-deny-action@v2

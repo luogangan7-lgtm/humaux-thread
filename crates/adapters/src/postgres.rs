@@ -336,9 +336,13 @@ mod tests {
                         })
                         .get(0);
                     if !exists {
-                        eprintln!(
-                            "SKIP role_match_succeeds_once_role_exists[{role}]: role not present in \
-                         pg_roles — roles.sql not applied to this DB yet (§79.2 — 跳过不等于通过)"
+                        humaux_testkit::skip_or_fail(
+                            &format!("role_match_succeeds_once_role_exists[{role}]"),
+                            &format!(
+                                "missing object: role {role} not present in pg_roles \
+                                 (roles.sql not applied to this DB yet)"
+                            ),
+                            humaux_testkit::ExternalDep::Postgres,
                         );
                         continue;
                     }
@@ -377,9 +381,13 @@ mod tests {
                 .unwrap_or_else(|e| panic!("pg_roles existence query failed for {role:?}: {e}"))
                 .get(0);
             if !exists {
-                eprintln!(
-                    "SKIP {test_name}: role {role:?} not present in pg_roles — roles.sql not \
-                     applied to this DB yet (§79.2 — 跳过不等于通过)"
+                humaux_testkit::skip_or_fail(
+                    test_name,
+                    &format!(
+                        "missing object: role {role:?} not present in pg_roles \
+                         (roles.sql not applied to this DB yet)"
+                    ),
+                    humaux_testkit::ExternalDep::Postgres,
                 );
                 return None;
             }
@@ -390,9 +398,13 @@ mod tests {
                 .unwrap_or_else(|e| panic!("to_regclass query failed for {table:?}: {e}"))
                 .get(0);
             if !exists {
-                eprintln!(
-                    "SKIP {test_name}: table {table:?} does not exist — §48 DDL not applied to \
-                     this DB yet (§79.2 — 跳过不等于通过)"
+                humaux_testkit::skip_or_fail(
+                    test_name,
+                    &format!(
+                        "missing object: table {table:?} does not exist \
+                         (§48 DDL not applied to this DB yet)"
+                    ),
+                    humaux_testkit::ExternalDep::Postgres,
                 );
                 return None;
             }

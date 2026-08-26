@@ -266,7 +266,21 @@ fn parse_registry(text: &str) -> Vec<RegistryEntry> {
     };
     while let Some(start) = rest.find(OPEN) {
         let after = &rest[start + OPEN.len()..];
-        let end = after.find("},").unwrap_or(after.len());
+        // 字面量的收尾：**一行里第一个非空白字符是 `}`**。
+        //
+        // 先前这里找的是字面串 `"},"`，而 `cargo fmt` 会把单元素数组收成 `}];`——找不到
+        // 就 `unwrap_or(after.len())` 把文件剩余部分整个当成一个 block，后面条目的字段
+        // 逐个覆盖前面的，**前一条直接消失**。实测撞上过：登记 DOD-090 之后 dod-check
+        // 仍报「no verifier registered」，而同文件更靠后的 DOD-017 却被认了出来。
+        // 按行首判定对 `},` / `}];` / `}` 三种收尾都成立，不依赖 rustfmt 当天的心情。
+        let end = after
+            .match_indices('\n')
+            .find_map(|(nl, _)| {
+                let line_start = nl + 1;
+                let line = after[line_start..].lines().next().unwrap_or("");
+                line.trim_start().starts_with('}').then_some(line_start)
+            })
+            .unwrap_or(after.len());
         let block = &after[..end];
 
         let mut id = None;
@@ -1004,12 +1018,76 @@ mod tests {
     // -- registry parsing / rule3 / rule6 ---------------------------------------------------
 
     #[test]
-    fn parse_registry_reads_real_phase0_file() {
+    /// 注错：`cargo fmt` 把单元素数组收成 `}];` 时，解析器**不得**把后续条目吞进同一个
+    /// block。先前那版找字面串 `"},"`，在这个形状下会让前一条条目整个消失。
+    #[test]
+    fn parse_registry_handles_single_element_array_closing_brace() {
+        let text = "pub const A: &[DodVerifier] = &[DodVerifier {\n\
+                    \x20   id: \"DOD-900\",\n\
+                    \x20   phase: 3,\n\
+                    \x20   fault: \"f900\",\n\
+                    \x20   kind: \"test\",\n\
+                    \x20   verifier_ref: \"r900\",\n\
+                    }];\n\
+                    pub const B: &[DodVerifier] = &[DodVerifier {\n\
+                    \x20   id: \"DOD-901\",\n\
+                    \x20   phase: 7,\n\
+                    \x20   fault: \"f901\",\n\
+                    \x20   kind: \"gate\",\n\
+                    \x20   verifier_ref: \"r901\",\n\
+                    }];\n";
+        let got = parse_registry(text);
+        let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["DOD-900", "DOD-901"],
+            "两条都要在——前一条被后一条覆盖掉正是那个 bug 的症状"
+        );
+        assert_eq!(got[0].fault, "f900", "字段串了：{got:?}");
+        assert_eq!(got[1].verifier_ref, "r901", "字段串了：{got:?}");
+    }
+
+    /// 正对照：传统的 `},` 收尾照旧要认。
+    #[test]
+    fn parse_registry_still_handles_comma_terminated_entries() {
+        let text = "pub const A: &[DodVerifier] = &[\n\
+                    \x20   DodVerifier {\n\
+                    \x20       id: \"DOD-902\",\n\
+                    \x20       phase: 4,\n\
+                    \x20       fault: \"f902\",\n\
+                    \x20       kind: \"test\",\n\
+                    \x20       verifier_ref: \"r902\",\n\
+                    \x20   },\n\
+                    ];\n";
+        let got = parse_registry(text);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "DOD-902");
+    }
+
+    #[test]
+    fn parse_registry_reads_the_real_file() {
         let entries = parse_registry(&real_registry());
-        assert_eq!(entries.len(), 5, "{entries:#?}");
-        for id in ["DOD-001", "DOD-002", "DOD-003", "DOD-004", "DOD-005"] {
-            assert!(entries.iter().any(|e| e.id == id), "missing {id}");
+        // 逐条点名而不是钉总数：总数会随每次登记新 DoD 变动，把它写死等于每加一条就要
+        // 回来改一次测试，改着改着就会有人顺手把断言调松。这里只要求「这些必须在」，
+        // 新增条目不影响本条。
+        for id in [
+            "DOD-001", "DOD-002", "DOD-003", "DOD-004", "DOD-005", // Phase 0
+            "DOD-090", // Phase 3
+            "DOD-017", // Phase 7
+        ] {
+            assert!(
+                entries.iter().any(|e| e.id == id),
+                "missing {id}: {entries:#?}"
+            );
         }
+        // 但「解析器活着」还是要有个正哨兵：真文件里一条都读不出来时上面的循环会红，
+        // 这条防的是另一种失明——重复 id（同一条被登记两次，check_dod_ids 的
+        // 「exactly one」判据会因此报错，但那要到更后面才发现）。
+        let mut ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "registry 里有重复 id: {entries:#?}");
     }
 
     fn one_checkbox(id: &str, phase: u32) -> Vec<CheckboxEntry> {

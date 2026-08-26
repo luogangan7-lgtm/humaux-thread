@@ -66,9 +66,85 @@ where
             body(handle);
         }
         Err(reason) => {
-            eprintln!("SKIP {test_name}: {reason} (§79.2 — 跳过不等于通过)");
+            // 判定不在这里做——见 [`skip_or_fail`]：跳过与失败的分界全 workspace 只有一处。
+            skip_or_fail(test_name, &reason.to_string(), ExternalDep::Postgres);
         }
     }
+}
+
+/// 测试可以声明「本次运行确实有」的外部依赖。**闭集**，不是字符串。
+///
+/// 早先这里把变量名当 `&str` 参数收，被 §78 的 env 扫描闸当场抓住——不是实现细节，是
+/// stringly-typed 的设计缺陷（仓库硬边界原文：禁止 stringly-typed）。闭集之后：新增一个可
+/// 声明依赖必须在这里加变体，编译器会逼所有 `match` 跟着改；读取点也各自持有字面量，静态
+/// 扫描看得见读的是什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalDep {
+    /// 真 PostgreSQL（§79.2 说的「只有真库能证明」的那一类：RLS / SKIP LOCKED 并发 /
+    /// fencing token / outbox 原子性 / 跨租户隔离 / read-your-writes）。
+    Postgres,
+    /// 真 Qdrant（向量投影契约往返）。
+    Qdrant,
+    /// 真 DashScope 出境（live egress 冒烟）。
+    DashScope,
+}
+
+impl ExternalDep {
+    /// 本次运行是否**声明**了自己有这个依赖。
+    ///
+    /// 每个分支读各自的字面量而不是收一个名字参数：读取点看得见读的是什么，静态扫描才判得
+    /// 出这是测试控制量而非生产配置（见 xtask 的 `TEST_CONTROL_ENV_PREFIXES`）。
+    #[must_use]
+    pub fn declared(self) -> bool {
+        let raw = match self {
+            Self::Postgres => std::env::var("HUMAUX_REQUIRE_DB"),
+            Self::Qdrant => std::env::var("HUMAUX_REQUIRE_QDRANT"),
+            Self::DashScope => std::env::var("HUMAUX_REQUIRE_DASHSCOPE"),
+        };
+        raw.is_ok_and(|v| v == "1")
+    }
+
+    /// 报错时告诉人该设哪个变量。
+    #[must_use]
+    pub const fn env_var(self) -> &'static str {
+        match self {
+            Self::Postgres => "HUMAUX_REQUIRE_DB",
+            Self::Qdrant => "HUMAUX_REQUIRE_QDRANT",
+            Self::DashScope => "HUMAUX_REQUIRE_DASHSCOPE",
+        }
+    }
+}
+
+/// **「跳过还是失败」的唯一判定点。** 任何因为外部被测对象缺席而要跳过的测试都走这里，
+/// 不要各自手写 `eprintln!("SKIP …"); return;`——散落的跳过点没法统一声明，也就没法统一兜底。
+///
+/// 语义：`dep` 被声明存在时，缺席即 **panic**；否则打印可见 SKIP 后正常返回（调用方随后
+/// `return`）。
+///
+/// **为什么需要这个开关**：SKIP 分支本身是对的（本机没起依赖时不该红），但它有一个致命的
+/// 副作用——**没有被测对象时它长得和通过一模一样**。CI 实测过这个后果：`ci.yml` 从来没有
+/// 配过 Postgres service，于是全 workspace **99 个**依赖真库的测试（RLS、SKIP LOCKED 并发、
+/// fencing token、outbox 原子性、跨租户隔离、read-your-writes）每次都走 SKIP 分支，而
+/// `cargo test --workspace` 一路绿灯。§79.2 说「跳过不等于通过」，CI 却正好把跳过当成了通过。
+///
+/// 光在 `ci.yml` 里补 service 治不了根：哪天有人删掉那段 YAML，CI 会**悄悄**退回静默跳过，
+/// 没有任何东西会红。所以由**声明**兜底：CI 声明「本次运行有真库」，此后任何一个 fixture
+/// 拿不到连接都是环境故障，必须响。删 service 的那次提交当场变红，而不是三个月后有人发现
+/// RLS 从来没被测过。
+///
+/// 每个外部依赖各自声明（见 [`ExternalDep`]）：它们是独立服务，合成一个开关会让「只起了
+/// Postgres」的环境被迫在 Qdrant 测试上变红。
+///
+/// 本机开发不设这些变量，行为与从前逐字相同。
+pub fn skip_or_fail(test_name: &str, missing_object: &str, dep: ExternalDep) {
+    if dep.declared() {
+        let var = dep.env_var();
+        panic!(
+            "{test_name}: {var} is set, so a skip here is a failure — {missing_object}\n\
+             声明了「本次运行有这个依赖」却拿不到它：这是环境坏了，不是这条测试不适用。"
+        );
+    }
+    eprintln!("SKIP {test_name}: {missing_object} (§79.2 — 跳过不等于通过)");
 }
 
 /// §79.3 cross-tenant 安全测试中的一个租户身份：租户 id、actor id、凭证
@@ -172,13 +248,32 @@ mod tests {
     }
 
     #[test]
-    fn run_db_fixture_skips_without_running_body_on_unreachable_db() {
-        // §79.2: 不可达时必须跳过而不是把 body 当成通过——body 根本不能跑。
-        let mut ran = false;
-        run_db_fixture::<AlwaysSkip, _>("smoke", |_handle| {
-            ran = true;
-        });
-        assert!(!ran, "body must not run when the DB fixture is unreachable");
+    fn run_db_fixture_never_runs_the_body_on_an_unreachable_db() {
+        // §79.2 的不变量在**两种模式下都成立**，本条断言的就是这个交集：
+        // 依赖不可达时 body 一行都不许跑。
+        //
+        // 两种模式的区别只在「之后怎么办」：未声明 ⇒ 打印可见 SKIP 后正常返回；
+        // 已声明（CI 就是这个模式，见 ADR-0005）⇒ panic。本条不去操作环境变量来
+        // 挑模式——env 是进程全局的，`cargo test` 并行跑时改它会污染同进程里的
+        // 其它测试，那种测试自己就是不确定性的来源。改为：无论当前哪种模式，
+        // 都断言 body 没跑；顺带断言 panic 与否恰好等于「有没有声明」。
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_db_fixture::<AlwaysSkip, _>("smoke", |_handle| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        }));
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "body must not run when the DB fixture is unreachable"
+        );
+        assert_eq!(
+            outcome.is_err(),
+            ExternalDep::Postgres.declared(),
+            "panic 与否必须恰好等于「本次运行有没有声明它有真库」——\
+             声明了却拿不到是环境故障；没声明则是这条测试不适用"
+        );
     }
 
     #[test]
