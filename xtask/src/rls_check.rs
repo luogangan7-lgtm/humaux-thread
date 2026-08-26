@@ -417,6 +417,34 @@ const MATRIX: &[Cell] = &[
         "role_maintenance",
         ["SELECT"]
     ),
+    // ops.deletion_plan_steps (T4.8 follow-up, migrations/0056): named-table override
+    // closing a §6.2.1 domain-default over-grant a review found — the four runtime roles
+    // held INSERT/UPDATE via the `ops` schema's domain default (meant for ops.jobs/
+    // ops.outbox's own named cells below), letting role_gateway forge a completed purge
+    // step (§41.2) for any deletion_request_id in its own tenant. Writes go through
+    // `ops.record_deletion_plan_step` (0054/0055, SECURITY DEFINER, owned by
+    // role_migration_owner) — no caller-side table grant is needed for that path.
+    // role_consolidation_worker/role_maintenance keep exactly their pre-existing
+    // domain-default SELECT (reaffirmed explicitly, not silently dropped, now that this
+    // table is named); role_maintenance additionally holds a direct INSERT (0056).
+    cell!("ops.deletion_plan_steps", "role_gateway", ["SELECT"]),
+    cell!("ops.deletion_plan_steps", "role_private_worker", ["SELECT"]),
+    cell!(
+        "ops.deletion_plan_steps",
+        "role_consolidation_worker",
+        ["SELECT"]
+    ),
+    cell!("ops.deletion_plan_steps", "role_public_worker", ["SELECT"]),
+    cell!(
+        "ops.deletion_plan_steps",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.deletion_plan_steps",
+        "role_maintenance",
+        ["SELECT", "INSERT"]
+    ),
 ];
 
 /// The §6.2.2 column set — "T" in the §48.2 "表集合派生" check's `S \ T == ∅`. Single

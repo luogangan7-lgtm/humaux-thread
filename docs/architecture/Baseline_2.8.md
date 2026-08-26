@@ -1087,16 +1087,16 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
 
 单元格里带括号的是 PostgreSQL column-level GRANT（比对 `information_schema.column_privileges`），不带括号的是表级（比对 `role_table_grants`）。
 
-| role | `private.ingest_tickets` | `private.events` | `projection.stream_log` | `projection.stream_checkpoints` | `ops.outbox` | `ops.jobs` | `control.quota_windows` | `private.evidence_objects` | `private.memory_records` | `private.memory_evidence` | `private.memory_consolidation_runs` | `private.memory_consolidation_inputs` | `private.memory_rollups` | `private.memory_rollup_sources` |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `role_gateway` | SELECT, UPDATE | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT(PK 六列), UPDATE(issued_highwater) | INSERT | SELECT, INSERT, UPDATE | SELECT, UPDATE(reserved, consumed) | SELECT, INSERT | SELECT, INSERT, UPDATE(status,superseded_by) | SELECT, INSERT | — | — | SELECT | SELECT |
-| `role_private_worker` | SELECT | SELECT | SELECT, UPDATE(state,error_class) | SELECT | SELECT, UPDATE | SELECT, INSERT, UPDATE | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | — | — | — | — |
-| `role_consolidation_worker` | — | — | — | — | — | SELECT, UPDATE(status,lease_owner,lease_expires_at) | — | SELECT | SELECT | SELECT | SELECT, INSERT, UPDATE(status,input_snapshot_seq,manifest_hash,output_digest,finished_at,error_class) | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT |
-| `role_public_worker` | — | — | — | — | SELECT, UPDATE | SELECT, INSERT, UPDATE | — | — | — | — | — | — | — | — |
-| `role_retrieval_worker` | — | — | SELECT, UPDATE | SELECT, UPDATE(evidence_highwater, knowledge_highwater, projection_highwater) | SELECT, UPDATE | SELECT, INSERT, UPDATE | — | SELECT | SELECT | SELECT | — | — | SELECT | SELECT |
-| `role_batch_issuer` | **INSERT, SELECT** | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| `role_maintenance` | SELECT, UPDATE（仅 `ISSUED → EXPIRED` 巡检，§15.6） | SELECT | SELECT, UPDATE（仅 `ISSUED → LOST` 巡检 §15.2 与 `retention::tombstone` 的 `* → TOMBSTONED` §37.2） | SELECT, UPDATE(serving, shadow) | SELECT | SELECT, UPDATE(status, lease_owner, lease_expires_at) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT |
-| `role_migration_owner` | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner |
+| role | `private.ingest_tickets` | `private.events` | `projection.stream_log` | `projection.stream_checkpoints` | `ops.outbox` | `ops.jobs` | `control.quota_windows` | `private.evidence_objects` | `private.memory_records` | `private.memory_evidence` | `private.memory_consolidation_runs` | `private.memory_consolidation_inputs` | `private.memory_rollups` | `private.memory_rollup_sources` | `ops.deletion_plan_steps` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `role_gateway` | SELECT, UPDATE | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT(PK 六列), UPDATE(issued_highwater) | INSERT | SELECT, INSERT, UPDATE | SELECT, UPDATE(reserved, consumed) | SELECT, INSERT | SELECT, INSERT, UPDATE(status,superseded_by) | SELECT, INSERT | — | — | SELECT | SELECT | SELECT |
+| `role_private_worker` | SELECT | SELECT | SELECT, UPDATE(state,error_class) | SELECT | SELECT, UPDATE | SELECT, INSERT, UPDATE | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | — | — | — | — | SELECT |
+| `role_consolidation_worker` | — | — | — | — | — | SELECT, UPDATE(status,lease_owner,lease_expires_at) | — | SELECT | SELECT | SELECT | SELECT, INSERT, UPDATE(status,input_snapshot_seq,manifest_hash,output_digest,finished_at,error_class) | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT |
+| `role_public_worker` | — | — | — | — | SELECT, UPDATE | SELECT, INSERT, UPDATE | — | — | — | — | — | — | — | — | SELECT |
+| `role_retrieval_worker` | — | — | SELECT, UPDATE | SELECT, UPDATE(evidence_highwater, knowledge_highwater, projection_highwater) | SELECT, UPDATE | SELECT, INSERT, UPDATE | — | SELECT | SELECT | SELECT | — | — | SELECT | SELECT | SELECT |
+| `role_batch_issuer` | **INSERT, SELECT** | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `role_maintenance` | SELECT, UPDATE（仅 `ISSUED → EXPIRED` 巡检，§15.6） | SELECT | SELECT, UPDATE（仅 `ISSUED → LOST` 巡检 §15.2 与 `retention::tombstone` 的 `* → TOMBSTONED` §37.2） | SELECT, UPDATE(serving, shadow) | SELECT | SELECT, UPDATE(status, lease_owner, lease_expires_at) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT |
+| `role_migration_owner` | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner |
 
 落点逐一对齐：
 
@@ -1107,6 +1107,8 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
 - **`projection.stream_checkpoints`（本轮新增列）**：§15.1 的 seq 分配是 `UPDATE ... SET issued_highwater = issued_highwater + 1 ... RETURNING`，与 `INSERT projection.stream_log` 同事务同连接（`role_gateway`）。此前本表没有这一列 ⇒ 落回 §6.2.1 域默认（`projection.* = R`）⇒ **每一次 `remember` 在发 seq 那一步就被 SQL 层拒绝**，A1 三件套的 (a) 稠密序号根本发不出来。列限定把可写面收到该收的列：`serving` / `shadow` 是读路由（§16.2 / §16.3 切版），只有 `role_maintenance` 能动；`INSERT` 只给 §15.3 主键那六列 ⇒ 首次建行时 `serving` / `shadow` 只能取 DDL 的 `DEFAULT false`，gateway 造不出一行自带 `serving = true` 的 checkpoint。`updated_at` 由 owner 的 `BEFORE UPDATE` 触发器写，不出现在任何 GRANT 里。
 - **`control.quota_windows`（本轮新增列）**：§72 的 reserve/commit 是请求路径上的 `UPDATE control.quota_windows SET reserved = reserved + $units ...`，而 `control.*` 域默认对所有 runtime role 只有 `R` —— 与上一条同型的静默拒绝。**窗口行由谁建，本文档没有冻结**（§71 / §76 的 Entitlement Projector 没有指定角色），所以本表对这张表不给任何 `INSERT`：这是**显式空缺，不是遗漏**。补建行方的时候必须回到这张表加格，否则 §48.2 的「授权逐条相等」立刻红。
 - **`ops.jobs`（本轮新增列）**：§61 的 SKIP LOCKED claim（`SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE ops.jobs`）本来就落在 `ops.*` 域默认里，列出来是为了让 S 的差集为空；唯一的实质变化是 `role_maintenance` 拿到列限定的 `UPDATE`，§65 的 `stale lease/lock reap` 才有角色可跑 —— `ops.*` 域默认给它的是 `R`，而 §6.2.1 冻结它只在本表列出的表上有 `UPDATE`。
+
+- **`ops.deletion_plan_steps`（本轮新增列，T4.8 review 补入）**：本表新建时未逐表列出 ⇒ 落回 §6.2.1 `ops.*` 域默认 ⇒ `role_gateway`/`role_private_worker`/`role_public_worker`/`role_retrieval_worker` 四个 runtime role 都自带 `INSERT`/`UPDATE`（域默认是给 `ops.jobs`/`ops.outbox` 这类队列表用的，不是给这张审计表用的）—— 请求路径角色因此能替任意 `deletion_request_id` 伪造一条已完成的 `QDRANT_POINTS`/`OBJECT_BYTES` 行，把 §41.2 `tombstoned_unpurged_over_sla` 读绿而字节从未真正 purge。逐条列出后收窄为四个 runtime role 只剩 `SELECT`；写路径只走 `ops.record_deletion_plan_step`（SECURITY DEFINER，owner 是 `role_migration_owner`），调用方不需要表级 `INSERT`。`role_consolidation_worker` 与 `role_maintenance` 的域默认 `SELECT` 原样保留（逐条列出后不再"落回默认"，必须显式写出才继续成立）；`role_maintenance` 另加一格显式 `INSERT`。
 
 `ops.outbox` 即 §60.1 权限块里写作 `outbox_event` 的那张表，同一张；表名以 §48 canonical schema 为准。**本节与 §48.2 的枚举只按 `ops.outbox` 取数**：拿 `outbox_event` 这个名字去查 `role_table_grants` 得到的是空集，全文其余位置见到旧名一律读作 `ops.outbox`。
 

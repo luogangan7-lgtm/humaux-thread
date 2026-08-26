@@ -1,0 +1,45 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T4.8 follow-up: named-table §6.2.2 override for ops.deletion_plan_steps, closing the
+# domain-default over-grant a review found (role_gateway et al. held INSERT/UPDATE via
+# §6.2.1's ops-schema default, letting the request-path role forge a completed purge step).
+
+migration_id = "0056_deletion_plan_steps_grants"
+class = "REVERSIBLE"
+
+precheck = """
+select
+  (select count(*) from information_schema.role_table_grants
+     where table_schema = 'ops' and table_name = 'deletion_plan_steps'
+       and grantee in ('role_gateway','role_private_worker','role_public_worker','role_retrieval_worker')
+       and privilege_type in ('INSERT','UPDATE')) = 8
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (select count(*) from information_schema.role_table_grants
+     where table_schema = 'ops' and table_name = 'deletion_plan_steps'
+       and grantee in ('role_gateway','role_private_worker','role_public_worker','role_retrieval_worker')
+       and privilege_type in ('INSERT','UPDATE')) = 0
+  and (select count(*) from information_schema.role_table_grants
+     where table_schema = 'ops' and table_name = 'deletion_plan_steps'
+       and grantee = 'role_maintenance' and privilege_type = 'INSERT') = 1
+  and (select count(*) from information_schema.role_table_grants
+     where table_schema = 'ops' and table_name = 'deletion_plan_steps'
+       and grantee in ('role_gateway','role_private_worker','role_public_worker',
+                       'role_retrieval_worker','role_consolidation_worker','role_maintenance')
+       and privilege_type = 'SELECT') = 6
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback:
+  REVOKE INSERT ON ops.deletion_plan_steps FROM role_maintenance;
+  GRANT INSERT, UPDATE ON ops.deletion_plan_steps
+    TO role_gateway, role_private_worker, role_public_worker, role_retrieval_worker;
+  (restores the pre-fix over-grant — only ever intended as an emergency rollback if this
+  migration's own postcheck were somehow wrong; the pre-fix state is the vulnerability this
+  migration exists to close, not a safe resting state to return to.)
+"""
+
+backup_restore_requirement = "none (GRANT/REVOKE only, no rows read or written)"

@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `AutoMutableMemoryId: From<BoundMemoryId>` is not satisfied
+  --> tests/ui/fail_bound_to_auto_mutable.rs:15:44
+   |
+15 |     let _auto: AutoMutableMemoryId = bound.into();
+   |                                            ^^^^ the trait `From<BoundMemoryId>` is not implemented for `AutoMutableMemoryId`
+   |
+help: the trait `From<BoundMemoryId>` is not implemented for `AutoMutableMemoryId`
+      but trait `From<UnboundMemoryId>` is implemented for it
+  --> src/consolidate.rs
+   |
+   | impl From<UnboundMemoryId> for AutoMutableMemoryId {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: for that trait implementation, expected `UnboundMemoryId`, found `BoundMemoryId`
+   = note: required for `BoundMemoryId` to implement `Into<AutoMutableMemoryId>`

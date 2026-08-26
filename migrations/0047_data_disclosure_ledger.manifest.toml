@@ -1,0 +1,69 @@
+# §46.1 migration manifest (K2 / T4.2). §7.4 Disclosure Ledger: CREATE ops.data_disclosures
+# (append-only reserve()->finalize() ledger, RLS+FORCE+NULLIF tenant policy) + ALTER the
+# already-existing ops.data_disclosure_sources (a 0008 P1-era skeleton: three columns,
+# zero rows, zero callers) up to §7.4's real shape — four-ID-exactly-one-non-NULL CHECK +
+# real FKs. Neither table is one of §6.2.2's 14 named tables, so GRANT is §6.2.1 domain
+# default only; data_disclosure_sources already carries its 0008 domain-default GRANTs and
+# OWNER, unchanged by this migration; data_disclosures gets fresh ones the same way (via
+# 0011's `ALTER DEFAULT PRIVILEGES FOR ROLE <connecting superuser> IN SCHEMA ops`).
+#
+# Migration number note: the K2 task card was originally assigned 0045-0047, but
+# 0045/0046 were consumed by a concurrent P3 wave task (stream_log_evidence_id /
+# stream_log_evidence_id_via_outbox) before this task started — confirmed via
+# `ls migrations` + git log before allocating this number. 0047 is the next free slot
+# (allocated under a coord_lock on "migrations-number-allocation" to avoid a second
+# collision with any other Phase 4 K-task creating migrations concurrently).
+#
+# Table-name collision note: `ops.data_disclosure_sources` was NOT free either — 0008
+# already created it as a generic skeleton stub (discovered only by attempting a bare
+# `CREATE TABLE` and hitting `relation already exists`, since `ls migrations` alone doesn't
+# surface pre-existing objects). This migration was rewritten from a second `CREATE TABLE`
+# into the `ALTER TABLE ADD COLUMN` shape below once that was found — see the .sql file's
+# own header comment on that table for the full reasoning (kept 0008's `tenant_id`+RLS
+# rather than dropping them).
+
+migration_id = "0047_data_disclosure_ledger"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('ops.data_disclosures') is null
+  and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'ops' and table_name = 'data_disclosure_sources' and column_name = 'disclosure_id'
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  to_regclass('ops.data_disclosures') is not null
+  and (select relrowsecurity from pg_class where oid = 'ops.data_disclosures'::regclass) = true
+  and (select relforcerowsecurity from pg_class where oid = 'ops.data_disclosures'::regclass) = true
+  and (select tableowner from pg_tables where schemaname='ops' and tablename='data_disclosures') = 'role_migration_owner'
+  and exists (select 1 from pg_trigger where tgname = 'data_disclosures_guard_mutation' and not tgisinternal)
+  and exists (select 1 from pg_policies where schemaname='ops' and tablename='data_disclosures' and policyname='data_disclosures_tenant_isolation')
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'ops' and table_name = 'data_disclosure_sources' and column_name = 'disclosure_id'
+  )
+  and exists (select 1 from pg_trigger where tgname = 'data_disclosure_sources_reject_mutation' and not tgisinternal)
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP TABLE IF EXISTS ops.data_disclosures CASCADE;
+DROP FUNCTION IF EXISTS ops.data_disclosures_guard_mutation();
+DROP TRIGGER IF EXISTS data_disclosure_sources_reject_mutation ON ops.data_disclosure_sources;
+DROP FUNCTION IF EXISTS ops.data_disclosure_sources_reject_mutation();
+ALTER TABLE ops.data_disclosure_sources
+  DROP COLUMN IF EXISTS disclosure_id, DROP COLUMN IF EXISTS source_kind,
+  DROP COLUMN IF EXISTS evidence_id, DROP COLUMN IF EXISTS memory_id,
+  DROP COLUMN IF EXISTS rollup_id, DROP COLUMN IF EXISTS release_id,
+  DROP COLUMN IF EXISTS ordinal;
+(safe: ops.data_disclosures is wholly new to this migration, zero rows; the ALTER on
+ops.data_disclosure_sources only drops columns this same migration added — its pre-existing
+0008 columns/RLS/policy/grants are untouched by both directions.)
+"""
+
+backup_restore_requirement = "none (two brand-new tables, zero rows at risk, no existing table altered)"

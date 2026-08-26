@@ -1,0 +1,60 @@
+# §46.1 migration manifest (G46-1 / G80-37): one manifest per migrations/*.sql.
+# T4.4 §11.2.1 completes control.private_reasoning_domains / control.reasoning_domain_grants
+# to the canonical schema. All new columns nullable-first then tightened (see file header);
+# also adds one trigger function and one new RLS policy on an existing table — REVERSIBLE,
+# not EXPAND_CONTRACT, because this touches existing tables' shape rather than only creating
+# new ones.
+
+migration_id = "0049_reasoning_domain_columns"
+class = "REVERSIBLE"
+
+precheck = """
+select not exists (
+  select 1 from information_schema.columns
+  where table_schema = 'control' and table_name = 'private_reasoning_domains'
+    and column_name = 'owner_user_id'
+) as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'control' and table_name = 'private_reasoning_domains'
+      and column_name = 'user_reasoning_profile_id'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'control' and table_name = 'reasoning_domain_grants'
+      and column_name = 'expires_at' and is_nullable = 'NO'
+  )
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'control.reasoning_domain_grants'::regclass)
+  and exists (
+    select 1 from pg_trigger
+    where tgname = 'private_reasoning_domains_check_profile_owner'
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback:
+  DROP POLICY IF EXISTS reasoning_domain_grants_tenant ON control.reasoning_domain_grants;
+  ALTER TABLE control.reasoning_domain_grants NO FORCE ROW LEVEL SECURITY;
+  ALTER TABLE control.reasoning_domain_grants DISABLE ROW LEVEL SECURITY;
+  ALTER TABLE control.reasoning_domain_grants
+    DROP COLUMN IF EXISTS workspace_id,
+    DROP COLUMN IF EXISTS purposes,
+    DROP COLUMN IF EXISTS expires_at,
+    DROP COLUMN IF EXISTS revoked_at;
+  DROP TRIGGER IF EXISTS private_reasoning_domains_check_profile_owner ON control.private_reasoning_domains;
+  DROP FUNCTION IF EXISTS control.private_reasoning_domains_check_profile_owner();
+  ALTER TABLE control.private_reasoning_domains
+    DROP COLUMN IF EXISTS owner_user_id,
+    DROP COLUMN IF EXISTS user_reasoning_profile_id,
+    DROP COLUMN IF EXISTS status;
+  -- safe only as long as 0050 (memory_automation_policies, independent table) and no
+  -- application code have shipped depending on any of the above.
+"""
+
+backup_restore_requirement = "standard pre-deploy snapshot; both altered tables are empty in every environment this migration has been applied to (grepped: no INSERT target for control.reasoning_domain_grants exists yet, and the two existing control.private_reasoning_domains test fixtures only ever set columns this migration does not touch)"

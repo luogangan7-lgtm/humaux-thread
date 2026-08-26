@@ -21,3 +21,19 @@ hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# T4.6/T4.7 §11.8: `PrivateReasoningPort` is the spec's own verbatim code block, `#[async_trait]`
+# included — same macro already resolved in the workspace lockfile via `humaux-adapters`'s
+# `email::EmailProvider` trait (its Cargo.toml doc explains the object-safety reason: a plain
+# `async fn` in a trait is not `dyn`-compatible, and callers need `&dyn PrivateReasoningPort`).
+async-trait = "0.1"
+# `consolidate::PrivateReasoningDomainId`'s inner id — same pin as `humaux-domain`'s existing
+# `uuid = "1.25.0"`, no new independent version in the dependency graph.
+uuid = "1.25.0"
+
+[dev-dependencies]
+# T4.6/T4.7 `consolidate.rs` tests: `PrivateReasoningPort::infer` is `async fn`, so its fake
+# in-crate test double needs an executor. Matches `crates/adapters`'s existing `tokio`
+# dev-dependency version pin (that crate drives its async fixtures via `Runtime::block_on`
+# instead of this macro — either is fine, `#[tokio::test]` is simply the smaller diff for a
+# single self-contained async test with no cross-test runtime sharing to worry about).
+tokio = { version = "1", features = ["macros", "rt"] }

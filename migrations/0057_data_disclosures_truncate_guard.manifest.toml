@@ -1,0 +1,80 @@
+# §46.1 migration manifest. Fixer-review follow-up to 0047_data_disclosure_ledger: closes the
+# TRUNCATE append-only bypass on ops.data_disclosures / ops.data_disclosure_sources and the
+# deletion_requested_at/deletion_confirmed_at rewrite gap — without editing the already-applied
+# 0047 (same pattern 0041_audit_hardening's Fix 5 used for control.audit_events/ops.audit_batches).
+
+migration_id = "0057_data_disclosures_truncate_guard"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  not exists (
+    select 1 from pg_trigger
+    where tgname = 'data_disclosures_reject_truncate' and not tgisinternal
+  )
+  and not exists (
+    select 1 from pg_trigger
+    where tgname = 'data_disclosure_sources_reject_truncate' and not tgisinternal
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from pg_trigger
+    where tgname = 'data_disclosures_reject_truncate' and not tgisinternal
+      and tgrelid = 'ops.data_disclosures'::regclass
+  )
+  and exists (
+    select 1 from pg_trigger
+    where tgname = 'data_disclosure_sources_reject_truncate' and not tgisinternal
+      and tgrelid = 'ops.data_disclosure_sources'::regclass
+  )
+  and to_regprocedure('ops.data_disclosures_guard_mutation()') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP TRIGGER IF EXISTS data_disclosure_sources_reject_truncate ON ops.data_disclosure_sources;
+          DROP TRIGGER IF EXISTS data_disclosures_reject_truncate ON ops.data_disclosures;
+          -- Restores 0047's original function body verbatim (drops the TRUNCATE branch and the
+          -- deletion_requested_at/deletion_confirmed_at monotonicity checks this migration added).
+          CREATE OR REPLACE FUNCTION ops.data_disclosures_guard_mutation() RETURNS trigger
+          LANGUAGE plpgsql AS $$
+          BEGIN
+            IF TG_OP = 'DELETE' THEN
+              RAISE EXCEPTION 'ops.data_disclosures is append-only (§7.4) — DELETE not permitted'
+                USING ERRCODE = 'insufficient_privilege';
+            END IF;
+            IF OLD.grant_id IS DISTINCT FROM NEW.grant_id
+               OR OLD.tenant_id IS DISTINCT FROM NEW.tenant_id
+               OR OLD.scope_kind IS DISTINCT FROM NEW.scope_kind
+               OR OLD.scope_id IS DISTINCT FROM NEW.scope_id
+               OR OLD.processor_id IS DISTINCT FROM NEW.processor_id
+               OR OLD.region IS DISTINCT FROM NEW.region
+               OR OLD.data_class IS DISTINCT FROM NEW.data_class
+               OR OLD.purpose IS DISTINCT FROM NEW.purpose
+               OR OLD.payload_sha256 IS DISTINCT FROM NEW.payload_sha256
+               OR OLD.payload_bytes IS DISTINCT FROM NEW.payload_bytes
+               OR OLD.reserved_at IS DISTINCT FROM NEW.reserved_at
+            THEN
+              RAISE EXCEPTION 'ops.data_disclosures identity/reservation columns are immutable after INSERT (§7.4)'
+                USING ERRCODE = 'insufficient_privilege';
+            END IF;
+            IF OLD.finalized_at IS NOT NULL
+               AND (OLD.finalized_at IS DISTINCT FROM NEW.finalized_at
+                    OR OLD.outcome IS DISTINCT FROM NEW.outcome)
+            THEN
+              RAISE EXCEPTION 'ops.data_disclosures already finalized — finalized_at/outcome cannot change again (§7.4)'
+                USING ERRCODE = 'insufficient_privilege';
+            END IF;
+            RETURN NEW;
+          END;
+          $$;
+"""
+
+# Two CREATE TRIGGER + one CREATE OR REPLACE FUNCTION, zero DDL on any column, zero rows
+# touched (ops.data_disclosures/ops.data_disclosure_sources semantics only get stricter, no
+# existing row's UPDATE path narrows further than the app already respects — see disclosure.rs).
+backup_restore_requirement = "none (trigger/function DDL only, no column or row changes, no existing table structurally altered)"

@@ -1,0 +1,49 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T4.8 follow-up: 0054 is applied and immutable, so its review findings land here as new
+# statements. record_deletion_plan_step boolean/bigint fix + tenant_id-from-request
+# derivation + composite FK backstop + ordinal/step CHECK + drop of the dead, untested,
+# drift-risk control.advance_deletion_request duplicate.
+
+migration_id = "0055_deletion_plan_fixes"
+class = "REVERSIBLE"
+
+precheck = """
+select
+  (select prosrc from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'ops' and p.proname = 'record_deletion_plan_step') like '%inserted boolean%'
+  and to_regprocedure('control.advance_deletion_request(uuid,uuid,text)') is not null
+  and not exists (
+    select 1 from pg_constraint where conname = 'deletion_plan_steps_ordinal_matches_step')
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'ops' and p.proname = 'record_deletion_plan_step') = 1
+  and to_regprocedure('control.advance_deletion_request(uuid,uuid,text)') is null
+  and exists (
+    select 1 from pg_constraint where conname = 'deletion_plan_steps_ordinal_matches_step')
+  and exists (
+    select 1 from pg_constraint where conname = 'deletion_plan_steps_request_tenant_fk')
+  and exists (
+    select 1 from pg_constraint where conname = 'deletion_requests_id_tenant_unique')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback:
+  ALTER TABLE ops.deletion_plan_steps DROP CONSTRAINT deletion_plan_steps_ordinal_matches_step;
+  ALTER TABLE ops.deletion_plan_steps DROP CONSTRAINT deletion_plan_steps_request_tenant_fk;
+  ALTER TABLE control.deletion_requests DROP CONSTRAINT deletion_requests_id_tenant_unique;
+  -- control.advance_deletion_request is not restored: nothing in the workspace calls it
+  -- (verified by grep before this migration was written), so rollback does not resurrect
+  -- unreachable code — a forward-fix would recreate it verbatim from 0054's source if a
+  -- caller ever needs it again.
+  -- record_deletion_plan_step is left at its 0055 definition (correct); reverting the
+  -- boolean/bigint bug is not a rollback anyone wants.
+  (safe: constraints only re-validate existing rows, which by 0055's own postcheck already
+  satisfy them; the dropped function has zero callers)
+"""
+
+backup_restore_requirement = "none (function redefinition + two new constraints + one dead-function drop; no data row is read or written by this migration itself)"

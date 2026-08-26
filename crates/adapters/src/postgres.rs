@@ -146,8 +146,6 @@ impl BatchIssuerDbPool {
     }
 }
 
-// ponytail: no Application-layer consumer yet reads `.0` (that layer is a later task).
-#[allow(dead_code)]
 /// `role_consolidation_worker`'s independent-process pool (§6.2.1 row
 /// `role_consolidation_worker`, 连接池=`consolidation（独立进程/独立池）`).
 pub struct ConsolidationDbPool(PgPool);
@@ -158,6 +156,13 @@ impl ConsolidationDbPool {
         connect_checked(dsn, ROLE_CONSOLIDATION_WORKER)
             .await
             .map(Self)
+    }
+
+    /// T4.6/T4.7 `adapters::consolidate_repo`'s pool accessor — see [`RuntimeDbPool::pool`]'s
+    /// doc for why `pub(crate)` keeps G6-DB1's closed set intact. `consolidate_repo.rs` is
+    /// this wrapper's first real reader of `.0`.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.0
     }
 }
 
@@ -240,8 +245,12 @@ mod tests {
     /// Test-only: production wrappers connect with a DSN that already authenticates as the
     /// target role directly.
     fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
+        // libpq-standard `options=-c role=X` (URL-encoded). The older `options[role]=X` form
+        // is silently tolerated by sqlx but rejected outright by rust-postgres ("invalid
+        // connection string") — which made every `Client::connect` role fixture skip, and a
+        // skip is not a pass (§79.2). This form is verified working on both drivers.
         let sep = if admin_dsn.contains('?') { '&' } else { '?' };
-        format!("{admin_dsn}{sep}options[role]={role}")
+        format!("{admin_dsn}{sep}options=-c%20role%3D{role}")
     }
 
     struct AdminConn;

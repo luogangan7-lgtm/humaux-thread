@@ -22,8 +22,12 @@ use sqlx::types::Uuid;
 // touch each other's rows even running concurrently.
 
 fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
+    // libpq-standard `options=-c role=X` (URL-encoded). The older `options[role]=X` form
+    // is silently tolerated by sqlx but rejected outright by rust-postgres ("invalid
+    // connection string") — which made every `Client::connect` role fixture skip, and a
+    // skip is not a pass (§79.2). This form is verified working on both drivers.
     let sep = if admin_dsn.contains('?') { '&' } else { '?' };
-    format!("{admin_dsn}{sep}options[role]={role}")
+    format!("{admin_dsn}{sep}options=-c%20role%3D{role}")
 }
 
 struct Handle {

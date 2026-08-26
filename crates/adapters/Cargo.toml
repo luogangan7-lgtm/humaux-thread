@@ -24,6 +24,10 @@ sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "r
 # established by humaux-application; this crate previously only pulled humaux-domain in as a
 # dev-dependency (test fixtures), promoted here to a real one for the same reason.
 humaux-domain = { path = "../domain" }
+# T4.8 `forget_repo.rs`: `DeletionStep`/`DeletionPlan` (§37) are pure types+logic that live in
+# humaux-application so they stay unit-testable without a database (§3/§78.3 — same
+# adapters-wraps-the-pure-crate direction as `humaux-projection` below for `stream_repo.rs`).
+humaux-application = { path = "../application" }
 # T3.3+T3.4 `stream_repo.rs`: `StreamKey`/`StreamLedgerSnapshot`/`advance_prefix`/
 # `StreamSlaConfig` (§15) are pure types+logic that live in humaux-projection so they stay
 # unit-testable without a database (§3/§78.3 — this crate is where the SQL wrapping them
@@ -45,11 +49,25 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 # as `serde_json::Value` (sqlx's `json` feature above only enables the Encode/Decode impls,
 # it does not re-export the crate or its `json!` macro).
 serde_json = "1"
+# T4.6/T4.7 `consolidate_repo.rs` (§11.7): per-row change-detection fingerprint for
+# `memory_consolidation_inputs.source_hash` (staleness check at publish time). Plain digest,
+# not an `EvidencePayloadSha256` — that type's sole construction point stays
+# `domain::evidence::payload_sha256` (§48.0①/§78 "唯一构造点"); reusing it here for an
+# unrelated fingerprint would blur what it identifies. Same version pin as
+# `humaux-domain`/`humaux-application`'s existing `sha2` uses.
+sha2 = "0.11"
+# T4.4/T4.5 `byok.rs` (§11.1/§11.2.1): `CredentialRef`/`ReasoningDomainId` mint new ids
+# directly via `Uuid::now_v7()`, same minting convention `domain::ids`'s `uuid_newtype!` macro
+# uses — promoted from dev-only (below) to a real dependency for that reason. `v4` (dev-only
+# feature) stays alongside for test fixtures; `v7` is what production code here calls.
+uuid = { version = "1.25.0", features = ["v7"] }
 
 [dev-dependencies]
 # T1.5 crates/adapters/tests/auth_scope_rls.rs: blocking client for the §62 RLS integration
 # test (same crate/version xtask already pins for its live-DB checks, no new dependency).
-postgres = { version = "0.19", features = ["with-uuid-1"] }
+# `with-serde_json-1` added for T4.6/T4.7's `tests/consolidate_snapshot.rs`: seeding
+# `private.memory_records.content` (jsonb) needs `serde_json::Value: ToSql`.
+postgres = { version = "0.19", features = ["with-uuid-1", "with-serde_json-1"] }
 # H3 `tests/email_outbox.rs`: `sqlx::types::Uuid` (the crate's own production-code alias,
 # see the `sqlx` entry above) has no random-generation feature turned on by sqlx's minimal
 # `uuid` flag — this dev-only entry adds `v4` for test fixtures' throwaway ids, matching
@@ -65,4 +83,7 @@ humaux-testkit = { path = "../testkit" }
 trybuild = "1"
 # Drives the async `sqlx` pool-connect fixtures (§6.2.3 assertion E, G6-DB2) from plain
 # `#[test]` functions via `Runtime::block_on`, alongside the sync `postgres` fixtures above.
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# `macros` added for T4.6/T4.7's `tests/consolidate_snapshot.rs`: `tokio::join!` (racing the
+# snapshot-bound selection against 60 concurrent inserts on a real thread) and
+# `tokio::task::spawn_blocking` both need it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

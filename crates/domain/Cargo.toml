@@ -11,3 +11,15 @@ workspace = true
 uuid = { version = "1.25.0", features = ["v7"] }
 # §8.1 / §48.0①: evidence::payload_sha256 raw-byte SHA-256.
 sha2 = "0.11"
+# §7.3 T4.1: `ExternalCall` is a production (non-test) trait that must be `dyn`-compatible
+# (`Arc<dyn ExternalCall>` at the call site) — real dependency, not dev-only. Same macro
+# already resolved in the workspace lockfile via `humaux-adapters`'s `email::EmailProvider`
+# trait (its own Cargo.toml doc explains the object-safety reason).
+async-trait = "0.1"
+
+[dev-dependencies]
+# §7.3 T4.1 tests/ui/: proves `EgressPermit` has no construction path outside this crate
+# (private fields + non-`pub(crate)` `issue`) — same pattern `humaux-adapters`'s G6-DB1
+# fixtures already use for its own §6.2.3 typed-pool topology. Reused unmodified by T4.6/T4.7
+# §11.8's `AutoMutableMemoryId` compile-fail fixture (`tests/ui/fail_bound_to_auto_mutable.rs`).
+trybuild = "1"

@@ -1,0 +1,26 @@
+# §46.1 migration manifest (G46-1 / G80-37): one manifest per migrations/*.sql.
+# T4.4 §11.2 UserReasoningProfile. Pure additive DDL (one new table), same shape as 0036 —
+# EXPAND_CONTRACT with only the expand sub-step.
+
+migration_id = "0048_user_reasoning_profiles"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('control.user_reasoning_profiles') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.user_reasoning_profiles') is not null
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'control.user_reasoning_profiles'::regclass)
+  and (select tableowner from pg_tables
+       where schemaname = 'control' and tablename = 'user_reasoning_profiles') = 'role_migration_owner'
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP TABLE IF EXISTS control.user_reasoning_profiles;
+  (safe — no other table gains an FK into this one until 0049, which is a later migration
+  number and must never be applied without this one first.)
+"""
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero rows at risk)"

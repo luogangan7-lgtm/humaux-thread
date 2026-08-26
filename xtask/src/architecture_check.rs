@@ -1075,6 +1075,421 @@ fn g80_22_payload_sha256_unique(root: &Path) -> Verdict {
     }
 }
 
+/// §11.8 / CLAUDE.md "唯一构造点模式": `classify()` (`crates/domain/src/consolidate.rs`) is the
+/// sole entry point that may produce a [`ClassifiedMemoryId`] — the fixer-review that landed
+/// this check found the rule named in CLAUDE.md's own list but never wired into this file
+/// (grep for "classify" here returned zero hits before this function existed). Counts
+/// *definitions* of `fn classify(` workspace-wide, not call sites — `adapters::byok::
+/// classify_http_status` is a different function name and does not match this needle.
+fn g11_8_classify_sole_construction_point(root: &Path) -> Verdict {
+    let files = walk_workspace_rs(root);
+    let object_exists = files.iter().any(|(_, s)| s.contains("fn classify("));
+    if !object_exists {
+        return Verdict::NotApplicable(
+            "domain::consolidate::classify (§11.8, T4.6/T4.7 尚未交付)".to_string(),
+        );
+    }
+    let mut count = 0usize;
+    let mut sites = Vec::new();
+    for (path, source) in &files {
+        let n = source.matches("fn classify(").count();
+        if n > 0 {
+            sites.push(format!("{}: {n}", display(root, path)));
+        }
+        count += n;
+    }
+    if count == 1 {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(vec![format!(
+            "expected exactly 1 `fn classify(` definition, found {count}: {sites:?}"
+        )])
+    }
+}
+
+// ============================================================================
+// §83.4 G80-3: Outbound Network Choke Point — real RHS
+// ============================================================================
+
+/// §83.4's `external-egress-registry` fenced block, column 1, verbatim order — the exact
+/// variant-name set `OutboundPurpose` (`crates/domain/src/egress.rs`, §7.3/§83.4) must equal.
+const EXTERNAL_EGRESS_REGISTRY: &[&str] = &[
+    "USER_REASONING",
+    "RETRIEVAL_EMBEDDING",
+    "RETRIEVAL_RERANK",
+    "PUBLIC_REASONING",
+    "BILLING",
+    "TRANSACTIONAL_EMAIL",
+    "GIT_PROVIDER",
+    "OAUTH_METADATA",
+    "PUBLIC_SOURCE_FETCH",
+    "DEADMAN_HEALTHCHECK",
+];
+
+const INFRA_EGRESS_HTTP_RS: &str = "crates/infra-egress/src/http.rs";
+
+/// §83.4 判据1, 注错 a: `reqwest`/`hyper`'s client type reached through a `use`-imported bare
+/// alias (`use reqwest::Client; Client::new()`) is exactly as much a raw-client construction
+/// as the fully-qualified spelling — the fully-qualified needle set below cannot see it at
+/// all, which is the exact loophole the 注错 a fixture in this module's tests demonstrates.
+/// Matched with a word-boundary guard ([`is_bare_needle_word_start`]) so an unrelated type that
+/// merely ends in `Client` (`MyClient::new(`) is not a false hit.
+const BARE_HTTP_CLIENT_NEEDLES: [&str; 4] = [
+    "Client::new(",
+    "Client::builder(",
+    "Client::default(",
+    "ClientBuilder::new(",
+];
+
+/// §83.4 raw HTTP transport construction needles: `reqwest::Client::new`/`::builder` and
+/// `hyper::Client::new`/`::builder` (fully-qualified spellings, kept alongside the bare-alias
+/// set above so both spellings are named explicitly in one place rather than relying on the
+/// bare set's substring overlap to carry the qualified case), comment-line-filtered like every
+/// other scan in this module. The needle already includes the call-opening `(`, so — unlike
+/// [`count_construction_calls`]'s struct-literal targets — there is no legal
+/// `struct`/`impl`/`->`-prefixed spelling of `reqwest::Client::new(` that isn't a real call,
+/// so no declaration-shape guard is needed for the qualified forms.
+fn find_raw_http_client_calls(source: &str) -> Vec<usize> {
+    let qualified_needles = [
+        "reqwest::Client::new(",
+        "reqwest::Client::builder(",
+        "hyper::Client::new(",
+        "hyper::Client::builder(",
+    ];
+    let mut hits = Vec::new();
+    for needle in qualified_needles {
+        let mut start = 0usize;
+        while let Some(rel) = source[start..].find(needle) {
+            let idx = start + rel;
+            if !line_is_comment_at(source, idx) {
+                hits.push(idx);
+            }
+            start = idx + needle.len();
+        }
+    }
+    for needle in BARE_HTTP_CLIENT_NEEDLES {
+        let mut start = 0usize;
+        while let Some(rel) = source[start..].find(needle) {
+            let idx = start + rel;
+            if !line_is_comment_at(source, idx) && is_bare_needle_word_start(source, idx) {
+                hits.push(idx);
+            }
+            start = idx + needle.len();
+        }
+    }
+    hits
+}
+
+/// Word-boundary guard for [`BARE_HTTP_CLIENT_NEEDLES`]: true unless the byte immediately
+/// before `idx` continues an identifier (letter/digit/`_`) — rejects `MyClient::new(` (a
+/// same-shaped but unrelated local type) while accepting both a bare `Client::new(` and the
+/// fully-qualified `reqwest::Client::new(` (preceded by `:`, not an identifier char).
+fn is_bare_needle_word_start(source: &str, idx: usize) -> bool {
+    match source[..idx].chars().next_back() {
+        None => true,
+        Some(c) => !(c.is_alphanumeric() || c == '_'),
+    }
+}
+
+/// Extracts each variant identifier from a `enum <enum_name> { .. }` block in `source` — same
+/// shape as [`parse_degrade_variant_names`] but for a plain `enum` (not the `degrade_code!`
+/// macro) and tolerant of data-carrying variants (`Foo(Bar)` counts as `Foo`, matching
+/// `OutboundPurpose`'s three private-data variants that each carry an `EgressPermit`).
+/// Doc-comment (`///`) and attribute (`#[..]`) lines are skipped.
+fn parse_enum_variant_names(source: &str, enum_name: &str) -> Vec<String> {
+    let needle = format!("enum {enum_name}");
+    let Some(rel) = source.find(&needle) else {
+        return Vec::new();
+    };
+    let after = rel + needle.len();
+    let Some(brace_rel) = source[after..].find('{') else {
+        return Vec::new();
+    };
+    let open = after + brace_rel;
+    let Some(close) = matching_brace_end(source, open) else {
+        return Vec::new();
+    };
+    let block = &source[open + 1..close - 1];
+    let mut out = Vec::new();
+    for line in block.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
+            continue;
+        }
+        let ident: String = t
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if ident.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            out.push(ident);
+        }
+    }
+    out
+}
+
+/// §83.4 判据3: same `enum <enum_name> { .. }` block [`parse_enum_variant_names`] walks, but
+/// keeps each variant's tuple payload text verbatim instead of discarding it — the payload
+/// shape is exactly what 判据3 ("标为 private-data 的 purpose 在类型上只能由 EgressPermit
+/// 构造") needs to check. One line per variant is assumed (this codebase's own style for
+/// `OutboundPurpose`, matched by every fixture in this module's tests): a variant's payload,
+/// if any, must open and close its parens on the same line.
+fn parse_enum_variant_payloads(source: &str, enum_name: &str) -> Vec<(String, Option<String>)> {
+    let needle = format!("enum {enum_name}");
+    let Some(rel) = source.find(&needle) else {
+        return Vec::new();
+    };
+    let after = rel + needle.len();
+    let Some(brace_rel) = source[after..].find('{') else {
+        return Vec::new();
+    };
+    let open = after + brace_rel;
+    let Some(close) = matching_brace_end(source, open) else {
+        return Vec::new();
+    };
+    let block = &source[open + 1..close - 1];
+    let mut out = Vec::new();
+    for line in block.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
+            continue;
+        }
+        let ident: String = t
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !ident.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            continue;
+        }
+        let rest = t[ident.len()..].trim_start();
+        let payload = if let Some(inner) = rest.strip_prefix('(') {
+            inner.find(')').map(|end| inner[..end].trim().to_string())
+        } else {
+            None
+        };
+        out.push((ident, payload));
+    }
+    out
+}
+
+/// §83.4 判据0 (workspace 正哨兵): `crates/infra-egress` must be a real, live workspace
+/// member with its transport file present — any one of the three missing is red before
+/// 判据1/2 are even evaluated. Without this, deleting the whole crate would make the
+/// raw-client scan below vacuously report "0 hits outside the expected file" (there is no
+/// file left to hit) — the exact 恒真闸 shape §59.1/§80.1 call out elsewhere in this module.
+/// `metadata_json` is injectable so tests do not need to shell out to a real `cargo metadata`
+/// against a fixture directory that has no real workspace `Cargo.toml`.
+fn g80_3_workspace_sentinel(root: &Path, metadata_json: Option<&str>) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !root.join("crates/infra-egress/Cargo.toml").is_file() {
+        problems.push("正哨兵缺失: crates/infra-egress/Cargo.toml 不存在".to_string());
+    }
+    if !root.join(INFRA_EGRESS_HTTP_RS).is_file() {
+        problems.push(format!("正哨兵缺失: {INFRA_EGRESS_HTTP_RS} 不存在"));
+    }
+    // Exact match against `packages[].name`, not a substring scan over the raw JSON text: a
+    // substring match on `"humaux-infra-egress"` stays true even after the crate is dropped
+    // from the workspace `members` list, as long as *some* other member still path-depends on
+    // it by name (that dependency edge's own JSON also contains the literal string) — the
+    // 注错 0b fixture below pins this against regressing back to `.contains`.
+    let member_present = metadata_json
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|v| v.get("packages").and_then(|p| p.as_array()).cloned())
+        .is_some_and(|packages| {
+            packages
+                .iter()
+                .any(|p| p.get("name").and_then(|n| n.as_str()) == Some("humaux-infra-egress"))
+        });
+    if !member_present {
+        problems.push("正哨兵缺失: cargo metadata members 不含 humaux-infra-egress".to_string());
+    }
+    problems
+}
+
+/// §83.4 判据1 补充 (manifest-level positive check, 注错 a 的第二重防线): the *set* of
+/// workspace-member manifests that declare a `reqwest`/`hyper` dependency must equal exactly
+/// `{crates/infra-egress/Cargo.toml}`. A raw client call needs a matching `[dependencies]`
+/// entry to even compile, so this catches a second crate reaching for `reqwest`/`hyper` at the
+/// manifest level — before any source-text needle (bare-alias or otherwise) even has a call
+/// site to find. Uses the same `cargo metadata` document [`g80_3_workspace_sentinel`] already
+/// requires, parsed the same way §78.3's `dependency_rule_from_metadata_json` parses it.
+fn g80_3_manifest_dependency_check(metadata_json: &str, root: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    let parsed: serde_json::Value = match serde_json::from_str(metadata_json) {
+        Ok(v) => v,
+        Err(e) => {
+            problems.push(format!("cargo metadata output not valid JSON: {e}"));
+            return problems;
+        }
+    };
+    let Some(packages) = parsed.get("packages").and_then(|p| p.as_array()) else {
+        problems.push("cargo metadata output has no `packages` array".to_string());
+        return problems;
+    };
+
+    // `cargo metadata`'s `manifest_path` is always an absolute, canonicalized path — `root`
+    // here is typically `CARGO_MANIFEST_DIR/..` (a literal, un-canonicalized `..` component),
+    // so a plain `display()` (component-wise `strip_prefix`) never matches it. Canonicalizing
+    // `root` once fixes the real-repo case; fixture tests pass a nonexistent root (e.g.
+    // `/fixture-root`) where `canonicalize` fails, so this falls back to comparing against
+    // `root` as given — exactly [`display`]'s existing behavior for those fixtures.
+    let root_for_display = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    let mut actual: BTreeSet<String> = BTreeSet::new();
+    for pkg in packages {
+        let deps = pkg
+            .get("dependencies")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let depends_on_http_client = deps.iter().any(|d| {
+            matches!(
+                d.get("name").and_then(|n| n.as_str()),
+                Some("reqwest") | Some("hyper")
+            )
+        });
+        if !depends_on_http_client {
+            continue;
+        }
+        let Some(manifest_path) = pkg.get("manifest_path").and_then(|m| m.as_str()) else {
+            continue;
+        };
+        actual.insert(display(&root_for_display, Path::new(manifest_path)));
+    }
+
+    let mut expected = BTreeSet::new();
+    expected.insert("crates/infra-egress/Cargo.toml".to_string());
+    if actual != expected {
+        problems.push(format!(
+            "reqwest/hyper 依赖声明的 manifest 集合 != {{crates/infra-egress/Cargo.toml}}，实际: \
+             {actual:?}"
+        ));
+    }
+    problems
+}
+
+/// §83.4 判据1/2 pure comparator over an already-scanned `.rs` file set — separated from
+/// [`g80_3_outbound_choke_point`] so tests can inject a small fixture file list instead of
+/// scanning (or faking) the whole workspace.
+fn g80_3_transport_and_registry_check(files: &[(PathBuf, String)], root: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    // 判据1: raw client construction path set == {infra-egress/src/http.rs}
+    let mut raw_sites: BTreeSet<String> = BTreeSet::new();
+    for (path, source) in files {
+        if !find_raw_http_client_calls(source).is_empty() {
+            raw_sites.insert(display(root, path));
+        }
+    }
+    let mut expected_raw = BTreeSet::new();
+    expected_raw.insert(INFRA_EGRESS_HTTP_RS.to_string());
+    if raw_sites != expected_raw {
+        problems.push(format!(
+            "raw HTTP client (reqwest::Client::new/builder, hyper::Client::new/builder) 构造 \
+             点集合 != {{{INFRA_EGRESS_HTTP_RS}}}，实际: {raw_sites:?}"
+        ));
+    }
+
+    // 判据2: OutboundPurpose 变体集合 == external-egress-registry 第一列，逐字相等
+    match files
+        .iter()
+        .find(|(p, _)| display(root, p) == "crates/domain/src/egress.rs")
+    {
+        None => problems.push(
+            "missing object: crates/domain/src/egress.rs::OutboundPurpose (§83.4 判据2 尚未\
+             交付)"
+                .to_string(),
+        ),
+        Some((_, source)) => {
+            let actual: BTreeSet<String> = parse_enum_variant_names(source, "OutboundPurpose")
+                .into_iter()
+                .collect();
+            let expected: BTreeSet<String> = EXTERNAL_EGRESS_REGISTRY
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            if actual.is_empty() {
+                problems.push(
+                    "positive control missing: OutboundPurpose 变体集合为空 —— matcher 坏了或\
+                     枚举未落地，两者都必须报红，不得默认放行"
+                        .to_string(),
+                );
+            } else if actual != expected {
+                problems.push(format!(
+                    "OutboundPurpose 变体集合 != external-egress-registry 第一列，实际: \
+                     {actual:?}，期望: {expected:?}"
+                ));
+            }
+
+            // 判据3: 每个 private-data 变体的 tuple payload 必须逐字是 `EgressPermit` ——
+            // "标为 private-data 的 purpose 在类型上只能由 EgressPermit 构造" is a claim
+            // about *this enum's definition text*, not about `authorize`'s behavior, so it
+            // belongs here alongside 判据2 rather than in a trybuild fixture that can only
+            // ever exercise `EgressPermit`'s own construction path (§7.3), never this enum's
+            // payload shape. `EXTERNAL_EGRESS_REGISTRY`'s first three entries are exactly the
+            // private-data rows (registry column order, pinned by 判据2's own comparison).
+            let payloads = parse_enum_variant_payloads(source, "OutboundPurpose");
+            for private_variant in &EXTERNAL_EGRESS_REGISTRY[..3] {
+                match payloads.iter().find(|(name, _)| name == private_variant) {
+                    None => {} // absence is already reported by 判据2 above.
+                    Some((_, None)) => problems.push(format!(
+                        "判据3 违反: OutboundPurpose::{private_variant} 是裸变体，未携带 \
+                         EgressPermit —— private-data purpose 必须类型化携带 permit"
+                    )),
+                    Some((_, Some(payload))) if payload != "EgressPermit" => {
+                        problems.push(format!(
+                            "判据3 违反: OutboundPurpose::{private_variant} 携带的是 \
+                             `{payload}`，不是 `EgressPermit`"
+                        ))
+                    }
+                    Some((_, Some(_))) => {}
+                }
+            }
+        }
+    }
+
+    problems
+}
+
+/// §83.4 G80-3 full check: 判据0/1/2/3, folding in real `cargo metadata` for the workspace
+/// positive sentinel.
+fn g80_3_outbound_choke_point(root: &Path) -> Verdict {
+    // No early `NotApplicable` return for a missing `crates/infra-egress` directory: T4.1 has
+    // already delivered this crate, so its absence from here on is a regression (someone
+    // deleted it), not "not yet built" — 注错 0a's whole point. Falling straight into the
+    // workspace sentinel below reports that as `Fail` with the three named-missing-object
+    // lines it already produces, instead of the vacuous "nothing to scan, so nothing is wrong"
+    // `NotApplicable` a directory-existence early-return would produce.
+    let metadata_json = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+
+    let mut problems = g80_3_workspace_sentinel(root, metadata_json.as_deref());
+    if !problems.is_empty() {
+        // 判据0 任一为假 -> 先红：前提不成立时继续判 1/2/3 只会制造噪声，不会制造信息。
+        return Verdict::Fail(problems);
+    }
+
+    // 判据0 通过意味着 `metadata_json` 一定是 `Some`（sentinel 的 member_present 检查在
+    // `None` 时必产生 problem，已在上面提前返回）——`expect` 而非静默跳过，manifest 依赖检查
+    // 不是可选项。
+    let metadata_json =
+        metadata_json.expect("g80_3_workspace_sentinel passed with no metadata_json");
+    problems.extend(g80_3_manifest_dependency_check(&metadata_json, root));
+
+    let files = walk_workspace_rs(root);
+    problems.extend(g80_3_transport_and_registry_check(&files, root));
+
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
 // ============================================================================
 // entry point
 // ============================================================================
@@ -1251,6 +1666,14 @@ pub fn run(_args: &[String]) -> i32 {
         (
             "§6.2.3 G80-40 static (typed DB pool topology)",
             g6_db_pool_topology(&root),
+        ),
+        (
+            "§83.4 G80-3 (outbound network choke point real RHS)",
+            g80_3_outbound_choke_point(&root),
+        ),
+        (
+            "§11.8 (classify sole construction point)",
+            g11_8_classify_sole_construction_point(&root),
         ),
     ];
 
@@ -2079,5 +2502,318 @@ mod tests {
         )
         .unwrap();
         fs::write(tmp.join("crates/other/src/lib.rs"), "\n").unwrap();
+    }
+
+    // -- §83.4 G80-3: Outbound Network Choke Point ------------------------------------------
+
+    fn outbound_purpose_fixture() -> String {
+        "pub enum OutboundPurpose {\n    \
+             USER_REASONING(EgressPermit),\n    \
+             RETRIEVAL_EMBEDDING(EgressPermit),\n    \
+             RETRIEVAL_RERANK(EgressPermit),\n    \
+             PUBLIC_REASONING,\n    \
+             BILLING,\n    \
+             TRANSACTIONAL_EMAIL,\n    \
+             GIT_PROVIDER,\n    \
+             OAUTH_METADATA,\n    \
+             PUBLIC_SOURCE_FETCH,\n    \
+             DEADMAN_HEALTHCHECK,\n\
+         }\n"
+        .to_string()
+    }
+
+    /// §80.1 准入条件: the real repo, once T4.1 lands, must be green end to end (includes a
+    /// real `cargo metadata` shell-out — this is the one test in this section that is not a
+    /// pure-fixture unit test).
+    #[test]
+    fn g80_3_real_repo_is_green() {
+        assert_eq!(g80_3_outbound_choke_point(&real_root()), Verdict::Pass);
+    }
+
+    /// Positive control: the exact fixture shape above, scanned in isolation, must itself be
+    /// clean — proves a later red is the injected fault, not a matcher that is broken by
+    /// construction.
+    #[test]
+    fn g80_3_clean_fixture_has_no_problems() {
+        let root = PathBuf::from("/fixture-root");
+        let files = vec![
+            (
+                root.join("crates/infra-egress/src/http.rs"),
+                "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
+            ),
+            (
+                root.join("crates/domain/src/egress.rs"),
+                outbound_purpose_fixture(),
+            ),
+        ];
+        assert!(g80_3_transport_and_registry_check(&files, &root).is_empty());
+    }
+
+    /// 注错 a (§83.4): a raw `reqwest::Client::new` written in some other crate must turn
+    /// 判据1 red and name the offending file, alongside the legitimate one.
+    #[test]
+    fn g80_3_fault_raw_client_outside_http_rs_is_red_and_named() {
+        let root = PathBuf::from("/fixture-root");
+        let files = vec![
+            (
+                root.join("crates/infra-egress/src/http.rs"),
+                "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
+            ),
+            (
+                root.join("crates/domain/src/egress.rs"),
+                outbound_purpose_fixture(),
+            ),
+            (
+                root.join("crates/adapters/src/retrieval.rs"),
+                "pub fn g() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
+            ),
+        ];
+        let problems = g80_3_transport_and_registry_check(&files, &root);
+        assert!(!problems.is_empty());
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("crates/adapters/src/retrieval.rs"))
+        );
+    }
+
+    /// 注错 a, bare-alias variant (§83.4): the exact loophole a real reviewer found —
+    /// `use reqwest::Client; Client::new()` (also `Client::default()` and
+    /// `ClientBuilder::new()`) — must be caught even though it never spells `reqwest::` at the
+    /// call site. Before [`BARE_HTTP_CLIENT_NEEDLES`] this whole file scanned clean.
+    #[test]
+    fn g80_3_fault_bare_alias_raw_client_is_red_and_named() {
+        let root = PathBuf::from("/fixture-root");
+        let files = vec![
+            (
+                root.join("crates/infra-egress/src/http.rs"),
+                "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
+            ),
+            (
+                root.join("crates/domain/src/egress.rs"),
+                outbound_purpose_fixture(),
+            ),
+            (
+                root.join("crates/adapters/src/_tmp_review_probe.rs"),
+                "use reqwest::Client;\n\
+                 pub fn a() -> Client { Client::new() }\n\
+                 pub fn b() -> Client { Client::default() }\n\
+                 pub fn c() -> reqwest::ClientBuilder { ClientBuilder::new() }\n"
+                    .to_string(),
+            ),
+        ];
+        let problems = g80_3_transport_and_registry_check(&files, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("crates/adapters/src/_tmp_review_probe.rs")),
+            "bare `Client::new()`/`Client::default()`/`ClientBuilder::new()` must be caught: \
+             {problems:?}"
+        );
+    }
+
+    /// Negative control for [`is_bare_needle_word_start`]: a same-shaped but unrelated local
+    /// type (`MyClient::new(`) must not be mistaken for `reqwest`/`hyper`'s `Client`.
+    #[test]
+    fn g80_3_bare_needle_does_not_match_unrelated_client_suffix_type() {
+        let root = PathBuf::from("/fixture-root");
+        let files = vec![
+            (
+                root.join("crates/infra-egress/src/http.rs"),
+                "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
+            ),
+            (
+                root.join("crates/domain/src/egress.rs"),
+                outbound_purpose_fixture(),
+            ),
+            (
+                root.join("crates/adapters/src/redis.rs"),
+                "struct MyClient;\nimpl MyClient { fn f() -> Self { MyClient::new() } }\n"
+                    .to_string(),
+            ),
+        ];
+        assert!(g80_3_transport_and_registry_check(&files, &root).is_empty());
+    }
+
+    /// 注错 c (§83.4 判据3): a private-data variant that stops carrying `EgressPermit` (the
+    /// spec's own "改成 generic NetworkPermit" wording, reproduced here as a bare variant —
+    /// same red either way, since 判据3 checks the payload's *name*) must turn 判据3 red. Before
+    /// this check existed, the module doc merely *claimed* trybuild fixtures covered this —
+    /// they never did (none of `egress_topology_ui.rs`'s three fixtures touch `OutboundPurpose`
+    /// at all), so this fault ran clean end to end.
+    #[test]
+    fn g80_3_fault_private_variant_without_permit_is_red() {
+        let root = PathBuf::from("/fixture-root");
+        let egress_src = outbound_purpose_fixture()
+            .replace("RETRIEVAL_RERANK(EgressPermit),\n", "RETRIEVAL_RERANK,\n");
+        let files = vec![
+            (
+                root.join("crates/infra-egress/src/http.rs"),
+                "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
+            ),
+            (root.join("crates/domain/src/egress.rs"), egress_src),
+        ];
+        let problems = g80_3_transport_and_registry_check(&files, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("RETRIEVAL_RERANK") && p.contains("判据3")),
+            "{problems:?}"
+        );
+    }
+
+    /// 判据3 must also catch the payload being swapped for a *different* named type (the
+    /// spec's literal "改成 generic NetworkPermit" wording), not just a bare variant.
+    #[test]
+    fn g80_3_fault_private_variant_wrong_payload_type_is_red() {
+        let root = PathBuf::from("/fixture-root");
+        let egress_src = outbound_purpose_fixture().replace(
+            "USER_REASONING(EgressPermit),\n",
+            "USER_REASONING(NetworkPermit),\n",
+        );
+        let files = vec![
+            (
+                root.join("crates/infra-egress/src/http.rs"),
+                "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
+            ),
+            (root.join("crates/domain/src/egress.rs"), egress_src),
+        ];
+        let problems = g80_3_transport_and_registry_check(&files, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("USER_REASONING") && p.contains("NetworkPermit")),
+            "{problems:?}"
+        );
+    }
+
+    /// 注错 b (§83.4): `OutboundPurpose` growing an unregistered variant must turn 判据2 red.
+    #[test]
+    fn g80_3_fault_unregistered_purpose_variant_is_red() {
+        let root = PathBuf::from("/fixture-root");
+        let mut egress_src = outbound_purpose_fixture();
+        egress_src = egress_src.replace(
+            "DEADMAN_HEALTHCHECK,\n",
+            "DEADMAN_HEALTHCHECK,\n    MYSTERY_PROVIDER,\n",
+        );
+        let files = vec![
+            (
+                root.join("crates/infra-egress/src/http.rs"),
+                "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
+            ),
+            (root.join("crates/domain/src/egress.rs"), egress_src),
+        ];
+        let problems = g80_3_transport_and_registry_check(&files, &root);
+        assert!(problems.iter().any(|p| p.contains("MYSTERY_PROVIDER")));
+    }
+
+    /// 注错 0a (§83.4): deleting `infra-egress/src/http.rs` must flip the positive sentinel
+    /// red, even when `cargo metadata` still (on paper) lists the crate as a member.
+    #[test]
+    fn g80_3_sentinel_flags_deleted_http_rs() {
+        let tmp = fresh_tmp("g80-3-deleted-http-rs");
+        fs::create_dir_all(tmp.join("crates/infra-egress/src")).unwrap();
+        fs::write(tmp.join("crates/infra-egress/Cargo.toml"), "").unwrap();
+        // http.rs deliberately not written.
+        let fake_metadata = r#"{"packages":[{"name":"humaux-infra-egress"}]}"#;
+        let problems = g80_3_workspace_sentinel(&tmp, Some(fake_metadata));
+        assert!(problems.iter().any(|p| p.contains(INFRA_EGRESS_HTTP_RS)));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 0b (§83.4): removing the crate from `cargo metadata`'s member list (e.g. dropped
+    /// from the workspace `Cargo.toml`) must flip the positive sentinel red even though the
+    /// files themselves are still on disk.
+    #[test]
+    fn g80_3_sentinel_flags_missing_metadata_member() {
+        let tmp = fresh_tmp("g80-3-missing-member");
+        fs::create_dir_all(tmp.join("crates/infra-egress/src")).unwrap();
+        fs::write(tmp.join("crates/infra-egress/Cargo.toml"), "").unwrap();
+        fs::write(tmp.join(INFRA_EGRESS_HTTP_RS), "").unwrap();
+        let fake_metadata = r#"{"packages":[{"name":"humaux-domain"}]}"#;
+        let problems = g80_3_workspace_sentinel(&tmp, Some(fake_metadata));
+        assert!(problems.iter().any(|p| p.contains("cargo metadata")));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Regression pin for the `member_present` fix: `"humaux-infra-egress"` appearing only as
+    /// a *substring* of some other package's dependency listing (a plausible shape once a
+    /// second crate path-depends on it by name) must NOT read as the crate itself being a
+    /// workspace member — the bug this test would have caught: `.contains("humaux-infra-egress")`
+    /// over the raw JSON text stays true here even though no `packages[].name` equals it.
+    #[test]
+    fn g80_3_sentinel_member_present_requires_exact_name_not_substring() {
+        let tmp = fresh_tmp("g80-3-substring-not-member");
+        fs::create_dir_all(tmp.join("crates/infra-egress/src")).unwrap();
+        fs::write(tmp.join("crates/infra-egress/Cargo.toml"), "").unwrap();
+        fs::write(tmp.join(INFRA_EGRESS_HTTP_RS), "").unwrap();
+        // No package here is literally named `humaux-infra-egress` — it only appears inside
+        // another package's dependency list (e.g. after the crate was dropped from `members`
+        // but a stale path-dependency edge to it still resolves in the lockfile/graph).
+        let fake_metadata = r#"{"packages":[{"name":"humaux-domain","dependencies":[]},
+            {"name":"humaux-other","dependencies":[{"name":"humaux-infra-egress"}]}]}"#;
+        let problems = g80_3_workspace_sentinel(&tmp, Some(fake_metadata));
+        assert!(
+            problems.iter().any(|p| p.contains("cargo metadata")),
+            "a dependency edge naming the crate must not be mistaken for workspace membership: \
+             {problems:?}"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// §83.4 判据0, full-path 注错 0a: with `crates/infra-egress` already delivered, deleting
+    /// the whole directory must flip [`g80_3_outbound_choke_point`] itself to `Fail`, not
+    /// `NotApplicable` — the early-return this test replaces made deletion vacuously
+    /// undetectable (判据1's raw-client scan finds nothing to complain about when there is
+    /// nothing left to scan).
+    #[test]
+    fn g80_3_outbound_choke_point_fails_when_infra_egress_directory_is_deleted() {
+        let tmp = fresh_tmp("g80-3-deleted-crate-full-path");
+        fs::create_dir_all(&tmp).unwrap();
+        // No `crates/infra-egress` at all, and no workspace `Cargo.toml` for `cargo metadata`
+        // to succeed against either — both read as absence, which is exactly the point: once
+        // delivered, absence is a fault, never a legitimate "nothing to check" state.
+        assert_eq!(
+            g80_3_outbound_choke_point(&tmp),
+            Verdict::Fail(g80_3_workspace_sentinel(&tmp, None))
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Positive control for [`g80_3_manifest_dependency_check`]: the real repo's own `cargo
+    /// metadata` document must show exactly one `reqwest`/`hyper`-dependent manifest.
+    #[test]
+    fn g80_3_manifest_dependency_check_real_repo_is_clean() {
+        let root = real_root();
+        let output = Command::new("cargo")
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .current_dir(&root)
+            .output()
+            .expect("cargo metadata");
+        assert!(output.status.success());
+        let metadata_json = String::from_utf8_lossy(&output.stdout);
+        assert!(g80_3_manifest_dependency_check(&metadata_json, &root).is_empty());
+    }
+
+    /// 注错 a, manifest-level (§83.4 判据1 补充): a second workspace member declaring a
+    /// `reqwest` dependency must be reported even before any source line calls it.
+    #[test]
+    fn g80_3_manifest_dependency_check_fault_second_crate_depends_on_reqwest() {
+        let root = PathBuf::from("/fixture-root");
+        let metadata_json = r#"{"packages":[
+            {"name":"humaux-infra-egress",
+             "manifest_path":"/fixture-root/crates/infra-egress/Cargo.toml",
+             "dependencies":[{"name":"reqwest"}]},
+            {"name":"humaux-adapters",
+             "manifest_path":"/fixture-root/crates/adapters/Cargo.toml",
+             "dependencies":[{"name":"reqwest"}]}
+        ]}"#;
+        let problems = g80_3_manifest_dependency_check(metadata_json, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("crates/adapters/Cargo.toml")),
+            "{problems:?}"
+        );
     }
 }

@@ -6,3 +6,14 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# T4.4/T4.5 §11/§11.1: this binary is the one process allowed to hold both `PrivateWorkerDbPool`
+# (role_private_worker, §6.2.1 R+W on `private.*`) and BYOK decrypt capability
+# (`humaux_adapters::byok`/`openbao`, §11.1 "仅 humaux-private-worker 在最贴近 adapter 处解密")
+# — unlike `humaux-consolidation-worker`, which deliberately has no path to either (see that
+# binary's own Cargo.toml comment). This skeleton only wires the DB pool; the BYOK provider
+# client and its OpenBao/transport backends are pending wiring (openbao.rs / infra-egress's
+# richer transport are still stubs, see `crates/adapters/src/byok.rs`'s module doc).
+humaux-adapters = { path = "../../crates/adapters" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

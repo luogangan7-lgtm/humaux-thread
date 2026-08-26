@@ -1,0 +1,25 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# §7.2 T4.1: control.egress_policies — per-tenant external-retrieval-egress switch.
+
+migration_id = "0051_egress_policies"
+class = "REVERSIBLE"
+
+precheck = "SELECT to_regclass('control.egress_policies') IS NULL AS precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.egress_policies') is not null
+  and (select relrowsecurity from pg_class where oid = 'control.egress_policies'::regclass)
+  and (select relforcerowsecurity from pg_class where oid = 'control.egress_policies'::regclass)
+  and (select count(*) from pg_policies where schemaname = 'control' and tablename = 'egress_policies') = 1
+  and (select tableowner from pg_tables where schemaname = 'control' and tablename = 'egress_policies') = 'role_migration_owner'
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP TABLE control.egress_policies;
+(no data ever existed before this migration — table is new, drop is safe with no forward-fix
+need as long as no application code has started writing rows yet).
+"""
+
+backup_restore_requirement = "none (new empty table, no existing data touched)"

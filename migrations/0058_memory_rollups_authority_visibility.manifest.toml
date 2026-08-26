@@ -1,0 +1,74 @@
+# §46.1 migration manifest (G46-1 / G80-37). Fixer-review follow-up to
+# 0005_private_pipeline / 0012_rls.sql: gives private.memory_rollups its own Authority class
+# (§11.9 ceiling has nothing to constrain otherwise) and its own visibility scoping (closes the
+# tenant-wide-readable-rollup-of-a-USER_PRIVATE/WORKSPACE_SHARED-summary gap the blanket
+# tenant-only policy left open). REVERSIBLE — new columns + constraints + one policy swap on an
+# existing, currently-empty table, no data migration.
+
+migration_id = "0058_memory_rollups_authority_visibility"
+class = "REVERSIBLE"
+
+precheck = """
+select not exists (
+  select 1 from information_schema.columns
+  where table_schema = 'private' and table_name = 'memory_rollups'
+    and column_name = 'authority_class'
+) as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'memory_rollups'
+      and column_name = 'authority_class' and is_nullable = 'NO'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'memory_rollups'
+      and column_name = 'visibility_class' and is_nullable = 'NO'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'memory_rollups'
+      and column_name = 'visibility_user_id'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'memory_rollups'
+      and column_name = 'visibility_workspace_id'
+  )
+  and not exists (
+    select 1 from pg_policies
+    where schemaname = 'private' and tablename = 'memory_rollups'
+      and policyname = 'memory_rollups_tenant_isolation'
+  )
+  and exists (
+    select 1 from pg_policies
+    where schemaname = 'private' and tablename = 'memory_rollups'
+      and policyname = 'memory_rollups_tenant_and_visibility'
+  )
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'private.memory_rollups'::regclass)
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback:
+  DROP POLICY IF EXISTS memory_rollups_tenant_and_visibility ON private.memory_rollups;
+  CREATE POLICY memory_rollups_tenant_isolation ON private.memory_rollups
+    USING (tenant_id = current_setting('humaux.tenant_id', true)::uuid)
+    WITH CHECK (tenant_id = current_setting('humaux.tenant_id', true)::uuid);
+  ALTER TABLE private.memory_rollups
+    DROP CONSTRAINT IF EXISTS memory_rollups_visibility_matches_class,
+    DROP CONSTRAINT IF EXISTS memory_rollups_authority_class_known,
+    DROP COLUMN IF EXISTS visibility_workspace_id,
+    DROP COLUMN IF EXISTS visibility_user_id,
+    DROP COLUMN IF EXISTS visibility_class,
+    DROP COLUMN IF EXISTS authority_class;
+  -- safe only as long as no application code has shipped depending on any of the above —
+  -- true at the time this migration lands (publish_rollup is this same review's own change,
+  -- gated behind the same review).
+"""
+
+backup_restore_requirement = "standard pre-deploy snapshot; private.memory_rollups is empty in every environment this migration has been applied to (verified live: select count(*) = 0), so the NOT NULL columns need no backfill UPDATE"

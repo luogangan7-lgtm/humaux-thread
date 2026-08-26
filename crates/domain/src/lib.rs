@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod authority;
 pub mod code;
+pub mod consolidate;
 pub mod context;
 pub mod coordination;
 pub mod dataclass;

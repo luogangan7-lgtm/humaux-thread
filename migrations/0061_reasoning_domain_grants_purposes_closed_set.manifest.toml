@@ -1,0 +1,51 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# Fixer-review follow-up to 0049_reasoning_domain_columns: control.reasoning_domain_grants.purposes
+# becomes non-empty + closed-set, and loses its `'{}'` default — without editing the
+# already-applied 0049.
+
+migration_id = "0061_reasoning_domain_grants_purposes_closed_set"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  not exists (
+    select 1 from pg_constraint
+    where conname = 'reasoning_domain_grants_purposes_nonempty'
+  )
+  and not exists (
+    select 1 from pg_constraint
+    where conname = 'reasoning_domain_grants_purposes_known'
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from pg_constraint
+    where conname = 'reasoning_domain_grants_purposes_nonempty'
+      and conrelid = 'control.reasoning_domain_grants'::regclass
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'reasoning_domain_grants_purposes_known'
+      and conrelid = 'control.reasoning_domain_grants'::regclass
+  )
+  and (select column_default from information_schema.columns
+       where table_schema = 'control' and table_name = 'reasoning_domain_grants'
+         and column_name = 'purposes') is null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE control.reasoning_domain_grants
+            DROP CONSTRAINT reasoning_domain_grants_purposes_known;
+          ALTER TABLE control.reasoning_domain_grants
+            DROP CONSTRAINT reasoning_domain_grants_purposes_nonempty;
+          ALTER TABLE control.reasoning_domain_grants
+            ALTER COLUMN purposes SET DEFAULT '{}';
+          (safe — table has zero rows anywhere this migration has run, no INSERT target for it
+          exists in the codebase yet)
+"""
+
+backup_restore_requirement = "none (two CHECK constraints + one DROP DEFAULT, zero rows in the table anywhere this has run)"

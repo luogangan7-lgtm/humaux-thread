@@ -1,0 +1,37 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T4.8 (§37/§37.1/§37.2/DeletionGraph): control.deletion_requests + ops.deletion_plan_steps,
+# plus two SECURITY DEFINER writer functions (ops.record_deletion_plan_step,
+# control.advance_deletion_request). Neither new table nor either function touches
+# projection.stream_log's columns or role grants — the frozen 12-column DDL (§15.1) and its
+# existing role_maintenance UPDATE grant (0011) are unchanged by this file.
+
+migration_id = "0054_deletion_plan"
+class = "REVERSIBLE"
+
+precheck = "SELECT to_regclass('control.deletion_requests') IS NULL AND to_regclass('ops.deletion_plan_steps') IS NULL AS precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.deletion_requests') is not null
+  and to_regclass('ops.deletion_plan_steps') is not null
+  and (select count(*) from information_schema.columns
+       where table_schema = 'projection' and table_name = 'stream_log') = 12
+  and has_function_privilege('role_maintenance',
+        'ops.record_deletion_plan_step(uuid,uuid,text,smallint,text,text)', 'EXECUTE')
+  and has_function_privilege('role_maintenance',
+        'control.advance_deletion_request(uuid,uuid,text)', 'EXECUTE')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP FUNCTION control.advance_deletion_request(uuid, uuid, text);
+  DROP FUNCTION ops.record_deletion_plan_step(uuid, uuid, text, smallint, text, text);
+  DROP TABLE ops.deletion_plan_steps;
+  DROP TABLE control.deletion_requests;
+  (safe before any deletion request has been created — both tables are new, nothing else
+  references them; after production deletion requests exist, dropping is data loss and the
+  forward-fix is instead to stop writing new rows and archive the two tables' existing
+  contents before a later, deliberate drop.)
+"""
+
+backup_restore_requirement = "none (two new tables + two new functions; no existing rows read or written; projection.stream_log is only read by this migration's postcheck column-count assertion, never written)"

@@ -6,3 +6,44 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# T4.6/T4.7 §11.7/§11.8: this binary's whole reason to exist is "owns ConsolidationDbPool,
+# does NOT own User BYOK decrypt capability" (§11.8) — expressed here as a dependency-graph
+# fact, not a comment: this Cargo.toml has no path to `byok`/`openbao` (both live inside
+# `humaux-adapters`, which this crate DOES depend on for `ConsolidationDbPool`/
+# `consolidate_repo`, but importing one module of a crate does not pull in another; nothing
+# below reaches `humaux_adapters::byok`). Its only inference capability is the
+# `PrivateReasoningPort` trait object from `humaux-application` — the sealed mTLS RPC client
+# that will implement it for real lives in a later task, out of this binary's file scope.
+humaux-adapters = { path = "../../crates/adapters" }
+humaux-application = { path = "../../crates/application" }
+humaux-domain = { path = "../../crates/domain" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `sqlx::types::Uuid` (what `consolidate_repo`'s functions take) is the literal `uuid::Uuid`
+# re-export (`crates/adapters/Cargo.toml`'s own doc comment on the H3 sqlx feature flags says
+# so) — pinning the same version directly lets this binary build/pass ids without depending on
+# `sqlx` itself (kept out of this Cargo.toml on purpose, same reasoning as the byok/openbao
+# comment above: the fewer capability-shaped things this binary can name, the fewer things it
+# could accidentally acquire).
+uuid = "1.25.0"
+serde_json = "1"
+# §11.8 `input_manifest_hash`: SHA-256 over this run's own materialized
+# `(memory_id, input_version, source_hash, ordinal)` tuples — same version pin as every other
+# sha2 use in this workspace (`crates/domain`/`application`/`adapters`/`protocol`/`contracts`
+# Cargo.toml, all "0.11"), not a second independent one.
+sha2 = "0.11"
+
+[dev-dependencies]
+# `tests/run_once_e2e.rs` — real-DB integration coverage for `run_once` (G11-R1/§79.2; before
+# this task neither existed anywhere in the workspace). Same version/feature pins
+# `crates/adapters/Cargo.toml`'s dev-dependencies already use for the equivalent seeding job in
+# `tests/consolidate_snapshot.rs`, not a second independent choice.
+postgres = { version = "0.19", features = ["with-uuid-1", "with-serde_json-1"] }
+uuid = { version = "1.25.0", features = ["v4"] }
+humaux-testkit = { path = "../../crates/testkit" }
+# The test's `FakePort` implements `PrivateReasoningPort`, which is itself declared with
+# `#[async_trait::async_trait]` (`crates/application/src/consolidate.rs`) — an implementor in
+# a different crate needs the same macro, same version pin as
+# `crates/application`/`crates/adapters` already use.
+async-trait = "0.1"

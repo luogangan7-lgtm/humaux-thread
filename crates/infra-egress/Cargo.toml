@@ -6,3 +6,21 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# §83.4: this crate's `src/http.rs` is the WORKSPACE'S ONLY sanctioned place to construct a
+# `reqwest::Client` — `xtask architecture-check`'s G80-3 (b) asserts that construction-site
+# set is exactly `{crates/infra-egress/src/http.rs}`.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# `ExternalCall` (§7.3, `humaux-domain`) is declared `#[async_trait]` there; this crate's impl
+# of it needs the identical macro.
+async-trait = "0.1"
+humaux-domain = { path = "../domain" }
+
+[dev-dependencies]
+# "net"/"io-util" back the tests' real `TcpListener` fixtures (§79: observe actual network
+# behavior instead of inferring it from an error-code side channel); "time" backs
+# `tokio::time::{sleep,timeout}`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# tests below mint throwaway `ProcessorId(Uuid::now_v7())` fixtures directly.
+uuid = { version = "1.25.0", features = ["v7"] }

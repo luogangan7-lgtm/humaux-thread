@@ -1,0 +1,11 @@
+error: cannot construct `EgressPermit` with struct literal syntax due to private fields
+ --> tests/ui/fail_egress_permit_struct_literal.rs:7:33
+  |
+7 |     let _permit: EgressPermit = EgressPermit {};
+  |                                 ^^^^^^^^^^^^
+  |
+help: you might have meant to use the `issue` associated function
+  |
+7 -     let _permit: EgressPermit = EgressPermit {};
+7 +     let _permit: EgressPermit = EgressPermit::issue(_, _, _, _, _, _);
+  |
