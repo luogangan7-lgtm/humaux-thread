@@ -6,6 +6,7 @@
 
 mod architecture_check;
 mod benchset_declaration;
+mod card_version;
 mod config_check;
 mod contract_impact;
 mod direction_table;
@@ -33,10 +34,11 @@ fn main() {
         Some("gate-registry") => gate_registry::run(&args[2..]),
         Some("dod-check") => dod_check::run(&args[2..]),
         Some("direction-table") => direction_table::run(&args[2..]),
+        Some("card-version") => card_version::run(&args[2..]),
         Some("migrate") => migrate::run(&args[2..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|direction-table>"
+                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|direction-table|card-version>"
             );
             2
         }
