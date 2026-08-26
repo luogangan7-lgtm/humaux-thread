@@ -6,5 +6,6 @@
 pub mod code;
 pub mod dense;
 pub mod graph;
+pub mod serving;
 pub mod sparse;
 pub mod stream;
