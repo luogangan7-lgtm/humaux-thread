@@ -7,6 +7,7 @@ pub mod audit_sink;
 pub mod batch;
 pub mod byok;
 pub mod dashscope;
+pub mod disclosure;
 pub mod email;
 pub mod jobs;
 pub mod openbao;

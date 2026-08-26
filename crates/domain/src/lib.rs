@@ -8,6 +8,8 @@ pub mod authority;
 pub mod code;
 pub mod context;
 pub mod coordination;
+pub mod dataclass;
+pub mod egress;
 pub mod error;
 pub mod evidence;
 pub mod identity;
