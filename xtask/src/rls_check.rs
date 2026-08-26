@@ -1968,13 +1968,32 @@ mod tests {
     // separate fixture schema is invisible to them; only the real object is.
     // ------------------------------------------------------------------
 
+    /// `HUMAUX_REQUIRE_DB=1` ⇒ 本文件里的跳过一律改为 panic。
+    ///
+    /// 与 `humaux_testkit::skip_or_fail` 同一条规矩（ADR-0005），只是 `xtask` 不依赖
+    /// testkit，所以在这里就地实现同样的语义而不是为一个常量加一条 crate 依赖。
+    /// 语义必须与那边逐字一致：**声明了有库却拿不到，是环境坏了，不是这条测试不适用。**
+    fn skip_is_a_failure() -> bool {
+        std::env::var("HUMAUX_REQUIRE_DB").is_ok_and(|v| v == "1")
+    }
+
     macro_rules! txn_or_skip {
         ($client:ident, $txn:ident) => {
             let Ok(dsn) = std::env::var(DSN_ENV) else {
+                assert!(
+                    !skip_is_a_failure(),
+                    "HUMAUX_REQUIRE_DB is set, so a skip here is a failure — \
+                     missing object: {DSN_ENV}"
+                );
                 eprintln!("rls-check test: not_applicable — {DSN_ENV} unset, skipping");
                 return;
             };
             let Ok(mut $client) = Client::connect(&dsn, NoTls) else {
+                assert!(
+                    !skip_is_a_failure(),
+                    "HUMAUX_REQUIRE_DB is set, so a skip here is a failure — \
+                     missing object: reachable Postgres at {DSN_ENV}"
+                );
                 eprintln!("rls-check test: not_applicable — cannot reach Postgres, skipping");
                 return;
             };

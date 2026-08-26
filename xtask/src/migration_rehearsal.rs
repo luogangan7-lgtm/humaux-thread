@@ -238,9 +238,9 @@ pub fn check_static(migrations_dir: &Path) -> (Vec<Manifest>, Vec<CheckError>) {
 
 /// `cargo xtask migration-rehearsal` — G46-1 / G80-37 (§46.1).
 ///
-/// Static manifest contract always runs and can `fail`. Rehearsal execution (spin up
-/// Postgres, run `up -> down -> up`, diff schema digest per class) is `not_applicable`
-/// this phase per §57.1 rule 3 — Phase 0 ships no runtime DB to rehearse against.
+/// Static manifest contract always runs and can `fail`. Rehearsal execution
+/// （`up -> down -> up` + 逐 class 比对 schema digest）目前仍是 `not_applicable`——
+/// 但**缺的是执行器，不是库**，见 [`rehearsal_execution_verdict`]。
 pub fn run(_args: &[String]) -> i32 {
     let migrations_dir = Path::new("migrations");
     let (manifests, errors) = check_static(migrations_dir);
@@ -261,17 +261,73 @@ pub fn run(_args: &[String]) -> i32 {
     for m in &manifests {
         eprintln!("  {} class={:?}", m.migration_id, m.class);
     }
-    eprintln!(
-        "migration-rehearsal: rehearsal execution not_applicable (missing object: \
-         live PostgreSQL instance for up/down/up + schema_digest_before/after comparison \
-         — Phase 0 has no runtime DB infrastructure, §57.1 rule 3)"
-    );
+    eprintln!("{}", rehearsal_execution_verdict(database_dsn().is_some()));
     0
+}
+
+/// 本次运行有没有可用的库 DSN。§78 的 env 扫描把 `xtask/` 整个豁免（它是 CI 闸工具本身），
+/// 所以这里直读环境变量是允许的。
+fn database_dsn() -> Option<String> {
+    ["HUMAUX_TEST_PG_DSN", "DATABASE_URL"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+}
+
+/// Rehearsal 执行段的三态措辞。**纯函数，便于直接对两种世界断言**。
+///
+/// 先前这里是一句**写死的**常量：「missing object: live PostgreSQL instance … Phase 0 has
+/// no runtime DB infrastructure」。它点错了对象，而且那个错会**永远为真**——无论环境怎么
+/// 变，那个字符串都说"没有库"。ADR-0005 给 CI 配上 Postgres service 之后，它声称缺失的
+/// 东西根本不缺了，可它一个字都不会变。
+///
+/// §57.1 第2条要求 NA「打印缺失对象名」，而缺失对象得是**探测出来的**，不是作者当年写下
+/// 的判断（ADR-0006：NA 的主语选错，闸就会在情况变化后继续沉默）。所以改成据实分辨：
+/// - 没有 DSN ⇒ 缺的是库；
+/// - 有 DSN ⇒ 库在，缺的是**执行器本身**（DOD-089，phase=16 尚未交付）。
+///
+/// 两种情形都仍是 `not_applicable`（执行器确实没交付），但说的是实话，而且执行器落地那天
+/// 这句话会自己变——不需要有人记得回来改一句注释。
+fn rehearsal_execution_verdict(has_dsn: bool) -> String {
+    if has_dsn {
+        "migration-rehearsal: rehearsal execution not_applicable (missing object: \
+         rehearsal executor itself — up/down/up + schema_digest_before/after 比对尚未实现，\
+         DOD-089 phase=16。**库不是瓶颈**：本次运行已有可用 DSN)"
+            .to_string()
+    } else {
+        "migration-rehearsal: rehearsal execution not_applicable (missing object: \
+         HUMAUX_TEST_PG_DSN / DATABASE_URL — 没有库可以 rehearse。执行器本身也尚未实现，\
+         DOD-089 phase=16)"
+            .to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 两种世界必须说不同的话。先前那句写死的常量对两种世界说同一句，而且那句在有库时
+    /// 是**假的**——ADR-0005 给 CI 配上 Postgres service 之后它依然宣称「没有库」。
+    #[test]
+    fn rehearsal_verdict_names_the_object_that_is_actually_missing() {
+        let without = rehearsal_execution_verdict(false);
+        let with = rehearsal_execution_verdict(true);
+
+        assert!(without.contains("HUMAUX_TEST_PG_DSN"), "{without}");
+        assert!(
+            with.contains("rehearsal executor itself"),
+            "有库时缺的是执行器，不该再说缺库: {with}"
+        );
+        assert!(
+            !with.contains("HUMAUX_TEST_PG_DSN /"),
+            "有库时不得把库列为缺失对象: {with}"
+        );
+        assert_ne!(without, with, "两种世界说同一句话 = 这条判定其实没在看环境");
+        // §57.1 第2条：两种情形都必须打印缺失对象名。
+        for v in [&without, &with] {
+            assert!(v.contains("missing object"), "{v}");
+            assert!(v.contains("not_applicable"), "{v}");
+        }
+    }
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
