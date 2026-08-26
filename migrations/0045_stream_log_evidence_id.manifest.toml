@@ -1,0 +1,30 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T3.8 (§15.5 read-your-writes: consistency_token + PG delta overlay): `role_gateway` has no
+# `SELECT` on `ops.outbox` (0011), so the serving-path overlay this task implements cannot
+# discover an Evidence's id from `projection.stream_log` via that table. One nullable FK
+# column, no data touched, no privileges changed (table-level SELECT/INSERT already covers
+# new columns).
+
+migration_id = "0045_stream_log_evidence_id"
+class = "REVERSIBLE"
+
+precheck = "SELECT NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='projection' AND table_name='stream_log' AND column_name='evidence_id') AS precheck_ok"
+
+postcheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'stream_log' and column_name = 'evidence_id'
+  )
+  and has_column_privilege('role_gateway', 'projection.stream_log', 'evidence_id', 'SELECT')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE projection.stream_log DROP COLUMN evidence_id;
+  (safe as long as no adapters::retrieve query has shipped depending on it being populated —
+  the column is nullable and additive, so a rollback only loses the evidence_id linkage, it
+  cannot orphan any other row.)
+"""
+
+backup_restore_requirement = "none (additive nullable column, no existing rows rewritten, no privileges changed)"

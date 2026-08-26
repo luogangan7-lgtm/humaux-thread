@@ -6,3 +6,11 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# T3.3+T3.4 (§15.1/§15.4) `stream::StreamKey` wraps `humaux_domain::ids::TenantId` (reuse,
+# not a second tenant-id type) and needs `Uuid` for `scope_id`/`stream_key_text` encoding —
+# no new feature flags beyond the crate's own default (Display/FromStr only, no `v7` minting
+# here: this module never mints an id, only carries and formats one).
+humaux-domain = { path = "../domain" }
+uuid = "1.25.0"

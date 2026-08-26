@@ -1,0 +1,29 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T3.1+T3.2 (§60 Transactional Outbox Rust 伪实现): `remember()`'s transaction B calls
+# `next_commit_seq(tx)` as its first step. No earlier migration created a commit_seq
+# generator (§60's own pseudocode names the function but never its DDL) — this migration
+# adds exactly one `CREATE SEQUENCE` plus the one GRANT its sole caller (role_gateway,
+# §34.2) needs. No table, no row, no policy touched.
+
+migration_id = "0043_commit_sequence"
+class = "REVERSIBLE"
+
+precheck = "SELECT to_regclass('ops.commit_seq_seq') IS NULL AS precheck_ok"
+
+postcheck = """
+select
+  to_regclass('ops.commit_seq_seq') is not null
+  and has_sequence_privilege('role_gateway', 'ops.commit_seq_seq', 'USAGE')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP SEQUENCE ops.commit_seq_seq;
+  (safe only before any row in ops.outbox / projection.stream_log has bound a commit_seq
+  value drawn from it — after that, dropping the generator does not touch already-written
+  rows, but a fresh generator restarting at 1 could collide with historical commit_seq
+  values on a re-create; forward-fix by creating a differently-named sequence and updating
+  next_commit_seq's call site instead of dropping+recreating under contention.)
+"""
+
+backup_restore_requirement = "none (new sequence object + one GRANT; no existing rows read or written)"

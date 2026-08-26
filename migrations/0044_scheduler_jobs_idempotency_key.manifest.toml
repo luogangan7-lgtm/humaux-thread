@@ -1,0 +1,22 @@
+# §46.1 migration manifest (G32-1 / G80-38).
+# §32.1 Scheduler Singleton/Failover Gate: adds the plain UNIQUE(idempotency_key) index on
+# ops.jobs the scheduler's exactly-once enqueue INSERT ... ON CONFLICT (idempotency_key)
+# needs (0008's UNIQUE(tenant_id, idempotency_key) does not satisfy that conflict target).
+# ops.scheduler_leases already has PK(schedule_id, planned_at) + UNIQUE(idempotency_key)
+# from 0008 — no change needed there.
+
+migration_id = "0044_scheduler_jobs_idempotency_key"
+class = "REVERSIBLE"
+
+precheck = "select to_regclass('ops.ops_jobs_idempotency_key_key') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('ops.ops_jobs_idempotency_key_key') is not null
+  and (select indisunique from pg_index where indexrelid = 'ops.ops_jobs_idempotency_key_key'::regclass) = true
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP INDEX IF EXISTS ops.ops_jobs_idempotency_key_key; — only after confirming no scheduler/J3 caller depends on it (see .sql file header)."
+
+backup_restore_requirement = "none (catalog-only index add, no data touched, IF NOT EXISTS makes re-apply a no-op)"

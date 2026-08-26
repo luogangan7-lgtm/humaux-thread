@@ -4,11 +4,17 @@
 //! Domain 永不 import HTTP / SQLx / Qdrant / Provider SDK / ENV（§3 / §78.3）。
 
 pub mod audit_sink;
+pub mod batch;
 pub mod byok;
 pub mod dashscope;
 pub mod email;
+pub mod jobs;
 pub mod openbao;
 pub mod postgres;
 pub mod qdrant;
+pub mod remember;
+pub mod retrieve;
 pub mod s3;
+pub mod scheduler;
+pub mod stream_repo;
 pub mod valkey;

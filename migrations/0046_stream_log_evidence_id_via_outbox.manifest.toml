@@ -1,0 +1,30 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T3.8 follow-up on 0045 (see that file's own header + this file's SQL header for the full
+# reasoning): drops the unpopulated `stream_log.evidence_id` column 0045 added and grants
+# `role_gateway` `SELECT` on `ops.outbox` instead — the join key with no cross-stream
+# ambiguity risk (`commit_seq` is globally unique; `stream_seq` alone is only unique within
+# one stream key).
+
+migration_id = "0046_stream_log_evidence_id_via_outbox"
+class = "REVERSIBLE"
+
+precheck = "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='projection' AND table_name='stream_log' AND column_name='evidence_id') AND NOT has_table_privilege('role_gateway', 'ops.outbox', 'SELECT') AS precheck_ok"
+
+postcheck = """
+select
+  not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'stream_log' and column_name = 'evidence_id'
+  )
+  and has_table_privilege('role_gateway', 'ops.outbox', 'SELECT')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: REVOKE SELECT ON ops.outbox FROM role_gateway;
+  ALTER TABLE projection.stream_log ADD COLUMN evidence_id uuid REFERENCES private.evidence_objects(evidence_id);
+  (restores 0045's shape exactly; safe, no data existed in the dropped column since nothing
+  ever wrote to it.)
+"""
+
+backup_restore_requirement = "none (drops an always-NULL column, adds one SELECT grant; no rows touched)"

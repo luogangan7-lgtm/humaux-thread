@@ -18,13 +18,20 @@
 //! task canvas; land a real static scan (or equivalent) before G80-40 / G6-DB1 assertion B is
 //! treated as closed.
 //!
-//! Closed set (§6.2.3): four newtypes, one per role that holds a standing connection pool.
-//! `inner` is private to this module on every wrapper; none of them implement `From`/`Into`
-//! of one another, `Deref<Target = PgPool>`, or `Clone` — a leaked `PgPool` (via any of
-//! those) would let a caller run SQL under the wrong role's grants, defeating the entire
-//! point of the closed set. Application ports must take `&RuntimeDbPool` /
-//! `&BatchIssuerDbPool` / `&ConsolidationDbPool` / `&PrivateWorkerDbPool` by name, never a
-//! bare `PgPool` (G6-DB1 `tests/ui/pass_*` / `fail_*` fixtures prove both directions).
+//! Closed set (§6.2.3): six newtypes, one per role that holds a standing connection pool
+//! (four landed with T1.4; T3.3+T3.4 adds `RetrievalWorkerDbPool` / `MaintenanceDbPool` —
+//! §15.4 `advance_prefix`'s `projection_highwater` write and §15.2's `ISSUED -> LOST` sweep
+//! are each the *only* legal writer of their respective column/transition per the §6.2.2
+//! grant matrix and `stream_log_guard_state_transition`'s per-`current_user` transition set
+//! in `0011_roles_and_grants.sql`, so each needs its own role-scoped pool rather than reusing
+//! one of the original four). `inner` is private to this module on every wrapper; none of
+//! them implement `From`/`Into` of one another, `Deref<Target = PgPool>`, or `Clone` — a
+//! leaked `PgPool` (via any of those) would let a caller run SQL under the wrong role's
+//! grants, defeating the entire point of the closed set. Application ports must take
+//! `&RuntimeDbPool` / `&BatchIssuerDbPool` / `&ConsolidationDbPool` / `&PrivateWorkerDbPool` /
+//! `&RetrievalWorkerDbPool` / `&MaintenanceDbPool` by name, never a bare `PgPool` (G6-DB1
+//! `tests/ui/pass_*` / `fail_*` fixtures prove both directions for the original four; the two
+//! added here follow the same `connect_checked` construction path so the same proof applies).
 
 use std::fmt;
 
@@ -39,6 +46,10 @@ pub const ROLE_BATCH_ISSUER: &str = "role_batch_issuer";
 pub const ROLE_CONSOLIDATION_WORKER: &str = "role_consolidation_worker";
 /// Literal `current_user` a [`PrivateWorkerDbPool`] connection must report (§6.2.3 assertion E).
 pub const ROLE_PRIVATE_WORKER: &str = "role_private_worker";
+/// Literal `current_user` a [`RetrievalWorkerDbPool`] connection must report (§6.2.3 assertion E).
+pub const ROLE_RETRIEVAL_WORKER: &str = "role_retrieval_worker";
+/// Literal `current_user` a [`MaintenanceDbPool`] connection must report (§6.2.3 assertion E).
+pub const ROLE_MAINTENANCE: &str = "role_maintenance";
 
 /// Construction-time failure for any of the four typed pools (§6.2.3: "不符返回 Err").
 #[derive(Debug)]
@@ -117,8 +128,6 @@ impl RuntimeDbPool {
     }
 }
 
-// ponytail: no Application-layer consumer yet reads `.0` (that layer is a later task).
-#[allow(dead_code)]
 /// `role_batch_issuer`'s independent single-purpose pool (§6.2.0: must not share a pool with
 /// any runtime role — sharing would hand request-path connections invoice-issuing power).
 pub struct BatchIssuerDbPool(PgPool);
@@ -127,6 +136,13 @@ impl BatchIssuerDbPool {
     /// §6.2.3 assertion E: connects and verifies `current_user == "role_batch_issuer"`.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
         connect_checked(dsn, ROLE_BATCH_ISSUER).await.map(Self)
+    }
+
+    /// T3.2 `batch::begin_batch`'s pool accessor — see [`RuntimeDbPool::pool`]'s doc for why
+    /// `pub(crate)` keeps G6-DB1's closed set intact. The `#[allow(dead_code)]` that used to
+    /// sit on the struct above is gone: `batch.rs` is that first real reader of `.0`.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.0
     }
 }
 
@@ -156,6 +172,48 @@ impl PrivateWorkerDbPool {
 
     /// H3 (§74.6) outbox worker's pool accessor — see [`RuntimeDbPool::pool`]'s doc for why
     /// `pub(crate)` keeps G6-DB1's closed set intact.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.0
+    }
+}
+
+/// `role_retrieval_worker`'s pool (§6.2.1 row `role_retrieval_worker`). Sole legal writer of
+/// `projection.stream_checkpoints.{evidence,knowledge,projection}_highwater` and of
+/// `projection.stream_log`'s `ISSUED -> {DONE,SKIPPED_BY_POLICY,FAILED}` terminal edges
+/// (§6.2.2 grant matrix; `stream_log_guard_state_transition` enforces the latter by
+/// `current_user`) — T3.3's `advance_prefix` connects through this wrapper, never
+/// `RuntimeDbPool` (which lacks the `projection_highwater` column grant) or
+/// `MaintenanceDbPool` (whose transition set doesn't include this edge).
+pub struct RetrievalWorkerDbPool(PgPool);
+
+impl RetrievalWorkerDbPool {
+    /// §6.2.3 assertion E: connects and verifies `current_user == "role_retrieval_worker"`.
+    pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
+        connect_checked(dsn, ROLE_RETRIEVAL_WORKER).await.map(Self)
+    }
+
+    /// T3.3 `humaux_adapters::stream_repo`'s pool accessor — see [`RuntimeDbPool::pool`]'s
+    /// doc for why `pub(crate)` keeps G6-DB1's closed set intact.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.0
+    }
+}
+
+/// `role_maintenance`'s ops-pool (§6.2.1 row `role_maintenance`, 连接池=`ops（repair job）`).
+/// Sole legal writer of `projection.stream_log`'s `ISSUED -> LOST` sweep edge (§15.2) and of
+/// `retention::tombstone`'s `* -> TOMBSTONED` edge (§37.2) — T3.4's LOST patrol connects
+/// through this wrapper. Not a runtime role (§6.2.1's five-name enum excludes it), so it is
+/// never handed to a request-path handler.
+pub struct MaintenanceDbPool(PgPool);
+
+impl MaintenanceDbPool {
+    /// §6.2.3 assertion E: connects and verifies `current_user == "role_maintenance"`.
+    pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
+        connect_checked(dsn, ROLE_MAINTENANCE).await.map(Self)
+    }
+
+    /// T3.4 `humaux_adapters::stream_repo`'s pool accessor — see [`RuntimeDbPool::pool`]'s
+    /// doc for why `pub(crate)` keeps G6-DB1's closed set intact.
     pub(crate) fn pool(&self) -> &PgPool {
         &self.0
     }
@@ -235,7 +293,7 @@ mod tests {
         });
     }
 
-    /// §6.2.3 assertion E, positive branch, for all four roles: once `roles.sql` has created
+    /// §6.2.3 assertion E, positive branch, for all six roles: once `roles.sql` has created
     /// the role, `SET ROLE` (via `dsn_as_role`) makes `current_user` match literally and
     /// `connect_checked` must return `Ok`. Per-role existence is a separate, narrower
     /// precondition than "DB reachable" — printed as its own `SKIP` line (§79 三态: 未就绪就
@@ -251,6 +309,8 @@ mod tests {
                     ROLE_BATCH_ISSUER,
                     ROLE_CONSOLIDATION_WORKER,
                     ROLE_PRIVATE_WORKER,
+                    ROLE_RETRIEVAL_WORKER,
+                    ROLE_MAINTENANCE,
                 ] {
                     // A failed existence query means the admin fixture itself is broken
                     // (connection dropped, grants changed, syntax regression) — that is a
@@ -535,6 +595,112 @@ mod tests {
                     .expect("connect as role_private_worker");
                 insert_probe_ok(&pool.0, "private.memory_records").await;
                 insert_probe_denied(&pool.0, "private.memory_consolidation_inputs").await;
+            });
+        });
+    }
+
+    /// Column-scoped positive probe: `col` succeeds on a 0-row `UPDATE`. Unlike
+    /// [`update_probe_denied`] this does not assert anything about *other* columns — it is
+    /// paired with [`update_column_probe_denied`] on a *different* column of the same table
+    /// (§6.2.2's column-limited grants put both a grantee and a non-grantee column on one
+    /// role, e.g. `role_retrieval_worker` has `projection_highwater` but not
+    /// `issued_highwater`), which `update_probe_denied`'s "zero grants across the whole
+    /// table" assertion cannot express.
+    async fn update_column_probe_ok(pool: &PgPool, table: &str, col: &str) {
+        sqlx::query(&format!("UPDATE {table} SET {col} = {col} WHERE false"))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("expected UPDATE {table}.{col} to succeed (0-row probe): {e}")
+            });
+    }
+
+    /// Column-scoped negative probe — see [`update_column_probe_ok`] for why this checks one
+    /// named column instead of every column on `table`.
+    async fn update_column_probe_denied(pool: &PgPool, table: &str, col: &str) {
+        let has: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege(current_user, $1::regclass, $2, 'UPDATE')",
+        )
+        .bind(table)
+        .bind(col)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("has_column_privilege check failed for {table}.{col}: {e}"));
+        assert!(
+            !has,
+            "expected no UPDATE privilege on {table}.{col}, but has_column_privilege reports true"
+        );
+
+        let err = sqlx::query(&format!("UPDATE {table} SET {col} = {col} WHERE false"))
+            .execute(pool)
+            .await
+            .expect_err(&format!(
+                "expected UPDATE {table}.{col} to be permission-denied"
+            ));
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("permission denied"),
+            "expected permission denied for {table}.{col}, got: {msg}"
+        );
+    }
+
+    /// §6.2.3 G6-DB2 — `RetrievalWorkerDbPool`: may `UPDATE
+    /// projection.stream_checkpoints.projection_highwater` (T3.3 `advance_prefix`'s write)
+    /// but not `.issued_highwater` (that column is `role_gateway`-only, §15.1 seq issuance).
+    #[test]
+    fn g6_db2_retrieval_worker_pool() {
+        run_db_fixture::<AdminConn, _>("g6_db2_retrieval_worker_pool", |(dsn, mut client)| {
+            let Some(()) = require(
+                &mut client,
+                "g6_db2_retrieval_worker_pool",
+                &[ROLE_RETRIEVAL_WORKER],
+                &["projection.stream_checkpoints"],
+            ) else {
+                return;
+            };
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime for sqlx connect");
+            rt.block_on(async {
+                let pool =
+                    RetrievalWorkerDbPool::connect(&dsn_as_role(&dsn, ROLE_RETRIEVAL_WORKER))
+                        .await
+                        .expect("connect as role_retrieval_worker");
+                update_column_probe_ok(
+                    &pool.0,
+                    "projection.stream_checkpoints",
+                    "projection_highwater",
+                )
+                .await;
+                update_column_probe_denied(
+                    &pool.0,
+                    "projection.stream_checkpoints",
+                    "issued_highwater",
+                )
+                .await;
+            });
+        });
+    }
+
+    /// §6.2.3 G6-DB2 — `MaintenanceDbPool`: may `UPDATE projection.stream_log.state` (T3.4's
+    /// `ISSUED -> LOST` sweep) but has no `INSERT` on it (§15.2 — only `role_gateway` mints
+    /// new `stream_log` rows, §60 `issue_stream_log_row`).
+    #[test]
+    fn g6_db2_maintenance_pool() {
+        run_db_fixture::<AdminConn, _>("g6_db2_maintenance_pool", |(dsn, mut client)| {
+            let Some(()) = require(
+                &mut client,
+                "g6_db2_maintenance_pool",
+                &[ROLE_MAINTENANCE],
+                &["projection.stream_log"],
+            ) else {
+                return;
+            };
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime for sqlx connect");
+            rt.block_on(async {
+                let pool = MaintenanceDbPool::connect(&dsn_as_role(&dsn, ROLE_MAINTENANCE))
+                    .await
+                    .expect("connect as role_maintenance");
+                update_column_probe_ok(&pool.0, "projection.stream_log", "state").await;
+                insert_probe_denied(&pool.0, "projection.stream_log").await;
             });
         });
     }

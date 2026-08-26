@@ -240,7 +240,11 @@ const MATRIX: &[Cell] = &[
         [("UPDATE", ["serving", "shadow"])]
     ),
     // ops.outbox (canonical name; spec §6.2.2 tail note: `outbox_event` is the retired alias)
-    cell!("ops.outbox", "role_gateway", ["INSERT"]),
+    // SELECT added by T3.8 (§15.5, migrations/0046_stream_log_evidence_id_via_outbox.sql):
+    // the read-your-writes overlay joins projection.stream_log to this table on
+    // (tenant_id, commit_seq) to recover the evidence_id a stream_log row does not itself
+    // carry — see that migration's header for why commit_seq, not stream_seq, is the join key.
+    cell!("ops.outbox", "role_gateway", ["INSERT", "SELECT"]),
     cell!("ops.outbox", "role_private_worker", ["SELECT", "UPDATE"]),
     cell!("ops.outbox", "role_public_worker", ["SELECT", "UPDATE"]),
     cell!("ops.outbox", "role_retrieval_worker", ["SELECT", "UPDATE"]),

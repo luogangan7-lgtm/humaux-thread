@@ -632,6 +632,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "humaux-domain",
+ "humaux-projection",
  "humaux-testkit",
  "lettre",
  "postgres",
@@ -705,6 +706,10 @@ version = "0.1.0"
 [[package]]
 name = "humaux-projection"
 version = "0.1.0"
+dependencies = [
+ "humaux-domain",
+ "uuid",
+]
 
 [[package]]
 name = "humaux-protocol"

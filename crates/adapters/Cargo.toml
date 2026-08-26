@@ -24,6 +24,11 @@ sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "r
 # established by humaux-application; this crate previously only pulled humaux-domain in as a
 # dev-dependency (test fixtures), promoted here to a real one for the same reason.
 humaux-domain = { path = "../domain" }
+# T3.3+T3.4 `stream_repo.rs`: `StreamKey`/`StreamLedgerSnapshot`/`advance_prefix`/
+# `StreamSlaConfig` (§15) are pure types+logic that live in humaux-projection so they stay
+# unit-testable without a database (§3/§78.3 — this crate is where the SQL wrapping them
+# belongs, not the other way around).
+humaux-projection = { path = "../projection" }
 # H3 (§74.6) `EmailProvider` trait: the spec's own code block names this macro verbatim
 # (`#[async_trait::async_trait]`) — already resolved in the workspace lockfile (pulled in
 # transitively by `postgres`'s dependency tree) but not previously a direct dependency of any
