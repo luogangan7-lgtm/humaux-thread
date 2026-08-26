@@ -8,7 +8,7 @@
 
 ---
 
-## 文档权威规则（2.8 Canonical）
+## 文档权威规则（2.9 Canonical）
 
 本文件是**单一当前架构规范**，不再保留 1.2/1.3/1.4/1.5/1.6 的追加式历史正文。历史决策进入 Git/ADR，而不是继续留在主规范中制造第二真源。
 
@@ -564,7 +564,7 @@ G5 是升级方向的唯一保证：没有它，runtime `NOT_APPLICABLE_YET` 会
 
 **副产品**：「哪些机制是为不存在的规模建的」从此是一条命令：`humaux-admin mechanism status --deployment ... --cell ...`。本文 bootstrap snapshot 的 8 个 `NOT_APPLICABLE_YET` 仅服务当前迁移证据。
 
-### 1.14.1 2.4 修正：Static MechanismSpec 与 Runtime Observation 分离
+### 1.14.1 Static MechanismSpec 与 Runtime Observation 分离
 
 上面的：
 
@@ -1729,6 +1729,17 @@ NOTE
 
 `OUTCOME` 保存 Action -> Result -> Validation，是 coding/agent continuity 的高价值知识。
 
+### MemoryRecord 原子性契约
+
+`MemoryRecord` 是 Humaux 的**最小权威知识单元**，不再新增与它平行的第二套 Claim/Assertion 真源。
+
+```text
+一个可以独立变真/变假的事实 -> 一个 MemoryRecord
+一个可以独立被纠正/撤销的约束 -> 一个 MemoryRecord
+```
+
+`PROCEDURE / OUTCOME / NOTE` 可以有结构化正文，但若内部存在可独立演化的事实，蒸馏阶段必须拆成多个 MemoryRecord + relation；不能把 5 个独立事实塞进一段 prose 后只绑定一个 Grounding 状态。这样 OpenWiki 的 atomic Claim 能力由现有 MemoryRecord 承担，不引入第二套 Authority。
+
 ## 8.6 MemoryEvidence — 唯一 provenance 关系
 
 Memory 到 Evidence 的 many-to-many 关系只有一张权威表：
@@ -1800,6 +1811,82 @@ Agent/LLM 总结不能把 origin_class 升级。
 
 `SystemMigration` 只继承旧 Evidence 的原始 origin；没有旧 origin 可恢复时默认按较低权限处理，不因“系统导入”自动获得高行为权威。
 
+
+## 8.8 Grounding Validity — “证据变了”与“事实错了”必须分开
+
+OpenWiki 的可复用核心不是 sidecar，而是：**保存当初为什么相信，并在来源版本变化后持续保留 recheck debt，直到真正验证。** Humaux 不新增 Claim 表，直接作用于 `MemoryRecord + memory_evidence + EvidenceObject`。
+
+### GroundingMode
+
+```rust
+pub enum GroundingMode {
+    Live,       // 陈述的是“当前事实”；来源版本变化必须重验
+    Snapshot,   // 陈述明确绑定历史 snapshot/commit；当前 HEAD 变化不使其过时
+    Immutable,  // 原始消息/事件等不可变 Evidence；通过 correction/supersession 演化
+}
+```
+
+### Resolver contract
+
+```rust
+pub trait EvidenceResolver {
+    async fn resolve(
+        &self,
+        resource: &GroundingResource,
+        previous_version: Option<&GroundingVersionToken>,
+    ) -> Result<ResolvedGroundingEvidence, GroundingResolveError>;
+}
+
+pub enum ResolvedGroundingEvidence {
+    Current { evidence: EvidenceObjectDraft, version: GroundingVersionToken },
+    Missing,
+}
+```
+
+`GroundingVersionToken` 完全由 resolver 拥有。调用方只比较 equality；resolver error 与 `Missing` 必须分开。
+
+### 派生状态，不新增可手改 stale flag
+
+```text
+CURRENT
+  所有 LIVE evidence resolve 成相同 version
+
+RECHECK_REQUIRED
+  所有 LIVE evidence 仍可解析，但至少一个 version != recorded version
+
+UNRESOLVED
+  至少一个 LIVE evidence 明确 Missing
+
+CANNOT_ESTABLISH
+  resolver error / timeout / policy block / 分母无法建立
+```
+
+优先级：`CANNOT_ESTABLISH > UNRESOLVED > RECHECK_REQUIRED > CURRENT`。
+
+**`RECHECK_REQUIRED` 不等于事实错误。** 它只撤销“继续安全假设为当前真值”的资格。重新验证后才产生：
+
+```text
+CONFIRM  -> statement 保持，绑定当前 Evidence revision
+REVISE   -> 写新 Memory/Correction，旧 Memory supersede
+RETRACT  -> revoke/supersede，不物理删 Evidence
+DEFER    -> Grounding debt 保持，下次继续
+```
+
+### Temporal Freshness 与 Grounding Validity 正交
+
+```text
+TemporalFreshness  回答：这条状态有多旧？
+GroundingState     回答：当初支持它的可变来源还是同一版本吗？
+```
+
+所以允许：
+
+```text
+两年前的历史 Memory + SNAPSHOT evidence -> grounding CURRENT
+刚写 5 分钟的 current-state Memory + 代码刚变化 -> RECHECK_REQUIRED
+```
+
+禁止把两者压回一个 `stale` 字段。
 
 # 9. 时间语义
 
@@ -2503,6 +2590,69 @@ Rollup -> expand source Memory -> Authority resolution
 
 把实现改成跨事务 `LIMIT/OFFSET` 后该测试必须红；这是这道闸的正注错。
 
+
+## 11.10 Grounding Revalidation Pipeline
+
+Deterministic detector 与 LLM revalidation 分开：
+
+```text
+Source revision / periodic resolver scan
+        -> compare recorded version token
+        -> reverse lookup private.memory_evidence
+        -> affected Memory = RECHECK_REQUIRED / UNRESOLVED
+        -> enqueue GROUNDING_RECHECK job
+```
+
+检测阶段不调用模型。语义重验若需要 LLM：
+
+```text
+Private Memory -> 同 reasoning_domain 的 USER_REASONING profile
+Public Knowledge -> PLATFORM_PUBLIC policy
+```
+
+禁止私人 Memory fallback 到平台 Public Key。
+
+### Finalization CAS
+
+Revalidator 开始时冻结：
+
+```text
+input_memory_version
+input_evidence_ids[]
+input_version_set_hash
+```
+
+模型返回 `CONFIRM/REVISE/RETRACT/DEFER` 后，在提交事务里重新 resolve/读取 current version set：
+
+```text
+current_version_set_hash != input_version_set_hash
+  -> STALE_INPUT
+  -> 丢弃未提交结果
+  -> 重新排队
+```
+
+这与 Consolidation 的 stale-input CAS 同源，防止“验证期间来源又改了一次”的 TOCTOU。
+
+### Event-driven + periodic census
+
+主路径按 source change 增量失效；同时每日/低频全量 census 重新 resolve 所有 `LIVE` grounding edge，用于发现 webhook 丢失、reverse index 漏建和 resolver bug。
+
+### G11-2 / G80-43 Grounding Validity
+
+固定夹具：
+
+```text
+A  version same               -> CURRENT
+B  version changed            -> RECHECK_REQUIRED
+C  resource missing           -> UNRESOLVED
+D  resolver throws            -> CANNOT_ESTABLISH（不能伪装 Missing）
+E  code only moved, content/anchor resolves same token -> CURRENT
+F  revalidation 中途 source 再变 -> STALE_INPUT，不得提交 CONFIRM
+G  RECHECK_REQUIRED ProjectConstraint -> 不得进入 Mandatory behavior context
+H  正对照：CONFIRM 后新版本绑定成功 -> CURRENT
+```
+
+注错：把 version compare 删除，B 必须由 RECHECK_REQUIRED 翻成 CURRENT 并令 gate 红；把 resolver error 当 Missing，D 红；去掉 finalization CAS，F 红；Context 忽略 GroundingState，G 红。
 
 # 12. Public Contribution Pipeline
 
@@ -4478,7 +4628,7 @@ Cloud reranker relevance。
 - truncation；
 - degraded/fallback status。
 
-## 21.5 Freshness
+## 21.5 Temporal Freshness
 
 完整不代表新鲜。尤其对 `STATE / ISSUE / NEXT_ACTION / ACTIVE_TASK`，必须单独计算：
 
@@ -4491,7 +4641,7 @@ freshness_class = fresh | aging | stale | unknown
 
 Freshness policy 按 memory type / workspace policy 决定，不能用统一 7 天硬编码覆盖所有知识。
 
-禁止把 Similarity / Relevance / Association / Completeness / Freshness 压成一个不可解释总分。
+禁止把 Similarity / Relevance / Association / Completeness / Temporal Freshness / Grounding State 压成一个不可解释总分。
 
 ---
 
@@ -9222,6 +9372,7 @@ project continuity set
 public provenance/revocation set
 planner_predicate set          （§20.3 混淆矩阵）
 memory security lifecycle set  （Write -> Recall -> Action -> Repair）
+evidence-version evolution / self-correction set
 ```
 
 ## 55.1 量具与生产同源 —— 拓扑约束，不是一段文字
@@ -9317,6 +9468,10 @@ code_retrieval
 memory_security_lifecycle
   -> Write / Recall / Action / Repair，
      覆盖 direct / compositional / dormant trigger / cross-scope
+
+grounding_evolution
+  -> 来源版本演化与自我纠正：relocation 正对照（内容/锚点未变则仍 CURRENT）、
+     missing 与 resolver error 必须可区分、revert 与 finalization CAS
 ```
 
 外部资料只帮助定义能力面；Humaux 的最终固定分母、fixture hash 与判定线仍以本 manifest 为准。
@@ -9822,7 +9977,7 @@ Phase 0 的出场判据见其 **Gate** 行，本表只替它列「本期起必�
 | 1 | §48.2 的枚举跑通：全库带 `tenant_id` 的表集合 == §48 清单，且逐张 RLS enabled + FORCE + policy + runtime role 非 owner。注错：新建一张带 `tenant_id` 的表不加 policy ⇒ 枚举差集非空 ⇒ 红 | `G80-7` `G80-14` `G80-22` `G80-26` `G80-40` · §46 `integration` `migration` `tenant isolation` `mutation tests` |
 | 2 | revoke 之后同一 session token 再用必被拒；auth / recovery 四条路径对「邮箱存在」与「不存在」返回同一响应体与同一错误码。注错：把「邮箱不存在」分支改成不同文案 ⇒ 差分测试红 | — |
 | 3 | 同一 `client_batch_id` 重放 3 次，`ops.jobs` 净增行数 == 1；8 worker claim 无重复；3 scheduler 同周期只 enqueue 1 次且 leader failover 下一周期仍 1 次。 | `G80-38` |
-| 4 | provider 调用/Disclosure 对账；Private Consolidation snapshot 不漏/重；Origin ceiling 夹具全绿；processing input fingerprint 逐轴敏感。 | `G80-3` `G80-11` `G80-29` `G80-30` `G80-34` · §46 `secret isolation` |
+| 4 | provider 调用/Disclosure 对账；Private Consolidation snapshot 不漏/重；Origin ceiling 夹具全绿；processing input fingerprint 逐轴敏感。 | `G80-3` `G80-11` `G80-29` `G80-30` `G80-34` `G80-43` · §46 `secret isolation` |
 | 5 | 空库重放到 N 条后账本闭合；`processing_gaps` 是 VIEW；projection shadow/serving 切版不会跨未知 gap。 | `G80-4` `G80-25` `G80-28` |
 | 6 | 六条 lane 各有 e2e；EXACT/分页 snapshot 不漏/重；envelope provenance 完整；online recall/context/continuity 无隐藏 USER/PUBLIC generative call。 | `G80-2` `G80-5` `G80-8` `G80-27` `G80-32` `G80-39` · §46 `retrieval benchmark` |
 | 7 | provider 调用 == ModelCallLedger；超 RPM 排队；任何 `mechanism.*` 质量归因都有单变量 counterfactual manifest。 | `G80-35` |
@@ -10984,7 +11139,7 @@ Humaux V2 只有满足下面的**单一 DoD**，才能从 Architecture Freeze Ca
 2.2 的 §80 明确承认：DoD checkbox 没有 gate id，因此“这个勾是谁证明的”无法机械回答。2.3 冻结：
 
 ```text
-当前 DoD IDs: DOD-001 .. DOD-091
+当前 DoD IDs: DOD-001 .. DOD-094
 ```
 
 每条 `[DOD-xxx][phase=N]` 必须在源码有且仅有一个 verifier：
@@ -11153,7 +11308,7 @@ D2 **不读取** `NOT_APPLICABLE_YET Observation` 行数、runtime `derived_stat
 
 Runtime 解冻后的机制仍保留在这张历史 Manifest 中，因为这里保存的是迁移证据，不是今天的 readiness。
 
-## Benchmark 集合分母声明（§55.3 落地，9 个集合逐行）
+## Benchmark 集合分母声明（§55.3 落地，10 个集合逐行）
 
 **本章冻结**：§55 列出的 9 个集合在本表**有且仅有一行**；**七个字段**（清单见 §55.3）缺任一 ⇒ 该集合判 `NOT_DECLARED`，其相关条目不得勾选、不得表述为通过（§55.3 已冻结「没有固定分母的集合不许进 §69 DoD」）。
 
@@ -11179,11 +11334,12 @@ set_id=<id> · fixed_denominator=<N>=<层1 n1 + 层2 n2> · decision_depth=<top_
 | `public_provenance_revocation` | public provenance/revocation set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · conditional owner=Public（Phase 9/10） |
 | `planner_predicate` | planner_predicate set（§20.3 混淆矩阵） | 21 = evals/planner_predicate/dataset.tsv 全集（T6.1）。21 行里仅 10 行可判别（5 正例 + 3 标注负例 + 2 活负例）—— 其余 11 行（3 条 DIRECT_GET + 8 条 metadata 分类）在 `predicate_id()` 语义下不可能记 miss，只贡献分母；§20.3 的 15% 漏判上限因此在评测harness 里改记「已判别正例基数」而非原始 21（`crates/retrieval/tests/planner_predicate_eval.rs::confusion_matrix_meets_frozen_thresholds` 的 `judged_miss_rate`），避免 padding 行稀释容忍度；`fixed_denominator=21` 本身仍按 §55.3 冻结不改 | 精确相等 | `resolution`：1 题——**实测**，非由 `decision_depth` 推导：真跑了一个可区分的第二系统（`QUANTIFIERS` 去掉「哪些」的变体）与真系统在同一 21 题固定集上逐行 diff，观测到恰好 1 行翻转（`我们之前否掉过哪些方案`——数据集里唯一只靠该词命中量词门的问法），见 `crates/retrieval/tests/planner_predicate_eval.rs::resolution_is_measured_via_a_real_second_system_diff`；本集无分层。`spread_tol`：0 题（`decide()` 纯函数无 IO/随机性，同 profile 重复 3 次逐行比对完全一致，见 crates/retrieval/tests/planner_predicate_eval.rs::repeated_runs_have_zero_spread） | 2026-08-26 / 53c82a5 | `DECLARED` · owner=Retrieval（Phase 6+） |
 | `memory_security_lifecycle` | memory security lifecycle set（Write -> Recall -> Action -> Repair） | 未声明 | Write→Recall→Action→Repair | 未实测 | — | `NOT_DECLARED` · owner=Security/Private Memory（Phase 4+） |
+| `grounding_evolution` | evidence-version evolution / self-correction set | 未声明 | exact state + revalidation outcome | 未实测 | — | `NOT_DECLARED` · owner=Grounding/Code（Phase 11+） |
 
 - `resolution` 与 `spread_tol` **都必须实测，禁止估值**；两者取数法不同（前者量系统间差异，后者量同系统重复噪声），各自写在模板里，换系统或换 `profile_fingerprint` **两个都要重测**。**禁止拿其中一个的读数去填另一个** —— 此前把「重复 3 次取极差」当成 `resolution` 的实测法就是这个撞名，已按本章 Continuation Gate 作废。
 - `continuation_198_v2` 的 `frozen_by` = 本文件冻结提交的 sha，由 `benchset-declaration-check` 在冻结时写入；写入前 Continuation Gate 输出 `cannot_establish`。
 - **`NO_DOD_ITEM` 从 2.3 起禁止。** 过去 8 个集合只有 `continuation_198_v2` 真正被 DoD 引用，另外 7 个可以永久 `NOT_DECLARED` 而不阻塞任何东西；这与旧系统“测试存在但不承重”完全同型。现在每个集合有 owning Phase/DoD，功能达到该 Phase 后未声明即红。
-- CI（`benchset-declaration-check`，§80.1 登记为 `G80-16`；**判据以本节为准**）：本表恰好 9 行，`set_id` 与 §55 集合清单逐名对齐；Benchmark 声明表的「判定」单元格出现 legacy unowned marker（旧值 `NO_DOD_ITEM`）即红。正文解释历史不在扫描域。每行必须声明 owning phase/conditional owner；达到 owning phase 后 `NOT_DECLARED` 即红。`BenchmarkManifest` 缺 source/version/license/hash 时同样视为 NOT_DECLARED。注错：删除 `code_retrieval` manifest，在 Phase 11 后必须红；把任一行重新写回 `NO_DOD_ITEM` 必须立即红。
+- CI（`benchset-declaration-check`，§80.1 登记为 `G80-16`；**判据以本节为准**）：本表恰好 10 行，`set_id` 与 §55 集合清单逐名对齐；Benchmark 声明表的「判定」单元格出现 legacy unowned marker（旧值 `NO_DOD_ITEM`）即红。正文解释历史不在扫描域。每行必须声明 owning phase/conditional owner；达到 owning phase 后 `NOT_DECLARED` 即红。`BenchmarkManifest` 缺 source/version/license/hash 时同样视为 NOT_DECLARED。注错：删除 `code_retrieval` manifest，在 Phase 11 后必须红；把任一行重新写回 `NO_DOD_ITEM` 必须立即红。
 
 - [ ] [DOD-086][phase=4] Processing `source_hash` 只承诺输入指纹：逐轴变化必改 hash；同输入 hash 稳定；LLM output 不要求逐字一致且重复 run 不覆盖。
 - [ ] [DOD-087][phase=7] 任一 `mechanism.*` 归因都有 CounterfactualExperimentManifest，changed_axis 恰好一个。
@@ -11192,6 +11348,9 @@ set_id=<id> · fixed_denominator=<N>=<层1 n1 + 层2 n2> · decision_depth=<top_
 - [ ] [DOD-090][phase=3] 3 scheduler 并发 + leader failover 下每个 `(schedule_id, planned_at)` 只产生一个逻辑 Job。
 
 - [ ] [DOD-091][phase=6] Online `recall/context/continuity` 默认 profile 不隐式调用 USER_REASONING/PLATFORM_PUBLIC；generative query transform 只能显式 profile + budget + benchmark。
+- [ ] [DOD-092][phase=4] `GroundingState` 由 recorded version vs resolver current version 推导；不存在可手改 `memory.stale=true` 真源。
+- [ ] [DOD-093][phase=8] Mandatory/Pinned behavior context 不得静默消费 `RECHECK_REQUIRED/UNRESOLVED/CANNOT_ESTABLISH` Memory；必须 fail-loud 并输出 `needs_verification[]`。
+- [ ] [DOD-094][phase=11] `grounding_evolution` BenchmarkManifest 已声明并通过：含 relocation 正对照、missing/error 区分、revert 与 finalization CAS。
 
 以上任何 P0 项未满足：
 
@@ -13794,6 +13953,7 @@ rollback plan
 | G80-40 Typed DB pool / role capability topology | PR · integration | §6.2.3#G6-DB1 · §6.2.3#G6-DB2 | 同左 |
 | G80-41 Enterprise feature activation registry | PR | §50.1#G50-1 | 同左 |
 | G80-42 Canonical change-impact closure | PR | §80.3#G80-42 | 同左 |
+| G80-43 Grounding validity / recheck debt | PR · Nightly | §11.10#G11-2 | 同左 |
 
 **本表与 §69 的关系（2.3 冻结）**：DoD 不再要求每条 checkbox 直接手写 G80 id；§69 的 `[DOD-xxx][phase=N]` 由 **G80-33** 与源码 `#[dod(...)]` verifier 一一绑定。verifier 可以调用某个 ADMITTED G80 gate、benchmark、probe 或 e2e test，但它自身必须有 fault case。于是：
 
@@ -13889,6 +14049,7 @@ G80-24  gate-registry-coverage（PR）
 | §50.1 | `G50-\d` | — |
 | §80.3 | `G80-42` | — |
 | §11.9 | `G11-\d` | — |
+| §11.10 | `G11-\d` | — |
 | §25.5 | `G25-\d` | — |
 | §45.2 | `G45-\d` | — |
 | §16.1 | `G16-\d` | — |
@@ -14015,7 +14176,7 @@ path       = crates/testkit/tests/metrics/<family>.rs
 
 ### Canonical Contract Blocks
 
-机器识别以下 7 个承重块：
+机器识别以下 9 个承重块：
 
 ```text
 MECHANISM_SPEC      §1.14  mechanism-registry fence
@@ -14025,6 +14186,8 @@ METRIC_REGISTRY     §41.2  metric table
 FEATURE_REGISTRY    §50.1  config/features.toml contract
 WORKSPACE_LAYOUT    §58    workspace tree / Cargo member contract
 GATE_REGISTRY       §80.1  G80 registry + id-family binding
+GROUNDING_CONTRACT   §8.8/§11.10 GroundingMode/State/Resolver/Revalidation
+NETWORK_BOUNDARY     §83.4 external/intra-cell registries + raw transport
 ```
 
 `cargo xtask contract-impact-check --base <merge-base>` 对 Git diff 做：
@@ -14047,6 +14210,8 @@ METRIC_REGISTRY  | G80-6,G80-18
 FEATURE_REGISTRY | G80-41
 WORKSPACE_LAYOUT | workspace-member-check,G80-3,G80-40,G80-41
 GATE_REGISTRY    | G80-23,G80-24,gate-phase-coverage
+GROUNDING_CONTRACT| G80-43,grounding-evolution-contract
+NETWORK_BOUNDARY  | G80-3,network-boundary-contract
 ```
 
 ### 映射本身不能偷偷漏新 block

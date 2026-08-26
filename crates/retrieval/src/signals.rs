@@ -1,8 +1,13 @@
-//! `retrieval::signals` — §21 五类检索质量信号：Similarity / Relevance / Association /
-//! Completeness / Freshness.
+//! `retrieval::signals` — §21 检索质量信号，按 §21.5 逐条点名的六个轴：Similarity /
+//! Relevance / Association / Completeness / Temporal Freshness / Grounding State.
 //!
-//! §21.5 frozen: **禁止把这五类压成一个不可解释总分**. [`QualitySignals`] therefore carries
-//! the five as independent fields with no `Add`/`Sum` impl and no method that folds them into
+//! 最后一个轴与 Temporal Freshness **正交**（§8.8「Temporal Freshness 与 Grounding Validity
+//! 正交」）：前者答「这条状态有多旧」，后者答「当初支持它的可变来源还是同一版本吗」。§8.8
+//! 「禁止把两者压回一个 `stale` 字段」，所以 [`QualitySignals::grounding`] 是自己的具名字段，
+//! 不是 [`FreshnessClass`] 的第五个变体、也不是布尔。
+//!
+//! §21.5 frozen: **禁止把这六类压成一个不可解释总分**. [`QualitySignals`] therefore carries
+//! them as independent fields with no `Add`/`Sum` impl and no method that folds them into
 //! one number. This is a *documented* prohibition, not a mechanically-checked one: no
 //! `xtask::architecture_check` gate scans this file today (verified — it appears exactly once
 //! in `architecture_check.rs`, inside `ONLINE_LANE_FILES`, an unrelated §20#G20-2 scan). A
@@ -14,12 +19,13 @@
 
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
+use humaux_domain::grounding::GroundingState;
 use humaux_domain::memory::MemoryType;
 
 use crate::completeness::FreshnessClass;
-use crate::envelope::{CompletenessBlock, CompletenessClassWire};
+use crate::envelope::{CompletenessBlock, CompletenessClassWire, GroundingStateWire};
 
 // ============================================================================
 // §21.1 Similarity
@@ -226,10 +232,55 @@ pub fn compute_freshness(
 }
 
 // ============================================================================
-// The five signals — kept apart, on purpose (§21.5)
+// §8.8 Grounding State — its own axis, never folded into Freshness
 // ============================================================================
 
-/// The five §21 signals for one item. **Deliberately five separate fields, no combined
+/// §8.8's `GroundingState` carried as a §21 signal.
+///
+/// The wrapped [`GroundingState`] is **private and this type has no field-literal
+/// constructor**: the only way in is [`From<GroundingState>`], and a `GroundingState` in turn
+/// can only leave `domain::grounding::derive_grounding_state`. DOD-092's「不存在可手改
+/// `memory.stale=true` 真源」therefore survives the crate boundary — this crate can relay a
+/// grounding verdict but cannot mint one, and there is no second derivation site to drift.
+///
+/// Serializes as §8.8's state name alone ([`GroundingStateWire`]); the mode/version/edge
+/// detail that produced it belongs to the resolver side, not to a retrieval result.
+// ponytail: no `revokes_current_truth_assumption` mirror field and no triggering-edge list —
+// the former is one call on §8.8's own type, the latter has no producer (no `EvidenceResolver`
+// impl exists in this workspace yet). Add the edge list when a resolver lands and a caller
+// actually needs to say *which* source moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroundingSignal(GroundingState);
+
+impl GroundingSignal {
+    /// The relayed §8.8 verdict, still as the domain type — callers needing
+    /// `revokes_current_truth_assumption()` read it off §8.8's own type rather than a copy.
+    #[must_use]
+    pub const fn state(self) -> GroundingState {
+        self.0
+    }
+}
+
+impl From<GroundingState> for GroundingSignal {
+    fn from(state: GroundingState) -> Self {
+        Self(state)
+    }
+}
+
+impl Serialize for GroundingSignal {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        GroundingStateWire::from(self.0.kind()).serialize(serializer)
+    }
+}
+
+// ============================================================================
+// §21 的五类信号 + §8.8 的 Grounding State —— 分开摆，不是风格问题（§21.5 冻结）
+// ============================================================================
+
+/// One item's six quality axes: §21's five signals (§21.1–§21.5) plus §8.8's Grounding
+/// State. The sixth is **not** a §21 signal — §21 is still「五类检索质量信号」; §21.5 is
+/// where the six are named together as the axes that must stay separable.
+/// **Deliberately six separate fields, no combined
 /// score.** Do not add an `Add`/`Sum` impl or a method returning one number derived from more
 /// than one field here — that is exactly what §21.5 forbids. No `xtask::architecture_check`
 /// gate watches this file for that shape today (see this module's own top-of-file doc); the
@@ -241,11 +292,20 @@ pub struct QualitySignals {
     pub association: AssociationSignal,
     pub completeness: CompletenessSignal,
     pub freshness: FreshnessSignal,
+    /// §8.8, orthogonal to `freshness` above — merging the two is the one thing §8.8 names as
+    /// forbidden. `None` means §8.8's judgement never ran for this item, **not** `Current`:
+    /// no `EvidenceResolver` producer exists in this workspace yet, and reporting an
+    /// un-attempted judgement as a passing one is exactly §23's「不许输出数字充数」.
+    pub grounding: Option<GroundingSignal>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use humaux_domain::grounding::{
+        EdgeOutcome, GroundingEdge, GroundingInputs, GroundingMode, GroundingStateKind,
+        GroundingVersionToken, derive_grounding_state,
+    };
 
     #[test]
     fn similarity_score_carries_raw_cosine_range_uncapped() {
@@ -341,6 +401,108 @@ mod tests {
             None,
         );
         assert_eq!(stale.class, FreshnessClass::Stale);
+    }
+
+    // ---- §8.8 grounding, and its orthogonality to §21.5 freshness ----
+
+    /// §8.8's sole derivation point is the only way this crate can obtain a [`GroundingState`]
+    /// — there is no constructor to reach for here, which is the point of DOD-092.
+    fn state_of(recorded: &str, resolved: &str) -> GroundingState {
+        let edges = [GroundingEdge {
+            mode: GroundingMode::Live,
+            recorded_version: Some(GroundingVersionToken::new(recorded)),
+            outcome: EdgeOutcome::Resolved(GroundingVersionToken::new(resolved)),
+        }];
+        derive_grounding_state(GroundingInputs::Edges(&edges))
+    }
+
+    /// §8.8's own worked example, built for real: a two-year-old memory whose source never
+    /// moved is `Stale × Current` — a combination that cannot exist if either signal is
+    /// derived from the other.
+    fn stale_but_grounded() -> QualitySignals {
+        QualitySignals {
+            similarity: None,
+            relevance: None,
+            association: AssociationSignal::none(),
+            completeness: CompletenessSignal {
+                class: CompletenessClassWire::SemanticBounded,
+                truncated: false,
+                degradations: vec![],
+            },
+            freshness: compute_freshness(
+                MemoryType::State,
+                Some(Duration::from_secs(730 * 86_400)),
+                None,
+                None,
+                None,
+            ),
+            grounding: Some(state_of("v1", "v1").into()),
+        }
+    }
+
+    fn grounding_kind(s: &QualitySignals) -> Option<GroundingStateKind> {
+        s.grounding.map(|g| g.state().kind())
+    }
+
+    /// §8.8「禁止把两者压回一个 `stale` 字段」/ §21.5「禁止压成一个不可解释总分」: moving one
+    /// axis must leave the other untouched. Both off-diagonal combinations §8.8 names appear
+    /// here — `Stale × Current` and `Fresh × RecheckRequired` — so folding either signal into
+    /// the other (or into one score) makes one of these four assertions unsatisfiable.
+    #[test]
+    fn grounding_and_freshness_move_independently() {
+        let mut s = stale_but_grounded();
+        assert_eq!(s.freshness.class, FreshnessClass::Stale);
+        assert_eq!(grounding_kind(&s), Some(GroundingStateKind::Current));
+
+        // Move grounding only: the source moved under a memory that is just as old as before.
+        s.grounding = Some(state_of("v1", "v2").into());
+        assert_eq!(
+            s.freshness.class,
+            FreshnessClass::Stale,
+            "grounding 变化不得改动 freshness"
+        );
+        assert_eq!(
+            grounding_kind(&s),
+            Some(GroundingStateKind::RecheckRequired)
+        );
+
+        // Move freshness only: rewritten 5 minutes ago, source still at the version it moved
+        // to — §8.8's「刚写 5 分钟的 current-state Memory + 代码刚变化 ⇒ RECHECK_REQUIRED」.
+        s.freshness = compute_freshness(
+            MemoryType::State,
+            Some(Duration::from_secs(300)),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(s.freshness.class, FreshnessClass::Fresh);
+        assert_eq!(
+            grounding_kind(&s),
+            Some(GroundingStateKind::RecheckRequired),
+            "freshness 变化不得改动 grounding"
+        );
+    }
+
+    /// The same orthogonality at the wire boundary: two separate keys, neither nested in the
+    /// other and neither a `stale` boolean.
+    #[test]
+    fn grounding_serializes_as_its_own_key_beside_freshness() {
+        let mut s = stale_but_grounded();
+        s.grounding = Some(state_of("v1", "v2").into());
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""freshness":{"class":"stale""#));
+        assert!(json.contains(r#""grounding":"recheck_required""#));
+    }
+
+    /// `None` is "judgement never ran", not `Current` — no resolver produces grounding today,
+    /// and reporting that absence as a pass would be the §23「不许输出数字充数」failure.
+    #[test]
+    fn absent_grounding_is_not_reported_as_current() {
+        let mut s = stale_but_grounded();
+        s.grounding = None;
+        assert_eq!(grounding_kind(&s), None);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""grounding":null"#));
     }
 
     /// §21.5's own worked example: `STATE` ages out same-day, unlike a uniform 7-day window.

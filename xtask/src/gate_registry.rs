@@ -7,7 +7,7 @@
 //! that exists in a home chapter but was never registered in §80.1. The two are deliberately
 //! not merged (§80.1.2: "两个方向缺一个都有半边看不见").
 //!
-//! Parsing targets the canonical spec markdown itself (`docs/architecture/Baseline_2.8.md`),
+//! Parsing targets the canonical spec markdown itself (`docs/architecture/Baseline_2.9.md`),
 //! never a second copy — every table/section is re-located by heading text each run, so a
 //! spec edit cannot silently desync this checker (same discipline as `mechanism_registry.rs`
 //! / `contract_impact.rs`).
@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SPEC_PATH: &str = "docs/architecture/Baseline_2.8.md";
+const SPEC_PATH: &str = "docs/architecture/Baseline_2.9.md";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -1167,7 +1167,7 @@ mod tests {
     ///
     /// - G80-23②: §80.1's G80-14 row anchors `§59.1#G59-6`, but `### G59-6 / Private Authority
     ///   Boundary` is defined under `# 10. Authority Contract` (`docs/architecture/
-    ///   Baseline_2.8.md:1904`), not inside §59.1 (whose body is G59-1..G59-5 only,
+    ///   Baseline_2.9.md:1904`), not inside §59.1 (whose body is G59-1..G59-5 only,
     ///   `:10121`-`:10230`). Fix: move the `### G59-6` block into §59.1, or repoint the G80-14
     ///   anchor at `:13756`.
     /// - G80-24①: §20's body declares `### G20-1 Snapshot Selection` (`:4441`, inside §20.4),
@@ -1176,7 +1176,7 @@ mod tests {
     ///   that cell to `§20#G20-1 · §20.4` (not `§20.4#G20-1` — the binding table only has a
     ///   `§20` row, so that shape would newly trip G80-24②).
     ///
-    /// Both fixes are edits to `docs/architecture/Baseline_2.8.md`, which is out of scope for
+    /// Both fixes are edits to `docs/architecture/Baseline_2.9.md`, which is out of scope for
     /// this file (`xtask/src/gate_registry.rs` only) — **blocked pending that spec edit**, not
     /// fixable from this module without loosening a check to paper over live content bugs
     /// (which this module must not do). Once the spec is corrected upstream this test starts

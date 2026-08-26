@@ -1,5 +1,5 @@
 //! xtask `benchset-declaration` — G80-16 benchset-declaration-check.
-//! 判据以 §69「Benchmark 集合分母声明」节为唯一真源（spec 行 11143–11173）：表恰 9 行、
+//! 判据以 §69「Benchmark 集合分母声明」节为唯一真源：表恰 10 行、
 //! `set_id` 与 §55 集合清单逐名对齐、「判定」格禁现 legacy `NO_DOD_ITEM`、§55.3 七字段
 //! （spec 行 9279–9291：`set_id`/`fixed_denominator`/`decision_depth`/`resolution`/
 //! `spread_tol`/`measured_at`/`frozen_by`）缺任一 ⇒ `NOT_DECLARED`、owning phase 到期仍
@@ -7,12 +7,12 @@
 
 use std::fs;
 
-const SPEC_PATH: &str = "docs/architecture/Baseline_2.8.md";
+const SPEC_PATH: &str = "docs/architecture/Baseline_2.9.md";
 /// §69 声明表标题；用它动态定位表格起点而不是硬编码行号，spec 改版漂移时自动跟随。
 const TABLE_HEADING: &str = "## Benchmark 集合分母声明";
 /// §55 顶层章节标题；其后第一个 ```text 围栏是集合清单（spec 行 9231–9241）。
 const CH55_HEADING_PREFIX: &str = "# 55.";
-const REQUIRED_ROW_COUNT: usize = 9;
+const REQUIRED_ROW_COUNT: usize = 10;
 const LEGACY_MARKER: &str = "NO_DOD_ITEM";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +24,7 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// 抽取 §55 顶层章节标题后第一个 ```text 围栏的 9 行集合清单，逐行折叠内部空白后返回，
+/// 抽取 §55 顶层章节标题后第一个 ```text 围栏的 10 行集合清单，逐行折叠内部空白后返回，
 /// 供与声明表「§55 名称」列比对（判据：`set_id` 与 §55 集合清单逐名对齐）。
 pub fn parse_ch55_set_list(spec_md: &str) -> Vec<String> {
     let mut in_ch55 = false;
@@ -442,7 +442,7 @@ mod tests {
 
     fn real_spec_md() -> String {
         let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/architecture/Baseline_2.8.md");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/architecture/Baseline_2.9.md");
         fs::read_to_string(path).expect("spec must be readable in test env")
     }
 
@@ -455,21 +455,21 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("tempdir create");
-        let path = dir.join("Baseline_2.8.md");
+        let path = dir.join("Baseline_2.9.md");
         fs::write(&path, content).expect("write fixture");
         fs::read_to_string(&path).expect("read fixture back")
     }
 
     #[test]
-    fn parse_ch55_set_list_has_9_entries() {
+    fn parse_ch55_set_list_has_10_entries() {
         let spec = real_spec_md();
         let names = parse_ch55_set_list(&spec);
-        assert_eq!(names.len(), 9, "§55 集合清单应恰好 9 行: {names:?}");
+        assert_eq!(names.len(), 10, "§55 集合清单应恰好 10 行: {names:?}");
         assert!(names.contains(&"code retrieval set".to_string()));
     }
 
     #[test]
-    fn parse_declaration_table_real_has_9_rows_in_known_order() {
+    fn parse_declaration_table_real_has_10_rows_in_known_order() {
         let spec = real_spec_md();
         let table = parse_declaration_table(&spec);
         assert_eq!(table.len(), REQUIRED_ROW_COUNT);
@@ -486,6 +486,7 @@ mod tests {
                 "public_provenance_revocation",
                 "planner_predicate",
                 "memory_security_lifecycle",
+                "grounding_evolution",
             ]
         );
     }

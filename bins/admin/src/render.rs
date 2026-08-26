@@ -11,7 +11,7 @@
 /// spec 唯一真源，相对本 crate manifest 目录解析（§1.14 冻结：不得另建镜像文件）。
 const SPEC_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../docs/architecture/Baseline_2.8.md"
+    "/../../docs/architecture/Baseline_2.9.md"
 );
 
 const FENCE_OPEN: &str = "```mechanism-registry";

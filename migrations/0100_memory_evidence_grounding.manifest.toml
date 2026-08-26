@@ -1,0 +1,56 @@
+# §46.1 migration manifest. Adds §8.8's two per-edge grounding columns to
+# private.memory_evidence (§11.10's detector reads them). Additive only: two new columns plus
+# one CHECK on the new one — no existing column, constraint, index, policy or grant is
+# touched, so the table's §62 RLS (0012's memory_evidence_tenant policy, ENABLE + FORCE) and
+# its §6.2.2 grants (0011) carry over unchanged; table-level GRANTs propagate to new columns
+# by definition, so no re-GRANT is needed.
+
+migration_id = "0100_memory_evidence_grounding"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('private.memory_evidence') is not null
+  and not exists (
+    select 1 from information_schema.columns
+    where table_schema='private' and table_name='memory_evidence'
+      and column_name in ('grounding_mode', 'recorded_version')
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (select count(*) from information_schema.columns
+   where table_schema='private' and table_name='memory_evidence'
+     and column_name in ('grounding_mode', 'recorded_version')) = 2
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema='private' and table_name='memory_evidence'
+      and column_name='grounding_mode'
+      and is_nullable='NO' and column_default is not null
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema='private' and table_name='memory_evidence'
+      and column_name='recorded_version' and is_nullable='YES'
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conrelid = 'private.memory_evidence'::regclass
+      and conname = 'memory_evidence_grounding_mode_check'
+      and convalidated
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE private.memory_evidence DROP COLUMN IF EXISTS recorded_version, DROP COLUMN IF EXISTS grounding_mode;
+(the CHECK constraint is dropped with its column. Safe up to the moment a writer starts
+setting these columns — no pre-existing row or column is touched, but rolling back after any
+recorded_version has been written discards those tokens, and §8.8 cannot re-derive them:
+the token is resolver-owned and only observable at resolve time. Past that point the
+forward fix is a new migration, not this rollback.)
+"""
+
+backup_restore_requirement = "none (two additive columns; the constant DEFAULT takes PG11+'s fast-default path so no existing row is rewritten, and VALIDATE CONSTRAINT scans rows that the same DEFAULT just made provably conforming). Standard pre-deploy snapshot only; no dedicated restore drill."

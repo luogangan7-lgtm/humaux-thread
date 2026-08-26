@@ -460,7 +460,7 @@ fn confusion_matrix_meets_frozen_thresholds() {
     // `PlannerDecision` variant except `Enumerate`, so those rows only ever score `correct`).
     // Scoring the 15% ceiling against the raw 21-row denominator let up to 3 misses through —
     // 60% of the 5 real positive rows — while still reading as "15%". Scored against the
-    // judged base (expected-positive rows) instead, matching Baseline_2.8.md §69's
+    // judged base (expected-positive rows) instead, matching Baseline_2.9.md §69's
     // `planner_predicate` row note.
     let judged_miss_rate = m.miss as f64 / expected_positive_count as f64;
     assert!(
@@ -614,7 +614,7 @@ fn resolution_is_measured_via_a_real_second_system_diff() {
         vec!["我们之前否掉过哪些方案"],
         "expected exactly the one row whose only quantifier hit is 哪些 to differ between the \
          two systems; got {differing_rows:?} — resolution measurement no longer isolates a \
-         single-row diff, update this test's reasoning (and Baseline_2.8.md §69's \
+         single-row diff, update this test's reasoning (and Baseline_2.9.md §69's \
          planner_predicate row) rather than just the expected value"
     );
     // The measured resolution: minimum observed nonzero item-count difference between two

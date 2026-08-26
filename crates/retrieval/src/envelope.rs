@@ -1,8 +1,8 @@
-//! `retrieval::envelope` — §23 Recall Result Envelope. Assembles the four blocks
-//! (`pipeline` / `completeness` / `provenance` / `freshness`) and, most load-bearing, the
-//! §23.1② A1/A2 arithmetic that turns a [`LedgerClosure`](crate::completeness) plus an
-//! independently-read Qdrant `visible` count into `completeness_ratio` / `current` /
-//! `PROJECTION_INVISIBLE_LOSS`.
+//! `retrieval::envelope` — §23 Recall Result Envelope. Assembles the five blocks
+//! (`pipeline` / `completeness` / `provenance` / `freshness` / `grounding`) and, most
+//! load-bearing, the §23.1② A1/A2 arithmetic that turns a
+//! [`LedgerClosure`](crate::completeness) plus an independently-read Qdrant `visible` count
+//! into `completeness_ratio` / `current` / `PROJECTION_INVISIBLE_LOSS`.
 //!
 //! Pure, no IO — same "adapters does the round trips, this crate only judges" split as
 //! [`crate::completeness::ledger`]. §23.1②'s "取数顺序固定：先读索引 count，后读账本快照" is a
@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::completeness::{
     CannotEstablishReason, CensusResult, CompletenessClass, FreshnessClass, LedgerClosure, classify,
 };
+use humaux_domain::grounding::{GroundingState, GroundingStateKind};
 use humaux_telemetry::degrade::{DegradeCode, Outcome, abstain};
 
 // ============================================================================
@@ -454,6 +455,102 @@ pub struct FreshnessBlock {
 }
 
 // ============================================================================
+// §8.8 `grounding` — a separate block from `freshness` above, on purpose
+// ============================================================================
+
+/// Wire mirror of [`GroundingStateKind`], for the same reason [`CompletenessClassWire`]
+/// exists: §8.8's type carries no serde derive (domain stays free of wire concerns, §3) and
+/// the envelope must not re-spell the vocabulary as free strings (§78.2).
+///
+/// Deliberately **not** `Ord`: §8.8's priority (`CANNOT_ESTABLISH > UNRESOLVED >
+/// RECHECK_REQUIRED > CURRENT`) is domain-private on purpose, and a derived ordering here
+/// would be a second, silently-drifting copy of it that happens to agree today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingStateWire {
+    Current,
+    RecheckRequired,
+    Unresolved,
+    CannotEstablish,
+}
+
+impl From<GroundingStateKind> for GroundingStateWire {
+    fn from(k: GroundingStateKind) -> Self {
+        match k {
+            GroundingStateKind::Current => Self::Current,
+            GroundingStateKind::RecheckRequired => Self::RecheckRequired,
+            GroundingStateKind::Unresolved => Self::Unresolved,
+            GroundingStateKind::CannotEstablish => Self::CannotEstablish,
+        }
+    }
+}
+
+/// §8.8 grounding, aggregated over the items this result returned — the result-level view of
+/// [`QualitySignals::grounding`](crate::signals::QualitySignals::grounding), the way
+/// [`FreshnessBlock`] is the result-level view of the freshness signal.
+///
+/// Its own block rather than a field on [`FreshnessBlock`]: §8.8 freezes 「禁止把两者压回一个
+/// `stale` 字段」, and a nested field would be that merge in all but name.
+///
+/// The four state counts stay broken out because §8.8 spends its `Missing`-vs-resolver-error
+/// text insisting the distinction survive to the consumer — collapsing them here would undo
+/// that at the reporting boundary, where the operational responses differ (recheck the source
+/// vs. fix the resolver).
+// ponytail: no `needs_verification[]` list of item ids — DOD-093 marks that phase=8 (Mandatory/
+// Pinned context lanes), and [`Envelope`] is generic over `T` so this crate has no item-id type
+// to list. Add it when §25's Mandatory Context Lane lands and can name the ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GroundingBlock {
+    pub current: u32,
+    pub recheck_required: u32,
+    pub unresolved: u32,
+    pub cannot_establish: u32,
+    /// Items §8.8's judgement never ran for — **not** a fifth state and never folded into
+    /// `current`. Same discipline as §23.1's `expected: null` / `visible: null`: an
+    /// un-attempted judgement is not a passing one.
+    pub not_judged: u32,
+    /// How many returned items no longer qualify to be assumed current truth (§8.8). Kept as
+    /// its own count rather than left to the reader to sum: the "which states revoke" rule is
+    /// §8.8's, read here off [`GroundingState::revokes_current_truth_assumption`], so a JSON
+    /// consumer never has to re-implement it and this number cannot disagree with the domain.
+    pub revokes_current_truth_assumption: u32,
+}
+
+impl GroundingBlock {
+    /// One entry per returned item; `None` means §8.8's judgement never ran for that item.
+    ///
+    /// Takes [`GroundingState`] values rather than re-deriving anything — this crate has no
+    /// derivation path of its own (§8.8: `derive_grounding_state` is the sole one).
+    #[must_use]
+    pub fn tally(states: impl IntoIterator<Item = Option<GroundingState>>) -> Self {
+        let mut b = Self {
+            current: 0,
+            recheck_required: 0,
+            unresolved: 0,
+            cannot_establish: 0,
+            not_judged: 0,
+            revokes_current_truth_assumption: 0,
+        };
+        for state in states {
+            let Some(state) = state else {
+                b.not_judged += 1;
+                continue;
+            };
+            match state.kind() {
+                GroundingStateKind::Current => b.current += 1,
+                GroundingStateKind::RecheckRequired => b.recheck_required += 1,
+                GroundingStateKind::Unresolved => b.unresolved += 1,
+                GroundingStateKind::CannotEstablish => b.cannot_establish += 1,
+            }
+            if state.revokes_current_truth_assumption() {
+                b.revokes_current_truth_assumption += 1;
+            }
+        }
+        b
+    }
+}
+
+// ============================================================================
 // Envelope
 // ============================================================================
 
@@ -468,12 +565,18 @@ pub struct Envelope<T> {
     pub completeness: CompletenessBlock,
     pub provenance: ProvenanceBlock,
     pub freshness: FreshnessBlock,
+    /// §8.8, reported next to `freshness` and never inside it — the two are orthogonal.
+    pub grounding: GroundingBlock,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::completeness::ledger::{self, LedgerReads};
+    use humaux_domain::grounding::{
+        EdgeOutcome, GroundingEdge, GroundingInputs, GroundingMode, GroundingVersionToken,
+        derive_grounding_state,
+    };
 
     fn closed(reads: LedgerReads) -> LedgerClosure {
         let c = ledger::close(reads);
@@ -951,9 +1054,135 @@ mod tests {
                 latest_evidence_at: None,
                 state_age_seconds: None,
             },
+            grounding: GroundingBlock::tally([None]),
         };
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(json.contains(r#""completeness_ratio":null"#));
         assert!(json.contains(r#""current":false"#));
+    }
+
+    // ---- §8.8 `grounding` block ----
+
+    /// Builds a real [`GroundingState`] through §8.8's sole derivation point — this crate has
+    /// no way to fabricate one, which is the property under test as much as the tally is.
+    fn live_state(recorded: &str, outcome: EdgeOutcome) -> GroundingState {
+        let edges = [GroundingEdge {
+            mode: GroundingMode::Live,
+            recorded_version: Some(GroundingVersionToken::new(recorded)),
+            outcome,
+        }];
+        derive_grounding_state(GroundingInputs::Edges(&edges))
+    }
+
+    fn state_of(recorded: &str, resolved: &str) -> GroundingState {
+        live_state(
+            recorded,
+            EdgeOutcome::Resolved(GroundingVersionToken::new(resolved)),
+        )
+    }
+
+    /// All four §8.8 states, each built through the derivation point rather than named — so a
+    /// fixture can cover the whole vocabulary without this file re-encoding how they arise.
+    fn one_of_each_state() -> [GroundingState; 4] {
+        [
+            state_of("v1", "v1"),
+            state_of("v1", "v2"),
+            live_state("v1", EdgeOutcome::Missing),
+            derive_grounding_state(GroundingInputs::DenominatorUnavailable),
+        ]
+    }
+
+    /// `None` is not a fifth state and must never be counted as `current` — the grounding-side
+    /// twin of §23.1's "不许输出数字充数".
+    #[test]
+    fn unjudged_items_are_counted_apart_from_current() {
+        let b = GroundingBlock::tally([None, None, Some(state_of("v1", "v1"))]);
+        assert_eq!(b.not_judged, 2);
+        assert_eq!(b.current, 1);
+        assert_eq!(b.revokes_current_truth_assumption, 0);
+    }
+
+    /// The four states stay broken out (§8.8 keeps `Missing` and resolver error distinct), and
+    /// `revokes_current_truth_assumption` tracks §8.8's own predicate rather than a local
+    /// "everything but current" sum. The fixture carries **one of each** state on purpose: with
+    /// any state absent, folding it into a neighbour is unobservable here.
+    #[test]
+    fn tally_keeps_the_four_states_apart_and_counts_revocations() {
+        let [current, recheck, unresolved, cannot_establish] = one_of_each_state();
+        let b = GroundingBlock::tally([
+            Some(current),
+            Some(recheck),
+            Some(unresolved),
+            Some(cannot_establish),
+            None,
+        ]);
+        assert_eq!(b.current, 1);
+        assert_eq!(b.recheck_required, 1);
+        assert_eq!(
+            b.unresolved, 1,
+            "「来源确实不在了」must not be lumped in with 「我没能问出来」(§8.8)"
+        );
+        assert_eq!(b.cannot_establish, 1);
+        assert_eq!(b.not_judged, 1);
+        assert_eq!(
+            b.revokes_current_truth_assumption, 3,
+            "the three non-CURRENT states revoke; `not_judged` is not a revocation, it is an \
+             absence of judgement"
+        );
+    }
+
+    /// One item at a time, each state's own revocation answer must equal §8.8's — proves the
+    /// count comes from `GroundingState::revokes_current_truth_assumption`, not from a
+    /// hand-maintained list of which states are "bad".
+    #[test]
+    fn revocation_count_agrees_with_the_domain_predicate_state_by_state() {
+        for state in one_of_each_state() {
+            let b = GroundingBlock::tally([Some(state)]);
+            assert_eq!(
+                b.revokes_current_truth_assumption == 1,
+                state.revokes_current_truth_assumption(),
+                "{:?} disagreed with §8.8's own predicate",
+                state.kind()
+            );
+        }
+    }
+
+    /// §8.8「禁止把两者压回一个 `stale` 字段」at the wire boundary: `freshness` and `grounding`
+    /// are two top-level keys, neither nested in the other.
+    #[test]
+    fn envelope_reports_grounding_beside_freshness_not_inside_it() {
+        let ledger = closed(LedgerReads {
+            expected: 1,
+            done: 1,
+            deleted: 0,
+            skipped: 0,
+            open_gaps: 0,
+            pending: 0,
+        });
+        let envelope = Envelope::<()> {
+            items: vec![],
+            pipeline: PipelineBlock {
+                evidence: EvidenceBlock::no_batch(1),
+                knowledge: KnowledgeBlock {
+                    eligible: 1,
+                    processed: 1,
+                    waiting_key: 0,
+                    failed: 0,
+                },
+                projection: build_projection_block(&ledger, Some(1)).value,
+            },
+            completeness: completeness_block(5, 5, vec![]),
+            provenance: full_provenance(),
+            freshness: FreshnessBlock {
+                class: FreshnessClass::Fresh,
+                latest_evidence_at: Some("2026-08-24T12:00:00Z".to_string()),
+                state_age_seconds: Some(300),
+            },
+            // §8.8's own worked example: a 5-minute-old memory whose source just moved.
+            grounding: GroundingBlock::tally([Some(state_of("v1", "v2"))]),
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains(r#""freshness":{"class":"fresh""#));
+        assert!(json.contains(r#""grounding":{"current":0,"recheck_required":1"#));
     }
 }

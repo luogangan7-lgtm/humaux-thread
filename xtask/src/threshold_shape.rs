@@ -6,7 +6,7 @@
 
 use std::fs;
 
-const SPEC_PATH: &str = "docs/architecture/Baseline_2.8.md";
+const SPEC_PATH: &str = "docs/architecture/Baseline_2.9.md";
 
 /// §69 判据①「量纲词」清单（题 / 条 / n=），逐字取自 spec 行 11049。
 const DIMENSION_WORDS: [&str; 3] = ["题", "条", "n="];
@@ -162,7 +162,7 @@ mod tests {
 
     fn real_spec_md() -> String {
         let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/architecture/Baseline_2.8.md");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/architecture/Baseline_2.9.md");
         fs::read_to_string(path).expect("spec must be readable in test env")
     }
 
@@ -176,7 +176,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("tempdir create");
-        let path = dir.join("Baseline_2.8.md");
+        let path = dir.join("Baseline_2.9.md");
         fs::write(&path, content).expect("write fixture");
         fs::read_to_string(&path).expect("read fixture back")
     }

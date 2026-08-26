@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 
 const FEATURES_TOML_PATH: &str = "config/features.toml";
-const SPEC_PATH: &str = "docs/architecture/Baseline_2.8.md";
+const SPEC_PATH: &str = "docs/architecture/Baseline_2.9.md";
 /// §58 workspace tree 里登记 `config/features.toml` 的那一行，逐字命中即视为在树中
 /// （G50-1 第0条）。
 const SPEC_TREE_MARK: &str =
@@ -244,7 +244,7 @@ mod tests {
 
     fn real_spec_md() -> String {
         let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/architecture/Baseline_2.8.md");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/architecture/Baseline_2.9.md");
         fs::read_to_string(path).expect("spec must be readable in test env")
     }
 

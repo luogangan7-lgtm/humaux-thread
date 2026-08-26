@@ -33,7 +33,7 @@ const SCHEMAS: &[&str] = &[
 
 const SPEC_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../docs/architecture/Baseline_2.8.md"
+    "/../docs/architecture/Baseline_2.9.md"
 );
 
 /// §57.1: every gate/check is three-state.

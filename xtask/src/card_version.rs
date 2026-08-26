@@ -30,7 +30,7 @@
 //!
 //! Scan domain for 1 and 3: every `.rs` file under the workspace (crates/ + xtask/, this file's
 //! own source excluded — see [`SELF_FILE`]) and every `migrations/*.sql` file, plus the spec's
-//! own `docs/architecture/Baseline_2.8.md` ([`SPEC_FILE`]). Same text-scan style as every other
+//! own `docs/architecture/Baseline_2.9.md` ([`SPEC_FILE`]). Same text-scan style as every other
 //! xtask gate in this repo (`xtask/src/direction_table.rs`'s own doc makes the same point) —
 //! judgment stays in §18.4, this file only cites it.
 
@@ -61,7 +61,7 @@ const SELF_FILE: &str = "xtask/src/card_version.rs";
 /// `CARD_BUILDER_VERSION`/`CARD_TEMPLATE_HASH` and the retired `card_template_version` name (to
 /// say the latter is retired), so it is excluded from [`retired_name_check`] the same way
 /// [`SELF_FILE`] is excluded from the pairing scan.
-const SPEC_FILE: &str = "docs/architecture/Baseline_2.8.md";
+const SPEC_FILE: &str = "docs/architecture/Baseline_2.9.md";
 
 /// §18.4: "旧名 `card_template_version` 全文作废" — both casings, since Rust source would spell
 /// a resurrected const `CARD_TEMPLATE_VERSION` while the spec's own prose uses snake_case.

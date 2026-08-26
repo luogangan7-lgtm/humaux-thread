@@ -3,7 +3,7 @@
 **Humaux Thread — Persistent context infrastructure for AI agents.**
 （Humaux 母品牌 · Thread 产品名 · AI Agent 持久上下文与知识记忆基础设施）
 
-- Spec（唯一规范真源）: `docs/architecture/Baseline_2.8.md` — Architecture Frozen, GO for Phase 0.
+- Spec（唯一规范真源）: `docs/architecture/Baseline_2.9.md` — Architecture Frozen；含 ADR-0001/0003/0004 的修正与 Baseline 2.9 Grounding 增量。
 - 开发计划: Humaux 记忆库 `[decision] Humaux Thread 0→1 开发任务计划 v1 定稿`（118 任务卡，Phase 0–17）。
 - 开发规范: `CLAUDE.md`（本仓所有 agent 必读）。
 

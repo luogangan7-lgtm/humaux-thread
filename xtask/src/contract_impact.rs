@@ -14,13 +14,17 @@ use std::process::Command;
 
 /// spec 唯一真源；cwd 假定为 repo root（`cargo xtask` 惯例，同 config_check.rs），
 /// 这样才能与 `git diff --name-only` 输出的仓库相对路径直接比较。
-const SPEC_PATH: &str = "docs/architecture/Baseline_2.8.md";
+const SPEC_PATH: &str = "docs/architecture/Baseline_2.9.md";
 const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
 const FEATURES_TOML_PATH: &str = "config/features.toml";
 const ROOT_CARGO_TOML_PATH: &str = "Cargo.toml";
 
-/// §80.3「机器识别以下 7 个承重块」正文前的锚点，定位其后紧跟的 ```text 围栏。
-const BLOCK_LIST_ANCHOR: &str = "机器识别以下 7 个承重块：";
+/// §80.3「机器识别以下 9 个承重块」正文前的锚点，定位其后紧跟的 ```text 围栏。
+///
+/// 数字是锚点的一部分：块数一变，这里先找不到围栏、`parse_canonical_blocks` 返回空集，
+/// 正哨兵随即以「0 个」变红——所以改块数时这个常量、下面的期望值、以及 fixture 三处必须
+/// 同改，漏一处当天即红（ADR-0004）。
+const BLOCK_LIST_ANCHOR: &str = "机器识别以下 9 个承重块：";
 const GENERIC_FENCE_OPEN: &str = "```text";
 const IMPACT_MAP_FENCE_OPEN: &str = "```contract-impact-map";
 const FENCE_CLOSE_LINE: &str = "\n```";
@@ -118,17 +122,17 @@ fn parse_impact_map(text: &str) -> Vec<ImpactMapRow> {
 }
 
 /// §80.3「映射本身不能偷偷漏新 block」正哨兵：`actual_canonical_block_ids == impact-map 第一列`，
-/// 且恰好 7 个（注错 C 多一个、注错 D 变空集，两者都在这里被拦）。
+/// 且恰好 9 个（注错 C 多一个、注错 D 变空集，两者都在这里被拦）。
 fn check_positive_sentinel(blocks: &[CanonicalBlock], map: &[ImpactMapRow]) -> GateResult {
     let actual: BTreeSet<&str> = blocks.iter().map(|b| b.id.as_str()).collect();
     let mapped: BTreeSet<&str> = map.iter().map(|r| r.block_id.as_str()).collect();
     let label = "block-sentinel".to_string();
-    if actual.len() != 7 {
+    if actual.len() != 9 {
         return GateResult {
             label,
             status: GateStatus::Fail,
             detail: format!(
-                "actual canonical block ids = {} 个（期望恰 7 个）: {actual:?}",
+                "actual canonical block ids = {} 个（期望恰 9 个）: {actual:?}",
                 actual.len()
             ),
         };
@@ -240,6 +244,45 @@ fn resolve_block_locations(spec_text: &str) -> BTreeMap<&'static str, Vec<Locati
         )
         .map_or(vec![], |(s, e)| vec![Location::SpecRange(s, e)]),
     );
+    {
+        // GROUNDING_CONTRACT 跨两章（§8.8 定义 GroundingMode/Resolver/四态派生，§11.10 定义
+        // Revalidation Pipeline 与 Finalization CAS）——两处都是承重面，任一处改动都要触发
+        // 同一组 checker，所以像 WORKSPACE_LAYOUT 一样登记多个 location 而不是二选一。
+        // `section_range` 按**逐字相等**匹配整行标题（不是前缀），所以这里必须写全副标题。
+        // 首版只写到 "## 8.8 Grounding Validity" 就漏了破折号之后的部分：§11.10 那条恰好逐字
+        // 命中，`if let Some` 把 §8.8 的落空静默吞掉，block 仍非空、测试照绿——半数承重面
+        // 无人看守。改成先收齐再断言「两处都要在」，落空即红。
+        const GROUNDING_HEADINGS: [&str; 2] = [
+            "## 8.8 Grounding Validity — “证据变了”与“事实错了”必须分开",
+            "## 11.10 Grounding Revalidation Pipeline",
+        ];
+        let v: Vec<Location> = GROUNDING_HEADINGS
+            .iter()
+            .filter_map(|h| {
+                section_range(spec_text, h, |l| {
+                    l.starts_with("## ") || l.starts_with("# ")
+                })
+                .map(|(s, e)| Location::SpecRange(s, e))
+            })
+            .collect();
+        m.insert(
+            "GROUNDING_CONTRACT",
+            if v.len() == GROUNDING_HEADINGS.len() {
+                v
+            } else {
+                Vec::new() // 缺任一处 -> 空集 -> 定位断言红，而不是半绿
+            },
+        );
+    }
+    m.insert(
+        "NETWORK_BOUNDARY",
+        section_range(
+            spec_text,
+            "## 83.4 Network Choke Point — G80-3 的真实 RHS（Layer 0/1A/1B，ADR-0003）",
+            |l| l.starts_with("## "),
+        )
+        .map_or(vec![], |(s, e)| vec![Location::SpecRange(s, e)]),
+    );
     m
 }
 
@@ -280,6 +323,9 @@ enum CheckerKind {
 fn default_checker_kind(id: &str) -> CheckerKind {
     match id {
         "G80-3" => CheckerKind::Implemented("architecture-check"),
+        // G80-43 与 G80-3 同型：判据本体活在 `architecture-check` 内部
+        // （`g80_43_grounding_validity`，§11.10#G11-2），没有独立子命令。
+        "G80-43" => CheckerKind::Implemented("architecture-check"),
         "G80-10" => CheckerKind::Implemented("mechanism-registry"),
         "G80-41" => CheckerKind::Implemented("config-check"),
         _ => CheckerKind::NotImplemented,
@@ -573,7 +619,7 @@ mod tests {
 
     fn real_spec() -> String {
         let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/architecture/Baseline_2.8.md");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/architecture/Baseline_2.9.md");
         fs::read_to_string(path).expect("spec must be readable in test env")
     }
 
@@ -582,7 +628,7 @@ mod tests {
         fs::read_to_string(path).expect("ci.yml must be readable in test env")
     }
 
-    /// 最小合规 fixture：镜像真实 §80.3 两个围栏的形状，7 行对 7 行，独立于 15074 行真 spec
+    /// 最小合规 fixture：镜像真实 §80.3 两个围栏的形状，9 行对 9 行，独立于真 spec
     /// （§1.14 冻结的「唯一副本」约束的是生产解析目标，不约束测试 fixture，同
     /// mechanism_registry.rs 的先例）。
     const VALID_FIXTURE: &str = "\
@@ -612,7 +658,7 @@ metric table body
 
 ## 80.3 contract-impact-check
 
-机器识别以下 7 个承重块：
+机器识别以下 9 个承重块：
 
 ```text
 MECHANISM_SPEC      §1.14  mechanism-registry fence
@@ -622,6 +668,8 @@ METRIC_REGISTRY     §41.2  metric table
 FEATURE_REGISTRY    §50.1  config/features.toml contract
 WORKSPACE_LAYOUT    §58    workspace tree
 GATE_REGISTRY       §80.1  G80 registry
+GROUNDING_CONTRACT   §8.8/§11.10 grounding contract
+NETWORK_BOUNDARY     §83.4 network boundary
 ```
 
 ```contract-impact-map
@@ -632,6 +680,8 @@ METRIC_REGISTRY  | G80-6,G80-18
 FEATURE_REGISTRY | G80-41
 WORKSPACE_LAYOUT | workspace-member-check,G80-3,G80-40,G80-41
 GATE_REGISTRY    | G80-23,G80-24,gate-phase-coverage
+GROUNDING_CONTRACT| G80-43,grounding-evolution-contract
+NETWORK_BOUNDARY  | G80-3,network-boundary-contract
 ```
 ";
 
@@ -641,8 +691,8 @@ GATE_REGISTRY    | G80-23,G80-24,gate-phase-coverage
     fn valid_fixture_sentinel_passes() {
         let blocks = parse_canonical_blocks(VALID_FIXTURE);
         let map = parse_impact_map(VALID_FIXTURE);
-        assert_eq!(blocks.len(), 7);
-        assert_eq!(map.len(), 7);
+        assert_eq!(blocks.len(), 9);
+        assert_eq!(map.len(), 9);
         assert_eq!(
             check_positive_sentinel(&blocks, &map).status,
             GateStatus::Pass

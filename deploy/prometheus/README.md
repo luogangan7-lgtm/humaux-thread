@@ -1,7 +1,7 @@
 # Prometheus 运行期不变量（INV-1..4）—— T0.5
 
 规则文件：`invariants.rules.yml`。规范唯一真源见
-`docs/architecture/Baseline_2.8.md` §53.5（四条不变量原文 + 注错块）、
+`docs/architecture/Baseline_2.9.md` §53.5（四条不变量原文 + 注错块）、
 §41.2（指标注册表，逐字对账）、§42（冻结：逐字复制进 rule 文件，
 禁止任何名字替换；部署前置 Prometheus >= 2.17）。
 

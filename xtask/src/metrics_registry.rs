@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SPEC_PATH: &str = "docs/architecture/Baseline_2.8.md";
+const SPEC_PATH: &str = "docs/architecture/Baseline_2.9.md";
 const CRATES_DIR: &str = "crates";
 const REGISTRY_HEADING: &str = "## 41.2 注册表（全集）";
 const WITNESS_SUBDIR: &str = "testkit/tests/metrics";
@@ -911,7 +911,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn spec_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/architecture/Baseline_2.8.md")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/architecture/Baseline_2.9.md")
     }
 
     // -- R parser against the real, frozen spec ----------------------------

@@ -2990,7 +2990,112 @@ fn provider_plane_architecture_gate_checks(root: &Path) -> Vec<(&'static str, Ve
             "§19 DOD-028 (b) retrieval credential purpose guard exists",
             g_retrieval_credential_purpose_guard_exists(root),
         ),
+        (
+            "§11.10#G11-2 / G80-43 (Grounding validity / recheck debt)",
+            g80_43_grounding_validity(root),
+        ),
     ]
+}
+/// §80.1 `G80-43` Grounding validity / recheck debt —— 判据 §11.10#G11-2。
+///
+/// 三条断言，各自钉一个**不同**的失效面（缺一都会让判据变成看起来在跑的空壳）：
+///
+/// 1. **八条固定夹具 A–H 逐名在场**（§11.10#G11-2 逐条列了它们）。夹具被删掉时判据会静默
+///    变弱——测试数量下降没人看得见，而 `cargo test` 照样全绿。
+/// 2. **`derive_grounding_state` 恰好定义一次**（活哨兵，§53.3 规则3 同款）。`GroundingState`
+///    的字段是私有的，本模块外造不出来；哨兵防的是家本身被掏空或改名后扫描器失明。
+/// 3. **没有可手改的 stale 真源**（DOD-092 原话「不存在可手改 `memory.stale=true` 真源」）：
+///    全 workspace 不允许出现给 memory 赋 stale 布尔的写法。
+///
+/// 三态：`crates/domain/src/grounding.rs` 不存在时返回 `not_applicable` 并点名（§57.1 第2条），
+/// 不静默 pass——Phase 4 之前这道闸本来就没有被测对象。
+pub fn g80_43_grounding_validity(root: &Path) -> Verdict {
+    const HOME: &str = "crates/domain/src/grounding.rs";
+    /// §11.10#G11-2 逐条列出的八条夹具，按 A–H 的函数名前缀。判据正文在 spec，这里只钉
+    /// 「它们在场」——不复制判据内容（CLAUDE.md：判据正文不得复制到第二处）。
+    const FIXTURE_PREFIXES: [&str; 8] = [
+        "fn fixture_a_",
+        "fn fixture_b_",
+        "fn fixture_c_",
+        "fn fixture_d_",
+        "fn fixture_e_",
+        "fn fixture_f_",
+        "fn fixture_g_",
+        "fn fixture_h_",
+    ];
+    /// 「可手改的 stale 真源」的书写形态。
+    ///
+    /// **`stale: bool` 排在第一位不是凑数**：DOD-092 禁的是「真源」，而真源是**字段本身**——
+    /// 先有可写的 `stale` 字段，才谈得上给它赋值。只钉赋值语法的话，`*stale_ref = true`
+    /// 这类间接写法就绕过去了；钉在字段声明上是堵上游，赋值那几条只是补网。
+    ///
+    /// 反过来，**读** stale 做判断不是 DOD-092 禁的事（`fn is_stale(&self) -> bool` 不含
+    /// `stale: bool`，天然不命中），所以这里不会误报合法读路径——见
+    /// `g80_43_reading_a_stale_field_is_not_a_violation`。
+    const HAND_SET_STALE_SHAPES: [&str; 5] = [
+        "stale: bool",
+        "stale = true",
+        "stale: true",
+        "set_stale(",
+        "stale=true",
+    ];
+
+    let Ok(home_src) = fs::read_to_string(root.join(HOME)) else {
+        return Verdict::NotApplicable(format!(
+            "missing object: {HOME} (§8.8 Grounding Validity 派生点，Phase 4 交付物)"
+        ));
+    };
+
+    let mut strays = Vec::new();
+
+    // 1. 八条夹具逐名在场。
+    for prefix in FIXTURE_PREFIXES {
+        if !home_src.contains(prefix) {
+            strays.push(format!(
+                "§11.10#G11-2 夹具缺失：{HOME} 中找不到 `{prefix}…`（八条 A–H 缺一即判据变弱）"
+            ));
+        }
+    }
+
+    // 2. 活哨兵：派生点恰好一处。带左括号做词边界——`derive_grounding_state_v2` 含子串，
+    //    不带括号的话改名不会被抓到（G80-22.5 的同款教训，见 g22_5_a1_sole_implementation）。
+    let home_hits = home_src.matches("pub fn derive_grounding_state(").count();
+    if home_hits != 1 {
+        strays.push(format!(
+            "positive sentinel: {HOME} defines `pub fn derive_grounding_state` {home_hits} \
+             time(s), expected exactly 1（§53.3 规则3 同款——扫描器失明或派生点被掏空）"
+        ));
+    }
+
+    // 3. DOD-092：全 workspace 不得出现手改 stale 的写法。
+    for (path, source) in read_files(&walk_files(root, &["rs"])) {
+        let disp = display(root, &path);
+        if disp.ends_with(SELF_FILE) {
+            continue; // 本文件逐字包含这些形态作为判据
+        }
+        let hits: usize = source
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .map(|l| {
+                HAND_SET_STALE_SHAPES
+                    .iter()
+                    .map(|shape| l.matches(shape).count())
+                    .sum::<usize>()
+            })
+            .sum();
+        if hits > 0 {
+            strays.push(format!(
+                "{disp}: DOD-092 禁止的可手改 stale 真源（{hits} 处）——GroundingState 只能由 \
+                 `derive_grounding_state` 推导"
+            ));
+        }
+    }
+
+    if strays.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(strays)
+    }
 }
 
 pub fn run(_args: &[String]) -> i32 {
@@ -3553,6 +3658,174 @@ mod tests {
     fn g80_22_real_repo_passes() {
         let root = real_root();
         assert_eq!(g80_22_payload_sha256_unique(&root), Verdict::Pass);
+    }
+
+    // ---- G80-43 (§11.10#G11-2) 注错族：fixture 树，不在真仓上变异 ----
+
+    /// 最小合规 fixture：一个 `grounding.rs`，八条夹具齐、派生点恰一处、无手改 stale。
+    fn grounding_fixture(dir: &Path, fixtures: &[&str], derive_sites: usize) {
+        fs::create_dir_all(dir).unwrap();
+        let mut src = String::new();
+        for _ in 0..derive_sites {
+            src.push_str(
+                "pub fn derive_grounding_state(i: GroundingInputs<'_>) -> GroundingState { todo!() }\n",
+            );
+        }
+        for f in fixtures {
+            src.push_str(&format!("#[test]\nfn {f}() {{}}\n"));
+        }
+        fs::write(dir.join("grounding.rs"), src).unwrap();
+    }
+
+    const ALL_EIGHT: [&str; 8] = [
+        "fixture_a_same_version_is_current",
+        "fixture_b_changed_version_is_recheck_required",
+        "fixture_c_missing_resource_is_unresolved",
+        "fixture_d_resolver_error_is_cannot_establish_not_missing",
+        "fixture_e_relocation_with_same_token_stays_current",
+        "fixture_f_source_changed_mid_revalidation_is_stale_input",
+        "fixture_g_recheck_required_must_not_enter_mandatory_context",
+        "fixture_h_after_confirm_rebinding_returns_to_current",
+    ];
+
+    #[test]
+    fn g80_43_green_on_compliant_fixture() {
+        let tmp = fresh_tmp("g80-43-green");
+        grounding_fixture(&tmp.join("crates/domain/src"), &ALL_EIGHT, 1);
+        assert_eq!(g80_43_grounding_validity(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 ①：删掉夹具 D（「resolver error 不能伪装 Missing」那条）→ 红并点名。
+    /// 这正是判据静默变弱的形态：`cargo test` 少跑一条，全绿如故。
+    #[test]
+    fn g80_43_red_when_a_fixture_is_deleted() {
+        let tmp = fresh_tmp("g80-43-red-fixture");
+        let seven: Vec<&str> = ALL_EIGHT
+            .iter()
+            .copied()
+            .filter(|f| !f.starts_with("fixture_d_"))
+            .collect();
+        grounding_fixture(&tmp.join("crates/domain/src"), &seven, 1);
+        match g80_43_grounding_validity(&tmp) {
+            Verdict::Fail(v) => assert!(
+                v.iter().any(|m| m.contains("fn fixture_d_")),
+                "必须点名缺失的那条夹具，而不是只说「有东西不对」: {v:?}"
+            ),
+            other => panic!("删掉夹具 D 必须红，实得 {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 ②：派生点被掏空（0 处）→ 活哨兵红。没有这条的话，`grounding.rs` 被清空成一个
+    /// 只剩八条空测试的壳，前一条断言照样绿。
+    #[test]
+    fn g80_43_red_when_derivation_point_is_gone() {
+        let tmp = fresh_tmp("g80-43-red-nohome");
+        grounding_fixture(&tmp.join("crates/domain/src"), &ALL_EIGHT, 0);
+        match g80_43_grounding_validity(&tmp) {
+            Verdict::Fail(v) => assert!(v.iter().any(|m| m.contains("positive sentinel")), "{v:?}"),
+            other => panic!("派生点消失必须红，实得 {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 ③：出现第二个派生点 → 活哨兵同样红（`!= 1` 不是 `< 1`）。
+    #[test]
+    fn g80_43_red_on_second_derivation_point() {
+        let tmp = fresh_tmp("g80-43-red-two");
+        grounding_fixture(&tmp.join("crates/domain/src"), &ALL_EIGHT, 2);
+        assert!(
+            matches!(g80_43_grounding_validity(&tmp), Verdict::Fail(_)),
+            "两个派生点必须红"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 ④：DOD-092 —— 别处冒出一个可手改的 stale 真源 → 红并点名文件。
+    #[test]
+    fn g80_43_red_on_hand_settable_stale_flag() {
+        let tmp = fresh_tmp("g80-43-red-stale");
+        grounding_fixture(&tmp.join("crates/domain/src"), &ALL_EIGHT, 1);
+        let other = tmp.join("crates/adapters/src");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(
+            other.join("repo.rs"),
+            "fn mark(m: &mut Memory) {\n    m.stale = true;\n}\n",
+        )
+        .unwrap();
+        match g80_43_grounding_validity(&tmp) {
+            Verdict::Fail(v) => assert!(
+                v.iter()
+                    .any(|m| m.contains("repo.rs") && m.contains("DOD-092")),
+                "{v:?}"
+            ),
+            other => panic!("手改 stale 必须红，实得 {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 ⑤：连赋值都没有，只是**声明**了一个可写的 `stale: bool` 字段 -> 仍然红。
+    /// 这条钉的是 DOD-092 的「真源」二字：字段一旦存在，`*r = true` 之类的间接赋值就有了
+    /// 落点，而那些写法逃得过赋值形态的匹配。
+    #[test]
+    fn g80_43_red_on_stale_field_declaration_even_without_assignment() {
+        let tmp = fresh_tmp("g80-43-red-field");
+        grounding_fixture(&tmp.join("crates/domain/src"), &ALL_EIGHT, 1);
+        let other = tmp.join("crates/domain/src");
+        fs::write(
+            other.join("memory.rs"),
+            "pub struct MemoryRow {\n    pub stale: bool,\n}\n",
+        )
+        .unwrap();
+        match g80_43_grounding_validity(&tmp) {
+            Verdict::Fail(v) => assert!(
+                v.iter()
+                    .any(|m| m.contains("memory.rs") && m.contains("DOD-092")),
+                "{v:?}"
+            ),
+            other => panic!("可写 stale 字段的声明必须红，实得 {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 反向对照：**读** stale 不是 DOD-092 禁的事，只有赋值才是。没有这条的话，判据可能被
+    /// 写成粗暴匹配 `stale`，把合法的读判定也误报成违规（G80-3 上线首日就是这类误报）。
+    #[test]
+    fn g80_43_reading_a_stale_field_is_not_a_violation() {
+        let tmp = fresh_tmp("g80-43-green-read");
+        grounding_fixture(&tmp.join("crates/domain/src"), &ALL_EIGHT, 1);
+        let other = tmp.join("crates/adapters/src");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(
+            other.join("repo.rs"),
+            "fn is_stale(m: &Memory) -> bool {\n    m.stale\n}\n",
+        )
+        .unwrap();
+        assert_eq!(g80_43_grounding_validity(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 三态：被测对象整个不存在（Phase 4 之前）→ `not_applicable` 并**点名缺失对象**，
+    /// 不是静默 pass（§57.1 第2条）。
+    #[test]
+    fn g80_43_not_applicable_without_the_grounding_module() {
+        let tmp = fresh_tmp("g80-43-na");
+        fs::create_dir_all(tmp.join("crates/domain/src")).unwrap();
+        match g80_43_grounding_validity(&tmp) {
+            Verdict::NotApplicable(m) => {
+                assert!(m.contains("missing object"), "{m}");
+                assert!(m.contains("grounding.rs"), "{m}");
+            }
+            other => panic!("缺被测对象时必须 not_applicable 并点名，实得 {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 真仓现状：Phase 4 的 grounding 已交付 → pass。
+    #[test]
+    fn g80_43_real_repo_passes() {
+        assert_eq!(g80_43_grounding_validity(&real_root()), Verdict::Pass);
     }
 
     fn fresh_tmp(label: &str) -> PathBuf {

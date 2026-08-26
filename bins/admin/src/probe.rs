@@ -14,7 +14,7 @@
 // ponytail: 与 §4.4 spec 表的相等性无自动闸（`xtask::mechanism_registry` 不解析这张表，
 // `INTRA_CELL_RESOURCE_REGISTRY`/`EXTERNAL_EGRESS_REGISTRY` 同款手抄副本问题是仓库既有的、
 // 跨多处的系统性缺口，不是本轮改动引入的，也不是这一处能局部补齐的——补齐需要在
-// xtask 里新增「解析 Baseline_2.8.md 里 `§4.4`/`intra-cell-resource-registry` 围栏并跟
+// xtask 里新增「解析 Baseline_2.9.md 里 `§4.4`/`intra-cell-resource-registry` 围栏并跟
 // Rust 端逐名 assert set 相等」这一类通用能力，规模超出本轮 minor 发现的范围。升级路径：
 // 在 architecture-check 里加一条这样的解析+比对，一次性覆盖 KNOWN_PROBES 和两个
 // registry 三处手抄副本，而不是每处各修一次。

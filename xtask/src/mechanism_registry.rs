@@ -5,7 +5,7 @@
 //! （运行期 Runtime Observation authority，§1.14.1）；该表本轮未部署，三项一律输出
 //! `not_applicable` 并打印缺失对象名（§57.1 第2条：not_applicable 必须打印缺失对象名）。
 //!
-//! 解析目标是 canonical md 本身（`docs/architecture/Baseline_2.8.md`），禁止引入
+//! 解析目标是 canonical md 本身（`docs/architecture/Baseline_2.9.md`），禁止引入
 //! 第二个数据文件（§1.14 本章冻结："围栏块是文档内唯一副本"）。
 
 use std::collections::BTreeSet;
@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 /// 用 `CARGO_MANIFEST_DIR` 而非相对 cwd，避免 `cargo xtask` 从非 workspace-root 目录调用时找错文件。
 const SPEC_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../docs/architecture/Baseline_2.8.md"
+    "/../docs/architecture/Baseline_2.9.md"
 );
 
 const FENCE_OPEN: &str = "```mechanism-registry";

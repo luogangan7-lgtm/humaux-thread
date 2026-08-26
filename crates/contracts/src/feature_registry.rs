@@ -3,7 +3,7 @@
 //!
 //! 唯一静态真源：`config/features.toml`。本模块只做纯文本 → 类型解析与结构校验，不接触文件
 //! 系统、也不比对 §1.14 mechanism-registry 围栏块本体——那一步需要读取
-//! `docs/architecture/Baseline_2.8.md`，属于 fs 编排，留给 `xtask config-check`（G50-1/G80-41）。
+//! `docs/architecture/Baseline_2.9.md`，属于 fs 编排，留给 `xtask config-check`（G50-1/G80-41）。
 
 use serde::Deserialize;
 use std::fmt;

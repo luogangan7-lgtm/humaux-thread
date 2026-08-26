@@ -22,7 +22,7 @@ use std::process::Command;
 
 const SPEC_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../docs/architecture/Baseline_2.8.md"
+    "/../docs/architecture/Baseline_2.9.md"
 );
 const TESTKIT_DOD_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../crates/testkit/src/dod.rs");
 
@@ -79,7 +79,7 @@ fn not_applicable(gate: impl Into<String>, detail: impl Into<String>) -> GateRes
 /// Slices the `# 69. Definition of Done` chapter out of the full spec text, up to (not
 /// including) the next top-level `# N.` heading. Covers the DoD checklist, the Verifier
 /// Contract, and the Bootstrap Deferred Manifest / D1-D3 table — all of §69 (spec lines
-/// 10854-11189 in Baseline_2.8.md at the time of writing).
+/// 10854-11189 in Baseline_2.9.md at the time of writing).
 fn section_69(text: &str) -> &str {
     let start = match text.find("# 69. Definition of Done") {
         Some(i) => i,
@@ -998,7 +998,7 @@ mod tests {
         let bounds = frozen_id_bounds(section);
         let r = check_rule2(&entries, bounds);
         assert_eq!(r.status, GateStatus::Pass, "{}", r.detail);
-        assert_eq!(entries.len(), 91, "expected all 91 DoD ids to parse");
+        assert_eq!(entries.len(), 94, "expected all 94 DoD ids to parse");
     }
 
     // -- registry parsing / rule3 / rule6 ---------------------------------------------------

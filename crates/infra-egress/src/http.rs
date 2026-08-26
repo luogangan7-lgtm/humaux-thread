@@ -34,7 +34,7 @@
 //!
 //! [`EnvCredentialSource`] is this module's only [`RetrievalCredentialSource`] impl today, and
 //! is a **dev/OSS-default implementation, not the production credential path** — see its own
-//! doc for the OpenBao upgrade this is standing in for (Baseline_2.8.md "Tenant Data
+//! doc for the OpenBao upgrade this is standing in for (Baseline_2.9.md "Tenant Data
 //! Encryption / Key Hierarchy").
 //!
 //! A non-2xx response status is classified into an [`ErrorCode`] by the caller-supplied
@@ -102,13 +102,13 @@ pub trait RetrievalCredentialSource: Send + Sync {
 /// (§50.1 "humaux-contracts owns the one legitimate config-read point"), so the actual raw read
 /// lives there, not here.
 ///
-/// **Not the production credential path.** Baseline_2.8.md's "Tenant Data Encryption / Key
+/// **Not the production credential path.** Baseline_2.9.md's "Tenant Data Encryption / Key
 /// Hierarchy" section names OpenBao Transit as the platform secret store this credential
 /// should come from in production — a real deployment MUST supply an OpenBao-backed
 /// `RetrievalCredentialSource` implementation (decrypting/fetching as close to
 /// [`HttpExternalCall::call`]'s own call site as this trait already places the read) in place
 /// of this type. `EnvCredentialSource` exists so `crates/retrieval-provider` has something real
-/// to run against for local development and the OSS default config (Baseline_2.8.md "OSS 默认
+/// to run against for local development and the OSS default config (Baseline_2.9.md "OSS 默认
 /// 配置") before that OpenBao implementation lands.
 pub struct EnvCredentialSource {
     var_name: String,
