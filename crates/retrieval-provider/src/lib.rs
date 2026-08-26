@@ -6,4 +6,8 @@
 pub mod adapters;
 pub mod admission;
 pub mod contract;
+pub mod cost;
+pub mod failover;
+pub mod health;
+pub mod pricing;
 pub mod router;
