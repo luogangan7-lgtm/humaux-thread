@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+  --> tests/ui/fail_resource_from_raw_url_string.rs:13:40
+   |
+13 |     let _resource: IntraCellResource = "http://internal-service:1337/evil";
+   |                    -----------------   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `IntraCellResource`, found `&str`
+   |                    |
+   |                    expected due to this

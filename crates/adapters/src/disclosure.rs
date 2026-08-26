@@ -31,6 +31,7 @@ use sqlx::Row;
 use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
+use humaux_domain::boundary::requires_disclosure_record;
 use humaux_domain::egress::{AuthorizedEgressPayload, EgressPermit, PrivateDataPurpose};
 
 use crate::postgres::{MaintenanceDbPool, PrivateWorkerDbPool, RetrievalWorkerDbPool};
@@ -56,6 +57,19 @@ pub enum DisclosureError {
     /// caller bug, not a disclosure with nothing to attribute, and must not silently produce
     /// an unattributed ledger row (see `data_disclosure_sources`'s no-write-path finding).
     NoSources,
+    /// ADR-0003 second-round correction (`domain::boundary`): `permit.purpose()`'s
+    /// [`PrivateDataPurpose::recipient_class`] does not satisfy
+    /// `domain::boundary::requires_disclosure_record`. Unreachable through any *production*
+    /// `PrivateDataPurpose` variant today (all three classify as `ExternalProcessor`) — kept
+    /// as a real, checked branch rather than an `assert!`/`debug_assert!` so a future variant
+    /// that is *not* an external recipient fails this write closed instead of silently
+    /// ledgering a same-entity resource access. §80.1 fault-injection proof that this branch
+    /// is actually wired into `reserve_in_txn` (not merely dead code alongside
+    /// `domain::boundary`'s own unit tests of the pure decision function):
+    /// `reserve_rejects_a_non_recipient_classified_purpose_before_any_write` in
+    /// `tests/disclosure_ledger.rs`, using the `test-support`-feature-only
+    /// `PrivateDataPurpose::NonRecipientForTest`.
+    NotADisclosureRecipient,
 }
 
 impl From<sqlx::Error> for DisclosureError {
@@ -75,6 +89,12 @@ impl std::fmt::Display for DisclosureError {
             Self::NoSources => write!(
                 f,
                 "reserve() requires at least one ops.data_disclosure_sources row (§7.4)"
+            ),
+            Self::NotADisclosureRecipient => write!(
+                f,
+                "permit.purpose()'s RecipientClass does not require a disclosure record \
+                 (domain::boundary::requires_disclosure_record) — refusing to write ops.\
+                 data_disclosures for a non-recipient"
             ),
         }
     }
@@ -127,6 +147,13 @@ fn purpose_as_db_str(purpose: PrivateDataPurpose) -> &'static str {
         PrivateDataPurpose::UserReasoning => "USER_REASONING",
         PrivateDataPurpose::RetrievalEmbedding => "RETRIEVAL_EMBEDDING",
         PrivateDataPurpose::RetrievalRerank => "RETRIEVAL_RERANK",
+        // §80.1 test-only variant (`domain::egress`'s own doc) — `reserve_in_txn`'s
+        // `RecipientClass` guard above always rejects it before this fn is ever reached.
+        #[cfg(feature = "test-support")]
+        PrivateDataPurpose::NonRecipientForTest => unreachable!(
+            "reserve_in_txn's RecipientClass guard rejects NonRecipientForTest before \
+             purpose_as_db_str is reached"
+        ),
     }
 }
 
@@ -209,6 +236,15 @@ async fn reserve_in_txn(
     scope: Option<DisclosureScope>,
     sources: &[DisclosureSource],
 ) -> Result<Uuid, DisclosureError> {
+    // ADR-0003 second-round correction: the write judgment is `RecipientClass`, never
+    // `NetworkRouteClass`/IntraCell/private-IP/protocol (`domain::boundary`'s own doc). This is
+    // the one call site that decides whether an `EgressPermit`-backed transfer becomes an
+    // `ops.data_disclosures` row — see that module's doc for the PrivateLink/Bedrock and
+    // same-Cell-Qdrant examples this line is meant to keep correct as `PrivateDataPurpose`
+    // grows new variants.
+    if !requires_disclosure_record(permit.purpose().recipient_class()) {
+        return Err(DisclosureError::NotADisclosureRecipient);
+    }
     if payload.sha256() != permit.payload_sha256() {
         return Err(DisclosureError::PayloadMismatch);
     }

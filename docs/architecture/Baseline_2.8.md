@@ -411,7 +411,7 @@ REVOKED_SOURCE -> recompute support closure -> invalidate unsupported descendant
 
 **问题**：一批机制在当前分母下**恒不可触发**，却与生效机制并列陈述，读起来一样「已定义」。这与坑7 同构 —— **给现象起了名字，但没人验证这个名字这一轮取到过值。**
 
-**契约**：分母元数据在全文只存在**一份**，就是本节的机器可读注册表。**本章冻结**：`mechanism-registry` 围栏块是文档内唯一副本，任何章节（含本节正文）不得再写第二份 status 表；需要人读的表由 `humaux-admin render mechanism-registry` 从本块渲染 —— 它是与 §4.4 的 `humaux-admin q <name>` **平级的另一个子命令，不是探针**：不进 §4.4 那份冻结的 10 条探针目录，也不产出那里冻结的 `{value, scanned_n, scope_hash, checked_at, probe_version}` JSON。（此前这里写作 `humaux-admin q mechanism.registry --render` 并注「§4.4 探针目录同规格」，而 §4.4 目录里没有 `mechanism.registry` 这一条、`--render` 也不在 `q` 的契约里 —— 那是引用了一个不存在的零件，作废。）渲染结果禁止回写进本文档。此前「每个机制章头声明三行」的写法作废，以本节为准。
+**契约**：分母元数据在全文只存在**一份**，就是本节的机器可读注册表。**本章冻结**：`mechanism-registry` 围栏块是文档内唯一副本，任何章节（含本节正文）不得再写第二份 status 表；需要人读的表由 `humaux-admin render mechanism-registry` 从本块渲染 —— 它是与 §4.4 的 `humaux-admin q <name>` **平级的另一个子命令，不是探针**：不进 §4.4 那份冻结的探针目录（ADR-0003 第二轮新增 `cell.resources` 后共 11 条），也不产出那里冻结的 `{value, scanned_n, scope_hash, checked_at, probe_version}` JSON。（此前这里写作 `humaux-admin q mechanism.registry --render` 并注「§4.4 探针目录同规格」，而 §4.4 目录里没有 `mechanism.registry` 这一条、`--render` 也不在 `q` 的契约里 —— 那是引用了一个不存在的零件，作废。）渲染结果禁止回写进本文档。此前「每个机制章头声明三行」的写法作废，以本节为准。
 
 一行一记录，`|` 分列，列序固定：
 
@@ -849,6 +849,7 @@ Adapters depend on Domain; Domain does not depend on Adapters.
 | `deploy.binary` | 运行中二进制的 git sha / build time / crate 版本 | 1 |
 | `tls.expiry` | 每张证书剩余天数 | 证书文件数 |
 | `parse.poison` | POISON artifact 数与 `limit_hit` 分布 | artifact 全表 |
+| `cell.resources` | §83.4 Layer 1B `intra-cell-resource-registry` 每条资源：registry 声明（`configured_host`/`configured_port`）与本次 live probe 独立取得的运行时事实（`resolved_ips`/`same_cell`/`private_route`/`identity_verified`/`reachable`）——两者必须来自两处，不得用声明自证声明（ADR-0003 第二轮，旧系统坑5） | `IntraCellResource::ALL` 变体数（穷举，同 `degrade.counters` 记法） |
 
 `flags.effective` 与 `deploy.binary` 直接对着坑 4（flag 不在注册表、钩子硬编码 `None`、三臂全跑旧镜像而验活全绿）：这两条探针存在的唯一意义，就是让"名"与"实"能被一条命令对齐。
 
@@ -1337,7 +1338,7 @@ pub trait ExternalCall {
 
 绕过 = 编译错误：`EgressPermit` 在 policy crate 外无任何构造路径 ⇒ `adapters/*` 造不出来；`ExternalCall::call` 是 adapter 唯一 pub 出境方法 ⇒ 直接 `reqwest::Client::post()` 的代码拿不到 permit。
 
-architecture-check 的唯一执行体见 §83.4：raw HTTP transport 路径集合恰为 `{crates/infra-egress/src/http.rs}`，`OutboundPurpose` 与 `external-egress-registry` 集合逐字相等；private-data purpose 还必须类型化携带 `EgressPermit`。
+architecture-check 的唯一执行体见 §83.4：raw HTTP transport 路径集合恰为 `{crates/infra-network/src/http.rs}`（ADR-0003 起，Layer 0）；`OutboundPurpose` 与 `external-egress-registry` 集合逐字相等；private-data purpose 还必须类型化携带 `EgressPermit`。
 
 ## 7.4 出境记账：每一次，不采样
 
@@ -1353,6 +1354,8 @@ architecture-check 的唯一执行体见 §83.4：raw HTTP transport 路径集�
 | `disclosure_id` | 主键；来源不存数组，见 `ops.data_disclosure_sources` |
 | `reserved_at` / `finalized_at` / `outcome` | 预留→完成；`reserved` 有而 `finalized` 无且超 60 s ⇒ §53 INV-3 立即红 |
 | `deletion_capability` / `deletion_requested_at` / `deletion_confirmed_at` | processor 侧能不能删、什么时候请求、什么时候回执（§37 删除传播读这三列；本表是它们的唯一列定义，§37 不另立第二份） |
+
+**本节冻结（ADR-0003 第二轮修正）**：本账本只记录**跨法律/组织实体**的处理或披露——收方是 `domain::boundary::RecipientClass::ExternalProcessor` 或 `ExternalIndependentRecipient`（`domain::boundary::requires_disclosure_record` 是唯一判定函数）。同实体资源（`RecipientClass::SameEntityResource`，例如 §83.4 Layer 1B 的自部署 Qdrant）访问**不得**写入本表，无论网络路径是公网、VPN、PrivateLink 还是同 Cell 私网——判据是收方的法律/组织身份，不是网络路径（`NetworkRouteClass`）。二者是两个正交、不可互转的枚举；任何写入路径改用「是不是 IntraCell / 是不是私有 IP / 是不是 HTTP」判断要不要写本表，都是对本节冻结的违反。
 
 来源关系规范化为：
 
@@ -9876,8 +9879,11 @@ humaux/
 │   │   ├── sparse/
 │   │   ├── graph/
 │   │   └── code/
-│   ├── infra-egress/
-│   │   └── src/http.rs          # G80-3 唯一 raw HTTP transport 正哨兵
+│   ├── infra-network/
+│   │   └── src/http.rs          # G80-3 唯一 raw HTTP transport 正哨兵（Layer 0，ADR-0003）
+│   ├── infra-egress/            # Layer 1A：外部出境（OutboundPurpose+EgressPermit，§7.3）
+│   ├── infra-cell/              # Layer 1B：Cell 内访问（IntraCellResource+CellAccessPermit）
+│   │   └── src/resource.rs      # intra-cell-resource-registry 正哨兵（ADR-0003）
 │   ├── retrieval-provider/
 │   │   ├── contract/
 │   │   ├── router/
@@ -9927,15 +9933,17 @@ resolver = "3"
 members = ["crates/*", "bins/*"]
 ```
 
-因此 `crates/infra-egress/Cargo.toml` 与 `crates/retrieval-provider/Cargo.toml`
+因此 `crates/infra-network/Cargo.toml`、`crates/infra-egress/Cargo.toml`、
+`crates/infra-cell/Cargo.toml` 与 `crates/retrieval-provider/Cargo.toml`
 必须出现在 `cargo metadata --no-deps` 的 workspace member 集合中。
 
-G80-3 增加第 0 条正哨兵：
+G80-3 增加第 0 条正哨兵（ADR-0003 起，三个 crate 各一份，见 §83.4）：
 
 ```text
-exists(crates/infra-egress/Cargo.toml)
-AND exists(crates/infra-egress/src/http.rs)
-AND cargo_metadata.members contains humaux-infra-egress
+exists(crates/infra-network/Cargo.toml)
+AND exists(crates/infra-network/src/http.rs)
+AND cargo_metadata.members contains humaux-infra-network
+# 同一形状再各查一次 crates/infra-egress、crates/infra-cell
 ```
 
 三者任一为假，**先红**，再谈“raw client 构造点集合 == 1”。否则 RHS 指向一条文档里有、
@@ -14634,16 +14642,22 @@ Audit + Metrics
 
 任何 Handler 不得绕过这条 pipeline。
 
-## 83.4 Outbound Network Choke Point — G80-3 的真实 RHS
+## 83.4 Network Choke Point — G80-3 的真实 RHS（Layer 0/1A/1B，ADR-0003）
 
-旧版 G80-3 是唯一 `NOT_ADMITTED`：它声称“扫描到的出网点 == 允许清单条数”，但**根本没有允许清单**。这与旧系统“有闸名、没有可观测对象”同型。
+旧版 G80-3 是唯一 `NOT_ADMITTED`：它声称“扫描到的出网点 == 允许清单条数”，但**根本没有允许清单**。这与旧系统“有闸名、没有可观测对象”同型。2.3 把它冻结为一层（下方“Raw HTTP Transport 只有一个”）。
 
-2.3 冻结为两层：
-
-### Raw HTTP Transport 只有一个
+**ADR-0003 修正**：该单层把两个不同的 choke point 意外合成了一个——“全 workspace 只有一处允许构造 `reqwest::Client`”（协议问题，与目的地无关）和“未经 `EgressPermit` 且未记账的出境是违规”（信任边界问题，只对**外部**目的地成立）。Qdrant 是 Cell 内部基础设施（§7.0/§7.2：“Sparse/BM25 是本地 Retrieval lane”），不是外部披露对象；把它塞进唯一出口会强迫它要么写一条它没有资格写的 `ops.data_disclosures`（§7.4），要么绕开 choke point 另开一个 `reqwest::Client` 构造点。ADR-0003（`docs/adr/0003-network-vs-egress-choke-point.md`）据此把这一层拆成三层：
 
 ```text
-crates/infra-egress/src/http.rs
+Layer 0  crates/infra-network/src/http.rs   唯一 raw client 构造点（协议中立，无 OutboundPurpose/EgressPermit 语义）
+Layer 1A crates/infra-egress/src/http.rs    外部出境：OutboundPurpose + EgressPermit + ExternalCall（§7.3 语义不变）
+Layer 1B crates/infra-cell/                 Cell 内访问：IntraCellResource + CellAccessPermit（不是 EgressPermit）
+```
+
+### Layer 0 — Raw HTTP Transport 只有一个
+
+```text
+crates/infra-network/src/http.rs
 ```
 
 全 workspace 只有该文件允许直接 import/construct：
@@ -14653,27 +14667,89 @@ reqwest::Client
 hyper::Client
 ```
 
-业务 Adapter 只能调用：
+（`tonic::Channel`：本 workspace 目前不使用 gRPC，G80-3 的 needle/manifest 扫描也未覆盖它——
+未落地前不得写进本围栏，否则闸名与可观测对象不匹配，同§59.1 判例。若未来引入 gRPC，扫描器
+与本围栏须同一提交内一起加。）
+
+Layer 1A/1B 只经由该文件的 re-export（`humaux_infra_network::reqwest`）取用 `reqwest::Client`/`reqwest::Error` 等**类型**——两者自己的 `Cargo.toml` 都不直接列 `reqwest`，G80-3 判据1 的 manifest 集合因此仍是严格的单文件相等，不随 Layer 1 wrapper 数量增长而放宽。
+
+### Layer 1A — External Egress（§7.3 语义不变，只换底层 client 来源）
 
 ```rust
-pub trait ExternalHttpTransport {
-    async fn execute(
+// crates/domain/src/egress.rs（§7.3 冻结正文，T4.1 已落地为 humaux_domain::egress）
+pub trait ExternalCall {
+    async fn call(
         &self,
-        purpose: OutboundPurpose,
-        permit: NetworkPermit,
-        request: BoundedHttpRequest,
-    ) -> Result<BoundedHttpResponse, NetworkError>;
+        permit: &EgressPermit,
+        payload: &AuthorizedEgressPayload,
+    ) -> Result<Vec<u8>, ErrorCode>;
 }
 ```
 
 涉及私人内容的 purpose 进一步要求：
 
 ```text
-NetworkPermit contains / is derived from EgressPermit
-payload_sha256 exact match
+OutboundPurpose 的三个 private-data 变体直接以元组形式携带 EgressPermit（USER_REASONING(EgressPermit) 等）
+payload_sha256 exact match（ExternalCall 实现内校验）
 ```
 
-### 逻辑 OutboundPurpose Registry
+`humaux-infra-egress`（`HttpExternalCall`）是这一层的唯一 `ExternalCall` 实现；它的 `reqwest::Client` 由 Layer 0 的 `infra_network::http::build_client` 构造，自己不再直接调用 `Client::builder()`。私人 purpose 仍须写 `ops.data_disclosures`（§7.4）——这一层的记账语义完全不变。
+
+### Layer 1B — Intra-Cell Access（新，不是 EgressPermit）
+
+```rust
+// crates/infra-cell/src/{resource,permit,transport}.rs
+pub enum IntraCellResource {   // 闭集，第一版仅一项
+    QDRANT_REST,
+}
+
+pub struct CellAccessPermit { /* 全字段私有；grant_id/resource/caller/expires_at */ }
+
+pub trait IntraCellHttpTransport {
+    async fn execute(
+        &self,
+        permit: &CellAccessPermit,
+        request: IntraCellRequest,     // 相对路径，不接受裸 URL
+    ) -> Result<IntraCellResponse, IntraCellError>;
+}
+```
+
+**为什么 Qdrant 绝不能写 `ops.data_disclosures`**（三条，ADR-0003 正文同款）：
+
+```text
+1. §7.4 冻结它是唯一权威出境账本；删除传播据此判断外部 processor 是否需删除——
+   写进去后一条删除请求会把 Qdrant 误列为 External recipient。
+2. PG 是 Authority、Qdrant 是可重建 Projection（§7.4/§17）：这是投影关系，不是披露关系。
+3. data_disclosures_finalized_total（§53.5 INV-2 分母）与 data_disclosures_reserved_unfinalized
+   （INV-3）是这两条不变式的真实指标；高频 Projection/Search 流量掺入会改变分母，
+   使两条不变式不再度量它们本该度量的东西。
+```
+
+`CellAccessPermit` 因此不携带 `payload_sha256`/`data_class`，也没有到 `EgressPermit` 的任何转换路径——minting 它结构上就不可能预留一条 `ops.data_disclosures` 行。
+
+### 逻辑 intra-cell-resource-registry（与 external-egress-registry 并列，独立围栏）
+
+```intra-cell-resource-registry
+QDRANT_REST | same-cell | §17 | CellAccessPermit
+```
+
+### intra-cell 六条 AND 判据（缺一 fail-closed）
+
+```text
+1. registry membership   — 调用方只能传 IntraCellResource 枚举值，不能传任意 URL；
+                            endpoint 由 registry/部署拓扑解析（代码级/类型级）
+2. same cell              — source_cell_id == target.cell_id（代码级，CellAccessPermit mint 时）
+3. resolved address ∈ Cell CIDR — 解析后每个地址核对 Cell 的 CIDR/Service IP 集；
+                            public IP / metadata IP(169.254.169.254) / link-local /
+                            别的 cell CIDR 一律拒（代码级，call 时，先于任何连接）
+4. no Internet/NAT route  — 部署级（deploy gate，见 README "Intra-cell network deploy gate"）
+5. destination identity   — mTLS 或 TLS 证书 + 精确内部 DNS SAN + API key（部署级，同上）
+6. caller allowlist       — registry 写死哪些进程可访问该资源（代码级，CellAccessPermit mint 时）
+```
+
+本期代码级实现 1/2/3/6；4/5 是部署流程检查，不伪装成 CI 闸。业界依据：Google VPC Service Controls / Istio egress gateway / AWS PrivateLink / Qdrant 官方自托管建议——都按安全边界划线，不按协议划线。
+
+### 逻辑 OutboundPurpose Registry（external-egress-registry，未改动）
 
 ```external-egress-registry
 USER_REASONING       | private-data | §11 | EgressPermit
@@ -14699,41 +14775,58 @@ SDK 若内部偷偷创建自己的 HTTP client、无法注入 Humaux transport�
 ### G80-3 判据 / 注错
 
 ```text
-0. workspace 正哨兵
-   exists(crates/infra-egress/Cargo.toml)
-   AND exists(crates/infra-egress/src/http.rs)
-   AND cargo metadata members contains humaux-infra-egress
+0. workspace 正哨兵（三条crate各一份）
+   exists(crates/infra-network/Cargo.toml) AND exists(crates/infra-network/src/http.rs)
+     AND cargo metadata members contains humaux-infra-network
+   exists(crates/infra-egress/Cargo.toml) AND exists(crates/infra-egress/src/http.rs)
+     AND cargo metadata members contains humaux-infra-egress
+   exists(crates/infra-cell/Cargo.toml) AND exists(crates/infra-cell/src/resource.rs)
+     AND cargo metadata members contains humaux-infra-cell
 
-1. raw reqwest/hyper client 构造点集合
-   == {crates/infra-egress/src/http.rs}
+1. raw reqwest/hyper client 构造点集合 == {crates/infra-network/src/http.rs}
+   reqwest/hyper 依赖声明的 manifest 集合 == {crates/infra-network/Cargo.toml}
 
-2. OutboundPurpose Rust enum 变体集合
-   == external-egress-registry 第一列
+2. OutboundPurpose Rust enum 变体集合 == external-egress-registry 第一列
+   IntraCellResource Rust enum 变体集合 == intra-cell-resource-registry 第一列
+   两个 registry 的名字集合互不相交（反向哨兵：防止同一个资源同时可经两条 registry 命名）
 
-3. 标为 private-data 的 purpose
-   在类型上只能由 EgressPermit 构造 NetworkPermit
+3. 标为 private-data 的 purpose 在类型上只能由 EgressPermit 构造 OutboundPurpose 变体
 ```
 
 注错：
 
 ```text
-0a. 从 §58 / Cargo workspace 删除 crates/infra-egress
-    -> workspace 正哨兵 1 -> 0 -> 红
+0a. 从 §58 / Cargo workspace 删除 crates/infra-network（或 infra-egress、或 infra-cell）
+    -> 对应 workspace 正哨兵 1 -> 0 -> 红
 
-a. 在 adapters/retrieval.rs 直接 new reqwest::Client
+a. 在 adapters/qdrant.rs（或 retrieval.rs）直接 new reqwest::Client
    -> raw client 路径集合多 1 -> 红
 
 b. 给 OutboundPurpose 加 `MysteryProvider` 不加 registry 行
    -> 集合差 -> 红
 
-c. 把 RETRIEVAL_RERANK 改成 generic NetworkPermit
-   -> compile-fail test 由失败变成功 -> 红
+b2. 把 QDRANT_REST 同时加进 external-egress-registry（且给 OutboundPurpose 加同名变体）
+    -> 两个 registry 不再互不相交 -> 红（这是本节唯一能看穿"两边协同改"的判据）
+
+c. 把 RETRIEVAL_RERANK 改成裸变体（不携带 EgressPermit）
+   -> 判据3 由通过变失败 -> 红
 
 d. 把 architecture-check matcher 写错使 raw client 命中 0
-   -> 正哨兵要求集合恰好含 infra-egress/http.rs，0 != 1 -> 红
+   -> 正哨兵要求集合恰好含 infra-network/http.rs，0 != 1 -> 红
+
+e. 给 IntraCellResource 加变体不加 intra-cell-resource-registry 行
+   -> 集合差 -> 红
+
+f. 让 IntraCellResource 接受裸 URL（例如加 Custom(String) 变体、From<&str>，或任意命名的
+   `fn xxx(&str/String) -> Self`，如 from_url）
+   -> architecture-check 的源码扫描 g80_3_no_string_to_resource_constructor_fn（扫
+      IntraCellResource 自己的 impl 块，禁止任何 &str/String 参数 + Self 返回值的 fn）-> 红。
+      trybuild 夹具 fail_resource_from_raw_url_string.rs（裸字面量强转）仍保留，但只证明
+      直接字面量强转这一种形状——任意命名的关联函数不是 From/FromStr，固定名字的
+      compile-fail 夹具看不见它，这正是该源码扫描存在的原因。
 ```
 
-G80-3 自本节起从 `NOT_ADMITTED` 转为 `ADMITTED`。
+G80-3 自本节起从 `NOT_ADMITTED` 转为 `ADMITTED`（Layer 0/1A/1B 均含）。
 
 
 ---

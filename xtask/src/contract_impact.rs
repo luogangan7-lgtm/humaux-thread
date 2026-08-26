@@ -267,11 +267,19 @@ enum CheckerKind {
 }
 
 /// §80.3 impact-map 里出现的 checker id -> 是否已是真正跑判据的 xtask 子命令（不是永远
-/// `not_applicable` 的 Phase 0 占位）。目前只有 G80-10（mechanism-registry，见 §80.1 该行）与
-/// G80-41（config-check，同上）已实现；其余（含任务卡点名的 mcp-contract-lock，Phase 15 交付）
-/// 按 `NotImplemented` 处理——各自任务卡交付时在此加一行即可，不改调用方逻辑。
+/// `not_applicable` 的 Phase 0 占位）。G80-10（mechanism-registry）/ G80-41（config-check）各
+/// 自有独立子命令；**G80-3 没有独立子命令，判据本体活在 `architecture-check` 内部**
+/// （`g80_3_outbound_choke_point`，§83.4）——之前这里按 `NotImplemented` 处理，导致
+/// contract-impact 对 WORKSPACE_LAYOUT 块的闭合永远报「checker G80-3 not implemented yet」，
+/// 即便 G80-3 本身早已实现且每次 CI 都真的跑了（ci.yml 的 `cargo xtask architecture-check`
+/// 步骤，见 [`executed_xtask_subcommands`]）。映射到 `architecture-check` 这个真实存在、真的
+/// 无条件跑 G80-3 的子命令，比新增一个 `architecture-check --only <id>` 子选项更省——后者要求
+/// architecture-check 自己先长出按 checker id 过滤的能力，而 contract-impact 现在只需要知道
+/// 「G80-3 跑了没有」，不需要单独跑它。其余（含任务卡点名的 mcp-contract-lock，Phase 15 交付）
+/// 仍按 `NotImplemented` 处理——各自任务卡交付时在此加一行即可，不改调用方逻辑。
 fn default_checker_kind(id: &str) -> CheckerKind {
     match id {
+        "G80-3" => CheckerKind::Implemented("architecture-check"),
         "G80-10" => CheckerKind::Implemented("mechanism-registry"),
         "G80-41" => CheckerKind::Implemented("config-check"),
         _ => CheckerKind::NotImplemented,
@@ -903,23 +911,27 @@ GATE_REGISTRY    | G80-23,G80-24,gate-phase-coverage
         assert!(msg.starts_with("contract-impact closure: not_applicable"));
     }
 
-    /// Reproduces the exact wiring gap the blocker finding named: real `ci.yml` invokes
-    /// `cargo xtask contract-impact` with no `--base` (see `.github/workflows/ci.yml`,
-    /// the `cargo xtask contract-impact` step). Until that step is fixed to pass
-    /// `--base`, this test documents — rather than silently accepts — that the real CI
-    /// wiring is currently the failing shape `missing_base_verdict(true)` covers above.
+    /// Positive control, inverse of the fixed wiring gap: real `ci.yml` now invokes
+    /// `cargo xtask contract-impact` with `--base ${{ github.event.pull_request.base.sha }}`
+    /// (see `.github/workflows/ci.yml`'s `cargo xtask contract-impact` step) — the closure
+    /// this module computes therefore actually runs in CI instead of silently reporting
+    /// `not_applicable` on every PR (the exact gap `missing_base_verdict(true)` above pins the
+    /// failing shape of).
     #[test]
-    fn real_ci_yml_contract_impact_step_has_no_base_flag() {
+    fn real_ci_yml_contract_impact_step_has_base_flag() {
         let ci_text = real_ci_yml();
+        // The step's `name:` line also contains the literal `cargo xtask contract-impact`
+        // text (as the step's display name) — split on the `run:` line specifically so this
+        // does not match that unrelated first occurrence.
         let step = ci_text
-            .split("cargo xtask contract-impact")
+            .split("run: cargo xtask contract-impact")
             .nth(1)
             .map(|rest| rest.lines().next().unwrap_or(""))
             .unwrap_or("");
         assert!(
-            !step.contains("--base"),
-            "ci.yml now passes --base to contract-impact — update this test and the \
-             companion note about the caller-side wiring fix still being owed"
+            step.contains("--base"),
+            "ci.yml's contract-impact step lost its --base flag — the closure this module \
+             computes would go back to never running in CI"
         );
     }
 

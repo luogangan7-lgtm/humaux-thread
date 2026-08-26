@@ -1,0 +1,29 @@
+[package]
+name = "humaux-infra-network"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# ADR-0003 / §83.4 Layer 0: this crate's `src/http.rs` is the WORKSPACE'S ONLY sanctioned
+# place to construct a `reqwest::Client` (and, if this workspace ever adds one, a
+# `hyper::Client`/`tonic::Channel`) — `xtask architecture-check`'s G80-3 判据1 asserts the
+# construction-site set is exactly `{crates/infra-network/src/http.rs}`, and its manifest
+# check asserts the reqwest/hyper-dependent *manifest* set is exactly
+# `{crates/infra-network/Cargo.toml}`. Both Layer 1A (`humaux-infra-egress`) and Layer 1B
+# (`humaux-infra-cell`) reach the `reqwest::Client`/`reqwest::Error` *types* only through this
+# crate's `pub use reqwest;` re-export — neither lists `reqwest` in its own `[dependencies]`,
+# so the manifest-level check stays a strict equality instead of a set that grows every time a
+# capability wrapper needs the type, not just the construction call.
+# `json` feature: both Layer 1A (§7.3 JSON payload bodies where applicable) and Layer 1B
+# (`humaux-infra-cell`, Qdrant's REST API, §17) need `RequestBuilder::json`/`Response::json`.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[dev-dependencies]
+# §83.4 判据3 regression (`redirect_is_never_followed_to_a_second_host`): "net"/"io-util" back
+# the test's real `TcpListener` fixtures, "rt-multi-thread"/"macros" back `#[tokio::test]`,
+# "time" backs the settle-then-assert sleep.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

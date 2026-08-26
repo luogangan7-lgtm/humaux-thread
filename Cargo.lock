@@ -686,8 +686,10 @@ name = "humaux-adapters"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "humaux-adapters",
  "humaux-application",
  "humaux-domain",
+ "humaux-infra-cell",
  "humaux-projection",
  "humaux-testkit",
  "lettre",
@@ -703,6 +705,14 @@ dependencies = [
 [[package]]
 name = "humaux-admin"
 version = "0.1.0"
+dependencies = [
+ "humaux-infra-cell",
+ "serde_json",
+ "sha2 0.11.0",
+ "time",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "humaux-application"
@@ -766,14 +776,36 @@ name = "humaux-gateway"
 version = "0.1.0"
 
 [[package]]
+name = "humaux-infra-cell"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "humaux-domain",
+ "humaux-infra-network",
+ "serde_json",
+ "tokio",
+ "trybuild",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "humaux-infra-egress"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "humaux-domain",
- "reqwest",
+ "humaux-infra-network",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "humaux-infra-network"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "tokio",
 ]
 
 [[package]]

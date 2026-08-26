@@ -7,6 +7,12 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# §80.1 fault-injection seam for `egress::PrivateDataPurpose::NonRecipientForTest` — never a
+# default feature, so it never ships in a production build. Enabled only via
+# `humaux-adapters`'s self-referencing `[dev-dependencies]` entry (its own Cargo.toml doc).
+test-support = []
+
 [dependencies]
 uuid = { version = "1.25.0", features = ["v7"] }
 # §8.1 / §48.0①: evidence::payload_sha256 raw-byte SHA-256.

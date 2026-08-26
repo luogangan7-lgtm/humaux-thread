@@ -6,8 +6,10 @@
 //!   不产出 §4.4 统一契约的 `{value, scanned_n, scope_hash, checked_at, probe_version}` JSON
 //!   （§1.14：「render 非探针」，此前 `humaux-admin q mechanism.registry --render` 的写法作废）。
 //! - `q <name>` —— §4.4 即时探针目录占位。本轮未接 DB，一律非零退出并打印缺失对象名，
-//!   禁止压成 `value = 0` 冒充（§4.4 坑5）。
+//!   禁止压成 `value = 0` 冒充（§4.4 坑5）。**例外**：`cell.resources`（ADR-0003 第二轮）已
+//!   真正接线为 live probe，见 `cell_resources` 模块文档。
 
+mod cell_resources;
 mod probe;
 mod render;
 

@@ -18,6 +18,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # contract-impact needs `git diff --name-only <base>` against the PR's real merge
+          # base (§80.3) — the default shallow (depth-1) checkout has no base commit to diff
+          # against at all.
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -48,7 +53,7 @@ jobs:
         run: cargo xtask config-check
 
       - name: cargo xtask contract-impact
-        run: cargo xtask contract-impact
+        run: cargo xtask contract-impact --base ${{ github.event.pull_request.base.sha }}
 
       - name: cargo xtask migration-rehearsal
         run: cargo xtask migration-rehearsal

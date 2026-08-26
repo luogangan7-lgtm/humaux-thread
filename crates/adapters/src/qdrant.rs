@@ -1,27 +1,25 @@
 //! `adapters::qdrant` — Qdrant multitenant placement adapter (§17, T5.4+T5.6).
 //!
-//! **Build status:** implements every part of §17 that does not require an HTTP client —
-//! collection/index request-body shaping, payload encoding, the
+//! Implements every part of §17: collection/index request-body shaping, payload encoding, the
 //! [`Condition`](humaux_projection::dense::Condition) → Qdrant filter JSON translation, the
-//! §17.5 HA consistency profile, and the §17.4 search-visible confirmation contract
-//! ([`verify_visible`]/[`VisibilityConfirmation`]). It does not send any of these bodies over
-//! the wire: `crates/adapters/Cargo.toml` has no HTTP client dependency.
+//! §17.5 HA consistency profile, the §17.4 search-visible confirmation contract
+//! ([`verify_visible`]/[`VisibilityConfirmation`]), and — as of ADR-0003 — real HTTP wiring for
+//! `upsert`/`scroll_by_ids`/`count`/[`verify_visible_via_transport`] over
+//! [`IntraCellHttpTransport`]. `crates/adapters/Cargo.toml` still has no HTTP client
+//! dependency: every wire call below takes `&dyn IntraCellHttpTransport` (an injected
+//! `humaux-infra-cell` trait object), the same DI shape `humaux_domain::egress::ExternalCall`
+//! already establishes for Layer 1A.
 //!
-//! §83.4 G80-3 (`xtask/src/architecture_check.rs:1354`) requires the reqwest/hyper-dependent
-//! manifest set to equal exactly `{crates/infra-egress/Cargo.toml}` and the raw-client
-//! construction-point set to equal exactly `{crates/infra-egress/src/http.rs}` — there is no
-//! "local Data Cell resource" exemption in that check. Adding `reqwest` to this crate's
-//! `Cargo.toml` would turn G80-3 from pass to fail today. Wiring the HTTP layer therefore needs
-//! one of, decided by ADR (§78.6) before any manifest changes:
-//!   (a) route through `infra-egress::http::ExternalHttpTransport` behind a new intra-cell
-//!       `OutboundPurpose`, kept in lockstep with the external-egress registry (§83.4 判据2);
-//!   (b) an ADR opening a "Data Cell internal resource" layer in §83.4, with
-//!       `g80_3_manifest_dependency_check`/`g80_3_transport_and_registry_check` updated to
-//!       match and its own fault-injection test added;
-//!   (c) go through the existing `crates/infra-egress/src/http.rs` client as-is.
-//! Not this module's call to make unilaterally. Once decided, `upsert`/`search`/`count`/the
-//! real body of `verify_visible`'s `check_visible` callback are thin wrappers around the
-//! functions already in this file.
+//! §83.4/ADR-0003: Qdrant is same-Cell infrastructure (§7.0/§7.2: "Sparse/BM25 是本地 Retrieval
+//! lane"), not an external egress destination — this module's HTTP calls go through
+//! [`IntraCellResource::QDRANT_REST`] + [`CellAccessPermit`], never through
+//! `humaux_domain::egress::OutboundPurpose`/`EgressPermit`, and never write `ops.
+//! data_disclosures` (§7.4). See `docs/adr/0003-network-vs-egress-choke-point.md` for the full
+//! argument; this module's earlier doc named three undecided options (a)/(b)/(c) for this —
+//! (b) is what ADR-0003 chose (a new Layer 1B, `humaux-infra-cell`, rather than folding Qdrant
+//! into the external-egress registry (a) or the pre-split `infra-egress::http` client as-is
+//! (c), both of which would have made Qdrant traffic either mis-typed as external disclosure or
+//! forced Qdrant to share Layer 1A's `EgressPermit`/ledger semantics it does not have).
 //!
 //! §3/§78.3: this crate sits below Domain in the dependency direction (adapters wraps HTTP/
 //! SQL, Domain never imports either) — not a boundary violation.
@@ -31,6 +29,9 @@ use humaux_domain::dataclass::DataClass;
 use humaux_domain::identity::{AuthorizationScope, VisibilityClass};
 use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
 use humaux_domain::memory::MemoryType;
+use humaux_infra_cell::{
+    CellAccessPermit, IntraCellError, IntraCellHttpTransport, IntraCellMethod, IntraCellRequest,
+};
 use humaux_projection::card::EgressDisposition;
 use humaux_projection::dense::{Condition, DenseQueryFilter, FieldMatch, build_dense_filter};
 use serde_json::{Value, json};
@@ -735,4 +736,265 @@ pub struct TenantPlacementRow {
     pub point_count: i64,
     pub bytes_estimate: i64,
     pub promotion_state: PromotionState,
+}
+
+// ============================================================================
+// ADR-0003 / §83.4 Layer 1B — real HTTP wiring over `IntraCellHttpTransport`
+// ============================================================================
+
+/// [`upsert`]/[`scroll_by_ids`]/[`count`]/[`verify_visible_via_transport`] failure — wraps the
+/// transport-level [`IntraCellError`] alongside the two failure modes specific to actually
+/// parsing a Qdrant response (a non-2xx status, or a 2xx body that does not have the shape this
+/// module expects).
+#[derive(Debug, Clone, PartialEq)]
+pub enum QdrantTransportError {
+    Transport(IntraCellError),
+    /// Qdrant returned a non-2xx HTTP status — `body` is the raw JSON body, if any, for the
+    /// caller to log (Qdrant's own error responses put the reason in `status.error`).
+    NonSuccessStatus {
+        status: u16,
+        body: Option<Value>,
+    },
+    /// A 2xx response whose body did not have the `result`/`points`/`count`/`id` shape this
+    /// module's parsers expect.
+    UnexpectedResponseShape(String),
+    /// §17.3's promotion path lets a collection name be data-derived (not always the fixed
+    /// `RetrievalFamily::collection_name` literal) — rejected here, before `format!` folds it
+    /// into a request path, rather than relying solely on `IntraCellHttpTransport::execute`'s
+    /// own path validation one layer down to catch it.
+    InvalidCollectionName(String),
+}
+
+impl std::fmt::Display for QdrantTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(e) => write!(f, "{e}"),
+            Self::NonSuccessStatus { status, body } => {
+                write!(f, "Qdrant returned HTTP {status}: {body:?}")
+            }
+            Self::UnexpectedResponseShape(s) => write!(f, "unexpected Qdrant response shape: {s}"),
+            Self::InvalidCollectionName(c) => write!(f, "invalid Qdrant collection name: {c:?}"),
+        }
+    }
+}
+
+impl std::error::Error for QdrantTransportError {}
+
+impl From<IntraCellError> for QdrantTransportError {
+    fn from(e: IntraCellError) -> Self {
+        Self::Transport(e)
+    }
+}
+
+/// One [`PointId`] wire form back out of a Qdrant response (§17's own two accepted forms —
+/// unsigned int or UUID string — [`PointId::to_json`]'s inverse).
+fn point_id_from_json(v: &Value) -> Option<PointId> {
+    if let Some(n) = v.as_u64() {
+        return Some(PointId::Num(n));
+    }
+    v.as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .map(PointId::Uuid)
+}
+
+async fn call(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    method: IntraCellMethod,
+    path: String,
+    json_body: Option<Value>,
+) -> Result<Value, QdrantTransportError> {
+    let response = transport
+        .execute(
+            permit,
+            IntraCellRequest {
+                method,
+                path,
+                json_body,
+                headers: Vec::new(),
+            },
+        )
+        .await?;
+    if !(200..300).contains(&response.status) {
+        return Err(QdrantTransportError::NonSuccessStatus {
+            status: response.status,
+            body: response.json_body,
+        });
+    }
+    response
+        .json_body
+        .ok_or_else(|| QdrantTransportError::UnexpectedResponseShape("empty body".to_string()))
+}
+
+/// §17.3: a promoted tenant's collection name can be data-derived, not always the fixed
+/// `RetrievalFamily::collection_name` literal — validated here, once, before any of this
+/// module's three callers (`upsert`/`scroll_by_ids`/`count`) folds it into
+/// `/collections/{collection}...` via `format!`. Rejects anything that would let the name
+/// escape its own path segment (`/`, `..` — the latter implied by rejecting `/` outright, a
+/// single segment cannot contain a `..` segment boundary), rewrite the URL authority (`@`), or
+/// smuggle a header/line-injection payload (whitespace/control characters) — the same shape
+/// `IntraCellHttpTransport::execute`'s own `validate_path` enforces one layer down, checked
+/// again here so a bad name is rejected with a Qdrant-specific error before a permit-bound
+/// call is even attempted.
+fn validate_collection(collection: &str) -> Result<(), QdrantTransportError> {
+    let ok = !collection.is_empty()
+        && !collection.contains('/')
+        && !collection.contains('@')
+        && !collection
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace());
+    if ok {
+        Ok(())
+    } else {
+        Err(QdrantTransportError::InvalidCollectionName(
+            collection.to_string(),
+        ))
+    }
+}
+
+/// §17's `PUT /collections/{name}/points` upsert, wired to a real [`IntraCellHttpTransport`].
+/// `vector` is required here (unlike [`upsert_point_body`], which deliberately omits it —
+/// embedding production is a separate concern from body-shaping): a real Qdrant collection with
+/// a configured vector size rejects a point that omits it, so the live wire call needs one.
+/// `ha_profile.write_params_json()`'s `ordering` (§17.5) is folded into the request body
+/// alongside `points`, matching Qdrant's REST API accepting write-ordering as a body field.
+pub async fn upsert(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+    points: &[(PointId, &IndexablePayload, Vec<f32>)],
+    ha_profile: HaConsistencyProfile,
+) -> Result<(), QdrantTransportError> {
+    validate_collection(collection)?;
+    let points_json: Vec<Value> = points
+        .iter()
+        .map(|(id, payload, vector)| {
+            let mut body = upsert_point_body(*id, payload);
+            body.as_object_mut()
+                .expect("upsert_point_body always returns an object")
+                .insert("vector".into(), json!(vector));
+            body
+        })
+        .collect();
+    let mut body = ha_profile.write_params_json();
+    body.as_object_mut()
+        .expect("write_params_json always returns an object")
+        .insert("points".into(), json!(points_json));
+    call(
+        transport,
+        permit,
+        IntraCellMethod::Put,
+        format!("/collections/{collection}/points?wait=true"),
+        Some(body),
+    )
+    .await?;
+    Ok(())
+}
+
+/// §17.4's real search-path visibility probe: `POST /collections/{name}/points/scroll` with a
+/// `has_id` filter — scroll reads from the same searchable index a real query does (unlike a
+/// bare "does this id exist" point-get), so an id it returns is genuinely search-visible, not
+/// merely written (§17.4: "acknowledged 仅表示写入已接受，不保证 point 已经可搜索").
+pub async fn scroll_by_ids(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+    point_ids: &[PointId],
+) -> Result<Vec<PointId>, QdrantTransportError> {
+    validate_collection(collection)?;
+    let body = json!({
+        "filter": { "must": [{ "has_id": point_ids.iter().map(|id| id.to_json()).collect::<Vec<_>>() }] },
+        "limit": point_ids.len().max(1),
+        "with_payload": false,
+        "with_vector": false,
+    });
+    let result = call(
+        transport,
+        permit,
+        IntraCellMethod::Post,
+        format!("/collections/{collection}/points/scroll"),
+        Some(body),
+    )
+    .await?;
+    let points = result
+        .get("result")
+        .and_then(|r| r.get("points"))
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| {
+            QdrantTransportError::UnexpectedResponseShape("missing result.points".to_string())
+        })?;
+    Ok(points
+        .iter()
+        .filter_map(|p| p.get("id").and_then(point_id_from_json))
+        .collect())
+}
+
+/// §16.3/§23.1②'s `POST /collections/{name}/points/count`, wired to a real transport —
+/// [`visible_count`] still owns the tombstone-subtraction arithmetic; this only performs the
+/// wire call and extracts `result.count`.
+pub async fn count(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+    filter: &VisibleCountFilter,
+) -> Result<u64, QdrantTransportError> {
+    validate_collection(collection)?;
+    let result = call(
+        transport,
+        permit,
+        IntraCellMethod::Post,
+        format!("/collections/{collection}/points/count"),
+        Some(count_body(filter)),
+    )
+    .await?;
+    result
+        .get("result")
+        .and_then(|r| r.get("count"))
+        .and_then(|c| c.as_u64())
+        .ok_or_else(|| {
+            QdrantTransportError::UnexpectedResponseShape("missing result.count".to_string())
+        })
+}
+
+/// [`verify_visible`] wired to a real [`scroll_by_ids`] call: fetches the actually-observed ids
+/// over the transport, then hands them to the existing pure decision function unchanged —
+/// [`verify_visible`]'s own `all_confirmed`/superset handling stays the single place that logic
+/// lives, this only supplies it a real `check_visible` result instead of a test closure.
+pub async fn verify_visible_via_transport(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+    point_ids: &[PointId],
+) -> Result<Option<VisibilityConfirmation>, QdrantTransportError> {
+    let observed = scroll_by_ids(transport, permit, collection, point_ids).await?;
+    Ok(verify_visible(point_ids, |_| observed.clone()))
+}
+
+#[cfg(test)]
+mod http_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn point_id_from_json_round_trips_both_wire_forms() {
+        assert_eq!(point_id_from_json(&json!(42)), Some(PointId::Num(42)));
+        let u = Uuid::now_v7();
+        assert_eq!(
+            point_id_from_json(&json!(u.to_string())),
+            Some(PointId::Uuid(u))
+        );
+        assert_eq!(point_id_from_json(&json!("not-a-uuid")), None);
+    }
+
+    /// §17.3 promotion-path regression, decisive proof: a data-derived collection name
+    /// carrying `@evil.example.com/steal`-style URL-authority-rewrite bytes (the exact shape
+    /// the reviewer proved rewrites `format!`'s output authority one layer down, in
+    /// `IntraCellHttpTransport::execute`) is rejected here before any request is built.
+    #[test]
+    fn validate_collection_rejects_authority_rewrite_shapes() {
+        assert!(validate_collection("tenant_abc").is_ok());
+        assert!(validate_collection("@evil.example.com/steal").is_err());
+        assert!(validate_collection("../../admin").is_err());
+        assert!(validate_collection("").is_err());
+        assert!(validate_collection("bad\r\nHost: evil").is_err());
+    }
 }

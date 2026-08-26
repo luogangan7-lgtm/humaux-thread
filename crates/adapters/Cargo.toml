@@ -7,6 +7,14 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# §80.1 fault-injection seam for `disclosure::reserve_in_txn`'s `RecipientClass` guard —
+# forwards to `humaux-domain/test-support` (that crate's Cargo.toml doc), which adds a
+# `PrivateDataPurpose` variant no real code path can construct. Turned on only via this
+# crate's own `[dev-dependencies]` self-reference below, never a default feature, so it never
+# reaches a production build.
+test-support = ["humaux-domain/test-support"]
+
 [dependencies]
 # §6.2.3 Typed DB Pool: sole encapsulation point is postgres.rs; runtime-tokio matches the
 # workspace's async runtime (tokio, dev-dependency below drives it in tests via
@@ -33,6 +41,12 @@ humaux-application = { path = "../application" }
 # unit-testable without a database (§3/§78.3 — this crate is where the SQL wrapping them
 # belongs, not the other way around).
 humaux-projection = { path = "../projection" }
+# ADR-0003 / §83.4 Layer 1B: `qdrant.rs`'s real upsert/search/count/verify_visible wiring goes
+# through `IntraCellHttpTransport` — this crate still does NOT depend on `reqwest` directly
+# (G80-3's manifest check stays a strict `{crates/infra-network/Cargo.toml}` equality); the
+# transport is injected by the caller (`Arc<dyn IntraCellHttpTransport>`), same DI shape
+# `humaux-domain::egress::ExternalCall` already establishes for Layer 1A.
+humaux-infra-cell = { path = "../infra-cell" }
 # H3 (§74.6) `EmailProvider` trait: the spec's own code block names this macro verbatim
 # (`#[async_trait::async_trait]`) — already resolved in the workspace lockfile (pulled in
 # transitively by `postgres`'s dependency tree) but not previously a direct dependency of any
@@ -63,6 +77,11 @@ sha2 = "0.11"
 uuid = { version = "1.25.0", features = ["v7"] }
 
 [dev-dependencies]
+# §80.1: self-referencing dev-dependency, the standard Cargo idiom for a feature that must be
+# active for this crate's own test builds (unit tests in src/ *and* integration tests in
+# tests/) but never for a normal `cargo build`/production build of this crate, since
+# dev-dependencies are not pulled in outside test targets. See `[features]` above.
+humaux-adapters = { path = ".", features = ["test-support"] }
 # T1.5 crates/adapters/tests/auth_scope_rls.rs: blocking client for the §62 RLS integration
 # test (same crate/version xtask already pins for its live-DB checks, no new dependency).
 # `with-serde_json-1` added for T4.6/T4.7's `tests/consolidate_snapshot.rs`: seeding

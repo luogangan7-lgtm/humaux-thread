@@ -6,3 +6,26 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# §4.4 `cell.resources` live probe: talks to §83.4 Layer 1B same-Cell resources through the
+# real `HttpIntraCellTransport`/registry machinery (reuse, not a second implementation of the
+# CIDR/metadata judgment) and needs its own DNS lookup independent of that transport's.
+# Deliberately *not* a direct `humaux-infra-network` dependency too — G80-3's manifest-level
+# check (`xtask architecture-check`) freezes that crate's dependent-manifest set to exactly
+# `{crates/infra-egress/Cargo.toml, crates/infra-cell/Cargo.toml}`; this crate reaches
+# `reqwest`'s types only transitively, through `humaux-infra-cell`'s own re-export.
+humaux-infra-cell = { path = "../../crates/infra-cell" }
+# `HttpIntraCellTransport::execute` is async; `main` stays sync (this binary has exactly one
+# probe that needs a runtime so far) — `cell_resources::run` opens a small dedicated runtime
+# rather than making every subcommand async.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# §4.4 envelope `{value, scanned_n, scope_hash, checked_at, probe_version}` plus this probe's
+# per-resource breakdown — same JSON shape every adapter in this workspace already emits with.
+serde_json = "1"
+# `scope_hash` (§4.4: "扫描范围规范化后的 sha256") — same crate/version domain already pins.
+sha2 = "0.11"
+# `checked_at` RFC3339 timestamp.
+time = { version = "0.3", features = ["formatting"] }
+# `HUMAUX_CELL_ID` env var parsing.
+uuid = "1.25.0"

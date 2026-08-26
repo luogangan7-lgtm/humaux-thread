@@ -299,6 +299,66 @@ fn reserve_rejects_empty_sources() {
     });
 }
 
+/// §80.1 fault-injection: `reserve_in_txn`'s `RecipientClass` guard (ADR-0003 second round) is
+/// unreachable via any *production* `PrivateDataPurpose` — all three real variants classify as
+/// `ExternalProcessor`. `NonRecipientForTest` (the `test-support`-feature-only variant,
+/// `domain::egress`'s own doc) reaches the real call site anyway, proving the guard is wired
+/// into `reserve_in_txn` itself, not merely exercised by `domain::boundary`'s own unit tests
+/// of the pure `requires_disclosure_record` decision function in isolation. Verified this test
+/// goes red on the mutation the guard exists to catch: deleting the `if
+/// !requires_disclosure_record(...)` block from `reserve_in_txn` makes this call fall through
+/// to a real INSERT, and the row-count assertion below fails.
+#[cfg(feature = "test-support")]
+#[test]
+fn reserve_rejects_a_non_recipient_classified_purpose_before_any_write() {
+    run_db_fixture::<DisclosureFixture, _>(
+        "reserve_rejects_a_non_recipient_classified_purpose_before_any_write",
+        |mut handle| {
+            let tenant_id = TenantId(handle.tenant_id);
+            let payload = AuthorizedEgressPayload::new(b"non-recipient probe".to_vec());
+            let permit = egress::authorize(
+                tenant_id,
+                ProcessorId(Uuid::now_v7()),
+                PrivateDataPurpose::NonRecipientForTest,
+                DataClass::Private,
+                &payload,
+                Duration::from_secs(300),
+            )
+            .expect("authorize() does not gate on recipient classification");
+            let evidence_id = seed_evidence(&mut handle);
+
+            let err = handle
+                .rt
+                .block_on(disclosure::reserve_private(
+                    &handle.private_worker,
+                    &permit,
+                    "cn-hangzhou",
+                    &payload,
+                    None,
+                    &[DisclosureSource::Evidence(evidence_id)],
+                ))
+                .expect_err("reserve must refuse a non-recipient-classified purpose");
+            assert!(matches!(
+                err,
+                disclosure::DisclosureError::NotADisclosureRecipient
+            ));
+
+            let row_count: i64 = handle
+                .admin
+                .query_one(
+                    "SELECT count(*) FROM ops.data_disclosures WHERE tenant_id = $1",
+                    &[&handle.tenant_id],
+                )
+                .expect("count query must succeed")
+                .get(0);
+            assert_eq!(
+                row_count, 0,
+                "reserve must not write any ops.data_disclosures row for a rejected purpose"
+            );
+        },
+    );
+}
+
 /// §53 INV-3: a reservation left unfinalized past the staleness window must be observable via
 /// `open_reservations_older_than`. Passing `staleness_seconds = 0` lets this test observe the
 /// "immediate red" case without a real 60s wait.

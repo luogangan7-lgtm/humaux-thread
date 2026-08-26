@@ -1,0 +1,55 @@
+[package]
+name = "humaux-infra-cell"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# ADR-0003 / §83.4 Layer 1B: same-Cell resource access. Reaches the `reqwest::Client`/
+# `reqwest::Error` types only through `humaux_infra_network::reqwest` — never lists `reqwest`
+# directly, mirroring `humaux-infra-egress`'s Layer 1A dependency (keeps G80-3 判据1-manifest's
+# `{crates/infra-network/Cargo.toml}` equality strict).
+humaux-infra-network = { path = "../infra-network" }
+# ADR-0003 second-round correction: `IntraCellResource::recipient_class` names
+# `domain::boundary::RecipientClass::SameEntityResource` in rustdoc/tests — the crate does not
+# otherwise use any `humaux-domain` type (Layer 1B stays deliberately `EgressPermit`-free, see
+# `permit.rs`'s module doc), so this is a documentation/classification-only dependency.
+humaux-domain = { path = "../domain" }
+# `IntraCellHttpTransport::execute` is `#[async_trait]`, matching `ExternalCall`'s convention
+# (§7.3, `humaux-domain`) and `humaux-infra-egress`'s own use of the same macro.
+async-trait = "0.1"
+# §83.4 判据6/CellAccessPermit `grant_id`-equivalent identity; same minting convention as
+# `domain::egress::ProcessorId`/`EgressPermit::grant_id`.
+uuid = { version = "1.25.0", features = ["v7"] }
+# `adapters::qdrant`'s request/response bodies are already `serde_json::Value` (§17) — this
+# crate's `IntraCellRequest`/`IntraCellResponse` carry the same shape so the adapter layer
+# never needs to hand-encode/decode JSON a second way.
+serde_json = "1"
+# ADR-0003 second-round fix: `transport::ValidatingResolver` runs the injected (possibly
+# blocking, e.g. `SystemDnsResolve`'s `std::net::ToSocketAddrs`) `DnsResolve` on a blocking
+# thread via `tokio::task::spawn_blocking` rather than inside the async resolver future itself
+# — `reqwest::dns::Resolve::resolve` is polled on the caller's async runtime, and a blocking
+# syscall there would stall it. "rt" is the minimum feature `spawn_blocking` needs; the fuller
+# feature set already in `[dev-dependencies]` below covers the test fixtures' real listeners.
+tokio = { version = "1", features = ["rt"] }
+# §83.4 判据3 blocker fix: `execute()` must judge the exact address `reqwest` will dial for an
+# IP-literal registry host the same way `ValidatingResolver` judges a resolved hostname —
+# `reqwest`'s connector never calls a custom `dns_resolver` for an authority that is (or
+# WHATWG-normalizes to) an IP literal, so this crate has to canonicalize it itself via the
+# real URL parser (`url::Host`) rather than a naive `str::parse::<IpAddr>()`, which misses# dword/octal/hex-encoded and bracketed-mapped-IPv6 forms the URL parser folds down to a
+# plain `Ipv4Addr`/`Ipv6Addr`. Same `url` crate `reqwest` itself vendors (`reqwest::Url` is a
+# re-export of it) — no new dependency resolution, and G80-3's manifest check only fences
+# `reqwest`/`hyper` by name, not `url` (`xtask::architecture_check::g80_3_manifest_dependency_check`).
+url = "2"
+
+[dev-dependencies]
+# Real `TcpListener` fixtures (§79: observe actual network behavior, not an inferred one) for
+# the DNS-resolution/CIDR fault-injection tests, same pattern `humaux-infra-egress`'s tests use.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# `tests/ui/`: proves `IntraCellResource`/`CellAccessPermit` have no construction path that
+# accepts a raw URL/string — same `trybuild` pattern `crates/domain/tests/egress_topology_ui.rs`
+# already uses for its own §7.3 topology.
+trybuild = "1"

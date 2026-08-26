@@ -8,10 +8,13 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-# §83.4: this crate's `src/http.rs` is the WORKSPACE'S ONLY sanctioned place to construct a
-# `reqwest::Client` — `xtask architecture-check`'s G80-3 (b) asserts that construction-site
-# set is exactly `{crates/infra-egress/src/http.rs}`.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# ADR-0003 / §83.4: raw `reqwest::Client` construction moved to Layer 0 (`humaux-infra-network`,
+# G80-3 判据1's real construction-site set is now `{crates/infra-network/src/http.rs}`). This
+# crate (Layer 1A external egress) reaches the `reqwest::Client`/`reqwest::Error` *types* only
+# through `humaux_infra_network::reqwest` — it deliberately does NOT list `reqwest` directly,
+# so `xtask architecture-check`'s manifest-level check stays a strict
+# `{crates/infra-network/Cargo.toml}` equality.
+humaux-infra-network = { path = "../infra-network" }
 # `ExternalCall` (§7.3, `humaux-domain`) is declared `#[async_trait]` there; this crate's impl
 # of it needs the identical macro.
 async-trait = "0.1"

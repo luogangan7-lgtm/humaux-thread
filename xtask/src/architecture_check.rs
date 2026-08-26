@@ -1210,7 +1210,20 @@ const EXTERNAL_EGRESS_REGISTRY: &[&str] = &[
     "DEADMAN_HEALTHCHECK",
 ];
 
-const INFRA_EGRESS_HTTP_RS: &str = "crates/infra-egress/src/http.rs";
+const INFRA_NETWORK_HTTP_RS: &str = "crates/infra-network/src/http.rs";
+
+/// ADR-0003 / §83.4's `intra-cell-resource-registry` fenced block, column 1 — the exact
+/// variant-name set `IntraCellResource` (`crates/infra-cell/src/resource.rs`) must equal.
+/// Sibling of [`EXTERNAL_EGRESS_REGISTRY`]; the two are checked for disjointness by
+/// [`intra_cell_registry_disjoint_from_external`] — a resource must never be nameable through
+/// both registries at once.
+const INTRA_CELL_RESOURCE_REGISTRY: &[&str] = &["QDRANT_REST"];
+
+const INFRA_CELL_RESOURCE_RS: &str = "crates/infra-cell/src/resource.rs";
+
+/// ADR-0003 Layer 1A's own sentinel file (external-egress HTTP transport, now built on top of
+/// Layer 0 instead of constructing its own raw client — [`g80_3_layer1_crates_sentinel`]).
+const INFRA_EGRESS_HTTP_RS_LAYER1A: &str = "crates/infra-egress/src/http.rs";
 
 /// §83.4 判据1, 注错 a: `reqwest`/`hyper`'s client type reached through a `use`-imported bare
 /// alias (`use reqwest::Client; Client::new()`) is exactly as much a raw-client construction
@@ -1224,6 +1237,20 @@ const BARE_HTTP_CLIENT_NEEDLES: [&str; 4] = [
     "Client::default(",
     "ClientBuilder::new(",
 ];
+
+/// §83.4 判据1, decisive proof this closes: `humaux_infra_network::reqwest`'s re-export lets a
+/// second crate reach `reqwest::Client` without ever listing `reqwest` in its own manifest —
+/// [`g80_3_manifest_dependency_check`] alone cannot see that (the second crate depends on
+/// `humaux-infra-network`, not `reqwest`, so its manifest set stays clean), and
+/// [`is_bare_needle_word_start`]'s own word-boundary guard *rejects* an attacker-chosen alias
+/// that happens to end in `Client` (`use ... reqwest::Client as HttpClient; HttpClient::new()`
+/// — the byte before `Client::new(` inside `HttpClient::new(` is `p`, an identifier char) by
+/// design, since that guard exists to reject an *unrelated* type merely named `MyClient`. This
+/// needle instead matches the import line itself — `reqwest::Client as`/`reqwest::ClientBuilder
+/// as`, any qualification prefix, any chosen alias name — so the alias's own name can never
+/// evade it the way the call-site needle above can be evaded.
+const REQWEST_CLIENT_ALIAS_IMPORT_NEEDLES: [&str; 2] =
+    ["reqwest::Client as ", "reqwest::ClientBuilder as "];
 
 /// §83.4 raw HTTP transport construction needles: `reqwest::Client::new`/`::builder` and
 /// `hyper::Client::new`/`::builder` (fully-qualified spellings, kept alongside the bare-alias
@@ -1256,6 +1283,16 @@ fn find_raw_http_client_calls(source: &str) -> Vec<usize> {
         while let Some(rel) = source[start..].find(needle) {
             let idx = start + rel;
             if !line_is_comment_at(source, idx) && is_bare_needle_word_start(source, idx) {
+                hits.push(idx);
+            }
+            start = idx + needle.len();
+        }
+    }
+    for needle in REQWEST_CLIENT_ALIAS_IMPORT_NEEDLES {
+        let mut start = 0usize;
+        while let Some(rel) = source[start..].find(needle) {
+            let idx = start + rel;
+            if !line_is_comment_at(source, idx) {
                 hits.push(idx);
             }
             start = idx + needle.len();
@@ -1355,7 +1392,7 @@ fn parse_enum_variant_payloads(source: &str, enum_name: &str) -> Vec<(String, Op
     out
 }
 
-/// §83.4 判据0 (workspace 正哨兵): `crates/infra-egress` must be a real, live workspace
+/// §83.4 判据0 (workspace 正哨兵): `crates/infra-network` must be a real, live workspace
 /// member with its transport file present — any one of the three missing is red before
 /// 判据1/2 are even evaluated. Without this, deleting the whole crate would make the
 /// raw-client scan below vacuously report "0 hits outside the expected file" (there is no
@@ -1364,14 +1401,14 @@ fn parse_enum_variant_payloads(source: &str, enum_name: &str) -> Vec<(String, Op
 /// against a fixture directory that has no real workspace `Cargo.toml`.
 fn g80_3_workspace_sentinel(root: &Path, metadata_json: Option<&str>) -> Vec<String> {
     let mut problems = Vec::new();
-    if !root.join("crates/infra-egress/Cargo.toml").is_file() {
-        problems.push("正哨兵缺失: crates/infra-egress/Cargo.toml 不存在".to_string());
+    if !root.join("crates/infra-network/Cargo.toml").is_file() {
+        problems.push("正哨兵缺失: crates/infra-network/Cargo.toml 不存在".to_string());
     }
-    if !root.join(INFRA_EGRESS_HTTP_RS).is_file() {
-        problems.push(format!("正哨兵缺失: {INFRA_EGRESS_HTTP_RS} 不存在"));
+    if !root.join(INFRA_NETWORK_HTTP_RS).is_file() {
+        problems.push(format!("正哨兵缺失: {INFRA_NETWORK_HTTP_RS} 不存在"));
     }
     // Exact match against `packages[].name`, not a substring scan over the raw JSON text: a
-    // substring match on `"humaux-infra-egress"` stays true even after the crate is dropped
+    // substring match on `"humaux-infra-network"` stays true even after the crate is dropped
     // from the workspace `members` list, as long as *some* other member still path-depends on
     // it by name (that dependency edge's own JSON also contains the literal string) — the
     // 注错 0b fixture below pins this against regressing back to `.contains`.
@@ -1381,17 +1418,63 @@ fn g80_3_workspace_sentinel(root: &Path, metadata_json: Option<&str>) -> Vec<Str
         .is_some_and(|packages| {
             packages
                 .iter()
-                .any(|p| p.get("name").and_then(|n| n.as_str()) == Some("humaux-infra-egress"))
+                .any(|p| p.get("name").and_then(|n| n.as_str()) == Some("humaux-infra-network"))
         });
     if !member_present {
-        problems.push("正哨兵缺失: cargo metadata members 不含 humaux-infra-egress".to_string());
+        problems.push("正哨兵缺失: cargo metadata members 不含 humaux-infra-network".to_string());
+    }
+    problems
+}
+
+/// ADR-0003 / §83.4 判据0 补充: Layer 1's two capability-wrapper crates
+/// (`humaux-infra-egress` external egress, `humaux-infra-cell` same-Cell access) must both be
+/// real, live workspace members — same three-part shape [`g80_3_workspace_sentinel`] already
+/// checks for Layer 0, one crate at a time so a missing member names exactly which crate/file
+/// is gone rather than one merged, ambiguous line.
+fn g80_3_layer1_crates_sentinel(root: &Path, metadata_json: Option<&str>) -> Vec<String> {
+    let mut problems = Vec::new();
+    let member_names: std::collections::HashSet<String> = metadata_json
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|v| v.get("packages").and_then(|p| p.as_array()).cloned())
+        .map(|packages| {
+            packages
+                .iter()
+                .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (crate_dir, manifest_name, sentinel_file) in [
+        (
+            "crates/infra-egress",
+            "humaux-infra-egress",
+            INFRA_EGRESS_HTTP_RS_LAYER1A,
+        ),
+        (
+            "crates/infra-cell",
+            "humaux-infra-cell",
+            INFRA_CELL_RESOURCE_RS,
+        ),
+    ] {
+        if !root.join(format!("{crate_dir}/Cargo.toml")).is_file() {
+            problems.push(format!("正哨兵缺失: {crate_dir}/Cargo.toml 不存在"));
+        }
+        if !root.join(sentinel_file).is_file() {
+            problems.push(format!("正哨兵缺失: {sentinel_file} 不存在"));
+        }
+        if !member_names.contains(manifest_name) {
+            problems.push(format!(
+                "正哨兵缺失: cargo metadata members 不含 {manifest_name}"
+            ));
+        }
     }
     problems
 }
 
 /// §83.4 判据1 补充 (manifest-level positive check, 注错 a 的第二重防线): the *set* of
 /// workspace-member manifests that declare a `reqwest`/`hyper` dependency must equal exactly
-/// `{crates/infra-egress/Cargo.toml}`. A raw client call needs a matching `[dependencies]`
+/// `{crates/infra-network/Cargo.toml}`. A raw client call needs a matching `[dependencies]`
 /// entry to even compile, so this catches a second crate reaching for `reqwest`/`hyper` at the
 /// manifest level — before any source-text needle (bare-alias or otherwise) even has a call
 /// site to find. Uses the same `cargo metadata` document [`g80_3_workspace_sentinel`] already
@@ -1441,11 +1524,70 @@ fn g80_3_manifest_dependency_check(metadata_json: &str, root: &Path) -> Vec<Stri
     }
 
     let mut expected = BTreeSet::new();
-    expected.insert("crates/infra-egress/Cargo.toml".to_string());
+    expected.insert("crates/infra-network/Cargo.toml".to_string());
     if actual != expected {
         problems.push(format!(
-            "reqwest/hyper 依赖声明的 manifest 集合 != {{crates/infra-egress/Cargo.toml}}，实际: \
+            "reqwest/hyper 依赖声明的 manifest 集合 != {{crates/infra-network/Cargo.toml}}，实际: \
              {actual:?}"
+        ));
+    }
+    problems
+}
+
+/// §83.4 判据1 补充, second backstop: `pub use reqwest;` (`crates/infra-network/src/lib.rs`)
+/// lets any crate reach `reqwest::Client`/`reqwest::Error` *types* through
+/// `humaux_infra_network::reqwest` without ever listing `reqwest` in its own manifest — which
+/// means [`g80_3_manifest_dependency_check`] alone cannot see a new crate that starts depending
+/// on `humaux-infra-network` for exactly that purpose. This asserts the *dependents* of
+/// `humaux-infra-network` are exactly the two Layer 1 crates ADR-0003 names — a third crate
+/// (e.g. `humaux-adapters`) adding `humaux-infra-network = { path = ... }` to reach the
+/// re-export is red here even if [`find_raw_http_client_calls`]'s needles somehow miss the
+/// resulting call site.
+fn g80_3_infra_network_dependents_check(metadata_json: &str, root: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    let parsed: serde_json::Value = match serde_json::from_str(metadata_json) {
+        Ok(v) => v,
+        Err(e) => {
+            problems.push(format!("cargo metadata output not valid JSON: {e}"));
+            return problems;
+        }
+    };
+    let Some(packages) = parsed.get("packages").and_then(|p| p.as_array()) else {
+        problems.push("cargo metadata output has no `packages` array".to_string());
+        return problems;
+    };
+    let root_for_display = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    let mut actual: BTreeSet<String> = BTreeSet::new();
+    for pkg in packages {
+        let deps = pkg
+            .get("dependencies")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let depends_on_infra_network = deps
+            .iter()
+            .any(|d| d.get("name").and_then(|n| n.as_str()) == Some("humaux-infra-network"));
+        if !depends_on_infra_network {
+            continue;
+        }
+        let Some(manifest_path) = pkg.get("manifest_path").and_then(|m| m.as_str()) else {
+            continue;
+        };
+        actual.insert(display(&root_for_display, Path::new(manifest_path)));
+    }
+
+    let expected: BTreeSet<String> = [
+        "crates/infra-egress/Cargo.toml",
+        "crates/infra-cell/Cargo.toml",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    if actual != expected {
+        problems.push(format!(
+            "humaux-infra-network 的依赖方 manifest 集合 != \
+             {{crates/infra-egress/Cargo.toml, crates/infra-cell/Cargo.toml}}，实际: {actual:?}"
         ));
     }
     problems
@@ -1457,7 +1599,7 @@ fn g80_3_manifest_dependency_check(metadata_json: &str, root: &Path) -> Vec<Stri
 fn g80_3_transport_and_registry_check(files: &[(PathBuf, String)], root: &Path) -> Vec<String> {
     let mut problems = Vec::new();
 
-    // 判据1: raw client construction path set == {infra-egress/src/http.rs}
+    // 判据1: raw client construction path set == {infra-network/src/http.rs}
     let mut raw_sites: BTreeSet<String> = BTreeSet::new();
     for (path, source) in files {
         if !find_raw_http_client_calls(source).is_empty() {
@@ -1465,11 +1607,11 @@ fn g80_3_transport_and_registry_check(files: &[(PathBuf, String)], root: &Path) 
         }
     }
     let mut expected_raw = BTreeSet::new();
-    expected_raw.insert(INFRA_EGRESS_HTTP_RS.to_string());
+    expected_raw.insert(INFRA_NETWORK_HTTP_RS.to_string());
     if raw_sites != expected_raw {
         problems.push(format!(
             "raw HTTP client (reqwest::Client::new/builder, hyper::Client::new/builder) 构造 \
-             点集合 != {{{INFRA_EGRESS_HTTP_RS}}}，实际: {raw_sites:?}"
+             点集合 != {{{INFRA_NETWORK_HTTP_RS}}}，实际: {raw_sites:?}"
         ));
     }
 
@@ -1534,10 +1676,201 @@ fn g80_3_transport_and_registry_check(files: &[(PathBuf, String)], root: &Path) 
     problems
 }
 
-/// §83.4 G80-3 full check: 判据0/1/2/3, folding in real `cargo metadata` for the workspace
-/// positive sentinel.
+/// ADR-0003 / §83.4 Layer 1B's own registry-consistency judgment — the sibling of 判据2 above,
+/// scanning `crates/infra-cell/src/resource.rs`'s `IntraCellResource` enum instead of
+/// `domain::egress::OutboundPurpose`. Pure comparator over an already-scanned file set, same
+/// shape [`g80_3_transport_and_registry_check`] uses, so tests can inject a small fixture
+/// instead of scanning the whole workspace.
+fn g80_3_intra_cell_registry_check(files: &[(PathBuf, String)], root: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    match files
+        .iter()
+        .find(|(p, _)| display(root, p) == INFRA_CELL_RESOURCE_RS)
+    {
+        None => problems.push(format!(
+            "missing object: {INFRA_CELL_RESOURCE_RS}::IntraCellResource (ADR-0003 判据1 尚未\
+             交付)"
+        )),
+        Some((_, source)) => {
+            let actual: BTreeSet<String> = parse_enum_variant_names(source, "IntraCellResource")
+                .into_iter()
+                .collect();
+            let expected: BTreeSet<String> = INTRA_CELL_RESOURCE_REGISTRY
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            if actual.is_empty() {
+                problems.push(
+                    "positive control missing: IntraCellResource 变体集合为空 —— matcher 坏了\
+                     或枚举未落地，两者都必须报红，不得默认放行"
+                        .to_string(),
+                );
+            } else if actual != expected {
+                problems.push(format!(
+                    "IntraCellResource 变体集合 != intra-cell-resource-registry，实际: \
+                     {actual:?}，期望: {expected:?}"
+                ));
+            }
+            problems.extend(g80_3_no_string_to_resource_constructor_fn(source));
+        }
+    }
+    problems
+}
+
+/// Byte offset of the `)` matching the `(` at `s`'s own start (`s.as_bytes()[0]` must be `(`).
+/// Depth-counting sibling of [`matching_brace_end`] for parens instead of braces.
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `ident` appears in `header` as a whole identifier, not merely a substring —
+/// `"IntraCellResourceRegistry"` must not match a search for `"IntraCellResource"` (both the
+/// byte before the match and the byte after it must not continue an identifier). Word-boundary
+/// sibling of [`is_bare_needle_word_start`], checked on both ends since `header` here is a
+/// short, already-located slice rather than a whole-file scan.
+fn header_names_ident_exactly(header: &str, ident: &str) -> bool {
+    let mut start = 0usize;
+    while let Some(rel) = header[start..].find(ident) {
+        let idx = start + rel;
+        let end = idx + ident.len();
+        let before_ok = match header[..idx].chars().next_back() {
+            None => true,
+            Some(c) => !(c.is_alphanumeric() || c == '_'),
+        };
+        let after_ok = match header[end..].chars().next() {
+            None => true,
+            Some(c) => !(c.is_alphanumeric() || c == '_'),
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+/// §83.4 判据1, 注错 f's real mechanism: no `fn` inside `IntraCellResource`'s own `impl`
+/// surface (`impl IntraCellResource { .. }` or `impl <Trait> for IntraCellResource { .. }`)
+/// may accept a `&str`/`String` parameter and return `Self` — the general "no string
+/// constructs this enum" property, scoped to this enum's own impls specifically so an
+/// unrelated type's legitimate `&str -> Result<Self, _>` (e.g. `CellCidr::from_str`, in the
+/// same file) is never a false hit.
+///
+/// A single fixed-name trybuild fixture (`tests/ui/fail_resource_from_raw_url_string.rs`)
+/// cannot pin this property on its own: it only ever exercises a *direct literal* coerced to
+/// `IntraCellResource`, which stays compile-fail regardless of whether some differently-named
+/// associated fn (`from_url`, `parse_legacy`, …) exists that does the equivalent conversion
+/// through a normal function call instead of a literal — `IntraCellResource::from_url("x")`
+/// compiles fine even though the trybuild fixture's own literal-coercion line still doesn't.
+/// This scan is the check that actually observes the property 判据1 claims: decisive proof is
+/// that adding `pub fn from_url(_u: &str) -> Self { Self::QDRANT_REST }` inside `impl
+/// IntraCellResource` left both the trybuild suite and `architecture-check` green before this
+/// function existed.
+fn g80_3_no_string_to_resource_constructor_fn(source: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = source[search_from..].find("impl ") {
+        let idx = search_from + rel;
+        if line_is_comment_at(source, idx) {
+            search_from = idx + 5;
+            continue;
+        }
+        let Some(brace_rel) = source[idx..].find('{') else {
+            break;
+        };
+        let open = idx + brace_rel;
+        let header = &source[idx..open];
+        search_from = open + 1;
+        if !header_names_ident_exactly(header, "IntraCellResource") {
+            continue;
+        }
+        let Some(close) = matching_brace_end(source, open) else {
+            continue;
+        };
+        let body = &source[open + 1..close - 1];
+        let body_start_abs = open + 1;
+        for (fn_rel, _) in body.match_indices("fn ") {
+            if line_is_comment_at(source, body_start_abs + fn_rel) {
+                continue;
+            }
+            let name_start = fn_rel + 3;
+            let Some(paren_rel) = body[name_start..].find('(') else {
+                continue;
+            };
+            let paren_abs_in_body = name_start + paren_rel;
+            let Some(close_paren_rel) = find_matching_paren(&body[paren_abs_in_body..]) else {
+                continue;
+            };
+            let params = &body[paren_abs_in_body + 1..paren_abs_in_body + close_paren_rel];
+            let after_params = &body[paren_abs_in_body + close_paren_rel + 1..];
+            let sig_end = after_params.find('{').unwrap_or(after_params.len());
+            let return_part = after_params[..sig_end].trim_start();
+            let takes_string = params.contains("&str") || params.contains("String");
+            let returns_self = return_part.starts_with("->") && return_part.contains("Self");
+            if takes_string && returns_self {
+                let name: String = body[name_start..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                problems.push(format!(
+                    "判据1 违反: {header_trimmed} 内存在字符串构造函数 fn {name}(...) -> Self \
+                     形状 —— 任意命名的 fn 均不得从 &str/String 构造 Self（不止 From/FromStr \
+                     两个固定名字）",
+                    header_trimmed = header.trim()
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// ADR-0003 reverse sentinel: `EXTERNAL_EGRESS_REGISTRY` and `INTRA_CELL_RESOURCE_REGISTRY`
+/// must name disjoint sets — a resource nameable through *both* registries at once is exactly
+/// the "Qdrant snuck into external-egress-registry" back door ADR-0003 exists to close (the
+/// two enums' own 判据2/判据1-sibling checks each independently compare against *one* of these
+/// two registries and would both report PASS if someone edited `OutboundPurpose` and
+/// `EXTERNAL_EGRESS_REGISTRY` together to add a variant that is also still a live
+/// `IntraCellResource` entry — this check is the only one that looks at both at once). Pure
+/// comparator over injectable registry slices so the fault test below does not have to mutate
+/// the real consts.
+fn intra_cell_registry_disjoint_from_external(
+    external: &[&str],
+    intra_cell: &[&str],
+) -> Vec<String> {
+    let external_set: BTreeSet<&str> = external.iter().copied().collect();
+    intra_cell
+        .iter()
+        .filter(|r| external_set.contains(*r))
+        .map(|r| {
+            format!(
+                "ADR-0003 反向哨兵违反: {r:?} 同时出现在 external-egress-registry 与 \
+                 intra-cell-resource-registry —— 一个资源不得同时可经两条 registry 命名"
+            )
+        })
+        .collect()
+}
+
+/// §83.4 G80-3 full check: Layer 0/1A/1B 判据0/1/2/3, folding in real `cargo metadata` for the
+/// workspace positive sentinel.
 fn g80_3_outbound_choke_point(root: &Path) -> Verdict {
-    // No early `NotApplicable` return for a missing `crates/infra-egress` directory: T4.1 has
+    // No early `NotApplicable` return for a missing `crates/infra-network` directory: T4.1 has
     // already delivered this crate, so its absence from here on is a regression (someone
     // deleted it), not "not yet built" — 注错 0a's whole point. Falling straight into the
     // workspace sentinel below reports that as `Fail` with the three named-missing-object
@@ -1552,6 +1885,7 @@ fn g80_3_outbound_choke_point(root: &Path) -> Verdict {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
 
     let mut problems = g80_3_workspace_sentinel(root, metadata_json.as_deref());
+    problems.extend(g80_3_layer1_crates_sentinel(root, metadata_json.as_deref()));
     if !problems.is_empty() {
         // 判据0 任一为假 -> 先红：前提不成立时继续判 1/2/3 只会制造噪声，不会制造信息。
         return Verdict::Fail(problems);
@@ -1563,9 +1897,15 @@ fn g80_3_outbound_choke_point(root: &Path) -> Verdict {
     let metadata_json =
         metadata_json.expect("g80_3_workspace_sentinel passed with no metadata_json");
     problems.extend(g80_3_manifest_dependency_check(&metadata_json, root));
+    problems.extend(g80_3_infra_network_dependents_check(&metadata_json, root));
 
     let files = walk_workspace_rs(root);
     problems.extend(g80_3_transport_and_registry_check(&files, root));
+    problems.extend(g80_3_intra_cell_registry_check(&files, root));
+    problems.extend(intra_cell_registry_disjoint_from_external(
+        EXTERNAL_EGRESS_REGISTRY,
+        INTRA_CELL_RESOURCE_REGISTRY,
+    ));
 
     if problems.is_empty() {
         Verdict::Pass
@@ -2695,7 +3035,7 @@ mod tests {
         let root = PathBuf::from("/fixture-root");
         let files = vec![
             (
-                root.join("crates/infra-egress/src/http.rs"),
+                root.join("crates/infra-network/src/http.rs"),
                 "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
             ),
             (
@@ -2713,7 +3053,7 @@ mod tests {
         let root = PathBuf::from("/fixture-root");
         let files = vec![
             (
-                root.join("crates/infra-egress/src/http.rs"),
+                root.join("crates/infra-network/src/http.rs"),
                 "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
             ),
             (
@@ -2743,7 +3083,7 @@ mod tests {
         let root = PathBuf::from("/fixture-root");
         let files = vec![
             (
-                root.join("crates/infra-egress/src/http.rs"),
+                root.join("crates/infra-network/src/http.rs"),
                 "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
             ),
             (
@@ -2776,7 +3116,7 @@ mod tests {
         let root = PathBuf::from("/fixture-root");
         let files = vec![
             (
-                root.join("crates/infra-egress/src/http.rs"),
+                root.join("crates/infra-network/src/http.rs"),
                 "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
             ),
             (
@@ -2792,6 +3132,81 @@ mod tests {
         assert!(g80_3_transport_and_registry_check(&files, &root).is_empty());
     }
 
+    // -- §83.4 判据1, 注错 f: IntraCellResource string-constructor scan ---------------------
+
+    /// Baseline: `IntraCellResource`'s real `impl` (closed enum, an `ALL` const, no fn
+    /// converting a string to `Self`) must scan clean.
+    #[test]
+    fn g80_3_no_string_to_resource_constructor_fn_clean_impl_is_empty() {
+        let src = "pub enum IntraCellResource {\n    QDRANT_REST,\n}\n\
+                   impl IntraCellResource {\n    \
+                       pub const ALL: [IntraCellResource; 1] = [Self::QDRANT_REST];\n\
+                   }\n";
+        assert!(g80_3_no_string_to_resource_constructor_fn(src).is_empty());
+    }
+
+    /// Decisive blindness proof (the exact injection the review found): an arbitrarily-named
+    /// associated fn — not `From::from`, not `FromStr::parse` — taking `&str` and returning
+    /// `Self` inside `impl IntraCellResource` is exactly the raw-URL construction path 判据1
+    /// forbids, and no fixed-name trybuild fixture would ever exercise it.
+    #[test]
+    fn g80_3_no_string_to_resource_constructor_fn_flags_arbitrarily_named_fn() {
+        let src = "pub enum IntraCellResource {\n    QDRANT_REST,\n}\n\
+                   impl IntraCellResource {\n    \
+                       pub fn from_url(_u: &str) -> Self {\n        Self::QDRANT_REST\n    }\n\
+                   }\n";
+        let problems = g80_3_no_string_to_resource_constructor_fn(src);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("from_url"));
+    }
+
+    /// The standard-trait spellings (`From<&str>`, `FromStr::parse` returning `Self`) must
+    /// also be caught — this scan is meant to subsume, not merely supplement, what a
+    /// `From<&str>`-shaped trybuild fixture would catch.
+    #[test]
+    fn g80_3_no_string_to_resource_constructor_fn_flags_from_str_impl() {
+        let src = "pub enum IntraCellResource {\n    QDRANT_REST,\n}\n\
+                   impl From<&str> for IntraCellResource {\n    \
+                       fn from(_s: &str) -> Self {\n        Self::QDRANT_REST\n    }\n\
+                   }\n";
+        let problems = g80_3_no_string_to_resource_constructor_fn(src);
+        assert_eq!(problems.len(), 1);
+    }
+
+    /// Negative control for [`header_names_ident_exactly`]: an unrelated type whose name
+    /// merely *contains* `IntraCellResource` as a substring (`IntraCellResourceRegistry`) must
+    /// not be scanned as if it were `IntraCellResource`'s own impl — a real `&str -> Self`
+    /// fn on that unrelated type is not a 判据1 violation.
+    #[test]
+    fn g80_3_no_string_to_resource_constructor_fn_ignores_registry_type_name_collision() {
+        let src = "impl IntraCellResourceRegistry {\n    \
+                       pub fn from_str(_s: &str) -> Self {\n        todo!()\n    }\n\
+                   }\n";
+        assert!(g80_3_no_string_to_resource_constructor_fn(src).is_empty());
+    }
+
+    /// Negative control: an unrelated type in the *same file* with a legitimate
+    /// `&str -> Result<Self, _>` (`CellCidr::from_str`, real production shape) must never be a
+    /// false hit — the scan is scoped to `IntraCellResource`'s own impl blocks only.
+    #[test]
+    fn g80_3_no_string_to_resource_constructor_fn_ignores_unrelated_type_from_str() {
+        let src = "impl FromStr for CellCidr {\n    \
+                       type Err = CellCidrParseError;\n    \
+                       fn from_str(s: &str) -> Result<Self, Self::Err> {\n        todo!()\n    }\n\
+                   }\n\
+                   impl IntraCellResource {\n    \
+                       pub const ALL: [IntraCellResource; 1] = [Self::QDRANT_REST];\n\
+                   }\n";
+        assert!(g80_3_no_string_to_resource_constructor_fn(src).is_empty());
+    }
+
+    /// The real `crates/infra-cell/src/resource.rs` must scan clean end to end.
+    #[test]
+    fn g80_3_no_string_to_resource_constructor_fn_real_file_is_clean() {
+        let source = fs::read_to_string(real_root().join(INFRA_CELL_RESOURCE_RS)).unwrap();
+        assert!(g80_3_no_string_to_resource_constructor_fn(&source).is_empty());
+    }
+
     /// 注错 c (§83.4 判据3): a private-data variant that stops carrying `EgressPermit` (the
     /// spec's own "改成 generic NetworkPermit" wording, reproduced here as a bare variant —
     /// same red either way, since 判据3 checks the payload's *name*) must turn 判据3 red. Before
@@ -2805,7 +3220,7 @@ mod tests {
             .replace("RETRIEVAL_RERANK(EgressPermit),\n", "RETRIEVAL_RERANK,\n");
         let files = vec![
             (
-                root.join("crates/infra-egress/src/http.rs"),
+                root.join("crates/infra-network/src/http.rs"),
                 "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
             ),
             (root.join("crates/domain/src/egress.rs"), egress_src),
@@ -2830,7 +3245,7 @@ mod tests {
         );
         let files = vec![
             (
-                root.join("crates/infra-egress/src/http.rs"),
+                root.join("crates/infra-network/src/http.rs"),
                 "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
             ),
             (root.join("crates/domain/src/egress.rs"), egress_src),
@@ -2855,7 +3270,7 @@ mod tests {
         );
         let files = vec![
             (
-                root.join("crates/infra-egress/src/http.rs"),
+                root.join("crates/infra-network/src/http.rs"),
                 "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
             ),
             (root.join("crates/domain/src/egress.rs"), egress_src),
@@ -2864,17 +3279,17 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("MYSTERY_PROVIDER")));
     }
 
-    /// 注错 0a (§83.4): deleting `infra-egress/src/http.rs` must flip the positive sentinel
+    /// 注错 0a (§83.4): deleting `infra-network/src/http.rs` must flip the positive sentinel
     /// red, even when `cargo metadata` still (on paper) lists the crate as a member.
     #[test]
     fn g80_3_sentinel_flags_deleted_http_rs() {
         let tmp = fresh_tmp("g80-3-deleted-http-rs");
-        fs::create_dir_all(tmp.join("crates/infra-egress/src")).unwrap();
-        fs::write(tmp.join("crates/infra-egress/Cargo.toml"), "").unwrap();
+        fs::create_dir_all(tmp.join("crates/infra-network/src")).unwrap();
+        fs::write(tmp.join("crates/infra-network/Cargo.toml"), "").unwrap();
         // http.rs deliberately not written.
-        let fake_metadata = r#"{"packages":[{"name":"humaux-infra-egress"}]}"#;
+        let fake_metadata = r#"{"packages":[{"name":"humaux-infra-network"}]}"#;
         let problems = g80_3_workspace_sentinel(&tmp, Some(fake_metadata));
-        assert!(problems.iter().any(|p| p.contains(INFRA_EGRESS_HTTP_RS)));
+        assert!(problems.iter().any(|p| p.contains(INFRA_NETWORK_HTTP_RS)));
         fs::remove_dir_all(&tmp).ok();
     }
 
@@ -2884,31 +3299,31 @@ mod tests {
     #[test]
     fn g80_3_sentinel_flags_missing_metadata_member() {
         let tmp = fresh_tmp("g80-3-missing-member");
-        fs::create_dir_all(tmp.join("crates/infra-egress/src")).unwrap();
-        fs::write(tmp.join("crates/infra-egress/Cargo.toml"), "").unwrap();
-        fs::write(tmp.join(INFRA_EGRESS_HTTP_RS), "").unwrap();
+        fs::create_dir_all(tmp.join("crates/infra-network/src")).unwrap();
+        fs::write(tmp.join("crates/infra-network/Cargo.toml"), "").unwrap();
+        fs::write(tmp.join(INFRA_NETWORK_HTTP_RS), "").unwrap();
         let fake_metadata = r#"{"packages":[{"name":"humaux-domain"}]}"#;
         let problems = g80_3_workspace_sentinel(&tmp, Some(fake_metadata));
         assert!(problems.iter().any(|p| p.contains("cargo metadata")));
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Regression pin for the `member_present` fix: `"humaux-infra-egress"` appearing only as
+    /// Regression pin for the `member_present` fix: `"humaux-infra-network"` appearing only as
     /// a *substring* of some other package's dependency listing (a plausible shape once a
     /// second crate path-depends on it by name) must NOT read as the crate itself being a
-    /// workspace member — the bug this test would have caught: `.contains("humaux-infra-egress")`
+    /// workspace member — the bug this test would have caught: `.contains("humaux-infra-network")`
     /// over the raw JSON text stays true here even though no `packages[].name` equals it.
     #[test]
     fn g80_3_sentinel_member_present_requires_exact_name_not_substring() {
         let tmp = fresh_tmp("g80-3-substring-not-member");
-        fs::create_dir_all(tmp.join("crates/infra-egress/src")).unwrap();
-        fs::write(tmp.join("crates/infra-egress/Cargo.toml"), "").unwrap();
-        fs::write(tmp.join(INFRA_EGRESS_HTTP_RS), "").unwrap();
-        // No package here is literally named `humaux-infra-egress` — it only appears inside
+        fs::create_dir_all(tmp.join("crates/infra-network/src")).unwrap();
+        fs::write(tmp.join("crates/infra-network/Cargo.toml"), "").unwrap();
+        fs::write(tmp.join(INFRA_NETWORK_HTTP_RS), "").unwrap();
+        // No package here is literally named `humaux-infra-network` — it only appears inside
         // another package's dependency list (e.g. after the crate was dropped from `members`
         // but a stale path-dependency edge to it still resolves in the lockfile/graph).
         let fake_metadata = r#"{"packages":[{"name":"humaux-domain","dependencies":[]},
-            {"name":"humaux-other","dependencies":[{"name":"humaux-infra-egress"}]}]}"#;
+            {"name":"humaux-other","dependencies":[{"name":"humaux-infra-network"}]}]}"#;
         let problems = g80_3_workspace_sentinel(&tmp, Some(fake_metadata));
         assert!(
             problems.iter().any(|p| p.contains("cargo metadata")),
@@ -2918,7 +3333,7 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// §83.4 判据0, full-path 注错 0a: with `crates/infra-egress` already delivered, deleting
+    /// §83.4 判据0, full-path 注错 0a: with `crates/infra-network` already delivered, deleting
     /// the whole directory must flip [`g80_3_outbound_choke_point`] itself to `Fail`, not
     /// `NotApplicable` — the early-return this test replaces made deletion vacuously
     /// undetectable (判据1's raw-client scan finds nothing to complain about when there is
@@ -2927,13 +3342,12 @@ mod tests {
     fn g80_3_outbound_choke_point_fails_when_infra_egress_directory_is_deleted() {
         let tmp = fresh_tmp("g80-3-deleted-crate-full-path");
         fs::create_dir_all(&tmp).unwrap();
-        // No `crates/infra-egress` at all, and no workspace `Cargo.toml` for `cargo metadata`
+        // No `crates/infra-network` at all, and no workspace `Cargo.toml` for `cargo metadata`
         // to succeed against either — both read as absence, which is exactly the point: once
         // delivered, absence is a fault, never a legitimate "nothing to check" state.
-        assert_eq!(
-            g80_3_outbound_choke_point(&tmp),
-            Verdict::Fail(g80_3_workspace_sentinel(&tmp, None))
-        );
+        let mut expected = g80_3_workspace_sentinel(&tmp, None);
+        expected.extend(g80_3_layer1_crates_sentinel(&tmp, None));
+        assert_eq!(g80_3_outbound_choke_point(&tmp), Verdict::Fail(expected));
         fs::remove_dir_all(&tmp).ok();
     }
 
@@ -2958,8 +3372,8 @@ mod tests {
     fn g80_3_manifest_dependency_check_fault_second_crate_depends_on_reqwest() {
         let root = PathBuf::from("/fixture-root");
         let metadata_json = r#"{"packages":[
-            {"name":"humaux-infra-egress",
-             "manifest_path":"/fixture-root/crates/infra-egress/Cargo.toml",
+            {"name":"humaux-infra-network",
+             "manifest_path":"/fixture-root/crates/infra-network/Cargo.toml",
              "dependencies":[{"name":"reqwest"}]},
             {"name":"humaux-adapters",
              "manifest_path":"/fixture-root/crates/adapters/Cargo.toml",
@@ -2971,6 +3385,164 @@ mod tests {
                 .iter()
                 .any(|p| p.contains("crates/adapters/Cargo.toml")),
             "{problems:?}"
+        );
+    }
+
+    /// Positive control for [`g80_3_infra_network_dependents_check`]: the real repo's own
+    /// `cargo metadata` document must show exactly the two Layer 1 crates depending on
+    /// `humaux-infra-network`.
+    #[test]
+    fn g80_3_infra_network_dependents_check_real_repo_is_clean() {
+        let root = real_root();
+        let output = Command::new("cargo")
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .current_dir(&root)
+            .output()
+            .expect("cargo metadata");
+        assert!(output.status.success());
+        let metadata_json = String::from_utf8_lossy(&output.stdout);
+        assert!(g80_3_infra_network_dependents_check(&metadata_json, &root).is_empty());
+    }
+
+    /// Decisive proof, reproducing the exact exploit the review found: a third crate
+    /// (`humaux-adapters`) adding a path dependency on `humaux-infra-network` — to reach the
+    /// `reqwest` re-export without ever listing `reqwest` itself — must be reported by this
+    /// dependents-set check even though [`g80_3_manifest_dependency_check`] alone stays clean
+    /// for it (it never lists `reqwest`/`hyper` directly).
+    #[test]
+    fn g80_3_infra_network_dependents_check_fault_third_crate_depends_on_infra_network() {
+        let root = PathBuf::from("/fixture-root");
+        let metadata_json = r#"{"packages":[
+            {"name":"humaux-infra-egress",
+             "manifest_path":"/fixture-root/crates/infra-egress/Cargo.toml",
+             "dependencies":[{"name":"humaux-infra-network"}]},
+            {"name":"humaux-infra-cell",
+             "manifest_path":"/fixture-root/crates/infra-cell/Cargo.toml",
+             "dependencies":[{"name":"humaux-infra-network"}]},
+            {"name":"humaux-adapters",
+             "manifest_path":"/fixture-root/crates/adapters/Cargo.toml",
+             "dependencies":[{"name":"humaux-infra-network"}]}
+        ]}"#;
+        let problems = g80_3_infra_network_dependents_check(metadata_json, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("crates/adapters/Cargo.toml")),
+            "{problems:?}"
+        );
+    }
+
+    /// §83.4 判据1, decisive proof (the exact injected-alias exploit the review found): `use
+    /// humaux_infra_network::reqwest::Client as HttpClient; HttpClient::new()` must be caught —
+    /// [`BARE_HTTP_CLIENT_NEEDLES`]'s word-boundary guard rejects the call site itself (the
+    /// byte before `Client::new(` inside `HttpClient::new(` is `p`), but
+    /// [`REQWEST_CLIENT_ALIAS_IMPORT_NEEDLES`] catches the import line regardless of the
+    /// alias's chosen name.
+    #[test]
+    fn find_raw_http_client_calls_catches_renamed_alias_import_regardless_of_call_site() {
+        let src = "use humaux_infra_network::reqwest::Client as HttpClient;\n\
+                   pub fn injected_alias() -> HttpClient { HttpClient::new() }\n";
+        assert_eq!(find_raw_http_client_calls(src).len(), 1);
+    }
+
+    // ============================================================================
+    // ADR-0003 / §83.4 Layer 1B: intra-cell-resource-registry checks + the two注错 tests the
+    // task explicitly names — (a) adapters constructing `reqwest::Client` directly, (b) Qdrant
+    // sneaking into `external-egress-registry`. (c) ("`IntraCellResource` accepts a raw URL")
+    // is a compile-time property, not a source-scan one — proved by
+    // `crates/infra-cell/tests/intra_cell_topology_ui.rs`'s `trybuild` fixture instead.
+    // ============================================================================
+
+    fn intra_cell_resource_fixture() -> String {
+        "pub enum IntraCellResource {\n    QDRANT_REST,\n}\n".to_string()
+    }
+
+    #[test]
+    fn g80_3_intra_cell_registry_clean_fixture_has_no_problems() {
+        let root = PathBuf::from("/fixture-root");
+        let files = vec![(
+            root.join(INFRA_CELL_RESOURCE_RS),
+            intra_cell_resource_fixture(),
+        )];
+        assert!(g80_3_intra_cell_registry_check(&files, &root).is_empty());
+    }
+
+    /// ADR-0003 判据1 sibling of 注错 b: `IntraCellResource` growing an unregistered variant
+    /// must turn this check red, same shape [`g80_3_fault_unregistered_purpose_variant_is_red`]
+    /// already proves for `OutboundPurpose`.
+    #[test]
+    fn g80_3_intra_cell_registry_fault_unregistered_resource_is_red() {
+        let root = PathBuf::from("/fixture-root");
+        let src = intra_cell_resource_fixture()
+            .replace("QDRANT_REST,\n", "QDRANT_REST,\n    MYSTERY_RESOURCE,\n");
+        let files = vec![(root.join(INFRA_CELL_RESOURCE_RS), src)];
+        let problems = g80_3_intra_cell_registry_check(&files, &root);
+        assert!(problems.iter().any(|p| p.contains("MYSTERY_RESOURCE")));
+    }
+
+    /// 注错 (a) (task item, source-level): a raw `reqwest::Client::new` written directly inside
+    /// `adapters/src/qdrant.rs` — the exact file ADR-0003 wires to `IntraCellHttpTransport`
+    /// instead of a raw client — must turn 判据1 red and name that file. Same mechanism
+    /// [`g80_3_fault_raw_client_outside_http_rs_is_red_and_named`] already proves generically,
+    /// pinned here against the specific file/crate the task calls out by name.
+    #[test]
+    fn g80_3_fault_adapters_qdrant_constructs_raw_reqwest_client_is_red() {
+        let root = PathBuf::from("/fixture-root");
+        let files = vec![
+            (
+                root.join(INFRA_NETWORK_HTTP_RS),
+                "pub fn f() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
+            ),
+            (
+                root.join("crates/domain/src/egress.rs"),
+                outbound_purpose_fixture(),
+            ),
+            (
+                root.join("crates/adapters/src/qdrant.rs"),
+                "pub fn sneaky() -> reqwest::Client { reqwest::Client::new() }\n".to_string(),
+            ),
+        ];
+        let problems = g80_3_transport_and_registry_check(&files, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("crates/adapters/src/qdrant.rs")),
+            "{problems:?}"
+        );
+    }
+
+    /// 注错 (b) (task item): Qdrant sneaking into `external-egress-registry` while still
+    /// present in `intra-cell-resource-registry` — the coordinated double-registration
+    /// [`intra_cell_registry_disjoint_from_external`] exists to catch, which neither registry's
+    /// own single-sided set-equality check (判据2 / this module's intra-cell sibling) can see on
+    /// its own (both would independently read PASS if `OutboundPurpose`/`EXTERNAL_EGRESS_
+    /// REGISTRY` were edited together to add the same name `IntraCellResource` already has).
+    #[test]
+    fn g80_3_fault_qdrant_added_to_external_egress_registry_is_red() {
+        let external_with_qdrant: Vec<&str> = EXTERNAL_EGRESS_REGISTRY
+            .iter()
+            .copied()
+            .chain(std::iter::once("QDRANT_REST"))
+            .collect();
+        let problems = intra_cell_registry_disjoint_from_external(
+            &external_with_qdrant,
+            INTRA_CELL_RESOURCE_REGISTRY,
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("QDRANT_REST")),
+            "{problems:?}"
+        );
+    }
+
+    /// Positive control: the real workspace's two registries must in fact be disjoint today.
+    #[test]
+    fn g80_3_real_registries_are_disjoint() {
+        assert!(
+            intra_cell_registry_disjoint_from_external(
+                EXTERNAL_EGRESS_REGISTRY,
+                INTRA_CELL_RESOURCE_REGISTRY,
+            )
+            .is_empty()
         );
     }
 }

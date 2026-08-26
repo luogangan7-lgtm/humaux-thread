@@ -1,17 +1,21 @@
-//! `infra-egress::http` — §83.4's sole raw HTTP transport construction point (G80-3).
+//! `infra-egress::http` — ADR-0003 / §83.4 Layer 1A: external-egress HTTP transport.
 //!
-//! Every other file in the workspace is forbidden from naming `reqwest::Client::new`/
-//! `::builder` (or `hyper::Client::new`/`::builder`) directly — `xtask architecture-check`'s
-//! G80-3 判据1 asserts the raw-client construction-site set equals exactly
-//! `{crates/infra-egress/src/http.rs}` (both the fully-qualified spelling and a bare
-//! `use`-imported alias — `Client::new()` without the `reqwest::` prefix — are covered).
+//! Raw `reqwest::Client` construction lives one layer down, in `humaux-infra-network` (the
+//! sole workspace-wide **protocol** choke point, `xtask architecture-check`'s G80-3 判据1) —
+//! this module reaches the `reqwest::Client`/`reqwest::Error` *types* only through
+//! `humaux_infra_network::reqwest`, and never calls `Client::new`/`::builder` itself.
 //! [`HttpExternalCall`] is this module's one `humaux_domain::egress::ExternalCall`
-//! implementation, and the only place in the workspace permitted to hold that client.
+//! implementation, and the only place in the workspace permitted to hold that client for
+//! **external** (cross-trust-boundary, §7.4-disclosed) destinations — same-Cell destinations
+//! (Qdrant) go through `humaux-infra-cell`'s `IntraCellHttpTransport` instead (ADR-0003), never
+//! through this trait.
 
 use std::time::Duration;
 
 use humaux_domain::egress::{AuthorizedEgressPayload, EgressPermit, ExternalCall, ProcessorId};
 use humaux_domain::error::ErrorCode;
+use humaux_infra_network::http::{ClientConfig, build_client};
+use humaux_infra_network::reqwest;
 
 /// §78.1: named, overridable knobs — not literals buried inside `Client::builder()` — for the
 /// per-request timeout and response-size cap this transport enforces.
@@ -69,18 +73,24 @@ pub struct HttpExternalCall {
 }
 
 impl HttpExternalCall {
-    /// The workspace's one legal `reqwest::Client` construction site (§83.4 G80-3).
-    ///
-    /// Fails only if the TLS backend cannot initialize (`reqwest::Client::builder().build()`'s
-    /// own failure mode) — a process-startup-time configuration error, not a per-call one.
+    /// Builds the `reqwest::Client` this instance holds via Layer 0's
+    /// [`build_client`] — ADR-0003: this crate itself has not named `Client::new`/`::builder`
+    /// since the Layer 0/1A split (see module doc); ownership of the *decision* to build a
+    /// client for this `(endpoint, processor)` pair still lives here.
     pub fn new(
         endpoint: impl Into<String>,
         processor: ProcessorId,
         config: HttpEgressConfig,
     ) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
-            .build()?;
+        let client = build_client(ClientConfig {
+            request_timeout: config.request_timeout,
+            // Layer 1A external egress: preserve `reqwest`'s prior default (obey
+            // `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) — an org's egress proxy is a legitimate
+            // path for traffic that is, by definition, already leaving Humaux-operated
+            // infrastructure. See `ClientConfig::trust_env_proxy`'s doc for why Layer 1B
+            // (`humaux-infra-cell`) answers this differently.
+            trust_env_proxy: true,
+        })?;
         Ok(Self {
             client,
             endpoint: endpoint.into(),

@@ -82,6 +82,33 @@ pub enum PrivateDataPurpose {
     RetrievalEmbedding,
     /// §83.4 registry row 3 / §19.
     RetrievalRerank,
+    /// §80.1 test-only escape hatch, gated behind the `test-support` Cargo feature (never
+    /// compiled into a production binary — the feature is enabled solely via
+    /// `humaux-adapters`'s self-referencing `[dev-dependencies]`). Every real variant above
+    /// classifies as `ExternalProcessor`, so `adapters::disclosure::reserve_in_txn`'s
+    /// `RecipientClass` guard is otherwise unreachable through any production code path —
+    /// this variant exists so a fault-injection test can prove that guard actually fires at
+    /// the real call site (§80.1: "一道闸没有『注错红转绿』记录就不算存在"), not merely in
+    /// `domain::boundary`'s own unit tests of `requires_disclosure_record` in isolation.
+    #[cfg(feature = "test-support")]
+    NonRecipientForTest,
+}
+
+impl PrivateDataPurpose {
+    /// ADR-0003 second-round correction (`crate::boundary`): every real `PrivateDataPurpose`
+    /// names a third-party model/embedding/rerank provider — a separate legal entity acting as
+    /// a GDPR Art.28 processor on Humaux's instructions, never a same-entity resource,
+    /// regardless of which network route a given call happens to take. This is the
+    /// classification `adapters::disclosure::reserve_private`/`reserve_retrieval` check against
+    /// [`crate::boundary::requires_disclosure_record`] before writing `ops.data_disclosures` —
+    /// see that module's doc for why the check must never instead consult route/IP/protocol.
+    pub fn recipient_class(self) -> crate::boundary::RecipientClass {
+        match self {
+            #[cfg(feature = "test-support")]
+            Self::NonRecipientForTest => crate::boundary::RecipientClass::SameEntityResource,
+            _ => crate::boundary::RecipientClass::ExternalProcessor,
+        }
+    }
 }
 
 /// §7.3: the sole out-bound authorization token. Every field is private; there is no `pub`
