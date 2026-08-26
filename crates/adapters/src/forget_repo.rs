@@ -1,8 +1,11 @@
 //! `adapters::forget_repo` — T4.8 §37/§37.2 physical IO: the sole `UPDATE
 //! projection.stream_log SET state = 'TOMBSTONED'` in this workspace
 //! ([`tombstone`]), the §37 `DeletionPlan` step-completion writer ([`record_step`]), §65's
-//! idempotent purge-replay loop ([`replay_pending_steps`]), and the current-computed
-//! `tombstoned_unpurged_over_sla` gauge ([`tombstoned_unpurged_over_sla`]).
+//! idempotent purge-replay loop ([`replay_pending_steps`]), the current-computed
+//! `tombstoned_unpurged_over_sla` gauge ([`tombstoned_unpurged_over_sla`]), and — §23.4 G23-2 —
+//! the two PG-side overlay reads a literal/EXACT-channel lane needs
+//! ([`count_excluding_tombstoned`], [`state_of`]), sharing this module's own `state <>
+//! 'TOMBSTONED'` knowledge instead of a caller re-deriving it.
 //!
 //! `humaux_application::forget` decides *what* to delete and *in what order* (pure, no IO,
 //! §3/§78.3); this module is the only place that decision turns into SQL — same split as
@@ -101,6 +104,72 @@ pub async fn tombstone(
     txn.commit().await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+/// §22.1 PostgreSQL EXACT channel / §23.4 G23-2 literal lane: rows in `[seq_lo, seq_hi]` whose
+/// `state` is not `TOMBSTONED` — the production predicate a PG-side lane applies to stay
+/// overlay-consistent with [`tombstone`]'s own state transition, instead of a caller
+/// re-deriving `state <> 'TOMBSTONED'` itself at each call site (§23.1②: the overlay predicate
+/// belongs in one place). Shares [`tombstone`]'s key shape and `role_maintenance` scoping.
+pub async fn count_excluding_tombstoned(
+    pool: &MaintenanceDbPool,
+    key: &StreamKey,
+    seq_lo: u64,
+    seq_hi: u64,
+) -> Result<i64, ForgetRepoError> {
+    let mut txn = pool.pool().begin().await?;
+    set_tenant_local(&mut txn, key.tenant_id.0).await?;
+
+    let row = sqlx::query(
+        "SELECT count(*) AS n FROM projection.stream_log \
+          WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3 AND domain = $4 \
+            AND projection_kind = $5 AND projection_version = $6 \
+            AND stream_seq BETWEEN $7 AND $8 AND state <> 'TOMBSTONED'",
+    )
+    .bind(key.tenant_id.0)
+    .bind(&key.scope_kind)
+    .bind(key.scope_id)
+    .bind(&key.domain)
+    .bind(&key.projection_kind)
+    .bind(&key.projection_version)
+    .bind(seq_lo as i64)
+    .bind(seq_hi as i64)
+    .fetch_one(&mut *txn)
+    .await?;
+    txn.commit().await?;
+
+    Ok(row.try_get::<i64, _>("n")?)
+}
+
+/// §23.4 G23-2 literal lane's per-row read: the current `state` for one `stream_seq`, `None`
+/// if the row does not exist for this key. Shares [`tombstone`]'s key shape and
+/// `role_maintenance` scoping — the production entry point a literal-lookup lane calls instead
+/// of hand-writing the same `SELECT state FROM projection.stream_log WHERE ...` per caller.
+pub async fn state_of(
+    pool: &MaintenanceDbPool,
+    key: &StreamKey,
+    seq: u64,
+) -> Result<Option<String>, ForgetRepoError> {
+    let mut txn = pool.pool().begin().await?;
+    set_tenant_local(&mut txn, key.tenant_id.0).await?;
+
+    let row = sqlx::query(
+        "SELECT state FROM projection.stream_log \
+          WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3 AND domain = $4 \
+            AND projection_kind = $5 AND projection_version = $6 AND stream_seq = $7",
+    )
+    .bind(key.tenant_id.0)
+    .bind(&key.scope_kind)
+    .bind(key.scope_id)
+    .bind(&key.domain)
+    .bind(&key.projection_kind)
+    .bind(&key.projection_version)
+    .bind(seq as i64)
+    .fetch_optional(&mut *txn)
+    .await?;
+    txn.commit().await?;
+
+    Ok(row.map(|r| r.try_get::<String, _>("state")).transpose()?)
 }
 
 /// §37/§65 step-completion writer: calls `ops.record_deletion_plan_step` (0054, `SECURITY

@@ -1,0 +1,41 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# Gate-hardening follow-up to 0080_model_call_ledger_purpose (§20#G20-2/G80-39 audit finding):
+# closes ops.model_call_ledger.purpose to the one value known today ('query_rewrite') so the
+# G20-2/G80-39 e2e gate's literal string match can't be silently defeated by a spelling
+# variant. Cannot edit already-applied 0080 — new EXPAND-only migration instead.
+
+migration_id = "0081_model_call_ledger_purpose_known_set"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('ops.model_call_ledger') is not null
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'ops' and table_name = 'model_call_ledger'
+      and column_name = 'purpose'
+  )
+  and not exists (
+    select 1 from pg_constraint
+    where conname = 'model_call_ledger_purpose_known'
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select exists (
+  select 1 from pg_constraint
+  where conname = 'model_call_ledger_purpose_known'
+    and conrelid = 'ops.model_call_ledger'::regclass
+) as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE ops.model_call_ledger
+            DROP CONSTRAINT model_call_ledger_purpose_known;
+          (safe — the constraint only narrows an already-nullable free-text column with no
+          rows relying on any other value; nothing in the codebase writes purpose today per
+          0080's own precheck comment)
+"""
+
+backup_restore_requirement = "none (single CHECK constraint addition, no data migration, no backfill)"

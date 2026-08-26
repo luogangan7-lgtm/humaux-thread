@@ -691,6 +691,8 @@ dependencies = [
  "humaux-domain",
  "humaux-infra-cell",
  "humaux-projection",
+ "humaux-retrieval",
+ "humaux-telemetry",
  "humaux-testkit",
  "lettre",
  "postgres",
@@ -845,6 +847,13 @@ version = "0.1.0"
 [[package]]
 name = "humaux-retrieval"
 version = "0.1.0"
+dependencies = [
+ "humaux-domain",
+ "humaux-telemetry",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
 
 [[package]]
 name = "humaux-retrieval-provider"

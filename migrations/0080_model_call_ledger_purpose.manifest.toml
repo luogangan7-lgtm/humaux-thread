@@ -1,0 +1,33 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T6.2 (§20.0 / §20#G20-2 / G80-39): adds the one §19.1 ModelCallLedger field the e2e half of
+# the "online recall 无隐藏生成调用" gate needs to query — `purpose`, so a `query_rewrite`
+# entry is detectable at all. Full §19.1 field list is Phase 7 scope, not this migration's.
+
+migration_id = "0080_model_call_ledger_purpose"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('ops.model_call_ledger') is not null
+  and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'ops' and table_name = 'model_call_ledger'
+      and column_name = 'purpose'
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select exists (
+  select 1 from information_schema.columns
+  where table_schema = 'ops' and table_name = 'model_call_ledger'
+    and column_name = 'purpose' and is_nullable = 'YES'
+) as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE ops.model_call_ledger DROP COLUMN purpose;
+          (safe — nullable column, no CHECK, no dependent view/index added by this migration)
+"""
+
+backup_restore_requirement = "none (single nullable ADD COLUMN with no default, no backfill, no data migration)"

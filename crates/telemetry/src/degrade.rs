@@ -131,6 +131,22 @@ pub struct Outcome<T> {
     pub degradations: SmallVec<[DegradeCode; 4]>,
 }
 
+impl<T> Outcome<T> {
+    /// The non-degraded case: `degradations` empty. Exists so a caller with no fail-open path
+    /// to report never has to spell `Outcome { value, degradations: Default::default() }` (or
+    /// `smallvec![]`) by hand — every such literal outside this module is one more shape G80-1
+    /// (architecture-check scan for direct `Outcome { degradations: ... }` construction, see
+    /// this type's own doc) would have to special-case as "fine, it's empty" instead of a flat
+    /// "not through `abstain()`, therefore red". Routing clean returns through here leaves
+    /// `abstain()` as the only remaining place that ever writes a non-empty `degradations`.
+    pub fn clean(value: T) -> Self {
+        Self {
+            value,
+            degradations: SmallVec::new(),
+        }
+    }
+}
+
 /// §52: a single request is either `Err(ErrorCode)` and terminated, or
 /// `Ok(Outcome<T>)` and successful (possibly degraded) — never both (G52-4).
 /// This is not a runtime check: `Result`'s `Ok`/`Err` variants each carry

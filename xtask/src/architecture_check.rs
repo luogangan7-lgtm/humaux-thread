@@ -1159,35 +1159,151 @@ fn g80_11_source_hash_unique(root: &Path) -> Verdict {
     }
 }
 
-/// §11.8 / CLAUDE.md "唯一构造点模式": `classify()` (`crates/domain/src/consolidate.rs`) is the
-/// sole entry point that may produce a [`ClassifiedMemoryId`] — the fixer-review that landed
-/// this check found the rule named in CLAUDE.md's own list but never wired into this file
-/// (grep for "classify" here returned zero hits before this function existed). Counts
-/// *definitions* of `fn classify(` workspace-wide, not call sites — `adapters::byok::
-/// classify_http_status` is a different function name and does not match this needle.
+// ============================================================================
+// §23.1② / §22.5: `LedgerCounts` field set is exactly 6 — same shape as §37.2's "12 列"
+// check. Guards the frozen invariant that the `visible` numerator can never be folded back
+// into the ledger struct (adding a 7th `visible: u64` field would let G23-2's two injections
+// stop being observable, §23.1②'s own text names this exact regression).
+// ============================================================================
+
+const LEDGER_COUNTS_FIELDS: &[&str] = &[
+    "expected",
+    "done",
+    "deleted",
+    "skipped",
+    "open_gaps",
+    "pending",
+];
+
+fn g23_1_ledger_counts_exactly_six_fields(root: &Path) -> Verdict {
+    let files = walk_workspace_rs(root);
+    let hit = files
+        .iter()
+        .find(|(_, s)| s.contains("struct LedgerCounts {"));
+    let Some((path, source)) = hit else {
+        return Verdict::NotApplicable(
+            "retrieval::completeness::LedgerCounts (§22.5, ledger::close 尚未交付)".to_string(),
+        );
+    };
+
+    let Some(start) = source.find("struct LedgerCounts {") else {
+        return Verdict::NotApplicable("LedgerCounts struct body".to_string());
+    };
+    let Some(rel_end) = source[start..].find('}') else {
+        return Verdict::Fail(vec![format!(
+            "{}: `struct LedgerCounts {{` has no matching `}}` on the same scan window",
+            display(root, path)
+        )]);
+    };
+    let body = &source[start..start + rel_end];
+
+    // One field name per non-empty line inside the braces, `name: type,` shape — the struct's
+    // own definition is exactly this shape (see completeness.rs), so a plain per-line field
+    // name extraction is sufficient without a full Rust parser.
+    let mut fields: Vec<&str> = Vec::new();
+    for line in body.lines().skip(1) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, _)) = line.split_once(':') {
+            fields.push(name.trim());
+        }
+    }
+
+    if fields.len() != 6 {
+        return Verdict::Fail(vec![format!(
+            "{}: LedgerCounts has {} field(s) {:?}, expected exactly 6 {:?} — a 7th field \
+             (e.g. `visible: u64`) would move the numerator back inside the ledger struct, \
+             defeating G23-2's fault injections (§23.1②)",
+            display(root, path),
+            fields.len(),
+            fields,
+            LEDGER_COUNTS_FIELDS
+        )]);
+    }
+
+    let expected: std::collections::BTreeSet<&str> = LEDGER_COUNTS_FIELDS.iter().copied().collect();
+    let actual: std::collections::BTreeSet<&str> = fields.iter().copied().collect();
+    if expected != actual {
+        return Verdict::Fail(vec![format!(
+            "{}: LedgerCounts field set is {:?}, expected exactly {:?}",
+            display(root, path),
+            fields,
+            LEDGER_COUNTS_FIELDS
+        )]);
+    }
+
+    Verdict::Pass
+}
+
+/// §11.8 / §22.5 / CLAUDE.md "唯一构造点模式": two independent concerns each name their sole
+/// constructor `classify()` — `ClassifiedMemoryId` (`domain::consolidate`, §11.8) and
+/// `CompletenessClass` (`retrieval::completeness`, §22.5). `FreshnessClass`'s equivalent
+/// (§21.5) is named `classify_age` in `retrieval::signals`, not `classify` — it does not share
+/// this needle and is out of this check's scope.
+///
+/// A single workspace-wide `fn classify(` count conflates the two concerns and can never pass
+/// once both land (T6.4 pushed the count from 1 to 2 — the fixer-review finding that named
+/// this exact collision) — so each concern's own file is checked independently: exactly 1
+/// `fn classify(` in that file, never `<= 1` (a missing constructor is its own
+/// `NotApplicable`, not a silent pass). The workspace-wide total is still cross-checked
+/// against the number of landed known sites, so a stray third `fn classify(` anywhere else is
+/// still red — it now fails at the site list instead of at a single global count.
+const CLASSIFY_SOLE_CONSTRUCTION_SITES: &[(&str, &str)] = &[
+    (
+        "crates/domain/src/consolidate.rs",
+        "ClassifiedMemoryId (§11.8)",
+    ),
+    (
+        "crates/retrieval/src/completeness.rs",
+        "CompletenessClass (§22.5)",
+    ),
+];
+
 fn g11_8_classify_sole_construction_point(root: &Path) -> Verdict {
     let files = walk_workspace_rs(root);
-    let object_exists = files.iter().any(|(_, s)| s.contains("fn classify("));
-    if !object_exists {
+    let total: usize = files
+        .iter()
+        .map(|(_, s)| s.matches("fn classify(").count())
+        .sum();
+
+    let mut applicable = 0usize;
+    let mut failures = Vec::new();
+    for (rel_path, label) in CLASSIFY_SOLE_CONSTRUCTION_SITES {
+        let full = root.join(rel_path);
+        let Some((_, source)) = files.iter().find(|(p, _)| *p == full) else {
+            continue;
+        };
+        applicable += 1;
+        let n = source.matches("fn classify(").count();
+        if n != 1 {
+            failures.push(format!(
+                "{rel_path} ({label}): expected exactly 1 `fn classify(`, found {n}"
+            ));
+        }
+    }
+
+    if applicable == 0 {
         return Verdict::NotApplicable(
-            "domain::consolidate::classify (§11.8, T4.6/T4.7 尚未交付)".to_string(),
+            "domain::consolidate::classify (§11.8) / retrieval::completeness::classify \
+             (§22.5) — neither has landed yet"
+                .to_string(),
         );
     }
-    let mut count = 0usize;
-    let mut sites = Vec::new();
-    for (path, source) in &files {
-        let n = source.matches("fn classify(").count();
-        if n > 0 {
-            sites.push(format!("{}: {n}", display(root, path)));
-        }
-        count += n;
+
+    if total != applicable {
+        failures.push(format!(
+            "workspace-wide `fn classify(` count is {total}, expected {applicable} (one per \
+             landed sole-construction site {CLASSIFY_SOLE_CONSTRUCTION_SITES:?}) — a stray \
+             definition exists outside the known sites"
+        ));
     }
-    if count == 1 {
+
+    if failures.is_empty() {
         Verdict::Pass
     } else {
-        Verdict::Fail(vec![format!(
-            "expected exactly 1 `fn classify(` definition, found {count}: {sites:?}"
-        )])
+        Verdict::Fail(failures)
     }
 }
 
@@ -2047,6 +2163,233 @@ pub fn g6_db_pool_topology(root: &Path) -> Verdict {
     }
 }
 
+// ============================================================================
+// §20#G20-2 / G80-39 — online recall/context/continuity: zero static dependency on any
+// reasoning provider (T6.2, §20.0)
+// ============================================================================
+
+/// The online-lane file set §20.0 names: `application::retrieve` (T6.2's own orchestration
+/// entry point), its sibling online lanes `application::continuity` and `domain::context`
+/// (§25.4 Mandatory Context Lane), `adapters::retrieve` — the one DB-backed online recall
+/// path already shipped (T3.8's `recall_with_overlay`; see that module's own doc comment for
+/// why real I/O lives there and not in `application::retrieve`) — plus the §20 Planner
+/// (`crates/retrieval/src/*.rs`) and its process entry point (`bins/retrieval-worker/src/
+/// main.rs`): a generative query rewrite inserted in the Planner is exactly as much a §20.0
+/// violation as one inserted in `application::retrieve`, and prior to this fix the Planner
+/// wasn't scanned at all. A listed file that does not exist yet contributes 0 hits, not a
+/// violation — §20.0's rule is "MUST NOT call", and an absent file trivially satisfies that;
+/// see [`g20_2_no_hidden_generative_recall`] for how a *placeholder* file (present but
+/// content-free) is treated instead of silently counting toward a green Pass.
+const ONLINE_LANE_FILES: &[&str] = &[
+    "crates/application/src/retrieve.rs",
+    "crates/application/src/continuity.rs",
+    "crates/domain/src/context.rs",
+    "crates/adapters/src/retrieve.rs",
+    "crates/retrieval/src/lib.rs",
+    "crates/retrieval/src/planner.rs",
+    "crates/retrieval/src/candidate.rs",
+    "crates/retrieval/src/fusion.rs",
+    "crates/retrieval/src/rerank.rs",
+    "crates/retrieval/src/compiler.rs",
+    "crates/retrieval/src/completeness.rs",
+    "crates/retrieval/src/envelope.rs",
+    "crates/retrieval/src/predicate_eval.rs",
+    "crates/retrieval/src/predicate_registry.rs",
+    "crates/retrieval/src/signals.rs",
+    "bins/retrieval-worker/src/main.rs",
+];
+
+/// The needles §20.0/G20-2 forbids anywhere in the online call graph, each paired with
+/// whether a hit additionally requires a non-identifier byte on the *right* (see
+/// [`count_identifier_hits`]):
+///
+/// - the two provider *type* names (naming either — bare, `dyn`-bound, or as a generic
+///   bound — is how Rust code reaches either provider's methods at all) — `true`: a full
+///   identifier match, so `UserReasoningProviderFactory` (a different type) does not count;
+/// - the literal method name from the spec's own 注错 text ("在 recall 前插一个
+///   complete_structured() query rewrite") — `false`, a left-bounded *prefix* match: the
+///   workspace's one real generative call site is
+///   `complete_structured_with_bounded_repair` (`crates/adapters/src/byok.rs`), whose name
+///   starts with `complete_structured` but continues with an identifier byte (`_`) — a
+///   right-boundary requirement here silently exempted the exact call the rule exists to
+///   catch (confirmed by injecting a caller of it into `application::retrieve` under the old
+///   matcher: the check stayed green);
+/// - `byok`, the adapter module that owns both provider traits and every generative call
+///   into them — belt-and-suspenders against a call site that reaches a provider through a
+///   local re-export/alias and so names neither the trait nor `complete_structured*`
+///   directly (e.g. `use humaux_adapters::byok::complete_structured_with_bounded_repair as
+///   rewrite;`). Confirmed zero false positives against the current online lane: the only
+///   pre-existing occurrence of the substring `byok` in the scan domain is this file's own
+///   `//!` doc line naming it in prose, which the comment-skip rule already excludes.
+const FORBIDDEN_GENERATIVE_NEEDLES: &[(&str, bool)] = &[
+    ("UserReasoningProvider", true),
+    ("PublicReasoningProvider", true),
+    ("complete_structured", false),
+    ("byok", true),
+];
+
+/// `application::retrieve`'s own placeholder convention (T0.x scaffold modules across this
+/// workspace share the exact `占位模块` marker in their sole doc comment, e.g.
+/// `crates/application/src/continuity.rs`) — a file matching this is present but carries no
+/// real call graph, so it must not count as scanned coverage the way a real online-lane file
+/// does (see [`g20_2_no_hidden_generative_recall`]).
+fn is_online_lane_placeholder(src: &str) -> bool {
+    src.contains("占位模块")
+}
+
+/// Word-boundary, comment-aware occurrence count of `needle` in `src` — same matching
+/// discipline as [`count_pgpool_type`] (prev byte not an identifier byte, `//`-comment lines
+/// excluded), generalized to an arbitrary needle instead of one hardcoded type name.
+/// `require_right_boundary` additionally requires the byte after the match not be an
+/// identifier byte either; pass `false` for a needle whose real-world violations extend past
+/// the needle itself (see [`FORBIDDEN_GENERATIVE_NEEDLES`]'s doc for why `complete_structured`
+/// needs this).
+fn count_identifier_hits(src: &str, needle: &str, require_right_boundary: bool) -> usize {
+    let mut n = 0usize;
+    for line in src.lines() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(needle) {
+            let at = from + rel;
+            let after = at + needle.len();
+            let prev_is_ident = at > 0 && is_ident_byte(bytes[at - 1]);
+            let next_is_ident = bytes.get(after).is_some_and(|b| is_ident_byte(*b));
+            if !prev_is_ident && (!require_right_boundary || !next_is_ident) {
+                n += 1;
+            }
+            from = after;
+        }
+    }
+    n
+}
+
+/// §20#G20-2 / G80-39: `application::retrieve` and its online-lane siblings (now including
+/// the §20 Planner, see [`ONLINE_LANE_FILES`]) must have zero static dependency on either
+/// reasoning provider — recall/context/continuity MUST NOT implicitly call USER_REASONING or
+/// PLATFORM_PUBLIC (§20.0). Pure text scan, same class as [`g6_db_pool_topology`] —
+/// deliberately not a `cargo tree`/dependency-graph query: the ban is about the *call graph*
+/// (or a re-export of it, hence the `byok` needle) naming either provider at all inside the
+/// online lane's own source text, not about a crate-level `Cargo.toml` dependency edge — e.g.
+/// `adapters::retrieve` legitimately lives in the same crate as `byok.rs` today, which is
+/// fine as long as `adapters/retrieve.rs`'s own source never spells out either provider or
+/// `byok`/`complete_structured*`.
+///
+/// There is deliberately no permanent positive-occurrence sentinel *inside* this scan domain
+/// (unlike [`g6_db_pool_topology`]'s `home_hits`): the rule here is "must be 0 everywhere in
+/// this domain, forever" — a legitimate non-zero home inside the domain would itself be the
+/// violation §20.0 forbids, so there is no legal place to put one. Scanner-aliveness is
+/// instead proven the way a rule with no legal positive home has to prove it (§53.3 规则3's
+/// own reasoning, applied without a permanent fixture): the `g20_2_fault_*` mutation tests
+/// below flip a synthetic copy of this same file set from 0 hits to >0 and assert the check
+/// goes red, plus a standalone `count_identifier_hits` unit test proves the matcher itself
+/// recognizes the needle text independent of any file.
+///
+/// A `Pass` additionally requires at least one scanned file to carry real content: a file
+/// that is either absent or a bare T0.x `占位模块` placeholder (see
+/// [`is_online_lane_placeholder`]) is tracked separately and, if *every* listed file is in
+/// that state, the check reports `NotApplicable` instead of a vacuous `Pass` — there being no
+/// real online call graph yet to have scanned in the first place.
+fn g20_2_no_hidden_generative_recall(root: &Path) -> Verdict {
+    let mut problems = Vec::new();
+    let mut not_yet_real = Vec::new();
+    for rel in ONLINE_LANE_FILES {
+        let path = root.join(rel);
+        let src = match fs::read_to_string(&path) {
+            Ok(src) => src,
+            Err(_) => {
+                not_yet_real.push(format!("{rel} (absent)"));
+                continue; // absent file ⇒ 0 hits, not a violation (see ONLINE_LANE_FILES doc)
+            }
+        };
+        if is_online_lane_placeholder(&src) {
+            not_yet_real.push(format!("{rel} (T0.x placeholder)"));
+        }
+        for (needle, require_right_boundary) in FORBIDDEN_GENERATIVE_NEEDLES {
+            let hits = count_identifier_hits(&src, needle, *require_right_boundary);
+            if hits > 0 {
+                problems.push(format!(
+                    "{rel}: 静态依赖 {needle} 命中 {hits} 次（§20.0 online recall/context/\
+                     continuity 禁止隐式调用生成式 provider）"
+                ));
+            }
+        }
+    }
+    if !problems.is_empty() {
+        return Verdict::Fail(problems);
+    }
+    if not_yet_real.len() == ONLINE_LANE_FILES.len() {
+        return Verdict::NotApplicable(not_yet_real.join(", "));
+    }
+    Verdict::Pass
+}
+
+/// §22.5 / §23.1②: the A1 identity (`done + open_gaps + pending == expected`) must have
+/// **exactly one** implementation workspace-wide. §22.5 freezes it verbatim: 「A1 的算式全库
+/// 只此一处，不会两边各写一遍再漂移」—— `retrieval::completeness::ledger::close`（三次独立
+/// 取数）与 `projection::stream::advance_prefix`（watermark 推进）都必须调用同一个判定，
+/// 不得各写一份表达式。
+///
+/// 扫描的是**算式形态**而不是函数名：一个复制回来的 `done + open_gaps + pending` 即使换了
+/// 变量名也会被 `open_gaps + pending` / `pending + open_gaps` 这两个片段抓到。允许出现的地方
+/// 只有算式的家（`crates/domain/src/ledger.rs`）与本检查器自己。
+pub fn g22_5_a1_sole_implementation(root: &Path) -> Verdict {
+    const HOME: &str = "crates/domain/src/ledger.rs";
+    // 算式的两种书写顺序；任一出现在 HOME 之外即为第二份实现。
+    const ARITHMETIC_SHAPES: [&str; 2] = ["open_gaps + pending", "pending + open_gaps"];
+
+    let mut strays = Vec::new();
+    let home_hits = fs::read_to_string(root.join(HOME))
+        // 带左括号做词边界：否则 `a1_holds_renamed` 含子串 `a1_holds`，改名不会被抓到
+        // （本闸自己第一版就踩了这个，变异测试当场抓出）。
+        .map(|s| s.matches("pub fn a1_holds(").count())
+        .unwrap_or(0);
+    for (path, source) in read_files(&walk_files(root, &["rs"])) {
+        let disp = display(root, &path);
+        if disp.ends_with(SELF_FILE) {
+            continue; // 本文件逐字包含这些片段作为判据
+        }
+        let hits: usize = source
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| {
+                ARITHMETIC_SHAPES
+                    .iter()
+                    .map(|shape| l.matches(shape).count())
+                    .sum::<usize>()
+            })
+            .sum();
+        if hits == 0 {
+            continue;
+        }
+        if disp.ends_with(HOME) {
+            continue; // 家里怎么写算式由它自己决定（当前是 saturating_add，防回绕）
+        } else {
+            strays.push(format!(
+                "{disp}: A1 arithmetic written here ({hits} site(s))"
+            ));
+        }
+    }
+
+    // 活哨兵（§53.3 规则3 同款）：家里必须**恰好**定义一次 `a1_holds`。算式的书写形式由家
+    // 自己决定（当前是 `saturating_add`，防回绕成假闭合），所以哨兵钉在定义上而不是字面算式
+    // 上——否则家一改写法，整道闸就会静默失明。
+    if home_hits != 1 {
+        strays.push(format!(
+            "positive sentinel: {HOME} defines `pub fn a1_holds` {home_hits} time(s), expected \
+             exactly 1 (§53.3 规则3 同款——扫描器失明或算式的家被掏空)"
+        ));
+    }
+
+    if strays.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(strays)
+    }
+}
+
 pub fn run(_args: &[String]) -> i32 {
     let root = workspace_root();
     let checks: Vec<(&str, Verdict)> = vec![
@@ -2106,6 +2449,18 @@ pub fn run(_args: &[String]) -> i32 {
         (
             "§11.8 (classify sole construction point)",
             g11_8_classify_sole_construction_point(&root),
+        ),
+        (
+            "§20#G20-2 / G80-39 (online recall 无隐藏生成调用)",
+            g20_2_no_hidden_generative_recall(&root),
+        ),
+        (
+            "§23.1② (LedgerCounts 字段集恰为 6)",
+            g23_1_ledger_counts_exactly_six_fields(&root),
+        ),
+        (
+            "§22.5 (A1 算式全库只此一处)",
+            g22_5_a1_sole_implementation(&root),
         ),
     ];
 
@@ -3544,5 +3899,492 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    // -- §20#G20-2 / G80-39: online recall/context/continuity — zero static dependency on
+    // any reasoning provider ----------------------------------------------------------------
+
+    /// Standalone proof the matcher itself recognizes the needle text — independent of any
+    /// file — since this rule has no legal permanent positive-hit fixture inside its own scan
+    /// domain (see [`g20_2_no_hidden_generative_recall`]'s doc for why not).
+    #[test]
+    fn count_identifier_hits_word_boundary_and_comment_rules() {
+        assert_eq!(
+            count_identifier_hits(
+                "let x = UserReasoningProvider::default();",
+                "UserReasoningProvider",
+                true
+            ),
+            1
+        );
+        assert_eq!(
+            count_identifier_hits(
+                "// UserReasoningProvider mentioned only in prose",
+                "UserReasoningProvider",
+                true
+            ),
+            0
+        );
+        // `UserReasoningProviderFactory` shares the needle as a prefix but is a different
+        // identifier — next byte is still an ident byte, so with `require_right_boundary:
+        // true` it must not count as a hit.
+        assert_eq!(
+            count_identifier_hits(
+                "struct UserReasoningProviderFactory;",
+                "UserReasoningProvider",
+                true
+            ),
+            0
+        );
+    }
+
+    /// Decisive: with `require_right_boundary: false`, `complete_structured` must count a
+    /// call to `complete_structured_with_bounded_repair` — this is the exact real call site
+    /// (`crates/adapters/src/byok.rs`) the old always-full-identifier matcher silently missed
+    /// (0 hits under the pre-fix matcher; see [`FORBIDDEN_GENERATIVE_NEEDLES`]'s doc).
+    #[test]
+    fn count_identifier_hits_prefix_mode_catches_bounded_repair_call() {
+        assert_eq!(
+            count_identifier_hits(
+                "rewrite::complete_structured_with_bounded_repair(req).await",
+                "complete_structured",
+                false
+            ),
+            1
+        );
+        // Same source, `require_right_boundary: true` (the old behavior) — 0 hits, proving
+        // this is a genuine regression the prefix mode fixes, not a redundant belt.
+        assert_eq!(
+            count_identifier_hits(
+                "rewrite::complete_structured_with_bounded_repair(req).await",
+                "complete_structured",
+                true
+            ),
+            0
+        );
+    }
+
+    /// The `byok` module-path needle: catches an aliased re-export that names neither
+    /// provider trait nor `complete_structured*` directly.
+    #[test]
+    fn count_identifier_hits_byok_needle() {
+        assert_eq!(
+            count_identifier_hits(
+                "use humaux_adapters::byok::complete_structured_with_bounded_repair as rewrite;",
+                "byok",
+                true
+            ),
+            1
+        );
+        // The current repo's only pre-existing mention is prose in a `//!` doc comment —
+        // must not count.
+        assert_eq!(
+            count_identifier_hits(
+                "//! names either type and never imports `humaux_adapters::byok` or anything",
+                "byok",
+                true
+            ),
+            0
+        );
+    }
+
+    /// Minimal, realistic fixture for the four §20.0 online-lane files; `retrieve_extra` is
+    /// spliced into `application::retrieve`'s body to carry the injected fault in the tests
+    /// below (empty string ⇒ the clean/green baseline).
+    fn write_online_lane_fixture(tmp: &Path, retrieve_extra: &str) {
+        for d in [
+            "crates/application/src",
+            "crates/domain/src",
+            "crates/adapters/src",
+        ] {
+            fs::create_dir_all(tmp.join(d)).unwrap();
+        }
+        fs::write(
+            tmp.join("crates/application/src/retrieve.rs"),
+            format!(
+                "//! application::retrieve — pure orchestration entry point (§20.0).\n\
+                 pub enum QueryTransform {{ Deterministic }}\n\
+                 pub fn resolve_profile() -> QueryTransform {{ QueryTransform::Deterministic }}\n\
+                 {retrieve_extra}"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("crates/application/src/continuity.rs"),
+            "//! application::continuity — placeholder.\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("crates/domain/src/context.rs"),
+            "//! domain::context — placeholder (§25.4 Mandatory Context Lane).\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("crates/adapters/src/retrieve.rs"),
+            "//! adapters::retrieve — recall_with_overlay (§15.5) lives here.\n\
+             pub fn recall_with_overlay() {}\n",
+        )
+        .unwrap();
+    }
+
+    /// Positive control: the real workspace's online-lane files are clean today.
+    #[test]
+    fn g20_2_real_repo_is_green() {
+        assert_eq!(
+            g20_2_no_hidden_generative_recall(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn g20_2_clean_fixture_is_green() {
+        let tmp = fresh_tmp("g20-2-green");
+        write_online_lane_fixture(&tmp, "");
+        assert_eq!(g20_2_no_hidden_generative_recall(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 a: a bare `dyn UserReasoningProvider` reference sneaks into the orchestration
+    /// entry point ⇒ static dependency 0→1 ⇒ red, and the offending file is named.
+    #[test]
+    fn g20_2_fault_user_reasoning_provider_reference_is_red() {
+        let tmp = fresh_tmp("g20-2-user");
+        write_online_lane_fixture(
+            &tmp,
+            "fn sneaky(p: &dyn UserReasoningProvider) { let _ = p; }\n",
+        );
+        match g20_2_no_hidden_generative_recall(&tmp) {
+            Verdict::Fail(lines) => assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("UserReasoningProvider") && l.contains("retrieve.rs")),
+                "{lines:?}"
+            ),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Same shape, `PublicReasoningProvider` half — proves both needles are live, not just
+    /// whichever one happens to have a real trait definition in the workspace today.
+    #[test]
+    fn g20_2_fault_public_reasoning_provider_reference_is_red() {
+        let tmp = fresh_tmp("g20-2-public");
+        write_online_lane_fixture(
+            &tmp,
+            "fn sneaky(p: &dyn PublicReasoningProvider) { let _ = p; }\n",
+        );
+        match g20_2_no_hidden_generative_recall(&tmp) {
+            Verdict::Fail(lines) => assert!(
+                lines.iter().any(|l| l.contains("PublicReasoningProvider")),
+                "{lines:?}"
+            ),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (task item 3, decisive acceptance): insert one `complete_structured()` generative
+    /// query rewrite call ahead of recall ⇒ static dependency 0→1 on both the trait name and
+    /// the method name ⇒ red. This is the exact injection the spec's own G20-2/G80-39 text
+    /// names ("在 recall 前插一个 complete_structured() query rewrite").
+    #[test]
+    fn g20_2_fault_complete_structured_call_before_recall_is_red() {
+        let tmp = fresh_tmp("g20-2-rewrite");
+        write_online_lane_fixture(
+            &tmp,
+            "async fn recall(provider: &dyn UserReasoningProvider) {\n    \
+             let _rewritten = provider.complete_structured().await;\n    \
+             // then the real deterministic recall would run\n\
+             }\n",
+        );
+        match g20_2_no_hidden_generative_recall(&tmp) {
+            Verdict::Fail(lines) => {
+                assert!(
+                    lines.iter().any(|l| l.contains("complete_structured")),
+                    "{lines:?}"
+                );
+                assert!(
+                    lines.iter().any(|l| l.contains("UserReasoningProvider")),
+                    "{lines:?}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (real-world repro that exposed the blocker this fix closes): the aliased-import
+    /// shape from the spec's own `byok.rs` — `complete_structured_with_bounded_repair` reached
+    /// through a `use ... as rewrite;` re-export, called from a `pub` fn that never spells out
+    /// `UserReasoningProvider` at the call site at all. Under the pre-fix matcher (full-
+    /// identifier `complete_structured` + no `byok` needle) this fixture stayed
+    /// `Verdict::Pass`; it must now be red on both needles.
+    #[test]
+    fn g20_2_fault_bounded_repair_via_byok_alias_is_red() {
+        let tmp = fresh_tmp("g20-2-byok-alias");
+        write_online_lane_fixture(
+            &tmp,
+            "use humaux_adapters::byok::complete_structured_with_bounded_repair as rewrite;\n\
+             pub async fn sneaky_rewrite() {\n    \
+             let _ = rewrite(Default::default()).await;\n\
+             }\n",
+        );
+        match g20_2_no_hidden_generative_recall(&tmp) {
+            Verdict::Fail(lines) => {
+                assert!(
+                    lines.iter().any(|l| l.contains("complete_structured")),
+                    "{lines:?}"
+                );
+                assert!(lines.iter().any(|l| l.contains("byok")), "{lines:?}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A scan domain where every listed file is either absent or a bare T0.x placeholder must
+    /// report `NotApplicable`, not a vacuous `Pass` — there is no real call graph to have
+    /// cleared the rule against yet (see [`g20_2_no_hidden_generative_recall`]'s doc).
+    #[test]
+    fn g20_2_all_placeholder_scan_domain_is_not_applicable() {
+        let tmp = fresh_tmp("g20-2-na");
+        for d in [
+            "crates/application/src",
+            "crates/domain/src",
+            "crates/adapters/src",
+        ] {
+            fs::create_dir_all(tmp.join(d)).unwrap();
+        }
+        for rel in [
+            "crates/application/src/retrieve.rs",
+            "crates/application/src/continuity.rs",
+            "crates/domain/src/context.rs",
+            "crates/adapters/src/retrieve.rs",
+        ] {
+            fs::write(tmp.join(rel), "//! 占位模块（T0.x 任务填充）。\n").unwrap();
+        }
+        match g20_2_no_hidden_generative_recall(&tmp) {
+            Verdict::NotApplicable(missing) => {
+                assert!(missing.contains("retrieve.rs"), "{missing}");
+            }
+            other => panic!("expected NotApplicable, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // -- §11.8 / §22.5: classify() sole-construction-point sites, path-qualified ----------
+
+    /// Positive control against the real repo: both known sites have landed
+    /// (`domain::consolidate::classify` from an earlier wave, `retrieval::completeness::
+    /// classify` from this task) and the workspace-wide total matches — no stray third
+    /// `fn classify(` exists anywhere else.
+    #[test]
+    fn classify_sole_construction_passes_on_real_repo() {
+        assert_eq!(
+            g11_8_classify_sole_construction_point(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    fn write_classify_sites_fixture(
+        tmp: &Path,
+        consolidate_count: usize,
+        completeness_count: usize,
+    ) {
+        let domain_dir = tmp.join("crates/domain/src");
+        let retrieval_dir = tmp.join("crates/retrieval/src");
+        fs::create_dir_all(&domain_dir).unwrap();
+        fs::create_dir_all(&retrieval_dir).unwrap();
+        let mut consolidate_src = String::new();
+        for i in 0..consolidate_count {
+            consolidate_src.push_str(&format!("pub fn classify(id: u64) -> u64 {{ id + {i} }}\n"));
+        }
+        let mut completeness_src = String::new();
+        for i in 0..completeness_count {
+            completeness_src.push_str(&format!(
+                "pub(crate) fn classify(x: u64) -> u64 {{ x + {i} }}\n"
+            ));
+        }
+        fs::write(domain_dir.join("consolidate.rs"), consolidate_src).unwrap();
+        fs::write(retrieval_dir.join("completeness.rs"), completeness_src).unwrap();
+    }
+
+    #[test]
+    fn classify_sole_construction_passes_with_exactly_one_each() {
+        let tmp = fresh_tmp("g11-8-green");
+        write_classify_sites_fixture(&tmp, 1, 1);
+        assert_eq!(g11_8_classify_sole_construction_point(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (this task's own finding, decisive acceptance): a second `fn classify(` landing
+    /// in `retrieval::completeness.rs` alongside the first (e.g. a copy-paste duplicate) ⇒
+    /// that file's own count is 2 != 1 ⇒ red. This is exactly the regression a bare
+    /// workspace-wide `== 1` could no longer detect once two legitimate sites coexist — the
+    /// per-path assertion is what makes it observable again.
+    #[test]
+    fn classify_sole_construction_fault_duplicate_in_completeness_is_red() {
+        let tmp = fresh_tmp("g11-8-red-duplicate");
+        write_classify_sites_fixture(&tmp, 1, 2);
+        match g11_8_classify_sole_construction_point(&tmp) {
+            Verdict::Fail(lines) => assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("completeness.rs") && l.contains("found 2")),
+                "{lines:?}"
+            ),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (stray-site regression): a third, unlisted `fn classify(` appearing anywhere else
+    /// in the workspace must still be red even though both known sites individually hold
+    /// exactly 1 — this is the cross-check the workspace-wide total/`applicable` comparison
+    /// exists for.
+    #[test]
+    fn classify_sole_construction_fault_stray_third_site_is_red() {
+        let tmp = fresh_tmp("g11-8-red-stray");
+        write_classify_sites_fixture(&tmp, 1, 1);
+        let stray_dir = tmp.join("crates/retrieval/src");
+        fs::write(
+            stray_dir.join("stray.rs"),
+            "pub fn classify(x: u64) -> u64 { x }\n",
+        )
+        .unwrap();
+        match g11_8_classify_sole_construction_point(&tmp) {
+            Verdict::Fail(lines) => assert!(
+                lines.iter().any(|l| l.contains("workspace-wide")),
+                "{lines:?}"
+            ),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // -- §23.1② G23-1: LedgerCounts field set is exactly 6 --------------------------------
+
+    /// Positive control against the real repo: `ledger::close` has landed (this task), and
+    /// `LedgerCounts`'s six fields must match §23.1②'s frozen set exactly.
+    #[test]
+    fn ledger_counts_six_fields_passes_on_real_repo() {
+        assert_eq!(
+            g23_1_ledger_counts_exactly_six_fields(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    fn write_ledger_counts_fixture(tmp: &Path, body: &str) {
+        let dir = tmp.join("crates/retrieval/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("completeness.rs"),
+            format!("pub struct LedgerCounts {{\n{body}}}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ledger_counts_six_fields_passes_with_exactly_six() {
+        let tmp = fresh_tmp("g23-1-green");
+        write_ledger_counts_fixture(
+            &tmp,
+            "    expected: u64,\n    done: u64,\n    deleted: u64,\n    skipped: u64,\n    \
+             open_gaps: u64,\n    pending: u64,\n",
+        );
+        assert_eq!(g23_1_ledger_counts_exactly_six_fields(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (decisive acceptance, §23.1②'s own worked example): adding a 7th `visible: u64`
+    /// field ⇒ `7 != 6` ⇒ red. This is the exact regression §23.1② names as the one that
+    /// would let G23-2's two injections stop being observable (numerator folded back into the
+    /// ledger struct, all counts taken from PostgreSQL only).
+    #[test]
+    fn ledger_counts_fault_seven_fields_with_visible_is_red() {
+        let tmp = fresh_tmp("g23-1-red");
+        write_ledger_counts_fixture(
+            &tmp,
+            "    expected: u64,\n    done: u64,\n    deleted: u64,\n    skipped: u64,\n    \
+             open_gaps: u64,\n    pending: u64,\n    visible: u64,\n",
+        );
+        match g23_1_ledger_counts_exactly_six_fields(&tmp) {
+            Verdict::Fail(lines) => {
+                assert!(lines.iter().any(|l| l.contains('7')), "{lines:?}");
+                assert!(lines.iter().any(|l| l.contains("visible")), "{lines:?}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn ledger_counts_not_applicable_when_type_absent() {
+        let tmp = fresh_tmp("g23-1-na");
+        fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(
+            g23_1_ledger_counts_exactly_six_fields(&tmp),
+            Verdict::NotApplicable(
+                "retrieval::completeness::LedgerCounts (§22.5, ledger::close 尚未交付)".to_string()
+            )
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+    /// §22.5 A1 闸：真仓库必须绿（算式只在 domain::ledger 一处）。
+    #[test]
+    fn g22_5_a1_real_repo_is_green() {
+        assert_eq!(g22_5_a1_sole_implementation(&real_root()), Verdict::Pass);
+    }
+
+    /// 注错 a：把算式抄回第二个 crate ⇒ 红并点名文件。
+    #[test]
+    fn g22_5_a1_fault_second_copy_elsewhere_is_red() {
+        let tmp = fresh_tmp("a1-second-copy");
+        write_a1_fixture(&tmp, "pub fn a1_holds(e: u64) -> bool { e == e }");
+        fs::create_dir_all(tmp.join("crates/projection/src")).unwrap();
+        fs::write(
+            tmp.join("crates/projection/src/stream.rs"),
+            "fn advance() -> bool { expected == done + open_gaps + pending }\n",
+        )
+        .unwrap();
+        match g22_5_a1_sole_implementation(&tmp) {
+            Verdict::Fail(lines) => {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("crates/projection/src/stream.rs"))
+                )
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// 注错 b：算式的家被掏空（定义没了）⇒ 哨兵必须红，否则整道闸静默失明。
+    #[test]
+    fn g22_5_a1_fault_dead_home_sentinel_is_red() {
+        let tmp = fresh_tmp("a1-dead-home");
+        write_a1_fixture(&tmp, "// the judgment used to live here\n");
+        match g22_5_a1_sole_implementation(&tmp) {
+            Verdict::Fail(lines) => assert!(lines.iter().any(|l| l.contains("sentinel"))),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// 注错 c：家里改名（`a1_holds_renamed`）——子串仍含 `a1_holds`，
+    /// 没有词边界的匹配会漏掉它。本闸第一版正是这么漏的。
+    #[test]
+    fn g22_5_a1_fault_renamed_home_fn_is_red() {
+        let tmp = fresh_tmp("a1-renamed-home");
+        write_a1_fixture(&tmp, "pub fn a1_holds_renamed(e: u64) -> bool { e == e }");
+        match g22_5_a1_sole_implementation(&tmp) {
+            Verdict::Fail(lines) => assert!(lines.iter().any(|l| l.contains("sentinel"))),
+            other => panic!("expected Fail (word-boundary), got {other:?}"),
+        }
+    }
+
+    fn write_a1_fixture(tmp: &Path, home_body: &str) {
+        fs::create_dir_all(tmp.join("crates/domain/src")).unwrap();
+        fs::write(tmp.join("crates/domain/src/ledger.rs"), home_body).unwrap();
     }
 }

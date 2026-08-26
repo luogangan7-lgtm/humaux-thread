@@ -3,8 +3,9 @@
 //! Implements every part of §17: collection/index request-body shaping, payload encoding, the
 //! [`Condition`](humaux_projection::dense::Condition) → Qdrant filter JSON translation, the
 //! §17.5 HA consistency profile, the §17.4 search-visible confirmation contract
-//! ([`verify_visible`]/[`VisibilityConfirmation`]), and — as of ADR-0003 — real HTTP wiring for
-//! `upsert`/`scroll_by_ids`/`count`/[`verify_visible_via_transport`] over
+//! ([`verify_visible`]/[`VisibilityConfirmation`]), §23.1②/§23.4 G23-2's retrieval-face
+//! tombstone overlay ([`overlay_filter`]/[`count_visible`]), and — as of ADR-0003 — real HTTP
+//! wiring for `upsert`/`scroll_by_ids`/`count`/[`verify_visible_via_transport`] over
 //! [`IntraCellHttpTransport`]. `crates/adapters/Cargo.toml` still has no HTTP client
 //! dependency: every wire call below takes `&dyn IntraCellHttpTransport` (an injected
 //! `humaux-infra-cell` trait object), the same DI shape `humaux_domain::egress::ExternalCall`
@@ -470,6 +471,71 @@ pub fn count_body(filter: &VisibleCountFilter) -> Value {
 /// (a tombstone recorded before the point was ever indexed).
 pub fn visible_count(raw_count: u64, tombstone_count: u64) -> u64 {
     raw_count.saturating_sub(tombstone_count)
+}
+
+/// §23.1②/§23.4 G23-2 — the retrieval-face overlay predicate: a `must_not` clause naming
+/// currently-tombstoned point ids, folded into `base_filter` (any Qdrant filter JSON object —
+/// [`condition_to_filter`]'s output, [`count_body`]'s inner filter, or an empty `{}`). The
+/// single builder every Qdrant-bound lane (dense scroll/search, sparse scroll/search,
+/// [`count_visible`]) must route its tombstoned ids through, instead of each call site
+/// re-deriving the `has_id` shape by hand (§23.1②: "overlay 是一个谓词，不是一个计数技巧" — the
+/// predicate belongs in one place, not re-derived per caller). A no-op (returns `base_filter`
+/// unchanged) when `tombstoned` is empty.
+pub fn overlay_filter(base_filter: Value, tombstoned: &[PointId]) -> Value {
+    if tombstoned.is_empty() {
+        return base_filter;
+    }
+    let mut obj = match base_filter {
+        Value::Object(o) => o,
+        // Any non-object base (in practice only ever `Value::Null`/`{}` from a caller with no
+        // other predicate) still needs a `must_not`-bearing object to fold into.
+        _ => serde_json::Map::new(),
+    };
+    let ids: Vec<Value> = tombstoned.iter().map(|id| id.to_json()).collect();
+    obj.entry("must_not".to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .expect("must_not is only ever constructed as an array by this function")
+        .push(json!({ "has_id": ids }));
+    Value::Object(obj)
+}
+
+/// §23.1②'s `visible`, purge-order-independent by construction: the tombstone overlay
+/// ([`overlay_filter`]) is folded into the *same* Qdrant `count` request as the caller's own
+/// filter, so the answer is correct whether or not §37 step 5's physical purge has run yet —
+/// unlike [`visible_count`]'s raw-count-minus-ledger-`deleted` arithmetic, which double-
+/// subtracts a tombstoned seq whose point was never indexed (or was already purged) and gives
+/// two different "correct" call shapes depending on purge order (major finding: "getting it
+/// wrong is not cosmetic"). This is the query-time replacement for that call site;
+/// [`visible_count`] itself is unchanged (still used where only the two raw numbers, not a live
+/// transport, are available).
+pub async fn count_visible(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+    filter: &VisibleCountFilter,
+    tombstoned: &[PointId],
+) -> Result<u64, QdrantTransportError> {
+    validate_collection(collection)?;
+    let body = json!({
+        "filter": overlay_filter(condition_to_filter(&filter.0), tombstoned),
+        "exact": true,
+    });
+    let result = call(
+        transport,
+        permit,
+        IntraCellMethod::Post,
+        format!("/collections/{collection}/points/count"),
+        Some(body),
+    )
+    .await?;
+    result
+        .get("result")
+        .and_then(|r| r.get("count"))
+        .and_then(|c| c.as_u64())
+        .ok_or_else(|| {
+            QdrantTransportError::UnexpectedResponseShape("missing result.count".to_string())
+        })
 }
 
 // ============================================================================

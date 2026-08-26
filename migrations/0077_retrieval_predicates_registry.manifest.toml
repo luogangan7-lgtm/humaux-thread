@@ -1,0 +1,23 @@
+# §46.1 migration manifest (G46-1 / G80-37). §20.1 predicate registry: one new `control`
+# table, additive only, no existing table touched — same shape as
+# 0032_invitation_referral.manifest.toml.
+
+migration_id = "0077_retrieval_predicates_registry"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('control.retrieval_predicates') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.retrieval_predicates') is not null
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'control.retrieval_predicates'::regclass)
+  and exists (
+    select 1 from control.retrieval_predicates where predicate_id = 'rejected_decisions_v1'
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS control.retrieval_predicates CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero pre-existing rows at risk)"

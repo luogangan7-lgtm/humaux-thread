@@ -1,0 +1,39 @@
+# §46.1 migration manifest (G46-1 / G80-37). Adds one index (additive, index-only) and
+# corrects one already-seeded row's `enumerable_scope` text column (single-row UPDATE, no
+# schema change) — same reversible shape class as 0078, plus a data correction that is itself
+# trivially re-appliable (idempotent SET to the same literal).
+
+migration_id = "0079_retrieval_predicates_scope_and_index_fix"
+class = "REVERSIBLE"
+
+precheck = """
+select
+  (not exists (
+    select 1 from pg_indexes
+    where schemaname = 'private' and tablename = 'memory_records'
+      and indexname = 'idx_memory_records_rejected_decisions_v1_cols'
+  ))
+  and (select enumerable_scope from control.retrieval_predicates where predicate_id = 'rejected_decisions_v1')
+      = 'private.memory_records WHERE visibility_workspace_id = $1'
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from pg_indexes
+    where schemaname = 'private' and tablename = 'memory_records'
+      and indexname = 'idx_memory_records_rejected_decisions_v1_cols'
+  )
+  and (select enumerable_scope from control.retrieval_predicates where predicate_id = 'rejected_decisions_v1')
+      = 'private.memory_records WHERE tenant_id = $1 AND visibility_workspace_id = $2'
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback:
+DROP INDEX IF EXISTS private.idx_memory_records_rejected_decisions_v1_cols;
+UPDATE control.retrieval_predicates SET enumerable_scope = 'private.memory_records WHERE visibility_workspace_id = $1' WHERE predicate_id = 'rejected_decisions_v1';
+"""
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (index-only DDL + single-row text-column UPDATE on platform config, not tenant data)"

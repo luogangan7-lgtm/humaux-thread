@@ -19,6 +19,7 @@ pub mod remember;
 pub mod retrieve;
 pub mod s3;
 pub mod scheduler;
+pub mod selection_repo;
 pub mod serving_repo;
 pub mod stream_repo;
 pub mod valkey;

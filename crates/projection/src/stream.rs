@@ -141,8 +141,10 @@ pub fn advance_prefix(snapshot: StreamLedgerSnapshot) -> Result<u64, Inconsisten
         contiguous_done_prefix,
     } = snapshot;
 
-    // §15.4 frozen identity: expected == done + open_gaps + pending.
-    if expected != done + open_gaps + pending {
+    // §15.4 frozen identity, evaluated by §22.5's sole A1 implementation
+    // (`humaux_domain::ledger::a1_holds`) rather than a second copy of the expression here —
+    // §22.5: 「A1 的算式全库只此一处，不会两边各写一遍再漂移」.
+    if !humaux_domain::ledger::a1_holds(expected, done, open_gaps, pending) {
         return Err(Inconsistent);
     }
     // The two independent "how far has this stream issued" numbers must agree — a drift here

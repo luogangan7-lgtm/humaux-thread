@@ -1,0 +1,42 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T6.3: ops.selection_snapshot_items was a zero-row §48 skeleton table (0008_ops_core.sql)
+# with no tenant_id/RLS/keyset-ordering column — this adds all three.
+
+migration_id = "0084_selection_snapshot_items_rls"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('ops.selection_snapshot_items') is not null
+  and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'ops' and table_name = 'selection_snapshot_items'
+      and column_name = 'tenant_id'
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (select is_nullable from information_schema.columns
+   where table_schema = 'ops' and table_name = 'selection_snapshot_items'
+     and column_name = 'tenant_id') = 'NO'
+  and (select is_nullable from information_schema.columns
+       where table_schema = 'ops' and table_name = 'selection_snapshot_items'
+         and column_name = 'ordinal') = 'NO'
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'ops.selection_snapshot_items'::regclass)
+  and to_regclass('ops.selection_snapshot_items_snapshot_ordinal') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP POLICY selection_snapshot_items_tenant ON ops.selection_snapshot_items;
+          ALTER TABLE ops.selection_snapshot_items DISABLE ROW LEVEL SECURITY;
+          DROP INDEX ops.selection_snapshot_items_snapshot_ordinal;
+          ALTER TABLE ops.selection_snapshot_items DROP COLUMN tenant_id, DROP COLUMN ordinal;
+          (safe — table has zero rows in every environment this migration has run; no INSERT
+          target for it exists in the codebase before this task's adapters::selection_repo)
+"""
+
+backup_restore_requirement = "none (ADD COLUMN NOT NULL + unique index + RLS enable on a zero-row table, no data migration, no default-value backfill)"

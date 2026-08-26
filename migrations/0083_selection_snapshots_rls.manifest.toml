@@ -1,0 +1,40 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T6.3: ops.selection_snapshots was a zero-row §48 skeleton table (0008_ops_core.sql) with no
+# RLS yet — this adds the two Mode B cursor columns (§20.4) and enables tenant RLS.
+
+migration_id = "0083_selection_snapshots_rls"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('ops.selection_snapshots') is not null
+  and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'ops' and table_name = 'selection_snapshots'
+      and column_name = 'query_fingerprint'
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (select is_nullable from information_schema.columns
+   where table_schema = 'ops' and table_name = 'selection_snapshots'
+     and column_name = 'query_fingerprint') = 'NO'
+  and (select is_nullable from information_schema.columns
+       where table_schema = 'ops' and table_name = 'selection_snapshots'
+         and column_name = 'expires_at') = 'NO'
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'ops.selection_snapshots'::regclass)
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP POLICY selection_snapshots_tenant ON ops.selection_snapshots;
+          ALTER TABLE ops.selection_snapshots DISABLE ROW LEVEL SECURITY;
+          ALTER TABLE ops.selection_snapshots DROP COLUMN query_fingerprint, DROP COLUMN expires_at;
+          (safe — table has zero rows in every environment this migration has run; no INSERT
+          target for it exists in the codebase before this task's adapters::selection_repo)
+"""
+
+backup_restore_requirement = "none (ADD COLUMN NOT NULL + RLS enable on a zero-row table, no data migration, no default-value backfill)"

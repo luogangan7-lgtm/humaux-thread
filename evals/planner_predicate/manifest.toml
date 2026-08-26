@@ -1,0 +1,17 @@
+# §55.3.1 BenchmarkManifest for the `planner_predicate` set (§20.3 confusion matrix).
+# Calculator: crates/retrieval/src/predicate_eval.rs (`parse_dataset_tsv` + `run`).
+# Harness: crates/retrieval/tests/planner_predicate_eval.rs.
+
+set_id = "planner_predicate"
+source_kind = "internal"
+source_ref = "evals/planner_predicate/dataset.tsv"
+source_version = "53c82a5"
+license = "internal-only, not redistributed"
+# sha256 of dataset.tsv, recomputed by `shasum -a 256 evals/planner_predicate/dataset.tsv` at
+# time of writing; recompute and update this value whenever dataset.tsv changes.
+fixture_sha256 = "d7d788ea33cab7a3e94297e7042f76c3323fca15f351e82bc5d342c4c50c7db9"
+fixed_denominator = 21
+decision_depth = "exact_equality"
+profile_fingerprint_policy = "recompute on any change to QUANTIFIERS, surface_patterns, or the registry row set (crates/retrieval/src/planner.rs)"
+measured_at = "2026-08-26"
+frozen_by = "53c82a5"

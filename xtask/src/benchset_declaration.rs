@@ -493,14 +493,33 @@ mod tests {
     /// 真实 spec 现状：9 个集合全部 `NOT_DECLARED`（§55.3 七字段没有任何一行齐全）。
     #[test]
     fn baseline_real_spec_all_9_rows_not_declared() {
+        // `planner_predicate` (T6.1, §20.3) is exempt: its row now carries a real 21-item
+        // eval-set measurement (evals/planner_predicate/dataset.tsv, crates/retrieval/tests/
+        // planner_predicate_eval.rs) and is genuinely `DECLARED` — same "pin expires when the
+        // underlying gap is actually closed" pattern the ADR-0001 comment below documents for
+        // `memory_security_lifecycle`'s name-alignment pin.
+        const DECLARED_EXEMPT: &[&str] = &["planner_predicate"];
         let spec = real_spec_md();
         let table = parse_declaration_table(&spec);
         for row in &table {
+            let set_id = strip_backticks(&row[0]);
             let (declared, missing) = row_declared(row);
+            if DECLARED_EXEMPT.contains(&set_id.as_str()) {
+                // `continue` alone (the pre-fix shape) drops coverage of this row entirely
+                // rather than flipping it — the pin then says nothing about the row's actual
+                // state, and a regression back to NOT_DECLARED would pass silently. Assert the
+                // exempt row is still genuinely `DECLARED` before skipping the below.
+                assert!(
+                    declared,
+                    "{set_id} is DECLARED_EXEMPT but row_declared() now says NOT_DECLARED \
+                     (missing={missing:?}) — the pin is stale, update the exemption or fix the \
+                     spec row"
+                );
+                continue;
+            }
             assert!(
                 !declared,
-                "{} 在真实 spec 上应为 NOT_DECLARED，实际判 declared，missing={missing:?}",
-                strip_backticks(&row[0])
+                "{set_id} 在真实 spec 上应为 NOT_DECLARED，实际判 declared，missing={missing:?}"
             );
         }
     }
