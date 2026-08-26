@@ -1,0 +1,80 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T5.1 (§16.1): completes projection.retrieval_cards's nine-field Projection record shape
+# without editing the already-applied 0007.
+
+migration_id = "0063_retrieval_cards_projection_record_fields"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'retrieval_cards'
+      and column_name in (
+        'projection_type', 'projection_version', 'source_stream_seq',
+        'evidence_payload_sha256', 'context_snapshot_seq', 'source_hash',
+        'model_id', 'model_revision', 'status'
+      )
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (select count(*) from information_schema.columns
+   where table_schema = 'projection' and table_name = 'retrieval_cards'
+     and column_name in (
+       'projection_type', 'projection_version', 'source_stream_seq',
+       'evidence_payload_sha256', 'context_snapshot_seq', 'source_hash',
+       'model_id', 'model_revision', 'status'
+     )
+     and is_nullable = 'NO') = 9
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_projection_type_known'
+      and conrelid = 'projection.retrieval_cards'::regclass
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_evidence_payload_sha256_nonempty'
+      and conrelid = 'projection.retrieval_cards'::regclass
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_status_known'
+      and conrelid = 'projection.retrieval_cards'::regclass
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_evidence_payload_sha256_width'
+      and conrelid = 'projection.retrieval_cards'::regclass
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_source_hash_width'
+      and conrelid = 'projection.retrieval_cards'::regclass
+  )
+  and exists (
+    select 1 from pg_proc
+    where proname = 'bytea_array_all_32_bytes'
+      and pronamespace = 'projection'::regnamespace
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE projection.retrieval_cards
+            DROP COLUMN projection_type, DROP COLUMN projection_version,
+            DROP COLUMN source_stream_seq, DROP COLUMN evidence_payload_sha256,
+            DROP COLUMN context_snapshot_seq, DROP COLUMN source_hash,
+            DROP COLUMN model_id, DROP COLUMN model_revision, DROP COLUMN status;
+          DROP FUNCTION projection.bytea_array_all_32_bytes(bytea[]);
+          (CHECK constraints and comments drop automatically with their columns; safe —
+          table has zero rows anywhere this migration has run, no INSERT target for it
+          exists in the codebase yet. The DROP FUNCTION line was missing — its absence left
+          the migration not re-appliable after its own documented rollback, since re-running
+          this file's CREATE FUNCTION would then abort on a name collision; code-review
+          finding, minor)
+"""
+
+backup_restore_requirement = "none (nine ADD COLUMN + five CHECK constraints, zero rows in the table anywhere this has run)"

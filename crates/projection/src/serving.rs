@@ -1,1 +1,378 @@
-//! Phase 5 T5.2/5.3: serving/shadow 读路由 + serving_version() 唯一入口 + 无裁量切换（§16.2/16.3）。占位：Phase 5 wave 实现；判据出处见 spec 家章。
+//! `projection::serving` — §16.2 换代期读路由 identity + §16.3 无裁量切换判据 (T5.2/T5.3).
+//!
+//! Same split as `projection::stream` / `adapters::stream_repo`: this module holds the pure
+//! (no-IO) half — the stream-family key and the three-criteria switch evaluator — so the
+//! "无裁量口" arithmetic is unit-testable without a database and cannot itself be tempted into
+//! reusing a query result across two supposedly-independent checks. The SQL (`serving_version`
+//! read, the atomic switch `UPDATE`) lives in `humaux_adapters::serving_repo` against
+//! `&RetrievalWorkerDbPool` / `&MaintenanceDbPool` (§6.2.2 grant matrix: only `role_maintenance`
+//! holds `UPDATE(serving, shadow)` on `projection.stream_checkpoints`).
+
+use humaux_domain::ids::TenantId;
+use uuid::Uuid;
+
+use crate::stream::StreamKey;
+
+/// §15.1's six-column key minus `projection_version` — the identity `ux_serving_one` (§16.2)
+/// constrains to at most one `serving = true` row: `(tenant_id, scope_kind, scope_id, domain,
+/// projection_kind)`. `projection_version` is deliberately excluded here — it is the column
+/// the family can hold *multiple* rows for (one `serving`, at most one `shadow`, and any
+/// number of retired non-serving rows kept as rollback targets, §16.3).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StreamFamily {
+    pub tenant_id: TenantId,
+    pub scope_kind: String,
+    pub scope_id: Uuid,
+    pub domain: String,
+    pub projection_kind: String,
+}
+
+impl StreamFamily {
+    /// Builds a family from its five identity columns.
+    pub fn new(
+        tenant_id: TenantId,
+        scope_kind: impl Into<String>,
+        scope_id: Uuid,
+        domain: impl Into<String>,
+        projection_kind: impl Into<String>,
+    ) -> Self {
+        Self {
+            tenant_id,
+            scope_kind: scope_kind.into(),
+            scope_id,
+            domain: domain.into(),
+            projection_kind: projection_kind.into(),
+        }
+    }
+
+    /// Composes a full six-column [`StreamKey`] by attaching one `projection_version` to this
+    /// family — the one place the switch/serving-read call sites build a `StreamKey` from a
+    /// family + a version string, so that composition isn't hand-rolled differently at each
+    /// call site.
+    pub fn with_version(&self, projection_version: impl Into<String>) -> StreamKey {
+        StreamKey::new(
+            self.tenant_id,
+            self.scope_kind.clone(),
+            self.scope_id,
+            self.domain.clone(),
+            self.projection_kind.clone(),
+            projection_version,
+        )
+    }
+}
+
+/// §16.3 判据③'s benchmark comparison, in the shape the spec names verbatim: "判据形态取 §69
+/// Continuation Gate 的 FAIL 侧". Four states, not two — `Fail` is the only state that *proves*
+/// degradation; `Inconclusive` and `CannotEstablish` both mean "not proven", and per §69
+/// ("INCONCLUSIVE ... 不得表述为『不劣于基线』") neither may be read as license to switch.
+///
+/// **Current real value**: `continuation_198_v2`'s `frozen_by` / `baseline_min` are not yet
+/// written (§69 Benchmark 集合分母声明 table: `NOT_DECLARED`, missing `frozen_by`) — until that
+/// lands, no caller can honestly produce anything but [`ContinuationVerdict::CannotEstablish`]
+/// for this field. There is no stub "always Pass" path here; wiring the real `§55`/`§69`
+/// benchmark harness is out of this task's scope (T5.2/T5.3 only owns §16.2/§16.3's read
+/// routing and switch arithmetic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationVerdict {
+    /// `new_min >= baseline_min + Δ`, gate self-check passed (§69 `PASS`).
+    Pass,
+    /// `baseline_min - new_min >= Δ` — proven degraded (§69 `FAIL`).
+    Fail,
+    /// Neither `PASS` nor `FAIL` condition reached — §69 `INCONCLUSIVE`, "不得勾选，不得表述为
+    /// 『不劣于基线』".
+    Inconclusive,
+    /// Gate's own preconditions unmet (`baseline_min`/`frozen_by`/`spread_tol` missing, or
+    /// declaration `NOT_DECLARED` per §55.3) — §69 `cannot_establish`.
+    CannotEstablish,
+}
+
+/// §16.3's three independently-taken inputs to [`evaluate_switch`]. None of these are computed
+/// by this module — that is the entire point of "无裁量口": the *inputs* come from real
+/// measurements (Qdrant `visible` counts per §23.1②, `projection.processing_gaps` per §15.1,
+/// the §69 Continuation Gate) taken by the caller, and this type only pins their shape so the
+/// evaluator can't quietly accept a partial or substituted set.
+#[derive(Debug, Clone)]
+pub struct SwitchCriteria {
+    /// §23.1②'s `visible` value for the **shadow** side, tagged with the `projection_version`
+    /// it was counted against: Qdrant count filtered by `tenant + scope + projection_version =
+    /// <shadow version>`, minus the tombstone overlay. `None` when the index count could not
+    /// be taken (§23.1②: "索引 count 取不到时输出 `visible: null`" — the same rule applies
+    /// here, not only to the envelope; a missing count is never backfilled from another
+    /// number). The version tag is what lets [`evaluate_switch`] catch a caller that
+    /// (accidentally or not) counted the *same* `projection_version` on both sides — see
+    /// [`SwitchRejection::VisibleSameVersionDeclared`].
+    pub visible_shadow: Option<(String, u64)>,
+    /// Same computation as `visible_shadow`, filtered by `projection_version = <serving
+    /// version>` instead — the spec's own warning is that this and `visible_shadow` must
+    /// differ **only** in that one filter, taken at the same instant (§16.3, §23.1②); this
+    /// type cannot enforce "same instant" across an IO boundary, but the version tag lets it
+    /// refuse a declared-but-not-actually-distinct pair, and lets the DB-layer caller
+    /// (`adapters::serving_repo::switch_projection_version`) cross-check the tag against the
+    /// real DB version before trusting the count at all.
+    pub visible_serving: Option<(String, u64)>,
+    /// `count(*)` from `projection.processing_gaps` (§15.1's sole gap-count source) filtered to
+    /// the **shadow** version's full [`StreamKey`] — §16.3's second criterion,
+    /// `shadow.open_gaps == 0`.
+    pub shadow_open_gaps: u64,
+    /// §16.3's third criterion input — see [`ContinuationVerdict`]'s doc for why this is a
+    /// 4-state enum, not a bool.
+    pub continuation: ContinuationVerdict,
+}
+
+/// One of §16.3's three criteria failed to hold. [`evaluate_switch`] collects every failing
+/// reason (not just the first) so a caller/log/test can see exactly which of the three "无裁量
+/// 口" gates blocked the switch — useful both for the G80-28 恒真闸 regression (below) and for
+/// an operator reading a rejected-switch log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchRejection {
+    /// Either side's `visible` count was unavailable (`None`), so criterion ① cannot be
+    /// evaluated at all — treated as a rejection, never silently skipped or backfilled.
+    VisibleUnavailable,
+    /// Both counts were available but unequal — `visible(shadow) != visible(serving)`.
+    VisibleMismatch,
+    /// Both sides declared the *same* `projection_version` — i.e. `visible_shadow` and
+    /// `visible_serving` were (mistakenly or maliciously) counted against one identical
+    /// version instead of the shadow/serving pair the spec requires. Comparing a count to
+    /// itself always holds, which is exactly the 恒真闸 (always-true gate) §16.3 warns about
+    /// — this rejects it at the type level rather than trusting equal counts alone.
+    VisibleSameVersionDeclared,
+    /// A declared `visible_*` tag names a `projection_version` that does not match the DB's
+    /// actual shadow/serving version for this family at switch time (checked only by the
+    /// DB-layer caller, `adapters::serving_repo::switch_projection_version`, which is the only
+    /// place that can see "actual" — this pure evaluator never sets this variant itself).
+    VisibleVersionMismatch,
+    /// `shadow.open_gaps != 0`.
+    OpenGaps,
+    /// The §69 Continuation Gate did not return `Pass` (§16.3's判据③: `Fail` proves
+    /// degradation; `Inconclusive` / `CannotEstablish` are both "not proven not-worse" and per
+    /// §69 must not be read as a pass — see [`ContinuationVerdict`]'s doc).
+    BenchmarkNotPass,
+}
+
+/// §16.3's frozen judgement: "三条全真才允许切换，任一为假直接拒绝，不存在『人工判断可以上』的
+/// 分支". A pure function on already-taken measurements is itself the enforcement of "no
+/// discretion branch" — there is no parameter here through which a caller could override a
+/// failing criterion, and every one of the three is checked (never short-circuited), so a
+/// caller inspecting `Err` sees the complete failing set, not just the first.
+///
+/// §16.3 gate ("恒真闸检测", G80-28 per this task's card): injecting "shadow 少回填 1 个点"
+/// (`visible_shadow` one less than `visible_serving`, all else held equal) must flip criterion
+/// ① from held to failed and the overall result from `Ok` to `Err` — pinned by
+/// `evaluate_switch_flips_red_when_shadow_is_missing_one_point` below. An implementation that
+/// only checks e.g. `shadow_open_gaps` and `continuation` while ignoring the `visible` pair
+/// would stay `Ok` under that injection — that is exactly the "永远不会拒绝任何切换的闸" §16.3
+/// warns about, and the reason this function takes the two `visible_*` counts as separate
+/// fields rather than a pre-reduced `bool`.
+///
+/// **G80-28 status (honest, not "已过")**: the test below injects the shortfall by mutating
+/// `SwitchCriteria.visible_shadow` directly, one layer below where the real defect could occur
+/// (a `count()` query built without a `projection_version` filter). It is a genuine positive
+/// control for *this* pure function, but it cannot catch a future `visible` implementation
+/// that ignores the filter and still happens to return equal numbers by construction — G80-28
+/// proper is `not_applicable` until a real Qdrant-backed `visible` counter exists
+/// (`adapters::qdrant` is still the T0.x placeholder) and the injection point moves to "really
+/// delete one point from the shadow version in Qdrant".
+pub fn evaluate_switch(criteria: &SwitchCriteria) -> Result<(), Vec<SwitchRejection>> {
+    let mut rejections = Vec::new();
+
+    match (&criteria.visible_shadow, &criteria.visible_serving) {
+        (Some((shadow_version, _)), Some((serving_version, _)))
+            if shadow_version == serving_version =>
+        {
+            // §23.1②/§16.3: a genuine comparison requires two *different* versions. Equal
+            // counts here would always agree with themselves — the 恒真闸 shape — so this is
+            // rejected before the counts are even looked at.
+            rejections.push(SwitchRejection::VisibleSameVersionDeclared);
+        }
+        (Some((_, shadow_count)), Some((_, serving_count))) if shadow_count == serving_count => {}
+        (Some(_), Some(_)) => rejections.push(SwitchRejection::VisibleMismatch),
+        _ => rejections.push(SwitchRejection::VisibleUnavailable),
+    }
+
+    if criteria.shadow_open_gaps != 0 {
+        rejections.push(SwitchRejection::OpenGaps);
+    }
+
+    if criteria.continuation != ContinuationVerdict::Pass {
+        rejections.push(SwitchRejection::BenchmarkNotPass);
+    }
+
+    if rejections.is_empty() {
+        Ok(())
+    } else {
+        Err(rejections)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn family() -> StreamFamily {
+        StreamFamily::new(
+            TenantId::new(),
+            "workspace",
+            Uuid::now_v7(),
+            "code",
+            "retrieval_card",
+        )
+    }
+
+    fn all_true() -> SwitchCriteria {
+        SwitchCriteria {
+            visible_shadow: Some(("v2".to_string(), 10)),
+            visible_serving: Some(("v1".to_string(), 10)),
+            shadow_open_gaps: 0,
+            continuation: ContinuationVerdict::Pass,
+        }
+    }
+
+    #[test]
+    fn stream_family_with_version_composes_a_stream_key() {
+        let f = family();
+        let key = f.with_version("v2");
+        assert_eq!(key.tenant_id, f.tenant_id);
+        assert_eq!(key.scope_kind, f.scope_kind);
+        assert_eq!(key.scope_id, f.scope_id);
+        assert_eq!(key.domain, f.domain);
+        assert_eq!(key.projection_kind, f.projection_kind);
+        assert_eq!(key.projection_version, "v2");
+    }
+
+    /// Positive control: three criteria all true ⇒ `Ok(())`, no rejection reasons at all.
+    #[test]
+    fn evaluate_switch_ok_when_all_three_criteria_hold() {
+        assert_eq!(evaluate_switch(&all_true()), Ok(()));
+    }
+
+    /// §16.3 gate / G80-28 恒真闸检测: baseline has `visible_shadow == visible_serving`
+    /// (criterion ① holds, switch would be `Ok`). Inject "shadow 少回填 1 个点" — `visible_shadow`
+    /// drops by exactly one, everything else held bit-for-bit identical — and criterion ① must
+    /// flip from held to failed, flipping the overall result from `Ok` to `Err` containing
+    /// `VisibleMismatch`. An evaluator that (bug) ignores the `visible_*` pair would stay `Ok`
+    /// here — that non-observation is precisely the "恒真闸" this test exists to catch; if this
+    /// assertion is ever weakened to allow that, the injection stops being detectable.
+    #[test]
+    fn evaluate_switch_flips_red_when_shadow_is_missing_one_point() {
+        let baseline = all_true();
+        assert_eq!(
+            evaluate_switch(&baseline),
+            Ok(()),
+            "baseline must be a genuine positive control before the injection is meaningful"
+        );
+
+        let mut injected = baseline.clone();
+        let (version, count) = baseline.visible_shadow.unwrap();
+        injected.visible_shadow = Some((version, count - 1));
+
+        let result = evaluate_switch(&injected);
+        assert_ne!(
+            result,
+            Ok(()),
+            "criterion ① must flip real ⇒ false under a one-point shadow shortfall, not stay Ok \
+             (a still-Ok result here is the always-true gate §16.3 warns about)"
+        );
+        assert_eq!(result, Err(vec![SwitchRejection::VisibleMismatch]));
+    }
+
+    /// §23.1②/§16.3 恒真闸 (second shape): both sides declared the *same* `projection_version`
+    /// — a caller (bug, or a hand-forged criteria) counting one version and reusing it for
+    /// both fields. Equal counts here would always pass criterion ① regardless of the actual
+    /// numbers — this must be rejected on the version tag alone, before comparing counts.
+    #[test]
+    fn evaluate_switch_rejects_when_both_sides_declare_the_same_version() {
+        let c = SwitchCriteria {
+            visible_shadow: Some(("v1".to_string(), 10)),
+            visible_serving: Some(("v1".to_string(), 10)),
+            shadow_open_gaps: 0,
+            continuation: ContinuationVerdict::Pass,
+        };
+        assert_eq!(
+            evaluate_switch(&c),
+            Err(vec![SwitchRejection::VisibleSameVersionDeclared]),
+            "identical declared versions must never be trusted as a real shadow/serving \
+             comparison, even with equal counts"
+        );
+    }
+
+    #[test]
+    fn evaluate_switch_rejects_when_visible_unavailable_on_either_side() {
+        let mut c = all_true();
+        c.visible_shadow = None;
+        assert_eq!(
+            evaluate_switch(&c),
+            Err(vec![SwitchRejection::VisibleUnavailable])
+        );
+
+        let mut c2 = all_true();
+        c2.visible_serving = None;
+        assert_eq!(
+            evaluate_switch(&c2),
+            Err(vec![SwitchRejection::VisibleUnavailable])
+        );
+    }
+
+    #[test]
+    fn evaluate_switch_rejects_on_open_gaps() {
+        let mut c = all_true();
+        c.shadow_open_gaps = 1;
+        assert_eq!(evaluate_switch(&c), Err(vec![SwitchRejection::OpenGaps]));
+    }
+
+    /// §55.4/§69: threshold not yet frozen ⇒ `CannotEstablish` ⇒ criterion ③ must reject, not
+    /// pass — "该条输出 cannot_establish 并拒绝切换，不得当通过" (this task's own card text).
+    #[test]
+    fn evaluate_switch_rejects_when_benchmark_cannot_establish() {
+        let mut c = all_true();
+        c.continuation = ContinuationVerdict::CannotEstablish;
+        assert_eq!(
+            evaluate_switch(&c),
+            Err(vec![SwitchRejection::BenchmarkNotPass])
+        );
+    }
+
+    /// §69 "INCONCLUSIVE ... 不得表述为『不劣于基线』" — must reject exactly like
+    /// `CannotEstablish`, not be treated as a soft pass.
+    #[test]
+    fn evaluate_switch_rejects_when_benchmark_inconclusive() {
+        let mut c = all_true();
+        c.continuation = ContinuationVerdict::Inconclusive;
+        assert_eq!(
+            evaluate_switch(&c),
+            Err(vec![SwitchRejection::BenchmarkNotPass])
+        );
+    }
+
+    #[test]
+    fn evaluate_switch_rejects_when_benchmark_fails() {
+        let mut c = all_true();
+        c.continuation = ContinuationVerdict::Fail;
+        assert_eq!(
+            evaluate_switch(&c),
+            Err(vec![SwitchRejection::BenchmarkNotPass])
+        );
+    }
+
+    /// All three criteria false at once ⇒ every rejection reason present, not just the first
+    /// — §16.3 "任一为假直接拒绝" does not mean "stop checking after the first failure" for
+    /// this pure evaluator (the adapter layer never proceeds past a non-empty `Err` either
+    /// way, but the full reason set matters for operator-facing logs).
+    #[test]
+    fn evaluate_switch_reports_every_failing_criterion_at_once() {
+        let c = SwitchCriteria {
+            visible_shadow: Some(("v2".to_string(), 9)),
+            visible_serving: Some(("v1".to_string(), 10)),
+            shadow_open_gaps: 3,
+            continuation: ContinuationVerdict::Fail,
+        };
+        let err = evaluate_switch(&c).unwrap_err();
+        assert_eq!(
+            err,
+            vec![
+                SwitchRejection::VisibleMismatch,
+                SwitchRejection::OpenGaps,
+                SwitchRejection::BenchmarkNotPass,
+            ]
+        );
+    }
+}

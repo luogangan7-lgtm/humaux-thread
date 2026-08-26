@@ -1,0 +1,71 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T5.7/T5.8: §18.2 RetrievalCard field list + §18.4 single card_builder_version axis, ALTERed
+# onto the P1 skeleton table (migrations/0007_projection.sql).
+
+migration_id = "0074_retrieval_card_fields"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('projection.retrieval_cards') is not null
+  and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'retrieval_cards'
+      and column_name = 'card_builder_version'
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (select count(*) from information_schema.columns
+   where table_schema = 'projection' and table_name = 'retrieval_cards'
+     and column_name in (
+       'schema_version','card_builder_version','card_template_hash','memory_type',
+       'data_class','egress_disposition','workspace_id','topic','effective_from','title',
+       'key_claim','entities','evidence_excerpt','card_text'
+     )) = 14
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_data_class_known_not_secret'
+      and conrelid = 'projection.retrieval_cards'::regclass
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_egress_disposition_known'
+      and conrelid = 'projection.retrieval_cards'::regclass
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_memory_type_known'
+      and conrelid = 'projection.retrieval_cards'::regclass
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_card_text_contains_title'
+      and conrelid = 'projection.retrieval_cards'::regclass
+  )
+  and (select column_default from information_schema.columns
+       where table_schema = 'projection' and table_name = 'retrieval_cards'
+         and column_name = 'card_builder_version') is null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE projection.retrieval_cards
+            DROP CONSTRAINT retrieval_cards_card_text_contains_title,
+            DROP CONSTRAINT retrieval_cards_memory_type_known,
+            DROP CONSTRAINT retrieval_cards_egress_disposition_known,
+            DROP CONSTRAINT retrieval_cards_data_class_known_not_secret,
+            DROP COLUMN card_text, DROP COLUMN evidence_excerpt,
+            DROP COLUMN entities, DROP COLUMN key_claim, DROP COLUMN title,
+            DROP COLUMN effective_from, DROP COLUMN topic, DROP COLUMN workspace_id,
+            DROP COLUMN egress_disposition, DROP COLUMN data_class, DROP COLUMN memory_type,
+            DROP COLUMN card_template_hash, DROP COLUMN card_builder_version,
+            DROP COLUMN schema_version;
+          (safe — table has zero rows in every environment this migration has run, no INSERT
+          target for it exists in the codebase yet, projection::card::build_card, T5.7, is
+          IO-free)
+"""
+
+backup_restore_requirement = "none (additive columns + CHECK constraints on a zero-row table, no data migration, no default-value backfill left in place after the DROP DEFAULT dance)"

@@ -1,1 +1,287 @@
-//! `projection::dense` — 占位模块（T0.x 任务填充；出处见 DevPlan v1 与 §58）。
+//! `projection::dense` — dense lane 查询构造：自动注入 `tenant + §6.1 AuthorizationScope
+//! visibility filter`（§17.1）。
+//!
+//! §17.1 冻结："所有 private query adapter 必须自动注入 tenant + AuthorizationScope
+//! visibility filter；业务层不得手写可选 filter。" 本模块的落实方式是类型级的，不是靠约定：
+//! [`DenseQueryFilter`] 的字段是私有的，唯一构造点是 [`build_dense_filter`]，其 `scope`
+//! 参数类型是 `&AuthorizationScope`（不是 `Option<&AuthorizationScope>`）——workspace 里没有
+//! 第二条能产出 `DenseQueryFilter` 却跳过 tenant/visibility 注入的路径；
+//! `tests/no_handwritten_filter_scan.rs` 用 architecture-check 风格的源码扫描把这一点钉死到
+//! 「本模块之外没有任何地方直接拼 [`Condition`] 树」。
+//!
+//! 可见性析取条件（[`visibility_disjunction`]）是 `domain::identity::can_read`（§6.1.1）三个
+//! match 分支的 Qdrant-filter 镜像，不是第二套可见性策略——`identity` 模块头本身就警告过
+//! "业务 Adapter 不允许各自维护一套'差不多相同'的可见性条件"；两者保持同步靠
+//! `visibility_disjunction_matches_can_read` 这条穷举一致性测试，不是靠人工审阅。
+//!
+//! 本 crate 不 import HTTP / serde_json / Qdrant SDK（§3/§78.3）：[`Condition`] 是
+//! adapter-中立的条件树，序列化成 Qdrant wire filter 是 `adapters::qdrant`（HTTP 层）的职责。
+
+use humaux_domain::identity::AuthorizationScope;
+
+/// Adapter-中立的 payload 条件树。`pub`：`adapters::qdrant` 需要遍历它来生成 Qdrant 的 wire
+/// JSON filter；但业务层不应该把它当"随手拼一个 filter"的入口——真正进入检索调用的值类型是
+/// [`DenseQueryFilter`]，它的字段私有，只能经 [`build_dense_filter`] 产出。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Condition {
+    /// `field == value`（字符串比较——payload 字段本身就是 §17 里列出的 keyword/uuid 文本）。
+    Eq { field: &'static str, value: String },
+    /// `field IN values`（Qdrant `MatchAny`，用于 `WORKSPACE_SHARED` 的多 workspace 成员测试）。
+    In {
+        field: &'static str,
+        values: Vec<String>,
+    },
+    /// 全部子条件为真。
+    And(Vec<Condition>),
+    /// 任一子条件为真。
+    Or(Vec<Condition>),
+}
+
+/// 调用方对已授权 universe 的进一步缩小（例如按 year/type/task，§17.2 "Query retrieval
+/// filter 可以在这个授权 universe 上继续按 year/type/task 缩小"）。[`build_dense_filter`]
+/// 的这个参数是 `&[FieldMatch]` 而不是 `Option<...>`：空切片就是"不再缩小"的表达方式，
+/// 所以不存在绕过 tenant/visibility 注入的第二个更底层入口。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldMatch {
+    pub field: &'static str,
+    pub value: String,
+}
+
+/// Dense lane 的查询 filter。唯一构造点是 [`build_dense_filter`]——字段私有，模块外没有任何
+/// 代码能凭空拼一个跳过 tenant/visibility 注入的实例（§17.1 的类型级落实，见模块头）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenseQueryFilter(Condition);
+
+impl DenseQueryFilter {
+    /// 读出拼装好的条件树，供 adapter 层序列化成 Qdrant wire filter（本 crate 自己不碰
+    /// HTTP/Qdrant SDK，§3/§78.3）。
+    pub fn as_condition(&self) -> &Condition {
+        &self.0
+    }
+}
+
+/// 构造 dense lane 的查询 filter：`tenant_id == scope.tenant_id()` AND
+/// [`visibility_disjunction`] AND 每一条 `narrow_by`（§17.1/§17.2）。
+///
+/// `scope` 是 `&AuthorizationScope`，不是 `Option<&AuthorizationScope>`——§17.1 "业务层不得
+/// 手写可选 filter" 在这里没有例外分支。
+pub fn build_dense_filter(
+    scope: &AuthorizationScope,
+    narrow_by: &[FieldMatch],
+) -> DenseQueryFilter {
+    let mut clauses = vec![tenant_clause(scope), visibility_disjunction(scope)];
+    clauses.extend(narrow_by.iter().map(|m| Condition::Eq {
+        field: m.field,
+        value: m.value.clone(),
+    }));
+    DenseQueryFilter(Condition::And(clauses))
+}
+
+/// §6.1.2 三段独立 AND 谓词里的第一段："tenant filter"。`identity::can_read` 本身从不检查
+/// tenant match（见其 rustdoc），调用方必须自己 AND 上这一条——这就是那一条。
+fn tenant_clause(scope: &AuthorizationScope) -> Condition {
+    Condition::Eq {
+        field: "tenant_id",
+        value: scope.tenant_id().0.to_string(),
+    }
+}
+
+/// §6.1.2 三段独立 AND 谓词里的第二段："authorized visibility disjunction"——`can_read`
+/// (§6.1.1) 三个 match 分支的 Qdrant-filter 镜像：
+/// - `TenantShared` 恒真（`can_read` 对它也恒真）；
+/// - `UserPrivate`：`scope.user_id()` 存在时才有对应分支（`can_read` 在 `scope.user_id()` 为
+///   `None` 时对 `UserPrivate` 恒假，所以这里不加任何 `UserPrivate` 分支，效果一致）；
+/// - `WorkspaceShared`：`scope.allowed_workspace_ids()` 非空时才有对应分支，用 `In` 枚举全部
+///   allowed workspace id（`can_read` 用 `BoundedSet::contains`，语义等价于这里的 `IN`）。
+fn visibility_disjunction(scope: &AuthorizationScope) -> Condition {
+    let mut arms = vec![Condition::Eq {
+        field: "visibility_class",
+        value: "TENANT_SHARED".to_string(),
+    }];
+
+    if let Some(uid) = scope.user_id() {
+        arms.push(Condition::And(vec![
+            Condition::Eq {
+                field: "visibility_class",
+                value: "USER_PRIVATE".to_string(),
+            },
+            Condition::Eq {
+                field: "visibility_user_id",
+                value: uid.0.to_string(),
+            },
+        ]));
+    }
+
+    let workspace_ids: Vec<String> = scope
+        .allowed_workspace_ids()
+        .iter()
+        .map(|w| w.0.to_string())
+        .collect();
+    if !workspace_ids.is_empty() {
+        arms.push(Condition::And(vec![
+            Condition::Eq {
+                field: "visibility_class",
+                value: "WORKSPACE_SHARED".to_string(),
+            },
+            Condition::In {
+                field: "visibility_workspace_id",
+                values: workspace_ids,
+            },
+        ]));
+    }
+
+    Condition::Or(arms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use humaux_domain::identity::{
+        BoundedSet, PrincipalId, VisibilityClass, VisibilityDescriptor, can_read,
+    };
+    use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
+
+    fn scope(user_id: Option<UserId>, workspaces: &[WorkspaceId]) -> AuthorizationScope {
+        AuthorizationScope::new(
+            TenantId::new(),
+            PrincipalId::new(),
+            user_id,
+            BoundedSet::new(workspaces.iter().copied()).unwrap(),
+        )
+    }
+
+    /// 独立求值 [`Condition`] 树，只用于测试断言——不是给生产用的第二个 evaluator。
+    fn eval(cond: &Condition, fields: &std::collections::HashMap<&str, String>) -> bool {
+        match cond {
+            Condition::Eq { field, value } => fields.get(field) == Some(value),
+            Condition::In { field, values } => {
+                fields.get(field).is_some_and(|v| values.contains(v))
+            }
+            Condition::And(cs) => cs.iter().all(|c| eval(c, fields)),
+            Condition::Or(cs) => cs.iter().any(|c| eval(c, fields)),
+        }
+    }
+
+    fn descriptor_fields(
+        desc: &VisibilityDescriptor,
+    ) -> std::collections::HashMap<&'static str, String> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "visibility_class",
+            match desc.class {
+                VisibilityClass::UserPrivate => "USER_PRIVATE",
+                VisibilityClass::WorkspaceShared => "WORKSPACE_SHARED",
+                VisibilityClass::TenantShared => "TENANT_SHARED",
+            }
+            .to_string(),
+        );
+        if let Some(uid) = desc.user_id {
+            m.insert("visibility_user_id", uid.0.to_string());
+        }
+        if let Some(wid) = desc.workspace_id {
+            m.insert("visibility_workspace_id", wid.0.to_string());
+        }
+        m
+    }
+
+    // ---- §17.1: tenant clause is always present ----
+
+    #[test]
+    fn build_dense_filter_always_ands_tenant_clause() {
+        let s = scope(None, &[]);
+        let filter = build_dense_filter(&s, &[]);
+        match filter.as_condition() {
+            Condition::And(clauses) => {
+                assert_eq!(
+                    clauses[0],
+                    Condition::Eq {
+                        field: "tenant_id",
+                        value: s.tenant_id().0.to_string()
+                    }
+                );
+            }
+            other => panic!("expected top-level And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn narrow_by_is_anded_in_without_replacing_tenant_visibility() {
+        let s = scope(None, &[]);
+        let filter = build_dense_filter(
+            &s,
+            &[FieldMatch {
+                field: "memory_type",
+                value: "fact".into(),
+            }],
+        );
+        let Condition::And(clauses) = filter.as_condition() else {
+            panic!("expected And")
+        };
+        // tenant clause + visibility disjunction + 1 narrow_by term.
+        assert_eq!(clauses.len(), 3);
+        assert_eq!(
+            clauses[2],
+            Condition::Eq {
+                field: "memory_type",
+                value: "fact".into()
+            }
+        );
+    }
+
+    // ---- §6.1.1: visibility_disjunction must agree with can_read on every combination ----
+
+    #[test]
+    fn visibility_disjunction_matches_can_read() {
+        let user_a = UserId::new();
+        let user_b = UserId::new();
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+
+        let scopes = [
+            scope(None, &[]),                   // service scope, no user, no workspace
+            scope(Some(user_a), &[]),           // on-behalf-of user_a, no workspace
+            scope(Some(user_a), &[ws_a]),       // user_a + workspace ws_a
+            scope(Some(user_a), &[ws_a, ws_b]), // user_a + two workspaces
+        ];
+
+        let descriptors = [
+            VisibilityDescriptor {
+                class: VisibilityClass::TenantShared,
+                user_id: None,
+                workspace_id: None,
+            },
+            VisibilityDescriptor {
+                class: VisibilityClass::UserPrivate,
+                user_id: Some(user_a),
+                workspace_id: None,
+            },
+            VisibilityDescriptor {
+                class: VisibilityClass::UserPrivate,
+                user_id: Some(user_b),
+                workspace_id: None,
+            },
+            VisibilityDescriptor {
+                class: VisibilityClass::WorkspaceShared,
+                user_id: None,
+                workspace_id: Some(ws_a),
+            },
+            VisibilityDescriptor {
+                class: VisibilityClass::WorkspaceShared,
+                user_id: None,
+                workspace_id: Some(ws_b),
+            },
+        ];
+
+        for s in &scopes {
+            let disjunction = visibility_disjunction(s);
+            for d in &descriptors {
+                let expected = can_read(s, d);
+                let got = eval(&disjunction, &descriptor_fields(d));
+                assert_eq!(
+                    got, expected,
+                    "scope={s:?} descriptor={d:?}: filter said {got}, can_read said {expected}"
+                );
+            }
+        }
+    }
+}

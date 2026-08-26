@@ -1,0 +1,109 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T5.4+T5.6 §17.3: completes the 0007 `projection.tenant_placements` skeleton
+# (tenant_id/cell_id/placed_at) to the §17.3 field list (projection_family/collection_name/
+# shard_key/placement_class/point_count/bytes_estimate/promotion_state/updated_at).
+# REVERSIBLE (same class 0049_reasoning_domain_columns used for the identical shape: adds
+# columns/constraints/a trigger to an existing, empty table).
+
+migration_id = "0068_tenant_placements_qdrant_fields"
+class = "REVERSIBLE"
+
+precheck = """
+select not exists (
+  select 1 from information_schema.columns
+  where table_schema = 'projection' and table_name = 'tenant_placements'
+    and column_name = 'projection_family'
+) as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'tenant_placements'
+      and column_name = 'projection_family' and is_nullable = 'NO'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'tenant_placements'
+      and column_name = 'collection_name' and is_nullable = 'NO'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'tenant_placements'
+      and column_name = 'shard_key' and is_nullable = 'YES'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'tenant_placements'
+      and column_name = 'placement_class'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'tenant_placements'
+      and column_name = 'point_count'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'tenant_placements'
+      and column_name = 'bytes_estimate'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'tenant_placements'
+      and column_name = 'promotion_state'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'tenant_placements'
+      and column_name = 'updated_at'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'tenant_placements'
+      and column_name = 'cell_id' and is_nullable = 'YES'
+  )
+  and (
+    select array_agg(a.attname order by a.attnum) = array['tenant_id','projection_family']
+    from pg_constraint c
+    join unnest(c.conkey) with ordinality as k(attnum, ord) on true
+    join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+    where c.conrelid = 'projection.tenant_placements'::regclass and c.contype = 'p'
+  )
+  and exists (
+    select 1 from pg_trigger
+    where tgname = 'tenant_placements_touch_updated_at'
+      and tgrelid = 'projection.tenant_placements'::regclass
+  )
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'projection.tenant_placements'::regclass)
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback:
+  DROP TRIGGER IF EXISTS tenant_placements_touch_updated_at ON projection.tenant_placements;
+  DROP FUNCTION IF EXISTS projection.tenant_placements_touch_updated_at();
+  ALTER TABLE projection.tenant_placements
+    DROP CONSTRAINT IF EXISTS tenant_placements_pkey,
+    DROP CONSTRAINT IF EXISTS tenant_placements_projection_family_known,
+    DROP CONSTRAINT IF EXISTS tenant_placements_placement_class_known,
+    DROP CONSTRAINT IF EXISTS tenant_placements_promotion_state_known,
+    DROP CONSTRAINT IF EXISTS tenant_placements_point_count_nonneg,
+    DROP CONSTRAINT IF EXISTS tenant_placements_bytes_estimate_nonneg,
+    DROP COLUMN IF EXISTS projection_family,
+    DROP COLUMN IF EXISTS collection_name,
+    DROP COLUMN IF EXISTS shard_key,
+    DROP COLUMN IF EXISTS placement_class,
+    DROP COLUMN IF EXISTS point_count,
+    DROP COLUMN IF EXISTS bytes_estimate,
+    DROP COLUMN IF EXISTS promotion_state,
+    DROP COLUMN IF EXISTS updated_at;
+  ALTER TABLE projection.tenant_placements ALTER COLUMN cell_id SET NOT NULL;
+  ALTER TABLE projection.tenant_placements ADD CONSTRAINT tenant_placements_pkey PRIMARY KEY (tenant_id, cell_id);
+  -- safe only as long as no application code depends on the §17.3 columns yet (grepped:
+  -- nothing writes/reads projection.tenant_placements anywhere in this codebase as of
+  -- T5.4+T5.6 — adapters::qdrant's TenantPlacementRow is a pure mirror type, no live SQL).
+"""
+
+backup_restore_requirement = "standard pre-deploy snapshot; table is empty in every environment this migration has been applied to (grepped: no INSERT target for projection.tenant_placements exists anywhere in the codebase yet)"

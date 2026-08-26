@@ -14,3 +14,8 @@ workspace = true
 # here: this module never mints an id, only carries and formats one).
 humaux-domain = { path = "../domain" }
 uuid = "1.25.0"
+# T5.1 (§16.1.1/G80-11): fingerprint::source_hash hashes the canonical processing-input
+# encoding. Same `sha2 = "0.11"` line every other workspace crate already carries
+# (humaux-domain::evidence::payload_sha256, humaux-contracts::config_registry, etc.) — no
+# new crate introduced to the dependency graph.
+sha2 = "0.11"

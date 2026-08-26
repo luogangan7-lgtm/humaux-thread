@@ -1,0 +1,29 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# §16.2 read-routing constraint: at most one `serving = true` row per stream family
+# (tenant_id, scope_kind, scope_id, domain, projection_kind). `serving`/`shadow` columns
+# already exist (0007 skeleton); this migration only adds the partial unique index.
+
+migration_id = "0065_serving_shadow_ux_serving_one"
+class = "REVERSIBLE"
+
+precheck = """
+select not exists (
+  select 1 from pg_indexes
+  where schemaname = 'projection' and indexname = 'ux_serving_one'
+) as precheck_ok
+"""
+
+postcheck = """
+select exists (
+  select 1 from pg_indexes
+  where schemaname = 'projection' and indexname = 'ux_serving_one'
+    and indexdef ilike '%WHERE serving%'
+) as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP INDEX projection.ux_serving_one;
+          (safe — index-only change, no data written or removed by this migration)
+"""
+
+backup_restore_requirement = "none (adds one partial unique index over an existing boolean column, no data migration, no column change)"

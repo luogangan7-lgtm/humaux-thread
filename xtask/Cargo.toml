@@ -16,3 +16,7 @@ humaux-contracts = { path = "../crates/contracts" }
 serde_json = "1"
 # Phase 1: migration runner (migrate.rs) + live-DB enumerations (rls_check.rs, §48.2).
 postgres = "0.19"
+# T5.8 card_version.rs: calls the real `projection::card::{assemble, CARD_TEMPLATE_HASH,
+# template_fingerprint}` instead of re-deriving/hardcoding a second copy of the template shape
+# — reuse, not a second implementation to keep in sync by hand.
+humaux-projection = { path = "../crates/projection" }

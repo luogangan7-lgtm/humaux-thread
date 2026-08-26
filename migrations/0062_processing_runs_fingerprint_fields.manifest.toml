@@ -1,0 +1,67 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T5.1 (§16.1.1): completes private.processing_runs's field list without editing the
+# already-applied 0005 (same "new migration, not an edit" pattern 0057/0060/0061 used).
+
+migration_id = "0062_processing_runs_fingerprint_fields"
+# §46.1 EXPAND_CONTRACT requires an old/new binary-compatibility window to rehearse
+# (expand -> migrate/backfill -> switch -> contract). `RENAME COLUMN finished_at TO
+# completed_at` has no such window — both names are never simultaneously live — so
+# EXPAND_CONTRACT asserted a property this migration structurally cannot have (code-review
+# finding, minor). FORWARD_ONLY is correct: a rename with no dual-name phase.
+class = "FORWARD_ONLY"
+
+precheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'processing_runs'
+      and column_name = 'finished_at'
+  )
+  and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'processing_runs'
+      and column_name in ('completed_at', 'provider_request_id', 'output_count')
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'processing_runs'
+      and column_name = 'completed_at'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'processing_runs'
+      and column_name = 'provider_request_id' and is_nullable = 'YES'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'processing_runs'
+      and column_name = 'output_count' and is_nullable = 'YES'
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'processing_runs_output_count_nonnegative'
+      and conrelid = 'private.processing_runs'::regclass
+  )
+  and exists (
+    select 1 from pg_class where relname = 'processing_runs_source_hash_idx'
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP INDEX private.processing_runs_source_hash_idx;
+          ALTER TABLE private.processing_runs
+            DROP CONSTRAINT processing_runs_output_count_nonnegative;
+          ALTER TABLE private.processing_runs DROP COLUMN output_count;
+          ALTER TABLE private.processing_runs DROP COLUMN provider_request_id;
+          ALTER TABLE private.processing_runs RENAME COLUMN completed_at TO finished_at;
+          (safe — table has zero rows anywhere this migration has run, no INSERT target for
+          it exists in the codebase yet)
+"""
+
+backup_restore_requirement = "none (rename + two nullable ADD COLUMN + one CHECK + one index, zero rows in the table anywhere this has run)"

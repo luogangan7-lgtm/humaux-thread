@@ -104,6 +104,14 @@ impl<T: PartialEq> BoundedSet<T> {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+
+    /// Iterates members in insertion order (post de-dup). Added for T5.5's query adapters
+    /// (`projection::dense`/`projection::sparse`, §17.1/§17.2): a static per-request Qdrant
+    /// filter must enumerate every allowed workspace id to build a `WORKSPACE_SHARED`
+    /// `MatchAny`/`IN` clause — `contains`/`len` alone cannot do that.
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.items.iter()
+    }
 }
 
 /// The three intra-tenant visibility classes (§6.1.1), frozen closed set — no `Other`.
@@ -394,6 +402,16 @@ mod tests {
         assert!(can_read(&s, &obj_b));
         // ...but not under the narrowed one.
         assert!(!can_read(&narrowed, &obj_b));
+    }
+
+    // ---- BoundedSet::iter ----
+
+    #[test]
+    fn bounded_set_iter_yields_every_member_in_insertion_order() {
+        let a = WorkspaceId::new();
+        let b = WorkspaceId::new();
+        let s = BoundedSet::new([a, b]).unwrap();
+        assert_eq!(s.iter().copied().collect::<Vec<_>>(), vec![a, b]);
     }
 
     // ---- BoundedSet cap ----

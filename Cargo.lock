@@ -793,6 +793,7 @@ name = "humaux-projection"
 version = "0.1.0"
 dependencies = [
  "humaux-domain",
+ "sha2 0.11.0",
  "uuid",
 ]
 
@@ -3041,6 +3042,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "humaux-contracts",
+ "humaux-projection",
  "postgres",
  "serde_json",
  "toml",

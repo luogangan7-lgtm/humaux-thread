@@ -1,0 +1,129 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# Code-review follow-up on 0062/0063 — expands private.processing_runs's fingerprint axes
+# and fixes projection.retrieval_cards's model_id/model_revision + projection_type CHECKs,
+# without editing the already-applied 0062/0063.
+
+migration_id = "0064_processing_runs_axes_and_retrieval_cards_model_fix"
+# No old/new binary-compatibility window exists for any of these four changes (two renames
+# feeding immediately-NOT-NULL columns, two DROP NOT NULL + CHECK additions, one CHECK
+# swap) — same reasoning this review applied to 0062's own (mis-)classification. Safe only
+# because private.processing_runs has zero production rows and
+# projection.retrieval_cards's model_id/model_revision have never been written by any real
+# caller (projection::card::build_card has no model field to write one with).
+class = "FORWARD_ONLY"
+
+precheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'processing_runs'
+      and column_name = 'processor'
+  )
+  and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'processing_runs'
+      and column_name in ('processor_kind', 'processor_version', 'model_provider',
+        'model_id', 'model_revision', 'prompt_hash', 'parser_version',
+        'embedding_version', 'card_builder_version', 'evidence_payload_sha256')
+  )
+  and exists (
+    select 1 from pg_attribute a
+    join pg_class c on c.oid = a.attrelid
+    where c.relname = 'retrieval_cards' and a.attname = 'model_id' and a.attnotnull
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_projection_type_known'
+      and conrelid = 'projection.retrieval_cards'::regclass
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'private' and table_name = 'processing_runs'
+      and column_name = 'processor_kind'
+  )
+  and (select count(*) from information_schema.columns
+       where table_schema = 'private' and table_name = 'processing_runs'
+         and column_name in ('processor_version', 'model_provider', 'model_revision',
+           'prompt_hash', 'parser_version', 'evidence_payload_sha256')
+         and is_nullable = 'NO') = 6
+  and (select count(*) from information_schema.columns
+       where table_schema = 'private' and table_name = 'processing_runs'
+         and column_name in ('embedding_version', 'card_builder_version')
+         and is_nullable = 'YES') = 2
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'processing_runs_evidence_payload_sha256_nonempty'
+      and conrelid = 'private.processing_runs'::regclass
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'processing_runs_evidence_payload_sha256_width'
+      and conrelid = 'private.processing_runs'::regclass
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'processing_runs_completed_has_output'
+      and conrelid = 'private.processing_runs'::regclass
+  )
+  and exists (
+    select 1 from pg_attribute a
+    join pg_class c on c.oid = a.attrelid
+    where c.relname = 'retrieval_cards' and a.attname = 'model_id' and not a.attnotnull
+  )
+  and exists (
+    select 1 from pg_attribute a
+    join pg_class c on c.oid = a.attrelid
+    where c.relname = 'retrieval_cards' and a.attname = 'model_revision' and not a.attnotnull
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_model_fields_absent'
+      and conrelid = 'projection.retrieval_cards'::regclass
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_cards_projection_type_known'
+      and conrelid = 'projection.retrieval_cards'::regclass
+      and pg_get_constraintdef(oid) like '%= ''RetrievalCard''%'
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE projection.retrieval_cards
+            DROP CONSTRAINT retrieval_cards_projection_type_known;
+          ALTER TABLE projection.retrieval_cards
+            ADD CONSTRAINT retrieval_cards_projection_type_known
+              CHECK (projection_type IN ('RetrievalCard', 'DenseEmbedding',
+                'SparseRepresentation', 'QdrantPoint', 'RelationProjection',
+                'CodeProjection'));
+          ALTER TABLE projection.retrieval_cards
+            DROP CONSTRAINT retrieval_cards_model_fields_absent;
+          ALTER TABLE projection.retrieval_cards
+            ALTER COLUMN model_id SET NOT NULL,
+            ALTER COLUMN model_revision SET NOT NULL;
+          ALTER TABLE private.processing_runs
+            DROP CONSTRAINT processing_runs_completed_has_output;
+          ALTER TABLE private.processing_runs
+            DROP CONSTRAINT processing_runs_evidence_payload_sha256_width;
+          ALTER TABLE private.processing_runs
+            DROP CONSTRAINT processing_runs_evidence_payload_sha256_nonempty;
+          ALTER TABLE private.processing_runs
+            DROP COLUMN evidence_payload_sha256, DROP COLUMN card_builder_version,
+            DROP COLUMN embedding_version, DROP COLUMN parser_version,
+            DROP COLUMN prompt_hash, DROP COLUMN model_revision,
+            DROP COLUMN model_provider, DROP COLUMN processor_version;
+          ALTER TABLE private.processing_runs RENAME COLUMN model_id TO model;
+          ALTER TABLE private.processing_runs RENAME COLUMN processor_kind TO processor;
+          (safe — zero production rows in processing_runs anywhere this has run, and
+          retrieval_cards.model_id/model_revision have never been written by any real
+          caller; forward re-apply after this rollback is not blocked by any dropped
+          shared object, unlike 0063's own rollback, which is fixed independently below)
+"""
+
+backup_restore_requirement = "none (renames + nullable/NOT NULL column additions + CHECK constraint changes, zero production rows in either table)"

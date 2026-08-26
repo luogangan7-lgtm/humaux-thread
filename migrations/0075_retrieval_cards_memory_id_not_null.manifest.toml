@@ -1,0 +1,35 @@
+# §46.1 migration manifest (G46-1 / G80-37).
+# T5.8 review (major): projection.retrieval_cards.memory_id was left nullable by both 0007
+# (skeleton) and 0074 (field-list completion) — §18.2 lists it as a card field, and §18.4/§22.1
+# both LEFT JOIN on it, so a NULL row is both a silent missing-card and an untraceable row.
+
+migration_id = "0075_retrieval_cards_memory_id_not_null"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('projection.retrieval_cards') is not null
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'projection' and table_name = 'retrieval_cards'
+      and column_name = 'memory_id' and is_nullable = 'YES'
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (select is_nullable from information_schema.columns
+   where table_schema = 'projection' and table_name = 'retrieval_cards'
+     and column_name = 'memory_id') = 'NO'
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE projection.retrieval_cards ALTER COLUMN memory_id DROP NOT NULL;
+          (safe — table has zero rows in every environment this migration has run, no INSERT
+          target for it exists in the codebase yet, projection::card::build_card, T5.7, is
+          IO-free)
+"""
+
+backup_restore_requirement = "none (single ALTER COLUMN SET NOT NULL on a zero-row table, no data migration, no default-value backfill)"

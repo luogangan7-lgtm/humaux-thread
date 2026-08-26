@@ -9,15 +9,19 @@
 //! delivering Phase has not landed yet (§80.1.1).
 //!
 //! §80.1.1 registers the injected-fault records for the rules that don't yet have a home
-//! in their own spec section: G80-1 (§53.3 规则3), G80-2 (§55.1), G80-4 (§16.2, out of this
-//! task's scope), G80-20 (§67.4, out of this task's scope). G80-22 lives at §48.0①. G59-3
-//! lives at §59.1. Each rule below cites its own §.
+//! in their own spec section: G80-1 (§53.3 规则3), G80-2 (§55.1), G80-4 (§16.2 — registered
+//! below, `not_applicable` until `adapters::retrieve` routes through `serving_version`),
+//! G80-20 (§67.4, out of this task's scope). G80-22 lives at §48.0①. G80-11's source_hash leg
+//! lives at §1.3/§48.0 (T5.1) — same single-crate-convergence family as G80-22, G80-11's other
+//! two legs (§1.12 tool schema, §7.5 classifier) are out of this task's scope. G59-3 lives at
+//! §59.1. Each rule below cites its own §.
 //!
-//! G52-1 / G59-3 / G80-2 / G80-22 scan the **whole workspace root** (`crates/` + `bins/` +
-//! `evals/` + `xtask/` + `migrations/`), not just `crates/`: §80.1.1 / §48.0① / §59.1 / §52.4
-//! all name `bins/*` / `evals/*` as required injection/scan territory. [`walk_workspace_rs`]
-//! is the shared scan domain for those four — it excludes this file itself ([`SELF_FILE`]) and
-//! strips every file's own `#[cfg(test)]` module ([`strip_cfg_test_module`]), both documented
+//! G52-1 / G59-3 / G80-2 / G80-4 / G80-11 / G80-22 scan the **whole workspace root**
+//! (`crates/` + `bins/` + `evals/` + `xtask/` + `migrations/`), not just `crates/`: §80.1.1 /
+//! §48.0① / §59.1 / §52.4 all name `bins/*` / `evals/*` as required injection/scan territory.
+//! [`walk_workspace_rs`] is the shared scan domain for those five — it excludes this file
+//! itself ([`SELF_FILE`]) and strips every file's own `#[cfg(test)]` module
+//! ([`strip_cfg_test_module`]), both documented
 //! at their definitions below.
 
 use std::collections::BTreeSet;
@@ -1044,6 +1048,50 @@ fn g80_2_build_request_unique(root: &Path) -> Verdict {
     }
 }
 
+/// §16.2 G80-4: "检索侧禁止把 `projection_version` 当常量读，只能经
+/// `serving_version(stream_family)` 取" — the enforcement mechanism is a workspace-wide
+/// consumer call-site count. `serving_version`'s own definition (`adapters::serving_repo`) and
+/// its direct definition-testing file (`adapters/tests/serving_repo.rs`, which calls it purely
+/// to pin the function's own read behavior, not as a retrieval consumer) are excluded from the
+/// count — same shape as `count_construction_calls` excluding a type's own declaration.
+///
+/// As of this task the retrieval read path (`adapters::retrieve`) does not yet call
+/// `serving_version` at all (see that module's / `serving_repo`'s own notes: `TokenClaims`'s
+/// `projection_version` still comes from the unsigned `consistency_token`, not this entry
+/// point) — so there is no consumer call site to count yet. `not_applicable`, not a fabricated
+/// `== 1`/`== 0` pass, same convention as the neighboring §55.1 G80-2 entry above.
+fn g80_4_serving_version_sole_entry_point(root: &Path) -> Verdict {
+    let files = walk_workspace_rs(root);
+    let mut count = 0usize;
+    let mut sites = Vec::new();
+    for (path, source) in &files {
+        let disp = display(root, path);
+        if disp.contains("serving_repo") {
+            continue; // definition site + its own direct tests, not a consumer call site
+        }
+        let n = source.matches("serving_version(").count();
+        if n > 0 {
+            sites.push(format!("{disp}: {n}"));
+            count += n;
+        }
+    }
+    if sites.is_empty() {
+        return Verdict::NotApplicable(
+            "serving_version(stream_family) 检索侧调用点 (§16.2, adapters::retrieve 尚未接入换代期读路由) \
+             尚未交付"
+                .to_string(),
+        );
+    }
+    if count == 1 {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(vec![format!(
+            "expected exactly 1 consumer-side `serving_version(` call site outside \
+             serving_repo, found {count}: {sites:?}"
+        )])
+    }
+}
+
 fn g80_22_payload_sha256_unique(root: &Path) -> Verdict {
     // Whole workspace, not just crates/: §48.0① names `bins/*` / `evals/*` / migration tooling
     // as required scan territory for the second construction site.
@@ -1071,6 +1119,42 @@ fn g80_22_payload_sha256_unique(root: &Path) -> Verdict {
     } else {
         Verdict::Fail(vec![format!(
             "expected exactly 1 `EvidencePayloadSha256( .. )` construction site, found {count}: {sites:?}"
+        )])
+    }
+}
+
+/// §1.3/§48.0 G80-11 (source_hash leg): `humaux_projection::fingerprint::source_hash` is the
+/// sole construction point of `SourceHash` (§16.1/§16.1.1, T5.1) — same single-crate
+/// convergence family as `EvidencePayloadSha256` (G80-22, above) and the §1.12 canonical tool
+/// schema. A second `SourceHash(` construction site anywhere in the workspace (a second crate
+/// re-deriving the processing-input-fingerprint encoding instead of calling `source_hash`)
+/// would let two different encodings both claim the name "the fingerprint", exactly the drift
+/// §1.3's "缺任意一项...回放/模型对比/精准重建...全部无法回答" warns about.
+fn g80_11_source_hash_unique(root: &Path) -> Verdict {
+    let files = walk_workspace_rs(root);
+    let object_exists = files
+        .iter()
+        .any(|(_, s)| s.contains("struct SourceHash") || s.contains("fn source_hash("));
+    if !object_exists {
+        return Verdict::NotApplicable(
+            "projection::fingerprint::source_hash / SourceHash (§1.3/§48.0 G80-11, T5.1 尚未交付)"
+                .to_string(),
+        );
+    }
+    let mut count = 0usize;
+    let mut sites = Vec::new();
+    for (path, source) in &files {
+        let n = count_construction_calls(source, "SourceHash(");
+        if n > 0 {
+            sites.push(format!("{}: {n}", display(root, path)));
+        }
+        count += n;
+    }
+    if count == 1 {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(vec![format!(
+            "expected exactly 1 `SourceHash( .. )` construction site, found {count}: {sites:?}"
         )])
     }
 }
@@ -1660,8 +1744,16 @@ pub fn run(_args: &[String]) -> i32 {
             g80_2_build_request_unique(&root),
         ),
         (
+            "§16.2 G80-4 (serving_version sole retrieval entry point)",
+            g80_4_serving_version_sole_entry_point(&root),
+        ),
+        (
             "§48.0① G80-22 (payload_sha256 sole construction point)",
             g80_22_payload_sha256_unique(&root),
+        ),
+        (
+            "§1.3/§48.0 G80-11 (source_hash sole construction point)",
+            g80_11_source_hash_unique(&root),
         ),
         (
             "§6.2.3 G80-40 static (typed DB pool topology)",
@@ -2275,6 +2367,71 @@ mod tests {
             g80_22_payload_sha256_unique(&tmp),
             Verdict::Fail(_)
         ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // -- §1.3/§48.0 G80-11 (source_hash leg, T5.1) -------------------------------------------
+
+    /// T5.1 delivers `projection::fingerprint::source_hash` / `SourceHash`: the real-repo
+    /// check flips from `NotApplicable` to `Pass` (exactly one construction site, in
+    /// `crates/projection/src/fingerprint.rs`) the same way G80-22 did for T1.6.
+    #[test]
+    fn g80_11_real_repo_passes() {
+        let root = real_root();
+        assert_eq!(g80_11_source_hash_unique(&root), Verdict::Pass);
+    }
+
+    #[test]
+    fn g80_11_passes_with_exactly_one_construction_site() {
+        let tmp = fresh_tmp("g80-11-green");
+        let dir = tmp.join("crates/projection/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("fingerprint.rs"),
+            "struct SourceHash([u8; 32]);\npub fn source_hash(x: u64) -> SourceHash {\n    SourceHash([0; 32])\n}\n",
+        )
+        .unwrap();
+        assert_eq!(g80_11_source_hash_unique(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (G80-11): matcher's type name typo'd to a nonexistent name → 0 hits → 红 (same
+    /// shape as G80-22's zero-construction-sites 注错).
+    #[test]
+    fn g80_11_fails_when_object_exists_but_zero_construction_sites_found() {
+        let tmp = fresh_tmp("g80-11-red-zero");
+        let dir = tmp.join("crates/projection/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("fingerprint.rs"),
+            "struct SourceHash([u8; 32]);\npub fn source_hash(x: u64) -> SourceHash {\n    todo!()\n}\n",
+        )
+        .unwrap();
+        assert!(matches!(g80_11_source_hash_unique(&tmp), Verdict::Fail(_)));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (G80-11): a second construction site in the real top-level `evals/` — same shape
+    /// as G80-22's evals/ 注错, proving the workspace-root scan (not a crates/-only one)
+    /// catches a second crate re-deriving the fingerprint encoding.
+    #[test]
+    fn g80_11_fails_with_second_construction_site_in_real_evals_dir() {
+        let tmp = fresh_tmp("g80-11-red-evals");
+        let dir = tmp.join("crates/projection/src");
+        let evals_dir = tmp.join("evals");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&evals_dir).unwrap();
+        fs::write(
+            dir.join("fingerprint.rs"),
+            "struct SourceHash([u8; 32]);\npub fn source_hash(x: u64) -> SourceHash {\n    SourceHash([0; 32])\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            evals_dir.join("probe.rs"),
+            "fn shortcut() { let _ = SourceHash([1; 32]); }\n",
+        )
+        .unwrap();
+        assert!(matches!(g80_11_source_hash_unique(&tmp), Verdict::Fail(_)));
         fs::remove_dir_all(&tmp).ok();
     }
 
