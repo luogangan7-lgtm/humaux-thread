@@ -1,0 +1,15 @@
+# §46.1 migration manifest (G46-1 / G80-37). Partial unique index over the currently-active
+# row per (provider_id, region, tenant_id, purpose) — additive only, no existing row touched.
+# Fails at apply time only if 0091/0092 already hold two overlapping active rows for the same
+# key (none exist yet: 0091/0092's precheck-verified state has zero seeded rows).
+
+migration_id = "0093_retrieval_provider_admission_limits_active_uniq"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('control.retrieval_provider_admission_limits_active_uniq') is null as precheck_ok"
+
+postcheck = "select to_regclass('control.retrieval_provider_admission_limits_active_uniq') is not null as postcheck_ok"
+
+rollback_or_forward_fix = "rollback: DROP INDEX IF EXISTS control.retrieval_provider_admission_limits_active_uniq;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL — a unique index over zero pre-existing rows)"

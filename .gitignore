@@ -1,3 +1,8 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Local credentials — never committed (§7 BYOK/secret boundary).
+.env
+.env.*
+!.env.example

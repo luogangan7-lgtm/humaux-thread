@@ -244,6 +244,10 @@ fn recorded_input_hash(handle: &mut Client, run_id: Uuid) -> Vec<u8> {
 /// exactly that iteration's 100 — no duplicates, nothing missing, no leak from the concurrent
 /// 60 (§11.7: "新 Memory 在 snapshot 之后写入 -> next consolidation run"). Returns the
 /// §11.9 "输入集合 hash" for the caller's cross-iteration sanity check.
+// Sequential DB setup/race/assert steps for one iteration, same shape as this crate's own
+// `qdrant_live.rs`/`recall_envelope_g23.rs` precedent for this allow — splitting would scatter
+// one iteration's steps across helpers with no reuse, not simplify anything.
+#[allow(clippy::too_many_lines)]
 fn run_one_iteration(handle: &mut Handle, iteration: usize) -> Vec<u8> {
     // Each iteration must select from exactly its own fresh 100 — without this, iteration N's
     // query would also see every prior iteration's still-`active` rows (this test never
@@ -298,6 +302,46 @@ fn run_one_iteration(handle: &mut Handle, iteration: usize) -> Vec<u8> {
         let inserter = tokio::task::spawn_blocking(move || {
             let mut client =
                 Client::connect(&admin_dsn, NoTls).expect("concurrent inserter connects");
+
+            // Barrier — without it this gate is timing-dependent in BOTH directions.
+            //
+            // `tokio::join!` alone does not order the two sides: an insert that commits
+            // *before* the selection transaction establishes its `REPEATABLE READ` snapshot
+            // legitimately predates that snapshot, so it is correctly selected — and the
+            // assertion below then reports a "leak" that never happened (observed: green when
+            // run alone, red under full-workspace load). The mirror failure is worse: under
+            // other timings the inserts could all land after selection has already read, so
+            // the gate would pass without ever exercising the isolation it exists to prove.
+            //
+            // `select_and_materialize_inputs`'s first data statement is
+            // `UPDATE ... memory_consolidation_runs SET status = 'SELECTING' WHERE run_id`,
+            // which takes a row lock AND establishes the snapshot. That lock is observable
+            // from another connection while the transaction is still open (the UPDATE itself
+            // is not — it is uncommitted). So: spin on `FOR UPDATE NOWAIT` until it is
+            // refused (55P03 lock_not_available) and only then start inserting. At that point
+            // the snapshot provably exists, and every one of the 60 rows below is provably
+            // concurrent-after-snapshot — which is the only shape that proves isolation.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "selection transaction never took the run row lock within 30s — the \
+                     barrier below cannot establish that the snapshot exists, so this gate \
+                     would be asserting on an unknown ordering"
+                );
+                match client.query_one(
+                    "SELECT run_id FROM private.memory_consolidation_runs \
+                     WHERE run_id = $1 FOR UPDATE NOWAIT",
+                    &[&run_id],
+                ) {
+                    // Lock acquired => the selection txn has NOT reached its UPDATE yet.
+                    Ok(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                    // Refused => the selection txn holds the row lock => snapshot established.
+                    Err(e) if e.code().map(|c| c.code()) == Some("55P03") => break,
+                    Err(e) => panic!("unexpected error while probing the run row lock: {e}"),
+                }
+            }
+
             for i in 0..60 {
                 let mut txn = client.transaction().expect("begin concurrent-insert txn");
                 let memory_id: Uuid = txn

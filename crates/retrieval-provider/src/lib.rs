@@ -9,5 +9,6 @@ pub mod contract;
 pub mod cost;
 pub mod failover;
 pub mod health;
+pub mod metrics;
 pub mod pricing;
 pub mod router;

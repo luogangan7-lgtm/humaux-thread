@@ -7,6 +7,20 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 
+/// The one sanctioned raw `std::env::var` read site outside process bootstrap (`bins/*`) and
+/// CI-gate tooling (`xtask/`) — module doc/§50.1: "humaux-contracts owns the one legitimate
+/// config-read point". Every other crate that needs a single named environment variable's
+/// value (rather than the full typed [`resolve_effective_config`] flow, which expects the raw
+/// key/value map already assembled) calls this function instead of naming `std::env::var`
+/// itself; `xtask`'s §78 boundary lint (`architecture_check::env_var_scan`) is a hard CI gate
+/// that fails on any other file containing that call. Returns `None` for both "unset" and
+/// "present but empty" alike — callers that must tell those two apart read
+/// `std::env::var(name)`'s own `Result` directly instead of going through this helper, but no
+/// caller in this workspace has needed that distinction yet.
+pub fn read_env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
 /// 单条 typed config registry entry（§50 字段表逐字对应）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigEntry {

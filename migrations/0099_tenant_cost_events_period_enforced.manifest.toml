@@ -1,0 +1,47 @@
+# §46.1 migration manifest. Code-review remediation for 0096 (finding #8, minor): a DEFAULT
+# and a CHECK retrofitted onto the existing `period` column so an off-month value can no
+# longer silently corrupt the `GROUP BY period` billing rollup. `NOT VALID` + `VALIDATE
+# CONSTRAINT` keeps the lock window short; live check before this migration found
+# ops.tenant_cost_events empty (0 rows) in the dev DB, so validation is instant here, but the
+# two-step shape is correct discipline regardless of today's row count.
+
+migration_id = "0099_tenant_cost_events_period_enforced"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema='ops' and table_name='tenant_cost_events' and column_name='period'
+  )
+  and not exists (
+    select 1 from pg_constraint
+    where conrelid = 'ops.tenant_cost_events'::regclass
+      and conname = 'tenant_cost_events_period_is_month_start'
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema='ops' and table_name='tenant_cost_events' and column_name='period'
+      and column_default is not null
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conrelid = 'ops.tenant_cost_events'::regclass
+      and conname = 'tenant_cost_events_period_is_month_start'
+      and convalidated
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE ops.tenant_cost_events DROP CONSTRAINT IF EXISTS tenant_cost_events_period_is_month_start;
+          ALTER TABLE ops.tenant_cost_events ALTER COLUMN period DROP DEFAULT;
+(safe — removes only the default/constraint this migration added; no row touched.)
+"""
+
+backup_restore_requirement = "none (additive DEFAULT + NOT VALID/VALIDATE CHECK; ops.tenant_cost_events is empty in every environment this migration has been rehearsed against — re-check row count before running in an environment where it is not, since VALIDATE CONSTRAINT there would need a real full-table-scan lock budget)."

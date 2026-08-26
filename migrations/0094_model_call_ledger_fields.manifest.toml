@@ -1,0 +1,111 @@
+# §46.1 migration manifest (T7.4). §19.1 ModelCallLedger full field list on the existing
+# ops.model_call_ledger skeleton (0008, extended by 0080/0081 for `purpose` only) — pure ADD
+# COLUMN + one DROP/ADD CONSTRAINT on `purpose`'s CHECK (cannot edit 0080/0081 in place, rule
+# ③) + an append-only/one-shot-finalize guard trigger, same shape as 0047's
+# `ops.data_disclosures_guard_mutation`. RLS ENABLE/FORCE/policy is NOT this migration's
+# doing — 0012's blanket per-tenant_id-column sweep already covers this table (confirmed live,
+# see the .sql file's own comment); this manifest's postcheck asserts that state exists, but
+# nothing here creates it.
+#
+# Migration band: T7.4 was assigned 0094-0096 (this repo's coord process); confirmed free via
+# `ls migrations` (nothing above 0084 existed before this task started).
+
+migration_id = "0094_model_call_ledger_fields"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('ops.model_call_ledger') is not null
+  and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'ops' and table_name = 'model_call_ledger' and column_name = 'request_id'
+  )
+  and exists (
+    select 1 from information_schema.table_constraints
+    where table_schema = 'ops' and table_name = 'model_call_ledger'
+      and constraint_name = 'model_call_ledger_purpose_known'
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'ops' and table_name = 'model_call_ledger' and column_name = 'request_id'
+      and is_nullable = 'NO'
+  )
+  and exists (
+    select 1 from information_schema.columns
+    where table_schema = 'ops' and table_name = 'model_call_ledger' and column_name = 'actual_cost'
+  )
+  and (select relrowsecurity from pg_class where oid = 'ops.model_call_ledger'::regclass) = true
+  and (select relforcerowsecurity from pg_class where oid = 'ops.model_call_ledger'::regclass) = true
+  and (select tableowner from pg_tables where schemaname='ops' and tablename='model_call_ledger') = 'role_migration_owner'
+  and exists (select 1 from pg_policies where schemaname='ops' and tablename='model_call_ledger' and policyname='model_call_ledger_tenant_isolation')
+  and exists (select 1 from pg_trigger where tgname = 'model_call_ledger_guard_mutation' and not tgisinternal)
+  and exists (
+    select 1 from pg_constraint
+    where conrelid = 'ops.model_call_ledger'::regclass and conname = 'model_call_ledger_purpose_known'
+      and pg_get_constraintdef(oid) like '%embedding%'
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP TRIGGER IF EXISTS model_call_ledger_guard_mutation ON ops.model_call_ledger;
+          DROP FUNCTION IF EXISTS ops.model_call_ledger_guard_mutation();
+          -- Deliberately NOT touching the model_call_ledger_tenant_isolation policy or
+          -- RLS ENABLE/FORCE — those are 0012's, not this migration's; rolling them back here
+          -- would remove tenant isolation this migration never added.
+          --
+          -- MANDATORY before the CHECK re-add below (code-review finding #5, minor): purge
+          -- every row whose purpose is not 'query_rewrite'. The guard trigger is already
+          -- dropped above, so DELETE is possible again; the table is NOT reliably empty
+          -- (crates/adapters/tests/model_call_ledger.rs deliberately never deletes its own
+          -- rows — its Drop impl comment says so explicitly), and re-adding the narrower
+          -- 'query_rewrite'-only CHECK against any 'embedding'/'rerank' row fails outright
+          -- (`check constraint ... is violated by some row`, reproduced live inside a
+          -- BEGIN...ROLLBACK). This DELETE is data-destructive by design, same as the
+          -- DROP COLUMN statements below — it is the rollback's actual precondition, not an
+          -- optional cleanup step.
+          DELETE FROM ops.model_call_ledger WHERE purpose IS DISTINCT FROM 'query_rewrite';
+          ALTER TABLE ops.model_call_ledger DROP CONSTRAINT model_call_ledger_purpose_known;
+          ALTER TABLE ops.model_call_ledger
+            ADD CONSTRAINT model_call_ledger_purpose_known
+              CHECK (purpose IS NULL OR purpose = ANY (ARRAY['query_rewrite']::text[]));
+          ALTER TABLE ops.model_call_ledger
+            DROP CONSTRAINT model_call_ledger_request_id_unique,
+            DROP COLUMN request_id, DROP COLUMN workspace_id, DROP COLUMN model,
+            DROP COLUMN model_revision, DROP COLUMN input_tokens, DROP COLUMN billable_tokens,
+            DROP COLUMN candidate_count, DROP COLUMN candidate_tokens, DROP COLUMN cache_hit,
+            DROP COLUMN latency_ms, DROP COLUMN estimated_cost, DROP COLUMN actual_cost,
+            DROP COLUMN status, DROP COLUMN error_class, DROP COLUMN provider_request_id;
+          DROP INDEX IF EXISTS idx_model_call_ledger_tenant;
+(NOT safe on an "empty table" assumption — that assumption was wrong, verified live: 37+ rows
+exist in dev today across embedding/rerank/query_rewrite purposes. The DELETE above is
+unavoidable data loss for every non-query_rewrite row, same risk profile 0047 accepted for its
+own new columns, just triggered by the CHECK re-add rather than the DROP COLUMNs alone.)
+"""
+
+backup_restore_requirement = """
+NOT none — corrected after live verification (code-review finding #5, minor):
+ops.model_call_ledger already holds real rows in dev today (37+: embedding/rerank/
+query_rewrite), and this task's own adapters test suite
+(crates/adapters/tests/model_call_ledger.rs) deliberately leaves its rows in place rather than
+deleting them (see its Drop impl comment) — "still empty in dev/CI today" was never true once
+that test suite ran once. Back up ops.model_call_ledger before running the rollback above in
+any environment — the rollback's mandatory pre-CHECK DELETE is destructive to every
+non-query_rewrite row, not just a hypothetical future case.
+
+Separately (code-review finding #9, minor): the forward ADD COLUMN ... DEFAULT uuidv7() in the
+.sql is a VOLATILE default, which forces a full table rewrite under ACCESS EXCLUSIVE, and the
+same migration follows it with a non-CONCURRENT UNIQUE constraint and a non-CONCURRENT CREATE
+INDEX on ops.model_call_ledger — the highest-write table in the Provider Plane by definition
+(one row per external call). Free at today's row count; a real lock-duration risk on any
+environment that has run for a while. Already applied here and not worth re-running for 42
+rows, but record the shape for the next table this size: ADD COLUMN nullable, backfill in
+batches, SET NOT NULL, and CREATE INDEX/UNIQUE INDEX CONCURRENTLY outside the transaction
+(migrations/0099's NOT VALID + VALIDATE CONSTRAINT two-step is the same lock-minimizing idea
+applied to a CHECK instead of an index).
+"""

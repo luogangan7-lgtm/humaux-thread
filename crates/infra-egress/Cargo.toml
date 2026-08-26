@@ -19,6 +19,15 @@ humaux-infra-network = { path = "../infra-network" }
 # of it needs the identical macro.
 async-trait = "0.1"
 humaux-domain = { path = "../domain" }
+# `EgressSecret` (http.rs): zeroizes its backing buffer on drop. Already resolved transitively
+# (aes-gcm et al. depend on it, see Cargo.lock) — named directly here rather than hand-rolling
+# volatile-write zeroing, which this crate has no other reason to get subtly wrong.
+zeroize = "1"
+# `EnvCredentialSource` (http.rs) reads its named variable through this crate's
+# `config_registry::read_env_var` — the workspace's one sanctioned raw `std::env::var` call
+# site (§50.1) — rather than naming `std::env::var` itself, which `xtask`'s §78 boundary lint
+# forbids outside `crates/contracts/`/`bins/*`/`xtask/`/`tests/`.
+humaux-contracts = { path = "../contracts" }
 
 [dev-dependencies]
 # "net"/"io-util" back the tests' real `TcpListener` fixtures (§79: observe actual network

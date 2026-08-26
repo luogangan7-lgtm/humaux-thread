@@ -1,0 +1,38 @@
+# §46.1 migration manifest (G46-1 / G80-37). §19.2 Tenant Budget / Purpose Budget tiers:
+# widens 0091's table with one nullable column + a named CHECK + a partial index, additive
+# only, no existing row touched (new column is NULL-default, existing Global/Region rows keep
+# their correct NULL `purpose`). Corrects 0091's header-comment plan to reuse
+# control.quota_windows for these two tiers — see this migration's own header for the §72/§72.4
+# reasoning (quota_windows is the ENTITLEMENT/QUOTA system, not ProviderCost).
+
+migration_id = "0092_retrieval_provider_token_windows"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select not exists (
+  select 1 from information_schema.columns
+  where table_schema = 'control'
+    and table_name = 'retrieval_provider_admission_limits'
+    and column_name = 'purpose'
+) as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'control'
+      and table_name = 'retrieval_provider_admission_limits'
+      and column_name = 'purpose'
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conname = 'retrieval_provider_admission_limits_purpose_needs_tenant'
+  )
+  and to_regclass('control.retrieval_provider_admission_limits_tenant_lookup') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: ALTER TABLE control.retrieval_provider_admission_limits DROP COLUMN IF EXISTS purpose CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL — new nullable column, no rewrite of existing rows)"

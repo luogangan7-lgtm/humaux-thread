@@ -1,0 +1,43 @@
+# §46.1 migration manifest (T7.2 follow-up). Adds `embedding_dimension` to the existing
+# `control.retrieval_provider_routes` table (0088) so router.rs's Projection Compatibility
+# gate can check dimension, not just (provider_id, model_id) — pure ADD COLUMN + one CHECK,
+# same EXPAND-only shape 0094 used to widen `ops.model_call_ledger`.
+
+migration_id = "0089_retrieval_provider_routes_dimension"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('control.retrieval_provider_routes') is not null
+  and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'control' and table_name = 'retrieval_provider_routes'
+      and column_name = 'embedding_dimension'
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (
+    select 1 from information_schema.columns
+    where table_schema = 'control' and table_name = 'retrieval_provider_routes'
+      and column_name = 'embedding_dimension'
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conrelid = 'control.retrieval_provider_routes'::regclass
+      and conname = 'retrieval_provider_routes_dimension_with_embedding'
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE control.retrieval_provider_routes
+            DROP CONSTRAINT IF EXISTS retrieval_provider_routes_dimension_with_embedding,
+            DROP COLUMN IF EXISTS embedding_dimension;
+(safe — table carries zero real traffic rows in every environment this migration has been
+designed against; a later environment with real rows would lose only the new column's data.)
+"""
+
+backup_restore_requirement = "none if control.retrieval_provider_routes is still empty of real traffic rows (true in dev/CI today); back up the table first if a later environment has accumulated real routes before this migration runs."

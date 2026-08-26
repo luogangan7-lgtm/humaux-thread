@@ -692,6 +692,7 @@ dependencies = [
  "humaux-infra-cell",
  "humaux-projection",
  "humaux-retrieval",
+ "humaux-retrieval-provider",
  "humaux-telemetry",
  "humaux-testkit",
  "lettre",
@@ -796,10 +797,12 @@ name = "humaux-infra-egress"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "humaux-contracts",
  "humaux-domain",
  "humaux-infra-network",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -858,6 +861,21 @@ dependencies = [
 [[package]]
 name = "humaux-retrieval-provider"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "humaux-adapters",
+ "humaux-contracts",
+ "humaux-domain",
+ "humaux-infra-egress",
+ "humaux-testkit",
+ "postgres",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "trybuild",
+ "uuid",
+]
 
 [[package]]
 name = "humaux-retrieval-worker"

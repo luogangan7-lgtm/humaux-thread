@@ -2390,9 +2390,612 @@ pub fn g22_5_a1_sole_implementation(root: &Path) -> Verdict {
     }
 }
 
+// ============================================================================
+// §19 "Provider Plane Architecture Gate" — seven CI checks, spec text verbatim (module doc's
+// own §80.1.1 registry note): this section carries **no** G80-*/INV-*/D*-style id ("本段无
+// G80-*/INV-* 形式编号" — the p7 task digest's own instruction is "勿发明编号"), so each check
+// below is named descriptively, the same way [`dependency_rule_check`]/[`env_var_scan`]
+// already are for rules with no spec-assigned number.
+// ============================================================================
+
+/// DashScope SDK-specific identifier hits in `src`, line by line, skipping `//`-comment lines
+/// (same discipline as [`count_identifier_hits`]). Deliberately **not** a bare
+/// case-insensitive `"dashscope"` substring match: the bare lowercase word `"dashscope"` is
+/// this crate's own `ProviderId`/business-data value (a routing/health/pricing lookup key
+/// threaded through `router.rs`/`admission.rs`/`health.rs`/`metrics.rs`/test fixtures
+/// entirely legitimately) — matching on it would flag that data, not "importing the SDK".
+/// The needles here instead target the SDK-*shape* surface a real DashScope adapter carries
+/// and nothing else legitimately would: `Dashscope`-prefixed PascalCase type names
+/// (`DashscopeEmbeddingProvider`, `DashscopeEmbeddingRequest`, …), `dashscope_`-embedded
+/// snake_case names (`map_dashscope_status`), the literal API host, and a `dashscope::` path
+/// segment (`use dashscope::Client;`, `dashscope::embeddings::create(...)`) — the most likely
+/// real shape of the violation these gates name ("Domain does not import DashScope SDK"),
+/// added after a review found the original three-needle set scored zero hits on exactly that
+/// shape. The `::` suffix cannot collide with the bare lowercase `"dashscope"` `ProviderId`
+/// business-data string this crate's routing/health/pricing code legitimately carries (no
+/// `::` follows a string literal's contents). Confirmed against the real repo
+/// (`crates/retrieval-provider/src/adapters.rs` and its own `tests/`) to hit only there — see
+/// this function's own unit tests for the positive/negative pair that pins the distinction.
+fn provider_plane_dashscope_sdk_hits(src: &str) -> usize {
+    const NEEDLES: [&str; 4] = [
+        "Dashscope",
+        "dashscope_",
+        "dashscope.aliyuncs.com",
+        "dashscope::",
+    ];
+    src.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .map(|l| NEEDLES.iter().map(|n| l.matches(n).count()).sum::<usize>())
+        .sum()
+}
+
+/// Provider Plane Architecture Gate check 1/7: "Domain does not import DashScope SDK". Scans
+/// `crates/domain/src/**/*.rs` only — a real, fully-populated crate (not a T0.x placeholder),
+/// so `Pass` on zero hits is a genuine finding, not a vacuous one (contrast
+/// [`g20_2_no_hidden_generative_recall`]'s `NotApplicable`-when-all-placeholder branch, which
+/// does not apply here because `crates/domain` has never been a placeholder).
+fn provider_plane_gate1_domain_no_dashscope_sdk(root: &Path) -> Verdict {
+    let mut problems = Vec::new();
+    for (path, source) in read_files(&walk_files(&root.join("crates/domain/src"), &["rs"])) {
+        let hits = provider_plane_dashscope_sdk_hits(&source);
+        if hits > 0 {
+            problems.push(format!(
+                "{}: DashScope SDK identifier hits {hits} (§19 Provider Plane Architecture \
+                 Gate: \"Domain does not import DashScope SDK\")",
+                display(root, &path)
+            ));
+        }
+    }
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
+/// Provider Plane Architecture Gate check 2/7: "Application does not call DashScope directly".
+/// Same shape as check 1/7 against `crates/application/src/**/*.rs`.
+fn provider_plane_gate2_application_no_dashscope_direct(root: &Path) -> Verdict {
+    let mut problems = Vec::new();
+    for (path, source) in read_files(&walk_files(&root.join("crates/application/src"), &["rs"])) {
+        let hits = provider_plane_dashscope_sdk_hits(&source);
+        if hits > 0 {
+            problems.push(format!(
+                "{}: DashScope SDK identifier hits {hits} (§19 Provider Plane Architecture \
+                 Gate: \"Application does not call DashScope directly\")",
+                display(root, &path)
+            ));
+        }
+    }
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
+/// Provider Plane Architecture Gate check 3/7 home: the one module/tests pair allowed to name
+/// the DashScope SDK surface at all — `retrieval-provider::adapters` itself, plus its own
+/// `tests/` (a test file importing the adapter's public types to exercise it is not "a second
+/// importer of the provider client", it is the adapter's own test surface — same allowance
+/// [`SELF_FILE`] grants this checker over itself).
+fn provider_plane_gate3_home(disp: &str) -> bool {
+    disp == "crates/retrieval-provider/src/adapters.rs"
+        || disp.starts_with("crates/retrieval-provider/tests/")
+}
+
+/// Provider Plane Architecture Gate check 3/7: "Only retrieval-provider/adapters may import
+/// provider client". Whole-workspace scan ([`walk_workspace_rs`], same domain
+/// §20#G20-2/G80-39 uses) — any DashScope SDK identifier hit outside
+/// [`provider_plane_gate3_home`] is a second importer.
+fn provider_plane_gate3_only_adapters_import_provider_client(root: &Path) -> Verdict {
+    let mut problems = Vec::new();
+    for (path, source) in walk_workspace_rs(root) {
+        let disp = display(root, &path);
+        if provider_plane_gate3_home(&disp) {
+            continue;
+        }
+        let hits = provider_plane_dashscope_sdk_hits(&source);
+        if hits > 0 {
+            problems.push(format!(
+                "{disp}: DashScope SDK identifier hits {hits} outside retrieval-provider/\
+                 adapters (§19 Provider Plane Architecture Gate: \"Only retrieval-provider/\
+                 adapters may import provider client\")"
+            ));
+        }
+    }
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
+/// Provider Plane Architecture Gate checks 4-6/7 share one scan domain and one "is this
+/// feature even built yet" precondition: every source file in
+/// `crates/retrieval-provider/src/`, not just `adapters.rs` alone (§19 review: the original
+/// single-file scan meant a second external-call-carrying file — an eventual rerank or
+/// custom-endpoint adapter — would go unscanned entirely, so "every external retrieval call"
+/// was enforced against one file, not "every"). A directory that is absent, or whose every
+/// file is still a bare T0.x `占位模块` placeholder (see [`is_online_lane_placeholder`],
+/// reused here), has no real call graph to judge — `NotApplicable`, not a vacuous `Pass`, same
+/// precondition split [`g20_2_no_hidden_generative_recall`] applies to its own online-lane
+/// file set.
+const PROVIDER_PLANE_SRC_DIR: &str = "crates/retrieval-provider/src";
+
+/// External-call-site count for one file: `.call(`/`::call(` occurrences (non-comment lines),
+/// counted only in a file that also names the `ExternalCall` trait or its `HttpExternalCall`
+/// implementor (both contain the substring `"ExternalCall"`) — scoping the scan to files that
+/// actually deal with that trait, rather than the field name (`self.transport`) today's sole
+/// adapter happens to use. §19 review: the old needle (`".transport.call("`) failed open on a
+/// renamed field or an aliased/`.await`-chained call shape; driving detection off the trait's
+/// own method name instead survives both.
+fn provider_plane_external_call_sites(source: &str) -> usize {
+    if !source.contains("ExternalCall") {
+        return 0;
+    }
+    count_code_line_hits(source, ".call(") + count_code_line_hits(source, "::call(")
+}
+
+/// Blanks every `/* ... */` block-comment span in `source` (bytes replaced with spaces,
+/// newlines preserved so line numbers are unaffected — same discipline
+/// [`strip_cfg_test_module`] uses for its own brace-matched span). An unterminated `/*` blanks
+/// to the end of the string rather than panicking or looping.
+fn strip_block_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let end = tail.find("*/").map(|e| e + 2).unwrap_or(tail.len());
+        out.extend(
+            tail[..end]
+                .chars()
+                .map(|c| if c == '\n' { '\n' } else { ' ' }),
+        );
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The prefix of `line` up to (excluding) its first `//` that is not inside a `"..."` string
+/// literal — a trailing comment (`let n = 1; // needle`) must not count as real code (§19
+/// review: `count_code_line_hits` previously only skipped a line whose *leading* trimmed text
+/// was `//`, so a trailing comment on an otherwise-real code line still counted). No escape
+/// handling — this codebase's own needle strings never place an escaped `"` before a same-line
+/// `//` (see this function's own tests for the shapes it does handle). A leading full-line
+/// comment reduces to `""` here too, so this alone replaces the old leading-only filter.
+fn code_before_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+/// Non-comment-line occurrence count of `needle` in `src` (plain substring, no identifier
+/// boundary — the companion needles this feeds are multi-word/qualified paths like
+/// `"admission::decide("`, not bare identifiers [`count_identifier_hits`] is built for).
+/// Strips `/* */` block comments over the whole source first, then a trailing `//` comment (if
+/// any, outside a string literal) from each remaining line before matching.
+fn count_code_line_hits(src: &str, needle: &str) -> usize {
+    strip_block_comments(src)
+        .lines()
+        .map(|l| code_before_line_comment(l).matches(needle).count())
+        .sum()
+}
+
+/// Shared body for Architecture Gate checks 4-6/7: `companion_needles` is the evidence a real
+/// external-call site must also carry (egress permit minting / ModelCallLedger write /
+/// admission participation); `rule_name` and `not_yet_wired_note` are this check's own §19
+/// quote and the missing-object explanation for the "call site exists, companion integration
+/// does not yet" state.
+///
+/// Three-way split on the companion evidence, not two: real code-line hits ⇒ `Pass`; **zero**
+/// code-line hits but the companion is named somewhere in a `//`-comment ⇒ `Fail` — a doc
+/// comment claiming the integration exists without a line of code that does it is exactly the
+/// 伪修复 shape repo CLAUDE.md's 交付准则 names ("拒绝伪修复：改表层没动根因"); zero hits
+/// anywhere at all ⇒ `NotApplicable`, the honest "not yet wired, a separate task's
+/// deliverable" state — not a silent `Pass`.
+fn provider_plane_call_site_companion_check(
+    root: &Path,
+    companion_needles: &[&str],
+    rule_name: &str,
+    not_yet_wired_note: &str,
+) -> Verdict {
+    let files = read_files(&walk_files(&root.join(PROVIDER_PLANE_SRC_DIR), &["rs"]));
+    if files.is_empty() {
+        return Verdict::NotApplicable(format!(
+            "{PROVIDER_PLANE_SRC_DIR}/ (absent) — §19 Provider Plane Architecture Gate: \
+             \"{rule_name}\""
+        ));
+    }
+    if files.iter().all(|(_, s)| is_online_lane_placeholder(s)) {
+        return Verdict::NotApplicable(format!(
+            "{PROVIDER_PLANE_SRC_DIR}/ (T0.x placeholder) — §19 Provider Plane Architecture \
+             Gate: \"{rule_name}\""
+        ));
+    }
+
+    let mut call_sites = 0usize;
+    let mut real_hits = 0usize;
+    let mut comment_only_files: Vec<String> = Vec::new();
+    for (path, source) in &files {
+        let sites = provider_plane_external_call_sites(source);
+        if sites == 0 {
+            continue;
+        }
+        call_sites += sites;
+        let file_real: usize = companion_needles
+            .iter()
+            .map(|n| count_code_line_hits(source, n))
+            .sum();
+        if file_real > 0 {
+            real_hits += file_real;
+            continue;
+        }
+        let file_comment: usize = companion_needles
+            .iter()
+            .map(|n| source.matches(n).count()) // includes comment lines, unlike count_code_line_hits
+            .sum();
+        if file_comment > 0 {
+            comment_only_files.push(display(root, path));
+        }
+    }
+
+    if call_sites == 0 {
+        // §19 review: this used to be a vacuous `Pass` ("no call site found, no violation
+        // possible") — indistinguishable from the needle simply missing a real call site (a
+        // renamed field, an aliased call). `NotApplicable` names the gap instead of silently
+        // going green either way when needle drift, not a genuinely-empty call graph, is the
+        // cause.
+        return Verdict::NotApplicable(format!(
+            "{PROVIDER_PLANE_SRC_DIR}/*.rs: no external call site matched (`.call(`/`::call(` \
+             in a file naming `ExternalCall`) — §19 Provider Plane Architecture Gate: \
+             \"{rule_name}\""
+        ));
+    }
+    if real_hits > 0 {
+        return Verdict::Pass;
+    }
+    if !comment_only_files.is_empty() {
+        return Verdict::Fail(vec![format!(
+            "{call_sites} external call site(s) across {PROVIDER_PLANE_SRC_DIR}/ \
+             ({comment_only_files:?}), and {not_yet_wired_note} appears only in a comment, \
+             never in real code — §19 Provider Plane Architecture Gate: \"{rule_name}\""
+        )]);
+    }
+    Verdict::NotApplicable(format!(
+        "{PROVIDER_PLANE_SRC_DIR}/*.rs: {call_sites} external call site(s) found, but no \
+         {not_yet_wired_note} — §19 Provider Plane Architecture Gate: \"{rule_name}\" (a \
+         separate task's deliverable not yet wired into the real call path)"
+    ))
+}
+
+/// Provider Plane Architecture Gate check 4/7: "Every external retrieval call passes
+/// EgressPolicy". Real positive finding today: `DashscopeEmbeddingProvider::embed` mints an
+/// `EgressPermit` via `egress::authorize(...)` before its one `.transport.call(` — this is the
+/// one of the seven checks whose real target already exists end to end (T4.1's `EgressPermit`
+/// topology + T7.1's adapter wiring), so this check is a real `Pass`, not `NotApplicable`.
+fn provider_plane_gate4_egress_policy_before_external_call(root: &Path) -> Verdict {
+    provider_plane_call_site_companion_check(
+        root,
+        &["authorize("],
+        "Every external retrieval call passes EgressPolicy",
+        "EgressPermit-minting `authorize(` call",
+    )
+}
+
+/// Provider Plane Architecture Gate check 5/7: "Every external retrieval call creates
+/// ModelCallLedger entry". `adapters::model_call_ledger::reserve_call`/`finalize` (§19.1) are
+/// real (T7.4) but not yet called from `DashscopeEmbeddingProvider::embed` — the digest's own
+/// task 4 ("ModelCallLedger + Pricing Registry") wires the *table*; wiring it into *this* call
+/// site is out of this task's file ownership (`adapters.rs` belongs to T7.1). `NotApplicable`
+/// is the honest state, not a silently-passing `Pass`.
+fn provider_plane_gate5_ledger_entry_per_external_call(root: &Path) -> Verdict {
+    provider_plane_call_site_companion_check(
+        root,
+        &["model_call_ledger", "ModelCallLedger"],
+        "Every external retrieval call creates ModelCallLedger entry",
+        "ModelCallLedger reserve/finalize reference",
+    )
+}
+
+/// Provider Plane Architecture Gate check 6/7: "Every call participates in provider admission
+/// control". `admission::decide`/`AdmissionRequest` (§19 Admission Controller) are real (T7.3)
+/// but not yet called from `DashscopeEmbeddingProvider::embed` — same "table built, call site
+/// not yet wired to it, out of this task's file ownership" state as check 5/7.
+fn provider_plane_gate6_admission_participation(root: &Path) -> Verdict {
+    provider_plane_call_site_companion_check(
+        root,
+        &["admission::decide(", "AdmissionRequest"],
+        "Every call participates in provider admission control",
+        "admission::decide/AdmissionRequest reference",
+    )
+}
+
+/// The tail of `source` starting at `insert_idx` (the byte offset of an `INSERT INTO
+/// private.processing_runs` match), up to the closing `"` of the enclosing Rust string literal
+/// — i.e. the SQL statement text itself, not the whole file. No escape handling: this
+/// codebase's own INSERT-statement string literals never place an escaped `"` inside the SQL
+/// text (see this function's own tests). Falls back to the rest of `source` if no closing
+/// quote is found (malformed/truncated fixture — better to over-scan than panic).
+fn insert_statement_text(source: &str, insert_idx: usize) -> &str {
+    let bytes = source.as_bytes();
+    let mut i = insert_idx;
+    while i < bytes.len() {
+        if bytes[i] == b'"' && bytes.get(i.wrapping_sub(1)) != Some(&b'\\') {
+            return &source[insert_idx..i];
+        }
+        i += 1;
+    }
+    &source[insert_idx..]
+}
+
+/// Provider Plane Architecture Gate check 7/7: "Embedding projection write contains
+/// provider/model/version metadata". `private.processing_runs.model_provider`/`model_id`/
+/// `model_revision` are already `NOT NULL` at the DB layer (`migrations/0064_processing_runs_
+/// axes_and_retrieval_cards_model_fix.sql`); whole-workspace scan of every `INSERT INTO
+/// private.processing_runs` call site.
+///
+/// `**/tests/**` is excluded from the evidence set (§19 review): a test fixture proves the
+/// matcher works, not that a real production write path exists —
+/// `crates/adapters/tests/processing_runs_fingerprint_rerun.rs`'s own fixture is the *only*
+/// hit in the workspace today, so counting it would green this gate on a test double, exactly
+/// the false-assurance shape §57.1's three-state rule exists to prevent. `NotApplicable` until
+/// a real (non-`tests/`) call site lands.
+///
+/// The three metadata-field checks are scoped to the matched INSERT statement's own text
+/// ([`insert_statement_text`]), not the whole file — a file whose INSERT omits a column but
+/// happens to mention its name elsewhere (a struct field, an unrelated `SELECT`) must not
+/// count as carrying it.
+fn provider_plane_gate7_projection_write_has_model_metadata(root: &Path) -> Verdict {
+    const INSERT_NEEDLE: &str = "INSERT INTO private.processing_runs";
+    const METADATA_FIELDS: [&str; 3] = ["model_provider", "model_id", "model_revision"];
+
+    let mut insert_sites: Vec<String> = Vec::new();
+    let mut incomplete: Vec<String> = Vec::new();
+    for (path, source) in walk_workspace_rs(root) {
+        let disp = display(root, &path);
+        if disp.contains("/tests/") {
+            continue;
+        }
+        let mut search = 0usize;
+        while let Some(rel) = source[search..].find(INSERT_NEEDLE) {
+            let idx = search + rel;
+            insert_sites.push(disp.clone());
+            let stmt = insert_statement_text(&source, idx);
+            let missing: Vec<&str> = METADATA_FIELDS
+                .iter()
+                .copied()
+                .filter(|f| !stmt.contains(f))
+                .collect();
+            if !missing.is_empty() {
+                incomplete.push(format!(
+                    "{disp}: INSERT INTO private.processing_runs missing {missing:?} (§19 \
+                     Provider Plane Architecture Gate: \"Embedding projection write contains \
+                     provider/model/version metadata\")"
+                ));
+            }
+            search = idx + INSERT_NEEDLE.len();
+        }
+    }
+    if !incomplete.is_empty() {
+        return Verdict::Fail(incomplete);
+    }
+    if insert_sites.is_empty() {
+        return Verdict::NotApplicable(
+            "no `INSERT INTO private.processing_runs` call site outside tests/ yet (§19 \
+             embedding-projection write path, a later Phase's deliverable — only a test \
+             fixture exists today) — §19 Provider Plane Architecture Gate: \"Embedding \
+             projection write contains provider/model/version metadata\""
+                .to_string(),
+        );
+    }
+    Verdict::Pass
+}
+
+// ============================================================================
+// §19 Embedding Provider Failover 硬规则 — sole decision point. Added per code review
+// (blocker): `failover::decide_embedding_failover`'s own rustdoc claims to be "the only place
+// in the workspace that may declare two ProjectionContracts failover-compatible", but
+// `router.rs::projection_compatible` independently hand-rolled the identical
+// provider_id/model_id/dimension comparison (via its own `ProjectionRef` type) without ever
+// calling through it — and, per its own module doc, without `normalization`/`projection_version`
+// at all.
+//
+// Fixed by extracting the actual 5-axis comparison out of `decide_embedding_failover` into
+// `failover::projection_contracts_compatible` — a permit-free pure function
+// `decide_embedding_failover` itself now calls after its own permit checks. `router.rs` cannot
+// call `decide_embedding_failover` directly: that function requires a live `EgressPermit`, and
+// `router::resolve` runs *before* a route (and therefore a `ProcessorId` a permit could be
+// minted for) has been chosen (`router::projection_compatible`'s own doc). Calling either
+// function is still routing through the one real comparison — this gate accepts both, so a
+// second *independently hand-rolled* comparison remains exactly as impossible as it was when
+// only `decide_embedding_failover` existed.
+// ============================================================================
+
+/// Pure comparator: `hits` is every file (outside `failover.rs`) that names the `ProjectionRef`
+/// type — router.rs's own embedding-projection-compatibility reference type — without calling
+/// through either `failover::decide_embedding_failover` (the permit-gated real egress call
+/// site) or `failover::projection_contracts_compatible` (the permit-free pure comparator that
+/// function itself delegates to, and the one a pre-permit caller like `router.rs` uses
+/// instead — see this section's own module comment). Empty ⇒ the sole decision point holds;
+/// any hit ⇒ a second, independently-maintained comparison exists that can silently diverge
+/// from the 5-axis rule.
+pub fn embedding_failover_sole_decision_point_check(hits: &[String]) -> Verdict {
+    if hits.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(
+            hits.iter()
+                .map(|f| {
+                    format!(
+                        "{f}: defines/uses `ProjectionRef` without calling \
+                         `failover::decide_embedding_failover` or \
+                         `failover::projection_contracts_compatible` — §19 Embedding Provider \
+                         Failover 硬规则 names those the sole places that may declare two \
+                         projection contracts failover-compatible"
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+const EMBEDDING_FAILOVER_HOME: &str = "crates/retrieval-provider/src/failover.rs";
+
+fn provider_plane_embedding_failover_sole_decision_point(root: &Path) -> Verdict {
+    let hits: Vec<String> = walk_workspace_rs(root)
+        .into_iter()
+        .filter_map(|(path, source)| {
+            let disp = display(root, &path);
+            if disp == EMBEDDING_FAILOVER_HOME {
+                return None;
+            }
+            let has_projection_ref = source.contains("ProjectionRef");
+            let delegates = source.contains("decide_embedding_failover(")
+                || source.contains("projection_contracts_compatible(");
+            (has_projection_ref && !delegates).then_some(disp)
+        })
+        .collect();
+    embedding_failover_sole_decision_point_check(&hits)
+}
+
+// ============================================================================
+// §19 DOD-028 Retrieval Credential Boundary — added per code review (minor): the credential
+// boundary this task introduced (`HttpExternalCall::call`'s purpose guard binding the platform
+// retrieval credential to `RetrievalEmbedding`/`RetrievalRerank`, and `EgressSecret::expose`'s
+// own doc claim of "exactly one hit per call site") shipped with no CI gate asserting either
+// stayed true. Two checks, same `== 1`/set-equality shape the file's other sole-construction-
+// point checks (`payload_sha256`, `Authority::new`) already use.
+// ============================================================================
+
+const EGRESS_SECRET_HOME: &str = "crates/infra-egress/src/http.rs";
+
+/// (a) `EgressSecret::expose` call-site set == `{crates/infra-egress/src/http.rs}`. A file
+/// counts as a call site only if it also names `EgressSecret` itself — a bare `.expose(` text
+/// match alone would also hit `crates/adapters/src/byok.rs`'s unrelated
+/// `PlaintextApiKey::expose`, a different credential type for a different trust domain
+/// (USER_REASONING BYOK, not the platform retrieval credential this check is about).
+/// `walk_workspace_rs` already strips `#[cfg(test)]` bodies, so this file's own test-only
+/// `secret.expose()` assertion does not count as a second site.
+fn g_egress_secret_expose_sole_call_site(root: &Path) -> Verdict {
+    let hits: Vec<String> = walk_workspace_rs(root)
+        .into_iter()
+        .map(|(p, s)| (display(root, &p), s))
+        .filter(|(disp, s)| {
+            disp != EGRESS_SECRET_HOME && s.contains("EgressSecret") && s.contains(".expose(")
+        })
+        .map(|(disp, _)| {
+            format!(
+                "{disp}: reads an `EgressSecret` via `.expose()` outside the one sanctioned \
+                 call site {EGRESS_SECRET_HOME} (that module's own doc, \"Credential \
+                 injection\": \"a grep for who reads a raw egress credential has exactly one \
+                 hit per call site\")"
+            )
+        })
+        .collect();
+    if hits.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(hits)
+    }
+}
+
+/// (b) the §19 DOD-028 purpose guard from the blocker/major review finding actually exists:
+/// `HttpExternalCall::call` must bind the platform retrieval credential to
+/// `RetrievalEmbedding`/`RetrievalRerank` before it ever resolves that credential — "任何 User
+/// BYOK MUST NOT 被 Retrieval Provider Plane 自动借用". Textual, like this file's other checks:
+/// looks for the exact guard shape rather than parsing control flow, so a rewrite that keeps
+/// the same restriction under different wording would need this needle updated too — same
+/// trade-off every other check in this file already accepts.
+fn g_retrieval_credential_purpose_guard_exists(root: &Path) -> Verdict {
+    let files = walk_workspace_rs(root);
+    let Some((_, source)) = files
+        .iter()
+        .find(|(p, _)| display(root, p) == EGRESS_SECRET_HOME)
+    else {
+        return Verdict::NotApplicable(format!("{EGRESS_SECRET_HOME} not found"));
+    };
+    let has_guard = source
+        .contains("PrivateDataPurpose::RetrievalEmbedding | PrivateDataPurpose::RetrievalRerank");
+    if has_guard {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(vec![format!(
+            "{EGRESS_SECRET_HOME}: `HttpExternalCall::call` has no guard binding the platform \
+             retrieval credential to RetrievalEmbedding/RetrievalRerank permits — §19 DOD-028"
+        )])
+    }
+}
+
+/// The seven §19 Provider Plane Architecture Gate checks, factored out of [`run`] so that
+/// function stays under clippy's `too_many_lines` threshold — same reason this file already
+/// splits other check families into their own functions.
+fn provider_plane_architecture_gate_checks(root: &Path) -> Vec<(&'static str, Verdict)> {
+    vec![
+        (
+            "§19 Provider Plane Architecture Gate 1/7 (Domain does not import DashScope SDK)",
+            provider_plane_gate1_domain_no_dashscope_sdk(root),
+        ),
+        (
+            "§19 Provider Plane Architecture Gate 2/7 (Application does not call DashScope \
+             directly)",
+            provider_plane_gate2_application_no_dashscope_direct(root),
+        ),
+        (
+            "§19 Provider Plane Architecture Gate 3/7 (Only retrieval-provider/adapters may \
+             import provider client)",
+            provider_plane_gate3_only_adapters_import_provider_client(root),
+        ),
+        (
+            "§19 Provider Plane Architecture Gate 4/7 (Every external retrieval call passes \
+             EgressPolicy)",
+            provider_plane_gate4_egress_policy_before_external_call(root),
+        ),
+        (
+            "§19 Provider Plane Architecture Gate 5/7 (Every external retrieval call creates \
+             ModelCallLedger entry)",
+            provider_plane_gate5_ledger_entry_per_external_call(root),
+        ),
+        (
+            "§19 Provider Plane Architecture Gate 6/7 (Every call participates in provider \
+             admission control)",
+            provider_plane_gate6_admission_participation(root),
+        ),
+        (
+            "§19 Embedding Provider Failover 硬规则 (decide_embedding_failover / \
+             projection_contracts_compatible sole decision point)",
+            provider_plane_embedding_failover_sole_decision_point(root),
+        ),
+        (
+            "§19 Provider Plane Architecture Gate 7/7 (Embedding projection write contains \
+             provider/model/version metadata)",
+            provider_plane_gate7_projection_write_has_model_metadata(root),
+        ),
+        (
+            "§19 DOD-028 (a) EgressSecret::expose sole call site",
+            g_egress_secret_expose_sole_call_site(root),
+        ),
+        (
+            "§19 DOD-028 (b) retrieval credential purpose guard exists",
+            g_retrieval_credential_purpose_guard_exists(root),
+        ),
+    ]
+}
+
 pub fn run(_args: &[String]) -> i32 {
     let root = workspace_root();
-    let checks: Vec<(&str, Verdict)> = vec![
+    let mut checks: Vec<(&str, Verdict)> = vec![
         (
             "§53.3 规则1 (Outcome<_> fallback outside abstain)",
             rule1_forbidden_fallback(&root),
@@ -2463,6 +3066,7 @@ pub fn run(_args: &[String]) -> i32 {
             g22_5_a1_sole_implementation(&root),
         ),
     ];
+    checks.extend(provider_plane_architecture_gate_checks(&root));
 
     let mut had_fail = false;
     for (name, verdict) in &checks {
@@ -4386,5 +4990,747 @@ mod tests {
     fn write_a1_fixture(tmp: &Path, home_body: &str) {
         fs::create_dir_all(tmp.join("crates/domain/src")).unwrap();
         fs::write(tmp.join("crates/domain/src/ledger.rs"), home_body).unwrap();
+    }
+
+    // ========================================================================================
+    // §19 Provider Plane Architecture Gate — 7 checks
+    // ========================================================================================
+
+    /// Positive/negative pin for [`provider_plane_dashscope_sdk_hits`]'s own core claim: the
+    /// bare business-data string `"dashscope"` (a `ProviderId` value, legitimate everywhere)
+    /// must NOT count, while the real SDK-shape needles (PascalCase type name, snake_case
+    /// name fragment, literal API host) must.
+    #[test]
+    fn provider_plane_dashscope_sdk_hits_distinguishes_data_from_sdk_surface() {
+        assert_eq!(
+            provider_plane_dashscope_sdk_hits("let p = ProviderId(\"dashscope\".into());"),
+            0,
+            "the bare provider_id string value must not count as SDK-surface"
+        );
+        assert_eq!(
+            provider_plane_dashscope_sdk_hits("pub struct DashscopeEmbeddingProvider {}"),
+            1
+        );
+        assert_eq!(
+            provider_plane_dashscope_sdk_hits("pub fn map_dashscope_status(s: u16) {}"),
+            1
+        );
+        assert_eq!(
+            provider_plane_dashscope_sdk_hits(
+                "const URL: &str = \"https://dashscope.aliyuncs.com/v1\";"
+            ),
+            1
+        );
+        assert_eq!(
+            provider_plane_dashscope_sdk_hits("// mentions Dashscope only in a comment"),
+            0,
+            "comment lines are skipped, same discipline as count_identifier_hits"
+        );
+        // §19 review: the original three-needle set scored 0 on exactly this shape — a Rust
+        // path import of the SDK crate — despite it being the rule's own named example
+        // ("Domain does not import DashScope SDK").
+        assert_eq!(
+            provider_plane_dashscope_sdk_hits("use dashscope::Client;"),
+            1,
+            "a bare `use dashscope::...` import must count as an SDK hit"
+        );
+        assert_eq!(
+            provider_plane_dashscope_sdk_hits("dashscope::embeddings::create(&req).await?;"),
+            1
+        );
+        assert_eq!(
+            provider_plane_dashscope_sdk_hits("let p = ProviderId(\"dashscope\".into());"),
+            0,
+            "the `dashscope::` needle must still not collide with the bare business-data \
+             string — no `::` follows a string literal's contents"
+        );
+    }
+
+    // -- Gate 1/7: Domain does not import DashScope SDK -------------------------------------
+
+    #[test]
+    fn provider_plane_gate1_real_repo_is_clean() {
+        assert_eq!(
+            provider_plane_gate1_domain_no_dashscope_sdk(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    /// 注错: inject a `Dashscope`-named type into `crates/domain/src/` → red.
+    #[test]
+    fn provider_plane_gate1_fault_dashscope_type_in_domain_is_red() {
+        let tmp = fresh_tmp("pp-gate1-fault");
+        let dir = tmp.join("crates/domain/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("leak.rs"),
+            "pub struct DashscopeEmbeddingProvider;\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            provider_plane_gate1_domain_no_dashscope_sdk(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (§19 review): a bare `use dashscope::...` import — the rule's own named example,
+    /// and the shape the original three-needle set missed entirely (0 hits) — must also be
+    /// caught.
+    #[test]
+    fn provider_plane_gate1_fault_dashscope_path_import_in_domain_is_red() {
+        let tmp = fresh_tmp("pp-gate1-fault-import");
+        let dir = tmp.join("crates/domain/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("leak.rs"), "use dashscope::Client;\n").unwrap();
+        assert!(matches!(
+            provider_plane_gate1_domain_no_dashscope_sdk(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 正向对照: the same domain dir with only the legitimate business-data string is green —
+    /// proves the fault above is the SDK-shape needle, not any mention of the word.
+    #[test]
+    fn provider_plane_gate1_business_data_string_alone_is_green() {
+        let tmp = fresh_tmp("pp-gate1-green");
+        let dir = tmp.join("crates/domain/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("ok.rs"), "let provider = \"dashscope\";\n").unwrap();
+        assert_eq!(
+            provider_plane_gate1_domain_no_dashscope_sdk(&tmp),
+            Verdict::Pass
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // -- Gate 2/7: Application does not call DashScope directly -----------------------------
+
+    #[test]
+    fn provider_plane_gate2_real_repo_is_clean() {
+        assert_eq!(
+            provider_plane_gate2_application_no_dashscope_direct(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    /// 注错: inject a direct DashScope call into `crates/application/src/` → red.
+    #[test]
+    fn provider_plane_gate2_fault_dashscope_call_in_application_is_red() {
+        let tmp = fresh_tmp("pp-gate2-fault");
+        let dir = tmp.join("crates/application/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("leak.rs"),
+            "fn go() { let _ = map_dashscope_status(200); }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            provider_plane_gate2_application_no_dashscope_direct(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // -- Gate 3/7: Only retrieval-provider/adapters may import provider client --------------
+
+    #[test]
+    fn provider_plane_gate3_real_repo_is_clean() {
+        assert_eq!(
+            provider_plane_gate3_only_adapters_import_provider_client(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    /// 注错: a second importer of the DashScope SDK surface outside retrieval-provider/
+    /// adapters (here: `crates/retrieval-provider/src/router.rs`, a sibling module in the
+    /// *same* crate — proves the home is the `adapters.rs` file, not the whole crate) → red.
+    #[test]
+    fn provider_plane_gate3_fault_second_importer_outside_adapters_is_red() {
+        let tmp = fresh_tmp("pp-gate3-fault");
+        let dir = tmp.join("crates/retrieval-provider/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("router.rs"),
+            "pub struct DashscopeEmbeddingProvider;\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            provider_plane_gate3_only_adapters_import_provider_client(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 正向对照: the identical SDK-shape identifier inside the real home
+    /// (`crates/retrieval-provider/src/adapters.rs`) is green — proves the fault above fires
+    /// on *location*, not on the identifier's mere presence anywhere.
+    #[test]
+    fn provider_plane_gate3_same_identifier_inside_home_is_green() {
+        let tmp = fresh_tmp("pp-gate3-green");
+        let dir = tmp.join("crates/retrieval-provider/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("adapters.rs"),
+            "pub struct DashscopeEmbeddingProvider;\n",
+        )
+        .unwrap();
+        assert_eq!(
+            provider_plane_gate3_only_adapters_import_provider_client(&tmp),
+            Verdict::Pass
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 正向对照: the adapter's own `tests/` directory is exempt too (§19's "adapters" reading
+    /// includes the module's own test surface, module doc).
+    #[test]
+    fn provider_plane_gate3_own_tests_dir_is_exempt() {
+        let tmp = fresh_tmp("pp-gate3-tests-green");
+        let dir = tmp.join("crates/retrieval-provider/tests");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("dashscope_live_smoke.rs"),
+            "pub struct DashscopeEmbeddingProvider;\n",
+        )
+        .unwrap();
+        assert_eq!(
+            provider_plane_gate3_only_adapters_import_provider_client(&tmp),
+            Verdict::Pass
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // -- Gates 4-6/7: shared companion-check helper ------------------------------------------
+
+    /// `body` is prefixed with an `ExternalCall` mention — matching the real adapter's own
+    /// `use humaux_domain::egress::{ExternalCall, ...}` — since [`provider_plane_external_call_sites`]
+    /// now scopes its `.call(`/`::call(` scan to files that name the trait (§19 review: no
+    /// longer keyed on the one field name `self.transport`).
+    fn write_adapter_home(tmp: &Path, body: &str) {
+        let dir = tmp.join("crates/retrieval-provider/src");
+        fs::create_dir_all(&dir).unwrap();
+        let full = format!("use humaux_domain::egress::ExternalCall;\n{body}");
+        fs::write(dir.join("adapters.rs"), full).unwrap();
+    }
+
+    #[test]
+    fn provider_plane_gate4_real_repo_egress_is_wired() {
+        // Unlike 5/7 and 6/7, this one has a real, already-wired target (T7.1's adapter) —
+        // pin it as a real `Pass`, not `NotApplicable`, so a regression that un-wires
+        // `egress::authorize` from the real call site is caught, not swallowed.
+        assert_eq!(
+            provider_plane_gate4_egress_policy_before_external_call(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    /// §19 review: a real, non-placeholder home with the `ExternalCall` trait named but zero
+    /// `.call(`/`::call(` hits ⇒ `NotApplicable` (needle found nothing to require), never the
+    /// old vacuous `Pass` a caller could not distinguish from "needle drifted and missed a
+    /// real call site".
+    #[test]
+    fn provider_plane_gate456_no_call_site_is_not_applicable() {
+        let tmp = fresh_tmp("pp-gate456-no-call-site");
+        write_adapter_home(&tmp, "pub struct Real;\nfn placeholder_only() {}\n");
+        for check in [
+            provider_plane_gate4_egress_policy_before_external_call,
+            provider_plane_gate5_ledger_entry_per_external_call,
+            provider_plane_gate6_admission_participation,
+        ] {
+            assert!(matches!(check(&tmp), Verdict::NotApplicable(_)));
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// §19 review: renaming the field the call is made through (`self.transport` →
+    /// `self.http_client`) must not fail the call-site scan open — the old needle
+    /// (`".transport.call("`) depended on that exact field name.
+    #[test]
+    fn provider_plane_gate4_call_site_detected_through_a_renamed_field() {
+        let tmp = fresh_tmp("pp-gate4-renamed-field");
+        write_adapter_home(
+            &tmp,
+            "fn embed() {\n    let permit = egress::authorize(x, y, z)?;\n    self.http_client.call(&permit, &payload);\n}\n",
+        );
+        assert_eq!(
+            provider_plane_gate4_egress_policy_before_external_call(&tmp),
+            Verdict::Pass
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// §19 review: a second file in the crate (not `adapters.rs`) carrying its own external
+    /// call site must be scanned too, not silently skipped.
+    #[test]
+    fn provider_plane_gate4_call_site_in_a_second_crate_file_is_scanned() {
+        let tmp = fresh_tmp("pp-gate4-second-file");
+        let dir = tmp.join("crates/retrieval-provider/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("rerank_adapter.rs"),
+            "use humaux_domain::egress::ExternalCall;\nfn rerank() {\n    let permit = egress::authorize(x, y, z)?;\n    self.transport.call(&permit, &payload);\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            provider_plane_gate4_egress_policy_before_external_call(&tmp),
+            Verdict::Pass
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错: absent adapters.rs ⇒ `NotApplicable`, not a vacuous `Pass`.
+    #[test]
+    fn provider_plane_gate456_absent_home_is_not_applicable() {
+        let tmp = fresh_tmp("pp-gate456-absent");
+        fs::create_dir_all(&tmp).unwrap();
+        for check in [
+            provider_plane_gate4_egress_policy_before_external_call,
+            provider_plane_gate5_ledger_entry_per_external_call,
+            provider_plane_gate6_admission_participation,
+        ] {
+            assert!(matches!(check(&tmp), Verdict::NotApplicable(_)));
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错: a T0.x placeholder home ⇒ `NotApplicable`, not `Pass` (no real call graph to
+    /// judge yet — same precondition [`g20_2_no_hidden_generative_recall`] applies).
+    #[test]
+    fn provider_plane_gate456_placeholder_home_is_not_applicable() {
+        let tmp = fresh_tmp("pp-gate456-placeholder");
+        write_adapter_home(&tmp, "//! retrieval-provider::adapters — 占位模块\n");
+        for check in [
+            provider_plane_gate4_egress_policy_before_external_call,
+            provider_plane_gate5_ledger_entry_per_external_call,
+            provider_plane_gate6_admission_participation,
+        ] {
+            assert!(matches!(check(&tmp), Verdict::NotApplicable(_)));
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错: a real (non-placeholder) home with a call site but zero companion evidence at
+    /// all ⇒ `NotApplicable` (honest "not yet wired"), never a silent `Pass`.
+    #[test]
+    fn provider_plane_gate4_fault_call_site_without_authorize_is_not_applicable() {
+        let tmp = fresh_tmp("pp-gate4-fault");
+        write_adapter_home(
+            &tmp,
+            "pub struct Real;\nfn embed() { self.transport.call(&permit, &payload); }\n",
+        );
+        assert!(matches!(
+            provider_plane_gate4_egress_policy_before_external_call(&tmp),
+            Verdict::NotApplicable(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 正向对照 (红转绿): the identical fixture, with a real (non-comment) `authorize(` call
+    /// added, goes green.
+    #[test]
+    fn provider_plane_gate4_fault_fixed_by_adding_authorize_call() {
+        let tmp = fresh_tmp("pp-gate4-fixed");
+        write_adapter_home(
+            &tmp,
+            "pub struct Real;\nfn embed() {\n    let permit = egress::authorize(x, y, z)?;\n    self.transport.call(&permit, &payload);\n}\n",
+        );
+        assert_eq!(
+            provider_plane_gate4_egress_policy_before_external_call(&tmp),
+            Verdict::Pass
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (伪修复 shape): the companion is named only in a comment, never in real code ⇒
+    /// `Fail`, not `NotApplicable` and not `Pass` — this is the reachable red state 4/5/6
+    /// each need (§80.1 "一道闸没有注错红转绿记录就不算存在").
+    #[test]
+    fn provider_plane_gate5_fault_ledger_mentioned_only_in_comment_is_red() {
+        let tmp = fresh_tmp("pp-gate5-fault-comment");
+        write_adapter_home(
+            &tmp,
+            "// TODO: write a ModelCallLedger entry here eventually\nfn embed() { self.transport.call(&permit, &payload); }\n",
+        );
+        assert!(matches!(
+            provider_plane_gate5_ledger_entry_per_external_call(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 正向对照 (红转绿): the identical fixture with a real (non-comment) ModelCallLedger
+    /// reference goes green.
+    #[test]
+    fn provider_plane_gate5_fixed_by_real_ledger_reference() {
+        let tmp = fresh_tmp("pp-gate5-fixed");
+        write_adapter_home(
+            &tmp,
+            "fn embed() {\n    model_call_ledger::reserve_call(&pool, &req)?;\n    self.transport.call(&permit, &payload);\n}\n",
+        );
+        assert_eq!(
+            provider_plane_gate5_ledger_entry_per_external_call(&tmp),
+            Verdict::Pass
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (§19 review): a trailing `//` comment on a real code line was previously counted
+    /// as a real hit (`count_code_line_hits` only skipped *leading* `//` lines) — must not be.
+    #[test]
+    fn provider_plane_gate5_fault_ledger_mentioned_only_in_trailing_comment_is_red() {
+        let tmp = fresh_tmp("pp-gate5-fault-trailing-comment");
+        write_adapter_home(
+            &tmp,
+            "fn embed() { self.transport.call(&permit, &payload); } // model_call_ledger later\n",
+        );
+        assert!(matches!(
+            provider_plane_gate5_ledger_entry_per_external_call(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (§19 review): same shape, inside a `/* */` block comment.
+    #[test]
+    fn provider_plane_gate5_fault_ledger_mentioned_only_in_block_comment_is_red() {
+        let tmp = fresh_tmp("pp-gate5-fault-block-comment");
+        write_adapter_home(
+            &tmp,
+            "/* model_call_ledger wiring TODO */\nfn embed() { self.transport.call(&permit, &payload); }\n",
+        );
+        assert!(matches!(
+            provider_plane_gate5_ledger_entry_per_external_call(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn provider_plane_gate5_real_repo_is_wired() {
+        // `adapters.rs::embed` now calls `model_call_ledger::reserve_call`/`finalize_call`
+        // around its external call — pin flipped from `NotApplicable` to `Pass` (this test's
+        // own doc comment did exactly what it said: it started failing when the wiring
+        // landed, telling this agent to update the pin instead of the gate silently staying
+        // green either way).
+        assert_eq!(
+            provider_plane_gate5_ledger_entry_per_external_call(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    /// Same 伪修复 shape as gate 5/7, for admission control.
+    #[test]
+    fn provider_plane_gate6_fault_admission_mentioned_only_in_comment_is_red() {
+        let tmp = fresh_tmp("pp-gate6-fault-comment");
+        write_adapter_home(
+            &tmp,
+            "// should call admission::decide( before sending\nfn embed() { self.transport.call(&permit, &payload); }\n",
+        );
+        assert!(matches!(
+            provider_plane_gate6_admission_participation(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 正向对照 (红转绿): a real (non-comment) `admission::decide(` call goes green.
+    #[test]
+    fn provider_plane_gate6_fixed_by_real_admission_call() {
+        let tmp = fresh_tmp("pp-gate6-fixed");
+        write_adapter_home(
+            &tmp,
+            "fn embed() {\n    let d = admission::decide(&req, &budgets);\n    self.transport.call(&permit, &payload);\n}\n",
+        );
+        assert_eq!(
+            provider_plane_gate6_admission_participation(&tmp),
+            Verdict::Pass
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn provider_plane_gate6_real_repo_is_wired() {
+        // `adapters.rs::admission_gate` now calls `admission::decide`/builds
+        // `admission::AdmissionRequest` around the external call — pin flipped from
+        // `NotApplicable` to `Pass`, same reasoning as gate 5/7's pin above.
+        assert_eq!(
+            provider_plane_gate6_admission_participation(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    // -- §19 Embedding Provider Failover 硬规则: decide_embedding_failover sole decision point -
+
+    #[test]
+    fn embedding_failover_sole_decision_point_check_passes_on_empty() {
+        assert_eq!(
+            embedding_failover_sole_decision_point_check(&[]),
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn embedding_failover_sole_decision_point_check_fails_on_a_hit() {
+        let hits = vec!["crates/retrieval-provider/src/router.rs".to_string()];
+        assert!(matches!(
+            embedding_failover_sole_decision_point_check(&hits),
+            Verdict::Fail(_)
+        ));
+    }
+
+    /// 注错 (红转绿): a fixture defining `ProjectionRef` without delegating to
+    /// `decide_embedding_failover` is red.
+    #[test]
+    fn provider_plane_embedding_failover_fault_hand_rolled_comparison_is_red() {
+        let tmp = fresh_tmp("pp-failover-fault");
+        let dir = tmp.join("crates/retrieval-provider/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("router.rs"),
+            "pub struct ProjectionRef { pub provider_id: String }\nfn projection_compatible() {}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            provider_plane_embedding_failover_sole_decision_point(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 正向对照 (红转绿): the identical fixture, with a real call to
+    /// `decide_embedding_failover(` added, goes green.
+    #[test]
+    fn provider_plane_embedding_failover_fixed_by_delegating() {
+        let tmp = fresh_tmp("pp-failover-fixed");
+        let dir = tmp.join("crates/retrieval-provider/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("router.rs"),
+            "pub struct ProjectionRef { pub provider_id: String }\nfn projection_compatible() {\n    failover::decide_embedding_failover(a, b, c, d)\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            provider_plane_embedding_failover_sole_decision_point(&tmp),
+            Verdict::Pass
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn provider_plane_embedding_failover_real_repo_is_green() {
+        // Was an honest red pin (repo CLAUDE.md 交付准则「拒绝伪修复」): `router.rs::
+        // ProjectionRef`/`projection_compatible` used to hand-roll the identical
+        // provider_id/model_id/dimension comparison inline instead of calling through
+        // `failover`. Fixed by extracting `failover::projection_contracts_compatible` (the
+        // permit-free half of `decide_embedding_failover`'s own comparison) and having
+        // `router::projection_compatible` call it — see this section's own module comment for
+        // why `router.rs` cannot instead call the permit-gated `decide_embedding_failover`
+        // directly. Both call names are the same one decision point; this pin now proves the
+        // real repo actually routes through one of them, not documents a known gap.
+        assert_eq!(
+            provider_plane_embedding_failover_sole_decision_point(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    // -- §19 DOD-028 (a): EgressSecret::expose sole call site --------------------------------
+
+    #[test]
+    fn g_egress_secret_expose_sole_call_site_passes_on_real_repo() {
+        assert_eq!(
+            g_egress_secret_expose_sole_call_site(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    /// 注错 (红转绿): a second file that both names `EgressSecret` and calls `.expose()` on one
+    /// — the exact "credential read outside the one sanctioned call site" shape this check
+    /// exists to catch — is red.
+    #[test]
+    fn g_egress_secret_expose_fault_second_call_site_is_red() {
+        let tmp = fresh_tmp("egress-secret-fault");
+        let dir = tmp.join("crates/some-other-crate/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("lib.rs"),
+            "use humaux_infra_egress::http::EgressSecret;\nfn leak(s: &EgressSecret) -> &str { s.expose() }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            g_egress_secret_expose_sole_call_site(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 正向对照: a file that calls some *other* type's `.expose()` (never naming
+    /// `EgressSecret`) must not be flagged — this is exactly `byok.rs`'s unrelated
+    /// `PlaintextApiKey::expose` shape.
+    #[test]
+    fn g_egress_secret_expose_ignores_unrelated_expose_methods() {
+        let tmp = fresh_tmp("egress-secret-unrelated");
+        let dir = tmp.join("crates/some-other-crate/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("lib.rs"),
+            "struct PlaintextApiKey(String);\nimpl PlaintextApiKey {\n    fn expose(&self) -> &str { &self.0 }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(g_egress_secret_expose_sole_call_site(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // -- §19 DOD-028 (b): retrieval credential purpose guard exists --------------------------
+
+    #[test]
+    fn g_retrieval_credential_purpose_guard_exists_passes_on_real_repo() {
+        assert_eq!(
+            g_retrieval_credential_purpose_guard_exists(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    /// 注错 (红转绿): a fixture standing in for `http.rs` with the purpose guard's needle
+    /// text absent — proving this check would have caught finding 1 before it was fixed.
+    #[test]
+    fn g_retrieval_credential_purpose_guard_fault_missing_guard_is_red() {
+        let tmp = fresh_tmp("purpose-guard-fault");
+        let dir = tmp.join("crates/infra-egress/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("http.rs"),
+            "async fn call() {\n    // no purpose guard here\n}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            g_retrieval_credential_purpose_guard_exists(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 正向对照: the identical fixture with the guard's needle text present goes green.
+    #[test]
+    fn g_retrieval_credential_purpose_guard_fixed_by_adding_guard() {
+        let tmp = fresh_tmp("purpose-guard-fixed");
+        let dir = tmp.join("crates/infra-egress/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("http.rs"),
+            "async fn call() {\n    if !matches!(permit.purpose(), PrivateDataPurpose::RetrievalEmbedding | PrivateDataPurpose::RetrievalRerank) {\n        return Err(ErrorCode::Forbidden);\n    }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            g_retrieval_credential_purpose_guard_exists(&tmp),
+            Verdict::Pass
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // -- Gate 7/7: Embedding projection write contains provider/model/version metadata -------
+
+    #[test]
+    fn provider_plane_gate7_real_repo_is_honestly_not_applicable() {
+        // §19 review: the only `INSERT INTO private.processing_runs` in the workspace today is
+        // `crates/adapters/tests/processing_runs_fingerprint_rerun.rs` — a test fixture, now
+        // excluded from evidence (module doc above). Pinned so a future real (non-`tests/`)
+        // write path landing is *noticed* (this test starts failing, telling the next agent to
+        // flip the pin to `Pass`) instead of the gate silently staying green on a test double.
+        assert!(matches!(
+            provider_plane_gate7_projection_write_has_model_metadata(&real_root()),
+            Verdict::NotApplicable(_)
+        ));
+    }
+
+    #[test]
+    fn insert_statement_text_stops_at_the_string_literals_closing_quote() {
+        let source = "let q = \"INSERT INTO private.processing_runs (model_id) VALUES ($1)\"; let unrelated = \"model_provider model_revision\";";
+        let idx = source.find("INSERT INTO").unwrap();
+        let stmt = insert_statement_text(source, idx);
+        assert!(stmt.contains("model_id"));
+        assert!(
+            !stmt.contains("model_provider"),
+            "the metadata check must not see text after the statement's own closing quote"
+        );
+    }
+
+    /// 注错: a real `INSERT INTO private.processing_runs` call site missing the metadata
+    /// columns ⇒ red.
+    #[test]
+    fn provider_plane_gate7_fault_insert_missing_model_metadata_is_red() {
+        let tmp = fresh_tmp("pp-gate7-fault");
+        let dir = tmp.join("crates/adapters/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("write.rs"),
+            "let q = \"INSERT INTO private.processing_runs (id) VALUES ($1)\";\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            provider_plane_gate7_projection_write_has_model_metadata(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 正向对照 (红转绿): the identical insert site with all three metadata columns present
+    /// goes green.
+    #[test]
+    fn provider_plane_gate7_fixed_by_including_all_three_metadata_columns() {
+        let tmp = fresh_tmp("pp-gate7-fixed");
+        let dir = tmp.join("crates/adapters/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("write.rs"),
+            "let q = \"INSERT INTO private.processing_runs (model_provider, model_id, model_revision) VALUES ($1, $2, $3)\";\n",
+        )
+        .unwrap();
+        assert_eq!(
+            provider_plane_gate7_projection_write_has_model_metadata(&tmp),
+            Verdict::Pass
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (§19 review, secondary weakness): the INSERT statement itself omits
+    /// `model_provider`, but the same file mentions it elsewhere (an unrelated struct field) —
+    /// must still be `Fail`, not swallowed into a false `Pass` by a whole-file `.contains`.
+    #[test]
+    fn provider_plane_gate7_fault_metadata_mentioned_only_outside_the_statement_is_red() {
+        let tmp = fresh_tmp("pp-gate7-fault-outside-statement");
+        let dir = tmp.join("crates/adapters/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("write.rs"),
+            "struct Row { model_provider: String }\nlet q = \"INSERT INTO private.processing_runs (model_id, model_revision) VALUES ($1, $2)\";\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            provider_plane_gate7_projection_write_has_model_metadata(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (§19 review): the only real `INSERT INTO private.processing_runs` in a `tests/`
+    /// directory must not green this gate — a test fixture proves the matcher works, not that
+    /// a production write path exists.
+    #[test]
+    fn provider_plane_gate7_test_fixture_only_is_not_applicable() {
+        let tmp = fresh_tmp("pp-gate7-tests-only");
+        let dir = tmp.join("crates/adapters/tests");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("fixture.rs"),
+            "let q = \"INSERT INTO private.processing_runs (model_provider, model_id, model_revision) VALUES ($1, $2, $3)\";\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            provider_plane_gate7_projection_write_has_model_metadata(&tmp),
+            Verdict::NotApplicable(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
     }
 }

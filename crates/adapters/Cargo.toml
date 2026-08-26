@@ -88,6 +88,14 @@ humaux-adapters = { path = ".", features = ["test-support"] }
 # `adapters` code has no dependency on `retrieval`/`telemetry` yet.
 humaux-retrieval = { path = "../retrieval" }
 humaux-telemetry = { path = "../telemetry" }
+# tests/model_call_ledger.rs (T7.4, §19.1): `humaux_retrieval_provider::{cost,pricing}` — the
+# pure cost/pricing computation this crate's own `model_call_ledger` module deliberately does
+# NOT depend on (that crate already depends on `humaux-adapters` for `disclosure::
+# reserve_retrieval`/`finalize_retrieval`, so the reverse edge in [dependencies] would be a
+# real build cycle; Cargo permits it here only because dev-dependencies are excluded from a
+# normal `cargo build` of this crate's library — same accepted pattern this file's own
+# `humaux-retrieval`/`humaux-telemetry` dev-deps already establish above).
+humaux-retrieval-provider = { path = "../retrieval-provider" }
 # T1.5 crates/adapters/tests/auth_scope_rls.rs: blocking client for the §62 RLS integration
 # test (same crate/version xtask already pins for its live-DB checks, no new dependency).
 # `with-serde_json-1` added for T4.6/T4.7's `tests/consolidate_snapshot.rs`: seeding

@@ -12,6 +12,7 @@ pub mod disclosure;
 pub mod email;
 pub mod forget_repo;
 pub mod jobs;
+pub mod model_call_ledger;
 pub mod openbao;
 pub mod postgres;
 pub mod qdrant;

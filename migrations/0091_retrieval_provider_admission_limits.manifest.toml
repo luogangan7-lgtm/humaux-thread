@@ -1,0 +1,20 @@
+# §46.1 migration manifest (G46-1 / G80-37). §19.2 Global/Region Provider Budget tier config:
+# one new `control` table, additive only, no existing table touched — same shape as
+# 0077_retrieval_predicates_registry.manifest.toml.
+
+migration_id = "0091_retrieval_provider_admission_limits"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('control.retrieval_provider_admission_limits') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.retrieval_provider_admission_limits') is not null
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'control.retrieval_provider_admission_limits'::regclass)
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS control.retrieval_provider_admission_limits CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero pre-existing rows at risk)"

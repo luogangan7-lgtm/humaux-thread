@@ -1,0 +1,36 @@
+# §46.1 migration manifest. Code-review remediation for 0095 (finding #2, major): a partial
+# unique index enforcing at most one open-ended (`effective_to IS NULL`) row per
+# (provider_id, model_id, region) — additive only, no existing row touched. Fails at apply time
+# only if control.provider_pricing_versions already holds two open rows for the same key (none
+# do today: live check before this migration found exactly 3 rows, one per key, all
+# effective_to IS NULL — confirmed via `select provider_id, model_id, region, count(*) filter
+# (where effective_to is null) from control.provider_pricing_versions group by 1,2,3 having
+# count(*) filter (where effective_to is null) > 1`, zero rows returned).
+
+migration_id = "0097_provider_pricing_versions_one_open_window"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.provider_pricing_versions_one_open_window') is null as precheck_ok
+"""
+
+postcheck = """
+select
+  to_regclass('control.provider_pricing_versions_one_open_window') is not null
+  and (
+    select bool_and(open_count <= 1) from (
+      select count(*) filter (where effective_to is null) as open_count
+      from control.provider_pricing_versions
+      group by provider_id, model_id, region
+    ) t
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP INDEX IF EXISTS control.provider_pricing_versions_one_open_window;
+(safe — the index carries no data of its own; dropping it only removes the enforcement, same
+risk profile 0093 accepted for retrieval_provider_admission_limits_active_uniq.)
+"""
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL — a unique index, and today's 3 seed rows already satisfy it)."

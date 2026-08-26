@@ -1,0 +1,31 @@
+# §46.1 migration manifest (T7.2 follow-up). Pure COMMENT ON COLUMN — no schema/data change,
+# corrects 0088's `priority` column comment to state the real tie-break order (tenant-
+# specificity > region-specificity > priority DESC > route_id DESC, matching
+# router.rs::ordering_key). REVERSIBLE: re-running the old comment text is a safe down.
+
+migration_id = "0090_retrieval_provider_routes_priority_comment_fix"
+class = "REVERSIBLE"
+
+precheck = """
+select to_regclass('control.retrieval_provider_routes') is not null as precheck_ok
+"""
+
+postcheck = """
+select
+  (select description from pg_description
+     join pg_attribute on pg_attribute.attrelid = pg_description.objoid
+       and pg_attribute.attnum = pg_description.objsubid
+     where pg_description.objoid = 'control.retrieval_provider_routes'::regclass
+       and pg_attribute.attname = 'priority') like '%NOT the primary sort key%'
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: COMMENT ON COLUMN control.retrieval_provider_routes.priority IS
+            'Higher value = more preferred. router::resolve orders candidates by priority DESC, '
+            'route_id DESC as the final deterministic tie-break (§19 Router input list has no '
+            'explicit tie-break rule; this is the one this migration/router.rs fixes).';
+(safe — comment-only, no data or schema at risk either direction.)
+"""
+
+backup_restore_requirement = "none — comment-only change, no data or DDL at risk."

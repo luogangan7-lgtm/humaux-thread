@@ -1,0 +1,21 @@
+# §46.1 migration manifest (G46-1 / G80-37). §19 Provider Route: one new `control` table,
+# additive only, no existing table touched — same shape as
+# 0077_retrieval_predicates_registry.manifest.toml.
+
+migration_id = "0088_retrieval_provider_routes"
+class = "EXPAND_CONTRACT"
+
+precheck = "select to_regclass('control.retrieval_provider_routes') is null as precheck_ok"
+
+postcheck = """
+select
+  to_regclass('control.retrieval_provider_routes') is not null
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid = 'control.retrieval_provider_routes'::regclass)
+  and to_regclass('control.retrieval_provider_routes_lookup') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP TABLE IF EXISTS control.retrieval_provider_routes CASCADE;"
+
+backup_restore_requirement = "standard pre-deploy snapshot; no dedicated restore drill required (additive-only DDL, zero pre-existing rows at risk)"

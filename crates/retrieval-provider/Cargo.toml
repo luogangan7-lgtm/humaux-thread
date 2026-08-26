@@ -6,3 +6,69 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# §19/§19.2 admission.rs: `TenantId` (identity, not a bare String key — §78.2) and `ErrorCode`
+# (429/401/5xx classification reuses the existing closed set — `ProviderRateLimited`/
+# `WaitingKey`/`Unauthorized`/`ProviderTransient`/`ProviderPermanent` already cover exactly
+# this task's cases, §52.1 "两个错误枚举" forbids a third). `PrivateDataPurpose` interop (not
+# used as this crate's own purpose type — see `admission::RetrievalPurpose`'s doc for why).
+#
+# Also T7.1 contract.rs/adapters.rs: `EmbeddingProvider`/`RerankProvider` return
+# `Result<_, humaux_domain::error::ErrorCode>` — the workspace's one terminal-error enum, not a
+# third error type for this crate. `ProcessorId`/`egress::authorize`/`PrivateDataPurpose`
+# (§7.3/§19) back the real DashScope adapter's egress-permit minting.
+#
+# Also §19 Embedding/Rerank Provider Failover 硬规则 (failover.rs/health.rs/metrics.rs): a live
+# `EgressPermit` (§7.3) is required before a compatible-failover decision can be reached at
+# all, and `metrics.rs`'s `purpose_label` reuses `PrivateDataPurpose` rather than a parallel
+# enum. One entry, not two/three — merged after concurrent-edit conflicts across this task's
+# parallel T7.x agents (admission.rs / T7.1 / failover-health-metrics-gate).
+humaux-domain = { path = "../domain" }
+# T7.1 (§19 Architecture Gate "Every external retrieval call passes EgressPolicy"): the real
+# DashScope adapter's sole HTTP transport — Layer 1A `ExternalCall`/`HttpExternalCall`. This
+# crate does not depend on `humaux-infra-network`/`reqwest` directly (no raw-client
+# construction site here at all, ADR-0003 §83.4).
+humaux-infra-egress = { path = "../infra-egress" }
+# §7.4/hard-rule⑤: every real external retrieval call must reserve+finalize an
+# `ops.data_disclosures` row (`disclosure::reserve_retrieval`/`finalize_retrieval`) via
+# `RetrievalWorkerDbPool` — both live in `humaux-adapters` (normal adapters-depend-on-adapters
+# direction already established elsewhere in this workspace's dependency graph; nothing in
+# `humaux-adapters` depends back on this crate).
+humaux-adapters = { path = "../adapters" }
+# `EmbeddingProvider`/`RerankProvider` are `#[async_trait]` so a caller can hold
+# `Arc<dyn EmbeddingProvider>` — same macro already used by `humaux-domain::egress::ExternalCall`.
+async-trait = "0.1"
+# DashScope embeddings request/response JSON bodies (adapters.rs).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# T7.2 router.rs: `RouteCandidate::route_id`/`ResolvedRoute::route_id` hold an already-parsed
+# `control.retrieval_provider_routes.route_id` value (adapters-crate reads it, this module
+# never issues SQL — router.rs module doc). No `v4`/`v7` feature: production code here never
+# mints a new `Uuid`, only stores/compares/returns ones handed in. Same version pin already
+# used by this crate's own `[dev-dependencies]` uuid entry below (one resolved copy).
+uuid = "1.25.0"
+# §19 Rerank Failover: `failover.rs`'s loud calibration stand-down (`tracing::warn!`) —
+# already a workspace dependency (`humaux-telemetry`, `humaux-infra-egress`).
+tracing = "0.1.44"
+
+[dev-dependencies]
+# Contract Tests (§19) drive the `#[async_trait]` methods from plain `#[test]` fns.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# `dashscope_live_smoke`'s state-1 (key-present) gate reads `DASHSCOPE_API_KEY` through the
+# same `config_registry::read_env_var` the production `EnvCredentialSource` uses (filters an
+# empty value), instead of a second, looser `std::env::var(..).is_ok()` predicate that could
+# drift from it (§79.2).
+humaux-contracts = { path = "../contracts" }
+# T4.1's own trybuild pattern (`crates/domain/tests/egress_topology_ui.rs`) reused here for the
+# `SealedRetrievalQuery`/`SealedRetrievalCard` type-narrowing compile-fail proof (§1.2.3/§41.4).
+trybuild = "1"
+# `v4`: T7.1 fixtures. `v7`: failover.rs/health.rs tests mint `ProcessorId(Uuid::now_v7())`
+# fixtures directly, matching `infra-egress`'s own test convention.
+uuid = { version = "1.25.0", features = ["v4", "v7"] }
+# `dashscope_live_smoke`'s three-state DB half (§79.2 `run_db_fixture`), same shape
+# `crates/adapters/tests/disclosure_ledger.rs` already uses: throwaway `control.tenants` +
+# `private.evidence_objects` rows seeded via the blocking `postgres` client, real disclosure
+# write via `RetrievalWorkerDbPool` (role-scoped DSN, `SET ROLE` trick — that module's own doc).
+postgres = { version = "0.19", features = ["with-uuid-1"] }
+humaux-testkit = { path = "../testkit" }

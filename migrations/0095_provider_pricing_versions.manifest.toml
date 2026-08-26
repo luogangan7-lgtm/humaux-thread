@@ -1,0 +1,31 @@
+# §46.1 migration manifest (T7.4). §19 Pricing Registry: brand-new
+# control.provider_pricing_versions, no tenant_id (platform-wide, §6.2.1 control.* domain
+# default = R for every runtime role — writes are admin/migration-time only), seeded with the
+# §19 2026-08 bootstrap pricing snapshot as data (not a Rust literal, §78.1).
+
+migration_id = "0095_provider_pricing_versions"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.provider_pricing_versions') is null as precheck_ok
+"""
+
+postcheck = """
+select
+  to_regclass('control.provider_pricing_versions') is not null
+  and (select tableowner from pg_tables where schemaname='control' and tablename='provider_pricing_versions') = 'role_migration_owner'
+  and (select count(*) from control.provider_pricing_versions) = 3
+  and exists (
+    select 1 from control.provider_pricing_versions
+    where provider_id = 'dashscope' and model_id = 'text-embedding-v4' and batch_discount = 0.5
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP TABLE IF EXISTS control.provider_pricing_versions CASCADE;
+(safe — table is wholly new to this migration, only the three bootstrap-seed rows this
+migration itself inserted exist.)
+"""
+
+backup_restore_requirement = "none (new table, seed data only, no existing table altered)"

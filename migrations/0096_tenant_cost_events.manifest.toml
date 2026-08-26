@@ -1,0 +1,27 @@
+# §46.1 migration manifest (T7.4). §19 Tenant Full Cost Ledger: brand-new
+# ops.tenant_cost_events, tenant-scoped, RLS ENABLE+FORCE+NULLIF policy (same template as
+# 0083/0084/0094), §6.2.1 domain default GRANT (not point-named in §6.2.2).
+
+migration_id = "0096_tenant_cost_events"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('ops.tenant_cost_events') is null as precheck_ok
+"""
+
+postcheck = """
+select
+  to_regclass('ops.tenant_cost_events') is not null
+  and (select relrowsecurity from pg_class where oid = 'ops.tenant_cost_events'::regclass) = true
+  and (select relforcerowsecurity from pg_class where oid = 'ops.tenant_cost_events'::regclass) = true
+  and (select tableowner from pg_tables where schemaname='ops' and tablename='tenant_cost_events') = 'role_migration_owner'
+  and exists (select 1 from pg_policies where schemaname='ops' and tablename='tenant_cost_events' and policyname='tenant_cost_events_tenant_isolation')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP TABLE IF EXISTS ops.tenant_cost_events CASCADE;
+(safe — table is wholly new to this migration, zero rows at risk.)
+"""
+
+backup_restore_requirement = "none (new table, no existing table altered)"

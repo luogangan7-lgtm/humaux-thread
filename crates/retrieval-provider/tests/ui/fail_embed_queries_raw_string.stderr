@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail_embed_queries_raw_string.rs:9:58
+  |
+9 |     let _ = provider.embed_queries(TenantId::new(), 256, &raw).await;
+  |                      -------------                       ^^^^ expected `&[SealedRetrievalQuery]`, found `&Vec<String>`
+  |                      |
+  |                      arguments to this method are incorrect
+  |
+  = note: expected reference `&[SealedRetrievalQuery]`
+             found reference `&Vec<String>`
+note: method defined here
+ --> src/contract.rs
+  |
+  |     async fn embed_queries(
+  |              ^^^^^^^^^^^^^

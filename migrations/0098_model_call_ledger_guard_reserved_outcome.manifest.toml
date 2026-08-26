@@ -1,0 +1,40 @@
+# §46.1 migration manifest. Code-review remediation for 0094 (finding #6, minor):
+# `CREATE OR REPLACE FUNCTION` widens the append-only guard trigger's outcome-column
+# protection to also apply while `status = 'RESERVED'`, not just after finalize. Same function
+# name/signature as 0094 (no DROP/CREATE TRIGGER needed — the existing trigger object already
+# points at this function by name), so this is a pure behavior-only forward fix, not a new
+# object.
+
+migration_id = "0098_model_call_ledger_guard_reserved_outcome"
+class = "FORWARD_ONLY"
+
+precheck = """
+select
+  exists (select 1 from pg_proc where proname = 'model_call_ledger_guard_mutation')
+  and (
+    -- Precondition this fix relies on: finalize_call's real write pattern is one UPDATE
+    -- moving every outcome column NULL -> value in the same statement it flips status, never
+    -- a partial NULL -> value -> another value sequence. Confirmed via the crate's own
+    -- reserve_in_txn/finalize_in_txn (crates/adapters/src/model_call_ledger.rs): reserve()
+    -- never touches an outcome column, finalize() sets them all at once.
+    true
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  exists (select 1 from pg_proc where proname = 'model_call_ledger_guard_mutation')
+  and exists (select 1 from pg_trigger where tgname = 'model_call_ledger_guard_mutation' and not tgisinternal)
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+No down migration (FORWARD_ONLY, §46.1) — a `CREATE OR REPLACE FUNCTION` on a trigger function
+has no meaningful "down" short of restoring 0094's exact prior body. Forward fix if this
+migration itself needs correcting: another `CREATE OR REPLACE FUNCTION
+ops.model_call_ledger_guard_mutation()` in a later migration, same pattern this one uses
+against 0094.
+"""
+
+backup_restore_requirement = "none — CREATE OR REPLACE FUNCTION only redefines trigger behavior for future statements; no existing row is read, written, or locked by this migration."
