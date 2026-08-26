@@ -1087,34 +1087,66 @@ fn g80_2_build_request_unique(root: &Path) -> Verdict {
 /// point) — so there is no consumer call site to count yet. `not_applicable`, not a fabricated
 /// `== 1`/`== 0` pass, same convention as the neighboring §55.1 G80-2 entry above.
 fn g80_4_serving_version_sole_entry_point(root: &Path) -> Verdict {
+    /// 定义点及其直属测试。**按精确路径排除，不用 `disp.contains("serving_repo")`**：
+    /// 子串匹配会连带排除任何未来路径含该子串的文件（`serving_repo_client.rs`、
+    /// `tests/serving_repo_wiring.rs`……），真调用点藏进那种文件里就永远数不到——
+    /// 与 G80-22.5 踩过的「改名绕过」同型。
+    const DEFINITION_FILES: [&str; 2] = [
+        "crates/adapters/src/serving_repo.rs",
+        "crates/adapters/tests/serving_repo.rs",
+    ];
+
     let files = walk_workspace_rs(root);
+
+    // §57.1 第2条：not_applicable 的唯一合法理由是**被测对象尚未交付**，且必须打印缺失
+    // 对象名。这里的被测对象是 `serving_version` 这个函数本身，按**内容**探针判（同
+    // `g80_2` 的 `fn build_request(` 手法），不按调用点数量。
+    //
+    // 先前判 NA 的条件是「检索侧一个调用点都没有」——而那恰恰就是 §16.2 被违反的状态本身，
+    // 于是这道闸在违规最严重的时候最安静，NA 与违规不可区分（ADR-0006）。§57.1 允许 NA 是
+    // 因为「没有被测对象就没什么可判的」，不是因为「判了会红」。
+    if !files
+        .iter()
+        .any(|(_, src)| src.contains("pub async fn serving_version("))
+    {
+        return Verdict::NotApplicable(
+            "missing object: §16.2 读路由入口 `pub async fn serving_version(` 尚未交付".to_string(),
+        );
+    }
+
     let mut count = 0usize;
     let mut sites = Vec::new();
     for (path, source) in &files {
         let disp = display(root, path);
-        if disp.contains("serving_repo") {
-            continue; // definition site + its own direct tests, not a consumer call site
+        if disp.ends_with(SELF_FILE) || DEFINITION_FILES.iter().any(|d| disp.ends_with(d)) {
+            continue;
         }
-        let n = source.matches("serving_version(").count();
+        // 只数**调用**：`serving_version(` 带左括号。rustdoc 里的 doc-link
+        // `[`…::serving_version`]` 不含左括号，天然不计入；行内注释里若写成带括号的形式
+        // 会被计入，所以本仓约定 rustdoc 一律用 doc-link 形式引用它。
+        let n = source
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| l.matches("serving_version(").count())
+            .sum::<usize>();
         if n > 0 {
             sites.push(format!("{disp}: {n}"));
             count += n;
         }
     }
-    if sites.is_empty() {
-        return Verdict::NotApplicable(
-            "serving_version(stream_family) 检索侧调用点 (§16.2, adapters::retrieve 尚未接入换代期读路由) \
-             尚未交付"
-                .to_string(),
-        );
-    }
-    if count == 1 {
-        Verdict::Pass
-    } else {
-        Verdict::Fail(vec![format!(
-            "expected exactly 1 consumer-side `serving_version(` call site outside \
-             serving_repo, found {count}: {sites:?}"
-        )])
+
+    match count {
+        1 => Verdict::Pass,
+        0 => Verdict::Fail(vec![format!(
+            "§16.2「检索侧只能经 serving_version(stream_family) 取」——消费侧调用点为 0，\
+             也就是读路径根本没有经过读路由。这**不是** not_applicable：被测对象
+             `serving_version` 就在 {}，缺的是调用它。",
+            DEFINITION_FILES[0]
+        )]),
+        n => Verdict::Fail(vec![format!(
+            "expected exactly 1 consumer-side `serving_version(` call site outside the \
+             definition files, found {n}: {sites:?}"
+        )]),
     }
 }
 
@@ -3914,6 +3946,126 @@ mod tests {
     #[test]
     fn g80_43_real_repo_passes() {
         assert_eq!(g80_43_grounding_validity(&real_root()), Verdict::Pass);
+    }
+
+    // ---- G80-4 (§16.2 换代期读路由) 注错族 ----
+
+    /// 造一棵最小树：`serving_repo.rs` 里有定义，`consumers` 里各放一个调用点。
+    fn serving_version_fixture(root: &Path, consumers: &[(&str, usize)]) {
+        let def = root.join("crates/adapters/src");
+        fs::create_dir_all(&def).unwrap();
+        fs::write(
+            def.join("serving_repo.rs"),
+            "pub async fn serving_version(pool: &P, f: &F) -> R { todo!() }\n",
+        )
+        .unwrap();
+        for (rel, n) in consumers {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let body: String = (0..*n)
+                .map(|_| "    let _ = serving_version(pool, &f).await;\n".to_string())
+                .collect();
+            fs::write(&path, format!("pub async fn consume() {{\n{body}}}\n")).unwrap();
+        }
+    }
+
+    #[test]
+    fn g80_4_passes_with_exactly_one_consumer_call_site() {
+        let tmp = fresh_tmp("g80-4-green");
+        serving_version_fixture(&tmp, &[("crates/adapters/src/retrieve.rs", 1)]);
+        assert_eq!(g80_4_serving_version_sole_entry_point(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// **本族最重要的一条。** 零调用点 = §16.2 被违反的状态本身，必须判 `Fail` 而**不是**
+    /// `NotApplicable`。先前那版正是在这里判 NA，于是闸在违规最严重时最安静（ADR-0006）。
+    #[test]
+    fn g80_4_zero_call_sites_is_fail_not_not_applicable() {
+        let tmp = fresh_tmp("g80-4-zero");
+        serving_version_fixture(&tmp, &[]);
+        match g80_4_serving_version_sole_entry_point(&tmp) {
+            Verdict::Fail(v) => assert!(
+                v.iter().any(|m| m.contains("消费侧调用点为 0")),
+                "必须点名「一个调用点都没有」而不是含糊报错: {v:?}"
+            ),
+            other => panic!(
+                "零调用点必须红——那正是违规状态本身，判 not_applicable 等于把违规当成\
+                 「没什么可判的」。实得 {other:?}"
+            ),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 三态：被测对象（`serving_version` 函数本身）真的不存在时才 NA，且必须点名。
+    #[test]
+    fn g80_4_not_applicable_only_when_the_function_itself_is_absent() {
+        let tmp = fresh_tmp("g80-4-na");
+        fs::create_dir_all(tmp.join("crates/adapters/src")).unwrap();
+        fs::write(
+            tmp.join("crates/adapters/src/retrieve.rs"),
+            "pub fn nothing() {}\n",
+        )
+        .unwrap();
+        match g80_4_serving_version_sole_entry_point(&tmp) {
+            Verdict::NotApplicable(m) => {
+                assert!(m.contains("missing object"), "{m}");
+                assert!(m.contains("serving_version"), "{m}");
+            }
+            other => panic!("函数本身不存在时才该 NA，实得 {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 第二个调用点 → 红（`== 1` 不是 `>= 1`）。
+    #[test]
+    fn g80_4_red_on_a_second_consumer_call_site() {
+        let tmp = fresh_tmp("g80-4-two");
+        serving_version_fixture(
+            &tmp,
+            &[
+                ("crates/adapters/src/retrieve.rs", 1),
+                ("crates/retrieval/src/planner.rs", 1),
+            ],
+        );
+        assert!(
+            matches!(
+                g80_4_serving_version_sole_entry_point(&tmp),
+                Verdict::Fail(_)
+            ),
+            "两个消费侧调用点必须红"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 排除按**精确路径**而非子串：调用点藏进一个路径含 `serving_repo` 子串的文件里，
+    /// 照样要被数到。先前那版 `disp.contains("serving_repo")` 会把它整个排除 = 假绿。
+    #[test]
+    fn g80_4_substring_named_file_does_not_escape_the_count() {
+        let tmp = fresh_tmp("g80-4-substr");
+        serving_version_fixture(
+            &tmp,
+            &[
+                ("crates/adapters/src/retrieve.rs", 1),
+                ("crates/adapters/src/serving_repo_client.rs", 1),
+            ],
+        );
+        match g80_4_serving_version_sole_entry_point(&tmp) {
+            Verdict::Fail(v) => assert!(
+                v.iter().any(|m| m.contains("serving_repo_client.rs")),
+                "藏在子串同名文件里的调用点必须被点名: {v:?}"
+            ),
+            other => panic!("子串同名文件不得逃过计数，实得 {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 真仓现状：读路径已接入 ⇒ 恰好一处 ⇒ pass。
+    #[test]
+    fn g80_4_real_repo_passes() {
+        assert_eq!(
+            g80_4_serving_version_sole_entry_point(&real_root()),
+            Verdict::Pass
+        );
     }
 
     fn fresh_tmp(label: &str) -> PathBuf {

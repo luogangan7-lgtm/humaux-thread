@@ -72,6 +72,26 @@ where
     }
 }
 
+/// `ops.data_disclosures` / `ops.data_disclosure_sources` 这一对表的测试序列化键。
+///
+/// **为什么需要它**：§7.4 的 append-only 守卫要用 `TRUNCATE … CASCADE` 才能触发（不带
+/// CASCADE 时 PostgreSQL 更早地以「cannot truncate a table referenced in a foreign key
+/// constraint」拒绝，守卫触发器根本不会触发，测试就断言不到 §7.4 了）。而
+/// **PostgreSQL 是先拿 `AccessExclusiveLock` 再触发 trigger**——即便 TRUNCATE 最终被拒，
+/// 锁已经拿到手；CASCADE 又按自己的顺序锁上述两张表，与并发读者的加锁顺序交叉即成环。
+/// 实测过一次真死锁（40P01，两个 relation 正是这两张表）。
+///
+/// 用法（最小序列化：读者之间仍并发，只有 TRUNCATE 那条独占）：
+/// - 读侧在 fixture 建连后取 **共享**：`SELECT pg_advisory_lock_shared($K)`；
+/// - TRUNCATE 那条先 `pg_advisory_unlock_shared($K)` 再 `pg_advisory_lock($K)`。
+///
+/// 键定义在这里而不是各文件各写一个数字：跨 crate 的两个测试 binary
+/// （`adapters/tests/disclosure_ledger.rs` 与 `retrieval-provider/tests/dashscope_live_smoke.rs`）
+/// 都要用同一个值，写两处迟早会有一处改漏——那时序列化静默失效，只剩偶发红。
+///
+/// 值是任取的固定 bigint，无语义；advisory lock 的命名空间与业务无关。
+pub const DISCLOSURE_LEDGER_ADVISORY_LOCK: i64 = 0x0074_4C45_4447_5231;
+
 /// 测试可以声明「本次运行确实有」的外部依赖。**闭集**，不是字符串。
 ///
 /// 早先这里把变量名当 `&str` 参数收，被 §78 的 env 扫描闸当场抓住——不是实现细节，是

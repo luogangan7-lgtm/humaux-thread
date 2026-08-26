@@ -88,8 +88,20 @@ impl DbIntegrationFixture for SmokeFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
-        let admin = Client::connect(&dsn, NoTls)
+        let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
+
+        // 与 `adapters/tests/disclosure_ledger.rs::guard_trigger_rejects_truncate` 的
+        // `TRUNCATE … CASCADE` 互斥：本条走真出境路径，会写 `ops.data_disclosures`，
+        // 而那条测试必须拿这两张表的 AccessExclusiveLock（见
+        // `humaux_testkit::DISCLOSURE_LEDGER_ADVISORY_LOCK` 的 doc）。两个 binary 并行跑，
+        // 交叉加锁即成环——实测过一次真 40P01。取共享锁，只在那一条测试跑时让路。
+        admin
+            .execute(
+                "SELECT pg_advisory_lock_shared($1)",
+                &[&humaux_testkit::DISCLOSURE_LEDGER_ADVISORY_LOCK],
+            )
+            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 
         let role_dsn = dsn_as_role(&dsn, "role_retrieval_worker");
         let rt = tokio::runtime::Runtime::new()

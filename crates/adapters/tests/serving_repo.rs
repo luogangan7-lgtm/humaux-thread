@@ -8,7 +8,7 @@
 
 use std::time::SystemTime;
 
-use humaux_adapters::postgres::{MaintenanceDbPool, RetrievalWorkerDbPool};
+use humaux_adapters::postgres::{MaintenanceDbPool, RuntimeDbPool};
 use humaux_adapters::serving_repo::{self, SwitchOutcome};
 use humaux_domain::ids::TenantId;
 use humaux_projection::serving::{ContinuationVerdict, StreamFamily};
@@ -26,7 +26,11 @@ fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
 
 struct Handle {
     rt: tokio::runtime::Runtime,
-    retrieval: RetrievalWorkerDbPool,
+    /// §16.2 读路由现在收 [`RuntimeDbPool`]（`role_gateway`）——见 `serving_repo::
+    /// serving_version` 的 rustdoc。**换掉而不是并存**：多留一个用不到的 pool 会在
+    /// `--all-targets -D warnings` 下因 dead_code 变红，而且这两条断言的价值恰恰在于
+    /// 实证「gateway 这个角色真能穿 RLS 读到 `serving` 列」。
+    runtime: RuntimeDbPool,
     maintenance: MaintenanceDbPool,
     admin: Client,
     tenant_id: Uuid,
@@ -97,11 +101,8 @@ impl DbIntegrationFixture for ServingFixture {
 
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
-        let retrieval = rt
-            .block_on(RetrievalWorkerDbPool::connect(&dsn_as_role(
-                &dsn,
-                "role_retrieval_worker",
-            )))
+        let runtime = rt
+            .block_on(RuntimeDbPool::connect(&dsn_as_role(&dsn, "role_gateway")))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let maintenance = rt
             .block_on(MaintenanceDbPool::connect(&dsn_as_role(
@@ -112,7 +113,7 @@ impl DbIntegrationFixture for ServingFixture {
 
         Ok(Handle {
             rt,
-            retrieval,
+            runtime,
             maintenance,
             admin,
             tenant_id,
@@ -256,7 +257,7 @@ fn serving_version_never_returns_a_shadow_only_version() {
 
             let version = handle
                 .rt
-                .block_on(serving_repo::serving_version(&handle.retrieval, &f))
+                .block_on(serving_repo::serving_version(&handle.runtime, &f))
                 .expect("read must succeed")
                 .expect("a serving row exists");
             assert_eq!(
@@ -279,7 +280,7 @@ fn serving_version_is_none_when_only_a_shadow_row_exists() {
 
             let version = handle
                 .rt
-                .block_on(serving_repo::serving_version(&handle.retrieval, &f))
+                .block_on(serving_repo::serving_version(&handle.runtime, &f))
                 .expect("read must succeed");
             assert_eq!(version, None);
         },

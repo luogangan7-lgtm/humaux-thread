@@ -91,3 +91,31 @@ CI 可行性也实测过：真·全新 `postgres:18` 集群（`docker run` 起�
 
 **一个「不适用」分支，如果它在被测对象缺席时的外观与「通过」无法区分，它就会腐烂。**
 对策不是靠人记得配环境，而是让**调用方声明自己的环境**，声明与现实不符时立刻响。
+
+## 后续：让测试真跑起来之后立刻浮出的第一个 flake
+
+本 ADR 落地当天，全量跑（声明模式）就红了一次：`disclosure_ledger::
+source_row_accepts_matching_single_id` 报 PostgreSQL 死锁 `40P01`，两个 relation 正是
+`ops.data_disclosures` 与 `ops.data_disclosure_sources`。
+
+根因链：
+1. §7.4/§77 的 append-only 守卫要用 `TRUNCATE … CASCADE` 才触发得到——不带 CASCADE 时
+   PostgreSQL 更早地以「cannot truncate a table referenced in a foreign key constraint」
+   拒绝，守卫触发器根本不会 fire，测试就断言不到 §7.4（两种形式都实跑核对过）。
+2. **PostgreSQL 先拿 `AccessExclusiveLock`，再触发 trigger。** 即便 TRUNCATE 最终被拒，
+   锁已经拿到手。
+3. CASCADE 按自己的顺序锁上述两张表，与并发读者的加锁顺序交叉即成环。碰这两张表的测试
+   跨了两个 binary（`adapters/tests/disclosure_ledger.rs` 与
+   `retrieval-provider/tests/dashscope_live_smoke.rs`），而 cargo 并行跑 binary。
+
+**这个 flake 一直都在，只是以前无害**——CI 从不跑这些测试。本 ADR 让它们真跑之后，它就成了
+一个会随机红的 CI。这本身是本 ADR 有效的一个侧证：**看不见的东西不会自己变好，只是不被看见。**
+
+修法（最小序列化，不是全局串行）：`humaux_testkit::DISCLOSURE_LEDGER_ADVISORY_LOCK` 定义
+唯一锁键，碰这两张表的 fixture 建连后取 `pg_advisory_lock_shared`（读者之间照旧并发），
+TRUNCATE 那条先 `pg_advisory_unlock_shared` 再 `pg_advisory_lock` 升排他。顺序不能反——
+同一 session 持共享时申请排他会自己阻塞自己。session 级锁，连接 drop 即释放，测试 panic
+也不漏锁。
+
+锁键定义在 testkit 一处而不是各文件各写一个数字：两个 binary 跨 crate，写两处迟早改漏，
+那时序列化静默失效、只剩偶发红——又是一个「失效时与正常态不可区分」的形状。

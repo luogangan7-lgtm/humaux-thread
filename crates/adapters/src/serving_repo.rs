@@ -7,7 +7,8 @@
 //! transaction — no free-standing duplicate of that query exists) and performs the atomic
 //! switch `UPDATE`. `visible(shadow)` / `visible(serving)` (§23.1②) and the §69 Continuation
 //! Gate verdict are **not** computed by this module — the former needs a Qdrant client (§17,
-//! not built in this crate: `adapters::qdrant` is still the T0.x placeholder), the latter
+//! not built in this crate — `adapters::qdrant` 已实装，但 §23.1② 的 visible 计数由它的
+//! `VisibleCountFilter` 承担，不在本模块), the latter
 //! needs the §55/§69 benchmark harness (`continuation_198_v2` is currently `NOT_DECLARED`, no
 //! `frozen_by` — see `humaux_projection::serving::ContinuationVerdict`'s doc).
 //! [`switch_projection_version`] therefore takes both as `(projection_version, count)`-tagged
@@ -20,10 +21,14 @@
 //! `serving_version` is `stream_family` retrieval's **sole entry point** for a family's active
 //! `projection_version` (§16.2: "检索侧禁止把 `projection_version` 当常量读，只能经
 //! `serving_version(stream_family)` 取"). G80-4 registers the workspace-wide call-site count
-//! as the enforcement mechanism; as of this task the retrieval read path (`adapters::retrieve`)
-//! does not yet route through `serving_version` — see that module's own notes — so `xtask
-//! architecture-check`'s G80-4 entry is `not_applicable` rather than a real `== 1` count, the
-//! same convention its neighboring G80-2 entry already uses.
+//! as the enforcement mechanism, and `adapters::retrieve::recall_with_overlay` is that one
+//! consumer-side call site.
+//!
+//! 这段先前写的是「检索读路径尚未接入 ⇒ G80-4 判 not_applicable」。那不是三态的合法用法，
+//! 是**自我豁免**：G80-4 的 NA 条件（检索侧一个调用点都没有）恰好就是 §16.2 被违反的状态，
+//! 于是闸在违规最严重的时候最安静。§57.1 第2条允许 NA 的前提是**被测对象尚未交付**，而
+//! `serving_version` 一直都在——缺的是调用它。已按 ADR-0006 改：闸的 NA 主语改成
+//! `serving_version` 函数本身，读路径接进来。
 
 use sqlx::Row;
 use sqlx::types::Uuid;
@@ -32,7 +37,7 @@ use humaux_projection::serving::{
     ContinuationVerdict, StreamFamily, SwitchCriteria, SwitchRejection, evaluate_switch,
 };
 
-use crate::postgres::{MaintenanceDbPool, RetrievalWorkerDbPool};
+use crate::postgres::{MaintenanceDbPool, RuntimeDbPool};
 
 type Txn<'c> = sqlx::Transaction<'c, sqlx::Postgres>;
 
@@ -115,8 +120,15 @@ fn bind_family<'q>(query: PgQuery<'q>, family: &'q StreamFamily) -> PgQuery<'q> 
 /// query can never itself return more than one; a caller reading `projection_version` from
 /// `stream_checkpoints` any other way (a hand-written query, a cached constant) bypasses this
 /// contract and is exactly what G80-4 exists to catch.
+///
+/// 收 [`RuntimeDbPool`]（`role_gateway`）而不是 `RetrievalWorkerDbPool`：读路由是**请求路径
+/// 上的纯读**，调用方是 `recall_with_overlay`，而 §6.2.3 的 typed pool 是闭集、没有任何转换
+/// 路径，所以要么在这里换边、要么让请求路径凭空拿到第二个 pool。授权侧支持这么换：
+/// `migrations/0011_roles_and_grants.sql:257` 给 `role_gateway` 的是表级无列限定
+/// `GRANT SELECT ON projection.stream_checkpoints`（§6.2.2 矩阵同款），而写面不变——
+/// `projection_highwater` 归 retrieval_worker、`serving`/`shadow` 归 maintenance。
 pub async fn serving_version(
-    pool: &RetrievalWorkerDbPool,
+    pool: &RuntimeDbPool,
     family: &StreamFamily,
 ) -> Result<Option<String>, ServingRepoError> {
     let mut txn = pool.pool().begin().await?;

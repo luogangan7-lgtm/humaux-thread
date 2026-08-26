@@ -30,9 +30,11 @@ use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
 use humaux_domain::ids::TenantId;
+use humaux_projection::serving::StreamFamily;
 use humaux_projection::stream::StreamKey;
 
 use crate::postgres::RuntimeDbPool;
+use crate::serving_repo::{self, ServingRepoError};
 
 /// DB/decode-layer failure. Adapter-local, not one of the workspace's two frozen domain
 /// error enums (§52) — same reasoning as `jobs::JobsError` / `postgres::PoolInitError`.
@@ -352,11 +354,20 @@ pub async fn contiguous_done_prefix(
     Ok(row.try_get::<i64, _>("prefix")?)
 }
 
-/// `projection.stream_checkpoints.projection_highwater` for this exact stream key — "已对检
-/// 索可见的边界" (§15.3), i.e. how far serving Qdrant has actually caught up. `0` (not an
-/// error) when no checkpoint row exists yet for this stream — an unstarted stream has served
-/// nothing, which is the correct starting point for the overlay decision below, not a
-/// distinct failure mode.
+/// `projection.stream_checkpoints.projection_highwater`，**且只取该 family 的 serving 行**
+/// ——"已对检索可见的边界"（§15.3）。§16.2 冻结「读路由只打 `serving` 行」，所以这里的
+/// `AND serving` 不是优化而是判据本身。
+///
+/// `0`（而非报错）覆盖两种情形，两者对 overlay 决策的含义相同：
+/// ① 这条流还没有 checkpoint 行——没服务过任何东西；
+/// ② 行在，但它不是 serving 行（token 指向已退役或仍在 shadow 回填的版本）——按 §16.2
+///    「该行不进入任何 envelope」，对检索面而言等同于没服务过。
+///
+/// 两种情形都 fail-closed 地走 overlay，也就是从 PG 直读而不是相信一个非 serving 版本的
+/// 水位。这里**不再另设一道「token.version == serving version」的等值守卫**：
+/// `ux_serving_one`（migration `0065`）保证每 family 至多一行 `serving = true`，因此
+/// 「六列命中且 serving」与那道等值判定在所有输入下同结果——留两道就必有一道永远观察不到
+/// 自己失败，那种判据按 §80.1 不算判据。
 pub async fn serving_projection_highwater(
     pool: &RuntimeDbPool,
     key: &StreamKey,
@@ -367,7 +378,8 @@ pub async fn serving_projection_highwater(
     let row = sqlx::query(
         "SELECT projection_highwater FROM projection.stream_checkpoints
          WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3
-           AND domain = $4 AND projection_kind = $5 AND projection_version = $6",
+           AND domain = $4 AND projection_kind = $5 AND projection_version = $6
+           AND serving",
     )
     .bind(key.tenant_id.0)
     .bind(&key.scope_kind)
@@ -493,6 +505,18 @@ pub struct RecallEnvelope {
     /// §15.4 `contiguous_done_prefix` at decision time — the overlay's completeness bound,
     /// not a filter on `overlay`'s contents (see [`pg_delta_overlay`]'s doc).
     pub contiguous_done_prefix: i64,
+    /// §16.2：本次响应**唯一合法的检索面版本**，取自该 family 的 `serving` 行
+    /// （[`crate::serving_repo::serving_version`]），**不是** token 里带的那个。
+    ///
+    /// 构造 §23.1② 的 visible filter（`qdrant::VisibleCountFilter::new`）时只许读这里：
+    /// token 是客户端提交的，拿它当路由依据等于让调用方指定读哪个版本，正是 §16.2 要禁的。
+    /// token 里的 version 仍然有用，但角色是**被核对项**（它命中的行是不是 serving），
+    /// 不是路由依据。
+    ///
+    /// `None` = 该 family 还没有任何 serving 行（正常引导态：§6.2.2 下 gateway 造不出
+    /// `serving = true` 的 checkpoint）。此时**不得**构建任何 visible count filter——
+    /// 没有 serving 版本时「可见计数」没有分母，按 §57.1 那是 `cannot_establish` 而不是 0。
+    pub serving_version: Option<String>,
 }
 
 /// Top-level entry point: decode `token`, reject cross-tenant/cross-workspace use, then decide
@@ -510,21 +534,43 @@ pub async fn recall_with_overlay(
     validate_scope(&claims, requested_tenant_id, requested_workspace_id)?;
 
     let key = claims.stream_key();
+
+    // §16.2 读路由的**唯一消费侧入口**（G80-4 数的就是这一处）。family = stream key 去掉
+    // version 的五列：版本本身正是要问出来的东西，不能拿 token 里那个去问。
+    let serving_version = serving_repo::serving_version(
+        pool,
+        &StreamFamily::new(
+            key.tenant_id,
+            key.scope_kind.clone(),
+            key.scope_id,
+            key.domain.clone(),
+            key.projection_kind.clone(),
+        ),
+    )
+    .await
+    // 不可反驳模式而不是 `_ =>`：`ServingRepoError` 日后新增变体会在这里编译期报错，
+    // 比加一个 `From` 更省，也不会把新变体的信息悄悄折叠掉。
+    .map_err(|ServingRepoError::Db(e)| RetrieveError::Db(e))?;
+
+    // 水位只从 serving 行取（SQL 带 `AND serving`）：token 指向退役/shadow 版本时无行 ⇒ 0
+    // ⇒ 整条流走 overlay。
     let serving_hw = serving_projection_highwater(pool, &key).await?;
+    let prefix = contiguous_done_prefix(pool, &key).await?;
     if serving_hw >= claims.stream_seq {
         return Ok(RecallEnvelope {
             served_by_projection: true,
             overlay: vec![],
-            contiguous_done_prefix: contiguous_done_prefix(pool, &key).await?,
+            contiguous_done_prefix: prefix,
+            serving_version,
         });
     }
 
-    let prefix = contiguous_done_prefix(pool, &key).await?;
     let overlay = pg_delta_overlay(pool, &key, serving_hw, claims.stream_seq).await?;
     Ok(RecallEnvelope {
         served_by_projection: false,
         overlay,
         contiguous_done_prefix: prefix,
+        serving_version,
     })
 }
 

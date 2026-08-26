@@ -13,7 +13,9 @@ use humaux_adapters::postgres::{MaintenanceDbPool, PrivateWorkerDbPool};
 use humaux_domain::dataclass::DataClass;
 use humaux_domain::egress::{self, AuthorizedEgressPayload, PrivateDataPurpose, ProcessorId};
 use humaux_domain::ids::TenantId;
-use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
+use humaux_testkit::{
+    DISCLOSURE_LEDGER_ADVISORY_LOCK, DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture,
+};
 use postgres::error::SqlState;
 use postgres::{Client, NoTls};
 use sqlx::types::Uuid;
@@ -73,6 +75,18 @@ impl DbIntegrationFixture for DisclosureFixture {
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
+
+        // 与 `guard_trigger_rejects_truncate` 的 `TRUNCATE … CASCADE` 互斥（见
+        // `DISCLOSURE_LEDGER_ADVISORY_LOCK` 的 doc：那条测试必须拿两张表的
+        // AccessExclusiveLock，与并发读者交叉即成环，实测过一次真 40P01）。
+        // 取**共享**锁：读者之间照旧并发，只在那一条测试跑时才让路。
+        // session 级锁，连接 drop 即释放，测试 panic 也不会漏锁。
+        admin
+            .execute(
+                "SELECT pg_advisory_lock_shared($1)",
+                &[&DISCLOSURE_LEDGER_ADVISORY_LOCK],
+            )
+            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 
         let migrated: bool = admin
             .query_one(
@@ -618,6 +632,23 @@ fn guard_trigger_rejects_second_deletion_requested_at_write() {
 fn guard_trigger_rejects_truncate() {
     run_db_fixture::<DisclosureFixture, _>("guard_trigger_rejects_truncate", |mut handle| {
         let _ = seed_finalized_disclosure(&mut handle);
+
+        // 升级为排他：先放掉 fixture 取的共享锁，再等所有并发读者放手。
+        // 顺序不能反——同一 session 持共享时申请排他会自己阻塞自己。
+        handle
+            .admin
+            .execute(
+                "SELECT pg_advisory_unlock_shared($1)",
+                &[&DISCLOSURE_LEDGER_ADVISORY_LOCK],
+            )
+            .expect("release shared advisory lock");
+        handle
+            .admin
+            .execute(
+                "SELECT pg_advisory_lock($1)",
+                &[&DISCLOSURE_LEDGER_ADVISORY_LOCK],
+            )
+            .expect("take exclusive advisory lock before TRUNCATE");
 
         let mut txn = handle.admin.transaction().expect("begin txn");
         let err = txn
