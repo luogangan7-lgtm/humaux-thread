@@ -7,3 +7,4 @@ pub mod code;
 pub mod dense;
 pub mod graph;
 pub mod sparse;
+pub mod stream;
