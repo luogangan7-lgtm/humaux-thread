@@ -1,0 +1,43 @@
+# §46.1 migration manifest。给 control.credit_ledger (§75.2) 与 ops.model_call_ledger
+# (§19.1) 补 TRUNCATE 守卫——两者此前只有 `FOR EACH ROW` 的 UPDATE/DELETE 触发器，而
+# TRUNCATE 永远不会触发 ROW 级触发器（0047→0057 在 ops.data_disclosures 上踩过同一个洞）。
+# 纯增：两个新 TRIGGER + 一次 CREATE OR REPLACE FUNCTION（只把 TG_OP 判定从 'DELETE'
+# 扩到 IN ('DELETE','TRUNCATE')，UPDATE 路径的身份列比较一字未动）。不碰任何表结构、
+# 列、索引、policy、grant。
+
+migration_id = "0101_ledger_truncate_guards"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('control.credit_ledger') is not null
+  and to_regclass('ops.model_call_ledger') is not null
+  and not exists (
+    select 1 from pg_trigger
+    where not tgisinternal and tgtype & 32 > 0
+      and tgrelid in ('control.credit_ledger'::regclass, 'ops.model_call_ledger'::regclass)
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (select count(*) from pg_trigger
+   where not tgisinternal and tgtype & 32 > 0
+     and tgrelid in ('control.credit_ledger'::regclass, 'ops.model_call_ledger'::regclass)) = 2
+  and exists (
+    select 1 from pg_proc
+    where proname = 'model_call_ledger_guard_mutation' and prosrc ilike '%TRUNCATE%'
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP TRIGGER IF EXISTS credit_ledger_reject_truncate ON control.credit_ledger;
+          DROP TRIGGER IF EXISTS model_call_ledger_reject_truncate ON ops.model_call_ledger;
+(函数的 CREATE OR REPLACE 不回退——把 TG_OP 判定收窄回 'DELETE' 只会重新打开那个洞，
+而它在 UPDATE 路径上的行为逐字未变，留着无害。真要完全复原得再写一次 CREATE OR REPLACE，
+那属于 forward fix 不属于 rollback。)
+"""
+
+backup_restore_requirement = "none（两个新触发器 + 一次函数体替换，无数据改动、无表重写）。标准部署前快照即可。"
