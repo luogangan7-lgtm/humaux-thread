@@ -816,6 +816,59 @@ mod tests {
     /// knob); tests just need *a* fixed byte string to key the HMAC with.
     const TEST_PEPPER: &[u8] = b"test-only-pepper-not-a-secret";
 
+    // ---- §74.3 口令哈希基线（OWASP Argon2id） ----
+
+    /// **DOD-049 的缺口之一，补上**：`Argon2Config::engine()` 里的 `Algorithm::Argon2id`
+    /// 此前没有任何断言钉住——改成 `Argon2i` 或 `Argon2d` 全仓无红。那是实质降级：
+    /// OWASP 明确要求 Argon2id（Argon2i 抗 GPU 弱，Argon2d 有侧信道风险），而口令哈希
+    /// 的降级不会有任何功能表现，只有被拖库那天才看得出来。
+    ///
+    /// 断言钉在 **PHC 串**而不是内部字段上：`hash_password` 的输出本身就是可观测产物，
+    /// 而 PHC 前缀同时编码了算法、版本与三个代价参数，一条断言把整条 OWASP 基线
+    /// （Argon2id / v=19 / 19 MiB / 2 iterations / 1 lane）一起钉住。改任一项都会变形。
+    #[test]
+    fn password_hash_pins_the_owasp_argon2id_baseline_in_its_phc_prefix() {
+        let hash = hash_password(cfg(), "correct horse battery staple")
+            .expect("hashing a well-formed password never fails");
+        let phc = hash.as_str();
+
+        assert!(
+            phc.starts_with("$argon2id$"),
+            "口令哈希算法必须是 Argon2id（OWASP §74.3）——Argon2i 抗 GPU 弱、Argon2d 有\
+             侧信道风险，两者都能通过除本条之外的每一个测试。实得: {}",
+            &phc[..phc.len().min(40)]
+        );
+        assert!(
+            phc.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "OWASP 基线（v=19 / 19 MiB / 2 iterations / 1 lane）被改动。参数调整是合法的\
+             运维决定，但必须是**显式**的：连同本断言一起改，而不是悄悄改掉 Default。\
+             实得: {}",
+            &phc[..phc.len().min(40)]
+        );
+    }
+
+    /// 反向对照：本条钉的是**基线**不是「任何 PHC 串都行」。故意用一组非基线参数，
+    /// 断言它产出的前缀确实不同——否则上面那条断言可能对任何输入都成立（那就是假绿）。
+    #[test]
+    fn a_non_baseline_config_produces_a_different_phc_prefix() {
+        let tuned = AuthConfig {
+            argon2: Argon2Config {
+                m_cost: 32 * 1024,
+                t_cost: 3,
+                p_cost: 2,
+            },
+            ..cfg()
+        };
+        let phc = hash_password(tuned, "correct horse battery staple")
+            .expect("hashing a well-formed password never fails");
+        let phc = phc.as_str();
+        assert!(phc.starts_with("$argon2id$"), "算法不该随参数变: {phc}");
+        assert!(
+            !phc.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "非基线参数产出了基线前缀——说明上面那条断言其实没在看参数: {phc}"
+        );
+    }
+
     // ---- §74.2 unverified account cannot use entitlements ----
 
     #[test]

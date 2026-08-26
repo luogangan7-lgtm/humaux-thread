@@ -406,12 +406,89 @@ mod tests {
     }
 
     fn binding(revision: &str, profile: &str) -> CalibrationBinding {
+        binding_on("dashscope", "gte-rerank-v2", revision, profile)
+    }
+
+    /// `binding` 的四轴版本。**存在的理由**：`binding` 把 `provider_id`/`model_id` 写死了，
+    /// 于是 §19 那条四合取判定里只有 `model_revision`/`calibration_profile` 两轴被测过——
+    /// 删掉 `c.provider_id == live.provider_id` 或 `c.model_id == live.model_id` 任一项，
+    /// 本模块此前的每一条测试都照样绿。DOD-022 要求的正是「provider/model **变化**绑定新
+    /// 的 calibration profile」，而变化的那两轴恰恰是没被覆盖的两轴。
+    fn binding_on(
+        provider: &str,
+        model: &str,
+        revision: &str,
+        profile: &str,
+    ) -> CalibrationBinding {
         CalibrationBinding {
-            provider_id: ProviderId("dashscope".into()),
-            model_id: ModelId("gte-rerank-v2".into()),
+            provider_id: ProviderId(provider.into()),
+            model_id: ModelId(model.into()),
             model_revision: revision.to_string(),
             calibration_profile: CalibrationProfileId(profile.into()),
         }
+    }
+
+    /// DOD-022 第一轴：**换了 provider** 就不能沿用旧 provider 的 calibration。
+    /// 注错：删掉判定里的 `c.provider_id == live.provider_id` ⇒ 本条必红。
+    #[test]
+    fn a_different_provider_is_not_calibrated_by_the_old_providers_profile() {
+        let live = binding_on("minimax", "gte-rerank-v2", "2026-08", "profile-a");
+        // 其余三轴逐字相同——只有 provider 变了。这样才能证明红的原因是那一轴，
+        // 而不是"反正有什么不一样"。
+        let known = vec![binding_on(
+            "dashscope",
+            "gte-rerank-v2",
+            "2026-08",
+            "profile-a",
+        )];
+        assert!(
+            matches!(
+                rerank_threshold_gate_state(&live, &known),
+                ThresholdGateState::StandDownLoud { .. }
+            ),
+            "换 provider 之后沿用旧 calibration 会让阈值门用错分布"
+        );
+    }
+
+    /// DOD-022 第二轴：**换了 model** 同理。
+    /// 注错：删掉 `c.model_id == live.model_id` ⇒ 本条必红。
+    #[test]
+    fn a_different_model_is_not_calibrated_by_the_old_models_profile() {
+        let live = binding_on("dashscope", "qwen3-rerank", "2026-08", "profile-a");
+        let known = vec![binding_on(
+            "dashscope",
+            "gte-rerank-v2",
+            "2026-08",
+            "profile-a",
+        )];
+        assert!(
+            matches!(
+                rerank_threshold_gate_state(&live, &known),
+                ThresholdGateState::StandDownLoud { .. }
+            ),
+            "换 model 之后沿用旧 calibration 会让阈值门用错分布"
+        );
+    }
+
+    /// 正对照：四轴逐字相同才算 calibrated。没有这条的话，上面两条也可能因为
+    /// 「判定恒返回 StandDownLoud」而绿——那同样是假绿，只是方向相反。
+    #[test]
+    fn all_four_axes_matching_is_what_makes_it_calibrated() {
+        let live = binding_on("minimax", "qwen3-rerank", "2026-09", "profile-b");
+        let known = vec![
+            binding_on("dashscope", "qwen3-rerank", "2026-09", "profile-b"), // provider 不同
+            binding_on("minimax", "gte-rerank-v2", "2026-09", "profile-b"),  // model 不同
+            binding_on("minimax", "qwen3-rerank", "2026-08", "profile-b"),   // revision 不同
+            binding_on("minimax", "qwen3-rerank", "2026-09", "profile-a"),   // profile 不同
+            binding_on("minimax", "qwen3-rerank", "2026-09", "profile-b"),   // 四轴全同
+        ];
+        assert_eq!(
+            rerank_threshold_gate_state(&live, &known),
+            ThresholdGateState::Calibrated {
+                calibration_profile: CalibrationProfileId("profile-b".into())
+            },
+            "四轴全同的那一条在集合里，必须判 Calibrated"
+        );
     }
 
     #[test]
