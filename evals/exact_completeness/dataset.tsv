@@ -1,0 +1,21 @@
+# exact_completeness eval set — §22.1 EXACT readouts / §22.4 non-enumerable triggers /
+# §23.4 deletion-tour EXACT-channel sampling. One row per case; harness:
+# crates/adapters/tests/exact_completeness_eval.rs (seeds each case's world in an isolated
+# workspace, runs the real probe→decide→census→classify→exact_outcome_block chain, compares
+# by exact equality). Layers freeze the fixed_denominator: exact 5 + non_enumerable 3 +
+# deletion_tour 3 = 11. "-" = not applicable for that case.
+# §20.2 rule 5 note: "quantifier query with no registry predicate → semantic routing" is
+# planner_predicate's turf (its live negatives pin that behavior); this set deliberately
+# does not re-measure it.
+case_id	layer	expect_class	expect_reason	expect_predicate_id	expect_total	expect_returned	expect_excluded_secret	expect_truncated	expect_lower_bound
+exact_full	exact	exact	-	rejected_decisions_v1	4	4	0	false	-
+exact_secret_deducted	exact	exact	-	rejected_decisions_v1	5	4	1	false	-
+exact_empty	exact	exact	-	rejected_decisions_v1	0	0	0	false	-
+exact_scope_isolated	exact	exact	-	rejected_decisions_v1	3	3	0	false	-
+exact_supersede_out	exact	exact	-	rejected_decisions_v1	3	3	0	false	-
+ne_missing_column	non_enumerable	cannot_establish	predicate_not_enumerable	-	-	-	-	-	-
+ne_mixed_scope	non_enumerable	cannot_establish	predicate_not_enumerable	-	-	-	-	-	-
+census_failed	non_enumerable	cannot_establish	census_failed	-	-	-	-	-	-
+tour_before	deletion_tour	exact	-	rejected_decisions_v1	12	12	0	false	-
+tour_after_tombstone	deletion_tour	exact	-	rejected_decisions_v1	9	9	0	false	-
+tour_after_purge	deletion_tour	exact	-	rejected_decisions_v1	9	9	0	false	-

@@ -6,6 +6,7 @@
 //! `NOT_DECLARED` ⇒ 红。本文件不复述判据散文，只引用 § 号（仓库硬边界）。
 
 use std::fs;
+use std::path::Path;
 
 const SPEC_PATH: &str = "docs/architecture/Baseline_2.9.md";
 /// §69 声明表标题；用它动态定位表格起点而不是硬编码行号，spec 改版漂移时自动跟随。
@@ -316,7 +317,62 @@ pub struct EvalResult {
 
 /// 对已解析的声明表跑 §69 全部判据（恰 9 行 / 逐名对齐 / legacy marker / 七字段 / owning
 /// phase）。从 `run()` 抽出以便测试直接驱动 owning-phase 到期分支（无需解析 stdout/stderr）。
-pub fn evaluate(spec_md: &str, table: &[Vec<String>], current_phase: u32) -> EvalResult {
+/// §55.3.1 manifest gate for one `DECLARED` row: the BenchmarkManifest file must exist and
+/// carry the frozen field set — "`BenchmarkManifest` 缺 source/version/license/hash 时同样
+/// 视为 NOT_DECLARED"，注错「删除 manifest ⇒ 红」以本函数落地（此前 checker 只读 spec 表
+/// 行，manifest 整个消失也无感——这正是删注错第一次跑就抓出来的缺口）。
+fn manifest_violation(manifest_root: &Path, set_id: &str) -> Option<Violation> {
+    let path = manifest_root
+        .join("evals")
+        .join(set_id)
+        .join("manifest.toml");
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => {
+            return Some(Violation(format!(
+                "{set_id}: DECLARED 但 BenchmarkManifest 不存在（{}）——§55.3.1 视为 NOT_DECLARED",
+                path.display()
+            )));
+        }
+    };
+    const REQUIRED_KEYS: &[&str] = &[
+        "set_id",
+        "source_kind",
+        "source_ref",
+        "source_version",
+        "license",
+        "fixture_sha256",
+        "fixed_denominator",
+        "decision_depth",
+        "measured_at",
+        "frozen_by",
+    ];
+    let missing: Vec<&str> = REQUIRED_KEYS
+        .iter()
+        .filter(|k| {
+            !text.lines().any(|l| {
+                let l = l.trim();
+                l.starts_with(**k) && l[k.len()..].trim_start().starts_with('=')
+            })
+        })
+        .copied()
+        .collect();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(Violation(format!(
+            "{set_id}: BenchmarkManifest 缺字段 {}（§55.3.1）——视为 NOT_DECLARED",
+            missing.join(",")
+        )))
+    }
+}
+
+pub fn evaluate(
+    spec_md: &str,
+    table: &[Vec<String>],
+    current_phase: u32,
+    manifest_root: Option<&Path>,
+) -> EvalResult {
     let mut violations = Vec::new();
 
     if table.len() != REQUIRED_ROW_COUNT {
@@ -361,7 +417,12 @@ pub fn evaluate(spec_md: &str, table: &[Vec<String>], current_phase: u32) -> Eva
                 )));
             }
             Some(_) if declared => {
-                // 七字段齐全，不受 owning phase 到期约束。
+                // 七字段齐全，不受 owning phase 到期约束——但 §55.3.1 的 manifest 面还要过。
+                if let Some(root) = manifest_root
+                    && let Some(v) = manifest_violation(root, &set_id)
+                {
+                    violations.push(v);
+                }
             }
             Some(phase) if current_phase >= phase => {
                 violations.push(Violation(format!(
@@ -403,7 +464,7 @@ pub fn run(args: &[String]) -> i32 {
     let EvalResult {
         violations,
         na_list,
-    } = evaluate(&spec_md, &table, current_phase);
+    } = evaluate(&spec_md, &table, current_phase, Some(Path::new(".")));
 
     // 三态单一状态行（§57.1）：有 violation ⇒ 只 fail（na_list 作附注打印，不当第二个状态）；
     // 无 violation 且 na_list 非空 ⇒ 只 not_applicable 并点名缺失对象；两者皆无 ⇒ pass。
@@ -437,6 +498,10 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    }
 
     fn real_spec_md() -> String {
         let path =
@@ -497,7 +562,11 @@ mod tests {
         // planner_predicate_eval.rs) and is genuinely `DECLARED` — same "pin expires when the
         // underlying gap is actually closed" pattern the ADR-0001 comment below documents for
         // `memory_security_lifecycle`'s name-alignment pin.
-        const DECLARED_EXEMPT: &[&str] = &["planner_predicate"];
+        // `exact_completeness` joined 2026-08-27: 11-item eval set
+        // (evals/exact_completeness/dataset.tsv, crates/adapters/tests/
+        // exact_completeness_eval.rs) with measured resolution (1) and spread (0) — same
+        // expiring-pin pattern as `planner_predicate` below.
+        const DECLARED_EXEMPT: &[&str] = &["planner_predicate", "exact_completeness"];
         let spec = real_spec_md();
         let table = parse_declaration_table(&spec);
         for row in &table {
@@ -578,7 +647,7 @@ mod tests {
     fn owning_phase_expires_red_at_phase_11_for_code_retrieval() {
         let spec = real_spec_md();
         let table = parse_declaration_table(&spec);
-        let result = evaluate(&spec, &table, 11);
+        let result = evaluate(&spec, &table, 11, Some(&repo_root()));
         assert!(
             result
                 .violations
@@ -594,7 +663,7 @@ mod tests {
     fn owning_phase_not_yet_due_at_phase_10_for_code_retrieval() {
         let spec = real_spec_md();
         let table = parse_declaration_table(&spec);
-        let result = evaluate(&spec, &table, 10);
+        let result = evaluate(&spec, &table, 10, Some(&repo_root()));
         assert!(
             !result
                 .violations
@@ -632,7 +701,7 @@ mod tests {
         assert!(declared, "fixture row must itself be §55.3-declared");
         let mut synthetic_table = table.clone();
         synthetic_table.push(declared_row);
-        let result = evaluate(&spec, &synthetic_table, 0);
+        let result = evaluate(&spec, &synthetic_table, 0, Some(&repo_root()));
         assert!(
             result
                 .violations
@@ -640,6 +709,51 @@ mod tests {
                 .any(|v| v.0.contains("synthetic_declared_row")
                     && v.0.contains("无法确定 owning phase")),
             "declared row with no owner=Phase annotation and no DoD fallback must still fail: {:?}",
+            result.violations
+        );
+    }
+
+    /// 注错（§55.3.1 manifest 面）：declared 行的 manifest 文件不存在 ⇒ 必须红。第一次跑
+    /// 删-manifest 注错时 checker 只读 spec 表行、对 manifest 消失完全无感——本测试钉住修复。
+    #[test]
+    fn declared_row_with_no_manifest_file_is_red() {
+        let spec = real_spec_md();
+        let mut table = parse_declaration_table(&spec);
+        table.push(vec![
+            "`synthetic_declared_row`".to_string(),
+            "synthetic set".to_string(),
+            "10 = a 5 + b 5".to_string(),
+            "top_k=5".to_string(),
+            "resolution：4 题；spread_tol：2 题".to_string(),
+            "2026-01-01 / abcdef0".to_string(),
+            "`DECLARED` · owner=Retrieval（Phase 6+）".to_string(),
+        ]);
+        let result = evaluate(&spec, &table, 0, Some(&repo_root()));
+        assert!(
+            result
+                .violations
+                .iter()
+                .any(|v| v.0.contains("synthetic_declared_row")
+                    && v.0.contains("BenchmarkManifest 不存在")),
+            "declared row without a manifest file must be red: {:?}",
+            result.violations
+        );
+    }
+
+    /// 窄度对照：真实的两个 DECLARED 行（planner_predicate / exact_completeness）manifest
+    /// 齐全，本闸不得对它们产生任何 manifest 违规——闸只红在该红的对象上（§57.1 精神）。
+    #[test]
+    fn real_declared_rows_pass_the_manifest_gate() {
+        let spec = real_spec_md();
+        let table = parse_declaration_table(&spec);
+        let result = evaluate(&spec, &table, 0, Some(&repo_root()));
+        assert!(
+            !result
+                .violations
+                .iter()
+                .any(|v| v.0.contains("BenchmarkManifest")),
+            "real declared rows carry complete manifests; manifest violations here mean the \
+             gate is over-firing: {:?}",
             result.violations
         );
     }

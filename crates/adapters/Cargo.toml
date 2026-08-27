@@ -32,6 +32,10 @@ sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "r
 # established by humaux-application; this crate previously only pulled humaux-domain in as a
 # dev-dependency (test fixtures), promoted here to a real one for the same reason.
 humaux-domain = { path = "../domain" }
+# `exact_census` (§22.1 census wiring): constructs `completeness::CensusResult` /
+# `ExactEnumeration` and consumes `predicate_registry::PredicateEntry` — the
+# adapters-constructs-the-pure-crate's-types direction those types' own rustdoc anticipates.
+humaux-retrieval = { path = "../retrieval" }
 # §11.1 BYOK 域的生产 transport（byok.rs::EgressHttpTransport -> infra-egress raw 出口）。
 # G80-3 把 infra-network 的依赖方钉死为 {infra-egress, infra-cell}，adapters 只能间接触达。
 humaux-infra-egress = { path = "../infra-egress" }
@@ -85,11 +89,11 @@ uuid = { version = "1.25.0", features = ["v7"] }
 # tests/) but never for a normal `cargo build`/production build of this crate, since
 # dev-dependencies are not pulled in outside test targets. See `[features]` above.
 humaux-adapters = { path = ".", features = ["test-support"] }
-# tests/recall_envelope_g23.rs (§23.4 G23-2): the judgment under test —
-# `humaux_retrieval::completeness::ledger::close` / `envelope::build_projection_block` — plus
-# `DegradeCode` to assert the exact `ProjectionInvisibleLoss` fired. Dev-only: production
-# `adapters` code has no dependency on `retrieval`/`telemetry` yet.
-humaux-retrieval = { path = "../retrieval" }
+# tests/recall_envelope_g23.rs (§23.4 G23-2): `DegradeCode` to assert the exact
+# `ProjectionInvisibleLoss` fired. Dev-only — production `adapters` has no telemetry dep.
+# (`humaux-retrieval` moved to [dependencies]: `exact_census` constructs
+# `completeness::CensusResult`/`ExactEnumeration` in production code, the crate-boundary the
+# retrieval types' own docs anticipate — "adapters is this type's eventual constructor".)
 humaux-telemetry = { path = "../telemetry" }
 # tests/model_call_ledger.rs (T7.4, §19.1): `humaux_retrieval_provider::{cost,pricing}` — the
 # pure cost/pricing computation this crate's own `model_call_ledger` module deliberately does

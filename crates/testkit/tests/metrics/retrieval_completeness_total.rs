@@ -49,7 +49,7 @@ fn every_reachable_class_reason_pair_increments_by_exactly_one() {
                 predicate_id: "rejected_decisions_v1".to_string(),
             },
             LaneStatus::Ok,
-            CensusResult { ok: true },
+            CensusResult::ok_without_enumeration(),
             broken_ledger(),
         ),
         (
@@ -57,7 +57,7 @@ fn every_reachable_class_reason_pair_increments_by_exactly_one() {
             "census_failed",
             PlannerDecision::Class(QueryClass::Semantic),
             LaneStatus::Ok,
-            CensusResult { ok: false },
+            CensusResult::failed(),
             closed_ledger(),
         ),
         (
@@ -65,7 +65,7 @@ fn every_reachable_class_reason_pair_increments_by_exactly_one() {
             "lane_failed",
             PlannerDecision::Class(QueryClass::Semantic),
             LaneStatus::Failed,
-            CensusResult { ok: true },
+            CensusResult::ok_without_enumeration(),
             closed_ledger(),
         ),
         (
@@ -73,7 +73,7 @@ fn every_reachable_class_reason_pair_increments_by_exactly_one() {
             "predicate_not_enumerable",
             PlannerDecision::CannotEstablish,
             LaneStatus::Ok,
-            CensusResult { ok: true },
+            CensusResult::ok_without_enumeration(),
             closed_ledger(),
         ),
         (
@@ -83,7 +83,7 @@ fn every_reachable_class_reason_pair_increments_by_exactly_one() {
                 predicate_id: "rejected_decisions_v1".to_string(),
             },
             LaneStatus::Ok,
-            CensusResult { ok: true },
+            CensusResult::ok_without_enumeration(),
             closed_ledger(),
         ),
         (
@@ -93,7 +93,7 @@ fn every_reachable_class_reason_pair_increments_by_exactly_one() {
                 "00000000-0000-0000-0000-000000000000".to_string(),
             )),
             LaneStatus::Ok,
-            CensusResult { ok: true },
+            CensusResult::ok_without_enumeration(),
             closed_ledger(),
         ),
         (
@@ -101,7 +101,7 @@ fn every_reachable_class_reason_pair_increments_by_exactly_one() {
             "none",
             PlannerDecision::Class(QueryClass::State),
             LaneStatus::Ok,
-            CensusResult { ok: true },
+            CensusResult::ok_without_enumeration(),
             closed_ledger(),
         ),
     ];
@@ -136,7 +136,7 @@ fn family_has_nonzero_samples_after_positive_path() {
             predicate_id: "rejected_decisions_v1".to_string(),
         },
         LaneStatus::Ok,
-        &CensusResult { ok: true },
+        &CensusResult::ok_without_enumeration(),
         &ledger,
     );
     assert!(

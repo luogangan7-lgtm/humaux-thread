@@ -339,6 +339,15 @@ mod tests {
             class: CompletenessClassWire::Exact,
             // 非 cannot_establish 的 class 没有 reason（见 CannotEstablishReasonWire）。
             reason: None,
+            // §22.0: class=exact must carry the §22.1 block — even a fixture keeps the pair.
+            exact: Some(crate::envelope::ExactReport {
+                predicate_id: "rejected_decisions_v1".to_string(),
+                total: 5,
+                returned: 5,
+                coverage: 1.0,
+                truncated: false,
+                excluded_secret: 0,
+            }),
             lanes: Default::default(),
             candidate_count: 10,
             reranked_count: 10,

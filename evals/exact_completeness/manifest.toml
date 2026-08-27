@@ -1,0 +1,21 @@
+# §55.3.1 BenchmarkManifest for the `exact_completeness` set (§22.1 EXACT readouts /
+# §22.4 non-enumerable triggers / §23.4 deletion-tour EXACT-channel sampling).
+# Calculator: crates/adapters/src/exact_census.rs (probe_predicate_inputs + exact_enumerate)
+#             + crates/retrieval/src/envelope.rs (exact_outcome_block).
+# Harness: crates/adapters/tests/exact_completeness_eval.rs.
+
+set_id = "exact_completeness"
+source_kind = "internal"
+source_ref = "evals/exact_completeness/dataset.tsv"
+source_version = "e64f95a"
+license = "internal-only, not redistributed"
+# sha256 of dataset.tsv, recomputed by `shasum -a 256 evals/exact_completeness/dataset.tsv`
+# at time of writing; recompute and update this value whenever dataset.tsv changes.
+fixture_sha256 = "7d7ed78d44966c60b2349f278d3594433c0a6efe34564f0a1b130b044a9c0e14"
+# 11 = exact 5 + non_enumerable 3 + deletion_tour 3 (layer split pinned by
+# exact_completeness_eval.rs::manifest_matches_real_dataset).
+fixed_denominator = 11
+decision_depth = "exact_equality"
+profile_fingerprint_policy = "recompute on any change to the census SQL (exact_census.rs), the 0077/0078 registry row or index, or the §23.1② overlay predicate"
+measured_at = "2026-08-27"
+frozen_by = "e64f95a"

@@ -11,6 +11,7 @@ pub mod context_repo;
 pub mod dashscope;
 pub mod disclosure;
 pub mod email;
+pub mod exact_census;
 pub mod forget_repo;
 pub mod jobs;
 pub mod model_call_ledger;

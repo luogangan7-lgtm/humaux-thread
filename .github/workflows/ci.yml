@@ -140,9 +140,11 @@ jobs:
       #   · dod-check --phase 7  → 9 pass / 40 fail / 50 na，40 条全是
       #     「no verifier registered」——§69 要求的 DoD→verifier→注错三段绑定，
       #     94 条里只登记了 5 条（crates/testkit/src/dod.rs 模块注释自陈「Phase 0 only」）。
-      #   · benchset-declaration --phase 7 → 4 个集合 owning phase 已到期仍 NOT_DECLARED
-      #     （continuation_198_v2 / longmemeval_style / exact_completeness /
-      #     memory_security_lifecycle），缺的是**实测**数据，不能估。
+      #   · benchset-declaration（PHASE=8 实跑）→ 5 个集合 owning phase 已到期仍
+      #     NOT_DECLARED（continuation_198_v2 / longmemeval_style / agent_workflow_outcome /
+      #     project_continuity / memory_security_lifecycle），缺的是**实测**数据，不能估。
+      #     exact_completeness 已于 2026-08-27 实测声明（evals/exact_completeness/ +
+      #     crates/adapters/tests/exact_completeness_eval.rs），从红名单摘除。
       #
       # 接的前提是先把缺口补上，而不是把相位调低到让它们变绿——那正是 §80.1.2
       # 批评已退休 G80-21 时说的「调松定义」。补完这两块即在此处接上，并把相位值

@@ -386,12 +386,103 @@ pub struct CompletenessBlock {
     /// §22.4 的 reason；非 `cannot_establish` 时为 `None`。由
     /// [`CannotEstablishReasonWire::from_class`] 单点产出。
     pub reason: Option<CannotEstablishReasonWire>,
+    /// §22.1 structured enumeration — present iff `class == exact` (§22.0 same-source
+    /// invariant, enforced by [`exact_outcome_block`], the sole legal producer of the pair).
+    pub exact: Option<ExactReport>,
     pub lanes: BTreeMap<String, LaneStatus>,
     pub candidate_count: u32,
     pub reranked_count: u32,
     pub returned: u32,
     pub truncated: bool,
     pub degradations: Vec<String>,
+}
+
+/// §22.1 EXACT enumeration wire block — the six readouts the spec's own example freezes
+/// (`predicate_id / total / returned / coverage / truncated / excluded_secret`). Serialized
+/// verbatim; every value is copied from one [`crate::completeness::ExactEnumeration`] (whose
+/// sole constructor already enforced `returned + excluded_secret <= total` and derived
+/// `coverage`/`truncated`), so no field here can disagree with the census that produced it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExactReport {
+    pub predicate_id: String,
+    pub total: u64,
+    pub returned: u64,
+    pub coverage: f64,
+    pub truncated: bool,
+    pub excluded_secret: u64,
+}
+
+impl ExactReport {
+    fn from_enumeration(e: &crate::completeness::ExactEnumeration) -> Self {
+        Self {
+            predicate_id: e.predicate_id().to_string(),
+            total: e.total(),
+            returned: e.returned(),
+            coverage: e.coverage(),
+            truncated: e.truncated(),
+            excluded_secret: e.excluded_secret(),
+        }
+    }
+}
+
+/// [`exact_outcome_block`]'s return: wire class + reason + the §22.1 block + §22.4's known
+/// lower bound, produced together so none of the four can be assembled independently of the
+/// others (the same one-place discipline as [`mandatory_outcome_blocks`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExactOutcome {
+    pub class: CompletenessClassWire,
+    pub reason: Option<CannotEstablishReasonWire>,
+    /// `Some` iff `class == Exact` (§22.0).
+    pub exact: Option<ExactReport>,
+    /// §22.4: `CANNOT_ESTABLISH` "必须带 reason 与已知下界：「至少有 N 条，我无法证明这是
+    /// 全部」". `Some(returned)` when the census did enumerate before a later trigger (broken
+    /// ledger, lane failure) blocked the class; `None` when nothing was ever counted.
+    pub known_lower_bound: Option<u64>,
+}
+
+/// §22.0 / §22.1 sole producer of the (`class`, `exact` block) pair — runs the real
+/// [`crate::completeness::classify_for_witness`]-underlying `classify()` path (metrics
+/// counted, §22.5 sole constructor respected) and derives the §22.1 block from the same
+/// [`CensusResult`] the classification consumed.
+///
+/// The one hard error: `class == exact` while the census carries no enumeration is §22.0's
+/// frozen invariant violation ("出现 `class=exact` 而 `predicate_id=null` 是不变量违反，直接
+/// 5xx，**不是降级**") ⇒ `Err(ErrorCode::Internal)`, never a silent downgrade to a weaker
+/// class (§22.5 direction table has no such transition).
+///
+/// Conversely a non-`exact` class never emits the block — an enumeration attached to a
+/// `cannot_establish` answer would be a second, contradicting completeness claim; the census's
+/// count survives only as `known_lower_bound` (§22.4).
+pub fn exact_outcome_block(
+    planner_output: &crate::planner::PlannerDecision,
+    lane_status: LaneStatus,
+    census: &crate::completeness::CensusResult,
+    ledger: &crate::completeness::LedgerClosure,
+) -> Result<ExactOutcome, humaux_domain::error::ErrorCode> {
+    let class = crate::completeness::classify(planner_output, lane_status, census, ledger);
+    let reason = CannotEstablishReasonWire::from_class(class);
+    let wire = CompletenessClassWire::from(class);
+    let exact = match (wire, census.enumeration()) {
+        (CompletenessClassWire::Exact, Some(e)) => Some(ExactReport::from_enumeration(e)),
+        (CompletenessClassWire::Exact, None) => {
+            return Err(humaux_domain::error::ErrorCode::Internal);
+        }
+        (_, _) => None,
+    };
+    // §22.4 scopes the lower bound to `CANNOT_ESTABLISH` alone — a `semantic_bounded`
+    // answer carrying "at least N" would be a partial completeness claim §22.2/§22.3 never
+    // defined for it.
+    let known_lower_bound = if wire == CompletenessClassWire::CannotEstablish {
+        census.enumeration().map(|e| e.returned())
+    } else {
+        None
+    };
+    Ok(ExactOutcome {
+        class: wire,
+        reason,
+        exact,
+        known_lower_bound,
+    })
 }
 
 impl CompletenessBlock {
@@ -993,6 +1084,7 @@ mod tests {
         let block = CompletenessBlock {
             class: CompletenessClassWire::CannotEstablish,
             reason: Some(CannotEstablishReasonWire::MandatoryContextOverflow),
+            exact: None,
             lanes: BTreeMap::new(),
             candidate_count: 0,
             reranked_count: 0,
@@ -1168,6 +1260,7 @@ mod tests {
             class: CompletenessClassWire::SemanticBounded,
             // 非 cannot_establish 的 class 没有 reason（见 CannotEstablishReasonWire）。
             reason: None,
+            exact: None,
             lanes: BTreeMap::new(),
             candidate_count: 100,
             reranked_count: 100,
@@ -1259,7 +1352,7 @@ mod tests {
         let class = assemble_completeness_class(
             &PlannerDecision::Class(crate::planner::QueryClass::Semantic),
             LaneStatus::Ok,
-            &CensusResult { ok: true },
+            &CensusResult::ok_without_enumeration(),
             &ledger,
             None,
             &out.value,
@@ -1283,7 +1376,7 @@ mod tests {
         let class = assemble_completeness_class(
             &PlannerDecision::Class(crate::planner::QueryClass::Semantic),
             LaneStatus::Ok,
-            &CensusResult { ok: true },
+            &CensusResult::ok_without_enumeration(),
             &ledger,
             Some(98),
             &out.value,
@@ -1310,7 +1403,7 @@ mod tests {
         let class = assemble_completeness_class(
             &PlannerDecision::Class(crate::planner::QueryClass::Semantic),
             LaneStatus::Ok,
-            &CensusResult { ok: true },
+            &CensusResult::ok_without_enumeration(),
             &ledger,
             Some(90),
             &out.value,
@@ -1392,6 +1485,7 @@ mod tests {
             class: CompletenessClassWire::SemanticBounded,
             // 非 cannot_establish 的 class 没有 reason（见 CannotEstablishReasonWire）。
             reason: None,
+            exact: None,
             lanes: BTreeMap::new(),
             candidate_count: candidate,
             reranked_count: reranked,
@@ -1638,5 +1732,129 @@ mod tests {
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(json.contains(r#""freshness":{"class":"fresh""#));
         assert!(json.contains(r#""grounding":{"current":0,"recheck_required":1"#));
+    }
+
+    /// §22.1: the exact class carries the full six-field block, every value copied from the
+    /// census's own enumeration (no independent assembly path exists).
+    #[test]
+    fn exact_class_carries_the_full_22_1_block() {
+        use crate::completeness::{CensusResult, ExactEnumeration, ledger};
+        use crate::planner::PlannerDecision;
+
+        let census = CensusResult::enumerated(
+            ExactEnumeration::new("rejected_decisions_v1", 17, 15, 2).unwrap(),
+        );
+        let out = exact_outcome_block(
+            &PlannerDecision::Enumerate {
+                predicate_id: "rejected_decisions_v1".to_string(),
+            },
+            LaneStatus::Ok,
+            &census,
+            &ledger::close(ledger::LedgerReads {
+                expected: 10,
+                done: 10,
+                deleted: 0,
+                skipped: 0,
+                open_gaps: 0,
+                pending: 0,
+            }),
+        )
+        .unwrap();
+        assert_eq!(out.class, CompletenessClassWire::Exact);
+        assert_eq!(out.reason, None);
+        assert_eq!(out.known_lower_bound, None);
+        let exact = out.exact.unwrap();
+        assert_eq!(exact.predicate_id, "rejected_decisions_v1");
+        assert_eq!(exact.total, 17);
+        assert_eq!(exact.returned, 15);
+        assert_eq!(exact.excluded_secret, 2);
+        assert!(!exact.truncated);
+        assert!((exact.coverage - 15.0 / 17.0).abs() < f64::EPSILON);
+    }
+
+    /// §22.0 fault, executable: an Enumerate decision whose census never enumerated would
+    /// surface as `class=exact` with no `predicate_id`-bearing block — "不变量违反，直接
+    /// 5xx，**不是降级**". The one Err path; nothing here downgrades to a weaker class.
+    #[test]
+    fn g22_0_fault_a_verbal_exact_claim_is_a_hard_error_not_a_downgrade() {
+        use crate::completeness::{CensusResult, ledger};
+        use crate::planner::PlannerDecision;
+
+        let err = exact_outcome_block(
+            &PlannerDecision::Enumerate {
+                predicate_id: "rejected_decisions_v1".to_string(),
+            },
+            LaneStatus::Ok,
+            &CensusResult::ok_without_enumeration(),
+            &ledger::close(ledger::LedgerReads {
+                expected: 1,
+                done: 1,
+                deleted: 0,
+                skipped: 0,
+                open_gaps: 0,
+                pending: 0,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err, humaux_domain::error::ErrorCode::Internal);
+    }
+
+    /// §22.4: when a later trigger (here a broken ledger) blocks the class *after* the census
+    /// already counted, the count survives only as `known_lower_bound` — the §22.1 block
+    /// itself must not ride along on a `cannot_establish` answer.
+    #[test]
+    fn cannot_establish_keeps_the_census_count_as_lower_bound_only() {
+        use crate::completeness::{CensusResult, ExactEnumeration, ledger};
+        use crate::planner::PlannerDecision;
+
+        let census = CensusResult::enumerated(
+            ExactEnumeration::new("rejected_decisions_v1", 17, 17, 0).unwrap(),
+        );
+        let out = exact_outcome_block(
+            &PlannerDecision::Enumerate {
+                predicate_id: "rejected_decisions_v1".to_string(),
+            },
+            LaneStatus::Ok,
+            &census,
+            &ledger::close(ledger::LedgerReads {
+                expected: 10,
+                done: 5,
+                deleted: 0,
+                skipped: 0,
+                open_gaps: 0,
+                pending: 0,
+            }),
+        )
+        .unwrap();
+        assert_eq!(out.class, CompletenessClassWire::CannotEstablish);
+        assert!(out.reason.is_some());
+        assert_eq!(out.exact, None);
+        assert_eq!(out.known_lower_bound, Some(17));
+    }
+
+    /// A semantic answer never emits the block *nor* a lower bound (§22.2/§22.3 define no
+    /// partial-count claim for `semantic_bounded`).
+    #[test]
+    fn non_exact_class_never_emits_the_enumeration_block() {
+        use crate::completeness::{CensusResult, ledger};
+        use crate::planner::{PlannerDecision, QueryClass};
+
+        let out = exact_outcome_block(
+            &PlannerDecision::Class(QueryClass::Semantic),
+            LaneStatus::Ok,
+            &CensusResult::ok_without_enumeration(),
+            &ledger::close(ledger::LedgerReads {
+                expected: 1,
+                done: 1,
+                deleted: 0,
+                skipped: 0,
+                open_gaps: 0,
+                pending: 0,
+            }),
+        )
+        .unwrap();
+        assert_eq!(out.class, CompletenessClassWire::SemanticBounded);
+        assert_eq!(out.exact, None);
+        assert_eq!(out.known_lower_bound, None);
     }
 }

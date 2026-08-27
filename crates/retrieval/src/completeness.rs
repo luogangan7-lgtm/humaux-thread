@@ -42,6 +42,7 @@
 // path: add a facet-coverage input (covered/required counts) to `classify()`'s signature and
 // give `PlannerDecision::Class(QueryClass::State)` its own arm once that lands.
 
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Ledger's six fields (§22.5): produced by `ledger::close(repo, stream_key)` taking three
@@ -168,16 +169,166 @@ impl CannotEstablishReason {
     }
 }
 
-/// Minimal readout `classify()` needs from Authority census (§22.4 trigger 4: "Authority
+/// §22.1 EXACT enumeration readout — the six-field structured block behind "必须结构化枚举".
+///
+/// Fields are private and [`ExactEnumeration::new`] is the sole constructor so the two §22.1
+/// derivation disciplines cannot be hand-picked around:
+///
+/// - `coverage` / `truncated` are **derived** accessors, not stored fields — the same
+///   "derived, not hand-picked" rule [`crate::envelope::RetrievalBlock`] applies to its own
+///   `truncated == (candidate_count > returned)` (§23.3). A stored `coverage` field would be
+///   a second representation of `returned / total` that only stays honest by discipline.
+/// - `new` rejects `returned + excluded_secret > total`: a readout claiming to have returned
+///   (or excluded) more rows than its own denominator holds is exactly the 分母内生 shape
+///   §22.1 forbids ("禁止用召回条数冒充 `total` —— 那是分母内生，永远得 1.0"). The reverse
+///   direction (`returned + excluded_secret < total`) is legal — that is what `truncated`
+///   reports.
+/// - `new` rejects a blank `predicate_id`: §22.0 freezes "`class=exact` 而 `predicate_id=null`
+///   是不变量违反" — an enumeration with no predicate id could never legally reach the wire,
+///   so it cannot be minted at all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExactEnumeration {
+    predicate_id: String,
+    total: u64,
+    returned: u64,
+    excluded_secret: u64,
+}
+
+/// [`ExactEnumeration::new`] rejection — a §50-style construction-time fault (garbage readout
+/// refused at the door), not a §52 runtime `ErrorCode`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactEnumerationError(pub String);
+
+impl fmt::Display for ExactEnumerationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ExactEnumerationError {}
+
+impl ExactEnumeration {
+    /// Sole constructor (see the type doc for the two invariants it enforces).
+    pub fn new(
+        predicate_id: impl Into<String>,
+        total: u64,
+        returned: u64,
+        excluded_secret: u64,
+    ) -> Result<Self, ExactEnumerationError> {
+        let predicate_id = predicate_id.into();
+        if predicate_id.trim().is_empty() {
+            return Err(ExactEnumerationError(
+                "predicate_id must not be blank — §22.0: class=exact with predicate_id=null \
+                 is an invariant violation, so the enumeration cannot even be minted"
+                    .to_string(),
+            ));
+        }
+        if returned + excluded_secret > total {
+            return Err(ExactEnumerationError(format!(
+                "returned ({returned}) + excluded_secret ({excluded_secret}) > total ({total}) \
+                 — §22.1: total comes from count(*) in the same transaction snapshot; a readout \
+                 that claims more rows than its own denominator is the 分母内生 shape §22.1 \
+                 forbids"
+            )));
+        }
+        Ok(Self {
+            predicate_id,
+            total,
+            returned,
+            excluded_secret,
+        })
+    }
+
+    pub fn predicate_id(&self) -> &str {
+        &self.predicate_id
+    }
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+    pub fn returned(&self) -> u64 {
+        self.returned
+    }
+    pub fn excluded_secret(&self) -> u64 {
+        self.excluded_secret
+    }
+
+    /// §22.1 `coverage` = `returned / total`, derived on read. `excluded_secret > 0` deducts
+    /// coverage by construction (the excluded rows stay in `total`, are absent from
+    /// `returned`) — "不许静默少给". Empty universe (`total == 0`) is vacuously complete.
+    pub fn coverage(&self) -> f64 {
+        if self.total == 0 {
+            1.0
+        } else {
+            // Precision note: exact only up to 2^53 rows, far beyond any real enumeration.
+            #[allow(clippy::cast_precision_loss)]
+            {
+                self.returned as f64 / self.total as f64
+            }
+        }
+    }
+
+    /// §22.1 `truncated`: rows that are neither returned nor accounted for as
+    /// `excluded_secret` — i.e. a caller-side cap cut the list. Secret exclusion alone does
+    /// NOT set this: those rows are named by `excluded_secret`, not silently dropped.
+    pub fn truncated(&self) -> bool {
+        self.returned + self.excluded_secret < self.total
+    }
+}
+
+/// Readout `classify()` needs from Authority census (§22.4 trigger 4: "Authority
 /// census 本身失败或当前授权策略明确排除了一部分权威行且无法定义可枚举的 authorized
-/// universe"). Not the real census pipeline — that lives with `domain::authority`/`adapters`
-/// once wired; this is only the one bit the frozen 4-param signature consumes. `pub`:
-/// `adapters` is this type's eventual constructor, same crate-boundary reasoning as
-/// `ledger::LedgerReads` below, and the G80-6 witness (adjudication 3) must be able to build
-/// one from `crates/testkit`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// universe"), now also the carrier of the §22.1 enumeration block when the census actually
+/// enumerated (T8 census wiring — the previous `pub ok: bool` placeholder let any caller
+/// claim a passing census without handing over what it counted).
+///
+/// Fields are private; the three constructors below are the closed set of shapes:
+/// `enumerated` (EXACT path — ok, with the §22.1 block), `ok_without_enumeration` (semantic
+/// path — census passed, nothing to enumerate), `failed`. The fourth combination (failed but
+/// carrying an enumeration) is unconstructible.
+///
+/// `pub`: `adapters` is this type's constructor (`exact_census`), same crate-boundary
+/// reasoning as `ledger::LedgerReads` below, and the G80-6 witness (adjudication 3) must be
+/// able to build one from `crates/testkit`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CensusResult {
-    pub ok: bool,
+    ok: bool,
+    enumeration: Option<ExactEnumeration>,
+}
+
+impl CensusResult {
+    /// Census ran and enumerated: the EXACT path (§22.1). The only way to attach an
+    /// enumeration — and it is inseparable from `ok`.
+    pub fn enumerated(enumeration: ExactEnumeration) -> Self {
+        Self {
+            ok: true,
+            enumeration: Some(enumeration),
+        }
+    }
+
+    /// Census passed with nothing to enumerate: the semantic path, where no §22.1 universe
+    /// was requested (a `SemanticBounded` answer never carries an enumeration block).
+    pub fn ok_without_enumeration() -> Self {
+        Self {
+            ok: true,
+            enumeration: None,
+        }
+    }
+
+    /// §22.4 trigger 4: census failed ⇒ `classify()` yields `CannotEstablish/CensusFailed`.
+    pub fn failed() -> Self {
+        Self {
+            ok: false,
+            enumeration: None,
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        self.ok
+    }
+
+    pub fn enumeration(&self) -> Option<&ExactEnumeration> {
+        self.enumeration.as_ref()
+    }
 }
 
 /// Freshness class, a closed set of 4 (§59).
@@ -516,7 +667,7 @@ pub(crate) fn classify(
         CompletenessClass::CannotEstablish {
             reason: CannotEstablishReason::LedgerNotClosed,
         }
-    } else if !census_result.ok {
+    } else if !census_result.is_ok() {
         CompletenessClass::CannotEstablish {
             reason: CannotEstablishReason::CensusFailed,
         }
@@ -684,7 +835,7 @@ mod tests {
                 predicate_id: "rejected_decisions_v1".to_string(),
             },
             LaneStatus::Ok,
-            &CensusResult { ok: true },
+            &CensusResult::ok_without_enumeration(),
             &broken_ledger(),
         );
         assert_eq!(
@@ -704,7 +855,7 @@ mod tests {
         let class = classify(
             &PlannerDecision::Class(QueryClass::Semantic),
             LaneStatus::Ok,
-            &CensusResult { ok: false },
+            &CensusResult::failed(),
             &closed_ledger(),
         );
         assert_eq!(
@@ -720,7 +871,7 @@ mod tests {
         let class = classify(
             &PlannerDecision::Class(QueryClass::Semantic),
             LaneStatus::Failed,
-            &CensusResult { ok: true },
+            &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
         );
         assert_eq!(
@@ -738,7 +889,7 @@ mod tests {
         let class = classify(
             &PlannerDecision::CannotEstablish,
             LaneStatus::Ok,
-            &CensusResult { ok: true },
+            &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
         );
         assert_eq!(
@@ -756,7 +907,7 @@ mod tests {
                 predicate_id: "rejected_decisions_v1".to_string(),
             },
             LaneStatus::Ok,
-            &CensusResult { ok: true },
+            &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
         );
         assert_eq!(class, CompletenessClass::Exact);
@@ -769,7 +920,7 @@ mod tests {
                 "0000-0000-0000-0000-000000000000".to_string(),
             )),
             LaneStatus::Ok,
-            &CensusResult { ok: true },
+            &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
         );
         assert_eq!(class, CompletenessClass::Exact);
@@ -782,7 +933,7 @@ mod tests {
         let class = classify(
             &PlannerDecision::Class(QueryClass::State),
             LaneStatus::Ok,
-            &CensusResult { ok: true },
+            &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
         );
         assert_eq!(class, CompletenessClass::SemanticBounded);
@@ -798,7 +949,7 @@ mod tests {
                 predicate_id: "rejected_decisions_v1".to_string(),
             },
             LaneStatus::Ok,
-            &CensusResult { ok: true },
+            &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
         );
         assert_eq!((class_label, reason_label), ("exact", "none"));
@@ -806,5 +957,74 @@ mod tests {
             retrieval_completeness_total_count("exact", "none"),
             before + 1
         );
+    }
+
+    /// §22.1 derivation: `coverage` and `truncated` are read off the constructor's inputs —
+    /// secret exclusion deducts coverage *without* setting `truncated` (those rows are named
+    /// by `excluded_secret`, not silently dropped), while a caller-side cap does set it.
+    #[test]
+    fn exact_enumeration_derives_coverage_and_truncated() {
+        // Full enumeration — §22.1's own example numbers.
+        let full = ExactEnumeration::new("rejected_decisions_v1", 17, 17, 0).unwrap();
+        assert!((full.coverage() - 1.0).abs() < f64::EPSILON);
+        assert!(!full.truncated());
+
+        // Secret exclusion: 15 returned + 2 excluded == 17 accounted ⇒ coverage deducted,
+        // truncated stays false.
+        let secret = ExactEnumeration::new("rejected_decisions_v1", 17, 15, 2).unwrap();
+        assert!((secret.coverage() - 15.0 / 17.0).abs() < f64::EPSILON);
+        assert!(!secret.truncated());
+        assert_eq!(secret.excluded_secret(), 2);
+
+        // Caller cap: 10 returned + 0 excluded < 17 ⇒ truncated.
+        let capped = ExactEnumeration::new("rejected_decisions_v1", 17, 10, 0).unwrap();
+        assert!(capped.truncated());
+    }
+
+    /// §22.1 fault, executable: "禁止用召回条数冒充 `total` —— 那是分母内生" — a readout
+    /// claiming more returned+excluded rows than its own denominator cannot be minted.
+    #[test]
+    fn fault_recall_count_cannot_overrun_the_denominator() {
+        let err = ExactEnumeration::new("rejected_decisions_v1", 10, 11, 0).unwrap_err();
+        assert!(
+            err.0.contains("分母内生"),
+            "error must name the forbidden shape: {err}"
+        );
+        assert!(ExactEnumeration::new("rejected_decisions_v1", 10, 9, 2).is_err());
+    }
+
+    /// §22.0 fault, executable at the *minting* layer: an enumeration with a blank
+    /// `predicate_id` could only ever surface as `class=exact` + `predicate_id=null` — the
+    /// frozen invariant violation — so it is unconstructible.
+    #[test]
+    fn fault_blank_predicate_id_is_unmintable() {
+        assert!(ExactEnumeration::new("", 3, 3, 0).is_err());
+        assert!(ExactEnumeration::new("   ", 3, 3, 0).is_err());
+    }
+
+    /// §22.1 edge: an empty universe (`total == 0`) is vacuously complete, not 0/0 = NaN.
+    #[test]
+    fn empty_universe_is_vacuously_complete() {
+        let e = ExactEnumeration::new("rejected_decisions_v1", 0, 0, 0).unwrap();
+        assert!((e.coverage() - 1.0).abs() < f64::EPSILON);
+        assert!(!e.truncated());
+    }
+
+    /// The placeholder `pub ok: bool` let any caller claim a passing census bare-handed; the
+    /// closed constructor set pins ok-ness to what was actually handed over.
+    #[test]
+    fn census_result_constructors_pin_ok_to_content() {
+        let e = ExactEnumeration::new("rejected_decisions_v1", 2, 2, 0).unwrap();
+        let enumerated = CensusResult::enumerated(e);
+        assert!(enumerated.is_ok());
+        assert_eq!(enumerated.enumeration().unwrap().total(), 2);
+        assert!(CensusResult::ok_without_enumeration().is_ok());
+        assert!(
+            CensusResult::ok_without_enumeration()
+                .enumeration()
+                .is_none()
+        );
+        assert!(!CensusResult::failed().is_ok());
+        assert!(CensusResult::failed().enumeration().is_none());
     }
 }
