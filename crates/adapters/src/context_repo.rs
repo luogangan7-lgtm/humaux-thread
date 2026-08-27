@@ -15,11 +15,13 @@
 
 use humaux_domain::authority::{AuthorityClass, MemoryId};
 use humaux_domain::context::{
-    BindingGrant, MandatoryLane, MandatoryRow, PinnedLane, ScopeKind, SelectorId, SelectorOutcome,
-    SelectorSpec, spec,
+    Admitted, BindingGrant, FrozenReads, MandatoryLane, MandatoryRow, PinnedLane, ScopeKind,
+    SelectorId, SelectorOutcome, SelectorSpec, spec,
 };
 use humaux_domain::error::ErrorCode;
+use humaux_domain::grounding::{GroundingMode, RowGrounding, SnapshotEdge, classify_in_snapshot};
 use humaux_domain::ids::Scope;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::types::Uuid;
 
@@ -174,9 +176,17 @@ async fn run_selector(
     .try_get(0)
     .map_err(|_| ErrorCode::Internal)?;
 
-    // ② 取行。
+    // ② 取行——每行带两个快照内 grounding 事实（有没有 LIVE edge / 有没有未记版本的
+    //    LIVE edge），喂 `classify_in_snapshot`。resolver 永不进本事务。
     let rows = sqlx::query(&format!(
-        "SELECT m.memory_id, m.authority_class, {EST_TOKENS_EXPR} AS est_tokens \
+        "SELECT m.memory_id, m.authority_class, {EST_TOKENS_EXPR} AS est_tokens, \
+                EXISTS(SELECT 1 FROM private.memory_evidence me \
+                       WHERE me.memory_id = m.memory_id AND me.grounding_mode = 'LIVE') \
+                  AS has_live, \
+                EXISTS(SELECT 1 FROM private.memory_evidence me \
+                       WHERE me.memory_id = m.memory_id AND me.grounding_mode = 'LIVE' \
+                         AND me.recorded_version IS NULL) \
+                  AS has_live_unversioned \
          FROM private.memory_records m WHERE {where_clause} ORDER BY m.memory_id"
     ))
     .bind(tenant_id)
@@ -187,31 +197,43 @@ async fn run_selector(
     .map_err(|_| ErrorCode::Internal)?;
 
     let mut out = Vec::with_capacity(rows.len());
+    let mut needs = Vec::new();
     for r in rows {
         let memory_id: Uuid = r.try_get("memory_id").map_err(|_| ErrorCode::Internal)?;
         let authority: String = r
             .try_get("authority_class")
             .map_err(|_| ErrorCode::Internal)?;
         let est_tokens: i32 = r.try_get("est_tokens").map_err(|_| ErrorCode::Internal)?;
+        let has_live: bool = r.try_get("has_live").map_err(|_| ErrorCode::Internal)?;
+        let has_live_unversioned: bool = r
+            .try_get("has_live_unversioned")
+            .map_err(|_| ErrorCode::Internal)?;
         let authority = parse_authority(&authority)?;
-        // `from_selector` 会按 spec 的 min_authority 复核——SQL 侧的 authority 过滤与
-        // domain 侧的下限是两道独立的门，不是一道门写两遍：SQL 那条可能被将来的谓词改动
-        // 放宽，domain 这条不会。
-        out.push(
-            MandatoryRow::from_selector(
-                s,
-                MemoryId(memory_id),
-                authority,
-                u32::try_from(est_tokens).unwrap_or(u32::MAX),
-            )
-            .map_err(|_| ErrorCode::Internal)?,
-        );
+
+        // 两个 bool → 最小 SnapshotEdge 集：分类规则住在 domain，这里只是投影出它要的事实。
+        let grounding = grounding_from_facts(has_live, has_live_unversioned);
+
+        // `from_selector` 按 spec 复核 authority 下限并跑 DOD-093 铸造门——SQL 侧过滤与
+        // domain 侧下限是两道独立的门；grounding 分流在 domain，不在 SQL。
+        match MandatoryRow::from_selector(
+            s,
+            MemoryId(memory_id),
+            authority,
+            u32::try_from(est_tokens).unwrap_or(u32::MAX),
+            grounding,
+        )
+        .map_err(|_| ErrorCode::Internal)?
+        {
+            Admitted::Row(row) => out.push(row),
+            Admitted::NeedsVerification(nv) => needs.push(nv),
+        }
     }
 
     Ok(SelectorOutcome::Ran {
         id: s.id,
         expected: u64::try_from(expected).unwrap_or(0),
         rows: out,
+        needs_verification: needs,
     })
 }
 
@@ -229,49 +251,90 @@ fn parse_authority(wire: &str) -> Result<AuthorityClass, ErrorCode> {
     }
 }
 
-/// §25.4 步骤 2 + 5：取两条 lane。
+/// 两个快照内事实 → [`RowGrounding`]。分类规则在 [`classify_in_snapshot`]（domain），
+/// 这里只投影出它要的最小 [`SnapshotEdge`] 集——不是第二份判据。
+fn grounding_from_facts(has_live: bool, has_live_unversioned: bool) -> RowGrounding {
+    let mut edges = Vec::with_capacity(2);
+    if has_live_unversioned {
+        edges.push(SnapshotEdge {
+            mode: GroundingMode::Live,
+            recorded_version_present: false,
+        });
+    } else if has_live {
+        edges.push(SnapshotEdge {
+            mode: GroundingMode::Live,
+            recorded_version_present: true,
+        });
+    }
+    classify_in_snapshot(&edges)
+}
+
+/// §25.4 装配的**全部冻结读数**，单事务取齐——G80-31「同一 `context_snapshot_seq` 两次
+/// 装配逐字节相同」的取数半边。
 ///
-/// 五个 selector 全部参与——不可用的那两个（`task_explicit_context_v1` /
-/// `required_current_state_facets_v1`，缺 `task_id` / `facet` 列）由 [`probe_selectors`]
-/// 探测出来后以 [`SelectorOutcome::Unavailable`] 交回，于是
-/// [`MandatoryLane::from_selectors`] 会**拒绝构造整条 lane**。
+/// 一个 `REPEATABLE READ` 事务（`consolidate_repo` 的 §11.7 同款配方，只读路径不带
+/// `READ WRITE`），依次：隔离级 → 租户上下文 → probe（`information_schema` 进同快照；
+/// DDL 探测滞后于快照是**接受语义**——本次装配看到的世界就是这个快照的世界）→ 各
+/// selector 的 COUNT + 取行 → pinned 的独立 COUNT + 取行 + excluded 具名 → 快照身份。
 ///
-/// 这是刻意的：「有两个 selector 坏了但先凑合上」不是一个可表达的状态，否则 Context 会在
-/// selector 缺席时安静地少带东西，而调用方看到的仍是一条"正常"的 lane。
+/// 此前这里是三个各自开事务的 pub 函数（probe / mandatory / pinned）——READ COMMITTED
+/// 下每条语句各看各的快照，probe 与取数之间还有 TOCTOU；「两次装配逐字节相同」在那个
+/// 形状下无从谈起。三函数已并入本函数（probe 保留 pub 供独立探测）。
 ///
 /// # Errors
-/// 库不可达、authority 线值不在闭集内、或行不过 `min_authority` ⇒ [`ErrorCode::Internal`]。
-/// 有 selector 不可用不是错误，它体现在返回的 `SelectorOutcome` 里。
-pub async fn fetch_mandatory_outcomes(
-    pool: &RuntimeDbPool,
-    scope: &Scope,
-) -> Result<[SelectorOutcome; 5], ErrorCode> {
-    let availability = probe_selectors(pool).await?;
+/// 库不可达、authority 线值不在闭集内 ⇒ [`ErrorCode::Internal`]。
+pub async fn fetch_frozen(pool: &RuntimeDbPool, scope: &Scope) -> Result<FrozenReads, ErrorCode> {
     let workspaces = workspace_ids(scope);
     let user_id = scope.user_id.map(|u| u.0);
     let tenant_id = scope.tenant_id.0;
 
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
+    // 必须是本事务第一条语句：隔离级在第一个取快照的语句之后就改不了了。
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *txn)
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
     set_tenant_local(&mut txn, tenant_id)
         .await
         .map_err(|_| ErrorCode::Internal)?;
 
+    // probe（同快照）。
+    let mut availability: Vec<(SelectorId, Option<String>)> = Vec::with_capacity(5);
+    for sp in &humaux_domain::context::REGISTRY {
+        let mut missing: Option<String> = None;
+        for (schema, table, column) in sp.required_columns {
+            let exists: bool = sqlx::query(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)",
+            )
+            .bind(schema)
+            .bind(table)
+            .bind(column)
+            .fetch_one(&mut *txn)
+            .await
+            .map_err(|_| ErrorCode::Internal)?
+            .try_get(0)
+            .map_err(|_| ErrorCode::Internal)?;
+            if !exists {
+                missing = Some(format!("{schema}.{table}.{column}"));
+                break;
+            }
+        }
+        availability.push((sp.id, missing));
+    }
+
+    // mandatory 五个 selector。
     let mut out: Vec<SelectorOutcome> = Vec::with_capacity(5);
-    for a in availability {
-        if let Some(missing_object) = a.missing_object {
-            out.push(SelectorOutcome::Unavailable {
-                id: a.id,
-                missing_object,
-            });
+    for (id, missing) in availability {
+        if let Some(missing_object) = missing {
+            out.push(SelectorOutcome::Unavailable { id, missing_object });
             continue;
         }
-        let s = spec(a.id);
-        let where_clause = match a.id {
+        let sp = spec(id);
+        let where_clause = match id {
             SelectorId::ProjectActiveConstraintsV1 => PROJECT_CONSTRAINTS_WHERE,
             SelectorId::UserConfirmedCorrectionsV1 => USER_CORRECTIONS_WHERE,
             SelectorId::ExplicitMandatoryBindingsV1 => EXPLICIT_BINDINGS_WHERE,
-            // probe 说它可用（所需列都在），但本模块还没写它的谓词——这不是"可用"，
-            // 是本模块欠它一条 WHERE。当成不可用交回并点名，不要拿一条空谓词冒充。
             other => {
                 out.push(SelectorOutcome::Unavailable {
                     id: other,
@@ -282,29 +345,69 @@ pub async fn fetch_mandatory_outcomes(
                 continue;
             }
         };
-        out.push(run_selector(&mut txn, s, where_clause, tenant_id, &workspaces, user_id).await?);
+        out.push(run_selector(&mut txn, sp, where_clause, tenant_id, &workspaces, user_id).await?);
     }
+    let outcomes: [SelectorOutcome; 5] = out.try_into().map_err(|_| ErrorCode::Internal)?;
+    let mandatory = MandatoryLane::from_selectors(outcomes);
+
+    let pinned = fetch_pinned_in_txn(&mut txn, tenant_id).await?;
+
+    // 快照身份：同一事务内取。seq（xmin）是 fingerprint 轴——必要非充分；
+    // token（完整 snapshot）才是「同快照 ⇒ 同字节」的充分条件（见 FrozenReads doc）。
+    let row = sqlx::query(
+        "SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint AS seq, \
+                pg_current_snapshot()::text AS token",
+    )
+    .fetch_one(&mut *txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?;
+    let seq: i64 = row.try_get("seq").map_err(|_| ErrorCode::Internal)?;
+    let token: String = row.try_get("token").map_err(|_| ErrorCode::Internal)?;
+    let digest = Sha256::digest(token.as_bytes());
+    let snapshot_token_sha256 = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
 
     txn.commit().await.map_err(|_| ErrorCode::Internal)?;
-    out.try_into().map_err(|_| ErrorCode::Internal)
+
+    Ok(FrozenReads {
+        mandatory,
+        pinned,
+        context_snapshot_seq: seq,
+        snapshot_token_sha256,
+    })
 }
 
-/// §25.4 步骤 5：Pinned lane。
-///
-/// 与 Mandatory 同源但走 `mode = 'PINNED'`，且**不复核 authority 下限**——Pinned 是用户
-/// 显式钉的，钉什么是什么；MANDATORY 才有「只放得下 ProjectConstraint 及以上」的读侧门。
-///
-/// # Errors
-/// 同 [`fetch_mandatory_outcomes`]。
-pub async fn fetch_pinned(pool: &RuntimeDbPool, scope: &Scope) -> Result<PinnedLane, ErrorCode> {
-    let tenant_id = scope.tenant_id.0;
-    let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
-    set_tenant_local(&mut txn, tenant_id)
-        .await
-        .map_err(|_| ErrorCode::Internal)?;
+/// [`fetch_frozen`] 的 pinned 半边：独立 COUNT（外部 oracle——「钉 3 带 2」必须可观测）
+/// + 取行 + excluded 具名。抽成函数只为行数闸，语义与内联时逐字相同。
+async fn fetch_pinned_in_txn(txn: &mut Txn<'_>, tenant_id: Uuid) -> Result<PinnedLane, ErrorCode> {
+    // pinned：独立 COUNT（外部 oracle——「钉 3 带 2」必须可观测）+ 取行 + excluded 具名。
+    let pinned_expected: i64 = sqlx::query(
+        "SELECT count(*) FROM private.memory_records m \
+         WHERE m.tenant_id = $1 AND m.status = 'active' AND m.superseded_by IS NULL \
+           AND EXISTS ( \
+             SELECT 1 FROM private.context_bindings cb \
+             WHERE cb.memory_id = m.memory_id AND cb.tenant_id = m.tenant_id \
+               AND cb.revoked_at IS NULL AND cb.mode = 'PINNED' \
+           )",
+    )
+    .bind(tenant_id)
+    .fetch_one(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?
+    .try_get(0)
+    .map_err(|_| ErrorCode::Internal)?;
 
     let rows = sqlx::query(&format!(
-        "SELECT m.memory_id, m.authority_class, {EST_TOKENS_EXPR} AS est_tokens \
+        "SELECT m.memory_id, m.authority_class, {EST_TOKENS_EXPR} AS est_tokens, \
+                EXISTS(SELECT 1 FROM private.memory_evidence me \
+                       WHERE me.memory_id = m.memory_id AND me.grounding_mode = 'LIVE') \
+                  AS has_live, \
+                EXISTS(SELECT 1 FROM private.memory_evidence me \
+                       WHERE me.memory_id = m.memory_id AND me.grounding_mode = 'LIVE' \
+                         AND me.recorded_version IS NULL) \
+                  AS has_live_unversioned \
          FROM private.memory_records m \
          WHERE m.tenant_id = $1 AND m.status = 'active' AND m.superseded_by IS NULL \
            AND EXISTS ( \
@@ -315,56 +418,51 @@ pub async fn fetch_pinned(pool: &RuntimeDbPool, scope: &Scope) -> Result<PinnedL
          ORDER BY m.memory_id"
     ))
     .bind(tenant_id)
-    .fetch_all(&mut *txn)
+    .fetch_all(&mut **txn)
     .await
     .map_err(|_| ErrorCode::Internal)?;
-    txn.commit().await.map_err(|_| ErrorCode::Internal)?;
 
-    // Pinned 借用 `ExplicitMandatoryBindingsV1` 的 spec 只为拿它的 min_authority 复核位；
-    // 若将来 Pinned 要独立声明（不同的 freshness/origin），加一条 REGISTRY 项，不要在这里
-    // 造第二套规则。
-    let s = spec(SelectorId::ExplicitMandatoryBindingsV1);
-    let mut out = Vec::with_capacity(rows.len());
+    let sp = spec(SelectorId::ExplicitMandatoryBindingsV1);
+    let mut pinned_rows = Vec::with_capacity(rows.len());
+    let mut excluded = Vec::new();
     for r in rows {
         let memory_id: Uuid = r.try_get("memory_id").map_err(|_| ErrorCode::Internal)?;
         let authority: String = r
             .try_get("authority_class")
             .map_err(|_| ErrorCode::Internal)?;
         let est_tokens: i32 = r.try_get("est_tokens").map_err(|_| ErrorCode::Internal)?;
+        let has_live: bool = r.try_get("has_live").map_err(|_| ErrorCode::Internal)?;
+        let has_live_unversioned: bool = r
+            .try_get("has_live_unversioned")
+            .map_err(|_| ErrorCode::Internal)?;
         let authority = parse_authority(&authority)?;
-        if (authority as u8) < (s.min_authority as u8) {
-            // Pinned 不设下限，低 authority 的照收——但 `from_selector` 会拒。
-            // 用一个不设下限的 spec 位来承载：这里退化成直接跳过，并在 lane 的
-            // returned 上体现，不静默当成"钉了但没带"。
+        if (authority as u8) < (sp.min_authority as u8) {
+            // 低 authority 的 pinned 行不进 lane，但**具名**——「钉 3 带 2」必须可观测。
+            excluded.push(MemoryId(memory_id));
             continue;
         }
-        out.push(
-            MandatoryRow::from_selector(
-                s,
-                MemoryId(memory_id),
-                authority,
-                u32::try_from(est_tokens).unwrap_or(u32::MAX),
-            )
-            .map_err(|_| ErrorCode::Internal)?,
-        );
+        match MandatoryRow::from_selector(
+            sp,
+            MemoryId(memory_id),
+            authority,
+            u32::try_from(est_tokens).unwrap_or(u32::MAX),
+            grounding_from_facts(has_live, has_live_unversioned),
+        )
+        .map_err(|_| ErrorCode::Internal)?
+        {
+            Admitted::Row(row) => pinned_rows.push(row),
+            // pinned 行同样过 DOD-093 门：RECHECK_REQUIRED 的 pinned 不进 lane。
+            // 它的披露并入 mandatory 侧的 needs_verification 是错的（不同 lane）——
+            // 以 excluded 具名。ponytail: pinned 专属 needs_verification 列表等
+            // §25.5 顶层块形状定了再拆，excluded 先保证可观测。
+            Admitted::NeedsVerification(nv) => excluded.push(nv.memory_id),
+        }
     }
-    Ok(PinnedLane::new(out))
-}
-
-/// 组装两条 lane。
-///
-/// # Errors
-/// 见 [`fetch_mandatory_outcomes`]；lane 构不出来时把 domain 的 `LaneUnavailable`
-/// 折成 [`ErrorCode::Internal`]——调用方要拿逐条缺失对象名的话走
-/// [`fetch_mandatory_outcomes`] 自己组装。
-pub async fn fetch_lanes(
-    pool: &RuntimeDbPool,
-    scope: &Scope,
-) -> Result<(MandatoryLane, PinnedLane), ErrorCode> {
-    let outcomes = fetch_mandatory_outcomes(pool, scope).await?;
-    let mandatory = MandatoryLane::from_selectors(outcomes).map_err(|_| ErrorCode::Internal)?;
-    let pinned = fetch_pinned(pool, scope).await?;
-    Ok((mandatory, pinned))
+    Ok(PinnedLane::new(
+        u64::try_from(pinned_expected).unwrap_or(0),
+        pinned_rows,
+        excluded,
+    ))
 }
 
 /// 全 workspace **唯一**的 `INSERT INTO private.context_bindings`。

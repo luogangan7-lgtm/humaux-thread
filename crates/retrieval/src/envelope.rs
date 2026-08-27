@@ -796,8 +796,24 @@ mod tests {
         let sp = spec(SelectorId::ProjectActiveConstraintsV1);
         let rows: Vec<MandatoryRow> = (0..2)
             .map(|_| {
-                MandatoryRow::from_selector(sp, MemoryId::new(), sp.min_authority, 80)
-                    .expect("min_authority 达标")
+                match MandatoryRow::from_selector(
+                    sp,
+                    MemoryId::new(),
+                    sp.min_authority,
+                    80,
+                    humaux_domain::grounding::RowGrounding::Judged(
+                        humaux_domain::grounding::derive_grounding_state(
+                            humaux_domain::grounding::GroundingInputs::Edges(&[]),
+                        ),
+                    ),
+                )
+                .expect("min_authority 达标")
+                {
+                    humaux_domain::context::Admitted::Row(r) => r,
+                    humaux_domain::context::Admitted::NeedsVerification(nv) => {
+                        panic!("CURRENT 行不该被分流: {nv:?}")
+                    }
+                }
             })
             .collect();
         let lane = humaux_domain::context::MandatoryLane::from_selectors([
@@ -805,30 +821,34 @@ mod tests {
                 id: SelectorId::TaskExplicitContextV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
                 expected: 2,
                 rows,
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
-        ])
-        .expect("lane");
-        let pinned = PinnedLane::new(vec![]);
+        ]);
+        let pinned = PinnedLane::new(0, vec![], vec![]);
         let overflow = ContextBudget::new(500, 100)
             .expect("budget")
             .reserve(&lane, &pinned)
@@ -881,30 +901,34 @@ mod tests {
                 id: SelectorId::TaskExplicitContextV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
-        ])
-        .expect("lane");
-        let pinned = PinnedLane::new(vec![]);
+        ]);
+        let pinned = PinnedLane::new(0, vec![], vec![]);
         let budget = ContextBudget::new(100, 50)
             .expect("budget")
             .reserve(&lane, &pinned)

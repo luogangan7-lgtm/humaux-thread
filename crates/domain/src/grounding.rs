@@ -240,6 +240,66 @@ pub fn derive_grounding_state(inputs: GroundingInputs<'_>) -> GroundingState {
     GroundingState(worst)
 }
 
+/// 快照内可见的单条 edge 事实——[`classify_in_snapshot`] 的输入。
+///
+/// 与 [`GroundingEdge`] 的区别：那边有 resolver 的**本轮解析结果**（`EdgeOutcome`），
+/// 这边只有装配读事务里查得到的两个事实（mode + 当初记没记版本）。resolver 永远不进
+/// 装配事务——外呼的时延与失败模式会毁掉「同一快照两次装配逐字节相同」（§57.1 Phase 8）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotEdge {
+    /// 时间语义档。
+    pub mode: GroundingMode,
+    /// 写入这条 edge 时是否记录了版本。
+    pub recorded_version_present: bool,
+}
+
+/// 快照内派生的行级 grounding 结论。
+///
+/// **`NotJudged` 是第三臂，不是 `Judged(Current)` 的别名**：LIVE 且已记版本的 edge 在
+/// 快照内无从比对（比对要 resolver），「没判」与「判过且通过」必须可区分——
+/// 同 `EvidenceBlock.expected: Option` 立的「未做的判断不是通过的判断」纪律。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowGrounding {
+    /// 快照内就能裁定的情形。
+    Judged(GroundingState),
+    /// 快照内不可裁（有 LIVE 且全部已记版本——要 resolver 才知道版本还同不同）。
+    NotJudged,
+}
+
+/// §8.8 的**快照内保守投影**——[`derive_grounding_state`] 的 resolver-free 姊妹入口。
+///
+/// 规则与 migration `0100` 写死的语义逐字对应：
+/// - 无 LIVE edge ⇒ `Judged(CURRENT)`（SNAPSHOT/IMMUTABLE-only 天然 CURRENT，§8.8 正例）；
+/// - 任一 LIVE 且 `recorded_version` 缺席 ⇒ `Judged(RECHECK_REQUIRED)`（当初没记版本就
+///   无法证明「还是同一版」，0100 的默认回填正是让历史行落进这一档）；
+/// - LIVE 全部已记版本 ⇒ [`RowGrounding::NotJudged`]。
+///
+/// 两个入口的重叠情形（无 LIVE / LIVE+无版本）由本模块测试钉死一致——分类规则只有一份，
+/// 这里不是第二份判据，是同一份判据在「拿不到 resolver」时能覆盖的那部分。
+///
+// ponytail: 两入口并存是事实（uncertain：上游是否要求收敛为一）；收敛的前提是 resolver
+// 进得了某种预算好的离线通道，那是 §11.10 census 的形态，不是装配的。
+#[must_use]
+pub fn classify_in_snapshot(edges: &[SnapshotEdge]) -> RowGrounding {
+    let mut live_all_versioned = true;
+    let mut has_live = false;
+    for e in edges {
+        if !e.mode.participates_in_revalidation() {
+            continue;
+        }
+        has_live = true;
+        if !e.recorded_version_present {
+            return RowGrounding::Judged(GroundingState(GroundingStateKind::RecheckRequired));
+        }
+        live_all_versioned &= e.recorded_version_present;
+    }
+    if !has_live {
+        return RowGrounding::Judged(GroundingState(GroundingStateKind::Current));
+    }
+    debug_assert!(live_all_versioned);
+    RowGrounding::NotJudged
+}
+
 /// §11.10 revalidation 的语义结论。检测阶段（版本比对）不产出这个——它只能由重验产出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RevalidationOutcome {
@@ -409,22 +469,79 @@ mod tests {
         assert_eq!(kind_of(&after), GroundingStateKind::Current);
     }
 
-    /// 夹具 G：`RECHECK_REQUIRED` 的 ProjectConstraint 不得进入 Mandatory behavior context。
+    /// 夹具 G（§11.10#G11-2）：`RECHECK_REQUIRED` 的 ProjectConstraint 不得进入
+    /// Mandatory behavior context——**真断言**，不再是 NA。
     ///
-    /// 被测对象 §25 Mandatory Context Lane 在本仓尚未交付（`domain::context` 仍是占位模块，
-    /// DOD-093 标 `phase=8`）。按 §57.1 第2条打印缺失对象名后返回，**不假装通过**。
+    /// 曾经这里打印「missing object: §25 Mandatory Context Lane（domain::context 仍是
+    /// 占位模块）」——那句话在 lane 落地后**继续打印了一段时间**，成了 ADR-0006 说的
+    /// 「情况变化后继续沉默的 NA」。教训同款：NA prose 是写下当天的判断，被测对象一落地
+    /// 它就开始说谎。现在的断言链：快照内派生 RECHECK_REQUIRED ⇒
+    /// `revokes_current_truth_assumption` ⇒ `context::MandatoryRow::from_selector` 的
+    /// 铸造门把它分流进 `NeedsVerification` 臂——row 铸不出来（DOD-093 的结构保证，
+    /// 完整判据在 `domain::context` 的测试里，这里钉派生侧那半）。
     #[test]
     fn fixture_g_recheck_required_must_not_enter_mandatory_context() {
         let constraint = [live(Some("v1"), EdgeOutcome::Resolved(token("v2")))];
         let state = derive_grounding_state(GroundingInputs::Edges(&constraint));
-        // 本波能证明的那一半：判据本身已经给出「撤销当前真值假设」的答案，Phase 8 的
-        // Mandatory lane 只需要读它。
         assert!(state.revokes_current_truth_assumption());
-        eprintln!(
-            "NOT_APPLICABLE fixture_g_recheck_required_must_not_enter_mandatory_context: \
-             missing object: §25 Mandatory Context Lane（`domain::context` 仍是占位模块；\
-             lane 本身是 DOD-020 phase=7，**已欠账**）——本条要断言的 fail-loud + \
-             needs_verification[] 属 DOD-093 phase=8，待 lane 建成后补全"
+
+        // 快照内入口对同一情形（LIVE + 无版本）给出同样的撤销结论。
+        let snap = classify_in_snapshot(&[SnapshotEdge {
+            mode: GroundingMode::Live,
+            recorded_version_present: false,
+        }]);
+        match snap {
+            RowGrounding::Judged(s) => assert!(
+                s.revokes_current_truth_assumption(),
+                "快照内派生的 RECHECK_REQUIRED 同样撤销当前真值假设"
+            ),
+            RowGrounding::NotJudged => panic!("LIVE + 无版本在快照内是可裁的"),
+        }
+    }
+
+    /// 两个派生入口在重叠情形上必须一致——分类规则只有一份。
+    /// 注错：把 `classify_in_snapshot` 的无-LIVE 分支改判 NotJudged ⇒ 本条红。
+    #[test]
+    fn snapshot_and_full_derivation_agree_on_their_overlap() {
+        // 情形①：无 LIVE edge ⇒ 两边都 CURRENT。
+        let full = derive_grounding_state(GroundingInputs::Edges(&[GroundingEdge {
+            mode: GroundingMode::Snapshot,
+            recorded_version: Some(token("old")),
+            outcome: EdgeOutcome::Resolved(token("new")),
+        }]));
+        assert_eq!(full.kind(), GroundingStateKind::Current);
+        assert_eq!(
+            classify_in_snapshot(&[SnapshotEdge {
+                mode: GroundingMode::Snapshot,
+                recorded_version_present: true,
+            }]),
+            RowGrounding::Judged(full),
+            "无 LIVE 的情形两入口必须同判 CURRENT"
+        );
+
+        // 情形②：LIVE + 无版本 ⇒ 两边都 RECHECK_REQUIRED。
+        let full2 = derive_grounding_state(GroundingInputs::Edges(&[live(
+            None,
+            EdgeOutcome::Resolved(token("whatever")),
+        )]));
+        assert_eq!(full2.kind(), GroundingStateKind::RecheckRequired);
+        assert_eq!(
+            classify_in_snapshot(&[SnapshotEdge {
+                mode: GroundingMode::Live,
+                recorded_version_present: false,
+            }]),
+            RowGrounding::Judged(full2),
+            "LIVE+无版本的情形两入口必须同判 RECHECK_REQUIRED"
+        );
+
+        // 情形③：LIVE + 已记版本 ⇒ 快照内不可裁（第三臂，不是 CURRENT 的别名）。
+        assert_eq!(
+            classify_in_snapshot(&[SnapshotEdge {
+                mode: GroundingMode::Live,
+                recorded_version_present: true,
+            }]),
+            RowGrounding::NotJudged,
+            "快照里比不了版本——「没判」不许伪装成「判过且通过」"
         );
     }
 

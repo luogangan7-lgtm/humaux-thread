@@ -24,6 +24,7 @@ use crate::authority::{
 };
 use crate::error::ErrorCode;
 use crate::evidence::EvidenceOriginClass;
+use crate::grounding::{GroundingStateKind, RowGrounding};
 use crate::ids::Scope;
 use crate::memory::MemoryType;
 use uuid::Uuid;
@@ -278,11 +279,44 @@ pub struct MandatoryRow {
     selector: SelectorId,
     authority: AuthorityClass,
     est_tokens: u32,
+    not_judged: bool,
+}
+
+/// DOD-093 的 fail-loud 载体：一条**没能**进 lane 的行，与它没能进的原因。
+///
+/// 它不是错误——装配继续；它是必须出现在 `needs_verification[]` 顶层块里的披露。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NeedsVerification {
+    /// 哪条 memory。
+    pub memory_id: MemoryId,
+    /// 哪个 selector 想选它。
+    pub selector: SelectorId,
+    /// 被撤销资格时的 grounding 状态（RECHECK_REQUIRED / UNRESOLVED / CANNOT_ESTABLISH）。
+    pub state: GroundingStateKind,
+}
+
+/// [`MandatoryRow::from_selector`] 的产出：铸成了，或者分流进 needs_verification。
+///
+/// **两臂都不是错误**——`Err` 留给「参数本身不合法」（authority 低于下限）。DOD-093 的
+/// 「不得静默消费」靠这个形状成立：RECHECK_REQUIRED 的行**铸不出** `MandatoryRow`，
+/// 而 [`NeedsVerification`] 是必须上报的另一个类型——「静默」没有可写的形态。
+#[derive(Debug)]
+pub enum Admitted {
+    /// 通过铸造门。
+    Row(MandatoryRow),
+    /// §8.8 撤销了「继续当作当前真值」的资格（DOD-093）。
+    NeedsVerification(NeedsVerification),
 }
 
 impl MandatoryRow {
-    /// 唯一铸造点。按 spec 复核 authority 下限——低于下限的行不是「排序靠后」，是**不该在
-    /// 这条 lane 里**。
+    /// 唯一铸造点。三道门，顺序即语义：
+    ///
+    /// 1. `authority` 低于 `spec.min_authority` ⇒ `Err`（参数不合法，不是分流）；
+    /// 2. `grounding` 撤销当前真值资格（[`GroundingStateKind::revokes_current_truth_assumption`]）
+    ///    ⇒ [`Admitted::NeedsVerification`]——**row 铸不出来**，这就是 DOD-093 的
+    ///    「Mandatory/Pinned 不得静默消费」在类型上的形状（§11.10 注错四的落点）；
+    /// 3. [`RowGrounding::NotJudged`]（快照内不可裁）⇒ 铸进 row 但打上 `not_judged`——
+    ///    「没判」进 lane 但必须具名披露，不许伪装成「判过且通过」。
     ///
     /// # Errors
     /// `authority` 低于 `spec.min_authority` 时返回 [`ErrorCode::InvalidInput`]。
@@ -291,16 +325,37 @@ impl MandatoryRow {
         memory_id: MemoryId,
         authority: AuthorityClass,
         est_tokens: u32,
-    ) -> Result<Self, ErrorCode> {
+        grounding: RowGrounding,
+    ) -> Result<Admitted, ErrorCode> {
         if (authority as u8) < (spec.min_authority as u8) {
             return Err(ErrorCode::InvalidInput);
         }
-        Ok(Self {
+        let not_judged = match grounding {
+            RowGrounding::Judged(state) => {
+                if state.revokes_current_truth_assumption() {
+                    return Ok(Admitted::NeedsVerification(NeedsVerification {
+                        memory_id,
+                        selector: spec.id,
+                        state: state.kind(),
+                    }));
+                }
+                false
+            }
+            RowGrounding::NotJudged => true,
+        };
+        Ok(Admitted::Row(Self {
             memory_id,
             selector: spec.id,
             authority,
             est_tokens,
-        })
+            not_judged,
+        }))
+    }
+
+    /// 快照内没能裁定 grounding 的行（见 [`RowGrounding::NotJudged`]）。上报用。
+    #[must_use]
+    pub const fn not_judged(&self) -> bool {
+        self.not_judged
     }
 
     /// 这行指向的 memory。
@@ -343,8 +398,10 @@ pub enum SelectorOutcome {
         id: SelectorId,
         /// 独立 COUNT 得到的应有条数。
         expected: u64,
-        /// 实际取回的行。
+        /// 实际取回的行（已过铸造门）。
         rows: Vec<MandatoryRow>,
+        /// 被铸造门分流的行（DOD-093：与 `rows` 同源同到场，不许丢）。
+        needs_verification: Vec<NeedsVerification>,
     },
     /// 被测对象缺席。
     Unavailable {
@@ -355,52 +412,73 @@ pub enum SelectorOutcome {
     },
 }
 
-/// 至少一个 selector 不可用 ⇒ 整条 lane 构不出来。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaneUnavailable {
-    /// 逐个点名，不合并成一句——调用方要能照着这个列表去建缺的东西。
-    pub missing: Vec<(SelectorId, String)>,
-}
-
 /// §25.4 步骤 2 的产物。字段私有：`expected` 不许被调用方改写。
 #[derive(Debug)]
 pub struct MandatoryLane {
     expected: u64,
     rows: Vec<MandatoryRow>,
+    needs_verification: Vec<NeedsVerification>,
+    unavailable: Vec<(SelectorId, String)>,
 }
 
 impl MandatoryLane {
-    /// 唯一构造点，收**定长数组**而不是 `Vec`。
+    /// 唯一构造点，收**定长数组**而不是 `Vec`——调用方少传一个 selector 会编译不过。
     ///
-    /// 定长是刻意的：调用方少传一个 selector 会编译不过，而不是让 `expected` 悄悄少算一截。
+    /// **恒成功（partial lane），推翻本模块上一版的整条拒建。** 上一版：任一
+    /// `Unavailable` ⇒ `Err(LaneUnavailable)`。后果（实测）：真 schema 缺
+    /// `private.memory_records.task_id` 与 `.facet` 两列，两个 selector **恒**不可用 ⇒
+    /// lane **永远**构不出来 ⇒ G80-31 永远 NA——按「没有注错红转绿的闸不算存在」，
+    /// 整条 Phase 8 出场判据就不存在。
     ///
-    /// # Errors
-    /// 任一 selector `Unavailable` ⇒ [`LaneUnavailable`]，整条 lane 构不出来。
-    /// 「有几个 selector 坏了但先凑合上」不是一个可表达的状态。
-    pub fn from_selectors(out: [SelectorOutcome; 5]) -> Result<Self, LaneUnavailable> {
-        let mut missing = Vec::new();
+    /// §25.5 禁的是「静默截掉仍声称 complete」，不禁 **loud partial**：`unavailable`
+    /// 逐个具名（probe 探测出的缺失对象），completeness 在它非空时构造不出 complete
+    /// （envelope 侧断言），handoff 顶层块如实携带。缺列补上的那天 probe 自动改口，
+    /// 无人需要回来改代码（ADR-0006）。
+    pub fn from_selectors(out: [SelectorOutcome; 5]) -> Self {
+        let mut unavailable = Vec::new();
         let mut expected = 0u64;
         let mut rows = Vec::new();
+        let mut needs = Vec::new();
         for o in out {
             match o {
                 SelectorOutcome::Unavailable { id, missing_object } => {
-                    missing.push((id, missing_object));
+                    unavailable.push((id, missing_object));
                 }
                 SelectorOutcome::Ran {
                     expected: e,
                     rows: mut r,
+                    needs_verification: mut nv,
                     ..
                 } => {
                     expected = expected.saturating_add(e);
                     rows.append(&mut r);
+                    needs.append(&mut nv);
                 }
             }
         }
-        if missing.is_empty() {
-            Ok(Self { expected, rows })
-        } else {
-            Err(LaneUnavailable { missing })
+        // 字节域卫生：按 (selector, memory_id) 定序——顺序是构造出来的，不是调用方碰巧的。
+        rows.sort_by_key(|r| (r.selector as u8, r.memory_id.0));
+        needs.sort_by_key(|n| (n.selector as u8, n.memory_id.0));
+        unavailable.sort_by_key(|(id, _)| *id as u8);
+        Self {
+            expected,
+            rows,
+            needs_verification: needs,
+            unavailable,
         }
+    }
+
+    /// 被铸造门分流的行（DOD-093 的 `needs_verification[]` 来源）。
+    #[must_use]
+    pub fn needs_verification(&self) -> &[NeedsVerification] {
+        &self.needs_verification
+    }
+
+    /// 不可用的 selector 与**探测出的**缺失对象名。非空 ⇒ 这条 lane 是 partial，
+    /// completeness 不得报 complete。
+    #[must_use]
+    pub fn unavailable(&self) -> &[(SelectorId, String)] {
+        &self.unavailable
     }
 
     /// 应有条数（各 selector 独立 COUNT 之和）。
@@ -446,18 +524,39 @@ impl MandatoryLane {
     }
 }
 
-/// §25.4 步骤 5 的产物。形状同 [`MandatoryLane`]，但**没有 `missing`**：
-/// Pinned 是用户/管理员显式钉的，钉了几条就是几条，没有「应有但没取到」这个概念。
+/// §25.4 步骤 5 的产物。没有 `missing`（Pinned 是显式钉的），但有 **`expected` 与
+/// `excluded`**：`expected` 来自独立 COUNT（外部 oracle，防「钉 3 带 2 不可观测」——
+/// 内部守恒式在 expected 内生时恒真），`excluded` 具名被跳过的低 authority 行。
 #[derive(Debug)]
 pub struct PinnedLane {
+    expected: u64,
     rows: Vec<MandatoryRow>,
+    excluded: Vec<MemoryId>,
 }
 
 impl PinnedLane {
-    /// 唯一构造点。
+    /// 唯一构造点。`expected` 必须来自与取行分离的独立 COUNT（同 Mandatory 的纪律）。
     #[must_use]
-    pub const fn new(rows: Vec<MandatoryRow>) -> Self {
-        Self { rows }
+    pub fn new(expected: u64, mut rows: Vec<MandatoryRow>, mut excluded: Vec<MemoryId>) -> Self {
+        rows.sort_by_key(|r| (r.selector as u8, r.memory_id.0));
+        excluded.sort_by_key(|m| m.0);
+        Self {
+            expected,
+            rows,
+            excluded,
+        }
+    }
+
+    /// 独立 COUNT 得到的「钉了几条」。
+    #[must_use]
+    pub const fn expected(&self) -> u64 {
+        self.expected
+    }
+
+    /// 被跳过的低 authority 行，具名——「钉 3 带 2」必须可观测。
+    #[must_use]
+    pub fn excluded(&self) -> &[MemoryId] {
+        &self.excluded
     }
 
     /// 实际取回的行。
@@ -485,6 +584,25 @@ impl PinnedLane {
     pub fn into_rows(self) -> Vec<MandatoryRow> {
         self.rows
     }
+}
+
+/// 一次装配的**全部冻结读数**——[`crate::grounding`] 的快照内派生 + 两条 lane +
+/// 快照身份。纯数据无 IO；`retrieval` 侧的 handoff 装配只收它，收不到时钟、收不到连接。
+///
+/// **`snapshot_token_sha256` 才是快照身份**；`context_snapshot_seq`（= `pg_snapshot_xmin`）
+/// 是 §1.2.1/§16.1 的 fingerprint 轴，**必要非充分**：并发长事务钉住 xmin 时，两次装配
+/// 可以同 seq 而读到不同集合（写入只对第二次可见）。「同快照 ⇒ 同字节」的充分条件是
+/// 完整 snapshot token（xmin:xmax:xip 全等 ⇒ 可见性全等）。
+#[derive(Debug)]
+pub struct FrozenReads {
+    /// §25.4 步骤 2。
+    pub mandatory: MandatoryLane,
+    /// §25.4 步骤 5。
+    pub pinned: PinnedLane,
+    /// `pg_snapshot_xmin(pg_current_snapshot())`——fingerprint 轴，必要非充分（见类型 doc）。
+    pub context_snapshot_seq: i64,
+    /// `SHA256(pg_current_snapshot()::text)`——快照身份，逐字节重现的充分条件。
+    pub snapshot_token_sha256: String,
 }
 
 /// §25.5 守恒：`expected == returned + missing`。
@@ -808,6 +926,7 @@ mod tests {
 
     use super::*;
     use crate::authority::AuthorizedAuthority;
+    use crate::grounding::{GroundingInputs, derive_grounding_state};
     use crate::ids::{TenantId, UserId, WorkspaceId};
 
     fn scope_of(tenant: Uuid, user: Option<Uuid>, workspace: Option<Uuid>) -> Scope {
@@ -822,9 +941,23 @@ mod tests {
         }
     }
 
+    fn current() -> RowGrounding {
+        RowGrounding::Judged(derive_grounding_state(GroundingInputs::Edges(&[])))
+    }
+
     fn row(spec: &'static SelectorSpec, tokens: u32) -> MandatoryRow {
-        MandatoryRow::from_selector(spec, MemoryId(Uuid::now_v7()), spec.min_authority, tokens)
-            .expect("min_authority 恰好等于下限，必须收下")
+        match MandatoryRow::from_selector(
+            spec,
+            MemoryId(Uuid::now_v7()),
+            spec.min_authority,
+            tokens,
+            current(),
+        )
+        .expect("min_authority 恰好等于下限，必须收下")
+        {
+            Admitted::Row(r) => r,
+            Admitted::NeedsVerification(nv) => panic!("CURRENT 行不该被分流: {nv:?}"),
+        }
     }
 
     // ---- registry ----
@@ -928,6 +1061,7 @@ mod tests {
                 MemoryId(Uuid::now_v7()),
                 AuthorityClass::PrivateKnowledge, // 低于下限
                 10,
+                current(),
             )
             .is_err(),
             "低于 min_authority 的行必须被拒"
@@ -938,6 +1072,7 @@ mod tests {
                 MemoryId(Uuid::now_v7()),
                 AuthorityClass::ExplicitTaskContext, // 高于下限
                 10,
+                current(),
             )
             .is_ok(),
             "高于下限的行应当收下"
@@ -946,10 +1081,15 @@ mod tests {
 
     // ---- lane 构造 ----
 
-    /// 任一 selector 不可用 ⇒ 整条 lane 构不出来，且**逐个点名**。
-    /// 「有几个坏了但先凑合上」不是一个可表达的状态——那正是 Context 静默少带东西的形态。
+    /// 不可用的 selector **逐个具名**留在 lane 上（partial-lane）。
+    ///
+    /// 本条推翻上一版的整条拒建（任一 Unavailable ⇒ Err）：真 schema 缺 task_id/facet
+    /// 两列，两个 selector 恒不可用 ⇒ 整条拒建让 lane 永远构不出来 ⇒ G80-31 永远 NA
+    /// ——按「没有红转绿的闸不算存在」，Phase 8 的出场判据就不存在。§25.5 禁的是
+    /// 「静默截掉仍声称 complete」，不禁 loud partial：unavailable 非空时 completeness
+    /// 构造不出 complete（envelope 侧断言），handoff 如实携带。
     #[test]
-    fn any_unavailable_selector_kills_the_whole_lane_and_names_each_one() {
+    fn unavailable_selectors_are_named_on_the_lane_not_fatal() {
         let out = [
             SelectorOutcome::Unavailable {
                 id: SelectorId::TaskExplicitContextV1,
@@ -959,11 +1099,13 @@ mod tests {
                 id: SelectorId::ProjectActiveConstraintsV1,
                 expected: 1,
                 rows: vec![row(spec(SelectorId::ProjectActiveConstraintsV1), 10)],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Unavailable {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
@@ -973,15 +1115,103 @@ mod tests {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
         ];
-        match MandatoryLane::from_selectors(out) {
-            Err(LaneUnavailable { missing }) => {
-                assert_eq!(missing.len(), 2, "两个都要点名: {missing:?}");
-                assert!(missing.iter().any(|(_, m)| m.contains("task_id")));
-                assert!(missing.iter().any(|(_, m)| m.contains("facet")));
-            }
-            Ok(_) => panic!("有 selector 不可用时 lane 不得构造成功"),
+        let lane = MandatoryLane::from_selectors(out);
+        assert_eq!(
+            lane.unavailable().len(),
+            2,
+            "两个都要点名: {:?}",
+            lane.unavailable()
+        );
+        assert!(
+            lane.unavailable()
+                .iter()
+                .any(|(_, m)| m.contains("task_id"))
+        );
+        assert!(lane.unavailable().iter().any(|(_, m)| m.contains("facet")));
+        // partial 不是空转：可用 selector 的行照常在。
+        assert_eq!(lane.returned(), 1);
+        assert_eq!(lane.expected(), 1);
+    }
+
+    /// DOD-093：RECHECK_REQUIRED 的行铸不出 row，分流进 needs_verification 且**不许丢**。
+    /// 注错：铸造门恒喂 Judged(CURRENT)（「忽略 GroundingState」唯一可写出的形态）⇒ 本条红。
+    #[test]
+    fn recheck_required_rows_are_diverted_and_named_not_minted() {
+        let s = spec(SelectorId::ProjectActiveConstraintsV1);
+        let recheck = RowGrounding::Judged(derive_grounding_state(GroundingInputs::Edges(&[
+            crate::grounding::GroundingEdge {
+                mode: crate::grounding::GroundingMode::Live,
+                recorded_version: None,
+                outcome: crate::grounding::EdgeOutcome::Resolved(
+                    crate::grounding::GroundingVersionToken::new("v2"),
+                ),
+            },
+        ])));
+        let id = MemoryId(Uuid::now_v7());
+        let admitted =
+            MandatoryRow::from_selector(s, id, s.min_authority, 10, recheck).expect("参数合法");
+        let nv = match admitted {
+            Admitted::NeedsVerification(nv) => nv,
+            Admitted::Row(r) => panic!("RECHECK_REQUIRED 的行铸出了 row: {r:?}"),
+        };
+        assert_eq!(nv.memory_id, id);
+        assert_eq!(nv.state, GroundingStateKind::RecheckRequired);
+
+        // 经 lane 聚合后仍然在场（同源同到场，不许丢）。
+        let lane = MandatoryLane::from_selectors([
+            SelectorOutcome::Ran {
+                id: SelectorId::TaskExplicitContextV1,
+                expected: 0,
+                rows: vec![],
+                needs_verification: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::ProjectActiveConstraintsV1,
+                expected: 1,
+                rows: vec![],
+                needs_verification: vec![nv],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::UserConfirmedCorrectionsV1,
+                expected: 0,
+                rows: vec![],
+                needs_verification: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::RequiredCurrentStateFacetsV1,
+                expected: 0,
+                rows: vec![],
+                needs_verification: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::ExplicitMandatoryBindingsV1,
+                expected: 0,
+                rows: vec![],
+                needs_verification: vec![],
+            },
+        ]);
+        assert_eq!(lane.needs_verification().len(), 1);
+        assert_eq!(lane.needs_verification()[0].memory_id, id);
+    }
+
+    /// NotJudged（快照内不可裁）铸进 row 但带 not_judged 标——第三臂不是 CURRENT 的别名。
+    #[test]
+    fn not_judged_rows_are_minted_but_flagged() {
+        let s = spec(SelectorId::ProjectActiveConstraintsV1);
+        let admitted = MandatoryRow::from_selector(
+            s,
+            MemoryId(Uuid::now_v7()),
+            s.min_authority,
+            10,
+            RowGrounding::NotJudged,
+        )
+        .expect("参数合法");
+        match admitted {
+            Admitted::Row(r) => assert!(r.not_judged(), "NotJudged 必须留痕"),
+            Admitted::NeedsVerification(nv) => panic!("NotJudged 不该被分流: {nv:?}"),
         }
     }
 
@@ -995,30 +1225,35 @@ mod tests {
                 id: SelectorId::TaskExplicitContextV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             // COUNT 说有 3 条，实际只取回 1 条（分页/LIMIT 之类）。
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
                 expected: 3,
                 rows: vec![row(s, 10)],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
         ];
-        let lane = MandatoryLane::from_selectors(out).expect("全部 Ran，应当构造成功");
+        let lane = MandatoryLane::from_selectors(out);
         assert_eq!(lane.expected(), 3);
         assert_eq!(lane.returned(), 1);
         assert_eq!(lane.missing(), 2, "少带了 2 条，这个差额必须显式可见");
@@ -1055,30 +1290,34 @@ mod tests {
                 id: SelectorId::TaskExplicitContextV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
                 expected: 1,
                 rows: vec![row(s, 30)],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
-        ])
-        .expect("lane");
-        let p = PinnedLane::new(vec![row(s, 20)]);
+        ]);
+        let p = PinnedLane::new(1, vec![row(s, 20)], vec![]);
         let budget = ContextBudget::new(200, 100).expect("budget");
         let rest = budget.reserve(&m, &p).expect("30 + 20 <= 100，不该溢出");
         assert_eq!(rest.tokens(), 150, "200 - (30 + 20)");
@@ -1097,30 +1336,34 @@ mod tests {
                 id: SelectorId::TaskExplicitContextV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
                 expected: 2,
                 rows: vec![row(s, 80), row(s, 80)],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
-        ])
-        .expect("lane");
-        let p = PinnedLane::new(vec![row(s, 10)]);
+        ]);
+        let p = PinnedLane::new(1, vec![row(s, 10)], vec![]);
         let budget = ContextBudget::new(500, 100).expect("budget");
 
         let overflow = budget

@@ -151,8 +151,24 @@ mod tests {
 
     fn m_row(tokens: u32) -> MandatoryRow {
         let s = spec(SelectorId::ProjectActiveConstraintsV1);
-        MandatoryRow::from_selector(s, MemoryId::new(), s.min_authority, tokens)
-            .expect("min_authority 恰好达标")
+        match MandatoryRow::from_selector(
+            s,
+            MemoryId::new(),
+            s.min_authority,
+            tokens,
+            humaux_domain::grounding::RowGrounding::Judged(
+                humaux_domain::grounding::derive_grounding_state(
+                    humaux_domain::grounding::GroundingInputs::Edges(&[]),
+                ),
+            ),
+        )
+        .expect("min_authority 恰好达标")
+        {
+            humaux_domain::context::Admitted::Row(r) => r,
+            humaux_domain::context::Admitted::NeedsVerification(nv) => {
+                panic!("CURRENT 行不该被分流: {nv:?}")
+            }
+        }
     }
 
     fn lane(rows: Vec<MandatoryRow>, expected: u64) -> MandatoryLane {
@@ -161,29 +177,33 @@ mod tests {
                 id: SelectorId::TaskExplicitContextV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
                 expected,
                 rows,
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
                 expected: 0,
                 rows: vec![],
+                needs_verification: vec![],
             },
         ])
-        .expect("全部 Ran")
     }
 
     /// **G25-1 本体**：1 条 Mandatory + 200 条高分补充候选，无论补充位怎么排，
@@ -197,7 +217,7 @@ mod tests {
         let row = m_row(10);
         let target = row.memory_id();
         let m = lane(vec![row], 1);
-        let p = PinnedLane::new(vec![]);
+        let p = PinnedLane::new(0, vec![], vec![]);
 
         // 200 条分数远高于任何 mandatory 的候选（mandatory 根本没有分数——这正是重点）。
         let noise: Vec<Candidate> = (0..200)
@@ -271,7 +291,7 @@ mod tests {
         };
 
         let (m_good, id) = make();
-        let p = PinnedLane::new(vec![]);
+        let p = PinnedLane::new(0, vec![], vec![]);
         let b = ContextBudget::new(100, 50)
             .expect("budget")
             .reserve(&m_good, &p)
@@ -279,7 +299,7 @@ mod tests {
         let good = compile(m_good, p, b, vec![]);
 
         let (m_bad, _) = make();
-        let p2 = PinnedLane::new(vec![]);
+        let p2 = PinnedLane::new(0, vec![], vec![]);
         let b2 = ContextBudget::new(100, 50)
             .expect("budget")
             .reserve(&m_bad, &p2)
@@ -302,7 +322,7 @@ mod tests {
     #[test]
     fn frozen_assembly_order_is_mandatory_then_pinned_then_supplemental() {
         let m = lane(vec![m_row(5)], 1);
-        let p = PinnedLane::new(vec![m_row(5)]);
+        let p = PinnedLane::new(1, vec![m_row(5)], vec![]);
         let budget = ContextBudget::new(100, 50)
             .expect("budget")
             .reserve(&m, &p)
@@ -329,7 +349,7 @@ mod tests {
     #[test]
     fn dropped_supplementals_are_named_not_just_counted() {
         let m = lane(vec![], 0);
-        let p = PinnedLane::new(vec![]);
+        let p = PinnedLane::new(0, vec![], vec![]);
         let budget = ContextBudget::new(10, 5)
             .expect("budget")
             .reserve(&m, &p)

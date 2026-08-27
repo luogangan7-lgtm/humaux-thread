@@ -13,7 +13,7 @@
 
 use humaux_adapters::context_repo;
 use humaux_adapters::postgres::RuntimeDbPool;
-use humaux_domain::context::{SelectorId, SelectorOutcome};
+use humaux_domain::context::SelectorId;
 use humaux_domain::ids::{Scope, TenantId};
 use humaux_testkit::{ExternalDep, skip_or_fail};
 use postgres::{Client, NoTls};
@@ -132,7 +132,13 @@ fn setup() -> Option<(Fixture, String)> {
 }
 
 /// 播一条 memory（含 §8.6 要求的 evidence 链），返回 memory_id。
-fn seed_memory(f: &mut Fixture, authority: &str) -> Uuid {
+///
+/// `grounding_mode` 决定这条 memory 在装配快照里的 grounding 结论（migration 0100 语义）：
+/// `SNAPSHOT` ⇒ 无 LIVE edge ⇒ CURRENT ⇒ 进 lane；`LIVE`（且不给 recorded_version）⇒
+/// RECHECK_REQUIRED ⇒ 被铸造门分流进 needs_verification（DOD-093）。**0100 的默认回填
+/// 正是 LIVE+NULL**——所以本 fixture 必须显式选档，否则种出来的行全都进不了 lane
+/// （这不是 bug，是门在工作；本文件第一次跑红正是这样发现的）。
+fn seed_memory(f: &mut Fixture, authority: &str, grounding_mode: &str) -> Uuid {
     let confidence: f32 = 0.9;
     let mut txn = f.admin.transaction().expect("begin");
     let memory_id: Uuid = txn
@@ -152,9 +158,9 @@ fn seed_memory(f: &mut Fixture, authority: &str) -> Uuid {
         .expect("insert memory")
         .get(0);
     txn.execute(
-        "INSERT INTO private.memory_evidence (memory_id, evidence_id, role) \
-         VALUES ($1, $2, 'PRIMARY')",
-        &[&memory_id, &f.evidence_id],
+        "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, grounding_mode) \
+         VALUES ($1, $2, 'PRIMARY', $3)",
+        &[&memory_id, &f.evidence_id, &grounding_mode],
     )
     .expect("link evidence (§8.6)");
     txn.commit().expect("commit");
@@ -223,32 +229,24 @@ fn probe_reports_the_columns_that_are_actually_missing() {
 fn project_constraints_are_selected_by_authority_not_similarity() {
     let Some((mut f, dsn)) = setup() else { return };
 
-    let constraint = seed_memory(&mut f, "ProjectConstraint");
+    let constraint = seed_memory(&mut f, "ProjectConstraint", "SNAPSHOT");
     // 内容逐字相同、只有 authority 不同——相似度选法会把两条都选进来，机械规则只选一条。
-    let _note = seed_memory(&mut f, "PrivateKnowledge");
+    let _note = seed_memory(&mut f, "PrivateKnowledge", "SNAPSHOT");
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn_as_role(&dsn, "role_gateway")))
         .expect("gateway pool");
-    let outcomes = rt
-        .block_on(context_repo::fetch_mandatory_outcomes(
-            &pool,
-            &scope_for(f.tenant_id),
-        ))
-        .expect("fetch outcomes");
+    let frozen = rt
+        .block_on(context_repo::fetch_frozen(&pool, &scope_for(f.tenant_id)))
+        .expect("fetch frozen");
 
-    let picked: Vec<Uuid> = outcomes
+    let picked: Vec<Uuid> = frozen
+        .mandatory
+        .rows()
         .iter()
-        .filter_map(|o| match o {
-            SelectorOutcome::Ran { id, rows, .. }
-                if *id == SelectorId::ProjectActiveConstraintsV1 =>
-            {
-                Some(rows.iter().map(|r| r.memory_id().0).collect::<Vec<_>>())
-            }
-            _ => None,
-        })
-        .flatten()
+        .filter(|r| r.selector() == SelectorId::ProjectActiveConstraintsV1)
+        .map(|r| r.memory_id().0)
         .collect();
 
     assert!(
@@ -263,13 +261,59 @@ fn project_constraints_are_selected_by_authority_not_similarity() {
     );
 }
 
+/// 判据 (d)（DOD-093 / §11.10 注错四的落点）：LIVE 且未记版本的 ProjectConstraint
+/// **不进** mandatory rows，且在 `needs_verification[]` **具名**（RECHECK_REQUIRED）。
+///
+/// 本文件第一次改造后跑红的正是这个行为——0100 的默认回填（LIVE+NULL）让所有夹具行
+/// 被分流。那次红不是回归，是门在工作；本条把它钉成正式判据。
+/// 注错：`from_selector` 恒喂 Judged(CURRENT)（「忽略 GroundingState」唯一可写出的形态）
+/// ⇒ 行进了 rows、needs_verification 空 ⇒ 两条断言都红。
+#[test]
+fn a_live_unversioned_constraint_is_diverted_and_named_not_consumed() {
+    let Some((mut f, dsn)) = setup() else { return };
+    let diverted = seed_memory(&mut f, "ProjectConstraint", "LIVE");
+    let admitted = seed_memory(&mut f, "ProjectConstraint", "SNAPSHOT");
+
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let pool = rt
+        .block_on(RuntimeDbPool::connect(&dsn_as_role(&dsn, "role_gateway")))
+        .expect("gateway pool");
+    let frozen = rt
+        .block_on(context_repo::fetch_frozen(&pool, &scope_for(f.tenant_id)))
+        .expect("fetch frozen");
+
+    let row_ids: Vec<Uuid> = frozen
+        .mandatory
+        .rows()
+        .iter()
+        .map(|r| r.memory_id().0)
+        .collect();
+    assert!(
+        row_ids.contains(&admitted),
+        "SNAPSHOT 档（CURRENT）的 constraint 必须进 lane"
+    );
+    assert!(
+        !row_ids.contains(&diverted),
+        "LIVE+未记版本（RECHECK_REQUIRED）的 constraint 不得进 lane——静默消费即 DOD-093 违规"
+    );
+    assert!(
+        frozen
+            .mandatory
+            .needs_verification()
+            .iter()
+            .any(|nv| nv.memory_id.0 == diverted),
+        "被分流的行必须在 needs_verification[] 具名，不许消失: {:?}",
+        frozen.mandatory.needs_verification()
+    );
+}
+
 /// §25.5 正对照：binding 撤销后必须**立刻**从 lane 里消失。最容易漏的一条。
 ///
 /// 注错：把 `EXPLICIT_BINDINGS_WHERE` 的 `cb.revoked_at IS NULL` 去掉 ⇒ 本条红。
 #[test]
 fn revoking_a_binding_removes_it_from_the_lane() {
     let Some((mut f, dsn)) = setup() else { return };
-    let memory_id = seed_memory(&mut f, "ProjectConstraint");
+    let memory_id = seed_memory(&mut f, "ProjectConstraint", "SNAPSHOT");
 
     let binding_id: Uuid = f
         .admin
@@ -288,19 +332,11 @@ fn revoking_a_binding_removes_it_from_the_lane() {
         .expect("gateway pool");
 
     let bound = |pool: &RuntimeDbPool| -> bool {
-        let outcomes = rt
-            .block_on(context_repo::fetch_mandatory_outcomes(
-                pool,
-                &scope_for(f.tenant_id),
-            ))
-            .expect("fetch");
-        outcomes.iter().any(|o| match o {
-            SelectorOutcome::Ran { id, rows, .. }
-                if *id == SelectorId::ExplicitMandatoryBindingsV1 =>
-            {
-                rows.iter().any(|r| r.memory_id().0 == memory_id)
-            }
-            _ => false,
+        let frozen = rt
+            .block_on(context_repo::fetch_frozen(pool, &scope_for(f.tenant_id)))
+            .expect("fetch frozen");
+        frozen.mandatory.rows().iter().any(|r| {
+            r.selector() == SelectorId::ExplicitMandatoryBindingsV1 && r.memory_id().0 == memory_id
         })
     };
 
