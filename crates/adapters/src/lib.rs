@@ -7,6 +7,7 @@ pub mod audit_sink;
 pub mod batch;
 pub mod byok;
 pub mod consolidate_repo;
+pub mod context_repo;
 pub mod dashscope;
 pub mod disclosure;
 pub mod email;
