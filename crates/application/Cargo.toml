@@ -10,6 +10,9 @@ workspace = true
 [dependencies]
 # Phase 2 identity/entitlement modules (§74/§75/§76). Versions: latest stable.
 humaux-domain = { path = "../domain" }
+# §25.3 continuity：assemble_handoff 产出 retrieval::handoff::Handoff（G80-31 字节域）。
+# retrieval 只依赖 domain+telemetry，无环。
+humaux-retrieval = { path = "../retrieval" }
 argon2 = "0.5"
 rand = "0.9"
 # §74.2/§73.5: HMAC-SHA256 keyed hash for verification codes, same construction and version

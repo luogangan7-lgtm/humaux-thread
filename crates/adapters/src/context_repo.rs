@@ -530,3 +530,28 @@ pub async fn revoke_binding(
     txn.commit().await.map_err(|_| ErrorCode::Internal)?;
     Ok(affected == 1)
 }
+
+/// [`humaux_application::continuity::ContextReadPort`] 的生产实现——委托
+/// [`fetch_frozen`]。application 依赖方向不许反转（它不能 import 本 crate），
+/// 端口在那边、实现在这边（`PrivateReasoningPort` 同款先例）。
+pub struct ContextReadAdapter {
+    pool: RuntimeDbPool,
+}
+
+impl ContextReadAdapter {
+    /// 构造。
+    #[must_use]
+    pub const fn new(pool: RuntimeDbPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl humaux_application::continuity::ContextReadPort for ContextReadAdapter {
+    async fn fetch_frozen(
+        &self,
+        scope: &Scope,
+    ) -> Result<humaux_domain::context::FrozenReads, ErrorCode> {
+        fetch_frozen(&self.pool, scope).await
+    }
+}

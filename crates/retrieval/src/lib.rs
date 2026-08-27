@@ -8,6 +8,7 @@ pub mod compiler;
 pub mod completeness;
 pub mod envelope;
 pub mod fusion;
+pub mod handoff;
 pub mod planner;
 pub mod predicate_eval;
 pub mod predicate_registry;

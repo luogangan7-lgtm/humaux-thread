@@ -120,6 +120,28 @@ pub const PHASE_6: &[DodVerifier] = &[DodVerifier {
     verifier_ref: "test::humaux-adapters::snapshot_survives_concurrent_higher_ranked_inserts",
 }];
 
+/// Phase 8 registrations — §25 Context Products。
+pub const PHASE_8: &[DodVerifier] = &[DodVerifier {
+    id: "DOD-093",
+    phase: 8,
+    // 判据链：§69「Mandatory/Pinned 不得静默消费 RECHECK_REQUIRED/UNRESOLVED/
+    // CANNOT_ESTABLISH；必须 fail-loud 并输出 needs_verification[]」≡ §11.10 注错四
+    // （Context 忽略 GroundingState ⇒ G 红）≡ grounding.rs 夹具 G 的真断言。
+    //
+    // 结构保证：`MandatoryRow::from_selector` 收 RowGrounding 返回
+    // Admitted{Row|NeedsVerification}——被撤销资格的行铸不出 row，「静默消费」没有
+    // 可写的形态；needs_verification 经 lane 到 handoff 顶层块（字节域测试钉住
+    // 「不进字节域的披露等于没披露」）。
+    //
+    // fault 的红转绿已实录（2026-08-27）：把铸造门改成忽略 grounding 恒 CURRENT，
+    // domain 侧 recheck_required_rows_are_diverted_and_named_not_minted 与 DB e2e 侧
+    // a_live_unversioned_constraint_is_diverted_and_named_not_consumed 同时红，
+    // 复原后绿。
+    fault: "recheck_required_rows_are_diverted_and_named_not_minted",
+    kind: "test",
+    verifier_ref: "test::humaux-adapters::a_live_unversioned_constraint_is_diverted_and_named_not_consumed",
+}];
+
 /// Phase 7 registrations — §69 Retrieval 量具面。
 pub const PHASE_7: &[DodVerifier] = &[
     DodVerifier {

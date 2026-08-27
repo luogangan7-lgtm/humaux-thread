@@ -92,8 +92,11 @@ pub fn read_phase_file(path: &Path) -> u32 {
 ///
 /// 只登记**下一个**相位的 marker 就够了：`PHASE` 每前进一步，下一行才变得相关；
 /// 一次性预登记全部 17 个相位的 marker 是在猜未来交付物的文件名，猜错的行永远不红。
-const NEXT_PHASE_MARKERS: [(u32, &str, &str); 1] =
-    [(8, "crates/application/src/continuity.rs", "占位模块")];
+const NEXT_PHASE_MARKERS: [(u32, &str, &str); 2] = [
+    (8, "crates/application/src/continuity.rs", "占位模块"),
+    // phase 9 = §12 Public Contribution；contribute.rs 今天是一行占位。
+    (9, "crates/application/src/contribute.rs", "占位模块"),
+];
 
 /// `cargo xtask phase-check` — `PHASE` 的过期闸。
 ///
@@ -164,8 +167,8 @@ mod tests {
     fn no_args_reads_the_repo_phase_file_not_zero() {
         let n = current_phase(&[]);
         assert!(
-            n >= 7,
-            "PHASE 真源读出 {n}，低于已交付的相位 7——相位只进不退"
+            n >= 8,
+            "PHASE 真源读出 {n}，低于已交付的相位 8——相位只进不退"
         );
     }
 
