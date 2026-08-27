@@ -825,21 +825,10 @@ fn walk_rs_sources(dir: &Path) -> Vec<String> {
 // ============================================================================
 
 fn parse_phase_flag(args: &[String]) -> u32 {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--phase" {
-            if let Some(v) = it.next()
-                && let Ok(n) = v.parse()
-            {
-                return n;
-            }
-        } else if let Some(v) = a.strip_prefix("--phase=")
-            && let Ok(n) = v.parse()
-        {
-            return n;
-        }
-    }
-    0
+    // 相位真源统一在 `phase::current_phase`：CLI 覆盖仍然生效（what-if 用），但**不传参数时
+    // 读仓库根的 PHASE 文件，不再默认 0**。默认 0 的年代，这道闸对 phase>0 的一切条目
+    // 静默豁免——仓库交付到 Phase 7 时它还在报「全部不适用」（审计结论，2026-08-27）。
+    crate::phase::current_phase(args)
 }
 
 fn report(results: &[GateResult]) -> i32 {

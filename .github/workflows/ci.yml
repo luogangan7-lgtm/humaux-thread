@@ -123,14 +123,20 @@ jobs:
       - name: cargo xtask rls-check
         run: cargo xtask rls-check
 
+      # PHASE 真源的过期闸：下一相位的交付物 marker 已非占位而 PHASE 未前进 ⇒ 红。
+      # 「当前状态」型常量写进静态文件的那天就开始腐烂，除非配一道会红的过期闸——
+      # PHASE 文件正是那种常量（审计结论，见 xtask/src/phase.rs 模块 doc）。
+      - name: cargo xtask phase-check
+        run: cargo xtask phase-check
+
       # ---------------------------------------------------------------------
       # 还没接进来的两道，以及为什么 —— 写在这里是为了留痕，不是为了免责。
       #
-      #   cargo xtask dod-check --phase <当前相位>
-      #   cargo xtask benchset-declaration --phase <当前相位>
+      #   cargo xtask dod-check
+      #   cargo xtask benchset-declaration
       #
-      # 两道都**带相位参数且默认 0**。默认值下它们豁免一切（0 相位没有任何条目到期），
-      # 所以即便接进来也证明不了什么；按真实相位跑则当前是红的：
+      # 相位真源已修（PHASE 文件 + xtask/src/phase.rs）：两道闸不传参数即按真实相位判，
+      # 「默认 0 豁免一切」已不存在。但按真实相位它们当前是红的：
       #   · dod-check --phase 7  → 9 pass / 40 fail / 50 na，40 条全是
       #     「no verifier registered」——§69 要求的 DoD→verifier→注错三段绑定，
       #     94 条里只登记了 5 条（crates/testkit/src/dod.rs 模块注释自陈「Phase 0 only」）。

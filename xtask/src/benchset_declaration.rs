@@ -303,11 +303,9 @@ fn owning_phase(spec_md: &str, set_id: &str, verdict_cell: &str) -> Option<u32> 
 }
 
 fn parse_phase_arg(args: &[String]) -> u32 {
-    args.iter()
-        .position(|a| a == "--phase")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0)
+    // 见 dod_check::parse_phase_flag 的同款注释：真源在 `phase::current_phase`，
+    // 顺带修掉两处解析器各写各的（这里原先不认 `--phase=N` 形式）。
+    crate::phase::current_phase(args)
 }
 
 /// 一次完整判定的结果：`violations` 决定退出码，`na_list` 只是尚未到 owning phase 的附注。
@@ -690,12 +688,19 @@ mod tests {
         assert!(parse_declaration_table(&fixture).is_empty());
     }
 
+    /// `--phase` 覆盖仍然生效；**不传参数时读仓库根的 PHASE 真源，不再默认 0**。
+    /// 旧断言「默认 0」测的正是被审计判定为假绿根因的行为（默认 0 豁免一切 phase>0 条目），
+    /// 因此这条改成钉新契约：无参数 ⇒ 至少是已交付的相位 7。
     #[test]
-    fn parse_phase_arg_defaults_to_0_and_parses_flag() {
-        assert_eq!(parse_phase_arg(&[]), 0);
+    fn parse_phase_arg_reads_the_truth_source_and_honors_the_flag() {
         assert_eq!(
-            parse_phase_arg(&["--phase".to_string(), "7".to_string()]),
-            7
+            parse_phase_arg(&["--phase".to_string(), "3".to_string()]),
+            3
+        );
+        assert_eq!(parse_phase_arg(&["--phase=11".to_string()]), 11);
+        assert!(
+            parse_phase_arg(&[]) >= 7,
+            "无参数必须读 PHASE 真源（当前 7），不得退回 0"
         );
     }
 }
