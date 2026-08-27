@@ -327,6 +327,55 @@ pub struct EvalResult {
 
 /// 对已解析的声明表跑 §69 全部判据（恰 9 行 / 逐名对齐 / legacy marker / 七字段 / owning
 /// phase）。从 `run()` 抽出以便测试直接驱动 owning-phase 到期分支（无需解析 stdout/stderr）。
+/// §55.3.2（ADR-0007）分段声明的 BLOCKED_ON_SUT 面。规则只绑在 **declared** 行上（未声明
+/// 行已由 owning-phase 到期红覆盖，双报只是噪声）：
+/// - `BLOCKED_ON_SUT` 标注必须带 `unblock_phase=<N>`（缺 ⇒ 红：挡箭牌没有到期日）；
+/// - `current_phase >= unblock_phase` ⇒ 红（§55.3.2「自动转 DUE_UNDECLARED」的 CI 面；
+///   注错：把 unblock_phase 改小于当前 phase ⇒ 红）；
+/// - declared + BLOCKED_ON_SUT ⇒ `evals/<set_id>/blocked_stage_inventory.toml` 必须存在
+///   （§55.3.2 防挑软样本条款：被挡段的攻击清单与已声明段语料同一提交冻结；注错：删
+///   inventory 而行仍 DECLARED ⇒ 红）。
+fn blocked_on_sut_violations(
+    set_id: &str,
+    verdict_cell: &str,
+    declared: bool,
+    current_phase: u32,
+    manifest_root: Option<&Path>,
+) -> Vec<Violation> {
+    let mut out = Vec::new();
+    if !verdict_cell.contains("BLOCKED_ON_SUT") || !declared {
+        return out;
+    }
+    match int_after(verdict_cell, "unblock_phase=") {
+        None => out.push(Violation(format!(
+            "{set_id}: BLOCKED_ON_SUT 段未标 unblock_phase=<N>（§55.3.2：挡箭牌必须带到期日）"
+        ))),
+        Some(unblock) => {
+            if i64::from(current_phase) >= unblock {
+                out.push(Violation(format!(
+                    "{set_id}: BLOCKED_ON_SUT 段的 unblock_phase={unblock} 已到期（当前 phase \
+                     {current_phase}）——该段按 §55.3.2 转 DUE_UNDECLARED，行不得再以 scoped \
+                     DECLARED 通过"
+                )));
+            }
+        }
+    }
+    if let Some(root) = manifest_root {
+        let inventory = root
+            .join("evals")
+            .join(set_id)
+            .join("blocked_stage_inventory.toml");
+        if !inventory.exists() {
+            out.push(Violation(format!(
+                "{set_id}: scoped DECLARED 但被挡段的冻结清单不存在（{}）——§55.3.2 防挑软\
+                 样本条款要求它与已声明段语料同一提交冻结",
+                inventory.display()
+            )));
+        }
+    }
+    out
+}
+
 /// §55.3.1 manifest gate for one `DECLARED` row: the BenchmarkManifest file must exist and
 /// carry the frozen field set — "`BenchmarkManifest` 缺 source/version/license/hash 时同样
 /// 视为 NOT_DECLARED"，注错「删除 manifest ⇒ 红」以本函数落地（此前 checker 只读 spec 表
@@ -505,6 +554,15 @@ pub fn evaluate(
                 "{set_id}: 判定格出现禁用标记 {LEGACY_MARKER}"
             )));
         }
+
+        // §55.3.2（ADR-0007）：declared 行上的 BLOCKED_ON_SUT 标注三项校验。
+        violations.extend(blocked_on_sut_violations(
+            &set_id,
+            verdict_cell,
+            row_declared(row).0,
+            current_phase,
+            manifest_root,
+        ));
 
         // 绑定两处文本：continuation_198_v2 声明表行判 DECLARED，但 Continuation Gate 块抓不到
         // 合格实测数（NotMeasured）⇒ 红。DECLARED 意味着 baseline_min/spread_tol 已冻结落库，
@@ -910,6 +968,86 @@ mod tests {
                 .any(|v| v.0.contains("Continuation Gate 块抓不到")),
             "DECLARED row + unmeasured block must red: {:?}",
             result.violations
+        );
+    }
+
+    /// §55.3.2（ADR-0007）BLOCKED_ON_SUT 三项注错。合成一个 scoped-DECLARED 形态的
+    /// memory_security_lifecycle 行（七字段齐全 + 判定格带 BLOCKED_ON_SUT 标注），逐项驱动。
+    fn scoped_declared_msl_row(verdict: &str) -> Vec<String> {
+        vec![
+            "`memory_security_lifecycle`".to_string(),
+            "memory security lifecycle set（Write -> Recall -> Action -> Repair）".to_string(),
+            "30 = write 12 + recall 10 + repair 8".to_string(),
+            "精确相等".to_string(),
+            "resolution：1 题；spread_tol：0 题".to_string(),
+            "2026-08-27 / abcdef0".to_string(),
+            verdict.to_string(),
+        ]
+    }
+
+    /// 注错①：BLOCKED_ON_SUT 无 unblock_phase ⇒ 红（挡箭牌必须带到期日）。
+    #[test]
+    fn fault_blocked_on_sut_without_unblock_phase_is_red() {
+        let row = scoped_declared_msl_row(
+            "`DECLARED`（scoped）· owner=Security/Private Memory（Phase 4+）· Action=BLOCKED_ON_SUT",
+        );
+        assert!(row_declared(&row).0, "fixture row must parse declared");
+        let v = blocked_on_sut_violations("memory_security_lifecycle", &row[6], true, 8, None);
+        assert!(
+            v.iter().any(|x| x.0.contains("unblock_phase")),
+            "missing unblock_phase must red: {v:?}"
+        );
+    }
+
+    /// 注错②：unblock_phase 已到期 ⇒ 红（把 14 改成 7，当前 phase 8）。反向：14 未到期不红。
+    #[test]
+    fn fault_expired_unblock_phase_is_red_and_future_is_not() {
+        let expired = scoped_declared_msl_row(
+            "`DECLARED`（scoped）· Action=BLOCKED_ON_SUT unblock_phase=7 · owner=X（Phase 4+）",
+        );
+        let v = blocked_on_sut_violations("memory_security_lifecycle", &expired[6], true, 8, None);
+        assert!(
+            v.iter().any(|x| x.0.contains("已到期")),
+            "expired unblock_phase must red: {v:?}"
+        );
+        let future = scoped_declared_msl_row(
+            "`DECLARED`（scoped）· Action=BLOCKED_ON_SUT unblock_phase=14 · owner=X（Phase 4+）",
+        );
+        let v = blocked_on_sut_violations("memory_security_lifecycle", &future[6], true, 8, None);
+        assert!(
+            !v.iter().any(|x| x.0.contains("已到期")),
+            "future unblock_phase must not red: {v:?}"
+        );
+    }
+
+    /// 注错③（防挑软样本）：scoped-DECLARED 行但被挡段冻结清单不存在 ⇒ 红。
+    /// 未声明行不触发本组校验（owning-phase 到期红已覆盖，双报是噪声）。
+    #[test]
+    fn fault_missing_blocked_stage_inventory_is_red_only_when_declared() {
+        let verdict =
+            "`DECLARED`（scoped）· Action=BLOCKED_ON_SUT unblock_phase=14 · owner=X（Phase 4+）";
+        let row = scoped_declared_msl_row(verdict);
+        let v = blocked_on_sut_violations(
+            "memory_security_lifecycle",
+            &row[6],
+            true,
+            8,
+            Some(&repo_root()),
+        );
+        assert!(
+            v.iter().any(|x| x.0.contains("blocked_stage_inventory")),
+            "missing inventory must red on declared row: {v:?}"
+        );
+        let none = blocked_on_sut_violations(
+            "memory_security_lifecycle",
+            &row[6],
+            false,
+            8,
+            Some(&repo_root()),
+        );
+        assert!(
+            none.is_empty(),
+            "undeclared row must not double-report: {none:?}"
         );
     }
 

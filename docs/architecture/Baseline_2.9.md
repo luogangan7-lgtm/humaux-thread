@@ -9476,6 +9476,34 @@ grounding_evolution
 
 外部资料只帮助定义能力面；Humaux 的最终固定分母、fixture hash 与判定线仍以本 manifest 为准。
 
+## 55.3.2 分段（stage-scoped）声明——仅限显式声明了 stage 结构的集合（ADR-0007）
+
+一个集合的被测对象横跨多个交付 Phase 时（`memory_security_lifecycle` 的 Action 段 SUT 由
+DOD-036 排 phase=14，而集合 owner 是 Phase 4+），声明单位从「整集合」细化为「stage」：
+
+```text
+stage_status ∈ { DECLARED, DUE_UNDECLARED, BLOCKED_ON_SUT }
+
+BLOCKED_ON_SUT 合法性（缺一即视同 DUE_UNDECLARED，红）：
+  - 点名缺失的 sut_capability（可探测对象，ADR-0006 纪律）
+  - 点名 unblock_phase（= 该 SUT 的 DoD phase）
+  - 禁止携带任何七字段实测值（不许填 0 / N/A / 估值顶位）
+  - current_phase >= unblock_phase ⇒ 自动转 DUE_UNDECLARED（checker 强制）
+
+汇总禁令：任一 required stage != DECLARED ⇒ lifecycle_complete = false，
+该集合不得表述为「已通过安全评测」，aggregate 安全判定 = UNAVAILABLE。
+（依据外部先例：OWASP AI Exchange「未测 threat category 显式报告，coverage gap 即
+finding；retrieval 与 downstream action 分开测」；NIST AI RMF MEASURE 1.1；AgentPoison
+的 ASR-r/ASR-a/ASR-t 分层——3/4 段绿永远推不出第 4 段安全。）
+```
+
+owner-phase 义务由 declared_scope 内各段的分段声明满足（每段各自完整实测七字段）；
+lifecycle_complete 的验收仍归 DOD-036（phase=14），两者不再互相矛盾。
+
+**防挑软样本条款**：BLOCKED_ON_SUT 段的攻击样本清单（attack IDs、benign 近邻设计、
+§45.2 四向量覆盖、未来分母 inventory）必须与已声明段的语料**同一提交冻结**——禁止
+unblock 之后看系统表现再挑样本。注错：删掉 Action 段的冻结清单而三段仍 DECLARED ⇒
+checker 红。
 
 ## 55.4 判定线余量必须大于自报分辨率
 
@@ -11183,15 +11211,30 @@ G80-33：
 gate_id:      continuation_198_v2
 denominator:  198 = state 178 + fact 20        # 分层判定，禁止合并成一个总比例
 repeats:      3（种子 s1/s2/s3，同一 profile_fingerprint，§55.1 唯一构造函数）
-report:       每层 pass_items 的 min / max / spread(=max-min)，绝对题数；禁报均值，禁报比例
+report:       每层每 run 输出**逐题 verdict 向量**；报 min / max pass_items 与
+              spread(= max pairwise Hamming)，绝对题数；禁报均值，禁报比例（ADR-0007）
 量具自检:      spread > spread_tol ⇒ cannot_establish（先修量具，不判系统）
               spread_tol 未取数前：只报 spread 数值、本层不判定 —— 此时整闸已因
               baseline_min 未冻结输出 cannot_establish，不需要也不许再补一个猜的常数
-spread_tol:   重复性容差。量的是「同一系统重复 3 次的离散度」，至今未通过合格取数 ⇒ 块内不写冻结常数。
-              取数方式：baseline 那一次 3 seed 在【旧生产】上跑出的 state 层实测 spread，
-              与 baseline_min 同一次取数、同一个 frozen_by 一起写死，此后不得手改
-              首次取数 2026-08-27 得 state 极差 1 题（run{1,2,3} pass_items 135/134/134），但**未通过降级筛查**
+spread_tol:   重复性容差，字段全名 spread_tol_observed_n3。量的是「同一系统重复 3 次的
+              逐题离散度」：每 run 输出该层逐题 verdict 向量 V_r ∈ {0,1}^n，
+              spread = max_{i<j} Hamming(V_i, V_j)，单位 = 题（ADR-0007：pass_items 总分
+              极差会被正负翻转互相抵消骗成假 0，禁用；语义如实为 n=3 观测极差，不声称
+              总体上界——NIST 口径下 n=3 的观测极差对真离散度约束极弱，禁止拍脑袋安全
+              系数，要真上界只能加 repeats，登记 §56）。
+              取数方式：baseline 那一次 3 seed 在【旧生产】上跑出的 state 层实测 Hamming，
+              与 baseline_min 同一次取数、同一个 frozen_by 一起写死，此后不得手改。
+              首次取数 2026-08-27 得 state Hamming=1 题（run{1,2,3} pass_items 135/134/134，
+              逐题复算 Hamming ≡ 极差，唯一翻转题 state-项目进度-2），但**未通过降级筛查**
               （旧生产 json_out 不落 degraded 标记，无法自证无 rerank 降级污染）⇒ 不作冻结值，见 §69 声明表返工清单
+resolution:   state 层取数法冻结（ADR-0007）：第二系统 = recency 权重**局部扰动族**
+              （预冻结邻域 {λ, λ−5%, λ−10%, λ−20%, …, 0}，其余全部冻结——embedding /
+              候选池 / RRF / rerank / top_k / 语料 / 判定），取第一个产生稳定非零翻转的
+              **局部** mutant；stable_flip(q) := baseline 三 run verdict 一致 ∧ mutant 三
+              run verdict 一致 ∧ 两者不同；resolution = stable_flip 计数，且要求
+              between-system disagreement > within-system disagreement 才可宣称分辨。
+              否决轴：换 embedding（量产品差距）、收 top_k（改判定契约 = 改尺子刻度，
+              绝对禁止）、λ→0 整轴消融与去 rerank（feature ablation，只作 sanity check）。
 Δ:            判定步长 5 题。可达条件两条（详见块外第 2 条），缺一即 cannot_establish：
               ① Δ > max(resolution, spread_tol)                   # 步长要大过噪声
               ② baseline_min + Δ <= 178 且 baseline_min >= Δ      # 步长要够得着分母
@@ -11331,7 +11374,7 @@ set_id=<id> · fixed_denominator=<N>=<层1 n1 + 层2 n2> · decision_depth=<top_
 
 | set_id | §55 名称 | fixed_denominator | decision_depth | resolution / spread_tol | measured_at / frozen_by | 判定 |
 |---|---|---|---|---|---|---|
-| `continuation_198_v2` | Humaux 真实 continuation set | 198 = state 178 + fact 20 | top_k=5 | `resolution`：全集 4 题（实测，§1 前言「现实分母」）· state / fact **分层均未实测**（本节 11214 明定：全集读数未分层「本身即 NOT_DECLARED 一项」，禁用全集上界顶替 state 层）；`spread_tol`：首次取数得 state 极差 1 题（旧生产 3 seed run{1,2,3} pass_items 135/134/134），但**未通过降级筛查**——旧生产 `continuation_eval.py` json_out 不落 `degraded` 标记，无法自证三次无 rerank 降级污染（run2/3 翻转题 rank 5→None 与降级签名同型），按 §55.3「禁止估值」不采信 | 2026-08-27 首次取数 / 待重取 | `NOT_DECLARED`（缺：state 层 `resolution` 实测、经降级筛查的 `spread_tol`/`baseline_min`、`frozen_by`。返工清单：① 重取只收 exit=0 的干净 run；② state 178 题固定集跑可区分第二系统 diff 实测 resolution，范式见 `exact_completeness`/`planner_predicate`） |
+| `continuation_198_v2` | Humaux 真实 continuation set | 198 = state 178 + fact 20 | top_k=5 | `resolution`：全集 4 题（实测，§1 前言「现实分母」）· state / fact **分层均未实测**（本节 11214 明定：全集读数未分层「本身即 NOT_DECLARED 一项」，禁用全集上界顶替 state 层）；`spread_tol`：首次取数得 state 极差 1 题（旧生产 3 seed run{1,2,3} pass_items 135/134/134），但**未通过降级筛查**——旧生产 `continuation_eval.py` json_out 不落 `degraded` 标记，无法自证三次无 rerank 降级污染（run2/3 翻转题 rank 5→None 与降级签名同型），按 §55.3「禁止估值」不采信 | 2026-08-27 首次取数 / 待重取 | `NOT_DECLARED`（缺：state 层 `resolution` 实测、经降级筛查的 `spread_tol`/`baseline_min`、`frozen_by`。返工清单：① 重取只收 exit=0 的干净 run，spread 按逐题 Hamming 取（ADR-0007）；② state 178 题固定集按 recency 权重局部扰动族实测 resolution（stable_flip 口径，见 Continuation Gate 块 resolution 行）） |
 | `longmemeval_style` | LongMemEval-style long-term set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · owner=Private Memory（Phase 4+） |
 | `agent_workflow_outcome` | agent workflow/outcome set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · owner=Continuity（Phase 8+） |
 | `code_retrieval` | code retrieval set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · owner=Code（Phase 11+） |
@@ -11339,7 +11382,7 @@ set_id=<id> · fixed_denominator=<N>=<层1 n1 + 层2 n2> · decision_depth=<top_
 | `project_continuity` | project continuity set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · owner=Continuity（Phase 8+） |
 | `public_provenance_revocation` | public provenance/revocation set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · conditional owner=Public（Phase 9/10） |
 | `planner_predicate` | planner_predicate set（§20.3 混淆矩阵） | 21 = evals/planner_predicate/dataset.tsv 全集（T6.1）。21 行里仅 10 行可判别（5 正例 + 3 标注负例 + 2 活负例）—— 其余 11 行（3 条 DIRECT_GET + 8 条 metadata 分类）在 `predicate_id()` 语义下不可能记 miss，只贡献分母；§20.3 的 15% 漏判上限因此在评测harness 里改记「已判别正例基数」而非原始 21（`crates/retrieval/tests/planner_predicate_eval.rs::confusion_matrix_meets_frozen_thresholds` 的 `judged_miss_rate`），避免 padding 行稀释容忍度；`fixed_denominator=21` 本身仍按 §55.3 冻结不改 | 精确相等 | `resolution`：1 题——**实测**，非由 `decision_depth` 推导：真跑了一个可区分的第二系统（`QUANTIFIERS` 去掉「哪些」的变体）与真系统在同一 21 题固定集上逐行 diff，观测到恰好 1 行翻转（`我们之前否掉过哪些方案`——数据集里唯一只靠该词命中量词门的问法），见 `crates/retrieval/tests/planner_predicate_eval.rs::resolution_is_measured_via_a_real_second_system_diff`；本集无分层。`spread_tol`：0 题（`decide()` 纯函数无 IO/随机性，同 profile 重复 3 次逐行比对完全一致，见 crates/retrieval/tests/planner_predicate_eval.rs::repeated_runs_have_zero_spread） | 2026-08-26 / 53c82a5 | `DECLARED` · owner=Retrieval（Phase 6+） |
-| `memory_security_lifecycle` | memory security lifecycle set（Write -> Recall -> Action -> Repair） | 未声明 | Write→Recall→Action→Repair | 未实测 | — | `NOT_DECLARED` · owner=Security/Private Memory（Phase 4+） |
+| `memory_security_lifecycle` | memory security lifecycle set（Write -> Recall -> Action -> Repair） | 未声明 | Write→Recall→Action→Repair | 未实测 | — | `NOT_DECLARED` · owner=Security/Private Memory（Phase 4+）——声明路径按 §55.3.2 分段（ADR-0007）：Write/Recall/Repair 三段各自实测七字段即满足 owner 义务；Action 段 BLOCKED_ON_SUT（sut=Context Renderer 分流/privileged action probe/consolidate disposition taint，unblock_phase=14=DOD-036），其攻击清单须与三段语料同一提交冻结；lifecycle_complete 归 DOD-036 |
 | `grounding_evolution` | evidence-version evolution / self-correction set | 未声明 | exact state + revalidation outcome | 未实测 | — | `NOT_DECLARED` · owner=Grounding/Code（Phase 11+） |
 
 - `resolution` 与 `spread_tol` **都必须实测，禁止估值**；两者取数法不同（前者量系统间差异，后者量同系统重复噪声），各自写在模板里，换系统或换 `profile_fingerprint` **两个都要重测**。**禁止拿其中一个的读数去填另一个** —— 此前把「重复 3 次取极差」当成 `resolution` 的实测法就是这个撞名，已按本章 Continuation Gate 作废。
