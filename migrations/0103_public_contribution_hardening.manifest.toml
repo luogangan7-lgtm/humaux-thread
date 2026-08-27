@@ -1,0 +1,91 @@
+# §46.1 migration manifest. §12/§13/Phase 9 contribution-schema hardening over 0010's
+# skeleton: pure DDL (columns + CHECKs on zero-row tables, one zero-row DROP/CREATE
+# reshape, two new tables), no DML.
+
+migration_id = "0103_public_contribution_hardening"
+class = "EXPAND_CONTRACT"
+
+# Zero rows is load-bearing three times over: the NOT NULL adds on contribution_releases
+# and on ops.source_acquisition_jobs (0008 skeleton) carry no DEFAULT (nothing to
+# backfill), and the contribution_release_sources DROP/CREATE is a pure shape swap only
+# because there is no data to move. The column probe proves 0103 itself has not already
+# applied.
+precheck = """
+select (select count(*) from staging.contribution_releases) = 0
+   and (select count(*) from staging.contribution_release_sources) = 0
+   and (select count(*) from ops.source_acquisition_jobs) = 0
+   and (select count(*) from public.claims) = 0
+   and (select count(*) from public.sources) = 0
+   and (select count(*) from public.syntheses) = 0
+   and not exists (
+     select 1 from information_schema.columns
+     where table_schema='staging' and table_name='contribution_releases'
+       and column_name='policy_snapshot'
+   )
+   as precheck_ok
+"""
+
+postcheck = """
+select
+  (select count(*) from information_schema.columns
+   where table_schema='staging' and table_name='contribution_releases'
+     and column_name in ('policy_snapshot','state','revoked_at','privacy_scan_outcome',
+                         'secret_scan_outcome','rights_basis','source_license','publisher',
+                         'contributor_attestation','redistribution_policy')) = 10
+  and (select count(*) from information_schema.columns
+   where table_schema='staging' and table_name='contribution_release_sources'
+     and column_name in ('contribution_release_id','evidence_id','memory_id','ordinal')) = 4
+  and exists (select 1 from pg_policies
+   where schemaname='staging' and tablename='contribution_release_sources')
+  and (select count(*) from information_schema.columns
+   where table_schema='public' and table_name='claims'
+     and column_name in ('moderation_state','source_quality_class',
+                         'contributor_independence_class','support_weight','anomaly_score',
+                         'poisoning_flags')) = 6
+  and to_regclass('public.synthesis_inputs') is not null
+  and (select count(*) from information_schema.columns
+   where table_schema='ops' and table_name='source_acquisition_jobs'
+     and column_name in ('knowledge_gap_id','state','updated_at')) = 3
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: ALTER TABLE ops.source_acquisition_jobs
+            DROP COLUMN IF EXISTS updated_at, DROP COLUMN IF EXISTS state,
+            DROP COLUMN IF EXISTS knowledge_gap_id;  -- back to 0008's skeleton
+          DROP TABLE IF EXISTS public.synthesis_inputs;
+          ALTER TABLE public.claims
+            DROP COLUMN IF EXISTS poisoning_flags, DROP COLUMN IF EXISTS anomaly_score,
+            DROP COLUMN IF EXISTS support_weight,
+            DROP COLUMN IF EXISTS contributor_independence_class,
+            DROP COLUMN IF EXISTS source_quality_class, DROP COLUMN IF EXISTS moderation_state;
+          ALTER TABLE public.sources DROP CONSTRAINT IF EXISTS sources_source_type_closed;
+          DROP TABLE IF EXISTS staging.contribution_release_sources;
+          -- recreate 0010's skeleton shape + 0012's derived-tenant policy (0031 NULLIF form):
+          CREATE TABLE staging.contribution_release_sources (
+            contribution_release_id uuid NOT NULL REFERENCES staging.contribution_releases(contribution_release_id),
+            memory_id                 uuid NOT NULL REFERENCES private.memory_records(memory_id),
+            PRIMARY KEY (contribution_release_id, memory_id));
+          CREATE POLICY contribution_release_sources_tenant ON staging.contribution_release_sources
+            USING (EXISTS (SELECT 1 FROM staging.contribution_releases cr
+              WHERE cr.contribution_release_id = contribution_release_sources.contribution_release_id
+                AND cr.tenant_id = NULLIF(current_setting('humaux.tenant_id', true), '')::uuid))
+            WITH CHECK (EXISTS (SELECT 1 FROM staging.contribution_releases cr
+              WHERE cr.contribution_release_id = contribution_release_sources.contribution_release_id
+                AND cr.tenant_id = NULLIF(current_setting('humaux.tenant_id', true), '')::uuid));
+          ALTER TABLE staging.contribution_release_sources ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE staging.contribution_release_sources FORCE ROW LEVEL SECURITY;
+          ALTER TABLE staging.contribution_release_sources OWNER TO role_migration_owner;
+          ALTER TABLE staging.contribution_releases
+            DROP CONSTRAINT IF EXISTS contribution_releases_revoked_iff_timestamped,
+            DROP CONSTRAINT IF EXISTS contribution_releases_policy_closed,
+            DROP COLUMN IF EXISTS redistribution_policy, DROP COLUMN IF EXISTS contributor_attestation,
+            DROP COLUMN IF EXISTS publisher, DROP COLUMN IF EXISTS source_license,
+            DROP COLUMN IF EXISTS rights_basis, DROP COLUMN IF EXISTS secret_scan_outcome,
+            DROP COLUMN IF EXISTS privacy_scan_outcome, DROP COLUMN IF EXISTS revoked_at,
+            DROP COLUMN IF EXISTS state, DROP COLUMN IF EXISTS policy_snapshot;
+(安全性随「两张 staging 表是否仍为零行」变化：一旦真实 Release 落库，回滚会丢 policy
+snapshot / rights provenance / 撤销状态——§13 撤销审计链断裂。过了那个点用 forward fix。)
+"""
+
+backup_restore_requirement = "none（可证明零行的表上做 DDL + 零行 DROP/CREATE 重建，无数据风险）。标准部署前快照即可。"
