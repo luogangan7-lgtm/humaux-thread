@@ -101,24 +101,42 @@ pub const PHASE_3: &[DodVerifier] = &[DodVerifier {
 /// 无一通过对抗验证。
 pub const PHASE_4: &[DodVerifier] = &[];
 
-/// Phase 6 registrations。**只有一条**——其余 9 条仍是真缺口（集中在 §55 量具面与
-/// Envelope 出口层），宁可让 dod-check 报 fail 也不硬凑错映射。
-pub const PHASE_6: &[DodVerifier] = &[DodVerifier {
-    id: "DOD-012",
-    phase: 6,
-    // 判据链：§69「snapshot-bound selection 无漏/重」≡ §11.7 单事务 snapshot 配方
-    // ≡ §20.4 禁「活集合上的 OFFSET 分页」。
-    //
-    // verifier = 真实现的免疫证明（60 并发高排序插入下 snapshot 不漏不重）；
-    // fault = **可执行的坏变体**：offset_pagination_positive_control.rs 把 §20.4 禁的
-    // 形态逐字实现（跨事务 OFFSET 分页、页数按开始前 COUNT 预算），在页间确定性插行，
-    // 断言它**必然**同时漏与重（实测 duplicates=40 missed=40，0.3s，零竞态）。
-    // 此前这个注错只活在两个测试文件的模块注释里（「本地做过红转绿，坏变体刻意不
-    // 提交」）——只活在注释里的注错无人能复跑，历史见证不是判据。
-    fault: "banned_cross_txn_offset_pagination_exhibits_both_duplicates_and_misses",
-    kind: "test",
-    verifier_ref: "test::humaux-adapters::snapshot_survives_concurrent_higher_ranked_inserts",
-}];
+/// Phase 6 registrations。其余仍是真缺口（集中在 §55 量具面与 Envelope 出口层），宁可让
+/// dod-check 报 fail 也不硬凑错映射。
+pub const PHASE_6: &[DodVerifier] = &[
+    DodVerifier {
+        id: "DOD-012",
+        phase: 6,
+        // 判据链：§69「snapshot-bound selection 无漏/重」≡ §11.7 单事务 snapshot 配方
+        // ≡ §20.4 禁「活集合上的 OFFSET 分页」。
+        //
+        // verifier = 真实现的免疫证明（60 并发高排序插入下 snapshot 不漏不重）；
+        // fault = **可执行的坏变体**：offset_pagination_positive_control.rs 把 §20.4 禁的
+        // 形态逐字实现（跨事务 OFFSET 分页、页数按开始前 COUNT 预算），在页间确定性插行，
+        // 断言它**必然**同时漏与重（实测 duplicates=40 missed=40，0.3s，零竞态）。
+        // 此前这个注错只活在两个测试文件的模块注释里（「本地做过红转绿，坏变体刻意不
+        // 提交」）——只活在注释里的注错无人能复跑，历史见证不是判据。
+        fault: "banned_cross_txn_offset_pagination_exhibits_both_duplicates_and_misses",
+        kind: "test",
+        verifier_ref: "test::humaux-adapters::snapshot_survives_concurrent_higher_ranked_inserts",
+    },
+    DodVerifier {
+        id: "DOD-010",
+        phase: 6,
+        // §69「EXACT 查询的 total 来自权威 SQL census，而非召回结果」。
+        //
+        // verifier = exact_completeness_eval 的 e2e 真 census 电池：secret 扣减案
+        // (total=5 来自 count(*)、returned=4、excluded=1 ⇒ coverage 4/5) 逐字段证明 total
+        // 是 SQL count(*) 而非召回条数 returned——若 total=returned 则 coverage 恒 1.0、
+        // secret 扣减永不可见，该案必红。需 DB env（同 DOD-093，CI 声明 HUMAUX_REQUIRE_DB）。
+        // fault = completeness.rs 的构造层注错：`ExactEnumeration::new` 拒绝
+        // returned+excluded>total（召回条数超过自己的分母 = §22.1「分母内生」），从类型上
+        // 封死「用召回冒充 total」。
+        fault: "fault_recall_count_cannot_overrun_the_denominator",
+        kind: "test",
+        verifier_ref: "test::humaux-adapters::all_cases_match_expected_readouts",
+    },
+];
 
 /// Phase 8 registrations — §25 Context Products。
 pub const PHASE_8: &[DodVerifier] = &[DodVerifier {
