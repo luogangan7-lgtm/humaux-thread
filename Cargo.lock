@@ -690,6 +690,7 @@ dependencies = [
  "humaux-application",
  "humaux-domain",
  "humaux-infra-cell",
+ "humaux-infra-egress",
  "humaux-projection",
  "humaux-retrieval",
  "humaux-retrieval-provider",

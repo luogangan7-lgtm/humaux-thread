@@ -107,6 +107,8 @@ pub enum ExternalDep {
     Qdrant,
     /// 真 DashScope 出境（live egress 冒烟）。
     DashScope,
+    /// 真 MiniMax 出境（§11 BYOK 域 live 冒烟）。
+    MiniMax,
 }
 
 impl ExternalDep {
@@ -120,6 +122,7 @@ impl ExternalDep {
             Self::Postgres => std::env::var("HUMAUX_REQUIRE_DB"),
             Self::Qdrant => std::env::var("HUMAUX_REQUIRE_QDRANT"),
             Self::DashScope => std::env::var("HUMAUX_REQUIRE_DASHSCOPE"),
+            Self::MiniMax => std::env::var("HUMAUX_REQUIRE_MINIMAX"),
         };
         raw.is_ok_and(|v| v == "1")
     }
@@ -131,6 +134,7 @@ impl ExternalDep {
             Self::Postgres => "HUMAUX_REQUIRE_DB",
             Self::Qdrant => "HUMAUX_REQUIRE_QDRANT",
             Self::DashScope => "HUMAUX_REQUIRE_DASHSCOPE",
+            Self::MiniMax => "HUMAUX_REQUIRE_MINIMAX",
         }
     }
 }

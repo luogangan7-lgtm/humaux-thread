@@ -32,6 +32,9 @@ sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "r
 # established by humaux-application; this crate previously only pulled humaux-domain in as a
 # dev-dependency (test fixtures), promoted here to a real one for the same reason.
 humaux-domain = { path = "../domain" }
+# §11.1 BYOK 域的生产 transport（byok.rs::EgressHttpTransport -> infra-egress raw 出口）。
+# G80-3 把 infra-network 的依赖方钉死为 {infra-egress, infra-cell}，adapters 只能间接触达。
+humaux-infra-egress = { path = "../infra-egress" }
 # T4.8 `forget_repo.rs`: `DeletionStep`/`DeletionPlan` (§37) are pure types+logic that live in
 # humaux-application so they stay unit-testable without a database (§3/§78.3 — same
 # adapters-wraps-the-pure-crate direction as `humaux-projection` below for `stream_repo.rs`).

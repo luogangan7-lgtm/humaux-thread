@@ -417,8 +417,16 @@ impl PrivateInferenceContext {
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
+    /// `usage.prompt_tokens`。
     pub input_tokens: Option<u64>,
+    /// `usage.completion_tokens`。
     pub output_tokens: Option<u64>,
+    /// `usage.completion_tokens_details.reasoning_tokens`（推理模型吃掉的那部分——
+    /// M3 实测：`max_tokens` 太小时 reasoning 吃光预算，answer 为空而 HTTP 200）。
+    pub reasoning_tokens: Option<u64>,
+    /// `usage.prompt_tokens_details.cached_tokens`（DOD-059 cache-hit 记账的通道开口；
+    /// 目前只上报不持久化，ledger 侧的列是独立 EXPAND 任务）。
+    pub cached_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -685,6 +693,186 @@ pub trait OpenAiCompatTransport: Send + Sync {
 }
 
 // =============================================================================
+// Chat envelope 解析（§11.3 的 provider 侧错误通道在这里翻译）
+// =============================================================================
+
+/// `choices[0].message.content` + usage 四字段。
+struct ChatEnvelope {
+    content: String,
+    usage: TokenUsage,
+}
+
+/// 解析 OpenAI 形状的 chat envelope，**顺序即语义**：
+///
+/// 1. 整体不是 JSON ⇒ [`ReasoningProviderError::ProviderPermanent`]（端点坏了，重试无益）。
+///    注意这与旧行为不同：旧代码把"body 不是 JSON"判成 `FailedOutputSchema`——那是把
+///    端点故障算在模型输出头上，bounded repair 会白白重试一个坏端点。
+/// 2. `base_resp` 存在且 `status_code != 0` ⇒ [`classify_base_resp`]，**绝不往下走**。
+///    这是 MiniMax 的独立错误通道：HTTP 200 + 非零 status_code 是失败（实测：限流走
+///    200 + 2062，不走 429）。字段缺席（真 OpenAI 端点）⇒ 无害通过——判据是
+///    「存在且非零 = 错」这条**通用规则**，不引 provider-name 分支。
+/// 3. 取 `choices[0].message.content`；缺 ⇒ `ProviderPermanent`。
+///    **显式忽略 `message.reasoning_content`**：M3 实测 reasoning 可能落在这个独立字段，
+///    它绝不许漏进结构化输出。
+/// 4. 解析 usage 四字段（缺哪个哪个 `None`，不编造）。
+fn parse_chat_envelope(body: &[u8]) -> Result<ChatEnvelope, ReasoningProviderError> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| ReasoningProviderError::ProviderPermanent {
+            message: "malformed envelope: response body is not JSON".to_string(),
+        })?;
+
+    if let Some(base) = v.get("base_resp") {
+        let code = base.get("status_code").and_then(serde_json::Value::as_i64);
+        if let Some(code) = code
+            && code != 0
+        {
+            let msg = base
+                .get("status_msg")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            return Err(classify_base_resp(code, msg));
+        }
+    }
+
+    let content = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ReasoningProviderError::ProviderPermanent {
+            message: "malformed envelope: choices[0].message.content missing".to_string(),
+        })?
+        .to_string();
+
+    let usage = v.get("usage");
+    let get = |path: &[&str]| -> Option<u64> {
+        let mut cur = usage?;
+        for k in path {
+            cur = cur.get(k)?;
+        }
+        cur.as_u64()
+    };
+    Ok(ChatEnvelope {
+        content,
+        usage: TokenUsage {
+            input_tokens: get(&["prompt_tokens"]),
+            output_tokens: get(&["completion_tokens"]),
+            reasoning_tokens: get(&["completion_tokens_details", "reasoning_tokens"]),
+            cached_input_tokens: get(&["prompt_tokens_details", "cached_tokens"]),
+        },
+    })
+}
+
+/// MiniMax `base_resp.status_code` ⇒ §11.3 语义。**不加新枚举变体**，闭集复用：
+///
+/// - `1004`（鉴权失败）⇒ [`ReasoningProviderError::WaitingKey`]——BYOK 域里它与 HTTP 401
+///   同语义（§11.3：key 无效不是平台故障，是等新 key）。
+/// - `1002 | 1039 | 2062` ⇒ [`ReasoningProviderError::RetryWait`]。**`2062` 是实测的
+///   Token Plan 限流码，走 HTTP 200 + 空 content**（2026-07-29 教训）——漏掉它，
+///   限流会被判成永久错误，bounded repair 直接放弃。
+/// - 其余非零 ⇒ `ProviderPermanent` 带原文，fail-closed。
+///
+// ponytail: 码表 best-effort（四个码来自实测与既往教训）；对照官方码表校准是升级路径，
+// 但闸不依赖码表完备——任何非零码都不可能被当成功。
+fn classify_base_resp(status_code: i64, status_msg: &str) -> ReasoningProviderError {
+    match status_code {
+        1004 => ReasoningProviderError::WaitingKey { fingerprint: None },
+        1002 | 1039 | 2062 => ReasoningProviderError::RetryWait { retry_after: None },
+        code => ReasoningProviderError::ProviderPermanent {
+            message: format!("base_resp {code}: {status_msg}"),
+        },
+    }
+}
+
+/// 剥掉每个 `<think>…</think>` 段；**未闭合的 `<think>` 剥到串尾**——那是 `max_tokens`
+/// 太小、reasoning 吃光预算的实测形态（M3：HTTP 200、无任何错误标志、content 只有半截
+/// 思考块）。剥后的空串过不了 JSON 校验 ⇒ `FailedOutputSchema`——静默 200 转显式红。
+fn strip_think_blocks(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("</think>") {
+            Some(end_rel) => rest = &rest[start + end_rel + "</think>".len()..],
+            None => return out, // 未闭合：剥到串尾
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+// =============================================================================
+// 生产 transport：经 infra-egress 的 raw 出口
+// =============================================================================
+
+/// [`OpenAiCompatTransport`] 的第一个生产实现，底层是
+/// `humaux_infra_egress::raw::RawHttpPost`（Layer 1A 的 BYOK 域出口）。
+///
+/// 为什么不复用 `HttpExternalCall`：那是 PlatformManaged 域（§19）——它自己注
+/// `Authorization`、自己按 `status_classifier` 分类（401 = `Unauthorized`）。BYOK 域这
+/// 两件事都归本模块：明文 key 的唯一展开点在 [`OpenAiCompatibleProvider`] 的
+/// `build_openai_request`，401 的语义是 `WaitingKey`（§11.3）。
+pub struct EgressHttpTransport {
+    raw: humaux_infra_egress::raw::RawHttpPost,
+}
+
+impl EgressHttpTransport {
+    /// 构造。`request_timeout` 语义见 `RawHttpPost::new`。
+    ///
+    /// # Errors
+    /// 底层 client 构造失败 ⇒ [`ReasoningProviderError::Transport`]。
+    pub fn new(request_timeout: Duration) -> Result<Self, ReasoningProviderError> {
+        humaux_infra_egress::raw::RawHttpPost::new(request_timeout)
+            .map(|raw| Self { raw })
+            .map_err(|e| ReasoningProviderError::Transport(format!("{e:?}")))
+    }
+}
+
+#[async_trait::async_trait]
+impl OpenAiCompatTransport for EgressHttpTransport {
+    async fn send(
+        &self,
+        request: OpenAiHttpRequest,
+        policy: &ssrf::CustomEndpointPolicy,
+    ) -> Result<OpenAiHttpOutcome, ReasoningProviderError> {
+        use humaux_infra_egress::raw::RawSendError;
+        // `HeaderValue::expose()` 只在本函数局部展开，随 `headers` 一起在 send 结束后落地
+        // ——与 `build_openai_request` 的单点纪律衔接（§11.1）。
+        let headers: Vec<(String, String)> = request
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.expose().to_string()))
+            .collect();
+        let outcome = self
+            .raw
+            .send(
+                &request.url,
+                &headers,
+                request.body,
+                usize::try_from(policy.max_response_bytes).unwrap_or(usize::MAX),
+            )
+            .await
+            .map_err(|e| match e {
+                // §11.3：超时是 transient——`RetryWait{None}`，不是永久故障。
+                RawSendError::Timeout => ReasoningProviderError::RetryWait { retry_after: None },
+                RawSendError::NonHttpsEndpoint => {
+                    ReasoningProviderError::Transport("non-https endpoint".to_string())
+                }
+                RawSendError::BodyTooLarge { limit } => ReasoningProviderError::Transport(format!(
+                    "response body exceeded {limit} bytes"
+                )),
+                RawSendError::Network(msg) => ReasoningProviderError::Transport(msg),
+            })?;
+        Ok(OpenAiHttpOutcome {
+            status: outcome.status,
+            retry_after: outcome.retry_after,
+            body: outcome.body,
+        })
+    }
+}
+
+// =============================================================================
 // Generic OpenAI-compatible provider
 // =============================================================================
 
@@ -795,7 +983,7 @@ impl<T: OpenAiCompatTransport, D: CredentialDecryptor> OpenAiCompatibleProvider<
 /// ponytail: hand-built minimal JSON, no serde_json struct — this crate already depends on
 /// serde_json (email.rs) but the OpenAI chat-completions body shape is not yet frozen by any
 /// spec section this task owns; upgrade to a typed request struct once that shape is.
-fn structured_request_body(
+pub fn structured_request_body(
     descriptor: &ReasoningProviderDescriptor,
     request: &StructuredReasoningRequest,
 ) -> Vec<u8> {
@@ -839,25 +1027,18 @@ impl<T: OpenAiCompatTransport, D: CredentialDecryptor> UserReasoningProvider
             .require_capability(ReasoningCapability::StructuredOutput)?;
         let body = structured_request_body(&self.descriptor, &request);
         let bytes = self.send_once(ctx, body).await?;
-        let json = String::from_utf8(bytes)
-            .map_err(|e| ReasoningProviderError::Transport(e.to_string()))?;
-        // §11.3 "invalid structured output -> schema validation failure": this call's own
-        // contract is "does it even parse as JSON" (see `StructuredReasoningRequest::
-        // json_schema`'s doc for the full-conformance ceiling) — a caller doing bounded
-        // repair (`complete_structured_with_bounded_repair`) is the one that turns a schema
-        // mismatch into `FailedOutputSchema` after its budget is exhausted, not this method.
+        // envelope 解析（含 MiniMax base_resp 独立错误通道——HTTP 200 不等于成功）。
+        let envelope = parse_chat_envelope(&bytes)?;
+        // 剥 <think> 块（含未闭合形态：reasoning 吃光 max_tokens 的实测静默失败）。
+        let json = strip_think_blocks(&envelope.content);
+        // §11.3 "invalid structured output -> schema validation failure"：剥后必须还是
+        // JSON。剥后的空串在这里自然失败——不单设空检查，同一条判据覆盖两种坏法。
         if serde_json::from_str::<serde_json::Value>(&json).is_err() {
             return Err(ReasoningProviderError::FailedOutputSchema { attempts: 1 });
         }
-        // ponytail: `json` is the raw response body verbatim, not `choices[0].message.content`
-        // parsed out of the OpenAI envelope, and `usage` is always `TokenUsage::default()` —
-        // §11.5's TOKEN_USAGE capability has no real implementation yet. Upgrade: parse
-        // `choices[0].message.content` and `usage.{prompt,completion}_tokens` with
-        // `serde_json::Value` (already a dependency, already used two lines up for the parse
-        // check).
         Ok(StructuredReasoningResponse {
             json,
-            usage: TokenUsage::default(),
+            usage: envelope.usage,
         })
     }
 
@@ -1221,10 +1402,11 @@ mod tests {
                         body: Vec::new(),
                     })
                 } else {
+                    // envelope 形状（parse_chat_envelope 之后，裸 JSON body 不再是合法响应）。
                     Ok(OpenAiHttpOutcome {
                         status: 200,
                         retry_after: None,
-                        body: b"{\"ok\":true}".to_vec(),
+                        body: br#"{"choices":[{"message":{"content":"{\"ok\":true}"}}]}"#.to_vec(),
                     })
                 }
             }
@@ -1255,8 +1437,161 @@ mod tests {
         });
     }
 
+    /// 固定 envelope 的 transport——G1–G4 的共用夹具。
+    struct CannedTransport(&'static [u8]);
+    #[async_trait::async_trait]
+    impl OpenAiCompatTransport for CannedTransport {
+        async fn send(
+            &self,
+            _request: OpenAiHttpRequest,
+            _policy: &ssrf::CustomEndpointPolicy,
+        ) -> Result<OpenAiHttpOutcome, ReasoningProviderError> {
+            Ok(OpenAiHttpOutcome {
+                status: 200,
+                retry_after: None,
+                body: self.0.to_vec(),
+            })
+        }
+    }
+
+    async fn call_canned(
+        body: &'static [u8],
+    ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
+        let resolver = resolver_for(example_public_ip());
+        let provider = OpenAiCompatibleProvider::new(
+            descriptor(),
+            "https://api.example.com/v1/chat/completions".to_string(),
+            CannedTransport(body),
+            StaticDecryptor,
+            ssrf::CustomEndpointPolicy::default(),
+            &resolver,
+        )
+        .expect("valid endpoint");
+        let tenant = TenantId::new();
+        let c = ctx(tenant);
+        provider.complete_structured(&c, structured_request()).await
+    }
+
+    /// G1：**HTTP 200 不等于成功**——`base_resp.status_code != 0` 是 MiniMax 的独立错误
+    /// 通道（实测：限流走 200 + 2062，不走 429）。三个码各按 §11.3 语义分类。
+    /// 注错：注释掉 parse_chat_envelope 的 base_resp 分支 ⇒ body 是合法 envelope、content
+    /// 可解析 ⇒ Ok ⇒ 三条断言全红。
+    #[test]
+    fn g1_nonzero_base_resp_fails_even_with_http_200() {
+        rt().block_on(async {
+            let auth = call_canned(
+                br#"{"base_resp":{"status_code":1004,"status_msg":"auth failed"},"choices":[{"message":{"content":"{}"}}]}"#,
+            )
+            .await;
+            assert!(
+                matches!(auth, Err(ReasoningProviderError::WaitingKey { .. })),
+                "1004 是 BYOK 鉴权失败 = WaitingKey（§11.3），实得 {auth:?}"
+            );
+
+            let throttle = call_canned(
+                br#"{"base_resp":{"status_code":2062,"status_msg":"token plan rate limit"},"choices":[{"message":{"content":"{}"}}]}"#,
+            )
+            .await;
+            assert!(
+                matches!(throttle, Err(ReasoningProviderError::RetryWait { .. })),
+                "2062 是实测限流码（HTTP 200 形态）——判成永久错误会让 bounded repair 直接\
+                 放弃，实得 {throttle:?}"
+            );
+
+            let unknown = call_canned(
+                br#"{"base_resp":{"status_code":9999,"status_msg":"?"},"choices":[{"message":{"content":"{}"}}]}"#,
+            )
+            .await;
+            assert!(
+                matches!(unknown, Err(ReasoningProviderError::ProviderPermanent { .. })),
+                "未知非零码 fail-closed 落 ProviderPermanent，实得 {unknown:?}"
+            );
+        });
+    }
+
+    /// G2：`<think>` 块必须剥掉，剥后才是结构化输出。
+    /// 注错：strip_think_blocks 改恒等返回 ⇒ 整串非法 JSON ⇒ FailedOutputSchema ⇒ 红。
+    #[test]
+    fn g2_think_blocks_are_stripped_from_the_structured_output() {
+        rt().block_on(async {
+            let resp = call_canned(
+                br#"{"choices":[{"message":{"content":"<think>reasoning here</think>{\"answer\":4}"}}]}"#,
+            )
+            .await
+            .expect("剥掉 think 块之后是合法 JSON");
+            assert_eq!(resp.json, r#"{"answer":4}"#);
+            assert!(!resp.json.contains("<think>"));
+        });
+    }
+
+    /// G3：**未闭合的 `<think>`**——max_tokens 太小、reasoning 吃光预算的实测形态：
+    /// HTTP 200、base_resp=0、无任何错误标志、content 只有半截思考块。必须变显式红
+    /// （FailedOutputSchema），不许把半截思考块当成结构化输出交出去。
+    /// 注错：删掉剥后 JSON 校验、直接 Ok 包裹 ⇒ 返回 Ok("") ⇒ 红。
+    #[test]
+    fn g3_an_unterminated_think_block_is_a_loud_schema_failure_not_silent_200() {
+        rt().block_on(async {
+            let r = call_canned(
+                br#"{"choices":[{"message":{"content":"<think>The user is asking me to"}}]}"#,
+            )
+            .await;
+            assert!(
+                matches!(r, Err(ReasoningProviderError::FailedOutputSchema { .. })),
+                "reasoning 吃光预算的静默 200 必须转显式 schema 失败，实得 {r:?}"
+            );
+        });
+    }
+
+    /// G4：usage 四字段逐一解析为精确值（含 reasoning/cached 两个嵌套字段）。
+    /// 注错：解析回退 TokenUsage::default() ⇒ 四条断言红。
+    #[test]
+    fn g4_usage_fields_are_parsed_not_defaulted() {
+        rt().block_on(async {
+            let resp = call_canned(
+                br#"{"choices":[{"message":{"content":"{}"}}],"usage":{"prompt_tokens":10,"completion_tokens":57,"completion_tokens_details":{"reasoning_tokens":50},"prompt_tokens_details":{"cached_tokens":3}}}"#,
+            )
+            .await
+            .expect("合法 envelope");
+            assert_eq!(resp.usage.input_tokens, Some(10));
+            assert_eq!(resp.usage.output_tokens, Some(57));
+            assert_eq!(resp.usage.reasoning_tokens, Some(50));
+            assert_eq!(resp.usage.cached_input_tokens, Some(3));
+        });
+    }
+
+    /// 语义修正的另一半：body **整体**不是 JSON = 端点坏了 = ProviderPermanent。
+    /// 旧行为把它判成 FailedOutputSchema，bounded repair 会拿预算白白重试一个坏端点。
+    #[test]
+    fn non_json_body_is_provider_permanent_not_schema_failure() {
+        rt().block_on(async {
+            let r = call_canned(b"not json at all").await;
+            assert!(
+                matches!(r, Err(ReasoningProviderError::ProviderPermanent { .. })),
+                "坏端点不该消耗 repair 预算，实得 {r:?}"
+            );
+        });
+    }
+
+    /// `reasoning_content` 独立字段（M3 实测形态之一）绝不许漏进结构化输出。
+    #[test]
+    fn reasoning_content_side_field_never_reaches_the_output() {
+        rt().block_on(async {
+            let resp = call_canned(
+                br#"{"choices":[{"message":{"content":"{\"a\":1}","reasoning_content":"secret chain of thought"}}]}"#,
+            )
+            .await
+            .expect("合法 envelope");
+            assert_eq!(resp.json, r#"{"a":1}"#);
+            assert!(!resp.json.contains("chain of thought"));
+        });
+    }
+
     #[test]
     fn failed_output_schema_after_budget_exhausted() {
+        // 语义修正（parse_chat_envelope 落地时同步）：body 整体不是 JSON = **端点坏了**
+        // = ProviderPermanent，bounded repair 不该拿预算重试一个坏端点——那个情形由下面的
+        // `non_json_body_is_provider_permanent_not_schema_failure` 单独钉。本条测的是
+        // 「envelope 合法但**模型输出**不是 JSON」——这才是 FailedOutputSchema 的语义。
         struct GarbageBodyTransport(AtomicU32);
         #[async_trait::async_trait]
         impl OpenAiCompatTransport for GarbageBodyTransport {
@@ -1269,7 +1604,7 @@ mod tests {
                 Ok(OpenAiHttpOutcome {
                     status: 200,
                     retry_after: None,
-                    body: b"not json".to_vec(),
+                    body: br#"{"choices":[{"message":{"content":"not json"}}]}"#.to_vec(),
                 })
             }
         }
