@@ -434,6 +434,16 @@ impl MandatoryLane {
             .iter()
             .fold(0u32, |acc, r| acc.saturating_add(r.est_tokens))
     }
+
+    /// 拆成 `(expected, rows)` 交给装配层。
+    ///
+    /// [`MandatoryRow`] 刻意不实现 `Clone`（见它的 doc），所以装配层要把行放进最终 Context
+    /// 就必须**拿走所有权**——`self` 按值消费。副作用正是想要的：一条 lane 只能被装配一次，
+    /// 装完之后调用方手里没有第二份可以再塞进别处。
+    #[must_use]
+    pub fn into_parts(self) -> (u64, Vec<MandatoryRow>) {
+        (self.expected, self.rows)
+    }
 }
 
 /// §25.4 步骤 5 的产物。形状同 [`MandatoryLane`]，但**没有 `missing`**：
@@ -468,6 +478,12 @@ impl PinnedLane {
         self.rows
             .iter()
             .fold(0u32, |acc, r| acc.saturating_add(r.est_tokens))
+    }
+
+    /// 拿走行。理由同 [`MandatoryLane::into_parts`]。
+    #[must_use]
+    pub fn into_rows(self) -> Vec<MandatoryRow> {
+        self.rows
     }
 }
 

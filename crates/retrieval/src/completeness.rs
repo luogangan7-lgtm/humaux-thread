@@ -85,7 +85,7 @@ impl CompletenessClass {
     /// §23.3 wire label pair (`class`, `reason`) — `reason` is `"none"` for every class except
     /// `CannotEstablish`. This is the single place the counter's label strings and any future
     /// JSON `class` string share a source, so the two cannot drift apart.
-    fn wire_labels(self) -> (&'static str, &'static str) {
+    pub(crate) fn wire_labels(self) -> (&'static str, &'static str) {
         match self {
             Self::Exact => ("exact", "none"),
             Self::FacetComplete => ("facet_complete", "none"),
@@ -127,6 +127,31 @@ pub(crate) enum CannotEstablishReason {
     /// [`Self::IndexCountUnavailable`].
     #[allow(dead_code)]
     A2OvershootBeyondPending,
+    /// §25.5：Mandatory Context 自身超过硬上限。
+    ///
+    /// **这是唯一允许的结果**——§25.5 原文「禁止静默截掉后半段并仍声称 complete」。
+    /// 产出它的是 `domain::context::ContextBudget::reserve` 的 `Err` 臂，而
+    /// `MandatoryOverflow` 里**没有任何可返回的 Context**：截断不是不该做的操作，
+    /// 是那个臂里没有那个值可以返回。
+    MandatoryContextOverflow,
+}
+
+/// §25.5 的唯一映射：Mandatory Context 溢出 ⇒ `cannot_establish`。
+///
+/// 「mandatory overflow 只能 `cannot_establish`，不能静默截断」这句话在类型上的落点。
+/// 收 [`humaux_domain::context::MandatoryOverflow`] 而不是收一个 bool：那个类型只可能来自
+/// `ContextBudget::reserve` 的 `Err` 臂，所以**造不出一个"假装溢出"的调用**；而它里面
+/// 没有任何可返回的 Context，所以调用方在这条路径上也拿不到"截断后的前半段"。
+///
+/// 返回 [`CompletenessClass`] 而不是直接返回 reason：§25.5 要的是 class **和** reason
+/// 一起变，分开返回就给了「reason 记了但 class 还是 exact」这条静默通道。
+#[must_use]
+pub(crate) const fn overflow_class(
+    _overflow: &humaux_domain::context::MandatoryOverflow,
+) -> CompletenessClass {
+    CompletenessClass::CannotEstablish {
+        reason: CannotEstablishReason::MandatoryContextOverflow,
+    }
 }
 
 impl CannotEstablishReason {
@@ -138,6 +163,7 @@ impl CannotEstablishReason {
             Self::LaneFailed => "lane_failed",
             Self::IndexCountUnavailable => "index_count_unavailable",
             Self::A2OvershootBeyondPending => "a2_overshoot_beyond_pending",
+            Self::MandatoryContextOverflow => "mandatory_context_overflow",
         }
     }
 }
@@ -374,7 +400,7 @@ impl CompletenessTotal {
         "semantic_bounded",
         "cannot_establish",
     ];
-    const REASONS: [&'static str; 7] = [
+    const REASONS: [&'static str; 8] = [
         "none",
         "ledger_not_closed",
         "predicate_not_enumerable",
@@ -382,15 +408,20 @@ impl CompletenessTotal {
         "lane_failed",
         "index_count_unavailable",
         "a2_overshoot_beyond_pending",
+        "mandatory_context_overflow",
     ];
     const CELLS: usize = Self::CLASSES.len() * Self::REASONS.len();
 
-    // 28 cells, hand-written: `AtomicU64` isn't `Copy`, and a `[X; N]` repeat expression
+    // 32 cells (4 classes × 8 reasons), hand-written: `AtomicU64` isn't `Copy`, and a `[X; N]` repeat expression
     // needs a `const ZERO`, which trips `clippy::declare_interior_mutable_const` (same
     // rationale `DegradeTotal::new` already documents). Update by hand if `CLASSES` or
     // `REASONS` ever grows.
     const fn new() -> Self {
         Self([
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -529,6 +560,72 @@ pub fn classify_for_witness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **每个 reason label 都必须在指标格子里有位置。**
+    ///
+    /// `CompletenessTotal` 的 `AtomicU64` 数组是**手写展开**的（`AtomicU64` 不是 `Copy`，
+    /// `[X; N]` 重复表达式要一个 `const ZERO`，那会触 clippy 的
+    /// `declare_interior_mutable_const`）。所以 `REASONS` 加一个变体而数组没跟着加一格时，
+    /// `idx()` 的 `expect` 会在**运行时**炸——而且只在那个 reason 真被记一次的时候才炸，
+    /// 也就是最不该炸的时候。本条把它提前到编译-测试期。
+    ///
+    /// 顺带钉住 label 的唯一来源：格子的键取自 `wire_labels()`，与 JSON 同源，
+    /// 所以「指标 label 与 JSON 漂移」也在这里被拦。
+    #[test]
+    fn every_class_reason_pair_has_a_metric_cell() {
+        let mut seen = std::collections::BTreeSet::new();
+        for class in [
+            CompletenessClass::Exact,
+            CompletenessClass::FacetComplete,
+            CompletenessClass::SemanticBounded,
+        ] {
+            let (c, r) = class.wire_labels();
+            let idx = CompletenessTotal::idx(c, r);
+            assert!(
+                idx < CompletenessTotal::CELLS,
+                "{c}/{r} 的下标 {idx} 越界（CELLS={})",
+                CompletenessTotal::CELLS
+            );
+            seen.insert(idx);
+        }
+        // 七个 CannotEstablish reason 逐个走一遍。少一个变体这里就少一个 idx，
+        // 而 REASONS 与数组长度对不上时 `idx()` 会直接 panic。
+        for reason in [
+            CannotEstablishReason::LedgerNotClosed,
+            CannotEstablishReason::PredicateNotEnumerable,
+            CannotEstablishReason::CensusFailed,
+            CannotEstablishReason::LaneFailed,
+            CannotEstablishReason::IndexCountUnavailable,
+            CannotEstablishReason::A2OvershootBeyondPending,
+            CannotEstablishReason::MandatoryContextOverflow,
+        ] {
+            let (c, r) = CompletenessClass::CannotEstablish { reason }.wire_labels();
+            let idx = CompletenessTotal::idx(c, r);
+            assert!(
+                idx < CompletenessTotal::CELLS,
+                "{c}/{r} 的下标 {idx} 越界（CELLS={}）——REASONS 加了变体但手写数组没跟着加格",
+                CompletenessTotal::CELLS
+            );
+            seen.insert(idx);
+        }
+        assert_eq!(
+            seen.len(),
+            10,
+            "十个 (class, reason) 组合应当落在十个不同的格子里"
+        );
+    }
+
+    /// 数组长度必须等于 `CELLS`。手写展开漏加一格时，上面那条要等到那个 reason 真被用到
+    /// 才炸；这条在任何一次 `cargo test` 里都炸。
+    #[test]
+    fn the_hand_written_cell_array_matches_cells() {
+        let t = CompletenessTotal::new();
+        assert_eq!(
+            t.0.len(),
+            CompletenessTotal::CELLS,
+            "手写的 AtomicU64 数组长度与 CLASSES × REASONS 对不上"
+        );
+    }
     use crate::envelope::LaneStatus;
     use crate::planner::{DirectGetLocator, PlannerDecision, QueryClass};
 

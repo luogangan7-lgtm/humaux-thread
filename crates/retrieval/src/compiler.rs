@@ -1,1 +1,272 @@
-//! `retrieval::compiler` — 占位模块（T0.x 任务填充；出处见 DevPlan v1 与 §58）。
+//! `retrieval::compiler` — §25.4 冻结装配的步骤 6+7。
+//!
+//! **这是 G25-1 真正的被测对象**：全仓唯一同时握着 Mandatory/Pinned 两条 lane 与
+//! semantic 候选池的地方，也因此是唯一能把「Mandatory 被 rerank 淘汰」这个注错写进去的
+//! 地方。断言写在只握一条 lane 的函数上会是同义反复。
+//!
+//! 步骤 2–5 已在 domain 侧完成，本模块**结构上拿不到**绕过它们的路径：
+//! - 拿不到未经 reserve 的预算——[`SupplementalBudget`] 没有第二构造点；
+//! - 拿不到 Mandatory 行的分数——[`MandatoryRow`] 没有那个字段，而
+//!   `Candidate::new` 要一个 `f32`，`MandatoryRow` 交不出来。
+//!
+//! 所以「把 mandatory 混进排序」不是一条要靠评审拦住的写法，是写不出来的表达式。
+
+use humaux_domain::authority::MemoryId;
+use humaux_domain::context::{
+    MandatoryLane, MandatoryOverflow, MandatoryRow, PinnedLane, SupplementalBudget,
+};
+
+use crate::candidate::Candidate;
+
+/// 装配后的一项。三档来源在类型上分开，不是一个带 `kind` 字段的结构体——
+/// 分开之后「把 Supplemental 当成 Mandatory 上报」需要显式改一个变体名，
+/// 而不是改一个字段值。
+#[derive(Debug)]
+pub enum ContextItem {
+    /// §25.4 步骤 2：确定性 selector 选出的必带项。
+    Mandatory(MandatoryRow),
+    /// §25.4 步骤 5：用户/管理员显式钉住的。
+    Pinned(MandatoryRow),
+    /// §25.4 步骤 6：补充位，已过 RRF/rerank。
+    Supplemental(Candidate),
+}
+
+/// 装配结果。
+#[derive(Debug)]
+pub struct CompiledContext {
+    ordered: Vec<ContextItem>,
+    dropped_supplemental: Vec<String>,
+}
+
+impl CompiledContext {
+    /// 最终 Context，按 §25.4 的冻结顺序：Mandatory → Pinned → Supplemental。
+    #[must_use]
+    pub fn items(&self) -> &[ContextItem] {
+        &self.ordered
+    }
+
+    /// 实际进入 Context 的 Mandatory id。
+    ///
+    /// **从 `ordered` 里筛，不是把输入字段照抄回来。** 这一条把 G25-1 从同义反复变成真
+    /// 断言：照抄的话，即便装配阶段把 mandatory 全丢了，这里也照样报得出它们。
+    #[must_use]
+    pub fn mandatory_ids(&self) -> Vec<MemoryId> {
+        self.ordered
+            .iter()
+            .filter_map(|i| match i {
+                ContextItem::Mandatory(r) => Some(r.memory_id()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 实际进入 Context 的 Mandatory 条数。同样是从 `ordered` 数出来的。
+    #[must_use]
+    pub fn mandatory_returned(&self) -> u64 {
+        self.mandatory_ids().len() as u64
+    }
+
+    /// Pinned id，同上。
+    #[must_use]
+    pub fn pinned_ids(&self) -> Vec<MemoryId> {
+        self.ordered
+            .iter()
+            .filter_map(|i| match i {
+                ContextItem::Pinned(r) => Some(r.memory_id()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 因补充位预算不足而被丢掉的候选 id。
+    ///
+    /// **补充位可以被丢，且丢了必须说。** 这与 Mandatory 的溢出是两件事：后者根本不产出
+    /// Context（走 `Err` 臂），前者产出 Context 但把丢掉的列出来。
+    #[must_use]
+    pub fn dropped_supplemental(&self) -> &[String] {
+        &self.dropped_supplemental
+    }
+}
+
+/// §25.4 步骤 6+7。
+///
+/// 两条 lane 按值消费（[`MandatoryRow`] 不实现 `Clone`），所以装完之后调用方手里没有第二份
+/// 可以再塞进别处。`ranked` 是**已经过 RRF/rerank 的**候选池——本函数不排序、不打分，
+/// 它只按冻结顺序拼接并按预算截补充位。
+///
+/// 步骤 2–5 不经过 rerank：Mandatory 与 Pinned 在这里是**原样拼进去**的，中间没有任何
+/// 依赖 `ranked` 的判断。
+#[must_use]
+pub fn compile(
+    mandatory: MandatoryLane,
+    pinned: PinnedLane,
+    budget: SupplementalBudget,
+    ranked: Vec<Candidate>,
+) -> CompiledContext {
+    let (_expected, mandatory_rows) = mandatory.into_parts();
+    let pinned_rows = pinned.into_rows();
+
+    let mut ordered: Vec<ContextItem> =
+        Vec::with_capacity(mandatory_rows.len() + pinned_rows.len() + ranked.len());
+    ordered.extend(mandatory_rows.into_iter().map(ContextItem::Mandatory));
+    ordered.extend(pinned_rows.into_iter().map(ContextItem::Pinned));
+
+    // 补充位按预算贪心装，装不下的记名丢弃。
+    let mut remaining = budget.tokens();
+    let mut dropped = Vec::new();
+    for c in ranked {
+        let cost = c.estimated_rerank_tokens();
+        if cost <= remaining {
+            remaining -= cost;
+            ordered.push(ContextItem::Supplemental(c));
+        } else {
+            dropped.push(c.id().to_string());
+        }
+    }
+
+    CompiledContext {
+        ordered,
+        dropped_supplemental: dropped,
+    }
+}
+
+/// §25.4 步骤 4–7 的完整结果。
+///
+/// 溢出是**与 Context 并列的一个变体**，不是 `CompiledContext` 里的一个 flag：
+/// 后者会给出「带着 overflow 标记但仍然返回一份 Context」这条静默通道，而 §25.5 要的正是
+/// 那条路走不通。
+#[derive(Debug)]
+pub enum ContextOutcome {
+    /// 装配成功。
+    Compiled(CompiledContext),
+    /// §25.5 溢出。**这个变体里没有 Context**。
+    Overflow(MandatoryOverflow),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::candidate::Facet;
+    use humaux_domain::context::{ContextBudget, SelectorId, SelectorOutcome, spec};
+
+    fn m_row(tokens: u32) -> MandatoryRow {
+        let s = spec(SelectorId::ProjectActiveConstraintsV1);
+        MandatoryRow::from_selector(s, MemoryId::new(), s.min_authority, tokens)
+            .expect("min_authority 恰好达标")
+    }
+
+    fn lane(rows: Vec<MandatoryRow>, expected: u64) -> MandatoryLane {
+        MandatoryLane::from_selectors([
+            SelectorOutcome::Ran {
+                id: SelectorId::TaskExplicitContextV1,
+                expected: 0,
+                rows: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::ProjectActiveConstraintsV1,
+                expected,
+                rows,
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::UserConfirmedCorrectionsV1,
+                expected: 0,
+                rows: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::RequiredCurrentStateFacetsV1,
+                expected: 0,
+                rows: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::ExplicitMandatoryBindingsV1,
+                expected: 0,
+                rows: vec![],
+            },
+        ])
+        .expect("全部 Ran")
+    }
+
+    /// **G25-1 本体**：1 条 Mandatory + 200 条高分补充候选，无论补充位怎么排，
+    /// Mandatory 必须在 Context 里。
+    ///
+    /// 注错：把 `compile` 里 mandatory 的 `extend` 删掉 ⇒ 本条红。
+    /// 这条断言之所以不是同义反复，是因为 `mandatory_ids()` **从 ordered 里筛**——
+    /// 它读的是装配结果，不是输入。
+    #[test]
+    fn one_mandatory_survives_two_hundred_higher_scoring_supplementals() {
+        let row = m_row(10);
+        let target = row.memory_id();
+        let m = lane(vec![row], 1);
+        let p = PinnedLane::new(vec![]);
+
+        // 200 条分数远高于任何 mandatory 的候选（mandatory 根本没有分数——这正是重点）。
+        let noise: Vec<Candidate> = (0..200)
+            .map(|i| Candidate::new(format!("noise-{i}"), Facet::State, 0.999, 1))
+            .collect();
+
+        // 预算只够装一小部分补充位：淘汰压力拉满。
+        let budget = ContextBudget::new(60, 50)
+            .expect("budget")
+            .reserve(&m, &p)
+            .expect("10 <= 50，不该溢出");
+
+        let compiled = compile(m, p, budget, noise);
+        assert!(
+            compiled.mandatory_ids().contains(&target),
+            "无论补充位怎么排，Mandatory 必须出现在 Context（§25.4 步骤 2-5 不经淘汰）"
+        );
+        assert_eq!(compiled.mandatory_returned(), 1);
+        assert!(
+            !compiled.dropped_supplemental().is_empty(),
+            "预算显然装不下 200 条，必须有被丢弃的补充位——否则这条测试没有制造出淘汰压力"
+        );
+    }
+
+    /// 冻结顺序：Mandatory 在 Pinned 之前，Pinned 在 Supplemental 之前。
+    #[test]
+    fn frozen_assembly_order_is_mandatory_then_pinned_then_supplemental() {
+        let m = lane(vec![m_row(5)], 1);
+        let p = PinnedLane::new(vec![m_row(5)]);
+        let budget = ContextBudget::new(100, 50)
+            .expect("budget")
+            .reserve(&m, &p)
+            .expect("no overflow");
+        let compiled = compile(
+            m,
+            p,
+            budget,
+            vec![Candidate::new("s-1", Facet::State, 0.5, 1)],
+        );
+        let kinds: Vec<&str> = compiled
+            .items()
+            .iter()
+            .map(|i| match i {
+                ContextItem::Mandatory(_) => "M",
+                ContextItem::Pinned(_) => "P",
+                ContextItem::Supplemental(_) => "S",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["M", "P", "S"]);
+    }
+
+    /// 补充位丢弃必须记名。丢了不说 = 静默截断，只是发生在补充位上。
+    #[test]
+    fn dropped_supplementals_are_named_not_just_counted() {
+        let m = lane(vec![], 0);
+        let p = PinnedLane::new(vec![]);
+        let budget = ContextBudget::new(10, 5)
+            .expect("budget")
+            .reserve(&m, &p)
+            .expect("no overflow");
+        let compiled = compile(
+            m,
+            p,
+            budget,
+            vec![
+                Candidate::new("fits", Facet::State, 0.9, 3),
+                Candidate::new("too-big", Facet::State, 0.8, 999),
+            ],
+        );
+        assert_eq!(compiled.dropped_supplemental(), &["too-big".to_string()]);
+    }
+}

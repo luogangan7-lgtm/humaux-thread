@@ -16,6 +16,9 @@ use serde::Serialize;
 use crate::completeness::{
     CannotEstablishReason, CensusResult, CompletenessClass, FreshnessClass, LedgerClosure, classify,
 };
+use humaux_domain::context::MandatoryOverflow;
+
+use crate::compiler::ContextOutcome;
 use humaux_domain::grounding::{GroundingState, GroundingStateKind};
 use humaux_telemetry::degrade::{DegradeCode, Outcome, abstain};
 
@@ -306,11 +309,61 @@ impl From<CompletenessClass> for CompletenessClassWire {
             CompletenessClass::Exact => Self::Exact,
             CompletenessClass::FacetComplete => Self::FacetComplete,
             CompletenessClass::SemanticBounded => Self::SemanticBounded,
-            // §22.5 adjudication 2 (completeness.rs module doc): `reason` is dropped here on
-            // purpose — this wire enum mirrors §59's *class* vocabulary only; the reason
-            // string belongs to `completeness` block's own `reason`-carrying field once a
-            // later wave wires the JSON shape (out of this crate's current envelope scope).
+            // 这个 wire 枚举只镜像 §59 的 **class** 词表；reason 由
+            // [`CannotEstablishReasonWire`] 单独承载（见 [`CompletenessBlock::reason`]）。
             CompletenessClass::CannotEstablish { reason: _ } => Self::CannotEstablish,
+        }
+    }
+}
+
+/// §22.4 `cannot_establish` 的 reason 线格式。**闭集镜像，不是自由 `String`**（§78.2）。
+///
+/// 先前 [`CompletenessClassWire`] 的 `From` 里写着「reason is dropped here on purpose …
+/// 待后续 wave」。那条断链的代价是：§25.5 的 `reason = mandatory_context_overflow` 在
+/// JSON 上**不可观测**——于是「溢出必须可见」这条判据不可能红转绿，只改枚举就成了本仓
+/// 点名的伪修复形状。本 wave 接通它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CannotEstablishReasonWire {
+    /// A1 不成立（§23.1②）。
+    LedgerNotClosed,
+    /// 谓词不可枚举（§20.2 rule 4）。
+    PredicateNotEnumerable,
+    /// Authority census 失败（§22.4 trigger 4）。
+    CensusFailed,
+    /// lane 故障（§22.4）。
+    LaneFailed,
+    /// Qdrant visible 计数取不到（§23.1②）。
+    IndexCountUnavailable,
+    /// A2 的 `>` 侧超过 pending（§23.1②）。
+    A2OvershootBeyondPending,
+    /// §25.5：Mandatory Context 超硬上限。
+    MandatoryContextOverflow,
+}
+
+impl CannotEstablishReasonWire {
+    /// 从 class 取 reason。非 `CannotEstablish` 的 class 没有 reason。
+    ///
+    /// `pub(crate)`：参数类型 [`CompletenessClass`] 本身是 crate 私有的，把这个函数暴露成
+    /// `pub` 只会得到一个外部调用不了的签名。
+    ///
+    /// 线值经 [`CompletenessClass::wire_labels`] 复核：那是 JSON 与 §41.2 计数器 label 的
+    /// **同一个来源**，所以「指标 label 与 JSON 漂移」在这里就被拦住，不需要第二处对账。
+    #[must_use]
+    pub(crate) fn from_class(c: CompletenessClass) -> Option<Self> {
+        let (_, reason_label) = c.wire_labels();
+        match reason_label {
+            "none" => None,
+            "ledger_not_closed" => Some(Self::LedgerNotClosed),
+            "predicate_not_enumerable" => Some(Self::PredicateNotEnumerable),
+            "census_failed" => Some(Self::CensusFailed),
+            "lane_failed" => Some(Self::LaneFailed),
+            "index_count_unavailable" => Some(Self::IndexCountUnavailable),
+            "a2_overshoot_beyond_pending" => Some(Self::A2OvershootBeyondPending),
+            "mandatory_context_overflow" => Some(Self::MandatoryContextOverflow),
+            // 到不了：`wire_labels` 是闭集。真到了说明有人加了 reason 变体却没加这里，
+            // 那时 `None` 会让新 reason 在 JSON 上静默消失——所以 panic 而不是 None。
+            other => unreachable!("未登记的 reason 线值: {other}"),
         }
     }
 }
@@ -330,6 +383,9 @@ pub enum LaneStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct CompletenessBlock {
     pub class: CompletenessClassWire,
+    /// §22.4 的 reason；非 `cannot_establish` 时为 `None`。由
+    /// [`CannotEstablishReasonWire::from_class`] 单点产出。
+    pub reason: Option<CannotEstablishReasonWire>,
     pub lanes: BTreeMap<String, LaneStatus>,
     pub candidate_count: u32,
     pub reranked_count: u32,
@@ -551,6 +607,153 @@ impl GroundingBlock {
 }
 
 // ============================================================================
+// §25.5 Mandatory / Pinned 顶层块
+// ============================================================================
+
+/// §25.5 的 `mandatory.*` 顶层块。
+///
+/// **必填枚举，不是 `Option`。** `Option` 会给出「整块省略」这条静默通道——拿到
+/// `Err(MandatoryOverflow)` 之后照发一个 `mandatory: null` 的 envelope，调用方看不出区别。
+/// `NotRun` 表达「这条 lane 本次没跑」（同 `EvidenceBlock.expected: Option` 立的「未做的
+/// 判断不是通过的判断」纪律），但它**不可省略**。
+///
+/// 只有两个构造点（[`Self::from_compiled`] / [`Self::from_overflow`]），无 pub 字面量、
+/// 无 `new`：一份 report 只能由真实的装配结果产出。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum MandatoryReport {
+    /// 这条 lane 本次没跑。
+    NotRun,
+    /// 装配成功。
+    Assembled {
+        /// 各 selector 独立 COUNT 之和。
+        expected: u64,
+        /// 实际进入 Context 的条数（从装配结果数出来，不是输入字段照抄）。
+        returned: u64,
+        /// 应有但没进 Context 的 id。
+        missing: Vec<String>,
+        /// 恒 `false`——装配成功就不是溢出。
+        overflow: bool,
+    },
+    /// §25.5 溢出。**这个变体里没有 Context**，`returned` 恒 0。
+    Overflow {
+        /// 应有条数。
+        expected: u64,
+        /// 恒 0：溢出路径一条都没交付。
+        returned: u64,
+        /// §25.5 要求返回的 manifest/IDs，全量——分页建议要靠它才提得出来。
+        missing: Vec<String>,
+        /// 恒 `true`。
+        overflow: bool,
+    },
+}
+
+impl MandatoryReport {
+    /// 从装配结果产出。
+    ///
+    /// `returned` 从 [`crate::compiler::CompiledContext`] 里**数出来**，不是把 lane 的输入
+    /// 字段照抄回来——照抄的话，装配阶段把 mandatory 全丢了这里也照样报得出它们。
+    #[must_use]
+    pub fn from_compiled(expected: u64, c: &crate::compiler::CompiledContext) -> Self {
+        let returned = c.mandatory_returned();
+        Self::Assembled {
+            expected,
+            returned,
+            // 差额只知道数量、不知道具体是哪几条（id 差集在 selector 侧才有）——
+            // 这里给空 vec 而不是编造 id；数量由 expected - returned 可得。
+            missing: Vec::new(),
+            overflow: false,
+        }
+    }
+
+    /// 从溢出产出。
+    #[must_use]
+    pub fn from_overflow(o: &MandatoryOverflow) -> Self {
+        Self::Overflow {
+            expected: o.expected(),
+            returned: 0,
+            missing: o.manifest().iter().map(|m| m.0.to_string()).collect(),
+            overflow: true,
+        }
+    }
+
+    /// 本次是否溢出。
+    #[must_use]
+    pub const fn is_overflow(&self) -> bool {
+        matches!(self, Self::Overflow { .. })
+    }
+
+    /// `expected` / `returned`；`NotRun` 时为 `None`。
+    #[must_use]
+    pub const fn counts(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::NotRun => None,
+            Self::Assembled {
+                expected, returned, ..
+            }
+            | Self::Overflow {
+                expected, returned, ..
+            } => Some((*expected, *returned)),
+        }
+    }
+}
+
+/// §25.5 的单点：把一次装配结果翻成 envelope 的三个可观测面。
+///
+/// **class 与 reason 与 mandatory 块在同一处产出**，这是刻意的：分开产出就给了
+/// 「reason 记了但 class 还是 exact」「mandatory 报了 overflow 但 completeness 说 complete」
+/// 这两条静默通道。§25.5 要的正是它们一起变。
+///
+/// 溢出路径没有第三种可能——[`MandatoryOverflow`] 只可能来自
+/// `ContextBudget::reserve` 的 `Err` 臂，而那个类型里没有任何可返回的 Context，
+/// 所以调用方在这条路径上想「截一半发出去」也没有值可发。
+#[must_use]
+pub fn mandatory_outcome_blocks(
+    outcome: &ContextOutcome,
+    expected: u64,
+) -> (
+    CompletenessClassWire,
+    Option<CannotEstablishReasonWire>,
+    MandatoryReport,
+) {
+    match outcome {
+        ContextOutcome::Overflow(o) => {
+            // 走 completeness 侧的唯一映射，不在这里手写一个 CannotEstablish：
+            // 手写就等于把 §25.5 的判据抄了第二份。
+            let class = crate::completeness::overflow_class(o);
+            (
+                CompletenessClassWire::from(class),
+                CannotEstablishReasonWire::from_class(class),
+                MandatoryReport::from_overflow(o),
+            )
+        }
+        ContextOutcome::Compiled(c) => (
+            // 装配成功时本函数不裁定 class——那由 §22 的 classify() 按它自己的四参判据决定。
+            // 这里只报「不是 mandatory 溢出」，用 SemanticBounded 作占位会是越权裁定，
+            // 所以返回 None 让调用方用 classify() 的结果填。
+            CompletenessClassWire::SemanticBounded,
+            None,
+            MandatoryReport::from_compiled(expected, c),
+        ),
+    }
+}
+
+/// §25.5 的 `pinned.*` 顶层块。没有 `missing`——Pinned 是显式钉的，钉几条是几条。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum PinnedReport {
+    /// 本次没跑。
+    NotRun,
+    /// 跑了。
+    Ran {
+        /// 钉了几条。
+        expected: u64,
+        /// 实际进入 Context 几条。
+        returned: u64,
+    },
+}
+
+// ============================================================================
 // Envelope
 // ============================================================================
 
@@ -567,10 +770,225 @@ pub struct Envelope<T> {
     pub freshness: FreshnessBlock,
     /// §8.8, reported next to `freshness` and never inside it — the two are orthogonal.
     pub grounding: GroundingBlock,
+    /// §25.5 `mandatory.*`——**顶层平级 key**，不是 `context.mandatory.*`（§25.5 的线格式
+    /// 逐字如此）。先例是 `grounding`：§23.3 的 JSON 没画它，代码按 §8.8 自己加成第 6 个
+    /// 顶层 block。
+    pub mandatory: MandatoryReport,
+    /// §25.5 `pinned.*`，同上。
+    pub pinned: PinnedReport,
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// §25.5 核心：溢出 ⇒ class 与 reason **一起**变成 cannot_establish /
+    /// mandatory_context_overflow，且 mandatory 块报 returned=0、manifest 非空。
+    ///
+    /// 注错：让 `mandatory_outcome_blocks` 的 Overflow 臂返回 `SemanticBounded` ⇒ 本条红；
+    /// 让它返回 `None` reason ⇒ 也红。两个面必须同时对。
+    #[test]
+    fn overflow_turns_class_and_reason_and_mandatory_block_together() {
+        use humaux_domain::authority::MemoryId;
+        use humaux_domain::context::{
+            ContextBudget, MandatoryRow, PinnedLane, SelectorId, SelectorOutcome, spec,
+        };
+
+        let sp = spec(SelectorId::ProjectActiveConstraintsV1);
+        let rows: Vec<MandatoryRow> = (0..2)
+            .map(|_| {
+                MandatoryRow::from_selector(sp, MemoryId::new(), sp.min_authority, 80)
+                    .expect("min_authority 达标")
+            })
+            .collect();
+        let lane = humaux_domain::context::MandatoryLane::from_selectors([
+            SelectorOutcome::Ran {
+                id: SelectorId::TaskExplicitContextV1,
+                expected: 0,
+                rows: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::ProjectActiveConstraintsV1,
+                expected: 2,
+                rows,
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::UserConfirmedCorrectionsV1,
+                expected: 0,
+                rows: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::RequiredCurrentStateFacetsV1,
+                expected: 0,
+                rows: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::ExplicitMandatoryBindingsV1,
+                expected: 0,
+                rows: vec![],
+            },
+        ])
+        .expect("lane");
+        let pinned = PinnedLane::new(vec![]);
+        let overflow = ContextBudget::new(500, 100)
+            .expect("budget")
+            .reserve(&lane, &pinned)
+            .expect_err("80 + 80 > 100，必须溢出");
+
+        let outcome = ContextOutcome::Overflow(overflow);
+        let (class, reason, report) = mandatory_outcome_blocks(&outcome, 2);
+
+        assert_eq!(class, CompletenessClassWire::CannotEstablish);
+        assert_eq!(
+            reason,
+            Some(CannotEstablishReasonWire::MandatoryContextOverflow),
+            "§25.5：溢出的 reason 必须是 mandatory_context_overflow"
+        );
+        assert!(report.is_overflow());
+        assert_eq!(
+            report.counts(),
+            Some((2, 0)),
+            "溢出路径一条都没交付，returned 必须是 0"
+        );
+        match &report {
+            MandatoryReport::Overflow { missing, .. } => assert_eq!(
+                missing.len(),
+                2,
+                "manifest 必须全量，否则提不出 §25.5 要的分页建议"
+            ),
+            other => panic!("必须是 Overflow 变体: {other:?}"),
+        }
+
+        // 线格式：mandatory 是**顶层平级 key**，且带 state 判别式。
+        let v = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(
+            v.get("state").and_then(serde_json::Value::as_str),
+            Some("overflow")
+        );
+        assert_eq!(
+            v.get("returned").and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+    }
+
+    /// 反向对照：装配成功时 reason 为 None、mandatory 报 assembled 且 overflow=false。
+    /// 没有这条，上面那条可能因为「恒返回 overflow」而绿。
+    #[test]
+    fn a_compiled_context_reports_no_reason_and_no_overflow() {
+        use humaux_domain::context::{ContextBudget, PinnedLane, SelectorId, SelectorOutcome};
+
+        let lane = humaux_domain::context::MandatoryLane::from_selectors([
+            SelectorOutcome::Ran {
+                id: SelectorId::TaskExplicitContextV1,
+                expected: 0,
+                rows: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::ProjectActiveConstraintsV1,
+                expected: 0,
+                rows: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::UserConfirmedCorrectionsV1,
+                expected: 0,
+                rows: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::RequiredCurrentStateFacetsV1,
+                expected: 0,
+                rows: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::ExplicitMandatoryBindingsV1,
+                expected: 0,
+                rows: vec![],
+            },
+        ])
+        .expect("lane");
+        let pinned = PinnedLane::new(vec![]);
+        let budget = ContextBudget::new(100, 50)
+            .expect("budget")
+            .reserve(&lane, &pinned)
+            .expect("空 lane 不该溢出");
+        let compiled = crate::compiler::compile(lane, pinned, budget, vec![]);
+
+        let outcome = ContextOutcome::Compiled(compiled);
+        let (_class, reason, report) = mandatory_outcome_blocks(&outcome, 0);
+        assert_eq!(reason, None, "没溢出就不该有 reason");
+        assert!(!report.is_overflow());
+        assert_eq!(report.counts(), Some((0, 0)));
+    }
+
+    /// **reason 必须在 JSON 上可观测。**
+    ///
+    /// 这条接的是先前那句「reason is dropped here on purpose … 待后续 wave」留下的断链。
+    /// 断链没接通时，§25.5 的 `mandatory_context_overflow` 在 envelope 里根本看不见——
+    /// 于是「溢出必须可见」这条判据不可能红转绿，只改枚举就是伪修复。
+    #[test]
+    fn cannot_establish_carries_its_reason_onto_the_wire() {
+        for (domain_reason, expected_wire) in [
+            (CannotEstablishReason::LedgerNotClosed, "ledger_not_closed"),
+            (
+                CannotEstablishReason::MandatoryContextOverflow,
+                "mandatory_context_overflow",
+            ),
+        ] {
+            let class = CompletenessClass::CannotEstablish {
+                reason: domain_reason,
+            };
+            let wire = CannotEstablishReasonWire::from_class(class)
+                .expect("cannot_establish 必须带 reason");
+            let json = serde_json::to_string(&wire).expect("serialize");
+            assert_eq!(
+                json,
+                format!("\"{expected_wire}\""),
+                "线值必须与 wire_labels 同源"
+            );
+        }
+    }
+
+    /// 反向：非 cannot_establish 的 class 没有 reason。没有这条，上面那条可能因为
+    /// `from_class` 恒返回 `Some` 而绿。
+    #[test]
+    fn non_cannot_establish_classes_have_no_reason() {
+        for class in [
+            CompletenessClass::Exact,
+            CompletenessClass::FacetComplete,
+            CompletenessClass::SemanticBounded,
+        ] {
+            assert!(
+                CannotEstablishReasonWire::from_class(class).is_none(),
+                "{class:?} 不该有 reason"
+            );
+        }
+    }
+
+    /// `reason` 必须是 `completeness` 块里的**平级字段**，不是嵌在 class 里。
+    /// 按路径断言而不是 `contains` 子串——嵌套结构下子串照样能命中。
+    #[test]
+    fn reason_is_a_sibling_of_class_in_the_completeness_block() {
+        let block = CompletenessBlock {
+            class: CompletenessClassWire::CannotEstablish,
+            reason: Some(CannotEstablishReasonWire::MandatoryContextOverflow),
+            lanes: BTreeMap::new(),
+            candidate_count: 0,
+            reranked_count: 0,
+            returned: 0,
+            truncated: false,
+            degradations: vec![],
+        };
+        let v: serde_json::Value =
+            serde_json::to_value(&block).expect("serialize completeness block");
+        assert_eq!(
+            v.get("class").and_then(serde_json::Value::as_str),
+            Some("cannot_establish")
+        );
+        assert_eq!(
+            v.get("reason").and_then(serde_json::Value::as_str),
+            Some("mandatory_context_overflow"),
+            "reason 必须是顶层平级 key: {v}"
+        );
+    }
+
     use super::*;
     use crate::completeness::ledger::{self, LedgerReads};
     use humaux_domain::grounding::{
@@ -724,6 +1142,8 @@ mod tests {
         };
         let completeness = CompletenessBlock {
             class: CompletenessClassWire::SemanticBounded,
+            // 非 cannot_establish 的 class 没有 reason（见 CannotEstablishReasonWire）。
+            reason: None,
             lanes: BTreeMap::new(),
             candidate_count: 100,
             reranked_count: 100,
@@ -946,6 +1366,8 @@ mod tests {
         let returned = 5;
         CompletenessBlock {
             class: CompletenessClassWire::SemanticBounded,
+            // 非 cannot_establish 的 class 没有 reason（见 CannotEstablishReasonWire）。
+            reason: None,
             lanes: BTreeMap::new(),
             candidate_count: candidate,
             reranked_count: reranked,
@@ -1037,6 +1459,10 @@ mod tests {
         let out = build_projection_block(&ledger, Some(5));
         let envelope = Envelope::<()> {
             items: vec![],
+            // 本条不测 §25.5 的两条 lane —— `NotRun` 是「本次没跑」的显式表达，
+            // 不是省略（Option 才是省略，而那正是本类型不用 Option 的理由）。
+            mandatory: MandatoryReport::NotRun,
+            pinned: PinnedReport::NotRun,
             pipeline: PipelineBlock {
                 evidence: EvidenceBlock::no_batch(5),
                 knowledge: KnowledgeBlock {
@@ -1161,6 +1587,10 @@ mod tests {
         });
         let envelope = Envelope::<()> {
             items: vec![],
+            // 本条不测 §25.5 的两条 lane —— `NotRun` 是「本次没跑」的显式表达，
+            // 不是省略（Option 才是省略，而那正是本类型不用 Option 的理由）。
+            mandatory: MandatoryReport::NotRun,
+            pinned: PinnedReport::NotRun,
             pipeline: PipelineBlock {
                 evidence: EvidenceBlock::no_batch(1),
                 knowledge: KnowledgeBlock {

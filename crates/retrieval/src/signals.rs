@@ -337,6 +337,8 @@ mod tests {
     fn completeness_signal_is_a_view_not_a_recomputation() {
         let block = CompletenessBlock {
             class: CompletenessClassWire::Exact,
+            // 非 cannot_establish 的 class 没有 reason（见 CannotEstablishReasonWire）。
+            reason: None,
             lanes: Default::default(),
             candidate_count: 10,
             reranked_count: 10,
