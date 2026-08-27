@@ -101,8 +101,24 @@ pub const PHASE_3: &[DodVerifier] = &[DodVerifier {
 /// 无一通过对抗验证。
 pub const PHASE_4: &[DodVerifier] = &[];
 
-/// Phase 6 registrations —— 同上，10 条无一通过（缺口集中在 §55 量具面与 Envelope 出口层）。
-pub const PHASE_6: &[DodVerifier] = &[];
+/// Phase 6 registrations。**只有一条**——其余 9 条仍是真缺口（集中在 §55 量具面与
+/// Envelope 出口层），宁可让 dod-check 报 fail 也不硬凑错映射。
+pub const PHASE_6: &[DodVerifier] = &[DodVerifier {
+    id: "DOD-012",
+    phase: 6,
+    // 判据链：§69「snapshot-bound selection 无漏/重」≡ §11.7 单事务 snapshot 配方
+    // ≡ §20.4 禁「活集合上的 OFFSET 分页」。
+    //
+    // verifier = 真实现的免疫证明（60 并发高排序插入下 snapshot 不漏不重）；
+    // fault = **可执行的坏变体**：offset_pagination_positive_control.rs 把 §20.4 禁的
+    // 形态逐字实现（跨事务 OFFSET 分页、页数按开始前 COUNT 预算），在页间确定性插行，
+    // 断言它**必然**同时漏与重（实测 duplicates=40 missed=40，0.3s，零竞态）。
+    // 此前这个注错只活在两个测试文件的模块注释里（「本地做过红转绿，坏变体刻意不
+    // 提交」）——只活在注释里的注错无人能复跑，历史见证不是判据。
+    fault: "banned_cross_txn_offset_pagination_exhibits_both_duplicates_and_misses",
+    kind: "test",
+    verifier_ref: "test::humaux-adapters::snapshot_survives_concurrent_higher_ranked_inserts",
+}];
 
 /// Phase 7 registrations — §69 Retrieval 量具面。
 pub const PHASE_7: &[DodVerifier] = &[
