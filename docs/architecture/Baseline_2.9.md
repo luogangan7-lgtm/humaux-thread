@@ -11187,9 +11187,11 @@ report:       每层 pass_items 的 min / max / spread(=max-min)，绝对题数�
 量具自检:      spread > spread_tol ⇒ cannot_establish（先修量具，不判系统）
               spread_tol 未取数前：只报 spread 数值、本层不判定 —— 此时整闸已因
               baseline_min 未冻结输出 cannot_establish，不需要也不许再补一个猜的常数
-spread_tol:   重复性容差。量的是「同一系统重复 3 次的离散度」，至今未实测 ⇒ 块内不写常数。
+spread_tol:   重复性容差。量的是「同一系统重复 3 次的离散度」，至今未通过合格取数 ⇒ 块内不写冻结常数。
               取数方式：baseline 那一次 3 seed 在【旧生产】上跑出的 state 层实测 spread，
               与 baseline_min 同一次取数、同一个 frozen_by 一起写死，此后不得手改
+              首次取数 2026-08-27 得 state 极差 1 题（run{1,2,3} pass_items 135/134/134），但**未通过降级筛查**
+              （旧生产 json_out 不落 degraded 标记，无法自证无 rerank 降级污染）⇒ 不作冻结值，见 §69 声明表返工清单
 Δ:            判定步长 5 题。可达条件两条（详见块外第 2 条），缺一即 cannot_establish：
               ① Δ > max(resolution, spread_tol)                   # 步长要大过噪声
               ② baseline_min + Δ <= 178 且 baseline_min >= Δ      # 步长要够得着分母
@@ -11197,6 +11199,10 @@ FAIL:         state 层 baseline_min - new_min >= Δ
 PASS:         量具自检过 且 state 层 new_min >= baseline_min + Δ
 其余:         INCONCLUSIVE —— 不得勾选，不得表述为「不劣于基线」
 baseline_min: 旧生产同 198 题、同内容锚（§55.2）、重复 3 次的每层最小值；取数一次后写死，记 frozen_by=<commit>
+              首次取数 2026-08-27 得 state min = 134 题（min(135,134,134)），未采信（同 spread_tol：未过降级筛查）。
+              可达条件校验（benchset-declaration-check::continuation_reachability_violation）在 baseline_min/
+              spread_tol/Δ 三数齐备时独立重算 ①②；首次取数下 ①(5>max(4,1)) ②(134+5≤178 且 134≥5) 均成立，
+              但因 state 层 resolution 未分层实测（本节 11214）+ spread_tol 未过降级筛查，整闸仍 NOT_DECLARED
 ```
 
 - **`resolution` 与 `spread_tol` 是两个不同的量，不许互相顶替**（此前块内同时留着 `2` 和 `4`，就是把它们当同一个数在用）：
@@ -11325,7 +11331,7 @@ set_id=<id> · fixed_denominator=<N>=<层1 n1 + 层2 n2> · decision_depth=<top_
 
 | set_id | §55 名称 | fixed_denominator | decision_depth | resolution / spread_tol | measured_at / frozen_by | 判定 |
 |---|---|---|---|---|---|---|
-| `continuation_198_v2` | Humaux 真实 continuation set | 198 = state 178 + fact 20 | top_k=5 | `resolution`：全集 4 题（实测，§1 前言「现实分母」）· state / fact **分层均未实测**；`spread_tol`：两层均未实测 | 2026-08-24 / 待填 | `NOT_DECLARED`（缺 `frozen_by`、分层 `resolution`、两层 `spread_tol`） |
+| `continuation_198_v2` | Humaux 真实 continuation set | 198 = state 178 + fact 20 | top_k=5 | `resolution`：全集 4 题（实测，§1 前言「现实分母」）· state / fact **分层均未实测**（本节 11214 明定：全集读数未分层「本身即 NOT_DECLARED 一项」，禁用全集上界顶替 state 层）；`spread_tol`：首次取数得 state 极差 1 题（旧生产 3 seed run{1,2,3} pass_items 135/134/134），但**未通过降级筛查**——旧生产 `continuation_eval.py` json_out 不落 `degraded` 标记，无法自证三次无 rerank 降级污染（run2/3 翻转题 rank 5→None 与降级签名同型），按 §55.3「禁止估值」不采信 | 2026-08-27 首次取数 / 待重取 | `NOT_DECLARED`（缺：state 层 `resolution` 实测、经降级筛查的 `spread_tol`/`baseline_min`、`frozen_by`。返工清单：① 重取只收 exit=0 的干净 run；② state 178 题固定集跑可区分第二系统 diff 实测 resolution，范式见 `exact_completeness`/`planner_predicate`） |
 | `longmemeval_style` | LongMemEval-style long-term set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · owner=Private Memory（Phase 4+） |
 | `agent_workflow_outcome` | agent workflow/outcome set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · owner=Continuity（Phase 8+） |
 | `code_retrieval` | code retrieval set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · owner=Code（Phase 11+） |

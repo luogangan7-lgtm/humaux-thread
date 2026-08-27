@@ -170,14 +170,24 @@ fn valid_decision_depth(v: &str) -> bool {
     }
 }
 
-/// 合并列里某一子字段是否带独立的「题」量纲实测读数（不是裸占位符、不是只提了维度没给数）。
+/// 一处子字段自陈「未实测/未通过合格取数」的标记词。含任一即视为该字段**未声明**——哪怕
+/// 同段还写着一个「X 题」的读数。这堵掉「拿一个全集/占位读数糊弄，却在同段自陈分层未实测」
+/// 的假绿（对抗审查 finding 9：continuation 用全集 4 题填 state 层 resolution，同段却写
+/// 「分层均未实测」，旧判据只看有没有「题」+数字就放行）。
+const UNMEASURED_MARKERS: &[&str] = &["未实测", "未分层", "未通过", "未采信", "待重取", "待填"];
+
+/// 合并列里某一子字段是否带独立的、**未被未实测标记否定的**「题」量纲实测读数。
 fn has_dimensioned_reading(s: &str) -> bool {
+    if UNMEASURED_MARKERS.iter().any(|m| s.contains(m)) {
+        return false;
+    }
     s.contains('题') && s.bytes().any(|b| b.is_ascii_digit())
 }
 
 /// §69 冻结（spec ~11155）：`resolution` 与 `spread_tol` 合并列必须**分别标明**、各自带独立
 /// 实测读数，禁止拿一个数含糊过两个字段。按字面出现的 `spread_tol` 关键字切成两半分别校验；
-/// 找不到关键字（如整格只写「未实测」）即两者都算缺失。
+/// 找不到关键字（如整格只写「未实测」）即两者都算缺失。任一段带未实测自陈（§69:11214
+/// 「全集读数未分层，本身即 NOT_DECLARED 一项」）即判该字段缺失，即使段内另有读数。
 fn missing_resolution_spread_tol(cell: &str) -> Vec<&'static str> {
     let mut missing = Vec::new();
     match cell.find("spread_tol") {
@@ -367,6 +377,91 @@ fn manifest_violation(manifest_root: &Path, set_id: &str) -> Option<Violation> {
     }
 }
 
+/// 抽 `key` 标签**同一行内**、标签之后的第一个十进制整数。找不到标签、或标签所在行标签之后
+/// 无数字 ⇒ `None`。
+///
+/// 「同一行」是硬约束（不是注释愿望）：先把 `key` 之后的文本切到该行行尾，再在这一行里找数字。
+/// 早先版本用 `rest.find(digit)` 在标签之后**整段**找，标签同行无数字时会静默抓到下一行的
+/// 数字（如 md5 / 日期）——正是可达校验被绕过的通道（对抗审查 finding 6）。
+fn int_after(haystack: &str, key: &str) -> Option<i64> {
+    let idx = haystack.find(key)? + key.len();
+    let after = &haystack[idx..];
+    let line = &after[..after.find('\n').unwrap_or(after.len())];
+    let start = line.find(|c: char| c.is_ascii_digit())?;
+    let digits: String = line[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// 定位 §69 Continuation Gate 的 ```text 块（以 `gate_id:      continuation_198_v2` 那行为锚，
+/// 向前找最近的 ```text 围栏、向后找闭合 ``` ）。块不存在 ⇒ `None`（本 checker 域外，NA）。
+fn extract_continuation_gate_block(spec_md: &str) -> Option<&str> {
+    let anchor = spec_md.find("gate_id:")?;
+    let fence_open = spec_md[..anchor].rfind("```text")? + "```text".len();
+    let fence_close = spec_md[fence_open..].find("```")? + fence_open;
+    Some(&spec_md[fence_open..fence_close])
+}
+
+/// [`continuation_reachability_status`] 的三态：抓不到合格实测数 / 三数齐备且①②都过 /
+/// 三数齐备但某条破。分成三态（而非 `Option<Violation>`）是为了让调用方能区分「gate 块没填」
+/// 与「填了且算式过」——这两者在旧的 `Option` 形态里都是 `None`，于是「声明表行判 DECLARED
+/// 却把 gate 块改坏成无数字」这条假绿通道无从拦（对抗审查 finding 6）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReachabilityStatus {
+    /// gate 块不存在，或 `baseline_min` / `spread_tol` 抓不到（仍是「未实测」散文）——
+    /// gate 运行时 `cannot_establish`，本身不是 CI 红（除非声明表行同时判 DECLARED，见
+    /// [`evaluate`] 的绑定）。
+    NotMeasured,
+    /// 三数齐备且①②都成立。
+    Holds,
+    /// 三数齐备但①或②破。
+    Violated(String),
+}
+
+/// spec:11213/11215 可达条件①②：Continuation Gate 块声明 `baseline_min` / `spread_tol` / `Δ`
+/// 后独立重算——不读块里写的「✓」结论（那是作者自陈，正是要防的假绿通道），只抓原始声明
+/// 数值重算。resolution 用 §69 冻结的全集上界 4 题。
+/// - ① `Δ > max(resolution, spread_tol)`（步长大过噪声）
+/// - ② `baseline_min + Δ <= state_denominator` 且 `baseline_min >= Δ`（步长够得着分母两侧）
+fn continuation_reachability_status(spec_md: &str) -> ReachabilityStatus {
+    const RESOLUTION_UPPER: i64 = 4; // §69 全集上界（分层未实测）
+    let Some(block) = extract_continuation_gate_block(spec_md) else {
+        return ReachabilityStatus::NotMeasured;
+    };
+    // 实测锚：baseline_min 行 `实测 baseline_min state = N`、spread_tol 行 `实测 spread_tol = N`。
+    // 未填时（散文「首次取数…未采信」/「未通过合格取数」）这两个锚不存在 ⇒ NotMeasured。
+    let (Some(delta), Some(state_denom), Some(baseline_min), Some(spread_tol)) = (
+        int_after(block, "判定步长"),
+        int_after(block, "state "), // denominator 行 `198 = state 178 + ...`
+        int_after(block, "实测 baseline_min state ="),
+        int_after(block, "实测 spread_tol ="),
+    ) else {
+        return ReachabilityStatus::NotMeasured;
+    };
+
+    if delta <= RESOLUTION_UPPER.max(spread_tol) {
+        return ReachabilityStatus::Violated(format!(
+            "可达条件① 破——Δ={delta} 未大过 max(resolution={RESOLUTION_UPPER}, \
+             spread_tol={spread_tol})；步长被噪声淹没 ⇒ §69 应输出 cannot_establish"
+        ));
+    }
+    if baseline_min + delta > state_denom {
+        return ReachabilityStatus::Violated(format!(
+            "可达条件② 破——baseline_min({baseline_min}) + Δ({delta}) = {} > state 分母 \
+             {state_denom}；PASS 侧越过分母上界，不可达",
+            baseline_min + delta
+        ));
+    }
+    if baseline_min < delta {
+        return ReachabilityStatus::Violated(format!(
+            "可达条件② 破——baseline_min({baseline_min}) < Δ({delta})；FAIL 侧够不着，不可达"
+        ));
+    }
+    ReachabilityStatus::Holds
+}
+
 pub fn evaluate(
     spec_md: &str,
     table: &[Vec<String>],
@@ -392,6 +487,14 @@ pub fn evaluate(
         violations.push(v);
     }
 
+    // spec:11215：可达条件①② 与 frozen_by 同处校验（Continuation Gate 块声明数值后独立重算）。
+    // Violated（三数齐备但算式破）无条件红；NotMeasured 是否红取决于声明表行是否判 DECLARED，
+    // 在行循环里绑定（对抗审查 finding 6：两处独立文本必须绑，否则 DECLARED 行 + 坏块无红）。
+    let reachability = continuation_reachability_status(spec_md);
+    if let ReachabilityStatus::Violated(msg) = &reachability {
+        violations.push(Violation(format!("continuation_198_v2: {msg}")));
+    }
+
     let mut na_list: Vec<String> = Vec::new();
     for row in table {
         let set_id = row.first().map(|s| strip_backticks(s)).unwrap_or_default();
@@ -401,6 +504,22 @@ pub fn evaluate(
             violations.push(Violation(format!(
                 "{set_id}: 判定格出现禁用标记 {LEGACY_MARKER}"
             )));
+        }
+
+        // 绑定两处文本：continuation_198_v2 声明表行判 DECLARED，但 Continuation Gate 块抓不到
+        // 合格实测数（NotMeasured）⇒ 红。DECLARED 意味着 baseline_min/spread_tol 已冻结落库，
+        // gate 块必须有可被可达校验独立重算的数字；块被改坏/未填而表行仍 DECLARED 正是
+        // finding 6 的假绿通道。
+        if set_id == "continuation_198_v2"
+            && row_declared(row).0
+            && reachability == ReachabilityStatus::NotMeasured
+        {
+            violations.push(Violation(
+                "continuation_198_v2: 声明表行判 DECLARED，但 Continuation Gate 块抓不到合格的 \
+                 baseline_min/spread_tol 实测数——DECLARED 要求 gate 块带可独立重算可达①②的数值 \
+                 (§69)"
+                    .to_string(),
+            ));
         }
 
         // owner/conditional-owner 标注检查对**所有**行无条件跑（spec 11173「每行必须声明」是
@@ -566,6 +685,10 @@ mod tests {
         // (evals/exact_completeness/dataset.tsv, crates/adapters/tests/
         // exact_completeness_eval.rs) with measured resolution (1) and spread (0) — same
         // expiring-pin pattern as `planner_predicate` below.
+        // `continuation_198_v2` was rolled back to NOT_DECLARED (2026-08-27): its state-layer
+        // resolution is unmeasured (§69:11214 «全集读数未分层，本身即 NOT_DECLARED 一项») and
+        // its baseline never passed a degradation screen — so it is NOT exempt, it must parse
+        // as NOT_DECLARED like the other undeclared rows below.
         const DECLARED_EXEMPT: &[&str] = &["planner_predicate", "exact_completeness"];
         let spec = real_spec_md();
         let table = parse_declaration_table(&spec);
@@ -639,6 +762,155 @@ mod tests {
     fn continuation_owning_phase_resolves_to_dod_015_phase_7() {
         let spec = real_spec_md();
         assert_eq!(dod_owning_phase(&spec, "continuation_198_v2"), Some(7));
+    }
+
+    /// 合成的**完整**（已实测）Continuation Gate 块——四个可达锚齐全，供可达校验注错。用合成
+    /// 块而非真实 spec：真实 spec 的 continuation 已回退成 NOT_DECLARED、gate 块无实测锚，注错
+    /// 无从落在真实文本上。`base` 是一份①②都过的健康块（Δ=5, denom=178, baseline_min=134,
+    /// spread_tol=1），各注错在它之上改一处。
+    fn healthy_gate_block() -> String {
+        "```text\n\
+         gate_id:      continuation_198_v2\n\
+         denominator:  198 = state 178 + fact 20\n\
+         Δ:            判定步长 5 题\n\
+         spread_tol:   实测 spread_tol = 1 题\n\
+         baseline_min: 实测 baseline_min state = 134 题\n\
+         ```"
+        .to_string()
+    }
+
+    /// 健康块（134/1/Δ=5）：可达①② 均过 ⇒ Holds。
+    #[test]
+    fn healthy_gate_block_reachability_holds() {
+        assert_eq!(
+            continuation_reachability_status(&healthy_gate_block()),
+            ReachabilityStatus::Holds
+        );
+    }
+
+    /// 注错（spec:11215）：`Δ` 改成 178 ⇒ 可达条件②破（134+178 > 178）⇒ Violated。
+    #[test]
+    fn fault_delta_178_breaks_reachability_two() {
+        let broken = healthy_gate_block().replace("判定步长 5 题", "判定步长 178 题");
+        match continuation_reachability_status(&broken) {
+            ReachabilityStatus::Violated(m) => assert!(m.contains("可达条件②"), "got: {m}"),
+            other => panic!("Δ=178 must be Violated②, got {other:?}"),
+        }
+    }
+
+    /// 注错（spec:11215）：`Δ` 改成 1 ⇒ 可达条件①破（1 > max(4,1)=4 假）⇒ Violated。
+    #[test]
+    fn fault_delta_1_breaks_reachability_one() {
+        let broken = healthy_gate_block().replace("判定步长 5 题", "判定步长 1 题");
+        match continuation_reachability_status(&broken) {
+            ReachabilityStatus::Violated(m) => assert!(m.contains("可达条件①"), "got: {m}"),
+            other => panic!("Δ=1 must be Violated①, got {other:?}"),
+        }
+    }
+
+    /// 注错（对抗审查 finding 7）：②的 FAIL 侧子条件 `baseline_min < Δ` 独立注错——把
+    /// baseline_min 降到 3（< Δ=5），同时仍过①(5>max(4,1)=4)与②-PASS(3+5≤178)，只破 FAIL 侧。
+    /// 此前只有 Δ=178（②-PASS 侧）与 Δ=1（①）注错，L429 的 `baseline_min < delta` 分支零覆盖，
+    /// 删掉它全部单测仍绿——违反 §80.1「没注错红转绿不算存在」。
+    #[test]
+    fn fault_baseline_below_delta_breaks_reachability_two_fail_side() {
+        let broken =
+            healthy_gate_block().replace("baseline_min state = 134", "baseline_min state = 3");
+        match continuation_reachability_status(&broken) {
+            ReachabilityStatus::Violated(m) => {
+                assert!(m.contains("可达条件②") && m.contains("FAIL 侧"), "got: {m}");
+            }
+            other => panic!("baseline_min=3 < Δ=5 must be Violated②-FAIL, got {other:?}"),
+        }
+    }
+
+    /// baseline 未填（gate 块仍是「未实测」散文，抓不到实测锚）⇒ NotMeasured：gate 运行时
+    /// cannot_establish，本身不是 CI 红（除非声明表行同时 DECLARED，见下一测试）。
+    #[test]
+    fn unmeasured_baseline_is_not_measured() {
+        let synthetic = "```text\ngate_id:      continuation_198_v2\n\
+             denominator:  198 = state 178 + fact 20\n\
+             Δ:            判定步长 5 题\n\
+             spread_tol:   至今未实测 ⇒ 块内不写常数\n\
+             baseline_min: 取数一次后写死，记 frozen_by=<commit>\n```";
+        assert_eq!(
+            continuation_reachability_status(synthetic),
+            ReachabilityStatus::NotMeasured
+        );
+    }
+
+    /// 注错（对抗审查 finding 9）：resolution 段同时有「4 题」读数和「分层未实测」自陈 ⇒ 判
+    /// resolution 缺失。旧判据只看有没有「题」+数字，会被全集读数糊弄放行（continuation 用全集
+    /// 4 题填 state 层 resolution 却同段自陈分层未实测正是此形）。反向：干净分层实测不误伤。
+    #[test]
+    fn unmeasured_marker_negates_a_dimensioned_reading() {
+        let hoodwink = "`resolution`：全集 4 题（实测）· state/fact 分层均未实测；\
+                        `spread_tol`：state 1 题、fact 0 题";
+        assert!(
+            missing_resolution_spread_tol(hoodwink).contains(&"resolution"),
+            "全集读数 + 分层未实测自陈必须判 resolution 缺失"
+        );
+        let clean = "`resolution`：state 层 3 题、fact 层 2 题（实测）；\
+                     `spread_tol`：state 1 题、fact 0 题";
+        assert!(
+            !missing_resolution_spread_tol(clean).contains(&"resolution"),
+            "干净分层实测不得误伤"
+        );
+        assert!(!missing_resolution_spread_tol(clean).contains(&"spread_tol"));
+    }
+
+    /// 真实 spec：continuation 已回退成 NOT_DECLARED、gate 块无实测锚 ⇒ NotMeasured，且声明表
+    /// 行非 DECLARED ⇒ evaluate 不产生任何 continuation 可达违规。
+    #[test]
+    fn real_spec_continuation_is_not_measured_and_clean() {
+        let spec = real_spec_md();
+        assert_eq!(
+            continuation_reachability_status(&spec),
+            ReachabilityStatus::NotMeasured
+        );
+        let table = parse_declaration_table(&spec);
+        let result = evaluate(&spec, &table, 8, Some(&repo_root()));
+        assert!(
+            !result
+                .violations
+                .iter()
+                .any(|v| v.0.contains("可达条件") || v.0.contains("Continuation Gate 块抓不到")),
+            "NOT_DECLARED + unmeasured block must not red: {:?}",
+            result.violations
+        );
+    }
+
+    /// 注错（对抗审查 finding 6 兜底）：把声明表行改成 DECLARED（七字段填满形态）但 gate 块
+    /// 仍无实测锚（NotMeasured）⇒ 两处独立文本被绑定，evaluate 必须红。防「表行 DECLARED +
+    /// 坏块」这条假绿通道。
+    #[test]
+    fn declared_row_with_unmeasured_gate_block_is_red() {
+        let spec = real_spec_md();
+        let mut table = parse_declaration_table(&spec);
+        // 换掉真实 continuation 行为一个七字段齐全（=DECLARED）的形态；gate 块保持真实 spec 的
+        // 未实测散文（NotMeasured）。
+        for row in &mut table {
+            if strip_backticks(&row[0]) == "continuation_198_v2" {
+                *row = vec![
+                    "`continuation_198_v2`".to_string(),
+                    "Humaux 真实 continuation set".to_string(),
+                    "198 = state 178 + fact 20".to_string(),
+                    "top_k=5".to_string(),
+                    "resolution：4 题；spread_tol：1 题".to_string(),
+                    "2026-08-27 / e33913d".to_string(),
+                    "`DECLARED`（owning phase 由 DoD 反解 = 7）".to_string(),
+                ];
+            }
+        }
+        let result = evaluate(&spec, &table, 8, Some(&repo_root()));
+        assert!(
+            result
+                .violations
+                .iter()
+                .any(|v| v.0.contains("Continuation Gate 块抓不到")),
+            "DECLARED row + unmeasured block must red: {:?}",
+            result.violations
+        );
     }
 
     /// 注错：Phase 11 后 `code_retrieval`（owner=Code Phase 11+，仍 NOT_DECLARED）必须红——
