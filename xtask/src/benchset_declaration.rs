@@ -747,7 +747,13 @@ mod tests {
         // resolution is unmeasured (§69:11214 «全集读数未分层，本身即 NOT_DECLARED 一项») and
         // its baseline never passed a degradation screen — so it is NOT exempt, it must parse
         // as NOT_DECLARED like the other undeclared rows below.
-        const DECLARED_EXEMPT: &[&str] = &["planner_predicate", "exact_completeness"];
+        // `memory_security_lifecycle` joined 2026-08-27 as scoped-DECLARED (ADR-0007
+        // §55.3.2): Write/Recall/Repair measured, Action=BLOCKED_ON_SUT(phase=14).
+        const DECLARED_EXEMPT: &[&str] = &[
+            "planner_predicate",
+            "exact_completeness",
+            "memory_security_lifecycle",
+        ];
         let spec = real_spec_md();
         let table = parse_declaration_table(&spec);
         for row in &table {
@@ -1027,8 +1033,10 @@ mod tests {
         let verdict =
             "`DECLARED`（scoped）· Action=BLOCKED_ON_SUT unblock_phase=14 · owner=X（Phase 4+）";
         let row = scoped_declared_msl_row(verdict);
+        // 用一个不存在 inventory 的合成 set_id 驱动「缺失红」——真实 memory_security_lifecycle
+        // 的 inventory 已随本 wave 落地，不再是缺失态。
         let v = blocked_on_sut_violations(
-            "memory_security_lifecycle",
+            "synthetic_blocked_set_no_inventory",
             &row[6],
             true,
             8,
@@ -1039,7 +1047,7 @@ mod tests {
             "missing inventory must red on declared row: {v:?}"
         );
         let none = blocked_on_sut_violations(
-            "memory_security_lifecycle",
+            "synthetic_blocked_set_no_inventory",
             &row[6],
             false,
             8,
@@ -1048,6 +1056,27 @@ mod tests {
         assert!(
             none.is_empty(),
             "undeclared row must not double-report: {none:?}"
+        );
+    }
+
+    /// 窄度正对照：真实 spec 的 memory_security_lifecycle 行（scoped-DECLARED，inventory 已落地、
+    /// unblock_phase=14 未到期）经 evaluate 不得产生任何 BLOCKED_ON_SUT 违规——闸只红在该红的
+    /// 对象上（§57.1 精神）。
+    #[test]
+    fn real_msl_row_passes_blocked_on_sut_gate() {
+        let spec = real_spec_md();
+        let table = parse_declaration_table(&spec);
+        let result = evaluate(&spec, &table, 8, Some(&repo_root()));
+        assert!(
+            !result
+                .violations
+                .iter()
+                .any(|v| v.0.contains("memory_security_lifecycle")
+                    && (v.0.contains("BLOCKED_ON_SUT")
+                        || v.0.contains("unblock_phase")
+                        || v.0.contains("blocked_stage_inventory"))),
+            "real msl row must pass the scoped/BLOCKED_ON_SUT gate: {:?}",
+            result.violations
         );
     }
 

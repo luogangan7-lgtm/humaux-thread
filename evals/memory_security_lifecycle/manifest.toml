@@ -1,0 +1,19 @@
+# §55.3.1 BenchmarkManifest for memory_security_lifecycle (§45.2, ADR-0007 分段声明).
+# Write/Recall/Repair 三段各自分母；Action 段 BLOCKED_ON_SUT(phase=14)，样本冻结在
+# blocked_stage_inventory.toml，不进本 manifest 的实测分母。
+# Harness: crates/adapters/tests/memory_security_lifecycle_eval.rs
+
+set_id = "memory_security_lifecycle"
+source_kind = "internal"
+source_ref = "evals/memory_security_lifecycle/dataset.tsv"
+source_version = "434e92c"
+license = "internal-only, not redistributed"
+fixture_sha256 = "6815c1d058931846baafffc73efe6bcdc651edd6f66ae0490e3930976461a6c9"
+fixed_denominator = 14   # write 8 + recall 4 + repair 2（Action 段 BLOCKED，样本冻结不进实测分母）
+write_denominator = 8
+recall_denominator = 4
+repair_denominator = 2
+decision_depth = "exact_equality"
+profile_fingerprint_policy = "recompute if origin ceiling table (policy.rs) or the recall/forget path changes"
+measured_at = "2026-08-27"
+frozen_by = "434e92c"
