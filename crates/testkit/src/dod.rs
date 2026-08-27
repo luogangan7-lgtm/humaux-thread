@@ -105,14 +105,35 @@ pub const PHASE_4: &[DodVerifier] = &[];
 pub const PHASE_6: &[DodVerifier] = &[];
 
 /// Phase 7 registrations — §69 Retrieval 量具面。
-pub const PHASE_7: &[DodVerifier] = &[DodVerifier {
-    id: "DOD-017",
-    phase: 7,
-    // 判据链：§69 ≡ §55.1（bins/*、evals/* 出现第二处构造点即红）≡ §80.1 G80-2。
-    // 该闸在真仓当前是 not_applicable 并点名了缺失对象（retrieval::build_request 尚未
-    // 交付）——登记它是为了让这条 DoD 的欠账**可见**：dod-check 会照实报出来，而不是
-    // 因为「没登记」被混在 40 条无差别的 fail 里。
-    fault: "g80_2_fails_with_second_construction_site_in_real_evals_dir",
-    kind: "gate",
-    verifier_ref: "architecture-check::§55.1 G80-2 (build_request sole construction point)",
-}];
+pub const PHASE_7: &[DodVerifier] = &[
+    DodVerifier {
+        id: "DOD-020",
+        phase: 7,
+        // 判据链：§69「Mandatory/Pinned Context 不参与 semantic 淘汰；mandatory overflow
+        // 只能 cannot_establish，不能静默截断」≡ §25.4 步骤 2-5 不经 RRF/reranker ≡
+        // §25.5 溢出走 Err(MandatoryOverflow)。
+        //
+        // verifier = G25-1 本体（compiler.rs：1 条 Mandatory + 200 条高分噪声 + 预算压满，
+        // Mandatory 必须在 Context 里）；fault = 仓内可执行坏变体
+        // compile_dropping_mandatory 与真 compile 的观测值必须不同——注错不活在文档里。
+        //
+        // 曾有 spec 级 BLOCKER（2026-08-25）：「该 reason 经 classify() 构造不出来」。
+        // 解法不是改 classify() 的冻结四参签名，而是 completeness::overflow_class 单独
+        // 映射（IndexCountUnavailable 的同款先例：context 侧的 cannot-establish 由
+        // envelope 侧观测，classify() 看不见也不该看见）。
+        fault: "g25_1_fault_a_compile_that_drops_mandatory_is_visible_in_the_observable",
+        kind: "test",
+        verifier_ref: "test::humaux-retrieval::one_mandatory_survives_two_hundred_higher_scoring_supplementals",
+    },
+    DodVerifier {
+        id: "DOD-017",
+        phase: 7,
+        // 判据链：§69 ≡ §55.1（bins/*、evals/* 出现第二处构造点即红）≡ §80.1 G80-2。
+        // 该闸在真仓当前是 not_applicable 并点名了缺失对象（retrieval::build_request 尚未
+        // 交付）——登记它是为了让这条 DoD 的欠账**可见**：dod-check 会照实报出来，而不是
+        // 因为「没登记」被混在 40 条无差别的 fail 里。
+        fault: "g80_2_fails_with_second_construction_site_in_real_evals_dir",
+        kind: "gate",
+        verifier_ref: "architecture-check::§55.1 G80-2 (build_request sole construction point)",
+    },
+];

@@ -3052,7 +3052,211 @@ fn provider_plane_architecture_gate_checks(root: &Path) -> Vec<(&'static str, Ve
             "§11.10#G11-2 / G80-43 (Grounding validity / recheck debt)",
             g80_43_grounding_validity(root),
         ),
+        (
+            "§25.4 A1 (Candidate 唯一构造点)",
+            g25_4_candidate_sole_construction_point(root),
+        ),
+        (
+            "§25.4 A2 (context_bindings 唯一写入点)",
+            g25_4_binding_insert_sole_site(root),
+        ),
+        (
+            "§25.4 A3 (authorize_mandatory/pinned 唯一调用点)",
+            g25_4_authorize_sole_caller(root),
+        ),
     ]
+}
+
+/// 统计 `needle` 在**非注释行**上的出现次数，跳过本文件自身（它逐字包含这些片段作为判据）。
+/// 返回 `(总数, 逐文件明细)`。
+fn count_outside_allowed(root: &Path, needle: &str, allowed: &[&str]) -> (usize, Vec<String>) {
+    let mut total = 0usize;
+    let mut sites = Vec::new();
+    for (path, source) in read_files(&walk_files(root, &["rs"])) {
+        let disp = display(root, &path);
+        // 精确路径排除，**不按子串**：子串匹配会连带排除任何路径含该片段的文件
+        // （`candidate_helpers.rs` 之类），真违规藏进去就永远数不到（ADR-0006 决定 2）。
+        if disp.ends_with(SELF_FILE) || allowed.iter().any(|a| disp.ends_with(a)) {
+            continue;
+        }
+        // `crates/<pkg>/tests/*.rs` 是 cargo 的集成测试目录——**按路径结构判定**
+        // （第三段恰好是 `tests`），不是 `contains("/tests/")` 那种子串匹配：
+        // 结构判定不会把一个碰巧叫 tests 的业务目录也放行。夹具造候选/写 binding 不是
+        // 本闸要抓的违规，生产代码那么做才是。
+        let segments: Vec<&str> = disp.split('/').collect();
+        if segments.first() == Some(&"crates") && segments.get(2) == Some(&"tests") {
+            continue;
+        }
+        // 同理剥掉 `src/*.rs` 尾部的 `#[cfg(test)] mod` 区。
+        // ponytail: 沿用 `env_var_scan` 的同一前缀启发式（第一个 `#[cfg(test)] mod` 之后全免），
+        // 天花板一致——生产代码若排在 cfg(test) 之后会被误免；真需要时一起换成 span 解析。
+        let source = match cfg_test_mod_offset(&source) {
+            Some(off) => &source[..off],
+            None => source.as_str(),
+        };
+        let n = source
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .map(|l| l.matches(needle).count())
+            .sum::<usize>();
+        if n > 0 {
+            sites.push(format!("{disp}: {n}"));
+            total += n;
+        }
+    }
+    (total, sites)
+}
+
+/// §25.4 A1：`Candidate` 只能在它自己的模块里造。
+///
+/// 机制①（Mandatory 不可被 rerank 淘汰）的一条腿。`Candidate` 的字段已经是私有的，
+/// 所以「手搓一个字面量」由编译器挡住；本闸挡的是**另一种失效**：有人把字段改回 `pub`，
+/// 或在别处加一个 `Candidate::new(...)` 把 Mandatory 行包装成普通候选送进排序。
+/// 前者编译器不会说话，后者编译得过——两种都只有静态扫描看得见。
+fn g25_4_candidate_sole_construction_point(root: &Path) -> Verdict {
+    const HOME: [&str; 1] = ["crates/retrieval/src/candidate.rs"];
+
+    let files = read_files(&walk_files(root, &["rs"]));
+    // 三态：被测对象是 `Candidate` 这个类型本身。
+    if !files
+        .iter()
+        .any(|(_, s)| s.contains("pub struct Candidate {"))
+    {
+        return Verdict::NotApplicable(
+            "missing object: §24 `pub struct Candidate` 尚未交付".to_string(),
+        );
+    }
+
+    let mut strays = Vec::new();
+
+    // ① 别处不得调用构造函数。
+    let (calls, call_sites) = count_outside_allowed(root, "Candidate::new(", &HOME);
+    if calls > 0 {
+        strays.push(format!(
+            "§24 `Candidate::new(` 只允许出现在 {}，实得 {calls} 处: {call_sites:?}",
+            HOME[0]
+        ));
+    }
+
+    // ② 字段必须仍是私有的。字段改回 `pub` 时编译器一声不吭，而「手搓一个
+    //    `Candidate { fusion_score: 0.0, .. }` 把 Mandatory 伪装成普通候选」就又成立了
+    //    ——这正是本闸存在的原因（实测过：收口前全仓字段全 pub）。
+    if let Some((_, home)) = files
+        .iter()
+        .find(|(p, _)| display(root, p).ends_with(HOME[0]))
+    {
+        for field in [
+            "pub id: String",
+            "pub facet: Facet",
+            "pub fusion_score: f32",
+            "pub estimated_rerank_tokens: u32",
+        ] {
+            if home.contains(field) {
+                strays.push(format!(
+                    "{}: `Candidate` 的字段 `{field}` 又变回 pub —— 字段公开之后\
+                     「Mandatory 不可被淘汰」只能是纪律，不再是拓扑",
+                    HOME[0]
+                ));
+            }
+        }
+    }
+
+    if strays.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(strays)
+    }
+}
+
+/// §25.4 A2：`private.context_bindings` 的写入点唯一。
+///
+/// 绕过 `domain::context` 的三个 `authorize_*` 直接写 binding，就是 §25.4 那条攻击路径
+/// （把低 origin 内容永久钉进每次 Context）的落地形态。
+fn g25_4_binding_insert_sole_site(root: &Path) -> Verdict {
+    const INSERT_HOME: [&str; 1] = ["crates/adapters/src/context_repo.rs"];
+    const GRANT_HOME: [&str; 1] = ["crates/domain/src/context.rs"];
+
+    let files = read_files(&walk_files(root, &["rs"]));
+    if !files
+        .iter()
+        .any(|(_, s)| s.contains("INSERT INTO private.context_bindings"))
+    {
+        return Verdict::NotApplicable(
+            "missing object: §25.4 `INSERT INTO private.context_bindings` 写入路径尚未交付"
+                .to_string(),
+        );
+    }
+
+    let mut strays = Vec::new();
+    let (inserts, sites) =
+        count_outside_allowed(root, "INSERT INTO private.context_bindings", &INSERT_HOME);
+    if inserts > 0 {
+        strays.push(format!(
+            "§25.4 binding 写入点只允许在 {}，实得 {inserts} 处: {sites:?}",
+            INSERT_HOME[0]
+        ));
+    }
+    // `BindingGrant` 的字面量同理：它是写入口唯一接受的类型，能在别处造出来就等于
+    // 绕过了三个 authorize_*。
+    let (grants, gsites) = count_outside_allowed(root, "BindingGrant {", &GRANT_HOME);
+    if grants > 0 {
+        strays.push(format!(
+            "§25.4 `BindingGrant {{` 字面量只允许在 {}，实得 {grants} 处: {gsites:?}",
+            GRANT_HOME[0]
+        ));
+    }
+
+    if strays.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(strays)
+    }
+}
+
+/// §25.4 A3：`authorize_mandatory` / `authorize_pinned` 的调用点收敛。
+///
+/// **零调用点在这条闸里是合法的 Pass，与 G80-4 相反**——两者的规则方向不同：
+/// G80-4 说的是「检索侧**必须**经过 serving_version」，零调用点就是违规本身；
+/// 本闸说的是「**只有** context_repo 可以调 authorize_*」，零调用点意味着没人违规。
+/// 同样是计数，NA/Pass 的语义相反，照着 G80-4 的形状改这里会改错（ADR-0006）。
+fn g25_4_authorize_sole_caller(root: &Path) -> Verdict {
+    // 定义点 + 允许的调用方 + 测试目录（夹具自己要调它们）。测试目录按**精确路径**列出，
+    // 不用 `contains("/tests/")`：那会把任何路径含 tests 的生产文件也放行。
+    const ALLOWED: [&str; 4] = [
+        "crates/domain/src/context.rs",
+        "crates/adapters/src/context_repo.rs",
+        "crates/adapters/tests/mandatory_context_lane.rs",
+        "crates/domain/tests/context_authorize.rs",
+    ];
+
+    let files = read_files(&walk_files(root, &["rs"]));
+    if !files
+        .iter()
+        .any(|(_, s)| s.contains("pub fn authorize_mandatory("))
+    {
+        return Verdict::NotApplicable(
+            "missing object: §25.4 `pub fn authorize_mandatory(` 尚未交付".to_string(),
+        );
+    }
+
+    let mut strays = Vec::new();
+    for needle in ["authorize_mandatory(", "authorize_pinned("] {
+        let (n, sites) = count_outside_allowed(root, needle, &ALLOWED);
+        if n > 0 {
+            strays.push(format!(
+                "§25.4 `{needle}` 的调用点越界（只允许 {ALLOWED:?}），实得 {n} 处: {sites:?}"
+            ));
+        }
+    }
+
+    if strays.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(strays)
+    }
 }
 /// §80.1 `G80-43` Grounding validity / recheck debt —— 判据 §11.10#G11-2。
 ///

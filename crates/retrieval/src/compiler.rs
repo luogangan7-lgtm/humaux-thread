@@ -222,6 +222,82 @@ mod tests {
         );
     }
 
+    /// **故意坏掉的装配**：把 mandatory 丢掉，其余与 [`compile`] 逐字相同。
+    ///
+    /// 只存在于测试。它的存在理由是：G25-1 的注错若只活在文档里（「把 mandatory 的 extend
+    /// 删掉就会红」），那句话就没有人验证过。有一个可执行的坏变体，观测点看不看得见这种
+    /// 坏法就成了一条能跑的断言。
+    fn compile_dropping_mandatory(
+        mandatory: MandatoryLane,
+        pinned: PinnedLane,
+        budget: SupplementalBudget,
+        ranked: Vec<Candidate>,
+    ) -> CompiledContext {
+        let (_expected, _dropped_on_purpose) = mandatory.into_parts();
+        let pinned_rows = pinned.into_rows();
+        let mut ordered: Vec<ContextItem> = Vec::new();
+        ordered.extend(pinned_rows.into_iter().map(ContextItem::Pinned));
+        let mut remaining = budget.tokens();
+        let mut dropped = Vec::new();
+        for c in ranked {
+            let cost = c.estimated_rerank_tokens();
+            if cost <= remaining {
+                remaining -= cost;
+                ordered.push(ContextItem::Supplemental(c));
+            } else {
+                dropped.push(c.id().to_string());
+            }
+        }
+        CompiledContext {
+            ordered,
+            dropped_supplemental: dropped,
+        }
+    }
+
+    /// **G25-1 的具名注错**（G80-33 规则6：没有具名注错的 verifier 不算数）。
+    ///
+    /// 同一条 mandatory、同一份输入，走真 `compile` 时观测点报 1 条，走
+    /// [`compile_dropping_mandatory`] 时报 0 条。**两个数不同**，这就是「`mandatory_ids()`
+    /// 读的是装配结果而不是输入」的证据——若它照抄输入，两边都会报 1 条，本条立刻红。
+    ///
+    /// 先前这条写成「空 lane 装配后必须报空」，那是**假的**：空 lane 下照抄输入也返回空，
+    /// 两种实现不可区分，注错改坏了它也照样绿（实测确认过）。
+    #[test]
+    fn g25_1_fault_a_compile_that_drops_mandatory_is_visible_in_the_observable() {
+        let make = || {
+            let row = m_row(10);
+            let id = row.memory_id();
+            (lane(vec![row], 1), id)
+        };
+
+        let (m_good, id) = make();
+        let p = PinnedLane::new(vec![]);
+        let b = ContextBudget::new(100, 50)
+            .expect("budget")
+            .reserve(&m_good, &p)
+            .expect("no overflow");
+        let good = compile(m_good, p, b, vec![]);
+
+        let (m_bad, _) = make();
+        let p2 = PinnedLane::new(vec![]);
+        let b2 = ContextBudget::new(100, 50)
+            .expect("budget")
+            .reserve(&m_bad, &p2)
+            .expect("no overflow");
+        let bad = compile_dropping_mandatory(m_bad, p2, b2, vec![]);
+
+        assert_eq!(good.mandatory_ids(), vec![id], "真 compile 必须带上它");
+        assert!(
+            bad.mandatory_ids().is_empty(),
+            "坏变体丢掉了 mandatory，观测点必须如实报空——报得出 id 就说明它读的是输入"
+        );
+        assert_ne!(
+            good.mandatory_returned(),
+            bad.mandatory_returned(),
+            "两种装配的观测值必须不同；相同就意味着这个观测点分辨不出 mandatory 有没有进 Context"
+        );
+    }
+
     /// 冻结顺序：Mandatory 在 Pinned 之前，Pinned 在 Supplemental 之前。
     #[test]
     fn frozen_assembly_order_is_mandatory_then_pinned_then_supplemental() {
