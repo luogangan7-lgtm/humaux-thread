@@ -48,12 +48,65 @@ impl Facet {
 
 /// One retrieval candidate — just what allocation/dedup/pack need, not a full
 /// `RetrievalCard` (§17's projection payload; assembling one is out of this crate's scope).
+///
+/// **字段私有、唯一构造点是 [`Candidate::new`]。** 先前四个字段全 `pub`、无构造函数，于是
+/// 任何调用方都能手搓一个 `Candidate { fusion_score: 0.0, .. }`——包括把一条本该走
+/// §25.4 Mandatory lane（不参与 semantic 淘汰）的条目伪装成普通候选送进排序与 rerank。
+/// 「Mandatory 不可被淘汰」这句话在字段公开时只能是**纪律**；收口之后它才有可能成为拓扑
+/// 结论。收口本身不构成那个结论（`new` 仍然收得下任意分数），它只是必要前提：
+/// 后续 §25.4 的 lane 是**另一个类型**，`build_candidates` 结构上收不下它。
+///
+// ponytail: 只收口构造，没有给 `fusion_score` 加区间校验（NaN/负数今天都合法——
+// `build_candidates` 的 `total_cmp` 刻意为 NaN 定义了确定序）。真要约束分数域，
+// 那是 §21.1 Similarity 的判据，不是本类型的。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
-    pub id: String,
-    pub facet: Facet,
-    pub fusion_score: f32,
-    pub estimated_rerank_tokens: u32,
+    id: String,
+    facet: Facet,
+    fusion_score: f32,
+    estimated_rerank_tokens: u32,
+}
+
+impl Candidate {
+    /// 全 crate 唯一构造点（见类型 doc）。
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        facet: Facet,
+        fusion_score: f32,
+        estimated_rerank_tokens: u32,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            facet,
+            fusion_score,
+            estimated_rerank_tokens,
+        }
+    }
+
+    /// 候选 id（dedup 依据）。
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// §21 facet 归属（reserve 依据）。
+    #[must_use]
+    pub const fn facet(&self) -> Facet {
+        self.facet
+    }
+
+    /// 融合分。**只读**：改分等于改排序，必须重新走一次融合而不是就地改。
+    #[must_use]
+    pub const fn fusion_score(&self) -> f32 {
+        self.fusion_score
+    }
+
+    /// 送进 rerank 的估计 token 数（§63 预算依据）。
+    #[must_use]
+    pub const fn estimated_rerank_tokens(&self) -> u32 {
+        self.estimated_rerank_tokens
+    }
 }
 
 /// §63's `pack_by_token_budget`: greedy left-to-right over an already-ordered list. By the
@@ -146,12 +199,20 @@ mod tests {
     use super::*;
 
     fn candidate(id: &str, facet: Facet, score: f32, tokens: u32) -> Candidate {
-        Candidate {
-            id: id.to_string(),
-            facet,
-            fusion_score: score,
-            estimated_rerank_tokens: tokens,
-        }
+        Candidate::new(id, facet, score, tokens)
+    }
+
+    /// 唯一构造点的活哨兵：`Candidate` 的字段是私有的，所以「全 workspace 只能经
+    /// `Candidate::new` 造」由编译器保证，不需要文本扫描。本条钉的是另一面——**`new` 本身
+    /// 还在，且它确实是那四个字段的全部入口**。它若被改成只填三个字段（第四个取默认值），
+    /// 下面的读回断言立刻红。
+    #[test]
+    fn new_is_the_only_way_in_and_round_trips_every_field() {
+        let c = Candidate::new("m-1", Facet::State, 0.75, 128);
+        assert_eq!(c.id(), "m-1");
+        assert_eq!(c.facet(), Facet::State);
+        assert!((c.fusion_score() - 0.75).abs() < f32::EPSILON);
+        assert_eq!(c.estimated_rerank_tokens(), 128);
     }
 
     /// §24's own worked concern, verbatim: "避免某一路召回把其他 facet 全淹没" — 40 `dense`

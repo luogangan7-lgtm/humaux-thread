@@ -1,0 +1,45 @@
+# §46.1 migration manifest。给 private.context_bindings（0006 建的骨架）补 §25.4 需要的
+# mode / scope / 撤销维度。纯 DDL 增列 + 两个部分索引，无 DML（理由见 .sql 顶部：本表 RLS
+# 是 ENABLE + FORCE，而 migrate 直连 DSN 从不 SET humaux.tenant_id，任何回填会命中 0 行）。
+
+migration_id = "0102_context_bindings_mode_scope"
+class = "EXPAND_CONTRACT"
+
+# 本表必须零行——`created_by`/`memory_id` 的 NOT VALID CHECK 与 mode 默认值选 SUPPLEMENTAL
+# 的安全论证都建立在这个前提上（没有存量行 ⇒ 任何默认值都不解除既有保护）。
+precheck = """
+select to_regclass('private.context_bindings') is not null
+   and (select count(*) from private.context_bindings) = 0
+   and not exists (
+     select 1 from information_schema.columns
+     where table_schema='private' and table_name='context_bindings' and column_name='mode'
+   )
+   as precheck_ok
+"""
+
+postcheck = """
+select
+  (select count(*) from information_schema.columns
+   where table_schema='private' and table_name='context_bindings'
+     and column_name in ('scope_kind','scope_id','mode','created_by','revoked_at')) = 5
+  and (select count(*) from private.context_bindings where mode = 'MANDATORY') = 0
+  and to_regclass('private.ux_context_bindings_active') is not null
+  and to_regclass('private.ix_context_bindings_active_scope') is not null
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: DROP INDEX IF EXISTS private.ux_context_bindings_active, private.ix_context_bindings_active_scope;
+          ALTER TABLE private.context_bindings
+            DROP CONSTRAINT IF EXISTS context_bindings_scope_id_present,
+            DROP CONSTRAINT IF EXISTS context_bindings_created_by_present,
+            DROP CONSTRAINT IF EXISTS context_bindings_memory_id_present,
+            DROP COLUMN IF EXISTS revoked_at, DROP COLUMN IF EXISTS created_by,
+            DROP COLUMN IF EXISTS mode, DROP COLUMN IF EXISTS scope_id,
+            DROP COLUMN IF EXISTS scope_kind;
+(安全性随「本表是否仍为零行」变化：一旦有真实 binding 落库，回滚会连同 mode/revoked_at
+一起丢掉——而 §11.8 的 auto-mutate 冻结判定依赖它们，回滚后所有 binding 会退化成
+「存在即冻结」。过了那个点，正确做法是 forward fix 而不是本回滚。)
+"""
+
+backup_restore_requirement = "none（在可证明为零行的表上做增量 DDL，无数据风险）。标准部署前快照即可。"

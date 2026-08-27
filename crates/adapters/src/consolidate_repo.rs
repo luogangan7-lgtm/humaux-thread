@@ -264,6 +264,20 @@ pub async fn create_run(
     Ok(run_id)
 }
 
+// §11.8「active no-auto-mutate binding」的唯一判据。同一条查询里的投影列
+// （`has_binding`）与 WHERE 过滤（`NOT EXISTS`）**必须同源**：先前两处各写一遍，
+// 都只判「存在任意一行 binding」。migration 0102 加上 mode/revoked_at 之后，那种写法
+// 会同时造出两个 bug——已撤销的 binding 永久冻结一条 memory、SUPPLEMENTAL binding
+// 误挡 consolidation——而且**现有测试一条都不会红**（本表当时零行）。所以 0102 与
+// 本处收敛必须同波落地，拆开就是伪修复。
+//
+// §25.4：只有 MANDATORY / PINNED 两档不参与 semantic 淘汰、也因此不许被自动
+// consolidation 就地改写；SUPPLEMENTAL 是普通补充位，不构成冻结。
+pub(crate) const ACTIVE_NO_AUTO_MUTATE_BINDING: &str = "SELECT 1 FROM private.context_bindings cb \
+     WHERE cb.memory_id = m.memory_id \
+       AND cb.revoked_at IS NULL \
+       AND cb.mode IN ('MANDATORY','PINNED')";
+
 /// §11.7 frozen recipe, verbatim: one `REPEATABLE READ READ WRITE` transaction resolves the
 /// snapshot, selects eligible memories, and materializes them into
 /// `memory_consolidation_inputs` — nothing here spans a second transaction or an `OFFSET`.
@@ -338,13 +352,11 @@ pub async fn select_and_materialize_inputs(
     //     below as `has_binding` too (always `false` for rows this filter lets through), so
     //     `classify` stays the type-level gate the domain module's rustdoc promises rather
     //     than a dead parameter once the SQL side also excludes it.
-    let rows = sqlx::query(
+
+    let rows = sqlx::query(&format!(
         "SELECT m.memory_id, m.updated_at, m.content, m.authority_class, m.confidence, \
                 m.status, m.superseded_by, \
-                EXISTS ( \
-                  SELECT 1 FROM private.context_bindings cb \
-                  WHERE cb.memory_id = m.memory_id \
-                ) AS has_binding \
+                EXISTS ( {ACTIVE_NO_AUTO_MUTATE_BINDING} ) AS has_binding \
          FROM private.memory_records m \
          WHERE m.tenant_id = $1 \
            AND m.status = 'active' \
@@ -355,12 +367,10 @@ pub async fn select_and_materialize_inputs(
              JOIN private.evidence_objects eo ON eo.evidence_id = me.evidence_id \
              WHERE me.memory_id = m.memory_id AND eo.reasoning_domain_id = $2 \
            ) \
-           AND NOT EXISTS ( \
-             SELECT 1 FROM private.context_bindings cb WHERE cb.memory_id = m.memory_id \
-           ) \
+           AND NOT EXISTS ( {ACTIVE_NO_AUTO_MUTATE_BINDING} ) \
          ORDER BY m.memory_id DESC \
-         LIMIT $4",
-    )
+         LIMIT $4"
+    ))
     .bind(tenant_id)
     .bind(reasoning_domain_id)
     .bind(workspace_id)
@@ -676,4 +686,206 @@ pub async fn publish_rollup(
 
     txn.commit().await?;
     Ok(PublishOutcome::Published { rollup_id })
+}
+
+#[cfg(test)]
+mod binding_predicate_tests {
+    //! §11.8 × §25.4：`ACTIVE_NO_AUTO_MUTATE_BINDING` 的真值表。
+    //!
+    //! **这组测试存在的理由是它此前不存在。** migration 0102 之前，两处判据各自写着
+    //! 「存在任意一行 binding 即冻结」，而 `private.context_bindings` 恰好零行，所以
+    //! 任何断言都恒真——两个 bug（已撤销的 binding 永久冻结、SUPPLEMENTAL 误挡
+    //! consolidation）会在第一条真 binding 落库那天同时上线，且现有测试一条都不会红。
+    //!
+    //! 打的是**真实谓词文本本身**（`ACTIVE_NO_AUTO_MUTATE_BINDING`），不复制第二份 SQL：
+    //! 复制一份就等于把刚收敛掉的漂移又放回来。
+
+    use super::ACTIVE_NO_AUTO_MUTATE_BINDING;
+    use humaux_testkit::{ExternalDep, skip_or_fail};
+    use postgres::{Client, NoTls};
+    use sqlx::types::Uuid;
+
+    /// 播一个租户 + 一条**带 evidence 链**的 memory，返回 (tenant_id, memory_id)。
+    ///
+    /// §8.6 有一条延迟到 COMMIT 的约束触发器 `check_memory_has_evidence`：任何 Memory 在
+    /// 提交时必须已有 `private.memory_evidence` 链接，否则报 orphan Memory。`postgres`
+    /// 的 `Client::execute` 是自动提交，单独插一条 memory 会当场被它顶回来——所以
+    /// memory 与它的链接必须在**同一个显式事务**里。
+    fn seed(admin: &mut Client) -> (Uuid, Uuid) {
+        let tenant_id: Uuid = admin
+            .query_one(
+                "INSERT INTO control.tenants (name) VALUES ($1) RETURNING tenant_id",
+                &[&"binding_predicate_tests throwaway tenant"],
+            )
+            .expect("insert tenant")
+            .get(0);
+        let reasoning_domain_id: Uuid = admin
+            .query_one(
+                "INSERT INTO control.private_reasoning_domains (tenant_id, name) \
+                 VALUES ($1, 'binding_predicate_tests domain') RETURNING reasoning_domain_id",
+                &[&tenant_id],
+            )
+            .expect("insert reasoning domain")
+            .get(0);
+        // EVENT-kind evidence 的最小配方，与 `tests/processing_runs_fingerprint_rerun.rs`
+        // 逐字同源。
+        let evidence_id: Uuid = admin
+            .query_one(
+                "INSERT INTO private.evidence_objects \
+                   (tenant_id, evidence_kind, payload_sha256, data_class, origin_class, \
+                    visibility_class, reasoning_domain_id) \
+                 VALUES ($1, 'EVENT', $2, 'INTERNAL', 'DirectUserInput', 'TENANT_SHARED', $3) \
+                 RETURNING evidence_id",
+                &[&tenant_id, &vec![0u8; 32], &reasoning_domain_id],
+            )
+            .expect("insert evidence")
+            .get(0);
+        admin
+            .execute(
+                "INSERT INTO private.events (event_id, event_kind, payload) \
+                 VALUES ($1, 'USER_MESSAGE', '{}'::jsonb)",
+                &[&evidence_id],
+            )
+            .expect("insert event");
+
+        let confidence: f32 = 0.9;
+        let mut txn = admin.transaction().expect("begin seed txn");
+        let memory_id: Uuid = txn
+            .query_one(
+                "INSERT INTO private.memory_records \
+                   (tenant_id, memory_type, content, visibility_class, \
+                    authority_class, confidence, status, asserted_at) \
+                 VALUES ($1, 'NOTE', $2, 'TENANT_SHARED', 'PrivateKnowledge', $3, 'active', now()) \
+                 RETURNING memory_id",
+                &[
+                    &tenant_id,
+                    &serde_json::json!({"fixture": "binding_predicate_tests"}),
+                    &confidence,
+                ],
+            )
+            .expect("insert memory")
+            .get(0);
+        txn.execute(
+            "INSERT INTO private.memory_evidence (memory_id, evidence_id, role) \
+             VALUES ($1, $2, 'PRIMARY')",
+            &[&memory_id, &evidence_id],
+        )
+        .expect("link memory to evidence (§8.6)");
+        txn.commit().expect("commit seed txn");
+
+        (tenant_id, memory_id)
+    }
+
+    /// 对一条 memory 跑真实谓词。
+    fn predicate_holds(admin: &mut Client, memory_id: &Uuid) -> bool {
+        admin
+            .query_one(
+                &format!(
+                    "SELECT EXISTS ( {ACTIVE_NO_AUTO_MUTATE_BINDING} ) \
+                     FROM private.memory_records m WHERE m.memory_id = $1"
+                ),
+                &[memory_id],
+            )
+            .expect("run the real §11.8 predicate")
+            .get(0)
+    }
+
+    #[test]
+    fn only_active_mandatory_or_pinned_bindings_freeze_a_memory() {
+        let Ok(dsn) = std::env::var("HUMAUX_TEST_PG_DSN") else {
+            skip_or_fail(
+                "only_active_mandatory_or_pinned_bindings_freeze_a_memory",
+                "missing object: Postgres DSN (HUMAUX_TEST_PG_DSN not set)",
+                ExternalDep::Postgres,
+            );
+            return;
+        };
+        let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
+            skip_or_fail(
+                "only_active_mandatory_or_pinned_bindings_freeze_a_memory",
+                "missing object: live Postgres",
+                ExternalDep::Postgres,
+            );
+            return;
+        };
+        // 0102 未应用时列不存在，谓词会语法错——那不是「不适用」，是环境没建好。
+        let migrated: bool = admin
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema='private' AND table_name='context_bindings'
+                     AND column_name='mode')",
+                &[],
+            )
+            .expect("probe 0102")
+            .get(0);
+        if !migrated {
+            skip_or_fail(
+                "only_active_mandatory_or_pinned_bindings_freeze_a_memory",
+                "missing object: private.context_bindings.mode — run `cargo xtask migrate` \
+                 (migrations/0102_context_bindings_mode_scope.sql)",
+                ExternalDep::Postgres,
+            );
+            return;
+        }
+
+        let (tenant_id, memory_id) = seed(&mut admin);
+
+        // 无 binding：不冻结。
+        assert!(
+            !predicate_holds(&mut admin, &memory_id),
+            "没有任何 binding 的 memory 不该被判为冻结"
+        );
+
+        // 逐档验证。每次只留一条 binding，避免「某一档漏判但被另一档掩盖」。
+        for (mode, revoked, expect_frozen, why) in [
+            ("MANDATORY", false, true, "MANDATORY 未撤销 ⇒ 冻结（§11.8）"),
+            ("PINNED", false, true, "PINNED 未撤销 ⇒ 冻结（§11.8）"),
+            (
+                "SUPPLEMENTAL",
+                false,
+                false,
+                "SUPPLEMENTAL 是普通补充位，**不**构成冻结——判据写成「存在即冻结」时这条会红",
+            ),
+            (
+                "MANDATORY",
+                true,
+                false,
+                "已撤销的 binding 不再冻结——判据漏掉 revoked_at IS NULL 时这条会红",
+            ),
+        ] {
+            admin
+                .execute(
+                    "DELETE FROM private.context_bindings WHERE memory_id = $1",
+                    &[&memory_id],
+                )
+                .expect("clear bindings between cases");
+            admin
+                .execute(
+                    "INSERT INTO private.context_bindings
+                       (tenant_id, memory_id, mode, created_by, revoked_at)
+                     VALUES ($1, $2, $3, $1, CASE WHEN $4 THEN now() ELSE NULL END)",
+                    &[&tenant_id, &memory_id, &mode, &revoked],
+                )
+                .expect("insert binding case");
+            assert_eq!(
+                predicate_holds(&mut admin, &memory_id),
+                expect_frozen,
+                "{why}（mode={mode} revoked={revoked}）"
+            );
+        }
+
+        // 清理：binding 不是 append-only，可以删。
+        let _ = admin.execute(
+            "DELETE FROM private.context_bindings WHERE memory_id = $1",
+            &[&memory_id],
+        );
+        let _ = admin.execute(
+            "DELETE FROM private.memory_records WHERE memory_id = $1",
+            &[&memory_id],
+        );
+        let _ = admin.execute(
+            "DELETE FROM control.tenants WHERE tenant_id = $1",
+            &[&tenant_id],
+        );
+    }
 }
