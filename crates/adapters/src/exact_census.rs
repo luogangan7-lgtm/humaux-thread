@@ -31,36 +31,18 @@
 use std::collections::BTreeSet;
 
 use humaux_domain::error::ErrorCode;
+use humaux_domain::identity::AuthorizationScope;
+use humaux_domain::ids::WorkspaceId;
 use humaux_projection::stream::StreamKey;
 use humaux_retrieval::completeness::{CensusResult, ExactEnumeration};
 use humaux_retrieval::predicate_registry::PredicateEntry;
 use sqlx::Row;
 use sqlx::types::Uuid;
 
+use crate::context_repo::{readable_memory_ids, set_authorization_local};
 use crate::postgres::RuntimeDbPool;
 
 type Txn<'c> = sqlx::Transaction<'c, sqlx::Postgres>;
-
-/// RLS 的请求上下文：tenant + (§6.1.1) user。`humaux.user_id` is what admits
-/// `WORKSPACE_SHARED` rows through 0012's membership branch — a census run without it sees
-/// only `TENANT_SHARED`, which is a *different authorized universe*, not an error (§22.4:
-/// "EXACT 应优先从 PostgreSQL 权威数据在当前授权快照内完成" — the user context IS the
-/// authorization snapshot).
-async fn set_request_context(
-    txn: &mut Txn<'_>,
-    tenant_id: Uuid,
-    user_id: Option<Uuid>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(&format!("SET LOCAL humaux.tenant_id = '{tenant_id}'"))
-        .execute(&mut **txn)
-        .await?;
-    if let Some(user_id) = user_id {
-        sqlx::query(&format!("SET LOCAL humaux.user_id = '{user_id}'"))
-            .execute(&mut **txn)
-            .await?;
-    }
-    Ok(())
-}
 
 /// The `FROM` face of an `enumerable_scope` fragment, split into probe-able parts.
 /// `None` = the fragment does not parse as `schema.table WHERE …` — which is §22.4 trigger 3's
@@ -166,11 +148,20 @@ pub struct ExactCensusOutcome {
 const NOT_TOMBSTONED: &str = "NOT EXISTS ( \
    SELECT 1 FROM private.memory_evidence me \
    JOIN ops.outbox ob ON ob.evidence_id = me.evidence_id \
+                        AND ob.tenant_id = memory_records.tenant_id \
    JOIN projection.stream_log sl \
      ON sl.tenant_id = ob.tenant_id AND sl.scope_kind = $3 AND sl.scope_id = $4 \
     AND sl.domain = $5 AND sl.projection_kind = $6 AND sl.projection_version = $7 \
-    AND sl.stream_seq = ob.stream_seq \
+    AND sl.commit_seq = ob.commit_seq \
    WHERE me.memory_id = memory_records.memory_id AND sl.state = 'TOMBSTONED')";
+
+/// Final materialization only exposes active, unsuperseded memory rows. EXACT must not report
+/// identifiers that the read path will reject after this snapshot.
+const ACTIVE_FINAL: &str =
+    "memory_records.status = 'active' AND memory_records.superseded_by IS NULL";
+
+/// The candidate universe has already passed context_repo's sole source-visibility authority.
+const AUTHORIZED_CANDIDATE: &str = "memory_records.memory_id = ANY($8)";
 
 /// §18/§22.1 `SECRET_MATERIAL` linkage: a memory whose evidence chain carries secret material
 /// is excluded from `returned` and counted by `excluded_secret`.
@@ -200,6 +191,7 @@ async fn census_count(txn: &mut Txn<'_>, sql: &str, args: &CensusArgs<'_>) -> sq
         .bind(&args.stream.domain)
         .bind(&args.stream.projection_kind)
         .bind(&args.stream.projection_version)
+        .bind(args.authorized_ids)
         .fetch_one(&mut **txn)
         .await?
         .try_get(0)
@@ -209,16 +201,105 @@ struct CensusArgs<'a> {
     tenant_id: Uuid,
     workspace_id: Uuid,
     stream: &'a StreamKey,
+    authorized_ids: &'a [Uuid],
+}
+
+struct CandidateQuery<'a> {
+    authorization: &'a AuthorizationScope,
+    workspace_id: WorkspaceId,
+    stream: &'a StreamKey,
+    scope: &'a str,
+    predicate: &'a str,
+}
+
+async fn authorized_candidate_ids(
+    txn: &mut Txn<'_>,
+    query: &CandidateQuery<'_>,
+) -> Result<Vec<Uuid>, ErrorCode> {
+    let candidates_sql = format!(
+        "SELECT memory_id FROM {} AND ({}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} \
+         ORDER BY memory_id",
+        query.scope, query.predicate,
+    );
+    let candidates: Vec<Uuid> = match sqlx::query(&candidates_sql)
+        .bind(query.authorization.tenant_id().0)
+        .bind(query.workspace_id.0)
+        .bind(&query.stream.scope_kind)
+        .bind(query.stream.scope_id)
+        .bind(&query.stream.domain)
+        .bind(&query.stream.projection_kind)
+        .bind(&query.stream.projection_version)
+        .fetch_all(&mut **txn)
+        .await
+    {
+        Ok(rows) => rows
+            .iter()
+            .map(|row| row.try_get::<Uuid, _>("memory_id"))
+            .collect::<Result<_, _>>()
+            .map_err(|_| ErrorCode::Internal)?,
+        Err(_) => return Err(ErrorCode::Internal),
+    };
+    let mut authorized_ids: Vec<_> = readable_memory_ids(txn, query.authorization, &candidates)
+        .await?
+        .into_iter()
+        .collect();
+    authorized_ids.sort_unstable();
+    Ok(authorized_ids)
+}
+
+async fn census_readout(
+    txn: &mut Txn<'_>,
+    scope: &str,
+    predicate: &str,
+    args: &CensusArgs<'_>,
+) -> Result<(i64, Vec<Uuid>, i64), ErrorCode> {
+    let total_sql = format!(
+        "SELECT count(*) FROM {scope} AND ({predicate}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} \
+         AND {AUTHORIZED_CANDIDATE}"
+    );
+    let total = census_count(txn, &total_sql, args)
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
+
+    let ids_sql = format!(
+        "SELECT memory_id FROM {scope} AND ({predicate}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} \
+         AND {AUTHORIZED_CANDIDATE} AND NOT {SECRET_LINKED} ORDER BY memory_id"
+    );
+    let ids: Vec<Uuid> = sqlx::query(&ids_sql)
+        .bind(args.tenant_id)
+        .bind(args.workspace_id)
+        .bind(&args.stream.scope_kind)
+        .bind(args.stream.scope_id)
+        .bind(&args.stream.domain)
+        .bind(&args.stream.projection_kind)
+        .bind(&args.stream.projection_version)
+        .bind(args.authorized_ids)
+        .fetch_all(&mut **txn)
+        .await
+        .map_err(|_| ErrorCode::Internal)?
+        .iter()
+        .map(|row| row.try_get::<Uuid, _>("memory_id"))
+        .collect::<Result<_, _>>()
+        .map_err(|_| ErrorCode::Internal)?;
+
+    let secret_sql = format!(
+        "SELECT count(*) FROM {scope} AND ({predicate}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} \
+         AND {AUTHORIZED_CANDIDATE} AND {SECRET_LINKED}"
+    );
+    let excluded_secret = census_count(txn, &secret_sql, args)
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
+    Ok((total, ids, excluded_secret))
 }
 
 /// Runs the §22.1 census for one already-established predicate (the caller has run
 /// [`probe_predicate_inputs`] → `decide()` and got `PlannerDecision::Enumerate`; running this
 /// for an unestablished predicate measures nothing the classifier will ever consume).
 ///
-/// One `REPEATABLE READ` transaction, three statements over the same snapshot:
-/// 1. `total`  — scope + predicate + tombstone overlay (secret rows stay in);
-/// 2. returned ids — additionally excludes secret-linked rows, `ORDER BY memory_id`;
-/// 3. `excluded_secret` — the secret-linked complement of 2 within 1.
+/// One `REPEATABLE READ READ ONLY` transaction first establishes the raw scope/predicate
+/// candidate ids, passes them through `context_repo::readable_memory_ids` (the sole backing
+/// source-visibility authority), then performs independent total, returned-id, and
+/// excluded-secret statements over the resulting authorized candidate universe.
 ///
 /// The registry fragments (`enumerable_scope` / `sql_predicate`) are interpolated, not bound:
 /// they are §50 typed config from `control.retrieval_predicates` (operator-written,
@@ -234,66 +315,50 @@ struct CensusArgs<'a> {
 pub async fn exact_enumerate(
     pool: &RuntimeDbPool,
     entry: &PredicateEntry,
-    tenant_id: Uuid,
-    user_id: Option<Uuid>,
-    workspace_id: Uuid,
+    authorization: &AuthorizationScope,
+    requested_workspace: WorkspaceId,
     stream: &StreamKey,
 ) -> Result<ExactCensusOutcome, ErrorCode> {
+    let authorization = authorization.narrow(requested_workspace)?;
+    if stream.tenant_id != authorization.tenant_id()
+        || stream.scope_kind != "workspace"
+        || stream.scope_id != requested_workspace.0
+    {
+        return Err(ErrorCode::Forbidden);
+    }
+
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     // 必须是本事务第一条语句：隔离级在第一个取快照的语句之后就改不了了（context_repo 同款）。
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *txn)
         .await
         .map_err(|_| ErrorCode::Internal)?;
-    set_request_context(&mut txn, tenant_id, user_id)
-        .await
-        .map_err(|_| ErrorCode::Internal)?;
+    set_authorization_local(&mut txn, &authorization).await?;
 
     let scope = entry.enumerable_scope();
     let pred = entry.sql_predicate();
+    let tenant_id = authorization.tenant_id().0;
+    let workspace_id = requested_workspace.0;
+    let candidate_query = CandidateQuery {
+        authorization: &authorization,
+        workspace_id: requested_workspace,
+        stream,
+        scope,
+        predicate: pred,
+    };
+    let authorized_ids = match authorized_candidate_ids(&mut txn, &candidate_query).await {
+        Ok(ids) => ids,
+        Err(_) => return census_failed(txn).await,
+    };
     let args = CensusArgs {
         tenant_id,
         workspace_id,
         stream,
+        authorized_ids: &authorized_ids,
     };
 
-    let total_sql = format!("SELECT count(*) FROM {scope} AND ({pred}) AND {NOT_TOMBSTONED}");
-    let total = match census_count(&mut txn, &total_sql, &args).await {
-        Ok(n) => n,
-        Err(_) => return census_failed(txn).await,
-    };
-
-    let ids_sql = format!(
-        "SELECT memory_id FROM {scope} AND ({pred}) AND {NOT_TOMBSTONED} \
-         AND NOT {SECRET_LINKED} ORDER BY memory_id"
-    );
-    let ids: Vec<Uuid> = match sqlx::query(&ids_sql)
-        .bind(args.tenant_id)
-        .bind(args.workspace_id)
-        .bind(&args.stream.scope_kind)
-        .bind(args.stream.scope_id)
-        .bind(&args.stream.domain)
-        .bind(&args.stream.projection_kind)
-        .bind(&args.stream.projection_version)
-        .fetch_all(&mut *txn)
-        .await
-    {
-        Ok(rows) => match rows
-            .iter()
-            .map(|r| r.try_get::<Uuid, _>("memory_id"))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(ids) => ids,
-            Err(_) => return census_failed(txn).await,
-        },
-        Err(_) => return census_failed(txn).await,
-    };
-
-    let secret_sql = format!(
-        "SELECT count(*) FROM {scope} AND ({pred}) AND {NOT_TOMBSTONED} AND {SECRET_LINKED}"
-    );
-    let excluded_secret = match census_count(&mut txn, &secret_sql, &args).await {
-        Ok(n) => n,
+    let (total, ids, excluded_secret) = match census_readout(&mut txn, scope, pred, &args).await {
+        Ok(readout) => readout,
         Err(_) => return census_failed(txn).await,
     };
 

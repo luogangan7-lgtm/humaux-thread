@@ -1,0 +1,196 @@
+//! Gateway-only read adapter for §73.5.1 service credential bindings.
+//! This module returns database facts only; HMAC and authorization decisions remain in
+//! the protocol/authentication layer.
+
+use humaux_domain::error::ErrorCode;
+use sqlx::Row;
+use sqlx::types::Uuid;
+use sqlx::types::time::OffsetDateTime;
+
+use crate::postgres::RuntimeDbPool;
+
+/// One row from the sole gateway-only api_key_lookup(text) entry point.
+///
+/// Fields are intentionally private: callers may inspect the authenticated database facts,
+/// but cannot construct a credential record or serialize verifier material accidentally.
+pub struct CredentialRecord {
+    api_key_id: Uuid,
+    tenant_id: Uuid,
+    key_hash: Vec<u8>,
+    status: String,
+    allowed_cidrs: Vec<String>,
+    expires_at: Option<OffsetDateTime>,
+    revoked_at: Option<OffsetDateTime>,
+    scopes: Vec<String>,
+    authorization_version: Option<i16>,
+    user_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+    tenant_security_epoch: Option<i64>,
+    user_security_epoch: Option<i64>,
+    tenant_state: String,
+    live_tenant_security_epoch: i64,
+    user_state: Option<String>,
+    live_user_security_epoch: Option<i64>,
+    membership_state: Option<String>,
+}
+
+impl CredentialRecord {
+    /// Immutable machine-principal identifier for this credential.
+    pub fn api_key_id(&self) -> Uuid {
+        self.api_key_id
+    }
+
+    /// Tenant bound to this credential row.
+    pub fn tenant_id(&self) -> Uuid {
+        self.tenant_id
+    }
+
+    /// Stored HMAC verifier bytes; callers must not log them.
+    pub fn key_hash(&self) -> &[u8] {
+        &self.key_hash
+    }
+
+    /// Stored lifecycle state, evaluated by the authentication layer.
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    /// CIDR allowlist rendered as text by the adapter query.
+    pub fn allowed_cidrs(&self) -> &[String] {
+        &self.allowed_cidrs
+    }
+
+    /// Optional credential expiry time.
+    pub fn expires_at(&self) -> Option<OffsetDateTime> {
+        self.expires_at
+    }
+
+    /// Optional credential revocation time.
+    pub fn revoked_at(&self) -> Option<OffsetDateTime> {
+        self.revoked_at
+    }
+
+    /// Scopes recorded on the credential row.
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+
+    /// Explicit authorization schema version, absent for inert legacy rows.
+    pub fn authorization_version(&self) -> Option<i16> {
+        self.authorization_version
+    }
+
+    /// Optional PAT on-behalf-of user binding.
+    pub fn user_id(&self) -> Option<Uuid> {
+        self.user_id
+    }
+
+    /// Optional workspace binding that narrows this credential.
+    pub fn workspace_id(&self) -> Option<Uuid> {
+        self.workspace_id
+    }
+
+    /// Tenant security epoch captured when this credential was authorized.
+    pub fn tenant_security_epoch(&self) -> Option<i64> {
+        self.tenant_security_epoch
+    }
+
+    /// User security epoch captured for a PAT, absent for a machine credential.
+    pub fn user_security_epoch(&self) -> Option<i64> {
+        self.user_security_epoch
+    }
+
+    /// Live tenant lifecycle state from the same lookup statement.
+    pub fn tenant_state(&self) -> &str {
+        &self.tenant_state
+    }
+
+    /// Live tenant security epoch from the same lookup statement.
+    pub fn live_tenant_security_epoch(&self) -> i64 {
+        self.live_tenant_security_epoch
+    }
+
+    /// Live bound-user lifecycle state, if this is a PAT.
+    pub fn user_state(&self) -> Option<&str> {
+        self.user_state.as_deref()
+    }
+
+    /// Live bound-user security epoch, if this is a PAT.
+    pub fn live_user_security_epoch(&self) -> Option<i64> {
+        self.live_user_security_epoch
+    }
+
+    /// Live tenant membership state for the bound PAT user.
+    pub fn membership_state(&self) -> Option<&str> {
+        self.membership_state.as_deref()
+    }
+}
+
+fn db_error(error: sqlx::Error) -> ErrorCode {
+    match error {
+        sqlx::Error::Database(database) if database.code().as_deref() == Some("42501") => {
+            ErrorCode::Forbidden
+        }
+        _ => ErrorCode::DependencyUnavailable,
+    }
+}
+
+/// Reads one credential binding through the only gateway-authorized lookup.
+///
+/// The returned record may be legacy, revoked, expired, or otherwise unauthorized. The caller
+/// must verify the HMAC and decide authorization from every returned live fact.
+pub async fn lookup(
+    pool: &RuntimeDbPool,
+    prefix: &str,
+) -> Result<Option<CredentialRecord>, ErrorCode> {
+    let row = sqlx::query(
+        r#"SELECT api_key_id, tenant_id, key_hash, status,
+                  allowed_cidrs::text[] AS allowed_cidrs,
+                  expires_at, revoked_at, scopes, authorization_version, user_id, workspace_id,
+                  tenant_security_epoch, user_security_epoch, tenant_state,
+                  live_tenant_security_epoch, user_state, live_user_security_epoch, membership_state
+           FROM control.api_key_lookup($1)"#,
+    )
+    .bind(prefix)
+    .fetch_optional(pool.pool())
+    .await
+    .map_err(db_error)?;
+
+    row.map(|row| {
+        Ok(CredentialRecord {
+            api_key_id: row.try_get("api_key_id").map_err(db_error)?,
+            tenant_id: row.try_get("tenant_id").map_err(db_error)?,
+            key_hash: row.try_get("key_hash").map_err(db_error)?,
+            status: row.try_get("status").map_err(db_error)?,
+            allowed_cidrs: row.try_get("allowed_cidrs").map_err(db_error)?,
+            expires_at: row.try_get("expires_at").map_err(db_error)?,
+            revoked_at: row.try_get("revoked_at").map_err(db_error)?,
+            scopes: row.try_get("scopes").map_err(db_error)?,
+            authorization_version: row.try_get("authorization_version").map_err(db_error)?,
+            user_id: row.try_get("user_id").map_err(db_error)?,
+            workspace_id: row.try_get("workspace_id").map_err(db_error)?,
+            tenant_security_epoch: row.try_get("tenant_security_epoch").map_err(db_error)?,
+            user_security_epoch: row.try_get("user_security_epoch").map_err(db_error)?,
+            tenant_state: row.try_get("tenant_state").map_err(db_error)?,
+            live_tenant_security_epoch: row
+                .try_get("live_tenant_security_epoch")
+                .map_err(db_error)?,
+            user_state: row.try_get("user_state").map_err(db_error)?,
+            live_user_security_epoch: row.try_get("live_user_security_epoch").map_err(db_error)?,
+            membership_state: row.try_get("membership_state").map_err(db_error)?,
+        })
+    })
+    .transpose()
+}
+
+/// Records successful credential use through the existing gateway-only touch function.
+///
+/// Authorization must already have succeeded; this only updates last_used_at.
+pub async fn mark_used(pool: &RuntimeDbPool, api_key_id: Uuid) -> Result<(), ErrorCode> {
+    sqlx::query("SELECT control.api_key_touch_last_used($1)")
+        .bind(api_key_id)
+        .execute(pool.pool())
+        .await
+        .map_err(db_error)?;
+    Ok(())
+}

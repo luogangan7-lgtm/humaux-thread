@@ -1,0 +1,31 @@
+error[E0560]: struct `RetrievalQueryCallContext<'_>` has no field named `profile_fingerprint`
+ --> tests/ui/fail_construct_query_provenance.rs:7:9
+  |
+7 |         profile_fingerprint: "caller-profile",
+  |         ^^^^^^^^^^^^^^^^^^^ `RetrievalQueryCallContext<'_>` does not have this field
+  |
+  = note: all struct fields are already assigned
+
+error[E0560]: struct `RetrievalQueryCallContext<'_>` has no field named `classifier_revision`
+ --> tests/ui/fail_construct_query_provenance.rs:8:9
+  |
+8 |         classifier_revision: "caller-classifier",
+  |         ^^^^^^^^^^^^^^^^^^^ `RetrievalQueryCallContext<'_>` does not have this field
+  |
+  = note: all struct fields are already assigned
+
+error[E0560]: struct `RetrievalQueryCallContext<'_>` has no field named `query_sha256`
+ --> tests/ui/fail_construct_query_provenance.rs:9:9
+  |
+9 |         query_sha256: [0_u8; 32],
+  |         ^^^^^^^^^^^^ `RetrievalQueryCallContext<'_>` does not have this field
+  |
+  = note: all struct fields are already assigned
+
+error[E0560]: struct `RetrievalQueryCallContext<'_>` has no field named `query_bytes`
+  --> tests/ui/fail_construct_query_provenance.rs:10:9
+   |
+10 |         query_bytes: 7,
+   |         ^^^^^^^^^^^ `RetrievalQueryCallContext<'_>` does not have this field
+   |
+   = note: all struct fields are already assigned

@@ -1,13 +1,21 @@
 //! xtask `mechanism-registry` — G0–G2 静态侧闸（§1.14 全文 + §1.14.1；对应 §80.1 G80-10 的
 //! 静态侧，见 extract_digest.md p0-gov）。
 //!
-//! G3（ACTIVE 取过值）/ G4（保鲜）/ G5（回收）读取 `ops.mechanism_observations`
-//! （运行期 Runtime Observation authority，§1.14.1）；该表本轮未部署，三项一律输出
-//! `not_applicable` 并打印缺失对象名（§57.1 第2条：not_applicable 必须打印缺失对象名）。
+//! G3/G4/G5 read actual target-scoped observations and E2E evidence (§1.14.1).
+//! Static-only invocations explicitly report missing target configuration, never
+//! assert that an unqueried database table is absent.
 //!
 //! 解析目标是 canonical md 本身（`docs/architecture/Baseline_2.9.md`），禁止引入
 //! 第二个数据文件（§1.14 本章冻结："围栏块是文档内唯一副本"）。
 
+use humaux_adapters::{
+    mechanism_observation::{RuntimeObservations, read_target},
+    postgres::AdminDbPool,
+};
+use humaux_contracts::mechanism_registry::{
+    ActivationKind, MechanismSpec, MechanismStatus, extract_fences, parse_registry,
+    parse_target_args,
+};
 use std::collections::BTreeSet;
 
 /// spec 唯一真源，相对本 crate manifest 目录解析（§1.14 冻结：不得另建镜像文件）。
@@ -16,9 +24,6 @@ const SPEC_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../docs/architecture/Baseline_2.9.md"
 );
-
-const FENCE_OPEN: &str = "```mechanism-registry";
-const FENCE_CLOSE: &str = "```";
 
 /// §1.14 固定列序：`ch | mechanism | activation_kind | min_denominator | probe |
 /// bootstrap_value | bootstrap_measured_at | note`。
@@ -51,28 +56,6 @@ struct Row {
     activation_kind: String,
     /// 该行原始列数，用于 G0 的 schema 校验（期望恰为 [`EXPECTED_COLUMNS`]）。
     column_count: usize,
-}
-
-/// 提取全文中所有 `mechanism-registry` 围栏块的正文（不含围栏标记行）。
-///
-/// 返回 Vec 的长度即 G0「围栏个数」判据；````text` 列头说明块（§1.14 行 419）不匹配
-/// [`FENCE_OPEN`]，不计入。
-fn extract_fences(text: &str) -> Vec<Vec<&str>> {
-    let mut fences = Vec::new();
-    let mut lines = text.lines();
-    while let Some(line) = lines.next() {
-        if line.trim() == FENCE_OPEN {
-            let mut body = Vec::new();
-            for inner in lines.by_ref() {
-                if inner.trim() == FENCE_CLOSE {
-                    break;
-                }
-                body.push(inner);
-            }
-            fences.push(body);
-        }
-    }
-    fences
 }
 
 /// 解析单个围栏正文为行记录。列数错误的行仍尽量取出 `ch`（首列）供 G1/G2 使用——
@@ -193,18 +176,76 @@ fn check_g2(text: &str, rows: &[Row]) -> GateResult {
     }
 }
 
-/// G3/G4/G5 均以 `ops.mechanism_observations` 为唯一真源（§1.14.1）；该表本轮未部署，
-/// 三态语义下输出 `not_applicable` 并打印缺失对象名（§57.1 第2条 / repo CLAUDE.md 硬边界）。
-fn check_runtime_gates() -> Vec<GateResult> {
-    const MISSING: &str = "ops.mechanism_observations not deployed";
+/// Static-only call: runtime truth was not requested, not checked and not inferred.
+fn missing_runtime_target() -> Vec<GateResult> {
+    ["G3", "G4", "G5"].into_iter().map(|gate| GateResult {
+        gate, status: GateStatus::NotApplicable,
+        detail: "missing runtime target (--deployment UUID --cell UUID) and HUMAUX_ADMIN_PG_DSN; ops.mechanism_observations not queried".into(),
+    }).collect()
+}
+
+fn runtime_results(specs: &[MechanismSpec], observations: &RuntimeObservations) -> Vec<GateResult> {
     ["G3", "G4", "G5"]
         .into_iter()
-        .map(|gate| GateResult {
-            gate,
-            status: GateStatus::NotApplicable,
-            detail: MISSING.to_string(),
+        .map(|gate| {
+            let failures: Vec<String> = specs
+                .iter()
+                .filter_map(|spec| {
+                    let derived = observations.status(spec);
+                    let obs = observations.latest.get(&spec.id());
+                    let failed = match gate {
+                        "G3" => derived.status == Some(MechanismStatus::Stale),
+                        "G4" => matches!(
+                            derived.reason,
+                            "no_data" | "wrong_target" | "invalid_or_stale_observation"
+                        ),
+                        _ => {
+                            spec.activation_kind == ActivationKind::DenominatorGated
+                                && (derived.status == Some(MechanismStatus::Stale)
+                                    || obs
+                                        .is_some_and(|o| derived.status != Some(o.recorded_status)))
+                        }
+                    };
+                    failed.then(|| format!("{}:{}", spec.id(), derived.reason))
+                })
+                .collect();
+            GateResult {
+                gate,
+                status: if failures.is_empty() {
+                    GateStatus::Pass
+                } else {
+                    GateStatus::Fail
+                },
+                detail: if failures.is_empty() {
+                    format!(
+                        "target {}/{}: live evidence evaluated",
+                        observations.target.deployment_id, observations.target.cell_id
+                    )
+                } else {
+                    format!("cannot_establish: {}", failures.join(", "))
+                },
+            }
         })
         .collect()
+}
+
+fn read_runtime(text: &str, args: &[String]) -> Result<Vec<GateResult>, String> {
+    let target = parse_target_args(args)?;
+    let specs = parse_registry(text)?;
+    let dsn = std::env::var("HUMAUX_ADMIN_PG_DSN").map_err(|_| "missing HUMAUX_ADMIN_PG_DSN")?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "cannot start database runtime")?;
+    let observations = runtime.block_on(async {
+        let pool = AdminDbPool::connect(&dsn)
+            .await
+            .map_err(|_| "cannot connect as role_admin")?;
+        read_target(&pool, &target)
+            .await
+            .map_err(|_| "cannot read runtime observation evidence")
+    })?;
+    Ok(runtime_results(&specs, &observations))
 }
 
 /// 对给定 canonical md 全文跑 G0–G5。G0 的围栏/schema 判定与 G1/G2 的覆盖/锚点判定
@@ -217,7 +258,7 @@ pub fn check_all(text: &str) -> Vec<GateResult> {
         check_g1(text, &rows),
         check_g2(text, &rows),
     ];
-    results.extend(check_runtime_gates());
+    results.extend(missing_runtime_target());
     results
 }
 
@@ -239,7 +280,7 @@ fn report(results: &[GateResult]) -> i32 {
     i32::from(failed)
 }
 
-pub fn run(_args: &[String]) -> i32 {
+pub fn run(args: &[String]) -> i32 {
     let text = match std::fs::read_to_string(SPEC_PATH) {
         Ok(t) => t,
         Err(e) => {
@@ -247,7 +288,19 @@ pub fn run(_args: &[String]) -> i32 {
             return 1;
         }
     };
-    report(&check_all(&text))
+    let mut results = check_all(&text);
+    if !args.is_empty() {
+        results.truncate(3);
+        match read_runtime(&text, args) {
+            Ok(runtime) => results.extend(runtime),
+            Err(error) => results.extend(["G3", "G4", "G5"].map(|gate| GateResult {
+                gate,
+                status: GateStatus::Fail,
+                detail: format!("cannot_establish: {error}"),
+            })),
+        }
+    }
+    report(&results)
 }
 
 #[cfg(test)]
@@ -322,7 +375,7 @@ ch | mechanism | activation_kind | min_denominator | probe | bootstrap_value | b
     /// 注错「删围栏」：整个 mechanism-registry 围栏消失（1→0）⇒ G0 红。红转绿：围栏恢复。
     #[test]
     fn g0_red_on_fence_deleted_then_green() {
-        let fence_start = VALID_FIXTURE.find(FENCE_OPEN).unwrap();
+        let fence_start = VALID_FIXTURE.find("```mechanism-registry").unwrap();
         let mutated = &VALID_FIXTURE[..fence_start];
         let red = check_all(mutated);
         assert_eq!(gate(&red, "G0").status, GateStatus::Fail);

@@ -1,0 +1,23 @@
+# §46.1 migration manifest. Single-statement owner repair for a table 0011's blanket loop
+# could not reach (0030 creates it after 0011 runs). No DML, no shape change.
+
+migration_id = "0138_ops_column_vitality_owner"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('ops.column_vitality') is not null as precheck_ok
+"""
+
+postcheck = """
+select (select tableowner from pg_tables
+        where schemaname = 'ops' and tablename = 'column_vitality')
+       = 'role_migration_owner' as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+forward fix only: ownership is a repair toward the §6.2 invariant; rolling back would
+re-introduce the deviation. If the ALTER must be undone in an emergency:
+ALTER TABLE ops.column_vitality OWNER TO postgres;
+"""
+
+backup_restore_requirement = "none (ownership change on an ops observation table, no data touched)."

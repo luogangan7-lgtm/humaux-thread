@@ -1,5 +1,6 @@
 //! `adapters::selection_repo` — §20.4 Stable Selection / Pagination Contract SQL (T6.3,
-//! G20-1/G80-32), through [`RetrievalWorkerDbPool`] only.
+//! G20-1/G80-32). The worker API uses [`RetrievalWorkerDbPool`]; crate-private manifest
+//! helpers also let `context_repo` authorize and materialize Gateway pages in one RR.
 //!
 //! [`begin_enumeration_snapshot`] is the Mode B "page 1" recipe: one `REPEATABLE READ
 //! READ WRITE` transaction inserts the `ops.selection_snapshots` row, runs exactly one
@@ -148,8 +149,8 @@ fn build_page(
 
 /// §20.4 Mode B, page 1. Opens one `REPEATABLE READ READ WRITE` transaction (`READ ONLY`
 /// rejects the `INSERT`s below with SQLSTATE 25006 — same frozen recipe
-/// `consolidate_repo::select_and_materialize_inputs` documents), creates the snapshot row,
-/// runs the one `SELECT` that establishes the snapshot's view of `private.memory_records`,
+/// `consolidate_repo::select_and_materialize_inputs` documents), creates the snapshot row
+/// (establishing the transaction view), runs one source `SELECT` against `private.memory_records`,
 /// and materializes every matching id into `ops.selection_snapshot_items` before committing.
 /// The first page is then read back from that now-immutable manifest.
 pub async fn begin_enumeration_snapshot(
@@ -180,9 +181,9 @@ pub async fn begin_enumeration_snapshot(
     let snapshot_id: Uuid = snapshot_row.get(0);
     let expires_at: OffsetDateTime = snapshot_row.get(1);
 
-    // The one and only SELECT this transaction issues against the live source — it
-    // establishes the REPEATABLE READ snapshot every later statement in `txn` (including the
-    // INSERTs below) observes. `ORDER BY memory_id DESC` matches
+    // The snapshot-row INSERT above established the REPEATABLE READ view. This sole
+    // source SELECT and the later manifest INSERTs use that same transaction view.
+    // `ORDER BY memory_id DESC` matches
     // `consolidate_repo::select_and_materialize_inputs`'s ordering and reasoning verbatim:
     // `memory_id` is UUIDv7 (time-ordered), so a row concurrently inserted while this
     // transaction is open always sorts first under DESC — the exact "并发插入 ... 更靠前的
@@ -304,4 +305,136 @@ async fn fetch_page_from_manifest(
         page_size,
         mac_key,
     ))
+}
+
+async fn authorized_page_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    meta: &SnapshotMeta<'_>,
+    after_ordinal: i64,
+    page_size: i64,
+    mac_key: &[u8],
+) -> Result<SnapshotPage, humaux_domain::error::ErrorCode> {
+    let snapshot_fp: Option<String> = sqlx::query_scalar(
+        "SELECT query_fingerprint FROM ops.selection_snapshots WHERE selection_snapshot_id=$1 AND tenant_id=$2",
+    )
+    .bind(meta.snapshot_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(|_| humaux_domain::error::ErrorCode::DependencyUnavailable)?;
+    if snapshot_fp.as_deref() != Some(meta.query_fingerprint) {
+        return Err(humaux_domain::error::ErrorCode::NotFound);
+    }
+    let rows = sqlx::query(
+        "SELECT item_id,ordinal FROM ops.selection_snapshot_items WHERE selection_snapshot_id=$1 AND tenant_id=$2 AND ordinal>$3 ORDER BY ordinal LIMIT $4",
+    )
+    .bind(meta.snapshot_id)
+    .bind(tenant_id)
+    .bind(after_ordinal)
+    .bind(page_size)
+    .fetch_all(&mut **txn)
+    .await
+    .map_err(|_| humaux_domain::error::ErrorCode::DependencyUnavailable)?;
+    let items = rows
+        .iter()
+        .map(|row| {
+            row.try_get("item_id")
+                .map_err(|_| humaux_domain::error::ErrorCode::Internal)
+        })
+        .collect::<Result<Vec<Uuid>, _>>()?;
+    let next_cursor = if items.len() == page_size as usize {
+        rows.last()
+            .map(|row| {
+                row.try_get("ordinal")
+                    .map_err(|_| humaux_domain::error::ErrorCode::Internal)
+            })
+            .transpose()?
+            .map(|ordinal| {
+                Cursor::sign(
+                    meta.snapshot_id,
+                    tenant_id,
+                    meta.query_fingerprint.to_owned(),
+                    ordinal,
+                    meta.expires_at.unix_timestamp(),
+                    mac_key,
+                )
+            })
+    } else {
+        None
+    };
+    Ok(SnapshotPage {
+        snapshot_id: meta.snapshot_id,
+        items,
+        next_cursor,
+    })
+}
+
+/// Creates an immutable authorization-filtered manifest in the caller's RR READ WRITE transaction.
+pub(crate) async fn begin_authorized_snapshot_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    fingerprint: &str,
+    ttl: std::time::Duration,
+    page_size: i64,
+    mac_key: &[u8],
+    item_ids: &[Uuid],
+) -> Result<SnapshotPage, humaux_domain::error::ErrorCode> {
+    let row = sqlx::query("INSERT INTO ops.selection_snapshots(tenant_id,query_fingerprint,expires_at) VALUES($1,$2,now()+make_interval(secs=>$3)) RETURNING selection_snapshot_id,expires_at")
+        .bind(tenant_id).bind(fingerprint).bind(ttl.as_secs_f64()).fetch_one(&mut **txn).await
+        .map_err(|_| humaux_domain::error::ErrorCode::DependencyUnavailable)?;
+    let meta = SnapshotMeta {
+        snapshot_id: row
+            .try_get("selection_snapshot_id")
+            .map_err(|_| humaux_domain::error::ErrorCode::Internal)?,
+        query_fingerprint: fingerprint,
+        expires_at: row
+            .try_get("expires_at")
+            .map_err(|_| humaux_domain::error::ErrorCode::Internal)?,
+    };
+    for (ordinal, id) in item_ids.iter().enumerate() {
+        sqlx::query("INSERT INTO ops.selection_snapshot_items(selection_snapshot_id,tenant_id,item_id,ordinal) VALUES($1,$2,$3,$4)")
+            .bind(meta.snapshot_id).bind(tenant_id).bind(id).bind(ordinal as i64).execute(&mut **txn).await
+            .map_err(|_| humaux_domain::error::ErrorCode::DependencyUnavailable)?;
+    }
+    authorized_page_in_txn(txn, tenant_id, &meta, -1, page_size, mac_key).await
+}
+
+/// Validates a trusted cursor and returns its frozen manifest page in the caller's RR transaction.
+pub(crate) async fn fetch_authorized_snapshot_page_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    cursor: &Cursor,
+    fingerprint: &str,
+    page_size: i64,
+    mac_key: &[u8],
+) -> Result<SnapshotPage, humaux_domain::error::ErrorCode> {
+    cursor
+        .validate(
+            tenant_id,
+            mac_key,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .map_err(|error| match error {
+            CursorError::Expired => humaux_domain::error::ErrorCode::NotFound,
+            _ => humaux_domain::error::ErrorCode::InvalidInput,
+        })?;
+    if cursor.query_fingerprint != fingerprint {
+        return Err(humaux_domain::error::ErrorCode::NotFound);
+    }
+    let expires_at = OffsetDateTime::from_unix_timestamp(cursor.expires_at_unix)
+        .map_err(|_| humaux_domain::error::ErrorCode::InvalidInput)?;
+    authorized_page_in_txn(
+        txn,
+        tenant_id,
+        &SnapshotMeta {
+            snapshot_id: cursor.snapshot_id,
+            query_fingerprint: fingerprint,
+            expires_at,
+        },
+        cursor.last_ordinal,
+        page_size,
+        mac_key,
+    )
+    .await
 }

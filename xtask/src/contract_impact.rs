@@ -19,12 +19,12 @@ const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
 const FEATURES_TOML_PATH: &str = "config/features.toml";
 const ROOT_CARGO_TOML_PATH: &str = "Cargo.toml";
 
-/// §80.3「机器识别以下 9 个承重块」正文前的锚点，定位其后紧跟的 ```text 围栏。
+/// §80.3「机器识别以下 10 个承重块」正文前的锚点，定位其后紧跟的 ```text 围栏。
 ///
 /// 数字是锚点的一部分：块数一变，这里先找不到围栏、`parse_canonical_blocks` 返回空集，
 /// 正哨兵随即以「0 个」变红——所以改块数时这个常量、下面的期望值、以及 fixture 三处必须
 /// 同改，漏一处当天即红（ADR-0004）。
-const BLOCK_LIST_ANCHOR: &str = "机器识别以下 9 个承重块：";
+const BLOCK_LIST_ANCHOR: &str = "机器识别以下 10 个承重块：";
 const GENERIC_FENCE_OPEN: &str = "```text";
 const IMPACT_MAP_FENCE_OPEN: &str = "```contract-impact-map";
 const FENCE_CLOSE_LINE: &str = "\n```";
@@ -122,17 +122,17 @@ fn parse_impact_map(text: &str) -> Vec<ImpactMapRow> {
 }
 
 /// §80.3「映射本身不能偷偷漏新 block」正哨兵：`actual_canonical_block_ids == impact-map 第一列`，
-/// 且恰好 9 个（注错 C 多一个、注错 D 变空集，两者都在这里被拦）。
+/// 且恰好 10 个（注错 C 多一个、注错 D 变空集，两者都在这里被拦）。
 fn check_positive_sentinel(blocks: &[CanonicalBlock], map: &[ImpactMapRow]) -> GateResult {
     let actual: BTreeSet<&str> = blocks.iter().map(|b| b.id.as_str()).collect();
     let mapped: BTreeSet<&str> = map.iter().map(|r| r.block_id.as_str()).collect();
     let label = "block-sentinel".to_string();
-    if actual.len() != 9 {
+    if actual.len() != 10 {
         return GateResult {
             label,
             status: GateStatus::Fail,
             detail: format!(
-                "actual canonical block ids = {} 个（期望恰 9 个）: {actual:?}",
+                "actual canonical block ids = {} 个（期望恰 10 个）: {actual:?}",
                 actual.len()
             ),
         };
@@ -283,6 +283,15 @@ fn resolve_block_locations(spec_text: &str) -> BTreeMap<&'static str, Vec<Locati
         )
         .map_or(vec![], |(s, e)| vec![Location::SpecRange(s, e)]),
     );
+    m.insert(
+        "CONTINUITY_AUTHORITY",
+        section_range(
+            spec_text,
+            "### 25.3.1 Project Continuity Authority / Completeness",
+            |l| l.starts_with("### ") || l.starts_with("## ") || l.starts_with("# "),
+        )
+        .map_or(vec![], |(s, e)| vec![Location::SpecRange(s, e)]),
+    );
     m
 }
 
@@ -323,6 +332,10 @@ enum CheckerKind {
 fn default_checker_kind(id: &str) -> CheckerKind {
     match id {
         "G80-3" => CheckerKind::Implemented("architecture-check"),
+        // §6.2.2/§6.2.3 are live gates, not Phase-0 placeholders. A permission
+        // change must require both actual CI commands rather than silently skipping them.
+        "G80-26" => CheckerKind::Implemented("rls-check"),
+        "G80-40" => CheckerKind::Implemented("architecture-check"),
         // G80-43 与 G80-3 同型：判据本体活在 `architecture-check` 内部
         // （`g80_43_grounding_validity`，§11.10#G11-2），没有独立子命令。
         "G80-43" => CheckerKind::Implemented("architecture-check"),
@@ -628,7 +641,7 @@ mod tests {
         fs::read_to_string(path).expect("ci.yml must be readable in test env")
     }
 
-    /// 最小合规 fixture：镜像真实 §80.3 两个围栏的形状，9 行对 9 行，独立于真 spec
+    /// 最小合规 fixture：镜像真实 §80.3 两个围栏的形状，10 行对 10 行，独立于真 spec
     /// （§1.14 冻结的「唯一副本」约束的是生产解析目标，不约束测试 fixture，同
     /// mechanism_registry.rs 的先例）。
     const VALID_FIXTURE: &str = "\
@@ -656,9 +669,15 @@ metric table body
 
 ## 41.3 boundary
 
+### 25.3.1 Project Continuity Authority / Completeness
+
+continuity authority body
+
+## 25.4 boundary
+
 ## 80.3 contract-impact-check
 
-机器识别以下 9 个承重块：
+机器识别以下 10 个承重块：
 
 ```text
 MECHANISM_SPEC      §1.14  mechanism-registry fence
@@ -670,6 +689,7 @@ WORKSPACE_LAYOUT    §58    workspace tree
 GATE_REGISTRY       §80.1  G80 registry
 GROUNDING_CONTRACT   §8.8/§11.10 grounding contract
 NETWORK_BOUNDARY     §83.4 network boundary
+CONTINUITY_AUTHORITY §25.3.1 continuity authority
 ```
 
 ```contract-impact-map
@@ -682,6 +702,7 @@ WORKSPACE_LAYOUT | workspace-member-check,G80-3,G80-40,G80-41
 GATE_REGISTRY    | G80-23,G80-24,gate-phase-coverage
 GROUNDING_CONTRACT| G80-43,grounding-evolution-contract
 NETWORK_BOUNDARY  | G80-3,network-boundary-contract
+CONTINUITY_AUTHORITY | G80-46,mcp-contract-lock,continuity-authority-live
 ```
 ";
 
@@ -691,8 +712,8 @@ NETWORK_BOUNDARY  | G80-3,network-boundary-contract
     fn valid_fixture_sentinel_passes() {
         let blocks = parse_canonical_blocks(VALID_FIXTURE);
         let map = parse_impact_map(VALID_FIXTURE);
-        assert_eq!(blocks.len(), 9);
-        assert_eq!(map.len(), 9);
+        assert_eq!(blocks.len(), 10);
+        assert_eq!(map.len(), 10);
         assert_eq!(
             check_positive_sentinel(&blocks, &map).status,
             GateStatus::Pass
@@ -718,6 +739,52 @@ NETWORK_BOUNDARY  | G80-3,network-boundary-contract
                 row.block_id
             );
         }
+    }
+
+    #[test]
+    fn continuity_authority_block_and_checker_map_fail_closed() {
+        let blocks = parse_canonical_blocks(VALID_FIXTURE);
+        let map = parse_impact_map(VALID_FIXTURE);
+        let locations = resolve_block_locations(VALID_FIXTURE);
+        assert!(locations["CONTINUITY_AUTHORITY"].len() == 1);
+        let Location::SpecRange(line, _) = locations["CONTINUITY_AUTHORITY"][0] else {
+            panic!("continuity authority must be a spec range");
+        };
+
+        let missing_row = map
+            .iter()
+            .filter(|row| row.block_id != "CONTINUITY_AUTHORITY")
+            .cloned()
+            .collect::<Vec<_>>();
+        let red = check_positive_sentinel(&blocks, &missing_row);
+        assert_eq!(red.status, GateStatus::Fail);
+        assert!(red.detail.contains("CONTINUITY_AUTHORITY"));
+
+        let statuses = evaluate_closure(
+            &map,
+            &locations,
+            &[SPEC_PATH.to_string()].into(),
+            &[line].into(),
+            &BTreeSet::new(),
+            default_checker_kind,
+        );
+        let continuity = statuses
+            .iter()
+            .filter(|(block, _, _)| block == "CONTINUITY_AUTHORITY")
+            .collect::<Vec<_>>();
+        assert_eq!(continuity.len(), 3);
+        assert_eq!(
+            continuity
+                .iter()
+                .map(|(_, checker, _)| checker.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["G80-46", "continuity-authority-live", "mcp-contract-lock",])
+        );
+        assert!(
+            continuity
+                .iter()
+                .all(|(_, _, status)| matches!(status, CheckerStatus::NotApplicable(_)))
+        );
     }
 
     // ---- G80-42 注错 A：修改 MECHANISM_SPEC，CI manifest 删除 G80-10 -> mandatory checker 缺项 ----
@@ -780,20 +847,15 @@ NETWORK_BOUNDARY  | G80-3,network-boundary-contract
         };
         let changed_lines: BTreeSet<usize> = [db_range].into();
 
-        // 场景内假设 G80-26/G80-40 都已实现（不同于当前仓库真实状态），专测「跑了一个漏一个」。
-        let kind_fn = |id: &str| match id {
-            "G80-26" => CheckerKind::Implemented("role-grant-check"),
-            "G80-40" => CheckerKind::Implemented("db-pool-topology-check"),
-            other => default_checker_kind(other),
-        };
-        let ci_only_g80_26 = "run: cargo xtask role-grant-check\n";
+        // Use the real dispatch: an invented test-only mapping hid the production gap.
+        let ci_only_g80_26 = "run: cargo xtask rls-check\n";
         let red = evaluate_closure(
             &map,
             &locations,
             &changed_files,
             &changed_lines,
             &executed_xtask_subcommands(ci_only_g80_26),
-            kind_fn,
+            default_checker_kind,
         );
         assert!(matches!(
             red.iter()
@@ -810,17 +872,32 @@ NETWORK_BOUNDARY  | G80-3,network-boundary-contract
             CheckerStatus::Pass
         );
 
-        let ci_both =
-            "run: cargo xtask role-grant-check\nrun: cargo xtask db-pool-topology-check\n";
+        let ci_both = "run: cargo xtask rls-check\nrun: cargo xtask architecture-check\n";
         let green = evaluate_closure(
             &map,
             &locations,
             &changed_files,
             &changed_lines,
             &executed_xtask_subcommands(ci_both),
-            kind_fn,
+            default_checker_kind,
         );
         assert!(green.iter().all(|(_, _, s)| *s == CheckerStatus::Pass));
+        let only_topology = evaluate_closure(
+            &map,
+            &locations,
+            &changed_files,
+            &changed_lines,
+            &executed_xtask_subcommands("run: cargo xtask architecture-check\n"),
+            default_checker_kind,
+        );
+        assert!(matches!(
+            only_topology
+                .iter()
+                .find(|(_, c, _)| c == "G80-26")
+                .unwrap()
+                .2,
+            CheckerStatus::Fail(_)
+        ));
     }
 
     // ---- G80-42 注错 C：加第 8 个 block，不加 impact-map 行 -> 正哨兵红 ----
@@ -942,6 +1019,12 @@ NETWORK_BOUNDARY  | G80-3,network-boundary-contract
         let executed = executed_xtask_subcommands(&real_ci_yml());
         assert!(executed.contains("mechanism-registry"));
         assert!(executed.contains("config-check"));
+        for checker in ["G80-26", "G80-40"] {
+            assert_eq!(
+                evaluate_checker(checker, &executed, default_checker_kind),
+                CheckerStatus::Pass
+            );
+        }
     }
 
     // ---- blocker fix: missing --base in an actual CI run must fail, not silently skip ----

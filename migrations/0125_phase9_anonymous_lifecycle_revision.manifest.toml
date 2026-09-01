@@ -1,0 +1,22 @@
+migration_id = "0125_phase9_anonymous_lifecycle_revision"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('public.carry_forward_anonymous_claim_lifecycle(uuid,bigint,bigint)') is null
+  as precheck_ok
+"""
+
+postcheck = """
+select to_regprocedure('public.carry_forward_anonymous_claim_lifecycle(uuid,bigint,bigint)') is not null
+  and has_function_privilege('role_public_worker',
+    'public.carry_forward_anonymous_claim_lifecycle(uuid,bigint,bigint)','EXECUTE')
+  and not has_function_privilege('role_gateway',
+    'public.carry_forward_anonymous_claim_lifecycle(uuid,bigint,bigint)','EXECUTE')
+  and not has_function_privilege('role_public_worker','control.anonymous_source_lineage','SELECT')
+  and (select prosecdef and provolatile='v' and prorettype='void'::regtype
+       from pg_proc where oid='public.carry_forward_anonymous_claim_lifecycle(uuid,bigint,bigint)'::regprocedure)
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Lifecycle receipts are append-only evidence; repair successor-revision selection or ACL behavior in a later migration."
+backup_restore_requirement = "Apply only to an isolated PostgreSQL acceptance fixture for rehearsal. Production rollout requires an approved backup because this adds append-only lifecycle receipts."

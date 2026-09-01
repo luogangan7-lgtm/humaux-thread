@@ -24,9 +24,10 @@ use crate::authority::{
 };
 use crate::error::ErrorCode;
 use crate::evidence::EvidenceOriginClass;
-use crate::grounding::{GroundingStateKind, RowGrounding};
+use crate::grounding::{GroundingState, GroundingStateKind, RowGrounding};
 use crate::ids::Scope;
 use crate::memory::MemoryType;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 // =============================================================================
@@ -279,7 +280,7 @@ pub struct MandatoryRow {
     selector: SelectorId,
     authority: AuthorityClass,
     est_tokens: u32,
-    not_judged: bool,
+    grounding_state: Option<GroundingState>,
 }
 
 /// DOD-093 的 fail-loud 载体：一条**没能**进 lane 的行，与它没能进的原因。
@@ -330,7 +331,7 @@ impl MandatoryRow {
         if (authority as u8) < (spec.min_authority as u8) {
             return Err(ErrorCode::InvalidInput);
         }
-        let not_judged = match grounding {
+        let grounding_state = match grounding {
             RowGrounding::Judged(state) => {
                 if state.revokes_current_truth_assumption() {
                     return Ok(Admitted::NeedsVerification(NeedsVerification {
@@ -339,23 +340,29 @@ impl MandatoryRow {
                         state: state.kind(),
                     }));
                 }
-                false
+                Some(state)
             }
-            RowGrounding::NotJudged => true,
+            RowGrounding::NotJudged => None,
         };
         Ok(Admitted::Row(Self {
             memory_id,
             selector: spec.id,
             authority,
             est_tokens,
-            not_judged,
+            grounding_state,
         }))
     }
 
     /// 快照内没能裁定 grounding 的行（见 [`RowGrounding::NotJudged`]）。上报用。
     #[must_use]
     pub const fn not_judged(&self) -> bool {
-        self.not_judged
+        self.grounding_state.is_none()
+    }
+
+    /// §8.8 已经派生的 grounding 状态；`None` 表示本快照未裁定。
+    #[must_use]
+    pub const fn grounding_state(&self) -> Option<GroundingState> {
+        self.grounding_state
     }
 
     /// 这行指向的 memory。
@@ -391,13 +398,13 @@ impl MandatoryRow {
 /// 安静地少带东西。
 #[derive(Debug)]
 pub enum SelectorOutcome {
-    /// 跑到了。`expected` 必须来自与 `rows` **分离的一次 COUNT**（不带 LIMIT），
-    /// 不是 `rows.len()`——内生的 expected 会让 §25.5 的守恒式退化成恒真算术。
+    /// 独立、无 LIMIT 的授权候选枚举，与返回 rows 分离。保留 ID 才能在 selector
+    /// 重叠时建立唯一全集；用 rows.len() 会让 §25.5 的守恒式退化成恒真算术。
     Ran {
         /// 哪个 selector。
         id: SelectorId,
-        /// 独立 COUNT 得到的应有条数。
-        expected: u64,
+        /// 独立授权枚举得到的候选 identity；不是 rows 的派生值。
+        candidate_ids: Vec<MemoryId>,
         /// 实际取回的行（已过铸造门）。
         rows: Vec<MandatoryRow>,
         /// 被铸造门分流的行（DOD-093：与 `rows` 同源同到场，不许丢）。
@@ -424,7 +431,7 @@ pub struct MandatoryLane {
 impl MandatoryLane {
     /// 唯一构造点，收**定长数组**而不是 `Vec`——调用方少传一个 selector 会编译不过。
     ///
-    /// **恒成功（partial lane），推翻本模块上一版的整条拒建。** 上一版：任一
+    /// **Unavailable 可形成 partial lane，不因缺失 selector 整条拒建。** 上一版：任一
     /// `Unavailable` ⇒ `Err(LaneUnavailable)`。后果（实测）：真 schema 缺
     /// `private.memory_records.task_id` 与 `.facet` 两列，两个 selector **恒**不可用 ⇒
     /// lane **永远**构不出来 ⇒ G80-31 永远 NA——按「没有注错红转绿的闸不算存在」，
@@ -434,38 +441,95 @@ impl MandatoryLane {
     /// 逐个具名（probe 探测出的缺失对象），completeness 在它非空时构造不出 complete
     /// （envelope 侧断言），handoff 顶层块如实携带。缺列补上的那天 probe 自动改口，
     /// 无人需要回来改代码（ADR-0006）。
-    pub fn from_selectors(out: [SelectorOutcome; 5]) -> Self {
+    ///
+    /// 同一候选的治理状态矛盾、行不属于自己的 selector 候选集时返回 Internal。
+    pub fn from_selectors(out: [SelectorOutcome; 5]) -> Result<Self, ErrorCode> {
         let mut unavailable = Vec::new();
-        let mut expected = 0u64;
-        let mut rows = Vec::new();
-        let mut needs = Vec::new();
-        for o in out {
-            match o {
+        let mut candidate_ids = HashSet::new();
+        let mut seen_selectors = HashSet::new();
+        let mut rows: Vec<MandatoryRow> = Vec::new();
+        let mut needs: Vec<NeedsVerification> = Vec::new();
+        for outcome in out {
+            let id = match &outcome {
+                SelectorOutcome::Ran { id, .. } | SelectorOutcome::Unavailable { id, .. } => *id,
+            };
+            if !seen_selectors.insert(id) {
+                return Err(ErrorCode::Internal);
+            }
+            match outcome {
                 SelectorOutcome::Unavailable { id, missing_object } => {
                     unavailable.push((id, missing_object));
                 }
                 SelectorOutcome::Ran {
-                    expected: e,
-                    rows: mut r,
-                    needs_verification: mut nv,
-                    ..
+                    id,
+                    candidate_ids: candidates,
+                    rows: mut selector_rows,
+                    needs_verification: mut selector_needs,
                 } => {
-                    expected = expected.saturating_add(e);
-                    rows.append(&mut r);
-                    needs.append(&mut nv);
+                    let selector_candidates: HashSet<MemoryId> = candidates.into_iter().collect();
+                    if selector_rows.iter().any(|row| {
+                        row.selector() != id || !selector_candidates.contains(&row.memory_id())
+                    }) || selector_needs.iter().any(|need| {
+                        need.selector != id || !selector_candidates.contains(&need.memory_id)
+                    }) {
+                        return Err(ErrorCode::Internal);
+                    }
+                    candidate_ids.extend(selector_candidates);
+                    rows.append(&mut selector_rows);
+                    needs.append(&mut selector_needs);
                 }
             }
         }
-        // 字节域卫生：按 (selector, memory_id) 定序——顺序是构造出来的，不是调用方碰巧的。
-        rows.sort_by_key(|r| (r.selector as u8, r.memory_id.0));
-        needs.sort_by_key(|n| (n.selector as u8, n.memory_id.0));
+        rows.sort_by_key(|row| (row.memory_id.0, row.selector as u8));
+        needs.sort_by_key(|need| (need.memory_id.0, need.selector as u8));
         unavailable.sort_by_key(|(id, _)| *id as u8);
-        Self {
-            expected,
-            rows,
-            needs_verification: needs,
-            unavailable,
+
+        let mut unique_rows: Vec<MandatoryRow> = Vec::with_capacity(rows.len());
+        for row in rows {
+            if !candidate_ids.contains(&row.memory_id()) {
+                return Err(ErrorCode::Internal);
+            }
+            if let Some(previous) = unique_rows.last()
+                && previous.memory_id() == row.memory_id()
+            {
+                if previous.grounding_state() != row.grounding_state() {
+                    return Err(ErrorCode::Internal);
+                }
+                continue;
+            }
+            unique_rows.push(row);
         }
+
+        let mut unique_needs: Vec<NeedsVerification> = Vec::with_capacity(needs.len());
+        for need in needs {
+            if !candidate_ids.contains(&need.memory_id) {
+                return Err(ErrorCode::Internal);
+            }
+            if unique_rows
+                .iter()
+                .any(|row: &MandatoryRow| row.memory_id() == need.memory_id)
+            {
+                return Err(ErrorCode::Internal);
+            }
+            if let Some(previous) = unique_needs.last()
+                && previous.memory_id == need.memory_id
+            {
+                if previous.state != need.state {
+                    return Err(ErrorCode::Internal);
+                }
+                continue;
+            }
+            unique_needs.push(need);
+        }
+
+        unique_rows.sort_by_key(|row| (row.selector as u8, row.memory_id.0));
+        unique_needs.sort_by_key(|need| (need.selector as u8, need.memory_id.0));
+        Ok(Self {
+            expected: candidate_ids.len() as u64,
+            rows: unique_rows,
+            needs_verification: unique_needs,
+            unavailable,
+        })
     }
 
     /// 被铸造门分流的行（DOD-093 的 `needs_verification[]` 来源）。
@@ -481,7 +545,7 @@ impl MandatoryLane {
         &self.unavailable
     }
 
-    /// 应有条数（各 selector 独立 COUNT 之和）。
+    /// 可用 selector 独立授权候选 ID 的并集基数；不可用的 selector 另行具名。
     #[must_use]
     pub const fn expected(&self) -> u64 {
         self.expected
@@ -534,6 +598,18 @@ pub struct PinnedLane {
     excluded: Vec<MemoryId>,
 }
 
+fn mandatory_memory_ids(mandatory: &MandatoryLane) -> HashSet<MemoryId> {
+    mandatory
+        .rows()
+        .iter()
+        .map(MandatoryRow::memory_id)
+        .collect()
+}
+
+fn is_pinned_only(row: &MandatoryRow, mandatory_ids: &HashSet<MemoryId>) -> bool {
+    !mandatory_ids.contains(&row.memory_id())
+}
+
 impl PinnedLane {
     /// 唯一构造点。`expected` 必须来自与取行分离的独立 COUNT（同 Mandatory 的纪律）。
     #[must_use]
@@ -545,6 +621,25 @@ impl PinnedLane {
             rows,
             excluded,
         }
+    }
+
+    /// Removes Pinned rows already emitted by Mandatory. The independent PINNED `expected`
+    /// oracle remains unchanged; the overlap is named as excluded so the lane's coverage
+    /// remains observable while one Memory consumes one Context slot and token charge.
+    #[must_use]
+    pub fn excluding_mandatory(mut self, mandatory: &MandatoryLane) -> Self {
+        let mandatory_ids = mandatory_memory_ids(mandatory);
+        self.rows.retain(|row| {
+            if is_pinned_only(row, &mandatory_ids) {
+                true
+            } else {
+                self.excluded.push(row.memory_id());
+                false
+            }
+        });
+        self.excluded.sort_by_key(|memory_id| memory_id.0);
+        self.excluded.dedup();
+        self
     }
 
     /// 独立 COUNT 得到的「钉了几条」。
@@ -661,14 +756,23 @@ impl ContextBudget {
         m: &MandatoryLane,
         p: &PinnedLane,
     ) -> Result<SupplementalBudget, MandatoryOverflow> {
-        let required = m.total_tokens().saturating_add(p.total_tokens());
+        let mandatory_ids = mandatory_memory_ids(m);
+        let pinned_rows: Vec<&MandatoryRow> = p
+            .rows()
+            .iter()
+            .filter(|row| is_pinned_only(row, &mandatory_ids))
+            .collect();
+        let pinned_tokens = pinned_rows
+            .iter()
+            .fold(0u32, |acc, row| acc.saturating_add(row.est_tokens));
+        let required = m.total_tokens().saturating_add(pinned_tokens);
         if required > self.mandatory_cap_tokens {
             return Err(MandatoryOverflow {
                 expected: m.expected(),
                 manifest: m
                     .rows()
                     .iter()
-                    .chain(p.rows().iter())
+                    .chain(pinned_rows)
                     .map(MandatoryRow::memory_id)
                     .collect(),
                 budget_tokens: self.mandatory_cap_tokens,
@@ -946,18 +1050,25 @@ mod tests {
     }
 
     fn row(spec: &'static SelectorSpec, tokens: u32) -> MandatoryRow {
-        match MandatoryRow::from_selector(
-            spec,
-            MemoryId(Uuid::now_v7()),
-            spec.min_authority,
-            tokens,
-            current(),
-        )
-        .expect("min_authority 恰好等于下限，必须收下")
+        row_with_id(spec, MemoryId(Uuid::now_v7()), tokens)
+    }
+
+    fn row_with_id(spec: &'static SelectorSpec, memory_id: MemoryId, tokens: u32) -> MandatoryRow {
+        match MandatoryRow::from_selector(spec, memory_id, spec.min_authority, tokens, current())
+            .expect("min_authority 恰好等于下限，必须收下")
         {
             Admitted::Row(r) => r,
             Admitted::NeedsVerification(nv) => panic!("CURRENT 行不该被分流: {nv:?}"),
         }
+    }
+
+    fn empty_selector_outcomes() -> [SelectorOutcome; 5] {
+        std::array::from_fn(|index| SelectorOutcome::Ran {
+            id: REGISTRY[index].id,
+            candidate_ids: vec![],
+            rows: vec![],
+            needs_verification: vec![],
+        })
     }
 
     // ---- registry ----
@@ -1090,6 +1201,7 @@ mod tests {
     /// 构造不出 complete（envelope 侧断言），handoff 如实携带。
     #[test]
     fn unavailable_selectors_are_named_on_the_lane_not_fatal() {
+        let memory_id = MemoryId(Uuid::now_v7());
         let out = [
             SelectorOutcome::Unavailable {
                 id: SelectorId::TaskExplicitContextV1,
@@ -1097,13 +1209,17 @@ mod tests {
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
-                expected: 1,
-                rows: vec![row(spec(SelectorId::ProjectActiveConstraintsV1), 10)],
+                candidate_ids: vec![memory_id],
+                rows: vec![row_with_id(
+                    spec(SelectorId::ProjectActiveConstraintsV1),
+                    memory_id,
+                    10,
+                )],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
@@ -1113,12 +1229,12 @@ mod tests {
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
         ];
-        let lane = MandatoryLane::from_selectors(out);
+        let lane = MandatoryLane::from_selectors(out).expect("consistent selector snapshots");
         assert_eq!(
             lane.unavailable().len(),
             2,
@@ -1164,37 +1280,47 @@ mod tests {
         let lane = MandatoryLane::from_selectors([
             SelectorOutcome::Ran {
                 id: SelectorId::TaskExplicitContextV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
-                expected: 1,
+                candidate_ids: vec![id],
                 rows: vec![],
                 needs_verification: vec![nv],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
-        ]);
+        ])
+        .expect("consistent selector snapshots");
         assert_eq!(lane.needs_verification().len(), 1);
         assert_eq!(lane.needs_verification()[0].memory_id, id);
+    }
+
+    /// Judged CURRENT survives admission so later Context aggregation does not invent a state.
+    #[test]
+    fn current_rows_retain_their_derived_grounding_state() {
+        let state = row(spec(SelectorId::ProjectActiveConstraintsV1), 10)
+            .grounding_state()
+            .expect("CURRENT must remain available to the reader");
+        assert_eq!(state.kind(), GroundingStateKind::Current);
     }
 
     /// NotJudged（快照内不可裁）铸进 row 但带 not_judged 标——第三臂不是 CURRENT 的别名。
@@ -1210,50 +1336,58 @@ mod tests {
         )
         .expect("参数合法");
         match admitted {
-            Admitted::Row(r) => assert!(r.not_judged(), "NotJudged 必须留痕"),
+            Admitted::Row(r) => {
+                assert!(r.not_judged(), "NotJudged 必须留痕");
+                assert!(r.grounding_state().is_none());
+            }
             Admitted::NeedsVerification(nv) => panic!("NotJudged 不该被分流: {nv:?}"),
         }
     }
 
-    /// `expected` 来自各 selector 的独立 COUNT，`returned` 是算出来的。
+    /// `expected` 来自各 selector 的独立授权候选并集，`returned` 是算出来的。
     /// **守恒式必须能红**：expected 若退化成 rows.len()，下面第二条断言就永远成立了。
     #[test]
     fn expected_comes_from_counts_not_from_rows_len() {
         let s = spec(SelectorId::ProjectActiveConstraintsV1);
+        let candidates = [
+            MemoryId(Uuid::now_v7()),
+            MemoryId(Uuid::now_v7()),
+            MemoryId(Uuid::now_v7()),
+        ];
         let out = [
             SelectorOutcome::Ran {
                 id: SelectorId::TaskExplicitContextV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
-            // COUNT 说有 3 条，实际只取回 1 条（分页/LIMIT 之类）。
+            // 独立候选集合有 3 条，实际只取回 1 条（分页/LIMIT 之类）。
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
-                expected: 3,
-                rows: vec![row(s, 10)],
+                candidate_ids: candidates.to_vec(),
+                rows: vec![row_with_id(s, candidates[0], 10)],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
         ];
-        let lane = MandatoryLane::from_selectors(out);
+        let lane = MandatoryLane::from_selectors(out).expect("consistent selector snapshots");
         assert_eq!(lane.expected(), 3);
         assert_eq!(lane.returned(), 1);
         assert_eq!(lane.missing(), 2, "少带了 2 条，这个差额必须显式可见");
@@ -1262,6 +1396,194 @@ mod tests {
             lane.returned(),
             lane.missing()
         ));
+    }
+
+    #[test]
+    fn selector_union_counts_and_budgets_each_memory_once_without_reordering() {
+        let project = SelectorId::ProjectActiveConstraintsV1;
+        let explicit = SelectorId::ExplicitMandatoryBindingsV1;
+        // The explicit-only ID sorts first by UUID, but selector order must still put it last.
+        let explicit_only = MemoryId(Uuid::from_u128(1));
+        let project_only = MemoryId(Uuid::from_u128(2));
+        let overlap = MemoryId(Uuid::from_u128(3));
+        let not_judged_row = |id, memory_id| {
+            let selector = spec(id);
+            match MandatoryRow::from_selector(
+                selector,
+                memory_id,
+                selector.min_authority,
+                10,
+                RowGrounding::NotJudged,
+            )
+            .expect("valid NotJudged candidate")
+            {
+                Admitted::Row(row) => row,
+                Admitted::NeedsVerification(_) => panic!("NotJudged remains deliverable"),
+            }
+        };
+        let mut outcomes = empty_selector_outcomes();
+        outcomes[project as usize] = SelectorOutcome::Ran {
+            id: project,
+            candidate_ids: vec![project_only, overlap],
+            rows: vec![
+                not_judged_row(project, overlap),
+                not_judged_row(project, project_only),
+            ],
+            needs_verification: vec![],
+        };
+        outcomes[explicit as usize] = SelectorOutcome::Ran {
+            id: explicit,
+            candidate_ids: vec![explicit_only, overlap],
+            rows: vec![
+                not_judged_row(explicit, overlap),
+                not_judged_row(explicit, explicit_only),
+            ],
+            needs_verification: vec![],
+        };
+        let lane = MandatoryLane::from_selectors(outcomes).expect("same candidate facts");
+        assert_eq!(
+            (lane.expected(), lane.returned(), lane.missing()),
+            (3, 3, 0)
+        );
+        assert_eq!(
+            lane.rows()
+                .iter()
+                .map(MandatoryRow::memory_id)
+                .collect::<Vec<_>>(),
+            vec![project_only, overlap, explicit_only]
+        );
+        assert!(lane.rows().iter().all(MandatoryRow::not_judged));
+        let remaining = ContextBudget::new(35, 30)
+            .expect("budget")
+            .reserve(&lane, &PinnedLane::new(0, vec![], vec![]))
+            .expect("duplicate selector hit must not consume another 10 tokens");
+        assert_eq!(remaining.tokens(), 5);
+    }
+
+    #[test]
+    fn overlapping_selector_grounding_cannot_be_resolved_by_priority() {
+        let project = SelectorId::ProjectActiveConstraintsV1;
+        let explicit = SelectorId::ExplicitMandatoryBindingsV1;
+        let id = MemoryId(Uuid::now_v7());
+        for diverted in [false, true] {
+            let mut outcomes = empty_selector_outcomes();
+            outcomes[project as usize] = SelectorOutcome::Ran {
+                id: project,
+                candidate_ids: vec![id],
+                rows: vec![row_with_id(spec(project), id, 10)],
+                needs_verification: vec![],
+            };
+            let (rows, needs_verification) = if diverted {
+                (
+                    vec![],
+                    vec![NeedsVerification {
+                        memory_id: id,
+                        selector: explicit,
+                        state: GroundingStateKind::RecheckRequired,
+                    }],
+                )
+            } else {
+                let row = match MandatoryRow::from_selector(
+                    spec(explicit),
+                    id,
+                    spec(explicit).min_authority,
+                    10,
+                    RowGrounding::NotJudged,
+                )
+                .expect("NotJudged row")
+                {
+                    Admitted::Row(row) => row,
+                    Admitted::NeedsVerification(_) => panic!("NotJudged must be deliverable"),
+                };
+                (vec![row], vec![])
+            };
+            outcomes[explicit as usize] = SelectorOutcome::Ran {
+                id: explicit,
+                candidate_ids: vec![id],
+                rows,
+                needs_verification,
+            };
+            assert!(
+                matches!(
+                    MandatoryLane::from_selectors(outcomes),
+                    Err(ErrorCode::Internal)
+                ),
+                "same-RR Current vs NotJudged/needs conflict cannot choose a favorable selector"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_verification_needs_are_unique_but_conflicting_states_fail_closed() {
+        let project = SelectorId::ProjectActiveConstraintsV1;
+        let explicit = SelectorId::ExplicitMandatoryBindingsV1;
+        let id = MemoryId(Uuid::now_v7());
+        for conflict in [false, true] {
+            let mut outcomes = empty_selector_outcomes();
+            for selector in [project, explicit] {
+                outcomes[selector as usize] = SelectorOutcome::Ran {
+                    id: selector,
+                    candidate_ids: vec![id],
+                    rows: vec![],
+                    needs_verification: vec![NeedsVerification {
+                        memory_id: id,
+                        selector,
+                        state: if conflict && selector == explicit {
+                            GroundingStateKind::Unresolved
+                        } else {
+                            GroundingStateKind::RecheckRequired
+                        },
+                    }],
+                };
+            }
+            let result = MandatoryLane::from_selectors(outcomes);
+            if conflict {
+                assert!(matches!(result, Err(ErrorCode::Internal)));
+            } else {
+                let lane = result.expect("consistent diagnostic");
+                assert_eq!(
+                    (lane.expected(), lane.returned(), lane.missing()),
+                    (1, 0, 1)
+                );
+                assert_eq!(lane.needs_verification().len(), 1);
+                assert_eq!(lane.needs_verification()[0].selector, project);
+            }
+        }
+    }
+
+    #[test]
+    fn selector_identity_and_candidate_membership_are_checked_before_union() {
+        let project = SelectorId::ProjectActiveConstraintsV1;
+        let explicit = SelectorId::ExplicitMandatoryBindingsV1;
+        let id = MemoryId(Uuid::now_v7());
+        for fault in 0..3 {
+            let mut outcomes = empty_selector_outcomes();
+            outcomes[project as usize] = SelectorOutcome::Ran {
+                id: project,
+                candidate_ids: if fault == 0 { vec![] } else { vec![id] },
+                rows: vec![row_with_id(
+                    spec(if fault == 1 { explicit } else { project }),
+                    id,
+                    10,
+                )],
+                needs_verification: vec![],
+            };
+            if fault == 2 {
+                outcomes[explicit as usize] = SelectorOutcome::Ran {
+                    id: project,
+                    candidate_ids: vec![],
+                    rows: vec![],
+                    needs_verification: vec![],
+                };
+            }
+            assert!(
+                matches!(
+                    MandatoryLane::from_selectors(outcomes),
+                    Err(ErrorCode::Internal)
+                ),
+                "missing candidate, wrong selector, or duplicate selector must fail closed"
+            );
+        }
     }
 
     /// 守恒式本身要能判假——否则它只是一句装饰。
@@ -1285,84 +1607,136 @@ mod tests {
     #[test]
     fn reserve_returns_the_remaining_budget() {
         let s = spec(SelectorId::ProjectActiveConstraintsV1);
+        let memory_id = MemoryId(Uuid::now_v7());
         let m = MandatoryLane::from_selectors([
             SelectorOutcome::Ran {
                 id: SelectorId::TaskExplicitContextV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
-                expected: 1,
-                rows: vec![row(s, 30)],
+                candidate_ids: vec![memory_id],
+                rows: vec![row_with_id(s, memory_id, 30)],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
-        ]);
+        ])
+        .expect("consistent selector snapshots");
         let p = PinnedLane::new(1, vec![row(s, 20)], vec![]);
         let budget = ContextBudget::new(200, 100).expect("budget");
         let rest = budget.reserve(&m, &p).expect("30 + 20 <= 100，不该溢出");
         assert_eq!(rest.tokens(), 150, "200 - (30 + 20)");
     }
 
-    /// §25.5 的核心：Mandatory 超上限 ⇒ `Err`，**且那个 Err 里没有可交付的 Context**。
-    ///
-    /// 「截掉后半段还声称 complete」在这里不是被禁止的操作——`MandatoryOverflow` 根本没有
-    /// 装 rows 的地方。本条能断言的是它带齐了 §25.5 要求的 manifest 与量纲；
-    /// 「没有 rows 可返回」由类型定义保证，不由本条保证。
+    /// A raw overlap still represents one physical Context item: mandatory owns it, so
+    /// reservation neither double charges nor falsely overflows.
     #[test]
-    fn mandatory_overflow_carries_a_full_manifest_and_no_context() {
+    fn reserve_charges_a_raw_cross_lane_overlap_once() {
         let s = spec(SelectorId::ProjectActiveConstraintsV1);
+        let memory_id = MemoryId(Uuid::now_v7());
         let m = MandatoryLane::from_selectors([
             SelectorOutcome::Ran {
                 id: SelectorId::TaskExplicitContextV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
-                expected: 2,
-                rows: vec![row(s, 80), row(s, 80)],
+                candidate_ids: vec![memory_id],
+                rows: vec![row_with_id(s, memory_id, 10)],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
-        ]);
+        ])
+        .expect("consistent selector snapshots");
+        let p = PinnedLane::new(1, vec![row_with_id(s, memory_id, 10)], vec![]);
+
+        let supplemental = ContextBudget::new(15, 10)
+            .expect("budget")
+            .reserve(&m, &p)
+            .expect("overlapping rows must not be double charged");
+
+        assert_eq!(supplemental.tokens(), 5);
+    }
+
+    /// Mandatory over cap returns an error with the complete manifest and no deliverable Context.
+    #[test]
+    fn mandatory_overflow_carries_a_full_manifest_and_no_context() {
+        let s = spec(SelectorId::ProjectActiveConstraintsV1);
+        let candidates = [MemoryId(Uuid::now_v7()), MemoryId(Uuid::now_v7())];
+        let m = MandatoryLane::from_selectors([
+            SelectorOutcome::Ran {
+                id: SelectorId::TaskExplicitContextV1,
+                candidate_ids: vec![],
+                rows: vec![],
+                needs_verification: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::ProjectActiveConstraintsV1,
+                candidate_ids: candidates.to_vec(),
+                rows: vec![
+                    row_with_id(s, candidates[0], 80),
+                    row_with_id(s, candidates[1], 80),
+                ],
+                needs_verification: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::UserConfirmedCorrectionsV1,
+                candidate_ids: vec![],
+                rows: vec![],
+                needs_verification: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::RequiredCurrentStateFacetsV1,
+                candidate_ids: vec![],
+                rows: vec![],
+                needs_verification: vec![],
+            },
+            SelectorOutcome::Ran {
+                id: SelectorId::ExplicitMandatoryBindingsV1,
+                candidate_ids: vec![],
+                rows: vec![],
+                needs_verification: vec![],
+            },
+        ])
+        .expect("consistent selector snapshots");
         let p = PinnedLane::new(1, vec![row(s, 10)], vec![]);
         let budget = ContextBudget::new(500, 100).expect("budget");
 

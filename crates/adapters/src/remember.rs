@@ -22,6 +22,7 @@ use humaux_domain::ids::TenantId;
 use humaux_projection::stream::StreamKey;
 
 use crate::postgres::RuntimeDbPool;
+use crate::retrieve::{self, TokenClaims};
 
 /// DB-layer failure plus the one domain-shaped terminal case this module can produce
 /// (§34.1 `BATCH_EXHAUSTED`). Adapter-local, not `humaux_domain::error::ErrorCode` itself —
@@ -31,6 +32,10 @@ use crate::postgres::RuntimeDbPool;
 #[derive(Debug)]
 pub enum RememberError {
     Db(sqlx::Error),
+    /// The caller-supplied consistency-token expiry is not after a validation clock reading.
+    /// `remember` returns this only with no committed writes; a late check rolls its transaction
+    /// back after a lock wait consumed the deadline.
+    ConsistencyTokenExpiryNotFuture,
     /// `cmd.batch_id` named a batch with zero remaining `state = 'ISSUED'` tickets (already
     /// fully redeemed, or every ticket expired). §34.1: "拒绝，错误码 BATCH_EXHAUSTED，不得
     /// 自动补票" — this variant carries no ticket, the transaction is rolled back (nothing this
@@ -48,6 +53,9 @@ impl std::fmt::Display for RememberError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Db(e) => write!(f, "remember DB error: {e}"),
+            Self::ConsistencyTokenExpiryNotFuture => {
+                write!(f, "consistency_token expiry must be after issuance time")
+            }
             Self::BatchExhausted => write!(f, "BATCH_EXHAUSTED (§34.1)"),
         }
     }
@@ -86,6 +94,10 @@ fn origin_class_db_str(c: EvidenceOriginClass) -> &'static str {
 #[derive(Debug, Clone)]
 pub struct RememberCommand {
     pub tenant_id: Uuid,
+    /// Authenticated actor from the trusted gateway request context. This is deliberately
+    /// distinct from `visibility_user_id`: workspace-shared Evidence has no visibility user,
+    /// but RLS still needs the acting member in `humaux.user_id`.
+    pub authorization_user_id: Option<Uuid>,
     /// `projection.stream_log` / `stream_checkpoints` locator (§15.1's other five PK columns,
     /// beyond `tenant_id`) — which pipeline this Evidence's stream_seq is issued against.
     pub scope_kind: String,
@@ -93,6 +105,11 @@ pub struct RememberCommand {
     pub domain: String,
     pub projection_kind: String,
     pub projection_version: String,
+    /// Explicit policy/configuration input for §15.5's token `expiry or policy` field.
+    /// It is validated against the one issuance clock captured by [`remember`] before any DB
+    /// write. This is an API break: callers must provide their own configured/policy expiry;
+    /// the adapter intentionally has no business TTL default.
+    pub consistency_token_expires_at: OffsetDateTime,
     /// `Some` = batch write (redeem one ticket, §34.1 row 1); `None` = single sync write, ticket
     /// untouched (§34.1 row 3, `expected_source = "none"`).
     pub batch_id: Option<Uuid>,
@@ -124,29 +141,32 @@ pub struct RememberAccepted {
     /// "一个 Evidence 后续可产生多条 memory_id" is a *query-time* fan-out, not something this
     /// handle itself encodes).
     pub processing_handle: String,
-    /// §15.5 opaque read-your-writes token. **Placeholder encoding** — a plain delimited
-    /// string, not signed/encrypted. §15.5's actual consumer (`recall`/`context` accepting
-    /// `consistency_token=<token>`, and the overlay-lower-bound logic reading it) is T3.8's
-    /// job, not this task's; that task owns the real encoding and may change this format
-    /// entirely. This task's literal scope per §60 is only "sign consistency_token" as
-    /// `remember`'s last step — never parsed by anything in this crate.
+    /// §15.5 opaque read-your-writes token, emitted only after the Evidence transaction commits.
+    /// Its one encoder is [`crate::retrieve::issue_consistency_token`]; it is not an
+    /// authentication token, and `recall` validates tenant/workspace against the authenticated
+    /// request context separately.
     pub consistency_token: String,
     pub ticket_ordinal: Option<i32>,
     pub batch_remaining: Option<i64>,
     pub status: &'static str,
 }
 
-/// Sets `humaux.tenant_id` for the remainder of `txn` (`SET LOCAL`, §62) — same pattern and
-/// same non-bindable-parameter reasoning as `jobs::set_tenant_local`; `tenant_id: Uuid`'s
-/// `Display` never emits anything but canonical lowercase hex, so this format is not an
-/// injection surface the way a user-supplied string would be.
-async fn set_tenant_local(
+/// Installs both RLS GUCs for this transaction. The user setting is always overwritten so a
+/// pooled connection never inherits a prior request; a headless write uses the UUID sentinel
+/// required by the current direct UUID cast in the user-visibility policy.
+async fn set_authorization_local(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,
+    user_id: Option<Uuid>,
 ) -> Result<(), RememberError> {
-    sqlx::query(&format!("SET LOCAL humaux.tenant_id = '{tenant_id}'"))
-        .execute(&mut **txn)
-        .await?;
+    sqlx::query(
+        "SELECT set_config('humaux.tenant_id', $1, true), \
+                set_config('humaux.user_id', $2, true)",
+    )
+    .bind(tenant_id.to_string())
+    .bind(user_id.unwrap_or_else(Uuid::nil).to_string())
+    .execute(&mut **txn)
+    .await?;
     Ok(())
 }
 
@@ -154,7 +174,7 @@ async fn set_tenant_local(
 /// (`migrations/0043_commit_sequence.sql`). "仅审计总序，不参与完整性判定" (§15) — nothing
 /// downstream may branch on this value's magnitude, only carry it through to `stream_log` /
 /// `outbox` for audit/cross-stream reconciliation.
-async fn next_commit_seq(
+pub(crate) async fn next_commit_seq(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<i64, RememberError> {
     Ok(sqlx::query_scalar("SELECT nextval('ops.commit_seq_seq')")
@@ -195,6 +215,13 @@ async fn create_evidence_object(
     .fetch_one(&mut **txn)
     .await?;
     Ok(row.try_get("evidence_id")?)
+}
+
+/// The token's optional workspace is a stream-routing binding, not Evidence visibility. A
+/// USER_PRIVATE Evidence in a workspace stream therefore carries the workspace in its token
+/// even though its stored `visibility_workspace_id` is necessarily NULL.
+fn token_workspace_id(key: &StreamKey) -> Option<Uuid> {
+    (key.scope_kind == "workspace").then_some(key.scope_id)
 }
 
 /// `insert_event_subtype` — `private.events` shares its primary key with the
@@ -360,39 +387,57 @@ async fn insert_outbox(
     Ok(())
 }
 
-/// §15.5 `consistency_token` — see [`RememberAccepted::consistency_token`]'s doc for why this
-/// is a plain placeholder encoding, not signed. Binds exactly the fields §15.5 lists: tenant/
-/// scope, stream key, `stream_seq`, `commit_seq` (audit only), `issued_at`.
-fn issue_consistency_token(
-    key: &StreamKey,
-    stream_seq: i64,
+/// The uncommitted outcome of [`remember_in_txn`]. The receipt/orchestrator caller receives
+/// only facts emitted by the successful SQL writes, then decides when to commit its larger
+/// transaction. It must call [`Self::into_accepted`] only after that transaction commits.
+#[derive(Debug, Clone)]
+pub struct RememberPending {
+    accepted: RememberAccepted,
+    stream_key: StreamKey,
     commit_seq: i64,
-    issued_at: OffsetDateTime,
-) -> String {
-    format!(
-        "ct1:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-        key.tenant_id.0,
-        key.scope_kind,
-        key.scope_id,
-        key.domain,
-        key.projection_kind,
-        key.projection_version,
-        stream_seq,
-        commit_seq,
-        issued_at.unix_timestamp(),
-    )
+    stream_seq: i64,
 }
 
-/// §60 transaction B, verbatim step order. Commits — or, on any error (including
-/// [`RememberError::BatchExhausted`]), rolls back everything this call attempted: dropping
-/// `txn` without calling `.commit()` on the early-return path undoes the Evidence/event rows
-/// already inserted earlier in this same function (§60 "DB 权威写与 Outbox 在同一事务" cuts
-/// both ways — nothing here is durable until every step, including the ticket redemption,
-/// succeeds).
-pub async fn remember(
-    pool: &RuntimeDbPool,
+impl RememberPending {
+    #[must_use]
+    pub fn accepted(&self) -> &RememberAccepted {
+        &self.accepted
+    }
+
+    #[must_use]
+    pub fn into_accepted(self) -> RememberAccepted {
+        self.accepted
+    }
+
+    #[must_use]
+    pub fn stream_key(&self) -> &StreamKey {
+        &self.stream_key
+    }
+
+    #[must_use]
+    pub const fn commit_seq(&self) -> i64 {
+        self.commit_seq
+    }
+
+    #[must_use]
+    pub const fn stream_seq(&self) -> i64 {
+        self.stream_seq
+    }
+}
+
+/// §60 transaction B without a commit. This is the atomic gateway-write seam: the caller may
+/// append receipt, quota, and audit rows in the same transaction, then commit exactly once.
+/// Errors leave rollback to the owning transaction; no SQL here commits independently.
+pub async fn remember_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     cmd: RememberCommand,
-) -> Result<RememberAccepted, RememberError> {
+) -> Result<RememberPending, RememberError> {
+    // This check is deliberately inside the reusable path, before its first write. The public
+    // wrapper's fast check only avoids opening a transaction for an already-expired command.
+    if cmd.consistency_token_expires_at <= OffsetDateTime::now_utc() {
+        return Err(RememberError::ConsistencyTokenExpiryNotFuture);
+    }
+
     let key = StreamKey::new(
         TenantId(cmd.tenant_id),
         cmd.scope_kind.clone(),
@@ -402,24 +447,23 @@ pub async fn remember(
         cmd.projection_version.clone(),
     );
 
-    let mut txn = pool.pool().begin().await?;
-    set_tenant_local(&mut txn, cmd.tenant_id).await?;
+    set_authorization_local(txn, cmd.tenant_id, cmd.authorization_user_id).await?;
 
-    let commit_seq = next_commit_seq(&mut txn).await?;
-    let evidence_id = create_evidence_object(&mut txn, &cmd).await?;
-    insert_event_subtype(&mut txn, evidence_id, &cmd).await?;
+    let commit_seq = next_commit_seq(txn).await?;
+    let evidence_id = create_evidence_object(txn, &cmd).await?;
+    insert_event_subtype(txn, evidence_id, &cmd).await?;
 
     // §34.1: batch_id present -> redeem (BATCH_EXHAUSTED rolls the whole transaction back,
     // never partially — see this function's doc); absent -> ticket untouched, both output
     // fields stay None (expected_source = "none").
     let ticket = match cmd.batch_id {
-        Some(batch_id) => Some(redeem_ticket(&mut txn, batch_id, evidence_id).await?),
+        Some(batch_id) => Some(redeem_ticket(txn, batch_id, evidence_id).await?),
         None => None,
     };
 
-    let stream_seq = issue_stream_log_row(&mut txn, &key, commit_seq).await?;
+    let stream_seq = issue_stream_log_row(txn, &key, commit_seq).await?;
     insert_outbox(
-        &mut txn,
+        txn,
         cmd.tenant_id,
         commit_seq,
         stream_seq,
@@ -428,19 +472,56 @@ pub async fn remember(
     )
     .await?;
 
+    // Sign at the actual issuance point, after every potentially blocking write. If a lock
+    // wait consumed the deadline, returning here drops `txn` and rolls every write back.
     let issued_at = OffsetDateTime::now_utc();
-    let consistency_token = issue_consistency_token(&key, stream_seq, commit_seq, issued_at);
+    if cmd.consistency_token_expires_at <= issued_at {
+        return Err(RememberError::ConsistencyTokenExpiryNotFuture);
+    }
+    let consistency_token = retrieve::issue_consistency_token(&TokenClaims {
+        tenant_id: key.tenant_id.0,
+        // This is routing identity from the trusted stream key, independent of Evidence's
+        // row-level visibility. `recall` compares it with its authenticated request context.
+        workspace_id: token_workspace_id(&key),
+        scope_kind: key.scope_kind.clone(),
+        scope_id: key.scope_id,
+        domain: key.domain.clone(),
+        projection_kind: key.projection_kind.clone(),
+        projection_version: key.projection_version.clone(),
+        stream_seq,
+        commit_seq,
+        issued_at,
+        expires_at: cmd.consistency_token_expires_at,
+    });
 
-    txn.commit().await?;
-
-    Ok(RememberAccepted {
-        evidence_id,
-        processing_handle: evidence_id.to_string(),
-        consistency_token,
-        ticket_ordinal: ticket.as_ref().map(|t| t.ordinal),
-        batch_remaining: ticket.as_ref().map(|t| t.remaining),
-        status: "accepted",
+    Ok(RememberPending {
+        accepted: RememberAccepted {
+            evidence_id,
+            processing_handle: evidence_id.to_string(),
+            consistency_token,
+            ticket_ordinal: ticket.as_ref().map(|t| t.ordinal),
+            batch_remaining: ticket.as_ref().map(|t| t.remaining),
+            status: "accepted",
+        },
+        stream_key: key,
+        commit_seq,
+        stream_seq,
     })
+}
+
+/// Public one-shot wrapper. It preserves the original accepted response and owns the commit;
+/// callers that need an atomic receipt/quota/audit bundle use [`remember_in_txn`] instead.
+pub async fn remember(
+    pool: &RuntimeDbPool,
+    cmd: RememberCommand,
+) -> Result<RememberAccepted, RememberError> {
+    if cmd.consistency_token_expires_at <= OffsetDateTime::now_utc() {
+        return Err(RememberError::ConsistencyTokenExpiryNotFuture);
+    }
+    let mut txn = pool.pool().begin().await?;
+    let pending = remember_in_txn(&mut txn, cmd).await?;
+    txn.commit().await?;
+    Ok(pending.into_accepted())
 }
 
 /// §78.2 "DB enum 与 Rust enum 走 contract test 对账", scoped to [`origin_class_db_str`] (see

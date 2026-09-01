@@ -47,7 +47,7 @@ pub struct NeedsVerificationWire {
 /// 计数块。全 u64/bool——冻结 SQL 的整数，无浮点。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HandoffCounts {
-    /// mandatory 应有（各 selector 独立 COUNT 之和）。
+    /// mandatory 应有（各可用 selector 独立授权候选集合的并集基数）。
     pub mandatory_expected: u64,
     /// mandatory 实际进入。
     pub mandatory_returned: u64,
@@ -57,7 +57,7 @@ pub struct HandoffCounts {
     pub pinned_expected: u64,
     /// pinned 实际进入。
     pub pinned_returned: u64,
-    /// pinned 被排除（低 authority / 被铸造门分流），具名清单在顶层块。
+    /// pinned 被排除（低 authority、铸造门分流，或已由 mandatory 吸收），具名清单在顶层块。
     pub pinned_excluded: u64,
     /// §25.5 溢出。true 时 mandatory/pinned 为空、`overflow_manifest` 携带全量 id。
     pub overflow: bool,
@@ -122,35 +122,46 @@ fn nv_wire(nv: &NeedsVerification) -> NeedsVerificationWire {
 /// 溢出（§25.5）不产出条目：`counts.overflow = true`、`overflow_manifest` 全量具名、
 /// mandatory/pinned 为空——`MandatoryOverflow` 里没有 Context 可返回，这里也没有。
 #[must_use]
-pub fn assemble(frozen: FrozenReads, budget: ContextBudget) -> Handoff {
+pub fn assemble_with_context(
+    frozen: FrozenReads,
+    budget: ContextBudget,
+) -> (Handoff, crate::compiler::ContextOutcome) {
     let FrozenReads {
         mandatory,
         pinned,
         context_snapshot_seq,
         snapshot_token_sha256,
     } = frozen;
-
+    let pinned = pinned.excluding_mandatory(&mandatory);
     let mandatory_expected = mandatory.expected();
     let pinned_expected = pinned.expected();
-    let needs_verification: Vec<NeedsVerificationWire> =
-        mandatory.needs_verification().iter().map(nv_wire).collect();
-    let unavailable_selectors: Vec<(String, String)> = mandatory
+    let needs_verification = mandatory.needs_verification().iter().map(nv_wire).collect();
+    let unavailable_selectors = mandatory
         .unavailable()
         .iter()
         .map(|(id, missing)| (selector_wire(*id).to_string(), missing.clone()))
         .collect();
     let pinned_excluded = pinned.excluded().len() as u64;
-
-    match budget.reserve(&mandatory, &pinned) {
-        Err(overflow) => Handoff {
+    let not_judged = not_judged_ids(&mandatory, &pinned);
+    let outcome = match budget.reserve(&mandatory, &pinned) {
+        Err(overflow) => crate::compiler::ContextOutcome::Overflow(overflow),
+        Ok(supplemental_budget) => crate::compiler::ContextOutcome::Compiled(compile(
+            mandatory,
+            pinned,
+            supplemental_budget,
+            Vec::new(),
+        )),
+    };
+    let handoff = match &outcome {
+        crate::compiler::ContextOutcome::Overflow(overflow) => Handoff {
             context_snapshot_seq,
             snapshot_token_sha256,
             mandatory: Vec::new(),
             pinned: Vec::new(),
             needs_verification,
-            not_judged: Vec::new(),
+            not_judged,
             unavailable_selectors,
-            overflow_manifest: overflow_manifest(&overflow),
+            overflow_manifest: overflow_manifest(overflow),
             counts: HandoffCounts {
                 mandatory_expected,
                 mandatory_returned: 0,
@@ -161,49 +172,37 @@ pub fn assemble(frozen: FrozenReads, budget: ContextBudget) -> Handoff {
                 overflow: true,
             },
         },
-        Ok(supplemental_budget) => {
-            // 单一 compile 真源；handoff 的字节域没有 supplemental，所以候选池给空。
-            let compiled = compile(mandatory, pinned, supplemental_budget, Vec::new());
-            let mut m_items = Vec::new();
-            let mut p_items = Vec::new();
-            let mut not_judged = Vec::new();
+        crate::compiler::ContextOutcome::Compiled(compiled) => {
+            let mut mandatory = Vec::new();
+            let mut pinned = Vec::new();
             for item in compiled.items() {
                 match item {
-                    ContextItem::Mandatory(r) => {
-                        if r.not_judged() {
-                            not_judged.push(r.memory_id().0.to_string());
-                        }
-                        m_items.push(HandoffItem {
-                            memory_id: r.memory_id().0.to_string(),
-                            selector: selector_wire(r.selector()).to_string(),
-                            authority: format!("{:?}", r.authority()),
+                    ContextItem::Mandatory(row) => {
+                        mandatory.push(HandoffItem {
+                            memory_id: row.memory_id().0.to_string(),
+                            selector: selector_wire(row.selector()).to_string(),
+                            authority: format!("{:?}", row.authority()),
                         });
                     }
-                    ContextItem::Pinned(r) => {
-                        if r.not_judged() {
-                            not_judged.push(r.memory_id().0.to_string());
-                        }
-                        p_items.push(HandoffItem {
-                            memory_id: r.memory_id().0.to_string(),
-                            selector: selector_wire(r.selector()).to_string(),
-                            authority: format!("{:?}", r.authority()),
+                    ContextItem::Pinned(row) => {
+                        pinned.push(HandoffItem {
+                            memory_id: row.memory_id().0.to_string(),
+                            selector: selector_wire(row.selector()).to_string(),
+                            authority: format!("{:?}", row.authority()),
                         });
                     }
                     ContextItem::Supplemental(_) => {
-                        // 候选池是空的，这一臂不可达；真到了说明有人把 supplemental
-                        // 接进了 handoff——那是字节域的破坏，宁 panic 不静默。
-                        unreachable!("handoff 的字节域不含 supplemental");
+                        unreachable!("handoff 的字节域不含 supplemental")
                     }
                 }
             }
-            not_judged.sort_unstable();
-            let mandatory_returned = m_items.len() as u64;
-            let pinned_returned = p_items.len() as u64;
+            let mandatory_returned = mandatory.len() as u64;
+            let pinned_returned = pinned.len() as u64;
             Handoff {
                 context_snapshot_seq,
                 snapshot_token_sha256,
-                mandatory: m_items,
-                pinned: p_items,
+                mandatory,
+                pinned,
                 needs_verification,
                 not_judged,
                 unavailable_selectors,
@@ -219,7 +218,28 @@ pub fn assemble(frozen: FrozenReads, budget: ContextBudget) -> Handoff {
                 },
             }
         }
-    }
+    };
+    (handoff, outcome)
+}
+#[must_use]
+pub fn assemble(frozen: FrozenReads, budget: ContextBudget) -> Handoff {
+    assemble_with_context(frozen, budget).0
+}
+
+fn not_judged_ids(
+    mandatory: &humaux_domain::context::MandatoryLane,
+    pinned: &humaux_domain::context::PinnedLane,
+) -> Vec<String> {
+    let mut ids = mandatory
+        .rows()
+        .iter()
+        .chain(pinned.rows())
+        .filter(|row| row.not_judged())
+        .map(|row| row.memory_id().0.to_string())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 fn overflow_manifest(o: &MandatoryOverflow) -> Vec<String> {
@@ -260,48 +280,57 @@ mod tests {
     }
 
     fn row_with(id: MemoryId, tokens: u32) -> MandatoryRow {
+        row_with_grounding(id, tokens, current())
+    }
+
+    fn row_with_grounding(id: MemoryId, tokens: u32, grounding: RowGrounding) -> MandatoryRow {
         let s = spec(SelectorId::ProjectActiveConstraintsV1);
-        match MandatoryRow::from_selector(s, id, s.min_authority, tokens, current())
+        match MandatoryRow::from_selector(s, id, s.min_authority, tokens, grounding)
             .expect("参数合法")
         {
             Admitted::Row(r) => r,
-            Admitted::NeedsVerification(nv) => panic!("CURRENT 不该分流: {nv:?}"),
+            Admitted::NeedsVerification(nv) => panic!("row 不该被分流: {nv:?}"),
         }
     }
 
     fn lane_of(ids: &[MemoryId]) -> MandatoryLane {
+        lane_with_rows(ids.iter().map(|id| row_with(*id, 10)).collect())
+    }
+
+    fn lane_with_rows(rows: Vec<MandatoryRow>) -> MandatoryLane {
         MandatoryLane::from_selectors([
             SelectorOutcome::Ran {
                 id: SelectorId::TaskExplicitContextV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
-                expected: ids.len() as u64,
-                rows: ids.iter().map(|id| row_with(*id, 10)).collect(),
+                candidate_ids: rows.iter().map(|row| row.memory_id()).collect(),
+                rows,
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
         ])
+        .expect("selector outcomes")
     }
 
     fn frozen_of(ids: &[MemoryId]) -> FrozenReads {
@@ -359,6 +388,53 @@ mod tests {
         assert_eq!(h.counts.mandatory_returned, 0);
     }
 
+    /// Overflow returns no body-bearing rows, but keeps the snapshot's existing NotJudged
+    /// diagnostic instead of silently relabeling it as judged.
+    #[test]
+    fn overflow_keeps_not_judged_diagnostics() {
+        let id = MemoryId::new();
+        let frozen = FrozenReads {
+            mandatory: lane_with_rows(vec![row_with_grounding(id, 10, RowGrounding::NotJudged)]),
+            pinned: PinnedLane::new(0, vec![], vec![]),
+            context_snapshot_seq: 12345,
+            snapshot_token_sha256: "deadbeef".repeat(8),
+        };
+
+        let handoff = assemble(frozen, ContextBudget::new(100, 5).expect("budget"));
+
+        assert!(handoff.counts.overflow);
+        assert!(handoff.mandatory.is_empty());
+        assert!(handoff.pinned.is_empty());
+        assert_eq!(handoff.not_judged, vec![id.0.to_string()]);
+    }
+
+    /// Cross-lane overlap is mandatory-precedence before reservation: one physical item,
+    /// no duplicate Pinned count, and no false mandatory overflow from charging it twice.
+    #[test]
+    fn mandatory_precedence_deduplicates_pinned_before_budget_reservation() {
+        let id = MemoryId::new();
+        let frozen = FrozenReads {
+            mandatory: lane_of(&[id]),
+            pinned: PinnedLane::new(1, vec![row_with(id, 10)], vec![]),
+            context_snapshot_seq: 12345,
+            snapshot_token_sha256: "deadbeef".repeat(8),
+        };
+        let (handoff, outcome) = assemble_with_context(
+            frozen,
+            ContextBudget::new(15, 10).expect("one mandatory item fits"),
+        );
+
+        assert!(matches!(
+            outcome,
+            crate::compiler::ContextOutcome::Compiled(_)
+        ));
+        assert_eq!(handoff.mandatory.len(), 1);
+        assert!(handoff.pinned.is_empty());
+        assert_eq!(handoff.counts.pinned_expected, 1);
+        assert_eq!(handoff.counts.pinned_returned, 0);
+        assert_eq!(handoff.counts.pinned_excluded, 1);
+    }
+
     /// needs_verification 与 unavailable 都在字节域里——它们变，字节就变。
     /// 「fail-loud」如果不进字节域，两次装配一个有告警一个没有也会"逐字节相同"，
     /// 那是把 DOD-093 的披露从判据里洗掉。
@@ -377,29 +453,30 @@ mod tests {
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
-                expected: 1,
+                candidate_ids: vec![a],
                 rows: vec![row_with(a, 10)],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
-        ]);
+        ])
+        .expect("selector outcomes");
         let h2 = assemble(lane_outcomes, budget());
         assert_ne!(
             h1.canonical_bytes(),

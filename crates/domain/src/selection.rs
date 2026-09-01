@@ -44,6 +44,15 @@ use uuid::Uuid;
 const FIELD_SEP: char = '\u{1}';
 const HMAC_BLOCK_SIZE: usize = 64;
 
+/// Authorized Gateway enumeration, distinct from the worker's tenant-shared predicate.
+pub const AUTHORIZED_MEMORY_ENUMERATION_V1: &str = "authorized_memory_enumeration_v1";
+
+/// Derives a pagination-only key from bootstrap secret material. The fixed purpose label
+/// prevents a cursor MAC from reusing the raw credential pepper as its signing key.
+pub fn cursor_mac_key(master_key: &[u8]) -> [u8; 32] {
+    hmac_sha256(master_key, b"humaux.memory.enumerate.cursor.v1")
+}
+
 /// HMAC-SHA256, hand-rolled from `sha2::Sha256` (already a `domain` dependency for
 /// `evidence::payload_sha256`) rather than adding the `hmac` crate for this one call site
 /// (ladder rung 5: an already-installed dependency does the hashing; the keying wrapper
@@ -340,6 +349,47 @@ mod tests {
             c.validate(Uuid::from_u128(2), b"a-different-key-entirely", 0),
             Err(CursorError::InvalidMac)
         );
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_short_and_long_key_vectors() {
+        // Independent expected values: RFC 4231 sections 4.2 and 4.7.
+        // https://www.rfc-editor.org/rfc/rfc4231
+        assert_eq!(
+            to_hex(&hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+        );
+        assert_eq!(
+            to_hex(&hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+        );
+    }
+
+    #[test]
+    fn cursor_key_is_separated_from_credentials_and_other_bootstraps() {
+        let key = cursor_mac_key(KEY);
+        let cursor = Cursor::sign(
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            "fp".to_owned(),
+            0,
+            100,
+            &key,
+        );
+        assert!(
+            cursor
+                .validate(Uuid::from_u128(2), &cursor_mac_key(KEY), 0)
+                .is_ok()
+        );
+        for other in [KEY, cursor_mac_key(b"other-bootstrap-secret").as_slice()] {
+            assert_eq!(
+                cursor.validate(Uuid::from_u128(2), other, 0),
+                Err(CursorError::InvalidMac)
+            );
+        }
     }
 
     #[test]

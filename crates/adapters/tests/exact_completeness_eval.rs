@@ -3,8 +3,10 @@
 //!
 //! Runs the real chain per fixture case — [`humaux_adapters::exact_census::
 //! probe_predicate_inputs`] → `planner::decide` → [`humaux_adapters::exact_census::
-//! exact_enumerate`] → `envelope::exact_outcome_block` (which runs the real `classify()`) —
-//! against `evals/exact_completeness/dataset.tsv`, comparing every readout by exact equality
+//! exact_enumerate`] → the component-only `classify_for_witness` label path — against
+//! `evals/exact_completeness/dataset.tsv`, comparing census/classifier readouts by exact equality.
+//! This harness deliberately does not produce a final Envelope or emit a completeness metric:
+//! its closed fixture ledger has no request-bound provenance, pipeline/A2, or mandatory Context.
 //! (`decision_depth = exact_equality`).
 //!
 //! Three §55.3 measurements live here, same shape as `planner_predicate_eval.rs`:
@@ -30,12 +32,14 @@ use std::path::PathBuf;
 use humaux_adapters::exact_census::{exact_enumerate, probe_predicate_inputs};
 use humaux_adapters::forget_repo;
 use humaux_adapters::postgres::{MaintenanceDbPool, RuntimeDbPool};
-use humaux_domain::ids::TenantId;
+use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
+use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
 use humaux_projection::stream::StreamKey;
-use humaux_retrieval::completeness::{CensusResult, LedgerClosure, ledger};
-use humaux_retrieval::envelope::{
-    CompletenessClassWire, ExactOutcome, LaneStatus, exact_outcome_block,
+use humaux_retrieval::completeness::{
+    CensusResult, ExactEnumeration, LedgerClosure, classify_for_witness, ledger,
+    retrieval_completeness_total_count,
 };
+use humaux_retrieval::envelope::LaneStatus;
 use humaux_retrieval::planner::{PlannerDecision, decide};
 use humaux_retrieval::predicate_registry::{PredicateEntry, PredicateRow, load_registry};
 use humaux_testkit::{ExternalDep, skip_or_fail};
@@ -46,13 +50,52 @@ const NAME: &str = "exact_completeness_eval";
 
 fn dsn_as_role(dsn: &str, role: &str) -> String {
     // 与 tests/mandatory_context_lane.rs / tests/serving_repo.rs 同形。
-    let Some(rest) = dsn.strip_prefix("postgres://") else {
+    let Some(rest) = dsn
+        .strip_prefix("postgres://")
+        .or_else(|| dsn.strip_prefix("postgresql://"))
+    else {
         return dsn.to_string();
     };
     let Some(at) = rest.find('@') else {
         return dsn.to_string();
     };
     format!("postgres://{role}:devlocal_{role}@{}", &rest[at + 1..])
+}
+
+fn verified_maintenance_dsn() -> Option<String> {
+    let Ok(dsn) = std::env::var("HUMAUX_MAINTENANCE_PG_DSN") else {
+        skip_or_fail(
+            NAME,
+            "missing object: role_maintenance PostgreSQL DSN",
+            ExternalDep::Postgres,
+        );
+        return None;
+    };
+    let Ok(mut probe) = Client::connect(&dsn, NoTls) else {
+        skip_or_fail(
+            NAME,
+            "missing object: role_maintenance PostgreSQL login",
+            ExternalDep::Postgres,
+        );
+        return None;
+    };
+    let role_ok: bool = probe
+        .query_one(
+            "SELECT current_user='role_maintenance' AND session_user='role_maintenance' \
+             AND NOT (SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname=current_user)",
+            &[],
+        )
+        .expect("probe role_maintenance session identity")
+        .get(0);
+    if !role_ok {
+        skip_or_fail(
+            NAME,
+            "invalid object: HUMAUX_MAINTENANCE_PG_DSN must be a non-bypass role_maintenance LOGIN",
+            ExternalDep::Postgres,
+        );
+        return None;
+    }
+    Some(dsn)
 }
 
 // ============================================================================
@@ -122,6 +165,7 @@ struct Fixture {
     /// only for a session carrying `humaux.user_id` with an ACTIVE membership; a census
     /// without it sees a different (narrower) authorized universe.
     user_id: Uuid,
+    other_user_id: Uuid,
     reasoning_domain_id: Uuid,
 }
 
@@ -140,13 +184,13 @@ impl Drop for Fixture {
              DELETE FROM control.memberships WHERE tenant_id = '{0}'; \
              DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
              DELETE FROM control.tenants WHERE tenant_id = '{0}'; \
-             DELETE FROM control.users WHERE user_id = '{1}';",
-            self.tenant_id, self.user_id
+             DELETE FROM control.users WHERE user_id IN ('{1}', '{2}');",
+            self.tenant_id, self.user_id, self.other_user_id
         ));
     }
 }
 
-fn setup() -> Option<(Fixture, String)> {
+fn setup() -> Option<(Fixture, String, String)> {
     let Ok(dsn) = std::env::var("HUMAUX_TEST_PG_DSN") else {
         skip_or_fail(NAME, "missing object: Postgres DSN", ExternalDep::Postgres);
         return None;
@@ -155,6 +199,7 @@ fn setup() -> Option<(Fixture, String)> {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;
     };
+    let maintenance_dsn = verified_maintenance_dsn()?;
     // The registry row is the structure the whole gauge sits on — without migration 0077
     // there is no set to measure at all (legal NA per ADR-0006's carve-out for the table the
     // tested judgment lives in, not the judgment itself).
@@ -164,7 +209,7 @@ fn setup() -> Option<(Fixture, String)> {
              WHERE predicate_id = 'rejected_decisions_v1')",
             &[],
         )
-        .ok()?
+        .expect("query retrieval predicate migration")
         .get(0);
     if !migrated {
         skip_or_fail(
@@ -181,7 +226,7 @@ fn setup() -> Option<(Fixture, String)> {
             "INSERT INTO control.tenants (name) VALUES ($1) RETURNING tenant_id",
             &[&"exact_completeness_eval throwaway tenant"],
         )
-        .ok()?
+        .expect("insert throwaway tenant")
         .get(0);
     let reasoning_domain_id: Uuid = admin
         .query_one(
@@ -189,14 +234,14 @@ fn setup() -> Option<(Fixture, String)> {
              VALUES ($1, 'exact_completeness_eval domain') RETURNING reasoning_domain_id",
             &[&tenant_id],
         )
-        .ok()?
+        .expect("insert private reasoning domain")
         .get(0);
     let user_id: Uuid = admin
         .query_one(
             "INSERT INTO control.users (state) VALUES ('ACTIVE') RETURNING user_id",
             &[],
         )
-        .ok()?
+        .expect("insert requesting user")
         .get(0);
     admin
         .execute(
@@ -204,16 +249,25 @@ fn setup() -> Option<(Fixture, String)> {
              VALUES ($1, $2, 'MEMBER', 'ACTIVE')",
             &[&tenant_id, &user_id],
         )
-        .ok()?;
+        .expect("insert requesting membership");
+    let other_user_id: Uuid = admin
+        .query_one(
+            "INSERT INTO control.users (state) VALUES ('ACTIVE') RETURNING user_id",
+            &[],
+        )
+        .expect("insert hidden-source owner")
+        .get(0);
 
     Some((
         Fixture {
             admin,
             tenant_id,
             user_id,
+            other_user_id,
             reasoning_domain_id,
         },
         dsn,
+        maintenance_dsn,
     ))
 }
 
@@ -302,16 +356,59 @@ fn seed_rejection(
     (memory_id, evidence_id)
 }
 
+fn add_hidden_backing_source(f: &mut Fixture, memory_id: Uuid) -> Uuid {
+    let mut txn = f.admin.transaction().expect("begin hidden source");
+    let mut payload_sha256 = vec![0_u8; 32];
+    payload_sha256[..16].copy_from_slice(Uuid::now_v7().as_bytes());
+    let evidence_id: Uuid = txn
+        .query_one(
+            "INSERT INTO private.evidence_objects \
+               (tenant_id, evidence_kind, payload_sha256, data_class, origin_class, \
+                visibility_class, visibility_user_id, reasoning_domain_id) \
+             VALUES ($1, 'EVENT', $2, 'INTERNAL', 'DirectUserInput', 'USER_PRIVATE', $3, $4) \
+             RETURNING evidence_id",
+            &[
+                &f.tenant_id,
+                &payload_sha256,
+                &f.other_user_id,
+                &f.reasoning_domain_id,
+            ],
+        )
+        .expect("insert hidden evidence")
+        .get(0);
+    txn.execute(
+        "INSERT INTO private.events (event_id, event_kind, payload) \
+         VALUES ($1, 'USER_MESSAGE', '{}'::jsonb)",
+        &[&evidence_id],
+    )
+    .expect("insert hidden event");
+    txn.execute(
+        "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, grounding_mode) \
+         VALUES ($1, $2, 'SUPPORTING', 'SNAPSHOT')",
+        &[&memory_id, &evidence_id],
+    )
+    .expect("link hidden source");
+    txn.commit().expect("commit hidden source");
+    evidence_id
+}
+
 /// §23.4 tour seeding: evidence + memory + the stream identity the overlay joins through —
 /// `ops.outbox(evidence_id, stream_seq)` (§60's same-transaction mapping) and a settled
 /// `projection.stream_log` row.
-fn seed_tour_memory(f: &mut Fixture, ws: Uuid, key: &StreamKey, seq: i64) -> (Uuid, Uuid) {
+fn seed_tour_memory(
+    f: &mut Fixture,
+    ws: Uuid,
+    key: &StreamKey,
+    stream_log_seq: i64,
+    outbox_stream_seq: i64,
+    commit_seq: i64,
+) -> (Uuid, Uuid) {
     let (memory_id, evidence_id) = seed_rejection(f, ws, false, None);
     f.admin
         .execute(
             "INSERT INTO ops.outbox (tenant_id, commit_seq, stream_seq, event_type, evidence_id) \
-             VALUES ($1, $2, $2, 'EVIDENCE_ACCEPTED', $3)",
-            &[&f.tenant_id, &seq, &evidence_id],
+             VALUES ($1, $2, $3, 'EVIDENCE_ACCEPTED', $4)",
+            &[&f.tenant_id, &commit_seq, &outbox_stream_seq, &evidence_id],
         )
         .expect("insert outbox");
     f.admin
@@ -319,7 +416,7 @@ fn seed_tour_memory(f: &mut Fixture, ws: Uuid, key: &StreamKey, seq: i64) -> (Uu
             "INSERT INTO projection.stream_log \
                (tenant_id, scope_kind, scope_id, domain, projection_kind, projection_version, \
                 stream_seq, commit_seq, state, settled_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'DONE', now())",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'DONE', now())",
             &[
                 &f.tenant_id,
                 &key.scope_kind,
@@ -327,7 +424,8 @@ fn seed_tour_memory(f: &mut Fixture, ws: Uuid, key: &StreamKey, seq: i64) -> (Uu
                 &key.domain,
                 &key.projection_kind,
                 &key.projection_version,
-                &seq,
+                &stream_log_seq,
+                &commit_seq,
             ],
         )
         .expect("insert stream_log");
@@ -376,15 +474,78 @@ fn closed_ledger() -> LedgerClosure {
 /// The quantifier query matching migration 0077's seeded surface pattern.
 const REAL_QUERY: &str = "我们之前否掉过哪些方案";
 
-/// One full real-chain run for an EXACT-lane case; returns the outcome and returned ids.
+fn authorization_for(tenant_id: Uuid, user_id: Uuid, workspace_id: Uuid) -> AuthorizationScope {
+    AuthorizationScope::new(
+        TenantId(tenant_id),
+        PrincipalId(user_id),
+        Some(UserId(user_id)),
+        BoundedSet::new([WorkspaceId(workspace_id)]).expect("one authorized workspace"),
+    )
+}
+
+#[derive(Debug, Clone)]
+struct ComponentExactReport {
+    predicate_id: String,
+    total: u64,
+    returned: u64,
+    coverage: f64,
+    truncated: bool,
+    excluded_secret: u64,
+}
+
+/// Classifier/census result for this component harness, never a final Envelope outcome.
+#[derive(Debug, Clone)]
+struct ComponentExactOutcome {
+    class_label: &'static str,
+    reason_label: Option<&'static str>,
+    exact: Option<ComponentExactReport>,
+    known_lower_bound: Option<u64>,
+}
+
+fn component_exact_outcome(
+    decision: &PlannerDecision,
+    census: &CensusResult,
+) -> Result<ComponentExactOutcome, String> {
+    let (class_label, reason_label) =
+        classify_for_witness(decision, LaneStatus::Ok, census, &closed_ledger());
+    let exact = match (class_label, census.enumeration()) {
+        ("exact", Some(enumeration)) => Some(component_exact_report(enumeration)),
+        ("exact", None) => {
+            return Err(
+                "component classifier produced exact without census enumeration".to_string(),
+            );
+        }
+        _ => None,
+    };
+    Ok(ComponentExactOutcome {
+        class_label,
+        reason_label: (reason_label != "none").then_some(reason_label),
+        exact,
+        known_lower_bound: (class_label == "cannot_establish")
+            .then(|| census.enumeration().map(ExactEnumeration::returned))
+            .flatten(),
+    })
+}
+
+fn component_exact_report(enumeration: &ExactEnumeration) -> ComponentExactReport {
+    ComponentExactReport {
+        predicate_id: enumeration.predicate_id().to_string(),
+        total: enumeration.total(),
+        returned: enumeration.returned(),
+        coverage: enumeration.coverage(),
+        truncated: enumeration.truncated(),
+        excluded_secret: enumeration.excluded_secret(),
+    }
+}
+
+/// One full real census/classifier component run; returns no final Envelope outcome or metric.
 async fn run_exact_case(
     pool: &RuntimeDbPool,
     entry: &PredicateEntry,
-    tenant_id: Uuid,
-    user_id: Uuid,
+    authorization: &AuthorizationScope,
     ws: Uuid,
     key: &StreamKey,
-) -> (ExactOutcome, Vec<Uuid>) {
+) -> (ComponentExactOutcome, Vec<Uuid>) {
     let (indexed, scopes) = probe_predicate_inputs(pool, entry)
         .await
         .expect("probe must run");
@@ -394,11 +555,11 @@ async fn run_exact_case(
         "real registry predicate must be established (probe: indexed={indexed:?}, \
          scopes={scopes:?})"
     );
-    let outcome = exact_enumerate(pool, entry, tenant_id, Some(user_id), ws, key)
+    let outcome = exact_enumerate(pool, entry, authorization, WorkspaceId(ws), key)
         .await
         .expect("census transaction must open");
-    let block = exact_outcome_block(&decision, LaneStatus::Ok, &outcome.census, &closed_ledger())
-        .expect("§22.0 pair must hold on the real path");
+    let block = component_exact_outcome(&decision, &outcome.census)
+        .expect("§22.0 component pair must hold on the real census path");
     (block, outcome.returned_ids)
 }
 
@@ -410,37 +571,16 @@ struct CaseResult {
     detail: String,
 }
 
-fn check(row: &DatasetRow, out: &ExactOutcome) -> (bool, String) {
-    let class_label = match out.class {
-        CompletenessClassWire::Exact => "exact",
-        CompletenessClassWire::FacetComplete => "facet_complete",
-        CompletenessClassWire::SemanticBounded => "semantic_bounded",
-        CompletenessClassWire::CannotEstablish => "cannot_establish",
-    };
+fn check(row: &DatasetRow, out: &ComponentExactOutcome) -> (bool, String) {
+    let class_label = out.class_label;
     let mut fails: Vec<String> = Vec::new();
     if class_label != row.expect_class {
         fails.push(format!("class {class_label} != {}", row.expect_class));
     }
-    // Snake-fold the Debug variant name — mirrors the serde rename without a JSON round trip.
-    let reason_snake = out.reason.map(|r| {
-        let d = format!("{r:?}");
-        let mut s = String::new();
-        for (i, c) in d.chars().enumerate() {
-            if c.is_uppercase() {
-                if i > 0 {
-                    s.push('_');
-                }
-                s.push(c.to_ascii_lowercase());
-            } else {
-                s.push(c);
-            }
-        }
-        s
-    });
-    if reason_snake != row.expect_reason {
+    if out.reason_label != row.expect_reason.as_deref() {
         fails.push(format!(
-            "reason {reason_snake:?} != {:?}",
-            row.expect_reason
+            "reason {:?} != {:?}",
+            out.reason_label, row.expect_reason
         ));
     }
     match (&out.exact, &row.expect_predicate_id) {
@@ -515,7 +655,7 @@ fn tour_key(tenant_id: Uuid, ws: Uuid) -> StreamKey {
 
 /// Runs every dataset case against freshly seeded workspaces (`run_tag` keeps repeat runs'
 /// worlds disjoint). `decoy_overlay` selects the *second system* for the resolution
-/// measurement: the census consulted with a mis-scoped [`StreamKey`], which silently
+/// measurement: the census consults a same-workspace but wrong-version [`StreamKey`], which silently
 /// no-ops the §23.1② overlay — a real, runnable regression shape, not a fixture-constant
 /// edit (§23.4's own discipline for named faults).
 // The battery is one linear scenario script (seed → cases → purge → cases): splitting it
@@ -525,6 +665,7 @@ fn tour_key(tenant_id: Uuid, ws: Uuid) -> StreamKey {
 fn run_battery(
     f: &mut Fixture,
     dsn: &str,
+    maintenance_dsn: &str,
     rows: &[DatasetRow],
     run_tag: &str,
     decoy_overlay: bool,
@@ -564,15 +705,57 @@ fn run_battery(
     let real_key = tour_key(tenant_id, ws_tour);
     let mut tour: Vec<(Uuid, i64)> = Vec::new();
     for seq in 1..=12i64 {
-        let (m, _) = seed_tour_memory(f, ws_tour, &real_key, seq);
+        let (m, _) = seed_tour_memory(f, ws_tour, &real_key, seq, seq, seq);
         tour.push((m, seq));
     }
     let tombstoned: Vec<(Uuid, i64)> = tour[..3].to_vec();
 
+    let ws_hidden = new_workspace(f, &format!("hidden-{run_tag}"));
+    let (hidden_memory, _) = seed_rejection(f, ws_hidden, false, None);
+    let _hidden_evidence = add_hidden_backing_source(f, hidden_memory);
+
+    // The outbox's stream position intentionally differs from its commit identity. A v2
+    // tombstone with the same stream position must not affect the v1 key; the v1 tombstone
+    // later must affect the row through commit_seq, not the mismatching stream_seq.
+    let ws_commit = new_workspace(f, &format!("commit-{run_tag}"));
+    let commit_key = tour_key(tenant_id, ws_commit);
+    let (commit_memory, _) = seed_tour_memory(f, ws_commit, &commit_key, 8, 9, 700);
+    let version_decoy = StreamKey::new(
+        TenantId(tenant_id),
+        "workspace",
+        ws_commit,
+        "private_memory",
+        "retrieval_cards",
+        "v2",
+    );
+    f.admin
+        .execute(
+            "INSERT INTO projection.stream_log \
+               (tenant_id, scope_kind, scope_id, domain, projection_kind, projection_version, \
+                stream_seq, commit_seq, state, settled_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 8, 700, 'TOMBSTONED', now())",
+            &[
+                &f.tenant_id,
+                &version_decoy.scope_kind,
+                &version_decoy.scope_id,
+                &version_decoy.domain,
+                &version_decoy.projection_kind,
+                &version_decoy.projection_version,
+            ],
+        )
+        .expect("insert cross-version tombstone decoy");
+
     // The census key: the real stream, or (second system) a decoy whose overlay join can
     // never match — same code path, overlay silently ineffective.
     let census_key = if decoy_overlay {
-        tour_key(tenant_id, Uuid::now_v7())
+        StreamKey::new(
+            TenantId(tenant_id),
+            "workspace",
+            ws_tour,
+            "private_memory",
+            "retrieval_cards",
+            "v2",
+        )
     } else {
         real_key.clone()
     };
@@ -617,6 +800,20 @@ fn run_battery(
         .enable_all()
         .build()
         .expect("tokio runtime");
+    let metric_before = [
+        ("exact", "none"),
+        ("cannot_establish", "ledger_not_closed"),
+        ("cannot_establish", "predicate_not_enumerable"),
+        ("cannot_establish", "census_failed"),
+    ]
+    .into_iter()
+    .map(|(class, reason)| {
+        (
+            (class, reason),
+            retrieval_completeness_total_count(class, reason),
+        )
+    })
+    .collect::<BTreeMap<_, _>>();
     let mut results: Vec<CaseResult> = Vec::new();
 
     // --- async phase 2: every case up to and including the tombstone boundary --------------
@@ -624,43 +821,175 @@ fn run_battery(
         let pool = RuntimeDbPool::connect(&dsn_as_role(dsn, "role_gateway"))
             .await
             .expect("runtime pool");
-        let maint = MaintenanceDbPool::connect(&dsn_as_role(dsn, "role_maintenance"))
+        let maint = MaintenanceDbPool::connect(maintenance_dsn)
             .await
             .expect("maintenance pool");
+
+        let own_scope = authorization_for(tenant_id, user_id, ws_iso_a);
+        assert!(matches!(
+            exact_enumerate(
+                &pool,
+                &entry,
+                &own_scope,
+                WorkspaceId(ws_iso_b),
+                &tour_key(tenant_id, ws_iso_b)
+            )
+            .await,
+            Err(humaux_domain::error::ErrorCode::Forbidden)
+        ));
+        let wrong_workspace_key = tour_key(tenant_id, ws_iso_b);
+        assert!(matches!(
+            exact_enumerate(
+                &pool,
+                &entry,
+                &own_scope,
+                WorkspaceId(ws_iso_a),
+                &wrong_workspace_key
+            )
+            .await,
+            Err(humaux_domain::error::ErrorCode::Forbidden)
+        ));
+        let foreign_key = tour_key(Uuid::now_v7(), ws_iso_a);
+        assert!(matches!(
+            exact_enumerate(
+                &pool,
+                &entry,
+                &own_scope,
+                WorkspaceId(ws_iso_a),
+                &foreign_key
+            )
+            .await,
+            Err(humaux_domain::error::ErrorCode::Forbidden)
+        ));
+        let wrong_scope_kind = StreamKey::new(
+            TenantId(tenant_id),
+            "tenant",
+            tenant_id,
+            "private_memory",
+            "retrieval_cards",
+            "v1",
+        );
+        assert!(matches!(
+            exact_enumerate(
+                &pool,
+                &entry,
+                &own_scope,
+                WorkspaceId(ws_iso_a),
+                &wrong_scope_kind
+            )
+            .await,
+            Err(humaux_domain::error::ErrorCode::Forbidden)
+        ));
+
+        let hidden = exact_enumerate(
+            &pool,
+            &entry,
+            &authorization_for(tenant_id, user_id, ws_hidden),
+            WorkspaceId(ws_hidden),
+            &tour_key(tenant_id, ws_hidden),
+        )
+        .await
+        .expect("hidden-source census");
+        let hidden_counts = hidden
+            .census
+            .enumeration()
+            .expect("hidden-source enumeration");
+        assert_eq!(
+            hidden_counts.total(),
+            0,
+            "hidden backing source must leave the denominator"
+        );
+        assert_eq!(hidden_counts.returned(), 0);
+        assert_eq!(hidden_counts.excluded_secret(), 0);
+        assert!(!hidden.returned_ids.contains(&hidden_memory));
+
+        let before_commit_tombstone = exact_enumerate(
+            &pool,
+            &entry,
+            &authorization_for(tenant_id, user_id, ws_commit),
+            WorkspaceId(ws_commit),
+            &commit_key,
+        )
+        .await
+        .expect("cross-version census");
+        assert_eq!(before_commit_tombstone.returned_ids, vec![commit_memory]);
+        forget_repo::tombstone(&maint, &commit_key, 8)
+            .await
+            .expect("tombstone matching commit identity");
+        let after_commit_tombstone = exact_enumerate(
+            &pool,
+            &entry,
+            &authorization_for(tenant_id, user_id, ws_commit),
+            WorkspaceId(ws_commit),
+            &commit_key,
+        )
+        .await
+        .expect("commit-seq tombstone census");
+        let after_counts = after_commit_tombstone
+            .census
+            .enumeration()
+            .expect("commit-seq enumeration");
+        assert_eq!(after_counts.total(), 0);
+        assert!(after_commit_tombstone.returned_ids.is_empty());
 
         for row in rows {
             let (out, extra) = match row.case_id.as_str() {
                 "exact_full" => {
-                    let (out, _) =
-                        run_exact_case(&pool, &entry, tenant_id, user_id, ws_full, &census_key)
-                            .await;
+                    let (out, _) = run_exact_case(
+                        &pool,
+                        &entry,
+                        &authorization_for(tenant_id, user_id, ws_full),
+                        ws_full,
+                        &tour_key(tenant_id, ws_full),
+                    )
+                    .await;
                     (out, None)
                 }
                 "exact_secret_deducted" => {
-                    let (out, ids) =
-                        run_exact_case(&pool, &entry, tenant_id, user_id, ws_secret, &census_key)
-                            .await;
+                    let (out, ids) = run_exact_case(
+                        &pool,
+                        &entry,
+                        &authorization_for(tenant_id, user_id, ws_secret),
+                        ws_secret,
+                        &tour_key(tenant_id, ws_secret),
+                    )
+                    .await;
                     // §22.1: excluded rows are *named*, never returned.
                     let extra =
                         (ids.len() != 4).then(|| format!("returned_ids len {} != 4", ids.len()));
                     (out, extra)
                 }
                 "exact_empty" => {
-                    let (out, _) =
-                        run_exact_case(&pool, &entry, tenant_id, user_id, ws_empty, &census_key)
-                            .await;
+                    let (out, _) = run_exact_case(
+                        &pool,
+                        &entry,
+                        &authorization_for(tenant_id, user_id, ws_empty),
+                        ws_empty,
+                        &tour_key(tenant_id, ws_empty),
+                    )
+                    .await;
                     (out, None)
                 }
                 "exact_scope_isolated" => {
-                    let (out, _) =
-                        run_exact_case(&pool, &entry, tenant_id, user_id, ws_iso_a, &census_key)
-                            .await;
+                    let (out, _) = run_exact_case(
+                        &pool,
+                        &entry,
+                        &authorization_for(tenant_id, user_id, ws_iso_a),
+                        ws_iso_a,
+                        &tour_key(tenant_id, ws_iso_a),
+                    )
+                    .await;
                     (out, None)
                 }
                 "exact_supersede_out" => {
-                    let (out, _) =
-                        run_exact_case(&pool, &entry, tenant_id, user_id, ws_sup, &census_key)
-                            .await;
+                    let (out, _) = run_exact_case(
+                        &pool,
+                        &entry,
+                        &authorization_for(tenant_id, user_id, ws_sup),
+                        ws_sup,
+                        &tour_key(tenant_id, ws_sup),
+                    )
+                    .await;
                     (out, None)
                 }
                 "ne_missing_column" => {
@@ -673,13 +1002,8 @@ fn run_battery(
                         &indexed,
                         &scopes,
                     );
-                    let out = exact_outcome_block(
-                        &d,
-                        LaneStatus::Ok,
-                        &CensusResult::ok_without_enumeration(),
-                        &closed_ledger(),
-                    )
-                    .expect("pair");
+                    let out = component_exact_outcome(&d, &CensusResult::ok_without_enumeration())
+                        .expect("pair");
                     (out, None)
                 }
                 "ne_mixed_scope" => {
@@ -692,13 +1016,8 @@ fn run_battery(
                         &indexed,
                         &scopes,
                     );
-                    let out = exact_outcome_block(
-                        &d,
-                        LaneStatus::Ok,
-                        &CensusResult::ok_without_enumeration(),
-                        &closed_ledger(),
-                    )
-                    .expect("pair");
+                    let out = component_exact_outcome(&d, &CensusResult::ok_without_enumeration())
+                        .expect("pair");
                     (out, None)
                 }
                 "census_failed" => {
@@ -718,22 +1037,24 @@ fn run_battery(
                     let outcome = exact_enumerate(
                         &pool,
                         &bad_predicate_entry,
-                        tenant_id,
-                        Some(user_id),
-                        ws_empty,
-                        &census_key,
+                        &authorization_for(tenant_id, user_id, ws_empty),
+                        WorkspaceId(ws_empty),
+                        &tour_key(tenant_id, ws_empty),
                     )
                     .await
                     .expect("census txn opens");
-                    let out =
-                        exact_outcome_block(&d, LaneStatus::Ok, &outcome.census, &closed_ledger())
-                            .expect("pair");
+                    let out = component_exact_outcome(&d, &outcome.census).expect("pair");
                     (out, None)
                 }
                 "tour_before" => {
-                    let (out, ids) =
-                        run_exact_case(&pool, &entry, tenant_id, user_id, ws_tour, &census_key)
-                            .await;
+                    let (out, ids) = run_exact_case(
+                        &pool,
+                        &entry,
+                        &authorization_for(tenant_id, user_id, ws_tour),
+                        ws_tour,
+                        &census_key,
+                    )
+                    .await;
                     let extra =
                         (ids.len() != 12).then(|| format!("returned_ids len {} != 12", ids.len()));
                     (out, extra)
@@ -745,9 +1066,14 @@ fn run_battery(
                             .await
                             .expect("tombstone");
                     }
-                    let (out, ids) =
-                        run_exact_case(&pool, &entry, tenant_id, user_id, ws_tour, &census_key)
-                            .await;
+                    let (out, ids) = run_exact_case(
+                        &pool,
+                        &entry,
+                        &authorization_for(tenant_id, user_id, ws_tour),
+                        ws_tour,
+                        &census_key,
+                    )
+                    .await;
                     // §23.4: the tombstoned rows must not appear — *including* now, before
                     // the physical purge has run.
                     let leaked: Vec<_> = tombstoned
@@ -800,8 +1126,14 @@ fn run_battery(
             if row.case_id != "tour_after_purge" {
                 continue;
             }
-            let (out, ids) =
-                run_exact_case(&pool, &entry, tenant_id, user_id, ws_tour, &census_key).await;
+            let (out, ids) = run_exact_case(
+                &pool,
+                &entry,
+                &authorization_for(tenant_id, user_id, ws_tour),
+                ws_tour,
+                &census_key,
+            )
+            .await;
             let leaked: Vec<_> = tombstoned
                 .iter()
                 .filter(|(m, _)| ids.contains(m))
@@ -826,6 +1158,13 @@ fn run_battery(
         }
     });
 
+    for ((class, reason), before) in metric_before {
+        assert_eq!(
+            retrieval_completeness_total_count(class, reason),
+            before,
+            "component census evaluator must not emit final completeness metric {class}/{reason}"
+        );
+    }
     results
 }
 
@@ -835,10 +1174,12 @@ fn run_battery(
 
 #[test]
 fn all_cases_match_expected_readouts() {
-    let Some((mut f, dsn)) = setup() else { return };
+    let Some((mut f, dsn, maintenance_dsn)) = setup() else {
+        return;
+    };
     let rows = read_dataset_rows();
     assert_eq!(rows.len(), 11, "frozen fixed_denominator = 11");
-    let results = run_battery(&mut f, &dsn, &rows, "judgment", false);
+    let results = run_battery(&mut f, &dsn, &maintenance_dsn, &rows, "judgment", false);
     assert_eq!(results.len(), 11, "every case must produce a result");
     let failed: Vec<_> = results.iter().filter(|r| !r.pass).collect();
     assert!(
@@ -857,11 +1198,20 @@ fn all_cases_match_expected_readouts() {
 /// zero is *observed* — the battery genuinely runs 3 times over fresh workspaces.
 #[test]
 fn repeated_runs_have_zero_spread() {
-    let Some((mut f, dsn)) = setup() else { return };
+    let Some((mut f, dsn, maintenance_dsn)) = setup() else {
+        return;
+    };
     let rows = read_dataset_rows();
     let mut per_run: Vec<BTreeMap<String, usize>> = Vec::new();
     for run in 0..3 {
-        let results = run_battery(&mut f, &dsn, &rows, &format!("spread{run}"), false);
+        let results = run_battery(
+            &mut f,
+            &dsn,
+            &maintenance_dsn,
+            &rows,
+            &format!("spread{run}"),
+            false,
+        );
         let mut layer_pass: BTreeMap<String, usize> = BTreeMap::new();
         for r in &results {
             *layer_pass.entry(r.layer.clone()).or_default() += usize::from(r.pass);
@@ -888,10 +1238,12 @@ fn repeated_runs_have_zero_spread() {
 /// exactly where the two systems genuinely differ: the tombstone boundary sample.
 #[test]
 fn resolution_is_measured_via_a_real_second_system_diff() {
-    let Some((mut f, dsn)) = setup() else { return };
+    let Some((mut f, dsn, maintenance_dsn)) = setup() else {
+        return;
+    };
     let rows = read_dataset_rows();
-    let real = run_battery(&mut f, &dsn, &rows, "res-real", false);
-    let second = run_battery(&mut f, &dsn, &rows, "res-second", true);
+    let real = run_battery(&mut f, &dsn, &maintenance_dsn, &rows, "res-real", false);
+    let second = run_battery(&mut f, &dsn, &maintenance_dsn, &rows, "res-second", true);
     assert_eq!(real.len(), second.len());
     let flipped: Vec<&str> = real
         .iter()

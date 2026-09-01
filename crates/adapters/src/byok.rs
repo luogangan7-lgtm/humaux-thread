@@ -108,6 +108,8 @@ impl fmt::Display for ReasoningCapability {
 pub struct ReasoningProviderDescriptor {
     pub provider_id: String,
     pub model_id: String,
+    /// Frozen revision configured on this provider instance; `None` is an exact identity value.
+    pub model_revision: Option<String>,
     pub capabilities: Vec<ReasoningCapability>,
     /// §11.4: `Some` only for a user-supplied custom/OpenAI-compatible `base_url`. Informational
     /// only — the actual SSRF choke point is [`OpenAiCompatibleProvider::new`], which calls
@@ -606,6 +608,12 @@ pub fn classify_http_status(
 pub trait UserReasoningProvider: Send + Sync {
     fn descriptor(&self) -> &ReasoningProviderDescriptor;
 
+    /// Exact endpoint used by the provider instance for the next HTTP request. Implementations
+    /// must return runtime state that drives the send, never optional descriptor metadata.
+    fn endpoint_ref(&self) -> &str;
+
+    fn model_revision(&self) -> Option<&str>;
+
     async fn complete_structured(
         &self,
         ctx: &PrivateInferenceContext,
@@ -1018,6 +1026,14 @@ impl<T: OpenAiCompatTransport, D: CredentialDecryptor> UserReasoningProvider
         &self.descriptor
     }
 
+    fn endpoint_ref(&self) -> &str {
+        &self.base_url
+    }
+
+    fn model_revision(&self) -> Option<&str> {
+        self.descriptor.model_revision.as_deref()
+    }
+
     async fn complete_structured(
         &self,
         ctx: &PrivateInferenceContext,
@@ -1330,6 +1346,7 @@ mod tests {
         ReasoningProviderDescriptor {
             provider_id: "openai-compatible".to_string(),
             model_id: "test-model".to_string(),
+            model_revision: None,
             capabilities: vec![
                 ReasoningCapability::StructuredOutput,
                 ReasoningCapability::Vision,

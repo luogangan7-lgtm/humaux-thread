@@ -1,0 +1,25 @@
+migration_id = "0107_contribution_finalize"
+class = "EXPAND_CONTRACT"
+precheck = """
+select to_regclass('staging.contribution_candidates') is null
+  and not exists(select 1 from control.contribution_policies group by tenant_id having count(*)>1)
+  as precheck_ok
+"""
+postcheck = """
+select to_regclass('control.contribution_confirmations') is not null
+  and not has_table_privilege('role_gateway','staging.contribution_candidates','SELECT')
+  and not has_table_privilege('role_public_worker','staging.contribution_candidates','SELECT')
+  and not has_table_privilege('role_private_worker','staging.contribution_candidates','UPDATE')
+  and not has_table_privilege('role_gateway','control.contribution_confirmations','UPDATE')
+  and has_table_privilege('role_gateway','control.contribution_confirmations','INSERT')
+  and exists(select 1 from pg_trigger where tgname='finalized_sources_equal' and tgdeferrable)
+  as postcheck_ok
+"""
+rollback_or_forward_fix = """
+Forward-only after candidate/confirmation use. Missing legacy receipts stay NULL and fail new
+public admission; never backfill PASSED. Duplicate policies require explicit admin reconciliation.
+Preserve candidates, confirmations, release snapshots and audit events. The short advisory input
+lock is a conservative correctness boundary; measure before refining it. Rehearse on a disposable
+PostgreSQL18.6 fixture, never point validation scripts at production.
+"""
+backup_restore_requirement = "Separate approval plus PostgreSQL snapshot and restore rehearsal before production; local disposable fixture only here."

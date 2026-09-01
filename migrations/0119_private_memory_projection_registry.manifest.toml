@@ -1,0 +1,38 @@
+migration_id = "0119_private_memory_projection_registry"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('projection.private_memory_points') is null
+  and to_regclass('private.memory_records') is not null as precheck_ok
+"""
+
+postcheck = """
+select to_regclass('projection.private_memory_points') is not null
+  and (select tableowner from pg_tables
+       where schemaname='projection' and tablename='private_memory_points')
+      = 'role_migration_owner'
+  and exists (
+    select 1 from pg_constraint
+    where conrelid='projection.private_memory_points'::regclass
+      and conname='private_memory_points_memory_tenant_fk' and contype='f'
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conrelid='projection.private_memory_points'::regclass
+      and conname='private_memory_points_exact_identity_unique' and contype='u'
+  )
+  and (select relrowsecurity and relforcerowsecurity
+       from pg_class where oid='projection.private_memory_points'::regclass)
+  and has_table_privilege('role_gateway','projection.private_memory_points','SELECT')
+  and not has_table_privilege('role_gateway','projection.private_memory_points','INSERT')
+  and not has_table_privilege('role_gateway','projection.private_memory_points','UPDATE')
+  and has_table_privilege('role_retrieval_worker','projection.private_memory_points','SELECT')
+  and has_table_privilege('role_retrieval_worker','projection.private_memory_points','INSERT')
+  and has_table_privilege('role_retrieval_worker','projection.private_memory_points','UPDATE')
+  and not has_table_privilege('role_retrieval_worker','projection.private_memory_points','DELETE')
+  and not has_table_privilege('role_public_worker','projection.private_memory_points','SELECT')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only after deployment. Preserve point-to-source bindings and retired rows for stale-vector diagnosis; repair registry/schema or rebuild Qdrant from PostgreSQL without rewriting canonical Memory identity."
+backup_restore_requirement = "Production requires approved backup and rollout. Acceptance may apply only to the isolated local PostgreSQL fixture and disposable Qdrant collection; no production migration, provider traffic, credentials, or deployment."

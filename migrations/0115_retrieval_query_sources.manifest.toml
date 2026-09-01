@@ -1,0 +1,25 @@
+migration_id = "0115_retrieval_query_sources"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('private.retrieval_query_sources') is null
+  and to_regclass('ops.data_disclosures') is not null
+  and to_regclass('ops.data_disclosure_sources') is not null as precheck_ok
+"""
+
+postcheck = """
+select to_regclass('private.retrieval_query_sources') is not null
+  and exists (select 1 from pg_constraint where conname='retrieval_query_sources_tenant_query_source_unique')
+  and exists (select 1 from pg_constraint where conname='data_disclosures_tenant_disclosure_unique')
+  and exists (select 1 from pg_constraint where conname='data_disclosure_sources_tenant_disclosure_fk')
+  and exists (select 1 from pg_constraint where conname='data_disclosure_sources_tenant_query_source_fk')
+  and has_table_privilege('role_retrieval_worker','private.retrieval_query_sources','INSERT')
+  and not has_table_privilege('role_gateway','private.retrieval_query_sources','SELECT')
+  and has_column_privilege('role_maintenance','private.retrieval_query_sources','revoked_at','UPDATE')
+  and not has_table_privilege('role_maintenance','private.retrieval_query_sources','DELETE')
+  and has_function_privilege('role_retrieval_worker', 'ops.attach_retrieval_query_source(uuid,uuid,uuid,integer)', 'EXECUTE')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only after deployment: retain query-source metadata and disclosure relations for deletion/revocation traceability; do not delete rows or reopen an expired/revoked source."
+backup_restore_requirement = "Production requires approved backup and rollout. Acceptance writes only the isolated 61719 guard database with real role logins; query bodies, provider traffic, credentials, and deployment are out of scope."

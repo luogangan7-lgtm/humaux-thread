@@ -1,0 +1,257 @@
+schema_version = 1
+phase = 9
+gate = "G-R4-FAULT-MANIFEST"
+provider_mode = "recording"
+canon_ref = "docs/architecture/Baseline_2.9.md §11.2.5.1"
+
+[[fault_case]]
+gate_id = "R4-FG-01"
+variant = "BASE"
+case_id = "r4_fg_01_base"
+fault_injection = "Race two enqueue requests with the same idempotency key and fingerprint."
+durable_observation = "Both callers return the same pre-minted identities; exactly one job, execution root, and source set exist."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_01_base"
+runner_case_id = "NONE"
+dispatch_expectation = "NOT_APPLICABLE"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-02"
+variant = "BASE"
+case_id = "r4_fg_02_base"
+fault_injection = "Repeat an enqueue key with a different fingerprint."
+durable_observation = "The request conflicts and creates no replacement root, source, job, receipt, or identity."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_02_base"
+runner_case_id = "NONE"
+dispatch_expectation = "NOT_APPLICABLE"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-03"
+variant = "BASE"
+case_id = "r4_fg_03_base"
+fault_injection = "Commit the claim and stop before reserving A."
+durable_observation = "The execution remains READY_A and a later live lease can reserve the pre-minted A request."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_03_base"
+runner_case_id = "NONE"
+dispatch_expectation = "NOT_APPLICABLE"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-04"
+variant = "BASE"
+case_id = "r4_fg_04_base"
+fault_injection = "Commit the A reservation and stop before provider I/O."
+durable_observation = "A_RESERVED and its exact reserved receipts remain; a fresh claimant records reconciliation without dispatch."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_04_base"
+runner_case_id = "runner_a_reserve_crash_zero_dispatch"
+dispatch_expectation = "ZERO_AFTER_RESERVE"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-05"
+variant = "BASE"
+case_id = "r4_fg_05_base"
+fault_injection = "Return the A provider response and stop before the A completion commit."
+durable_observation = "The exact A reservation remains without a terminal receipt and no claimant redispatches it."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "NONE"
+runner_case_id = "runner_a_response_before_commit_zero_redispatch"
+dispatch_expectation = "ONE_INITIAL_ZERO_REDISPATCH"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-06"
+variant = "BASE"
+case_id = "r4_fg_06_base"
+fault_injection = "Abort the A completion transaction after the coverage read."
+durable_observation = "No A coverage receipt is visible; execution, ledger, and disclosure remain at their exact reservation."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_06_base"
+runner_case_id = "NONE"
+dispatch_expectation = "NOT_APPLICABLE"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-07"
+variant = "BASE"
+case_id = "r4_fg_07_base"
+fault_injection = "Commit A completion and stop immediately afterwards."
+durable_observation = "READY_B contains exact summaries and digest with successful A receipts; B can resume without replaying A."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_07_base"
+runner_case_id = "NONE"
+dispatch_expectation = "NOT_APPLICABLE"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-08"
+variant = "BASE"
+case_id = "r4_fg_08_base"
+fault_injection = "Commit the B reservation, then crash or time out."
+durable_observation = "B_RESERVED and its exact reserved receipts remain; later claimants do not replay B."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_08_base"
+runner_case_id = "runner_b_reserve_timeout_zero_redispatch"
+dispatch_expectation = "ONE_INITIAL_ZERO_REDISPATCH"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-09"
+variant = "BASE"
+case_id = "r4_fg_09_base"
+fault_injection = "Return B output, then make the scanner outcome unknown."
+durable_observation = "B_RESERVED and reserved receipts remain, no candidate exists, and no claimant redispatches B."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_09_base"
+runner_case_id = "runner_b_scanner_unknown_zero_redispatch"
+dispatch_expectation = "ONE_INITIAL_ZERO_REDISPATCH"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-10"
+variant = "BASE"
+case_id = "r4_fg_10_base"
+fault_injection = "Abort the B completion transaction before commit."
+durable_observation = "No partial assessment, scan, or candidate fact is visible; B receipts remain reserved."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_10_base"
+runner_case_id = "NONE"
+dispatch_expectation = "NOT_APPLICABLE"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-11"
+variant = "BASE"
+case_id = "r4_fg_11_base"
+fault_injection = "Commit B completion and stop before candidate settlement."
+durable_observation = "READY_CANDIDATE contains the complete B receipt and can resume candidate settlement without provider or scanner I/O."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_11_base"
+runner_case_id = "NONE"
+dispatch_expectation = "NOT_APPLICABLE"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-12"
+variant = "BASE"
+case_id = "r4_fg_12_base"
+fault_injection = "Abort the candidate settlement transaction."
+durable_observation = "Candidate, execution DONE, and job DONE are either all absent or all committed; no partial subset exists."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_12_base"
+runner_case_id = "NONE"
+dispatch_expectation = "NOT_APPLICABLE"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-13"
+variant = "BASE"
+case_id = "r4_fg_13_base"
+fault_injection = "Expire the lease while the exact matching A or B provider attempt is in flight, then return its response."
+durable_observation = "Exact late completion advances only attempt and execution facts; candidate and job settlement stay absent."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_13_base"
+runner_case_id = "runner_live_late_and_outcomes"
+dispatch_expectation = "ONE_INITIAL_ZERO_REDISPATCH"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-14"
+variant = "BASE"
+case_id = "r4_fg_14_base"
+fault_injection = "Attempt late completion with a mismatched call, request, intent, or disclosure identity."
+durable_observation = "The completion is rejected and none of the business or receipt authorities change."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_14_base"
+runner_case_id = "NONE"
+dispatch_expectation = "NOT_APPLICABLE"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-15"
+variant = "BASE"
+case_id = "r4_fg_15_base"
+fault_injection = "Let a fresh claimant observe A_RESERVED or B_RESERVED."
+durable_observation = "The execution keeps the exact reserved stage while the job records reconciliation and no provider successor is dispatched."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_15_base"
+runner_case_id = "runner_reserved_successor_zero_redispatch"
+dispatch_expectation = "ZERO_ON_RESERVED_SUCCESSOR"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-16"
+variant = "BASE"
+case_id = "r4_fg_16_base"
+fault_injection = "Attempt candidate insertion with the A ledger or a non-succeeded B ledger."
+durable_observation = "The database guard rejects the candidate and leaves execution and job unsettled."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_16_base"
+runner_case_id = "NONE"
+dispatch_expectation = "NOT_APPLICABLE"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-17"
+variant = "BASE"
+case_id = "r4_fg_17_base"
+fault_injection = "Compare live terminal completion with exact late completion and later fresh settlement."
+durable_observation = "Live completion atomically settles the existing job; late completion changes only exact attempt facts and later settlement performs no provider I/O."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_17_base"
+runner_case_id = "runner_live_late_and_outcomes"
+dispatch_expectation = "ONE_INITIAL_ZERO_REDISPATCH"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-18"
+variant = "B_GATE_FAIL"
+case_id = "r4_fg_18_b_gate_fail"
+fault_injection = "Return a valid B assessment with at least one business gate failure."
+durable_observation = "NOT_CONTRIBUTABLE has successful B receipts, no candidate, and a live job settlement."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_18_b_gate_fail"
+runner_case_id = "runner_live_late_and_outcomes"
+dispatch_expectation = "ONE_INITIAL_ZERO_REDISPATCH"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-18"
+variant = "SCAN_REJECT"
+case_id = "r4_fg_18_scan_reject"
+fault_injection = "Return provider output and an explicit scanner rejection."
+durable_observation = "REJECTED_SAFETY has successful exact receipts, a durable rejection receipt, and no candidate."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_18_scan_reject"
+runner_case_id = "runner_live_late_and_outcomes"
+dispatch_expectation = "ONE_INITIAL_ZERO_REDISPATCH"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-18"
+variant = "PROVIDER_DEFINITE_FAILURE"
+case_id = "r4_fg_18_provider_definite_failure"
+fault_injection = "Return a definite provider terminal failure."
+durable_observation = "FAILED_TERMINAL has failed exact receipts, no candidate, and a live failed job settlement."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_18_provider_definite_failure"
+runner_case_id = "runner_live_late_and_outcomes"
+dispatch_expectation = "ONE_INITIAL_ZERO_REDISPATCH"
+requires_fresh_connection = true
+
+[[fault_case]]
+gate_id = "R4-FG-18"
+variant = "TIMEOUT"
+case_id = "r4_fg_18_timeout"
+fault_injection = "Time out or lose certainty after the B reservation may have reached the provider."
+durable_observation = "The B reservation and reserved receipts remain, the job records reconciliation, no candidate exists, and B is not redispatched."
+probe_axes = ["execution", "job", "ledger", "disclosure", "candidate"]
+sql_case_id = "sql_r4_fg_18_timeout"
+runner_case_id = "runner_b_reserve_timeout_zero_redispatch"
+dispatch_expectation = "ONE_INITIAL_ZERO_REDISPATCH"
+requires_fresh_connection = true

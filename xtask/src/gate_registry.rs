@@ -281,6 +281,7 @@ fn parse_anchor_cell(raw: &str, allow_same_left: bool) -> Option<Vec<AnchorUnit>
 
 struct GateRow {
     id: String,
+    cross_phase: bool,
     criterion_raw: String,
     error_raw: String,
 }
@@ -303,12 +304,18 @@ fn parse_gate_table(text: &str) -> Result<Vec<GateRow>, String> {
         if cells.len() < 4 {
             continue;
         }
-        let id = cells[0].split_whitespace().next().unwrap_or("").to_string();
+        let first_cell = cells[0].trim();
+        let id = first_cell
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
         if !id.starts_with("G80-") {
             continue;
         }
         out.push(GateRow {
             id,
+            cross_phase: first_cell.contains("(cross-phase)"),
             criterion_raw: cells[2].clone(),
             error_raw: cells[3].clone(),
         });
@@ -838,7 +845,13 @@ fn g80_24_check3(text: &str, gate_rows: &[GateRow]) -> Verdict {
     let subitems = subitem_families(text);
     let declared: BTreeSet<String> = gate_rows.iter().map(|r| r.id.clone()).collect();
     let mut bad = Vec::new();
-    for id in &declared {
+    for row in gate_rows {
+        let id = &row.id;
+        // A registry row marked cross-phase remains registered and CI-enforced, but is not
+        // required to appear in a single Phase exit column.
+        if row.cross_phase {
+            continue;
+        }
         if let Some(expected) = subitems.get(id) {
             let mut counts: BTreeMap<String, u32> = BTreeMap::new();
             let prefix = format!("{id}.");
@@ -1265,6 +1278,7 @@ mod tests {
     fn fault_g24_f_undeclared_new_id_is_check1_red() {
         let gate_rows = vec![GateRow {
             id: "G80-5".to_string(),
+            cross_phase: false,
             criterion_raw: "§23.4#G23-1a".to_string(),
             error_raw: "同左".to_string(),
         }];
@@ -1291,6 +1305,7 @@ mod tests {
     fn fault_g24_g_removing_family_member_still_referenced_is_g80_23_check2_red() {
         let rows = vec![GateRow {
             id: "G80-14".to_string(),
+            cross_phase: false,
             criterion_raw: "§59.1#G59-1 · §59.1#G59-2".to_string(),
             error_raw: "同左".to_string(),
         }];
@@ -1308,6 +1323,7 @@ mod tests {
     fn fault_g24_h_anchor_section_missing_from_binding_table_is_check2_red() {
         let rows = vec![GateRow {
             id: "G80-98".to_string(),
+            cross_phase: false,
             criterion_raw: "§65#G65-1".to_string(),
             error_raw: "同左".to_string(),
         }];
@@ -1336,15 +1352,46 @@ mod tests {
     #[test]
     fn fault_g24_i_duplicating_phase_entry_is_check3_red() {
         let real = real_spec_text();
-        let doubled = real.replacen(
-            "| 8 | 同一 `context_snapshot_seq` 两次装配 handoff 逐字节相同；Mandatory Context 在 200 条相似噪声下仍不可被 rerank 淘汰。 | `G80-31` |",
-            "| 8 | 同一 `context_snapshot_seq` 两次装配 handoff 逐字节相同；Mandatory Context 在 200 条相似噪声下仍不可被 rerank 淘汰。 | `G80-31` `G80-31` |",
-            1,
-        );
+        let doubled = real.replacen("| `G80-31` `G80-46` |", "| `G80-31` `G80-31` `G80-46` |", 1);
         assert_ne!(
             doubled, real,
             "fixture assumption broken: Phase 8 row text has moved"
         );
         assert!(fails(&run_all(&doubled), "G80-24③"));
+    }
+
+    #[test]
+    fn cross_phase_marker_allows_registered_gate_without_phase_exit_entry() {
+        let real = real_spec_text();
+        let rows = parse_gate_table(&real).expect("real registry parses");
+        assert_eq!(g80_24_check3(&real, &rows), Verdict::Pass);
+    }
+
+    #[test]
+    fn removing_cross_phase_marker_requires_phase_exit_entry() {
+        let real = real_spec_text();
+        let rows = parse_gate_table(&real.replace(
+            "G80-44 R4 fault manifest closure (cross-phase)",
+            "G80-44 R4 fault manifest closure",
+        ))
+        .expect("mutated registry parses");
+        assert!(fails(
+            &run_all(&real.replace(
+                "G80-44 R4 fault manifest closure (cross-phase)",
+                "G80-44 R4 fault manifest closure",
+            )),
+            "G80-24③"
+        ));
+        assert!(matches!(g80_24_check3(&real, &rows), Verdict::Fail(_)));
+    }
+
+    #[test]
+    fn arbitrary_cross_phase_marked_id_is_not_hardcoded_to_g80_44() {
+        let real = real_spec_text().replace(
+            "G80-44 R4 fault manifest closure (cross-phase)",
+            "G80-98 arbitrary closure (cross-phase)",
+        );
+        let rows = parse_gate_table(&real).expect("mutated registry parses");
+        assert_eq!(g80_24_check3(&real, &rows), Verdict::Pass);
     }
 }

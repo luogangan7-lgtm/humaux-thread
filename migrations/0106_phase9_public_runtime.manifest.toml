@@ -1,0 +1,28 @@
+migration_id = "0106_phase9_public_runtime"
+class = "EXPAND_CONTRACT"
+precheck = """
+select to_regclass('public.claim_trust_evaluations') is null
+  and not exists(select 1 from public.sources where contribution_release_id is not null
+    group by contribution_release_id having count(*)>1)
+  and not exists(select 1 from staging.contribution_releases where state='REVOKED')
+  as precheck_ok
+"""
+postcheck = """
+select to_regclass('public.eligible_objects') is not null
+  and to_regclass('ops.jobs_outbox_consumer_unique') is not null
+  and to_regclass('ops.public_release_revocations') is not null
+  and not has_table_privilege('role_private_worker','public.claims','UPDATE')
+  and not has_table_privilege('role_gateway','staging.contribution_releases','SELECT')
+  and not has_table_privilege('role_public_worker','public.claim_trust_evaluations','UPDATE')
+  and has_table_privilege('role_private_worker','ops.public_release_revocations','INSERT')
+  and not has_table_privilege('role_gateway','ops.public_release_revocations','INSERT')
+  and has_column_privilege('role_public_worker','ops.outbox','object_revision','INSERT')
+  as postcheck_ok
+"""
+rollback_or_forward_fix = """
+Forward-only after use. No legacy trust/scan receipts are fabricated. A pre-existing revoked
+release requires a separately reviewed migration of its authentic revoke event, not a guessed
+backfill. Preserve revoke facts and referenced outbox audit rows during retention. If this
+isolated rehearsal fails, discard only the disposable fixture and replay immutable migrations.
+"""
+backup_restore_requirement = "Snapshot and restore rehearsal before separately approved production rollout; isolated PostgreSQL 18.6 only for this implementation."

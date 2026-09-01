@@ -1,0 +1,134 @@
+# §46.1 migration manifest. R1 is additive and deliberately inert: it creates the
+# USER_REASONING foundation without migrating or switching legacy profile behavior.
+
+migration_id = "0128_reasoning_route_foundation"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select not exists (
+  select 1 from pg_class where oid = to_regclass('control.reasoning_profiles')
+) as precheck_ok
+"""
+
+postcheck = """
+select
+  (select count(*) from pg_class where oid in (
+    to_regclass('control.processor_models'),
+    to_regclass('control.provider_accounts'),
+    to_regclass('control.provider_endpoints'),
+    to_regclass('control.provider_billing_accounts'),
+    to_regclass('control.provider_billing_instruments'),
+    to_regclass('control.reasoning_profiles'),
+    to_regclass('control.reasoning_route_policies'),
+    to_regclass('control.reasoning_route_candidates'),
+    to_regclass('control.reasoning_route_bindings'),
+    to_regclass('control.reasoning_credential_bindings')
+  )) = 10
+  and (select count(*) from pg_class
+       where oid in (
+         to_regclass('control.provider_accounts'),
+         to_regclass('control.provider_endpoints'),
+         to_regclass('control.provider_billing_accounts'),
+         to_regclass('control.provider_billing_instruments'),
+         to_regclass('control.reasoning_profiles'),
+         to_regclass('control.reasoning_route_policies'),
+         to_regclass('control.reasoning_route_candidates'),
+         to_regclass('control.reasoning_route_bindings'),
+         to_regclass('control.reasoning_credential_bindings')
+       ) and relrowsecurity and relforcerowsecurity) = 9
+  and (select count(*) from pg_trigger where tgrelid in (
+    'control.processor_models'::regclass,
+    'control.provider_accounts'::regclass,
+    'control.provider_endpoints'::regclass,
+    'control.provider_billing_accounts'::regclass,
+    'control.provider_billing_instruments'::regclass,
+    'control.reasoning_profiles'::regclass,
+    'control.reasoning_route_policies'::regclass,
+    'control.reasoning_route_candidates'::regclass,
+    'control.reasoning_route_bindings'::regclass,
+    'control.reasoning_credential_bindings'::regclass
+  ) and not tgisinternal) = 19
+  and not exists (
+    select 1 from (values
+      ('provider_accounts_check_owner', 'control.provider_accounts'::regclass),
+      ('provider_endpoints_check_account', 'control.provider_endpoints'::regclass),
+      ('provider_billing_accounts_check_account', 'control.provider_billing_accounts'::regclass),
+      ('provider_billing_instruments_check_account', 'control.provider_billing_instruments'::regclass),
+      ('reasoning_credential_bindings_check_authority', 'control.reasoning_credential_bindings'::regclass),
+      ('reasoning_profiles_check_ownership', 'control.reasoning_profiles'::regclass),
+      ('reasoning_route_policies_check_owner', 'control.reasoning_route_policies'::regclass),
+      ('reasoning_route_candidates_check_profile', 'control.reasoning_route_candidates'::regclass),
+      ('reasoning_route_bindings_check_domain_and_policy', 'control.reasoning_route_bindings'::regclass),
+      ('reasoning_profiles_append_only', 'control.reasoning_profiles'::regclass),
+      ('reasoning_credential_bindings_append_only', 'control.reasoning_credential_bindings'::regclass),
+      ('reasoning_route_policies_append_only', 'control.reasoning_route_policies'::regclass),
+      ('reasoning_route_candidates_append_only', 'control.reasoning_route_candidates'::regclass),
+      ('reasoning_route_bindings_close_only', 'control.reasoning_route_bindings'::regclass),
+      ('processor_models_identity_immutable', 'control.processor_models'::regclass),
+      ('provider_accounts_identity_immutable', 'control.provider_accounts'::regclass),
+      ('provider_endpoints_identity_immutable', 'control.provider_endpoints'::regclass),
+      ('provider_billing_accounts_identity_immutable', 'control.provider_billing_accounts'::regclass),
+      ('provider_billing_instruments_identity_immutable', 'control.provider_billing_instruments'::regclass)
+    ) expected(tgname, tgrelid)
+    where not exists (
+      select 1 from pg_trigger actual
+       where actual.tgname = expected.tgname
+         and actual.tgrelid = expected.tgrelid
+         and not actual.tgisinternal
+    )
+  )
+  and position('pg_advisory_xact_lock' in pg_get_functiondef(
+        'control.reasoning_profiles_check_ownership()'::regprocedure)) > 0
+  and position('pg_advisory_xact_lock' in pg_get_functiondef(
+        'control.reasoning_route_policies_check_owner()'::regprocedure)) > 0
+  and position('pg_advisory_xact_lock' in pg_get_functiondef(
+        'control.reasoning_route_bindings_check_domain_and_policy()'::regprocedure)) > 0
+  and position('transaction_isolation' in pg_get_functiondef(
+        'control.reasoning_profiles_check_ownership()'::regprocedure)) > 0
+  and position('transaction_isolation' in pg_get_functiondef(
+        'control.reasoning_route_policies_check_owner()'::regprocedure)) > 0
+  and position('transaction_isolation' in pg_get_functiondef(
+        'control.reasoning_route_bindings_check_domain_and_policy()'::regprocedure)) > 0
+  and position('40001' in pg_get_functiondef(
+        'control.reasoning_profiles_check_ownership()'::regprocedure)) > 0
+  and position('40001' in pg_get_functiondef(
+        'control.reasoning_route_policies_check_owner()'::regprocedure)) > 0
+  and position('40001' in pg_get_functiondef(
+        'control.reasoning_route_bindings_check_domain_and_policy()'::regprocedure)) > 0
+  and position('FOR UPDATE' in pg_get_functiondef(
+        'control.reasoning_route_candidates_check_profile()'::regprocedure)) > 0
+  and position('effective_to IS NULL' in pg_get_functiondef(
+        'control.reasoning_route_bindings_check_domain_and_policy()'::regprocedure)) > 0
+  and position('FOR UPDATE' in pg_get_functiondef(
+        'control.reasoning_route_bindings_check_domain_and_policy()'::regprocedure)) > 0
+  and position('enabled AND priority = 0 AND fallback_class = ''NONE''' in pg_get_functiondef(
+        'control.reasoning_policy_state_only()'::regprocedure)) > 0
+  and (select count(*) from pg_proc where oid in (
+        'control.reasoning_profiles_check_ownership()'::regprocedure,
+        'control.reasoning_route_policies_check_owner()'::regprocedure,
+        'control.reasoning_route_candidates_check_profile()'::regprocedure,
+        'control.reasoning_route_bindings_check_domain_and_policy()'::regprocedure
+      ) and provolatile = 'v') = 4
+  and position('NEW.enabled AND NOT OLD.enabled' in pg_get_functiondef(
+        'control.provider_accounts_check_owner()'::regprocedure)) > 0
+  and position('NEW.enabled AND NOT OLD.enabled' in pg_get_functiondef(
+        'control.provider_endpoints_check_account()'::regprocedure)) > 0
+  and position('NEW.enabled AND NOT OLD.enabled' in pg_get_functiondef(
+        'control.provider_billing_accounts_check_account()'::regprocedure)) > 0
+  and position('NEW.enabled AND NOT OLD.enabled' in pg_get_functiondef(
+        'control.provider_billing_instruments_check_account()'::regprocedure)) > 0
+  and position('NEW.enabled AND NOT OLD.enabled' in pg_get_functiondef(
+        'control.reasoning_profiles_check_ownership()'::regprocedure)) > 0
+  and position('NEW.lifecycle_state = OLD.lifecycle_state' in pg_get_functiondef(
+        'control.reasoning_route_policies_check_owner()'::regprocedure)) > 0
+  and not has_table_privilege('role_private_worker', 'control.reasoning_profiles', 'SELECT')
+  and not has_table_privilege('role_public_worker', 'control.reasoning_route_bindings', 'SELECT')
+  and not has_table_privilege('role_retrieval_worker', 'control.provider_accounts', 'SELECT')
+  and not has_table_privilege('role_retrieval_worker', 'control.reasoning_credential_bindings', 'SELECT')
+  and not has_table_privilege('role_private_worker', 'control.processor_models', 'SELECT')
+  and not has_any_column_privilege('role_public_worker', 'control.reasoning_profiles', 'SELECT')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only after deployment. Preserve any future route snapshots and add a successor migration; R1 does not backfill, alter, or remove control.user_reasoning_profiles."
+backup_restore_requirement = "Apply only to an isolated PostgreSQL 18 acceptance fixture until production backup and rollout are approved. This additive migration creates protected control-plane tables and no runtime route switch."

@@ -31,7 +31,11 @@
 //! Three-state skip (§79.2): no DSN, unreachable DB, or the migration missing all print a
 //! visible SKIP and return.
 
-use std::sync::Mutex;
+use std::{
+    sync::{Mutex, mpsc},
+    thread,
+    time::{Duration, Instant},
+};
 
 use humaux_adapters::postgres::RetrievalWorkerDbPool;
 use humaux_adapters::selection_repo::{self, SelectionRepoError};
@@ -52,6 +56,39 @@ fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
     // verified working against both drivers there.
     let sep = if admin_dsn.contains('?') { '&' } else { '?' };
     format!("{admin_dsn}{sep}options=-c%20role%3D{role}")
+}
+
+fn dsn_as_role_with_application(admin_dsn: &str, role: &str, application_name: &str) -> String {
+    format!(
+        "{}&application_name={application_name}",
+        dsn_as_role(admin_dsn, role)
+    )
+}
+
+fn wait_for_snapshot_materialization_wait(
+    admin: &mut Client,
+    application_name: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: bool = admin
+            .query_one(
+                "SELECT EXISTS (                   SELECT 1                     FROM pg_stat_activity AS activity                     JOIN pg_locks AS locks USING (pid)                    WHERE activity.application_name = $1                      AND locks.locktype = 'relation'                      AND locks.relation = 'ops.selection_snapshot_items'::regclass                      AND locks.mode = 'RowExclusiveLock'                      AND NOT locks.granted                 )",
+                &[&application_name],
+            )
+            .map_err(|error| format!("inspect snapshot materialization wait: {error}"))?
+            .get(0);
+        if waiting {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "snapshot actor {application_name} never waited for a RowExclusiveLock on \
+                 ops.selection_snapshot_items within 30s"
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 struct Handle {
@@ -216,20 +253,21 @@ fn seed_active_memories(
 /// Inserts `count` more "concurrent" active memory rows on an independent blocking connection
 /// — newer UUIDv7 than anything seeded before it, so they sort first under
 /// `ORDER BY memory_id DESC` (the exact "更靠前的行" shape §20.4's G20-1 fault injection
-/// describes).
-/// The actual insert loop, connection-agnostic — used both from inside a `spawn_blocking`
-/// (racing the snapshot's own materializing transaction, see
-/// [`spawn_concurrent_inserter`]) and called directly (the post-page-1 wave, which needs no
-/// race, just to exist before the remaining pages are fetched).
+/// describes). All rows and their evidence links commit together, so the caller can use the
+/// returned result as a precise "concurrent source set committed" signal.
 fn insert_concurrent_batch(
-    client: &mut Client,
+    admin_dsn: &str,
     tenant_id: Uuid,
     evidence_id: Uuid,
     count: usize,
     tag: &str,
-) {
+) -> Result<(), String> {
+    let mut client = Client::connect(admin_dsn, NoTls)
+        .map_err(|error| format!("concurrent inserter connects: {error}"))?;
+    let mut txn = client
+        .transaction()
+        .map_err(|error| format!("begin concurrent-insert transaction: {error}"))?;
     for i in 0..count {
-        let mut txn = client.transaction().expect("begin concurrent-insert txn");
         let memory_id: Uuid = txn
             .query_one(
                 "INSERT INTO private.memory_records \
@@ -240,39 +278,24 @@ fn insert_concurrent_batch(
                  RETURNING memory_id",
                 &[&tenant_id, &serde_json::json!({"concurrent": tag, "i": i})],
             )
-            .expect("concurrent insert must succeed")
+            .map_err(|error| format!("insert concurrent memory: {error}"))?
             .get(0);
         txn.execute(
             "INSERT INTO private.memory_evidence (memory_id, evidence_id, role) \
              VALUES ($1, $2, 'PRIMARY')",
             &[&memory_id, &evidence_id],
         )
-        .expect("concurrent memory_evidence link must succeed");
-        txn.commit().expect("commit concurrent-insert txn");
+        .map_err(|error| format!("link concurrent memory evidence: {error}"))?;
     }
-}
-
-/// Inserts `count` more "concurrent" active memory rows on an independent blocking connection
-/// — newer UUIDv7 than anything seeded before it, so they sort first under
-/// `ORDER BY memory_id DESC` (the exact "更靠前的行" shape §20.4's G20-1 fault injection
-/// describes). Must be called from inside an active Tokio runtime (`spawn_blocking` needs a
-/// reactor at call time, not just when awaited).
-fn spawn_concurrent_inserter(
-    admin_dsn: String,
-    tenant_id: Uuid,
-    evidence_id: Uuid,
-    count: usize,
-    tag: &'static str,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
-        let mut client = Client::connect(&admin_dsn, NoTls).expect("concurrent inserter connects");
-        insert_concurrent_batch(&mut client, tenant_id, evidence_id, count, tag);
-    })
+    txn.commit()
+        .map_err(|error| format!("commit concurrent-insert batch: {error}"))?;
+    Ok(())
 }
 
 /// G20-1 / G80-32: base 30 + 20 concurrent-during-materialization + 15 concurrent-after-page-1
 /// — every page collected afterward must equal exactly the base 30, no more, no less.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn snapshot_pagination_is_stable_under_concurrent_inserts() {
     let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     run_db_fixture::<SelectionFixture, _>(
@@ -286,32 +309,89 @@ fn snapshot_pagination_is_stable_under_concurrent_inserts() {
             let tenant_id = handle.tenant_id;
             let evidence_id = handle.evidence_id;
             let admin_dsn = handle.admin_dsn.clone();
-            let retrieval = &handle.retrieval;
+            let snapshot_application_name = format!("selection_snapshot_actor_{}", Uuid::new_v4());
+            let snapshot_dsn = dsn_as_role_with_application(
+                &admin_dsn,
+                "role_retrieval_worker",
+                &snapshot_application_name,
+            );
 
-            // Race 20 "higher-ranked" inserts against the snapshot's own materializing
-            // transaction — mirrors `consolidate_snapshot.rs`'s G11-1 race exactly.
-            let first_page = handle.rt.block_on(async {
-                let snapshot = selection_repo::begin_enumeration_snapshot(
-                    retrieval, tenant_id, 300.0, 7, MAC_KEY,
-                );
-                let inserter = spawn_concurrent_inserter(
-                    admin_dsn.clone(),
-                    tenant_id,
-                    evidence_id,
-                    20,
-                    "during",
-                );
-                let (snapshot, _) = tokio::join!(snapshot, inserter);
-                snapshot.expect("begin_enumeration_snapshot must not error")
+            // The real actor fixes its RR snapshot with the first `selection_snapshots` INSERT,
+            // reads the live source, then blocks only when materializing into this held target.
+            let mut holder = Client::connect(&admin_dsn, NoTls)
+                .expect("connect snapshot materialization holder");
+            let mut holder_txn = holder
+                .transaction()
+                .expect("begin snapshot materialization-holder transaction");
+            holder_txn
+                .batch_execute("LOCK TABLE ops.selection_snapshot_items IN SHARE MODE")
+                .expect("hold snapshot materialization table SHARE lock");
+
+            let snapshot = thread::spawn(move || {
+                let actor_rt = tokio::runtime::Runtime::new()
+                    .map_err(|error| format!("create snapshot actor runtime: {error}"))?;
+                let actor_pool = actor_rt
+                    .block_on(RetrievalWorkerDbPool::connect(&snapshot_dsn))
+                    .map_err(|error| format!("connect snapshot actor pool: {error}"))?;
+                actor_rt
+                    .block_on(selection_repo::begin_enumeration_snapshot(
+                        &actor_pool,
+                        tenant_id,
+                        300.0,
+                        7,
+                        MAC_KEY,
+                    ))
+                    .map_err(|error| format!("begin enumeration snapshot: {error}"))
             });
+
+            let barrier_result = wait_for_snapshot_materialization_wait(
+                &mut handle.admin,
+                &snapshot_application_name,
+            );
+            let (inserter_done_tx, inserter_done_rx) = mpsc::channel();
+            let inserter = barrier_result.as_ref().ok().map(|()| {
+                let admin_dsn = admin_dsn.clone();
+                thread::spawn(move || {
+                    let result =
+                        insert_concurrent_batch(&admin_dsn, tenant_id, evidence_id, 20, "during");
+                    let completion = result.as_ref().map_err(Clone::clone).map(|_| ());
+                    let _ = inserter_done_tx.send(completion);
+                    result
+                })
+            });
+            let insertion_completion = inserter.as_ref().map(|_| {
+                inserter_done_rx.recv_timeout(Duration::from_secs(30)).map_err(|error| {
+                    format!(
+                        "concurrent inserter did not report a committed result within 30s: {error}"
+                    )
+                })?
+            });
+
+            // Release first, then collect both actor results before any assertion can panic.
+            let holder_release = holder_txn.rollback();
+            let snapshot_join = snapshot.join();
+            let inserter_join = inserter.map(|actor| actor.join());
+
+            barrier_result.expect("snapshot actor must reach the materialization wait barrier");
+            insertion_completion
+                .expect("inserter runs only after the materialization barrier")
+                .expect("concurrent higher-ranked inserts must commit");
+            holder_release.expect("release snapshot materialization-holder transaction");
+            let first_page = snapshot_join
+                .expect("snapshot actor must join")
+                .expect("begin_enumeration_snapshot must not error");
+            inserter_join
+                .expect("inserter runs only after the materialization barrier")
+                .expect("inserter actor must join")
+                .expect("concurrent higher-ranked inserts must commit");
 
             // Now insert a *second* wave after page 1 has already been returned to the caller
             // — the "page 1 后插入排序更靠前的 20 行" shape from §20.4's own G20-1 wording,
             // this time strictly after materialization committed. No race needed here (the
             // manifest is already immutable), so this runs synchronously on the admin
             // connection, no Tokio runtime required.
-            insert_concurrent_batch(&mut handle.admin, tenant_id, evidence_id, 15, "after");
-            let _ = admin_dsn; // kept alive above only for the "during" race's inserter
+            insert_concurrent_batch(&admin_dsn, tenant_id, evidence_id, 15, "after")
+                .expect("post-page concurrent inserts must commit");
 
             let mut collected = first_page.items.clone();
             let mut cursor = first_page.next_cursor.clone();

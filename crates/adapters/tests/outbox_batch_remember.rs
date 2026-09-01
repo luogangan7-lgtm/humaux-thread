@@ -160,11 +160,17 @@ fn command(
 ) -> RememberCommand {
     RememberCommand {
         tenant_id: handle.tenant_id,
+        // This fixture deliberately writes tenant-shared Evidence without an authenticated
+        // actor, exercising the headless UUID sentinel path.
+        authorization_user_id: None,
         scope_kind: "workspace".to_string(),
         scope_id,
         domain: "private_memory".to_string(),
         projection_kind: "PRIVATE_MEMORY".to_string(),
         projection_version: "v1".to_string(),
+        // Test policy input; production callers must supply configured/policy expiry.
+        consistency_token_expires_at: OffsetDateTime::now_utc()
+            + std::time::Duration::from_secs(3600),
         batch_id,
         payload_sha256: payload_sha256(content.as_bytes()),
         data_class: "INTERNAL".to_string(),

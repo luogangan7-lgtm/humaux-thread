@@ -1,0 +1,16 @@
+[package]
+name = "humaux-local-secret-scan"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+humaux-domain = { path = "../domain" }
+humaux-retrieval = { path = "../retrieval" }
+humaux-projection = { path = "../projection" }
+serde_json = "1"
+sha2 = "0.11"
+uuid = { version = "1.25.0", features = ["v7"] }

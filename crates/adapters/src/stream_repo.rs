@@ -21,6 +21,10 @@ use sqlx::Row;
 use sqlx::types::Uuid;
 
 use humaux_projection::stream::{Inconsistent, StreamKey, StreamLedgerSnapshot};
+use humaux_retrieval::completeness::{
+    LedgerClosure,
+    ledger::{self, LedgerReads},
+};
 
 use crate::postgres::{MaintenanceDbPool, RetrievalWorkerDbPool};
 
@@ -204,6 +208,38 @@ async fn fetch_snapshot_in_txn(
         max_stream_seq,
         contiguous_done_prefix,
     })
+}
+
+/// Closes one stream ledger inside a caller-owned, tenant-scoped transaction.
+///
+/// The four A1 inputs remain `fetch_snapshot_in_txn`'s independent reads. This helper adds
+/// only the separately reported settled subsets and delegates all closure arithmetic to
+/// [`ledger::close`]. Callers establish isolation and RLS GUCs before invoking it.
+pub(crate) async fn close_ledger_in_txn(
+    txn: &mut Txn<'_>,
+    key: &StreamKey,
+) -> Result<LedgerClosure, sqlx::Error> {
+    let snapshot = fetch_snapshot_in_txn(txn, key).await?;
+    let row = bind_key(
+        sqlx::query(&format!(
+            "SELECT count(*) FILTER (WHERE state = 'TOMBSTONED') AS deleted, \
+                    count(*) FILTER (WHERE state = 'SKIPPED_BY_POLICY') AS skipped \
+             FROM projection.stream_log WHERE {KEY_WHERE}"
+        )),
+        key,
+    )
+    .fetch_one(&mut **txn)
+    .await?;
+    let deleted = row.try_get::<i64, _>("deleted")? as u64;
+    let skipped = row.try_get::<i64, _>("skipped")? as u64;
+    Ok(ledger::close(LedgerReads {
+        expected: snapshot.expected,
+        done: snapshot.done,
+        deleted,
+        skipped,
+        open_gaps: snapshot.open_gaps,
+        pending: snapshot.pending,
+    }))
 }
 
 /// Public, read-only entry point for [`fetch_snapshot_in_txn`]: opens its own tenant-scoped

@@ -304,8 +304,8 @@ pub async fn select_and_materialize_inputs(
 ) -> Result<Vec<MaterializedInput>, ConsolidateRepoError> {
     let mut txn = pool.pool().begin().await?;
     // §11.7 "READ WRITE 是硬修正，不是风格选择": `READ ONLY` rejects the INSERT below with
-    // SQLSTATE 25006. Must run before any other statement in this transaction — Postgres only
-    // accepts `SET TRANSACTION` as the transaction's first statement.
+    // SQLSTATE 25006. Set isolation before any query or data modification can establish
+    // the transaction snapshot.
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ WRITE")
         .execute(&mut *txn)
         .await?;
@@ -325,9 +325,9 @@ pub async fn select_and_materialize_inputs(
         });
     }
 
-    // The one and only SELECT this transaction ever issues — it establishes the
-    // `REPEATABLE READ` snapshot every later statement in `txn` (including the INSERTs below)
-    // observes. `ORDER BY memory_id DESC` is the "stable_tuple" §11.7 asks for: no dedicated
+    // This source SELECT uses the `REPEATABLE READ` snapshot already established by the
+    // run UPDATE above. The later INSERTs use that same transaction view.
+    // `ORDER BY memory_id DESC` is the "stable_tuple" §11.7 asks for: no dedicated
     // ranking score exists yet on `memory_records` (a later task's concern), so this uses the
     // primary key as today's deterministic tie-break — DESC specifically because `memory_id`
     // is UUIDv7 (time-ordered), so newest-first is the closest available proxy for "most

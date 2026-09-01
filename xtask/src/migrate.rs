@@ -25,7 +25,12 @@ const BOOTSTRAP_SQL: &str = "\
       migration_id text PRIMARY KEY, \
       checksum     text NOT NULL, \
       applied_at   timestamptz NOT NULL DEFAULT now() \
-    );";
+    ); \
+    DO $owner$ BEGIN \
+      IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'role_migration_owner') THEN \
+        ALTER TABLE ops.schema_migrations OWNER TO role_migration_owner; \
+      END IF; \
+    END $owner$;";
 
 /// FNV-1a: dependency-free, deterministic, sufficient for drift detection (this is not a
 /// security boundary — sha256 is already the workspace's payload-identity function,
@@ -207,8 +212,56 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use postgres::Client;
+    use postgres::{Client, types::Type};
     use std::fs;
+
+    fn database_dsn(base: &str, database: &str) -> String {
+        let (without_query, query) = base
+            .split_once('?')
+            .map_or((base, None), |(head, tail)| (head, Some(tail)));
+        let slash = without_query.rfind('/').expect("database path in test DSN");
+        format!(
+            "{}{database}{}",
+            &without_query[..=slash],
+            query.map_or(String::new(), |tail| format!("?{tail}"))
+        )
+    }
+
+    fn assert_exact_manifest_boolean(client: &mut Client, field: &str, expected: bool) {
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../migrations/0137_project_continuity_read.manifest.toml");
+        let manifest: toml::Value =
+            toml::from_str(&fs::read_to_string(manifest_path).expect("read exact 0137 manifest"))
+                .expect("parse exact 0137 manifest");
+        let query = manifest
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .expect("exact 0137 manifest boolean query");
+        let rows = client
+            .query(query, &[])
+            .expect("execute exact manifest query");
+        assert_eq!(rows.len(), 1, "{field} must return exactly one row");
+        assert_eq!(rows[0].columns().len(), 1, "{field} must return one column");
+        assert_eq!(
+            *rows[0].columns()[0].type_(),
+            Type::BOOL,
+            "{field} must return a boolean"
+        );
+        assert_eq!(rows[0].get::<_, bool>(0), expected, "exact 0137 {field}");
+    }
+
+    struct DisposableDatabase {
+        admin_dsn: String,
+        name: String,
+    }
+
+    impl Drop for DisposableDatabase {
+        fn drop(&mut self) {
+            if let Ok(mut admin) = Client::connect(&self.admin_dsn, NoTls) {
+                let _ = admin.batch_execute(&format!("DROP DATABASE {} WITH (FORCE)", self.name));
+            }
+        }
+    }
 
     #[test]
     fn collect_migrations_sorts_by_filename() {
@@ -288,6 +341,18 @@ mod tests {
 
         let (applied, skipped) = apply_all(&mut client, &migrations).expect("clean apply");
         assert_eq!((applied, skipped), (2, 0), "first run applies both");
+        let migration_table_owner: String = client
+            .query_one(
+                "SELECT tableowner FROM pg_tables \
+                 WHERE schemaname = 'ops' AND tablename = 'schema_migrations'",
+                &[],
+            )
+            .expect("migration ledger owner query")
+            .get(0);
+        assert_eq!(
+            migration_table_owner, "role_migration_owner",
+            "migration bootstrap must converge to the Canonical owner once that role exists"
+        );
 
         let (applied, skipped) = apply_all(&mut client, &migrations).expect("idempotent re-apply");
         assert_eq!(
@@ -349,5 +414,115 @@ mod tests {
                 &[&vec![id_ok1, id_ok2, id_bad]],
             )
             .expect("fixture cleanup: unrecord this test's own migration ids");
+    }
+
+    #[test]
+    fn final_0137_candidate_runtime_failure_has_zero_residue() {
+        let Ok(base_dsn) = std::env::var(DSN_ENV) else {
+            eprintln!("migrate test: not_applicable — {DSN_ENV} unset, skipping");
+            return;
+        };
+        let run_id = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        );
+        let database = format!("humaux_w2_0137_{run_id}");
+        let test_dsn = database_dsn(&base_dsn, &database);
+        let mut admin = match Client::connect(&base_dsn, NoTls) {
+            Ok(client) => client,
+            Err(error) => {
+                eprintln!(
+                    "migrate test: not_applicable — cannot reach Postgres at ${DSN_ENV}: {error}, skipping"
+                );
+                return;
+            }
+        };
+        admin
+            .batch_execute(&format!("CREATE DATABASE {database}"))
+            .expect("create disposable PostgreSQL 18 database");
+        let _database = DisposableDatabase {
+            admin_dsn: base_dsn,
+            name: database,
+        };
+        drop(admin);
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let migrations = collect_migrations(&root.join("migrations")).expect("collect migrations");
+        let split = migrations
+            .iter()
+            .position(|migration| migration.migration_id == "0137_project_continuity_read")
+            .expect("exact 0137 migration");
+        let before = &migrations[..split];
+        let exact = &migrations[split];
+        assert_eq!(exact.migration_id, "0137_project_continuity_read");
+        let mut client = Client::connect(&test_dsn, NoTls).expect("connect disposable database");
+        let (applied, skipped) = apply_all(&mut client, before).expect("apply through 0136");
+        assert_eq!(
+            (applied, skipped),
+            (before.len(), 0),
+            "fresh through-0136 apply"
+        );
+        assert_exact_manifest_boolean(&mut client, "precheck", true);
+
+        let probe = format!("w2_0137_probe_{run_id}");
+        let failed_id = format!("w2_0137_failed_{run_id}");
+        let failed = PendingMigration {
+            migration_id: failed_id.clone(),
+            sql: format!(
+                "{}\nCREATE TABLE {probe} (id integer);\nSELECT 1/0;",
+                exact.sql
+            ),
+        };
+        let error = apply_all(&mut client, &[failed]).expect_err("exact 0137 candidate must fail");
+        assert!(
+            error.contains(&failed_id),
+            "failure names exact candidate: {error}"
+        );
+        let residue = client
+            .query_one(
+                "SELECT \
+                   to_regprocedure('private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])') IS NULL, \
+                   to_regclass($1) IS NULL, \
+                   NOT EXISTS (SELECT 1 FROM ops.schema_migrations WHERE migration_id=$2)",
+                &[&probe, &failed_id],
+            )
+            .expect("candidate residue query");
+        assert!(
+            residue.get::<_, bool>(0),
+            "0137 reader function must roll back"
+        );
+        assert!(residue.get::<_, bool>(1), "post-body probe must roll back");
+        assert!(
+            residue.get::<_, bool>(2),
+            "failed candidate must not enter ledger"
+        );
+
+        let (applied, skipped) = apply_all(&mut client, std::slice::from_ref(exact))
+            .expect("apply untouched exact 0137");
+        assert_eq!((applied, skipped), (1, 0), "untouched 0137 applies once");
+        assert_exact_manifest_boolean(&mut client, "postcheck", true);
+        // Migrations authored after 0137 must be applied before the replay assertion below.
+        // Without this the test silently encodes "0137 is the last migration on disk": every
+        // later migration would show up as a fresh apply during the replay and turn the
+        // zero-apply assertion red for a reason that has nothing to do with 0137's residue.
+        let after = &migrations[split + 1..];
+        let (applied, skipped) =
+            apply_all(&mut client, after).expect("apply migrations authored after 0137");
+        assert_eq!(
+            (applied, skipped),
+            (after.len(), 0),
+            "post-0137 migrations apply exactly once"
+        );
+        let (applied, skipped) =
+            apply_all(&mut client, &migrations).expect("replay exact migration set");
+        assert_eq!(
+            (applied, skipped),
+            (0, migrations.len()),
+            "replay is zero-apply"
+        );
     }
 }

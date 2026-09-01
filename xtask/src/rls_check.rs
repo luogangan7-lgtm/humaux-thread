@@ -90,6 +90,7 @@ pub const RUNTIME_ROLES: &[&str] = &[
 pub const NON_RUNTIME_ROLES: &[&str] = &[
     "role_batch_issuer",
     "role_maintenance",
+    "role_admin",
     "role_migration_owner",
 ];
 
@@ -109,6 +110,7 @@ const NON_OWNER_ROLES: &[&str] = &[
     "role_retrieval_worker",
     "role_batch_issuer",
     "role_maintenance",
+    "role_admin",
 ];
 
 fn frozen_role_set() -> BTreeSet<&'static str> {
@@ -120,7 +122,7 @@ fn frozen_role_set() -> BTreeSet<&'static str> {
 }
 
 // ============================================================================
-// §6.2.2 — table-level/column-level grant matrix (the 14 point-named tables). One
+// §6.2.2 — table-level/column-level grant matrix (the Phase9 point-named tables). One
 // `Cell` per non-empty (table, role) entry; a (table, role) pair absent from MATRIX
 // means the matrix cell is `—` (explicitly empty, §6.2.2 overrides §6.2.1's domain
 // default entirely for a listed table — absence is not "fall back to default").
@@ -152,6 +154,52 @@ macro_rules! cell {
 /// for the prose; this is the runnable form of the same table, not a second copy of its
 /// reasoning).
 const MATRIX: &[Cell] = &[
+    cell!("ops.mechanism_observations", "role_gateway", ["SELECT"]),
+    cell!(
+        "ops.mechanism_observations",
+        "role_private_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.mechanism_observations",
+        "role_consolidation_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.mechanism_observations",
+        "role_public_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.mechanism_observations",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.mechanism_observations",
+        "role_maintenance",
+        ["SELECT", "INSERT"]
+    ),
+    cell!("ops.mechanism_observations", "role_admin", ["SELECT"]),
+    cell!("ops.mechanism_e2e_runs", "role_gateway", ["SELECT"]),
+    cell!("ops.mechanism_e2e_runs", "role_private_worker", ["SELECT"]),
+    cell!(
+        "ops.mechanism_e2e_runs",
+        "role_consolidation_worker",
+        ["SELECT"]
+    ),
+    cell!("ops.mechanism_e2e_runs", "role_public_worker", ["SELECT"]),
+    cell!(
+        "ops.mechanism_e2e_runs",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.mechanism_e2e_runs",
+        "role_maintenance",
+        ["SELECT", "INSERT"]
+    ),
+    cell!("ops.mechanism_e2e_runs", "role_admin", ["SELECT"]),
     // private.ingest_tickets
     cell!(
         "private.ingest_tickets",
@@ -244,11 +292,69 @@ const MATRIX: &[Cell] = &[
     // the read-your-writes overlay joins projection.stream_log to this table on
     // (tenant_id, commit_seq) to recover the evidence_id a stream_log row does not itself
     // carry — see that migration's header for why commit_seq, not stream_seq, is the join key.
-    cell!("ops.outbox", "role_gateway", ["INSERT", "SELECT"]),
-    cell!("ops.outbox", "role_private_worker", ["SELECT", "UPDATE"]),
-    cell!("ops.outbox", "role_public_worker", ["SELECT", "UPDATE"]),
+    cell!(
+        "ops.outbox",
+        "role_gateway",
+        ["SELECT"],
+        [(
+            "INSERT",
+            [
+                "tenant_id",
+                "commit_seq",
+                "stream_seq",
+                "event_type",
+                "evidence_id"
+            ]
+        )]
+    ),
+    cell!(
+        "ops.outbox",
+        "role_private_worker",
+        ["SELECT", "UPDATE"],
+        [(
+            "INSERT",
+            [
+                "tenant_id",
+                "commit_seq",
+                "event_type",
+                "contribution_release_id",
+                "anonymous_source_id",
+                "candidate_envelope_sha256",
+                "anonymous_source_revision"
+            ]
+        )]
+    ),
+    cell!("ops.outbox", "role_public_worker", []),
     cell!("ops.outbox", "role_retrieval_worker", ["SELECT", "UPDATE"]),
     cell!("ops.outbox", "role_maintenance", ["SELECT"]),
+    // §12/§13, ADR-0008: release IO is separate from gateway Evidence production.
+    cell!(
+        "staging.contribution_releases",
+        "role_private_worker",
+        ["SELECT", "INSERT"],
+        [("UPDATE", ["state", "revoked_at"])]
+    ),
+    cell!("staging.contribution_releases", "role_public_worker", []),
+    cell!(
+        "staging.contribution_releases",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    cell!(
+        "staging.contribution_release_sources",
+        "role_private_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "staging.contribution_release_sources",
+        "role_public_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "staging.contribution_release_sources",
+        "role_maintenance",
+        ["SELECT"]
+    ),
     // ops.jobs
     cell!("ops.jobs", "role_gateway", ["SELECT", "INSERT", "UPDATE"]),
     cell!(
@@ -262,11 +368,7 @@ const MATRIX: &[Cell] = &[
         ["SELECT"],
         [("UPDATE", ["status", "lease_owner", "lease_expires_at"])]
     ),
-    cell!(
-        "ops.jobs",
-        "role_public_worker",
-        ["SELECT", "INSERT", "UPDATE"]
-    ),
+    cell!("ops.jobs", "role_public_worker", []),
     cell!(
         "ops.jobs",
         "role_retrieval_worker",
@@ -287,6 +389,49 @@ const MATRIX: &[Cell] = &[
     ),
     cell!("control.quota_windows", "role_private_worker", ["SELECT"]),
     cell!("control.quota_windows", "role_maintenance", ["SELECT"]),
+    // §72.2.1 / §6.2.2: durable request accounting and rate limiting.
+    cell!(
+        "control.usage_reservations",
+        "role_gateway",
+        ["SELECT", "INSERT"],
+        [("UPDATE", ["status", "finished_at"])]
+    ),
+    cell!("control.usage_reservations", "role_maintenance", ["SELECT"]),
+    cell!(
+        "control.rate_buckets",
+        "role_gateway",
+        ["SELECT", "INSERT"],
+        [(
+            "UPDATE",
+            [
+                "capacity",
+                "tokens",
+                "refill_per_second",
+                "updated_at",
+                "version"
+            ]
+        )]
+    ),
+    cell!("control.rate_buckets", "role_maintenance", ["SELECT"]),
+    cell!(
+        "control.operation_receipts",
+        "role_gateway",
+        ["SELECT", "INSERT"]
+    ),
+    cell!("control.operation_receipts", "role_maintenance", ["SELECT"]),
+    // §19 native retrieval query disclosure source: only the retrieval worker may create it;
+    // maintenance may revoke it without rewriting the immutable identity.
+    cell!(
+        "private.retrieval_query_sources",
+        "role_retrieval_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.retrieval_query_sources",
+        "role_maintenance",
+        ["SELECT"],
+        [("UPDATE", ["revoked_at", "revocation_reason"])]
+    ),
     // private.evidence_objects
     cell!(
         "private.evidence_objects",
@@ -445,6 +590,373 @@ const MATRIX: &[Cell] = &[
         "role_maintenance",
         ["SELECT", "INSERT"]
     ),
+    // Phase9 public runtime and contribution staging tables (0106/0107).
+    cell!(
+        "control.public_moderator_grants",
+        "role_public_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "control.public_moderator_grants",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.public_release_revocations",
+        "role_private_worker",
+        ["INSERT"]
+    ),
+    cell!("ops.public_release_revocations", "role_gateway", ["SELECT"]),
+    cell!(
+        "ops.public_release_revocations",
+        "role_public_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.public_release_revocations",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.public_release_revocations",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.claim_trust_evaluations",
+        "role_public_worker",
+        [],
+        [(
+            "INSERT",
+            [
+                "evaluation_id",
+                "claim_id",
+                "synthesis_id",
+                "object_revision",
+                "body_sha256",
+                "policy_version",
+                "moderation_state",
+                "evaluator_user_id",
+                "evaluator_grant_version",
+                "rationale",
+                "support_count",
+                "independent_support_count",
+                "trusted_source_count",
+                "identity_incomplete",
+                "contradiction_count",
+                "checks_complete"
+            ]
+        )]
+    ),
+    cell!(
+        "public.claim_trust_evaluations",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.claim_trust_evaluation_sources",
+        "role_public_worker",
+        [],
+        [(
+            "INSERT",
+            [
+                "evaluation_id",
+                "root_source_id",
+                "source_content_hash",
+                "contribution_release_id"
+            ]
+        )]
+    ),
+    cell!(
+        "public.claim_trust_evaluation_sources",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.poisoning_signals",
+        "role_public_worker",
+        [],
+        [(
+            "INSERT",
+            ["evaluation_id", "signal_code", "check_version", "detected"]
+        )]
+    ),
+    cell!("public.poisoning_signals", "role_maintenance", ["SELECT"]),
+    cell!(
+        "staging.contribution_candidates",
+        "role_private_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "staging.contribution_candidates",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    cell!(
+        "staging.contribution_candidate_sources",
+        "role_private_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "staging.contribution_candidate_sources",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    cell!(
+        "control.contribution_confirmations",
+        "role_gateway",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "control.contribution_confirmations",
+        "role_private_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "control.contribution_confirmations",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    // 0124: aggregate receipt is public-safe, but its protected write path is definer-only.
+    cell!(
+        "public.claim_independence_attestations",
+        "role_gateway",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.claim_independence_attestations",
+        "role_public_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.claim_independence_attestations",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.claim_independence_attestations",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    // 0135 owner-rights hydration view: runtime reads the outer safe projection only.
+    cell!("public.eligible_objects", "role_gateway", ["SELECT"]),
+    cell!("public.eligible_objects", "role_public_worker", ["SELECT"]),
+    cell!(
+        "public.eligible_objects",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!("public.eligible_objects", "role_maintenance", ["SELECT"]),
+];
+
+// 0120 is an additive observation-window seam, not a rewrite of the frozen §6.2.2 header.
+// Keep its narrow grants executable and bidirectionally checked while the later contract
+// phase decides whether to merge these columns into the Canonical matrix.
+const ADDITIVE_SEAM_MATRIX: &[Cell] = &[
+    // 0134: moderator identity/rationale remain owner-only. The private worker may invoke
+    // one narrow definer but receives no direct protected-table privilege.
+    cell!(
+        "control.anonymous_claim_trust_authorities",
+        "role_private_worker",
+        []
+    ),
+    cell!(
+        "public.anonymous_claim_trust_receipts",
+        "role_gateway",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.anonymous_claim_trust_receipts",
+        "role_public_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.anonymous_claim_trust_receipts",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.anonymous_claim_trust_receipts",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    // Phase9 anonymous public seam (0120): protected release resolution stays private;
+    // only the public lifecycle facts are readable by gateway/retrieval roles.
+    cell!(
+        "control.anonymous_source_lineage",
+        "role_private_worker",
+        ["SELECT"],
+        [("INSERT", ["contribution_release_id", "tenant_id"])]
+    ),
+    cell!(
+        "control.anonymous_source_lineage",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    cell!(
+        "staging.sanitized_public_candidates",
+        "role_private_worker",
+        ["SELECT"],
+        [(
+            "INSERT",
+            [
+                "tenant_id",
+                "anonymous_source_id",
+                "sanitized_content",
+                "content_sha256",
+                "policy_version",
+                "policy_digest",
+                "assessment_outcome",
+                "assessment_digest",
+                "envelope_sha256"
+            ]
+        )]
+    ),
+    cell!(
+        "staging.sanitized_public_candidates",
+        "role_public_worker",
+        []
+    ),
+    cell!(
+        "staging.sanitized_public_candidates",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    // Phase9 0121: only private USER_REASONING storage retains probe/coverage/assessment
+    // bindings. Public workers get neither table access nor a column-level escape hatch.
+    cell!(
+        "staging.contribution_candidate_phase9_assessments",
+        "role_private_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "staging.contribution_candidate_phase9_assessments",
+        "role_public_worker",
+        []
+    ),
+    cell!(
+        "public.anonymous_source_lifecycle_events",
+        "role_gateway",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.anonymous_source_lifecycle_events",
+        "role_public_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.anonymous_source_lifecycle_events",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.anonymous_source_lifecycle_events",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.current_anonymous_source_objects",
+        "role_gateway",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.current_anonymous_source_objects",
+        "role_public_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.current_anonymous_source_objects",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "public.current_anonymous_source_objects",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    // 0122: an immutable random-pair revoke fence is readable by public-serving paths but
+    // carries neither tenant, release nor contributor identity. The authority journal itself
+    // is definer-only and explicitly suppresses schema-default grants below.
+    cell!(
+        "ops.anonymous_public_revocations",
+        "role_gateway",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.anonymous_public_revocations",
+        "role_private_worker",
+        []
+    ),
+    cell!(
+        "ops.anonymous_public_revocations",
+        "role_consolidation_worker",
+        []
+    ),
+    cell!(
+        "ops.anonymous_public_revocations",
+        "role_public_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.anonymous_public_revocations",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.anonymous_public_revocations",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    // 0131 R4 execution authority: direct reads only for the private worker; every
+    // other non-owner cell is deliberately empty and writes stay typed-definer-only.
+    cell!(
+        "private.contribution_executions",
+        "role_private_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "private.contribution_execution_sources",
+        "role_private_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.contribution_execution_job_links",
+        "role_private_worker",
+        ["SELECT"]
+    ),
+];
+
+/// Named §6.2.2 tables whose non-owner cells are all deliberately empty. Their only public
+/// mutation surface is a narrowly granted SECURITY DEFINER function, so they still must bypass
+/// the wider `ops.*` domain default even though there is no non-empty [`Cell`] to carry the name.
+const NAMED_NO_NON_OWNER_GRANTS: &[&str] = &[
+    // 0130 R3 health truth is append-only and resolver-only.  These entries must override
+    // the `ops.*` domain default completely: no worker, admin, or maintenance pool may read
+    // or write observations directly.
+    "ops.reasoning_provider_health_observations",
+    "ops.reasoning_account_health_observations",
+    "ops.retrieval_provider_budget_reservations",
+    "ops.retrieval_provider_budget_allocations",
+    "public.anonymous_source_authority_events",
+    "ops.public_anonymous_dispatches",
+    // 0128 R1 route foundation is intentionally inert: only role_migration_owner may
+    // access the control plane until the later R2/R3 activation gates grant a narrow read path.
+    "control.processor_models",
+    "control.provider_accounts",
+    "control.provider_endpoints",
+    "control.provider_billing_accounts",
+    "control.provider_billing_instruments",
+    "control.reasoning_profiles",
+    "control.reasoning_route_policies",
+    "control.reasoning_route_candidates",
+    "control.reasoning_route_bindings",
+    "control.reasoning_credential_bindings",
+    // 0129 R2 receipts remain migration-owner-only.  The explicit bootstrap procedure
+    // has no runtime grant, so these rows cannot become a second routing authority.
+    "control.reasoning_route_profile_receipts",
+    "control.reasoning_route_domain_receipts",
+    // 0135 receipt predicate SSOT is readable only through owner-rights consumers.
+    "public._legacy_receipt_match_basis",
 ];
 
 /// The §6.2.2 column set — "T" in the §48.2 "表集合派生" check's `S \ T == ∅`. Single
@@ -452,7 +964,16 @@ const MATRIX: &[Cell] = &[
 /// domain-default treatment) and [`check_table_set_derivation`] (what S is compared
 /// against) — never hand-recounted a second time (§6.2.2: "S 不再手抄张数").
 fn named_tables() -> BTreeSet<&'static str> {
-    MATRIX.iter().map(|c| c.table).collect()
+    MATRIX
+        .iter()
+        .chain(ADDITIVE_SEAM_MATRIX.iter())
+        .map(|cell| cell.table)
+        .chain(NAMED_NO_NON_OWNER_GRANTS.iter().copied())
+        .collect()
+}
+
+fn spec_named_tables() -> BTreeSet<&'static str> {
+    named_tables()
 }
 
 // ============================================================================
@@ -470,6 +991,7 @@ const DEFAULT_NONE: &[&str] = &[];
 /// One row of §6.2.1's table, verb sets in [`SCHEMAS`] column order
 /// (control · private · staging · public · projection · coord · ops).
 const DOMAIN_DEFAULT: &[(&str, [&[&str]; 7])] = &[
+    ("role_admin", [DEFAULT_NONE; 7]),
     (
         "role_gateway",
         [
@@ -669,7 +1191,7 @@ fn canonicalize_table_name(name: &str) -> String {
 /// column there must still leave it derivable from elsewhere in the doc).
 ///
 /// ponytail: this under-approximates recall (see `check_table_set_derivation`'s doc for
-/// which of the 14 named tables it currently can't independently re-derive) but has zero
+/// which of the Phase9 named tables it currently can't independently re-derive) but has zero
 /// false positives against the current frozen spec — a heuristic with lower recall and
 /// no false positives is the safe failure mode for a gate (misses some drift now; never
 /// cries wolf on a clean spec). Upgrade path: widen the verb/role vocabulary or add
@@ -685,6 +1207,7 @@ fn extract_s_grant(spec_text: &str) -> BTreeSet<String> {
         "role_batch_issuer",
         "role_maintenance",
         "role_migration_owner",
+        "role_admin",
         "runtime role",
     ];
     const VERB_TOKENS: &[&str] = &[
@@ -803,12 +1326,15 @@ fn scan_qualified_tables(text: &str) -> Vec<String> {
         while let Some(rel) = text[from..].find(&needle) {
             let idx = from + rel;
             let boundary_ok = idx == 0 || !is_ident(bytes[idx - 1]);
-            if boundary_ok
-                && let Some(name) = next_identifier(text, idx)
-                && let Some((_, table)) = name.split_once('.')
-                && !table.is_empty()
-            {
-                out.push(name);
+            if boundary_ok && let Some(name) = next_identifier(text, idx) {
+                let suffix = &text[idx + name.len()..];
+                let is_function_token = suffix.trim_start().starts_with('(');
+                if let Some((_, table)) = name.split_once('.')
+                    && !table.is_empty()
+                    && !is_function_token
+                {
+                    out.push(name);
+                }
             }
             from = idx + needle.len();
         }
@@ -820,7 +1346,7 @@ fn scan_qualified_tables(text: &str) -> Vec<String> {
 /// [`scan_qualified_tables`], or a bare short table name (e.g. `` `stream_log` ``,
 /// `` `ingest_tickets` `` — §48.2's own text uses both forms) completed against
 /// [`named_tables`]'s short-name → qualified-name map. The completion is restricted to
-/// the 14 §6.2.2-named tables' own (unambiguous) short names, not a free-text guess — a
+/// the Phase9 §6.2.2-named tables' own (unambiguous) short names, not a free-text guess — a
 /// bare identifier that isn't one of those 14 names is left alone.
 fn find_backtick_tables(text: &str) -> Vec<String> {
     let short_names: BTreeMap<&str, &str> = named_tables()
@@ -864,10 +1390,38 @@ fn parse_matrix_header_tables(spec_text: &str) -> BTreeSet<String> {
     scan_qualified_tables(header_line).into_iter().collect()
 }
 
+/// Returns the first malformed §6.2.2 Markdown row.  The grant derivation only consumes
+/// the header, but a short separator/role row makes the canonical matrix ambiguous to
+/// readers and must therefore fail the same production gate.
+fn matrix_row_width_error(spec_text: &str) -> Option<String> {
+    let Some(start) = spec_text.find("### 6.2.2") else {
+        return Some("§6.2.2 matrix heading is missing".to_string());
+    };
+    let matrix = &spec_text[start..];
+    let Some(end) = matrix.find("### 6.2.3") else {
+        return Some("§6.2.3 heading must follow the §6.2.2 matrix".to_string());
+    };
+    let rows: Vec<&str> = matrix[..end]
+        .lines()
+        .filter(|line| line.trim_start().starts_with('|'))
+        .collect();
+    let Some(header) = rows.first() else {
+        return Some("§6.2.2 matrix header is missing".to_string());
+    };
+    let header_width = header.split('|').count();
+
+    rows.iter().find_map(|row| {
+        let width = row.split('|').count();
+        (width != header_width).then(|| {
+            format!("§6.2.2 matrix row has {width} cells; header has {header_width}: {row}")
+        })
+    })
+}
+
 /// The `S \ T == ∅` half of [`check_table_set_derivation`], factored out so tests can
 /// exercise the S_write/S_grant scan against a synthetic one-table spec fixture without
 /// also tripping the real-[`MATRIX`]-drift assertion (which always reads the real,
-/// 14-table [`MATRIX`] and would spuriously fail against a deliberately tiny fixture).
+/// Phase9 [`MATRIX`] and would spuriously fail against a deliberately tiny fixture).
 fn derivation_check_from_text(spec_text: &str) -> GateResult {
     let s_write = extract_s_write(spec_text);
     let s_grant = extract_s_grant(spec_text);
@@ -884,13 +1438,17 @@ fn derivation_check_from_text(spec_text: &str) -> GateResult {
 /// table set silently diverging from the header it's supposed to transcribe. Needs no
 /// DB — pure text — so it always reports `pass`/`fail`, never `not_applicable`.
 pub fn check_table_set_derivation(spec_text: &str) -> GateResult {
+    if let Some(detail) = matrix_row_width_error(spec_text) {
+        return fail("表集合派生", detail);
+    }
+
     let derivation = derivation_check_from_text(spec_text);
     if derivation.status != GateStatus::Pass {
         return derivation;
     }
 
     let t = parse_matrix_header_tables(spec_text);
-    let matrix_t = named_tables();
+    let matrix_t = spec_named_tables();
     let doc_t: BTreeSet<&str> = t.iter().map(String::as_str).collect();
     if matrix_t != doc_t {
         return fail(
@@ -1017,8 +1575,8 @@ fn fetch_roles(client: &mut impl GenericClient) -> Result<Vec<RoleRow>, postgres
 }
 
 /// §6.2.0: `pg_roles` restricted to `rolcanlogin AND NOT rolsuper` must equal the frozen
-/// eight-name set exactly (extra/missing/renamed all red), and per §48.2's opening block
-/// each of the eight must independently be `NOT SUPERUSER` / `NOT BYPASSRLS`.
+/// declared-name set exactly (extra/missing/renamed all red), and per §48.2's opening block
+/// every role must independently be `NOT SUPERUSER` / `NOT BYPASSRLS`.
 pub fn check_role_set_equality(client: &mut impl GenericClient) -> GateResult {
     let roles = match fetch_roles(client) {
         Ok(r) => r,
@@ -1055,14 +1613,14 @@ pub fn check_role_set_equality(client: &mut impl GenericClient) -> GateResult {
     let extra: Vec<&&str> = actual.iter().filter(|n| !expected.contains(*n)).collect();
     if !extra.is_empty() {
         problems.push(format!(
-            "extra login role(s) beyond the frozen eight: {extra:?}"
+            "extra login role(s) beyond the frozen role set: {extra:?}"
         ));
     }
 
     if problems.is_empty() {
         pass(
             "角色全集相等",
-            "pg_roles login∧¬superuser set == §6.2.0 frozen eight, all NOT SUPERUSER/NOBYPASSRLS",
+            "pg_roles login∧¬superuser set == §6.2.0 frozen role set, all NOT SUPERUSER/NOBYPASSRLS",
         )
     } else {
         fail("角色全集相等", problems.join("; "))
@@ -1142,9 +1700,8 @@ fn grant_equality_mismatches_for_table(
         .expect("named_tables() is schema-qualified");
     let mut mismatches = Vec::new();
 
-    // §6.2.2's own row for role_migration_owner: `owner` on all 14 tables. Not a MATRIX
-    // cell (owner isn't modeled as a grant) — checked against pg_tables directly, the
-    // only place ownership shows up.
+    // §6.2.2's own row for role_migration_owner: `owner` on all named tables and views. Not a
+    // MATRIX cell (owner isn't modeled as a grant), so check the shared pg_class owner instead.
     let actual_owner = owners.get(&(schema.to_string(), tname.to_string()));
     if actual_owner.map(String::as_str) != Some(OWNER_ROLE) {
         mismatches.push(format!(
@@ -1153,7 +1710,10 @@ fn grant_equality_mismatches_for_table(
     }
 
     for &role in non_owner_roles {
-        let cell = MATRIX.iter().find(|c| c.table == table && c.role == role);
+        let cell = MATRIX
+            .iter()
+            .chain(ADDITIVE_SEAM_MATRIX.iter())
+            .find(|c| c.table == table && c.role == role);
         let expected_table_verbs: BTreeSet<&str> = cell
             .map(|c| c.table_verbs.iter().copied().collect())
             .unwrap_or_default();
@@ -1210,7 +1770,8 @@ pub fn check_grant_equality(client: &mut impl GenericClient) -> GateResult {
     let t = named_tables();
     let existing_tables: BTreeSet<String> = match client.query(
         "SELECT table_schema || '.' || table_name FROM information_schema.tables \
-         WHERE table_type = 'BASE TABLE' AND table_schema || '.' || table_name = ANY($1)",
+         WHERE table_type IN ('BASE TABLE','VIEW') \
+           AND table_schema || '.' || table_name = ANY($1)",
         &[&t.iter().map(|s| s.to_string()).collect::<Vec<_>>()],
     ) {
         Ok(rows) => rows.iter().map(|r| r.get::<_, String>(0)).collect(),
@@ -1245,7 +1806,9 @@ pub fn check_grant_equality(client: &mut impl GenericClient) -> GateResult {
         }
     };
     let owners: BTreeMap<(String, String), String> = match client.query(
-        "SELECT schemaname, tablename, tableowner FROM pg_tables",
+        "SELECT n.nspname,c.relname,r.rolname \
+         FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
+         JOIN pg_roles r ON r.oid=c.relowner WHERE c.relkind IN ('r','p','v','m','f')",
         &[],
     ) {
         Ok(rows) => rows
@@ -1257,7 +1820,7 @@ pub fn check_grant_equality(client: &mut impl GenericClient) -> GateResult {
 
     let non_owner_roles: Vec<&str> = RUNTIME_ROLES
         .iter()
-        .chain(["role_batch_issuer", "role_maintenance"].iter())
+        .chain(["role_batch_issuer", "role_maintenance", "role_admin"].iter())
         .copied()
         .collect();
     let mismatches: Vec<String> = t
@@ -1281,8 +1844,8 @@ pub fn check_grant_equality(client: &mut impl GenericClient) -> GateResult {
         return not_applicable(
             "授权逐条相等",
             format!(
-                "missing object: table(s) {missing_tables:?} from §6.2.2 do not exist yet \
-                 ({} of {} named tables compared clean)",
+                "missing object: relation(s) {missing_tables:?} from §6.2.2 do not exist yet \
+                 ({} of {} named relations compared clean)",
                 t.len() - missing_tables.len(),
                 t.len()
             ),
@@ -1291,7 +1854,7 @@ pub fn check_grant_equality(client: &mut impl GenericClient) -> GateResult {
     pass(
         "授权逐条相等",
         format!(
-            "{} named tables × {} non-owner roles all match §6.2.2, all owned by {OWNER_ROLE}",
+            "{} named relations × {} non-owner roles all match §6.2.2, all owned by {OWNER_ROLE}",
             t.len(),
             non_owner_roles.len()
         ),
@@ -1300,27 +1863,27 @@ pub fn check_grant_equality(client: &mut impl GenericClient) -> GateResult {
 
 // ============================================================================
 // §6.2.1 域级默认授权 — tables §6.2.2 doesn't name (§48.2: "枚举面 = 全部 schema 的全部
-// 表", not just the 14 point-named ones).
+// 表", not just the Phase9 point-named ones).
 // ============================================================================
 
 /// §6.2.1: every non-owner role's table-level grants on every BASE TABLE **not** named
 /// by §6.2.2 must equal that role's domain default for the table's schema
 /// ([`DOMAIN_DEFAULT`]). Without this, an over-grant or under-grant on any of the tables
-/// outside the 14-table matrix — the majority of the schema — has no check at all;
+/// outside the Phase9 matrix — the majority of the schema — has no check at all;
 /// [`check_grant_equality`] only ever looks at `T`.
 pub fn check_domain_default_grants(client: &mut impl GenericClient) -> GateResult {
     let t = named_tables();
-    let all_tables: Vec<(String, String)> = match client.query(
-        "SELECT table_schema, table_name FROM information_schema.tables \
-         WHERE table_type = 'BASE TABLE' AND table_schema = ANY($1)",
+    let all_tables: Vec<(String, String, String)> = match client.query(
+        "SELECT schemaname, tablename, tableowner FROM pg_tables \
+         WHERE schemaname = ANY($1)",
         &[&SCHEMAS.to_vec()],
     ) {
-        Ok(rows) => rows.iter().map(|r| (r.get(0), r.get(1))).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect(),
         Err(e) => {
-            return fail(
-                "域默认授权",
-                format!("query information_schema.tables failed: {e}"),
-            );
+            return fail("域默认授权", format!("query pg_tables failed: {e}"));
         }
     };
     let table_grants = match fetch_table_grants(client) {
@@ -1330,8 +1893,25 @@ pub fn check_domain_default_grants(client: &mut impl GenericClient) -> GateResul
 
     let mut checked = 0usize;
     let mut problems = Vec::new();
-    for (schema, tname) in &all_tables {
+    for (schema, tname, owner) in &all_tables {
         let full = format!("{schema}.{tname}");
+        if owner != OWNER_ROLE {
+            problems.push(format!(
+                "{full}: Canonical owner expected {OWNER_ROLE:?}, actual {owner:?}"
+            ));
+        }
+        if matches!(
+            full.as_str(),
+            "private.continuity_projects"
+                | "private.continuity_facet_versions"
+                | "private.continuity_facet_memory_links"
+                | "private.continuity_facet_evidence_links"
+                | "private.continuity_facet_slots"
+        ) {
+            // §25.3.1 W1 freezes zero direct runtime privileges; the focused W1 catalog
+            // check below owns this explicit exception to §6.2.1's generic domain default.
+            continue;
+        }
         if t.contains(full.as_str()) {
             continue; // §6.2.2 overrides the domain default for a named table entirely.
         }
@@ -1359,13 +1939,16 @@ pub fn check_domain_default_grants(client: &mut impl GenericClient) -> GateResul
     if checked == 0 {
         return not_applicable(
             "域默认授权",
-            "missing object: no BASE TABLE outside §6.2.2's 14 named tables exists yet",
+            "missing object: no BASE TABLE outside §6.2.2's named tables exists yet",
         );
     }
     if problems.is_empty() {
         pass(
             "域默认授权",
-            format!("{checked} non-named table(s) × 7 non-owner roles all match §6.2.1"),
+            format!(
+                "{checked} non-named table(s) × 7 non-owner roles match §6.2.1; all {} in-scope table(s) owned by {OWNER_ROLE}",
+                all_tables.len()
+            ),
         )
     } else {
         fail("域默认授权", problems.join("; "))
@@ -1376,7 +1959,7 @@ pub fn check_domain_default_grants(client: &mut impl GenericClient) -> GateResul
 // Item 4 — §6.2.1 全域禁动词
 // ============================================================================
 
-/// §6.2.1 "全域硬约束，无例外": the seven non-owner roles ([`NON_OWNER_ROLES`]) get no
+/// §6.2.1 "全域硬约束，无例外": the non-owner roles ([`NON_OWNER_ROLES`]) get no
 /// DELETE/TRUNCATE anywhere (`role_table_grants`), no CREATE on any schema
 /// (`has_schema_privilege`), and own nothing (`pg_tables.tableowner`).
 pub fn check_forbidden_verbs(client: &mut impl GenericClient) -> GateResult {
@@ -1627,6 +2210,17 @@ pub fn check_rls_four_item(client: &mut impl GenericClient) -> GateResult {
     let mut problems = Vec::new();
     for t in &tables {
         let full = format!("{}.{}", t.schema, t.table);
+        // R3 health observations are intentionally owner-quarantined histories, not tenant
+        // visibility tables. Their `USING/WITH CHECK (true)` owner policy is checked exactly
+        // by check_r3_health_observation_boundary below; applying the tenant-template here
+        // would reject the frozen boundary merely because account health carries tenant_id.
+        if matches!(
+            full.as_str(),
+            "ops.reasoning_provider_health_observations"
+                | "ops.reasoning_account_health_observations"
+        ) {
+            continue;
+        }
         if !t.rowsecurity {
             problems.push(format!("{full}: RLS not enabled"));
         }
@@ -1715,6 +2309,556 @@ pub fn check_admin_plane_no_leak(client: &mut impl GenericClient) -> GateResult 
     }
 }
 
+/// R3's two health histories are deliberately outside the normal `ops.*` default grant.  The
+/// provider table has no tenant_id, so §62's tenant-only enumeration cannot prove FORCE RLS for
+/// it; keep this named-object check beside the matrix and resolver ACL checks instead.
+pub fn check_r3_health_observation_boundary(client: &mut impl GenericClient) -> GateResult {
+    const TABLES: [&str; 2] = [
+        "reasoning_provider_health_observations",
+        "reasoning_account_health_observations",
+    ];
+    let rows = match client.query(
+        "SELECT c.relname, pg_get_userbyid(c.relowner), c.relrowsecurity, c.relforcerowsecurity \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'ops' AND c.relkind IN ('r', 'p') AND c.relname = ANY($1)\
+         ORDER BY c.relname",
+        &[&&TABLES[..]],
+    ) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return fail(
+                "R3 health boundary",
+                format!("query health tables failed: {e}"),
+            );
+        }
+    };
+    let mut problems = Vec::new();
+    if rows.len() != TABLES.len() {
+        problems.push(format!(
+            "missing R3 health table(s): expected {TABLES:?}, found {}",
+            rows.len()
+        ));
+    }
+    for row in rows {
+        let table: String = row.get(0);
+        let owner: String = row.get(1);
+        let rls: bool = row.get(2);
+        let force: bool = row.get(3);
+        if owner != OWNER_ROLE || !rls || !force {
+            problems.push(format!(
+                "ops.{table}: expected owner={OWNER_ROLE}, ENABLE+FORCE RLS; actual owner={owner}, rls={rls}, force={force}"
+            ));
+        }
+    }
+    for table in TABLES {
+        let policies = match client.query(
+            "SELECT cmd, roles, qual, with_check FROM pg_policies \
+             WHERE schemaname = 'ops' AND tablename = $1",
+            &[&table],
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                problems.push(format!(
+                    "ops.{table}: query owner quarantine policy failed: {e}"
+                ));
+                continue;
+            }
+        };
+        let owner_only = policies.iter().any(|row| {
+            let cmd: String = row.get(0);
+            let roles: Vec<String> = row.get(1);
+            let qual: Option<String> = row.get(2);
+            let with_check: Option<String> = row.get(3);
+            cmd == "ALL"
+                && roles.len() == 1
+                && roles.first().is_some_and(|role| role == OWNER_ROLE)
+                && qual.as_deref() == Some("true")
+                && with_check.as_deref() == Some("true")
+        });
+        if !owner_only {
+            problems.push(format!(
+                "ops.{table}: requires owner-only ALL USING (true) WITH CHECK (true) policy"
+            ));
+        }
+    }
+
+    if let Err(result) = check_r3_health_resolver_contract(client, &mut problems) {
+        return result;
+    }
+    if problems.is_empty() {
+        pass(
+            "R3 health boundary",
+            "two owner-only FORCE RLS health tables; resolver is private-worker-only SECURITY DEFINER".to_string(),
+        )
+    } else {
+        fail("R3 health boundary", problems.join("; "))
+    }
+}
+
+fn check_r3_health_resolver_contract(
+    client: &mut impl GenericClient,
+    problems: &mut Vec<String>,
+) -> Result<(), GateResult> {
+    let function = match client.query_opt(
+        "SELECT pg_get_userbyid(p.proowner), p.prosecdef, coalesce(p.proconfig, ARRAY[]::text[]) \
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'control' \
+           AND p.oid = to_regprocedure('control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)')",
+        &[],
+    ) {
+        Ok(Some(row)) => row,
+        Ok(None) => return Err(fail("R3 health boundary", "missing control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)")),
+        Err(e) => return Err(fail("R3 health boundary", format!("query resolver failed: {e}"))),
+    };
+    let owner: String = function.get(0);
+    let security_definer: bool = function.get(1);
+    let config: Vec<String> = function.get(2);
+    if owner != OWNER_ROLE
+        || !security_definer
+        || !config.iter().any(|v| v == "search_path=pg_catalog")
+    {
+        problems.push(format!(
+            "resolver expected owner={OWNER_ROLE}, SECURITY DEFINER, search_path=pg_catalog; actual owner={owner}, security_definer={security_definer}, config={config:?}"
+        ));
+    }
+    for role in NON_OWNER_ROLES {
+        let allowed: bool = match client.query_one(
+            "SELECT has_function_privilege($1::text, \
+             'control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)', 'EXECUTE')",
+            &[role],
+        ) {
+            Ok(row) => row.get(0),
+            Err(e) => {
+                problems.push(format!("resolver privilege probe for {role} failed: {e}"));
+                continue;
+            }
+        };
+        let expected = *role == "role_private_worker";
+        if allowed != expected {
+            problems.push(format!(
+                "resolver/{role}: expected EXECUTE={expected}, actual {allowed}"
+            ));
+        }
+    }
+    let public_execute_absent: bool = match client.query_one(
+        "SELECT NOT EXISTS ( \
+           SELECT 1 \
+           FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x \
+           WHERE x.grantee = 0 AND x.privilege_type = 'EXECUTE' \
+         ) \
+         FROM pg_proc p \
+         JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'control' \
+           AND p.oid = to_regprocedure('control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)')",
+        &[],
+    ) {
+        Ok(row) => row.get(0),
+        Err(e) => {
+            problems.push(format!("resolver PUBLIC privilege probe failed: {e}"));
+            false
+        }
+    };
+    if !public_execute_absent {
+        problems.push("resolver/PUBLIC: EXECUTE must be revoked".to_string());
+    }
+    Ok(())
+}
+
+/// R4-D0/0133: the worker surface is an exact, overload-safe allow-list. Table grants alone
+/// cannot prove this boundary because mutations intentionally route through SECURITY DEFINER.
+const R4_TYPED_FUNCTIONS: &[&str] = &[
+    "private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])",
+    "private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)",
+    "private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)",
+    "private.complete_contribution_a_exact(uuid,uuid,uuid,uuid,bytea,uuid,text,bytea,uuid,integer,bytea,bytea,jsonb,bytea,text,text,text,uuid,text,integer)",
+    "private.complete_contribution_b_exact(uuid,uuid,uuid,uuid,bytea,uuid,text,bytea,bytea,text,text,text,text,bytea,bytea,jsonb,bytea,text,text,text,uuid,text,integer)",
+    "private.commit_contribution_candidate(uuid,uuid,uuid,text,integer)",
+    "private.settle_contribution_terminal_job(uuid,uuid,uuid,text,integer)",
+    "private.mark_contribution_reconciliation_required(uuid,uuid,uuid,text,integer)",
+];
+
+const R4_INTERNAL_FUNCTIONS: &[&str] = &[
+    "private.require_contribution_execution_lease(uuid,uuid,uuid,text,integer)",
+    "private.reserve_contribution_execution_call(uuid,uuid,uuid,text,integer,text,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)",
+    "private.settle_contribution_job_if_live(uuid,uuid,uuid,text,integer,text,text)",
+    "private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)",
+    "private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)",
+    "private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])",
+    "private.contribution_execution_closure_seal_immutable()",
+    "private.require_contribution_source_manifest()",
+    "private.assert_contribution_prepared_route_shape(jsonb)",
+    "private.assert_current_contribution_reservation_authority(ops.model_call_ledger)",
+    "ops.contribution_reservation_authority_validate()",
+];
+
+const R4_MIGRATION_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../migrations/0131_contribution_execution.sql"
+);
+
+fn r4_create_tables(sql: &str) -> BTreeSet<String> {
+    sql.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with("--") {
+                return None;
+            }
+            let mut words = line.split_whitespace();
+            if !words.next()?.eq_ignore_ascii_case("CREATE")
+                || !words.next()?.eq_ignore_ascii_case("TABLE")
+            {
+                return None;
+            }
+            let next = words.next()?;
+            let name = if next.eq_ignore_ascii_case("IF") {
+                if !words.next()?.eq_ignore_ascii_case("NOT")
+                    || !words.next()?.eq_ignore_ascii_case("EXISTS")
+                {
+                    return None;
+                }
+                words.next()?
+            } else {
+                next
+            };
+            (name.contains('.')).then(|| name.trim_matches('"').to_string())
+        })
+        .collect()
+}
+
+fn r4_registry_coverage(created: &BTreeSet<String>, named: &BTreeSet<&str>) -> Vec<String> {
+    if created.is_empty() {
+        return vec!["0131 CREATE TABLE set is empty".to_string()];
+    }
+    created
+        .iter()
+        .filter(|relation| !named.contains(relation.as_str()))
+        .map(|relation| {
+            format!("{relation}: 0131-created relation missing exact named ACL registry")
+        })
+        .collect()
+}
+
+pub fn check_r4_execution_registry(client: &mut impl GenericClient) -> GateResult {
+    let named = named_tables();
+    let mut problems = Vec::new();
+    let sql = match fs::read_to_string(R4_MIGRATION_PATH) {
+        Ok(sql) => sql,
+        Err(e) => {
+            return fail(
+                "R4 execution registry",
+                format!("cannot read {R4_MIGRATION_PATH}: {e}"),
+            );
+        }
+    };
+    let created = r4_create_tables(&sql);
+    problems.extend(r4_registry_coverage(&created, &named));
+    for relation in &created {
+        match client.query_one("SELECT to_regclass($1) IS NOT NULL", &[relation]) {
+            Ok(row) if row.get::<_, bool>(0) => {}
+            Ok(_) => problems.push(format!("{relation}: missing required R4 relation")),
+            Err(e) => problems.push(format!("{relation}: catalog probe failed: {e}")),
+        }
+    }
+    if problems.is_empty() {
+        pass(
+            "R4 execution registry",
+            "all current 0131-created relations are present and registered",
+        )
+    } else {
+        fail("R4 execution registry", problems.join("; "))
+    }
+}
+
+pub fn check_r4_execution_function_boundary(client: &mut impl GenericClient) -> GateResult {
+    let mut problems = Vec::new();
+    let expected: BTreeSet<String> = R4_TYPED_FUNCTIONS
+        .iter()
+        .chain(R4_INTERNAL_FUNCTIONS)
+        .map(|signature| (*signature).to_string())
+        .collect();
+    match client.query(
+        "SELECT p.oid::regprocedure::text \
+         FROM pg_proc p \
+         JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE p.prosecdef \
+           AND n.nspname IN ('private', 'ops') \
+           AND (p.proname LIKE '%contribution%' \
+                OR pg_get_functiondef(p.oid) LIKE '%private.contribution_executions%') \
+         ORDER BY 1",
+        &[],
+    ) {
+        Ok(rows) => {
+            let actual: BTreeSet<String> = rows
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect();
+            for signature in actual.difference(&expected) {
+                problems.push(format!(
+                    "{signature}: unregistered R4 contribution SECURITY DEFINER function"
+                ));
+            }
+            for signature in expected.difference(&actual) {
+                problems.push(format!(
+                    "{signature}: absent from exact R4 contribution SECURITY DEFINER catalog census"
+                ));
+            }
+        }
+        Err(e) => problems.push(format!(
+            "exact R4 contribution SECURITY DEFINER catalog census failed: {e}"
+        )),
+    }
+    for (signature, worker_execute) in R4_TYPED_FUNCTIONS
+        .iter()
+        .map(|signature| (*signature, true))
+        .chain(
+            R4_INTERNAL_FUNCTIONS
+                .iter()
+                .map(|signature| (*signature, false)),
+        )
+    {
+        let row = match client.query_opt(
+            "SELECT pg_get_userbyid(p.proowner), p.prosecdef, coalesce(p.proconfig, ARRAY[]::text[]) \
+             FROM pg_proc p WHERE p.oid = to_regprocedure($1)",
+            &[&signature],
+        ) {
+            Ok(Some(row)) => row,
+            Ok(None) => { problems.push(format!("missing R4 typed function {signature}")); continue; }
+            Err(e) => { problems.push(format!("{signature}: catalog query failed: {e}")); continue; }
+        };
+        let owner: String = row.get(0);
+        let definer: bool = row.get(1);
+        let config: Vec<String> = row.get(2);
+        if owner != OWNER_ROLE || !definer || config.as_slice() != ["search_path=pg_catalog"] {
+            problems.push(format!("{signature}: expected owner={OWNER_ROLE}, SECURITY DEFINER, search_path=pg_catalog; actual owner={owner}, definer={definer}, config={config:?}"));
+        }
+        for role in NON_OWNER_ROLES {
+            let allowed = match client.query_one(
+                "SELECT has_function_privilege($1::text, $2::text, 'EXECUTE')",
+                &[role, &signature],
+            ) {
+                Ok(row) => row.get::<_, bool>(0),
+                Err(e) => {
+                    problems.push(format!("{signature}/{role}: privilege probe failed: {e}"));
+                    continue;
+                }
+            };
+            let expected = worker_execute && *role == "role_private_worker";
+            if allowed != expected {
+                problems.push(format!(
+                    "{signature}/{role}: expected EXECUTE={expected}, actual {allowed}"
+                ));
+            }
+        }
+        let public_absent = match client.query_one("SELECT NOT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x WHERE p.oid=to_regprocedure($1) AND x.grantee=0 AND x.privilege_type='EXECUTE')", &[&signature]) { Ok(row) => row.get::<_, bool>(0), Err(e) => { problems.push(format!("{signature}/PUBLIC: privilege probe failed: {e}")); false } };
+        if !public_absent {
+            problems.push(format!("{signature}/PUBLIC: EXECUTE must be revoked"));
+        }
+    }
+    if problems.is_empty() {
+        pass(
+            "R4 execution function boundary",
+            format!(
+                "{} exposed private-worker APIs and {} internal no-runtime APIs are exact",
+                R4_TYPED_FUNCTIONS.len(),
+                R4_INTERNAL_FUNCTIONS.len()
+            ),
+        )
+    } else {
+        fail("R4 execution function boundary", problems.join("; "))
+    }
+}
+
+/// §25.3.1 W1: five owner/FORCE tables, Gateway-only commands, and the marker-scoped A''
+/// Evidence SELECT/locking policy pairs. The query is deliberately catalog-backed rather than trusting SQL
+/// source text; architecture-check owns the companion call-site/protocol scan.
+#[allow(clippy::too_many_lines)]
+pub fn check_w1_continuity_boundary(client: &mut impl GenericClient) -> GateResult {
+    let check = "W1 Project Continuity boundary";
+    let exists: bool = match client.query_one(
+        "SELECT to_regclass('private.continuity_projects') IS NOT NULL",
+        &[],
+    ) {
+        Ok(row) => row.get(0),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    if !exists {
+        return not_applicable(check, "missing object: private.continuity_projects");
+    }
+    let sql = r#"
+WITH continuity_tables(name) AS (VALUES
+ ('continuity_projects'),('continuity_facet_versions'),
+ ('continuity_facet_memory_links'),('continuity_facet_evidence_links'),
+ ('continuity_facet_slots')),
+runtime_roles(name) AS (VALUES
+ ('role_admin'),('role_gateway'),('role_private_worker'),
+ ('role_consolidation_worker'),('role_public_worker'),('role_retrieval_worker'),
+ ('role_batch_issuer'),('role_maintenance')),
+continuity_functions(signature) AS (VALUES
+ ('private.register_continuity_project(uuid,uuid,uuid,uuid,uuid,text)'),
+ ('private.publish_continuity_facet(uuid,uuid,uuid,uuid,uuid,text,bigint,text,jsonb,uuid[],bytea[],uuid[],bytea[])'))
+SELECT
+ (SELECT count(*)=5 FROM continuity_tables expected
+  JOIN pg_class c ON c.relname=expected.name
+  JOIN pg_namespace n ON n.oid=c.relnamespace AND n.nspname='private'
+  WHERE c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity
+    AND pg_get_userbyid(c.relowner)='role_migration_owner')
+ AND NOT EXISTS(SELECT 1 FROM continuity_tables t CROSS JOIN runtime_roles r
+  WHERE has_table_privilege(r.name,'private.'||t.name,
+   'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'))
+ AND NOT EXISTS(SELECT 1 FROM continuity_functions f CROSS JOIN runtime_roles r
+  WHERE has_function_privilege(r.name,f.signature,'EXECUTE')
+   IS DISTINCT FROM (r.name='role_gateway'))
+ AND NOT EXISTS(SELECT 1 FROM continuity_functions f
+  WHERE has_function_privilege('public',f.signature,'EXECUTE'))
+ AND (SELECT count(*)=1 FROM pg_policy p WHERE
+  p.polrelid='private.evidence_objects'::regclass
+  AND p.polname='continuity_evidence_owner_exact_allow' AND p.polcmd='r'
+  AND p.polpermissive AND p.polwithcheck IS NULL
+  AND p.polroles=ARRAY[(SELECT oid FROM pg_roles WHERE rolname='role_migration_owner')]
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'humaux.continuity_publish')>0
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'humaux.workspace_id')>0
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'pg_input_is_valid')>0)
+ AND (SELECT count(*)=1 FROM pg_policy p WHERE
+  p.polrelid='private.evidence_objects'::regclass
+  AND p.polname='continuity_evidence_owner_lock_allow' AND p.polcmd='w'
+  AND p.polpermissive
+  AND p.polroles=ARRAY[(SELECT oid FROM pg_roles WHERE rolname='role_migration_owner')]
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'humaux.continuity_publish')>0
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'humaux.workspace_id')>0
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'pg_input_is_valid')>0
+  AND pg_get_expr(p.polwithcheck,p.polrelid)='false')
+ AND (SELECT count(*)=1 FROM pg_policy p WHERE
+  p.polrelid='private.evidence_objects'::regclass
+  AND p.polname='continuity_evidence_owner_lock_guard' AND p.polcmd='w'
+  AND NOT p.polpermissive
+  AND p.polroles=ARRAY[(SELECT oid FROM pg_roles WHERE rolname='role_migration_owner')]
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'humaux.continuity_publish')>0
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'humaux.workspace_id')>0
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'pg_input_is_valid')>0
+  AND strpos(pg_get_expr(p.polwithcheck,p.polrelid),'humaux.continuity_publish')>0
+  AND strpos(pg_get_expr(p.polwithcheck,p.polrelid),'IS DISTINCT FROM')>0)
+ AND (SELECT polcmd='*' AND polpermissive AND polroles=ARRAY[0::oid]
+  AND encode(sha256(convert_to(pg_get_expr(polqual,polrelid),'UTF8')),'hex')
+   ='c77b3b830c7abec4ad46704fc7e88cded9a75b028c77ffd1946d2f288d7a045f'
+  AND encode(sha256(convert_to(pg_get_expr(polwithcheck,polrelid),'UTF8')),'hex')
+   ='c77b3b830c7abec4ad46704fc7e88cded9a75b028c77ffd1946d2f288d7a045f'
+ FROM pg_policy WHERE polrelid='private.evidence_objects'::regclass
+   AND polname='evidence_objects_tenant_and_visibility')
+ AND (SELECT count(*)=5 FROM pg_policy
+  WHERE polrelid='private.evidence_objects'::regclass)
+ AND (SELECT count(*)=4 FROM (VALUES
+   ('continuity_evidence_owner_exact_allow','r',true,
+    'a0094a5c18098d94a48082666c19502cb123edafc20bff09abb46eae279e466c',NULL::text),
+   ('continuity_evidence_owner_exact_guard','r',false,
+    'c4c9a222db017fad89980cab140029fc8fa63c169d491652902e328ed5ae338d',NULL::text),
+   ('continuity_evidence_owner_lock_allow','w',true,
+    'a0094a5c18098d94a48082666c19502cb123edafc20bff09abb46eae279e466c',
+    'fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa'),
+   ('continuity_evidence_owner_lock_guard','w',false,
+    'c4c9a222db017fad89980cab140029fc8fa63c169d491652902e328ed5ae338d',
+    '8d750b95910aa4cec8bc44aef62926b4c361e16a6850d659848de4a7b08b328a')
+  ) expected(name,cmd,permissive,qual_sha,check_sha)
+  JOIN pg_policy p ON p.polrelid='private.evidence_objects'::regclass
+   AND p.polname=expected.name AND p.polcmd=expected.cmd
+   AND p.polpermissive=expected.permissive
+   AND p.polroles=ARRAY[(SELECT oid FROM pg_roles WHERE rolname='role_migration_owner')]
+   AND encode(sha256(convert_to(pg_get_expr(p.polqual,p.polrelid),'UTF8')),'hex')
+    =expected.qual_sha
+   AND coalesce(encode(sha256(convert_to(pg_get_expr(p.polwithcheck,p.polrelid),'UTF8')),'hex'),'')
+    =coalesce(expected.check_sha,''))
+ AND (SELECT count(*)=1 FROM pg_policy p WHERE
+  p.polrelid='private.evidence_objects'::regclass
+  AND p.polname='continuity_evidence_owner_exact_guard' AND p.polcmd='r'
+  AND NOT p.polpermissive AND p.polwithcheck IS NULL
+  AND p.polroles=ARRAY[(SELECT oid FROM pg_roles WHERE rolname='role_migration_owner')]
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'humaux.continuity_publish')>0
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'humaux.workspace_id')>0
+  AND strpos(pg_get_expr(p.polqual,p.polrelid),'pg_input_is_valid')>0)
+ AND (SELECT count(*)=5 FROM pg_trigger WHERE NOT tgisinternal AND tgname IN
+  ('continuity_project_mutation_guard','continuity_facet_versions_append_only',
+   'continuity_facet_memory_links_append_only','continuity_facet_evidence_links_append_only',
+   'continuity_facet_version_source_required'))
+ AND (SELECT count(*)=3 FROM pg_constraint WHERE convalidated AND conname IN
+  ('continuity_facet_versions_kind_closed','continuity_facet_slots_kind_closed',
+   'continuity_facet_slots_current_fkey'))
+ AND (SELECT proconfig @> ARRAY['search_path=pg_catalog','humaux.continuity_publish=1']::text[]
+  FROM pg_proc WHERE oid=
+   'private.publish_continuity_facet(uuid,uuid,uuid,uuid,uuid,text,bigint,text,jsonb,uuid[],bytea[],uuid[],bytea[])'::regprocedure)
+ AND (SELECT NOT (coalesce(proconfig,'{}') @> ARRAY['humaux.continuity_publish=1']::text[])
+  FROM pg_proc WHERE oid=
+   'private.register_continuity_project(uuid,uuid,uuid,uuid,uuid,text)'::regprocedure)
+"#;
+    match client.query_one(sql, &[]) {
+        Ok(row) if row.get::<_, bool>(0) => pass(check, "catalog/ACL/RLS/A'' marker census exact"),
+        Ok(_) => fail(check, "catalog/ACL/RLS/A'' marker census mismatch"),
+        Err(error) => fail(check, format!("catalog census failed: {error}")),
+    }
+}
+
+/// §25.3.1 W2: the single raw reader is migration-owner/STABLE/definer, PUBLIC is
+/// absent, Gateway is the sole runtime EXECUTE principal, and W1 tables remain opaque.
+pub fn check_w2_continuity_boundary(client: &mut impl GenericClient) -> GateResult {
+    let check = "W2 Project Continuity read boundary";
+    let signature = "private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])";
+    let exists: bool =
+        match client.query_one("SELECT to_regprocedure($1) IS NOT NULL", &[&signature]) {
+            Ok(row) => row.get(0),
+            Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+        };
+    if !exists {
+        return not_applicable(
+            check,
+            "missing object: private.read_continuity_project_storage_v1",
+        );
+    }
+    let sql = r#"
+WITH runtime_roles(name) AS (VALUES
+ ('role_admin'),('role_gateway'),('role_private_worker'),
+ ('role_consolidation_worker'),('role_public_worker'),('role_retrieval_worker'),
+ ('role_batch_issuer'),('role_maintenance')),
+continuity_tables(name) AS (VALUES
+ ('continuity_projects'),('continuity_facet_versions'),
+ ('continuity_facet_memory_links'),('continuity_facet_evidence_links'),
+ ('continuity_facet_slots')),
+reader AS (
+ SELECT p.oid,p.prosecdef,p.provolatile,p.proconfig,p.proowner,
+        pg_get_functiondef(p.oid) definition
+ FROM pg_proc p WHERE p.oid=to_regprocedure(
+  'private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])'))
+SELECT
+ (SELECT count(*)=1 FROM reader WHERE prosecdef AND provolatile='s'
+  AND proconfig=ARRAY['search_path=pg_catalog']::text[]
+  AND pg_get_userbyid(proowner)='role_migration_owner')
+ AND NOT has_function_privilege('public',
+  'private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])','EXECUTE')
+ AND NOT EXISTS(SELECT 1 FROM runtime_roles r WHERE has_function_privilege(
+  r.name,'private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])','EXECUTE')
+  IS DISTINCT FROM (r.name='role_gateway'))
+ AND NOT EXISTS(SELECT 1 FROM continuity_tables t CROSS JOIN runtime_roles r
+  WHERE has_table_privilege(r.name,'private.'||t.name,
+   'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'))
+ AND (SELECT strpos(definition,'project.workspace_id=ANY(p_authorized_workspace_ids)')>0
+  AND strpos(definition,'project.lifecycle_state=''ACTIVE''')>0
+  AND strpos(definition,'p_requested_workspace_id IS NULL')>0
+  AND strpos(definition,'humaux.workspace_id')>0
+  AND strpos(definition,'pg_input_is_valid')>0
+  AND strpos(definition,'memory_links_exact')>0
+  AND strpos(definition,'evidence_links_exact')>0
+  AND strpos(definition,'stored_body_sha256')>0
+  AND strpos(definition,'ORDER BY slot.facet_kind NULLS FIRST')>0
+  AND strpos(definition,'INSERT INTO')=0
+  AND strpos(definition,'UPDATE private.')=0
+  AND strpos(definition,'DELETE FROM')=0 FROM reader)
+"#;
+    match client.query_one(sql, &[]) {
+        Ok(row) if row.get::<_, bool>(0) => {
+            pass(check, "exact owner/config/ACL and zero W1 direct grants")
+        }
+        Ok(_) => fail(check, "owner/config/ACL or W1 direct-grant census mismatch"),
+        Err(error) => fail(check, format!("catalog census failed: {error}")),
+    }
+}
+
 fn report(results: &[GateResult]) -> i32 {
     let mut failed = false;
     for r in results {
@@ -1752,6 +2896,11 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_invoice_privilege_unique(&mut client));
             results.push(check_rls_four_item(&mut client));
             results.push(check_admin_plane_no_leak(&mut client));
+            results.push(check_r3_health_observation_boundary(&mut client));
+            results.push(check_r4_execution_function_boundary(&mut client));
+            results.push(check_r4_execution_registry(&mut client));
+            results.push(check_w1_continuity_boundary(&mut client));
+            results.push(check_w2_continuity_boundary(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -1762,6 +2911,11 @@ pub fn run(_args: &[String]) -> i32 {
                 "发票权唯一",
                 "RLS 四项",
                 "Admin-Plane 防泄漏",
+                "R3 health boundary",
+                "R4 execution function boundary",
+                "R4 execution registry",
+                "W1 Project Continuity boundary",
+                "W2 Project Continuity read boundary",
             ] {
                 results.push(fail_for(name, &conn_err));
             }
@@ -1785,6 +2939,276 @@ mod tests {
     }
 
     #[test]
+    fn r4_execution_function_classification_is_exact() {
+        let exposed: BTreeSet<_> = R4_TYPED_FUNCTIONS.iter().copied().collect();
+        let internal: BTreeSet<_> = R4_INTERNAL_FUNCTIONS.iter().copied().collect();
+        assert_eq!(R4_TYPED_FUNCTIONS.len(), 8, "8 exposed APIs are frozen");
+        assert_eq!(
+            R4_INTERNAL_FUNCTIONS.len(),
+            11,
+            "11 retired/internal authority functions are frozen"
+        );
+        assert_eq!(
+            exposed.len(),
+            8,
+            "exposed list must not duplicate signatures"
+        );
+        assert_eq!(
+            internal.len(),
+            11,
+            "internal list must not duplicate signatures"
+        );
+        assert!(
+            exposed.is_disjoint(&internal),
+            "a signature cannot be both exposed and internal"
+        );
+    }
+
+    /// `HUMAUX_REQUIRE_DB=1` makes a missing disposable database a hard failure.
+    fn skip_is_a_failure() -> bool {
+        std::env::var("HUMAUX_REQUIRE_DB").is_ok_and(|v| v == "1")
+    }
+
+    macro_rules! txn_or_skip {
+        ($client:ident, $txn:ident) => {
+            let Ok(dsn) = std::env::var(DSN_ENV) else {
+                assert!(
+                    !skip_is_a_failure(),
+                    "HUMAUX_REQUIRE_DB is set, so a skip here is a failure — missing object: {DSN_ENV}"
+                );
+                eprintln!("rls-check test: not_applicable — {DSN_ENV} unset, skipping");
+                return;
+            };
+            let Ok(mut $client) = Client::connect(&dsn, NoTls) else {
+                assert!(
+                    !skip_is_a_failure(),
+                    "HUMAUX_REQUIRE_DB is set, so a skip here is a failure — missing object: reachable Postgres at {DSN_ENV}"
+                );
+                eprintln!("rls-check test: not_applicable — cannot reach Postgres, skipping");
+                return;
+            };
+            let mut $txn = $client
+                .transaction()
+                .expect("open fault-injection transaction");
+        };
+    }
+
+    fn assert_r4_function_boundary_fault(
+        txn: &mut impl GenericClient,
+        signature: &str,
+        expected_detail: &str,
+    ) {
+        let result = check_r4_execution_function_boundary(txn);
+        assert_eq!(result.status, GateStatus::Fail, "{}", result.detail);
+        assert!(result.detail.contains(signature), "{}", result.detail);
+        assert!(
+            result.detail.contains(expected_detail),
+            "expected {expected_detail:?} in {}",
+            result.detail
+        );
+    }
+
+    fn apply_r4_function_fault(
+        txn: &mut impl GenericClient,
+        signature: &str,
+        fault_sql: &str,
+        restore_sql: &str,
+        expected_detail: &str,
+    ) {
+        txn.batch_execute(fault_sql)
+            .expect("apply R4 function fault");
+        assert_r4_function_boundary_fault(txn, signature, expected_detail);
+        txn.batch_execute(restore_sql)
+            .expect("restore R4 function boundary");
+        let restored = check_r4_execution_function_boundary(txn);
+        assert_eq!(restored.status, GateStatus::Pass, "{}", restored.detail);
+    }
+
+    fn apply_r4_public_execute_fault(txn: &mut impl GenericClient, signature: &str) {
+        txn.batch_execute(&format!("GRANT EXECUTE ON FUNCTION {signature} TO PUBLIC"))
+            .expect("grant R4 function to PUBLIC");
+        let public_execute: bool = txn
+            .query_one(
+                "SELECT has_function_privilege(0, $1::text, 'EXECUTE')",
+                &[&signature],
+            )
+            .expect("verify PUBLIC grant")
+            .get(0);
+        assert!(
+            public_execute,
+            "PUBLIC grant did not take effect for {signature}"
+        );
+        assert_r4_function_boundary_fault(txn, signature, "PUBLIC");
+        txn.batch_execute(&format!(
+            "REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC"
+        ))
+        .expect("revoke R4 function from PUBLIC");
+        let restored = check_r4_execution_function_boundary(txn);
+        assert_eq!(restored.status, GateStatus::Pass, "{}", restored.detail);
+    }
+
+    /// The real R4 typed-function gate must observe every boundary mutation and
+    /// recover after its inverse. This is deliberately one uncommitted transaction:
+    /// no ACL, owner, or `proconfig` fault escapes to a shared test database.
+    #[test]
+    fn r4_function_boundary_fault_matrix() {
+        txn_or_skip!(client, txn);
+
+        let clean = check_r4_execution_function_boundary(&mut txn);
+        assert_eq!(clean.status, GateStatus::Pass, "{}", clean.detail);
+
+        txn.batch_execute(
+            "CREATE FUNCTION private.contribution_unregistered_fixture() RETURNS void \
+             LANGUAGE sql SECURITY DEFINER SET search_path TO pg_catalog AS 'SELECT 1'",
+        )
+        .expect("create unregistered R4 SECURITY DEFINER fixture");
+        assert_r4_function_boundary_fault(
+            &mut txn,
+            "private.contribution_unregistered_fixture()",
+            "unregistered R4 contribution SECURITY DEFINER function",
+        );
+        txn.batch_execute("DROP FUNCTION private.contribution_unregistered_fixture()")
+            .expect("drop unregistered R4 SECURITY DEFINER fixture");
+        let census_restored = check_r4_execution_function_boundary(&mut txn);
+        assert_eq!(
+            census_restored.status,
+            GateStatus::Pass,
+            "{}",
+            census_restored.detail
+        );
+
+        let backend_pid: i32 = txn
+            .query_one("SELECT pg_backend_pid()", &[])
+            .expect("read backend pid")
+            .get(0);
+        let wrong_owner = format!("xtask_fx_r4_wrong_owner_{backend_pid}");
+        txn.batch_execute(&format!("CREATE ROLE {wrong_owner} NOLOGIN"))
+            .expect("create transaction-local wrong-owner role");
+        txn.batch_execute(&format!("GRANT CREATE ON SCHEMA private TO {wrong_owner}"))
+            .expect("allow temporary function owner to own private functions");
+        txn.batch_execute(&format!("GRANT CREATE ON SCHEMA ops TO {wrong_owner}"))
+            .expect("allow temporary function owner to own ops trigger functions");
+
+        for signature in R4_TYPED_FUNCTIONS.iter().chain(R4_INTERNAL_FUNCTIONS) {
+            apply_r4_function_fault(
+                &mut txn,
+                signature,
+                &format!("ALTER FUNCTION {signature} OWNER TO {wrong_owner}"),
+                &format!("ALTER FUNCTION {signature} OWNER TO {OWNER_ROLE}"),
+                &wrong_owner,
+            );
+            apply_r4_function_fault(
+                &mut txn,
+                signature,
+                &format!("ALTER FUNCTION {signature} SET search_path TO pg_catalog, private"),
+                &format!("ALTER FUNCTION {signature} SET search_path TO pg_catalog"),
+                "private",
+            );
+            apply_r4_function_fault(
+                &mut txn,
+                signature,
+                &format!("ALTER FUNCTION {signature} SET work_mem TO '1MB'"),
+                &format!("ALTER FUNCTION {signature} RESET work_mem"),
+                "work_mem",
+            );
+        }
+
+        for signature in R4_TYPED_FUNCTIONS {
+            apply_r4_public_execute_fault(&mut txn, signature);
+            apply_r4_function_fault(
+                &mut txn,
+                signature,
+                &format!("GRANT EXECUTE ON FUNCTION {signature} TO role_gateway"),
+                &format!("REVOKE EXECUTE ON FUNCTION {signature} FROM role_gateway"),
+                "role_gateway",
+            );
+            apply_r4_function_fault(
+                &mut txn,
+                signature,
+                &format!("REVOKE EXECUTE ON FUNCTION {signature} FROM role_private_worker"),
+                &format!("GRANT EXECUTE ON FUNCTION {signature} TO role_private_worker"),
+                "role_private_worker",
+            );
+        }
+
+        for signature in R4_INTERNAL_FUNCTIONS {
+            for role in ["role_private_worker", "PUBLIC", "role_gateway"] {
+                if role == "PUBLIC" {
+                    apply_r4_public_execute_fault(&mut txn, signature);
+                } else {
+                    apply_r4_function_fault(
+                        &mut txn,
+                        signature,
+                        &format!("GRANT EXECUTE ON FUNCTION {signature} TO {role}"),
+                        &format!("REVOKE EXECUTE ON FUNCTION {signature} FROM {role}"),
+                        role,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r4_execution_relation_classification_is_exact() {
+        let created = r4_create_tables(include_str!(
+            "../../migrations/0131_contribution_execution.sql"
+        ));
+        let expected: BTreeSet<String> = [
+            "private.contribution_executions",
+            "private.contribution_execution_sources",
+            "ops.contribution_execution_job_links",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(created, expected, "test-only S1 identity evidence");
+        assert!(r4_registry_coverage(&created, &named_tables()).is_empty());
+    }
+
+    #[test]
+    fn r4_migration_origin_table_set_is_exact_and_fail_closed() {
+        let clean = "CREATE TABLE private.contribution_executions (x int);\nCREATE TABLE private.contribution_execution_sources (x int);\nCREATE TABLE ops.contribution_execution_job_links (x int);";
+        let created = r4_create_tables(clean);
+        let partial_named: BTreeSet<&str> = [
+            "private.contribution_executions",
+            "private.contribution_execution_sources",
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            !r4_registry_coverage(&created, &partial_named).is_empty(),
+            "N1"
+        );
+        let full_named: BTreeSet<&str> = [
+            "private.contribution_executions",
+            "private.contribution_execution_sources",
+            "ops.contribution_execution_job_links",
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            r4_registry_coverage(&created, &full_named).is_empty(),
+            "P current coverage"
+        );
+        let future = format!("{clean}\nCREATE TABLE private.any_fourth_relation (x int);");
+        let n2 = r4_registry_coverage(&r4_create_tables(&future), &full_named);
+        assert_eq!(
+            n2,
+            vec![
+                "private.any_fourth_relation: 0131-created relation missing exact named ACL registry"
+            ]
+        );
+        let ordinary = "private.contribution_execution_future_probe";
+        assert!(
+            r4_registry_coverage(&created, &full_named).is_empty(),
+            "P non-origin {ordinary} is irrelevant"
+        );
+        let parser = "-- CREATE TABLE private.comment_only (x int)\n  create   table if not exists private.lower (x int);";
+        assert!(r4_create_tables(parser).contains("private.lower"));
+        assert!(!r4_create_tables(parser).contains("private.comment_only"));
+    }
+
+    #[test]
     fn table_set_derivation_passes_on_clean_matrix_only_spec() {
         let spec = matrix_block();
         let r = derivation_check_from_text(spec);
@@ -1793,7 +3217,7 @@ mod tests {
 
     /// T must come from the doc's own header row, not the hardcoded [`MATRIX`]: parsing
     /// the fixture's one-table header must yield exactly that table, independent of the
-    /// real (14-table) MATRIX constant.
+    /// real Phase9 MATRIX constant.
     #[test]
     fn parse_matrix_header_tables_reads_the_doc_not_the_rust_matrix() {
         let t = parse_matrix_header_tables(matrix_block());
@@ -1802,6 +3226,25 @@ mod tests {
             BTreeSet::from(["private.ingest_tickets".to_string()]),
             "{t:?}"
         );
+    }
+
+    /// The canonical Markdown table must keep every row aligned with its header.  The
+    /// derivation parser only needs the header, so this catches a malformed separator
+    /// or role row before a rendered §6.2.2 matrix becomes misleading.
+    #[test]
+    fn real_matrix_rows_match_header_width() {
+        let spec = fs::read_to_string(SPEC_PATH).expect("spec file must exist");
+        assert_eq!(matrix_row_width_error(&spec), None);
+    }
+
+    /// The production derivation gate must reject malformed matrix rows before it can
+    /// accept their header-derived table set.
+    #[test]
+    fn table_set_derivation_fault_short_matrix_separator_turns_red() {
+        let malformed = matrix_block().replacen("|---|---|", "|---|", 1);
+        let r = check_table_set_derivation(&malformed);
+        assert_eq!(r.status, GateStatus::Fail, "{}", r.detail);
+        assert!(r.detail.contains("matrix row has"), "{}", r.detail);
     }
 
     /// 派生闸正向（§48.2 注错①）: a fresh SQL block writing to a table absent from
@@ -1890,6 +3333,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_receipt_matrix_columns_are_independently_required() {
+        let spec = fs::read_to_string(SPEC_PATH).expect("spec file must exist");
+        for column in [
+            "`public._legacy_receipt_match_basis`",
+            "`public.eligible_objects`",
+        ] {
+            let mutated = spec.replacen(column, "", 1);
+            let result = check_table_set_derivation(&mutated);
+            assert_eq!(
+                result.status,
+                GateStatus::Fail,
+                "{column}: {}",
+                result.detail
+            );
+        }
+    }
+
+    #[test]
     fn table_set_derivation_real_spec_is_clean() {
         let spec = fs::read_to_string(SPEC_PATH).expect("spec file must exist");
         let r = check_table_set_derivation(&spec);
@@ -1934,6 +3395,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn function_tokens_do_not_hide_adjacent_legacy_receipt_relations() {
+        let text = "runtime role has no SELECT on `public._legacy_receipt_match_basis` or \
+            `public.eligible_objects`; it has no EXECUTE on \
+            `public.public_receipt_matches(...)`, `public.require_trust_root_seal()`, or \
+            `public.guard_evaluated_source_identity()`";
+        let found: BTreeSet<String> = find_backtick_tables(text).into_iter().collect();
+        assert_eq!(
+            found,
+            BTreeSet::from([
+                "public._legacy_receipt_match_basis".to_string(),
+                "public.eligible_objects".to_string(),
+            ])
+        );
+    }
+
     /// A bare short name (no schema prefix) inside backticks, as §48.2's prose actually
     /// writes it (`` `stream_log` ``, `` `ingest_tickets` ``), completes to its qualified
     /// §6.2.2 name.
@@ -1968,39 +3445,168 @@ mod tests {
     // separate fixture schema is invisible to them; only the real object is.
     // ------------------------------------------------------------------
 
-    /// `HUMAUX_REQUIRE_DB=1` ⇒ 本文件里的跳过一律改为 panic。
-    ///
-    /// 与 `humaux_testkit::skip_or_fail` 同一条规矩（ADR-0005），只是 `xtask` 不依赖
-    /// testkit，所以在这里就地实现同样的语义而不是为一个常量加一条 crate 依赖。
-    /// 语义必须与那边逐字一致：**声明了有库却拿不到，是环境坏了，不是这条测试不适用。**
-    fn skip_is_a_failure() -> bool {
-        std::env::var("HUMAUX_REQUIRE_DB").is_ok_and(|v| v == "1")
+    #[test]
+    fn w1_continuity_catalog_faults_drive_actual_gate_red_then_restore() {
+        txn_or_skip!(client, txn);
+        let clean = check_w1_continuity_boundary(&mut txn);
+        assert_eq!(clean.status, GateStatus::Pass, "{}", clean.detail);
+
+        for (label, fault) in [
+            (
+                "drop exact SELECT guard",
+                "DROP POLICY continuity_evidence_owner_exact_guard ON private.evidence_objects",
+            ),
+            (
+                "change UPDATE guard permissiveness and checks",
+                "DROP POLICY continuity_evidence_owner_lock_guard ON private.evidence_objects; \
+                 CREATE POLICY continuity_evidence_owner_lock_guard ON private.evidence_objects \
+                 AS PERMISSIVE FOR UPDATE TO role_migration_owner USING (true) WITH CHECK (true)",
+            ),
+            (
+                "broaden exact workspace predicate",
+                "DROP POLICY continuity_evidence_owner_exact_allow ON private.evidence_objects; \
+                 CREATE POLICY continuity_evidence_owner_exact_allow ON private.evidence_objects \
+                 AS PERMISSIVE FOR SELECT TO role_migration_owner USING ( \
+                   current_setting('humaux.continuity_publish',true)='1' \
+                   AND visibility_class='WORKSPACE_SHARED')",
+            ),
+            (
+                "add fifth W1 owner policy",
+                "CREATE POLICY continuity_evidence_owner_extra ON private.evidence_objects \
+                 AS PERMISSIVE FOR SELECT TO role_migration_owner USING (false)",
+            ),
+            (
+                "remove FORCE RLS",
+                "ALTER TABLE private.continuity_projects NO FORCE ROW LEVEL SECURITY",
+            ),
+            (
+                "over-grant direct runtime table access",
+                "GRANT SELECT ON private.continuity_projects TO role_private_worker",
+            ),
+            (
+                "drop composite pointer foreign key",
+                "ALTER TABLE private.continuity_facet_slots \
+                 DROP CONSTRAINT continuity_facet_slots_current_fkey",
+            ),
+            (
+                "drop closed facet check",
+                "ALTER TABLE private.continuity_facet_slots \
+                 DROP CONSTRAINT continuity_facet_slots_kind_closed",
+            ),
+            (
+                "drop append-only guard",
+                "DROP TRIGGER continuity_facet_versions_append_only \
+                 ON private.continuity_facet_versions",
+            ),
+        ] {
+            txn.batch_execute("SAVEPOINT w1_policy_fault")
+                .expect("fault savepoint");
+            txn.batch_execute(fault).expect(label);
+            let red = check_w1_continuity_boundary(&mut txn);
+            assert_eq!(red.status, GateStatus::Fail, "{label}: {}", red.detail);
+            txn.batch_execute(
+                "ROLLBACK TO SAVEPOINT w1_policy_fault; RELEASE SAVEPOINT w1_policy_fault",
+            )
+            .expect("restore exact catalog");
+        }
+
+        let restored = check_w1_continuity_boundary(&mut txn);
+        assert_eq!(restored.status, GateStatus::Pass, "{}", restored.detail);
     }
 
-    macro_rules! txn_or_skip {
-        ($client:ident, $txn:ident) => {
-            let Ok(dsn) = std::env::var(DSN_ENV) else {
-                assert!(
-                    !skip_is_a_failure(),
-                    "HUMAUX_REQUIRE_DB is set, so a skip here is a failure — \
-                     missing object: {DSN_ENV}"
-                );
-                eprintln!("rls-check test: not_applicable — {DSN_ENV} unset, skipping");
-                return;
-            };
-            let Ok(mut $client) = Client::connect(&dsn, NoTls) else {
-                assert!(
-                    !skip_is_a_failure(),
-                    "HUMAUX_REQUIRE_DB is set, so a skip here is a failure — \
-                     missing object: reachable Postgres at {DSN_ENV}"
-                );
-                eprintln!("rls-check test: not_applicable — cannot reach Postgres, skipping");
-                return;
-            };
-            let mut $txn = $client
-                .transaction()
-                .expect("open fault-injection transaction");
+    #[test]
+    fn w2_continuity_catalog_faults_drive_actual_gate_red_then_restore() {
+        txn_or_skip!(client, txn);
+        let clean = check_w2_continuity_boundary(&mut txn);
+        assert_eq!(clean.status, GateStatus::Pass, "{}", clean.detail);
+        let signature =
+            "private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])";
+        for (label, fault) in [
+            (
+                "PUBLIC execute",
+                format!("GRANT EXECUTE ON FUNCTION {signature} TO PUBLIC"),
+            ),
+            (
+                "second runtime executor",
+                format!("GRANT EXECUTE ON FUNCTION {signature} TO role_private_worker"),
+            ),
+            (
+                "security invoker",
+                format!("ALTER FUNCTION {signature} SECURITY INVOKER"),
+            ),
+            ("volatile", format!("ALTER FUNCTION {signature} VOLATILE")),
+            (
+                "missing gateway execute",
+                format!("REVOKE EXECUTE ON FUNCTION {signature} FROM role_gateway"),
+            ),
+            (
+                "unsafe definer search path",
+                format!("ALTER FUNCTION {signature} SET search_path TO public"),
+            ),
+            (
+                "direct W1 grant",
+                "GRANT SELECT ON private.continuity_facet_slots TO role_gateway".to_string(),
+            ),
+        ] {
+            txn.batch_execute("SAVEPOINT w2_reader_fault")
+                .expect("savepoint");
+            txn.batch_execute(&fault).expect(label);
+            let red = check_w2_continuity_boundary(&mut txn);
+            assert_eq!(red.status, GateStatus::Fail, "{label}: {}", red.detail);
+            txn.batch_execute(
+                "ROLLBACK TO SAVEPOINT w2_reader_fault; RELEASE SAVEPOINT w2_reader_fault",
+            )
+            .expect("restore exact catalog");
+        }
+        let restored = check_w2_continuity_boundary(&mut txn);
+        assert_eq!(restored.status, GateStatus::Pass, "{}", restored.detail);
+    }
+
+    /// The catalog census is not a substitute for a real runtime login: Gateway cannot
+    /// directly inspect W1 storage, and PostgreSQL itself rejects a write after READ ONLY.
+    #[test]
+    fn w2_gateway_runtime_role_direct_storage_denial_and_read_only_write_are_real() {
+        let Ok(admin_dsn) = std::env::var(DSN_ENV) else {
+            assert!(
+                !skip_is_a_failure(),
+                "HUMAUX_REQUIRE_DB is set, so a skip here is a failure — missing object: {DSN_ENV}"
+            );
+            eprintln!("rls-check test: not_applicable — {DSN_ENV} unset, skipping");
+            return;
         };
+        let Some((_, authority)) = admin_dsn.split_once('@') else {
+            panic!("{DSN_ENV} must be a PostgreSQL URL with an authority");
+        };
+        let gateway_dsn = format!("postgres://role_gateway:devlocal_role_gateway@{authority}");
+        let mut gateway = Client::connect(&gateway_dsn, NoTls).unwrap_or_else(|error| {
+            panic!("role_gateway must be reachable for W2 runtime boundary proof: {error}")
+        });
+        let direct_read = gateway
+            .query_one("SELECT count(*) FROM private.continuity_projects", &[])
+            .expect_err("role_gateway must not directly read W1 continuity storage");
+        assert_eq!(
+            direct_read.code().expect("SQLSTATE").code(),
+            "42501",
+            "{direct_read}"
+        );
+
+        gateway
+            .batch_execute("BEGIN TRANSACTION READ ONLY")
+            .expect("open actual read-only runtime transaction");
+        let read_only_write = gateway
+            .execute(
+                "UPDATE private.ingest_tickets SET state=state WHERE false",
+                &[],
+            )
+            .expect_err("READ ONLY runtime transaction must reject a write attempt");
+        assert_eq!(
+            read_only_write.code().expect("SQLSTATE").code(),
+            "25006",
+            "{read_only_write}"
+        );
+        gateway
+            .batch_execute("ROLLBACK")
+            .expect("rollback read-only runtime transaction");
     }
 
     /// §48.2 注错「多授」/「少授」/「列限定」, exercised directly against
@@ -2053,6 +3659,27 @@ mod tests {
             "{}",
             under_grant.detail
         );
+    }
+
+    #[test]
+    fn legacy_receipt_views_over_and_under_grants_are_red() {
+        txn_or_skip!(client, txn);
+
+        assert_eq!(check_grant_equality(&mut txn).status, GateStatus::Pass);
+        txn.batch_execute("GRANT SELECT ON public._legacy_receipt_match_basis TO role_gateway")
+            .expect("helper over-grant fault");
+        let over = check_grant_equality(&mut txn);
+        assert_eq!(over.status, GateStatus::Fail, "{}", over.detail);
+        assert!(over.detail.contains("_legacy_receipt_match_basis"));
+
+        txn.batch_execute(
+            "REVOKE SELECT ON public._legacy_receipt_match_basis FROM role_gateway; \
+             REVOKE SELECT ON public.eligible_objects FROM role_gateway",
+        )
+        .expect("outer-view under-grant fault");
+        let under = check_grant_equality(&mut txn);
+        assert_eq!(under.status, GateStatus::Fail, "{}", under.detail);
+        assert!(under.detail.contains("eligible_objects"));
     }
 
     /// §48.2 注错「发票权唯一」「多授」: owner is excluded, and a second non-owner
@@ -2197,6 +3824,165 @@ mod tests {
         );
     }
 
+    /// Every 0131-created relation stays in the one existing named ACL/RLS authority.
+    /// Each DDL fault is inverted before the next one so the test proves red→green,
+    /// without committing any mutation to the disposable database.
+    #[test]
+    fn r4_relation_boundary_fault_matrix() {
+        txn_or_skip!(client, txn);
+
+        assert_eq!(check_grant_equality(&mut txn).status, GateStatus::Pass);
+        assert_eq!(check_rls_four_item(&mut txn).status, GateStatus::Pass);
+        assert_eq!(
+            check_r4_execution_registry(&mut txn).status,
+            GateStatus::Pass
+        );
+
+        let backend_pid: i32 = txn
+            .query_one("SELECT pg_backend_pid()", &[])
+            .expect("read backend pid")
+            .get(0);
+        let wrong_owner = format!("xtask_fx_r4_relation_owner_{backend_pid}");
+        txn.batch_execute(&format!(
+            "CREATE ROLE {wrong_owner} NOLOGIN; \
+             GRANT CREATE ON SCHEMA private TO {wrong_owner}; \
+             GRANT CREATE ON SCHEMA ops TO {wrong_owner}"
+        ))
+        .expect("create transaction-local wrong relation owner");
+
+        let relations = [
+            "private.contribution_executions",
+            "private.contribution_execution_sources",
+            "ops.contribution_execution_job_links",
+        ];
+        for relation in relations {
+            for verb in ["INSERT", "UPDATE", "DELETE"] {
+                txn.batch_execute(&format!(
+                    "GRANT {verb} ON TABLE {relation} TO role_private_worker"
+                ))
+                .expect("grant forbidden R4 relation DML");
+                let result = check_grant_equality(&mut txn);
+                assert_eq!(result.status, GateStatus::Fail, "{}", result.detail);
+                assert!(result.detail.contains(relation), "{}", result.detail);
+                assert!(
+                    result.detail.contains("role_private_worker"),
+                    "{}",
+                    result.detail
+                );
+                txn.batch_execute(&format!(
+                    "REVOKE {verb} ON TABLE {relation} FROM role_private_worker"
+                ))
+                .expect("revoke forbidden R4 relation DML");
+                assert_eq!(check_grant_equality(&mut txn).status, GateStatus::Pass);
+            }
+
+            txn.batch_execute(&format!(
+                "ALTER TABLE {relation} DISABLE ROW LEVEL SECURITY"
+            ))
+            .expect("disable R4 relation RLS");
+            let disabled = check_rls_four_item(&mut txn);
+            assert_eq!(disabled.status, GateStatus::Fail, "{}", disabled.detail);
+            assert!(disabled.detail.contains(relation), "{}", disabled.detail);
+            txn.batch_execute(&format!("ALTER TABLE {relation} ENABLE ROW LEVEL SECURITY"))
+                .expect("restore R4 relation RLS");
+            assert_eq!(check_rls_four_item(&mut txn).status, GateStatus::Pass);
+
+            txn.batch_execute(&format!(
+                "ALTER TABLE {relation} NO FORCE ROW LEVEL SECURITY"
+            ))
+            .expect("disable R4 relation FORCE RLS");
+            let no_force = check_rls_four_item(&mut txn);
+            assert_eq!(no_force.status, GateStatus::Fail, "{}", no_force.detail);
+            assert!(no_force.detail.contains(relation), "{}", no_force.detail);
+            txn.batch_execute(&format!("ALTER TABLE {relation} FORCE ROW LEVEL SECURITY"))
+                .expect("restore R4 relation FORCE RLS");
+            assert_eq!(check_rls_four_item(&mut txn).status, GateStatus::Pass);
+
+            txn.batch_execute(&format!("ALTER TABLE {relation} OWNER TO {wrong_owner}"))
+                .expect("set wrong R4 relation owner");
+            let wrong_owner_result = check_grant_equality(&mut txn);
+            assert_eq!(
+                wrong_owner_result.status,
+                GateStatus::Fail,
+                "{}",
+                wrong_owner_result.detail
+            );
+            assert!(
+                wrong_owner_result.detail.contains(relation),
+                "{}",
+                wrong_owner_result.detail
+            );
+            assert!(
+                wrong_owner_result.detail.contains(&wrong_owner),
+                "{}",
+                wrong_owner_result.detail
+            );
+            txn.batch_execute(&format!("ALTER TABLE {relation} OWNER TO {OWNER_ROLE}"))
+                .expect("restore R4 relation owner");
+            assert_eq!(check_grant_equality(&mut txn).status, GateStatus::Pass);
+
+            let (schema, name) = relation.split_once('.').expect("qualified R4 relation");
+            let renamed = format!("xtask_fx_r4_missing_{backend_pid}_{name}");
+            txn.batch_execute(&format!("ALTER TABLE {relation} RENAME TO {renamed}"))
+                .expect("rename R4 relation away from migration-origin identity");
+            let missing = check_r4_execution_registry(&mut txn);
+            assert_eq!(missing.status, GateStatus::Fail, "{}", missing.detail);
+            assert!(missing.detail.contains(relation), "{}", missing.detail);
+            txn.batch_execute(&format!("ALTER TABLE {schema}.{renamed} RENAME TO {name}"))
+                .expect("restore R4 relation migration-origin identity");
+            assert_eq!(
+                check_r4_execution_registry(&mut txn).status,
+                GateStatus::Pass
+            );
+        }
+    }
+
+    fn pre_r4_verdicts(client: &mut impl GenericClient) -> Vec<GateStatus> {
+        [
+            check_role_set_equality(client),
+            check_grant_equality(client),
+            check_domain_default_grants(client),
+            check_forbidden_verbs(client),
+            check_invoice_privilege_unique(client),
+            check_rls_four_item(client),
+            check_admin_plane_no_leak(client),
+            check_r3_health_observation_boundary(client),
+        ]
+        .into_iter()
+        .map(|result| result.status)
+        .collect()
+    }
+
+    /// R4 migration-origin coverage must not turn into a prefix deny-list or alter the
+    /// eight pre-R4 verdicts. A non-0131 private table with an R4-looking name follows
+    /// only the Canonical private domain defaults.
+    #[test]
+    fn r4_non_r4_baseline_regression() {
+        txn_or_skip!(client, txn);
+
+        let before = pre_r4_verdicts(&mut txn);
+        assert!(before.iter().all(|status| *status == GateStatus::Pass));
+
+        txn.batch_execute(
+            "CREATE TABLE private.contribution_execution_future_probe (id bigint); \
+             ALTER TABLE private.contribution_execution_future_probe OWNER TO role_migration_owner; \
+             GRANT SELECT, INSERT, UPDATE ON private.contribution_execution_future_probe \
+               TO role_gateway, role_private_worker; \
+             GRANT SELECT ON private.contribution_execution_future_probe \
+               TO role_consolidation_worker, role_retrieval_worker, role_maintenance;",
+        )
+        .expect("create ordinary private domain-default fixture");
+        let registry = check_r4_execution_registry(&mut txn);
+        assert_eq!(registry.status, GateStatus::Pass, "{}", registry.detail);
+        let domain = check_domain_default_grants(&mut txn);
+        assert_eq!(domain.status, GateStatus::Pass, "{}", domain.detail);
+        let after = pre_r4_verdicts(&mut txn);
+        assert_eq!(
+            after, before,
+            "ordinary non-0131 relation changed a pre-R4 verdict"
+        );
+    }
+
     /// §6.2.1 域默认授权, red→green against [`check_domain_default_grants`] directly:
     /// a non-named table over-granted beyond its schema's domain default must be caught.
     #[test]
@@ -2212,6 +3998,7 @@ mod tests {
         // R+W, consolidation_worker/maintenance get R, batch_issuer gets nothing.
         txn.batch_execute(
             "CREATE TABLE ops.xtask_fx_domain_table (id bigint); \
+             ALTER TABLE ops.xtask_fx_domain_table OWNER TO role_migration_owner; \
              GRANT SELECT, INSERT, UPDATE ON ops.xtask_fx_domain_table \
                TO role_gateway, role_private_worker, role_public_worker, role_retrieval_worker; \
              GRANT SELECT ON ops.xtask_fx_domain_table \
@@ -2230,6 +4017,36 @@ mod tests {
         assert_eq!(after.status, GateStatus::Fail, "{}", after.detail);
         assert!(
             after.detail.contains("role_batch_issuer"),
+            "{}",
+            after.detail
+        );
+    }
+
+    /// §6.2.1 Canonical owner is global, including tables that fall back to domain defaults.
+    /// A deployment runner retaining ownership must turn the same executable gate red.
+    #[test]
+    fn domain_default_owner_fault_injection() {
+        txn_or_skip!(client, txn);
+
+        txn.batch_execute(
+            "CREATE TABLE ops.xtask_fx_domain_owner (id bigint); \
+             ALTER TABLE ops.xtask_fx_domain_owner OWNER TO role_migration_owner; \
+             GRANT SELECT, INSERT, UPDATE ON ops.xtask_fx_domain_owner \
+               TO role_gateway, role_private_worker, role_public_worker, role_retrieval_worker; \
+             GRANT SELECT ON ops.xtask_fx_domain_owner \
+               TO role_consolidation_worker, role_maintenance;",
+        )
+        .expect("fixture DDL");
+
+        let clean = check_domain_default_grants(&mut txn);
+        assert_eq!(clean.status, GateStatus::Pass, "{}", clean.detail);
+
+        txn.batch_execute("ALTER TABLE ops.xtask_fx_domain_owner OWNER TO role_gateway")
+            .expect("fault injection");
+        let after = check_domain_default_grants(&mut txn);
+        assert_eq!(after.status, GateStatus::Fail, "{}", after.detail);
+        assert!(
+            after.detail.contains("Canonical owner expected"),
             "{}",
             after.detail
         );

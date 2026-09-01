@@ -343,7 +343,9 @@ impl IntraCellResourceRegistry {
         self.entries.values()
     }
 
-    pub(crate) fn local_cell_id(&self) -> CellId {
+    /// Immutable local identity loaded at bootstrap. Reading it does not grant access
+    /// to a resource or allow the caller to override the registry's identity.
+    pub fn local_cell_id(&self) -> CellId {
         self.local_cell_id
     }
 

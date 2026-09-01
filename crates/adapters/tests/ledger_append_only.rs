@@ -218,8 +218,13 @@ fn model_call_ledger_rejects_delete_and_truncate() {
         // model_call_ledger 行需要 provider_pricing_versions 等一串前置，那些已由
         // `model_call_ledger.rs` 覆盖；本条要证的是 0101 补上的那条腿。
         let mut txn = h.admin.transaction().expect("begin txn");
+        // `CASCADE` 不是为了真的级联清空，而是为了让 TRUNCATE **走到** 0101 的守卫：
+        // PostgreSQL 先做 `heap_truncate_check_FKs`，后跑 BEFORE TRUNCATE 触发器。自从
+        // `ops.data_disclosures` 加了指向本表的外键，裸 TRUNCATE 会先撞 FK 报 0A000，
+        // 守卫一次都执行不到——表面仍然"失败"，但被验证的已经不是 §19.1 那道防线了。
+        // 这正是本文件下面那条断言（"不是别的什么把它顺手挡住了"）要防的形态。
         let err = txn
-            .execute("TRUNCATE ops.model_call_ledger", &[])
+            .execute("TRUNCATE ops.model_call_ledger CASCADE", &[])
             .expect_err("§19.1: 整表清空必须被拒（0101 之前这里是成功的）");
         assert_eq!(
             err.code().map(|c| c.code()),

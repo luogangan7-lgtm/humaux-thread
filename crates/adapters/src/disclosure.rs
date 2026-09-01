@@ -70,6 +70,12 @@ pub enum DisclosureError {
     /// `tests/disclosure_ledger.rs`, using the `test-support`-feature-only
     /// `PrivateDataPurpose::NonRecipientForTest`.
     NotADisclosureRecipient,
+    /// `RETRIEVAL_QUERY` is deliberately unavailable to the broad four-source reserve API.
+    /// The typed query-source writer proves tenant, lifecycle, and both digests before it can
+    /// use the narrowly granted database function.
+    QuerySourceRequiresTypedReserve,
+    /// Query sources are only evidence for the native dense-embedding disclosure purpose.
+    QuerySourceRequiresEmbeddingPermit,
 }
 
 impl From<sqlx::Error> for DisclosureError {
@@ -95,6 +101,14 @@ impl std::fmt::Display for DisclosureError {
                 "permit.purpose()'s RecipientClass does not require a disclosure record \
                  (domain::boundary::requires_disclosure_record) — refusing to write ops.\
                  data_disclosures for a non-recipient"
+            ),
+            Self::QuerySourceRequiresTypedReserve => write!(
+                f,
+                "RETRIEVAL_QUERY requires the typed retrieval-query reserve path"
+            ),
+            Self::QuerySourceRequiresEmbeddingPermit => write!(
+                f,
+                "RETRIEVAL_QUERY requires a RETRIEVAL_EMBEDDING EgressPermit"
             ),
         }
     }
@@ -177,11 +191,11 @@ pub enum DisclosureSource {
     Memory(Uuid),
     Rollup(Uuid),
     Release(Uuid),
+    RetrievalQuery(Uuid),
 }
 
 impl DisclosureSource {
-    /// `(source_kind wire string, evidence_id, memory_id, rollup_id, release_id)` — the exact
-    /// five-column shape `ops.data_disclosure_sources` binds per row.
+    /// `(source_kind wire string, evidence_id, memory_id, rollup_id, release_id, query_source_id)`.
     #[allow(clippy::type_complexity)]
     fn columns(
         self,
@@ -191,12 +205,14 @@ impl DisclosureSource {
         Option<Uuid>,
         Option<Uuid>,
         Option<Uuid>,
+        Option<Uuid>,
     ) {
         match self {
-            Self::Evidence(id) => ("EVIDENCE", Some(id), None, None, None),
-            Self::Memory(id) => ("MEMORY", None, Some(id), None, None),
-            Self::Rollup(id) => ("ROLLUP", None, None, Some(id), None),
-            Self::Release(id) => ("PUBLIC_RELEASE", None, None, None, Some(id)),
+            Self::Evidence(id) => ("EVIDENCE", Some(id), None, None, None, None),
+            Self::Memory(id) => ("MEMORY", None, Some(id), None, None, None),
+            Self::Rollup(id) => ("ROLLUP", None, None, Some(id), None, None),
+            Self::Release(id) => ("PUBLIC_RELEASE", None, None, None, Some(id), None),
+            Self::RetrievalQuery(id) => ("RETRIEVAL_QUERY", None, None, None, None, Some(id)),
         }
     }
 }
@@ -228,13 +244,16 @@ async fn set_tenant_local(
 /// transaction with the ledger insert — an empty slice is rejected
 /// ([`DisclosureError::NoSources`]) rather than silently producing an unattributed disclosure
 /// (§7.4 "来源关系规范化": deletion/revocation propagation only ever queries this relation).
+#[allow(clippy::too_many_arguments)] // Shared primitive preserves the existing retrieval and new reasoning reservation shapes.
 async fn reserve_in_txn(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    model_call_id: Option<Uuid>,
     permit: &EgressPermit,
     region: &str,
     payload: &AuthorizedEgressPayload,
     scope: Option<DisclosureScope>,
     sources: &[DisclosureSource],
+    allow_query_source: bool,
 ) -> Result<Uuid, DisclosureError> {
     // ADR-0003 second-round correction: the write judgment is `RecipientClass`, never
     // `NetworkRouteClass`/IntraCell/private-IP/protocol (`domain::boundary`'s own doc). This is
@@ -251,6 +270,13 @@ async fn reserve_in_txn(
     if sources.is_empty() {
         return Err(DisclosureError::NoSources);
     }
+    if !allow_query_source
+        && sources
+            .iter()
+            .any(|source| matches!(source, DisclosureSource::RetrievalQuery(_)))
+    {
+        return Err(DisclosureError::QuerySourceRequiresTypedReserve);
+    }
 
     let tenant_id = permit.tenant_id().0;
     set_tenant_local(txn, tenant_id).await?;
@@ -258,8 +284,8 @@ async fn reserve_in_txn(
     let row = sqlx::query(
         "INSERT INTO ops.data_disclosures \
            (grant_id, tenant_id, scope_kind, scope_id, processor_id, region, \
-            data_class, purpose, payload_sha256, payload_bytes) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+            data_class, purpose, payload_sha256, payload_bytes, model_call_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          RETURNING disclosure_id",
     )
     .bind(permit.grant_id())
@@ -272,31 +298,101 @@ async fn reserve_in_txn(
     .bind(purpose_as_db_str(permit.purpose()))
     .bind(permit.payload_sha256().to_vec())
     .bind(payload.bytes().len() as i64)
+    .bind(model_call_id)
     .fetch_one(&mut **txn)
     .await?;
     let disclosure_id: Uuid = row.get("disclosure_id");
 
     for (ordinal, source) in sources.iter().enumerate() {
-        let (source_kind, evidence_id, memory_id, rollup_id, release_id) = source.columns();
-        sqlx::query(
-            "INSERT INTO ops.data_disclosure_sources \
-               (tenant_id, disclosure_id, source_kind, evidence_id, memory_id, rollup_id, \
-                release_id, ordinal) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(tenant_id)
-        .bind(disclosure_id)
-        .bind(source_kind)
-        .bind(evidence_id)
-        .bind(memory_id)
-        .bind(rollup_id)
-        .bind(release_id)
-        .bind(ordinal as i32)
-        .execute(&mut **txn)
-        .await?;
+        if let DisclosureSource::RetrievalQuery(query_source_id) = source {
+            sqlx::query("SELECT ops.attach_retrieval_query_source($1, $2, $3, $4)")
+                .bind(tenant_id)
+                .bind(disclosure_id)
+                .bind(query_source_id)
+                .bind(ordinal as i32)
+                .execute(&mut **txn)
+                .await?;
+        } else {
+            let (source_kind, evidence_id, memory_id, rollup_id, release_id, query_source_id) =
+                source.columns();
+            sqlx::query(
+                "INSERT INTO ops.data_disclosure_sources \
+                   (tenant_id, disclosure_id, source_kind, evidence_id, memory_id, rollup_id, \
+                    release_id, query_source_id, ordinal) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            )
+            .bind(tenant_id)
+            .bind(disclosure_id)
+            .bind(source_kind)
+            .bind(evidence_id)
+            .bind(memory_id)
+            .bind(rollup_id)
+            .bind(release_id)
+            .bind(query_source_id)
+            .bind(ordinal as i32)
+            .execute(&mut **txn)
+            .await?;
+        }
     }
 
     Ok(disclosure_id)
+}
+
+/// Crate-private companion for [`crate::retrieval_query_source`]. The public generic reserve
+/// APIs reject this source variant so it cannot be used as an unchecked fifth source kind.
+pub(crate) async fn reserve_retrieval_queries_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    permit: &EgressPermit,
+    region: &str,
+    payload: &AuthorizedEgressPayload,
+    scope: DisclosureScope,
+    query_source_ids: &[Uuid],
+) -> Result<Uuid, DisclosureError> {
+    if permit.purpose() != PrivateDataPurpose::RetrievalEmbedding {
+        return Err(DisclosureError::QuerySourceRequiresEmbeddingPermit);
+    }
+    let sources: Vec<DisclosureSource> = query_source_ids
+        .iter()
+        .copied()
+        .map(DisclosureSource::RetrievalQuery)
+        .collect();
+    reserve_in_txn(
+        txn,
+        None,
+        permit,
+        region,
+        payload,
+        Some(scope),
+        &sources,
+        true,
+    )
+    .await
+}
+
+/// USER_REASONING disclosure reservation bound to the exact ModelCallLedger attempt in the
+/// caller's pre-provider transaction.
+pub(crate) async fn reserve_reasoning_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    model_call_id: Uuid,
+    permit: &EgressPermit,
+    region: &str,
+    payload: &AuthorizedEgressPayload,
+    sources: &[DisclosureSource],
+) -> Result<Uuid, DisclosureError> {
+    if permit.purpose() != PrivateDataPurpose::UserReasoning {
+        return Err(DisclosureError::NotADisclosureRecipient);
+    }
+    reserve_in_txn(
+        txn,
+        Some(model_call_id),
+        permit,
+        region,
+        payload,
+        None,
+        sources,
+        false,
+    )
+    .await
 }
 
 /// §7.4 finalize() — records the outcome of the [`ExternalCall`] a prior [`reserve`] reserved
@@ -329,6 +425,30 @@ async fn finalize_in_txn(
     Ok(result.rows_affected() > 0)
 }
 
+/// Finalizes one USER_REASONING disclosure against its exact model call in the caller's
+/// post-provider transaction.
+pub(crate) async fn finalize_reasoning_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    disclosure_id: Uuid,
+    model_call_id: Uuid,
+    outcome: DisclosureOutcome,
+    deletion_capability: DeletionCapability,
+) -> Result<bool, DisclosureError> {
+    set_tenant_local(txn, tenant_id).await?;
+    let result = sqlx::query(
+        "UPDATE ops.data_disclosures SET finalized_at=now(),outcome=$4,deletion_capability=$5 WHERE disclosure_id=$1 AND tenant_id=$2 AND model_call_id=$3 AND purpose='USER_REASONING' AND finalized_at IS NULL",
+    )
+    .bind(disclosure_id)
+    .bind(tenant_id)
+    .bind(model_call_id)
+    .bind(outcome.as_str())
+    .bind(deletion_capability.as_str())
+    .execute(&mut **txn)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// [`reserve_in_txn`] for the §11 `USER_REASONING` egress path ([`PrivateWorkerDbPool`]).
 pub async fn reserve_private(
     pool: &PrivateWorkerDbPool,
@@ -339,7 +459,10 @@ pub async fn reserve_private(
     sources: &[DisclosureSource],
 ) -> Result<Uuid, DisclosureError> {
     let mut txn = pool.pool().begin().await?;
-    let disclosure_id = reserve_in_txn(&mut txn, permit, region, payload, scope, sources).await?;
+    let disclosure_id = reserve_in_txn(
+        &mut txn, None, permit, region, payload, scope, sources, false,
+    )
+    .await?;
     txn.commit().await?;
     Ok(disclosure_id)
 }
@@ -355,7 +478,10 @@ pub async fn reserve_retrieval(
     sources: &[DisclosureSource],
 ) -> Result<Uuid, DisclosureError> {
     let mut txn = pool.pool().begin().await?;
-    let disclosure_id = reserve_in_txn(&mut txn, permit, region, payload, scope, sources).await?;
+    let disclosure_id = reserve_in_txn(
+        &mut txn, None, permit, region, payload, scope, sources, false,
+    )
+    .await?;
     txn.commit().await?;
     Ok(disclosure_id)
 }

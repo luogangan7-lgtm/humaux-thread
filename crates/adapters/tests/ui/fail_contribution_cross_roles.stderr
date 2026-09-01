@@ -1,0 +1,41 @@
+warning: unreachable statement
+  --> tests/ui/fail_contribution_cross_roles.rs:10:5
+   |
+ 9 |     let public: PublicWorkerDbPool = unimplemented!();
+   |                                      ---------------- any code following this expression is unreachable
+10 |     let private: PrivateWorkerDbPool = unimplemented!();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0308]: mismatched types
+  --> tests/ui/fail_contribution_cross_roles.rs:16:28
+   |
+16 |     let _ = create_release(&public, tenant, &release);
+   |             -------------- ^^^^^^^ expected `&PrivateWorkerDbPool`, found `&PublicWorkerDbPool`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected reference `&PrivateWorkerDbPool`
+              found reference `&PublicWorkerDbPool`
+note: function defined here
+  --> src/contribution_repo.rs
+   |
+   | pub async fn create_release(
+   |              ^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/fail_contribution_cross_roles.rs:17:27
+   |
+17 |     let _ = promote_claim(&private, tenant, &content, &source_ids);
+   |             ------------- ^^^^^^^^ expected `&PublicWorkerDbPool`, found `&PrivateWorkerDbPool`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected reference `&PublicWorkerDbPool`
+              found reference `&PrivateWorkerDbPool`
+note: function defined here
+  --> src/contribution_repo.rs
+   |
+   | pub async fn promote_claim(
+   |              ^^^^^^^^^^^^^

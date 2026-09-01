@@ -163,7 +163,7 @@ fn parse_checkbox_entries(section: &str) -> Vec<CheckboxEntry> {
         .collect()
 }
 
-/// Reads the frozen `当前 DoD IDs: DOD-001 .. DOD-091` line (§69 DoD Verifier Contract) and
+/// Reads the frozen `当前 DoD IDs: DOD-001 .. DOD-095` line (§69 DoD Verifier Contract) and
 /// returns `(min, max)`. This is the single source for "how many ids should exist" — never
 /// hardcoded, so a future re-freeze (adding/removing DoD items) doesn't require touching
 /// this checker.
@@ -370,50 +370,97 @@ fn resolve_verifier(
             )),
         };
     }
-    // `test::<package>::<filter>` — runs `cargo test -p <package> <filter>` and judges by
-    // cargo's own `test result:` line (§69 verifier kind = "test"). A filter matching zero
-    // tests is Fail, not Pass — a vacuous verifier must not satisfy G80-33 rule 5.
-    if let Some(rest) = verifier_ref.strip_prefix("test::") {
-        let (package, filter) = rest
-            .split_once("::")
-            .ok_or_else(|| format!("test:: verifier needs <package>::<filter>, got {rest:?}"))?;
+    // `test-ignored::` explicitly runs resource-dependent tests; `test::` must not
+    // silently skip them and report green. Zero executed tests remains Fail.
+    if let Some(args) = test_verifier_args(verifier_ref)? {
         let out = std::process::Command::new("cargo")
-            .args(["test", "-p", package, filter, "--", "--test-threads=1"])
+            .args(args)
             .output()
             .map_err(|e| format!("cargo test spawn failed: {e}"))?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let (mut passed, mut failed) = (0u64, 0u64);
-        for line in text.lines() {
-            if let Some(rest) = line.trim().strip_prefix("test result: ") {
-                for part in rest.split(';') {
-                    let part = part.trim();
-                    if let Some(n) = part.strip_suffix(" passed") {
-                        passed += n
-                            .split_whitespace()
-                            .next_back()
-                            .unwrap_or("0")
-                            .parse::<u64>()
-                            .unwrap_or(0);
-                    } else if let Some(n) = part.strip_suffix(" failed") {
-                        failed += n
-                            .split_whitespace()
-                            .next_back()
-                            .unwrap_or("0")
-                            .parse::<u64>()
-                            .unwrap_or(0);
-                    }
-                }
-            }
-        }
-        return Ok(if failed > 0 || passed == 0 {
-            GateStatus::Fail
-        } else {
-            GateStatus::Pass
-        });
+        return Ok(test_process_verdict(
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+        ));
     }
     Err(format!(
         "no execution binding registered in dod_check.rs for verifier_ref {verifier_ref:?}"
     ))
+}
+
+fn test_verifier_args(verifier_ref: &str) -> Result<Option<Vec<&str>>, String> {
+    let Some((rest, ignored, target)) = [
+        ("test-ignored-bin::", true, Some("--test")),
+        ("test-bin::", false, Some("--test")),
+        ("test-lib::", false, Some("--lib")),
+        ("test-ignored::", true, None),
+        ("test::", false, None),
+    ]
+    .into_iter()
+    .find_map(|(prefix, ignored, target)| {
+        verifier_ref
+            .strip_prefix(prefix)
+            .map(|rest| (rest, ignored, target))
+    }) else {
+        return Ok(None);
+    };
+    let (package, selection) = rest
+        .split_once("::")
+        .filter(|(package, selection)| !package.is_empty() && !selection.is_empty())
+        .ok_or_else(|| format!("test verifier needs <package>::<selection>, got {rest:?}"))?;
+    let mut args = vec!["test", "--locked", "-p", package];
+    if target == Some("--test") {
+        let (binary, filter) = selection
+            .split_once("::")
+            .map_or((selection, None), |(binary, filter)| (binary, Some(filter)));
+        if binary.is_empty() || filter == Some("") || (!ignored && filter.is_none()) {
+            return Err(format!(
+                "invalid test binary/filter selection {selection:?}"
+            ));
+        }
+        args.extend(["--test", binary]);
+        args.extend(filter);
+    } else {
+        args.extend(target);
+        args.push(selection);
+    }
+    args.extend(["--", "--test-threads=1"]);
+    if ignored {
+        args.push("--ignored");
+    }
+    Ok(Some(args))
+}
+
+// A later test binary/doc-test can fail to launch or compile after an earlier binary
+// printed passing tests. Counts alone cannot turn a failed cargo process into a pass.
+fn test_process_verdict(success: bool, output: &str) -> GateStatus {
+    let (mut passed, mut failed) = (0u64, 0u64);
+    for line in output.lines() {
+        if let Some(rest) = line.trim().strip_prefix("test result: ") {
+            for part in rest.split(';') {
+                let part = part.trim();
+                if let Some(n) = part.strip_suffix(" passed") {
+                    passed += n
+                        .split_whitespace()
+                        .next_back()
+                        .unwrap_or("0")
+                        .parse::<u64>()
+                        .unwrap_or(0);
+                } else if let Some(n) = part.strip_suffix(" failed") {
+                    failed += n
+                        .split_whitespace()
+                        .next_back()
+                        .unwrap_or("0")
+                        .parse::<u64>()
+                        .unwrap_or(0);
+                }
+            }
+        }
+    }
+    if !success || failed > 0 || passed == 0 {
+        GateStatus::Fail
+    } else {
+        GateStatus::Pass
+    }
 }
 
 /// G80-33 rules 3/4/5/6, evaluated per §69 checkbox id against the testkit registry.
@@ -912,6 +959,99 @@ mod tests {
         fs::read_to_string(TESTKIT_DOD_PATH).expect("registry must be readable")
     }
 
+    #[test]
+    fn failed_cargo_exit_cannot_be_hidden_by_an_earlier_passing_binary() {
+        let output = "test result: ok. 3 passed; 0 failed; 0 ignored; 4 filtered out\n";
+        assert_eq!(test_process_verdict(false, output), GateStatus::Fail);
+        assert_eq!(test_process_verdict(true, output), GateStatus::Pass);
+    }
+
+    #[test]
+    fn ignored_or_failed_tests_are_not_a_dod_pass() {
+        for output in [
+            "test result: ok. 0 passed; 0 failed; 3 ignored; 0 filtered out\n",
+            "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 filtered out\n",
+            "no test result\n",
+        ] {
+            assert_eq!(test_process_verdict(true, output), GateStatus::Fail);
+        }
+    }
+
+    #[test]
+    fn resource_dependent_verifiers_must_explicitly_run_ignored_tests() {
+        let normal = test_verifier_args("test::humaux-adapters::some_test")
+            .unwrap()
+            .unwrap();
+        let ignored = test_verifier_args("test-ignored::humaux-adapters::some_test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(normal, &ignored[..ignored.len() - 1]);
+        assert_eq!(ignored.last(), Some(&"--ignored"));
+        assert_eq!(normal.last(), Some(&"--test-threads=1"));
+        assert_eq!(
+            test_verifier_args("test-ignored-bin::humaux-adapters::contribution_pipeline")
+                .unwrap()
+                .unwrap(),
+            vec![
+                "test",
+                "--locked",
+                "-p",
+                "humaux-adapters",
+                "--test",
+                "contribution_pipeline",
+                "--",
+                "--test-threads=1",
+                "--ignored"
+            ]
+        );
+        assert!(test_verifier_args("test-ignored::humaux-adapters::").is_err());
+        assert!(test_verifier_args("test::missing_filter").is_err());
+        assert!(test_verifier_args("unregistered::test").unwrap().is_none());
+    }
+
+    #[test]
+    fn targeted_verifiers_keep_the_filter_and_select_a_single_binary() {
+        assert_eq!(
+            test_verifier_args("test-bin::humaux-adapters::scheduler_exactly_once::g32_1")
+                .unwrap()
+                .unwrap(),
+            vec![
+                "test",
+                "--locked",
+                "-p",
+                "humaux-adapters",
+                "--test",
+                "scheduler_exactly_once",
+                "g32_1",
+                "--",
+                "--test-threads=1"
+            ]
+        );
+        assert_eq!(
+            test_verifier_args("test-lib::humaux-application::public_evolve::tests")
+                .unwrap()
+                .unwrap(),
+            vec![
+                "test",
+                "--locked",
+                "-p",
+                "humaux-application",
+                "--lib",
+                "public_evolve::tests",
+                "--",
+                "--test-threads=1"
+            ]
+        );
+        for invalid in [
+            "test-bin::humaux-adapters::scheduler_exactly_once",
+            "test-bin::humaux-adapters::::filter",
+            "test-bin::humaux-adapters::scheduler_exactly_once::",
+            "test-lib::humaux-application::",
+        ] {
+            assert!(test_verifier_args(invalid).is_err(), "{invalid}");
+        }
+    }
+
     // -- section_69 / rule1 --------------------------------------------------------------
 
     #[test]
@@ -984,6 +1124,16 @@ mod tests {
     }
 
     #[test]
+    fn rule2_red_when_new_frozen_bound_has_no_checkbox() {
+        let section = fixture_section(&[(1, 0), (2, 8)], 3);
+        let entries = parse_checkbox_entries(&section);
+        let bounds = frozen_id_bounds(&section);
+        let r = check_rule2(&entries, bounds);
+        assert_eq!(r.status, GateStatus::Fail);
+        assert!(r.detail.contains("missing"));
+    }
+
+    #[test]
     fn rule2_red_on_phase_out_of_range() {
         let section = fixture_section(&[(1, 0), (2, 18)], 2);
         let entries = parse_checkbox_entries(&section);
@@ -1001,7 +1151,7 @@ mod tests {
         let bounds = frozen_id_bounds(section);
         let r = check_rule2(&entries, bounds);
         assert_eq!(r.status, GateStatus::Pass, "{}", r.detail);
-        assert_eq!(entries.len(), 94, "expected all 94 DoD ids to parse");
+        assert_eq!(entries.len(), 95, "expected all 95 DoD ids to parse");
     }
 
     // -- registry parsing / rule3 / rule6 ---------------------------------------------------

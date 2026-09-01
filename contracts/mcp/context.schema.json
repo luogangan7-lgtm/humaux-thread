@@ -1,0 +1,6 @@
+{
+  "type":"object",
+  "oneOf":[
+    {"x-humaux-operation":{"operation_key":"context.assemble","required_scope":"context:read","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"workspace_id":{"type":"string","format":"uuid"},"task_id":{"type":"string","format":"uuid"},"query":{"type":"string","minLength":1,"maxLength":4096},"limit":{"type":"integer","minimum":1,"maximum":100}},"additionalProperties":false}
+  ]
+}

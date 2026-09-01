@@ -1,0 +1,338 @@
+# Phase 9 corrective cutover: execution-root reservation authority is rechecked before the
+# first ledger/disclosure mutation. No provider call or historic closure rewrite occurs here.
+migration_id = "0133_contribution_self_principal_reservation_authority"
+class = "FORWARD_ONLY"
+
+precheck = """
+select
+  to_regclass('private.contribution_executions') is not null
+  and to_regclass('private.contribution_execution_sources') is not null
+  and to_regclass('ops.model_call_ledger') is not null
+  and to_regprocedure(
+    'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])'
+  ) is not null
+  and to_regprocedure(
+    'private.reserve_contribution_execution_call(uuid,uuid,uuid,text,integer,text,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'
+  ) is not null
+  and to_regprocedure(
+    'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'
+  ) is not null
+  and to_regprocedure(
+    'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'
+  ) is not null
+  and to_regprocedure(
+    'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'
+  ) is null
+  and to_regprocedure(
+    'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'
+  ) is null
+  and to_regprocedure(
+    'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])'
+  ) is null
+  and to_regprocedure('private.contribution_execution_closure_seal_immutable()') is null
+  and to_regprocedure('private.assert_contribution_prepared_route_shape(jsonb)') is null
+  and to_regprocedure(
+    'private.assert_current_contribution_reservation_authority(ops.model_call_ledger)'
+  ) is null
+  and to_regprocedure('ops.contribution_reservation_authority_validate()') is null
+  and not exists (
+    select 1 from pg_trigger
+    where tgrelid='control.workspaces'::regclass
+      and tgname='contribution_input_change'
+      and not tgisinternal
+  )
+  and not exists (
+    select 1 from pg_attribute
+    where attrelid='private.contribution_executions'::regclass and not attisdropped
+      and attname in (
+        'source_backing_closure_version','source_backing_closure_sha256','backing_link_count'
+      )
+  )
+  and not exists (
+    select 1 from private.contribution_executions
+    where state in ('READY_A','A_RESERVED','READY_B','B_RESERVED','READY_CANDIDATE')
+  )
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (
+    select count(*)=3
+      and bool_and(not attnotnull)
+      and bool_and(
+        (attname='source_backing_closure_version' and atttypid='smallint'::regtype)
+        or (attname='source_backing_closure_sha256' and atttypid='bytea'::regtype)
+        or (attname='backing_link_count' and atttypid='integer'::regtype)
+      )
+    from pg_attribute
+    where attrelid='private.contribution_executions'::regclass and not attisdropped
+      and attname in (
+        'source_backing_closure_version','source_backing_closure_sha256','backing_link_count'
+      )
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conrelid='private.contribution_executions'::regclass
+      and conname='contribution_executions_source_backing_closure_shape'
+      and contype='c' and convalidated
+      and position('source_backing_closure_version = 1' in pg_get_constraintdef(oid))>0
+      and position('source_backing_closure_sha256 IS NOT NULL' in pg_get_constraintdef(oid))>0
+      and position('backing_link_count IS NOT NULL' in pg_get_constraintdef(oid))>0
+      and position('octet_length(source_backing_closure_sha256) = 32' in pg_get_constraintdef(oid))>0
+      and position('backing_link_count >= 0' in pg_get_constraintdef(oid))>0
+      and position('FAILED_TERMINAL' in pg_get_constraintdef(oid))>0
+  )
+  and (
+    select count(*)=1
+      and bool_and(tgtype=27)
+      and bool_and(tgenabled='O')
+      and bool_and(tgfoid='ops.guard_contribution_input_change()'::regprocedure)
+      and bool_and(tgqual is null)
+    from pg_trigger
+    where tgrelid='control.workspaces'::regclass
+      and tgname='contribution_input_change'
+      and not tgisinternal
+  )
+  and (
+    select count(*)=9 and bool_and(
+      prosecdef
+      and proowner='role_migration_owner'::regrole
+      and proconfig=ARRAY['search_path=pg_catalog']::text[]
+    )
+    from pg_proc
+    where oid in (
+      'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])'::regprocedure,
+      'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])'::regprocedure,
+      'private.contribution_execution_closure_seal_immutable()'::regprocedure,
+      'private.require_contribution_source_manifest()'::regprocedure,
+      'private.assert_contribution_prepared_route_shape(jsonb)'::regprocedure,
+      'private.assert_current_contribution_reservation_authority(ops.model_call_ledger)'::regprocedure,
+      'ops.contribution_reservation_authority_validate()'::regprocedure,
+      'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure,
+      'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure
+    )
+  )
+  and (
+    select count(*)=1 from pg_trigger
+    where tgrelid='ops.model_call_ledger'::regclass
+      and tgname='contribution_reservation_authority_validate'
+      and not tgisinternal and tgenabled='O'
+      and tgtype=7 and tgqual is not null
+      and tgfoid='ops.contribution_reservation_authority_validate()'::regprocedure
+      and pg_get_triggerdef(oid)=
+        'CREATE TRIGGER contribution_reservation_authority_validate BEFORE INSERT ON ops.model_call_ledger FOR EACH ROW WHEN ((new.purpose = ''CONTRIBUTION_DEIDENTIFY''::text)) EXECUTE FUNCTION ops.contribution_reservation_authority_validate()'
+  )
+  and (
+    select count(*)=1 from pg_trigger
+    where tgrelid='private.contribution_executions'::regclass
+      and tgname='contribution_execution_closure_seal_immutable'
+      and not tgisinternal and tgenabled='O'
+      and tgtype=19 and tgqual is null
+      and tgfoid='private.contribution_execution_closure_seal_immutable()'::regprocedure
+  )
+  and (
+    select count(*)=2
+      and bool_and(tgenabled='O')
+      and bool_and(not tgisinternal)
+      and bool_and(tgtype=5)
+      and bool_and(tgqual is null)
+    from pg_trigger
+    where (
+      (tgname='contribution_execution_manifest_complete'
+       and tgrelid='private.contribution_executions'::regclass)
+      or (tgname='contribution_execution_sources_complete'
+          and tgrelid='private.contribution_execution_sources'::regclass)
+    )
+      and tgfoid='private.require_contribution_source_manifest()'::regprocedure
+      and tgdeferrable and tginitdeferred
+  )
+  and (
+    select count(*)=3
+      and bool_and(tgenabled='O')
+      and bool_and(tgqual is null)
+      and bool_and(tgfoid='ops.guard_contribution_input_change()'::regprocedure)
+    from pg_trigger
+    where tgname='contribution_input_change' and not tgisinternal
+      and (
+        (tgrelid='private.memory_evidence'::regclass and tgtype=31)
+        or (tgrelid='private.evidence_objects'::regclass and tgtype=27)
+        or (tgrelid='private.memory_records'::regclass and tgtype=27)
+      )
+  )
+  and has_function_privilege(
+    'role_private_worker',
+    'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])',
+    'EXECUTE'
+  )
+  and not has_function_privilege(
+    'role_private_worker',
+    'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)',
+    'EXECUTE'
+  )
+  and not has_function_privilege(
+    'role_private_worker',
+    'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)',
+    'EXECUTE'
+  )
+  and has_function_privilege(
+    'role_private_worker',
+    'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)',
+    'EXECUTE'
+  )
+  and has_function_privilege(
+    'role_private_worker',
+    'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)',
+    'EXECUTE'
+  )
+  and not exists (
+    select 1
+    from unnest(ARRAY[
+      'role_admin','role_gateway','role_consolidation_worker','role_public_worker',
+      'role_retrieval_worker','role_batch_issuer','role_maintenance'
+    ]::text[]) role_name
+    cross join unnest(ARRAY[
+      'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])',
+      'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)',
+      'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'
+    ]::text[]) signature
+    where has_function_privilege(role_name,signature,'EXECUTE')
+  )
+  and not exists (
+    select 1
+    from unnest(ARRAY[
+      'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])',
+      'private.contribution_execution_closure_seal_immutable()',
+      'private.require_contribution_source_manifest()',
+      'private.assert_contribution_prepared_route_shape(jsonb)',
+      'private.assert_current_contribution_reservation_authority(ops.model_call_ledger)',
+      'ops.contribution_reservation_authority_validate()',
+      'private.reserve_contribution_execution_call(uuid,uuid,uuid,text,integer,text,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'
+    ]::text[]) signature
+    cross join unnest(ARRAY[
+      'role_admin','role_gateway','role_private_worker','role_consolidation_worker',
+      'role_public_worker','role_retrieval_worker','role_batch_issuer','role_maintenance'
+    ]::text[]) role_name
+    where has_function_privilege(role_name,signature,'EXECUTE')
+  )
+  and not exists (
+    select 1
+    from unnest(ARRAY[
+      'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])',
+      'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])',
+      'private.contribution_execution_closure_seal_immutable()',
+      'private.require_contribution_source_manifest()',
+      'private.assert_contribution_prepared_route_shape(jsonb)',
+      'private.assert_current_contribution_reservation_authority(ops.model_call_ledger)',
+      'ops.contribution_reservation_authority_validate()',
+      'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)',
+      'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'
+    ]::text[]) signature
+    where has_function_privilege(0,signature,'EXECUTE')
+  )
+  and position('HUMAUX_CONTRIBUTION_SOURCE_BACKING_CLOSURE' in pg_get_functiondef(
+    'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])'::regprocedure
+  ))>0
+  and position('int4send(direct.direct_ordinal)' in pg_get_functiondef(
+    'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])'::regprocedure
+  ))>0
+  and position('backing.role' in pg_get_functiondef(
+    'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])'::regprocedure
+  ))>0
+  and position('backing.ordinal' in pg_get_functiondef(
+    'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])'::regprocedure
+  ))>0
+  and position('convert_to(encoded.backing_role,''UTF8'')' in pg_get_functiondef(
+    'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])'::regprocedure
+  ))>0
+  and position('evidence.payload_sha256' in pg_get_functiondef(
+    'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])'::regprocedure
+  ))>0
+  and position('evidence.data_class' in pg_get_functiondef(
+    'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])'::regprocedure
+  ))>0
+  and position('evidence.reasoning_domain_id' in pg_get_functiondef(
+    'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])'::regprocedure
+  ))>0
+  and position('visibility_workspace_id' in pg_get_functiondef(
+    'private.compute_contribution_source_backing_closure_v1(uuid,uuid,uuid,text[],uuid[],bytea[])'::regprocedure
+  ))>0
+  and position('private.compute_contribution_source_backing_closure_v1' in pg_get_functiondef(
+    'private.require_contribution_source_manifest()'::regprocedure
+  ))>0
+  and position('source_backing_closure_sha256' in pg_get_functiondef(
+    'private.require_contribution_source_manifest()'::regprocedure
+  ))>0
+  and position('ops.lock_contribution_inputs()' in pg_get_functiondef(
+    'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])'::regprocedure
+  ))>0
+  and position('ops.lock_contribution_inputs()' in pg_get_functiondef(
+    'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])'::regprocedure
+  )) < position('contribution-enqueue:' in pg_get_functiondef(
+    'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])'::regprocedure
+  ))
+  and position('source_backing_closure_version' in pg_get_functiondef(
+    'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])'::regprocedure
+  ))>0
+  and position('root_match_count <> 1' in pg_get_functiondef(
+    'private.assert_current_contribution_reservation_authority(ops.model_call_ledger)'::regprocedure
+  ))>0
+  and position('private.compute_contribution_source_backing_closure_v1' in pg_get_functiondef(
+    'private.assert_current_contribution_reservation_authority(ops.model_call_ledger)'::regprocedure
+  ))>0
+  and position('source_backing_closure_sha256' in pg_get_functiondef(
+    'private.assert_current_contribution_reservation_authority(ops.model_call_ledger)'::regprocedure
+  ))>0
+  and position('policy.effective_to IS NULL' in pg_get_functiondef(
+    'private.assert_current_contribution_reservation_authority(ops.model_call_ledger)'::regprocedure
+  ))>0
+  and position('resolve_user_reasoning_admission' in pg_get_functiondef(
+    'private.assert_current_contribution_reservation_authority(ops.model_call_ledger)'::regprocedure
+  ))>0
+  and position('processor_model_id' in pg_get_functiondef(
+    'private.assert_current_contribution_reservation_authority(ops.model_call_ledger)'::regprocedure
+  ))>0
+  and position('humaux.contribution_prepared_route' in pg_get_functiondef(
+    'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure
+  ))>0
+  and position('ops.lock_contribution_inputs()' in pg_get_functiondef(
+    'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure
+  ))>0
+  and position('private.reserve_contribution_execution_call' in pg_get_functiondef(
+    'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure
+  ))>0
+  and position('ops.lock_contribution_inputs()' in pg_get_functiondef(
+    'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure
+  )) < position('private.reserve_contribution_execution_call' in pg_get_functiondef(
+    'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure
+  ))
+  and position('humaux.contribution_prepared_route' in pg_get_functiondef(
+    'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure
+  ))>0
+  and position('ops.lock_contribution_inputs()' in pg_get_functiondef(
+    'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure
+  ))>0
+  and position('private.reserve_contribution_execution_call' in pg_get_functiondef(
+    'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure
+  ))>0
+  and position('ops.lock_contribution_inputs()' in pg_get_functiondef(
+    'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure
+  )) < position('private.reserve_contribution_execution_call' in pg_get_functiondef(
+    'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint,jsonb)'::regprocedure
+  ))
+  and not exists (
+    select 1 from private.contribution_executions
+    where source_backing_closure_version is null
+      and state in ('READY_A','A_RESERVED','READY_B','B_RESERVED','READY_CANDIDATE')
+  )
+  and not exists (
+    select 1 from private.contribution_executions
+    where num_nonnulls(
+      source_backing_closure_version,source_backing_closure_sha256,backing_link_count
+    ) not in (0,3)
+  )
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward-fix only after deployment. Never infer or backfill a historic closure for a pre-0133 terminal root, rewrite terminal history, or restore runtime EXECUTE on the 14-argument wrappers."
+backup_restore_requirement = "Production apply requires an explicit restore point, approval, and a proven drain of every nonterminal 0131 root. Acceptance uses only disposable PostgreSQL 18, verifies failed cutover leaves no partial DDL/data change, then removes the task container."

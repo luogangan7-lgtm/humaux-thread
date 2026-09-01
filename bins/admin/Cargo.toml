@@ -16,6 +16,8 @@ workspace = true
 # `{crates/infra-egress/Cargo.toml, crates/infra-cell/Cargo.toml}`; this crate reaches
 # `reqwest`'s types only transitively, through `humaux-infra-cell`'s own re-export.
 humaux-infra-cell = { path = "../../crates/infra-cell" }
+humaux-adapters = { path = "../../crates/adapters" }
+humaux-contracts = { path = "../../crates/contracts" }
 # `HttpIntraCellTransport::execute` is async; `main` stays sync (this binary has exactly one
 # probe that needs a runtime so far) — `cell_resources::run` opens a small dedicated runtime
 # rather than making every subcommand async.

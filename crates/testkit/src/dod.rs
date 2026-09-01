@@ -29,6 +29,13 @@ pub struct DodVerifier {
     /// one of `xtask architecture-check`'s own sub-checks verbatim (the `name` string in
     /// that subcommand's `checks` vec) — `dod_check.rs` runs that subcommand and matches its
     /// per-check report line against `<name>` to get pass/fail (G80-33 rule 5).
+    /// `test::<package>::<filter>` executes ordinary tests; `test-ignored::` explicitly
+    /// executes ignored integration tests with the same package/filter format. Missing
+    /// required resources or zero executed tests cannot yield a passing verifier.
+    /// `test-ignored-bin::<package>::<binary>` runs all ignored tests in one integration
+    /// binary when a contract requires several complementary positive/negative cases.
+    /// `test-bin::<package>::<binary>::<filter>` and `test-lib::<package>::<filter>`
+    /// select one Cargo target without changing its filter or acceptance conditions.
     pub verifier_ref: &'static str,
 }
 
@@ -51,7 +58,7 @@ pub const PHASE_0: &[DodVerifier] = &[
         // 与 typed IDs 无关（ADR-0001 同批更正）。
         fault: "parse_rejects_garbage",
         kind: "test",
-        verifier_ref: "test::humaux-domain::ids",
+        verifier_ref: "test-lib::humaux-domain::ids",
     },
     DodVerifier {
         id: "DOD-003",
@@ -94,7 +101,7 @@ pub const PHASE_3: &[DodVerifier] = &[DodVerifier {
     // dod-check 跟着判 Pass——一条空跑的绿。
     fault: "g32_1_fault_injection_unique_constraint_is_the_final_arbiter",
     kind: "test",
-    verifier_ref: "test::humaux-adapters::g32_1_exactly_once_enqueue_survives_concurrent_replicas_and_leader_failover",
+    verifier_ref: "test-bin::humaux-adapters::scheduler_exactly_once::g32_1_exactly_once_enqueue_survives_concurrent_replicas_and_leader_failover",
 }];
 
 /// Phase 4 registrations —— **空 slice 是真值，不是占位**：本轮 2 条 phase 4 的 DoD
@@ -118,7 +125,7 @@ pub const PHASE_6: &[DodVerifier] = &[
         // 提交」）——只活在注释里的注错无人能复跑，历史见证不是判据。
         fault: "banned_cross_txn_offset_pagination_exhibits_both_duplicates_and_misses",
         kind: "test",
-        verifier_ref: "test::humaux-adapters::snapshot_survives_concurrent_higher_ranked_inserts",
+        verifier_ref: "test-bin::humaux-adapters::consolidate_snapshot::snapshot_survives_concurrent_higher_ranked_inserts",
     },
     DodVerifier {
         id: "DOD-010",
@@ -134,7 +141,7 @@ pub const PHASE_6: &[DodVerifier] = &[
         // 封死「用召回冒充 total」。
         fault: "fault_recall_count_cannot_overrun_the_denominator",
         kind: "test",
-        verifier_ref: "test::humaux-adapters::all_cases_match_expected_readouts",
+        verifier_ref: "test-bin::humaux-adapters::exact_completeness_eval::all_cases_match_expected_readouts",
     },
 ];
 
@@ -157,7 +164,7 @@ pub const PHASE_8: &[DodVerifier] = &[DodVerifier {
     // 复原后绿。
     fault: "recheck_required_rows_are_diverted_and_named_not_minted",
     kind: "test",
-    verifier_ref: "test::humaux-adapters::a_live_unversioned_constraint_is_diverted_and_named_not_consumed",
+    verifier_ref: "test-bin::humaux-adapters::mandatory_context_lane::a_live_unversioned_constraint_is_diverted_and_named_not_consumed",
 }];
 
 /// Phase 7 registrations — §69 Retrieval 量具面。
@@ -179,7 +186,7 @@ pub const PHASE_7: &[DodVerifier] = &[
         // envelope 侧观测，classify() 看不见也不该看见）。
         fault: "g25_1_fault_a_compile_that_drops_mandatory_is_visible_in_the_observable",
         kind: "test",
-        verifier_ref: "test::humaux-retrieval::one_mandatory_survives_two_hundred_higher_scoring_supplementals",
+        verifier_ref: "test-lib::humaux-retrieval::one_mandatory_survives_two_hundred_higher_scoring_supplementals",
     },
     DodVerifier {
         id: "DOD-017",
@@ -191,5 +198,67 @@ pub const PHASE_7: &[DodVerifier] = &[
         fault: "g80_2_fails_with_second_construction_site_in_real_evals_dir",
         kind: "gate",
         verifier_ref: "architecture-check::§55.1 G80-2 (build_request sole construction point)",
+    },
+];
+
+/// Phase 9 local release/trust verifiers. Deployment applicability/recursive evolution
+/// remains a separate obligation; these registrations do not activate Phase 10.
+pub const PHASE_9: &[DodVerifier] = &[
+    DodVerifier {
+        id: "DOD-050",
+        phase: 9,
+        // Public facts enter through a source-backed release boundary. The negative control
+        // attempts the empty-source shape and must be rejected before any public LLM capability
+        // can turn it into a fact; this is a runnable fault probe, not a vocabulary grep.
+        fault: "release_rejects_empty_sources",
+        kind: "test",
+        verifier_ref: "test-lib::humaux-domain::release_rejects_empty_sources",
+    },
+    DodVerifier {
+        id: "DOD-051",
+        phase: 9,
+        fault: "scan_failure_or_changed_payload_creates_no_candidate_or_release",
+        kind: "test",
+        verifier_ref: "test-ignored-bin::humaux-adapters::contribution_pipeline",
+    },
+    DodVerifier {
+        id: "DOD-052",
+        phase: 9,
+        // Removing either SUT grouping predicate made 100 copied sources count as100.
+        // Restored source returned to 9/9. Known-link groups do not prove epistemic
+        // independence; missing identities remain explicitly incomplete (§12.6).
+        fault: "copied_content_does_not_gain_support_from_distinct_publisher_ids",
+        kind: "test",
+        verifier_ref: "test-lib::humaux-application::public_evolve::tests",
+    },
+    DodVerifier {
+        id: "DOD-053",
+        phase: 9,
+        // Widening the real eligible_objects view to include quarantine killed this
+        // serving assertion; restoring its exact definition/owner/ACL returned green.
+        fault: "quarantine_is_durable_but_not_retrievable_and_revoked_or_disabled_moderator_cannot_mutate",
+        kind: "test",
+        verifier_ref: "test-ignored-bin::humaux-adapters::public_trust",
+    },
+    DodVerifier {
+        id: "DOD-054",
+        phase: 9,
+        // The assessed global-queue path proves the active anonymous root/lifecycle, identity-safe
+        // receipt surface, and ACL reverse reachability: evaluate carries the exact lifecycle
+        // revision, stale projection is rejected, and revoke removes both receipt eligibility
+        // and serving eligibility. It does not claim coverage beyond this verifier's cases.
+        fault: "assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_closed",
+        kind: "test",
+        verifier_ref: "test-ignored-bin::humaux-adapters::public_runtime::assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_closed",
+    },
+    DodVerifier {
+        id: "DOD-055",
+        phase: 9,
+        // A live observation with an inflated markdown bootstrap value is the negative control:
+        // without the required denominator/e2e evidence it remains NOT_APPLICABLE_YET and does
+        // not start resident evolution.
+        fault: "real_observation_freshness_and_denominator_never_use_bootstrap",
+        kind: "test",
+        verifier_ref: "test-ignored-bin::humaux-adapters::mechanism_observation::real_observation_freshness_and_denominator_never_use_bootstrap",
     },
 ];

@@ -25,6 +25,8 @@ workspace = true
 # enum. One entry, not two/three — merged after concurrent-edit conflicts across this task's
 # parallel T7.x agents (admission.rs / T7.1 / failover-health-metrics-gate).
 humaux-domain = { path = "../domain" }
+# Concrete pinned local scanner owns sealed egress construction.
+humaux-local-secret-scan = { path = "../local-secret-scan" }
 # T7.1 (§19 Architecture Gate "Every external retrieval call passes EgressPolicy"): the real
 # DashScope adapter's sole HTTP transport — Layer 1A `ExternalCall`/`HttpExternalCall`. This
 # crate does not depend on `humaux-infra-network`/`reqwest` directly (no raw-client
@@ -53,6 +55,8 @@ uuid = "1.25.0"
 tracing = "0.1.44"
 
 [dev-dependencies]
+humaux-projection = { path = "../projection" }
+humaux-retrieval = { path = "../retrieval" }
 # Contract Tests (§19) drive the `#[async_trait]` methods from plain `#[test]` fns.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # `dashscope_live_smoke`'s state-1 (key-present) gate reads `DASHSCOPE_API_KEY` through the

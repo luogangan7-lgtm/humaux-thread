@@ -1,0 +1,9 @@
+error[E0451]: fields `queries` and `payload` of struct `SerializedRetrievalQueryBatch` are private
+  --> tests/ui/fail_construct_query_wire_binding.rs:10:9
+   |
+ 9 |     let _ = SerializedRetrievalQueryBatch {
+   |             ----------------------------- in this type
+10 |         queries,
+   |         ^^^^^^^ private field
+11 |         payload: AuthorizedEgressPayload::new(b"unrelated wire".to_vec()),
+   |         ^^^^^^^ private field

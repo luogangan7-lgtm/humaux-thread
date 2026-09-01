@@ -1,0 +1,37 @@
+migration_id = "0127_phase9_anonymous_dispatch_rls_bridge"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('public.admit_anonymous_dispatch(uuid,text,integer)') is null
+  and to_regprocedure('public.revoke_anonymous_dispatch(uuid,text,integer)') is null as precheck_ok
+"""
+
+postcheck = """
+select to_regprocedure('public.admit_anonymous_dispatch(uuid,text,integer)') is not null
+  and to_regprocedure('public.revoke_anonymous_dispatch(uuid,text,integer)') is not null
+  and has_function_privilege('role_public_worker','public.admit_anonymous_dispatch(uuid,text,integer)','EXECUTE')
+  and has_function_privilege('role_public_worker','public.revoke_anonymous_dispatch(uuid,text,integer)','EXECUTE')
+  and not has_function_privilege('role_public_worker','public.admit_anonymous_source(uuid,bytea,bigint)','EXECUTE')
+  and not has_function_privilege('role_public_worker','public.revoke_anonymous_source(uuid,bytea,bigint)','EXECUTE')
+  and exists(select 1 from pg_policies where schemaname='ops' and tablename='outbox'
+    and policyname='outbox_phase9_owner_dispatch_read' and roles=array['role_migration_owner']::name[])
+  and (select prosecdef from pg_proc where oid='public.admit_anonymous_dispatch(uuid,text,integer)'::regprocedure)
+  and (select prosecdef from pg_proc where oid='public.revoke_anonymous_dispatch(uuid,text,integer)'::regprocedure)
+  and (select prosecdef from pg_proc where oid='ops.enqueue_public_projection_from_anonymous_dispatch(uuid,text,integer,uuid,uuid,bigint)'::regprocedure)
+  and (select prosecdef from pg_proc where oid='public.require_object_outbox()'::regprocedure)
+  and (select proowner='role_migration_owner'::regrole from pg_proc
+    where oid='public.require_object_outbox()'::regprocedure)
+  and (select proconfig=array['search_path=pg_catalog']::text[] from pg_proc
+    where oid='public.admit_anonymous_dispatch(uuid,text,integer)'::regprocedure)
+  and (select proconfig=array['search_path=pg_catalog']::text[] from pg_proc
+    where oid='public.revoke_anonymous_dispatch(uuid,text,integer)'::regprocedure)
+  and (select proconfig=array['search_path=pg_catalog']::text[] from pg_proc
+    where oid='ops.enqueue_public_projection_from_anonymous_dispatch(uuid,text,integer,uuid,uuid,bigint)'::regprocedure)
+  and (select proconfig=array['search_path=pg_catalog']::text[] from pg_proc
+    where oid='public.require_object_outbox()'::regprocedure)
+  and not has_table_privilege('role_public_worker','ops.outbox','SELECT')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Preserve anonymous dispatch rows and repair bridge behavior in a later migration."
+backup_restore_requirement = "Apply to an isolated PostgreSQL acceptance fixture before production rollout. The migration removes direct anonymous admit/revoke execution from role_public_worker."

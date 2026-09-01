@@ -1,0 +1,22 @@
+migration_id = "0105_release_source_tenant_policy"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select exists (select 1 from pg_constraint where conname='release_sources_tenant_release_fk')
+  and exists (select 1 from pg_policies where schemaname='staging'
+    and tablename='contribution_release_sources'
+    and policyname='contribution_release_sources_tenant') as precheck_ok
+"""
+postcheck = """
+select exists (select 1 from pg_policies where schemaname='staging'
+  and tablename='contribution_release_sources' and cmd='ALL'
+  and policyname='contribution_release_sources_tenant'
+  and qual like '%tenant_id =%NULLIF%humaux.tenant_id%'
+  and with_check like '%tenant_id =%NULLIF%humaux.tenant_id%') as postcheck_ok
+"""
+rollback_or_forward_fix = """
+Forward fix with an equivalent tenant equality policy plus the 0104 composite tenant FK.
+Do not remove USING, WITH CHECK, FORCE RLS or the FK to make a check pass. If needed,
+restore 0103's parent EXISTS policy (with the FK intact), not an unrestricted predicate.
+"""
+backup_restore_requirement = "Policy-only change, no row mutation. Production requires a schema backup and approval; this run targets only disposable local PostgreSQL."

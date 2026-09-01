@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "oneOf": [
+    {
+      "x-humaux-operation": {
+        "operation_key": "continuity.get",
+        "required_scope": "context:read",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "required": ["project_id"],
+      "properties": {
+        "workspace_id": {"type":"string","format":"uuid"},
+        "project_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-7[0-9A-Fa-f]{3}-[89AaBb][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$"
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

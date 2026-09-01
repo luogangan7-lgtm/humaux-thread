@@ -17,8 +17,8 @@ use humaux_adapters::consolidate_repo::{self, ConsolidateRepoError, PublishOutco
 use humaux_adapters::postgres::ConsolidationDbPool;
 use humaux_application::consolidate::{
     ContentSha256, NextStep, PrivateReasoningDomainId, PrivateReasoningError, PrivateReasoningPort,
-    PrivateReasoningPurpose, PrivateReasoningResult, SealedPrivateReasoningRequest,
-    UserReasoningProfileVersion, next_step,
+    PrivateReasoningPurpose, PrivateReasoningResult, ReasoningRouteBindingId,
+    ReasoningRouteBindingVersion, SealedPrivateReasoningRequest, next_step,
 };
 use humaux_domain::authority::{AuthorityClass, EvidenceId};
 use humaux_domain::consolidate::AutoMutableMemoryId;
@@ -49,12 +49,9 @@ fn compute_input_manifest_hash(inputs: &[consolidate_repo::MaterializedInput]) -
 /// port and publish. `port` is `&dyn` — see module doc for why this crate never names a
 /// concrete inference client type.
 ///
-/// `profile_version` is caller-supplied rather than looked up here: `role_consolidation_worker`
-/// has no path to a real `UserReasoningProfile` (that lookup needs `humaux.user_id` set under
-/// `control.user_reasoning_profiles`'s owner-scoped RLS policy, which this binary — deliberately
-/// BYOK-capability-free, see module doc — never sets); a caller that *does* hold that context
-/// (T4.4/T4.5's own resolution step) passes the real version through instead of this binary
-/// fabricating one.
+/// `binding_id` plus `binding_version` is the caller's exact immutable Phase 9 R3 authority.
+/// This BYOK-capability-free worker only seals and forwards that pair; the private worker must
+/// resolve and admit it immediately before private materialization or provider dispatch.
 ///
 /// `build_rollup` receives the actual [`PrivateReasoningResult`] (not just the id list) so its
 /// `output_bytes` are never silently discarded (§11.5.1: a `RunInference` call that then throws
@@ -71,7 +68,8 @@ pub async fn run_once(
     port: &dyn PrivateReasoningPort,
     tenant_id: Uuid,
     reasoning_domain_id: Uuid,
-    profile_version: UserReasoningProfileVersion,
+    binding_id: ReasoningRouteBindingId,
+    binding_version: ReasoningRouteBindingVersion,
     workspace_id: Option<Uuid>,
     max_inputs: i64,
     build_rollup: impl FnOnce(
@@ -128,9 +126,11 @@ pub async fn run_once(
             let manifest_hash = compute_input_manifest_hash(&inputs);
             let req = SealedPrivateReasoningRequest {
                 reasoning_domain_id: PrivateReasoningDomainId(reasoning_domain_id),
-                profile_version,
+                binding_id,
+                binding_version,
                 input_manifest_hash: manifest_hash,
                 purpose: PrivateReasoningPurpose::Consolidate,
+                contribution_attempt: None,
             };
             let inference = port.infer(req).await?;
             let (content, rollup_class, sources) = build_rollup(&auto_ids, &inference)?;

@@ -11,7 +11,8 @@
 use humaux_adapters::postgres::ConsolidationDbPool;
 use humaux_application::consolidate::{
     ContentSha256, PrivateReasoningError, PrivateReasoningPort, PrivateReasoningResult,
-    ProviderTraceRef, SealedPrivateReasoningRequest, UserReasoningProfileVersion,
+    ProviderTraceRef, ReasoningRouteBindingId, ReasoningRouteBindingVersion,
+    SealedPrivateReasoningRequest,
 };
 use humaux_consolidation_worker::{RunOnceError, run_once};
 use humaux_domain::authority::{AuthorityClass, EvidenceId};
@@ -199,6 +200,9 @@ fn run_once_skips_inference_when_no_inputs() {
                 output_bytes: b"unused".to_vec(),
                 output_sha256: ContentSha256([0u8; 32]),
                 provider_trace: ProviderTraceRef("unused".into()),
+                model_call_id: Uuid::from_u128(0x2001),
+                binding_id: ReasoningRouteBindingId(Uuid::from_u128(0x1001)),
+                binding_version: ReasoningRouteBindingVersion(1),
             },
         };
 
@@ -207,7 +211,8 @@ fn run_once_skips_inference_when_no_inputs() {
             &port,
             handle.tenant_id,
             handle.reasoning_domain_id,
-            UserReasoningProfileVersion(1),
+            ReasoningRouteBindingId(Uuid::from_u128(0x1001)),
+            ReasoningRouteBindingVersion(1),
             None,
             10_000,
             |_ids, _result| panic!("build_rollup must not be called on the empty-input path"),
@@ -244,6 +249,9 @@ fn run_once_publishes_rollup_from_inference_result() {
                     output_bytes: b"the actual inference output".to_vec(),
                     output_sha256: ContentSha256([9u8; 32]),
                     provider_trace: ProviderTraceRef("trace-e2e".into()),
+                    model_call_id: Uuid::from_u128(0x2001),
+                    binding_id: ReasoningRouteBindingId(Uuid::from_u128(0x1001)),
+                    binding_version: ReasoningRouteBindingVersion(1),
                 },
             };
 
@@ -254,7 +262,10 @@ fn run_once_publishes_rollup_from_inference_result() {
                     &port,
                     handle.tenant_id,
                     handle.reasoning_domain_id,
-                    UserReasoningProfileVersion(1),
+                    // This fake-port E2E proves exact Binding pair propagation only. It does not
+                    // exercise or claim the private-worker database admission resolver.
+                    ReasoningRouteBindingId(Uuid::from_u128(0x1001)),
+                    ReasoningRouteBindingVersion(1),
                     None,
                     10_000,
                     |ids, result| {

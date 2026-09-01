@@ -1,0 +1,157 @@
+# Phase 9 corrective migration: contribution policy history remains in the authoritative table.
+migration_id = "0132_contribution_policy_lifecycle"
+class = "FORWARD_ONLY"
+
+precheck = """
+select
+  not exists (
+    select 1
+    from private.contribution_executions e
+    left join control.contribution_policies p
+      on (p.tenant_id,p.policy_id,p.policy_version)
+       =(e.tenant_id,e.policy_id,e.policy_version)
+    where p.policy_id is null
+  )
+  and not exists (
+    select 1
+    from staging.contribution_candidates c
+    left join control.contribution_policies p
+      on (p.tenant_id,p.policy_id,p.policy_version)
+       =(c.tenant_id,c.policy_id,c.policy_version)
+    where p.policy_id is null
+  )
+  and (
+    select count(*)=6
+    from pg_constraint
+    where (conrelid,conname,pg_get_constraintdef(oid)) in (
+      ('control.contribution_policies'::regclass,'contribution_policies_pkey',
+       'PRIMARY KEY (policy_id)'),
+      ('control.contribution_policies'::regclass,'contribution_policy_one_per_tenant',
+       'UNIQUE (tenant_id)'),
+      ('control.contribution_policies'::regclass,'contribution_policy_tenant_key',
+       'UNIQUE (tenant_id, policy_id)'),
+      ('control.contribution_policies'::regclass,'contribution_policies_tenant_version_unique',
+       'UNIQUE (tenant_id, policy_id, policy_version)'),
+      ('staging.contribution_candidates'::regclass,
+       'contribution_candidates_tenant_id_policy_id_fkey',
+       'FOREIGN KEY (tenant_id, policy_id) REFERENCES control.contribution_policies(tenant_id, policy_id)'),
+      ('private.contribution_executions'::regclass,'contribution_executions_policy_fk',
+       'FOREIGN KEY (tenant_id, policy_id, policy_version) REFERENCES control.contribution_policies(tenant_id, policy_id, policy_version)')
+    )
+  )
+  and not exists (
+    select 1 from pg_attribute
+    where attrelid='control.contribution_policies'::regclass
+      and attname in ('effective_from','effective_to') and not attisdropped
+  )
+  and to_regprocedure(
+    'control.append_contribution_policy_successor(uuid,uuid,bigint,boolean,text,text,text,text,text,text)'
+  ) is null
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (
+    select count(*)=2
+      and bool_and(
+        (attname='effective_from' and attnotnull and not atthasdef and atttypid='timestamptz'::regtype)
+        or (attname='effective_to' and not attnotnull and not atthasdef and atttypid='timestamptz'::regtype)
+      )
+    from pg_attribute
+    where attrelid='control.contribution_policies'::regclass
+      and attname in ('effective_from','effective_to') and not attisdropped
+  )
+  and (
+    select count(*)=5
+    from pg_constraint
+    where convalidated and (conrelid,conname,pg_get_constraintdef(oid)) in (
+      ('control.contribution_policies'::regclass,'contribution_policies_pkey',
+       'PRIMARY KEY (policy_id, policy_version)'),
+      ('control.contribution_policies'::regclass,'contribution_policies_tenant_version_unique',
+       'UNIQUE (tenant_id, policy_id, policy_version)'),
+      ('control.contribution_policies'::regclass,'contribution_policies_effective_interval_check',
+       'CHECK ((isfinite(effective_from) AND ((effective_to IS NULL) OR (isfinite(effective_to) AND (effective_to > effective_from)))))'),
+      ('staging.contribution_candidates'::regclass,'contribution_candidates_policy_version_fk',
+       'FOREIGN KEY (tenant_id, policy_id, policy_version) REFERENCES control.contribution_policies(tenant_id, policy_id, policy_version)'),
+      ('private.contribution_executions'::regclass,'contribution_executions_policy_fk',
+       'FOREIGN KEY (tenant_id, policy_id, policy_version) REFERENCES control.contribution_policies(tenant_id, policy_id, policy_version)')
+    )
+  )
+  and not exists (
+    select 1 from pg_constraint
+    where conrelid in (
+      'control.contribution_policies'::regclass,
+      'staging.contribution_candidates'::regclass
+    ) and conname in (
+      'contribution_policy_one_per_tenant',
+      'contribution_policy_tenant_key',
+      'contribution_candidates_tenant_id_policy_id_fkey'
+    )
+  )
+  and pg_get_indexdef('control.contribution_policies_one_open_head_per_tenant'::regclass)=
+    'CREATE UNIQUE INDEX contribution_policies_one_open_head_per_tenant ON control.contribution_policies USING btree (tenant_id) WHERE (effective_to IS NULL)'
+  and (
+    select count(*)=1
+    from pg_trigger
+    where tgrelid='control.contribution_policies'::regclass
+      and tgname='contribution_policy_lifecycle' and not tgisinternal
+      and tgfoid='control.guard_contribution_policy_lifecycle()'::regprocedure
+  )
+  and not exists (
+    select 1 from pg_trigger
+    where tgrelid='control.contribution_policies'::regclass
+      and tgname='contribution_input_change' and not tgisinternal
+  )
+  and (
+    select prosecdef and proowner='role_migration_owner'::regrole
+      and proconfig=ARRAY['search_path=pg_catalog']::text[]
+    from pg_proc
+    where oid='control.append_contribution_policy_successor(uuid,uuid,bigint,boolean,text,text,text,text,text,text)'::regprocedure
+  )
+  and not has_function_privilege(0,
+    'control.append_contribution_policy_successor(uuid,uuid,bigint,boolean,text,text,text,text,text,text)',
+    'EXECUTE')
+  and not exists (
+    select 1 from unnest(ARRAY[
+      'role_admin','role_gateway','role_private_worker','role_consolidation_worker',
+      'role_public_worker','role_retrieval_worker','role_batch_issuer','role_maintenance'
+    ]::text[]) role_name
+    where has_function_privilege(role_name,
+      'control.append_contribution_policy_successor(uuid,uuid,bigint,boolean,text,text,text,text,text,text)',
+      'EXECUTE')
+  )
+  and not exists (
+    select 1 from unnest(ARRAY[
+      'role_admin','role_gateway','role_private_worker','role_consolidation_worker',
+      'role_public_worker','role_retrieval_worker','role_batch_issuer','role_maintenance'
+    ]::text[]) role_name
+    where has_table_privilege(role_name,'control.contribution_policies','INSERT,UPDATE,DELETE,TRUNCATE')
+  )
+  and (
+    select relrowsecurity and relforcerowsecurity and relowner='role_migration_owner'::regrole
+    from pg_class where oid='control.contribution_policies'::regclass
+  )
+  and position('OLD.effective_to IS NOT NULL' in pg_get_functiondef(
+    'control.guard_contribution_policy_lifecycle()'::regprocedure))>0
+  and position('prior.policy_version+1' in pg_get_functiondef(
+    'control.guard_contribution_policy_lifecycle()'::regprocedure))>0
+  and position('transaction_isolation' in pg_get_functiondef(
+    'control.append_contribution_policy_successor(uuid,uuid,bigint,boolean,text,text,text,text,text,text)'::regprocedure))>0
+  and position('set_config(''humaux.tenant_id''' in pg_get_functiondef(
+    'control.append_contribution_policy_successor(uuid,uuid,bigint,boolean,text,text,text,text,text,text)'::regprocedure))>0
+  and position('pg_advisory_xact_lock' in pg_get_functiondef(
+    'control.append_contribution_policy_successor(uuid,uuid,bigint,boolean,text,text,text,text,text,text)'::regprocedure))>0
+  and position('FOR UPDATE' in pg_get_functiondef(
+    'control.append_contribution_policy_successor(uuid,uuid,bigint,boolean,text,text,text,text,text,text)'::regprocedure))>0
+  and position('p.effective_to IS NULL' in pg_get_functiondef(
+    'staging.guard_finalized_contribution()'::regprocedure))>0
+  and position('call.call_kind=''TYPED_ASSESSMENT''' in pg_get_functiondef(
+    'staging.guard_finalized_contribution()'::regprocedure))>0
+  and position('candidate sources are absent, invisible or changed' in pg_get_functiondef(
+    'staging.guard_finalized_contribution()'::regprocedure))>0
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Restore the pre-0132 restore point before enabling writes; otherwise ship a forward migration only. Never rewrite historical policy, candidate, or execution versions."
+backup_restore_requirement = "Production apply requires an explicit restore point and approval. Rehearse on a disposable PostgreSQL 18 instance, prove both hard-stop prechecks and the exact postcheck, then run the ignored lifecycle matrix."

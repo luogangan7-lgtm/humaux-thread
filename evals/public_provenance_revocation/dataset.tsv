@@ -1,0 +1,5 @@
+case_id	layer	primary_expected	counterfactual_expected
+a_provenance_active_release	provenance2	true	true
+b_provenance_edge_deleted	provenance2	false	false
+c_eligible_supported_active	withdrawal2	true	true
+d_eligible_supported_after_revoke_before_consumer	withdrawal2	false	true

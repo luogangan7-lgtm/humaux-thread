@@ -731,9 +731,9 @@ mod tests {
         );
     }
 
-    /// 真实 spec 现状：9 个集合全部 `NOT_DECLARED`（§55.3 七字段没有任何一行齐全）。
+    /// Measured sets must remain declared; missing measurements must still fail closed.
     #[test]
-    fn baseline_real_spec_all_9_rows_not_declared() {
+    fn real_spec_preserves_declared_sets_and_rejects_unmeasured_sets() {
         // `planner_predicate` (T6.1, §20.3) is exempt: its row now carries a real 21-item
         // eval-set measurement (evals/planner_predicate/dataset.tsv, crates/retrieval/tests/
         // planner_predicate_eval.rs) and is genuinely `DECLARED` — same "pin expires when the
@@ -749,10 +749,13 @@ mod tests {
         // as NOT_DECLARED like the other undeclared rows below.
         // `memory_security_lifecycle` joined 2026-08-27 as scoped-DECLARED (ADR-0007
         // §55.3.2): Write/Recall/Repair measured, Action=BLOCKED_ON_SUT(phase=14).
+        // Public joined 2026-08-28 with four local real-PG cases, measured stable flips
+        // and per-layer Hamming. Production applicability/DOD-054 remains separate.
         const DECLARED_EXEMPT: &[&str] = &[
             "planner_predicate",
             "exact_completeness",
             "memory_security_lifecycle",
+            "public_provenance_revocation",
         ];
         let spec = real_spec_md();
         let table = parse_declaration_table(&spec);

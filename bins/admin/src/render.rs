@@ -4,18 +4,16 @@
 //! checked_at, probe_version}` JSON 契约，只把 static spec 的 `mechanism-registry` 围栏
 //! 渲染成表格。渲染结果禁止回写进 canonical md（§1.14）。
 //!
-//! `--deployment` / `--cell` 是 §1.14.1 描述的目标接口（static spec JOIN 目标 Observation），
-//! 但 `ops.mechanism_observations` 本轮未部署（见 xtask `mechanism-registry` G3/G4/G5），
-//! 因此本轮渲染只输出 static spec 一侧，忽略这两个参数。
+//! With an explicit target, join actual runtime observations through role_admin.
+//! Without a target, render only the static fence and do not assert runtime status.
+
+use humaux_contracts::mechanism_registry::{extract_fences, parse_registry};
 
 /// spec 唯一真源，相对本 crate manifest 目录解析（§1.14 冻结：不得另建镜像文件）。
 const SPEC_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../docs/architecture/Baseline_2.9.md"
 );
-
-const FENCE_OPEN: &str = "```mechanism-registry";
-const FENCE_CLOSE: &str = "```";
 
 /// §1.14 固定列序。
 const COLUMNS: [&str; 8] = [
@@ -30,7 +28,31 @@ const COLUMNS: [&str; 8] = [
 ];
 
 /// 渲染 canonical md 的 `mechanism-registry` 围栏为人读表格；返回进程退出码。
-pub fn mechanism_registry(_args: &[String]) -> i32 {
+pub fn mechanism_registry(args: &[String]) -> i32 {
+    if !args.is_empty() {
+        return match crate::mechanism::read(args) {
+            Ok((specs, observations)) => {
+                println!("mechanism_id | runtime_status | reason | value | scanned_n");
+                for spec in &specs {
+                    let derived = observations.status(spec);
+                    let observation = observations.latest.get(&spec.id());
+                    println!(
+                        "{} | {} | {} | {:?} | {:?}",
+                        spec.id(),
+                        derived.status.map_or("-", |s| s.as_str()),
+                        derived.reason,
+                        observation.map(|o| o.value),
+                        observation.and_then(|o| o.scanned_n)
+                    );
+                }
+                i32::from(observations.cannot_establish(&specs))
+            }
+            Err(error) => {
+                eprintln!("render mechanism-registry: cannot_establish — {error}");
+                1
+            }
+        };
+    }
     let text = match std::fs::read_to_string(SPEC_PATH) {
         Ok(t) => t,
         Err(e) => {
@@ -38,7 +60,12 @@ pub fn mechanism_registry(_args: &[String]) -> i32 {
             return 1;
         }
     };
-    let Some(body) = extract_fence(&text) else {
+    if let Err(error) = parse_registry(&text) {
+        eprintln!("render mechanism-registry: invalid spec — {error}");
+        return 1;
+    }
+    let fences = extract_fences(&text);
+    let Some(body) = fences.first() else {
         eprintln!(
             "render mechanism-registry: fail — missing object: mechanism-registry fence in {SPEC_PATH}"
         );
@@ -52,22 +79,4 @@ pub fn mechanism_registry(_args: &[String]) -> i32 {
         "# note: render is not a probe — outside the §4.4 probe catalog, no {{value, scanned_n, scope_hash, checked_at, probe_version}} envelope (§1.14)."
     );
     0
-}
-
-/// 找到第一个（唯一一个，见 xtask G0）`mechanism-registry` 围栏并返回其正文行。
-fn extract_fence(text: &str) -> Option<Vec<&str>> {
-    let mut lines = text.lines();
-    while let Some(line) = lines.next() {
-        if line.trim() == FENCE_OPEN {
-            let mut body = Vec::new();
-            for inner in lines.by_ref() {
-                if inner.trim() == FENCE_CLOSE {
-                    break;
-                }
-                body.push(inner);
-            }
-            return Some(body);
-        }
-    }
-    None
 }

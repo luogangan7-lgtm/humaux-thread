@@ -18,12 +18,21 @@
 
 use humaux_adapters::disclosure::DisclosureSource;
 use humaux_adapters::postgres::RetrievalWorkerDbPool;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    time::Duration,
+};
+
 use humaux_domain::egress::ProcessorId;
-use humaux_domain::ids::TenantId;
+use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
+use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
+use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig};
+use humaux_retrieval::request::{RetrievalIntent, build_request};
 use humaux_retrieval_provider::adapters::DashscopeEmbeddingProvider;
 use humaux_retrieval_provider::admission::RetrievalPurpose;
 use humaux_retrieval_provider::contract::{
-    EmbeddingModelDescriptor, EmbeddingProvider, ModelId, SealedRetrievalQuery,
+    EmbeddingModelDescriptor, EmbeddingProvider, ModelId, RetrievalQueryCallContext,
 };
 use humaux_retrieval_provider::metrics::{
     Provider, Region, retrieval_provider_requests_total_count,
@@ -55,6 +64,39 @@ fn text_embedding_v4() -> EmbeddingModelDescriptor {
     }
 }
 
+fn sealed_live_query() -> humaux_local_secret_scan::SealedRetrievalQuery {
+    let scanner = LocalSecretScanner::new(LocalSecretScannerConfig {
+        executable: PathBuf::from(
+            std::env::var("HUMAUX_TEST_GITLEAKS_BIN")
+                .expect("live provider fixture requires HUMAUX_TEST_GITLEAKS_BIN"),
+        ),
+        expected_version: std::env::var("HUMAUX_TEST_GITLEAKS_VERSION")
+            .expect("live provider fixture requires HUMAUX_TEST_GITLEAKS_VERSION"),
+        expected_executable_sha256: std::env::var("HUMAUX_TEST_GITLEAKS_SHA256")
+            .expect("live provider fixture requires HUMAUX_TEST_GITLEAKS_SHA256"),
+        timeout: Duration::from_secs(5),
+        max_payload_bytes: 64 * 1024,
+        finding_exit_code: 1,
+    })
+    .expect("pinned scanner fixture");
+    let profile = humaux_retrieval::request::resolve_registered_retrieval_profile(&BTreeMap::new())
+        .expect("registered profile");
+    let request = build_request(
+        RetrievalIntent::new(
+            "Humaux Thread retrieval provider smoke test".to_owned(),
+            vec![],
+            BTreeSet::new(),
+            BTreeSet::new(),
+        )
+        .expect("text intent"),
+        &profile,
+    )
+    .expect("request");
+    scanner
+        .seal_query(&request.trusted_query().expect("text request"))
+        .expect("clean pinned scan")
+}
+
 struct Handle {
     rt: tokio::runtime::Runtime,
     // `Option` so `DashscopeEmbeddingProvider::new` (which takes the pool by value) can
@@ -62,6 +104,8 @@ struct Handle {
     pool: Option<RetrievalWorkerDbPool>,
     admin: Client,
     tenant_id: Uuid,
+    user_id: Uuid,
+    workspace_id: Uuid,
 }
 
 impl Drop for Handle {
@@ -118,12 +162,34 @@ impl DbIntegrationFixture for SmokeFixture {
             )
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
             .get(0);
+        let user_id = Uuid::now_v7();
+        admin
+            .execute(
+                "INSERT INTO control.users(user_id,state) VALUES($1,'ACTIVE')",
+                &[&user_id],
+            )
+            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        let workspace_id: Uuid = admin
+            .query_one(
+                "INSERT INTO control.workspaces(tenant_id,name) VALUES($1,'dashscope smoke workspace') RETURNING workspace_id",
+                &[&tenant_id],
+            )
+            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
+            .get(0);
+        admin
+            .execute(
+                "INSERT INTO control.memberships(tenant_id,user_id,role,state) VALUES($1,$2,'member','ACTIVE')",
+                &[&tenant_id, &user_id],
+            )
+            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 
         Ok(Handle {
             rt,
             pool: Some(pool),
             admin,
             tenant_id,
+            user_id,
+            workspace_id,
         })
     }
 }
@@ -203,9 +269,23 @@ fn dashscope_live_smoke() {
         let before_tokens =
             retrieval_provider_tokens_total_count(Provider::DashScope, RetrievalPurpose::Embedding);
 
-        let query = SealedRetrievalQuery::seal("Humaux Thread retrieval provider smoke test");
-        let result = handle.rt.block_on(provider.embed_queries(
+        let query = sealed_live_query();
+        let authorization = AuthorizationScope::new(
             tenant_id,
+            PrincipalId(Uuid::now_v7()),
+            Some(UserId(handle.user_id)),
+            BoundedSet::new([WorkspaceId(handle.workspace_id)]).expect("bounded workspace"),
+        );
+        let context = RetrievalQueryCallContext::new(
+            &authorization,
+            WorkspaceId(handle.workspace_id),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            1,
+        )
+        .expect("trusted query call context");
+        let result = handle.rt.block_on(provider.embed_queries(
+            &context,
             1024,
             std::slice::from_ref(&query),
         ));

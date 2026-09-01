@@ -17,24 +17,35 @@
 //! Token format is self-contained here (hex-encoded field list, no signature — see
 //! [`decode_consistency_token`]'s doc for the ponytail note on that ceiling) rather than
 //! reusing `humaux_projection::stream::StreamKey`'s `Serialize`/`Deserialize` (it derives
-//! neither, and this module does not own that file to add them). `crate::remember`'s (T3.2)
-//! own `issue_consistency_token` is a private `fn` scoped to that module, and its doc calls
-//! its own format "**Placeholder encoding**... T3.8's job... may change this format
-//! entirely" — this module's [`issue_consistency_token`] is the real one that doc points at;
-//! `remember()` has not been switched over to it (that would edit a file this task does not
-//! own), so the two token formats coexist as separate, non-interoperable encodings for now
-//! (documented on both sides), not a "唯一构造点" violation of the same mechanism.
+//! neither, and this module does not own that file to add them). [`issue_consistency_token`]
+//! is the only encoder: `crate::remember::remember` builds [`TokenClaims`] from its in-transaction
+//! Evidence/stream write and returns the result only after commit, so every returned token is
+//! accepted by [`recall_with_overlay`] without a compatibility parser.
+
+use std::collections::{BTreeMap, HashSet};
 
 use sqlx::Row;
 use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
-use humaux_domain::ids::TenantId;
+use humaux_domain::error::ErrorCode;
+use humaux_domain::identity::AuthorizationScope;
+use humaux_domain::ids::{TenantId, WorkspaceId};
 use humaux_projection::serving::StreamFamily;
 use humaux_projection::stream::StreamKey;
+use humaux_retrieval::completeness::LedgerClosure;
+use humaux_retrieval::envelope::GroundingBlock;
 
 use crate::postgres::RuntimeDbPool;
+use crate::private_projection_registry::{
+    PrivateProjectionRegistryError, ProjectionPointId, resolve_private_memory_points_in_txn,
+};
+use crate::qdrant::{DenseCandidate, PointId};
+use crate::read_materialize::{MaterializedBodies, materialize_final_bodies_in_txn};
 use crate::serving_repo::{self, ServingRepoError};
+use crate::stream_repo::close_ledger_in_txn;
+
+type Txn<'c> = sqlx::Transaction<'c, sqlx::Postgres>;
 
 /// DB/decode-layer failure. Adapter-local, not one of the workspace's two frozen domain
 /// error enums (§52) — same reasoning as `jobs::JobsError` / `postgres::PoolInitError`.
@@ -52,6 +63,35 @@ pub enum RetrieveError {
     /// Same rule, workspace half — `None` (tenant-shared scope) and `Some(_)` are also a
     /// mismatch, not just two different `Some` values (fail-closed, no partial credit).
     CrossWorkspace,
+    /// The token's configured/policy expiry has passed. The token remains non-authentication
+    /// data; expiry only bounds read-your-writes overlay use.
+    TokenExpired,
+    /// The token claims a stream family that does not equal the caller/bootstrap-selected
+    /// five-column family. Tokens never select a retrieval route (§15.5/§16.2).
+    UntrustedStreamFamily,
+    /// Only the existing lowercase `tenant` and `workspace` scope forms are admitted here.
+    UnknownScopeKind,
+    /// A syntactically valid token did not match one exact issued stream row and registered
+    /// checkpoint version for its trusted family.
+    TokenNotIssued,
+    /// Gateway RLS needs an authenticated user setting for private visibility reads.
+    MissingAuthenticatedUser,
+    /// Dense Qdrant candidates have opaque projection point identities. Until PostgreSQL owns
+    /// an immutable point-to-object registry, no candidate can be hydrated as a Memory.
+    SemanticCandidateProjectionRegistryUnavailable,
+    /// Private semantic serving accepts only the UUID point-id family registered in PG.
+    UnsupportedPrivateProjectionPointId,
+    ProjectionRegistry(PrivateProjectionRegistryError),
+    FinalMaterialization(ErrorCode),
+    /// A caught-up envelope cannot carry an overlay. Treat a contradictory input as a failed
+    /// invariant rather than returning Evidence whose status cannot be explained.
+    CaughtUpEnvelopeHasOverlay,
+    /// The authoritative overlay has one object identity per Evidence. Conflicting copies
+    /// cannot be deterministically merged without inventing a processing state.
+    ConflictingOverlayEvidence,
+    /// The Qdrant candidate query used a version that stopped being the serving projection
+    /// before the authoritative PostgreSQL snapshot began. The caller must retry from routing.
+    ServingProjectionChanged,
 }
 
 impl From<sqlx::Error> for RetrieveError {
@@ -80,7 +120,50 @@ impl std::fmt::Display for RetrieveError {
                     "§15.5: consistency_token used outside its bound workspace"
                 )
             }
+            Self::TokenExpired => write!(f, "§15.5: consistency_token has expired"),
+            Self::UntrustedStreamFamily => write!(f, "§15.5: token cannot select a stream family"),
+            Self::UnknownScopeKind => write!(f, "§15.5: token scope kind is not supported"),
+            Self::TokenNotIssued => write!(
+                f,
+                "§15.5: token does not name an issued registered stream row"
+            ),
+            Self::MissingAuthenticatedUser => {
+                write!(f, "§6.1: recall requires an authenticated user context")
+            }
+            Self::SemanticCandidateProjectionRegistryUnavailable => write!(
+                f,
+                "private semantic read serving requires a PostgreSQL projection identity registry"
+            ),
+            Self::UnsupportedPrivateProjectionPointId => write!(
+                f,
+                "private semantic candidate uses an unregistered point-id family"
+            ),
+            Self::ProjectionRegistry(error) => write!(f, "{error}"),
+            Self::FinalMaterialization(error) => {
+                write!(
+                    f,
+                    "private semantic final materialization failed: {error:?}"
+                )
+            }
+            Self::CaughtUpEnvelopeHasOverlay => write!(
+                f,
+                "caught-up read-your-writes envelope unexpectedly carries an overlay"
+            ),
+            Self::ConflictingOverlayEvidence => write!(
+                f,
+                "read-your-writes overlay repeats an Evidence with conflicting state"
+            ),
+            Self::ServingProjectionChanged => write!(
+                f,
+                "private semantic candidate version is no longer the serving projection"
+            ),
         }
+    }
+}
+
+impl From<PrivateProjectionRegistryError> for RetrieveError {
+    fn from(value: PrivateProjectionRegistryError) -> Self {
+        Self::ProjectionRegistry(value)
     }
 }
 
@@ -129,7 +212,7 @@ impl ProcessingState {
         }
     }
 
-    fn parse(s: &str) -> Result<Self, RetrieveError> {
+    pub(crate) fn parse(s: &str) -> Result<Self, RetrieveError> {
         Self::ALL
             .into_iter()
             .find(|v| v.as_db_str() == s)
@@ -283,33 +366,67 @@ pub fn decode_consistency_token(token: &str) -> Result<TokenClaims, RetrieveErro
     })
 }
 
-/// §15.5 "consistency_token 只提供 read-your-writes 约束...不可跨 tenant/workspace 使用" —
-/// fail-closed: any mismatch is an `Err`, never a silent downgrade to "ignore the token".
+/// Validates the only supported token-to-scope mappings and returns the effective, possibly
+/// narrowed scope.  The token is never an authorization capability: `AuthorizationScope` comes
+/// from the authenticated request and a workspace token can only shrink it.
 pub fn validate_scope(
     claims: &TokenClaims,
-    requested_tenant_id: Uuid,
-    requested_workspace_id: Option<Uuid>,
-) -> Result<(), RetrieveError> {
-    if claims.tenant_id != requested_tenant_id {
+    authorization: &AuthorizationScope,
+) -> Result<AuthorizationScope, RetrieveError> {
+    if claims.tenant_id != authorization.tenant_id().0 {
         return Err(RetrieveError::CrossTenant);
     }
-    if claims.workspace_id != requested_workspace_id {
-        return Err(RetrieveError::CrossWorkspace);
+
+    match claims.scope_kind.as_str() {
+        "tenant" if claims.workspace_id.is_none() && claims.scope_id == claims.tenant_id => {
+            Ok(authorization.clone())
+        }
+        "workspace" if claims.workspace_id == Some(claims.scope_id) => authorization
+            .narrow(WorkspaceId(claims.scope_id))
+            .map_err(|_| RetrieveError::CrossWorkspace),
+        "tenant" | "workspace" => Err(RetrieveError::CrossWorkspace),
+        _ => Err(RetrieveError::UnknownScopeKind),
+    }
+}
+
+fn validate_stream_family(
+    claims: &TokenClaims,
+    family: &StreamFamily,
+) -> Result<(), RetrieveError> {
+    if claims.tenant_id != family.tenant_id.0
+        || claims.scope_kind != family.scope_kind
+        || claims.scope_id != family.scope_id
+        || claims.domain != family.domain
+        || claims.projection_kind != family.projection_kind
+    {
+        return Err(RetrieveError::UntrustedStreamFamily);
     }
     Ok(())
 }
 
-/// Sets `humaux.tenant_id` for the remainder of `txn` (§6.1 RLS context) — same technique and
-/// same non-bind-parameter rationale as `crate::jobs::set_tenant_local` (a `Uuid`'s `Display`
-/// only ever emits the canonical lowercase-hex form, so this formatted string carries no
-/// injectable characters).
-async fn set_tenant_local(
+fn validate_expiry(claims: &TokenClaims, now: OffsetDateTime) -> Result<(), RetrieveError> {
+    if claims.expires_at <= now {
+        return Err(RetrieveError::TokenExpired);
+    }
+    Ok(())
+}
+
+/// Binds both values that private RLS uses.  A request without an authenticated user fails
+/// closed instead of borrowing a pooled connection's previous setting or using the token.
+async fn set_authorization_local(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    tenant_id: Uuid,
+    authorization: &AuthorizationScope,
 ) -> Result<(), RetrieveError> {
-    sqlx::query(&format!("SET LOCAL humaux.tenant_id = '{tenant_id}'"))
-        .execute(&mut **txn)
-        .await?;
+    let Some(user_id) = authorization.user_id() else {
+        return Err(RetrieveError::MissingAuthenticatedUser);
+    };
+    sqlx::query(
+        "SELECT set_config('humaux.tenant_id', $1, true), set_config('humaux.user_id', $2, true)",
+    )
+    .bind(authorization.tenant_id().0.to_string())
+    .bind(user_id.0.to_string())
+    .execute(&mut **txn)
+    .await?;
     Ok(())
 }
 
@@ -326,11 +443,20 @@ async fn set_tenant_local(
 /// *write-path's own* cross-checks, not about every reader in the codebase sharing one query.
 pub async fn contiguous_done_prefix(
     pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
     key: &StreamKey,
 ) -> Result<i64, RetrieveError> {
     let mut txn = pool.pool().begin().await?;
-    set_tenant_local(&mut txn, key.tenant_id.0).await?;
+    set_authorization_local(&mut txn, authorization).await?;
+    let prefix = contiguous_done_prefix_in_txn(&mut txn, key).await?;
+    txn.commit().await?;
+    Ok(prefix)
+}
 
+pub(crate) async fn contiguous_done_prefix_in_txn(
+    txn: &mut Txn<'_>,
+    key: &StreamKey,
+) -> Result<i64, RetrieveError> {
     let row = sqlx::query(
         "SELECT COALESCE(
            MIN(stream_seq) FILTER (WHERE state NOT IN ('DONE','SKIPPED_BY_POLICY','TOMBSTONED')) - 1,
@@ -347,10 +473,8 @@ pub async fn contiguous_done_prefix(
     .bind(&key.domain)
     .bind(&key.projection_kind)
     .bind(&key.projection_version)
-    .fetch_one(&mut *txn)
+    .fetch_one(&mut **txn)
     .await?;
-    txn.commit().await?;
-
     Ok(row.try_get::<i64, _>("prefix")?)
 }
 
@@ -370,11 +494,20 @@ pub async fn contiguous_done_prefix(
 /// 自己失败，那种判据按 §80.1 不算判据。
 pub async fn serving_projection_highwater(
     pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
     key: &StreamKey,
 ) -> Result<i64, RetrieveError> {
     let mut txn = pool.pool().begin().await?;
-    set_tenant_local(&mut txn, key.tenant_id.0).await?;
+    set_authorization_local(&mut txn, authorization).await?;
+    let highwater = serving_projection_highwater_in_txn(&mut txn, key).await?;
+    txn.commit().await?;
+    Ok(highwater)
+}
 
+pub(crate) async fn serving_projection_highwater_in_txn(
+    txn: &mut Txn<'_>,
+    key: &StreamKey,
+) -> Result<i64, RetrieveError> {
     let row = sqlx::query(
         "SELECT projection_highwater FROM projection.stream_checkpoints
          WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3
@@ -387,13 +520,47 @@ pub async fn serving_projection_highwater(
     .bind(&key.domain)
     .bind(&key.projection_kind)
     .bind(&key.projection_version)
-    .fetch_optional(&mut *txn)
+    .fetch_optional(&mut **txn)
     .await?;
-    txn.commit().await?;
-
     match row {
-        Some(r) => Ok(r.try_get::<i64, _>("projection_highwater")?),
+        Some(row) => Ok(row.try_get::<i64, _>("projection_highwater")?),
         None => Ok(0),
+    }
+}
+
+pub(crate) async fn validate_issued_token_in_txn(
+    txn: &mut Txn<'_>,
+    key: &StreamKey,
+    claims: &TokenClaims,
+) -> Result<(), RetrieveError> {
+    let registered_and_issued: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+           SELECT 1 FROM projection.stream_checkpoints checkpoint
+            WHERE checkpoint.tenant_id = $1 AND checkpoint.scope_kind = $2
+              AND checkpoint.scope_id = $3 AND checkpoint.domain = $4
+              AND checkpoint.projection_kind = $5 AND checkpoint.projection_version = $6
+         ) AND EXISTS (
+           SELECT 1 FROM projection.stream_log stream
+            WHERE stream.tenant_id = $1 AND stream.scope_kind = $2
+              AND stream.scope_id = $3 AND stream.domain = $4
+              AND stream.projection_kind = $5 AND stream.projection_version = $6
+              AND stream.stream_seq = $7 AND stream.commit_seq = $8
+         )",
+    )
+    .bind(key.tenant_id.0)
+    .bind(&key.scope_kind)
+    .bind(key.scope_id)
+    .bind(&key.domain)
+    .bind(&key.projection_kind)
+    .bind(&key.projection_version)
+    .bind(claims.stream_seq)
+    .bind(claims.commit_seq)
+    .fetch_one(&mut **txn)
+    .await?;
+    if registered_and_issued {
+        Ok(())
+    } else {
+        Err(RetrieveError::TokenNotIssued)
     }
 }
 
@@ -448,23 +615,54 @@ pub struct OverlayCandidate {
 /// instead of granting `role_gateway` `SELECT` on `ops.outbox`.
 pub async fn pg_delta_overlay(
     pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
     key: &StreamKey,
     serving_highwater: i64,
     up_to_stream_seq_inclusive: i64,
 ) -> Result<Vec<OverlayCandidate>, RetrieveError> {
     let mut txn = pool.pool().begin().await?;
-    set_tenant_local(&mut txn, key.tenant_id.0).await?;
+    set_authorization_local(&mut txn, authorization).await?;
+    let overlay = pg_delta_overlay_in_txn(
+        &mut txn,
+        authorization,
+        key,
+        serving_highwater,
+        up_to_stream_seq_inclusive,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(overlay)
+}
 
+pub(crate) async fn pg_delta_overlay_in_txn(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+    key: &StreamKey,
+    serving_highwater: i64,
+    up_to_stream_seq_inclusive: i64,
+) -> Result<Vec<OverlayCandidate>, RetrieveError> {
     let rows = sqlx::query(
         "SELECT sl.stream_seq, sl.state, ob.evidence_id,
-                array_agg(DISTINCT me.memory_id) FILTER (WHERE me.memory_id IS NOT NULL)
+                array_agg(DISTINCT mr.memory_id) FILTER (WHERE mr.memory_id IS NOT NULL)
                   AS memory_ids
          FROM projection.stream_log sl
          JOIN ops.outbox ob ON ob.tenant_id = sl.tenant_id AND ob.commit_seq = sl.commit_seq
-         LEFT JOIN private.memory_evidence me ON me.evidence_id = ob.evidence_id
+         JOIN private.evidence_objects evidence
+           ON evidence.evidence_id = ob.evidence_id AND evidence.tenant_id = sl.tenant_id
+         LEFT JOIN private.memory_evidence me ON me.evidence_id = evidence.evidence_id
+         LEFT JOIN private.memory_records mr
+           ON mr.memory_id = me.memory_id AND mr.tenant_id = sl.tenant_id
+          AND mr.status = 'active'
+          AND (mr.visibility_class = 'TENANT_SHARED'
+            OR (mr.visibility_class = 'USER_PRIVATE' AND mr.visibility_user_id = $9)
+            OR (mr.visibility_class = 'WORKSPACE_SHARED' AND mr.visibility_workspace_id = ANY($10)))
          WHERE sl.tenant_id = $1 AND sl.scope_kind = $2 AND sl.scope_id = $3
            AND sl.domain = $4 AND sl.projection_kind = $5 AND sl.projection_version = $6
-           AND sl.stream_seq > $7 AND sl.stream_seq <= $8
+           AND sl.stream_seq > $7 AND sl.stream_seq <= $8 AND sl.state <> 'TOMBSTONED'
+           AND (evidence.visibility_class = 'TENANT_SHARED'
+             OR (evidence.visibility_class = 'USER_PRIVATE' AND evidence.visibility_user_id = $9)
+             OR (evidence.visibility_class = 'WORKSPACE_SHARED'
+                 AND evidence.visibility_workspace_id = ANY($10)))
          GROUP BY sl.stream_seq, sl.state, ob.evidence_id
          ORDER BY sl.stream_seq",
     )
@@ -476,18 +674,25 @@ pub async fn pg_delta_overlay(
     .bind(&key.projection_version)
     .bind(serving_highwater)
     .bind(up_to_stream_seq_inclusive)
-    .fetch_all(&mut *txn)
+    .bind(authorization.user_id().expect("bound before query").0)
+    .bind(
+        authorization
+            .allowed_workspace_ids()
+            .iter()
+            .map(|workspace| workspace.0)
+            .collect::<Vec<_>>(),
+    )
+    .fetch_all(&mut **txn)
     .await?;
-    txn.commit().await?;
 
     rows.iter()
-        .map(|r| {
-            let state: String = r.try_get("state")?;
+        .map(|row| {
+            let state: String = row.try_get("state")?;
             Ok(OverlayCandidate {
-                stream_seq: r.try_get("stream_seq")?,
-                evidence_id: r.try_get("evidence_id")?,
+                stream_seq: row.try_get("stream_seq")?,
+                evidence_id: row.try_get("evidence_id")?,
                 processing_state: ProcessingState::parse(&state)?,
-                memory_ids: r
+                memory_ids: row
                     .try_get::<Option<Vec<Uuid>>, _>("memory_ids")?
                     .unwrap_or_default(),
             })
@@ -500,6 +705,7 @@ pub async fn pg_delta_overlay(
 /// from `overlay` (it is empty in that case).
 #[derive(Debug, Clone)]
 pub struct RecallEnvelope {
+    validated_stream_key: StreamKey,
     pub served_by_projection: bool,
     pub overlay: Vec<OverlayCandidate>,
     /// §15.4 `contiguous_done_prefix` at decision time — the overlay's completeness bound,
@@ -519,54 +725,284 @@ pub struct RecallEnvelope {
     pub serving_version: Option<String>,
 }
 
-/// Top-level entry point: decode `token`, reject cross-tenant/cross-workspace use, then decide
-/// whether serving already covers the write or a PG overlay is needed (§15.5). The only
-/// caller-supplied identity is the opaque token string plus the request's own authenticated
-/// tenant/workspace — no stream key, no `stream_seq`: exactly the "Agent 不需要理解...也不能
-/// 自行构造 token" contract.
+impl RecallEnvelope {
+    /// Full stream identity was independently checked against the token ledger before this
+    /// envelope existed. Subsequent snapshot reads may use it but must not reconstruct it from
+    /// the client token.
+    pub fn validated_stream_key(&self) -> &StreamKey {
+        &self.validated_stream_key
+    }
+}
+
+/// Canonical input for the existing final PostgreSQL materializer.
+///
+/// This is deliberately only a candidate composition seam: it has no bodies and no alternate
+/// hydrate path. Its output must be passed to `read_materialize::materialize_final_bodies_in_txn`,
+/// which owns final visibility, lifecycle, secret-source, tombstone, and revocation checks.
+/// `memory_ids` remains empty until a PostgreSQL projection identity registry can resolve
+/// opaque Qdrant point ids to canonical objects.
+#[derive(Debug, Clone)]
+pub struct PrivateReadServingCandidates {
+    pub memory_ids: Vec<Uuid>,
+    pub overlay: Vec<OverlayCandidate>,
+    pub serving_version: Option<String>,
+}
+
+/// One private semantic result whose bodies, ledger closure, and conservative grounding report
+/// were all produced under the same PostgreSQL repeatable-read snapshot.
+#[derive(Debug, Clone)]
+pub struct MaterializedPrivateReadServing {
+    pub bodies: MaterializedBodies,
+    pub ledger: LedgerClosure,
+    pub grounding: GroundingBlock,
+}
+
+/// Carries an already-authorized RYW decision to the final materializer without making Qdrant
+/// a source of truth.
+///
+/// Every nonempty semantic list fails loudly: `DenseCandidate::point_id` is an opaque projection
+/// identifier, never a `MemoryId` even when its wire shape is a UUID. A future registry resolver
+/// must supply canonical object identity, revision, body hash, projection version, and scope
+/// from PostgreSQL before semantic candidates enter this seam. The RYW overlay is deduplicated
+/// by stable Evidence identity and emitted by `(stream_seq, evidence_id)`; the materializer then
+/// rechecks it and performs the authoritative Memory/overlay union.
+pub fn private_read_serving_candidates(
+    semantic: &[DenseCandidate],
+    envelope: &RecallEnvelope,
+) -> Result<PrivateReadServingCandidates, RetrieveError> {
+    if envelope.served_by_projection && !envelope.overlay.is_empty() {
+        return Err(RetrieveError::CaughtUpEnvelopeHasOverlay);
+    }
+    if !semantic.is_empty() {
+        return Err(RetrieveError::SemanticCandidateProjectionRegistryUnavailable);
+    }
+
+    let mut overlay_by_evidence = BTreeMap::<Uuid, OverlayCandidate>::new();
+    for candidate in &envelope.overlay {
+        let mut candidate = candidate.clone();
+        candidate.memory_ids.sort_unstable();
+        candidate.memory_ids.dedup();
+        if let Some(existing) = overlay_by_evidence.get(&candidate.evidence_id) {
+            if existing.stream_seq != candidate.stream_seq
+                || existing.processing_state != candidate.processing_state
+                || existing.memory_ids != candidate.memory_ids
+            {
+                return Err(RetrieveError::ConflictingOverlayEvidence);
+            }
+            continue;
+        }
+        overlay_by_evidence.insert(candidate.evidence_id, candidate);
+    }
+    let mut overlay = overlay_by_evidence.into_values().collect::<Vec<_>>();
+    overlay.sort_by_key(|candidate| (candidate.stream_seq, candidate.evidence_id));
+
+    Ok(PrivateReadServingCandidates {
+        memory_ids: Vec::new(),
+        overlay,
+        serving_version: envelope.serving_version.clone(),
+    })
+}
+
+/// Resolves opaque Qdrant candidates through PostgreSQL and hydrates them with the RYW overlay
+/// under one repeatable-read snapshot. The Qdrant score controls only candidate order; identity,
+/// liveness, body hash, authorization and final content all come from PG.
+pub async fn materialize_private_read_serving(
+    pool: &RuntimeDbPool,
+    consistency_token: Option<&str>,
+    authorization: &AuthorizationScope,
+    family: &StreamFamily,
+    projection_version: &str,
+    embedding_version: &str,
+    semantic: &[DenseCandidate],
+) -> Result<MaterializedPrivateReadServing, RetrieveError> {
+    let mut txn = pool.pool().begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *txn)
+        .await?;
+    let bodies = materialize_private_read_serving_in_txn(
+        &mut txn,
+        consistency_token,
+        authorization,
+        family,
+        projection_version,
+        embedding_version,
+        semantic,
+    )
+    .await?;
+    let key = family.with_version(projection_version);
+    let ledger = close_ledger_in_txn(&mut txn, &key).await?;
+    // Grounding derivation is intentionally not reconstructed from bodies here. Until the
+    // claim-level resolver is joined to this semantic path, every returned item is reported as
+    // not judged instead of being silently treated as current.
+    let grounding = GroundingBlock::tally(std::iter::repeat_n(None, bodies.items.len()));
+    txn.commit().await?;
+    Ok(MaterializedPrivateReadServing {
+        bodies,
+        ledger,
+        grounding,
+    })
+}
+
+/// Reads the private projection selector through the same authenticated adapter boundary used
+/// by final materialization. Gateway uses this value only to address Qdrant; final hydration
+/// rechecks it in its own repeatable-read snapshot before trusting any candidate.
+pub async fn private_read_projection_selector(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    family: &StreamFamily,
+) -> Result<Option<String>, RetrieveError> {
+    let mut txn = pool.pool().begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *txn)
+        .await?;
+    set_authorization_local(&mut txn, authorization).await?;
+    let version = private_read_projection_selector_in_txn(&mut txn, authorization, family).await?;
+    txn.commit().await?;
+    Ok(version)
+}
+
+async fn private_read_projection_selector_in_txn(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+    family: &StreamFamily,
+) -> Result<Option<String>, RetrieveError> {
+    serving_repo::serving_version_in_txn(txn, authorization, family)
+        .await
+        .map_err(|error| match error {
+            ServingRepoError::Db(error) => RetrieveError::Db(error),
+            ServingRepoError::CrossTenant => RetrieveError::CrossTenant,
+            ServingRepoError::MissingAuthenticatedUser => RetrieveError::MissingAuthenticatedUser,
+        })
+}
+
+pub(crate) async fn materialize_private_read_serving_in_txn(
+    txn: &mut Txn<'_>,
+    consistency_token: Option<&str>,
+    authorization: &AuthorizationScope,
+    family: &StreamFamily,
+    projection_version: &str,
+    embedding_version: &str,
+    semantic: &[DenseCandidate],
+) -> Result<MaterializedBodies, RetrieveError> {
+    let envelope = match consistency_token {
+        Some(token) => recall_with_overlay_in_txn(txn, token, authorization, family).await?,
+        None => {
+            set_authorization_local(txn, authorization).await?;
+            let serving_version =
+                private_read_projection_selector_in_txn(txn, authorization, family).await?;
+            RecallEnvelope {
+                validated_stream_key: family.with_version(projection_version),
+                served_by_projection: true,
+                overlay: Vec::new(),
+                contiguous_done_prefix: 0,
+                serving_version,
+            }
+        }
+    };
+    if envelope.validated_stream_key != family.with_version(projection_version) {
+        return Err(RetrieveError::UntrustedStreamFamily);
+    }
+    if envelope.serving_version.as_deref() != Some(projection_version) {
+        return Err(RetrieveError::ServingProjectionChanged);
+    }
+    let mut serving = private_read_serving_candidates(&[], &envelope)?;
+    let point_ids = semantic
+        .iter()
+        .map(|candidate| match candidate.point_id {
+            PointId::Uuid(id) => Ok(ProjectionPointId::new(id)),
+            PointId::Num(_) => Err(RetrieveError::UnsupportedPrivateProjectionPointId),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let resolved = resolve_private_memory_points_in_txn(
+        txn,
+        authorization,
+        family,
+        projection_version,
+        embedding_version,
+        &point_ids,
+    )
+    .await?;
+    let mut seen = HashSet::new();
+    serving.memory_ids = resolved
+        .into_iter()
+        .map(|candidate| candidate.memory_id.0)
+        .filter(|memory_id| seen.insert(*memory_id))
+        .collect();
+    materialize_final_bodies_in_txn(
+        txn,
+        authorization,
+        family,
+        &envelope.validated_stream_key,
+        &serving.memory_ids,
+        &serving.overlay,
+    )
+    .await
+    .map_err(RetrieveError::FinalMaterialization)
+}
+
+/// Top-level read-your-writes entry. The token only proves the requested overlay boundary;
+/// authenticated authorization and the five-column stream family arrive independently from
+/// the request/router, and no token field may select either.
 pub async fn recall_with_overlay(
     pool: &RuntimeDbPool,
     token: &str,
-    requested_tenant_id: Uuid,
-    requested_workspace_id: Option<Uuid>,
+    authorization: &AuthorizationScope,
+    family: &StreamFamily,
+) -> Result<RecallEnvelope, RetrieveError> {
+    let mut txn = pool.pool().begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *txn)
+        .await?;
+    let envelope = recall_with_overlay_in_txn(&mut txn, token, authorization, family).await?;
+    txn.commit().await?;
+    Ok(envelope)
+}
+
+/// Transaction-owned RYW decision. The trusted authorization and stream family come from the
+/// request route; the opaque token only supplies the ledger boundary. The caller owns the
+/// transaction/snapshot and may continue with final body, grounding, and ledger reads before
+/// its single commit.
+///
+/// This decides only the PG delta. When `served_by_projection` is false, callers must union
+/// normal serving candidates with [`RecallEnvelope::overlay`] before final authorization and
+/// lifecycle materialization; lag never replaces the serving result set with overlay alone.
+pub(crate) async fn recall_with_overlay_in_txn(
+    txn: &mut Txn<'_>,
+    token: &str,
+    authorization: &AuthorizationScope,
+    family: &StreamFamily,
 ) -> Result<RecallEnvelope, RetrieveError> {
     let claims = decode_consistency_token(token)?;
-    validate_scope(&claims, requested_tenant_id, requested_workspace_id)?;
+    let authorization = validate_scope(&claims, authorization)?;
+    validate_stream_family(&claims, family)?;
+    validate_expiry(&claims, OffsetDateTime::now_utc())?;
+    let key = family.with_version(claims.projection_version.clone());
 
-    let key = claims.stream_key();
-
-    // §16.2 读路由的**唯一消费侧入口**（G80-4 数的就是这一处）。family = stream key 去掉
-    // version 的五列：版本本身正是要问出来的东西，不能拿 token 里那个去问。
-    let serving_version = serving_repo::serving_version(
-        pool,
-        &StreamFamily::new(
-            key.tenant_id,
-            key.scope_kind.clone(),
-            key.scope_id,
-            key.domain.clone(),
-            key.projection_kind.clone(),
-        ),
-    )
-    .await
-    // 不可反驳模式而不是 `_ =>`：`ServingRepoError` 日后新增变体会在这里编译期报错，
-    // 比加一个 `From` 更省，也不会把新变体的信息悄悄折叠掉。
-    .map_err(|ServingRepoError::Db(e)| RetrieveError::Db(e))?;
-
-    // 水位只从 serving 行取（SQL 带 `AND serving`）：token 指向退役/shadow 版本时无行 ⇒ 0
-    // ⇒ 整条流走 overlay。
-    let serving_hw = serving_projection_highwater(pool, &key).await?;
-    let prefix = contiguous_done_prefix(pool, &key).await?;
-    if serving_hw >= claims.stream_seq {
+    set_authorization_local(txn, &authorization).await?;
+    validate_issued_token_in_txn(txn, &key, &claims).await?;
+    let serving_version =
+        private_read_projection_selector_in_txn(txn, &authorization, family).await?;
+    let serving_highwater = serving_projection_highwater_in_txn(txn, &key).await?;
+    let prefix = contiguous_done_prefix_in_txn(txn, &key).await?;
+    if serving_highwater >= claims.stream_seq {
         return Ok(RecallEnvelope {
+            validated_stream_key: key,
             served_by_projection: true,
-            overlay: vec![],
+            overlay: Vec::new(),
             contiguous_done_prefix: prefix,
             serving_version,
         });
     }
-
-    let overlay = pg_delta_overlay(pool, &key, serving_hw, claims.stream_seq).await?;
+    let overlay = pg_delta_overlay_in_txn(
+        txn,
+        &authorization,
+        &key,
+        serving_highwater,
+        claims.stream_seq,
+    )
+    .await?;
     Ok(RecallEnvelope {
+        validated_stream_key: key,
         served_by_projection: false,
         overlay,
         contiguous_done_prefix: prefix,
@@ -705,12 +1141,22 @@ mod contract_tests {
         ));
     }
 
-    fn sample_claims(tenant_id: Uuid, workspace_id: Option<Uuid>) -> TokenClaims {
+    fn auth(tenant_id: Uuid, workspaces: impl IntoIterator<Item = Uuid>) -> AuthorizationScope {
+        AuthorizationScope::new(
+            TenantId(tenant_id),
+            humaux_domain::identity::PrincipalId::new(),
+            Some(humaux_domain::ids::UserId::new()),
+            humaux_domain::identity::BoundedSet::new(workspaces.into_iter().map(WorkspaceId))
+                .expect("test workspace set"),
+        )
+    }
+
+    fn tenant_claims(tenant_id: Uuid) -> TokenClaims {
         TokenClaims {
             tenant_id,
-            workspace_id,
-            scope_kind: "workspace".to_string(),
-            scope_id: Uuid::new_v4(),
+            workspace_id: None,
+            scope_kind: "tenant".to_string(),
+            scope_id: tenant_id,
             domain: "knowledge".to_string(),
             projection_kind: "ingest".to_string(),
             projection_version: "v1".to_string(),
@@ -721,42 +1167,153 @@ mod contract_tests {
         }
     }
 
-    /// §15.5 "不可跨 tenant...使用" — pure, no DB needed (the DB-backed test additionally
-    /// proves the same rule end to end through `recall_with_overlay`, see
-    /// `tests/retrieve_read_your_writes.rs`).
     #[test]
     fn validate_scope_rejects_cross_tenant() {
         let tenant_a = Uuid::new_v4();
         let tenant_b = Uuid::new_v4();
-        let claims = sample_claims(tenant_a, None);
+        let claims = tenant_claims(tenant_a);
         assert!(matches!(
-            validate_scope(&claims, tenant_b, None),
+            validate_scope(&claims, &auth(tenant_b, [])),
             Err(RetrieveError::CrossTenant)
         ));
-        assert!(validate_scope(&claims, tenant_a, None).is_ok());
+        assert!(validate_scope(&claims, &auth(tenant_a, [])).is_ok());
     }
 
-    /// §15.5 "...workspace 使用" — both directions of the mismatch (different workspace, and
-    /// tenant-shared-vs-workspace-scoped) must reject, not just literal inequality of two
-    /// `Some` values.
     #[test]
-    fn validate_scope_rejects_cross_workspace() {
+    fn validate_scope_only_allows_authorized_workspace_narrowing() {
         let tenant = Uuid::new_v4();
         let workspace_a = Uuid::new_v4();
         let workspace_b = Uuid::new_v4();
-        let claims = sample_claims(tenant, Some(workspace_a));
+        let mut claims = tenant_claims(tenant);
+        claims.scope_kind = "workspace".to_string();
+        claims.scope_id = workspace_a;
+        claims.workspace_id = Some(workspace_a);
 
         assert!(matches!(
-            validate_scope(&claims, tenant, Some(workspace_b)),
+            validate_scope(&claims, &auth(tenant, [workspace_b])),
             Err(RetrieveError::CrossWorkspace)
         ));
-        assert!(
-            matches!(
-                validate_scope(&claims, tenant, None),
-                Err(RetrieveError::CrossWorkspace)
-            ),
-            "tenant-shared request against a workspace-bound token must also reject"
+        assert_eq!(
+            validate_scope(&claims, &auth(tenant, [workspace_a]))
+                .expect("authorized workspace may narrow")
+                .allowed_workspace_ids()
+                .len(),
+            1
         );
-        assert!(validate_scope(&claims, tenant, Some(workspace_a)).is_ok());
+        claims.scope_kind = "unrecognized".to_string();
+        assert!(matches!(
+            validate_scope(&claims, &auth(tenant, [workspace_a])),
+            Err(RetrieveError::UnknownScopeKind)
+        ));
+    }
+
+    #[test]
+    fn private_read_serving_canonicalizes_ryw_overlay_without_semantic_candidates() {
+        let memory_a = Uuid::from_u128(1);
+        let memory_b = Uuid::from_u128(2);
+        let evidence_a = Uuid::from_u128(11);
+        let evidence_b = Uuid::from_u128(12);
+        let envelope = RecallEnvelope {
+            validated_stream_key: StreamKey::new(
+                TenantId(Uuid::from_u128(99)),
+                "tenant",
+                Uuid::from_u128(99),
+                "knowledge",
+                "ingest",
+                "v1",
+            ),
+            served_by_projection: false,
+            overlay: vec![
+                OverlayCandidate {
+                    stream_seq: 2,
+                    evidence_id: evidence_b,
+                    processing_state: ProcessingState::Processing,
+                    memory_ids: vec![memory_b],
+                },
+                OverlayCandidate {
+                    stream_seq: 1,
+                    evidence_id: evidence_a,
+                    processing_state: ProcessingState::Issued,
+                    memory_ids: vec![memory_b, memory_a, memory_a],
+                },
+                OverlayCandidate {
+                    stream_seq: 1,
+                    evidence_id: evidence_a,
+                    processing_state: ProcessingState::Issued,
+                    memory_ids: vec![memory_a, memory_b],
+                },
+            ],
+            contiguous_done_prefix: 0,
+            serving_version: Some("v1".to_owned()),
+        };
+        let serving = private_read_serving_candidates(&[], &envelope)
+            .expect("RYW overlay composes without a semantic identity registry");
+
+        assert!(serving.memory_ids.is_empty());
+        assert_eq!(serving.serving_version.as_deref(), Some("v1"));
+        assert_eq!(serving.overlay.len(), 2);
+        assert_eq!(serving.overlay[0].evidence_id, evidence_a);
+        assert_eq!(serving.overlay[0].processing_state, ProcessingState::Issued);
+        assert_eq!(serving.overlay[0].memory_ids, vec![memory_a, memory_b]);
+        assert_eq!(serving.overlay[1].evidence_id, evidence_b);
+        assert_eq!(
+            serving.overlay[1].processing_state,
+            ProcessingState::Processing
+        );
+    }
+
+    #[test]
+    fn private_read_serving_keeps_a_caught_up_overlay_empty() {
+        let envelope = RecallEnvelope {
+            validated_stream_key: StreamKey::new(
+                TenantId(Uuid::from_u128(99)),
+                "tenant",
+                Uuid::from_u128(99),
+                "knowledge",
+                "ingest",
+                "v1",
+            ),
+            served_by_projection: true,
+            overlay: Vec::new(),
+            contiguous_done_prefix: 0,
+            serving_version: Some("v1".to_owned()),
+        };
+
+        let serving = private_read_serving_candidates(&[], &envelope)
+            .expect("caught-up envelope remains a serving-only read");
+
+        assert!(serving.memory_ids.is_empty());
+        assert!(serving.overlay.is_empty());
+    }
+
+    #[test]
+    fn private_read_serving_requires_a_projection_registry_for_semantic_candidates() {
+        let envelope = RecallEnvelope {
+            validated_stream_key: StreamKey::new(
+                TenantId(Uuid::from_u128(99)),
+                "tenant",
+                Uuid::from_u128(99),
+                "knowledge",
+                "ingest",
+                "v1",
+            ),
+            served_by_projection: true,
+            overlay: Vec::new(),
+            contiguous_done_prefix: 0,
+            serving_version: Some("v1".to_owned()),
+        };
+
+        let result = private_read_serving_candidates(
+            &[crate::qdrant::DenseCandidate {
+                point_id: crate::qdrant::PointId::Uuid(Uuid::from_u128(1)),
+                score: 0.9,
+            }],
+            &envelope,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RetrieveError::SemanticCandidateProjectionRegistryUnavailable)
+        ));
     }
 }

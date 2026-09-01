@@ -116,8 +116,26 @@ impl ssrf::DnsResolver for PinnedPublicResolver {
     }
 }
 
+#[test]
+fn dsn_as_role_accepts_both_postgres_uri_schemes() {
+    let postgres = dsn_as_role(
+        "postgres://postgres@127.0.0.1:54329/test",
+        "role_private_worker",
+    );
+    let postgresql = dsn_as_role(
+        "postgresql://postgres@127.0.0.1:54329/test",
+        "role_private_worker",
+    );
+
+    assert_eq!(postgres, postgresql);
+    assert!(postgres.starts_with("postgres://role_private_worker:"));
+}
+
 fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
-    let Some(rest) = admin_dsn.strip_prefix("postgres://") else {
+    let Some(rest) = admin_dsn
+        .strip_prefix("postgres://")
+        .or_else(|| admin_dsn.strip_prefix("postgresql://"))
+    else {
         return admin_dsn.to_string();
     };
     let Some(at) = rest.find('@') else {
@@ -249,6 +267,7 @@ fn descriptor() -> ReasoningProviderDescriptor {
     ReasoningProviderDescriptor {
         provider_id: "minimax".to_string(),
         model_id: MINIMAX_MODEL.to_string(),
+        model_revision: None,
         capabilities: vec![ReasoningCapability::StructuredOutput],
         custom_endpoint: Some(MINIMAX_CHAT_URL.to_string()),
     }

@@ -10,7 +10,7 @@
 //!
 //! §80.1.1 registers the injected-fault records for the rules that don't yet have a home
 //! in their own spec section: G80-1 (§53.3 规则3), G80-2 (§55.1), G80-4 (§16.2 — registered
-//! below, `not_applicable` until `adapters::retrieve` routes through `serving_version`),
+//! below; `not_applicable` only while the `serving_version` definition is absent),
 //! G80-20 (§67.4, out of this task's scope). G80-22 lives at §48.0①. G80-11's source_hash leg
 //! lives at §1.3/§48.0 (T5.1) — same single-crate-convergence family as G80-22, G80-11's other
 //! two legs (§1.12 tool schema, §7.5 classifier) are out of this task's scope. G59-3 lives at
@@ -1008,7 +1008,7 @@ fn env_var_scan(root: &Path) -> Verdict {
 }
 
 // ============================================================================
-// §55.1 G80-2 / §48.0① G80-22: unique construction points not yet delivered
+// §55.1 G80-2 / §48.0① G80-22: unique construction points
 // ============================================================================
 
 /// Counts non-definition occurrences of `needle` (e.g. `"Foo {"` for a struct literal, or
@@ -1081,11 +1081,10 @@ fn g80_2_build_request_unique(root: &Path) -> Verdict {
 /// to pin the function's own read behavior, not as a retrieval consumer) are excluded from the
 /// count — same shape as `count_construction_calls` excluding a type's own declaration.
 ///
-/// As of this task the retrieval read path (`adapters::retrieve`) does not yet call
-/// `serving_version` at all (see that module's / `serving_repo`'s own notes: `TokenClaims`'s
-/// `projection_version` still comes from the unsigned `consistency_token`, not this entry
-/// point) — so there is no consumer call site to count yet. `not_applicable`, not a fabricated
-/// `== 1`/`== 0` pass, same convention as the neighboring §55.1 G80-2 entry above.
+/// The pool-owned wrapper and its caller-owned transaction form share one SQL authority
+/// in `serving_repo`. Count both forms together: moving a retrieval read into its final RR
+/// transaction changes the API spelling, not the exactly-one consumer constraint. A missing
+/// consumer is a failure; only a missing definition can be `not_applicable` (ADR-0006).
 fn g80_4_serving_version_sole_entry_point(root: &Path) -> Verdict {
     /// 定义点及其直属测试。**按精确路径排除，不用 `disp.contains("serving_repo")`**：
     /// 子串匹配会连带排除任何未来路径含该子串的文件（`serving_repo_client.rs`、
@@ -1121,13 +1120,14 @@ fn g80_4_serving_version_sole_entry_point(root: &Path) -> Verdict {
         if disp.ends_with(SELF_FILE) || DEFINITION_FILES.iter().any(|d| disp.ends_with(d)) {
             continue;
         }
-        // 只数**调用**：`serving_version(` 带左括号。rustdoc 里的 doc-link
-        // `[`…::serving_version`]` 不含左括号，天然不计入；行内注释里若写成带括号的形式
-        // 会被计入，所以本仓约定 rustdoc 一律用 doc-link 形式引用它。
+        // The two closed spellings enter the same authoritative SQL; together they must
+        // still have exactly one consumer. Doc links lack `(` and comments are excluded.
         let n = source
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .map(|l| l.matches("serving_version(").count())
+            .map(|l| {
+                l.matches("serving_version(").count() + l.matches("serving_version_in_txn(").count()
+            })
             .sum::<usize>();
         if n > 0 {
             sites.push(format!("{disp}: {n}"));
@@ -1144,7 +1144,7 @@ fn g80_4_serving_version_sole_entry_point(root: &Path) -> Verdict {
             DEFINITION_FILES[0]
         )]),
         n => Verdict::Fail(vec![format!(
-            "expected exactly 1 consumer-side `serving_version(` call site outside the \
+            "expected exactly 1 consumer-side `serving_version`/`serving_version_in_txn` call site outside the \
              definition files, found {n}: {sites:?}"
         )]),
     }
@@ -2146,7 +2146,7 @@ fn count_pgpool_type(src: &str) -> usize {
 }
 
 /// G80-40 static side (§6.2.3): raw `sqlx::PgPool` may be *named* only inside the single
-/// encapsulation point `crates/adapters/src/postgres.rs`; the four wrapper types must each
+/// encapsulation point `crates/adapters/src/postgres.rs`; the seven wrapper types must each
 /// be declared exactly once there. The deliberate compile-fail fixtures under
 /// `crates/adapters/tests/ui/` are this scan's positive sentinel — they contain the raw
 /// type on purpose, so zero hits there means the scanner went blind (§53.3 规则3 同款).
@@ -2162,12 +2162,16 @@ pub fn g6_db_pool_topology(root: &Path) -> Verdict {
 
     let mut problems = Vec::new();
 
-    // Four wrappers, each declared exactly once, all in the encapsulation point.
+    // Eight wrappers, each declared exactly once, all in the encapsulation point.
     for wrapper in [
         "RuntimeDbPool",
         "BatchIssuerDbPool",
         "ConsolidationDbPool",
         "PrivateWorkerDbPool",
+        "RetrievalWorkerDbPool",
+        "MaintenanceDbPool",
+        "PublicWorkerDbPool",
+        "AdminDbPool",
     ] {
         let decl = format!("pub struct {wrapper}");
         let n = pool_src.matches(&decl).count();
@@ -2179,7 +2183,7 @@ pub fn g6_db_pool_topology(root: &Path) -> Verdict {
     }
 
     // Positive control (scanner-is-alive): the encapsulation point itself must name the
-    // raw type at least once — the four wrappers each hold a `sqlx::PgPool` inner field.
+    // raw type at least once — the seven wrappers each hold a `sqlx::PgPool` inner field.
     // If this drops to 0 the scanner (or postgres.rs) is broken; a dead scanner would
     // otherwise report "no violations" forever. (The ui/ compile-fail fixtures test field
     // *privacy* via `.0`, not raw-type naming, so they are not a naming sentinel.)
@@ -3388,6 +3392,969 @@ pub fn g80_43_grounding_validity(root: &Path) -> Verdict {
     }
 }
 
+/// R3 is intentionally admission-time only.  This parser is small but structural: it scopes
+/// every resolver assertion to the actual 0130 function body, so a comment or a second helper
+/// cannot satisfy a missing decision predicate.  The live migration is the contract; tests
+/// inject mutations into a self-contained fixture below.
+fn r3_health_migration_contract(source: &str) -> Verdict {
+    let sql = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut failures = Vec::new();
+    r3_health_table_contract(&sql, &mut failures);
+
+    let resolver_start = "CREATE FUNCTION control.resolve_user_reasoning_admission(";
+    let Some(start) = sql.find(resolver_start) else {
+        failures.push("missing exact R3 admission resolver signature".to_string());
+        return Verdict::Fail(failures);
+    };
+    let resolver = &sql[start..];
+    let Some(body_start) = resolver.find("AS $$") else {
+        failures.push("resolver is missing a SQL body".to_string());
+        return Verdict::Fail(failures);
+    };
+    let body_end = resolver[body_start..]
+        .find("$$;")
+        .map(|end| body_start + end + 3)
+        .unwrap_or(resolver.len());
+    let resolver = &resolver[..body_end];
+    r3_health_resolver_contract(&sql, resolver, &mut failures);
+
+    if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(failures)
+    }
+}
+
+fn r3_health_table_contract(sql: &str, failures: &mut Vec<String>) {
+    for table in [
+        "ops.reasoning_provider_health_observations",
+        "ops.reasoning_account_health_observations",
+    ] {
+        let create = format!("CREATE TABLE {table}");
+        if !sql.contains(&create) {
+            failures.push(format!("missing append-only health authority {table}"));
+        }
+        if !sql.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"))
+            || !sql.contains(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY"))
+        {
+            failures.push(format!("{table}: ENABLE + FORCE RLS are both required"));
+        }
+    }
+    let provider_start = sql.find("CREATE TABLE ops.reasoning_provider_health_observations");
+    let account_start = sql.find("CREATE TABLE ops.reasoning_account_health_observations");
+    let account_end = sql.find("CREATE INDEX reasoning_account_health_latest");
+    for (name, block) in [
+        (
+            "provider",
+            provider_start.zip(account_start).map(|(a, b)| &sql[a..b]),
+        ),
+        (
+            "account",
+            account_start.zip(account_end).map(|(a, b)| &sql[a..b]),
+        ),
+    ] {
+        let Some(block) = block else {
+            continue;
+        };
+        if !block.contains("source_kind text NOT NULL CHECK (btrim(source_kind) <> '')")
+            || !block.contains(
+                "reason_code text CHECK (reason_code IS NULL OR btrim(reason_code) <> '')",
+            )
+        {
+            failures.push(format!(
+                "{name} health observation needs audit-only source_kind/reason_code shape"
+            ));
+        }
+    }
+    if sql.contains("_health_current") {
+        failures.push("R3 forbids mutable *_health_current projection tables".to_string());
+    }
+    if !sql.contains("ops.reasoning_health_observation_reject_mutation()")
+        || !sql.contains("CREATE TRIGGER reasoning_provider_health_append_only")
+        || !sql.contains("CREATE TRIGGER reasoning_account_health_append_only")
+        || !sql.contains("CREATE TRIGGER reasoning_provider_health_reject_truncate")
+        || !sql.contains("CREATE TRIGGER reasoning_account_health_reject_truncate")
+    {
+        failures.push("both R3 health histories need explicit append-only guards".to_string());
+    }
+}
+
+fn r3_health_resolver_contract(sql: &str, resolver: &str, failures: &mut Vec<String>) {
+    if !resolver.contains("SECURITY DEFINER") || !resolver.contains("SET search_path = pg_catalog")
+    {
+        failures.push("resolver must be SECURITY DEFINER with search_path=pg_catalog".to_string());
+    }
+    if resolver.matches("clock_timestamp()").count() != 1 {
+        failures.push("resolver must capture clock_timestamp() exactly once".to_string());
+    }
+    if resolver
+        .matches("ORDER BY observation.observed_at DESC, observation.observation_id DESC")
+        .count()
+        != 2
+        || resolver.matches("LIMIT 1").count() < 2
+    {
+        failures.push(
+            "resolver must select one latest provider and account row before verdict".to_string(),
+        );
+    }
+    for predicate in [
+        "observed_at <= route.admitted_at",
+        "route.admitted_at <",
+        "lifecycle_state = 'SERVING'",
+        "strategy = 'PINNED'",
+        "fallback_class = 'NONE'",
+        "1 = (\n       SELECT count(*)",
+        "b.effective_to IS NULL",
+    ] {
+        if !resolver.contains(predicate) {
+            failures.push(format!(
+                "resolver missing R3 decision predicate {predicate:?}"
+            ));
+        }
+    }
+    if resolver.contains("COALESCE(provider_health") || resolver.contains("COALESCE(account_health")
+    {
+        failures.push(
+            "resolver may not fallback from the deterministically latest health row".to_string(),
+        );
+    }
+    let grant = "GRANT EXECUTE ON FUNCTION control.resolve_user_reasoning_admission(uuid, bigint, uuid, text)";
+    let revoke = sql[..sql.find(grant).unwrap_or(0)]
+        .rfind("REVOKE ALL ON FUNCTION")
+        .map(|start| &sql[start..sql.find(grant).unwrap_or(start)]);
+    if !sql.contains(grant)
+        || !sql.contains("TO role_private_worker")
+        || !revoke.is_some_and(|block| {
+            block.contains("control.resolve_user_reasoning_admission(uuid, bigint, uuid, text)")
+                && block.contains("FROM PUBLIC")
+        })
+    {
+        failures.push(
+            "resolver must be private-worker-only; PUBLIC EXECUTE must be revoked".to_string(),
+        );
+    }
+}
+
+fn r3_health_migration_gate(root: &Path) -> Verdict {
+    let path = root.join("migrations/0130_reasoning_route_health_admission.sql");
+    match fs::read_to_string(&path) {
+        Ok(source) => r3_health_migration_contract(&source),
+        Err(_) => Verdict::NotApplicable(
+            "migrations/0130_reasoning_route_health_admission.sql is not present yet; R3 health activation is not integrated"
+                .to_string(),
+        ),
+    }
+}
+
+/// The R3 call ledger is not an optional receipt beside the real provider call.  The migration
+/// owns the coupled shape (ledger snapshot, disclosure link, candidate reference); the runtime
+/// owns the transaction order.  Keep the two static halves separate so a comment or an
+/// unrelated retrieval ledger cannot green the contribution path.
+fn r3_contribution_ledger_migration_contract(source: &str) -> Verdict {
+    let sql = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut failures = Vec::new();
+    let ledger = sql
+        .find("ALTER TABLE ops.model_call_ledger")
+        .map(|start| &sql[start..]);
+    let Some(ledger) = ledger else {
+        return Verdict::Fail(vec![
+            "R3 requires an ops.model_call_ledger expansion in 0130, not a second receipt table"
+                .to_string(),
+        ]);
+    };
+    for column in [
+        "call_kind",
+        "intent_sha256",
+        "reasoning_domain_id",
+        "binding_id",
+        "binding_version",
+        "route_policy_id",
+        "route_policy_version",
+        "profile_id",
+        "profile_version",
+        "provider_account_id",
+        "provider_endpoint_id",
+        "credential_ref",
+        "billing_account_id",
+        "billing_instrument_id",
+        "provider_health_observation_id",
+        "account_health_observation_id",
+        "billing_responsibility",
+        "admitted_at",
+        "egress_processor_id",
+    ] {
+        if !ledger.contains(column) {
+            failures.push(format!("model_call_ledger R3 snapshot missing {column}"));
+        }
+    }
+    for invariant in [
+        "CONTRIBUTION_DEIDENTIFY",
+        "model_call_ledger_reasoning_snapshot_shape",
+        "ops.reasoning_model_call_validate()",
+        "reasoning_model_call_validate",
+        "model_call_ledger_reasoning_recipient_unique",
+        "model_call_ledger_reasoning_binding_unique",
+        "model_call_ledger_reasoning_endpoint_fk",
+        "data_disclosures_tenant_model_call_unique",
+        "data_disclosures_reasoning_model_call_fk",
+        "data_disclosure_reasoning_model_call_validate",
+        "contribution_candidates_reasoning_model_call_exact_fk",
+        "contribution_candidate_reasoning_route_validate",
+        "provider_endpoints_tenant_endpoint_egress_unique",
+        "endpoint.egress_processor_id",
+        "endpoint.egress_processor_id IS NOT NULL",
+        "route.egress_processor_id",
+    ] {
+        if !sql.contains(invariant) {
+            failures.push(format!("R3 ledger linkage/guard missing {invariant}"));
+        }
+    }
+    if !ledger.contains("estimated_cost IS NULL") || !ledger.contains("actual_cost IS NULL") {
+        failures.push(
+            "CONTRIBUTION_DEIDENTIFY must keep estimated_cost and actual_cost NULL".to_string(),
+        );
+    }
+    for idempotency_invariant in [
+        "model_call_ledger_reasoning_call_kind_known",
+        "call_kind IN ('COVERAGE_PROBE', 'TYPED_ASSESSMENT')",
+        "octet_length(intent_sha256) = 32",
+        "OLD.call_kind IS DISTINCT FROM NEW.call_kind",
+        "OLD.intent_sha256 IS DISTINCT FROM NEW.intent_sha256",
+    ] {
+        if !ledger.contains(idempotency_invariant) {
+            failures.push(format!(
+                "R3 idempotency requires immutable call kind and intent fingerprint: missing {idempotency_invariant}"
+            ));
+        }
+    }
+    if !ledger.contains("request_id <> '00000000-0000-0000-0000-000000000000'::uuid") {
+        failures.push(
+            "R3 ledger shape must reject the nil UUID request_id for CONTRIBUTION_DEIDENTIFY"
+                .to_string(),
+        );
+    }
+    if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(failures)
+    }
+}
+
+fn r3_function_body<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
+    let start = source.find(signature)?;
+    let open = start + source[start..].find('{')?;
+    let close = matching_brace_end(source, open)?;
+    Some(&source[open..close])
+}
+
+fn r3_ordered(body: &str, markers: &[&str]) -> bool {
+    let mut cursor = 0;
+    for marker in markers {
+        let Some(relative) = body[cursor..].find(marker) else {
+            return false;
+        };
+        cursor += relative + marker.len();
+    }
+    true
+}
+
+fn r3_contribution_runtime_contract(
+    contribution: &str,
+    ledger: &str,
+    disclosure: &str,
+    byok: &str,
+) -> Verdict {
+    let required = [
+        "resolve_and_reserve_reasoning_call",
+        "complete_structured(",
+        "finalize_reasoning_call",
+    ];
+    let mut missing: Vec<String> = required
+        .iter()
+        .filter(|needle| !contribution.contains(**needle))
+        .map(|needle| format!("missing contribution runtime marker {needle}"))
+        .collect();
+    for (source, marker) in [
+        (ledger, "reserve_reasoning_call_in_txn"),
+        (ledger, "finalize_reasoning_call_in_txn"),
+        (ledger, "egress_processor_id"),
+        (disclosure, "reserve_reasoning_in_txn"),
+        (disclosure, "finalize_reasoning_in_txn"),
+        (disclosure, "model_call_id"),
+        (byok, "endpoint_ref"),
+    ] {
+        if !source.contains(marker) {
+            missing.push(format!("missing R3 runtime marker {marker}"));
+        }
+    }
+    if !missing.is_empty() {
+        return Verdict::Fail(std::mem::take(&mut missing));
+    }
+    let reserve = r3_function_body(contribution, "async fn resolve_and_reserve_reasoning_call");
+    let call = r3_function_body(contribution, "async fn call_structured");
+    let finalize = r3_function_body(contribution, "async fn finalize_reasoning_call");
+    let ledger_reserve = r3_function_body(ledger, "async fn reserve_reasoning_call_in_txn");
+    let disclosure_reserve = r3_function_body(disclosure, "async fn reserve_reasoning_in_txn");
+    let Some((reserve, call, finalize)) =
+        reserve.zip(call).zip(finalize).map(|((a, b), c)| (a, b, c))
+    else {
+        return Verdict::Fail(vec![
+            "R3 contribution helper body is missing or malformed".to_string(),
+        ]);
+    };
+    let Some((ledger_reserve, disclosure_reserve)) = ledger_reserve.zip(disclosure_reserve) else {
+        return Verdict::Fail(vec![
+            "R3 in-transaction reserve helper body is missing or malformed".to_string(),
+        ]);
+    };
+    let authorize_window = reserve
+        .find("let permit = authorize(")
+        .map(|start| &reserve[start..reserve.len().min(start + 512)]);
+    if !r3_ordered(
+        reserve,
+        &[
+            "load_with_admission",
+            "reserve_reasoning_call_in_txn",
+            "reserve_reasoning_in_txn",
+            "txn.commit()",
+        ],
+    ) || !authorize_window.is_some_and(|window| window.contains("admission.egress_processor_id"))
+    {
+        return Verdict::Fail(vec![
+            "R3 reserve helper must use resolver-derived processor and atomically resolve -> ledger reserve -> disclosure reserve -> commit"
+                .to_string(),
+        ]);
+    }
+    if !ledger_reserve.contains("locator.egress_processor_id")
+        || !disclosure_reserve.contains("model_call_id")
+        || !disclosure_reserve.contains("reserve_in_txn")
+    {
+        return Verdict::Fail(vec![
+            "R3 ledger/disclosure reserve helpers must carry resolver processor and exact model_call_id"
+                .to_string(),
+        ]);
+    }
+    if !r3_ordered(
+        call,
+        &[
+            "resolve_and_reserve_reasoning_call",
+            "complete_structured(",
+            "self.finalize_reasoning_call",
+        ],
+    ) || !r3_ordered(
+        finalize,
+        &[
+            "finalize_reasoning_in_txn",
+            "finalize_reasoning_call_in_txn",
+            "txn.commit()",
+        ],
+    ) {
+        return Verdict::Fail(vec![
+            "R3 actual call must be reserve -> provider -> dual finalize, with no provider retry path"
+                .to_string(),
+        ]);
+    }
+    Verdict::Pass
+}
+
+/// A committed RESERVED row is the idempotency authority. This structural gate keeps its lookup
+/// ahead of a fresh resolver call, so current health cannot turn a crashed attempt into a retry.
+fn r3_contribution_idempotency_contract(
+    contribution: &str,
+    ledger: &str,
+    application: &str,
+    contribute: &str,
+    pg_tests: &str,
+) -> Verdict {
+    let mut failures = Vec::new();
+    if contribution.contains("Uuid::now_v7") {
+        failures.push("ContributionReasoner must not mint a retry request id".to_string());
+    }
+    r3_application_idempotency_contract(application, contribution, contribute, &mut failures);
+    let reserve = r3_function_body(contribution, "async fn resolve_and_reserve_reasoning_call");
+    let lookup = r3_function_body(ledger, "async fn lookup_reasoning_call_in_txn");
+    if !reserve.is_some_and(|body| {
+        r3_ordered(
+            body,
+            &[
+                "lookup_reasoning_call_in_txn",
+                "load_with_admission",
+                "reserve_reasoning_call_in_txn",
+                "reserve_reasoning_in_txn",
+                "txn.commit()",
+            ],
+        ) && body.contains("ReasoningCallLookup::ExistingReserved")
+            && body.contains("existing_reservation")
+    }) {
+        failures.push(
+            "R3 retry must lookup ExistingReserved before current admission and return before provider dispatch"
+                .to_string(),
+        );
+    }
+    r3_ledger_idempotency_contract(ledger, reserve, lookup, pg_tests, &mut failures);
+    if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(failures)
+    }
+}
+
+fn r3_application_idempotency_contract(
+    application: &str,
+    contribution: &str,
+    contribute: &str,
+    failures: &mut Vec<String>,
+) {
+    for marker in [
+        "ContributionReasoningCallKind",
+        "CoverageProbe",
+        "TypedAssessment",
+        "LogicalReasoningCallId",
+        "ReasoningIntentSha256",
+        "contribution_attempt",
+        "with_contribution_attempt",
+        "contribution_attempt_is_canonical",
+    ] {
+        if !application.contains(marker) {
+            failures.push(format!(
+                "caller-carried R3 idempotency contract missing {marker}"
+            ));
+        }
+    }
+    let canonical_attempt =
+        r3_function_body(application, "pub fn contribution_attempt_is_canonical");
+    if !canonical_attempt.is_some_and(|body| {
+        body.contains("(ContributionReasoningCallKind::CoverageProbe, None)")
+            && body.contains("(ContributionReasoningCallKind::TypedAssessment, Some(_))")
+    }) || !contribution.contains("contribution_attempt_is_canonical(coverage_digest)")
+        || !contribute.contains("ContributionReasoningCallKind::CoverageProbe,\n                None")
+        || !contribute.contains("ContributionReasoningCallKind::TypedAssessment,\n                Some(public_coverage.binding().digest_sha256())")
+    {
+        failures.push(
+            "R3 coverage shape requires probe=None and typed assessment=exact canonical coverage digest"
+                .to_string(),
+        );
+    }
+    let intent_builder = r3_function_body(application, "pub fn with_contribution_attempt");
+    let intent_encoder = r3_function_body(application, "fn contribution_reasoning_intent_sha256");
+    if !intent_builder.is_some_and(|body| {
+        body.contains("intent_schema_version: CONTRIBUTION_REASONING_INTENT_SCHEMA_VERSION")
+            && body.contains("contribution_reasoning_intent_sha256(")
+            && body.contains("CONTRIBUTION_REASONING_INTENT_SCHEMA_VERSION,")
+    }) || !intent_encoder.is_some_and(|body| {
+        body.contains("b\"intent_schema_version\\0\"")
+            && body.contains("intent_schema_version.to_be_bytes()")
+    }) {
+        failures.push(
+            "R3 canonical intent must explicitly version intent_schema_version before hashing"
+                .to_string(),
+        );
+    }
+}
+
+fn r3_ledger_idempotency_contract(
+    ledger: &str,
+    reserve: Option<&str>,
+    lookup: Option<&str>,
+    pg_tests: &str,
+    failures: &mut Vec<String>,
+) {
+    let tenant_scoped_lock = ledger.contains(
+        "const REASONING_REQUEST_ADVISORY_LOCK_SQL: &str = \"SELECT pg_advisory_xact_lock(hashtextextended('model-call-request:' || $1::uuid::text || ':' || $2::uuid::text,0))\"",
+    ) && lookup.is_some_and(|body| {
+        body.contains("sqlx::query(REASONING_REQUEST_ADVISORY_LOCK_SQL)")
+            && r3_ordered(body, &[".bind(tenant_id)", ".bind(logical_call_id.0)"])
+    });
+    if !lookup.is_some_and(|body| {
+        tenant_scoped_lock
+            && body.contains("WHERE call.tenant_id=$1 AND call.request_id=$2")
+            && body.contains("FOR UPDATE OF call")
+            && body.contains("status")
+            && body.contains("call_kind")
+            && body.contains("intent_sha256")
+            && body.contains("ReasoningReservationConflict")
+    }) {
+        failures.push(
+            "R3 retry lookup must serialize the tenant+request key and reject terminal or intent-mismatched rows"
+                .to_string(),
+        );
+    }
+    if !reserve.is_some_and(|body| body.contains("attempt.logical_call_id.0.is_nil()")) {
+        failures.push(
+            "R3 Reasoner must fail closed on a nil caller-carried logical_call_id".to_string(),
+        );
+    }
+    if !ledger.contains("input.logical_call_id.0")
+        || !ledger.contains("input.call_kind.as_db_str()")
+        || !ledger.contains("input.intent_sha256.0.as_slice()")
+    {
+        failures.push(
+            "R3 ledger insert must persist caller logical id plus independent kind and intent hash"
+                .to_string(),
+        );
+    }
+    let test_name = "fn reasoning_attempt_ledger_disclosure_candidate_and_atomicity()";
+    if !pg_tests.contains(test_name)
+        || !pg_tests.contains("existing_reserved_after_health_change")
+        || !pg_tests.contains("same tenant/request key serializes before authority query")
+        || !pg_tests.contains("same request UUID across tenants does not serialize")
+        || !pg_tests.contains("model-call-request:' || $1::uuid::text || ':' || $2::uuid::text")
+        || !pg_tests.contains("ledger_intent_mutation")
+    {
+        failures.push(
+            "R3 PostgreSQL idempotency fault test must cover tenant-scoped locking, health drift, and intent mutation"
+                .to_string(),
+        );
+    }
+}
+
+fn r3_contribution_ledger_gate(root: &Path) -> Verdict {
+    let migration =
+        match fs::read_to_string(root.join("migrations/0130_reasoning_route_health_admission.sql"))
+        {
+            Ok(source) => source,
+            Err(e) => return Verdict::Fail(vec![format!("cannot read 0130 R3 migration: {e}")]),
+        };
+    let contribution =
+        match fs::read_to_string(root.join("crates/adapters/src/contribution_reasoner.rs")) {
+            Ok(source) => source,
+            Err(e) => return Verdict::Fail(vec![format!("cannot read ContributionReasoner: {e}")]),
+        };
+    let ledger = fs::read_to_string(root.join("crates/adapters/src/model_call_ledger.rs"));
+    let disclosure = fs::read_to_string(root.join("crates/adapters/src/disclosure.rs"));
+    let byok = fs::read_to_string(root.join("crates/adapters/src/byok.rs"));
+    let application = fs::read_to_string(root.join("crates/application/src/consolidate.rs"));
+    let contribute = fs::read_to_string(root.join("crates/application/src/contribute.rs"));
+    let pg_tests =
+        fs::read_to_string(root.join("crates/adapters/tests/reasoning_route_health_admission.rs"));
+    let mut failures = match r3_contribution_ledger_migration_contract(&migration) {
+        Verdict::Fail(items) => items,
+        Verdict::Pass => Vec::new(),
+        Verdict::NotApplicable(detail) => vec![detail],
+    };
+    let (Ok(ledger), Ok(disclosure), Ok(byok), Ok(application), Ok(contribute), Ok(pg_tests)) =
+        (ledger, disclosure, byok, application, contribute, pg_tests)
+    else {
+        return Verdict::Fail(vec![
+            "cannot read one or more R3 contribution runtime/idempotency modules".to_string(),
+        ]);
+    };
+    match r3_contribution_runtime_contract(&contribution, &ledger, &disclosure, &byok) {
+        Verdict::Fail(items) => failures.extend(items),
+        Verdict::Pass => {}
+        Verdict::NotApplicable(detail) => failures.push(detail),
+    }
+    match r3_contribution_idempotency_contract(
+        &contribution,
+        &ledger,
+        &application,
+        &contribute,
+        &pg_tests,
+    ) {
+        Verdict::Fail(items) => failures.extend(items),
+        Verdict::Pass => {}
+        Verdict::NotApplicable(detail) => failures.push(detail),
+    }
+    if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(failures)
+    }
+}
+
+/// W1's storage writer is intentionally one SQL-owned protocol. This companion check keeps
+/// the marker a function-local scope switch and prevents a second Rust/application CAS.
+#[allow(clippy::too_many_lines)]
+fn w1_continuity_contract_from(
+    migration: &str,
+    domain: &str,
+    adapter: &str,
+    marker_sets_outside_publish: usize,
+) -> Verdict {
+    let mut failures = Vec::new();
+    for needle in [
+        "CREATE TABLE private.continuity_projects",
+        "CREATE TABLE private.continuity_facet_versions",
+        "CREATE TABLE private.continuity_facet_memory_links",
+        "CREATE TABLE private.continuity_facet_evidence_links",
+        "CREATE TABLE private.continuity_facet_slots",
+        "ALTER TABLE private.continuity_projects FORCE ROW LEVEL SECURITY;",
+        "ALTER TABLE private.continuity_facet_versions FORCE ROW LEVEL SECURITY;",
+        "ALTER TABLE private.continuity_facet_memory_links FORCE ROW LEVEL SECURITY;",
+        "ALTER TABLE private.continuity_facet_evidence_links FORCE ROW LEVEL SECURITY;",
+        "ALTER TABLE private.continuity_facet_slots FORCE ROW LEVEL SECURITY;",
+        "CONSTRAINT continuity_facet_versions_kind_closed CHECK",
+        "CONSTRAINT continuity_facet_slots_kind_closed CHECK",
+        "CONSTRAINT continuity_facet_slots_current_fkey FOREIGN KEY",
+        "DEFERRABLE INITIALLY DEFERRED",
+        "CREATE POLICY continuity_evidence_owner_exact_allow",
+        "AS PERMISSIVE FOR SELECT TO role_migration_owner",
+        "current_setting('humaux.continuity_publish',true)='1' AND CASE",
+        "CREATE POLICY continuity_evidence_owner_exact_guard",
+        "AS RESTRICTIVE FOR SELECT TO role_migration_owner",
+        "CREATE POLICY continuity_evidence_owner_lock_allow",
+        "AS PERMISSIVE FOR UPDATE TO role_migration_owner",
+        "END) WITH CHECK (false);",
+        "CREATE POLICY continuity_evidence_owner_lock_guard",
+        "AS RESTRICTIVE FOR UPDATE TO role_migration_owner",
+        "END) WITH CHECK (\n      current_setting('humaux.continuity_publish',true) IS DISTINCT FROM '1');",
+        "current_setting('humaux.continuity_publish',true) IS DISTINCT FROM '1' OR CASE",
+        "pg_catalog.pg_input_is_valid(current_setting('humaux.tenant_id',true),'uuid')",
+        "pg_catalog.pg_input_is_valid(current_setting('humaux.workspace_id',true),'uuid')",
+        "pg_catalog.pg_input_is_valid(current_setting('humaux.user_id',true),'uuid')",
+        "SET humaux.continuity_publish TO '1'",
+        "AND slot.project_id=p_project_id AND slot.facet_kind=p_facet_kind\n    FOR UPDATE;",
+        "locked_version<>p_expected_slot_version",
+        "slot.slot_version=p_expected_slot_version",
+        "GET DIAGNOSTICS affected=ROW_COUNT",
+        "IF affected<>1",
+        "ORDER BY memory.memory_id FOR SHARE OF memory",
+        "ORDER BY evidence.evidence_id FOR SHARE OF evidence",
+        "SELECT count(*) INTO locked_source_count FROM (",
+        ") locked_memory;",
+        ") locked_evidence;",
+    ] {
+        if !migration.contains(needle) {
+            failures.push(format!("0136 continuity contract missing `{needle}`"));
+        }
+    }
+    for forbidden in [
+        "ON CONFLICT",
+        "MERGE INTO",
+        "MAX(facet_version)",
+        "Scope::Project",
+        "compute_contribution_source_backing_closure_v1",
+        "set_config('humaux.continuity_publish'",
+        "GET DIAGNOSTICS locked_source_count=ROW_COUNT",
+    ] {
+        if migration.contains(forbidden) {
+            failures.push(format!(
+                "0136 continuity contract contains forbidden `{forbidden}`"
+            ));
+        }
+    }
+    if migration
+        .matches("SET humaux.continuity_publish TO '1'")
+        .count()
+        != 1
+        || marker_sets_outside_publish != 0
+    {
+        failures
+            .push("continuity marker must be set only by publish function proconfig".to_string());
+    }
+    for derived in ["'HANDOFF'", "'COVERAGE'"] {
+        if migration.contains(derived) {
+            failures.push(format!(
+                "derived facet has writable storage literal {derived}"
+            ));
+        }
+    }
+    for needle in [
+        "continuity_uuid_v7!(ProjectId)",
+        "continuity_uuid_v7!(ContinuityFacetVersionId)",
+        "pub const ALL: [Self; 15]",
+    ] {
+        if !domain.contains(needle) {
+            failures.push(format!("domain continuity surface missing `{needle}`"));
+        }
+    }
+    for needle in [
+        "pool: &RuntimeDbPool",
+        "authorization: &AuthorizationScope",
+        "authorization.narrow(command.workspace_id)",
+        "private.register_continuity_project",
+        "private.publish_continuity_facet",
+    ] {
+        if !adapter.contains(needle) {
+            failures.push(format!("adapter continuity surface missing `{needle}`"));
+        }
+    }
+    if adapter.contains("slot_version + 1") || adapter.contains("expected_slot_version + 1") {
+        failures.push("Rust adapter independently computes continuity CAS successor".to_string());
+    }
+    if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(failures)
+    }
+}
+
+fn w1_continuity_gate(root: &Path) -> Verdict {
+    let paths = [
+        "migrations/0136_project_continuity.sql",
+        "crates/domain/src/continuity.rs",
+        "crates/adapters/src/continuity_repo.rs",
+    ];
+    let mut sources = Vec::new();
+    for path in paths {
+        match fs::read_to_string(root.join(path)) {
+            Ok(source) => sources.push(source),
+            Err(_) => return Verdict::NotApplicable(format!("missing object: {path}")),
+        }
+    }
+    let sql_marker_sets = walk_files(&root.join("migrations"), &["sql"])
+        .into_iter()
+        .filter(|path| !path.ends_with("0136_project_continuity.sql"))
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .map(|source| {
+            source.matches("SET humaux.continuity_publish").count()
+                + source
+                    .matches("set_config('humaux.continuity_publish'")
+                    .count()
+        })
+        .sum::<usize>();
+    let rust_marker_sets = walk_workspace_rs(root)
+        .into_iter()
+        .filter(|(path, _)| {
+            path.strip_prefix(root).is_ok_and(|relative| {
+                let mut components = relative.components();
+                components
+                    .next()
+                    .is_some_and(|part| part.as_os_str() == "crates")
+                    && components.any(|part| part.as_os_str() == "src")
+            })
+        })
+        .map(|(_, source)| {
+            source.matches("SET humaux.continuity_publish").count()
+                + source
+                    .matches("set_config('humaux.continuity_publish'")
+                    .count()
+        })
+        .sum::<usize>();
+    w1_continuity_contract_from(
+        &sources[0],
+        &sources[1],
+        &sources[2],
+        sql_marker_sets + rust_marker_sets,
+    )
+}
+
+/// §25.3.1 W2: one native Continuity read route backed by one Gateway-only
+/// SECURITY DEFINER reader and one application-owned RR READ ONLY transaction.
+#[allow(clippy::too_many_lines)]
+fn w2_continuity_contract_from(
+    migration: &str,
+    manifest: &str,
+    application: &str,
+    adapter: &str,
+    gateway: &str,
+    guard: &str,
+    dispatch: &str,
+) -> Verdict {
+    let mut failures = Vec::new();
+    let manifest: toml::Value = match toml::from_str(manifest) {
+        Ok(value) => value,
+        Err(error) => {
+            return Verdict::Fail(vec![format!(
+                "0137 continuity manifest is invalid TOML: {error}"
+            )]);
+        }
+    };
+    if manifest.get("migration_id").and_then(toml::Value::as_str)
+        != Some("0137_project_continuity_read")
+    {
+        failures.push("0137 continuity manifest must bind its exact migration_id".to_string());
+    }
+    if manifest.get("class").and_then(toml::Value::as_str) != Some("FORWARD_ONLY") {
+        failures.push("0137 continuity manifest must remain FORWARD_ONLY".to_string());
+    }
+    for (field, needle) in [
+        (
+            "precheck",
+            "to_regprocedure('private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])') is null",
+        ),
+        (
+            "precheck",
+            "to_regclass('private.continuity_projects') is not null",
+        ),
+        ("precheck", "private.publish_continuity_facet("),
+        (
+            "postcheck",
+            "select count(*)=1 from reader where prosecdef and provolatile='s'",
+        ),
+        ("postcheck", "array['search_path=pg_catalog']::text[]"),
+        (
+            "postcheck",
+            "pg_get_userbyid(proowner)='role_migration_owner'",
+        ),
+        ("postcheck", "not has_function_privilege('public'"),
+        ("postcheck", "role.name='role_gateway'"),
+        (
+            "postcheck",
+            "SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER",
+        ),
+        ("postcheck", "strpos(definition,'INSERT ') = 0"),
+        ("postcheck", "strpos(definition,'UPDATE ') = 0"),
+        ("postcheck", "strpos(definition,'DELETE ') = 0"),
+    ] {
+        if !manifest
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .is_some_and(|value| value.contains(needle))
+        {
+            failures.push(format!(
+                "0137 continuity manifest {field} missing `{needle}`"
+            ));
+        }
+    }
+    for needle in [
+        "CREATE FUNCTION private.read_continuity_project_storage_v1(",
+        "LANGUAGE plpgsql STABLE SECURITY DEFINER",
+        "SET search_path TO pg_catalog",
+        "ALTER FUNCTION private.read_continuity_project_storage_v1(",
+        ") OWNER TO role_migration_owner;",
+        "project.workspace_id=ANY(p_authorized_workspace_ids)",
+        "project.lifecycle_state='ACTIVE'",
+        "p_requested_workspace_id IS NULL",
+        "pg_catalog.pg_input_is_valid(tenant_setting,'uuid')",
+        "memory_links_exact boolean",
+        "evidence_links_exact boolean",
+        "stored_body_sha256 bytea",
+        "ORDER BY slot.facet_kind NULLS FIRST",
+        "REVOKE ALL ON FUNCTION private.read_continuity_project_storage_v1(",
+        ") FROM PUBLIC;",
+        "GRANT EXECUTE ON FUNCTION private.read_continuity_project_storage_v1(",
+        ") TO role_gateway;",
+        "array_agg(link.memory_id ORDER BY link.memory_id)",
+        "array_agg(link.memory_sha256 ORDER BY link.memory_id)",
+        "array_agg(link.evidence_id ORDER BY link.evidence_id)",
+        "array_agg(link.evidence_sha256 ORDER BY link.evidence_id)",
+    ] {
+        if !migration.contains(needle) {
+            failures.push(format!("0137 continuity reader missing `{needle}`"));
+        }
+    }
+    for forbidden in [
+        "CREATE TABLE",
+        "INSERT INTO",
+        "UPDATE private.",
+        "DELETE FROM",
+    ] {
+        if migration.contains(forbidden) {
+            failures.push(format!(
+                "0137 continuity reader contains forbidden `{forbidden}`"
+            ));
+        }
+    }
+    for needle in [
+        "pub const W2_FORCED_UNAVAILABLE: [ContinuityFacetKind; 6]",
+        "VerifiedCurrentFacet::from_authoritative_jsonb_text",
+        "humaux.continuity.result.v1\\0",
+        "ContinuityFacetKind::ALL",
+        "if accounted != 17",
+        "if counts[0] == 17 && !closed.handoff.counts.overflow",
+    ] {
+        if !application.contains(needle) {
+            failures.push(format!("application continuity surface missing `{needle}`"));
+        }
+    }
+    for needle in [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+        "private.read_continuity_project_storage_v1",
+        "install_lookup_context(&mut tx, authorization).await?;",
+        "install_workspace_context(&mut tx, workspace).await?;",
+        "let frozen = fetch_frozen_in_txn",
+        "final_memory_ids_in_txn",
+        "DiagnosticCode::VisibilityRevalidationFailed",
+        "TOMBSTONED",
+        "count(stream.commit_seq) AS association_count",
+        "let body_sha256 = digest(raw.stored_body_sha256)?;",
+    ] {
+        if !adapter.contains(needle) {
+            failures.push(format!("adapter continuity reader missing `{needle}`"));
+        }
+    }
+    if adapter.contains("fetch_frozen(") || adapter.contains("assemble_materialized(") {
+        failures.push("W2 reader opens a forbidden second materialization path".to_string());
+    }
+    for needle in ["read_project_continuity", "PostgresContinuityReadPort"] {
+        if !gateway.contains(needle) {
+            failures.push(format!("Gateway continuity route missing `{needle}`"));
+        }
+    }
+    for needle in ["WorkspaceAdmission::PreserveContinuityFilter => None"] {
+        if !guard.contains(needle) {
+            failures.push(format!("Gateway continuity guard missing `{needle}`"));
+        }
+    }
+    if guard
+        .matches("operation.operation_key() != \"continuity.get\"")
+        .count()
+        != 2
+    {
+        failures.push(
+            "Gateway continuity guard must preserve both Continuity scope branches".to_string(),
+        );
+    }
+    for needle in [
+        "SUPPORTED_OPERATION_KEYS: [&str; 6]",
+        "\"continuity.get\" =>",
+    ] {
+        if !dispatch.contains(needle) {
+            failures.push(format!("Gateway continuity dispatch missing `{needle}`"));
+        }
+    }
+    if dispatch
+        .matches("catalog.validate_output(ToolName::Continuity, &value)")
+        .count()
+        != 2
+    {
+        failures.push(
+            "Gateway continuity dispatch must validate both Continuity result paths".to_string(),
+        );
+    }
+    for source in [application, adapter, gateway, guard, dispatch] {
+        for forbidden in ["Scope::Project", "embedding", "rerank", "USER_REASONING"] {
+            if source.contains(forbidden) {
+                failures.push(format!(
+                    "W2 production path contains forbidden `{forbidden}`"
+                ));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(failures)
+    }
+}
+
+fn w2_continuity_gate(root: &Path) -> Verdict {
+    let paths = [
+        "migrations/0137_project_continuity_read.sql",
+        "migrations/0137_project_continuity_read.manifest.toml",
+        "crates/application/src/continuity.rs",
+        "crates/adapters/src/continuity_read.rs",
+        "bins/gateway/src/continuity.rs",
+        "bins/gateway/src/guard.rs",
+        "bins/gateway/src/mcp_application.rs",
+    ];
+    let mut sources = Vec::new();
+    for path in paths {
+        match fs::read_to_string(root.join(path)) {
+            Ok(source) => sources.push(source),
+            Err(_) => return Verdict::NotApplicable(format!("missing object: {path}")),
+        }
+    }
+    w2_continuity_contract_from(
+        &sources[0],
+        &sources[1],
+        &sources[2],
+        &sources[3],
+        &sources[4],
+        &sources[5],
+        &sources[6],
+    )
+}
+
 pub fn run(_args: &[String]) -> i32 {
     let root = workspace_root();
     let mut checks: Vec<(&str, Verdict)> = vec![
@@ -3460,6 +4427,22 @@ pub fn run(_args: &[String]) -> i32 {
             "§22.5 (A1 算式全库只此一处)",
             g22_5_a1_sole_implementation(&root),
         ),
+        (
+            "§11.2.4–11.2.5 R3 (append-only exact-health admission contract)",
+            r3_health_migration_gate(&root),
+        ),
+        (
+            "§11.2.5 R3 (actual contribution call ledger/disclosure transaction)",
+            r3_contribution_ledger_gate(&root),
+        ),
+        (
+            "§25.3.1 W1 (Project Continuity storage/CAS/marker boundary)",
+            w1_continuity_gate(&root),
+        ),
+        (
+            "§25.3.1 W2 (Project Continuity native RR read boundary)",
+            w2_continuity_gate(&root),
+        ),
     ];
     checks.extend(provider_plane_architecture_gate_checks(&root));
 
@@ -3479,6 +4462,387 @@ mod tests {
 
     fn real_root() -> PathBuf {
         workspace_root()
+    }
+
+    fn w1_real_sources() -> (String, String, String) {
+        let root = real_root();
+        (
+            fs::read_to_string(root.join("migrations/0136_project_continuity.sql")).unwrap(),
+            fs::read_to_string(root.join("crates/domain/src/continuity.rs")).unwrap(),
+            fs::read_to_string(root.join("crates/adapters/src/continuity_repo.rs")).unwrap(),
+        )
+    }
+
+    #[test]
+    fn w1_continuity_real_repository_gate_is_green() {
+        assert_eq!(w1_continuity_gate(&real_root()), Verdict::Pass);
+    }
+
+    #[test]
+    fn w1_continuity_contract_mutations_are_red() {
+        let (migration, domain, adapter) = w1_real_sources();
+        for needle in [
+            "ALTER TABLE private.continuity_projects FORCE ROW LEVEL SECURITY;",
+            "CONSTRAINT continuity_facet_slots_kind_closed CHECK",
+            "CONSTRAINT continuity_facet_slots_current_fkey FOREIGN KEY",
+            "ORDER BY memory.memory_id FOR SHARE OF memory",
+            "ORDER BY evidence.evidence_id FOR SHARE OF evidence",
+            "AND slot.project_id=p_project_id AND slot.facet_kind=p_facet_kind\n    FOR UPDATE;",
+            "slot.slot_version=p_expected_slot_version",
+            "GET DIAGNOSTICS affected=ROW_COUNT",
+            "IF affected<>1",
+            "SET humaux.continuity_publish TO '1'",
+            "CREATE POLICY continuity_evidence_owner_lock_allow",
+            "END) WITH CHECK (false);",
+            "CREATE POLICY continuity_evidence_owner_lock_guard",
+            "END) WITH CHECK (\n      current_setting('humaux.continuity_publish',true) IS DISTINCT FROM '1');",
+        ] {
+            let broken = migration.replacen(needle, "", 1);
+            assert!(
+                matches!(
+                    w1_continuity_contract_from(&broken, &domain, &adapter, 0),
+                    Verdict::Fail(_)
+                ),
+                "mutation removing `{needle}` must fail the actual W1 gate"
+            );
+        }
+        assert!(matches!(
+            w1_continuity_contract_from(
+                &format!("{migration}\n-- 'HANDOFF'"),
+                &domain,
+                &adapter,
+                0
+            ),
+            Verdict::Fail(_)
+        ));
+        assert!(matches!(
+            w1_continuity_contract_from(&migration, &domain, &adapter, 1),
+            Verdict::Fail(_)
+        ));
+        assert!(matches!(
+            w1_continuity_contract_from(
+                &migration,
+                &domain.replacen("continuity_uuid_v7!(ProjectId)", "", 1),
+                &adapter,
+                0,
+            ),
+            Verdict::Fail(_)
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn w2_continuity_real_repository_and_boundary_mutations() {
+        let root = real_root();
+        let paths = [
+            "migrations/0137_project_continuity_read.sql",
+            "migrations/0137_project_continuity_read.manifest.toml",
+            "crates/application/src/continuity.rs",
+            "crates/adapters/src/continuity_read.rs",
+            "bins/gateway/src/continuity.rs",
+            "bins/gateway/src/guard.rs",
+            "bins/gateway/src/mcp_application.rs",
+        ];
+        let sources: Vec<_> = paths
+            .iter()
+            .map(|path| fs::read_to_string(root.join(path)).unwrap())
+            .collect();
+        assert_eq!(
+            w2_continuity_contract_from(
+                &sources[0],
+                &sources[1],
+                &sources[2],
+                &sources[3],
+                &sources[4],
+                &sources[5],
+                &sources[6]
+            ),
+            Verdict::Pass
+        );
+        for (index, needle) in [
+            (0, "LANGUAGE plpgsql STABLE SECURITY DEFINER"),
+            (
+                0,
+                "ALTER FUNCTION private.read_continuity_project_storage_v1(",
+            ),
+            (0, ") OWNER TO role_migration_owner;"),
+            (
+                0,
+                "REVOKE ALL ON FUNCTION private.read_continuity_project_storage_v1(",
+            ),
+            (0, ") FROM PUBLIC;"),
+            (0, "project.workspace_id=ANY(p_authorized_workspace_ids)"),
+            (0, "p_requested_workspace_id IS NULL"),
+            (0, "pg_catalog.pg_input_is_valid(tenant_setting,'uuid')"),
+            (0, "memory_links_exact boolean"),
+            (0, "evidence_links_exact boolean"),
+            (0, "stored_body_sha256 bytea"),
+            (0, "array_agg(link.memory_id ORDER BY link.memory_id)"),
+            (0, "array_agg(link.memory_sha256 ORDER BY link.memory_id)"),
+            (0, "array_agg(link.evidence_id ORDER BY link.evidence_id)"),
+            (
+                0,
+                "array_agg(link.evidence_sha256 ORDER BY link.evidence_id)",
+            ),
+            (1, "migration_id = \"0137_project_continuity_read\""),
+            (
+                1,
+                "to_regprocedure('private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])') is null",
+            ),
+            (1, "to_regclass('private.continuity_projects') is not null"),
+            (1, "private.publish_continuity_facet("),
+            (
+                1,
+                "select count(*)=1 from reader where prosecdef and provolatile='s'",
+            ),
+            (1, "array['search_path=pg_catalog']::text[]"),
+            (1, "pg_get_userbyid(proowner)='role_migration_owner'"),
+            (1, "not has_function_privilege('public'"),
+            (1, "role.name='role_gateway'"),
+            (1, "SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER"),
+            (1, "strpos(definition,'INSERT ') = 0"),
+            (
+                2,
+                "pub const W2_FORCED_UNAVAILABLE: [ContinuityFacetKind; 6]",
+            ),
+            (2, "humaux.continuity.result.v1\\0"),
+            (2, "if accounted != 17"),
+            (2, "if counts[0] == 17 && !closed.handoff.counts.overflow"),
+            (
+                3,
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+            ),
+            (3, "let frozen = fetch_frozen_in_txn"),
+            (3, "TOMBSTONED"),
+            (3, "install_lookup_context(&mut tx, authorization).await?;"),
+            (3, "install_workspace_context(&mut tx, workspace).await?;"),
+            (3, "count(stream.commit_seq) AS association_count"),
+            (3, "let body_sha256 = digest(raw.stored_body_sha256)?;"),
+            (5, "WorkspaceAdmission::PreserveContinuityFilter => None"),
+            (5, "operation.operation_key() != \"continuity.get\""),
+            (6, "catalog.validate_output(ToolName::Continuity, &value)"),
+            (6, "SUPPORTED_OPERATION_KEYS: [&str; 6]"),
+            (6, "\"continuity.get\" =>"),
+        ] {
+            let mut broken = sources.clone();
+            broken[index] = broken[index].replacen(needle, "", 1);
+            assert!(
+                matches!(
+                    w2_continuity_contract_from(
+                        &broken[0], &broken[1], &broken[2], &broken[3], &broken[4], &broken[5],
+                        &broken[6]
+                    ),
+                    Verdict::Fail(_)
+                ),
+                "mutation removing `{needle}` must fail the actual W2 gate"
+            );
+        }
+    }
+
+    #[test]
+    fn r3_health_contract_real_migration_is_green() {
+        let source = fs::read_to_string(
+            real_root().join("migrations/0130_reasoning_route_health_admission.sql"),
+        )
+        .unwrap();
+        assert_eq!(r3_health_migration_contract(&source), Verdict::Pass);
+    }
+
+    #[test]
+    fn r3_health_contract_faults_current_projection_latest_order_and_fallback() {
+        let source = fs::read_to_string(
+            real_root().join("migrations/0130_reasoning_route_health_admission.sql"),
+        )
+        .unwrap();
+        for (label, broken) in [
+            (
+                "current projection",
+                format!("{source}\nCREATE TABLE ops.provider_health_current ();"),
+            ),
+            (
+                "latest order",
+                source.replacen(
+                    "ORDER BY observation.observed_at DESC, observation.observation_id DESC",
+                    "ORDER BY observation.observation_id DESC",
+                    1,
+                ),
+            ),
+            (
+                "fallback candidate",
+                source.replacen(
+                    "candidate.fallback_class = 'NONE'",
+                    "candidate.fallback_class = 'ANY'",
+                    1,
+                ),
+            ),
+            (
+                "health audit receipt",
+                source.replacen(
+                    "source_kind text NOT NULL CHECK (btrim(source_kind) <> ''),",
+                    "source_kind text,",
+                    1,
+                ),
+            ),
+        ] {
+            assert!(
+                matches!(r3_health_migration_contract(&broken), Verdict::Fail(_)),
+                "{label} fault escaped"
+            );
+        }
+    }
+
+    fn r3_contribution_runtime_fixture() -> (&'static str, &'static str, &'static str, &'static str)
+    {
+        (
+            "async fn resolve_and_reserve_reasoning_call() { load_with_admission(); let permit = authorize(admission.egress_processor_id); reserve_reasoning_call_in_txn(); reserve_reasoning_in_txn(); txn.commit(); }\nasync fn finalize_reasoning_call() { finalize_reasoning_in_txn(); finalize_reasoning_call_in_txn(); txn.commit(); }\nasync fn call_structured() { resolve_and_reserve_reasoning_call(); complete_structured(); self.finalize_reasoning_call(); }",
+            "async fn reserve_reasoning_call_in_txn() { locator.egress_processor_id; }\nasync fn finalize_reasoning_call_in_txn() {}\negress_processor_id",
+            "async fn reserve_reasoning_in_txn(model_call_id: Uuid) { model_call_id; reserve_in_txn(); }\nasync fn finalize_reasoning_in_txn() {}\nmodel_call_id",
+            "fn endpoint_ref() {}",
+        )
+    }
+
+    #[test]
+    fn r3_contribution_runtime_contract_accepts_atomic_reserve_and_finalize_order() {
+        let (contribution, ledger, disclosure, byok) = r3_contribution_runtime_fixture();
+        assert_eq!(
+            r3_contribution_runtime_contract(contribution, ledger, disclosure, byok),
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn r3_contribution_runtime_contract_faults_reversed_reserves_and_config_authority() {
+        let (contribution, ledger, disclosure, byok) = r3_contribution_runtime_fixture();
+        let provider_before_reserve = contribution.replacen(
+            "reserve_reasoning_call_in_txn(); reserve_reasoning_in_txn();",
+            "reserve_reasoning_in_txn(); reserve_reasoning_call_in_txn();",
+            1,
+        );
+        assert!(matches!(
+            r3_contribution_runtime_contract(&provider_before_reserve, ledger, disclosure, byok),
+            Verdict::Fail(_)
+        ));
+        let config_authority = contribution.replacen(
+            "authorize(admission.egress_processor_id)",
+            "authorize(self.config.allowed_egress_processor_id)",
+            1,
+        );
+        assert!(matches!(
+            r3_contribution_runtime_contract(&config_authority, ledger, disclosure, byok),
+            Verdict::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn r3_idempotency_contract_real_sources_are_green() {
+        let root = real_root();
+        let contribution =
+            fs::read_to_string(root.join("crates/adapters/src/contribution_reasoner.rs")).unwrap();
+        let ledger =
+            fs::read_to_string(root.join("crates/adapters/src/model_call_ledger.rs")).unwrap();
+        let application =
+            fs::read_to_string(root.join("crates/application/src/consolidate.rs")).unwrap();
+        let contribute =
+            fs::read_to_string(root.join("crates/application/src/contribute.rs")).unwrap();
+        let pg_tests = fs::read_to_string(
+            root.join("crates/adapters/tests/reasoning_route_health_admission.rs"),
+        )
+        .unwrap();
+        assert_eq!(
+            r3_contribution_idempotency_contract(
+                &contribution,
+                &ledger,
+                &application,
+                &contribute,
+                &pg_tests,
+            ),
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn r3_idempotency_contract_faults_reasoner_minted_key_and_late_lookup() {
+        let root = real_root();
+        let contribution =
+            fs::read_to_string(root.join("crates/adapters/src/contribution_reasoner.rs")).unwrap();
+        let ledger =
+            fs::read_to_string(root.join("crates/adapters/src/model_call_ledger.rs")).unwrap();
+        let application =
+            fs::read_to_string(root.join("crates/application/src/consolidate.rs")).unwrap();
+        let contribute =
+            fs::read_to_string(root.join("crates/application/src/contribute.rs")).unwrap();
+        let pg_tests = fs::read_to_string(
+            root.join("crates/adapters/tests/reasoning_route_health_admission.rs"),
+        )
+        .unwrap();
+        for broken in [
+            format!("Uuid::now_v7();\n{contribution}"),
+            contribution.replacen("lookup_reasoning_call_in_txn", "lookup_removed", 1),
+        ] {
+            assert!(matches!(
+                r3_contribution_idempotency_contract(
+                    &broken,
+                    &ledger,
+                    &application,
+                    &contribute,
+                    &pg_tests,
+                ),
+                Verdict::Fail(_)
+            ));
+        }
+        let typed_without_coverage = application.replacen(
+            "ContributionReasoningCallKind::TypedAssessment, Some(_)",
+            "ContributionReasoningCallKind::TypedAssessment, None",
+            1,
+        );
+        assert!(matches!(
+            r3_contribution_idempotency_contract(
+                &contribution,
+                &ledger,
+                &typed_without_coverage,
+                &contribute,
+                &pg_tests,
+            ),
+            Verdict::Fail(_)
+        ));
+        let unversioned_intent =
+            application.replacen("b\"intent_schema_version\\0\"", "b\"version\\0\"", 1);
+        assert!(matches!(
+            r3_contribution_idempotency_contract(
+                &contribution,
+                &ledger,
+                &unversioned_intent,
+                &contribute,
+                &pg_tests,
+            ),
+            Verdict::Fail(_)
+        ));
+        let request_only_lock = ledger.replacen(
+            "'model-call-request:' || $1::uuid::text || ':' || $2::uuid::text",
+            "'model-call-request:' || $2::uuid::text",
+            1,
+        );
+        assert!(matches!(
+            r3_contribution_idempotency_contract(
+                &contribution,
+                &request_only_lock,
+                &application,
+                &contribute,
+                &pg_tests,
+            ),
+            Verdict::Fail(_)
+        ));
+        let nil_allowed = contribution.replacen("attempt.logical_call_id.0.is_nil()", "false", 1);
+        assert!(matches!(
+            r3_contribution_idempotency_contract(
+                &nil_allowed,
+                &ledger,
+                &application,
+                &contribute,
+                &pg_tests,
+            ),
+            Verdict::Fail(_)
+        ));
     }
 
     // -- §53.3 规则1/规则3: scan_outcome_fallback_violations ------------------------------
@@ -3933,12 +5297,9 @@ mod tests {
     // -- G80-2 / G80-22 --------------------------------------------------------------------
 
     #[test]
-    fn g80_2_real_repo_is_not_applicable() {
+    fn g80_2_real_repo_passes() {
         let root = real_root();
-        assert!(matches!(
-            g80_2_build_request_unique(&root),
-            Verdict::NotApplicable(_)
-        ));
+        assert_eq!(g80_2_build_request_unique(&root), Verdict::Pass);
     }
 
     /// T1.6 delivers `evidence::payload_sha256` / `EvidencePayloadSha256` (§48.0① G80-22): the
@@ -4178,6 +5539,29 @@ mod tests {
         let tmp = fresh_tmp("g80-4-green");
         serving_version_fixture(&tmp, &[("crates/adapters/src/retrieve.rs", 1)]);
         assert_eq!(g80_4_serving_version_sole_entry_point(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn g80_4_transaction_form_preserves_the_single_consumer_constraint() {
+        let tmp = fresh_tmp("g80-4-transaction");
+        let consumer = "crates/adapters/src/retrieve.rs";
+        serving_version_fixture(&tmp, &[(consumer, 1)]);
+        let path = tmp.join(consumer);
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            original.replace("serving_version(", "serving_version_in_txn("),
+        )
+        .unwrap();
+        assert_eq!(g80_4_serving_version_sole_entry_point(&tmp), Verdict::Pass);
+
+        // One caller of each spelling is still two consumers, not two independent passes.
+        fs::write(tmp.join("crates/adapters/src/second.rs"), original).unwrap();
+        assert!(matches!(
+            g80_4_serving_version_sole_entry_point(&tmp),
+            Verdict::Fail(_)
+        ));
         fs::remove_dir_all(&tmp).ok();
     }
 
@@ -4629,7 +6013,7 @@ mod tests {
         let src = "impl Authority {\n    pub fn new(x: i32) -> Self {\n        Authority { x }\n    }\n}\n";
         assert_eq!(find_authority_struct_literals(src).len(), 1);
     }
-    /// G80-40 static: real repo must pass (four wrappers once each, no raw pool outside,
+    /// G80-40 static: real repo must pass (seven wrappers once each, no raw pool outside,
     /// ui fixtures keep the sentinel alive).
     #[test]
     fn g80_40_real_repo_is_green() {
@@ -4660,7 +6044,7 @@ mod tests {
     fn g80_40_fault_dead_sentinel_is_red() {
         let tmp = fresh_tmp("g80-40-sentinel");
         copy_adapters_fixture(&tmp);
-        // wrappers still declared (so the four-count check passes) but their inner field
+        // wrappers still declared (so the seven-count check passes) but their inner field
         // no longer *names* the raw type — only a comment mentions it. A live scanner
         // must notice the naming sentinel went to 0.
         fs::write(
@@ -4669,7 +6053,11 @@ mod tests {
              pub struct RuntimeDbPool(());\n\
              pub struct BatchIssuerDbPool(());\n\
              pub struct ConsolidationDbPool(());\n\
-             pub struct PrivateWorkerDbPool(());\n",
+             pub struct PrivateWorkerDbPool(());\n\
+             pub struct RetrievalWorkerDbPool(());\n\
+             pub struct MaintenanceDbPool(());\n\
+             pub struct PublicWorkerDbPool(());\n\
+             pub struct AdminDbPool(());\n",
         )
         .unwrap();
         match g6_db_pool_topology(&tmp) {
@@ -4692,7 +6080,11 @@ mod tests {
             "pub struct RuntimeDbPool { inner: sqlx::PgPool }\n\
              pub struct BatchIssuerDbPool { inner: sqlx::PgPool }\n\
              pub struct ConsolidationDbPool { inner: sqlx::PgPool }\n\
-             pub struct PrivateWorkerDbPool { inner: sqlx::PgPool }\n",
+             pub struct PrivateWorkerDbPool { inner: sqlx::PgPool }\n\
+             pub struct RetrievalWorkerDbPool { inner: sqlx::PgPool }\n\
+             pub struct MaintenanceDbPool { inner: sqlx::PgPool }\n\
+             pub struct PublicWorkerDbPool { inner: sqlx::PgPool }\n\
+             pub struct AdminDbPool { inner: sqlx::PgPool }\n",
         )
         .unwrap();
         fs::write(

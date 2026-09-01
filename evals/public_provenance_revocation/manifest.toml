@@ -1,0 +1,16 @@
+# §55.3.1 local synthetic Phase9 public provenance/revocation benchmark.
+# Scoped to four local synthetic real-PG cases; not a production applicability claim.
+# This source freeze is a real detached-worktree commit, preserving the user's main index.
+set_id = "public_provenance_revocation"
+source_kind = "internal"
+source_ref = "evals/public_provenance_revocation/dataset.tsv"
+source_version = "d9bfd3dfe87771a89b45e880d71d543d1f611f3b"
+license = "internal-only, not redistributed"
+fixture_sha256 = "a6982808fad9010304b28fed9f536d9c6379e265a694148b1f32877ef0c05937"
+fixed_denominator = 4
+decision_depth = "exact_equality"
+profile_fingerprint_policy = "length-prefixed SHA256 of harness, public_provenance, public_repo, contribution_repo, fixture, public_evolve, migrations0104-0109, Cargo.lock and dataset; all three runs must use identical bytes"
+measured_at = "2026-08-28"
+frozen_by = "d9bfd3dfe87771a89b45e880d71d543d1f611f3b"
+scope = "local synthetic provenance2 and withdrawal2; no production DOD054 or Phase10 activation"
+profile_fingerprint = "193a90448329355d3028adf7edaf3da43da0f21a09ab7eb6b867419e37e6eaec"

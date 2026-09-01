@@ -12,5 +12,6 @@ pub mod handoff;
 pub mod planner;
 pub mod predicate_eval;
 pub mod predicate_registry;
+pub mod request;
 pub mod rerank;
 pub mod signals;

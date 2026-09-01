@@ -74,10 +74,24 @@ fn point_id_json(id: PointId) -> serde_json::Value {
     }
 }
 
-const QDRANT_ADDR: &str = "127.0.0.1:6333";
+const DEFAULT_QDRANT_PORT: u16 = 6333;
+
+fn qdrant_port() -> u16 {
+    std::env::var("HUMAUX_TEST_QDRANT_PORT")
+        .map(|raw| {
+            let port: u16 = raw.parse().expect("HUMAUX_TEST_QDRANT_PORT must be a u16");
+            assert_ne!(port, 0, "HUMAUX_TEST_QDRANT_PORT must be nonzero");
+            port
+        })
+        .unwrap_or(DEFAULT_QDRANT_PORT)
+}
+
+fn qdrant_addr() -> String {
+    format!("127.0.0.1:{}", qdrant_port())
+}
 
 fn qdrant_reachable() -> bool {
-    TcpStream::connect_timeout(&QDRANT_ADDR.parse().unwrap(), Duration::from_millis(500)).is_ok()
+    TcpStream::connect_timeout(&qdrant_addr().parse().unwrap(), Duration::from_millis(500)).is_ok()
 }
 
 /// Combined three-state skip (§57.1/§79.2): both a live Postgres and a live Qdrant are
@@ -108,7 +122,7 @@ fn skip_unless_both_reachable(test_name: &str) -> Option<(String, Client)> {
     if !qdrant_reachable() {
         skip_or_fail(
             test_name,
-            &format!("missing object: live Qdrant server at {QDRANT_ADDR}"),
+            &format!("missing object: live Qdrant server at {}", qdrant_addr()),
             ExternalDep::Qdrant,
         );
         return None;
@@ -272,7 +286,7 @@ fn registry(cell: CellId, caller: CallerId) -> IntraCellResourceRegistry {
         IntraCellResource::QDRANT_REST,
         ResourceEntry::new(
             "127.0.0.1",
-            6333,
+            qdrant_port(),
             cell,
             vec!["127.0.0.1/32".parse().unwrap()],
             BTreeSet::from([caller.clone()]),

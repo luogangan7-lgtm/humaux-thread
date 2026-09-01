@@ -1,5 +1,5 @@
 //! `domain::audit` — §77 双轨审计: `AuditEvent` minimal field set, the `AuditMetadata`
-//! allowlist type, `SensitiveAdminAction`, the ten `McpAuditAction` events, and the
+//! allowlist type, `SensitiveAdminAction`, the closed `McpAuditAction` set, and the
 //! `AuditBatch` hash-chain (construction + verification only — no IO, no ObjectStore; the
 //! adapter-layer export port lives in `adapters::audit_sink`, §3/§78.3 keeps this crate free
 //! of it).
@@ -153,7 +153,7 @@ pub const SYSTEM_TENANT_ID: TenantId = TenantId(Uuid::nil());
 ///
 /// `actor_type`/`actor_id`/`action`/`resource_type`/`resource_id`/`result` stay `String`
 /// rather than closed Rust enums (§78.2): unlike `EvidenceOriginClass`'s 9 variants or
-/// `McpAuditAction`'s 10, §77 never freezes an enumerated set for any of these — inventing
+/// the closed `McpAuditAction` set, §77 never freezes an enumerated set for these — inventing
 /// one here would be structure the spec does not license, not a §78.2 compliance win.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEvent {
@@ -209,7 +209,7 @@ pub struct SensitiveAdminAction {
     pub step_up_auth_context: String,
 }
 
-/// §77 "MCP Security Audit Events" — the ten events MCP integration "至少记录" (closed set,
+/// §77 "MCP Security Audit Events" — the events MCP integration "至少记录" (closed set,
 /// unlike the general `AuditEvent.action` string field above).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpAuditAction {
@@ -223,11 +223,14 @@ pub enum McpAuditAction {
     McpQuotaReleased,
     McpClientRegistered,
     McpAuthLogin,
+    McpRequestDenied,
+    McpRequestFinished,
+    McpRequestOutcomeUnknown,
 }
 
 impl McpAuditAction {
-    /// All ten variants, §77 listing order.
-    pub const ALL: [McpAuditAction; 10] = [
+    /// All variants, §77 listing order.
+    pub const ALL: [McpAuditAction; 13] = [
         McpAuditAction::McpGrantCreated,
         McpAuditAction::McpGrantRefreshed,
         McpAuditAction::McpGrantRevoked,
@@ -238,6 +241,9 @@ impl McpAuditAction {
         McpAuditAction::McpQuotaReleased,
         McpAuditAction::McpClientRegistered,
         McpAuditAction::McpAuthLogin,
+        McpAuditAction::McpRequestDenied,
+        McpAuditAction::McpRequestFinished,
+        McpAuditAction::McpRequestOutcomeUnknown,
     ];
 
     /// SCREAMING_SNAKE wire form — the value this variant is written into
@@ -254,6 +260,9 @@ impl McpAuditAction {
             McpAuditAction::McpQuotaReleased => "MCP_QUOTA_RELEASED",
             McpAuditAction::McpClientRegistered => "MCP_CLIENT_REGISTERED",
             McpAuditAction::McpAuthLogin => "MCP_AUTH_LOGIN",
+            McpAuditAction::McpRequestDenied => "MCP_REQUEST_DENIED",
+            McpAuditAction::McpRequestFinished => "MCP_REQUEST_FINISHED",
+            McpAuditAction::McpRequestOutcomeUnknown => "MCP_REQUEST_OUTCOME_UNKNOWN",
         }
     }
 }
@@ -497,8 +506,8 @@ mod tests {
     }
 
     #[test]
-    fn mcp_audit_action_has_exactly_ten_variants() {
-        assert_eq!(McpAuditAction::ALL.len(), 10);
+    fn mcp_audit_action_has_the_complete_closed_set() {
+        assert_eq!(McpAuditAction::ALL.len(), 13);
 
         fn assert_exhaustive(a: McpAuditAction) {
             match a {
@@ -511,7 +520,10 @@ mod tests {
                 | McpAuditAction::McpQuotaConsumed
                 | McpAuditAction::McpQuotaReleased
                 | McpAuditAction::McpClientRegistered
-                | McpAuditAction::McpAuthLogin => {}
+                | McpAuditAction::McpAuthLogin
+                | McpAuditAction::McpRequestDenied
+                | McpAuditAction::McpRequestFinished
+                | McpAuditAction::McpRequestOutcomeUnknown => {}
             }
         }
         for a in McpAuditAction::ALL {
@@ -530,7 +542,7 @@ mod tests {
             );
             assert!(seen.insert(s), "duplicate wire form {s}");
         }
-        assert_eq!(seen.len(), 10);
+        assert_eq!(seen.len(), McpAuditAction::ALL.len());
     }
 
     /// Acceptance test named in the T2.8 task card: "每类 MCP_* 事件构造往返" — build an

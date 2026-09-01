@@ -373,7 +373,7 @@ impl PointId {
 /// responsibilities). Takes [`IndexablePayload`], not a bare [`QdrantPointPayload`] — §18.2's
 /// `SECRET_MATERIAL` gate (see [`QdrantPointPayload::into_indexable`]) is therefore not
 /// bypassable by calling this function directly. The caller assembles the full request
-/// (`{"points": [...]}`, plus `ha_profile.write_params_json()` for the `?ordering=` query
+/// (`{"points": [...]}`, plus a typed `?ordering=` URI control
 /// param, §17.5) once an HTTP client lands — see module doc.
 pub fn upsert_point_body(id: PointId, payload: &IndexablePayload) -> Value {
     json!({ "id": id.to_json(), "payload": payload.0.to_json() })
@@ -574,12 +574,12 @@ pub enum ReadConsistency {
 }
 
 impl ReadConsistency {
-    fn as_json(self) -> Value {
+    fn as_query_value(self) -> String {
         match self {
-            Self::Quorum => json!("quorum"),
-            Self::Majority => json!("majority"),
-            Self::All => json!("all"),
-            Self::Factor(n) => json!(n),
+            Self::Quorum => "quorum".to_owned(),
+            Self::Majority => "majority".to_owned(),
+            Self::All => "all".to_owned(),
+            Self::Factor(n) => n.to_string(),
         }
     }
 }
@@ -601,7 +601,7 @@ pub enum QdrantOperation {
 ///
 /// `write_consistency_factor` is deliberately not a field here — it is a collection-level
 /// parameter (Qdrant's `PUT /collections/{name}` body, see [`create_collection_body`]), not a
-/// per-request one; `write_params_json` below only ever emits per-request `ordering`.
+/// per-request one; the wire builder below only ever emits per-request `ordering`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HaConsistencyProfile {
     pub write_ordering: WriteOrdering,
@@ -631,21 +631,12 @@ pub fn ha_profile_for(op: QdrantOperation) -> HaConsistencyProfile {
 }
 
 impl HaConsistencyProfile {
-    /// Wire fragment for a Qdrant write request's query-string/body ordering param. Never
-    /// carries `consistency` — that is a read parameter (see [`Self::read_params_json`]);
-    /// putting it on a write request silently no-ops on Qdrant's side, which previously masked
-    /// this exact mistake.
-    pub fn write_params_json(&self) -> Value {
-        json!({ "ordering": self.write_ordering.as_str() })
+    fn write_control(&self) -> QdrantRequestControl {
+        QdrantRequestControl::Ordering(self.write_ordering)
     }
 
-    /// Wire fragment for a Qdrant read (search/scroll/count) request's `consistency` param.
-    /// Empty object when `read_consistency` is `None` — Qdrant's own single-replica default.
-    pub fn read_params_json(&self) -> Value {
-        match self.read_consistency {
-            Some(rc) => json!({ "consistency": rc.as_json() }),
-            None => json!({}),
-        }
+    fn read_control(&self) -> Option<QdrantRequestControl> {
+        self.read_consistency.map(QdrantRequestControl::Consistency)
     }
 }
 
@@ -829,6 +820,8 @@ pub enum QdrantTransportError {
     /// into a request path, rather than relying solely on `IntraCellHttpTransport::execute`'s
     /// own path validation one layer down to catch it.
     InvalidCollectionName(String),
+    /// A dense query attempted to bypass the adapter's bounded, typed query contract.
+    InvalidDenseQuery(String),
 }
 
 impl std::fmt::Display for QdrantTransportError {
@@ -840,6 +833,7 @@ impl std::fmt::Display for QdrantTransportError {
             }
             Self::UnexpectedResponseShape(s) => write!(f, "unexpected Qdrant response shape: {s}"),
             Self::InvalidCollectionName(c) => write!(f, "invalid Qdrant collection name: {c:?}"),
+            Self::InvalidDenseQuery(reason) => write!(f, "invalid dense query: {reason}"),
         }
     }
 }
@@ -861,6 +855,40 @@ fn point_id_from_json(v: &Value) -> Option<PointId> {
     v.as_str()
         .and_then(|s| Uuid::parse_str(s).ok())
         .map(PointId::Uuid)
+}
+
+/// The only controls this adapter may append to a Qdrant URI. Values originate in closed
+/// enums or a literal boolean, so no caller-provided URL fragment can reach the transport.
+#[derive(Debug, Clone, Copy)]
+enum QdrantRequestControl {
+    Wait,
+    Ordering(WriteOrdering),
+    Consistency(ReadConsistency),
+}
+
+impl QdrantRequestControl {
+    fn pair(self) -> (&'static str, String) {
+        match self {
+            Self::Wait => ("wait", "true".to_owned()),
+            Self::Ordering(ordering) => ("ordering", ordering.as_str().to_owned()),
+            Self::Consistency(consistency) => ("consistency", consistency.as_query_value()),
+        }
+    }
+}
+
+fn qdrant_path(path: String, controls: &[QdrantRequestControl]) -> String {
+    if controls.is_empty() {
+        return path;
+    }
+    let params = controls
+        .iter()
+        .map(|control| {
+            let (name, value) = control.pair();
+            format!("{name}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{path}?{params}")
 }
 
 async fn call(
@@ -918,12 +946,201 @@ fn validate_collection(collection: &str) -> Result<(), QdrantTransportError> {
     }
 }
 
+/// A dense candidate is only a Qdrant point id and similarity score. It is deliberately not a
+/// materialized or authorized body; callers must perform their own final authoritative read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DenseCandidate {
+    pub point_id: PointId,
+    pub score: f64,
+}
+
+/// Exact vector-space identity required by every dense query. Keeping the two versions in one
+/// named value prevents call sites from silently omitting either half of the projection contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenseQueryVersions<'a> {
+    pub projection: &'a str,
+    pub embedding: &'a str,
+}
+
+/// One fully-scoped Qdrant dense query. Its sole constructor makes tenant/visibility,
+/// projection version, placement and tombstone overlay non-optional.
+#[derive(Debug, Clone)]
+pub struct DenseQuery {
+    collection: String,
+    shard_key: Option<String>,
+    filter: DenseQueryFilter,
+    vector: Vec<f32>,
+    limit: u32,
+    tombstoned: Vec<PointId>,
+    ha_profile: HaConsistencyProfile,
+}
+
+impl DenseQuery {
+    pub fn new(
+        scope: &AuthorizationScope,
+        placement: &TenantPlacementRow,
+        versions: DenseQueryVersions<'_>,
+        vector: Vec<f32>,
+        limit: u32,
+        tombstoned: Vec<PointId>,
+        ha_profile: HaConsistencyProfile,
+    ) -> Result<Self, QdrantTransportError> {
+        if placement.tenant_id != scope.tenant_id() {
+            return Err(QdrantTransportError::InvalidDenseQuery(
+                "placement tenant differs from authorization scope".to_owned(),
+            ));
+        }
+        validate_collection(&placement.collection_name)?;
+        if versions.projection.trim().is_empty() {
+            return Err(QdrantTransportError::InvalidDenseQuery(
+                "projection_version is empty".to_owned(),
+            ));
+        }
+        if versions.embedding.trim().is_empty() {
+            return Err(QdrantTransportError::InvalidDenseQuery(
+                "embedding_version is empty".to_owned(),
+            ));
+        }
+        if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+            return Err(QdrantTransportError::InvalidDenseQuery(
+                "vector must be non-empty and finite".to_owned(),
+            ));
+        }
+        if limit == 0 {
+            return Err(QdrantTransportError::InvalidDenseQuery(
+                "limit must be nonzero".to_owned(),
+            ));
+        }
+        if placement
+            .shard_key
+            .as_deref()
+            .is_some_and(|key| key.is_empty() || key.chars().any(|c| c.is_control()))
+        {
+            return Err(QdrantTransportError::InvalidDenseQuery(
+                "placement shard key is invalid".to_owned(),
+            ));
+        }
+        Ok(Self {
+            collection: placement.collection_name.clone(),
+            shard_key: placement.shard_key.clone(),
+            filter: build_dense_filter(
+                scope,
+                &[
+                    FieldMatch {
+                        field: "projection_version",
+                        value: versions.projection.to_owned(),
+                    },
+                    FieldMatch {
+                        field: "embedding_version",
+                        value: versions.embedding.to_owned(),
+                    },
+                ],
+            ),
+            vector,
+            limit,
+            tombstoned,
+            ha_profile,
+        })
+    }
+}
+
+/// Qdrant's documented points/query dense-vector shape.
+/// Payloads and vectors are never returned: this is candidate discovery only.
+pub fn dense_query_body(query: &DenseQuery) -> Value {
+    let mut body = json!({
+        "query": query.vector,
+        "filter": overlay_filter(condition_to_filter(&query.filter), &query.tombstoned),
+        "limit": query.limit,
+        "with_payload": false,
+        "with_vector": false,
+    });
+    if let Some(shard_key) = &query.shard_key {
+        body.as_object_mut()
+            .expect("dense query body is an object")
+            .insert("shard_key".to_owned(), json!(shard_key));
+    }
+    body
+}
+
+fn parse_dense_candidates(
+    result: &Value,
+    limit: u32,
+) -> Result<Vec<DenseCandidate>, QdrantTransportError> {
+    let points = result
+        .get("result")
+        .and_then(|value| value.get("points"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            QdrantTransportError::UnexpectedResponseShape(
+                "missing result.points for dense query".to_owned(),
+            )
+        })?;
+    if points.len() > limit as usize {
+        return Err(QdrantTransportError::UnexpectedResponseShape(
+            "dense query response exceeds requested limit".to_owned(),
+        ));
+    }
+    let mut ids = std::collections::HashSet::new();
+    points
+        .iter()
+        .map(|point| {
+            let point_id = point
+                .get("id")
+                .and_then(point_id_from_json)
+                .ok_or_else(|| {
+                    QdrantTransportError::UnexpectedResponseShape(
+                        "dense candidate has invalid id".to_owned(),
+                    )
+                })?;
+            let score = point.get("score").and_then(Value::as_f64).ok_or_else(|| {
+                QdrantTransportError::UnexpectedResponseShape(
+                    "dense candidate has invalid score".to_owned(),
+                )
+            })?;
+            if !score.is_finite() {
+                return Err(QdrantTransportError::UnexpectedResponseShape(
+                    "dense candidate score is non-finite".to_owned(),
+                ));
+            }
+            if !ids.insert(point_id) {
+                return Err(QdrantTransportError::UnexpectedResponseShape(
+                    "dense query response contains duplicate point id".to_owned(),
+                ));
+            }
+            Ok(DenseCandidate { point_id, score })
+        })
+        .collect()
+}
+
+/// Executes one permit-bound dense query. This never substitutes scroll for nearest-neighbour
+/// query and returns candidates only; authoritative bodies remain a later read boundary.
+pub async fn query_dense(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    query: &DenseQuery,
+) -> Result<Vec<DenseCandidate>, QdrantTransportError> {
+    let path = format!("/collections/{}/points/query", query.collection);
+    let path = match query.ha_profile.read_control() {
+        Some(control) => qdrant_path(path, &[control]),
+        None => path,
+    };
+    let result = call(
+        transport,
+        permit,
+        IntraCellMethod::Post,
+        path,
+        Some(dense_query_body(query)),
+    )
+    .await?;
+    parse_dense_candidates(&result, query.limit)
+}
+
 /// §17's `PUT /collections/{name}/points` upsert, wired to a real [`IntraCellHttpTransport`].
 /// `vector` is required here (unlike [`upsert_point_body`], which deliberately omits it —
 /// embedding production is a separate concern from body-shaping): a real Qdrant collection with
 /// a configured vector size rejects a point that omits it, so the live wire call needs one.
-/// `ha_profile.write_params_json()`'s `ordering` (§17.5) is folded into the request body
-/// alongside `points`, matching Qdrant's REST API accepting write-ordering as a body field.
+/// `ha_profile`'s `ordering` (§17.5) is appended as Qdrant's documented URI control; the body
+/// contains only point data.
 pub async fn upsert(
     transport: &dyn IntraCellHttpTransport,
     permit: &CellAccessPermit,
@@ -942,15 +1159,15 @@ pub async fn upsert(
             body
         })
         .collect();
-    let mut body = ha_profile.write_params_json();
-    body.as_object_mut()
-        .expect("write_params_json always returns an object")
-        .insert("points".into(), json!(points_json));
+    let body = json!({ "points": points_json });
     call(
         transport,
         permit,
         IntraCellMethod::Put,
-        format!("/collections/{collection}/points?wait=true"),
+        qdrant_path(
+            format!("/collections/{collection}/points"),
+            &[QdrantRequestControl::Wait, ha_profile.write_control()],
+        ),
         Some(body),
     )
     .await?;

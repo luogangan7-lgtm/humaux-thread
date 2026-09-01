@@ -17,6 +17,7 @@ mod metrics_registry;
 mod migrate;
 mod migration_rehearsal;
 mod phase;
+mod r4_fault_manifest;
 mod rls_check;
 mod threshold_shape;
 
@@ -35,12 +36,13 @@ fn main() {
         Some("gate-registry") => gate_registry::run(&args[2..]),
         Some("dod-check") => dod_check::run(&args[2..]),
         Some("phase-check") => phase::run(&args[2..]),
+        Some("r4-fault-manifest") => r4_fault_manifest::run(&args[2..]),
         Some("direction-table") => direction_table::run(&args[2..]),
         Some("card-version") => card_version::run(&args[2..]),
         Some("migrate") => migrate::run(&args[2..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|direction-table|card-version>"
+                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|r4-fault-manifest|direction-table|card-version>"
             );
             2
         }

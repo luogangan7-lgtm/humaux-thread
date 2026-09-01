@@ -9,7 +9,7 @@
 use std::sync::Mutex;
 
 use humaux_adapters::jobs::{self, FailInput, JobStatus};
-use humaux_adapters::postgres::RuntimeDbPool;
+use humaux_adapters::postgres::{PrivateWorkerDbPool, RuntimeDbPool};
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
 use sqlx::types::Uuid;
@@ -33,6 +33,7 @@ fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
 struct Handle {
     rt: tokio::runtime::Runtime,
     gateway: RuntimeDbPool,
+    private: PrivateWorkerDbPool,
     admin: Client,
     tenant_id: Uuid,
     /// `role_gateway` DSN, kept around so the concurrency test below can open one independent
@@ -92,10 +93,17 @@ impl DbIntegrationFixture for JobsFixture {
         let gateway = rt
             .block_on(RuntimeDbPool::connect(&gateway_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        let private = rt
+            .block_on(PrivateWorkerDbPool::connect(&dsn_as_role(
+                &dsn,
+                "role_private_worker",
+            )))
+            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 
         Ok(Handle {
             rt,
             gateway,
+            private,
             admin,
             tenant_id,
             gateway_dsn,
@@ -105,16 +113,20 @@ impl DbIntegrationFixture for JobsFixture {
 
 /// Seeds one `PENDING` `ops.jobs` row, claimable immediately (`next_retry_at = now()` — see
 /// `jobs.rs`'s module doc on why this must be set explicitly). Returns its `job_id`.
-fn seed_pending(handle: &mut Handle, idempotency_key: &str) -> Uuid {
+fn seed_pending_with_type(handle: &mut Handle, job_type: &str, idempotency_key: &str) -> Uuid {
     handle
         .admin
         .query_one(
             "INSERT INTO ops.jobs (tenant_id, job_type, idempotency_key, next_retry_at) \
-             VALUES ($1, 'test.noop', $2, now()) RETURNING job_id",
-            &[&handle.tenant_id, &idempotency_key],
+             VALUES ($1, $2, $3, now()) RETURNING job_id",
+            &[&handle.tenant_id, &job_type, &idempotency_key],
         )
         .expect("seed PENDING job")
         .get(0)
+}
+
+fn seed_pending(handle: &mut Handle, idempotency_key: &str) -> Uuid {
+    seed_pending_with_type(handle, "test.noop", idempotency_key)
 }
 
 fn job_status(handle: &mut Handle, job_id: Uuid) -> String {
@@ -250,6 +262,7 @@ fn waiting_key_round_trip_does_not_increment_attempt() {
                     tenant_id,
                     job_id,
                     "wk-worker",
+                    claimed[0].attempt,
                 ))
                 .expect("mark_waiting_key must not error");
             assert!(
@@ -295,7 +308,7 @@ fn dead_is_reachable_once_retry_budget_is_exhausted() {
             let job_id = seed_pending(&mut handle, &format!("dead-{}", Uuid::new_v4()));
             let tenant_id = handle.tenant_id;
 
-            handle
+            let claimed = handle
                 .rt
                 .block_on(jobs::claim(
                     &handle.gateway,
@@ -305,6 +318,7 @@ fn dead_is_reachable_once_retry_budget_is_exhausted() {
                     1,
                 ))
                 .expect("claim must succeed");
+            let attempt = claimed[0].attempt;
 
             let outcome = handle
                 .rt
@@ -314,6 +328,7 @@ fn dead_is_reachable_once_retry_budget_is_exhausted() {
                     FailInput {
                         job_id,
                         lease_owner: "dead-worker",
+                        attempt,
                         error_class: "boom",
                         retryable: true,
                         max_attempts: 1,
@@ -338,7 +353,7 @@ fn non_retryable_failure_reaches_failed_not_dead() {
             let job_id = seed_pending(&mut handle, &format!("failed-{}", Uuid::new_v4()));
             let tenant_id = handle.tenant_id;
 
-            handle
+            let claimed = handle
                 .rt
                 .block_on(jobs::claim(
                     &handle.gateway,
@@ -348,6 +363,7 @@ fn non_retryable_failure_reaches_failed_not_dead() {
                     1,
                 ))
                 .expect("claim must succeed");
+            let attempt = claimed[0].attempt;
 
             let outcome = handle
                 .rt
@@ -357,6 +373,7 @@ fn non_retryable_failure_reaches_failed_not_dead() {
                     FailInput {
                         job_id,
                         lease_owner: "failed-worker",
+                        attempt,
                         error_class: "permanent_schema_violation",
                         retryable: false,
                         max_attempts: 100,
@@ -378,7 +395,7 @@ fn complete_transitions_processing_to_done() {
         let job_id = seed_pending(&mut handle, &format!("done-{}", Uuid::new_v4()));
         let tenant_id = handle.tenant_id;
 
-        handle
+        let claimed = handle
             .rt
             .block_on(jobs::claim(
                 &handle.gateway,
@@ -396,6 +413,7 @@ fn complete_transitions_processing_to_done() {
                 tenant_id,
                 job_id,
                 "done-worker",
+                claimed[0].attempt,
             ))
             .expect("complete must not error");
         assert!(completed);
@@ -411,7 +429,7 @@ fn heartbeat_extends_lease_expiry() {
         let job_id = seed_pending(&mut handle, &format!("heartbeat-{}", Uuid::new_v4()));
         let tenant_id = handle.tenant_id;
 
-        handle
+        let claimed = handle
             .rt
             .block_on(jobs::claim(&handle.gateway, tenant_id, "hb-worker", 5.0, 1))
             .expect("claim must succeed");
@@ -432,6 +450,7 @@ fn heartbeat_extends_lease_expiry() {
                 tenant_id,
                 job_id,
                 "hb-worker",
+                claimed[0].attempt,
                 600.0,
             ))
             .expect("heartbeat must not error");
@@ -463,7 +482,7 @@ fn heartbeat_after_lease_lost_is_a_no_op() {
         let job_id = seed_pending(&mut handle, &format!("lost-lease-{}", Uuid::new_v4()));
         let tenant_id = handle.tenant_id;
 
-        handle
+        let claimed = handle
             .rt
             .block_on(jobs::claim(
                 &handle.gateway,
@@ -492,6 +511,7 @@ fn heartbeat_after_lease_lost_is_a_no_op() {
                 tenant_id,
                 job_id,
                 "original-owner",
+                claimed[0].attempt,
                 600.0,
             ))
             .expect("heartbeat must not itself error, just report no-op");
@@ -527,6 +547,326 @@ fn claim_on_empty_table_returns_empty_without_blocking() {
                 claimed.is_empty(),
                 "no PENDING/RETRY_WAIT rows exist for this tenant"
             );
+        },
+    );
+}
+
+/// `attempt` is the sole monotonic fencing token: even the same owner cannot finish a job with
+/// its first claim after a reaper has made it claimable and it has been claimed again.
+#[test]
+fn same_owner_reclaim_rejects_old_attempt() {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<JobsFixture, _>("same_owner_reclaim_rejects_old_attempt", |mut handle| {
+        let job_id = seed_pending(&mut handle, &format!("fence-reclaim-{}", Uuid::new_v4()));
+        let tenant_id = handle.tenant_id;
+        let first = handle
+            .rt
+            .block_on(jobs::claim(
+                &handle.gateway,
+                tenant_id,
+                "same-owner",
+                60.0,
+                1,
+            ))
+            .expect("first claim")
+            .remove(0);
+        handle
+            .admin
+            .execute(
+                "UPDATE ops.jobs SET status = 'PENDING', lease_owner = NULL, \
+                 lease_expires_at = NULL, next_retry_at = clock_timestamp() WHERE job_id = $1",
+                &[&job_id],
+            )
+            .expect("simulate reaper requeue");
+        let second = handle
+            .rt
+            .block_on(jobs::claim(
+                &handle.gateway,
+                tenant_id,
+                "same-owner",
+                60.0,
+                1,
+            ))
+            .expect("second claim")
+            .remove(0);
+        assert_eq!(second.attempt, first.attempt + 1);
+        assert!(
+            !handle
+                .rt
+                .block_on(jobs::complete(
+                    &handle.gateway,
+                    tenant_id,
+                    job_id,
+                    "same-owner",
+                    first.attempt,
+                ))
+                .expect("stale completion query"),
+            "same owner with an old attempt must not complete the reclaimed lease"
+        );
+        assert!(
+            handle
+                .rt
+                .block_on(jobs::complete(
+                    &handle.gateway,
+                    tenant_id,
+                    job_id,
+                    "same-owner",
+                    second.attempt,
+                ))
+                .expect("current completion query")
+        );
+    });
+}
+
+/// Every lease-sensitive transition rejects an expired lease, even when owner and attempt still
+/// match. This uses PostgreSQL's clock, so no timing sleep manufactures the expiry ordering.
+#[test]
+fn expired_lease_rejects_sensitive_transitions() {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<JobsFixture, _>(
+        "expired_lease_rejects_sensitive_transitions",
+        |mut handle| {
+            let job_id = seed_pending(&mut handle, &format!("expired-{}", Uuid::new_v4()));
+            let tenant_id = handle.tenant_id;
+            let claimed = handle
+                .rt
+                .block_on(jobs::claim(
+                    &handle.gateway,
+                    tenant_id,
+                    "expired-owner",
+                    60.0,
+                    1,
+                ))
+                .expect("claim")
+                .remove(0);
+            handle
+            .admin
+            .execute(
+                "UPDATE ops.jobs SET lease_expires_at = clock_timestamp() - interval '1 second' \
+                 WHERE job_id = $1",
+                &[&job_id],
+            )
+            .expect("expire lease");
+            assert!(
+                !handle
+                    .rt
+                    .block_on(jobs::heartbeat(
+                        &handle.gateway,
+                        tenant_id,
+                        job_id,
+                        "expired-owner",
+                        claimed.attempt,
+                        60.0,
+                    ))
+                    .expect("expired heartbeat query")
+            );
+            assert_eq!(
+                handle
+                    .rt
+                    .block_on(jobs::fail(
+                        &handle.gateway,
+                        tenant_id,
+                        FailInput {
+                            job_id,
+                            lease_owner: "expired-owner",
+                            attempt: claimed.attempt,
+                            error_class: "expired",
+                            retryable: false,
+                            max_attempts: 1,
+                            retry_after_seconds: 1.0,
+                        },
+                    ))
+                    .expect("expired fail query"),
+                None,
+            );
+            assert!(
+                !handle
+                    .rt
+                    .block_on(jobs::mark_waiting_key(
+                        &handle.gateway,
+                        tenant_id,
+                        job_id,
+                        "expired-owner",
+                        claimed.attempt,
+                    ))
+                    .expect("expired wait query")
+            );
+            assert!(
+                !handle
+                    .rt
+                    .block_on(jobs::complete(
+                        &handle.gateway,
+                        tenant_id,
+                        job_id,
+                        "expired-owner",
+                        claimed.attempt,
+                    ))
+                    .expect("expired complete query")
+            );
+            assert_eq!(job_status(&mut handle, job_id), "PROCESSING");
+        },
+    );
+}
+
+/// A stale token cannot heartbeat, fail, or complete a still-live lease.
+#[test]
+fn stale_attempt_rejects_heartbeat_fail_and_complete() {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<JobsFixture, _>(
+        "stale_attempt_rejects_heartbeat_fail_and_complete",
+        |mut handle| {
+            let job_id = seed_pending(&mut handle, &format!("stale-{}", Uuid::new_v4()));
+            let tenant_id = handle.tenant_id;
+            let claimed = handle
+                .rt
+                .block_on(jobs::claim(
+                    &handle.gateway,
+                    tenant_id,
+                    "stale-owner",
+                    60.0,
+                    1,
+                ))
+                .expect("claim")
+                .remove(0);
+            let stale_attempt = claimed.attempt - 1;
+            assert!(
+                !handle
+                    .rt
+                    .block_on(jobs::heartbeat(
+                        &handle.gateway,
+                        tenant_id,
+                        job_id,
+                        "stale-owner",
+                        stale_attempt,
+                        60.0,
+                    ))
+                    .expect("stale heartbeat query")
+            );
+            assert_eq!(
+                handle
+                    .rt
+                    .block_on(jobs::fail(
+                        &handle.gateway,
+                        tenant_id,
+                        FailInput {
+                            job_id,
+                            lease_owner: "stale-owner",
+                            attempt: stale_attempt,
+                            error_class: "stale",
+                            retryable: false,
+                            max_attempts: 1,
+                            retry_after_seconds: 1.0,
+                        },
+                    ))
+                    .expect("stale fail query"),
+                None,
+            );
+            assert!(
+                !handle
+                    .rt
+                    .block_on(jobs::complete(
+                        &handle.gateway,
+                        tenant_id,
+                        job_id,
+                        "stale-owner",
+                        stale_attempt,
+                    ))
+                    .expect("stale complete query")
+            );
+            assert!(
+                handle
+                    .rt
+                    .block_on(jobs::complete(
+                        &handle.gateway,
+                        tenant_id,
+                        job_id,
+                        "stale-owner",
+                        claimed.attempt,
+                    ))
+                    .expect("current complete query")
+            );
+        },
+    );
+}
+
+/// Generic workers cannot steal any `PUBLIC_` job, and the private worker claims only the
+/// contribution execution kind. Public dispatch ownership stays in `public_repo`, whose
+/// SECURITY DEFINER entry points are tested by the public-runtime suite.
+#[test]
+fn generic_and_private_claims_preserve_public_boundary() {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<JobsFixture, _>(
+        "generic_and_private_claims_preserve_public_boundary",
+        |mut handle| {
+            let tenant_id = handle.tenant_id;
+            let generic = seed_pending(&mut handle, &format!("generic-{}", Uuid::new_v4()));
+            let contribution = seed_pending_with_type(
+                &mut handle,
+                "CONTRIBUTION_EXECUTE",
+                &format!("contribution-{}", Uuid::new_v4()),
+            );
+            let mut public_ids = Vec::new();
+            // The tenant-bearing queue has exactly these three public kinds. Anonymous
+            // release/revoke work lives in ops.public_anonymous_dispatches and is exercised by
+            // public_runtime; seeding it into ops.jobs would blur the 0123 boundary this test
+            // protects.
+            for kind in [
+                "PUBLIC_RELEASE_APPLY",
+                "PUBLIC_REVOKE_APPLY",
+                "PUBLIC_PROJECT",
+            ] {
+                public_ids.push(seed_pending_with_type(
+                    &mut handle,
+                    kind,
+                    &format!("{kind}-{}", Uuid::new_v4()),
+                ));
+            }
+            let deferred = seed_pending_with_type(
+                &mut handle,
+                "PUBLIC_SYNTHESIS_REBUILD",
+                &format!("deferred-{}", Uuid::new_v4()),
+            );
+            let generic_claimed = handle
+                .rt
+                .block_on(jobs::claim(&handle.gateway, tenant_id, "generic", 60.0, 8))
+                .expect("generic claim");
+            assert_eq!(
+                generic_claimed.iter().map(|j| j.job_id).collect::<Vec<_>>(),
+                vec![generic]
+            );
+            assert_eq!(job_status(&mut handle, contribution), "PENDING");
+            // Seed after the generic claim: this row is a negative control for the exact
+            // contribution-only private claim, not a claim about the existing generic scope.
+            let private_other = seed_pending_with_type(
+                &mut handle,
+                "PRIVATE_OTHER",
+                &format!("private-other-{}", Uuid::new_v4()),
+            );
+            let contribution_claimed = handle
+                .rt
+                .block_on(jobs::private_claim(
+                    &handle.private,
+                    tenant_id,
+                    "private",
+                    60.0,
+                    8,
+                ))
+                .expect("private contribution claim");
+            assert_eq!(
+                contribution_claimed
+                    .iter()
+                    .map(|j| j.job_id)
+                    .collect::<Vec<_>>(),
+                vec![contribution]
+            );
+            assert_eq!(contribution_claimed[0].job_type, "CONTRIBUTION_EXECUTE");
+            assert_eq!(contribution_claimed[0].attempt, 1);
+            assert!(contribution_claimed[0].lease_expires_at.is_some());
+            assert_eq!(job_status(&mut handle, private_other), "PENDING");
+            for public_id in public_ids {
+                assert_eq!(job_status(&mut handle, public_id), "PENDING");
+            }
+            assert_eq!(job_status(&mut handle, deferred), "PENDING");
         },
     );
 }

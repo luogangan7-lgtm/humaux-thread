@@ -387,9 +387,9 @@ envelope 必须能表达这四层各自的「你看不到什么」。**字段全
 REVOKED_SOURCE -> recompute support closure -> invalidate unsupported descendants -> rebuild affected public projections
 ```
 
-维护 `public.provenance_edges` 与可重建的物化闭包 `public.source_closure(release_id, public_node_id, depth)`。`ContributionRelease` 除隐私授权外记录 `rights_basis` / `source_license` / `contributor_attestation` / `redistribution_policy`，技术 provenance 与使用权 provenance 分开保存。
+维护直接 provenance 与可重建的物化闭包。闭包的唯一物理契约见 §12.3；用户来源到 release 的 FK 与权利快照见 §12.1 / §70.5，撤销消费链见 §13。本节不维护第二份 closure 列表。
 
-**当前实测**：公池 6778 条全 `asserted`，`corroboration > 1` 零条，`source_closure` 深度恒为 1 ⇒ 闭包传播路径在生产上**从未取过值**。按 §1.14 标 `NOT_APPLICABLE_YET`，不进 DoD。
+**历史基线实测**：当时公池 6778 条全 `asserted`，`corroboration > 1` 零条，`source_closure` 深度恒为 1；这不是当前进度断言。当前 applicability 只读取 §1.14 注册表 ch=12，不能用本地 depth-2 夹具替代生产分母或据此宣布 DOD-054 通过。
 
 ## 1.12 MCP 跨平台兼容契约（保留）
 
@@ -433,20 +433,7 @@ ch | mechanism | activation_kind | min_denominator | probe | bootstrap_value | b
   不参与 Phase 10/17、DoD、release gate 的实时判定。
 - `note` —— 量纲/口径/历史背景。
 
-Runtime authority 只有：
-
-```text
-ops.mechanism_observations
-  deployment_id
-  cell_id
-  mechanism_id
-  value
-  scanned_n?
-  measured_at
-  derived_status
-  probe_version
-  binary_build
-```
+Runtime Observation 与 E2E 关联的字段和权威边界唯一见 §1.14.1；本节不另抄字段副本。
 
 运行期 `derived_status` ∈ `ACTIVE | NOT_APPLICABLE_YET | STALE`，由
 `(MechanismSpec, latest fresh MechanismObservation, e2e evidence)` 计算；
@@ -550,7 +537,7 @@ ops.mechanism_observations
 | G0 唯一副本 | 全文 `mechanism-registry` 围栏个数；围栏 schema 必须恰为 8 列且第三列只允许 `NO_MECHANISM/ALWAYS/DENOMINATOR_GATED` | 围栏 ≠ 1、列数 != 8、或出现 runtime `status/current_value/measured_at` 列 ⇒ 红 | 把 runtime status 列重新加回 registry header ⇒ 红；删除整个围栏 ⇒ 1→0 ⇒ 红 |
 | G1 覆盖 | 注册表 `ch` 去重集合 vs 全文 `^# N.` 的 N 集合（当前双方均为 1..84） | 两集合不相等 | 加一个顶级章不加行 ⇒ 差集 `{85}` 非空 ⇒ 红 |
 | G2 锚可解析 | 每行 `ch` 能否定位到实际标题行 | 定位失败 | 把 §67 的章号改掉 ⇒ ch=67 无锚 ⇒ 红 |
-| G3 ACTIVE 取过值 | target deployment/cell 的 latest Observation + 最近一次 e2e 前后 delta；只读 `ops.mechanism_observations` | Phase 0 无 e2e ⇒ `no_data`；应 ACTIVE 的机制 delta=0 ⇒ runtime `STALE`；**不得读 bootstrap 列补值** | 注释掉 §22.5 唯一自增点 ⇒ ch=22 live observation 无有效 delta ⇒ STALE；把 evaluator 改成读取 bootstrap_value ⇒ 专门的 `bootstrap_not_runtime` fixture 红 |
+| G3 ACTIVE 取过值 | target deployment/cell 的 latest Observation + 最近一次显式关联 e2e 前后 delta；只读 §1.14.1 的 Observation + run 关联 | Phase 0 无 e2e ⇒ `no_data`；应 ACTIVE 的机制无正向 delta ⇒ runtime `STALE`；**不得读 bootstrap 列补值** | 注释掉 §22.5 唯一自增点 ⇒ ch=22 live observation 无有效 delta ⇒ STALE；把 evaluator 改成读取 bootstrap_value ⇒ 专门的 `bootstrap_not_runtime` fixture 红 |
 | G4 保鲜 | `ops.mechanism_observations.measured_at` 与 `scanned_n` | >90 天或 `scanned_n==0` ⇒ latest Observation 派生 STALE；§69 对目标 deployment/cell 输出 `cannot_establish` | 将 observation 回拨 91 天 ⇒ 红；把扫描域指空 ⇒ runtime STALE |
 | G5 回收 | Static Spec 的 `activation_kind/min_denominator/probe` vs target deployment/cell latest **live** Observation.value | `DENOMINATOR_GATED` 达阈值后仍 `NOT_APPLICABLE_YET` ⇒ 红；无 fresh Observation ⇒ STALE/cannot_establish；bootstrap_value 禁止参与 | 造 1 条 corroboration>1 ⇒ live value=1 达阈，状态不转 ACTIVE ⇒ 红；只改 bootstrap_value=999 而 live value=0 ⇒ 仍 NOT_APPLICABLE_YET，若转 ACTIVE 则红 |
 
@@ -597,7 +584,43 @@ MechanismObservation authority
       derived_status
       probe_version
       binary_build
+      scope_hash?  # §4.4 扫描域；历史行 NULL 不补造
+
+MechanismE2eEvidence authority
+  = ops.mechanism_e2e_runs
+      run_id
+      deployment_id
+      cell_id
+      mechanism_id
+      before_observation_id  # FK -> Observation
+      after_observation_id   # FK -> Observation，唯一完成收据
+      scope_hash
+      probe_version
+      binary_build
+      started_at
+      completed_at
 ```
+
+`mechanism_id` 复用 §50.1 的 `ch:mechanism` 引用格式，不在 DB 复制 StaticSpec。
+Observer 必须按 `(deployment_id, cell_id, mechanism_id)` 选 latest，顺序为
+`measured_at DESC, created_at DESC, observation_id DESC`；新行过期/非法时不得回退旧 ACTIVE。
+`derived_status` 是当时计算的缓存，读取时重算；手工 ACTIVE 不构成 E2E 证据。
+缺运行 target 参数明确报告缺参数；已配置 target 无行是 `no_data -> STALE/cannot_establish`，
+不许固定返回“表未部署”或借别的 cell/markdown bootstrap 补值。
+
+E2E run 只由受控运维执行器在 `probe(before) -> 已登记的真实业务操作 -> probe(after)` 后记录，
+不提供任意 SQL/命令/回调的“成功”接口。两端必须同 target/mechanism、同非空 `scope_hash`、
+同 probe_version/binary_build，且 `started_at <= before.measured_at < after.measured_at <= completed_at <= now`。
+执行器在 bootstrap 固定 deployment/build，cell 从既有资源 registry 的 local identity 取得；
+业务池与测量池的 registry cell、实际 PostgreSQL database/server identity 必须一致且可确认。
+每次调用不得重传 target/build；错配在业务操作前拒绝。部署配置仍是信任边界，数据库身份校验
+不是对运维者自报部署标签的独立认证。run 本身的 `scope_hash` 读取时也须与两端逐一比较。
+运行时仅使用 `after_observation_id` 等于 latest 的显式收据，正向 delta 才能说明本轮取过值；
+相邻记录、计数器重置和自报状态不能代替收据。这是执行与测量证据，不是 §55.7 的机制因果实验。
+Observation 与完成的 run 均 append-only；更正追加新行，禁止 UPDATE/DELETE/TRUNCATE。
+历史行的 hash/run 缺失不伪回填。fresh 非空、低于门槛的观测仍可 NA；缺 hash/run 只阻止进入 ACTIVE。
+`scanned_n` 未知/零、未来时间、超 G4 年龄、负值、版本/构建缺失均不能派生 ACTIVE。
+读取角色、写入角色和精确权限仅见 §6.2；只读 admin 不复用 maintenance 凭证。
 
 CI 不再把 production `current_value/status/measured_at` 自动写回 canonical md。`humaux-admin render mechanism-registry --deployment ... --cell ...` 将 static spec 与目标 Observation JOIN 后渲染。
 
@@ -793,7 +816,7 @@ Adapters depend on Domain; Domain does not depend on Adapters.
 | `humaux-private-worker` | **唯一**能解 BYOK 的进程 | — | — |
 | `humaux-consolidation-worker` | **不解密 BYOK**；仅 `role_consolidation_worker` DB pool；LLM 请求走 private-worker 的内部 `PrivateReasoningPort` | Dream 不能持有基础 Memory 写权限 | snapshot selection + LLM wait |
 | `humaux-retrieval-worker` | PLATFORM_RETRIEVAL provider credential ref | provider/API 故障与在线请求隔离 | Provider admission / cache / network I/O；**不加载模型权重** |
-| `humaux-public-worker` | PLATFORM_PUBLIC key，无 private schema 权限 | — | — |
+| `humaux-public-worker` | PLATFORM_PUBLIC key；仅匿名 public objects、direct provenance、aggregate trust 与获授权的 sanitized-envelope 列；无 private/protected-lineage/完整 staging-row 权限 | — | — |
 | `humaux-maintenance` | 备份/恢复凭证 | 恢复演练失败不得影响在线 | 备份 IO 尖峰 |
 | `parse-sandbox`（非常驻，worker spawn/exec） | **零凭证** | 不可信输入，崩溃即回收 | 见 4.3 上限 |
 | `humaux-admin`（一次性 CLI） | 只读 DB 角色 | — | — |
@@ -839,8 +862,8 @@ Adapters depend on Domain; Domain does not depend on Adapters.
 
 | name | 回答什么 | `scanned_n` 的分母 |
 |---|---|---|
-| `public.corroborated` | 公池 `corroboration>1` 条数 | `public.claims` 全表（§48 canonical public schema 里承载公池那 6778 条断言的表） |
-| `public.consensus_ready` | 满足 ≥4 独立贡献者的条数 | 同上 |
+| `public.corroborated` | §12.6 当前有效来源收据中 independent_support_count>1、身份完整的可用 claim 条数 | `public.claims` 全表（§48 canonical public schema 里承载公池那 6778 条断言的表） |
+| `public.consensus_ready` | 同上当前有效来源收据中 ≥4 独立贡献者、身份完整的可用 claim 条数 | 同上 |
 | `stream.watermark` | 每条 stream 的 checkpoint 与滞后 | `stream_checkpoints` 行数 |
 | `outbox.backlog` | 未投递 outbox 数与最老 age | 未投递行 |
 | `jobs.stuck` | lease 过期未续租的 job | 在租行 |
@@ -1044,7 +1067,7 @@ idf.corpus = USER_PRIVATE(current user)
 
 ```text
 runtime role     = role_gateway · role_private_worker · role_consolidation_worker · role_public_worker · role_retrieval_worker
-非 runtime role  = role_batch_issuer · role_maintenance · role_migration_owner
+非 runtime role  = role_batch_issuer · role_maintenance · role_admin · role_migration_owner
 ```
 
 判据是两条同时成立，不是「听起来像不像运行时」：**持有常驻连接池**（请求路径或常驻 worker），且**不拥有任何表**（§48.2）。凡「runtime role 无 X 权限」的断言，指对上面五个角色**逐个**成立 —— 五个里有一个成立不了，该断言就是假的。
@@ -1061,20 +1084,22 @@ runtime role     = role_gateway · role_private_worker · role_consolidation_wor
 
 | role | 连接池 | `control.*` | `private.*` | `staging.*` | `public.*` | `projection.*` | `coord.*` | `ops.*` |
 |---|---|---|---|---|---|---|---|---|
-| `role_gateway` | request | R | R + W | — | R | R | R + W | R + W |
-| `role_private_worker` | worker | R | R + W | W（release） | — | — | R | R + W |
-| `role_consolidation_worker` | consolidation（独立进程/独立池） | R | R | — | — | — | R | R |
-| `role_public_worker` | worker | R | — | R（release） | R + W | — | R | R + W |
-| `role_retrieval_worker` | worker | R | R（仅 RetrievalCard 面，无 LLM secret） | — | R | R + W | R | R + W |
-| `role_batch_issuer` | batch（独立池，仅 `begin_batch`） | — | — | — | — | — | — | — |
-| `role_maintenance` | ops（repair job） | R | R | R | R | R | R | R |
-| `role_migration_owner` | migration only（不进任何应用连接池） | owner | owner | owner | owner | owner | owner | owner |
+| `role_gateway` | request | R | R + W | — | R | R | R + W | R + W | — | — | — |
+| `role_private_worker` | worker | R | R + W | W（release） | — | — | R | R + W | SELECT | SELECT | SELECT |
+| `role_consolidation_worker` | consolidation（独立进程/独立池） | R | R | — | — | — | R | R | — | — | — |
+| `role_public_worker` | worker | R | — | R（release） | R + W | — | R | R + W | — | — | — |
+| `role_retrieval_worker` | worker | R | R（仅 RetrievalCard 面，无 LLM secret） | — | R | R + W | R | R + W | — | — | — |
+| `role_batch_issuer` | batch（独立池，仅 `begin_batch`） | — | — | — | — | — | — | — | — | — | — |
+| `role_maintenance` | ops（repair job） | R | R | R | R | R | R | R | — | — | — |
+| `role_admin` | admin（一次性只读） | — | — | — | — | — | — | — | — | — | — |
+| `role_migration_owner` | migration only（不进任何应用连接池） | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner |
 
 **全域硬约束，无例外**：
 
 ```text
 runtime role      对任何 schema 的任何表：无 DELETE / TRUNCATE / DDL
 role_batch_issuer 同上，且域默认全 —— 它只在 §6.2.2 里有一行非空
+role_admin        无 INSERT / UPDATE / DELETE / TRUNCATE / DDL，不继承其他角色
 role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6.2.2 逐条列出的表上有 UPDATE
 物理删行唯一出口  migration owner + partition drop（§48.1）
 逻辑删除唯一出口  retention::tombstone —— 改 state，不删行（§37.2）
@@ -1088,30 +1113,60 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
 
 单元格里带括号的是 PostgreSQL column-level GRANT（比对 `information_schema.column_privileges`），不带括号的是表级（比对 `role_table_grants`）。
 
-| role | `private.ingest_tickets` | `private.events` | `projection.stream_log` | `projection.stream_checkpoints` | `ops.outbox` | `ops.jobs` | `control.quota_windows` | `private.evidence_objects` | `private.memory_records` | `private.memory_evidence` | `private.memory_consolidation_runs` | `private.memory_consolidation_inputs` | `private.memory_rollups` | `private.memory_rollup_sources` | `ops.deletion_plan_steps` |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `role_gateway` | SELECT, UPDATE | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT(PK 六列), UPDATE(issued_highwater) | INSERT | SELECT, INSERT, UPDATE | SELECT, UPDATE(reserved, consumed) | SELECT, INSERT | SELECT, INSERT, UPDATE(status,superseded_by) | SELECT, INSERT | — | — | SELECT | SELECT | SELECT |
-| `role_private_worker` | SELECT | SELECT | SELECT, UPDATE(state,error_class) | SELECT | SELECT, UPDATE | SELECT, INSERT, UPDATE | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | — | — | — | — | SELECT |
-| `role_consolidation_worker` | — | — | — | — | — | SELECT, UPDATE(status,lease_owner,lease_expires_at) | — | SELECT | SELECT | SELECT | SELECT, INSERT, UPDATE(status,input_snapshot_seq,manifest_hash,output_digest,finished_at,error_class) | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT |
-| `role_public_worker` | — | — | — | — | SELECT, UPDATE | SELECT, INSERT, UPDATE | — | — | — | — | — | — | — | — | SELECT |
-| `role_retrieval_worker` | — | — | SELECT, UPDATE | SELECT, UPDATE(evidence_highwater, knowledge_highwater, projection_highwater) | SELECT, UPDATE | SELECT, INSERT, UPDATE | — | SELECT | SELECT | SELECT | — | — | SELECT | SELECT | SELECT |
-| `role_batch_issuer` | **INSERT, SELECT** | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| `role_maintenance` | SELECT, UPDATE（仅 `ISSUED → EXPIRED` 巡检，§15.6） | SELECT | SELECT, UPDATE（仅 `ISSUED → LOST` 巡检 §15.2 与 `retention::tombstone` 的 `* → TOMBSTONED` §37.2） | SELECT, UPDATE(serving, shadow) | SELECT | SELECT, UPDATE(status, lease_owner, lease_expires_at) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT |
-| `role_migration_owner` | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner |
+| role | `private.ingest_tickets` | `private.events` | `projection.stream_log` | `projection.stream_checkpoints` | `ops.outbox` | `ops.jobs` | `control.quota_windows` | `private.evidence_objects` | `private.memory_records` | `private.memory_evidence` | `private.memory_consolidation_runs` | `private.memory_consolidation_inputs` | `private.memory_rollups` | `private.memory_rollup_sources` | `ops.deletion_plan_steps` | `staging.contribution_releases` | `staging.contribution_release_sources` | `control.public_moderator_grants` | `ops.public_release_revocations` | `public.claim_trust_evaluations` | `public.claim_trust_evaluation_sources` | `public.poisoning_signals` | `staging.contribution_candidates` | `staging.contribution_candidate_sources` | `control.contribution_confirmations` | `ops.mechanism_observations` | `ops.mechanism_e2e_runs` | `control.usage_reservations` | `control.rate_buckets` | `control.operation_receipts` | `private.retrieval_query_sources` | `ops.retrieval_provider_budget_reservations` | `ops.retrieval_provider_budget_allocations` | `control.anonymous_source_lineage` | `staging.sanitized_public_candidates` | `public.anonymous_source_lifecycle_events` | `public.current_anonymous_source_objects` | `staging.contribution_candidate_phase9_assessments` | `ops.anonymous_public_revocations` | `public.anonymous_source_authority_events` | `control.processor_models` | `control.provider_accounts` | `control.provider_endpoints` | `control.provider_billing_accounts` | `control.provider_billing_instruments` | `control.reasoning_profiles` | `control.reasoning_route_policies` | `control.reasoning_route_candidates` | `control.reasoning_route_bindings` | `control.reasoning_credential_bindings` | `control.reasoning_route_profile_receipts` | `control.reasoning_route_domain_receipts` | `public.claim_independence_attestations` | `ops.public_anonymous_dispatches`  | `ops.reasoning_provider_health_observations` | `ops.reasoning_account_health_observations` | `private.contribution_executions` | `private.contribution_execution_sources` | `ops.contribution_execution_job_links` | `control.anonymous_claim_trust_authorities` | `public.anonymous_claim_trust_receipts` | `public._legacy_receipt_match_basis` | `public.eligible_objects` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `role_gateway` | SELECT, UPDATE | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT(PK 六列), UPDATE(issued_highwater) | SELECT, INSERT(tenant_id,commit_seq,stream_seq,event_type,evidence_id) | SELECT, INSERT, UPDATE | SELECT, UPDATE(reserved, consumed) | SELECT, INSERT | SELECT, INSERT, UPDATE(status,superseded_by) | SELECT, INSERT | — | — | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | SELECT | SELECT | — | — | SELECT, INSERT | SELECT | SELECT | SELECT, INSERT, UPDATE(status, finished_at) | SELECT, INSERT, UPDATE(capacity, tokens, refill_per_second, updated_at, version) | SELECT, INSERT | — | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT |
+| `role_private_worker` | SELECT | SELECT | SELECT, UPDATE(state,error_class) | SELECT | SELECT, UPDATE, INSERT(tenant_id,commit_seq,event_type,contribution_release_id,anonymous_source_id,candidate_envelope_sha256,anonymous_source_revision) | SELECT, INSERT, UPDATE | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | — | — | — | — | SELECT | SELECT, INSERT, UPDATE(state,revoked_at) | SELECT, INSERT | — | INSERT | — | — | — | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT | SELECT | — | — | — | — | — | — | SELECT, INSERT(contribution_release_id,tenant_id) | SELECT, INSERT(tenant_id,anonymous_source_id,sanitized_content,content_sha256,policy_version,policy_digest,assessment_outcome,assessment_digest,envelope_sha256) | — | — | SELECT, INSERT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | SELECT | SELECT | SELECT | — | — | — | — |
+| `role_consolidation_worker` | — | — | — | — | — | SELECT, UPDATE(status,lease_owner,lease_expires_at) | — | SELECT | SELECT | SELECT | SELECT, INSERT, UPDATE(status,input_snapshot_seq,manifest_hash,output_digest,finished_at,error_class) | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — |
+| `role_public_worker` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | — | — | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT |
+| `role_retrieval_worker` | — | — | SELECT, UPDATE | SELECT, UPDATE(evidence_highwater, knowledge_highwater, projection_highwater) | SELECT, UPDATE | SELECT, INSERT, UPDATE | — | SELECT | SELECT | SELECT | — | — | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | — | — | — | SELECT, INSERT | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT |
+| `role_batch_issuer` | **INSERT, SELECT** | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — |
+| `role_maintenance` | SELECT, UPDATE（仅 `ISSUED → EXPIRED` 巡检，§15.6） | SELECT | SELECT, UPDATE（仅 `ISSUED → LOST` 巡检 §15.2 与 `retention::tombstone` 的 `* → TOMBSTONED` §37.2） | SELECT, UPDATE(serving, shadow) | SELECT | SELECT, UPDATE(status, lease_owner, lease_expires_at) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT | SELECT | SELECT, UPDATE(revoked_at, revocation_reason) | — | — | SELECT | SELECT | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT |
+| `role_admin` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — |
+| `role_migration_owner` | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner  | owner | owner | owner | owner | owner | owner | owner | owner | owner |
 
 落点逐一对齐：
+
+- **R1 USER_REASONING route foundation（0128）与 R2 receipt bootstrap（0129）**：十二表的所有非 owner 单元均为 `—`；0129 的 profile/domain receipt 同样只由 `role_migration_owner` 读取或写入，bootstrap/resolver function 也没有 runtime EXECUTE grant。R1 继续使用 `control.user_reasoning_profiles` 的旧运行路径；R2 只通过显式 owner procedure 写入 shadow graph，仍不授予 SELECT、写入或外呼能力。R3 activation gate 前，`role_migration_owner` 保持唯一 owner。tenant 表必须 FORCE RLS；在 zero-grant quarantine 下不构成 activation-ready owner isolation。后续若给窄 resolver grant，必须在同一变更里同时更新本矩阵、`rls-check`、DDL 授权和真实角色正负测试；禁止先给通用 runtime SELECT 再补 owner gate。
+
+- **R3 health observations（0130）**：`ops.reasoning_provider_health_observations` 与
+  `ops.reasoning_account_health_observations` 的所有非 owner 表级单元均为 `—`，显式覆盖
+  `ops.*` 域默认，不能让 gateway、worker、maintenance 或 admin 直接读写 health truth。
+  唯一运行接口是 `control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)`：PUBLIC
+  与全部 runtime role 无 EXECUTE，`role_private_worker` 只有此窄 resolver 的 EXECUTE；函数
+  owner 为 `role_migration_owner`、SECURITY DEFINER、`search_path=pg_catalog`，返回值不得含
+  secret bytes。函数授权不以本表格冒充，必须由 0130 DDL 与 `rls-check` 的 function gate
+  双向验证。
+
+- **R4 execution relations（0131，尚未实现）**：`private.contribution_executions`、
+  `private.contribution_execution_sources` 与 `ops.contribution_execution_job_links` 显式覆盖
+  域默认：仅 `role_private_worker` 可 `SELECT`，其余七个 non-owner roles 均为 `—`，owner
+  为 `role_migration_owner`。这些直接表格不是 mutation path；A provisional 冻结的 typed
+  SECURITY DEFINER function signatures、exact per-role `EXECUTE`、PUBLIC 无 `EXECUTE`、
+  function owner 与 safe `search_path` 必须由 D0 在既有 `rls-check` function gate 精确验证，
+  不由本矩阵复制或放宽。
+
+- **Phase 9 anonymous boundary（0123/0124/0127）**：`role_public_worker` 对 `ops.outbox`、`ops.jobs` 与 `staging.contribution_releases` 均为 `—`；其 dispatch、projection 与 protected release checks 只经 owner 的 narrow SECURITY DEFINER functions。`ops.public_anonymous_dispatches` 全部非 owner 单元也为 `—`。`public.claim_independence_attestations` 只向 gateway/public/retrieval/maintenance 公开 aggregate SELECT，不能回读 protected lineage。
+
+- **0134 anonymous claim trust split**：`control.anonymous_claim_trust_authorities` 与 `public.anonymous_claim_trust_receipts` 的逐角色列授权见本矩阵新增两列；authority 对全部 non-owner roles 为 `—`，receipt 仅 gateway/public/retrieval/maintenance `SELECT`，owner 保持 `owner`。0134 只通过窄 SECURITY DEFINER 入口维护 authority，并向公共面投影 identity-free receipt safe fields；不得以 `rls-check` carve-out 替代本表授权真源。
+
+- **§1.14.1 观测证据**：`ops.mechanism_observations` 与 `ops.mechanism_e2e_runs` 仅 `role_maintenance` 有 INSERT；`role_admin` 仅 SELECT，所有其他域默认无权，不继承写入角色、无写入 SECURITY DEFINER 函数 EXECUTE。运行角色只读，不能用自报 ACTIVE 或伪造 run 开启机制。凭证从环境/secret manager 供应，迁移不带口令。
 
 - **§60.1 / §23.4 G23-1c 自发票**：`INSERT ON private.ingest_tickets` 整列只有 `role_batch_issuer` 一行有，五个 runtime role 全为空 —— G23-1c 静态查的就是这一列与这五行的交叉。反向同时封死：`role_batch_issuer` 整行除这一格外全是 `—`，发票方垫不了分子。`role_migration_owner` 的 `owner` 格不参与这条判定，理由见 §48.2「发票权唯一」（表 owner 隐式持有全部权限，不排除掉它这条闸恒红）。
 - **`ingest_tickets` 无人有 `DELETE`，且 `role_batch_issuer` 无 `UPDATE`**：这是「`expected` 一经发放不可回缩」（§15.6 · §60.1）的权限落点。发票的 `INSERT` 与销票的 `UPDATE` 拆给两个不同角色，任何一个角色都凑不齐「先发再撤」这套动作。
 - **§37.2 / §15.2 的 `projection.stream_log` 无 `DELETE`**：本表逐角色成立。那两节的原话是「runtime role 对 `stream_log` 只有 `SELECT` / `UPDATE`」，**承重的是「无 `DELETE`」那半句**：`INSERT` 必须由 `role_gateway` 在 `remember` 事务 B 内持有（§60 `issue_stream_log_row` —— 不发行 seq 行就根本没有账本可查）；`state` 推进拆给两个角色 —— 投影侧终态（`ISSUED → DONE | SKIPPED_BY_POLICY | FAILED`）在 `role_retrieval_worker`，巡检与逻辑删除（`ISSUED → LOST` §15.2、`* → TOMBSTONED` §37.2）在 `role_maintenance`，因为 §65 把 `retention` 与巡检都列成每日 repair job、跑在 ops 池上。此前这两条状态推进在授权表里**没有任何角色能执行**（`role_maintenance` 只有 `SELECT`），DeletionPlan 第 1 步与 `ISSUED → LOST` 都跑不起来，而 §23 的 `deleted` / `open_gaps` 两个读数全靠它们产生。两处表述冲突按「本章显式冻结 > 同主题较早说明」裁决，以本表为准。
 - **两个角色都拿 `UPDATE`，不与 §37.2「没有第二个函数能改这张表的 `state`」打架**：那句话的承重是「`state` 只能沿冻结的迁移图走」，权限侧落点是 `role_migration_owner` 拥有的 `BEFORE UPDATE` 触发器 —— 按 `current_user` 取可迁移集合，上一条括号里那两组就是全集，不在集合里的迁移直接 `RAISE`。触发器归 owner，三类非 owner 角色无 DDL（§6.2.1）⇒ 删不掉也改不了。**反过来把两组迁移合给一个角色更差**：`role_retrieval_worker` 是请求路径常驻角色，给它 tombstone 权等于把删除出口放回热路径；而把终态推进给 `role_maintenance` 则要求每日 job 去做逐条 settle，两者都不成立。
 - **`projection.stream_checkpoints`（本轮新增列）**：§15.1 的 seq 分配是 `UPDATE ... SET issued_highwater = issued_highwater + 1 ... RETURNING`，与 `INSERT projection.stream_log` 同事务同连接（`role_gateway`）。此前本表没有这一列 ⇒ 落回 §6.2.1 域默认（`projection.* = R`）⇒ **每一次 `remember` 在发 seq 那一步就被 SQL 层拒绝**，A1 三件套的 (a) 稠密序号根本发不出来。列限定把可写面收到该收的列：`serving` / `shadow` 是读路由（§16.2 / §16.3 切版），只有 `role_maintenance` 能动；`INSERT` 只给 §15.3 主键那六列 ⇒ 首次建行时 `serving` / `shadow` 只能取 DDL 的 `DEFAULT false`，gateway 造不出一行自带 `serving = true` 的 checkpoint。`updated_at` 由 owner 的 `BEFORE UPDATE` 触发器写，不出现在任何 GRANT 里。
-- **`control.quota_windows`（本轮新增列）**：§72 的 reserve/commit 是请求路径上的 `UPDATE control.quota_windows SET reserved = reserved + $units ...`，而 `control.*` 域默认对所有 runtime role 只有 `R` —— 与上一条同型的静默拒绝。**窗口行由谁建，本文档没有冻结**（§71 / §76 的 Entitlement Projector 没有指定角色），所以本表对这张表不给任何 `INSERT`：这是**显式空缺，不是遗漏**。补建行方的时候必须回到这张表加格，否则 §48.2 的「授权逐条相等」立刻红。
+- **`control.quota_windows`**：消费侧仍只有 gateway 的计数列 UPDATE；所有非 owner 角色均无直接 INSERT。窗口创建与过期 reservation 回收仅由 `role_maintenance` EXECUTE `control.issue_quota_window(uuid,text)` / `control.reap_quota_reservations(uuid,integer)`，固定 owner 函数仍受 tenant FORCE RLS，不进入 owner 应用池。两函数对 PUBLIC 和五个 runtime role 均无 EXECUTE。窗口、快照、幂等与验收的唯一语义见 §72.2.1；`version` 仅由 owner 触发器推进，不增加 gateway 列权限。
 - **`ops.jobs`（本轮新增列）**：§61 的 SKIP LOCKED claim（`SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE ops.jobs`）本来就落在 `ops.*` 域默认里，列出来是为了让 S 的差集为空；唯一的实质变化是 `role_maintenance` 拿到列限定的 `UPDATE`，§65 的 `stale lease/lock reap` 才有角色可跑 —— `ops.*` 域默认给它的是 `R`，而 §6.2.1 冻结它只在本表列出的表上有 `UPDATE`。
 
 - **`ops.deletion_plan_steps`（本轮新增列，T4.8 review 补入）**：本表新建时未逐表列出 ⇒ 落回 §6.2.1 `ops.*` 域默认 ⇒ `role_gateway`/`role_private_worker`/`role_public_worker`/`role_retrieval_worker` 四个 runtime role 都自带 `INSERT`/`UPDATE`（域默认是给 `ops.jobs`/`ops.outbox` 这类队列表用的，不是给这张审计表用的）—— 请求路径角色因此能替任意 `deletion_request_id` 伪造一条已完成的 `QDRANT_POINTS`/`OBJECT_BYTES` 行，把 §41.2 `tombstoned_unpurged_over_sla` 读绿而字节从未真正 purge。逐条列出后收窄为四个 runtime role 只剩 `SELECT`；写路径只走 `ops.record_deletion_plan_step`（SECURITY DEFINER，owner 是 `role_migration_owner`），调用方不需要表级 `INSERT`。`role_consolidation_worker` 与 `role_maintenance` 的域默认 `SELECT` 原样保留（逐条列出后不再"落回默认"，必须显式写出才继续成立）；`role_maintenance` 另加一格显式 `INSERT`。
 
 `ops.outbox` 即 §60.1 权限块里写作 `outbox_event` 的那张表，同一张；表名以 §48 canonical schema 为准。**本节与 §48.2 的枚举只按 `ops.outbox` 取数**：拿 `outbox_event` 这个名字去查 `role_table_grants` 得到的是空集，全文其余位置见到旧名一律读作 `ops.outbox`。
+
+- **`private.retrieval_query_sources`**：它是原生私有检索查询的元数据披露来源，不保存 query 正文、provider response 或 credential。只有 `role_retrieval_worker` 可 `SELECT, INSERT`；`role_maintenance` 只可 `SELECT` 并列限定更新 `revoked_at / revocation_reason`。其他非 owner 角色全为空，不能按 `private.*` 域默认放宽。
+- **`ops.retrieval_provider_budget_reservations / allocations`**：所有非 owner 角色的直接表授权均为空；`role_retrieval_worker` 仅通过窄授权的 SECURITY DEFINER reserve/dispatch/settle/finalize 函数操作，`role_maintenance` 仅通过 reap 函数处理过期 reservation。把这两表落回 `ops.*` 域默认会让 gateway/private/public worker 获得直接写账本能力，因此必须在本矩阵显式点名为全空覆盖。
+- **Phase 9 assessed/anonymous 三表**：`staging.contribution_candidate_phase9_assessments` 仅 private worker 可读写；`ops.anonymous_public_revocations` 只向 serving/public/maintenance 角色提供匿名 pair 的只读撤销 fence；`public.anonymous_source_authority_events` 对所有非 owner 角色均无直接权限，只能由 0122 的窄 definer 函数追加。public worker 对 `staging.sanitized_public_candidates` 与 anonymous lifecycle event 均无直写/直读逃逸面；admit/revoke 的唯一写入口见 §7.6。
 
 
 ### 6.2.3 Typed DB Pool Capability Topology
@@ -1119,7 +1174,7 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
 所有 Application/Domain 代码禁止持有裸 `sqlx::PgPool`。Raw pool 的唯一封装点：
 
 ```text
-crates/adapters/postgres/src/pools.rs
+crates/adapters/src/postgres.rs
 ```
 
 闭集：
@@ -1129,6 +1184,10 @@ pub struct RuntimeDbPool(PgPool);        // role_gateway
 pub struct BatchIssuerDbPool(PgPool);    // role_batch_issuer
 pub struct ConsolidationDbPool(PgPool);  // role_consolidation_worker
 pub struct PrivateWorkerDbPool(PgPool);  // role_private_worker
+pub struct RetrievalWorkerDbPool(PgPool); // role_retrieval_worker
+pub struct MaintenanceDbPool(PgPool);    // role_maintenance
+pub struct PublicWorkerDbPool(PgPool);   // role_public_worker
+pub struct AdminDbPool(PgPool);          // role_admin
 ```
 
 inner 字段 crate-private；这些 wrapper **不得**互相 `From/Into`，不得 `Deref<Target=PgPool>`，Application port 不接受裸 `PgPool`。
@@ -1136,16 +1195,16 @@ inner 字段 crate-private；这些 wrapper **不得**互相 `From/Into`，不�
 #### G6-DB1 类型正哨兵 + 编译反哨兵
 
 ```text
-A  wrapper 定义计数：四种类型各 == 1
-B  raw PgPool field/constructor/import outside pools.rs == 0
-C  compile-pass：pass_runtime_pool / pass_batch_pool / pass_consolidation_pool / pass_private_pool 全成功
+A  wrapper 定义计数：八种类型各 == 1
+B  raw PgPool field/constructor/import outside postgres.rs == 0
+C  compile-pass：现有 pass_runtime_pool / pass_batch_pool / pass_consolidation_pool / pass_private_pool / pass_public_pool 五个夹具全成功；不冒充八种独立编译夹具
 D  compile-fail：
    fail_remember_with_batch_pool
    fail_begin_batch_with_runtime_pool
    fail_consolidation_with_private_pool
    fail_pool_cross_from
    必须全部失败
-E  每种 pool 建立连接后 SELECT current_user 与注释角色逐字相等
+E  八种 pool 建立连接后 SELECT current_user 与注释角色逐字相等；PublicWorkerDbPool 的正例与 gateway/private 反例直接调用其构造器；AdminDbPool 同样验证实际 role_admin 与非 admin 反例
 ```
 
 因此“newtype 一个都没实现”时 A/C/E 会红，不再被两个 `== ∅` 负向式骗绿。
@@ -1177,7 +1236,7 @@ PrivateWorkerDbPool:
 
 **注错（G6-DB2）**：给 `role_consolidation_worker` 临时 `GRANT UPDATE ON private.memory_records`，越权失败夹具必须从 permission denied 翻成成功并令 gate 红；反向 `REVOKE INSERT ON private.memory_consolidation_inputs` 后，允许成功夹具必须失败并令 gate 红。两边缺一边，这道权限闸都不准入。
 
-PostgreSQL 的 `GRANT` 是最终硬边界：对象 owner 默认拥有全部权限，因此四个应用 pool 对应 role 都必须保持 `not owner / NOBYPASSRLS`。G80-40 = G6-DB1 + G6-DB2，Phase 1 起必过。
+PostgreSQL 的 `GRANT` 是最终硬边界：对象 owner 默认拥有全部权限，因此所有应用 pool 对应 role 都必须保持 `not owner / NOBYPASSRLS`。G80-40 = G6-DB1 + G6-DB2，Phase 1 起必过。
 
 ---
 
@@ -1270,7 +1329,16 @@ SCIM deactivation、membership removal 与“擦除个人/租户数据”是不�
 
 ## 7.1 USER_REASONING
 
-用户自己的 LLM/VLM Key。允许：私人完整会话蒸馏 · 私人文档理解 · 图片理解 · fact/state/decision/lesson/outcome 提取 · 用户侧公共贡献判断与脱敏候选生成。
+用户自己的 LLM/VLM Key。允许：私人完整会话蒸馏 · 私人文档理解 · 图片理解 · fact/state/decision/lesson/outcome 提取，以及 Phase 9 的两段用户侧公共贡献判断。四个平面的 canonical home 仅在本节定义：
+
+| 平面 | 只负责 | 不得负责 |
+|---|---|---|
+| `USER_REASONING` | `public-safe probe -> deterministic public scan -> bounded/versioned PublicCoverageDigest -> typed novelty/quality/generality/grounding assessment + distilled candidate`；两段都在用户的 reasoning domain 内 | 把 private raw、identity 或完整 staging row 交给 public worker；把 PLATFORM_PUBLIC 当作判断者 |
+| `PLATFORM_POLICY` | 确定性的 rights、privacy、secret、integrity 准入与拒绝；绑定版本、digest 与 receipt | 生成/归纳事实，或以 policy pass 替代四个 USER_REASONING gate |
+| `PROTECTED_LINEAGE` | release、contributor、attestation、anti-Sybil、revoke，以及每个 release 到随机 UUIDv4 `anonymous_source_id` 的映射 | 向 public.* 暴露 release、tenant、contributor、publisher 或 evaluator identity |
+| `PLATFORM_PUBLIC` | 已准入的匿名蒸馏知识、匿名 direct provenance 与 aggregate trust | 读取 private raw/identity/完整 staging rows，或反查 protected lineage |
+
+第一段只从 sealed private input 生成可公开探针；`PublicCoveragePort` 只能看该 probe，并通过 `public.phase9_public_coverage_for_probe(bytea,integer)` 确定性选择一个受容量限制、带 digest identity/version 的 `PublicCoverageDigest`。该函数最多返回 32 个、每个最多 1,024 UTF-8 bytes 的匿名 public-safe 摘要，不返回 source/release/tenant/contributor 元数据。第二段把该 digest 作为不可信比较上下文，返回四个彼此独立的 typed gate 与 distilled candidate；任一 gate、binding 或 hash 不匹配均拒绝。
 
 禁止 fallback 到平台 public key —— 跨 Processor failover 是隐私边界改变，不是网络重试（§7）。失败时走 §53 `abstain(DegradeCode::EgressDenied)`，不换 provider。
 
@@ -1429,23 +1497,11 @@ LLM **没有** API 可以把 `SENSITIVE/SECRET_MATERIAL` 改成 `PRIVATE/PUBLIC`
 
 ## 7.6 PLATFORM_PUBLIC 在 GA 到底存不存在
 
-企业公共知识整理 Key，只能读 `staging.contribution_releases` 与 `public.*`，无 private schema 权限、无 BYOK 解密权限。
+`PLATFORM_PUBLIC` 是 §7.1 四平面中仅保存匿名蒸馏知识、匿名 direct provenance 和 aggregate trust 的面。它没有 private schema 权限、BYOK 解密权限或 `control.anonymous_source_lineage` 读取权；public worker 不能读取 `staging.contribution_releases`、任何 private raw/identity、`staging.sanitized_public_candidates` 或 `staging.contribution_candidate_phase9_assessments`。Phase 9 public worker 只从已领取 job 获得 `(anonymous_source_id, candidate_envelope_sha256, source_revision)`，并调用 migration 0122 的窄 `SECURITY DEFINER` admission/revoke 函数；函数用精确 outbox authority 与 sealed envelope 复核，调用方没有 staging 直读、release resolver 或 lifecycle 直写权限。精确表/列授权唯一见 §6.2.2。
 
-实测分母：公池 6778 条**全为 asserted**，`corroboration > 1` **零条**；consensus 判定需 ≥4 独立贡献者，而全平台 12 租户 / 7 用户 / **1 个真实用户**。⇒ 公共演化在 GA 期不可能触发哪怕一次状态跃迁。
+Phase 9 的 public worker 只执行显式 `PUBLIC_RELEASE_APPLY`、`PUBLIC_REVOKE_APPLY`（legacy expand window）、`PUBLIC_ANONYMOUS_RELEASE_APPLY`、`PUBLIC_ANONYMOUS_REVOKE_APPLY` 与 `PUBLIC_PROJECT`，可在 **Phase 10 disabled** 时独立验收；没有 resident daemon、cron、隐式 merge 或 synthesis。新 assessed candidate 只走匿名两类，legacy 两类不得解析 assessed release。`PUBLIC_SYNTHESIS_REBUILD` 只能登记，直到 Phase 10 的启用 gate 满足才可消费（§12.2）。
 
-裁决：**schema 预留，运行时不建。** 取舍判据 = 事后补的代价。
-
-| 项 | GA | 理由 |
-|---|---|---|
-| `public.*` 表与列（`corroboration` / `contributor_set` / `consensus_state`） | **建** | 贵：加列要改分区表 + 回填 + 改 RLS |
-| `staging.contribution_releases` + revocation 链路（§13） | **建** | 贵：撤回要能追溯已发布派生物，血缘事后补不出来 |
-| 贡献记录上的 `data_class` + `staging.contribution_release_sources` | **建** | 贵：同上，出境反查依赖它 |
-| PLATFORM_PUBLIC 的 Key、轮换、OpenBao 路径 | **建** | 贵：涉及 §7 密钥层级，事后插一层要重新加密 |
-| `humaux-public-worker` 常驻进程 | 不建 | 便宜：起进程是部署改动，不动数据 |
-| consensus 计算 / 公共演化调度 / 公池重排 | 不建 | 便宜：纯计算，随时可开 |
-| 公池对用户暴露检索 | 不建（GA 关闭） | 便宜；且 6778 条全 asserted 的公池暴露出去只会稀释私有召回 |
-
-开启条件由 versioned `PublicEvolutionPolicy` 配置，不靠人判断。当前 Humaux Cloud bootstrap 值为：`humaux-admin q public.consensus_ready` 连续 7 天 `value ≥ 50` 且独立贡献者 ≥ 4；这组数不是 OSS 架构常量。在此之前 §41 中 public 相关指标固定为 0，且**不计入缺失告警**（否则就是自造一条永远红的噪声）。
+当前是 additive `EXPAND/dual-run`：0120 保留 `public.sources` 的 `LEGACY` 行与既有 release-linked columns，并添加 `ANONYMOUS_RELEASE` / `ANONYMOUS_USER_CONTRIBUTION` 分支。不得宣称 legacy 已删除；未来 contract-drop 必须先备份、通过 migration rehearsal，并获得用户明确批准。
 
 
 ## Tenant Data Policy 与 Processor Registry
@@ -2178,6 +2234,546 @@ control.reasoning_domain_grants
 ```
 
 `owner_user_id` 与 `user_reasoning_profile_id` 必须属于同一 tenant/user。默认不存在 tenant-global shared private key。
+
+## 11.2.2 R1 Canon 边界与 R1–R5 顺序
+
+本仓库 `docs/architecture/Baseline_2.9.md` 在 R1 期间仍是唯一规范 Canon。外部
+`Humaux_Thread_Architecture_Baseline_2.10_Reasoning_Routing_Agent_Capture_Canonical.md`
+只是 upstream design input，不是 repo Canon、不是第二个可引用真源，也不得整体复制或晋升。
+本节只语义吸收与 0128/R1 直接承重的合同；物理 DDL 由
+`migrations/0128_reasoning_route_foundation.sql` 实现，二者不各自发明第二套字段。
+
+唯一 retrofit 顺序：
+
+```text
+R1 Schema Expand
+  -> 只新增十表、复合版本约束、RLS/owner quarantine
+  -> 不迁移旧配置、不切换行为、不创建 health 表、不授予 runtime capability
+
+R2 Compatibility Bootstrap
+  -> 每个被 eligible domain 引用的 distinct non-null legacy profile 恰好投影一个新
+     Profile、一个 PINNED Policy、一个且仅一个 Candidate
+  -> 每个 eligible non-null domain 恰好生成一个 current Binding，指向该 profile 的 Policy
+  -> 当前 purpose 仅 CONTRIBUTION_DEIDENTIFY；其它 purpose 不在本轮 bootstrap
+  -> legacy path 与 Binding shadow decision 必须 100% 选择同一执行身份
+
+R3 Route Switch
+  -> 运行时只读 frozen Binding@version；旧 profile 指针不再是可写/可读路由权威
+  -> egress 前同时满足 current administrative state 与 fresh health
+
+R4 Multi-profile
+  -> 另行 gate 后才允许多 Profile、非 PINNED 策略或受资助私域候选
+
+R5 Continue later Phase 9 work
+```
+
+R1 不包含 Phase 9E / PLATFORM_PUBLIC reasoning runtime，也不包含任何 Phase 10 runtime。
+两者保持 disabled；schema/contract 的存在不构成激活、外呼或完成证据。
+
+## 11.2.3 R1 versioned route schema 与不变量
+
+0128 的 schema 真源恰为 §6.2.2 列出的十表。四类 route identity 冻结为：
+
+```text
+Profile   = (tenant_id, profile_id, profile_version)
+Policy    = (tenant_id, route_policy_id, policy_version)
+Candidate = (tenant_id, route_policy_id, route_policy_version,
+             profile_id, profile_version)
+Binding   = (tenant_id, binding_id, binding_version)
+```
+
+Candidate 必须用精确复合 FK 同时命中同 tenant 的 Policy logical-id+version 与
+Profile logical-id+version；Binding 必须用精确复合 FK 命中 Policy logical-id+version。
+业务检查再冻结相同 tenant、owner、trust domain、billing responsibility、reasoning
+domain 与 purpose，不能靠“UUID 恰好存在”替代复合 authority。每个
+`(tenant_id, reasoning_domain_id, purpose)` 最多一条 `effective_to IS NULL` 的
+current Binding；切换必须先 close 旧 interval，再 INSERT successor version。
+
+同一 logical id 的 successor version 必须保持 identity spine；新 version 不能借版本号
+改租户、所有者或授权语义：
+
+```text
+same profile_id preserves:
+  tenant_id, owner_kind, owner_user_id, trust_domain, billing_responsibility
+
+same route_policy_id preserves:
+  tenant_id, policy_owner_kind, policy_owner_user_id,
+  purpose, trust_domain, billing_responsibility
+
+same binding_id preserves:
+  tenant_id, reasoning_domain_id, purpose
+```
+
+每个 logical id 的首版创建与 successor spine 校验必须在同一数据库串行化边界；两个
+并发 first-version INSERT 不得各自建立不同 spine。版本 PK/UNIQUE 只能防重复 version，
+不能替代这条跨版本 identity gate。并发验收必须让两个参与者写同 logical id 的不同
+version，并由第三连接在放行 holder 前通过 `pg_locks` / `pg_stat_activity.wait_event`
+观察 contender 确实等待目标 advisory/row lock；只看到 same-version UNIQUE 失败不构成
+串行化证据。
+
+**R1 冻结的隔离级别合同**：当前“transaction advisory lock 后查询既有 version”的
+最小正确协议只允许在 `READ COMMITTED` 下执行 Profile/Policy/Binding spine version
+INSERT。数据库入口必须读取真实 `transaction_isolation`，不是信任调用方标签；非
+`READ COMMITTED` 一律在写入前以 SQLSTATE `40001` 拒绝，不能假装获得跨 snapshot
+串行化。`40001` 复用 0104 fresh-post-lock guard 与 adapter `Conflict` 映射；调用方只能
+开启新的 READ COMMITTED transaction 重试，不能在同一个 RR/Serializable snapshot 内重放。
+验收至少：
+
+```text
+positive: SHOW transaction_isolation = read committed
+          different-version contender 被第三连接观察为真实等待，放行后按 holder commit 重验
+negative matrix:
+  isolation in {repeatable read, serializable}
+  x spine in {Profile, Policy, Binding}
+  -> SQLSTATE 40001 before write; committed row count unchanged
+```
+
+Profile 的执行语义、Policy 的选择语义、Candidate 集合与版本、credential authority
+binding 都是 append-only。Binding 只允许把 current `effective_to` 从 NULL 关闭一次。
+Candidate 只能在其精确 `Policy@version.lifecycle_state = DRAFT` 时 INSERT；Policy 离开
+DRAFT 后 candidate set 即冻结，不能再靠新增行改变同一 policy version 的选择结果。
+R1/PINNED 的 `DRAFT -> SHADOW` 必须与候选集合校验共用同一串行化边界，并且集合恰为
+一条 `priority=0, fallback_class=NONE` Candidate；零条、多条、非零 priority 或其它
+fallback 都拒绝晋级。Policy lifecycle 只允许相邻单向迁移
+`DRAFT -> SHADOW -> SERVING`，禁止跳级、回退或从已关闭 policy 复活。Binding INSERT
+只能引用 `SHADOW` 或 `SERVING` Policy@version，不得把 DRAFT policy 暴露为
+shadow/current route。
+Provider parent identity 不可删除；窄 administrative mutation 只有：
+`processor_models.status`、`provider_accounts.status/enabled`、
+`provider_endpoints.enabled`、`provider_billing_accounts.enabled`、
+`provider_billing_instruments.enabled`、`reasoning_profiles.enabled`，以及
+Policy 的 `lifecycle_state` 与一次性 `effective_to` close；相应 `updated_at` 只是管理时间。
+其它变化必须 INSERT 新 version，禁止 UPDATE 历史语义或重写历史 route decision。
+
+**Safety exit 优先级**：authority trigger 不得对所有 UPDATE 无差别重跑“父对象当前有效”
+检查。下列单向收紧/关闭即使 owner membership、provider account、model、credential、billing
+account/instrument 或其它父 authority 已失效，也必须能够执行：
+
+```text
+ACTIVE/enabled -> RETIRED/DISABLED/false
+Profile enabled true -> false
+Policy effective_to NULL -> non-NULL close
+Binding effective_to NULL -> non-NULL close
+updated_at-only maintenance update
+```
+
+这些 safety exit 只能保持或减少 capability，不能改变 tenant/owner/trust/payer/identity
+语义。相反，INSERT、re-enable/reactivate、Policy lifecycle advance，以及任何扩大 capability
+的 UPDATE 都必须重验 current tenant/owner/credential/account/model/billing authority；父链失效
+时 fail closed。semantic 历史列在两条路径都 append-only，任何修改仍拒绝。验收必须先
+建立合法链，再逐个失效 parent，证明 disable/close/updated_at-only 仍成功，同时 re-enable、
+lifecycle advance 与新 INSERT 失败；不能只在所有父对象 ACTIVE 的顺境测试 kill switch。
+
+R1 **不**要求为了 child re-enable 与 parent disable 的并发而按固定顺序对 membership、
+account、model、endpoint、credential、billing parents 执行 `SELECT ... FOR SHARE`，也不要求
+parent disable 后级联物化 `child.enabled=false`。R3 的唯一正确性边界是每次 egress 前对
+exact parents 的 current admin state 与 §11.2.5 两类 fresh health 重新判定；因此并发可以
+线性化为 child re-enable 先成功、parent disable 后成功，最终 parent gate 仍封锁出口。
+验收应并发执行这两条 mutation，并在二者结束后证明一次 fresh egress eligibility 判定为
+false，而不是强制某个锁等待形状。只有未来合同要求跨 parent/child **级联物化一致性**时，
+才在该阶段另行设计固定锁序；不能为 R1 预埋多父行锁并扩大死锁面。
+
+Canon 同样不要求把 0128 的多个 `BEFORE` trigger 重构为一个 mutation guard。约束的是
+可观察行为：每张表的每类 mutation 必须精确映射到全部适用 guard；每个 guard 只能
+`RETURN NEW` 或抛错，禁止 `RETURN NULL` 静默吞掉 mutation，也禁止改写 `NEW` 的语义列；
+组合验收必须证明 append-only、状态迁移、current-authority 与 safety-exit 四组规则同时
+生效。只有出现可复现的 trigger 顺序歧义或漏检，才以最小修复调整拓扑。
+
+## 11.2.4 Execution identity、credential 与 billing authority
+
+一次可执行 USER_REASONING 身份不是 provider/model 字符串，而是同一条 authority chain：
+
+```text
+tenant + owner_user + trust_domain(USER_REASONING) + billing_responsibility(USER)
+  -> provider_account(processor_id)
+  -> endpoint(region, service_tier)
+  -> processor_model(processor_id, provider_model_id, model_revision)
+  -> credential binding(credential_ref, account, processor,
+                        credential_purpose=USER_REASONING,
+                        invocation_eligibility=API_CALLABLE)
+  -> billing_account + eligible billing_instrument?
+  -> Profile@version -> Policy@version -> Candidate -> Binding@version
+```
+
+`CredentialRef` 只是 OpenBao locator；它既不是 secret，也不能单独证明 account、owner、
+processor、purpose 或调用资格。`control.credentials.purpose` 与 typed credential binding
+都必须是 `USER_REASONING`，且 selected credential 必须 `API_CALLABLE`。网页 seat、cookie、
+session token 或 `INTERACTIVE_ONLY` 资产不得进入可执行 Profile。
+
+Billing instrument kind 是闭集：`PAYG | PREPAID_CREDIT | RESOURCE_PACKAGE | TOKEN_PLAN |
+COMMITTED_SPEND | PROVISIONED_THROUGHPUT | API_SUBSCRIPTION_ALLOWANCE | INVOICED_CONTRACT |
+CUSTOMER_BILLED`。调用资格是 `API_CALLABLE | TOOL_SPECIFIC | INTERACTIVE_ONLY`；Reasoning
+Profile 只接受 `API_CALLABLE`。余额或“同一家 provider”不能证明覆盖；coverage 必须逐字段
+精确匹配 `processor_id + provider_model_id + model_revision + region + service_tier`，同时满足
+有效期、owner/payer、billing account 与 overage policy。
+
+R3 admission 冻结的 route decision 至少保存 Binding/Policy/Profile 的 logical id+version，
+provider account、endpoint、processor/model/revision、credential authority、payer/billing
+instrument snapshot 与 purpose。后续管理状态变化不得改写这份历史事实。
+
+R3 的 provider exact identity 是 `(tenant_id, processor_id, processor_model_id,
+provider_model_id, model_revision, provider_endpoint_id, endpoint_ref, region, service_tier)`；
+account exact tuple 是一行
+`(tenant_id, provider_account_id, credential_ref, billing_account_id?,
+billing_instrument_id?)`。nullable billing shape 按原 tuple 比较，不把 NULL
+伪造为 `NA` 或另一个可替换身份；`reasoning_credential_bindings` 没有虚构的独立
+id/version，exact authority 就是 `(tenant_id, credential_ref, provider_account_id)`。route policy
+版本字段统一为 `route_policy_version`。历史 Binding/route receipt/health receipt 仅供审计，绝不
+构成当前调用权或绕过当前管理状态。
+
+## 11.2.5 Administrative state、ProviderHealth 与 AccountHealth
+
+Administrative state 与 health observation 是两类权威：前者表达管理员当前允许/禁止，
+后者表达带时间戳的运行观测。`ProviderHealth` 覆盖 provider/model/endpoint/region 共享健康；
+`AccountHealth` 覆盖 provider account/credential/billing account/instrument 的局部健康。
+两者不得合成一个 bool，也不得回写 versioned route semantics。
+
+R1 **不创建** ProviderHealth 或 AccountHealth 表，也不以 `enabled/status` 冒充 health。R3
+唯一 health authority 是两张 append-only 表：
+`ops.reasoning_provider_health_observations`（provider exact identity 一行一个 verdict）与
+`ops.reasoning_account_health_observations`（account exact tuple 一行同时记录 account、
+credential、billing-account、billing-instrument 四个 component verdict）。不设
+`*_health_current` 或任何 mutable current projection；更正必须追加 observation，不能
+UPDATE/DELETE/TRUNCATE 历史。两张表均由 `role_migration_owner` owner、ENABLE + FORCE RLS，
+无任何 direct runtime/admin/maintenance table grant。
+
+每次 admission 在一个数据库 snapshot 内先以 `clock_timestamp()` 捕获唯一 `admission_now`，
+再对每一张表按 exact identity/tuple 选择**唯一** latest row：
+`ORDER BY observed_at DESC, observation_id DESC LIMIT 1`。先选 latest、后判 verdict/freshness；
+不能因最新行是 negative、UNKNOWN、future 或 stale 而回退旧 HEALTHY。`observed_at <
+valid_until` 是写入不变量，`observed_at <= admission_now < valid_until` 才 fresh，future 行
+必须 deny。两张 observation 都有必填非空白 `source_kind` 与可空 `reason_code`（出现时必须
+非空白）；它们只记录审计来源/原因，不参与 exact identity、latest order 或 admission，R3 不
+发明其枚举。
+
+R3 每次 egress 前必须同时成立：
+
+```text
+current administrative state allows the exact frozen identity
+AND latest fresh ProviderHealth for the exact provider identity is HEALTHY
+AND latest fresh AccountHealth for the exact account tuple has all required components HEALTHY
+```
+
+Binding 必须是 current authority 并指向 SERVING Policy；该 Policy 只能有**唯一**
+`priority=0, fallback_class=NONE` 的 PINNED Candidate，且引用 exact Profile@version。Profile、
+account、credential binding 与 billing coverage 的 current admin predicates 必须在同一 snapshot
+成立。缺失、future、stale、UNKNOWN、DEGRADED、UNAVAILABLE 或任何 negative/component mismatch
+一律 fail closed，不得沿用旧 healthy 行。HTTP 401/invalid credential 只打开 selected
+credential/account 的 local circuit；不得熔断同 processor 的其它 account、tenant、credential 或
+全局 ProviderHealth。R1/PINNED 无合法下一候选时保持 WAITING_KEY，禁止 fallback、provider/
+account/payer substitution 或 PLATFORM_PUBLIC 借用。
+
+唯一 runtime entry 是 owner 的 narrow `SECURITY DEFINER`
+`control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)`，固定
+`search_path=pg_catalog`，只给 `role_private_worker` EXECUTE，PUBLIC 与其余 runtime 均无
+EXECUTE；它只返回 typed route/credential locator 与 snapshot references，绝不返回 secret bytes。
+`control.provider_endpoints.egress_processor_id uuid NULL` 是 endpoint-derived Egress Processor
+SSOT：legacy 行可为 NULL，R3 SERVING resolver 必须拒绝 NULL 并返回该 UUID；
+`EgressPermit.processor_id` 只可由 resolver output 取得，配置、caller input、provider/model
+字符串以及 `processor_model_id` 都不是 authority。每一个 R3 attempt 的
+`ModelCallLedger.egress_processor_id`、matching `data_disclosure.processor_id` 与 resolver endpoint
+值必须在同一 reserve transaction 精确相等；任一 mismatch/缺值使 reserve rollback 且 provider=0。
+
+对每一个**真实** `CONTRIBUTION_DEIDENTIFY` provider attempt，`ops.model_call_ledger` 是
+actual attempt 的唯一 route-admission snapshot SSOT：它保存 stable `model_call_id`、exact
+Binding/Policy/Profile logical id+version、provider account/model/revision/endpoint、credential
+reference、nullable billing tuple、payer/billing responsibility、ProviderHealth/AccountHealth
+observation id 与 `admitted_at`。这组 snapshot 在此 purpose 上全部必填，唯 Canon 明确允许的
+nullable billing component 保持 paired NULL；不存 secret/hash bytes，USER payer 的
+`estimated_cost` 与 `actual_cost` 必须是 NULL，未知 usage/cost 也保持 NULL 而非伪造 0。Candidate 只保存
+`model_call_id` 与 binding pair 作业务关联，绝不复制 route/health/payer snapshot。
+
+严格时序是同一 PG transaction 的 `exact admission resolver -> one ModelCallLedger RESERVED
+-> one matching data_disclosure RESERVED -> commit`；任一 reserve 失败必须整体 rollback，且
+provider call 为 0。commit 后立即执行一次真实 provider attempt；成功或明确失败按实际结果
+finalize ledger/disclosure。若 provider 已调用而任一 finalize 失败，保留 durable RESERVED
+receipt，**不得**为补 finalize 再调用 provider。`model_call_id` 重试仅当 immutable snapshot
+逐字段相等才返回原 row；不同 route/payer/purpose/source 必须 conflict，terminal row 不得回到
+RESERVED。admission snapshot 是 resolver 当时的一次线性化证据，后续 health/admin 变化不授予
+重试或另一次调用权。
+
+R3 retry 的唯一 logical identity 是 caller-carried、在 assessed-contribution operation/work item
+首次持久化并可跨崩溃重放的 `logical_call_id`，并且 `request_id = logical_call_id`。
+`logical_call_id` / `request_id` 不得为 nil UUID；Reasoner 与 ledger shape 都必须 fail closed，避免
+nil 变成跨用户或跨重放域的伪逻辑身份。
+Reasoner 不得 mint `request_id`；每次 assessed contribution 的 A `COVERAGE_PROBE` 与 B
+`TYPED_ASSESSMENT` 必须使用不同的 logical id。一次新的合法用户 execution 即使 payload 相同也
+必须获得新的 A/B logical id，不能把完整 outbound wire payload hash 当作身份。
+
+`request_id` 与 `intent_sha256` 是分离的 SSOT：后者是 canonical intent 的 SHA-256，严格包含
+`intent_schema_version`、`call_kind`、purpose、reasoning domain、Binding@version、sealed input
+manifest hash、prompt contract version，以及 canonical public coverage digest（probe 为 NULL、assessment
+为 digest）；不包含 `admitted_at`、health observation time、ledger creation time、serialization whitespace
+或 transient provider header。ledger 的 R3 `call_kind` 是闭集 `COVERAGE_PROBE | TYPED_ASSESSMENT`，
+`intent_sha256` 必须为 32 bytes；这两个字段同 route snapshot 是 immutable mutation-guarded receipt。
+`call_kind` 还绑定 coverage shape：A `COVERAGE_PROBE` 必须以 `coverage_digest=None` 形成 intent，B
+`TYPED_ASSESSMENT` 必须以该 probe 所选 public coverage 的 exact canonical digest 形成 intent；任一
+缺失、错配或借 legacy path 的 typed assessment 都必须在 R3 Reasoner fail closed。
+
+同一 `(tenant_id, request_id)` 的 retry 必须先以包含 tenant 与 request 两部分的 transaction advisory
+lock serialize，再 lookup existing ledger；不同 tenant 的相同 request UUID 不得互锁，**之后**才可对不存在的
+key 作 current admission。existing RESERVED 且 `intent_sha256` 相同，且有
+matching RESERVED disclosure 时，必须 commit 后返回原 `model_call_id`，provider calls=0，绝不可再次
+dispatch；intent 不同或 terminal row 必须 conflict，resolver/provider 都不得运行。只有 key 不存在才执行
+current resolver 后原子 reserve ledger+disclosure。已 RESERVED receipt 不因随后 health/admin 变化或新
+`admitted_at` 改写、重准入或再调用。`model_call_id` 是首次 reserve 的 attempt receipt，可作 provider
+trace；`request_id` 只有在 provider/API 官方明确支持 scope、retention 与 duplicate semantics 时才可进入
+provider idempotency header，系统不得自造该 header。
+
+Phase 9 异步 execution root 的 A/B **fresh reservation** 另有 prepare→reserve TOCTOU 围栏：prepare
+把本次 admission 的 stable route identity 封成 strict `RouteIdentityV1`，0133 的 A/B stage wrapper
+以第 15 个 `jsonb` 参数携带它；旧 14 参数 wrapper 对 runtime 撤权。V1 由 `schema_version=1` 加
+Binding/domain/purpose、Policy/Profile logical id+version、§11.2.4 的 provider/account exact tuple、
+`egress_processor_id` 与 credential/billing identity 组成；`processor_model_id` 与
+`provider_model_id` 是两个独立必等轴，不能因外部 model string 相同而忽略内部 governed model object。
+ProviderHealth/AccountHealth observation id 与 `admitted_at` 是本次 fresh resolver 的观察事实，必须写入
+ledger 且继续通过 current health gate，但不进入 prepare/reserve identity equality。V1 的固定键全部必填，
+只有 Canon 已声明 nullable 的 model revision/billing component 可显式 `null`；missing/unknown/wrong-type/
+unsupported version 一律 fail closed，禁止把缺 expectation 解释为 legacy。
+
+对能映射到 execution root 的首次 `ModelCallLedger` INSERT，owner 的 `BEFORE INSERT` guard 必须先取
+`ops.lock_contribution_inputs()`，再以 root user 重验当前 active tenant/user/membership、self-owned active
+domain、完整 source/backing closure 与 hash、0132 enabled MANUAL open head，以及 fresh route 同
+`RouteIdentityV1` 和待写 ledger 的逐轴相等；任一失败时 ledger/disclosure/root state/provider call 的 delta
+均为 0。无 execution-root 映射的既有同步 legacy path 才可显式 bypass root expectation。升级到该 guard
+前必须 drain 0131 所有仍可能产生 provider side effect 的 nonterminal root；禁止猜测旧 root 的 creator
+principal。锁与数据库事务在 provider I/O 前提交，不跨网络持有。
+
+这里的 complete source/backing closure 只有一个 SQL 真源。`input_manifest_hash` 继续且只表示 direct
+Evidence/Memory 的 canonical content manifest；execution root 另存 SQL 派生的完整性 receipt：
+`source_backing_closure_version=1`、`source_backing_closure_sha256` 与 `backing_link_count`。该 receipt 不是
+caller manifest，也不得由 Rust/worker 提供 digest。V1 以固定 domain separator/version 加 root
+tenant/user/reasoning-domain 开头，使用固定宽度 UUID/integer、length-prefixed UTF-8 text 和显式 nullable
+UUID tag 的 binary encoding；所有参与排序的 text（含 backing role）先转为 UTF-8 bytes，禁止依赖数据库
+default collation/ICU version；按 direct ordinal 排序并覆盖每个 direct 的 kind/id/current hash、data class、
+domain（Evidence）与 visibility scope，以及每个 Memory backing 的 parent Memory、Evidence id、role、ordinal、
+payload hash、data class、domain 与 visibility scope。`created_at`、grounding detector metadata、route/provider/
+health observation 不进入此 receipt；后者仍由本节各自的 fresh authority gate 管理。
+
+唯一 owner helper 必须在 enqueue、deferred root/source postcheck 与 A/B reserve 三处复用同一编码；enqueue
+先取 `ops.lock_contribution_inputs()`，在 root INSERT 时写入 receipt，postcheck 证明 durable direct rows 和
+receipt 相等，reserve 在首条 ledger 前从当前完整 closure 复算并逐字节比较。Evidence/Memory/
+`memory_evidence` mutation 与 `control.workspaces` tenant reassignment/delete 已取同一 advisory lock，因此
+backing INSERT phantom、WORKSPACE_SHARED authority drift 与 reserve 只能线性化为
+“变更先提交后拒绝”或“reserve 先提交后变更等待”。direct ordinal、backing add/remove、role/ordinal、
+payload/data-class/domain/visibility 或 Memory content/status/visibility 任一变化都必须拒绝且四类 delta 为 0。
+旧 terminal root 的历史 closure 不得从当前关系伪回填，可保留三列全 NULL 作 audit；任何能映射到 root
+却缺 receipt 的请求都拒绝，只有真正无 execution-root mapping 的同步 legacy path 可 bypass。
+
+R3 最小 fault gate 必须覆盖：deny 时 ledger/disclosure/provider 均为 0；allow 的真实 provider
+double 恰有一条 RESERVED→terminal ledger 和一条 disclosure；任一 reserve 失败 rollback/provider=0；
+finalize failure 后 provider 调用仍恰一次；SHADOW、stale/UNKNOWN/negative health、非唯一 PINNED
+与 alternate healthy account 均为零调用；route mutation 后 ledger snapshot 不变。
+还必须覆盖：reserve commit 后/provider 前崩溃、provider 返回后/finalize 前崩溃、same key+same intent
+RESERVED（同 model_call_id、零 dispatch）、same key+different intent/terminal（conflict）、A/B key
+collision、同 key 并发（至多一个 NewlyReserved）、以及旧 key 在 health/admin 改变后不重准入。
+**R4 production closure（未闭合，非 R3 DoD）**：当前 terminal finalize 与内存中 probe/assessment
+bytes、以及 assessment 后 candidate store 之间的 atomic stage-output boundary 必须有 durable work item +
+recovery 裁决和 fault gate；在此闭合前，finalize 后 crash 可能令相同 terminal key 无法安全重跑却丢失
+output。它不得被 R3 Canon 冒充为已闭环，也不在本 R3 implementation 的验收范围内。
+R3 不实现也不验收 probe scheduler/daemon、自动选择、多候选评分、DEGRADED 放行、fallback/
+substitution、provider quota/cost balancing、health-driven rewrite、automatic reconciliation、public
+evolution、recursive governance，或完整 Processor Registry/FK 治理；后者仅在出现多 endpoint
+独立 processor provenance、processor lifecycle/RLS 或跨表 referential integrity 的实测需求时升级，
+不是 R3 或当前 Phase 10 的实现项。这些均不能用作 Phase 9 DoD。
+
+### 11.2.5.1 R4 durable contribution execution（规范冻结；A/0133 authority slice 已实现，R4-D 未实现）
+
+R4 只闭合 `CONTRIBUTION_DEIDENTIFY` 的 durable A/B execution 边界：Provider 已返回但
+ledger/disclosure 已终结、业务事实尚未 durable 的 crash gap。它是 private-worker workflow，
+不是新的 worker framework，也不改变 R3 admission、Binding 或 ledger 的权威边界。0131 已实现
+execution root/typed command 基座，0133 已实现 self-principal fresh reservation authority 与 §11.2.5 的
+exact source/backing closure seal；它们只证明各自窄切片存在，不证明 R4-D recovery、完整 fault package
+或 Phase 9 DoD 已完成。
+
+**权威和状态闭集。** `private.contribution_executions` 是一次 contribution provider-side-effect
+workflow 的唯一业务根与状态权威；`ops.model_call_ledger` 及其精确关联的
+`ops.data_disclosures` 是一次实际 A/B provider attempt 的权威 receipt；`ops.jobs` 只保存调度、
+claim、owner、attempt、live lease 与 operations disposition。job payload 只可为
+`{schema_version, execution_id}`，不得承载或推断输入、route、logical call identity、output 或业务
+state。业务状态严格闭集为：
+
+```text
+READY_A -> A_RESERVED -> READY_B -> B_RESERVED -> READY_CANDIDATE -> DONE
+                    \-> REJECTED_SAFETY | FAILED_TERMINAL
+                                      B_RESERVED -> NOT_CONTRIBUTABLE
+```
+
+其精确允许边为：`READY_A -> A_RESERVED`；`A_RESERVED -> READY_B | REJECTED_SAFETY |
+FAILED_TERMINAL`；`READY_B -> B_RESERVED`；`B_RESERVED -> READY_CANDIDATE |
+NOT_CONTRIBUTABLE | REJECTED_SAFETY | FAILED_TERMINAL`；`READY_CANDIDATE -> DONE`。不得从
+`*_RESERVED` 回到 ready，终态不可变；尤其不得新增 `RECONCILE_A` / `RECONCILE_B` 等执行状态。
+`ops.jobs` 状态仍仅为 `PENDING | PROCESSING | WAITING_KEY | RETRY_WAIT | DONE | FAILED | DEAD`；
+`RECONCILIATION_REQUIRED` 只能是 `FAILED` job 的 `last_error_class`，不是 job 或 execution state。
+
+**冻结输入、route 与 logical identities。** enqueue 只在既有 preparation 已验证 caller-carried
+`Binding@version` 后，将该 exact pair 写入 execution；它是 A/B 的唯一 route authority。每次 A
+reserve 都必须以这个 exact Binding 调用 current admission，current administrative state 或 health
+不满足即拒绝，绝不可选择、替换或 reroute Binding。`Profile@version` 不是 caller/enqueue authority，
+不得保存 `profile_version_at_enqueue`；它只由 resolver 在每个实际 A/B reserve 时导出，并只写入该
+次 ModelCallLedger 的 admission snapshot。
+
+execution 在 claimable work 前一次性预铸 `coverage_request_id`、`assessment_request_id` 与
+`candidate_id`；A/B request identities 不得由 reserve、executor 或 Reasoner 新生成，二者必须不同，
+且在 `(tenant_id, logical_id)` 域唯一。它还冻结唯一名称为 `input_manifest_hash` 的 canonical source
+manifest、typed execution-source rows、policy id/version、prompt/contract versions 与 Binding pair；完整
+backing closure 的 SQL-owned receipt 唯一见 §11.2.5，不得在 R4 另造 caller manifest 或第二编码。
+不得同时持久化 `source_manifest_hash`、泛化 preparation blob 或另一份 profile snapshot；这些会制造
+第二真源。enqueue idempotency 对相同 key + fingerprint 返回原 execution/job/A/B/candidate identities；
+相同 key + 不同 fingerprint 必须 conflict，且不得创建任何 replacement root 或 receipt。
+
+**R4 fault acceptance identity。** 验收身份冻结为 `(gate_id, variant)`，而非 fault-table 的行数：
+`R4-FG-01` 至 `R4-FG-17` 各只允许 `BASE`；`R4-FG-18` 必须分别覆盖
+`B_GATE_FAIL`、`SCAN_REJECT`、`PROVIDER_DEFINITE_FAILURE` 与 `TIMEOUT`。前者 17 个加后者
+4 个，当前导出 21 个 case；21 只是当前清单统计，不是接口，也不得以重排行、拆行或合行改变任何
+`(gate_id, variant)`。`B_GATE_FAIL` 必到 `NOT_CONTRIBUTABLE`，`SCAN_REJECT` 必到
+`REJECTED_SAFETY`，`PROVIDER_DEFINITE_FAILURE` 才可到 `FAILED_TERMINAL`，`TIMEOUT` 必保留
+对应 `*_RESERVED` 与 `FAILED + RECONCILIATION_REQUIRED`、零 redispatch。gate manifest 必以该
+pair 键控，要求全体 pair 唯一、实际执行且断言 execution/job/ledger/disclosure/candidate invariant；
+不得以任何数字 tally 或表行数作为通过条件。
+`contracts/r4_fault_manifest.toml` 是本闭集唯一机器可读投影；Package E 的 SQL/runner harness 只能
+读取其中的 `case_id`、`sql_case_id`、`runner_case_id`、probe 与 dispatch 映射，不得另抄第二份清单；
+`cargo xtask r4-fault-manifest` 只校验该投影与本节一致，不另立语义真源。
+
+**G11-3 / G80-44 R4 fault manifest closure（PR，Phase 9 起必过）。**
+`cargo xtask r4-fault-manifest` 必须对 canonical manifest 的闭集 pair、唯一 key、case / SQL /
+runner 映射、完整 probe axes、Phase 9 与 recording-provider 边界逐项 fail closed；缺少 manifest 或
+任何必填对象必须失败，不得输出 `not_applicable`。注错记录由
+`xtask/src/r4_fault_manifest.rs::tests::contract_mutations_fail_closed` 唯一持有：依次注入 missing、
+duplicate、extra、wrong variant、unknown SQL mapping、unknown runner mapping、wrong probe axes、
+Phase10、live provider 与 numeric tally，十个 mutation-negative case 必须全部被 validator 拒绝。
+
+**intent commitment。** R4-A 不给 `ops.model_call_ledger` 或
+`private.contribution_executions` 新增独立 `intent_schema_version`。intent serialization version
+必须进入 canonical intent bytes 并由 `intent_sha256` commitment；execution 已冻结 coverage/assessment
+contract version 与 prompt contract hash，receipt 已有 request id、call kind 与 exact hash。只有数据库必须
+按 intent schema version 分支、只靠历史 ledger 行回答该 version、多个 serializer 需 SQL
+query/constraint，或 canonicalization/hash migration 需要 DB 内 dual verification 时，才另立升级。
+
+**fresh lease 与 exact late completion 是不同能力。** A/B reserve、provider dispatch、DB-only
+candidate creation、以及当前 job 的 `DONE` / `FAILED` settlement 都要求同一 transaction 内的 fresh
+lease predicate 与 execution `FOR UPDATE`。只有 `NewlyReserved(ProviderDispatchPermit)`
+可以 provider dispatch；existing reserved/idempotent lookup 永远不给 dispatch permit。fresh claimant
+看到 `A_RESERVED` / `B_RESERVED` 时零 dispatch、不得改 execution，必须以
+typed SQL command 将该 job 记为实际 `FAILED + RECONCILIATION_REQUIRED`。
+
+lease 失效不丢弃已经 dispatch 的 exact response。late completion 只在同一 transaction 已证明：同一
+execution、相同 reserved stage、相同 model_call_id/request_id/intent_sha256/disclosure_id，ledger 仍
+`RESERVED`、disclosure 未 finalize，且无新 id、dispatch 或 route change 时，才能持久化并终结该
+**exact** A/B receipt。它可推进 execution 到业务后继/终态，却绝不可启动 B、创建 candidate、改变
+job state、mark job done、reroute 或 enqueue。后续持有 fresh lease 的 claimant 可从已经 terminal 的
+execution 无 provider I/O 地 settlement 一个尚未 settled 的 job；它不改变业务真相。自动 replay、
+reconciliation、重发、换 route、换 provider/account/payer/credential 或 fallback 全部禁止；继续调度
+只能由人明确授权。
+
+**coupled SQL command boundary。** R4 所有跨 execution 与 exact ledger/disclosure/candidate/job 的
+coupled mutation，只能经 owner 的 typed `SECURITY DEFINER` SQL command 在一个 PostgreSQL
+transaction 内完成：A/B reserve；A exact completion；B exact completion（含所有合法后继/terminal
+outcome）；`READY_CANDIDATE` candidate/execution/job settlement；以及 fresh claimant 对
+`*_RESERVED` 的 job failure disposition。Rust runner 只能构造参数、拿 newly-reserved dispatch permit、
+做 provider dispatch/parse/scan 并调用该 command；不得以 `model_call_ledger`、`disclosure`、`jobs`
+或 execution helper 拼接 coupled terminal writes。此 command boundary 不另造 job/ledger authority，
+只使现有各 authority 的跨表 bundle 不可绕过。
+
+**原子业务 bundle。** A usable completion 必须在一个 transaction 内同时 durable：规范化的 coverage
+snapshot/version/summaries/digest、probe/scan receipt、exact A ledger `SUCCEEDED`、exact A disclosure
+`SUCCESS` 与 `A_RESERVED -> READY_B`。B PASS completion 必须在一个 transaction 内同时 durable：完整
+canonical typed assessment/hash、四个 raw gate `PASS`、candidate bytes/hash、PASS scan receipt、已经
+冻结的 source/policy/Binding references、exact B ledger `SUCCEEDED`、exact B disclosure `SUCCESS` 与
+`B_RESERVED -> READY_CANDIDATE`。scanner 可以在 transaction 外运行以避免长锁，但 scanner
+unknown/timeout、coverage failure、malformed output 或 transaction abort 必须保留 reservation；禁止
+partial output、伪造 failure 或 provider replay。
+
+`READY_CANDIDATE` 没有 provider I/O。fresh-lease transaction 必须验证完整 B receipt，以预铸
+`candidate_id` 仅插入一次（既存 candidate 只能是 exact match），并原子完成 candidate、execution
+`DONE` 与 job `DONE`。candidate 的 database guard 必须要求：execution 是 `READY_CANDIDATE`、B
+ledger/disclosure 分别为 `SUCCEEDED` / `SUCCESS`、四个 gate 与 scan receipt 均 PASS、candidate
+identity/model call 与冻结 B receipt 精确相等；A ledger 绝不可满足该条件。
+
+**业务结果分类。** B gate failure 是 `NOT_CONTRIBUTABLE`，scanner 明确拒绝是
+`REJECTED_SAFETY`，均为正常 no-candidate business outcome：对应 exact ledger/disclosure 是
+`SUCCEEDED` / `SUCCESS`，live holder 与该 completion bundle 一并将 job `DONE`。确定的 provider
+terminal failure 是 `FAILED_TERMINAL`，对应 exact ledger/disclosure `FAILED`，live holder 同 bundle
+将 job 记为实际 `FAILED`。timeout、connection loss、dispatch 后 crash、scanner unknown/timeout、
+coverage failure 和不完整 completion bundle 保持 `A_RESERVED` / `B_RESERVED` 及其 reservation，
+不映射为 terminal business result。late completion 只改变 ledger/disclosure/execution，不结算 job。
+
+**物理安全边界与验收。** R4 的 execution root、typed source snapshot 与 job link 必须是 tenant-scoped
+append-only/RLS-protected records；mutation 只可经 typed SECURITY DEFINER transition functions，runtime
+不得拥有 generic INSERT/UPDATE，identity/input/logical ids、已设 completion fields 与 terminal states
+不可重写。实现验收至少要有按上述 `(gate_id, variant)` manifest 键控的真实 PostgreSQL fault cases：enqueue conflict/id stability；exact frozen
+Binding admission（不能 reroute）与 resolver-derived Profile snapshot；fresh-lease fence 与 exact-late
+exception 的禁止动作；A/B bundle abort 不留 partial durable result；candidate/execution/job 三者全有或
+全无；每个业务 outcome 的 ledger/disclosure/job classification；以及 `RECONCILIATION_REQUIRED` 无新
+state。任何 Phase 10 worker/runtime grant、自动重放或 provider substitution 均必须使 R4 contract gate
+失败；Phase 10 继续 disabled，R4 不能拿 Phase 10、public evolution 或 provider E2E 当作完成证据。
+
+**R4-A/D0/D acceptance 编排。** 唯一无环顺序是 `Canon -> A provisional -> D0 ->
+A final -> D`。A provisional 不是 PASS，也不解锁任何要求 A final 的工作包；它只冻结
+`0131_contribution_execution.sql`、`0133_contribution_self_principal_reservation_authority.sql` 与两份
+对应 manifest 的 SHA-256，并以直接 PostgreSQL 18 assertion 证明
+owner、`ENABLE/FORCE RLS`、无 generic runtime DML 与 exact typed `SECURITY DEFINER` EXECUTE。此时
+`rls-check` 只能因这三个已冻结、schema-qualified R4 relation **及 A provisional 冻结的 typed
+SECURITY DEFINER function signatures / exact per-role EXECUTE matrix** 尚未被其既有 named
+registry/matrix 精确注册而红；任何 owner、RLS、ACL、definer owner/search path 或其他 checker
+violation 都不得被标为 expected。
+
+独立 D0 只可在 A provisional 之后，由 checker owner 编辑 `xtask/src/rls_check.rs` 及其 focused
+checker test/fixture，把 `private.contribution_executions`、
+`private.contribution_execution_sources` 与 `ops.contribution_execution_job_links`，以及 A
+provisional 冻结的 schema-qualified typed SECURITY DEFINER function signatures，注册到**同一套**
+既有严格 named ACL/RLS/function semantics。函数注册必须逐 signature 固定 exact per-role EXECUTE
+matrix、PUBLIC 无 EXECUTE、owner 与 safe `search_path`；不得另造第二套 checker。D0 绑定 A
+provisional 的两份 SQL/两份 manifest SHA-256，四者任一漂移即失效。D0 不得修改 0131/0133、runtime、jobs、
+provider、ledger、disclosure 或任何 Phase 10 文件，也不得为绿灯放宽 unknown-table、owner、RLS、
+PUBLIC/runtime privilege 或 exact function-EXECUTE 判断。
+
+`G-R4-D0-RLS-REGISTRATION` 必须 fail closed：exact registration 的对象是上述 schema-qualified
+relations **加上** frozen function signatures / per-role EXECUTE matrix。对每个 relation，
+`role_private_worker` 的 `INSERT`、`UPDATE`、`DELETE`，RLS disabled、wrong owner、从 registry
+删除该表、或新增未注册 future table 都必须使 `rls-check` 非零；任何 function signature 或 EXECUTE
+matrix drift（包括 PUBLIC EXECUTE、owner 或 search_path 漂移）同样必须非零。无关既有 matrix verdict
+必须逐项不变。仅 D0 成功后，A final 才可在
+**同一组** 0131/0133 SQL/manifest hash 上要求 manifest、focused PG18、`rls-check` exit 0，并以
+owner/RLS/no generic grants/exact typed EXECUTE 的 4/4 完成 A；D full 依赖 Canon、A final 与 D0，且
+不得重做第二套 registry。上述 A/D0 编排状态不是 execution/job/database state；R4-D recovery 与完整
+R4 fault closure 仍未实现，Phase 10 继续 disabled。
+
+## 11.2.6 Legacy compatibility 与单一切换权威
+
+R1 对 `control.user_reasoning_profiles` 只读保留现状：不 backfill、不迁移、不删表、
+不改历史 `processing_run.profile_id/profile_version`，新十表也没有 runtime reader。
+
+R2 当前只 bootstrap `CONTRIBUTION_DEIDENTIFY`。它有两层基数，禁止把 domain 数量乘到
+Profile 数量上：
+
+```text
+每个被 eligible domain 引用的 distinct non-null legacy profile
+  -> exactly one reasoning_profiles@version
+  -> exactly one PINNED policy@version
+  -> exactly one priority=0, fallback=NONE Candidate
+
+每个 eligible non-null legacy domain
+  -> exactly one current Binding to that profile's PINNED Policy
+
+legacy domain.user_reasoning_profile_id IS NULL
+  -> NO_LEGACY_PROFILE receipt; no executable Binding
+```
+
+`private_reasoning_domains.user_reasoning_profile_id` 是普通 FK、不是 UNIQUE；多个 domain
+可以共享同一 legacy profile，所以 profile-route receipt 与 domain-route receipt 必须分开。
+每个 legacy profile 还必须恰好解析到一个 typed R1 account/endpoint/model/credential/billing
+identity；零个或多个匹配都让该 bootstrap transaction fail closed。shadow gate 必须逐字段
+证明旧选择与新 frozen decision 的 processor/account/endpoint/model/revision、credential、
+trust、payer、billing eligibility 以及 absence/error class 相同；只比 provider/model 名不算
+等价。R2 不发 provider call、不铸 egress permit、不 reverse write 旧表，其他 purpose 在其
+独立 bootstrap contract/gate 前继续走 legacy path。
+
+R3 开始只有 Binding 是 route entry。旧表/旧列只能在冻结窗口内变为 read-only
+compatibility view，之后由独立 contract migration 删除；禁止长期 dual write、禁止旧指针
+与 Binding 同时可写、禁止为对齐新 schema 回写历史 run。R3 之前不得预先授予 runtime
+访问；R2/R3 的 successor grant wave 以 §6.2.2 的原子更新规则为唯一权限真源。
+
 ## 11.3 Provider Error Semantics
 
 ```text
@@ -2246,7 +2842,7 @@ profile version
 
 ```text
 billing_responsibility = USER
-actual_platform_cost = NULL
+actual_cost = NULL
 ```
 
 不能把用户自己的 Provider 账单计入 Humaux Cloud Retrieval/LLM 毛成本。
@@ -2474,7 +3070,7 @@ pub struct SealedPrivateReasoningRequest {
     reasoning_domain_id: PrivateReasoningDomainId,
     profile_version: UserReasoningProfileVersion,
     input_manifest_hash: ContentSha256,
-    purpose: PrivateReasoningPurpose, // Distill | Consolidate | Vision
+    purpose: PrivateReasoningPurpose, // Distill | Consolidate | Vision | ContributionDeidentify
     // payload 只通过内部 mTLS RPC body 传递，不携带 DB capability
 }
 
@@ -2656,30 +3252,22 @@ H  正对照：CONFIRM 后新版本绑定成功 -> CURRENT
 
 # 12. Public Contribution Pipeline
 
-用户知识进入公共域必须是一个明确 Release 行为，而不是 public worker 读取 private memory。
+用户知识进入公共域必须是一个明确 Release 行为，而不是 public worker 读取 private memory。平面职责唯一见 §7.1；本章只定义 release 到匿名公共对象的流转。
 
 ```text
-Private Memory
+sealed private input
     |
-    v USER_REASONING
-Contribution Candidate
+    v USER_REASONING: public-safe probe
+deterministic public scan -> bounded/versioned PublicCoverageDigest
     |
-    v
-De-identification / Secret Scan / Policy
+    v USER_REASONING: typed assessment + distilled candidate
+PLATFORM_POLICY deterministic privacy/secret/rights/integrity gates
     |
-    v
-ContributionRelease
+    v PROTECTED_LINEAGE: ContributionRelease + UUIDv4 anonymous_source_id
+sanitized candidate envelope
     |
-    v
-staging.*
-    |
-    v PLATFORM_PUBLIC
-Public Claim
-    |
-    +--> relation/contradiction/merge
-    |
-    v
-Public Synthesis
+    v PLATFORM_PUBLIC (Phase 9)
+anonymous PublicSource / direct provenance / lifecycle fact
 ```
 
 ## 12.1 Contribution Policy
@@ -2697,16 +3285,33 @@ ContributionRelease 与私人来源之间不存 `source_ids[]`。唯一关系：
 ```text
 staging.contribution_release_sources
   release_id
+  tenant_id  # 由 release 派生，受复合 FK 约束，不是独立租户权威
   evidence_id?
   memory_id?
   ordinal
 ```
 
-CHECK：`evidence_id` / `memory_id` 恰好一个非 NULL，并分别 FK 到 authority 表。Public provenance DAG 从这张表开始闭包。
+CHECK：`evidence_id` / `memory_id` 恰好一个非 NULL。`(tenant_id, release_id/evidence_id/memory_id)` 分别以复合 FK 指向 release / Evidence / Memory 的同租户键；仅 UUID FK 不足以证明同租户。写入还必须在调用方真实 RLS 上下文中证明来源可见。物理列名 `contribution_release_id` 与本节 `release_id` 为同一键。
 
-## 12.2 Public LLM 不是新事实来源
+Release 创建/撤销属于 private worker（精确授权唯一见 §6.2.2），均与 §14 对应 outbox 同事务。来源先写；legacy candidate 写 `PUBLIC_RELEASE` / `PUBLIC_REVOKE`，有完整 Phase 9 assessment binding 的 candidate 写 `PUBLIC_ANONYMOUS_RELEASE` / `PUBLIC_ANONYMOUS_REVOKE`。事件落定后 release 的 policy/rights/来源快照不可就地改写，`ACTIVE -> REVOKED` 是唯一状态推进。延迟约束在 COMMIT 核验来源非空及对应 legacy/anonymous 精确事件，禁止孤立状态写。
 
-Public LLM 只能：
+`PLATFORM_POLICY` 和 `PROTECTED_LINEAGE` 在受保护上下文中验证 release `ACTIVE`、双 scan `PASSED`、非空 rights_basis，并只把已封口的匿名 envelope 交给 `PublicWorkerDbPool`。public worker 不被授予 release/lineage/private 读取或 staging UPDATE；它不得用真实租户、行锁或 SECURITY DEFINER 绕过该界线。受保护的 release 锁、RLS 与创建/撤销规则仍由本节前两段和 §6.2.2 的既有入口定义。跨租户已公开 claim 可以在后续公共合成中组合，不把 public 改成租户域。
+
+### 12.1.1 精确字节准入（Phase 9）
+
+默认只开放 MANUAL。服务端以真实 AuthorizationScope 读取有效用户、membership、当前 contribution policy/version、同一 reasoning domain/profile 与来源当前 hash。Phase 9 必经 §7.1 的两段 USER_REASONING contract：先生成 public-safe probe，确定性 scan 只以该 probe 通过生产 `PublicCoveragePort` 选择 bounded/versioned `PublicCoverageDigest`，再以 digest binding 返回 novelty/quality/generality/grounding 四个 typed assessment 与 distilled candidate。任何 gate、probe/digest binding、payload hash 或 provider trace 不完整都不进入 storage；candidate 与 assessment binding 必须同事务持久化。
+
+候选随后必须通过有版本的确定性隐私规则和固定版本/二进制摘要的 Gitleaks stdin 扫描，失败、超时、未配置均禁止发布。扫描返回不可反序列化的 receipt；API 不接受调用者的 PASSED。扫描不证明不存在所有敏感信息，用户必须预览并确认精确 payload SHA-256。
+
+私有 candidate/confirmation/release 记录仍保存来源 hash、policy/version、actor/profile、rights 与 scan receipt。0120 另以 `control.anonymous_source_lineage` 为每个 release 发行 database-generated UUIDv4 `anonymous_source_id`，并在 `staging.sanitized_public_candidates` 保存只含匿名 content/policy/assessment digest 的 sealed envelope；0121 保存两段 USER_REASONING 的 probe/coverage/assessment binding；0122 以匿名 source、envelope digest 与 revision 封口 dispatch。`control.contribution_confirmations` 保存认证用户对 candidate/hash/policy 的不可变确认。Gateway 不读 staging；预览走已认证 private-worker。存储和最终提交都重查来源、授权与策略；assessed finalize 在同事务创建 release、release_sources、lineage、sealed envelope 与 `PUBLIC_ANONYMOUS_RELEASE(revision=1)`，legacy candidate 在 expand window 才写 `PUBLIC_RELEASE`。相同 candidate 重试返回同一 release。已有 release 缺少 assessment receipt 时不回填虚构通过值，不能被匿名公共入口消费。AUTO_AFTER_USER_DISTILLATION 在经验证的版本化策略投入之前保持关闭。
+
+授权沿 §11.2.1 的真实 domain owner → bound profile，不以「同用户存在某个相同版本 profile」替代绑定。直接用户必须是该 domain owner；Phase 9 新 contribution root 与 preview/confirm/finalize/replay 的共同入口还必须满足 `AuthorizationScope.principal() == AuthorizationScope.user_id()`。`USER_REASONING` grant 仍是通用 reasoning-domain facility，但无论 grant 是否有效，headless/delegated principal 都不能据此创建或继续用户公共贡献。candidate 仍保存准备时 self principal 与允许的 workspace scope；finalize 复核当前 self scope 与全部 direct/backing source visibility，原确认不扩大权限。短事务共享 `ops.lock_contribution_inputs()`，策略、身份、profile/domain、grant、Evidence/Memory 与 memory_evidence 关系变更均加入同一锁协议；provider/scanner 不持该锁。候选的 source_count 与规范化 manifest hash 在延迟约束中封口，不允许确认前后追加来源。异步 A/B 的 final reservation authority 与 strict route expectation 唯一见 §11.2.5，不在本节复制字段清单。此全局短锁只用于正确性，细分前须测量竞争。
+
+公共入口只消费已授权的匿名 envelope 字段，不能接受 release ID、调用者正文或保护侧 bytes/hash/rights。匿名 PublicSource、初始 claim、direct provenance 与 ADMIT lifecycle fact 同事务且幂等；初始 claim 进入 UNDER_REVIEW，不因扫描通过而自动成为 SUPPORTED。
+
+## 12.2 Phase 10 Public Evolution（disabled until separately enabled）
+
+Phase 10 disabled 时，本节的任何工作都不得被 Phase 9 worker 领取或用作其验收证据。启用后，Phase 10 对**已准入**公共知识负责的范围仅为：
 
 - normalize；
 - classify；
@@ -2716,9 +3321,9 @@ Public LLM 只能：
 - propose relation；
 - produce synthesis from supported claims。
 
-每个 Public Synthesis 必须可回溯到 `ContributionRelease`。
+每个 Public Synthesis 必须可回溯到全部根 PublicSource；匿名用户根只保留匿名 direct provenance，protected release/contributor 追溯留在 §7.1 的 `PROTECTED_LINEAGE`。Phase 10 还消费已经登记的 `PUBLIC_SYNTHESIS_REBUILD`，并负责其分类、合并、矛盾检测、递归合成与演化；不得倒推或读取 protected lineage。
 
-## 12.3 递归演化
+## 12.3 递归演化（Phase 10 only）
 
 允许：
 
@@ -2735,8 +3340,14 @@ source_closure(S2) = {A, B, C}
 
 禁止递归后失去原始 provenance。
 
+**物化闭包的唯一物理契约（ADR-0008）**：直接边为 `public.provenance_edges`（claim -> PublicSource）与 `public.synthesis_inputs`（synthesis -> claim 或 synthesis，XOR）。`public.source_closure` 只存派生的根 PublicSource 集：`claim_id? / synthesis_id?` 恰好一个、`root_source_id`、`depth >= 1`、`is_current`、`computed_at`。claim 的直接来源 depth=1，每层 synthesis 增 1；同根多路取最短距离。匿名用户根在 public.* 只保留 §70.5 的 anonymous root；它到 release/private source 的关系只在 `PROTECTED_LINEAGE`，非用户公共来源保留原始 PublicSource。
 
-## 12.4 Public Source Acquisition
+每个 target/root pair 终生只一行：claim 与 synthesis 各自的唯一索引仅以 target 非 NULL 为谓词，**不含 is_current**。刷新先完整验证，再把目标旧行置 false、UPSERT 新集合为 true；无物理 DELETE，也不把 synthesis 的 union 写回子 claim。is_current 表示输入图版本，不表示来源当前许可有效；撤销根仍保留给 §13 影响分析。
+
+刷新事务用 REPEATABLE READ，但必须在第一个 SELECT（含 set_config/advisory SELECT）之前，按固定顺序对 provenance_edges / sources / synthesis_inputs 取 SHARE 表锁，再对 closure 取 SHARE ROW EXCLUSIVE；之后读图。输入写入与刷新串行化，环、任一可达无根分支或不存在的目标均失败并保留原闭包。短时表锁是当前实现的明确取舍；只有实测锁竞争影响 SLO 时才升级为版本化细粒度协议，不声称已量测吞吐。
+
+
+## 12.4 Public Source Acquisition（Phase 10 only）
 
 公共知识“补全”只能通过新增 Evidence，不能由企业 LLM 凭空生成事实。
 
@@ -2856,6 +3467,14 @@ PUBLIC_STAGING
 
 高风险/新 contributor 可以进入审核或较低权威层，而不是一贡献即成为 public truth。
 
+### 12.6 当前信任凭证
+
+`public.claim_trust_evaluations` 是 append-only 评估，target 为 claim/synthesis XOR，绑定正文 hash、策略版本、审核身份、根集合与解释维度；`public.claim_trust_evaluation_sources` 是该次评估的不可变根 receipt，不是第二个可变 closure。`public.poisoning_signals` 保存具体风险及检查版本，未检查维度为 NULL/NOT_RUN，不能写成零风险。当前 target 只通过 revision CAS 指向一条完整 receipt。已有正文被评估后不可就地改写；换正文创建新对象，旧对象保留追溯。
+
+support_count 是根数。independent_support_count 是把已验证的同组织、规范 URL、内容 hash、文档 fingerprint、上游根关联连通后得到的组数；衍生 synthesis 不额外投票。缺身份显式标记 incomplete；此数不是统计独立性或严格下界。trusted_source_count 必须来自明确 source policy，不能凭来源类型或账户数猜测；本阶段无校准自动 promotion。人工评估的 UNDER_REVIEW、QUARANTINED、SUPPORTED 均要求服务端核验当前有效的 global moderator grant、用户与 membership；不能只保护 SUPPORTED 而让任意用户改写审核状态。contradiction_count 与具体 relation/signal 对应，不合成神奇总分。
+
+所有公共读取（包括向量候选 hydrate）用新的 READ COMMITTED 单 SQL 重新验证：SUPPORTED、当前 receipt/revision、正文 hash、receipt 根与当前 closure/直接 provenance 图一致、根非空、没有 §13 撤销事实。候选/缓存/Qdrant 命中不是授权。准入时图修改与评估串行化；图变化会使旧 receipt 失效，不能靠过期 closure 隐藏被撤销的根。
+
 ---
 
 # 13. Contribution Revocation
@@ -2870,15 +3489,16 @@ ACTIVE -> REVOKED
 
 ```text
 release revoked
-  -> enqueue PUBLIC_REVOKE
-  -> query source_closure
-  -> mark affected claims/syntheses unsupported
-  -> recompute multi-source nodes
-  -> invalidate nodes with zero valid support
-  -> rebuild affected public projections
+  -> protected revoke + anonymous REVOKE lifecycle fact
+  -> assessed: enqueue PUBLIC_ANONYMOUS_REVOKE(source_id, envelope_sha256, revision=2)
+  -> legacy expand window: enqueue PUBLIC_REVOKE(release_id)
+  -> Phase 10 only: query source_closure
+  -> Phase 10 only: mark/recompute/invalidate/rebuild affected public syntheses
 ```
 
-如果公共 synthesis 仍有其他独立有效来源，不一定删除，只需移除撤销来源并重新评估。
+Legacy 撤销事务 append `ops.public_release_revocations(release_id,revoke_event_id)`；assessed 撤销事务与 REVOKED 状态原子写 `PUBLIC_ANONYMOUS_REVOKE`，其 owner trigger 同事务 append `ops.anonymous_public_revocations(anonymous_source_id,candidate_envelope_sha256,revoke_event_id)`。两种事实均不可删除/改写，delivery 清理不得使它们失效。匿名 fence 不含 tenant、release、contributor 或正文；public serving 只读该 fence，public worker 只能用 job 中的匿名三元组调用精确 definer 函数。新读快照在撤销 commit 之后即拒绝相关对象，不等待异步 worker；已开始的旧快照不在这一保证内。
+
+影响分析沿现有 source_closure。零有效根的对象变 REVOKED；仍有根的对象进入 UNDER_REVIEW，必须针对剩余根重新验证正文。含被撤销内容的旧 synthesis 不得通过删一条 edge 重新 SUPPORTED；需要新正文时创建替代对象。Phase 9 只登记明确的 PUBLIC_SYNTHESIS_REBUILD 待办，Phase 10 未启用时不领取、不谎报重建成功。每次公共状态变更同事务发 §14 的对象事件，projection 使用对象+revision 的独立 identity，旧任务不能删除/覆盖新 revision。
 
 ---
 
@@ -2896,6 +3516,10 @@ COMMIT
 ```
 
 Worker 之后消费。
+
+`ops.outbox` 以 event_type 区分四种互斥行类：Evidence 事件带 evidence_id + stream_seq；legacy `PUBLIC_RELEASE` / `PUBLIC_REVOKE` 带 contribution_release_id；assessed `PUBLIC_ANONYMOUS_RELEASE` / `PUBLIC_ANONYMOUS_REVOKE` 带 random anonymous_source_id + candidate_envelope_sha256 + source_revision（分别固定 1/2）；`PUBLIC_OBJECT_CHANGED` 带 claim_id/synthesis_id XOR 与 object_revision。各类其他源引用均为空。legacy release ID 与 tenant_id 有真实复合 FK；匿名事件以 protected lineage、sealed candidate 与同事务 release 状态复核，public payload 不带 release/tenant/contributor；object/revision 唯一。所有事件复用 §15 的唯一 commit_seq 分配器，不伪造 Evidence、stream_seq=0 或 public 魔法 tenant；使用发起 job 的实际 tenant。消费者以 event_id+consumer 唯一键将 enqueue 与 outbox ack 同事务提交，崩溃重投不产生重复任务。
+
+生产者的列级 INSERT 见 §6.2.2；状态/lease 更新不得修改 outbox 身份、源引用、commit_seq 或 event_type。release 事件必须匹配同事务中的可见 ACTIVE/REVOKED 状态；public worker 只可新建公共对象事件，行类约束/触发器补足列级 GRANT 的表达边界。后续消费链必须独立验收，不借用 Card C 的创建/撤销测试冒充。
 
 禁止 API 路径直接：
 
@@ -3089,6 +3713,10 @@ issued_at / expiry or policy
 
 Agent **不需要理解** `commit_seq` 或 `stream_seq`，也不能自行构造 token。
 
+token 的 workspace 绑定来自 **pipeline stream 的路由**，不从 Evidence 的可见性字段推导。
+例如 workspace 流中的 `USER_PRIVATE` Evidence，其 `visibility_workspace_id` 仍为 NULL，
+token 仍绑定该 workspace；召回时同时校验流路由与真实对象可见性，不能因此向同 workspace 的其他用户披露。
+
 后续：
 
 ```text
@@ -3107,6 +3735,14 @@ PostgreSQL Evidence/Memory delta overlay
 overlay 下界取 `contiguous_done_prefix`，不取 `max(stream_seq)`。如果 Evidence 尚未完成蒸馏，允许把该 Evidence 作为带 `processing_state` 的临时上下文候选返回，从而满足“刚记住的内容不能立即失忆”，但不能冒充已完成 Memory。
 
 `consistency_token` 只提供 read-your-writes 约束，不是认证 token，不可跨 tenant/workspace 使用。
+
+读入口必须接收独立认证层建立的 `AuthorizationScope`，不能以 token 字段或 raw tenant/workspace
+参数建立授权。每个读事务的 tenant/user 来自该 scope，workspace 只可收窄；token 的 stream family
+必须与受信路由/配置提供的 family 相符（不得从 token 反造 expected family 自比），版本和 seq
+须在实际 stream 账本登记。已登记的旧版本仍按现有 overlay 规则处理，不因退休而误选另一条流。
+`scope_kind` 保留 text；各 adapter 须声明实际支持的映射、拒绝未知映射，不由 token 自选实现。
+最终 Evidence/Memory hydrate 与 overlay 均须执行 §6.1 的 tenant + 授权可见性 AND，并排除
+tombstone/revoked/不可见对象；一致性命中不得扩大可见性。无需把 token 升级为认证载体。
 
 ## 15.6 Knowledge Processing Completeness
 
@@ -3429,6 +4065,12 @@ IDF corpus       -> authorized visibility universe
 
 如果 tenant policy 连 Data Cell 内的 Qdrant text processing 都不允许（极端 policy），Sparse lane 标 `SKIPPED_BY_POLICY`；不要回退到外部 provider。
 
+### 17.6.1 Phase 9 公共 BM25 投影
+
+公共 collection 与私有 payload 分开，仅持 `object_kind / object_id / object_revision / evaluation_id / body_sha256 / projection_live`；不伪造 tenant、Evidence 或私有 stream。point UUID 由 kind/id/revision 确定，正文取 PostgreSQL `content::text` 的规范字节，摘要也绑定这些字节。live 写使用 `update_mode=insert_only` 与 `wait=true`；退役对同一 revision 写 `projection_live=false`、无向量的永久标记。必须覆盖尚未实际投影的历史 revision，禁止用物理删除代替标记，否则晚到的旧 live 写会复活。新 revision 不受较旧退役事件影响。
+
+公共 BM25 查询的 retrieval filter 与独立 `params.idf.corpus` 都必须含 `projection_live=true`，sparse vector 配置必须启用 `modifier=idf`；不回退到全库 IDF。Qdrant 候选不是真源，返回前必须通过新 READ COMMITTED 单条 SQL 核验 kind/id/revision/evaluation/body hash 及 §13 的 eligible/revocation 谓词。任务成功前回读实际点，核身份、摘要、live 与向量状态；过时 live 被永久标记挡下时只有经 PostgreSQL 再确认过期才能作为 superseded 终结。验收须实测晚到旧写、旧退役不伤新版本、非 live 向量不污染 IDF，并对这些保护做注错反测。
+
 ## 17.7 RAM 策略
 
 Qdrant 1.19 的实际限制：dense vectors / payload 不支持 `pinned`，推荐初始实验：
@@ -3554,6 +4196,9 @@ status
 error_class
 provider_request_id
 ```
+
+R3 `CONTRIBUTION_DEIDENTIFY` 的 route/health/payer snapshot、reserve/finalize ordering、
+idempotency 与 USER payer cost-null rule 唯一见 §11.2.5；本节不复制第二份调用账本合同。
 
 ## 19.2 Provider Budget
 
@@ -4555,6 +5200,28 @@ MAC/signature
 
 第二页以后只读该 snapshot universe。
 
+**授权 `memory.enumerate` 的具体接线**：第一页以真实 Gateway 身份在同一 RR 读写事务中，
+通过 Memory 及全部 Evidence 的最终可读与生命周期规则筛选 ID，再写 immutable manifest；
+不得把 secret backing source 或 tombstone 先纳入 manifest、等翻页才丢弃。后续每页以新的
+只读 RR 事务读取该 manifest 的本页 ID，并在该事务中重新校验当前权限及生命周期，再读取
+正文、grounding 与完整 StreamKey 的账本。本页任一 ID 已不可读则整页统一 `NOT_FOUND`，
+不交付部分正文、不返回丢失/跳过数量；客户端需重新开始快照。其他页尚未读取的 ID 不要求
+在每次请求时重扫；grounding 的 `recheck_required` 是可交付的核验状态，不等同撤销。
+异常额外/重复/不匹配 ID 保留内部错误，不能伪装成合法过滤。
+
+cursor 的 query fingerprint 绑定枚举 predicate、tenant、principal、user 和已收窄 workspace。
+签名使用由现有启动 secret 经固定用途 HMAC 派生的专用 key，不复用原始凭据 pepper；
+服务端有效期固定 900 秒，客户端不能覆写。密钥轮换使旧游标失效。格式/MAC 错误为
+`INVALID_INPUT`，合法但过期、已回收或已不适用于当前主体的快照为不泄漏对象信息的
+`NOT_FOUND`；显式越权 workspace 仍在查询前返回 `FORBIDDEN`。分页 limit 不覆盖
+已注册 retrieval profile，也不能把单页数量当成全链 census。新增记录只进入新快照。
+
+Memory 的单一 `outputSchema` 使用 `oneOf`：`get` 保持本节引用的原 Envelope，
+`enumerate` 为 `{content: Envelope, pagination: {snapshot_id, next_cursor}}`。
+Envelope schema 仅在 `context.output.schema.json#/properties/content` 定义，catalog
+通过受控本地引用将其嵌入 Memory schema 的 `$defs`；广告契约与运行时校验一致，无网络
+schema resolver。没有独立全链计数时完整性仍为 `cannot_establish`（见 §23.1④）。
+
 普通“浏览最近内容”若明确标：
 
 ```text
@@ -4722,6 +5389,7 @@ projection lag 超过门槛
 census 失败
 账本闭合 A1 不成立      <-- 本轮补列，此前只写在 §23.1② / §15.4
 谓词不可枚举          <-- 最常见的一条，此前漏列
+envelope 跨块计数无法同口径闭合（唯一判据与 reason 见 §23.1④）
 ```
 
 **账本闭合 A1 不成立**（`done + open_gaps + pending != expected`，§23.1②；等价于 §15.4 `advance_prefix` 判出的 `Inconsistent`）：两路账本互相矛盾，不知道真值是哪一边 ⇒ 不输出任何比值。此前这条只写在 §15.4 与 §23.1② 两处、本表漏列，于是 §22.5 的构造器签名里也没有它的位置，这个裁决只能靠调用方自觉执行 —— 修法见下节新增的第四个入参。
@@ -4776,7 +5444,7 @@ pub(crate) enum LedgerClosure { Closed(LedgerCounts), Broken(LedgerCounts) }
 
 EXACT 分支的错误路径在类型里只有 `CannotEstablish` 一个变体，**枚举里根本不存在 EXACT → SemanticBounded 的转移，写不出来**，不是评审时才发现。
 
-`retrieval_completeness_total{class,reason}` 在该构造器内自增，全 workspace 唯一自增点 —— 呼应 §53：counter 挂在唯一出口上才可能真的跳；挂在硬编码 `None` 的钩子上的 counter 永远不会加一（坑3 实证：22 条 fail-open 只有 7 个能跳，2 枚不可能跳）。
+`classify` 保留上述四参签名及 A1 优先分支，但只做纯判定，不提前记账。Envelope 在同一出口完成 A2、§23.1④ 计数口径、§23.1③ provenance 与 mandatory overflow 校验后，才把最终 `class/reason/exact/known_lower_bound` 一起交付；不得先记 `exact`，再向调用方返回 `cannot_establish`。若本次确实产生 §25.5 `ContextOutcome::Overflow`，最终 reason 为 `mandatory_context_overflow`，同时保留真实 projection/账本诊断；不得改写账本或把非 overflow 结果改成该 reason。`known_lower_bound` 仅取真实 census 已知下界，未知为 `null`，不得用正文条数回填。`envelope_outcome_block` 是唯一 prepare：完成上述判定，并通过接纳回调组装、序列化及校验实际输出，返回字段私有、不可 Clone 的 `PendingEnvelope<T>`，此时不记指标。Gateway 还须完成配额与审计结算，全部成功后才消费 `pending.finish(self)` 返回已准备的输出；`finish` 是 `completeness::record_final_classification` 的全 workspace 唯一调用点。prepare/校验/结算失败或丢弃 pending 均不记最终指标，类型所有权禁止同一 pending 重复 finish。指标度量服务端已接纳的业务结果，不声称远端已收到网络字节；transport 错误另行观测。组件 EXACT census 与 `classify_for_witness` 只提供纯判定，不能绕过 provenance/计数/Context 门发最终指标；G80-6 指标 witness 必须经过同一最终入口，不能伪造全集或索引读数将组件测试冒充全链验收。此处不改变 A1/A2、降级方向或字段的单一权威。
 
 ---
 
@@ -4900,6 +5568,69 @@ A1 违反 = 两路账本互相矛盾，不知道真值是哪个；A2 `<` 侧违�
 
 `provenance` 块在所有模式下都必须完整，不允许裁剪。
 
+**字段适用性只有本节这一处定义。** `binary_build` 必须是实际运行二进制的非空身份，
+`profile_fingerprint` 必须由 §55.1 唯一 `build_request` 生成（算法见 §23.3），
+不能由调用方填一个看似非空的摘要。其余四个字段 `projection_version`、
+`embedding_model_id`、`rerank_model_id`、`card_builder_version` 共用一个显式类型：
+
+| 线格式 | 含义 | 完整 provenance 统计资格 |
+|---|---|---|
+| `{"status":"used","id":"实际身份"}` | 该组件实际参与本次结果，身份有执行或所消费投影/卡的记录可查 | ID 真实、非空且不是占位值时成立 |
+| `{"status":"not_applicable"}` | 现有 planner 的执行分支明确未选择、也未使用该组件 | 只有分支证明不适用时成立 |
+| `{"status":"cannot_establish"}` | 该组件与本次路径有关，但无法可靠确认实际使用身份 | 不成立；保留诊断，不进入完整 provenance 统计 |
+
+纯 PostgreSQL `DirectGet` / `Enumerate` / 结构化 `context` 分支若只消费 Memory 正文或
+Event payload、完全未消费索引或 RetrievalCard，可以对这四项如实报 `not_applicable`。
+“编译了某个 card builder”不是“本次用了该 builder”，不能填编译时可用版本充数。
+已选择 semantic/provider/card/projection 的分支发生失败时，不能退写 `not_applicable`；
+只能保留真实参与的身份、报 `cannot_establish` 或返回明确依赖错误。
+适用性由既有 `PlannerDecision` 和执行分支决定，禁止客户端自报或另建一套计划 registry。
+缺字段、未知状态、空白 ID、`none` / `n/a` / `unknown` 等占位身份均无效。
+`is_valid` 继续表示“完整 provenance 可进入统计”：任何 `cannot_establish` 必须为 false，
+但失败诊断仍可序列化且六字段不得省略；不新增另一套 validity 口径。
+这不豁免 `pipeline` 的取数与 `completeness` 判定：未取到索引可见数仍按 §23.1② 处理。
+
+### ④ 计数全集与未知值
+
+**块级计数口径只有本节这一处定义。** `EvidenceBlock` 与 `KnowledgeBlock` 各有一个
+`count_scope`，线值为 `authorized_view` 或 `stream_ledger`。同一块的计数必须来自同一
+实际全集、同一授权与快照；不能只把两个不同集合贴成同一个标签。
+`ProjectionBlock` 的口径固定为本请求完整六列 `StreamKey` 的 `stream_ledger`，调用方
+不得另选；`expected` 仍只读 §23.1② 的 `issued_highwater`。
+
+`evidence.persisted` 及 `knowledge.eligible / processed / waiting_key / failed` 可以为
+`null`，表示当前角色或依赖无法给出该口径的读数；禁止填 `0`、返回条数、
+`issued_highwater` 或其他块的值充数。无 batch 时 `evidence.expected = null` 是
+§23.1① 的正常定义，不因此触发计数未知。票据与流计数仍禁止互相回填。
+
+`pipeline` 的唯一闭合判定只在相关计数已知、口径相同且等式成立时返回 true：
+`evidence.persisted == knowledge.eligible == projection.expected`，知识层自身的
+`processed + waiting_key + failed == eligible` 也必须成立。已知同口径但数值矛盾为
+`pipeline_count_mismatch`，缺必要读数为 `count_unknown`，跨口径为
+`count_scope_mismatch`；三者都使完整 envelope 为 `cannot_establish`。
+既有 ledger / census / lane 的更具体不可判定原因不被后置检查覆盖。
+这不另造 classifier、Envelope 或统计资格，也不改 §23.1② 的 A1/A2 算法。
+
+同 workspace 内不同用户的 `USER_PRIVATE` Evidence 会进入同一流账本，但不一定
+属于当前用户的授权可见集合。因此授权 EXACT census 即使独立证明了自己的 total，
+也不能让全链闭合跨全集变成 true：可保留已验证 items 与枚举计数，完整性仍须
+如实 `cannot_establish`。合法隐私过滤**不写** `processing_gaps`，不增加
+`open_gaps`，不伪造 `FAILED` / `LOST` 或 `PROJECTION_INVISIBLE_LOSS`。
+
+**当前本地 MCP DirectGet 边界**：`memory.get` 将校验后的 `MemoryId` 作为可信 intent
+送入 §55.1 唯一 `build_request`，不伪造查询文本或 profile。授权先收窄到凭据绑定的
+workspace，再在同一个只读 RR 事务内读取 Memory 与全部 Evidence 的最终正文权限、
+grounding 和完整 StreamKey 的账本；对象缺失、不可见、已撤销、被替代、secret backing
+source 或 tombstone 均返回同一 `NOT_FOUND`，显式越权 workspace 仍在对象读取前返回
+`FORBIDDEN`。结果复用本节 `Envelope`，`mandatory/pinned` 均为 `not_run`；MCP catalog
+通过 §20.4 的 Memory 输出 union 引用 `context.output.schema.json#/properties/content`，
+不复制第二份 Envelope schema。
+没有独立 census 的对象读取不生成 `exact` 或 `known_lower_bound`，未读 pipeline 数值
+依本节保留未知。只有实际输出通过 schema、quota 结算及审计后才允许完成
+`PendingEnvelope` 并记录一次最终完整性指标；任一步失败都不记录该指标。
+入口验收必须覆盖真实 MCP 授权与生命周期负例、并发同快照对照、未知值不可提升为
+Exact，以及 schema/结算/审计失败的零指标对照；此入口不代表已完成枚举或语义检索。
+
 ## 23.2 「删了 10 条」vs「漏了 10 条」vs「丢了 10 条」
 
 三种情况 `visible` 都是 90，在旧 envelope 里长得一模一样；第三种在旧口径（分子 `done - deleted`）下还会报 `1.0`。
@@ -4944,8 +5675,8 @@ A1 违反 = 两路账本互相矛盾，不知道真值是哪个；A2 `<` 侧违�
 {
   "items": [],
   "pipeline": {
-    "evidence": { "expected": 100, "expected_source": "ticket", "persisted": 98 },
-    "knowledge": { "eligible": 98, "processed": 95, "waiting_key": 2, "failed": 1 },
+    "evidence": { "count_scope": "stream_ledger", "expected": 100, "expected_source": "ticket", "persisted": 98 },
+    "knowledge": { "count_scope": "stream_ledger", "eligible": 98, "processed": 95, "waiting_key": 2, "failed": 1 },
     "projection": {
       "expected": 98,
       "done": 95,
@@ -4969,10 +5700,10 @@ A1 违反 = 两路账本互相矛盾，不知道真值是哪个；A2 `<` 侧违�
   },
   "provenance": {
     "binary_build": "humaux-gateway 2026-08-24T09:11:03Z g1e1529f",
-    "projection_version": "dense-v3",
-    "embedding_model_id": "text-embedding-v4@2026-06-11",
-    "rerank_model_id": "qwen3-rerank@<provider-revision>",
-    "card_builder_version": "card-v2",
+    "projection_version": {"status": "used", "id": "dense-v3"},
+    "embedding_model_id": {"status": "used", "id": "text-embedding-v4@2026-06-11"},
+    "rerank_model_id": {"status": "used", "id": "qwen3-rerank@revision-1"},
+    "card_builder_version": {"status": "used", "id": "card-v2"},
     "profile_fingerprint": "sha256:9f2c1d7a4b0e…",
     "profile": {
       "top_k": 5,
@@ -4993,7 +5724,13 @@ A1 违反 = 两路账本互相矛盾，不知道真值是哪个；A2 `<` 侧违�
 
 检索侧同理：`candidate_count 25` / `reranked_count 12` / `returned 5`。`RERANK_PROVIDER_TIMEOUT` 的含义是 25 个候选里只有 12 个真过了重排、其余走 fallback 序；**两个 count 相等的示例看不出降级发生过**，正是 §23.2 那条判据例要排除的形态（本示例先前写 `25 / 25` 却同时挂着这条降级，自己违反了自己立的标准，已改）。三个数的自洽关系即 §23.4 的夹具断言：`returned (5) == profile.top_k`、`reranked_count (12) <= candidate_count (25) == profile.cand_k == min(top_k * 5, 200)`、`truncated = true` 因为 `candidate_count > returned`；且 `reranked_count == candidate_count` 时 `degradations` 不得含任何 rerank 类降级（重排全数完成 = 结果未被降级；重试后全数成功只记指标，不进 `degradations`），反之含该降级时 `reranked_count` 必须严格小于 `candidate_count`。
 
-`degradations` 取代旧的 `degraded: bool`，字段名以本节为准、全文只此一个（§53.1 从之）；成员是 §53.2 `DegradeCode` 变体的**线格式**，即 `fold(变体名)` 得到的 SCREAMING_SNAKE 串，形式与映射冻结在 §53.2。本例的 `RERANK_PROVIDER_TIMEOUT` 对应变体 `RerankProviderTimeout`；早先此处写的 `RERANK_TIMEOUT_PARTIAL` 是同一件事的第二个名字（§41.1 R3 同物二名），已删，不留兼容期、不加别名。`profile_fingerprint` = §55 那个唯一构造函数输出的检索请求的规范序列化 sha256。
+`degradations` 取代旧的 `degraded: bool`，字段名以本节为准、全文只此一个（§53.1 从之）；成员是 §53.2 `DegradeCode` 变体的**线格式**，即 `fold(变体名)` 得到的 SCREAMING_SNAKE 串，形式与映射冻结在 §53.2。本例的 `RERANK_PROVIDER_TIMEOUT` 对应变体 `RerankProviderTimeout`；早先此处写的 `RERANK_TIMEOUT_PARTIAL` 是同一件事的第二个名字（§41.1 R3 同物二名），已删，不留兼容期、不加别名。`profile_fingerprint` = §55 那个唯一构造函数输出的检索请求中实际生效的检索配置的规范序列化 sha256（`sha256:` 前缀）。
+
+该指纹由唯一 `build_request` 在默认值、clamp、派生计算完成后生成，必须包含实际 `cand_k`
+及会改变检索行为的配置；query 文本、tenant/user/token、request ID 不属于 profile，不入指纹。
+同有效配置的不同 query 指纹相同，实际候选深度不同则指纹不同；跨指纹聚合按 G23-4 拒绝。
+§50 全局 effective-config 指纹与此检索 profile 指纹用途不同，可复用规范化 hash helper，
+不得直接把未包含派生请求配置的原始 config 摘要充作本字段。
 
 ## 23.4 可判定 gate
 
@@ -5013,9 +5750,10 @@ A1 违反 = 两路账本互相矛盾，不知道真值是哪个；A2 `<` 侧违�
   - **分母侧仍需单测**：`completeness_ratio` 的分母恒为 `expected - deleted`，用 §23.2 三个对照 JSON 作为夹具，第三例读数必须是 `0.9`，读到 `1.0` 即口径没改动。
   - **合法删除对照（不可省，与两条注入共用夹具）**：`begin_batch(100)` → 100 条全部 search-visible → 走完整 `DeletionPlan`（§37）删 10 条，在**每一步边界**各取一次 envelope。全程 A2 必须闭合（`90 + 10 + 0 == 100`）、`completeness_ratio` 恒 `1.0`（`90 / (100 - 10)`）、`current` 恒 `true`、`PROJECTION_INVISIBLE_LOSS` 一次都不许出现。**同一批采样点上各跑一次检索**（dense / sparse / literal / §22.1 的 PostgreSQL EXACT 通道各一次），被 tombstone 的那 10 条一次都不许出现在 `items` 里 —— 包括第 5 步物理 purge 还没跑的那些采样点。这一半是 §23.1② overlay 谓词挂在检索面上的注错点：把 overlay 退回成「只在 `count()` 里减」，第 1 步与第 5 步之间的采样必然把已删的 10 条检索出来（envelope 却全程绿）⇒ 本条红。把 tombstone 移回收尾（旧顺序）后，第 4 步与第 8 步之间的采样点必然读到 `done=100, deleted=0, visible=90` 并点亮该降级 ⇒ 本条红。**它与上面两条注入方向相反：注入要它红、合法删除要它绿，同一判据两侧都被钉住，才堵掉「把闸调钝就全绿」这条退路。**
 - **G23-3 三方证伪**：直接改视图底表让 `done + open_gaps + pending ≠ expected`，envelope 必须输出 `cannot_establish`，不得照算比值。
+  - **计数全集负测**（判据见 §23.1④）：同 workspace 增加他人 private Evidence，当前用户的授权 count 不随之增加，不与全流数混算，实际 gaps 不变；必要读数为 `null` 时不回填；授权 EXACT 结果正确而全流无法核验时，完整 envelope 仍不能报告全链闭合。已知同口径计数被改成不相等，也必须判不可建立，而非隐去矛盾。
 - **G23-4 量具同源**：benchmark / 评测汇总按 `profile_fingerprint` 分组；跨 fingerprint 汇总直接失败退出。
 - **G23-5 被测物在不在**：e2e 中三臂的 `binary_build` 必须两两不同，相同即红。
-- **G23-6 完整性**：`provenance` 六个字段任一为空 ⇒ 该结果视为无效，不进任何统计。
+- **G23-6 完整性**：`provenance` 六字段按 §23.1③ 验证，缺失、非法身份或无法确认均不得进入完整 provenance 统计。必须覆盖：纯 PG 分支真实未用组件、semantic 失败不得伪装未用、空白/占位/未知状态拒绝、请求 fingerprint 只来自唯一构造器；失败诊断保留完整字段。不得用非空占位字符串把本闸调绿。
 
 对普通 semantic recall，`pipeline` 可以只返回 query scope 下可得的摘要；对 `context` / `continuity` 必须完整报告 processing gaps —— 这些 gap 直接决定「当前上下文是否齐全」。`provenance` 与 `expected_source` 两块不受此豁免。
 
@@ -5072,28 +5810,174 @@ recent evidence
 
 ## 25.3 continuity
 
-项目级 context product。
+项目级 context product；完整 facet census、authority、result 与 coverage contract 唯一见 §25.3.1。
+
+### 25.3.1 Project Continuity Authority / Completeness
+
+本节是 Project Continuity v1 的**唯一规范真源**。Tool 5、Phase 8、§57.1、§69、§80.1
+与 contract-impact 只引用本节，不复制 facet、状态、存储、授权或验收定义。
+
+#### Project identity 与 authorization parent
+
+`ProjectId` 是全局稳定的 UUIDv7 identity，不是 authorization scope。项目通过唯一 registry
+映射到不可变的 `(tenant_id, workspace_id, project_id)` parent，再复用既有 workspace
+membership、role/policy、visibility 与 revoke epoch 授权。不得新增 `Scope::Project`，也不得把
+`project_id` 等同于 `workspace_id` 或 `repository_id`。request 中的 `workspace_id` 若存在，只能
+作为 exact narrow；不匹配即统一拒绝。不存在与未授权必须使用同一外部错误形状，授权完成前
+不得泄漏 title、facet existence、version、hash 或 source identity。
+
+#### Closed facet census
+
+v1 的分母固定为以下 17 项，顺序、名称与 mode 都是 contract：
+
+| Ordinal | Facet | Mode / owner boundary |
+|---:|---|---|
+| 1 | `GOAL` | `SOURCE_BACKED` |
+| 2 | `CURRENT_STATE` | `SOURCE_BACKED` |
+| 3 | `DECISIONS` | `SOURCE_BACKED` |
+| 4 | `REJECTIONS` | `SOURCE_BACKED` |
+| 5 | `CONSTRAINTS` | `SOURCE_BACKED` |
+| 6 | `KNOWN_ISSUES` | `SOURCE_BACKED` |
+| 7 | `NEXT_ACTIONS` | `SOURCE_BACKED` |
+| 8 | `ACTIVE_TASKS` | `SOURCE_BACKED`，Phase 12 owns source |
+| 9 | `RECENT_CHANGES` | `SOURCE_BACKED`，Phase 11 owns source |
+| 10 | `CODE` | `SOURCE_BACKED`，Phase 11 owns source |
+| 11 | `TESTS` | `SOURCE_BACKED`，Phase 11 owns source |
+| 12 | `CONFIG` | `SOURCE_BACKED`，Phase 11 owns source |
+| 13 | `MIGRATIONS` | `SOURCE_BACKED`，Phase 11 owns source |
+| 14 | `HANDOFF` | `SYSTEM_DERIVED`，复用同一 snapshot 的 HandoffV1 |
+| 15 | `PROCEDURES` | `SOURCE_BACKED` |
+| 16 | `OUTCOMES` | `SOURCE_BACKED` |
+| 17 | `COVERAGE` | `SYSTEM_DERIVED`，由同一 result census 计算 |
+
+只有 15 个 `SOURCE_BACKED` facet 可进入 version/source-link/current-slot 写路径。
+`HANDOFF` 只引用顶层 `#/handoff`；`COVERAGE` 只引用顶层 `#/coverage`。两者不得有第二份
+arbitrary body、version、source links 或 writable current slot。
+
+#### Append-only authority 与 CAS current slot
+
+W1 落地的 PostgreSQL authority 必须保持以下单向关系；本节冻结 contract，不表示 W0 已有
+storage/runtime：
 
 ```text
-Goal
-Current State
-Decisions
-Rejections
-Constraints
-Known Issues
-Next Actions
-Active Tasks
-Recent Changes
-Relevant Code
-Relevant Tests
-Configuration
-Migrations
-Handoff
-Procedures
-Outcomes
+private.continuity_projects
+  immutable (tenant_id, workspace_id, project_id UUIDv7)
+  mutable bounded title; ACTIVE -> ARCHIVED only
+
+private.continuity_facet_versions
+  immutable (tenant_id, workspace_id, project_id, facet_kind, facet_version)
+  facet_version_id + canonical body + exact body_sha256 + author
+  facet_kind restricted to the 15 SOURCE_BACKED kinds
+  runtime roles: no UPDATE / DELETE
+
+private.continuity_facet_memory_links
+private.continuity_facet_evidence_links
+  immutable exact source set bound to the same project/facet/version
+  runtime roles: no UPDATE / DELETE
+
+private.continuity_facet_slots
+  one current pointer per project + SOURCE_BACKED facet
+  current_version_id proved by composite same-parent/same-facet FK
+  slot_version changed only by compare-and-swap
 ```
 
-并输出 facet coverage。
+publish 明确提供 `project_id`、source-backed `facet_kind`、canonical body、exact Memory/Evidence
+source ids 与 `expected_slot_version`。同一事务先授权 registry parent，再验证 exact sources、插入
+immutable version/links，最后执行带 `slot_version = expected_slot_version` predicate 的 slot
+UPDATE。affected rows 不等于 1 时返回 Conflict 并回滚全部 version/links；禁止 orphan、upsert、
+last-writer-wins。CAS mismatch 不是 semantic `CONFLICTED`；该状态只表示明确持久化的 unresolved
+semantic conflict。reader 不生成 facet，也不把 `MemoryType`、`AuthorityClass`、tag、topic、
+`Scope` 或 repository path 自动升级成 facet。
+
+#### One-RR read、source revalidation 与 recovery
+
+每次 `continuity.get` 以 registry parent 完成 workspace authorization 后，使用一个真实
+`REPEATABLE READ READ ONLY` 事务读取 project registry、15 slots、exact immutable versions、
+exact source links、source lifecycle/RLS/revoke/tombstone/supersession/grounding、HandoffV1
+`FrozenReads` 与完整 PostgreSQL snapshot token。provider、embedding、rerank 与 LLM 调用数必须为
+0。只有 project/workspace authorized、slot/version/hash closed、所有 exact sources 在该 RR 可读且
+deliverable 时，source-backed facet 才能为 `CURRENT`。
+
+revoke committed 后的**下一次 RR**不得返回旧 body；已开始的旧 RR 维持自己的 snapshot，不承诺
+跨事务物理瞬时线性化。W2 默认无 Continuity cache。commit 前 crash 不留 version/link/slot；
+commit 后 restart 只从 PostgreSQL registry/slot/version/link 恢复。真正 `REVOKED` 的旧 version
+永不自动复活；恢复 ACL 且 source 仍 ACTIVE 时，同一 immutable version 可重新可读。
+
+#### ContinuityResult v1
+
+`continuity.get` input 必须有 `project_id`；`workspace_id` 只作 optional exact narrow；v1 无
+`limit`，因为 limit 不得裁掉固定 census。output 必须绑定 canonical
+`contracts/mcp/continuity.output.schema.json`，并包含：
+
+```text
+contract_version = "1"
+project_id
+snapshot { context_snapshot_seq, snapshot_token_sha256, result_sha256 }
+facets[17] exactly, fixed order above, unique kind
+  kind
+  mode = SOURCE_BACKED | SYSTEM_DERIVED
+  status = CURRENT | MISSING | UNAVAILABLE | STALE | CONFLICTED
+  current?      SOURCE_BACKED + authorized CURRENT only
+  payload_ref?  CURRENT HANDOFF/COVERAGE only
+  diagnostic_code? bounded and non-leaking
+handoff = exact HandoffV1 from the same snapshot
+coverage
+```
+
+`current` 含 exact immutable `facet_version_id`、monotonic `facet_version`、canonical body、
+`body_sha256` 与 exact Memory/Evidence source ids。非 `CURRENT` entry 不得携带或泄漏 body、hash、
+version 或 source identity。
+
+| Status | Meaning |
+|---|---|
+| `CURRENT` | capability、exact version/hash 与同 RR source visibility/lifecycle/grounding 全成立 |
+| `MISSING` | capability 已实现，但 project 尚无 current version |
+| `UNAVAILABLE` | 当前 build 尚无 authoritative source/selector/adapter |
+| `STALE` | basis 在本 RR 不再可交付，含 revoke/supersede/tombstone/visibility revalidation failure |
+| `CONFLICTED` | 明确持久化的 unresolved semantic conflict |
+
+caller-specific source 不可读归 `STALE` + bounded `VISIBILITY_REVALIDATION_FAILED`，不得泄漏 source。
+增加第六状态（例如 `INACCESSIBLE`）是 output v2 变更，不得在 v1 偷加。
+
+Coverage 必须满足：
+
+```text
+required = 17
+required = current + missing + unavailable + stale + conflicted
+ratio = current / 17
+
+FACET_COMPLETE iff
+  all 15 SOURCE_BACKED facets CURRENT
+  AND HANDOFF CURRENT
+  AND COVERAGE CURRENT
+  AND every source/Handoff invariant closes in the same RR
+otherwise CANNOT_ESTABLISH
+```
+
+`UNAVAILABLE` 仍在固定分母内；不得用 returned/implemented items 作分母。census/partition 无法闭合
+时不得生成有利 ratio，只能 `CANNOT_ESTABLISH` 或整次失败。
+
+#### Phase ownership 与 serial delivery boundary
+
+- W0 只拥有本 Canon、input/output contract、catalog/manifest topology 与静态 gates；不写
+  migration、storage、application、Gateway runtime 或 provider。
+- W1 才拥有 registry/version/link/slot storage、RLS/FORCE、append-only 与真实双连接 CAS。
+- W2 才拥有 real Gateway → application → PostgreSQL one-RR read、revoke/restart/no-provider vertical slice。
+- W3 才拥有 `G25-2` live verifier、独立 mutations、CI receipt 与 full closure；W0/W1/W2 局部绿
+  均不等于 Project Continuity accepted。
+- Phase 11 authority 存在前，`CODE/TESTS/CONFIG/MIGRATIONS/RECENT_CHANGES` 必须
+  `UNAVAILABLE`；Phase 12 authority 存在前，`ACTIVE_TASKS` 必须 `UNAVAILABLE`。
+- Phase 13 不新增第 18 个 `DOCUMENTS` facet，也不把 artifact/document 猜映射到现有 facet。
+- Phase 10/providers 在 W0–W3 全程保持 disabled；Continuity 不读、不写、不触发、不验收 Phase 10。
+
+**G25-2 Project Continuity Authority Closure（G80-46）。** 最终 verifier 必须经 real Gateway
+`continuity.get` 证明 registry/workspace auth → one RR → exact fixed 17 statuses → exact source links
+revalidated → HandoffV1 same snapshot → closed coverage，且 provider calls = 0。独立注错至少逐项击中：
+删 dispatch、project 当 workspace、绕 registry auth、新增 `Scope::Project`、去 CAS、放开 immutable
+UPDATE/DELETE、dynamic denominator、去 RR、去 source visibility/revoke revalidation、泄漏非 current
+payload、把 Phase11/12 unavailable 改 current、给 derived facets 建 writable slot、Handoff snapshot
+漂移、接 provider、用 limit 裁 facets。W0 只验证 Canon/contract/topology 的静态形状；W3 live
+verifier 与每个 mutation receipt 到场前，G80-46 不得宣称 accepted。
 
 ---
 
@@ -5144,6 +6028,10 @@ Pinned：
 ```text
 user/admin explicit ContextBinding(mode=PINNED)
 ```
+
+Mandatory 内同一 `memory_id` 被多个 selector 命中时只交付一次。各 selector 必须保留同 RR 内独立、无 LIMIT、经授权后的 candidate-ID 集合；唯一 lane 构造点取这些集合的并集，`mandatory.expected` 为并集基数，不能相加 selector occurrence，也不能从返回 rows 反推。候选被治理门分到 `needs_verification` 时仍属于 expected，未返回正文仍计入 `missing = expected - returned`；`NotJudged` 按既有规则随正文交付。Unavailable selector 保持具名诊断，此时 expected 只覆盖可用 selector 的已知候选并集，不能宣称完整全集已建立。manifest、诊断、grounding 和 token 均按 memory ID 唯一；固定 selector 顺序只决定代表 selector 与稳定排序，不能择优掩盖同 ID 不一致的 grounding，矛盾必须 fail closed。无重叠时既有排序与 Handoff 字段格式不变。
+
+跨 lane 同一 `memory_id` 由 Mandatory 优先承载，只占一次正文、grounding 和 token 预算；raw budget reserve、compiler 与 Handoff 必须复用同一选择规则。`pinned.expected` 保留独立授权候选计数，`pinned.returned` 为实际独立 Pinned 行，重叠项纳入既有 `pinned_excluded`；非 overflow 且候选可完整判定时三者闭合，overflow 的 returned=0 不得解释为全量被排除。
 
 Supplemental：
 
@@ -5222,6 +6110,8 @@ mandatory.overflow
 pinned.expected
 pinned.returned
 ```
+
+**Context 输出组合契约**：当前本地未发布的 MCP `context.assemble` 返回 `ContextResult { handoff: Handoff, content: Envelope<ContextItem> }`；`ContextItem` 只带实际授权记忆的 `memory_id/content`。`Handoff` v1 字节域与既有 golden 不变，负责 mandatory/pinned ID manifest、`needs_verification`、`not_judged`、`unavailable_selectors` 与快照身份；`content` 复用 §23 Envelope，不将 manifest 数组塞进 mandatory/pinned 计数报告。两部分必须来自同一个 RR 事务和同一个 `ContextOutcome`，正常路径的物化 ID/顺序与编译结果一致；overflow 时正文为空，但完整 manifest、诊断和快照仍返回。可信 Context intent 通过唯一 `build_request` 和注册 profile；调用方不能选择 planner/档位。显式 workspace 只绑定真实 bootstrap stream，未配置的 tenant route 返回 `DependencyUnavailable`，不能构造空 stream 冒充全量。验收同时覆盖 Handoff golden、真实 MCP 正文与 schema、同快照授权/顺序、overflow 和 DOD-093；未读取的 pipeline/freshness 信息保持未知，不能据此宣称全链完整。
 
 ### G25-1 Mandatory Non-eviction
 
@@ -5704,6 +6594,12 @@ retryable
 
 `WAITING_KEY` 不消耗 retry。
 
+`attempt` 是同一 job_id 的单调领取令牌，不因 retry/WAITING_KEY 重置。heartbeat、fail、complete 与业务提交均比较 tenant/job/owner/attempt/PROCESSING 且 lease_expires_at > clock_timestamp()；业务事务先锁住并核验当前 lease，再提交结果与 DONE。相同 owner 重领也不能让旧 attempt 写入。
+
+上述原子 fencing 的范围是 PostgreSQL 业务状态、outbox 与 DONE。Qdrant HTTP 副作用不能随 PostgreSQL 回滚；禁止承诺过期 attempt 没有任何迟到物理写。每次远端 I/O 前复核/必要时续租，重新以 READ COMMITTED 读取目标资格，使用有限请求 deadline；回包后再次核 lease 与当前 revision/eligibility 才可结账。取得资格的数据库快照与 HTTP 实际落点不是同一线性化点。跨系统安全性与收敛由 §17.6.1 的不可变 revision 身份、insert_only、永久退役标记、精确回读和返回前 fresh hydrate 保证；正常版本替换也必须清退旧 revision。验收须在投影 I/O 期间令 lease 失效，证明旧 attempt 不提交 PostgreSQL 业务变更/DONE、新 attempt 重放收敛且不能复活已退役点。
+
+Phase 9 只提供显式 run_once：PublicWorkerDbPool 仅领取 legacy `PUBLIC_RELEASE_APPLY` / `PUBLIC_REVOKE_APPLY`、新路径 `PUBLIC_ANONYMOUS_RELEASE_APPLY` / `PUBLIC_ANONYMOUS_REVOKE_APPLY` 与 `PUBLIC_PROJECT`；通用 Runtime claim 排除 PUBLIC_ 前缀。assessed job payload 只含匿名 source、envelope digest 与 source revision，不含 release/tenant/contributor。`PUBLIC_SYNTHESIS_REBUILD` 只登记待办，不能被本阶段领取。没有 resident daemon、cron 或隐式 Phase 10。
+
 ---
 
 # 32. Tenant Fair Scheduler
@@ -5785,7 +6681,7 @@ Humaux 的 Agent 主接口采用 remote HTTP MCP。Native wire target 是 `2026-
 - DCR deprecated，CIMD 为新方向；
 - legacy HTTP+SSE deprecated。
 
-官方 Rust SDK `rmcp 3.0.0` 已稳定支持 MCP `2026-07-28`；Rust SDK 当前为官方 **Tier 2**。SDK 仍不进入 Domain，所有 SDK/wire 类型只存在 `protocol/mcp`；Tier/SDK 演进只能修改 Protocol Adapter / Compatibility Profile。
+Protocol Adapter 固定使用官方 Rust SDK `rmcp =3.1.4`（2026-08-28 复核官方版本发布）；native wire 保持 MCP `2026-07-28`。SDK 仍不进入 Domain，所有 SDK/wire 类型只存在 `protocol/mcp`；Tier/SDK 演进只能修改 Protocol Adapter / Compatibility Profile。历史 Tier 2 调研记录见 §84，当前实现不依赖 Tier 标签。
 
 ## 33.1 Canonical Tool Contract
 
@@ -7203,31 +8099,8 @@ user context
 
 ## Tool 5 — continuity
 
-项目开发专用。
-
-返回：
-
-```text
-Goal
-Current State
-Decisions
-Rejections
-Constraints
-Known Issues
-Next Actions
-Active Tasks
-Recent Changes
-Code
-Tests
-Config
-Migrations
-Handoff
-Procedures
-Outcomes
-Coverage
-```
-
-这是 Humaux 的核心差异化 Tool。
+项目开发专用；完整 Project Continuity contract 唯一见 §25.3.1。本处不另定义 facet、状态、
+授权或 coverage。
 
 
 ## Tool 6 — artifact
@@ -7508,6 +8381,22 @@ Quota logic
 ```
 
 `accepted` 只表示 Evidence + Outbox 已在 PostgreSQL 权威事务中提交。它**不表示**蒸馏、Memory 生成、Embedding 或 Projection 已完成。一个 Evidence 后续可产生多条 `memory_id`；通过 `processing_handle` / `memory` / `context` 查询处理结果。
+
+## 34.0.1 本地写入的幂等与提交恢复（2026-08-28 冻结）
+
+普通 `remember(operation="put")` 的最小入参为 `content`、`idempotency_key`，可带已授权的 `workspace_id`。`idempotency_key` 沿用 §68/§69.1 的名称，是匹配 `^[A-Za-z0-9._:-]{1,128}$` 的调用方逻辑操作键；不是 HTTP request_id、租户/用户身份或 Evidence 主键。服务端每个 HTTP 请求仍生成独立 request_id。相同 `(tenant_id, principal_id, operation, idempotency_key)` 只执行一次；键与原始 arguments 字节的 SHA-256、当前认证身份及资源路由绑定，不把重新序列化后的 JSON 当原始字节。
+
+写入复用单个 `role_gateway` PG 事务：先以 `operation-receipt:` 命名空间、完整幂等元组的确定性 `pg_try_advisory_xact_lock(hashtextextended(...,0))` 排除同键并发；冲突返回有界 `CONFLICT`。查已提交 receipt，未命中才 reserve BMO → `remember_in_txn` → quota CONSUMED → 必要审计 → INSERT 完整 receipt → COMMIT。网络/provider 调用不得置于此事务；读操作仍可使用 §72.2.1 的独立 reserve/finalize。事务内所有 deadline 在阻塞后重新判断；任一步失败使业务、计数、审计和 receipt 一起回滚。必要审计失败也不能留下半个 accepted。
+
+`control.operation_receipts` 只保存 COMMITTED 事实，不保存可见 IN_PROGRESS：幂等元组、input SHA、认证 user/workspace 绑定、reservation 引用、Evidence/stream/commit 引用、提交时间和 replay_expires_at；不存正文、Bearer 或认证 secret。追加迁移创建，不改已应用的 0113。其权限只见 §6.2.2。已提交写入的 reservation 必为 CONSUMED，因此既有仅处理 RESERVED 的 reaper 不能退款；receipt 不是第二套可改计费账本。
+
+每次重试先经过当前认证、scope、tenant/workspace、rate 与 entitlement 检查；命中 receipt 不再预留/消费 BMO、不再执行 writer。input SHA 或绑定不一致 → CONFLICT；重放前重新验证 Evidence 当前可见和未被删除，不能绕过撤销/删除保护。响应通过已提交的非敏感引用重建，consistency token 仍单独按当前身份校验。COMMIT 返回连接错误不证明回滚；下一次同键必须重新取得锁再查 receipt，以数据库提交事实确定结果。
+
+写事务等待超时或 COMMIT 返回错误时，Gateway 只返回可重试 `DEPENDENCY_UNAVAILABLE`，不得另写同 request_id 的终态失败 `MCP_REQUEST_FINISHED`、退款或重执。可用独立、有界的 `MCP_REQUEST_OUTCOME_UNKNOWN`（result=`UNKNOWN`）记录网关观测；它不裁决提交结果、不得覆盖原子 OK 审计或 receipt，数据库不可用时也不能因此伪造确定结果。恢复 gate 必须真实读到 PG 的 COMMIT 完成帧后丢弃该回执，核对同键重试、业务/BMO各一次及不存在矛盾的终态失败审计；仅丢弃已经返回成功的函数值不等于这个故障。
+
+replay_expires_at 仅表示允许重建正常结果的期限，来自显式服务端策略，不是键复用期限。到期保留不可重新执行的墓碑并返回 CONFLICT，不重新 reserve；物理清理需另走保留/删除治理，不能通过清理悄悄恢复同键写入能力。Evidence 删除后的引用必须保留防重放墓碑、不得阻塞冻结的删除链；具体删除联动同 §37。
+
+验收 gate：真实 gateway LOGIN；同键同字节并发只一次 writer/Evidence/消费；同键异字节拒绝；COMMIT 后响应丢失再试返回原 Evidence；事务内 audit/receipt/settle 故障全部回滚；COMMIT 结果不确定靠真实 receipt 恢复；过期、授权撤销或 Evidence 不可见均不重执；reaper 不退已提交写入。移除幂等锁/绑定或把 settle 移到事务外时负对照必须失败。批次发票能力隔离仍按 §34.2，不借普通写入发票。
 
 ## 34.1 `batch_id` 可选 —— 三条写入路径穷尽
 
@@ -7983,7 +8872,7 @@ Trace / logs with protected access
 | `humaux_retrieval_requests_total{intent,completeness_class}` | §20 planner：每次经 §55.1 `build_request()` 且 envelope 返回时 · 1 | counter·次 | **§53.5 INV-1 分母**；§1.4 坑3 gate |
 | `retrieval_candidates{stage}` | §24 Candidate Builder 出池处 · 1 | histogram·条 | §55.5 pool recall |
 | `retrieval_lane_hits_total{lane}` | §21 五类信号每 lane 命中处 · 1 | counter·次 | §55.5 facet coverage |
-| `retrieval_completeness_total{class,reason}` | §22.5 `completeness::classify()` 内，全 workspace 唯一自增点 · 1 | counter·次 | §22.5 唯一构造器闸；§80.1 G80-6 |
+| `retrieval_completeness_total{class,reason}` | §22.5 `completeness::record_final_classification()` 内，最终结果接纳后唯一自增点 · 1 | counter·次 | §22.5 唯一构造器与最终记录闸；§80.1 G80-6 |
 | `retrieval_cards_built_total` | §7.5 入口 B `seal_card()` 每封一张卡 · 1 | counter·张 | §1.2.3 gate |
 | `egress_chars_total{domain}` | §7.5 入口 B `seal_card()` / 入口 C `seal_query()` · 2（封口是唯一出境口） | counter·字符 | §1.2.3 gate：与上一行 × 卡长上限对不上即红 |
 | `degrade_total{code}` | §53.1 `abstain()` 内唯一 `.inc()` · 1 | counter·次 | §53.5 INV-1/2/4；§53.3 规则2；§4.4 `degrade.counters` |
@@ -8675,7 +9564,7 @@ coord.tasks · task_runs · leases · locks · canvases · canvas_elements · ha
 ```text
 ops.outbox · jobs · scheduler_leases · model_call_ledger · stage_runs · data_disclosure_sources
 ops.selection_snapshots · selection_snapshot_items
-ops.restore_drills · consistency_reports · source_acquisition_jobs · mechanism_observations
+ops.restore_drills · consistency_reports · source_acquisition_jobs · mechanism_observations · mechanism_e2e_runs
 ```
 
 ## 48.0 本轮五处变更的 DDL 与理由
@@ -9815,6 +10704,8 @@ Embedding model/dimension、RetrievalCard 长度和 rerank budget 用 §55 bench
 
 ## Phase 8 — Context / Project Continuity
 
+Project Continuity authority/completeness 唯一见 §25.3.1；本 Phase 的对应验收锚为 G80-46。
+
 实现：
 
 ```text
@@ -9832,18 +10723,17 @@ handoff assembly
 
 ```text
 ContributionRelease
-staging
-rights provenance
-privacy/secret gate
-PublicSource
-public claim
-source provenance
-revoke
-trust/quarantine
-poisoning/source-independence schema
+two-pass USER_REASONING gap/quality contract
+deterministic PLATFORM_POLICY rights/privacy/secret/integrity gate
+PROTECTED_LINEAGE release/contributor/attestation/anti-Sybil/revoke
+one UUIDv4 anonymous_source_id per release
+sanitized candidate envelope
+anonymous PublicSource / direct provenance / lifecycle admit-revoke
+aggregate trust/quarantine/poisoning/source-independence schema
+explicit run_once public application, project, revoke
 ```
 
-Public Evolution 未达到 §1.14 分母条件时，Schema 建但 Worker 不常驻运行。
+Phase 9 的验收必须在 Phase 10 disabled 下成立；它不分类、合并、检测矛盾、递归合成、演化或消费 `PUBLIC_SYNTHESIS_REBUILD`。
 
 ## Phase 10 — Public Evolution（条件启用）
 
@@ -9853,11 +10743,10 @@ Public Evolution 未达到 §1.14 分母条件时，Schema 建但 Worker 不常�
 merge
 contradiction
 synthesis
-topics
 source closure
-knowledge gap
-public source acquisition
 recursive evolution
+classification/evolution
+PUBLIC_SYNTHESIS_REBUILD consumption
 ```
 
 ## Phase 11 — Code Intelligence
@@ -10009,9 +10898,9 @@ Phase 0 的出场判据见其 **Gate** 行，本表只替它列「本期起必�
 | 5 | 空库重放到 N 条后账本闭合；`processing_gaps` 是 VIEW；projection shadow/serving 切版不会跨未知 gap。 | `G80-4` `G80-25` `G80-28` |
 | 6 | 六条 lane 各有 e2e；EXACT/分页 snapshot 不漏/重；envelope provenance 完整；online recall/context/continuity 无隐藏 USER/PUBLIC generative call。 | `G80-2` `G80-5` `G80-8` `G80-27` `G80-32` `G80-39` · §46 `retrieval benchmark` |
 | 7 | provider 调用 == ModelCallLedger；超 RPM 排队；任何 `mechanism.*` 质量归因都有单变量 counterfactual manifest。 | `G80-35` |
-| 8 | 同一 `context_snapshot_seq` 两次装配 handoff 逐字节相同；Mandatory Context 在 200 条相似噪声下仍不可被 rerank 淘汰。 | `G80-31` |
-| 9 | `public.claims` 中沿 `provenance_edges` 回不到任何 `staging.contribution_releases` 的行数 == 0。注错：手工插一条无 parent 的 claim ⇒ 0→1 ⇒ 红 | — |
-| 10 | 条件启用期。对**目标 deployment/cell** 现场执行 ch=12/ch=21 的 Spec.probe，读取 fresh `ops.mechanism_observations`；两行 `derived_status == ACTIVE` 才允许启用。`bootstrap_value/bootstrap_measured_at` 不参与。注错：只把 markdown bootstrap_value 改到阈值以上、live probe 仍为 0 ⇒ Phase 10 必须仍拒绝 | — |
+| 8 | Project Continuity authority closure 与 Mandatory Context 两项只引用各自 home gate：§25.3.1#G25-2、§25.5#G25-1；本表不复制判据或注错。 | `G80-31` `G80-46` |
+| 9 | Phase 9 active anonymous denominator 中沿 direct provenance 图无法到达 §70.5 current `ANONYMOUS_RELEASE` / `ANONYMOUS_USER_CONTRIBUTION` root 的行数 == 0；root 必须有 append-only ADMIT/REVOKE lifecycle receipt，且 public.* 不含 release/tenant/contributor identity。根类型约束唯一见 §70.5；legacy physical compatibility schema 不改变 active anonymous denominator；此处只验证 Phase 9 接线，不代替 Phase 10 的 closure/depth/rebuild 验收。注错：独立测试库插一条无 parent、无 lifecycle receipt 或带 protected identity 的 claim ⇒ 红 | `G80-45` |
+| 10 | 条件启用期。对**目标 deployment/cell** 现场执行 ch=12/ch=21 的 Spec.probe，读取 fresh `ops.mechanism_observations`；两行按 §1.14.1 重算 `derived_status == ACTIVE` 才允许启用。`bootstrap_value/bootstrap_measured_at` 不参与。注错：只把 markdown bootstrap_value 改到阈值以上、live probe 仍为 0 ⇒ Phase 10 必须仍拒绝 | — |
 | 11 | 同一 commit 连续两次建图，code graph 逐字节相同；SCIP 缺失走 Tree-sitter fallback 时结果必须带 degraded 标记。注错：让 fallback 静默不标 degraded ⇒ 红 | — |
 | 12 | 同时起 3 个 scheduler，一个周期内 enqueue 计数 == 任务数（§1.13）；lease 过期后旧持有者带旧 fencing token 的写入必被拒。注错：去掉 fencing 比较 ⇒ 旧持有者写入成功 ⇒ 红 | — |
 | 13 | 恶意/benign threat corpus 在 ARM64/x86_64 Linux 跑完；每个 ThreatKind 双向夹具齐全；常驻 worker 存活。 | `G80-36` |
@@ -11051,7 +11940,7 @@ T2  步骤 7 通过 → 停影子写，旧系统 read-only
 
 Humaux V2 只有满足下面的**单一 DoD**，才能从 Architecture Freeze Candidate 转成 Development-Ready，并最终替换旧系统。不存在第二份“补充 DoD”。
 
-**本章冻结**：任一 DoD 条目的运行可用性以目标 deployment/cell 的 `ops.mechanism_observations.derived_status` 为准；静态门槛/Probe 定义以 §1.14 MechanismSpec 为准。Runtime Observation 变 `NOT_APPLICABLE_YET/STALE` 时对应 DoD 失去勾选资格，但不修改 canonical md。
+**本章冻结**：任一 DoD 条目的运行可用性以目标 deployment/cell 按 §1.14.1 观测+E2E 证据重算的 `derived_status` 为准；静态门槛/Probe 定义以 §1.14 MechanismSpec 为准。Runtime Observation 变 `NOT_APPLICABLE_YET/STALE` 时对应 DoD 失去勾选资格，但不修改 canonical md。
 
 ## Architecture / Domain
 
@@ -11125,9 +12014,7 @@ Humaux V2 只有满足下面的**单一 DoD**，才能从 Architecture Freeze Ca
 - [ ] [DOD-051][phase=9] ContributionRelease 有 privacy + rights provenance。
 - [ ] [DOD-052][phase=9] source independence 与 duplicate support 可区分。
 - [ ] [DOD-053][phase=9] poisoning/quarantine 状态可见。
-- [ ] [DOD-054][phase=9] source closure 可回到原始 PublicSource/ContributionRelease。
-- [deferred] revoke 传播 / 独立支持重算 —— closure depth 恒 1（§1.14）
-  不计入 Phase 0 验收 · 解冻条件 depth≥2 · 合成分母测试必须绿
+- [ ] [DOD-054][phase=9]（G80-45）每个 Phase 9 public object 有当前匿名 direct-provenance root 与 append-only ADMIT/REVOKE lifecycle receipt；其 root 是 §70.5 `ANONYMOUS_RELEASE` / `ANONYMOUS_USER_CONTRIBUTION`，无法经 public.* 反查 release、tenant 或 contributor。递归 source closure、depth≥2 与 synthesis rebuild consumption 属 Phase 10，不能拿来阻塞或冒充 Phase 9 的独立验收。
 - [ ] [DOD-055][phase=9] 当前分母未满足的 Public Evolution 机制在目标 deployment/cell Observation 中派生为 `NOT_APPLICABLE_YET`，不伪装成已验证；本章不得独立断言其可用，条目一律进本章 DEFERRED 池。
 
 ## Cost DoD
@@ -11167,7 +12054,7 @@ Humaux V2 只有满足下面的**单一 DoD**，才能从 Architecture Freeze Ca
 2.2 的 §80 明确承认：DoD checkbox 没有 gate id，因此“这个勾是谁证明的”无法机械回答。2.3 冻结：
 
 ```text
-当前 DoD IDs: DOD-001 .. DOD-094
+当前 DoD IDs: DOD-001 .. DOD-095
 ```
 
 每条 `[DOD-xxx][phase=N]` 必须在源码有且仅有一个 verifier：
@@ -11380,7 +12267,7 @@ set_id=<id> · fixed_denominator=<N>=<层1 n1 + 层2 n2> · decision_depth=<top_
 | `code_retrieval` | code retrieval set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · owner=Code（Phase 11+） |
 | `exact_completeness` | exact completeness set | 11 = evals/exact_completeness/dataset.tsv 全集：exact 5（§22.1 读数：全量 / secret 扣减 / 空全集 / scope 隔离 / supersede 出集）+ non_enumerable 3（§22.4 触发 2/3/4；触发 1「量词无谓词」按 §20.2 规则 5 归 `planner_predicate` 集，不在本集重测）+ deletion_tour 3（§23.4 EXACT 通道三个采样边界：删除前 / tombstone 后 purge 前 / purge 后） | 精确相等（每案对 class/reason/§22.1 六读数/known_lower_bound 逐字段比对，coverage 按导出式交叉验证） | `resolution`：1 题——**实测**，非推导：真跑了一个可区分的第二系统（census 的 overlay 错配到 decoy stream ⇒ §23.1② overlay 实质失效——正是 §23.4 点名的回退形状）与真系统在同一 11 案固定集上逐案 diff，观测到恰好 1 案翻转（`tour_after_tombstone`——全集里唯一只靠 overlay 判对的采样点），见 `crates/adapters/tests/exact_completeness_eval.rs::resolution_is_measured_via_a_real_second_system_diff`；本集分层（exact/non_enumerable/deletion_tour）但第二系统只在 deletion_tour 层可区分，其余两层 diff 为 0。`spread_tol`：0 题——同 profile 对新种子世界重复跑 3 次全电池（真 DB 路径：REPEATABLE READ 快照 + tombstone overlay + RLS 授权快照），每层 pass_items 极差实测为 0，见同文件 `repeated_runs_have_zero_spread` | 2026-08-27 / e64f95a | `DECLARED` · owner=Retrieval（Phase 6+） |
 | `project_continuity` | project continuity set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · owner=Continuity（Phase 8+） |
-| `public_provenance_revocation` | public provenance/revocation set | 未声明 | 未声明 | 未实测 | — | `NOT_DECLARED` · conditional owner=Public（Phase 9/10） |
+| `public_provenance_revocation` | public provenance/revocation set | 4 = provenance2（有效 release / 直接来源边丢失）+ withdrawal2（受支持且有效 / 撤销后尚未消费）；固定全集 `evals/public_provenance_revocation/dataset.tsv` | 精确相等（真实 PG probe / Gateway hydrate 的布尔判定逐案对冻结标签） | `resolution`：1 题——同一四案集上的真实 SQL 第二系统省略 withdrawal 的撤销/receipt 守卫；两系统各 3 run，仅第 4 案产生稳定翻转，其余三案相同。第二系统仅为本地谓词负对照，不称独立实现。`spread_tol`：0 题——同 profile 三轮新 tenant 夹具，provenance2/withdrawal2 的逐题 verdict 向量最大两两 Hamming 均实测 0；每层每轮正确 2 题。计算与抵消翻转反例见 `crates/adapters/tests/public_provenance_revocation_eval.rs` | 2026-08-28 / d9bfd3dfe87771a89b45e880d71d543d1f611f3b | `DECLARED`（仅本地四案合成范围）· conditional owner=Public（Phase 9/10）；不替代 §1.14 生产分母/Observation，不据此勾选 DOD-054，不启用 Phase10 |
 | `planner_predicate` | planner_predicate set（§20.3 混淆矩阵） | 21 = evals/planner_predicate/dataset.tsv 全集（T6.1）。21 行里仅 10 行可判别（5 正例 + 3 标注负例 + 2 活负例）—— 其余 11 行（3 条 DIRECT_GET + 8 条 metadata 分类）在 `predicate_id()` 语义下不可能记 miss，只贡献分母；§20.3 的 15% 漏判上限因此在评测harness 里改记「已判别正例基数」而非原始 21（`crates/retrieval/tests/planner_predicate_eval.rs::confusion_matrix_meets_frozen_thresholds` 的 `judged_miss_rate`），避免 padding 行稀释容忍度；`fixed_denominator=21` 本身仍按 §55.3 冻结不改 | 精确相等 | `resolution`：1 题——**实测**，非由 `decision_depth` 推导：真跑了一个可区分的第二系统（`QUANTIFIERS` 去掉「哪些」的变体）与真系统在同一 21 题固定集上逐行 diff，观测到恰好 1 行翻转（`我们之前否掉过哪些方案`——数据集里唯一只靠该词命中量词门的问法），见 `crates/retrieval/tests/planner_predicate_eval.rs::resolution_is_measured_via_a_real_second_system_diff`；本集无分层。`spread_tol`：0 题（`decide()` 纯函数无 IO/随机性，同 profile 重复 3 次逐行比对完全一致，见 crates/retrieval/tests/planner_predicate_eval.rs::repeated_runs_have_zero_spread） | 2026-08-26 / 53c82a5 | `DECLARED` · owner=Retrieval（Phase 6+） |
 | `memory_security_lifecycle` | memory security lifecycle set（Write -> Recall -> Action -> Repair） | 14 = write 8 + recall 4 + repair 2（Action 段 SUT 未落地，样本冻结在 blocked_stage_inventory.toml，不进实测分母） | 精确相等 | `resolution`：1 题（write/recall/repair 各段第二系统=去掉 origin ceiling 让低信来源可洗白，翻转攻击案）；`spread_tol`：0 题（domain policy + SQL 生命周期谓词确定性，逐题 Hamming=0，见 `crates/adapters/tests/memory_security_lifecycle_eval.rs::write_segment_repeated_runs_zero_hamming`） | 2026-08-27 / 434e92c | `DECLARED`（scoped，§55.3.2 / ADR-0007）· owner=Security/Private Memory（Phase 4+）· Write/Recall/Repair 三段各自实测七字段（harness 5 测试全绿）· Action=BLOCKED_ON_SUT unblock_phase=14（sut=Context Renderer 分流/privileged action probe/consolidate disposition taint=DOD-036，攻击清单已与三段语料同一提交冻结）· lifecycle_complete=false 归 DOD-036 |
 | `grounding_evolution` | evidence-version evolution / self-correction set | 未声明 | exact state + revalidation outcome | 未实测 | — | `NOT_DECLARED` · owner=Grounding/Code（Phase 11+） |
@@ -11400,6 +12287,7 @@ set_id=<id> · fixed_denominator=<N>=<层1 n1 + 层2 n2> · decision_depth=<top_
 - [ ] [DOD-092][phase=4] `GroundingState` 由 recorded version vs resolver current version 推导；不存在可手改 `memory.stale=true` 真源。
 - [ ] [DOD-093][phase=8] Mandatory/Pinned behavior context 不得静默消费 `RECHECK_REQUIRED/UNRESOLVED/CANNOT_ESTABLISH` Memory；必须 fail-loud 并输出 `needs_verification[]`。
 - [ ] [DOD-094][phase=11] `grounding_evolution` BenchmarkManifest 已声明并通过：含 relocation 正对照、missing/error 区分、revert 与 finalization CAS。
+- [ ] [DOD-095][phase=8] Project Continuity authority/completeness 仅由 §25.3.1#G25-2 / G80-46 verifier 证明；W3 live verifier 与独立 mutation receipts 到场前不可勾选。
 
 以上任何 P0 项未满足：
 
@@ -11566,23 +12454,25 @@ leader acquired
 
 ## 70.5 Public Source 核心 Schema
 
-```sql
-CREATE TABLE public.sources (
-  source_id              uuid PRIMARY KEY DEFAULT uuidv7(),
-  source_type            text NOT NULL,
-  publisher              text,
-  source_url             text,
-  content_hash           text NOT NULL,
-  source_license         text,
-  rights_basis           text NOT NULL,
-  redistribution_policy  text,
-  trust_class            text NOT NULL,
-  retrieved_at           timestamptz,
-  created_at             timestamptz NOT NULL DEFAULT now()
-);
-```
+0120 是当前 public-source 的 additive `EXPAND/dual-run` contract；其精确 DDL、RLS、column grants 与 trigger 均由 `migrations/0120_phase9_anonymous_public_seam.sql` 唯一维护，本文不复制 SQL。
 
-所有 `public.claims` 必须至少有一个有效 source/provenance parent。
+| physical home | 当前合同 |
+|---|---|
+| `control.anonymous_source_lineage` | protected release -> database-generated UUIDv4 `anonymous_source_id`；一个 release 恰好一个随机 bridge，永不作为 contributor pseudonym |
+| `staging.sanitized_public_candidates` | pre-admission、tenant-protected、封口的匿名 `sanitized_content` 与 content/policy/assessment/envelope digest；public worker 只获列级匿名读取，不获整行/tenant identity |
+| `public.sources` | 既有 `LEGACY` branch 原样保留；新 `lineage_mode=ANONYMOUS_RELEASE` 只能是 `source_type=ANONYMOUS_USER_CONTRIBUTION`，`source_id` 为 UUIDv4 anonymous bridge，且无 release/publisher/URL/tenant/evaluator identity |
+| `public.anonymous_source_lifecycle_events` | append-only anonymous `ADMIT` / `REVOKE` direct-provenance lifecycle facts，按 source/object/revision 序列化 |
+| `public.current_anonymous_source_objects` | 从 lifecycle facts 导出的 current anonymous object predicate；读路径不得以缓存或 timestamp 猜测替代 |
+
+所有 `public.claims` 必须有有效 direct-provenance parent。对于匿名用户贡献，这个 parent 只到 `ANONYMOUS_USER_CONTRIBUTION` root；release、contributor、attestation、anti-Sybil 与 revoke 事实始终留在 `PROTECTED_LINEAGE`（§7.1），公共面不能反解它。分类、闭包、递归合成与 rebuild 仅见 Phase 10 §§12.2–12.3。
+
+0120 没有删除 legacy columns/rows，也没有把 `PublicCoveragePort` 变成 DB view。任何 future contract-drop 必须先备份、完成 migration rehearsal，并得到用户明确批准；在此之前所有 release-linked legacy compatibility 都按 dual-run 保留。
+
+**G70-1 Active Anonymous Safe Topology（Phase 9 起必过；G80-45）。** 当前 anonymous claim universe 必须由 current anonymous lifecycle/source exact tuple 与 direct provenance 导出，不得由 caller flag 声明。对每个当前匿名 claim，必须存在 exact current `ADMIT`、direct root 与 receipt；public claim/source 的 legacy identity linkage 必须为 `NULL`。Protected moderator authority 必须不可达；public identity-free trust receipt 只暴露 safe fields。runtime role 不得从 anonymous claim/root 反查 release、tenant、contributor、publisher、evaluator 或 grant。Legacy positive compatibility 继续通过，但 Legacy Compatibility Enclave 的 physical columns 必须与 active anonymous topology 机械不相交；Phase 10 保持 disabled。
+
+**Legacy receipt sealing ACL（0135；G80-45）。** 0134 对 gateway/public/retrieval 的 legacy trust 三表 direct `SELECT` revoke 必须保持。Legacy receipt matching 只有一个 relational SSOT：owner 为 `role_migration_owner`、`security_barrier=true`、`security_invoker=false` 且 runtime 零 `SELECT` 的 `public._legacy_receipt_match_basis`；它只输出 matching 所需的最小 tuple，不输出 runtime identity。`public.eligible_objects` 保持同 owner/options，直接消费该 helper，definition 禁止调用 `public_receipt_matches`。`public.public_receipt_matches(...)` 保持 `STABLE SECURITY INVOKER`，只包装同一 helper 供 trusted owner-context caller 使用，PUBLIC 与所有 runtime（含 maintenance）零 `EXECUTE`，且不得直接引用 legacy trust 三表。只有 deferred `public.require_trust_root_seal()` 与 `public.guard_evaluated_source_identity()` 可作为显式窄 `SECURITY DEFINER` trigger allowlist：owner 为 `role_migration_owner`，`search_path=pg_catalog,pg_temp`，对象全 schema-qualified，PUBLIC/runtime direct `EXECUTE` 全 deny；`guard_trust_evaluation()` 与 `current_public_roots(...)` 仍为 INVOKER。helper 的 normalized `pg_get_viewdef` digest 是 0135 postcheck anchor；漏任一 0106 receipt 条件、outer view 恢复 matcher call、helper 变 `security_invoker=true`、helper `SELECT` 泄漏、matcher `EXECUTE`/DEFINER 泄漏均必须令 gate 红。Fresh PostgreSQL 18 同时证明 legacy moderator deferred COMMIT、mismatch `23514` 且零 partial、gateway/public/retrieval hydration、protected/helper/matcher direct-negative、owner-context matcher positive、anonymous identity reachability=0；Phase 10 不在本规则内。
+
+注错至少覆盖：orphan、missing `ADMIT`、identity linkage、base grant 或 function leak、double lane，以及 revoke 后仍 eligible；任一命中即红。命令绑定为 exact ignored integration test 与 `rls-check`，不新增 xtask wrapper。
 
 ## 70.6 Artifact Quarantine
 
@@ -11889,8 +12779,9 @@ control.quota_windows
 
 control.usage_reservations
   reservation_id
-  request_id UNIQUE
+  request_id
   tenant_id
+  UNIQUE (tenant_id, request_id)
   entitlement_key
   units
   status RESERVED|CONSUMED|RELEASED
@@ -11925,6 +12816,20 @@ RESERVED -> RELEASED
 ```
 
 Maintenance 回收过期 reservation，避免 worker 崩溃永久占额度。
+
+### 72.2.1 周期发行、请求账本与回收（2026-08-28 冻结）
+
+`control.entitlement_snapshots.effective["mcp.billable_operations.per_period"]` 是 BMO 的唯一在线配额配置；§72.1 的 `MCP_BILLABLE_CALL` 是计量名称，不是第二个配置键。特征值为一个原子对象，必含：`limit`（非负整数）、`period`（`calendar_month` / `subscription_period`）、`period_start` / `period_end`（RFC3339）、`charge_policy`（`success_only` / `completed_business_calls`）。周期边界来自可信 Plan 输入经 §76 Projector 产生；不得在代码中硬编码自然月，不得从请求补写字段或回读 raw grants。缺失、畸形或非当前周期均 fail closed。
+
+`control.issue_quota_window(tenant_id, entitlement_key)` 不接受 limit、时间或周期参数。它在读取快照前取得 `pg_advisory_xact_lock(hashtextextended('quota-window:' || tenant_id || ':' || entitlement_key, 0))`，再用 PG `clock_timestamp()` 验证 `start <= now < end`。已有相同窗口幂等返回且不改 `hard_limit/window_end/issued_snapshot_at`；与已发行窗口重叠但边界不同则拒绝。期中升降级只影响下一窗口；即时停用 feature 仍由在线 entitlement 判定阻断，不等待窗口结束。函数 ACL 仅见 §6.2.2。
+
+`control.usage_reservations` 保存 `(tenant_id, request_id)` 唯一性、principal、operation、request_fingerprint、完整窗口 PK、units、状态、创建/过期/完成时刻；request advisory lock 同样包含 tenant，不同租户的相同 request UUID 不能互相占位。reserve 的窗口条件更新与 reservation INSERT 同事务；只有新 reservation 才可进入 handler。重试必须核对相同身份/operation/fingerprint，不再扣量、不再执行 handler；没有持久化可重放响应时显式返回 `CONFLICT` / in-progress，而不是伪造成功。finalize/release 锁同一 reservation 并原子更新计数与状态，终态不能改回 RESERVED。过期回收只处理 RESERVED，已 CONSUMED/RELEASED 不变；`control.reap_quota_reservations` 是 maintenance 的固定回收入口。
+
+`success_only` 只消费成功结果；`completed_business_calls` 另消费已进入 handler 的合法业务结果（如 NOT_FOUND），不消费鉴权/参数前置失败或依赖/内部故障。Rate 尝试计数、BMO 和 ProviderCost 保持独立；§83 的 rate → entitlement → quota 顺序不变。
+
+`control.rate_buckets` 是 PG token bucket，按 tenant、subject_kind（ip/credential/user/tenant）、subject_id、operation、bucket_key 区分。容量和每秒补充率只来自已解析的服务器 policy；token 用 numeric 保留补充精度，不用 fixed-window 替代。每次尝试在确定性 `rate:` 命名空间的事务 advisory lock 内补充并条件消费，锁冲突/不足拒绝，不能退回进程内无界计数。授权矩阵为唯一 GRANT 真源。
+
+验收：真实 maintenance/gateway LOGIN 的 issuer ACL 与 FORCE RLS；缺/坏 snapshot 拒绝；并发发行与重试只一窗口、不同边界重叠拒绝、期中改 limit 不改旧窗口；同请求最多一次 reservation/handler；并发额度不超发；成功消费、内部失败释放、过期回收幂等；用户/tenant/operation 绑定与独立 rate 反例；移除原子额度条件或权限条件时注错 gate 必须红。生产迁移前须备份并核旧窗口的周期/计数 CHECK，不能自动修正账本。
 
 ## 72.3 Rate Limit Hierarchy
 
@@ -12075,10 +12980,10 @@ lock release
 Billable MCP Operation (BMO)
 ```
 
-Free：
+Free 的示例 limit（完整配置对象和周期规则见 §72.2.1）：
 
 ```text
-mcp.billable_operations.per_period = 50
+limit = 50
 ```
 
 具体周期来自：
@@ -12661,6 +13566,46 @@ CREATE -> ACTIVE -> ROTATING -> REVOKED/EXPIRED
 ```
 
 支持 overlap rotation window。
+
+### 73.5.1 Headless Service Credential 授权绑定
+
+`control.api_keys` 是服务凭证及其授权绑定的唯一可写真源；不另建一份 credential-to-scope 权威。
+在既有字段上加入 `authorization_version`、`user_id?`、`workspace_id?`、
+`tenant_security_epoch`、`user_security_epoch?`。当前显式授权版本为 `1`。
+历史行保留 `authorization_version IS NULL`，一律不能通过新的 headless 认证；迁移不自动
+激活、补用户或扩大历史凭证范围。重新授权必须由可信管理流程显式写入完整绑定与当前 epoch。
+
+机器 principal 固定为该行不可变的 `api_key_id`；PAT 的 on-behalf-of user 只能来自
+该行 `user_id`，不能由请求参数补入。非空 workspace 必须以数据库复合约束绑定同一 tenant。
+版本 1 的无 workspace 凭证产生空 workspace 授权集合，仅允许其已获 scope 对应的
+TENANT_SHARED 及（有有效 PAT user 时）该用户的 USER_PRIVATE；不隐式获得全部 workspace。
+有 workspace 的凭证只授予该 workspace，且资源路由必须继续受此绑定限制，不能仅依靠
+可见性析取条件替代资源范围检查。
+
+每次认证读取当前凭证与 tenant/user/membership 状态，复用 §73.5 的 HMAC 验证和
+ACTIVE/ROTATING、expiry、revocation、CIDR 判据；不能把合法 rotation overlap 改成只允许 ACTIVE。
+tenant 必须 ACTIVE；PAT user 与对应 membership 都必须 ACTIVE；签发 epoch 必须匹配当前
+tenant/user epoch。未知授权版本、未知 §33 scope、缺少操作所需 scope、跨 tenant/workspace
+和任一缺失授权事实均拒绝。OAuth scope 名称与映射只引用 §33 的规范，不在此维护第二份列表。
+
+Headless wire 凭证为 `prefix.secret`，仅通过 `Authorization: Bearer` 传入；prefix 为
+1–64 个 ASCII 字母、数字、下划线或连字符，secret 为 32–256 个相同字符集字符。
+可信签发端必须使用密码学安全随机源生成至少 256 bit 的 secret；上述长度校验不替代随机性。
+HMAC 覆盖完整 wire 凭证，prefix 仅供精确查询。禁止日志、错误或 Debug 输出 secret/verifier。
+
+验收必须用真实 PG 证明：legacy 正确密钥仍被拒绝；有效机器/PAT 只能取得绑定范围；移除
+membership、停用 tenant/user、递增 epoch、撤销/过期或 CIDR 不匹配立即拒绝；跨 tenant
+workspace 绑定在数据库层失败；未知/缺少 scope 和客户端扩大范围均失败。
+**认证 bootstrap 的 RLS 边界**：`SECURITY DEFINER` 不会自动绕过 `FORCE RLS`。
+`api_key_lookup` 和 `api_key_touch_last_used` 继续由既有 `role_migration_owner` 拥有且仅 gateway 可执行；
+对 `api_keys` / `tenants` / `memberships` 仅增加 `FOR SELECT TO role_migration_owner` 的显式策略，
+对 `api_keys` 另增加 owner 的 `FOR UPDATE` 策略，谓词均为 `current_user = 'role_migration_owner'`。
+不改变 §6.2 的角色属性/GRANT/应用池隔离，不关闭 FORCE，不新增 BYPASSRLS，不借调用者 GUC 做认证 bootstrap。
+owner 本身仍是可登录的受信 migration/DDL 主体；这些策略不是函数内沙箱，也不限制 owner 的列权限。
+请求侧修改范围由既有固定 `touch(key_id)` SQL 限定为指定行的 `last_used_at`，未来新增不可信 definer 必须重新审查 owner 边界。
+验收必须使用实际 gateway 登录连接，证明无 GUC 可 lookup、伪造 GUC 不改变 lookup、调用前后 GUC 不变、其他角色无执行权、gateway 不能切换到 owner、touch 不改其他列/行。
+
+这只是 §83 的认证输入，不替代后续统一 RequestGuard、OAuth、计量或 MCP 端到端验收。
 
 ## 73.6 Web Console Session
 
@@ -13370,7 +14315,14 @@ MCP_QUOTA_CONSUMED
 MCP_QUOTA_RELEASED
 MCP_CLIENT_REGISTERED
 MCP_AUTH_LOGIN
+MCP_REQUEST_DENIED
+MCP_REQUEST_FINISHED
+MCP_REQUEST_OUTCOME_UNKNOWN
 ```
+
+`MCP_REQUEST_DENIED` 记录统一入口在业务执行前的拒绝；`MCP_REQUEST_FINISHED` 记录已进入业务执行的结果。
+`MCP_REQUEST_OUTCOME_UNKNOWN` 仅记录 §34.0.1 的非终态提交不确定性，result 固定为 `UNKNOWN`；后续以 receipt 的提交事实恢复，不将这条观测当作失败或退款依据。
+成功结果统一为 `OK`；本地原子写入的成功完成事件须与业务事实、配额结算和提交 receipt 同事务（§34.0.1）。
 
 不记录：
 
@@ -13900,6 +14852,8 @@ alert-rule-check 表达式静态校验（G80-18，§42）
 payload_sha256 唯一构造点断言（G80-22，§48.0①）
 gate-anchor-check：登记表两列必须整体是锚，且每个锚可解析（G80-23，§80.1.2）
 gate-registry-coverage：家章带 id 的闸无遗漏（G80-24，§80.1.2）
+R4 fault manifest closure（G80-44，§11.2.5.1#G11-3）
+Active anonymous safe topology（G80-45，§70.5#G70-1）
 stream_log 列集合 == §15.1 DDL 的 12 列（G80-25，§37.2）
 role / grant 全集枚举（G80-26，§48.2）
 诊断轴闸 G55-6（G80-27，§55.6）
@@ -14003,6 +14957,9 @@ rollback plan
 | G80-41 Enterprise feature activation registry | PR | §50.1#G50-1 | 同左 |
 | G80-42 Canonical change-impact closure | PR | §80.3#G80-42 | 同左 |
 | G80-43 Grounding validity / recheck debt | PR · Nightly | §11.10#G11-2 | 同左 |
+| G80-44 R4 fault manifest closure (cross-phase) | PR | §11.2.5.1#G11-3 | 同左 |
+| G80-45 Active anonymous safe topology | PR · integration | §70.5#G70-1 | 同左 |
+| G80-46 Project Continuity authority closure | PR · integration · e2e | §25.3.1#G25-2 | 同左 |
 
 **本表与 §69 的关系（2.3 冻结）**：DoD 不再要求每条 checkbox 直接手写 G80 id；§69 的 `[DOD-xxx][phase=N]` 由 **G80-33** 与源码 `#[dod(...)]` verifier 一一绑定。verifier 可以调用某个 ADMITTED G80 gate、benchmark、probe 或 e2e test，但它自身必须有 fault case。于是：
 
@@ -14083,7 +15040,7 @@ G80-24  gate-registry-coverage（PR）
   ①  下面「id 族绑定表」逐行：在该小节正文内按族正则取去重 id 集合 A；§80.1 表引用到
       该小节的 id 集合 B；退役列集合 Rt。A \ (B ∪ Rt) ≠ ∅ ⇒ 红，打印差集与所在小节
   ②  §80.1 表里出现的每个 §…#ID 锚，其（小节, id 族）必须在绑定表里有行 ⇒ 否则红
-  ③  §80.1 每个 G80-* 在 §57.1「本期起必过」恰好出现一次；按子项分期的 family
+  ③  §80.1 每个 G80-* 在 §57.1「本期起必过」恰好出现一次；跨阶段 gate（当前仅 G80-44 R4 closure）在登记表注明 `cross-phase` 后不作为 Phase 9 exit gate 计数；按子项分期的 family
       必须列全子项且并集等于该 family。0 次 = 未定生效期，≥2 次 = 两个 Phase 都自称权威。
   扫描域排除 §80.1 / §80.1.1 / §80.1.2 三节自身 —— 它们逐字复制 id，进扫描域就是
   拿表校验表自己（§80.2 开头同一条纪律）。族按 id 里的章号绑死（G23-* 只在 §23.*、
@@ -14097,9 +15054,12 @@ G80-24  gate-registry-coverage（PR）
 | §6.2.3 | `G6-DB\d` | — |
 | §50.1 | `G50-\d` | — |
 | §80.3 | `G80-42` | — |
+| §11.2.5.1 | `G11-\d` | — |
+| §70.5 | `G70-1` | — |
 | §11.9 | `G11-\d` | — |
 | §11.10 | `G11-\d` | — |
 | §25.5 | `G25-\d` | — |
+| §25.3.1 | `G25-\d` | — |
 | §45.2 | `G45-\d` | — |
 | §16.1 | `G16-\d` | — |
 | §20 | `G20-\d` | — |
@@ -14225,7 +15185,7 @@ path       = crates/testkit/tests/metrics/<family>.rs
 
 ### Canonical Contract Blocks
 
-机器识别以下 9 个承重块：
+机器识别以下 10 个承重块：
 
 ```text
 MECHANISM_SPEC      §1.14  mechanism-registry fence
@@ -14237,6 +15197,7 @@ WORKSPACE_LAYOUT    §58    workspace tree / Cargo member contract
 GATE_REGISTRY       §80.1  G80 registry + id-family binding
 GROUNDING_CONTRACT   §8.8/§11.10 GroundingMode/State/Resolver/Revalidation
 NETWORK_BOUNDARY     §83.4 external/intra-cell registries + raw transport
+CONTINUITY_AUTHORITY §25.3.1 Project Continuity authority/completeness
 ```
 
 `cargo xtask contract-impact-check --base <merge-base>` 对 Git diff 做：
@@ -14261,6 +15222,7 @@ WORKSPACE_LAYOUT | workspace-member-check,G80-3,G80-40,G80-41
 GATE_REGISTRY    | G80-23,G80-24,gate-phase-coverage
 GROUNDING_CONTRACT| G80-43,grounding-evolution-contract
 NETWORK_BOUNDARY  | G80-3,network-boundary-contract
+CONTINUITY_AUTHORITY | G80-46,mcp-contract-lock,continuity-authority-live
 ```
 
 ### 映射本身不能偷偷漏新 block

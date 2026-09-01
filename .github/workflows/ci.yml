@@ -71,6 +71,32 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install pinned Gitleaks fixture (v8.30.1)
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive='gitleaks_8.30.1_linux_x64.tar.gz'
+          archive_sha256='551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+          release='https://github.com/gitleaks/gitleaks/releases/download/v8.30.1'
+          tools_dir="$RUNNER_TEMP/gitleaks-8.30.1"
+          curl --fail --location --silent --show-error "$release/gitleaks_8.30.1_checksums.txt" \
+            -o "$RUNNER_TEMP/gitleaks-checksums.txt"
+          grep -Fqx "$archive_sha256  $archive" "$RUNNER_TEMP/gitleaks-checksums.txt"
+          curl --fail --location --silent --show-error "$release/$archive" -o "$RUNNER_TEMP/$archive"
+          printf '%s  %s\n' "$archive_sha256" "$RUNNER_TEMP/$archive" | sha256sum --check --strict
+          mkdir -p "$tools_dir"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$tools_dir" gitleaks
+          binary="$tools_dir/gitleaks"
+          test -x "$binary"
+          version="$($binary version | tr -d '\r\n')"
+          test "$version" = '8.30.1'
+          binary_sha256="$(sha256sum "$binary" | awk '{print $1}')"
+          {
+            echo "HUMAUX_TEST_GITLEAKS_BIN=$binary"
+            echo "HUMAUX_TEST_GITLEAKS_VERSION=$version"
+            echo "HUMAUX_TEST_GITLEAKS_SHA256=$binary_sha256"
+          } >> "$GITHUB_ENV"
+
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
@@ -87,6 +113,19 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      - name: contribution ignored integration tests
+        run: |
+          cargo test -p humaux-adapters --test contribution_scan -- --ignored --test-threads=1
+          cargo test -p humaux-adapters --test contribution_pipeline -- --ignored --test-threads=1
+          cargo test -p humaux-adapters --test contribution_authorization -- --ignored --test-threads=1
+          cargo test -p humaux-adapters --test contribution_reasoner -- --ignored --test-threads=1
+          cargo test -p humaux-adapters --test public_provenance -- --ignored --test-threads=1
+          cargo test -p humaux-adapters --test public_trust -- --ignored --test-threads=1
+          cargo test -p humaux-adapters --test public_provenance_revocation_eval -- --ignored --test-threads=1
+
+      - name: G80-45/DOD-054 public anonymous topology
+        run: cargo test -p humaux-adapters --test public_runtime assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_closed -- --ignored --exact --test-threads=1
 
       - name: cargo xtask architecture-check
         run: cargo xtask architecture-check
@@ -110,6 +149,9 @@ jobs:
 
       - name: cargo xtask gate-registry
         run: cargo xtask gate-registry
+
+      - name: cargo xtask r4-fault-manifest
+        run: cargo xtask r4-fault-manifest
 
       - name: cargo xtask threshold-shape
         run: cargo xtask threshold-shape

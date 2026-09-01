@@ -1,0 +1,38 @@
+# §46.1 migration manifest. Single GRANT repairing 0104's permission topology: the
+# contribution guard triggers run SECURITY INVOKER (deliberately — RLS provides the tenant
+# isolation) but role_public_worker lacked table-level SELECT on staging.contribution_releases.
+# Pure DDL, no DML.
+
+migration_id = "0139_contribution_source_guard_rights_lookup"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('staging.assert_active_contribution_release(uuid)') is not null
+   and to_regprocedure('staging.assert_active_release_rights(uuid)') is null
+   as precheck_ok
+"""
+
+# RLS must stay ENABLE+FORCE with the tenant-isolation policy intact — the GRANT is only safe
+# because row visibility is still cut by RLS. If either is ever dropped, this postcheck fails.
+# §6.2.2 anonymous boundary must survive: the worker gains EXECUTE on the narrow function,
+# never table-level SELECT. RLS stays ENABLE+FORCE for every other (INVOKER) reader.
+postcheck = """
+select (select prosecdef from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'staging' and p.proname = 'assert_active_release_rights') = true
+   and has_function_privilege('role_public_worker',
+         'staging.assert_active_release_rights(uuid)', 'EXECUTE')
+   and not has_table_privilege('role_public_worker',
+         'staging.contribution_releases', 'SELECT')
+   and (select relrowsecurity and relforcerowsecurity from pg_class
+        where oid = 'staging.contribution_releases'::regclass)
+   as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback: CREATE OR REPLACE the two public.* guard functions back to 0104's bodies (calling
+          staging.assert_active_contribution_release), then
+          DROP FUNCTION staging.assert_active_release_rights(uuid);
+          — restores the 42501 defect on the legitimate admission path, forward fix preferred.
+"""
+
+backup_restore_requirement = "none (function definitions + one EXECUTE grant; no data touched)."

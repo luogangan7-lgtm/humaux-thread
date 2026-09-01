@@ -1,0 +1,242 @@
+# Phase 9 R3 adds two append-only health authorities and extends the existing provider-attempt
+# ledger/disclosure/candidate path. It does not create mutable current projections or backfill rows.
+migration_id = "0130_reasoning_route_health_admission"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('control.reasoning_route_bindings') is not null
+  and to_regclass('control.provider_endpoints') is not null
+  and to_regclass('ops.model_call_ledger') is not null
+  and to_regclass('ops.data_disclosures') is not null
+  and to_regclass('staging.contribution_candidates') is not null
+  and to_regclass('ops.reasoning_provider_health_observations') is null
+  and to_regclass('ops.reasoning_account_health_observations') is null
+  and to_regprocedure('control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)') is null
+  and not exists (
+    select 1 from pg_attribute
+     where attrelid = 'control.provider_endpoints'::regclass
+       and attname = 'egress_processor_id' and not attisdropped
+  )
+  and not exists (
+    select 1 from pg_attribute
+     where attrelid = 'ops.data_disclosures'::regclass
+       and attname = 'model_call_id' and not attisdropped
+  )
+  and not exists (
+    select 1 from pg_attribute
+     where attrelid = 'staging.contribution_candidates'::regclass
+       and attname in ('binding_id','binding_version','model_call_id') and not attisdropped
+  )
+  and not exists (
+    select 1 from pg_attribute
+     where attrelid = 'ops.model_call_ledger'::regclass
+       and attname in (
+         'reasoning_domain_id','call_kind','intent_sha256','binding_id','binding_version','route_policy_id',
+         'route_policy_version','profile_id','profile_version','provider_account_id',
+         'provider_endpoint_id','egress_processor_id','credential_ref','billing_account_id',
+         'billing_instrument_id','provider_health_observation_id',
+         'account_health_observation_id','billing_responsibility','admitted_at'
+       ) and not attisdropped
+  )
+  as precheck_ok
+"""
+
+# Postcheck pins catalog identities and named relational guards. Dynamic PG18 tests exercise
+# verdict/freshness/latest ordering, mutation failure, snapshot atomicity and post-call history.
+postcheck = """
+select
+  to_regclass('ops.reasoning_provider_health_observations') is not null
+  and to_regclass('ops.reasoning_account_health_observations') is not null
+  and to_regclass('ops.reasoning_provider_health_current') is null
+  and to_regclass('ops.reasoning_account_health_current') is null
+  and (
+    select count(*) = 2 and bool_and(relrowsecurity and relforcerowsecurity
+      and relowner = 'role_migration_owner'::regrole)
+    from pg_class where oid in (
+      'ops.reasoning_provider_health_observations'::regclass,
+      'ops.reasoning_account_health_observations'::regclass
+    )
+  )
+  and (
+    select count(*) = 2
+    from pg_policy where polrelid in (
+      'ops.reasoning_provider_health_observations'::regclass,
+      'ops.reasoning_account_health_observations'::regclass
+    ) and polroles = array['role_migration_owner'::regrole::oid]
+      and polcmd = '*'
+      and pg_get_expr(polqual,polrelid) = 'true'
+      and pg_get_expr(polwithcheck,polrelid) = 'true'
+  )
+  and (
+    select count(*) = 4
+    from pg_attribute
+    where attrelid in (
+      'ops.reasoning_provider_health_observations'::regclass,
+      'ops.reasoning_account_health_observations'::regclass
+    ) and attname in ('source_kind','reason_code') and not attisdropped
+      and ((attname='source_kind' and attnotnull) or (attname='reason_code' and not attnotnull))
+  )
+  and position(
+    '(tenant_id, processor_id, processor_model_id, provider_model_id, model_revision, provider_endpoint_id, region, service_tier, observed_at DESC, observation_id DESC)'
+    in pg_get_indexdef('ops.reasoning_provider_health_latest'::regclass)
+  ) > 0
+  and position(
+    '(tenant_id, provider_account_id, credential_ref, billing_account_id, billing_instrument_id, observed_at DESC, observation_id DESC)'
+    in pg_get_indexdef('ops.reasoning_account_health_latest'::regclass)
+  ) > 0
+  and (
+    select count(*) = 4 from pg_trigger
+    where not tgisinternal and (tgrelid,tgname) in (
+      ('ops.reasoning_provider_health_observations'::regclass,'reasoning_provider_health_append_only'),
+      ('ops.reasoning_provider_health_observations'::regclass,'reasoning_provider_health_reject_truncate'),
+      ('ops.reasoning_account_health_observations'::regclass,'reasoning_account_health_append_only'),
+      ('ops.reasoning_account_health_observations'::regclass,'reasoning_account_health_reject_truncate')
+    )
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conrelid='control.provider_endpoints'::regclass
+      and conname='provider_endpoints_egress_processor_non_nil'
+      and contype='c' and convalidated
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conrelid='control.provider_endpoints'::regclass
+      and conname='provider_endpoints_tenant_endpoint_egress_unique'
+      and contype='u' and convalidated
+  )
+  and (
+    select not attnotnull and not atthasdef
+    from pg_attribute where attrelid='control.provider_endpoints'::regclass
+      and attname='egress_processor_id' and not attisdropped
+  )
+  and (
+    select count(*) = 14 from pg_constraint
+    where conrelid='ops.model_call_ledger'::regclass and convalidated
+      and conname in (
+        'model_call_ledger_reasoning_snapshot_shape',
+        'model_call_ledger_reasoning_call_kind_known',
+        'model_call_ledger_reasoning_recipient_unique',
+        'model_call_ledger_reasoning_binding_unique',
+        'model_call_ledger_reasoning_binding_fk',
+        'model_call_ledger_reasoning_policy_fk',
+        'model_call_ledger_reasoning_profile_fk',
+        'model_call_ledger_reasoning_provider_account_fk',
+        'model_call_ledger_reasoning_endpoint_fk',
+        'model_call_ledger_reasoning_credential_authority_fk',
+        'model_call_ledger_reasoning_billing_account_fk',
+        'model_call_ledger_reasoning_billing_instrument_fk',
+        'model_call_ledger_reasoning_provider_health_fk',
+        'model_call_ledger_reasoning_account_health_fk'
+      )
+  )
+  and (
+    select count(*) = 2 and bool_and(not attnotnull and not atthasdef)
+    from pg_attribute where attrelid='ops.model_call_ledger'::regclass
+      and attname in ('call_kind','intent_sha256') and not attisdropped
+  )
+  and position('octet_length(intent_sha256) = 32' in pg_get_constraintdef(
+    (select oid from pg_constraint where conrelid='ops.model_call_ledger'::regclass
+      and conname='model_call_ledger_reasoning_snapshot_shape'))) > 0
+  and position('request_id <> ''00000000-0000-0000-0000-000000000000''::uuid' in pg_get_constraintdef(
+    (select oid from pg_constraint where conrelid='ops.model_call_ledger'::regclass
+      and conname='model_call_ledger_reasoning_snapshot_shape'))) > 0
+  and position('COVERAGE_PROBE' in pg_get_constraintdef(
+    (select oid from pg_constraint where conrelid='ops.model_call_ledger'::regclass
+      and conname='model_call_ledger_reasoning_call_kind_known'))) > 0
+  and position('TYPED_ASSESSMENT' in pg_get_constraintdef(
+    (select oid from pg_constraint where conrelid='ops.model_call_ledger'::regclass
+      and conname='model_call_ledger_reasoning_call_kind_known'))) > 0
+  and position('estimated_cost IS NULL' in pg_get_constraintdef(
+    (select oid from pg_constraint where conrelid='ops.model_call_ledger'::regclass
+      and conname='model_call_ledger_reasoning_snapshot_shape'))) > 0
+  and position('actual_cost IS NULL' in pg_get_constraintdef(
+    (select oid from pg_constraint where conrelid='ops.model_call_ledger'::regclass
+      and conname='model_call_ledger_reasoning_snapshot_shape'))) > 0
+  and position('CONTRIBUTION_DEIDENTIFY' in pg_get_constraintdef(
+    (select oid from pg_constraint where conrelid='ops.model_call_ledger'::regclass
+      and conname='model_call_ledger_purpose_known'))) > 0
+  and (
+    select count(*) = 3 and bool_and(not attnotnull and not atthasdef)
+    from pg_attribute where attrelid='staging.contribution_candidates'::regclass
+      and attname in ('binding_id','binding_version','model_call_id') and not attisdropped
+  )
+  and (
+    select count(*) = 3 from pg_constraint
+    where conrelid='staging.contribution_candidates'::regclass and convalidated
+      and conname in (
+        'contribution_candidates_reasoning_binding_pair',
+        'contribution_candidates_reasoning_binding_exact_fk',
+        'contribution_candidates_reasoning_model_call_exact_fk'
+      )
+  )
+  and (
+    select not attnotnull and not atthasdef
+    from pg_attribute where attrelid='ops.data_disclosures'::regclass
+      and attname='model_call_id' and not attisdropped
+  )
+  and (
+    select count(*) = 2 from pg_constraint
+    where conrelid='ops.data_disclosures'::regclass and convalidated
+      and conname in (
+        'data_disclosures_tenant_model_call_unique',
+        'data_disclosures_reasoning_model_call_fk'
+      )
+  )
+  and (
+    select prosecdef and provolatile='v'
+      and proowner='role_migration_owner'::regrole
+      and proconfig @> array['search_path=pg_catalog']
+    from pg_proc where oid=
+      'control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)'::regprocedure
+  )
+  and (select count(*) from regexp_matches(pg_get_functiondef(
+    'control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)'::regprocedure),
+    'clock_timestamp\\(\\)','g')) = 1
+  and position('endpoint.egress_processor_id IS NOT NULL' in pg_get_functiondef(
+    'control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)'::regprocedure)) > 0
+  and position('lifecycle_state = ''SERVING''' in pg_get_functiondef(
+    'control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)'::regprocedure)) > 0
+  and position('strategy = ''PINNED''' in pg_get_functiondef(
+    'control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)'::regprocedure)) > 0
+  and (select count(*) from regexp_matches(pg_get_functiondef(
+    'control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)'::regprocedure),
+    'ORDER BY observation.observed_at DESC, observation.observation_id DESC','g')) = 2
+  and position('OLD.call_kind IS DISTINCT FROM NEW.call_kind' in
+    pg_get_functiondef('ops.model_call_ledger_guard_mutation()'::regprocedure)) > 0
+  and position('OLD.intent_sha256 IS DISTINCT FROM NEW.intent_sha256' in
+    pg_get_functiondef('ops.model_call_ledger_guard_mutation()'::regprocedure)) > 0
+  and position('admission.egress_processor_id = NEW.egress_processor_id' in
+    pg_get_functiondef('ops.reasoning_model_call_validate()'::regprocedure)) > 0
+  and position('call.egress_processor_id = NEW.processor_id' in
+    pg_get_functiondef('ops.data_disclosure_reasoning_model_call_validate()'::regprocedure)) > 0
+  and position('disclosure.outcome = ''SUCCESS''' in
+    pg_get_functiondef('staging.contribution_candidate_reasoning_route_validate()'::regprocedure)) > 0
+  and position('call.call_kind = ''TYPED_ASSESSMENT''' in
+    pg_get_functiondef('staging.contribution_candidate_reasoning_route_validate()'::regprocedure)) > 0
+  and not exists (
+    select 1 from pg_class c cross join lateral aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) acl
+    where c.oid in (
+      'ops.reasoning_provider_health_observations'::regclass,
+      'ops.reasoning_account_health_observations'::regclass
+    ) and acl.grantee in (
+      'role_gateway'::regrole,'role_private_worker'::regrole,
+      'role_consolidation_worker'::regrole,'role_public_worker'::regrole,
+      'role_retrieval_worker'::regrole,'role_batch_issuer'::regrole,
+      'role_maintenance'::regrole
+    )
+  )
+  and has_function_privilege('role_private_worker',
+    'control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)','EXECUTE')
+  and not has_function_privilege(0,
+    'control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)','EXECUTE')
+  and not has_function_privilege('role_gateway',
+    'control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)','EXECUTE')
+  as postcheck_ok
+"""
+
+# Replay is runner-idempotent: a second migrate observes the recorded 0130 id and executes no
+# DDL, creates no observation, changes no identity value and leaves legacy NULL seams untouched.
+rollback_or_forward_fix = "Forward-fix only after deployment: never delete/rewrite health history, never backfill legacy candidate/model-call/disclosure rows, and never relax exact route/recipient FKs. Before deployment, rollback means discard the disposable database and replay the immutable chain."
+backup_restore_requirement = "Production rollout is out of scope without explicit backup/approval. Acceptance uses disposable PostgreSQL 18, proves fresh 0001-to-0130 apply, postcheck, zero-apply replay, focused failure injection, and restores by discarding the fixture."

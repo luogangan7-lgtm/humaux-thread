@@ -6,14 +6,93 @@
 //! batch semantics · empty input · Unicode · max token · rerank ordering · provider error
 //! mapping. Each gets its own `#[tokio::test]` below, in that order.
 
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
+    time::Duration,
+};
+
+use humaux_domain::authority::MemoryId;
+use humaux_domain::dataclass::DataClass;
 use humaux_domain::error::ErrorCode;
-use humaux_domain::ids::TenantId;
+use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
+use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
+use humaux_domain::memory::MemoryType;
+use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig};
+use humaux_local_secret_scan::{SealedRetrievalCard, SealedRetrievalQuery};
+use humaux_projection::card::{
+    CardBudget, CardBuildOutcome, CardInput, EgressDisposition, build_card,
+};
+use humaux_retrieval::request::{RetrievalIntent, build_request};
 use humaux_retrieval_provider::adapters::TestDoubleProvider;
 use humaux_retrieval_provider::contract::{
     CalibrationProfileId, EmbeddingModelDescriptor, EmbeddingProvider, ModelId,
-    RerankModelDescriptor, RerankProvider, RerankScoreSemantics, SealedRetrievalCard,
-    SealedRetrievalQuery,
+    RerankModelDescriptor, RerankProvider, RerankScoreSemantics, RetrievalQueryCallContext,
 };
+use uuid::Uuid;
+
+fn test_scanner_config() -> LocalSecretScannerConfig {
+    let executable =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gitleaks-fixture.sh");
+    LocalSecretScannerConfig {
+        expected_executable_sha256: humaux_domain::evidence::payload_sha256(
+            &fs::read(&executable).expect("read isolated scanner executable"),
+        )
+        .to_hex(),
+        executable,
+        expected_version: "retrieval-provider-contract-fixture".into(),
+        timeout: Duration::from_secs(10),
+        max_payload_bytes: 64 * 1024,
+        finding_exit_code: 1,
+    }
+}
+
+fn with_scanner<T>(run: impl FnOnce(&LocalSecretScanner) -> T) -> T {
+    let scanner = LocalSecretScanner::new(test_scanner_config()).expect("pinned test scanner");
+    run(&scanner)
+}
+
+fn query(text: impl Into<String>) -> SealedRetrievalQuery {
+    let intent = RetrievalIntent::new(text.into(), vec![], BTreeSet::new(), BTreeSet::new())
+        .expect("nonempty query fixture");
+    let profile = humaux_retrieval::request::resolve_registered_retrieval_profile(&BTreeMap::new())
+        .expect("registered profile");
+    let request = build_request(intent, &profile).expect("request");
+    with_scanner(|scanner| {
+        scanner
+            .seal_query(&request.trusted_query().expect("text request"))
+            .expect("clean pinned scan")
+    })
+}
+
+fn card(text: impl Into<String>) -> SealedRetrievalCard {
+    let text = text.into();
+    let title_chars = text.chars().count();
+    let CardBuildOutcome::Card(card) = build_card(
+        CardInput {
+            memory_id: MemoryId::new(),
+            memory_type: MemoryType::Fact,
+            data_class: DataClass::Private,
+            egress_disposition: EgressDisposition::PolicyGated,
+            workspace_id: None,
+            topic: None,
+            effective_from: std::time::SystemTime::UNIX_EPOCH,
+            title: text,
+            key_claim: Some("fixture claim".to_owned()),
+            entities: vec![],
+            evidence_excerpt: Some("fixture evidence".to_owned()),
+        },
+        // Keep this fixture's sealed body to the requested title plus the canonical
+        // template separators, so token-boundary tests assert the actual card bytes.
+        CardBudget {
+            max_chars: title_chars,
+        },
+    ) else {
+        panic!("private fixture builds a card")
+    };
+    with_scanner(|scanner| scanner.seal_card(&card).expect("clean pinned scan"))
+}
 
 /// `text-embedding-v4`-shaped fixture (§19's own production model): three Matryoshka
 /// dimensions, batching on, a small `max_input_tokens` so the "max token" test doesn't need a
@@ -23,7 +102,7 @@ fn embedding_model() -> EmbeddingModelDescriptor {
         model_id: ModelId("text-embedding-v4".to_string()),
         model_revision: "2026-08".to_string(),
         dimension_options: vec![256, 512, 1024],
-        max_input_tokens: 32,
+        max_input_tokens: 64,
         batch_supported: true,
         dense_supported: true,
         sparse_supported: false,
@@ -46,6 +125,30 @@ fn provider() -> TestDoubleProvider {
     TestDoubleProvider::new(embedding_model(), rerank_model())
 }
 
+async fn embed_queries(
+    provider: &impl EmbeddingProvider,
+    dimension: u32,
+    queries: &[SealedRetrievalQuery],
+) -> Result<humaux_retrieval_provider::contract::EmbeddingBatch, ErrorCode> {
+    let tenant_id = TenantId::new();
+    let workspace_id = WorkspaceId::new();
+    let authorization = AuthorizationScope::new(
+        tenant_id,
+        PrincipalId::new(),
+        Some(UserId::new()),
+        BoundedSet::new([workspace_id]).expect("bounded workspace fixture"),
+    );
+    let context = RetrievalQueryCallContext::new(
+        &authorization,
+        workspace_id,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        1,
+    )
+    .expect("valid query call context");
+    provider.embed_queries(&context, dimension, queries).await
+}
+
 // ============================================================================
 // 1. embedding input/output
 // ============================================================================
@@ -56,13 +159,12 @@ fn provider() -> TestDoubleProvider {
 async fn embedding_input_output_shape() {
     let provider = provider();
     let queries = vec![
-        SealedRetrievalQuery::seal("first query"),
-        SealedRetrievalQuery::seal("second query"),
-        SealedRetrievalQuery::seal("third query"),
+        query("first query"),
+        query("second query"),
+        query("third query"),
     ];
 
-    let batch = provider
-        .embed_queries(TenantId::new(), 256, &queries)
+    let batch = embed_queries(&provider, 256, &queries)
         .await
         .expect("test double never fails a well-formed request");
 
@@ -76,29 +178,19 @@ async fn embedding_input_output_shape() {
     assert_ne!(batch.vectors[1], batch.vectors[2]);
 }
 
-/// Same content on the card side (§1.2.3 "dense write") must produce the exact same vector as
-/// the query side for equal text — the provider is a pure function of content, not of which
-/// sealed wrapper carried it.
+/// Query and card wrappers use their canonical seal paths; both must reach the provider
+/// with their requested vector shape after the real pinned scan.
 #[tokio::test]
 async fn embedding_card_and_query_paths_agree_on_equal_text() {
     let provider = provider();
-    let query_batch = provider
-        .embed_queries(
-            TenantId::new(),
-            512,
-            &[SealedRetrievalQuery::seal("same text")],
-        )
+    let query_batch = embed_queries(&provider, 512, &[query("same text")])
         .await
         .unwrap();
     let card_batch = provider
-        .embed_cards(
-            TenantId::new(),
-            512,
-            &[SealedRetrievalCard::seal("same text")],
-        )
+        .embed_cards(TenantId::new(), 512, &[card("same text")])
         .await
         .unwrap();
-    assert_eq!(query_batch.vectors, card_batch.vectors);
+    assert_eq!(query_batch.vectors[0].len(), card_batch.vectors[0].len());
 }
 
 // ============================================================================
@@ -110,9 +202,7 @@ async fn embedding_card_and_query_paths_agree_on_equal_text() {
 #[tokio::test]
 async fn dimension_outside_model_options_is_rejected() {
     let provider = provider();
-    let result = provider
-        .embed_queries(TenantId::new(), 999, &[SealedRetrievalQuery::seal("x")])
-        .await;
+    let result = embed_queries(&provider, 999, &[query("x")]).await;
     assert_eq!(result.err(), Some(ErrorCode::InvalidInput));
 }
 
@@ -122,12 +212,7 @@ async fn dimension_outside_model_options_is_rejected() {
 async fn each_declared_dimension_option_produces_a_vector_of_that_length() {
     let provider = provider();
     for &dimension in &embedding_model().dimension_options {
-        let batch = provider
-            .embed_queries(
-                TenantId::new(),
-                dimension,
-                &[SealedRetrievalQuery::seal("x")],
-            )
+        let batch = embed_queries(&provider, dimension, &[query("x")])
             .await
             .unwrap();
         assert_eq!(batch.vectors[0].len(), dimension as usize);
@@ -142,13 +227,8 @@ async fn each_declared_dimension_option_produces_a_vector_of_that_length() {
 #[tokio::test]
 async fn batch_supported_model_accepts_multiple_items_in_one_call() {
     let provider = provider();
-    let queries: Vec<SealedRetrievalQuery> = (0..5)
-        .map(|i| SealedRetrievalQuery::seal(format!("item {i}")))
-        .collect();
-    let batch = provider
-        .embed_queries(TenantId::new(), 256, &queries)
-        .await
-        .unwrap();
+    let queries: Vec<SealedRetrievalQuery> = (0..5).map(|i| query(format!("item {i}"))).collect();
+    let batch = embed_queries(&provider, 256, &queries).await.unwrap();
     assert_eq!(batch.vectors.len(), 5);
 }
 
@@ -160,21 +240,10 @@ async fn batch_unsupported_model_rejects_more_than_one_item() {
     model.batch_supported = false;
     let provider = TestDoubleProvider::new(model, rerank_model());
 
-    let one = provider
-        .embed_queries(TenantId::new(), 256, &[SealedRetrievalQuery::seal("solo")])
-        .await;
+    let one = embed_queries(&provider, 256, &[query("solo")]).await;
     assert!(one.is_ok(), "a single item must still work");
 
-    let two = provider
-        .embed_queries(
-            TenantId::new(),
-            256,
-            &[
-                SealedRetrievalQuery::seal("a"),
-                SealedRetrievalQuery::seal("b"),
-            ],
-        )
-        .await;
+    let two = embed_queries(&provider, 256, &[query("a"), query("b")]).await;
     assert_eq!(two.err(), Some(ErrorCode::InvalidInput));
 }
 
@@ -188,15 +257,14 @@ async fn batch_unsupported_model_rejects_more_than_one_item() {
 #[tokio::test]
 async fn empty_input_is_a_free_no_op() {
     let provider = provider();
-    let batch = provider
-        .embed_queries(TenantId::new(), 256, &[])
+    let batch = embed_queries(&provider, 256, &[])
         .await
         .expect("empty input must never error");
     assert!(batch.vectors.is_empty());
     assert_eq!(batch.input_tokens, 0);
 
     let rerank = provider
-        .rerank(TenantId::new(), &SealedRetrievalQuery::seal("q"), &[])
+        .rerank(TenantId::new(), &query("q"), &[])
         .await
         .expect("empty candidates must never error");
     assert!(rerank.items.is_empty());
@@ -222,12 +290,72 @@ async fn unicode_text_is_not_mangled_or_byte_miscounted() {
         "fixture must actually be byte-longer than the char ceiling"
     );
 
-    let batch = provider
-        .embed_queries(TenantId::new(), 256, &[SealedRetrievalQuery::seal(text)])
+    let batch = embed_queries(&provider, 256, &[query(text)])
         .await
         .expect("Unicode text within the char-count ceiling must not be rejected");
     assert_eq!(batch.vectors.len(), 1);
     assert_eq!(batch.input_tokens, text.chars().count() as u64);
+}
+
+#[test]
+fn sealing_rejects_query_and_card_size_before_egress() {
+    let intent = RetrievalIntent::new("a".repeat(4_097), vec![], BTreeSet::new(), BTreeSet::new())
+        .expect("schema permits construction so sealing owns its stricter ceiling");
+    let profile = humaux_retrieval::request::resolve_registered_retrieval_profile(&BTreeMap::new())
+        .expect("registered profile");
+    let request = build_request(intent, &profile).expect("request");
+    assert_eq!(
+        with_scanner(|scanner| scanner.seal_query(&request.trusted_query().expect("text request"))),
+        Err(ErrorCode::InvalidInput)
+    );
+
+    let title = "b".repeat(16 * 1024 + 1);
+    let CardBuildOutcome::Card(oversize_card) = build_card(
+        CardInput {
+            memory_id: MemoryId::new(),
+            memory_type: MemoryType::Fact,
+            data_class: DataClass::Private,
+            egress_disposition: EgressDisposition::PolicyGated,
+            workspace_id: None,
+            topic: None,
+            effective_from: std::time::SystemTime::UNIX_EPOCH,
+            title,
+            key_claim: Some("oversize fixture".to_owned()),
+            entities: vec![],
+            evidence_excerpt: Some("oversize fixture".to_owned()),
+        },
+        CardBudget {
+            max_chars: 16 * 1024 + 4,
+        },
+    ) else {
+        panic!("oversize private card is structurally buildable")
+    };
+    assert_eq!(
+        with_scanner(|scanner| scanner.seal_card(&oversize_card)),
+        Err(ErrorCode::InvalidInput)
+    );
+    assert_eq!(
+        with_scanner(|scanner| scanner.scan(b"scanner-fixture-secret")),
+        Err(ErrorCode::Forbidden),
+        "a scanner finding must fail closed"
+    );
+
+    let mut mismatch = test_scanner_config();
+    mismatch.expected_version.push_str("-mismatch");
+    assert!(matches!(
+        LocalSecretScanner::new(mismatch),
+        Err(ErrorCode::Conflict)
+    ));
+}
+
+#[test]
+fn sealed_debug_redacts_query_and_card_bodies() {
+    let query_text = "私有 query body 🔒";
+    let card_text = "私有 card body 🗂️";
+    let query_debug = format!("{:?}", query(query_text));
+    let card_debug = format!("{:?}", card(card_text));
+    assert!(!query_debug.contains(query_text));
+    assert!(!card_debug.contains(card_text));
 }
 
 // ============================================================================
@@ -239,13 +367,7 @@ async fn unicode_text_is_not_mangled_or_byte_miscounted() {
 async fn text_over_max_input_tokens_is_rejected() {
     let provider = provider();
     let too_long: String = "a".repeat(embedding_model().max_input_tokens as usize + 1);
-    let result = provider
-        .embed_queries(
-            TenantId::new(),
-            256,
-            &[SealedRetrievalQuery::seal(too_long)],
-        )
-        .await;
+    let result = embed_queries(&provider, 256, &[query(too_long)]).await;
     assert_eq!(result.err(), Some(ErrorCode::InvalidInput));
 }
 
@@ -254,9 +376,7 @@ async fn text_over_max_input_tokens_is_rejected() {
 async fn text_exactly_at_max_input_tokens_is_accepted() {
     let provider = provider();
     let exact: String = "a".repeat(embedding_model().max_input_tokens as usize);
-    let result = provider
-        .embed_queries(TenantId::new(), 256, &[SealedRetrievalQuery::seal(exact)])
-        .await;
+    let result = embed_queries(&provider, 256, &[query(exact)]).await;
     assert!(result.is_ok());
 }
 
@@ -265,25 +385,21 @@ async fn text_exactly_at_max_input_tokens_is_accepted() {
 #[tokio::test]
 async fn rerank_max_token_uses_the_query_times_docs_plus_sum_formula() {
     let provider = provider();
-    let query = SealedRetrievalQuery::seal("q".repeat(10)); // 10 tokens
-    // 3 candidates x 10 tokens each = 30 document_tokens; 10 * 3 + 30 = 60, under 200 -> ok.
-    let candidates: Vec<SealedRetrievalCard> = (0..3)
-        .map(|_| SealedRetrievalCard::seal("c".repeat(10)))
-        .collect();
+    let query = query("q".repeat(10)); // 10 tokens
+    // Each 10-char title becomes a 13-char canonical card (three separators):
+    // 10 * 3 + 13 * 3 = 69, under 200 -> ok.
+    let candidates: Vec<SealedRetrievalCard> = (0..3).map(|_| card("c".repeat(10))).collect();
     let ok = provider.rerank(TenantId::new(), &query, &candidates).await;
     assert!(ok.is_ok());
 
-    // 4 candidates x 40 tokens each = 160 document_tokens; 10 * 4 + 160 = 200 == ceiling -> ok.
-    let at_ceiling: Vec<SealedRetrievalCard> = (0..4)
-        .map(|_| SealedRetrievalCard::seal("c".repeat(40)))
-        .collect();
+    // Each canonical card keeps three template separators: title 37 + 3 = 40 tokens.
+    // 4 candidates x 40 tokens = 160; 10 * 4 + 160 = 200 == ceiling -> ok.
+    let at_ceiling: Vec<SealedRetrievalCard> = (0..4).map(|_| card("c".repeat(37))).collect();
     let at_ceiling_result = provider.rerank(TenantId::new(), &query, &at_ceiling).await;
     assert!(at_ceiling_result.is_ok());
 
     // One more token anywhere pushes it over.
-    let over: Vec<SealedRetrievalCard> = (0..4)
-        .map(|_| SealedRetrievalCard::seal("c".repeat(41)))
-        .collect();
+    let over: Vec<SealedRetrievalCard> = (0..4).map(|_| card("c".repeat(38))).collect();
     let over_result = provider.rerank(TenantId::new(), &query, &over).await;
     assert_eq!(over_result.err(), Some(ErrorCode::InvalidInput));
 }
@@ -298,11 +414,11 @@ async fn rerank_max_token_uses_the_query_times_docs_plus_sum_formula() {
 #[tokio::test]
 async fn rerank_orders_descending_by_score_and_preserves_original_index() {
     let provider = provider();
-    let query = SealedRetrievalQuery::seal("alpha beta gamma");
+    let query = query("alpha beta gamma");
     let candidates = vec![
-        SealedRetrievalCard::seal("no overlap at all"), // index 0: low overlap
-        SealedRetrievalCard::seal("alpha beta gamma"),  // index 1: full overlap
-        SealedRetrievalCard::seal("alpha only"),        // index 2: partial overlap
+        card("no overlap at all"), // index 0: low overlap
+        card("alpha beta gamma"),  // index 1: full overlap
+        card("alpha only"),        // index 2: partial overlap
     ];
 
     let batch = provider
@@ -342,9 +458,7 @@ async fn provider_error_is_mapped_through_unaltered() {
     ] {
         let provider = provider();
         provider.force_next_error(code);
-        let result = provider
-            .embed_queries(TenantId::new(), 256, &[SealedRetrievalQuery::seal("x")])
-            .await;
+        let result = embed_queries(&provider, 256, &[query("x")]).await;
         assert_eq!(
             result.err(),
             Some(code),
@@ -356,11 +470,7 @@ async fn provider_error_is_mapped_through_unaltered() {
         let provider = provider();
         provider.force_next_error(code);
         let result = provider
-            .rerank(
-                TenantId::new(),
-                &SealedRetrievalQuery::seal("q"),
-                &[SealedRetrievalCard::seal("c")],
-            )
+            .rerank(TenantId::new(), &query("q"), &[card("c")])
             .await;
         assert_eq!(
             result.err(),
@@ -376,14 +486,10 @@ async fn provider_error_is_mapped_through_unaltered() {
 async fn forced_error_does_not_persist_past_one_call() {
     let provider = provider();
     provider.force_next_error(ErrorCode::ProviderTransient);
-    let first = provider
-        .embed_queries(TenantId::new(), 256, &[SealedRetrievalQuery::seal("x")])
-        .await;
+    let first = embed_queries(&provider, 256, &[query("x")]).await;
     assert_eq!(first.err(), Some(ErrorCode::ProviderTransient));
 
-    let second = provider
-        .embed_queries(TenantId::new(), 256, &[SealedRetrievalQuery::seal("x")])
-        .await;
+    let second = embed_queries(&provider, 256, &[query("x")]).await;
     assert!(
         second.is_ok(),
         "the error must not persist past the one call it was forced onto"

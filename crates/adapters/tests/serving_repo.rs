@@ -10,7 +10,8 @@ use std::time::SystemTime;
 
 use humaux_adapters::postgres::{MaintenanceDbPool, RuntimeDbPool};
 use humaux_adapters::serving_repo::{self, SwitchOutcome};
-use humaux_domain::ids::TenantId;
+use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
+use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
 use humaux_projection::serving::{ContinuationVerdict, StreamFamily};
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::error::SqlState;
@@ -34,6 +35,8 @@ struct Handle {
     maintenance: MaintenanceDbPool,
     admin: Client,
     tenant_id: Uuid,
+    user_id: Uuid,
+    auth: AuthorizationScope,
 }
 
 impl Drop for Handle {
@@ -43,8 +46,10 @@ impl Drop for Handle {
         let _ = self.admin.batch_execute(&format!(
             "DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
              DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}'; \
+             DELETE FROM control.memberships WHERE tenant_id = '{0}'; \
+             DELETE FROM control.users WHERE user_id = '{1}'; \
              DELETE FROM control.tenants WHERE tenant_id = '{0}';",
-            self.tenant_id
+            self.tenant_id, self.user_id
         ));
     }
 }
@@ -99,6 +104,29 @@ impl DbIntegrationFixture for ServingFixture {
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
             .get(0);
 
+        let user_id: Uuid = admin
+            .query_one(
+                "INSERT INTO control.users(state) VALUES ('ACTIVE') RETURNING user_id",
+                &[],
+            )
+            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
+            .get(0);
+        admin
+            .execute(
+                "INSERT INTO control.memberships(tenant_id, user_id, role, state) \
+                 VALUES ($1, $2, 'member', 'ACTIVE')",
+                &[&tenant_id, &user_id],
+            )
+            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        let auth = AuthorizationScope::new(
+            TenantId(tenant_id),
+            PrincipalId(user_id),
+            Some(UserId(user_id)),
+            BoundedSet::<WorkspaceId>::new([]).map_err(|e| {
+                DbFixtureSkipReason::IsolationSetupFailed(format!("auth scope: {e:?}"))
+            })?,
+        );
+
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let runtime = rt
@@ -117,6 +145,8 @@ impl DbIntegrationFixture for ServingFixture {
             maintenance,
             admin,
             tenant_id,
+            user_id,
+            auth,
         })
     }
 }
@@ -257,7 +287,11 @@ fn serving_version_never_returns_a_shadow_only_version() {
 
             let version = handle
                 .rt
-                .block_on(serving_repo::serving_version(&handle.runtime, &f))
+                .block_on(serving_repo::serving_version(
+                    &handle.runtime,
+                    &handle.auth,
+                    &f,
+                ))
                 .expect("read must succeed")
                 .expect("a serving row exists");
             assert_eq!(
@@ -280,7 +314,11 @@ fn serving_version_is_none_when_only_a_shadow_row_exists() {
 
             let version = handle
                 .rt
-                .block_on(serving_repo::serving_version(&handle.runtime, &f))
+                .block_on(serving_repo::serving_version(
+                    &handle.runtime,
+                    &handle.auth,
+                    &f,
+                ))
                 .expect("read must succeed");
             assert_eq!(version, None);
         },
@@ -511,6 +549,33 @@ fn switch_projection_version_rejects_when_declared_serving_version_does_not_matc
                 v1_serving,
                 "rejection must leave the old serving row untouched"
             );
+        },
+    );
+}
+
+/// The read route is bound to the authenticated tenant before its own transaction starts; a
+/// caller cannot pass a family from another tenant even though the gateway pool is reusable.
+#[test]
+fn serving_version_rejects_family_outside_authenticated_tenant() {
+    run_db_fixture::<ServingFixture, _>(
+        "serving_version_rejects_family_outside_authenticated_tenant",
+        |handle| {
+            let foreign = StreamFamily::new(
+                TenantId(Uuid::new_v4()),
+                "workspace",
+                Uuid::new_v4(),
+                "code",
+                "retrieval_card",
+            );
+            let result = handle.rt.block_on(serving_repo::serving_version(
+                &handle.runtime,
+                &handle.auth,
+                &foreign,
+            ));
+            assert!(matches!(
+                result,
+                Err(serving_repo::ServingRepoError::CrossTenant)
+            ));
         },
     );
 }

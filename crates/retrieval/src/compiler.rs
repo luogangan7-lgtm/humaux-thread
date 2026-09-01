@@ -103,6 +103,7 @@ pub fn compile(
     budget: SupplementalBudget,
     ranked: Vec<Candidate>,
 ) -> CompiledContext {
+    let pinned = pinned.excluding_mandatory(&mandatory);
     let (_expected, mandatory_rows) = mandatory.into_parts();
     let pinned_rows = pinned.into_rows();
 
@@ -150,10 +151,14 @@ mod tests {
     use humaux_domain::context::{ContextBudget, SelectorId, SelectorOutcome, spec};
 
     fn m_row(tokens: u32) -> MandatoryRow {
+        m_row_with_id(MemoryId::new(), tokens)
+    }
+
+    fn m_row_with_id(memory_id: MemoryId, tokens: u32) -> MandatoryRow {
         let s = spec(SelectorId::ProjectActiveConstraintsV1);
         match MandatoryRow::from_selector(
             s,
-            MemoryId::new(),
+            memory_id,
             s.min_authority,
             tokens,
             humaux_domain::grounding::RowGrounding::Judged(
@@ -171,39 +176,40 @@ mod tests {
         }
     }
 
-    fn lane(rows: Vec<MandatoryRow>, expected: u64) -> MandatoryLane {
+    fn lane(rows: Vec<MandatoryRow>) -> MandatoryLane {
         MandatoryLane::from_selectors([
             SelectorOutcome::Ran {
                 id: SelectorId::TaskExplicitContextV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
-                expected,
+                candidate_ids: rows.iter().map(|row| row.memory_id()).collect(),
                 rows,
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
         ])
+        .expect("selector outcomes")
     }
 
     /// **G25-1 本体**：1 条 Mandatory + 200 条高分补充候选，无论补充位怎么排，
@@ -216,7 +222,7 @@ mod tests {
     fn one_mandatory_survives_two_hundred_higher_scoring_supplementals() {
         let row = m_row(10);
         let target = row.memory_id();
-        let m = lane(vec![row], 1);
+        let m = lane(vec![row]);
         let p = PinnedLane::new(0, vec![], vec![]);
 
         // 200 条分数远高于任何 mandatory 的候选（mandatory 根本没有分数——这正是重点）。
@@ -287,7 +293,7 @@ mod tests {
         let make = || {
             let row = m_row(10);
             let id = row.memory_id();
-            (lane(vec![row], 1), id)
+            (lane(vec![row]), id)
         };
 
         let (m_good, id) = make();
@@ -318,10 +324,36 @@ mod tests {
         );
     }
 
+    /// The public compiler also accepts raw lanes, so mandatory precedence must hold even
+    /// when no handoff assembly normalized the Pinned lane first.
+    #[test]
+    fn compile_keeps_a_raw_cross_lane_memory_id_once() {
+        let memory_id = MemoryId::new();
+        let m = lane(vec![m_row_with_id(memory_id, 5)]);
+        let p = PinnedLane::new(1, vec![m_row_with_id(memory_id, 5)], vec![]);
+        let budget = ContextBudget::new(20, 10)
+            .expect("budget")
+            .reserve(&m, &p)
+            .expect("raw overlap must not overflow");
+
+        let compiled = compile(m, p, budget, vec![]);
+        let mut ids = compiled
+            .mandatory_ids()
+            .into_iter()
+            .chain(compiled.pinned_ids())
+            .collect::<Vec<_>>();
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+
+        assert_eq!(before, 1);
+        assert_eq!(ids, vec![memory_id]);
+    }
+
     /// 冻结顺序：Mandatory 在 Pinned 之前，Pinned 在 Supplemental 之前。
     #[test]
     fn frozen_assembly_order_is_mandatory_then_pinned_then_supplemental() {
-        let m = lane(vec![m_row(5)], 1);
+        let m = lane(vec![m_row(5)]);
         let p = PinnedLane::new(1, vec![m_row(5)], vec![]);
         let budget = ContextBudget::new(100, 50)
             .expect("budget")
@@ -348,7 +380,7 @@ mod tests {
     /// 补充位丢弃必须记名。丢了不说 = 静默截断，只是发生在补充位上。
     #[test]
     fn dropped_supplementals_are_named_not_just_counted() {
-        let m = lane(vec![], 0);
+        let m = lane(vec![]);
         let p = PinnedLane::new(0, vec![], vec![]);
         let budget = ContextBudget::new(10, 5)
             .expect("budget")

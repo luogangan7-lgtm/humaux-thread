@@ -30,12 +30,12 @@
 //! `serving_version` 一直都在——缺的是调用它。已按 ADR-0006 改：闸的 NA 主语改成
 //! `serving_version` 函数本身，读路径接进来。
 
-use sqlx::Row;
-use sqlx::types::Uuid;
-
+use humaux_domain::identity::AuthorizationScope;
 use humaux_projection::serving::{
     ContinuationVerdict, StreamFamily, SwitchCriteria, SwitchRejection, evaluate_switch,
 };
+use sqlx::Row;
+use sqlx::types::Uuid;
 
 use crate::postgres::{MaintenanceDbPool, RuntimeDbPool};
 
@@ -46,6 +46,8 @@ type Txn<'c> = sqlx::Transaction<'c, sqlx::Postgres>;
 #[derive(Debug)]
 pub enum ServingRepoError {
     Db(sqlx::Error),
+    CrossTenant,
+    MissingAuthenticatedUser,
 }
 
 impl From<sqlx::Error> for ServingRepoError {
@@ -58,6 +60,10 @@ impl std::fmt::Display for ServingRepoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Db(e) => write!(f, "serving_repo DB error: {e}"),
+            Self::CrossTenant => write!(f, "serving family is outside the authenticated tenant"),
+            Self::MissingAuthenticatedUser => {
+                write!(f, "serving read requires an authenticated user")
+            }
         }
     }
 }
@@ -89,12 +95,29 @@ pub enum SwitchOutcome {
     TargetVersionMissing,
 }
 
-/// Sets `humaux.tenant_id` for the remainder of `txn` (§6.1 RLS context) — same technique as
-/// `stream_repo::set_tenant_local` / `retrieve::set_tenant_local`.
+/// Maintenance writes remain tenant-scoped but have no end-user request context.
 async fn set_tenant_local(txn: &mut Txn<'_>, tenant_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query(&format!("SET LOCAL humaux.tenant_id = '{tenant_id}'"))
         .execute(&mut **txn)
         .await?;
+    Ok(())
+}
+
+/// Binds the authenticated tenant and user for this independently-opened read transaction.
+async fn set_authorization_local(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+) -> Result<(), ServingRepoError> {
+    let Some(user_id) = authorization.user_id() else {
+        return Err(ServingRepoError::MissingAuthenticatedUser);
+    };
+    sqlx::query(
+        "SELECT set_config('humaux.tenant_id', $1, true), set_config('humaux.user_id', $2, true)",
+    )
+    .bind(authorization.tenant_id().0.to_string())
+    .bind(user_id.0.to_string())
+    .execute(&mut **txn)
+    .await?;
     Ok(())
 }
 
@@ -129,23 +152,42 @@ fn bind_family<'q>(query: PgQuery<'q>, family: &'q StreamFamily) -> PgQuery<'q> 
 /// `projection_highwater` 归 retrieval_worker、`serving`/`shadow` 归 maintenance。
 pub async fn serving_version(
     pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
     family: &StreamFamily,
 ) -> Result<Option<String>, ServingRepoError> {
     let mut txn = pool.pool().begin().await?;
-    set_tenant_local(&mut txn, family.tenant_id.0).await?;
-    let version: Option<String> = bind_family(
+    set_authorization_local(&mut txn, authorization).await?;
+    let version = serving_version_in_txn(&mut txn, authorization, family).await?;
+    txn.commit().await?;
+    Ok(version)
+}
+
+/// Transaction-owned form of [`serving_version`]. The caller has already established its
+/// request snapshot and bound the authorization GUCs; this keeps §16.2's one authoritative
+/// serving-version SQL query inside that snapshot instead of opening a second read transaction.
+pub(crate) async fn serving_version_in_txn(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+    family: &StreamFamily,
+) -> Result<Option<String>, ServingRepoError> {
+    if authorization.tenant_id() != family.tenant_id {
+        return Err(ServingRepoError::CrossTenant);
+    }
+    if authorization.user_id().is_none() {
+        return Err(ServingRepoError::MissingAuthenticatedUser);
+    }
+    bind_family(
         sqlx::query(&format!(
             "SELECT projection_version FROM projection.stream_checkpoints \
              WHERE {FAMILY_WHERE} AND serving"
         )),
         family,
     )
-    .fetch_optional(&mut *txn)
+    .fetch_optional(&mut **txn)
     .await?
     .map(|row| row.try_get::<String, _>("projection_version"))
-    .transpose()?;
-    txn.commit().await?;
-    Ok(version)
+    .transpose()
+    .map_err(ServingRepoError::Db)
 }
 
 /// Composes the single `bigint` key `pg_advisory_xact_lock` takes from a family's five

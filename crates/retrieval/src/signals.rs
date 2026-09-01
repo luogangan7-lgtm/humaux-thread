@@ -348,6 +348,7 @@ mod tests {
                 truncated: false,
                 excluded_secret: 0,
             }),
+            known_lower_bound: None,
             lanes: Default::default(),
             candidate_count: 10,
             reranked_count: 10,

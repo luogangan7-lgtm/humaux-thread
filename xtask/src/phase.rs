@@ -92,10 +92,17 @@ pub fn read_phase_file(path: &Path) -> u32 {
 ///
 /// 只登记**下一个**相位的 marker 就够了：`PHASE` 每前进一步，下一行才变得相关；
 /// 一次性预登记全部 17 个相位的 marker 是在猜未来交付物的文件名，猜错的行永远不红。
-const NEXT_PHASE_MARKERS: [(u32, &str, &str); 2] = [
+const NEXT_PHASE_MARKERS: [(u32, &str, &str); 3] = [
     (8, "crates/application/src/continuity.rs", "占位模块"),
-    // phase 9 = §12 Public Contribution；contribute.rs 今天是一行占位。
+    // phase 9 = §12 Public Contribution; implementation has started, not an acceptance claim.
     (9, "crates/application/src/contribute.rs", "占位模块"),
+    // Phase 9 shares this process with future resident evolution, but only wires run_once.
+    // Removing the explicit disabled marker means Phase 10 must be acknowledged separately.
+    (
+        10,
+        "bins/public-worker/src/main.rs",
+        "Phase10 resident evolution is not enabled",
+    ),
 ];
 
 /// `cargo xtask phase-check` — `PHASE` 的过期闸。

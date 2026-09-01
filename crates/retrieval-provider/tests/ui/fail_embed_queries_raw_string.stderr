@@ -1,8 +1,18 @@
-error[E0308]: mismatched types
- --> tests/ui/fail_embed_queries_raw_string.rs:9:58
+warning: unreachable statement
+ --> tests/ui/fail_embed_queries_raw_string.rs:9:5
   |
-9 |     let _ = provider.embed_queries(TenantId::new(), 256, &raw).await;
-  |                      -------------                       ^^^^ expected `&[SealedRetrievalQuery]`, found `&Vec<String>`
+8 |     let context: RetrievalQueryCallContext<'_> = unimplemented!();
+  |                                                  ---------------- any code following this expression is unreachable
+9 |     let _ = provider.embed_queries(&context, 256, &raw).await;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+  |
+  = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0308]: mismatched types
+ --> tests/ui/fail_embed_queries_raw_string.rs:9:51
+  |
+9 |     let _ = provider.embed_queries(&context, 256, &raw).await;
+  |                      -------------                ^^^^ expected `&[SealedRetrievalQuery]`, found `&Vec<String>`
   |                      |
   |                      arguments to this method are incorrect
   |

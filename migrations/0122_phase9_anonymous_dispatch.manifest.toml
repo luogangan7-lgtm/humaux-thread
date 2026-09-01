@@ -1,0 +1,24 @@
+migration_id = "0122_phase9_anonymous_dispatch"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('public.revoke_anonymous_source(uuid,bytea,bigint)') is null
+  and not exists(select 1 from information_schema.columns
+    where table_schema='ops' and table_name='outbox' and column_name='anonymous_source_id') as precheck_ok
+"""
+
+postcheck = """
+select to_regprocedure('public.revoke_anonymous_source(uuid,bytea,bigint)') is not null
+  and exists(select 1 from information_schema.columns
+    where table_schema='ops' and table_name='outbox' and column_name='anonymous_source_id')
+  and has_function_privilege('role_public_worker','public.revoke_anonymous_source(uuid,bytea,bigint)','EXECUTE')
+  and not has_function_privilege('role_public_worker','staging.read_sanitized_public_candidate(uuid,bytea)','EXECUTE')
+  and not has_function_privilege('role_public_worker','public.read_anonymous_release_binding(uuid)','EXECUTE')
+  and not has_any_column_privilege('role_public_worker','staging.sanitized_public_candidates','SELECT')
+  and not has_table_privilege('role_public_worker','public.anonymous_source_lifecycle_events','INSERT')
+  and not has_sequence_privilege('role_public_worker','public.anonymous_source_lifecycle_events_lifecycle_seq_seq','USAGE')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Anonymous outbox rows and lifecycle facts are immutable; repair dispatch behavior in a later additive migration."
+backup_restore_requirement = "Apply only to an isolated PostgreSQL acceptance fixture until production backup and rollout are approved. Legacy release-addressed events remain for dual-run."

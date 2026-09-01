@@ -1,0 +1,66 @@
+migration_id = "0117_retrieval_provider_budget"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('ops.retrieval_provider_budget_reservations') is null
+  and to_regclass('ops.retrieval_provider_budget_allocations') is null as precheck_ok
+"""
+
+postcheck = """
+select to_regclass('ops.retrieval_provider_budget_reservations') is not null
+  and to_regclass('ops.retrieval_provider_budget_allocations') is not null
+  and to_regprocedure('ops.reserve_retrieval_provider_budget(uuid,uuid,text,text,text,text,bigint,bigint)') is not null
+  and to_regprocedure('ops.mark_retrieval_provider_budget_dispatched(uuid,uuid)') is not null
+  and to_regprocedure('ops.settle_retrieval_provider_budget(uuid,uuid)') is not null
+  and to_regprocedure('ops.finalize_retrieval_provider_budget(uuid,uuid,uuid,text,bigint,bigint,integer,bigint,boolean,integer,double precision,text,text)') is not null
+  and to_regprocedure('ops.reap_expired_retrieval_provider_budget(uuid,integer)') is not null
+  and (select relforcerowsecurity from pg_class where oid = 'ops.retrieval_provider_budget_reservations'::regclass)
+  and (select relforcerowsecurity from pg_class where oid = 'ops.retrieval_provider_budget_allocations'::regclass)
+  and (select count(*) = 7 from information_schema.columns
+       where table_schema = 'ops' and table_name = 'retrieval_provider_budget_allocations'
+         and column_name in ('tier','limit_provider_id','limit_tenant_id','limit_region','limit_purpose','limit_tpm_limit','limit_rpm_limit'))
+  and not exists (
+    select 1
+    from (values
+      ('role_gateway'), ('role_private_worker'), ('role_consolidation_worker'), ('role_public_worker'),
+      ('role_retrieval_worker'), ('role_batch_issuer'), ('role_maintenance'), ('role_admin')
+    ) as runtime_role(role_name)
+    cross join (values
+      ('ops.retrieval_provider_budget_reservations'), ('ops.retrieval_provider_budget_allocations')
+    ) as budget_table(table_name)
+    cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE')) as table_privilege(privilege_name)
+    where has_table_privilege(runtime_role.role_name, budget_table.table_name, table_privilege.privilege_name)
+  )
+  and not exists (
+    select 1
+    from (values
+      ('role_gateway'), ('role_private_worker'), ('role_consolidation_worker'), ('role_public_worker'),
+      ('role_retrieval_worker'), ('role_batch_issuer'), ('role_maintenance'), ('role_admin')
+    ) as runtime_role(role_name)
+    cross join (values
+      ('ops.reserve_retrieval_provider_budget(uuid,uuid,text,text,text,text,bigint,bigint)', 'role_retrieval_worker'),
+      ('ops.mark_retrieval_provider_budget_dispatched(uuid,uuid)', 'role_retrieval_worker'),
+      ('ops.settle_retrieval_provider_budget(uuid,uuid)', 'role_retrieval_worker'),
+      ('ops.finalize_retrieval_provider_budget(uuid,uuid,uuid,text,bigint,bigint,integer,bigint,boolean,integer,double precision,text,text)', 'role_retrieval_worker'),
+      ('ops.reap_expired_retrieval_provider_budget(uuid,integer)', 'role_maintenance')
+    ) as budget_function(function_name, allowed_role)
+    where has_function_privilege(runtime_role.role_name, budget_function.function_name, 'EXECUTE')
+      is distinct from (runtime_role.role_name = budget_function.allowed_role)
+  )
+  and not exists (
+    select 1
+    from (values
+      ('ops.reserve_retrieval_provider_budget(uuid,uuid,text,text,text,text,bigint,bigint)'),
+      ('ops.mark_retrieval_provider_budget_dispatched(uuid,uuid)'),
+      ('ops.settle_retrieval_provider_budget(uuid,uuid)'),
+      ('ops.finalize_retrieval_provider_budget(uuid,uuid,uuid,text,bigint,bigint,integer,bigint,boolean,integer,double precision,text,text)'),
+      ('ops.reap_expired_retrieval_provider_budget(uuid,integer)')
+    ) as budget_function(function_name)
+    join pg_proc p on p.oid = to_regprocedure(budget_function.function_name)
+    cross join lateral aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) as function_acl
+    where function_acl.grantee = 0 and function_acl.privilege_type = 'EXECUTE'
+  ) as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Retain provider budget reservations and allocations so the rolling-window and ModelCallLedger trace remain auditable; never delete or reopen terminal allocations."
+backup_restore_requirement = "Production requires approved backup and rollout. Acceptance may write only the isolated 127.0.0.1:61719 guard database with actual retrieval-worker and maintenance logins; provider traffic, credentials, deployment, and production migration remain out of scope."

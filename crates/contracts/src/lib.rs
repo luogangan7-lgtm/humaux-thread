@@ -5,3 +5,5 @@
 
 pub mod config_registry;
 pub mod feature_registry;
+pub mod mechanism_registry;
+pub mod retrieval_config;

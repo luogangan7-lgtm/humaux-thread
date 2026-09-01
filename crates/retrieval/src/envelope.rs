@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::completeness::{
     CannotEstablishReason, CensusResult, CompletenessClass, FreshnessClass, LedgerClosure, classify,
@@ -19,6 +19,8 @@ use crate::completeness::{
 use humaux_domain::context::MandatoryOverflow;
 
 use crate::compiler::ContextOutcome;
+use crate::planner::{PlannerDecision, QueryClass};
+use crate::request::{ProfileFingerprint, RetrievalRequest};
 use humaux_domain::grounding::{GroundingState, GroundingStateKind};
 use humaux_telemetry::degrade::{DegradeCode, Outcome, abstain};
 
@@ -36,33 +38,46 @@ pub enum ExpectedSource {
     None,
 }
 
+/// The universe a pipeline block's counts describe. Projection is always the StreamLedger
+/// universe because it is derived from the fixed stream ledger snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CountScope {
+    AuthorizedView,
+    StreamLedger,
+}
+
 /// §23.3 `pipeline.evidence` block.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EvidenceBlock {
     /// `null` iff `expected_source == None` (§23.1①: "恒等值就是装饰列，不许输出数字充数").
     pub expected: Option<u64>,
     pub expected_source: ExpectedSource,
-    pub persisted: u64,
+    /// `null` means the caller cannot establish a count in this block's declared universe.
+    pub persisted: Option<u64>,
+    pub count_scope: CountScope,
 }
 
 impl EvidenceBlock {
     /// The call carried a `batch_id` whose `begin_batch` transaction A already committed —
     /// `expected` is that batch's ticket count (§23.1①, "一经发放不可回缩").
-    pub fn ticket(expected: u64, persisted: u64) -> Self {
+    pub fn ticket(expected: u64, persisted: Option<u64>, count_scope: CountScope) -> Self {
         Self {
             expected: Some(expected),
             expected_source: ExpectedSource::Ticket,
             persisted,
+            count_scope,
         }
     }
 
     /// The call carried no `batch_id` — `expected` must be `null`, never backfilled from
     /// `persisted` (§23.1①).
-    pub fn no_batch(persisted: u64) -> Self {
+    pub fn no_batch(persisted: Option<u64>, count_scope: CountScope) -> Self {
         Self {
             expected: None,
             expected_source: ExpectedSource::None,
             persisted,
+            count_scope,
         }
     }
 }
@@ -74,10 +89,11 @@ impl EvidenceBlock {
 /// §23.3 `pipeline.knowledge` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct KnowledgeBlock {
-    pub eligible: u64,
-    pub processed: u64,
-    pub waiting_key: u64,
-    pub failed: u64,
+    pub eligible: Option<u64>,
+    pub processed: Option<u64>,
+    pub waiting_key: Option<u64>,
+    pub failed: Option<u64>,
+    pub count_scope: CountScope,
 }
 
 // ============================================================================
@@ -241,13 +257,42 @@ pub(crate) fn assemble_completeness_class(
     census_result: &CensusResult,
     ledger: &LedgerClosure,
     visible: Option<u64>,
-    projection: &ProjectionBlock,
-) -> CompletenessClassWire {
-    let class = classify(planner_output, lane_status, census_result, ledger);
+    pipeline: &PipelineBlock,
+) -> (CompletenessClassWire, Option<CannotEstablishReasonWire>) {
+    let class = final_completeness_class(
+        planner_output,
+        lane_status,
+        census_result,
+        ledger,
+        pipeline,
+        visible,
+        None,
+    );
 
-    let class = if projection.completeness_ratio.is_none()
-        && !matches!(class, CompletenessClass::CannotEstablish { .. })
-    {
+    (class.into(), CannotEstablishReasonWire::from_class(class))
+}
+
+fn final_completeness_class(
+    planner_output: &crate::planner::PlannerDecision,
+    lane_status: LaneStatus,
+    census_result: &CensusResult,
+    ledger: &LedgerClosure,
+    pipeline: &PipelineBlock,
+    visible: Option<u64>,
+    context: Option<&ContextOutcome>,
+) -> CompletenessClass {
+    let classified = classify(planner_output, lane_status, census_result, ledger);
+    // §25.5's final outcome makes a real Mandatory Context overflow the canonical reason even
+    // when §22's pure classifier has already found a different failure. The `PipelineBlock` is
+    // still retained by the caller as the diagnostic record; only the one final wire reason is
+    // prioritized here.
+    if let Some(ContextOutcome::Overflow(overflow)) = context {
+        return crate::completeness::overflow_class(overflow);
+    }
+    if matches!(classified, CompletenessClass::CannotEstablish { .. }) {
+        return classified;
+    }
+    if pipeline.projection.completeness_ratio.is_none() {
         let reason = if !ledger.is_closed() {
             CannotEstablishReason::LedgerNotClosed
         } else if visible.is_none() {
@@ -255,12 +300,12 @@ pub(crate) fn assemble_completeness_class(
         } else {
             CannotEstablishReason::A2OvershootBeyondPending
         };
-        CompletenessClass::CannotEstablish { reason }
-    } else {
-        class
-    };
-
-    class.into()
+        return CompletenessClass::CannotEstablish { reason };
+    }
+    if let Some(reason) = pipeline.count_inconsistency_reason() {
+        return CompletenessClass::CannotEstablish { reason };
+    }
+    classified
 }
 
 // ============================================================================
@@ -274,6 +319,8 @@ pub struct PipelineBlock {
     pub projection: ProjectionBlock,
 }
 
+/// Single pipeline-count admission authority. It never mutates stream state: unknown or
+/// cross-scope values are epistemic limits, not FAILED/LOST rows.
 impl PipelineBlock {
     /// §23.3's pipeline-chaining fixture invariant, named exactly to guard the substitution
     /// mistake §23.3 itself warns about: the chain is `evidence.persisted == knowledge.eligible
@@ -281,8 +328,36 @@ impl PipelineBlock {
     /// actually finished, vs. rows the pipeline considers in scope at all) that nothing else in
     /// this type would catch if swapped in by hand.
     pub fn chaining_consistent(&self) -> bool {
-        self.evidence.persisted == self.knowledge.eligible
-            && self.knowledge.eligible == self.projection.expected
+        self.count_inconsistency_reason().is_none()
+    }
+
+    fn count_inconsistency_reason(&self) -> Option<CannotEstablishReason> {
+        // The assembler may label scopes equal only after it read the same authorized universe
+        // and snapshot; this pure type checks the declared contract, never manufactures it.
+        let (Some(persisted), Some(eligible), Some(processed), Some(waiting_key), Some(failed)) = (
+            self.evidence.persisted,
+            self.knowledge.eligible,
+            self.knowledge.processed,
+            self.knowledge.waiting_key,
+            self.knowledge.failed,
+        ) else {
+            return Some(CannotEstablishReason::CountUnknown);
+        };
+        if self.evidence.count_scope != self.knowledge.count_scope
+            || self.evidence.count_scope != CountScope::StreamLedger
+        {
+            return Some(CannotEstablishReason::CountScopeMismatch);
+        }
+        let knowledge_total = processed
+            .checked_add(waiting_key)
+            .and_then(|total| total.checked_add(failed));
+        if persisted != eligible
+            || eligible != self.projection.expected
+            || knowledge_total != Some(eligible)
+        {
+            return Some(CannotEstablishReason::PipelineCountMismatch);
+        }
+        None
     }
 }
 
@@ -339,6 +414,12 @@ pub enum CannotEstablishReasonWire {
     A2OvershootBeyondPending,
     /// §25.5：Mandatory Context 超硬上限。
     MandatoryContextOverflow,
+    /// A required pipeline count is unknown; it must not be filled from returned/highwater.
+    CountUnknown,
+    /// Pipeline blocks describe different count universes.
+    CountScopeMismatch,
+    /// Known values in the same universe disagree.
+    PipelineCountMismatch,
 }
 
 impl CannotEstablishReasonWire {
@@ -361,6 +442,9 @@ impl CannotEstablishReasonWire {
             "index_count_unavailable" => Some(Self::IndexCountUnavailable),
             "a2_overshoot_beyond_pending" => Some(Self::A2OvershootBeyondPending),
             "mandatory_context_overflow" => Some(Self::MandatoryContextOverflow),
+            "count_unknown" => Some(Self::CountUnknown),
+            "count_scope_mismatch" => Some(Self::CountScopeMismatch),
+            "pipeline_count_mismatch" => Some(Self::PipelineCountMismatch),
             // 到不了：`wire_labels` 是闭集。真到了说明有人加了 reason 变体却没加这里，
             // 那时 `None` 会让新 reason 在 JSON 上静默消失——所以 panic 而不是 None。
             other => unreachable!("未登记的 reason 线值: {other}"),
@@ -387,8 +471,11 @@ pub struct CompletenessBlock {
     /// [`CannotEstablishReasonWire::from_class`] 单点产出。
     pub reason: Option<CannotEstablishReasonWire>,
     /// §22.1 structured enumeration — present iff `class == exact` (§22.0 same-source
-    /// invariant, enforced by [`exact_outcome_block`], the sole legal producer of the pair).
+    /// invariant, enforced by the final envelope outcome producer).
     pub exact: Option<ExactReport>,
+    /// §22.4's known lower bound when the final class is `cannot_establish`. It is copied from
+    /// the actual census outcome, never inferred from rendered body/item length.
+    pub known_lower_bound: Option<u64>,
     pub lanes: BTreeMap<String, LaneStatus>,
     pub candidate_count: u32,
     pub reranked_count: u32,
@@ -425,7 +512,7 @@ impl ExactReport {
     }
 }
 
-/// [`exact_outcome_block`]'s return: wire class + reason + the §22.1 block + §22.4's known
+/// Final/component outcome return: wire class + reason + the §22.1 block + §22.4's known
 /// lower bound, produced together so none of the four can be assembled independently of the
 /// others (the same one-place discipline as [`mandatory_outcome_blocks`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -440,10 +527,68 @@ pub struct ExactOutcome {
     pub known_lower_bound: Option<u64>,
 }
 
-/// §22.0 / §22.1 sole producer of the (`class`, `exact` block) pair — runs the real
-/// [`crate::completeness::classify_for_witness`]-underlying `classify()` path (metrics
-/// counted, §22.5 sole constructor respected) and derives the §22.1 block from the same
-/// [`CensusResult`] the classification consumed.
+/// Borrowed facts required to produce one final, metric-qualified completeness outcome.
+/// The caller retains all diagnostics, including invalid provenance, if this returns an error.
+pub struct CompletenessInputs<'a> {
+    pub lane_status: &'a LaneStatus,
+    pub census: &'a CensusResult,
+    pub ledger: &'a LedgerClosure,
+    pub pipeline: &'a PipelineBlock,
+    pub provenance: &'a ProvenanceBlock,
+    pub visible: Option<u64>,
+    pub context: Option<&'a ContextOutcome>,
+}
+
+/// A fully validated outcome whose final metric is still pending downstream acceptance.
+///
+/// The value cannot be cloned or inspected before [`Self::finish`] consumes it. Dropping this
+/// token deliberately records nothing: an output that did not survive its final schema and
+/// transaction boundary is not a final retrieval result.
+#[must_use = "call PendingEnvelope::finish only after the caller's final acceptance boundary"]
+pub struct PendingEnvelope<T> {
+    value: T,
+    class: CompletenessClass,
+}
+
+impl<T> PendingEnvelope<T> {
+    /// Commits the one observable final classification after the caller has accepted its output.
+    pub fn finish(self) -> T {
+        crate::completeness::record_final_classification(self.class);
+        self.value
+    }
+}
+
+/// The final envelope completeness path. It validates request-bound provenance and produces an
+/// accepted-but-unrecorded outcome. Only [`PendingEnvelope::finish`] records the sole final
+/// metric, after the caller's final schema or transaction boundary succeeds.
+pub fn envelope_outcome_block<T>(
+    request: &RetrievalRequest,
+    inputs: CompletenessInputs<'_>,
+    accept: impl FnOnce(ExactOutcome) -> Result<T, humaux_domain::error::ErrorCode>,
+) -> Result<PendingEnvelope<T>, humaux_domain::error::ErrorCode> {
+    if !inputs.provenance.is_valid(request) {
+        return Err(humaux_domain::error::ErrorCode::Internal);
+    }
+    let class = final_completeness_class(
+        request.planner_decision(),
+        *inputs.lane_status,
+        inputs.census,
+        inputs.ledger,
+        inputs.pipeline,
+        inputs.visible,
+        inputs.context,
+    );
+    let outcome = exact_outcome_from_class(class, inputs.census)?;
+    let value = accept(outcome)?;
+    Ok(PendingEnvelope { value, class })
+}
+
+/// Pure component-level producer of the (`class`, `exact` block) pair, retained only for this
+/// crate's classifier/unit invariants. It intentionally emits no final metric: an exact/census
+/// component has no request-bound provenance, pipeline/A2, or mandatory-context facts and
+/// therefore cannot truthfully report a full Envelope outcome.
+///
+/// Final result reporting must use [`envelope_outcome_block`].
 ///
 /// The one hard error: `class == exact` while the census carries no enumeration is §22.0's
 /// frozen invariant violation ("出现 `class=exact` 而 `predicate_id=null` 是不变量违反，直接
@@ -453,13 +598,21 @@ pub struct ExactOutcome {
 /// Conversely a non-`exact` class never emits the block — an enumeration attached to a
 /// `cannot_establish` answer would be a second, contradicting completeness claim; the census's
 /// count survives only as `known_lower_bound` (§22.4).
-pub fn exact_outcome_block(
+#[cfg(test)]
+pub(crate) fn component_exact_outcome(
     planner_output: &crate::planner::PlannerDecision,
     lane_status: LaneStatus,
     census: &crate::completeness::CensusResult,
     ledger: &crate::completeness::LedgerClosure,
 ) -> Result<ExactOutcome, humaux_domain::error::ErrorCode> {
     let class = crate::completeness::classify(planner_output, lane_status, census, ledger);
+    exact_outcome_from_class(class, census)
+}
+
+pub(crate) fn exact_outcome_from_class(
+    class: CompletenessClass,
+    census: &crate::completeness::CensusResult,
+) -> Result<ExactOutcome, humaux_domain::error::ErrorCode> {
     let reason = CannotEstablishReasonWire::from_class(class);
     let wire = CompletenessClassWire::from(class);
     let exact = match (wire, census.enumeration()) {
@@ -477,12 +630,13 @@ pub fn exact_outcome_block(
     } else {
         None
     };
-    Ok(ExactOutcome {
+    let outcome = ExactOutcome {
         class: wire,
         reason,
         exact,
         known_lower_bound,
-    })
+    };
+    Ok(outcome)
 }
 
 impl CompletenessBlock {
@@ -530,36 +684,78 @@ pub struct ProfileBlock {
     pub lanes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status", deny_unknown_fields)]
+pub enum ProvenanceValue {
+    Used { id: String },
+    NotApplicable {},
+    CannotEstablish {},
+}
+
+impl ProvenanceValue {
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Used { id } => {
+                let id = id.trim();
+                !id.is_empty()
+                    && !matches!(
+                        id.to_ascii_lowercase().as_str(),
+                        "none" | "n/a" | "n-a" | "unknown" | "null"
+                    )
+            }
+            Self::NotApplicable {} => true,
+            Self::CannotEstablish {} => false,
+        }
+    }
+
+    fn is_not_applicable(&self) -> bool {
+        matches!(self, Self::NotApplicable {})
+    }
+}
+
 /// §23.3 `provenance` block — "在所有模式下都必须完整，不允许裁剪" (§23.1③). The six required
 /// fields are named verbatim in §23.4 G23-6; `profile` is a nested block, not one of the six.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProvenanceBlock {
     pub binary_build: String,
-    pub projection_version: String,
-    pub embedding_model_id: String,
-    pub rerank_model_id: String,
-    pub card_builder_version: String,
-    // TODO(§55.1 build_request): `profile_fingerprint` is a bare `String` today — G23-6's
-    // `is_valid()` below only checks non-empty, so a fabricated string (not §55's canonical
-    // sha256 of the retrieval request) passes. `architecture-check`'s own §55.1 G80-2
-    // (`build_request` sole construction point) currently reports `not_applicable` — nothing
-    // covers this field's provenance from either end yet. Once `build_request` lands, this
-    // must become a newtype it alone mints (§78.2 — no stringly-typed domain), not a free
-    // `String` any caller can populate by hand.
-    pub profile_fingerprint: String,
+    pub projection_version: ProvenanceValue,
+    pub embedding_model_id: ProvenanceValue,
+    pub rerank_model_id: ProvenanceValue,
+    pub card_builder_version: ProvenanceValue,
+    /// Minted only by the sole request constructor; cannot be populated from a raw string.
+    pub profile_fingerprint: ProfileFingerprint,
     pub profile: ProfileBlock,
 }
 
 impl ProvenanceBlock {
-    /// G23-6: any of the six required fields empty ⇒ the whole result is invalid and must not
-    /// enter any statistic (§23.4).
-    pub fn is_valid(&self) -> bool {
-        !self.binary_build.is_empty()
-            && !self.projection_version.is_empty()
-            && !self.embedding_model_id.is_empty()
-            && !self.rerank_model_id.is_empty()
-            && !self.card_builder_version.is_empty()
-            && !self.profile_fingerprint.is_empty()
+    /// G23-6's sole validity gate: the identities and effective profile must belong to the
+    /// request actually executed. Unknown provenance never enters result statistics.
+    #[must_use]
+    pub fn is_valid(&self, request: &RetrievalRequest) -> bool {
+        if self.binary_build.trim().is_empty()
+            || self.profile_fingerprint != *request.profile_fingerprint_identity()
+            || self.profile.top_k != request.top_k()
+            || self.profile.cand_k != request.cand_k()
+            || matches!(request.planner_decision(), PlannerDecision::CannotEstablish)
+        {
+            return false;
+        }
+        let values = [
+            &self.projection_version,
+            &self.embedding_model_id,
+            &self.rerank_model_id,
+            &self.card_builder_version,
+        ];
+        let structured_read = matches!(
+            request.planner_decision(),
+            PlannerDecision::DirectGet(_)
+                | PlannerDecision::Enumerate { .. }
+                | PlannerDecision::Class(QueryClass::Continuity)
+        );
+        values.into_iter().all(ProvenanceValue::is_valid)
+            && (structured_read
+                || (!self.projection_version.is_not_applicable()
+                    && !self.embedding_model_id.is_not_applicable()))
     }
 }
 
@@ -717,7 +913,7 @@ pub enum MandatoryReport {
     NotRun,
     /// 装配成功。
     Assembled {
-        /// 各 selector 独立 COUNT 之和。
+        /// 各可用 selector 独立授权候选集合的并集基数。
         expected: u64,
         /// 实际进入 Context 的条数（从装配结果数出来，不是输入字段照抄）。
         returned: u64,
@@ -877,20 +1073,19 @@ mod tests {
     ///
     /// 注错：让 `mandatory_outcome_blocks` 的 Overflow 臂返回 `SemanticBounded` ⇒ 本条红；
     /// 让它返回 `None` reason ⇒ 也红。两个面必须同时对。
-    #[test]
-    fn overflow_turns_class_and_reason_and_mandatory_block_together() {
+    fn overflow_context_outcome() -> ContextOutcome {
         use humaux_domain::authority::MemoryId;
         use humaux_domain::context::{
             ContextBudget, MandatoryRow, PinnedLane, SelectorId, SelectorOutcome, spec,
         };
 
-        let sp = spec(SelectorId::ProjectActiveConstraintsV1);
-        let rows: Vec<MandatoryRow> = (0..2)
+        let selector = spec(SelectorId::ProjectActiveConstraintsV1);
+        let rows: Vec<humaux_domain::context::MandatoryRow> = (0..2)
             .map(|_| {
                 match MandatoryRow::from_selector(
-                    sp,
+                    selector,
                     MemoryId::new(),
-                    sp.min_authority,
+                    selector.min_authority,
                     80,
                     humaux_domain::grounding::RowGrounding::Judged(
                         humaux_domain::grounding::derive_grounding_state(
@@ -898,11 +1093,11 @@ mod tests {
                         ),
                     ),
                 )
-                .expect("min_authority 达标")
+                .expect("min_authority")
                 {
-                    humaux_domain::context::Admitted::Row(r) => r,
-                    humaux_domain::context::Admitted::NeedsVerification(nv) => {
-                        panic!("CURRENT 行不该被分流: {nv:?}")
+                    humaux_domain::context::Admitted::Row(row) => row,
+                    humaux_domain::context::Admitted::NeedsVerification(value) => {
+                        panic!("CURRENT: {value:?}")
                     }
                 }
             })
@@ -910,42 +1105,47 @@ mod tests {
         let lane = humaux_domain::context::MandatoryLane::from_selectors([
             SelectorOutcome::Ran {
                 id: SelectorId::TaskExplicitContextV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
-                expected: 2,
+                candidate_ids: rows.iter().map(|row| row.memory_id()).collect(),
                 rows,
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
-        ]);
+        ])
+        .expect("selector outcomes");
         let pinned = PinnedLane::new(0, vec![], vec![]);
         let overflow = ContextBudget::new(500, 100)
             .expect("budget")
             .reserve(&lane, &pinned)
-            .expect_err("80 + 80 > 100，必须溢出");
+            .expect_err("80 + 80 > 100");
+        ContextOutcome::Overflow(overflow)
+    }
 
-        let outcome = ContextOutcome::Overflow(overflow);
+    #[test]
+    fn overflow_turns_class_and_reason_and_mandatory_block_together() {
+        let outcome = overflow_context_outcome();
         let (class, reason, report) = mandatory_outcome_blocks(&outcome, 2);
 
         assert_eq!(class, CompletenessClassWire::CannotEstablish);
@@ -979,10 +1179,194 @@ mod tests {
             v.get("returned").and_then(serde_json::Value::as_u64),
             Some(0)
         );
+
+        // The final outcome keeps this manifest-carrying overflow as cannot_establish and
+        // cannot emit an Exact block before recording its one final metric.
+        use crate::completeness::take_final_record_trace;
+        let request = provenance_request("all rejected", 5, true);
+        let ledger = closed(LedgerReads {
+            expected: 1,
+            done: 1,
+            deleted: 0,
+            skipped: 0,
+            open_gaps: 0,
+            pending: 0,
+        });
+        let pipeline = PipelineBlock {
+            evidence: EvidenceBlock::no_batch(Some(1), CountScope::StreamLedger),
+            knowledge: KnowledgeBlock {
+                eligible: Some(1),
+                processed: Some(1),
+                waiting_key: Some(0),
+                failed: Some(0),
+                count_scope: CountScope::StreamLedger,
+            },
+            projection: build_projection_block(&ledger, Some(1)).value,
+        };
+        assert!(take_final_record_trace().is_empty());
+        let final_out = envelope_outcome_block(
+            &request,
+            CompletenessInputs {
+                lane_status: &LaneStatus::Ok,
+                census: &CensusResult::ok_without_enumeration(),
+                ledger: &ledger,
+                pipeline: &pipeline,
+                provenance: &full_provenance(),
+                visible: Some(1),
+                context: Some(&outcome),
+            },
+            Ok,
+        )
+        .unwrap()
+        .finish();
+        assert_eq!(final_out.class, CompletenessClassWire::CannotEstablish);
+        assert_eq!(
+            final_out.reason,
+            Some(CannotEstablishReasonWire::MandatoryContextOverflow)
+        );
+        assert!(final_out.exact.is_none());
+        assert_eq!(
+            take_final_record_trace(),
+            vec![("cannot_establish", "mandatory_context_overflow")]
+        );
     }
 
     /// 反向对照：装配成功时 reason 为 None、mandatory 报 assembled 且 overflow=false。
     /// 没有这条，上面那条可能因为「恒返回 overflow」而绿。
+    #[test]
+    fn final_overflow_prioritizes_reason_over_broken_ledger_and_keeps_census_lower_bound() {
+        use crate::completeness::{ExactEnumeration, take_final_record_trace};
+
+        let request = provenance_request("all rejected", 5, true);
+        let ledger = ledger::close(LedgerReads {
+            expected: 2,
+            done: 1,
+            deleted: 0,
+            skipped: 0,
+            open_gaps: 0,
+            pending: 0,
+        });
+        assert!(
+            !ledger.is_closed(),
+            "fixture must preserve the broken A1 diagnostic"
+        );
+        let pipeline = PipelineBlock {
+            evidence: EvidenceBlock::no_batch(Some(2), CountScope::StreamLedger),
+            knowledge: KnowledgeBlock {
+                eligible: Some(2),
+                processed: Some(2),
+                waiting_key: Some(0),
+                failed: Some(0),
+                count_scope: CountScope::StreamLedger,
+            },
+            projection: build_projection_block(&ledger, Some(1)).value,
+        };
+        assert!(
+            pipeline.projection.completeness_ratio.is_none(),
+            "broken projection stays attached as a diagnostic instead of being rewritten"
+        );
+        let census = CensusResult::enumerated(ExactEnumeration::new("p", 3, 2, 0).unwrap());
+        let overflow = overflow_context_outcome();
+        assert!(take_final_record_trace().is_empty());
+        let out = envelope_outcome_block(
+            &request,
+            CompletenessInputs {
+                lane_status: &LaneStatus::Ok,
+                census: &census,
+                ledger: &ledger,
+                pipeline: &pipeline,
+                provenance: &full_provenance(),
+                visible: Some(1),
+                context: Some(&overflow),
+            },
+            Ok,
+        )
+        .unwrap()
+        .finish();
+        assert_eq!(out.class, CompletenessClassWire::CannotEstablish);
+        assert_eq!(
+            out.reason,
+            Some(CannotEstablishReasonWire::MandatoryContextOverflow)
+        );
+        assert!(out.exact.is_none());
+        assert_eq!(out.known_lower_bound, Some(2));
+        assert_eq!(
+            take_final_record_trace(),
+            vec![("cannot_establish", "mandatory_context_overflow")],
+            "the combined failure records exactly one final, prioritized result"
+        );
+
+        let block = CompletenessBlock {
+            class: out.class,
+            reason: out.reason,
+            exact: out.exact.clone(),
+            known_lower_bound: out.known_lower_bound,
+            lanes: BTreeMap::new(),
+            candidate_count: 0,
+            reranked_count: 0,
+            returned: 0,
+            truncated: false,
+            degradations: vec![],
+        };
+        assert_eq!(
+            serde_json::to_value(block)
+                .unwrap()
+                .get("known_lower_bound")
+                .and_then(serde_json::Value::as_u64),
+            Some(2),
+            "CompletenessBlock carries the actual census lower bound, never body length"
+        );
+    }
+
+    #[test]
+    fn broken_ledger_without_overflow_keeps_its_own_reason() {
+        use crate::completeness::{ExactEnumeration, take_final_record_trace};
+
+        let request = provenance_request("all rejected", 5, true);
+        let ledger = ledger::close(LedgerReads {
+            expected: 2,
+            done: 1,
+            deleted: 0,
+            skipped: 0,
+            open_gaps: 0,
+            pending: 0,
+        });
+        let pipeline = PipelineBlock {
+            evidence: EvidenceBlock::no_batch(Some(2), CountScope::StreamLedger),
+            knowledge: KnowledgeBlock {
+                eligible: Some(2),
+                processed: Some(2),
+                waiting_key: Some(0),
+                failed: Some(0),
+                count_scope: CountScope::StreamLedger,
+            },
+            projection: build_projection_block(&ledger, Some(1)).value,
+        };
+        let census = CensusResult::enumerated(ExactEnumeration::new("p", 3, 2, 0).unwrap());
+        assert!(take_final_record_trace().is_empty());
+        let out = envelope_outcome_block(
+            &request,
+            CompletenessInputs {
+                lane_status: &LaneStatus::Ok,
+                census: &census,
+                ledger: &ledger,
+                pipeline: &pipeline,
+                provenance: &full_provenance(),
+                visible: Some(1),
+                context: None,
+            },
+            Ok,
+        )
+        .unwrap()
+        .finish();
+        assert_eq!(out.reason, Some(CannotEstablishReasonWire::LedgerNotClosed));
+        assert_eq!(out.known_lower_bound, Some(2));
+        assert_eq!(
+            take_final_record_trace(),
+            vec![("cannot_establish", "ledger_not_closed")]
+        );
+    }
+
     #[test]
     fn a_compiled_context_reports_no_reason_and_no_overflow() {
         use humaux_domain::context::{ContextBudget, PinnedLane, SelectorId, SelectorOutcome};
@@ -990,35 +1374,36 @@ mod tests {
         let lane = humaux_domain::context::MandatoryLane::from_selectors([
             SelectorOutcome::Ran {
                 id: SelectorId::TaskExplicitContextV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ProjectActiveConstraintsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::UserConfirmedCorrectionsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::RequiredCurrentStateFacetsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
             SelectorOutcome::Ran {
                 id: SelectorId::ExplicitMandatoryBindingsV1,
-                expected: 0,
+                candidate_ids: vec![],
                 rows: vec![],
                 needs_verification: vec![],
             },
-        ]);
+        ])
+        .expect("selector outcomes");
         let pinned = PinnedLane::new(0, vec![], vec![]);
         let budget = ContextBudget::new(100, 50)
             .expect("budget")
@@ -1045,6 +1430,15 @@ mod tests {
             (
                 CannotEstablishReason::MandatoryContextOverflow,
                 "mandatory_context_overflow",
+            ),
+            (CannotEstablishReason::CountUnknown, "count_unknown"),
+            (
+                CannotEstablishReason::CountScopeMismatch,
+                "count_scope_mismatch",
+            ),
+            (
+                CannotEstablishReason::PipelineCountMismatch,
+                "pipeline_count_mismatch",
             ),
         ] {
             let class = CompletenessClass::CannotEstablish {
@@ -1085,6 +1479,7 @@ mod tests {
             class: CompletenessClassWire::CannotEstablish,
             reason: Some(CannotEstablishReasonWire::MandatoryContextOverflow),
             exact: None,
+            known_lower_bound: None,
             lanes: BTreeMap::new(),
             candidate_count: 0,
             reranked_count: 0,
@@ -1102,6 +1497,11 @@ mod tests {
             v.get("reason").and_then(serde_json::Value::as_str),
             Some("mandatory_context_overflow"),
             "reason 必须是顶层平级 key: {v}"
+        );
+        assert_eq!(
+            v.get("known_lower_bound"),
+            Some(&serde_json::Value::Null),
+            "non-census cannot_establish keeps the lower bound explicitly null"
         );
     }
 
@@ -1226,12 +1626,13 @@ mod tests {
         // (evidence.persisted == knowledge.eligible == projection.expected — NOT
         // knowledge.processed, §23.3's own callout) and the completeness/profile trio.
         let pipeline = PipelineBlock {
-            evidence: EvidenceBlock::ticket(98, 98),
+            evidence: EvidenceBlock::ticket(98, Some(98), CountScope::StreamLedger),
             knowledge: KnowledgeBlock {
-                eligible: 98,
-                processed: 95,
-                waiting_key: 1,
-                failed: 2,
+                eligible: Some(98),
+                processed: Some(95),
+                waiting_key: Some(1),
+                failed: Some(2),
+                count_scope: CountScope::StreamLedger,
             },
             projection: *b,
         };
@@ -1243,12 +1644,32 @@ mod tests {
         // the chain — proves the invariant actually reads the right field.
         let wrong_chain = PipelineBlock {
             knowledge: KnowledgeBlock {
-                eligible: 95, // would-be mistake: processed's value, not eligible's
+                eligible: Some(95), // would-be mistake: processed's value, not eligible's
                 ..pipeline.knowledge
             },
             ..pipeline.clone()
         };
         assert!(!wrong_chain.chaining_consistent());
+
+        let cross_scope = PipelineBlock {
+            evidence: EvidenceBlock::no_batch(Some(98), CountScope::AuthorizedView),
+            ..pipeline.clone()
+        };
+        assert_eq!(
+            cross_scope.count_inconsistency_reason(),
+            Some(CannotEstablishReason::CountScopeMismatch)
+        );
+        assert!(!cross_scope.chaining_consistent());
+
+        let unknown = PipelineBlock {
+            evidence: EvidenceBlock::no_batch(None, CountScope::AuthorizedView),
+            ..pipeline.clone()
+        };
+        assert_eq!(
+            unknown.count_inconsistency_reason(),
+            Some(CannotEstablishReason::CountUnknown)
+        );
+        assert!(!unknown.chaining_consistent());
 
         let profile = ProfileBlock {
             top_k: 20,
@@ -1261,6 +1682,7 @@ mod tests {
             // 非 cannot_establish 的 class 没有 reason（见 CannotEstablishReasonWire）。
             reason: None,
             exact: None,
+            known_lower_bound: None,
             lanes: BTreeMap::new(),
             candidate_count: 100,
             reranked_count: 100,
@@ -1349,15 +1771,29 @@ mod tests {
         });
         let out = build_projection_block(&ledger, None);
         assert_eq!(out.value.completeness_ratio, None, "fixture precondition");
-        let class = assemble_completeness_class(
+        let (class, reason) = assemble_completeness_class(
             &PlannerDecision::Class(crate::planner::QueryClass::Semantic),
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
             &ledger,
             None,
-            &out.value,
+            &PipelineBlock {
+                evidence: EvidenceBlock::no_batch(Some(100), CountScope::StreamLedger),
+                knowledge: KnowledgeBlock {
+                    eligible: Some(100),
+                    processed: Some(100),
+                    waiting_key: Some(0),
+                    failed: Some(0),
+                    count_scope: CountScope::StreamLedger,
+                },
+                projection: out.value,
+            },
         );
         assert_eq!(class, CompletenessClassWire::CannotEstablish);
+        assert_eq!(
+            reason,
+            Some(CannotEstablishReasonWire::IndexCountUnavailable)
+        );
     }
 
     #[test]
@@ -1373,15 +1809,29 @@ mod tests {
         });
         let out = build_projection_block(&ledger, Some(98)); // over=8 > pending(5)
         assert_eq!(out.value.completeness_ratio, None, "fixture precondition");
-        let class = assemble_completeness_class(
+        let (class, reason) = assemble_completeness_class(
             &PlannerDecision::Class(crate::planner::QueryClass::Semantic),
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
             &ledger,
             Some(98),
-            &out.value,
+            &PipelineBlock {
+                evidence: EvidenceBlock::no_batch(Some(100), CountScope::StreamLedger),
+                knowledge: KnowledgeBlock {
+                    eligible: Some(100),
+                    processed: Some(90),
+                    waiting_key: Some(5),
+                    failed: Some(5),
+                    count_scope: CountScope::StreamLedger,
+                },
+                projection: out.value,
+            },
         );
         assert_eq!(class, CompletenessClassWire::CannotEstablish);
+        assert_eq!(
+            reason,
+            Some(CannotEstablishReasonWire::A2OvershootBeyondPending)
+        );
     }
 
     #[test]
@@ -1400,15 +1850,404 @@ mod tests {
             out.value.completeness_ratio.is_some(),
             "fixture precondition"
         );
-        let class = assemble_completeness_class(
+        let (class, reason) = assemble_completeness_class(
             &PlannerDecision::Class(crate::planner::QueryClass::Semantic),
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
             &ledger,
             Some(90),
-            &out.value,
+            &PipelineBlock {
+                evidence: EvidenceBlock::no_batch(Some(100), CountScope::StreamLedger),
+                knowledge: KnowledgeBlock {
+                    eligible: Some(100),
+                    processed: Some(100),
+                    waiting_key: Some(0),
+                    failed: Some(0),
+                    count_scope: CountScope::StreamLedger,
+                },
+                projection: out.value,
+            },
         );
         assert_eq!(class, CompletenessClassWire::SemanticBounded);
+        assert_eq!(reason, None);
+    }
+
+    fn exact_pipeline_fixture() -> (LedgerClosure, PipelineBlock, CensusResult) {
+        use crate::completeness::ExactEnumeration;
+
+        let ledger = closed(LedgerReads {
+            expected: 100,
+            done: 100,
+            deleted: 0,
+            skipped: 0,
+            open_gaps: 0,
+            pending: 0,
+        });
+        let pipeline = PipelineBlock {
+            evidence: EvidenceBlock::no_batch(Some(100), CountScope::StreamLedger),
+            knowledge: KnowledgeBlock {
+                eligible: Some(100),
+                processed: Some(100),
+                waiting_key: Some(0),
+                failed: Some(0),
+                count_scope: CountScope::StreamLedger,
+            },
+            projection: build_projection_block(&ledger, Some(100)).value,
+        };
+        let census = CensusResult::enumerated(ExactEnumeration::new("p", 100, 100, 0).unwrap());
+        (ledger, pipeline, census)
+    }
+
+    fn pipeline_count_failure_cases(
+        base: &PipelineBlock,
+    ) -> Vec<(PipelineBlock, CannotEstablishReasonWire)> {
+        let mut cases = vec![
+            (
+                PipelineBlock {
+                    evidence: EvidenceBlock::no_batch(None, CountScope::StreamLedger),
+                    ..base.clone()
+                },
+                CannotEstablishReasonWire::CountUnknown,
+            ),
+            (
+                PipelineBlock {
+                    evidence: EvidenceBlock::no_batch(Some(100), CountScope::AuthorizedView),
+                    ..base.clone()
+                },
+                CannotEstablishReasonWire::CountScopeMismatch,
+            ),
+            (
+                PipelineBlock {
+                    knowledge: KnowledgeBlock {
+                        eligible: Some(99),
+                        ..base.knowledge
+                    },
+                    ..base.clone()
+                },
+                CannotEstablishReasonWire::PipelineCountMismatch,
+            ),
+            (
+                PipelineBlock {
+                    knowledge: KnowledgeBlock {
+                        processed: Some(99),
+                        ..base.knowledge
+                    },
+                    ..base.clone()
+                },
+                CannotEstablishReasonWire::PipelineCountMismatch,
+            ),
+            (
+                PipelineBlock {
+                    knowledge: KnowledgeBlock {
+                        processed: Some(u64::MAX),
+                        waiting_key: Some(1),
+                        failed: Some(0),
+                        ..base.knowledge
+                    },
+                    ..base.clone()
+                },
+                CannotEstablishReasonWire::PipelineCountMismatch,
+            ),
+        ];
+        for field in ["eligible", "processed", "waiting_key", "failed"] {
+            let mut knowledge = base.knowledge;
+            match field {
+                "eligible" => knowledge.eligible = None,
+                "processed" => knowledge.processed = None,
+                "waiting_key" => knowledge.waiting_key = None,
+                "failed" => knowledge.failed = None,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                serde_json::to_value(knowledge).unwrap().get(field),
+                Some(&serde_json::Value::Null),
+                "unknown knowledge {field} stays JSON null"
+            );
+            cases.push((
+                PipelineBlock {
+                    knowledge,
+                    ..base.clone()
+                },
+                CannotEstablishReasonWire::CountUnknown,
+            ));
+        }
+        cases
+    }
+
+    #[test]
+    fn exact_pipeline_fixture_keeps_no_batch_expected_null_and_exact_precondition() {
+        use crate::planner::PlannerDecision;
+
+        let (ledger, base, census) = exact_pipeline_fixture();
+        assert_eq!(base.evidence.expected, None, "no batch keeps expected null");
+        assert!(
+            base.chaining_consistent(),
+            "no-batch expected=null is legitimate when the count chain is known"
+        );
+        assert_eq!(
+            serde_json::to_value(&base.evidence)
+                .unwrap()
+                .get("expected")
+                .cloned(),
+            Some(serde_json::Value::Null),
+            "the wire preserves no-batch expected as JSON null"
+        );
+        let evidence_unknown_json =
+            serde_json::to_value(EvidenceBlock::no_batch(None, CountScope::StreamLedger)).unwrap();
+        assert_eq!(
+            evidence_unknown_json.get("persisted"),
+            Some(&serde_json::Value::Null),
+            "unknown persisted stays JSON null"
+        );
+        assert_eq!(
+            classify(
+                &PlannerDecision::Enumerate {
+                    predicate_id: "p".to_string(),
+                },
+                LaneStatus::Ok,
+                &census,
+                &ledger,
+            ),
+            CompletenessClass::Exact,
+            "the count gate, not a census failure, downgrades this fixture"
+        );
+    }
+
+    #[test]
+    fn assemble_rejects_each_pipeline_count_failure_from_a_real_exact_census() {
+        use crate::planner::PlannerDecision;
+
+        let (ledger, base, census) = exact_pipeline_fixture();
+        for (pipeline, expected_reason) in pipeline_count_failure_cases(&base) {
+            assert!(
+                !pipeline.chaining_consistent(),
+                "a failed pipeline count gate cannot chain"
+            );
+            let (class, reason) = assemble_completeness_class(
+                &PlannerDecision::Enumerate {
+                    predicate_id: "p".to_string(),
+                },
+                LaneStatus::Ok,
+                &census,
+                &ledger,
+                Some(100),
+                &pipeline,
+            );
+            assert_eq!(class, CompletenessClassWire::CannotEstablish);
+            assert_eq!(reason, Some(expected_reason));
+        }
+    }
+
+    fn valid_final_exact_outcome<T>(
+        accept: impl FnOnce(ExactOutcome) -> Result<T, humaux_domain::error::ErrorCode>,
+    ) -> Result<PendingEnvelope<T>, humaux_domain::error::ErrorCode> {
+        let request = provenance_request("all rejected", 5, true);
+        let ledger = closed(LedgerReads {
+            expected: 1,
+            done: 1,
+            deleted: 0,
+            skipped: 0,
+            open_gaps: 0,
+            pending: 0,
+        });
+        let pipeline = PipelineBlock {
+            evidence: EvidenceBlock::no_batch(Some(1), CountScope::StreamLedger),
+            knowledge: KnowledgeBlock {
+                eligible: Some(1),
+                processed: Some(1),
+                waiting_key: Some(0),
+                failed: Some(0),
+                count_scope: CountScope::StreamLedger,
+            },
+            projection: build_projection_block(&ledger, Some(1)).value,
+        };
+        let census = CensusResult::enumerated(
+            crate::completeness::ExactEnumeration::new("p", 1, 1, 0).unwrap(),
+        );
+        envelope_outcome_block(
+            &request,
+            CompletenessInputs {
+                lane_status: &LaneStatus::Ok,
+                census: &census,
+                ledger: &ledger,
+                pipeline: &pipeline,
+                provenance: &full_provenance(),
+                visible: Some(1),
+                context: None,
+            },
+            accept,
+        )
+    }
+
+    #[test]
+    fn final_outcome_records_once_only_after_a_real_exact_passes_every_gate() {
+        use crate::completeness::take_final_record_trace;
+        assert!(take_final_record_trace().is_empty());
+        let pending = valid_final_exact_outcome(Ok).unwrap();
+        assert!(take_final_record_trace().is_empty());
+        let out = pending.finish();
+        assert_eq!(out.class, CompletenessClassWire::Exact);
+        assert!(out.exact.is_some());
+        assert_eq!(take_final_record_trace(), vec![("exact", "none")]);
+    }
+
+    #[test]
+    fn final_outcome_accept_failure_and_unfinished_pending_record_nothing() {
+        use crate::completeness::take_final_record_trace;
+        assert!(take_final_record_trace().is_empty());
+        assert!(matches!(
+            valid_final_exact_outcome(|_| Err::<(), _>(humaux_domain::error::ErrorCode::Internal)),
+            Err(humaux_domain::error::ErrorCode::Internal)
+        ));
+        assert!(take_final_record_trace().is_empty());
+
+        let pending = valid_final_exact_outcome(|_| Ok::<(), humaux_domain::error::ErrorCode>(()))
+            .expect("all final Envelope gates pass before a caller chooses to finish");
+        assert!(take_final_record_trace().is_empty());
+        drop(pending);
+        assert!(take_final_record_trace().is_empty());
+    }
+
+    #[test]
+    fn final_outcome_rejects_unknown_counts_and_invalid_provenance_without_exact_recording() {
+        use crate::completeness::{ExactEnumeration, take_final_record_trace};
+        let request = provenance_request("all rejected", 5, true);
+        let ledger = closed(LedgerReads {
+            expected: 1,
+            done: 1,
+            deleted: 0,
+            skipped: 0,
+            open_gaps: 0,
+            pending: 0,
+        });
+        let census = CensusResult::enumerated(ExactEnumeration::new("p", 1, 1, 0).unwrap());
+        let pipeline = PipelineBlock {
+            evidence: EvidenceBlock::no_batch(None, CountScope::StreamLedger),
+            knowledge: KnowledgeBlock {
+                eligible: Some(1),
+                processed: Some(1),
+                waiting_key: Some(0),
+                failed: Some(0),
+                count_scope: CountScope::StreamLedger,
+            },
+            projection: build_projection_block(&ledger, Some(1)).value,
+        };
+        assert!(take_final_record_trace().is_empty());
+        let out = envelope_outcome_block(
+            &request,
+            CompletenessInputs {
+                lane_status: &LaneStatus::Ok,
+                census: &census,
+                ledger: &ledger,
+                pipeline: &pipeline,
+                provenance: &full_provenance(),
+                visible: Some(1),
+                context: None,
+            },
+            Ok,
+        )
+        .unwrap()
+        .finish();
+        assert_eq!(out.class, CompletenessClassWire::CannotEstablish);
+        assert_eq!(out.reason, Some(CannotEstablishReasonWire::CountUnknown));
+        assert!(out.exact.is_none());
+        assert_eq!(
+            take_final_record_trace(),
+            vec![("cannot_establish", "count_unknown")]
+        );
+
+        let cross_scope = PipelineBlock {
+            evidence: EvidenceBlock::no_batch(Some(1), CountScope::AuthorizedView),
+            ..pipeline.clone()
+        };
+        assert!(take_final_record_trace().is_empty());
+        let cross_scope_out = envelope_outcome_block(
+            &request,
+            CompletenessInputs {
+                lane_status: &LaneStatus::Ok,
+                census: &census,
+                ledger: &ledger,
+                pipeline: &cross_scope,
+                provenance: &full_provenance(),
+                visible: Some(1),
+                context: None,
+            },
+            Ok,
+        )
+        .unwrap()
+        .finish();
+        assert_eq!(
+            cross_scope_out.reason,
+            Some(CannotEstablishReasonWire::CountScopeMismatch)
+        );
+        assert_eq!(
+            take_final_record_trace(),
+            vec![("cannot_establish", "count_scope_mismatch")]
+        );
+
+        let mut invalid = full_provenance();
+        invalid.binary_build.clear();
+        assert!(take_final_record_trace().is_empty());
+        assert!(matches!(
+            envelope_outcome_block(
+                &request,
+                CompletenessInputs {
+                    lane_status: &LaneStatus::Ok,
+                    census: &census,
+                    ledger: &ledger,
+                    pipeline: &pipeline,
+                    provenance: &invalid,
+                    visible: Some(1),
+                    context: None,
+                },
+                Ok::<_, humaux_domain::error::ErrorCode>,
+            ),
+            Err(humaux_domain::error::ErrorCode::Internal)
+        ));
+        assert!(take_final_record_trace().is_empty());
+    }
+
+    #[test]
+    fn final_exact_without_enumeration_is_an_error_and_never_records() {
+        use crate::completeness::take_final_record_trace;
+        let request = provenance_request("all rejected", 5, true);
+        let ledger = closed(LedgerReads {
+            expected: 1,
+            done: 1,
+            deleted: 0,
+            skipped: 0,
+            open_gaps: 0,
+            pending: 0,
+        });
+        let pipeline = PipelineBlock {
+            evidence: EvidenceBlock::no_batch(Some(1), CountScope::StreamLedger),
+            knowledge: KnowledgeBlock {
+                eligible: Some(1),
+                processed: Some(1),
+                waiting_key: Some(0),
+                failed: Some(0),
+                count_scope: CountScope::StreamLedger,
+            },
+            projection: build_projection_block(&ledger, Some(1)).value,
+        };
+        assert!(take_final_record_trace().is_empty());
+        assert!(matches!(
+            envelope_outcome_block(
+                &request,
+                CompletenessInputs {
+                    lane_status: &LaneStatus::Ok,
+                    census: &CensusResult::ok_without_enumeration(),
+                    ledger: &ledger,
+                    pipeline: &pipeline,
+                    provenance: &full_provenance(),
+                    visible: Some(1),
+                    context: None,
+                },
+                Ok::<_, humaux_domain::error::ErrorCode>,
+            ),
+            Err(humaux_domain::error::ErrorCode::Internal)
+        ));
+        assert!(take_final_record_trace().is_empty());
     }
 
     /// A2 `>` side within `pending` — normal in-flight write, not a loss, ratio still
@@ -1486,6 +2325,7 @@ mod tests {
             // 非 cannot_establish 的 class 没有 reason（见 CannotEstablishReasonWire）。
             reason: None,
             exact: None,
+            known_lower_bound: None,
             lanes: BTreeMap::new(),
             candidate_count: candidate,
             reranked_count: reranked,
@@ -1515,37 +2355,188 @@ mod tests {
 
     // ---- ProvenanceBlock / G23-6 ----
 
+    fn provenance_request(query: &str, top_k: u32, enumerable: bool) -> RetrievalRequest {
+        use crate::predicate_registry::{PredicateRow, load_registry};
+        use crate::request::{
+            RetrievalIntent, build_request, resolve_registered_retrieval_profile,
+        };
+        use std::collections::BTreeSet;
+
+        let scope = "private.memory_records WHERE tenant_id = $1 AND visibility_workspace_id = $2";
+        let columns = ["memory_type", "superseded_at", "visibility_workspace_id"];
+        let registry = load_registry(vec![PredicateRow {
+            predicate_id: "rejected_decisions_v1".to_string(),
+            sql_predicate: "memory_type='REJECTION' AND superseded_at IS NULL".to_string(),
+            required_columns: columns.map(str::to_string).to_vec(),
+            enumerable_scope: scope.to_string(),
+            surface_patterns: vec!["all rejected".to_string()],
+            owner_module: "retrieval::planner".to_string(),
+        }])
+        .expect("validated predicate");
+        let indexed = columns.into_iter().map(str::to_string).collect();
+        let scopes = if enumerable {
+            BTreeSet::from([scope.to_string()])
+        } else {
+            BTreeSet::new()
+        };
+        let raw = BTreeMap::from([("retrieval.profile.top_k".to_string(), top_k.to_string())]);
+        let profile = resolve_registered_retrieval_profile(&raw).expect("registered profile");
+        let intent = RetrievalIntent::new(query.to_string(), registry, indexed, scopes)
+            .expect("valid intent");
+        build_request(intent, &profile).expect("request")
+    }
+
     fn full_provenance() -> ProvenanceBlock {
+        let request = provenance_request("fixture", 5, true);
         ProvenanceBlock {
             binary_build: "humaux-gateway 2026-08-24T09:11:03Z g1e1529f".to_string(),
-            projection_version: "dense-v3".to_string(),
-            embedding_model_id: "text-embedding-v4@2026-06-11".to_string(),
-            rerank_model_id: "qwen3-rerank@rev".to_string(),
-            card_builder_version: "card-v2".to_string(),
-            profile_fingerprint: "sha256:abc".to_string(),
+            projection_version: ProvenanceValue::Used {
+                id: "dense-v3".to_string(),
+            },
+            embedding_model_id: ProvenanceValue::Used {
+                id: "text-embedding-v4@2026-06-11".to_string(),
+            },
+            rerank_model_id: ProvenanceValue::Used {
+                id: "qwen3-rerank@rev".to_string(),
+            },
+            card_builder_version: ProvenanceValue::Used {
+                id: "card-v2".to_string(),
+            },
+            profile_fingerprint: request.profile_fingerprint_identity().clone(),
             profile: ProfileBlock {
-                top_k: 5,
-                cand_k: 25,
+                top_k: request.top_k(),
+                cand_k: request.cand_k(),
                 cand_k_formula: "min(top_k*5, 200)".to_string(),
                 lanes: vec!["literal".to_string(), "dense".to_string()],
             },
         }
     }
 
-    #[test]
-    fn g23_6_all_six_fields_present_is_valid() {
-        assert!(full_provenance().is_valid());
+    fn provenance_fields(value: &mut ProvenanceBlock) -> [&mut ProvenanceValue; 4] {
+        [
+            &mut value.projection_version,
+            &mut value.embedding_model_id,
+            &mut value.rerank_model_id,
+            &mut value.card_builder_version,
+        ]
     }
 
     #[test]
-    fn g23_6_any_empty_field_invalidates_the_result() {
-        let mut p = full_provenance();
-        p.rerank_model_id = String::new();
-        assert!(!p.is_valid());
+    fn g23_6_all_six_fields_present_is_valid() {
+        let request = provenance_request("fixture", 5, true);
+        assert_eq!(
+            request.planner_decision(),
+            &PlannerDecision::Class(QueryClass::Semantic)
+        );
+        assert!(full_provenance().is_valid(&request));
+    }
 
-        let mut p2 = full_provenance();
-        p2.profile_fingerprint = String::new();
-        assert!(!p2.is_valid());
+    #[test]
+    fn g23_6_only_established_structured_reads_admit_not_applicable() {
+        let queries = [
+            "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+            "all rejected",
+            "continue from last session",
+        ];
+        for query in queries {
+            let request = provenance_request(query, 5, true);
+            let mut value = full_provenance();
+            for field in provenance_fields(&mut value) {
+                *field = ProvenanceValue::NotApplicable {};
+            }
+            assert!(value.is_valid(&request), "structured request {query:?}");
+        }
+        let unestablished = provenance_request("all rejected", 5, false);
+        assert_eq!(
+            unestablished.planner_decision(),
+            &PlannerDecision::CannotEstablish
+        );
+        assert!(!full_provenance().is_valid(&unestablished));
+    }
+
+    #[test]
+    fn g23_6_semantic_requires_projection_and_embedding_but_allows_unused_stages() {
+        let semantic = provenance_request("fixture", 5, true);
+        let structured = provenance_request("all rejected", 5, true);
+        for index in 0..4 {
+            let mut value = full_provenance();
+            *provenance_fields(&mut value)[index] = ProvenanceValue::CannotEstablish {};
+            assert!(!value.is_valid(&semantic));
+            assert!(!value.is_valid(&structured));
+        }
+        for index in 0..2 {
+            let mut value = full_provenance();
+            *provenance_fields(&mut value)[index] = ProvenanceValue::NotApplicable {};
+            assert!(
+                !value.is_valid(&semantic),
+                "semantic required component NA at {index}"
+            );
+        }
+        for index in 2..4 {
+            let mut value = full_provenance();
+            *provenance_fields(&mut value)[index] = ProvenanceValue::NotApplicable {};
+            assert!(
+                value.is_valid(&semantic),
+                "semantic unused component NA at {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn g23_6_rejects_reserved_used_ids_and_unknown_serde_shapes() {
+        let request = provenance_request("fixture", 5, true);
+        for id in ["", "none", "N/A", "n-a", " UNKNOWN ", "null", "   "] {
+            for index in 0..4 {
+                let mut value = full_provenance();
+                *provenance_fields(&mut value)[index] =
+                    ProvenanceValue::Used { id: id.to_string() };
+                assert!(!value.is_valid(&request), "reserved id {id:?} at {index}");
+            }
+        }
+        for value in [
+            ProvenanceValue::Used {
+                id: "dense-v3".to_string(),
+            },
+            ProvenanceValue::NotApplicable {},
+            ProvenanceValue::CannotEstablish {},
+        ] {
+            let json = serde_json::to_string(&value).expect("serialize provenance");
+            assert_eq!(
+                serde_json::from_str::<ProvenanceValue>(&json).unwrap(),
+                value
+            );
+        }
+        for json in [
+            r#"{"status":"made_up"}"#,
+            r#"{"id":"dense-v3"}"#,
+            r#"{"status":"used"}"#,
+            r#"{"status":"used","id":"dense-v3","extra":true}"#,
+            r#"{"status":"not_applicable","id":"dense-v3"}"#,
+            r#"{"status":"cannot_establish","id":"dense-v3"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ProvenanceValue>(json).is_err(),
+                "accepted {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn g23_6_requires_the_executed_request_fingerprint_and_depth() {
+        let request = provenance_request("fixture", 5, true);
+        let different = provenance_request("fixture", 10, true);
+        let mut value = full_provenance();
+        value.profile_fingerprint = different.profile_fingerprint_identity().clone();
+        assert!(!value.is_valid(&request));
+        value = full_provenance();
+        value.profile.top_k += 1;
+        assert!(!value.is_valid(&request));
+        value = full_provenance();
+        value.profile.cand_k += 1;
+        assert!(!value.is_valid(&request));
+        value = full_provenance();
+        value.binary_build = " \n\t".to_string();
+        assert!(!value.is_valid(&request));
     }
 
     #[test]
@@ -1582,12 +2573,13 @@ mod tests {
             mandatory: MandatoryReport::NotRun,
             pinned: PinnedReport::NotRun,
             pipeline: PipelineBlock {
-                evidence: EvidenceBlock::no_batch(5),
+                evidence: EvidenceBlock::no_batch(Some(5), CountScope::StreamLedger),
                 knowledge: KnowledgeBlock {
-                    eligible: 5,
-                    processed: 5,
-                    waiting_key: 0,
-                    failed: 0,
+                    eligible: Some(5),
+                    processed: Some(5),
+                    waiting_key: Some(0),
+                    failed: Some(0),
+                    count_scope: CountScope::StreamLedger,
                 },
                 projection: out.value,
             },
@@ -1710,12 +2702,13 @@ mod tests {
             mandatory: MandatoryReport::NotRun,
             pinned: PinnedReport::NotRun,
             pipeline: PipelineBlock {
-                evidence: EvidenceBlock::no_batch(1),
+                evidence: EvidenceBlock::no_batch(Some(1), CountScope::StreamLedger),
                 knowledge: KnowledgeBlock {
-                    eligible: 1,
-                    processed: 1,
-                    waiting_key: 0,
-                    failed: 0,
+                    eligible: Some(1),
+                    processed: Some(1),
+                    waiting_key: Some(0),
+                    failed: Some(0),
+                    count_scope: CountScope::StreamLedger,
                 },
                 projection: build_projection_block(&ledger, Some(1)).value,
             },
@@ -1737,14 +2730,16 @@ mod tests {
     /// §22.1: the exact class carries the full six-field block, every value copied from the
     /// census's own enumeration (no independent assembly path exists).
     #[test]
-    fn exact_class_carries_the_full_22_1_block() {
+    fn component_exact_outcome_carries_the_full_22_1_block_without_recording() {
         use crate::completeness::{CensusResult, ExactEnumeration, ledger};
         use crate::planner::PlannerDecision;
 
         let census = CensusResult::enumerated(
             ExactEnumeration::new("rejected_decisions_v1", 17, 15, 2).unwrap(),
         );
-        let out = exact_outcome_block(
+        use crate::completeness::take_final_record_trace;
+        assert!(take_final_record_trace().is_empty());
+        let out = component_exact_outcome(
             &PlannerDecision::Enumerate {
                 predicate_id: "rejected_decisions_v1".to_string(),
             },
@@ -1770,6 +2765,7 @@ mod tests {
         assert_eq!(exact.excluded_secret, 2);
         assert!(!exact.truncated);
         assert!((exact.coverage - 15.0 / 17.0).abs() < f64::EPSILON);
+        assert!(take_final_record_trace().is_empty());
     }
 
     /// §22.0 fault, executable: an Enumerate decision whose census never enumerated would
@@ -1780,7 +2776,7 @@ mod tests {
         use crate::completeness::{CensusResult, ledger};
         use crate::planner::PlannerDecision;
 
-        let err = exact_outcome_block(
+        let err = component_exact_outcome(
             &PlannerDecision::Enumerate {
                 predicate_id: "rejected_decisions_v1".to_string(),
             },
@@ -1810,7 +2806,7 @@ mod tests {
         let census = CensusResult::enumerated(
             ExactEnumeration::new("rejected_decisions_v1", 17, 17, 0).unwrap(),
         );
-        let out = exact_outcome_block(
+        let out = component_exact_outcome(
             &PlannerDecision::Enumerate {
                 predicate_id: "rejected_decisions_v1".to_string(),
             },
@@ -1839,7 +2835,7 @@ mod tests {
         use crate::completeness::{CensusResult, ledger};
         use crate::planner::{PlannerDecision, QueryClass};
 
-        let out = exact_outcome_block(
+        let out = component_exact_outcome(
             &PlannerDecision::Class(QueryClass::Semantic),
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),

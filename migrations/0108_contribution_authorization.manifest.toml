@@ -1,0 +1,18 @@
+migration_id = "0108_contribution_authorization"
+class = "EXPAND_CONTRACT"
+precheck = """
+select to_regclass('staging.contribution_candidates') is not null
+  and to_regprocedure('staging.guard_contribution_authorization()') is null
+  as precheck_ok
+"""
+postcheck = """
+select to_regprocedure('staging.guard_contribution_authorization()') is not null
+  and exists(select 1 from pg_trigger where tgname='contribution_input_change'
+    and tgrelid='control.reasoning_domain_grants'::regclass)
+  and exists(select 1 from pg_trigger where tgname='contribution_input_change'
+    and tgrelid='private.memory_evidence'::regclass)
+  and exists(select 1 from pg_trigger where tgname='finalized_authorization_guard')
+  as postcheck_ok
+"""
+rollback_or_forward_fix = "Forward fix only. Preserve confirmations, candidates, grants and audit history. Fix stale scope by a new authenticated preparation; never rewrite old receipts."
+backup_restore_requirement = "Separate approval and database backup before production. Current acceptance is restricted to the disposable PostgreSQL18.6 fixture."

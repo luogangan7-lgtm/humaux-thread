@@ -6,11 +6,16 @@
 //! in `tests/qdrant_live.rs`, which reports `not_applicable` naming the missing HTTP client —
 //! this file is not where that gap is papered over.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use humaux_adapters::qdrant::{
-    Distance, HaConsistencyProfile, PlacementClass, PointId, PromotionState, QdrantOperation,
-    QdrantPointPayload, ReadConsistency, RetrievalFamily, ShardingMethod, VisibleCountFilter,
-    WriteOrdering, condition_to_filter, count_body, create_collection_body, ha_profile_for,
-    may_advance_checkpoint, shard_key_body, tenant_index_body, upsert_point_body, verify_visible,
+    DenseQuery, DenseQueryVersions, Distance, PlacementClass, PointId, PromotionState,
+    QdrantOperation, QdrantPointPayload, QdrantTransportError, ReadConsistency, RetrievalFamily,
+    ShardingMethod, TenantPlacementRow, VisibleCountFilter, WriteOrdering, condition_to_filter,
+    count_body, create_collection_body, dense_query_body, ha_profile_for, may_advance_checkpoint,
+    query_dense, shard_key_body, tenant_index_body, upsert, upsert_point_body, verify_visible,
     visible_count,
 };
 use humaux_domain::authority::{AuthorityClass, AuthorityStatus};
@@ -18,8 +23,14 @@ use humaux_domain::dataclass::DataClass;
 use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId, VisibilityClass};
 use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
 use humaux_domain::memory::MemoryType;
+use humaux_infra_cell::{
+    CallerId, CellAccessPermit, CellId, IntraCellError, IntraCellHttpTransport, IntraCellMethod,
+    IntraCellRequest, IntraCellResource, IntraCellResourceRegistry, IntraCellResponse,
+    ResourceEntry, authorize_cell_access,
+};
 use humaux_projection::card::EgressDisposition;
 use sqlx::types::time::OffsetDateTime;
+use uuid::Uuid;
 
 fn scope(tenant_id: TenantId, workspaces: &[WorkspaceId]) -> AuthorizationScope {
     AuthorizationScope::new(
@@ -27,6 +38,86 @@ fn scope(tenant_id: TenantId, workspaces: &[WorkspaceId]) -> AuthorizationScope 
         PrincipalId::new(),
         None,
         BoundedSet::new(workspaces.iter().copied()).unwrap(),
+    )
+}
+
+fn dense_query(scope: &AuthorizationScope, vector: Vec<f32>, limit: u32) -> DenseQuery {
+    DenseQuery::new(
+        scope,
+        &TenantPlacementRow {
+            tenant_id: scope.tenant_id(),
+            projection_family: RetrievalFamily::PrivateMemoryV1,
+            collection_name: "private_memory_v1".to_owned(),
+            shard_key: Some("tenant-shard".to_owned()),
+            placement_class: PlacementClass::Dedicated,
+            point_count: 0,
+            bytes_estimate: 0,
+            promotion_state: PromotionState::Stable,
+        },
+        DenseQueryVersions {
+            projection: "v1",
+            embedding: "embed-v1",
+        },
+        vector,
+        limit,
+        vec![PointId::Num(99)],
+        ha_profile_for(QdrantOperation::ReadYourWriteStrict),
+    )
+    .expect("valid dense query")
+}
+
+fn qdrant_permit() -> CellAccessPermit {
+    let cell = CellId(Uuid::now_v7());
+    let caller = CallerId("qdrant-contract-test".to_owned());
+    let mut entries = BTreeMap::new();
+    entries.insert(
+        IntraCellResource::QDRANT_REST,
+        ResourceEntry::new(
+            "127.0.0.1",
+            64642,
+            cell,
+            vec!["127.0.0.1/32".parse().expect("valid loopback CIDR")],
+            BTreeSet::from([caller.clone()]),
+            false,
+        )
+        .expect("contract fixture resource"),
+    );
+    let registry = IntraCellResourceRegistry::new(entries, cell, caller);
+    authorize_cell_access(
+        &registry,
+        IntraCellResource::QDRANT_REST,
+        Duration::from_secs(30),
+    )
+    .expect("allowlisted same-cell test caller")
+}
+
+struct RecordedTransport {
+    response: IntraCellResponse,
+    observed: Arc<Mutex<Option<IntraCellRequest>>>,
+}
+
+#[async_trait::async_trait]
+impl IntraCellHttpTransport for RecordedTransport {
+    async fn execute(
+        &self,
+        _permit: &CellAccessPermit,
+        request: IntraCellRequest,
+    ) -> Result<IntraCellResponse, IntraCellError> {
+        *self.observed.lock().expect("recording lock") = Some(request);
+        Ok(self.response.clone())
+    }
+}
+
+fn recorded_transport(
+    response: IntraCellResponse,
+) -> (RecordedTransport, Arc<Mutex<Option<IntraCellRequest>>>) {
+    let observed = Arc::new(Mutex::new(None));
+    (
+        RecordedTransport {
+            response,
+            observed: Arc::clone(&observed),
+        },
+        observed,
     )
 }
 
@@ -288,35 +379,7 @@ fn read_your_write_strict_path_uses_quorum_or_stronger_read_consistency() {
     );
 }
 
-#[test]
-fn write_params_json_carries_ordering_and_never_a_read_consistency_key() {
-    let p: HaConsistencyProfile = ha_profile_for(QdrantOperation::CorrectionDeleteSupersede);
-    let json = p.write_params_json();
-    assert_eq!(json["ordering"], "strong");
-    assert!(
-        json.as_object().unwrap().get("consistency").is_none(),
-        "consistency is a read parameter, must never appear in a write request body"
-    );
-}
-
-#[test]
-fn read_params_json_carries_consistency_only_when_set() {
-    let strict = ha_profile_for(QdrantOperation::ReadYourWriteStrict);
-    assert_eq!(strict.read_params_json()["consistency"], "quorum");
-
-    let normal = ha_profile_for(QdrantOperation::NormalImmutableUpsert);
-    assert!(
-        normal
-            .read_params_json()
-            .as_object()
-            .unwrap()
-            .get("consistency")
-            .is_none()
-    );
-}
-
 // ---- §16.3/§23.1②: visible count filter must be tagged with projection_version ----
-
 #[test]
 fn visible_count_filter_refuses_an_empty_projection_version() {
     let s = scope(TenantId::new(), &[]);
@@ -334,6 +397,221 @@ fn count_body_is_exact_and_carries_the_projection_version_clause() {
     assert_eq!(must.len(), 3);
     assert_eq!(must[2]["key"], "projection_version");
     assert_eq!(must[2]["match"]["value"], "card-v2");
+}
+
+#[test]
+fn dense_query_body_keeps_scope_version_tombstone_and_shard_in_one_request() {
+    let tenant = TenantId::new();
+    let user = UserId::new();
+    let authorized = AuthorizationScope::new(
+        tenant,
+        PrincipalId::new(),
+        Some(user),
+        BoundedSet::new(Vec::<WorkspaceId>::new()).expect("empty workspace set is valid"),
+    );
+    let query = dense_query(&authorized, vec![0.1, 0.2], 3);
+    let body = dense_query_body(&query);
+    assert_eq!(body["query"], serde_json::json!([0.1_f32, 0.2_f32]));
+    assert_eq!(body["limit"], 3);
+    assert_eq!(body["with_payload"], false);
+    assert_eq!(body["with_vector"], false);
+    assert_eq!(body["shard_key"], "tenant-shard");
+    assert!(body.get("consistency").is_none());
+    let must = body["filter"]["must"].as_array().expect("scope filter");
+    assert_eq!(must[0]["key"], "tenant_id");
+    assert_eq!(must[0]["match"]["value"], tenant.0.to_string());
+    let private_arm = must[1]["should"][1]["must"]
+        .as_array()
+        .expect("private visibility arm");
+    assert_eq!(private_arm[0]["match"]["value"], "USER_PRIVATE");
+    assert_eq!(
+        private_arm[1]["match"]["value"],
+        user.0.to_string(),
+        "private vectors remain bound to the authorized user"
+    );
+    assert_eq!(must[2]["key"], "projection_version");
+    assert_eq!(must[2]["match"]["value"], "v1");
+    assert_eq!(must[3]["key"], "embedding_version");
+    assert_eq!(must[3]["match"]["value"], "embed-v1");
+    assert_eq!(body["filter"]["must_not"][0]["has_id"][0], 99);
+}
+
+#[test]
+fn dense_query_rejects_empty_non_finite_or_zero_limit_inputs() {
+    let scope = scope(TenantId::new(), &[]);
+    let placement = TenantPlacementRow {
+        tenant_id: scope.tenant_id(),
+        projection_family: RetrievalFamily::PrivateMemoryV1,
+        collection_name: "private_memory_v1".to_owned(),
+        shard_key: None,
+        placement_class: PlacementClass::SharedFallback,
+        point_count: 0,
+        bytes_estimate: 0,
+        promotion_state: PromotionState::Stable,
+    };
+    for (vector, limit, version) in [
+        (vec![], 1, "v1"),
+        (vec![f32::NAN], 1, "v1"),
+        (vec![f32::INFINITY], 1, "v1"),
+        (vec![0.1], 0, "v1"),
+        (vec![0.1], 1, ""),
+    ] {
+        assert!(
+            DenseQuery::new(
+                &scope,
+                &placement,
+                DenseQueryVersions {
+                    projection: version,
+                    embedding: "embed-v1",
+                },
+                vector,
+                limit,
+                vec![],
+                ha_profile_for(QdrantOperation::NormalImmutableUpsert),
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        DenseQuery::new(
+            &scope,
+            &placement,
+            DenseQueryVersions {
+                projection: "v1",
+                embedding: "",
+            },
+            vec![0.1],
+            1,
+            vec![],
+            ha_profile_for(QdrantOperation::NormalImmutableUpsert),
+        )
+        .is_err()
+    );
+    let foreign_placement = TenantPlacementRow {
+        tenant_id: TenantId::new(),
+        collection_name: "bad/collection".to_owned(),
+        ..placement
+    };
+    assert!(
+        DenseQuery::new(
+            &scope,
+            &foreign_placement,
+            DenseQueryVersions {
+                projection: "v1",
+                embedding: "embed-v1",
+            },
+            vec![0.1],
+            1,
+            vec![],
+            ha_profile_for(QdrantOperation::ReadYourWriteStrict),
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn dense_query_uses_post_query_path_and_returns_typed_candidates() {
+    let scope = scope(TenantId::new(), &[]);
+    let query = dense_query(&scope, vec![0.1, 0.2], 2);
+    let (transport, observed) = recorded_transport(IntraCellResponse {
+        status: 200,
+        json_body: Some(serde_json::json!({
+            "result": {"points": [{"id": 7, "score": 0.9}]}
+        })),
+    });
+
+    let candidates = query_dense(&transport, &qdrant_permit(), &query)
+        .await
+        .expect("well-formed dense response");
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].point_id, PointId::Num(7));
+    assert_eq!(candidates[0].score, 0.9);
+    let request = observed
+        .lock()
+        .expect("recording lock")
+        .clone()
+        .expect("query request");
+    assert_eq!(request.method, IntraCellMethod::Post);
+    assert_eq!(
+        request.path,
+        "/collections/private_memory_v1/points/query?consistency=quorum"
+    );
+    assert_eq!(request.json_body, Some(dense_query_body(&query)));
+    assert!(
+        request
+            .json_body
+            .as_ref()
+            .is_some_and(|body| body.get("consistency").is_none())
+    );
+}
+
+#[tokio::test]
+async fn dense_query_rejects_malformed_or_duplicate_candidates() {
+    let scope = scope(TenantId::new(), &[]);
+    let query = dense_query(&scope, vec![0.1, 0.2], 2);
+    for body in [
+        serde_json::json!({"result": {"points": [{"id": 7, "score": "bad"}]}}),
+        serde_json::json!({"result": {"points": [{"id": 7, "score": 0.9}, {"id": 7, "score": 0.8}]}}),
+        serde_json::json!({"result": {"points": [{"id": 7, "score": 0.9}, {"id": 8, "score": 0.8}, {"id": 9, "score": 0.7}]}}),
+        serde_json::json!({"result": {}}),
+    ] {
+        let (transport, _) = recorded_transport(IntraCellResponse {
+            status: 200,
+            json_body: Some(body),
+        });
+        assert!(matches!(
+            query_dense(&transport, &qdrant_permit(), &query).await,
+            Err(QdrantTransportError::UnexpectedResponseShape(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn upsert_controls_are_uri_parameters_not_point_body_fields() {
+    let payload = sample_payload()
+        .into_indexable()
+        .expect("sample payload is indexable");
+    let (transport, observed) = recorded_transport(IntraCellResponse {
+        status: 200,
+        json_body: Some(serde_json::json!({})),
+    });
+    upsert(
+        &transport,
+        &qdrant_permit(),
+        "private_memory_v1",
+        &[(PointId::Num(7), &payload, vec![0.1, 0.2])],
+        ha_profile_for(QdrantOperation::CorrectionDeleteSupersede),
+    )
+    .await
+    .expect("accepted upsert response");
+    let request = observed
+        .lock()
+        .expect("recording lock")
+        .clone()
+        .expect("upsert request");
+    assert_eq!(
+        request.path,
+        "/collections/private_memory_v1/points?wait=true&ordering=strong"
+    );
+    let body = request.json_body.expect("upsert body");
+    assert!(body.get("points").is_some());
+    assert!(body.get("wait").is_none());
+    assert!(body.get("ordering").is_none());
+}
+
+#[tokio::test]
+async fn dense_query_preserves_http_failure_without_candidate_fallback() {
+    let scope = scope(TenantId::new(), &[]);
+    let query = dense_query(&scope, vec![0.1, 0.2], 2);
+    let (transport, _) = recorded_transport(IntraCellResponse {
+        status: 503,
+        json_body: Some(serde_json::json!({"status": {"error": "unavailable"}})),
+    });
+    assert!(matches!(
+        query_dense(&transport, &qdrant_permit(), &query).await,
+        Err(QdrantTransportError::NonSuccessStatus { status: 503, .. })
+    ));
 }
 
 #[test]

@@ -1,0 +1,15 @@
+{
+  "contract_version": "1",
+  "protocol_version": "2026-07-28",
+  "shared_output_schema": "output.schema.json",
+  "tools": [
+    {"name":"remember","title":"Remember","description":"Record evidence or manage an ingest batch.","input_schema":"remember.schema.json"},
+    {"name":"recall","title":"Recall","description":"Retrieve visible knowledge through the retrieval planner.","input_schema":"recall.schema.json"},
+    {"name":"memory","title":"Memory","description":"Read or manage an existing memory.","input_schema":"memory.schema.json","output_schema":"memory.output.schema.json"},
+    {"name":"context","title":"Context","description":"Assemble task and scope context.","input_schema":"context.schema.json","output_schema":"context.output.schema.json"},
+    {"name":"continuity","title":"Continuity","description":"Read project development continuity.","input_schema":"continuity.schema.json","output_schema":"continuity.output.schema.json"},
+    {"name":"artifact","title":"Artifact","description":"Manage document and image assets.","input_schema":"artifact.schema.json"},
+    {"name":"code","title":"Code","description":"Manage and query code knowledge.","input_schema":"code.schema.json"},
+    {"name":"coordinate","title":"Coordinate","description":"Coordinate tasks, leases, locks, and canvas state.","input_schema":"coordinate.schema.json"}
+  ]
+}

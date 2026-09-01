@@ -1,8 +1,9 @@
 //! `retrieval::completeness` — `LedgerCounts` / `CompletenessClass` / `FreshnessClass` / the
 //! `ledger::close` and `classify()` sole constructors (§22.4 / §22.5 / §59).
 //!
-//! `classify()` is the sole constructor of [`CompletenessClass`] and the single increment
-//! point of `retrieval_completeness_total{class,reason}` (§22.5, §41.2 registry row). Its
+//! `classify()` is the sole constructor of [`CompletenessClass`]; final outcome emission is
+//! the sole increment point of `retrieval_completeness_total{class,reason}` (§22.5, §41.2).
+//! Its
 //! four parameters are the frozen signature (`planner_output` / `lane_status` /
 //! `census_result` / `ledger`); this module reuses [`crate::planner::PlannerDecision`] for
 //! `planner_output` and [`crate::envelope::LaneStatus`] for `lane_status` rather than
@@ -23,13 +24,11 @@
 //!    — a reason field. §78.2 bans stringly-typed domain, so `reason` here is a closed enum
 //!    ([`CannotEstablishReason`]), not a loose `&'static str`.
 //! 3. G80-6 witness reachability: `classify()` must stay `pub(crate)` (adjudication 1), but
-//!    §80.1 G80-6's witness harness runs from `crates/testkit` — a different crate — and can
-//!    only call `pub` entry points. [`classify_for_witness`] is the resolution: it calls
-//!    `classify()` verbatim and returns only the wire label pair the counter itself used,
-//!    never the `CompletenessClass` value (a `pub` fn cannot name a `pub(crate)` return type
-//!    anyway) — so the "sole constructor" privacy invariant (nothing outside this module ever
-//!    holds a `CompletenessClass`) still holds, while the real production emit path stays
-//!    genuinely externally triggerable.
+//!    §80.1 G80-6's component witness harness runs from `crates/testkit` — a different crate —
+//!    and can only call `pub` entry points. [`classify_for_witness`] calls `classify()` verbatim
+//!    and returns only its wire label pair, never the `CompletenessClass` value (a `pub` fn
+//!    cannot name a `pub(crate)` return type anyway). It is label-only: the actual final metric
+//!    remains reachable solely through `envelope_outcome_block` after full Envelope validation.
 //! 4. `PlannerDecision::Class(_)` (every §20 wire class except `DirectGet`/`Enumerate`,
 //!    including `State` — §22.2 FACET_COMPLETE's natural source) maps to `SemanticBounded`,
 //!    not `FacetComplete`: the frozen 4-param signature carries no `covered_facets` /
@@ -135,6 +134,12 @@ pub(crate) enum CannotEstablishReason {
     /// `MandatoryOverflow` 里**没有任何可返回的 Context**：截断不是不该做的操作，
     /// 是那个臂里没有那个值可以返回。
     MandatoryContextOverflow,
+    /// A required pipeline count is unavailable in the declared universe.
+    CountUnknown,
+    /// Pipeline count blocks cannot be compared because their universes differ.
+    CountScopeMismatch,
+    /// Known pipeline counts in one universe disagree.
+    PipelineCountMismatch,
 }
 
 /// §25.5 的唯一映射：Mandatory Context 溢出 ⇒ `cannot_establish`。
@@ -165,6 +170,9 @@ impl CannotEstablishReason {
             Self::IndexCountUnavailable => "index_count_unavailable",
             Self::A2OvershootBeyondPending => "a2_overshoot_beyond_pending",
             Self::MandatoryContextOverflow => "mandatory_context_overflow",
+            Self::CountUnknown => "count_unknown",
+            Self::CountScopeMismatch => "count_scope_mismatch",
+            Self::PipelineCountMismatch => "pipeline_count_mismatch",
         }
     }
 }
@@ -452,7 +460,7 @@ pub mod ledger {
     /// **not** judge A2 (§22.4/§23.1②: "A2 只能在 envelope 层求值", `ledger::close` 不判 A2") —
     /// this function has no `visible` input at all, by construction, so A2 cannot be judged
     /// here even by accident. `retrieval_completeness_total{class,reason}`'s single increment
-    /// point (§22.5) lives in `classify()` (this module's parent), not here.
+    /// point (§22.5) lives in final Envelope outcome assembly, not here.
     pub fn close(reads: LedgerReads) -> LedgerClosure {
         let counts = LedgerCounts {
             expected: reads.expected,
@@ -551,7 +559,7 @@ impl CompletenessTotal {
         "semantic_bounded",
         "cannot_establish",
     ];
-    const REASONS: [&'static str; 8] = [
+    const REASONS: [&'static str; 11] = [
         "none",
         "ledger_not_closed",
         "predicate_not_enumerable",
@@ -560,15 +568,30 @@ impl CompletenessTotal {
         "index_count_unavailable",
         "a2_overshoot_beyond_pending",
         "mandatory_context_overflow",
+        "count_unknown",
+        "count_scope_mismatch",
+        "pipeline_count_mismatch",
     ];
     const CELLS: usize = Self::CLASSES.len() * Self::REASONS.len();
 
-    // 32 cells (4 classes × 8 reasons), hand-written: `AtomicU64` isn't `Copy`, and a `[X; N]` repeat expression
+    // 44 cells (4 classes × 11 reasons), hand-written: `AtomicU64` isn't `Copy`, and a `[X; N]` repeat expression
     // needs a `const ZERO`, which trips `clippy::declare_interior_mutable_const` (same
     // rationale `DegradeTotal::new` already documents). Update by hand if `CLASSES` or
     // `REASONS` ever grows.
     const fn new() -> Self {
         Self([
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -638,12 +661,32 @@ pub fn retrieval_completeness_total_count(class: &str, reason: &str) -> u64 {
     RETRIEVAL_COMPLETENESS_TOTAL.count(class, reason)
 }
 
+/// Sole final-outcome metric emission. Call only after the envelope outcome's invariants have
+/// been checked; provisional classifier answers must never be observed as result statistics.
+pub(crate) fn record_final_classification(class: CompletenessClass) {
+    let (class_label, reason_label) = class.wire_labels();
+    RETRIEVAL_COMPLETENESS_TOTAL.inc(class_label, reason_label);
+    #[cfg(test)]
+    FINAL_RECORD_TRACE.with(|trace| trace.borrow_mut().push((class_label, reason_label)));
+}
+
+#[cfg(test)]
+thread_local! {
+    static FINAL_RECORD_TRACE: std::cell::RefCell<Vec<(&'static str, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_final_record_trace() -> Vec<(&'static str, &'static str)> {
+    FINAL_RECORD_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+}
+
 // ============================================================================
 // §22.5 — `classify()`: the sole constructor of `CompletenessClass`.
 // ============================================================================
 
-/// §22.5's sole constructor of [`CompletenessClass`] and single increment point of
-/// `retrieval_completeness_total{class,reason}` (§41.2 registry row, §80.1 G80-6).
+/// §22.5's sole pure constructor of [`CompletenessClass`]. Final outcome assembly records the
+/// resulting class only after all later gates have passed.
 ///
 /// Match order is the frozen degrade-direction table (§22.5): ledger closure is checked
 /// *before* `planner_output` is read at all — a broken ledger blocks every class, EXACT
@@ -663,7 +706,7 @@ pub(crate) fn classify(
     use crate::envelope::LaneStatus;
     use crate::planner::PlannerDecision;
 
-    let class = if !ledger.is_closed() {
+    if !ledger.is_closed() {
         CompletenessClass::CannotEstablish {
             reason: CannotEstablishReason::LedgerNotClosed,
         }
@@ -685,27 +728,23 @@ pub(crate) fn classify(
             }
             PlannerDecision::Class(_) => CompletenessClass::SemanticBounded,
         }
-    };
-
-    let (class_label, reason_label) = class.wire_labels();
-    // labels: class,reason
-    RETRIEVAL_COMPLETENESS_TOTAL.inc(class_label, reason_label);
-
-    class
+    }
 }
 
 /// §80.1 G80-6 crate-external witness door (adjudication 3 above). `classify()` itself stays
 /// `pub(crate)` — this is not a second constructor, it calls `classify()` verbatim and hands
 /// back only the wire label pair the real call produced, never the `CompletenessClass` value
-/// (which a `pub` fn could not name outside this crate regardless). Exists solely so
-/// `crates/testkit`'s metrics witness can exercise the genuine production emit path.
+/// (which a `pub` fn could not name outside this crate regardless). It is deliberately
+/// label-only: a component classifier has no provenance/pipeline/context inputs and must not
+/// increment the final result metric.
 pub fn classify_for_witness(
     planner_output: &crate::planner::PlannerDecision,
     lane_status: crate::envelope::LaneStatus,
     census_result: &CensusResult,
     ledger: &LedgerClosure,
 ) -> (&'static str, &'static str) {
-    classify(planner_output, lane_status, census_result, ledger).wire_labels()
+    let class = classify(planner_output, lane_status, census_result, ledger);
+    class.wire_labels()
 }
 
 #[cfg(test)]
@@ -739,7 +778,7 @@ mod tests {
             );
             seen.insert(idx);
         }
-        // 七个 CannotEstablish reason 逐个走一遍。少一个变体这里就少一个 idx，
+        // 十个 CannotEstablish reason 逐个走一遍。少一个变体这里就少一个 idx，
         // 而 REASONS 与数组长度对不上时 `idx()` 会直接 panic。
         for reason in [
             CannotEstablishReason::LedgerNotClosed,
@@ -749,6 +788,9 @@ mod tests {
             CannotEstablishReason::IndexCountUnavailable,
             CannotEstablishReason::A2OvershootBeyondPending,
             CannotEstablishReason::MandatoryContextOverflow,
+            CannotEstablishReason::CountUnknown,
+            CannotEstablishReason::CountScopeMismatch,
+            CannotEstablishReason::PipelineCountMismatch,
         ] {
             let (c, r) = CompletenessClass::CannotEstablish { reason }.wire_labels();
             let idx = CompletenessTotal::idx(c, r);
@@ -761,8 +803,8 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            10,
-            "十个 (class, reason) 组合应当落在十个不同的格子里"
+            13,
+            "十三个 (class, reason) 组合应当落在十三个不同的格子里"
         );
     }
 
@@ -829,7 +871,6 @@ mod tests {
     /// lane, planner) looks fine — read *before* `planner_output`.
     #[test]
     fn broken_ledger_yields_cannot_establish_ledger_not_closed_ahead_of_everything_else() {
-        let before = retrieval_completeness_total_count("cannot_establish", "ledger_not_closed");
         let class = classify(
             &PlannerDecision::Enumerate {
                 predicate_id: "rejected_decisions_v1".to_string(),
@@ -843,10 +884,6 @@ mod tests {
             CompletenessClass::CannotEstablish {
                 reason: CannotEstablishReason::LedgerNotClosed
             }
-        );
-        assert_eq!(
-            retrieval_completeness_total_count("cannot_establish", "ledger_not_closed"),
-            before + 1
         );
     }
 
@@ -939,24 +976,24 @@ mod tests {
         assert_eq!(class, CompletenessClass::SemanticBounded);
     }
 
-    /// Adjudication 3: the witness door returns labels only, and drives the same counter as
-    /// direct `classify()` calls.
+    /// The public component witness is label-only; final result metrics require the full
+    /// Envelope path, which checks provenance, pipeline/A2, and mandatory context first.
     #[test]
-    fn classify_for_witness_drives_the_real_counter() {
-        let before = retrieval_completeness_total_count("exact", "none");
+    fn classify_for_witness_is_label_only() {
+        assert!(take_final_record_trace().is_empty());
+        let census = CensusResult::enumerated(
+            ExactEnumeration::new("rejected_decisions_v1", 1, 1, 0).unwrap(),
+        );
         let (class_label, reason_label) = classify_for_witness(
             &PlannerDecision::Enumerate {
                 predicate_id: "rejected_decisions_v1".to_string(),
             },
             LaneStatus::Ok,
-            &CensusResult::ok_without_enumeration(),
+            &census,
             &closed_ledger(),
         );
         assert_eq!((class_label, reason_label), ("exact", "none"));
-        assert_eq!(
-            retrieval_completeness_total_count("exact", "none"),
-            before + 1
-        );
+        assert!(take_final_record_trace().is_empty());
     }
 
     /// §22.1 derivation: `coverage` and `truncated` are read off the constructor's inputs —

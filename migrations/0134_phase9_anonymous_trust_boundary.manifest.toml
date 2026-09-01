@@ -1,0 +1,106 @@
+# Phase 16 impact: N/A. This migration changes only the Phase 9 anonymous trust boundary;
+# it creates no provider, billing, credential, deployment, or Phase 16 contract.
+migration_id = "0134_phase9_anonymous_trust_boundary"
+class = "FORWARD_ONLY"
+
+precheck = """
+select to_regclass('public.claim_independence_attestations') is not null
+  and to_regprocedure('public.attest_current_claim_independence(uuid,bigint,bytea)') is not null
+  and to_regclass('control.anonymous_claim_trust_authorities') is null
+  and to_regclass('public.anonymous_claim_trust_receipts') is null
+  and to_regprocedure(
+    'public.evaluate_anonymous_claim(uuid,uuid,uuid,bigint,bytea,text,text,text)'
+  ) is null
+  and not exists(select 1 from pg_attribute
+    where attrelid='public.claims'::regclass and not attisdropped
+      and attname='current_anonymous_trust_receipt_id')
+  as precheck_ok
+"""
+
+postcheck = """
+select to_regclass('control.anonymous_claim_trust_authorities') is not null
+  and to_regclass('public.anonymous_claim_trust_receipts') is not null
+  and to_regprocedure(
+    'public.evaluate_anonymous_claim(uuid,uuid,uuid,bigint,bytea,text,text,text)'
+  ) is not null
+  and to_regprocedure('public.public_projection_identities(uuid,text,bigint)') is not null
+  and (select array_agg(column_name::text order by ordinal_position)
+       from information_schema.columns
+       where table_schema='control' and table_name='anonymous_claim_trust_authorities')
+      = array['anonymous_trust_authority_id','tenant_id','claim_id','object_revision',
+        'body_sha256','evaluator_user_id','evaluator_grant_version','rationale',
+        'policy_version','moderation_state','independence_attestation_id','public_receipt_id',
+        'review_commitment','created_at']
+  and (select array_agg(column_name::text order by ordinal_position)
+       from information_schema.columns
+       where table_schema='public' and table_name='anonymous_claim_trust_receipts')
+      = array['anonymous_trust_receipt_id','claim_id','object_revision','body_sha256',
+        'policy_version','moderation_state','independence_attestation_id','root_set_sha256',
+        'support_count','independent_support_count','sybil_risk','checks_complete',
+        'review_commitment','created_at']
+  and not exists(select 1 from information_schema.columns
+    where table_schema='public' and table_name='anonymous_claim_trust_receipts'
+      and column_name ~* '(tenant|release|contributor|publisher|evaluator|grant|rationale|protected)')
+  and exists(select 1 from pg_attribute
+    where attrelid='public.claims'::regclass and not attisdropped
+      and attname='current_anonymous_trust_receipt_id' and atttypid='uuid'::regtype)
+  and (select relowner='role_migration_owner'::regrole and relrowsecurity and relforcerowsecurity
+       from pg_class where oid='control.anonymous_claim_trust_authorities'::regclass)
+  and exists(select 1 from pg_policy
+    where polrelid='control.anonymous_claim_trust_authorities'::regclass
+      and polname='anonymous_claim_trust_authority_tenant_isolation'
+      and position('humaux.tenant_id' in pg_get_expr(polqual,polrelid))>0
+      and position('tenant_id' in pg_get_expr(polqual,polrelid))>0)
+  and exists(select 1 from pg_trigger
+    where tgrelid='control.anonymous_claim_trust_authorities'::regclass
+      and tgname='anonymous_claim_trust_authority_append_only' and tgenabled='O')
+  and exists(select 1 from pg_trigger
+    where tgrelid='public.anonymous_claim_trust_receipts'::regclass
+      and tgname='anonymous_claim_trust_receipt_append_only' and tgenabled='O')
+  and exists(select 1 from pg_trigger
+    where tgrelid='public.anonymous_claim_trust_receipts'::regclass
+      and tgname='anonymous_receipt_authority_complete' and tgenabled='O'
+      and tgdeferrable and tginitdeferred)
+  and exists(select 1 from pg_trigger
+    where tgrelid='public.claims'::regclass
+      and tgname='claim_supported_receipt_complete' and tgenabled='O'
+      and tgdeferrable and tginitdeferred)
+  and (select pg_get_userbyid(proowner)='role_migration_owner' and prosecdef
+       and provolatile='v' and proconfig=array['search_path=pg_catalog']
+       from pg_proc where oid=
+         'public.evaluate_anonymous_claim(uuid,uuid,uuid,bigint,bytea,text,text,text)'::regprocedure)
+  and has_function_privilege('role_private_worker',
+    'public.evaluate_anonymous_claim(uuid,uuid,uuid,bigint,bytea,text,text,text)','EXECUTE')
+  and not has_function_privilege('role_gateway',
+    'public.evaluate_anonymous_claim(uuid,uuid,uuid,bigint,bytea,text,text,text)','EXECUTE')
+  and not has_function_privilege('role_public_worker',
+    'public.evaluate_anonymous_claim(uuid,uuid,uuid,bigint,bytea,text,text,text)','EXECUTE')
+  and not has_function_privilege('role_retrieval_worker',
+    'public.evaluate_anonymous_claim(uuid,uuid,uuid,bigint,bytea,text,text,text)','EXECUTE')
+  and not has_table_privilege('role_private_worker',
+    'control.anonymous_claim_trust_authorities','SELECT')
+  and not has_table_privilege('role_public_worker',
+    'control.anonymous_claim_trust_authorities','SELECT')
+  and not has_table_privilege('role_gateway',
+    'control.anonymous_claim_trust_authorities','SELECT')
+  and not has_table_privilege('role_retrieval_worker',
+    'control.anonymous_claim_trust_authorities','SELECT')
+  and has_table_privilege('role_gateway','public.anonymous_claim_trust_receipts','SELECT')
+  and has_table_privilege('role_public_worker','public.anonymous_claim_trust_receipts','SELECT')
+  and has_table_privilege('role_retrieval_worker','public.anonymous_claim_trust_receipts','SELECT')
+  and not has_table_privilege('role_gateway','public.claim_trust_evaluations','SELECT')
+  and not has_table_privilege('role_public_worker','public.claim_trust_evaluations','SELECT')
+  and not has_table_privilege('role_retrieval_worker','public.claim_trust_evaluations','SELECT')
+  and has_column_privilege('role_public_worker','public.claim_trust_evaluations',
+    'evaluation_id','INSERT')
+  and not exists(
+    select 1 from public.claims claim
+    where claim.current_evaluation_id is not null
+      and exists(select 1 from public.current_public_roots(claim.claim_id,null) root
+        join public.sources source on source.source_id=root.root_source_id
+        where source.lineage_mode='ANONYMOUS_RELEASE'))
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Preserve protected authorities, public receipts, anti-Sybil attestations, and legacy trust history as append-only evidence; repair constraints or ACLs in a successor migration."
+backup_restore_requirement = "Production apply requires an approved restore point and a dry-run proving every active anonymous legacy pointer can move safely. Acceptance must use disposable PostgreSQL 18, fresh 0001-through-0134 migration, exact postcheck, replay=0, and the focused ignored lifecycle gate."

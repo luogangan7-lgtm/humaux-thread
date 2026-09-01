@@ -1,0 +1,196 @@
+# Phase 9 R4 adds the durable two-attempt contribution execution authority. It does not
+# activate Phase 10, replay a provider call, or add a reconciliation business state.
+migration_id = "0131_contribution_execution"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+  to_regclass('private.contribution_executions') is null
+  and to_regclass('private.contribution_execution_sources') is null
+  and to_regclass('ops.contribution_execution_job_links') is null
+  and to_regtype('private.contribution_execution_state') is null
+  and to_regclass('ops.jobs') is not null
+  and to_regclass('ops.model_call_ledger') is not null
+  and to_regclass('ops.data_disclosures') is not null
+  and to_regclass('staging.contribution_candidates') is not null
+  and to_regclass('staging.contribution_candidate_phase9_assessments') is not null
+  and to_regprocedure('control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)') is not null
+  and not exists (
+    select 1 from pg_attribute
+    where attrelid='staging.contribution_candidates'::regclass
+      and attname='contribution_execution_id' and not attisdropped
+  ) as precheck_ok
+"""
+
+postcheck = """
+select
+  (
+    select array_agg(enumlabel order by enumsortorder)::text[] = array[
+      'READY_A','A_RESERVED','READY_B','B_RESERVED','READY_CANDIDATE','DONE',
+      'NOT_CONTRIBUTABLE','REJECTED_SAFETY','FAILED_TERMINAL'
+    ]
+    from pg_enum where enumtypid='private.contribution_execution_state'::regtype
+  )
+  and (
+    select count(*)=3 and bool_and(relrowsecurity and relforcerowsecurity
+      and relowner='role_migration_owner'::regrole)
+    from pg_class where oid in (
+      'private.contribution_executions'::regclass,
+      'private.contribution_execution_sources'::regclass,
+      'ops.contribution_execution_job_links'::regclass
+    )
+  )
+  and (
+    select count(*)=3 from pg_policy where polrelid in (
+      'private.contribution_executions'::regclass,
+      'private.contribution_execution_sources'::regclass,
+      'ops.contribution_execution_job_links'::regclass
+    )
+  )
+  and (
+    select count(*)=18 from pg_constraint where convalidated and conname in (
+      'contribution_executions_tenant_execution_unique',
+      'contribution_executions_tenant_enqueue_unique',
+      'contribution_executions_coverage_request_unique',
+      'contribution_executions_assessment_request_unique',
+      'contribution_executions_candidate_unique',
+      'contribution_executions_distinct_request_ids',
+      'contribution_executions_membership_fk',
+      'contribution_executions_domain_fk',
+      'contribution_executions_policy_fk',
+      'contribution_executions_binding_fk',
+      'contribution_executions_coverage_model_call_fk',
+      'contribution_executions_assessment_model_call_fk',
+      'contribution_executions_coverage_disclosure_fk',
+      'contribution_executions_assessment_disclosure_fk',
+      'contribution_execution_sources_exact_one',
+      'contribution_execution_sources_execution_fk',
+      'contribution_execution_job_links_job_fk',
+      'contribution_execution_job_links_execution_fk'
+    )
+  )
+  and (
+    select count(*)=11 and bool_and(
+      prosecdef
+      and proowner='role_migration_owner'::regrole
+      and proconfig=ARRAY['search_path=pg_catalog']::text[]
+    )
+    from pg_proc where oid in (
+      'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])'::regprocedure,
+      'private.reserve_contribution_execution_call(uuid,uuid,uuid,text,integer,text,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'::regprocedure,
+      'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'::regprocedure,
+      'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'::regprocedure,
+      'private.settle_contribution_job_if_live(uuid,uuid,uuid,text,integer,text,text)'::regprocedure,
+      'private.complete_contribution_a_exact(uuid,uuid,uuid,uuid,bytea,uuid,text,bytea,uuid,integer,bytea,bytea,jsonb,bytea,text,text,text,uuid,text,integer)'::regprocedure,
+      'private.complete_contribution_b_exact(uuid,uuid,uuid,uuid,bytea,uuid,text,bytea,bytea,text,text,text,text,bytea,bytea,jsonb,bytea,text,text,text,uuid,text,integer)'::regprocedure,
+      'private.commit_contribution_candidate(uuid,uuid,uuid,text,integer)'::regprocedure,
+      'private.settle_contribution_terminal_job(uuid,uuid,uuid,text,integer)'::regprocedure,
+      'private.mark_contribution_reconciliation_required(uuid,uuid,uuid,text,integer)'::regprocedure,
+      'private.require_contribution_execution_lease(uuid,uuid,uuid,text,integer)'::regprocedure
+    )
+  )
+  and (
+    select count(*)=9 from pg_trigger where not tgisinternal and (tgrelid,tgname) in (
+      ('private.contribution_executions'::regclass,'contribution_execution_guard'),
+      ('private.contribution_executions'::regclass,'contribution_execution_reject_truncate'),
+      ('private.contribution_execution_sources'::regclass,'contribution_execution_sources_append_only'),
+      ('private.contribution_execution_sources'::regclass,'contribution_execution_sources_reject_truncate'),
+      ('ops.contribution_execution_job_links'::regclass,'contribution_execution_job_links_append_only'),
+      ('ops.contribution_execution_job_links'::regclass,'contribution_execution_job_links_reject_truncate'),
+      ('ops.contribution_execution_job_links'::regclass,'contribution_execution_job_link_validate'),
+      ('private.contribution_executions'::regclass,'contribution_execution_manifest_complete'),
+      ('private.contribution_execution_sources'::regclass,'contribution_execution_sources_complete')
+    )
+  )
+  and not has_table_privilege('role_private_worker','private.contribution_executions','INSERT,UPDATE,DELETE,TRUNCATE')
+  and not has_table_privilege('role_private_worker','private.contribution_execution_sources','INSERT,UPDATE,DELETE,TRUNCATE')
+  and not has_table_privilege('role_private_worker','ops.contribution_execution_job_links','INSERT,UPDATE,DELETE,TRUNCATE')
+  and (
+    select count(*)=8 and bool_and(
+      has_function_privilege('role_private_worker',p.oid,'EXECUTE')
+      and not has_function_privilege(0,p.oid,'EXECUTE')
+      and not exists (
+        select 1 from unnest(ARRAY[
+          'role_admin','role_gateway','role_consolidation_worker','role_public_worker',
+          'role_retrieval_worker','role_batch_issuer','role_maintenance'
+        ]) role_name
+        where has_function_privilege(role_name,p.oid,'EXECUTE')
+      )
+    )
+    from pg_proc p where p.oid in (
+      'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])'::regprocedure,
+      'private.reserve_contribution_a(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'::regprocedure,
+      'private.reserve_contribution_b(uuid,uuid,uuid,text,integer,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'::regprocedure,
+      'private.complete_contribution_a_exact(uuid,uuid,uuid,uuid,bytea,uuid,text,bytea,uuid,integer,bytea,bytea,jsonb,bytea,text,text,text,uuid,text,integer)'::regprocedure,
+      'private.complete_contribution_b_exact(uuid,uuid,uuid,uuid,bytea,uuid,text,bytea,bytea,text,text,text,text,bytea,bytea,jsonb,bytea,text,text,text,uuid,text,integer)'::regprocedure,
+      'private.commit_contribution_candidate(uuid,uuid,uuid,text,integer)'::regprocedure,
+      'private.settle_contribution_terminal_job(uuid,uuid,uuid,text,integer)'::regprocedure,
+      'private.mark_contribution_reconciliation_required(uuid,uuid,uuid,text,integer)'::regprocedure
+    )
+  )
+  and (
+    select count(*)=3 and bool_and(
+      not has_function_privilege(0,p.oid,'EXECUTE')
+      and not exists (
+        select 1 from unnest(ARRAY[
+          'role_admin','role_gateway','role_private_worker','role_consolidation_worker',
+          'role_public_worker','role_retrieval_worker','role_batch_issuer','role_maintenance'
+        ]) role_name
+        where has_function_privilege(role_name,p.oid,'EXECUTE')
+      )
+    )
+    from pg_proc p where p.oid in (
+      'private.require_contribution_execution_lease(uuid,uuid,uuid,text,integer)'::regprocedure,
+      'private.reserve_contribution_execution_call(uuid,uuid,uuid,text,integer,text,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'::regprocedure,
+      'private.settle_contribution_job_if_live(uuid,uuid,uuid,text,integer,text,text)'::regprocedure
+    )
+  )
+  and (
+    select position('INSERT INTO ops.data_disclosure_sources' in pg_get_functiondef(
+      'private.reserve_contribution_execution_call(uuid,uuid,uuid,text,integer,text,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'::regprocedure
+    ))>0
+    and position('ORDER BY source.ordinal' in pg_get_functiondef(
+      'private.reserve_contribution_execution_call(uuid,uuid,uuid,text,integer,text,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'::regprocedure
+    ))>0
+    and position('inserted_source_count=0' in pg_get_functiondef(
+      'private.reserve_contribution_execution_call(uuid,uuid,uuid,text,integer,text,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'::regprocedure
+    ))>0
+    and position('inserted_source_count<>root.source_count' in pg_get_functiondef(
+      'private.reserve_contribution_execution_call(uuid,uuid,uuid,text,integer,text,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'::regprocedure
+    ))>0
+    and position('contribution disclosure source count mismatch' in pg_get_functiondef(
+      'private.reserve_contribution_execution_call(uuid,uuid,uuid,text,integer,text,uuid,uuid,bytea,uuid,text,uuid,text,bytea,bigint)'::regprocedure
+    ))>0
+  )
+  and (
+    select bool_and(
+      position('p_job_id IS NOT NULL OR p_lease_owner IS NOT NULL OR p_attempt IS NOT NULL'
+        in pg_get_functiondef(p.oid))>0
+      and position('PERFORM private.require_contribution_execution_lease'
+        in pg_get_functiondef(p.oid))>0
+    )
+    from pg_proc p where p.oid in (
+      'private.complete_contribution_a_exact(uuid,uuid,uuid,uuid,bytea,uuid,text,bytea,uuid,integer,bytea,bytea,jsonb,bytea,text,text,text,uuid,text,integer)'::regprocedure,
+      'private.complete_contribution_b_exact(uuid,uuid,uuid,uuid,bytea,uuid,text,bytea,bytea,text,text,text,text,bytea,bytea,jsonb,bytea,text,text,text,uuid,text,integer)'::regprocedure
+    )
+  )
+  and not has_function_privilege(0,
+    'private.enqueue_contribution_execution(uuid,uuid,uuid,uuid,uuid,uuid,text,bytea,uuid,uuid,bytea,uuid,bigint,jsonb,text,text,text,text,text,uuid,bigint,bigint,bigint,bytea,bytea,text[],uuid[],bytea[])','EXECUTE')
+  and not exists (
+    select 1 from pg_enum where enumtypid='private.contribution_execution_state'::regtype
+      and enumlabel like 'RECONCILE%'
+  )
+  and (
+    select not attnotnull and not atthasdef
+    from pg_attribute where attrelid='staging.contribution_candidates'::regclass
+      and attname='contribution_execution_id' and not attisdropped
+  )
+  and position('RECONCILIATION_REQUIRED' in pg_get_functiondef(
+    'private.mark_contribution_reconciliation_required(uuid,uuid,uuid,text,integer)'::regprocedure))>0
+  and position('FAILED' in pg_get_functiondef(
+    'private.mark_contribution_reconciliation_required(uuid,uuid,uuid,text,integer)'::regprocedure))>0
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward-fix only after deployment: never rewrite execution, source, job-link, ledger, disclosure, or candidate receipts. Before deployment, rollback means discard the disposable database and replay the immutable migration chain."
+backup_restore_requirement = "Production rollout is excluded without explicit backup and approval. Acceptance uses a disposable PostgreSQL 18 container, full 0001-to-0131 apply, zero-drift replay, manifest/RLS checks, focused fault tests, then proves the container absent."

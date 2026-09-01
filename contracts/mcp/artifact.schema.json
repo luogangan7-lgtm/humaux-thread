@@ -1,0 +1,10 @@
+{
+  "type":"object",
+  "oneOf":[
+    {"x-humaux-operation":{"operation_key":"artifact.create_upload","required_scope":"artifact:manage","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"create_upload"},"filename":{"type":"string","minLength":1,"maxLength":255},"content_type":{"type":"string","minLength":3,"maxLength":255},"size_bytes":{"type":"integer","minimum":1,"maximum":104857600},"workspace_id":{"type":"string","format":"uuid"}},"required":["action","filename","content_type","size_bytes"],"additionalProperties":false},
+    {"x-humaux-operation":{"operation_key":"artifact.status","required_scope":"artifact:manage","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"status"},"artifact_id":{"type":"string","format":"uuid"}},"required":["action","artifact_id"],"additionalProperties":false},
+    {"x-humaux-operation":{"operation_key":"artifact.get","required_scope":"artifact:manage","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"get"},"artifact_id":{"type":"string","format":"uuid"}},"required":["action","artifact_id"],"additionalProperties":false},
+    {"x-humaux-operation":{"operation_key":"artifact.list","required_scope":"artifact:manage","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"list"},"workspace_id":{"type":"string","format":"uuid"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string","minLength":1,"maxLength":1024}},"required":["action"],"additionalProperties":false},
+    {"x-humaux-operation":{"operation_key":"artifact.search","required_scope":"artifact:manage","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"search"},"query":{"type":"string","minLength":1,"maxLength":4096},"workspace_id":{"type":"string","format":"uuid"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["action","query"],"additionalProperties":false}
+  ]
+}

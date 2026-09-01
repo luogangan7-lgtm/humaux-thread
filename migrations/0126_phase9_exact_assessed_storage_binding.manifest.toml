@@ -1,0 +1,48 @@
+migration_id = "0126_phase9_exact_assessed_storage_binding"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('staging.assert_phase9_exact_assessed_release(uuid)') is null
+  and not exists(select 1 from pg_constraint
+    where conrelid='staging.contribution_candidate_phase9_assessments'::regclass
+      and conname='phase9_assessment_exact_candidate_fk')
+  as precheck_ok
+"""
+
+postcheck = """
+select to_regprocedure('staging.assert_phase9_exact_assessed_release(uuid)') is not null
+  and exists(select 1 from pg_constraint
+    where conrelid='staging.contribution_candidates'::regclass
+      and conname='contribution_candidates_phase9_assessment_binding_unique' and contype='u')
+  and exists(select 1 from pg_constraint
+    where conrelid='staging.contribution_candidate_phase9_assessments'::regclass
+      and conname='phase9_assessment_exact_candidate_fk' and contype='f'
+      and condeferrable and condeferred)
+  and exists(select 1 from pg_constraint
+    where conrelid='staging.sanitized_public_candidates'::regclass
+      and conname='sanitized_public_candidates_phase9_source_unique' and contype='u')
+  and (select count(*)=6 from pg_trigger where tgname in
+    ('phase9_exact_candidate_binding','phase9_exact_release_binding','phase9_exact_assessment_binding',
+     'phase9_exact_lineage_binding','phase9_exact_envelope_binding',
+     'phase9_exact_outbox_binding') and tgenabled='O' and tgconstraint<>0)
+  and (select prosecdef and provolatile='v' and prorettype='void'::regtype
+       from pg_proc where oid='staging.assert_phase9_exact_assessed_release(uuid)'::regprocedure)
+  and not has_function_privilege('role_private_worker',
+    'staging.assert_phase9_exact_assessed_release(uuid)','EXECUTE')
+  and not has_function_privilege('role_public_worker',
+    'staging.assert_phase9_exact_assessed_release(uuid)','EXECUTE')
+  and not has_table_privilege('role_public_worker','staging.contribution_candidates','SELECT')
+  and not has_table_privilege('role_public_worker',
+    'staging.contribution_candidate_phase9_assessments','SELECT')
+  and not has_table_privilege('role_public_worker','staging.contribution_releases','SELECT')
+  and not has_table_privilege('role_public_worker','control.anonymous_source_lineage','SELECT')
+  and not has_table_privilege('role_public_worker','ops.outbox','SELECT')
+  and not has_any_column_privilege('role_public_worker',
+    'staging.contribution_candidate_phase9_assessments','SELECT')
+  and not has_any_column_privilege('role_public_worker',
+    'control.anonymous_source_lineage','SELECT')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Preserve applied assessed rows and anonymous history; repair bindings with a successor migration rather than weakening or rewriting this gate."
+backup_restore_requirement = "Apply only to an isolated PostgreSQL acceptance fixture until a production backup and rollout are approved. The migration validates every existing release and fails closed on a partial or mismatched assessed chain."

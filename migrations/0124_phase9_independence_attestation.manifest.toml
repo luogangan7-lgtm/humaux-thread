@@ -1,0 +1,44 @@
+migration_id = "0124_phase9_independence_attestation"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('public.claim_independence_attestations') is null
+  and to_regprocedure('public.attest_current_claim_independence(uuid,bigint,bytea)') is null
+  as precheck_ok
+"""
+
+postcheck = """
+select to_regclass('public.claim_independence_attestations') is not null
+  and to_regprocedure('public.attest_current_claim_independence(uuid,bigint,bytea)') is not null
+  and (select array_agg(column_name::text order by ordinal_position) from information_schema.columns
+       where table_schema='public' and table_name='claim_independence_attestations')
+      = array['attestation_id','claim_id','object_revision','body_sha','root_set_sha',
+        'support_count','independent_count','sybil_risk','policy_version','policy_digest',
+        'checks_complete','attested_at']
+  and not exists(select 1 from information_schema.columns
+    where table_schema='public' and table_name='claim_independence_attestations'
+      and column_name ~* '(principal|user|tenant|release|group|pseudonym|nullifier|roots?$)')
+  and exists(select 1 from pg_trigger
+    where tgrelid='public.claim_independence_attestations'::regclass
+      and tgname='claim_independence_attestation_append_only' and tgenabled='O')
+  and has_table_privilege('role_public_worker','public.claim_independence_attestations','SELECT')
+  and not has_table_privilege('role_public_worker','public.claim_independence_attestations','INSERT')
+  and not has_table_privilege('role_public_worker','public.claim_independence_attestations','UPDATE')
+  and not has_table_privilege('role_public_worker','public.claim_independence_attestations','DELETE')
+  and has_function_privilege('role_public_worker',
+    'public.attest_current_claim_independence(uuid,bigint,bytea)','EXECUTE')
+  and not has_table_privilege('role_public_worker','control.anonymous_source_lineage','SELECT')
+  and not has_any_column_privilege('role_public_worker','control.anonymous_source_lineage','SELECT')
+  and not has_table_privilege('role_public_worker','staging.contribution_releases','SELECT')
+  and not has_column_privilege('role_public_worker','staging.contribution_releases',
+    'policy_snapshot','SELECT')
+  and not has_table_privilege('role_public_worker',
+    'staging.contribution_candidate_phase9_assessments','SELECT')
+  and not has_table_privilege('role_public_worker','staging.sanitized_public_candidates','SELECT')
+  and (select prosecdef and provolatile='v' and prorettype='public.claim_independence_attestations'::regtype
+       from pg_proc where oid='public.attest_current_claim_independence(uuid,bigint,bytea)'::regprocedure)
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Preserve aggregate receipts as immutable evidence; repair clustering, policy, or ACL behavior in a successor migration without rewriting prior rows."
+backup_restore_requirement = "Apply only to an isolated PostgreSQL acceptance fixture for rehearsal. Production rollout requires an approved backup because this adds an append-only public receipt and owner-only protected-plane RLS policies."

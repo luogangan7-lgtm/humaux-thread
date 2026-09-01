@@ -27,7 +27,11 @@
 //! Three-state skip (§79.2): no DSN, unreachable DB, or the migration missing all print a
 //! visible SKIP and return.
 
-use std::sync::Mutex;
+use std::{
+    sync::{Mutex, mpsc},
+    thread,
+    time::{Duration, Instant},
+};
 
 use humaux_adapters::consolidate_repo;
 use humaux_adapters::postgres::ConsolidationDbPool;
@@ -49,6 +53,39 @@ fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
     // skip is not a pass (§79.2). This form is verified working on both drivers.
     let sep = if admin_dsn.contains('?') { '&' } else { '?' };
     format!("{admin_dsn}{sep}options=-c%20role%3D{role}")
+}
+
+fn dsn_as_role_with_application(admin_dsn: &str, role: &str, application_name: &str) -> String {
+    format!(
+        "{}&application_name={application_name}",
+        dsn_as_role(admin_dsn, role)
+    )
+}
+
+fn wait_for_selector_materialization_wait(
+    admin: &mut Client,
+    application_name: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: bool = admin
+            .query_one(
+                "SELECT EXISTS (                   SELECT 1                     FROM pg_stat_activity AS activity                     JOIN pg_locks AS locks USING (pid)                    WHERE activity.application_name = $1                      AND locks.locktype = 'relation'                      AND locks.relation = 'private.memory_consolidation_inputs'::regclass                      AND locks.mode = 'RowExclusiveLock'                      AND NOT locks.granted                 )",
+                &[&application_name],
+            )
+            .map_err(|error| format!("inspect selector materialization wait: {error}"))?
+            .get(0);
+        if waiting {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "selector {application_name} never waited for a RowExclusiveLock on \
+                 private.memory_consolidation_inputs within 30s"
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 struct Handle {
@@ -214,6 +251,41 @@ fn seed_active_memories(handle: &mut Handle, confidence: f32, count: usize) -> V
     ids
 }
 
+fn insert_concurrent_higher_ranked_memories(
+    admin_dsn: &str,
+    tenant_id: Uuid,
+    evidence_id: Uuid,
+) -> Result<(), String> {
+    let mut client = Client::connect(admin_dsn, NoTls)
+        .map_err(|error| format!("concurrent inserter connects: {error}"))?;
+    let mut txn = client
+        .transaction()
+        .map_err(|error| format!("begin concurrent insert transaction: {error}"))?;
+    for i in 0..60 {
+        let memory_id: Uuid = txn
+            .query_one(
+                "INSERT INTO private.memory_records \
+                   (tenant_id, memory_type, content, visibility_class, \
+                    authority_class, confidence, status, asserted_at) \
+                 VALUES ($1, 'NOTE', $2, 'TENANT_SHARED', \
+                         'PrivateKnowledge', 0.9, 'active', now()) \
+                 RETURNING memory_id",
+                &[&tenant_id, &serde_json::json!({"concurrent": i})],
+            )
+            .map_err(|error| format!("insert concurrent memory: {error}"))?
+            .get(0);
+        txn.execute(
+            "INSERT INTO private.memory_evidence (memory_id, evidence_id, role) \
+             VALUES ($1, $2, 'PRIMARY')",
+            &[&memory_id, &evidence_id],
+        )
+        .map_err(|error| format!("link concurrent memory evidence: {error}"))?;
+    }
+    txn.commit()
+        .map_err(|error| format!("commit concurrent memory inserts: {error}"))?;
+    Ok(())
+}
+
 fn recorded_input_memory_ids(handle: &mut Client, run_id: Uuid) -> Vec<Uuid> {
     handle
         .query(
@@ -283,91 +355,85 @@ fn run_one_iteration(handle: &mut Handle, iteration: usize) -> Vec<u8> {
     let reasoning_domain_id = handle.reasoning_domain_id;
     let evidence_id = handle.evidence_id;
     let admin_dsn = handle.admin_dsn.clone();
-    let consolidation = &handle.consolidation;
+    let selector_application_name = format!("cs_{iteration}_{}", Uuid::new_v4());
+    let selector_dsn = dsn_as_role_with_application(
+        &admin_dsn,
+        "role_consolidation_worker",
+        &selector_application_name,
+    );
 
-    // Fire the 60 "higher-ranked" (newer UUIDv7 -> sorts first under `ORDER BY memory_id
-    // DESC`) concurrent inserts on an independent connection, racing them against the
-    // selection transaction itself — a real thread, not a sequenced call, so the interleaving
-    // is genuine, not simulated. Each insert carries its own `memory_evidence` link in the
-    // same short transaction (§8.6, see `seed_active_memories`'s doc for why).
-    let accepted = handle.rt.block_on(async {
-        let selection = consolidate_repo::select_and_materialize_inputs(
-            consolidation,
-            run_id,
-            tenant_id,
-            reasoning_domain_id,
-            None,
-            10_000,
-        );
-        let inserter = tokio::task::spawn_blocking(move || {
-            let mut client =
-                Client::connect(&admin_dsn, NoTls).expect("concurrent inserter connects");
+    // This fixture-held SHARE lock is a durable barrier, unlike the old brief run-row lock.
+    // The selector has already established its REPEATABLE READ snapshot and read all eligible
+    // memory rows before its first INSERT into this table requests the blocked RowExclusiveLock.
+    let mut holder = Client::connect(&admin_dsn, NoTls).expect("connect materialization holder");
+    let mut holder_txn = holder
+        .transaction()
+        .expect("begin materialization-holder transaction");
+    holder_txn
+        .batch_execute("LOCK TABLE private.memory_consolidation_inputs IN SHARE MODE")
+        .expect("hold materialization table SHARE lock");
 
-            // Barrier — without it this gate is timing-dependent in BOTH directions.
-            //
-            // `tokio::join!` alone does not order the two sides: an insert that commits
-            // *before* the selection transaction establishes its `REPEATABLE READ` snapshot
-            // legitimately predates that snapshot, so it is correctly selected — and the
-            // assertion below then reports a "leak" that never happened (observed: green when
-            // run alone, red under full-workspace load). The mirror failure is worse: under
-            // other timings the inserts could all land after selection has already read, so
-            // the gate would pass without ever exercising the isolation it exists to prove.
-            //
-            // `select_and_materialize_inputs`'s first data statement is
-            // `UPDATE ... memory_consolidation_runs SET status = 'SELECTING' WHERE run_id`,
-            // which takes a row lock AND establishes the snapshot. That lock is observable
-            // from another connection while the transaction is still open (the UPDATE itself
-            // is not — it is uncommitted). So: spin on `FOR UPDATE NOWAIT` until it is
-            // refused (55P03 lock_not_available) and only then start inserting. At that point
-            // the snapshot provably exists, and every one of the 60 rows below is provably
-            // concurrent-after-snapshot — which is the only shape that proves isolation.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "selection transaction never took the run row lock within 30s — the \
-                     barrier below cannot establish that the snapshot exists, so this gate \
-                     would be asserting on an unknown ordering"
-                );
-                match client.query_one(
-                    "SELECT run_id FROM private.memory_consolidation_runs \
-                     WHERE run_id = $1 FOR UPDATE NOWAIT",
-                    &[&run_id],
-                ) {
-                    // Lock acquired => the selection txn has NOT reached its UPDATE yet.
-                    Ok(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
-                    // Refused => the selection txn holds the row lock => snapshot established.
-                    Err(e) if e.code().map(|c| c.code()) == Some("55P03") => break,
-                    Err(e) => panic!("unexpected error while probing the run row lock: {e}"),
-                }
-            }
-
-            for i in 0..60 {
-                let mut txn = client.transaction().expect("begin concurrent-insert txn");
-                let memory_id: Uuid = txn
-                    .query_one(
-                        "INSERT INTO private.memory_records \
-                           (tenant_id, memory_type, content, visibility_class, \
-                            authority_class, confidence, status, asserted_at) \
-                         VALUES ($1, 'NOTE', $2, 'TENANT_SHARED', \
-                                 'PrivateKnowledge', 0.9, 'active', now()) \
-                         RETURNING memory_id",
-                        &[&tenant_id, &serde_json::json!({"concurrent": i})],
-                    )
-                    .expect("concurrent insert must succeed")
-                    .get(0);
-                txn.execute(
-                    "INSERT INTO private.memory_evidence (memory_id, evidence_id, role) \
-                     VALUES ($1, $2, 'PRIMARY')",
-                    &[&memory_id, &evidence_id],
-                )
-                .expect("concurrent memory_evidence link must succeed");
-                txn.commit().expect("commit concurrent-insert txn");
-            }
-        });
-        let (selection, _) = tokio::join!(selection, inserter);
-        selection.expect("select_and_materialize_inputs must not error")
+    let selector = thread::spawn(move || {
+        let actor_rt = tokio::runtime::Runtime::new()
+            .map_err(|error| format!("create selector runtime: {error}"))?;
+        let actor_pool = actor_rt
+            .block_on(ConsolidationDbPool::connect(&selector_dsn))
+            .map_err(|error| format!("connect selector pool: {error}"))?;
+        actor_rt
+            .block_on(consolidate_repo::select_and_materialize_inputs(
+                &actor_pool,
+                run_id,
+                tenant_id,
+                reasoning_domain_id,
+                None,
+                10_000,
+            ))
+            .map_err(|error| format!("selector materialization: {error}"))
     });
+
+    // The exact actor must be waiting on this exact target relation before the 60 new rows
+    // commit. The fixture therefore proves a source set frozen before materialization, and
+    // catches the specific bad implementation that paginates and materializes each page in a
+    // separate transaction; it does not claim to distinguish RR from RC for one eager SELECT.
+    let barrier_result =
+        wait_for_selector_materialization_wait(&mut handle.admin, &selector_application_name);
+    let (inserter_done_tx, inserter_done_rx) = mpsc::channel();
+    let inserter = barrier_result.as_ref().ok().map(|()| {
+        let admin_dsn = admin_dsn.clone();
+        thread::spawn(move || {
+            let result =
+                insert_concurrent_higher_ranked_memories(&admin_dsn, tenant_id, evidence_id);
+            let completion = result.as_ref().map_err(Clone::clone).map(|_| ());
+            let _ = inserter_done_tx.send(completion);
+            result
+        })
+    });
+    let insertion_completion = inserter.as_ref().map(|_| {
+        inserter_done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|error| {
+                format!("concurrent inserter did not report a committed result within 30s: {error}")
+            })?
+    });
+
+    // No assertion may bypass cleanup: release the fixture lock, then collect every actor
+    // result, before reporting a barrier, writer, or selector failure.
+    let holder_release = holder_txn.rollback();
+    let selector_join = selector.join();
+    let inserter_join = inserter.map(|actor| actor.join());
+
+    barrier_result.expect("selector must reach the materialization wait barrier");
+    insertion_completion
+        .expect("inserter runs only after the materialization barrier")
+        .expect("concurrent higher-ranked inserts must commit");
+    holder_release.expect("release materialization-holder transaction");
+    let accepted = selector_join
+        .expect("selector actor must join")
+        .expect("select_and_materialize_inputs must not error");
+    inserter_join
+        .expect("inserter runs only after the materialization barrier")
+        .expect("inserter actor must join")
+        .expect("concurrent higher-ranked inserts must commit");
 
     let mut recorded: Vec<Uuid> = accepted
         .into_iter()

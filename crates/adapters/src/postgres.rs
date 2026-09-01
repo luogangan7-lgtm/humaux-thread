@@ -5,21 +5,14 @@
 //! meant to be** that sole encapsulation point — no other file in this workspace is meant to
 //! name `sqlx::PgPool` (G6-DB1 assertion B).
 //!
-//! **Assertion B has no execution body yet — this is a known gap, not a passing check.**
-//! `xtask/src/architecture_check.rs` implements `rule1_forbidden_fallback` /
-//! `rule2_degrade_fault_parity` / `rule3_positive_sentinels` and the §78.3
-//! `DOMAIN_FORBIDDEN_DEPS` scan, but that scan only runs against `humaux-domain` (the source
-//! explicitly notes `humaux-application` "is deliberately not checked here"). No
-//! `db-pool-topology-check` (G80-40) subcommand exists in `xtask` — the name only appears in
-//! `xtask/src/contract_impact.rs`'s test fixtures as a hypothetical `CheckerKind::Implemented`
-//! for a scenario that "assumes G80-26/G80-40 are already implemented (unlike this repo's
-//! actual state)". Adding a bare `PgPool` field anywhere outside this file — including on
-//! `humaux-application` types — will not be caught by any current gate. Tracked on the shared
-//! task canvas; land a real static scan (or equivalent) before G80-40 / G6-DB1 assertion B is
-//! treated as closed.
+//! G80-40's static topology scan is implemented in
+//! `xtask/src/architecture_check.rs`; the runtime half remains the `current_user` check and
+//! SQL fixtures below. Adding a bare `PgPool` field anywhere outside this file is therefore
+//! covered by the architecture gate as well as the compile-time sentinels.
 //!
-//! Closed set (§6.2.3): six newtypes, one per role that holds a standing connection pool
-//! (four landed with T1.4; T3.3+T3.4 adds `RetrievalWorkerDbPool` / `MaintenanceDbPool` —
+//! Closed set (§6.2.3): eight newtypes, one per role that holds a standing connection pool
+//! (four landed with T1.4; T3.3+T3.4 adds `RetrievalWorkerDbPool` / `MaintenanceDbPool`, and
+//! Phase 9 adds `PublicWorkerDbPool`; operational observations add read-only `AdminDbPool` —
 //! §15.4 `advance_prefix`'s `projection_highwater` write and §15.2's `ISSUED -> LOST` sweep
 //! are each the *only* legal writer of their respective column/transition per the §6.2.2
 //! grant matrix and `stream_log_guard_state_transition`'s per-`current_user` transition set
@@ -29,12 +22,13 @@
 //! leaked `PgPool` (via any of those) would let a caller run SQL under the wrong role's
 //! grants, defeating the entire point of the closed set. Application ports must take
 //! `&RuntimeDbPool` / `&BatchIssuerDbPool` / `&ConsolidationDbPool` / `&PrivateWorkerDbPool` /
-//! `&RetrievalWorkerDbPool` / `&MaintenanceDbPool` by name, never a bare `PgPool` (G6-DB1
-//! `tests/ui/pass_*` / `fail_*` fixtures prove both directions for the original four; the two
-//! added here follow the same `connect_checked` construction path so the same proof applies).
+//! `&RetrievalWorkerDbPool` / `&MaintenanceDbPool` / `&PublicWorkerDbPool` / `&AdminDbPool` by name, never a bare `PgPool` (G6-DB1
+//! `tests/ui/pass_*` / `fail_*` fixtures cover the five wrappers currently exposed by typed
+//! compile-pass ports; all eight wrappers use the same `connect_checked` construction path.
 
 use std::fmt;
 
+use humaux_domain::error::ErrorCode;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
@@ -50,8 +44,12 @@ pub const ROLE_PRIVATE_WORKER: &str = "role_private_worker";
 pub const ROLE_RETRIEVAL_WORKER: &str = "role_retrieval_worker";
 /// Literal `current_user` a [`MaintenanceDbPool`] connection must report (§6.2.3 assertion E).
 pub const ROLE_MAINTENANCE: &str = "role_maintenance";
+/// Literal `current_user` a [`PublicWorkerDbPool`] connection must report (§6.2.3 assertion E).
+pub const ROLE_PUBLIC_WORKER: &str = "role_public_worker";
+/// §6.2 read-only operational observation identity (ADR-0011).
+pub const ROLE_ADMIN: &str = "role_admin";
 
-/// Construction-time failure for any of the four typed pools (§6.2.3: "不符返回 Err").
+/// Construction-time failure for any typed pool (§6.2.3: "不符返回 Err").
 #[derive(Debug)]
 pub enum PoolInitError {
     /// The DSN could not be reached / authenticated at all.
@@ -211,6 +209,22 @@ impl RetrievalWorkerDbPool {
 /// never handed to a request-path handler.
 pub struct MaintenanceDbPool(PgPool);
 
+/// The read-only §4.2 admin identity. It has only the explicit observation SELECT
+/// grants in §6.2.2 and cannot inherit a maintenance or runtime writer connection.
+pub struct AdminDbPool(PgPool);
+
+impl AdminDbPool {
+    /// Connect and verify the actual database role before exposing any admin query.
+    pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
+        connect_checked(dsn, ROLE_ADMIN).await.map(Self)
+    }
+
+    /// Internal access only; callers cannot use an admin handle as a writer pool.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.0
+    }
+}
+
 impl MaintenanceDbPool {
     /// §6.2.3 assertion E: connects and verifies `current_user == "role_maintenance"`.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
@@ -221,6 +235,46 @@ impl MaintenanceDbPool {
     /// doc for why `pub(crate)` keeps G6-DB1's closed set intact.
     pub(crate) fn pool(&self) -> &PgPool {
         &self.0
+    }
+}
+
+/// `role_public_worker`'s independent public-contribution worker pool (§6.2.1).
+pub struct PublicWorkerDbPool(PgPool);
+
+impl PublicWorkerDbPool {
+    /// §6.2.3 assertion E: connects and verifies `current_user == "role_public_worker"`.
+    pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
+        connect_checked(dsn, ROLE_PUBLIC_WORKER).await.map(Self)
+    }
+
+    /// Public contribution worker queries stay inside this crate so the checked role wrapper
+    /// cannot be replaced by a pool belonging to another role.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.0
+    }
+}
+
+/// Binds observation writes to the public business pool's actual database identity.
+/// Raw pool handling stays in the sole PostgreSQL encapsulation module; the caller
+/// supplies only the two role-specific handles and never a request-provided target.
+pub(crate) async fn public_observation_database_matches(
+    writer: &MaintenanceDbPool,
+    business: &PublicWorkerDbPool,
+) -> Result<bool, ErrorCode> {
+    Ok(database_identity(&writer.0).await? == database_identity(&business.0).await?)
+}
+
+async fn database_identity(pool: &PgPool) -> Result<(String, String, i32), ErrorCode> {
+    let row = sqlx::query("SELECT current_database() AS db, inet_server_addr()::text AS addr, inet_server_port() AS port")
+        .fetch_one(pool).await.map_err(|_| ErrorCode::Internal)?;
+    let db: String = row.try_get("db").map_err(|_| ErrorCode::Internal)?;
+    let addr: Option<String> = row.try_get("addr").map_err(|_| ErrorCode::Internal)?;
+    let port: Option<i32> = row.try_get("port").map_err(|_| ErrorCode::Internal)?;
+    match (addr, port) {
+        (Some(addr), Some(port)) if !db.is_empty() && !addr.is_empty() && port > 0 => {
+            Ok((db, addr, port))
+        }
+        _ => Err(ErrorCode::InvalidInput),
     }
 }
 
@@ -280,29 +334,53 @@ mod tests {
             let Some(()) = require(
                 &mut client,
                 "role_mismatch_is_rejected",
-                &[ROLE_BATCH_ISSUER],
+                &[
+                    ROLE_BATCH_ISSUER,
+                    ROLE_PUBLIC_WORKER,
+                    ROLE_GATEWAY,
+                    ROLE_PRIVATE_WORKER,
+                ],
                 &[],
             ) else {
                 return;
             };
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime for sqlx connect");
-            rt.block_on(async {
-                let scoped = dsn_as_role(&dsn, ROLE_BATCH_ISSUER);
-                let err = connect_checked(&scoped, ROLE_GATEWAY).await.expect_err(
-                    "role_batch_issuer's current_user must not literally be role_gateway",
-                );
-                match err {
+            for wrong_role in [ROLE_GATEWAY, ROLE_PRIVATE_WORKER] {
+                let mismatch = rt
+                    .block_on(PublicWorkerDbPool::connect(&dsn_as_role(&dsn, wrong_role)))
+                    .err()
+                    .unwrap_or_else(|| panic!("public worker must reject {wrong_role} DSN"));
+                match mismatch {
                     PoolInitError::RoleMismatch { expected, actual } => {
-                        assert_eq!(expected, ROLE_GATEWAY);
-                        assert_eq!(actual, ROLE_BATCH_ISSUER);
+                        assert_eq!(expected, ROLE_PUBLIC_WORKER);
+                        assert_eq!(actual, wrong_role);
                     }
-                    PoolInitError::Connect(e) => panic!("expected RoleMismatch, got Connect({e})"),
+                    PoolInitError::Connect(e) => {
+                        panic!("expected RoleMismatch, got Connect({e})")
+                    }
                 }
-            });
+            }
+            for wrong_role in [ROLE_BATCH_ISSUER, ROLE_PUBLIC_WORKER] {
+                rt.block_on(async {
+                    let scoped = dsn_as_role(&dsn, wrong_role);
+                    let err = connect_checked(&scoped, ROLE_GATEWAY).await.expect_err(
+                        "a non-gateway current_user must not literally be role_gateway",
+                    );
+                    match err {
+                        PoolInitError::RoleMismatch { expected, actual } => {
+                            assert_eq!(expected, ROLE_GATEWAY);
+                            assert_eq!(actual, wrong_role);
+                        }
+                        PoolInitError::Connect(e) => {
+                            panic!("expected RoleMismatch, got Connect({e})")
+                        }
+                    }
+                });
+            }
         });
     }
 
-    /// §6.2.3 assertion E, positive branch, for all six roles: once `roles.sql` has created
+    /// §6.2.3 assertion E, positive branch, for all seven roles: once `roles.sql` has created
     /// the role, `SET ROLE` (via `dsn_as_role`) makes `current_user` match literally and
     /// `connect_checked` must return `Ok`. Per-role existence is a separate, narrower
     /// precondition than "DB reachable" — printed as its own `SKIP` line (§79 三态: 未就绪就
@@ -313,6 +391,22 @@ mod tests {
             "role_match_succeeds_once_role_exists",
             |(dsn, mut client)| {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime for sqlx connect");
+                if require(
+                    &mut client,
+                    "public_worker_direct_connect",
+                    &[ROLE_PUBLIC_WORKER],
+                    &[],
+                )
+                .is_some()
+                {
+                    let pool = rt
+                        .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
+                            &dsn,
+                            ROLE_PUBLIC_WORKER,
+                        )))
+                        .unwrap_or_else(|e| panic!("public worker wrapper connect failed: {e}"));
+                    rt.block_on(pool.pool().close());
+                }
                 for role in [
                     ROLE_GATEWAY,
                     ROLE_BATCH_ISSUER,
@@ -320,6 +414,7 @@ mod tests {
                     ROLE_PRIVATE_WORKER,
                     ROLE_RETRIEVAL_WORKER,
                     ROLE_MAINTENANCE,
+                    ROLE_PUBLIC_WORKER,
                 ] {
                     // A failed existence query means the admin fixture itself is broken
                     // (connection dropped, grants changed, syntax regression) — that is a

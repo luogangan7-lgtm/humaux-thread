@@ -1,0 +1,32 @@
+migration_id = "0123_phase9_public_dispatch_boundary"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('ops.claim_public_dispatch_jobs(uuid,text,double precision,bigint)') is null as precheck_ok
+"""
+
+postcheck = """
+select to_regprocedure('ops.dispatch_public_outbox(uuid,bigint)') is not null
+  and to_regprocedure('ops.claim_public_dispatch_jobs(uuid,text,double precision,bigint)') is not null
+  and to_regprocedure('ops.claim_global_anonymous_public_dispatches(text,double precision,bigint)') is not null
+  and has_function_privilege('role_public_worker','ops.claim_public_dispatch_jobs(uuid,text,double precision,bigint)','EXECUTE')
+  and has_function_privilege('role_public_worker','ops.claim_global_anonymous_public_dispatches(text,double precision,bigint)','EXECUTE')
+  and not exists(select 1 from information_schema.columns
+    where table_schema='ops' and table_name='public_anonymous_dispatches' and column_name='tenant_id')
+  and not has_table_privilege('role_public_worker','ops.public_anonymous_dispatches','SELECT')
+  and not has_table_privilege('role_public_worker','ops.public_anonymous_dispatches','INSERT')
+  and not has_table_privilege('role_public_worker','ops.public_anonymous_dispatches','UPDATE')
+  and not has_table_privilege('role_public_worker','ops.public_anonymous_dispatches','DELETE')
+  and not has_any_column_privilege('role_public_worker','ops.public_anonymous_dispatches','SELECT')
+  and not has_any_column_privilege('role_public_worker','ops.public_anonymous_dispatches','INSERT')
+  and not has_any_column_privilege('role_public_worker','ops.public_anonymous_dispatches','UPDATE')
+  and not has_table_privilege('role_public_worker','ops.outbox','SELECT')
+  and not has_table_privilege('role_public_worker','ops.jobs','SELECT')
+  and not has_any_column_privilege('role_public_worker','ops.outbox','SELECT')
+  and not has_any_column_privilege('role_public_worker','ops.jobs','SELECT')
+  and not has_table_privilege('role_public_worker','ops.outbox','INSERT')
+  and not has_table_privilege('role_public_worker','ops.jobs','UPDATE') as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Keep existing outbox/job rows immutable and repair protected dispatcher behavior in a later migration."
+backup_restore_requirement = "Apply first to an isolated PostgreSQL acceptance fixture. This revokes the public worker's direct ops queue access, so deploy this migration together with a binary that uses the protected dispatcher functions."

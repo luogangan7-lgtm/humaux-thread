@@ -9,6 +9,7 @@ pub mod boundary;
 pub mod code;
 pub mod consolidate;
 pub mod context;
+pub mod continuity;
 pub mod coordination;
 pub mod dataclass;
 pub mod egress;

@@ -1,0 +1,54 @@
+migration_id = "0137_project_continuity_read"
+class = "FORWARD_ONLY"
+
+precheck = """
+select to_regprocedure('private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])') is null
+  and to_regclass('private.continuity_projects') is not null
+  and to_regprocedure('private.publish_continuity_facet(uuid,uuid,uuid,uuid,uuid,text,bigint,text,jsonb,uuid[],bytea[],uuid[],bytea[])') is not null
+  as precheck_ok
+"""
+
+postcheck = """
+with runtime_roles(name) as (values
+  ('role_admin'),('role_gateway'),('role_private_worker'),
+  ('role_consolidation_worker'),('role_public_worker'),('role_retrieval_worker'),
+  ('role_batch_issuer'),('role_maintenance')),
+continuity_tables(name) as (values
+  ('continuity_projects'),('continuity_facet_versions'),
+  ('continuity_facet_memory_links'),('continuity_facet_evidence_links'),
+  ('continuity_facet_slots')),
+reader as (
+  select p.oid,p.prosecdef,p.provolatile,p.proconfig,p.proowner,
+         pg_get_functiondef(p.oid) definition
+  from pg_proc p where p.oid=
+    'private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])'::regprocedure
+)
+select
+  (select count(*)=1 from reader where prosecdef and provolatile='s'
+    and proconfig @> array['search_path=pg_catalog']::text[]
+    and pg_get_userbyid(proowner)='role_migration_owner')
+  and not has_function_privilege('public',
+    'private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])','EXECUTE')
+  and not exists(select 1 from runtime_roles role
+    where has_function_privilege(role.name,
+      'private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])','EXECUTE')
+      is distinct from (role.name='role_gateway'))
+  and not exists(select 1 from continuity_tables t cross join runtime_roles r
+    where has_table_privilege(r.name,'private.'||t.name,
+      'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'))
+  and (select strpos(definition,'project.workspace_id=ANY(p_authorized_workspace_ids)')>0
+    and strpos(definition,'project.lifecycle_state=''ACTIVE''')>0
+    and strpos(definition,'p_requested_workspace_id IS NULL')>0
+    and strpos(definition,'humaux.workspace_id')>0
+    and strpos(definition,'pg_input_is_valid')>0
+    and strpos(definition,'ORDER BY slot.facet_kind NULLS FIRST')>0
+    and strpos(definition,'selected_is_latest')>0
+    and strpos(definition,'max(candidate.facet_version)')>0
+    and strpos(definition,'continuity_facet_versions orphan')>0
+    and strpos(definition,'INSERT ') = 0 and strpos(definition,'UPDATE ') = 0
+    and strpos(definition,'DELETE ') = 0 from reader)
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Preserve the single Gateway-only raw reader, uniform zero-row NotFound seam, nil-before-parent GUC contract, and W1 zero-direct-table-privilege boundary."
+backup_restore_requirement = "Production apply is forbidden in W2 authoring. A future apply requires an approved restore point and distinct fresh PostgreSQL 18 apply/replay, ACL/RLS, one-RR concurrency, restart and mutation evidence."

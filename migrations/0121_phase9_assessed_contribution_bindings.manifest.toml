@@ -1,0 +1,36 @@
+migration_id = "0121_phase9_assessed_contribution_bindings"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('staging.contribution_candidate_phase9_assessments') is null
+  and to_regprocedure('staging.read_sanitized_public_candidate(uuid,bytea)') is null
+  and to_regprocedure('public.phase9_public_coverage_for_probe(bytea,integer)') is null as precheck_ok
+"""
+
+postcheck = """
+select to_regclass('staging.contribution_candidate_phase9_assessments') is not null
+  and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid='staging.contribution_candidate_phase9_assessments'::regclass)
+  and exists(select 1 from pg_constraint where conrelid='staging.contribution_candidate_phase9_assessments'::regclass
+    and conname='contribution_candidate_phase9_assessments_pkey' and contype='p')
+  and exists(select 1 from pg_trigger where tgrelid='staging.contribution_candidate_phase9_assessments'::regclass
+    and tgname='phase9_assessment_binding_guard' and tgenabled='O')
+  and exists(select 1 from pg_trigger where tgrelid='public.sources'::regclass
+    and tgname='anonymous_source_admission_guard' and tgenabled='O')
+  and exists(select 1 from pg_trigger where tgrelid='public.anonymous_source_lifecycle_events'::regclass
+    and tgname='anonymous_lifecycle_admission_guard' and tgenabled='O')
+  and has_table_privilege('role_private_worker','staging.contribution_candidate_phase9_assessments','SELECT')
+  and has_table_privilege('role_private_worker','staging.contribution_candidate_phase9_assessments','INSERT')
+  and not has_table_privilege('role_public_worker','staging.contribution_candidate_phase9_assessments','SELECT')
+  and has_function_privilege('role_public_worker','staging.read_sanitized_public_candidate(uuid,bytea)','EXECUTE')
+  and not has_table_privilege('role_public_worker','staging.sanitized_public_candidates','SELECT')
+  and not has_any_column_privilege('role_public_worker','staging.sanitized_public_candidates','SELECT')
+  and has_function_privilege('role_private_worker','public.phase9_public_coverage_for_probe(bytea,integer)','EXECUTE')
+  and has_function_privilege('role_public_worker','public.admit_anonymous_source(uuid,bytea)','EXECUTE')
+  and not has_table_privilege('role_private_worker','public.current_anonymous_source_objects','SELECT')
+  and not has_table_privilege('role_private_worker','public.claims','SELECT')
+  and not has_table_privilege('role_private_worker','public.syntheses','SELECT') as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Preserve protected two-pass bindings and public envelope history; adjust function shape or grants in a later migration without exposing tenant or release identity."
+backup_restore_requirement = "Apply only to the isolated PostgreSQL acceptance fixture until a production backup and rollout are approved. Legacy public.sources identity columns remain during the expand window; this migration does not authorize contract-drop."

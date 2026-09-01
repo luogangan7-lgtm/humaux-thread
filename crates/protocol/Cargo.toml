@@ -14,3 +14,14 @@ humaux-domain = { version = "0.1.0", path = "../domain" }
 # (paired digest 0.11.x, see Cargo.lock) rather than introducing a second major line.
 hmac = "0.13"
 sha2 = "0.11"
+# §33: SDK and HTTP wire types stay inside the Protocol adapter.
+# Native 2026-07-28 only; no provider/client/auth SDK feature is enabled.
+rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-streamable-http-server"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+jsonschema = { version = "=0.52.0", default-features = false }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync"] }
+tokio-util = "0.7"
+uuid = { version = "1.25.0", features = ["v7"] }

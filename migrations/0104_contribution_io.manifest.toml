@@ -1,0 +1,48 @@
+# §46.1 / ADR-0008: constrained tenant backfill + additive release events/closure targets.
+migration_id = "0104_contribution_io"
+class = "EXPAND_CONTRACT"
+
+# An old USER_CONTRIBUTION without a release parent cannot be repaired by guessing.
+# The release-source FK validation is authoritative; precheck detects known cross-tenancy.
+precheck = """
+select not exists (select 1 from public.sources where source_type='USER_CONTRIBUTION')
+  and not exists (
+    select 1 from staging.contribution_release_sources s
+    join staging.contribution_releases r using (contribution_release_id)
+    left join private.evidence_objects e on e.evidence_id=s.evidence_id
+    left join private.memory_records m on m.memory_id=s.memory_id
+    where (s.evidence_id is not null and e.tenant_id <> r.tenant_id)
+       or (s.memory_id is not null and m.tenant_id <> r.tenant_id))
+  and not exists (select 1 from information_schema.columns
+    where table_schema='ops' and table_name='outbox' and column_name='contribution_release_id')
+  as precheck_ok
+"""
+
+postcheck = """
+select (select count(*) from pg_constraint where conname in (
+    'release_sources_tenant_release_fk','release_sources_tenant_evidence_fk',
+    'release_sources_tenant_memory_fk','outbox_tenant_release_fk','outbox_row_class',
+    'sources_release_type','source_closure_exactly_one_target')) = 7
+  and to_regclass('public.source_closure_claim_root_unique') is not null
+  and to_regclass('public.source_closure_synthesis_root_unique') is not null
+  and to_regclass('ops.outbox_release_event_unique') is not null
+  and (select count(*) from pg_trigger where not tgisinternal and tgname in (
+    'contribution_release_guard','contribution_release_source_guard',
+    'contribution_release_requires_outbox','public_source_contribution_guard',
+    'public_provenance_contribution_guard','outbox_identity_guard')) = 6
+  and has_column_privilege('role_private_worker','ops.outbox','contribution_release_id','INSERT')
+  and not has_column_privilege('role_gateway','ops.outbox','contribution_release_id','INSERT')
+  and not has_table_privilege('role_public_worker','staging.contribution_releases','UPDATE')
+  and not has_table_privilege('role_public_worker','public.source_closure','DELETE')
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+Forward fix only after release events or synthesis closure rows exist. Do not discard audit
+events, release ancestry, or inactive closure pairs to fit the old schema. Before any production
+rollout take a PostgreSQL snapshot and rehearse restore. If a precheck detects orphan user
+sources, stop and recover their actual release provenance; never fabricate a release ID.
+On an isolated empty rehearsal database, discard the entire disposable database and replay
+immutable migrations from scratch rather than publishing a destructive reverse migration.
+"""
+backup_restore_requirement = "PostgreSQL snapshot + tested restore before production; transaction rollback on failure. This development run uses only a new disposable local database."

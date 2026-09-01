@@ -1,0 +1,129 @@
+migration_id = "0135_phase9_legacy_trust_trigger_acl"
+class = "FORWARD_ONLY"
+
+precheck = """
+select to_regprocedure('public.require_trust_root_seal()') is not null
+  and to_regprocedure('public.guard_evaluated_source_identity()') is not null
+  and to_regprocedure('public.public_receipt_matches(uuid,uuid,uuid,bigint,jsonb)') is not null
+  and to_regclass('public._legacy_receipt_match_basis') is null
+  and exists(select 1 from pg_trigger where tgrelid='public.claim_trust_evaluations'::regclass
+    and tgname='trust_roots_complete' and tgenabled='O'
+    and tgfoid='public.require_trust_root_seal()'::regprocedure)
+  and exists(select 1 from pg_trigger where tgrelid='public.claim_trust_evaluation_sources'::regclass
+    and tgname='trust_roots_sealed' and tgenabled='O'
+    and tgfoid='public.require_trust_root_seal()'::regprocedure)
+  and exists(select 1 from pg_trigger where tgrelid='public.sources'::regclass
+    and tgname='evaluated_source_identity' and tgenabled='O'
+    and tgfoid='public.guard_evaluated_source_identity()'::regprocedure)
+  and not (select prosecdef from pg_proc
+    where oid='public.require_trust_root_seal()'::regprocedure)
+  and not (select prosecdef from pg_proc
+    where oid='public.guard_evaluated_source_identity()'::regprocedure)
+  as precheck_ok
+"""
+
+postcheck = """
+select
+  (select pg_get_userbyid(relowner)='role_migration_owner'
+          and reloptions @> array['security_barrier=true','security_invoker=false']::text[]
+   from pg_class where oid='public._legacy_receipt_match_basis'::regclass)
+  and encode(sha256(convert_to(
+        pg_get_viewdef('public._legacy_receipt_match_basis'::regclass,true),'UTF8')),'hex')
+      ='7f397bfa87f9848f991cc7fb0cd6bafc65e8824a4f687413f5da6a77ba8a1bb1'
+  and (select pg_get_userbyid(relowner)='role_migration_owner'
+          and reloptions @> array['security_barrier=true','security_invoker=false']::text[]
+       from pg_class where oid='public.eligible_objects'::regclass)
+  and strpos(pg_get_viewdef('public.eligible_objects'::regclass,true),
+      '_legacy_receipt_match_basis')>0
+  and strpos(pg_get_viewdef('public.eligible_objects'::regclass,true),
+      'public_receipt_matches')=0
+  and (select pg_get_userbyid(proowner)='role_migration_owner'
+              and not prosecdef and provolatile='s'
+              and proconfig=array['search_path=pg_catalog, pg_temp']::text[]
+              and strpos(pg_get_functiondef(oid),'_legacy_receipt_match_basis')>0
+              and strpos(pg_get_functiondef(oid),'claim_trust_evaluations')=0
+              and strpos(pg_get_functiondef(oid),'claim_trust_evaluation_sources')=0
+              and strpos(pg_get_functiondef(oid),'poisoning_signals')=0
+        from pg_proc
+        where oid='public.public_receipt_matches(uuid,uuid,uuid,bigint,jsonb)'::regprocedure)
+  and (select pg_get_userbyid(proowner)='role_migration_owner'
+              and prosecdef and provolatile='v'
+              and proconfig=array['search_path=pg_catalog, pg_temp']::text[]
+        from pg_proc where oid='public.require_trust_root_seal()'::regprocedure)
+  and (select pg_get_userbyid(proowner)='role_migration_owner'
+              and prosecdef and provolatile='v'
+              and proconfig=array['search_path=pg_catalog, pg_temp']::text[]
+        from pg_proc where oid='public.guard_evaluated_source_identity()'::regprocedure)
+  and exists(select 1 from pg_trigger where tgrelid='public.claim_trust_evaluations'::regclass
+    and tgname='trust_roots_complete' and tgenabled='O'
+    and tgfoid='public.require_trust_root_seal()'::regprocedure)
+  and exists(select 1 from pg_trigger where tgrelid='public.claim_trust_evaluation_sources'::regclass
+    and tgname='trust_roots_sealed' and tgenabled='O'
+    and tgfoid='public.require_trust_root_seal()'::regprocedure)
+  and exists(select 1 from pg_trigger where tgrelid='public.sources'::regclass
+    and tgname='evaluated_source_identity' and tgenabled='O'
+    and tgfoid='public.guard_evaluated_source_identity()'::regprocedure)
+  and not (select prosecdef from pg_proc
+    where oid='public.guard_trust_evaluation()'::regprocedure)
+  and not exists(
+    select 1 from aclexplode(coalesce(
+      (select relacl from pg_class where oid='public._legacy_receipt_match_basis'::regclass),
+      acldefault('r',(select relowner from pg_class
+        where oid='public._legacy_receipt_match_basis'::regclass)))) acl
+    where acl.grantee=0 and acl.privilege_type='SELECT')
+  and not exists(
+    select 1 from aclexplode(coalesce(
+      (select relacl from pg_class where oid='public.eligible_objects'::regclass),
+      acldefault('r',(select relowner from pg_class
+        where oid='public.eligible_objects'::regclass)))) acl
+    where acl.grantee=0)
+  and not exists(
+    select 1 from (values
+      ('role_admin',false),('role_gateway',true),('role_private_worker',false),
+      ('role_consolidation_worker',false),('role_public_worker',true),
+      ('role_retrieval_worker',true),('role_batch_issuer',false),
+      ('role_maintenance',true)) runtime(role_name,expected_select)
+    where has_table_privilege(runtime.role_name,'public.eligible_objects','SELECT')
+      is distinct from runtime.expected_select
+      or has_table_privilege(runtime.role_name,
+        'public.eligible_objects','INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'))
+  and not exists(
+    select 1 from aclexplode(coalesce(
+      (select proacl from pg_proc where oid=
+        'public.public_receipt_matches(uuid,uuid,uuid,bigint,jsonb)'::regprocedure),
+      acldefault('f',(select proowner from pg_proc where oid=
+        'public.public_receipt_matches(uuid,uuid,uuid,bigint,jsonb)'::regprocedure)))) acl
+    where acl.grantee=0 and acl.privilege_type='EXECUTE')
+  and not exists(
+    select 1 from (values
+      ('role_admin'),('role_gateway'),('role_private_worker'),
+      ('role_consolidation_worker'),('role_public_worker'),('role_retrieval_worker'),
+      ('role_batch_issuer'),('role_maintenance')) runtime(role_name)
+    where has_table_privilege(runtime.role_name,
+      'public._legacy_receipt_match_basis','SELECT')
+      or has_function_privilege(runtime.role_name,
+        'public.public_receipt_matches(uuid,uuid,uuid,bigint,jsonb)','EXECUTE')
+      or has_function_privilege(runtime.role_name,
+        'public.require_trust_root_seal()','EXECUTE')
+      or has_function_privilege(runtime.role_name,
+        'public.guard_evaluated_source_identity()','EXECUTE'))
+  and not exists(
+    select 1 from (values
+      ('role_gateway'),('role_public_worker'),('role_retrieval_worker')) runtime(role_name)
+    where has_table_privilege(runtime.role_name,
+      'public.claim_trust_evaluations','SELECT')
+      or has_table_privilege(runtime.role_name,
+        'public.claim_trust_evaluation_sources','SELECT')
+      or has_table_privilege(runtime.role_name,
+        'public.poisoning_signals','SELECT'))
+  and not exists(
+    select 1 from (values
+      ('role_gateway'),('role_public_worker'),('role_retrieval_worker'),('role_maintenance'))
+      runtime(role_name)
+    where not has_function_privilege(runtime.role_name,
+      'public.current_public_roots(uuid,uuid)','EXECUTE'))
+  as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Preserve the 0134 anonymous no-read fence, the owner-only receipt-basis SSOT, and append-only legacy receipts; repair any later issue in a successor migration."
+backup_restore_requirement = "Production apply requires an approved restore point and disposable PostgreSQL 18 proof of 103/103 migrations plus replay-0, legacy commit success, support-count rollback, helper/table/matcher direct denial, trusted matcher use, anonymous fence continuity, hydration, and predicate mutation reds."

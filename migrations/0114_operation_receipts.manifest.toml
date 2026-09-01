@@ -1,0 +1,27 @@
+migration_id = "0114_operation_receipts"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.usage_reservations') is not null
+ and to_regclass('control.operation_receipts') is null as precheck_ok
+"""
+
+postcheck = """
+select to_regclass('control.operation_receipts') is not null
+ and has_table_privilege('role_gateway','control.operation_receipts','SELECT')
+ and has_table_privilege('role_gateway','control.operation_receipts','INSERT')
+ and not has_table_privilege('role_gateway','control.operation_receipts','UPDATE')
+ and not has_table_privilege('role_gateway','control.operation_receipts','DELETE')
+ and has_table_privilege('role_maintenance','control.operation_receipts','SELECT')
+ and not has_table_privilege('role_maintenance','control.operation_receipts','INSERT')
+ and not has_table_privilege('role_batch_issuer','control.operation_receipts','INSERT')
+ and exists(select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
+            where n.nspname='control' and c.relname='operation_receipts'
+              and c.relrowsecurity and c.relforcerowsecurity)
+ and exists(select 1 from pg_trigger where tgrelid='control.operation_receipts'::regclass
+            and tgname='operation_receipt_integrity' and not tgisinternal)
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Never delete committed idempotency keys or reopen them silently; preserve receipt tombstones and billing/audit references. No owner runtime pool."
+backup_restore_requirement = "Production requires approved backup and rollout. Local acceptance may write only the separately approved isolated request-guard fixture. Keep applied 0113 immutable; verify atomic business/quota/audit failure and physical Evidence deletion tombstones before release."

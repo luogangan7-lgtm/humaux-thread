@@ -7,11 +7,11 @@
 //! `humaux-consolidation-worker`, whose own Cargo.toml documents *not* having a path to
 //! either `humaux_adapters::byok`'s decrypt trait or an OpenBao client, §11.8 — that binary
 //! must go through this one over mTLS for any USER_REASONING call). This task's scope is the
-//! process skeleton only: `humaux_adapters::openbao` (real OpenBao client) and this module's
-//! own `OpenAiCompatTransport` real backend are still pending wiring (see `crates/adapters/
-//! src/byok.rs`'s module doc) — wiring the actual claim/lease job loop and the concrete
-//! `UserReasoningProvider` construction is a later task, same "not wired yet" boundary every
-//! other `bins/*/src/main.rs` in this workspace currently documents for its own process.
+//! process bootstrap only: [`humaux_private_worker::ContributionExecutionRunner`] now owns the
+//! bounded claim/lease state machine, while `humaux_adapters::openbao` (real OpenBao client), the
+//! concrete `UserReasoningProvider`, and deployment config remain pending wiring (see
+//! `crates/adapters/src/byok.rs`'s module doc). This binary therefore still proves only the typed
+//! role connection; it cannot start a production provider loop without those explicit inputs.
 
 use humaux_adapters::postgres::PrivateWorkerDbPool;
 

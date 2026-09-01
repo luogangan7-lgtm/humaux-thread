@@ -10,12 +10,17 @@
 //!   真正接线为 live probe，见 `cell_resources` 模块文档。
 
 mod cell_resources;
+mod mechanism;
 mod probe;
 mod render;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str) {
+        Some("mechanism") => match args.get(2).map(String::as_str) {
+            Some("status") => mechanism::status(&args[3..]),
+            _ => usage(),
+        },
         Some("render") => match args.get(2).map(String::as_str) {
             Some("mechanism-registry") => render::mechanism_registry(&args[3..]),
             _ => usage(),
@@ -31,7 +36,7 @@ fn main() {
 
 fn usage() -> i32 {
     eprintln!(
-        "usage: humaux-admin <render mechanism-registry [--deployment ID --cell ID] | q <name>>"
+        "usage: humaux-admin <render mechanism-registry [--deployment ID --cell ID] | mechanism status --deployment ID --cell ID | q <name>>"
     );
     2
 }

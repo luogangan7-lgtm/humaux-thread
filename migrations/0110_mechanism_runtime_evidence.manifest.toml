@@ -1,0 +1,17 @@
+migration_id = "0110_mechanism_runtime_evidence"
+class = "EXPAND_CONTRACT"
+precheck = """
+select to_regclass('ops.mechanism_observations') is not null
+ and to_regclass('ops.mechanism_e2e_runs') is null as precheck_ok
+"""
+postcheck = """
+select to_regclass('ops.mechanism_e2e_runs') is not null
+ and exists(select 1 from information_schema.columns
+   where table_schema='ops' and table_name='mechanism_observations' and column_name='scope_hash')
+ and has_table_privilege('role_admin','ops.mechanism_observations','SELECT')
+ and not has_table_privilege('role_admin','ops.mechanism_observations','INSERT')
+ and exists(select 1 from pg_trigger where tgname='mechanism_e2e_binding'
+   and tgrelid='ops.mechanism_e2e_runs'::regclass) as postcheck_ok
+"""
+rollback_or_forward_fix = "Forward fix only; retain original observations and linked run receipts. Never manufacture legacy hashes or E2E links."
+backup_restore_requirement = "Production requires backup, impact review, approval and externally provisioned role_admin authentication. Test only in a separate disposable PostgreSQL18 cluster because CREATE ROLE is cluster-wide."

@@ -1,0 +1,32 @@
+migration_id = "0116_retrieval_query_source_hardening"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('private.retrieval_query_sources') is not null
+  and not exists (
+    select 1 from pg_constraint
+    where conrelid='private.retrieval_query_sources'::regclass
+      and conname='retrieval_query_sources_private_data_class'
+  ) as precheck_ok
+"""
+
+postcheck = """
+select exists (
+    select 1 from pg_constraint
+    where conrelid='private.retrieval_query_sources'::regclass
+      and conname='retrieval_query_sources_private_data_class'
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conrelid='private.retrieval_query_sources'::regclass
+      and conname='retrieval_query_sources_query_bytes_positive'
+  )
+  and exists (
+    select 1 from pg_constraint
+    where conrelid='private.retrieval_query_sources'::regclass
+      and conname='retrieval_query_sources_wire_payload_bytes_positive'
+  ) as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. The stricter sealed-query contract is retained for already durable metadata; do not delete retained source or disclosure rows."
+backup_restore_requirement = "Production requires approved backup and rollout. Acceptance writes only the isolated 127.0.0.1:61719 guard database; query bodies, provider traffic, credentials, and deployment remain out of scope."

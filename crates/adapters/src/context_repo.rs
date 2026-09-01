@@ -8,24 +8,41 @@
 //! 走 [`RuntimeDbPool`]（`role_gateway`）：这是在线请求路径上的**纯读**，与 §16.2 的读路由
 //! 同一条依据。§6.2.3 的 typed pool 闭集不动、无转换路径。
 //!
-//! **每个 selector 发两条查询**：一条不带 `LIMIT` 的 `COUNT(*)` 给 `expected`，一条取行。
-//! 两个数分开取是 §25.5「禁止静默截断」在取数段**唯一能红**的形态——`expected` 若内生
-//! （取 `rows.len()`），守恒式 `expected == returned + missing` 就退化成恒真算术，
-//! 少带了多少永远算作 0。同 `EvidenceBlock` 的 ticket/no_batch 手法。
+//! **每个 selector 发两次独立的无 `LIMIT` 枚举**：第一次得到 `expected` 的候选集合，第二次
+//! 投影 lane 行。两次都经过同一个 `can_read` 回验，但不能从投影行的长度反推 expected；否则
+//! `expected == returned + missing` 会退化成恒真算术，少带了多少永远算作 0。
 
 use humaux_domain::authority::{AuthorityClass, MemoryId};
 use humaux_domain::context::{
-    Admitted, BindingGrant, FrozenReads, MandatoryLane, MandatoryRow, PinnedLane, ScopeKind,
+    Admitted, BindingGrant, ContextBudget, FrozenReads, MandatoryLane, MandatoryRow, PinnedLane,
     SelectorId, SelectorOutcome, SelectorSpec, spec,
 };
 use humaux_domain::error::ErrorCode;
 use humaux_domain::grounding::{GroundingMode, RowGrounding, SnapshotEdge, classify_in_snapshot};
-use humaux_domain::ids::Scope;
+use humaux_domain::identity::{
+    AuthorizationScope, VisibilityClass, VisibilityDescriptor, can_read,
+};
+use humaux_domain::ids::{Scope, UserId, WorkspaceId};
+use humaux_domain::selection::{AUTHORIZED_MEMORY_ENUMERATION_V1, Cursor, query_fingerprint};
+use humaux_projection::serving::StreamFamily;
+use humaux_projection::stream::StreamKey;
+use humaux_retrieval::compiler::{ContextItem, ContextOutcome};
+use humaux_retrieval::envelope::GroundingBlock;
+use humaux_retrieval::handoff::{Handoff, assemble_with_context};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::types::Uuid;
+use std::collections::{HashMap, HashSet};
 
 use crate::postgres::RuntimeDbPool;
+use crate::read_materialize::{
+    MaterializedBodies, MaterializedItem, final_memory_ids_in_txn, materialize_final_bodies_in_txn,
+    materialize_one_memory_in_txn,
+};
+use crate::selection_repo::{
+    begin_authorized_snapshot_in_txn, fetch_authorized_snapshot_page_in_txn,
+};
+use crate::stream_repo::close_ledger_in_txn;
 
 type Txn<'c> = sqlx::Transaction<'c, sqlx::Postgres>;
 
@@ -35,6 +52,64 @@ async fn set_tenant_local(txn: &mut Txn<'_>, tenant_id: Uuid) -> Result<(), sqlx
         .execute(&mut **txn)
         .await?;
     Ok(())
+}
+
+pub(crate) async fn set_authorization_local(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+) -> Result<(), ErrorCode> {
+    set_tenant_local(txn, authorization.tenant_id().0)
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    // A pooled connection can have a session-level value from outside this adapter. Always
+    // install a transaction-local value. Existing visibility RLS casts this GUC directly to
+    // UUID, so a headless scope uses the nil UUID sentinel rather than an empty string; it
+    // cannot match a normal authenticated user and keeps the query fail-closed.
+    sqlx::query("SELECT set_config('humaux.user_id', $1, true)")
+        .bind(
+            authorization
+                .user_id()
+                .map(|user| user.0.to_string())
+                .unwrap_or_else(|| Uuid::nil().to_string()),
+        )
+        .execute(&mut **txn)
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    Ok(())
+}
+
+/// Resolves a tool-supplied scope against the authenticated scope. The resulting scope is
+/// made only from authenticated fields; caller input can select one already-authorized
+/// workspace but cannot manufacture a tenant, user, or deeper resource grant (§6.1.1).
+fn canonical_scope(
+    authorization: &AuthorizationScope,
+    requested: &Scope,
+) -> Result<(AuthorizationScope, Scope), ErrorCode> {
+    if requested.tenant_id != authorization.tenant_id()
+        || requested.user_id != authorization.user_id()
+        || requested.repository_id.is_some()
+        || requested.task_id.is_some()
+        || requested.run_id.is_some()
+        || requested.agent_id.is_some()
+    {
+        return Err(ErrorCode::Forbidden);
+    }
+    let authorization = match requested.workspace_id {
+        Some(workspace) => authorization.narrow(workspace)?,
+        None => authorization.clone(),
+    };
+    Ok((
+        authorization.clone(),
+        Scope {
+            tenant_id: authorization.tenant_id(),
+            user_id: authorization.user_id(),
+            workspace_id: requested.workspace_id,
+            repository_id: None,
+            task_id: None,
+            run_id: None,
+            agent_id: None,
+        },
+    ))
 }
 
 /// 一个 selector 今天跑不跑得起来。
@@ -91,27 +166,11 @@ pub async fn probe_selectors(pool: &RuntimeDbPool) -> Result<[SelectorAvailabili
     out.try_into().map_err(|_| ErrorCode::Internal)
 }
 
-/// `scope_chain` 里所有 workspace 层 id（`project_active_constraints_v1` 的可见域）。
-fn workspace_ids(scope: &Scope) -> Vec<Uuid> {
-    humaux_domain::context::scope_chain(scope)
-        .into_iter()
-        .filter(|(kind, _)| matches!(kind, ScopeKind::Workspace))
-        .map(|(_, id)| id)
-        .collect()
-}
-
 /// `project_active_constraints_v1` 的 WHERE。
-///
-/// **`visibility_class <> 'USER_PRIVATE' OR visibility_user_id = $3` 这半句不可省。**
-/// 今天 `0012_rls.sql` 的组合策略会兜住它，但 selector 自己的谓词不能错：任何一条绕过或
-/// 尚未上 RLS 的读路径都会把**同租户里别人的私有 constraint** 装进 Context。
-/// 判据不该依赖另一层恰好也在。
 const PROJECT_CONSTRAINTS_WHERE: &str = "m.tenant_id = $1 \
      AND m.authority_class = 'ProjectConstraint' \
      AND m.status = 'active' \
-     AND m.superseded_by IS NULL \
-     AND (m.visibility_workspace_id IS NULL OR m.visibility_workspace_id = ANY($2)) \
-     AND (m.visibility_class <> 'USER_PRIVATE' OR m.visibility_user_id = $3)";
+     AND m.superseded_by IS NULL";
 
 /// `user_confirmed_corrections_v1` 的 WHERE。
 ///
@@ -122,7 +181,6 @@ const USER_CORRECTIONS_WHERE: &str = "m.tenant_id = $1 \
      AND m.authority_class = 'UserCorrection' \
      AND m.status = 'active' \
      AND m.superseded_by IS NULL \
-     AND (m.visibility_class <> 'USER_PRIVATE' OR m.visibility_user_id = $3) \
      AND EXISTS ( \
        SELECT 1 FROM private.memory_evidence me \
        JOIN private.evidence_objects eo ON eo.evidence_id = me.evidence_id \
@@ -137,14 +195,18 @@ const USER_CORRECTIONS_WHERE: &str = "m.tenant_id = $1 \
 const EXPLICIT_BINDINGS_WHERE: &str = "m.tenant_id = $1 \
      AND m.status = 'active' \
      AND m.superseded_by IS NULL \
-     AND m.authority_class = 'ProjectConstraint' \
-     AND (m.visibility_class <> 'USER_PRIVATE' OR m.visibility_user_id = $3) \
+     AND m.authority_class IN ('ProjectConstraint', 'ExplicitTaskContext') \
      AND EXISTS ( \
        SELECT 1 FROM private.context_bindings cb \
        WHERE cb.memory_id = m.memory_id \
          AND cb.tenant_id = m.tenant_id \
          AND cb.revoked_at IS NULL \
          AND cb.mode = 'MANDATORY' \
+         AND EXISTS ( \
+           SELECT 1 FROM unnest($2::text[], $3::uuid[]) AS request_scope(kind, id) \
+           WHERE cb.scope_kind = request_scope.kind \
+             AND COALESCE(cb.scope_id, cb.tenant_id) = request_scope.id \
+         ) \
      )";
 
 /// 每行的估计 token 数。
@@ -154,31 +216,152 @@ const EXPLICIT_BINDINGS_WHERE: &str = "m.tenant_id = $1 \
 // 「超没超硬上限」不是「差几个 token」）；真 tokenizer 落地后换掉这一处即可。
 const EST_TOKENS_EXPR: &str = "GREATEST(1, (octet_length(m.content::text) / 4))::int4";
 
-/// 跑一个 selector 的两条查询。
+/// Converts the database's closed visibility wire values into the actual descriptor on that
+/// row. The visibility decision itself remains [`can_read`]'s single implementation.
+pub(crate) fn visibility_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<VisibilityDescriptor, ErrorCode> {
+    let class: String = row
+        .try_get("visibility_class")
+        .map_err(|_| ErrorCode::Internal)?;
+    let class = match class.as_str() {
+        "USER_PRIVATE" => VisibilityClass::UserPrivate,
+        "WORKSPACE_SHARED" => VisibilityClass::WorkspaceShared,
+        "TENANT_SHARED" => VisibilityClass::TenantShared,
+        _ => return Err(ErrorCode::Internal),
+    };
+    let user_id = row
+        .try_get::<Option<Uuid>, _>("visibility_user_id")
+        .map_err(|_| ErrorCode::Internal)?
+        .map(UserId);
+    let workspace_id = row
+        .try_get::<Option<Uuid>, _>("visibility_workspace_id")
+        .map_err(|_| ErrorCode::Internal)?
+        .map(WorkspaceId);
+    Ok(VisibilityDescriptor {
+        class,
+        user_id,
+        workspace_id,
+    })
+}
+
+fn scope_chain_params(scope: &Scope) -> (Vec<String>, Vec<Uuid>) {
+    humaux_domain::context::scope_chain(scope)
+        .into_iter()
+        .map(|(kind, id)| (kind.wire().to_owned(), id))
+        .unzip()
+}
+
+/// Runs `can_read` against real Memory and backing Evidence rows. A Memory without a backing
+/// Evidence row, or with any Evidence row hidden by RLS, fails closed (§6.1.1/§8.6).
+pub(crate) async fn readable_memory_ids(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+    candidate_ids: &[Uuid],
+) -> Result<HashSet<Uuid>, ErrorCode> {
+    if candidate_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let memories = sqlx::query(
+        "SELECT memory_id, visibility_class, visibility_user_id, visibility_workspace_id \
+         FROM private.memory_records WHERE tenant_id = $1 AND memory_id = ANY($2)",
+    )
+    .bind(authorization.tenant_id().0)
+    .bind(candidate_ids)
+    .fetch_all(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?;
+    let mut memory_visibility = HashMap::with_capacity(memories.len());
+    for row in memories {
+        let memory_id = row.try_get("memory_id").map_err(|_| ErrorCode::Internal)?;
+        memory_visibility.insert(memory_id, visibility_from_row(&row)?);
+    }
+
+    // `memory_evidence` remains visible through its Memory RLS policy; the LEFT JOIN exposes
+    // a hidden Evidence row as NULL, so a tenant-visible Memory cannot smuggle a private source
+    // into Context merely because the Evidence table's RLS omitted it from the join.
+    let evidence = sqlx::query(
+        "SELECT me.memory_id, eo.evidence_id AS visible_evidence_id, eo.visibility_class, \
+                eo.visibility_user_id, eo.visibility_workspace_id \
+         FROM private.memory_evidence me \
+         LEFT JOIN private.evidence_objects eo \
+           ON eo.evidence_id = me.evidence_id AND eo.tenant_id = $1 \
+         WHERE me.memory_id = ANY($2)",
+    )
+    .bind(authorization.tenant_id().0)
+    .bind(candidate_ids)
+    .fetch_all(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?;
+    let mut evidence_by_memory: HashMap<Uuid, Vec<Option<VisibilityDescriptor>>> = HashMap::new();
+    for row in evidence {
+        let memory_id = row.try_get("memory_id").map_err(|_| ErrorCode::Internal)?;
+        let visible: Option<Uuid> = row
+            .try_get("visible_evidence_id")
+            .map_err(|_| ErrorCode::Internal)?;
+        let descriptor = visible.map(|_| visibility_from_row(&row)).transpose()?;
+        evidence_by_memory
+            .entry(memory_id)
+            .or_default()
+            .push(descriptor);
+    }
+
+    Ok(memory_visibility
+        .into_iter()
+        .filter_map(|(memory_id, descriptor)| {
+            let evidence = evidence_by_memory.get(&memory_id)?;
+            (can_read(authorization, &descriptor)
+                && !evidence.is_empty()
+                && evidence.iter().all(|descriptor| {
+                    descriptor.is_some_and(|value| can_read(authorization, &value))
+                }))
+            .then_some(memory_id)
+        })
+        .collect())
+}
+
+async fn selector_candidate_ids(
+    txn: &mut Txn<'_>,
+    s: &'static SelectorSpec,
+    where_clause: &str,
+    scope: &Scope,
+) -> Result<Vec<Uuid>, ErrorCode> {
+    let sql = format!("SELECT m.memory_id FROM private.memory_records m WHERE {where_clause}");
+    let rows = if s.id == SelectorId::ExplicitMandatoryBindingsV1 {
+        let (kinds, ids) = scope_chain_params(scope);
+        sqlx::query(&sql)
+            .bind(scope.tenant_id.0)
+            .bind(kinds)
+            .bind(ids)
+            .fetch_all(&mut **txn)
+            .await
+    } else {
+        sqlx::query(&sql)
+            .bind(scope.tenant_id.0)
+            .fetch_all(&mut **txn)
+            .await
+    }
+    .map_err(|_| ErrorCode::Internal)?;
+    rows.into_iter()
+        .map(|row| row.try_get("memory_id").map_err(|_| ErrorCode::Internal))
+        .collect()
+}
+
+/// Runs one selector's independent candidate enumeration and row projection. The former
+/// remains the expected-count oracle; both are filtered by the single Rust `can_read` policy.
 async fn run_selector(
     txn: &mut Txn<'_>,
     s: &'static SelectorSpec,
     where_clause: &str,
-    tenant_id: Uuid,
-    workspaces: &[Uuid],
-    user_id: Option<Uuid>,
+    authorization: &AuthorizationScope,
+    scope: &Scope,
 ) -> Result<SelectorOutcome, ErrorCode> {
-    // ① 不带 LIMIT 的 COUNT —— `expected` 的来源。与 ② 分开发，见模块 doc。
-    let expected: i64 = sqlx::query(&format!(
-        "SELECT count(*) FROM private.memory_records m WHERE {where_clause}"
-    ))
-    .bind(tenant_id)
-    .bind(workspaces)
-    .bind(user_id)
-    .fetch_one(&mut **txn)
-    .await
-    .map_err(|_| ErrorCode::Internal)?
-    .try_get(0)
-    .map_err(|_| ErrorCode::Internal)?;
+    let expected_candidates = selector_candidate_ids(txn, s, where_clause, scope).await?;
+    let expected_ids = readable_memory_ids(txn, authorization, &expected_candidates).await?;
 
     // ② 取行——每行带两个快照内 grounding 事实（有没有 LIVE edge / 有没有未记版本的
     //    LIVE edge），喂 `classify_in_snapshot`。resolver 永不进本事务。
-    let rows = sqlx::query(&format!(
+    let sql = format!(
         "SELECT m.memory_id, m.authority_class, {EST_TOKENS_EXPR} AS est_tokens, \
                 EXISTS(SELECT 1 FROM private.memory_evidence me \
                        WHERE me.memory_id = m.memory_id AND me.grounding_mode = 'LIVE') \
@@ -188,18 +371,30 @@ async fn run_selector(
                          AND me.recorded_version IS NULL) \
                   AS has_live_unversioned \
          FROM private.memory_records m WHERE {where_clause} ORDER BY m.memory_id"
-    ))
-    .bind(tenant_id)
-    .bind(workspaces)
-    .bind(user_id)
-    .fetch_all(&mut **txn)
-    .await
+    );
+    let rows = if s.id == SelectorId::ExplicitMandatoryBindingsV1 {
+        let (kinds, ids) = scope_chain_params(scope);
+        sqlx::query(&sql)
+            .bind(scope.tenant_id.0)
+            .bind(kinds)
+            .bind(ids)
+            .fetch_all(&mut **txn)
+            .await
+    } else {
+        sqlx::query(&sql)
+            .bind(scope.tenant_id.0)
+            .fetch_all(&mut **txn)
+            .await
+    }
     .map_err(|_| ErrorCode::Internal)?;
 
     let mut out = Vec::with_capacity(rows.len());
     let mut needs = Vec::new();
     for r in rows {
         let memory_id: Uuid = r.try_get("memory_id").map_err(|_| ErrorCode::Internal)?;
+        if !expected_ids.contains(&memory_id) {
+            continue;
+        }
         let authority: String = r
             .try_get("authority_class")
             .map_err(|_| ErrorCode::Internal)?;
@@ -231,7 +426,7 @@ async fn run_selector(
 
     Ok(SelectorOutcome::Ran {
         id: s.id,
-        expected: u64::try_from(expected).unwrap_or(0),
+        candidate_ids: expected_ids.into_iter().map(MemoryId).collect(),
         rows: out,
         needs_verification: needs,
     })
@@ -275,7 +470,7 @@ fn grounding_from_facts(has_live: bool, has_live_unversioned: bool) -> RowGround
 /// 一个 `REPEATABLE READ` 事务（`consolidate_repo` 的 §11.7 同款配方，只读路径不带
 /// `READ WRITE`），依次：隔离级 → 租户上下文 → probe（`information_schema` 进同快照；
 /// DDL 探测滞后于快照是**接受语义**——本次装配看到的世界就是这个快照的世界）→ 各
-/// selector 的 COUNT + 取行 → pinned 的独立 COUNT + 取行 + excluded 具名 → 快照身份。
+/// selector 的独立候选枚举 + 取行 → pinned 的独立候选枚举 + 取行 + excluded 具名 → 快照身份。
 ///
 /// 此前这里是三个各自开事务的 pub 函数（probe / mandatory / pinned）——READ COMMITTED
 /// 下每条语句各看各的快照，probe 与取数之间还有 TOCTOU；「两次装配逐字节相同」在那个
@@ -283,10 +478,12 @@ fn grounding_from_facts(has_live: bool, has_live_unversioned: bool) -> RowGround
 ///
 /// # Errors
 /// 库不可达、authority 线值不在闭集内 ⇒ [`ErrorCode::Internal`]。
-pub async fn fetch_frozen(pool: &RuntimeDbPool, scope: &Scope) -> Result<FrozenReads, ErrorCode> {
-    let workspaces = workspace_ids(scope);
-    let user_id = scope.user_id.map(|u| u.0);
-    let tenant_id = scope.tenant_id.0;
+pub async fn fetch_frozen(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    requested_scope: &Scope,
+) -> Result<FrozenReads, ErrorCode> {
+    let _ = canonical_scope(authorization, requested_scope)?;
 
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     // 必须是本事务第一条语句：隔离级在第一个取快照的语句之后就改不了了。
@@ -294,10 +491,23 @@ pub async fn fetch_frozen(pool: &RuntimeDbPool, scope: &Scope) -> Result<FrozenR
         .execute(&mut *txn)
         .await
         .map_err(|_| ErrorCode::Internal)?;
-    set_tenant_local(&mut txn, tenant_id)
-        .await
-        .map_err(|_| ErrorCode::Internal)?;
+    let frozen = fetch_frozen_in_txn(&mut txn, authorization, requested_scope).await?;
+    txn.commit().await.map_err(|_| ErrorCode::Internal)?;
+    Ok(frozen)
+}
 
+/// Reads frozen Context lanes through a caller-owned repeatable-read transaction.
+///
+/// The adapter reruns raw scope narrowing and installs the transaction-local
+/// authorization guard before issuing its first Context query. Callers establish
+/// repeatable-read mode before their first query.
+pub(crate) async fn fetch_frozen_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    authorization: &AuthorizationScope,
+    requested_scope: &Scope,
+) -> Result<FrozenReads, ErrorCode> {
+    let (authorization, scope) = canonical_scope(authorization, requested_scope)?;
+    set_authorization_local(txn, &authorization).await?;
     // probe（同快照）。
     let mut availability: Vec<(SelectorId, Option<String>)> = Vec::with_capacity(5);
     for sp in &humaux_domain::context::REGISTRY {
@@ -310,7 +520,7 @@ pub async fn fetch_frozen(pool: &RuntimeDbPool, scope: &Scope) -> Result<FrozenR
             .bind(schema)
             .bind(table)
             .bind(column)
-            .fetch_one(&mut *txn)
+            .fetch_one(&mut **txn)
             .await
             .map_err(|_| ErrorCode::Internal)?
             .try_get(0)
@@ -345,12 +555,12 @@ pub async fn fetch_frozen(pool: &RuntimeDbPool, scope: &Scope) -> Result<FrozenR
                 continue;
             }
         };
-        out.push(run_selector(&mut txn, sp, where_clause, tenant_id, &workspaces, user_id).await?);
+        out.push(run_selector(txn, sp, where_clause, &authorization, &scope).await?);
     }
     let outcomes: [SelectorOutcome; 5] = out.try_into().map_err(|_| ErrorCode::Internal)?;
-    let mandatory = MandatoryLane::from_selectors(outcomes);
+    let mandatory = MandatoryLane::from_selectors(outcomes)?;
 
-    let pinned = fetch_pinned_in_txn(&mut txn, tenant_id).await?;
+    let pinned = fetch_pinned_in_txn(txn, &authorization, &scope).await?;
 
     // 快照身份：同一事务内取。seq（xmin）是 fingerprint 轴——必要非充分；
     // token（完整 snapshot）才是「同快照 ⇒ 同字节」的充分条件（见 FrozenReads doc）。
@@ -358,7 +568,7 @@ pub async fn fetch_frozen(pool: &RuntimeDbPool, scope: &Scope) -> Result<FrozenR
         "SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint AS seq, \
                 pg_current_snapshot()::text AS token",
     )
-    .fetch_one(&mut *txn)
+    .fetch_one(&mut **txn)
     .await
     .map_err(|_| ErrorCode::Internal)?;
     let seq: i64 = row.try_get("seq").map_err(|_| ErrorCode::Internal)?;
@@ -369,8 +579,6 @@ pub async fn fetch_frozen(pool: &RuntimeDbPool, scope: &Scope) -> Result<FrozenR
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
 
-    txn.commit().await.map_err(|_| ErrorCode::Internal)?;
-
     Ok(FrozenReads {
         mandatory,
         pinned,
@@ -379,25 +587,458 @@ pub async fn fetch_frozen(pool: &RuntimeDbPool, scope: &Scope) -> Result<FrozenR
     })
 }
 
-/// [`fetch_frozen`] 的 pinned 半边：独立 COUNT（外部 oracle——「钉 3 带 2」必须可观测）
-/// + 取行 + excluded 具名。抽成函数只为行数闸，语义与内联时逐字相同。
-async fn fetch_pinned_in_txn(txn: &mut Txn<'_>, tenant_id: Uuid) -> Result<PinnedLane, ErrorCode> {
-    // pinned：独立 COUNT（外部 oracle——「钉 3 带 2」必须可观测）+ 取行 + excluded 具名。
-    let pinned_expected: i64 = sqlx::query(
-        "SELECT count(*) FROM private.memory_records m \
-         WHERE m.tenant_id = $1 AND m.status = 'active' AND m.superseded_by IS NULL \
-           AND EXISTS ( \
-             SELECT 1 FROM private.context_bindings cb \
-             WHERE cb.memory_id = m.memory_id AND cb.tenant_id = m.tenant_id \
-               AND cb.revoked_at IS NULL AND cb.mode = 'PINNED' \
-           )",
+/// One exact, object-level Memory read from the caller's trusted serving stream.
+///
+/// `bodies` carries the same RR snapshot identity as the final Memory body. `ledger` and
+/// `grounding` were read in that same transaction, but this type does not claim a complete
+/// stream or pipeline census.
+pub struct MaterializedMemory {
+    pub bodies: MaterializedBodies,
+    pub ledger: humaux_retrieval::completeness::LedgerClosure,
+    pub grounding: GroundingBlock,
+}
+
+/// Trusted server-side pagination inputs for an authorized memory enumeration.
+pub struct MemoryEnumerationParams<'a> {
+    pub cursor: Option<&'a str>,
+    pub page_size: u16,
+    pub ttl: std::time::Duration,
+    pub mac_key: &'a [u8],
+}
+
+/// One immutable manifest page whose body, grounding and ledger share one PostgreSQL snapshot.
+pub struct MaterializedMemoryPage {
+    pub snapshot_id: Uuid,
+    pub next_cursor: Option<String>,
+    pub memory: MaterializedMemory,
+}
+
+fn enumeration_fingerprint(authorization: &AuthorizationScope, scope: &Scope) -> String {
+    let workspace = scope
+        .workspace_id
+        .map(|id| id.0.to_string())
+        .unwrap_or_default();
+    let user = authorization
+        .user_id()
+        .map(|id| id.0.to_string())
+        .unwrap_or_default();
+    query_fingerprint(
+        &format!(
+            "{AUTHORIZED_MEMORY_ENUMERATION_V1}:{}:{}:{}",
+            authorization.principal().0,
+            user,
+            workspace
+        ),
+        authorization.tenant_id().0,
     )
-    .bind(tenant_id)
-    .fetch_one(&mut **txn)
+}
+
+fn validate_enumeration_params(params: &MemoryEnumerationParams<'_>) -> Result<(), ErrorCode> {
+    if !(1..=100).contains(&params.page_size)
+        || !(1..=86_400).contains(&params.ttl.as_secs())
+        || params.ttl.subsec_nanos() != 0
+        || params.mac_key.is_empty()
+        || params
+            .cursor
+            .is_some_and(|cursor| cursor.is_empty() || cursor.len() > 1024)
+    {
+        return Err(ErrorCode::InvalidInput);
+    }
+    Ok(())
+}
+
+async fn page_grounding_in_txn(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+    ids: &[Uuid],
+) -> Result<GroundingBlock, ErrorCode> {
+    let mut result = GroundingBlock::tally([]);
+    for id in ids {
+        let block = direct_get_grounding_in_txn(txn, authorization, MemoryId(*id)).await?;
+        result.current += block.current;
+        result.recheck_required += block.recheck_required;
+        result.unresolved += block.unresolved;
+        result.cannot_establish += block.cannot_establish;
+        result.not_judged += block.not_judged;
+        result.revokes_current_truth_assumption += block.revokes_current_truth_assumption;
+    }
+    Ok(result)
+}
+/// Materializes an authorization-bound immutable Memory page.
+pub async fn materialize_memory_enumeration(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    scope: &Scope,
+    expected_family: &StreamFamily,
+    validated_key: &StreamKey,
+    params: MemoryEnumerationParams<'_>,
+) -> Result<MaterializedMemoryPage, ErrorCode> {
+    validate_enumeration_params(&params)?;
+    let (authorization, scope) = canonical_scope(authorization, scope)?;
+    materialized_identity(&scope, expected_family, validated_key)?;
+    let fingerprint = enumeration_fingerprint(&authorization, &scope);
+    let mut txn = pool
+        .pool()
+        .begin()
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    let read_write = params.cursor.is_none();
+    sqlx::query(if read_write {
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ WRITE"
+    } else {
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+    })
+    .execute(&mut *txn)
     .await
-    .map_err(|_| ErrorCode::Internal)?
-    .try_get(0)
+    .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    set_authorization_local(&mut txn, &authorization).await?;
+    let page = if let Some(encoded) = params.cursor {
+        let cursor = Cursor::decode(encoded).map_err(|_| ErrorCode::InvalidInput)?;
+        fetch_authorized_snapshot_page_in_txn(
+            &mut txn,
+            authorization.tenant_id().0,
+            &cursor,
+            &fingerprint,
+            params.page_size as i64,
+            params.mac_key,
+        )
+        .await?
+    } else {
+        let rows = sqlx::query("SELECT memory_id FROM private.memory_records WHERE tenant_id=$1 AND status='active' AND superseded_by IS NULL ORDER BY memory_id DESC")
+            .bind(authorization.tenant_id().0).fetch_all(&mut *txn).await.map_err(|_| ErrorCode::DependencyUnavailable)?;
+        let candidates = rows
+            .into_iter()
+            .map(|row| row.try_get("memory_id").map_err(|_| ErrorCode::Internal))
+            .collect::<Result<Vec<Uuid>, ErrorCode>>()?;
+        let ids = final_memory_ids_in_txn(&mut txn, &authorization, &candidates).await?;
+        begin_authorized_snapshot_in_txn(
+            &mut txn,
+            authorization.tenant_id().0,
+            &fingerprint,
+            params.ttl,
+            params.page_size as i64,
+            params.mac_key,
+            &ids,
+        )
+        .await?
+    };
+    let expected: HashSet<_> = page.items.iter().copied().collect();
+    if expected.len() != page.items.len() {
+        return Err(ErrorCode::Internal);
+    }
+    let bodies = materialize_final_bodies_in_txn(
+        &mut txn,
+        &authorization,
+        expected_family,
+        validated_key,
+        &page.items,
+        &[],
+    )
+    .await?;
+    let materialized = body_ids(&bodies);
+    if materialized.len() != bodies.items.len()
+        || materialized.iter().any(|id| !expected.contains(id))
+        || materialized.iter().collect::<HashSet<_>>().len() != materialized.len()
+    {
+        return Err(ErrorCode::Internal);
+    }
+    if materialized.len() != page.items.len() {
+        return Err(ErrorCode::NotFound);
+    }
+    let grounding = page_grounding_in_txn(&mut txn, &authorization, &page.items).await?;
+    let ledger = close_ledger_in_txn(&mut txn, validated_key)
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    txn.commit()
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    Ok(MaterializedMemoryPage {
+        snapshot_id: page.snapshot_id,
+        next_cursor: page.next_cursor.map(|cursor| cursor.encode()),
+        memory: MaterializedMemory {
+            bodies,
+            ledger,
+            grounding,
+        },
+    })
+}
+
+/// Gateway-callable Context manifest and bodies produced from one PostgreSQL snapshot.
+pub struct MaterializedContext {
+    /// Canonical v1 manifest assembled from the frozen lanes.
+    pub handoff: Handoff,
+    /// Compiler outcome that produced the manifest, including mandatory overflow.
+    pub outcome: ContextOutcome,
+    /// Final body rows rechecked in the manifest's transaction snapshot.
+    pub bodies: MaterializedBodies,
+    /// Stream ledger closure read in that same transaction snapshot.
+    pub ledger: humaux_retrieval::completeness::LedgerClosure,
+    /// Actual §8.8 states retained from compiled mandatory and pinned rows.
+    pub grounding: GroundingBlock,
+}
+
+fn grounding_block(outcome: &ContextOutcome) -> Result<GroundingBlock, ErrorCode> {
+    let ContextOutcome::Compiled(compiled) = outcome else {
+        return Ok(GroundingBlock::tally([]));
+    };
+    let mut states = Vec::with_capacity(compiled.items().len());
+    for item in compiled.items() {
+        let state = match item {
+            ContextItem::Mandatory(row) | ContextItem::Pinned(row) => row.grounding_state(),
+            ContextItem::Supplemental(_) => return Err(ErrorCode::DependencyUnavailable),
+        };
+        states.push(state);
+    }
+    Ok(GroundingBlock::tally(states))
+}
+
+fn materialized_ids(outcome: &ContextOutcome) -> Vec<Uuid> {
+    let ContextOutcome::Compiled(compiled) = outcome else {
+        return Vec::new();
+    };
+    compiled
+        .mandatory_ids()
+        .into_iter()
+        .chain(compiled.pinned_ids())
+        .map(|id| id.0)
+        .collect()
+}
+
+fn handoff_ids(handoff: &Handoff) -> Result<Vec<Uuid>, ErrorCode> {
+    handoff
+        .mandatory
+        .iter()
+        .chain(&handoff.pinned)
+        .map(|item| Uuid::parse_str(&item.memory_id).map_err(|_| ErrorCode::DependencyUnavailable))
+        .collect()
+}
+
+fn body_ids(bodies: &MaterializedBodies) -> Vec<Uuid> {
+    bodies
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            MaterializedItem::Memory { memory_id, .. } => Some(*memory_id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn same_id_set(left: &[Uuid], right: &[Uuid]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_unstable();
+    left.dedup();
+    right.sort_unstable();
+    right.dedup();
+    left == right
+}
+fn materialized_identity(
+    scope: &Scope,
+    family: &StreamFamily,
+    key: &StreamKey,
+) -> Result<(), ErrorCode> {
+    if family.tenant_id != scope.tenant_id
+        || key.tenant_id != scope.tenant_id
+        || family.tenant_id != key.tenant_id
+        || family.scope_kind != key.scope_kind
+        || family.scope_id != key.scope_id
+        || family.domain != key.domain
+        || family.projection_kind != key.projection_kind
+    {
+        return Err(ErrorCode::Forbidden);
+    }
+    match (scope.workspace_id, key.scope_kind.as_str()) {
+        (None, "tenant") if key.scope_id == scope.tenant_id.0 => Ok(()),
+        (Some(workspace), "workspace") if key.scope_id == workspace.0 => Ok(()),
+        _ => Err(ErrorCode::Forbidden),
+    }
+}
+/// Reads grounding facts for a Memory already admitted by final materialization.
+///
+/// The preceding body read has already performed the Memory-plus-all-Evidence authorization
+/// gate. A missing row in this same RR snapshot is therefore an invariant break, rather than
+/// a second observable existence oracle.
+async fn direct_get_grounding_in_txn(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+    memory_id: MemoryId,
+) -> Result<GroundingBlock, ErrorCode> {
+    let row = sqlx::query(
+        r#"
+        SELECT EXISTS(
+                   SELECT 1
+                   FROM private.memory_evidence AS me
+                   WHERE me.memory_id = m.memory_id
+                     AND me.grounding_mode = 'LIVE'
+               ) AS has_live,
+               EXISTS(
+                   SELECT 1
+                   FROM private.memory_evidence AS me
+                   WHERE me.memory_id = m.memory_id
+                     AND me.grounding_mode = 'LIVE'
+                     AND me.recorded_version IS NULL
+               ) AS has_live_unversioned
+        FROM private.memory_records AS m
+        WHERE m.tenant_id = $1
+          AND m.memory_id = $2
+          AND m.status = 'active'
+          AND m.superseded_by IS NULL
+        "#,
+    )
+    .bind(authorization.tenant_id().0)
+    .bind(memory_id.0)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::DependencyUnavailable)?
+    .ok_or(ErrorCode::Internal)?;
+    let grounding = grounding_from_facts(
+        row.try_get("has_live").map_err(|_| ErrorCode::Internal)?,
+        row.try_get("has_live_unversioned")
+            .map_err(|_| ErrorCode::Internal)?,
+    );
+    let state = match grounding {
+        RowGrounding::Judged(state) => Some(state),
+        RowGrounding::NotJudged => None,
+    };
+    Ok(GroundingBlock::tally([state]))
+}
+
+/// Materializes one exact Memory, its final body, ledger and grounding in one RR snapshot.
+///
+/// Scope canonicalization runs before object access, so a requested foreign workspace remains
+/// `FORBIDDEN`; all object-level absence and final-body policy failures map to `NOT_FOUND`.
+/// `expected_family` and `validated_key` must be supplied by trusted serving/token validation.
+pub async fn materialize_memory_get(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    scope: &Scope,
+    expected_family: &StreamFamily,
+    validated_key: &StreamKey,
+    memory_id: MemoryId,
+) -> Result<MaterializedMemory, ErrorCode> {
+    let _ = canonical_scope(authorization, scope)?;
+    materialized_identity(scope, expected_family, validated_key)?;
+    let mut txn = pool
+        .pool()
+        .begin()
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *txn)
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    let bodies = materialize_one_memory_in_txn(
+        &mut txn,
+        authorization,
+        expected_family,
+        validated_key,
+        memory_id,
+    )
+    .await?;
+    let grounding = direct_get_grounding_in_txn(&mut txn, authorization, memory_id).await?;
+    let ledger = close_ledger_in_txn(&mut txn, validated_key)
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    txn.commit()
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    Ok(MaterializedMemory {
+        bodies,
+        ledger,
+        grounding,
+    })
+}
+
+/// Assembles v1 Handoff and its mandatory/pinned bodies in one RR read-only transaction.
+pub async fn assemble_materialized(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    scope: &Scope,
+    budget: ContextBudget,
+    expected_family: &StreamFamily,
+    validated_key: &StreamKey,
+) -> Result<MaterializedContext, ErrorCode> {
+    let _ = canonical_scope(authorization, scope)?;
+    materialized_identity(scope, expected_family, validated_key)?;
+    let mut txn = pool
+        .pool()
+        .begin()
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *txn)
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    let frozen = fetch_frozen_in_txn(&mut txn, authorization, scope).await?;
+    let (handoff, outcome) = assemble_with_context(frozen, budget);
+    let ids = materialized_ids(&outcome);
+    let grounding = grounding_block(&outcome)?;
+    let bodies = materialize_final_bodies_in_txn(
+        &mut txn,
+        authorization,
+        expected_family,
+        validated_key,
+        &ids,
+        &[],
+    )
+    .await?;
+    let emitted_ids = handoff_ids(&handoff)?;
+    if handoff.context_snapshot_seq != bodies.snapshot.context_snapshot_seq
+        || handoff.snapshot_token_sha256 != bodies.snapshot.snapshot_token_sha256
+        || !same_id_set(&ids, &emitted_ids)
+        || !same_id_set(&ids, &body_ids(&bodies))
+    {
+        return Err(ErrorCode::DependencyUnavailable);
+    }
+    let ledger = close_ledger_in_txn(&mut txn, validated_key)
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    txn.commit()
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    Ok(MaterializedContext {
+        handoff,
+        outcome,
+        bodies,
+        ledger,
+        grounding,
+    })
+}
+
+/// [`fetch_frozen`] 的 pinned 半边：独立候选枚举（外部 oracle——「钉 3 带 2」必须可观测）
+/// + 取行 + excluded 具名。抽成函数只为行数闸，语义与内联时逐字相同。
+async fn fetch_pinned_in_txn(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+    scope: &Scope,
+) -> Result<PinnedLane, ErrorCode> {
+    let (kinds, ids) = scope_chain_params(scope);
+    let where_clause = "m.tenant_id = $1 AND m.status = 'active' AND m.superseded_by IS NULL \
+        AND EXISTS ( \
+          SELECT 1 FROM private.context_bindings cb \
+          WHERE cb.memory_id = m.memory_id AND cb.tenant_id = m.tenant_id \
+            AND cb.revoked_at IS NULL AND cb.mode = 'PINNED' \
+            AND EXISTS ( \
+              SELECT 1 FROM unnest($2::text[], $3::uuid[]) AS request_scope(kind, id) \
+              WHERE cb.scope_kind = request_scope.kind \
+                AND COALESCE(cb.scope_id, cb.tenant_id) = request_scope.id \
+            ) \
+        )";
+    let candidates = sqlx::query(&format!(
+        "SELECT m.memory_id FROM private.memory_records m WHERE {where_clause}"
+    ))
+    .bind(scope.tenant_id.0)
+    .bind(&kinds)
+    .bind(&ids)
+    .fetch_all(&mut **txn)
+    .await
     .map_err(|_| ErrorCode::Internal)?;
+    let candidate_ids: Vec<Uuid> = candidates
+        .into_iter()
+        .map(|row| row.try_get("memory_id").map_err(|_| ErrorCode::Internal))
+        .collect::<Result<_, _>>()?;
+    let expected_ids = readable_memory_ids(txn, authorization, &candidate_ids).await?;
 
     let rows = sqlx::query(&format!(
         "SELECT m.memory_id, m.authority_class, {EST_TOKENS_EXPR} AS est_tokens, \
@@ -409,15 +1050,12 @@ async fn fetch_pinned_in_txn(txn: &mut Txn<'_>, tenant_id: Uuid) -> Result<Pinne
                          AND me.recorded_version IS NULL) \
                   AS has_live_unversioned \
          FROM private.memory_records m \
-         WHERE m.tenant_id = $1 AND m.status = 'active' AND m.superseded_by IS NULL \
-           AND EXISTS ( \
-             SELECT 1 FROM private.context_bindings cb \
-             WHERE cb.memory_id = m.memory_id AND cb.tenant_id = m.tenant_id \
-               AND cb.revoked_at IS NULL AND cb.mode = 'PINNED' \
-           ) \
+         WHERE {where_clause} \
          ORDER BY m.memory_id"
     ))
-    .bind(tenant_id)
+    .bind(scope.tenant_id.0)
+    .bind(kinds)
+    .bind(ids)
     .fetch_all(&mut **txn)
     .await
     .map_err(|_| ErrorCode::Internal)?;
@@ -427,6 +1065,9 @@ async fn fetch_pinned_in_txn(txn: &mut Txn<'_>, tenant_id: Uuid) -> Result<Pinne
     let mut excluded = Vec::new();
     for r in rows {
         let memory_id: Uuid = r.try_get("memory_id").map_err(|_| ErrorCode::Internal)?;
+        if !expected_ids.contains(&memory_id) {
+            continue;
+        }
         let authority: String = r
             .try_get("authority_class")
             .map_err(|_| ErrorCode::Internal)?;
@@ -459,7 +1100,7 @@ async fn fetch_pinned_in_txn(txn: &mut Txn<'_>, tenant_id: Uuid) -> Result<Pinne
         }
     }
     Ok(PinnedLane::new(
-        u64::try_from(pinned_expected).unwrap_or(0),
+        u64::try_from(expected_ids.len()).unwrap_or(0),
         pinned_rows,
         excluded,
     ))
@@ -535,14 +1176,21 @@ pub async fn revoke_binding(
 /// [`fetch_frozen`]。application 依赖方向不许反转（它不能 import 本 crate），
 /// 端口在那边、实现在这边（`PrivateReasoningPort` 同款先例）。
 pub struct ContextReadAdapter {
-    pool: RuntimeDbPool,
+    pool: std::sync::Arc<RuntimeDbPool>,
+    authorization: AuthorizationScope,
 }
 
 impl ContextReadAdapter {
     /// 构造。
     #[must_use]
-    pub const fn new(pool: RuntimeDbPool) -> Self {
-        Self { pool }
+    pub fn new(
+        pool: impl Into<std::sync::Arc<RuntimeDbPool>>,
+        authorization: AuthorizationScope,
+    ) -> Self {
+        Self {
+            pool: pool.into(),
+            authorization,
+        }
     }
 }
 
@@ -552,6 +1200,6 @@ impl humaux_application::continuity::ContextReadPort for ContextReadAdapter {
         &self,
         scope: &Scope,
     ) -> Result<humaux_domain::context::FrozenReads, ErrorCode> {
-        fetch_frozen(&self.pool, scope).await
+        fetch_frozen(&self.pool, &self.authorization, scope).await
     }
 }

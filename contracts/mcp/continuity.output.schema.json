@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ContinuityResultV1",
+  "description": "Project Continuity v1: fixed 17-facet census from one authorized PostgreSQL snapshot. HANDOFF and COVERAGE are system-derived, never writable source facets.",
+  "type": "object",
+  "$defs": {
+    "CurrentFacet": {
+      "type": "object",
+      "required": ["facet_version_id","facet_version","body","body_sha256","memory_source_ids","evidence_source_ids"],
+      "properties": {
+        "facet_version_id": {"type":"string","format":"uuid"},
+        "facet_version": {"type":"integer","minimum":1},
+        "body": {},
+        "body_sha256": {"type":"string","pattern":"^[0-9a-f]{64}$"},
+        "memory_source_ids": {"type":"array","items":{"type":"string","format":"uuid"},"uniqueItems":true},
+        "evidence_source_ids": {"type":"array","items":{"type":"string","format":"uuid"},"uniqueItems":true}
+      },
+      "additionalProperties": false
+    },
+    "SourceFacet": {
+      "type": "object",
+      "required": ["kind","mode","status"],
+      "properties": {
+        "kind": {"enum":["GOAL","CURRENT_STATE","DECISIONS","REJECTIONS","CONSTRAINTS","KNOWN_ISSUES","NEXT_ACTIONS","ACTIVE_TASKS","RECENT_CHANGES","CODE","TESTS","CONFIG","MIGRATIONS","PROCEDURES","OUTCOMES"]},
+        "mode": {"const":"SOURCE_BACKED"},
+        "status": {"enum":["CURRENT","MISSING","UNAVAILABLE","STALE","CONFLICTED"]},
+        "current": {"$ref":"#/$defs/CurrentFacet"},
+        "diagnostic_code": {"type":"string","pattern":"^[A-Z][A-Z0-9_]{0,63}$"}
+      },
+      "oneOf": [
+        {"properties":{"status":{"const":"CURRENT"}},"required":["current"]},
+        {"properties":{"status":{"enum":["MISSING","UNAVAILABLE","STALE","CONFLICTED"]}},"not":{"required":["current"]}}
+      ],
+      "additionalProperties": false
+    },
+    "DerivedFacet": {
+      "type": "object",
+      "required": ["kind","mode","status"],
+      "properties": {
+        "kind": {"enum":["HANDOFF","COVERAGE"]},
+        "mode": {"const":"SYSTEM_DERIVED"},
+        "status": {"enum":["CURRENT","MISSING","UNAVAILABLE","STALE","CONFLICTED"]},
+        "payload_ref": {"enum":["#/handoff","#/coverage"]},
+        "diagnostic_code": {"type":"string","pattern":"^[A-Z][A-Z0-9_]{0,63}$"}
+      },
+      "oneOf": [
+        {"properties":{"status":{"const":"CURRENT"}},"required":["payload_ref"]},
+        {"properties":{"status":{"enum":["MISSING","UNAVAILABLE","STALE","CONFLICTED"]}},"not":{"required":["payload_ref"]}}
+      ],
+      "additionalProperties": false
+    },
+    "HandoffV1": {"$ref":"context.output.schema.json#/properties/handoff"}
+  },
+  "required": ["contract_version","project_id","snapshot","facets","handoff","coverage"],
+  "properties": {
+    "contract_version": {"const":"1"},
+    "project_id": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-7[0-9A-Fa-f]{3}-[89AaBb][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$"
+    },
+    "snapshot": {
+      "type": "object",
+      "required": ["context_snapshot_seq","snapshot_token_sha256","result_sha256"],
+      "properties": {
+        "context_snapshot_seq": {"type":"integer","minimum":0},
+        "snapshot_token_sha256": {"type":"string","pattern":"^[0-9a-f]{64}$"},
+        "result_sha256": {"type":"string","pattern":"^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "facets": {
+      "type": "array",
+      "prefixItems": [
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"GOAL"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"CURRENT_STATE"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"DECISIONS"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"REJECTIONS"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"CONSTRAINTS"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"KNOWN_ISSUES"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"NEXT_ACTIONS"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"ACTIVE_TASKS"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"RECENT_CHANGES"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"CODE"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"TESTS"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"CONFIG"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"MIGRATIONS"}}}]},
+        {"allOf":[{"$ref":"#/$defs/DerivedFacet"},{"properties":{"kind":{"const":"HANDOFF"},"payload_ref":{"const":"#/handoff"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"PROCEDURES"}}}]},
+        {"allOf":[{"$ref":"#/$defs/SourceFacet"},{"properties":{"kind":{"const":"OUTCOMES"}}}]},
+        {"allOf":[{"$ref":"#/$defs/DerivedFacet"},{"properties":{"kind":{"const":"COVERAGE"},"payload_ref":{"const":"#/coverage"}}}]}
+      ],
+      "items": false,
+      "minItems": 17,
+      "maxItems": 17
+    },
+    "handoff": {"$ref":"#/$defs/HandoffV1"},
+    "coverage": {
+      "type": "object",
+      "required": ["required","current","missing","unavailable","stale","conflicted","ratio","completeness_class"],
+      "properties": {
+        "required": {"const":17},
+        "current": {"type":"integer","minimum":0,"maximum":17},
+        "missing": {"type":"integer","minimum":0,"maximum":17},
+        "unavailable": {"type":"integer","minimum":0,"maximum":17},
+        "stale": {"type":"integer","minimum":0,"maximum":17},
+        "conflicted": {"type":"integer","minimum":0,"maximum":17},
+        "ratio": {"type":"number","minimum":0,"maximum":1},
+        "completeness_class": {"enum":["FACET_COMPLETE","CANNOT_ESTABLISH"]}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryReadResult",
+  "description": "Direct Memory Envelope or one authorized immutable enumeration page. The catalog resolves the embedded canonical Envelope without network access.",
+  "type": "object",
+  "$defs": {
+    "Envelope": {"$ref":"context.output.schema.json#/properties/content"}
+  },
+  "oneOf": [
+    {"$ref":"#/$defs/Envelope"},
+    {
+      "type": "object",
+      "required": ["content","pagination"],
+      "properties": {
+        "content": {"$ref":"#/$defs/Envelope"},
+        "pagination": {
+          "type": "object",
+          "required": ["snapshot_id","next_cursor"],
+          "properties": {
+            "snapshot_id": {"type":"string","format":"uuid"},
+            "next_cursor": {"type":["string","null"],"minLength":1,"maxLength":1024}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

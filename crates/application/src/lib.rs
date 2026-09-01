@@ -7,6 +7,7 @@ pub mod auth;
 pub mod consolidate;
 pub mod continuity;
 pub mod contribute;
+pub mod contribution_execution;
 pub mod correct;
 pub mod distill;
 pub mod entitlement;

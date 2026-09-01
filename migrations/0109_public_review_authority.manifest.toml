@@ -1,0 +1,15 @@
+migration_id = "0109_public_review_authority"
+class = "EXPAND_CONTRACT"
+precheck = """
+select to_regprocedure('public.guard_trust_evaluation()') is not null
+  and not exists(select 1 from pg_trigger where tgname='contribution_input_change'
+    and tgrelid='control.public_moderator_grants'::regclass) as precheck_ok
+"""
+postcheck = """
+select exists(select 1 from pg_trigger where tgname='contribution_input_change'
+  and tgrelid='control.public_moderator_grants'::regclass)
+  and position('manual public review requires active moderator authorization'
+    in pg_get_functiondef('public.guard_trust_evaluation()'::regprocedure))>0 as postcheck_ok
+"""
+rollback_or_forward_fix = "Forward fix only; preserve immutable review receipts. Do not restore unauthenticated demotion or quarantine."
+backup_restore_requirement = "Separate approval and backup before production; only disposable local PostgreSQL18.6 used for current tests."

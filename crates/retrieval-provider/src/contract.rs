@@ -8,17 +8,11 @@
 //!
 //! ## Sealed egress types (§1.2.3 / §41.4)
 //!
-//! [`SealedRetrievalQuery`] / [`SealedRetrievalCard`] do not exist anywhere else in the
-//! workspace yet — §18 (`humaux-projection::card`) is the section that eventually owns their
-//! canonical construction (`seal_query()`/`seal_card()`) and the §41.4/§80.2 D5
-//! `egress_chars_total` self-increment discipline that must fire at exactly those two call
-//! sites. **This module ships a minimal placeholder** so [`EmbeddingProvider`]/
-//! [`RerankProvider`] can freeze the compile-time type-narrowing §1.2.3 requires today
-//! ("`private.memory_records.body` 与任意裸 `String/Bytes` 不得直接进入 provider 调用") without
-//! waiting on §18's own delivery. When §18 lands its real `seal_query()`/`seal_card()` with
-//! the `egress_chars_total` bookkeeping, these two types (and their `seal()` constructors)
-//! belong to `humaux-projection` — this module should switch to re-exporting them instead of
-//! defining its own, so there is never a second, uncounted seal path.
+//! [`SealedRetrievalQuery`] / [`SealedRetrievalCard`] are canonical scanner-attested values
+//! from `humaux-local-secret-scan`. Sealing performs only the pinned local privacy/Gitleaks
+//! scan; it neither authorizes data access nor substitutes for the egress permit, disclosure
+//! reserve/finalize path, or provider call gates that this crate owns.
+
 //!
 //! ## Provider identifiers
 //!
@@ -38,46 +32,13 @@ use humaux_domain::error::ErrorCode;
 use humaux_domain::ids::TenantId;
 
 // ============================================================================
-// §1.2.3 / §41.4 Sealed egress types — see module doc.
+// §1.2.3 / §41.4 canonical sealed egress types.
 // ============================================================================
 
-/// The only private-content shape an [`EmbeddingProvider`]/[`RerankProvider`] may accept for
-/// a *query* (§1.2.3: "Dense write/query -> SealedRetrievalCard / SealedRetrievalQuery",
-/// §17 line 1392). See module doc for why this is a T7.1 placeholder, not §18's canonical type.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SealedRetrievalQuery(String);
-
-impl SealedRetrievalQuery {
-    /// Placeholder constructor — see module doc. Not `seal_query()`: does not participate in
-    /// the §41.4/§80.2 D5 `egress_chars_total` accounting, which is §18's construction site to
-    /// own once it lands.
-    pub fn seal(text: impl Into<String>) -> Self {
-        Self(text.into())
-    }
-
-    /// The sealed text — the only way any [`EmbeddingProvider`]/[`RerankProvider`]
-    /// implementation may read the content it was asked to send out.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// The only private-content shape an [`EmbeddingProvider`]/[`RerankProvider`] may accept for a
-/// *card* (§1.2.3, §18 RetrievalCard text). See module doc for why this is a T7.1 placeholder.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SealedRetrievalCard(String);
-
-impl SealedRetrievalCard {
-    /// Placeholder constructor — see [`SealedRetrievalQuery::seal`]'s doc; same caveat.
-    pub fn seal(text: impl Into<String>) -> Self {
-        Self(text.into())
-    }
-
-    /// The sealed text — see [`SealedRetrievalQuery::as_str`].
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+pub use humaux_adapters::retrieval_query_source::RetrievalQueryCallContext;
+/// Canonical scanner-attested types live in `humaux-local-secret-scan`; this crate merely
+/// consumes them at external provider boundaries. There is no local constructor or wire decode.
+pub use humaux_local_secret_scan::{SealedRetrievalCard, SealedRetrievalQuery};
 
 // ============================================================================
 // §19 "Provider Descriptor" — identifiers.
@@ -302,10 +263,10 @@ pub fn validate_rerank_batch(
 /// them into one generic method would let a caller accidentally embed a card where a query was
 /// meant (or vice versa) and have the type system say nothing about it.
 ///
-/// `tenant_id` is a parameter, not implementation state: the §7.3 `EgressPermit`/§7.4
-/// disclosure-ledger row a real implementation must mint per call are both tenant-scoped, and
-/// one provider instance legitimately serves every tenant sharing a region/model route (§19
-/// "Humaux Cloud 默认配置": "统一 provider routing").
+/// Query calls take a [`RetrievalQueryCallContext`] so tenant/principal/user/workspace and
+/// request/logical-call/attempt identity arrive together from the trusted authorization path.
+/// Card calls retain the established tenant-scoped source flow. One provider instance still
+/// legitimately serves every tenant sharing a region/model route (§19 "统一 provider routing").
 #[async_trait::async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     /// The model this instance is bound to — callers use this to check
@@ -315,7 +276,7 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Embeds `queries` (dense query side, §1.2.3 line 1392) at `dimension`.
     async fn embed_queries(
         &self,
-        tenant_id: TenantId,
+        context: &RetrievalQueryCallContext<'_>,
         dimension: u32,
         queries: &[SealedRetrievalQuery],
     ) -> Result<EmbeddingBatch, ErrorCode>;

@@ -27,7 +27,7 @@ use sqlx::Row;
 use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
-use crate::postgres::RuntimeDbPool;
+use crate::postgres::{PrivateWorkerDbPool, RuntimeDbPool};
 
 /// DB-layer failure from any function in this module. Adapter-local, not one of the
 /// workspace's two frozen domain error enums (§52) — same reasoning as
@@ -165,18 +165,70 @@ async fn set_tenant_local(
     Ok(())
 }
 
-/// §61 SKIP LOCKED Claim SQL, verbatim: picks up to `limit` claimable rows
-/// (`status IN ('PENDING','RETRY_WAIT') AND next_retry_at <= now()`, priority/age ordered,
-/// `FOR UPDATE SKIP LOCKED` so concurrent claimers never contend on the same row) and
-/// transitions them to `PROCESSING` under `lease_owner` with `lease_expires_at = now() +
-/// lease_seconds` and `attempt = attempt + 1`, all in the same statement — the row lock and
-/// the state flip are atomic, so two concurrent callers can never both return the same
-/// `job_id` (G-level property this task's `jobs_claim.rs` integration test exercises under
-/// real concurrency).
-///
-/// An empty result (no claimable row) returns `Ok(vec![])` immediately — `FOR UPDATE SKIP
-/// LOCKED` never blocks waiting for a lock the way plain `FOR UPDATE` would, so this never
-/// hangs on an empty or fully-locked table.
+/// Shared §61 claim implementation. `scope` only changes the closed job-type predicate;
+/// leasing, attempt increment, and row locking stay identical for every typed pool.
+#[derive(Clone, Copy)]
+enum ClaimScope {
+    Generic,
+    Contribution,
+}
+
+impl ClaimScope {
+    const fn predicate(self) -> &'static str {
+        match self {
+            Self::Generic => {
+                "LEFT(job_type, 7) <> 'PUBLIC_' AND job_type <> 'CONTRIBUTION_EXECUTE'"
+            }
+            Self::Contribution => "job_type = 'CONTRIBUTION_EXECUTE'",
+        }
+    }
+}
+
+async fn claim_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    lease_owner: &str,
+    lease_seconds: f64,
+    limit: i64,
+    scope: ClaimScope,
+) -> Result<Vec<ClaimedJob>, JobsError> {
+    set_tenant_local(txn, tenant_id).await?;
+    let sql = format!(
+        "WITH picked AS ( \
+           SELECT job_id \
+           FROM ops.jobs \
+           WHERE status IN ('PENDING', 'RETRY_WAIT') \
+             AND next_retry_at <= clock_timestamp() \
+             AND {} \
+           ORDER BY priority DESC, next_retry_at, created_at \
+           FOR UPDATE SKIP LOCKED \
+           LIMIT $1 \
+         ) \
+         UPDATE ops.jobs j \
+         SET status = 'PROCESSING', \
+             lease_owner = $2, \
+             lease_expires_at = clock_timestamp() + make_interval(secs => $3), \
+             attempt = attempt + 1 \
+         FROM picked \
+         WHERE j.job_id = picked.job_id \
+         RETURNING j.*",
+        scope.predicate()
+    );
+    let rows = sqlx::query(&sql)
+        .bind(limit)
+        .bind(lease_owner)
+        .bind(lease_seconds)
+        .fetch_all(&mut **txn)
+        .await?;
+    let claimed = rows
+        .iter()
+        .map(ClaimedJob::from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(claimed)
+}
+
+/// Claims only non-public jobs. `attempt` increments on every successful claim and is the
+/// monotonic lease fencing token returned in [`ClaimedJob`].
 pub async fn claim(
     pool: &RuntimeDbPool,
     tenant_id: Uuid,
@@ -185,39 +237,67 @@ pub async fn claim(
     limit: i64,
 ) -> Result<Vec<ClaimedJob>, JobsError> {
     let mut txn = pool.pool().begin().await?;
-    set_tenant_local(&mut txn, tenant_id).await?;
-
-    let rows = sqlx::query(
-        "WITH picked AS ( \
-           SELECT job_id \
-           FROM ops.jobs \
-           WHERE status IN ('PENDING', 'RETRY_WAIT') \
-             AND next_retry_at <= now() \
-           ORDER BY priority DESC, next_retry_at, created_at \
-           FOR UPDATE SKIP LOCKED \
-           LIMIT $1 \
-         ) \
-         UPDATE ops.jobs j \
-         SET status = 'PROCESSING', \
-             lease_owner = $2, \
-             lease_expires_at = now() + make_interval(secs => $3), \
-             attempt = attempt + 1 \
-         FROM picked \
-         WHERE j.job_id = picked.job_id \
-         RETURNING j.*",
+    let claimed = claim_in_txn(
+        &mut txn,
+        tenant_id,
+        lease_owner,
+        lease_seconds,
+        limit,
+        ClaimScope::Generic,
     )
-    .bind(limit)
-    .bind(lease_owner)
-    .bind(lease_seconds)
-    .fetch_all(&mut *txn)
     .await?;
-
-    let claimed = rows
-        .iter()
-        .map(ClaimedJob::from_row)
-        .collect::<Result<Vec<_>, _>>()?;
     txn.commit().await?;
     Ok(claimed)
+}
+
+/// Claims only the exact private Phase 9 contribution job kind. Keeping this on the private
+/// worker pool makes the job-type boundary explicit: generic runtime workers cannot steal it,
+/// and the private worker cannot broaden its claim to another private job namespace.
+pub async fn private_claim(
+    pool: &PrivateWorkerDbPool,
+    tenant_id: Uuid,
+    lease_owner: &str,
+    lease_seconds: f64,
+    limit: i64,
+) -> Result<Vec<ClaimedJob>, JobsError> {
+    let mut txn = pool.pool().begin().await?;
+    let claimed = claim_in_txn(
+        &mut txn,
+        tenant_id,
+        lease_owner,
+        lease_seconds,
+        limit,
+        ClaimScope::Contribution,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(claimed)
+}
+
+/// Locks and verifies one exact live lease inside a caller-owned business transaction.
+/// A `false` result means the caller must not perform its final business write.
+#[allow(dead_code)] // Consumed by the Phase 9 workflow finalizer in a sibling adapter module.
+pub(crate) async fn lock_current_lease(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    job_id: Uuid,
+    lease_owner: &str,
+    attempt: i32,
+) -> Result<bool, JobsError> {
+    set_tenant_local(txn, tenant_id).await?;
+    let locked = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM ops.jobs \
+         WHERE job_id = $1 AND tenant_id = $2 AND lease_owner = $3 AND attempt = $4 \
+           AND status = 'PROCESSING' AND lease_expires_at > clock_timestamp() \
+         FOR UPDATE",
+    )
+    .bind(job_id)
+    .bind(tenant_id)
+    .bind(lease_owner)
+    .bind(attempt)
+    .fetch_optional(&mut **txn)
+    .await?;
+    Ok(locked.is_some())
 }
 
 /// Extends a held lease (worker heartbeat). Only takes effect while `job_id` is still
@@ -230,46 +310,83 @@ pub async fn heartbeat(
     tenant_id: Uuid,
     job_id: Uuid,
     lease_owner: &str,
+    attempt: i32,
     lease_seconds: f64,
 ) -> Result<bool, JobsError> {
     let mut txn = pool.pool().begin().await?;
-    set_tenant_local(&mut txn, tenant_id).await?;
-
-    let result = sqlx::query(
-        "UPDATE ops.jobs \
-         SET lease_expires_at = now() + make_interval(secs => $3) \
-         WHERE job_id = $1 AND lease_owner = $2 AND status = 'PROCESSING'",
+    let changed = heartbeat_in_txn(
+        &mut txn,
+        tenant_id,
+        job_id,
+        lease_owner,
+        attempt,
+        lease_seconds,
     )
-    .bind(job_id)
-    .bind(lease_owner)
-    .bind(lease_seconds)
-    .execute(&mut *txn)
     .await?;
     txn.commit().await?;
+    Ok(changed)
+}
+
+async fn heartbeat_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    job_id: Uuid,
+    lease_owner: &str,
+    attempt: i32,
+    lease_seconds: f64,
+) -> Result<bool, JobsError> {
+    set_tenant_local(txn, tenant_id).await?;
+    let result = sqlx::query(
+        "UPDATE ops.jobs \
+         SET lease_expires_at = clock_timestamp() + make_interval(secs => $5) \
+         WHERE job_id = $1 AND tenant_id = $2 AND lease_owner = $3 AND attempt = $4 \
+           AND status = 'PROCESSING' AND lease_expires_at > clock_timestamp()",
+    )
+    .bind(job_id)
+    .bind(tenant_id)
+    .bind(lease_owner)
+    .bind(attempt)
+    .bind(lease_seconds)
+    .execute(&mut **txn)
+    .await?;
     Ok(result.rows_affected() > 0)
 }
 
-/// `PROCESSING` -> `DONE`. Same lease-ownership guard as [`heartbeat`]: a completion from a
-/// worker whose lease was already reclaimed is a no-op (`Ok(false)`), not an overwrite of
-/// whatever state the reclaiming owner has since driven the row to.
+/// `PROCESSING` -> `DONE` under the exact still-live fencing token.
 pub async fn complete(
     pool: &RuntimeDbPool,
     tenant_id: Uuid,
     job_id: Uuid,
     lease_owner: &str,
+    attempt: i32,
 ) -> Result<bool, JobsError> {
     let mut txn = pool.pool().begin().await?;
-    set_tenant_local(&mut txn, tenant_id).await?;
+    let done = complete_in_txn(&mut txn, tenant_id, job_id, lease_owner, attempt).await?;
+    txn.commit().await?;
+    Ok(done)
+}
 
+/// Completes a job in the caller's transaction after its business writes. The exact token,
+/// owner, status, tenant, and live lease are all rechecked at the final transition.
+pub(crate) async fn complete_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    job_id: Uuid,
+    lease_owner: &str,
+    attempt: i32,
+) -> Result<bool, JobsError> {
+    set_tenant_local(txn, tenant_id).await?;
     let result = sqlx::query(
         "UPDATE ops.jobs SET status = 'DONE' \
-         WHERE job_id = $1 AND lease_owner = $2 AND status = 'PROCESSING'",
+         WHERE job_id = $1 AND tenant_id = $2 AND lease_owner = $3 AND attempt = $4 \
+           AND status = 'PROCESSING' AND lease_expires_at > clock_timestamp()",
     )
     .bind(job_id)
+    .bind(tenant_id)
     .bind(lease_owner)
-    .execute(&mut *txn)
+    .bind(attempt)
+    .execute(&mut **txn)
     .await?;
-    txn.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -280,6 +397,8 @@ pub async fn complete(
 pub struct FailInput<'a> {
     pub job_id: Uuid,
     pub lease_owner: &'a str,
+    /// Monotonic token returned by the claim this worker is finalizing.
+    pub attempt: i32,
     pub error_class: &'a str,
     /// `false` -> this error class is permanent, skip straight to `FAILED` regardless of
     /// remaining budget.
@@ -289,58 +408,53 @@ pub struct FailInput<'a> {
     pub retry_after_seconds: f64,
 }
 
-/// `PROCESSING` -> one of `FAILED` / `RETRY_WAIT` / `DEAD`, decided in the same statement so
-/// the decision and the write are atomic:
-///
-/// - `retryable = false` -> `FAILED` (permanent, this error class is never worth retrying).
-/// - `retryable = true` and `attempt >= max_attempts` -> `DEAD` (retry budget exhausted).
-/// - otherwise -> `RETRY_WAIT`, `next_retry_at = now() + retry_after_seconds`.
-///
-/// Does not touch `attempt` — only [`claim`] does that (§31 "WAITING_KEY 不消耗 retry" is
-/// true precisely because no *other* transition in this module increments it either; `attempt`
-/// counts claims, not failures).
-///
-/// Returns the resulting [`JobStatus`], or `None` if `job_id` was not `PROCESSING` under
-/// `input.lease_owner` (lease already reclaimed).
+/// `PROCESSING` -> one of `FAILED` / `RETRY_WAIT` / `DEAD` under the exact live token.
 pub async fn fail(
     pool: &RuntimeDbPool,
     tenant_id: Uuid,
     input: FailInput<'_>,
 ) -> Result<Option<JobStatus>, JobsError> {
     let mut txn = pool.pool().begin().await?;
-    set_tenant_local(&mut txn, tenant_id).await?;
+    let status = fail_in_txn(&mut txn, tenant_id, input).await?;
+    txn.commit().await?;
+    Ok(status)
+}
 
+async fn fail_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    input: FailInput<'_>,
+) -> Result<Option<JobStatus>, JobsError> {
+    set_tenant_local(txn, tenant_id).await?;
     let row = sqlx::query(
         "UPDATE ops.jobs \
          SET status = CASE \
-                        WHEN NOT $4 THEN 'FAILED' \
-                        WHEN attempt >= $5 THEN 'DEAD' \
+                        WHEN NOT $6 THEN 'FAILED' \
+                        WHEN attempt >= $7 THEN 'DEAD' \
                         ELSE 'RETRY_WAIT' \
                       END, \
              next_retry_at = CASE \
-                        WHEN NOT $4 THEN next_retry_at \
-                        WHEN attempt >= $5 THEN next_retry_at \
-                        ELSE now() + make_interval(secs => $6) \
+                        WHEN NOT $6 THEN next_retry_at \
+                        WHEN attempt >= $7 THEN next_retry_at \
+                        ELSE clock_timestamp() + make_interval(secs => $8) \
                       END, \
-             last_error_class = $3 \
-         WHERE job_id = $1 AND lease_owner = $2 AND status = 'PROCESSING' \
+             last_error_class = $5 \
+         WHERE job_id = $1 AND tenant_id = $2 AND lease_owner = $3 AND attempt = $4 \
+           AND status = 'PROCESSING' AND lease_expires_at > clock_timestamp() \
          RETURNING status",
     )
     .bind(input.job_id)
+    .bind(tenant_id)
     .bind(input.lease_owner)
+    .bind(input.attempt)
     .bind(input.error_class)
     .bind(input.retryable)
     .bind(input.max_attempts)
     .bind(input.retry_after_seconds)
-    .fetch_optional(&mut *txn)
+    .fetch_optional(&mut **txn)
     .await?;
-    txn.commit().await?;
-
-    row.map(|r| {
-        let status: String = r.try_get("status")?;
-        JobStatus::parse(&status)
-    })
-    .transpose()
+    row.map(|r| JobStatus::parse(&r.try_get::<String, _>("status")?))
+        .transpose()
 }
 
 /// `PROCESSING` -> `WAITING_KEY`. Does not touch `attempt` (§31 "WAITING_KEY 不消耗 retry") —
@@ -351,16 +465,19 @@ pub async fn mark_waiting_key(
     tenant_id: Uuid,
     job_id: Uuid,
     lease_owner: &str,
+    attempt: i32,
 ) -> Result<bool, JobsError> {
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
-
     let result = sqlx::query(
         "UPDATE ops.jobs SET status = 'WAITING_KEY' \
-         WHERE job_id = $1 AND lease_owner = $2 AND status = 'PROCESSING'",
+         WHERE job_id = $1 AND tenant_id = $2 AND lease_owner = $3 AND attempt = $4 \
+           AND status = 'PROCESSING' AND lease_expires_at > clock_timestamp()",
     )
     .bind(job_id)
+    .bind(tenant_id)
     .bind(lease_owner)
+    .bind(attempt)
     .execute(&mut *txn)
     .await?;
     txn.commit().await?;

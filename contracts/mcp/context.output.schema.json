@@ -1,0 +1,433 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ContextResult",
+  "description": "Same-snapshot Handoff diagnostics and materialized Context Envelope. Handoff v1 remains its own stable byte domain.",
+  "type": "object",
+  "required": ["handoff","content"],
+  "properties": {
+    "handoff": {
+      "type": "object",
+      "required": [
+        "context_snapshot_seq",
+        "snapshot_token_sha256",
+        "mandatory",
+        "pinned",
+        "needs_verification",
+        "not_judged",
+        "unavailable_selectors",
+        "overflow_manifest",
+        "counts"
+      ],
+      "properties": {
+        "context_snapshot_seq": {"type":"integer","minimum":0},
+        "snapshot_token_sha256": {"type":"string","pattern":"^[0-9a-f]{64}$"},
+        "mandatory": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["memory_id","selector","authority"],
+            "properties": {
+              "memory_id": {"type":"string","format":"uuid"},
+              "selector": {"type":"string","minLength":1},
+              "authority": {"type":"string","minLength":1}
+            },
+            "additionalProperties": false
+          }
+        },
+        "pinned": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["memory_id","selector","authority"],
+            "properties": {
+              "memory_id": {"type":"string","format":"uuid"},
+              "selector": {"type":"string","minLength":1},
+              "authority": {"type":"string","minLength":1}
+            },
+            "additionalProperties": false
+          }
+        },
+        "needs_verification": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["memory_id","selector","state"],
+            "properties": {
+              "memory_id": {"type":"string","format":"uuid"},
+              "selector": {"type":"string","minLength":1},
+              "state": {"enum":["current","recheck_required","unresolved","cannot_establish"]}
+            },
+            "additionalProperties": false
+          }
+        },
+        "not_judged": {"type":"array","items":{"type":"string","format":"uuid"},"uniqueItems":true},
+        "unavailable_selectors": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [{"type":"string","minLength":1},{"type":"string","minLength":1}],
+            "items": false,
+            "minItems": 2,
+            "maxItems": 2
+          }
+        },
+        "overflow_manifest": {"type":"array","items":{"type":"string","format":"uuid"},"uniqueItems":true},
+        "counts": {
+          "type": "object",
+          "required": [
+            "mandatory_expected",
+            "mandatory_returned",
+            "mandatory_missing",
+            "pinned_expected",
+            "pinned_returned",
+            "pinned_excluded",
+            "overflow"
+          ],
+          "properties": {
+            "mandatory_expected": {"type":"integer","minimum":0},
+            "mandatory_returned": {"type":"integer","minimum":0},
+            "mandatory_missing": {"type":"integer","minimum":0},
+            "pinned_expected": {"type":"integer","minimum":0},
+            "pinned_returned": {"type":"integer","minimum":0},
+            "pinned_excluded": {"type":"integer","minimum":0},
+            "overflow": {"type":"boolean"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "content": {
+      "type": "object",
+      "required": ["items","pipeline","completeness","provenance","freshness","grounding","mandatory","pinned"],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["memory_id","content"],
+            "properties": {"memory_id":{"type":"string","format":"uuid"},"content":{}},
+            "additionalProperties": false
+          }
+        },
+        "pipeline": {
+          "type": "object",
+          "required": ["evidence","knowledge","projection"],
+          "properties": {
+            "evidence": {
+              "type": "object",
+              "required": ["expected","expected_source","persisted","count_scope"],
+              "properties": {
+                "expected": {"type":["integer","null"],"minimum":0},
+                "expected_source": {"enum":["ticket","none"]},
+                "persisted": {"type":["integer","null"],"minimum":0},
+                "count_scope": {"enum":["authorized_view","stream_ledger"]}
+              },
+              "additionalProperties": false
+            },
+            "knowledge": {
+              "type": "object",
+              "required": ["eligible","processed","waiting_key","failed","count_scope"],
+              "properties": {
+                "eligible": {"type":["integer","null"],"minimum":0},
+                "processed": {"type":["integer","null"],"minimum":0},
+                "waiting_key": {"type":["integer","null"],"minimum":0},
+                "failed": {"type":["integer","null"],"minimum":0},
+                "count_scope": {"enum":["authorized_view","stream_ledger"]}
+              },
+              "additionalProperties": false
+            },
+            "projection": {
+              "type": "object",
+              "required": [
+                "expected",
+                "done",
+                "deleted",
+                "skipped",
+                "visible",
+                "open_gaps",
+                "pending",
+                "completeness_ratio",
+                "current"
+              ],
+              "properties": {
+                "expected": {"type":"integer","minimum":0},
+                "done": {"type":"integer","minimum":0},
+                "deleted": {"type":"integer","minimum":0},
+                "skipped": {"type":"integer","minimum":0},
+                "visible": {"type":["integer","null"],"minimum":0},
+                "open_gaps": {"type":"integer","minimum":0},
+                "pending": {"type":"integer","minimum":0},
+                "completeness_ratio": {"type":["number","null"],"minimum":0},
+                "current": {"type":"boolean"}
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "completeness": {
+          "type": "object",
+          "required": [
+            "class",
+            "reason",
+            "exact",
+            "known_lower_bound",
+            "lanes",
+            "candidate_count",
+            "reranked_count",
+            "returned",
+            "truncated",
+            "degradations"
+          ],
+          "properties": {
+            "class": {"enum":["exact","facet_complete","semantic_bounded","cannot_establish"]},
+            "reason": {
+              "enum": [
+                null,
+                "ledger_not_closed",
+                "predicate_not_enumerable",
+                "census_failed",
+                "lane_failed",
+                "index_count_unavailable",
+                "a2_overshoot_beyond_pending",
+                "mandatory_context_overflow",
+                "count_unknown",
+                "count_scope_mismatch",
+                "pipeline_count_mismatch"
+              ]
+            },
+            "exact": {
+              "oneOf": [
+                {"type":"null"},
+                {
+                  "type": "object",
+                  "required": ["predicate_id","total","returned","coverage","truncated","excluded_secret"],
+                  "properties": {
+                    "predicate_id": {"type":"string","minLength":1},
+                    "total": {"type":"integer","minimum":0},
+                    "returned": {"type":"integer","minimum":0},
+                    "coverage": {"type":"number","minimum":0,"maximum":1},
+                    "truncated": {"type":"boolean"},
+                    "excluded_secret": {"type":"integer","minimum":0}
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "known_lower_bound": {"type":["integer","null"],"minimum":0},
+            "lanes": {"type":"object","additionalProperties":{"enum":["ok","failed","not_required"]}},
+            "candidate_count": {"type":"integer","minimum":0},
+            "reranked_count": {"type":"integer","minimum":0},
+            "returned": {"type":"integer","minimum":0},
+            "truncated": {"type":"boolean"},
+            "degradations": {"type":"array","items":{"type":"string","minLength":1}}
+          },
+          "additionalProperties": false
+        },
+        "provenance": {
+          "type": "object",
+          "required": [
+            "binary_build",
+            "projection_version",
+            "embedding_model_id",
+            "rerank_model_id",
+            "card_builder_version",
+            "profile_fingerprint",
+            "profile"
+          ],
+          "properties": {
+            "binary_build": {"type":"string","minLength":1},
+            "projection_version": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "required": ["status","id"],
+                  "properties": {"status":{"const":"used"},"id":{"type":"string","minLength":1}},
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {"status":{"const":"not_applicable"}},
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {"status":{"const":"cannot_establish"}},
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "embedding_model_id": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "required": ["status","id"],
+                  "properties": {"status":{"const":"used"},"id":{"type":"string","minLength":1}},
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {"status":{"const":"not_applicable"}},
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {"status":{"const":"cannot_establish"}},
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "rerank_model_id": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "required": ["status","id"],
+                  "properties": {"status":{"const":"used"},"id":{"type":"string","minLength":1}},
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {"status":{"const":"not_applicable"}},
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {"status":{"const":"cannot_establish"}},
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "card_builder_version": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "required": ["status","id"],
+                  "properties": {"status":{"const":"used"},"id":{"type":"string","minLength":1}},
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {"status":{"const":"not_applicable"}},
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {"status":{"const":"cannot_establish"}},
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "profile_fingerprint": {"type":"string","minLength":1},
+            "profile": {
+              "type": "object",
+              "required": ["top_k","cand_k","cand_k_formula","lanes"],
+              "properties": {
+                "top_k": {"type":"integer","minimum":0},
+                "cand_k": {"type":"integer","minimum":0},
+                "cand_k_formula": {"type":"string","minLength":1},
+                "lanes": {"type":"array","items":{"type":"string","minLength":1}}
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "freshness": {
+          "type": "object",
+          "required": ["class","latest_evidence_at","state_age_seconds"],
+          "properties": {
+            "class": {"enum":["fresh","aging","stale","unknown"]},
+            "latest_evidence_at": {"type":["string","null"],"format":"date-time"},
+            "state_age_seconds": {"type":["integer","null"],"minimum":0}
+          },
+          "additionalProperties": false
+        },
+        "grounding": {
+          "type": "object",
+          "required": [
+            "current",
+            "recheck_required",
+            "unresolved",
+            "cannot_establish",
+            "not_judged",
+            "revokes_current_truth_assumption"
+          ],
+          "properties": {
+            "current": {"type":"integer","minimum":0},
+            "recheck_required": {"type":"integer","minimum":0},
+            "unresolved": {"type":"integer","minimum":0},
+            "cannot_establish": {"type":"integer","minimum":0},
+            "not_judged": {"type":"integer","minimum":0},
+            "revokes_current_truth_assumption": {"type":"integer","minimum":0}
+          },
+          "additionalProperties": false
+        },
+        "mandatory": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["state"],
+              "properties": {"state":{"const":"not_run"}},
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["state","expected","returned","missing","overflow"],
+              "properties": {
+                "state": {"const":"assembled"},
+                "expected": {"type":"integer","minimum":0},
+                "returned": {"type":"integer","minimum":0},
+                "missing": {"type":"array","items":{"type":"string","format":"uuid"},"uniqueItems":true},
+                "overflow": {"const":false}
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["state","expected","returned","missing","overflow"],
+              "properties": {
+                "state": {"const":"overflow"},
+                "expected": {"type":"integer","minimum":0},
+                "returned": {"type":"integer","minimum":0},
+                "missing": {"type":"array","items":{"type":"string","format":"uuid"},"uniqueItems":true},
+                "overflow": {"const":true}
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "pinned": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["state"],
+              "properties": {"state":{"const":"not_run"}},
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["state","expected","returned"],
+              "properties": {
+                "state": {"const":"ran"},
+                "expected": {"type":"integer","minimum":0},
+                "returned": {"type":"integer","minimum":0}
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

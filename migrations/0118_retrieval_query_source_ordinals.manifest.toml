@@ -1,0 +1,38 @@
+migration_id = "0118_retrieval_query_source_ordinals"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select not exists (
+  select 1 from information_schema.columns
+  where table_schema='private' and table_name='retrieval_query_sources'
+    and column_name='query_ordinal'
+) as precheck_ok
+"""
+
+postcheck = """
+select exists (
+  select 1 from information_schema.columns
+  where table_schema='private' and table_name='retrieval_query_sources'
+    and column_name='query_ordinal' and is_nullable='NO' and column_default is not null
+) and exists (
+  select 1 from pg_constraint
+  where conrelid='private.retrieval_query_sources'::regclass
+    and conname='retrieval_query_sources_query_ordinal_nonnegative'
+    and contype='c'
+    and pg_get_expr(conbin,conrelid) = '(query_ordinal >= 0)'
+) and exists (
+  select 1 from pg_constraint
+  where conrelid='private.retrieval_query_sources'::regclass
+    and conname='retrieval_query_sources_attempt_ordinal_unique'
+    and contype='u'
+    and pg_get_constraintdef(oid) =
+      'UNIQUE (tenant_id, logical_call_id, attempt_no, query_ordinal)'
+) and not exists (
+  select 1 from pg_constraint
+  where conrelid='private.retrieval_query_sources'::regclass
+    and conname='retrieval_query_sources_attempt_unique'
+) as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. Preserve query ordinals and durable source relations; repair forward without deleting provenance rows."
+backup_restore_requirement = "Production requires approved backup and rollout. Acceptance may apply only to the isolated 127.0.0.1:61719 guard database; provider traffic, deployment, and production migration remain out of scope."
