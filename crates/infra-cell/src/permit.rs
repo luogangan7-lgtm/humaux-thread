@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
-use crate::resource::{IntraCellResource, IntraCellResourceRegistry};
+use crate::resource::{CellAccessMode, IntraCellResource, IntraCellResourceRegistry};
 
 /// Deployment-Cell identity (§17.3 `projection.tenant_placements.cell_id` /
 /// `ops.mechanism_observations.cell_id`'s Rust analogue, both `uuid` columns). Kept local to
@@ -70,18 +70,32 @@ pub struct CellAccessPermit {
     resource: IntraCellResource,
     caller: CallerId,
     expires_at: Instant,
+    access_mode: CellAccessMode,
 }
 
 impl CellAccessPermit {
     /// Not `pub`, not even `pub(crate)` beyond this module: only [`authorize_cell_access`],
-    /// which lives here, may name it.
-    fn issue(resource: IntraCellResource, caller: CallerId, ttl: Duration) -> Self {
+    /// which lives here, may name it. `access_mode` is the registered [`ResourceEntry`]'s own
+    /// mode at mint time (crate::resource::ResourceEntry::access_mode) — a permit carries it so
+    /// `crate::transport::HttpIntraCellTransport::execute` can enforce §83.4's read-only ruling
+    /// without re-resolving the registry entry per request.
+    fn issue(
+        resource: IntraCellResource,
+        caller: CallerId,
+        ttl: Duration,
+        access_mode: CellAccessMode,
+    ) -> Self {
         Self {
             grant_id: Uuid::now_v7(),
             resource,
             caller,
             expires_at: Instant::now() + ttl,
+            access_mode,
         }
+    }
+
+    pub fn access_mode(&self) -> CellAccessMode {
+        self.access_mode
     }
 
     pub fn grant_id(&self) -> Uuid {
@@ -128,7 +142,12 @@ pub fn authorize_cell_access(
     if !entry.caller_allowed(caller) {
         return Err(PermitError::UnknownCaller);
     }
-    Ok(CellAccessPermit::issue(resource, caller.clone(), ttl))
+    Ok(CellAccessPermit::issue(
+        resource,
+        caller.clone(),
+        ttl,
+        entry.access_mode(),
+    ))
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ pub mod mechanism_observation;
 pub mod model_call_ledger;
 pub mod openbao;
 pub mod operation_receipt;
+pub mod placement_repo;
 pub mod postgres;
 pub mod private_projection_registry;
 pub mod projection_worker;

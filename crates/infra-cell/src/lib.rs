@@ -39,7 +39,7 @@ pub mod transport;
 
 pub use permit::{CallerId, CellAccessPermit, CellId, PermitError, authorize_cell_access};
 pub use resource::{
-    CellCidr, IntraCellResource, IntraCellResourceRegistry, ResourceEntry,
+    CellAccessMode, CellCidr, IntraCellResource, IntraCellResourceRegistry, ResourceEntry,
     is_private_or_reserved_address,
 };
 pub use transport::{

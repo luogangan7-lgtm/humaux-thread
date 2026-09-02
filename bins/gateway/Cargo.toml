@@ -12,7 +12,6 @@ humaux-domain = { path = "../../crates/domain" }
 humaux-protocol = { path = "../../crates/protocol" }
 humaux-projection = { path = "../../crates/projection" }
 humaux-retrieval = { path = "../../crates/retrieval" }
-humaux-retrieval-provider = { path = "../../crates/retrieval-provider" }
 humaux-infra-cell = { path = "../../crates/infra-cell" }
 humaux-local-secret-scan = { path = "../../crates/local-secret-scan" }
 async-trait = "0.1"
@@ -28,6 +27,9 @@ sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "r
 
 [dev-dependencies]
 humaux-testkit = { path = "../../crates/testkit" }
+# §4.2 / ADR-0012: the gateway binary itself never links the provider/model-descriptor code —
+# only its test doubles (TestDoubleProvider) are used, and only by tests.
+humaux-retrieval-provider = { path = "../../crates/retrieval-provider" }
 postgres = { version = "0.19", features = ["with-uuid-1", "with-serde_json-1"] }
 # tests/query_embedding_rpc.rs: spawns the real worker RPC app in-process rather than
 # reimplementing (and drifting from) its handler — see that test file's own module doc and

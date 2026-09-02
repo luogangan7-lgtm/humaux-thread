@@ -7,13 +7,14 @@
 //! authorization and acceptance gate before this bootstrap can serve it.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
 
 use humaux_adapters::{postgres::RuntimeDbPool, quota_repo::RatePolicy};
+use humaux_application::retrieval_embedding_port::RetrievalEmbeddingPort;
 use humaux_contracts::config_registry::{
     ConfigEntry, effective_config_fingerprint, resolve_effective_config,
 };
@@ -23,6 +24,11 @@ use humaux_contracts::retrieval_config::{
 use humaux_domain::{
     context::ContextBudget, dataclass::DataClass, identity::VisibilityClass, ids::TenantId,
 };
+use humaux_infra_cell::{
+    CallerId, CellAccessMode, CellCidr, CellId, DEFAULT_MAX_RESPONSE_BYTES, HttpIntraCellTransport,
+    IntraCellResource, IntraCellResourceRegistry, ResourceEntry,
+};
+use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig};
 use humaux_projection::stream::StreamKey;
 use humaux_protocol::{
     edge::{Cidr, TrustedProxyConfig},
@@ -35,7 +41,9 @@ use crate::{
     context::ContextBootstrap,
     guard::{GatewayGuard, GuardRatePolicies, GuardSettings},
     mcp_application::GatewayMcpApplication,
+    recall::{SemanticRecallRuntime, SemanticRecallVersions},
     remember::{RememberEventKind, RememberPolicy},
+    retrieval_embedding_client::GatewayRetrievalEmbeddingClient,
 };
 
 const PREFIX: &str = "HUMAUX_GATEWAY_";
@@ -80,6 +88,31 @@ pub struct GatewayBootstrap {
     remember_event_kind: RememberEventKind,
     context_bootstrap: ContextBootstrap,
     config_fingerprint: String,
+    semantic_recall: Option<SemanticRecallConfig>,
+    /// Copied out of `guard` before it moves into [`GatewayGuard::new`] (`build`) — the one
+    /// piece of guard config the semantic-recall wiring also needs, for the Qdrant transport's
+    /// own request timeout (never a literal, §78.1).
+    handler_timeout: Duration,
+}
+
+/// Parsed `HUMAUX_GATEWAY_RETRIEVAL_RPC_*` / `HUMAUX_GATEWAY_EMBEDDING_*` /
+/// `HUMAUX_GATEWAY_QDRANT_*` / `HUMAUX_GATEWAY_CELL_ID` / `HUMAUX_GATEWAY_CALLER_ID` /
+/// `HUMAUX_GATEWAY_GITLEAKS_*` configuration — present only when
+/// `HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH` is non-empty (`parse_semantic_recall`'s doc).
+struct SemanticRecallConfig {
+    socket_path: String,
+    permit_ttl: Duration,
+    embedding_dimension: u32,
+    embedding_version: String,
+    qdrant_host: String,
+    qdrant_port: u16,
+    qdrant_cidr: CellCidr,
+    qdrant_tls: bool,
+    cell_id: CellId,
+    caller_id: CallerId,
+    gitleaks_bin: String,
+    gitleaks_version: String,
+    gitleaks_sha256: String,
 }
 
 /// Ready-to-serve components for `main`: bind [`Self::bind_addr`], then serve
@@ -145,13 +178,31 @@ impl GatewayBootstrap {
         let advertised = catalog.trusted_catalog().map_err(|_| {
             BootstrapError::new("canonical MCP catalog", "invalid embedded contract")
         })?;
-        let application = Arc::new(GatewayMcpApplication::new(
+        let mut application = GatewayMcpApplication::new(
             catalog,
-            guard,
+            guard.clone(),
             self.remember_policy,
             self.remember_event_kind,
             self.context_bootstrap,
-        ));
+        );
+        match self.semantic_recall {
+            Some(config) => {
+                let runtime = build_semantic_recall_runtime(
+                    guard.runtime_pool(),
+                    config,
+                    self.handler_timeout,
+                )?;
+                application = application.with_semantic_recall(runtime);
+            }
+            None => {
+                // §57.1: not_applicable prints the missing object's name, not a silent skip.
+                eprintln!(
+                    "gateway bootstrap: not_applicable: HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH \
+                     (semantic recall stays disabled, recall.search keeps returning DependencyUnavailable)"
+                );
+            }
+        }
+        let application = Arc::new(application);
         Ok(GatewayRuntime {
             bind_addr: self.bind_addr,
             adapter: McpAdapter::new(application, advertised, self.http),
@@ -165,16 +216,20 @@ impl GatewayBootstrap {
             .map_err(|error| BootstrapError::new(error.entry_name, "missing or undeclared"))?;
         let remember_policy = parse_remember_policy(&effective)?;
         let context_bootstrap = parse_context_bootstrap(&effective, &remember_policy)?;
+        let guard = parse_guard(&effective)?;
+        let handler_timeout = guard.handler_timeout;
 
         Ok(Self {
             bind_addr: parse_bind_addr(required(&effective, "HUMAUX_GATEWAY_BIND_ADDR")?)?,
             http: parse_http(&effective)?,
             pg_dsn: required(&effective, "HUMAUX_GATEWAY_PG_DSN")?.to_owned(),
-            guard: parse_guard(&effective)?,
+            guard,
             remember_policy,
             remember_event_kind: parse_remember_event_kind(&effective)?,
             context_bootstrap,
             config_fingerprint: redacted_fingerprint(&registry, &effective),
+            semantic_recall: parse_semantic_recall(&effective)?,
+            handler_timeout,
         })
     }
 }
@@ -342,6 +397,164 @@ fn parse_context_bootstrap(
         .map_err(|_| BootstrapError::new("gateway binary", "provenance unavailable"))
 }
 
+/// `HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH` gates the whole feature: empty (not merely
+/// "unset" — see [`registry`]'s doc on why every declared key must literally be present, even
+/// blank) means semantic recall stays disabled and every other `HUMAUX_GATEWAY_{RETRIEVAL_RPC,
+/// EMBEDDING,QDRANT,CELL_ID,CALLER_ID,GITLEAKS}_*` key may itself be blank. A non-empty socket
+/// path requires all of them filled in.
+fn parse_semantic_recall(
+    effective: &BTreeMap<String, String>,
+) -> Result<Option<SemanticRecallConfig>, BootstrapError> {
+    let socket_path = present(effective, "HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH")?;
+    if socket_path.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SemanticRecallConfig {
+        socket_path: socket_path.to_owned(),
+        permit_ttl: seconds(
+            required(effective, "HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS")?,
+            "HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS",
+        )?,
+        embedding_dimension: parse_u32(
+            required(effective, "HUMAUX_GATEWAY_EMBEDDING_DIMENSION")?,
+            "HUMAUX_GATEWAY_EMBEDDING_DIMENSION",
+        )?,
+        embedding_version: nonempty(
+            required(effective, "HUMAUX_GATEWAY_EMBEDDING_VERSION")?,
+            "HUMAUX_GATEWAY_EMBEDDING_VERSION",
+        )?
+        .to_owned(),
+        qdrant_host: nonempty(
+            required(effective, "HUMAUX_GATEWAY_QDRANT_HOST")?,
+            "HUMAUX_GATEWAY_QDRANT_HOST",
+        )?
+        .to_owned(),
+        qdrant_port: {
+            let port = parse_u32(
+                required(effective, "HUMAUX_GATEWAY_QDRANT_PORT")?,
+                "HUMAUX_GATEWAY_QDRANT_PORT",
+            )?;
+            u16::try_from(port)
+                .map_err(|_| BootstrapError::new("HUMAUX_GATEWAY_QDRANT_PORT", "must fit u16"))?
+        },
+        qdrant_cidr: required(effective, "HUMAUX_GATEWAY_QDRANT_CIDR")?
+            .parse()
+            .map_err(|_| BootstrapError::new("HUMAUX_GATEWAY_QDRANT_CIDR", "invalid CIDR"))?,
+        qdrant_tls: match required(effective, "HUMAUX_GATEWAY_QDRANT_TLS")? {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(BootstrapError::new(
+                    "HUMAUX_GATEWAY_QDRANT_TLS",
+                    "must be true or false",
+                ));
+            }
+        },
+        cell_id: CellId(uuid(
+            required(effective, "HUMAUX_GATEWAY_CELL_ID")?,
+            "HUMAUX_GATEWAY_CELL_ID",
+        )?),
+        caller_id: CallerId(
+            nonempty(
+                required(effective, "HUMAUX_GATEWAY_CALLER_ID")?,
+                "HUMAUX_GATEWAY_CALLER_ID",
+            )?
+            .to_owned(),
+        ),
+        gitleaks_bin: required(effective, "HUMAUX_GATEWAY_GITLEAKS_BIN")?.to_owned(),
+        gitleaks_version: required(effective, "HUMAUX_GATEWAY_GITLEAKS_VERSION")?.to_owned(),
+        gitleaks_sha256: required(effective, "HUMAUX_GATEWAY_GITLEAKS_SHA256")?.to_owned(),
+    }))
+}
+
+/// Builds the one native semantic-recall lane's runtime — `IntraCellResource::QDRANT_REST`
+/// registered [`CellAccessMode::QdrantReadOnly`] (2026-08-30 ruling), never `ReadWrite`;
+/// `xtask architecture-check`'s ADR-0014 gate statically asserts this file never constructs
+/// the latter. `IntraCellResource::RETRIEVAL_EMBEDDING_RPC` shares the same registry/Cell/
+/// caller identity (ADR-0012 §决定3) even though its actual transport bypasses
+/// `IntraCellHttpTransport` entirely (`GatewayRetrievalEmbeddingClient`'s own doc).
+fn build_semantic_recall_runtime(
+    pool: Arc<RuntimeDbPool>,
+    config: SemanticRecallConfig,
+    handler_timeout: Duration,
+) -> Result<SemanticRecallRuntime, BootstrapError> {
+    let mut entries = BTreeMap::new();
+    entries.insert(
+        IntraCellResource::QDRANT_REST,
+        ResourceEntry::new(
+            config.qdrant_host,
+            config.qdrant_port,
+            config.cell_id,
+            vec![config.qdrant_cidr],
+            BTreeSet::from([config.caller_id.clone()]),
+            config.qdrant_tls,
+        )
+        .map_err(|_| BootstrapError::new("HUMAUX_GATEWAY_QDRANT_*", "invalid Qdrant resource"))?
+        .with_access_mode(CellAccessMode::QdrantReadOnly),
+    );
+    entries.insert(
+        IntraCellResource::RETRIEVAL_EMBEDDING_RPC,
+        ResourceEntry::new(
+            "unix-socket",
+            0,
+            config.cell_id,
+            vec![],
+            BTreeSet::from([config.caller_id.clone()]),
+            false,
+        )
+        .map_err(|_| {
+            BootstrapError::new("gateway semantic recall", "invalid RPC resource entry")
+        })?,
+    );
+    let registry = IntraCellResourceRegistry::new(entries, config.cell_id, config.caller_id);
+
+    let qdrant_transport = Arc::new(
+        HttpIntraCellTransport::new(
+            registry.clone(),
+            handler_timeout,
+            DEFAULT_MAX_RESPONSE_BYTES,
+        )
+        .map_err(|_| {
+            BootstrapError::new(
+                "gateway semantic recall",
+                "could not construct Qdrant transport",
+            )
+        })?,
+    );
+    let embedding_port: Arc<dyn RetrievalEmbeddingPort> =
+        Arc::new(GatewayRetrievalEmbeddingClient::new(
+            pool,
+            config.socket_path,
+            registry.clone(),
+            config.permit_ttl,
+        ));
+    let scanner = Arc::new(
+        LocalSecretScanner::new(LocalSecretScannerConfig {
+            executable: config.gitleaks_bin.into(),
+            expected_version: config.gitleaks_version,
+            expected_executable_sha256: config.gitleaks_sha256,
+            timeout: Duration::from_secs(5),
+            max_payload_bytes: 64 * 1024,
+            finding_exit_code: 1,
+        })
+        .map_err(|_| {
+            BootstrapError::new("HUMAUX_GATEWAY_GITLEAKS_*", "invalid local secret scanner")
+        })?,
+    );
+    SemanticRecallRuntime::new(
+        scanner,
+        embedding_port,
+        qdrant_transport,
+        registry,
+        SemanticRecallVersions {
+            embedding_version: config.embedding_version,
+            dimension: config.embedding_dimension,
+        },
+        handler_timeout,
+    )
+    .map_err(|_| BootstrapError::new("gateway semantic recall", "invalid runtime configuration"))
+}
+
 fn retrieval_env_key(canonical_key: &str) -> String {
     format!(
         "{PREFIX}{}",
@@ -390,6 +603,32 @@ fn registry() -> Vec<ConfigEntry> {
     .into_iter()
     .map(|(suffix, type_name, secret)| entry(&format!("{PREFIX}{suffix}"), type_name, secret))
     .collect::<Vec<_>>();
+    // Semantic-recall wiring keys: gated as a group by `RETRIEVAL_RPC_SOCKET_PATH`
+    // (`parse_semantic_recall`'s doc) — absent is a valid, expected deployment shape (semantic
+    // recall stays disabled), so each gets `default: ""` rather than `None`. `None` would make
+    // `resolve_effective_config` hard-fail startup on any deployment that hasn't turned the
+    // feature on yet, instead of reaching the `not_applicable` degrade path in `build`.
+    entries.extend(
+        [
+            ("RETRIEVAL_RPC_SOCKET_PATH", "path", false),
+            ("RETRIEVAL_RPC_PERMIT_TTL_SECONDS", "u64", false),
+            ("EMBEDDING_DIMENSION", "u32", false),
+            ("EMBEDDING_VERSION", "string", false),
+            ("QDRANT_HOST", "string", false),
+            ("QDRANT_PORT", "u16", false),
+            ("QDRANT_CIDR", "cidr", false),
+            ("QDRANT_TLS", "bool", false),
+            ("CELL_ID", "uuid", false),
+            ("CALLER_ID", "string", false),
+            ("GITLEAKS_BIN", "path", false),
+            ("GITLEAKS_VERSION", "string", false),
+            ("GITLEAKS_SHA256", "string", false),
+        ]
+        .into_iter()
+        .map(|(suffix, type_name, secret)| {
+            entry_with_default(&format!("{PREFIX}{suffix}"), type_name, secret, "")
+        }),
+    );
     for name in ["PREAUTH_IP", "CREDENTIAL", "USER", "TENANT", "OPERATION"] {
         entries.push(entry(
             &format!("HUMAUX_GATEWAY_RATE_{name}_CAPACITY"),
@@ -418,6 +657,13 @@ fn entry(name: &str, type_name: &str, secret: bool) -> ConfigEntry {
         secret,
         reloadability: "static".to_owned(),
         owner_module: "gateway.bootstrap".to_owned(),
+    }
+}
+
+fn entry_with_default(name: &str, type_name: &str, secret: bool, default: &str) -> ConfigEntry {
+    ConfigEntry {
+        default: Some(default.to_owned()),
+        ..entry(name, type_name, secret)
     }
 }
 
@@ -650,6 +896,21 @@ mod tests {
                 "HUMAUX_GATEWAY_REMEMBER_EVENT_KIND" => "USER_MESSAGE".into(),
                 "HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS" => "2048".into(),
                 "HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS" => "1024".into(),
+                // Semantic recall stays disabled in this fixture (empty socket path) — every
+                // other key in this group may legitimately be blank when it is.
+                "HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH"
+                | "HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS"
+                | "HUMAUX_GATEWAY_EMBEDDING_DIMENSION"
+                | "HUMAUX_GATEWAY_EMBEDDING_VERSION"
+                | "HUMAUX_GATEWAY_QDRANT_HOST"
+                | "HUMAUX_GATEWAY_QDRANT_PORT"
+                | "HUMAUX_GATEWAY_QDRANT_CIDR"
+                | "HUMAUX_GATEWAY_QDRANT_TLS"
+                | "HUMAUX_GATEWAY_CELL_ID"
+                | "HUMAUX_GATEWAY_CALLER_ID"
+                | "HUMAUX_GATEWAY_GITLEAKS_BIN"
+                | "HUMAUX_GATEWAY_GITLEAKS_VERSION"
+                | "HUMAUX_GATEWAY_GITLEAKS_SHA256" => String::new(),
                 key if key.contains("_CAPACITY") || key.contains("_REFILL_PER_SECOND") => {
                     "100".into()
                 }
@@ -726,5 +987,96 @@ mod tests {
         values.insert("HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K".into(), "7".into());
         let changed = GatewayBootstrap::from_raw(values).expect("registered profile override");
         assert_ne!(first.config_fingerprint, changed.config_fingerprint);
+    }
+
+    fn semantic_recall_enabled_values() -> BTreeMap<String, String> {
+        let mut values = raw();
+        let cell_id = Uuid::now_v7().to_string();
+        for (key, value) in [
+            (
+                "HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH",
+                "/tmp/hgb-test.sock",
+            ),
+            ("HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS", "30"),
+            ("HUMAUX_GATEWAY_EMBEDDING_DIMENSION", "4"),
+            ("HUMAUX_GATEWAY_EMBEDDING_VERSION", "embed-v1"),
+            ("HUMAUX_GATEWAY_QDRANT_HOST", "127.0.0.1"),
+            ("HUMAUX_GATEWAY_QDRANT_PORT", "6333"),
+            ("HUMAUX_GATEWAY_QDRANT_CIDR", "127.0.0.1/32"),
+            ("HUMAUX_GATEWAY_QDRANT_TLS", "false"),
+            ("HUMAUX_GATEWAY_CALLER_ID", "gateway"),
+        ] {
+            values.insert(key.into(), value.into());
+        }
+        values.insert("HUMAUX_GATEWAY_CELL_ID".into(), cell_id);
+        for (key, env) in [
+            ("HUMAUX_GATEWAY_GITLEAKS_BIN", "HUMAUX_TEST_GITLEAKS_BIN"),
+            (
+                "HUMAUX_GATEWAY_GITLEAKS_VERSION",
+                "HUMAUX_TEST_GITLEAKS_VERSION",
+            ),
+            (
+                "HUMAUX_GATEWAY_GITLEAKS_SHA256",
+                "HUMAUX_TEST_GITLEAKS_SHA256",
+            ),
+        ] {
+            values.insert(
+                key.into(),
+                std::env::var(env)
+                    .unwrap_or_else(|_| panic!("semantic recall bootstrap test requires {env}")),
+            );
+        }
+        values
+    }
+
+    /// A non-empty `HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH` requires every other
+    /// `HUMAUX_GATEWAY_{RETRIEVAL_RPC,EMBEDDING,QDRANT,CELL_ID,CALLER_ID,GITLEAKS}_*` key —
+    /// dropping any one of them must fail closed, never silently disable the lane.
+    #[test]
+    fn semantic_recall_requires_every_field_once_the_socket_path_is_set() {
+        let values = semantic_recall_enabled_values();
+        GatewayBootstrap::from_raw(values.clone()).expect("fully configured semantic recall");
+        for key in [
+            "HUMAUX_GATEWAY_EMBEDDING_DIMENSION",
+            "HUMAUX_GATEWAY_EMBEDDING_VERSION",
+            "HUMAUX_GATEWAY_QDRANT_HOST",
+            "HUMAUX_GATEWAY_QDRANT_CIDR",
+            "HUMAUX_GATEWAY_CELL_ID",
+            "HUMAUX_GATEWAY_CALLER_ID",
+            "HUMAUX_GATEWAY_GITLEAKS_BIN",
+        ] {
+            let mut broken = values.clone();
+            broken.insert(key.into(), String::new());
+            assert!(
+                GatewayBootstrap::from_raw(broken).is_err(),
+                "{key} must be required once semantic recall is enabled"
+            );
+        }
+    }
+
+    /// The real build path (`GatewayBootstrap::build`'s `build_semantic_recall_runtime`) wires
+    /// a working `SemanticRecallRuntime` — proven by constructing it directly here with the
+    /// same parser this bootstrap uses, against a real `role_gateway` pool (§79.2: no mock
+    /// PostgreSQL), rather than spinning up the whole HTTP-listener stack `build()` needs.
+    #[tokio::test]
+    async fn semantic_recall_config_builds_a_runtime() {
+        let effective = resolve_effective_config(&registry(), &semantic_recall_enabled_values())
+            .expect("effective config");
+        let config = parse_semantic_recall(&effective)
+            .expect("valid semantic recall config")
+            .expect("socket path is non-empty");
+        let handler_timeout = parse_guard(&effective)
+            .expect("valid guard")
+            .handler_timeout;
+        let pool = Arc::new(
+            RuntimeDbPool::connect(
+                &std::env::var("HUMAUX_GATEWAY_PG_DSN")
+                    .expect("semantic recall bootstrap test requires HUMAUX_GATEWAY_PG_DSN"),
+            )
+            .await
+            .expect("real role_gateway pool"),
+        );
+        build_semantic_recall_runtime(pool, config, handler_timeout)
+            .expect("semantic recall runtime builds from valid config");
     }
 }

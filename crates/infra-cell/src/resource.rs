@@ -219,6 +219,22 @@ pub fn is_private_or_reserved_address(ip: IpAddr) -> bool {
     })
 }
 
+/// Write-denial access mode a [`ResourceEntry`] carries and [`crate::permit::CellAccessPermit`]
+/// mints alongside its resource (2026-08-30 ruling: "no Gateway Qdrant access before a closed
+/// operation/method/path write denial exists") — [`crate::transport::HttpIntraCellTransport::execute`]
+/// enforces [`CellAccessMode::QdrantReadOnly`] before any request leaves the process: GET on any
+/// path, POST only to a Qdrant read endpoint (`/points/search`, `/points/search/batch`,
+/// `/points/query`, `/points/scroll`, `/points/count`); everything else (PUT/DELETE anywhere;
+/// POST elsewhere) is refused. `ReadWrite` is the default — every existing registry-construction
+/// call site keeps compiling unchanged; a caller opts a resource into the read-only allowlist
+/// with [`ResourceEntry::with_access_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CellAccessMode {
+    #[default]
+    ReadWrite,
+    QdrantReadOnly,
+}
+
 /// [`ResourceEntry::new`] failure: a registered CIDR is not entirely inside a private/reserved
 /// range.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +260,7 @@ pub struct ResourceEntry {
     allowed_cidrs: Vec<CellCidr>,
     allowed_callers: BTreeSet<CallerId>,
     tls: bool,
+    access_mode: CellAccessMode,
 }
 
 impl ResourceEntry {
@@ -273,7 +290,22 @@ impl ResourceEntry {
             allowed_cidrs,
             allowed_callers,
             tls,
+            access_mode: CellAccessMode::ReadWrite,
         })
+    }
+
+    /// Opts this entry into a stricter [`CellAccessMode`] than the `ReadWrite` default —
+    /// bootstrap's own choice, never inferred from `host`/`port`/tls. The gateway's bootstrap
+    /// registers `QDRANT_REST` with [`CellAccessMode::QdrantReadOnly`] via this method;
+    /// `xtask architecture-check`'s ADR-0012 gate asserts it never registers a `ReadWrite` one.
+    #[must_use]
+    pub fn with_access_mode(mut self, access_mode: CellAccessMode) -> Self {
+        self.access_mode = access_mode;
+        self
+    }
+
+    pub fn access_mode(&self) -> CellAccessMode {
+        self.access_mode
     }
 
     pub fn host(&self) -> &str {

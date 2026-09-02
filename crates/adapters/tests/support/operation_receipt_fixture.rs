@@ -59,7 +59,19 @@ pub struct ScopedContextRecord {
     pub binding_id: Uuid,
 }
 
+/// Every consumer of this fixture creates and tears down a real tenant, and the teardown
+/// toggles triggers on shared tables (`control.audit_events`, the continuity append-only
+/// guards). Two handles alive at once in one test binary therefore interfere — a fact that
+/// stayed hidden while the fixture skipped on every standard environment. Handles hold this
+/// guard for their whole lifetime so consumers serialize without `--test-threads=1`.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+thread_local! {
+    // A test that builds a second handle on the same thread must not deadlock on itself.
+    static SERIAL_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub struct Handle {
+    _serial: Option<std::sync::MutexGuard<'static, ()>>,
     pub rt: tokio::runtime::Runtime,
     pub runtime: RuntimeDbPool,
     pub maintenance: MaintenanceDbPool,
@@ -83,9 +95,25 @@ fn setup_failed<T>(_: T) -> DbFixtureSkipReason {
     DbFixtureSkipReason::IsolationSetupFailed("operation receipt fixture setup failed".into())
 }
 
-fn expected_dsn(options: &PgConnectOptions, dsn: &str, role: Option<&str>) -> bool {
-    let fixture_target = (options.get_port() == 61719
-        && options.get_database() == Some(FIXTURE_DB))
+/// The disposable target every role DSN must point at. By contract that is whatever
+/// `HUMAUX_TEST_PG_DSN` names (the repo-wide isolated test database, §79.2) — pinning two
+/// machine-local ports here made every consumer of this fixture skip (or spin up a side
+/// container) on any standard environment, i.e. a false green. The two legacy literal targets
+/// stay accepted for the environments that still use them.
+struct FixtureTarget {
+    port: u16,
+    database: String,
+}
+
+fn expected_dsn(
+    options: &PgConnectOptions,
+    dsn: &str,
+    role: Option<&str>,
+    target: &FixtureTarget,
+) -> bool {
+    let fixture_target = (options.get_port() == target.port
+        && options.get_database() == Some(target.database.as_str()))
+        || (options.get_port() == 61719 && options.get_database() == Some(FIXTURE_DB))
         || (options.get_port() == 50324 && options.get_database() == Some(PHASE9_OWNER_FIXTURE_DB));
     role.is_none_or(|expected| options.get_username() == expected)
         && options.get_host() == "127.0.0.1"
@@ -101,12 +129,25 @@ fn fixture_dsns() -> Result<(String, String, String), DbFixtureSkipReason> {
     let admin_options = PgConnectOptions::from_str(&admin_dsn).map_err(setup_failed)?;
     let gateway_options = PgConnectOptions::from_str(&gateway_dsn).map_err(setup_failed)?;
     let maintenance_options = PgConnectOptions::from_str(&maintenance_dsn).map_err(setup_failed)?;
-    if !expected_dsn(&admin_options, &admin_dsn, None)
-        || !expected_dsn(&gateway_options, &gateway_dsn, Some("role_gateway"))
+    let target = FixtureTarget {
+        port: admin_options.get_port(),
+        database: admin_options
+            .get_database()
+            .ok_or_else(|| setup_failed(()))?
+            .to_owned(),
+    };
+    if !expected_dsn(&admin_options, &admin_dsn, None, &target)
+        || !expected_dsn(
+            &gateway_options,
+            &gateway_dsn,
+            Some("role_gateway"),
+            &target,
+        )
         || !expected_dsn(
             &maintenance_options,
             &maintenance_dsn,
             Some("role_maintenance"),
+            &target,
         )
     {
         return Err(setup_failed(()));
@@ -118,6 +159,15 @@ impl DbIntegrationFixture for Fixture {
     type Handle = Handle;
 
     fn isolate() -> Result<Handle, DbFixtureSkipReason> {
+        let serial = if SERIAL_HELD.with(std::cell::Cell::get) {
+            None
+        } else {
+            let guard = SERIAL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            SERIAL_HELD.with(|held| held.set(true));
+            Some(guard)
+        };
         let (admin_dsn, gateway_dsn, maintenance_dsn) = fixture_dsns()?;
 
         let mut admin = Client::connect(&admin_dsn, NoTls).map_err(setup_failed)?;
@@ -197,6 +247,7 @@ impl DbIntegrationFixture for Fixture {
         seed.commit().map_err(setup_failed)?;
 
         Ok(Handle {
+            _serial: serial,
             rt,
             runtime,
             maintenance,
@@ -219,6 +270,9 @@ impl DbIntegrationFixture for Fixture {
 impl Drop for Handle {
     #[allow(clippy::too_many_lines)]
     fn drop(&mut self) {
+        if self._serial.is_some() {
+            SERIAL_HELD.with(|held| held.set(false));
+        }
         let mut user_ids = self.extra_user_ids.clone();
         user_ids.push(self.user_id);
         let mut workspace_ids = self.extra_workspace_ids.clone();
@@ -288,6 +342,8 @@ impl Drop for Handle {
             for statement in [
                 "DELETE FROM control.operation_receipts WHERE tenant_id=$1",
                 "DELETE FROM ops.outbox WHERE tenant_id=$1",
+                "DELETE FROM projection.private_memory_points WHERE tenant_id=$1",
+                "DELETE FROM projection.tenant_placements WHERE tenant_id=$1",
                 "DELETE FROM projection.stream_log WHERE tenant_id=$1",
                 "DELETE FROM projection.stream_checkpoints WHERE tenant_id=$1",
                 "DELETE FROM private.context_bindings WHERE tenant_id=$1",
@@ -352,9 +408,9 @@ impl Drop for Handle {
         })();
         if let Err(error) = cleanup {
             if std::thread::panicking() {
-                eprintln!("operation receipt fixture cleanup failed: {error}");
+                eprintln!("operation receipt fixture cleanup failed: {error:?}");
             } else {
-                panic!("operation receipt fixture cleanup failed: {error}");
+                panic!("operation receipt fixture cleanup failed: {error:?}");
             }
         }
     }
@@ -610,10 +666,15 @@ impl Handle {
         if proxy_port == 0 {
             return Err("loopback proxy port must be nonzero".into());
         }
-        let (credential, database) = self
+        // Split at the (already validated, host == 127.0.0.1) authority, whatever its port.
+        let (credential, rest) = self
             .gateway_dsn
-            .rsplit_once("@127.0.0.1:61719/")
+            .rsplit_once('@')
             .ok_or_else(|| "validated gateway DSN lost approved authority".to_owned())?;
+        let database = rest
+            .split_once('/')
+            .map(|(_, db)| db)
+            .ok_or_else(|| "validated gateway DSN lost its database".to_owned())?;
         let proxied = format!("{credential}@127.0.0.1:{proxy_port}/{database}?sslmode=disable");
         RuntimeDbPool::connect(&proxied)
             .await

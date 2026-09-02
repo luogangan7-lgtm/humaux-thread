@@ -4,12 +4,17 @@
 //! candidate lookup, and the sole PostgreSQL final hydration boundary. It owns no alternate
 //! search or body fallback.
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use humaux_adapters::{
+    placement_repo::tenant_placement,
     postgres::RuntimeDbPool,
     qdrant::{
-        DenseQuery, DenseQueryVersions, QdrantOperation, TenantPlacementRow, ha_profile_for,
+        DenseQuery, DenseQueryVersions, QdrantOperation, RetrievalFamily, ha_profile_for,
         query_dense,
     },
     read_materialize::MaterializedItem,
@@ -18,7 +23,12 @@ use humaux_adapters::{
         private_read_projection_selector,
     },
 };
-use humaux_application::retrieve::{RetrievalIntent, prepare_request};
+use humaux_application::{
+    retrieval_embedding_port::{
+        RetrievalEmbeddingInput, RetrievalEmbeddingOutcome, RetrievalEmbeddingPort,
+    },
+    retrieve::{RetrievalIntent, prepare_request},
+};
 use humaux_domain::{error::ErrorCode, identity::AuthorizationScope, ids::WorkspaceId};
 use humaux_infra_cell::{
     CellAccessPermit, IntraCellHttpTransport, IntraCellResource, IntraCellResourceRegistry,
@@ -40,21 +50,34 @@ use humaux_retrieval::{
     },
     planner::{PlannerDecision, QueryClass},
 };
-use humaux_retrieval_provider::contract::{EmbeddingProvider, RetrievalQueryCallContext};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::context::ContextBootstrap;
 
 /// Bootstrap-owned components for the one native private-memory dense lane.
+///
+/// Holds no [`TenantPlacementRow`](humaux_adapters::qdrant::TenantPlacementRow) — an earlier
+/// shape baked in exactly one tenant's placement at construction time, which made every other
+/// tenant's `recall.search` call assert against it and fail closed. [`search`] resolves a
+/// placement per request instead, through [`tenant_placement`], so this runtime carries no
+/// single-tenant assumption at all (ADR-0012 gateway wiring card).
+///
+/// Holds `port: Arc<dyn RetrievalEmbeddingPort>`, not a provider trait object — §4.2:
+/// the gateway process must never hold a provider descriptor/credential; the real
+/// implementation (`crate::retrieval_embedding_client::GatewayRetrievalEmbeddingClient`) RPCs
+/// `humaux-retrieval-worker`, which alone calls the real provider.
 pub struct SemanticRecallRuntime {
     scanner: Arc<LocalSecretScanner>,
-    embedder: Arc<dyn EmbeddingProvider>,
+    port: Arc<dyn RetrievalEmbeddingPort>,
     qdrant: Arc<dyn IntraCellHttpTransport>,
     cell_registry: IntraCellResourceRegistry,
-    placement: TenantPlacementRow,
     embedding_version: String,
     dimension: u32,
+    /// Bounds [`RetrievalEmbeddingInput::deadline_unix_ms`] — the gateway's own configured
+    /// handler timeout (`bins/gateway/src/guard.rs::GuardSettings::handler_timeout`), not a
+    /// literal (§78.1).
+    handler_timeout: Duration,
 }
 
 pub struct SemanticRecallVersions {
@@ -65,31 +88,27 @@ pub struct SemanticRecallVersions {
 impl SemanticRecallRuntime {
     pub fn new(
         scanner: Arc<LocalSecretScanner>,
-        embedder: Arc<dyn EmbeddingProvider>,
+        port: Arc<dyn RetrievalEmbeddingPort>,
         qdrant: Arc<dyn IntraCellHttpTransport>,
         cell_registry: IntraCellResourceRegistry,
-        placement: TenantPlacementRow,
         versions: SemanticRecallVersions,
+        handler_timeout: Duration,
     ) -> Result<Self, ErrorCode> {
         let SemanticRecallVersions {
             embedding_version,
             dimension,
         } = versions;
-        if placement.projection_family != humaux_adapters::qdrant::RetrievalFamily::PrivateMemoryV1
-            || embedding_version.trim().is_empty()
-            || !embedder.model().dense_supported
-            || !embedder.model().dimension_options.contains(&dimension)
-        {
+        if embedding_version.trim().is_empty() || dimension == 0 || handler_timeout.is_zero() {
             return Err(ErrorCode::InvalidInput);
         }
         Ok(Self {
             scanner,
-            embedder,
+            port,
             qdrant,
             cell_registry,
-            placement,
             embedding_version,
             dimension,
+            handler_timeout,
         })
     }
 
@@ -100,6 +119,17 @@ impl SemanticRecallRuntime {
             Duration::from_secs(30),
         )
         .map_err(|_| ErrorCode::DependencyUnavailable)
+    }
+
+    fn deadline_unix_ms(&self) -> Result<i64, ErrorCode> {
+        let deadline = SystemTime::now() + self.handler_timeout;
+        i64::try_from(
+            deadline
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ErrorCode::Internal)?
+                .as_millis(),
+        )
+        .map_err(|_| ErrorCode::Internal)
     }
 }
 
@@ -112,6 +142,7 @@ pub struct RecallSearchRequest {
     pub limit: Option<u32>,
 }
 
+#[allow(clippy::too_many_lines)] // Keep the one native semantic-recall request/response chain together.
 pub async fn search(
     pool: Arc<RuntimeDbPool>,
     runtime: Arc<SemanticRecallRuntime>,
@@ -129,10 +160,19 @@ pub async fn search(
     let authorization = authorization.narrow(input.workspace_id)?;
     if bootstrap.stream.tenant_id != authorization.tenant_id()
         || bootstrap.stream.scope_id != input.workspace_id.0
-        || runtime.placement.tenant_id != authorization.tenant_id()
     {
         return Err(ErrorCode::Forbidden);
     }
+    // §17.3 per-tenant placement, resolved fresh every request — `None` means "not indexed
+    // yet for this tenant", never a fallback onto another tenant's collection.
+    let placement = tenant_placement(
+        &pool,
+        authorization.tenant_id(),
+        RetrievalFamily::PrivateMemoryV1,
+    )
+    .await
+    .map_err(|_| ErrorCode::DependencyUnavailable)?
+    .ok_or(ErrorCode::DependencyUnavailable)?;
     let family = StreamFamily::new(
         bootstrap.stream.tenant_id,
         bootstrap.stream.scope_kind.clone(),
@@ -151,21 +191,37 @@ pub async fn search(
         return Err(ErrorCode::InvalidInput);
     }
     let trusted_query = retrieval.trusted_query().ok_or(ErrorCode::Internal)?;
+    // Defense-in-depth local scan before the raw text crosses the wire to
+    // `humaux-retrieval-worker` (which independently scans/seals it worker-side, ADR-0012 §2's
+    // "raw query text ... never a sealed query" crossing the boundary).
     let sealed = runtime.scanner.seal_query(&trusted_query)?;
-    let call_context = RetrievalQueryCallContext::new(
-        &authorization,
-        input.workspace_id,
+    let embedding_input = RetrievalEmbeddingInput {
+        authorization: &authorization,
+        workspace_id: input.workspace_id,
         request_id,
-        request_id,
-        1,
-    )
-    .map_err(|_| ErrorCode::Forbidden)?;
-    let embeddings = runtime
-        .embedder
-        .embed_queries(&call_context, runtime.dimension, &[sealed])
-        .await?;
-    let [vector] = embeddings.vectors.as_slice() else {
-        return Err(ErrorCode::DependencyUnavailable);
+        logical_call_id: request_id,
+        attempt_no: 1,
+        profile_fingerprint: retrieval.profile_fingerprint_identity().as_str(),
+        dimension: runtime.dimension,
+        query: sealed.as_str(),
+        deadline_unix_ms: runtime.deadline_unix_ms()?,
+    };
+    let (vector, embedding_model_id) = match runtime.port.embed_query(embedding_input).await? {
+        RetrievalEmbeddingOutcome::Embedded {
+            vector,
+            dimension,
+            model_id,
+            ..
+        } if dimension == runtime.dimension && vector.len() == runtime.dimension as usize => {
+            (vector, model_id)
+        }
+        // A wrong-dimension vector is never truncated/padded to fit — ADR-0012 gateway wiring
+        // card: "mismatch ⇒ DependencyUnavailable, never truncate".
+        RetrievalEmbeddingOutcome::Embedded { .. }
+        | RetrievalEmbeddingOutcome::Skipped
+        | RetrievalEmbeddingOutcome::Unavailable { .. } => {
+            return Err(ErrorCode::DependencyUnavailable);
+        }
     };
     let projection_version = private_read_projection_selector(&pool, &authorization, &family)
         .await
@@ -173,12 +229,12 @@ pub async fn search(
         .ok_or(ErrorCode::DependencyUnavailable)?;
     let dense = DenseQuery::new(
         &authorization,
-        &runtime.placement,
+        &placement,
         DenseQueryVersions {
             projection: &projection_version,
             embedding: &runtime.embedding_version,
         },
-        vector.clone(),
+        vector,
         retrieval.top_k(),
         Vec::new(),
         ha_profile_for(QdrantOperation::ReadYourWriteStrict),
@@ -186,7 +242,22 @@ pub async fn search(
     .map_err(|_| ErrorCode::DependencyUnavailable)?;
     let candidates = query_dense(runtime.qdrant.as_ref(), &runtime.qdrant_permit()?, &dense)
         .await
-        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+        .map_err(|error| {
+            // ADR-0014: a `WriteDenied` here means the registered `QDRANT_REST` entry itself is
+            // misconfigured (a read-only permit rejected a request `query_dense` never should
+            // have shaped as a write) — a Forbidden, not a transient dependency failure a
+            // caller could usefully retry.
+            if matches!(
+                error,
+                humaux_adapters::qdrant::QdrantTransportError::Transport(
+                    humaux_infra_cell::IntraCellError::WriteDenied
+                )
+            ) {
+                ErrorCode::Forbidden
+            } else {
+                ErrorCode::DependencyUnavailable
+            }
+        })?;
     let materialized = materialize_private_read_serving(
         &pool,
         input.consistency_token.as_deref(),
@@ -212,17 +283,20 @@ pub async fn search(
         &bootstrap,
         &runtime,
         &projection_version,
+        &embedding_model_id,
         candidates.len(),
         &catalog,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // One envelope-assembly step over the request's own fixed field set.
 fn accepted_output(
     materialized: MaterializedPrivateReadServing,
     request: &humaux_retrieval::request::RetrievalRequest,
     bootstrap: &ContextBootstrap,
     runtime: &SemanticRecallRuntime,
     projection_version: &str,
+    embedding_model_id: &str,
     candidate_count: usize,
     catalog: &CanonicalCatalog,
 ) -> Result<PendingEnvelope<ToolOutput>, ErrorCode> {
@@ -247,11 +321,7 @@ fn accepted_output(
             id: projection_version.to_owned(),
         },
         embedding_model_id: ProvenanceValue::Used {
-            id: format!(
-                "{}@{}",
-                runtime.embedder.model().model_id.0,
-                runtime.embedding_version
-            ),
+            id: format!("{embedding_model_id}@{}", runtime.embedding_version),
         },
         rerank_model_id: ProvenanceValue::NotApplicable {},
         card_builder_version: ProvenanceValue::NotApplicable {},

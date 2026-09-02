@@ -20,9 +20,8 @@ use humaux_adapters::{
     forget_repo,
     postgres::RuntimeDbPool,
     qdrant::{
-        Distance, PlacementClass, PointId, PromotionState, QdrantOperation, QdrantPointPayload,
-        RetrievalFamily, ShardingMethod, TenantPlacementRow, create_collection_body,
-        ha_profile_for, tenant_index_body, upsert,
+        Distance, PointId, QdrantOperation, QdrantPointPayload, ShardingMethod,
+        create_collection_body, ha_profile_for, tenant_index_body, upsert,
     },
     quota_repo::RatePolicy,
 };
@@ -267,7 +266,76 @@ fn semantic_qdrant_registry(cell: CellId, caller: CallerId) -> IntraCellResource
         )
         .expect("loopback Qdrant resource"),
     );
+    // ADR-0012 §决定3: `GatewayRetrievalEmbeddingClient` mints a permit against this same
+    // registry every call, even though its actual dial bypasses `IntraCellHttpTransport`.
+    entries.insert(
+        IntraCellResource::RETRIEVAL_EMBEDDING_RPC,
+        ResourceEntry::new(
+            "unix-socket",
+            0,
+            cell,
+            vec![],
+            BTreeSet::from([caller.clone()]),
+            false,
+        )
+        .expect("valid RPC resource entry"),
+    );
     IntraCellResourceRegistry::new(entries, cell, caller)
+}
+
+/// `std::env::temp_dir()` overflows `sockaddr_un`'s ~104-byte limit on macOS — mirrors
+/// `tests/query_embedding_rpc.rs`'s identical helper (separate test binary, no shared module).
+fn semantic_rpc_socket_path(tag: &str) -> PathBuf {
+    PathBuf::from(format!("/tmp/hgm-{tag}-{}.sock", Uuid::now_v7().simple()))
+}
+
+/// Learns this test process's own real uid via a local self-connected socket pair's peer
+/// credential — mirrors `tests/query_embedding_rpc.rs`'s identical helper.
+async fn semantic_own_uid() -> u32 {
+    let path = semantic_rpc_socket_path("uid-probe");
+    let listener = tokio::net::UnixListener::bind(&path).expect("bind uid probe socket");
+    let client = tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("connect uid probe");
+    let (server_side, _) = listener.accept().await.expect("accept uid probe");
+    let uid = server_side.peer_cred().expect("peer credential").uid();
+    drop(client);
+    drop(server_side);
+    let _ = std::fs::remove_file(&path);
+    uid
+}
+
+/// Spawns the real `humaux-retrieval-worker` RPC app in-process on a temporary UDS, backed by
+/// `semantic_provider()` — the port double these semantic tests now drive
+/// `SemanticRecallRuntime` through, instead of holding an `EmbeddingProvider` directly (mirrors
+/// `tests/query_embedding_rpc.rs`'s `spawn_worker`).
+async fn spawn_semantic_worker(expected_gateway_uid: u32) -> String {
+    let socket_path = semantic_rpc_socket_path("worker");
+    let calls = humaux_adapters::postgres::RetrievalWorkerDbPool::connect(
+        &std::env::var("HUMAUX_RETRIEVAL_WORKER_PG_DSN")
+            .expect("semantic Gateway fixture requires HUMAUX_RETRIEVAL_WORKER_PG_DSN"),
+    )
+    .await
+    .expect("retrieval worker db pool");
+    let state = Arc::new(humaux_retrieval_worker::rpc::RpcState {
+        expected_gateway_uid,
+        calls,
+        scanner: semantic_scanner(),
+        embedder: semantic_provider(),
+        dimension: 4,
+        provider_id: "gateway-test-provider".to_owned(),
+    });
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind worker rpc socket");
+    let app = humaux_retrieval_worker::rpc::router(state);
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<humaux_retrieval_worker::rpc::PeerIdentity>(),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    socket_path.to_string_lossy().into_owned()
 }
 
 async fn create_semantic_collection(
@@ -403,19 +471,43 @@ struct SemanticProjectionCleanup {
 
 impl Drop for SemanticProjectionCleanup {
     fn drop(&mut self) {
-        let result = self.owner.execute(
-            "DELETE FROM projection.private_memory_points WHERE tenant_id=$1",
-            &[&self.tenant_id],
-        );
-        if let Err(error) = result {
-            let missing_fixture_table = error
-                .as_db_error()
-                .is_some_and(|error| error.code() == &postgres::error::SqlState::UNDEFINED_TABLE);
-            if !missing_fixture_table && !std::thread::panicking() {
-                panic!("cleanup semantic projection registry rows: {error}");
+        for (sql, table) in [
+            (
+                "DELETE FROM projection.private_memory_points WHERE tenant_id=$1",
+                "projection.private_memory_points",
+            ),
+            (
+                "DELETE FROM projection.tenant_placements WHERE tenant_id=$1",
+                "projection.tenant_placements",
+            ),
+        ] {
+            let result = self.owner.execute(sql, &[&self.tenant_id]);
+            if let Err(error) = result {
+                let missing_fixture_table = error.as_db_error().is_some_and(|error| {
+                    error.code() == &postgres::error::SqlState::UNDEFINED_TABLE
+                });
+                if !missing_fixture_table && !std::thread::panicking() {
+                    panic!("cleanup semantic {table} rows: {error}");
+                }
             }
         }
     }
+}
+
+/// §17.3 per-tenant placement row a real `recall.search` call now resolves per request
+/// (`adapters::placement_repo::tenant_placement`) — an in-memory `TenantPlacementRow` is no
+/// longer enough, `SemanticRecallRuntime` holds none.
+fn seed_tenant_placement(handle: &mut Handle, collection: &str) {
+    handle
+        .admin
+        .execute(
+            "INSERT INTO projection.tenant_placements \
+               (tenant_id,projection_family,collection_name,shard_key,placement_class, \
+                point_count,bytes_estimate,promotion_state) \
+             VALUES ($1,'private_memory_v1',$2,NULL,'SHARED_FALLBACK',2,0,'STABLE')",
+            &[&handle.tenant_id, &collection],
+        )
+        .expect("owner seeds tenant placement row");
 }
 
 fn seed_semantic_registry_row(
@@ -669,7 +761,17 @@ async fn proxy_postgres_connection(
     client: TcpStream,
     witness: Arc<CommitAckWitness>,
 ) -> Result<(), String> {
-    let upstream = TcpStream::connect("127.0.0.1:61719")
+    // Upstream = the gateway role DSN's authority (host:port), never a machine-local literal —
+    // the fixture already validated host == 127.0.0.1 and the port matches HUMAUX_TEST_PG_DSN.
+    let upstream_authority = std::env::var("HUMAUX_GATEWAY_PG_DSN")
+        .ok()
+        .and_then(|dsn| dsn.rsplit_once('@').map(|(_, rest)| rest.to_owned()))
+        .and_then(|rest| {
+            rest.split_once('/')
+                .map(|(authority, _)| authority.to_owned())
+        })
+        .expect("HUMAUX_GATEWAY_PG_DSN must be postgres://<user>:<pw>@<host>:<port>/<db>");
+    let upstream = TcpStream::connect(upstream_authority.as_str())
         .await
         .map_err(|_| "connect isolated PostgreSQL from proxy".to_owned())?;
     let receipt_insert_sent = Arc::new(AtomicBool::new(false));
@@ -1396,30 +1498,41 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 .expect("semantic Qdrant transport"),
             );
             let collection = format!("gateway_semantic_{}", Uuid::now_v7().simple());
-            let placement = TenantPlacementRow {
-                tenant_id: TenantId(handle.tenant_id),
-                projection_family: RetrievalFamily::PrivateMemoryV1,
-                collection_name: collection.clone(),
-                shard_key: None,
-                placement_class: PlacementClass::SharedFallback,
-                point_count: 2,
-                bytes_estimate: 0,
-                promotion_state: PromotionState::Stable,
-            };
+            seed_tenant_placement(&mut handle, &collection);
             let runtime_handle = handle.rt.handle().clone();
             let runtime = runtime_handle
                 .block_on(handle.fresh_runtime())
                 .expect("fresh semantic Gateway runtime");
+            let gateway_uid = runtime_handle.block_on(semantic_own_uid());
+            let socket_path = runtime_handle.block_on(spawn_semantic_worker(gateway_uid));
+            let embedding_port: Arc<
+                dyn humaux_application::retrieval_embedding_port::RetrievalEmbeddingPort,
+            > = Arc::new(
+                humaux_gateway::retrieval_embedding_client::GatewayRetrievalEmbeddingClient::new(
+                    Arc::new(
+                        runtime_handle
+                            .block_on(RuntimeDbPool::connect(
+                                &std::env::var("HUMAUX_GATEWAY_PG_DSN").expect(
+                                    "semantic Gateway fixture requires HUMAUX_GATEWAY_PG_DSN",
+                                ),
+                            ))
+                            .expect("gateway runtime pool for the embedding client"),
+                    ),
+                    socket_path,
+                    registry.clone(),
+                    Duration::from_secs(30),
+                ),
+            );
             let semantic = SemanticRecallRuntime::new(
                 semantic_scanner(),
-                semantic_provider(),
+                embedding_port.clone(),
                 transport.clone(),
                 registry.clone(),
-                placement.clone(),
                 SemanticRecallVersions {
                     embedding_version: "embed-v1".to_owned(),
                     dimension: 4,
                 },
+                Duration::from_secs(10),
             )
             .expect("trusted semantic runtime");
             let app = application(&handle, runtime).with_semantic_recall(semantic);
@@ -1592,14 +1705,14 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                     .expect("fresh serving-race Gateway runtime");
                 let race_semantic = SemanticRecallRuntime::new(
                     semantic_scanner(),
-                    semantic_provider(),
+                    embedding_port.clone(),
                     switch_transport.clone(),
                     registry.clone(),
-                    placement,
                     SemanticRecallVersions {
                         embedding_version: "embed-v1".to_owned(),
                         dimension: 4,
                     },
+                    Duration::from_secs(10),
                 )
                 .expect("trusted serving-race runtime");
                 let race_app = application(&handle, race_runtime).with_semantic_recall(race_semantic);

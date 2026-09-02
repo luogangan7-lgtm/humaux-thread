@@ -2210,6 +2210,74 @@ fn adr_0012_gateway_boundary_gate(root: &Path) -> Verdict {
     }
 }
 
+/// ADR-0014: gateway's own `IntraCellResource::QDRANT_REST` registry entry must always carry
+/// `CellAccessMode::QdrantReadOnly` — a static source-scan companion to
+/// `crates/infra-cell`'s runtime enforcement (`HttpIntraCellTransport::execute`'s method/path
+/// allowlist), catching a `bootstrap.rs` regression that drops
+/// `.with_access_mode(CellAccessMode::QdrantReadOnly)` or explicitly reaches for
+/// `CellAccessMode::ReadWrite` before it ever reaches a running process.
+fn adr_0014_gateway_qdrant_read_only_gate(root: &Path) -> Verdict {
+    let dir = root.join(GATEWAY_SRC_DIR);
+    if !dir.is_dir() {
+        return Verdict::NotApplicable(format!("missing object: {GATEWAY_SRC_DIR}"));
+    }
+    let files = read_files(&walk_files(&dir, &["rs"]));
+    if files.is_empty() {
+        return Verdict::NotApplicable(format!("missing object: {GATEWAY_SRC_DIR}/*.rs"));
+    }
+    let mut found_qdrant_entry = false;
+    let mut problems = Vec::new();
+    for (path, source) in &files {
+        let needle = "IntraCellResource::QDRANT_REST";
+        let mut search_from = 0;
+        while let Some(offset) = source[search_from..].find(needle) {
+            let idx = search_from + offset;
+            if !line_is_comment_at(source, idx) {
+                // Only a registry-entry *construction* site is in scope — e.g.
+                // `entries.insert(IntraCellResource::QDRANT_REST, ResourceEntry::new(...)
+                // .with_access_mode(...))`. A plain reference to the variant (minting a permit,
+                // `authorize_cell_access(&registry, IntraCellResource::QDRANT_REST, ttl)`,
+                // rustdoc prose) is not — this scan would otherwise demand
+                // `CellAccessMode::QdrantReadOnly` appear near every read-only permit request
+                // too, which has nothing to configure.
+                let window_end = (idx + 800).min(source.len());
+                let window = &source[idx..window_end];
+                if window.contains("ResourceEntry::new(") {
+                    found_qdrant_entry = true;
+                    if !window.contains("CellAccessMode::QdrantReadOnly") {
+                        problems.push(format!(
+                            "ADR-0014 违反: {} 注册 QDRANT_REST 时未见 CellAccessMode::QdrantReadOnly（附近 800 字符窗口内）",
+                            display(root, path)
+                        ));
+                    }
+                }
+            }
+            search_from = idx + needle.len();
+        }
+        let mut search_from = 0;
+        while let Some(offset) = source[search_from..].find("CellAccessMode::ReadWrite") {
+            let idx = search_from + offset;
+            if !line_is_comment_at(source, idx) {
+                problems.push(format!(
+                    "ADR-0014 违反: {} 显式构造了 CellAccessMode::ReadWrite（gateway 的 Qdrant 访问必须只读）",
+                    display(root, path)
+                ));
+            }
+            search_from = idx + "CellAccessMode::ReadWrite".len();
+        }
+    }
+    if !found_qdrant_entry {
+        return Verdict::NotApplicable(
+            "gateway 尚未注册 IntraCellResource::QDRANT_REST resource entry".to_owned(),
+        );
+    }
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
 // ============================================================================
 // entry point
 // ============================================================================
@@ -4573,6 +4641,10 @@ pub fn run(_args: &[String]) -> i32 {
         (
             "ADR-0012 (RPC transport stays UDS + peer_cred, never TCP)",
             adr_0012_uds_transport_gate(&root),
+        ),
+        (
+            "ADR-0014 (gateway Qdrant access is QdrantReadOnly, never ReadWrite)",
+            adr_0014_gateway_qdrant_read_only_gate(&root),
         ),
     ];
     checks.extend(provider_plane_architecture_gate_checks(&root));
@@ -7997,6 +8069,91 @@ mod tests {
             provider_plane_gate7_projection_write_has_model_metadata(&tmp),
             Verdict::NotApplicable(_)
         ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn adr_0014_real_gateway_bootstrap_is_green() {
+        assert_eq!(
+            adr_0014_gateway_qdrant_read_only_gate(&real_root()),
+            Verdict::Pass
+        );
+    }
+
+    fn adr_0014_tmp_root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "arch-check-adr0014-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn adr_0014_write_bootstrap(tmp: &Path, body: &str) {
+        let dir = tmp.join(GATEWAY_SRC_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("bootstrap.rs"), body).unwrap();
+    }
+
+    /// 注错正向对照：`.with_access_mode(CellAccessMode::QdrantReadOnly)` present → green.
+    #[test]
+    fn adr_0014_qdrant_read_only_entry_is_green() {
+        let tmp = adr_0014_tmp_root("green");
+        adr_0014_write_bootstrap(
+            &tmp,
+            "entries.insert(IntraCellResource::QDRANT_REST, ResourceEntry::new(host, port, cell, cidrs, callers, tls).unwrap().with_access_mode(CellAccessMode::QdrantReadOnly));",
+        );
+        assert_eq!(adr_0014_gateway_qdrant_read_only_gate(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (红): 建了 QDRANT_REST entry 却没有 `.with_access_mode(QdrantReadOnly)` → red.
+    #[test]
+    fn adr_0014_qdrant_entry_missing_read_only_mode_is_red() {
+        let tmp = adr_0014_tmp_root("missing-mode");
+        adr_0014_write_bootstrap(
+            &tmp,
+            "entries.insert(IntraCellResource::QDRANT_REST, ResourceEntry::new(host, port, cell, cidrs, callers, tls).unwrap());",
+        );
+        assert!(matches!(
+            adr_0014_gateway_qdrant_read_only_gate(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 注错 (红): 显式构造 `CellAccessMode::ReadWrite` → red, 即便同时也标了 QdrantReadOnly。
+    #[test]
+    fn adr_0014_explicit_read_write_mode_is_red() {
+        let tmp = adr_0014_tmp_root("read-write");
+        adr_0014_write_bootstrap(
+            &tmp,
+            "entries.insert(IntraCellResource::QDRANT_REST, ResourceEntry::new(host, port, cell, cidrs, callers, tls).unwrap().with_access_mode(CellAccessMode::QdrantReadOnly));\nlet oops = CellAccessMode::ReadWrite;",
+        );
+        assert!(matches!(
+            adr_0014_gateway_qdrant_read_only_gate(&tmp),
+            Verdict::Fail(_)
+        ));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 正向对照：只引用 `IntraCellResource::QDRANT_REST`（铸造 permit）而不构造 `ResourceEntry`
+    /// 的文件不应被误判——这条扫描只关心注册点，不关心每一次读用途的引用。
+    #[test]
+    fn adr_0014_permit_reference_without_construction_is_not_flagged() {
+        let tmp = adr_0014_tmp_root("permit-only");
+        adr_0014_write_bootstrap(
+            &tmp,
+            "authorize_cell_access(&self.cell_registry, IntraCellResource::QDRANT_REST, Duration::from_secs(30))",
+        );
+        assert_eq!(
+            adr_0014_gateway_qdrant_read_only_gate(&tmp),
+            Verdict::NotApplicable(
+                "gateway 尚未注册 IntraCellResource::QDRANT_REST resource entry".to_owned()
+            )
+        );
         fs::remove_dir_all(&tmp).ok();
     }
 }

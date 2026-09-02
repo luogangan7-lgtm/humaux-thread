@@ -61,7 +61,7 @@ use humaux_infra_network::reqwest;
 use serde_json::Value;
 
 use crate::permit::CellAccessPermit;
-use crate::resource::{IntraCellResourceRegistry, ResourceEntry};
+use crate::resource::{CellAccessMode, IntraCellResourceRegistry, ResourceEntry};
 
 /// §83.4: response-buffering cap this transport enforces by default — same value and same
 /// rationale `HttpEgressConfig::max_response_bytes` (Layer 1A) documents: comfortably covers a
@@ -110,6 +110,10 @@ pub enum IntraCellError {
     ExpiredPermit,
     /// §83.4 判据1: `request.path` does not satisfy [`validate_path`]'s contract.
     InvalidPath(String),
+    /// 2026-08-30 read-only ruling: `permit`'s [`CellAccessMode::QdrantReadOnly`] does not admit
+    /// this request's method/path — checked before DNS resolution or any connection attempt
+    /// (see [`is_read_allowed`]'s doc for the exact allowlist).
+    WriteDenied,
     /// The permit's resource has no registry entry — should not happen for a permit minted by
     /// [`crate::permit::authorize_cell_access`] against the same registry, but re-checked here
     /// (defense in depth, same posture `HttpExternalCall::call` takes re-checking `processor`).
@@ -141,6 +145,10 @@ impl std::fmt::Display for IntraCellError {
                 f,
                 "invalid path {p:?}: must start with '/' and contain no '@', \"//\", \"..\" \
                  segment, or whitespace/control character"
+            ),
+            Self::WriteDenied => write!(
+                f,
+                "read-only permit: method/path is not on the Qdrant read allowlist"
             ),
             Self::UnregisteredResource => write!(f, "resource not in intra-cell registry"),
             Self::DnsResolutionFailed(h) => write!(f, "DNS resolution failed for {h}"),
@@ -203,6 +211,39 @@ fn validate_path(path: &str) -> Result<(), IntraCellError> {
 /// parser) decodes and collapses these identically to a real `..` segment.
 fn is_dot_dot_segment(segment: &str) -> bool {
     segment.replace("%2e", ".").replace("%2E", ".") == ".."
+}
+
+/// Qdrant REST path suffixes a [`CellAccessMode::QdrantReadOnly`] permit's `POST` may target —
+/// 2026-08-30 ruling's exact allowlist: search/query/scroll/count, never a mutating endpoint
+/// (`/points`, `/collections`, `/snapshots`, …). Matched by suffix, not exact equality, so a
+/// per-collection path (`/collections/{name}/points/search`) still matches.
+const QDRANT_READ_ONLY_POST_SUFFIXES: [&str; 5] = [
+    "/points/search",
+    "/points/search/batch",
+    "/points/query",
+    "/points/scroll",
+    "/points/count",
+];
+
+/// Whether `method`/`path` is admitted under [`CellAccessMode::QdrantReadOnly`]: `GET` on any
+/// path, `POST` only to [`QDRANT_READ_ONLY_POST_SUFFIXES`]; `PUT`/`DELETE` are refused
+/// unconditionally regardless of path.
+///
+/// Matches against the path component only — everything from the first `?`/`#` onward is
+/// stripped before the suffix check. Every real Qdrant read carries a query string (e.g.
+/// `?consistency=quorum`), so matching the raw string would deny all of them; conversely a
+/// mutating endpoint could otherwise smuggle an allowlisted suffix into its query string (e.g.
+/// `/collections/c/points/delete?zz=/points/search`) and pass an `ends_with` check on the raw
+/// path. Splitting first closes both holes.
+fn is_read_allowed(method: IntraCellMethod, path: &str) -> bool {
+    let path_only = path.split(['?', '#']).next().unwrap_or(path);
+    match method {
+        IntraCellMethod::Get => true,
+        IntraCellMethod::Post => QDRANT_READ_ONLY_POST_SUFFIXES
+            .iter()
+            .any(|suffix| path_only.ends_with(suffix)),
+        IntraCellMethod::Put | IntraCellMethod::Delete => false,
+    }
 }
 
 /// §83.4 Layer 1B's capability wrapper: same-Cell resource access, never `ops.data_disclosures`
@@ -403,6 +444,14 @@ impl IntraCellHttpTransport for HttpIntraCellTransport {
         validate_path(&request.path)?;
         if permit.is_expired(std::time::Instant::now()) {
             return Err(IntraCellError::ExpiredPermit);
+        }
+        // 2026-08-30 ruling: enforced before any DNS resolution or dial, on the permit's own
+        // mint-time access mode — a misconfigured registry entry cannot widen this back by the
+        // time `execute` runs.
+        if permit.access_mode() == CellAccessMode::QdrantReadOnly
+            && !is_read_allowed(request.method, &request.path)
+        {
+            return Err(IntraCellError::WriteDenied);
         }
         let entry = self
             .registry
@@ -1120,5 +1169,209 @@ mod tests {
             .execute(&permit, plain_request("/collections"))
             .await;
         assert_eq!(result.map(|r| r.status), Ok(200));
+    }
+
+    /// A `QdrantReadOnly` registry entry, wired up like [`registry_allowing`] but with the
+    /// stricter access mode a permit must carry through to `execute`'s allowlist check.
+    fn registry_read_only(cidr: &str, cell: CellId) -> IntraCellResourceRegistry {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            IntraCellResource::QDRANT_REST,
+            ResourceEntry::new(
+                "qdrant.internal",
+                6333,
+                cell,
+                vec![cidr.parse().unwrap()],
+                BTreeSet::from([CallerId("retrieval-worker".to_string())]),
+                true,
+            )
+            .unwrap()
+            .with_access_mode(CellAccessMode::QdrantReadOnly),
+        );
+        IntraCellResourceRegistry::new(entries, cell, CallerId("retrieval-worker".to_string()))
+    }
+
+    fn request(method: IntraCellMethod, path: &str) -> IntraCellRequest {
+        IntraCellRequest {
+            method,
+            path: path.to_string(),
+            json_body: None,
+            headers: Vec::new(),
+        }
+    }
+
+    /// 2026-08-30 ruling unit coverage: `GET` on any path is always admitted under
+    /// `QdrantReadOnly`, checked before any DNS resolution happens (a resolver that always
+    /// errors proves the allowlist decision is not what let this call proceed further than it
+    /// should — a `WriteDenied` or a `DnsResolutionFailed` are the only two possible outcomes,
+    /// and this asserts it is never the latter for `GET`).
+    #[tokio::test]
+    async fn read_only_permit_admits_get_on_any_path() {
+        let cell = CellId(uuid::Uuid::now_v7());
+        let registry = registry_read_only("10.0.0.0/8", cell);
+        let permit = permit_for(&registry);
+        struct AlwaysErr;
+        impl DnsResolve for AlwaysErr {
+            fn resolve(&self, host: &str, _port: u16) -> Result<Vec<IpAddr>, IntraCellError> {
+                Err(IntraCellError::DnsResolutionFailed(host.to_string()))
+            }
+        }
+        let transport = HttpIntraCellTransport::with_resolver(
+            registry,
+            Duration::from_secs(1),
+            DEFAULT_MAX_RESPONSE_BYTES,
+            Arc::new(AlwaysErr),
+        )
+        .unwrap();
+        let result = transport
+            .execute(&permit, request(IntraCellMethod::Get, "/collections/x"))
+            .await;
+        assert!(!matches!(result, Err(IntraCellError::WriteDenied)));
+    }
+
+    /// A `POST` to a read-shaped Qdrant endpoint (`/points/search`) is admitted under
+    /// `QdrantReadOnly` — proven the same way as the `GET` case above (denial would surface as
+    /// `WriteDenied`, never a DNS error, since the DNS resolver here always fails).
+    #[tokio::test]
+    async fn read_only_permit_admits_post_points_search() {
+        let cell = CellId(uuid::Uuid::now_v7());
+        let registry = registry_read_only("10.0.0.0/8", cell);
+        let permit = permit_for(&registry);
+        struct AlwaysErr;
+        impl DnsResolve for AlwaysErr {
+            fn resolve(&self, host: &str, _port: u16) -> Result<Vec<IpAddr>, IntraCellError> {
+                Err(IntraCellError::DnsResolutionFailed(host.to_string()))
+            }
+        }
+        let transport = HttpIntraCellTransport::with_resolver(
+            registry,
+            Duration::from_secs(1),
+            DEFAULT_MAX_RESPONSE_BYTES,
+            Arc::new(AlwaysErr),
+        )
+        .unwrap();
+        let result = transport
+            .execute(
+                &permit,
+                request(IntraCellMethod::Post, "/collections/x/points/search"),
+            )
+            .await;
+        assert!(!matches!(result, Err(IntraCellError::WriteDenied)));
+    }
+
+    /// Every real Qdrant read `recall.rs` issues carries a query string (e.g.
+    /// `ha_profile_for(QdrantOperation::ReadYourWriteStrict)` appends `?consistency=quorum`
+    /// via `qdrant_path`) — a raw-string `ends_with` match against the allowlisted suffixes
+    /// would deny 100% of production reads. This is the regression test for that hole.
+    #[tokio::test]
+    async fn read_only_permit_admits_post_points_query_with_consistency_param() {
+        let cell = CellId(uuid::Uuid::now_v7());
+        let registry = registry_read_only("10.0.0.0/8", cell);
+        let permit = permit_for(&registry);
+        struct AlwaysErr;
+        impl DnsResolve for AlwaysErr {
+            fn resolve(&self, host: &str, _port: u16) -> Result<Vec<IpAddr>, IntraCellError> {
+                Err(IntraCellError::DnsResolutionFailed(host.to_string()))
+            }
+        }
+        let transport = HttpIntraCellTransport::with_resolver(
+            registry,
+            Duration::from_secs(1),
+            DEFAULT_MAX_RESPONSE_BYTES,
+            Arc::new(AlwaysErr),
+        )
+        .unwrap();
+        let result = transport
+            .execute(
+                &permit,
+                request(
+                    IntraCellMethod::Post,
+                    "/collections/x/points/query?consistency=quorum",
+                ),
+            )
+            .await;
+        assert!(!matches!(result, Err(IntraCellError::WriteDenied)));
+    }
+
+    /// A mutating endpoint must not be able to smuggle an allowlisted suffix into its query
+    /// string to bypass the `ends_with` check (e.g. `/points/delete?zz=/points/search`).
+    #[tokio::test]
+    async fn read_only_permit_denies_mutating_endpoint_with_allowlisted_suffix_in_query_string() {
+        let cell = CellId(uuid::Uuid::now_v7());
+        let registry = registry_read_only("10.0.0.0/8", cell);
+        let permit = permit_for(&registry);
+        let transport = HttpIntraCellTransport::new(
+            registry,
+            Duration::from_secs(1),
+            DEFAULT_MAX_RESPONSE_BYTES,
+        )
+        .unwrap();
+        let result = transport
+            .execute(
+                &permit,
+                request(
+                    IntraCellMethod::Post,
+                    "/collections/x/points/delete?zz=/points/search",
+                ),
+            )
+            .await;
+        assert_eq!(result, Err(IntraCellError::WriteDenied));
+    }
+
+    #[tokio::test]
+    async fn read_only_permit_denies_put_points() {
+        let cell = CellId(uuid::Uuid::now_v7());
+        let registry = registry_read_only("10.0.0.0/8", cell);
+        let permit = permit_for(&registry);
+        let transport = HttpIntraCellTransport::new(
+            registry,
+            Duration::from_secs(1),
+            DEFAULT_MAX_RESPONSE_BYTES,
+        )
+        .unwrap();
+        let result = transport
+            .execute(
+                &permit,
+                request(IntraCellMethod::Put, "/collections/x/points"),
+            )
+            .await;
+        assert_eq!(result, Err(IntraCellError::WriteDenied));
+    }
+
+    #[tokio::test]
+    async fn read_only_permit_denies_delete() {
+        let cell = CellId(uuid::Uuid::now_v7());
+        let registry = registry_read_only("10.0.0.0/8", cell);
+        let permit = permit_for(&registry);
+        let transport = HttpIntraCellTransport::new(
+            registry,
+            Duration::from_secs(1),
+            DEFAULT_MAX_RESPONSE_BYTES,
+        )
+        .unwrap();
+        let result = transport
+            .execute(&permit, request(IntraCellMethod::Delete, "/collections/x"))
+            .await;
+        assert_eq!(result, Err(IntraCellError::WriteDenied));
+    }
+
+    #[tokio::test]
+    async fn read_only_permit_denies_post_to_a_mutating_endpoint() {
+        let cell = CellId(uuid::Uuid::now_v7());
+        let registry = registry_read_only("10.0.0.0/8", cell);
+        let permit = permit_for(&registry);
+        let transport = HttpIntraCellTransport::new(
+            registry,
+            Duration::from_secs(1),
+            DEFAULT_MAX_RESPONSE_BYTES,
+        )
+        .unwrap();
+        let result = transport
+            .execute(
+                &permit,
+                request(IntraCellMethod::Post, "/collections/x/points"),
+            )
+            .await;
+        assert_eq!(result, Err(IntraCellError::WriteDenied));
     }
 }
