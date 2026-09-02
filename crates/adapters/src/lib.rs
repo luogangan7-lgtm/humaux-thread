@@ -29,6 +29,7 @@ pub mod openbao;
 pub mod operation_receipt;
 pub mod postgres;
 pub mod private_projection_registry;
+pub mod projection_worker;
 pub mod provider_budget;
 pub mod public_projection;
 pub mod public_provenance;

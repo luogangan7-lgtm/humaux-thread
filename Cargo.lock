@@ -1154,6 +1154,17 @@ dependencies = [
 [[package]]
 name = "humaux-retrieval-worker"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "humaux-adapters",
+ "humaux-domain",
+ "humaux-infra-cell",
+ "humaux-local-secret-scan",
+ "humaux-projection",
+ "humaux-retrieval-provider",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "humaux-telemetry"

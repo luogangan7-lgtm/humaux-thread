@@ -6,3 +6,19 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+humaux-adapters = { path = "../../crates/adapters" }
+humaux-domain = { path = "../../crates/domain" }
+humaux-infra-cell = { path = "../../crates/infra-cell" }
+# T7.1 `EmbeddingProvider`/`DashscopeEmbeddingProvider`/`EmbeddingModelDescriptor` — this
+# binary is the one legal place to name both `humaux-adapters` and `humaux-retrieval-provider`
+# together (no cycle: neither depends on this crate) — see
+# `crates/adapters/src/projection_worker.rs`'s `CardEmbedder` doc for why `humaux-adapters`
+# itself cannot.
+humaux-retrieval-provider = { path = "../../crates/retrieval-provider" }
+humaux-local-secret-scan = { path = "../../crates/local-secret-scan" }
+humaux-projection = { path = "../../crates/projection" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1.25.0", features = ["v7"] }
