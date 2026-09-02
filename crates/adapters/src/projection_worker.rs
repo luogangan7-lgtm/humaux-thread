@@ -34,20 +34,23 @@
 //! never attempts one; a row is read, fully processed end-to-end (Qdrant calls included), and
 //! written straight to its terminal state in one final `UPDATE`.
 //!
-//! ## RLS and visibility (a real limitation, not a bug)
+//! ## RLS and visibility
 //!
-//! `private.memory_records`' RLS policy (`migrations/0012_row_level_security.sql`) has no
-//! bypass for `role_retrieval_worker`: a `TENANT_SHARED` row is visible once
-//! `humaux.tenant_id` is set, but `USER_PRIVATE`/`WORKSPACE_SHARED` additionally require
-//! `humaux.user_id` to match the row's owner or an active membership — a fixed sentinel this
-//! headless worker sets can never satisfy that. §6.2.2 grants this role table-level `SELECT`
-//! but does not carve out a policy bypass the way `ops.i4_authority_consistency_scan` gets one
-//! for `role_migration_owner`, so this is the architecture's own boundary, not a missing
-//! grant: a `USER_PRIVATE`/`WORKSPACE_SHARED` memory's stream_log row resolves to "no visible
-//! memory record" here and settles `FAILED`, exactly like any other unresolvable row.
-// ponytail: per-user impersonation to widen this is a real feature (a later task), not a
-// shortcut to take here — tracked in coord task 7e6da2f9 alongside the embedding-model catalog
-// gap `bins/retrieval-worker/src/main.rs` names.
+//! `private.memory_records`' RLS policy (`migrations/0012_row_level_security.sql`, amended by
+//! `migrations/0140_memory_records_rls_retrieval_worker_read.sql`) carves out a read-only
+//! bypass for `role_retrieval_worker`, mirroring the `role_migration_owner` clause already in
+//! the policy: inside the tenant-equality branch, `current_user = 'role_retrieval_worker'`
+//! short-circuits the `USER_PRIVATE`/`WORKSPACE_SHARED` visibility disjunction, so this
+//! tenant-scoped, headless worker can read every row of its own tenant regardless of
+//! `visibility_class`/`visibility_user_id`/membership — real per-query visibility is enforced
+//! downstream at Qdrant read time (§6.1.2) via the payload fields this module writes
+//! (`visibility_class`/`visibility_user_id`/`visibility_workspace_id`) plus
+//! `humaux_projection::dense::visibility_disjunction`, not by restricting what this worker can
+//! index. The `WITH CHECK` clause is untouched — this worker never writes
+//! `private.memory_records`. [`set_worker_rls_context`] still pins `humaux.user_id` to the nil
+//! sentinel on every transaction (not to gate this policy — `current_user` does that — but to
+//! keep a pooled connection's copy of that GUC always cast-safe for `private.evidence_objects`'
+//! own, un-bypassed policy; see that function's doc for the plan-time crash this avoids).
 //!
 //! ## Scope
 //!
@@ -158,9 +161,23 @@ pub struct RunOnceOutcome {
     pub projection_highwater: u64,
 }
 
-/// Sets `humaux.tenant_id`/`humaux.user_id` for the remainder of `txn` — same technique as
-/// `remember::set_authorization_local`/`stream_repo::set_tenant_local`. `user_id` is always the
-/// nil sentinel: this worker never impersonates a specific principal (module doc's RLS note).
+/// Sets `humaux.tenant_id` for the remainder of `txn` — same technique as
+/// `stream_repo::set_tenant_local`. `humaux.user_id` is pinned to the nil sentinel on every
+/// call, not to gate `private.memory_records` (0140's `current_user = 'role_retrieval_worker'`
+/// clause does that regardless of this value — this worker never impersonates a principal, per
+/// the module doc's RLS note) but to keep a *pooled* connection's `humaux.user_id` GUC always a
+/// syntactically valid uuid. Leaving it unset on a connection this worker's own
+/// `private_projection_registry::register_private_memory_point` call has previously `SET
+/// LOCAL`-ed (even to this same nil value) is not safe: PostgreSQL reverts a custom GUC to an
+/// empty-string placeholder, not to NULL, once a transaction that `SET LOCAL`-ed it commits
+/// (0031's documented tenant_id hazard, never patched for user_id) — and `private.evidence_objects`'
+/// own RLS policy (no role bypass, out of 0140's scope) casts
+/// `current_setting('humaux.user_id', true)::uuid` unconditionally in its `USER_PRIVATE`
+/// branch. PostgreSQL's planner constant-folds that stable-function cast at *plan time*
+/// (verified: even a bare `EXPLAIN`, no `ANALYZE`, throws 22P02 on a leaked `''`) — before the
+/// executor's branch-level short-circuiting would ever get a chance to skip it — so re-pinning
+/// a valid value here every transaction is the only way to keep this worker's `resolve_memory`
+/// join from crashing on a `TENANT_SHARED`-evidence row it has every right to read.
 async fn set_worker_rls_context(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,

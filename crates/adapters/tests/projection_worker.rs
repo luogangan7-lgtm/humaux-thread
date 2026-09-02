@@ -15,13 +15,15 @@ use async_trait::async_trait;
 use humaux_adapters::postgres::{RetrievalWorkerDbPool, RuntimeDbPool};
 use humaux_adapters::projection_worker::{CardEmbedder, ProjectionWorkerDeps, run_once};
 use humaux_adapters::qdrant::{
-    Distance, PlacementClass, PromotionState, RetrievalFamily, ShardingMethod, TenantPlacementRow,
-    create_collection_body, tenant_index_body,
+    DenseCandidate, DenseQuery, DenseQueryVersions, Distance, PlacementClass, PointId,
+    PromotionState, QdrantOperation, RetrievalFamily, ShardingMethod, TenantPlacementRow,
+    create_collection_body, ha_profile_for, query_dense, tenant_index_body,
 };
 use humaux_adapters::remember::{self, RememberCommand};
 use humaux_domain::error::ErrorCode;
 use humaux_domain::evidence::{EvidenceOriginClass, payload_sha256};
-use humaux_domain::ids::TenantId;
+use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
+use humaux_domain::ids::{TenantId, UserId};
 use humaux_infra_cell::{
     CallerId, CellAccessPermit, CellId, HttpIntraCellTransport, IntraCellError,
     IntraCellHttpTransport, IntraCellMethod, IntraCellRequest, IntraCellResource,
@@ -122,6 +124,7 @@ impl Drop for Handle {
                WHERE events.event_id = eo.evidence_id AND eo.tenant_id = '{0}'; \
              DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
              DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
+             DELETE FROM control.workspaces WHERE tenant_id = '{0}'; \
              DELETE FROM control.tenants WHERE tenant_id = '{0}';",
             self.tenant_id
         ));
@@ -356,10 +359,110 @@ fn unused_rerank_model() -> RerankModelDescriptor {
 /// `content` carries `title`/`key_claim`/`evidence_excerpt` directly so [`build_card`] always
 /// produces a `Complete` card — this fixture is about `run_once`'s own contract, not §18.4's
 /// partial-card substitution.
+/// A real `control.users` row — `private.memory_records.visibility_user_id` is FK-constrained
+/// to it, so `USER_PRIVATE` fixtures can't use a bare `Uuid::new_v4()`.
+fn seed_user(handle: &mut Handle) -> Uuid {
+    handle
+        .admin
+        .query_one(
+            "INSERT INTO control.users DEFAULT VALUES RETURNING user_id",
+            &[],
+        )
+        .expect("seed throwaway user")
+        .get(0)
+}
+
+/// A real `control.workspaces` row (this fixture's tenant) — `private.memory_records`'s
+/// `visibility_workspace_id` is FK-constrained to it, so `WORKSPACE_SHARED` fixtures can't use a
+/// A throwaway `control.users` row with an ACTIVE membership in this fixture's tenant — the
+/// acting member a `WORKSPACE_SHARED` evidence write needs to satisfy `evidence_objects`'
+/// WITH CHECK (membership EXISTS for `humaux.user_id`).
+fn seed_member(handle: &mut Handle) -> Uuid {
+    let user_id = seed_user(handle);
+    handle
+        .admin
+        .execute(
+            "INSERT INTO control.memberships (tenant_id, user_id, role, state) \
+             VALUES ($1, $2, 'MEMBER', 'ACTIVE')",
+            &[&handle.tenant_id, &user_id],
+        )
+        .expect("seed ACTIVE membership");
+    user_id
+}
+
+/// bare `Uuid::new_v4()`.
+fn seed_workspace(handle: &mut Handle) -> Uuid {
+    handle
+        .admin
+        .query_one(
+            "INSERT INTO control.workspaces (tenant_id, name) VALUES ($1, 'throwaway') \
+             RETURNING workspace_id",
+            &[&handle.tenant_id],
+        )
+        .expect("seed throwaway workspace")
+        .get(0)
+}
+
 fn seed_memory(handle: &mut Handle, scope_id: Uuid, content: &str) -> i64 {
+    seed_memory_with_visibility(handle, scope_id, content, "TENANT_SHARED", None, None).0
+}
+
+/// Same as [`seed_memory`] but lets the caller choose the `private.memory_records` row's own
+/// `visibility_class`/`visibility_user_id`/`visibility_workspace_id`; the Evidence's own
+/// visibility (the `RememberCommand` fields) stays `TENANT_SHARED` here (see
+/// [`seed_memory_with_visibility_and_evidence`] for the non-shared case), mirroring
+/// `remember::token_workspace_id`'s "stream-routing binding, not Evidence visibility"
+/// distinction the module doc's `## Scope` section already draws: the memory row is what §6.1.2
+/// gates, not the Evidence that backs it. Returns `(stream_seq, memory_id)` — the latter lets a
+/// caller resolve the deterministic Qdrant point id from `projection.private_memory_points`.
+fn seed_memory_with_visibility(
+    handle: &mut Handle,
+    scope_id: Uuid,
+    content: &str,
+    visibility_class: &str,
+    visibility_user_id: Option<Uuid>,
+    visibility_workspace_id: Option<Uuid>,
+) -> (i64, Uuid) {
+    seed_memory_with_visibility_and_evidence(
+        handle,
+        scope_id,
+        content,
+        visibility_class,
+        visibility_user_id,
+        visibility_workspace_id,
+        "TENANT_SHARED",
+        None,
+        None,
+    )
+}
+
+/// Like [`seed_memory_with_visibility`] but the backing Evidence row gets its own
+/// `visibility_*` triple too. `resolve_memory` INNER JOINs `private.evidence_objects`, so a
+/// memory whose PRIMARY evidence is `USER_PRIVATE`/`WORKSPACE_SHARED` is only resolvable
+/// because migration 0140 widened *both* policies for `role_retrieval_worker` — the earlier
+/// fixture always wrote `TENANT_SHARED` evidence and therefore never exercised that half of
+/// the join (the production shape `remember.rs` writes verbatim from the request).
+#[allow(clippy::too_many_arguments)]
+fn seed_memory_with_visibility_and_evidence(
+    handle: &mut Handle,
+    scope_id: Uuid,
+    content: &str,
+    visibility_class: &str,
+    visibility_user_id: Option<Uuid>,
+    visibility_workspace_id: Option<Uuid>,
+    evidence_visibility_class: &str,
+    evidence_visibility_user_id: Option<Uuid>,
+    evidence_visibility_workspace_id: Option<Uuid>,
+) -> (i64, Uuid) {
+    // §6.1.2 WITH CHECK: writing USER_PRIVATE/WORKSPACE_SHARED evidence needs the acting
+    // member in `humaux.user_id` (remember.rs:450 sets it from `authorization_user_id`) — and
+    // for WORKSPACE_SHARED that member must hold an ACTIVE membership. The production writer
+    // is always a member, so the fixture mirrors that instead of bypassing RLS.
+    let acting_user = evidence_visibility_user_id
+        .or_else(|| evidence_visibility_workspace_id.map(|_| seed_member(handle)));
     let cmd = RememberCommand {
         tenant_id: handle.tenant_id,
-        authorization_user_id: None,
+        authorization_user_id: acting_user,
         scope_kind: "workspace".to_owned(),
         scope_id,
         domain: "private_memory".to_owned(),
@@ -373,9 +476,9 @@ fn seed_memory(handle: &mut Handle, scope_id: Uuid, content: &str) -> i64 {
         origin_class: EvidenceOriginClass::DirectUserInput,
         origin_principal_id: None,
         origin_connector_id: None,
-        visibility_class: "TENANT_SHARED".to_owned(),
-        visibility_user_id: None,
-        visibility_workspace_id: None,
+        visibility_class: evidence_visibility_class.to_owned(),
+        visibility_user_id: evidence_visibility_user_id,
+        visibility_workspace_id: evidence_visibility_workspace_id,
         reasoning_domain_id: handle.reasoning_domain_id,
         occurred_at: None,
         event_kind: "MANUAL_NOTE".to_owned(),
@@ -397,9 +500,15 @@ fn seed_memory(handle: &mut Handle, scope_id: Uuid, content: &str) -> i64 {
             "INSERT INTO private.memory_records \
                (tenant_id, memory_type, content, visibility_class, visibility_user_id, \
                 visibility_workspace_id, authority_class, confidence, status, asserted_at) \
-             VALUES ($1,'NOTE',$2,'TENANT_SHARED',NULL,NULL,'PrivateKnowledge',0.9,'active',now()) \
+             VALUES ($1,'NOTE',$2,$3,$4,$5,'PrivateKnowledge',0.9,'active',now()) \
              RETURNING memory_id",
-            &[&handle.tenant_id, &content_json],
+            &[
+                &handle.tenant_id,
+                &content_json,
+                &visibility_class,
+                &visibility_user_id,
+                &visibility_workspace_id,
+            ],
         )
         .expect("insert memory_records row")
         .get(0);
@@ -411,7 +520,7 @@ fn seed_memory(handle: &mut Handle, scope_id: Uuid, content: &str) -> i64 {
     .expect("link memory to its evidence");
     txn.commit().expect("commit memory + evidence link");
 
-    handle
+    let stream_seq: i64 = handle
         .admin
         .query_one(
             "SELECT sl.stream_seq FROM projection.stream_log sl \
@@ -420,7 +529,53 @@ fn seed_memory(handle: &mut Handle, scope_id: Uuid, content: &str) -> i64 {
             &[&accepted.evidence_id],
         )
         .expect("resolve the stream_log row remember() issued")
+        .get(0);
+    (stream_seq, memory_id)
+}
+
+/// Resolves the deterministic Qdrant point id `finish_row` registered for a given `memory_id`,
+/// once `run_once` has processed it.
+fn point_id_for_memory(handle: &mut Handle, memory_id: Uuid) -> Uuid {
+    handle
+        .admin
+        .query_one(
+            "SELECT point_id FROM projection.private_memory_points WHERE memory_id = $1",
+            &[&memory_id],
+        )
+        .expect("registered point for this memory")
         .get(0)
+}
+
+/// Raw `POST /collections/{name}/points/scroll` with `with_payload: true` — the only way to
+/// read a point's payload back out; [`humaux_adapters::qdrant::scroll_by_ids`] deliberately
+/// hardcodes `with_payload: false` (it only proves presence, §17's read-your-write check), so
+/// this test goes around the adapter layer to inspect the indexed payload directly, the same
+/// way [`setup_qdrant_collection`] talks to the transport directly for collection setup.
+fn scroll_payloads(
+    handle: &Handle,
+    permit: &CellAccessPermit,
+    point_ids: &[Uuid],
+) -> serde_json::Value {
+    let body = serde_json::json!({
+        "filter": { "must": [{ "has_id": point_ids.iter().map(ToString::to_string).collect::<Vec<_>>() }] },
+        "limit": point_ids.len().max(1),
+        "with_payload": true,
+        "with_vector": false,
+    });
+    handle
+        .rt
+        .block_on(handle.transport.execute(
+            permit,
+            IntraCellRequest {
+                method: IntraCellMethod::Post,
+                path: format!("/collections/{}/points/scroll", handle.collection),
+                json_body: Some(body),
+                headers: Vec::new(),
+            },
+        ))
+        .expect("scroll with payload succeeds")
+        .json_body
+        .expect("scroll response has a JSON body")
 }
 
 fn stream_log_state(
@@ -874,4 +1029,342 @@ fn failed_row_blocks_checkpoint_past_it() {
             "checkpoint must not have advanced past the FAILED row"
         );
     });
+}
+
+/// (T4): 0140's `role_retrieval_worker` RLS read bypass — before it existed, a
+/// `USER_PRIVATE`/`WORKSPACE_SHARED` row's stream_log entry could never resolve under this
+/// worker's tenant-only session and settled `FAILED` forever (module doc's old "RLS and
+/// visibility" note). A batch mixing a `USER_PRIVATE` row (owned by user A) and a
+/// `WORKSPACE_SHARED` row in the same stream both settle `DONE`, both land in Qdrant with their
+/// real `visibility_user_id`/`visibility_workspace_id` payload fields populated (real
+/// enforcement stays downstream at query time, §6.1.2 — see T5), and the checkpoint reaches the
+/// batch's last seq.
+#[test]
+fn mixed_visibility_batch_indexes_both_and_populates_payload() {
+    run_db_fixture::<Fixture, _>(
+        "mixed_visibility_batch_indexes_both_and_populates_payload",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let user_a = seed_user(&mut handle);
+            let workspace_w = seed_workspace(&mut handle);
+            let (seq1, private_memory_id) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "user A's private memory",
+                "USER_PRIVATE",
+                Some(user_a),
+                None,
+            );
+            let (seq2, shared_memory_id) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "workspace shared memory",
+                "WORKSPACE_SHARED",
+                None,
+                Some(workspace_w),
+            );
+            assert_eq!((seq1, seq2), (1, 2));
+
+            let provider = Arc::new(TestDoubleProvider::new(
+                embedding_model(),
+                unused_rerank_model(),
+            ));
+            let deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
+
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("run_once succeeds");
+            let key = (
+                handle.tenant_id,
+                "workspace",
+                scope_id,
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            );
+            assert_eq!(outcome.done, 2);
+            assert_eq!(outcome.failed, 0);
+            assert_eq!(outcome.skipped_by_policy, 0);
+            assert_eq!(outcome.projection_highwater, 2);
+
+            assert_eq!(stream_log_state(&mut handle, &key, seq1), "DONE");
+            assert_eq!(stream_log_state(&mut handle, &key, seq2), "DONE");
+
+            let registered: i64 = handle
+                .admin
+                .query_one(
+                    "SELECT count(*) FROM projection.private_memory_points \
+                     WHERE tenant_id = $1 AND scope_id = $2",
+                    &[&handle.tenant_id, &scope_id],
+                )
+                .expect("registry query")
+                .get(0);
+            assert_eq!(
+                registered, 2,
+                "both rows registered despite mixed visibility"
+            );
+
+            let private_point = point_id_for_memory(&mut handle, private_memory_id);
+            let shared_point = point_id_for_memory(&mut handle, shared_memory_id);
+            let permit = authorize_cell_access(
+                &handle.registry,
+                IntraCellResource::QDRANT_REST,
+                Duration::from_secs(30),
+            )
+            .expect("admin Qdrant permit");
+            let scrolled = scroll_payloads(&handle, &permit, &[private_point, shared_point]);
+            assert_mixed_visibility_payloads(
+                &scrolled,
+                private_point,
+                user_a,
+                shared_point,
+                workspace_w,
+            );
+        },
+    );
+}
+
+/// Asserts T4's scroll result contains exactly the `USER_PRIVATE` point (with its
+/// `visibility_user_id`) and the `WORKSPACE_SHARED` point (with its `visibility_workspace_id`)
+/// — split out of the test body purely to stay under this repo's line-count lint.
+fn assert_mixed_visibility_payloads(
+    scrolled: &serde_json::Value,
+    private_point: Uuid,
+    user_a: Uuid,
+    shared_point: Uuid,
+    workspace_w: Uuid,
+) {
+    let points = scrolled
+        .get("result")
+        .and_then(|r| r.get("points"))
+        .and_then(|p| p.as_array())
+        .expect("scroll result.points");
+    assert_eq!(points.len(), 2, "both points present in Qdrant");
+    for point in points {
+        let payload = point.get("payload").expect("point has a payload");
+        let id = point.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        if id == private_point.to_string() {
+            assert_eq!(
+                payload.get("visibility_class").and_then(|v| v.as_str()),
+                Some("USER_PRIVATE")
+            );
+            assert_eq!(
+                payload.get("visibility_user_id").and_then(|v| v.as_str()),
+                Some(user_a.to_string()).as_deref()
+            );
+        } else if id == shared_point.to_string() {
+            assert_eq!(
+                payload.get("visibility_class").and_then(|v| v.as_str()),
+                Some("WORKSPACE_SHARED")
+            );
+            assert_eq!(
+                payload
+                    .get("visibility_workspace_id")
+                    .and_then(|v| v.as_str()),
+                Some(workspace_w.to_string()).as_deref()
+            );
+        } else {
+            panic!("unexpected point id {id} in scroll result");
+        }
+    }
+}
+
+/// Builds a limit-10, `ReadYourWriteStrict` `DenseQuery` scoped to `user_id` (no workspace
+/// grants), against `v1`/`embed-v1`, with a fixed finite non-zero probe vector — the caller only
+/// ever asserts result-set membership, never ranking/score, so the exact vector value is
+/// unimportant as long as it is valid.
+fn dense_query_for_user(
+    handle: &Handle,
+    placement: &TenantPlacementRow,
+    user_id: Uuid,
+) -> DenseQuery {
+    let scope = AuthorizationScope::new(
+        TenantId(handle.tenant_id),
+        PrincipalId(Uuid::new_v4()),
+        Some(UserId(user_id)),
+        BoundedSet::new([]).expect("empty workspace set is always within MAX_LEN"),
+    );
+    DenseQuery::new(
+        &scope,
+        placement,
+        DenseQueryVersions {
+            projection: "v1",
+            embedding: "embed-v1",
+        },
+        vec![1.0_f32, 0.0, 0.0, 0.0],
+        10,
+        Vec::new(),
+        ha_profile_for(QdrantOperation::ReadYourWriteStrict),
+    )
+    .expect("valid dense query")
+}
+
+/// (T5): §6.1.2's real visibility boundary — enforced downstream at Qdrant query time via
+/// `projection::dense::visibility_disjunction`, not by 0140's RLS read bypass (that bypass only
+/// lets the worker *index* the row; it grants no reader anything). Reuses T4's indexed points:
+/// a `DenseQuery` built for user B (a different user of the same tenant, no membership in
+/// `workspace_w`) returns 0 hits for the `USER_PRIVATE` point owned by user A, while the same
+/// query built for user A does return it — proving the RLS widening in 0140 did not leak
+/// `USER_PRIVATE` visibility to an unrelated query-time reader.
+#[test]
+fn cross_user_dense_query_still_enforces_user_private_visibility() {
+    run_db_fixture::<Fixture, _>(
+        "cross_user_dense_query_still_enforces_user_private_visibility",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let user_a = seed_user(&mut handle);
+            let user_b = seed_user(&mut handle);
+            let (_, private_memory_id) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "user A's private memory for cross-user check",
+                "USER_PRIVATE",
+                Some(user_a),
+                None,
+            );
+
+            let provider = Arc::new(TestDoubleProvider::new(
+                embedding_model(),
+                unused_rerank_model(),
+            ));
+            let deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("run_once succeeds");
+            assert_eq!(outcome.done, 1);
+
+            let private_point = point_id_for_memory(&mut handle, private_memory_id);
+            let placement = TenantPlacementRow {
+                tenant_id: TenantId(handle.tenant_id),
+                projection_family: RetrievalFamily::PrivateMemoryV1,
+                collection_name: handle.collection.clone(),
+                shard_key: None,
+                placement_class: PlacementClass::SharedFallback,
+                point_count: 1,
+                bytes_estimate: 0,
+                promotion_state: PromotionState::Stable,
+            };
+            let permit = handle
+                .rt
+                .block_on(async {
+                    authorize_cell_access(
+                        &handle.registry,
+                        IntraCellResource::QDRANT_REST,
+                        Duration::from_secs(30),
+                    )
+                })
+                .expect("query permit");
+            let query_as_a = dense_query_for_user(&handle, &placement, user_a);
+            let query_as_b = dense_query_for_user(&handle, &placement, user_b);
+
+            // Real Qdrant upsert-then-search has read-after-write lag under Weak ordering, so
+            // poll like `private_projection_registry.rs`'s own `query_private_qdrant_points`
+            // does, rather than asserting on the very first attempt.
+            let hits_as_a: Vec<DenseCandidate> = handle.rt.block_on(async {
+                for _ in 0..20 {
+                    let candidates = query_dense(handle.transport.as_ref(), &permit, &query_as_a)
+                        .await
+                        .expect("dense query as user A succeeds");
+                    if !candidates.is_empty() {
+                        return candidates;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Vec::new()
+            });
+            assert_eq!(
+                hits_as_a.len(),
+                1,
+                "user A's own USER_PRIVATE memory is visible to user A"
+            );
+            assert_eq!(hits_as_a[0].point_id, PointId::Uuid(private_point));
+
+            let hits_as_b = handle
+                .rt
+                .block_on(query_dense(handle.transport.as_ref(), &permit, &query_as_b))
+                .expect("dense query as user B succeeds");
+            assert!(
+                hits_as_b.is_empty(),
+                "0140's RLS read bypass must not leak USER_PRIVATE visibility to user B's \
+                 query-time dense read: got {hits_as_b:?}"
+            );
+        },
+    );
+}
+
+/// 0140 must widen the evidence half of `resolve_memory`'s INNER JOIN too: a memory whose
+/// PRIMARY evidence is `USER_PRIVATE`/`WORKSPACE_SHARED` (the shape `remember.rs` writes when
+/// the request says so) has to index and advance the checkpoint, not settle FAILED and freeze
+/// the tenant under §15.7. Fault F-evidence: drop the role clause from
+/// `evidence_objects_tenant_and_visibility` ⇒ this test goes red (rows FAILED, highwater 0).
+#[test]
+fn non_tenant_shared_evidence_still_resolves_and_advances_checkpoint() {
+    run_db_fixture::<Fixture, _>(
+        "non_tenant_shared_evidence_still_resolves_and_advances_checkpoint",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let user_a = seed_user(&mut handle);
+            let workspace_w = seed_workspace(&mut handle);
+            let (seq1, _) = seed_memory_with_visibility_and_evidence(
+                &mut handle,
+                scope_id,
+                "private memory backed by private evidence",
+                "USER_PRIVATE",
+                Some(user_a),
+                None,
+                "USER_PRIVATE",
+                Some(user_a),
+                None,
+            );
+            let (seq2, _) = seed_memory_with_visibility_and_evidence(
+                &mut handle,
+                scope_id,
+                "shared memory backed by workspace-shared evidence",
+                "WORKSPACE_SHARED",
+                None,
+                Some(workspace_w),
+                "WORKSPACE_SHARED",
+                None,
+                Some(workspace_w),
+            );
+            assert_eq!((seq1, seq2), (1, 2));
+            let provider = Arc::new(TestDoubleProvider::new(
+                embedding_model(),
+                unused_rerank_model(),
+            ));
+            let deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("run_once succeeds");
+            let key = (
+                handle.tenant_id,
+                "workspace",
+                scope_id,
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            );
+            assert_eq!(
+                (outcome.done, outcome.failed, outcome.skipped_by_policy),
+                (2, 0, 0),
+                "non-TENANT_SHARED evidence must resolve under 0140, not settle FAILED"
+            );
+            assert_eq!(outcome.projection_highwater, 2);
+            assert_eq!(stream_log_state(&mut handle, &key, seq1), "DONE");
+            assert_eq!(stream_log_state(&mut handle, &key, seq2), "DONE");
+            let registered: i64 = handle
+                .admin
+                .query_one(
+                    "SELECT count(*) FROM projection.private_memory_points \
+                     WHERE tenant_id = $1 AND scope_id = $2",
+                    &[&handle.tenant_id, &scope_id],
+                )
+                .expect("registry query")
+                .get(0);
+            assert_eq!(registered, 2);
+        },
+    );
 }

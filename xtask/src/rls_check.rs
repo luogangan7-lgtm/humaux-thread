@@ -2744,8 +2744,9 @@ SELECT
    ='c77b3b830c7abec4ad46704fc7e88cded9a75b028c77ffd1946d2f288d7a045f'
  FROM pg_policy WHERE polrelid='private.evidence_objects'::regclass
    AND polname='evidence_objects_tenant_and_visibility')
- AND (SELECT count(*)=5 FROM pg_policy
+ AND (SELECT count(*)=6 FROM pg_policy
   WHERE polrelid='private.evidence_objects'::regclass)
+ -- 6 = 0012 legacy + four W1 owner policies + 0140's evidence_objects_retrieval_worker_read
  AND (SELECT count(*)=4 FROM (VALUES
    ('continuity_evidence_owner_exact_allow','r',true,
     'a0094a5c18098d94a48082666c19502cb123edafc20bff09abb46eae279e466c',NULL::text),
