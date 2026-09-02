@@ -9,3 +9,4 @@ pub mod mcp_application;
 mod memory;
 pub mod recall;
 pub mod remember;
+pub mod retrieval_embedding_client;

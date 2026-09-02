@@ -69,3 +69,20 @@ credential_authority、billing_responsibility、billing_instrument_snapshot_id�
 - 9 张新表 + 6 个新列是 Phase 9 Router/成本预留/账单对账的实现前提，属最大空白。
 - `ReasoningExecutionProfile`（2.10 命名）与代码中的 `UserReasoningProfile` 尚未统一，
   实现前须定名，避免两套并行命名。
+
+## 附录 A（2026-09-02）：① 编号冲突实测清单与映射
+
+对两份文档做全量 ID 盘点（scratch 产物：`baseline_2_10_work/id_remap.tsv`）：共享 186 个
+（95 DOD + 91 G*），其中 **6 个语义冲突**，代码/迁移/xtask 钉住的均为 2.9 含义：
+
+| 2.10 旧 ID | 新 ID | 2.9 含义（保留） | 钉住它的位置 |
+|---|---|---|---|
+| DOD-054 | DOD-099 | 匿名 direct-provenance root | `crates/testkit/src/dod.rs:244` |
+| DOD-095 | DOD-100 | Project Continuity authority/completeness (phase 8) | `xtask/src/contract_impact.rs` |
+| G80-44 | G80-47 | R4 fault manifest closure | `xtask/src/gate_registry.rs:1374-1391` |
+| G80-45 | G80-48 | Phase 9 anonymous trust boundary | `migrations/0134_*.sql:1` |
+| G80-46 | G80-49 | Project Continuity authority closure | `migrations/0135_*.sql:1` |
+| G11-3 | G11-5 | R4 fault manifest closure 的家章锚 | 同 G80-44 行；**本 ADR 原文未列** |
+
+2.9 独有且必须保留：`G25-2`、`G70-1`。2.10 独有（合入时按新号进入）：`DOD-096/097/098`、
+`G11-4`、`G12-1`、`G34-1`、`G80-3A`。无真实悬空引用。

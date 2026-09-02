@@ -40,6 +40,7 @@ pub mod read_materialize;
 pub mod reasoning_route_admission;
 pub mod remember;
 pub mod request_guard_repo;
+pub mod retrieval_embedding_rpc;
 pub mod retrieval_query_source;
 pub mod retrieve;
 pub mod s3;

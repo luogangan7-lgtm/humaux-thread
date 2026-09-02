@@ -29,8 +29,9 @@ use humaux_infra_cell::{
 };
 use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig, SealedRetrievalCard};
 use humaux_projection::serving::StreamFamily;
-use humaux_retrieval_provider::adapters::DashscopeEmbeddingProvider;
+use humaux_retrieval_provider::adapters::embedding_provider_for;
 use humaux_retrieval_provider::contract::{EmbeddingModelDescriptor, EmbeddingProvider, ModelId};
+use std::sync::Arc;
 use uuid::Uuid;
 
 fn required(name: &str) -> Result<String, String> {
@@ -44,18 +45,18 @@ fn parse<T: std::str::FromStr>(name: &str) -> Result<T, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: humaux-retrieval-worker --run-once"
+    "usage: humaux-retrieval-worker (--run-once | --serve-rpc)"
 }
 
 /// Local wrapper making a real [`EmbeddingProvider`] satisfy [`CardEmbedder`] — see that
 /// trait's doc in `crates/adapters/src/projection_worker.rs` for why the orphan rule forces
-/// this indirection here rather than an `impl CardEmbedder for DashscopeEmbeddingProvider` in
+/// this indirection here rather than a blanket impl on the provider type in
 /// `humaux-adapters` (neither trait nor type is local to that crate; both are local, or the
 /// wrapper is, only here — the one crate that depends on both with no cycle).
-struct EmbedderAdapter<P>(P);
+struct EmbedderAdapter(Arc<dyn EmbeddingProvider>);
 
 #[async_trait]
-impl<P: EmbeddingProvider> CardEmbedder for EmbedderAdapter<P> {
+impl CardEmbedder for EmbedderAdapter {
     async fn embed_cards(
         &self,
         tenant_id: TenantId,
@@ -98,10 +99,17 @@ impl From<String> for Outcome {
 
 async fn run() -> Result<(), Outcome> {
     let args = env::args().skip(1).collect::<Vec<_>>();
-    if args.len() != 1 || args[0] != "--run-once" {
+    if args.len() != 1 {
         return Err(Outcome::Failed(usage().to_owned()));
     }
+    match args[0].as_str() {
+        "--run-once" => run_once_mode().await,
+        "--serve-rpc" => rpc_mode::run().await,
+        _ => Err(Outcome::Failed(usage().to_owned())),
+    }
+}
 
+async fn run_once_mode() -> Result<(), Outcome> {
     // Gate: the embedding-model descriptor is config-driven (§78.1 bans a hardcoded model/
     // dim/endpoint), and the catalog that would otherwise supply it does not exist yet
     // (`crates/retrieval-provider/src/contract.rs`'s own T7.1 scope note).
@@ -248,10 +256,15 @@ fn build_scanner() -> Result<LocalSecretScanner, Outcome> {
 /// need the model catalog the "ponytail: descriptor from env" note above already names as
 /// missing — a fixed nil processor id and a fixed batch-level `DisclosureSource` stand in
 /// until that registry exists (tracked in coord task 7e6da2f9).
-async fn build_embedder(
+/// ponytail: the Processor Registry (§7) and a per-memory `DisclosureSource` attribution both
+/// need the model catalog the "ponytail: descriptor from env" note above already names as
+/// missing — a fixed nil processor id and a fixed batch-level `DisclosureSource` stand in
+/// until that registry exists (tracked in coord task 7e6da2f9). Shared by both `--run-once`
+/// (wrapped as `CardEmbedder`) and `--serve-rpc` (used directly as `EmbeddingProvider`).
+async fn build_embedding_provider(
     dsn: &str,
     dimension: u32,
-) -> Result<std::sync::Arc<dyn CardEmbedder>, Outcome> {
+) -> Result<Arc<dyn EmbeddingProvider>, Outcome> {
     let model = EmbeddingModelDescriptor {
         model_id: ModelId(required("HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL")?),
         model_revision: required("HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION")?,
@@ -264,13 +277,88 @@ async fn build_embedder(
     let embedder_pool = RetrievalWorkerDbPool::connect(dsn).await.map_err(|_| {
         "retrieval worker database role connection failed (embedder pool)".to_owned()
     })?;
-    let provider = DashscopeEmbeddingProvider::new(
+    // §78.1: the provider is configuration, not code — the id selects the adapter inside
+    // `humaux_retrieval_provider::adapters` (§19 Gate 3/7 keeps the concrete type there).
+    let provider = embedding_provider_for(
+        &required("HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER")?,
         embedder_pool,
         ProcessorId(Uuid::nil()),
         model,
         required("HUMAUX_RETRIEVAL_WORKER_REGION")?,
         DisclosureSource::Memory(Uuid::nil()),
     )
-    .map_err(|_| "could not construct DashScope embedding provider".to_owned())?;
+    .map_err(|_| "could not construct the configured embedding provider".to_owned())?;
+    Ok(provider)
+}
+
+async fn build_embedder(
+    dsn: &str,
+    dimension: u32,
+) -> Result<std::sync::Arc<dyn CardEmbedder>, Outcome> {
+    let provider = build_embedding_provider(dsn, dimension).await?;
     Ok(std::sync::Arc::new(EmbedderAdapter(provider)))
+}
+
+/// ADR-0012 `--serve-rpc` entry point: the Unix-domain-socket query-embedding RPC listener,
+/// alongside (never instead of) the existing `--run-once` projection loop above.
+mod rpc_mode {
+    use std::sync::Arc;
+
+    use humaux_adapters::postgres::RetrievalWorkerDbPool;
+
+    use super::{Outcome, build_embedding_provider, build_scanner, parse, required};
+    use humaux_retrieval_worker::rpc::{RpcState, router};
+
+    pub async fn run() -> Result<(), Outcome> {
+        for var in [
+            "HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL",
+            "HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION",
+            "HUMAUX_RETRIEVAL_WORKER_DIMENSION",
+        ] {
+            if std::env::var(var).is_err() {
+                return Err(Outcome::NotApplicable(format!("missing {var}")));
+            }
+        }
+        let dimension = parse::<u32>("HUMAUX_RETRIEVAL_WORKER_DIMENSION")?;
+        if dimension == 0 {
+            return Err(Outcome::Failed(
+                "invalid configuration: HUMAUX_RETRIEVAL_WORKER_DIMENSION".to_owned(),
+            ));
+        }
+        let gateway_uid = parse::<u32>("HUMAUX_RETRIEVAL_WORKER_GATEWAY_UID")?;
+        let socket_path = required("HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH")?;
+        let dsn = required("HUMAUX_RETRIEVAL_WORKER_PG_DSN")?;
+
+        let embedder: Arc<dyn humaux_retrieval_provider::contract::EmbeddingProvider> =
+            build_embedding_provider(&dsn, dimension).await?;
+        let scanner = Arc::new(build_scanner()?);
+        let calls = RetrievalWorkerDbPool::connect(&dsn).await.map_err(|_| {
+            "retrieval worker database role connection failed (rpc pool)".to_owned()
+        })?;
+
+        let state = Arc::new(RpcState {
+            expected_gateway_uid: gateway_uid,
+            calls,
+            scanner,
+            embedder,
+            dimension,
+            // §78.1: same configured provider id the embedding provider was built from.
+            provider_id: required("HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER")?,
+        });
+
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = tokio::net::UnixListener::bind(&socket_path).map_err(|error| {
+            format!("failed to bind retrieval embedding RPC socket {socket_path}: {error}")
+        })?;
+        eprintln!("humaux-retrieval-worker RPC listening on {socket_path}");
+        axum::serve(
+            listener,
+            router(state)
+                .into_make_service_with_connect_info::<humaux_retrieval_worker::rpc::PeerIdentity>(
+                ),
+        )
+        .await
+        .map_err(|error| format!("retrieval embedding RPC server failed: {error}"))?;
+        Ok(())
+    }
 }

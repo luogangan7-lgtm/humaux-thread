@@ -31,12 +31,21 @@ pub enum IntraCellResource {
     /// "Sparse/BM25 是本地 Retrieval lane" — Qdrant is Cell-internal infrastructure, not an
     /// external disclosure recipient; see `docs/adr/0003-…` for the full argument).
     QDRANT_REST,
+
+    /// ADR-0012: gateway → `humaux-retrieval-worker` query-embedding RPC. Same-Cell,
+    /// same-legal-entity traffic (never an `ExternalProcessor`) — the transport is a Unix
+    /// domain socket with kernel peer-credential authentication rather than
+    /// [`crate::transport::IntraCellHttpTransport`]'s TCP/CIDR dialing (ADR-0012 §决定1/2);
+    /// this variant exists so the call still goes through the one closed
+    /// `IntraCellResource` registry and [`authorize_cell_access`](crate::permit::authorize_cell_access)
+    /// gate, not so `IntraCellResourceRegistry::resolve` is dialed for it.
+    RETRIEVAL_EMBEDDING_RPC,
 }
 
 impl IntraCellResource {
     /// Every variant — for a registry builder that wants to assert full coverage, and for
     /// `xtask architecture-check`'s registry-consistency scan.
-    pub const ALL: [IntraCellResource; 1] = [Self::QDRANT_REST];
+    pub const ALL: [IntraCellResource; 2] = [Self::QDRANT_REST, Self::RETRIEVAL_EMBEDDING_RPC];
 
     /// ADR-0003 second-round correction (`domain::boundary`): every `IntraCellResource` is,
     /// by definition of belonging to this closed registry, the same legal entity operating
@@ -54,6 +63,7 @@ impl IntraCellResource {
     pub fn name(self) -> &'static str {
         match self {
             Self::QDRANT_REST => "QDRANT_REST",
+            Self::RETRIEVAL_EMBEDDING_RPC => "RETRIEVAL_EMBEDDING_RPC",
         }
     }
 }

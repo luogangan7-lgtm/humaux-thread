@@ -432,6 +432,51 @@ const MATRIX: &[Cell] = &[
         ["SELECT"],
         [("UPDATE", ["revoked_at", "revocation_reason"])]
     ),
+    // ADR-0012 query-embedding RPC registration/idempotency anchor (migration 0141):
+    // role_gateway registers (column-narrow INSERT, never UPDATE — it never claims its own
+    // registration); role_retrieval_worker claims/finishes (column-narrow UPDATE only).
+    cell!(
+        "ops.retrieval_embedding_rpc_calls",
+        "role_gateway",
+        ["SELECT"],
+        [(
+            "INSERT",
+            [
+                "call_id",
+                "tenant_id",
+                "principal_id",
+                "user_id",
+                "workspace_id",
+                "request_id",
+                "logical_call_id",
+                "attempt_no",
+                "profile_fingerprint",
+                "query_sha256",
+                "expires_at"
+            ]
+        )]
+    ),
+    cell!(
+        "ops.retrieval_embedding_rpc_calls",
+        "role_retrieval_worker",
+        ["SELECT"],
+        [(
+            "UPDATE",
+            [
+                "state",
+                "claimed_at",
+                "claimed_by",
+                "finished_at",
+                "outcome",
+                "response_vector",
+                "response_provider_id",
+                "response_model_id",
+                "response_model_revision",
+                "response_dimension",
+                "response_failure_code"
+            ]
+        )]
+    ),
     // private.evidence_objects
     cell!(
         "private.evidence_objects",

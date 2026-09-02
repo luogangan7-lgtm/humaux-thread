@@ -1002,6 +1002,7 @@ dependencies = [
  "humaux-protocol",
  "humaux-retrieval",
  "humaux-retrieval-provider",
+ "humaux-retrieval-worker",
  "humaux-testkit",
  "postgres",
  "serde",
@@ -1156,13 +1157,19 @@ name = "humaux-retrieval-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "humaux-adapters",
  "humaux-domain",
  "humaux-infra-cell",
  "humaux-local-secret-scan",
  "humaux-projection",
+ "humaux-retrieval",
  "humaux-retrieval-provider",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

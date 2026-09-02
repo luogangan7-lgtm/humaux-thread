@@ -391,6 +391,30 @@ fn admission_gate(estimated_input_tokens: u64) -> Result<(), ErrorCode> {
 /// batch is therefore always the caller's own verified argument, never an unchecked echo.
 ///
 /// §19.1 `ModelCallLedger.input_tokens` doc: provider-reported when available (`usage` present
+/// Provider id the route table (`control.retrieval_provider_routes.embedding_provider_id`,
+/// migration 0088) and worker configuration use for this adapter. §78.2: one spelling, here.
+pub const DASHSCOPE_PROVIDER_ID: &str = "dashscope";
+
+/// §19 Provider Plane Architecture Gate 3/7 ("Only retrieval-provider/adapters may import
+/// provider client"): binaries select an embedding provider by id (config / route table,
+/// §78.1) and receive a trait object; the concrete client type never leaves this module.
+/// Unknown ids are `InvalidInput` — there is no default provider (§78.1).
+pub fn embedding_provider_for(
+    provider_id: &str,
+    pool: RetrievalWorkerDbPool,
+    processor: ProcessorId,
+    model: EmbeddingModelDescriptor,
+    region: impl Into<String>,
+    source: DisclosureSource,
+) -> Result<Arc<dyn EmbeddingProvider>, ErrorCode> {
+    match provider_id {
+        DASHSCOPE_PROVIDER_ID => Ok(Arc::new(DashscopeEmbeddingProvider::new(
+            pool, processor, model, region, source,
+        )?)),
+        _ => Err(ErrorCode::InvalidInput),
+    }
+}
+
 /// and non-zero), `estimated_input_tokens` (this crate's own char-count estimate) otherwise —
 /// a response that omits `usage` must not silently record a real, billed call as zero tokens.
 fn parse_embedding_response(

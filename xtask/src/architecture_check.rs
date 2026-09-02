@@ -1391,7 +1391,7 @@ const INFRA_NETWORK_HTTP_RS: &str = "crates/infra-network/src/http.rs";
 /// Sibling of [`EXTERNAL_EGRESS_REGISTRY`]; the two are checked for disjointness by
 /// [`intra_cell_registry_disjoint_from_external`] — a resource must never be nameable through
 /// both registries at once.
-const INTRA_CELL_RESOURCE_REGISTRY: &[&str] = &["QDRANT_REST"];
+const INTRA_CELL_RESOURCE_REGISTRY: &[&str] = &["QDRANT_REST", "RETRIEVAL_EMBEDDING_RPC"];
 
 const INFRA_CELL_RESOURCE_RS: &str = "crates/infra-cell/src/resource.rs";
 
@@ -2081,6 +2081,128 @@ fn g80_3_outbound_choke_point(root: &Path) -> Verdict {
         INTRA_CELL_RESOURCE_REGISTRY,
     ));
 
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
+// ============================================================================
+// ADR-0012 §决定1/2 — the RPC transport must stay a Unix domain socket + kernel
+// peer-credential identity, never TCP.
+// ============================================================================
+
+const RETRIEVAL_WORKER_SRC_DIR: &str = "bins/retrieval-worker/src";
+const GATEWAY_RETRIEVAL_CLIENT_FILE: &str = "bins/gateway/src/retrieval_embedding_client.rs";
+
+/// ADR-0012 is binding on the *transport*, not just on which symbols may cross the gateway/
+/// worker boundary — swapping `UnixListener`/`UnixStream` for `TcpListener`/`TcpStream` in
+/// either the worker's RPC listener or the gateway's dial would silently drop the
+/// `peer_cred()`-based identity check (§决定2) that the ADR calls "读 body 之前" enforcement,
+/// while every other gate here (which only greps for worker-only *symbols*) would keep saying
+/// pass. This gate fails on any literal `TcpListener`/`TcpStream` in the two RPC-specific
+/// files, and requires the corresponding Unix type to actually appear — so a same-host TCP
+/// swap (or the two files simply losing their transport code entirely) both go red.
+fn adr_0012_uds_transport_gate(root: &Path) -> Verdict {
+    let worker_dir = root.join(RETRIEVAL_WORKER_SRC_DIR);
+    let gateway_file = root.join(GATEWAY_RETRIEVAL_CLIENT_FILE);
+    if !worker_dir.is_dir() || !gateway_file.is_file() {
+        return Verdict::NotApplicable(format!(
+            "missing object: {RETRIEVAL_WORKER_SRC_DIR} or {GATEWAY_RETRIEVAL_CLIENT_FILE}"
+        ));
+    }
+    let mut files = read_files(&walk_files(&worker_dir, &["rs"]));
+    let Ok(gateway_source) = std::fs::read_to_string(&gateway_file) else {
+        return Verdict::NotApplicable(format!("unreadable: {GATEWAY_RETRIEVAL_CLIENT_FILE}"));
+    };
+    files.push((gateway_file.clone(), gateway_source));
+
+    const FORBIDDEN: [&str; 2] = ["TcpListener", "TcpStream"];
+    let mut problems = Vec::new();
+    let mut has_unix_listener = false;
+    let mut has_unix_stream = false;
+    for (path, source) in &files {
+        for needle in FORBIDDEN {
+            let mut search_from = 0;
+            while let Some(offset) = source[search_from..].find(needle) {
+                let idx = search_from + offset;
+                if !line_is_comment_at(source, idx) {
+                    problems.push(format!(
+                        "ADR-0012 决定1/2 违反: {} 使用了 TCP 传输 {needle:?}（必须是 UDS + peer_cred）",
+                        display(root, path)
+                    ));
+                }
+                search_from = idx + needle.len();
+            }
+        }
+        if source.contains("UnixListener") {
+            has_unix_listener = true;
+        }
+        if source.contains("UnixStream") {
+            has_unix_stream = true;
+        }
+    }
+    if !has_unix_listener {
+        problems.push(format!(
+            "ADR-0012 决定1 违反: {RETRIEVAL_WORKER_SRC_DIR} 未见 UnixListener — RPC 监听器传输丢失或被替换"
+        ));
+    }
+    if !has_unix_stream {
+        problems.push(format!(
+            "ADR-0012 决定1 违反: {GATEWAY_RETRIEVAL_CLIENT_FILE} 未见 UnixStream — 网关拨号传输丢失或被替换"
+        ));
+    }
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
+// ============================================================================
+// ADR-0012 — gateway↔retrieval-worker query-embedding RPC boundary
+// ============================================================================
+
+const GATEWAY_SRC_DIR: &str = "bins/gateway/src";
+
+/// §4.2 / ADR-0012 决定3: `bins/gateway` may authorize
+/// [`IntraCellResource::RETRIEVAL_EMBEDDING_RPC`](crate) via the shared registry/permit gate,
+/// but the DashScope provider credential, `role_retrieval_worker` pool, and the platform
+/// retrieval credential env var stay `humaux-retrieval-worker`-only (ADR-0012's own
+/// consequence: "gateway 与 retrieval-worker 以不同 OS 用户运行" presumes gateway never even
+/// links the code that would need that credential). A literal hit for any of the three needles
+/// outside a comment line is a regression of that boundary, not a style nit.
+fn adr_0012_gateway_boundary_gate(root: &Path) -> Verdict {
+    let dir = root.join(GATEWAY_SRC_DIR);
+    if !dir.is_dir() {
+        return Verdict::NotApplicable(format!("missing object: {GATEWAY_SRC_DIR}"));
+    }
+    let files = read_files(&walk_files(&dir, &["rs"]));
+    if files.is_empty() {
+        return Verdict::NotApplicable(format!("missing object: {GATEWAY_SRC_DIR}/*.rs"));
+    }
+    const FORBIDDEN: [&str; 3] = [
+        "DashscopeEmbeddingProvider",
+        "RetrievalWorkerDbPool",
+        "DASHSCOPE_API_KEY",
+    ];
+    let mut problems = Vec::new();
+    for (path, source) in &files {
+        for needle in FORBIDDEN {
+            let mut search_from = 0;
+            while let Some(offset) = source[search_from..].find(needle) {
+                let idx = search_from + offset;
+                if !line_is_comment_at(source, idx) {
+                    problems.push(format!(
+                        "ADR-0012 决定3 违反: {} 引用了 worker-only 符号 {needle:?}",
+                        display(root, path)
+                    ));
+                }
+                search_from = idx + needle.len();
+            }
+        }
+    }
     if problems.is_empty() {
         Verdict::Pass
     } else {
@@ -4355,6 +4477,7 @@ fn w2_continuity_gate(root: &Path) -> Verdict {
     )
 }
 
+#[allow(clippy::too_many_lines)] // §57.1: one flat, closed registry of every gate in declaration order — splitting it would hide the list this file exists to make visible.
 pub fn run(_args: &[String]) -> i32 {
     let root = workspace_root();
     let mut checks: Vec<(&str, Verdict)> = vec![
@@ -4442,6 +4565,14 @@ pub fn run(_args: &[String]) -> i32 {
         (
             "§25.3.1 W2 (Project Continuity native RR read boundary)",
             w2_continuity_gate(&root),
+        ),
+        (
+            "ADR-0012 (gateway↔retrieval-worker boundary, worker-only symbols)",
+            adr_0012_gateway_boundary_gate(&root),
+        ),
+        (
+            "ADR-0012 (RPC transport stays UDS + peer_cred, never TCP)",
+            adr_0012_uds_transport_gate(&root),
         ),
     ];
     checks.extend(provider_plane_architecture_gate_checks(&root));

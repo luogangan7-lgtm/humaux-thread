@@ -1,0 +1,20 @@
+# §46.1 migration manifest. Adds the (tenant_id, logical_call_id, attempt_no) idempotency
+# index 0141 shipped without — pure DDL, no DML, no privilege change (the index needs no GRANT
+# of its own; role_gateway already has SELECT/INSERT on the table from 0141).
+
+migration_id = "0142_retrieval_embedding_rpc_calls_logical_call_idx"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('ops.retrieval_embedding_rpc_calls_logical_call_idx') is null
+   and to_regclass('ops.retrieval_embedding_rpc_calls') is not null
+   as precheck_ok
+"""
+
+postcheck = """
+select to_regclass('ops.retrieval_embedding_rpc_calls_logical_call_idx') is not null
+   as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. DROP INDEX ops.retrieval_embedding_rpc_calls_logical_call_idx rollback is safe pre-release (the table itself holds only short-TTL in-flight RPC metadata, 0141's own manifest)."
+backup_restore_requirement = "none (index only, no data migration)."

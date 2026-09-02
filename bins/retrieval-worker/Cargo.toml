@@ -11,14 +11,29 @@ workspace = true
 humaux-adapters = { path = "../../crates/adapters" }
 humaux-domain = { path = "../../crates/domain" }
 humaux-infra-cell = { path = "../../crates/infra-cell" }
-# T7.1 `EmbeddingProvider`/`DashscopeEmbeddingProvider`/`EmbeddingModelDescriptor` — this
+# T7.1 `EmbeddingProvider`/`embedding_provider_for`/`EmbeddingModelDescriptor` — this
 # binary is the one legal place to name both `humaux-adapters` and `humaux-retrieval-provider`
 # together (no cycle: neither depends on this crate) — see
 # `crates/adapters/src/projection_worker.rs`'s `CardEmbedder` doc for why `humaux-adapters`
 # itself cannot.
 humaux-retrieval-provider = { path = "../../crates/retrieval-provider" }
 humaux-local-secret-scan = { path = "../../crates/local-secret-scan" }
+# Same pin as crates/retrieval-provider and crates/telemetry — no [workspace.dependencies]
+# refactor (query_embed_rpc card §6 resolution).
+tracing = "0.1.44"
 humaux-projection = { path = "../../crates/projection" }
+# ADR-0012 `rpc.rs`: `humaux_retrieval::request::{RetrievalIntent, build_request,
+# resolve_registered_retrieval_profile}` — sealing the RPC's raw query text needs the same
+# sole request constructor every other caller uses (§55.1), not a worker-local shortcut.
+humaux-retrieval = { path = "../../crates/retrieval" }
 async-trait = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-uuid = { version = "1.25.0", features = ["v7"] }
+# ADR-0012: `axum::serve` over a `tokio::net::UnixListener` (axum 0.8 native `Listener` impl)
+# is this binary's RPC transport — same pin sibling bins already use.
+axum = "0.8.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Matches `crates/adapters`/`crates/local-secret-scan`'s existing sha2 0.11 pin — no second
+# independent version in the dependency graph.
+sha2 = "0.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+uuid = { version = "1.25.0", features = ["v7", "serde"] }
