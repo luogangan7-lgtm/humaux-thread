@@ -20,6 +20,8 @@ pub mod contribution_scan;
 pub mod credential_repo;
 pub mod dashscope;
 pub mod disclosure;
+pub mod distill_reasoner;
+pub mod distill_repo;
 pub mod email;
 pub mod exact_census;
 pub mod forget_repo;

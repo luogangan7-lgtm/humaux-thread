@@ -19,6 +19,10 @@ humaux-adapters = { path = "../../crates/adapters" }
 humaux-application = { path = "../../crates/application" }
 humaux-domain = { path = "../../crates/domain" }
 humaux-infra-cell = { path = "../../crates/infra-cell" }
+# ADR-0016 `distill.rs`: `humaux_projection::fingerprint::source_hash` is the workspace's sole
+# `SourceHash` constructor (§48.0/G80-11) — the Distill hop's `private.processing_runs.
+# source_hash` must come from it, never a second hasher.
+humaux-projection = { path = "../../crates/projection" }
 # §11.8 `inference_rpc.rs`: `axum::serve` over a `tokio::net::UnixListener` (axum 0.8 native
 # `Listener` impl) — same pin `bins/retrieval-worker`'s own ADR-0012 RPC transport already uses.
 axum = "0.8.9"
@@ -26,10 +30,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 hex = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-uuid = { version = "1.25.0", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+uuid = { version = "1.25.0", features = ["serde", "v7"] }
 
 [dev-dependencies]
 async-trait = "0.1"
 postgres = { version = "0.19", features = ["with-uuid-1", "with-serde_json-1"] }
 uuid = { version = "1.25.0", features = ["v4"] }
+# `tests/distill_hop_e2e.rs` (ADR-0016): live MiniMax + live DB, visible SKIP / `HUMAUX_REQUIRE_*`
+# panic via the shared testkit; the projection leg drives the real
+# `humaux_adapters::projection_worker::run_once` with the real gitleaks-backed scanner.
+humaux-testkit = { path = "../../crates/testkit" }
+humaux-local-secret-scan = { path = "../../crates/local-secret-scan" }
+sha2 = "0.11"

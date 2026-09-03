@@ -1,0 +1,76 @@
+# §46.1 migration manifest. ADR-0016 (Distill hop): the headless private worker may INSERT the
+# memory_records row it derives from Evidence (visibility copied verbatim: TENANT_SHARED /
+# workspace-named WORKSPACE_SHARED / user-named USER_PRIVATE), and may look up the effective
+# route binding for (session tenant, reasoning domain, purpose) through one narrow SECURITY
+# DEFINER function. One policy rewrite (USING byte-identical to 0145) + one function; no DML,
+# no table grants.
+
+migration_id = "0147_private_worker_distill_write_policy"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select exists (select 1 from pg_policies where schemaname='private' and tablename='memory_records'
+                 and policyname='memory_records_tenant_and_visibility'
+                 and qual like '%role_private_worker%'
+                 and with_check not like '%role_private_worker%')
+   and to_regprocedure('control.current_reasoning_route_binding(uuid,text)') is null
+   as precheck_ok
+"""
+
+postcheck = """
+select exists (select 1 from pg_policies where schemaname='private' and tablename='memory_records'
+                 and policyname='memory_records_tenant_and_visibility'
+                 and qual like '%role_private_worker%'
+                 and with_check like '%role_private_worker%'
+                 and with_check like '%visibility_workspace_id IS NOT NULL%'
+                 and with_check like '%visibility_user_id IS NOT NULL%')
+   and exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+                 where n.nspname = 'control' and p.proname = 'current_reasoning_route_binding'
+                   and p.prosecdef and pg_get_userbyid(p.proowner) = 'role_migration_owner')
+   and has_function_privilege('role_private_worker',
+         'control.current_reasoning_route_binding(uuid,text)', 'EXECUTE')
+   and not has_function_privilege('role_gateway',
+         'control.current_reasoning_route_binding(uuid,text)', 'EXECUTE')
+   as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+DROP FUNCTION IF EXISTS control.current_reasoning_route_binding(uuid, text);
+ALTER POLICY memory_records_tenant_and_visibility ON private.memory_records
+USING (
+  current_user = 'role_migration_owner'
+  OR (
+    tenant_id = NULLIF(current_setting('humaux.tenant_id', true), '')::uuid
+    AND (
+      current_user IN ('role_retrieval_worker', 'role_consolidation_worker', 'role_private_worker')
+      OR visibility_class = 'TENANT_SHARED'
+      OR (visibility_class = 'USER_PRIVATE'
+          AND visibility_user_id = current_setting('humaux.user_id', true)::uuid)
+      OR (visibility_class = 'WORKSPACE_SHARED'
+          AND EXISTS (
+            SELECT 1 FROM control.memberships m
+            WHERE m.tenant_id = memory_records.tenant_id
+              AND m.user_id = current_setting('humaux.user_id', true)::uuid
+              AND m.state = 'ACTIVE'
+          ))
+    )
+  )
+)
+WITH CHECK (
+  tenant_id = current_setting('humaux.tenant_id', true)::uuid
+  AND (
+    visibility_class = 'TENANT_SHARED'
+    OR (visibility_class = 'USER_PRIVATE'
+        AND visibility_user_id = current_setting('humaux.user_id', true)::uuid)
+    OR (visibility_class = 'WORKSPACE_SHARED'
+        AND EXISTS (
+          SELECT 1 FROM control.memberships m
+          WHERE m.tenant_id = memory_records.tenant_id
+            AND m.user_id = current_setting('humaux.user_id', true)::uuid
+            AND m.state = 'ACTIVE'
+        ))
+  )
+);
+"""
+
+backup_restore_requirement = "none (one policy definition rewrite + one function; no row data touched)."

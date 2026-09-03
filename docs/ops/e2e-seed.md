@@ -34,12 +34,14 @@ Prints, once, to stdout:
   `api_key_id`, `api_key_prefix`) and the bearer (`Authorization: Bearer <wire>`);
 - the PRIVATE_CONSOLIDATE R3 admission lane's own ids (`binding_id`, `binding_version`,
   `credential_id`, `provider_account_id`, `processor_model_id`, `endpoint_id`,
-  `profile_id`, `policy_id`);
+  `profile_id`, `policy_id`) plus `distill_binding_id` — a second policy/candidate/binding
+  for purpose `PRIVATE_DISTILL_TEXT` over the same profile (ADR-0016). The private worker
+  resolves it by purpose at runtime, so no `*_BINDING_ID` export is printed for it;
 - the semantic-recall placement's `collection_name`/`dimension`;
-- three paste-ready `export` blocks (`HUMAUX_CONSOLIDATION_WORKER_*`,
-  `HUMAUX_PRIVATE_WORKER_*`, `HUMAUX_RETRIEVAL_WORKER_*`) plus
-  `HUMAUX_GATEWAY_EMBEDDING_DIMENSION`, so every rehearsal hop can pick up the exact same
-  seeded values (`provider_matches_admission`).
+- four paste-ready `export` blocks (`HUMAUX_CONSOLIDATION_WORKER_*`,
+  `HUMAUX_PRIVATE_WORKER_*`, `HUMAUX_RETRIEVAL_WORKER_*`,
+  `HUMAUX_PRIVATE_WORKER_DISTILL_*`) plus `HUMAUX_GATEWAY_EMBEDDING_DIMENSION`, so every
+  rehearsal hop can pick up the exact same seeded values (`provider_matches_admission`).
 
 Nothing is written to a file, logged, or stored — the bearer's secret half only ever
 appears in this one stdout line.
@@ -70,6 +72,28 @@ explicitly.
 
 Refuses to run unless `$HUMAUX_TEST_PG_DSN`'s host is `127.0.0.1` and its database name
 starts with `humaux_thread_` — this never touches a production database.
+
+## Distill hop (remember → private-worker → memory_records, ADR-0016)
+
+With the seeded bearer and the `HUMAUX_PRIVATE_WORKER_*` + `HUMAUX_PRIVATE_WORKER_DISTILL_*`
+exports in the shell (plus `HUMAUX_PRIVATE_WORKER_DISTILL_BATCH`,
+`HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS` and, for `--distill-serve`,
+`HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS` — deployment values, no defaults):
+
+```sh
+target/debug/humaux-private-worker --distill-once    # one pass over pending EVIDENCE_ACCEPTED rows
+target/debug/humaux-private-worker --distill-serve   # resident loop on the poll interval
+```
+
+Write Evidence through the gateway's `remember.put` first. One pass claims the tenant's
+`ops.outbox` `EVIDENCE_ACCEPTED` rows (PENDING → PROCESSING → DONE, FAILED only for an
+unusable Evidence or a fail-closed parse; a not-yet-admitted route or a provider 429/5xx hands
+the row back to PENDING for the next pass), leaves one
+`private.processing_runs` row per Evidence (fingerprint recorded before the provider call),
+and 0..N `private.memory_records` + PRIMARY `memory_evidence` rows whose visibility is the
+Evidence's own. The remember-time `projection.stream_log` ticket then resolves in the
+retrieval worker (a 0-memory Evidence settles it `SKIPPED_BY_POLICY/no_memory_distilled`).
+`--teardown` removes these rows too (they all carry `tenant_id`).
 
 ## Second hop (consolidation ⇄ private-worker rehearsal)
 

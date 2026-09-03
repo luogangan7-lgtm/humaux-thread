@@ -17,6 +17,11 @@
 //!   pair `bins/consolidation-worker/tests/consolidation_hop_e2e.rs` proves in-process, so
 //!   the tests cover the accept loop production runs. Provider identity/endpoint/capabilities
 //!   are configuration (§78.1: no literal model, endpoint, or dimension in code).
+//! * `--distill-once` / `--distill-serve` (ADR-0016): one pass / a resident loop of
+//!   [`humaux_private_worker::distill::run_once`] over the `(tenant, reasoning_domain)` pair in
+//!   `HUMAUX_PRIVATE_WORKER_DISTILL_*` — same provider/config bootstrap as `--serve-rpc`
+//!   ([`bootstrap`]), same single-pinned-target shape `humaux-consolidation-worker --run-once`
+//!   uses (no cross-tenant enumeration exists for a tenant-pinned RLS session).
 
 use std::env;
 use std::process::ExitCode;
@@ -33,7 +38,8 @@ use humaux_adapters::contribution_reasoner::ContributionReasonerConfig;
 use humaux_adapters::disclosure::DeletionCapability;
 use humaux_adapters::postgres::PrivateWorkerDbPool;
 use humaux_domain::egress::ProcessorId;
-use humaux_private_worker::inference_rpc::{RpcState, bind_socket, serve};
+use humaux_private_worker::distill::{self, DistillConfig};
+use humaux_private_worker::inference_rpc::{RpcState, bind_socket, clone_config, serve};
 use uuid::Uuid;
 
 fn required(name: &str) -> Result<String, String> {
@@ -47,7 +53,7 @@ fn parse<T: std::str::FromStr>(name: &str) -> Result<T, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: humaux-private-worker (--probe-connection | --serve-rpc)"
+    "usage: humaux-private-worker (--probe-connection | --serve-rpc | --distill-once | --distill-serve)"
 }
 
 #[tokio::main]
@@ -58,13 +64,20 @@ async fn main() -> ExitCode {
             probe_connection().await;
             ExitCode::SUCCESS
         }
-        Some("--serve-rpc") => match serve_rpc().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("humaux-private-worker: {error}");
-                ExitCode::from(2)
+        Some(mode @ ("--serve-rpc" | "--distill-once" | "--distill-serve")) => {
+            let outcome = match mode {
+                "--serve-rpc" => serve_rpc().await,
+                "--distill-once" => distill_mode(false).await,
+                _ => distill_mode(true).await,
+            };
+            match outcome {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("humaux-private-worker: {error}");
+                    ExitCode::from(2)
+                }
             }
-        },
+        }
         Some(_) => {
             eprintln!("humaux-private-worker: {}", usage());
             ExitCode::from(2)
@@ -117,12 +130,18 @@ impl CredentialDecryptor for EnvCredential {
     }
 }
 
-/// ADR-0015 `--serve-rpc`: the Unix-domain-socket private inference listener.
-async fn serve_rpc() -> Result<(), String> {
-    let dsn = required("PRIVATE_WORKER_PG_DSN")?;
-    let socket_path = required("HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH")?;
-    let consolidation_uid = parse::<u32>("HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID")?;
+/// The provider + deployment config + `role_private_worker` pool every inference-bearing mode
+/// of this binary shares (`--serve-rpc`, `--distill-once`, `--distill-serve`) — one bootstrap,
+/// so the Distill hop and the RPC listener can never drift on which provider/endpoint/key they
+/// hold (§4.2 one process, one credential).
+struct Bootstrap {
+    pool: PrivateWorkerDbPool,
+    config: ContributionReasonerConfig,
+    provider: OpenAiCompatibleProvider<EgressHttpTransport, EnvCredential>,
+}
 
+async fn bootstrap() -> Result<Bootstrap, String> {
+    let dsn = required("PRIVATE_WORKER_PG_DSN")?;
     let chat_url = required("HUMAUX_PRIVATE_WORKER_CHAT_URL")?;
     let descriptor = ReasoningProviderDescriptor {
         provider_id: required("HUMAUX_PRIVATE_WORKER_PROVIDER_ID")?,
@@ -192,12 +211,28 @@ async fn serve_rpc() -> Result<(), String> {
         .validate()
         .map_err(|code| format!("invalid configuration: {code:?}"))?;
 
-    let calls = PrivateWorkerDbPool::connect(&dsn)
+    let pool = PrivateWorkerDbPool::connect(&dsn)
         .await
         .map_err(|e| format!("private worker database role connection failed: {e}"))?;
+    Ok(Bootstrap {
+        pool,
+        config,
+        provider,
+    })
+}
+
+/// ADR-0015 `--serve-rpc`: the Unix-domain-socket private inference listener.
+async fn serve_rpc() -> Result<(), String> {
+    let socket_path = required("HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH")?;
+    let consolidation_uid = parse::<u32>("HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID")?;
+    let Bootstrap {
+        pool,
+        config,
+        provider,
+    } = bootstrap().await?;
     let state = Arc::new(RpcState {
         expected_consolidation_uid: consolidation_uid,
-        calls,
+        calls: pool,
         config,
         provider: Box::new(provider),
     });
@@ -209,4 +244,63 @@ async fn serve_rpc() -> Result<(), String> {
     serve(listener, state)
         .await
         .map_err(|error| format!("private inference RPC server failed: {error}"))
+}
+
+/// ADR-0016 `--distill-once` (one pass, then exit) / `--distill-serve` (poll on
+/// `HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS` until killed). The route binding is
+/// resolved by `(tenant, reasoning_domain, purpose = Distill)` inside the pass — no binding id
+/// in the environment.
+async fn distill_mode(resident: bool) -> Result<(), String> {
+    let distill = DistillConfig {
+        tenant_id: parse::<Uuid>("HUMAUX_PRIVATE_WORKER_DISTILL_TENANT_ID")?,
+        reasoning_domain_id: parse::<Uuid>("HUMAUX_PRIVATE_WORKER_DISTILL_REASONING_DOMAIN_ID")?,
+        batch: parse::<i64>("HUMAUX_PRIVATE_WORKER_DISTILL_BATCH")?,
+        lease_seconds: parse::<u64>("HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS")? as f64,
+        // Per-process owner: the DONE flip is fenced on it, so two resident workers over the
+        // same tenant never both commit the same claimed row (ADR-0016 D5).
+        lease_owner: format!("humaux-private-worker/{}", Uuid::now_v7()),
+    };
+    distill.validate().map_err(|code| {
+        format!("invalid configuration: HUMAUX_PRIVATE_WORKER_DISTILL_* ({code:?})")
+    })?;
+    let poll_interval = if resident {
+        Some(Duration::from_secs(parse::<u64>(
+            "HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS",
+        )?))
+    } else {
+        None
+    };
+    let Bootstrap {
+        pool,
+        config,
+        provider,
+    } = bootstrap().await?;
+    loop {
+        let report =
+            match distill::run_once(&pool, &provider, clone_config(&config), &distill).await {
+                Ok(report) => report,
+                // Resident mode: one failed pass (transient DB/provider blip) is logged and retried
+                // on the next poll; `--distill-once` still surfaces it as the exit status.
+                Err(error) if poll_interval.is_some() => {
+                    eprintln!("humaux-private-worker: distill pass failed: {error}");
+                    tokio::time::sleep(poll_interval.unwrap_or_default()).await;
+                    continue;
+                }
+                Err(error) => return Err(format!("distill pass failed: {error}")),
+            };
+        println!(
+            "humaux-private-worker: distill pass claimed={} done={} failed={} deferred={} lost_lease={} memories={} rejected={}",
+            report.claimed,
+            report.done,
+            report.failed,
+            report.deferred,
+            report.lost_lease,
+            report.memories,
+            report.rejected
+        );
+        let Some(interval) = poll_interval else {
+            return Ok(());
+        };
+        tokio::time::sleep(interval).await;
+    }
 }

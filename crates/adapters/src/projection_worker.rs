@@ -156,6 +156,8 @@ pub struct RunOnceOutcome {
     pub skipped_by_policy: u64,
     /// Rows this call settled `FAILED`.
     pub failed: u64,
+    /// Rows left `ISSUED` because their Evidence is not distilled yet (ADR-0016 D6).
+    pub pending: u64,
     /// `projection_highwater` after this call's [`stream_repo::advance_prefix`] — unchanged
     /// from before the call if nothing in this batch was contiguous-done-eligible (§15.7).
     pub projection_highwater: u64,
@@ -397,6 +399,24 @@ enum RowTerminal {
     Done,
     SkippedByPolicy,
     Failed,
+    /// Not a terminal: the Evidence behind this ticket has not been distilled yet (its
+    /// `ops.outbox` row is still PENDING/PROCESSING, ADR-0016 D6) — the row stays `ISSUED` and
+    /// is re-read next pass. Never written to `stream_log`.
+    Pending,
+}
+
+/// ADR-0016 D6: what a ticket whose `ops.outbox` row resolves to no memory means, decided from
+/// that row's own status. Distill is asynchronous to remember (§15.5 "0/1/N later"), so "no
+/// memory yet" is only a gap while the row is still open; a DONE row with no memory is the
+/// legitimate 0-memory outcome and settles as a no-op (`SKIPPED_BY_POLICY`, counted toward the
+/// contiguous prefix like every policy exclusion), and a FAILED row fails the ticket.
+fn terminal_for_missing_memory(outbox_status: Option<&str>) -> (RowTerminal, &'static str) {
+    match outbox_status {
+        Some("DONE") => (RowTerminal::SkippedByPolicy, "no_memory_distilled"),
+        Some("PENDING" | "PROCESSING") => (RowTerminal::Pending, "distill_pending"),
+        Some("FAILED") => (RowTerminal::Failed, "distill_failed"),
+        _ => (RowTerminal::Failed, "no_visible_memory_record"),
+    }
 }
 
 /// Runs (b)-(h) of the module doc's per-row order for exactly one `stream_seq`, given its
@@ -438,10 +458,23 @@ async fn resolve_and_embed(
     let memory = resolve_memory(&mut txn, deps.family.tenant_id.0, commit_seq)
         .await
         .map_err(|_| (RowTerminal::Failed, "db_resolve_failed"))?;
+    let outbox_status: Option<String> = if memory.is_none() {
+        sqlx::query_scalar(
+            "SELECT status FROM ops.outbox WHERE tenant_id = $1 AND commit_seq = $2 \
+             AND event_type = 'EVIDENCE_ACCEPTED' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(deps.family.tenant_id.0)
+        .bind(commit_seq)
+        .fetch_optional(&mut *txn)
+        .await
+        .map_err(|_| (RowTerminal::Failed, "db_resolve_failed"))?
+    } else {
+        None
+    };
     txn.commit()
         .await
         .map_err(|_| (RowTerminal::Failed, "db_commit_failed"))?;
-    let memory = memory.ok_or((RowTerminal::Failed, "no_visible_memory_record"))?;
+    let memory = memory.ok_or_else(|| terminal_for_missing_memory(outbox_status.as_deref()))?;
 
     let input = card_input(&memory, workspace_id);
     let card = match build_card(input, CardBudget::default()) {
@@ -641,6 +674,7 @@ async fn settle_row(
         RowTerminal::Done => "DONE",
         RowTerminal::SkippedByPolicy => "SKIPPED_BY_POLICY",
         RowTerminal::Failed => "FAILED",
+        RowTerminal::Pending => return Ok(()),
     };
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     set_worker_rls_context(&mut txn, key.tenant_id.0)
@@ -696,6 +730,7 @@ pub async fn run_once(
             RowTerminal::Done => outcome.done += 1,
             RowTerminal::SkippedByPolicy => outcome.skipped_by_policy += 1,
             RowTerminal::Failed => outcome.failed += 1,
+            RowTerminal::Pending => outcome.pending += 1,
         }
     }
 

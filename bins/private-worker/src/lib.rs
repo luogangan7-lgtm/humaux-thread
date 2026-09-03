@@ -4,11 +4,14 @@
 //! same reason `bins/retrieval-worker/src/lib.rs` exports its own ADR-0012 `rpc` module:
 //! `bins/consolidation-worker/tests/consolidation_hop_e2e.rs` spawns the real handler
 //! in-process against a temp UDS path rather than reimplementing (and drifting from) it.
+//! `pub mod distill` (ADR-0016) is the Evidence → MemoryRecord hop the binary's
+//! `--distill-once`/`--distill-serve` modes drive and `tests/distill_hop_e2e.rs` proves.
 //!
 //! This library deliberately exposes one `run_once` operation rather than a resident loop. The
 //! binary's provider/config bootstrap remains deployment-owned; this module owns only the frozen
 //! R4 claim, reserve, single-dispatch, scan, completion, and reconciliation state machine.
 
+pub mod distill;
 pub mod inference_rpc;
 
 use humaux_adapters::{

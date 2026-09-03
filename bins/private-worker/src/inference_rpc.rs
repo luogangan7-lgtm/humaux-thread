@@ -345,8 +345,9 @@ async fn infer(
 
 /// `ContributionReasonerConfig` has no `Clone` (`Duration`/`String`/enum fields only, but no
 /// derive) — this handler's config is fixed for the process lifetime, so a field-by-field copy
-/// here is simpler than adding a derive this crate's own file scope does not include.
-fn clone_config(config: &ContributionReasonerConfig) -> ContributionReasonerConfig {
+/// here is simpler than adding a derive this crate's own file scope does not include. `pub`
+/// because the binary's `--distill-*` modes (ADR-0016) hand one copy per pass to the same type.
+pub fn clone_config(config: &ContributionReasonerConfig) -> ContributionReasonerConfig {
     ContributionReasonerConfig {
         allowed_egress_processor_id: ProcessorId(config.allowed_egress_processor_id.0),
         region: config.region.clone(),

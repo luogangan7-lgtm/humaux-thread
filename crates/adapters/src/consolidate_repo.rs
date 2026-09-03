@@ -63,7 +63,7 @@ pub(crate) fn authority_class_from_db_str(s: &str) -> Option<AuthorityClass> {
 /// `authority_class_from_db_str` above, needed because `private.memory_rollups.authority_class`
 /// (added by `migrations/0058_memory_rollups_authority_visibility.sql`) is `text`, not a
 /// dedicated Postgres enum.
-const fn authority_class_to_db_str(class: AuthorityClass) -> &'static str {
+pub(crate) const fn authority_class_to_db_str(class: AuthorityClass) -> &'static str {
     match class {
         AuthorityClass::PublicKnowledge => "PublicKnowledge",
         AuthorityClass::PrivateKnowledge => "PrivateKnowledge",

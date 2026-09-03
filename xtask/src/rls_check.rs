@@ -2538,27 +2538,52 @@ pub fn check_r3_health_observation_boundary(client: &mut impl GenericClient) -> 
     if problems.is_empty() {
         pass(
             "R3 health boundary",
-            "two owner-only FORCE RLS health tables; resolver is private-worker-only SECURITY DEFINER".to_string(),
+            "two owner-only FORCE RLS health tables; resolver + binding lookup are private-worker-only SECURITY DEFINER".to_string(),
         )
     } else {
         fail("R3 health boundary", problems.join("; "))
     }
 }
 
+/// The two narrow `control.*` SECURITY DEFINER functions `role_private_worker` alone may
+/// execute: the 0130 admission resolver and its 0147 twin that names the effective binding for
+/// `(session tenant, reasoning domain, purpose)` (ADR-0016 D1) — §6.2.2 "后续若给窄 resolver
+/// grant，必须在同一变更里同时更新本矩阵、`rls-check`".
+const R3_PRIVATE_WORKER_FUNCTIONS: &[&str] = &[
+    "control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)",
+    "control.current_reasoning_route_binding(uuid,text)",
+];
+
 fn check_r3_health_resolver_contract(
     client: &mut impl GenericClient,
     problems: &mut Vec<String>,
+) -> Result<(), GateResult> {
+    for signature in R3_PRIVATE_WORKER_FUNCTIONS {
+        check_r3_private_worker_function(client, problems, signature)?;
+    }
+    Ok(())
+}
+
+fn check_r3_private_worker_function(
+    client: &mut impl GenericClient,
+    problems: &mut Vec<String>,
+    signature: &str,
 ) -> Result<(), GateResult> {
     let function = match client.query_opt(
         "SELECT pg_get_userbyid(p.proowner), p.prosecdef, coalesce(p.proconfig, ARRAY[]::text[]) \
          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = 'control' \
-           AND p.oid = to_regprocedure('control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)')",
-        &[],
+           AND p.oid = to_regprocedure($1)",
+        &[&signature],
     ) {
         Ok(Some(row)) => row,
-        Ok(None) => return Err(fail("R3 health boundary", "missing control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)")),
-        Err(e) => return Err(fail("R3 health boundary", format!("query resolver failed: {e}"))),
+        Ok(None) => return Err(fail("R3 health boundary", format!("missing {signature}"))),
+        Err(e) => {
+            return Err(fail(
+                "R3 health boundary",
+                format!("query resolver failed: {e}"),
+            ));
+        }
     };
     let owner: String = function.get(0);
     let security_definer: bool = function.get(1);
@@ -2568,14 +2593,13 @@ fn check_r3_health_resolver_contract(
         || !config.iter().any(|v| v == "search_path=pg_catalog")
     {
         problems.push(format!(
-            "resolver expected owner={OWNER_ROLE}, SECURITY DEFINER, search_path=pg_catalog; actual owner={owner}, security_definer={security_definer}, config={config:?}"
+            "{signature}: expected owner={OWNER_ROLE}, SECURITY DEFINER, search_path=pg_catalog; actual owner={owner}, security_definer={security_definer}, config={config:?}"
         ));
     }
     for role in NON_OWNER_ROLES {
         let allowed: bool = match client.query_one(
-            "SELECT has_function_privilege($1::text, \
-             'control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)', 'EXECUTE')",
-            &[role],
+            "SELECT has_function_privilege($1::text, $2::text, 'EXECUTE')",
+            &[role, &signature],
         ) {
             Ok(row) => row.get(0),
             Err(e) => {
@@ -2586,7 +2610,7 @@ fn check_r3_health_resolver_contract(
         let expected = *role == "role_private_worker";
         if allowed != expected {
             problems.push(format!(
-                "resolver/{role}: expected EXECUTE={expected}, actual {allowed}"
+                "{signature}/{role}: expected EXECUTE={expected}, actual {allowed}"
             ));
         }
     }
@@ -2599,8 +2623,8 @@ fn check_r3_health_resolver_contract(
          FROM pg_proc p \
          JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = 'control' \
-           AND p.oid = to_regprocedure('control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)')",
-        &[],
+           AND p.oid = to_regprocedure($1)",
+        &[&signature],
     ) {
         Ok(row) => row.get(0),
         Err(e) => {
@@ -2609,7 +2633,7 @@ fn check_r3_health_resolver_contract(
         }
     };
     if !public_execute_absent {
-        problems.push("resolver/PUBLIC: EXECUTE must be revoked".to_string());
+        problems.push(format!("{signature}/PUBLIC: EXECUTE must be revoked"));
     }
     Ok(())
 }

@@ -275,6 +275,7 @@ struct LoadedInput {
     authority_class: String,
 }
 
+/// private-worker reasoners open their read transactions with.
 async fn set_tenant(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,
@@ -325,7 +326,7 @@ async fn verify_run(
 /// Same identity gate `ContributionReasoner` applies before dispatch: an ACTIVE tenant, an
 /// ACTIVE reasoning domain with an ACTIVE owner membership — the owner is the `user_id` the
 /// §11.1 context carries for this headless call.
-async fn domain_owner(
+pub(crate) async fn domain_owner(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,
     reasoning_domain_id: Uuid,

@@ -9,7 +9,9 @@
 //! `crates/adapters/tests/support/operation_receipt_fixture.rs`'s `isolate()`; the
 //! PRIVATE_CONSOLIDATE R3 admission lane mirrors `bins/consolidation-worker/tests/
 //! consolidation_hop_e2e.rs::setup_db` verbatim (2026-09-03 addition — the second
-//! rehearsal hop needs a resolvable admission lane, not just a bearer). The 追加2 lane
+//! rehearsal hop needs a resolvable admission lane, not just a bearer); the same profile
+//! also gets a second policy/candidate/binding for purpose `PRIVATE_DISTILL_TEXT` (ADR-0016:
+//! the private worker resolves it by purpose, so nothing new is printed). The 追加2 lane
 //! (same date) provisions the semantic-recall placement the third/fourth rehearsal hop needs:
 //! a Qdrant collection (mirrors `bins/gateway/tests/semantic_recall_wiring.rs::create_collection`,
 //! reusing `humaux_adapters::qdrant`'s body constructors and the real
@@ -159,6 +161,9 @@ fn parse_lane_flags(args: &[String]) -> Result<LaneFlags, String> {
 struct LaneSeed {
     binding_id: Uuid,
     binding_version: i64,
+    /// ADR-0016 D7: the `PRIVATE_DISTILL_TEXT` binding over the same profile — resolved by
+    /// purpose at runtime, printed only for teardown bookkeeping.
+    distill_binding_id: Uuid,
     credential_id: Uuid,
     provider_account_id: Uuid,
     processor_model_id: Uuid,
@@ -264,6 +269,52 @@ fn seed_base(
     })
 }
 
+/// One route policy (pinned candidate over `profile_id`, promoted SHADOW → SERVING) + its
+/// binding for `purpose` — the tail of the lane graph, shared by the PRIVATE_CONSOLIDATE and
+/// PRIVATE_DISTILL_TEXT purposes (same profile, same provider). Returns
+/// `(route_policy_id, binding_id)`.
+fn seed_route(
+    txn: &mut postgres::Transaction<'_>,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    reasoning_domain_id: Uuid,
+    profile_id: Uuid,
+    purpose: &str,
+) -> Result<(Uuid, Uuid), String> {
+    let policy_id: Uuid = txn
+        .query_one(
+            "INSERT INTO control.reasoning_route_policies(tenant_id,policy_owner_user_id,purpose) VALUES($1,$2,$3) RETURNING route_policy_id",
+            &[&tenant_id, &user_id, &purpose],
+        )
+        .map_err(|e| format!("insert route policy ({purpose}): {}", db_detail(&e)))?
+        .get(0);
+    txn.execute(
+        "INSERT INTO control.reasoning_route_candidates(tenant_id,route_policy_id,route_policy_version,profile_id,profile_version,priority) \
+         VALUES($1,$2,1,$3,1,0)",
+        &[&tenant_id, &policy_id, &profile_id],
+    )
+    .map_err(|e| format!("insert route candidate ({purpose}): {}", db_detail(&e)))?;
+    txn.execute(
+        "UPDATE control.reasoning_route_policies SET lifecycle_state='SHADOW' WHERE route_policy_id=$1 AND policy_version=1",
+        &[&policy_id],
+    )
+    .map_err(|e| format!("promote policy to shadow ({purpose}): {}", db_detail(&e)))?;
+    txn.execute(
+        "UPDATE control.reasoning_route_policies SET lifecycle_state='SERVING' WHERE route_policy_id=$1 AND policy_version=1",
+        &[&policy_id],
+    )
+    .map_err(|e| format!("promote policy to serving ({purpose}): {}", db_detail(&e)))?;
+    let binding_id: Uuid = txn
+        .query_one(
+            "INSERT INTO control.reasoning_route_bindings(tenant_id,reasoning_domain_id,purpose,route_policy_id,route_policy_version) \
+             VALUES($1,$2,$3,$4,1) RETURNING binding_id",
+            &[&tenant_id, &reasoning_domain_id, &purpose, &policy_id],
+        )
+        .map_err(|e| format!("insert route binding ({purpose}): {}", db_detail(&e)))?
+        .get(0);
+    Ok((policy_id, binding_id))
+}
+
 /// Mirrors `bins/consolidation-worker/tests/consolidation_hop_e2e.rs::setup_db`'s R3
 /// admission-lane graph verbatim (2026-09-03 card addition — 逐字镜像, not a rederivation).
 #[allow(clippy::too_many_lines)]
@@ -275,6 +326,7 @@ fn seed_lane(
     flags: &LaneFlags,
 ) -> Result<LaneSeed, String> {
     const PURPOSE: &str = "PRIVATE_CONSOLIDATE";
+    const DISTILL_PURPOSE: &str = "PRIVATE_DISTILL_TEXT";
     let mut txn = client
         .transaction()
         .map_err(|e| format!("begin lane txn: {}", db_detail(&e)))?;
@@ -333,37 +385,22 @@ fn seed_lane(
         )
         .map_err(|e| format!("insert reasoning profile: {}", db_detail(&e)))?
         .get(0);
-    let policy_id: Uuid = txn
-        .query_one(
-            "INSERT INTO control.reasoning_route_policies(tenant_id,policy_owner_user_id,purpose) VALUES($1,$2,$3) RETURNING route_policy_id",
-            &[&tenant_id, &user_id, &PURPOSE],
-        )
-        .map_err(|e| format!("insert route policy: {}", db_detail(&e)))?
-        .get(0);
-    txn.execute(
-        "INSERT INTO control.reasoning_route_candidates(tenant_id,route_policy_id,route_policy_version,profile_id,profile_version,priority) \
-         VALUES($1,$2,1,$3,1,0)",
-        &[&tenant_id, &policy_id, &profile_id],
-    )
-    .map_err(|e| format!("insert route candidate: {}", db_detail(&e)))?;
-    txn.execute(
-        "UPDATE control.reasoning_route_policies SET lifecycle_state='SHADOW' WHERE route_policy_id=$1 AND policy_version=1",
-        &[&policy_id],
-    )
-    .map_err(|e| format!("promote policy to shadow: {}", db_detail(&e)))?;
-    txn.execute(
-        "UPDATE control.reasoning_route_policies SET lifecycle_state='SERVING' WHERE route_policy_id=$1 AND policy_version=1",
-        &[&policy_id],
-    )
-    .map_err(|e| format!("promote policy to serving: {}", db_detail(&e)))?;
-    let binding_id: Uuid = txn
-        .query_one(
-            "INSERT INTO control.reasoning_route_bindings(tenant_id,reasoning_domain_id,purpose,route_policy_id,route_policy_version) \
-             VALUES($1,$2,$3,$4,1) RETURNING binding_id",
-            &[&tenant_id, &reasoning_domain_id, &PURPOSE, &policy_id],
-        )
-        .map_err(|e| format!("insert route binding: {}", db_detail(&e)))?
-        .get(0);
+    let (policy_id, binding_id) = seed_route(
+        &mut txn,
+        tenant_id,
+        user_id,
+        reasoning_domain_id,
+        profile_id,
+        PURPOSE,
+    )?;
+    let (_, distill_binding_id) = seed_route(
+        &mut txn,
+        tenant_id,
+        user_id,
+        reasoning_domain_id,
+        profile_id,
+        DISTILL_PURPOSE,
+    )?;
     txn.execute(
         "INSERT INTO ops.reasoning_provider_health_observations(tenant_id,processor_id,processor_model_id,provider_model_id,model_revision,provider_endpoint_id,endpoint_ref,region,service_tier,source_kind,reason_code,verdict,observed_at,valid_until) \
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'TEST',NULL,'HEALTHY',clock_timestamp()-interval '1 second',clock_timestamp()+interval '30 minutes')",
@@ -383,6 +420,7 @@ fn seed_lane(
     Ok(LaneSeed {
         binding_id,
         binding_version: 1,
+        distill_binding_id,
         credential_id,
         provider_account_id,
         processor_model_id,
@@ -672,7 +710,19 @@ fn teardown(client: &mut Client, tenant_id: Uuid) -> Result<(), String> {
         "DELETE FROM projection.tenant_placements WHERE tenant_id=$1",
         "DELETE FROM projection.stream_log WHERE tenant_id=$1",
         "DELETE FROM projection.stream_checkpoints WHERE tenant_id=$1",
+        // Distill-hop outputs (ADR-0016) the rehearsal wrote for this tenant after seeding:
+        // disclosure receipts, memories + their PRIMARY links, processing runs, then the
+        // outbox rows and the Evidence they announced.
+        "DELETE FROM ops.data_disclosure_sources WHERE tenant_id=$1",
+        "DELETE FROM ops.data_disclosures WHERE tenant_id=$1",
+        "DELETE FROM private.memory_evidence WHERE memory_id IN \
+           (SELECT memory_id FROM private.memory_records WHERE tenant_id=$1)",
+        "DELETE FROM private.memory_records WHERE tenant_id=$1",
+        "DELETE FROM private.processing_runs WHERE tenant_id=$1",
         "DELETE FROM ops.outbox WHERE tenant_id=$1",
+        "DELETE FROM private.events WHERE event_id IN \
+           (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id=$1)",
+        "DELETE FROM private.evidence_objects WHERE tenant_id=$1",
         "DELETE FROM control.api_keys WHERE tenant_id=$1",
         "DELETE FROM control.entitlement_snapshots WHERE tenant_id=$1",
         "DELETE FROM control.quota_windows WHERE tenant_id=$1",
@@ -897,6 +947,7 @@ pub fn run(args: &[String]) -> i32 {
     println!("Authorization: Bearer {}", base.wire);
     println!("binding_id: {}", lane.binding_id);
     println!("binding_version: {}", lane.binding_version);
+    println!("distill_binding_id: {}", lane.distill_binding_id);
     println!("credential_id: {}", lane.credential_id);
     println!("provider_account_id: {}", lane.provider_account_id);
     println!("processor_model_id: {}", lane.processor_model_id);
@@ -969,6 +1020,15 @@ pub fn run(args: &[String]) -> i32 {
     println!(
         "export HUMAUX_GATEWAY_EMBEDDING_DIMENSION={}",
         qdrant_flags.dimension
+    );
+    println!();
+    println!(
+        "export HUMAUX_PRIVATE_WORKER_DISTILL_TENANT_ID={}",
+        base.tenant_id
+    );
+    println!(
+        "export HUMAUX_PRIVATE_WORKER_DISTILL_REASONING_DOMAIN_ID={}",
+        base.reasoning_domain_id
     );
 
     0

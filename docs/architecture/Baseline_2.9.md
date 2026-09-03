@@ -1138,6 +1138,16 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
   secret bytes。函数授权不以本表格冒充，必须由 0130 DDL 与 `rls-check` 的 function gate
   双向验证。
 
+- **Distill hop（0147，ADR-0016）**：`role_private_worker` 对 `private.memory_records`/`private.memory_evidence`
+  的 `SELECT, INSERT` 与对 `private.processing_runs`/`ops.outbox` 的既有格**不变**（本表无新增 grant）；0147 只改
+  `memory_records_tenant_and_visibility` 的 WITH CHECK（新增 headless 臂：该角色只能写 TENANT_SHARED、带
+  `visibility_workspace_id` 的 WORKSPACE_SHARED、带 `visibility_user_id` 的 USER_PRIVATE —— 三列逐字继承自 Evidence，
+  永不放宽），USING 与 0145 逐字节一致。`control.reasoning_route_bindings` 的非 owner 单元仍全为 `—`：按
+  `(session tenant, reasoning_domain, purpose)` 取当前 binding 走第二个窄 SECURITY DEFINER 函数
+  `control.current_reasoning_route_binding(uuid,text)`（owner `role_migration_owner`、`search_path=pg_catalog`、
+  仅 `role_private_worker` 有 EXECUTE、PUBLIC 无），与 0130 resolver 同一纪律，由 `rls-check` 的 R3 function gate
+  一并钉住（`R3_PRIVATE_WORKER_FUNCTIONS`）。
+
 - **R4 execution relations（0131，尚未实现）**：`private.contribution_executions`、
   `private.contribution_execution_sources` 与 `ops.contribution_execution_job_links` 显式覆盖
   域默认：仅 `role_private_worker` 可 `SELECT`，其余七个 non-owner roles 均为 `—`，owner
