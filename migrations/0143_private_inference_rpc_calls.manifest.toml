@@ -1,0 +1,27 @@
+# §46.1 migration manifest. §11.8 consolidation<->private-worker inference RPC
+# registration/idempotency table. Pure DDL, no DML.
+
+migration_id = "0143_private_inference_rpc_calls"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('ops.private_inference_rpc_calls') is null as precheck_ok
+"""
+
+postcheck = """
+select to_regclass('ops.private_inference_rpc_calls') is not null
+   and (select relrowsecurity and relforcerowsecurity from pg_class
+        where oid = 'ops.private_inference_rpc_calls'::regclass)
+   and has_table_privilege('role_consolidation_worker', 'ops.private_inference_rpc_calls', 'INSERT')
+   and has_table_privilege('role_consolidation_worker', 'ops.private_inference_rpc_calls', 'SELECT')
+   and not has_table_privilege('role_consolidation_worker', 'ops.private_inference_rpc_calls', 'UPDATE')
+   and not has_table_privilege('role_consolidation_worker', 'ops.private_inference_rpc_calls', 'DELETE')
+   and has_table_privilege('role_private_worker', 'ops.private_inference_rpc_calls', 'SELECT')
+   and has_column_privilege('role_private_worker', 'ops.private_inference_rpc_calls', 'state', 'UPDATE')
+   and not has_column_privilege('role_private_worker', 'ops.private_inference_rpc_calls', 'tenant_id', 'UPDATE')
+   and not has_table_privilege('role_private_worker', 'ops.private_inference_rpc_calls', 'INSERT')
+   as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. DROP TABLE ops.private_inference_rpc_calls rollback is safe pre-release (no other table references it) — this table only ever holds short-TTL in-flight RPC metadata."
+backup_restore_requirement = "none (new table, no data migration)."

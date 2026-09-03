@@ -1,0 +1,53 @@
+# §46.1 migration manifest. ADR-0015 D3 extended to private.memory_rollups: the headless
+# consolidation worker may INSERT the TENANT_SHARED / workspace-named WORKSPACE_SHARED rollup
+# publish_rollup derives from its run; the three headless roles may read rollups. Pure policy
+# rewrite, no DML, no grants.
+
+migration_id = "0146_memory_rollups_headless_consolidation_write"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select exists (select 1 from pg_policies where schemaname='private' and tablename='memory_rollups'
+                 and policyname='memory_rollups_tenant_and_visibility'
+                 and with_check not like '%role_consolidation_worker%'
+                 and qual not like '%role_consolidation_worker%')
+   as precheck_ok
+"""
+
+postcheck = """
+select exists (select 1 from pg_policies where schemaname='private' and tablename='memory_rollups'
+                 and policyname='memory_rollups_tenant_and_visibility'
+                 and with_check like '%role_consolidation_worker%'
+                 and with_check not like '%role_private_worker%'
+                 and qual like '%role_consolidation_worker%'
+                 and qual like '%role_retrieval_worker%')
+   as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+ALTER POLICY memory_rollups_tenant_and_visibility ON private.memory_rollups
+  USING (
+    tenant_id = current_setting('humaux.tenant_id', true)::uuid
+    AND (visibility_class = 'TENANT_SHARED'
+      OR (visibility_class = 'USER_PRIVATE'
+          AND visibility_user_id = current_setting('humaux.user_id', true)::uuid)
+      OR (visibility_class = 'WORKSPACE_SHARED'
+          AND EXISTS (SELECT 1 FROM control.memberships m
+                      WHERE m.tenant_id = memory_rollups.tenant_id
+                        AND m.user_id = current_setting('humaux.user_id', true)::uuid
+                        AND m.state = 'ACTIVE')))
+  )
+  WITH CHECK (
+    tenant_id = current_setting('humaux.tenant_id', true)::uuid
+    AND (visibility_class = 'TENANT_SHARED'
+      OR (visibility_class = 'USER_PRIVATE'
+          AND visibility_user_id = current_setting('humaux.user_id', true)::uuid)
+      OR (visibility_class = 'WORKSPACE_SHARED'
+          AND EXISTS (SELECT 1 FROM control.memberships m
+                      WHERE m.tenant_id = memory_rollups.tenant_id
+                        AND m.user_id = current_setting('humaux.user_id', true)::uuid
+                        AND m.state = 'ACTIVE')))
+  );
+"""
+
+backup_restore_requirement = "none (single policy definition rewrite; no row data touched)."

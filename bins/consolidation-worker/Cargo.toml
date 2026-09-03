@@ -19,20 +19,26 @@ workspace = true
 humaux-adapters = { path = "../../crates/adapters" }
 humaux-application = { path = "../../crates/application" }
 humaux-domain = { path = "../../crates/domain" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 # `sqlx::types::Uuid` (what `consolidate_repo`'s functions take) is the literal `uuid::Uuid`
 # re-export (`crates/adapters/Cargo.toml`'s own doc comment on the H3 sqlx feature flags says
 # so) — pinning the same version directly lets this binary build/pass ids without depending on
 # `sqlx` itself (kept out of this Cargo.toml on purpose, same reasoning as the byok/openbao
 # comment above: the fewer capability-shaped things this binary can name, the fewer things it
 # could accidentally acquire).
-uuid = "1.25.0"
+uuid = { version = "1.25.0", features = ["v7", "serde"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # §11.8 `input_manifest_hash`: SHA-256 over this run's own materialized
 # `(memory_id, input_version, source_hash, ordinal)` tuples — same version pin as every other
 # sha2 use in this workspace (`crates/domain`/`application`/`adapters`/`protocol`/`contracts`
 # Cargo.toml, all "0.11"), not a second independent one.
 sha2 = "0.11"
+hex = "0.4"
+# `inference_client::UdsInferenceClient` implements `PrivateReasoningPort`, which is itself
+# declared with `#[async_trait::async_trait]` — same version pin
+# `crates/application`/`crates/adapters` already use.
+async-trait = "0.1"
 
 [dev-dependencies]
 # `tests/run_once_e2e.rs` — real-DB integration coverage for `run_once` (G11-R1/§79.2; before
@@ -42,8 +48,10 @@ sha2 = "0.11"
 postgres = { version = "0.19", features = ["with-uuid-1", "with-serde_json-1"] }
 uuid = { version = "1.25.0", features = ["v4"] }
 humaux-testkit = { path = "../../crates/testkit" }
-# The test's `FakePort` implements `PrivateReasoningPort`, which is itself declared with
-# `#[async_trait::async_trait]` (`crates/application/src/consolidate.rs`) — an implementor in
-# a different crate needs the same macro, same version pin as
-# `crates/application`/`crates/adapters` already use.
-async-trait = "0.1"
+# `tests/consolidation_hop_e2e.rs` spawns the real `humaux-private-worker` RPC app in-process
+# (its own lib target) rather than reimplementing (and drifting from) its handler — same
+# reasoning `bins/gateway/Cargo.toml`'s doc gives for linking `humaux-retrieval-worker`.
+humaux-private-worker = { path = "../private-worker" }
+# Builds the same real BYOK provider `crates/adapters/tests/minimax_live_smoke.rs:361`
+# constructs — endpoint/model from env, never a literal in src (§78.1).
+axum = "0.8.9"

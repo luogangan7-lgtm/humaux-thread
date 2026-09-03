@@ -304,7 +304,7 @@ async fn redeem_ticket(
 /// `(tenant_id, commit_seq)` — 0046's own comment names this function as the reason: T3.1/T3.2
 /// owns §60's pseudocode field list and must not add a column to it for a different task's
 /// read path.
-async fn issue_stream_log_row(
+pub(crate) async fn issue_stream_log_row(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key: &StreamKey,
     commit_seq: i64,
@@ -365,7 +365,20 @@ async fn issue_stream_log_row(
 /// announces (§14 "DB write -> INSERT outbox_event -> COMMIT"; `ops.outbox` is this schema's
 /// canonical name for what §14/§60's prose calls `outbox_event`, per `migrations/
 /// 0008_ops_core.sql`'s table comment).
-async fn insert_outbox(
+/// §14/§15.1: `role_consolidation_worker`'s own private-Evidence-shaped outbox event for a
+/// published `private.memory_rollups` row (§78.2: pinned here, not reused from
+/// `EVIDENCE_ACCEPTED`, so a reader can tell "a rollup published" from "an Evidence was
+/// remembered" without inspecting the row's other columns).
+pub(crate) const MEMORY_PUBLISHED: &str = "MEMORY_PUBLISHED";
+
+/// §14/§15.1: reserved sibling of [`MEMORY_PUBLISHED`] for a future consolidation undo/
+/// retraction op — not emitted by this crate today, named now so the two literals stay next to
+/// each other (§78.2 "no second literal elsewhere").
+// ponytail: unused until an undo/retraction write path exists; add its call site then.
+#[allow(dead_code)]
+pub(crate) const MEMORY_LIFECYCLE: &str = "MEMORY_LIFECYCLE";
+
+pub(crate) async fn insert_outbox(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,
     commit_seq: i64,

@@ -35,15 +35,18 @@ use humaux_application::consolidate::{
 };
 use humaux_domain::authority::{AuthorityClass, EvidenceId, MemoryId};
 use humaux_domain::consolidate::{AutoMutableMemoryId, ClassifiedMemoryId, classify};
+use humaux_domain::ids::TenantId;
+use humaux_projection::stream::StreamKey;
 
 use crate::postgres::ConsolidationDbPool;
+use crate::remember;
 
 /// `private.memory_records.authority_class` / `private.memory_rollups.authority_class`'s text
 /// encoding, reversed. `AuthorityClass` carries no `from_db_str` of its own
 /// (`crates/domain/src/authority.rs` is outside this task's file scope) — this mirrors
 /// `migrations/0004_private_evidence_memory.sql`'s CHECK list verbatim, same technique
 /// `domain::consolidate::ConsolidationRunState::from_db_str` uses for its own DB string.
-fn authority_class_from_db_str(s: &str) -> Option<AuthorityClass> {
+pub(crate) fn authority_class_from_db_str(s: &str) -> Option<AuthorityClass> {
     Some(match s {
         "PublicKnowledge" => AuthorityClass::PublicKnowledge,
         "PrivateKnowledge" => AuthorityClass::PrivateKnowledge,
@@ -132,6 +135,21 @@ impl std::fmt::Display for ConsolidateRepoError {
 
 impl std::error::Error for ConsolidateRepoError {}
 
+/// `issue_stream_log_row`/`insert_outbox` (see `publish_rollup`'s call site below) only ever
+/// construct [`remember::RememberError::Db`] — the other two variants
+/// (`ConsistencyTokenExpiryNotFuture`/`BatchExhausted`) belong to `remember`'s own
+/// consistency-token/batch-ticket steps, neither of which this call site runs. The fallback
+/// arm exists only so this `impl` compiles without `unreachable!()` on a signature both
+/// functions merely happen to share, never because this path is expected to hit it.
+impl From<remember::RememberError> for ConsolidateRepoError {
+    fn from(e: remember::RememberError) -> Self {
+        match e {
+            remember::RememberError::Db(db) => Self::Db(db),
+            other => Self::Db(sqlx::Error::Protocol(other.to_string())),
+        }
+    }
+}
+
 async fn set_tenant_local(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,
@@ -150,7 +168,7 @@ async fn set_tenant_local(
 /// excludes `updated_at` itself — that already becomes `input_version` (see call sites) — and
 /// the immutable identity columns (`memory_id`/`tenant_id`/`memory_type`), which correct/
 /// supersede/revoke never touch.
-fn row_fingerprint(
+pub(crate) fn row_fingerprint(
     content: &serde_json::Value,
     authority_class: &str,
     confidence: f32,
@@ -193,7 +211,16 @@ pub struct MaterializedInput {
     pub input_version: i64,
     pub source_hash: Vec<u8>,
     pub ordinal: i32,
+    /// §11.6 source closure: the input memory's own in-domain Evidence (PRIMARY preferred),
+    /// resolved in the same snapshot SELECT so `publish_rollup`'s `(memory_id, evidence_id)`
+    /// pairs come from the materialized inputs, not a second read.
+    pub evidence_id: EvidenceId,
 }
+
+/// §14/§15.1 `ops.outbox.event_type` `publish_rollup` emits for a published rollup — the one
+/// literal lives in `remember` (§78.2); re-exposed here so the consolidation-worker tests can
+/// assert the ticket without a second copy of the string.
+pub const ROLLUP_TICKET_EVENT_TYPE: &str = remember::MEMORY_PUBLISHED;
 
 fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<Candidate, ConsolidateRepoError> {
     let memory_id: Uuid = row.try_get("memory_id")?;
@@ -348,6 +375,16 @@ pub async fn select_and_materialize_inputs(
     //     `visibility_user_id` scoping exists on the rollup path this run publishes through
     //     yet, so the only safe stance is "never select it", not "select it and hope the
     //     publish path narrows later")
+    //   * the `CASE` on `$3` (§11.6/§11.9 rollup visibility ceiling): `publish_rollup` writes a
+    //     tenant-scoped run's rollup as TENANT_SHARED and a workspace-scoped run's as
+    //     WORKSPACE_SHARED in that workspace, so the inputs must already sit inside that scope
+    //     — a `None` run may only consume TENANT_SHARED memories, a `Some(w)` run only memories
+    //     in `w`. `$3 IS NULL OR ...` (the pre-0145 shape) was only ever safe because RLS hid
+    //     every WORKSPACE_SHARED row from the headless role; once 0145 let the role read them
+    //     for workspace runs, the vacuous branch would have republished any workspace's
+    //     WORKSPACE_SHARED bodies as a tenant-wide TENANT_SHARED rollup (cross-workspace →
+    //     tenant widening). Same "never select it" stance as USER_PRIVATE above:
+    //     `consolidation_hop_e2e.rs` T6 pins it.
     //   * `NOT EXISTS ... context_bindings` (§11.8 Pinned/Mandatory) — still fed to `classify`
     //     below as `has_binding` too (always `false` for rows this filter lets through), so
     //     `classify` stays the type-level gate the domain module's rustdoc promises rather
@@ -356,12 +393,17 @@ pub async fn select_and_materialize_inputs(
     let rows = sqlx::query(&format!(
         "SELECT m.memory_id, m.updated_at, m.content, m.authority_class, m.confidence, \
                 m.status, m.superseded_by, \
-                EXISTS ( {ACTIVE_NO_AUTO_MUTATE_BINDING} ) AS has_binding \
+                EXISTS ( {ACTIVE_NO_AUTO_MUTATE_BINDING} ) AS has_binding, \
+                ( SELECT me.evidence_id FROM private.memory_evidence me \
+                  JOIN private.evidence_objects eo ON eo.evidence_id = me.evidence_id \
+                  WHERE me.memory_id = m.memory_id AND eo.reasoning_domain_id = $2 \
+                  ORDER BY (me.role = 'PRIMARY') DESC, me.ordinal, me.evidence_id \
+                  LIMIT 1 ) AS evidence_id \
          FROM private.memory_records m \
          WHERE m.tenant_id = $1 \
            AND m.status = 'active' \
            AND m.visibility_class <> 'USER_PRIVATE' \
-           AND ($3::uuid IS NULL OR m.visibility_workspace_id = $3) \
+           AND CASE WHEN $3::uuid IS NULL THEN m.visibility_class = 'TENANT_SHARED' ELSE m.visibility_workspace_id = $3 END \
            AND EXISTS ( \
              SELECT 1 FROM private.memory_evidence me \
              JOIN private.evidence_objects eo ON eo.evidence_id = me.evidence_id \
@@ -382,6 +424,7 @@ pub async fn select_and_materialize_inputs(
     let mut ordinal: i32 = 0;
     for row in &rows {
         let candidate = row_to_candidate(row)?;
+        let evidence_id: Uuid = row.try_get("evidence_id")?;
         let classified = classify(MemoryId(candidate.memory_id), candidate.has_active_binding);
         let ClassifiedMemoryId::Unbound(unbound) = classified else {
             continue; // §11.8: Bound (Pinned/Mandatory-equivalent) never becomes an input.
@@ -403,6 +446,7 @@ pub async fn select_and_materialize_inputs(
             input_version: candidate.input_version,
             source_hash: candidate.fingerprint,
             ordinal,
+            evidence_id: EvidenceId(evidence_id),
         });
         ordinal += 1;
     }
@@ -568,7 +612,7 @@ fn resolve_source_authorities(
     Ok(source_authorities)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn publish_rollup(
     pool: &ConsolidationDbPool,
     run_id: Uuid,
@@ -634,8 +678,9 @@ pub async fn publish_rollup(
     };
 
     // §11.6/§11.8 rollup visibility mirrors the run's own input scoping — `workspace_id` is
-    // the same value `select_and_materialize_inputs` filtered on, so a rollup over
-    // WORKSPACE_SHARED inputs stays WORKSPACE_SHARED, never widening to the whole tenant.
+    // the same value `select_and_materialize_inputs` filtered on (`Some(w)` ⇒ only memories in
+    // `w`; `None` ⇒ only TENANT_SHARED memories, never any workspace's WORKSPACE_SHARED rows),
+    // so a rollup never carries a body beyond the visibility class its inputs already had.
     // `USER_PRIVATE` is not reachable here: selection excludes it entirely (see that
     // function's doc comment), so this table's three-branch CHECK never sees that branch from
     // this call site.
@@ -672,6 +717,41 @@ pub async fn publish_rollup(
         .execute(&mut *txn)
         .await?;
     }
+
+    // VERIFIED GAP (task card §"Why"): `publish_rollup` wrote `private.memory_rollups` with no
+    // matching `projection.stream_log`/`ops.outbox` row, so the projection worker (which reads
+    // `stream_log` joined to `ops.outbox` by `(tenant_id, commit_seq)`, `projection_worker.rs`'s
+    // `resolve_memory`) never saw this publish at all. §15.1: the writer of a derived row is
+    // its own issuer — this ticket does not describe the new rollup (rollups are not
+    // `private.memory_records` rows the existing resolver can join to; §11.9 "rollup 是
+    // navigation/context, never higher authority than source Memory") but re-signals the first
+    // source memory's own PRIMARY evidence, through the one existing issuer function
+    // (`remember::issue_stream_log_row`/`insert_outbox`, not a second copy of that SQL).
+    let evidence_id_for_ticket = source_authorities[0].evidence_id.0;
+    let scope = match workspace_id {
+        Some(w) => ("workspace".to_owned(), w),
+        None => ("tenant".to_owned(), tenant_id),
+    };
+    let key = StreamKey::new(
+        TenantId(tenant_id),
+        scope.0,
+        scope.1,
+        "private_memory".to_owned(),
+        "PRIVATE_MEMORY".to_owned(),
+        "v1".to_owned(),
+    );
+    let ticket_commit_seq = remember::next_commit_seq(&mut txn).await?;
+    let ticket_stream_seq =
+        remember::issue_stream_log_row(&mut txn, &key, ticket_commit_seq).await?;
+    remember::insert_outbox(
+        &mut txn,
+        tenant_id,
+        ticket_commit_seq,
+        ticket_stream_seq,
+        remember::MEMORY_PUBLISHED,
+        evidence_id_for_ticket,
+    )
+    .await?;
 
     sqlx::query(
         "UPDATE private.memory_consolidation_runs \

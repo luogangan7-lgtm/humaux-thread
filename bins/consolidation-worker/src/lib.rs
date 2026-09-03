@@ -7,47 +7,109 @@
 //!
 //! §11.8 hard boundary this crate's dependency graph enforces structurally (see `Cargo.toml`'s
 //! doc comment): it owns [`ConsolidationDbPool`] and nothing else capability-shaped — no
-//! `PrivateWorkerDbPool`, no BYOK decrypt client. Its only inference path is
-//! [`PrivateReasoningPort`], a trait object supplied by whatever wires this binary for real (the
-//! sealed mTLS RPC client that talks to `humaux-private-worker` is a later task, out of this
-//! crate's file scope) — [`run_once`] takes `&dyn PrivateReasoningPort` rather than naming a
-//! concrete client type for exactly that reason.
+//! private-worker pool type, no BYOK decrypt client. Its only inference path is
+//! [`PrivateReasoningPort`], a trait object built per run by the caller's factory
+//! ([`run_once_bound`]'s `bind_port`) — this crate never names a concrete client type in its
+//! orchestration; `src/main.rs` supplies the real `UdsInferenceClient` bound to the run id.
+//!
+//! §78 single-source: the input manifest hash and the rollup output parser live in
+//! `humaux_adapters::consolidation_reasoner` and are shared with `humaux-private-worker` —
+//! the two hop ends can only agree on "what was sent" if they hash the same bytes the same way.
 
-use humaux_adapters::consolidate_repo::{self, ConsolidateRepoError, PublishOutcome};
+pub mod inference_client;
+
+use humaux_adapters::consolidate_repo::{
+    self, ConsolidateRepoError, MaterializedInput, PublishOutcome,
+};
+use humaux_adapters::consolidation_reasoner::{compute_input_manifest_hash, parse_rollup_output};
 use humaux_adapters::postgres::ConsolidationDbPool;
 use humaux_application::consolidate::{
-    ContentSha256, NextStep, PrivateReasoningDomainId, PrivateReasoningError, PrivateReasoningPort,
+    NextStep, PrivateReasoningDomainId, PrivateReasoningError, PrivateReasoningPort,
     PrivateReasoningPurpose, PrivateReasoningResult, ReasoningRouteBindingId,
     ReasoningRouteBindingVersion, SealedPrivateReasoningRequest, next_step,
 };
 use humaux_domain::authority::{AuthorityClass, EvidenceId};
 use humaux_domain::consolidate::AutoMutableMemoryId;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-/// §11.8 `input_manifest_hash`: SHA-256 over this run's *own* materialized inputs, in the exact
-/// `(memory_id, input_version, source_hash, ordinal)` shape `private.memory_consolidation_inputs`
-/// recorded them — this identifies precisely what was sent for inference (the whole reason the
-/// field exists) rather than a placeholder constant no adversary or auditor could ever tie back
-/// to a real snapshot.
-fn compute_input_manifest_hash(inputs: &[consolidate_repo::MaterializedInput]) -> ContentSha256 {
-    let mut hasher = Sha256::new();
-    for input in inputs {
-        hasher.update(input.memory_id.into_inner().0.as_bytes());
-        hasher.update(input.input_version.to_be_bytes());
-        hasher.update(&input.source_hash);
-        hasher.update(input.ordinal.to_be_bytes());
+/// What `build_rollup` must hand `consolidate_repo::publish_rollup`.
+pub type RollupParts = (
+    serde_json::Value,
+    AuthorityClass,
+    Vec<(AutoMutableMemoryId, EvidenceId)>,
+);
+
+/// The production `build_rollup` (§11.6/§11.9): the private worker's JSON reply parsed
+/// fail-closed against exactly this run's materialized `(memory_id, evidence_id)` pairs —
+/// `parse_rollup_output` can only ever pick sources from ids the run itself recorded, and the
+/// rollup body is the reply's `content` string wrapped as `{"content": ...}`.
+pub fn build_rollup(
+    inputs: &[MaterializedInput],
+    result: &PrivateReasoningResult,
+) -> Result<RollupParts, PrivateReasoningError> {
+    let allowed: Vec<(AutoMutableMemoryId, EvidenceId)> = inputs
+        .iter()
+        .map(|input| (input.memory_id, input.evidence_id))
+        .collect();
+    let (content, class, sources) = parse_rollup_output(&result.output_bytes, &allowed)
+        .map_err(|code| PrivateReasoningError::new(format!("ROLLUP_OUTPUT_REJECTED:{code:?}")))?;
+    Ok((serde_json::json!({ "content": content }), class, sources))
+}
+
+/// `&dyn PrivateReasoningPort` viewed as an owned port, so [`run_once`] can reuse
+/// [`run_once_bound`] for callers that have no per-run state to bind.
+struct BorrowedPort<'a>(&'a dyn PrivateReasoningPort);
+
+#[async_trait::async_trait]
+impl PrivateReasoningPort for BorrowedPort<'_> {
+    async fn infer(
+        &self,
+        req: SealedPrivateReasoningRequest,
+    ) -> Result<PrivateReasoningResult, PrivateReasoningError> {
+        self.0.infer(req).await
     }
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&digest);
-    ContentSha256(bytes)
+}
+
+/// [`run_once_bound`] for a port that carries no per-run state; the closure receives the
+/// materialized ids only.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_once(
+    pool: &ConsolidationDbPool,
+    port: &dyn PrivateReasoningPort,
+    tenant_id: Uuid,
+    reasoning_domain_id: Uuid,
+    binding_id: ReasoningRouteBindingId,
+    binding_version: ReasoningRouteBindingVersion,
+    workspace_id: Option<Uuid>,
+    max_inputs: i64,
+    build_rollup: impl FnOnce(
+        &[AutoMutableMemoryId],
+        &PrivateReasoningResult,
+    ) -> Result<RollupParts, PrivateReasoningError>,
+) -> Result<PublishOutcome, RunOnceError> {
+    run_once_bound(
+        pool,
+        |_run_id| BorrowedPort(port),
+        tenant_id,
+        reasoning_domain_id,
+        binding_id,
+        binding_version,
+        workspace_id,
+        max_inputs,
+        |inputs, result| {
+            let ids: Vec<AutoMutableMemoryId> = inputs.iter().map(|m| m.memory_id).collect();
+            build_rollup(&ids, result)
+        },
+    )
+    .await
 }
 
 /// One consolidation run, start to finish: snapshot-bound selection (§11.7), then either skip
 /// straight to `SUCCEEDED_NO_OUTPUT` (§11.7, empty input set) or call the sealed inference
-/// port and publish. `port` is `&dyn` — see module doc for why this crate never names a
-/// concrete inference client type.
+/// port and publish. `bind_port` builds the port AFTER `create_run` so the port can carry the
+/// run id (ADR-0015: `UdsInferenceClient` registers `consolidation_run_id` alongside the sealed
+/// identifiers, since the sealed request itself — §11.8 — carries no run id); see module doc
+/// for why this crate never names a concrete inference client type.
 ///
 /// `binding_id` plus `binding_version` is the caller's exact immutable Phase 9 R3 authority.
 /// This BYOK-capability-free worker only seals and forwards that pair; the private worker must
@@ -63,9 +125,9 @@ fn compute_input_manifest_hash(inputs: &[consolidate_repo::MaterializedInput]) -
 /// `build_rollup` can therefore only ever pick from the ids it was itself handed (§11.8's
 /// typestate has no public constructor for the type), never invent one out of thin air.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_once(
+pub async fn run_once_bound<P: PrivateReasoningPort>(
     pool: &ConsolidationDbPool,
-    port: &dyn PrivateReasoningPort,
+    bind_port: impl FnOnce(Uuid) -> P,
     tenant_id: Uuid,
     reasoning_domain_id: Uuid,
     binding_id: ReasoningRouteBindingId,
@@ -73,19 +135,13 @@ pub async fn run_once(
     workspace_id: Option<Uuid>,
     max_inputs: i64,
     build_rollup: impl FnOnce(
-        &[AutoMutableMemoryId],
+        &[MaterializedInput],
         &PrivateReasoningResult,
-    ) -> Result<
-        (
-            serde_json::Value,
-            AuthorityClass,
-            Vec<(AutoMutableMemoryId, EvidenceId)>,
-        ),
-        PrivateReasoningError,
-    >,
+    ) -> Result<RollupParts, PrivateReasoningError>,
 ) -> Result<PublishOutcome, RunOnceError> {
     let run_id =
         consolidate_repo::create_run(pool, tenant_id, reasoning_domain_id, workspace_id).await?;
+    let port = bind_port(run_id);
 
     let inputs = consolidate_repo::select_and_materialize_inputs(
         pool,
@@ -133,7 +189,7 @@ pub async fn run_once(
                 contribution_attempt: None,
             };
             let inference = port.infer(req).await?;
-            let (content, rollup_class, sources) = build_rollup(&auto_ids, &inference)?;
+            let (content, rollup_class, sources) = build_rollup(&inputs, &inference)?;
             Ok(consolidate_repo::publish_rollup(
                 pool,
                 run_id,

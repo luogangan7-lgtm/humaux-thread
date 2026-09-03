@@ -243,6 +243,14 @@ const MATRIX: &[Cell] = &[
         "role_maintenance",
         ["SELECT", "UPDATE"]
     ),
+    // role_consolidation_worker is the §15.1 issuer of private_memory stream_log rows for
+    // its own publish_rollup writes (migration 0143) — same INSERT+SELECT shape role_gateway
+    // holds for its own Evidence-acceptance writes, mirrored not duplicated.
+    cell!(
+        "projection.stream_log",
+        "role_consolidation_worker",
+        ["SELECT", "INSERT"]
+    ),
     // projection.stream_checkpoints
     cell!(
         "projection.stream_checkpoints",
@@ -287,6 +295,28 @@ const MATRIX: &[Cell] = &[
         ["SELECT"],
         [("UPDATE", ["serving", "shadow"])]
     ),
+    // role_consolidation_worker (migration 0144): same column-scoped INSERT+UPDATE shape as
+    // role_gateway's own bootstrap-then-increment issuer grant, for its own private_memory
+    // stream_checkpoints row (`remember::issue_stream_log_row`, shared not duplicated).
+    cell!(
+        "projection.stream_checkpoints",
+        "role_consolidation_worker",
+        ["SELECT"],
+        [
+            (
+                "INSERT",
+                [
+                    "tenant_id",
+                    "scope_kind",
+                    "scope_id",
+                    "domain",
+                    "projection_kind",
+                    "projection_version"
+                ]
+            ),
+            ("UPDATE", ["issued_highwater"]),
+        ]
+    ),
     // ops.outbox (canonical name; spec §6.2.2 tail note: `outbox_event` is the retired alias)
     // SELECT added by T3.8 (§15.5, migrations/0046_stream_log_evidence_id_via_outbox.sql):
     // the read-your-writes overlay joins projection.stream_log to this table on
@@ -327,6 +357,24 @@ const MATRIX: &[Cell] = &[
     cell!("ops.outbox", "role_public_worker", []),
     cell!("ops.outbox", "role_retrieval_worker", ["SELECT", "UPDATE"]),
     cell!("ops.outbox", "role_maintenance", ["SELECT"]),
+    // role_consolidation_worker (migration 0143): same column-scoped INSERT set as
+    // role_gateway's own private-Evidence outbox row (§15.1's issuer grant), for the
+    // MEMORY_PUBLISHED/MEMORY_LIFECYCLE rows publish_rollup writes in its own transaction.
+    cell!(
+        "ops.outbox",
+        "role_consolidation_worker",
+        ["SELECT"],
+        [(
+            "INSERT",
+            [
+                "tenant_id",
+                "commit_seq",
+                "stream_seq",
+                "event_type",
+                "evidence_id"
+            ]
+        )]
+    ),
     // §12/§13, ADR-0008: release IO is separate from gateway Evidence production.
     cell!(
         "staging.contribution_releases",
@@ -477,6 +525,50 @@ const MATRIX: &[Cell] = &[
             ]
         )]
     ),
+    // §11.8 consolidation<->private-worker inference RPC registration/idempotency anchor
+    // (migration 0143): role_consolidation_worker registers (column-narrow INSERT, never
+    // UPDATE — it never claims its own registration); role_private_worker claims/finishes
+    // (column-narrow UPDATE only). Same shape as ops.retrieval_embedding_rpc_calls above.
+    cell!(
+        "ops.private_inference_rpc_calls",
+        "role_consolidation_worker",
+        ["SELECT"],
+        [(
+            "INSERT",
+            [
+                "call_id",
+                "tenant_id",
+                "reasoning_domain_id",
+                "binding_id",
+                "binding_version",
+                "purpose",
+                "input_manifest_hash",
+                "expires_at",
+                // migration 0145 (ADR-0015): the run a Consolidate call reasons over.
+                "consolidation_run_id"
+            ]
+        )]
+    ),
+    cell!(
+        "ops.private_inference_rpc_calls",
+        "role_private_worker",
+        ["SELECT"],
+        [(
+            "UPDATE",
+            [
+                "state",
+                "claimed_at",
+                "claimed_by",
+                "finished_at",
+                "outcome",
+                "response_output_bytes",
+                "response_output_sha256",
+                "response_provider_trace",
+                "response_model_call_id",
+                "response_failure_message"
+            ]
+        )]
+    ),
     // private.evidence_objects
     cell!(
         "private.evidence_objects",
@@ -561,6 +653,14 @@ const MATRIX: &[Cell] = &[
             ]
         )]
     ),
+    // §11.8/ADR-0015 (migration 0145): the private worker reads the run + its input manifest
+    // to re-verify a Consolidate call's `input_manifest_hash`; SELECT only (§11.6 MUST NOT
+    // write runs/inputs/rollups).
+    cell!(
+        "private.memory_consolidation_runs",
+        "role_private_worker",
+        ["SELECT"]
+    ),
     cell!(
         "private.memory_consolidation_runs",
         "role_maintenance",
@@ -571,6 +671,11 @@ const MATRIX: &[Cell] = &[
         "private.memory_consolidation_inputs",
         "role_consolidation_worker",
         ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.memory_consolidation_inputs",
+        "role_private_worker",
+        ["SELECT"]
     ),
     cell!(
         "private.memory_consolidation_inputs",
@@ -2792,6 +2897,7 @@ SELECT
  AND (SELECT count(*)=6 FROM pg_policy
   WHERE polrelid='private.evidence_objects'::regclass)
  -- 6 = 0012 legacy + four W1 owner policies + 0140's evidence_objects_retrieval_worker_read
+ -- (0145 widened that policy's role list to the two consolidation roles; count unchanged)
  AND (SELECT count(*)=4 FROM (VALUES
    ('continuity_evidence_owner_exact_allow','r',true,
     'a0094a5c18098d94a48082666c19502cb123edafc20bff09abb46eae279e466c',NULL::text),

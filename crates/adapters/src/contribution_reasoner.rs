@@ -456,14 +456,12 @@ impl<'a> ContributionReasoner<'a> {
             json_schema: schema.to_owned(),
             max_output_tokens: self.config.max_output_tokens,
         };
-        let wire_payload =
-            AuthorizedEgressPayload::new(structured_request_body(descriptor, &request));
-        let egress_permit = authorize(
-            TenantId(execution.tenant_id),
-            admission.egress_processor_id,
-            PrivateDataPurpose::UserReasoning,
+        let (wire_payload, egress_permit) = authorize_structured_egress(
+            execution.tenant_id,
+            &admission,
+            descriptor,
+            &request,
             data_class,
-            &wire_payload,
             self.config.permit_ttl,
         )?;
         txn.commit()
@@ -516,15 +514,12 @@ impl<'a> ContributionReasoner<'a> {
         {
             return Err(ErrorCode::Conflict);
         }
-        let context = PrivateInferenceContext::new(
-            TenantId(prepared.tenant_id),
-            UserId(prepared.user_id),
-            ReasoningDomainId(prepared.sealed.reasoning_domain_id.0),
-            CredentialRef::new(prepared.admission.credential_ref),
+        let context = admitted_inference_context(
+            prepared.tenant_id,
+            prepared.user_id,
+            prepared.sealed.reasoning_domain_id.0,
+            &prepared.admission,
             prepared.egress_permit,
-            prepared.admission.processor_id,
-            prepared.admission.provider_model_id,
-            prepared.admission.profile_version,
             binding.model_call_id().to_string(),
         )
         .map_err(|_| ErrorCode::Conflict)?;
@@ -644,14 +639,12 @@ impl<'a> ContributionReasoner<'a> {
             json_schema,
             max_output_tokens: self.config.max_output_tokens,
         };
-        let wire_payload =
-            AuthorizedEgressPayload::new(structured_request_body(descriptor, &provider_request));
-        let permit = authorize(
-            request.authorization.tenant_id(),
-            admission.egress_processor_id,
-            PrivateDataPurpose::UserReasoning,
+        let (wire_payload, permit) = authorize_structured_egress(
+            request.authorization.tenant_id().0,
+            &admission,
+            descriptor,
+            &provider_request,
             join_data_class(materialized.classes),
-            &wire_payload,
             self.config.permit_ttl,
         )
         .map_err(|_| fail("egress authorization rejected"))?;
@@ -672,15 +665,12 @@ impl<'a> ContributionReasoner<'a> {
             ));
         }
         let trace_id = reserved.model_call_id.to_string();
-        let context = PrivateInferenceContext::new(
-            request.authorization.tenant_id(),
-            user_id,
-            ReasoningDomainId(sealed.reasoning_domain_id.0),
-            CredentialRef::new(admission.credential_ref),
+        let context = admitted_inference_context(
+            request.authorization.tenant_id().0,
+            user_id.0,
+            sealed.reasoning_domain_id.0,
+            &admission,
             permit,
-            admission.processor_id,
-            admission.provider_model_id,
-            admission.profile_version,
             trace_id,
         )
         .map_err(|_| fail("private context rejected"))?;
@@ -765,35 +755,12 @@ impl<'a> ContributionReasoner<'a> {
                 coverage_digest,
             )
             .await?;
-        let started = std::time::Instant::now();
-        let response = self
-            .provider
-            .complete_structured(&reserved.context, reserved.provider_request.clone())
-            .await;
-        let latency_ms = i32::try_from(started.elapsed().as_millis()).ok();
-        let (disclosure_outcome, model_outcome, finalize) = match &response {
-            Ok(response) => (
-                DisclosureOutcome::Success,
-                ModelCallOutcome::Succeeded,
-                FinalizeCall {
-                    input_tokens: response
-                        .usage
-                        .input_tokens
-                        .and_then(|v| i64::try_from(v).ok()),
-                    latency_ms,
-                    ..FinalizeCall::default()
-                },
-            ),
-            Err(_) => (
-                DisclosureOutcome::Failed,
-                ModelCallOutcome::Failed,
-                FinalizeCall {
-                    latency_ms,
-                    error_class: Some("PROVIDER_ERROR".to_owned()),
-                    ..FinalizeCall::default()
-                },
-            ),
-        };
+        let (response, disclosure_outcome, model_outcome, finalize) = complete_structured_timed(
+            self.provider,
+            &reserved.context,
+            reserved.provider_request.clone(),
+        )
+        .await;
         self.finalize_reasoning_call(&reserved, disclosure_outcome, model_outcome, &finalize)
             .await?;
         let output_bytes = response
@@ -809,6 +776,96 @@ impl<'a> ContributionReasoner<'a> {
             binding_version: reserved.binding_version,
         })
     }
+}
+
+/// §7.3 egress authorization for one structured USER_REASONING request against the admitted
+/// route's `egress_processor_id` — the exact wire bytes are what the permit covers. Shared by
+/// every private-worker dispatch path (contribution R4, legacy contribution, consolidation —
+/// `crate::consolidation_reasoner`), so there is one place that decides what a provider may
+/// receive.
+pub(crate) fn authorize_structured_egress(
+    tenant_id: Uuid,
+    admission: &ReasoningAdmissionLocator,
+    descriptor: &crate::byok::ReasoningProviderDescriptor,
+    request: &StructuredReasoningRequest,
+    data_class: DataClass,
+    permit_ttl: Duration,
+) -> Result<(AuthorizedEgressPayload, EgressPermit), ErrorCode> {
+    let wire_payload = AuthorizedEgressPayload::new(structured_request_body(descriptor, request));
+    let permit = authorize(
+        TenantId(tenant_id),
+        admission.egress_processor_id,
+        PrivateDataPurpose::UserReasoning,
+        data_class,
+        &wire_payload,
+        permit_ttl,
+    )?;
+    Ok((wire_payload, permit))
+}
+
+/// §11.1 [`PrivateInferenceContext`] from one admitted route + the permit minted over the
+/// exact wire bytes. Shared by the same three dispatch paths as
+/// [`authorize_structured_egress`].
+pub(crate) fn admitted_inference_context(
+    tenant_id: Uuid,
+    user_id: Uuid,
+    reasoning_domain_id: Uuid,
+    admission: &ReasoningAdmissionLocator,
+    permit: EgressPermit,
+    trace_id: String,
+) -> Result<PrivateInferenceContext, crate::byok::InferenceContextError> {
+    PrivateInferenceContext::new(
+        TenantId(tenant_id),
+        UserId(user_id),
+        ReasoningDomainId(reasoning_domain_id),
+        CredentialRef::new(admission.credential_ref),
+        permit,
+        admission.processor_id.clone(),
+        admission.provider_model_id.clone(),
+        admission.profile_version,
+        trace_id,
+    )
+}
+
+/// The one provider invocation + its ledger classification: latency, disclosure outcome,
+/// model-call outcome and the finalize columns, decided identically for every dispatch path.
+pub(crate) async fn complete_structured_timed(
+    provider: &dyn UserReasoningProvider,
+    context: &PrivateInferenceContext,
+    request: StructuredReasoningRequest,
+) -> (
+    Result<crate::byok::StructuredReasoningResponse, ReasoningProviderError>,
+    DisclosureOutcome,
+    ModelCallOutcome,
+    FinalizeCall,
+) {
+    let started = std::time::Instant::now();
+    let response = provider.complete_structured(context, request).await;
+    let latency_ms = i32::try_from(started.elapsed().as_millis()).ok();
+    let (disclosure_outcome, model_outcome, finalize) = match &response {
+        Ok(response) => (
+            DisclosureOutcome::Success,
+            ModelCallOutcome::Succeeded,
+            FinalizeCall {
+                input_tokens: response
+                    .usage
+                    .input_tokens
+                    .and_then(|v| i64::try_from(v).ok()),
+                latency_ms,
+                ..FinalizeCall::default()
+            },
+        ),
+        Err(_) => (
+            DisclosureOutcome::Failed,
+            ModelCallOutcome::Failed,
+            FinalizeCall {
+                latency_ms,
+                error_class: Some("PROVIDER_ERROR".to_owned()),
+                ..FinalizeCall::default()
+            },
+        ),
+    };
+    (response, disclosure_outcome, model_outcome, finalize)
 }
 
 struct MaterializedSources {
@@ -948,7 +1005,7 @@ fn validate_admission(
     Ok(())
 }
 
-fn provider_matches_admission(
+pub(crate) fn provider_matches_admission(
     provider: &dyn UserReasoningProvider,
     admission: &ReasoningAdmissionLocator,
     config: &ContributionReasonerConfig,
@@ -1529,7 +1586,7 @@ impl PublicCoveragePort for ContributionReasoner<'_> {
     }
 }
 
-fn fail(label: &'static str) -> PrivateReasoningError {
+pub(crate) fn fail(label: &'static str) -> PrivateReasoningError {
     PrivateReasoningError::new(label)
 }
 

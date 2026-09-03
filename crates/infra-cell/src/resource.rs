@@ -40,12 +40,22 @@ pub enum IntraCellResource {
     /// `IntraCellResource` registry and [`authorize_cell_access`](crate::permit::authorize_cell_access)
     /// gate, not so `IntraCellResourceRegistry::resolve` is dialed for it.
     RETRIEVAL_EMBEDDING_RPC,
+
+    /// §11.8: `humaux-consolidation-worker` → `humaux-private-worker` inference-only RPC.
+    /// Same-Cell, same-legal-entity traffic like [`Self::RETRIEVAL_EMBEDDING_RPC`] — a Unix
+    /// domain socket with `UnixStream::peer_cred()` authentication (ADR-0012 pattern), gated
+    /// through this one closed registry rather than a bespoke second identity type.
+    PRIVATE_INFERENCE_RPC,
 }
 
 impl IntraCellResource {
     /// Every variant — for a registry builder that wants to assert full coverage, and for
     /// `xtask architecture-check`'s registry-consistency scan.
-    pub const ALL: [IntraCellResource; 2] = [Self::QDRANT_REST, Self::RETRIEVAL_EMBEDDING_RPC];
+    pub const ALL: [IntraCellResource; 3] = [
+        Self::QDRANT_REST,
+        Self::RETRIEVAL_EMBEDDING_RPC,
+        Self::PRIVATE_INFERENCE_RPC,
+    ];
 
     /// ADR-0003 second-round correction (`domain::boundary`): every `IntraCellResource` is,
     /// by definition of belonging to this closed registry, the same legal entity operating
@@ -64,6 +74,7 @@ impl IntraCellResource {
         match self {
             Self::QDRANT_REST => "QDRANT_REST",
             Self::RETRIEVAL_EMBEDDING_RPC => "RETRIEVAL_EMBEDDING_RPC",
+            Self::PRIVATE_INFERENCE_RPC => "PRIVATE_INFERENCE_RPC",
         }
     }
 }

@@ -1,0 +1,79 @@
+# §46.1 migration manifest. §11.8/ADR-0015: the private worker locates a Consolidate call's
+# inputs by run id (new nullable FK column on 0143's registration table), reads the two
+# consolidation tables (SELECT grants), and both headless consolidation roles read
+# WORKSPACE_SHARED memory/evidence rows (0140's role disjunct / role list widened). Pure DDL +
+# GRANT, no DML.
+
+migration_id = "0145_private_inference_consolidation_run_binding"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select not exists (select 1 from information_schema.columns
+                   where table_schema='ops' and table_name='private_inference_rpc_calls'
+                     and column_name='consolidation_run_id')
+   and not has_table_privilege('role_private_worker', 'private.memory_consolidation_runs', 'SELECT')
+   and not has_table_privilege('role_private_worker', 'private.memory_consolidation_inputs', 'SELECT')
+   and exists (select 1 from pg_policies where schemaname='private' and tablename='memory_records'
+                 and policyname='memory_records_tenant_and_visibility'
+                 and qual like '%role_retrieval_worker%'
+                 and qual not like '%role_private_worker%')
+   and exists (select 1 from pg_policies where schemaname='private' and tablename='evidence_objects'
+                 and policyname='evidence_objects_retrieval_worker_read'
+                 and roles = array['role_retrieval_worker']::name[])
+   as precheck_ok
+"""
+
+postcheck = """
+select exists (select 1 from information_schema.columns
+               where table_schema='ops' and table_name='private_inference_rpc_calls'
+                 and column_name='consolidation_run_id' and is_nullable='YES')
+   and exists (select 1 from pg_constraint
+               where conrelid='ops.private_inference_rpc_calls'::regclass and contype='f'
+                 and confrelid='private.memory_consolidation_runs'::regclass)
+   and has_column_privilege('role_consolidation_worker', 'ops.private_inference_rpc_calls', 'consolidation_run_id', 'INSERT')
+   and not has_column_privilege('role_private_worker', 'ops.private_inference_rpc_calls', 'consolidation_run_id', 'UPDATE')
+   and has_table_privilege('role_private_worker', 'private.memory_consolidation_runs', 'SELECT')
+   and not has_table_privilege('role_private_worker', 'private.memory_consolidation_runs', 'INSERT')
+   and not has_table_privilege('role_private_worker', 'private.memory_consolidation_runs', 'UPDATE')
+   and has_table_privilege('role_private_worker', 'private.memory_consolidation_inputs', 'SELECT')
+   and not has_table_privilege('role_private_worker', 'private.memory_consolidation_inputs', 'INSERT')
+   and exists (select 1 from pg_policies where schemaname='private' and tablename='memory_consolidation_runs'
+                 and cmd='ALL' and roles = array['public']::name[]
+                 and qual like '%NULLIF(current_setting(''humaux.tenant_id''::text, true), ''''::text)%')
+   and exists (select 1 from pg_policies where schemaname='private' and tablename='memory_consolidation_inputs'
+                 and cmd='ALL' and roles = array['public']::name[])
+   and exists (select 1 from pg_policies
+        where schemaname='private' and tablename='memory_records'
+          and policyname='memory_records_tenant_and_visibility'
+          and qual like '%role_retrieval_worker%'
+          and qual like '%role_consolidation_worker%'
+          and qual like '%role_private_worker%'
+          and qual like '%NULLIF(current_setting(''humaux.tenant_id''::text, true), ''''::text)%'
+          and (with_check is null or with_check not like '%role_private_worker%'))
+   and exists (select 1 from pg_policies
+        where schemaname='private' and tablename='evidence_objects'
+          and policyname='evidence_objects_retrieval_worker_read'
+          and permissive='PERMISSIVE' and cmd='SELECT'
+          and roles @> array['role_retrieval_worker','role_consolidation_worker','role_private_worker']::name[]
+          and array_length(roles, 1) = 3
+          and qual like '%NULLIF(current_setting(''humaux.tenant_id''::text, true), ''''::text)%')
+   and (select count(*) = 6 from pg_policy where polrelid='private.evidence_objects'::regclass)
+   and (select encode(sha256(convert_to(pg_get_expr(polqual,polrelid),'UTF8')),'hex')
+        from pg_policy where polrelid='private.evidence_objects'::regclass
+          and polname='evidence_objects_tenant_and_visibility')
+       = 'c77b3b830c7abec4ad46704fc7e88cded9a75b028c77ffd1946d2f288d7a045f'
+   as postcheck_ok
+"""
+
+rollback_or_forward_fix = """
+rollback (exact, pre-release only): ALTER TABLE ops.private_inference_rpc_calls DROP COLUMN
+  consolidation_run_id; REVOKE SELECT ON private.memory_consolidation_runs,
+  private.memory_consolidation_inputs FROM role_private_worker; re-run 0140's memory_records
+  ALTER POLICY ... USING verbatim (single-role disjunct); ALTER POLICY
+  evidence_objects_retrieval_worker_read ON private.evidence_objects TO role_retrieval_worker;
+  then DELETE FROM ops.schema_migrations WHERE migration_id =
+  '0145_private_inference_consolidation_run_binding'. Restores the state where a Consolidate
+  RPC can never locate its inputs — forward fix preferred.
+"""
+
+backup_restore_requirement = "none (nullable column add + grants + policy definitions only; no row data touched)."

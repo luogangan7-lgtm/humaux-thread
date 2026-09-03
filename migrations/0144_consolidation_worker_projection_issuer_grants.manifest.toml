@@ -1,0 +1,28 @@
+# §46.1 migration manifest. §15.1: role_consolidation_worker becomes the issuer for its own
+# private_memory stream_log/outbox rows (see this migration's own header). Pure GRANT, no DDL
+# on any table shape, no DML.
+
+migration_id = "0144_consolidation_worker_projection_issuer_grants"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select not has_table_privilege('role_consolidation_worker', 'projection.stream_log', 'INSERT')
+   and not has_column_privilege('role_consolidation_worker', 'projection.stream_checkpoints', 'issued_highwater', 'UPDATE')
+   and not has_table_privilege('role_consolidation_worker', 'ops.outbox', 'SELECT')
+   as precheck_ok
+"""
+
+postcheck = """
+select has_table_privilege('role_consolidation_worker', 'projection.stream_log', 'SELECT')
+   and has_table_privilege('role_consolidation_worker', 'projection.stream_log', 'INSERT')
+   and not has_table_privilege('role_consolidation_worker', 'projection.stream_log', 'UPDATE')
+   and not has_table_privilege('role_consolidation_worker', 'projection.stream_log', 'DELETE')
+   and has_column_privilege('role_consolidation_worker', 'projection.stream_checkpoints', 'issued_highwater', 'UPDATE')
+   and has_table_privilege('role_consolidation_worker', 'ops.outbox', 'SELECT')
+   and has_column_privilege('role_consolidation_worker', 'ops.outbox', 'evidence_id', 'INSERT')
+   and not has_column_privilege('role_consolidation_worker', 'ops.outbox', 'contribution_release_id', 'INSERT')
+   as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. REVOKE the three grants this migration adds is safe pre-release — pure privilege widening, no data/shape change."
+backup_restore_requirement = "none (privilege-only change)."

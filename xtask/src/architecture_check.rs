@@ -1391,7 +1391,11 @@ const INFRA_NETWORK_HTTP_RS: &str = "crates/infra-network/src/http.rs";
 /// Sibling of [`EXTERNAL_EGRESS_REGISTRY`]; the two are checked for disjointness by
 /// [`intra_cell_registry_disjoint_from_external`] — a resource must never be nameable through
 /// both registries at once.
-const INTRA_CELL_RESOURCE_REGISTRY: &[&str] = &["QDRANT_REST", "RETRIEVAL_EMBEDDING_RPC"];
+const INTRA_CELL_RESOURCE_REGISTRY: &[&str] = &[
+    "QDRANT_REST",
+    "RETRIEVAL_EMBEDDING_RPC",
+    "PRIVATE_INFERENCE_RPC",
+];
 
 const INFRA_CELL_RESOURCE_RS: &str = "crates/infra-cell/src/resource.rs";
 
@@ -3856,6 +3860,39 @@ fn r3_ordered(body: &str, markers: &[&str]) -> bool {
     true
 }
 
+/// The `let permit = authorize(` window the R3 reserve leg is judged on: inline in the
+/// reserve helper, or one level down in `authorize_structured_egress` when the reserve leg
+/// delegates to it with the resolver-derived `&admission` (never a config-derived processor).
+fn r3_authorize_window<'a>(contribution: &'a str, reserve: &'a str) -> Option<&'a str> {
+    if let Some(start) = reserve.find("let permit = authorize(") {
+        return Some(&reserve[start..reserve.len().min(start + 512)]);
+    }
+    let call = reserve.find("authorize_structured_egress(")?;
+    let call_window = &reserve[call..reserve.len().min(call + 512)];
+    if !call_window.contains("&admission") {
+        return None;
+    }
+    let helper = r3_function_body(contribution, "fn authorize_structured_egress")?;
+    let start = helper.find("let permit = authorize(")?;
+    Some(&helper[start..helper.len().min(start + 512)])
+}
+
+/// The provider-call marker the R3 call leg is ordered on. `complete_structured_timed(` is
+/// accepted only when that shared helper is itself a single `.complete_structured(` with no
+/// retry loop — otherwise the literal direct call is required, as before.
+fn r3_provider_call_marker(contribution: &str, call: &str) -> &'static str {
+    if call.contains("complete_structured_timed(")
+        && let Some(helper) = r3_function_body(contribution, "async fn complete_structured_timed")
+    {
+        let single_call = helper.matches(".complete_structured(").count() == 1;
+        let no_retry = !helper.contains("loop {") && !helper.contains("retry");
+        if single_call && no_retry {
+            return "complete_structured_timed(";
+        }
+    }
+    "complete_structured("
+}
+
 fn r3_contribution_runtime_contract(
     contribution: &str,
     ledger: &str,
@@ -3905,9 +3942,11 @@ fn r3_contribution_runtime_contract(
             "R3 in-transaction reserve helper body is missing or malformed".to_string(),
         ]);
     };
-    let authorize_window = reserve
-        .find("let permit = authorize(")
-        .map(|start| &reserve[start..reserve.len().min(start + 512)]);
+    // §11.2.5 R3 + ADR-0015 D5: the authorize leg may live in the shared `pub(crate)`
+    // helper `authorize_structured_egress` (one provider path for Contribution and
+    // Consolidate). The gate follows exactly one level of indirection and still demands
+    // the resolver-derived processor at the actual `authorize(` call.
+    let authorize_window = r3_authorize_window(contribution, reserve);
     if !r3_ordered(
         reserve,
         &[
@@ -3932,11 +3971,12 @@ fn r3_contribution_runtime_contract(
                 .to_string(),
         ]);
     }
+    let provider_marker = r3_provider_call_marker(contribution, call);
     if !r3_ordered(
         call,
         &[
             "resolve_and_reserve_reasoning_call",
-            "complete_structured(",
+            provider_marker,
             "self.finalize_reasoning_call",
         ],
     ) || !r3_ordered(
@@ -4934,6 +4974,61 @@ mod tests {
             r3_contribution_runtime_contract(&config_authority, ledger, disclosure, byok),
             Verdict::Fail(_)
         ));
+    }
+
+    fn r3_contribution_runtime_shared_helper_fixture() -> String {
+        concat!(
+            "async fn resolve_and_reserve_reasoning_call() { load_with_admission(); ",
+            "let (wire_payload, permit) = authorize_structured_egress(tenant_id, &admission, &descriptor); ",
+            "reserve_reasoning_call_in_txn(); reserve_reasoning_in_txn(); txn.commit() }\n",
+            "async fn call_structured() { self.resolve_and_reserve_reasoning_call(); ",
+            "complete_structured_timed(self.provider); self.finalize_reasoning_call() }\n",
+            "async fn finalize_reasoning_call() { finalize_reasoning_in_txn(); ",
+            "finalize_reasoning_call_in_txn(); txn.commit() }\n",
+            "pub(crate) fn authorize_structured_egress() { let permit = authorize(admission.egress_processor_id); }\n",
+            "pub(crate) async fn complete_structured_timed() { provider.complete_structured(context, request).await }\n",
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn r3_contribution_runtime_contract_follows_shared_helpers_one_level() {
+        let (_, ledger, disclosure, byok) = r3_contribution_runtime_fixture();
+        let contribution = r3_contribution_runtime_shared_helper_fixture();
+        assert_eq!(
+            r3_contribution_runtime_contract(&contribution, ledger, disclosure, byok),
+            Verdict::Pass
+        );
+        for (label, broken) in [
+            (
+                "helper authorizes with config processor",
+                contribution.replacen(
+                    "authorize(admission.egress_processor_id)",
+                    "authorize(self.config.allowed_egress_processor_id)",
+                    1,
+                ),
+            ),
+            (
+                "reserve leg passes a non-resolver admission",
+                contribution.replacen("&admission, &descriptor", "&self.config, &descriptor", 1),
+            ),
+            (
+                "timed helper grows a retry loop",
+                contribution.replacen(
+                    "provider.complete_structured(context, request).await",
+                    "loop { provider.complete_structured(context, request).await }",
+                    1,
+                ),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    r3_contribution_runtime_contract(&broken, ledger, disclosure, byok),
+                    Verdict::Fail(_)
+                ),
+                "{label} fault escaped"
+            );
+        }
     }
 
     #[test]

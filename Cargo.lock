@@ -951,11 +951,15 @@ name = "humaux-consolidation-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "hex",
  "humaux-adapters",
  "humaux-application",
  "humaux-domain",
+ "humaux-private-worker",
  "humaux-testkit",
  "postgres",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
@@ -1070,10 +1074,14 @@ name = "humaux-private-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "hex",
  "humaux-adapters",
  "humaux-application",
  "humaux-domain",
+ "humaux-infra-cell",
  "postgres",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
