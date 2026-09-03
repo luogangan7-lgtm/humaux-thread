@@ -194,6 +194,10 @@ struct Inferred {
     disclosure_id: Uuid,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one claimed row's whole lifecycle (fingerprint → provider → write → settle) reads best in one place; ADR-0016 D2"
+)]
 async fn process_claimed(
     pool: &PrivateWorkerDbPool,
     reasoner: &DistillReasoner<'_>,

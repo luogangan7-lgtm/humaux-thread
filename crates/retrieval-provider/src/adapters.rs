@@ -583,6 +583,10 @@ impl DashscopeEmbeddingProvider {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the §7.4 card sources ride the same prepare path as the query call (one provider pipeline, no second egress)"
+    )]
     async fn prepare_embedding_dispatch(
         &self,
         tenant_id: TenantId,
