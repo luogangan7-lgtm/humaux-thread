@@ -133,6 +133,72 @@ pub trait DnsResolver: Send + Sync {
     fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, SsrfError>;
 }
 
+/// Static DNS pins for hardened egress (§11.4). Hosts listed here resolve to the pinned
+/// addresses instead of the system resolver — for operators whose local DNS is not
+/// trustworthy (VPN "fake-ip" ranges, captive resolvers) — while every other host falls back
+/// to [`SystemDnsResolver`]. The forbidden-range check downstream still runs on whatever this
+/// returns, so a pin can never admit a loopback/private/reserved address.
+///
+/// Spec format: `host=ip[|ip...][,host=ip...]`, e.g. `api.example.com=203.0.113.10|203.0.113.11`.
+#[derive(Debug, Clone, Default)]
+pub struct PinnedDnsResolver {
+    pins: std::collections::HashMap<String, Vec<IpAddr>>,
+}
+
+impl PinnedDnsResolver {
+    /// Parses the pin spec; rejects empty hosts, empty pin lists and unparsable addresses.
+    pub fn parse(spec: &str) -> Result<Self, SsrfError> {
+        let mut pins = std::collections::HashMap::new();
+        for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let (host, addrs) = entry.split_once('=').ok_or_else(|| {
+                SsrfError::UrlMalformed(format!("dns pin {entry:?}: expected host=ip"))
+            })?;
+            let host = host.trim().to_ascii_lowercase();
+            if host.is_empty() {
+                return Err(SsrfError::UrlMalformed(format!(
+                    "dns pin {entry:?}: empty host"
+                )));
+            }
+            let parsed: Result<Vec<IpAddr>, _> = addrs
+                .split('|')
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .map(str::parse::<IpAddr>)
+                .collect();
+            let parsed = parsed
+                .map_err(|_| SsrfError::UrlMalformed(format!("dns pin {entry:?}: bad address")))?;
+            if parsed.is_empty() {
+                return Err(SsrfError::UrlMalformed(format!(
+                    "dns pin {entry:?}: no addresses"
+                )));
+            }
+            pins.insert(host, parsed);
+        }
+        Ok(Self { pins })
+    }
+
+    /// Number of pinned hosts.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pins.len()
+    }
+
+    /// True when no host is pinned (every lookup falls through to the system resolver).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pins.is_empty()
+    }
+}
+
+impl DnsResolver for PinnedDnsResolver {
+    fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, SsrfError> {
+        match self.pins.get(&host.to_ascii_lowercase()) {
+            Some(addrs) => Ok(addrs.clone()),
+            None => SystemDnsResolver.resolve(host),
+        }
+    }
+}
+
 /// Production resolver: `std::net::ToSocketAddrs` — works uniformly for a bare hostname
 /// (real DNS lookup) and an IP literal (returns that IP with no lookup at all), so both cases
 /// funnel through the same forbidden-range check below.
@@ -490,4 +556,60 @@ mod tests {
     // exists, to "there is exactly one validation function" — already demonstrated by every
     // other test in this module calling the same `validate_custom_endpoint`, not by a test
     // that pretends to follow a redirect it never does.
+}
+
+#[cfg(test)]
+mod pinned_dns_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_host_returns_pins_and_others_fall_back() {
+        let r = PinnedDnsResolver::parse(
+            "Api.Example.com=203.0.113.10|203.0.113.11, other.example=198.51.100.7",
+        )
+        .expect("valid spec");
+        assert_eq!(r.len(), 2);
+        let pinned = r.resolve("api.example.com").expect("pinned");
+        assert_eq!(
+            pinned,
+            vec![
+                "203.0.113.10".parse::<IpAddr>().unwrap(),
+                "203.0.113.11".parse().unwrap()
+            ]
+        );
+        // An IP literal is not pinned: the fallback resolver returns it verbatim.
+        assert_eq!(
+            r.resolve("192.0.2.9").expect("literal"),
+            vec!["192.0.2.9".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn malformed_specs_are_rejected() {
+        for bad in [
+            "api.example.com",
+            "=203.0.113.10",
+            "api.example.com=",
+            "api.example.com=not-an-ip",
+        ] {
+            assert!(
+                PinnedDnsResolver::parse(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        assert!(
+            PinnedDnsResolver::parse("")
+                .expect("empty spec is no pins")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pins_never_bypass_the_forbidden_range_check() {
+        // A pin to a reserved/private address still fails downstream: the check is on the
+        // resolved set, not on how it was resolved.
+        let r = PinnedDnsResolver::parse("api.example.com=198.18.0.139").expect("parses");
+        let addrs = r.resolve("api.example.com").expect("resolves");
+        assert!(addrs.iter().copied().all(is_forbidden_ip));
+    }
 }

@@ -148,6 +148,16 @@ async fn serve_rpc() -> Result<(), String> {
     let key = env::var(&key_env).map_err(|_| {
         format!("missing required configuration: {key_env} (HUMAUX_PRIVATE_WORKER_KEY_ENV)")
     })?;
+    // §11.4 static DNS pins (optional): `host=ip[|ip],...` — for hosts whose system DNS answer
+    // is not trustworthy on this node. The forbidden-range check still runs on the pins.
+    let resolver: Box<dyn ssrf::DnsResolver> = match env::var("HUMAUX_PRIVATE_WORKER_DNS_PINS") {
+        Ok(spec) if !spec.trim().is_empty() => {
+            Box::new(ssrf::PinnedDnsResolver::parse(&spec).map_err(|e| {
+                format!("invalid configuration: HUMAUX_PRIVATE_WORKER_DNS_PINS ({e:?})")
+            })?)
+        }
+        _ => Box::new(ssrf::SystemDnsResolver),
+    };
     let provider = OpenAiCompatibleProvider::new(
         descriptor,
         chat_url,
@@ -155,7 +165,7 @@ async fn serve_rpc() -> Result<(), String> {
             .map_err(|_| "egress transport construction failed".to_owned())?,
         EnvCredential(key),
         ssrf::CustomEndpointPolicy::default(),
-        &ssrf::SystemDnsResolver,
+        resolver.as_ref(),
     )
     .map_err(|_| {
         "invalid configuration: HUMAUX_PRIVATE_WORKER_CHAT_URL rejected by the §11.4 SSRF choke point".to_owned()
