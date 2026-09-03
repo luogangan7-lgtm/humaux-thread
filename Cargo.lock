@@ -3815,11 +3815,16 @@ version = "0.1.0"
 dependencies = [
  "humaux-adapters",
  "humaux-contracts",
+ "humaux-domain",
+ "humaux-infra-cell",
  "humaux-projection",
+ "humaux-protocol",
  "postgres",
+ "rand 0.9.5",
  "serde_json",
  "tokio",
  "toml",
+ "uuid",
 ]
 
 [[package]]
