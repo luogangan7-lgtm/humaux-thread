@@ -203,7 +203,13 @@ async fn process_claimed(
 ) -> Result<(), DistillError> {
     let inferred = match infer_claimed(pool, reasoner, distill, row).await {
         Ok(Some(inferred)) => inferred,
-        Ok(None) => return settle_failed(pool, distill, row, report).await,
+        Ok(None) => {
+            eprintln!(
+                "humaux-private-worker: distill evidence={} failed: no_output",
+                row.evidence_id
+            );
+            return settle_failed(pool, distill, row, report).await;
+        }
         Err(DistillError::Reasoning(_)) => {
             return settle_deferred(pool, distill, row, report).await;
         }
@@ -211,7 +217,14 @@ async fn process_claimed(
     };
     let candidates = match parse_distill_output(&inferred.output_bytes) {
         Ok(candidates) => candidates,
-        Err(_) => return settle_failed(pool, distill, row, report).await,
+        Err(error) => {
+            // Wire-level class only (ErrorCode / redacted reasoning error), never payload text.
+            eprintln!(
+                "humaux-private-worker: distill evidence={} failed: {error:?}",
+                row.evidence_id
+            );
+            return settle_failed(pool, distill, row, report).await;
+        }
     };
 
     let evidence = &inferred.evidence;

@@ -305,6 +305,8 @@ pub async fn switch_projection_version(
     let criteria = SwitchCriteria {
         visible_shadow: checked_shadow,
         visible_serving: checked_serving,
+        // ADR-0017: no serving row for this family ⇒ first activation of a projection version.
+        first_activation: current_serving_version.is_none(),
         shadow_open_gaps: shadow_open_gaps as u64,
         continuation,
     };

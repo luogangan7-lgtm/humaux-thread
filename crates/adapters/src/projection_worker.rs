@@ -113,6 +113,8 @@ pub trait CardEmbedder: Send + Sync {
         tenant_id: TenantId,
         dimension: u32,
         cards: &[SealedRetrievalCard],
+        // §7.4: the memories the cards belong to (one per card) — the disclosure sources.
+        memory_ids: &[Uuid],
     ) -> Result<Vec<Vec<f32>>, ErrorCode>;
 }
 
@@ -492,9 +494,18 @@ async fn resolve_and_embed(
 
     let vectors = deps
         .embedder
-        .embed_cards(deps.family.tenant_id, deps.dimension, &[sealed])
+        .embed_cards(
+            deps.family.tenant_id,
+            deps.dimension,
+            &[sealed],
+            &[memory.memory_id.0],
+        )
         .await
-        .map_err(|_| (RowTerminal::Failed, "embedding_failed"))?;
+        .map_err(|code| {
+            // Operator signal only: the wire `ErrorCode` variant, never provider text (§7.x).
+            eprintln!("projection_worker: commit_seq={commit_seq} embedding_failed code={code:?}");
+            (RowTerminal::Failed, "embedding_failed")
+        })?;
     // (d): reject a dimension mismatch — checked against the actual returned vector length,
     // since this trait carries no separate `EmbeddingBatch::dimension` field (see
     // `CardEmbedder`'s doc).

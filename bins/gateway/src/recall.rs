@@ -171,8 +171,14 @@ pub async fn search(
         RetrievalFamily::PrivateMemoryV1,
     )
     .await
-    .map_err(|_| ErrorCode::DependencyUnavailable)?
-    .ok_or(ErrorCode::DependencyUnavailable)?;
+    .map_err(|_| {
+        eprintln!("humaux-gateway: recall request_id={request_id} placement_lookup_failed");
+        ErrorCode::DependencyUnavailable
+    })?
+    .ok_or_else(|| {
+        eprintln!("humaux-gateway: recall request_id={request_id} placement_missing");
+        ErrorCode::DependencyUnavailable
+    })?;
     let family = StreamFamily::new(
         bootstrap.stream.tenant_id,
         bootstrap.stream.scope_kind.clone(),
@@ -220,13 +226,20 @@ pub async fn search(
         RetrievalEmbeddingOutcome::Embedded { .. }
         | RetrievalEmbeddingOutcome::Skipped
         | RetrievalEmbeddingOutcome::Unavailable { .. } => {
+            eprintln!("humaux-gateway: recall request_id={request_id} query_embedding_unusable");
             return Err(ErrorCode::DependencyUnavailable);
         }
     };
     let projection_version = private_read_projection_selector(&pool, &authorization, &family)
         .await
-        .map_err(|_| ErrorCode::DependencyUnavailable)?
-        .ok_or(ErrorCode::DependencyUnavailable)?;
+        .map_err(|_| {
+            eprintln!("humaux-gateway: recall request_id={request_id} projection_selector_failed");
+            ErrorCode::DependencyUnavailable
+        })?
+        .ok_or_else(|| {
+            eprintln!("humaux-gateway: recall request_id={request_id} no_serving_projection");
+            ErrorCode::DependencyUnavailable
+        })?;
     let dense = DenseQuery::new(
         &authorization,
         &placement,
@@ -239,7 +252,10 @@ pub async fn search(
         Vec::new(),
         ha_profile_for(QdrantOperation::ReadYourWriteStrict),
     )
-    .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    .map_err(|_| {
+        eprintln!("humaux-gateway: recall request_id={request_id} dense_query_build_failed");
+        ErrorCode::DependencyUnavailable
+    })?;
     let candidates = query_dense(runtime.qdrant.as_ref(), &runtime.qdrant_permit()?, &dense)
         .await
         .map_err(|error| {
@@ -255,6 +271,8 @@ pub async fn search(
             ) {
                 ErrorCode::Forbidden
             } else {
+                // Operator signal: transport error class only (no body/URL), §ADR-0014.
+                eprintln!("humaux-gateway: recall request_id={request_id} qdrant_query_failed");
                 ErrorCode::DependencyUnavailable
             }
         })?;

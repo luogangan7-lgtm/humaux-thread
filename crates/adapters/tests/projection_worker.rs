@@ -319,6 +319,7 @@ impl CardEmbedder for TestEmbedder {
         tenant_id: TenantId,
         dimension: u32,
         cards: &[SealedRetrievalCard],
+        _memory_ids: &[Uuid],
     ) -> Result<Vec<Vec<f32>>, ErrorCode> {
         Ok(self
             .0
@@ -769,6 +770,7 @@ impl CardEmbedder for WrongDimEmbedder {
         _tenant_id: TenantId,
         dimension: u32,
         cards: &[SealedRetrievalCard],
+        _memory_ids: &[Uuid],
     ) -> Result<Vec<Vec<f32>>, ErrorCode> {
         Ok(cards
             .iter()

@@ -113,6 +113,11 @@ pub struct SwitchCriteria {
     /// `count(*)` from `projection.processing_gaps` (§15.1's sole gap-count source) filtered to
     /// the **shadow** version's full [`StreamKey`] — §16.3's second criterion,
     /// `shadow.open_gaps == 0`.
+    /// §16.2 first activation (ADR-0017): the family has NO serving version yet, so there is
+    /// nothing to compare the shadow against — the shadow read-back, zero open gaps and a
+    /// passing continuation verdict are the whole criterion. Derived by the DB layer from the
+    /// checkpoint rows, never declared by a caller.
+    pub first_activation: bool,
     pub shadow_open_gaps: u64,
     /// §16.3's third criterion input — see [`ContinuationVerdict`]'s doc for why this is a
     /// 4-state enum, not a bool.
@@ -176,6 +181,7 @@ pub fn evaluate_switch(criteria: &SwitchCriteria) -> Result<(), Vec<SwitchReject
     let mut rejections = Vec::new();
 
     match (&criteria.visible_shadow, &criteria.visible_serving) {
+        (Some(_), None) if criteria.first_activation => {}
         (Some((shadow_version, _)), Some((serving_version, _)))
             if shadow_version == serving_version =>
         {
@@ -222,9 +228,53 @@ mod tests {
         SwitchCriteria {
             visible_shadow: Some(("v2".to_string(), 10)),
             visible_serving: Some(("v1".to_string(), 10)),
+            first_activation: false,
             shadow_open_gaps: 0,
             continuation: ContinuationVerdict::Pass,
         }
+    }
+
+    #[test]
+    fn first_activation_accepts_a_shadow_read_back_without_a_serving_version() {
+        let criteria = SwitchCriteria {
+            visible_serving: None,
+            first_activation: true,
+            ..all_true()
+        };
+        assert_eq!(evaluate_switch(&criteria), Ok(()));
+    }
+
+    #[test]
+    fn first_activation_still_needs_the_shadow_read_back_and_no_open_gaps() {
+        let no_shadow = SwitchCriteria {
+            visible_shadow: None,
+            visible_serving: None,
+            first_activation: true,
+            ..all_true()
+        };
+        assert_eq!(
+            evaluate_switch(&no_shadow),
+            Err(vec![SwitchRejection::VisibleUnavailable])
+        );
+        let gaps = SwitchCriteria {
+            visible_serving: None,
+            first_activation: true,
+            shadow_open_gaps: 1,
+            ..all_true()
+        };
+        assert_eq!(evaluate_switch(&gaps), Err(vec![SwitchRejection::OpenGaps]));
+    }
+
+    #[test]
+    fn a_missing_serving_version_without_first_activation_is_still_unavailable() {
+        let criteria = SwitchCriteria {
+            visible_serving: None,
+            ..all_true()
+        };
+        assert_eq!(
+            evaluate_switch(&criteria),
+            Err(vec![SwitchRejection::VisibleUnavailable])
+        );
     }
 
     #[test]
@@ -284,6 +334,7 @@ mod tests {
         let c = SwitchCriteria {
             visible_shadow: Some(("v1".to_string(), 10)),
             visible_serving: Some(("v1".to_string(), 10)),
+            first_activation: false,
             shadow_open_gaps: 0,
             continuation: ContinuationVerdict::Pass,
         };
@@ -362,6 +413,7 @@ mod tests {
         let c = SwitchCriteria {
             visible_shadow: Some(("v2".to_string(), 9)),
             visible_serving: Some(("v1".to_string(), 10)),
+            first_activation: false,
             shadow_open_gaps: 3,
             continuation: ContinuationVerdict::Fail,
         };

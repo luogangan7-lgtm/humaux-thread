@@ -591,6 +591,7 @@ impl DashscopeEmbeddingProvider {
         query_call: Option<(&RetrievalQueryCallContext<'_>, &[SealedRetrievalQuery])>,
         texts: &[&str],
         estimated_input_tokens: u64,
+        card_sources: &[DisclosureSource],
     ) -> Result<PreparedEmbeddingDispatch, ErrorCode> {
         let dispatch_payload = match query_call {
             Some((_, queries)) => EmbeddingDispatchPayload::Query(
@@ -656,7 +657,11 @@ impl DashscopeEmbeddingProvider {
                 &self.region,
                 payload,
                 None,
-                std::slice::from_ref(&self.source),
+                if card_sources.is_empty() {
+                    std::slice::from_ref(&self.source)
+                } else {
+                    card_sources
+                },
             )
             .await
             .map_err(retrieval_query_source::RetrievalQuerySourceError::Disclosure),
@@ -703,6 +708,7 @@ impl DashscopeEmbeddingProvider {
         data_class: DataClass,
         query_call: Option<(&RetrievalQueryCallContext<'_>, &[SealedRetrievalQuery])>,
         texts: &[&str],
+        card_sources: &[DisclosureSource],
     ) -> Result<EmbeddingBatch, ErrorCode> {
         validate_embedding_batch(&self.model, dimension, texts)?;
         if texts.is_empty() {
@@ -731,6 +737,7 @@ impl DashscopeEmbeddingProvider {
                 query_call,
                 texts,
                 estimated_input_tokens,
+                card_sources,
             )
             .await?;
 
@@ -1043,6 +1050,7 @@ impl EmbeddingProvider for DashscopeEmbeddingProvider {
             data_class,
             Some((context, queries)),
             &texts,
+            &[],
         )
         .await
     }
@@ -1059,7 +1067,39 @@ impl EmbeddingProvider for DashscopeEmbeddingProvider {
             .map(SealedRetrievalCard::data_class)
             .max()
             .unwrap_or(DataClass::SecretMaterial);
-        self.embed(tenant_id, dimension, data_class, None, &texts)
+        self.embed(
+            tenant_id,
+            dimension,
+            data_class,
+            None,
+            &texts,
+            std::slice::from_ref(&self.source),
+        )
+        .await
+    }
+
+    async fn embed_cards_for_memories(
+        &self,
+        tenant_id: TenantId,
+        dimension: u32,
+        cards: &[SealedRetrievalCard],
+        memory_ids: &[uuid::Uuid],
+    ) -> Result<EmbeddingBatch, ErrorCode> {
+        if memory_ids.len() != cards.len() || memory_ids.is_empty() {
+            return Err(ErrorCode::InvalidInput);
+        }
+        let texts: Vec<&str> = cards.iter().map(SealedRetrievalCard::as_str).collect();
+        let data_class = cards
+            .iter()
+            .map(SealedRetrievalCard::data_class)
+            .max()
+            .unwrap_or(DataClass::SecretMaterial);
+        let sources: Vec<DisclosureSource> = memory_ids
+            .iter()
+            .copied()
+            .map(DisclosureSource::Memory)
+            .collect();
+        self.embed(tenant_id, dimension, data_class, None, &texts, &sources)
             .await
     }
 }
@@ -1690,6 +1730,7 @@ mod tests {
                     Some((&context, &queries)),
                     &texts,
                     estimated_tokens,
+                    &[],
                 ))
                 .expect("prepare dispatch before forced ledger terminal state");
             handle

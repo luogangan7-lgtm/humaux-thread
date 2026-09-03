@@ -109,3 +109,6 @@ first (using the seeded bearer), then run the two workers above. A successful ho
 produces one `private.memory_rollups` row and a `projection.stream_log` row with
 `scope_kind='workspace'` and event type `MEMORY_PUBLISHED` for the seeded tenant.
 `--teardown` afterward brings every seeded table back to zero rows for that tenant.
+
+- `--embedding-provider <id> --embedding-region <region>` (required): seeds `control.retrieval_provider_admission_limits` rows (purposes embedding + rerank) so projection/query embedding admission succeeds; echoed as `HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER/REGION`.
+- Admission limits: the seed creates the 0117 canonical tiers for `--embedding-provider` — shared GLOBAL and REGION rows (tenant NULL, created only when missing, never torn down) plus the tenant's TENANT and TENANT+PURPOSE rows (RETRIEVAL_EMBEDDING, RETRIEVAL_RERANK); `--teardown` removes only the tenant-scoped rows.

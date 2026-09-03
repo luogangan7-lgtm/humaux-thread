@@ -288,6 +288,22 @@ pub trait EmbeddingProvider: Send + Sync {
         dimension: u32,
         cards: &[SealedRetrievalCard],
     ) -> Result<EmbeddingBatch, ErrorCode>;
+
+    /// Embeds `cards` whose §7.4 disclosure sources are the memories being projected — one
+    /// `memory_id` per card, same order. Providers that keep no disclosure ledger fall back to
+    /// [`EmbeddingProvider::embed_cards`]; the DashScope adapter records the real sources
+    /// (rehearsal 2026-09-03: a constructor-time placeholder source failed the
+    /// `data_disclosure_sources` FK and every projection ticket ended `embedding_failed`).
+    async fn embed_cards_for_memories(
+        &self,
+        tenant_id: TenantId,
+        dimension: u32,
+        cards: &[SealedRetrievalCard],
+        memory_ids: &[uuid::Uuid],
+    ) -> Result<EmbeddingBatch, ErrorCode> {
+        let _ = memory_ids;
+        self.embed_cards(tenant_id, dimension, cards).await
+    }
 }
 
 /// §19's "Managed Rerank" capability (§1.2.3 line 1285: "Rerank -> SealedRetrievalQuery +

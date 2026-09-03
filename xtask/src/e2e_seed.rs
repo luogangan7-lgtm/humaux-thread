@@ -438,6 +438,10 @@ struct QdrantFlags {
     dimension: u32,
     host: String,
     port: u16,
+    /// §19 retrieval-provider admission is keyed by (provider_id, region, tenant, purpose):
+    /// the embedding/rerank limit rows the projection/recall hops need (§78.1: from the CLI).
+    embedding_provider: String,
+    embedding_region: String,
 }
 
 fn parse_qdrant_flags(args: &[String]) -> Result<QdrantFlags, String> {
@@ -457,11 +461,19 @@ fn parse_qdrant_flags(args: &[String]) -> Result<QdrantFlags, String> {
         Some(v) => v.parse().map_err(|e| format!("--qdrant-port: {e}"))?,
         None => 6333,
     };
+    let embedding_provider = arg(args, "--embedding-provider").ok_or_else(|| {
+        "missing required flag --embedding-provider (§78.1: no default)".to_string()
+    })?;
+    let embedding_region = arg(args, "--embedding-region").ok_or_else(|| {
+        "missing required flag --embedding-region (§78.1: no default)".to_string()
+    })?;
     Ok(QdrantFlags {
         collection,
         dimension,
         host,
         port,
+        embedding_provider,
+        embedding_region,
     })
 }
 
@@ -615,6 +627,47 @@ fn drop_qdrant_collection(
 
 /// `projection.tenant_placements` row the 追加2 card names — `SHARED_FALLBACK` placement class,
 /// zero point/byte counts (a fresh collection), `STABLE` promotion state.
+/// §19 retrieval-provider admission limits for the rehearsal tenant. `ops.reserve_retrieval_
+/// provider_budget` (0117) demands exactly ONE active limit row for each canonical tier —
+/// GLOBAL (tenant NULL, region NULL, purpose NULL), REGION (tenant NULL, region, purpose NULL),
+/// TENANT (tenant, region NULL, purpose NULL) and TENANT+PURPOSE (tenant, region NULL,
+/// purpose RETRIEVAL_EMBEDDING / RETRIEVAL_RERANK) — otherwise it raises P0003 and every
+/// projection ticket ends `embedding_failed` with a ledger row FAILED/Conflict (rehearsal-
+/// verified). The two shared tiers are created only when missing and are NEVER torn down
+/// (they are cross-tenant catalog rows, like processor_models); the tenant tiers are.
+fn seed_embedding_admission(
+    client: &mut Client,
+    tenant_id: Uuid,
+    provider_id: &str,
+    region: &str,
+) -> Result<(), String> {
+    let tiers: [(Option<Uuid>, Option<&str>, Option<&str>); 5] = [
+        (None, None, None),
+        (None, Some(region), None),
+        (Some(tenant_id), None, None),
+        (Some(tenant_id), None, Some("RETRIEVAL_EMBEDDING")),
+        (Some(tenant_id), None, Some("RETRIEVAL_RERANK")),
+    ];
+    for (tier_tenant, tier_region, tier_purpose) in tiers {
+        client
+            .execute(
+                "INSERT INTO control.retrieval_provider_admission_limits \
+                   (tenant_id,provider_id,region,purpose,tpm_limit,rpm_limit,effective_from) \
+                 VALUES($1,$2,$3,$4,1000000000,1000000000,clock_timestamp()-interval '1 second') \
+                 ON CONFLICT (provider_id,region,tenant_id,purpose) WHERE effective_to IS NULL \
+                 DO UPDATE SET tpm_limit=EXCLUDED.tpm_limit,rpm_limit=EXCLUDED.rpm_limit",
+                &[&tier_tenant, &provider_id, &tier_region, &tier_purpose],
+            )
+            .map_err(|e| {
+                format!(
+                    "seed admission limit (tenant={tier_tenant:?}, region={tier_region:?}, purpose={tier_purpose:?}): {}",
+                    db_detail(&e)
+                )
+            })?;
+    }
+    Ok(())
+}
+
 fn seed_placement(client: &mut Client, tenant_id: Uuid, collection: &str) -> Result<(), String> {
     client
         .execute(
@@ -715,6 +768,11 @@ fn teardown(client: &mut Client, tenant_id: Uuid) -> Result<(), String> {
         // outbox rows and the Evidence they announced.
         "DELETE FROM ops.data_disclosure_sources WHERE tenant_id=$1",
         "DELETE FROM ops.data_disclosures WHERE tenant_id=$1",
+        "DELETE FROM ops.retrieval_provider_budget_allocations WHERE tenant_id=$1",
+        "DELETE FROM ops.retrieval_provider_budget_reservations WHERE tenant_id=$1",
+        "DELETE FROM ops.model_call_ledger WHERE tenant_id=$1",
+        "DELETE FROM private.retrieval_query_sources WHERE tenant_id=$1",
+        "DELETE FROM control.retrieval_provider_admission_limits WHERE tenant_id=$1",
         "DELETE FROM private.memory_evidence WHERE memory_id IN \
            (SELECT memory_id FROM private.memory_records WHERE tenant_id=$1)",
         "DELETE FROM private.memory_records WHERE tenant_id=$1",
@@ -933,6 +991,15 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("e2e-seed: fail (qdrant collection: {e})");
         return 1;
     }
+    if let Err(e) = seed_embedding_admission(
+        &mut client,
+        base.tenant_id,
+        &qdrant_flags.embedding_provider,
+        &qdrant_flags.embedding_region,
+    ) {
+        eprintln!("e2e-seed: {e}");
+        return 1;
+    }
     if let Err(e) = seed_placement(&mut client, base.tenant_id, &qdrant_flags.collection) {
         eprintln!("e2e-seed: fail ({e})");
         return 1;
@@ -955,6 +1022,8 @@ pub fn run(args: &[String]) -> i32 {
     println!("profile_id: {}", lane.profile_id);
     println!("policy_id: {}", lane.policy_id);
     println!("collection_name: {}", qdrant_flags.collection);
+    println!("embedding_provider: {}", qdrant_flags.embedding_provider);
+    println!("embedding_region: {}", qdrant_flags.embedding_region);
     println!("dimension: {}", qdrant_flags.dimension);
     println!();
     println!(
@@ -1000,6 +1069,14 @@ pub fn run(args: &[String]) -> i32 {
         lane_flags.egress_processor_id
     );
     println!();
+    println!(
+        "export HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER={}",
+        qdrant_flags.embedding_provider
+    );
+    println!(
+        "export HUMAUX_RETRIEVAL_WORKER_REGION={}",
+        qdrant_flags.embedding_region
+    );
     println!(
         "export HUMAUX_RETRIEVAL_WORKER_QDRANT_COLLECTION={}",
         qdrant_flags.collection

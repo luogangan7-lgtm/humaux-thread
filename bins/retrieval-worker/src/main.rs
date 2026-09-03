@@ -62,10 +62,11 @@ impl CardEmbedder for EmbedderAdapter {
         tenant_id: TenantId,
         dimension: u32,
         cards: &[SealedRetrievalCard],
+        memory_ids: &[Uuid],
     ) -> Result<Vec<Vec<f32>>, ErrorCode> {
         Ok(self
             .0
-            .embed_cards(tenant_id, dimension, cards)
+            .embed_cards_for_memories(tenant_id, dimension, cards, memory_ids)
             .await?
             .vectors)
     }
