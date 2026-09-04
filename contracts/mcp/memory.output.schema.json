@@ -1,29 +1,140 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MemoryReadResult",
-  "description": "Direct Memory Envelope or one authorized immutable enumeration page. The catalog resolves the embedded canonical Envelope without network access.",
+  "description": "Direct Memory Envelope, one authorized immutable enumeration page, or one of the two memory.supersede results (confirmation_required / superseded). The catalog resolves the embedded canonical Envelope without network access.",
   "type": "object",
   "$defs": {
-    "Envelope": {"$ref":"context.output.schema.json#/properties/content"}
+    "Envelope": {
+      "$ref": "context.output.schema.json#/properties/content"
+    },
+    "ConfirmationRequired": {
+      "type": "object",
+      "description": "§33.10 rule 9 / ADR-0018 first call of a gated destructive op: the server minted a single-use confirm_token bound to (tenant,user,operation,target,successor); nothing else was written.",
+      "required": [
+        "confirmation_required",
+        "confirm_token",
+        "operation",
+        "target",
+        "expires_at"
+      ],
+      "properties": {
+        "confirmation_required": {
+          "const": true
+        },
+        "confirm_token": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "memory.supersede"
+          ]
+        },
+        "target": {
+          "type": "object",
+          "required": [
+            "memory_id",
+            "replacement_memory_id"
+          ],
+          "properties": {
+            "memory_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "replacement_memory_id": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "additionalProperties": false
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Superseded": {
+      "type": "object",
+      "description": "memory.supersede executed (§36): target now status=superseded with superseded_by=replacement_memory_id; one MEMORY_LIFECYCLE ticket was issued on the workspace projection stream (§15.7).",
+      "required": [
+        "memory_id",
+        "replacement_memory_id",
+        "superseded_at",
+        "stream_seq",
+        "commit_seq"
+      ],
+      "properties": {
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "replacement_memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "superseded_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "stream_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "commit_seq": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
   },
   "oneOf": [
-    {"$ref":"#/$defs/Envelope"},
+    {
+      "$ref": "#/$defs/Envelope"
+    },
     {
       "type": "object",
-      "required": ["content","pagination"],
+      "required": [
+        "content",
+        "pagination"
+      ],
       "properties": {
-        "content": {"$ref":"#/$defs/Envelope"},
+        "content": {
+          "$ref": "#/$defs/Envelope"
+        },
         "pagination": {
           "type": "object",
-          "required": ["snapshot_id","next_cursor"],
+          "required": [
+            "snapshot_id",
+            "next_cursor"
+          ],
           "properties": {
-            "snapshot_id": {"type":"string","format":"uuid"},
-            "next_cursor": {"type":["string","null"],"minLength":1,"maxLength":1024}
+            "snapshot_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1,
+              "maxLength": 1024
+            }
           },
           "additionalProperties": false
         }
       },
       "additionalProperties": false
+    },
+    {
+      "$ref": "#/$defs/ConfirmationRequired"
+    },
+    {
+      "$ref": "#/$defs/Superseded"
     }
   ]
 }

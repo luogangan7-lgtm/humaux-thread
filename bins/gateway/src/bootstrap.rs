@@ -93,6 +93,8 @@ pub struct GatewayBootstrap {
     /// piece of guard config the semantic-recall wiring also needs, for the Qdrant transport's
     /// own request timeout (never a literal, §78.1).
     handler_timeout: Duration,
+    /// §33.10 rule 9 confirm-token lifetime (ADR-0018), `HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS`.
+    confirm_token_ttl: Duration,
 }
 
 /// Parsed `HUMAUX_GATEWAY_RETRIEVAL_RPC_*` / `HUMAUX_GATEWAY_EMBEDDING_*` /
@@ -184,7 +186,14 @@ impl GatewayBootstrap {
             self.remember_policy,
             self.remember_event_kind,
             self.context_bootstrap,
-        );
+        )
+        .with_confirm_token_ttl(self.confirm_token_ttl)
+        .map_err(|_| {
+            BootstrapError::new(
+                "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS",
+                "must be positive seconds",
+            )
+        })?;
         match self.semantic_recall {
             Some(config) => {
                 let runtime = build_semantic_recall_runtime(
@@ -218,6 +227,10 @@ impl GatewayBootstrap {
         let context_bootstrap = parse_context_bootstrap(&effective, &remember_policy)?;
         let guard = parse_guard(&effective)?;
         let handler_timeout = guard.handler_timeout;
+        let confirm_token_ttl = seconds(
+            required(&effective, "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS")?,
+            "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS",
+        )?;
 
         Ok(Self {
             bind_addr: parse_bind_addr(required(&effective, "HUMAUX_GATEWAY_BIND_ADDR")?)?,
@@ -230,6 +243,7 @@ impl GatewayBootstrap {
             config_fingerprint: redacted_fingerprint(&registry, &effective),
             semantic_recall: parse_semantic_recall(&effective)?,
             handler_timeout,
+            confirm_token_ttl,
         })
     }
 }
@@ -578,6 +592,7 @@ fn registry() -> Vec<ConfigEntry> {
         ("HANDLER_TIMEOUT_SECONDS", "u64", false),
         ("FINALIZE_TIMEOUT_SECONDS", "u64", false),
         ("REPLAY_TTL_SECONDS", "u64", false),
+        ("CONFIRM_TOKEN_TTL_SECONDS", "u64", false),
         ("REMEMBER_TENANT_ID", "uuid", false),
         ("REMEMBER_WORKSPACE_ID", "uuid", false),
         ("REMEMBER_SCOPE_KIND", "enum:workspace", false),
@@ -883,6 +898,7 @@ mod tests {
                 "HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS" => "5".into(),
                 "HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS" => "2".into(),
                 "HUMAUX_GATEWAY_REPLAY_TTL_SECONDS" => "60".into(),
+                "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS" => "300".into(),
                 "HUMAUX_GATEWAY_REMEMBER_TENANT_ID" => tenant.to_string(),
                 "HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID" => workspace.to_string(),
                 "HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND" => "workspace".into(),

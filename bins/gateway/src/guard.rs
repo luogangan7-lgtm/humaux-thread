@@ -9,6 +9,7 @@ use std::{
 };
 
 use humaux_adapters::{
+    confirm_token_repo::{self, ConfirmationClaim},
     operation_receipt::{self, AtomicRememberRequest, AtomicRememberResult},
     postgres::RuntimeDbPool,
     quota_repo::{self, QuotaReservation, RatePolicy, RateSubject},
@@ -17,6 +18,7 @@ use humaux_adapters::{
 };
 use humaux_domain::{
     audit::{AuditEvent, AuditEventId, AuditMetadata, McpAuditAction, SYSTEM_TENANT_ID},
+    confirm::{ConfirmToken, DestructiveOp, RISK_TAG_CONFIRMATION_MINTED},
     error::ErrorCode,
     identity::AuthorizationScope,
     ids::WorkspaceId,
@@ -131,6 +133,40 @@ struct ReadCompletion<'a> {
     reservation: Option<&'a QuotaReservation>,
     consume: bool,
     error: Option<ErrorCode>,
+}
+
+/// §33.10 rule 9 / ADR-0018: the shared precondition of every destructive action. The
+/// dispatch arm names the closed operation and its target; the guard decides between
+/// "mint and ask" (no token) and "hand the claim to a same-transaction consumer" (token).
+pub(crate) struct ConfirmGate {
+    pub op: DestructiveOp,
+    pub target_id: Uuid,
+    /// The operation's second argument, bound with the target (a confirmed `supersede C
+    /// with B` can never execute as `supersede C with E`).
+    pub successor_id: Option<Uuid>,
+    pub presented: Option<ConfirmToken>,
+    /// Server policy TTL (`HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS`), never a literal.
+    pub ttl: Duration,
+}
+
+/// Everything a confirmed write handler needs to run its one transaction. The claim is
+/// consumed by the adapter inside that transaction (`confirm_token_repo::consume_in_txn`),
+/// never here — that is what makes verify+consume+mutate atomic by construction.
+pub(crate) struct ConfirmedWrite {
+    pub request: AuthorizedRequest,
+    pub claim: ConfirmationClaim,
+    pub request_fingerprint: String,
+    pub reservation_ttl: Duration,
+    pub finished_audit: AuditEvent,
+}
+
+/// D-B: the first call is a success-shaped result, not an error (§52.1 keeps 18 codes).
+pub(crate) enum ConfirmedOutcome<T> {
+    ConfirmationRequired {
+        token: ConfirmToken,
+        expires_at: OffsetDateTime,
+    },
+    Executed(T),
 }
 
 #[derive(Clone, Copy)]
@@ -647,6 +683,134 @@ impl GatewayGuard {
         .await;
         self.record_request(operation, &result);
         result
+    }
+
+    /// A confirm-gated local write (§33.10 rule 9, ADR-0018). Same admission as every other
+    /// route; the first call mints a token (one transaction: token row + finished audit, no
+    /// other durable write, no BMO); the second call runs `handler` under the handler
+    /// timeout with the claim it must consume in its own transaction.
+    pub(crate) async fn run_confirmed_write<T, F, Fut>(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        requested_workspace: Option<WorkspaceId>,
+        raw_arguments: &str,
+        gate: ConfirmGate,
+        handler: F,
+    ) -> Result<ConfirmedOutcome<T>, ErrorCode>
+    where
+        F: FnOnce(ConfirmedWrite) -> Fut,
+        Fut: Future<Output = Result<T, ErrorCode>>,
+    {
+        let result = async {
+            let admitted = self.admit(context, operation, requested_workspace).await?;
+            if DestructiveOp::parse_operation_key(operation.operation_key()) != Some(gate.op)
+                || operation.meter_kind() != MeterKind::Ordinary
+            {
+                return self
+                    .denied(
+                        context,
+                        operation,
+                        &admitted,
+                        ErrorCode::DependencyUnavailable,
+                    )
+                    .await;
+            }
+            // D-A: a token binds to a real user; a headless credential cannot confirm.
+            if admitted.request.authorization().user_id().is_none() {
+                return self
+                    .denied(context, operation, &admitted, ErrorCode::Forbidden)
+                    .await;
+            }
+            let finished_audit = self.audit_event(
+                context,
+                &admitted.network,
+                Some(admitted.request.authorization()),
+                McpAuditAction::McpRequestFinished,
+                operation.operation_key(),
+                None,
+            );
+            let Some(token) = gate.presented else {
+                // §77: the mint's finished audit must not read as an executed write.
+                let mut mint_audit = finished_audit;
+                mint_audit
+                    .risk_tags
+                    .push(RISK_TAG_CONFIRMATION_MINTED.to_owned());
+                return match self.mint_confirmation(&admitted, &gate, &mint_audit).await {
+                    Ok((token, expires_at)) => {
+                        Ok(ConfirmedOutcome::ConfirmationRequired { token, expires_at })
+                    }
+                    Err(code) => self.denied(context, operation, &admitted, code).await,
+                };
+            };
+            let write = ConfirmedWrite {
+                request: admitted.request.clone(),
+                claim: ConfirmationClaim {
+                    op: gate.op,
+                    target_id: gate.target_id,
+                    successor_id: gate.successor_id,
+                    nonce_sha256: token.sha256(),
+                },
+                request_fingerprint: hex::encode(Sha256::digest(raw_arguments.as_bytes())),
+                reservation_ttl: self.settings.reservation_ttl,
+                finished_audit,
+            };
+            let result = tokio::time::timeout(self.settings.handler_timeout, handler(write))
+                .await
+                .unwrap_or(Err(ErrorCode::DependencyUnavailable));
+            match &result {
+                Ok(_) => {
+                    self.metrics
+                        .increment("mcp_quota_reservations_total", &[("result", "ok")]);
+                    self.metrics
+                        .increment("mcp_bmo_consumed_total", &[("plan_class", "unclassified")]);
+                }
+                Err(ErrorCode::DependencyUnavailable) => {
+                    self.observe_unknown(context, operation, &admitted).await;
+                }
+                Err(code) => {
+                    self.audit(
+                        context,
+                        &admitted.network,
+                        Some(admitted.request.authorization()),
+                        McpAuditAction::McpRequestFinished,
+                        operation.operation_key(),
+                        Some(*code),
+                    )
+                    .await?;
+                }
+            }
+            result.map(ConfirmedOutcome::Executed)
+        }
+        .await;
+        self.record_request(operation, &result);
+        result
+    }
+
+    /// D-B first call: mint the nonce, persist only its digest + the finished audit.
+    async fn mint_confirmation(
+        &self,
+        admitted: &AdmittedOperation,
+        gate: &ConfirmGate,
+        finished_audit: &AuditEvent,
+    ) -> Result<(ConfirmToken, OffsetDateTime), ErrorCode> {
+        let token = humaux_application::supersede::mint_confirm_token();
+        let minted = tokio::time::timeout(
+            self.settings.handler_timeout,
+            confirm_token_repo::mint_with_audit(
+                &self.pool,
+                admitted.request.authorization(),
+                gate.op,
+                gate.target_id,
+                gate.successor_id,
+                gate.ttl,
+                token.sha256(),
+                finished_audit,
+            ),
+        )
+        .await
+        .unwrap_or(Err(ErrorCode::DependencyUnavailable))?;
+        Ok((token, minted.expires_at))
     }
 
     async fn observe_unknown(

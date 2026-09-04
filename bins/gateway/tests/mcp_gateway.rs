@@ -194,6 +194,8 @@ fn application_with_budget(
         RememberEventKind::UserMessage,
         context_bootstrap,
     )
+    .with_confirm_token_ttl(Duration::from_secs(300))
+    .expect("positive fixture confirm-token TTL")
 }
 
 fn semantic_scanner() -> Arc<LocalSecretScanner> {
@@ -2788,6 +2790,10 @@ impl GatewayProcessConfig {
             ("HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS".into(), "2".into()),
             ("HUMAUX_GATEWAY_REPLAY_TTL_SECONDS".into(), "60".into()),
             (
+                "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS".into(),
+                "300".into(),
+            ),
+            (
                 "HUMAUX_GATEWAY_REMEMBER_TENANT_ID".into(),
                 handle.tenant_id.to_string(),
             ),
@@ -3347,4 +3353,483 @@ fn native_mcp_memory_enumeration_fails_whole_revoked_page_and_restarts() {
         });
         },
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// §33.10 rule 9 confirm gate + §36 memory.supersede (ADR-0018)
+// ---------------------------------------------------------------------------------------
+
+fn assert_tool_error(response: &Value, code: &str) {
+    let result = &response["result"];
+    assert_eq!(result["isError"], true, "expected {code}: {response}");
+    assert_eq!(
+        result["structuredContent"]["code"], code,
+        "tool error code: {response}"
+    );
+}
+
+async fn supersede_call(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    target: Uuid,
+    successor: Uuid,
+    token: Option<&str>,
+) -> (u16, Value) {
+    let mut arguments = json!({
+        "action": "supersede",
+        "memory_id": target,
+        "replacement_memory_id": successor,
+    });
+    if let Some(token) = token {
+        arguments["confirm_token"] = Value::String(token.to_owned());
+    }
+    raw_request(
+        address,
+        &tool_call_headers("memory", bearer),
+        &rpc(request_id, "tools/call", call_params("memory", arguments)),
+    )
+    .await
+}
+
+/// First call: must be a success-shaped result carrying the token, never a mutation.
+async fn mint_supersede_token(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    target: Uuid,
+    successor: Uuid,
+) -> String {
+    let (status, response) =
+        supersede_call(address, bearer, request_id, target, successor, None).await;
+    assert_eq!(status, 200, "first call is an MCP result: {response}");
+    let result = &response["result"];
+    assert_ne!(
+        result["isError"], true,
+        "confirmation is not an error: {response}"
+    );
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["confirmation_required"], true, "{response}");
+    assert_eq!(structured["operation"], "memory.supersede", "{response}");
+    assert_eq!(
+        structured["target"]["memory_id"],
+        target.to_string(),
+        "{response}"
+    );
+    assert_eq!(
+        structured["target"]["replacement_memory_id"],
+        successor.to_string(),
+        "{response}"
+    );
+    assert!(structured["expires_at"].is_string(), "{response}");
+    let text: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().expect("text mirror"))
+            .expect("JSON text mirror");
+    assert_eq!(&text, structured, "structured and text results must agree");
+    let token = structured["confirm_token"]
+        .as_str()
+        .expect("confirm_token string")
+        .to_owned();
+    assert_eq!(token.len(), 43, "base64url of 32 bytes: {token}");
+    token
+}
+
+/// (status, superseded_by, superseded_at IS NOT NULL, G59-4 holds) for one row.
+fn memory_state(handle: &mut Handle, memory_id: Uuid) -> (String, Option<Uuid>, bool, bool) {
+    let row = handle
+        .admin
+        .query_one(
+            "SELECT status, superseded_by, superseded_at IS NOT NULL, \
+                    (status='superseded') = (superseded_by IS NOT NULL) \
+             FROM private.memory_records WHERE memory_id=$1",
+            &[&memory_id],
+        )
+        .expect("owner reads memory lifecycle state");
+    (row.get(0), row.get(1), row.get(2), row.get(3))
+}
+
+fn token_consumed(handle: &mut Handle, wire: &str) -> Option<bool> {
+    let digest = humaux_domain::confirm::ConfirmToken::decode(wire)
+        .expect("wire token decodes")
+        .sha256()
+        .to_vec();
+    handle
+        .admin
+        .query_opt(
+            "SELECT consumed_at IS NOT NULL FROM control.confirm_tokens WHERE nonce_sha256=$1",
+            &[&digest],
+        )
+        .expect("owner reads token row")
+        .map(|row| row.get(0))
+}
+
+fn lifecycle_ticket_count(handle: &mut Handle, evidence_id: Uuid) -> i64 {
+    handle
+        .admin
+        .query_one(
+            "SELECT count(*) FROM ops.outbox o \
+             JOIN projection.stream_log s ON s.tenant_id=o.tenant_id AND s.commit_seq=o.commit_seq \
+             WHERE o.tenant_id=$1 AND o.evidence_id=$2 AND o.event_type='MEMORY_LIFECYCLE' \
+               AND s.state='ISSUED' AND s.stream_seq=o.stream_seq",
+            &[&handle.tenant_id, &evidence_id],
+        )
+        .expect("owner counts lifecycle tickets")
+        .get(0)
+}
+
+fn all_rows_satisfy_g59_4(handle: &mut Handle) -> bool {
+    handle
+        .admin
+        .query_one(
+            "SELECT bool_and((status='superseded') = (superseded_by IS NOT NULL)) \
+             FROM private.memory_records WHERE tenant_id=$1",
+            &[&handle.tenant_id],
+        )
+        .expect("owner checks G59-4")
+        .get(0)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One real HTTP fixture carries the whole (a)-(g) acceptance matrix.
+fn native_mcp_memory_supersede_confirm_gate_acceptance() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>("native_mcp_memory_supersede_confirm_gate", |mut handle| {
+        handle.assert_gateway_login();
+        let prefix = format!("msup{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let wire = format!("{prefix}.{}", "e".repeat(32));
+        let credential = handle.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &prefix,
+            &wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+            64,
+        );
+        let peer_user = handle.seed_peer_user();
+        let peer_prefix = format!("mpee{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let peer_wire = format!("{peer_prefix}.{}", "d".repeat(32));
+        let peer = handle.seed_synthetic_service_credential(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &peer_prefix,
+            &peer_wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &peer_wire),
+        );
+        handle
+            .admin
+            .execute(
+                "UPDATE control.api_keys SET user_id=$2 WHERE api_key_id=$1",
+                &[&peer.api_key_id, &peer_user],
+            )
+            .expect("owner rebinds peer credential to the peer user");
+
+        let a = handle.seed_workspace_visible_context_record();
+        let b = handle.seed_workspace_visible_context_record();
+        let c = handle.seed_workspace_visible_context_record();
+        let d = handle.seed_workspace_visible_context_record();
+        let e = handle.seed_workspace_visible_context_record();
+        let fault_fn = format!(
+            "public.humaux_test_supersede_fault_{}",
+            Uuid::now_v7().simple()
+        );
+
+        let runtime_handle = handle.rt.handle().clone();
+        let runtime = runtime_handle
+            .block_on(handle.fresh_runtime())
+            .expect("checked supersede runtime");
+        let app = application(&handle, runtime);
+        runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let bearer = credential.bearer.as_str();
+            let before = blocking_counts(&mut handle);
+
+            // (a) first call: confirmation_required + token, no mutation.
+            let token_ab = mint_supersede_token(address, bearer, 1, a.memory_id, b.memory_id).await;
+            tokio::task::block_in_place(|| {
+                assert_eq!(memory_state(&mut handle, a.memory_id), ("active".into(), None, false, true));
+                assert_eq!(token_consumed(&mut handle, &token_ab), Some(false));
+                let after = counts(&mut handle);
+                assert_eq!(durable_counts(after), durable_counts(before), "no durable write besides the token row");
+                assert_eq!(lifecycle_ticket_count(&mut handle, a.evidence_id), 0);
+            });
+
+            // Fault injection: the UPDATE fails inside the gated transaction -> the token
+            // consume must roll back with it (partial-write sentinel).
+            tokio::task::block_in_place(|| {
+                handle
+                    .admin
+                    .batch_execute(&format!(
+                        "CREATE FUNCTION {fault_fn}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                         BEGIN RAISE EXCEPTION 'injected supersede fault' USING ERRCODE='23514'; END $$; \
+                         CREATE TRIGGER humaux_test_supersede_fault BEFORE UPDATE OF status \
+                         ON private.memory_records FOR EACH ROW WHEN (NEW.status = 'superseded') \
+                         EXECUTE FUNCTION {fault_fn}();"
+                    ))
+                    .expect("owner installs supersede fault");
+            });
+            let (status, faulted) =
+                supersede_call(address, bearer, 2, a.memory_id, b.memory_id, Some(&token_ab)).await;
+            tokio::task::block_in_place(|| {
+                handle
+                    .admin
+                    .batch_execute(&format!(
+                        "DROP TRIGGER humaux_test_supersede_fault ON private.memory_records; \
+                         DROP FUNCTION {fault_fn}();"
+                    ))
+                    .expect("owner removes supersede fault");
+            });
+            assert_eq!(status, 200, "faulted write is a tool error: {faulted}");
+            assert_tool_error(&faulted, "CONFLICT");
+            tokio::task::block_in_place(|| {
+                assert_eq!(token_consumed(&mut handle, &token_ab), Some(false), "token consume rolled back with the failed UPDATE");
+                assert_eq!(memory_state(&mut handle, a.memory_id), ("active".into(), None, false, true));
+                assert_eq!(lifecycle_ticket_count(&mut handle, a.evidence_id), 0);
+                assert_eq!(durable_counts(counts(&mut handle)), durable_counts(before), "reservation/outbox rolled back");
+            });
+
+            // (b) same token now executes: one commit flips status/superseded_by/superseded_at.
+            let (status, done) =
+                supersede_call(address, bearer, 3, a.memory_id, b.memory_id, Some(&token_ab)).await;
+            assert_eq!(status, 200, "confirmed supersede: {done}");
+            let result = &done["result"];
+            assert_ne!(result["isError"], true, "{done}");
+            let structured = &result["structuredContent"];
+            assert_eq!(structured["memory_id"], a.memory_id.to_string(), "{done}");
+            assert_eq!(structured["replacement_memory_id"], b.memory_id.to_string(), "{done}");
+            assert!(structured["superseded_at"].is_string(), "{done}");
+            let stream_seq = structured["stream_seq"].as_i64().expect("stream_seq");
+            assert!(stream_seq >= 1, "{done}");
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, a.memory_id),
+                    ("superseded".into(), Some(b.memory_id), true, true)
+                );
+                assert_eq!(memory_state(&mut handle, b.memory_id), ("active".into(), None, false, true));
+                assert_eq!(token_consumed(&mut handle, &token_ab), Some(true));
+                assert_eq!(lifecycle_ticket_count(&mut handle, a.evidence_id), 1, "MEMORY_LIFECYCLE ticket issued once");
+                // §77: the mint and the executed write share (action, resource_id, result);
+                // only the CONFIRMATION_MINTED risk tag tells an auditor which one mutated.
+                let (minted, executed): (i64, i64) = {
+                    let row = handle
+                        .admin
+                        .query_one(
+                            "SELECT count(*) FILTER (WHERE $2 = ANY(risk_tags)), \
+                                    count(*) FILTER (WHERE NOT ($2 = ANY(risk_tags))) \
+                             FROM control.audit_events WHERE tenant_id=$1 \
+                               AND resource_id='memory.supersede' AND action='MCP_REQUEST_FINISHED' AND result='OK'",
+                            &[&handle.tenant_id, &humaux_domain::confirm::RISK_TAG_CONFIRMATION_MINTED],
+                        )
+                        .expect("owner counts finished audits");
+                    (row.get(0), row.get(1))
+                };
+                assert_eq!((minted, executed), (1, 1), "one tagged mint audit, one untagged executed-write audit");
+                let consumed: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM control.usage_reservations WHERE tenant_id=$1 \
+                         AND operation='memory.supersede' AND status='CONSUMED'",
+                        &[&handle.tenant_id],
+                    )
+                    .expect("owner counts consumed reservations")
+                    .get(0);
+                assert_eq!(consumed, 1, "exactly one BMO consumed, in the same commit");
+            });
+
+            // (c) replaying the consumed token is rejected.
+            let (status, replay) =
+                supersede_call(address, bearer, 4, a.memory_id, b.memory_id, Some(&token_ab)).await;
+            assert_eq!(status, 200, "{replay}");
+            assert_tool_error(&replay, "CONFLICT");
+
+            // (f) superseding an already-superseded row: a fresh token is minted (no row read
+            // on the first call), the confirmed call is CONFLICT and changes nothing.
+            let token_again = mint_supersede_token(address, bearer, 5, a.memory_id, c.memory_id).await;
+            let (status, again) =
+                supersede_call(address, bearer, 6, a.memory_id, c.memory_id, Some(&token_again)).await;
+            assert_eq!(status, 200, "{again}");
+            assert_tool_error(&again, "CONFLICT");
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, a.memory_id),
+                    ("superseded".into(), Some(b.memory_id), true, true)
+                );
+                assert_eq!(token_consumed(&mut handle, &token_again), Some(false), "pair-rule rejection rolls the consume back");
+            });
+
+            // (d) an expired token is rejected.
+            let token_expired = mint_supersede_token(address, bearer, 7, c.memory_id, b.memory_id).await;
+            tokio::task::block_in_place(|| {
+                let digest = humaux_domain::confirm::ConfirmToken::decode(&token_expired)
+                    .expect("wire token")
+                    .sha256()
+                    .to_vec();
+                handle
+                    .admin
+                    .batch_execute("ALTER TABLE control.confirm_tokens DISABLE TRIGGER confirm_token_single_use")
+                    .expect("owner pauses single-use guard for expiry seeding");
+                let expired = handle
+                    .admin
+                    .execute(
+                        "UPDATE control.confirm_tokens SET expires_at = issued_at + interval '1 microsecond' \
+                         WHERE nonce_sha256=$1",
+                        &[&digest],
+                    )
+                    .expect("owner expires token");
+                handle
+                    .admin
+                    .batch_execute("ALTER TABLE control.confirm_tokens ENABLE TRIGGER confirm_token_single_use")
+                    .expect("owner restores single-use guard");
+                assert_eq!(expired, 1);
+            });
+            let (status, expired) =
+                supersede_call(address, bearer, 8, c.memory_id, b.memory_id, Some(&token_expired)).await;
+            assert_eq!(status, 200, "{expired}");
+            assert_tool_error(&expired, "CONFLICT");
+            tokio::task::block_in_place(|| {
+                assert_eq!(memory_state(&mut handle, c.memory_id), ("active".into(), None, false, true));
+                assert_eq!(token_consumed(&mut handle, &token_expired), Some(false));
+            });
+
+            // (e) a token minted for (C -> B) is rejected against D, against a different
+            // successor E (the confirmed action is the pair, not the target alone), against
+            // another operation's binding, and under another user's credential; it still
+            // works for (C -> B) afterwards.
+            let token_c = mint_supersede_token(address, bearer, 9, c.memory_id, b.memory_id).await;
+            let (status, wrong_target) =
+                supersede_call(address, bearer, 10, d.memory_id, b.memory_id, Some(&token_c)).await;
+            assert_eq!(status, 200, "{wrong_target}");
+            assert_tool_error(&wrong_target, "CONFLICT");
+            let (status, wrong_successor) =
+                supersede_call(address, bearer, 17, c.memory_id, e.memory_id, Some(&token_c)).await;
+            assert_eq!(status, 200, "{wrong_successor}");
+            assert_tool_error(&wrong_successor, "CONFLICT");
+            let (status, wrong_user) =
+                supersede_call(address, &peer.bearer, 11, c.memory_id, b.memory_id, Some(&token_c)).await;
+            assert_eq!(status, 200, "{wrong_user}");
+            assert_tool_error(&wrong_user, "CONFLICT");
+            tokio::task::block_in_place(|| {
+                let digest = humaux_domain::confirm::ConfirmToken::decode(&token_c)
+                    .expect("wire token")
+                    .sha256()
+                    .to_vec();
+                let mut gateway = handle.gateway_client().expect("actual gateway login");
+                let mut txn = gateway.transaction().expect("gateway txn");
+                txn.execute(
+                    "SELECT set_config('humaux.tenant_id',$1,true), set_config('humaux.user_id',$2,true)",
+                    &[&handle.tenant_id.to_string(), &handle.user_id.to_string()],
+                )
+                .expect("gateway RLS context");
+                let other_operation = txn
+                    .execute(
+                        "UPDATE control.confirm_tokens SET consumed_at = clock_timestamp() \
+                         WHERE nonce_sha256=$1 AND tenant_id=$2 AND user_id=$3 \
+                           AND operation='memory.archive' AND target_id=$4 AND successor_id=$5 \
+                           AND consumed_at IS NULL AND expires_at > clock_timestamp()",
+                        &[&digest, &handle.tenant_id, &handle.user_id, &c.memory_id, &b.memory_id],
+                    )
+                    .expect("gateway probes the operation binding");
+                txn.rollback().expect("probe rollback");
+                assert_eq!(other_operation, 0, "token is bound to memory.supersede, not another operation");
+                assert_eq!(memory_state(&mut handle, c.memory_id), ("active".into(), None, false, true));
+                assert_eq!(memory_state(&mut handle, d.memory_id), ("active".into(), None, false, true));
+                assert_eq!(memory_state(&mut handle, e.memory_id), ("active".into(), None, false, true));
+                assert_eq!(token_consumed(&mut handle, &token_c), Some(false));
+            });
+            let (status, c_done) =
+                supersede_call(address, bearer, 12, c.memory_id, b.memory_id, Some(&token_c)).await;
+            assert_eq!(status, 200, "{c_done}");
+            assert_ne!(c_done["result"]["isError"], true, "{c_done}");
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, c.memory_id),
+                    ("superseded".into(), Some(b.memory_id), true, true)
+                );
+            });
+
+            // (g) concurrent double-supersede of D with two live tokens: exactly one wins,
+            // the loser's consume rolls back, G59-4 holds on every row throughout. The two
+            // gated transactions are made to overlap in PostgreSQL by holding the tenant's
+            // quota window row from an owner session until both writers are queued on it —
+            // the same-IP preflight limiter (`pg_try_advisory_xact_lock`, fail-closed 429) would
+            // otherwise reject a byte-simultaneous second HTTP request before it reaches the DB.
+            let token_d1 = mint_supersede_token(address, bearer, 13, d.memory_id, e.memory_id).await;
+            let token_d2 = mint_supersede_token(address, bearer, 14, d.memory_id, e.memory_id).await;
+            let mut window_lock = tokio::task::block_in_place(|| {
+                let mut client = handle.owner_client().expect("owner window-lock client");
+                client
+                    .batch_execute("BEGIN")
+                    .expect("owner window-lock txn");
+                let locked = client
+                    .execute(
+                        "SELECT 1 FROM control.quota_windows WHERE tenant_id=$1 FOR UPDATE",
+                        &[&handle.tenant_id],
+                    )
+                    .expect("owner holds the quota window row");
+                assert!(locked >= 1, "fixture tenant has a quota window to hold");
+                client
+            });
+            let left = tokio::spawn({
+                let bearer = bearer.to_owned();
+                let token = token_d1.clone();
+                let (target, successor) = (d.memory_id, e.memory_id);
+                async move { supersede_call(address, &bearer, 15, target, successor, Some(&token)).await }
+            });
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let right = tokio::spawn({
+                let bearer = bearer.to_owned();
+                let token = token_d2.clone();
+                let (target, successor) = (d.memory_id, e.memory_id);
+                async move { supersede_call(address, &bearer, 16, target, successor, Some(&token)).await }
+            });
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::task::block_in_place(|| {
+                let queued: i64 = window_lock
+                    .query_one(
+                        "SELECT count(*) FROM pg_stat_activity WHERE usename='role_gateway' \
+                         AND wait_event_type='Lock' AND state='active'",
+                        &[],
+                    )
+                    .expect("owner observes queued gateway writers")
+                    .get(0);
+                assert_eq!(
+                    queued, 2,
+                    "both gated transactions are open and queued on the DB"
+                );
+                window_lock
+                    .batch_execute("COMMIT")
+                    .expect("release quota window row");
+                // The blocking client is dropped off the async worker (postgres 0.19 drives
+                // its own runtime on drop).
+                drop(window_lock);
+            });
+            let (left, right) = tokio::join!(left, right);
+            let outcomes = [left.expect("left writer"), right.expect("right writer")];
+            let winners = outcomes
+                .iter()
+                .filter(|(status, response)| *status == 200 && response["result"]["isError"] != true)
+                .count();
+            assert_eq!(winners, 1, "exactly one concurrent supersede wins: {outcomes:?}");
+            for (status, response) in &outcomes {
+                assert_eq!(*status, 200, "{response}");
+                if response["result"]["isError"] == true {
+                    assert_tool_error(response, "CONFLICT");
+                }
+            }
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, d.memory_id),
+                    ("superseded".into(), Some(e.memory_id), true, true)
+                );
+                assert_eq!(lifecycle_ticket_count(&mut handle, d.evidence_id), 1, "one ticket for one supersede");
+                let consumed = [&token_d1, &token_d2]
+                    .into_iter()
+                    .filter(|token| token_consumed(&mut handle, token) == Some(true))
+                    .count();
+                assert_eq!(consumed, 1, "the loser's token consume rolled back with its transaction");
+                assert!(all_rows_satisfy_g59_4(&mut handle), "G59-4 never violated");
+            });
+
+            stop_server(server).await.expect("stop supersede server");
+        });
+    });
 }

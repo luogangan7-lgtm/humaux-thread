@@ -7,6 +7,7 @@ use humaux_adapters::{
         MaterializedMemory, MemoryEnumerationParams, materialize_memory_enumeration,
         materialize_memory_get,
     },
+    memory_governance_repo::{self, SupersedeOutcome, SupersedeRequest},
     postgres::RuntimeDbPool,
     read_materialize::MaterializedItem,
 };
@@ -16,7 +17,7 @@ use humaux_domain::{
     identity::AuthorizationScope,
     ids::{Scope, WorkspaceId},
 };
-use humaux_projection::serving::StreamFamily;
+use humaux_projection::{serving::StreamFamily, stream::StreamKey};
 use humaux_retrieval::{
     completeness::{CensusResult, FreshnessClass},
     envelope::{
@@ -29,7 +30,10 @@ use humaux_retrieval::{
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::context::{ContextBootstrap, ContextItem, provenance};
+use crate::{
+    context::{ContextBootstrap, ContextItem, provenance},
+    guard::ConfirmedWrite,
+};
 
 /// Pagination metadata deliberately omits snapshot totals and skipped/lost-access counts.
 #[derive(Serialize)]
@@ -123,6 +127,41 @@ pub(crate) async fn enumerate<T>(
 
 /// Bootstrap policy for this cursor protocol; callers cannot extend it in MCP arguments.
 pub(crate) const ENUMERATION_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// §36 `memory.supersede`, second (confirmed) call. The bound workspace must be the
+/// bootstrap stream's workspace — the same `read_scope` rule `memory.get` applies — so the
+/// lifecycle ticket lands on the stream whose ledger the reads consult.
+pub(crate) async fn supersede(
+    pool: Arc<RuntimeDbPool>,
+    write: ConfirmedWrite,
+    stream: StreamKey,
+    target: MemoryId,
+    successor: MemoryId,
+) -> Result<SupersedeOutcome, ErrorCode> {
+    let workspace = write
+        .request
+        .workspace_id()
+        .ok_or(ErrorCode::DependencyUnavailable)?;
+    let authorization = write.request.authorization().narrow(workspace)?;
+    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
+        return Err(ErrorCode::DependencyUnavailable);
+    }
+    memory_governance_repo::supersede_atomically(
+        &pool,
+        &authorization,
+        SupersedeRequest {
+            request_id: write.request.request_id(),
+            request_fingerprint: write.request_fingerprint,
+            reservation_ttl: write.reservation_ttl,
+            target,
+            successor,
+            stream,
+            claim: write.claim,
+            finished_audit: write.finished_audit,
+        },
+    )
+    .await
+}
 
 fn read_scope(
     authorization: AuthorizationScope,

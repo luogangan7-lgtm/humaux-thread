@@ -793,9 +793,19 @@ mod tests {
                 .as_array()
                 .expect("stable output union")
                 .len(),
-            2
+            4
         );
         assert_eq!(advertised["oneOf"][0]["$ref"], "#/$defs/Envelope");
+        // ADR-0018: memory.supersede's two results are the third and fourth branches.
+        assert_eq!(
+            advertised["oneOf"][2]["$ref"],
+            "#/$defs/ConfirmationRequired"
+        );
+        assert_eq!(advertised["oneOf"][3]["$ref"], "#/$defs/Superseded");
+        assert_eq!(
+            advertised["$defs"]["ConfirmationRequired"]["properties"]["confirmation_required"]["const"],
+            true
+        );
         assert_eq!(
             advertised["oneOf"][1]["properties"]["content"]["$ref"],
             "#/$defs/Envelope"

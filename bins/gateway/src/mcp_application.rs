@@ -5,12 +5,16 @@
 //! every other valid contract is admitted and denied by [`GatewayGuard`] rather
 //! than becoming a successful no-op.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use humaux_adapters::{context_repo::MemoryEnumerationParams, postgres::RuntimeDbPool};
 use humaux_domain::{
-    authority::MemoryId, continuity::ProjectId, error::ErrorCode, ids::WorkspaceId,
+    authority::MemoryId,
+    confirm::{ConfirmToken, DestructiveOp},
+    continuity::ProjectId,
+    error::ErrorCode,
+    ids::WorkspaceId,
 };
 use humaux_protocol::{
     mcp::{McpApplication, McpHttpContext, McpOperation, McpToolArguments, ToolName, ToolOutput},
@@ -18,26 +22,29 @@ use humaux_protocol::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json, value::RawValue};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
     context::{self, ContextBootstrap},
     continuity,
-    guard::GatewayGuard,
+    guard::{ConfirmGate, ConfirmedOutcome, GatewayGuard},
     memory,
     recall::{self, RecallSearchRequest, SemanticRecallRuntime},
     remember::{self, PreparedEvidencePayload, RememberEventKind, RememberPolicy},
 };
 
-/// The only real MCP business routes currently available from Gateway.
-pub const SUPPORTED_OPERATION_KEYS: [&str; 6] = [
+/// The only real MCP business routes currently available from Gateway. Confirm-gated
+/// destructive keys come from the closed `DestructiveOp` table (§78.2, ADR-0018), never a
+/// second literal.
+pub const SUPPORTED_OPERATION_KEYS: [&str; 7] = [
     "remember.put",
     "recall.search",
     "context.assemble",
     "memory.get",
     "memory.enumerate",
     "continuity.get",
+    DestructiveOp::MemorySupersede.operation_key(),
 ];
 
 /// Bootstrap-owned, authenticated MCP dispatch.  It has no client-selected
@@ -51,6 +58,9 @@ pub struct GatewayMcpApplication {
     remember_event_kind: RememberEventKind,
     context_bootstrap: ContextBootstrap,
     semantic_recall: Option<Arc<SemanticRecallRuntime>>,
+    /// §33.10 rule 9 token lifetime (ADR-0018). `None` keeps every confirm-gated route
+    /// failing closed through `reject_unsupported`.
+    confirm_token_ttl: Option<Duration>,
     #[cfg(test)]
     trusted_continuity_scope: Option<humaux_domain::identity::AuthorizationScope>,
 }
@@ -74,9 +84,20 @@ impl GatewayMcpApplication {
             remember_event_kind,
             context_bootstrap,
             semantic_recall: None,
+            confirm_token_ttl: None,
             #[cfg(test)]
             trusted_continuity_scope: None,
         }
+    }
+
+    /// Enables the confirm-gated governance routes with the bootstrap-owned token TTL
+    /// (`HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS`, §78.1). A zero TTL is refused.
+    pub fn with_confirm_token_ttl(mut self, ttl: Duration) -> Result<Self, ErrorCode> {
+        if ttl.is_zero() {
+            return Err(ErrorCode::InvalidInput);
+        }
+        self.confirm_token_ttl = Some(ttl);
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -385,6 +406,87 @@ impl GatewayMcpApplication {
         Ok(pending.finish())
     }
 
+    /// §36 `memory.supersede` through the shared §33.10 confirm gate (ADR-0018). The
+    /// schema carries no `workspace_id`: the route is the credential's bound workspace,
+    /// which must be the bootstrap projection stream's workspace (same rule as `memory.get`).
+    async fn memory_supersede(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        raw_arguments: &str,
+        value: &Value,
+    ) -> Result<ToolOutput, ErrorCode> {
+        let target = MemoryId::parse(value["memory_id"].as_str().ok_or(ErrorCode::InvalidInput)?)?;
+        let successor = MemoryId::parse(
+            value["replacement_memory_id"]
+                .as_str()
+                .ok_or(ErrorCode::InvalidInput)?,
+        )?;
+        let presented = value
+            .get("confirm_token")
+            .map(|token| {
+                token
+                    .as_str()
+                    .ok_or(ErrorCode::InvalidInput)
+                    .and_then(ConfirmToken::decode)
+            })
+            .transpose()?;
+        let Some(ttl) = self.confirm_token_ttl else {
+            return self.reject_unsupported(context, operation, None).await;
+        };
+        let pool = self.runtime_pool.clone();
+        let stream = self.context_bootstrap.stream.clone();
+        let outcome = self
+            .guard
+            .run_confirmed_write(
+                context,
+                operation,
+                None,
+                raw_arguments,
+                ConfirmGate {
+                    op: DestructiveOp::MemorySupersede,
+                    target_id: target.0,
+                    successor_id: Some(successor.0),
+                    presented,
+                    ttl,
+                },
+                move |write| async move {
+                    memory::supersede(pool, write, stream, target, successor).await
+                },
+            )
+            .await?;
+        match outcome {
+            ConfirmedOutcome::ConfirmationRequired { token, expires_at } => {
+                let value = json!({
+                    "confirmation_required": true,
+                    "confirm_token": token.encode(),
+                    "operation": operation.operation_key(),
+                    "target": {
+                        "memory_id": target.0,
+                        "replacement_memory_id": successor.0,
+                    },
+                    "expires_at": rfc3339(expires_at)?,
+                });
+                // Both supersede results are branches of memory.output.schema.json (tools/list
+                // advertises it); validate like every other memory arm so the wire contract
+                // cannot drift silently.
+                self.catalog.validate_output(ToolName::Memory, &value)?;
+                output(value)
+            }
+            ConfirmedOutcome::Executed(done) => {
+                let value = json!({
+                    "memory_id": target.0,
+                    "replacement_memory_id": successor.0,
+                    "superseded_at": rfc3339(done.superseded_at)?,
+                    "stream_seq": done.stream_seq,
+                    "commit_seq": done.commit_seq,
+                });
+                self.catalog.validate_output(ToolName::Memory, &value)?;
+                output(value)
+            }
+        }
+    }
+
     async fn recall_search(
         &self,
         context: &McpHttpContext,
@@ -505,6 +607,10 @@ impl McpApplication for GatewayMcpApplication {
                 self.continuity_get(context, &operation, &raw_arguments, &value)
                     .await
             }
+            key if key == DestructiveOp::MemorySupersede.operation_key() => {
+                self.memory_supersede(context, &operation, &raw_arguments, &value)
+                    .await
+            }
             _ => {
                 self.reject_unsupported(context, &operation, workspace(&value)?)
                     .await
@@ -551,6 +657,10 @@ fn workspace(value: &Value) -> Result<Option<WorkspaceId>, ErrorCode> {
     Ok(Some(WorkspaceId(
         Uuid::parse_str(value).map_err(|_| ErrorCode::InvalidInput)?,
     )))
+}
+
+fn rfc3339(at: OffsetDateTime) -> Result<String, ErrorCode> {
+    at.format(&Rfc3339).map_err(|_| ErrorCode::Internal)
 }
 
 fn output(structured_content: Value) -> Result<ToolOutput, ErrorCode> {

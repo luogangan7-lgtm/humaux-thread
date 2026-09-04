@@ -1,0 +1,313 @@
+//! `adapters::confirm_token_repo` — `control.confirm_tokens` (migration 0148, ADR-0018).
+//!
+//! Two writes, both `role_gateway`, both FORCE-RLS tenant-scoped:
+//! - [`mint_with_audit`]: first call of a §33.10 two-step destructive action. One
+//!   transaction = token row + the operation's `MCP_REQUEST_FINISHED` audit; no other
+//!   durable write (D-B). Stores only `sha256(nonce)`. The audit row carries
+//!   `RISK_TAG_CONFIRMATION_MINTED` so it never counts as an executed destructive write.
+//! - [`consume_in_txn`]: second call. One `UPDATE ... WHERE <full binding> AND consumed_at
+//!   IS NULL AND expires_at > now RETURNING` inside the *caller's* transaction, so the
+//!   token is consumed atomically with the mutation it gates. Zero rows — replayed, expired,
+//!   or bound to another (tenant, user, operation, target, successor) — is one indistinguishable
+//!   `Conflict` (D-B: never a silent success, never an existence oracle).
+
+use std::time::Duration;
+
+use humaux_domain::{
+    audit::{AuditEvent, McpAuditAction},
+    confirm::{DestructiveOp, RISK_TAG_CONFIRMATION_MINTED},
+    error::ErrorCode,
+    identity::AuthorizationScope,
+};
+use sqlx::types::time::OffsetDateTime;
+use uuid::Uuid;
+
+use crate::{
+    postgres::RuntimeDbPool,
+    request_guard_repo::{self, AuditTenant},
+};
+
+type Txn<'c> = sqlx::Transaction<'c, sqlx::Postgres>;
+
+/// A presented token's server-side binding, carried from the gateway gate into the
+/// adapter transaction that consumes it. Holds only the digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmationClaim {
+    pub op: DestructiveOp,
+    pub target_id: Uuid,
+    /// The operation's second argument (`memory.supersede`: `replacement_memory_id`). Part of
+    /// the binding: a token confirms one (target, successor) pair, not a target alone.
+    pub successor_id: Option<Uuid>,
+    pub nonce_sha256: [u8; 32],
+}
+
+/// The only consume predicate: the full binding, unconsumed, unexpired. `successor_id` uses
+/// `IS NOT DISTINCT FROM` so a NULL-bound token matches only a NULL claim. Pinned by
+/// `consume_predicate_is_the_full_binding` — the owner trigger in 0148 masks a dropped
+/// expiry/consumed clause at the DB layer, so the adapter predicate needs its own witness.
+const CONSUME_SQL: &str = "UPDATE control.confirm_tokens SET consumed_at = clock_timestamp() \
+     WHERE nonce_sha256 = $1 AND tenant_id = $2 AND user_id = $3 \
+       AND operation = $4 AND target_id = $5 AND successor_id IS NOT DISTINCT FROM $6 \
+       AND consumed_at IS NULL AND expires_at > clock_timestamp() \
+     RETURNING confirm_token_id";
+
+/// What the first call hands back to the client alongside the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MintedConfirmation {
+    pub expires_at: OffsetDateTime,
+}
+
+fn db_error(error: sqlx::Error) -> ErrorCode {
+    match error {
+        sqlx::Error::RowNotFound => ErrorCode::NotFound,
+        sqlx::Error::Database(ref db) => match db.code().as_deref() {
+            Some("42501") => ErrorCode::Forbidden,
+            Some("23503") => ErrorCode::TenantBoundary,
+            Some("23505" | "40001" | "40P01" | "55P03" | "23514") => ErrorCode::Conflict,
+            Some("22023" | "22P02" | "22003") => ErrorCode::InvalidInput,
+            _ => ErrorCode::Internal,
+        },
+        _ => ErrorCode::DependencyUnavailable,
+    }
+}
+
+pub(crate) async fn set_authorization_local(
+    txn: &mut Txn<'_>,
+    auth: &AuthorizationScope,
+) -> Result<(), ErrorCode> {
+    sqlx::query(
+        "SELECT set_config('humaux.tenant_id',$1,true), set_config('humaux.user_id',$2,true)",
+    )
+    .bind(auth.tenant_id().0.to_string())
+    .bind(
+        auth.user_id()
+            .map(|id| id.0)
+            .unwrap_or_else(Uuid::nil)
+            .to_string(),
+    )
+    .execute(&mut **txn)
+    .await
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// Pure input contract of [`mint_with_audit`]: a token is always bound to a real user
+/// (D-A), lives for a positive server-policy TTL, binds a successor distinct from the target,
+/// and is audited as exactly this operation *tagged as a mint* (never as an executed write).
+fn validate_mint(
+    auth: &AuthorizationScope,
+    op: DestructiveOp,
+    target_id: Uuid,
+    successor_id: Option<Uuid>,
+    ttl: Duration,
+    finished_audit: &AuditEvent,
+) -> Result<(Uuid, f64), ErrorCode> {
+    let user_id = auth.user_id().ok_or(ErrorCode::Unauthorized)?.0;
+    if auth.tenant_id().0.is_nil() || auth.principal().0.is_nil() || user_id.is_nil() {
+        return Err(ErrorCode::Unauthorized);
+    }
+    if ttl.is_zero() || ttl > Duration::from_secs(86_400 * 366) || successor_id == Some(target_id) {
+        return Err(ErrorCode::InvalidInput);
+    }
+    if finished_audit.tenant_id != auth.tenant_id()
+        || finished_audit.actor_id != auth.principal().0.to_string()
+        || finished_audit.action != McpAuditAction::McpRequestFinished.as_str()
+        || finished_audit.resource_id != op.operation_key()
+        || finished_audit.result != "OK"
+        || !finished_audit
+            .risk_tags
+            .iter()
+            .any(|tag| tag == RISK_TAG_CONFIRMATION_MINTED)
+    {
+        return Err(ErrorCode::InvalidInput);
+    }
+    Ok((user_id, ttl.as_secs_f64()))
+}
+
+/// D-B first call: token row + finished audit in one commit; nothing else durable.
+#[allow(clippy::too_many_arguments)] // ADR-0018 D-A binding is 8 explicit facts (pool, scope, op, target, successor, nonce, ttl, audit); bundling them into a struct would hide the binding the reviewer must read.
+pub async fn mint_with_audit(
+    pool: &RuntimeDbPool,
+    auth: &AuthorizationScope,
+    op: DestructiveOp,
+    target_id: Uuid,
+    successor_id: Option<Uuid>,
+    ttl: Duration,
+    nonce_sha256: [u8; 32],
+    finished_audit: &AuditEvent,
+) -> Result<MintedConfirmation, ErrorCode> {
+    let (user_id, ttl_seconds) =
+        validate_mint(auth, op, target_id, successor_id, ttl, finished_audit)?;
+    let mut txn = pool.pool().begin().await.map_err(db_error)?;
+    set_authorization_local(&mut txn, auth).await?;
+    let expires_at: OffsetDateTime = sqlx::query_scalar(
+        "INSERT INTO control.confirm_tokens \
+           (tenant_id, user_id, operation, target_id, successor_id, nonce_sha256, expires_at) \
+         VALUES ($1, $2, $3, $4, $7, $5, clock_timestamp() + make_interval(secs => $6)) \
+         RETURNING expires_at",
+    )
+    .bind(auth.tenant_id().0)
+    .bind(user_id)
+    .bind(op.operation_key())
+    .bind(target_id)
+    .bind(nonce_sha256.as_slice())
+    .bind(ttl_seconds)
+    .bind(successor_id)
+    .fetch_one(&mut *txn)
+    .await
+    .map_err(db_error)?;
+    request_guard_repo::audit_event_insert_in_txn(
+        &mut txn,
+        AuditTenant::Authenticated(auth),
+        finished_audit,
+    )
+    .await?;
+    txn.commit().await.map_err(db_error)?;
+    Ok(MintedConfirmation { expires_at })
+}
+
+/// D-A/D-B second call: verify + consume in the caller's transaction. Exactly one row may
+/// match the full binding while unconsumed and unexpired; anything else is `Conflict`.
+pub async fn consume_in_txn(
+    txn: &mut Txn<'_>,
+    auth: &AuthorizationScope,
+    claim: &ConfirmationClaim,
+) -> Result<(), ErrorCode> {
+    let user_id = auth.user_id().ok_or(ErrorCode::Unauthorized)?.0;
+    set_authorization_local(txn, auth).await?;
+    let consumed: Option<Uuid> = sqlx::query_scalar(CONSUME_SQL)
+        .bind(claim.nonce_sha256.as_slice())
+        .bind(auth.tenant_id().0)
+        .bind(user_id)
+        .bind(claim.op.operation_key())
+        .bind(claim.target_id)
+        .bind(claim.successor_id)
+        .fetch_optional(&mut **txn)
+        .await
+        .map_err(db_error)?;
+    consumed.map(|_| ()).ok_or(ErrorCode::Conflict)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use humaux_domain::{
+        audit::{AuditEventId, AuditMetadata, SYSTEM_TENANT_ID},
+        identity::{BoundedSet, PrincipalId},
+        ids::{TenantId, UserId, WorkspaceId},
+    };
+
+    use super::*;
+
+    fn scope(user: Option<Uuid>) -> AuthorizationScope {
+        AuthorizationScope::new(
+            TenantId(Uuid::now_v7()),
+            PrincipalId(Uuid::now_v7()),
+            user.map(UserId),
+            BoundedSet::new([WorkspaceId(Uuid::now_v7())]).unwrap(),
+        )
+    }
+
+    fn audit(auth: &AuthorizationScope, resource: &str, result: &str) -> AuditEvent {
+        AuditEvent {
+            event_id: AuditEventId::new(),
+            ts: SystemTime::now(),
+            tenant_id: auth.tenant_id(),
+            actor_type: "SERVICE_CREDENTIAL".into(),
+            actor_id: auth.principal().0.to_string(),
+            action: McpAuditAction::McpRequestFinished.as_str().into(),
+            resource_type: "MCP_OPERATION".into(),
+            resource_id: resource.into(),
+            result: result.into(),
+            request_id: Uuid::now_v7().to_string(),
+            trace_id: String::new(),
+            client_ip: "127.0.0.1".into(),
+            user_agent_hash: String::new(),
+            risk_tags: vec![RISK_TAG_CONFIRMATION_MINTED.to_owned()],
+            before_fingerprint: None,
+            after_fingerprint: None,
+            metadata: AuditMetadata::new(),
+        }
+    }
+
+    #[test]
+    fn mint_contract_requires_user_positive_ttl_pair_and_tagged_audit() {
+        let op = DestructiveOp::MemorySupersede;
+        let auth = scope(Some(Uuid::now_v7()));
+        let (target, successor) = (Uuid::now_v7(), Some(Uuid::now_v7()));
+        let ttl = Duration::from_secs(60);
+        let ok = audit(&auth, op.operation_key(), "OK");
+        let mint = |auth: &AuthorizationScope, successor, ttl, event: &AuditEvent| {
+            validate_mint(auth, op, target, successor, ttl, event).err()
+        };
+        assert_eq!(mint(&auth, successor, ttl, &ok), None);
+        assert_eq!(mint(&auth, None, ttl, &ok), None);
+        assert_eq!(
+            mint(&scope(None), successor, ttl, &ok),
+            Some(ErrorCode::Unauthorized)
+        );
+        assert_eq!(
+            mint(&auth, successor, Duration::ZERO, &ok),
+            Some(ErrorCode::InvalidInput)
+        );
+        assert_eq!(
+            mint(&auth, Some(target), ttl, &ok),
+            Some(ErrorCode::InvalidInput),
+            "a token never binds a self-supersede"
+        );
+        assert_eq!(
+            mint(&auth, successor, ttl, &audit(&auth, "memory.get", "OK")),
+            Some(ErrorCode::InvalidInput)
+        );
+        assert_eq!(
+            mint(
+                &auth,
+                successor,
+                ttl,
+                &audit(&auth, op.operation_key(), "CONFLICT")
+            ),
+            Some(ErrorCode::InvalidInput)
+        );
+        let mut untagged = ok.clone();
+        untagged.risk_tags.clear();
+        assert_eq!(
+            mint(&auth, successor, ttl, &untagged),
+            Some(ErrorCode::InvalidInput),
+            "a mint audit indistinguishable from an executed write is refused"
+        );
+        let mut foreign = ok.clone();
+        foreign.tenant_id = SYSTEM_TENANT_ID;
+        assert_eq!(
+            mint(&auth, successor, ttl, &foreign),
+            Some(ErrorCode::InvalidInput)
+        );
+    }
+
+    /// Fault-injection witness for the adapter predicate: the 0148 owner trigger rejects a
+    /// consume past `expires_at` on its own, so a live test cannot tell "adapter refused"
+    /// from "trigger refused". Every clause of the binding is pinned here instead.
+    #[test]
+    fn consume_predicate_is_the_full_binding() {
+        for clause in [
+            "nonce_sha256 = $1",
+            "tenant_id = $2",
+            "user_id = $3",
+            "operation = $4",
+            "target_id = $5",
+            "successor_id IS NOT DISTINCT FROM $6",
+            "consumed_at IS NULL",
+            "expires_at > clock_timestamp()",
+            "RETURNING confirm_token_id",
+        ] {
+            assert!(
+                CONSUME_SQL.contains(clause),
+                "consume predicate lost `{clause}`"
+            );
+        }
+        assert!(
+            CONSUME_SQL
+                .starts_with("UPDATE control.confirm_tokens SET consumed_at = clock_timestamp()")
+        );
+    }
+}

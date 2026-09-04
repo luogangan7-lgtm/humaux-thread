@@ -6,6 +6,7 @@
 pub mod audit_sink;
 pub mod batch;
 pub mod byok;
+pub mod confirm_token_repo;
 pub mod consolidate_repo;
 pub mod consolidation_reasoner;
 pub mod context_repo;
@@ -27,6 +28,7 @@ pub mod exact_census;
 pub mod forget_repo;
 pub mod jobs;
 pub mod mechanism_observation;
+pub mod memory_governance_repo;
 pub mod model_call_ledger;
 pub mod openbao;
 pub mod operation_receipt;

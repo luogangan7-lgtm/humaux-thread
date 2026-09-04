@@ -467,6 +467,16 @@ const MATRIX: &[Cell] = &[
         ["SELECT", "INSERT"]
     ),
     cell!("control.operation_receipts", "role_maintenance", ["SELECT"]),
+    // 0148 (ADR-0018): §33.10 rule 9 confirm tokens. Gateway mints (INSERT), verifies and
+    // consumes (column-scoped UPDATE(consumed_at)) inside the gated mutation's own transaction;
+    // maintenance may only read. No role deletes or reopens a token.
+    cell!(
+        "control.confirm_tokens",
+        "role_gateway",
+        ["SELECT", "INSERT"],
+        [("UPDATE", ["consumed_at"])]
+    ),
+    cell!("control.confirm_tokens", "role_maintenance", ["SELECT"]),
     // §19 native retrieval query disclosure source: only the retrieval worker may create it;
     // maintenance may revoke it without rewriting the immutable identity.
     cell!(
@@ -596,7 +606,7 @@ const MATRIX: &[Cell] = &[
         "private.memory_records",
         "role_gateway",
         ["SELECT", "INSERT"],
-        [("UPDATE", ["status", "superseded_by"])]
+        [("UPDATE", ["status", "superseded_by", "superseded_at"])]
     ),
     cell!(
         "private.memory_records",

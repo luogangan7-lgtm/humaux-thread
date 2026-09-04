@@ -7,6 +7,7 @@ pub mod audit;
 pub mod authority;
 pub mod boundary;
 pub mod code;
+pub mod confirm;
 pub mod consolidate;
 pub mod context;
 pub mod continuity;
