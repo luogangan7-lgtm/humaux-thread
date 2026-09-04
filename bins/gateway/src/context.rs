@@ -70,6 +70,11 @@ impl ContextBootstrap {
 pub struct ContextItem {
     pub memory_id: Uuid,
     pub content: Value,
+    /// Q3/ADR-0024 D-C: `true` only on `memory.get` of an archived Memory. recall/context/
+    /// enumerate never emit an archived item, so the field is skipped when `false` and those
+    /// wire shapes stay byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 /// Composes existing contracts without putting manifest arrays into Envelope report fields.
@@ -187,9 +192,12 @@ fn into_result<T>(
         .items
         .into_iter()
         .map(|item| match item {
-            MaterializedItem::Memory { memory_id, content } => {
-                Ok(ContextItem { memory_id, content })
-            }
+            MaterializedItem::Memory { memory_id, content } => Ok(ContextItem {
+                memory_id,
+                content,
+                // context.assemble excludes archived rows at the candidate step (D-C).
+                archived: false,
+            }),
             _ => Err(ErrorCode::Internal),
         })
         .collect::<Result<Vec<_>, _>>()?;

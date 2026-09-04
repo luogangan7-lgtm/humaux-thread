@@ -1,0 +1,43 @@
+# ADR-0024: `memory.archive` / `memory.unarchive` —— 隐藏而不销毁（研究问题 Q3）
+
+日期：2026-09-05 · 状态：Accepted · 影响面：`migrations/0150_memory_records_archive.{sql,manifest.toml}`（`private.memory_records.archived_at` 列 + partial index `WHERE archived_at IS NULL` + `role_gateway` 列级 `UPDATE(archived_at)` grant）/ `crates/domain/src/confirm.rs`（`DestructiveOp::MemoryArchive`/`MemoryUnarchive`）/ `crates/domain/src/context.rs`（穷尽性一臂）/ `crates/application/src/archive.rs`（新，纯 `archive_allowed`）/ `crates/adapters/src/{memory_governance_repo.rs,context_repo.rs,read_materialize.rs?,retrieve.rs}` / `bins/gateway/src/{mcp_application.rs,memory.rs,context.rs}` / `contracts/mcp/{memory.schema.json,memory.output.schema.json,context.output.schema.json}` / `docs/architecture/Baseline_2.9.md §36` / `xtask/src/rls_check.rs` / `bins/gateway/tests/mcp_gateway.rs`。无新 `ErrorCode`。前置：卡 1（confirm 门 / `DestructiveOp`）、卡 3（`ops.memory_lifecycle_events` + `ops.append_memory_lifecycle` + `lifecycle_head_event_id` + `ConflictReason`）已在树上。
+
+## 背景
+`archive` 是 §36 治理动词表里**唯一在数据模型里完全没有落点**的一个：`memory.pin` 在 §36 有 canonical 语义（:8570），而 `archive` 只出现在动词列表里、零 worked semantics。`'archived'` 既不在 `private.memory_records` 的 status CHECK（0004:131，只允许 active/superseded/revoked/expired），也不在 `humaux_domain::authority::AuthorityStatus`（同四态）。它是 agent 说「别再给我看这条，但别销毁它」的唯一方式——今天的替代品是 `forget`，而 forget 不可逆。它需要一条迁移才能写第一行代码，所以自成一卡。
+
+## 研究问题 Q3（第五个 AuthorityStatus 还是独立列）
+**决定：独立的 `archived_at timestamptz NULL` 列，不是第五个 `AuthorityStatus`。**
+
+- AuthorityStatus 参与 §10/§59.1 的裁决总序（`is_active` 门、G59-4 配对）。archive 与裁决**正交**：一条被 archive 的 memory 保留它原本的 `status`（几乎总是 `active`），它只是被藏起来。把 archive 塞进 status 会污染裁决语义，并要动 G59-4 那条冻结配对 `(status='superseded') = (superseded_by IS NOT NULL)`——那是 §59.1 逐字引用、注错闸冻结的不变量。
+- 独立列让 archive 成为一个纯粹的可见性事实：一个 `WHERE archived_at IS NULL` 谓词，partial index 支撑，加/去 archive 都不碰 status/superseded_by，G59-4 恒真。
+- **注错（验收）**：把 status CHECK 放宽却不扩 Rust `AuthorityStatus` 枚举，`memory_governance_repo` 的 wire-parse 测试 `status_wire_forms_match_the_g59_check_list`（断言四个 wire 形 + `status("ARCHIVED")==Err(Internal)`）必须转红——DB/Rust 枚举镜像（§78.2）由此独立于本卡守住。archive 不走 status，所以这条冻结镜像本卡不动。
+
+## 决定
+1. **迁移 0150（D-A）**：`private.memory_records` 加 `archived_at timestamptz NULL` + partial index `idx_memory_records_live (tenant_id) WHERE archived_at IS NULL`（recall/context/enumerate 每条非 get 读都带这个谓词，索引因此不随 archive 增长而膨胀）。`role_gateway` 的列级 `UPDATE` 由 `(status,superseded_by,superseded_at,lifecycle_head_event_id)` 扩到再加 `archived_at`（表级 UPDATE 仍不授予）；`xtask/src/rls_check.rs` 的 §6.2.2 矩阵在同一 PR 加这一列。EXPAND_CONTRACT，前向修复，0149 之后第一个空号。G59-4 与 status CHECK 不动。
+2. **`DestructiveOp::MemoryArchive` / `MemoryUnarchive`（D-B，复用卡 1 的门）**：两个动词都走同一个 confirm 门（`run_confirmed_write`，`successor_id=None`），不开第二条 token 路径。门机制（`guard.rs`/`confirm_token_repo.rs`）对 op 泛型、`control.confirm_tokens.operation` 只有正则 CHECK（`^[a-z][a-z0-9_.]{0,95}$`），故两者零改动即接纳新 key。`DestructiveOp::ALL` 长度 4→6。
+3. **`archive_or_unarchive_atomically`（一个事务，archive/unarchive 共用一臂，op 与仲裁谓词是唯一差别——与 pin/unpin 同形复用）**：幂等预检（命中同 key+fingerprint 的 ARCHIVE/RESTORE 事件 ⇒ 直接返回原成功，绝不二次 BMO/consume/mutate）→ consume token（坏 token = `Conflict`，`isError`）→ 可见性 + 当前 `archived_at`（不可见 = `NOT_FOUND`）→ `archive_allowed`（已在目标态 ⇒ 返回 `ALREADY_IN_STATE` 并让事务回滚，token 消费撤回）→ reserve BMO（只在成功路径，拒不计费）→ 发**新** `MEMORY_LIFECYCLE` 票（D-D）→ append `ARCHIVE`（reason `USER_ARCHIVE`，**无 `undo_deadline`**）或 `RESTORE`（`undoes_event_id` 指向 ARCHIVE head，reason 空）→ 仲裁 `UPDATE ... SET archived_at=[clock_timestamp()|NULL], lifecycle_head_event_id=新事件 WHERE archived_at IS [NULL|NOT NULL]`（0 行 = `Conflict`，把票和事件一起回滚，与 supersede 的 `WHERE status='active'` 同形，并发竞态在行锁下裁决）→ 结算。只写 `role_gateway` 有 grant 的列（`archived_at` + `lifecycle_head_event_id`），永不碰 `status`/`updated_at`——archive 不是 status 转换。
+4. **撤销方向（Q2 一致）**：archive **任何时候可 unarchive**（无 undo 窗口，`undo_deadline` 为 NULL），但**永不经 `memory.restore`**：`domain::lifecycle::restore_allowed` 把 ARCHIVE head 判为 `NOT_REVERSIBLE`（1202）。unarchive 追加的 `RESTORE` 事件本身不可撤（RESTORE head ⇒ 1202）。这与卡 3「RESTORE 只撤 SUPERSEDE」不冲突：unarchive 是独立动词，它撤的是 ARCHIVE head，不复用 `memory.restore` 路由。
+5. **幂等（D-B，与 restore 同）**：`idempotency_key = hex(sha256(nonce))`。重放同一次已确认的 archive/unarchive 呈同一 token ⇒ 靠 `ops.memory_lifecycle_events` 的 `UNIQUE(tenant, actor, idempotency_key)` 返回原成功；**语义级**的重复（archive 一条已 archive 的行 / unarchive 一条在世的行）是成功形状的 `{code:CONFLICT, reason:1201 ALREADY_IN_STATE}`，非第 19 个 `ErrorCode`（§52.1 冻结 18 不变）。
+6. **读取侧（D-C）**：
+   - `recall.search`：`adapters::retrieve::materialize_private_read_serving_in_txn` 在拿到 Qdrant 解析出的 `serving.memory_ids` 后、hydrate 前，按 `archived_at IS NULL` 过滤（保序，只丢 archived 的 id）。Qdrant 点保留，只 PG 过滤。
+   - `context.assemble`：三个 mandatory selector 的候选 WHERE（`PROJECT_CONSTRAINTS_WHERE`/`USER_CORRECTIONS_WHERE`/`EXPLICIT_BINDINGS_WHERE`）与 pinned lane 的候选 WHERE 各加 `AND m.archived_at IS NULL`，使 handoff 计数与 body 集一致（否则 archived 候选进 handoff 却被 body 排除，触发 ids≠body_ids 的一致性错误）。
+   - `memory.enumerate`：默认候选查询加 `AND archived_at IS NULL`（默认排除；显式包含 archived 的 filter 是后续扩展，本卡不做）。
+   - `memory.get`：**不排除**。`materialize_memory_get` 额外读 `archived_at IS NOT NULL` 填 `MaterializedMemory.archived`，gateway 在 `memory.get` 的单条 item 上带 `archived:true`（`ContextItem.archived`，`skip_serializing_if` 使 recall/context/enumerate 的线格式逐字不变；`contracts/mcp/context.output.schema.json` 的 item schema 加一个可选 `archived` boolean）。
+7. **投影（D-D）**：archive/unarchive 各发一张 `MEMORY_LIFECYCLE` 票（`issue_lifecycle_ticket`，与 supersede/restore 同一机制），投影 worker 据此刷新点 payload。若不存在 `archived` payload 标志，worker 走既有的 `SKIPPED_BY_POLICY`/`lifecycle_not_projected`——无遗留缺口，`projection_worker.rs`/`qdrant.rs` 本卡零改动。
+
+## 越界改动（需主线裁决，与 ADR-0018/0019/0020 同一情形）
+卡片的「允许改动文件」清单未列全其决定所必然触及的文件；下列改动各由本卡某条决定直接要求，逐条记录：
+- `crates/domain/src/confirm.rs`：加 `DestructiveOp::MemoryArchive`/`MemoryUnarchive`（confirm.rs 文档本就写「每个被门控的 op 加一个变体」，D-B）。
+- `crates/domain/src/context.rs`：`from_consumed_confirmation` 的 match 因穷尽性加一臂（archive/unarchive 不是 pin/unpin ⇒ `MissingConfirmation`）。
+- `crates/adapters/src/context_repo.rs`：候选 WHERE 排除 archived（D-C）；`materialize_memory_get` 读 archived flag（D-C）；`apply_binding_write` 的 match 因穷尽性加一臂。
+- `crates/adapters/src/retrieve.rs`：recall hydrate 排除 archived（D-C，卡片正文点名此文件）。
+- `xtask/src/rls_check.rs`：§6.2.2 矩阵加 `archived_at` 列（D-A，grant 变更必须同 PR 配矩阵，§6.2.2/§48.2）。
+- `contracts/mcp/context.output.schema.json`：Envelope item schema 加可选 `archived`（D-C，`memory.get` 带 flag）。
+
+## 验收
+`bins/gateway/tests/mcp_gateway.rs::native_mcp_memory_archive_confirm_gate_acceptance`（真 role_gateway LOGIN + 真 PG）：archive 前 `memory.get` 返回该行、无 archived flag；archive（确认）⇒ `archived_at` 被设、`status='active'` 与 G59-4 恒真、一条 ARCHIVE 事件；`memory.get` 仍返回该行且 `archived:true`；`memory.enumerate` 默认排除该行；`memory.restore` 于 ARCHIVE head ⇒ CONFLICT 1202 NOT_REVERSIBLE、零变更；重复 archive ⇒ 1201 ALREADY_IN_STATE；unarchive ⇒ `archived_at` 清空、head 是指向 ARCHIVE 的 RESTORE；`memory.get`/`enumerate` 复见该行；重复 unarchive ⇒ 1201。`native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance`（真 Qdrant）：archive 一条被 recall 命中的 memory 后，`recall.search` 只返回在世的那条、`memory.get` 仍返回被 archive 的那条且 `archived:true`；unarchive 后 recall 复见两条。单测：`humaux-application --lib archive`（`archive_allowed` 对称：archive 在世/unarchive 已 archive 才 productive，否则 1201）。门：`cargo xtask migrate`（0150 应用、drift 0）/ `rls-check` / `architecture-check` / `cargo test -p humaux-gateway --test mcp_gateway` / clippy / fmt / secret grep。
+
+## 主线裁定与覆盖边界（2026-09-05）
+- **flaky barrier（native_mcp_context_records_final_metric_only_after_quota_settlement）**：0150 给 memory_records 加列+部分索引后统计过期，首个冷查询计划劣化导致 gateway 错过测试的 2s read-barrier 窗口（约 1/3 冷跑红）。forward-fix 迁移 **0151_analyze_memory_records_after_archive**（`ANALYZE private.memory_records;`，class FORWARD_ONLY）刷新统计后 4/4 稳定通过。0150 已应用不可改（§46 checksum 钉死），故独立迁移。
+- **protocol 目录测试**：实现者给 memory.output.schema.json 加 `ArchiveChanged` 分支使 oneOf 7→8，主线同步 crates/protocol 的 `memory_output_accepts_bare_and_snapshot_page_shapes`：断言 8 分支、ArchiveChanged@6 / ConflictReason@7。属主线跨卡契约。
+- **recall.search 排除已归档行的覆盖边界（诚实登记）**：recall / context / enumerate 三条读路径共用 `read_materialize::final_memory_ids_in_txn(include_archived)`，谓词 `AND (m.archived_at IS NULL OR $3::boolean)` 是排除的**唯一闸门**；memory.get 是唯一传 `true` 的调用方。enumerate 的排除已由 `native_mcp_memory_archive_confirm_gate_acceptance` 直接实测（同一函数、同一 `false` 字面量）。**recall 路径的活证人无法在 worker-less 测试台产出**：归档 `third` 会在其证据处于 serving 投影时发一张 MEMORY_LIFECYCLE 票，无投影 worker 消费该票时 recall 命中 `RetrieveError::ConflictingOverlayEvidence`（与 supersede/restore 的 pre-worker 窗口同类），返回 DEPENDENCY_UNAVAILABLE——先前把「归档→recall」塞进 #[ignore] 的真 Qdrant 测试因此在 request 1 就红，已回退。recall 路径的 `include_archived=false` 由构造保证（与 enumerate 同函数同字面量），**活链证人归入卡 24 全链演练**（投影 worker 在跑时：归档一条语义命中行→recall 不返回它、memory.get 仍返回 archived:true）。

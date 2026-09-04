@@ -752,6 +752,327 @@ pub async fn restore_atomically(
     }))
 }
 
+// ===========================================================================================
+// memory.archive / memory.unarchive — flip private.memory_records.archived_at (ADR-0024 Q3).
+// ===========================================================================================
+
+/// Trusted application inputs for `memory.archive` / `memory.unarchive` (built by the gateway
+/// gate). `op` is `MemoryArchive` or `MemoryUnarchive`; the claim carries the same op.
+pub struct ArchiveRequest {
+    pub request_id: Uuid,
+    pub request_fingerprint: String,
+    pub reservation_ttl: Duration,
+    pub target: MemoryId,
+    pub stream: StreamKey,
+    pub claim: ConfirmationClaim,
+    pub finished_audit: AuditEvent,
+    /// `MemoryArchive` sets `archived_at`; `MemoryUnarchive` clears it.
+    pub op: DestructiveOp,
+}
+
+/// A successful archive/unarchive: the flag flipped, on a new MEMORY_LIFECYCLE stream seq.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveDone {
+    /// The instant the flag flipped (`archived_at` for archive; the clear instant for unarchive).
+    pub changed_at: OffsetDateTime,
+    pub stream_seq: i64,
+    pub commit_seq: i64,
+}
+
+/// The outcome of an archive/unarchive attempt. `Refused(ALREADY_IN_STATE)` is a success-shaped
+/// business conflict (D-B): archive of an archived Memory / unarchive of a live one — the
+/// transaction rolled back, nothing mutated, the token stays unconsumed. Infra/visibility
+/// failures still return `Err(ErrorCode)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveResult {
+    Done(ArchiveDone),
+    Refused(ConflictReason),
+}
+
+/// Pure input contract, mirroring [`validate_restore`]: the claim is `op` on exactly this
+/// target with no successor, the stream is the caller's tenant, and the audit describes exactly
+/// this executed operation (never carrying the mint tag).
+fn validate_archive(auth: &AuthorizationScope, request: &ArchiveRequest) -> Result<(), ErrorCode> {
+    if !matches!(
+        request.op,
+        DestructiveOp::MemoryArchive | DestructiveOp::MemoryUnarchive
+    ) {
+        return Err(ErrorCode::InvalidInput);
+    }
+    if auth.tenant_id().0.is_nil() || auth.principal().0.is_nil() || auth.user_id().is_none() {
+        return Err(ErrorCode::Unauthorized);
+    }
+    if request.request_id.is_nil()
+        || request.reservation_ttl.is_zero()
+        || request.request_fingerprint.len() != 64
+        || !request
+            .request_fingerprint
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(ErrorCode::InvalidInput);
+    }
+    if request.claim.op != request.op
+        || request.claim.target_id != request.target.0
+        || request.claim.successor_id.is_some()
+    {
+        return Err(ErrorCode::Conflict);
+    }
+    if request.stream.tenant_id != auth.tenant_id() {
+        return Err(ErrorCode::TenantBoundary);
+    }
+    let event = &request.finished_audit;
+    if event.tenant_id != auth.tenant_id()
+        || event.actor_id != auth.principal().0.to_string()
+        || event.request_id != request.request_id.to_string()
+        || event.action != McpAuditAction::McpRequestFinished.as_str()
+        || event.resource_id != request.op.operation_key()
+        || event.result != "OK"
+        || event
+            .risk_tags
+            .iter()
+            .any(|tag| tag == RISK_TAG_CONFIRMATION_MINTED)
+    {
+        return Err(ErrorCode::InvalidInput);
+    }
+    Ok(())
+}
+
+/// Visibility of the target + its current `archived_at` and its NEWEST `ARCHIVE` lifecycle
+/// event, under the caller's RLS. A row the caller cannot read is `NotFound`, never a hint.
+///
+/// The ARCHIVE event (not `lifecycle_head_event_id`) is what an unarchive RESTORE undoes: a
+/// supersede between the archive and the unarchive moves the head to that SUPERSEDE, so using
+/// the head would point the RESTORE's `undoes_event_id` at the wrong event.
+async fn archive_state(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    auth: &AuthorizationScope,
+    target: MemoryId,
+) -> Result<(bool, Option<Uuid>), ErrorCode> {
+    let readable = context_repo::readable_memory_ids(txn, auth, &[target.0]).await?;
+    if !readable.contains(&target.0) {
+        return Err(ErrorCode::NotFound);
+    }
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT (archived_at IS NOT NULL) AS archived, \
+                (SELECT event_id FROM ops.memory_lifecycle_events \
+                  WHERE tenant_id = $1 AND memory_id = $2 AND op = 'ARCHIVE' \
+                  ORDER BY event_seq DESC LIMIT 1) AS archive_event \
+         FROM private.memory_records WHERE tenant_id = $1 AND memory_id = $2",
+    )
+    .bind(auth.tenant_id().0)
+    .bind(target.0)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(db_error)?
+    .ok_or(ErrorCode::NotFound)?;
+    Ok((
+        row.try_get("archived").map_err(|_| ErrorCode::Internal)?,
+        row.try_get("archive_event")
+            .map_err(|_| ErrorCode::Internal)?,
+    ))
+}
+
+/// D-B, atomically. One gated transaction shared by both directions (the `op` and the
+/// `archived_at IS [NOT] NULL` arbiter predicate are the only differences — same one-arm reuse
+/// as pin/unpin). Step order: idempotency pre-check (replay before consume), then consume
+/// token, then visibility + current archived state, then `archive_allowed` (ALREADY_IN_STATE
+/// rolls back), then reserve BMO, then a new MEMORY_LIFECYCLE ticket, then append ARCHIVE
+/// (reason USER_ARCHIVE, no deadline) or RESTORE (undoes the newest ARCHIVE event), then the
+/// `archived_at` UPDATE (sole arbiter, 0 rows = Conflict), then settle.
+// ADR-0024 D-B: one gated transaction whose step ORDER is the contract (idempotency before
+// consume, arbiter UPDATE last). Splitting it would scatter that ordering and hide the rollback
+// boundary the reviewer must read as one sequence.
+#[allow(clippy::too_many_lines)]
+pub async fn archive_or_unarchive_atomically(
+    pool: &RuntimeDbPool,
+    auth: &AuthorizationScope,
+    request: ArchiveRequest,
+) -> Result<ArchiveResult, ErrorCode> {
+    validate_archive(auth, &request)?;
+    let op = request.op;
+    let idempotency_key = lifecycle_idempotency_key(&request.claim);
+    let mut txn = pool.pool().begin().await.map_err(db_error)?;
+    confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
+
+    // Idempotency: a replayed confirmed call returns the original success, never a second
+    // BMO/consume/mutation. A different request under the same key is ALREADY_IN_STATE.
+    use sqlx::Row;
+    if let Some(row) = sqlx::query(
+        "SELECT op, request_fingerprint, stream_seq, commit_seq, created_at \
+         FROM ops.memory_lifecycle_events \
+         WHERE tenant_id = $1 AND actor_principal_id = $2 AND idempotency_key = $3",
+    )
+    .bind(auth.tenant_id().0)
+    .bind(auth.principal().0)
+    .bind(&idempotency_key)
+    .fetch_optional(&mut *txn)
+    .await
+    .map_err(db_error)?
+    {
+        let stored_op: String = row.try_get("op").map_err(|_| ErrorCode::Internal)?;
+        let fingerprint: String = row
+            .try_get("request_fingerprint")
+            .map_err(|_| ErrorCode::Internal)?;
+        let expected_op = match op {
+            DestructiveOp::MemoryArchive => LifecycleOp::Archive,
+            _ => LifecycleOp::Restore,
+        };
+        if stored_op != expected_op.as_db_str() || fingerprint != request.request_fingerprint {
+            return Ok(ArchiveResult::Refused(ConflictReason::ALREADY_IN_STATE));
+        }
+        let (Some(stream_seq), Some(commit_seq)) = (
+            row.try_get::<Option<i64>, _>("stream_seq")
+                .map_err(|_| ErrorCode::Internal)?,
+            row.try_get::<Option<i64>, _>("commit_seq")
+                .map_err(|_| ErrorCode::Internal)?,
+        ) else {
+            return Err(ErrorCode::Internal);
+        };
+        let changed_at: OffsetDateTime =
+            row.try_get("created_at").map_err(|_| ErrorCode::Internal)?;
+        return Ok(ArchiveResult::Done(ArchiveDone {
+            changed_at,
+            stream_seq,
+            commit_seq,
+        }));
+    }
+
+    // Token first (same as supersede/restore): a replayed/expired/misbound token is Conflict.
+    confirm_token_repo::consume_in_txn(&mut txn, auth, &request.claim).await?;
+
+    let (currently_archived, archive_event) = archive_state(&mut txn, auth, request.target).await?;
+    if let Err(reason) = humaux_application::archive::archive_allowed(op, currently_archived) {
+        // ALREADY_IN_STATE: return the reason and let the transaction roll back (consume undone).
+        return Ok(ArchiveResult::Refused(reason));
+    }
+
+    let reservation = match quota_repo::reserve_bmo_in_txn(
+        &mut txn,
+        auth,
+        request.request_id,
+        op.operation_key(),
+        &request.request_fingerprint,
+        request.reservation_ttl,
+    )
+    .await?
+    {
+        ReserveResult::Created(reservation) => reservation,
+        ReserveResult::Existing(_) => return Err(ErrorCode::Conflict),
+    };
+    let mut quota_audit = request.finished_audit.clone();
+    quota_audit.event_id = AuditEventId::new();
+    quota_audit.action = McpAuditAction::McpQuotaReserved.as_str().to_owned();
+    request_guard_repo::audit_event_insert_in_txn(
+        &mut txn,
+        AuditTenant::Authenticated(auth),
+        &quota_audit,
+    )
+    .await?;
+
+    // New ticket (new stream seq) + lifecycle event before the arbiter UPDATE; a 0-row UPDATE
+    // (a concurrent racer flipped the flag first) rolls both back.
+    let (stream_seq, commit_seq) =
+        issue_lifecycle_ticket(&mut txn, auth, &request.stream, request.target).await?;
+    let (lifecycle_op, reason, undoes) = match op {
+        DestructiveOp::MemoryArchive => (
+            LifecycleOp::Archive,
+            Some(LifecycleReason::UserArchive),
+            None,
+        ),
+        // Unarchive undoes the memory's newest ARCHIVE event (D-B): a RESTORE naming that
+        // event, no fresh reason. NOT the current lifecycle head — a supersede between the
+        // archive and this unarchive moves the head to that SUPERSEDE, and naming it would
+        // record a false undo edge in the append-only log.
+        _ => (
+            LifecycleOp::Restore,
+            None,
+            Some(archive_event.ok_or(ErrorCode::Internal)?),
+        ),
+    };
+    let event_id = append_lifecycle_event(
+        &mut txn,
+        auth,
+        lifecycle_op,
+        reason,
+        request.target.0,
+        None,
+        undoes,
+        // No undo_deadline: archive is unarchivable any time; the RESTORE undo is terminal.
+        None,
+        &idempotency_key,
+        &request.request_fingerprint,
+        stream_seq,
+        commit_seq,
+    )
+    .await?;
+
+    // Sole arbiter (mirrors supersede's WHERE status='active'): PostgreSQL re-evaluates the
+    // `archived_at IS [NOT] NULL` predicate under the row lock, so the concurrent
+    // archive/unarchive race and "already in that state" both resolve here, never on a stale
+    // pre-read. Only columns role_gateway holds a grant for (§6.2.2): archived_at +
+    // lifecycle_head_event_id — never status/updated_at. G59-4 is untouched (archive is not a
+    // status transition). Return clock_timestamp() as the change instant.
+    let arbiter = match op {
+        DestructiveOp::MemoryArchive => {
+            "UPDATE private.memory_records \
+                SET archived_at = clock_timestamp(), lifecycle_head_event_id = $3 \
+              WHERE tenant_id = $2 AND memory_id = $1 AND archived_at IS NULL \
+              RETURNING archived_at"
+        }
+        _ => {
+            "UPDATE private.memory_records \
+                SET archived_at = NULL, lifecycle_head_event_id = $3 \
+              WHERE tenant_id = $2 AND memory_id = $1 AND archived_at IS NOT NULL \
+              RETURNING clock_timestamp()"
+        }
+    };
+    let changed_at: Option<OffsetDateTime> = sqlx::query_scalar(arbiter)
+        .bind(request.target.0)
+        .bind(auth.tenant_id().0)
+        .bind(event_id)
+        .fetch_optional(&mut *txn)
+        .await
+        .map_err(db_error)?;
+    let changed_at = changed_at.ok_or(ErrorCode::Conflict)?;
+
+    if quota_repo::finish_reservation_in_txn(&mut txn, auth, &reservation, true).await?
+        != ReservationStatus::Consumed
+    {
+        return Err(ErrorCode::Conflict);
+    }
+    quota_audit.event_id = AuditEventId::new();
+    quota_audit.action = McpAuditAction::McpQuotaConsumed.as_str().to_owned();
+    request_guard_repo::audit_event_insert_in_txn(
+        &mut txn,
+        AuditTenant::Authenticated(auth),
+        &quota_audit,
+    )
+    .await?;
+    request_guard_repo::audit_event_insert_in_txn(
+        &mut txn,
+        AuditTenant::Authenticated(auth),
+        &request.finished_audit,
+    )
+    .await?;
+    let finalized_at: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *txn)
+        .await
+        .map_err(db_error)?;
+    if finalized_at >= reservation.expires_at() {
+        return Err(ErrorCode::Conflict);
+    }
+    txn.commit()
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    Ok(ArchiveResult::Done(ArchiveDone {
+        changed_at,
+        stream_seq,
+        commit_seq,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::SystemTime;

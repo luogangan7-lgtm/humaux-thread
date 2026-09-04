@@ -32,15 +32,24 @@ pub enum DestructiveOp {
     /// §36 `memory.restore`: undo a SUPERSEDE within the window (ADR-0020). Not itself
     /// destructive, but it runs through the same confirm gate (reuse, no second token path).
     MemoryRestore,
+    /// §36 `memory.archive`: hide one Memory from recall/context without destroying it
+    /// (ADR-0024, Q3). Sets `archived_at`; not a fifth AuthorityStatus. Runs the same gate.
+    MemoryArchive,
+    /// §36 `memory.unarchive`: clear `archived_at`, making the Memory visible again
+    /// (ADR-0024). The inverse of archive — never reachable via `memory.restore` (an ARCHIVE
+    /// head is NOT_REVERSIBLE there). Same gate, no successor.
+    MemoryUnarchive,
 }
 
 impl DestructiveOp {
     /// Every variant, for table-driven lookups.
-    pub const ALL: [DestructiveOp; 4] = [
+    pub const ALL: [DestructiveOp; 6] = [
         DestructiveOp::MemorySupersede,
         DestructiveOp::MemoryPin,
         DestructiveOp::MemoryUnpin,
         DestructiveOp::MemoryRestore,
+        DestructiveOp::MemoryArchive,
+        DestructiveOp::MemoryUnarchive,
     ];
 
     /// Canonical operation key (contracts/mcp/*.schema.json `x-humaux-operation.operation_key`).
@@ -50,6 +59,8 @@ impl DestructiveOp {
             DestructiveOp::MemoryPin => "memory.pin",
             DestructiveOp::MemoryUnpin => "memory.unpin",
             DestructiveOp::MemoryRestore => "memory.restore",
+            DestructiveOp::MemoryArchive => "memory.archive",
+            DestructiveOp::MemoryUnarchive => "memory.unarchive",
         }
     }
 

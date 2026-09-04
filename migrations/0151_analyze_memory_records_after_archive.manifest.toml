@@ -1,0 +1,21 @@
+# §46.1 manifest. Forward-fix after 0150: refresh planner statistics for private.memory_records
+# so the new archived_at column + partial index plan well on the first cold read. No schema
+# change, no grant change, no DML — ANALYZE only.
+
+migration_id = "0151_analyze_memory_records_after_archive"
+class = "FORWARD_ONLY"
+
+precheck = """
+select exists(select 1 from information_schema.columns
+              where table_schema='private' and table_name='memory_records'
+                and column_name='archived_at') as precheck_ok
+"""
+
+postcheck = """
+select (select (last_analyze is not null or last_autoanalyze is not null)
+        from pg_stat_all_tables
+        where schemaname='private' and relname='memory_records') as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. ANALYZE is idempotent maintenance with no schema or grant effect; nothing to roll back."
+backup_restore_requirement = "none (ANALYZE only; no data or schema touched)."

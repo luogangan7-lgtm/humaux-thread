@@ -8589,6 +8589,15 @@ upsert private.context_bindings(mode=PINNED)
 
 不是在 Memory body 上打一个容易被 consolidation 覆盖的布尔字段。`unpin` 只撤 binding，不改 Evidence/Memory。自动 consolidation、retention suggestion 均不能修改 PINNED/MANDATORY binding；用户显式操作可以。
 
+`memory.archive` / `memory.unarchive` 的 canonical 语义（ADR-0024，研究问题 Q3）：
+
+```text
+archive:   private.memory_records.archived_at := clock_timestamp()
+unarchive: private.memory_records.archived_at := NULL
+```
+
+archive 是「别再给我看这条，但别销毁它」——`forget` 的可逆替代品。落点是 `private.memory_records` 上一个 `archived_at timestamptz NULL` 列（+ partial index `WHERE archived_at IS NULL`），**不是第五个 `AuthorityStatus`**：archive 与裁决正交，一条被 archive 的 memory 保留原 `status`（通常 `active`），G59-4 的 `(status='superseded') = (superseded_by IS NOT NULL)` 冻结配对**逐字不动**。读取侧（D-C）：`recall.search` 与 `context.assemble` 在 PG hydrate 步排除 `archived_at IS NOT NULL` 的行（Qdrant 点保留，只 PG 过滤）；`memory.get` 仍按 id 返回该行并带 `archived:true`；`memory.enumerate` 默认排除。写入侧（D-B）复用卡 3 的 lifecycle 日志：archive 追加一条 `ARCHIVE` 事件（reason `USER_ARCHIVE`，**无 `undo_deadline`**——任何时候可 `unarchive`，但**永不经 `memory.restore`**：`restore_allowed` 把 ARCHIVE head 判为 `NOT_REVERSIBLE`），并盖 `archived_at`；unarchive 追加一条 `undoes_event_id` 指向那条 ARCHIVE 的 `RESTORE` 事件并清 `archived_at`。两者都经卡 1 的 confirm 门（`DestructiveOp::MemoryArchive`/`MemoryUnarchive`，无 successor），且幂等：archive 一条已 archive 的行、unarchive 一条在世的行都是成功形状的 `{code:CONFLICT, reason:1201 ALREADY_IN_STATE}`（非第 19 个 `ErrorCode`）。archive/unarchive 各发一张 `MEMORY_LIFECYCLE` 票，投影 worker 据此刷新点 payload（无 `archived` payload 标志则 `SKIPPED_BY_POLICY`/`lifecycle_not_projected`，无遗留缺口）。
+
 ---
 
 # 37. Retention / Deletion

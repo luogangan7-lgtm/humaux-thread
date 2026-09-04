@@ -106,7 +106,7 @@
           "items": {
             "type": "object",
             "required": ["memory_id","content"],
-            "properties": {"memory_id":{"type":"string","format":"uuid"},"content":{}},
+            "properties": {"memory_id":{"type":"string","format":"uuid"},"content":{},"archived":{"type":"boolean"}},
             "additionalProperties": false
           }
         },

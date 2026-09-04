@@ -628,7 +628,10 @@ const MATRIX: &[Cell] = &[
                 "status",
                 "superseded_by",
                 "superseded_at",
-                "lifecycle_head_event_id"
+                "lifecycle_head_event_id",
+                // migration 0150 (ADR-0024): memory.archive/unarchive stamps/clears this in the
+                // same UPDATE that flips lifecycle_head_event_id. Column-level only, never table.
+                "archived_at"
             ]
         )]
     ),

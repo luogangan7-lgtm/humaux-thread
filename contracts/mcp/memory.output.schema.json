@@ -31,7 +31,9 @@
             "memory.supersede",
             "memory.pin",
             "memory.unpin",
-            "memory.restore"
+            "memory.restore",
+            "memory.archive",
+            "memory.unarchive"
           ]
         },
         "target": {
@@ -178,6 +180,42 @@
       },
       "additionalProperties": false
     },
+    "ArchiveChanged": {
+      "type": "object",
+      "description": "memory.archive / memory.unarchive executed (§36/ADR-0024, Q3): archive set private.memory_records.archived_at (the memory is now hidden from recall/context/enumerate, still returned by memory.get); unarchive cleared it. NOT a status transition — G59-4 is untouched. One MEMORY_LIFECYCLE ticket was issued (new stream_seq) so the projection worker can refresh the point payload. Exactly one of archived_at / unarchived_at is present.",
+      "required": [
+        "memory_id",
+        "stream_seq",
+        "commit_seq"
+      ],
+      "properties": {
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "archived_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "unarchived_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "stream_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "commit_seq": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["archived_at"], "not": { "required": ["unarchived_at"] } },
+        { "required": ["unarchived_at"], "not": { "required": ["archived_at"] } }
+      ]
+    },
     "Superseded": {
       "type": "object",
       "description": "memory.supersede executed (§36): target now status=superseded with superseded_by=replacement_memory_id; one MEMORY_LIFECYCLE ticket was issued on the workspace projection stream (§15.7).",
@@ -263,6 +301,9 @@
     },
     {
       "$ref": "#/$defs/Restored"
+    },
+    {
+      "$ref": "#/$defs/ArchiveChanged"
     },
     {
       "$ref": "#/$defs/ConflictReason"

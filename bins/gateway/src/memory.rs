@@ -8,7 +8,8 @@ use humaux_adapters::{
         MemoryEnumerationParams, materialize_memory_enumeration, materialize_memory_get,
     },
     memory_governance_repo::{
-        self, RestoreRequest, RestoreResult, SupersedeOutcome, SupersedeRequest,
+        self, ArchiveRequest, ArchiveResult, RestoreRequest, RestoreResult, SupersedeOutcome,
+        SupersedeRequest,
     },
     postgres::RuntimeDbPool,
     read_materialize::MaterializedItem,
@@ -75,12 +76,14 @@ pub(crate) async fn get<T>(
         memory_id,
     )
     .await?;
+    let archived = materialized.archived;
     accept_memory_envelope(
         materialized,
         &request,
         &bootstrap.binary_build,
         "direct_get",
         false,
+        archived,
         accept,
     )
 }
@@ -119,6 +122,7 @@ pub(crate) async fn enumerate<T>(
         &bootstrap.binary_build,
         "enumerate",
         pagination.next_cursor.is_some(),
+        false,
         |content| {
             accept(EnumerationResult {
                 content,
@@ -202,6 +206,41 @@ pub(crate) async fn restore(
     .await
 }
 
+/// §36 `memory.archive` / `memory.unarchive`, second (confirmed) call (ADR-0024). Same
+/// `read_scope` workspace rule as the other governance writes: the lifecycle ticket lands on
+/// the bootstrap stream's workspace. `op` is `MemoryArchive` or `MemoryUnarchive`.
+pub(crate) async fn archive(
+    pool: Arc<RuntimeDbPool>,
+    write: ConfirmedWrite,
+    stream: StreamKey,
+    op: DestructiveOp,
+    target: MemoryId,
+) -> Result<ArchiveResult, ErrorCode> {
+    let workspace = write
+        .request
+        .workspace_id()
+        .ok_or(ErrorCode::DependencyUnavailable)?;
+    let authorization = write.request.authorization().narrow(workspace)?;
+    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
+        return Err(ErrorCode::DependencyUnavailable);
+    }
+    memory_governance_repo::archive_or_unarchive_atomically(
+        &pool,
+        &authorization,
+        ArchiveRequest {
+            request_id: write.request.request_id(),
+            request_fingerprint: write.request_fingerprint,
+            reservation_ttl: write.reservation_ttl,
+            target,
+            stream,
+            claim: write.claim,
+            finished_audit: write.finished_audit,
+            op,
+        },
+    )
+    .await
+}
+
 /// §36 `memory.pin` / `memory.unpin`, second (confirmed) call (ADR-0019). The PINNED row is
 /// scoped to the credential's bound workspace, which must be the bootstrap stream's
 /// workspace — the same rule `memory.get` / `memory.supersede` apply — so `context.assemble`
@@ -237,9 +276,10 @@ pub(crate) async fn write_binding(
         DestructiveOp::MemoryUnpin => {
             context_repo::unpin_confirmed(&pool, &authorization, request).await
         }
-        DestructiveOp::MemorySupersede | DestructiveOp::MemoryRestore => {
-            Err(ErrorCode::InvalidInput)
-        }
+        DestructiveOp::MemorySupersede
+        | DestructiveOp::MemoryRestore
+        | DestructiveOp::MemoryArchive
+        | DestructiveOp::MemoryUnarchive => Err(ErrorCode::InvalidInput),
     }
 }
 
@@ -280,6 +320,7 @@ fn accept_memory_envelope<T>(
     binary_build: &str,
     lane: &str,
     truncated: bool,
+    archived: bool,
     accept: impl FnOnce(Envelope<ContextItem>) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
     let items = materialized
@@ -287,9 +328,13 @@ fn accept_memory_envelope<T>(
         .items
         .into_iter()
         .map(|item| match item {
-            MaterializedItem::Memory { memory_id, content } => {
-                Ok(ContextItem { memory_id, content })
-            }
+            // Q3/ADR-0024 D-C: memory.get carries `archived` on its single item; enumerate
+            // never returns an archived row so it passes `false`.
+            MaterializedItem::Memory { memory_id, content } => Ok(ContextItem {
+                memory_id,
+                content,
+                archived,
+            }),
             _ => Err(ErrorCode::Internal),
         })
         .collect::<Result<Vec<_>, _>>()?;

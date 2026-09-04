@@ -1,0 +1,40 @@
+# §46.1 migration manifest. ADR-0024 (§36 memory.archive/unarchive / Q3 ARCHIVE ruling): one
+# nullable column `archived_at` on private.memory_records, one partial index
+# (WHERE archived_at IS NULL), and one column-level UPDATE grant to role_gateway. NOT a fifth
+# AuthorityStatus — the status CHECK and G59-4 pairing are untouched. No DML, no data touched;
+# §46 forward-fix (EXPAND_CONTRACT, next free number after 0149).
+
+migration_id = "0150_memory_records_archive"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('private.memory_records') is not null
+ and not exists(select 1 from information_schema.columns
+                where table_schema='private' and table_name='memory_records'
+                  and column_name='archived_at')
+ and not has_column_privilege('role_gateway','private.memory_records','archived_at','UPDATE')
+ as precheck_ok
+"""
+
+postcheck = """
+select exists(select 1 from information_schema.columns
+              where table_schema='private' and table_name='memory_records'
+                and column_name='archived_at' and data_type='timestamp with time zone'
+                and is_nullable='YES')
+ and has_column_privilege('role_gateway','private.memory_records','archived_at','UPDATE')
+ and not has_table_privilege('role_gateway','private.memory_records','UPDATE')
+ and not has_column_privilege('role_private_worker','private.memory_records','archived_at','UPDATE')
+ and not has_column_privilege('role_retrieval_worker','private.memory_records','archived_at','UPDATE')
+ and exists(select 1 from pg_indexes where schemaname='private'
+            and tablename='memory_records' and indexname='idx_memory_records_live'
+            and indexdef like '%archived_at IS NULL%')
+ and (select count(*) from information_schema.check_constraints cc
+      join information_schema.constraint_column_usage ccu
+        on ccu.constraint_name = cc.constraint_name
+      where ccu.table_schema='private' and ccu.table_name='memory_records'
+        and cc.check_clause like '%superseded_by%') >= 1
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. archived_at is a nullable visibility flag; dropping the column reverts every archived memory to visible (safe — recall/context simply stop filtering). The archived_at column grant is only ever narrowed by a later migration, never widened to table-level UPDATE. G59-4 and the status CHECK are not touched by this migration and need no rollback consideration."
+backup_restore_requirement = "none (one nullable column + one partial index + one column-level grant; no row data touched)."

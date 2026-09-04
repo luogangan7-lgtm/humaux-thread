@@ -175,7 +175,8 @@ pub async fn probe_selectors(pool: &RuntimeDbPool) -> Result<[SelectorAvailabili
 const PROJECT_CONSTRAINTS_WHERE: &str = "m.tenant_id = $1 \
      AND m.authority_class = 'ProjectConstraint' \
      AND m.status = 'active' \
-     AND m.superseded_by IS NULL";
+     AND m.superseded_by IS NULL \
+     AND m.archived_at IS NULL";
 
 /// `user_confirmed_corrections_v1` 的 WHERE。
 ///
@@ -186,6 +187,7 @@ const USER_CORRECTIONS_WHERE: &str = "m.tenant_id = $1 \
      AND m.authority_class = 'UserCorrection' \
      AND m.status = 'active' \
      AND m.superseded_by IS NULL \
+     AND m.archived_at IS NULL \
      AND EXISTS ( \
        SELECT 1 FROM private.memory_evidence me \
        JOIN private.evidence_objects eo ON eo.evidence_id = me.evidence_id \
@@ -200,6 +202,7 @@ const USER_CORRECTIONS_WHERE: &str = "m.tenant_id = $1 \
 const EXPLICIT_BINDINGS_WHERE: &str = "m.tenant_id = $1 \
      AND m.status = 'active' \
      AND m.superseded_by IS NULL \
+     AND m.archived_at IS NULL \
      AND m.authority_class IN ('ProjectConstraint', 'ExplicitTaskContext') \
      AND EXISTS ( \
        SELECT 1 FROM private.context_bindings cb \
@@ -601,6 +604,10 @@ pub struct MaterializedMemory {
     pub bodies: MaterializedBodies,
     pub ledger: humaux_retrieval::completeness::LedgerClosure,
     pub grounding: GroundingBlock,
+    /// Q3/ADR-0024 D-C: `true` when this memory carries `archived_at IS NOT NULL`. Only
+    /// `memory.get` ever sees `true` — recall/context/enumerate exclude archived rows at their
+    /// candidate step, so those paths always set `false`.
+    pub archived: bool,
 }
 
 /// Trusted server-side pagination inputs for an authorized memory enumeration.
@@ -709,13 +716,13 @@ pub async fn materialize_memory_enumeration(
         )
         .await?
     } else {
-        let rows = sqlx::query("SELECT memory_id FROM private.memory_records WHERE tenant_id=$1 AND status='active' AND superseded_by IS NULL ORDER BY memory_id DESC")
+        let rows = sqlx::query("SELECT memory_id FROM private.memory_records WHERE tenant_id=$1 AND status='active' AND superseded_by IS NULL AND archived_at IS NULL ORDER BY memory_id DESC")
             .bind(authorization.tenant_id().0).fetch_all(&mut *txn).await.map_err(|_| ErrorCode::DependencyUnavailable)?;
         let candidates = rows
             .into_iter()
             .map(|row| row.try_get("memory_id").map_err(|_| ErrorCode::Internal))
             .collect::<Result<Vec<Uuid>, ErrorCode>>()?;
-        let ids = final_memory_ids_in_txn(&mut txn, &authorization, &candidates).await?;
+        let ids = final_memory_ids_in_txn(&mut txn, &authorization, &candidates, false).await?;
         begin_authorized_snapshot_in_txn(
             &mut txn,
             authorization.tenant_id().0,
@@ -738,6 +745,7 @@ pub async fn materialize_memory_enumeration(
         validated_key,
         &page.items,
         &[],
+        false,
     )
     .await?;
     let materialized = body_ids(&bodies);
@@ -764,6 +772,9 @@ pub async fn materialize_memory_enumeration(
             bodies,
             ledger,
             grounding,
+            // Enumerate excludes archived rows at the candidate query (D-C), so a page never
+            // carries one; the flag is meaningful only on memory.get.
+            archived: false,
         },
     })
 }
@@ -942,6 +953,19 @@ pub async fn materialize_memory_get(
     )
     .await?;
     let grounding = direct_get_grounding_in_txn(&mut txn, authorization, memory_id).await?;
+    // Q3/ADR-0024 D-C: memory.get surfaces `archived:true` (unlike recall/context, which
+    // exclude archived rows). The body read above already gated visibility/lifecycle, so a
+    // missing row here is an invariant break in the same RR snapshot, not an existence oracle.
+    let archived: bool = sqlx::query_scalar(
+        "SELECT archived_at IS NOT NULL FROM private.memory_records \
+         WHERE tenant_id = $1 AND memory_id = $2",
+    )
+    .bind(authorization.tenant_id().0)
+    .bind(memory_id.0)
+    .fetch_optional(&mut *txn)
+    .await
+    .map_err(|_| ErrorCode::DependencyUnavailable)?
+    .ok_or(ErrorCode::Internal)?;
     let ledger = close_ledger_in_txn(&mut txn, validated_key)
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
@@ -952,6 +976,7 @@ pub async fn materialize_memory_get(
         bodies,
         ledger,
         grounding,
+        archived,
     })
 }
 
@@ -986,6 +1011,7 @@ pub async fn assemble_materialized(
         validated_key,
         &ids,
         &[],
+        false,
     )
     .await?;
     let emitted_ids = handoff_ids(&handoff)?;
@@ -1020,6 +1046,7 @@ async fn fetch_pinned_in_txn(
 ) -> Result<PinnedLane, ErrorCode> {
     let (kinds, ids) = scope_chain_params(scope);
     let where_clause = "m.tenant_id = $1 AND m.status = 'active' AND m.superseded_by IS NULL \
+        AND m.archived_at IS NULL \
         AND EXISTS ( \
           SELECT 1 FROM private.context_bindings cb \
           WHERE cb.memory_id = m.memory_id AND cb.tenant_id = m.tenant_id \
@@ -1372,9 +1399,10 @@ async fn apply_binding_write(
                 inserted: false,
             })
         }
-        DestructiveOp::MemorySupersede | DestructiveOp::MemoryRestore => {
-            Err(ErrorCode::InvalidInput)
-        }
+        DestructiveOp::MemorySupersede
+        | DestructiveOp::MemoryRestore
+        | DestructiveOp::MemoryArchive
+        | DestructiveOp::MemoryUnarchive => Err(ErrorCode::InvalidInput),
     }
 }
 

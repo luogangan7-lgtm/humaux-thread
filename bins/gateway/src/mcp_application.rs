@@ -9,7 +9,8 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use humaux_adapters::{
-    context_repo::MemoryEnumerationParams, memory_governance_repo::RestoreResult,
+    context_repo::MemoryEnumerationParams,
+    memory_governance_repo::{ArchiveResult, RestoreResult},
     postgres::RuntimeDbPool,
 };
 use humaux_domain::{
@@ -40,7 +41,7 @@ use crate::{
 /// The only real MCP business routes currently available from Gateway. Confirm-gated
 /// destructive keys come from the closed `DestructiveOp` table (§78.2, ADR-0018), never a
 /// second literal.
-pub const SUPPORTED_OPERATION_KEYS: [&str; 10] = [
+pub const SUPPORTED_OPERATION_KEYS: [&str; 12] = [
     "remember.put",
     "recall.search",
     "context.assemble",
@@ -51,6 +52,8 @@ pub const SUPPORTED_OPERATION_KEYS: [&str; 10] = [
     DestructiveOp::MemoryPin.operation_key(),
     DestructiveOp::MemoryUnpin.operation_key(),
     DestructiveOp::MemoryRestore.operation_key(),
+    DestructiveOp::MemoryArchive.operation_key(),
+    DestructiveOp::MemoryUnarchive.operation_key(),
 ];
 
 /// Bootstrap-owned, authenticated MCP dispatch.  It has no client-selected
@@ -651,6 +654,84 @@ impl GatewayMcpApplication {
         output(value)
     }
 
+    /// §36 `memory.archive` / `memory.unarchive` through the same §33.10 confirm gate
+    /// (ADR-0024, Q3). One arm for both: identical wire shape (`memory_id` + optional
+    /// `confirm_token`), the closed `op` is the only difference and the token is bound to it (an
+    /// archive confirmation never runs an unarchive). No `workspace_id` on the wire: the route
+    /// is the credential's bound workspace (same rule as `memory.get` / `memory.supersede`).
+    /// Archive appends an ARCHIVE lifecycle event and sets `archived_at`; unarchive appends a
+    /// RESTORE undoing it and clears `archived_at`. An already-in-state call is a success-shaped
+    /// `{code:"CONFLICT", reason:1201}` (D-B — §52.1 keeps 18 codes).
+    async fn memory_archive_write(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        raw_arguments: &str,
+        value: &Value,
+        op: DestructiveOp,
+    ) -> Result<ToolOutput, ErrorCode> {
+        let memory = MemoryId::parse(value["memory_id"].as_str().ok_or(ErrorCode::InvalidInput)?)?;
+        let presented = value
+            .get("confirm_token")
+            .map(|token| {
+                token
+                    .as_str()
+                    .ok_or(ErrorCode::InvalidInput)
+                    .and_then(ConfirmToken::decode)
+            })
+            .transpose()?;
+        let Some(ttl) = self.confirm_token_ttl else {
+            return self.reject_unsupported(context, operation, None).await;
+        };
+        let pool = self.runtime_pool.clone();
+        let stream = self.context_bootstrap.stream.clone();
+        let outcome = self
+            .guard
+            .run_confirmed_write(
+                context,
+                operation,
+                None,
+                raw_arguments,
+                ConfirmGate {
+                    op,
+                    target_id: memory.0,
+                    successor_id: None,
+                    presented,
+                    ttl,
+                },
+                move |write| async move { memory::archive(pool, write, stream, op, memory).await },
+            )
+            .await?;
+        let changed_field = if op == DestructiveOp::MemoryArchive {
+            "archived_at"
+        } else {
+            "unarchived_at"
+        };
+        let value = match outcome {
+            ConfirmedOutcome::ConfirmationRequired { token, expires_at } => json!({
+                "confirmation_required": true,
+                "confirm_token": token.encode(),
+                "operation": operation.operation_key(),
+                "target": { "memory_id": memory.0 },
+                "expires_at": rfc3339(expires_at)?,
+            }),
+            ConfirmedOutcome::Executed(ArchiveResult::Done(done)) => json!({
+                "memory_id": memory.0,
+                changed_field: rfc3339(done.changed_at)?,
+                "stream_seq": done.stream_seq,
+                "commit_seq": done.commit_seq,
+            }),
+            // D-B: an already-in-state archive/unarchive is a success-shaped CONFLICT-with-reason.
+            ConfirmedOutcome::Executed(ArchiveResult::Refused(reason)) => json!({
+                "code": "CONFLICT",
+                "reason": reason.code(),
+                "reason_label": reason.label().unwrap_or("UNKNOWN"),
+            }),
+        };
+        self.catalog.validate_output(ToolName::Memory, &value)?;
+        output(value)
+    }
+
     async fn recall_search(
         &self,
         context: &McpHttpContext,
@@ -798,6 +879,26 @@ impl McpApplication for GatewayMcpApplication {
             key if key == DestructiveOp::MemoryRestore.operation_key() => {
                 self.memory_restore(context, &operation, &raw_arguments, &value)
                     .await
+            }
+            key if key == DestructiveOp::MemoryArchive.operation_key() => {
+                self.memory_archive_write(
+                    context,
+                    &operation,
+                    &raw_arguments,
+                    &value,
+                    DestructiveOp::MemoryArchive,
+                )
+                .await
+            }
+            key if key == DestructiveOp::MemoryUnarchive.operation_key() => {
+                self.memory_archive_write(
+                    context,
+                    &operation,
+                    &raw_arguments,
+                    &value,
+                    DestructiveOp::MemoryUnarchive,
+                )
+                .await
             }
             _ => {
                 self.reject_unsupported(context, &operation, workspace(&value)?)

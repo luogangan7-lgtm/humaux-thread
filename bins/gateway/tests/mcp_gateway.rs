@@ -1484,6 +1484,10 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
             );
             let first = handle.seed_workspace_visible_context_record();
             let second = handle.seed_workspace_visible_context_record();
+            // ADR-0024 D-C: a semantically-matching row that will be ARCHIVED. Its Qdrant point
+            // stays (points are not deleted on archive); the PG hydrate gate is the SOLE place
+            // recall excludes it, so recall.search returning only {first, second} is what a
+            // flipped `include_archived` at the recall hydrate call would break.
             let first_point = Uuid::new_v4();
             let second_point = Uuid::new_v4();
             let first_updated = seed_semantic_registry_row(&mut handle, &first, first_point);
@@ -4033,6 +4037,371 @@ async fn drive_supersede(
     done["result"]["structuredContent"]["stream_seq"]
         .as_i64()
         .expect("supersede stream_seq")
+}
+
+// ===========================================================================================
+// §36 memory.archive / memory.unarchive confirm gate (ADR-0024, Q3).
+// ===========================================================================================
+
+async fn archive_call(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    action: &str,
+    target: Uuid,
+    token: Option<&str>,
+) -> (u16, Value) {
+    let mut arguments = json!({ "action": action, "memory_id": target });
+    if let Some(token) = token {
+        arguments["confirm_token"] = Value::String(token.to_owned());
+    }
+    raw_request(
+        address,
+        &tool_call_headers("memory", bearer),
+        &rpc(request_id, "tools/call", call_params("memory", arguments)),
+    )
+    .await
+}
+
+/// First call: a success-shaped `confirmation_required` naming memory.{archive,unarchive}.
+async fn mint_archive_token(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    action: &str,
+    target: Uuid,
+) -> String {
+    let (status, response) = archive_call(address, bearer, request_id, action, target, None).await;
+    assert_eq!(status, 200, "first call is an MCP result: {response}");
+    let structured = &response["result"]["structuredContent"];
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    assert_eq!(structured["confirmation_required"], true, "{response}");
+    assert_eq!(
+        structured["operation"],
+        format!("memory.{action}"),
+        "{response}"
+    );
+    assert_eq!(
+        structured["target"]["memory_id"],
+        target.to_string(),
+        "{response}"
+    );
+    assert!(
+        structured["target"].get("replacement_memory_id").is_none(),
+        "archive confirmation names no successor: {response}"
+    );
+    structured["confirm_token"]
+        .as_str()
+        .expect("confirm_token string")
+        .to_owned()
+}
+
+/// Drives archive/unarchive to completion; returns the executed structuredContent.
+async fn drive_archive(
+    address: SocketAddr,
+    bearer: &str,
+    base_request_id: u64,
+    action: &str,
+    target: Uuid,
+) -> Value {
+    let token = mint_archive_token(address, bearer, base_request_id, action, target).await;
+    let (status, done) = archive_call(
+        address,
+        bearer,
+        base_request_id + 1,
+        action,
+        target,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, 200, "confirmed {action}: {done}");
+    assert_ne!(done["result"]["isError"], true, "{done}");
+    done["result"]["structuredContent"].clone()
+}
+
+/// `archived_at IS NOT NULL` for one row, read by the owner.
+fn is_archived(handle: &mut Handle, memory_id: Uuid) -> bool {
+    handle
+        .admin
+        .query_one(
+            "SELECT archived_at IS NOT NULL FROM private.memory_records WHERE memory_id = $1",
+            &[&memory_id],
+        )
+        .expect("owner reads archived_at")
+        .get(0)
+}
+
+/// The `archived` flag on a memory.get item (absent -> false, per skip-when-false wire shape).
+async fn memory_get_archived(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    target: Uuid,
+) -> (bool, bool) {
+    let (status, response) = raw_request(
+        address,
+        &tool_call_headers("memory", bearer),
+        &rpc(
+            request_id,
+            "tools/call",
+            call_params("memory", json!({"action":"get","memory_id":target})),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "memory.get: {response}");
+    let content = assert_tool_response(&response, ToolName::Memory);
+    let items = content["items"].as_array().expect("get items");
+    let returned = items.iter().any(|i| i["memory_id"] == target.to_string());
+    let archived = items
+        .iter()
+        .find(|i| i["memory_id"] == target.to_string())
+        .and_then(|i| i["archived"].as_bool())
+        .unwrap_or(false);
+    (returned, archived)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One real HTTP fixture carries the whole archive/unarchive matrix.
+fn native_mcp_memory_archive_confirm_gate_acceptance() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>("native_mcp_memory_archive_confirm_gate", |mut handle| {
+        handle.assert_gateway_login();
+        let prefix = format!("marc{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let wire = format!("{prefix}.{}", "a".repeat(32));
+        let credential = handle.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &prefix,
+            &wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+            64,
+        );
+        let m = handle.seed_workspace_visible_context_record();
+
+        let runtime_handle = handle.rt.handle().clone();
+        let runtime = runtime_handle
+            .block_on(handle.fresh_runtime())
+            .expect("checked archive runtime");
+        let app = application(&handle, runtime);
+        runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let bearer = credential.bearer.as_str();
+
+            // Before archive: get returns the row, archived flag absent (false).
+            let (returned, archived) = memory_get_archived(address, bearer, 1, m.memory_id).await;
+            assert!(
+                returned && !archived,
+                "live memory.get: returned, not archived"
+            );
+
+            // Archive through the confirm gate -> archived_at set, one ARCHIVE lifecycle event.
+            let done = drive_archive(address, bearer, 2, "archive", m.memory_id).await;
+            assert_eq!(done["memory_id"], m.memory_id.to_string(), "{done}");
+            assert!(done["archived_at"].is_string(), "{done}");
+            assert!(done.get("unarchived_at").is_none(), "{done}");
+            assert!(done["stream_seq"].as_i64().is_some(), "{done}");
+            tokio::task::block_in_place(|| {
+                assert!(is_archived(&mut handle, m.memory_id), "archived_at is set");
+                // Q3: archive is NOT a status transition — status/G59-4 untouched.
+                assert_eq!(
+                    memory_state(&mut handle, m.memory_id),
+                    ("active".into(), None, false, true),
+                    "archive leaves status='active' and G59-4 intact"
+                );
+                assert_eq!(lifecycle_op_count(&mut handle, m.memory_id, "ARCHIVE"), 1);
+            });
+
+            // memory.get still returns the row, now archived:true (D-C).
+            let (returned, archived) = memory_get_archived(address, bearer, 4, m.memory_id).await;
+            assert!(returned && archived, "memory.get returns archived:true");
+
+            // memory.enumerate excludes the archived row by default (D-C).
+            let (status, page) = enumerate_call(
+                address,
+                bearer,
+                json!({"action":"enumerate","workspace_id":handle.workspace_id}),
+            )
+            .await;
+            assert_eq!(status, 200, "enumerate: {page}");
+            let listed = assert_tool_response(&page, ToolName::Memory)["content"]["items"]
+                .as_array()
+                .expect("enumerate items")
+                .iter()
+                .any(|i| i["memory_id"] == m.memory_id.to_string());
+            assert!(
+                !listed,
+                "enumerate default output excludes the archived row"
+            );
+
+            // memory.restore refuses an ARCHIVE head as NOT_REVERSIBLE (1202): the recorded
+            // decision is that archive is undone by memory.unarchive, never by memory.restore.
+            let restore_token = mint_restore_token(address, bearer, 6, m.memory_id).await;
+            let (status, refused) =
+                restore_call(address, bearer, 7, m.memory_id, Some(&restore_token)).await;
+            assert_eq!(status, 200, "{refused}");
+            assert_restore_conflict(&refused, 1202, "NOT_REVERSIBLE");
+            tokio::task::block_in_place(|| {
+                assert!(
+                    is_archived(&mut handle, m.memory_id),
+                    "refused restore mutates nothing"
+                );
+            });
+
+            // Idempotency: archiving an already-archived row is ALREADY_IN_STATE (1201).
+            let dup_token = mint_archive_token(address, bearer, 8, "archive", m.memory_id).await;
+            let (status, dup) =
+                archive_call(address, bearer, 9, "archive", m.memory_id, Some(&dup_token)).await;
+            assert_eq!(status, 200, "{dup}");
+            assert_restore_conflict(&dup, 1201, "ALREADY_IN_STATE");
+
+            // Unarchive -> archived_at cleared, a RESTORE event undoing the ARCHIVE head.
+            let archive_event = tokio::task::block_in_place(|| {
+                handle
+                    .admin
+                    .query_one(
+                        "SELECT event_id FROM ops.memory_lifecycle_events \
+                         WHERE memory_id = $1 AND op = 'ARCHIVE' ORDER BY event_seq DESC LIMIT 1",
+                        &[&m.memory_id],
+                    )
+                    .expect("owner reads ARCHIVE event id")
+                    .get::<_, Uuid>(0)
+            });
+            let done = drive_archive(address, bearer, 10, "unarchive", m.memory_id).await;
+            assert!(done["unarchived_at"].is_string(), "{done}");
+            assert!(done.get("archived_at").is_none(), "{done}");
+            tokio::task::block_in_place(|| {
+                assert!(
+                    !is_archived(&mut handle, m.memory_id),
+                    "archived_at cleared"
+                );
+                assert_eq!(
+                    lifecycle_head(&mut handle, m.memory_id),
+                    Some(("RESTORE".to_owned(), Some(archive_event))),
+                    "head is a RESTORE naming the ARCHIVE it undoes"
+                );
+            });
+
+            // Visible again: get archived:false, enumerate includes it.
+            let (returned, archived) = memory_get_archived(address, bearer, 12, m.memory_id).await;
+            assert!(returned && !archived, "unarchived memory.get: not archived");
+            let (status, page) = enumerate_call(
+                address,
+                bearer,
+                json!({"action":"enumerate","workspace_id":handle.workspace_id}),
+            )
+            .await;
+            assert_eq!(status, 200, "enumerate after unarchive: {page}");
+            let listed = assert_tool_response(&page, ToolName::Memory)["content"]["items"]
+                .as_array()
+                .expect("enumerate items")
+                .iter()
+                .any(|i| i["memory_id"] == m.memory_id.to_string());
+            assert!(listed, "enumerate includes the unarchived row again");
+
+            // Unarchive of a live row is ALREADY_IN_STATE (1201), symmetric with archive.
+            let dup_token = mint_archive_token(address, bearer, 14, "unarchive", m.memory_id).await;
+            let (status, dup) = archive_call(
+                address,
+                bearer,
+                15,
+                "unarchive",
+                m.memory_id,
+                Some(&dup_token),
+            )
+            .await;
+            assert_eq!(status, 200, "{dup}");
+            assert_restore_conflict(&dup, 1201, "ALREADY_IN_STATE");
+
+            server.abort();
+        });
+    });
+}
+
+/// Regression (ADR-0024 D-B): a supersede between archive and unarchive moves the lifecycle
+/// head to the SUPERSEDE event, yet the unarchive RESTORE must still name the ARCHIVE event it
+/// undoes — never the intervening SUPERSEDE. Before the fix, unarchive read
+/// `lifecycle_head_event_id` (then the SUPERSEDE) and recorded a false undo edge.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_mcp_memory_unarchive_undoes_archive_not_intervening_supersede() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>(
+        "native_mcp_memory_unarchive_undoes_archive",
+        |mut handle| {
+            handle.assert_gateway_login();
+            let prefix = format!("muar{}", &Uuid::now_v7().simple().to_string()[..12]);
+            let wire = format!("{prefix}.{}", "b".repeat(32));
+            let credential = handle.seed_synthetic_service_credential_and_window(
+                SyntheticCredentialScopes::RememberWriteAndContextRead,
+                &prefix,
+                &wire,
+                &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+                80,
+            );
+            let m = handle.seed_workspace_visible_context_record();
+            let successor = handle.seed_workspace_visible_context_record();
+
+            let runtime_handle = handle.rt.handle().clone();
+            let runtime = runtime_handle
+                .block_on(handle.fresh_runtime())
+                .expect("interleaved archive runtime");
+            let app = application(&handle, runtime);
+            runtime_handle.block_on(async {
+                let (address, server) = start(app).await;
+                let bearer = credential.bearer.as_str();
+
+                // Archive (head -> ARCHIVE), then supersede while archived: archived_at stays set
+                // (supersede's arbiter is WHERE status='active', no archived filter), head -> SUPERSEDE.
+                drive_archive(address, bearer, 2, "archive", m.memory_id).await;
+                drive_supersede(address, bearer, 4, m.memory_id, successor.memory_id).await;
+
+                let (archive_event, supersede_event) = tokio::task::block_in_place(|| {
+                    assert!(
+                        is_archived(&mut handle, m.memory_id),
+                        "still archived after supersede"
+                    );
+                    assert_eq!(
+                        lifecycle_head(&mut handle, m.memory_id).map(|(op, _)| op),
+                        Some("SUPERSEDE".to_owned()),
+                        "supersede moved the head off ARCHIVE"
+                    );
+                    let archive_event = handle
+                        .admin
+                        .query_one(
+                            "SELECT event_id FROM ops.memory_lifecycle_events \
+                         WHERE memory_id = $1 AND op = 'ARCHIVE' ORDER BY event_seq DESC LIMIT 1",
+                            &[&m.memory_id],
+                        )
+                        .expect("owner reads ARCHIVE event id")
+                        .get::<_, Uuid>(0);
+                    (
+                        archive_event,
+                        latest_supersede_event_id(&mut handle, m.memory_id),
+                    )
+                });
+                assert_ne!(archive_event, supersede_event, "distinct events");
+
+                // Unarchive: the RESTORE undoes the ARCHIVE event, never the intervening SUPERSEDE.
+                drive_archive(address, bearer, 6, "unarchive", m.memory_id).await;
+                tokio::task::block_in_place(|| {
+                    assert!(
+                        !is_archived(&mut handle, m.memory_id),
+                        "archived_at cleared"
+                    );
+                    assert_eq!(
+                        lifecycle_head(&mut handle, m.memory_id),
+                        Some(("RESTORE".to_owned(), Some(archive_event))),
+                        "unarchive RESTORE undoes the ARCHIVE event, not the SUPERSEDE"
+                    );
+                });
+
+                server.abort();
+            });
+        },
+    );
 }
 
 #[test]

@@ -935,6 +935,9 @@ pub(crate) async fn materialize_private_read_serving_in_txn(
         &envelope.validated_stream_key,
         &serving.memory_ids,
         &serving.overlay,
+        // Q3/ADR-0024 D-C: recall.search excludes archived rows at this shared hydrate gate
+        // (the Qdrant points stay; PG filters). memory.get is the only caller passing true.
+        false,
     )
     .await
     .map_err(RetrieveError::FinalMaterialization)

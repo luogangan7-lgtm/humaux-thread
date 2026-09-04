@@ -90,6 +90,7 @@ pub(crate) async fn final_memory_ids_in_txn(
     txn: &mut Txn<'_>,
     authorization: &AuthorizationScope,
     candidates: &[Uuid],
+    include_archived: bool,
 ) -> Result<Vec<Uuid>, ErrorCode> {
     let readable = readable_memory_ids(txn, authorization, candidates).await?;
     let rows = sqlx::query(
@@ -100,6 +101,9 @@ pub(crate) async fn final_memory_ids_in_txn(
           AND m.memory_id = ANY($2)
           AND m.status = 'active'
           AND m.superseded_by IS NULL
+          -- Q3/ADR-0024 D-C: recall/context/enumerate exclude archived rows here (the shared
+          -- final-eligibility gate); only memory.get passes include_archived=true.
+          AND (m.archived_at IS NULL OR $3::boolean)
           AND NOT EXISTS (
               SELECT 1
               FROM private.memory_evidence AS me
@@ -125,6 +129,7 @@ pub(crate) async fn final_memory_ids_in_txn(
     )
     .bind(authorization.tenant_id().0)
     .bind(candidates)
+    .bind(include_archived)
     .fetch_all(&mut **txn)
     .await
     .map_err(|_| ErrorCode::DependencyUnavailable)?;
@@ -144,8 +149,10 @@ async fn load_memories(
     txn: &mut Txn<'_>,
     authorization: &AuthorizationScope,
     candidates: &[Uuid],
+    include_archived: bool,
 ) -> Result<Vec<(Uuid, serde_json::Value)>, ErrorCode> {
-    let eligible = final_memory_ids_in_txn(txn, authorization, candidates).await?;
+    let eligible =
+        final_memory_ids_in_txn(txn, authorization, candidates, include_archived).await?;
     let rows = sqlx::query(
         r#"
         SELECT m.memory_id, m.content
@@ -365,6 +372,7 @@ pub async fn materialize_final_bodies(
         validated_key,
         memory_ids,
         overlay,
+        false,
     )
     .await?;
     txn.commit()
@@ -386,6 +394,7 @@ pub(crate) async fn materialize_one_memory_in_txn(
     validated_key: &StreamKey,
     memory_id: MemoryId,
 ) -> Result<MaterializedBodies, ErrorCode> {
+    // Q3/ADR-0024 D-C: memory.get is the one read that must still return an archived row.
     let bodies = materialize_final_bodies_in_txn(
         txn,
         authorization,
@@ -393,6 +402,7 @@ pub(crate) async fn materialize_one_memory_in_txn(
         validated_key,
         &[memory_id.0],
         &[],
+        true,
     )
     .await?;
     match bodies.items.as_slice() {
@@ -419,6 +429,7 @@ pub(crate) async fn materialize_final_bodies_in_txn(
     validated_key: &StreamKey,
     memory_ids: &[Uuid],
     overlay: &[OverlayCandidate],
+    include_archived: bool,
 ) -> Result<MaterializedBodies, ErrorCode> {
     let authorization = effective_authorization(authorization, expected_family, validated_key)?;
     set_authorization_local(txn, &authorization).await?;
@@ -430,7 +441,7 @@ pub(crate) async fn materialize_final_bodies_in_txn(
                 .flat_map(|item| item.linked_memory_ids.iter().copied()),
         ),
     );
-    let memories = load_memories(txn, &authorization, &candidate_ids).await?;
+    let memories = load_memories(txn, &authorization, &candidate_ids, include_archived).await?;
     let readable_memory_ids = memories.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
     for item in &mut overlay {
         item.linked_memory_ids
