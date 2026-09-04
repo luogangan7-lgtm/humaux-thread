@@ -477,6 +477,22 @@ const MATRIX: &[Cell] = &[
         [("UPDATE", ["consumed_at"])]
     ),
     cell!("control.confirm_tokens", "role_maintenance", ["SELECT"]),
+    // 0149 (ADR-0020): §36/§37.1 memory lifecycle event log. Append-only; writes go ONLY
+    // through owner SECURITY DEFINER ops.append_memory_lifecycle (EXECUTE to role_gateway),
+    // so no runtime role holds a table INSERT/UPDATE/DELETE grant — same chokepoint shape as
+    // ops.deletion_plan_steps. Readers per the LIFECYCLE LOG ruling: gateway/retrieval_worker/
+    // maintenance.
+    cell!("ops.memory_lifecycle_events", "role_gateway", ["SELECT"]),
+    cell!(
+        "ops.memory_lifecycle_events",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "ops.memory_lifecycle_events",
+        "role_maintenance",
+        ["SELECT"]
+    ),
     // §19 native retrieval query disclosure source: only the retrieval worker may create it;
     // maintenance may revoke it without rewriting the immutable identity.
     cell!(
@@ -606,7 +622,15 @@ const MATRIX: &[Cell] = &[
         "private.memory_records",
         "role_gateway",
         ["SELECT", "INSERT"],
-        [("UPDATE", ["status", "superseded_by", "superseded_at"])]
+        [(
+            "UPDATE",
+            [
+                "status",
+                "superseded_by",
+                "superseded_at",
+                "lifecycle_head_event_id"
+            ]
+        )]
     ),
     cell!(
         "private.memory_records",

@@ -138,6 +138,68 @@ pub const CONCEPT_PAIRS: [ConceptPair; 2] = [
     },
 ];
 
+/// A `CONFLICT` sub-reason (ADR-0020, §52 D-B). `ErrorCode` stays frozen at 18: a business
+/// conflict is `ErrorCode::Conflict` on the wire, and this transparent newtype is the extra
+/// `reason` field the gateway surfaces in `structuredContent {code:"CONFLICT", reason:<u16>,
+/// reason_label:<SCREAMING_SNAKE>}`. It is NOT a 19th `ErrorCode` variant — the ALL/as_str
+/// gate (§52.4 G52-2) is untouched. The u16 space is partitioned by leading digit: 10xx
+/// lifecycle restore, 11xx distill candidate, 12xx generic state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConflictReason(pub u16);
+
+impl ConflictReason {
+    /// Restore refused: the undo window (§78.1) has elapsed for this transition.
+    pub const UNDO_WINDOW_EXPIRED: ConflictReason = ConflictReason(1001);
+    /// Restore refused: the target is not the current head of a reversible transition.
+    pub const TARGET_NOT_CURRENT: ConflictReason = ConflictReason(1002);
+    /// Restore refused: the transition was an ERASE (§37 permanent), never restorable.
+    pub const ERASE_TERMINAL: ConflictReason = ConflictReason(1003);
+    /// Restore refused: the successor has itself been superseded — the graph advanced.
+    pub const TARGET_ADVANCED: ConflictReason = ConflictReason(1004);
+    /// Distill candidate already confirmed by another call (card 5).
+    pub const CANDIDATE_ALREADY_CONFIRMED: ConflictReason = ConflictReason(1101);
+    /// Distill candidate expired past its window (card 5).
+    pub const CANDIDATE_EXPIRED: ConflictReason = ConflictReason(1102);
+    /// The object is already in the requested state (idempotency-key reuse with a
+    /// different request fingerprint, §34.0.1).
+    pub const ALREADY_IN_STATE: ConflictReason = ConflictReason(1201);
+    /// The requested undo is not reversible (a RESTORE/ARCHIVE head; §36).
+    pub const NOT_REVERSIBLE: ConflictReason = ConflictReason(1202);
+
+    /// Every defined reason, for table-driven lookups and the label mapping.
+    pub const ALL: [ConflictReason; 8] = [
+        Self::UNDO_WINDOW_EXPIRED,
+        Self::TARGET_NOT_CURRENT,
+        Self::ERASE_TERMINAL,
+        Self::TARGET_ADVANCED,
+        Self::CANDIDATE_ALREADY_CONFIRMED,
+        Self::CANDIDATE_EXPIRED,
+        Self::ALREADY_IN_STATE,
+        Self::NOT_REVERSIBLE,
+    ];
+
+    /// The raw numeric reason surfaced in `structuredContent.reason`.
+    pub const fn code(self) -> u16 {
+        self.0
+    }
+
+    /// SCREAMING_SNAKE label surfaced in `structuredContent.reason_label`; `None` for an
+    /// unknown code (never minted by this crate, but the wire type is a bare u16).
+    pub const fn label(self) -> Option<&'static str> {
+        Some(match self.0 {
+            1001 => "UNDO_WINDOW_EXPIRED",
+            1002 => "TARGET_NOT_CURRENT",
+            1003 => "ERASE_TERMINAL",
+            1004 => "TARGET_ADVANCED",
+            1101 => "CANDIDATE_ALREADY_CONFIRMED",
+            1102 => "CANDIDATE_EXPIRED",
+            1201 => "ALREADY_IN_STATE",
+            1202 => "NOT_REVERSIBLE",
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +241,33 @@ mod tests {
         assert_eq!(CONCEPT_PAIRS[1].error_code, "CANNOT_ESTABLISH_COMPLETENESS");
         assert_eq!(CONCEPT_PAIRS[1].degrade_variant, "CompletenessUnknown");
         assert!(!CONCEPT_PAIRS[1].literally_same);
+    }
+
+    /// ADR-0020 D-B: the `CONFLICT` sub-reasons keep their frozen numeric codes and
+    /// SCREAMING_SNAKE labels, every code round-trips through `label`, and none collide —
+    /// the wire contract the gateway surfaces in `structuredContent.reason`.
+    #[test]
+    fn conflict_reason_codes_and_labels_are_frozen_and_unique() {
+        assert_eq!(ConflictReason::UNDO_WINDOW_EXPIRED.code(), 1001);
+        assert_eq!(ConflictReason::TARGET_NOT_CURRENT.code(), 1002);
+        assert_eq!(ConflictReason::ERASE_TERMINAL.code(), 1003);
+        assert_eq!(ConflictReason::TARGET_ADVANCED.code(), 1004);
+        assert_eq!(ConflictReason::CANDIDATE_ALREADY_CONFIRMED.code(), 1101);
+        assert_eq!(ConflictReason::CANDIDATE_EXPIRED.code(), 1102);
+        assert_eq!(ConflictReason::ALREADY_IN_STATE.code(), 1201);
+        assert_eq!(ConflictReason::NOT_REVERSIBLE.code(), 1202);
+        let mut labels = std::collections::HashSet::new();
+        let mut codes = std::collections::HashSet::new();
+        for reason in ConflictReason::ALL {
+            let label = reason.label().expect("defined reason has a label");
+            assert!(
+                label.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "{label} is not SCREAMING_SNAKE"
+            );
+            assert!(labels.insert(label), "duplicate reason label {label}");
+            assert!(codes.insert(reason.code()), "duplicate reason code");
+        }
+        assert_eq!(ConflictReason(9999).label(), None);
     }
 
     /// Every `CONCEPT_PAIRS[i].error_code` must name a real `ErrorCode`

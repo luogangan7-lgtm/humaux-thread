@@ -1372,7 +1372,9 @@ async fn apply_binding_write(
                 inserted: false,
             })
         }
-        DestructiveOp::MemorySupersede => Err(ErrorCode::InvalidInput),
+        DestructiveOp::MemorySupersede | DestructiveOp::MemoryRestore => {
+            Err(ErrorCode::InvalidInput)
+        }
     }
 }
 

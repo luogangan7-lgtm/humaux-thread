@@ -79,6 +79,12 @@ impl RememberPolicy {
         WorkspaceId(self.stream.scope_id)
     }
 
+    /// §15.5 consistency_token lifetime — reused by `memory.restore` for the token it returns
+    /// on the restored memory's new stream seq (ADR-0020). Positive by construction.
+    pub(crate) fn consistency_token_ttl(&self) -> Duration {
+        Duration::try_from(self.consistency_token_ttl).unwrap_or(Duration::from_secs(0))
+    }
+
     /// Builds a policy after bootstrap has selected its trusted stream and expiry.
     pub fn new(
         stream: StreamKey,

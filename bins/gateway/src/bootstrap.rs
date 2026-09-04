@@ -95,6 +95,8 @@ pub struct GatewayBootstrap {
     handler_timeout: Duration,
     /// §33.10 rule 9 confirm-token lifetime (ADR-0018), `HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS`.
     confirm_token_ttl: Duration,
+    /// §78.1 memory.restore undo window (ADR-0020), `HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS`.
+    undo_window: Duration,
 }
 
 /// Parsed `HUMAUX_GATEWAY_RETRIEVAL_RPC_*` / `HUMAUX_GATEWAY_EMBEDDING_*` /
@@ -193,6 +195,13 @@ impl GatewayBootstrap {
                 "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS",
                 "must be positive seconds",
             )
+        })?
+        .with_undo_window(self.undo_window)
+        .map_err(|_| {
+            BootstrapError::new(
+                "HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS",
+                "must be positive seconds",
+            )
         })?;
         match self.semantic_recall {
             Some(config) => {
@@ -231,6 +240,10 @@ impl GatewayBootstrap {
             required(&effective, "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS")?,
             "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS",
         )?;
+        let undo_window = seconds(
+            required(&effective, "HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS")?,
+            "HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS",
+        )?;
 
         Ok(Self {
             bind_addr: parse_bind_addr(required(&effective, "HUMAUX_GATEWAY_BIND_ADDR")?)?,
@@ -244,6 +257,7 @@ impl GatewayBootstrap {
             semantic_recall: parse_semantic_recall(&effective)?,
             handler_timeout,
             confirm_token_ttl,
+            undo_window,
         })
     }
 }
@@ -593,6 +607,7 @@ fn registry() -> Vec<ConfigEntry> {
         ("FINALIZE_TIMEOUT_SECONDS", "u64", false),
         ("REPLAY_TTL_SECONDS", "u64", false),
         ("CONFIRM_TOKEN_TTL_SECONDS", "u64", false),
+        ("UNDO_WINDOW_SECONDS", "u64", false),
         ("REMEMBER_TENANT_ID", "uuid", false),
         ("REMEMBER_WORKSPACE_ID", "uuid", false),
         ("REMEMBER_SCOPE_KIND", "enum:workspace", false),
@@ -899,6 +914,7 @@ mod tests {
                 "HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS" => "2".into(),
                 "HUMAUX_GATEWAY_REPLAY_TTL_SECONDS" => "60".into(),
                 "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS" => "300".into(),
+                "HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS" => "86400".into(),
                 "HUMAUX_GATEWAY_REMEMBER_TENANT_ID" => tenant.to_string(),
                 "HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID" => workspace.to_string(),
                 "HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND" => "workspace".into(),

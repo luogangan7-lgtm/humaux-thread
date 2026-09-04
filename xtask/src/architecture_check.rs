@@ -4532,7 +4532,7 @@ fn w2_continuity_contract_from(
         );
     }
     for needle in [
-        "SUPPORTED_OPERATION_KEYS: [&str; 9]",
+        "SUPPORTED_OPERATION_KEYS: [&str; 10]",
         "\"continuity.get\" =>",
     ] {
         if !dispatch.contains(needle) {
@@ -4871,7 +4871,7 @@ mod tests {
             (5, "WorkspaceAdmission::PreserveContinuityFilter => None"),
             (5, "operation.operation_key() != \"continuity.get\""),
             (6, "catalog.validate_output(ToolName::Continuity, &value)"),
-            (6, "SUPPORTED_OPERATION_KEYS: [&str; 9]"),
+            (6, "SUPPORTED_OPERATION_KEYS: [&str; 10]"),
             (6, "\"continuity.get\" =>"),
         ] {
             let mut broken = sources.clone();

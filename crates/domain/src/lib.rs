@@ -21,6 +21,7 @@ pub mod identity;
 pub mod ids;
 pub mod knowledge;
 pub mod ledger;
+pub mod lifecycle;
 pub mod memory;
 pub mod policy;
 pub mod public;

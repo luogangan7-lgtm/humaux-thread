@@ -924,7 +924,9 @@ impl ConfirmedUserActor {
                 memory_id,
                 _priv: (),
             }),
-            DestructiveOp::MemorySupersede => Err(CandidateRejection::MissingConfirmation),
+            DestructiveOp::MemorySupersede | DestructiveOp::MemoryRestore => {
+                Err(CandidateRejection::MissingConfirmation)
+            }
         }
     }
 

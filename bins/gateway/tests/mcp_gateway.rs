@@ -196,6 +196,8 @@ fn application_with_budget(
     )
     .with_confirm_token_ttl(Duration::from_secs(300))
     .expect("positive fixture confirm-token TTL")
+    .with_undo_window(Duration::from_secs(86_400))
+    .expect("positive fixture undo window")
 }
 
 fn semantic_scanner() -> Arc<LocalSecretScanner> {
@@ -1647,7 +1649,7 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                         "query":query,
                         "workspace_id":workspace_id,
                         "mode":"semantic",
-                        "consistency_token":consistency_token,
+                        "consistency_token":consistency_token.clone(),
                     }),
                 )
                 .await;
@@ -1655,6 +1657,76 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 let with_token = assert_tool_response(&with_token, ToolName::Recall);
                 assert_eq!(with_token["items"].as_array().expect("RYW items").len(), 3);
                 assert!(with_token["items"].as_array().unwrap().iter().any(|item| {
+                    item["kind"] == "temporary_evidence" && item["evidence_id"] == evidence_id
+                }));
+
+                // §15.5 / ADR-0020 §7: read-your-writes is a *lower* bound only. A recall
+                // carrying a consistency_token minted *before* a later, higher-seq lifecycle
+                // write on the same workspace stream (here a supersede+restore) must still
+                // resolve immediately — the pre-restore token's lower bound was satisfied the
+                // moment it was issued, and restore only advances the stream head past it. RYW
+                // never promises a stale token observes a *newer* write; to see the restored
+                // state a caller uses restore's own (higher) token. This is the acceptance the
+                // card requires "the answer this card must state and test" and closes the gap
+                // where ADR-0020 §7 claimed RYW was tested but no recall ran with a pre-restore
+                // token.
+                let ryw_target = tokio::task::block_in_place(|| {
+                    handle.seed_workspace_visible_context_record()
+                });
+                let ryw_successor = tokio::task::block_in_place(|| {
+                    handle.seed_workspace_visible_context_record()
+                });
+                drive_supersede(
+                    address,
+                    &credential.bearer,
+                    50,
+                    ryw_target.memory_id,
+                    ryw_successor.memory_id,
+                )
+                .await;
+                let ryw_restore_token =
+                    mint_restore_token(address, &credential.bearer, 52, ryw_target.memory_id).await;
+                let (status, restored) = restore_call(
+                    address,
+                    &credential.bearer,
+                    53,
+                    ryw_target.memory_id,
+                    Some(&ryw_restore_token),
+                )
+                .await;
+                assert_eq!(status, 200, "pre-restore RYW: confirmed restore: {restored}");
+                assert_ne!(
+                    restored["result"]["isError"], true,
+                    "the higher-seq restore succeeded: {restored}"
+                );
+                // The same pre-restore token (a *lower* stream seq than the restore just issued)
+                // still returns immediately and obeys the RYW lower bound — same three items,
+                // never blocked or rejected as not-yet-served.
+                let (status, stale_token_recall) = recall_call(
+                    address,
+                    Some(&credential.bearer),
+                    json!({
+                        "query":query,
+                        "workspace_id":workspace_id,
+                        "mode":"semantic",
+                        "consistency_token":consistency_token,
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "pre-restore token recall returns, never blocks: {stale_token_recall}"
+                );
+                let stale_token_recall = assert_tool_response(&stale_token_recall, ToolName::Recall);
+                assert_eq!(
+                    stale_token_recall["items"]
+                        .as_array()
+                        .expect("pre-restore RYW items")
+                        .len(),
+                    3,
+                    "the pre-restore token's lower bound is still met after a higher-seq restore"
+                );
+                assert!(stale_token_recall["items"].as_array().unwrap().iter().any(|item| {
                     item["kind"] == "temporary_evidence" && item["evidence_id"] == evidence_id
                 }));
 
@@ -2793,6 +2865,7 @@ impl GatewayProcessConfig {
                 "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS".into(),
                 "300".into(),
             ),
+            ("HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS".into(), "86400".into()),
             (
                 "HUMAUX_GATEWAY_REMEMBER_TENANT_ID".into(),
                 handle.tenant_id.to_string(),
@@ -3830,6 +3903,421 @@ fn native_mcp_memory_supersede_confirm_gate_acceptance() {
             });
 
             stop_server(server).await.expect("stop supersede server");
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------------------
+// §36 memory.restore behind the same confirm gate (ADR-0020)
+// ---------------------------------------------------------------------------------------
+
+async fn restore_call(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    target: Uuid,
+    token: Option<&str>,
+) -> (u16, Value) {
+    let mut arguments = json!({ "action": "restore", "memory_id": target });
+    if let Some(token) = token {
+        arguments["confirm_token"] = Value::String(token.to_owned());
+    }
+    raw_request(
+        address,
+        &tool_call_headers("memory", bearer),
+        &rpc(request_id, "tools/call", call_params("memory", arguments)),
+    )
+    .await
+}
+
+/// First call: a success-shaped `confirmation_required` naming memory.restore, no successor.
+async fn mint_restore_token(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    target: Uuid,
+) -> String {
+    let (status, response) = restore_call(address, bearer, request_id, target, None).await;
+    assert_eq!(status, 200, "first call is an MCP result: {response}");
+    let result = &response["result"];
+    assert_ne!(
+        result["isError"], true,
+        "confirmation is not an error: {response}"
+    );
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["confirmation_required"], true, "{response}");
+    assert_eq!(structured["operation"], "memory.restore", "{response}");
+    assert_eq!(
+        structured["target"]["memory_id"],
+        target.to_string(),
+        "{response}"
+    );
+    assert!(
+        structured["target"].get("replacement_memory_id").is_none(),
+        "restore confirmation names no successor: {response}"
+    );
+    structured["confirm_token"]
+        .as_str()
+        .expect("confirm_token string")
+        .to_owned()
+}
+
+fn assert_restore_conflict(response: &Value, reason: u64, label: &str) {
+    let structured = &response["result"]["structuredContent"];
+    assert_ne!(
+        response["result"]["isError"], true,
+        "a refused restore is a success-shaped CONFLICT-with-reason: {response}"
+    );
+    assert_eq!(structured["code"], "CONFLICT", "{response}");
+    assert_eq!(structured["reason"], reason, "{response}");
+    assert_eq!(structured["reason_label"], label, "{response}");
+}
+
+/// (op, undoes_event_id) of the memory's current head lifecycle event, if any.
+fn lifecycle_head(handle: &mut Handle, memory_id: Uuid) -> Option<(String, Option<Uuid>)> {
+    handle
+        .admin
+        .query_opt(
+            "SELECT e.op, e.undoes_event_id FROM private.memory_records m \
+             JOIN ops.memory_lifecycle_events e ON e.event_id = m.lifecycle_head_event_id \
+             WHERE m.memory_id = $1",
+            &[&memory_id],
+        )
+        .expect("owner reads lifecycle head")
+        .map(|row| (row.get(0), row.get(1)))
+}
+
+fn lifecycle_op_count(handle: &mut Handle, memory_id: Uuid, op: &str) -> i64 {
+    handle
+        .admin
+        .query_one(
+            "SELECT count(*) FROM ops.memory_lifecycle_events WHERE memory_id = $1 AND op = $2",
+            &[&memory_id, &op],
+        )
+        .expect("owner counts lifecycle events")
+        .get(0)
+}
+
+fn latest_supersede_event_id(handle: &mut Handle, memory_id: Uuid) -> Uuid {
+    handle
+        .admin
+        .query_one(
+            "SELECT event_id FROM ops.memory_lifecycle_events \
+             WHERE memory_id = $1 AND op = 'SUPERSEDE' ORDER BY event_seq DESC LIMIT 1",
+            &[&memory_id],
+        )
+        .expect("owner reads SUPERSEDE event id")
+        .get(0)
+}
+
+/// Drives supersede's confirm gate to completion, returning the executed stream_seq.
+async fn drive_supersede(
+    address: SocketAddr,
+    bearer: &str,
+    base_request_id: u64,
+    target: Uuid,
+    successor: Uuid,
+) -> i64 {
+    let token = mint_supersede_token(address, bearer, base_request_id, target, successor).await;
+    let (status, done) = supersede_call(
+        address,
+        bearer,
+        base_request_id + 1,
+        target,
+        successor,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, 200, "confirmed supersede: {done}");
+    assert_ne!(done["result"]["isError"], true, "{done}");
+    done["result"]["structuredContent"]["stream_seq"]
+        .as_i64()
+        .expect("supersede stream_seq")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One real HTTP fixture carries the whole (a)-(g) restore matrix.
+fn native_mcp_memory_restore_confirm_gate_acceptance() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>("native_mcp_memory_restore_confirm_gate", |mut handle| {
+        handle.assert_gateway_login();
+        let prefix = format!("mres{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let wire = format!("{prefix}.{}", "f".repeat(32));
+        let credential = handle.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &prefix,
+            &wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+            96,
+        );
+
+        let a = handle.seed_workspace_visible_context_record();
+        let b = handle.seed_workspace_visible_context_record();
+        let c = handle.seed_workspace_visible_context_record();
+        let d = handle.seed_workspace_visible_context_record();
+        let e = handle.seed_workspace_visible_context_record();
+        let f = handle.seed_workspace_visible_context_record();
+        let g = handle.seed_workspace_visible_context_record();
+        let h = handle.seed_workspace_visible_context_record();
+        let fault_fn = format!(
+            "public.humaux_test_restore_fault_{}",
+            Uuid::now_v7().simple()
+        );
+
+        let runtime_handle = handle.rt.handle().clone();
+        let runtime = runtime_handle
+            .block_on(handle.fresh_runtime())
+            .expect("checked restore runtime");
+        let app = application(&handle, runtime);
+        runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let bearer = credential.bearer.as_str();
+
+            // (a) supersede A->B, then restore A inside the window.
+            let supersede_seq = drive_supersede(address, bearer, 1, a.memory_id, b.memory_id).await;
+            let supersede_event = tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, a.memory_id),
+                    ("superseded".into(), Some(b.memory_id), true, true)
+                );
+                assert_eq!(lifecycle_op_count(&mut handle, a.memory_id, "SUPERSEDE"), 1,
+                    "card-1 supersede now also appends a SUPERSEDE lifecycle event");
+                latest_supersede_event_id(&mut handle, a.memory_id)
+            });
+            let token_a = mint_restore_token(address, bearer, 3, a.memory_id).await;
+            let (status, done) = restore_call(address, bearer, 4, a.memory_id, Some(&token_a)).await;
+            assert_eq!(status, 200, "confirmed restore: {done}");
+            let structured = &done["result"]["structuredContent"];
+            assert_ne!(done["result"]["isError"], true, "{done}");
+            assert_eq!(structured["memory_id"], a.memory_id.to_string(), "{done}");
+            assert!(structured["restored_at"].is_string(), "{done}");
+            assert!(structured["consistency_token"].is_string(), "{done}");
+            let restore_seq = structured["stream_seq"].as_i64().expect("restore stream_seq");
+            assert!(
+                restore_seq > supersede_seq,
+                "restore issues a NEW higher stream seq ({restore_seq} > {supersede_seq}), never revives the old row"
+            );
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, a.memory_id),
+                    ("active".into(), None, false, true),
+                    "A is active again with superseded_by NULL and G59-4 satisfied"
+                );
+                assert_eq!(
+                    lifecycle_head(&mut handle, a.memory_id),
+                    Some(("RESTORE".to_owned(), Some(supersede_event))),
+                    "head is a RESTORE naming the SUPERSEDE it undoes"
+                );
+                assert_eq!(token_consumed(&mut handle, &token_a), Some(true));
+            });
+
+            // (b) restore after the window -> CONFLICT reason 1001, mutates nothing.
+            drive_supersede(address, bearer, 5, c.memory_id, b.memory_id).await;
+            tokio::task::block_in_place(|| {
+                handle
+                    .admin
+                    .execute(
+                        "UPDATE ops.memory_lifecycle_events \
+                         SET undo_deadline = clock_timestamp() - interval '1 second' \
+                         WHERE memory_id = $1 AND op = 'SUPERSEDE'",
+                        &[&c.memory_id],
+                    )
+                    .expect("owner expires the undo window");
+            });
+            let token_c = mint_restore_token(address, bearer, 7, c.memory_id).await;
+            let (status, expired) =
+                restore_call(address, bearer, 8, c.memory_id, Some(&token_c)).await;
+            assert_eq!(status, 200, "{expired}");
+            assert_restore_conflict(&expired, 1001, "UNDO_WINDOW_EXPIRED");
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, c.memory_id),
+                    ("superseded".into(), Some(b.memory_id), true, true)
+                );
+                assert_eq!(token_consumed(&mut handle, &token_c), Some(false),
+                    "a refused restore rolls the token consume back");
+                assert_eq!(lifecycle_op_count(&mut handle, c.memory_id, "RESTORE"), 0);
+            });
+
+            // (c) restore of a memory whose successor was itself superseded -> 1004.
+            drive_supersede(address, bearer, 9, d.memory_id, e.memory_id).await;
+            drive_supersede(address, bearer, 11, e.memory_id, f.memory_id).await;
+            let token_d = mint_restore_token(address, bearer, 13, d.memory_id).await;
+            let (status, advanced) =
+                restore_call(address, bearer, 14, d.memory_id, Some(&token_d)).await;
+            assert_eq!(status, 200, "{advanced}");
+            assert_restore_conflict(&advanced, 1004, "TARGET_ADVANCED");
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, d.memory_id),
+                    ("superseded".into(), Some(e.memory_id), true, true)
+                );
+            });
+
+            // (d) restore when the head is already a RESTORE -> 1202.
+            let token_a2 = mint_restore_token(address, bearer, 15, a.memory_id).await;
+            let (status, again) =
+                restore_call(address, bearer, 16, a.memory_id, Some(&token_a2)).await;
+            assert_eq!(status, 200, "{again}");
+            assert_restore_conflict(&again, 1202, "NOT_REVERSIBLE");
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, a.memory_id),
+                    ("active".into(), None, false, true)
+                );
+                assert_eq!(token_consumed(&mut handle, &token_a2), Some(false));
+            });
+
+            // (e) replay of the same confirmed restore -> the original success, one RESTORE event.
+            let supersede_seq_g = drive_supersede(address, bearer, 17, g.memory_id, h.memory_id).await;
+            let token_g = mint_restore_token(address, bearer, 19, g.memory_id).await;
+            let (status, first) = restore_call(address, bearer, 20, g.memory_id, Some(&token_g)).await;
+            assert_eq!(status, 200, "{first}");
+            let first_seq = first["result"]["structuredContent"]["stream_seq"]
+                .as_i64()
+                .expect("first restore stream_seq");
+            assert!(first_seq > supersede_seq_g);
+            let (status, replay) = restore_call(address, bearer, 21, g.memory_id, Some(&token_g)).await;
+            assert_eq!(status, 200, "{replay}");
+            assert_ne!(replay["result"]["isError"], true, "replay is the original success: {replay}");
+            assert_eq!(
+                replay["result"]["structuredContent"]["stream_seq"].as_i64(),
+                Some(first_seq),
+                "replay returns the original event's stream seq, never a second restore"
+            );
+            tokio::task::block_in_place(|| {
+                assert_eq!(lifecycle_op_count(&mut handle, g.memory_id, "RESTORE"), 1,
+                    "an idempotent replay appends no second RESTORE event");
+                assert_eq!(
+                    memory_state(&mut handle, g.memory_id),
+                    ("active".into(), None, false, true)
+                );
+            });
+
+            // (f) an invisible / non-existent target -> NOT_FOUND (never an existence oracle).
+            let ghost = Uuid::now_v7();
+            let token_ghost = mint_restore_token(address, bearer, 22, ghost).await;
+            let (status, missing) =
+                restore_call(address, bearer, 23, ghost, Some(&token_ghost)).await;
+            assert_eq!(status, 200, "{missing}");
+            assert_tool_error(&missing, "NOT_FOUND");
+
+            // Fault injection: the authority UPDATE fails inside the gated transaction -> the
+            // RESTORE event append and the token consume must roll back with it (no orphan event).
+            let m = tokio::task::block_in_place(|| handle.seed_workspace_visible_context_record());
+            drive_supersede(address, bearer, 24, m.memory_id, b.memory_id).await;
+            let token_m = mint_restore_token(address, bearer, 26, m.memory_id).await;
+            tokio::task::block_in_place(|| {
+                handle
+                    .admin
+                    .batch_execute(&format!(
+                        "CREATE FUNCTION {fault_fn}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                         BEGIN RAISE EXCEPTION 'injected restore fault' USING ERRCODE='23514'; END $$; \
+                         CREATE TRIGGER humaux_test_restore_fault BEFORE UPDATE OF status \
+                         ON private.memory_records FOR EACH ROW WHEN (NEW.status = 'active') \
+                         EXECUTE FUNCTION {fault_fn}();"
+                    ))
+                    .expect("owner installs restore fault");
+            });
+            let (status, faulted) =
+                restore_call(address, bearer, 27, m.memory_id, Some(&token_m)).await;
+            tokio::task::block_in_place(|| {
+                handle
+                    .admin
+                    .batch_execute(&format!(
+                        "DROP TRIGGER humaux_test_restore_fault ON private.memory_records; \
+                         DROP FUNCTION {fault_fn}();"
+                    ))
+                    .expect("owner removes restore fault");
+            });
+            assert_eq!(status, 200, "{faulted}");
+            assert_tool_error(&faulted, "CONFLICT");
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, m.memory_id),
+                    ("superseded".into(), Some(b.memory_id), true, true),
+                    "the authority flip rolled back"
+                );
+                assert_eq!(lifecycle_op_count(&mut handle, m.memory_id, "RESTORE"), 0,
+                    "no orphaned RESTORE event survived the rolled-back UPDATE");
+                assert_eq!(token_consumed(&mut handle, &token_m), Some(false));
+            });
+
+            // (g) concurrent double-restore of one superseded memory: exactly one wins, the
+            // loser's consume + event roll back, G59-4 holds throughout (same window-lock
+            // overlap trick as the supersede race).
+            let n = tokio::task::block_in_place(|| handle.seed_workspace_visible_context_record());
+            drive_supersede(address, bearer, 28, n.memory_id, b.memory_id).await;
+            let token_n1 = mint_restore_token(address, bearer, 30, n.memory_id).await;
+            let token_n2 = mint_restore_token(address, bearer, 31, n.memory_id).await;
+            let mut window_lock = tokio::task::block_in_place(|| {
+                let mut client = handle.owner_client().expect("owner window-lock client");
+                client.batch_execute("BEGIN").expect("owner window-lock txn");
+                let locked = client
+                    .execute(
+                        "SELECT 1 FROM control.quota_windows WHERE tenant_id=$1 FOR UPDATE",
+                        &[&handle.tenant_id],
+                    )
+                    .expect("owner holds the quota window row");
+                assert!(locked >= 1, "fixture tenant has a quota window to hold");
+                client
+            });
+            let left = tokio::spawn({
+                let bearer = bearer.to_owned();
+                let token = token_n1.clone();
+                let target = n.memory_id;
+                async move { restore_call(address, &bearer, 32, target, Some(&token)).await }
+            });
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let right = tokio::spawn({
+                let bearer = bearer.to_owned();
+                let token = token_n2.clone();
+                let target = n.memory_id;
+                async move { restore_call(address, &bearer, 33, target, Some(&token)).await }
+            });
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::task::block_in_place(|| {
+                let queued: i64 = window_lock
+                    .query_one(
+                        "SELECT count(*) FROM pg_stat_activity WHERE usename='role_gateway' \
+                         AND wait_event_type='Lock' AND state='active'",
+                        &[],
+                    )
+                    .expect("owner observes queued gateway writers")
+                    .get(0);
+                assert_eq!(queued, 2, "both gated restore transactions are open and queued");
+                window_lock.batch_execute("COMMIT").expect("release quota window row");
+                drop(window_lock);
+            });
+            let (left, right) = tokio::join!(left, right);
+            let outcomes = [left.expect("left restore"), right.expect("right restore")];
+            let winners = outcomes
+                .iter()
+                .filter(|(status, response)| {
+                    *status == 200
+                        && response["result"]["isError"] != true
+                        && response["result"]["structuredContent"].get("restored_at").is_some()
+                })
+                .count();
+            assert_eq!(winners, 1, "exactly one concurrent restore wins: {outcomes:?}");
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, n.memory_id),
+                    ("active".into(), None, false, true)
+                );
+                assert_eq!(lifecycle_op_count(&mut handle, n.memory_id, "RESTORE"), 1,
+                    "one restore event for one winning restore");
+                let consumed = [&token_n1, &token_n2]
+                    .into_iter()
+                    .filter(|token| token_consumed(&mut handle, token) == Some(true))
+                    .count();
+                assert_eq!(consumed, 1, "the loser's token consume rolled back");
+                assert!(all_rows_satisfy_g59_4(&mut handle), "G59-4 never violated");
+            });
+
+            stop_server(server).await.expect("stop restore server");
         });
     });
 }

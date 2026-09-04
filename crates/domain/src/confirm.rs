@@ -29,14 +29,18 @@ pub enum DestructiveOp {
     MemoryPin,
     /// §36 `memory.unpin`: revoke that binding row only — never Evidence/Memory (ADR-0019).
     MemoryUnpin,
+    /// §36 `memory.restore`: undo a SUPERSEDE within the window (ADR-0020). Not itself
+    /// destructive, but it runs through the same confirm gate (reuse, no second token path).
+    MemoryRestore,
 }
 
 impl DestructiveOp {
     /// Every variant, for table-driven lookups.
-    pub const ALL: [DestructiveOp; 3] = [
+    pub const ALL: [DestructiveOp; 4] = [
         DestructiveOp::MemorySupersede,
         DestructiveOp::MemoryPin,
         DestructiveOp::MemoryUnpin,
+        DestructiveOp::MemoryRestore,
     ];
 
     /// Canonical operation key (contracts/mcp/*.schema.json `x-humaux-operation.operation_key`).
@@ -45,6 +49,7 @@ impl DestructiveOp {
             DestructiveOp::MemorySupersede => "memory.supersede",
             DestructiveOp::MemoryPin => "memory.pin",
             DestructiveOp::MemoryUnpin => "memory.unpin",
+            DestructiveOp::MemoryRestore => "memory.restore",
         }
     }
 

@@ -30,7 +30,8 @@
           "enum": [
             "memory.supersede",
             "memory.pin",
-            "memory.unpin"
+            "memory.unpin",
+            "memory.restore"
           ]
         },
         "target": {
@@ -119,6 +120,64 @@
       },
       "additionalProperties": false
     },
+    "Restored": {
+      "type": "object",
+      "description": "memory.restore executed (§36/ADR-0020): target is status=active again with superseded_by cleared; a NEW MEMORY_LIFECYCLE ticket was issued (new stream_seq — the old TOMBSTONED/consumed row is never revived), and consistency_token is bound to that new seq (§15.5).",
+      "required": [
+        "memory_id",
+        "restored_at",
+        "stream_seq",
+        "commit_seq",
+        "consistency_token"
+      ],
+      "properties": {
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "restored_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "stream_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "commit_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "consistency_token": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConflictReason": {
+      "type": "object",
+      "description": "A refused governance op surfaced as a success-shaped CONFLICT with a sub-reason (ADR-0020 D-B): ErrorCode stays frozen at 18 (§52.1), so the u16 reason and its SCREAMING_SNAKE label ride here instead of a 19th ErrorCode. memory.restore uses 1001 UNDO_WINDOW_EXPIRED, 1002 TARGET_NOT_CURRENT, 1003 ERASE_TERMINAL, 1004 TARGET_ADVANCED, 1201 ALREADY_IN_STATE, 1202 NOT_REVERSIBLE.",
+      "required": [
+        "code",
+        "reason",
+        "reason_label"
+      ],
+      "properties": {
+        "code": {
+          "const": "CONFLICT"
+        },
+        "reason": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 65535
+        },
+        "reason_label": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$"
+        }
+      },
+      "additionalProperties": false
+    },
     "Superseded": {
       "type": "object",
       "description": "memory.supersede executed (§36): target now status=superseded with superseded_by=replacement_memory_id; one MEMORY_LIFECYCLE ticket was issued on the workspace projection stream (§15.7).",
@@ -201,6 +260,12 @@
     },
     {
       "$ref": "#/$defs/BindingWritten"
+    },
+    {
+      "$ref": "#/$defs/Restored"
+    },
+    {
+      "$ref": "#/$defs/ConflictReason"
     }
   ]
 }

@@ -8,7 +8,10 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use humaux_adapters::{context_repo::MemoryEnumerationParams, postgres::RuntimeDbPool};
+use humaux_adapters::{
+    context_repo::MemoryEnumerationParams, memory_governance_repo::RestoreResult,
+    postgres::RuntimeDbPool,
+};
 use humaux_domain::{
     authority::MemoryId,
     confirm::{ConfirmToken, DestructiveOp},
@@ -37,7 +40,7 @@ use crate::{
 /// The only real MCP business routes currently available from Gateway. Confirm-gated
 /// destructive keys come from the closed `DestructiveOp` table (§78.2, ADR-0018), never a
 /// second literal.
-pub const SUPPORTED_OPERATION_KEYS: [&str; 9] = [
+pub const SUPPORTED_OPERATION_KEYS: [&str; 10] = [
     "remember.put",
     "recall.search",
     "context.assemble",
@@ -47,6 +50,7 @@ pub const SUPPORTED_OPERATION_KEYS: [&str; 9] = [
     DestructiveOp::MemorySupersede.operation_key(),
     DestructiveOp::MemoryPin.operation_key(),
     DestructiveOp::MemoryUnpin.operation_key(),
+    DestructiveOp::MemoryRestore.operation_key(),
 ];
 
 /// Bootstrap-owned, authenticated MCP dispatch.  It has no client-selected
@@ -63,6 +67,9 @@ pub struct GatewayMcpApplication {
     /// §33.10 rule 9 token lifetime (ADR-0018). `None` keeps every confirm-gated route
     /// failing closed through `reject_unsupported`.
     confirm_token_ttl: Option<Duration>,
+    /// §78.1 memory.restore undo window (ADR-0020). `None` keeps memory.supersede and
+    /// memory.restore failing closed (both write the lifecycle log).
+    undo_window: Option<Duration>,
     #[cfg(test)]
     trusted_continuity_scope: Option<humaux_domain::identity::AuthorizationScope>,
 }
@@ -87,6 +94,7 @@ impl GatewayMcpApplication {
             context_bootstrap,
             semantic_recall: None,
             confirm_token_ttl: None,
+            undo_window: None,
             #[cfg(test)]
             trusted_continuity_scope: None,
         }
@@ -99,6 +107,17 @@ impl GatewayMcpApplication {
             return Err(ErrorCode::InvalidInput);
         }
         self.confirm_token_ttl = Some(ttl);
+        Ok(self)
+    }
+
+    /// Sets the §78.1 memory.restore undo window (`HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS`,
+    /// ADR-0020). A zero window is refused. Until set, memory.supersede and memory.restore
+    /// fail closed through `reject_unsupported` (both append to the lifecycle log).
+    pub fn with_undo_window(mut self, window: Duration) -> Result<Self, ErrorCode> {
+        if window.is_zero() {
+            return Err(ErrorCode::InvalidInput);
+        }
+        self.undo_window = Some(window);
         Ok(self)
     }
 
@@ -433,7 +452,7 @@ impl GatewayMcpApplication {
                     .and_then(ConfirmToken::decode)
             })
             .transpose()?;
-        let Some(ttl) = self.confirm_token_ttl else {
+        let (Some(ttl), Some(undo_window)) = (self.confirm_token_ttl, self.undo_window) else {
             return self.reject_unsupported(context, operation, None).await;
         };
         let pool = self.runtime_pool.clone();
@@ -453,7 +472,7 @@ impl GatewayMcpApplication {
                     ttl,
                 },
                 move |write| async move {
-                    memory::supersede(pool, write, stream, target, successor).await
+                    memory::supersede(pool, write, stream, target, successor, undo_window).await
                 },
             )
             .await?;
@@ -487,6 +506,81 @@ impl GatewayMcpApplication {
                 output(value)
             }
         }
+    }
+
+    /// §36 `memory.restore` through the same §33.10 confirm gate (ADR-0020). Undoes a
+    /// SUPERSEDE within the window: reuses card 1's token (no successor argument), returns the
+    /// reactivated memory on a new stream seq with a new consistency_token, or a success-shaped
+    /// `{code:"CONFLICT", reason:<u16>}` when the undo is refused (D-B — §52.1 keeps 18 codes).
+    async fn memory_restore(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        raw_arguments: &str,
+        value: &Value,
+    ) -> Result<ToolOutput, ErrorCode> {
+        let target = MemoryId::parse(value["memory_id"].as_str().ok_or(ErrorCode::InvalidInput)?)?;
+        let presented = value
+            .get("confirm_token")
+            .map(|token| {
+                token
+                    .as_str()
+                    .ok_or(ErrorCode::InvalidInput)
+                    .and_then(ConfirmToken::decode)
+            })
+            .transpose()?;
+        // Both lifecycle-writing routes gate on the undo-window config together; restore reads
+        // the stored deadline but stays disabled until the process declares the window.
+        let (Some(ttl), Some(_window)) = (self.confirm_token_ttl, self.undo_window) else {
+            return self.reject_unsupported(context, operation, None).await;
+        };
+        let pool = self.runtime_pool.clone();
+        let stream = self.context_bootstrap.stream.clone();
+        let consistency_token_ttl = self.remember_policy.consistency_token_ttl();
+        let outcome = self
+            .guard
+            .run_confirmed_write(
+                context,
+                operation,
+                None,
+                raw_arguments,
+                ConfirmGate {
+                    op: DestructiveOp::MemoryRestore,
+                    target_id: target.0,
+                    successor_id: None,
+                    presented,
+                    ttl,
+                },
+                move |write| async move {
+                    memory::restore(pool, write, stream, target, consistency_token_ttl).await
+                },
+            )
+            .await?;
+        let value = match outcome {
+            ConfirmedOutcome::ConfirmationRequired { token, expires_at } => json!({
+                "confirmation_required": true,
+                "confirm_token": token.encode(),
+                "operation": operation.operation_key(),
+                "target": { "memory_id": target.0 },
+                "expires_at": rfc3339(expires_at)?,
+            }),
+            ConfirmedOutcome::Executed(RestoreResult::Restored(done)) => json!({
+                "memory_id": target.0,
+                "restored_at": rfc3339(done.restored_at)?,
+                "stream_seq": done.stream_seq,
+                "commit_seq": done.commit_seq,
+                "consistency_token": done.consistency_token,
+            }),
+            // D-B: a refused undo is a success-shaped CONFLICT-with-reason result, not an
+            // ErrorCode (which would carry no reason through the frozen §52.1 error map).
+            ConfirmedOutcome::Executed(RestoreResult::Refused(reason)) => json!({
+                "code": "CONFLICT",
+                "reason": reason.code(),
+                "reason_label": reason.label().unwrap_or("UNKNOWN"),
+            }),
+        };
+        self.catalog.validate_output(ToolName::Memory, &value)?;
+        output(value)
     }
 
     /// §36 `memory.pin` / `memory.unpin` through the same §33.10 confirm gate (ADR-0019).
@@ -700,6 +794,10 @@ impl McpApplication for GatewayMcpApplication {
                     DestructiveOp::MemoryUnpin,
                 )
                 .await
+            }
+            key if key == DestructiveOp::MemoryRestore.operation_key() => {
+                self.memory_restore(context, &operation, &raw_arguments, &value)
+                    .await
             }
             _ => {
                 self.reject_unsupported(context, &operation, workspace(&value)?)

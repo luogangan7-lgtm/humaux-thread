@@ -7,7 +7,9 @@ use humaux_adapters::{
         self, BindingWriteOutcome, BindingWriteRequest, MaterializedMemory,
         MemoryEnumerationParams, materialize_memory_enumeration, materialize_memory_get,
     },
-    memory_governance_repo::{self, SupersedeOutcome, SupersedeRequest},
+    memory_governance_repo::{
+        self, RestoreRequest, RestoreResult, SupersedeOutcome, SupersedeRequest,
+    },
     postgres::RuntimeDbPool,
     read_materialize::MaterializedItem,
 };
@@ -138,6 +140,7 @@ pub(crate) async fn supersede(
     stream: StreamKey,
     target: MemoryId,
     successor: MemoryId,
+    undo_window: Duration,
 ) -> Result<SupersedeOutcome, ErrorCode> {
     let workspace = write
         .request
@@ -159,6 +162,41 @@ pub(crate) async fn supersede(
             stream,
             claim: write.claim,
             finished_audit: write.finished_audit,
+            undo_window,
+        },
+    )
+    .await
+}
+
+/// §36 `memory.restore`, second (confirmed) call (ADR-0020). Same `read_scope` workspace rule
+/// as `memory.supersede`: the lifecycle ticket lands on the bootstrap stream's workspace.
+pub(crate) async fn restore(
+    pool: Arc<RuntimeDbPool>,
+    write: ConfirmedWrite,
+    stream: StreamKey,
+    target: MemoryId,
+    consistency_token_ttl: Duration,
+) -> Result<RestoreResult, ErrorCode> {
+    let workspace = write
+        .request
+        .workspace_id()
+        .ok_or(ErrorCode::DependencyUnavailable)?;
+    let authorization = write.request.authorization().narrow(workspace)?;
+    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
+        return Err(ErrorCode::DependencyUnavailable);
+    }
+    memory_governance_repo::restore_atomically(
+        &pool,
+        &authorization,
+        RestoreRequest {
+            request_id: write.request.request_id(),
+            request_fingerprint: write.request_fingerprint,
+            reservation_ttl: write.reservation_ttl,
+            target,
+            stream,
+            claim: write.claim,
+            finished_audit: write.finished_audit,
+            consistency_token_ttl,
         },
     )
     .await
@@ -199,7 +237,9 @@ pub(crate) async fn write_binding(
         DestructiveOp::MemoryUnpin => {
             context_repo::unpin_confirmed(&pool, &authorization, request).await
         }
-        DestructiveOp::MemorySupersede => Err(ErrorCode::InvalidInput),
+        DestructiveOp::MemorySupersede | DestructiveOp::MemoryRestore => {
+            Err(ErrorCode::InvalidInput)
+        }
     }
 }
 
