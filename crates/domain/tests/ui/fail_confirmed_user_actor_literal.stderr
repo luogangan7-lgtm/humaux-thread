@@ -1,0 +1,7 @@
+error: cannot construct `ConfirmedUserActor` with struct literal syntax due to private fields
+  --> tests/ui/fail_confirmed_user_actor_literal.rs:16:18
+   |
+16 |     let forged = ConfirmedUserActor { _priv: () };
+   |                  ^^^^^^^^^^^^^^^^^^   --------- private field
+   |
+   = note: ...and other private field `memory_id` that was not provided

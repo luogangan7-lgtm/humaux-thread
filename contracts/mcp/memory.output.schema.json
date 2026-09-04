@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MemoryReadResult",
-  "description": "Direct Memory Envelope, one authorized immutable enumeration page, or one of the two memory.supersede results (confirmation_required / superseded). The catalog resolves the embedded canonical Envelope without network access.",
+  "description": "Direct Memory Envelope, one authorized immutable enumeration page, a confirmation_required result of a gated op (memory.supersede / memory.pin / memory.unpin), a superseded result, or a pin/unpin binding result. The catalog resolves the embedded canonical Envelope without network access.",
   "type": "object",
   "$defs": {
     "Envelope": {
@@ -28,14 +28,15 @@
         "operation": {
           "type": "string",
           "enum": [
-            "memory.supersede"
+            "memory.supersede",
+            "memory.pin",
+            "memory.unpin"
           ]
         },
         "target": {
           "type": "object",
           "required": [
-            "memory_id",
-            "replacement_memory_id"
+            "memory_id"
           ],
           "properties": {
             "memory_id": {
@@ -52,6 +53,68 @@
         "expires_at": {
           "type": "string",
           "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "memory.supersede"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "required": [
+              "memory_id",
+              "replacement_memory_id"
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "target": {
+            "not": {
+              "required": [
+                "replacement_memory_id"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "BindingWritten": {
+      "type": "object",
+      "description": "memory.pin / memory.unpin executed (§36, ADR-0019): binding_id is the private.context_bindings row (mode=PINNED at the credential's workspace scope). pin: inserted=false when the memory was already pinned (D-C idempotent, no new row). unpin: revoked=true, the row's revoked_at is set; Evidence/Memory untouched.",
+      "required": [
+        "memory_id",
+        "binding_id",
+        "mode",
+        "state"
+      ],
+      "properties": {
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "binding_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "mode": {
+          "const": "PINNED"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "pinned",
+            "unpinned"
+          ]
+        },
+        "inserted": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -135,6 +198,9 @@
     },
     {
       "$ref": "#/$defs/Superseded"
+    },
+    {
+      "$ref": "#/$defs/BindingWritten"
     }
   ]
 }

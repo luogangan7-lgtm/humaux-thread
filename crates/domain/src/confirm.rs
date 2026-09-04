@@ -25,16 +25,26 @@ use crate::error::ErrorCode;
 pub enum DestructiveOp {
     /// §36 `memory.supersede`: mark one Memory superseded by a successor (G59-4).
     MemorySupersede,
+    /// §36 `memory.pin`: upsert one PINNED `context_bindings` row (ADR-0019).
+    MemoryPin,
+    /// §36 `memory.unpin`: revoke that binding row only — never Evidence/Memory (ADR-0019).
+    MemoryUnpin,
 }
 
 impl DestructiveOp {
     /// Every variant, for table-driven lookups.
-    pub const ALL: [DestructiveOp; 1] = [DestructiveOp::MemorySupersede];
+    pub const ALL: [DestructiveOp; 3] = [
+        DestructiveOp::MemorySupersede,
+        DestructiveOp::MemoryPin,
+        DestructiveOp::MemoryUnpin,
+    ];
 
     /// Canonical operation key (contracts/mcp/*.schema.json `x-humaux-operation.operation_key`).
     pub const fn operation_key(self) -> &'static str {
         match self {
             DestructiveOp::MemorySupersede => "memory.supersede",
+            DestructiveOp::MemoryPin => "memory.pin",
+            DestructiveOp::MemoryUnpin => "memory.unpin",
         }
     }
 

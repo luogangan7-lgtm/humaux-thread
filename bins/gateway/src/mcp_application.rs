@@ -37,7 +37,7 @@ use crate::{
 /// The only real MCP business routes currently available from Gateway. Confirm-gated
 /// destructive keys come from the closed `DestructiveOp` table (§78.2, ADR-0018), never a
 /// second literal.
-pub const SUPPORTED_OPERATION_KEYS: [&str; 7] = [
+pub const SUPPORTED_OPERATION_KEYS: [&str; 9] = [
     "remember.put",
     "recall.search",
     "context.assemble",
@@ -45,6 +45,8 @@ pub const SUPPORTED_OPERATION_KEYS: [&str; 7] = [
     "memory.enumerate",
     "continuity.get",
     DestructiveOp::MemorySupersede.operation_key(),
+    DestructiveOp::MemoryPin.operation_key(),
+    DestructiveOp::MemoryUnpin.operation_key(),
 ];
 
 /// Bootstrap-owned, authenticated MCP dispatch.  It has no client-selected
@@ -487,6 +489,74 @@ impl GatewayMcpApplication {
         }
     }
 
+    /// §36 `memory.pin` / `memory.unpin` through the same §33.10 confirm gate (ADR-0019).
+    /// One arm for both: identical wire shape (`memory_id` + optional `confirm_token`), the
+    /// closed `op` is the only difference, and the token is bound to it (a pin confirmation
+    /// never executes an unpin). No `workspace_id` on the wire: the route is the credential's
+    /// bound workspace (same rule as `memory.get` / `memory.supersede`).
+    async fn memory_binding_write(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        raw_arguments: &str,
+        value: &Value,
+        op: DestructiveOp,
+    ) -> Result<ToolOutput, ErrorCode> {
+        let memory = MemoryId::parse(value["memory_id"].as_str().ok_or(ErrorCode::InvalidInput)?)?;
+        let presented = value
+            .get("confirm_token")
+            .map(|token| {
+                token
+                    .as_str()
+                    .ok_or(ErrorCode::InvalidInput)
+                    .and_then(ConfirmToken::decode)
+            })
+            .transpose()?;
+        let Some(ttl) = self.confirm_token_ttl else {
+            return self.reject_unsupported(context, operation, None).await;
+        };
+        let pool = self.runtime_pool.clone();
+        let stream = self.context_bootstrap.stream.clone();
+        let outcome =
+            self.guard
+                .run_confirmed_write(
+                    context,
+                    operation,
+                    None,
+                    raw_arguments,
+                    ConfirmGate {
+                        op,
+                        target_id: memory.0,
+                        successor_id: None,
+                        presented,
+                        ttl,
+                    },
+                    move |write| async move {
+                        memory::write_binding(pool, write, stream, op, memory).await
+                    },
+                )
+                .await?;
+        let value = match outcome {
+            ConfirmedOutcome::ConfirmationRequired { token, expires_at } => json!({
+                "confirmation_required": true,
+                "confirm_token": token.encode(),
+                "operation": operation.operation_key(),
+                "target": { "memory_id": memory.0 },
+                "expires_at": rfc3339(expires_at)?,
+            }),
+            ConfirmedOutcome::Executed(done) => json!({
+                "memory_id": memory.0,
+                "binding_id": done.binding_id,
+                "mode": "PINNED",
+                "state": if op == DestructiveOp::MemoryPin { "pinned" } else { "unpinned" },
+                "inserted": done.inserted,
+            }),
+        };
+        // Both results are branches of memory.output.schema.json (tools/list advertises it).
+        self.catalog.validate_output(ToolName::Memory, &value)?;
+        output(value)
+    }
+
     async fn recall_search(
         &self,
         context: &McpHttpContext,
@@ -610,6 +680,26 @@ impl McpApplication for GatewayMcpApplication {
             key if key == DestructiveOp::MemorySupersede.operation_key() => {
                 self.memory_supersede(context, &operation, &raw_arguments, &value)
                     .await
+            }
+            key if key == DestructiveOp::MemoryPin.operation_key() => {
+                self.memory_binding_write(
+                    context,
+                    &operation,
+                    &raw_arguments,
+                    &value,
+                    DestructiveOp::MemoryPin,
+                )
+                .await
+            }
+            key if key == DestructiveOp::MemoryUnpin.operation_key() => {
+                self.memory_binding_write(
+                    context,
+                    &operation,
+                    &raw_arguments,
+                    &value,
+                    DestructiveOp::MemoryUnpin,
+                )
+                .await
             }
             _ => {
                 self.reject_unsupported(context, &operation, workspace(&value)?)

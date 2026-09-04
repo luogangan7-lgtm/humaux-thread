@@ -3833,3 +3833,465 @@ fn native_mcp_memory_supersede_confirm_gate_acceptance() {
         });
     });
 }
+
+// ---------------------------------------------------------------------------------------
+// §36 memory.pin / memory.unpin behind the same confirm gate (ADR-0019)
+// ---------------------------------------------------------------------------------------
+
+async fn binding_call(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    action: &str,
+    memory_id: Uuid,
+    token: Option<&str>,
+) -> (u16, Value) {
+    let mut arguments = json!({ "action": action, "memory_id": memory_id });
+    if let Some(token) = token {
+        arguments["confirm_token"] = Value::String(token.to_owned());
+    }
+    raw_request(
+        address,
+        &tool_call_headers("memory", bearer),
+        &rpc(request_id, "tools/call", call_params("memory", arguments)),
+    )
+    .await
+}
+
+/// First call of pin/unpin: a success-shaped `confirmation_required` result, never a write.
+async fn mint_binding_token(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    action: &str,
+    memory_id: Uuid,
+) -> String {
+    let (status, response) =
+        binding_call(address, bearer, request_id, action, memory_id, None).await;
+    assert_eq!(status, 200, "first call is an MCP result: {response}");
+    let structured = assert_tool_response(&response, ToolName::Memory);
+    assert_eq!(structured["confirmation_required"], true, "{response}");
+    assert_eq!(
+        structured["operation"],
+        format!("memory.{action}"),
+        "{response}"
+    );
+    assert_eq!(
+        structured["target"]["memory_id"],
+        memory_id.to_string(),
+        "{response}"
+    );
+    assert!(
+        structured["target"].get("replacement_memory_id").is_none(),
+        "{response}"
+    );
+    let token = structured["confirm_token"]
+        .as_str()
+        .expect("confirm_token string")
+        .to_owned();
+    assert_eq!(token.len(), 43, "base64url of 32 bytes: {token}");
+    token
+}
+
+/// Active (revoked_at IS NULL) PINNED rows for one memory: `(count, binding_id of the first)`.
+fn pinned_rows(handle: &mut Handle, memory_id: Uuid) -> (i64, Option<Uuid>) {
+    let row = handle
+        .admin
+        .query_one(
+            "SELECT count(*), min(context_binding_id::text)::uuid FROM private.context_bindings \
+             WHERE tenant_id=$1 AND memory_id=$2 AND mode='PINNED' AND revoked_at IS NULL",
+            &[&handle.tenant_id, &memory_id],
+        )
+        .expect("owner counts pinned rows");
+    (row.get(0), row.get(1))
+}
+
+/// The row versions of a memory and its evidence links/objects: unpin must leave all of them
+/// exactly as they were (§36: "unpin 只撤 binding，不改 Evidence/Memory").
+fn memory_and_evidence_versions(
+    handle: &mut Handle,
+    memory_id: Uuid,
+) -> (String, String, Vec<String>) {
+    let memory = handle
+        .admin
+        .query_one(
+            "SELECT status, xmin::text FROM private.memory_records WHERE memory_id=$1",
+            &[&memory_id],
+        )
+        .expect("owner reads memory row version");
+    let evidence: Vec<String> = handle
+        .admin
+        .query(
+            "SELECT me.xmin::text || ':' || eo.xmin::text FROM private.memory_evidence me \
+             JOIN private.evidence_objects eo ON eo.evidence_id = me.evidence_id \
+             WHERE me.memory_id=$1 ORDER BY me.evidence_id",
+            &[&memory_id],
+        )
+        .expect("owner reads evidence row versions")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    (memory.get(0), memory.get(1), evidence)
+}
+
+/// libpq-standard `options=-c role=X` (same helper `crates/adapters/tests/consolidate_snapshot.rs`
+/// uses): a real `role_consolidation_worker` LOGIN for the §11.8 exclusion witness.
+fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
+    let sep = if admin_dsn.contains('?') { '&' } else { '?' };
+    format!("{admin_dsn}{sep}options=-c%20role%3D{role}")
+}
+
+/// Runs the real consolidation selector (`select_and_materialize_inputs`, whose WHERE carries
+/// the one `ACTIVE_NO_AUTO_MUTATE_BINDING` predicate) for the fixture workspace and returns
+/// the selected memory ids.
+async fn consolidation_selected_inputs(handle: &mut Handle) -> Vec<Uuid> {
+    let admin_dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("fixture ran, so the DSN is set");
+    let pool = humaux_adapters::postgres::ConsolidationDbPool::connect(&dsn_as_role(
+        &admin_dsn,
+        "role_consolidation_worker",
+    ))
+    .await
+    .expect("actual role_consolidation_worker login");
+    let run_id = humaux_adapters::consolidate_repo::create_run(
+        &pool,
+        handle.tenant_id,
+        handle.reasoning_domain_id,
+        Some(handle.workspace_id),
+    )
+    .await
+    .expect("consolidation run");
+    let selected: Vec<Uuid> = humaux_adapters::consolidate_repo::select_and_materialize_inputs(
+        &pool,
+        run_id,
+        handle.tenant_id,
+        handle.reasoning_domain_id,
+        Some(handle.workspace_id),
+        1_000,
+    )
+    .await
+    .expect("consolidation selection")
+    .into_iter()
+    .map(|input| input.memory_id.into_inner().0)
+    .collect();
+    // The fixture teardown does not know consolidation tables; drop the witness run's rows
+    // so its memory_records deletes are not blocked by `memory_consolidation_inputs`' FK.
+    tokio::task::block_in_place(|| {
+        handle
+            .admin
+            .batch_execute(&format!(
+                "DELETE FROM private.memory_consolidation_inputs WHERE run_id='{run_id}'; \
+                 DELETE FROM private.memory_consolidation_runs WHERE run_id='{run_id}'"
+            ))
+            .expect("owner removes the witness consolidation run");
+    });
+    selected
+}
+
+async fn assemble_pinned_ids(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    workspace: Uuid,
+) -> Vec<Uuid> {
+    let (status, response) = raw_request(
+        address,
+        &tool_call_headers("context", bearer),
+        &rpc(
+            request_id,
+            "tools/call",
+            call_params("context", json!({"workspace_id": workspace})),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "context.assemble: {response}");
+    let value = assert_tool_response(&response, ToolName::Context);
+    value["handoff"]["pinned"]
+        .as_array()
+        .expect("pinned IDs")
+        .iter()
+        .map(|row| Uuid::parse_str(row["memory_id"].as_str().expect("memory_id")).expect("uuid"))
+        .collect()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One real HTTP fixture carries the whole pin/unpin acceptance matrix.
+fn native_mcp_memory_pin_unpin_confirm_gate_acceptance() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>("native_mcp_memory_pin_unpin_confirm_gate", |mut handle| {
+        handle.assert_gateway_login();
+        let prefix = format!("mpin{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let wire = format!("{prefix}.{}", "f".repeat(32));
+        let credential = handle.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &prefix,
+            &wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+            64,
+        );
+        // x: a workspace-visible memory with NO mandatory binding (the fixture's MANDATORY row
+        // is revoked) and an authority no mandatory selector picks up, so the only way it can
+        // reach the Context is the PINNED lane. y: a second record for the misbound-token case.
+        let x = handle.seed_workspace_visible_context_record();
+        let y = handle.seed_workspace_visible_context_record();
+        for record in [&x, &y] {
+            handle
+                .admin
+                .execute(
+                    "UPDATE private.context_bindings SET revoked_at = now() WHERE context_binding_id=$1",
+                    &[&record.binding_id],
+                )
+                .expect("owner revokes the fixture's mandatory binding");
+            handle
+                .admin
+                .execute(
+                    "UPDATE private.memory_records SET authority_class='ExplicitTaskContext' WHERE memory_id=$1",
+                    &[&record.memory_id],
+                )
+                .expect("owner raises authority above the pinned-lane floor");
+        }
+
+        let runtime_handle = handle.rt.handle().clone();
+        let runtime = runtime_handle
+            .block_on(handle.fresh_runtime())
+            .expect("checked pin runtime");
+        let app = application(&handle, runtime);
+        runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let bearer = credential.bearer.as_str();
+            let workspace = handle.workspace_id;
+
+            // Baseline: nothing pinned, the Context has no pinned rows, consolidation sees x.
+            assert_eq!(assemble_pinned_ids(address, bearer, 1, workspace).await, Vec::<Uuid>::new());
+            assert!(consolidation_selected_inputs(&mut handle).await.contains(&x.memory_id));
+            let before = blocking_counts(&mut handle);
+
+            // (a) pin without a token: confirmation_required, no binding row, no durable write
+            // besides the token row + its tagged audit.
+            let token_x = mint_binding_token(address, bearer, 2, "pin", x.memory_id).await;
+            tokio::task::block_in_place(|| {
+                assert_eq!(pinned_rows(&mut handle, x.memory_id), (0, None), "mint inserts no binding");
+                assert_eq!(token_consumed(&mut handle, &token_x), Some(false));
+                assert_eq!(durable_counts(counts(&mut handle)), durable_counts(before));
+            });
+
+            // Negative gate: a token minted for y is rejected on x (target binding), and a pin
+            // token is rejected by unpin (operation binding). Both: CONFLICT, no row, token unconsumed.
+            // Fault-injection sentinel: stub `consume_in_txn` to always pass and these go red.
+            let token_y = mint_binding_token(address, bearer, 3, "pin", y.memory_id).await;
+            let (status, wrong_target) =
+                binding_call(address, bearer, 4, "pin", x.memory_id, Some(&token_y)).await;
+            assert_eq!(status, 200, "{wrong_target}");
+            assert_tool_error(&wrong_target, "CONFLICT");
+            let (status, wrong_op) =
+                binding_call(address, bearer, 5, "unpin", x.memory_id, Some(&token_x)).await;
+            assert_eq!(status, 200, "{wrong_op}");
+            assert_tool_error(&wrong_op, "CONFLICT");
+            let garbage = "A".repeat(43);
+            let (status, unknown) =
+                binding_call(address, bearer, 6, "pin", x.memory_id, Some(&garbage)).await;
+            assert_eq!(status, 200, "{unknown}");
+            assert_tool_error(&unknown, "CONFLICT");
+            tokio::task::block_in_place(|| {
+                assert_eq!(pinned_rows(&mut handle, x.memory_id), (0, None));
+                assert_eq!(pinned_rows(&mut handle, y.memory_id), (0, None));
+                assert_eq!(token_consumed(&mut handle, &token_x), Some(false));
+                assert_eq!(token_consumed(&mut handle, &token_y), Some(false));
+            });
+
+            // (b) pin with its token: one PINNED row, revoked_at NULL, token consumed; the
+            // read side surfaces it through the existing PinnedLane with zero read-side change.
+            let (status, pinned) =
+                binding_call(address, bearer, 7, "pin", x.memory_id, Some(&token_x)).await;
+            assert_eq!(status, 200, "{pinned}");
+            let structured = assert_tool_response(&pinned, ToolName::Memory);
+            assert_eq!(structured["memory_id"], x.memory_id.to_string());
+            assert_eq!(structured["mode"], "PINNED");
+            assert_eq!(structured["state"], "pinned");
+            assert_eq!(structured["inserted"], true);
+            let binding_id = Uuid::parse_str(structured["binding_id"].as_str().expect("binding_id")).expect("uuid");
+            tokio::task::block_in_place(|| {
+                assert_eq!(pinned_rows(&mut handle, x.memory_id), (1, Some(binding_id)));
+                let row = handle
+                    .admin
+                    .query_one(
+                        "SELECT mode, scope_kind, scope_id, created_by, revoked_at IS NULL \
+                         FROM private.context_bindings WHERE context_binding_id=$1",
+                        &[&binding_id],
+                    )
+                    .expect("owner reads the binding");
+                let (mode, scope_kind, scope_id, created_by, active): (String, String, Uuid, Uuid, bool) =
+                    (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+                assert_eq!((mode.as_str(), scope_kind.as_str(), scope_id, created_by, active),
+                    ("PINNED", "WORKSPACE", workspace, handle.user_id, true));
+                assert_eq!(token_consumed(&mut handle, &token_x), Some(true));
+                let (minted, executed): (i64, i64) = {
+                    let row = handle
+                        .admin
+                        .query_one(
+                            "SELECT count(*) FILTER (WHERE $2 = ANY(risk_tags)), \
+                                    count(*) FILTER (WHERE NOT ($2 = ANY(risk_tags))) \
+                             FROM control.audit_events WHERE tenant_id=$1 \
+                               AND resource_id='memory.pin' AND action='MCP_REQUEST_FINISHED' AND result='OK'",
+                            &[&handle.tenant_id, &humaux_domain::confirm::RISK_TAG_CONFIRMATION_MINTED],
+                        )
+                        .expect("owner counts finished audits");
+                    (row.get(0), row.get(1))
+                };
+                assert_eq!((minted, executed), (2, 1), "two tagged mints (x, y), one executed write");
+            });
+            assert_eq!(assemble_pinned_ids(address, bearer, 8, workspace).await, vec![x.memory_id]);
+            // §11.8: the pinned memory is no longer an automatic consolidation input.
+            assert!(!consolidation_selected_inputs(&mut handle).await.contains(&x.memory_id));
+
+            // (c) idempotent: a second confirmed pin returns the same row, inserts nothing.
+            let token_again = mint_binding_token(address, bearer, 9, "pin", x.memory_id).await;
+            let (status, again) =
+                binding_call(address, bearer, 10, "pin", x.memory_id, Some(&token_again)).await;
+            assert_eq!(status, 200, "{again}");
+            let structured = assert_tool_response(&again, ToolName::Memory);
+            assert_eq!(structured["binding_id"], binding_id.to_string());
+            assert_eq!(structured["inserted"], false);
+            tokio::task::block_in_place(|| {
+                assert_eq!(pinned_rows(&mut handle, x.memory_id), (1, Some(binding_id)));
+                assert_eq!(token_consumed(&mut handle, &token_again), Some(true));
+            });
+
+            // (c') Envelope-rollback witness (ADR-0019 D-B): the binding write runs on the
+            // confirm transaction, so a rejection *after* it leaves the PINNED row active and
+            // the token unconsumed. The owner holds a row lock on the binding so the
+            // envelope's UPDATE waits past its 1s reservation lease; once released, the
+            // revoke lands, finalize finds the lease expired (Released, not Consumed) and
+            // the whole envelope — revoke included — rolls back with CONFLICT. A binding
+            // writer on its own connection would have committed the revoke here.
+            let rollback_token = mint_binding_token(address, bearer, 17, "unpin", x.memory_id).await;
+            let request_id = Uuid::now_v7();
+            let mut metadata = humaux_domain::audit::AuditMetadata::new();
+            metadata.insert("role", "member").expect("allowlisted audit metadata");
+            let finished_audit = humaux_domain::audit::AuditEvent {
+                event_id: humaux_domain::audit::AuditEventId::new(),
+                ts: std::time::SystemTime::now(),
+                tenant_id: TenantId(handle.tenant_id),
+                actor_type: "user".into(),
+                actor_id: handle.principal_id.to_string(),
+                action: humaux_domain::audit::McpAuditAction::McpRequestFinished.as_str().into(),
+                resource_type: "mcp".into(),
+                resource_id: "memory.unpin".into(),
+                result: "OK".into(),
+                request_id: request_id.to_string(),
+                trace_id: format!("pin-rollback-{request_id}"),
+                client_ip: "127.0.0.1".into(),
+                user_agent_hash: "pin-rollback-witness".into(),
+                risk_tags: vec![],
+                before_fingerprint: None,
+                after_fingerprint: None,
+                metadata,
+            };
+            let request = humaux_adapters::context_repo::BindingWriteRequest {
+                request_id,
+                request_fingerprint: "0".repeat(64),
+                reservation_ttl: Duration::from_secs(1),
+                memory: humaux_domain::authority::MemoryId(x.memory_id),
+                workspace: WorkspaceId(workspace),
+                claim: humaux_adapters::confirm_token_repo::ConfirmationClaim {
+                    op: humaux_domain::confirm::DestructiveOp::MemoryUnpin,
+                    target_id: x.memory_id,
+                    successor_id: None,
+                    nonce_sha256: humaux_domain::confirm::ConfirmToken::decode(&rollback_token)
+                        .expect("wire token decodes")
+                        .sha256(),
+                },
+                finished_audit,
+            };
+            let mut row_lock = tokio::task::block_in_place(|| {
+                let mut txn = handle.admin.transaction().expect("owner lock transaction");
+                txn.execute(
+                    "SELECT 1 FROM private.context_bindings WHERE context_binding_id=$1 FOR UPDATE",
+                    &[&binding_id],
+                )
+                .expect("owner locks the PINNED row");
+                txn
+            });
+            let (rejected, ()) = tokio::join!(
+                humaux_adapters::context_repo::unpin_confirmed(&handle.runtime, &handle.auth, request),
+                async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::task::block_in_place(|| {
+                        let held = row_lock
+                            .query_one(
+                                "SELECT count(*) FROM pg_stat_activity \
+                                 WHERE wait_event_type = 'Lock' \
+                                   AND query LIKE 'UPDATE private.context_bindings SET revoked_at%'",
+                                &[],
+                            )
+                            .expect("owner reads lock waiters")
+                            .get::<_, i64>(0);
+                        assert_eq!(held, 1, "the envelope's revoke is waiting on the owner's row lock");
+                        row_lock.commit().expect("owner releases the row lock");
+                    });
+                }
+            );
+            assert_eq!(
+                rejected.map(|outcome| outcome.binding_id),
+                Err(humaux_domain::error::ErrorCode::Conflict),
+                "a lease expired at finalize is rejected"
+            );
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    pinned_rows(&mut handle, x.memory_id),
+                    (1, Some(binding_id)),
+                    "a post-write rejection must roll the binding write back with the envelope"
+                );
+                assert_eq!(token_consumed(&mut handle, &rollback_token), Some(false));
+            });
+
+            // (d) unpin: first call mints, the confirmed call sets revoked_at on the binding
+            // row only — Memory and Evidence row versions are byte-identical before/after.
+            let versions_before = tokio::task::block_in_place(|| memory_and_evidence_versions(&mut handle, x.memory_id));
+            let unpin_token = mint_binding_token(address, bearer, 11, "unpin", x.memory_id).await;
+            tokio::task::block_in_place(|| assert_eq!(pinned_rows(&mut handle, x.memory_id), (1, Some(binding_id))));
+            let (status, unpinned) =
+                binding_call(address, bearer, 12, "unpin", x.memory_id, Some(&unpin_token)).await;
+            assert_eq!(status, 200, "{unpinned}");
+            let structured = assert_tool_response(&unpinned, ToolName::Memory);
+            assert_eq!(structured["binding_id"], binding_id.to_string());
+            assert_eq!(structured["state"], "unpinned");
+            tokio::task::block_in_place(|| {
+                assert_eq!(pinned_rows(&mut handle, x.memory_id), (0, None));
+                let revoked: bool = handle
+                    .admin
+                    .query_one(
+                        "SELECT revoked_at IS NOT NULL FROM private.context_bindings WHERE context_binding_id=$1",
+                        &[&binding_id],
+                    )
+                    .expect("owner reads revoked_at")
+                    .get(0);
+                assert!(revoked, "unpin is a soft revoke of the same row");
+                assert_eq!(memory_and_evidence_versions(&mut handle, x.memory_id), versions_before, "unpin touched Memory/Evidence");
+                assert_eq!(token_consumed(&mut handle, &unpin_token), Some(true));
+            });
+            assert_eq!(assemble_pinned_ids(address, bearer, 13, workspace).await, Vec::<Uuid>::new());
+            assert!(consolidation_selected_inputs(&mut handle).await.contains(&x.memory_id));
+
+            // (e) unpin of a non-pinned memory: CONFLICT, and the token is not consumed.
+            let unpin_again = mint_binding_token(address, bearer, 14, "unpin", x.memory_id).await;
+            let (status, conflict) =
+                binding_call(address, bearer, 15, "unpin", x.memory_id, Some(&unpin_again)).await;
+            assert_eq!(status, 200, "{conflict}");
+            assert_tool_error(&conflict, "CONFLICT");
+            tokio::task::block_in_place(|| {
+                assert_eq!(token_consumed(&mut handle, &unpin_again), Some(false), "rejection rolls the consume back");
+            });
+
+            // (f) replaying a consumed token is CONFLICT and pins nothing.
+            let (status, replay) =
+                binding_call(address, bearer, 16, "pin", x.memory_id, Some(&token_x)).await;
+            assert_eq!(status, 200, "{replay}");
+            assert_tool_error(&replay, "CONFLICT");
+            tokio::task::block_in_place(|| assert_eq!(pinned_rows(&mut handle, x.memory_id), (0, None)));
+
+            stop_server(server).await.expect("stop pin server");
+        });
+    });
+}

@@ -14,6 +14,7 @@ pub mod entitlement;
 pub mod forget;
 pub mod ingest;
 pub mod notify;
+pub mod pin;
 pub mod public_evolve;
 pub mod referral;
 pub mod remember;

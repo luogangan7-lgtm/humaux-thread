@@ -793,7 +793,7 @@ mod tests {
                 .as_array()
                 .expect("stable output union")
                 .len(),
-            4
+            5
         );
         assert_eq!(advertised["oneOf"][0]["$ref"], "#/$defs/Envelope");
         // ADR-0018: memory.supersede's two results are the third and fourth branches.
@@ -802,6 +802,13 @@ mod tests {
             "#/$defs/ConfirmationRequired"
         );
         assert_eq!(advertised["oneOf"][3]["$ref"], "#/$defs/Superseded");
+        // ADR-0019: memory.pin / memory.unpin executed result.
+        assert_eq!(advertised["oneOf"][4]["$ref"], "#/$defs/BindingWritten");
+        // A supersede confirmation must still name its successor; pin/unpin must not.
+        assert_eq!(
+            advertised["$defs"]["ConfirmationRequired"]["if"]["properties"]["operation"]["const"],
+            "memory.supersede"
+        );
         assert_eq!(
             advertised["$defs"]["ConfirmationRequired"]["properties"]["confirmation_required"]["const"],
             true

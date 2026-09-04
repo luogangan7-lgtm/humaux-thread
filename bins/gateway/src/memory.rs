@@ -4,8 +4,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use humaux_adapters::{
     context_repo::{
-        MaterializedMemory, MemoryEnumerationParams, materialize_memory_enumeration,
-        materialize_memory_get,
+        self, BindingWriteOutcome, BindingWriteRequest, MaterializedMemory,
+        MemoryEnumerationParams, materialize_memory_enumeration, materialize_memory_get,
     },
     memory_governance_repo::{self, SupersedeOutcome, SupersedeRequest},
     postgres::RuntimeDbPool,
@@ -13,6 +13,7 @@ use humaux_adapters::{
 };
 use humaux_domain::{
     authority::MemoryId,
+    confirm::DestructiveOp,
     error::ErrorCode,
     identity::AuthorizationScope,
     ids::{Scope, WorkspaceId},
@@ -161,6 +162,45 @@ pub(crate) async fn supersede(
         },
     )
     .await
+}
+
+/// §36 `memory.pin` / `memory.unpin`, second (confirmed) call (ADR-0019). The PINNED row is
+/// scoped to the credential's bound workspace, which must be the bootstrap stream's
+/// workspace — the same rule `memory.get` / `memory.supersede` apply — so `context.assemble`
+/// reads it back through the same scope chain.
+pub(crate) async fn write_binding(
+    pool: Arc<RuntimeDbPool>,
+    write: ConfirmedWrite,
+    stream: StreamKey,
+    op: DestructiveOp,
+    memory: MemoryId,
+) -> Result<BindingWriteOutcome, ErrorCode> {
+    let workspace = write
+        .request
+        .workspace_id()
+        .ok_or(ErrorCode::DependencyUnavailable)?;
+    let authorization = write.request.authorization().narrow(workspace)?;
+    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
+        return Err(ErrorCode::DependencyUnavailable);
+    }
+    let request = BindingWriteRequest {
+        request_id: write.request.request_id(),
+        request_fingerprint: write.request_fingerprint,
+        reservation_ttl: write.reservation_ttl,
+        memory,
+        workspace,
+        claim: write.claim,
+        finished_audit: write.finished_audit,
+    };
+    match op {
+        DestructiveOp::MemoryPin => {
+            context_repo::pin_confirmed(&pool, &authorization, request).await
+        }
+        DestructiveOp::MemoryUnpin => {
+            context_repo::unpin_confirmed(&pool, &authorization, request).await
+        }
+        DestructiveOp::MemorySupersede => Err(ErrorCode::InvalidInput),
+    }
 }
 
 fn read_scope(

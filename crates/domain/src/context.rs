@@ -17,11 +17,13 @@
 //!    **不含任何可返回的 Context**。「截掉后半段还声称 complete」不是不该做的操作，
 //!    是那个臂里没有那个值可以返回。
 //!
-//! 写侧的诚实答案见 [`ElevatedActor`]：MANDATORY/PINNED 的 binding 今天**没有铸造路径**。
+//! 写侧：MANDATORY 见 [`ElevatedActor`]——今天**没有铸造路径**。PINNED 见
+//! [`ConfirmedUserActor`]——唯一铸造点是 §33.10 规则 9 的 confirm_token 被消费之后（ADR-0019）。
 
 use crate::authority::{
     AuthorityClass, AuthorityPolicy, AuthorityStatus, CandidateRejection, MemoryId, NonEmptyVec,
 };
+use crate::confirm::DestructiveOp;
 use crate::error::ErrorCode;
 use crate::evidence::EvidenceOriginClass;
 use crate::grounding::{GroundingState, GroundingStateKind, RowGrounding};
@@ -885,13 +887,52 @@ pub struct ElevatedActor {
     _priv: (),
 }
 
-/// 建 PINNED binding 所需的、经过交互确认的用户 actor。
+/// 建 PINNED binding 所需的、经过交互确认的用户 actor（ADR-0019 D-A）。
 ///
-/// 同样**今天没有铸造路径**：`confirm_token` / MRTR 交互确认全仓零命中
-/// （`crates/protocol/src/mcp.rs` 仍是占位模块）。
+/// 唯一铸造点是 [`ConfirmedUserActor::from_consumed_confirmation`]，且只认
+/// [`DestructiveOp::MemoryPin`] / [`DestructiveOp::MemoryUnpin`]：调用方必须**刚刚在同一事务里
+/// 消费了**那条 memory 的 confirm_token（`adapters::confirm_token_repo::consume_in_txn`，
+/// 0 行即 `Conflict`，永远到不了这里）。它绑定一条 memory：拿 X 的确认去建 Y 的 binding，
+/// [`authorize_pinned`] 以 `MissingConfirmation` 拒。字段私有、无 `Default`、无字面量构造
+/// （`tests/ui/fail_confirmed_user_actor_literal.rs` 注错证明），所以 consolidation /
+/// retention / private-worker 代码即便拿到 `BindingRequest` 也造不出它。
+///
+// 「只有 context_repo 的确认信封能调 from_consumed_confirmation」在 Rust 可见性上表达不出来
+// （同 workspace 任何 crate 都能调 pub fn），所以它和 `authorize_pinned(` 一样是
+// architecture-check A3 的 sole-caller needle：生产代码里只允许出现在本文件与
+// `crates/adapters/src/context_repo.rs`，而那里的唯一调用点先 `consume_in_txn` 再铸。
+// 连同 A2（`BindingGrant {` 只许在本文件）三道闸闭合：别处即便拿到 `BindingRequest`
+// 也铸不出 actor、造不出 grant、调不了 authorize。
 #[derive(Debug)]
 pub struct ConfirmedUserActor {
+    memory_id: MemoryId,
     _priv: (),
+}
+
+impl ConfirmedUserActor {
+    /// ADR-0019 D-A：只在 `op` 是 pin / unpin 时铸造，其它任何 op（包括另一个被门控的
+    /// `MemorySupersede`）都是 `MissingConfirmation`——supersede 的确认不是 pin 的确认。
+    ///
+    /// # Errors
+    /// `op` 不是 [`DestructiveOp::MemoryPin`] / [`DestructiveOp::MemoryUnpin`]。
+    pub const fn from_consumed_confirmation(
+        op: DestructiveOp,
+        memory_id: MemoryId,
+    ) -> Result<Self, CandidateRejection> {
+        match op {
+            DestructiveOp::MemoryPin | DestructiveOp::MemoryUnpin => Ok(Self {
+                memory_id,
+                _priv: (),
+            }),
+            DestructiveOp::MemorySupersede => Err(CandidateRejection::MissingConfirmation),
+        }
+    }
+
+    /// 这次确认绑定的 memory。
+    #[must_use]
+    pub const fn memory_id(&self) -> MemoryId {
+        self.memory_id
+    }
 }
 
 /// 建 binding 的请求。
@@ -999,20 +1040,21 @@ pub fn authorize_mandatory(
     })
 }
 
-/// PINNED binding 的唯一入口。
+/// PINNED binding 的唯一入口（唯一调用点由 architecture-check A3 钉在 `context_repo`）。
 ///
 /// # Errors
-/// `actor` 缺席 ⇒ [`CandidateRejection::MissingConfirmation`]。这给了那个变体第一个
-/// **可达**的生产者——它此前在仓里结构上不可达。mode 不符 ⇒ `OriginAuthorityCeiling`。
-pub const fn authorize_pinned(
+/// `actor` 缺席、或 `actor` 确认的不是 `req.memory_id` 这条 memory ⇒
+/// [`CandidateRejection::MissingConfirmation`]。mode 不符 ⇒ `OriginAuthorityCeiling`。
+pub fn authorize_pinned(
     actor: Option<&ConfirmedUserActor>,
     req: BindingRequest,
 ) -> Result<BindingGrant, CandidateRejection> {
     if !matches!(req.mode, BindingMode::Pinned) {
         return Err(CandidateRejection::OriginAuthorityCeiling);
     }
-    if actor.is_none() {
-        return Err(CandidateRejection::MissingConfirmation);
+    match actor {
+        Some(actor) if actor.memory_id() == req.memory_id => {}
+        _ => return Err(CandidateRejection::MissingConfirmation),
     }
     Ok(BindingGrant {
         mode: req.mode,
@@ -1802,6 +1844,44 @@ mod tests {
         assert_eq!(
             authorize_pinned(None, req(BindingMode::Pinned)),
             Err(CandidateRejection::MissingConfirmation)
+        );
+    }
+
+    /// ADR-0019 D-A：actor 只从 pin/unpin 的已消费确认铸造，且只对它确认的那条 memory 有效。
+    /// 注错：去掉 `from_consumed_confirmation` 的 op 判定或 `authorize_pinned` 的 memory 比对
+    /// ⇒ 本条红。
+    #[test]
+    fn confirmed_actor_binds_one_memory_and_only_pin_ops_mint_it() {
+        let request = req(BindingMode::Pinned);
+        assert!(
+            ConfirmedUserActor::from_consumed_confirmation(
+                DestructiveOp::MemorySupersede,
+                request.memory_id
+            )
+            .is_err(),
+            "a supersede confirmation is not a pin confirmation"
+        );
+        let actor = ConfirmedUserActor::from_consumed_confirmation(
+            DestructiveOp::MemoryPin,
+            request.memory_id,
+        )
+        .expect("pin confirmation mints the actor");
+        let grant = authorize_pinned(Some(&actor), request).expect("grant");
+        assert_eq!(grant.mode(), BindingMode::Pinned);
+        assert_eq!(grant.memory_id(), request.memory_id);
+
+        let other = req(BindingMode::Pinned);
+        assert_eq!(
+            authorize_pinned(Some(&actor), other),
+            Err(CandidateRejection::MissingConfirmation),
+            "a confirmation for X never grants a binding on Y"
+        );
+        assert!(
+            ConfirmedUserActor::from_consumed_confirmation(
+                DestructiveOp::MemoryUnpin,
+                other.memory_id
+            )
+            .is_ok()
         );
     }
 

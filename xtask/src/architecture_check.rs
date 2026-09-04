@@ -3414,7 +3414,10 @@ fn g25_4_binding_insert_sole_site(root: &Path) -> Verdict {
     }
 }
 
-/// §25.4 A3：`authorize_mandatory` / `authorize_pinned` 的调用点收敛。
+/// §25.4 A3：`authorize_mandatory` / `authorize_pinned` 的调用点收敛，连同 ADR-0019 D-A 的
+/// actor 铸造点 `ConfirmedUserActor::from_consumed_confirmation`——它是 pub fn，可见性挡不住
+/// consolidation / retention / private-worker 代码调它，这条 needle 才是把「只在 consume 之后
+/// 铸造」钉死的东西。
 ///
 /// **零调用点在这条闸里是合法的 Pass，与 G80-4 相反**——两者的规则方向不同：
 /// G80-4 说的是「检索侧**必须**经过 serving_version」，零调用点就是违规本身；
@@ -3441,7 +3444,11 @@ fn g25_4_authorize_sole_caller(root: &Path) -> Verdict {
     }
 
     let mut strays = Vec::new();
-    for needle in ["authorize_mandatory(", "authorize_pinned("] {
+    for needle in [
+        "authorize_mandatory(",
+        "authorize_pinned(",
+        "from_consumed_confirmation(",
+    ] {
         let (n, sites) = count_outside_allowed(root, needle, &ALLOWED);
         if n > 0 {
             strays.push(format!(
@@ -4525,7 +4532,7 @@ fn w2_continuity_contract_from(
         );
     }
     for needle in [
-        "SUPPORTED_OPERATION_KEYS: [&str; 7]",
+        "SUPPORTED_OPERATION_KEYS: [&str; 9]",
         "\"continuity.get\" =>",
     ] {
         if !dispatch.contains(needle) {
@@ -4864,7 +4871,7 @@ mod tests {
             (5, "WorkspaceAdmission::PreserveContinuityFilter => None"),
             (5, "operation.operation_key() != \"continuity.get\""),
             (6, "catalog.validate_output(ToolName::Continuity, &value)"),
-            (6, "SUPPORTED_OPERATION_KEYS: [&str; 7]"),
+            (6, "SUPPORTED_OPERATION_KEYS: [&str; 9]"),
             (6, "\"continuity.get\" =>"),
         ] {
             let mut broken = sources.clone();

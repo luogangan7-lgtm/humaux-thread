@@ -12,10 +12,12 @@
 //! 投影 lane 行。两次都经过同一个 `can_read` 回验，但不能从投影行的长度反推 expected；否则
 //! `expected == returned + missing` 会退化成恒真算术，少带了多少永远算作 0。
 
+use humaux_domain::audit::{AuditEvent, AuditEventId, McpAuditAction};
 use humaux_domain::authority::{AuthorityClass, MemoryId};
+use humaux_domain::confirm::{DestructiveOp, RISK_TAG_CONFIRMATION_MINTED};
 use humaux_domain::context::{
-    Admitted, BindingGrant, ContextBudget, FrozenReads, MandatoryLane, MandatoryRow, PinnedLane,
-    SelectorId, SelectorOutcome, SelectorSpec, spec,
+    Admitted, BindingGrant, ConfirmedUserActor, ContextBudget, FrozenReads, MandatoryLane,
+    MandatoryRow, PinnedLane, SelectorId, SelectorOutcome, SelectorSpec, authorize_pinned, spec,
 };
 use humaux_domain::error::ErrorCode;
 use humaux_domain::grounding::{GroundingMode, RowGrounding, SnapshotEdge, classify_in_snapshot};
@@ -34,11 +36,14 @@ use sqlx::Row;
 use sqlx::types::Uuid;
 use std::collections::{HashMap, HashSet};
 
+use crate::confirm_token_repo::{self, ConfirmationClaim};
 use crate::postgres::RuntimeDbPool;
+use crate::quota_repo::{self, ReservationStatus, ReserveResult};
 use crate::read_materialize::{
     MaterializedBodies, MaterializedItem, final_memory_ids_in_txn, materialize_final_bodies_in_txn,
     materialize_one_memory_in_txn,
 };
+use crate::request_guard_repo::{self, AuditTenant};
 use crate::selection_repo::{
     begin_authorized_snapshot_in_txn, fetch_authorized_snapshot_page_in_txn,
 };
@@ -1106,25 +1111,25 @@ async fn fetch_pinned_in_txn(
     ))
 }
 
-/// 全 workspace **唯一**的 `INSERT INTO private.context_bindings`。
+/// 全 workspace **唯一**的 `INSERT INTO private.context_bindings`，在调用方的事务里。
 ///
 /// 只收 [`BindingGrant`]——它的字段私有、无 pub 构造式，拿到它的唯一办法是走
 /// `domain::context` 的三个 `authorize_*` 之一。所以「绕过授权直接写 binding」不是一条
 /// 要靠评审拦住的路径，是这个函数签名收不下的东西。
 ///
+/// 调用方负责 `humaux.tenant_id` 已在该事务里 `SET LOCAL`（[`insert_binding`] 自己做；
+/// [`write_binding_confirmed`] 的信封在开头做）——binding 写与它的确认/审计**同一事务**，
+/// 信封回滚时它一起回滚，不存在「行已提交、token 未消费」的窗口。
+///
 /// # Errors
 /// 库不可达、或唯一索引冲突（同 scope 同 memory 同 mode 已有未撤销的 binding）。
-pub async fn insert_binding(
-    pool: &RuntimeDbPool,
+pub async fn insert_binding_in_txn(
+    txn: &mut Txn<'_>,
     created_by: Uuid,
     grant: &BindingGrant,
     tenant_id: Uuid,
 ) -> Result<Uuid, ErrorCode> {
-    let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
-    set_tenant_local(&mut txn, tenant_id)
-        .await
-        .map_err(|_| ErrorCode::Internal)?;
-    let id: Uuid = sqlx::query(
+    sqlx::query(
         "INSERT INTO private.context_bindings \
            (tenant_id, memory_id, mode, scope_kind, scope_id, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING context_binding_id",
@@ -1135,20 +1140,60 @@ pub async fn insert_binding(
     .bind(grant.scope_kind().wire())
     .bind(grant.scope_id())
     .bind(created_by)
-    .fetch_one(&mut *txn)
+    .fetch_one(&mut **txn)
     .await
     .map_err(|_| ErrorCode::Internal)?
     .try_get(0)
-    .map_err(|_| ErrorCode::Internal)?;
+    .map_err(|_| ErrorCode::Internal)
+}
+
+/// [`insert_binding_in_txn`] in its own short transaction (non-gated callers).
+///
+/// # Errors
+/// As [`insert_binding_in_txn`].
+pub async fn insert_binding(
+    pool: &RuntimeDbPool,
+    created_by: Uuid,
+    grant: &BindingGrant,
+    tenant_id: Uuid,
+) -> Result<Uuid, ErrorCode> {
+    let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
+    set_tenant_local(&mut txn, tenant_id)
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
+    let id = insert_binding_in_txn(&mut txn, created_by, grant, tenant_id).await?;
     txn.commit().await.map_err(|_| ErrorCode::Internal)?;
     Ok(id)
 }
 
-/// 撤销一条 binding。**软删除**：binding 的历史是审计对象，物理删掉就查不到"谁在什么时候
-/// 把什么钉进过 Context"。返回是否真的改了一行（已撤销的再撤一次返回 `false`）。
+/// 撤销一条 binding，在调用方的事务里。**软删除**：binding 的历史是审计对象，物理删掉就
+/// 查不到"谁在什么时候把什么钉进过 Context"。返回是否真的改了一行（已撤销的再撤一次返回
+/// `false`）。`tenant_id` 同时进 WHERE，不只依赖 GUC。
 ///
 /// # Errors
 /// 库不可达。
+pub async fn revoke_binding_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    binding_id: Uuid,
+) -> Result<bool, ErrorCode> {
+    let affected = sqlx::query(
+        "UPDATE private.context_bindings SET revoked_at = now() \
+         WHERE context_binding_id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(binding_id)
+    .bind(tenant_id)
+    .execute(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+/// [`revoke_binding_in_txn`] in its own short transaction (non-gated callers).
+///
+/// # Errors
+/// As [`revoke_binding_in_txn`].
 pub async fn revoke_binding(
     pool: &RuntimeDbPool,
     tenant_id: Uuid,
@@ -1158,18 +1203,271 @@ pub async fn revoke_binding(
     set_tenant_local(&mut txn, tenant_id)
         .await
         .map_err(|_| ErrorCode::Internal)?;
-    let affected = sqlx::query(
-        "UPDATE private.context_bindings SET revoked_at = now() \
-         WHERE context_binding_id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
-    )
-    .bind(binding_id)
-    .bind(tenant_id)
-    .execute(&mut *txn)
-    .await
-    .map_err(|_| ErrorCode::Internal)?
-    .rows_affected();
+    let revoked = revoke_binding_in_txn(&mut txn, tenant_id, binding_id).await?;
     txn.commit().await.map_err(|_| ErrorCode::Internal)?;
-    Ok(affected == 1)
+    Ok(revoked)
+}
+
+// =============================================================================
+// §36 memory.pin / memory.unpin —— ADR-0019 的确认写入（confirm-gated binding writes）
+// =============================================================================
+
+/// Trusted inputs of one confirmed pin/unpin (built by the gateway gate, never deserialized
+/// from MCP). `claim` is the presented token's binding, consumed **inside** this write's
+/// transaction (`confirm_token_repo::consume_in_txn`, the only consume entry).
+pub struct BindingWriteRequest {
+    pub request_id: Uuid,
+    pub request_fingerprint: String,
+    pub reservation_ttl: std::time::Duration,
+    pub memory: MemoryId,
+    /// The credential's bound workspace: the PINNED row's scope (`application::pin::pin_request`).
+    pub workspace: WorkspaceId,
+    pub claim: ConfirmationClaim,
+    pub finished_audit: AuditEvent,
+}
+
+/// Result of a confirmed pin (D-C: idempotent) or unpin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingWriteOutcome {
+    pub binding_id: Uuid,
+    /// pin: `false` when the row already existed (nothing inserted). unpin: always `false`.
+    pub inserted: bool,
+}
+
+/// Pure input contract (same shape as `memory_governance_repo::validate`): a real user, a
+/// well-formed reservation, the claim bound to exactly this op + memory, the success audit
+/// describing this op as an executed write (never carrying the mint tag).
+fn validate_binding_write(
+    auth: &AuthorizationScope,
+    op: DestructiveOp,
+    request: &BindingWriteRequest,
+) -> Result<(), ErrorCode> {
+    if auth.tenant_id().0.is_nil() || auth.principal().0.is_nil() || auth.user_id().is_none() {
+        return Err(ErrorCode::Unauthorized);
+    }
+    if request.request_id.is_nil()
+        || request.reservation_ttl.is_zero()
+        || request.request_fingerprint.len() != 64
+        || !request
+            .request_fingerprint
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(ErrorCode::InvalidInput);
+    }
+    humaux_application::pin::check_claim(
+        op,
+        request.claim.op,
+        request.claim.target_id,
+        request.claim.successor_id,
+        request.memory,
+    )?;
+    let event = &request.finished_audit;
+    if event.tenant_id != auth.tenant_id()
+        || event.actor_id != auth.principal().0.to_string()
+        || event.request_id != request.request_id.to_string()
+        || event.action != McpAuditAction::McpRequestFinished.as_str()
+        || event.resource_id != op.operation_key()
+        || event.result != "OK"
+        || event
+            .risk_tags
+            .iter()
+            .any(|tag| tag == RISK_TAG_CONFIRMATION_MINTED)
+    {
+        return Err(ErrorCode::InvalidInput);
+    }
+    Ok(())
+}
+
+/// The active PINNED row for (tenant, WORKSPACE scope, memory), if any — the same key
+/// `ux_context_bindings_active` makes unique, so at most one row can match.
+async fn active_pinned_binding_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    workspace: WorkspaceId,
+    memory: MemoryId,
+) -> Result<Option<Uuid>, ErrorCode> {
+    sqlx::query_scalar(
+        "SELECT context_binding_id FROM private.context_bindings \
+         WHERE tenant_id = $1 AND memory_id = $2 AND mode = 'PINNED' \
+           AND scope_kind = 'WORKSPACE' AND scope_id = $3 AND revoked_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(memory.0)
+    .bind(workspace.0)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)
+}
+
+fn rejection(_: humaux_domain::authority::CandidateRejection) -> ErrorCode {
+    ErrorCode::Forbidden
+}
+
+/// `memory.pin`, confirmed call (ADR-0019 D-B/D-C). See [`write_binding_confirmed`].
+///
+/// # Errors
+/// `Conflict` for a replayed/expired/misbound token or a lost BMO race; `NotFound` when the
+/// memory is not visible to the caller; `DependencyUnavailable` when COMMIT is unproven.
+pub async fn pin_confirmed(
+    pool: &RuntimeDbPool,
+    auth: &AuthorizationScope,
+    request: BindingWriteRequest,
+) -> Result<BindingWriteOutcome, ErrorCode> {
+    write_binding_confirmed(pool, auth, DestructiveOp::MemoryPin, request).await
+}
+
+/// `memory.unpin`, confirmed call: revokes the PINNED row only — Evidence/Memory untouched
+/// (§36). `Conflict` when nothing is pinned (D-C).
+///
+/// # Errors
+/// As [`pin_confirmed`].
+pub async fn unpin_confirmed(
+    pool: &RuntimeDbPool,
+    auth: &AuthorizationScope,
+    request: BindingWriteRequest,
+) -> Result<BindingWriteOutcome, ErrorCode> {
+    write_binding_confirmed(pool, auth, DestructiveOp::MemoryUnpin, request).await
+}
+
+/// The binding step of [`write_binding_confirmed`], past the consumed token and **in the
+/// same transaction**: D-C idempotent pin through the sole INSERT site, unpin through the
+/// sole revoke site.
+async fn apply_binding_write(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    op: DestructiveOp,
+    request: &BindingWriteRequest,
+    existing: Option<Uuid>,
+) -> Result<BindingWriteOutcome, ErrorCode> {
+    use humaux_application::pin::{PinAction, pin_action, pin_request, unpin_target};
+    match op {
+        DestructiveOp::MemoryPin => match pin_action(existing) {
+            PinAction::ReturnExisting(binding_id) => Ok(BindingWriteOutcome {
+                binding_id,
+                inserted: false,
+            }),
+            PinAction::Insert => {
+                // D-A: the actor exists only past a consumed confirmation for this memory.
+                let actor = ConfirmedUserActor::from_consumed_confirmation(op, request.memory)
+                    .map_err(rejection)?;
+                let grant =
+                    authorize_pinned(Some(&actor), pin_request(request.memory, request.workspace))
+                        .map_err(rejection)?;
+                let binding_id = insert_binding_in_txn(txn, user_id, &grant, tenant_id).await?;
+                Ok(BindingWriteOutcome {
+                    binding_id,
+                    inserted: true,
+                })
+            }
+        },
+        DestructiveOp::MemoryUnpin => {
+            let binding_id = unpin_target(existing)?;
+            if !revoke_binding_in_txn(txn, tenant_id, binding_id).await? {
+                return Err(ErrorCode::Conflict);
+            }
+            Ok(BindingWriteOutcome {
+                binding_id,
+                inserted: false,
+            })
+        }
+        DestructiveOp::MemorySupersede => Err(ErrorCode::InvalidInput),
+    }
+}
+
+/// One `role_gateway` transaction, in this order: reserve BMO -> quota audit -> **consume the
+/// confirm token** (0 rows = `Conflict`, nothing below runs) -> visibility of the memory
+/// (`readable_memory_ids`, the workspace's own `can_read` judge) -> the binding write ->
+/// quota CONSUMED -> audits -> COMMIT.
+///
+/// The binding write goes through the two sole writers [`insert_binding_in_txn`] /
+/// [`revoke_binding_in_txn`] **on this transaction** (D-B, same shape as
+/// `memory_governance_repo::supersede_atomically`): one pooled connection for the whole
+/// envelope, and every later rejection — reservation not `Consumed`, lease expired at
+/// finalize, COMMIT failure — rolls the binding row back together with the token consume and
+/// the audits. No path leaves a PINNED row changed without a consumed confirmation.
+async fn write_binding_confirmed(
+    pool: &RuntimeDbPool,
+    auth: &AuthorizationScope,
+    op: DestructiveOp,
+    request: BindingWriteRequest,
+) -> Result<BindingWriteOutcome, ErrorCode> {
+    validate_binding_write(auth, op, &request)?;
+    let user_id = auth.user_id().ok_or(ErrorCode::Unauthorized)?.0;
+    let tenant_id = auth.tenant_id().0;
+    let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
+    set_authorization_local(&mut txn, auth).await?;
+
+    let reservation = match quota_repo::reserve_bmo_in_txn(
+        &mut txn,
+        auth,
+        request.request_id,
+        op.operation_key(),
+        &request.request_fingerprint,
+        request.reservation_ttl,
+    )
+    .await?
+    {
+        ReserveResult::Created(reservation) => reservation,
+        ReserveResult::Existing(_) => return Err(ErrorCode::Conflict),
+    };
+    let mut quota_audit = request.finished_audit.clone();
+    quota_audit.event_id = AuditEventId::new();
+    quota_audit.action = McpAuditAction::McpQuotaReserved.as_str().to_owned();
+    request_guard_repo::audit_event_insert_in_txn(
+        &mut txn,
+        AuditTenant::Authenticated(auth),
+        &quota_audit,
+    )
+    .await?;
+
+    // Token first: a replayed/expired/misbound token must never reach the binding writers.
+    confirm_token_repo::consume_in_txn(&mut txn, auth, &request.claim).await?;
+
+    if !readable_memory_ids(&mut txn, auth, &[request.memory.0])
+        .await?
+        .contains(&request.memory.0)
+    {
+        return Err(ErrorCode::NotFound);
+    }
+    let existing =
+        active_pinned_binding_in_txn(&mut txn, tenant_id, request.workspace, request.memory)
+            .await?;
+    let outcome = apply_binding_write(&mut txn, tenant_id, user_id, op, &request, existing).await?;
+
+    if quota_repo::finish_reservation_in_txn(&mut txn, auth, &reservation, true).await?
+        != ReservationStatus::Consumed
+    {
+        return Err(ErrorCode::Conflict);
+    }
+    quota_audit.event_id = AuditEventId::new();
+    quota_audit.action = McpAuditAction::McpQuotaConsumed.as_str().to_owned();
+    request_guard_repo::audit_event_insert_in_txn(
+        &mut txn,
+        AuditTenant::Authenticated(auth),
+        &quota_audit,
+    )
+    .await?;
+    request_guard_repo::audit_event_insert_in_txn(
+        &mut txn,
+        AuditTenant::Authenticated(auth),
+        &request.finished_audit,
+    )
+    .await?;
+    let finalized_at: sqlx::types::time::OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *txn)
+            .await
+            .map_err(|_| ErrorCode::Internal)?;
+    if finalized_at >= reservation.expires_at() {
+        return Err(ErrorCode::Conflict);
+    }
+    // A COMMIT error cannot establish rollback (§34.0.1); the caller reports retryable.
+    txn.commit()
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    Ok(outcome)
 }
 
 /// [`humaux_application::continuity::ContextReadPort`] 的生产实现——委托

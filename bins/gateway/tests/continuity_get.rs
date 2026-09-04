@@ -874,7 +874,7 @@ fn continuity_guard_and_dispatch_are_not_generic_narrowing() {
     assert!(guard.contains("operation.operation_key() != \"continuity.get\""));
     assert!(dispatch.contains("ToolName::Continuity"));
     assert!(dispatch.contains("catalog.validate_output(ToolName::Continuity, &value)"));
-    assert!(dispatch.contains("SUPPORTED_OPERATION_KEYS: [&str; 7]"));
+    assert!(dispatch.contains("SUPPORTED_OPERATION_KEYS: [&str; 9]"));
     assert!(!dispatch.contains("Scope::Project"));
 
     let baseline = HttpResponse {
