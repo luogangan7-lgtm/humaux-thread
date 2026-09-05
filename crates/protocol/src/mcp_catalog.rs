@@ -793,7 +793,7 @@ mod tests {
                 .as_array()
                 .expect("stable output union")
                 .len(),
-            9
+            12
         );
         assert_eq!(advertised["oneOf"][0]["$ref"], "#/$defs/Envelope");
         // ADR-0018: memory.supersede's two results are the third and fourth branches.
@@ -811,9 +811,16 @@ mod tests {
         assert_eq!(advertised["oneOf"][7]["$ref"], "#/$defs/ConflictReason");
         // ADR-0025: memory.correct's executed result (Correction Event + new version).
         assert_eq!(advertised["oneOf"][8]["$ref"], "#/$defs/Corrected");
-        // A supersede confirmation must still name its successor; pin/unpin must not.
+        // ADR-0026 (Card 6): memory.confirm / memory.reject executed results + the candidates page.
+        assert_eq!(advertised["oneOf"][9]["$ref"], "#/$defs/Confirmed");
+        assert_eq!(advertised["oneOf"][10]["$ref"], "#/$defs/Rejected");
+        assert_eq!(advertised["oneOf"][11]["$ref"], "#/$defs/CandidatesPage");
+        // A supersede confirmation must still name its successor; pin/unpin must not. ADR-0026
+        // restructured ConfirmationRequired's conditionals into an allOf (candidate-target ops
+        // join the memory-target ones), so the supersede branch is now allOf[0].
         assert_eq!(
-            advertised["$defs"]["ConfirmationRequired"]["if"]["properties"]["operation"]["const"],
+            advertised["$defs"]["ConfirmationRequired"]["allOf"][0]["if"]["properties"]["operation"]
+                ["const"],
             "memory.supersede"
         );
         assert_eq!(

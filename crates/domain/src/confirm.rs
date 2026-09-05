@@ -44,11 +44,18 @@ pub enum DestructiveOp {
     /// Runs the same confirm gate; no successor argument on the wire (the successor is minted
     /// inside the confirmed transaction, so the token carries no `successor_id`).
     MemoryCorrect,
+    /// §36/§10.1 `memory.confirm` (ADR-0026, Card 6): promote a `private.distill_candidates`
+    /// row into `UserConfirmed` Evidence + a new Memory version. Runs the same confirm gate; the
+    /// gate `target_id` is the `candidate_id` (not a memory_id), no successor argument.
+    MemoryConfirm,
+    /// §36 `memory.reject` (ADR-0026, Card 6): mark a pending candidate REJECTED. Same gate,
+    /// `target_id` is the candidate_id, no successor; writes no Evidence/Memory.
+    MemoryReject,
 }
 
 impl DestructiveOp {
     /// Every variant, for table-driven lookups.
-    pub const ALL: [DestructiveOp; 7] = [
+    pub const ALL: [DestructiveOp; 9] = [
         DestructiveOp::MemorySupersede,
         DestructiveOp::MemoryPin,
         DestructiveOp::MemoryUnpin,
@@ -56,6 +63,8 @@ impl DestructiveOp {
         DestructiveOp::MemoryArchive,
         DestructiveOp::MemoryUnarchive,
         DestructiveOp::MemoryCorrect,
+        DestructiveOp::MemoryConfirm,
+        DestructiveOp::MemoryReject,
     ];
 
     /// Canonical operation key (contracts/mcp/*.schema.json `x-humaux-operation.operation_key`).
@@ -68,6 +77,8 @@ impl DestructiveOp {
             DestructiveOp::MemoryArchive => "memory.archive",
             DestructiveOp::MemoryUnarchive => "memory.unarchive",
             DestructiveOp::MemoryCorrect => "memory.correct",
+            DestructiveOp::MemoryConfirm => "memory.confirm",
+            DestructiveOp::MemoryReject => "memory.reject",
         }
     }
 

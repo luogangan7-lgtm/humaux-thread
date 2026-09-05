@@ -4351,6 +4351,503 @@ fn native_mcp_memory_correct_writes_new_version_and_never_edits_evidence() {
 }
 
 // ===========================================================================================
+// §36/§10.1 memory.confirm / memory.reject behind the same confirm gate (ADR-0026, Card 6).
+// Promote a distill candidate the §10.1 ceiling rejected into UserConfirmed Evidence + a new
+// Memory; the candidate queue is the thing that makes memory.confirm reachable.
+// ===========================================================================================
+
+/// Inserts one PENDING `private.distill_candidates` row (owner) and returns its id + the hex of
+/// its `candidate_sha256`. The sha is over the exact body bytes, so the confirm lock matches the
+/// echoed hex regardless of jsonb round-tripping.
+fn seed_pending_candidate(
+    handle: &mut Handle,
+    source_evidence_id: Uuid,
+    requested_class: &str,
+    memory_type: &str,
+    body: &Value,
+) -> (Uuid, String) {
+    let bytes = serde_json::to_vec(body).expect("serialize candidate body");
+    let mut digest = Sha256::new();
+    digest.update(&bytes);
+    let sha: [u8; 32] = digest.finalize().into();
+    let sha_vec = sha.to_vec();
+    let requested_class = requested_class.to_owned();
+    let memory_type = memory_type.to_owned();
+    let candidate_id: Uuid = handle
+        .admin
+        .query_one(
+            r#"INSERT INTO private.distill_candidates
+                 (tenant_id, source_evidence_id, candidate_body, candidate_sha256, rejection_reason,
+                  requested_class, memory_type, confidence, data_class, visibility_class,
+                  visibility_workspace_id, reasoning_domain_id, state, expires_at)
+               VALUES ($1,$2,$3,$4,'origin_authority_ceiling',$5,$6,0.7,'INTERNAL','WORKSPACE_SHARED',
+                       $7,$8,'PENDING', clock_timestamp() + interval '7 days')
+               RETURNING candidate_id"#,
+            &[
+                &handle.tenant_id,
+                &source_evidence_id,
+                body,
+                &sha_vec,
+                &requested_class,
+                &memory_type,
+                &handle.workspace_id,
+                &handle.reasoning_domain_id,
+            ],
+        )
+        .expect("owner seeds pending candidate")
+        .get(0);
+    (candidate_id, hex::encode(sha))
+}
+
+/// Seeds a second ACTIVE tenant and one PENDING candidate under it (reusing tenant A's
+/// evidence/workspace/reasoning-domain — no FK enforces a tenant match), returning the foreign
+/// `(tenant_id, candidate_id, sha hex)`. For the ADR-0026 cross-tenant RLS refusal gate: a
+/// confirm under tenant A must resolve this row to NOT_FOUND via RLS, not application code.
+fn seed_foreign_tenant_candidate(
+    handle: &mut Handle,
+    source_evidence_id: Uuid,
+    body: &Value,
+) -> (Uuid, Uuid, String) {
+    let bytes = serde_json::to_vec(body).expect("serialize candidate body");
+    let mut digest = Sha256::new();
+    digest.update(&bytes);
+    let sha: [u8; 32] = digest.finalize().into();
+    let sha_vec = sha.to_vec();
+    let foreign_tenant = Uuid::new_v4();
+    handle
+        .admin
+        .execute(
+            "INSERT INTO control.tenants(tenant_id,name,state) VALUES($1,$2,'ACTIVE')",
+            &[&foreign_tenant, &format!("card6-foreign-{foreign_tenant}")],
+        )
+        .expect("seed foreign tenant");
+    let candidate_id: Uuid = handle
+        .admin
+        .query_one(
+            r#"INSERT INTO private.distill_candidates
+                 (tenant_id, source_evidence_id, candidate_body, candidate_sha256, rejection_reason,
+                  requested_class, memory_type, confidence, data_class, visibility_class,
+                  visibility_workspace_id, reasoning_domain_id, state, expires_at)
+               VALUES ($1,$2,$3,$4,'origin_authority_ceiling','ProjectDecision','DECISION',0.7,
+                       'INTERNAL','WORKSPACE_SHARED',$5,$6,'PENDING',
+                       clock_timestamp() + interval '7 days')
+               RETURNING candidate_id"#,
+            &[
+                &foreign_tenant,
+                &source_evidence_id,
+                body,
+                &sha_vec,
+                &handle.workspace_id,
+                &handle.reasoning_domain_id,
+            ],
+        )
+        .expect("seed foreign-tenant candidate")
+        .get(0);
+    (foreign_tenant, candidate_id, hex::encode(sha))
+}
+
+async fn confirm_call(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    candidate_id: Uuid,
+    candidate_sha256: &str,
+    token: Option<&str>,
+) -> (u16, Value) {
+    let mut arguments = json!({
+        "action": "confirm",
+        "candidate_id": candidate_id,
+        "candidate_sha256": candidate_sha256,
+    });
+    if let Some(token) = token {
+        arguments["confirm_token"] = Value::String(token.to_owned());
+    }
+    raw_request(
+        address,
+        &tool_call_headers("memory", bearer),
+        &rpc(request_id, "tools/call", call_params("memory", arguments)),
+    )
+    .await
+}
+
+async fn reject_call(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    candidate_id: Uuid,
+    token: Option<&str>,
+) -> (u16, Value) {
+    let mut arguments = json!({ "action": "reject", "candidate_id": candidate_id });
+    if let Some(token) = token {
+        arguments["confirm_token"] = Value::String(token.to_owned());
+    }
+    raw_request(
+        address,
+        &tool_call_headers("memory", bearer),
+        &rpc(request_id, "tools/call", call_params("memory", arguments)),
+    )
+    .await
+}
+
+/// Extracts the confirm_token from a first-call `confirmation_required` naming the op + candidate.
+fn mint_candidate_token(operation: &str, candidate_id: Uuid, first_call: (u16, Value)) -> String {
+    let (status, response) = first_call;
+    assert_eq!(status, 200, "first call is an MCP result: {response}");
+    let structured = &response["result"]["structuredContent"];
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    assert_eq!(structured["confirmation_required"], true, "{response}");
+    assert_eq!(structured["operation"], operation, "{response}");
+    assert_eq!(
+        structured["target"]["candidate_id"],
+        candidate_id.to_string(),
+        "{response}"
+    );
+    assert!(
+        structured["target"].get("memory_id").is_none(),
+        "candidate confirmation names no memory_id: {response}"
+    );
+    structured["confirm_token"]
+        .as_str()
+        .expect("confirm_token string")
+        .to_owned()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One HTTP fixture carries the whole confirm acceptance gate.
+fn native_mcp_memory_confirm_promotes_candidate_to_user_confirmed_evidence() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>("native_mcp_memory_confirm", |mut handle| {
+        handle.assert_gateway_login();
+        let prefix = format!("mcfm{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let wire = format!("{prefix}.{}", "c".repeat(32));
+        let credential = handle.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &prefix,
+            &wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+            96,
+        );
+        let m = handle.seed_workspace_visible_context_record();
+        let body = json!({
+            "title": "Adopt Postgres for the job queue",
+            "key_claim": "The team decided to adopt Postgres for the job queue.",
+        });
+        let (candidate_id, sha_hex) = tokio::task::block_in_place(|| {
+            seed_pending_candidate(
+                &mut handle,
+                m.evidence_id,
+                "ProjectDecision",
+                "DECISION",
+                &body,
+            )
+        });
+
+        let runtime_handle = handle.rt.handle().clone();
+        let runtime = runtime_handle
+            .block_on(handle.fresh_runtime())
+            .expect("confirm runtime");
+        let app = application(&handle, runtime);
+        runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let bearer = credential.bearer.as_str();
+
+            // 1. A confirmed call with a made-up token is rejected (confirm needs a real token).
+            let bogus = "A".repeat(43);
+            let (status, denied) =
+                confirm_call(address, bearer, 1, candidate_id, &sha_hex, Some(&bogus)).await;
+            assert_eq!(status, 200, "{denied}");
+            assert_eq!(
+                denied["result"]["isError"], true,
+                "bogus token rejected: {denied}"
+            );
+
+            // 1a. M1 sentinel: a WRONG candidate_sha256 is NOT_FOUND. The lock binds the exact
+            //     reviewed body (candidate_id + sha), so a mismatched sha resolves to no row — it
+            //     never falls back to the right candidate. The lock's NOT_FOUND precedes token
+            //     consume, so the real candidate stays PENDING for step 2.
+            let wrong_sha = "0".repeat(64);
+            let first = confirm_call(address, bearer, 10, candidate_id, &wrong_sha, None).await;
+            let wrong_token = mint_candidate_token("memory.confirm", candidate_id, first);
+            let (status, mismatched) = confirm_call(
+                address,
+                bearer,
+                11,
+                candidate_id,
+                &wrong_sha,
+                Some(&wrong_token),
+            )
+            .await;
+            assert_eq!(status, 200, "{mismatched}");
+            assert_tool_error(&mismatched, "NOT_FOUND");
+
+            // 1b. Cross-tenant acceptance gate: another tenant's candidate is refused by RLS
+            //     (0 rows -> NOT_FOUND), never by application code. Seed tenant B + a tenant-B
+            //     candidate, then confirm it under tenant A's credential.
+            let (foreign_tenant, foreign_candidate, foreign_sha) =
+                tokio::task::block_in_place(|| {
+                    seed_foreign_tenant_candidate(&mut handle, m.evidence_id, &body)
+                });
+            let first =
+                confirm_call(address, bearer, 12, foreign_candidate, &foreign_sha, None).await;
+            let foreign_token = mint_candidate_token("memory.confirm", foreign_candidate, first);
+            let (status, cross) = confirm_call(
+                address,
+                bearer,
+                13,
+                foreign_candidate,
+                &foreign_sha,
+                Some(&foreign_token),
+            )
+            .await;
+            assert_eq!(status, 200, "{cross}");
+            assert_tool_error(&cross, "NOT_FOUND");
+
+            // 1c. M4 sentinel: an EXPIRED (past-deadline) PENDING candidate is a 1102 CONFLICT,
+            //     never a confirm. Seed a second tenant-A candidate and push its deadline past.
+            let (expired_candidate, expired_sha) = tokio::task::block_in_place(|| {
+                let (cid, sha) = seed_pending_candidate(
+                    &mut handle,
+                    m.evidence_id,
+                    "ProjectDecision",
+                    "DECISION",
+                    &body,
+                );
+                handle
+                    .admin
+                    .execute(
+                        "UPDATE private.distill_candidates \
+                         SET expires_at = clock_timestamp() - interval '1 hour' \
+                         WHERE candidate_id = $1",
+                        &[&cid],
+                    )
+                    .expect("expire the candidate");
+                (cid, sha)
+            });
+            let first =
+                confirm_call(address, bearer, 14, expired_candidate, &expired_sha, None).await;
+            let expired_token = mint_candidate_token("memory.confirm", expired_candidate, first);
+            let (status, expired) = confirm_call(
+                address,
+                bearer,
+                15,
+                expired_candidate,
+                &expired_sha,
+                Some(&expired_token),
+            )
+            .await;
+            assert_eq!(status, 200, "{expired}");
+            let s = &expired["result"]["structuredContent"];
+            assert_eq!(s["code"], "CONFLICT", "expired is a CONFLICT: {expired}");
+            assert_eq!(s["reason"], 1102, "CANDIDATE_EXPIRED: {expired}");
+
+            // 2. Mint a token (first call, no token), then confirm the candidate.
+            let first = confirm_call(address, bearer, 2, candidate_id, &sha_hex, None).await;
+            let token = mint_candidate_token("memory.confirm", candidate_id, first);
+            let (status, done) =
+                confirm_call(address, bearer, 3, candidate_id, &sha_hex, Some(&token)).await;
+            assert_eq!(status, 200, "confirmed: {done}");
+            assert_ne!(done["result"]["isError"], true, "{done}");
+            let structured = &done["result"]["structuredContent"];
+            let m2 =
+                Uuid::parse_str(structured["memory_id"].as_str().expect("M id")).expect("M uuid");
+            let e2 =
+                Uuid::parse_str(structured["evidence_id"].as_str().expect("E id")).expect("E uuid");
+            assert_eq!(
+                structured["candidate_id"],
+                candidate_id.to_string(),
+                "{done}"
+            );
+            assert!(structured["consistency_token"].is_string(), "{done}");
+
+            tokio::task::block_in_place(|| {
+                // The candidate is CONFIRMED and names the new memory.
+                let (state, confirmed): (String, Option<Uuid>) = {
+                    let row = handle
+                        .admin
+                        .query_one(
+                            "SELECT state, confirmed_memory_id FROM private.distill_candidates \
+                             WHERE candidate_id = $1",
+                            &[&candidate_id],
+                        )
+                        .expect("owner reads candidate");
+                    (row.get(0), row.get(1))
+                };
+                assert_eq!(state, "CONFIRMED", "candidate is CONFIRMED");
+                assert_eq!(confirmed, Some(m2), "candidate names the new memory");
+
+                // M is a new active memory: type from the candidate, authority via UserConfirmed
+                // ceiling (ProjectDecision <= UserCorrection), never the source origin's lower one.
+                let (mstatus, mtype, aclass): (String, String, String) = {
+                    let row = handle
+                        .admin
+                        .query_one(
+                            "SELECT status, memory_type, authority_class \
+                             FROM private.memory_records WHERE memory_id = $1",
+                            &[&m2],
+                        )
+                        .expect("owner reads M");
+                    (row.get(0), row.get(1), row.get(2))
+                };
+                assert_eq!(mstatus, "active", "M is active");
+                assert_eq!(mtype, "DECISION", "M carries the candidate's memory_type");
+                assert_eq!(
+                    aclass, "ProjectDecision",
+                    "UserConfirmed basis authorizes the requested ProjectDecision"
+                );
+
+                // M's PRIMARY evidence is E2, a UserConfirmed manual note traceable to the source.
+                let (prim, origin, kind): (Uuid, String, String) = {
+                    let row = handle
+                        .admin
+                        .query_one(
+                            "SELECT me.evidence_id, eo.origin_class, ev.event_kind \
+                             FROM private.memory_evidence me \
+                             JOIN private.evidence_objects eo ON eo.evidence_id = me.evidence_id \
+                             JOIN private.events ev ON ev.event_id = me.evidence_id \
+                             WHERE me.memory_id = $1 AND me.role = 'PRIMARY'",
+                            &[&m2],
+                        )
+                        .expect("owner reads M PRIMARY evidence");
+                    (row.get(0), row.get(1), row.get(2))
+                };
+                assert_eq!(prim, e2, "M <- E2 PRIMARY");
+                assert_eq!(origin, "UserConfirmed", "E2 origin is UserConfirmed");
+                assert_eq!(kind, "MANUAL_NOTE", "E2 is a manual note subtype");
+            });
+
+            // 3. Re-confirming the now-CONFIRMED candidate is refused with 1101 (needs a fresh
+            //    token — the first was consumed).
+            let first = confirm_call(address, bearer, 4, candidate_id, &sha_hex, None).await;
+            let token2 = mint_candidate_token("memory.confirm", candidate_id, first);
+            let (status, again) =
+                confirm_call(address, bearer, 5, candidate_id, &sha_hex, Some(&token2)).await;
+            assert_eq!(status, 200, "{again}");
+            let s = &again["result"]["structuredContent"];
+            assert_eq!(
+                s["code"], "CONFLICT",
+                "already-confirmed is a CONFLICT: {again}"
+            );
+            assert_eq!(s["reason"], 1101, "CANDIDATE_ALREADY_CONFIRMED: {again}");
+
+            // The fixture cleans up by tenant A's id only; drop tenant B (cascades its candidate).
+            tokio::task::block_in_place(|| {
+                handle
+                    .admin
+                    .execute(
+                        "DELETE FROM control.tenants WHERE tenant_id = $1",
+                        &[&foreign_tenant],
+                    )
+                    .expect("clean up foreign tenant");
+            });
+
+            stop_server(server).await.expect("server shutdown");
+        });
+    });
+}
+
+#[test]
+fn native_mcp_memory_reject_and_enumerate_candidates() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>("native_mcp_memory_reject", |mut handle| {
+        handle.assert_gateway_login();
+        let prefix = format!("mcrj{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let wire = format!("{prefix}.{}", "c".repeat(32));
+        let credential = handle.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &prefix,
+            &wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+            96,
+        );
+        let m = handle.seed_workspace_visible_context_record();
+        let body = json!({"title": "Prefer Rust", "key_claim": "Prefer Rust for new services."});
+        let (candidate_id, _sha) = tokio::task::block_in_place(|| {
+            seed_pending_candidate(
+                &mut handle,
+                m.evidence_id,
+                "UserPreference",
+                "PREFERENCE",
+                &body,
+            )
+        });
+
+        let runtime_handle = handle.rt.handle().clone();
+        let runtime = runtime_handle
+            .block_on(handle.fresh_runtime())
+            .expect("reject runtime");
+        let app = application(&handle, runtime);
+        runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let bearer = credential.bearer.as_str();
+
+            // Enumerate: the pending candidate is listed.
+            let (status, listed) = enumerate_call(
+                address,
+                bearer,
+                json!({ "action": "enumerate", "candidates": true }),
+            )
+            .await;
+            assert_eq!(status, 200, "{listed}");
+            let cands = listed["result"]["structuredContent"]["candidates"]
+                .as_array()
+                .expect("candidates array");
+            assert!(
+                cands
+                    .iter()
+                    .any(|c| c["candidate_id"] == candidate_id.to_string()),
+                "pending candidate is enumerated: {listed}"
+            );
+
+            // Reject it (mint token, then reject).
+            let first = reject_call(address, bearer, 1, candidate_id, None).await;
+            let token = mint_candidate_token("memory.reject", candidate_id, first);
+            let (status, done) = reject_call(address, bearer, 2, candidate_id, Some(&token)).await;
+            assert_eq!(status, 200, "rejected: {done}");
+            assert_ne!(done["result"]["isError"], true, "{done}");
+            assert_eq!(
+                done["result"]["structuredContent"]["state"], "rejected",
+                "{done}"
+            );
+
+            tokio::task::block_in_place(|| {
+                let state: String = handle
+                    .admin
+                    .query_one(
+                        "SELECT state FROM private.distill_candidates WHERE candidate_id = $1",
+                        &[&candidate_id],
+                    )
+                    .expect("owner reads candidate")
+                    .get(0);
+                assert_eq!(state, "REJECTED", "candidate is REJECTED");
+            });
+
+            // A rejected candidate no longer enumerates.
+            let (_status, listed) = enumerate_call(
+                address,
+                bearer,
+                json!({ "action": "enumerate", "candidates": true }),
+            )
+            .await;
+            let cands = listed["result"]["structuredContent"]["candidates"]
+                .as_array()
+                .expect("candidates array");
+            assert!(
+                !cands
+                    .iter()
+                    .any(|c| c["candidate_id"] == candidate_id.to_string()),
+                "rejected candidate is not enumerated: {listed}"
+            );
+
+            stop_server(server).await.expect("server shutdown");
+        });
+    });
+}
+
+// ===========================================================================================
 // §36 memory.archive / memory.unarchive confirm gate (ADR-0024, Q3).
 // ===========================================================================================
 

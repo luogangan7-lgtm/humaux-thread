@@ -127,12 +127,26 @@ impl From<PrivateReasoningError> for DistillError {
 /// (`Baseline_2.9.md` metrics registry: origin_authority_ceiling | untrusted_instruction |
 /// cross_tenant_evidence | missing_confirmation).
 fn rejection_reason(rejection: CandidateRejection) -> &'static str {
-    match rejection {
-        CandidateRejection::OriginAuthorityCeiling => "origin_authority_ceiling",
-        CandidateRejection::UntrustedInstruction => "untrusted_instruction",
-        CandidateRejection::CrossTenantEvidence => "cross_tenant_evidence",
-        CandidateRejection::MissingConfirmation => "missing_confirmation",
+    // One mapping (§78.2): the domain enum owns the label; this is the metric-value view of the
+    // same string `private.distill_candidates.rejection_reason` stores.
+    rejection.as_db_str()
+}
+
+/// §78.1 candidate TTL, from `HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS` (no literal default).
+/// Consulted only when a rejection is actually persisted — a pass with no rejected candidates
+/// (including SKIPPED_BY_POLICY 0-output passes) never needs it. Missing/invalid = config error,
+/// which defers the row (fail-closed) rather than writing a candidate with an ad-hoc deadline.
+fn candidate_ttl_seconds() -> Result<i64, DistillError> {
+    let raw = std::env::var("HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS")
+        .map_err(|_| DistillError::Config(ErrorCode::InvalidInput))?;
+    let secs: i64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| DistillError::Config(ErrorCode::InvalidInput))?;
+    if secs <= 0 {
+        return Err(DistillError::Config(ErrorCode::InvalidInput));
     }
+    Ok(secs)
 }
 
 /// ADR-0016 D2: the acting identity the §11.1 context carries — the Evidence's own principal
@@ -281,6 +295,31 @@ async fn process_claimed(
                     candidate.class,
                     evidence.origin_class,
                 );
+                // ADR-0026 (Card 6): a §10.1-rejected candidate is persisted PENDING (same write
+                // txn as the admitted memories) so a user can promote it via memory.confirm. The
+                // admitted memories are NOT candidates; SKIPPED_BY_POLICY (0 outputs, this loop
+                // never runs) creates none.
+                let ttl_secs = candidate_ttl_seconds()?;
+                let content = memory_content(&candidate.content);
+                let content_bytes = serde_json::to_vec(&content)
+                    .map_err(|_| DistillError::Config(ErrorCode::Internal))?;
+                let sha_bytes = hex::decode(payload_sha256(&content_bytes).to_hex())
+                    .map_err(|_| DistillError::Config(ErrorCode::Internal))?;
+                distill_repo::insert_candidate(
+                    &mut txn,
+                    distill.tenant_id,
+                    evidence,
+                    &distill_repo::NewCandidate {
+                        body: &content,
+                        sha256: &sha_bytes,
+                        rejection,
+                        requested_class: candidate.class,
+                        memory_type: candidate.memory_type,
+                        confidence: candidate.confidence,
+                        ttl_seconds: ttl_secs,
+                    },
+                )
+                .await?;
                 report.rejected += 1;
             }
         }

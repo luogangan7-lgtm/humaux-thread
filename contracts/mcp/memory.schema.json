@@ -1,15 +1,324 @@
 {
-  "type":"object",
-  "oneOf":[
-    {"x-humaux-operation":{"operation_key":"memory.get","required_scope":"context:read","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"get"},"memory_id":{"type":"string","format":"uuid"},"workspace_id":{"type":"string","format":"uuid"}},"required":["action","memory_id"],"additionalProperties":false},
-    {"x-humaux-operation":{"operation_key":"memory.enumerate","required_scope":"context:read","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"enumerate"},"workspace_id":{"type":"string","format":"uuid"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string","minLength":1,"maxLength":1024}},"required":["action"],"additionalProperties":false},
-    {"x-humaux-operation":{"operation_key":"memory.correct","required_scope":"memory:write","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"correct"},"memory_id":{"type":"string","format":"uuid"},"text":{"type":"string","minLength":1,"maxLength":65536},"confirm_token":{"type":"string","minLength":16,"maxLength":512}},"required":["action","memory_id","text"],"additionalProperties":false},
-    {"x-humaux-operation":{"operation_key":"memory.supersede","required_scope":"memory:write","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"supersede"},"memory_id":{"type":"string","format":"uuid"},"replacement_memory_id":{"type":"string","format":"uuid"},"confirm_token":{"type":"string","minLength":16,"maxLength":512}},"required":["action","memory_id","replacement_memory_id"],"additionalProperties":false},
-    {"x-humaux-operation":{"operation_key":"memory.confirm","required_scope":"memory:write","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"confirm"},"confirm_token":{"type":"string","minLength":16,"maxLength":512}},"required":["action","confirm_token"],"additionalProperties":false},
-    {"x-humaux-operation":{"operation_key":"memory.pin","required_scope":"memory:write","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"pin"},"memory_id":{"type":"string","format":"uuid"},"confirm_token":{"type":"string","minLength":16,"maxLength":512}},"required":["action","memory_id"],"additionalProperties":false},
-    {"x-humaux-operation":{"operation_key":"memory.unpin","required_scope":"memory:write","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"unpin"},"memory_id":{"type":"string","format":"uuid"},"confirm_token":{"type":"string","minLength":16,"maxLength":512}},"required":["action","memory_id"],"additionalProperties":false},
-    {"x-humaux-operation":{"operation_key":"memory.archive","required_scope":"memory:write","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"archive"},"memory_id":{"type":"string","format":"uuid"},"confirm_token":{"type":"string","minLength":16,"maxLength":512}},"required":["action","memory_id"],"additionalProperties":false},
-    {"x-humaux-operation":{"operation_key":"memory.unarchive","required_scope":"memory:write","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"unarchive"},"memory_id":{"type":"string","format":"uuid"},"confirm_token":{"type":"string","minLength":16,"maxLength":512}},"required":["action","memory_id"],"additionalProperties":false},
-    {"x-humaux-operation":{"operation_key":"memory.restore","required_scope":"memory:write","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"action":{"const":"restore"},"memory_id":{"type":"string","format":"uuid"},"confirm_token":{"type":"string","minLength":16,"maxLength":512}},"required":["action","memory_id"],"additionalProperties":false}
+  "type": "object",
+  "oneOf": [
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.get",
+        "required_scope": "context:read",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "properties": {
+        "action": {
+          "const": "get"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "workspace_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "action",
+        "memory_id"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.enumerate",
+        "required_scope": "context:read",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "properties": {
+        "action": {
+          "const": "enumerate"
+        },
+        "workspace_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "cursor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "candidates": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.correct",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "properties": {
+        "action": {
+          "const": "correct"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536
+        },
+        "confirm_token": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "action",
+        "memory_id",
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.supersede",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "properties": {
+        "action": {
+          "const": "supersede"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "replacement_memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "confirm_token": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "action",
+        "memory_id",
+        "replacement_memory_id"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.confirm",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "properties": {
+        "action": {
+          "const": "confirm"
+        },
+        "candidate_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "candidate_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "confirm_token": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "action",
+        "candidate_id",
+        "candidate_sha256"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.reject",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "properties": {
+        "action": {
+          "const": "reject"
+        },
+        "candidate_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "confirm_token": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "action",
+        "candidate_id"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.pin",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "properties": {
+        "action": {
+          "const": "pin"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "confirm_token": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "action",
+        "memory_id"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.unpin",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "properties": {
+        "action": {
+          "const": "unpin"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "confirm_token": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "action",
+        "memory_id"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.archive",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "properties": {
+        "action": {
+          "const": "archive"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "confirm_token": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "action",
+        "memory_id"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.unarchive",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "properties": {
+        "action": {
+          "const": "unarchive"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "confirm_token": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "action",
+        "memory_id"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.restore",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "properties": {
+        "action": {
+          "const": "restore"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "confirm_token": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "action",
+        "memory_id"
+      ],
+      "additionalProperties": false
+    }
   ]
 }

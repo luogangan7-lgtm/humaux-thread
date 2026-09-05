@@ -343,6 +343,33 @@ pub enum CandidateRejection {
     MissingConfirmation,
 }
 
+impl CandidateRejection {
+    /// The closed label persisted in `private.distill_candidates.rejection_reason` and emitted
+    /// as the `memory_candidate_rejections_total{reason}` metric value (§78.2 DB<->Rust — one
+    /// mapping, never a parallel string in the distill hop or the migration).
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::OriginAuthorityCeiling => "origin_authority_ceiling",
+            Self::UntrustedInstruction => "untrusted_instruction",
+            Self::CrossTenantEvidence => "cross_tenant_evidence",
+            Self::MissingConfirmation => "missing_confirmation",
+        }
+    }
+
+    /// Inverse of [`Self::as_db_str`]; `None` for any value outside the closed set.
+    #[must_use]
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "origin_authority_ceiling" => Self::OriginAuthorityCeiling,
+            "untrusted_instruction" => Self::UntrustedInstruction,
+            "cross_tenant_evidence" => Self::CrossTenantEvidence,
+            "missing_confirmation" => Self::MissingConfirmation,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,360 +1,589 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "MemoryReadResult",
-  "description": "Direct Memory Envelope, one authorized immutable enumeration page, a confirmation_required result of a gated op (memory.supersede / memory.pin / memory.unpin), a superseded result, or a pin/unpin binding result. The catalog resolves the embedded canonical Envelope without network access.",
-  "type": "object",
-  "$defs": {
-    "Envelope": {
-      "$ref": "context.output.schema.json#/properties/content"
-    },
-    "ConfirmationRequired": {
-      "type": "object",
-      "description": "§33.10 rule 9 / ADR-0018 first call of a gated destructive op: the server minted a single-use confirm_token bound to (tenant,user,operation,target,successor); nothing else was written.",
-      "required": [
-        "confirmation_required",
-        "confirm_token",
-        "operation",
-        "target",
-        "expires_at"
-      ],
-      "properties": {
-        "confirmation_required": {
-          "const": true
-        },
-        "confirm_token": {
-          "type": "string",
-          "pattern": "^[A-Za-z0-9_-]{43}$"
-        },
-        "operation": {
-          "type": "string",
-          "enum": [
-            "memory.supersede",
-            "memory.pin",
-            "memory.unpin",
-            "memory.restore",
-            "memory.archive",
-            "memory.unarchive",
-            "memory.correct"
-          ]
-        },
-        "target": {
-          "type": "object",
-          "required": [
-            "memory_id"
-          ],
-          "properties": {
-            "memory_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "replacement_memory_id": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          "additionalProperties": false
-        },
-        "expires_at": {
-          "type": "string",
-          "format": "date-time"
-        }
-      },
-      "additionalProperties": false,
-      "if": {
-        "properties": {
-          "operation": {
-            "const": "memory.supersede"
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "target": {
-            "required": [
-              "memory_id",
-              "replacement_memory_id"
-            ]
-          }
-        }
-      },
-      "else": {
-        "properties": {
-          "target": {
-            "not": {
-              "required": [
-                "replacement_memory_id"
-              ]
-            }
-          }
-        }
-      }
-    },
-    "BindingWritten": {
-      "type": "object",
-      "description": "memory.pin / memory.unpin executed (§36, ADR-0019): binding_id is the private.context_bindings row (mode=PINNED at the credential's workspace scope). pin: inserted=false when the memory was already pinned (D-C idempotent, no new row). unpin: revoked=true, the row's revoked_at is set; Evidence/Memory untouched.",
-      "required": [
-        "memory_id",
-        "binding_id",
-        "mode",
-        "state"
-      ],
-      "properties": {
-        "memory_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "binding_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "mode": {
-          "const": "PINNED"
-        },
-        "state": {
-          "type": "string",
-          "enum": [
-            "pinned",
-            "unpinned"
-          ]
-        },
-        "inserted": {
-          "type": "boolean"
-        }
-      },
-      "additionalProperties": false
-    },
-    "Restored": {
-      "type": "object",
-      "description": "memory.restore executed (§36/ADR-0020): target is status=active again with superseded_by cleared; a NEW MEMORY_LIFECYCLE ticket was issued (new stream_seq — the old TOMBSTONED/consumed row is never revived), and consistency_token is bound to that new seq (§15.5).",
-      "required": [
-        "memory_id",
-        "restored_at",
-        "stream_seq",
-        "commit_seq",
-        "consistency_token"
-      ],
-      "properties": {
-        "memory_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "restored_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "stream_seq": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "commit_seq": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "consistency_token": {
-          "type": "string",
-          "minLength": 1
-        }
-      },
-      "additionalProperties": false
-    },
-    "ConflictReason": {
-      "type": "object",
-      "description": "A refused governance op surfaced as a success-shaped CONFLICT with a sub-reason (ADR-0020 D-B): ErrorCode stays frozen at 18 (§52.1), so the u16 reason and its SCREAMING_SNAKE label ride here instead of a 19th ErrorCode. memory.restore uses 1001 UNDO_WINDOW_EXPIRED, 1002 TARGET_NOT_CURRENT, 1003 ERASE_TERMINAL, 1004 TARGET_ADVANCED, 1201 ALREADY_IN_STATE, 1202 NOT_REVERSIBLE.",
-      "required": [
-        "code",
-        "reason",
-        "reason_label"
-      ],
-      "properties": {
-        "code": {
-          "const": "CONFLICT"
-        },
-        "reason": {
-          "type": "integer",
-          "minimum": 1000,
-          "maximum": 65535
-        },
-        "reason_label": {
-          "type": "string",
-          "pattern": "^[A-Z][A-Z0-9_]*$"
-        }
-      },
-      "additionalProperties": false
-    },
-    "ArchiveChanged": {
-      "type": "object",
-      "description": "memory.archive / memory.unarchive executed (§36/ADR-0024, Q3): archive set private.memory_records.archived_at (the memory is now hidden from recall/context/enumerate, still returned by memory.get); unarchive cleared it. NOT a status transition — G59-4 is untouched. One MEMORY_LIFECYCLE ticket was issued (new stream_seq) so the projection worker can refresh the point payload. Exactly one of archived_at / unarchived_at is present.",
-      "required": [
-        "memory_id",
-        "stream_seq",
-        "commit_seq"
-      ],
-      "properties": {
-        "memory_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "archived_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "unarchived_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "stream_seq": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "commit_seq": {
-          "type": "integer",
-          "minimum": 0
-        }
-      },
-      "additionalProperties": false,
-      "oneOf": [
-        { "required": ["archived_at"], "not": { "required": ["unarchived_at"] } },
-        { "required": ["unarchived_at"], "not": { "required": ["archived_at"] } }
-      ]
-    },
-    "Superseded": {
-      "type": "object",
-      "description": "memory.supersede executed (§36): target now status=superseded with superseded_by=replacement_memory_id; one MEMORY_LIFECYCLE ticket was issued on the workspace projection stream (§15.7).",
-      "required": [
-        "memory_id",
-        "replacement_memory_id",
-        "superseded_at",
-        "stream_seq",
-        "commit_seq"
-      ],
-      "properties": {
-        "memory_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "replacement_memory_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "superseded_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "stream_seq": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "commit_seq": {
-          "type": "integer",
-          "minimum": 0
-        }
-      },
-      "additionalProperties": false
-    },
-    "Corrected": {
-      "type": "object",
-      "description": "memory.correct executed (§Q4/ADR-0025): a user correction. One transaction inserted a new DirectUserInput Evidence (evidence_id) and a new active Memory version (memory_id), linked the original (superseded) to it via superseded_by, and appended a SUPERSEDE lifecycle event (reason USER_CORRECTION) that is itself restorable via memory.restore within the undo window. The original Evidence body is never edited in place. consistency_token is bound to the new stream_seq (§15.5).",
-      "required": [
-        "memory_id",
-        "superseded",
-        "evidence_id",
-        "superseded_at",
-        "stream_seq",
-        "commit_seq",
-        "consistency_token"
-      ],
-      "properties": {
-        "memory_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "superseded": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "evidence_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "superseded_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "stream_seq": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "commit_seq": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "consistency_token": {
-          "type": "string",
-          "minLength": 1
-        }
-      },
-      "additionalProperties": false
-    }
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "MemoryReadResult",
+ "description": "Direct Memory Envelope, one authorized immutable enumeration page, a confirmation_required result of a gated op (memory.supersede / memory.pin / memory.unpin), a superseded result, or a pin/unpin binding result. The catalog resolves the embedded canonical Envelope without network access.",
+ "type": "object",
+ "$defs": {
+  "Envelope": {
+   "$ref": "context.output.schema.json#/properties/content"
   },
-  "oneOf": [
-    {
-      "$ref": "#/$defs/Envelope"
+  "ConfirmationRequired": {
+   "type": "object",
+   "description": "\u00a733.10 rule 9 / ADR-0018 first call of a gated destructive op: the server minted a single-use confirm_token bound to (tenant,user,operation,target,successor); nothing else was written.",
+   "required": [
+    "confirmation_required",
+    "confirm_token",
+    "operation",
+    "target",
+    "expires_at"
+   ],
+   "properties": {
+    "confirmation_required": {
+     "const": true
     },
+    "confirm_token": {
+     "type": "string",
+     "pattern": "^[A-Za-z0-9_-]{43}$"
+    },
+    "operation": {
+     "type": "string",
+     "enum": [
+      "memory.supersede",
+      "memory.pin",
+      "memory.unpin",
+      "memory.restore",
+      "memory.archive",
+      "memory.unarchive",
+      "memory.correct",
+      "memory.confirm",
+      "memory.reject"
+     ]
+    },
+    "target": {
+     "type": "object",
+     "properties": {
+      "memory_id": {
+       "type": "string",
+       "format": "uuid"
+      },
+      "replacement_memory_id": {
+       "type": "string",
+       "format": "uuid"
+      },
+      "candidate_id": {
+       "type": "string",
+       "format": "uuid"
+      }
+     },
+     "additionalProperties": false
+    },
+    "expires_at": {
+     "type": "string",
+     "format": "date-time"
+    }
+   },
+   "additionalProperties": false,
+   "allOf": [
     {
-      "type": "object",
+     "if": {
       "required": [
-        "content",
-        "pagination"
+       "operation"
       ],
       "properties": {
-        "content": {
-          "$ref": "#/$defs/Envelope"
-        },
-        "pagination": {
-          "type": "object",
-          "required": [
-            "snapshot_id",
-            "next_cursor"
-          ],
-          "properties": {
-            "snapshot_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "next_cursor": {
-              "type": [
-                "string",
-                "null"
-              ],
-              "minLength": 1,
-              "maxLength": 1024
-            }
+       "operation": {
+        "const": "memory.supersede"
+       }
+      }
+     },
+     "then": {
+      "properties": {
+       "target": {
+        "required": [
+         "memory_id",
+         "replacement_memory_id"
+        ]
+       }
+      }
+     }
+    },
+    {
+     "if": {
+      "required": [
+       "operation"
+      ],
+      "properties": {
+       "operation": {
+        "enum": [
+         "memory.confirm",
+         "memory.reject"
+        ]
+       }
+      }
+     },
+     "then": {
+      "properties": {
+       "target": {
+        "required": [
+         "candidate_id"
+        ],
+        "not": {
+         "anyOf": [
+          {
+           "required": [
+            "memory_id"
+           ]
           },
-          "additionalProperties": false
+          {
+           "required": [
+            "replacement_memory_id"
+           ]
+          }
+         ]
         }
+       }
+      }
+     },
+     "else": {
+      "properties": {
+       "target": {
+        "required": [
+         "memory_id"
+        ],
+        "not": {
+         "required": [
+          "candidate_id"
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "if": {
+      "required": [
+       "operation"
+      ],
+      "properties": {
+       "operation": {
+        "not": {
+         "const": "memory.supersede"
+        }
+       }
+      }
+     },
+     "then": {
+      "properties": {
+       "target": {
+        "not": {
+         "required": [
+          "replacement_memory_id"
+         ]
+        }
+       }
+      }
+     }
+    }
+   ]
+  },
+  "BindingWritten": {
+   "type": "object",
+   "description": "memory.pin / memory.unpin executed (\u00a736, ADR-0019): binding_id is the private.context_bindings row (mode=PINNED at the credential's workspace scope). pin: inserted=false when the memory was already pinned (D-C idempotent, no new row). unpin: revoked=true, the row's revoked_at is set; Evidence/Memory untouched.",
+   "required": [
+    "memory_id",
+    "binding_id",
+    "mode",
+    "state"
+   ],
+   "properties": {
+    "memory_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "binding_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "mode": {
+     "const": "PINNED"
+    },
+    "state": {
+     "type": "string",
+     "enum": [
+      "pinned",
+      "unpinned"
+     ]
+    },
+    "inserted": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false
+  },
+  "Restored": {
+   "type": "object",
+   "description": "memory.restore executed (\u00a736/ADR-0020): target is status=active again with superseded_by cleared; a NEW MEMORY_LIFECYCLE ticket was issued (new stream_seq \u2014 the old TOMBSTONED/consumed row is never revived), and consistency_token is bound to that new seq (\u00a715.5).",
+   "required": [
+    "memory_id",
+    "restored_at",
+    "stream_seq",
+    "commit_seq",
+    "consistency_token"
+   ],
+   "properties": {
+    "memory_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "restored_at": {
+     "type": "string",
+     "format": "date-time"
+    },
+    "stream_seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "commit_seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "consistency_token": {
+     "type": "string",
+     "minLength": 1
+    }
+   },
+   "additionalProperties": false
+  },
+  "ConflictReason": {
+   "type": "object",
+   "description": "A refused governance op surfaced as a success-shaped CONFLICT with a sub-reason (ADR-0020 D-B): ErrorCode stays frozen at 18 (\u00a752.1), so the u16 reason and its SCREAMING_SNAKE label ride here instead of a 19th ErrorCode. memory.restore uses 1001 UNDO_WINDOW_EXPIRED, 1002 TARGET_NOT_CURRENT, 1003 ERASE_TERMINAL, 1004 TARGET_ADVANCED, 1201 ALREADY_IN_STATE, 1202 NOT_REVERSIBLE.",
+   "required": [
+    "code",
+    "reason",
+    "reason_label"
+   ],
+   "properties": {
+    "code": {
+     "const": "CONFLICT"
+    },
+    "reason": {
+     "type": "integer",
+     "minimum": 1000,
+     "maximum": 65535
+    },
+    "reason_label": {
+     "type": "string",
+     "pattern": "^[A-Z][A-Z0-9_]*$"
+    }
+   },
+   "additionalProperties": false
+  },
+  "ArchiveChanged": {
+   "type": "object",
+   "description": "memory.archive / memory.unarchive executed (\u00a736/ADR-0024, Q3): archive set private.memory_records.archived_at (the memory is now hidden from recall/context/enumerate, still returned by memory.get); unarchive cleared it. NOT a status transition \u2014 G59-4 is untouched. One MEMORY_LIFECYCLE ticket was issued (new stream_seq) so the projection worker can refresh the point payload. Exactly one of archived_at / unarchived_at is present.",
+   "required": [
+    "memory_id",
+    "stream_seq",
+    "commit_seq"
+   ],
+   "properties": {
+    "memory_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "archived_at": {
+     "type": "string",
+     "format": "date-time"
+    },
+    "unarchived_at": {
+     "type": "string",
+     "format": "date-time"
+    },
+    "stream_seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "commit_seq": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "additionalProperties": false,
+   "oneOf": [
+    {
+     "required": [
+      "archived_at"
+     ],
+     "not": {
+      "required": [
+       "unarchived_at"
+      ]
+     }
+    },
+    {
+     "required": [
+      "unarchived_at"
+     ],
+     "not": {
+      "required": [
+       "archived_at"
+      ]
+     }
+    }
+   ]
+  },
+  "Superseded": {
+   "type": "object",
+   "description": "memory.supersede executed (\u00a736): target now status=superseded with superseded_by=replacement_memory_id; one MEMORY_LIFECYCLE ticket was issued on the workspace projection stream (\u00a715.7).",
+   "required": [
+    "memory_id",
+    "replacement_memory_id",
+    "superseded_at",
+    "stream_seq",
+    "commit_seq"
+   ],
+   "properties": {
+    "memory_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "replacement_memory_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "superseded_at": {
+     "type": "string",
+     "format": "date-time"
+    },
+    "stream_seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "commit_seq": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "additionalProperties": false
+  },
+  "Corrected": {
+   "type": "object",
+   "description": "memory.correct executed (\u00a7Q4/ADR-0025): a user correction. One transaction inserted a new DirectUserInput Evidence (evidence_id) and a new active Memory version (memory_id), linked the original (superseded) to it via superseded_by, and appended a SUPERSEDE lifecycle event (reason USER_CORRECTION) that is itself restorable via memory.restore within the undo window. The original Evidence body is never edited in place. consistency_token is bound to the new stream_seq (\u00a715.5).",
+   "required": [
+    "memory_id",
+    "superseded",
+    "evidence_id",
+    "superseded_at",
+    "stream_seq",
+    "commit_seq",
+    "consistency_token"
+   ],
+   "properties": {
+    "memory_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "superseded": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "evidence_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "superseded_at": {
+     "type": "string",
+     "format": "date-time"
+    },
+    "stream_seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "commit_seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "consistency_token": {
+     "type": "string",
+     "minLength": 1
+    }
+   },
+   "additionalProperties": false
+  },
+  "Confirmed": {
+   "type": "object",
+   "description": "memory.confirm executed (\u00a736/\u00a710.1/ADR-0026, Card 6): one transaction promoted a distill_candidates row into a new UserConfirmed Evidence (evidence_id) + a new active Memory (memory_id), marked the candidate CONFIRMED naming that memory, and issued one MEMORY_LIFECYCLE ticket. consistency_token is bound to the new stream_seq (\u00a715.5).",
+   "required": [
+    "memory_id",
+    "evidence_id",
+    "candidate_id",
+    "stream_seq",
+    "commit_seq",
+    "consistency_token"
+   ],
+   "properties": {
+    "memory_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "evidence_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "candidate_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "stream_seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "commit_seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "consistency_token": {
+     "type": "string",
+     "minLength": 1
+    }
+   },
+   "additionalProperties": false
+  },
+  "Rejected": {
+   "type": "object",
+   "description": "memory.reject executed (\u00a736/ADR-0026, Card 6): the pending candidate is now REJECTED; no Evidence/Memory written.",
+   "required": [
+    "candidate_id",
+    "state"
+   ],
+   "properties": {
+    "candidate_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "state": {
+     "const": "rejected"
+    }
+   },
+   "additionalProperties": false
+  },
+  "CandidatesPage": {
+   "type": "object",
+   "description": "memory.enumerate {candidates:true} (ADR-0026, Card 6 D-E): the tenant's PENDING distill candidates visible to the caller, newest first. Read-only.",
+   "required": [
+    "candidates",
+    "snapshot_id"
+   ],
+   "properties": {
+    "snapshot_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "candidates": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "candidate_id",
+       "candidate_sha256",
+       "candidate_body",
+       "requested_class",
+       "memory_type",
+       "rejection_reason",
+       "confidence",
+       "source_evidence_id",
+       "created_at",
+       "expires_at"
+      ],
+      "properties": {
+       "candidate_id": {
+        "type": "string",
+        "format": "uuid"
+       },
+       "candidate_sha256": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+       },
+       "candidate_body": {},
+       "requested_class": {
+        "type": "string"
+       },
+       "memory_type": {
+        "type": "string"
+       },
+       "rejection_reason": {
+        "type": "string"
+       },
+       "confidence": {
+        "type": "number"
+       },
+       "source_evidence_id": {
+        "type": "string",
+        "format": "uuid"
+       },
+       "created_at": {
+        "type": "string",
+        "format": "date-time"
+       },
+       "expires_at": {
+        "type": "string",
+        "format": "date-time"
+       }
       },
       "additionalProperties": false
-    },
-    {
-      "$ref": "#/$defs/ConfirmationRequired"
-    },
-    {
-      "$ref": "#/$defs/Superseded"
-    },
-    {
-      "$ref": "#/$defs/BindingWritten"
-    },
-    {
-      "$ref": "#/$defs/Restored"
-    },
-    {
-      "$ref": "#/$defs/ArchiveChanged"
-    },
-    {
-      "$ref": "#/$defs/ConflictReason"
-    },
-    {
-      "$ref": "#/$defs/Corrected"
+     }
     }
-  ]
+   },
+   "additionalProperties": false
+  }
+ },
+ "oneOf": [
+  {
+   "$ref": "#/$defs/Envelope"
+  },
+  {
+   "type": "object",
+   "required": [
+    "content",
+    "pagination"
+   ],
+   "properties": {
+    "content": {
+     "$ref": "#/$defs/Envelope"
+    },
+    "pagination": {
+     "type": "object",
+     "required": [
+      "snapshot_id",
+      "next_cursor"
+     ],
+     "properties": {
+      "snapshot_id": {
+       "type": "string",
+       "format": "uuid"
+      },
+      "next_cursor": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "minLength": 1,
+       "maxLength": 1024
+      }
+     },
+     "additionalProperties": false
+    }
+   },
+   "additionalProperties": false
+  },
+  {
+   "$ref": "#/$defs/ConfirmationRequired"
+  },
+  {
+   "$ref": "#/$defs/Superseded"
+  },
+  {
+   "$ref": "#/$defs/BindingWritten"
+  },
+  {
+   "$ref": "#/$defs/Restored"
+  },
+  {
+   "$ref": "#/$defs/ArchiveChanged"
+  },
+  {
+   "$ref": "#/$defs/ConflictReason"
+  },
+  {
+   "$ref": "#/$defs/Corrected"
+  },
+  {
+   "$ref": "#/$defs/Confirmed"
+  },
+  {
+   "$ref": "#/$defs/Rejected"
+  },
+  {
+   "$ref": "#/$defs/CandidatesPage"
+  }
+ ]
 }

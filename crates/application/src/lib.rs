@@ -5,6 +5,7 @@
 
 pub mod archive;
 pub mod auth;
+pub mod confirm;
 pub mod consolidate;
 pub mod continuity;
 pub mod contribute;

@@ -928,7 +928,9 @@ impl ConfirmedUserActor {
             | DestructiveOp::MemoryRestore
             | DestructiveOp::MemoryArchive
             | DestructiveOp::MemoryUnarchive
-            | DestructiveOp::MemoryCorrect => Err(CandidateRejection::MissingConfirmation),
+            | DestructiveOp::MemoryCorrect
+            | DestructiveOp::MemoryConfirm
+            | DestructiveOp::MemoryReject => Err(CandidateRejection::MissingConfirmation),
         }
     }
 

@@ -7,6 +7,9 @@ use humaux_adapters::{
         self, BindingWriteOutcome, BindingWriteRequest, MaterializedMemory,
         MemoryEnumerationParams, materialize_memory_enumeration, materialize_memory_get,
     },
+    distill_repo::{
+        self, ConfirmOutcome, ConfirmRequest, PendingCandidate, RejectOutcome, RejectRequest,
+    },
     memory_governance_repo::{
         self, ArchiveRequest, ArchiveResult, CorrectDone, CorrectRequest, RestoreRequest,
         RestoreResult, SupersedeOutcome, SupersedeRequest,
@@ -86,6 +89,72 @@ pub(crate) async fn get<T>(
         archived,
         accept,
     )
+}
+
+/// One PENDING candidate as `memory.enumerate {candidates:true}` serializes it (ADR-0026 D-E).
+#[derive(Serialize)]
+pub(crate) struct CandidateItem {
+    candidate_id: Uuid,
+    candidate_sha256: String,
+    candidate_body: serde_json::Value,
+    requested_class: String,
+    memory_type: String,
+    rejection_reason: String,
+    confidence: f32,
+    source_evidence_id: Uuid,
+    created_at: String,
+    expires_at: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CandidatesResult {
+    candidates: Vec<CandidateItem>,
+    snapshot_id: Uuid,
+}
+
+/// §36/ADR-0026 D-E `memory.enumerate {candidates:true}`: the tenant's PENDING distill
+/// candidates visible to the caller. Read-only; same workspace rule as `memory.get`.
+pub(crate) async fn list_candidates(
+    pool: Arc<RuntimeDbPool>,
+    authorization: AuthorizationScope,
+    requested_workspace: Option<WorkspaceId>,
+    bootstrap: ContextBootstrap,
+    limit: i64,
+) -> Result<CandidatesResult, ErrorCode> {
+    let (authorization, _scope, _family) =
+        read_scope(authorization, requested_workspace, &bootstrap)?;
+    let workspace = requested_workspace.ok_or(ErrorCode::DependencyUnavailable)?;
+    let rows =
+        distill_repo::list_pending_candidates(&pool, &authorization, workspace, limit).await?;
+    let candidates = rows
+        .into_iter()
+        .map(candidate_item)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CandidatesResult {
+        candidates,
+        snapshot_id: Uuid::now_v7(),
+    })
+}
+
+fn candidate_item(row: PendingCandidate) -> Result<CandidateItem, ErrorCode> {
+    Ok(CandidateItem {
+        candidate_id: row.candidate_id,
+        candidate_sha256: hex::encode(&row.candidate_sha256),
+        candidate_body: row.candidate_body,
+        requested_class: row.requested_class,
+        memory_type: row.memory_type,
+        rejection_reason: row.rejection_reason,
+        confidence: row.confidence,
+        source_evidence_id: row.source_evidence_id,
+        created_at: row
+            .created_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|_| ErrorCode::Internal)?,
+        expires_at: row
+            .expires_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|_| ErrorCode::Internal)?,
+    })
 }
 
 pub(crate) async fn enumerate<T>(
@@ -249,6 +318,76 @@ pub(crate) async fn correct(
     .await
 }
 
+/// §36/§10.1 `memory.confirm`, second (confirmed) call (ADR-0026, Card 6). One transaction
+/// promotes a `private.distill_candidates` row into a new UserConfirmed Evidence + a new Memory
+/// version. Same `read_scope` workspace rule as the other governance writes: the lifecycle ticket
+/// lands on the bootstrap stream's workspace. `candidate_sha256` binds the confirm to the exact
+/// body the user reviewed.
+pub(crate) async fn confirm(
+    pool: Arc<RuntimeDbPool>,
+    write: ConfirmedWrite,
+    stream: StreamKey,
+    candidate_id: Uuid,
+    candidate_sha256: Vec<u8>,
+    consistency_token_ttl: Duration,
+) -> Result<ConfirmOutcome, ErrorCode> {
+    let workspace = write
+        .request
+        .workspace_id()
+        .ok_or(ErrorCode::DependencyUnavailable)?;
+    let authorization = write.request.authorization().narrow(workspace)?;
+    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
+        return Err(ErrorCode::DependencyUnavailable);
+    }
+    distill_repo::confirm_candidate_atomically(
+        &pool,
+        &authorization,
+        ConfirmRequest {
+            request_id: write.request.request_id(),
+            request_fingerprint: write.request_fingerprint,
+            reservation_ttl: write.reservation_ttl,
+            candidate_id,
+            candidate_sha256,
+            stream,
+            claim: write.claim,
+            finished_audit: write.finished_audit,
+            consistency_token_ttl,
+        },
+    )
+    .await
+}
+
+/// §36 `memory.reject`, second (confirmed) call (ADR-0026, Card 6). Marks a pending candidate
+/// REJECTED; writes no Evidence/Memory and issues no ticket. Same gate as confirm.
+pub(crate) async fn reject(
+    pool: Arc<RuntimeDbPool>,
+    write: ConfirmedWrite,
+    stream: StreamKey,
+    candidate_id: Uuid,
+) -> Result<RejectOutcome, ErrorCode> {
+    let workspace = write
+        .request
+        .workspace_id()
+        .ok_or(ErrorCode::DependencyUnavailable)?;
+    let authorization = write.request.authorization().narrow(workspace)?;
+    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
+        return Err(ErrorCode::DependencyUnavailable);
+    }
+    distill_repo::reject_candidate_atomically(
+        &pool,
+        &authorization,
+        RejectRequest {
+            request_id: write.request.request_id(),
+            request_fingerprint: write.request_fingerprint,
+            reservation_ttl: write.reservation_ttl,
+            candidate_id,
+            claim: write.claim,
+            finished_audit: write.finished_audit,
+        },
+    )
+    .await
+}
+
 /// §36 `memory.archive` / `memory.unarchive`, second (confirmed) call (ADR-0024). Same
 /// `read_scope` workspace rule as the other governance writes: the lifecycle ticket lands on
 /// the bootstrap stream's workspace. `op` is `MemoryArchive` or `MemoryUnarchive`.
@@ -323,7 +462,9 @@ pub(crate) async fn write_binding(
         | DestructiveOp::MemoryRestore
         | DestructiveOp::MemoryArchive
         | DestructiveOp::MemoryUnarchive
-        | DestructiveOp::MemoryCorrect => Err(ErrorCode::InvalidInput),
+        | DestructiveOp::MemoryCorrect
+        | DestructiveOp::MemoryConfirm
+        | DestructiveOp::MemoryReject => Err(ErrorCode::InvalidInput),
     }
 }
 

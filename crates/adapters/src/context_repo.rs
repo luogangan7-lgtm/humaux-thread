@@ -1403,7 +1403,9 @@ async fn apply_binding_write(
         | DestructiveOp::MemoryRestore
         | DestructiveOp::MemoryArchive
         | DestructiveOp::MemoryUnarchive
-        | DestructiveOp::MemoryCorrect => Err(ErrorCode::InvalidInput),
+        | DestructiveOp::MemoryCorrect
+        | DestructiveOp::MemoryConfirm
+        | DestructiveOp::MemoryReject => Err(ErrorCode::InvalidInput),
     }
 }
 

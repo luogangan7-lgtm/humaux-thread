@@ -651,6 +651,27 @@ const MATRIX: &[Cell] = &[
         ["SELECT"]
     ),
     cell!("private.memory_records", "role_maintenance", ["SELECT"]),
+    // private.distill_candidates (migration 0152, ADR-0026): the distill candidate queue. NAMED
+    // (overrides the private-schema RW domain default): the producer writes but never updates a
+    // candidate; the gateway updates only (state, confirmed_memory_id) via memory.confirm/reject;
+    // maintenance flips only (state) in the expiry sweep. Every other role — .
+    cell!(
+        "private.distill_candidates",
+        "role_private_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.distill_candidates",
+        "role_gateway",
+        ["SELECT"],
+        [("UPDATE", ["state", "confirmed_memory_id"])]
+    ),
+    cell!(
+        "private.distill_candidates",
+        "role_maintenance",
+        ["SELECT"],
+        [("UPDATE", ["state"])]
+    ),
     // private.memory_evidence
     cell!(
         "private.memory_evidence",

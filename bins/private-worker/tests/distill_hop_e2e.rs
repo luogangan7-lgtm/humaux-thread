@@ -288,6 +288,13 @@ impl Drop for Fixture {
 /// `PRIVATE_DISTILL_TEXT` over the MiniMax descriptor (mirrors consolidation_hop_e2e::setup_db).
 #[allow(clippy::too_many_lines)]
 fn setup_db(test_name: &str) -> Option<Fixture> {
+    // ADR-0026: the distill producer reads the candidate TTL from env (§78.1, no literal). Every
+    // distill test that reaches a rejection needs it; set it here for all of them.
+    // SAFETY: the mandated distill_hop_e2e run is --test-threads=1; every writer sets the same
+    // value and nothing else reads this var, so there is no data race.
+    unsafe {
+        std::env::set_var("HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS", "604800");
+    }
     let Ok(dsn) = std::env::var("HUMAUX_TEST_PG_DSN") else {
         skip_or_fail(
             test_name,
@@ -1125,8 +1132,53 @@ fn d2_over_ceiling_candidate_rejected_not_downgraded() {
     assert_eq!(o.outbox_status, "DONE");
     assert!(o.run_completed);
     assert_eq!(o.run_output_count, Some(0));
+
+    // ADR-0026 (Card 6) D-B: the rejected candidate is persisted PENDING so a user can confirm
+    // it. FAULT SENTINEL: this exact-count assertion goes red if the candidate INSERT is dropped
+    // from the distill transaction (the card's required fault-injection check).
+    let candidates = f
+        .admin
+        .query(
+            "SELECT state, rejection_reason, requested_class, memory_type, confidence, \
+                    confirmed_memory_id, candidate_body \
+             FROM private.distill_candidates WHERE source_evidence_id = $1",
+            &[&evidence_id],
+        )
+        .expect("read distill candidates");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "a rejected distill output persists exactly one candidate"
+    );
+    let c = &candidates[0];
+    let state: String = c.get(0);
+    let reason: String = c.get(1);
+    let requested_class: String = c.get(2);
+    let memory_type: String = c.get(3);
+    let confirmed: Option<Uuid> = c.get(5);
+    let body: serde_json::Value = c.get(6);
+    assert_eq!(state, "PENDING", "candidate is PENDING");
+    assert_eq!(
+        reason, "origin_authority_ceiling",
+        "closed CandidateRejection reason is persisted verbatim"
+    );
+    assert_eq!(
+        requested_class, "UserCorrection",
+        "the rejected requested class is carried (not downgraded)"
+    );
+    assert_eq!(memory_type, "DECISION", "the parsed memory_type is carried");
+    assert!(
+        confirmed.is_none(),
+        "a PENDING candidate names no memory yet"
+    );
+    assert_eq!(
+        body["key_claim"], "Health endpoint before traffic.",
+        "the parsed content is carried so a user can confirm it"
+    );
+
     println!(
-        "D2 ASSERTION LOG: report={report:?} memories={} outbox={} output_count={:?}",
+        "D2 ASSERTION LOG: report={report:?} memories={} outbox={} output_count={:?} \
+         candidate=(state={state} reason={reason} requested={requested_class} type={memory_type})",
         o.memories, o.outbox_status, o.run_output_count
     );
 }
@@ -1150,6 +1202,22 @@ fn d3_zero_memories_settles_outbox_and_ticket() {
     assert_eq!(o.memories, 0);
     assert_eq!(o.outbox_status, "DONE");
     assert_eq!(o.run_output_count, Some(0));
+
+    // ADR-0026 (Card 6) D-B: a SKIPPED_BY_POLICY pass (0 outputs) is NOT a rejected candidate —
+    // it creates no queue row. FAULT SENTINEL: goes red if a 0-output pass ever persists a
+    // candidate (distinct from D2's ceiling-rejected case, which persists exactly one).
+    let candidate_count: i64 = f
+        .admin
+        .query_one(
+            "SELECT count(*) FROM private.distill_candidates WHERE source_evidence_id = $1",
+            &[&evidence_id],
+        )
+        .expect("read distill candidate count")
+        .get(0);
+    assert_eq!(
+        candidate_count, 0,
+        "a zero-output (SKIPPED_BY_POLICY) distill pass persists no candidate"
+    );
 
     let Some((outcome, upserts)) = run_projection(&rt, &f, test_name) else {
         return;

@@ -10,6 +10,7 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use humaux_adapters::{
     context_repo::MemoryEnumerationParams,
+    distill_repo::{ConfirmOutcome, RejectOutcome},
     memory_governance_repo::{ArchiveResult, RestoreResult},
     postgres::RuntimeDbPool,
 };
@@ -384,6 +385,13 @@ impl GatewayMcpApplication {
         value: &Value,
     ) -> Result<ToolOutput, ErrorCode> {
         let requested_workspace = workspace(value)?;
+        // ADR-0026 D-E: `{candidates:true}` lists PENDING distill candidates instead of memories
+        // (same read gate + workspace rule). The smaller schema change vs. a new op.
+        if value.get("candidates").and_then(Value::as_bool) == Some(true) {
+            return self
+                .memory_enumerate_candidates(context, operation, raw_arguments, value)
+                .await;
+        }
         let page_size = u16::try_from(
             value
                 .get("limit")
@@ -429,6 +437,49 @@ impl GatewayMcpApplication {
             )
             .await?;
         Ok(pending.finish())
+    }
+
+    /// ADR-0026 D-E: `memory.enumerate {candidates:true}` — the tenant's PENDING distill
+    /// candidates visible to the caller. Same read gate as memory.enumerate.
+    async fn memory_enumerate_candidates(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        raw_arguments: &str,
+        value: &Value,
+    ) -> Result<ToolOutput, ErrorCode> {
+        let requested_workspace = workspace(value)?;
+        let limit = i64::try_from(
+            value
+                .get("limit")
+                .map_or(Ok(50), |v| v.as_u64().ok_or(ErrorCode::InvalidInput))?,
+        )
+        .map_err(|_| ErrorCode::InvalidInput)?
+        .clamp(1, 100);
+        let pool = self.runtime_pool.clone();
+        let bootstrap = self.context_bootstrap.clone();
+        let catalog = self.catalog.clone();
+        self.guard
+            .run_local_read(
+                context,
+                operation,
+                requested_workspace,
+                raw_arguments,
+                move |request| async move {
+                    let result = memory::list_candidates(
+                        pool,
+                        request.authorization().clone(),
+                        request.workspace_id(),
+                        bootstrap,
+                        limit,
+                    )
+                    .await?;
+                    let value = serde_json::to_value(result).map_err(|_| ErrorCode::Internal)?;
+                    catalog.validate_output(ToolName::Memory, &value)?;
+                    output(value)
+                },
+            )
+            .await
     }
 
     /// §36 `memory.supersede` through the shared §33.10 confirm gate (ADR-0018). The
@@ -663,6 +714,169 @@ impl GatewayMcpApplication {
             // D-B: a refused undo is a success-shaped CONFLICT-with-reason result, not an
             // ErrorCode (which would carry no reason through the frozen §52.1 error map).
             ConfirmedOutcome::Executed(RestoreResult::Refused(reason)) => json!({
+                "code": "CONFLICT",
+                "reason": reason.code(),
+                "reason_label": reason.label().unwrap_or("UNKNOWN"),
+            }),
+        };
+        self.catalog.validate_output(ToolName::Memory, &value)?;
+        output(value)
+    }
+
+    /// §36/§10.1 `memory.confirm` through the same §33.10 confirm gate (ADR-0026, Card 6).
+    /// Promotes a `private.distill_candidates` row into UserConfirmed Evidence + a new Memory.
+    /// The gate target is the `candidate_id` (not a memory_id); `candidate_sha256` binds the
+    /// confirm to the exact reviewed body. A refused confirm (already confirmed / expired) is a
+    /// success-shaped `{code:CONFLICT, reason:<u16>}` (§52.1 keeps 18 codes).
+    async fn memory_confirm(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        raw_arguments: &str,
+        value: &Value,
+    ) -> Result<ToolOutput, ErrorCode> {
+        let candidate_id = Uuid::parse_str(
+            value["candidate_id"]
+                .as_str()
+                .ok_or(ErrorCode::InvalidInput)?,
+        )
+        .map_err(|_| ErrorCode::InvalidInput)?;
+        let candidate_sha256 = hex::decode(
+            value["candidate_sha256"]
+                .as_str()
+                .ok_or(ErrorCode::InvalidInput)?,
+        )
+        .map_err(|_| ErrorCode::InvalidInput)?;
+        if candidate_sha256.len() != 32 {
+            return Err(ErrorCode::InvalidInput);
+        }
+        let presented = value
+            .get("confirm_token")
+            .map(|token| {
+                token
+                    .as_str()
+                    .ok_or(ErrorCode::InvalidInput)
+                    .and_then(ConfirmToken::decode)
+            })
+            .transpose()?;
+        let Some(ttl) = self.confirm_token_ttl else {
+            return self.reject_unsupported(context, operation, None).await;
+        };
+        let pool = self.runtime_pool.clone();
+        let stream = self.context_bootstrap.stream.clone();
+        let consistency_token_ttl = self.remember_policy.consistency_token_ttl();
+        let outcome = self
+            .guard
+            .run_confirmed_write(
+                context,
+                operation,
+                None,
+                raw_arguments,
+                ConfirmGate {
+                    op: DestructiveOp::MemoryConfirm,
+                    target_id: candidate_id,
+                    successor_id: None,
+                    presented,
+                    ttl,
+                },
+                move |write| async move {
+                    memory::confirm(
+                        pool,
+                        write,
+                        stream,
+                        candidate_id,
+                        candidate_sha256,
+                        consistency_token_ttl,
+                    )
+                    .await
+                },
+            )
+            .await?;
+        let value = match outcome {
+            ConfirmedOutcome::ConfirmationRequired { token, expires_at } => json!({
+                "confirmation_required": true,
+                "confirm_token": token.encode(),
+                "operation": operation.operation_key(),
+                "target": { "candidate_id": candidate_id },
+                "expires_at": rfc3339(expires_at)?,
+            }),
+            ConfirmedOutcome::Executed(ConfirmOutcome::Confirmed(done)) => json!({
+                "memory_id": done.memory_id,
+                "evidence_id": done.evidence_id,
+                "candidate_id": done.candidate_id,
+                "stream_seq": done.stream_seq,
+                "commit_seq": done.commit_seq,
+                "consistency_token": done.consistency_token,
+            }),
+            ConfirmedOutcome::Executed(ConfirmOutcome::Refused(reason)) => json!({
+                "code": "CONFLICT",
+                "reason": reason.code(),
+                "reason_label": reason.label().unwrap_or("UNKNOWN"),
+            }),
+        };
+        self.catalog.validate_output(ToolName::Memory, &value)?;
+        output(value)
+    }
+
+    /// §36 `memory.reject` through the same §33.10 confirm gate (ADR-0026, Card 6). Marks a
+    /// pending candidate REJECTED; writes no Evidence/Memory.
+    async fn memory_reject(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        raw_arguments: &str,
+        value: &Value,
+    ) -> Result<ToolOutput, ErrorCode> {
+        let candidate_id = Uuid::parse_str(
+            value["candidate_id"]
+                .as_str()
+                .ok_or(ErrorCode::InvalidInput)?,
+        )
+        .map_err(|_| ErrorCode::InvalidInput)?;
+        let presented = value
+            .get("confirm_token")
+            .map(|token| {
+                token
+                    .as_str()
+                    .ok_or(ErrorCode::InvalidInput)
+                    .and_then(ConfirmToken::decode)
+            })
+            .transpose()?;
+        let Some(ttl) = self.confirm_token_ttl else {
+            return self.reject_unsupported(context, operation, None).await;
+        };
+        let pool = self.runtime_pool.clone();
+        let stream = self.context_bootstrap.stream.clone();
+        let outcome = self
+            .guard
+            .run_confirmed_write(
+                context,
+                operation,
+                None,
+                raw_arguments,
+                ConfirmGate {
+                    op: DestructiveOp::MemoryReject,
+                    target_id: candidate_id,
+                    successor_id: None,
+                    presented,
+                    ttl,
+                },
+                move |write| async move { memory::reject(pool, write, stream, candidate_id).await },
+            )
+            .await?;
+        let value = match outcome {
+            ConfirmedOutcome::ConfirmationRequired { token, expires_at } => json!({
+                "confirmation_required": true,
+                "confirm_token": token.encode(),
+                "operation": operation.operation_key(),
+                "target": { "candidate_id": candidate_id },
+                "expires_at": rfc3339(expires_at)?,
+            }),
+            ConfirmedOutcome::Executed(RejectOutcome::Rejected(candidate_id)) => json!({
+                "candidate_id": candidate_id,
+                "state": "rejected",
+            }),
+            ConfirmedOutcome::Executed(RejectOutcome::Refused(reason)) => json!({
                 "code": "CONFLICT",
                 "reason": reason.code(),
                 "reason_label": reason.label().unwrap_or("UNKNOWN"),
@@ -944,6 +1158,14 @@ impl McpApplication for GatewayMcpApplication {
             }
             key if key == DestructiveOp::MemoryCorrect.operation_key() => {
                 self.memory_correct(context, &operation, &raw_arguments, &value)
+                    .await
+            }
+            key if key == DestructiveOp::MemoryConfirm.operation_key() => {
+                self.memory_confirm(context, &operation, &raw_arguments, &value)
+                    .await
+            }
+            key if key == DestructiveOp::MemoryReject.operation_key() => {
+                self.memory_reject(context, &operation, &raw_arguments, &value)
                     .await
             }
             key if key == DestructiveOp::MemoryPin.operation_key() => {
