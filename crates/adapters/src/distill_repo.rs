@@ -25,6 +25,7 @@ use humaux_domain::evidence::{EvidenceOriginClass, payload_sha256};
 use humaux_domain::identity::AuthorizationScope;
 use humaux_domain::ids::{Scope, WorkspaceId};
 use humaux_domain::memory::MemoryType;
+use humaux_domain::subject::SubjectDeclaration;
 use humaux_projection::stream::StreamKey;
 use serde_json::Value;
 use sqlx::Row;
@@ -422,6 +423,12 @@ pub struct NewMemory<'a> {
 /// Grounding: the link is `IMMUTABLE` against the Evidence's `payload_sha256` — an EVENT
 /// payload is content-addressed and never rewritten (§8.1), so the recorded version is that
 /// digest's hex (§8.8: IMMUTABLE edges are excluded from the recheck derivation).
+///
+/// §6.1.3 / ADR-0028: this is the workspace's single `INSERT INTO private.memory_records`
+/// (Distill hop, `memory.confirm`, `memory.correct` all route here), so the deterministic
+/// subject resolve hook runs here once — after the PRIMARY link exists, because the hook reads
+/// it — and no sibling writer can forget it. Explicit links (rules 1/2) are the caller's; the
+/// hook adds rule 3 (Evidence declaration / correction predecessor) and byte-span mentions.
 pub async fn insert_memory(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,
@@ -456,6 +463,7 @@ pub async fn insert_memory(
     .bind(hex::encode(&evidence.payload_sha256))
     .execute(&mut **txn)
     .await?;
+    crate::subject_repo::link_memory_in_txn(txn, tenant_id, memory_id, &[]).await?;
     Ok(memory_id)
 }
 
@@ -600,6 +608,7 @@ fn remember_err(error: remember::RememberError) -> ErrorCode {
         remember::RememberError::Db(error) => candidate_db_error(error),
         remember::RememberError::ConsistencyTokenExpiryNotFuture
         | remember::RememberError::BatchExhausted => ErrorCode::Conflict,
+        remember::RememberError::Subject(code) => code,
     }
 }
 
@@ -673,6 +682,9 @@ pub struct ConfirmRequest {
     pub claim: ConfirmationClaim,
     pub finished_audit: AuditEvent,
     pub consistency_token_ttl: Duration,
+    /// §6.1.3 rules 1/2: explicit subjects the confirmed memory is about (resolved under the
+    /// tenant's RLS before the token is consumed; unknown ⇒ `INVALID_INPUT`, nothing written).
+    pub subjects: SubjectDeclaration,
 }
 
 #[derive(Debug, Clone)]
@@ -685,6 +697,9 @@ pub struct ConfirmDone {
     pub stream_seq: i64,
     pub commit_seq: i64,
     pub consistency_token: String,
+    /// §6.1.3: every subject M is linked to after the hook ran (explicit + inherited from the
+    /// candidate's source Evidence declaration).
+    pub subject_ids: Vec<Uuid>,
 }
 
 /// Success-shaped outcome: an executed confirm, or a refused one carrying a §52.1 sub-reason.
@@ -727,6 +742,9 @@ pub struct PendingCandidate {
 struct LockedCandidate {
     state: String,
     expired: bool,
+    /// Provenance: the Evidence the candidate was distilled from (its subject declaration is
+    /// carried onto E2 so the confirmed memory inherits it, §6.1.3 rule 3a).
+    source_evidence_id: Uuid,
     body: Value,
     payload_sha256: Vec<u8>,
     requested_class: AuthorityClass,
@@ -793,7 +811,8 @@ async fn lock_candidate(
     sha256: &[u8],
 ) -> Result<Option<LockedCandidate>, ErrorCode> {
     let Some(row) = sqlx::query(
-        "SELECT state, expires_at <= clock_timestamp() AS expired, candidate_body, \
+        "SELECT state, expires_at <= clock_timestamp() AS expired, source_evidence_id, \
+                candidate_body, \
                 candidate_sha256, requested_class, memory_type, confidence, data_class, \
                 visibility_class, visibility_user_id, visibility_workspace_id, \
                 reasoning_domain_id, occurred_at \
@@ -819,6 +838,9 @@ async fn lock_candidate(
     Ok(Some(LockedCandidate {
         state: row.try_get("state").map_err(|_| ErrorCode::Internal)?,
         expired: row.try_get("expired").map_err(|_| ErrorCode::Internal)?,
+        source_evidence_id: row
+            .try_get("source_evidence_id")
+            .map_err(|_| ErrorCode::Internal)?,
         body: row
             .try_get("candidate_body")
             .map_err(|_| ErrorCode::Internal)?,
@@ -898,6 +920,15 @@ pub async fn confirm_candidate_atomically(
         return Ok(ConfirmOutcome::Refused(ConflictReason::CANDIDATE_EXPIRED));
     }
 
+    // §6.1.3 rules 1/2 under this tenant's RLS, before the token is consumed: an unknown (or
+    // another tenant's) subject is INVALID_INPUT with nothing written and the token intact.
+    let explicit_subjects = crate::subject_repo::resolve_declaration_in_txn(
+        &mut txn,
+        auth.tenant_id().0,
+        &request.subjects,
+    )
+    .await?;
+
     // Token first (same as correct/restore): a replayed/expired/misbound token is Conflict.
     confirm_token_repo::consume_in_txn(&mut txn, auth, &request.claim).await?;
 
@@ -962,6 +993,7 @@ pub async fn confirm_candidate_atomically(
         // trust axis is origin_class = UserConfirmed above.
         event_kind: "MANUAL_NOTE".to_owned(),
         event_payload: candidate.body.clone(),
+        subjects: humaux_domain::subject::SubjectDeclaration::default(),
     };
     let evidence_id = remember::create_evidence_object(&mut txn, &cmd)
         .await
@@ -969,6 +1001,16 @@ pub async fn confirm_candidate_atomically(
     remember::insert_event_subtype(&mut txn, evidence_id, &cmd)
         .await
         .map_err(remember_err)?;
+    // §6.1.3 rule 3a: E2's provenance is the candidate's source Evidence, so its subject
+    // declaration rides onto E2 and the ordinary hook in insert_memory links M from it.
+    crate::subject_repo::inherit_evidence_declarations_in_txn(
+        &mut txn,
+        auth.tenant_id().0,
+        candidate.source_evidence_id,
+        evidence_id,
+    )
+    .await
+    .map_err(candidate_db_error)?;
 
     // One MEMORY_LIFECYCLE ticket bound to E2 (NOT EVIDENCE_ACCEPTED — M is materialized below;
     // projection resolves it via memory_evidence(E2)).
@@ -1041,6 +1083,22 @@ pub async fn confirm_candidate_atomically(
     )
     .await
     .map_err(candidate_db_error)?;
+    // §6.1.3 rules 1/2: the caller's explicit subjects, through the same hook (idempotent on
+    // top of what insert_memory already inherited).
+    if !explicit_subjects.is_empty() {
+        crate::subject_repo::link_memory_in_txn(
+            &mut txn,
+            auth.tenant_id().0,
+            memory_id,
+            &explicit_subjects,
+        )
+        .await
+        .map_err(candidate_db_error)?;
+    }
+    let subject_ids =
+        crate::subject_repo::memory_subject_ids_in_txn(&mut txn, auth.tenant_id().0, memory_id)
+            .await
+            .map_err(candidate_db_error)?;
 
     // Mark the candidate CONFIRMED naming M. Guarded WHERE state='PENDING' under the row lock:
     // 0 rows means a concurrent confirm/reject/expire won — roll E2/M back as a Conflict.
@@ -1100,6 +1158,7 @@ pub async fn confirm_candidate_atomically(
         stream_seq,
         commit_seq,
         consistency_token,
+        subject_ids,
     }))
 }
 

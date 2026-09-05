@@ -484,6 +484,7 @@ fn seed_memory_with_visibility_and_evidence(
         occurred_at: None,
         event_kind: "MANUAL_NOTE".to_owned(),
         event_payload: serde_json::json!({ "content": content }),
+        subjects: humaux_domain::subject::SubjectDeclaration::default(),
     };
     let accepted = handle
         .rt

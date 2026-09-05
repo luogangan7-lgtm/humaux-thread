@@ -421,6 +421,7 @@ fn remember_command(
         occurred_at: None,
         event_kind: "USER_MESSAGE".to_string(),
         event_payload: serde_json::json!({ "content": content }),
+        subjects: humaux_domain::subject::SubjectDeclaration::default(),
     }
 }
 

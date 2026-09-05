@@ -793,7 +793,7 @@ mod tests {
                 .as_array()
                 .expect("stable output union")
                 .len(),
-            12
+            14
         );
         assert_eq!(advertised["oneOf"][0]["$ref"], "#/$defs/Envelope");
         // ADR-0018: memory.supersede's two results are the third and fourth branches.
@@ -815,6 +815,16 @@ mod tests {
         assert_eq!(advertised["oneOf"][9]["$ref"], "#/$defs/Confirmed");
         assert_eq!(advertised["oneOf"][10]["$ref"], "#/$defs/Rejected");
         assert_eq!(advertised["oneOf"][11]["$ref"], "#/$defs/CandidatesPage");
+        // ADR-0028: memory.enumerate {subjects:true} page (memory<->subject linkage read-back)
+        // and the single-subject result of memory.subject_register / memory.subject_link_key.
+        assert_eq!(advertised["oneOf"][12]["$ref"], "#/$defs/SubjectsPage");
+        assert_eq!(advertised["oneOf"][13]["$ref"], "#/$defs/Subject");
+        // D-D: the Envelope item may carry its subject links (memory.get / memory.enumerate).
+        assert_eq!(
+            advertised["$defs"]["Envelope"]["properties"]["items"]["items"]["properties"]["subjects"]
+                ["items"]["format"],
+            "uuid"
+        );
         // A supersede confirmation must still name its successor; pin/unpin must not. ADR-0026
         // restructured ConfirmationRequired's conditionals into an allOf (candidate-target ops
         // join the memory-target ones), so the supersede branch is now allOf[0].

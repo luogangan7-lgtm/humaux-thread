@@ -90,6 +90,7 @@ fn command(
         occurred_at: None,
         event_kind: "USER_MESSAGE".into(),
         event_payload: serde_json::json!({"content": content}),
+        subjects: humaux_domain::subject::SubjectDeclaration::default(),
     }
 }
 

@@ -106,7 +106,7 @@
           "items": {
             "type": "object",
             "required": ["memory_id","content"],
-            "properties": {"memory_id":{"type":"string","format":"uuid"},"content":{},"archived":{"type":"boolean"}},
+            "properties": {"memory_id":{"type":"string","format":"uuid"},"content":{},"archived":{"type":"boolean"},"subjects":{"description":"§6.1.3 (ADR-0028 D-D): the subject ids this memory is linked to, in link order. Present on memory.get / memory.enumerate items (empty = linked to nothing); context.assemble does not read the axis and omits it.","type":"array","items":{"type":"string","format":"uuid"},"uniqueItems":true}},
             "additionalProperties": false
           }
         },

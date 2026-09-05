@@ -13,6 +13,7 @@ use humaux_adapters::{
     distill_repo::{ConfirmOutcome, RejectOutcome},
     memory_governance_repo::{ArchiveResult, RestoreResult},
     postgres::RuntimeDbPool,
+    subject_repo,
 };
 use humaux_domain::{
     authority::MemoryId,
@@ -21,6 +22,7 @@ use humaux_domain::{
     error::ErrorCode,
     evidence::payload_sha256,
     ids::WorkspaceId,
+    subject::{SubjectId, SubjectKey, SubjectKeyKind, SubjectKind, SubjectRole, SubjectWriteOp},
 };
 use humaux_protocol::{
     mcp::{McpApplication, McpHttpContext, McpOperation, McpToolArguments, ToolName, ToolOutput},
@@ -43,7 +45,7 @@ use crate::{
 /// The only real MCP business routes currently available from Gateway. Confirm-gated
 /// destructive keys come from the closed `DestructiveOp` table (§78.2, ADR-0018), never a
 /// second literal.
-pub const SUPPORTED_OPERATION_KEYS: [&str; 12] = [
+pub const SUPPORTED_OPERATION_KEYS: [&str; 14] = [
     "remember.put",
     "recall.search",
     "context.assemble",
@@ -56,6 +58,8 @@ pub const SUPPORTED_OPERATION_KEYS: [&str; 12] = [
     DestructiveOp::MemoryRestore.operation_key(),
     DestructiveOp::MemoryArchive.operation_key(),
     DestructiveOp::MemoryUnarchive.operation_key(),
+    SubjectWriteOp::Register.operation_key(),
+    SubjectWriteOp::LinkKey.operation_key(),
 ];
 
 /// Bootstrap-owned, authenticated MCP dispatch.  It has no client-selected
@@ -178,6 +182,10 @@ impl GatewayMcpApplication {
         value: &Value,
     ) -> Result<ToolOutput, ErrorCode> {
         let wire = RememberPutWire::from_raw(raw_arguments, value)?;
+        // §6.1.3 rules 1/2 (ADR-0028): parse the declaration here (malformed ⇒ INVALID_INPUT
+        // before admission); it is RESOLVED inside `remember_in_txn`, before the Evidence is
+        // written, so an unknown id/key rejects with nothing accepted or metered.
+        let subjects = subject_repo::parse_declaration(value)?;
         let workspace = wire.workspace_id.unwrap_or(self.remember_workspace);
         let configured_workspace = self.remember_workspace;
         let policy = self.remember_policy.clone();
@@ -201,6 +209,7 @@ impl GatewayMcpApplication {
                         event_kind,
                         None,
                         OffsetDateTime::now_utc(),
+                        subjects,
                     )
                 },
             )
@@ -392,6 +401,13 @@ impl GatewayMcpApplication {
                 .memory_enumerate_candidates(context, operation, raw_arguments, value)
                 .await;
         }
+        // ADR-0028: `{subjects:true}` lists the tenant's registered subjects (§6.1.3) — the
+        // registry read-back, same read gate + workspace rule.
+        if value.get("subjects").and_then(Value::as_bool) == Some(true) {
+            return self
+                .memory_enumerate_subjects(context, operation, raw_arguments, value)
+                .await;
+        }
         let page_size = u16::try_from(
             value
                 .get("limit")
@@ -402,6 +418,12 @@ impl GatewayMcpApplication {
             .get("cursor")
             .map(|v| v.as_str().map(str::to_owned).ok_or(ErrorCode::InvalidInput))
             .transpose()?;
+        // §6.1.3 D-D (ADR-0028): an exact subject filter on the manifest predicate.
+        let subject_id = value
+            .get("subject_id")
+            .map(|v| SubjectId::parse(v.as_str().ok_or(ErrorCode::InvalidInput)?))
+            .transpose()?
+            .map(|id| id.0);
         let pool = self.runtime_pool.clone();
         let bootstrap = self.context_bootstrap.clone();
         let catalog = self.catalog.clone();
@@ -424,6 +446,7 @@ impl GatewayMcpApplication {
                             page_size,
                             ttl: memory::ENUMERATION_TTL,
                             mac_key: &mac_key,
+                            subject_id,
                         },
                         |result| {
                             let value =
@@ -475,6 +498,155 @@ impl GatewayMcpApplication {
                     )
                     .await?;
                     let value = serde_json::to_value(result).map_err(|_| ErrorCode::Internal)?;
+                    catalog.validate_output(ToolName::Memory, &value)?;
+                    output(value)
+                },
+            )
+            .await
+    }
+
+    /// §6.1.3 / ADR-0028: `memory.enumerate {subjects:true}` — the tenant's registered subjects
+    /// with keys and roles, under RLS. Same read gate as memory.enumerate.
+    async fn memory_enumerate_subjects(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        raw_arguments: &str,
+        value: &Value,
+    ) -> Result<ToolOutput, ErrorCode> {
+        let requested_workspace = workspace(value)?;
+        let limit = i64::try_from(
+            value
+                .get("limit")
+                .map_or(Ok(50), |v| v.as_u64().ok_or(ErrorCode::InvalidInput))?,
+        )
+        .map_err(|_| ErrorCode::InvalidInput)?
+        .clamp(1, 100);
+        let pool = self.runtime_pool.clone();
+        let bootstrap = self.context_bootstrap.clone();
+        let catalog = self.catalog.clone();
+        self.guard
+            .run_local_read(
+                context,
+                operation,
+                requested_workspace,
+                raw_arguments,
+                move |request| async move {
+                    let result = memory::list_subjects(
+                        pool,
+                        request.authorization().clone(),
+                        request.workspace_id(),
+                        bootstrap,
+                        limit,
+                    )
+                    .await?;
+                    let value = serde_json::to_value(result).map_err(|_| ErrorCode::Internal)?;
+                    catalog.validate_output(ToolName::Memory, &value)?;
+                    output(value)
+                },
+            )
+            .await
+    }
+
+    /// §6.1.3 / ADR-0028 D-F (card 7 D-E1): `memory.subject_register` / `memory.subject_link_key`
+    /// — the two non-destructive registry writes, through the guard's admitted-write runner (no
+    /// confirm gate). Kinds/roles/key kinds are the closed domain sets; anything else is
+    /// INVALID_INPUT before admission.
+    async fn memory_subject_write(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        raw_arguments: &str,
+        value: &Value,
+        op: SubjectWriteOp,
+    ) -> Result<ToolOutput, ErrorCode> {
+        let requested_workspace = workspace(value)?;
+        let text = |field: &str| -> Result<String, ErrorCode> {
+            value
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or(ErrorCode::InvalidInput)
+        };
+        enum Write {
+            Register {
+                kind: SubjectKind,
+                display_name: String,
+                roles: Vec<SubjectRole>,
+            },
+            LinkKey {
+                subject_id: SubjectId,
+                key: SubjectKey,
+            },
+        }
+        let write = match op {
+            SubjectWriteOp::Register => Write::Register {
+                kind: SubjectKind::parse(&text("kind")?).ok_or(ErrorCode::InvalidInput)?,
+                display_name: text("display_name")?,
+                roles: match value.get("roles") {
+                    None => Vec::new(),
+                    Some(list) => list
+                        .as_array()
+                        .ok_or(ErrorCode::InvalidInput)?
+                        .iter()
+                        .map(|r| {
+                            r.as_str()
+                                .and_then(SubjectRole::parse)
+                                .ok_or(ErrorCode::InvalidInput)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                },
+            },
+            SubjectWriteOp::LinkKey => Write::LinkKey {
+                subject_id: SubjectId::parse(&text("subject_id")?)?,
+                key: SubjectKey::new(
+                    SubjectKeyKind::parse(&text("kind")?).ok_or(ErrorCode::InvalidInput)?,
+                    text("value")?,
+                )?,
+            },
+        };
+        let pool = self.runtime_pool.clone();
+        let bootstrap = self.context_bootstrap.clone();
+        let catalog = self.catalog.clone();
+        self.guard
+            .run_local_write(
+                context,
+                operation,
+                requested_workspace,
+                raw_arguments,
+                move |request| async move {
+                    let authorization = request.authorization().clone();
+                    let workspace = request.workspace_id();
+                    let subject = match write {
+                        Write::Register {
+                            kind,
+                            display_name,
+                            roles,
+                        } => {
+                            memory::register_subject(
+                                pool,
+                                authorization,
+                                workspace,
+                                bootstrap,
+                                kind,
+                                display_name,
+                                roles,
+                            )
+                            .await?
+                        }
+                        Write::LinkKey { subject_id, key } => {
+                            memory::link_subject_key(
+                                pool,
+                                authorization,
+                                workspace,
+                                bootstrap,
+                                subject_id,
+                                key,
+                            )
+                            .await?
+                        }
+                    };
+                    let value = serde_json::to_value(subject).map_err(|_| ErrorCode::Internal)?;
                     catalog.validate_output(ToolName::Memory, &value)?;
                     output(value)
                 },
@@ -594,6 +766,7 @@ impl GatewayMcpApplication {
         let (Some(ttl), Some(undo_window)) = (self.confirm_token_ttl, self.undo_window) else {
             return self.reject_unsupported(context, operation, None).await;
         };
+        let subjects = subject_repo::parse_declaration(value)?;
         let pool = self.runtime_pool.clone();
         let stream = self.context_bootstrap.stream.clone();
         let consistency_token_ttl = self.remember_policy.consistency_token_ttl();
@@ -621,6 +794,7 @@ impl GatewayMcpApplication {
                         digest,
                         undo_window,
                         consistency_token_ttl,
+                        subjects,
                     )
                     .await
                 },
@@ -642,6 +816,7 @@ impl GatewayMcpApplication {
                 "stream_seq": done.stream_seq,
                 "commit_seq": done.commit_seq,
                 "consistency_token": done.consistency_token,
+                "subject_ids": done.subject_ids,
             }),
         };
         self.catalog.validate_output(ToolName::Memory, &value)?;
@@ -762,6 +937,7 @@ impl GatewayMcpApplication {
         let Some(ttl) = self.confirm_token_ttl else {
             return self.reject_unsupported(context, operation, None).await;
         };
+        let subjects = subject_repo::parse_declaration(value)?;
         let pool = self.runtime_pool.clone();
         let stream = self.context_bootstrap.stream.clone();
         let consistency_token_ttl = self.remember_policy.consistency_token_ttl();
@@ -787,6 +963,7 @@ impl GatewayMcpApplication {
                         candidate_id,
                         candidate_sha256,
                         consistency_token_ttl,
+                        subjects,
                     )
                     .await
                 },
@@ -807,6 +984,7 @@ impl GatewayMcpApplication {
                 "stream_seq": done.stream_seq,
                 "commit_seq": done.commit_seq,
                 "consistency_token": done.consistency_token,
+                "subject_ids": done.subject_ids,
             }),
             ConfirmedOutcome::Executed(ConfirmOutcome::Refused(reason)) => json!({
                 "code": "CONFLICT",
@@ -1211,6 +1389,11 @@ impl McpApplication for GatewayMcpApplication {
                     DestructiveOp::MemoryUnarchive,
                 )
                 .await
+            }
+            key if SubjectWriteOp::parse_operation_key(key).is_some() => {
+                let op = SubjectWriteOp::parse_operation_key(key).ok_or(ErrorCode::Internal)?;
+                self.memory_subject_write(context, &operation, &raw_arguments, &value, op)
+                    .await
             }
             _ => {
                 self.reject_unsupported(context, &operation, workspace(&value)?)

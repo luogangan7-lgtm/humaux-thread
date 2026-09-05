@@ -385,6 +385,14 @@
     "consistency_token": {
      "type": "string",
      "minLength": 1
+    },
+    "subject_ids": {
+     "description": "§6.1.3 (ADR-0028): every subject the new version is linked to — inherited from the original (INHERITED) plus any explicit subject_ids/subject_keys the call declared.",
+     "type": "array",
+     "items": {
+      "type": "string",
+      "format": "uuid"
+     }
     }
    },
    "additionalProperties": false
@@ -424,6 +432,14 @@
     "consistency_token": {
      "type": "string",
      "minLength": 1
+    },
+    "subject_ids": {
+     "description": "§6.1.3 (ADR-0028): every subject the confirmed memory is linked to — the source Evidence's own declaration (carried onto the UserConfirmed Evidence) plus any explicit subject_ids/subject_keys the call declared.",
+     "type": "array",
+     "items": {
+      "type": "string",
+      "format": "uuid"
+     }
     }
    },
    "additionalProperties": false
@@ -514,6 +530,76 @@
     }
    },
    "additionalProperties": false
+  },
+  "Subject": {
+   "type": "object",
+   "description": "One registered subject (§6.1.3, ADR-0028): the item shape of memory.enumerate {subjects:true} and the whole result of memory.subject_register / memory.subject_link_key (D-F).",
+   "required": [
+    "subject_id",
+    "kind",
+    "display_name",
+    "keys",
+    "roles"
+   ],
+   "properties": {
+    "subject_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "kind": {
+     "type": "string"
+    },
+    "display_name": {
+     "type": "string"
+    },
+    "keys": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "kind",
+       "value"
+      ],
+      "properties": {
+       "kind": {
+        "type": "string"
+       },
+       "value": {
+        "type": "string"
+       }
+      },
+      "additionalProperties": false
+     }
+    },
+    "roles": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "SubjectsPage": {
+   "type": "object",
+   "description": "memory.enumerate {subjects:true} (§6.1.3, ADR-0028, card 8): the caller's tenant's registered subjects (live heads only), newest first, with their external keys and roles. Read-only; another tenant's registry is absent under RLS, never filtered in application code.",
+   "required": [
+    "subjects",
+    "snapshot_id"
+   ],
+   "properties": {
+    "snapshot_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "subjects": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/Subject"
+     }
+    }
+   },
+   "additionalProperties": false
   }
  },
  "oneOf": [
@@ -584,6 +670,12 @@
   },
   {
    "$ref": "#/$defs/CandidatesPage"
+  },
+  {
+   "$ref": "#/$defs/SubjectsPage"
+  },
+  {
+   "$ref": "#/$defs/Subject"
   }
  ]
 }

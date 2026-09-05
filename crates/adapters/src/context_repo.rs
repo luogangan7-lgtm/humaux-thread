@@ -604,6 +604,10 @@ pub struct MaterializedMemory {
     pub bodies: MaterializedBodies,
     pub ledger: humaux_retrieval::completeness::LedgerClosure,
     pub grounding: GroundingBlock,
+    /// §6.1.3 (ADR-0028 D-D): `memory_id → linked subject ids` (link order) for every body in
+    /// `bodies`, read in the same RR snapshot under the caller's RLS. A memory with no link has
+    /// no entry.
+    pub subjects: HashMap<Uuid, Vec<Uuid>>,
     /// Q3/ADR-0024 D-C: `true` when this memory carries `archived_at IS NOT NULL`. Only
     /// `memory.get` ever sees `true` — recall/context/enumerate exclude archived rows at their
     /// candidate step, so those paths always set `false`.
@@ -616,6 +620,11 @@ pub struct MemoryEnumerationParams<'a> {
     pub page_size: u16,
     pub ttl: std::time::Duration,
     pub mac_key: &'a [u8],
+    /// §6.1.3 (ADR-0028 D-D): restrict the EXACT enumeration predicate to memories linked to
+    /// this subject (`private.memory_subjects`, under RLS). Part of the manifest's query
+    /// fingerprint, so a cursor minted with one filter cannot page another; never a
+    /// post-filter, so the page's completeness claim stays what the manifest says.
+    pub subject_id: Option<Uuid>,
 }
 
 /// One immutable manifest page whose body, grounding and ledger share one PostgreSQL snapshot.
@@ -625,7 +634,11 @@ pub struct MaterializedMemoryPage {
     pub memory: MaterializedMemory,
 }
 
-fn enumeration_fingerprint(authorization: &AuthorizationScope, scope: &Scope) -> String {
+fn enumeration_fingerprint(
+    authorization: &AuthorizationScope,
+    scope: &Scope,
+    subject_id: Option<Uuid>,
+) -> String {
     let workspace = scope
         .workspace_id
         .map(|id| id.0.to_string())
@@ -634,15 +647,47 @@ fn enumeration_fingerprint(authorization: &AuthorizationScope, scope: &Scope) ->
         .user_id()
         .map(|id| id.0.to_string())
         .unwrap_or_default();
+    // The subject filter is part of the predicate identity (empty segment when absent), so a
+    // cursor minted under one filter never pages another manifest.
+    let subject = subject_id.map(|id| id.to_string()).unwrap_or_default();
     query_fingerprint(
         &format!(
-            "{AUTHORIZED_MEMORY_ENUMERATION_V1}:{}:{}:{}",
+            "{AUTHORIZED_MEMORY_ENUMERATION_V1}:{}:{}:{}:{subject}",
             authorization.principal().0,
             user,
             workspace
         ),
         authorization.tenant_id().0,
     )
+}
+
+/// §6.1.3 (ADR-0028 D-D): linked subject ids for each of `ids`, in link order, under the
+/// transaction's RLS (`private.memory_subjects` is visible exactly where its memory is).
+async fn memory_subjects_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<Uuid>>, ErrorCode> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query(
+        "SELECT memory_id, subject_id FROM private.memory_subjects \
+         WHERE tenant_id = $1 AND memory_id = ANY($2) \
+         ORDER BY memory_id, created_at, subject_id",
+    )
+    .bind(tenant_id)
+    .bind(ids)
+    .fetch_all(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    let mut out: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for row in rows {
+        let memory_id: Uuid = row.try_get("memory_id").map_err(|_| ErrorCode::Internal)?;
+        let subject_id: Uuid = row.try_get("subject_id").map_err(|_| ErrorCode::Internal)?;
+        out.entry(memory_id).or_default().push(subject_id);
+    }
+    Ok(out)
 }
 
 fn validate_enumeration_params(params: &MemoryEnumerationParams<'_>) -> Result<(), ErrorCode> {
@@ -677,6 +722,7 @@ async fn page_grounding_in_txn(
     Ok(result)
 }
 /// Materializes an authorization-bound immutable Memory page.
+#[allow(clippy::too_many_lines)] // ADR-0028 D-D: the exact enumeration predicate now carries the subject_id filter inside the same manifest SQL + fingerprint; splitting it would separate the predicate from the completeness classification it must stay honest with.
 pub async fn materialize_memory_enumeration(
     pool: &RuntimeDbPool,
     authorization: &AuthorizationScope,
@@ -688,7 +734,7 @@ pub async fn materialize_memory_enumeration(
     validate_enumeration_params(&params)?;
     let (authorization, scope) = canonical_scope(authorization, scope)?;
     materialized_identity(&scope, expected_family, validated_key)?;
-    let fingerprint = enumeration_fingerprint(&authorization, &scope);
+    let fingerprint = enumeration_fingerprint(&authorization, &scope, params.subject_id);
     let mut txn = pool
         .pool()
         .begin()
@@ -716,8 +762,22 @@ pub async fn materialize_memory_enumeration(
         )
         .await?
     } else {
-        let rows = sqlx::query("SELECT memory_id FROM private.memory_records WHERE tenant_id=$1 AND status='active' AND superseded_by IS NULL AND archived_at IS NULL ORDER BY memory_id DESC")
-            .bind(authorization.tenant_id().0).fetch_all(&mut *txn).await.map_err(|_| ErrorCode::DependencyUnavailable)?;
+        // §6.1.3 D-D: the subject filter is part of the EXACT manifest predicate (RLS-visible
+        // memory_subjects rows), never a post-filter over an unfiltered page.
+        let rows = sqlx::query(
+            "SELECT m.memory_id FROM private.memory_records m \
+             WHERE m.tenant_id = $1 AND m.status = 'active' AND m.superseded_by IS NULL \
+               AND m.archived_at IS NULL \
+               AND ($2::uuid IS NULL OR EXISTS (SELECT 1 FROM private.memory_subjects ms \
+                    WHERE ms.tenant_id = m.tenant_id AND ms.memory_id = m.memory_id \
+                      AND ms.subject_id = $2)) \
+             ORDER BY m.memory_id DESC",
+        )
+        .bind(authorization.tenant_id().0)
+        .bind(params.subject_id)
+        .fetch_all(&mut *txn)
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
         let candidates = rows
             .into_iter()
             .map(|row| row.try_get("memory_id").map_err(|_| ErrorCode::Internal))
@@ -759,6 +819,8 @@ pub async fn materialize_memory_enumeration(
         return Err(ErrorCode::NotFound);
     }
     let grounding = page_grounding_in_txn(&mut txn, &authorization, &page.items).await?;
+    let subjects =
+        memory_subjects_in_txn(&mut txn, authorization.tenant_id().0, &page.items).await?;
     let ledger = close_ledger_in_txn(&mut txn, validated_key)
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
@@ -772,6 +834,7 @@ pub async fn materialize_memory_enumeration(
             bodies,
             ledger,
             grounding,
+            subjects,
             // Enumerate excludes archived rows at the candidate query (D-C), so a page never
             // carries one; the flag is meaningful only on memory.get.
             archived: false,
@@ -966,6 +1029,8 @@ pub async fn materialize_memory_get(
     .await
     .map_err(|_| ErrorCode::DependencyUnavailable)?
     .ok_or(ErrorCode::Internal)?;
+    let subjects =
+        memory_subjects_in_txn(&mut txn, authorization.tenant_id().0, &[memory_id.0]).await?;
     let ledger = close_ledger_in_txn(&mut txn, validated_key)
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
@@ -976,6 +1041,7 @@ pub async fn materialize_memory_get(
         bodies,
         ledger,
         grounding,
+        subjects,
         archived,
     })
 }

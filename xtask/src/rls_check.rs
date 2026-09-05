@@ -1162,6 +1162,91 @@ const ADDITIVE_SEAM_MATRIX: &[Cell] = &[
     ),
     cell!("private.subject_roles", "role_retrieval_worker", ["SELECT"]),
     cell!("private.subject_roles", "role_maintenance", ["SELECT"]),
+    // 0154 (ADR-0028, card 8) memory<->subject linkage. evidence_subjects: the gateway declares
+    // at remember.put (SELECT+INSERT); private_worker/retrieval_worker/maintenance read.
+    // memory_subjects + memory_subject_mentions: written by whichever role inserted the memory
+    // (gateway for confirm/correct, private_worker for the Distill hop) through the ONE hook
+    // function; consolidation_worker/retrieval_worker/maintenance read. memory_rollup_subjects:
+    // consolidation_worker writes in publish_rollup; gateway/retrieval_worker/maintenance read.
+    // Every other non-owner role — (absence == no grant).
+    cell!(
+        "private.evidence_subjects",
+        "role_gateway",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.evidence_subjects",
+        "role_private_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "private.evidence_subjects",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!("private.evidence_subjects", "role_maintenance", ["SELECT"]),
+    cell!(
+        "private.memory_subjects",
+        "role_gateway",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.memory_subjects",
+        "role_private_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.memory_subjects",
+        "role_consolidation_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "private.memory_subjects",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!("private.memory_subjects", "role_maintenance", ["SELECT"]),
+    cell!(
+        "private.memory_subject_mentions",
+        "role_gateway",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.memory_subject_mentions",
+        "role_private_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.memory_subject_mentions",
+        "role_consolidation_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "private.memory_subject_mentions",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "private.memory_subject_mentions",
+        "role_maintenance",
+        ["SELECT"]
+    ),
+    cell!(
+        "private.memory_rollup_subjects",
+        "role_consolidation_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!("private.memory_rollup_subjects", "role_gateway", ["SELECT"]),
+    cell!(
+        "private.memory_rollup_subjects",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "private.memory_rollup_subjects",
+        "role_maintenance",
+        ["SELECT"]
+    ),
 ];
 
 /// Named §6.2.2 tables whose non-owner cells are all deliberately empty. Their only public

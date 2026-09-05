@@ -22,6 +22,7 @@ use humaux_domain::{
     error::ErrorCode,
     identity::AuthorizationScope,
     ids::WorkspaceId,
+    subject::SubjectWriteOp,
 };
 use humaux_protocol::{
     edge::{
@@ -444,6 +445,45 @@ impl GatewayGuard {
                 operation.operation_key(),
                 "context.assemble" | "memory.get" | "memory.enumerate"
             ) {
+                return self
+                    .denied(
+                        context,
+                        operation,
+                        &admitted,
+                        ErrorCode::DependencyUnavailable,
+                    )
+                    .await;
+            }
+            self.read_admitted(context, operation, raw_arguments, &admitted, handler)
+                .await
+        }
+        .await;
+        self.record_request(operation, &result);
+        result
+    }
+
+    /// A non-destructive admitted write (§6.1.3 / ADR-0028 D-F: the `SubjectWriteOp` registry
+    /// ops — `memory.subject_register` / `memory.subject_link_key`). Same admission, rate,
+    /// entitlement, ordinary BMO reservation/settlement and finished audit as a local read; no
+    /// confirm gate because nothing is deleted, superseded or hidden. The handler owns its own
+    /// transaction; an error there settles as a refused write (reservation released).
+    pub(crate) async fn run_local_write<T, F, Fut>(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        requested_workspace: Option<WorkspaceId>,
+        raw_arguments: &str,
+        handler: F,
+    ) -> Result<T, ErrorCode>
+    where
+        F: FnOnce(AuthorizedRequest) -> Fut,
+        Fut: Future<Output = Result<T, ErrorCode>>,
+    {
+        let result = async {
+            let admitted = self.admit(context, operation, requested_workspace).await?;
+            if SubjectWriteOp::parse_operation_key(operation.operation_key()).is_none()
+                || operation.meter_kind() != MeterKind::Ordinary
+            {
                 return self
                     .denied(
                         context,

@@ -1446,3 +1446,159 @@ fn d6_retryable_failures_hand_the_row_back_for_a_later_pass() {
         "D6 ASSERTION LOG: unadmitted={unadmitted:?} throttled={throttled:?} recovered={recovered:?} after={after:?}"
     );
 }
+
+// ----------------------------------------------------------------------------
+// D7 — §6.1.3 / ADR-0028 (card 8): a remember-time subject declaration on the Evidence reaches
+// the Distill-born memory through the ONE shared hook inside `distill_repo::insert_memory`
+// (rule 3a: the PRIMARY Evidence's declaration → INHERITED, 10000 bp, ABOUT — the Evidence row
+// keeps whether it was declared by id or by key), and every mention span indexes back into the
+// exact stored revision. The Distill hop itself stays deterministic on this axis: nothing in the
+// model output is consulted for linking.
+// ----------------------------------------------------------------------------
+
+/// Registers one Person (declared by id) and one Organisation (declared by exact CRM key) under
+/// the fixture tenant and records both declarations on `evidence_id` the way the gateway's
+/// `remember.put` does (`private.evidence_subjects` rows under `role_gateway`, in the Evidence's
+/// own transaction — `adapters::remember::remember_in_txn`). Returns `(person, org)`.
+fn seed_subject_declaration(f: &mut Fixture, evidence_id: Uuid) -> (Uuid, Uuid) {
+    let person: Uuid = f
+        .admin
+        .query_one(
+            "INSERT INTO private.subjects (tenant_id, kind, display_name) \
+             VALUES ($1, 'PERSON', 'Ada Lovelace') RETURNING subject_id",
+            &[&f.tenant_id],
+        )
+        .expect("seed person")
+        .get(0);
+    let org: Uuid = f
+        .admin
+        .query_one(
+            "INSERT INTO private.subjects (tenant_id, kind, display_name) \
+             VALUES ($1, 'ORGANISATION', 'Analytical Engines Ltd') RETURNING subject_id",
+            &[&f.tenant_id],
+        )
+        .expect("seed org")
+        .get(0);
+    f.admin
+        .execute(
+            "INSERT INTO private.subject_keys (tenant_id, subject_id, key_kind, key_value) \
+             VALUES ($1, $2, 'CRM', 'CRM-1001')",
+            &[&f.tenant_id, &org],
+        )
+        .expect("seed crm key");
+    // The gateway resolves the key to the org id under RLS before declaring; the declaration
+    // itself carries the rule that produced it.
+    let mut txn = f.admin.transaction().expect("begin declare");
+    txn.batch_execute(&format!(
+        "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{}'; SET LOCAL humaux.user_id = '{}';",
+        f.tenant_id, f.user_id
+    ))
+    .expect("gateway context");
+    let written = txn
+        .execute(
+            "INSERT INTO private.evidence_subjects (tenant_id, evidence_id, subject_id, source_kind) \
+             VALUES ($1, $2, $3, 'DECLARED'), ($1, $2, $4, 'EXTERNAL_KEY')",
+            &[&f.tenant_id, &evidence_id, &person, &org],
+        )
+        .expect("declare under role_gateway");
+    assert_eq!(written, 2, "two declaration rows on the Evidence");
+    txn.commit().expect("commit declare");
+    (person, org)
+}
+
+#[test]
+fn d7_declared_subjects_reach_the_distilled_memory_with_spans() {
+    let Some(mut f) = setup_db("d7_declared_subjects_reach_the_distilled_memory_with_spans") else {
+        return;
+    };
+    let (evidence_id, _, _) = seed_evidence(
+        &mut f,
+        "Ada Lovelace (account CRM-1001) wants the renewal moved to Q4.",
+    );
+    let (person, org) = seed_subject_declaration(&mut f, evidence_id);
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    // The model output names no subject at all — linking must come from the declaration.
+    let provider = FakeProvider::new(vec![
+        r#"{"memories":[{"content":"Ada Lovelace wants the CRM-1001 renewal moved to Q4.","memory_type":"Decision","class":"PrivateKnowledge","confidence":0.9}]}"#,
+    ]);
+    let report = run_pass(&rt, &f, &provider, "d7-worker");
+    assert_eq!(report.done, 1, "{report:?}");
+    assert_eq!(report.memories, 1, "{report:?}");
+    let o = observe(&mut f, evidence_id);
+    assert_eq!(o.memories, 1);
+
+    // FAULT SENTINEL: exact link count per source_kind goes red if the hook call is dropped from
+    // `distill_repo::insert_memory` (0 rows) or the declaration is not carried as INHERITED.
+    let mut rows = f
+        .admin
+        .query(
+            "SELECT ms.subject_id, ms.relation, ms.source_kind, ms.confidence_bp \
+             FROM private.memory_subjects ms \
+             JOIN private.memory_evidence me ON me.memory_id = ms.memory_id \
+             WHERE me.evidence_id = $1",
+            &[&evidence_id],
+        )
+        .expect("read links")
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<_, Uuid>(0),
+                r.get::<_, String>(1),
+                r.get::<_, String>(2),
+                r.get::<_, i16>(3),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    let mut expected = vec![
+        (person, "ABOUT".to_owned(), "INHERITED".to_owned(), 10_000),
+        (org, "ABOUT".to_owned(), "INHERITED".to_owned(), 10_000),
+    ];
+    expected.sort();
+    assert_eq!(
+        rows, expected,
+        "the distilled memory inherits both Evidence declarations (§6.1.3 rule 3 → INHERITED)"
+    );
+
+    // Mention spans: each subject's display_name / key value located in the exact stored
+    // revision bytes, sha256-bound to that revision.
+    let mentions = f
+        .admin
+        .query(
+            "SELECT ms.subject_id, \
+                    convert_from(substring(convert_to(m.content::text,'UTF8') \
+                        FROM ms.span_start + 1 FOR ms.span_end - ms.span_start), 'UTF8'), \
+                    ms.revision_sha256 = sha256(convert_to(m.content::text,'UTF8')) \
+             FROM private.memory_subject_mentions ms \
+             JOIN private.memory_records m ON m.memory_id = ms.memory_id \
+             JOIN private.memory_evidence me ON me.memory_id = ms.memory_id \
+             WHERE me.evidence_id = $1",
+            &[&evidence_id],
+        )
+        .expect("read mentions")
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<_, Uuid>(0),
+                r.get::<_, String>(1),
+                r.get::<_, bool>(2),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        mentions
+            .iter()
+            .any(|(id, text, bound)| *id == person && text == "Ada Lovelace" && *bound),
+        "person span indexes the stored revision: {mentions:?}"
+    );
+    assert!(
+        mentions
+            .iter()
+            .any(|(id, text, bound)| *id == org && text == "CRM-1001" && *bound),
+        "org key span indexes the stored revision: {mentions:?}"
+    );
+    println!(
+        "D7 ASSERTION LOG: report={report:?} links={rows:?} mentions={}",
+        mentions.len()
+    );
+}

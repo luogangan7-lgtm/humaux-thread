@@ -40,6 +40,7 @@ use humaux_domain::{
     ids::{Scope, WorkspaceId},
     lifecycle::{LifecycleOp, LifecycleReason, RestoreTargetState, restore_allowed},
     memory::MemoryType,
+    subject::SubjectDeclaration,
 };
 use humaux_projection::stream::StreamKey;
 use sqlx::types::time::OffsetDateTime;
@@ -185,6 +186,7 @@ fn remember_error(error: RememberError) -> ErrorCode {
         RememberError::ConsistencyTokenExpiryNotFuture | RememberError::BatchExhausted => {
             ErrorCode::Conflict
         }
+        RememberError::Subject(code) => code,
     }
 }
 
@@ -1154,6 +1156,11 @@ pub struct CorrectRequest {
     pub undo_window: Duration,
     /// §15.5 consistency_token lifetime for the token returned on `M2`'s new stream seq.
     pub consistency_token_ttl: Duration,
+    /// §6.1.3 rules 1/2 (ADR-0028): explicit subjects `M2` is about, on top of what it inherits
+    /// from `M1` (the 0154 trigger). Resolved under the tenant's RLS BEFORE the token is
+    /// consumed — unknown ⇒ `INVALID_INPUT`, nothing written, token intact — and applied inside
+    /// this same transaction.
+    pub subjects: SubjectDeclaration,
 }
 
 #[derive(Debug, Clone)]
@@ -1168,6 +1175,9 @@ pub struct CorrectDone {
     pub stream_seq: i64,
     pub commit_seq: i64,
     pub consistency_token: String,
+    /// §6.1.3: every subject `M2` is linked to after the hook ran (inherited from `M1` +
+    /// explicit), in link order.
+    pub subject_ids: Vec<Uuid>,
 }
 
 /// The `M1` facts a correction copies onto `E2`/`M2` (visibility + reasoning domain + type).
@@ -1368,6 +1378,13 @@ pub async fn correct_atomically(
             commit_seq,
             request.consistency_token_ttl,
         )?;
+        let subject_ids = crate::subject_repo::memory_subject_ids_in_txn(
+            &mut txn,
+            auth.tenant_id().0,
+            replacement,
+        )
+        .await
+        .map_err(db_error)?;
         return Ok(CorrectDone {
             new_memory_id: MemoryId(replacement),
             superseded: request.target,
@@ -1376,6 +1393,7 @@ pub async fn correct_atomically(
             stream_seq,
             commit_seq,
             consistency_token,
+            subject_ids,
         });
     }
 
@@ -1399,6 +1417,15 @@ pub async fn correct_atomically(
         &mut txn,
         AuditTenant::Authenticated(auth),
         &quota_audit,
+    )
+    .await?;
+
+    // §6.1.3 rules 1/2 under this tenant's RLS, before the token is consumed: an unknown (or
+    // another tenant's) subject is INVALID_INPUT with nothing written and the token intact.
+    let explicit_subjects = crate::subject_repo::resolve_declaration_in_txn(
+        &mut txn,
+        auth.tenant_id().0,
+        &request.subjects,
     )
     .await?;
 
@@ -1440,6 +1467,7 @@ pub async fn correct_atomically(
         occurred_at: None,
         event_kind: "USER_CORRECTION".to_owned(),
         event_payload: request.content.clone(),
+        subjects: humaux_domain::subject::SubjectDeclaration::default(),
     };
     let evidence_id = remember::create_evidence_object(&mut txn, &cmd)
         .await
@@ -1551,6 +1579,23 @@ pub async fn correct_atomically(
     .map_err(db_error)?;
     let superseded_at = superseded_at.ok_or(ErrorCode::Conflict)?;
 
+    // §6.1.3: the arbiter UPDATE above fired the 0154 trigger (M2 inherited M1's links);
+    // the caller's explicit subjects go through the same hook in this same transaction.
+    if !explicit_subjects.is_empty() {
+        crate::subject_repo::link_memory_in_txn(
+            &mut txn,
+            auth.tenant_id().0,
+            new_memory_id,
+            &explicit_subjects,
+        )
+        .await
+        .map_err(db_error)?;
+    }
+    let subject_ids =
+        crate::subject_repo::memory_subject_ids_in_txn(&mut txn, auth.tenant_id().0, new_memory_id)
+            .await
+            .map_err(db_error)?;
+
     if quota_repo::finish_reservation_in_txn(&mut txn, auth, &reservation, true).await?
         != ReservationStatus::Consumed
     {
@@ -1594,6 +1639,7 @@ pub async fn correct_atomically(
         stream_seq,
         commit_seq,
         consistency_token,
+        subject_ids,
     })
 }
 

@@ -1205,3 +1205,76 @@ fn read_memory_snapshot(
         .expect("read memory snapshot");
     (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
 }
+
+/// (T7) §6.1.3 / ADR-0028 (card 8): a rollup published by the real consolidation path inherits
+/// its source memories' subject links through the ONE shared hook (`publish_rollup` →
+/// `private.link_rollup_subjects`). FAULT SENTINEL: removing the `link_rollup_in_txn` call from
+/// `consolidate_repo::publish_rollup` leaves `memory_rollup_subjects` empty and this exact-count
+/// assertion goes red — the proof that the rollup path is covered, not only the Distill path.
+#[test]
+fn t7_rollup_inherits_subject_links_through_publish_rollup() {
+    let Some(mut f) = setup_db("t7_rollup_inherits_subject_links_through_publish_rollup") else {
+        return;
+    };
+    let (memory_id, evidence_id) = seed_workspace_memory(&mut f, "t7 memory about Babbage & Co");
+    let org: Uuid = f
+        .admin
+        .query_one(
+            "INSERT INTO private.subjects (tenant_id, kind, display_name) \
+             VALUES ($1, 'ORGANISATION', 'Babbage & Co') RETURNING subject_id",
+            &[&f.tenant_id],
+        )
+        .expect("seed org")
+        .get(0);
+    f.admin
+        .execute(
+            "SELECT private.link_memory_subjects($1, $2, ARRAY[$3]::uuid[], ARRAY['DECLARED']::text[])",
+            &[&f.tenant_id, &memory_id, &org],
+        )
+        .expect("link the source memory");
+
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let consolidation_pool = rt
+        .block_on(ConsolidationDbPool::connect(&dsn_as_role(
+            &f.dsn,
+            "role_consolidation_worker",
+        )))
+        .expect("consolidation pool");
+    let outcome = rt.block_on(run_once(
+        &consolidation_pool,
+        &FakePort,
+        f.tenant_id,
+        f.reasoning_domain_id,
+        ReasoningRouteBindingId(UNADMITTED_BINDING_ID),
+        ReasoningRouteBindingVersion(1),
+        Some(f.workspace_id),
+        10_000,
+        |ids, _result| {
+            let content = serde_json::json!({"content": "Babbage & Co: consolidated view"});
+            let sources = ids
+                .iter()
+                .map(|id| (*id, humaux_domain::authority::EvidenceId(evidence_id)))
+                .collect();
+            Ok((content, AuthorityClass::PrivateKnowledge, sources))
+        },
+    ));
+    let rollup_id = match outcome {
+        Ok(PublishOutcome::Published { rollup_id }) => rollup_id,
+        other => panic!("T7 expected a published rollup, got: {other:?}"),
+    };
+    let rows: Vec<(Uuid, String)> = f
+        .admin
+        .query(
+            "SELECT subject_id, source_kind FROM private.memory_rollup_subjects WHERE rollup_id = $1",
+            &[&rollup_id],
+        )
+        .expect("read rollup subjects")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(org, "INHERITED".to_owned())],
+        "the rollup inherits exactly its source memory's subject as INHERITED"
+    );
+}

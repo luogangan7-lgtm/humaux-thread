@@ -5960,3 +5960,542 @@ fn native_mcp_memory_pin_unpin_confirm_gate_acceptance() {
         });
     });
 }
+
+// ===========================================================================================
+// §6.1.3 subject registry (card 7 D-E1/D-E2) / declaration / read-back / confirm + correct
+// linkage (ADR-0028, card 8).
+// ===========================================================================================
+
+async fn memory_call(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    args: Value,
+) -> (u16, Value) {
+    raw_request(
+        address,
+        &tool_call_headers("memory", bearer),
+        &rpc(request_id, "tools/call", call_params("memory", args)),
+    )
+    .await
+}
+
+/// `memory.subject_register` through the real MCP surface (D-E1), asserting the `Subject` result
+/// shape; returns the new subject id.
+async fn register_subject(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    kind: &str,
+    display_name: &str,
+    roles: &[&str],
+) -> Uuid {
+    let (status, response) = memory_call(
+        address,
+        bearer,
+        request_id,
+        json!({
+            "action": "subject_register",
+            "kind": kind,
+            "display_name": display_name,
+            "roles": roles,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{response}");
+    let structured = assert_tool_response(&response, ToolName::Memory);
+    assert_eq!(structured["kind"], kind, "{response}");
+    assert_eq!(structured["display_name"], display_name, "{response}");
+    assert_eq!(structured["roles"], json!(roles), "{response}");
+    assert_eq!(structured["keys"], json!([]), "{response}");
+    Uuid::parse_str(structured["subject_id"].as_str().expect("subject_id")).expect("uuid")
+}
+
+/// §52.1: `INVALID_INPUT` is a protocol-level refusal (HTTP 400, JSON-RPC `-32602`) — the same
+/// layer every other INVALID_INPUT assertion in this suite reads.
+fn assert_protocol_invalid_input(status: u16, response: &Value) {
+    assert_eq!(status, 400, "{response}");
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+    assert_eq!(
+        response["error"]["data"]["code"], "INVALID_INPUT",
+        "{response}"
+    );
+    assert!(response.get("result").is_none(), "{response}");
+}
+
+async fn remember_with_subjects(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    workspace_id: Uuid,
+    content: &str,
+    subject_ids: Vec<Uuid>,
+    subject_keys: Vec<(&str, &str)>,
+) -> (u16, Value) {
+    let mut args = json!({
+        "operation": "put",
+        "content": content,
+        "idempotency_key": format!("card8-{}", Uuid::now_v7()),
+        "workspace_id": workspace_id,
+    });
+    if !subject_ids.is_empty() {
+        args["subject_ids"] = json!(subject_ids);
+    }
+    if !subject_keys.is_empty() {
+        args["subject_keys"] = json!(
+            subject_keys
+                .iter()
+                .map(|(kind, value)| json!({"kind": kind, "value": value}))
+                .collect::<Vec<_>>()
+        );
+    }
+    raw_request(
+        address,
+        &tool_call_headers("remember", bearer),
+        &rpc(request_id, "tools/call", call_params("remember", args)),
+    )
+    .await
+}
+
+fn evidence_declarations(handle: &mut Handle, evidence_id: Uuid) -> Vec<(Uuid, String)> {
+    handle
+        .admin
+        .query(
+            "SELECT subject_id, source_kind FROM private.evidence_subjects \
+             WHERE evidence_id = $1 ORDER BY source_kind",
+            &[&evidence_id],
+        )
+        .expect("read evidence declarations")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
+}
+
+fn memory_links(handle: &mut Handle, memory_id: Uuid) -> Vec<(Uuid, String)> {
+    handle
+        .admin
+        .query(
+            "SELECT subject_id, source_kind FROM private.memory_subjects \
+             WHERE memory_id = $1 ORDER BY source_kind",
+            &[&memory_id],
+        )
+        .expect("read memory links")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
+}
+
+/// Owner-side row counts that a refused write must leave untouched.
+fn count_rows(handle: &mut Handle, sql: &str, id: Uuid) -> i64 {
+    handle
+        .admin
+        .query_one(sql, &[&id])
+        .expect("owner counts rows")
+        .get(0)
+}
+
+const EVIDENCE_OF_TENANT: &str =
+    "SELECT count(*) FROM private.evidence_objects WHERE tenant_id = $1";
+const SUBJECTS_OF_TENANT: &str = "SELECT count(*) FROM private.subjects WHERE tenant_id = $1";
+const KEYS_OF_SUBJECT: &str = "SELECT count(*) FROM private.subject_keys WHERE subject_id = $1";
+const DECLARATIONS_OF_SUBJECT: &str =
+    "SELECT count(*) FROM private.evidence_subjects WHERE subject_id = $1";
+
+fn listed_subject_ids(listed: &Value) -> BTreeSet<String> {
+    listed["result"]["structuredContent"]["subjects"]
+        .as_array()
+        .expect("subjects array")
+        .iter()
+        .map(|s| s["subject_id"].as_str().expect("id").to_owned())
+        .collect()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One HTTP fixture pair carries the whole card-8 gateway gate.
+fn native_mcp_subject_registry_declaration_and_linkage_acceptance() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Tenant B: its own fixture, credential and server — D-E2's "the other credential sees
+    // zero" is proven through a second real MCP surface, never through owner SQL.
+    run_db_fixture::<Fixture, _>("native_mcp_subjects_foreign", |mut foreign| {
+        foreign.assert_gateway_login();
+        let fprefix = format!("mcsf{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let fwire = format!("{fprefix}.{}", "d".repeat(32));
+        let foreign_credential = foreign.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &fprefix,
+            &fwire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &fwire),
+            96,
+        );
+        let foreign_rt = foreign.rt.handle().clone();
+        let foreign_runtime = foreign_rt
+            .block_on(foreign.fresh_runtime())
+            .expect("foreign subjects runtime");
+        let (foreign_address, foreign_server) =
+            foreign_rt.block_on(start(application(&foreign, foreign_runtime)));
+        let foreign_bearer = foreign_credential.bearer.clone();
+        let foreign_person = foreign_rt.block_on(register_subject(
+            foreign_address,
+            &foreign_bearer,
+            1,
+            "PERSON",
+            "Grace Hopper",
+            &[],
+        ));
+
+        run_db_fixture::<Fixture, _>("native_mcp_subjects", |mut handle| {
+            handle.assert_gateway_login();
+            let prefix = format!("mcsj{}", &Uuid::now_v7().simple().to_string()[..12]);
+            let wire = format!("{prefix}.{}", "c".repeat(32));
+            let credential = handle.seed_synthetic_service_credential_and_window(
+                SyntheticCredentialScopes::RememberWriteAndContextRead,
+                &prefix,
+                &wire,
+                &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+                96,
+            );
+            let tenant_a = handle.tenant_id;
+            let workspace = handle.workspace_id;
+            let m = handle.seed_workspace_visible_context_record();
+            let body = json!({
+                "title": "Renewal",
+                "key_claim": "Analytical Engines Ltd renews in Q4.",
+            });
+            let (candidate_id, sha_hex) = tokio::task::block_in_place(|| {
+                seed_pending_candidate(
+                    &mut handle,
+                    m.evidence_id,
+                    "ProjectDecision",
+                    "DECISION",
+                    &body,
+                )
+            });
+
+            let runtime_handle = handle.rt.handle().clone();
+            let runtime = runtime_handle
+                .block_on(handle.fresh_runtime())
+                .expect("subjects runtime");
+            let app = application(&handle, runtime);
+            runtime_handle.block_on(async {
+                let (address, server) = start(app).await;
+                let bearer = credential.bearer.as_str();
+
+                // 1. Registry through the MCP surface (D-E1): a Person, an Organisation with a
+                //    CUSTOMER role, and a CRM key on the organisation.
+                let person = register_subject(address, bearer, 1, "PERSON", "Ada Lovelace", &[]).await;
+                let org = register_subject(
+                    address,
+                    bearer,
+                    2,
+                    "ORGANISATION",
+                    "Analytical Engines Ltd",
+                    &["CUSTOMER"],
+                )
+                .await;
+                let link_key = |request_id: u64, subject_id: Uuid, kind: &str, value: &str| {
+                    memory_call(
+                        address,
+                        bearer,
+                        request_id,
+                        json!({
+                            "action": "subject_link_key",
+                            "subject_id": subject_id,
+                            "kind": kind,
+                            "value": value,
+                        }),
+                    )
+                };
+                let (status, linked) = link_key(3, org, "CRM", "CRM-2001").await;
+                assert_eq!(status, 200, "{linked}");
+                let structured = assert_tool_response(&linked, ToolName::Memory);
+                assert_eq!(structured["subject_id"], org.to_string(), "{linked}");
+                assert_eq!(
+                    structured["keys"],
+                    json!([{"kind": "CRM", "value": "CRM-2001"}]),
+                    "{linked}"
+                );
+                // The same key twice is CONFLICT (0153 UNIQUE(tenant, kind, value)).
+                let (status, duplicate) = link_key(4, org, "CRM", "CRM-2001").await;
+                assert_eq!(status, 200, "{duplicate}");
+                assert_tool_error(&duplicate, "CONFLICT");
+                // An unknown key kind never reaches the database.
+                let (status, bad_kind) = link_key(5, org, "LDAP", "cn=ada").await;
+                assert_protocol_invalid_input(status, &bad_kind);
+                // Cross-tenant: tenant B's subject is unknown under tenant A's RLS.
+                let (status, foreign_link) = link_key(6, foreign_person, "CRM", "CRM-9999").await;
+                assert_protocol_invalid_input(status, &foreign_link);
+                tokio::task::block_in_place(|| {
+                    assert_eq!(count_rows(&mut handle, KEYS_OF_SUBJECT, org), 1);
+                    assert_eq!(count_rows(&mut handle, KEYS_OF_SUBJECT, foreign_person), 0);
+                    assert_eq!(count_rows(&mut handle, SUBJECTS_OF_TENANT, tenant_a), 2);
+                });
+
+                // 2. Registry read-back scoped to tenant A: exactly its own two, org with key +
+                //    role; tenant B's registry is absent under RLS.
+                let (status, listed) = enumerate_call(
+                    address,
+                    bearer,
+                    json!({ "action": "enumerate", "subjects": true }),
+                )
+                .await;
+                assert_eq!(status, 200, "{listed}");
+                assert_eq!(
+                    listed_subject_ids(&listed),
+                    BTreeSet::from([person.to_string(), org.to_string()]),
+                    "tenant A lists exactly its own registry: {listed}"
+                );
+                let org_entry = listed["result"]["structuredContent"]["subjects"]
+                    .as_array()
+                    .expect("subjects")
+                    .iter()
+                    .find(|s| s["subject_id"] == org.to_string())
+                    .expect("org listed")
+                    .clone();
+                assert_eq!(org_entry["kind"], "ORGANISATION", "{listed}");
+                assert_eq!(org_entry["keys"][0]["kind"], "CRM", "{listed}");
+                assert_eq!(org_entry["keys"][0]["value"], "CRM-2001", "{listed}");
+                assert_eq!(org_entry["roles"][0], "CUSTOMER", "{listed}");
+
+                // 3. remember.put with an explicit id (rule 1) and an exact key (rule 2): the
+                //    accepted Evidence carries both declarations, committed with it.
+                let evidence_before =
+                    tokio::task::block_in_place(|| count_rows(&mut handle, EVIDENCE_OF_TENANT, tenant_a));
+                let (status, accepted) = remember_with_subjects(
+                    address,
+                    bearer,
+                    7,
+                    workspace,
+                    "Ada Lovelace says CRM-2001 renews in Q4.",
+                    vec![person],
+                    vec![("CRM", "CRM-2001")],
+                )
+                .await;
+                assert_eq!(status, 200, "{accepted}");
+                assert_ne!(accepted["result"]["isError"], true, "{accepted}");
+                let evidence_id = Uuid::parse_str(
+                    accepted["result"]["structuredContent"]["evidence_id"]
+                        .as_str()
+                        .expect("evidence_id"),
+                )
+                .expect("uuid");
+                tokio::task::block_in_place(|| {
+                    assert_eq!(
+                        evidence_declarations(&mut handle, evidence_id),
+                        vec![
+                            (person, "DECLARED".to_owned()),
+                            (org, "EXTERNAL_KEY".to_owned())
+                        ],
+                        "remember.put declaration rows carry the rule that produced them"
+                    );
+                    assert_eq!(count_rows(&mut handle, EVIDENCE_OF_TENANT, tenant_a), evidence_before + 1);
+                });
+
+                // 4. Cross-tenant declaration: tenant B's subject id is unknown under tenant A's
+                //    RLS → INVALID_INPUT BEFORE acceptance — no Evidence row, no link, nothing
+                //    metered (ruling item 4).
+                let (status, denied) = remember_with_subjects(
+                    address,
+                    bearer,
+                    8,
+                    workspace,
+                    "about someone else's customer",
+                    vec![foreign_person],
+                    vec![],
+                )
+                .await;
+                assert_protocol_invalid_input(status, &denied);
+                // 5. Unknown key: INVALID_INPUT, no Evidence, and NEVER an auto-registered
+                //    subject (§6.1.3; the mutation that replaces the reject with an INSERT dies here).
+                let (status, unknown_key) = remember_with_subjects(
+                    address,
+                    bearer,
+                    9,
+                    workspace,
+                    "about an account nobody registered",
+                    vec![],
+                    vec![("CRM", "CRM-NOPE")],
+                )
+                .await;
+                assert_protocol_invalid_input(status, &unknown_key);
+                tokio::task::block_in_place(|| {
+                    assert_eq!(
+                        count_rows(&mut handle, EVIDENCE_OF_TENANT, tenant_a),
+                        evidence_before + 1,
+                        "a refused declaration accepts no Evidence"
+                    );
+                    assert_eq!(count_rows(&mut handle, DECLARATIONS_OF_SUBJECT, foreign_person), 0);
+                    assert_eq!(count_rows(&mut handle, SUBJECTS_OF_TENANT, tenant_a), 2);
+                    let nope: i64 = handle
+                        .admin
+                        .query_one(
+                            "SELECT count(*) FROM private.subject_keys WHERE key_value = 'CRM-NOPE'",
+                            &[],
+                        )
+                        .expect("count")
+                        .get(0);
+                    assert_eq!(nope, 0, "an unknown key is never auto-registered");
+                });
+
+                // 6. memory.confirm: an unknown key is refused before the token is consumed;
+                //    the same token then confirms with an explicit subject (DECLARED).
+                let first = confirm_call(address, bearer, 10, candidate_id, &sha_hex, None).await;
+                let token = mint_candidate_token("memory.confirm", candidate_id, first);
+                let (status, refused) = memory_call(
+                    address,
+                    bearer,
+                    11,
+                    json!({
+                        "action": "confirm",
+                        "candidate_id": candidate_id,
+                        "candidate_sha256": sha_hex,
+                        "confirm_token": token,
+                        "subject_keys": [{"kind": "CRM", "value": "CRM-NOPE"}],
+                    }),
+                )
+                .await;
+                assert_protocol_invalid_input(status, &refused);
+                tokio::task::block_in_place(|| {
+                    assert_eq!(token_consumed(&mut handle, &token), Some(false), "token intact");
+                    let state: String = handle
+                        .admin
+                        .query_one(
+                            "SELECT state FROM private.distill_candidates WHERE candidate_id = $1",
+                            &[&candidate_id],
+                        )
+                        .expect("candidate state")
+                        .get(0);
+                    assert_eq!(state, "PENDING", "nothing written by the refused confirm");
+                });
+                let (status, confirmed) = memory_call(
+                    address,
+                    bearer,
+                    12,
+                    json!({
+                        "action": "confirm",
+                        "candidate_id": candidate_id,
+                        "candidate_sha256": sha_hex,
+                        "confirm_token": token,
+                        "subject_ids": [org],
+                        "subject_keys": [],
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "{confirmed}");
+                assert_ne!(confirmed["result"]["isError"], true, "{confirmed}");
+                let structured = &confirmed["result"]["structuredContent"];
+                let new_memory = Uuid::parse_str(structured["memory_id"].as_str().expect("memory_id"))
+                    .expect("uuid");
+                assert_eq!(
+                    structured["subject_ids"],
+                    json!([org]),
+                    "confirm result names the linked subject: {confirmed}"
+                );
+                tokio::task::block_in_place(|| {
+                    assert_eq!(memory_links(&mut handle, new_memory), vec![(org, "DECLARED".to_owned())]);
+                });
+
+                // 7. Read side (D-D): memory.get carries the item's subjects; memory.enumerate
+                //    accepts an exact subject_id predicate.
+                let (status, got) = memory_call(
+                    address,
+                    bearer,
+                    13,
+                    json!({ "action": "get", "memory_id": new_memory }),
+                )
+                .await;
+                assert_eq!(status, 200, "{got}");
+                let envelope = assert_tool_response(&got, ToolName::Memory);
+                assert_eq!(envelope["items"][0]["memory_id"], new_memory.to_string(), "{got}");
+                assert_eq!(envelope["items"][0]["subjects"], json!([org]), "{got}");
+                for (subject, expected) in [(org, vec![new_memory]), (person, vec![])] {
+                    let (status, page) = enumerate_call(
+                        address,
+                        bearer,
+                        json!({ "action": "enumerate", "subject_id": subject }),
+                    )
+                    .await;
+                    assert_eq!(status, 200, "{page}");
+                    let content = &assert_tool_response(&page, ToolName::Memory)["content"];
+                    let ids: Vec<Uuid> = content["items"]
+                        .as_array()
+                        .expect("items")
+                        .iter()
+                        .map(|i| Uuid::parse_str(i["memory_id"].as_str().expect("id")).expect("uuid"))
+                        .collect();
+                    assert_eq!(ids, expected, "exact subject predicate for {subject}: {page}");
+                    for item in content["items"].as_array().expect("items") {
+                        assert_eq!(item["subjects"], json!([subject]), "{page}");
+                    }
+                }
+
+                // 8. memory.correct (ruling item 5): a cross-tenant declaration is refused with
+                //    the token intact; the same token then corrects with an explicit subject and
+                //    M2 carries M1's link as INHERITED plus the explicit one as DECLARED.
+                let correct_token = mint_correct_token(address, bearer, 14, new_memory).await;
+                let correct = |request_id: u64, subject_ids: Vec<Uuid>| {
+                    memory_call(
+                        address,
+                        bearer,
+                        request_id,
+                        json!({
+                            "action": "correct",
+                            "memory_id": new_memory,
+                            "text": "Analytical Engines Ltd renews in Q1 (Ada Lovelace).",
+                            "confirm_token": correct_token,
+                            "subject_ids": subject_ids,
+                        }),
+                    )
+                };
+                let (status, refused) = correct(15, vec![foreign_person]).await;
+                assert_protocol_invalid_input(status, &refused);
+                tokio::task::block_in_place(|| {
+                    assert_eq!(token_consumed(&mut handle, &correct_token), Some(false));
+                    assert_eq!(memory_links(&mut handle, new_memory), vec![(org, "DECLARED".to_owned())]);
+                });
+                let (status, corrected) = correct(16, vec![person]).await;
+                assert_eq!(status, 200, "{corrected}");
+                assert_ne!(corrected["result"]["isError"], true, "{corrected}");
+                let structured = &corrected["result"]["structuredContent"];
+                let m2 = Uuid::parse_str(structured["memory_id"].as_str().expect("M2")).expect("uuid");
+                let reported: BTreeSet<String> = structured["subject_ids"]
+                    .as_array()
+                    .expect("subject_ids")
+                    .iter()
+                    .map(|v| v.as_str().expect("uuid").to_owned())
+                    .collect();
+                assert_eq!(
+                    reported,
+                    BTreeSet::from([org.to_string(), person.to_string()]),
+                    "correct result names inherited + explicit subjects: {corrected}"
+                );
+                tokio::task::block_in_place(|| {
+                    assert_eq!(
+                        memory_links(&mut handle, m2),
+                        vec![(person, "DECLARED".to_owned()), (org, "INHERITED".to_owned())],
+                        "M2: explicit DECLARED + inherited from M1 via the 0154 trigger"
+                    );
+                });
+
+                stop_server(server).await.expect("server shutdown");
+            });
+        });
+
+        // Tenant B, after everything tenant A did: still exactly its own subject.
+        let (status, listed) = foreign_rt.block_on(enumerate_call(
+            foreign_address,
+            &foreign_bearer,
+            json!({ "action": "enumerate", "subjects": true }),
+        ));
+        assert_eq!(status, 200, "{listed}");
+        assert_eq!(
+            listed_subject_ids(&listed),
+            BTreeSet::from([foreign_person.to_string()]),
+            "tenant B lists exactly its own registry: {listed}"
+        );
+        foreign_rt
+            .block_on(stop_server(foreign_server))
+            .expect("foreign server shutdown");
+    });
+}

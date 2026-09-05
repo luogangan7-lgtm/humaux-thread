@@ -16,6 +16,7 @@ use humaux_adapters::{
     },
     postgres::RuntimeDbPool,
     read_materialize::MaterializedItem,
+    subject_repo,
 };
 use humaux_domain::{
     authority::MemoryId,
@@ -23,6 +24,7 @@ use humaux_domain::{
     error::ErrorCode,
     identity::AuthorizationScope,
     ids::{Scope, WorkspaceId},
+    subject::{SubjectDeclaration, SubjectId, SubjectKey, SubjectKind, SubjectRole},
 };
 use humaux_projection::{serving::StreamFamily, stream::StreamKey};
 use humaux_retrieval::{
@@ -51,8 +53,19 @@ pub(crate) struct Pagination {
 
 #[derive(Serialize)]
 pub(crate) struct EnumerationResult {
-    content: Envelope<ContextItem>,
+    content: Envelope<MemoryItem>,
     pagination: Pagination,
+}
+
+/// One Memory body as `memory.get` / `memory.enumerate` return it: the shared Envelope item
+/// (`ContextItem`) plus its §6.1.3 subject links (ADR-0028 D-D). Always present on these two
+/// reads — an empty list is a fact ("linked to nothing"), unlike `context.assemble`, which does
+/// not read the axis and omits the field.
+#[derive(Serialize)]
+pub(crate) struct MemoryItem {
+    #[serde(flatten)]
+    item: ContextItem,
+    subjects: Vec<Uuid>,
 }
 
 pub(crate) async fn get<T>(
@@ -61,7 +74,7 @@ pub(crate) async fn get<T>(
     requested_workspace: Option<WorkspaceId>,
     bootstrap: ContextBootstrap,
     memory_id: MemoryId,
-    accept: impl FnOnce(Envelope<ContextItem>) -> Result<T, ErrorCode>,
+    accept: impl FnOnce(Envelope<MemoryItem>) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
     let (authorization, scope, family) =
         read_scope(authorization, requested_workspace, &bootstrap)?;
@@ -279,6 +292,11 @@ pub(crate) async fn restore(
 /// DirectUserInput Evidence + a new Memory version and supersedes the original with reason
 /// USER_CORRECTION. Same `read_scope` workspace rule as the other governance writes. The
 /// corrected content arrives already hashed (`payload_sha256`) through the sole constructor.
+///
+/// §6.1.3 (ADR-0028): the new version inherits the original's subjects inside that transaction
+/// (0154 trigger on `superseded_by`); an explicit `subjects` declaration is resolved BEFORE the
+/// token is consumed (unknown ⇒ `INVALID_INPUT`, token untouched) and applied in the same
+/// transaction. `CorrectDone::subject_ids` is the version's full subject id list.
 #[allow(clippy::too_many_arguments)] // one confirmed-write's worth of trusted, gate-built inputs
 pub(crate) async fn correct(
     pool: Arc<RuntimeDbPool>,
@@ -289,6 +307,7 @@ pub(crate) async fn correct(
     payload_sha256: humaux_domain::evidence::EvidencePayloadSha256,
     undo_window: Duration,
     consistency_token_ttl: Duration,
+    subjects: SubjectDeclaration,
 ) -> Result<CorrectDone, ErrorCode> {
     let workspace = write
         .request
@@ -313,6 +332,7 @@ pub(crate) async fn correct(
             finished_audit: write.finished_audit,
             undo_window,
             consistency_token_ttl,
+            subjects,
         },
     )
     .await
@@ -330,6 +350,7 @@ pub(crate) async fn confirm(
     candidate_id: Uuid,
     candidate_sha256: Vec<u8>,
     consistency_token_ttl: Duration,
+    subjects: SubjectDeclaration,
 ) -> Result<ConfirmOutcome, ErrorCode> {
     let workspace = write
         .request
@@ -352,9 +373,107 @@ pub(crate) async fn confirm(
             claim: write.claim,
             finished_audit: write.finished_audit,
             consistency_token_ttl,
+            subjects,
         },
     )
     .await
+}
+
+/// One registered subject as `memory.enumerate {subjects:true}` serializes it (ADR-0028).
+#[derive(Serialize)]
+pub(crate) struct SubjectItem {
+    subject_id: Uuid,
+    kind: &'static str,
+    display_name: String,
+    keys: Vec<SubjectKeyItem>,
+    roles: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SubjectKeyItem {
+    kind: &'static str,
+    value: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SubjectsResult {
+    subjects: Vec<SubjectItem>,
+    snapshot_id: Uuid,
+}
+
+impl From<subject_repo::SubjectListing> for SubjectItem {
+    fn from(row: subject_repo::SubjectListing) -> Self {
+        SubjectItem {
+            subject_id: row.subject_id,
+            kind: row.kind.as_str(),
+            display_name: row.display_name,
+            keys: row
+                .keys
+                .into_iter()
+                .map(|(kind, value)| SubjectKeyItem {
+                    kind: kind.as_str(),
+                    value,
+                })
+                .collect(),
+            roles: row.roles.into_iter().map(SubjectRole::as_str).collect(),
+        }
+    }
+}
+
+/// §6.1.3 / ADR-0028 `memory.enumerate {subjects:true}`: the caller's tenant's registered
+/// subjects (live heads) with keys and roles, under RLS. Read-only; same workspace rule as
+/// `memory.get`. This is the gateway face of the registry's cross-tenant invisibility.
+pub(crate) async fn list_subjects(
+    pool: Arc<RuntimeDbPool>,
+    authorization: AuthorizationScope,
+    requested_workspace: Option<WorkspaceId>,
+    bootstrap: ContextBootstrap,
+    limit: i64,
+) -> Result<SubjectsResult, ErrorCode> {
+    let (authorization, _scope, _family) =
+        read_scope(authorization, requested_workspace, &bootstrap)?;
+    let rows = subject_repo::list_subjects(&pool, &authorization, limit).await?;
+    Ok(SubjectsResult {
+        subjects: rows.into_iter().map(SubjectItem::from).collect(),
+        snapshot_id: Uuid::now_v7(),
+    })
+}
+
+/// §6.1.3 / ADR-0028 D-F `memory.subject_register` (card 7 D-E1): registers one subject under
+/// the authenticated tenant. Same workspace rule as `memory.get`; the tenant is the credential's,
+/// never an argument.
+pub(crate) async fn register_subject(
+    pool: Arc<RuntimeDbPool>,
+    authorization: AuthorizationScope,
+    requested_workspace: Option<WorkspaceId>,
+    bootstrap: ContextBootstrap,
+    kind: SubjectKind,
+    display_name: String,
+    roles: Vec<SubjectRole>,
+) -> Result<SubjectItem, ErrorCode> {
+    let (authorization, _scope, _family) =
+        read_scope(authorization, requested_workspace, &bootstrap)?;
+    subject_repo::register_subject(&pool, &authorization, kind, &display_name, &roles)
+        .await
+        .map(SubjectItem::from)
+}
+
+/// §6.1.3 / ADR-0028 D-F `memory.subject_link_key`: attaches an exact external key to one of the
+/// tenant's registered subjects (unknown / another tenant's subject ⇒ `INVALID_INPUT`, a key
+/// already registered ⇒ `CONFLICT`).
+pub(crate) async fn link_subject_key(
+    pool: Arc<RuntimeDbPool>,
+    authorization: AuthorizationScope,
+    requested_workspace: Option<WorkspaceId>,
+    bootstrap: ContextBootstrap,
+    subject_id: SubjectId,
+    key: SubjectKey,
+) -> Result<SubjectItem, ErrorCode> {
+    let (authorization, _scope, _family) =
+        read_scope(authorization, requested_workspace, &bootstrap)?;
+    subject_repo::link_key(&pool, &authorization, subject_id, &key)
+        .await
+        .map(SubjectItem::from)
 }
 
 /// §36 `memory.reject`, second (confirmed) call (ADR-0026, Card 6). Marks a pending candidate
@@ -500,13 +619,13 @@ fn read_scope(
 }
 
 fn accept_memory_envelope<T>(
-    materialized: MaterializedMemory,
+    mut materialized: MaterializedMemory,
     request: &RetrievalRequest,
     binary_build: &str,
     lane: &str,
     truncated: bool,
     archived: bool,
-    accept: impl FnOnce(Envelope<ContextItem>) -> Result<T, ErrorCode>,
+    accept: impl FnOnce(Envelope<MemoryItem>) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
     let items = materialized
         .bodies
@@ -515,10 +634,13 @@ fn accept_memory_envelope<T>(
         .map(|item| match item {
             // Q3/ADR-0024 D-C: memory.get carries `archived` on its single item; enumerate
             // never returns an archived row so it passes `false`.
-            MaterializedItem::Memory { memory_id, content } => Ok(ContextItem {
-                memory_id,
-                content,
-                archived,
+            MaterializedItem::Memory { memory_id, content } => Ok(MemoryItem {
+                item: ContextItem {
+                    memory_id,
+                    content,
+                    archived,
+                },
+                subjects: materialized.subjects.remove(&memory_id).unwrap_or_default(),
             }),
             _ => Err(ErrorCode::Internal),
         })

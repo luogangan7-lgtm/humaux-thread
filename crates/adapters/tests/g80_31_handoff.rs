@@ -402,6 +402,7 @@ async fn one_enumerated(
             page_size,
             ttl: Duration::from_secs(30),
             mac_key: ENUMERATION_MAC_KEY,
+            subject_id: None,
         },
     )
     .await
@@ -1078,6 +1079,7 @@ fn enumeration_keeps_body_grounding_and_ledger_on_one_snapshot() {
                         page_size: 1,
                         ttl: Duration::from_secs(30),
                         mac_key: ENUMERATION_MAC_KEY,
+                        subject_id: None,
                     },
                 ),
             )

@@ -17,8 +17,10 @@ use sqlx::Row;
 use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
+use humaux_domain::error::ErrorCode;
 use humaux_domain::evidence::{EvidenceOriginClass, EvidencePayloadSha256};
 use humaux_domain::ids::TenantId;
+use humaux_domain::subject::SubjectDeclaration;
 use humaux_projection::stream::StreamKey;
 
 use crate::postgres::RuntimeDbPool;
@@ -41,6 +43,10 @@ pub enum RememberError {
     /// 自动补票" — this variant carries no ticket, the transaction is rolled back (nothing this
     /// call would have written — Evidence, event, stream_log row, outbox row — is committed).
     BatchExhausted,
+    /// §6.1.3 rules 1/2 (ADR-0028): the command's `subjects` declaration did not resolve under
+    /// the tenant's RLS (unknown, merged-away or another tenant's id/key ⇒ `INVALID_INPUT`), or
+    /// the resolve itself failed. Raised BEFORE the first write, so nothing is committed.
+    Subject(ErrorCode),
 }
 
 impl From<sqlx::Error> for RememberError {
@@ -57,6 +63,7 @@ impl std::fmt::Display for RememberError {
                 write!(f, "consistency_token expiry must be after issuance time")
             }
             Self::BatchExhausted => write!(f, "BATCH_EXHAUSTED (§34.1)"),
+            Self::Subject(code) => write!(f, "subject declaration rejected: {code}"),
         }
     }
 }
@@ -130,6 +137,11 @@ pub struct RememberCommand {
     pub occurred_at: Option<OffsetDateTime>,
     pub event_kind: String,
     pub event_payload: serde_json::Value,
+    /// §6.1.3 rules 1/2 (ADR-0028): the explicit `subject_ids` / `subject_keys` this Evidence is
+    /// about. Resolved under the tenant's RLS before the first write and recorded on
+    /// `private.evidence_subjects` in the same transaction; an unknown id/key is
+    /// [`RememberError::Subject`]`(INVALID_INPUT)` and nothing is written.
+    pub subjects: SubjectDeclaration,
 }
 
 /// `remember()`'s accepted result (§34 / §15.5, verbatim field set).
@@ -462,9 +474,20 @@ pub async fn remember_in_txn(
 
     set_authorization_local(txn, cmd.tenant_id, cmd.authorization_user_id).await?;
 
+    // §6.1.3 rules 1/2 (ADR-0028): resolve the declaration BEFORE the first write so an unknown
+    // id/key rejects with nothing committed — no Evidence, no ticket, no outbox row.
+    let subjects =
+        crate::subject_repo::resolve_declaration_in_txn(txn, cmd.tenant_id, &cmd.subjects)
+            .await
+            .map_err(RememberError::Subject)?;
+
     let commit_seq = next_commit_seq(txn).await?;
     let evidence_id = create_evidence_object(txn, &cmd).await?;
     insert_event_subtype(txn, evidence_id, &cmd).await?;
+    // The declaration rides on the Evidence in this same transaction (the memory is born later
+    // in the Distill hop and inherits it through link_memory_subjects rule 3a).
+    crate::subject_repo::declare_evidence_in_txn(txn, cmd.tenant_id, evidence_id, &subjects)
+        .await?;
 
     // §34.1: batch_id present -> redeem (BATCH_EXHAUSTED rolls the whole transaction back,
     // never partially — see this function's doc); absent -> ticket untouched, both output

@@ -184,6 +184,7 @@ fn command(
         occurred_at: None,
         event_kind: "MANUAL_NOTE".to_string(),
         event_payload: serde_json::json!({ "content": content }),
+        subjects: humaux_domain::subject::SubjectDeclaration::default(),
     }
 }
 

@@ -717,6 +717,11 @@ pub async fn publish_rollup(
         .execute(&mut *txn)
         .await?;
     }
+    // §6.1.3 / ADR-0028: the rollup inherits its sources' subjects through the ONE shared hook
+    // (`private.link_rollup_subjects`, the rollup face of `link_memory_subjects`) — after the
+    // closure rows exist, because the hook reads them. Dropping this call leaves every rollup
+    // unlabelled; `consolidation_hop_e2e::t7_rollup_inherits_subject_links` is its sentinel.
+    crate::subject_repo::link_rollup_in_txn(&mut txn, tenant_id, rollup_id).await?;
 
     // VERIFIED GAP (task card §"Why"): `publish_rollup` wrote `private.memory_rollups` with no
     // matching `projection.stream_log`/`ops.outbox` row, so the projection worker (which reads

@@ -12,6 +12,7 @@ use humaux_domain::error::ErrorCode;
 use humaux_domain::evidence::{EvidenceOriginClass, payload_sha256};
 use humaux_domain::identity::{AuthorizationScope, VisibilityClass};
 use humaux_domain::ids::WorkspaceId;
+use humaux_domain::subject::SubjectDeclaration;
 use humaux_projection::stream::StreamKey;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -157,7 +158,15 @@ pub async fn put(
     occurred_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
 ) -> Result<RememberAccepted, ErrorCode> {
-    let cmd = command(authorization, policy, content, event_kind, occurred_at, now)?;
+    let cmd = command(
+        authorization,
+        policy,
+        content,
+        event_kind,
+        occurred_at,
+        now,
+        SubjectDeclaration::default(),
+    )?;
     remember::remember(pool, cmd)
         .await
         .map_err(map_remember_error)
@@ -170,6 +179,7 @@ pub(crate) fn command(
     event_kind: RememberEventKind,
     occurred_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
+    subjects: SubjectDeclaration,
 ) -> Result<RememberCommand, ErrorCode> {
     if authorization.user_id().is_none()
         || policy.stream.tenant_id != authorization.tenant_id()
@@ -219,6 +229,7 @@ pub(crate) fn command(
         occurred_at,
         event_kind: event_kind.as_db_str().to_owned(),
         event_payload: content.value,
+        subjects,
     })
 }
 
@@ -226,6 +237,7 @@ fn map_remember_error(error: remember::RememberError) -> ErrorCode {
     match error {
         remember::RememberError::ConsistencyTokenExpiryNotFuture => ErrorCode::InvalidInput,
         remember::RememberError::BatchExhausted => ErrorCode::Conflict,
+        remember::RememberError::Subject(code) => code,
         remember::RememberError::Db(error) => match error {
             sqlx::Error::RowNotFound => ErrorCode::NotFound,
             sqlx::Error::Database(ref database) => match database.code().as_deref() {
@@ -297,6 +309,7 @@ mod tests {
                 RememberEventKind::ManualNote,
                 None,
                 OffsetDateTime::now_utc(),
+                SubjectDeclaration::default(),
             ),
             Err(ErrorCode::Forbidden)
         ));
@@ -314,6 +327,7 @@ mod tests {
                 RememberEventKind::ManualNote,
                 None,
                 OffsetDateTime::now_utc(),
+                SubjectDeclaration::default(),
             ),
             Err(ErrorCode::Forbidden)
         ));
@@ -331,6 +345,7 @@ mod tests {
             RememberEventKind::UserMessage,
             None,
             OffsetDateTime::now_utc(),
+            SubjectDeclaration::default(),
         )
         .unwrap();
         assert_eq!(cmd.origin_class, EvidenceOriginClass::AuthenticatedAgent);
@@ -354,6 +369,7 @@ mod tests {
             RememberEventKind::UserMessage,
             None,
             OffsetDateTime::now_utc(),
+            SubjectDeclaration::default(),
         )
         .unwrap();
         assert_eq!(cmd.event_payload, value);

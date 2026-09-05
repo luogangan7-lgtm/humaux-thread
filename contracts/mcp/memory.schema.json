@@ -54,6 +54,15 @@
         },
         "candidates": {
           "type": "boolean"
+        },
+        "subjects": {
+          "description": "§6.1.3 (ADR-0028): true lists the caller's tenant's registered subjects (with keys and roles) instead of memories; another tenant's registry is invisible under RLS.",
+          "type": "boolean"
+        },
+        "subject_id": {
+          "description": "§6.1.3 (ADR-0028 D-D): restrict the exact enumeration predicate to memories linked to this subject (never a post-filter; a cursor is bound to its filter).",
+          "type": "string",
+          "format": "uuid"
         }
       },
       "required": [
@@ -85,6 +94,41 @@
           "type": "string",
           "minLength": 16,
           "maxLength": 512
+        },
+        "subject_ids": {
+          "description": "§6.1.3 rule 1: registered subjects the corrected version is about (in addition to what it inherits from the original). Unknown id is INVALID_INPUT before any write.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "maxItems": 16,
+          "uniqueItems": true
+        },
+        "subject_keys": {
+          "description": "§6.1.3 rule 2: exact trusted external keys (closed SubjectKeyKind). Unknown key is INVALID_INPUT before any write.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "additionalProperties": false
+          },
+          "maxItems": 16
         }
       },
       "required": [
@@ -149,6 +193,41 @@
           "type": "string",
           "minLength": 16,
           "maxLength": 512
+        },
+        "subject_ids": {
+          "description": "§6.1.3 rule 1: registered subjects the confirmed memory is about (in addition to the source Evidence's own declaration). Unknown id is INVALID_INPUT; the confirm token is not consumed.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "maxItems": 16,
+          "uniqueItems": true
+        },
+        "subject_keys": {
+          "description": "§6.1.3 rule 2: exact trusted external keys (closed SubjectKeyKind). Unknown key is INVALID_INPUT; the confirm token is not consumed.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "additionalProperties": false
+          },
+          "maxItems": 16
         }
       },
       "required": [
@@ -317,6 +396,90 @@
       "required": [
         "action",
         "memory_id"
+      ],
+      "additionalProperties": false
+    }
+    ,
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.subject_register",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "description": "§6.1.3 / ADR-0028 D-F (card 7 D-E1): register one subject under the authenticated tenant. kind is the closed SubjectKind set, roles the closed SubjectRole set; unknown values are INVALID_INPUT. Not confirm-gated (nothing is deleted or hidden).",
+      "properties": {
+        "action": {
+          "const": "subject_register"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "roles": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "maxItems": 4,
+          "uniqueItems": true
+        },
+        "workspace_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "action",
+        "kind",
+        "display_name"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.subject_link_key",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "description": "§6.1.3 / ADR-0028 D-F: attach an exact external key (closed SubjectKeyKind) to one of the tenant's registered subjects. Unknown or another tenant's subject is INVALID_INPUT; a key already registered for the tenant is CONFLICT.",
+      "properties": {
+        "action": {
+          "const": "subject_link_key"
+        },
+        "subject_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "workspace_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "action",
+        "subject_id",
+        "kind",
+        "value"
       ],
       "additionalProperties": false
     }
