@@ -3214,6 +3214,74 @@ SELECT
     }
 }
 
+/// §6.1.3 / ADR-0029 (migration 0155): the subject-scoped visibility guard on
+/// `private.memory_records` is AS RESTRICTIVE, SELECT-only, applies to exactly `role_gateway` +
+/// `role_maintenance`, carries the verbatim §62 tenant clause and calls the owner SECURITY
+/// DEFINER STABLE predicate `private.memory_subject_visibility_ok(uuid,uuid)` (search_path
+/// pinned). The role-list equality is the §15.7 regression sentinel: adding any headless role
+/// (`role_retrieval_worker` first of all) to the TO list would hide subject-gated rows from the
+/// projection worker and freeze the tenant's watermark. The predicate's ACL is pinned the way
+/// `check_w2_continuity_boundary` pins 0137's reader: PUBLIC has no EXECUTE and, among the
+/// runtime roles, exactly the two the policy names do — a definer predicate reads
+/// `private.memory_subjects` with the owner's privileges, so any other role that could call it
+/// (`role_batch_issuer` has USAGE on schema private and no grant on the subject tables) would
+/// learn subject-linkage facts that table's RLS withholds. Missing objects ⇒ `not_applicable`.
+pub fn check_subject_visibility_policy(client: &mut impl GenericClient) -> GateResult {
+    let check = "§6.1.3 subject visibility RESTRICTIVE policy";
+    let signature = "private.memory_subject_visibility_ok(uuid,uuid)";
+    let exists: bool =
+        match client.query_one("SELECT to_regprocedure($1) IS NOT NULL", &[&signature]) {
+            Ok(row) => row.get(0),
+            Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+        };
+    if !exists {
+        return not_applicable(
+            check,
+            "missing object: private.memory_subject_visibility_ok",
+        );
+    }
+    let sql = r#"
+WITH runtime_roles(name) AS (VALUES
+ ('role_admin'),('role_gateway'),('role_private_worker'),
+ ('role_consolidation_worker'),('role_public_worker'),('role_retrieval_worker'),
+ ('role_batch_issuer'),('role_maintenance'))
+SELECT
+ (SELECT count(*)=1 FROM pg_proc p
+   WHERE p.oid=to_regprocedure('private.memory_subject_visibility_ok(uuid,uuid)')
+     AND p.prosecdef AND p.provolatile='s'
+     AND p.proconfig=ARRAY['search_path=pg_catalog']::text[]
+     AND pg_get_userbyid(p.proowner)='role_migration_owner')
+ AND NOT has_function_privilege('public',
+  'private.memory_subject_visibility_ok(uuid,uuid)','EXECUTE')
+ AND NOT EXISTS(SELECT 1 FROM runtime_roles r WHERE has_function_privilege(
+  r.name,'private.memory_subject_visibility_ok(uuid,uuid)','EXECUTE')
+  IS DISTINCT FROM (r.name IN ('role_gateway','role_maintenance')))
+ AND (SELECT count(*)=1 FROM pg_policy p
+   WHERE p.polrelid='private.memory_records'::regclass
+     AND p.polname='memory_records_subject_visibility'
+     AND NOT p.polpermissive AND p.polcmd='r' AND p.polwithcheck IS NULL
+     AND p.polroles=(SELECT array_agg(oid ORDER BY oid) FROM pg_roles
+                      WHERE rolname IN ('role_gateway','role_maintenance'))
+     AND strpos(pg_get_expr(p.polqual,p.polrelid),$1)>0
+     AND strpos(pg_get_expr(p.polqual,p.polrelid),
+                'private.memory_subject_visibility_ok(tenant_id, memory_id)')>0)
+ -- exactly one RESTRICTIVE policy on memory_records: this one
+ AND (SELECT count(*)=1 FROM pg_policy
+   WHERE polrelid='private.memory_records'::regclass AND NOT polpermissive)
+"#;
+    match client.query_one(sql, &[&TENANT_CLAUSE]) {
+        Ok(row) if row.get::<_, bool>(0) => pass(
+            check,
+            "RESTRICTIVE SELECT policy TO {role_gateway, role_maintenance} only; owner definer STABLE predicate, EXECUTE to exactly those two roles (PUBLIC none)",
+        ),
+        Ok(_) => fail(
+            check,
+            "memory_records_subject_visibility shape/role-list or memory_subject_visibility_ok owner/config/EXECUTE-ACL mismatch",
+        ),
+        Err(error) => fail(check, format!("catalog census failed: {error}")),
+    }
+}
+
 fn report(results: &[GateResult]) -> i32 {
     let mut failed = false;
     for r in results {
@@ -3256,6 +3324,7 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_r4_execution_registry(&mut client));
             results.push(check_w1_continuity_boundary(&mut client));
             results.push(check_w2_continuity_boundary(&mut client));
+            results.push(check_subject_visibility_policy(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -3271,6 +3340,7 @@ pub fn run(_args: &[String]) -> i32 {
                 "R4 execution registry",
                 "W1 Project Continuity boundary",
                 "W2 Project Continuity read boundary",
+                "§6.1.3 subject visibility RESTRICTIVE policy",
             ] {
                 results.push(fail_for(name, &conn_err));
             }

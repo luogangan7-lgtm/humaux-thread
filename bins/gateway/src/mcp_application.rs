@@ -1245,6 +1245,19 @@ impl GatewayMcpApplication {
                     .ok_or(ErrorCode::InvalidInput)
             })
             .transpose()?;
+        // §6.1.3/ADR-0029: `subject_ids` is schema-validated as an array of uuid strings
+        // upstream; a malformed element here is still INVALID_INPUT, never a silent drop.
+        let subject_ids = value
+            .get("subject_ids")
+            .map(|ids| {
+                ids.as_array()
+                    .ok_or(ErrorCode::InvalidInput)?
+                    .iter()
+                    .map(|id| SubjectId::parse(id.as_str().ok_or(ErrorCode::InvalidInput)?))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         let input = RecallSearchRequest {
             query,
             workspace_id,
@@ -1255,6 +1268,7 @@ impl GatewayMcpApplication {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             limit,
+            subject_ids,
         };
         let pool = self.runtime_pool.clone();
         let bootstrap = self.context_bootstrap.clone();

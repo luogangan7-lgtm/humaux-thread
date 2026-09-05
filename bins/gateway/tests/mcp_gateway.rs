@@ -21,7 +21,7 @@ use humaux_adapters::{
     postgres::RuntimeDbPool,
     qdrant::{
         Distance, PointId, QdrantOperation, QdrantPointPayload, ShardingMethod,
-        create_collection_body, ha_profile_for, tenant_index_body, upsert,
+        create_collection_body, ha_profile_for, subject_index_body, tenant_index_body, upsert,
     },
     quota_repo::RatePolicy,
 };
@@ -362,6 +362,11 @@ async fn create_semantic_collection(
             format!("/collections/{collection}/index"),
             tenant_index_body(),
         ),
+        // §6.1.3/ADR-0029: the `subject_ids` uuid payload index the any-of prefilter uses.
+        (
+            format!("/collections/{collection}/index"),
+            subject_index_body(),
+        ),
     ] {
         let response = transport
             .execute(
@@ -576,6 +581,40 @@ fn semantic_payload(
     }
     .into_indexable()
     .expect("non-secret semantic fixture payload")
+}
+
+/// §6.1.3/ADR-0029 fixture: one subject row (owner-side) for the semantic A/B matrix.
+fn seed_subject_row(handle: &mut Handle, name: &str) -> Uuid {
+    handle
+        .admin
+        .query_one(
+            "INSERT INTO private.subjects (tenant_id, kind, display_name) \
+             VALUES ($1, 'ORGANISATION', $2) RETURNING subject_id",
+            &[&handle.tenant_id, &name],
+        )
+        .expect("owner seeds subject")
+        .get(0)
+}
+
+fn link_memory_subject(handle: &mut Handle, memory_id: Uuid, subject_id: Uuid) {
+    handle
+        .admin
+        .execute(
+            "INSERT INTO private.memory_subjects \
+               (tenant_id, memory_id, subject_id, relation, source_kind, confidence_bp) \
+             VALUES ($1, $2, $3, 'ABOUT', 'DECLARED', 10000)",
+            &[&handle.tenant_id, &memory_id, &subject_id],
+        )
+        .expect("owner links memory to subject");
+}
+
+fn returned_memory_ids(structured: &Value) -> BTreeSet<String> {
+    structured["items"]
+        .as_array()
+        .expect("semantic items")
+        .iter()
+        .map(|item| item["memory_id"].as_str().expect("memory id").to_owned())
+        .collect()
 }
 
 async fn recall_call(address: SocketAddr, bearer: Option<&str>, arguments: Value) -> (u16, Value) {
@@ -1488,10 +1527,23 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
             // stays (points are not deleted on archive); the PG hydrate gate is the SOLE place
             // recall excludes it, so recall.search returning only {first, second} is what a
             // flipped `include_archived` at the recall hydrate call would break.
+            // §6.1.3/ADR-0029 D-C A/B matrix (worker-less harness: projected points are seeded
+            // directly, exactly as the two rows above). PG linkage of record: first→{A},
+            // second→{B}, third→{A,B}. Qdrant payloads: first [A], second [A,B] (claims A but PG
+            // says only B — the hydrate re-check witness), third [A,B].
+            let third = handle.seed_workspace_visible_context_record();
+            let subject_a = seed_subject_row(&mut handle, "Acme (A)");
+            let subject_b = seed_subject_row(&mut handle, "Bolt (B)");
+            link_memory_subject(&mut handle, first.memory_id, subject_a);
+            link_memory_subject(&mut handle, second.memory_id, subject_b);
+            link_memory_subject(&mut handle, third.memory_id, subject_a);
+            link_memory_subject(&mut handle, third.memory_id, subject_b);
             let first_point = Uuid::new_v4();
             let second_point = Uuid::new_v4();
+            let third_point = Uuid::new_v4();
             let first_updated = seed_semantic_registry_row(&mut handle, &first, first_point);
             let second_updated = seed_semantic_registry_row(&mut handle, &second, second_point);
+            let third_updated = seed_semantic_registry_row(&mut handle, &third, third_point);
             seed_semantic_checkpoint(&mut handle);
 
             let cell = CellId(Uuid::now_v7());
@@ -1555,8 +1607,13 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                     Duration::from_secs(60),
                 )
                 .expect("semantic upsert permit");
-                let first_payload = semantic_payload(&handle, first_updated);
-                let second_payload = semantic_payload(&handle, second_updated);
+                let sa = humaux_domain::subject::SubjectId(subject_a);
+                let sb = humaux_domain::subject::SubjectId(subject_b);
+                let first_payload = semantic_payload(&handle, first_updated).with_subject_ids(vec![sa]);
+                let second_payload =
+                    semantic_payload(&handle, second_updated).with_subject_ids(vec![sa, sb]);
+                let third_payload =
+                    semantic_payload(&handle, third_updated).with_subject_ids(vec![sa, sb]);
                 let vector = semantic_vector(query);
                 upsert(
                     transport.as_ref(),
@@ -1564,7 +1621,8 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                     &collection,
                     &[
                         (PointId::Uuid(first_point), &first_payload, vector.clone()),
-                        (PointId::Uuid(second_point), &second_payload, vector),
+                        (PointId::Uuid(second_point), &second_payload, vector.clone()),
+                        (PointId::Uuid(third_point), &third_payload, vector),
                     ],
                     ha_profile_for(QdrantOperation::NormalImmutableUpsert),
                 )
@@ -1599,15 +1657,78 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 assert_eq!(status, 200, "no-token semantic recall: {no_token}");
                 let no_token = assert_tool_response(&no_token, ToolName::Recall);
                 let returned = no_token["items"].as_array().expect("semantic items");
-                assert_eq!(returned.len(), 2);
-                let returned_ids = returned
-                    .iter()
-                    .map(|item| item["memory_id"].as_str().expect("memory id").to_owned())
-                    .collect::<BTreeSet<String>>();
+                assert_eq!(returned.len(), 3);
                 assert_eq!(
-                    returned_ids,
-                    BTreeSet::from([first.memory_id.to_string(), second.memory_id.to_string()])
+                    returned_memory_ids(no_token),
+                    BTreeSet::from([
+                        first.memory_id.to_string(),
+                        second.memory_id.to_string(),
+                        third.memory_id.to_string(),
+                    ])
                 );
+
+                // §6.1.3/ADR-0029 D-C: subject-scoped recall through the real Gateway + real
+                // Qdrant prefilter + real PG hydrate re-check. `second` carries A in its Qdrant
+                // payload but has no PG link to A, so it passes the prefilter and must be dropped
+                // by `final_memory_ids_about_in_txn` — Qdrant is a prefilter, never the authority.
+                for (subjects, expected, label) in [
+                    (vec![subject_a], vec![&first, &third], "A: A-only + A+B, never B-only"),
+                    (vec![subject_b], vec![&second, &third], "B: B-only + A+B, never A-only"),
+                    (vec![subject_a, subject_b], vec![&first, &second, &third], "A or B: all"),
+                ] {
+                    let (status, scoped) = recall_call(
+                        address,
+                        Some(&credential.bearer),
+                        json!({
+                            "query":query,
+                            "workspace_id":workspace_id,
+                            "mode":"semantic",
+                            "subject_ids":subjects,
+                        }),
+                    )
+                    .await;
+                    assert_eq!(status, 200, "subject-scoped recall {label}: {scoped}");
+                    let scoped = assert_tool_response(&scoped, ToolName::Recall);
+                    assert_eq!(
+                        returned_memory_ids(scoped),
+                        expected
+                            .iter()
+                            .map(|r| r.memory_id.to_string())
+                            .collect::<BTreeSet<_>>(),
+                        "{label}: {scoped}"
+                    );
+                }
+                let (status, unknown_subject) = recall_call(
+                    address,
+                    Some(&credential.bearer),
+                    json!({
+                        "query":query,
+                        "workspace_id":workspace_id,
+                        "mode":"semantic",
+                        "subject_ids":[Uuid::new_v4()],
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "unknown subject: {unknown_subject}");
+                assert!(
+                    assert_tool_response(&unknown_subject, ToolName::Recall)["items"]
+                        .as_array()
+                        .expect("items")
+                        .is_empty(),
+                    "a subject nothing is about yields zero rows, never the unscoped set"
+                );
+                let (status, malformed) = recall_call(
+                    address,
+                    Some(&credential.bearer),
+                    json!({
+                        "query":query,
+                        "workspace_id":workspace_id,
+                        "mode":"semantic",
+                        "subject_ids":["not-a-uuid"],
+                    }),
+                )
+                .await;
+                assert_eq!(status, 400, "malformed subject id is INVALID_INPUT: {malformed}");
                 assert_eq!(no_token["provenance"]["projection_version"]["id"], "v1");
                 assert_eq!(
                     no_token["provenance"]["embedding_model_id"]["id"],
@@ -1659,10 +1780,90 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 .await;
                 assert_eq!(status, 200, "token semantic recall: {with_token}");
                 let with_token = assert_tool_response(&with_token, ToolName::Recall);
-                assert_eq!(with_token["items"].as_array().expect("RYW items").len(), 3);
+                assert_eq!(with_token["items"].as_array().expect("RYW items").len(), 4);
                 assert!(with_token["items"].as_array().unwrap().iter().any(|item| {
                     item["kind"] == "temporary_evidence" && item["evidence_id"] == evidence_id
                 }));
+
+                // §6.1.3/ADR-0029 D-A, overlay leg (placed BEFORE the supersede/restore pair below:
+                // a token minted after two lifecycle tickets bound to one Evidence trips the
+                // harness's ConflictingOverlayEvidence, the worker-less limitation the card names).
+                // The subject scope also governs what the RYW
+                // overlay may carry. A just-written, not-yet-projected Evidence declared about B
+                // rides in on a B-scoped recall as `temporary_evidence` and must NOT ride in on
+                // an A-scoped one — nor may the earlier undeclared write (`evidence_id`, about
+                // nobody) appear under either scope. Without the `evidence_subjects` re-check in
+                // `read_materialize::load_overlay` the A-scoped call returned B's raw body.
+                let (status, about_b) = remember_with_subjects(
+                    address,
+                    &credential.bearer,
+                    3,
+                    workspace_id,
+                    "semantic write about B awaiting projection",
+                    vec![subject_b],
+                    Vec::new(),
+                )
+                .await;
+                assert_eq!(status, 200, "remember about B: {about_b}");
+                let about_b_token = about_b["result"]["structuredContent"]["consistency_token"]
+                    .as_str()
+                    .expect("about-B consistency token")
+                    .to_owned();
+                let about_b_evidence = about_b["result"]["structuredContent"]["evidence_id"]
+                    .as_str()
+                    .expect("about-B evidence id")
+                    .to_owned();
+                for (subjects, memories, overlay, label) in [
+                    (
+                        vec![subject_a],
+                        vec![&first, &third],
+                        BTreeSet::new(),
+                        "A-scoped RYW: no overlay Evidence about B or about nobody",
+                    ),
+                    (
+                        vec![subject_b],
+                        vec![&second, &third],
+                        BTreeSet::from([about_b_evidence.clone()]),
+                        "B-scoped RYW: exactly the Evidence declared about B",
+                    ),
+                ] {
+                    let (status, scoped) = recall_call(
+                        address,
+                        Some(&credential.bearer),
+                        json!({
+                            "query":query,
+                            "workspace_id":workspace_id,
+                            "mode":"semantic",
+                            "subject_ids":subjects,
+                            "consistency_token":about_b_token.clone(),
+                        }),
+                    )
+                    .await;
+                    assert_eq!(status, 200, "{label}: {scoped}");
+                    let scoped = assert_tool_response(&scoped, ToolName::Recall);
+                    let items = scoped["items"].as_array().expect("scoped RYW items");
+                    let by_kind = |kind: &str, field: &str| -> BTreeSet<String> {
+                        items
+                            .iter()
+                            .filter(|item| item["kind"] == kind)
+                            .map(|item| item[field].as_str().expect(field).to_owned())
+                            .collect()
+                    };
+                    assert_eq!(
+                        by_kind("memory", "memory_id"),
+                        memories
+                            .iter()
+                            .map(|r| r.memory_id.to_string())
+                            .collect::<BTreeSet<_>>(),
+                        "{label}: {scoped}"
+                    );
+                    assert_eq!(
+                        by_kind("temporary_evidence", "evidence_id"),
+                        overlay,
+                        "{label}: {scoped}"
+                    );
+                    assert_eq!(items.len(), memories.len() + overlay.len(), "{label}: {scoped}");
+                }
 
                 // §15.5 / ADR-0020 §7: read-your-writes is a *lower* bound only. A recall
                 // carrying a consistency_token minted *before* a later, higher-seq lifecycle
@@ -1727,7 +1928,7 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                         .as_array()
                         .expect("pre-restore RYW items")
                         .len(),
-                    3,
+                    4,
                     "the pre-restore token's lower bound is still met after a higher-seq restore"
                 );
                 assert!(stale_token_recall["items"].as_array().unwrap().iter().any(|item| {
@@ -1747,10 +1948,10 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                         .admin
                         .execute(
                             "UPDATE private.memory_records SET status='revoked',updated_at=clock_timestamp() \
-                             WHERE tenant_id=$1 AND memory_id=$2",
-                            &[&tenant_id, &second.memory_id],
+                             WHERE tenant_id=$1 AND memory_id=ANY($2)",
+                            &[&tenant_id, &vec![second.memory_id, third.memory_id]],
                         )
-                        .expect("revoke authoritative semantic source");
+                        .expect("revoke authoritative semantic sources");
                 });
                 let (status, invalidated) = recall_call(
                     address,

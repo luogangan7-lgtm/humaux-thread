@@ -1,0 +1,87 @@
+# §46.1 migration manifest. ADR-0029 (Card 9, §6.1.3 subject-scoped visibility): one SECURITY
+# DEFINER STABLE predicate (private.memory_subject_visibility_ok, owner role_migration_owner,
+# search_path pinned) + one AS RESTRICTIVE FOR SELECT policy on private.memory_records TO
+# role_gateway, role_maintenance (headless roles exempt, A1; verbatim tenant clause, A2). The
+# predicate's EXECUTE is REVOKEd from PUBLIC and GRANTed to exactly those two roles (0137/0147/0149
+# definer convention; rls_check pins the ACL). One DML block: a MEMORY_LIFECYCLE projection-ticket
+# backfill (§60 issue_stream_log_row + insert_outbox sequence, set-based) for every live-registered
+# active memory that already has a memory_subjects link, so points projected before the
+# `subject_ids` payload field existed are re-projected by the worker with it. No existing policy
+# text touched — the 0153-pinned evidence_objects policy hash in xtask/src/rls_check.rs is
+# therefore unchanged by construction (postcheck asserts it).
+# §46 forward-fix (EXPAND_CONTRACT, next free number after 0154).
+
+migration_id = "0155_subject_visibility_policy"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('private.memory_records') is not null
+ and to_regclass('private.memory_subjects') is not null
+ and to_regclass('private.subjects') is not null
+ and to_regprocedure('private.visibility_allowed(text,boolean,boolean,boolean)') is not null
+ and to_regprocedure('private.memory_subject_visibility_ok(uuid,uuid)') is null
+ and not exists (select 1 from pg_policy where polrelid='private.memory_records'::regclass
+                  and polname='memory_records_subject_visibility')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- A. predicate: SECURITY DEFINER, STABLE, owner role_migration_owner, search_path pinned
+ (select count(*)=1 from pg_proc p
+   where p.oid='private.memory_subject_visibility_ok(uuid,uuid)'::regprocedure
+     and p.prosecdef and p.provolatile='s'
+     and pg_get_userbyid(p.proowner)='role_migration_owner'
+     and 'search_path=pg_catalog' = any(coalesce(p.proconfig, array[]::text[])))
+ -- A2. ACL: PUBLIC no EXECUTE; among the runtime roles exactly role_gateway + role_maintenance
+ and not has_function_privilege('public',
+       'private.memory_subject_visibility_ok(uuid,uuid)','EXECUTE')
+ and not exists (select 1 from unnest(array['role_admin','role_gateway','role_private_worker',
+       'role_consolidation_worker','role_public_worker','role_retrieval_worker',
+       'role_batch_issuer','role_maintenance']) r(name)
+     where has_function_privilege(r.name,
+             'private.memory_subject_visibility_ok(uuid,uuid)','EXECUTE')
+       is distinct from (r.name in ('role_gateway','role_maintenance')))
+ -- B. policy: RESTRICTIVE, SELECT only, exactly the two user-facing roles, verbatim tenant clause
+ and (select count(*)=1 from pg_policy p
+   where p.polrelid='private.memory_records'::regclass
+     and p.polname='memory_records_subject_visibility'
+     and not p.polpermissive and p.polcmd='r' and p.polwithcheck is null
+     and p.polroles = (select array_agg(oid order by oid) from pg_roles
+                        where rolname in ('role_gateway','role_maintenance'))
+     and strpos(pg_get_expr(p.polqual,p.polrelid),
+                '(tenant_id = (current_setting(''humaux.tenant_id''::text, true))::uuid)')>0
+     and strpos(pg_get_expr(p.polqual,p.polrelid),'memory_subject_visibility_ok')>0)
+ -- C. the permissive 0012/0153 policy is byte-identical to before (no re-pin needed)
+ and (select encode(sha256(convert_to(pg_get_expr(polqual,polrelid),'UTF8')),'hex')
+        ='e877f26ccafdc3264091c1676922c2a34adb8afd2857d78aedccb171fca491cd'
+      from pg_policy where polrelid='private.evidence_objects'::regclass
+        and polname='evidence_objects_tenant_and_visibility')
+ -- D. headless roles are NOT in the TO list (§15.7 regression sentinel)
+ and not exists (select 1 from pg_policy p
+   where p.polrelid='private.memory_records'::regclass
+     and p.polname='memory_records_subject_visibility'
+     and p.polroles && (select array_agg(oid) from pg_roles
+                         where rolname in ('role_retrieval_worker','role_consolidation_worker',
+                                           'role_private_worker','role_migration_owner')))
+ -- E. backfill: every live-registered active memory with a subject link has an ISSUED ticket
+ --    on its own stream (C. issued one per (stream, bound evidence); the worker settles them)
+ and not exists (select 1 from projection.private_memory_points p
+   join private.memory_records m on m.tenant_id=p.tenant_id and m.memory_id=p.memory_id
+   where p.projection_live and m.status='active' and m.superseded_by is null
+     and exists (select 1 from private.memory_subjects ms
+                  where ms.tenant_id=m.tenant_id and ms.memory_id=m.memory_id)
+     and not exists (select 1 from projection.stream_log sl
+                  join ops.outbox ob on ob.tenant_id=sl.tenant_id and ob.commit_seq=sl.commit_seq
+                  join private.memory_evidence me on me.evidence_id=ob.evidence_id
+                  where sl.tenant_id=p.tenant_id and sl.scope_kind=p.scope_kind
+                    and sl.scope_id=p.scope_id and sl.domain=p.domain
+                    and sl.projection_kind=p.projection_kind
+                    and sl.projection_version=p.projection_version
+                    and sl.state='ISSUED' and ob.event_type='MEMORY_LIFECYCLE'
+                    and me.memory_id=m.memory_id))
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. A later migration may DROP POLICY memory_records_subject_visibility and DROP FUNCTION private.memory_subject_visibility_ok(uuid,uuid) in that order if the card is reverted (the function's own EXECUTE grant goes with it). The backfill tickets are ordinary MEMORY_LIFECYCLE rows the worker settles to DONE; they are never rolled back (a settled re-projection of the same point is harmless)."
+backup_restore_requirement = "none (one new function with its own EXECUTE grant + one new policy; the only DML is append-only ticket issuance on projection.stream_log / ops.outbox plus the matching stream_checkpoints.issued_highwater bump; no existing policy edited)."

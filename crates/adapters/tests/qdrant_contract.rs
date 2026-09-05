@@ -15,14 +15,15 @@ use humaux_adapters::qdrant::{
     QdrantOperation, QdrantPointPayload, QdrantTransportError, ReadConsistency, RetrievalFamily,
     ShardingMethod, TenantPlacementRow, VisibleCountFilter, WriteOrdering, condition_to_filter,
     count_body, create_collection_body, dense_query_body, ha_profile_for, may_advance_checkpoint,
-    query_dense, shard_key_body, tenant_index_body, upsert, upsert_point_body, verify_visible,
-    visible_count,
+    query_dense, shard_key_body, subject_index_body, tenant_index_body, upsert, upsert_point_body,
+    verify_visible, visible_count,
 };
 use humaux_domain::authority::{AuthorityClass, AuthorityStatus};
 use humaux_domain::dataclass::DataClass;
 use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId, VisibilityClass};
 use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
 use humaux_domain::memory::MemoryType;
+use humaux_domain::subject::SubjectId;
 use humaux_infra_cell::{
     CallerId, CellAccessPermit, CellId, IntraCellError, IntraCellHttpTransport, IntraCellMethod,
     IntraCellRequest, IntraCellResource, IntraCellResourceRegistry, IntraCellResponse,
@@ -349,6 +350,74 @@ fn condition_to_filter_translates_scope_to_must_with_nested_visibility_disjuncti
     let ws_arm = should[1]["must"].as_array().expect("nested must array");
     assert_eq!(ws_arm[0]["match"]["value"], "WORKSPACE_SHARED");
     assert_eq!(ws_arm[1]["match"]["any"][0], ws.0.to_string());
+}
+
+// ---- §6.1.3 / ADR-0029: subject_ids payload + uuid index + any-of prefilter wire shape ----
+
+#[test]
+fn subject_index_body_is_uuid_index_on_subject_ids() {
+    let body = subject_index_body();
+    assert_eq!(body["field_name"], "subject_ids");
+    assert_eq!(body["field_schema"]["type"], "uuid");
+}
+
+#[test]
+fn indexable_payload_writes_sorted_deduped_subject_ids_array() {
+    let a = SubjectId(Uuid::from_u128(2));
+    let b = SubjectId(Uuid::from_u128(1));
+    let indexable = sample_payload()
+        .into_indexable()
+        .expect("non-secret")
+        .with_subject_ids(vec![a, b, a]);
+    let body = upsert_point_body(PointId::Num(1), &indexable);
+    assert_eq!(
+        body["payload"]["subject_ids"],
+        serde_json::json!([b.0.to_string(), a.0.to_string()]),
+        "sorted + deduplicated, spelled exactly like the query field"
+    );
+    // Without `with_subject_ids` the field is still present (empty), never absent — a reader
+    // filtering on it must not confuse "unlinked" with "pre-ADR-0029 point".
+    let plain = sample_payload().into_indexable().expect("non-secret");
+    assert_eq!(
+        upsert_point_body(PointId::Num(1), &plain)["payload"]["subject_ids"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn dense_query_with_subject_ids_ands_an_any_of_should_after_tenant_and_visibility() {
+    let tenant_id = TenantId::new();
+    let s = scope(tenant_id, &[]);
+    let a = SubjectId::new();
+    let b = SubjectId::new();
+    let query = dense_query(&s, vec![0.1, 0.2], 3).with_subject_ids(&[a, b]);
+    let body = dense_query_body(&query);
+    let must = body["filter"]["must"].as_array().expect("must");
+    // tenant + visibility + projection_version + embedding_version + subject any-of.
+    assert_eq!(must.len(), 5);
+    assert_eq!(must[0]["key"], "tenant_id");
+    let any_of = must[4]["should"]
+        .as_array()
+        .expect("subject any-of is a should");
+    assert_eq!(any_of.len(), 2);
+    for (arm, id) in any_of.iter().zip([a, b]) {
+        assert_eq!(arm["key"], "subject_ids");
+        assert_eq!(
+            arm["match"]["value"],
+            id.0.to_string(),
+            "array-contains via match.value"
+        );
+        assert!(
+            arm["match"].get("any").is_none(),
+            "never the `any` (scalar-in) shape"
+        );
+    }
+    // Empty = the unscoped body, byte for byte.
+    let unscoped = dense_query(&s, vec![0.1, 0.2], 3);
+    assert_eq!(
+        dense_query_body(&unscoped.clone().with_subject_ids(&[])),
+        dense_query_body(&unscoped)
+    );
 }
 
 // ---- §17.5: HA consistency profile per operation ----

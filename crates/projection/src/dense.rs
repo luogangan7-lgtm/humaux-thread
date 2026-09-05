@@ -18,6 +18,13 @@
 //! adapter-中立的条件树，序列化成 Qdrant wire filter 是 `adapters::qdrant`（HTTP 层）的职责。
 
 use humaux_domain::identity::AuthorizationScope;
+use humaux_domain::subject::SubjectId;
+
+/// §6.1.3 / ADR-0029: the Qdrant payload field carrying a point's linked subject ids
+/// (`adapters::qdrant::IndexablePayload::with_subject_ids` writes it, [`DenseQueryFilter::
+/// about_any_of`] filters on it). One spelling, shared by writer and reader — a drift here would
+/// make subject-scoped recall silently return nothing.
+pub const SUBJECT_IDS_FIELD: &str = "subject_ids";
 
 /// Adapter-中立的 payload 条件树。`pub`：`adapters::qdrant` 需要遍历它来生成 Qdrant 的 wire
 /// JSON filter；但业务层不应该把它当"随手拼一个 filter"的入口——真正进入检索调用的值类型是
@@ -57,6 +64,35 @@ impl DenseQueryFilter {
     /// HTTP/Qdrant SDK，§3/§78.3）。
     pub fn as_condition(&self) -> &Condition {
         &self.0
+    }
+
+    /// §6.1.3 / ADR-0029 D-A: narrow an already-built filter to points linked to *any* of
+    /// `subject_ids` (the aboutness axis), ANDed on top of the tenant clause and §6.1.2
+    /// visibility disjunction — never in place of them. Consumes `self`, so the only way to
+    /// obtain a subject-scoped filter is still through [`build_dense_filter`] first (§17.1's
+    /// single construction point is unchanged). An empty slice returns the filter untouched.
+    ///
+    /// The clause is an `Or` of `Eq` terms on the `subject_ids` *array* payload field: Qdrant's
+    /// `match.value` on an array field means "array contains value", so each `Eq` is one
+    /// array-contains test and the `Or` is the any-of. `In` (`match.any`) is deliberately not
+    /// used — it is the multi-workspace membership shape and would read as a scalar test.
+    pub fn about_any_of(self, subject_ids: &[SubjectId]) -> Self {
+        if subject_ids.is_empty() {
+            return self;
+        }
+        let arms = subject_ids
+            .iter()
+            .map(|s| Condition::Eq {
+                field: SUBJECT_IDS_FIELD,
+                value: s.0.to_string(),
+            })
+            .collect();
+        let mut clauses = match self.0 {
+            Condition::And(clauses) => clauses,
+            other => vec![other],
+        };
+        clauses.push(Condition::Or(arms));
+        DenseQueryFilter(Condition::And(clauses))
     }
 }
 
@@ -225,6 +261,45 @@ mod tests {
                 field: "memory_type",
                 value: "fact".into()
             }
+        );
+    }
+
+    // ---- §6.1.3 / ADR-0029: subject any-of is ANDed after tenant + visibility ----
+
+    #[test]
+    fn about_any_of_ands_an_or_of_array_contains_terms_after_tenant_and_visibility() {
+        let s = scope(None, &[]);
+        let a = SubjectId::new();
+        let b = SubjectId::new();
+        let filter = build_dense_filter(&s, &[]).about_any_of(&[a, b]);
+        let Condition::And(clauses) = filter.as_condition() else {
+            panic!("expected And")
+        };
+        assert_eq!(clauses.len(), 3, "tenant + visibility + subject clause");
+        assert_eq!(
+            clauses[0],
+            Condition::Eq {
+                field: "tenant_id",
+                value: s.tenant_id().0.to_string()
+            }
+        );
+        assert_eq!(
+            clauses[2],
+            Condition::Or(vec![
+                Condition::Eq {
+                    field: SUBJECT_IDS_FIELD,
+                    value: a.0.to_string()
+                },
+                Condition::Eq {
+                    field: SUBJECT_IDS_FIELD,
+                    value: b.0.to_string()
+                },
+            ])
+        );
+        // Empty = untouched (no vacuous `Or([])`, which Qdrant would treat as match-nothing).
+        assert_eq!(
+            build_dense_filter(&s, &[]).about_any_of(&[]),
+            build_dense_filter(&s, &[])
         );
     }
 

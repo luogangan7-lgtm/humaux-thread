@@ -6,6 +6,7 @@ use humaux_domain::authority::MemoryId;
 use humaux_domain::error::ErrorCode;
 use humaux_domain::identity::{AuthorizationScope, can_read};
 use humaux_domain::ids::WorkspaceId;
+use humaux_domain::subject::SubjectId;
 use humaux_projection::serving::StreamFamily;
 use humaux_projection::stream::StreamKey;
 use sha2::{Digest, Sha256};
@@ -92,7 +93,24 @@ pub(crate) async fn final_memory_ids_in_txn(
     candidates: &[Uuid],
     include_archived: bool,
 ) -> Result<Vec<Uuid>, ErrorCode> {
+    final_memory_ids_about_in_txn(txn, authorization, candidates, include_archived, &[]).await
+}
+
+/// [`final_memory_ids_in_txn`] plus the §6.1.3 / ADR-0029 D-A subject re-check: when
+/// `subject_ids` is non-empty, only memories linked (`private.memory_subjects`, read under the
+/// caller's RLS) to at least one of them survive. Qdrant's `subject_ids` payload prefilter is
+/// never trusted on its own — this is the authoritative membership test, in the same shared
+/// gate `include_archived` lives in. Empty `subject_ids` = no subject narrowing.
+pub(crate) async fn final_memory_ids_about_in_txn(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+    candidates: &[Uuid],
+    include_archived: bool,
+    subject_ids: &[SubjectId],
+) -> Result<Vec<Uuid>, ErrorCode> {
     let readable = readable_memory_ids(txn, authorization, candidates).await?;
+    let subject_filter: Option<Vec<Uuid>> =
+        (!subject_ids.is_empty()).then(|| subject_ids.iter().map(|s| s.0).collect());
     let rows = sqlx::query(
         r#"
         SELECT m.memory_id
@@ -104,6 +122,14 @@ pub(crate) async fn final_memory_ids_in_txn(
           -- Q3/ADR-0024 D-C: recall/context/enumerate exclude archived rows here (the shared
           -- final-eligibility gate); only memory.get passes include_archived=true.
           AND (m.archived_at IS NULL OR $3::boolean)
+          -- §6.1.3/ADR-0029 D-A: subject any-of re-check (NULL = not subject-scoped).
+          AND ($4::uuid[] IS NULL OR EXISTS (
+              SELECT 1
+              FROM private.memory_subjects AS ms
+              WHERE ms.tenant_id = m.tenant_id
+                AND ms.memory_id = m.memory_id
+                AND ms.subject_id = ANY($4::uuid[])
+          ))
           AND NOT EXISTS (
               SELECT 1
               FROM private.memory_evidence AS me
@@ -130,6 +156,7 @@ pub(crate) async fn final_memory_ids_in_txn(
     .bind(authorization.tenant_id().0)
     .bind(candidates)
     .bind(include_archived)
+    .bind(subject_filter)
     .fetch_all(&mut **txn)
     .await
     .map_err(|_| ErrorCode::DependencyUnavailable)?;
@@ -150,9 +177,16 @@ async fn load_memories(
     authorization: &AuthorizationScope,
     candidates: &[Uuid],
     include_archived: bool,
+    subject_ids: &[SubjectId],
 ) -> Result<Vec<(Uuid, serde_json::Value)>, ErrorCode> {
-    let eligible =
-        final_memory_ids_in_txn(txn, authorization, candidates, include_archived).await?;
+    let eligible = final_memory_ids_about_in_txn(
+        txn,
+        authorization,
+        candidates,
+        include_archived,
+        subject_ids,
+    )
+    .await?;
     let rows = sqlx::query(
         r#"
         SELECT m.memory_id, m.content
@@ -195,16 +229,25 @@ struct RecheckedOverlay {
     linked_memory_ids: Vec<Uuid>,
 }
 
+/// Re-checks the RYW overlay under the caller's RLS snapshot. `subject_ids` (§6.1.3 / ADR-0029
+/// D-A) is the same any-of scope the memory gate applies: when non-empty, an overlay Evidence
+/// rides in only if `private.evidence_subjects` declares it about one of those subjects —
+/// otherwise a subject-scoped recall carrying a consistency_token would return the raw body of
+/// a just-written Evidence about someone else as `temporary_evidence`. Applied here, in the one
+/// overlay loader, so every caller of the shared gate inherits it.
 async fn load_overlay(
     txn: &mut Txn<'_>,
     authorization: &AuthorizationScope,
     key: &StreamKey,
     input: &[OverlayCandidate],
+    subject_ids: &[SubjectId],
 ) -> Result<Vec<RecheckedOverlay>, ErrorCode> {
     let requested = dedup(input.iter().map(|item| (item.stream_seq, item.evidence_id)));
     if requested.is_empty() {
         return Ok(Vec::new());
     }
+    let subject_filter: Option<Vec<Uuid>> =
+        (!subject_ids.is_empty()).then(|| subject_ids.iter().map(|s| s.0).collect());
     let seqs = requested.iter().map(|(seq, _)| *seq).collect::<Vec<_>>();
     let evidence_ids = requested.iter().map(|(_, id)| *id).collect::<Vec<_>>();
     let rows = sqlx::query(
@@ -239,6 +282,14 @@ async fn load_overlay(
           AND sl.projection_version = $6
           AND sl.state <> 'TOMBSTONED'
           AND eo.data_class <> 'SECRET_MATERIAL'
+          -- §6.1.3/ADR-0029 D-A: subject any-of re-check for the overlay (NULL = not scoped).
+          AND ($9::uuid[] IS NULL OR EXISTS (
+              SELECT 1
+              FROM private.evidence_subjects AS es
+              WHERE es.tenant_id = eo.tenant_id
+                AND es.evidence_id = eo.evidence_id
+                AND es.subject_id = ANY($9::uuid[])
+          ))
         ORDER BY sl.stream_seq, ob.evidence_id
         "#,
     )
@@ -250,6 +301,7 @@ async fn load_overlay(
     .bind(&key.projection_version)
     .bind(seqs)
     .bind(evidence_ids)
+    .bind(subject_filter)
     .fetch_all(&mut **txn)
     .await
     .map_err(|_| ErrorCode::DependencyUnavailable)?;
@@ -431,9 +483,40 @@ pub(crate) async fn materialize_final_bodies_in_txn(
     overlay: &[OverlayCandidate],
     include_archived: bool,
 ) -> Result<MaterializedBodies, ErrorCode> {
+    materialize_final_bodies_about_in_txn(
+        txn,
+        authorization,
+        expected_family,
+        validated_key,
+        memory_ids,
+        overlay,
+        include_archived,
+        &[],
+    )
+    .await
+}
+
+/// [`materialize_final_bodies_in_txn`] with the §6.1.3 / ADR-0029 D-A subject any-of re-check
+/// applied at the shared final-eligibility gate — to the candidate memories, to the memories an
+/// overlay item links, and to the overlay Evidence items themselves (via
+/// `private.evidence_subjects` in [`load_overlay`]): a not-yet-projected write about someone
+/// else never rides in on the RYW overlay, neither as a linked memory nor as raw
+/// `temporary_evidence`.
+#[allow(clippy::too_many_arguments)] // One gate, one more axis (subject) next to `include_archived`.
+pub(crate) async fn materialize_final_bodies_about_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    authorization: &AuthorizationScope,
+    expected_family: &StreamFamily,
+    validated_key: &StreamKey,
+    memory_ids: &[Uuid],
+    overlay: &[OverlayCandidate],
+    include_archived: bool,
+    subject_ids: &[SubjectId],
+) -> Result<MaterializedBodies, ErrorCode> {
     let authorization = effective_authorization(authorization, expected_family, validated_key)?;
     set_authorization_local(txn, &authorization).await?;
-    let mut overlay = load_overlay(txn, &authorization, validated_key, overlay).await?;
+    let mut overlay =
+        load_overlay(txn, &authorization, validated_key, overlay, subject_ids).await?;
     let candidate_ids = dedup(
         memory_ids.iter().copied().chain(
             overlay
@@ -441,7 +524,14 @@ pub(crate) async fn materialize_final_bodies_in_txn(
                 .flat_map(|item| item.linked_memory_ids.iter().copied()),
         ),
     );
-    let memories = load_memories(txn, &authorization, &candidate_ids, include_archived).await?;
+    let memories = load_memories(
+        txn,
+        &authorization,
+        &candidate_ids,
+        include_archived,
+        subject_ids,
+    )
+    .await?;
     let readable_memory_ids = memories.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
     for item in &mut overlay {
         item.linked_memory_ids

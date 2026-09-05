@@ -483,6 +483,7 @@ fn recall_request(query: &str, workspace_id: Uuid) -> RecallSearchRequest {
         mode: Some("semantic".to_owned()),
         completeness_request: None,
         limit: None,
+        subject_ids: Vec::new(),
     }
 }
 

@@ -19,7 +19,7 @@ use humaux_adapters::{
     },
     read_materialize::MaterializedItem,
     retrieve::{
-        MaterializedPrivateReadServing, materialize_private_read_serving,
+        MaterializedPrivateReadServing, materialize_private_read_serving_about,
         private_read_projection_selector,
     },
 };
@@ -29,7 +29,9 @@ use humaux_application::{
     },
     retrieve::{RetrievalIntent, prepare_request},
 };
-use humaux_domain::{error::ErrorCode, identity::AuthorizationScope, ids::WorkspaceId};
+use humaux_domain::{
+    error::ErrorCode, identity::AuthorizationScope, ids::WorkspaceId, subject::SubjectId,
+};
 use humaux_infra_cell::{
     CellAccessPermit, IntraCellHttpTransport, IntraCellResource, IntraCellResourceRegistry,
     authorize_cell_access,
@@ -140,6 +142,11 @@ pub struct RecallSearchRequest {
     pub mode: Option<String>,
     pub completeness_request: Option<String>,
     pub limit: Option<u32>,
+    /// §6.1.3 / ADR-0029 D-A: any-of subject narrowing (`recall.search.subject_ids`). Empty =
+    /// unscoped. Applied twice by design — as a Qdrant payload prefilter
+    /// (`DenseQuery::with_subject_ids`) and re-checked at the PG hydrate gate
+    /// (`materialize_private_read_serving_about`); the prefilter is never the authority.
+    pub subject_ids: Vec<SubjectId>,
 }
 
 #[allow(clippy::too_many_lines)] // Keep the one native semantic-recall request/response chain together.
@@ -255,7 +262,8 @@ pub async fn search(
     .map_err(|_| {
         eprintln!("humaux-gateway: recall request_id={request_id} dense_query_build_failed");
         ErrorCode::DependencyUnavailable
-    })?;
+    })?
+    .with_subject_ids(&input.subject_ids);
     let candidates = query_dense(runtime.qdrant.as_ref(), &runtime.qdrant_permit()?, &dense)
         .await
         .map_err(|error| {
@@ -276,7 +284,7 @@ pub async fn search(
                 ErrorCode::DependencyUnavailable
             }
         })?;
-    let materialized = materialize_private_read_serving(
+    let materialized = materialize_private_read_serving_about(
         &pool,
         input.consistency_token.as_deref(),
         &authorization,
@@ -284,6 +292,7 @@ pub async fn search(
         &projection_version,
         &runtime.embedding_version,
         &candidates,
+        &input.subject_ids,
     )
     .await
     .map_err(|error| match error {
@@ -293,7 +302,19 @@ pub async fn search(
         humaux_adapters::retrieve::RetrieveError::TokenMalformed(_)
         | humaux_adapters::retrieve::RetrieveError::TokenExpired
         | humaux_adapters::retrieve::RetrieveError::TokenNotIssued => ErrorCode::InvalidInput,
-        _ => ErrorCode::DependencyUnavailable,
+        error => {
+            // Operator signal, same discipline as the qdrant_query_failed line above: the
+            // RetrieveError class only — `Db` carries driver text and is reduced to its name.
+            let class = if matches!(error, humaux_adapters::retrieve::RetrieveError::Db(_)) {
+                "db_error".to_owned()
+            } else {
+                error.to_string()
+            };
+            eprintln!(
+                "humaux-gateway: recall request_id={request_id} materialize_failed class={class}"
+            );
+            ErrorCode::DependencyUnavailable
+        }
     })?;
     accepted_output(
         materialized,

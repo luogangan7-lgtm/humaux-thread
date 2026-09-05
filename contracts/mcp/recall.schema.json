@@ -1,6 +1,6 @@
 {
   "type":"object",
   "oneOf":[
-    {"x-humaux-operation":{"operation_key":"recall.search","required_scope":"context:read","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"query":{"type":"string","minLength":1,"maxLength":4096},"workspace_id":{"type":"string","format":"uuid"},"consistency_token":{"type":"string","minLength":1,"maxLength":4096},"limit":{"type":"integer","minimum":1,"maximum":100},"mode":{"enum":["semantic","literal","state","temporal","association"]},"completeness_request":{"enum":["best_effort","required"]}},"required":["query"],"additionalProperties":false}
+    {"x-humaux-operation":{"operation_key":"recall.search","required_scope":"context:read","feature_key":"mcp.billable_operations.per_period","meter_kind":"ordinary1"},"properties":{"query":{"type":"string","minLength":1,"maxLength":4096},"workspace_id":{"type":"string","format":"uuid"},"consistency_token":{"type":"string","minLength":1,"maxLength":4096},"limit":{"type":"integer","minimum":1,"maximum":100},"mode":{"enum":["semantic","literal","state","temporal","association"]},"completeness_request":{"enum":["best_effort","required"]},"subject_ids":{"type":"array","items":{"type":"string","format":"uuid"},"minItems":1,"maxItems":256,"uniqueItems":true}},"required":["query"],"additionalProperties":false}
   ]
 }

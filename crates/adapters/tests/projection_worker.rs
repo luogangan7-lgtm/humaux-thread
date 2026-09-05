@@ -17,13 +17,14 @@ use humaux_adapters::projection_worker::{CardEmbedder, ProjectionWorkerDeps, run
 use humaux_adapters::qdrant::{
     DenseCandidate, DenseQuery, DenseQueryVersions, Distance, PlacementClass, PointId,
     PromotionState, QdrantOperation, RetrievalFamily, ShardingMethod, TenantPlacementRow,
-    create_collection_body, ha_profile_for, query_dense, tenant_index_body,
+    create_collection_body, ha_profile_for, query_dense, subject_index_body, tenant_index_body,
 };
 use humaux_adapters::remember::{self, RememberCommand};
 use humaux_domain::error::ErrorCode;
 use humaux_domain::evidence::{EvidenceOriginClass, payload_sha256};
 use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
 use humaux_domain::ids::{TenantId, UserId};
+use humaux_domain::subject::SubjectId;
 use humaux_infra_cell::{
     CallerId, CellAccessPermit, CellId, HttpIntraCellTransport, IntraCellError,
     IntraCellHttpTransport, IntraCellMethod, IntraCellRequest, IntraCellResource,
@@ -205,6 +206,10 @@ async fn setup_qdrant_collection() -> Result<
         (
             format!("/collections/{collection}/index"),
             tenant_index_body(),
+        ),
+        (
+            format!("/collections/{collection}/index"),
+            subject_index_body(),
         ),
     ] {
         transport
@@ -1368,6 +1373,524 @@ fn non_tenant_shared_evidence_still_resolves_and_advances_checkpoint() {
                 .expect("registry query")
                 .get(0);
             assert_eq!(registered, 2);
+        },
+    );
+}
+
+// ============================================================================
+// §6.1.3 / ADR-0029 (card 9): subject-scoped projection payload, any-of dense prefilter, and the
+// 0155 RESTRICTIVE subject-visibility policy's headless exemption.
+// ============================================================================
+
+fn seed_subject(handle: &mut Handle, name: &str) -> Uuid {
+    handle
+        .admin
+        .query_one(
+            "INSERT INTO private.subjects (tenant_id, kind, display_name) \
+             VALUES ($1, 'PERSON', $2) RETURNING subject_id",
+            &[&handle.tenant_id, &name],
+        )
+        .expect("owner seeds subject")
+        .get(0)
+}
+
+fn link_subject(handle: &mut Handle, memory_id: Uuid, subject_id: Uuid) {
+    handle
+        .admin
+        .execute(
+            "INSERT INTO private.memory_subjects \
+               (tenant_id, memory_id, subject_id, relation, source_kind, confidence_bp) \
+             VALUES ($1, $2, $3, 'ABOUT', 'DECLARED', 10000)",
+            &[&handle.tenant_id, &memory_id, &subject_id],
+        )
+        .expect("owner links memory to subject");
+}
+
+/// Payload `subject_ids` read back from Qdrant for one point (sorted, as the writer emits).
+fn scrolled_subject_ids(scrolled: &serde_json::Value, point: Uuid) -> Vec<String> {
+    scrolled["result"]["points"]
+        .as_array()
+        .expect("scroll result.points")
+        .iter()
+        .find(|p| p["id"].as_str() == Some(&point.to_string()))
+        .unwrap_or_else(|| panic!("point {point} missing from scroll"))["payload"]["subject_ids"]
+        .as_array()
+        .expect("subject_ids payload array")
+        .iter()
+        .map(|v| v.as_str().expect("uuid string").to_owned())
+        .collect()
+}
+
+fn sorted_ids(ids: &[Uuid]) -> Vec<String> {
+    let mut v: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    v.sort();
+    v
+}
+
+fn hit_points(hits: &[DenseCandidate]) -> BTreeSet<Uuid> {
+    hits.iter()
+        .map(|c| match c.point_id {
+            PointId::Uuid(id) => id,
+            PointId::Num(n) => panic!("unexpected numeric point id {n}"),
+        })
+        .collect()
+}
+
+/// Polls a dense query until it returns `expected` hits (real Qdrant read-after-write lag under
+/// Weak ordering, same pattern as T5) and returns the final candidate list either way.
+fn poll_dense(
+    handle: &Handle,
+    permit: &CellAccessPermit,
+    query: &DenseQuery,
+    expected: usize,
+) -> Vec<DenseCandidate> {
+    handle.rt.block_on(async {
+        let mut last = Vec::new();
+        for _ in 0..40 {
+            last = query_dense(handle.transport.as_ref(), permit, query)
+                .await
+                .expect("dense query succeeds");
+            if last.len() == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        last
+    })
+}
+
+/// (S1, ADR-0029 D-C): two subjects A/B, four memories (A-only, B-only, A+B, and a USER_PRIVATE
+/// A-only owned by user X) go through the real projection worker; the payload `subject_ids`
+/// arrays are read back verbatim; `DenseQuery::with_subject_ids(&[A])` returns exactly the
+/// A-linked points and never the B-only one (fault sentinel: stubbing
+/// `DenseQueryFilter::about_any_of` to a no-op makes the B-only point appear here); the same
+/// query as user Y (same tenant, not the owner) drops the USER_PRIVATE row — subject narrowing
+/// is ANDed with §6.1.2 visibility, never a substitute for it.
+#[test]
+#[allow(clippy::too_many_lines)] // One causal chain: seed -> project -> payload -> filtered queries.
+fn subject_scoped_dense_query_returns_only_memories_about_that_subject() {
+    run_db_fixture::<Fixture, _>(
+        "subject_scoped_dense_query_returns_only_memories_about_that_subject",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let user_x = seed_user(&mut handle);
+            let user_y = seed_user(&mut handle);
+            let subject_a = seed_subject(&mut handle, "Ada Customer");
+            let subject_b = seed_subject(&mut handle, "Bob Customer");
+            let (_, only_a) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "about A only",
+                "TENANT_SHARED",
+                None,
+                None,
+            );
+            let (_, only_b) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "about B only",
+                "TENANT_SHARED",
+                None,
+                None,
+            );
+            let (_, both) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "about A and B",
+                "TENANT_SHARED",
+                None,
+                None,
+            );
+            let (_, private_a) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "user X private about A",
+                "USER_PRIVATE",
+                Some(user_x),
+                None,
+            );
+            link_subject(&mut handle, only_a, subject_a);
+            link_subject(&mut handle, only_b, subject_b);
+            link_subject(&mut handle, both, subject_a);
+            link_subject(&mut handle, both, subject_b);
+            link_subject(&mut handle, private_a, subject_a);
+
+            let provider = Arc::new(TestDoubleProvider::new(
+                embedding_model(),
+                unused_rerank_model(),
+            ));
+            let deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("run_once succeeds");
+            assert_eq!(
+                (outcome.done, outcome.failed),
+                (4, 0),
+                "every subject-linked row projects"
+            );
+
+            let p_only_a = point_id_for_memory(&mut handle, only_a);
+            let p_only_b = point_id_for_memory(&mut handle, only_b);
+            let p_both = point_id_for_memory(&mut handle, both);
+            let p_private_a = point_id_for_memory(&mut handle, private_a);
+            let permit = authorize_cell_access(
+                &handle.registry,
+                IntraCellResource::QDRANT_REST,
+                Duration::from_secs(30),
+            )
+            .expect("admin Qdrant permit");
+            let scrolled =
+                scroll_payloads(&handle, &permit, &[p_only_a, p_only_b, p_both, p_private_a]);
+            assert_eq!(
+                scrolled_subject_ids(&scrolled, p_only_a),
+                sorted_ids(&[subject_a])
+            );
+            assert_eq!(
+                scrolled_subject_ids(&scrolled, p_only_b),
+                sorted_ids(&[subject_b])
+            );
+            assert_eq!(
+                scrolled_subject_ids(&scrolled, p_both),
+                sorted_ids(&[subject_a, subject_b])
+            );
+            assert_eq!(
+                scrolled_subject_ids(&scrolled, p_private_a),
+                sorted_ids(&[subject_a])
+            );
+
+            let placement = TenantPlacementRow {
+                tenant_id: TenantId(handle.tenant_id),
+                projection_family: RetrievalFamily::PrivateMemoryV1,
+                collection_name: handle.collection.clone(),
+                shard_key: None,
+                placement_class: PlacementClass::SharedFallback,
+                point_count: 4,
+                bytes_estimate: 0,
+                promotion_state: PromotionState::Stable,
+            };
+            let a = [SubjectId(subject_a)];
+            let b = [SubjectId(subject_b)];
+            let as_x_about_a =
+                dense_query_for_user(&handle, &placement, user_x).with_subject_ids(&a);
+            let hits = poll_dense(&handle, &permit, &as_x_about_a, 3);
+            assert_eq!(
+                hit_points(&hits),
+                BTreeSet::from([p_only_a, p_both, p_private_a]),
+                "subject A any-of: A-only + A+B + X's private A row; never the B-only point"
+            );
+            let as_y_about_a =
+                dense_query_for_user(&handle, &placement, user_y).with_subject_ids(&a);
+            let hits = poll_dense(&handle, &permit, &as_y_about_a, 2);
+            assert_eq!(
+                hit_points(&hits),
+                BTreeSet::from([p_only_a, p_both]),
+                "user Y is not authorized for X's USER_PRIVATE row: subject filter ANDs with visibility"
+            );
+            let as_x_about_b =
+                dense_query_for_user(&handle, &placement, user_x).with_subject_ids(&b);
+            let hits = poll_dense(&handle, &permit, &as_x_about_b, 2);
+            assert_eq!(hit_points(&hits), BTreeSet::from([p_only_b, p_both]));
+            let unscoped = dense_query_for_user(&handle, &placement, user_x);
+            let hits = poll_dense(&handle, &permit, &unscoped, 4);
+            assert_eq!(
+                hits.len(),
+                4,
+                "no subject filter = the plain visibility read"
+            );
+        },
+    );
+}
+
+/// Row count of one memory under `SET LOCAL ROLE {role}` with the tenant GUC set, inside a
+/// rolled-back transaction on the superuser fixture connection.
+fn count_as_role(handle: &mut Handle, role: &str, tenant: Uuid, memory_id: Uuid) -> i64 {
+    let mut txn = handle.admin.transaction().expect("txn");
+    txn.batch_execute(&format!(
+        "SET LOCAL ROLE {role}; SET LOCAL humaux.tenant_id = '{tenant}'; SET LOCAL humaux.user_id = '';"
+    ))
+    .expect("set role + GUCs");
+    let n: i64 = txn
+        .query_one(
+            "SELECT count(*) FROM private.memory_records WHERE memory_id = $1",
+            &[&memory_id],
+        )
+        .expect("count under role")
+        .get(0);
+    txn.rollback().expect("rollback");
+    n
+}
+
+/// (S2, ADR-0029 D-B): migration 0155's RESTRICTIVE `memory_records_subject_visibility` policy.
+/// A subject-linked TENANT_SHARED memory: `role_gateway` under the owning tenant reads it (1);
+/// a gateway session under another tenant reads 0; with the predicate faulted to always-false
+/// (inside a rolled-back transaction, so the fault never leaks) the gateway read goes to 0 —
+/// proving the policy is wired through the function — while `role_retrieval_worker` still
+/// reads the row in both states (the §15.7 watermark-freeze regression sentinel: the headless
+/// role is exempt from the RESTRICTIVE policy, so a projection run never skips a row).
+#[test]
+fn subject_visibility_policy_gates_gateway_reads_but_never_the_retrieval_worker() {
+    run_db_fixture::<Fixture, _>(
+        "subject_visibility_policy_gates_gateway_reads_but_never_the_retrieval_worker",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let subject_a = seed_subject(&mut handle, "Gated Customer");
+            let (_, memory_id) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "gated by subject A",
+                "TENANT_SHARED",
+                None,
+                None,
+            );
+            link_subject(&mut handle, memory_id, subject_a);
+            let tenant = handle.tenant_id;
+
+            assert_eq!(
+                count_as_role(&mut handle, "role_gateway", tenant, memory_id),
+                1
+            );
+            assert_eq!(
+                count_as_role(&mut handle, "role_retrieval_worker", tenant, memory_id),
+                1
+            );
+            assert_eq!(
+                count_as_role(&mut handle, "role_gateway", Uuid::new_v4(), memory_id),
+                0,
+                "another tenant's gateway session is not authorized"
+            );
+
+            // Fault: the predicate answers false for every row. Superuser CREATE OR REPLACE
+            // keeps the owner (role_migration_owner) and SECURITY DEFINER; rolled back below.
+            let mut txn = handle.admin.transaction().expect("fault txn");
+            txn.batch_execute(
+                "CREATE OR REPLACE FUNCTION private.memory_subject_visibility_ok(p_tenant_id uuid, p_memory_id uuid) \
+                 RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog \
+                 AS $$ SELECT false $$;",
+            )
+            .expect("fault the predicate");
+            let count_in = |txn: &mut postgres::Transaction<'_>, role: &str| -> i64 {
+                let mut sp = txn.savepoint("role_probe").expect("savepoint");
+                sp.batch_execute(&format!(
+                    "SET LOCAL ROLE {role}; SET LOCAL humaux.tenant_id = '{tenant}'; \
+                     SET LOCAL humaux.user_id = '';"
+                ))
+                .expect("set role");
+                let n: i64 = sp
+                    .query_one(
+                        "SELECT count(*) FROM private.memory_records WHERE memory_id = $1",
+                        &[&memory_id],
+                    )
+                    .expect("count under role")
+                    .get(0);
+                sp.rollback().expect("rollback savepoint");
+                n
+            };
+            assert_eq!(
+                count_in(&mut txn, "role_gateway"),
+                0,
+                "faulted predicate hides the row from the gateway: the RESTRICTIVE policy is live"
+            );
+            assert_eq!(
+                count_in(&mut txn, "role_retrieval_worker"),
+                1,
+                "role_retrieval_worker is exempt from the RESTRICTIVE policy (§15.7 sentinel)"
+            );
+            txn.rollback().expect("undo the fault");
+
+            assert_eq!(
+                count_as_role(&mut handle, "role_gateway", tenant, memory_id),
+                1
+            );
+
+            // ACL (0155 A2): the definer predicate reads memory_subjects with the owner's
+            // privileges, so only the two roles the policy names may call it. role_batch_issuer
+            // has USAGE on schema private and no grant on the subject tables — a direct call
+            // must be a permission error, never a boolean (the one-bit oracle the review found).
+            let mut txn = handle.admin.transaction().expect("acl txn");
+            txn.batch_execute(&format!(
+                "SET LOCAL ROLE role_batch_issuer; SET LOCAL humaux.tenant_id = '{tenant}';"
+            ))
+            .expect("set role");
+            let denied = txn
+                .query_one(
+                    "SELECT private.memory_subject_visibility_ok($1, $2)",
+                    &[&tenant, &memory_id],
+                )
+                .expect_err("role_batch_issuer has no EXECUTE on the subject predicate");
+            assert_eq!(
+                denied.code().map(|c| c.code()),
+                Some("42501"),
+                "insufficient_privilege, not a boolean: {denied}"
+            );
+            txn.rollback().expect("rollback acl probe");
+        },
+    );
+}
+
+/// Re-issues one `MEMORY_LIFECYCLE` ticket for `memory_id` on the fixture's `v1` workspace
+/// stream — the §60 `issue_stream_log_row` + `insert_outbox` sequence that migration 0155's
+/// backfill block (C.) and `memory_governance_repo::issue_lifecycle_ticket` both perform, bound
+/// to the memory's PRIMARY-first Evidence exactly as they bind it.
+fn reissue_lifecycle_ticket(handle: &mut Handle, scope_id: Uuid, memory_id: Uuid) -> i64 {
+    let mut txn = handle.admin.transaction().expect("ticket txn");
+    let evidence_id: Uuid = txn
+        .query_one(
+            "SELECT evidence_id FROM private.memory_evidence WHERE memory_id = $1 \
+             ORDER BY (role = 'PRIMARY') DESC, ordinal ASC LIMIT 1",
+            &[&memory_id],
+        )
+        .expect("bound evidence")
+        .get(0);
+    let commit_seq: i64 = txn
+        .query_one("SELECT nextval('ops.commit_seq_seq')", &[])
+        .expect("commit seq")
+        .get(0);
+    let stream_seq: i64 = txn
+        .query_one(
+            "UPDATE projection.stream_checkpoints SET issued_highwater = issued_highwater + 1 \
+             WHERE tenant_id = $1 AND scope_kind = 'workspace' AND scope_id = $2 \
+               AND domain = 'private_memory' AND projection_kind = 'PRIVATE_MEMORY' \
+               AND projection_version = 'v1' \
+             RETURNING issued_highwater",
+            &[&handle.tenant_id, &scope_id],
+        )
+        .expect("bump issued_highwater")
+        .get(0);
+    txn.execute(
+        "INSERT INTO projection.stream_log \
+           (tenant_id, scope_kind, scope_id, domain, projection_kind, projection_version, \
+            stream_seq, commit_seq) \
+         VALUES ($1, 'workspace', $2, 'private_memory', 'PRIVATE_MEMORY', 'v1', $3, $4)",
+        &[&handle.tenant_id, &scope_id, &stream_seq, &commit_seq],
+    )
+    .expect("stream_log row");
+    txn.execute(
+        "INSERT INTO ops.outbox (tenant_id, commit_seq, stream_seq, event_type, evidence_id) \
+         VALUES ($1, $2, $3, 'MEMORY_LIFECYCLE', $4)",
+        &[&handle.tenant_id, &commit_seq, &stream_seq, &evidence_id],
+    )
+    .expect("outbox row");
+    txn.commit().expect("commit ticket");
+    stream_seq
+}
+
+/// (S3, ADR-0029 D-A backfill): a point projected BEFORE its memory carried any subject link
+/// has `subject_ids: []` and the any-of prefilter never matches it — the shape every point
+/// projected before 0155 is in (no field at all, same non-match). Migration 0155's block C.
+/// re-issues one MEMORY_LIFECYCLE ticket per such linked memory; this is that mechanism end to
+/// end: link A after the first projection, re-issue the ticket the way 0155 does, run the
+/// worker again — the SAME point id (registration is keyed by `updated_at` + `body_sha256`,
+/// which a link does not touch) now carries `[A]`, the ticket settles DONE, and the A-scoped
+/// dense query hits the point it could not see before.
+#[test]
+#[allow(clippy::too_many_lines)] // One causal chain: project -> stale miss -> link -> re-ticket -> rewritten hit.
+fn reissued_lifecycle_ticket_reprojects_the_same_point_with_current_subject_ids() {
+    run_db_fixture::<Fixture, _>(
+        "reissued_lifecycle_ticket_reprojects_the_same_point_with_current_subject_ids",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let user = seed_user(&mut handle);
+            let subject_a = seed_subject(&mut handle, "Late-linked Customer");
+            let (_, memory_id) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "linked after projection",
+                "TENANT_SHARED",
+                None,
+                None,
+            );
+            let provider = Arc::new(TestDoubleProvider::new(
+                embedding_model(),
+                unused_rerank_model(),
+            ));
+            let deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("first run_once succeeds");
+            assert_eq!((outcome.done, outcome.failed), (1, 0));
+            let point = point_id_for_memory(&mut handle, memory_id);
+            let permit = authorize_cell_access(
+                &handle.registry,
+                IntraCellResource::QDRANT_REST,
+                Duration::from_secs(30),
+            )
+            .expect("admin Qdrant permit");
+            let scrolled = scroll_payloads(&handle, &permit, &[point]);
+            assert_eq!(
+                scrolled_subject_ids(&scrolled, point),
+                Vec::<String>::new(),
+                "projected before any link: empty subject_ids"
+            );
+            let placement = TenantPlacementRow {
+                tenant_id: TenantId(handle.tenant_id),
+                projection_family: RetrievalFamily::PrivateMemoryV1,
+                collection_name: handle.collection.clone(),
+                shard_key: None,
+                placement_class: PlacementClass::SharedFallback,
+                point_count: 1,
+                bytes_estimate: 0,
+                promotion_state: PromotionState::Stable,
+            };
+            let a = [SubjectId(subject_a)];
+            let about_a = dense_query_for_user(&handle, &placement, user).with_subject_ids(&a);
+            // Presence first (read-after-write lag), then the scoped miss is a real miss.
+            assert_eq!(
+                poll_dense(
+                    &handle,
+                    &permit,
+                    &dense_query_for_user(&handle, &placement, user),
+                    1
+                )
+                .len(),
+                1
+            );
+            let stale = handle
+                .rt
+                .block_on(query_dense(handle.transport.as_ref(), &permit, &about_a))
+                .expect("dense query succeeds");
+            assert!(
+                stale.is_empty(),
+                "the stale payload cannot be matched by the any-of prefilter"
+            );
+
+            link_subject(&mut handle, memory_id, subject_a);
+            let reissued = reissue_lifecycle_ticket(&mut handle, scope_id, memory_id);
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("second run_once succeeds");
+            assert_eq!(
+                (outcome.done, outcome.failed),
+                (1, 0),
+                "the re-issued ticket projects"
+            );
+            let key = (
+                handle.tenant_id,
+                "workspace",
+                scope_id,
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            );
+            assert_eq!(stream_log_state(&mut handle, &key, reissued), "DONE");
+            assert_eq!(
+                point_id_for_memory(&mut handle, memory_id),
+                point,
+                "same deterministic point id: the payload was rewritten in place"
+            );
+            let scrolled = scroll_payloads(&handle, &permit, &[point]);
+            assert_eq!(
+                scrolled_subject_ids(&scrolled, point),
+                sorted_ids(&[subject_a])
+            );
+            let hits = poll_dense(&handle, &permit, &about_a, 1);
+            assert_eq!(
+                hit_points(&hits),
+                BTreeSet::from([point]),
+                "after re-projection the A-scoped prefilter sees the point"
+            );
         },
     );
 }

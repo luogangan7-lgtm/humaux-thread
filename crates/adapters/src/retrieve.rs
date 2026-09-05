@@ -31,6 +31,7 @@ use sqlx::types::time::OffsetDateTime;
 use humaux_domain::error::ErrorCode;
 use humaux_domain::identity::AuthorizationScope;
 use humaux_domain::ids::{TenantId, WorkspaceId};
+use humaux_domain::subject::SubjectId;
 use humaux_projection::serving::StreamFamily;
 use humaux_projection::stream::StreamKey;
 use humaux_retrieval::completeness::LedgerClosure;
@@ -41,7 +42,7 @@ use crate::private_projection_registry::{
     PrivateProjectionRegistryError, ProjectionPointId, resolve_private_memory_points_in_txn,
 };
 use crate::qdrant::{DenseCandidate, PointId};
-use crate::read_materialize::{MaterializedBodies, materialize_final_bodies_in_txn};
+use crate::read_materialize::{MaterializedBodies, materialize_final_bodies_about_in_txn};
 use crate::serving_repo::{self, ServingRepoError};
 use crate::stream_repo::close_ledger_in_txn;
 
@@ -815,6 +816,35 @@ pub async fn materialize_private_read_serving(
     embedding_version: &str,
     semantic: &[DenseCandidate],
 ) -> Result<MaterializedPrivateReadServing, RetrieveError> {
+    materialize_private_read_serving_about(
+        pool,
+        consistency_token,
+        authorization,
+        family,
+        projection_version,
+        embedding_version,
+        semantic,
+        &[],
+    )
+    .await
+}
+
+/// [`materialize_private_read_serving`] narrowed to memories linked to any of `subject_ids`
+/// (§6.1.3 / ADR-0029 D-A). The Qdrant `subject_ids` prefilter the caller applied is not
+/// trusted: membership is re-checked against `private.memory_subjects` at the shared PG hydrate
+/// gate (`read_materialize::final_memory_ids_about_in_txn`), the same place `include_archived`
+/// is enforced. Empty `subject_ids` = the unscoped read.
+#[allow(clippy::too_many_arguments)] // Same fixed argument set as the unscoped entry + one axis.
+pub async fn materialize_private_read_serving_about(
+    pool: &RuntimeDbPool,
+    consistency_token: Option<&str>,
+    authorization: &AuthorizationScope,
+    family: &StreamFamily,
+    projection_version: &str,
+    embedding_version: &str,
+    semantic: &[DenseCandidate],
+    subject_ids: &[SubjectId],
+) -> Result<MaterializedPrivateReadServing, RetrieveError> {
     let mut txn = pool.pool().begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *txn)
@@ -827,6 +857,7 @@ pub async fn materialize_private_read_serving(
         projection_version,
         embedding_version,
         semantic,
+        subject_ids,
     )
     .await?;
     let key = family.with_version(projection_version);
@@ -875,6 +906,7 @@ async fn private_read_projection_selector_in_txn(
         })
 }
 
+#[allow(clippy::too_many_arguments)] // Transaction-owned twin of `materialize_private_read_serving_about`.
 pub(crate) async fn materialize_private_read_serving_in_txn(
     txn: &mut Txn<'_>,
     consistency_token: Option<&str>,
@@ -883,6 +915,7 @@ pub(crate) async fn materialize_private_read_serving_in_txn(
     projection_version: &str,
     embedding_version: &str,
     semantic: &[DenseCandidate],
+    subject_ids: &[SubjectId],
 ) -> Result<MaterializedBodies, RetrieveError> {
     let envelope = match consistency_token {
         Some(token) => recall_with_overlay_in_txn(txn, token, authorization, family).await?,
@@ -928,7 +961,7 @@ pub(crate) async fn materialize_private_read_serving_in_txn(
         .map(|candidate| candidate.memory_id.0)
         .filter(|memory_id| seen.insert(*memory_id))
         .collect();
-    materialize_final_bodies_in_txn(
+    materialize_final_bodies_about_in_txn(
         txn,
         authorization,
         family,
@@ -938,6 +971,8 @@ pub(crate) async fn materialize_private_read_serving_in_txn(
         // Q3/ADR-0024 D-C: recall.search excludes archived rows at this shared hydrate gate
         // (the Qdrant points stay; PG filters). memory.get is the only caller passing true.
         false,
+        // §6.1.3/ADR-0029 D-A: subject membership re-check at the same gate.
+        subject_ids,
     )
     .await
     .map_err(RetrieveError::FinalMaterialization)

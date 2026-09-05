@@ -30,11 +30,14 @@ use humaux_domain::dataclass::DataClass;
 use humaux_domain::identity::{AuthorizationScope, VisibilityClass};
 use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
 use humaux_domain::memory::MemoryType;
+use humaux_domain::subject::SubjectId;
 use humaux_infra_cell::{
     CellAccessPermit, IntraCellError, IntraCellHttpTransport, IntraCellMethod, IntraCellRequest,
 };
 use humaux_projection::card::EgressDisposition;
-use humaux_projection::dense::{Condition, DenseQueryFilter, FieldMatch, build_dense_filter};
+use humaux_projection::dense::{
+    Condition, DenseQueryFilter, FieldMatch, SUBJECT_IDS_FIELD, build_dense_filter,
+};
 use serde_json::{Value, json};
 use sqlx::types::time::OffsetDateTime;
 use uuid::Uuid;
@@ -159,6 +162,17 @@ pub fn tenant_index_body() -> Value {
             "type": "keyword",
             "is_tenant": true,
         }
+    })
+}
+
+/// `PUT /collections/{name}/index` request body for the §6.1.3 / ADR-0029 subject axis: the
+/// `subject_ids` array payload field carries a `uuid` payload index so the any-of prefilter
+/// ([`DenseQuery::with_subject_ids`]) is an index lookup, not a payload scan. One call per family
+/// collection, next to [`tenant_index_body`].
+pub fn subject_index_body() -> Value {
+    json!({
+        "field_name": SUBJECT_IDS_FIELD,
+        "field_schema": { "type": "uuid" }
     })
 }
 
@@ -337,14 +351,53 @@ impl QdrantPointPayload {
     /// [`QdrantPointPayload`], so a caller cannot reach the index-write body constructor
     /// without going through this gate first.
     pub fn into_indexable(self) -> Option<IndexablePayload> {
-        (self.data_class != DataClass::SecretMaterial).then_some(IndexablePayload(self))
+        (self.data_class != DataClass::SecretMaterial).then_some(IndexablePayload {
+            payload: self,
+            subject_ids: Vec::new(),
+        })
     }
 }
 
 /// A [`QdrantPointPayload`] proven not to be [`DataClass::SecretMaterial`] — see
-/// [`QdrantPointPayload::into_indexable`], the sole constructor.
+/// [`QdrantPointPayload::into_indexable`], the sole constructor — plus the §6.1.3 / ADR-0029
+/// `subject_ids` the point is linked to (`private.memory_subjects`, read by the projection
+/// worker at index time). The subject list rides here rather than on [`QdrantPointPayload`]
+/// because it is linkage, not a property of the memory row, and it only ever matters on the
+/// index-write path this type gates.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexablePayload(QdrantPointPayload);
+pub struct IndexablePayload {
+    payload: QdrantPointPayload,
+    subject_ids: Vec<SubjectId>,
+}
+
+impl IndexablePayload {
+    /// Attaches the point's linked subject ids (ADR-0029 D-A). Written to the `subject_ids`
+    /// array payload field ([`SUBJECT_IDS_FIELD`]) — the same spelling
+    /// [`DenseQuery::with_subject_ids`] filters on. Sorted + deduplicated so the wire payload is
+    /// deterministic for the same link set.
+    pub fn with_subject_ids(mut self, mut subject_ids: Vec<SubjectId>) -> Self {
+        subject_ids.sort_unstable_by_key(|s| s.0);
+        subject_ids.dedup();
+        self.subject_ids = subject_ids;
+        self
+    }
+
+    fn to_json(&self) -> Value {
+        let mut json = self.payload.to_json();
+        json.as_object_mut()
+            .expect("QdrantPointPayload::to_json is always an object")
+            .insert(
+                SUBJECT_IDS_FIELD.into(),
+                Value::Array(
+                    self.subject_ids
+                        .iter()
+                        .map(|s| json!(s.0.to_string()))
+                        .collect(),
+                ),
+            );
+        json
+    }
+}
 
 // ============================================================================
 // Qdrant point id — Qdrant's own two accepted wire forms (unsigned int or UUID)
@@ -376,7 +429,7 @@ impl PointId {
 /// (`{"points": [...]}`, plus a typed `?ordering=` URI control
 /// param, §17.5) once an HTTP client lands — see module doc.
 pub fn upsert_point_body(id: PointId, payload: &IndexablePayload) -> Value {
-    json!({ "id": id.to_json(), "payload": payload.0.to_json() })
+    json!({ "id": id.to_json(), "payload": payload.to_json() })
 }
 
 // ============================================================================
@@ -1041,6 +1094,18 @@ impl DenseQuery {
             tombstoned,
             ha_profile,
         })
+    }
+}
+
+impl DenseQuery {
+    /// §6.1.3 / ADR-0029 D-A: narrow this query to points linked to any of `subject_ids`
+    /// (`DenseQueryFilter::about_any_of` — ANDed after the tenant clause and §6.1.2 visibility
+    /// disjunction [`Self::new`] injected; a subject filter never widens a read). Qdrant is a
+    /// prefilter only: the PG hydrate gate (`read_materialize::final_memory_ids_about_in_txn`)
+    /// re-checks membership against `private.memory_subjects` under RLS.
+    pub fn with_subject_ids(mut self, subject_ids: &[SubjectId]) -> Self {
+        self.filter = self.filter.about_any_of(subject_ids);
+        self
     }
 }
 

@@ -19,8 +19,8 @@ use std::time::Duration;
 use humaux_adapters::qdrant::{
     DenseQuery, DenseQueryVersions, Distance, IndexablePayload, PointId, QdrantOperation,
     QdrantPointPayload, ShardingMethod, TenantPlacementRow, VisibleCountFilter, count,
-    create_collection_body, ha_profile_for, query_dense, scroll_by_ids, tenant_index_body, upsert,
-    verify_visible_via_transport,
+    create_collection_body, ha_profile_for, query_dense, scroll_by_ids, subject_index_body,
+    tenant_index_body, upsert, verify_visible_via_transport,
 };
 use humaux_domain::authority::{AuthorityClass, AuthorityStatus};
 use humaux_domain::dataclass::DataClass;
@@ -222,6 +222,23 @@ async fn upsert_then_search_visible_round_trips_over_real_qdrant() {
         assert!(
             (200..300).contains(&index.status),
             "tenant index create failed: {index:?}"
+        );
+        // §6.1.3/ADR-0029: real Qdrant must accept the `subject_ids` uuid payload index.
+        let subject_index = transport
+            .execute(
+                &permit,
+                IntraCellRequest {
+                    method: IntraCellMethod::Put,
+                    path: format!("/collections/{body_collection}/index"),
+                    json_body: Some(subject_index_body()),
+                    headers: Vec::new(),
+                },
+            )
+            .await
+            .expect("subject index request must not fail transport-side");
+        assert!(
+            (200..300).contains(&subject_index.status),
+            "subject index create failed: {subject_index:?}"
         );
 
         // Two authorized points plus four higher-scoring exclusion witnesses. Asking for all

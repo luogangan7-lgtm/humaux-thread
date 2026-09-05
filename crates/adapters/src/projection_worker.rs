@@ -68,6 +68,7 @@ use humaux_domain::error::ErrorCode;
 use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
 use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
 use humaux_domain::memory::MemoryType;
+use humaux_domain::subject::SubjectId;
 use humaux_infra_cell::{CellAccessPermit, IntraCellHttpTransport};
 use humaux_local_secret_scan::{LocalSecretScanner, SealedRetrievalCard};
 use humaux_projection::card::{
@@ -279,6 +280,10 @@ struct ResolvedMemory {
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     body_sha256: Vec<u8>,
+    /// §6.1.3 / ADR-0029 D-A: the memory's `private.memory_subjects` links, read in the same
+    /// transaction as the row (role_retrieval_worker's own SELECT; the 0155 RESTRICTIVE subject
+    /// policy exempts this role precisely so a subject-gated row still projects — §15.7).
+    subject_ids: Vec<SubjectId>,
 }
 
 /// (b): resolves one `stream_log` row's bound Memory through `ops.outbox` ->
@@ -333,9 +338,21 @@ async fn resolve_memory(
     ) else {
         return Ok(None);
     };
+    let memory_id: Uuid = row.try_get("memory_id")?;
+    let subject_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT subject_id FROM private.memory_subjects \
+         WHERE tenant_id = $1 AND memory_id = $2 ORDER BY subject_id",
+    )
+    .bind(tenant_id)
+    .bind(memory_id)
+    .fetch_all(&mut **txn)
+    .await?
+    .into_iter()
+    .map(SubjectId)
+    .collect();
 
     Ok(Some(ResolvedMemory {
-        memory_id: MemoryId(row.try_get("memory_id")?),
+        memory_id: MemoryId(memory_id),
         content: row.try_get("content")?,
         visibility,
         memory_type,
@@ -347,6 +364,7 @@ async fn resolve_memory(
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         body_sha256: row.try_get("body_sha256")?,
+        subject_ids,
     }))
 }
 
@@ -556,6 +574,8 @@ async fn finish_row(
     let Some(indexable) = payload.into_indexable() else {
         return (RowTerminal::SkippedByPolicy, "secret_material");
     };
+    // ADR-0029 D-A: subject linkage rides the indexable payload (`subject_ids` array field).
+    let indexable = indexable.with_subject_ids(memory.subject_ids);
 
     let registration = PrivateMemoryPointRegistration::deterministic(
         deps.family.clone(),
