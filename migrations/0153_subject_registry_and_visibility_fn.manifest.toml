@@ -1,0 +1,70 @@
+# §46.1 migration manifest. ADR-0027 (Card 7, §6.1.3 Subject / Aboutness Axis + §6.1.1 visibility
+# fn): creates the pure predicate private.visibility_allowed, re-points 0012's three visibility
+# policies at it via ALTER POLICY (forward-fix, 0012 untouched), and lands the subject registry
+# (private.subjects / subject_keys / subject_roles — FORCE RLS, tenant policy, owner
+# role_migration_owner, NAMED §6.2.2 grants). No DML; §46 forward-fix (EXPAND_CONTRACT, next free
+# number after 0152).
+
+migration_id = "0153_subject_registry_and_visibility_fn"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.tenants') is not null
+ and to_regclass('private.evidence_objects') is not null
+ and to_regclass('private.memory_records') is not null
+ and to_regclass('private.memory_rollups') is not null
+ and to_regprocedure('private.visibility_allowed(text,boolean,boolean,boolean)') is null
+ and to_regclass('private.subjects') is null
+ and to_regclass('private.subject_keys') is null
+ and to_regclass('private.subject_roles') is null
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- A. visibility_allowed exists, pure (IMMUTABLE), and the three policies now call it.
+ to_regprocedure('private.visibility_allowed(text,boolean,boolean,boolean)') is not null
+ and (select provolatile='i' and proparallel='s' and pg_get_userbyid(proowner)='role_migration_owner'
+      from pg_proc where oid='private.visibility_allowed(text,boolean,boolean,boolean)'::regprocedure)
+ and (select pg_get_expr(polqual,polrelid) like '%visibility_allowed%'
+      from pg_policy where polrelid='private.evidence_objects'::regclass
+        and polname='evidence_objects_tenant_and_visibility')
+ and (select pg_get_expr(polqual,polrelid) like '%visibility_allowed%'
+      from pg_policy where polrelid='private.memory_records'::regclass
+        and polname='memory_records_tenant_and_visibility')
+ and (select pg_get_expr(polqual,polrelid) like '%visibility_allowed%'
+      from pg_policy where polrelid='private.memory_rollups'::regclass
+        and polname='memory_rollups_tenant_and_visibility')
+ -- B. three subject tables exist, FORCE RLS, owned by role_migration_owner, tenant policy present.
+ and (select count(*)=3 from pg_class c join pg_namespace n on n.oid=c.relnamespace
+      where n.nspname='private' and c.relname in ('subjects','subject_keys','subject_roles')
+        and c.relrowsecurity and c.relforcerowsecurity
+        and pg_get_userbyid(c.relowner)='role_migration_owner')
+ and (select count(*)=3 from pg_policies where schemaname='private'
+      and tablename in ('subjects','subject_keys','subject_roles')
+      and qual like '%humaux.tenant_id%' and with_check like '%humaux.tenant_id%')
+ -- B. every subject FK carries the tenant leg (composite (tenant_id, subject_id) → subjects).
+ and (select count(*)=3 from pg_constraint
+      where contype='f' and confrelid='private.subjects'::regclass
+        and conrelid in ('private.subjects'::regclass,'private.subject_keys'::regclass,
+                         'private.subject_roles'::regclass)
+        and array_length(conkey,1)=2)
+ -- B. NAMED §6.2.2 grants exact for each subject table.
+ and (select bool_and(g) from (values
+        (has_table_privilege('role_gateway','private.subjects','SELECT')),
+        (has_table_privilege('role_gateway','private.subjects','INSERT')),
+        (has_table_privilege('role_private_worker','private.subject_keys','INSERT')),
+        (has_table_privilege('role_retrieval_worker','private.subject_roles','SELECT')),
+        (has_table_privilege('role_maintenance','private.subjects','SELECT'))
+      ) v(g))
+ and not has_table_privilege('role_retrieval_worker','private.subjects','INSERT')
+ and not has_table_privilege('role_maintenance','private.subject_keys','INSERT')
+ and not has_table_privilege('role_consolidation_worker','private.subjects','SELECT')
+ and not has_table_privilege('role_public_worker','private.subject_keys','SELECT')
+ and not has_table_privilege('role_batch_issuer','private.subject_roles','SELECT')
+ and not has_table_privilege('role_admin','private.subjects','SELECT')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. The subject registry is a new empty foundation (no rows to preserve); the three ALTER POLICY re-points are behaviour-preserving refactors of the §6.1.1 disjunction into private.visibility_allowed — a forward migration can re-ALTER the policies back to the inline disjunction (0012's original expressions are recoverable from the migration set) and drop the function/tables if the whole card is reverted. The pinned rls_check policy hash moves with the re-point in the same PR."
+backup_restore_requirement = "none (new function + three new empty tables + their grants/indexes/policies; the three ALTER POLICY refactors touch no row data)."

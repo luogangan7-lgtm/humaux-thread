@@ -1132,6 +1132,36 @@ const ADDITIVE_SEAM_MATRIX: &[Cell] = &[
         "role_private_worker",
         ["SELECT"]
     ),
+    // 0153 (ADR-0027, card 7) subject registry: gateway/private_worker register (SELECT+INSERT),
+    // retrieval_worker/maintenance read only. Every other non-owner role — (absence == no grant).
+    cell!("private.subjects", "role_gateway", ["SELECT", "INSERT"]),
+    cell!(
+        "private.subjects",
+        "role_private_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!("private.subjects", "role_retrieval_worker", ["SELECT"]),
+    cell!("private.subjects", "role_maintenance", ["SELECT"]),
+    cell!("private.subject_keys", "role_gateway", ["SELECT", "INSERT"]),
+    cell!(
+        "private.subject_keys",
+        "role_private_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!("private.subject_keys", "role_retrieval_worker", ["SELECT"]),
+    cell!("private.subject_keys", "role_maintenance", ["SELECT"]),
+    cell!(
+        "private.subject_roles",
+        "role_gateway",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.subject_roles",
+        "role_private_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!("private.subject_roles", "role_retrieval_worker", ["SELECT"]),
+    cell!("private.subject_roles", "role_maintenance", ["SELECT"]),
 ];
 
 /// Named §6.2.2 tables whose non-owner cells are all deliberately empty. Their only public
@@ -2969,11 +2999,17 @@ SELECT
   AND strpos(pg_get_expr(p.polqual,p.polrelid),'pg_input_is_valid')>0
   AND strpos(pg_get_expr(p.polwithcheck,p.polrelid),'humaux.continuity_publish')>0
   AND strpos(pg_get_expr(p.polwithcheck,p.polrelid),'IS DISTINCT FROM')>0)
+ -- Frozen §6.1.1 visibility hash. Migration 0153 (ADR-0027) re-pointed this policy's inline
+ -- disjunction at private.visibility_allowed(...) via ALTER POLICY (0012 untouched), moving the
+ -- deparse — hence this pin moved from the old c77b3b83… (inline OR chain) to the value below
+ -- (the visibility_allowed(...) form: tenant cast byte-identical to 0012, user_id casts NULLIF-guarded
+ -- against eager argument evaluation). USING == WITH CHECK,
+ -- so both legs carry the same hash.
  AND (SELECT polcmd='*' AND polpermissive AND polroles=ARRAY[0::oid]
   AND encode(sha256(convert_to(pg_get_expr(polqual,polrelid),'UTF8')),'hex')
-   ='c77b3b830c7abec4ad46704fc7e88cded9a75b028c77ffd1946d2f288d7a045f'
+   ='e877f26ccafdc3264091c1676922c2a34adb8afd2857d78aedccb171fca491cd'
   AND encode(sha256(convert_to(pg_get_expr(polwithcheck,polrelid),'UTF8')),'hex')
-   ='c77b3b830c7abec4ad46704fc7e88cded9a75b028c77ffd1946d2f288d7a045f'
+   ='e877f26ccafdc3264091c1676922c2a34adb8afd2857d78aedccb171fca491cd'
  FROM pg_policy WHERE polrelid='private.evidence_objects'::regclass
    AND polname='evidence_objects_tenant_and_visibility')
  AND (SELECT count(*)=6 FROM pg_policy
