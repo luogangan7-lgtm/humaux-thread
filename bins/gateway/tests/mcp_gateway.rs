@@ -2489,6 +2489,15 @@ fn assert_local_read_final_metric_after_settlement(
             4,
         );
         let memory = handle.seed_workspace_visible_context_record();
+        // Fresh planner statistics for private.memory_records: 0150 added archived_at + a partial
+        // index, and test-fixture churn drifts the stats, so a cold plan of the gateway read can
+        // run slowly enough to miss the 2s read-barrier deadline below. ANALYZE takes only a
+        // ShareUpdateExclusiveLock and commits before the barrier transaction takes ACCESS
+        // EXCLUSIVE — it changes plan cost, never the read's correctness or the settlement path.
+        handle
+            .admin
+            .batch_execute("ANALYZE private.memory_records")
+            .expect("refresh memory_records statistics before the read-barrier timing");
         let runtime_handle = handle.rt.handle().clone();
         let runtime = runtime_handle
             .block_on(handle.fresh_runtime())
@@ -4037,6 +4046,308 @@ async fn drive_supersede(
     done["result"]["structuredContent"]["stream_seq"]
         .as_i64()
         .expect("supersede stream_seq")
+}
+
+// ===========================================================================================
+// §Q4 memory.correct behind the same confirm gate (ADR-0025). A user correction: new Evidence
+// + new Memory version + SUPERSEDE(USER_CORRECTION); the original Evidence is never edited.
+// ===========================================================================================
+
+async fn correct_call(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    target: Uuid,
+    text: &str,
+    token: Option<&str>,
+) -> (u16, Value) {
+    let mut arguments = json!({ "action": "correct", "memory_id": target, "text": text });
+    if let Some(token) = token {
+        arguments["confirm_token"] = Value::String(token.to_owned());
+    }
+    raw_request(
+        address,
+        &tool_call_headers("memory", bearer),
+        &rpc(request_id, "tools/call", call_params("memory", arguments)),
+    )
+    .await
+}
+
+/// First call: a success-shaped `confirmation_required` naming memory.correct, no successor.
+async fn mint_correct_token(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    target: Uuid,
+) -> String {
+    let (status, response) = correct_call(address, bearer, request_id, target, "x", None).await;
+    assert_eq!(status, 200, "first call is an MCP result: {response}");
+    let structured = &response["result"]["structuredContent"];
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    assert_eq!(structured["confirmation_required"], true, "{response}");
+    assert_eq!(structured["operation"], "memory.correct", "{response}");
+    assert_eq!(
+        structured["target"]["memory_id"],
+        target.to_string(),
+        "{response}"
+    );
+    assert!(
+        structured["target"].get("replacement_memory_id").is_none(),
+        "correct confirmation names no successor: {response}"
+    );
+    structured["confirm_token"]
+        .as_str()
+        .expect("confirm_token string")
+        .to_owned()
+}
+
+/// (payload_sha256 bytes, events.payload) of one Evidence — the "original body" the correction
+/// must never touch (acceptance: byte-for-byte unchanged).
+fn evidence_body(handle: &mut Handle, evidence_id: Uuid) -> (Vec<u8>, Option<Value>) {
+    let sha: Vec<u8> = handle
+        .admin
+        .query_one(
+            "SELECT payload_sha256 FROM private.evidence_objects WHERE evidence_id = $1",
+            &[&evidence_id],
+        )
+        .expect("owner reads evidence hash")
+        .get(0);
+    let payload: Option<Value> = handle
+        .admin
+        .query_opt(
+            "SELECT payload FROM private.events WHERE event_id = $1",
+            &[&evidence_id],
+        )
+        .expect("owner reads event body")
+        .map(|row| row.get(0));
+    (sha, payload)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One HTTP fixture carries the whole correction acceptance gate.
+fn native_mcp_memory_correct_writes_new_version_and_never_edits_evidence() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>("native_mcp_memory_correct", |mut handle| {
+        handle.assert_gateway_login();
+        let prefix = format!("mcor{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let wire = format!("{prefix}.{}", "c".repeat(32));
+        let credential = handle.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &prefix,
+            &wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+            96,
+        );
+        let m = handle.seed_workspace_visible_context_record();
+
+        // The original Evidence body, captured before the correction runs.
+        let body_before = tokio::task::block_in_place(|| evidence_body(&mut handle, m.evidence_id));
+
+        let runtime_handle = handle.rt.handle().clone();
+        let runtime = runtime_handle
+            .block_on(handle.fresh_runtime())
+            .expect("correct runtime");
+        let app = application(&handle, runtime);
+        runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let bearer = credential.bearer.as_str();
+
+            // Correct M1 with new content.
+            let token = mint_correct_token(address, bearer, 1, m.memory_id).await;
+            let (status, done) =
+                correct_call(address, bearer, 2, m.memory_id, "the corrected fact", Some(&token))
+                    .await;
+            assert_eq!(status, 200, "confirmed correct: {done}");
+            assert_ne!(done["result"]["isError"], true, "{done}");
+            let structured = &done["result"]["structuredContent"];
+            let m2 = Uuid::parse_str(structured["memory_id"].as_str().expect("M2 id"))
+                .expect("M2 uuid");
+            let e2 = Uuid::parse_str(structured["evidence_id"].as_str().expect("E2 id"))
+                .expect("E2 uuid");
+            assert_eq!(structured["superseded"], m.memory_id.to_string(), "{done}");
+            assert_ne!(m2, m.memory_id, "correction is a NEW version, not in place");
+            assert_ne!(e2, m.evidence_id, "correction writes NEW Evidence");
+            assert!(structured["consistency_token"].is_string(), "{done}");
+            assert!(structured["superseded_at"].is_string(), "{done}");
+
+            tokio::task::block_in_place(|| {
+                // M1 is superseded by M2, G59-4 holds.
+                assert_eq!(
+                    memory_state(&mut handle, m.memory_id),
+                    ("superseded".into(), Some(m2), true, true),
+                    "M1 -> superseded_by = M2"
+                );
+                // M2 is a new active version, type inherited, authority via policy (not inherited).
+                let (status, mtype, aclass): (String, String, String) = {
+                    let row = handle
+                        .admin
+                        .query_one(
+                            "SELECT status, memory_type, authority_class \
+                             FROM private.memory_records WHERE memory_id = $1",
+                            &[&m2],
+                        )
+                        .expect("owner reads M2");
+                    (row.get(0), row.get(1), row.get(2))
+                };
+                assert_eq!(status, "active", "M2 is active");
+                assert_eq!(mtype, "NOTE", "M2 inherits M1's memory_type");
+                assert_eq!(
+                    aclass, "UserCorrection",
+                    "DirectUserInput correction reaches UserCorrection, not M1's ProjectConstraint"
+                );
+                // M2's PRIMARY evidence is E2, and E2 is a DirectUserInput correction body.
+                let (prim_evidence, origin): (Uuid, String) = {
+                    let row = handle
+                        .admin
+                        .query_one(
+                            "SELECT me.evidence_id, eo.origin_class \
+                             FROM private.memory_evidence me \
+                             JOIN private.evidence_objects eo ON eo.evidence_id = me.evidence_id \
+                             WHERE me.memory_id = $1 AND me.role = 'PRIMARY'",
+                            &[&m2],
+                        )
+                        .expect("owner reads M2 PRIMARY evidence");
+                    (row.get(0), row.get(1))
+                };
+                assert_eq!(prim_evidence, e2, "M2 <- E2 PRIMARY");
+                assert_eq!(origin, "DirectUserInput", "E2 origin is DirectUserInput");
+                let (e2_kind, e2_payload): (String, Value) = {
+                    let row = handle
+                        .admin
+                        .query_one(
+                            "SELECT event_kind, payload FROM private.events WHERE event_id = $1",
+                            &[&e2],
+                        )
+                        .expect("owner reads E2 body");
+                    (row.get(0), row.get(1))
+                };
+                assert_eq!(e2_kind, "USER_CORRECTION");
+                assert_eq!(e2_payload, json!("the corrected fact"), "E2 carries the new text");
+
+                // ACCEPTANCE: the ORIGINAL Evidence body is unchanged byte-for-byte. If the
+                // adapter were changed to UPDATE M1's Evidence text in place, this goes red.
+                let body_after = evidence_body(&mut handle, m.evidence_id);
+                assert_eq!(
+                    body_after, body_before,
+                    "the correction must never edit historical Evidence in place (spec :8568)"
+                );
+
+                // The correction record: a SUPERSEDE(USER_CORRECTION) naming M2 + E2 + the actor.
+                let (op, reason, replacement, corr_evidence, has_deadline, actor_nonnil): (
+                    String,
+                    Option<String>,
+                    Option<Uuid>,
+                    Option<Uuid>,
+                    bool,
+                    bool,
+                ) = {
+                    let row = handle
+                        .admin
+                        .query_one(
+                            "SELECT op, reason_code, replacement_memory_id, correction_evidence_id, \
+                                    undo_deadline IS NOT NULL, actor_principal_id IS NOT NULL \
+                             FROM ops.memory_lifecycle_events \
+                             WHERE memory_id = $1 AND op = 'SUPERSEDE' \
+                             ORDER BY event_seq DESC LIMIT 1",
+                            &[&m.memory_id],
+                        )
+                        .expect("owner reads the correction event");
+                    (
+                        row.get(0),
+                        row.get(1),
+                        row.get(2),
+                        row.get(3),
+                        row.get(4),
+                        row.get(5),
+                    )
+                };
+                assert_eq!(op, "SUPERSEDE");
+                assert_eq!(reason.as_deref(), Some("USER_CORRECTION"));
+                assert_eq!(replacement, Some(m2), "correction names M2");
+                assert_eq!(corr_evidence, Some(e2), "correction names E2");
+                assert!(has_deadline, "a correction is restorable within the undo window");
+                assert!(actor_nonnil, "correction names the actor");
+                assert_eq!(
+                    lifecycle_head(&mut handle, m.memory_id).map(|(op, _)| op),
+                    Some("SUPERSEDE".to_owned())
+                );
+            });
+
+            // Replay of the same confirmed call returns the original success, no second version.
+            let (status, replay) =
+                correct_call(address, bearer, 3, m.memory_id, "the corrected fact", Some(&token))
+                    .await;
+            assert_eq!(status, 200, "{replay}");
+            assert_eq!(
+                replay["result"]["structuredContent"]["memory_id"],
+                m2.to_string(),
+                "replay is idempotent (same M2), never a second correction"
+            );
+            tokio::task::block_in_place(|| {
+                let versions: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM private.memory_records \
+                         WHERE tenant_id = $1 AND status = 'active' AND memory_id = $2",
+                        &[&handle.tenant_id, &m2],
+                    )
+                    .expect("count M2")
+                    .get(0);
+                assert_eq!(versions, 1, "exactly one M2");
+            });
+
+            // ACCEPTANCE: the correction is itself restorable via card 3 (memory.restore undoes
+            // the SUPERSEDE(USER_CORRECTION) within the window).
+            let restore_token = mint_restore_token(address, bearer, 5, m.memory_id).await;
+            let (status, restored) =
+                restore_call(address, bearer, 6, m.memory_id, Some(&restore_token)).await;
+            assert_eq!(status, 200, "confirmed restore of a correction: {restored}");
+            assert_ne!(restored["result"]["isError"], true, "{restored}");
+            assert_eq!(
+                restored["result"]["structuredContent"]["memory_id"],
+                m.memory_id.to_string()
+            );
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    memory_state(&mut handle, m.memory_id),
+                    ("active".into(), None, false, true),
+                    "M1 is active again after restoring the correction"
+                );
+                assert_eq!(
+                    lifecycle_head(&mut handle, m.memory_id).map(|(op, _)| op),
+                    Some("RESTORE".to_owned()),
+                    "head is a RESTORE undoing the correction's SUPERSEDE"
+                );
+                // Undoing a correction must also deactivate the correction-minted M2, else BOTH
+                // the restored original and the corrected text stay active (dual-active). M2 is
+                // reversed symmetrically: now superseded_by = M1.
+                assert_eq!(
+                    memory_state(&mut handle, m2),
+                    ("superseded".into(), Some(m.memory_id), true, true),
+                    "M2 is deactivated (superseded_by = M1) after the correction is undone"
+                );
+                // Exactly one active version of this fact remains, and it is M1.
+                let active_versions: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM private.memory_records \
+                         WHERE tenant_id = $1 AND status = 'active' \
+                           AND memory_id IN ($2, $3)",
+                        &[&handle.tenant_id, &m.memory_id, &m2],
+                    )
+                    .expect("count active versions after undo")
+                    .get(0);
+                assert_eq!(
+                    active_versions, 1,
+                    "restoring a correction leaves exactly one active version (M1), never two"
+                );
+            });
+
+            stop_server(server).await.expect("server shutdown");
+        });
+    });
 }
 
 // ===========================================================================================

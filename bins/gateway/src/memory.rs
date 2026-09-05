@@ -8,8 +8,8 @@ use humaux_adapters::{
         MemoryEnumerationParams, materialize_memory_enumeration, materialize_memory_get,
     },
     memory_governance_repo::{
-        self, ArchiveRequest, ArchiveResult, RestoreRequest, RestoreResult, SupersedeOutcome,
-        SupersedeRequest,
+        self, ArchiveRequest, ArchiveResult, CorrectDone, CorrectRequest, RestoreRequest,
+        RestoreResult, SupersedeOutcome, SupersedeRequest,
     },
     postgres::RuntimeDbPool,
     read_materialize::MaterializedItem,
@@ -206,6 +206,49 @@ pub(crate) async fn restore(
     .await
 }
 
+/// §Q4 `memory.correct`, second (confirmed) call (ADR-0025). One transaction inserts a new
+/// DirectUserInput Evidence + a new Memory version and supersedes the original with reason
+/// USER_CORRECTION. Same `read_scope` workspace rule as the other governance writes. The
+/// corrected content arrives already hashed (`payload_sha256`) through the sole constructor.
+#[allow(clippy::too_many_arguments)] // one confirmed-write's worth of trusted, gate-built inputs
+pub(crate) async fn correct(
+    pool: Arc<RuntimeDbPool>,
+    write: ConfirmedWrite,
+    stream: StreamKey,
+    target: MemoryId,
+    content: serde_json::Value,
+    payload_sha256: humaux_domain::evidence::EvidencePayloadSha256,
+    undo_window: Duration,
+    consistency_token_ttl: Duration,
+) -> Result<CorrectDone, ErrorCode> {
+    let workspace = write
+        .request
+        .workspace_id()
+        .ok_or(ErrorCode::DependencyUnavailable)?;
+    let authorization = write.request.authorization().narrow(workspace)?;
+    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
+        return Err(ErrorCode::DependencyUnavailable);
+    }
+    memory_governance_repo::correct_atomically(
+        &pool,
+        &authorization,
+        CorrectRequest {
+            request_id: write.request.request_id(),
+            request_fingerprint: write.request_fingerprint,
+            reservation_ttl: write.reservation_ttl,
+            target,
+            content,
+            payload_sha256,
+            stream,
+            claim: write.claim,
+            finished_audit: write.finished_audit,
+            undo_window,
+            consistency_token_ttl,
+        },
+    )
+    .await
+}
+
 /// §36 `memory.archive` / `memory.unarchive`, second (confirmed) call (ADR-0024). Same
 /// `read_scope` workspace rule as the other governance writes: the lifecycle ticket lands on
 /// the bootstrap stream's workspace. `op` is `MemoryArchive` or `MemoryUnarchive`.
@@ -279,7 +322,8 @@ pub(crate) async fn write_binding(
         DestructiveOp::MemorySupersede
         | DestructiveOp::MemoryRestore
         | DestructiveOp::MemoryArchive
-        | DestructiveOp::MemoryUnarchive => Err(ErrorCode::InvalidInput),
+        | DestructiveOp::MemoryUnarchive
+        | DestructiveOp::MemoryCorrect => Err(ErrorCode::InvalidInput),
     }
 }
 

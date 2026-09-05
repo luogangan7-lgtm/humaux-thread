@@ -39,17 +39,23 @@ pub enum DestructiveOp {
     /// (ADR-0024). The inverse of archive — never reachable via `memory.restore` (an ARCHIVE
     /// head is NOT_REVERSIBLE there). Same gate, no successor.
     MemoryUnarchive,
+    /// §Q4 `memory.correct` (ADR-0025): a user correction — one transaction inserts a new
+    /// Evidence + a new Memory version and supersedes the original (reason USER_CORRECTION).
+    /// Runs the same confirm gate; no successor argument on the wire (the successor is minted
+    /// inside the confirmed transaction, so the token carries no `successor_id`).
+    MemoryCorrect,
 }
 
 impl DestructiveOp {
     /// Every variant, for table-driven lookups.
-    pub const ALL: [DestructiveOp; 6] = [
+    pub const ALL: [DestructiveOp; 7] = [
         DestructiveOp::MemorySupersede,
         DestructiveOp::MemoryPin,
         DestructiveOp::MemoryUnpin,
         DestructiveOp::MemoryRestore,
         DestructiveOp::MemoryArchive,
         DestructiveOp::MemoryUnarchive,
+        DestructiveOp::MemoryCorrect,
     ];
 
     /// Canonical operation key (contracts/mcp/*.schema.json `x-humaux-operation.operation_key`).
@@ -61,6 +67,7 @@ impl DestructiveOp {
             DestructiveOp::MemoryRestore => "memory.restore",
             DestructiveOp::MemoryArchive => "memory.archive",
             DestructiveOp::MemoryUnarchive => "memory.unarchive",
+            DestructiveOp::MemoryCorrect => "memory.correct",
         }
     }
 

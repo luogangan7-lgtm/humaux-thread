@@ -186,7 +186,7 @@ pub(crate) async fn next_commit_seq(
 /// fixed (see [`RememberCommand`]'s doc). `evidence_id` / `created_at` are the table's own
 /// `DEFAULT uuidv7()` / `DEFAULT now()`, never bound here — same reasoning `begin_batch` gives
 /// for asking Postgres for `uuidv7()` rather than minting client-side.
-async fn create_evidence_object(
+pub(crate) async fn create_evidence_object(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     cmd: &RememberCommand,
 ) -> Result<Uuid, RememberError> {
@@ -227,7 +227,7 @@ fn token_workspace_id(key: &StreamKey) -> Option<Uuid> {
 /// `insert_event_subtype` — `private.events` shares its primary key with the
 /// `evidence_objects` row it subtypes (`events.event_id REFERENCES evidence_objects.evidence_id`,
 /// 1:1, no separate id minted here).
-async fn insert_event_subtype(
+pub(crate) async fn insert_event_subtype(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     evidence_id: Uuid,
     cmd: &RememberCommand,

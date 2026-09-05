@@ -18,6 +18,7 @@ use humaux_domain::{
     confirm::{ConfirmToken, DestructiveOp},
     continuity::ProjectId,
     error::ErrorCode,
+    evidence::payload_sha256,
     ids::WorkspaceId,
 };
 use humaux_protocol::{
@@ -511,6 +512,91 @@ impl GatewayMcpApplication {
         }
     }
 
+    /// §Q4 `memory.correct` through the same §33.10 confirm gate (ADR-0025). One transaction
+    /// inserts a new DirectUserInput Evidence + a new Memory version and supersedes the
+    /// original (reason USER_CORRECTION); the original Evidence body is never edited in place.
+    /// No successor on the wire (M2 is minted inside the confirmed transaction, so the token
+    /// carries no successor). Same workspace rule as `memory.get` / `memory.supersede`.
+    async fn memory_correct(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        raw_arguments: &str,
+        value: &Value,
+    ) -> Result<ToolOutput, ErrorCode> {
+        let target = MemoryId::parse(value["memory_id"].as_str().ok_or(ErrorCode::InvalidInput)?)?;
+        let text = value["text"].as_str().ok_or(ErrorCode::InvalidInput)?;
+        // The corrected content is stored verbatim as E2's payload and M2's content; the digest
+        // is over the exact raw bytes (§48.0①: the sole constructor, no normalization).
+        let content = Value::String(text.to_owned());
+        let content_raw = serde_json::to_vec(&content).map_err(|_| ErrorCode::Internal)?;
+        let digest = payload_sha256(&content_raw);
+        let presented = value
+            .get("confirm_token")
+            .map(|token| {
+                token
+                    .as_str()
+                    .ok_or(ErrorCode::InvalidInput)
+                    .and_then(ConfirmToken::decode)
+            })
+            .transpose()?;
+        let (Some(ttl), Some(undo_window)) = (self.confirm_token_ttl, self.undo_window) else {
+            return self.reject_unsupported(context, operation, None).await;
+        };
+        let pool = self.runtime_pool.clone();
+        let stream = self.context_bootstrap.stream.clone();
+        let consistency_token_ttl = self.remember_policy.consistency_token_ttl();
+        let outcome = self
+            .guard
+            .run_confirmed_write(
+                context,
+                operation,
+                None,
+                raw_arguments,
+                ConfirmGate {
+                    op: DestructiveOp::MemoryCorrect,
+                    target_id: target.0,
+                    successor_id: None,
+                    presented,
+                    ttl,
+                },
+                move |write| async move {
+                    memory::correct(
+                        pool,
+                        write,
+                        stream,
+                        target,
+                        content,
+                        digest,
+                        undo_window,
+                        consistency_token_ttl,
+                    )
+                    .await
+                },
+            )
+            .await?;
+        let value = match outcome {
+            ConfirmedOutcome::ConfirmationRequired { token, expires_at } => json!({
+                "confirmation_required": true,
+                "confirm_token": token.encode(),
+                "operation": operation.operation_key(),
+                "target": { "memory_id": target.0 },
+                "expires_at": rfc3339(expires_at)?,
+            }),
+            ConfirmedOutcome::Executed(done) => json!({
+                "memory_id": done.new_memory_id.0,
+                "superseded": done.superseded.0,
+                "evidence_id": done.evidence_id,
+                "superseded_at": rfc3339(done.superseded_at)?,
+                "stream_seq": done.stream_seq,
+                "commit_seq": done.commit_seq,
+                "consistency_token": done.consistency_token,
+            }),
+        };
+        self.catalog.validate_output(ToolName::Memory, &value)?;
+        output(value)
+    }
+
     /// §36 `memory.restore` through the same §33.10 confirm gate (ADR-0020). Undoes a
     /// SUPERSEDE within the window: reuses card 1's token (no successor argument), returns the
     /// reactivated memory on a new stream seq with a new consistency_token, or a success-shaped
@@ -854,6 +940,10 @@ impl McpApplication for GatewayMcpApplication {
             }
             key if key == DestructiveOp::MemorySupersede.operation_key() => {
                 self.memory_supersede(context, &operation, &raw_arguments, &value)
+                    .await
+            }
+            key if key == DestructiveOp::MemoryCorrect.operation_key() => {
+                self.memory_correct(context, &operation, &raw_arguments, &value)
                     .await
             }
             key if key == DestructiveOp::MemoryPin.operation_key() => {

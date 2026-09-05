@@ -7,7 +7,10 @@
 //! The domain has no clock: the caller passes `window_expired` (it owns `now >= undo_deadline`),
 //! so this function is fully table-testable and never reaches for wall-clock time.
 
-use crate::{authority::AuthorityStatus, error::ConflictReason};
+use crate::{
+    authority::{AuthorityStatus, EvidenceId, MemoryId},
+    error::ConflictReason,
+};
 
 /// The kind of object a lifecycle event is about (`target_kind` column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -178,6 +181,61 @@ pub fn restore_allowed(state: RestoreTargetState) -> Result<(), ConflictReason> 
     }
 }
 
+/// §Q4 (ADR-0025) Correction Event — the shape the spec mandates (spec :8568: "a user edit
+/// writes a Correction Event plus a new version and never edits historical evidence in place")
+/// but leaves undefined. Research question 4's answer is: correction needs no new table — a
+/// correction *is* a `SUPERSEDE` lifecycle event whose reason is [`LifecycleReason::UserCorrection`]
+/// and which additionally names the new DirectUserInput Evidence that justifies it. This value
+/// object is that record's in-memory shape (the persisted form is one `ops.memory_lifecycle_events`
+/// row): who corrected what, the old and new Memory versions, and the correction Evidence.
+///
+/// It is a witness, not a second source of truth: the adapter builds one from the row it just
+/// appended so the gateway result and any audit reader share one definition of "what a
+/// correction is", instead of each re-deriving the (op, reason, replacement, evidence) tuple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorrectionEvent {
+    /// The principal who issued the correction (`actor_principal_id`).
+    pub actor_principal_id: uuid::Uuid,
+    /// The corrected (now-superseded) Memory, `M1`.
+    pub superseded_memory_id: MemoryId,
+    /// The new active Memory version, `M2` (`replacement_memory_id`).
+    pub replacement_memory_id: MemoryId,
+    /// The new DirectUserInput Evidence justifying the correction, `E2`
+    /// (`correction_evidence_id`).
+    pub correction_evidence_id: EvidenceId,
+}
+
+impl CorrectionEvent {
+    /// The invariant every correction shares (§Q4): op is `SUPERSEDE`, reason is
+    /// `USER_CORRECTION`, and it carries both a distinct replacement Memory and a correction
+    /// Evidence. Returns `Err(ErrorCode::InvalidInput)` rather than silently accepting a
+    /// malformed record — a correction that superseded a Memory with itself, or that named a
+    /// plain (non-correction) reason, is not a correction.
+    pub fn new(
+        actor_principal_id: uuid::Uuid,
+        superseded_memory_id: MemoryId,
+        replacement_memory_id: MemoryId,
+        correction_evidence_id: EvidenceId,
+    ) -> Result<Self, crate::error::ErrorCode> {
+        if superseded_memory_id == replacement_memory_id {
+            return Err(crate::error::ErrorCode::InvalidInput);
+        }
+        Ok(Self {
+            actor_principal_id,
+            superseded_memory_id,
+            replacement_memory_id,
+            correction_evidence_id,
+        })
+    }
+
+    /// The lifecycle `(op, reason)` a correction always writes — the pin that keeps the adapter's
+    /// SUPERSEDE-with-USER_CORRECTION append and this domain shape from drifting apart.
+    #[must_use]
+    pub const fn lifecycle(&self) -> (LifecycleOp, LifecycleReason) {
+        (LifecycleOp::Supersede, LifecycleReason::UserCorrection)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +254,24 @@ mod tests {
         assert_eq!(LifecycleOp::parse_db("supersede"), None);
         assert_eq!(LifecycleOp::parse_db(""), None);
         assert_eq!(LifecycleReason::parse_db("USER_RESTORE"), None);
+    }
+
+    #[test]
+    fn correction_event_is_a_supersede_with_user_correction_and_rejects_self() {
+        let m1 = MemoryId::new();
+        let m2 = MemoryId::new();
+        let e2 = EvidenceId::new();
+        let actor = uuid::Uuid::now_v7();
+        let event = CorrectionEvent::new(actor, m1, m2, e2).expect("distinct m1/m2");
+        assert_eq!(
+            event.lifecycle(),
+            (LifecycleOp::Supersede, LifecycleReason::UserCorrection)
+        );
+        assert_eq!(event.superseded_memory_id, m1);
+        assert_eq!(event.replacement_memory_id, m2);
+        assert_eq!(event.correction_evidence_id, e2);
+        // A memory cannot correct itself.
+        assert!(CorrectionEvent::new(actor, m1, m1, e2).is_err());
     }
 
     fn supersede_head(

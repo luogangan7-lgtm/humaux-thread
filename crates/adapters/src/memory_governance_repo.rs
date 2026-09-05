@@ -35,8 +35,11 @@ use humaux_domain::{
     authority::{AuthorityStatus, MemoryId},
     confirm::{DestructiveOp, RISK_TAG_CONFIRMATION_MINTED},
     error::{ConflictReason, ErrorCode},
+    evidence::{EvidenceOriginClass, EvidencePayloadSha256},
     identity::AuthorizationScope,
+    ids::{Scope, WorkspaceId},
     lifecycle::{LifecycleOp, LifecycleReason, RestoreTargetState, restore_allowed},
+    memory::MemoryType,
 };
 use humaux_projection::stream::StreamKey;
 use sqlx::types::time::OffsetDateTime;
@@ -45,15 +48,17 @@ use uuid::Uuid;
 use crate::{
     confirm_token_repo::{self, ConfirmationClaim},
     context_repo,
+    distill_repo::{self, LoadedEvidence, NewMemory},
     postgres::RuntimeDbPool,
     quota_repo::{self, ReservationStatus, ReserveResult},
-    remember::{self, RememberError},
+    remember::{self, RememberCommand, RememberError},
     request_guard_repo::{self, AuditTenant},
     retrieve::{self, TokenClaims},
 };
 
 const OP: DestructiveOp = DestructiveOp::MemorySupersede;
 const RESTORE_OP: DestructiveOp = DestructiveOp::MemoryRestore;
+const CORRECT_OP: DestructiveOp = DestructiveOp::MemoryCorrect;
 
 /// The one lifecycle-event writer, wrapping owner `ops.append_memory_lifecycle` (0149). The
 /// idempotency key is the confirm token's `sha256(nonce)` in hex: a client that retries the
@@ -70,6 +75,9 @@ async fn append_lifecycle_event(
     reason: Option<LifecycleReason>,
     memory_id: Uuid,
     replacement: Option<Uuid>,
+    // §Q4/ADR-0025: the DirectUserInput Evidence a `memory.correct` SUPERSEDE is grounded on;
+    // `None` for every non-correction transition (plain supersede/restore/archive).
+    correction_evidence: Option<Uuid>,
     undoes_event: Option<Uuid>,
     undo_window_secs: Option<f64>,
     idempotency_key: &str,
@@ -78,10 +86,10 @@ async fn append_lifecycle_event(
     commit_seq: i64,
 ) -> Result<Uuid, ErrorCode> {
     let event_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT ops.append_memory_lifecycle($1, 'MEMORY', $2, $3, $4, $5, $6, NULL, $7, \
-            CASE WHEN $8::float8 IS NULL THEN NULL \
-                 ELSE clock_timestamp() + make_interval(secs => $8) END, \
-            $9, $10, $11, $12)",
+        "SELECT ops.append_memory_lifecycle($1, 'MEMORY', $2, $3, $4, $5, $6, $7, $8, \
+            CASE WHEN $9::float8 IS NULL THEN NULL \
+                 ELSE clock_timestamp() + make_interval(secs => $9) END, \
+            $10, $11, $12, $13)",
     )
     .bind(auth.tenant_id().0)
     .bind(memory_id)
@@ -89,6 +97,7 @@ async fn append_lifecycle_event(
     .bind(reason.map(LifecycleReason::as_db_str))
     .bind(auth.principal().0)
     .bind(replacement)
+    .bind(correction_evidence)
     .bind(undoes_event)
     .bind(undo_window_secs)
     .bind(idempotency_key)
@@ -347,7 +356,8 @@ pub async fn supersede_atomically(
         Some(LifecycleReason::ExplicitSupersede),
         request.target.0,
         Some(request.successor.0),
-        None,
+        None, // correction_evidence: a plain supersede is not a correction
+        None, // undoes_event
         Some(request.undo_window.as_secs_f64()),
         &lifecycle_idempotency_key(&request.claim),
         &request.request_fingerprint,
@@ -494,6 +504,11 @@ struct HeadState {
     memory_status: AuthorityStatus,
     head_event_id: Option<Uuid>,
     head_op: Option<LifecycleOp>,
+    /// The head event's reason. A correction is a `SUPERSEDE` whose reason is
+    /// `USER_CORRECTION`; undoing one must also deactivate the replacement `M2`.
+    head_reason: Option<LifecycleReason>,
+    /// The SUPERSEDE successor (`M2`), if the head is a SUPERSEDE.
+    successor_id: Option<Uuid>,
     successor_status: Option<AuthorityStatus>,
     window_expired: bool,
 }
@@ -512,7 +527,7 @@ async fn head_state(
     }
     let row = sqlx::query(
         "SELECT m.status AS memory_status, m.lifecycle_head_event_id, e.op AS head_op, \
-                e.replacement_memory_id, \
+                e.reason_code AS head_reason, e.replacement_memory_id, \
                 (e.undo_deadline IS NULL OR e.undo_deadline <= clock_timestamp()) AS window_expired \
          FROM private.memory_records m \
          LEFT JOIN ops.memory_lifecycle_events e ON e.event_id = m.lifecycle_head_event_id \
@@ -536,6 +551,11 @@ async fn head_state(
         .try_get::<Option<String>, _>("head_op")
         .map_err(|_| ErrorCode::Internal)?
         .map(|op| LifecycleOp::parse_db(&op).ok_or(ErrorCode::Internal))
+        .transpose()?;
+    let head_reason = row
+        .try_get::<Option<String>, _>("head_reason")
+        .map_err(|_| ErrorCode::Internal)?
+        .map(|reason| LifecycleReason::parse_db(&reason).ok_or(ErrorCode::Internal))
         .transpose()?;
     let replacement: Option<Uuid> = row
         .try_get("replacement_memory_id")
@@ -562,6 +582,8 @@ async fn head_state(
         memory_status,
         head_event_id,
         head_op,
+        head_reason,
+        successor_id: replacement,
         successor_status,
         window_expired,
     })
@@ -678,7 +700,8 @@ pub async fn restore_atomically(
         LifecycleOp::Restore,
         None,
         request.target.0,
-        None,
+        None, // replacement
+        None, // correction_evidence
         Some(undoes_event),
         None,
         &idempotency_key,
@@ -708,6 +731,34 @@ pub async fn restore_atomically(
     .await
     .map_err(db_error)?;
     let restored_at = restored_at.ok_or(ErrorCode::Conflict)?;
+
+    // Undoing a correction is not complete until the correction-minted replacement M2 is also
+    // deactivated: M2 has no independent existence (it was born only to carry the corrected
+    // body), so leaving it active would surface BOTH the restored original and the corrected
+    // text to recall/get/enumerate. Symmetric reversal — the correction made M1 superseded_by
+    // M2, the undo makes M2 superseded_by M1 (G59-4's biconditional holds either way). Guarded
+    // WHERE status='active' under the row lock: 0 rows means the successor advanced concurrently
+    // (restore_allowed pre-checked it Active), so the whole undo rolls back as a Conflict rather
+    // than half-undoing. Plain (ExplicitSupersede) supersedes are untouched — M2 is then an
+    // independent user memory that must stay active.
+    if head.head_op == Some(LifecycleOp::Supersede)
+        && head.head_reason == Some(LifecycleReason::UserCorrection)
+    {
+        let successor = head.successor_id.ok_or(ErrorCode::Internal)?;
+        let deactivated: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE private.memory_records \
+                SET status = 'superseded', superseded_by = $2, superseded_at = clock_timestamp() \
+              WHERE tenant_id = $3 AND memory_id = $1 AND status = 'active' \
+              RETURNING memory_id",
+        )
+        .bind(successor)
+        .bind(request.target.0)
+        .bind(auth.tenant_id().0)
+        .fetch_optional(&mut *txn)
+        .await
+        .map_err(db_error)?;
+        deactivated.ok_or(ErrorCode::Conflict)?;
+    }
 
     if quota_repo::finish_reservation_in_txn(&mut txn, auth, &reservation, true).await?
         != ReservationStatus::Consumed
@@ -997,7 +1048,8 @@ pub async fn archive_or_unarchive_atomically(
         lifecycle_op,
         reason,
         request.target.0,
-        None,
+        None, // replacement
+        None, // correction_evidence
         undoes,
         // No undo_deadline: archive is unarchivable any time; the RESTORE undo is terminal.
         None,
@@ -1071,6 +1123,478 @@ pub async fn archive_or_unarchive_atomically(
         stream_seq,
         commit_seq,
     }))
+}
+
+// ===========================================================================================
+// memory.correct — a user correction: one transaction inserts a new DirectUserInput Evidence
+// + a new Memory version and supersedes the original (ADR-0025, §Q4 / spec :8568).
+// ===========================================================================================
+
+/// Trusted application inputs for `memory.correct` (built by the gateway gate). The corrected
+/// content arrives already paired with its `EvidencePayloadSha256` (the gateway hashed the raw
+/// bytes through `evidence::payload_sha256`, the sole constructor) so the Evidence digest is
+/// never re-derived here.
+pub struct CorrectRequest {
+    pub request_id: Uuid,
+    pub request_fingerprint: String,
+    pub reservation_ttl: Duration,
+    /// The Memory being corrected, `M1`.
+    pub target: MemoryId,
+    /// The corrected content, stored verbatim as `E2`'s event payload and `M2`'s content.
+    pub content: serde_json::Value,
+    /// Digest of the exact raw bytes of `content` (§48.0①), for `E2`.
+    pub payload_sha256: EvidencePayloadSha256,
+    /// Stream family the lifecycle ticket + the new Evidence are issued on.
+    pub stream: StreamKey,
+    pub claim: ConfirmationClaim,
+    pub finished_audit: AuditEvent,
+    /// §78.1 undo window: how long the resulting SUPERSEDE (reason USER_CORRECTION) stays
+    /// restorable via `memory.restore` (a correction's undo IS card 3's restore of that
+    /// SUPERSEDE).
+    pub undo_window: Duration,
+    /// §15.5 consistency_token lifetime for the token returned on `M2`'s new stream seq.
+    pub consistency_token_ttl: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct CorrectDone {
+    /// The new active Memory version, `M2`.
+    pub new_memory_id: MemoryId,
+    /// The corrected (now-superseded) Memory, `M1`.
+    pub superseded: MemoryId,
+    /// The new DirectUserInput Evidence, `E2`.
+    pub evidence_id: Uuid,
+    pub superseded_at: OffsetDateTime,
+    pub stream_seq: i64,
+    pub commit_seq: i64,
+    pub consistency_token: String,
+}
+
+/// The `M1` facts a correction copies onto `E2`/`M2` (visibility + reasoning domain + type).
+struct CorrectionSource {
+    memory_type: MemoryType,
+    reasoning_domain_id: Uuid,
+    data_class: String,
+    visibility_class: String,
+    visibility_user_id: Option<Uuid>,
+    visibility_workspace_id: Option<Uuid>,
+}
+
+/// §78.2 read-side inverse of `distill_repo::memory_type_db_str`, reusing that sole write-side
+/// mapping (no third copy of the CHECK strings).
+fn memory_type_from_wire(wire: &str) -> Option<MemoryType> {
+    [
+        MemoryType::Fact,
+        MemoryType::Preference,
+        MemoryType::Decision,
+        MemoryType::Rejection,
+        MemoryType::State,
+        MemoryType::Issue,
+        MemoryType::Lesson,
+        MemoryType::Constraint,
+        MemoryType::Procedure,
+        MemoryType::Outcome,
+        MemoryType::Reference,
+        MemoryType::Note,
+    ]
+    .into_iter()
+    .find(|t| distill_repo::memory_type_db_str(*t) == wire)
+}
+
+/// Pure input contract for `memory.correct`: the claim must be this operation on exactly this
+/// target with NO successor (M2 is minted inside this transaction, so the token carries none),
+/// the stream family must be the caller's tenant, and the success audit must describe exactly
+/// this operation as an executed write.
+fn validate_correct(auth: &AuthorizationScope, request: &CorrectRequest) -> Result<(), ErrorCode> {
+    if auth.tenant_id().0.is_nil() || auth.principal().0.is_nil() || auth.user_id().is_none() {
+        return Err(ErrorCode::Unauthorized);
+    }
+    if request.request_id.is_nil()
+        || request.reservation_ttl.is_zero()
+        || request.request_fingerprint.len() != 64
+        || !request
+            .request_fingerprint
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(ErrorCode::InvalidInput);
+    }
+    if request.claim.op != CORRECT_OP
+        || request.claim.target_id != request.target.0
+        || request.claim.successor_id.is_some()
+    {
+        return Err(ErrorCode::Conflict);
+    }
+    if request.stream.tenant_id != auth.tenant_id() {
+        return Err(ErrorCode::TenantBoundary);
+    }
+    let event = &request.finished_audit;
+    if event.tenant_id != auth.tenant_id()
+        || event.actor_id != auth.principal().0.to_string()
+        || event.request_id != request.request_id.to_string()
+        || event.action != McpAuditAction::McpRequestFinished.as_str()
+        || event.resource_id != CORRECT_OP.operation_key()
+        || event.result != "OK"
+        || event
+            .risk_tags
+            .iter()
+            .any(|tag| tag == RISK_TAG_CONFIRMATION_MINTED)
+    {
+        return Err(ErrorCode::InvalidInput);
+    }
+    Ok(())
+}
+
+/// Loads `M1`'s visibility/reasoning-domain/type facts to copy onto `E2`/`M2`, after checking
+/// `M1` is readable to the caller (RLS + `can_read`). A row the caller cannot read is
+/// `NotFound`, never a hint (same rule as supersede's `successor_status`).
+async fn correction_source(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    auth: &AuthorizationScope,
+    target: MemoryId,
+) -> Result<CorrectionSource, ErrorCode> {
+    let readable = context_repo::readable_memory_ids(txn, auth, &[target.0]).await?;
+    if !readable.contains(&target.0) {
+        return Err(ErrorCode::NotFound);
+    }
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT mr.memory_type, eo.reasoning_domain_id, eo.data_class, eo.visibility_class, \
+                eo.visibility_user_id, eo.visibility_workspace_id \
+         FROM private.memory_records mr \
+         JOIN private.memory_evidence me ON me.memory_id = mr.memory_id \
+         JOIN private.evidence_objects eo ON eo.evidence_id = me.evidence_id \
+         WHERE mr.tenant_id = $1 AND mr.memory_id = $2 \
+         ORDER BY (me.role = 'PRIMARY') DESC, me.ordinal ASC LIMIT 1",
+    )
+    .bind(auth.tenant_id().0)
+    .bind(target.0)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(db_error)?
+    .ok_or(ErrorCode::NotFound)?;
+    let memory_type_wire: String = row
+        .try_get("memory_type")
+        .map_err(|_| ErrorCode::Internal)?;
+    let memory_type = memory_type_from_wire(&memory_type_wire).ok_or(ErrorCode::Internal)?;
+    Ok(CorrectionSource {
+        memory_type,
+        reasoning_domain_id: row
+            .try_get("reasoning_domain_id")
+            .map_err(|_| ErrorCode::Internal)?,
+        data_class: row.try_get("data_class").map_err(|_| ErrorCode::Internal)?,
+        visibility_class: row
+            .try_get("visibility_class")
+            .map_err(|_| ErrorCode::Internal)?,
+        visibility_user_id: row
+            .try_get("visibility_user_id")
+            .map_err(|_| ErrorCode::Internal)?,
+        visibility_workspace_id: row
+            .try_get("visibility_workspace_id")
+            .map_err(|_| ErrorCode::Internal)?,
+    })
+}
+
+/// §Q4/ADR-0025, atomically. Order: reserve BMO -> consume token -> read + copy M1's facts ->
+/// insert Evidence E2 (DirectUserInput) via remember's own issuers -> issue a MEMORY_LIFECYCLE
+/// ticket bound to E2 (NOT an EVIDENCE_ACCEPTED distill trigger — M2 is materialized here) ->
+/// materialize M2 via the distill version-insert -> append a SUPERSEDE(USER_CORRECTION) event
+/// naming M2 + E2 with the undo deadline -> `UPDATE ... WHERE status='active'` (sole arbiter) ->
+/// quota CONSUMED + audits -> COMMIT. The original Evidence's `events` row is never touched.
+/// A replay of the same confirmed call returns the original success (idempotent on the
+/// lifecycle table's UNIQUE(tenant, actor, idempotency_key), like restore).
+#[allow(clippy::too_many_lines)] // one confirmed correction transaction, read top to bottom like supersede/restore
+pub async fn correct_atomically(
+    pool: &RuntimeDbPool,
+    auth: &AuthorizationScope,
+    request: CorrectRequest,
+) -> Result<CorrectDone, ErrorCode> {
+    validate_correct(auth, &request)?;
+    let idempotency_key = lifecycle_idempotency_key(&request.claim);
+    let mut txn = pool.pool().begin().await.map_err(db_error)?;
+    confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
+
+    // Idempotency (D-B): a replayed confirmed call returns the original CorrectDone — never a
+    // second E2/M2 — resolved before any BMO/consume/insert. A different request under the
+    // same key is Conflict.
+    use sqlx::Row;
+    if let Some(row) = sqlx::query(
+        "SELECT op, reason_code, request_fingerprint, replacement_memory_id, \
+                correction_evidence_id, stream_seq, commit_seq, created_at \
+         FROM ops.memory_lifecycle_events \
+         WHERE tenant_id = $1 AND actor_principal_id = $2 AND idempotency_key = $3",
+    )
+    .bind(auth.tenant_id().0)
+    .bind(auth.principal().0)
+    .bind(&idempotency_key)
+    .fetch_optional(&mut *txn)
+    .await
+    .map_err(db_error)?
+    {
+        let op: String = row.try_get("op").map_err(|_| ErrorCode::Internal)?;
+        let reason: Option<String> = row
+            .try_get("reason_code")
+            .map_err(|_| ErrorCode::Internal)?;
+        let fingerprint: String = row
+            .try_get("request_fingerprint")
+            .map_err(|_| ErrorCode::Internal)?;
+        if op != LifecycleOp::Supersede.as_db_str()
+            || reason.as_deref() != Some(LifecycleReason::UserCorrection.as_db_str())
+            || fingerprint != request.request_fingerprint
+        {
+            return Err(ErrorCode::Conflict);
+        }
+        let (Some(replacement), Some(evidence_id)) = (
+            row.try_get::<Option<Uuid>, _>("replacement_memory_id")
+                .map_err(|_| ErrorCode::Internal)?,
+            row.try_get::<Option<Uuid>, _>("correction_evidence_id")
+                .map_err(|_| ErrorCode::Internal)?,
+        ) else {
+            return Err(ErrorCode::Internal);
+        };
+        let (Some(stream_seq), Some(commit_seq)) = (
+            row.try_get::<Option<i64>, _>("stream_seq")
+                .map_err(|_| ErrorCode::Internal)?,
+            row.try_get::<Option<i64>, _>("commit_seq")
+                .map_err(|_| ErrorCode::Internal)?,
+        ) else {
+            return Err(ErrorCode::Internal);
+        };
+        let superseded_at: OffsetDateTime =
+            row.try_get("created_at").map_err(|_| ErrorCode::Internal)?;
+        let consistency_token = build_consistency_token(
+            &request.stream,
+            stream_seq,
+            commit_seq,
+            request.consistency_token_ttl,
+        )?;
+        return Ok(CorrectDone {
+            new_memory_id: MemoryId(replacement),
+            superseded: request.target,
+            evidence_id,
+            superseded_at,
+            stream_seq,
+            commit_seq,
+            consistency_token,
+        });
+    }
+
+    let reservation = match quota_repo::reserve_bmo_in_txn(
+        &mut txn,
+        auth,
+        request.request_id,
+        CORRECT_OP.operation_key(),
+        &request.request_fingerprint,
+        request.reservation_ttl,
+    )
+    .await?
+    {
+        ReserveResult::Created(reservation) => reservation,
+        ReserveResult::Existing(_) => return Err(ErrorCode::Conflict),
+    };
+    let mut quota_audit = request.finished_audit.clone();
+    quota_audit.event_id = AuditEventId::new();
+    quota_audit.action = McpAuditAction::McpQuotaReserved.as_str().to_owned();
+    request_guard_repo::audit_event_insert_in_txn(
+        &mut txn,
+        AuditTenant::Authenticated(auth),
+        &quota_audit,
+    )
+    .await?;
+
+    // Token first: a replayed/expired/misbound token never reaches the row work.
+    confirm_token_repo::consume_in_txn(&mut txn, auth, &request.claim).await?;
+
+    let source = correction_source(&mut txn, auth, request.target).await?;
+
+    // E2: a new DirectUserInput Evidence, visibility + reasoning-domain copied from M1, through
+    // remember's own evidence/event issuers (never a second hand-written INSERT).
+    let now = OffsetDateTime::now_utc();
+    let expires_at = now
+        .checked_add(
+            time::Duration::try_from(request.consistency_token_ttl)
+                .map_err(|_| ErrorCode::InvalidInput)?,
+        )
+        .ok_or(ErrorCode::InvalidInput)?;
+    let cmd = RememberCommand {
+        tenant_id: auth.tenant_id().0,
+        authorization_user_id: auth.user_id().map(|u| u.0),
+        scope_kind: request.stream.scope_kind.clone(),
+        scope_id: request.stream.scope_id,
+        domain: request.stream.domain.clone(),
+        projection_kind: request.stream.projection_kind.clone(),
+        projection_version: request.stream.projection_version.clone(),
+        consistency_token_expires_at: expires_at,
+        batch_id: None,
+        payload_sha256: request.payload_sha256,
+        data_class: source.data_class.clone(),
+        // §Q4/§10.1: a user correction is DirectUserInput — its authority is NOT inherited from
+        // M1, it is derived from this origin's ceiling.
+        origin_class: EvidenceOriginClass::DirectUserInput,
+        origin_principal_id: Some(auth.principal().0),
+        origin_connector_id: None,
+        visibility_class: source.visibility_class.clone(),
+        visibility_user_id: source.visibility_user_id,
+        visibility_workspace_id: source.visibility_workspace_id,
+        reasoning_domain_id: source.reasoning_domain_id,
+        occurred_at: None,
+        event_kind: "USER_CORRECTION".to_owned(),
+        event_payload: request.content.clone(),
+    };
+    let evidence_id = remember::create_evidence_object(&mut txn, &cmd)
+        .await
+        .map_err(remember_error)?;
+    remember::insert_event_subtype(&mut txn, evidence_id, &cmd)
+        .await
+        .map_err(remember_error)?;
+
+    // One MEMORY_LIFECYCLE ticket bound to E2 (NOT EVIDENCE_ACCEPTED — no distill round trip;
+    // D-C: M2 is materialized directly below, projection resolves it via memory_evidence(E2)).
+    let commit_seq = remember::next_commit_seq(&mut txn)
+        .await
+        .map_err(remember_error)?;
+    let stream_seq = remember::issue_stream_log_row(&mut txn, &request.stream, commit_seq)
+        .await
+        .map_err(remember_error)?;
+    remember::insert_outbox(
+        &mut txn,
+        auth.tenant_id().0,
+        commit_seq,
+        stream_seq,
+        remember::MEMORY_LIFECYCLE,
+        evidence_id,
+    )
+    .await
+    .map_err(remember_error)?;
+
+    // M2: materialize the new version through the distill version-insert (memory_records +
+    // PRIMARY memory_evidence(E2)). Authority via OriginBoundAuthorityPolicy for
+    // DirectUserInput (not inherited).
+    let scope = Scope {
+        tenant_id: auth.tenant_id(),
+        user_id: auth.user_id(),
+        workspace_id: (request.stream.scope_kind == "workspace")
+            .then_some(WorkspaceId(request.stream.scope_id)),
+        repository_id: None,
+        task_id: None,
+        run_id: None,
+        agent_id: None,
+    };
+    let class = humaux_application::correct::authorize_correction(source.memory_type, &scope)
+        .map_err(|_| ErrorCode::Internal)?;
+    let loaded = LoadedEvidence {
+        evidence_id,
+        reasoning_domain_id: source.reasoning_domain_id,
+        origin_class: EvidenceOriginClass::DirectUserInput,
+        origin_class_wire: "DirectUserInput".to_owned(),
+        origin_principal_id: Some(auth.principal().0),
+        data_class: source.data_class.clone(),
+        visibility_class: source.visibility_class.clone(),
+        visibility_user_id: source.visibility_user_id,
+        visibility_workspace_id: source.visibility_workspace_id,
+        occurred_at: None,
+        payload_sha256: hex::decode(request.payload_sha256.to_hex())
+            .map_err(|_| ErrorCode::Internal)?,
+        event_kind: "USER_CORRECTION".to_owned(),
+        payload: request.content.clone(),
+        rls_user_id: auth.user_id().map_or_else(Uuid::nil, |u| u.0),
+    };
+    let new_memory_id = distill_repo::insert_memory(
+        &mut txn,
+        auth.tenant_id().0,
+        &loaded,
+        &NewMemory {
+            content: &request.content,
+            memory_type: source.memory_type,
+            class,
+            // A direct user correction is asserted at full confidence.
+            confidence: 1.0,
+        },
+    )
+    .await
+    .map_err(db_error)?;
+
+    // The SUPERSEDE(USER_CORRECTION) record: names M2 + E2, carries the undo deadline. Written
+    // before the arbiter UPDATE so a 0-row UPDATE rolls it back with the txn.
+    let event_id = append_lifecycle_event(
+        &mut txn,
+        auth,
+        LifecycleOp::Supersede,
+        Some(LifecycleReason::UserCorrection),
+        request.target.0,
+        Some(new_memory_id),
+        Some(evidence_id),
+        None,
+        Some(request.undo_window.as_secs_f64()),
+        &idempotency_key,
+        &request.request_fingerprint,
+        stream_seq,
+        commit_seq,
+    )
+    .await?;
+
+    // Sole arbiter (mirrors supersede): PostgreSQL re-evaluates status='active' under the row
+    // lock. 0 rows (already superseded / lost the race) = Conflict, rolling E2/M2 back.
+    let superseded_at: Option<OffsetDateTime> = sqlx::query_scalar(
+        "UPDATE private.memory_records \
+            SET status = 'superseded', superseded_by = $2, superseded_at = clock_timestamp(), \
+                lifecycle_head_event_id = $4 \
+          WHERE tenant_id = $3 AND memory_id = $1 AND status = 'active' \
+          RETURNING superseded_at",
+    )
+    .bind(request.target.0)
+    .bind(new_memory_id)
+    .bind(auth.tenant_id().0)
+    .bind(event_id)
+    .fetch_optional(&mut *txn)
+    .await
+    .map_err(db_error)?;
+    let superseded_at = superseded_at.ok_or(ErrorCode::Conflict)?;
+
+    if quota_repo::finish_reservation_in_txn(&mut txn, auth, &reservation, true).await?
+        != ReservationStatus::Consumed
+    {
+        return Err(ErrorCode::Conflict);
+    }
+    quota_audit.event_id = AuditEventId::new();
+    quota_audit.action = McpAuditAction::McpQuotaConsumed.as_str().to_owned();
+    request_guard_repo::audit_event_insert_in_txn(
+        &mut txn,
+        AuditTenant::Authenticated(auth),
+        &quota_audit,
+    )
+    .await?;
+    request_guard_repo::audit_event_insert_in_txn(
+        &mut txn,
+        AuditTenant::Authenticated(auth),
+        &request.finished_audit,
+    )
+    .await?;
+    let finalized_at: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *txn)
+        .await
+        .map_err(db_error)?;
+    if finalized_at >= reservation.expires_at() {
+        return Err(ErrorCode::Conflict);
+    }
+    let consistency_token = build_consistency_token(
+        &request.stream,
+        stream_seq,
+        commit_seq,
+        request.consistency_token_ttl,
+    )?;
+    txn.commit()
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    Ok(CorrectDone {
+        new_memory_id: MemoryId(new_memory_id),
+        superseded: request.target,
+        evidence_id,
+        superseded_at,
+        stream_seq,
+        commit_seq,
+        consistency_token,
+    })
 }
 
 #[cfg(test)]
