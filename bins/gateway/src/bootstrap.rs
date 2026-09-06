@@ -97,6 +97,9 @@ pub struct GatewayBootstrap {
     confirm_token_ttl: Duration,
     /// §78.1 memory.restore undo window (ADR-0020), `HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS`.
     undo_window: Duration,
+    /// §8.5.1 / ADR-0030 D-B frozen mood half-life policy (§78.1, no literal),
+    /// `HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS`.
+    mood_half_life: Duration,
 }
 
 /// Parsed `HUMAUX_GATEWAY_RETRIEVAL_RPC_*` / `HUMAUX_GATEWAY_EMBEDDING_*` /
@@ -202,6 +205,13 @@ impl GatewayBootstrap {
                 "HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS",
                 "must be positive seconds",
             )
+        })?
+        .with_mood_half_life(self.mood_half_life)
+        .map_err(|_| {
+            BootstrapError::new(
+                "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS",
+                "must be positive seconds",
+            )
         })?;
         match self.semantic_recall {
             Some(config) => {
@@ -244,6 +254,10 @@ impl GatewayBootstrap {
             required(&effective, "HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS")?,
             "HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS",
         )?;
+        let mood_half_life = seconds(
+            required(&effective, "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS")?,
+            "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS",
+        )?;
 
         Ok(Self {
             bind_addr: parse_bind_addr(required(&effective, "HUMAUX_GATEWAY_BIND_ADDR")?)?,
@@ -258,6 +272,7 @@ impl GatewayBootstrap {
             handler_timeout,
             confirm_token_ttl,
             undo_window,
+            mood_half_life,
         })
     }
 }
@@ -608,6 +623,7 @@ fn registry() -> Vec<ConfigEntry> {
         ("REPLAY_TTL_SECONDS", "u64", false),
         ("CONFIRM_TOKEN_TTL_SECONDS", "u64", false),
         ("UNDO_WINDOW_SECONDS", "u64", false),
+        ("MOOD_HALF_LIFE_SECONDS", "u64", false),
         ("REMEMBER_TENANT_ID", "uuid", false),
         ("REMEMBER_WORKSPACE_ID", "uuid", false),
         ("REMEMBER_SCOPE_KIND", "enum:workspace", false),
@@ -915,6 +931,7 @@ mod tests {
                 "HUMAUX_GATEWAY_REPLAY_TTL_SECONDS" => "60".into(),
                 "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS" => "300".into(),
                 "HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS" => "86400".into(),
+                "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS" => "21600".into(),
                 "HUMAUX_GATEWAY_REMEMBER_TENANT_ID" => tenant.to_string(),
                 "HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID" => workspace.to_string(),
                 "HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND" => "workspace".into(),

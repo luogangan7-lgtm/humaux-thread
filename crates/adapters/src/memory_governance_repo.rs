@@ -31,6 +31,7 @@
 use std::time::Duration;
 
 use humaux_domain::{
+    affect::MoodHalfLife,
     audit::{AuditEvent, AuditEventId, McpAuditAction},
     authority::{AuthorityStatus, MemoryId},
     confirm::{DestructiveOp, RISK_TAG_CONFIRMATION_MINTED},
@@ -47,6 +48,7 @@ use sqlx::types::time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
+    affect_repo::{self, AffectInput, AffectParent},
     confirm_token_repo::{self, ConfirmationClaim},
     context_repo,
     distill_repo::{self, LoadedEvidence, NewMemory},
@@ -186,7 +188,7 @@ fn remember_error(error: RememberError) -> ErrorCode {
         RememberError::ConsistencyTokenExpiryNotFuture | RememberError::BatchExhausted => {
             ErrorCode::Conflict
         }
-        RememberError::Subject(code) => code,
+        RememberError::Subject(code) | RememberError::Affect(code) => code,
     }
 }
 
@@ -1161,6 +1163,14 @@ pub struct CorrectRequest {
     /// consumed — unknown ⇒ `INVALID_INPUT`, nothing written, token intact — and applied inside
     /// this same transaction.
     pub subjects: SubjectDeclaration,
+    /// §8.5.1 (ADR-0030 D-E): `M2`'s affect annotations, re-supplied in full (`M1`'s rows ride
+    /// with the superseded version). Target subjects resolve BEFORE the token is consumed
+    /// (unknown ⇒ `INVALID_INPUT`, token intact); the rows are written inside this same
+    /// transaction after the arbiter UPDATE — one `MEMORY_LIFECYCLE` ticket covers them.
+    pub affects: Vec<AffectInput>,
+    /// The frozen MOOD half-life policy stamped onto MOOD rows (`None` = not declared ⇒ a MOOD
+    /// input is `DEPENDENCY_UNAVAILABLE`).
+    pub mood_half_life: Option<MoodHalfLife>,
 }
 
 #[derive(Debug, Clone)]
@@ -1178,6 +1188,8 @@ pub struct CorrectDone {
     /// §6.1.3: every subject `M2` is linked to after the hook ran (inherited from `M1` +
     /// explicit), in link order.
     pub subject_ids: Vec<Uuid>,
+    /// §8.5.1: `M2`'s affect rows (the re-supplied annotations), in write order.
+    pub affect_ids: Vec<Uuid>,
 }
 
 /// The `M1` facts a correction copies onto `E2`/`M2` (visibility + reasoning domain + type).
@@ -1385,6 +1397,13 @@ pub async fn correct_atomically(
         )
         .await
         .map_err(db_error)?;
+        let affect_ids =
+            affect_repo::affects_for_memories_in_txn(&mut txn, auth.tenant_id().0, &[replacement])
+                .await
+                .map_err(db_error)?
+                .into_iter()
+                .map(|row| row.affect_id)
+                .collect();
         return Ok(CorrectDone {
             new_memory_id: MemoryId(replacement),
             superseded: request.target,
@@ -1394,6 +1413,7 @@ pub async fn correct_atomically(
             commit_seq,
             consistency_token,
             subject_ids,
+            affect_ids,
         });
     }
 
@@ -1428,6 +1448,9 @@ pub async fn correct_atomically(
         &request.subjects,
     )
     .await?;
+    // §8.5.1: the affects' target subjects under the same rule, also before the consume.
+    let affect_targets =
+        affect_repo::resolve_targets_in_txn(&mut txn, auth.tenant_id().0, &request.affects).await?;
 
     // Token first: a replayed/expired/misbound token never reaches the row work.
     confirm_token_repo::consume_in_txn(&mut txn, auth, &request.claim).await?;
@@ -1468,6 +1491,8 @@ pub async fn correct_atomically(
         event_kind: "USER_CORRECTION".to_owned(),
         event_payload: request.content.clone(),
         subjects: humaux_domain::subject::SubjectDeclaration::default(),
+        affects: Vec::new(),
+        mood_half_life: None,
     };
     let evidence_id = remember::create_evidence_object(&mut txn, &cmd)
         .await
@@ -1596,6 +1621,20 @@ pub async fn correct_atomically(
             .await
             .map_err(db_error)?;
 
+    // §8.5.1 (ADR-0030 D-E): M2's re-supplied affects, provenance E2, through the sole affect
+    // issuer in THIS transaction — the MEMORY_LIFECYCLE ticket above already re-projects M2 with
+    // them; there is no second transaction and no second ticket.
+    let affect_ids = affect_repo::insert_in_txn(
+        &mut txn,
+        auth.tenant_id().0,
+        AffectParent::Memory(new_memory_id),
+        evidence_id,
+        &request.affects,
+        &affect_targets,
+        request.mood_half_life,
+    )
+    .await?;
+
     if quota_repo::finish_reservation_in_txn(&mut txn, auth, &reservation, true).await?
         != ReservationStatus::Consumed
     {
@@ -1640,6 +1679,7 @@ pub async fn correct_atomically(
         commit_seq,
         consistency_token,
         subject_ids,
+        affect_ids,
     })
 }
 

@@ -185,6 +185,8 @@ fn command(
         event_kind: "MANUAL_NOTE".to_string(),
         event_payload: serde_json::json!({ "content": content }),
         subjects: humaux_domain::subject::SubjectDeclaration::default(),
+        affects: Vec::new(),
+        mood_half_life: None,
     }
 }
 

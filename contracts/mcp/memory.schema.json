@@ -105,6 +105,46 @@
           "maxItems": 16,
           "uniqueItems": true
         },
+        "affects": {
+          "description": "§8.5.1 (ADR-0030 D-E): the corrected version's affect annotations, re-supplied in full — the original's rows stay with the superseded version. Target subjects resolve before the confirm token is consumed (unknown is INVALID_INPUT, token intact); the rows are written inside the correction's own transaction under its single MEMORY_LIFECYCLE ticket.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "§8.5.1 (ADR-0030): one affect annotation. kind EMOTION (never decays) | MOOD (decays by the frozen half-life at read time); label is the closed 12-value EmotionLabel; valence/arousal/dominance are basis points -10000..10000; intensity/confidence 0..10000. Out-of-range or unknown values are INVALID_INPUT, never clamped. target_subject_id (rule 1) or target_subject_key (rule 2) must resolve under the tenant's registry, else INVALID_INPUT — never auto-registered.",
+            "properties": {
+              "kind": {"type": "string", "enum": ["EMOTION", "MOOD"]},
+              "label": {"type": "string", "enum": ["JOY", "SADNESS", "ANGER", "FEAR", "DISGUST", "SURPRISE", "AFFECTION", "ANXIETY", "FRUSTRATION", "CALM", "EXCITEMENT", "RELIEF"]},
+              "valence": {"type": "integer", "minimum": -10000, "maximum": 10000},
+              "arousal": {"type": "integer", "minimum": -10000, "maximum": 10000},
+              "dominance": {"type": "integer", "minimum": -10000, "maximum": 10000},
+              "intensity": {"type": "integer", "minimum": 0, "maximum": 10000},
+              "confidence": {"type": "integer", "minimum": 0, "maximum": 10000},
+              "target_subject_id": {"type": "string", "format": "uuid"},
+              "target_subject_key": {
+                "type": "object",
+                "properties": {
+                  "kind": {"type": "string", "minLength": 1, "maxLength": 32},
+                  "value": {"type": "string", "minLength": 1, "maxLength": 512}
+                },
+                "required": ["kind", "value"],
+                "additionalProperties": false
+              },
+              "target_scope": {
+                "type": "object",
+                "properties": {
+                  "kind": {"type": "string", "enum": ["WORKSPACE", "REPOSITORY", "TASK", "RUN", "AGENT"]},
+                  "id": {"type": "string", "format": "uuid"}
+                },
+                "required": ["kind", "id"],
+                "additionalProperties": false
+              },
+              "observed_at": {"type": "string", "format": "date-time"}
+            },
+            "required": ["kind", "intensity", "confidence"],
+            "additionalProperties": false
+          },
+          "maxItems": 16
+        },
         "subject_keys": {
           "description": "§6.1.3 rule 2: exact trusted external keys (closed SubjectKeyKind). Unknown key is INVALID_INPUT before any write.",
           "type": "array",
@@ -480,6 +520,74 @@
         "subject_id",
         "kind",
         "value"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.annotate_affect",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "description": "§8.5.1 / ADR-0030 D-C: append 1..16 immutable affect annotations to the visible active head memory (provenance = its PRIMARY Evidence) and issue the re-projection ticket. Not confirm-gated (nothing is deleted or hidden). Unknown/invisible memory is NOT_FOUND; a superseded version is CONFLICT (annotate the head); unknown target subject is INVALID_INPUT.",
+      "properties": {
+        "action": {
+          "const": "annotate_affect"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "affects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "§8.5.1 (ADR-0030): one affect annotation. kind EMOTION (never decays) | MOOD (decays by the frozen half-life at read time); label is the closed 12-value EmotionLabel; valence/arousal/dominance are basis points -10000..10000; intensity/confidence 0..10000. Out-of-range or unknown values are INVALID_INPUT, never clamped. target_subject_id (rule 1) or target_subject_key (rule 2) must resolve under the tenant's registry, else INVALID_INPUT — never auto-registered.",
+            "properties": {
+              "kind": {"type": "string", "enum": ["EMOTION", "MOOD"]},
+              "label": {"type": "string", "enum": ["JOY", "SADNESS", "ANGER", "FEAR", "DISGUST", "SURPRISE", "AFFECTION", "ANXIETY", "FRUSTRATION", "CALM", "EXCITEMENT", "RELIEF"]},
+              "valence": {"type": "integer", "minimum": -10000, "maximum": 10000},
+              "arousal": {"type": "integer", "minimum": -10000, "maximum": 10000},
+              "dominance": {"type": "integer", "minimum": -10000, "maximum": 10000},
+              "intensity": {"type": "integer", "minimum": 0, "maximum": 10000},
+              "confidence": {"type": "integer", "minimum": 0, "maximum": 10000},
+              "target_subject_id": {"type": "string", "format": "uuid"},
+              "target_subject_key": {
+                "type": "object",
+                "properties": {
+                  "kind": {"type": "string", "minLength": 1, "maxLength": 32},
+                  "value": {"type": "string", "minLength": 1, "maxLength": 512}
+                },
+                "required": ["kind", "value"],
+                "additionalProperties": false
+              },
+              "target_scope": {
+                "type": "object",
+                "properties": {
+                  "kind": {"type": "string", "enum": ["WORKSPACE", "REPOSITORY", "TASK", "RUN", "AGENT"]},
+                  "id": {"type": "string", "format": "uuid"}
+                },
+                "required": ["kind", "id"],
+                "additionalProperties": false
+              },
+              "observed_at": {"type": "string", "format": "date-time"}
+            },
+            "required": ["kind", "intensity", "confidence"],
+            "additionalProperties": false
+          },
+          "minItems": 1,
+          "maxItems": 16
+        },
+        "workspace_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "action",
+        "memory_id",
+        "affects"
       ],
       "additionalProperties": false
     }

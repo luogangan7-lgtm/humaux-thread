@@ -62,6 +62,7 @@
 
 use std::sync::Arc;
 
+use humaux_domain::affect::AffectAnnotation;
 use humaux_domain::authority::{AuthorityClass, AuthorityStatus, MemoryId};
 use humaux_domain::dataclass::DataClass;
 use humaux_domain::error::ErrorCode;
@@ -284,6 +285,10 @@ struct ResolvedMemory {
     /// transaction as the row (role_retrieval_worker's own SELECT; the 0155 RESTRICTIVE subject
     /// policy exempts this role precisely so a subject-gated row still projects — §15.7).
     subject_ids: Vec<SubjectId>,
+    /// §8.5.1 / ADR-0030 D-D: the memory's `private.memory_affects` rows, read in the same
+    /// transaction (role_retrieval_worker's own SELECT) through the ONE set-based read
+    /// (`affect_repo::affects_for_memories_in_txn`), flattened into the payload by `finish_row`.
+    affects: Vec<AffectAnnotation>,
 }
 
 /// (b): resolves one `stream_log` row's bound Memory through `ops.outbox` ->
@@ -350,6 +355,11 @@ async fn resolve_memory(
     .into_iter()
     .map(SubjectId)
     .collect();
+    let affects = crate::affect_repo::affects_for_memories_in_txn(txn, tenant_id, &[memory_id])
+        .await?
+        .into_iter()
+        .map(|row| row.annotation)
+        .collect();
 
     Ok(Some(ResolvedMemory {
         memory_id: MemoryId(memory_id),
@@ -365,6 +375,7 @@ async fn resolve_memory(
         updated_at: row.try_get("updated_at")?,
         body_sha256: row.try_get("body_sha256")?,
         subject_ids,
+        affects,
     }))
 }
 
@@ -575,7 +586,10 @@ async fn finish_row(
         return (RowTerminal::SkippedByPolicy, "secret_material");
     };
     // ADR-0029 D-A: subject linkage rides the indexable payload (`subject_ids` array field).
-    let indexable = indexable.with_subject_ids(memory.subject_ids);
+    let indexable = indexable
+        .with_subject_ids(memory.subject_ids)
+        // ADR-0030 D-D: affect annotations ride the same payload (six flat array fields).
+        .with_affects(memory.affects);
 
     let registration = PrivateMemoryPointRegistration::deterministic(
         deps.family.clone(),

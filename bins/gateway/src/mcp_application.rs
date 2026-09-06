@@ -9,6 +9,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use humaux_adapters::{
+    affect_repo,
     context_repo::MemoryEnumerationParams,
     distill_repo::{ConfirmOutcome, RejectOutcome},
     memory_governance_repo::{ArchiveResult, RestoreResult},
@@ -16,6 +17,7 @@ use humaux_adapters::{
     subject_repo,
 };
 use humaux_domain::{
+    affect::{AffectWriteOp, MoodHalfLife},
     authority::MemoryId,
     confirm::{ConfirmToken, DestructiveOp},
     continuity::ProjectId,
@@ -45,7 +47,7 @@ use crate::{
 /// The only real MCP business routes currently available from Gateway. Confirm-gated
 /// destructive keys come from the closed `DestructiveOp` table (§78.2, ADR-0018), never a
 /// second literal.
-pub const SUPPORTED_OPERATION_KEYS: [&str; 14] = [
+pub const SUPPORTED_OPERATION_KEYS: [&str; 15] = [
     "remember.put",
     "recall.search",
     "context.assemble",
@@ -60,6 +62,7 @@ pub const SUPPORTED_OPERATION_KEYS: [&str; 14] = [
     DestructiveOp::MemoryUnarchive.operation_key(),
     SubjectWriteOp::Register.operation_key(),
     SubjectWriteOp::LinkKey.operation_key(),
+    AffectWriteOp::Annotate.operation_key(),
 ];
 
 /// Bootstrap-owned, authenticated MCP dispatch.  It has no client-selected
@@ -79,6 +82,10 @@ pub struct GatewayMcpApplication {
     /// §78.1 memory.restore undo window (ADR-0020). `None` keeps memory.supersede and
     /// memory.restore failing closed (both write the lifecycle log).
     undo_window: Option<Duration>,
+    /// §8.5.1 / ADR-0030 D-B frozen mood half-life policy
+    /// (`HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS`, §78.1). `None` keeps `memory.annotate_affect`
+    /// failing closed through `reject_unsupported` (a MOOD row needs the policy to stamp).
+    mood_half_life: Option<MoodHalfLife>,
     #[cfg(test)]
     trusted_continuity_scope: Option<humaux_domain::identity::AuthorizationScope>,
 }
@@ -104,9 +111,18 @@ impl GatewayMcpApplication {
             semantic_recall: None,
             confirm_token_ttl: None,
             undo_window: None,
+            mood_half_life: None,
             #[cfg(test)]
             trusted_continuity_scope: None,
         }
+    }
+
+    /// Sets the §8.5.1 mood half-life (`HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS`, ADR-0030 D-B).
+    /// A zero half-life is refused. Until set, `memory.annotate_affect` (and `memory.correct
+    /// {affects}`) fail closed through `reject_unsupported`.
+    pub fn with_mood_half_life(mut self, half_life: Duration) -> Result<Self, ErrorCode> {
+        self.mood_half_life = Some(MoodHalfLife::new(half_life)?);
+        Ok(self)
     }
 
     /// Enables the confirm-gated governance routes with the bootstrap-owned token TTL
@@ -186,6 +202,16 @@ impl GatewayMcpApplication {
         // before admission); it is RESOLVED inside `remember_in_txn`, before the Evidence is
         // written, so an unknown id/key rejects with nothing accepted or metered.
         let subjects = subject_repo::parse_declaration(value)?;
+        // §8.5.1 (ADR-0030 D-C): `affects` parse here the same way (closed sets, basis-point
+        // ranges ⇒ INVALID_INPUT before admission), resolve their target subjects inside
+        // `remember_in_txn` before the Evidence is written, and land on `evidence_affects` in
+        // that same transaction; the Distill-born memory inherits them (0157 trigger).
+        let affects = affect_repo::parse_affects(value)?;
+        let mood_half_life = match (affects.is_empty(), self.mood_half_life) {
+            (true, _) => None,
+            (false, Some(half_life)) => Some(half_life),
+            (false, None) => return self.reject_unsupported(context, operation, None).await,
+        };
         let workspace = wire.workspace_id.unwrap_or(self.remember_workspace);
         let configured_workspace = self.remember_workspace;
         let policy = self.remember_policy.clone();
@@ -210,6 +236,8 @@ impl GatewayMcpApplication {
                         None,
                         OffsetDateTime::now_utc(),
                         subjects,
+                        affects,
+                        mood_half_life,
                     )
                 },
             )
@@ -654,6 +682,58 @@ impl GatewayMcpApplication {
             .await
     }
 
+    /// §8.5.1 / ADR-0030 D-C `memory.annotate_affect` — the non-destructive affect write,
+    /// through the guard's admitted-write runner (no confirm gate, like the subject registry
+    /// ops). Kinds/labels/scope kinds are the closed domain sets and every basis-point value is
+    /// range-checked by the domain constructors: anything outside is INVALID_INPUT before
+    /// admission, never clamped.
+    async fn memory_annotate_affect(
+        &self,
+        context: &McpHttpContext,
+        operation: &OperationDescriptor,
+        raw_arguments: &str,
+        value: &Value,
+    ) -> Result<ToolOutput, ErrorCode> {
+        let memory_id =
+            MemoryId::parse(value["memory_id"].as_str().ok_or(ErrorCode::InvalidInput)?)?;
+        let inputs = affect_repo::parse_affects(value)?;
+        if inputs.is_empty() {
+            return Err(ErrorCode::InvalidInput);
+        }
+        let requested_workspace = workspace(value)?;
+        let Some(mood_half_life) = self.mood_half_life else {
+            return self
+                .reject_unsupported(context, operation, requested_workspace)
+                .await;
+        };
+        let pool = self.runtime_pool.clone();
+        let bootstrap = self.context_bootstrap.clone();
+        let catalog = self.catalog.clone();
+        self.guard
+            .run_local_write(
+                context,
+                operation,
+                requested_workspace,
+                raw_arguments,
+                move |request| async move {
+                    let result = memory::annotate_affect(
+                        pool,
+                        request.authorization().clone(),
+                        request.workspace_id(),
+                        bootstrap,
+                        memory_id,
+                        inputs,
+                        mood_half_life,
+                    )
+                    .await?;
+                    let value = serde_json::to_value(result).map_err(|_| ErrorCode::Internal)?;
+                    catalog.validate_output(ToolName::Memory, &value)?;
+                    output(value)
+                },
+            )
+            .await
+    }
+
     /// §36 `memory.supersede` through the shared §33.10 confirm gate (ADR-0018). The
     /// schema carries no `workspace_id`: the route is the credential's bound workspace,
     /// which must be the bootstrap projection stream's workspace (same rule as `memory.get`).
@@ -767,6 +847,17 @@ impl GatewayMcpApplication {
             return self.reject_unsupported(context, operation, None).await;
         };
         let subjects = subject_repo::parse_declaration(value)?;
+        // §8.5.1 / ADR-0030 D-E: a correction re-supplies the new version's affects (the old
+        // rows ride with the superseded version). Parsed before the gate (malformed ⇒
+        // INVALID_INPUT, token untouched); their target subjects resolve before the consume and
+        // the rows are written inside correct_atomically's transaction — one ticket, no second
+        // transaction.
+        let affects = affect_repo::parse_affects(value)?;
+        let mood_half_life = match (affects.is_empty(), self.mood_half_life) {
+            (true, _) => None,
+            (false, Some(half_life)) => Some(half_life),
+            (false, None) => return self.reject_unsupported(context, operation, None).await,
+        };
         let pool = self.runtime_pool.clone();
         let stream = self.context_bootstrap.stream.clone();
         let consistency_token_ttl = self.remember_policy.consistency_token_ttl();
@@ -795,6 +886,8 @@ impl GatewayMcpApplication {
                         undo_window,
                         consistency_token_ttl,
                         subjects,
+                        affects,
+                        mood_half_life,
                     )
                     .await
                 },
@@ -817,6 +910,7 @@ impl GatewayMcpApplication {
                 "commit_seq": done.commit_seq,
                 "consistency_token": done.consistency_token,
                 "subject_ids": done.subject_ids,
+                "affect_ids": done.affect_ids,
             }),
         };
         self.catalog.validate_output(ToolName::Memory, &value)?;
@@ -1258,6 +1352,10 @@ impl GatewayMcpApplication {
             })
             .transpose()?
             .unwrap_or_default();
+        // §8.5.1/ADR-0030 D-D: the explicit affect query + optional mood point, parsed the one
+        // way every affect-carrying op parses (closed sets, basis-point ranges, lo <= hi).
+        let affect = affect_repo::parse_filter(value)?;
+        let mood_congruence = affect_repo::parse_mood(value)?;
         let input = RecallSearchRequest {
             query,
             workspace_id,
@@ -1269,6 +1367,8 @@ impl GatewayMcpApplication {
                 .map(str::to_owned),
             limit,
             subject_ids,
+            affect,
+            mood_congruence,
         };
         let pool = self.runtime_pool.clone();
         let bootstrap = self.context_bootstrap.clone();
@@ -1407,6 +1507,10 @@ impl McpApplication for GatewayMcpApplication {
             key if SubjectWriteOp::parse_operation_key(key).is_some() => {
                 let op = SubjectWriteOp::parse_operation_key(key).ok_or(ErrorCode::Internal)?;
                 self.memory_subject_write(context, &operation, &raw_arguments, &value, op)
+                    .await
+            }
+            key if AffectWriteOp::parse_operation_key(key) == Some(AffectWriteOp::Annotate) => {
+                self.memory_annotate_affect(context, &operation, &raw_arguments, &value)
                     .await
             }
             _ => {

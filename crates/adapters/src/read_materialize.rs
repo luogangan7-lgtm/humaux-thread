@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use humaux_application::affect::memories_matching;
+use humaux_domain::affect::AffectFilter;
 use humaux_domain::authority::MemoryId;
 use humaux_domain::error::ErrorCode;
 use humaux_domain::identity::{AuthorizationScope, can_read};
@@ -12,7 +14,9 @@ use humaux_projection::stream::StreamKey;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::types::Uuid;
+use sqlx::types::time::OffsetDateTime;
 
+use crate::affect_repo;
 use crate::context_repo::{readable_memory_ids, set_authorization_local, visibility_from_row};
 use crate::postgres::RuntimeDbPool;
 use crate::retrieve::{OverlayCandidate, ProcessingState};
@@ -93,7 +97,7 @@ pub(crate) async fn final_memory_ids_in_txn(
     candidates: &[Uuid],
     include_archived: bool,
 ) -> Result<Vec<Uuid>, ErrorCode> {
-    final_memory_ids_about_in_txn(txn, authorization, candidates, include_archived, &[]).await
+    final_memory_ids_about_in_txn(txn, authorization, candidates, include_archived, &[], None).await
 }
 
 /// [`final_memory_ids_in_txn`] plus the §6.1.3 / ADR-0029 D-A subject re-check: when
@@ -101,12 +105,18 @@ pub(crate) async fn final_memory_ids_in_txn(
 /// caller's RLS) to at least one of them survive. Qdrant's `subject_ids` payload prefilter is
 /// never trusted on its own — this is the authoritative membership test, in the same shared
 /// gate `include_archived` lives in. Empty `subject_ids` = no subject narrowing.
+///
+/// §8.5.1 / ADR-0030 D-D: `affect` is the explicit affect query, re-checked here per annotation
+/// on the read-time effective intensity (Qdrant's flat-array prefilter is an over-approximation
+/// across annotations and cannot compute decay). ONE extra round trip for the whole candidate
+/// set (`affect_repo::AFFECTS_FOR_MEMORIES_SQL`), never a per-row query. `None` = unscoped.
 pub(crate) async fn final_memory_ids_about_in_txn(
     txn: &mut Txn<'_>,
     authorization: &AuthorizationScope,
     candidates: &[Uuid],
     include_archived: bool,
     subject_ids: &[SubjectId],
+    affect: Option<&AffectFilter>,
 ) -> Result<Vec<Uuid>, ErrorCode> {
     let readable = readable_memory_ids(txn, authorization, candidates).await?;
     let subject_filter: Option<Vec<Uuid>> =
@@ -165,11 +175,23 @@ pub(crate) async fn final_memory_ids_about_in_txn(
         .into_iter()
         .map(|row| row.try_get("memory_id").map_err(|_| ErrorCode::Internal))
         .collect::<Result<HashSet<Uuid>, ErrorCode>>()?;
-    Ok(candidates
+    let mut survivors: Vec<Uuid> = candidates
         .iter()
         .filter(|id| readable.contains(id) && eligible.contains(id))
         .copied()
-        .collect())
+        .collect();
+    if let Some(filter) = affect {
+        let rows =
+            affect_repo::affects_for_memories_in_txn(txn, authorization.tenant_id().0, &survivors)
+                .await
+                .map_err(|_| ErrorCode::DependencyUnavailable)?;
+        let matching = memories_matching(
+            filter,
+            &affect_repo::observed(&rows, OffsetDateTime::now_utc()),
+        );
+        survivors.retain(|id| matching.contains(id));
+    }
+    Ok(survivors)
 }
 
 async fn load_memories(
@@ -178,6 +200,7 @@ async fn load_memories(
     candidates: &[Uuid],
     include_archived: bool,
     subject_ids: &[SubjectId],
+    affect: Option<&AffectFilter>,
 ) -> Result<Vec<(Uuid, serde_json::Value)>, ErrorCode> {
     let eligible = final_memory_ids_about_in_txn(
         txn,
@@ -185,6 +208,7 @@ async fn load_memories(
         candidates,
         include_archived,
         subject_ids,
+        affect,
     )
     .await?;
     let rows = sqlx::query(
@@ -492,6 +516,7 @@ pub(crate) async fn materialize_final_bodies_in_txn(
         overlay,
         include_archived,
         &[],
+        None,
     )
     .await
 }
@@ -502,7 +527,11 @@ pub(crate) async fn materialize_final_bodies_in_txn(
 /// `private.evidence_subjects` in [`load_overlay`]): a not-yet-projected write about someone
 /// else never rides in on the RYW overlay, neither as a linked memory nor as raw
 /// `temporary_evidence`.
-#[allow(clippy::too_many_arguments)] // One gate, one more axis (subject) next to `include_archived`.
+///
+/// §8.5.1 / ADR-0030 D-D: with an `affect` filter the overlay's raw Evidence items are dropped
+/// too — an Evidence has no affect rows (affects hang on memories), so it can never satisfy the
+/// filter; the memories it links still enter the candidate set and pass the same gate.
+#[allow(clippy::too_many_arguments)] // One gate, two more axes (subject, affect) next to `include_archived`.
 pub(crate) async fn materialize_final_bodies_about_in_txn(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     authorization: &AuthorizationScope,
@@ -512,6 +541,7 @@ pub(crate) async fn materialize_final_bodies_about_in_txn(
     overlay: &[OverlayCandidate],
     include_archived: bool,
     subject_ids: &[SubjectId],
+    affect: Option<&AffectFilter>,
 ) -> Result<MaterializedBodies, ErrorCode> {
     let authorization = effective_authorization(authorization, expected_family, validated_key)?;
     set_authorization_local(txn, &authorization).await?;
@@ -530,8 +560,12 @@ pub(crate) async fn materialize_final_bodies_about_in_txn(
         &candidate_ids,
         include_archived,
         subject_ids,
+        affect,
     )
     .await?;
+    if affect.is_some() {
+        overlay.clear();
+    }
     let readable_memory_ids = memories.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
     for item in &mut overlay {
         item.linked_memory_ids

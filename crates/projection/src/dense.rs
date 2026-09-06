@@ -17,6 +17,7 @@
 //! 本 crate 不 import HTTP / serde_json / Qdrant SDK（§3/§78.3）：[`Condition`] 是
 //! adapter-中立的条件树，序列化成 Qdrant wire filter 是 `adapters::qdrant`（HTTP 层）的职责。
 
+use humaux_domain::affect::{AffectFilter, BasisPointRange, BasisPoints};
 use humaux_domain::identity::AuthorizationScope;
 use humaux_domain::subject::SubjectId;
 
@@ -25,6 +26,21 @@ use humaux_domain::subject::SubjectId;
 /// about_any_of`] filters on it). One spelling, shared by writer and reader — a drift here would
 /// make subject-scoped recall silently return nothing.
 pub const SUBJECT_IDS_FIELD: &str = "subject_ids";
+
+/// §8.5.1 / ADR-0030 D-D: the six FLAT array payload fields carrying a point's affect
+/// annotations (`adapters::qdrant::IndexablePayload::with_affects` writes them,
+/// [`DenseQueryFilter::with_affect`] filters on them). One annotation contributes one element
+/// to each array at the same index; Qdrant evaluates an array field as "any element matches",
+/// so a multi-clause filter is an OVER-approximation across annotations (clause A may hit one
+/// annotation, clause B another). That is by design: Qdrant is a prefilter only — the PG hydrate
+/// gate re-checks per annotation (`application::affect::memories_matching`). Same one-spelling
+/// rule as [`SUBJECT_IDS_FIELD`].
+pub const AFFECT_KINDS_FIELD: &str = "affect_kinds";
+pub const AFFECT_LABELS_FIELD: &str = "affect_labels";
+pub const AFFECT_VALENCE_FIELD: &str = "affect_valence_bp";
+pub const AFFECT_AROUSAL_FIELD: &str = "affect_arousal_bp";
+pub const AFFECT_DOMINANCE_FIELD: &str = "affect_dominance_bp";
+pub const AFFECT_INTENSITY_FIELD: &str = "affect_intensity_bp";
 
 /// Adapter-中立的 payload 条件树。`pub`：`adapters::qdrant` 需要遍历它来生成 Qdrant 的 wire
 /// JSON filter；但业务层不应该把它当"随手拼一个 filter"的入口——真正进入检索调用的值类型是
@@ -37,6 +53,12 @@ pub enum Condition {
     In {
         field: &'static str,
         values: Vec<String>,
+    },
+    /// `gte <= field <= lte`（Qdrant `range`，整数 payload；ADR-0030 的 affect basis-point 轴）。
+    Range {
+        field: &'static str,
+        gte: i64,
+        lte: i64,
     },
     /// 全部子条件为真。
     And(Vec<Condition>),
@@ -92,6 +114,71 @@ impl DenseQueryFilter {
             other => vec![other],
         };
         clauses.push(Condition::Or(arms));
+        DenseQueryFilter(Condition::And(clauses))
+    }
+
+    /// §8.5.1 / ADR-0030 D-D: narrow an already-built filter by an explicit affect query,
+    /// ANDed on top of tenant + visibility (+ subject) — never in place of them. Same consuming
+    /// shape as [`Self::about_any_of`], so §17.1's single construction point stays
+    /// [`build_dense_filter`]. `None` / an empty filter returns the filter untouched.
+    ///
+    /// Clause mapping onto the flat affect arrays ([`AFFECT_KINDS_FIELD`] …): `kinds` /
+    /// `labels_any` → `Or(Eq …)` (array-contains any), each VAD interval → `Range`,
+    /// `min_effective_intensity` → `Range` on the RAW intensity (effective ≤ raw for every row,
+    /// so the raw bound is a superset — the exact effective test is PG's).
+    pub fn with_affect(self, filter: Option<&AffectFilter>) -> Self {
+        let Some(filter) = filter.filter(|f| !f.is_empty()) else {
+            return self;
+        };
+        let mut clauses = match self.0 {
+            Condition::And(clauses) => clauses,
+            other => vec![other],
+        };
+        let any_of = |field: &'static str, values: Vec<String>| {
+            Condition::Or(
+                values
+                    .into_iter()
+                    .map(|value| Condition::Eq { field, value })
+                    .collect(),
+            )
+        };
+        let range = |field: &'static str, r: BasisPointRange| Condition::Range {
+            field,
+            gte: i64::from(r.lo.get()),
+            lte: i64::from(r.hi.get()),
+        };
+        if !filter.kinds.is_empty() {
+            clauses.push(any_of(
+                AFFECT_KINDS_FIELD,
+                filter.kinds.iter().map(|k| k.as_str().to_owned()).collect(),
+            ));
+        }
+        if !filter.labels_any.is_empty() {
+            clauses.push(any_of(
+                AFFECT_LABELS_FIELD,
+                filter
+                    .labels_any
+                    .iter()
+                    .map(|l| l.as_str().to_owned())
+                    .collect(),
+            ));
+        }
+        for (field, interval) in [
+            (AFFECT_VALENCE_FIELD, filter.valence),
+            (AFFECT_AROUSAL_FIELD, filter.arousal),
+            (AFFECT_DOMINANCE_FIELD, filter.dominance),
+        ] {
+            if let Some(interval) = interval {
+                clauses.push(range(field, interval));
+            }
+        }
+        if let Some(min) = filter.min_effective_intensity {
+            clauses.push(Condition::Range {
+                field: AFFECT_INTENSITY_FIELD,
+                gte: i64::from(min.get()),
+                lte: i64::from(BasisPoints::MAX.get()),
+            });
+        }
         DenseQueryFilter(Condition::And(clauses))
     }
 }
@@ -195,6 +282,10 @@ mod tests {
             }
             Condition::And(cs) => cs.iter().all(|c| eval(c, fields)),
             Condition::Or(cs) => cs.iter().any(|c| eval(c, fields)),
+            Condition::Range { field, gte, lte } => fields
+                .get(field)
+                .and_then(|raw| raw.parse::<i64>().ok())
+                .is_some_and(|v| v >= *gte && v <= *lte),
         }
     }
 
@@ -299,6 +390,69 @@ mod tests {
         // Empty = untouched (no vacuous `Or([])`, which Qdrant would treat as match-nothing).
         assert_eq!(
             build_dense_filter(&s, &[]).about_any_of(&[]),
+            build_dense_filter(&s, &[])
+        );
+    }
+
+    // ---- §8.5.1 / ADR-0030: affect clauses are ANDed after tenant + visibility ----
+
+    #[test]
+    fn with_affect_ands_any_of_and_ranges_after_tenant_and_visibility() {
+        use humaux_domain::affect::{AffectKind, EmotionLabel};
+        let s = scope(None, &[]);
+        let filter = AffectFilter {
+            kinds: vec![AffectKind::Emotion],
+            labels_any: vec![EmotionLabel::Frustration, EmotionLabel::Anger],
+            valence: Some(
+                BasisPointRange::new(
+                    BasisPoints::signed(-10_000).expect("bp"),
+                    BasisPoints::signed(-1).expect("bp"),
+                )
+                .expect("range"),
+            ),
+            arousal: None,
+            dominance: None,
+            min_effective_intensity: Some(BasisPoints::unit(5_000).expect("bp")),
+        };
+        let built = build_dense_filter(&s, &[]).with_affect(Some(&filter));
+        let Condition::And(clauses) = built.as_condition() else {
+            panic!("expected And")
+        };
+        assert_eq!(
+            clauses.len(),
+            6,
+            "tenant + visibility + kinds + labels + valence + min"
+        );
+        assert_eq!(
+            clauses[2],
+            Condition::Or(vec![Condition::Eq {
+                field: AFFECT_KINDS_FIELD,
+                value: "EMOTION".to_owned()
+            }])
+        );
+        assert_eq!(
+            clauses[4],
+            Condition::Range {
+                field: AFFECT_VALENCE_FIELD,
+                gte: -10_000,
+                lte: -1
+            }
+        );
+        assert_eq!(
+            clauses[5],
+            Condition::Range {
+                field: AFFECT_INTENSITY_FIELD,
+                gte: 5_000,
+                lte: 10_000
+            }
+        );
+        // None / empty = untouched.
+        assert_eq!(
+            build_dense_filter(&s, &[]).with_affect(None),
+            build_dense_filter(&s, &[])
+        );
+        assert_eq!(
+            build_dense_filter(&s, &[]).with_affect(Some(&AffectFilter::default())),
             build_dense_filter(&s, &[])
         );
     }

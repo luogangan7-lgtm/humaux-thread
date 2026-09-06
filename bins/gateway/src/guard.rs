@@ -17,6 +17,7 @@ use humaux_adapters::{
     request_guard_repo::{self, AuditTenant, EffectiveEntitlementFacts},
 };
 use humaux_domain::{
+    affect::AffectWriteOp,
     audit::{AuditEvent, AuditEventId, AuditMetadata, McpAuditAction, SYSTEM_TENANT_ID},
     confirm::{ConfirmToken, DestructiveOp, RISK_TAG_CONFIRMATION_MINTED},
     error::ErrorCode,
@@ -481,7 +482,10 @@ impl GatewayGuard {
     {
         let result = async {
             let admitted = self.admit(context, operation, requested_workspace).await?;
-            if SubjectWriteOp::parse_operation_key(operation.operation_key()).is_none()
+            // ADR-0028 D-F / ADR-0030 D-C: the two closed non-destructive write sets (subject
+            // registry ops, affect annotation) — never a generic "any write" admission.
+            if (SubjectWriteOp::parse_operation_key(operation.operation_key()).is_none()
+                && AffectWriteOp::parse_operation_key(operation.operation_key()).is_none())
                 || operation.meter_kind() != MeterKind::Ordinary
             {
                 return self

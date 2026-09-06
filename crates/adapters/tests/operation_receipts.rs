@@ -91,6 +91,8 @@ fn command(
         event_kind: "USER_MESSAGE".into(),
         event_payload: serde_json::json!({"content": content}),
         subjects: humaux_domain::subject::SubjectDeclaration::default(),
+        affects: Vec::new(),
+        mood_half_life: None,
     }
 }
 

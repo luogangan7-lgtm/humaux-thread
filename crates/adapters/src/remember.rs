@@ -17,12 +17,14 @@ use sqlx::Row;
 use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
+use humaux_domain::affect::MoodHalfLife;
 use humaux_domain::error::ErrorCode;
 use humaux_domain::evidence::{EvidenceOriginClass, EvidencePayloadSha256};
 use humaux_domain::ids::TenantId;
 use humaux_domain::subject::SubjectDeclaration;
 use humaux_projection::stream::StreamKey;
 
+use crate::affect_repo::{self, AffectInput, AffectParent};
 use crate::postgres::RuntimeDbPool;
 use crate::retrieve::{self, TokenClaims};
 
@@ -47,6 +49,10 @@ pub enum RememberError {
     /// the tenant's RLS (unknown, merged-away or another tenant's id/key ⇒ `INVALID_INPUT`), or
     /// the resolve itself failed. Raised BEFORE the first write, so nothing is committed.
     Subject(ErrorCode),
+    /// §8.5.1 (ADR-0030 D-C): an affect in `cmd.affects` was refused — its `target_subject`
+    /// did not resolve (`INVALID_INPUT`, raised BEFORE the first write like [`Self::Subject`]),
+    /// or a MOOD arrived with no half-life policy (`DEPENDENCY_UNAVAILABLE`).
+    Affect(ErrorCode),
 }
 
 impl From<sqlx::Error> for RememberError {
@@ -64,6 +70,7 @@ impl std::fmt::Display for RememberError {
             }
             Self::BatchExhausted => write!(f, "BATCH_EXHAUSTED (§34.1)"),
             Self::Subject(code) => write!(f, "subject declaration rejected: {code}"),
+            Self::Affect(code) => write!(f, "affect declaration rejected: {code}"),
         }
     }
 }
@@ -142,6 +149,14 @@ pub struct RememberCommand {
     /// `private.evidence_subjects` in the same transaction; an unknown id/key is
     /// [`RememberError::Subject`]`(INVALID_INPUT)` and nothing is written.
     pub subjects: SubjectDeclaration,
+    /// §8.5.1 (ADR-0030 D-C): the affects declared at `remember.put`. Their `target_subject`
+    /// ids/keys are resolved with `subjects` BEFORE the first write; the rows land on
+    /// `private.evidence_affects` in this same transaction (0157) and reach every memory born
+    /// from this Evidence through the `memory_evidence` PRIMARY trigger. Empty = none.
+    pub affects: Vec<AffectInput>,
+    /// The frozen MOOD half-life policy stamped onto MOOD rows; required only when `affects`
+    /// carries a MOOD ([`RememberError::Affect`]`(DEPENDENCY_UNAVAILABLE)` otherwise).
+    pub mood_half_life: Option<MoodHalfLife>,
 }
 
 /// `remember()`'s accepted result (§34 / §15.5, verbatim field set).
@@ -480,6 +495,11 @@ pub async fn remember_in_txn(
         crate::subject_repo::resolve_declaration_in_txn(txn, cmd.tenant_id, &cmd.subjects)
             .await
             .map_err(RememberError::Subject)?;
+    // §8.5.1 (ADR-0030 D-C): the affects' target subjects resolve under the same rule, also
+    // before the first write — an unknown target refuses the whole put with nothing accepted.
+    let affect_targets = affect_repo::resolve_targets_in_txn(txn, cmd.tenant_id, &cmd.affects)
+        .await
+        .map_err(RememberError::Affect)?;
 
     let commit_seq = next_commit_seq(txn).await?;
     let evidence_id = create_evidence_object(txn, &cmd).await?;
@@ -488,6 +508,19 @@ pub async fn remember_in_txn(
     // in the Distill hop and inherits it through link_memory_subjects rule 3a).
     crate::subject_repo::declare_evidence_in_txn(txn, cmd.tenant_id, evidence_id, &subjects)
         .await?;
+    // The affect declaration rides on the Evidence the same way (0157 evidence_affects, the
+    // sole affect issuer); the newborn memory's copy is the memory_evidence PRIMARY trigger's.
+    affect_repo::insert_in_txn(
+        txn,
+        cmd.tenant_id,
+        AffectParent::Evidence,
+        evidence_id,
+        &cmd.affects,
+        &affect_targets,
+        cmd.mood_half_life,
+    )
+    .await
+    .map_err(RememberError::Affect)?;
 
     // §34.1: batch_id present -> redeem (BATCH_EXHAUSTED rolls the whole transaction back,
     // never partially — see this function's doc); absent -> ticket untouched, both output

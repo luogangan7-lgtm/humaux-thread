@@ -3,6 +3,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use humaux_adapters::{
+    affect_repo::{self, AffectInput, AffectRow, AnnotateDone},
     context_repo::{
         self, BindingWriteOutcome, BindingWriteRequest, MaterializedMemory,
         MemoryEnumerationParams, materialize_memory_enumeration, materialize_memory_get,
@@ -19,6 +20,7 @@ use humaux_adapters::{
     subject_repo,
 };
 use humaux_domain::{
+    affect::{BasisPoints, MoodHalfLife},
     authority::MemoryId,
     confirm::DestructiveOp,
     error::ErrorCode,
@@ -66,6 +68,88 @@ pub(crate) struct MemoryItem {
     #[serde(flatten)]
     item: ContextItem,
     subjects: Vec<Uuid>,
+    /// §8.5.1 (ADR-0030 D-D): the memory's affect annotations, raw row + read-time
+    /// `effective_intensity` (never persisted). Empty = un-annotated.
+    affects: Vec<AffectItem>,
+}
+
+/// One affect annotation as `memory.get` / `memory.enumerate` render it (ADR-0030 D-D).
+#[derive(Serialize)]
+pub(crate) struct AffectItem {
+    affect_id: Uuid,
+    kind: &'static str,
+    label: Option<&'static str>,
+    valence: Option<i16>,
+    arousal: Option<i16>,
+    dominance: Option<i16>,
+    intensity: i16,
+    /// `effective_intensity(now)`: equals `intensity` for an EMOTION; decayed for a MOOD.
+    effective_intensity: i16,
+    confidence: i16,
+    evidence_id: Uuid,
+    target_subject_id: Option<Uuid>,
+    target_scope: Option<AffectScopeItem>,
+    observed_at: String,
+    half_life_seconds: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AffectScopeItem {
+    kind: &'static str,
+    id: Uuid,
+}
+
+fn affect_item(row: AffectRow, effective: BasisPoints) -> Result<AffectItem, ErrorCode> {
+    let a = row.annotation;
+    Ok(AffectItem {
+        affect_id: row.affect_id,
+        kind: a.kind.as_str(),
+        label: a.label.map(|l| l.as_str()),
+        valence: a.valence.map(BasisPoints::get),
+        arousal: a.arousal.map(BasisPoints::get),
+        dominance: a.dominance.map(BasisPoints::get),
+        intensity: a.intensity.get(),
+        effective_intensity: effective.get(),
+        confidence: a.confidence.get(),
+        evidence_id: row.evidence_id,
+        target_subject_id: a.target_subject.map(|s| s.0),
+        target_scope: a.target_scope.map(|s| AffectScopeItem {
+            kind: s.kind.as_str(),
+            id: s.id,
+        }),
+        observed_at: row
+            .observed_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|_| ErrorCode::Internal)?,
+        half_life_seconds: row.half_life.map(|h| h.duration().as_secs()),
+    })
+}
+
+/// The affects of every memory in `materialized`, `memory_id → items`, read under the caller's
+/// RLS in one round trip with `effective_intensity(now)` derived per row (ADR-0030 D-B).
+async fn affects_by_memory(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    materialized: &MaterializedMemory,
+) -> Result<BTreeMap<Uuid, Vec<AffectItem>>, ErrorCode> {
+    let memory_ids: Vec<Uuid> = materialized
+        .bodies
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            MaterializedItem::Memory { memory_id, .. } => Some(*memory_id),
+            _ => None,
+        })
+        .collect();
+    let rows = affect_repo::affects_for_memories(pool, authorization, &memory_ids).await?;
+    let observed = affect_repo::observed(&rows, time::OffsetDateTime::now_utc());
+    let mut out: BTreeMap<Uuid, Vec<AffectItem>> = BTreeMap::new();
+    for (row, observed) in rows.into_iter().zip(observed) {
+        out.entry(row.memory_id)
+            .or_default()
+            .push(affect_item(row, observed.effective_intensity)?);
+    }
+    Ok(out)
 }
 
 pub(crate) async fn get<T>(
@@ -92,9 +176,11 @@ pub(crate) async fn get<T>(
         memory_id,
     )
     .await?;
+    let affects = affects_by_memory(&pool, &authorization, &materialized).await?;
     let archived = materialized.archived;
     accept_memory_envelope(
         materialized,
+        affects,
         &request,
         &bootstrap.binary_build,
         "direct_get",
@@ -198,8 +284,10 @@ pub(crate) async fn enumerate<T>(
         snapshot_id: page.snapshot_id,
         next_cursor: page.next_cursor,
     };
+    let affects = affects_by_memory(&pool, &authorization, &page.memory).await?;
     accept_memory_envelope(
         page.memory,
+        affects,
         &request,
         &bootstrap.binary_build,
         "enumerate",
@@ -297,6 +385,10 @@ pub(crate) async fn restore(
 /// (0154 trigger on `superseded_by`); an explicit `subjects` declaration is resolved BEFORE the
 /// token is consumed (unknown ⇒ `INVALID_INPUT`, token untouched) and applied in the same
 /// transaction. `CorrectDone::subject_ids` is the version's full subject id list.
+///
+/// §8.5.1 (ADR-0030 D-E): `affects` are the new version's annotations, resolved before the
+/// consume and written inside `correct_atomically`'s transaction (`CorrectDone::affect_ids`) —
+/// one ticket, never a second transaction.
 #[allow(clippy::too_many_arguments)] // one confirmed-write's worth of trusted, gate-built inputs
 pub(crate) async fn correct(
     pool: Arc<RuntimeDbPool>,
@@ -308,6 +400,8 @@ pub(crate) async fn correct(
     undo_window: Duration,
     consistency_token_ttl: Duration,
     subjects: SubjectDeclaration,
+    affects: Vec<AffectInput>,
+    mood_half_life: Option<MoodHalfLife>,
 ) -> Result<CorrectDone, ErrorCode> {
     let workspace = write
         .request
@@ -333,6 +427,8 @@ pub(crate) async fn correct(
             undo_window,
             consistency_token_ttl,
             subjects,
+            affects,
+            mood_half_life,
         },
     )
     .await
@@ -474,6 +570,54 @@ pub(crate) async fn link_subject_key(
     subject_repo::link_key(&pool, &authorization, subject_id, &key)
         .await
         .map(SubjectItem::from)
+}
+
+/// `memory.annotate_affect` result shape (ADR-0030 D-C).
+#[derive(Serialize)]
+pub(crate) struct AnnotateResult {
+    memory_id: Uuid,
+    pub(crate) affect_ids: Vec<Uuid>,
+    stream_seq: i64,
+    commit_seq: i64,
+}
+
+impl From<AnnotateDone> for AnnotateResult {
+    fn from(done: AnnotateDone) -> Self {
+        AnnotateResult {
+            memory_id: done.memory_id,
+            affect_ids: done.affect_ids,
+            stream_seq: done.stream_seq,
+            commit_seq: done.commit_seq,
+        }
+    }
+}
+
+/// §8.5.1 / ADR-0030 D-C `memory.annotate_affect`: appends immutable affect rows to the visible
+/// active head `memory_id` (provenance = its PRIMARY Evidence) and issues the re-projection
+/// ticket on the bootstrap stream. Same workspace rule as `memory.get`; the tenant is the
+/// credential's. Not confirm-gated: nothing is deleted, superseded or hidden. Also the sole
+/// path `memory.correct {affects}` re-supplies the new version's affects through.
+pub(crate) async fn annotate_affect(
+    pool: Arc<RuntimeDbPool>,
+    authorization: AuthorizationScope,
+    requested_workspace: Option<WorkspaceId>,
+    bootstrap: ContextBootstrap,
+    memory_id: MemoryId,
+    inputs: Vec<AffectInput>,
+    mood_half_life: MoodHalfLife,
+) -> Result<AnnotateResult, ErrorCode> {
+    let (authorization, _scope, _family) =
+        read_scope(authorization, requested_workspace, &bootstrap)?;
+    affect_repo::annotate(
+        &pool,
+        &authorization,
+        &bootstrap.stream,
+        memory_id,
+        &inputs,
+        mood_half_life,
+    )
+    .await
+    .map(AnnotateResult::from)
 }
 
 /// §36 `memory.reject`, second (confirmed) call (ADR-0026, Card 6). Marks a pending candidate
@@ -618,8 +762,10 @@ fn read_scope(
     Ok((authorization, scope, family))
 }
 
+#[allow(clippy::too_many_arguments)] // One envelope assembly over the read's fixed inputs + the affect axis.
 fn accept_memory_envelope<T>(
     mut materialized: MaterializedMemory,
+    mut affects: BTreeMap<Uuid, Vec<AffectItem>>,
     request: &RetrievalRequest,
     binary_build: &str,
     lane: &str,
@@ -641,6 +787,7 @@ fn accept_memory_envelope<T>(
                     archived,
                 },
                 subjects: materialized.subjects.remove(&memory_id).unwrap_or_default(),
+                affects: affects.remove(&memory_id).unwrap_or_default(),
             }),
             _ => Err(ErrorCode::Internal),
         })

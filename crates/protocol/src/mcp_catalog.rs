@@ -793,7 +793,7 @@ mod tests {
                 .as_array()
                 .expect("stable output union")
                 .len(),
-            14
+            15
         );
         assert_eq!(advertised["oneOf"][0]["$ref"], "#/$defs/Envelope");
         // ADR-0018: memory.supersede's two results are the third and fourth branches.
@@ -819,6 +819,14 @@ mod tests {
         // and the single-subject result of memory.subject_register / memory.subject_link_key.
         assert_eq!(advertised["oneOf"][12]["$ref"], "#/$defs/SubjectsPage");
         assert_eq!(advertised["oneOf"][13]["$ref"], "#/$defs/Subject");
+        // ADR-0030: memory.annotate_affect's result (affect rows + re-projection ticket).
+        assert_eq!(advertised["oneOf"][14]["$ref"], "#/$defs/AffectAnnotated");
+        // D-D: the Envelope item may carry its affect annotations with effective_intensity.
+        assert_eq!(
+            advertised["$defs"]["Envelope"]["properties"]["items"]["items"]["properties"]["affects"]
+                ["items"]["required"][3],
+            "effective_intensity"
+        );
         // D-D: the Envelope item may carry its subject links (memory.get / memory.enumerate).
         assert_eq!(
             advertised["$defs"]["Envelope"]["properties"]["items"]["items"]["properties"]["subjects"]

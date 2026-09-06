@@ -393,6 +393,14 @@
       "type": "string",
       "format": "uuid"
      }
+    },
+    "affect_ids": {
+     "description": "§8.5.1 (ADR-0030 D-E): the affect rows appended to the new version from the call's `affects` (empty when none were supplied).",
+     "type": "array",
+     "items": {
+      "type": "string",
+      "format": "uuid"
+     }
     }
    },
    "additionalProperties": false
@@ -580,6 +588,39 @@
    },
    "additionalProperties": false
   },
+  "AffectAnnotated": {
+   "type": "object",
+   "description": "memory.annotate_affect executed (§8.5.1, ADR-0030 D-C): the immutable affect rows appended to memory_id and the MEMORY_LIFECYCLE re-projection ticket (stream_seq/commit_seq) issued on the memory's stream so the Qdrant point picks up the affect payload.",
+   "required": [
+    "memory_id",
+    "affect_ids",
+    "stream_seq",
+    "commit_seq"
+   ],
+   "properties": {
+    "memory_id": {
+     "type": "string",
+     "format": "uuid"
+    },
+    "affect_ids": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "format": "uuid"
+     },
+     "minItems": 1
+    },
+    "stream_seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "commit_seq": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "additionalProperties": false
+  },
   "SubjectsPage": {
    "type": "object",
    "description": "memory.enumerate {subjects:true} (§6.1.3, ADR-0028, card 8): the caller's tenant's registered subjects (live heads only), newest first, with their external keys and roles. Read-only; another tenant's registry is absent under RLS, never filtered in application code.",
@@ -676,6 +717,9 @@
   },
   {
    "$ref": "#/$defs/Subject"
+  },
+  {
+   "$ref": "#/$defs/AffectAnnotated"
   }
  ]
 }

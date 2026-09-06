@@ -608,7 +608,7 @@ fn remember_err(error: remember::RememberError) -> ErrorCode {
         remember::RememberError::Db(error) => candidate_db_error(error),
         remember::RememberError::ConsistencyTokenExpiryNotFuture
         | remember::RememberError::BatchExhausted => ErrorCode::Conflict,
-        remember::RememberError::Subject(code) => code,
+        remember::RememberError::Subject(code) | remember::RememberError::Affect(code) => code,
     }
 }
 
@@ -994,6 +994,8 @@ pub async fn confirm_candidate_atomically(
         event_kind: "MANUAL_NOTE".to_owned(),
         event_payload: candidate.body.clone(),
         subjects: humaux_domain::subject::SubjectDeclaration::default(),
+        affects: Vec::new(),
+        mood_half_life: None,
     };
     let evidence_id = remember::create_evidence_object(&mut txn, &cmd)
         .await

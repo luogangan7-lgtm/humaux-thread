@@ -26,6 +26,7 @@ use humaux_adapters::{
     quota_repo::RatePolicy,
 };
 use humaux_domain::{
+    affect::{AffectAnnotation, AffectKind, BasisPoints, EmotionLabel},
     authority::{AuthorityClass, AuthorityStatus},
     context::ContextBudget,
     dataclass::DataClass,
@@ -198,7 +199,13 @@ fn application_with_budget(
     .expect("positive fixture confirm-token TTL")
     .with_undo_window(Duration::from_secs(86_400))
     .expect("positive fixture undo window")
+    .with_mood_half_life(MOOD_HALF_LIFE)
+    .expect("positive fixture mood half-life")
 }
+
+/// §8.5.1 / ADR-0030 D-B fixture policy (`HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS` in the binary
+/// fixture below): six hours, so a MOOD observed two half-lives ago reads at a quarter.
+const MOOD_HALF_LIFE: Duration = Duration::from_secs(21_600);
 
 fn semantic_scanner() -> Arc<LocalSecretScanner> {
     Arc::new(
@@ -606,6 +613,70 @@ fn link_memory_subject(handle: &mut Handle, memory_id: Uuid, subject_id: Uuid) {
             &[&handle.tenant_id, &memory_id, &subject_id],
         )
         .expect("owner links memory to subject");
+}
+
+/// §8.5.1/ADR-0030 fixture: one owner-side `private.memory_affects` row in the shape
+/// `affect_repo::annotate` writes (provenance = the record's PRIMARY Evidence). `observed_ago_secs`
+/// backdates `observed_at` so a MOOD row reads decayed through the real read path.
+#[allow(clippy::too_many_arguments)] // one row's worth of fixture columns
+fn seed_affect_row(
+    handle: &mut Handle,
+    record: &ScopedContextRecord,
+    kind: &str,
+    label: &str,
+    valence: i16,
+    arousal: i16,
+    intensity: i16,
+    target_subject: Option<Uuid>,
+    observed_ago_secs: f64,
+    half_life_seconds: Option<i32>,
+) -> Uuid {
+    handle
+        .admin
+        .query_one(
+            "INSERT INTO private.memory_affects \
+               (tenant_id, memory_id, affect_kind, label, valence_bp, arousal_bp, intensity_bp, \
+                confidence_bp, evidence_id, target_subject_id, observed_at, half_life_seconds) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 10000, $8, $9, \
+                     now() - make_interval(secs => $10), $11) RETURNING affect_id",
+            &[
+                &handle.tenant_id,
+                &record.memory_id,
+                &kind,
+                &label,
+                &valence,
+                &arousal,
+                &intensity,
+                &record.evidence_id,
+                &target_subject,
+                &observed_ago_secs,
+                &half_life_seconds,
+            ],
+        )
+        .expect("owner seeds affect row")
+        .get(0)
+}
+
+/// The Qdrant-side twin of [`seed_affect_row`] for the worker-less harness (the projection
+/// worker would build exactly this from the PG row).
+fn affect_annotation(
+    kind: AffectKind,
+    label: EmotionLabel,
+    valence: i16,
+    arousal: i16,
+    intensity: i16,
+) -> AffectAnnotation {
+    AffectAnnotation {
+        kind,
+        label: Some(label),
+        valence: Some(BasisPoints::signed(valence).expect("fixture valence")),
+        arousal: Some(BasisPoints::signed(arousal).expect("fixture arousal")),
+        dominance: None,
+        intensity: BasisPoints::unit(intensity).expect("fixture intensity"),
+        confidence: BasisPoints::MAX,
+        target_subject: None,
+        target_scope: None,
+    }
 }
 
 fn returned_memory_ids(structured: &Value) -> BTreeSet<String> {
@@ -1519,7 +1590,7 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 &prefix,
                 &wire,
                 &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
-                16,
+                48,
             );
             let first = handle.seed_workspace_visible_context_record();
             let second = handle.seed_workspace_visible_context_record();
@@ -1538,6 +1609,34 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
             link_memory_subject(&mut handle, second.memory_id, subject_b);
             link_memory_subject(&mut handle, third.memory_id, subject_a);
             link_memory_subject(&mut handle, third.memory_id, subject_b);
+            // §8.5.1/ADR-0030 D-D affect matrix (PG rows of record). first: EMOTION FRUSTRATION
+            // about A (never decays). second: NO row (its Qdrant payload will claim FRUSTRATION —
+            // the hydrate re-check witness). third: MOOD CALM observed two half-lives ago, so its
+            // read-time effective intensity is 8200 / 4 = 2050 while the row keeps 8200.
+            seed_affect_row(
+                &mut handle,
+                &first,
+                "EMOTION",
+                "FRUSTRATION",
+                -8_000,
+                5_000,
+                9_000,
+                Some(subject_a),
+                0.0,
+                None,
+            );
+            seed_affect_row(
+                &mut handle,
+                &third,
+                "MOOD",
+                "CALM",
+                6_000,
+                -4_000,
+                8_200,
+                None,
+                2.0 * MOOD_HALF_LIFE.as_secs_f64(),
+                Some(i32::try_from(MOOD_HALF_LIFE.as_secs()).expect("fixture half-life fits i32")),
+            );
             let first_point = Uuid::new_v4();
             let second_point = Uuid::new_v4();
             let third_point = Uuid::new_v4();
@@ -1609,11 +1708,24 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 .expect("semantic upsert permit");
                 let sa = humaux_domain::subject::SubjectId(subject_a);
                 let sb = humaux_domain::subject::SubjectId(subject_b);
-                let first_payload = semantic_payload(&handle, first_updated).with_subject_ids(vec![sa]);
-                let second_payload =
-                    semantic_payload(&handle, second_updated).with_subject_ids(vec![sa, sb]);
-                let third_payload =
-                    semantic_payload(&handle, third_updated).with_subject_ids(vec![sa, sb]);
+                let frustration =
+                    affect_annotation(AffectKind::Emotion, EmotionLabel::Frustration, -8_000, 5_000, 9_000);
+                let first_payload = semantic_payload(&handle, first_updated)
+                    .with_subject_ids(vec![sa])
+                    .with_affects(vec![frustration.clone()]);
+                // Tampered/stale payload: claims FRUSTRATION, PG holds no affect row.
+                let second_payload = semantic_payload(&handle, second_updated)
+                    .with_subject_ids(vec![sa, sb])
+                    .with_affects(vec![frustration]);
+                let third_payload = semantic_payload(&handle, third_updated)
+                    .with_subject_ids(vec![sa, sb])
+                    .with_affects(vec![affect_annotation(
+                        AffectKind::Mood,
+                        EmotionLabel::Calm,
+                        6_000,
+                        -4_000,
+                        8_200,
+                    )]);
                 let vector = semantic_vector(query);
                 upsert(
                     transport.as_ref(),
@@ -1729,6 +1841,96 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 )
                 .await;
                 assert_eq!(status, 400, "malformed subject id is INVALID_INPUT: {malformed}");
+
+                // §8.5.1/ADR-0030 D-D: affect-filtered recall through the real Gateway + real
+                // Qdrant flat-array prefilter + real PG re-check per annotation on the read-time
+                // effective intensity. `second` passes every Qdrant prefilter it claims and is
+                // dropped by `final_memory_ids_about_in_txn` (no PG row); `third`'s MOOD passes
+                // the raw-intensity prefilter (8200) and is dropped by the effective test (2050).
+                let affect_recall = |affect: Value| {
+                    recall_call(
+                        address,
+                        Some(&credential.bearer),
+                        json!({
+                            "query":query,
+                            "workspace_id":workspace_id,
+                            "mode":"semantic",
+                            "affect":affect,
+                        }),
+                    )
+                };
+                for (affect, expected, label) in [
+                    (json!({"labels_any":["FRUSTRATION"]}), vec![&first], "label any-of: tampered second dropped"),
+                    (json!({"valence":[-10000,-1]}), vec![&first], "negative valence interval"),
+                    (json!({"kinds":["MOOD"]}), vec![&third], "kind MOOD"),
+                    (json!({"min_effective_intensity":5000}), vec![&first], "min effective: decayed mood out, emotion in"),
+                    (json!({"labels_any":["JOY"]}), vec![], "a label nothing carries"),
+                    (json!({"kinds":["EMOTION"],"labels_any":["FRUSTRATION"],"arousal":[0,10000]}), vec![&first], "ANDed clauses"),
+                ] {
+                    let (status, scoped) = affect_recall(affect.clone()).await;
+                    assert_eq!(status, 200, "affect recall {label}: {scoped}");
+                    let scoped = assert_tool_response(&scoped, ToolName::Recall);
+                    assert_eq!(
+                        returned_memory_ids(scoped),
+                        expected
+                            .iter()
+                            .map(|r| r.memory_id.to_string())
+                            .collect::<BTreeSet<_>>(),
+                        "{label} ({affect}): {scoped}"
+                    );
+                }
+                let (status, inverted) = affect_recall(json!({"valence":[1,-1]})).await;
+                assert_eq!(status, 400, "lo > hi is INVALID_INPUT: {inverted}");
+                // Mood-congruent late rerank: a permutation of the visible set — all three still
+                // return, the closest annotation comes first, `reranked_count` names the count.
+                for ((valence, arousal), expected_first, label) in [
+                    ((-8_000, 5_000), &first, "frustrated reader → the FRUSTRATION memory first"),
+                    ((6_000, -4_000), &third, "calm reader → the CALM memory first"),
+                ] {
+                    let (status, ranked) = recall_call(
+                        address,
+                        Some(&credential.bearer),
+                        json!({
+                            "query":query,
+                            "workspace_id":workspace_id,
+                            "mode":"semantic",
+                            "mood_congruence":{"valence":valence,"arousal":arousal},
+                        }),
+                    )
+                    .await;
+                    assert_eq!(status, 200, "mood recall {label}: {ranked}");
+                    let ranked = assert_tool_response(&ranked, ToolName::Recall);
+                    let items = ranked["items"].as_array().expect("items");
+                    assert_eq!(items.len(), 3, "{label}: rerank never narrows: {ranked}");
+                    assert_eq!(items[0]["memory_id"], expected_first.memory_id.to_string(), "{label}: {ranked}");
+                    assert_eq!(ranked["completeness"]["reranked_count"], 3, "{label}: {ranked}");
+                }
+                // Card E1 speed goal: recall p50 with / without the affect filter (numbers only;
+                // card 24 sets the baseline).
+                let mut plain = Vec::new();
+                let mut filtered = Vec::new();
+                for _ in 0..5 {
+                    let started = Instant::now();
+                    let (status, _) = recall_call(
+                        address,
+                        Some(&credential.bearer),
+                        json!({"query":query,"workspace_id":workspace_id,"mode":"semantic"}),
+                    )
+                    .await;
+                    assert_eq!(status, 200);
+                    plain.push(started.elapsed());
+                    let started = Instant::now();
+                    let (status, _) = affect_recall(json!({"labels_any":["FRUSTRATION"]})).await;
+                    assert_eq!(status, 200);
+                    filtered.push(started.elapsed());
+                }
+                plain.sort();
+                filtered.sort();
+                eprintln!(
+                    "recall p50 without affect filter = {} ms; with affect filter = {} ms (n=5 each)",
+                    plain[2].as_millis(),
+                    filtered[2].as_millis()
+                );
                 assert_eq!(no_token["provenance"]["projection_version"]["id"], "v1");
                 assert_eq!(
                     no_token["provenance"]["embedding_model_id"]["id"],
@@ -3080,6 +3282,10 @@ impl GatewayProcessConfig {
                 "300".into(),
             ),
             ("HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS".into(), "86400".into()),
+            (
+                "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS".into(),
+                "21600".into(),
+            ),
             (
                 "HUMAUX_GATEWAY_REMEMBER_TENANT_ID".into(),
                 handle.tenant_id.to_string(),
@@ -6698,5 +6904,418 @@ fn native_mcp_subject_registry_declaration_and_linkage_acceptance() {
         foreign_rt
             .block_on(stop_server(foreign_server))
             .expect("foreign server shutdown");
+    });
+}
+
+// ===========================================================================================
+// §8.5.1 / ADR-0030 (card E1): affect annotation axis through the real MCP surface.
+// ===========================================================================================
+
+async fn annotate_call(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    memory_id: Uuid,
+    affects: Value,
+) -> (u16, Value) {
+    memory_call(
+        address,
+        bearer,
+        request_id,
+        json!({ "action": "annotate_affect", "memory_id": memory_id, "affects": affects }),
+    )
+    .await
+}
+
+/// `(kind, label, valence_bp, intensity_bp, target_subject_id)` rows for one memory, owner view.
+#[allow(clippy::type_complexity)] // test helper returns the full affect witness tuple; a named alias here would only rename the shape the assertions read.
+fn affect_rows(
+    handle: &mut Handle,
+    memory_id: Uuid,
+) -> Vec<(String, Option<String>, Option<i16>, i16, Option<Uuid>)> {
+    handle
+        .admin
+        .query(
+            "SELECT affect_kind, label, valence_bp, intensity_bp, target_subject_id \
+             FROM private.memory_affects WHERE memory_id = $1 ORDER BY created_at, affect_id",
+            &[&memory_id],
+        )
+        .expect("read affect rows")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+        .collect()
+}
+
+/// `remember.put {affects}` (ADR-0030 D-C, main-line ruling 2): the declaration rides with the
+/// Evidence in remember_in_txn's transaction.
+async fn remember_with_affects(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    workspace_id: Uuid,
+    content: &str,
+    affects: Value,
+) -> (u16, Value) {
+    let args = json!({
+        "operation": "put",
+        "content": content,
+        "idempotency_key": format!("cardE1-{}", Uuid::now_v7()),
+        "workspace_id": workspace_id,
+        "affects": affects,
+    });
+    raw_request(
+        address,
+        &tool_call_headers("remember", bearer),
+        &rpc(request_id, "tools/call", call_params("remember", args)),
+    )
+    .await
+}
+
+/// `(kind, label, valence_bp, intensity_bp, target_subject_id, half_life_seconds)` rows of the
+/// 0157 write-side carrier for one Evidence, owner view.
+#[allow(clippy::type_complexity)] // test helper returns the full carrier witness tuple.
+fn evidence_affect_rows(
+    handle: &mut Handle,
+    evidence_id: Uuid,
+) -> Vec<(
+    String,
+    Option<String>,
+    Option<i16>,
+    i16,
+    Option<Uuid>,
+    Option<i32>,
+)> {
+    handle
+        .admin
+        .query(
+            "SELECT affect_kind, label, valence_bp, intensity_bp, target_subject_id, half_life_seconds \
+             FROM private.evidence_affects WHERE evidence_id = $1 ORDER BY created_at, affect_id",
+            &[&evidence_id],
+        )
+        .expect("read evidence affect rows")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))
+        .collect()
+}
+
+fn affect_by_kind<'a>(affects: &'a [Value], kind: &str) -> &'a Value {
+    affects
+        .iter()
+        .find(|a| a["kind"] == kind)
+        .unwrap_or_else(|| panic!("no {kind} annotation in {affects:?}"))
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One HTTP fixture carries the whole card-E1 governance gate.
+fn native_mcp_affect_annotation_governance_acceptance() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>("native_mcp_affects", |mut handle| {
+        handle.assert_gateway_login();
+        let prefix = format!("mcaf{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let wire = format!("{prefix}.{}", "e".repeat(32));
+        let credential = handle.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &prefix,
+            &wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+            96,
+        );
+        let record = handle.seed_workspace_visible_context_record();
+        let m1 = record.memory_id;
+        let runtime_handle = handle.rt.handle().clone();
+        let runtime = runtime_handle
+            .block_on(handle.fresh_runtime())
+            .expect("affects runtime");
+        let app = application(&handle, runtime);
+        runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let bearer = credential.bearer.as_str();
+            let person = register_subject(address, bearer, 1, "PERSON", "Ada Lovelace", &[]).await;
+
+            // 1. annotate: an EMOTION (FRUSTRATION, negative valence, high intensity) about the
+            //    person + a MOOD (ANXIETY) observed two half-lives ago.
+            let two_half_lives_ago = (time::OffsetDateTime::now_utc() - 2 * MOOD_HALF_LIFE)
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("rfc3339");
+            let (status, annotated) = annotate_call(
+                address,
+                bearer,
+                2,
+                m1,
+                json!([
+                    {"kind":"EMOTION","label":"FRUSTRATION","valence":-8000,"arousal":5000,
+                     "dominance":-4000,"intensity":9000,"confidence":10000,
+                     "target_subject_id":person},
+                    {"kind":"MOOD","label":"ANXIETY","valence":-3000,"arousal":2000,
+                     "intensity":8200,"confidence":7000,"observed_at":two_half_lives_ago},
+                ]),
+            )
+            .await;
+            assert_eq!(status, 200, "{annotated}");
+            let structured = assert_tool_response(&annotated, ToolName::Memory);
+            assert_eq!(structured["memory_id"], m1.to_string(), "{annotated}");
+            assert_eq!(structured["affect_ids"].as_array().expect("affect_ids").len(), 2);
+            assert!(structured["stream_seq"].is_u64() && structured["commit_seq"].is_u64());
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    affect_rows(&mut handle, m1),
+                    vec![
+                        ("EMOTION".to_owned(), Some("FRUSTRATION".to_owned()), Some(-8000), 9000, Some(person)),
+                        ("MOOD".to_owned(), Some("ANXIETY".to_owned()), Some(-3000), 8200, None),
+                    ]
+                );
+            });
+
+            // 2. Read side (D-D): memory.get carries both rows with the read-time effective
+            //    intensity — the EMOTION never decays, the MOOD reads at a quarter while the row
+            //    keeps its raw value (D-B: decay is derived, never written).
+            let (status, got) = memory_call(address, bearer, 3, json!({"action":"get","memory_id":m1})).await;
+            assert_eq!(status, 200, "{got}");
+            let envelope = assert_tool_response(&got, ToolName::Memory);
+            let affects = envelope["items"][0]["affects"].as_array().expect("affects");
+            assert_eq!(affects.len(), 2, "{got}");
+            let emotion = affect_by_kind(affects, "EMOTION");
+            assert_eq!(emotion["label"], "FRUSTRATION");
+            assert_eq!(emotion["valence"], -8000);
+            assert_eq!(emotion["intensity"], 9000);
+            assert_eq!(emotion["effective_intensity"], 9000, "an EMOTION never decays");
+            assert_eq!(emotion["target_subject_id"], person.to_string());
+            assert_eq!(emotion["evidence_id"], record.evidence_id.to_string());
+            assert!(emotion["half_life_seconds"].is_null());
+            let mood = affect_by_kind(affects, "MOOD");
+            assert_eq!(mood["intensity"], 8200, "raw intensity is the stored fact");
+            assert_eq!(mood["effective_intensity"], 2050, "two half-lives: 8200 / 4");
+            assert_eq!(mood["valence"], -3000);
+            assert_eq!(mood["half_life_seconds"], MOOD_HALF_LIFE.as_secs());
+            let (status, page) = enumerate_call(address, bearer, json!({"action":"enumerate"})).await;
+            assert_eq!(status, 200, "{page}");
+            let content = &assert_tool_response(&page, ToolName::Memory)["content"];
+            let listed = content["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .find(|i| i["memory_id"] == m1.to_string())
+                .expect("annotated memory enumerated");
+            assert_eq!(listed["affects"].as_array().expect("affects").len(), 2, "{page}");
+
+            // 3. Refusals write nothing: unknown target subject (never auto-registered), a label
+            //    or basis-point value outside the closed sets (fail closed, never clamped), an
+            //    unknown memory.
+            for (affects, label) in [
+                (json!([{"kind":"EMOTION","intensity":1,"confidence":1,"target_subject_id":Uuid::new_v4()}]), "unknown subject"),
+                (json!([{"kind":"EMOTION","intensity":1,"confidence":1,"target_subject_key":{"kind":"CRM","value":"CRM-NOPE"}}]), "unknown key"),
+                (json!([{"kind":"EMOTION","label":"BOREDOM","intensity":1,"confidence":1}]), "label outside the closed set"),
+                (json!([{"kind":"MOOD","valence":10001,"intensity":1,"confidence":1}]), "valence over range"),
+                (json!([{"kind":"EMOTION","intensity":-1,"confidence":1}]), "negative intensity"),
+                (json!([]), "empty list"),
+            ] {
+                let (status, refused) = annotate_call(address, bearer, 4, m1, affects).await;
+                assert_protocol_invalid_input(status, &refused);
+                assert!(refused.to_string().contains("INVALID_INPUT"), "{label}: {refused}");
+            }
+            let (status, missing) = annotate_call(
+                address,
+                bearer,
+                5,
+                Uuid::new_v4(),
+                json!([{"kind":"EMOTION","intensity":1,"confidence":1}]),
+            )
+            .await;
+            assert_eq!(status, 200, "{missing}");
+            assert_tool_error(&missing, "NOT_FOUND");
+            tokio::task::block_in_place(|| {
+                assert_eq!(affect_rows(&mut handle, m1).len(), 2, "refusals wrote nothing");
+                let subjects: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM private.subjects WHERE tenant_id = $1",
+                        &[&handle.tenant_id],
+                    )
+                    .expect("count")
+                    .get(0);
+                assert_eq!(subjects, 1, "an unknown target subject is never auto-registered");
+            });
+
+            // 4. memory.correct re-supplies the new version's affects (D-E) INSIDE
+            //    correct_atomically's transaction (main-line ruling 1): an affect whose target
+            //    key is unknown is refused before the token is consumed — M1 stays the active
+            //    head with its two rows, no M2, the token is intact — and the same token then
+            //    corrects: M2 carries only the new CALM row under ONE MEMORY_LIFECYCLE ticket,
+            //    M1's two rows ride with the superseded version, G59-4 holds.
+            let token = mint_correct_token(address, bearer, 6, m1).await;
+            let (status, refused) = memory_call(
+                address,
+                bearer,
+                7,
+                json!({
+                    "action":"correct","memory_id":m1,"text":"Actually the renewal went fine.",
+                    "confirm_token":token,
+                    "affects":[{"kind":"EMOTION","intensity":1,"confidence":1,
+                                "target_subject_key":{"kind":"CRM","value":"CRM-NOPE"}}],
+                }),
+            )
+            .await;
+            assert_protocol_invalid_input(status, &refused);
+            tokio::task::block_in_place(|| {
+                assert_eq!(token_consumed(&mut handle, &token), Some(false), "token intact");
+                assert_eq!(affect_rows(&mut handle, m1).len(), 2);
+                let head: (String, Option<Uuid>) = handle
+                    .admin
+                    .query_one(
+                        "SELECT status, superseded_by FROM private.memory_records WHERE memory_id = $1",
+                        &[&m1],
+                    )
+                    .map(|r| (r.get(0), r.get(1)))
+                    .expect("M1");
+                assert_eq!(head, ("active".to_owned(), None), "no M2 was minted by a refused correction");
+            });
+            let (status, corrected) = memory_call(
+                address,
+                bearer,
+                7,
+                json!({
+                    "action":"correct","memory_id":m1,"text":"Actually the renewal went fine.",
+                    "confirm_token":token,
+                    "affects":[{"kind":"EMOTION","label":"CALM","valence":5000,"arousal":-2000,
+                                "intensity":4000,"confidence":9000}],
+                }),
+            )
+            .await;
+            assert_eq!(status, 200, "{corrected}");
+            assert_ne!(corrected["result"]["isError"], true, "{corrected}");
+            let structured = &corrected["result"]["structuredContent"];
+            let m2 = Uuid::parse_str(structured["memory_id"].as_str().expect("M2")).expect("uuid");
+            let e2 = Uuid::parse_str(structured["evidence_id"].as_str().expect("E2")).expect("uuid");
+            assert_eq!(structured["affect_ids"].as_array().expect("affect_ids").len(), 1, "{corrected}");
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    affect_rows(&mut handle, m2),
+                    vec![("EMOTION".to_owned(), Some("CALM".to_owned()), Some(5000), 4000, None)],
+                    "M2 carries exactly the re-supplied affect"
+                );
+                let tickets: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM ops.outbox WHERE evidence_id = $1 AND event_type = 'MEMORY_LIFECYCLE'",
+                        &[&e2],
+                    )
+                    .expect("tickets")
+                    .get(0);
+                assert_eq!(tickets, 1, "one correction = one MEMORY_LIFECYCLE ticket, affects included");
+                assert_eq!(affect_rows(&mut handle, m1).len(), 2, "M1's rows ride with the superseded version");
+                let g59_4: bool = handle
+                    .admin
+                    .query_one(
+                        "SELECT (superseded_by IS NOT NULL) = (status = 'superseded') AND superseded_by = $2 \
+                         FROM private.memory_records WHERE memory_id = $1",
+                        &[&m1, &m2],
+                    )
+                    .expect("G59-4")
+                    .get(0);
+                assert!(g59_4, "G59-4: superseded_by ⇔ status='superseded', naming M2");
+            });
+            // A superseded version is not the head: annotating it is CONFLICT, nothing written.
+            let (status, stale) = annotate_call(
+                address,
+                bearer,
+                8,
+                m1,
+                json!([{"kind":"EMOTION","intensity":1,"confidence":1}]),
+            )
+            .await;
+            assert_eq!(status, 200, "{stale}");
+            assert_tool_error(&stale, "CONFLICT");
+            let (status, got2) = memory_call(address, bearer, 9, json!({"action":"get","memory_id":m2})).await;
+            assert_eq!(status, 200, "{got2}");
+            let affects2 = assert_tool_response(&got2, ToolName::Memory)["items"][0]["affects"]
+                .as_array()
+                .expect("affects")
+                .clone();
+            assert_eq!(affects2.len(), 1, "{got2}");
+            assert_eq!(affects2[0]["label"], "CALM");
+
+            // 5. remember.put {affects} (D-C, main-line ruling 2): the declaration lands on the
+            //    0157 evidence_affects carrier in the Evidence's own transaction (the Distill-born
+            //    memory inherits it through the memory_evidence PRIMARY trigger — proven under
+            //    role_private_worker in crates/adapters/tests/memory_affects.rs); an unknown
+            //    target key refuses the whole put before the Evidence is accepted.
+            let (tenant, workspace) = (handle.tenant_id, handle.workspace_id);
+            let evidence_before =
+                tokio::task::block_in_place(|| count_rows(&mut handle, EVIDENCE_OF_TENANT, tenant));
+            let (status, accepted) = remember_with_affects(
+                address,
+                bearer,
+                10,
+                workspace,
+                "The customer declined the renewal; I was frustrated with Ada.",
+                json!([
+                    {"kind":"EMOTION","label":"FRUSTRATION","valence":-8000,"arousal":5000,
+                     "intensity":9000,"confidence":10000,"target_subject_id":person},
+                    {"kind":"MOOD","label":"ANXIETY","valence":-3000,"intensity":8200,"confidence":7000},
+                ]),
+            )
+            .await;
+            assert_eq!(status, 200, "{accepted}");
+            assert_ne!(accepted["result"]["isError"], true, "{accepted}");
+            let declared_evidence = Uuid::parse_str(
+                accepted["result"]["structuredContent"]["evidence_id"]
+                    .as_str()
+                    .expect("evidence_id"),
+            )
+            .expect("uuid");
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    evidence_affect_rows(&mut handle, declared_evidence),
+                    vec![
+                        ("EMOTION".to_owned(), Some("FRUSTRATION".to_owned()), Some(-8000), 9000, Some(person), None),
+                        ("MOOD".to_owned(), Some("ANXIETY".to_owned()), Some(-3000), 8200, None, Some(i32::try_from(MOOD_HALF_LIFE.as_secs()).expect("i32"))),
+                    ],
+                    "remember.put wrote the carrier rows with the Evidence (MOOD stamped with the write-time half-life)"
+                );
+                assert_eq!(count_rows(&mut handle, EVIDENCE_OF_TENANT, tenant), evidence_before + 1);
+            });
+            let (status, refused) = remember_with_affects(
+                address,
+                bearer,
+                11,
+                workspace,
+                "about an account nobody registered",
+                json!([{"kind":"EMOTION","intensity":1,"confidence":1,
+                        "target_subject_key":{"kind":"CRM","value":"CRM-NOPE"}}]),
+            )
+            .await;
+            assert_protocol_invalid_input(status, &refused);
+            tokio::task::block_in_place(|| {
+                assert_eq!(
+                    count_rows(&mut handle, EVIDENCE_OF_TENANT, tenant),
+                    evidence_before + 1,
+                    "a refused affect declaration accepts no Evidence"
+                );
+            });
+
+            // 6. Subject ERASE (§37) is terminal for the affect about the person — on the memory
+            //    row AND on the carrier; the MOOD rows (about nobody) and M2's row survive.
+            tokio::task::block_in_place(|| {
+                handle
+                    .admin
+                    .execute("DELETE FROM private.subjects WHERE subject_id = $1", &[&person])
+                    .expect("erase subject");
+                assert_eq!(
+                    affect_rows(&mut handle, m1),
+                    vec![("MOOD".to_owned(), Some("ANXIETY".to_owned()), Some(-3000), 8200, None)],
+                    "the affect targeting the erased person cascaded"
+                );
+                assert_eq!(affect_rows(&mut handle, m2).len(), 1);
+                assert_eq!(
+                    evidence_affect_rows(&mut handle, declared_evidence).len(),
+                    1,
+                    "the carrier row targeting the erased person cascaded too"
+                );
+            });
+
+            stop_server(server).await.expect("server shutdown");
+        });
     });
 }

@@ -484,6 +484,8 @@ fn recall_request(query: &str, workspace_id: Uuid) -> RecallSearchRequest {
         completeness_request: None,
         limit: None,
         subject_ids: Vec::new(),
+        affect: None,
+        mood_congruence: None,
     }
 }
 

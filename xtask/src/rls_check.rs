@@ -1247,6 +1247,44 @@ const ADDITIVE_SEAM_MATRIX: &[Cell] = &[
         "role_maintenance",
         ["SELECT"]
     ),
+    // 0156 (ADR-0030, card E1) affect annotation axis. memory_affects: gateway annotates
+    // (memory.annotate_affect / memory.correct affects) and reads; private_worker may emit
+    // affects for Distill-born memories; retrieval_worker reads them into the projection payload;
+    // maintenance reads. Rows are immutable — no role holds UPDATE/DELETE (owner trigger rejects
+    // UPDATE; the memory/subject cascades are the only DELETE path). Every other non-owner role —
+    // (absence == no grant).
+    cell!(
+        "private.memory_affects",
+        "role_gateway",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.memory_affects",
+        "role_private_worker",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.memory_affects",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!("private.memory_affects", "role_maintenance", ["SELECT"]),
+    // 0157 (ADR-0030, card E1) write-side carrier. evidence_affects: the gateway declares at
+    // remember.put (SELECT+INSERT, same transaction as the Evidence); private_worker reads it
+    // (the memory_evidence PRIMARY copy trigger runs under the Distill hop's role); maintenance
+    // reads. Immutable — no role holds UPDATE/DELETE. Every other non-owner role — (absence ==
+    // no grant).
+    cell!(
+        "private.evidence_affects",
+        "role_gateway",
+        ["SELECT", "INSERT"]
+    ),
+    cell!(
+        "private.evidence_affects",
+        "role_private_worker",
+        ["SELECT"]
+    ),
+    cell!("private.evidence_affects", "role_maintenance", ["SELECT"]),
 ];
 
 /// Named §6.2.2 tables whose non-owner cells are all deliberately empty. Their only public

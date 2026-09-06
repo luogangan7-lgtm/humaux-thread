@@ -11,6 +11,7 @@ use std::{
 };
 
 use humaux_adapters::{
+    affect_repo,
     placement_repo::tenant_placement,
     postgres::RuntimeDbPool,
     qdrant::{
@@ -23,6 +24,7 @@ use humaux_adapters::{
         private_read_projection_selector,
     },
 };
+use humaux_application::affect::rerank_by_mood;
 use humaux_application::{
     retrieval_embedding_port::{
         RetrievalEmbeddingInput, RetrievalEmbeddingOutcome, RetrievalEmbeddingPort,
@@ -30,7 +32,11 @@ use humaux_application::{
     retrieve::{RetrievalIntent, prepare_request},
 };
 use humaux_domain::{
-    error::ErrorCode, identity::AuthorizationScope, ids::WorkspaceId, subject::SubjectId,
+    affect::{AffectFilter, MoodPoint},
+    error::ErrorCode,
+    identity::AuthorizationScope,
+    ids::WorkspaceId,
+    subject::SubjectId,
 };
 use humaux_infra_cell::{
     CellAccessPermit, IntraCellHttpTransport, IntraCellResource, IntraCellResourceRegistry,
@@ -147,6 +153,14 @@ pub struct RecallSearchRequest {
     /// (`DenseQuery::with_subject_ids`) and re-checked at the PG hydrate gate
     /// (`materialize_private_read_serving_about`); the prefilter is never the authority.
     pub subject_ids: Vec<SubjectId>,
+    /// §8.5.1 / ADR-0030 D-D: the explicit affect query (`recall.search.affect`). Same double
+    /// application as `subject_ids`: Qdrant structured-payload prefilter (flat affect arrays,
+    /// ANDed inside the same filter) + PG hydrate re-check per annotation on the read-time
+    /// effective intensity. `None` = unscoped.
+    pub affect: Option<AffectFilter>,
+    /// §8.5.1 / ADR-0030 D-D: optional mood-congruent late rerank — a bounded permutation of the
+    /// already-visible set (never widens it), applied after the hydrate gate.
+    pub mood_congruence: Option<MoodPoint>,
 }
 
 #[allow(clippy::too_many_lines)] // Keep the one native semantic-recall request/response chain together.
@@ -263,7 +277,8 @@ pub async fn search(
         eprintln!("humaux-gateway: recall request_id={request_id} dense_query_build_failed");
         ErrorCode::DependencyUnavailable
     })?
-    .with_subject_ids(&input.subject_ids);
+    .with_subject_ids(&input.subject_ids)
+    .with_affect_filter(input.affect.as_ref());
     let candidates = query_dense(runtime.qdrant.as_ref(), &runtime.qdrant_permit()?, &dense)
         .await
         .map_err(|error| {
@@ -284,7 +299,7 @@ pub async fn search(
                 ErrorCode::DependencyUnavailable
             }
         })?;
-    let materialized = materialize_private_read_serving_about(
+    let mut materialized = materialize_private_read_serving_about(
         &pool,
         input.consistency_token.as_deref(),
         &authorization,
@@ -293,6 +308,7 @@ pub async fn search(
         &runtime.embedding_version,
         &candidates,
         &input.subject_ids,
+        input.affect.as_ref(),
     )
     .await
     .map_err(|error| match error {
@@ -316,6 +332,15 @@ pub async fn search(
             ErrorCode::DependencyUnavailable
         }
     })?;
+    let reranked = match input.mood_congruence {
+        None => 0,
+        Some(mood) => mood_rerank(&pool, &authorization, &mut materialized.bodies.items, mood)
+            .await
+            .map_err(|_| {
+                eprintln!("humaux-gateway: recall request_id={request_id} mood_rerank_failed");
+                ErrorCode::DependencyUnavailable
+            })?,
+    };
     accepted_output(
         materialized,
         &retrieval,
@@ -324,8 +349,40 @@ pub async fn search(
         &projection_version,
         &embedding_model_id,
         candidates.len(),
+        reranked,
         &catalog,
     )
+}
+
+/// ADR-0030 D-D late rerank: reorders the visible Memory items by mood congruence
+/// (`application::affect::rerank_by_mood`, stable) using the rows' affects read under the
+/// caller's RLS; overlay items keep their place after the memories. Returns how many memory
+/// items were reranked (the envelope's `reranked_count`). Never adds or drops an item.
+async fn mood_rerank(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    items: &mut [MaterializedItem],
+    mood: MoodPoint,
+) -> Result<u32, ErrorCode> {
+    let memory_ids: Vec<uuid::Uuid> = items
+        .iter()
+        .filter_map(|item| match item {
+            MaterializedItem::Memory { memory_id, .. } => Some(*memory_id),
+            _ => None,
+        })
+        .collect();
+    let rows = affect_repo::affects_for_memories(pool, authorization, &memory_ids).await?;
+    let observed = affect_repo::observed(&rows, time::OffsetDateTime::now_utc());
+    let order = rerank_by_mood(memory_ids, mood, &observed);
+    let rank = |item: &MaterializedItem| match item {
+        MaterializedItem::Memory { memory_id, .. } => order
+            .iter()
+            .position(|id| id == memory_id)
+            .unwrap_or(usize::MAX),
+        _ => usize::MAX,
+    };
+    items.sort_by_key(rank);
+    u32::try_from(order.len()).map_err(|_| ErrorCode::Internal)
 }
 
 #[allow(clippy::too_many_arguments)] // One envelope-assembly step over the request's own fixed field set.
@@ -337,6 +394,7 @@ fn accepted_output(
     projection_version: &str,
     embedding_model_id: &str,
     candidate_count: usize,
+    reranked_count: u32,
     catalog: &CanonicalCatalog,
 ) -> Result<PendingEnvelope<ToolOutput>, ErrorCode> {
     let items = render_items(materialized.bodies.items);
@@ -395,7 +453,7 @@ fn accepted_output(
                     known_lower_bound: outcome.known_lower_bound,
                     lanes: std::collections::BTreeMap::from([("dense".to_owned(), lane_status)]),
                     candidate_count,
-                    reranked_count: 0,
+                    reranked_count,
                     returned,
                     truncated: candidate_count > returned,
                     degradations: projection

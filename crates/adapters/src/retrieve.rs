@@ -28,6 +28,7 @@ use sqlx::Row;
 use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
+use humaux_domain::affect::AffectFilter;
 use humaux_domain::error::ErrorCode;
 use humaux_domain::identity::AuthorizationScope;
 use humaux_domain::ids::{TenantId, WorkspaceId};
@@ -825,6 +826,7 @@ pub async fn materialize_private_read_serving(
         embedding_version,
         semantic,
         &[],
+        None,
     )
     .await
 }
@@ -833,8 +835,9 @@ pub async fn materialize_private_read_serving(
 /// (§6.1.3 / ADR-0029 D-A). The Qdrant `subject_ids` prefilter the caller applied is not
 /// trusted: membership is re-checked against `private.memory_subjects` at the shared PG hydrate
 /// gate (`read_materialize::final_memory_ids_about_in_txn`), the same place `include_archived`
-/// is enforced. Empty `subject_ids` = the unscoped read.
-#[allow(clippy::too_many_arguments)] // Same fixed argument set as the unscoped entry + one axis.
+/// is enforced. Empty `subject_ids` = the unscoped read. `affect` (§8.5.1 / ADR-0030 D-D) is
+/// re-checked at the same gate per annotation on the read-time effective intensity.
+#[allow(clippy::too_many_arguments)] // Same fixed argument set as the unscoped entry + two axes.
 pub async fn materialize_private_read_serving_about(
     pool: &RuntimeDbPool,
     consistency_token: Option<&str>,
@@ -844,6 +847,7 @@ pub async fn materialize_private_read_serving_about(
     embedding_version: &str,
     semantic: &[DenseCandidate],
     subject_ids: &[SubjectId],
+    affect: Option<&AffectFilter>,
 ) -> Result<MaterializedPrivateReadServing, RetrieveError> {
     let mut txn = pool.pool().begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
@@ -858,6 +862,7 @@ pub async fn materialize_private_read_serving_about(
         embedding_version,
         semantic,
         subject_ids,
+        affect,
     )
     .await?;
     let key = family.with_version(projection_version);
@@ -916,6 +921,7 @@ pub(crate) async fn materialize_private_read_serving_in_txn(
     embedding_version: &str,
     semantic: &[DenseCandidate],
     subject_ids: &[SubjectId],
+    affect: Option<&AffectFilter>,
 ) -> Result<MaterializedBodies, RetrieveError> {
     let envelope = match consistency_token {
         Some(token) => recall_with_overlay_in_txn(txn, token, authorization, family).await?,
@@ -973,6 +979,8 @@ pub(crate) async fn materialize_private_read_serving_in_txn(
         false,
         // §6.1.3/ADR-0029 D-A: subject membership re-check at the same gate.
         subject_ids,
+        // §8.5.1/ADR-0030 D-D: affect re-check (per annotation, effective intensity) too.
+        affect,
     )
     .await
     .map_err(RetrieveError::FinalMaterialization)

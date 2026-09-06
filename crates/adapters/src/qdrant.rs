@@ -25,6 +25,7 @@
 //! §3/§78.3: this crate sits below Domain in the dependency direction (adapters wraps HTTP/
 //! SQL, Domain never imports either) — not a boundary violation.
 
+use humaux_domain::affect::{AffectAnnotation, AffectFilter, BasisPoints, EmotionLabel};
 use humaux_domain::authority::{AuthorityClass, AuthorityStatus};
 use humaux_domain::dataclass::DataClass;
 use humaux_domain::identity::{AuthorizationScope, VisibilityClass};
@@ -36,7 +37,9 @@ use humaux_infra_cell::{
 };
 use humaux_projection::card::EgressDisposition;
 use humaux_projection::dense::{
-    Condition, DenseQueryFilter, FieldMatch, SUBJECT_IDS_FIELD, build_dense_filter,
+    AFFECT_AROUSAL_FIELD, AFFECT_DOMINANCE_FIELD, AFFECT_INTENSITY_FIELD, AFFECT_KINDS_FIELD,
+    AFFECT_LABELS_FIELD, AFFECT_VALENCE_FIELD, Condition, DenseQueryFilter, FieldMatch,
+    SUBJECT_IDS_FIELD, build_dense_filter,
 };
 use serde_json::{Value, json};
 use sqlx::types::time::OffsetDateTime;
@@ -354,6 +357,7 @@ impl QdrantPointPayload {
         (self.data_class != DataClass::SecretMaterial).then_some(IndexablePayload {
             payload: self,
             subject_ids: Vec::new(),
+            affects: Vec::new(),
         })
     }
 }
@@ -368,6 +372,10 @@ impl QdrantPointPayload {
 pub struct IndexablePayload {
     payload: QdrantPointPayload,
     subject_ids: Vec<SubjectId>,
+    /// §8.5.1 / ADR-0030 D-D: the memory's `private.memory_affects` rows, flattened into the six
+    /// parallel array fields at index time (`AFFECT_*_FIELD`). Same reasoning as `subject_ids`:
+    /// annotation, not a property of the memory row, index-write path only.
+    affects: Vec<AffectAnnotation>,
 }
 
 impl IndexablePayload {
@@ -382,19 +390,55 @@ impl IndexablePayload {
         self
     }
 
+    /// Attaches the point's affect annotations (ADR-0030 D-D), written as six parallel arrays —
+    /// `affect_kinds` / `affect_labels` / `affect_valence_bp` / `affect_arousal_bp` /
+    /// `affect_dominance_bp` / `affect_intensity_bp` — one element per annotation, in the
+    /// stored write order. An axis the annotation did not record is written as JSON `null` so
+    /// positions stay aligned and a range filter never matches it (Qdrant ignores nulls in
+    /// `range`). `observed_at` / half-life are deliberately NOT projected: decay is PG's
+    /// read-time derivation, never a payload fact.
+    pub fn with_affects(mut self, affects: Vec<AffectAnnotation>) -> Self {
+        self.affects = affects;
+        self
+    }
+
     fn to_json(&self) -> Value {
         let mut json = self.payload.to_json();
-        json.as_object_mut()
-            .expect("QdrantPointPayload::to_json is always an object")
-            .insert(
-                SUBJECT_IDS_FIELD.into(),
-                Value::Array(
-                    self.subject_ids
-                        .iter()
-                        .map(|s| json!(s.0.to_string()))
-                        .collect(),
-                ),
-            );
+        let obj = json
+            .as_object_mut()
+            .expect("QdrantPointPayload::to_json is always an object");
+        obj.insert(
+            SUBJECT_IDS_FIELD.into(),
+            Value::Array(
+                self.subject_ids
+                    .iter()
+                    .map(|s| json!(s.0.to_string()))
+                    .collect(),
+            ),
+        );
+        fn bp(v: Option<BasisPoints>) -> Value {
+            v.map_or(Value::Null, |v| json!(v.get()))
+        }
+        let column =
+            |f: fn(&AffectAnnotation) -> Value| Value::Array(self.affects.iter().map(f).collect());
+        obj.insert(
+            AFFECT_KINDS_FIELD.into(),
+            column(|a| json!(a.kind.as_str())),
+        );
+        obj.insert(
+            AFFECT_LABELS_FIELD.into(),
+            column(|a| {
+                a.label
+                    .map_or(Value::Null, |l| json!(EmotionLabel::as_str(l)))
+            }),
+        );
+        obj.insert(AFFECT_VALENCE_FIELD.into(), column(|a| bp(a.valence)));
+        obj.insert(AFFECT_AROUSAL_FIELD.into(), column(|a| bp(a.arousal)));
+        obj.insert(AFFECT_DOMINANCE_FIELD.into(), column(|a| bp(a.dominance)));
+        obj.insert(
+            AFFECT_INTENSITY_FIELD.into(),
+            column(|a| json!(a.intensity.get())),
+        );
         json
     }
 }
@@ -470,6 +514,9 @@ fn condition_to_wire(condition: &Condition) -> Value {
     match condition {
         Condition::Eq { field, value } => json!({ "key": field, "match": { "value": value } }),
         Condition::In { field, values } => json!({ "key": field, "match": { "any": values } }),
+        Condition::Range { field, gte, lte } => {
+            json!({ "key": field, "range": { "gte": gte, "lte": lte } })
+        }
         Condition::And(clauses) => {
             json!({ "must": clauses.iter().map(condition_to_wire).collect::<Vec<_>>() })
         }
@@ -1105,6 +1152,15 @@ impl DenseQuery {
     /// re-checks membership against `private.memory_subjects` under RLS.
     pub fn with_subject_ids(mut self, subject_ids: &[SubjectId]) -> Self {
         self.filter = self.filter.about_any_of(subject_ids);
+        self
+    }
+
+    /// §8.5.1 / ADR-0030 D-D: narrow this query by an explicit affect filter
+    /// (`DenseQueryFilter::with_affect`, ANDed inside the SAME structured filter as the tenant,
+    /// visibility and subject clauses). Prefilter only: the PG hydrate gate re-checks every
+    /// clause per annotation on the read-time effective intensity.
+    pub fn with_affect_filter(mut self, filter: Option<&AffectFilter>) -> Self {
+        self.filter = self.filter.with_affect(filter);
         self
     }
 }

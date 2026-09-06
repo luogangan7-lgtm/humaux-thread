@@ -61,7 +61,7 @@ fn remember_error(error: RememberError) -> ErrorCode {
         RememberError::ConsistencyTokenExpiryNotFuture => ErrorCode::Conflict,
         RememberError::BatchExhausted => ErrorCode::Conflict,
         // §6.1.3: an unresolvable subject declaration is INVALID_INPUT with nothing written.
-        RememberError::Subject(code) => code,
+        RememberError::Subject(code) | RememberError::Affect(code) => code,
         RememberError::Db(error) => db_error(error),
     }
 }
