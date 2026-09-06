@@ -10,12 +10,13 @@ use humaux_adapters::{
     context_repo::{MaterializedContext, assemble_materialized},
     postgres::RuntimeDbPool,
     read_materialize::MaterializedItem,
+    retrieve::private_read_projection_selector,
 };
 use humaux_domain::{
     context::ContextBudget,
     error::ErrorCode,
     identity::AuthorizationScope,
-    ids::{Scope, WorkspaceId},
+    ids::{Scope, TenantId, WorkspaceId},
 };
 use humaux_projection::{serving::StreamFamily, stream::StreamKey};
 use humaux_retrieval::{
@@ -63,6 +64,50 @@ impl ContextBootstrap {
     pub(crate) const fn budget(&self) -> ContextBudget {
         self.budget
     }
+
+    /// §34.0.1 / ADR-0031 D-A (Q9 ruling): the stream a read consults is derived per request —
+    /// principal tenant + the requested (already membership-narrowed) workspace + this process's
+    /// `(scope_kind, domain, projection_kind, projection_version)`. No registry table and no
+    /// process-wide cache: the six-tuple itself is the identity, and computing it costs no PG
+    /// round trip. The bootstrap `stream`'s own `tenant_id` / `scope_id` are deliberately not
+    /// consulted here — they bind only the write route until card 11 lifts it.
+    pub(crate) fn request_stream(
+        &self,
+        tenant_id: TenantId,
+        workspace: WorkspaceId,
+    ) -> (StreamFamily, StreamKey) {
+        let family = StreamFamily::new(
+            tenant_id,
+            self.stream.scope_kind.clone(),
+            workspace.0,
+            self.stream.domain.clone(),
+            self.stream.projection_kind.clone(),
+        );
+        let key = family.with_version(self.stream.projection_version.clone());
+        (family, key)
+    }
+
+    /// [`Self::request_stream`] admitted through §16.2's read routing: the derived family must
+    /// have a `serving` projection (`private_read_projection_selector`, the same lookup
+    /// `recall.search` already runs) or the pair is unprovisioned and the read fails closed with
+    /// `DependencyUnavailable` — never a synthetic empty stream whose ledger closes "complete"
+    /// because no `stream_checkpoints` row exists for it (§15.4 reads 0 for a missing row).
+    /// This is the one PG round trip the derivation adds, and it is the existing serving read
+    /// ADR-0031 D-A names, not a new lookup. The ledger key keeps the process-configured
+    /// `projection_version` (Q9 ruling); the serving value only proves the pair exists.
+    pub(crate) async fn provisioned_request_stream(
+        &self,
+        pool: &RuntimeDbPool,
+        authorization: &AuthorizationScope,
+        workspace: WorkspaceId,
+    ) -> Result<(StreamFamily, StreamKey), ErrorCode> {
+        let (family, key) = self.request_stream(authorization.tenant_id(), workspace);
+        private_read_projection_selector(pool, authorization, &family)
+            .await
+            .map_err(|_| ErrorCode::DependencyUnavailable)?
+            .ok_or(ErrorCode::DependencyUnavailable)?;
+        Ok((family, key))
+    }
 }
 
 /// One actually materialized Memory; membership and authority remain in the handoff.
@@ -107,8 +152,12 @@ fn executable_fingerprint() -> Result<String, ErrorCode> {
     Ok(build)
 }
 
-/// Reads only the configured workspace stream. A missing tenant route is not a synthetic
-/// empty stream, and a client cannot select a version or broaden authorization.
+/// Reads the stream derived from the credential's tenant and the requested workspace
+/// (`ContextBootstrap::provisioned_request_stream`, ADR-0031 D-A). A workspace outside the
+/// credential's membership is `Forbidden` (the guard's `credential.authorize` already
+/// narrowed; the `narrow` here is defense in depth for in-process callers); a pair without a
+/// serving projection is `DependencyUnavailable`, never a synthetic empty stream; a client
+/// cannot select a version or broaden authorization.
 pub async fn assemble<T>(
     pool: impl Into<Arc<RuntimeDbPool>>,
     authorization: AuthorizationScope,
@@ -118,11 +167,10 @@ pub async fn assemble<T>(
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
     let workspace = requested_workspace.ok_or(ErrorCode::DependencyUnavailable)?;
     let authorization = authorization.narrow(workspace)?;
-    if bootstrap.stream.tenant_id != authorization.tenant_id()
-        || bootstrap.stream.scope_id != workspace.0
-    {
-        return Err(ErrorCode::DependencyUnavailable);
-    }
+    let pool = pool.into();
+    let (family, stream) = bootstrap
+        .provisioned_request_stream(&pool, &authorization, workspace)
+        .await?;
     let scope = Scope {
         tenant_id: authorization.tenant_id(),
         user_id: authorization.user_id(),
@@ -134,21 +182,13 @@ pub async fn assemble<T>(
     };
     let request = build_request(RetrievalIntent::trusted_context(), &bootstrap.profile)
         .map_err(|_| ErrorCode::Internal)?;
-    let pool = pool.into();
-    let family = StreamFamily::new(
-        bootstrap.stream.tenant_id,
-        bootstrap.stream.scope_kind.clone(),
-        bootstrap.stream.scope_id,
-        bootstrap.stream.domain.clone(),
-        bootstrap.stream.projection_kind.clone(),
-    );
     let materialized = assemble_materialized(
         &pool,
         &authorization,
         &scope,
         bootstrap.budget,
         &family,
-        &bootstrap.stream,
+        &stream,
     )
     .await?;
     into_result(materialized, &request, &bootstrap.binary_build, accept)

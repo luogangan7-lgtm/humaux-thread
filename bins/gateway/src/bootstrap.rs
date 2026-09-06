@@ -1,7 +1,11 @@
-//! Process bootstrap for the one configured Gateway write stream.
+//! Process bootstrap: the one configured Gateway *write* stream plus the process-wide
+//! `(scope_kind, domain, projection_kind, projection_version)` the read routes attach to each
+//! request's own `(tenant, workspace)` (ADR-0031 D-A, §34.0.1 Q9: one process serves every
+//! provisioned pair for reads; no registry table, no per-process stream cache).
 //!
 //! This module owns process configuration only. Tool arguments never select a
-//! tenant, stream, credential verifier, listener, or rate policy.
+//! stream version, credential verifier, listener, or rate policy; a tool argument selects a
+//! workspace only inside the credential's already-authorized membership (`narrow`).
 //! `GuardSettings::tenant_network` is deliberately empty in this single-policy
 //! process. A tenant-specific network-policy loader needs a separate approved
 //! authorization and acceptance gate before this bootstrap can serve it.
@@ -624,6 +628,10 @@ fn registry() -> Vec<ConfigEntry> {
         ("CONFIRM_TOKEN_TTL_SECONDS", "u64", false),
         ("UNDO_WINDOW_SECONDS", "u64", false),
         ("MOOD_HALF_LIFE_SECONDS", "u64", false),
+        // ADR-0031 D-B: these two bind ONLY the write route (`remember.put` and the
+        // confirm-gated governance writers) until card 11; the read routes derive the stream
+        // per request and no longer compare against them. Deprecated for reads; still required
+        // at boot because the write route lives in the same process.
         ("REMEMBER_TENANT_ID", "uuid", false),
         ("REMEMBER_WORKSPACE_ID", "uuid", false),
         ("REMEMBER_SCOPE_KIND", "enum:workspace", false),

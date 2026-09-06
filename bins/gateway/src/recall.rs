@@ -43,7 +43,6 @@ use humaux_infra_cell::{
     authorize_cell_access,
 };
 use humaux_local_secret_scan::LocalSecretScanner;
-use humaux_projection::serving::StreamFamily;
 use humaux_protocol::{
     mcp::{ToolName, ToolOutput},
     mcp_catalog::CanonicalCatalog,
@@ -178,12 +177,12 @@ pub async fn search(
     {
         return Err(ErrorCode::DependencyUnavailable);
     }
+    // Membership narrowing (`Forbidden` outside the credential's workspaces) already happened
+    // in the guard's `credential.authorize` on the wire path; this `narrow` is defense in depth
+    // for in-process callers. The stream family below is derived per request (ADR-0031 D-A);
+    // an unprovisioned pair fails closed at the placement / serving-projection reads that
+    // follow — the same serving read the PG read routes run in `read_scope` / `assemble`.
     let authorization = authorization.narrow(input.workspace_id)?;
-    if bootstrap.stream.tenant_id != authorization.tenant_id()
-        || bootstrap.stream.scope_id != input.workspace_id.0
-    {
-        return Err(ErrorCode::Forbidden);
-    }
     // §17.3 per-tenant placement, resolved fresh every request — `None` means "not indexed
     // yet for this tenant", never a fallback onto another tenant's collection.
     let placement = tenant_placement(
@@ -200,13 +199,7 @@ pub async fn search(
         eprintln!("humaux-gateway: recall request_id={request_id} placement_missing");
         ErrorCode::DependencyUnavailable
     })?;
-    let family = StreamFamily::new(
-        bootstrap.stream.tenant_id,
-        bootstrap.stream.scope_kind.clone(),
-        bootstrap.stream.scope_id,
-        bootstrap.stream.domain.clone(),
-        bootstrap.stream.projection_kind.clone(),
-    );
+    let (family, _) = bootstrap.request_stream(authorization.tenant_id(), input.workspace_id);
     let intent = RetrievalIntent::new(input.query, Vec::new(), BTreeSet::new(), BTreeSet::new())
         .map_err(|_| ErrorCode::InvalidInput)?;
     let retrieval = prepare_request(intent, &bootstrap.profile).map_err(|_| ErrorCode::Internal)?;

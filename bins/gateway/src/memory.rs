@@ -160,22 +160,15 @@ pub(crate) async fn get<T>(
     memory_id: MemoryId,
     accept: impl FnOnce(Envelope<MemoryItem>) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
-    let (authorization, scope, family) =
-        read_scope(authorization, requested_workspace, &bootstrap)?;
+    let (authorization, scope, family, stream) =
+        read_scope(&pool, authorization, requested_workspace, &bootstrap).await?;
     let request = build_request(
         RetrievalIntent::trusted_memory_get(memory_id),
         &bootstrap.profile,
     )
     .map_err(|_| ErrorCode::Internal)?;
-    let materialized = materialize_memory_get(
-        &pool,
-        &authorization,
-        &scope,
-        &family,
-        &bootstrap.stream,
-        memory_id,
-    )
-    .await?;
+    let materialized =
+        materialize_memory_get(&pool, &authorization, &scope, &family, &stream, memory_id).await?;
     let affects = affects_by_memory(&pool, &authorization, &materialized).await?;
     let archived = materialized.archived;
     accept_memory_envelope(
@@ -220,8 +213,8 @@ pub(crate) async fn list_candidates(
     bootstrap: ContextBootstrap,
     limit: i64,
 ) -> Result<CandidatesResult, ErrorCode> {
-    let (authorization, _scope, _family) =
-        read_scope(authorization, requested_workspace, &bootstrap)?;
+    let (authorization, _scope, _family, _stream) =
+        read_scope(&pool, authorization, requested_workspace, &bootstrap).await?;
     let workspace = requested_workspace.ok_or(ErrorCode::DependencyUnavailable)?;
     let rows =
         distill_repo::list_pending_candidates(&pool, &authorization, workspace, limit).await?;
@@ -264,22 +257,16 @@ pub(crate) async fn enumerate<T>(
     params: MemoryEnumerationParams<'_>,
     accept: impl FnOnce(EnumerationResult) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
-    let (authorization, scope, family) =
-        read_scope(authorization, requested_workspace, &bootstrap)?;
+    let (authorization, scope, family, stream) =
+        read_scope(&pool, authorization, requested_workspace, &bootstrap).await?;
     let request = build_request(
         RetrievalIntent::trusted_memory_enumerate(),
         &bootstrap.profile,
     )
     .map_err(|_| ErrorCode::Internal)?;
-    let page = materialize_memory_enumeration(
-        &pool,
-        &authorization,
-        &scope,
-        &family,
-        &bootstrap.stream,
-        params,
-    )
-    .await?;
+    let page =
+        materialize_memory_enumeration(&pool, &authorization, &scope, &family, &stream, params)
+            .await?;
     let pagination = Pagination {
         snapshot_id: page.snapshot_id,
         next_cursor: page.next_cursor,
@@ -306,8 +293,9 @@ pub(crate) async fn enumerate<T>(
 pub(crate) const ENUMERATION_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// §36 `memory.supersede`, second (confirmed) call. The bound workspace must be the
-/// bootstrap stream's workspace — the same `read_scope` rule `memory.get` applies — so the
-/// lifecycle ticket lands on the stream whose ledger the reads consult.
+/// bootstrap stream's workspace (write routes stay bootstrap-bound until card 11; the read
+/// routes derive their stream per request, ADR-0031) so the lifecycle ticket lands on the
+/// stream whose ledger the reads consult.
 pub(crate) async fn supersede(
     pool: Arc<RuntimeDbPool>,
     write: ConfirmedWrite,
@@ -518,7 +506,8 @@ impl From<subject_repo::SubjectListing> for SubjectItem {
 
 /// §6.1.3 / ADR-0028 `memory.enumerate {subjects:true}`: the caller's tenant's registered
 /// subjects (live heads) with keys and roles, under RLS. Read-only; same workspace rule as
-/// `memory.get`. This is the gateway face of the registry's cross-tenant invisibility.
+/// `memory.get` (`read_scope`). This is the gateway face of the registry's cross-tenant
+/// invisibility.
 pub(crate) async fn list_subjects(
     pool: Arc<RuntimeDbPool>,
     authorization: AuthorizationScope,
@@ -526,8 +515,8 @@ pub(crate) async fn list_subjects(
     bootstrap: ContextBootstrap,
     limit: i64,
 ) -> Result<SubjectsResult, ErrorCode> {
-    let (authorization, _scope, _family) =
-        read_scope(authorization, requested_workspace, &bootstrap)?;
+    let (authorization, _scope, _family, _stream) =
+        read_scope(&pool, authorization, requested_workspace, &bootstrap).await?;
     let rows = subject_repo::list_subjects(&pool, &authorization, limit).await?;
     Ok(SubjectsResult {
         subjects: rows.into_iter().map(SubjectItem::from).collect(),
@@ -536,8 +525,8 @@ pub(crate) async fn list_subjects(
 }
 
 /// §6.1.3 / ADR-0028 D-F `memory.subject_register` (card 7 D-E1): registers one subject under
-/// the authenticated tenant. Same workspace rule as `memory.get`; the tenant is the credential's,
-/// never an argument.
+/// the authenticated tenant. Same workspace rule as `memory.supersede` (`write_scope`); the
+/// tenant is the credential's, never an argument.
 pub(crate) async fn register_subject(
     pool: Arc<RuntimeDbPool>,
     authorization: AuthorizationScope,
@@ -547,8 +536,7 @@ pub(crate) async fn register_subject(
     display_name: String,
     roles: Vec<SubjectRole>,
 ) -> Result<SubjectItem, ErrorCode> {
-    let (authorization, _scope, _family) =
-        read_scope(authorization, requested_workspace, &bootstrap)?;
+    let authorization = write_scope(authorization, requested_workspace, &bootstrap)?;
     subject_repo::register_subject(&pool, &authorization, kind, &display_name, &roles)
         .await
         .map(SubjectItem::from)
@@ -565,8 +553,7 @@ pub(crate) async fn link_subject_key(
     subject_id: SubjectId,
     key: SubjectKey,
 ) -> Result<SubjectItem, ErrorCode> {
-    let (authorization, _scope, _family) =
-        read_scope(authorization, requested_workspace, &bootstrap)?;
+    let authorization = write_scope(authorization, requested_workspace, &bootstrap)?;
     subject_repo::link_key(&pool, &authorization, subject_id, &key)
         .await
         .map(SubjectItem::from)
@@ -594,9 +581,9 @@ impl From<AnnotateDone> for AnnotateResult {
 
 /// §8.5.1 / ADR-0030 D-C `memory.annotate_affect`: appends immutable affect rows to the visible
 /// active head `memory_id` (provenance = its PRIMARY Evidence) and issues the re-projection
-/// ticket on the bootstrap stream. Same workspace rule as `memory.get`; the tenant is the
-/// credential's. Not confirm-gated: nothing is deleted, superseded or hidden. Also the sole
-/// path `memory.correct {affects}` re-supplies the new version's affects through.
+/// ticket on the bootstrap stream. Same workspace rule as `memory.supersede` (`write_scope`);
+/// the tenant is the credential's. Not confirm-gated: nothing is deleted, superseded or hidden.
+/// Also the sole path `memory.correct {affects}` re-supplies the new version's affects through.
 pub(crate) async fn annotate_affect(
     pool: Arc<RuntimeDbPool>,
     authorization: AuthorizationScope,
@@ -606,8 +593,7 @@ pub(crate) async fn annotate_affect(
     inputs: Vec<AffectInput>,
     mood_half_life: MoodHalfLife,
 ) -> Result<AnnotateResult, ErrorCode> {
-    let (authorization, _scope, _family) =
-        read_scope(authorization, requested_workspace, &bootstrap)?;
+    let authorization = write_scope(authorization, requested_workspace, &bootstrap)?;
     affect_repo::annotate(
         &pool,
         &authorization,
@@ -688,8 +674,8 @@ pub(crate) async fn archive(
 
 /// §36 `memory.pin` / `memory.unpin`, second (confirmed) call (ADR-0019). The PINNED row is
 /// scoped to the credential's bound workspace, which must be the bootstrap stream's
-/// workspace — the same rule `memory.get` / `memory.supersede` apply — so `context.assemble`
-/// reads it back through the same scope chain.
+/// workspace — the same rule `memory.supersede` applies — so `context.assemble` reads it back
+/// through the same scope chain.
 pub(crate) async fn write_binding(
     pool: Arc<RuntimeDbPool>,
     write: ConfirmedWrite,
@@ -731,18 +717,27 @@ pub(crate) async fn write_binding(
     }
 }
 
-fn read_scope(
+/// The read-route scope rule (memory.get / memory.enumerate and its `candidates` / `subjects`
+/// faces; context.assemble applies the same one inline): membership-narrow to the requested
+/// workspace (`Forbidden` outside the credential's set — the guard's `credential.authorize`
+/// already narrowed on the wire path, so this `narrow` is defense in depth for in-process
+/// callers, not the load-bearing gate), then derive the stream per request from the
+/// credential's tenant + that workspace and admit it only if that family has a `serving`
+/// projection (`ContextBootstrap::provisioned_request_stream`, ADR-0031 D-A / §16.2). The
+/// bootstrap stream's tenant/workspace are not compared against the request here — one
+/// process serves every provisioned pair; an unprovisioned one is `DEPENDENCY_UNAVAILABLE`
+/// from that serving read, and an invisible object stays `NOT_FOUND`.
+async fn read_scope(
+    pool: &RuntimeDbPool,
     authorization: AuthorizationScope,
     requested_workspace: Option<WorkspaceId>,
     bootstrap: &ContextBootstrap,
-) -> Result<(AuthorizationScope, Scope, StreamFamily), ErrorCode> {
+) -> Result<(AuthorizationScope, Scope, StreamFamily, StreamKey), ErrorCode> {
     let workspace = requested_workspace.ok_or(ErrorCode::DependencyUnavailable)?;
     let authorization = authorization.narrow(workspace)?;
-    if bootstrap.stream.tenant_id != authorization.tenant_id()
-        || bootstrap.stream.scope_id != workspace.0
-    {
-        return Err(ErrorCode::DependencyUnavailable);
-    }
+    let (family, stream) = bootstrap
+        .provisioned_request_stream(pool, &authorization, workspace)
+        .await?;
     let scope = Scope {
         tenant_id: authorization.tenant_id(),
         user_id: authorization.user_id(),
@@ -752,14 +747,26 @@ fn read_scope(
         run_id: None,
         agent_id: None,
     };
-    let family = StreamFamily::new(
-        bootstrap.stream.tenant_id,
-        bootstrap.stream.scope_kind.clone(),
-        bootstrap.stream.scope_id,
-        bootstrap.stream.domain.clone(),
-        bootstrap.stream.projection_kind.clone(),
-    );
-    Ok((authorization, scope, family))
+    Ok((authorization, scope, family, stream))
+}
+
+/// The write-route scope rule for the non-confirm-gated writers that share the memory op
+/// (`subject_register`, `subject_link_key`, `annotate_affect`): until card 11 lifts the write
+/// route, a write may only land on the one bootstrap-configured stream, so the request's
+/// (tenant, workspace) must still equal it — the constant comparison the read routes dropped.
+fn write_scope(
+    authorization: AuthorizationScope,
+    requested_workspace: Option<WorkspaceId>,
+    bootstrap: &ContextBootstrap,
+) -> Result<AuthorizationScope, ErrorCode> {
+    let workspace = requested_workspace.ok_or(ErrorCode::DependencyUnavailable)?;
+    let authorization = authorization.narrow(workspace)?;
+    if bootstrap.stream.tenant_id != authorization.tenant_id()
+        || bootstrap.stream.scope_id != workspace.0
+    {
+        return Err(ErrorCode::DependencyUnavailable);
+    }
+    Ok(authorization)
 }
 
 #[allow(clippy::too_many_arguments)] // One envelope assembly over the read's fixed inputs + the affect axis.

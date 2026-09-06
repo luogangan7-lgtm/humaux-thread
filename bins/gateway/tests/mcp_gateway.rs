@@ -159,11 +159,51 @@ fn application(handle: &Handle, runtime: RuntimeDbPool) -> GatewayMcpApplication
     )
 }
 
+/// Provisions one (tenant, workspace) pair the way ops does for the process's `v1` stream
+/// (§16.2 / `xtask projection-serve`): the `v1` checkpoint row exists and is the family's
+/// `serving` row. ADR-0031: every read route admits a pair only through that serving read, so
+/// a fixture pair that was never provisioned reads `DEPENDENCY_UNAVAILABLE` — exactly what the
+/// multi-pair acceptance asserts for its unprovisioned control. Idempotent: a row a test seeded
+/// itself (`seed_semantic_checkpoint`, `seed_done_stream_identity`) or a later serving version
+/// (`v2` after the §16.3 switch) is left as is.
+fn provision_stream_pair(handle: &Handle, workspace_id: Uuid) {
+    // `application()` is also built inside `block_on` bodies; the sync `postgres` client
+    // spins its own runtime, so enter blocking mode the way the harness does for `handle.admin`.
+    tokio::task::block_in_place(|| provision_stream_pair_blocking(handle, workspace_id));
+}
+
+fn provision_stream_pair_blocking(handle: &Handle, workspace_id: Uuid) {
+    let mut owner = handle
+        .owner_client()
+        .expect("owner provisions the fixture stream pair");
+    owner
+        .execute(
+            "INSERT INTO projection.stream_checkpoints \
+               (tenant_id,scope_kind,scope_id,domain,projection_kind,projection_version) \
+             VALUES($1,'workspace',$2,'knowledge','ingest','v1') ON CONFLICT DO NOTHING",
+            &[&handle.tenant_id, &workspace_id],
+        )
+        .expect("owner seeds the v1 checkpoint row");
+    owner
+        .execute(
+            "UPDATE projection.stream_checkpoints SET serving=true \
+             WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2 \
+               AND domain='knowledge' AND projection_kind='ingest' AND projection_version='v1' \
+               AND NOT EXISTS (SELECT 1 FROM projection.stream_checkpoints \
+                               WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2 \
+                                 AND domain='knowledge' AND projection_kind='ingest' AND serving)",
+            &[&handle.tenant_id, &workspace_id],
+        )
+        .expect("owner promotes v1 to serving when the family has no serving row");
+}
+
 fn application_with_budget(
     handle: &Handle,
     runtime: RuntimeDbPool,
     budget: ContextBudget,
 ) -> GatewayMcpApplication {
+    // The in-process fixture app's bootstrap pair is provisioned like a deployed one.
+    provision_stream_pair(handle, handle.workspace_id);
     let policy = RememberPolicy::new(
         StreamKey::new(
             TenantId(handle.tenant_id),
@@ -3088,6 +3128,13 @@ fn reserved_read_at_read_barrier(
 ) -> Result<Uuid, String> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
+        // `barrier` is one long transaction, and PostgreSQL freezes `pg_stat_activity` at its
+        // first access within a transaction: a gateway backend that connected after the first
+        // poll (the read now runs on a connection opened after the ADR-0031 serving read) would
+        // stay invisible to the join below forever without discarding that snapshot.
+        barrier
+            .batch_execute("SELECT pg_stat_clear_snapshot()")
+            .map_err(|_| "refresh backend activity snapshot".to_owned())?;
         let row = barrier
             .query_opt(
                 "SELECT reservation_id FROM control.usage_reservations \
@@ -3286,6 +3333,8 @@ impl GatewayProcessConfig {
                 "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS".into(),
                 "21600".into(),
             ),
+            // ADR-0031 D-B: bind the WRITE route only (read routes derive their stream per
+            // request from the credential's tenant + requested workspace).
             (
                 "HUMAUX_GATEWAY_REMEMBER_TENANT_ID".into(),
                 handle.tenant_id.to_string(),
@@ -3519,6 +3568,7 @@ fn gateway_binary_real_bootstrap_mcp_interaction_and_sigterm_acceptance() {
                 .insert("HUMAUX_GATEWAY_UNKNOWN".into(), "rejected".into());
             assert_binary_rejects_before_listening(unknown);
 
+            provision_stream_pair(&handle, handle.workspace_id);
             let mut process = GatewayProcess::start(&config).expect("gateway binary starts");
             let runtime = handle.rt.handle().clone();
             runtime.block_on(async {
@@ -7318,4 +7368,529 @@ fn native_mcp_affect_annotation_governance_acceptance() {
             stop_server(server).await.expect("server shutdown");
         });
     });
+}
+
+// ---------------------------------------------------------------------------------------
+// ADR-0031 (card 10): one gateway process, N provisioned (tenant, workspace) pairs, the
+// stream identity derived per request — never compared against the bootstrap constant and
+// never cached process-wide — and admitted only through the family's serving projection.
+// ---------------------------------------------------------------------------------------
+
+/// One (tenant, workspace) pair as the multi-pair acceptance drives it.
+#[derive(Clone)]
+struct StreamPair {
+    label: &'static str,
+    workspace_id: Uuid,
+    bearer: String,
+    memory_id: Uuid,
+}
+
+/// The four read routes for one bearer / workspace / target, in a fixed order.
+const PAIR_READ_ROUTES: [&str; 4] = ["memory.get", "memory.enumerate", "context", "recall"];
+
+/// The MCP tool name and arguments one read route sends for a workspace / target.
+fn route_request(
+    route: &str,
+    workspace_id: Uuid,
+    memory_id: Uuid,
+    query: &str,
+) -> (&'static str, Value) {
+    match route {
+        "memory.get" => (
+            "memory",
+            json!({"action":"get","memory_id":memory_id,"workspace_id":workspace_id}),
+        ),
+        "memory.enumerate" => (
+            "memory",
+            json!({"action":"enumerate","workspace_id":workspace_id,"limit":100}),
+        ),
+        "context" => ("context", json!({"workspace_id":workspace_id})),
+        _ => (
+            "recall",
+            json!({"query":query,"workspace_id":workspace_id,"mode":"semantic"}),
+        ),
+    }
+}
+
+async fn tool_call(
+    address: SocketAddr,
+    tool: &str,
+    bearer: &str,
+    arguments: Value,
+) -> (u16, Value) {
+    raw_request(
+        address,
+        &tool_call_headers(tool, bearer),
+        &rpc(1, "tools/call", call_params(tool, arguments)),
+    )
+    .await
+}
+
+/// One read-route call. A 429 here is the guard's per-bucket `pg_try_advisory_xact_lock`
+/// refusing a *concurrent* request on the same bucket (§72.2 bounded rate accounting), not a
+/// stream/identity outcome — the interleaved leg retries it a bounded number of times so the
+/// assertion stays about cross-pair bleed, which a retry can never mask.
+async fn route_call(
+    address: SocketAddr,
+    route: &str,
+    bearer: &str,
+    workspace_id: Uuid,
+    memory_id: Uuid,
+    query: &str,
+) -> (u16, Value) {
+    let mut attempt = 0_u32;
+    loop {
+        let (tool, arguments) = route_request(route, workspace_id, memory_id, query);
+        let response = tool_call(address, tool, bearer, arguments).await;
+        if response.0 != 429 || attempt >= 40 {
+            return response;
+        }
+        attempt += 1;
+        tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt))).await;
+    }
+}
+
+async fn pair_reads(
+    address: SocketAddr,
+    bearer: &str,
+    workspace_id: Uuid,
+    memory_id: Uuid,
+    query: &str,
+) -> Vec<(u16, Value)> {
+    let mut responses = Vec::with_capacity(PAIR_READ_ROUTES.len());
+    for route in PAIR_READ_ROUTES {
+        responses.push(route_call(address, route, bearer, workspace_id, memory_id, query).await);
+    }
+    responses
+}
+
+/// Every route succeeded and returned exactly the pair's own memory — nothing from the other
+/// pairs, nothing extra.
+fn assert_pair_reads(pair: &StreamPair, responses: &[(u16, Value)]) {
+    let own = BTreeSet::from([pair.memory_id.to_string()]);
+    for (route, (status, response)) in PAIR_READ_ROUTES.iter().zip(responses) {
+        assert_eq!(*status, 200, "{} {route}: {response}", pair.label);
+        let ids: BTreeSet<String> = match *route {
+            "memory.get" => assert_tool_response(response, ToolName::Memory)["items"]
+                .as_array()
+                .expect("get items")
+                .iter()
+                .map(|item| item["memory_id"].as_str().expect("memory id").to_owned())
+                .collect(),
+            "memory.enumerate" => {
+                assert_tool_response(response, ToolName::Memory)["content"]["items"]
+                    .as_array()
+                    .expect("enumerate items")
+                    .iter()
+                    .map(|item| item["memory_id"].as_str().expect("memory id").to_owned())
+                    .collect()
+            }
+            "context" => assert_tool_response(response, ToolName::Context)["handoff"]["mandatory"]
+                .as_array()
+                .expect("mandatory ids")
+                .iter()
+                .map(|row| row["memory_id"].as_str().expect("memory id").to_owned())
+                .collect(),
+            _ => returned_memory_ids(assert_tool_response(response, ToolName::Recall)),
+        };
+        assert_eq!(
+            ids, own,
+            "{} {route} must return only its own memory: {response}",
+            pair.label
+        );
+    }
+}
+
+/// Every route answered as a tool error carrying `code` — no envelope, no items.
+fn assert_pair_tool_errors(label: &str, responses: &[(u16, Value)], code: &str) {
+    for (route, (status, response)) in PAIR_READ_ROUTES.iter().zip(responses) {
+        assert_eq!(*status, 200, "{label} {route}: {response}");
+        assert_eq!(
+            response["result"]["isError"], true,
+            "{label} {route}: {response}"
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["code"], code,
+            "{label} {route}: {response}"
+        );
+    }
+}
+
+/// Runs `seed` with the fixture handle temporarily pointed at `workspace_id` — the
+/// fixture's owner-side seeders (`seed_synthetic_service_credential`,
+/// `seed_workspace_visible_context_record`, the semantic registry/checkpoint rows) all key off
+/// `handle.workspace_id`, so this is how a second workspace of the SAME tenant is seeded
+/// without a second fixture.
+fn with_workspace<R>(
+    handle: &mut Handle,
+    workspace_id: Uuid,
+    seed: impl FnOnce(&mut Handle) -> R,
+) -> R {
+    let own = std::mem::replace(&mut handle.workspace_id, workspace_id);
+    let out = seed(handle);
+    handle.workspace_id = own;
+    out
+}
+
+/// One seeded pair: credential bound to `handle.workspace_id`, one WORKSPACE_SHARED memory
+/// with its mandatory binding, its Qdrant point registered, and (when `provisioned`) the
+/// family's `v1` serving checkpoint.
+fn seed_pair(
+    handle: &mut Handle,
+    label: &'static str,
+    tag: &str,
+    provisioned: bool,
+) -> (StreamPair, Uuid, humaux_adapters::qdrant::IndexablePayload) {
+    let prefix = format!("{tag}{}", &Uuid::now_v7().simple().to_string()[..12]);
+    let wire = format!("{prefix}.{}", tag.repeat(32));
+    let credential = handle.seed_synthetic_service_credential(
+        SyntheticCredentialScopes::RememberWriteAndContextRead,
+        &prefix,
+        &wire,
+        &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+    );
+    let record = handle.seed_workspace_visible_context_record();
+    let point = Uuid::new_v4();
+    let updated = seed_semantic_registry_row(handle, &record, point);
+    if provisioned {
+        seed_semantic_checkpoint(handle);
+    }
+    (
+        StreamPair {
+            label,
+            workspace_id: handle.workspace_id,
+            bearer: credential.bearer,
+            memory_id: record.memory_id,
+        },
+        point,
+        semantic_payload(handle, updated),
+    )
+}
+
+fn percentile_p50(samples: &mut [Duration]) -> Duration {
+    samples.sort_unstable();
+    samples[samples.len() / 2]
+}
+
+/// Card 10 acceptance gate: ONE gateway process (bootstrap write stream = pair A) serves three
+/// distinct provisioned (tenant, workspace) pairs on every read route with strictly disjoint
+/// data. Pair B shares pair A's TENANT — the configuration this card newly enables, where the
+/// enumerate candidate predicate is tenant-wide and isolation rests on the per-request
+/// workspace half of the stream identity (a tenant-level regression cannot mask a workspace
+/// one here); pair C is another tenant. Interleaved concurrent requests for all three never
+/// bleed; a pair-A credential naming B's or C's workspace is `FORBIDDEN`; a same-tenant
+/// memory named under the wrong workspace is `NOT_FOUND`; a same-tenant workspace with
+/// membership but no serving projection is `DEPENDENCY_UNAVAILABLE` on all four routes (never
+/// a synthetic empty stream, ADR-0031 D-A); a body `tenant_id` is rejected by the closed
+/// schemas before dispatch; and the §34.0.1 receipt key pins to (tenant, principal,
+/// operation, idempotency_key) — no `projection_version` — so pairs' replays never collide
+/// (ADR-0031 D-C).
+#[test]
+#[ignore = "requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+#[allow(clippy::too_many_lines)] // ADR-0031: one live oracle keeps three pairs, four routes, 18 interleaved tasks and the cross-pair/unprovisioned refusals causally ordered against ONE gateway process (same precedent as the real-Qdrant live test).
+fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>(
+        "native_mcp_one_process_serves_three_stream_pairs_per_request_pair_c",
+        |mut pair_c_handle| {
+            let _c_cleanup = SemanticProjectionCleanup {
+                owner: pair_c_handle.owner_client().expect("pair C cleanup owner"),
+                tenant_id: pair_c_handle.tenant_id,
+            };
+            pair_c_handle.seed_current_entitlement_and_window(400);
+            let (pair_c, c_point, c_payload) = seed_pair(&mut pair_c_handle, "pair C", "c", true);
+            run_db_fixture::<Fixture, _>(
+                "native_mcp_one_process_serves_three_stream_pairs_per_request_pair_a",
+                |mut handle| {
+                    handle.assert_gateway_login();
+                    let _a_cleanup = SemanticProjectionCleanup {
+                        owner: handle.owner_client().expect("pair A cleanup owner"),
+                        tenant_id: handle.tenant_id,
+                    };
+                    handle.seed_current_entitlement_and_window(600);
+                    let (pair_a, a_point, a_payload) = seed_pair(&mut handle, "pair A", "a", true);
+                    // Pair B: the SAME tenant as A, a second workspace with its own credential.
+                    let b_workspace = handle.seed_workspace();
+                    let (pair_b, b_point, b_payload) =
+                        with_workspace(&mut handle, b_workspace, |handle| {
+                            seed_pair(handle, "pair B", "b", true)
+                        });
+                    // Pair D: same tenant, real membership, but NO serving projection — the
+                    // unprovisioned control for the serving gate.
+                    let d_workspace = handle.seed_workspace();
+                    let (pair_d, _d_point, _d_payload) =
+                        with_workspace(&mut handle, d_workspace, |handle| {
+                            seed_pair(handle, "pair D", "d", false)
+                        });
+                    assert_eq!(pair_a.workspace_id, handle.workspace_id);
+                    assert_ne!(pair_a.workspace_id, pair_b.workspace_id);
+                    assert_ne!(handle.tenant_id, pair_c_handle.tenant_id);
+
+                    // ADR-0031 D-C: the receipt key is (tenant, principal, operation,
+                    // idempotency_key) + request_fingerprint; projection_version is a payload
+                    // column, never part of the key, so N pairs per process cannot collide.
+                    let key_columns: Vec<String> = handle
+                        .admin
+                        .query(
+                            "SELECT a.attname::text FROM pg_constraint c \
+                             CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
+                             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum \
+                             WHERE c.conrelid = 'control.operation_receipts'::regclass \
+                               AND c.contype = 'p' ORDER BY k.ord",
+                            &[],
+                        )
+                        .expect("receipt primary key columns")
+                        .iter()
+                        .map(|row| row.get::<_, String>(0))
+                        .collect();
+                    assert_eq!(
+                        key_columns,
+                        ["tenant_id", "principal_id", "operation", "idempotency_key"],
+                        "§34.0.1 receipt key must stay per (tenant, principal) and carry no projection_version"
+                    );
+
+                    // Both tenants are placed in ONE shared collection: disjointness must come
+                    // from the per-request tenant + workspace filters, not from physical
+                    // separation (A and B are one tenant, so they share the placement too).
+                    let cell = CellId(Uuid::now_v7());
+                    let registry = semantic_qdrant_registry(
+                        cell,
+                        CallerId("gateway-multi-pair-acceptance".to_owned()),
+                    );
+                    let transport = Arc::new(
+                        HttpIntraCellTransport::new(
+                            registry.clone(),
+                            Duration::from_secs(10),
+                            humaux_infra_cell::DEFAULT_MAX_RESPONSE_BYTES,
+                        )
+                        .expect("semantic Qdrant transport"),
+                    );
+                    let collection = format!("gateway_multi_pair_{}", Uuid::now_v7().simple());
+                    seed_tenant_placement(&mut handle, &collection);
+                    seed_tenant_placement(&mut pair_c_handle, &collection);
+                    let runtime_handle = handle.rt.handle().clone();
+                    let runtime = runtime_handle
+                        .block_on(handle.fresh_runtime())
+                        .expect("fresh Gateway runtime");
+                    let gateway_uid = runtime_handle.block_on(semantic_own_uid());
+                    let socket_path = runtime_handle.block_on(spawn_semantic_worker(gateway_uid));
+                    let embedding_port: Arc<
+                        dyn humaux_application::retrieval_embedding_port::RetrievalEmbeddingPort,
+                    > = Arc::new(
+                        humaux_gateway::retrieval_embedding_client::GatewayRetrievalEmbeddingClient::new(
+                            Arc::new(
+                                runtime_handle
+                                    .block_on(RuntimeDbPool::connect(
+                                        &std::env::var("HUMAUX_GATEWAY_PG_DSN")
+                                            .expect("fixture requires HUMAUX_GATEWAY_PG_DSN"),
+                                    ))
+                                    .expect("gateway runtime pool for the embedding client"),
+                            ),
+                            socket_path,
+                            registry.clone(),
+                            Duration::from_secs(30),
+                        ),
+                    );
+                    let semantic = SemanticRecallRuntime::new(
+                        semantic_scanner(),
+                        embedding_port,
+                        transport.clone(),
+                        registry.clone(),
+                        SemanticRecallVersions {
+                            embedding_version: "embed-v1".to_owned(),
+                            dimension: 4,
+                        },
+                        Duration::from_secs(10),
+                    )
+                    .expect("trusted semantic runtime");
+                    // The ONE process: its bootstrap write stream is pair A's.
+                    let app = application(&handle, runtime).with_semantic_recall(semantic);
+                    let query = "operation receipt scoped context";
+                    let pairs = [pair_a.clone(), pair_b.clone(), pair_c.clone()];
+                    runtime_handle.block_on(async {
+                        create_semantic_collection(&transport, &registry, &collection).await;
+                        let permit = authorize_cell_access(
+                            &registry,
+                            IntraCellResource::QDRANT_REST,
+                            Duration::from_secs(60),
+                        )
+                        .expect("semantic upsert permit");
+                        let vector = semantic_vector(query);
+                        upsert(
+                            transport.as_ref(),
+                            &permit,
+                            &collection,
+                            &[
+                                (PointId::Uuid(a_point), &a_payload, vector.clone()),
+                                (PointId::Uuid(b_point), &b_payload, vector.clone()),
+                                (PointId::Uuid(c_point), &c_payload, vector),
+                            ],
+                            ha_profile_for(QdrantOperation::NormalImmutableUpsert),
+                        )
+                        .await
+                        .expect("real Qdrant points for all pairs");
+                        let (address, server) = start(app).await;
+
+                        // Sequential sanity for each pair, plus p50 for the card's speed record
+                        // (uncontended: no 429 retry ever fires here).
+                        for pair in &pairs {
+                            assert_pair_reads(
+                                pair,
+                                &pair_reads(
+                                    address,
+                                    &pair.bearer,
+                                    pair.workspace_id,
+                                    pair.memory_id,
+                                    query,
+                                )
+                                .await,
+                            );
+                            for route in PAIR_READ_ROUTES {
+                                let mut samples = Vec::new();
+                                for _ in 0..5 {
+                                    let started = Instant::now();
+                                    let (status, response) = route_call(
+                                        address,
+                                        route,
+                                        &pair.bearer,
+                                        pair.workspace_id,
+                                        pair.memory_id,
+                                        query,
+                                    )
+                                    .await;
+                                    assert_eq!(status, 200, "{} {route}: {response}", pair.label);
+                                    samples.push(started.elapsed());
+                                }
+                                eprintln!(
+                                    "card10 p50 {} {route}: {:?} (n={})",
+                                    pair.label,
+                                    percentile_p50(&mut samples),
+                                    samples.len()
+                                );
+                            }
+                        }
+
+                        // Interleaved: all pairs, all four routes, concurrently on the one
+                        // process. A process-wide (rather than per-request) StreamKey would
+                        // serve some of these requests under another pair's identity — for
+                        // pair B that is caught by the WORKSPACE half alone (same tenant).
+                        let mut tasks = JoinSet::new();
+                        for round in 0..6_u8 {
+                            for pair in pairs.iter().cloned() {
+                                tasks.spawn(async move {
+                                    let responses = pair_reads(
+                                        address,
+                                        &pair.bearer,
+                                        pair.workspace_id,
+                                        pair.memory_id,
+                                        query,
+                                    )
+                                    .await;
+                                    (round, pair, responses)
+                                });
+                            }
+                        }
+                        let mut completed = 0;
+                        while let Some(joined) = tasks.join_next().await {
+                            let (round, pair, responses) = joined.expect("interleaved read task");
+                            assert_pair_reads(&pair, &responses);
+                            completed += 1;
+                            let _ = round;
+                        }
+                        assert_eq!(completed, 18, "every interleaved task must report");
+
+                        // Cross-pair: pair A's credential naming another pair's workspace —
+                        // same tenant (B) or not (C) — is refused by membership narrowing on
+                        // every route, before any stream/object read.
+                        for other in [&pair_b, &pair_c] {
+                            for (route, (status, response)) in PAIR_READ_ROUTES.iter().zip(
+                                pair_reads(
+                                    address,
+                                    &pair_a.bearer,
+                                    other.workspace_id,
+                                    other.memory_id,
+                                    query,
+                                )
+                                .await,
+                            ) {
+                                assert_eq!(status, 403, "A→{} {route}: {response}", other.label);
+                                assert_eq!(
+                                    response["error"]["data"]["code"], "FORBIDDEN",
+                                    "A→{} {route}: {response}",
+                                    other.label
+                                );
+                            }
+                        }
+                        // ... and another pair's memory named under pair A's own workspace
+                        // stays an invisible target (NOT_FOUND, never an existence oracle) —
+                        // for B this is the same-tenant case the tenant filter cannot catch.
+                        for other in [&pair_b, &pair_c] {
+                            let (status, response) = tool_call(
+                                address,
+                                "memory",
+                                &pair_a.bearer,
+                                json!({"action":"get","memory_id":other.memory_id,"workspace_id":pair_a.workspace_id}),
+                            )
+                            .await;
+                            assert_eq!(
+                                status, 200,
+                                "cross-pair get ({}) is a tool error: {response}",
+                                other.label
+                            );
+                            assert_memory_not_found(&response);
+                        }
+                        // Pair D: membership and a real credential, but the family has no
+                        // serving projection — every route fails closed, none fabricates a
+                        // complete ledger over the tenant's rows.
+                        assert_pair_tool_errors(
+                            "unprovisioned same-tenant pair D",
+                            &pair_reads(
+                                address,
+                                &pair_d.bearer,
+                                pair_d.workspace_id,
+                                pair_d.memory_id,
+                                query,
+                            )
+                            .await,
+                            "DEPENDENCY_UNAVAILABLE",
+                        );
+                        // A workspace outside the credential's membership on any route still
+                        // fails closed (403).
+                        let unprovisioned = Uuid::now_v7();
+                        for (route, (status, response)) in PAIR_READ_ROUTES.iter().zip(
+                            pair_reads(
+                                address,
+                                &pair_b.bearer,
+                                unprovisioned,
+                                pair_b.memory_id,
+                                query,
+                            )
+                            .await,
+                        ) {
+                            assert_eq!(status, 403, "non-member workspace {route}: {response}");
+                        }
+                        // The tenant is the principal's, never an argument: a body `tenant_id`
+                        // (pair C's) dies at the closed schema before any dispatch could read it.
+                        for route in PAIR_READ_ROUTES {
+                            let (tool, mut arguments) =
+                                route_request(route, pair_a.workspace_id, pair_a.memory_id, query);
+                            arguments["tenant_id"] = json!(pair_c_handle.tenant_id);
+                            let (status, response) =
+                                tool_call(address, tool, &pair_a.bearer, arguments).await;
+                            assert_eq!(status, 400, "body tenant_id {route}: {response}");
+                            assert_eq!(
+                                response["error"]["data"]["code"], "INVALID_INPUT",
+                                "body tenant_id {route}: {response}"
+                            );
+                        }
+
+                        stop_server(server).await.expect("stop multi-pair server");
+                        delete_semantic_collection(&transport, &registry, &collection).await;
+                    });
+                },
+            );
+        },
+    );
 }

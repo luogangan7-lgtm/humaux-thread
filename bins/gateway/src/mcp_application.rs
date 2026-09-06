@@ -736,7 +736,8 @@ impl GatewayMcpApplication {
 
     /// §36 `memory.supersede` through the shared §33.10 confirm gate (ADR-0018). The
     /// schema carries no `workspace_id`: the route is the credential's bound workspace,
-    /// which must be the bootstrap projection stream's workspace (same rule as `memory.get`).
+    /// which must be the bootstrap projection stream's workspace (write routes stay
+    /// bootstrap-bound until card 11; reads derive their stream per request, ADR-0031).
     async fn memory_supersede(
         &self,
         context: &McpHttpContext,

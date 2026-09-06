@@ -8446,6 +8446,8 @@ Quota logic
 
 replay_expires_at 仅表示允许重建正常结果的期限，来自显式服务端策略，不是键复用期限。到期保留不可重新执行的墓碑并返回 CONFLICT，不重新 reserve；物理清理需另走保留/删除治理，不能通过清理悄悄恢复同键写入能力。Evidence 删除后的引用必须保留防重放墓碑、不得阻塞冻结的删除链；具体删除联动同 §37。
 
+**Stream identity 与 N pair / 进程（Q9 裁决，ADR-0031）**：没有 stream registry 表；§15.1 的六元组 `StreamKey` 本身就是身份。读路由（`memory.get/enumerate`、`recall.search`、`context.assemble`）按请求推导：`principal tenant_id` + 已经成员资格收窄的请求 `workspace_id` + 进程配置的 `(scope_kind, domain, projection_kind, projection_version)`；只按请求推导、不按进程缓存、不加 PG 往返。pair 的存在性只由 §16.2 的 serving 读证明：四条读路由都先经 `serving_version(family)`（gateway 侧经 `private_read_projection_selector`），family 没有 `serving` 行 ⇒ `DEPENDENCY_UNAVAILABLE`，绝不落到 §15.4「无 checkpoint 行 ⇒ 全 0」的合成空账本；非成员 workspace 由成员资格收窄关闭（`FORBIDDEN`）。写路由到卡 11 之前仍绑定 bootstrap 的一条写流。本节的 receipt 键 `(tenant_id, principal_id, operation, idempotency_key)` + `request_fingerprint` 不含 `projection_version`（它只是 payload 列），所以一个进程服务 N 个 pair 不需要任何额外语义。
+
 验收 gate：真实 gateway LOGIN；同键同字节并发只一次 writer/Evidence/消费；同键异字节拒绝；COMMIT 后响应丢失再试返回原 Evidence；事务内 audit/receipt/settle 故障全部回滚；COMMIT 结果不确定靠真实 receipt 恢复；过期、授权撤销或 Evidence 不可见均不重执；reaper 不退已提交写入。移除幂等锁/绑定或把 settle 移到事务外时负对照必须失败。批次发票能力隔离仍按 §34.2，不借普通写入发票。
 
 ## 34.1 `batch_id` 可选 —— 三条写入路径穷尽
