@@ -1,0 +1,58 @@
+# §46.1 migration manifest. ADR-0033 (card 12, §6.3 membership lifecycle admin path): grants
+# role_maintenance INSERT + column-level UPDATE(state, role, updated_at) on control.memberships,
+# creates the owner SECURITY DEFINER control.bump_user_security_epoch(uuid) (increment-only
+# writer for control.users.security_epoch, EXECUTE to role_maintenance only) and extends
+# control.audit_event_insert's EXECUTE list to role_maintenance. No DDL on any table, no DML, no
+# policy change. §46 forward-fix (EXPAND_CONTRACT, next free number after 0160).
+
+migration_id = "0161_membership_lifecycle_admin_path"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.memberships') is not null
+ and to_regclass('control.users') is not null
+ and to_regprocedure('control.audit_event_insert(uuid,timestamptz,uuid,text,text,text,text,text,text,text,text,inet,text,text[],text,text,jsonb)') is not null
+ and to_regprocedure('control.bump_user_security_epoch(uuid)') is null
+ and not has_table_privilege('role_maintenance','control.memberships','INSERT')
+ and not has_column_privilege('role_maintenance','control.memberships','state','UPDATE')
+ as precheck_ok
+"""
+
+postcheck = """
+select has_table_privilege('role_maintenance','control.memberships','INSERT')
+ and has_column_privilege('role_maintenance','control.memberships','state','UPDATE')
+ and has_column_privilege('role_maintenance','control.memberships','role','UPDATE')
+ and has_column_privilege('role_maintenance','control.memberships','updated_at','UPDATE')
+ and not has_column_privilege('role_maintenance','control.memberships','tenant_id','UPDATE')
+ and not has_column_privilege('role_maintenance','control.memberships','user_id','UPDATE')
+ and not has_table_privilege('role_maintenance','control.memberships','DELETE')
+ -- the only other writer of control.memberships stays the owner
+ and not has_table_privilege('role_gateway','control.memberships','INSERT')
+ and not has_column_privilege('role_gateway','control.memberships','state','UPDATE')
+ -- control.users: no column grant to anyone but the owner; the definer is the sole writer
+ and not has_column_privilege('role_maintenance','control.users','security_epoch','UPDATE')
+ and (select p.prosecdef and pg_get_userbyid(p.proowner)='role_migration_owner'
+        and p.proconfig @> array['search_path=pg_catalog, control']
+      from pg_proc p where p.oid='control.bump_user_security_epoch(uuid)'::regprocedure)
+ and has_function_privilege('role_maintenance','control.bump_user_security_epoch(uuid)','EXECUTE')
+ and not has_function_privilege('role_gateway','control.bump_user_security_epoch(uuid)','EXECUTE')
+ and not exists(select 1 from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                where p.oid='control.bump_user_security_epoch(uuid)'::regprocedure
+                  and x.grantee=0 and x.privilege_type='EXECUTE')
+ and has_function_privilege('role_maintenance',
+       'control.audit_event_insert(uuid,timestamptz,uuid,text,text,text,text,text,text,text,text,inet,text,text[],text,text,jsonb)','EXECUTE')
+ -- untouched: 0160 role closed set + trigger, FORCE RLS and the tenant policy
+ and exists(select 1 from pg_constraint where conrelid='control.memberships'::regclass
+            and conname='memberships_role_known' and convalidated)
+ and exists(select 1 from pg_trigger where tgrelid='control.memberships'::regclass
+            and tgname='memberships_canonical_role' and not tgisinternal)
+ and exists(select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
+            where n.nspname='control' and c.relname='memberships'
+              and c.relrowsecurity and c.relforcerowsecurity)
+ and exists(select 1 from pg_policies where schemaname='control' and tablename='memberships'
+            and policyname='memberships_tenant_isolation')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. REVOKE the two control.memberships grants and DROP control.bump_user_security_epoch(uuid) only together with retiring the adapter (adapters::membership_repo) and `xtask member`; otherwise the admin path silently degrades to 42501 and tenant onboarding falls back to raw owner SQL. The audit_event_insert EXECUTE extension is harmless to keep."
+backup_restore_requirement = "none beyond the standard pre-migration backup: grant/function-only, no table DDL, no DML."

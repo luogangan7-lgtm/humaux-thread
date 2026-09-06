@@ -1285,6 +1285,27 @@ const ADDITIVE_SEAM_MATRIX: &[Cell] = &[
         ["SELECT"]
     ),
     cell!("private.evidence_affects", "role_maintenance", ["SELECT"]),
+    // 0161 / ADR-0033 (card 12): control.memberships leaves the control-domain default so
+    // the §6.3 membership lifecycle admin path is the one writer — role_maintenance holds
+    // INSERT + column-level UPDATE(state, role, updated_at); every runtime role keeps the
+    // domain-default SELECT; batch_issuer/admin stay `—`. control.users is NOT named: its
+    // security_epoch is written only through the owner definer
+    // control.bump_user_security_epoch(uuid) (EXECUTE to role_maintenance), no column grant.
+    cell!("control.memberships", "role_gateway", ["SELECT"]),
+    cell!("control.memberships", "role_private_worker", ["SELECT"]),
+    cell!(
+        "control.memberships",
+        "role_consolidation_worker",
+        ["SELECT"]
+    ),
+    cell!("control.memberships", "role_public_worker", ["SELECT"]),
+    cell!("control.memberships", "role_retrieval_worker", ["SELECT"]),
+    cell!(
+        "control.memberships",
+        "role_maintenance",
+        ["SELECT", "INSERT"],
+        [("UPDATE", ["state", "role", "updated_at"])]
+    ),
 ];
 
 /// Named §6.2.2 tables whose non-owner cells are all deliberately empty. Their only public

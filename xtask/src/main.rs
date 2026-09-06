@@ -14,6 +14,7 @@ mod dod_check;
 mod e2e_seed;
 mod gate_registry;
 mod mechanism_registry;
+mod member;
 mod metrics_registry;
 mod migrate;
 mod migration_rehearsal;
@@ -43,10 +44,11 @@ fn main() {
         Some("card-version") => card_version::run(&args[2..]),
         Some("migrate") => migrate::run(&args[2..]),
         Some("e2e-seed") => e2e_seed::run(&args[2..]),
+        Some("member") => member::run(&args[2..]),
         Some("projection-serve") => projection_serve::run(&args[2..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|r4-fault-manifest|direction-table|card-version|migrate|e2e-seed|projection-serve>"
+                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|r4-fault-manifest|direction-table|card-version|migrate|e2e-seed|member|projection-serve>"
             );
             2
         }

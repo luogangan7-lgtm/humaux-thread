@@ -29,6 +29,7 @@ pub mod exact_census;
 pub mod forget_repo;
 pub mod jobs;
 pub mod mechanism_observation;
+pub mod membership_repo;
 pub mod memory_governance_repo;
 pub mod model_call_ledger;
 pub mod openbao;

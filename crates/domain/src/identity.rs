@@ -250,6 +250,193 @@ pub fn can_read(scope: &AuthorizationScope, object: &VisibilityDescriptor) -> bo
     }
 }
 
+// ============================================================================
+// §6.3 MembershipState machine (ADR-0033, card 12)
+// ============================================================================
+
+/// §6.3 `MembershipState` — the closed four-state set `INVITED / ACTIVE / SUSPENDED /
+/// REMOVED`, spelled once here (§78.2) in the exact form `control.memberships.state`'s
+/// CHECK constraint (migration 0003) stores it. `REMOVED` is terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MembershipState {
+    /// Row exists, the user has not accepted / been activated yet.
+    Invited,
+    /// Full member.
+    Active,
+    /// Access withheld (security/compliance/admin policy); data retained.
+    Suspended,
+    /// Terminal: the membership is gone; no transition leaves this state.
+    Removed,
+}
+
+impl MembershipState {
+    /// Every state, database spelling order.
+    pub const ALL: [MembershipState; 4] =
+        [Self::Invited, Self::Active, Self::Suspended, Self::Removed];
+
+    /// The stored spelling (`control.memberships.state` CHECK, migration 0003).
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Invited => "INVITED",
+            Self::Active => "ACTIVE",
+            Self::Suspended => "SUSPENDED",
+            Self::Removed => "REMOVED",
+        }
+    }
+
+    /// Parses the stored spelling; anything outside the closed set is `None` (a row the
+    /// CHECK constraint would never have admitted — the caller fails closed, §78.2).
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_db_str() == value)
+    }
+}
+
+/// §6.3 / migration 0160 `control.memberships.role` closed set `OWNER | ADMIN | MEMBER`.
+/// `Owner` is the role the last-OWNER rule (§6.3 Ownership / Offboarding) protects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MembershipRole {
+    /// Holds tenant-level authority; a tenant must keep at least one ACTIVE owner.
+    Owner,
+    /// Tenant administration without the ownership invariant.
+    Admin,
+    /// Plain member.
+    Member,
+}
+
+impl MembershipRole {
+    /// Every role, database spelling order.
+    pub const ALL: [MembershipRole; 3] = [Self::Owner, Self::Admin, Self::Member];
+
+    /// The stored spelling (`memberships_role_known` CHECK, migration 0160).
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Owner => "OWNER",
+            Self::Admin => "ADMIN",
+            Self::Member => "MEMBER",
+        }
+    }
+
+    /// Parses the stored spelling (case-sensitive: 0160 canonicalizes on write, so the
+    /// column only ever holds these three spellings); unknown ⇒ `None`.
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_db_str() == value)
+    }
+}
+
+/// One requested §6.3 membership mutation, as the admin path (`xtask member`) issues it.
+/// `Invite` is not here: it creates the row (`INVITED`) rather than transitioning one, and
+/// has no "from" state to judge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipMutation {
+    /// `INVITED → ACTIVE` (accept) or `SUSPENDED → ACTIVE` (reinstate).
+    Activate,
+    /// `ACTIVE → SUSPENDED`.
+    Suspend,
+    /// `INVITED | ACTIVE | SUSPENDED → REMOVED` (terminal).
+    Remove,
+    /// Role change on an `ACTIVE` membership; state unchanged.
+    ChangeRole(MembershipRole),
+}
+
+/// Why a [`MembershipMutation`] was refused by the type (never by the database — the CHECK
+/// constraints only close the value sets, the machine lives here). All three surface as
+/// `ErrorCode::Conflict` (§52: the object is in a state that refuses the request).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipConflict {
+    /// The membership is already in the requested state / already holds the role.
+    AlreadyInState,
+    /// The machine has no such edge (e.g. anything out of `REMOVED`, `INVITED → SUSPENDED`).
+    TransitionNotAllowed,
+    /// §6.3 "last OWNER cannot silently leave": the mutation would leave the tenant with no
+    /// `ACTIVE` `OWNER`. Transfer ownership first (promote another ACTIVE member to OWNER).
+    LastOwner,
+}
+
+impl MembershipConflict {
+    /// The wire error code every membership conflict maps to.
+    pub const fn error_code(self) -> ErrorCode {
+        ErrorCode::Conflict
+    }
+
+    /// SCREAMING_SNAKE spelling, defined once (§78.2) — what the §77 audit row of a refused
+    /// membership mutation records as its `refusal`, and what `Display` prints.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadyInState => "ALREADY_IN_STATE",
+            Self::TransitionNotAllowed => "TRANSITION_NOT_ALLOWED",
+            Self::LastOwner => "LAST_OWNER",
+        }
+    }
+}
+
+/// The current row the machine judges, plus the one fact outside the row the last-OWNER
+/// rule needs: how many *other* memberships of the same tenant are `ACTIVE` `OWNER`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MembershipSnapshot {
+    pub state: MembershipState,
+    pub role: MembershipRole,
+    /// `ACTIVE` owners of the tenant *excluding* this membership.
+    pub other_active_owners: u32,
+}
+
+/// The row after a permitted mutation, plus whether §6.3 requires a security-epoch bump for
+/// it ("membership removed/suspended" and "role/security-sensitive policy changed" ⇒ bump;
+/// invite/activate do not — bumping on activation would also revoke the user's live
+/// credentials in *other* tenants for no security reason).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MembershipTransition {
+    pub state: MembershipState,
+    pub role: MembershipRole,
+    pub bumps_security_epoch: bool,
+}
+
+impl MembershipSnapshot {
+    /// Whether this membership currently counts toward the tenant's ACTIVE-OWNER set.
+    const fn is_active_owner(self) -> bool {
+        matches!(self.state, MembershipState::Active) && matches!(self.role, MembershipRole::Owner)
+    }
+
+    /// §6.3 machine: judges `mutation` against this snapshot. Pure; the adapter applies the
+    /// returned row inside the same transaction as the epoch bump and the audit row.
+    pub fn apply(
+        self,
+        mutation: MembershipMutation,
+    ) -> Result<MembershipTransition, MembershipConflict> {
+        use MembershipConflict::{AlreadyInState, LastOwner, TransitionNotAllowed};
+        use MembershipState::{Active, Invited, Removed, Suspended};
+        let (state, role, bumps) = match (self.state, mutation) {
+            (Removed, _) => return Err(TransitionNotAllowed),
+            (Active, MembershipMutation::Activate) => return Err(AlreadyInState),
+            (Invited | Suspended, MembershipMutation::Activate) => (Active, self.role, false),
+            (Suspended, MembershipMutation::Suspend) => return Err(AlreadyInState),
+            (Invited, MembershipMutation::Suspend) => return Err(TransitionNotAllowed),
+            (Active, MembershipMutation::Suspend) => (Suspended, self.role, true),
+            (Invited | Active | Suspended, MembershipMutation::Remove) => {
+                (Removed, self.role, true)
+            }
+            (Invited | Suspended, MembershipMutation::ChangeRole(_)) => {
+                return Err(TransitionNotAllowed);
+            }
+            (Active, MembershipMutation::ChangeRole(role)) if role == self.role => {
+                return Err(AlreadyInState);
+            }
+            (Active, MembershipMutation::ChangeRole(role)) => (Active, role, true),
+        };
+        // Last-OWNER rule: leaving the ACTIVE-OWNER set is only allowed when someone else is
+        // still in it. Only a membership that is in the set now can leave it.
+        let leaves_owner_set =
+            self.is_active_owner() && !(state == Active && role == MembershipRole::Owner);
+        if leaves_owner_set && self.other_active_owners == 0 {
+            return Err(LastOwner);
+        }
+        Ok(MembershipTransition {
+            state,
+            role,
+            bumps_security_epoch: bumps,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +609,144 @@ mod tests {
             .map(|_| WorkspaceId::new())
             .collect();
         assert_eq!(BoundedSet::new(ids).unwrap_err(), ErrorCode::InvalidInput);
+    }
+
+    // ---- §6.3 MembershipState machine (ADR-0033) ----
+
+    fn snap(state: MembershipState, role: MembershipRole, others: u32) -> MembershipSnapshot {
+        MembershipSnapshot {
+            state,
+            role,
+            other_active_owners: others,
+        }
+    }
+
+    #[test]
+    fn membership_closed_sets_round_trip_their_db_spelling() {
+        for s in MembershipState::ALL {
+            assert_eq!(MembershipState::from_db_str(s.as_db_str()), Some(s));
+        }
+        for r in MembershipRole::ALL {
+            assert_eq!(MembershipRole::from_db_str(r.as_db_str()), Some(r));
+        }
+        assert_eq!(MembershipState::from_db_str("active"), None);
+        assert_eq!(MembershipRole::from_db_str("owner"), None);
+    }
+
+    #[test]
+    fn membership_legal_edges_and_epoch_bumps() {
+        use MembershipMutation::{Activate, ChangeRole, Remove, Suspend};
+        use MembershipRole::{Admin, Member, Owner};
+        use MembershipState::{Active, Invited, Removed, Suspended};
+        let ok = |s, r, o, m| snap(s, r, o).apply(m).expect("legal edge");
+        assert_eq!(
+            ok(Invited, Member, 0, Activate),
+            MembershipTransition {
+                state: Active,
+                role: Member,
+                bumps_security_epoch: false
+            }
+        );
+        assert_eq!(
+            ok(Suspended, Member, 0, Activate),
+            MembershipTransition {
+                state: Active,
+                role: Member,
+                bumps_security_epoch: false
+            }
+        );
+        assert_eq!(
+            ok(Active, Member, 0, Suspend),
+            MembershipTransition {
+                state: Suspended,
+                role: Member,
+                bumps_security_epoch: true
+            }
+        );
+        assert_eq!(ok(Invited, Member, 0, Remove).state, Removed);
+        assert_eq!(
+            ok(Active, Member, 0, Remove),
+            MembershipTransition {
+                state: Removed,
+                role: Member,
+                bumps_security_epoch: true
+            }
+        );
+        assert_eq!(ok(Suspended, Owner, 0, Remove).state, Removed);
+        assert_eq!(
+            ok(Active, Member, 0, ChangeRole(Admin)),
+            MembershipTransition {
+                state: Active,
+                role: Admin,
+                bumps_security_epoch: true
+            }
+        );
+        // An owner may leave the owner set when another ACTIVE owner remains.
+        assert_eq!(ok(Active, Owner, 1, Remove).state, Removed);
+        assert_eq!(ok(Active, Owner, 1, Suspend).state, Suspended);
+        assert_eq!(ok(Active, Owner, 1, ChangeRole(Member)).role, Member);
+    }
+
+    #[test]
+    fn membership_removed_is_terminal_and_illegal_edges_are_typed() {
+        use MembershipConflict::{AlreadyInState, TransitionNotAllowed};
+        use MembershipMutation::{Activate, ChangeRole, Remove, Suspend};
+        use MembershipRole::{Admin, Member};
+        use MembershipState::{Active, Invited, Removed, Suspended};
+        for m in [Activate, Suspend, Remove, ChangeRole(Admin)] {
+            assert_eq!(
+                snap(Removed, Member, 5).apply(m),
+                Err(TransitionNotAllowed),
+                "{m:?}"
+            );
+        }
+        assert_eq!(snap(Active, Member, 0).apply(Activate), Err(AlreadyInState));
+        assert_eq!(
+            snap(Suspended, Member, 0).apply(Suspend),
+            Err(AlreadyInState)
+        );
+        assert_eq!(
+            snap(Invited, Member, 0).apply(Suspend),
+            Err(TransitionNotAllowed)
+        );
+        assert_eq!(
+            snap(Invited, Member, 0).apply(ChangeRole(Admin)),
+            Err(TransitionNotAllowed)
+        );
+        assert_eq!(
+            snap(Suspended, Member, 0).apply(ChangeRole(Admin)),
+            Err(TransitionNotAllowed)
+        );
+        assert_eq!(
+            snap(Active, Member, 0).apply(ChangeRole(Member)),
+            Err(AlreadyInState)
+        );
+        assert_eq!(AlreadyInState.error_code(), ErrorCode::Conflict);
+    }
+
+    #[test]
+    fn membership_last_active_owner_cannot_leave_the_owner_set() {
+        use MembershipConflict::LastOwner;
+        use MembershipMutation::{Activate, ChangeRole, Remove, Suspend};
+        use MembershipRole::{Member, Owner};
+        use MembershipState::{Active, Invited, Suspended};
+        let last = snap(Active, Owner, 0);
+        assert_eq!(last.apply(Remove), Err(LastOwner));
+        assert_eq!(last.apply(Suspend), Err(LastOwner));
+        assert_eq!(last.apply(ChangeRole(Member)), Err(LastOwner));
+        // Not in the ACTIVE-OWNER set ⇒ the rule does not apply (the tenant is already
+        // ownerless or owned by someone else; removing this row changes nothing).
+        assert_eq!(
+            snap(Suspended, Owner, 0).apply(Remove).map(|t| t.state),
+            Ok(MembershipState::Removed)
+        );
+        assert_eq!(
+            snap(Invited, Owner, 0).apply(Remove).map(|t| t.state),
+            Ok(MembershipState::Removed)
+        );
+        assert_eq!(
+            snap(Suspended, Owner, 0).apply(Activate).map(|t| t.state),
+            Ok(Active)
+        );
     }
 }

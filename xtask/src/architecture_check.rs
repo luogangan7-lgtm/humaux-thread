@@ -6852,8 +6852,19 @@ mod tests {
     // `crates/infra-cell/tests/intra_cell_topology_ui.rs`'s `trybuild` fixture instead.
     // ============================================================================
 
+    /// The clean fixture enumerates exactly the registry's variants — derived from
+    /// [`INTRA_CELL_RESOURCE_REGISTRY`] so a registry addition (RETRIEVAL_EMBEDDING_RPC /
+    /// PRIVATE_INFERENCE_RPC landed with the Distill/embedding hops) cannot leave this fixture
+    /// stale and red for an unrelated card.
     fn intra_cell_resource_fixture() -> String {
-        "pub enum IntraCellResource {\n    QDRANT_REST,\n}\n".to_string()
+        let mut src = String::from("pub enum IntraCellResource {\n");
+        for variant in INTRA_CELL_RESOURCE_REGISTRY {
+            src.push_str("    ");
+            src.push_str(variant);
+            src.push_str(",\n");
+        }
+        src.push_str("}\n");
+        src
     }
 
     #[test]
@@ -8072,16 +8083,17 @@ mod tests {
     // -- Gate 7/7: Embedding projection write contains provider/model/version metadata -------
 
     #[test]
-    fn provider_plane_gate7_real_repo_is_honestly_not_applicable() {
-        // §19 review: the only `INSERT INTO private.processing_runs` in the workspace today is
-        // `crates/adapters/tests/processing_runs_fingerprint_rerun.rs` — a test fixture, now
-        // excluded from evidence (module doc above). Pinned so a future real (non-`tests/`)
-        // write path landing is *noticed* (this test starts failing, telling the next agent to
-        // flip the pin to `Pass`) instead of the gate silently staying green on a test double.
-        assert!(matches!(
+    fn provider_plane_gate7_real_repo_projection_write_carries_model_metadata() {
+        // §19 review: the Distill hop (ADR-0016, crates/adapters/src/distill_repo.rs) is now a
+        // real, non-`tests/` `INSERT INTO private.processing_runs` write path, so the pin flips
+        // from `NotApplicable` (the pre-Distill state, when only a test fixture wrote the table)
+        // to `Pass`: the write must carry provider / model / revision metadata. If this ever
+        // fails with `Fail`, a real write path dropped the §19 metadata — fix the write, not
+        // this pin.
+        assert_eq!(
             provider_plane_gate7_projection_write_has_model_metadata(&real_root()),
-            Verdict::NotApplicable(_)
-        ));
+            Verdict::Pass
+        );
     }
 
     #[test]

@@ -18,6 +18,9 @@ use std::{
 
 use humaux_adapters::{
     forget_repo,
+    membership_repo::{
+        self, AdminAction, MembershipOutcome, MembershipRepoError, MembershipRequest,
+    },
     operation_receipt::{self, AtomicRememberRequest},
     postgres::RuntimeDbPool,
     qdrant::{
@@ -33,7 +36,10 @@ use humaux_domain::{
     context::ContextBudget,
     dataclass::DataClass,
     evidence::{EvidenceOriginClass, payload_sha256},
-    identity::{AuthorizationScope, BoundedSet, PrincipalId, VisibilityClass},
+    identity::{
+        AuthorizationScope, BoundedSet, MembershipConflict, MembershipMutation, MembershipRole,
+        MembershipState, PrincipalId, VisibilityClass,
+    },
     ids::{TenantId, UserId, WorkspaceId},
     memory::MemoryType,
 };
@@ -8599,6 +8605,293 @@ fn native_mcp_remember_put_per_call_visibility_and_per_request_stream() {
             });
                 },
             );
+        },
+    );
+}
+
+// ============================================================================
+// Card 12 / ADR-0033: membership lifecycle → security epoch → bearer rejected on the very
+// next request (no token TTL wait), last OWNER protected, audit rows present.
+// ============================================================================
+
+/// `(SUCCESS rows, DENIED rows)` — §77: applied and refused membership requests both audit.
+fn membership_audit_counts(handle: &mut Handle) -> (i64, i64) {
+    let row = handle
+        .admin
+        .query_one(
+            "SELECT count(*) FILTER (WHERE result='SUCCESS'), \
+                    count(*) FILTER (WHERE result='DENIED'), count(*) \
+             FROM control.audit_events \
+             WHERE tenant_id=$1 AND action LIKE 'MEMBERSHIP_%' AND actor_type='ADMIN'",
+            &[&handle.tenant_id],
+        )
+        .expect("owner counts membership audit rows");
+    let (success, denied, total): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
+    assert_eq!(success + denied, total);
+    (success, denied)
+}
+
+const MEMBERSHIP_ADMIN: AdminAction<'static> = AdminAction {
+    actor: "card12-e2e",
+    reason: "gateway e2e: suspend rejects bearer on next request",
+    ticket: "OPS-12-E2E",
+    trace_id: "trace-card12-e2e",
+    step_up_auth_context: "test-fixture:maintenance-dsn",
+};
+
+fn user_security_epoch(handle: &mut Handle, user_id: Uuid) -> i64 {
+    handle
+        .admin
+        .query_one(
+            "SELECT security_epoch FROM control.users WHERE user_id=$1",
+            &[&user_id],
+        )
+        .expect("owner reads user epoch")
+        .get(0)
+}
+
+/// The admin path under the fixture's real `role_maintenance` pool. Awaited inside the
+/// test's runtime (never `rt.block_on` from within it).
+async fn membership_apply(
+    handle: &Handle,
+    user_id: Uuid,
+    request: MembershipRequest,
+) -> Result<MembershipOutcome, MembershipRepoError> {
+    membership_repo::apply(
+        &handle.maintenance,
+        TenantId(handle.tenant_id),
+        UserId(user_id),
+        request,
+        MEMBERSHIP_ADMIN,
+    )
+    .await
+}
+
+/// Binds a fresh synthetic credential to `user_id` with the user's *current* epoch snapshot
+/// (what a credential issued after the lifecycle event would carry).
+fn bind_credential_to_user(
+    handle: &mut Handle,
+    credential: &SyntheticServiceCredential,
+    user_id: Uuid,
+    user_epoch: i64,
+) {
+    handle
+        .admin
+        .execute(
+            "UPDATE control.api_keys SET user_id=$2, user_security_epoch=$3 WHERE api_key_id=$1",
+            &[&credential.api_key_id, &user_id, &user_epoch],
+        )
+        .expect("owner binds credential to user");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // one serialized lifecycle story against one gateway
+fn native_mcp_membership_suspend_rejects_bearer_on_next_request_and_last_owner_protected() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>(
+        "native_mcp_membership_suspend_rejects_bearer_on_next_request",
+        |mut handle| {
+            handle.assert_gateway_login();
+            // Quota window for the tenant (the peer's calls draw on it too).
+            let prefix = format!("mown{}", &Uuid::now_v7().simple().to_string()[..12]);
+            let wire = format!("{prefix}.{}", "a".repeat(32));
+            let _owner_credential = handle.seed_synthetic_service_credential_and_window(
+                SyntheticCredentialScopes::ContextRead,
+                &prefix,
+                &wire,
+                &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+                64,
+            );
+            let peer_user = handle.seed_peer_user();
+            let peer_prefix = format!("mpe1{}", &Uuid::now_v7().simple().to_string()[..12]);
+            let peer_wire = format!("{peer_prefix}.{}", "b".repeat(32));
+            let peer = handle.seed_synthetic_service_credential(
+                SyntheticCredentialScopes::ContextRead,
+                &peer_prefix,
+                &peer_wire,
+                &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &peer_wire),
+            );
+            bind_credential_to_user(&mut handle, &peer, peer_user, 0);
+            let visible = handle.seed_workspace_visible_context_record();
+            let owner_user = handle.user_id;
+            assert_eq!(membership_audit_counts(&mut handle), (0, 0));
+
+            let runtime_handle = handle.rt.handle().clone();
+            let runtime = runtime_handle
+                .block_on(handle.fresh_runtime())
+                .expect("checked membership runtime");
+            let app = application(&handle, runtime);
+            runtime_handle.block_on(async {
+                let (address, server) = start(app).await;
+                let get = || {
+                    rpc(
+                        1,
+                        "tools/call",
+                        call_params(
+                            "memory",
+                            json!({"action":"get","memory_id":visible.memory_id}),
+                        ),
+                    )
+                };
+                let call = |bearer: String| async move {
+                    let (status, response) =
+                        raw_request(address, &tool_call_headers("memory", &bearer), &get()).await;
+                    (status, response)
+                };
+
+                // (1) peer's bearer works while ACTIVE.
+                let (status, response) = call(peer.bearer.clone()).await;
+                assert_eq!(status, 200, "active peer memory.get: {response}");
+                assert_tool_response(&response, ToolName::Memory);
+
+                // (2) suspend ⇒ epoch bumped in the same transaction ⇒ next request 401.
+                let suspended = membership_apply(
+                    &handle,
+                    peer_user,
+                    MembershipRequest::Mutate(MembershipMutation::Suspend),
+                )
+                .await
+                .expect("suspend peer");
+                assert_eq!(suspended.state, MembershipState::Suspended);
+                assert_eq!(suspended.user_security_epoch, Some(1));
+                tokio::task::block_in_place(|| {
+                    assert_eq!(user_security_epoch(&mut handle, peer_user), 1);
+                    assert_eq!(membership_audit_counts(&mut handle), (1, 0));
+                });
+                let (status, response) = call(peer.bearer.clone()).await;
+                assert_eq!(
+                    status, 401,
+                    "suspended peer must be rejected immediately: {response}"
+                );
+
+                // (3) re-activate ⇒ the membership is ACTIVE again, but the OLD bearer stays
+                // dead: its epoch snapshot (0) no longer matches the user's live epoch (1) —
+                // §6.3's whole point (no TTL wait, no revival). A credential issued after the
+                // reinstatement (snapshot = live epoch) works.
+                let activated = membership_apply(
+                    &handle,
+                    peer_user,
+                    MembershipRequest::Mutate(MembershipMutation::Activate),
+                )
+                .await
+                .expect("re-activate peer");
+                assert_eq!(activated.state, MembershipState::Active);
+                assert_eq!(
+                    activated.user_security_epoch, None,
+                    "activation never bumps"
+                );
+                let (status, response) = call(peer.bearer.clone()).await;
+                assert_eq!(
+                    status, 401,
+                    "old epoch snapshot stays invalid after reinstatement: {response}"
+                );
+                let fresh = tokio::task::block_in_place(|| {
+                    let fresh_prefix =
+                        format!("mpe2{}", &Uuid::now_v7().simple().to_string()[..12]);
+                    let fresh_wire = format!("{fresh_prefix}.{}", "c".repeat(32));
+                    let fresh = handle.seed_synthetic_service_credential(
+                        SyntheticCredentialScopes::ContextRead,
+                        &fresh_prefix,
+                        &fresh_wire,
+                        &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &fresh_wire),
+                    );
+                    let live = user_security_epoch(&mut handle, peer_user);
+                    bind_credential_to_user(&mut handle, &fresh, peer_user, live);
+                    fresh
+                });
+                let (status, response) = call(fresh.bearer.clone()).await;
+                assert_eq!(
+                    status, 200,
+                    "credential issued under the live epoch works: {response}"
+                );
+                assert_tool_response(&response, ToolName::Memory);
+
+                // (4) remove ⇒ bumped again ⇒ the fresh bearer dies on the very next call.
+                let removed = membership_apply(
+                    &handle,
+                    peer_user,
+                    MembershipRequest::Mutate(MembershipMutation::Remove),
+                )
+                .await
+                .expect("remove peer");
+                assert_eq!(
+                    (removed.state, removed.user_security_epoch),
+                    (MembershipState::Removed, Some(2))
+                );
+                let (status, response) = call(fresh.bearer.clone()).await;
+                assert_eq!(
+                    status, 401,
+                    "removed member rejected on the next request: {response}"
+                );
+
+                // (5) last OWNER protected: promote the fixture user (seeded MEMBER) to the
+                // tenant's only OWNER, then removal/suspension is CONFLICT and nothing moves.
+                membership_apply(
+                    &handle,
+                    owner_user,
+                    MembershipRequest::Mutate(MembershipMutation::ChangeRole(
+                        MembershipRole::Owner,
+                    )),
+                )
+                .await
+                .expect("promote fixture user to OWNER");
+                let (epoch_before, audits_before) = tokio::task::block_in_place(|| {
+                    (
+                        user_security_epoch(&mut handle, owner_user),
+                        membership_audit_counts(&mut handle),
+                    )
+                });
+                for mutation in [MembershipMutation::Remove, MembershipMutation::Suspend] {
+                    let refused =
+                        membership_apply(&handle, owner_user, MembershipRequest::Mutate(mutation))
+                            .await;
+                    assert!(
+                        matches!(
+                            refused,
+                            Err(MembershipRepoError::Conflict(MembershipConflict::LastOwner))
+                        ),
+                        "{mutation:?}: {refused:?}"
+                    );
+                }
+                tokio::task::block_in_place(|| {
+                    assert_eq!(user_security_epoch(&mut handle, owner_user), epoch_before);
+                    // Applied rows: suspend, activate, remove, change_role = 4; the two
+                    // refused last-OWNER attempts each leave a DENIED row (§77 "全部审计").
+                    assert_eq!(audits_before, (4, 0));
+                    assert_eq!(membership_audit_counts(&mut handle), (4, 2));
+                    let denied: Vec<(String, String, String)> = handle
+                        .admin
+                        .query(
+                            "SELECT action, request_id, metadata->>'refusal' \
+                             FROM control.audit_events \
+                             WHERE tenant_id=$1 AND action LIKE 'MEMBERSHIP_%' AND result='DENIED' \
+                             ORDER BY audit_seq",
+                            &[&handle.tenant_id],
+                        )
+                        .expect("owner reads DENIED rows")
+                        .iter()
+                        .map(|r| (r.get(0), r.get(1), r.get(2)))
+                        .collect();
+                    assert_eq!(
+                        denied,
+                        vec![
+                            (
+                                "MEMBERSHIP_REMOVE".into(),
+                                MEMBERSHIP_ADMIN.ticket.into(),
+                                "LAST_OWNER".into()
+                            ),
+                            (
+                                "MEMBERSHIP_SUSPEND".into(),
+                                MEMBERSHIP_ADMIN.ticket.into(),
+                                "LAST_OWNER".into()
+                            ),
+                        ]
+                    );
+                });
+                stop_server(server).await.expect("server stops");
+            });
         },
     );
 }

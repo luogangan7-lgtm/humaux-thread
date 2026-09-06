@@ -1,0 +1,45 @@
+# ADR-0033: Membership lifecycle admin path — INVITED→ACTIVE / suspend / remove / set-role, security_epoch bump, last-OWNER rule（Card 12）
+
+日期：2026-09-06 · 状态：Accepted · 影响面：`crates/domain/src/identity.rs`（`MembershipState` / `MembershipRole` 闭集 + `MembershipSnapshot::apply` 状态机 + `MembershipConflict`）/ `crates/adapters/src/membership_repo.rs`（新，`role_maintenance` 下的唯一写路径：锁行 → 机裁决 → UPDATE/INSERT → `control.bump_user_security_epoch` → `control.audit_event_insert`，一事务）/ `xtask/src/member.rs`（新，`cargo xtask member <invite|activate|suspend|remove|set-role> --tenant --user --actor --reason --ticket --step-up-auth [--trace-id] [--role]`）/ 迁移 `0161_membership_lifecycle_admin_path`（`role_maintenance`：`control.memberships` INSERT + 列级 UPDATE(state, role, updated_at)；owner SECURITY DEFINER `control.bump_user_security_epoch(uuid)` 只增不设，EXECUTE 仅 `role_maintenance`；`audit_event_insert` EXECUTE 加 `role_maintenance`）/ `xtask/src/rls_check.rs`（`control.memberships` 六格）/ Baseline §6.2.2（新列 + 0161 落点）与 §6.3（状态机表 + last-OWNER 可执行形式）/ 测试 `crates/adapters/tests/membership_lifecycle.rs` + `bins/gateway/tests/mcp_gateway.rs::native_mcp_membership_suspend_rejects_bearer_on_next_request_and_last_owner_protected`。前置：卡 1–11 与 E1 在树上（HEAD ecb4a40，迁移至 0160）。
+
+## 背景
+仓库里没有任何一条代码路径能新增、停用或移除一个 workspace 成员：`control.memberships` 的写只有 DDL 与测试 fixture 的裸 INSERT，给第二个用户开通等于手写生产 SQL。§6.3 要求 membership removed/suspended 递增 security epoch，`migrations/0003_control_core.sql` 在 DDL 里明写「递增的事件由接状态机的那张卡去接」；请求侧的 epoch 校验（`bins/gateway/src/auth.rs::authenticated_binding`，比对 api_key 快照 epoch 与 `control.users.security_epoch` 现值）早已在跑——只差没人递增。last-OWNER 规则（§6.3 Ownership / Offboarding）零实现。
+
+## 决定
+
+### D-A 状态机在类型里，数据库只封闭取值集
+- `MembershipState {Invited, Active, Suspended, Removed}` / `MembershipRole {Owner, Admin, Member}`，各自 `as_db_str`/`from_db_str` 在一处拼写（§78.2；与 0003 state CHECK、0160 role CHECK 逐字一致，live 测试用 `pg_get_constraintdef` 双向核，接受 `IN (` 与 `= ANY (ARRAY[` 两种 deparse 形）。
+- `MembershipSnapshot {state, role, other_active_owners}.apply(MembershipMutation) -> Result<MembershipTransition, MembershipConflict>` 是**唯一裁决点**。边：`INVITED|SUSPENDED → ACTIVE`（activate）、`ACTIVE → SUSPENDED`、`INVITED|ACTIVE|SUSPENDED → REMOVED`（终态）、`ACTIVE` 上 set-role。同态重放 `AlreadyInState`；`REMOVED → *`、`INVITED → SUSPENDED`、非 ACTIVE 上改角色 `TransitionNotAllowed`；三者都是 `ErrorCode::Conflict`。非法边在任何 SQL 之前被拒（验收：`REMOVED → activate` 后 `updated_at` 逐字不变）。
+- **epoch 递增规则按 §6.3 原文，不按「每次 mutation 都递增」**：suspend / remove / set-role 递增（`MembershipTransition.bumps_security_epoch`），invite / activate **不**递增——一个 user 可同时是多个 Organization Tenant 的成员，在租户 B 接受邀请不应作废其在租户 A 的全部凭据（§6.3 列的四类事件里没有 activation）。卡片 D-A 的「every mutation bumps」在此处按 spec 收窄，验收 gate 只断言 REMOVE/SUSPEND 递增，与本决定一致。
+- last-OWNER：会把一个 `ACTIVE OWNER` 移出「本租户 ACTIVE OWNER 集合」的 mutation（remove / suspend / 降级）在 `other_active_owners == 0` 时 `LastOwner`。不在集合里的行（SUSPENDED/INVITED 的 owner）不受此规则约束——移除它不改变集合。transfer ownership = 先 set-role 另一位 ACTIVE 成员为 OWNER，再移除原 owner（live 测试走这条路）。
+
+### D-B 唯一写路径：`role_maintenance` + 一事务 + 只增的 epoch 函数
+- `adapters::membership_repo::apply(&MaintenanceDbPool, tenant, user, MembershipRequest, AdminAction)`：`SET LOCAL humaux.tenant_id`（FORCE RLS）→ 目标行 `FOR UPDATE` → 需要计数时对其他 `ACTIVE OWNER` 行 `FOR UPDATE` 再 `count(*)`（两条并发「移除 owner」串行化，第二条看到第一条的结果；ponytail: 锁的是 owner 行而不是 tenant 行，因为 `role_maintenance` 对 `control.tenants` 没有 UPDATE，锁不了）→ 机裁决 → `UPDATE control.memberships SET state, role, updated_at`（invite 则 `INSERT ... ON CONFLICT (tenant_id,user_id) DO NOTHING`，0 行 = `AlreadyInState`）→ 需要时 `SELECT control.bump_user_security_epoch($user)` → `SELECT control.audit_event_insert(...)`（action `MEMBERSHIP_INVITE|ACTIVATE|SUSPEND|REMOVE|CHANGE_ROLE`，actor_type `ADMIN`，resource `membership/<id>`，result `SUCCESS`，before/after fingerprint `STATE/ROLE`，metadata 带 user_id / from / to / requested_role / 新 epoch）→ commit。任何一步失败整体回滚。**被拒也审计**（§77「全部审计」，role change 在高风险动作表里）：`Conflict` / `NotFound` 在任何 membership 写之前判定，同一事务只落一条 result `DENIED` 的审计行（metadata.refusal = `LAST_OWNER | TRANSITION_NOT_ALLOWED | ALREADY_IN_STATE | NOT_FOUND`，before fingerprint = 被拒时的行；resource_id 已知则为 membership_id，NOT_FOUND 为 0041 的空串哨兵）再 commit——反复尝试移除最后一位 OWNER 对审计员可见。`InvalidInput` / `Db` 不落行。
+- **§77 Sensitive Admin Action 七要素**由 `AdminAction { actor, reason, ticket, trace_id, step_up_auth_context }` 从操作员处带入，每项非空（空 = `InvalidInput`，§78.1 无缺省）：actor → `actor_id`；subject → `tenant_id` + `metadata.user_id`；reason → `metadata.reason`；request/ticket → `request_id`（= ticket）+ `metadata.ticket`；before/after → fingerprint + metadata from/to；`trace_id` → `trace_id`；step-up → `metadata.step_up_auth_context`。`user_agent_hash` 为 0041 空串哨兵（CLI 无 UA）。不用 `domain::audit::SensitiveAdminAction` 作输入：它是成品记录（subject + before/after `AuditMetadata`，其键 allowlist 只有 plan/previous_role/role，且 `audit.rs` 不在本卡允许面内）。
+- 为什么 users 的 epoch 不给列级 UPDATE：拿到 `UPDATE(security_epoch)` 也就能把 epoch **调低**，让作废的凭据复活。`control.bump_user_security_epoch(uuid)` 只做 `security_epoch + 1 RETURNING`，owner SECURITY DEFINER，EXECUTE 仅 `role_maintenance`、PUBLIC 无（0037/0041 同一 chokepoint 纪律）。`control.users` 无 RLS（0003/0036：无 tenant_id），definer 不需要策略。`control.users` 因此**不**进 §6.2.2 点名表（表级授权未变）。
+- `control.memberships` 进 §6.2.2：`role_maintenance` `SELECT, INSERT, UPDATE(state, role, updated_at)`；五个 runtime role `SELECT`（等于原域默认，逐格显式）；`role_batch_issuer` / `role_admin` `—`。身份列无人可写。rls_check `ADDITIVE_SEAM_MATRIX` 同一变更加六格；`cargo xtask rls-check` 的「授权逐条相等 / 域默认授权 / 表集合派生」三闸都过。
+- `xtask member`：`HUMAUX_MAINTENANCE_PG_DSN`，`--actor --reason --ticket --step-up-auth` 必填（§77 Sensitive Admin Action，§78.1 无缺省身份/理由），`--trace-id` 可选（缺省时每次调用铸一个 UUIDv7，pass/fail 行都回显，便于把被拒的尝试与重试关联），输出一行 `member: pass (membership_id=… state=… role=… user_security_epoch=…|unchanged audit_event_id=… trace_id=…)` / `member: fail (<ErrorCode> … trace_id=…)`。不是 MCP 动词，不走 confirm 门（§33.10 的门是 agent-facing 破坏性操作用的；这条是操作员路径，审计行即留痕）。
+
+### D-C e2e：suspend → 下一次请求 401 → 重新激活 → 新凭据可用；旧凭据永不复活
+`native_mcp_membership_suspend_rejects_bearer_on_next_request_and_last_owner_protected`（纯 PG，非 ignore）：peer 用户的 PAT 绑定 `user_security_epoch=0`；`memory.get` 200 → `suspend`（同事务 epoch 0→1，审计 1 行）→ 同一 bearer **下一次请求** 401（既是 membership_state 也是 epoch 不匹配，无 TTL 等待）→ `activate`（不递增；ACTIVE）→ **旧 bearer 仍 401**：它的快照 epoch 0 ≠ 现值 1，这正是 §6.3「不等 Access Token 自然过期」的含义——重新激活不复活旧凭据，需签发新凭据（快照 = 现值）→ 新 bearer 200 → `remove`（1→2）→ 新 bearer 下一次请求 401 → 把 fixture 用户升为租户唯一 OWNER 后 remove / suspend 都是 `Conflict(LastOwner)`，epoch 不变、SUCCESS 行仍 4（suspend / activate / remove / change_role），DENIED 行恰 2（MEMBERSHIP_REMOVE / MEMBERSHIP_SUSPEND，request_id = ticket，metadata.refusal = LAST_OWNER）。
+
+## 验收 gate
+- `cargo test -p humaux-domain --lib identity`：状态机 4 个单测（闭集往返、合法边 + 递增标记、REMOVED 终态与非法边、last-OWNER）。
+- `cargo test -p humaux-adapters --test membership_lifecycle`（live DB，`role_maintenance` 真登录）：五个 §77 字段任一为空 = `InvalidInput` 且零行；last-OWNER 三种 mutation 被拒、行与 epoch 不动、各落一条 DENIED（refusal=LAST_OWNER，request_id=ticket，trace_id/reason/step_up_auth_context 逐字）；invite → activate（epoch 不动）→ 同态重放 CONFLICT；suspend 递增；**原子性双向注错**——在 `control.users` 装 `BEFORE UPDATE OF security_epoch` 抛错触发器 ⇒ remove 失败且 state 仍 SUSPENDED / 审计不增；在 `control.audit_events` 装 `BEFORE INSERT` 抛错触发器 ⇒ remove 失败且 **state 与 epoch 都不动**（把 bump 挪到第二个事务，这条断言必红）；撤掉后 remove 提交两者；REMOVED 上四种 mutation 都 `TransitionNotAllowed` 且行逐字不变；再 invite 已 REMOVED 的 user = `AlreadyInState`（UNIQUE 约束，见「已知局限」）；未知 user `NotFound`（DENIED，resource_id 空串，metadata.user_id 指名）；transfer ownership 后原 owner 可离开、新 owner 受保护；审计计数逐步核对到 (SUCCESS 7, DENIED 15)。
+- gateway e2e 见 D-C。`cargo xtask migrate`（0161 应用，drift 0）、`rls-check`、`architecture-check`、clippy `-D warnings`、fmt、secret grep = 0。
+
+## 速度
+本卡不碰任何 gateway 路由；请求路径零新增 PG 往返（epoch 校验本来就在 `api_key_lookup` 的那一条语句里）。admin 路径每次 mutation 3–5 条语句一事务（锁行 / 计数 / UPDATE / bump / audit），非请求侧。
+
+## 已知局限 / 升级信号
+- **REMOVED 后不能再 invite**：0003 的 `UNIQUE (tenant_id, user_id)` + §6.3「REMOVED 终态」⇒ 同一 user 在同一租户只能有一行。若产品需要「移除后重新邀请」，是一张新卡：把 UNIQUE 换成 `WHERE state <> 'REMOVED'` 的 partial unique index，machine 不变。
+- **`ConflictReason` 无 13xx membership 段**：`crates/domain/src/error.rs` 不在本卡允许面内，`MembershipConflict` 只映射到 `ErrorCode::Conflict`；这条路径不面向 agent，没有 `structuredContent.reason` 需要。若日后把 membership 动词抬成 MCP 工具，再铸 `1301 MEMBERSHIP_TRANSITION_INVALID / 1302 LAST_OWNER`。
+- **tenant epoch 不递增**：membership 是 user×tenant 的事，递增 `control.tenants.security_epoch` 会作废该租户**全部**（含机器）凭据；§6.3 把 tenant epoch 留给 tenant suspended/deleting。
+- **无 user 级 UserState 转换**（suspend user / deactivate）：不在本卡；`bump_user_security_epoch` 已可复用。
+
+## 否决 / 未做
+- **owner SECURITY DEFINER `control.membership_transition(...)` 把三步都塞进一个函数**：能省两格 grant，但状态机会有第二份（plpgsql）或退化成「函数里不判、Rust 里判」——Rust 里判的话函数只是一层薄壳，换不来什么；直接列级 grant 让 §6.2.2 矩阵本身陈述「谁能写 memberships」。
+- **`UPDATE(security_epoch)` 列级 grant 给 `role_maintenance`**：见 D-B，可调低 = 可复活。
+- **在 `crates/application` 加一层 membership service**：机在 domain、SQL 在 adapter、入口在 xtask，中间层只会是透传（YAGNI）。
+- **每次 mutation 都递增 epoch（含 invite/activate）**：见 D-A，跨租户作废。
+- **走 §33.10 confirm 门**：那是 agent-facing 破坏性 MCP 动词的两步确认；操作员 CLI 有 `--actor` + 审计行，没有 token 可以「第二次调用」。
