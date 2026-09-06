@@ -1,0 +1,43 @@
+# §46.1 migration manifest. ADR-0032 (card 11, §34.0.1 per-stream receipt key): replaces
+# control.operation_receipts' primary key (tenant_id, principal_id, operation, idempotency_key)
+# with (tenant_id, principal_id, scope_kind, scope_id, operation, idempotency_key) so one process
+# serving N (tenant, workspace) write pairs never collides two streams' receipts. No DML, no
+# grant, policy or trigger change; every existing row stays unique under the superset key.
+# §46 forward-fix (EXPAND_CONTRACT, next free number after 0157).
+
+migration_id = "0158_operation_receipts_stream_scoped_key"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.operation_receipts') is not null
+ and (select array_agg(a.attname::text order by k.ord) from pg_constraint c
+       cross join lateral unnest(c.conkey) with ordinality as k(attnum, ord)
+       join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+       where c.conrelid = 'control.operation_receipts'::regclass and c.contype = 'p')
+     = array['tenant_id','principal_id','operation','idempotency_key']
+ as precheck_ok
+"""
+
+postcheck = """
+select (select array_agg(a.attname::text order by k.ord) from pg_constraint c
+       cross join lateral unnest(c.conkey) with ordinality as k(attnum, ord)
+       join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+       where c.conrelid = 'control.operation_receipts'::regclass and c.contype = 'p')
+     = array['tenant_id','principal_id','scope_kind','scope_id','operation','idempotency_key']
+ -- untouched: §6.2.2 grants, FORCE RLS, the integrity trigger
+ and has_table_privilege('role_gateway','control.operation_receipts','SELECT')
+ and has_table_privilege('role_gateway','control.operation_receipts','INSERT')
+ and not has_table_privilege('role_gateway','control.operation_receipts','UPDATE')
+ and not has_table_privilege('role_gateway','control.operation_receipts','DELETE')
+ and has_table_privilege('role_maintenance','control.operation_receipts','SELECT')
+ and not has_table_privilege('role_maintenance','control.operation_receipts','INSERT')
+ and exists(select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
+            where n.nspname='control' and c.relname='operation_receipts'
+              and c.relrowsecurity and c.relforcerowsecurity)
+ and exists(select 1 from pg_trigger where tgrelid='control.operation_receipts'::regclass
+            and tgname='operation_receipt_integrity' and not tgisinternal)
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. A later migration may only widen the key further, never drop scope columns from it (that would silently merge two streams' committed keys); committed receipts are never deleted or reopened."
+backup_restore_requirement = "none for rows (no DML; the key change is metadata only and every existing row is unique under the superset key). Production still takes the standard pre-migration backup because the primary-key index is rebuilt."

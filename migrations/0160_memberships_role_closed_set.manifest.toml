@@ -1,0 +1,43 @@
+# §46.1 migration manifest. ADR-0032 (card 11, §6.3 / §78.2 membership role closed set): folds
+# every existing control.memberships.role to upper case (DML: spelling only, no role changes
+# meaning), adds a BEFORE INSERT/UPDATE OF role trigger that canonicalizes NEW.role the same way,
+# and closes the set with CHECK (role IN ('OWNER','ADMIN','MEMBER')). No grant, policy, PK or FK
+# change. §46 forward-fix (EXPAND_CONTRACT, next free number after 0159).
+
+migration_id = "0160_memberships_role_closed_set"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.memberships') is not null
+ and to_regprocedure('control.memberships_canonical_role()') is null
+ and not exists(select 1 from pg_constraint where conrelid='control.memberships'::regclass
+                and conname='memberships_role_known')
+ -- every existing spelling folds into the closed set (a stray value fails here, loudly)
+ and not exists(select 1 from control.memberships where upper(role) not in ('OWNER','ADMIN','MEMBER'))
+ as precheck_ok
+"""
+
+postcheck = """
+select not exists(select 1 from control.memberships where role <> upper(role))
+ and exists(select 1 from pg_constraint where conrelid='control.memberships'::regclass
+            and conname='memberships_role_known' and contype='c' and convalidated)
+ and exists(select 1 from pg_trigger where tgrelid='control.memberships'::regclass
+            and tgname='memberships_canonical_role' and not tgisinternal
+            and tgfoid='control.memberships_canonical_role()'::regprocedure)
+ and (select not p.prosecdef and pg_get_userbyid(p.proowner)='role_migration_owner'
+      from pg_proc p where p.oid='control.memberships_canonical_role()'::regprocedure)
+ -- untouched: the 0107 input-change guard, PK/UNIQUE, FORCE RLS and the §6.2.2 grants
+ and exists(select 1 from pg_trigger where tgrelid='control.memberships'::regclass
+            and tgname='contribution_input_change' and not tgisinternal)
+ and exists(select 1 from pg_constraint where conrelid='control.memberships'::regclass
+            and contype='u')
+ and exists(select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
+            where n.nspname='control' and c.relname='memberships'
+              and c.relrowsecurity and c.relforcerowsecurity)
+ and has_table_privilege('role_gateway','control.memberships','SELECT')
+ and not has_table_privilege('role_gateway','control.memberships','UPDATE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Widening the set is a new migration that replaces the CHECK; the trigger and CHECK may be dropped only together with the reader (operation_receipt::TENANT_SHARED_WRITER_ROLES) being retired, otherwise the authorization gate silently degrades to an exact-spelling match again. The upper-case backfill is not reversed (the lower-case spellings carried no meaning)."
+backup_restore_requirement = "standard pre-migration backup of control.memberships (one DML statement rewrites the role spelling of every lower-case row; the value set is otherwise unchanged)."

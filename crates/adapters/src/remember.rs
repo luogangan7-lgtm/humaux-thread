@@ -53,6 +53,11 @@ pub enum RememberError {
     /// did not resolve (`INVALID_INPUT`, raised BEFORE the first write like [`Self::Subject`]),
     /// or a MOOD arrived with no half-life policy (`DEPENDENCY_UNAVAILABLE`).
     Affect(ErrorCode),
+    /// §11.2.1 ingress (ADR-0032 D-A): the command's tenant has no reasoning domain this
+    /// Evidence could be processed under — the process-configured domain is another tenant's
+    /// and the on-behalf-of user owns no ACTIVE domain here. The tenant is not provisioned for
+    /// writes (`DEPENDENCY_UNAVAILABLE`); raised BEFORE the first write, nothing is committed.
+    ReasoningDomainUnresolved,
 }
 
 impl From<sqlx::Error> for RememberError {
@@ -71,6 +76,9 @@ impl std::fmt::Display for RememberError {
             Self::BatchExhausted => write!(f, "BATCH_EXHAUSTED (§34.1)"),
             Self::Subject(code) => write!(f, "subject declaration rejected: {code}"),
             Self::Affect(code) => write!(f, "affect declaration rejected: {code}"),
+            Self::ReasoningDomainUnresolved => {
+                write!(f, "no reasoning domain for this tenant (§11.2.1)")
+            }
         }
     }
 }
@@ -195,6 +203,40 @@ async fn set_authorization_local(
     .execute(&mut **txn)
     .await?;
     Ok(())
+}
+
+/// §11.2.1 ingress (ADR-0032 D-A): which `control.private_reasoning_domains` row this Evidence
+/// is processed under, chosen inside the write transaction from the command's OWN tenant (the
+/// tenant-isolation policy on that table is the fence; `set_authorization_local` has already
+/// pinned it). Precedence, one indexed read: first `cmd.reasoning_domain_id` — the
+/// process-configured domain (`HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID`) — when it is one
+/// of THIS tenant's ACTIVE domains (the deployment's own tenant keeps its boot-time domain
+/// byte-for-byte; the private worker distills exactly that domain); otherwise the ACTIVE domain
+/// owned by the on-behalf-of user (§11.2.1 "用户直接输入 -> reasoning_domain = 该用户"); neither
+/// ⇒ [`RememberError::ReasoningDomainUnresolved`] — "无法确定 processing principal": the tenant
+/// is not provisioned for writes, nothing is written.
+/// The single-column FK of 0004 never refused a cross-tenant domain (RI bypasses RLS); 0159's
+/// composite FK now does, so a bypass of this resolve is a `23503`, not a silent cross-tenant
+/// pointer.
+// ponytail: earliest user-owned ACTIVE domain when a user owns several; the §11.2.1
+// reasoning_domain_grants binding replaces rule 2 once grants are issued anywhere.
+async fn resolve_reasoning_domain(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cmd: &RememberCommand,
+) -> Result<Uuid, RememberError> {
+    sqlx::query_scalar(
+        "SELECT reasoning_domain_id FROM control.private_reasoning_domains \
+         WHERE tenant_id = $1 AND status = 'ACTIVE' \
+           AND (reasoning_domain_id = $2 OR owner_user_id = $3) \
+         ORDER BY reasoning_domain_id = $2 DESC, created_at, reasoning_domain_id \
+         LIMIT 1",
+    )
+    .bind(cmd.tenant_id)
+    .bind(cmd.reasoning_domain_id)
+    .bind(cmd.authorization_user_id)
+    .fetch_optional(&mut **txn)
+    .await?
+    .ok_or(RememberError::ReasoningDomainUnresolved)
 }
 
 /// §15.1: `next_commit_seq` — the sole caller of `ops.commit_seq_seq`
@@ -470,7 +512,7 @@ impl RememberPending {
 /// Errors leave rollback to the owning transaction; no SQL here commits independently.
 pub async fn remember_in_txn(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    cmd: RememberCommand,
+    mut cmd: RememberCommand,
 ) -> Result<RememberPending, RememberError> {
     // This check is deliberately inside the reusable path, before its first write. The public
     // wrapper's fast check only avoids opening a transaction for an already-expired command.
@@ -488,6 +530,11 @@ pub async fn remember_in_txn(
     );
 
     set_authorization_local(txn, cmd.tenant_id, cmd.authorization_user_id).await?;
+
+    // §11.2.1 (ADR-0032 D-A): the reasoning domain is the caller tenant's, resolved per request
+    // under that tenant's RLS BEFORE the first write — never the process's boot constant
+    // stamped onto another tenant's Evidence (0159's composite FK is the DB-side invariant).
+    cmd.reasoning_domain_id = resolve_reasoning_domain(txn, &cmd).await?;
 
     // §6.1.3 rules 1/2 (ADR-0028): resolve the declaration BEFORE the first write so an unknown
     // id/key rejects with nothing committed — no Evidence, no ticket, no outbox row.

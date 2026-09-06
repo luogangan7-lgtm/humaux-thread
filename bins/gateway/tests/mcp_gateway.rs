@@ -18,6 +18,7 @@ use std::{
 
 use humaux_adapters::{
     forget_repo,
+    operation_receipt::{self, AtomicRememberRequest},
     postgres::RuntimeDbPool,
     qdrant::{
         Distance, PointId, QdrantOperation, QdrantPointPayload, ShardingMethod,
@@ -27,11 +28,13 @@ use humaux_adapters::{
 };
 use humaux_domain::{
     affect::{AffectAnnotation, AffectKind, BasisPoints, EmotionLabel},
+    audit::{AuditEvent, AuditEventId, AuditMetadata, McpAuditAction},
     authority::{AuthorityClass, AuthorityStatus},
     context::ContextBudget,
     dataclass::DataClass,
-    identity::VisibilityClass,
-    ids::{TenantId, WorkspaceId},
+    evidence::{EvidenceOriginClass, payload_sha256},
+    identity::{AuthorizationScope, BoundedSet, PrincipalId, VisibilityClass},
+    ids::{TenantId, UserId, WorkspaceId},
     memory::MemoryType,
 };
 use humaux_gateway::{
@@ -7583,8 +7586,8 @@ fn percentile_p50(samples: &mut [Duration]) -> Duration {
 /// membership but no serving projection is `DEPENDENCY_UNAVAILABLE` on all four routes (never
 /// a synthetic empty stream, ADR-0031 D-A); a body `tenant_id` is rejected by the closed
 /// schemas before dispatch; and the §34.0.1 receipt key pins to (tenant, principal,
-/// operation, idempotency_key) — no `projection_version` — so pairs' replays never collide
-/// (ADR-0031 D-C).
+/// scope_kind, scope_id, operation, idempotency_key) — no `projection_version` — so pairs'
+/// replays never collide (ADR-0031 D-C, ADR-0032 D-C).
 #[test]
 #[ignore = "requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
 #[allow(clippy::too_many_lines)] // ADR-0031: one live oracle keeps three pairs, four routes, 18 interleaved tasks and the cross-pair/unprovisioned refusals causally ordered against ONE gateway process (same precedent as the real-Qdrant live test).
@@ -7628,9 +7631,10 @@ fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
                     assert_ne!(pair_a.workspace_id, pair_b.workspace_id);
                     assert_ne!(handle.tenant_id, pair_c_handle.tenant_id);
 
-                    // ADR-0031 D-C: the receipt key is (tenant, principal, operation,
-                    // idempotency_key) + request_fingerprint; projection_version is a payload
-                    // column, never part of the key, so N pairs per process cannot collide.
+                    // ADR-0031 D-C / ADR-0032 D-C: the receipt key is (tenant, principal,
+                    // scope_kind, scope_id, operation, idempotency_key) + request_fingerprint;
+                    // projection_version is a payload column, never part of the key, so N
+                    // pairs per process cannot collide (migration 0158).
                     let key_columns: Vec<String> = handle
                         .admin
                         .query(
@@ -7647,8 +7651,15 @@ fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
                         .collect();
                     assert_eq!(
                         key_columns,
-                        ["tenant_id", "principal_id", "operation", "idempotency_key"],
-                        "§34.0.1 receipt key must stay per (tenant, principal) and carry no projection_version"
+                        [
+                            "tenant_id",
+                            "principal_id",
+                            "scope_kind",
+                            "scope_id",
+                            "operation",
+                            "idempotency_key"
+                        ],
+                        "§34.0.1 receipt key must be per (tenant, principal, stream scope) and carry no projection_version"
                     );
 
                     // Both tenants are placed in ONE shared collection: disjointness must come
@@ -7889,6 +7900,703 @@ fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
                         stop_server(server).await.expect("stop multi-pair server");
                         delete_semantic_collection(&transport, &registry, &collection).await;
                     });
+                },
+            );
+        },
+    );
+}
+
+/// Card 11 speed record (运行速度快 is an acceptance goal): `remember.put` p50 on the plain
+/// wire shape, uncontended, printed for the ADR's before/after table. No assertion beyond
+/// every call committing.
+#[test]
+fn native_mcp_remember_put_p50_speed_record() {
+    run_db_fixture::<Fixture, _>("native_mcp_remember_put_p50_speed_record", |mut handle| {
+        handle.assert_gateway_login();
+        let prefix = format!("p50{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let wire = format!("{prefix}.{}", "e".repeat(32));
+        let credential = handle.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWrite,
+            &prefix,
+            &wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+            64,
+        );
+        let runtime_handle = handle.rt.handle().clone();
+        let runtime = runtime_handle
+            .block_on(handle.fresh_runtime())
+            .expect("fresh checked gateway pool");
+        let app = application(&handle, runtime);
+        let workspace = handle.workspace_id;
+        runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let mut samples = Vec::new();
+            for n in 0..9_u8 {
+                let started = Instant::now();
+                let (status, response) = tool_call(
+                    address,
+                    "remember",
+                    &credential.bearer,
+                    json!({
+                        "operation": "put",
+                        "content": format!("speed record {n}"),
+                        "idempotency_key": format!("p50-{n}-{}", Uuid::now_v7()),
+                        "workspace_id": workspace,
+                    }),
+                )
+                .await;
+                samples.push(started.elapsed());
+                assert_eq!(status, 200, "{response}");
+                assert_ne!(response["result"]["isError"], true, "{response}");
+            }
+            eprintln!(
+                "card11 p50 remember.put: {:?} (n={})",
+                percentile_p50(&mut samples),
+                samples.len()
+            );
+            stop_server(server).await.expect("stop p50 server");
+        });
+    });
+}
+
+/// One evidence row's classification as stored, read back by the owner (RLS bypass) so the
+/// assertion is about what was written, not about what the caller may read.
+fn stored_evidence(
+    handle: &mut Handle,
+    evidence_id: Uuid,
+) -> (String, Option<Uuid>, Option<Uuid>, String, String) {
+    let row = handle
+        .admin
+        .query_one(
+            "SELECT e.visibility_class, e.visibility_user_id, e.visibility_workspace_id, e.data_class, ev.event_kind \
+             FROM private.evidence_objects e JOIN private.events ev ON ev.event_id = e.evidence_id \
+             WHERE e.evidence_id = $1 AND e.tenant_id = $2",
+            &[&evidence_id, &handle.tenant_id],
+        )
+        .expect("owner reads the stored evidence classification");
+    (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
+}
+
+/// `(issued_highwater, stream_log rows, outbox tickets)` of one workspace's `v1` stream.
+fn stream_ledger(handle: &mut Handle, workspace_id: Uuid) -> (i64, i64, i64) {
+    let row = handle
+        .admin
+        .query_one(
+            "SELECT \
+               coalesce((SELECT issued_highwater FROM projection.stream_checkpoints \
+                 WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2 \
+                   AND domain='knowledge' AND projection_kind='ingest' AND projection_version='v1'), 0), \
+               (SELECT count(*) FROM projection.stream_log \
+                 WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2 \
+                   AND domain='knowledge' AND projection_kind='ingest' AND projection_version='v1'), \
+               (SELECT count(*) FROM ops.outbox o JOIN projection.stream_log s \
+                   ON s.tenant_id=o.tenant_id AND s.commit_seq=o.commit_seq \
+                 WHERE o.tenant_id=$1 AND o.event_type='EVIDENCE_ACCEPTED' \
+                   AND s.scope_kind='workspace' AND s.scope_id=$2)",
+            &[&handle.tenant_id, &workspace_id],
+        )
+        .expect("owner reads the stream ledger");
+    (row.get(0), row.get(1), row.get(2))
+}
+
+/// One evidence row's `reasoning_domain_id` as stored, read back by the owner (RLS bypass).
+fn stored_reasoning_domain(handle: &mut Handle, evidence_id: Uuid) -> Uuid {
+    handle
+        .admin
+        .query_one(
+            "SELECT reasoning_domain_id FROM private.evidence_objects \
+             WHERE evidence_id = $1 AND tenant_id = $2",
+            &[&evidence_id, &handle.tenant_id],
+        )
+        .expect("owner reads the stored reasoning domain")
+        .get(0)
+}
+
+/// The §34.0.1 receipt-transaction inputs for a direct `remember_atomically` call on
+/// `workspace_id`'s stream, mirroring what `remember::command` + the guard build for one
+/// `remember.put` (the adapter receipt fixture's shape).
+fn direct_receipt_request(
+    handle: &Handle,
+    principal: Uuid,
+    workspace_id: Uuid,
+    key: &str,
+    content: &str,
+) -> AtomicRememberRequest {
+    let request_id = Uuid::new_v4();
+    let mut metadata = AuditMetadata::new();
+    metadata
+        .insert("role", "member")
+        .expect("allowlisted audit metadata");
+    AtomicRememberRequest {
+        request_id,
+        idempotency_key: key.into(),
+        request_fingerprint: hex::encode(Sha256::digest(content.as_bytes())),
+        workspace_id: Some(WorkspaceId(workspace_id)),
+        reservation_ttl: Duration::from_secs(30),
+        replay_ttl: Duration::from_secs(60),
+        command: humaux_adapters::remember::RememberCommand {
+            tenant_id: handle.tenant_id,
+            authorization_user_id: Some(handle.user_id),
+            scope_kind: "workspace".into(),
+            scope_id: workspace_id,
+            domain: "knowledge".into(),
+            projection_kind: "ingest".into(),
+            projection_version: "v1".into(),
+            consistency_token_expires_at: time::OffsetDateTime::now_utc() + Duration::from_secs(45),
+            batch_id: None,
+            payload_sha256: payload_sha256(content.as_bytes()),
+            data_class: "INTERNAL".into(),
+            origin_class: EvidenceOriginClass::AuthenticatedAgent,
+            origin_principal_id: Some(principal),
+            origin_connector_id: None,
+            visibility_class: "WORKSPACE_SHARED".into(),
+            visibility_user_id: None,
+            visibility_workspace_id: Some(workspace_id),
+            reasoning_domain_id: handle.reasoning_domain_id,
+            occurred_at: None,
+            event_kind: "USER_MESSAGE".into(),
+            event_payload: json!({"content": content}),
+            subjects: humaux_domain::subject::SubjectDeclaration::default(),
+            affects: Vec::new(),
+            mood_half_life: None,
+        },
+        finished_audit: AuditEvent {
+            event_id: AuditEventId::new(),
+            ts: std::time::SystemTime::now(),
+            tenant_id: TenantId(handle.tenant_id),
+            actor_type: "user".into(),
+            actor_id: principal.to_string(),
+            action: McpAuditAction::McpRequestFinished.as_str().into(),
+            resource_type: "mcp".into(),
+            resource_id: "remember.put".into(),
+            result: "OK".into(),
+            request_id: request_id.to_string(),
+            trace_id: format!("card11-{request_id}"),
+            client_ip: "127.0.0.1".into(),
+            user_agent_hash: "card11-fixture".into(),
+            risk_tags: vec!["fixture".into()],
+            before_fingerprint: None,
+            after_fingerprint: None,
+            metadata,
+        },
+    }
+}
+
+/// Card 11 acceptance gate (ADR-0032): ONE gateway process (bootstrap write pair = A).
+/// D-B — two `remember.put` calls in the same session land `USER_PRIVATE` and
+/// `WORKSPACE_SHARED` rows (per-call `data_class` / `event_kind` too, defaults when absent); a
+/// third asking for `TENANT_SHARED` as a plain member is `INVALID_INPUT` with nothing written
+/// or metered, and lands with NULL user/workspace once the member is an owner (promoted with
+/// the lower-case spelling: 0160 canonicalizes the closed role set, so the gate is never a
+/// silent deny for a writer's spelling; a value outside the set is a CHECK violation); an
+/// unknown class dies at the closed schema. D-A — a second (same-tenant) workspace's
+/// credential writes to ITS stream: the family's checkpoint row is created by that first
+/// write, its stream_seq and outbox ticket are issued against B, A's ledger is untouched;
+/// credential A naming B is `FORBIDDEN`; and pair C — ANOTHER tenant on the same process —
+/// fails closed (`DEPENDENCY_UNAVAILABLE`, nothing written) until its user owns a reasoning
+/// domain, then lands on C's stream under C's OWN reasoning domain (never the process's boot
+/// constant, §11.2.1), with A's and B's ledgers untouched, and the 0159 composite FK refuses a
+/// cross-tenant domain even for a writer that bypasses the resolve. D-C — the same principal,
+/// the same `idempotency_key`, two streams, CONCURRENTLY: two committed writes (never a
+/// `CONFLICT`), each replayable by its own stream; dropping the scope from the receipt key
+/// makes this leg red. Plus the p50 record.
+#[test]
+#[allow(clippy::too_many_lines)] // one live oracle keeps D-A (three pairs, two tenants), D-B and D-C causally ordered against ONE process (same precedent as the replay acceptance)
+fn native_mcp_remember_put_per_call_visibility_and_per_request_stream() {
+    run_db_fixture::<Fixture, _>(
+        "native_mcp_remember_put_per_call_visibility_and_per_request_stream_tenant_c",
+        |mut tenant_c| {
+            // Pair C: another tenant with its own workspace, credential and reasoning domain,
+            // served by the process built on tenant A below (same nesting as the ADR-0031
+            // three-pair gate).
+            let prefix_c = format!("vcc{}", &Uuid::now_v7().simple().to_string()[..12]);
+            let wire_c = format!("{prefix_c}.{}", "c".repeat(32));
+            let credential_c = tenant_c.seed_synthetic_service_credential_and_window(
+                SyntheticCredentialScopes::RememberWrite,
+                &prefix_c,
+                &wire_c,
+                &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire_c),
+                64,
+            );
+            let workspace_c = tenant_c.workspace_id;
+            run_db_fixture::<Fixture, _>(
+                "native_mcp_remember_put_per_call_visibility_and_per_request_stream",
+                |mut handle| {
+                    assert_ne!(handle.tenant_id, tenant_c.tenant_id);
+                    assert_ne!(handle.reasoning_domain_id, tenant_c.reasoning_domain_id);
+                    handle.assert_gateway_login();
+                    let prefix_a = format!("vca{}", &Uuid::now_v7().simple().to_string()[..12]);
+                    let wire_a = format!("{prefix_a}.{}", "a".repeat(32));
+                    let credential_a = handle.seed_synthetic_service_credential_and_window(
+                        SyntheticCredentialScopes::RememberWrite,
+                        &prefix_a,
+                        &wire_a,
+                        &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire_a),
+                        64,
+                    );
+                    let workspace_a = handle.workspace_id;
+                    // Pair B: the SAME tenant, a second workspace, its own credential bound to it.
+                    let workspace_b = handle.seed_workspace();
+                    let prefix_b = format!("vcb{}", &Uuid::now_v7().simple().to_string()[..12]);
+                    let wire_b = format!("{prefix_b}.{}", "b".repeat(32));
+                    let credential_b = with_workspace(&mut handle, workspace_b, |handle| {
+                        handle.seed_synthetic_service_credential(
+                            SyntheticCredentialScopes::RememberWrite,
+                            &prefix_b,
+                            &wire_b,
+                            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire_b),
+                        )
+                    });
+                    let runtime_handle = handle.rt.handle().clone();
+                    let runtime = runtime_handle
+                        .block_on(handle.fresh_runtime())
+                        .expect("fresh checked gateway pool");
+                    let direct_pool = runtime_handle
+                        .block_on(handle.fresh_runtime())
+                        .expect("second checked gateway pool for the direct receipt leg");
+                    let app = application(&handle, runtime);
+                    assert_eq!(
+                        stream_ledger(&mut handle, workspace_a),
+                        (0, 0, 0),
+                        "pair A starts provisioned and empty"
+                    );
+                    let user_id = handle.user_id;
+                    let tenant_id = handle.tenant_id;
+
+                    runtime_handle.block_on(async {
+                let (address, server) = start(app).await;
+                let put = |bearer: String, arguments: Value| async move {
+                    tool_call(address, "remember", &bearer, arguments).await
+                };
+                let accepted = |response: &Value| -> Uuid {
+                    assert_ne!(response["result"]["isError"], true, "{response}");
+                    let content = &response["result"]["structuredContent"];
+                    assert_eq!(content["replayed"], false, "{response}");
+                    Uuid::parse_str(content["evidence_id"].as_str().expect("evidence_id"))
+                        .expect("uuid evidence_id")
+                };
+
+                // ---- D-B: per-call classification in one session ----
+                let (status, private) = put(
+                    credential_a.bearer.clone(),
+                    json!({
+                        "operation": "put", "content": "card11 private note",
+                        "idempotency_key": format!("c11-private-{}", Uuid::now_v7()),
+                        "workspace_id": workspace_a,
+                        "visibility_class": "USER_PRIVATE", "data_class": "PRIVATE",
+                        "event_kind": "MANUAL_NOTE",
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "{private}");
+                let private_evidence = accepted(&private);
+                let (status, shared) = put(
+                    credential_a.bearer.clone(),
+                    json!({
+                        "operation": "put", "content": "card11 shared note",
+                        "idempotency_key": format!("c11-shared-{}", Uuid::now_v7()),
+                        "workspace_id": workspace_a,
+                        "visibility_class": "WORKSPACE_SHARED",
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "{shared}");
+                let shared_evidence = accepted(&shared);
+                // Defaults when absent: the process env (WORKSPACE_SHARED / INTERNAL / USER_MESSAGE).
+                let (status, defaulted) = put(
+                    credential_a.bearer.clone(),
+                    json!({
+                        "operation": "put", "content": "card11 defaulted note",
+                        "idempotency_key": format!("c11-default-{}", Uuid::now_v7()),
+                        "workspace_id": workspace_a,
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "{defaulted}");
+                let defaulted_evidence = accepted(&defaulted);
+                let before_refusals = blocking_counts(&mut handle);
+                // A plain member may not widen to the tenant audience: INVALID_INPUT (the
+                // §52 invalid-params mapping, judged inside the receipt transaction), nothing
+                // written or metered — the failure audit row is the only durable trace.
+                let (status, refused) = put(
+                    credential_a.bearer.clone(),
+                    json!({
+                        "operation": "put", "content": "card11 tenant note as member",
+                        "idempotency_key": format!("c11-tenant-member-{}", Uuid::now_v7()),
+                        "workspace_id": workspace_a,
+                        "visibility_class": "TENANT_SHARED",
+                    }),
+                )
+                .await;
+                assert_eq!(status, 400, "{refused}");
+                assert_eq!(
+                    refused["error"]["data"]["code"], "INVALID_INPUT",
+                    "member TENANT_SHARED: {refused}"
+                );
+                // Outside the closed set: the catalog schema refuses it before dispatch.
+                let (status, unknown) = put(
+                    credential_a.bearer.clone(),
+                    json!({
+                        "operation": "put", "content": "card11 unknown class",
+                        "idempotency_key": format!("c11-unknown-{}", Uuid::now_v7()),
+                        "workspace_id": workspace_a,
+                        "visibility_class": "EVERYONE",
+                    }),
+                )
+                .await;
+                assert_eq!(status, 400, "{unknown}");
+                assert_eq!(
+                    unknown["error"]["data"]["code"], "INVALID_INPUT",
+                    "{unknown}"
+                );
+                assert_eq!(
+                    durable_counts(blocking_counts(&mut handle)),
+                    durable_counts(before_refusals),
+                    "refused puts leave no Evidence, receipt or consumed reservation"
+                );
+                // OWNER: the tenant audience is reachable, bound to neither user nor workspace.
+                // Promoted with the lower-case spelling the older seeds use: 0160 folds it to
+                // the canonical `OWNER` the gate compares against, and a value outside the
+                // closed set is refused by the CHECK (so the role column is a closed set the
+                // gate can be exact against, §78.2).
+                tokio::task::block_in_place(|| {
+                    handle
+                        .admin
+                        .execute(
+                            "UPDATE control.memberships SET role='owner' WHERE tenant_id=$1 AND user_id=$2",
+                            &[&tenant_id, &user_id],
+                        )
+                        .expect("owner promotes the fixture member");
+                    let stored: String = handle
+                        .admin
+                        .query_one(
+                            "SELECT role FROM control.memberships WHERE tenant_id=$1 AND user_id=$2",
+                            &[&tenant_id, &user_id],
+                        )
+                        .expect("owner reads the promoted role")
+                        .get(0);
+                    assert_eq!(stored, "OWNER", "0160 canonicalizes the role spelling on write");
+                    let outside = handle.admin.execute(
+                        "UPDATE control.memberships SET role='viewer' WHERE tenant_id=$1 AND user_id=$2",
+                        &[&tenant_id, &user_id],
+                    );
+                    assert_eq!(
+                        outside
+                            .expect_err("a role outside the closed set is a CHECK violation")
+                            .code(),
+                        Some(&postgres::error::SqlState::CHECK_VIOLATION)
+                    );
+                });
+                let (status, tenant) = put(
+                    credential_a.bearer.clone(),
+                    json!({
+                        "operation": "put", "content": "card11 tenant note as owner",
+                        "idempotency_key": format!("c11-tenant-owner-{}", Uuid::now_v7()),
+                        "workspace_id": workspace_a,
+                        "visibility_class": "TENANT_SHARED",
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "{tenant}");
+                let tenant_evidence = accepted(&tenant);
+                tokio::task::block_in_place(|| {
+                    assert_eq!(
+                        stored_evidence(&mut handle, private_evidence),
+                        (
+                            "USER_PRIVATE".into(),
+                            Some(user_id),
+                            None,
+                            "PRIVATE".into(),
+                            "MANUAL_NOTE".into()
+                        )
+                    );
+                    assert_eq!(
+                        stored_evidence(&mut handle, shared_evidence),
+                        (
+                            "WORKSPACE_SHARED".into(),
+                            None,
+                            Some(workspace_a),
+                            "INTERNAL".into(),
+                            "USER_MESSAGE".into()
+                        )
+                    );
+                    assert_eq!(
+                        stored_evidence(&mut handle, defaulted_evidence),
+                        (
+                            "WORKSPACE_SHARED".into(),
+                            None,
+                            Some(workspace_a),
+                            "INTERNAL".into(),
+                            "USER_MESSAGE".into()
+                        )
+                    );
+                    assert_eq!(
+                        stored_evidence(&mut handle, tenant_evidence),
+                        (
+                            "TENANT_SHARED".into(),
+                            None,
+                            None,
+                            "INTERNAL".into(),
+                            "USER_MESSAGE".into()
+                        )
+                    );
+                });
+
+                // ---- D-A: pair B writes land on B's stream, created by that first write ----
+                assert_eq!(
+                    tokio::task::block_in_place(|| stream_ledger(&mut handle, workspace_b)),
+                    (0, 0, 0),
+                    "pair B has no checkpoint row before its first write"
+                );
+                let (status, on_b) = put(
+                    credential_b.bearer.clone(),
+                    json!({
+                        "operation": "put", "content": "card11 note on pair B",
+                        "idempotency_key": format!("c11-pair-b-{}", Uuid::now_v7()),
+                        "workspace_id": workspace_b,
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "{on_b}");
+                let b_evidence = accepted(&on_b);
+                tokio::task::block_in_place(|| {
+                    assert_eq!(
+                        stored_evidence(&mut handle, b_evidence),
+                        (
+                            "WORKSPACE_SHARED".into(),
+                            None,
+                            Some(workspace_b),
+                            "INTERNAL".into(),
+                            "USER_MESSAGE".into()
+                        )
+                    );
+                    assert_eq!(
+                        stream_ledger(&mut handle, workspace_b),
+                        (1, 1, 1),
+                        "B's first write creates B's checkpoint row and issues B's ticket"
+                    );
+                    assert_eq!(
+                        stream_ledger(&mut handle, workspace_a),
+                        (4, 4, 4),
+                        "A's ledger counts only A's four accepted writes"
+                    );
+                });
+                // Credential A is not a member of B: FORBIDDEN before any write.
+                let (status, forbidden) = put(
+                    credential_a.bearer.clone(),
+                    json!({
+                        "operation": "put", "content": "card11 A naming B",
+                        "idempotency_key": format!("c11-a-on-b-{}", Uuid::now_v7()),
+                        "workspace_id": workspace_b,
+                    }),
+                )
+                .await;
+                assert_eq!(status, 403, "{forbidden}");
+                assert_eq!(
+                    forbidden["error"]["data"]["code"], "FORBIDDEN",
+                    "{forbidden}"
+                );
+
+                // ---- D-A across tenants: pair C is ANOTHER tenant on the same process ----
+                // C's fixture domain is neither the process's configured domain (A's) nor
+                // owned by C's user: the tenant cannot take a write yet — fail closed
+                // (§11.2.1 "无法确定 processing principal"), nothing written, no stream row,
+                // no ticket; the boot constant is never stamped onto C's Evidence.
+                let before_c = blocking_counts(&mut tenant_c);
+                let (status, unresolved) = put(
+                    credential_c.bearer.clone(),
+                    json!({
+                        "operation": "put", "content": "card11 tenant C before its domain is bound",
+                        "idempotency_key": format!("c11-pair-c-unbound-{}", Uuid::now_v7()),
+                        "workspace_id": workspace_c,
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "{unresolved}");
+                assert_eq!(unresolved["result"]["isError"], true, "{unresolved}");
+                assert_eq!(
+                    unresolved["result"]["structuredContent"]["code"], "DEPENDENCY_UNAVAILABLE",
+                    "a tenant without a reasoning domain fails closed: {unresolved}"
+                );
+                assert_eq!(
+                    durable_counts(blocking_counts(&mut tenant_c)),
+                    durable_counts(before_c),
+                    "an unresolved reasoning domain leaves no Evidence, receipt or consumed reservation"
+                );
+                tokio::task::block_in_place(|| {
+                    assert_eq!(stream_ledger(&mut tenant_c, workspace_c), (0, 0, 0));
+                    // §11.2.1 ingress: user input is processed under that user's own domain.
+                    tenant_c
+                        .admin
+                        .execute(
+                            "UPDATE control.private_reasoning_domains SET owner_user_id=$1 \
+                             WHERE tenant_id=$2 AND reasoning_domain_id=$3",
+                            &[
+                                &tenant_c.user_id,
+                                &tenant_c.tenant_id,
+                                &tenant_c.reasoning_domain_id,
+                            ],
+                        )
+                        .expect("owner binds C's reasoning domain to C's user");
+                });
+                let (status, on_c) = put(
+                    credential_c.bearer.clone(),
+                    json!({
+                        "operation": "put", "content": "card11 note on tenant C",
+                        "idempotency_key": format!("c11-pair-c-{}", Uuid::now_v7()),
+                        "workspace_id": workspace_c,
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "{on_c}");
+                let c_evidence = accepted(&on_c);
+                tokio::task::block_in_place(|| {
+                    assert_eq!(
+                        stored_evidence(&mut tenant_c, c_evidence),
+                        (
+                            "WORKSPACE_SHARED".into(),
+                            None,
+                            Some(workspace_c),
+                            "INTERNAL".into(),
+                            "USER_MESSAGE".into()
+                        )
+                    );
+                    assert_eq!(
+                        stored_reasoning_domain(&mut tenant_c, c_evidence),
+                        tenant_c.reasoning_domain_id,
+                        "C's Evidence is processed under C's own reasoning domain, not A's boot constant"
+                    );
+                    assert_eq!(
+                        stream_ledger(&mut tenant_c, workspace_c),
+                        (1, 1, 1),
+                        "C's first write creates C's checkpoint row and issues C's ticket"
+                    );
+                    assert_eq!(
+                        stream_ledger(&mut handle, workspace_a),
+                        (4, 4, 4),
+                        "A's ledger is untouched by another tenant's write"
+                    );
+                    assert_eq!(stream_ledger(&mut handle, workspace_b), (1, 1, 1));
+                    // 0159: the database itself refuses a cross-tenant reasoning domain, even
+                    // for a writer that bypasses the resolve — the owner client bypasses RLS,
+                    // so the composite FK is the only thing that can say no here.
+                    let cross = handle.admin.execute(
+                        "INSERT INTO private.evidence_objects \
+                           (tenant_id, evidence_kind, payload_sha256, data_class, origin_class, \
+                            visibility_class, reasoning_domain_id) \
+                         VALUES ($1, 'EVENT', sha256(convert_to(gen_random_uuid()::text,'UTF8')), \
+                                 'INTERNAL', 'DirectUserInput', 'TENANT_SHARED', $2)",
+                        &[&tenant_id, &tenant_c.reasoning_domain_id],
+                    );
+                    assert_eq!(
+                        cross
+                            .expect_err("tenant A Evidence under tenant C's reasoning domain")
+                            .code(),
+                        Some(&postgres::error::SqlState::FOREIGN_KEY_VIOLATION)
+                    );
+                });
+                // The tenant is the principal's: credential C naming A's workspace is not a
+                // member there — FORBIDDEN before any write.
+                let (status, forbidden_c) = put(
+                    credential_c.bearer.clone(),
+                    json!({
+                        "operation": "put", "content": "card11 C naming A",
+                        "idempotency_key": format!("c11-c-on-a-{}", Uuid::now_v7()),
+                        "workspace_id": workspace_a,
+                    }),
+                )
+                .await;
+                assert_eq!(status, 403, "{forbidden_c}");
+                assert_eq!(
+                    forbidden_c["error"]["data"]["code"], "FORBIDDEN",
+                    "{forbidden_c}"
+                );
+
+                // ---- D-C: same principal, same key, two streams, concurrently ----
+                let principal = credential_a.api_key_id;
+                let two_pairs = AuthorizationScope::new(
+                    TenantId(tenant_id),
+                    PrincipalId(principal),
+                    Some(UserId(user_id)),
+                    BoundedSet::new([WorkspaceId(workspace_a), WorkspaceId(workspace_b)])
+                        .expect("two-workspace scope"),
+                );
+                let key = format!("c11-cross-stream-{}", Uuid::now_v7());
+                let content_a = "card11 cross-stream on A";
+                let content_b = "card11 cross-stream on B";
+                let (first_a, first_b) = tokio::join!(
+                    operation_receipt::remember_atomically(
+                        &direct_pool,
+                        &two_pairs,
+                        direct_receipt_request(&handle, principal, workspace_a, &key, content_a),
+                    ),
+                    operation_receipt::remember_atomically(
+                        &direct_pool,
+                        &two_pairs,
+                        direct_receipt_request(&handle, principal, workspace_b, &key, content_b),
+                    ),
+                );
+                let first_a = first_a.expect("same key on stream A commits");
+                let first_b =
+                    first_b.expect("same key on stream B commits concurrently, never CONFLICT");
+                assert!(!first_a.replayed && !first_b.replayed);
+                assert_ne!(first_a.accepted.evidence_id, first_b.accepted.evidence_id);
+                // Each stream replays its own receipt.
+                let replay_a = operation_receipt::remember_atomically(
+                    &direct_pool,
+                    &two_pairs,
+                    direct_receipt_request(&handle, principal, workspace_a, &key, content_a),
+                )
+                .await
+                .expect("stream A replays");
+                let replay_b = operation_receipt::remember_atomically(
+                    &direct_pool,
+                    &two_pairs,
+                    direct_receipt_request(&handle, principal, workspace_b, &key, content_b),
+                )
+                .await
+                .expect("stream B replays");
+                assert!(replay_a.replayed && replay_b.replayed);
+                assert_eq!(replay_a.accepted.evidence_id, first_a.accepted.evidence_id);
+                assert_eq!(replay_b.accepted.evidence_id, first_b.accepted.evidence_id);
+                let receipts: i64 = tokio::task::block_in_place(|| {
+                    handle
+                        .admin
+                        .query_one(
+                            "SELECT count(*) FROM control.operation_receipts \
+                             WHERE tenant_id=$1 AND principal_id=$2 AND idempotency_key=$3",
+                            &[&tenant_id, &principal, &key],
+                        )
+                        .expect("owner counts receipts")
+                        .get(0)
+                });
+                assert_eq!(receipts, 2, "one receipt per stream for the same caller key");
+
+                // ---- speed record for the ADR (uncontended, per-call class) ----
+                let mut samples = Vec::new();
+                for n in 0..9_u8 {
+                    let started = Instant::now();
+                    let (status, response) = put(
+                        credential_a.bearer.clone(),
+                        json!({
+                            "operation": "put", "content": format!("card11 speed {n}"),
+                            "idempotency_key": format!("c11-p50-{n}-{}", Uuid::now_v7()),
+                            "workspace_id": workspace_a,
+                            "visibility_class": "USER_PRIVATE",
+                        }),
+                    )
+                    .await;
+                    samples.push(started.elapsed());
+                    assert_eq!(status, 200, "{response}");
+                    accepted(&response);
+                }
+                eprintln!(
+                    "card11 p50 remember.put (per-call class): {:?} (n={})",
+                    percentile_p50(&mut samples),
+                    samples.len()
+                );
+                stop_server(server).await.expect("stop card 11 server");
+            });
                 },
             );
         },

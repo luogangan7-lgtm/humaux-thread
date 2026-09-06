@@ -21,8 +21,10 @@ use humaux_domain::{
     authority::MemoryId,
     confirm::{ConfirmToken, DestructiveOp},
     continuity::ProjectId,
+    dataclass::DataClass,
     error::ErrorCode,
     evidence::payload_sha256,
+    identity::VisibilityClass,
     ids::WorkspaceId,
     subject::{SubjectId, SubjectKey, SubjectKeyKind, SubjectKind, SubjectRole, SubjectWriteOp},
 };
@@ -41,7 +43,9 @@ use crate::{
     guard::{ConfirmGate, ConfirmedOutcome, GatewayGuard},
     memory,
     recall::{self, RecallSearchRequest, SemanticRecallRuntime},
-    remember::{self, PreparedEvidencePayload, RememberEventKind, RememberPolicy},
+    remember::{
+        self, PreparedEvidencePayload, PutClassification, RememberEventKind, RememberPolicy,
+    },
 };
 
 /// The only real MCP business routes currently available from Gateway. Confirm-gated
@@ -212,10 +216,19 @@ impl GatewayMcpApplication {
             (false, Some(half_life)) => Some(half_life),
             (false, None) => return self.reject_unsupported(context, operation, None).await,
         };
+        // ADR-0032 D-B: per-call classification within the closed sets, process defaults
+        // when absent (backward compatible). Reachability of the class is judged downstream
+        // (`remember::command` for scope, the receipt transaction for the TENANT_SHARED role).
+        let classification = PutClassification {
+            visibility_class: wire
+                .visibility_class
+                .unwrap_or(self.remember_policy.visibility_class()),
+            data_class: wire.data_class.unwrap_or(self.remember_policy.data_class()),
+            event_kind: wire.event_kind.unwrap_or(self.remember_event_kind),
+        };
         let workspace = wire.workspace_id.unwrap_or(self.remember_workspace);
-        let configured_workspace = self.remember_workspace;
         let policy = self.remember_policy.clone();
-        let event_kind = self.remember_event_kind;
+        let bootstrap = self.context_bootstrap.clone();
         let result = self
             .guard
             .run_atomic_remember(
@@ -225,14 +238,22 @@ impl GatewayMcpApplication {
                 raw_arguments,
                 wire.idempotency_key,
                 move |request| {
-                    if request.workspace_id() != Some(configured_workspace) {
+                    if request.workspace_id() != Some(workspace) {
                         return Err(ErrorCode::Forbidden);
                     }
+                    // ADR-0032 D-A (§34.0.1 Q9): the write stream is derived per request at
+                    // the read routes' single derivation point — principal tenant + the
+                    // membership-narrowed requested workspace + the process family. Pure, no
+                    // PG round trip; the pair's checkpoint row is created idempotently by the
+                    // first write (`issue_stream_log_row`).
+                    let (_, stream) =
+                        bootstrap.request_stream(request.authorization().tenant_id(), workspace);
                     remember::command(
                         request.authorization(),
                         &policy,
+                        &stream,
                         wire.content,
-                        event_kind,
+                        classification,
                         None,
                         OffsetDateTime::now_utc(),
                         subjects,
@@ -736,8 +757,9 @@ impl GatewayMcpApplication {
 
     /// §36 `memory.supersede` through the shared §33.10 confirm gate (ADR-0018). The
     /// schema carries no `workspace_id`: the route is the credential's bound workspace,
-    /// which must be the bootstrap projection stream's workspace (write routes stay
-    /// bootstrap-bound until card 11; reads derive their stream per request, ADR-0031).
+    /// which must be the bootstrap projection stream's workspace (the confirm-gated governance
+    /// writers stay bootstrap-bound; `remember.put` and the reads derive their stream per
+    /// request, ADR-0031 / ADR-0032).
     async fn memory_supersede(
         &self,
         context: &McpHttpContext,
@@ -1526,6 +1548,11 @@ struct RememberPutWire {
     content: PreparedEvidencePayload,
     idempotency_key: String,
     workspace_id: Option<WorkspaceId>,
+    /// ADR-0032 D-B per-call overrides, each parsed into its closed set (unknown ⇒
+    /// `INVALID_INPUT` before admission; the schema already refuses them at the catalog).
+    visibility_class: Option<VisibilityClass>,
+    data_class: Option<DataClass>,
+    event_kind: Option<RememberEventKind>,
 }
 
 #[derive(Deserialize)]
@@ -1533,6 +1560,9 @@ struct RawRememberPutWire {
     content: Box<RawValue>,
     idempotency_key: String,
     workspace_id: Option<Uuid>,
+    visibility_class: Option<String>,
+    data_class: Option<String>,
+    event_kind: Option<String>,
 }
 
 impl RememberPutWire {
@@ -1548,6 +1578,21 @@ impl RememberPutWire {
             content: PreparedEvidencePayload::new(raw.content.get().as_bytes().to_vec(), content)?,
             idempotency_key: raw.idempotency_key,
             workspace_id: raw.workspace_id.map(WorkspaceId),
+            visibility_class: raw
+                .visibility_class
+                .as_deref()
+                .map(remember::parse_visibility_class)
+                .transpose()?,
+            data_class: raw
+                .data_class
+                .as_deref()
+                .map(remember::parse_data_class)
+                .transpose()?,
+            event_kind: raw
+                .event_kind
+                .as_deref()
+                .map(RememberEventKind::parse)
+                .transpose()?,
         })
     }
 }

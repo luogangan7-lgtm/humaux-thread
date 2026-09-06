@@ -1,7 +1,9 @@
-//! Process bootstrap: the one configured Gateway *write* stream plus the process-wide
-//! `(scope_kind, domain, projection_kind, projection_version)` the read routes attach to each
-//! request's own `(tenant, workspace)` (ADR-0031 D-A, §34.0.1 Q9: one process serves every
-//! provisioned pair for reads; no registry table, no per-process stream cache).
+//! Process bootstrap: the process-wide stream family `(scope_kind, domain, projection_kind,
+//! projection_version)` that the read routes AND `remember.put` attach to each request's own
+//! `(tenant, workspace)` (ADR-0031 D-A / ADR-0032 D-A, §34.0.1 Q9: one process serves every
+//! pair; no registry table, no per-process stream cache), plus the default write pair
+//! (`REMEMBER_TENANT_ID` / `REMEMBER_WORKSPACE_ID`) a put without `workspace_id` lands on and
+//! the confirm-gated governance writers still compare against.
 //!
 //! This module owns process configuration only. Tool arguments never select a
 //! stream version, credential verifier, listener, or rate policy; a tool argument selects a
@@ -46,7 +48,7 @@ use crate::{
     guard::{GatewayGuard, GuardRatePolicies, GuardSettings},
     mcp_application::GatewayMcpApplication,
     recall::{SemanticRecallRuntime, SemanticRecallVersions},
-    remember::{RememberEventKind, RememberPolicy},
+    remember::{self, RememberEventKind, RememberPolicy},
     retrieval_embedding_client::GatewayRetrievalEmbeddingClient,
 };
 
@@ -628,10 +630,10 @@ fn registry() -> Vec<ConfigEntry> {
         ("CONFIRM_TOKEN_TTL_SECONDS", "u64", false),
         ("UNDO_WINDOW_SECONDS", "u64", false),
         ("MOOD_HALF_LIFE_SECONDS", "u64", false),
-        // ADR-0031 D-B: these two bind ONLY the write route (`remember.put` and the
-        // confirm-gated governance writers) until card 11; the read routes derive the stream
-        // per request and no longer compare against them. Deprecated for reads; still required
-        // at boot because the write route lives in the same process.
+        // ADR-0032 (card 11): these two are the DEFAULT write pair — `remember.put` derives
+        // its stream per request like the reads (ADR-0031) and lands here only when the call
+        // omits `workspace_id`; the confirm-gated governance writers still compare against
+        // them. Still required at boot (fail-closed bootstrap, ADR-0031 D-B).
         ("REMEMBER_TENANT_ID", "uuid", false),
         ("REMEMBER_WORKSPACE_ID", "uuid", false),
         ("REMEMBER_SCOPE_KIND", "enum:workspace", false),
@@ -849,24 +851,22 @@ fn validate_guard(guard: &GuardSettings) -> Result<(), BootstrapError> {
     Ok(())
 }
 
+// The three closed-set parsers are `remember`'s (ADR-0032 D-B: one parser each for the env
+// default and the per-call argument, so the two spellings can never drift apart).
 fn data_class(value: &str) -> Result<DataClass, BootstrapError> {
-    match value {
-        "PUBLIC" => Ok(DataClass::Public),
-        "INTERNAL" => Ok(DataClass::Internal),
-        "PRIVATE" => Ok(DataClass::Private),
-        "SENSITIVE" => Ok(DataClass::Sensitive),
-        "SECRET_MATERIAL" => Ok(DataClass::SecretMaterial),
-        _ => Err(BootstrapError::new(
+    remember::parse_data_class(value).map_err(|_| {
+        BootstrapError::new(
             "HUMAUX_GATEWAY_REMEMBER_DATA_CLASS",
             "unknown closed enum value",
-        )),
-    }
+        )
+    })
 }
 
+/// The process DEFAULT may not be `TENANT_SHARED`: that class is reachable per call only,
+/// behind the OWNER/ADMIN membership gate (ADR-0032 D-B).
 fn visibility(value: &str) -> Result<VisibilityClass, BootstrapError> {
-    match value {
-        "USER_PRIVATE" => Ok(VisibilityClass::UserPrivate),
-        "WORKSPACE_SHARED" => Ok(VisibilityClass::WorkspaceShared),
+    match remember::parse_visibility_class(value) {
+        Ok(class) if class != VisibilityClass::TenantShared => Ok(class),
         _ => Err(BootstrapError::new(
             "HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS",
             "only USER_PRIVATE or WORKSPACE_SHARED is enabled",
@@ -875,21 +875,12 @@ fn visibility(value: &str) -> Result<VisibilityClass, BootstrapError> {
 }
 
 fn event_kind(value: &str) -> Result<RememberEventKind, BootstrapError> {
-    match value {
-        "USER_MESSAGE" => Ok(RememberEventKind::UserMessage),
-        "ASSISTANT_MESSAGE" => Ok(RememberEventKind::AssistantMessage),
-        "TOOL_CALL" => Ok(RememberEventKind::ToolCall),
-        "TOOL_RESULT" => Ok(RememberEventKind::ToolResult),
-        "MANUAL_NOTE" => Ok(RememberEventKind::ManualNote),
-        "USER_CORRECTION" => Ok(RememberEventKind::UserCorrection),
-        "TASK_EVENT" => Ok(RememberEventKind::TaskEvent),
-        "GIT_EVENT" => Ok(RememberEventKind::GitEvent),
-        "SYSTEM_IMPORT" => Ok(RememberEventKind::SystemImport),
-        _ => Err(BootstrapError::new(
+    RememberEventKind::parse(value).map_err(|_| {
+        BootstrapError::new(
             "HUMAUX_GATEWAY_REMEMBER_EVENT_KIND",
             "unknown closed enum value",
-        )),
-    }
+        )
+    })
 }
 
 fn redacted_fingerprint(registry: &[ConfigEntry], effective: &BTreeMap<String, String>) -> String {

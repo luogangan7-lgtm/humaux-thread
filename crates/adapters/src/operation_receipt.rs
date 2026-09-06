@@ -25,6 +25,17 @@ use crate::{
 const OPERATION: &str = "remember.put";
 type Txn<'c> = sqlx::Transaction<'c, sqlx::Postgres>;
 
+/// §6.1.1 / ADR-0032 D-B: the `control.memberships.role` values whose ACTIVE holder may write
+/// `TENANT_SHARED` Evidence through `remember.put`. A tenant-wide audience is the widest class
+/// there is, so it is gated on the membership role rather than on the credential scope alone
+/// (`memory:write` is what every member already holds); any other role is `INVALID_INPUT`
+/// with nothing written or metered. §78.2: these are two of the three values of the column's
+/// closed set — migration 0160 `memberships_role_known` CHECK (`OWNER | ADMIN | MEMBER`) plus
+/// the `memberships_canonical_role` trigger that folds every write to that spelling — so an
+/// exact match here is exact against the whole set, never a silent deny for a writer's
+/// spelling. The set lives here once, next to the one statement that reads it.
+pub const TENANT_SHARED_WRITER_ROLES: [&str; 2] = ["OWNER", "ADMIN"];
+
 /// Trusted application inputs. This is not a deserializable MCP request or a credential.
 pub struct AtomicRememberRequest {
     pub request_id: Uuid,
@@ -62,6 +73,9 @@ fn remember_error(error: RememberError) -> ErrorCode {
         RememberError::BatchExhausted => ErrorCode::Conflict,
         // §6.1.3: an unresolvable subject declaration is INVALID_INPUT with nothing written.
         RememberError::Subject(code) | RememberError::Affect(code) => code,
+        // §11.2.1 / ADR-0032 D-A: the caller tenant has no reasoning domain to process this
+        // Evidence under — not provisioned for writes, nothing written, retryable once it is.
+        RememberError::ReasoningDomainUnresolved => ErrorCode::DependencyUnavailable,
         RememberError::Db(error) => db_error(error),
     }
 }
@@ -180,6 +194,14 @@ pub async fn remember_atomically(
             replayed: true,
         });
     }
+    // ADR-0032 D-B: TENANT_SHARED is reachable only for an OWNER/ADMIN member; judged in this
+    // same transaction (one indexed membership read, only on that path) before any reservation
+    // so a refused put leaves no Evidence, no BMO and no receipt.
+    if request.command.visibility_class == "TENANT_SHARED"
+        && !tenant_shared_write_allowed(&mut txn, &auth).await?
+    {
+        return Err(ErrorCode::InvalidInput);
+    }
     let reservation = match quota_repo::reserve_bmo_in_txn(
         &mut txn,
         &auth,
@@ -226,11 +248,8 @@ pub async fn remember_atomically(
         &request.finished_audit,
     )
     .await?;
-    let now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
-        .fetch_one(&mut *txn)
-        .await
-        .map_err(db_error)?;
-    let replay_expires_at = now
+    let replay_expires_at = db_now(&mut txn)
+        .await?
         .checked_add(replay_duration)
         .ok_or(ErrorCode::InvalidInput)?;
     let stream = pending.stream_key();
@@ -249,10 +268,7 @@ pub async fn remember_atomically(
     .bind(&stream.projection_kind).bind(&stream.projection_version)
     .bind(pending.stream_seq()).bind(pending.commit_seq()).bind(audit_id.0).bind(replay_expires_at)
     .execute(&mut *txn).await.map_err(db_error)?;
-    let finalized_at: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
-        .fetch_one(&mut *txn)
-        .await
-        .map_err(db_error)?;
+    let finalized_at = db_now(&mut txn).await?;
     if finalized_at >= reservation.expires_at() || finalized_at >= token_expires_at {
         return Err(ErrorCode::Conflict);
     }
@@ -267,6 +283,46 @@ pub async fn remember_atomically(
     })
 }
 
+/// The transaction's `clock_timestamp()` — every §34.0.1 deadline is judged on the database
+/// clock after the blocking writes, never on the gateway's.
+async fn db_now(txn: &mut Txn<'_>) -> Result<OffsetDateTime, ErrorCode> {
+    sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **txn)
+        .await
+        .map_err(db_error)
+}
+
+/// The §6.3 lifecycle triple the contribution path already requires (`contribution_entry_repo`):
+/// an ACTIVE membership of an ACTIVE user in an ACTIVE tenant, holding one of
+/// [`TENANT_SHARED_WRITER_ROLES`]. Fails closed on every other state.
+async fn tenant_shared_write_allowed(
+    txn: &mut Txn<'_>,
+    auth: &AuthorizationScope,
+) -> Result<bool, ErrorCode> {
+    let Some(user) = auth.user_id() else {
+        return Ok(false);
+    };
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM control.memberships m \
+         JOIN control.users u USING(user_id) JOIN control.tenants t USING(tenant_id) \
+         WHERE m.tenant_id=$1 AND m.user_id=$2 AND m.state='ACTIVE' AND u.state='ACTIVE' \
+           AND t.state='ACTIVE' AND m.role = ANY($3))",
+    )
+    .bind(auth.tenant_id().0)
+    .bind(user.0)
+    .bind(&TENANT_SHARED_WRITER_ROLES[..])
+    .fetch_one(&mut **txn)
+    .await
+    .map_err(db_error)
+}
+
+/// §34.0.1 / ADR-0032 D-C: the receipt key is `(tenant, principal, scope_kind, scope_id,
+/// operation, idempotency_key)` — the stream scope the write was issued against is part of
+/// the key (migration 0158), `projection_version` never is. The advisory lock and the lookup
+/// both carry the scope, so the same caller key under two streams is two operations, never a
+/// `CONFLICT`, and two concurrent same-key writes on different streams never serialize on each
+/// other. `scope_kind`/`scope_id` come from the validated command (they equal the routed
+/// workspace by `validate`'s TenantBoundary check).
 async fn lock_and_find_receipt(
     txn: &mut Txn<'_>,
     auth: &AuthorizationScope,
@@ -288,9 +344,11 @@ async fn lock_and_find_receipt(
     let locked: bool =
         sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))")
             .bind(format!(
-                "operation-receipt:{}:{}:{OPERATION}:{}",
+                "operation-receipt:{}:{}:{}:{}:{OPERATION}:{}",
                 auth.tenant_id().0,
                 auth.principal().0,
+                request.command.scope_kind,
+                request.command.scope_id,
                 request.idempotency_key
             ))
             .fetch_one(&mut **txn)
@@ -301,10 +359,13 @@ async fn lock_and_find_receipt(
     }
     sqlx::query(
         "SELECT *, clock_timestamp() AS observed_at FROM control.operation_receipts \
-         WHERE tenant_id=$1 AND principal_id=$2 AND operation=$3 AND idempotency_key=$4",
+         WHERE tenant_id=$1 AND principal_id=$2 AND scope_kind=$3 AND scope_id=$4 \
+           AND operation=$5 AND idempotency_key=$6",
     )
     .bind(auth.tenant_id().0)
     .bind(auth.principal().0)
+    .bind(&request.command.scope_kind)
+    .bind(request.command.scope_id)
     .bind(OPERATION)
     .bind(&request.idempotency_key)
     .fetch_optional(&mut **txn)

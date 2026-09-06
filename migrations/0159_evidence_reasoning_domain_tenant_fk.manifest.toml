@@ -1,0 +1,51 @@
+# §46.1 migration manifest. ADR-0032 (card 11, §11.2.1 reasoning domain per tenant): adds the
+# composite FOREIGN KEY (tenant_id, reasoning_domain_id) on private.evidence_objects referencing
+# control.private_reasoning_domains(tenant_id, reasoning_domain_id) so an Evidence can never
+# reference another tenant's reasoning domain (NOT VALID + VALIDATE when the table is clean, the
+# 0099/0100 lock split; a pre-existing RI-bypassed orphan keeps it NOT VALID — still enforced for
+# every new write — with a WARNING). No DML, no grant, policy or trigger change; the 0004
+# single-column FK is kept. §46 forward-fix (EXPAND_CONTRACT, next free number after 0158).
+
+migration_id = "0159_evidence_reasoning_domain_tenant_fk"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('private.evidence_objects') is not null
+ and exists(select 1 from pg_constraint
+            where conrelid='control.private_reasoning_domains'::regclass and contype='u'
+              and conname='private_reasoning_domains_tenant_identity_unique')
+ and not exists(select 1 from pg_constraint
+                where conrelid='private.evidence_objects'::regclass
+                  and conname='evidence_objects_reasoning_domain_tenant_fk')
+ as precheck_ok
+"""
+
+postcheck = """
+select exists(select 1 from pg_constraint c
+              where c.conrelid='private.evidence_objects'::regclass
+                and c.conname='evidence_objects_reasoning_domain_tenant_fk'
+                and c.contype='f'
+                and c.confrelid='control.private_reasoning_domains'::regclass
+                -- validated unless RI-bypassed orphans predate this migration
+                and (c.convalidated or exists(
+                      select 1 from private.evidence_objects e
+                      where not exists(select 1 from control.private_reasoning_domains d
+                                       where d.tenant_id=e.tenant_id
+                                         and d.reasoning_domain_id=e.reasoning_domain_id)))
+                and (select array_agg(a.attname::text order by k.ord)
+                     from unnest(c.conkey) with ordinality as k(attnum, ord)
+                     join pg_attribute a on a.attrelid=c.conrelid and a.attnum=k.attnum)
+                    = array['tenant_id','reasoning_domain_id'])
+ -- untouched: the 0004 FK, FORCE RLS and the §6.2.2 grants on evidence_objects
+ and exists(select 1 from pg_constraint where conrelid='private.evidence_objects'::regclass
+            and conname='evidence_objects_reasoning_domain_id_fkey')
+ and exists(select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
+            where n.nspname='private' and c.relname='evidence_objects'
+              and c.relrowsecurity and c.relforcerowsecurity)
+ and has_table_privilege('role_gateway','private.evidence_objects','INSERT')
+ and not has_table_privilege('role_gateway','private.evidence_objects','DELETE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. A later migration may drop the composite FK only together with a replacement invariant of at least the same strength (a cross-tenant reasoning domain must stay unwritable); no row is rewritten by this migration. Where the WARNING fired, ops repairs or removes the orphan rows through the §37 deletion governance and runs VALIDATE CONSTRAINT evidence_objects_reasoning_domain_tenant_fk."
+backup_restore_requirement = "none for rows (no DML). Production still takes the standard pre-migration backup because VALIDATE CONSTRAINT scans evidence_objects under SHARE UPDATE EXCLUSIVE."
