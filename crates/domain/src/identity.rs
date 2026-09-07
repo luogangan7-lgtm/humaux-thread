@@ -186,7 +186,12 @@ impl AuthorizationScope {
         self.user_id
     }
 
-    /// The bounded set of workspaces this scope is currently authorized into.
+    /// The bounded set of workspaces this scope is currently authorized into. For a
+    /// request scope this is built per request by the authentication layer (ADR-0035,
+    /// §6.1.1): the on-behalf-of user's live ACTIVE WorkspaceMembership set
+    /// (`control.workspace_memberships`, not tenant membership) intersected with the
+    /// credential's optional bound workspace — never the credential's baked column alone,
+    /// and never a union.
     pub fn allowed_workspace_ids(&self) -> &BoundedSet<WorkspaceId> {
         &self.allowed_workspace_ids
     }

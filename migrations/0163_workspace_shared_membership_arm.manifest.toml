@@ -1,0 +1,49 @@
+# §46.1 migration manifest. ADR-0035 (card 13, §6.1.1): re-points the WORKSPACE_SHARED arm of the
+# three visibility policies (evidence_objects / memory_records / memory_rollups) from 0153's
+# tenant-membership EXISTS to a control.workspace_memberships EXISTS matching the row's own
+# visibility_workspace_id — implementing what §6.1.1 already requires. private.visibility_allowed
+# and every other policy arm are unchanged; 0012/0153 bytes untouched. The frozen §6.1.1 policy
+# hash in xtask/src/rls_check.rs is re-pinned in the same change (a legal forward-fix, not drift).
+# No table DDL, no DML. §46 forward-fix (EXPAND_CONTRACT, next free number after 0162).
+
+migration_id = "0163_workspace_shared_membership_arm"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.workspace_memberships') is not null
+ and to_regprocedure('private.visibility_allowed(text,boolean,boolean,boolean)') is not null
+ -- still on 0153's tenant-membership form (control.memberships), not yet re-pointed
+ and (select pg_get_expr(polqual,polrelid) like '%control.memberships%'
+      and pg_get_expr(polqual,polrelid) not like '%workspace_memberships%'
+      from pg_policy where polrelid='private.evidence_objects'::regclass
+        and polname='evidence_objects_tenant_and_visibility')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- all three arms now read control.workspace_memberships and the row's visibility_workspace_id
+ (select bool_and(ok) from (
+   select (pg_get_expr(polqual,polrelid) like '%control.workspace_memberships%'
+           and pg_get_expr(polqual,polrelid) like '%visibility_workspace_id%'
+           and pg_get_expr(polqual,polrelid) not like '%control.memberships m%'
+           and (polwithcheck is null
+                or (pg_get_expr(polwithcheck,polrelid) like '%control.workspace_memberships%'
+                    and pg_get_expr(polwithcheck,polrelid) not like '%control.memberships m%'))) as ok
+   from pg_policy
+   where (polrelid='private.evidence_objects'::regclass and polname='evidence_objects_tenant_and_visibility')
+      or (polrelid='private.memory_records'::regclass and polname='memory_records_tenant_and_visibility')
+      or (polrelid='private.memory_rollups'::regclass and polname='memory_rollups_tenant_and_visibility')
+ ) s)
+ -- still calls the untouched pure function
+ and (select pg_get_expr(polqual,polrelid) like '%visibility_allowed%'
+      from pg_policy where polrelid='private.memory_records'::regclass
+        and polname='memory_records_tenant_and_visibility')
+ -- private.visibility_allowed body unchanged (owner + IMMUTABLE)
+ and (select provolatile='i' and pg_get_userbyid(proowner)='role_migration_owner'
+      from pg_proc where oid='private.visibility_allowed(text,boolean,boolean,boolean)'::regprocedure)
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Reverting is another ALTER POLICY back to 0153's tenant-membership EXISTS (recoverable from the migration set) — but that re-opens the §6.1.1 gap, so it is only done together with reverting 0162. The re-pinned rls_check policy hash moves with this migration in the same PR."
+backup_restore_requirement = "none: three ALTER POLICY re-points, no row data touched."

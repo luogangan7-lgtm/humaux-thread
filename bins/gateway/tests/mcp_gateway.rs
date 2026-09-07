@@ -8714,6 +8714,9 @@ fn native_mcp_membership_suspend_rejects_bearer_on_next_request_and_last_owner_p
                 &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &peer_wire),
             );
             bind_credential_to_user(&mut handle, &peer, peer_user, 0);
+            // ADR-0035 (card 13): the peer reads a WORKSPACE_SHARED memory in the fixture workspace
+            // while ACTIVE — its ACTIVE WorkspaceMembership on that workspace comes from
+            // `seed_peer_user`. Suspending the tenant membership still 401s the next request.
             let visible = handle.seed_workspace_visible_context_record();
             let owner_user = handle.user_id;
             assert_eq!(membership_audit_counts(&mut handle), (0, 0));
@@ -8894,4 +8897,275 @@ fn native_mcp_membership_suspend_rejects_bearer_on_next_request_and_last_owner_p
             });
         },
     );
+}
+
+/// One `memory.get` for `memory_id`, optionally routed to `workspace_id` (ADR-0035 e2e).
+async fn memory_get_in(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    memory_id: Uuid,
+    workspace_id: Option<Uuid>,
+) -> (u16, Value) {
+    let mut arguments = json!({"action":"get","memory_id":memory_id});
+    if let Some(workspace_id) = workspace_id {
+        arguments["workspace_id"] = Value::String(workspace_id.to_string());
+    }
+    raw_request(
+        address,
+        &tool_call_headers("memory", bearer),
+        &rpc(request_id, "tools/call", call_params("memory", arguments)),
+    )
+    .await
+}
+
+/// Card 13 acceptance gate (ADR-0035, §6.1.1): `AuthorizationScope.allowed_workspace_ids` is
+/// derived per request from the on-behalf-of user's live ACTIVE *WorkspaceMembership* set
+/// (`control.workspace_memberships`, migration 0162 — a tenant membership alone grants NO
+/// workspace; the peer user's memberships {A, B} are seeded explicitly below) intersected with
+/// the credential's optional bound workspace. One unbound PAT therefore sees WORKSPACE_SHARED
+/// memories of its two member workspaces in one session without a second credential; a workspace
+/// the user is not a member of (another tenant's, or a non-existent one)
+/// is `FORBIDDEN` before any object lookup; a same-tenant memory named under the wrong
+/// workspace stays `NOT_FOUND`; a credential carrying an explicit `workspace_id` still narrows
+/// to exactly that one (the binding is a default route and a ceiling on the live set, never an
+/// authority — replace the intersection with a union and this branch goes red); and after
+/// card 12's suspension the very next request is 401 on both workspaces.
+#[test]
+#[allow(clippy::too_many_lines)] // one causally ordered story against ONE gateway process
+fn native_mcp_workspace_membership_scope() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>("native_mcp_workspace_membership_scope_foreign", |foreign| {
+        let foreign_workspace = foreign.workspace_id;
+        run_db_fixture::<Fixture, _>("native_mcp_workspace_membership_scope", |mut handle| {
+            handle.assert_gateway_login();
+            let workspace_a = handle.workspace_id;
+            let workspace_b = handle.seed_workspace();
+            // Both pairs are provisioned (serving projection, ADR-0031 D-A); the
+            // bootstrap pair A is provisioned by `application()` itself.
+            provision_stream_pair(&handle, workspace_b);
+            // The multi-workspace human: an ACTIVE member of the tenant (§6.3), never
+            // the fixture owner (its credentials keep the single-workspace shape).
+            let peer_user = handle.seed_peer_user();
+            let bound_prefix = format!("mwb{}", &Uuid::now_v7().simple().to_string()[..12]);
+            let bound_wire = format!("{bound_prefix}.{}", "g".repeat(32));
+            let bound = handle.seed_synthetic_service_credential_and_window(
+                SyntheticCredentialScopes::ContextRead,
+                &bound_prefix,
+                &bound_wire,
+                &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &bound_wire),
+                128,
+            );
+            bind_credential_to_user(&mut handle, &bound, peer_user, 0);
+            let unbound_prefix = format!("mwu{}", &Uuid::now_v7().simple().to_string()[..12]);
+            let unbound_wire = format!("{unbound_prefix}.{}", "h".repeat(32));
+            let unbound = handle.seed_synthetic_service_credential(
+                SyntheticCredentialScopes::ContextRead,
+                &unbound_prefix,
+                &unbound_wire,
+                &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &unbound_wire),
+            );
+            bind_credential_to_user(&mut handle, &unbound, peer_user, 0);
+            handle
+                .admin
+                .execute(
+                    "UPDATE control.api_keys SET workspace_id=NULL WHERE api_key_id=$1",
+                    &[&unbound.api_key_id],
+                )
+                .expect("owner unbinds the credential's workspace");
+            // ADR-0035: the peer user's live WorkspaceMemberships are {A, B}. Membership on A (the
+            // fixture default workspace) comes from `seed_peer_user`; add B so the unbound PAT reads
+            // both in one session while the bound credential (bound to A) still narrows to A. A
+            // tenant membership alone would grant neither.
+            handle
+                .admin
+                .execute(
+                    "INSERT INTO control.workspace_memberships\
+                     (tenant_id,workspace_id,user_id,role,state) \
+                     VALUES($1,$2,$3,'MEMBER','ACTIVE')",
+                    &[&handle.tenant_id, &workspace_b, &peer_user],
+                )
+                .expect("owner seeds peer workspace_b membership");
+            let a_memory = handle.seed_workspace_visible_context_record();
+            let b_memory = with_workspace(&mut handle, workspace_b, |handle| {
+                handle.seed_workspace_visible_context_record()
+            });
+
+            let runtime_handle = handle.rt.handle().clone();
+            let runtime = runtime_handle
+                .block_on(handle.fresh_runtime())
+                .expect("checked multi-workspace runtime");
+            let app = application(&handle, runtime);
+            runtime_handle.block_on(async {
+                let (address, server) = start(app).await;
+
+                // Speed record (卡片 acceptance goal): p50 of memory.get on the
+                // single-workspace (bound) credential shape — the route every
+                // existing credential takes, measured before/after this card.
+                let mut samples = Vec::new();
+                for n in 0..9_u64 {
+                    let started = Instant::now();
+                    let (status, response) = memory_get_in(
+                        address,
+                        &bound.bearer,
+                        100 + n,
+                        a_memory.memory_id,
+                        Some(workspace_a),
+                    )
+                    .await;
+                    samples.push(started.elapsed());
+                    assert_eq!(status, 200, "bound memory.get: {response}");
+                    assert_tool_response(&response, ToolName::Memory);
+                }
+                eprintln!(
+                    "card13 p50 memory.get (bound credential): {:?} (n={})",
+                    percentile_p50(&mut samples),
+                    samples.len()
+                );
+
+                // (1) One unbound PAT, one session: both member workspaces readable.
+                let (status, response) = memory_get_in(
+                    address,
+                    &unbound.bearer,
+                    1,
+                    a_memory.memory_id,
+                    Some(workspace_a),
+                )
+                .await;
+                assert_eq!(status, 200, "unbound PAT reads workspace A: {response}");
+                assert_memory_response(
+                    &response,
+                    a_memory.memory_id,
+                    5,
+                    &std::env::current_exe().expect("test binary"),
+                );
+                let (status, response) = memory_get_in(
+                    address,
+                    &unbound.bearer,
+                    2,
+                    b_memory.memory_id,
+                    Some(workspace_b),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "same credential reads workspace B without reissue: {response}"
+                );
+                assert_memory_response(
+                    &response,
+                    b_memory.memory_id,
+                    5,
+                    &std::env::current_exe().expect("test binary"),
+                );
+                // D-B: enumerate accepts any member workspace and stays workspace-exact.
+                let (status, page) = enumerate_call(
+                    address,
+                    &unbound.bearer,
+                    json!({"action":"enumerate","limit":100,"workspace_id":workspace_b}),
+                )
+                .await;
+                assert_eq!(status, 200, "enumerate in workspace B: {page}");
+                assert!(assert_enumeration_response(&page, &[b_memory.memory_id]).is_none());
+                let (status, page) = enumerate_call(
+                    address,
+                    &unbound.bearer,
+                    json!({"action":"enumerate","limit":100,"workspace_id":workspace_a}),
+                )
+                .await;
+                assert_eq!(status, 200, "enumerate in workspace A: {page}");
+                assert!(assert_enumeration_response(&page, &[a_memory.memory_id]).is_none());
+
+                // (2) Narrowing to A hides B's memory (NOT_FOUND, never an oracle);
+                // a workspace the user is not a member of is FORBIDDEN before lookup.
+                let (status, response) = memory_get_in(
+                    address,
+                    &unbound.bearer,
+                    3,
+                    b_memory.memory_id,
+                    Some(workspace_a),
+                )
+                .await;
+                assert_eq!(status, 200, "wrong-workspace object denial: {response}");
+                assert_memory_not_found(&response);
+                for (request_id, outside) in [(4, foreign_workspace), (5, Uuid::now_v7())] {
+                    let (status, response) = memory_get_in(
+                        address,
+                        &unbound.bearer,
+                        request_id,
+                        a_memory.memory_id,
+                        Some(outside),
+                    )
+                    .await;
+                    assert_eq!(
+                        status, 403,
+                        "non-member workspace {outside} is FORBIDDEN: {response}"
+                    );
+                }
+                // An unbound PAT has no default route: the request must name one.
+                let (status, response) =
+                    memory_get_in(address, &unbound.bearer, 6, a_memory.memory_id, None).await;
+                assert_eq!(
+                    status, 200,
+                    "no default route stays a tool error: {response}"
+                );
+                assert_tool_error(&response, "DEPENDENCY_UNAVAILABLE");
+
+                // (3) A credential carrying workspace_id narrows to exactly that one:
+                // the live set {A, B} ∩ {A} = {A}. Union instead of intersection ⇒ red.
+                let (status, response) = memory_get_in(
+                    address,
+                    &bound.bearer,
+                    7,
+                    b_memory.memory_id,
+                    Some(workspace_b),
+                )
+                .await;
+                assert_eq!(
+                    status, 403,
+                    "bound credential must not widen to a second member workspace: {response}"
+                );
+                let (status, response) =
+                    memory_get_in(address, &bound.bearer, 8, a_memory.memory_id, None).await;
+                assert_eq!(
+                    status, 200,
+                    "bound workspace is the default route: {response}"
+                );
+                assert_memory_response(
+                    &response,
+                    a_memory.memory_id,
+                    5,
+                    &std::env::current_exe().expect("test binary"),
+                );
+
+                // (4) Suspension (card 12) empties the scope on the very next request:
+                // the membership is no longer ACTIVE and the epoch snapshot is stale.
+                let suspended = membership_apply(
+                    &handle,
+                    peer_user,
+                    MembershipRequest::Mutate(MembershipMutation::Suspend),
+                )
+                .await
+                .expect("suspend the multi-workspace user");
+                assert_eq!(suspended.state, MembershipState::Suspended);
+                for (request_id, bearer, memory_id, workspace) in [
+                    (9, &unbound.bearer, a_memory.memory_id, workspace_a),
+                    (10, &unbound.bearer, b_memory.memory_id, workspace_b),
+                    (11, &bound.bearer, a_memory.memory_id, workspace_a),
+                ] {
+                    let (status, response) =
+                        memory_get_in(address, bearer, request_id, memory_id, Some(workspace))
+                            .await;
+                    assert_eq!(
+                        status, 401,
+                        "suspended member sees nothing on the next request: {response}"
+                    );
+                }
+                stop_server(server)
+                    .await
+                    .expect("stop multi-workspace server");
+            });
+        });
+    });
 }

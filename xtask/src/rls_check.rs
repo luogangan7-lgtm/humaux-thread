@@ -1306,6 +1306,40 @@ const ADDITIVE_SEAM_MATRIX: &[Cell] = &[
         ["SELECT", "INSERT"],
         [("UPDATE", ["state", "role", "updated_at"])]
     ),
+    // 0162 / ADR-0035 (card 13): control.workspace_memberships is the §6.1.1 workspace-level
+    // admission fact. SELECT goes to the SAME runtime readers control.memberships grants — every
+    // role that reads evidence_objects / memory_records / memory_rollups must evaluate the
+    // re-pointed WORKSPACE_SHARED EXISTS over this table (a policy expression's referenced table is
+    // permission-checked regardless of a role-bypass OR arm), plus the card-9 prefilter / ops.
+    // Reads are further gated by the restrictive self-read policy. No runtime role writes it: the
+    // sole writer is the owner definer control.set_workspace_membership (EXECUTE to
+    // role_maintenance), so every write cell is `—`; batch_issuer / admin get nothing.
+    cell!("control.workspace_memberships", "role_gateway", ["SELECT"]),
+    cell!(
+        "control.workspace_memberships",
+        "role_private_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "control.workspace_memberships",
+        "role_consolidation_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "control.workspace_memberships",
+        "role_public_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "control.workspace_memberships",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
+    cell!(
+        "control.workspace_memberships",
+        "role_maintenance",
+        ["SELECT"]
+    ),
 ];
 
 /// Named §6.2.2 tables whose non-owner cells are all deliberately empty. Their only public
@@ -3144,16 +3178,19 @@ SELECT
   AND strpos(pg_get_expr(p.polwithcheck,p.polrelid),'humaux.continuity_publish')>0
   AND strpos(pg_get_expr(p.polwithcheck,p.polrelid),'IS DISTINCT FROM')>0)
  -- Frozen §6.1.1 visibility hash. Migration 0153 (ADR-0027) re-pointed this policy's inline
- -- disjunction at private.visibility_allowed(...) via ALTER POLICY (0012 untouched), moving the
- -- deparse — hence this pin moved from the old c77b3b83… (inline OR chain) to the value below
- -- (the visibility_allowed(...) form: tenant cast byte-identical to 0012, user_id casts NULLIF-guarded
- -- against eager argument evaluation). USING == WITH CHECK,
- -- so both legs carry the same hash.
+ -- disjunction at private.visibility_allowed(...) via ALTER POLICY; migration 0163 (ADR-0035,
+ -- card 13) then re-pointed the WORKSPACE_SHARED arm from a control.memberships (tenant-membership)
+ -- EXISTS to a control.workspace_memberships EXISTS matching the row's visibility_workspace_id —
+ -- implementing what §6.1.1 already required. Each re-point moved the deparse: c77b3b83… (0012
+ -- inline OR chain) -> e877f26c… (0153 visibility_allowed + tenant-membership arm) -> the value
+ -- below (0163 visibility_allowed + workspace-membership arm). The migration-file integrity hash is
+ -- unchanged; this policy-definition hash is intentionally new (a legal forward-fix, not drift —
+ -- ADR-0035). USING == WITH CHECK, so both legs carry the same hash.
  AND (SELECT polcmd='*' AND polpermissive AND polroles=ARRAY[0::oid]
   AND encode(sha256(convert_to(pg_get_expr(polqual,polrelid),'UTF8')),'hex')
-   ='e877f26ccafdc3264091c1676922c2a34adb8afd2857d78aedccb171fca491cd'
+   ='54539243bf3f9d39e8e08986a0721d8f8289d8f960ec7b98580794c57c488fe1'
   AND encode(sha256(convert_to(pg_get_expr(polwithcheck,polrelid),'UTF8')),'hex')
-   ='e877f26ccafdc3264091c1676922c2a34adb8afd2857d78aedccb171fca491cd'
+   ='54539243bf3f9d39e8e08986a0721d8f8289d8f960ec7b98580794c57c488fe1'
  FROM pg_policy WHERE polrelid='private.evidence_objects'::regclass
    AND polname='evidence_objects_tenant_and_visibility')
  AND (SELECT count(*)=6 FROM pg_policy

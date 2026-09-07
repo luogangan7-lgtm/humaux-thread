@@ -772,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one exhaustive pin of the memory.output oneOf branch order
     fn memory_output_accepts_bare_and_snapshot_page_shapes() {
         let catalog = CanonicalCatalog::load().expect("catalog");
         let advertised = Value::Object(
@@ -848,6 +849,25 @@ mod tests {
         assert_eq!(
             advertised["oneOf"][1]["properties"]["content"]["$ref"],
             "#/$defs/Envelope"
+        );
+        // D-E (card 13, ADR-0035): BindingWritten reports the binding's scope { kind: WORKSPACE,
+        // id }. `scope` is required and closed to a WORKSPACE-kinded uuid — dropping the field or
+        // widening `kind` off the const turns this red.
+        assert!(
+            advertised["$defs"]["BindingWritten"]["required"]
+                .as_array()
+                .expect("BindingWritten.required")
+                .iter()
+                .any(|field| field == "scope"),
+            "BindingWritten must require scope"
+        );
+        assert_eq!(
+            advertised["$defs"]["BindingWritten"]["properties"]["scope"]["properties"]["kind"]["const"],
+            "WORKSPACE"
+        );
+        assert_eq!(
+            advertised["$defs"]["BindingWritten"]["properties"]["scope"]["properties"]["id"]["format"],
+            "uuid"
         );
         let advertised_validator =
             validator_for(&advertised).expect("self-contained advertised schema");

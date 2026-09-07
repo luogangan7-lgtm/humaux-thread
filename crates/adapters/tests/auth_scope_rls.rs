@@ -196,3 +196,171 @@ fn rls_tenant_context_via_set_local() {
         }
     });
 }
+
+// ADR-0035 (card 13, §6.1.1): WORKSPACE_SHARED(W) is readable iff the reader holds an ACTIVE
+// WorkspaceMembership(T, W, U) — NOT merely an ACTIVE tenant membership. This test proves the
+// re-pointed policy (migration 0163) against the canonical FORCE-RLS `private.memory_records` and
+// the real `role_gateway` login, and the Rust derivation `credential_repo::load_live_workspace_ids`
+// against `control.workspace_memberships` (migration 0162). The fixture's fresh tenant is created
+// AFTER the 0162 backfill, so its workspace memberships are seeded explicitly here.
+// The shared fixture exposes many helpers; this test uses only a few. Other tests exercise the
+// rest, so the unused-here methods are not dead code across the crate.
+#[allow(dead_code)]
+#[path = "support/operation_receipt_fixture.rs"]
+mod operation_receipt_fixture;
+
+use humaux_adapters::credential_repo;
+use operation_receipt_fixture::Fixture;
+use uuid::Uuid;
+
+fn seed_workspace_membership(admin: &mut Client, tenant: Uuid, workspace: Uuid, user: Uuid) {
+    // Superuser bypasses FORCE RLS; role/state are the closed CHECK sets (OWNER|MEMBER,
+    // ACTIVE|SUSPENDED|REMOVED). No 0160-style folding trigger on this table, so spell 'MEMBER'.
+    admin
+        .execute(
+            "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
+             VALUES($1,$2,$3,'MEMBER','ACTIVE')",
+            &[&tenant, &workspace, &user],
+        )
+        .expect("owner seeds workspace membership");
+}
+
+/// A WORKSPACE_SHARED memory filed under `workspace`, grounded on one PRIMARY evidence (mirrors
+/// the fixture's own scoped-context seed, but at a caller-chosen workspace).
+fn seed_workspace_shared_memory(
+    admin: &mut Client,
+    tenant: Uuid,
+    workspace: Uuid,
+    reasoning_domain: Uuid,
+) -> Uuid {
+    let mut txn = admin.transaction().expect("begin ws-shared memory seed");
+    let evidence_id: Uuid = txn
+        .query_one(
+            r#"INSERT INTO private.evidence_objects
+               (tenant_id,evidence_kind,payload_sha256,data_class,origin_class,visibility_class,visibility_workspace_id,reasoning_domain_id)
+             VALUES($1,'EVENT',$2,'INTERNAL','DirectUserInput','WORKSPACE_SHARED',$3,$4)
+             RETURNING evidence_id"#,
+            &[&tenant, &vec![5_u8; 32], &workspace, &reasoning_domain],
+        )
+        .expect("owner seeds ws evidence")
+        .get(0);
+    let confidence: f32 = 0.9;
+    let memory_id: Uuid = txn
+        .query_one(
+            r#"INSERT INTO private.memory_records
+               (tenant_id,memory_type,content,visibility_class,visibility_workspace_id,authority_class,confidence,status,asserted_at)
+             VALUES($1,'NOTE',$2,'WORKSPACE_SHARED',$3,'ProjectConstraint',$4,'active',clock_timestamp())
+             RETURNING memory_id"#,
+            &[
+                &tenant,
+                &serde_json::json!({"fixture": "ws-shared membership rls"}),
+                &workspace,
+                &confidence,
+            ],
+        )
+        .expect("owner seeds ws-shared memory")
+        .get(0);
+    txn.execute(
+        r#"INSERT INTO private.memory_evidence(memory_id,evidence_id,role,grounding_mode)
+         VALUES($1,$2,'PRIMARY','SNAPSHOT')"#,
+        &[&memory_id, &evidence_id],
+    )
+    .expect("owner links ws-shared memory to evidence");
+    txn.commit().expect("commit ws-shared memory seed");
+    memory_id
+}
+
+fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
+    ids.sort_unstable();
+    ids
+}
+
+/// Reads `memory_id`'s visibility for one on-behalf-of user, through the real `role_gateway`
+/// login (non-superuser, non-BYPASSRLS) with `SET LOCAL humaux.tenant_id/user_id` — exactly the
+/// gateway request shape. Returns how many rows RLS admits (0 or 1).
+fn gateway_sees(gw: &mut Client, tenant: Uuid, user: Uuid, memory_id: Uuid) -> i64 {
+    let mut txn = gw.transaction().expect("begin gateway read");
+    txn.batch_execute(&format!(
+        "SET LOCAL humaux.tenant_id = '{tenant}'; SET LOCAL humaux.user_id = '{user}';"
+    ))
+    .expect("set gateway request context");
+    let count: i64 = txn
+        .query_one(
+            "SELECT count(*) FROM private.memory_records WHERE memory_id = $1",
+            &[&memory_id],
+        )
+        .expect("gateway visibility count")
+        .get(0);
+    txn.rollback().expect("rollback gateway read");
+    count
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // one causally ordered acceptance story: RLS + Rust derivation
+fn workspace_shared_needs_workspace_membership_not_tenant_membership() {
+    run_db_fixture::<Fixture, _>(
+        "workspace_shared_needs_workspace_membership_not_tenant_membership",
+        |mut handle| {
+            let tenant = handle.tenant_id;
+            let alice = handle.user_id; // ACTIVE tenant member (fixture owner user)
+            let w1 = handle.workspace_id;
+            let w2 = handle.seed_workspace();
+            let w3 = handle.seed_workspace();
+            let bob = handle.seed_peer_user(); // ACTIVE tenant member, different user
+            let reasoning_domain = handle.reasoning_domain_id;
+
+            // Alice {W1, W2}; Bob {W2, W3}. Both are ACTIVE tenant members. Alice's W1 membership
+            // is seeded by the fixture (its owner user on its own workspace); `seed_peer_user` gives
+            // Bob a W1 membership by default, which this acceptance removes so Bob is exactly
+            // {W2, W3} — a member of neither the fixture's W1 nor, importantly, no wider set.
+            handle
+                .admin
+                .execute(
+                    "DELETE FROM control.workspace_memberships WHERE tenant_id=$1 AND workspace_id=$2 AND user_id=$3",
+                    &[&tenant, &w1, &bob],
+                )
+                .expect("drop Bob's default-workspace membership");
+            seed_workspace_membership(&mut handle.admin, tenant, w2, alice);
+            seed_workspace_membership(&mut handle.admin, tenant, w2, bob);
+            seed_workspace_membership(&mut handle.admin, tenant, w3, bob);
+
+            let memory_w3 =
+                seed_workspace_shared_memory(&mut handle.admin, tenant, w3, reasoning_domain);
+
+            // Live PG RLS: Alice (a tenant member, but NOT a W3 workspace member) must see 0 rows.
+            // Under 0153's tenant-membership arm this returned 1 — the §6.1.1 bug this card fixes;
+            // dropping the workspace-membership EXISTS collapses right back to that (tenant-wide).
+            let mut gw = handle.gateway_client().expect("actual role_gateway login");
+            assert_eq!(
+                gateway_sees(&mut gw, tenant, alice, memory_w3),
+                0,
+                "Alice holds no ACTIVE WorkspaceMembership(T, W3): WORKSPACE_SHARED(W3) is invisible"
+            );
+            assert_eq!(
+                gateway_sees(&mut gw, tenant, bob, memory_w3),
+                1,
+                "Bob holds ACTIVE WorkspaceMembership(T, W3): WORKSPACE_SHARED(W3) is visible"
+            );
+
+            // The Rust derivation reads the same live set per (tenant, user).
+            let alice_ws = handle
+                .rt
+                .block_on(credential_repo::load_live_workspace_ids(
+                    &handle.runtime,
+                    tenant,
+                    alice,
+                ))
+                .expect("load Alice live workspaces");
+            assert_eq!(sorted(alice_ws), sorted(vec![w1, w2]));
+            let bob_ws = handle
+                .rt
+                .block_on(credential_repo::load_live_workspace_ids(
+                    &handle.runtime,
+                    tenant,
+                    bob,
+                ))
+                .expect("load Bob live workspaces");
+            assert_eq!(sorted(bob_ws), sorted(vec![w2, w3]));
+        },
+    );
+}

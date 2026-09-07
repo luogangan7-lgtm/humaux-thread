@@ -1,13 +1,25 @@
 //! Gateway-only read adapter for §73.5.1 service credential bindings.
 //! This module returns database facts only; HMAC and authorization decisions remain in
 //! the protocol/authentication layer.
+//!
+//! [`lookup`] is the single cheap credential snapshot (no membership work). The per-request
+//! §6.1.1 workspace ceiling is a SEPARATE read, [`load_live_workspace_ids`], the authentication
+//! layer runs only after `validate_api_key` succeeds for a user-bound credential (ADR-0035, card
+//! 13) — so a machine credential or a bad key does no membership DB work.
 
 use humaux_domain::error::ErrorCode;
+use humaux_domain::identity::MembershipState;
 use sqlx::Row;
 use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
 use crate::postgres::RuntimeDbPool;
+
+/// §6.1.1 ceiling: no request may carry more workspaces than this. Queried `LIMIT 257` so a
+/// membership set of exactly the 256-cap ([`humaux_domain::identity::BoundedSet::MAX_LEN`]) is
+/// returned whole while one row beyond it is observed (not silently truncated to 256) and turned
+/// into `INVALID_INPUT` by the caller. ADR-0035, card 13.
+const LIVE_WORKSPACE_QUERY_LIMIT: i64 = 257;
 
 /// One row from the sole gateway-only api_key_lookup(text) entry point.
 ///
@@ -181,6 +193,52 @@ pub async fn lookup(
         })
     })
     .transpose()
+}
+
+/// The live workspace ceiling for one (tenant, user): every workspace the user holds an ACTIVE
+/// [`MembershipState`] `control.workspace_memberships` row in (ADR-0035 / §6.1.1). Read per request
+/// in the authentication layer (`bins/gateway/src/auth.rs`) AFTER `validate_api_key` succeeds and
+/// only when the credential carries a `user_id` — a machine credential or a bad key never reaches
+/// here, so this adds no pre-auth DB work.
+///
+/// `control.workspace_memberships` is FORCE RLS with a self-read policy (tenant GUC AND user GUC
+/// match the row), so both GUCs are set transaction-locally first; without them the gateway role
+/// reads nothing, which is the fail-closed direction, and the `SET LOCAL` dies with the READ
+/// COMMITTED transaction (never leaking onto another pooled request). More than
+/// [`humaux_domain::identity::BoundedSet::MAX_LEN`] memberships is `INVALID_INPUT`, not a silent
+/// truncation (see [`LIVE_WORKSPACE_QUERY_LIMIT`]).
+pub async fn load_live_workspace_ids(
+    pool: &RuntimeDbPool,
+    tenant_id: Uuid,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>, ErrorCode> {
+    let mut txn = pool.pool().begin().await.map_err(db_error)?;
+    sqlx::query(
+        "SELECT set_config('humaux.tenant_id', $1, true), set_config('humaux.user_id', $2, true)",
+    )
+    .bind(tenant_id.to_string())
+    .bind(user_id.to_string())
+    .execute(&mut *txn)
+    .await
+    .map_err(db_error)?;
+    let rows = sqlx::query_scalar::<_, Uuid>(
+        "SELECT workspace_id FROM control.workspace_memberships \
+         WHERE tenant_id = $1 AND user_id = $2 AND state = $3 \
+         ORDER BY workspace_id LIMIT $4",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(MembershipState::Active.as_db_str())
+    .bind(LIVE_WORKSPACE_QUERY_LIMIT)
+    .fetch_all(&mut *txn)
+    .await
+    .map_err(db_error)?;
+    txn.commit().await.map_err(db_error)?;
+    if rows.len() as i64 >= LIVE_WORKSPACE_QUERY_LIMIT {
+        // The 257th row proves the set exceeds the 256 cap: refuse rather than truncate.
+        return Err(ErrorCode::InvalidInput);
+    }
+    Ok(rows)
 }
 
 /// Records successful credential use through the existing gateway-only touch function.

@@ -167,12 +167,13 @@
   },
   "BindingWritten": {
    "type": "object",
-   "description": "memory.pin / memory.unpin executed (\u00a736, ADR-0019): binding_id is the private.context_bindings row (mode=PINNED at the credential's workspace scope). pin: inserted=false when the memory was already pinned (D-C idempotent, no new row). unpin: revoked=true, the row's revoked_at is set; Evidence/Memory untouched.",
+   "description": "memory.pin / memory.unpin executed (\u00a736, ADR-0019): binding_id is the private.context_bindings row (mode=PINNED at the credential's workspace scope). pin: inserted=false when the memory was already pinned (D-C idempotent, no new row). unpin: revoked=true, the row's revoked_at is set; Evidence/Memory untouched. scope names the WORKSPACE the binding was written under (D-E, card 13).",
    "required": [
     "memory_id",
     "binding_id",
     "mode",
-    "state"
+    "state",
+    "scope"
    ],
    "properties": {
     "memory_id": {
@@ -185,6 +186,24 @@
     },
     "mode": {
      "const": "PINNED"
+    },
+    "scope": {
+     "type": "object",
+     "description": "\u00a736/ADR-0035 (card 13, D-E): the binding's authorization scope \u2014 the credential's WORKSPACE route the pin/unpin landed on.",
+     "required": [
+      "kind",
+      "id"
+     ],
+     "properties": {
+      "kind": {
+       "const": "WORKSPACE"
+      },
+      "id": {
+       "type": "string",
+       "format": "uuid"
+      }
+     },
+     "additionalProperties": false
     },
     "state": {
      "type": "string",
@@ -387,7 +406,7 @@
      "minLength": 1
     },
     "subject_ids": {
-     "description": "§6.1.3 (ADR-0028): every subject the new version is linked to — inherited from the original (INHERITED) plus any explicit subject_ids/subject_keys the call declared.",
+     "description": "\u00a76.1.3 (ADR-0028): every subject the new version is linked to \u2014 inherited from the original (INHERITED) plus any explicit subject_ids/subject_keys the call declared.",
      "type": "array",
      "items": {
       "type": "string",
@@ -395,7 +414,7 @@
      }
     },
     "affect_ids": {
-     "description": "§8.5.1 (ADR-0030 D-E): the affect rows appended to the new version from the call's `affects` (empty when none were supplied).",
+     "description": "\u00a78.5.1 (ADR-0030 D-E): the affect rows appended to the new version from the call's `affects` (empty when none were supplied).",
      "type": "array",
      "items": {
       "type": "string",
@@ -442,7 +461,7 @@
      "minLength": 1
     },
     "subject_ids": {
-     "description": "§6.1.3 (ADR-0028): every subject the confirmed memory is linked to — the source Evidence's own declaration (carried onto the UserConfirmed Evidence) plus any explicit subject_ids/subject_keys the call declared.",
+     "description": "\u00a76.1.3 (ADR-0028): every subject the confirmed memory is linked to \u2014 the source Evidence's own declaration (carried onto the UserConfirmed Evidence) plus any explicit subject_ids/subject_keys the call declared.",
      "type": "array",
      "items": {
       "type": "string",
@@ -541,7 +560,7 @@
   },
   "Subject": {
    "type": "object",
-   "description": "One registered subject (§6.1.3, ADR-0028): the item shape of memory.enumerate {subjects:true} and the whole result of memory.subject_register / memory.subject_link_key (D-F).",
+   "description": "One registered subject (\u00a76.1.3, ADR-0028): the item shape of memory.enumerate {subjects:true} and the whole result of memory.subject_register / memory.subject_link_key (D-F).",
    "required": [
     "subject_id",
     "kind",
@@ -590,7 +609,7 @@
   },
   "AffectAnnotated": {
    "type": "object",
-   "description": "memory.annotate_affect executed (§8.5.1, ADR-0030 D-C): the immutable affect rows appended to memory_id and the MEMORY_LIFECYCLE re-projection ticket (stream_seq/commit_seq) issued on the memory's stream so the Qdrant point picks up the affect payload.",
+   "description": "memory.annotate_affect executed (\u00a78.5.1, ADR-0030 D-C): the immutable affect rows appended to memory_id and the MEMORY_LIFECYCLE re-projection ticket (stream_seq/commit_seq) issued on the memory's stream so the Qdrant point picks up the affect payload.",
    "required": [
     "memory_id",
     "affect_ids",
@@ -623,7 +642,7 @@
   },
   "SubjectsPage": {
    "type": "object",
-   "description": "memory.enumerate {subjects:true} (§6.1.3, ADR-0028, card 8): the caller's tenant's registered subjects (live heads only), newest first, with their external keys and roles. Read-only; another tenant's registry is absent under RLS, never filtered in application code.",
+   "description": "memory.enumerate {subjects:true} (\u00a76.1.3, ADR-0028, card 8): the caller's tenant's registered subjects (live heads only), newest first, with their external keys and roles. Read-only; another tenant's registry is absent under RLS, never filtered in application code.",
    "required": [
     "subjects",
     "snapshot_id"

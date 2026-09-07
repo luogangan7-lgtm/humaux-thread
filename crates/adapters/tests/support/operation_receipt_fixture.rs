@@ -158,6 +158,7 @@ fn fixture_dsns() -> Result<(String, String, String), DbFixtureSkipReason> {
 impl DbIntegrationFixture for Fixture {
     type Handle = Handle;
 
+    #[allow(clippy::too_many_lines)] // one linear owner-role seed of the whole fixture tenant tree
     fn isolate() -> Result<Handle, DbFixtureSkipReason> {
         let serial = if SERIAL_HELD.with(std::cell::Cell::get) {
             None
@@ -237,6 +238,18 @@ impl DbIntegrationFixture for Fixture {
         seed.execute(
             "INSERT INTO control.workspaces(workspace_id,tenant_id,name) VALUES($1,$2,'operation receipt fixture')",
             &[&workspace_id, &tenant_id],
+        )
+        .map_err(setup_failed)?;
+        // ADR-0035 (card 13): a user-bound PAT's `allowed_workspace_ids` is now derived from live
+        // `control.workspace_memberships` (0162), not tenant membership. The fixture tenant is
+        // created after 0162's backfill, so the fixture user is made an ACTIVE MEMBER of its own
+        // workspace here — the test-fixture analogue of that backfill — or the default user-bound
+        // credential authenticates to an empty workspace set. Extra workspaces created by
+        // `seed_workspace` grant no membership unless the test seeds one (mirrors the freeze rule).
+        seed.execute(
+            "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
+             VALUES($1,$2,$3,'MEMBER','ACTIVE')",
+            &[&tenant_id, &workspace_id, &user_id],
         )
         .map_err(setup_failed)?;
         seed.execute(
@@ -443,6 +456,16 @@ impl Handle {
             &[&self.tenant_id, &user_id],
         )
         .expect("owner seeds fixture peer membership");
+        // ADR-0035 (card 13): a tenant membership no longer grants any workspace. Give the peer an
+        // ACTIVE WorkspaceMembership on the fixture default workspace so peer-bound credentials
+        // authenticate to it (the common case: a peer acting in the fixture workspace). Tests that
+        // need a peer with a different/precise workspace set seed those rows themselves.
+        seed.execute(
+            "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
+             VALUES($1,$2,$3,'MEMBER','ACTIVE')",
+            &[&self.tenant_id, &self.workspace_id, &user_id],
+        )
+        .expect("owner seeds fixture peer workspace membership");
         seed.commit().expect("commit fixture peer user");
         user_id
     }
@@ -538,6 +561,17 @@ impl Handle {
                 ],
             )
             .expect("owner seeds isolated synthetic service credential");
+        // ADR-0035 (card 13): a PAT bound to (user_id, workspace_id) needs the matching ACTIVE
+        // WorkspaceMembership to authenticate (a tenant membership no longer grants any workspace).
+        // Ensure it for whichever workspace this credential binds to — `with_workspace` may have
+        // pointed self.workspace_id at a freshly seeded workspace. Idempotent for the default one.
+        self.admin
+            .execute(
+                "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
+                 VALUES($1,$2,$3,'MEMBER','ACTIVE') ON CONFLICT DO NOTHING",
+                &[&self.tenant_id, &self.workspace_id, &self.user_id],
+            )
+            .expect("owner seeds credential workspace membership");
         SyntheticServiceCredential {
             api_key_id,
             bearer: format!("Bearer {wire}"),

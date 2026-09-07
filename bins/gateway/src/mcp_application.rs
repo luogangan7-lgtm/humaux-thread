@@ -1209,25 +1209,30 @@ impl GatewayMcpApplication {
         };
         let pool = self.runtime_pool.clone();
         let stream = self.context_bootstrap.stream.clone();
-        let outcome =
-            self.guard
-                .run_confirmed_write(
-                    context,
-                    operation,
-                    None,
-                    raw_arguments,
-                    ConfirmGate {
-                        op,
-                        target_id: memory.0,
-                        successor_id: None,
-                        presented,
-                        ttl,
-                    },
-                    move |write| async move {
-                        memory::write_binding(pool, write, stream, op, memory).await
-                    },
-                )
-                .await?;
+        let outcome = self
+            .guard
+            .run_confirmed_write(
+                context,
+                operation,
+                None,
+                raw_arguments,
+                ConfirmGate {
+                    op,
+                    target_id: memory.0,
+                    successor_id: None,
+                    presented,
+                    ttl,
+                },
+                move |write| async move {
+                    // D-E (card 13, ADR-0035): the binding lands at the request's authorized
+                    // WORKSPACE route; carry it out so BindingWritten can report the scope.
+                    let scope_workspace = write.request.workspace_id();
+                    memory::write_binding(pool, write, stream, op, memory)
+                        .await
+                        .map(|done| (done, scope_workspace))
+                },
+            )
+            .await?;
         let value = match outcome {
             ConfirmedOutcome::ConfirmationRequired { token, expires_at } => json!({
                 "confirmation_required": true,
@@ -1236,13 +1241,19 @@ impl GatewayMcpApplication {
                 "target": { "memory_id": memory.0 },
                 "expires_at": rfc3339(expires_at)?,
             }),
-            ConfirmedOutcome::Executed(done) => json!({
-                "memory_id": memory.0,
-                "binding_id": done.binding_id,
-                "mode": "PINNED",
-                "state": if op == DestructiveOp::MemoryPin { "pinned" } else { "unpinned" },
-                "inserted": done.inserted,
-            }),
+            ConfirmedOutcome::Executed((done, scope_workspace)) => {
+                // write_binding rejects a missing workspace before it can return Ok, so this is
+                // always Some on the executed path; refuse rather than emit a scope-less binding.
+                let scope_workspace = scope_workspace.ok_or(ErrorCode::Internal)?;
+                json!({
+                    "memory_id": memory.0,
+                    "binding_id": done.binding_id,
+                    "mode": "PINNED",
+                    "state": if op == DestructiveOp::MemoryPin { "pinned" } else { "unpinned" },
+                    "inserted": done.inserted,
+                    "scope": { "kind": "WORKSPACE", "id": scope_workspace.0 },
+                })
+            }
         };
         // Both results are branches of memory.output.schema.json (tools/list advertises it).
         self.catalog.validate_output(ToolName::Memory, &value)?;

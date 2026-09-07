@@ -1,0 +1,92 @@
+# §46.1 migration manifest. ADR-0035 (card 13, §6.1.1 workspace-level membership): creates the
+# tenant-scoped control.workspace_memberships (FORCE RLS, self-read policy, owner
+# role_migration_owner, composite tenant-leg FKs to control.memberships / control.workspaces,
+# partial ACTIVE index), the owner SECURITY DEFINER control.set_workspace_membership(...) as the
+# sole writer (EXECUTE to role_maintenance), NAMED §6.2.2 grants (gateway/retrieval_worker/
+# maintenance SELECT; no runtime INSERT/UPDATE), and the D-B backfill (every current ACTIVE
+# tenant member -> ACTIVE MEMBER of every existing workspace, one DML statement) BEFORE 0163
+# re-points the WORKSPACE_SHARED arm. §46 forward-fix (EXPAND_CONTRACT, next free after 0161).
+
+migration_id = "0162_workspace_memberships"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.workspaces') is not null
+ and to_regclass('control.memberships') is not null
+ and to_regclass('control.workspace_memberships') is null
+ and to_regprocedure('control.set_workspace_membership(uuid,uuid,uuid,text,text)') is null
+ -- both composite FK targets already exist (no UNIQUE added here)
+ and exists(select 1 from pg_constraint where conrelid='control.workspaces'::regclass
+            and contype='u' and conkey = (
+              select array_agg(attnum order by attnum) from pg_attribute
+              where attrelid='control.workspaces'::regclass and attname in ('tenant_id','workspace_id')))
+ and exists(select 1 from pg_constraint where conrelid='control.memberships'::regclass
+            and contype='u')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- table exists, FORCE RLS, owned by role_migration_owner
+ (select c.relrowsecurity and c.relforcerowsecurity
+    and pg_get_userbyid(c.relowner)='role_migration_owner'
+  from pg_class c join pg_namespace n on n.oid=c.relnamespace
+  where n.nspname='control' and c.relname='workspace_memberships')
+ -- closed role/state sets
+ and exists(select 1 from pg_constraint where conrelid='control.workspace_memberships'::regclass
+            and contype='c' and convalidated
+            and pg_get_constraintdef(oid) like '%role%')
+ and exists(select 1 from pg_constraint where conrelid='control.workspace_memberships'::regclass
+            and contype='c' and convalidated
+            and pg_get_constraintdef(oid) like '%state%')
+ -- PK + both composite tenant-leg FKs
+ and exists(select 1 from pg_constraint where conrelid='control.workspace_memberships'::regclass
+            and contype='p' and array_length(conkey,1)=3)
+ and (select count(*)=2 from pg_constraint where contype='f'
+      and conrelid='control.workspace_memberships'::regclass and array_length(conkey,1)=2)
+ -- partial ACTIVE index
+ and exists(select 1 from pg_indexes where schemaname='control'
+            and tablename='workspace_memberships' and indexname='workspace_memberships_active_idx'
+            and indexdef like '%state%ACTIVE%')
+ -- permissive ALL tenant-isolation policy (§48.2 RLS-四项 template) + restrictive self-read
+ and exists(select 1 from pg_policies where schemaname='control'
+            and tablename='workspace_memberships'
+            and policyname='workspace_memberships_tenant_isolation'
+            and cmd='ALL' and permissive='PERMISSIVE'
+            and qual like '%humaux.tenant_id%' and with_check like '%humaux.tenant_id%')
+ and exists(select 1 from pg_policies where schemaname='control'
+            and tablename='workspace_memberships' and policyname='workspace_memberships_self_read'
+            and cmd='SELECT' and permissive='RESTRICTIVE' and qual like '%humaux.user_id%')
+ -- NAMED §6.2.2 grants: the six runtime readers (== control.memberships readers), no runtime writer
+ and has_table_privilege('role_gateway','control.workspace_memberships','SELECT')
+ and has_table_privilege('role_private_worker','control.workspace_memberships','SELECT')
+ and has_table_privilege('role_consolidation_worker','control.workspace_memberships','SELECT')
+ and has_table_privilege('role_public_worker','control.workspace_memberships','SELECT')
+ and has_table_privilege('role_retrieval_worker','control.workspace_memberships','SELECT')
+ and has_table_privilege('role_maintenance','control.workspace_memberships','SELECT')
+ and not has_table_privilege('role_gateway','control.workspace_memberships','INSERT')
+ and not has_table_privilege('role_maintenance','control.workspace_memberships','INSERT')
+ and not has_table_privilege('role_maintenance','control.workspace_memberships','UPDATE')
+ and not has_table_privilege('role_batch_issuer','control.workspace_memberships','SELECT')
+ and not has_table_privilege('role_admin','control.workspace_memberships','SELECT')
+ -- sole writer: owner definer, EXECUTE to role_maintenance only, PUBLIC none
+ and (select p.prosecdef and pg_get_userbyid(p.proowner)='role_migration_owner'
+        and p.proconfig @> array['search_path=pg_catalog, control']
+      from pg_proc p where p.oid='control.set_workspace_membership(uuid,uuid,uuid,text,text)'::regprocedure)
+ and has_function_privilege('role_maintenance','control.set_workspace_membership(uuid,uuid,uuid,text,text)','EXECUTE')
+ and not has_function_privilege('role_gateway','control.set_workspace_membership(uuid,uuid,uuid,text,text)','EXECUTE')
+ and not exists(select 1 from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                where p.oid='control.set_workspace_membership(uuid,uuid,uuid,text,text)'::regprocedure
+                  and x.grantee=0 and x.privilege_type='EXECUTE')
+ -- D-B backfill: every ACTIVE tenant member has a workspace membership for every existing workspace
+ and not exists(
+   select 1 from control.workspaces w
+   join control.memberships m on m.tenant_id = w.tenant_id and m.state='ACTIVE'
+   where not exists (select 1 from control.workspace_memberships wm
+                     where wm.tenant_id=w.tenant_id and wm.workspace_id=w.workspace_id
+                       and wm.user_id=m.user_id and wm.state='ACTIVE'))
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. The table is a new foundation; the backfill preserves today's access, so it is not reversed (dropping the table returns to the below-Canon tenant-wide read only together with reverting 0163). REVOKE/DROP only together with retiring the reader (auth.rs load_live_workspace_ids + the 0163 WORKSPACE_SHARED arm), else WORKSPACE_SHARED collapses to empty (fail-closed) for every user."
+backup_restore_requirement = "standard pre-migration backup: one DML backfill INSERT (idempotent, ON CONFLICT DO NOTHING); table/grant/function DDL otherwise."

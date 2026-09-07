@@ -749,10 +749,25 @@ fn native_gateway_preserves_raw_workspace_non_disclosure_and_validates_output() 
                         if force_native_panic {
                             panic!("continuity forced native panic witness");
                         }
+                        // ADR-0035 (card 13): an unbound PAT is no longer an empty workspace
+                        // set. `allowed_workspace_ids` is derived per request from live ACTIVE
+                        // control.workspace_memberships, so this credential reads exactly the
+                        // workspaces its user is a member of — here the fixture's own workspace,
+                        // which holds `project`. (Baseline §73.5.1 corrected in the same change;
+                        // a machine key with no bound workspace still has an empty set.)
+                        // (That an unbound PAT now DOES read its member workspaces is asserted by
+                        // card 13's own native_mcp_workspace_membership_scope; adding a second
+                        // successful read here would change this test's single-success receipt
+                        // assertion below, so this test stays focused on non-disclosure.)
+                        // Non-disclosure is unchanged where it matters: an unbound PAT must
+                        // still not learn anything about a workspace it holds no membership in.
+                        // `unauthorized` lives in `other_workspace`, which was seeded WITHOUT a
+                        // membership (the freeze rule), so this stays NOT_FOUND and remains the
+                        // seventh member of the byte-identical failure set compared below.
                         let unbound_failure = request(
                             address,
                             &unbound_bearer,
-                            json!({"project_id":project}),
+                            json!({"project_id":unauthorized}),
                             forwarded,
                         )
                         .await;
