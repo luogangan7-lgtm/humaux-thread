@@ -597,6 +597,7 @@ fn t1_full_inference_hop_publishes_ticket() {
             Some(f.workspace_id),
             10_000,
             build_rollup,
+            None,
         )
         .await
     });
@@ -1059,6 +1060,7 @@ fn t5_manifest_mismatch_fails_closed_without_provider_call() {
             Some(f.workspace_id),
             10_000,
             build_rollup,
+            None,
         )
         .await
     });
@@ -1150,6 +1152,7 @@ fn t6_tenant_scoped_run_never_consumes_workspace_shared_inputs() {
                 sources,
             ))
         },
+        None,
     ));
     let rollup_id = match outcome {
         Ok(PublishOutcome::Published { rollup_id }) => rollup_id,

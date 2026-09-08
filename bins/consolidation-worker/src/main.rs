@@ -4,20 +4,22 @@
 //! `tests/*.rs` can link against, so splitting it out is what makes `tests/run_once_e2e.rs`
 //! and `tests/consolidation_hop_e2e.rs` possible at all.
 //!
-//! `--run-once` wires the real §11.8 inference hop
-//! ([`humaux_consolidation_worker::inference_client::UdsInferenceClient`]) for one explicit
-//! `(tenant_id, reasoning_domain_id)` pair — same "no config-loading infrastructure exists yet"
-//! scaffold shape every other `bins/*/src/main.rs` in this workspace already uses (`required`/
-//! `parse` env helpers, no discovery of *which* tenants have pending work). A real resident
-//! loop that enumerates pending `(tenant_id, reasoning_domain_id)` pairs across tenants cannot
-//! be built the way this binary's own DB role works: `role_consolidation_worker`'s RLS session
-//! context is set per-call from a caller-supplied `tenant_id`
-//! (`consolidate_repo::set_tenant_local`), so a cross-tenant "which tenants have pending
-//! inputs" query would return zero rows under any single session's `humaux.tenant_id` — the
-//! same reason `role_gateway`/`role_retrieval_worker` never self-discover tenants either
-//! (`ops.jobs`' per-tenant claim is the existing pattern; no consolidation-shaped job type
-//! exists yet). This binary polls the one pair it was given, on an interval, rather than
-//! inventing that missing enumeration mechanism.
+//! Modes:
+//! * no flag / `--probe-connection`: the original Phase 4 typed-role probe.
+//! * `--run-once`: ONE bounded cross-tenant dispatch pass, then exit — including when there was
+//!   nothing to claim (before ADR-0036 this flag looped forever on an env-pinned pair and never
+//!   exited on an empty tenant, which is what the deployment report flagged).
+//! * `--serve`: the same pass on `HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS` until killed.
+//!
+//! ADR-0036 (card 14): there is no tenant id, reasoning domain, or route binding in this
+//! binary's environment any more. `role_consolidation_worker`'s RLS session context is still set
+//! per call from a caller-supplied tenant_id — which is exactly why "which tenants have pending
+//! work" cannot be a plain query from this process — so discovery goes through the owner
+//! SECURITY DEFINER `ops.claim_derived_work` (migration 0164), which is the ONE cross-tenant read
+//! of `ops.jobs` in the workspace. Everything after the claim runs under the claimed job's own
+//! tenant context through the ordinary repos, and the route binding is resolved per tenant
+//! through the narrow 0147 resolver (`consolidate_repo::resolve_consolidate_binding`).
+//!
 //!
 //! `build_rollup` is [`humaux_consolidation_worker::build_rollup`]: the private worker's typed
 //! JSON reply parsed fail-closed against this run's own materialized `(memory_id, evidence_id)`
@@ -29,11 +31,9 @@ use std::env;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use humaux_adapters::consolidate_repo::PublishOutcome;
 use humaux_adapters::postgres::ConsolidationDbPool;
-use humaux_application::consolidate::{ReasoningRouteBindingId, ReasoningRouteBindingVersion};
 use humaux_consolidation_worker::{
-    RunOnceError, build_rollup, inference_client::UdsInferenceClient, run_once_bound,
+    DispatchConfig, dispatch_pass, inference_client::UdsInferenceClient,
 };
 use uuid::Uuid;
 
@@ -48,7 +48,7 @@ fn parse<T: std::str::FromStr>(name: &str) -> Result<T, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: humaux-consolidation-worker (--probe-connection | --run-once)"
+    "usage: humaux-consolidation-worker (--probe-connection | --run-once | --serve)"
 }
 
 #[tokio::main]
@@ -63,7 +63,7 @@ async fn main() -> ExitCode {
             probe_connection().await;
             ExitCode::SUCCESS
         }
-        Some("--run-once") => match run_once_mode().await {
+        Some(mode @ ("--run-once" | "--serve")) => match dispatch_mode(mode == "--serve").await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("humaux-consolidation-worker: {error}");
@@ -95,44 +95,44 @@ async fn probe_connection() {
     }
 }
 
-/// One explicit `(tenant_id, reasoning_domain_id)` target, polled on
-/// `HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS` until the process is killed — see module
-/// doc for why this is a single pinned target, not a cross-tenant enumeration.
-async fn run_once_mode() -> Result<(), String> {
+/// ADR-0036 `--run-once` (one bounded pass, then exit — `claimed == 0` exits zero promptly
+/// instead of spinning) / `--serve` (the same pass on
+/// `HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS` until the process is killed).
+async fn dispatch_mode(resident: bool) -> Result<(), String> {
     let dsn = required("CONSOLIDATION_WORKER_PG_DSN")?;
-    let tenant_id = parse::<Uuid>("HUMAUX_CONSOLIDATION_WORKER_TENANT_ID")?;
-    let reasoning_domain_id = parse::<Uuid>("HUMAUX_CONSOLIDATION_WORKER_REASONING_DOMAIN_ID")?;
-    let binding_id =
-        ReasoningRouteBindingId(parse::<Uuid>("HUMAUX_CONSOLIDATION_WORKER_BINDING_ID")?);
-    let binding_version =
-        ReasoningRouteBindingVersion(parse::<i64>("HUMAUX_CONSOLIDATION_WORKER_BINDING_VERSION")?);
-    let workspace_id = match env::var("HUMAUX_CONSOLIDATION_WORKER_WORKSPACE_ID") {
-        Ok(raw) if !raw.is_empty() => Some(raw.parse::<Uuid>().map_err(|_| {
-            "invalid configuration: HUMAUX_CONSOLIDATION_WORKER_WORKSPACE_ID".to_owned()
-        })?),
-        _ => None,
-    };
     let socket_path = required("HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH")?;
-    let max_inputs = parse::<i64>("HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS")?;
-    if max_inputs <= 0 {
-        return Err("invalid configuration: HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS".to_owned());
-    }
     let call_ttl = Duration::from_secs(parse::<u64>("HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS")?);
     let dial_timeout = Duration::from_secs(parse::<u64>(
         "HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS",
     )?);
-    let poll_interval = Duration::from_secs(parse::<u64>(
-        "HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS",
-    )?);
+    let config = DispatchConfig {
+        // Per-process owner: every terminal transition is fenced on it plus the claim's
+        // `attempt`, so two resident workers never both settle one job.
+        lease_owner: format!("humaux-consolidation-worker/{}", Uuid::now_v7()),
+        lease_seconds: parse::<u64>("HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS")? as f64,
+        batch: parse::<i64>("HUMAUX_CONSOLIDATION_WORKER_BATCH")?,
+        max_inputs: parse::<i64>("HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS")?,
+        max_attempts: parse::<i32>("HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS")?,
+    };
+    config
+        .validate()
+        .map_err(|field| format!("invalid configuration: HUMAUX_CONSOLIDATION_WORKER_{field}"))?;
+    let poll_interval = if resident {
+        Some(Duration::from_secs(parse::<u64>(
+            "HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS",
+        )?))
+    } else {
+        None
+    };
 
     let pool = ConsolidationDbPool::connect(&dsn)
         .await
         .map_err(|e| format!("consolidation worker database role connection failed: {e}"))?;
 
     loop {
-        let outcome = run_once_bound(
+        let report = dispatch_pass(
             &pool,
-            |run_id| {
+            |tenant_id, run_id| {
                 UdsInferenceClient::new(
                     &pool,
                     socket_path.clone(),
@@ -142,32 +142,31 @@ async fn run_once_mode() -> Result<(), String> {
                     run_id,
                 )
             },
-            tenant_id,
-            reasoning_domain_id,
-            binding_id,
-            binding_version,
-            workspace_id,
-            max_inputs,
-            build_rollup,
+            &config,
         )
         .await;
-        match outcome {
-            Ok(PublishOutcome::NoOutput) => {
-                println!("humaux-consolidation-worker: no eligible inputs this pass")
+        match report {
+            Ok(report) => println!(
+                "humaux-consolidation-worker: dispatch pass claimed={} published={} no_output={} stale={} not_ready={} deferred={} dead={} lost_lease={}",
+                report.claimed,
+                report.published,
+                report.no_output,
+                report.stale_input,
+                report.not_ready,
+                report.deferred,
+                report.dead,
+                report.lost_lease
+            ),
+            // Resident mode: one failed pass (a DB blip) is logged and retried on the next poll;
+            // `--run-once` surfaces it as the exit status.
+            Err(error) if poll_interval.is_some() => {
+                eprintln!("humaux-consolidation-worker: dispatch pass failed: {error}")
             }
-            Ok(PublishOutcome::StaleInput) => {
-                println!("humaux-consolidation-worker: stale input, will retry next pass")
-            }
-            Ok(PublishOutcome::Published { rollup_id }) => {
-                println!("humaux-consolidation-worker: published rollup {rollup_id}")
-            }
-            Err(RunOnceError::Reasoning(error)) => {
-                eprintln!("humaux-consolidation-worker: inference hop failed this pass: {error}")
-            }
-            Err(RunOnceError::Repo(error)) => {
-                eprintln!("humaux-consolidation-worker: repository error this pass: {error}")
-            }
+            Err(error) => return Err(format!("dispatch pass failed: {error}")),
         }
-        tokio::time::sleep(poll_interval).await;
+        let Some(interval) = poll_interval else {
+            return Ok(());
+        };
+        tokio::time::sleep(interval).await;
     }
 }

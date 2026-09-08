@@ -380,10 +380,12 @@ fn seed_user(handle: &mut Handle) -> Uuid {
 
 /// A real `control.workspaces` row (this fixture's tenant) — `private.memory_records`'s
 /// `visibility_workspace_id` is FK-constrained to it, so `WORKSPACE_SHARED` fixtures can't use a
-/// A throwaway `control.users` row with an ACTIVE membership in this fixture's tenant — the
-/// acting member a `WORKSPACE_SHARED` evidence write needs to satisfy `evidence_objects`'
-/// WITH CHECK (membership EXISTS for `humaux.user_id`).
-fn seed_member(handle: &mut Handle) -> Uuid {
+/// A throwaway `control.users` row with an ACTIVE membership in this fixture's tenant AND an
+/// ACTIVE `control.workspace_memberships` row for `workspace_id` — the acting member a
+/// `WORKSPACE_SHARED` evidence write needs to satisfy `evidence_objects`' WITH CHECK (ADR-0035,
+/// card 13: the WORKSPACE_SHARED arm now EXISTS-checks `control.workspace_memberships` for the
+/// row's own workspace, not tenant `control.memberships`).
+fn seed_member(handle: &mut Handle, workspace_id: Uuid) -> Uuid {
     let user_id = seed_user(handle);
     handle
         .admin
@@ -393,6 +395,14 @@ fn seed_member(handle: &mut Handle) -> Uuid {
             &[&handle.tenant_id, &user_id],
         )
         .expect("seed ACTIVE membership");
+    handle
+        .admin
+        .execute(
+            "INSERT INTO control.workspace_memberships (tenant_id, workspace_id, user_id, role, state) \
+             VALUES ($1, $2, $3, 'MEMBER', 'ACTIVE')",
+            &[&handle.tenant_id, &workspace_id, &user_id],
+        )
+        .expect("seed ACTIVE workspace membership");
     user_id
 }
 
@@ -465,7 +475,7 @@ fn seed_memory_with_visibility_and_evidence(
     // for WORKSPACE_SHARED that member must hold an ACTIVE membership. The production writer
     // is always a member, so the fixture mirrors that instead of bypassing RLS.
     let acting_user = evidence_visibility_user_id
-        .or_else(|| evidence_visibility_workspace_id.map(|_| seed_member(handle)));
+        .or_else(|| evidence_visibility_workspace_id.map(|ws| seed_member(handle, ws)));
     let cmd = RememberCommand {
         tenant_id: handle.tenant_id,
         authorization_user_id: acting_user,

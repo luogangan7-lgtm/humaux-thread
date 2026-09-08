@@ -74,6 +74,7 @@ fn approve_supported(
 /// then is immediately excluded by the revoke fact before consumption. The subsequent bounded
 /// consumer writes a permanent tombstone; a delayed old LIVE cannot resurrect it.
 #[test]
+#[ignore = "pins the retired tenant-scoped public runtime (admit_release as role_public_worker -> drain_outbox(tenant) -> run_once(tenant)); 0124 fenced that path on purpose (see public_runtime.rs legacy_release_admission_is_fenced_from_protected_rows) and the live seam is run_anonymous_once. Rewrite this Qdrant tombstone oracle onto the anonymous seam — card 23 (stale/ignored lane); disposition recorded in ADR-0036 main-line dispositions"]
 #[allow(clippy::too_many_lines)] // One end-to-end oracle keeps authenticated release, PG revoke fence, and Qdrant tombstone causally ordered.
 fn supported_projection_revoke_fences_hydrate_and_tombstones_old_live() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

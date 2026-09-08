@@ -17,11 +17,12 @@
 //!   pair `bins/consolidation-worker/tests/consolidation_hop_e2e.rs` proves in-process, so
 //!   the tests cover the accept loop production runs. Provider identity/endpoint/capabilities
 //!   are configuration (§78.1: no literal model, endpoint, or dimension in code).
-//! * `--distill-once` / `--distill-serve` (ADR-0016): one pass / a resident loop of
-//!   [`humaux_private_worker::distill::run_once`] over the `(tenant, reasoning_domain)` pair in
-//!   `HUMAUX_PRIVATE_WORKER_DISTILL_*` — same provider/config bootstrap as `--serve-rpc`
-//!   ([`bootstrap`]), same single-pinned-target shape `humaux-consolidation-worker --run-once`
-//!   uses (no cross-tenant enumeration exists for a tenant-pinned RLS session).
+//! * `--distill-once` / `--distill-serve` (ADR-0016, cross-tenant since ADR-0036): one bounded
+//!   pass / a resident loop of [`humaux_private_worker::distill::dispatch_pass`] — same
+//!   provider/config bootstrap as `--serve-rpc` ([`bootstrap`]). There is no tenant id or
+//!   reasoning domain in the environment any more: both come from the `DERIVED_DISTILL` job the
+//!   pass claims through the owner SECURITY DEFINER `ops.claim_derived_work` (migration 0164),
+//!   and everything after the claim runs under that job's own tenant context.
 
 use std::env;
 use std::process::ExitCode;
@@ -38,7 +39,7 @@ use humaux_adapters::contribution_reasoner::ContributionReasonerConfig;
 use humaux_adapters::disclosure::DeletionCapability;
 use humaux_adapters::postgres::PrivateWorkerDbPool;
 use humaux_domain::egress::ProcessorId;
-use humaux_private_worker::distill::{self, DistillConfig};
+use humaux_private_worker::distill::{self, DistillDispatchConfig};
 use humaux_private_worker::inference_rpc::{RpcState, bind_socket, clone_config, serve};
 use uuid::Uuid;
 
@@ -246,21 +247,21 @@ async fn serve_rpc() -> Result<(), String> {
         .map_err(|error| format!("private inference RPC server failed: {error}"))
 }
 
-/// ADR-0016 `--distill-once` (one pass, then exit) / `--distill-serve` (poll on
-/// `HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS` until killed). The route binding is
-/// resolved by `(tenant, reasoning_domain, purpose = Distill)` inside the pass — no binding id
-/// in the environment.
+/// ADR-0016 `--distill-once` (one bounded cross-tenant pass, then exit — `claimed == 0` exits
+/// zero promptly) / `--distill-serve` (the same pass on
+/// `HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS` until killed). The route binding is still
+/// resolved by `(tenant, reasoning_domain, purpose = PRIVATE_DISTILL_TEXT)` inside the pass.
 async fn distill_mode(resident: bool) -> Result<(), String> {
-    let distill = DistillConfig {
-        tenant_id: parse::<Uuid>("HUMAUX_PRIVATE_WORKER_DISTILL_TENANT_ID")?,
-        reasoning_domain_id: parse::<Uuid>("HUMAUX_PRIVATE_WORKER_DISTILL_REASONING_DOMAIN_ID")?,
-        batch: parse::<i64>("HUMAUX_PRIVATE_WORKER_DISTILL_BATCH")?,
-        lease_seconds: parse::<u64>("HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS")? as f64,
-        // Per-process owner: the DONE flip is fenced on it, so two resident workers over the
-        // same tenant never both commit the same claimed row (ADR-0016 D5).
+    let dispatch = DistillDispatchConfig {
+        // Per-process owner: both the ops.jobs lease and the per-tenant ops.outbox lease are
+        // fenced on it, so two resident workers never both settle one row (ADR-0016 D5).
         lease_owner: format!("humaux-private-worker/{}", Uuid::now_v7()),
+        lease_seconds: parse::<u64>("HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS")? as f64,
+        job_batch: parse::<i64>("HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH")?,
+        batch: parse::<i64>("HUMAUX_PRIVATE_WORKER_DISTILL_BATCH")?,
+        max_attempts: parse::<i32>("HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS")?,
     };
-    distill.validate().map_err(|code| {
+    dispatch.validate().map_err(|code| {
         format!("invalid configuration: HUMAUX_PRIVATE_WORKER_DISTILL_* ({code:?})")
     })?;
     let poll_interval = if resident {
@@ -276,27 +277,37 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
         provider,
     } = bootstrap().await?;
     loop {
-        let report =
-            match distill::run_once(&pool, &provider, clone_config(&config), &distill).await {
-                Ok(report) => report,
-                // Resident mode: one failed pass (transient DB/provider blip) is logged and retried
-                // on the next poll; `--distill-once` still surfaces it as the exit status.
-                Err(error) if poll_interval.is_some() => {
-                    eprintln!("humaux-private-worker: distill pass failed: {error}");
-                    tokio::time::sleep(poll_interval.unwrap_or_default()).await;
-                    continue;
-                }
-                Err(error) => return Err(format!("distill pass failed: {error}")),
-            };
+        let report = match distill::dispatch_pass(
+            &pool,
+            &provider,
+            clone_config(&config),
+            &dispatch,
+        )
+        .await
+        {
+            Ok(report) => report,
+            // Resident mode: one failed pass (transient DB/provider blip) is logged and retried
+            // on the next poll; `--distill-once` still surfaces it as the exit status.
+            Err(error) if poll_interval.is_some() => {
+                eprintln!("humaux-private-worker: distill dispatch pass failed: {error}");
+                tokio::time::sleep(poll_interval.unwrap_or_default()).await;
+                continue;
+            }
+            Err(error) => return Err(format!("distill dispatch pass failed: {error}")),
+        };
         println!(
-            "humaux-private-worker: distill pass claimed={} done={} failed={} deferred={} lost_lease={} memories={} rejected={}",
+            "humaux-private-worker: distill dispatch claimed={} completed={} not_ready={} deferred={} dead={} lost_lease={} evidence_claimed={} done={} failed={} memories={} rejected={}",
             report.claimed,
-            report.done,
-            report.failed,
+            report.completed,
+            report.not_ready,
             report.deferred,
+            report.dead,
             report.lost_lease,
-            report.memories,
-            report.rejected
+            report.work.claimed,
+            report.work.done,
+            report.work.failed,
+            report.work.memories,
+            report.work.rejected
         );
         let Some(interval) = poll_interval else {
             return Ok(());

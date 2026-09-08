@@ -121,6 +121,28 @@ impl Fixture {
                 &[&id, &tenant],
             ).unwrap();
         }
+        // ADR-0035 (card 13): 0163 re-points the WORKSPACE_SHARED visibility arm from
+        // control.memberships (tenant membership) to an ACTIVE control.workspace_memberships row
+        // for the row's OWN workspace. `f.user` is made a member of BOTH `workspace` and
+        // `other_workspace`: this is only the base-RLS visibility gate, and
+        // `evidence_owner_marker_matrix_is_exact_and_real_updates_are_closed`'s "legacy" (no
+        // `humaux.continuity_publish` marker) block does a raw `role_migration_owner` read/lock/
+        // update of `cross_workspace_evidence` and expects it visible — matching pre-0163
+        // behaviour, since `role_migration_owner` carries no bypass arm on `evidence_objects`.
+        // `headless_visibility_hash_successor_and_acl_are_closed`'s rejection of the same
+        // Evidence during an actual `publish_continuity_facet()` call is unaffected by this: that
+        // rejection comes from the function's own explicit `visibility_workspace_id=p_workspace_id`
+        // match (via the 0136 `continuity_evidence_owner_exact_*` policies gated on
+        // `humaux.continuity_publish='1'`), never from workspace_memberships breadth.
+        for id in [workspace, other_workspace] {
+            admin
+                .execute(
+                    "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
+                 VALUES($1,$2,$3,'MEMBER','ACTIVE')",
+                    &[&tenant, &id, &user],
+                )
+                .unwrap();
+        }
         admin
             .execute(
                 "INSERT INTO control.private_reasoning_domains(reasoning_domain_id,tenant_id,name) \
@@ -1396,6 +1418,20 @@ fn role_private_worker_enqueue_preserves_0133_legacy_workspace_shared_route() {
         "INSERT INTO control.workspaces(tenant_id,name) VALUES($1,'legacy-wsc') RETURNING workspace_id",
         &[&tenant],
     ).unwrap().get(0);
+    // ADR-0035 (card 13): 0163 re-points the WORKSPACE_SHARED visibility arm from
+    // control.memberships (tenant membership) to an ACTIVE control.workspace_memberships row
+    // for the row's OWN workspace. `user` (the reasoning domain owner) is made a member of this
+    // freshly-created `workspace` so the base RLS policy still surfaces the row to
+    // `private.compute_contribution_source_backing_closure_v1`'s own (pre-0163) WORKSPACE_SHARED
+    // re-check, which never reads workspace_memberships itself.
+    fixture
+        .admin
+        .execute(
+            "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
+             VALUES($1,$2,$3,'MEMBER','ACTIVE')",
+            &[&tenant, &workspace, &user],
+        )
+        .unwrap();
     fixture
         .admin
         .execute(

@@ -31,7 +31,8 @@ use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
 use humaux_application::consolidate::{
-    RollupAuthorityViolation, SourceAuthority, validate_rollup_before_publish,
+    ReasoningRouteBindingId, ReasoningRouteBindingVersion, RollupAuthorityViolation,
+    SourceAuthority, validate_rollup_before_publish,
 };
 use humaux_domain::authority::{AuthorityClass, EvidenceId, MemoryId};
 use humaux_domain::consolidate::{AutoMutableMemoryId, ClassifiedMemoryId, classify};
@@ -97,11 +98,21 @@ pub enum ConsolidateRepoError {
     UnknownSource(Uuid),
     /// §11.9: the proposed rollup's `AuthorityClass` outranks its own source closure.
     AuthorityCeiling(RollupAuthorityViolation),
+    /// The `ops.jobs` lease fence [`publish_rollup`] settles inside its own transaction
+    /// (ADR-0036) failed at the database level. A LOST fence is not this error — that is
+    /// [`PublishOutcome::LostLease`], a normal outcome.
+    Jobs(crate::jobs::JobsError),
 }
 
 impl From<sqlx::Error> for ConsolidateRepoError {
     fn from(e: sqlx::Error) -> Self {
         Self::Db(e)
+    }
+}
+
+impl From<crate::jobs::JobsError> for ConsolidateRepoError {
+    fn from(e: crate::jobs::JobsError) -> Self {
+        Self::Jobs(e)
     }
 }
 
@@ -129,6 +140,7 @@ impl std::fmt::Display for ConsolidateRepoError {
                     "consolidate_repo: §11.9 authority ceiling violated: {violation:?}"
                 )
             }
+            Self::Jobs(e) => write!(f, "consolidate_repo job lease settle failed: {e}"),
         }
     }
 }
@@ -161,6 +173,40 @@ async fn set_tenant_local(
         .execute(&mut **txn)
         .await?;
     Ok(())
+}
+
+/// ADR-0036 (card 14): the effective `PRIVATE_CONSOLIDATE` route binding for
+/// `(tenant_id, reasoning_domain_id)`, through the SAME narrow 0147 SECURITY DEFINER resolver
+/// `role_private_worker` uses for `PRIVATE_DISTILL_TEXT` (0164 adds this role to its EXECUTE
+/// list; `control.reasoning_route_bindings`' non-owner grant cells stay `—`).
+///
+/// This exists because `control.reasoning_route_bindings` has a `tenant_id` column: a binding is
+/// per `(tenant, reasoning_domain, purpose)`, so the env-pinned
+/// `HUMAUX_CONSOLIDATION_WORKER_BINDING_ID` a single-tenant worker could carry cannot survive
+/// cross-tenant serving. `None` = this tenant has no admitted Consolidate route yet, which is an
+/// environmental (retryable) condition, not a failure of the run.
+pub async fn resolve_consolidate_binding(
+    pool: &ConsolidationDbPool,
+    tenant_id: Uuid,
+    reasoning_domain_id: Uuid,
+) -> Result<Option<(ReasoningRouteBindingId, ReasoningRouteBindingVersion)>, ConsolidateRepoError> {
+    let mut txn = pool.pool().begin().await?;
+    set_tenant_local(&mut txn, tenant_id).await?;
+    let row = sqlx::query(
+        "SELECT binding_id, binding_version \
+         FROM control.current_reasoning_route_binding($1, 'PRIVATE_CONSOLIDATE')",
+    )
+    .bind(reasoning_domain_id)
+    .fetch_optional(&mut *txn)
+    .await?;
+    txn.commit().await?;
+    row.map(|row| {
+        Ok((
+            ReasoningRouteBindingId(row.try_get("binding_id")?),
+            ReasoningRouteBindingVersion(row.try_get("binding_version")?),
+        ))
+    })
+    .transpose()
 }
 
 /// §11.7's per-row change-detection fingerprint: everything about a `memory_records` row that
@@ -487,14 +533,22 @@ pub async fn select_and_materialize_inputs(
     Ok(accepted)
 }
 
-/// Outcome of [`publish_rollup`] — mirrors the three terminal `ConsolidationRunState`s it can
-/// reach (`SUCCEEDED` / `SUCCEEDED_NO_OUTPUT` / `STALE_INPUT`; `FAILED` is the caller's to set
-/// on an inference error, before ever calling this function).
+/// Outcome of [`publish_rollup`] — the three terminal `ConsolidationRunState`s it can reach
+/// (`SUCCEEDED` / `SUCCEEDED_NO_OUTPUT` / `STALE_INPUT`; `FAILED` is the caller's to set on an
+/// inference error, before ever calling this function), plus `LostLease`, which reaches NO
+/// terminal state because the whole transaction rolled back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishOutcome {
-    Published { rollup_id: Uuid },
+    Published {
+        rollup_id: Uuid,
+    },
     NoOutput,
     StaleInput,
+    /// The caller passed a [`crate::jobs::DerivedLease`] fence and the job it names was already
+    /// re-claimed by another worker (its `attempt` moved). NOTHING was written: the rollup, its
+    /// closure rows, the ticket and the run's terminal status all rolled back with the fence
+    /// check, so the worker that now holds the job publishes the one and only rollup.
+    LostLease,
 }
 
 /// §11.7: "运行完成准备 publish rollup 时，再验证 input memory version/source_hash. 如果任一
@@ -613,6 +667,12 @@ fn resolve_source_authorities(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// `fence`, when the caller runs under a cross-tenant `ops.jobs` lease (ADR-0036), settles that
+/// job `DONE` INSIDE this transaction. The rollup and the job's terminal state therefore commit
+/// together or not at all — a worker whose run outlived its lease and was re-claimed publishes
+/// nothing instead of a second rollup over the same inputs, and a worker that publishes can
+/// never be re-claimed afterwards, because there is no window between the publish commit and
+/// the settle for the lease to lapse in.
 pub async fn publish_rollup(
     pool: &ConsolidationDbPool,
     run_id: Uuid,
@@ -622,6 +682,7 @@ pub async fn publish_rollup(
     rollup_class: AuthorityClass,
     manifest_hash: Option<&[u8]>,
     sources: &[(AutoMutableMemoryId, EvidenceId)],
+    fence: Option<&crate::jobs::DerivedLease<'_>>,
 ) -> Result<PublishOutcome, ConsolidateRepoError> {
     let mut txn = pool.pool().begin().await?;
     // §11.7-style consistency guard for the re-validation loop below — see doc comment.
@@ -768,6 +829,14 @@ pub async fn publish_rollup(
     .bind(manifest_hash)
     .execute(&mut *txn)
     .await?;
+
+    // Last statement before COMMIT: everything above is discarded if the lease is gone.
+    if let Some(lease) = fence
+        && !crate::jobs::settle_derived_done_in_txn(&mut txn, lease).await?
+    {
+        txn.rollback().await?;
+        return Ok(PublishOutcome::LostLease);
+    }
 
     txn.commit().await?;
     Ok(PublishOutcome::Published { rollup_id })

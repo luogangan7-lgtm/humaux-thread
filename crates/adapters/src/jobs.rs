@@ -27,7 +27,7 @@ use sqlx::Row;
 use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
-use crate::postgres::{PrivateWorkerDbPool, RuntimeDbPool};
+use crate::postgres::{ConsolidationDbPool, PrivateWorkerDbPool, RuntimeDbPool};
 
 /// DB-layer failure from any function in this module. Adapter-local, not one of the
 /// workspace's two frozen domain error enums (§52) — same reasoning as
@@ -177,7 +177,12 @@ impl ClaimScope {
     const fn predicate(self) -> &'static str {
         match self {
             Self::Generic => {
-                "LEFT(job_type, 7) <> 'PUBLIC_' AND job_type <> 'CONTRIBUTION_EXECUTE'"
+                // `DERIVED_` is excluded because those rows belong to the two derived-layer
+                // workers' own cross-tenant dispatch loop ([`claim_derived_work_*`], 0164) —
+                // a generic runtime claim must not steal a job whose lease the consolidation /
+                // private worker is the only process able to settle.
+                "LEFT(job_type, 7) <> 'PUBLIC_' AND LEFT(job_type, 8) <> 'DERIVED_' \
+                 AND job_type <> 'CONTRIBUTION_EXECUTE'"
             }
             Self::Contribution => "job_type = 'CONTRIBUTION_EXECUTE'",
         }
@@ -272,6 +277,272 @@ pub async fn private_claim(
     .await?;
     txn.commit().await?;
     Ok(claimed)
+}
+
+/// §78.2 closed set: the derived-layer job types `migrations/0164_derived_work_dispatch.sql`'s
+/// enqueue triggers emit and `ops.claim_derived_work` accepts. Pinned against the migration's own
+/// `ARRAY[...]` guard by [`contract_tests::derived_job_type_matches_claim_function_guard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedJobType {
+    /// One accepted Evidence waiting for the Distill hop (`ops.outbox` `EVIDENCE_ACCEPTED`).
+    Distill,
+    /// One new memory making its `(tenant, reasoning_domain)` pair eligible for a rollup pass.
+    Consolidate,
+}
+
+impl DerivedJobType {
+    pub const ALL: [DerivedJobType; 2] = [Self::Distill, Self::Consolidate];
+
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Distill => "DERIVED_DISTILL",
+            Self::Consolidate => "DERIVED_CONSOLIDATE",
+        }
+    }
+}
+
+/// How a derived-layer worker settles a job it claimed, expressed only in the four columns
+/// §6.2.2 grants both worker roles on `ops.jobs` (`status`, `lease_owner`, `lease_expires_at`,
+/// `next_retry_at` — the last one added for `role_consolidation_worker` by 0164 so a released job
+/// can back off) — deliberately NOT [`fail`]'s shape, which also writes `last_error_class`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedWorkOutcome {
+    /// The pass committed its business writes; the job is finished.
+    Done,
+    /// Environmental failure — release the lease so a later dispatch pass re-claims it, with
+    /// `next_retry_at` pushed out by [`retry_backoff_seconds`] so the release is a backoff and
+    /// not a spin.
+    Retry,
+    /// Retry budget exhausted; park the row so the loop stops spending on it.
+    Dead,
+}
+
+impl DerivedWorkOutcome {
+    const fn as_db_status(self) -> &'static str {
+        match self {
+            Self::Done => "DONE",
+            Self::Retry => "PENDING",
+            Self::Dead => "DEAD",
+        }
+    }
+}
+
+/// The cross-tenant claim (0164, ADR-0036). This is the ONE statement in the workspace that reads
+/// `ops.jobs` across tenants, and it is not this process's own SQL: `ops.claim_derived_work` is a
+/// SECURITY DEFINER function owned by `role_migration_owner`, whose non-spoofable `current_user`
+/// arm on `jobs_tenant_isolation` is what lets it see other tenants' rows. The worker gets back
+/// only the rows it just claimed, and every read/write it then performs goes through the ordinary
+/// per-tenant repos with [`set_tenant_local`]'s context installed from `ClaimedJob::tenant_id`.
+async fn claim_derived_work_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    kinds: &[DerivedJobType],
+    lease_owner: &str,
+    lease_seconds: f64,
+    limit: i64,
+) -> Result<Vec<ClaimedJob>, JobsError> {
+    let kinds: Vec<String> = kinds
+        .iter()
+        .map(|k| k.as_db_str().to_owned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let rows = sqlx::query("SELECT * FROM ops.claim_derived_work($1, $2, $3, $4)")
+        .bind(&kinds)
+        .bind(lease_owner)
+        .bind(lease_seconds)
+        .bind(limit)
+        .fetch_all(&mut **txn)
+        .await?;
+    rows.iter().map(ClaimedJob::from_row).collect()
+}
+
+/// `role_consolidation_worker`'s entry point to [`claim_derived_work_in_txn`].
+pub async fn claim_derived_work_consolidation(
+    pool: &ConsolidationDbPool,
+    kinds: &[DerivedJobType],
+    lease_owner: &str,
+    lease_seconds: f64,
+    limit: i64,
+) -> Result<Vec<ClaimedJob>, JobsError> {
+    let mut txn = pool.pool().begin().await?;
+    let claimed =
+        claim_derived_work_in_txn(&mut txn, kinds, lease_owner, lease_seconds, limit).await?;
+    txn.commit().await?;
+    Ok(claimed)
+}
+
+/// `role_private_worker`'s entry point to [`claim_derived_work_in_txn`].
+pub async fn claim_derived_work_private(
+    pool: &PrivateWorkerDbPool,
+    kinds: &[DerivedJobType],
+    lease_owner: &str,
+    lease_seconds: f64,
+    limit: i64,
+) -> Result<Vec<ClaimedJob>, JobsError> {
+    let mut txn = pool.pool().begin().await?;
+    let claimed =
+        claim_derived_work_in_txn(&mut txn, kinds, lease_owner, lease_seconds, limit).await?;
+    txn.commit().await?;
+    Ok(claimed)
+}
+
+/// Post-claim lease refresh and terminal transition. Both run under NORMAL RLS with the claimed
+/// job's own tenant installed — that is the whole point of the split: only the discovery read is
+/// privileged, everything after it is tenant-scoped again.
+/// Capped exponential backoff for a job this pass is handing back, in seconds.
+///
+/// `attempt` is the claim's own monotonic fencing token, so the delay grows with the number of
+/// times the row has already been tried; `lease_seconds` is the base because it is the operator's
+/// existing "how long is one attempt worth" dial — a released job that becomes eligible again
+/// sooner than one lease could ever complete is just a spin. Without this the row kept the
+/// enqueue trigger's `next_retry_at` (already in the past), so every poll burned one attempt with
+/// zero delay and a tenant whose environment was not ready yet exhausted `max_attempts` in
+/// seconds (ADR-0036 D5).
+fn retry_backoff_seconds(lease_seconds: f64, attempt: i32) -> f64 {
+    const CAP_SECONDS: f64 = 300.0;
+    let doublings = attempt.clamp(1, 16) - 1;
+    (lease_seconds * f64::from(2i32.pow(u32::try_from(doublings).unwrap_or(0)))).min(CAP_SECONDS)
+}
+
+/// The `lease_owner` + `attempt` pair IS the fence: the claim bumps `attempt` and rewrites
+/// `lease_owner`, so a settle from a worker whose job somebody else re-claimed matches no row.
+/// There is deliberately NO `lease_expires_at > clock_timestamp()` predicate here — it added
+/// nothing the fencing token did not already guarantee, and it actively rejected the settle of
+/// the ONE worker still legitimately holding the job whenever its own run outlived the lease,
+/// leaving the row PROCESSING-with-expired-lease for the next pass to redo (ADR-0036 D4: the
+/// double-rollup path).
+async fn settle_derived_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    lease: &DerivedLease<'_>,
+    outcome: DerivedWorkOutcome,
+    lease_seconds: f64,
+) -> Result<bool, JobsError> {
+    set_tenant_local(txn, lease.tenant_id).await?;
+    let result = sqlx::query(
+        "UPDATE ops.jobs \
+         SET status = $5, \
+             lease_owner = CASE WHEN $5 = 'DONE' THEN lease_owner ELSE NULL END, \
+             lease_expires_at = CASE WHEN $5 = 'DONE' THEN lease_expires_at ELSE NULL END, \
+             next_retry_at = CASE WHEN $5 = 'PENDING' \
+                                  THEN clock_timestamp() + make_interval(secs => $6) \
+                                  ELSE next_retry_at END \
+         WHERE job_id = $1 AND tenant_id = $2 AND lease_owner = $3 AND attempt = $4 \
+           AND status = 'PROCESSING'",
+    )
+    .bind(lease.job_id)
+    .bind(lease.tenant_id)
+    .bind(lease.lease_owner)
+    .bind(lease.attempt)
+    .bind(outcome.as_db_status())
+    .bind(retry_backoff_seconds(lease_seconds, lease.attempt))
+    .execute(&mut **txn)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The exact lease a derived-layer worker holds: identity plus the monotonic fencing token the
+/// claim returned. Grouped so the settle/heartbeat calls stay under clippy's argument-count lint.
+pub struct DerivedLease<'a> {
+    pub tenant_id: Uuid,
+    pub job_id: Uuid,
+    pub lease_owner: &'a str,
+    /// `attempt` as the claim returned it — a stale token settles nothing.
+    pub attempt: i32,
+}
+
+impl<'a> DerivedLease<'a> {
+    /// The lease exactly as [`claim_derived_work_consolidation`]/[`claim_derived_work_private`]
+    /// handed it back, so no call site can retype the fencing token by hand.
+    pub fn of(job: &ClaimedJob, lease_owner: &'a str) -> Self {
+        Self {
+            tenant_id: job.tenant_id,
+            job_id: job.job_id,
+            lease_owner,
+            attempt: job.attempt,
+        }
+    }
+}
+
+/// Post-claim lease refresh, under NORMAL RLS with the claimed job's own tenant installed —
+/// that is the whole point of the split: only the discovery read is privileged.
+pub async fn heartbeat_derived_consolidation(
+    pool: &ConsolidationDbPool,
+    lease: &DerivedLease<'_>,
+    lease_seconds: f64,
+) -> Result<bool, JobsError> {
+    let mut txn = pool.pool().begin().await?;
+    let changed = heartbeat_in_txn(
+        &mut txn,
+        lease.tenant_id,
+        lease.job_id,
+        lease.lease_owner,
+        lease.attempt,
+        lease_seconds,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(changed)
+}
+
+pub async fn heartbeat_derived_private(
+    pool: &PrivateWorkerDbPool,
+    lease: &DerivedLease<'_>,
+    lease_seconds: f64,
+) -> Result<bool, JobsError> {
+    let mut txn = pool.pool().begin().await?;
+    let changed = heartbeat_in_txn(
+        &mut txn,
+        lease.tenant_id,
+        lease.job_id,
+        lease.lease_owner,
+        lease.attempt,
+        lease_seconds,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(changed)
+}
+
+pub async fn settle_derived_consolidation(
+    pool: &ConsolidationDbPool,
+    lease: &DerivedLease<'_>,
+    outcome: DerivedWorkOutcome,
+    lease_seconds: f64,
+) -> Result<bool, JobsError> {
+    let mut txn = pool.pool().begin().await?;
+    let settled = settle_derived_in_txn(&mut txn, lease, outcome, lease_seconds).await?;
+    txn.commit().await?;
+    Ok(settled)
+}
+
+pub async fn settle_derived_private(
+    pool: &PrivateWorkerDbPool,
+    lease: &DerivedLease<'_>,
+    outcome: DerivedWorkOutcome,
+    lease_seconds: f64,
+) -> Result<bool, JobsError> {
+    let mut txn = pool.pool().begin().await?;
+    let settled = settle_derived_in_txn(&mut txn, lease, outcome, lease_seconds).await?;
+    txn.commit().await?;
+    Ok(settled)
+}
+
+/// The terminal `DONE` transition inside a CALLER-owned business transaction, so the business
+/// write and the job's settle commit or roll back together.
+///
+/// This is what makes "the result is written exactly once" structural rather than timing-
+/// dependent: `consolidate_repo::publish_rollup` writes the rollup and settles the job in ONE
+/// transaction, so a worker whose job somebody else re-claimed mid-run (its `attempt` bumped)
+/// rolls its own rollup back instead of publishing a second one over the same inputs. `false`
+/// means the caller must abort — not retry — its business write.
+///
+/// `DONE` only: a released (`PENDING`) job needs the backoff argument, and no business write
+/// should be committing alongside a release.
+pub(crate) async fn settle_derived_done_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    lease: &DerivedLease<'_>,
+) -> Result<bool, JobsError> {
+    settle_derived_in_txn(txn, lease, DerivedWorkOutcome::Done, 0.0).await
 }
 
 /// Locks and verifies one exact live lease inside a caller-owned business transaction.
@@ -555,6 +826,63 @@ mod contract_tests {
             .split(',')
             .map(|s| s.trim().trim_matches('\'').to_string())
             .collect()
+    }
+
+    const DISPATCH_MIGRATION_SQL: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../migrations/0164_derived_work_dispatch.sql"
+    ));
+
+    /// §78.2: [`DerivedJobType::ALL`] must equal the closed `ARRAY[...]` guard inside
+    /// `ops.claim_derived_work` verbatim, in order. Reads the migration text so it always runs.
+    #[test]
+    fn derived_job_type_matches_claim_function_guard() {
+        let needle = "p_job_types <@ ARRAY[";
+        let open = DISPATCH_MIGRATION_SQL
+            .find(needle)
+            .expect("0164 must guard p_job_types with a closed ARRAY[...] literal")
+            + needle.len();
+        let close = DISPATCH_MIGRATION_SQL[open..]
+            .find(']')
+            .expect("unterminated ARRAY[...] guard")
+            + open;
+        let db: Vec<String> = DISPATCH_MIGRATION_SQL[open..close]
+            .split(',')
+            .map(|s| s.trim().trim_matches('\'').to_string())
+            .collect();
+        let rust: Vec<String> = DerivedJobType::ALL
+            .iter()
+            .map(|t| t.as_db_str().to_string())
+            .collect();
+        assert_eq!(
+            db, rust,
+            "DerivedJobType::ALL must list exactly ops.claim_derived_work's accepted types"
+        );
+    }
+
+    /// Both enqueue triggers must emit a `job_type` the claim guard accepts — otherwise a row is
+    /// written that nothing can ever claim.
+    #[test]
+    fn enqueue_triggers_emit_only_claimable_job_types() {
+        for kind in DerivedJobType::ALL {
+            assert!(
+                DISPATCH_MIGRATION_SQL.contains(&format!("'{}', 'PENDING'", kind.as_db_str())),
+                "0164 has no enqueue site for {}",
+                kind.as_db_str()
+            );
+        }
+    }
+
+    /// The `DERIVED_` namespace must stay outside the generic claim: `role_gateway`'s
+    /// [`claim`] cannot settle a derived job (it has no route to the derived repos), so stealing
+    /// one would wedge the tenant's derived layer until the lease expired.
+    #[test]
+    fn generic_claim_excludes_the_derived_namespace() {
+        let predicate = ClaimScope::Generic.predicate();
+        assert!(predicate.contains("LEFT(job_type, 8) <> 'DERIVED_'"));
+        for kind in DerivedJobType::ALL {
+            assert!(kind.as_db_str().starts_with("DERIVED_"));
+        }
     }
 
     #[test]

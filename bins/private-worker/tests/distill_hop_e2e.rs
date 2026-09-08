@@ -364,6 +364,18 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
         )
         .expect("workspace")
         .get(0);
+    // ADR-0035 (card 13): 0163 re-points the WORKSPACE_SHARED visibility arm from
+    // control.memberships (tenant membership) to an ACTIVE control.workspace_memberships row
+    // for the row's OWN workspace. This fixture writes WORKSPACE_SHARED evidence/subjects under
+    // `user_id` in `workspace_id`, so it needs an ACTIVE workspace membership, not just a tenant
+    // membership, for role_gateway's WITH CHECK / USING to see them.
+    admin
+        .execute(
+            "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
+             VALUES($1,$2,$3,'MEMBER','ACTIVE')",
+            &[&tenant_id, &workspace_id, &user_id],
+        )
+        .expect("workspace membership");
 
     let credential: Uuid = admin
         .query_one(

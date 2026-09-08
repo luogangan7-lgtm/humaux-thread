@@ -1,5 +1,7 @@
 # ADR-0016: Private worker 自己拥有 Distill hop（Evidence → 0..N MemoryRecord，无 RPC）
 
+> **环境契约已被 ADR-0036（card 14，migration 0164）取代**：本文提到的 `HUMAUX_PRIVATE_WORKER_DISTILL_TENANT_ID` / `_REASONING_DOMAIN_ID` 已从二进制删除；distill worker 现在通过 `ops.claim_derived_work` 跨租户认领 job，env 里不再有任何租户/域 id（必填键见 bins/private-worker/src/main.rs 与 ADR-0036）。以下正文保留为历史决策轨迹。
+
 日期：2026-09-03 · 状态：Accepted · 影响面：`migrations/0147`（`memory_records` WITH CHECK 的 headless 臂 + 窄函数
 `control.current_reasoning_route_binding`）/ `crates/adapters`（`distill_reasoner.rs`、`distill_repo.rs` 新增；
 `consolidation_reasoner.rs` 两个 helper 改 `pub(crate)`；`projection_worker.rs` D6）/ `bins/private-worker`

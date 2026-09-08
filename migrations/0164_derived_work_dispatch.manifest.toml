@@ -1,0 +1,75 @@
+# §46.1 migration manifest. ADR-0036 (card 14, §31/§61 durable jobs + §6.2.2 function grants):
+# cross-tenant pending-work discovery for the two derived-layer workers. Adds the
+# `current_user = 'role_migration_owner'` arm to ops.jobs' 0012 blanket policy (rest byte-identical
+# to the live expression), makes ops.jobs.tenant_id cascade on tenant delete, adds two
+# invoker-rights AFTER INSERT enqueue triggers (ops.outbox EVIDENCE_ACCEPTED, private.memory_evidence
+# PRIMARY), one owner SECURITY DEFINER cross-tenant claim `ops.claim_derived_work` (EXECUTE:
+# role_consolidation_worker + role_private_worker only), and extends the 0147 route-binding
+# resolver's EXECUTE list to role_consolidation_worker, and adds `next_retry_at` to
+# role_consolidation_worker's column-level UPDATE on ops.jobs so an environmentally-deferred job
+# backs off instead of burning one attempt per poll. No new table, no new role, no new column,
+# no DML. §46 forward-fix (EXPAND_CONTRACT, first free number after 0163).
+
+migration_id = "0164_derived_work_dispatch"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('ops.jobs') is not null
+ and to_regprocedure('control.current_reasoning_route_binding(uuid,text)') is not null
+ and to_regprocedure('ops.claim_derived_work(text[],text,double precision,bigint)') is null
+ -- still on 0012's bare tenant form (no owner arm yet)
+ and (select pg_get_expr(polqual,polrelid) not like '%role_migration_owner%'
+      from pg_policy where polrelid='ops.jobs'::regclass and polname='jobs_tenant_isolation')
+ and not has_function_privilege('role_consolidation_worker',
+       'control.current_reasoning_route_binding(uuid,text)','EXECUTE')
+ and not has_column_privilege('role_consolidation_worker','ops.jobs','next_retry_at','UPDATE')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- owner arm present on BOTH legs, tenant arm still there
+ (select pg_get_expr(polqual,polrelid) like '%role_migration_owner%'
+     and pg_get_expr(polqual,polrelid) like '%humaux.tenant_id%'
+     and pg_get_expr(polwithcheck,polrelid) like '%role_migration_owner%'
+     and pg_get_expr(polwithcheck,polrelid) like '%humaux.tenant_id%'
+  from pg_policy where polrelid='ops.jobs'::regclass and polname='jobs_tenant_isolation')
+ -- still exactly one permissive policy on ops.jobs (no silently-widening second policy)
+ and (select count(*)=1 from pg_policy where polrelid='ops.jobs'::regclass and polpermissive)
+ and (select relrowsecurity and relforcerowsecurity from pg_class where oid='ops.jobs'::regclass)
+ -- tenant delete cascades
+ and (select confdeltype='c' from pg_constraint where conname='jobs_tenant_id_fkey'
+       and conrelid='ops.jobs'::regclass)
+ -- the claim function: owner, SECURITY DEFINER, pinned search_path, exactly two executors
+ and (select pg_get_userbyid(proowner)='role_migration_owner' and prosecdef
+        and proconfig @> ARRAY['search_path=pg_catalog']
+      from pg_proc where oid='ops.claim_derived_work(text[],text,double precision,bigint)'::regprocedure)
+ and (select bool_and(has_function_privilege(r,'ops.claim_derived_work(text[],text,double precision,bigint)','EXECUTE')
+                      = (r in ('role_consolidation_worker','role_private_worker')))
+      from unnest(ARRAY['role_gateway','role_private_worker','role_consolidation_worker',
+                        'role_public_worker','role_retrieval_worker','role_batch_issuer',
+                        'role_maintenance','role_admin']) r)
+ and not exists (select 1 from pg_proc p,
+                 aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                 where p.oid='ops.claim_derived_work(text[],text,double precision,bigint)'::regprocedure
+                   and x.grantee = 0 and x.privilege_type='EXECUTE')
+ -- both enqueue triggers exist and are AFTER INSERT row triggers
+ and (select count(*)=2 from pg_trigger
+      where tgname in ('derived_distill_work_enqueue','derived_consolidate_work_enqueue')
+        and not tgisinternal)
+ -- consolidation worker joined the narrow route resolver; no table grant came with it
+ and has_function_privilege('role_consolidation_worker',
+       'control.current_reasoning_route_binding(uuid,text)','EXECUTE')
+ and not has_table_privilege('role_consolidation_worker','control.reasoning_route_bindings','SELECT')
+ -- no broader ops.jobs table grant snuck in with the function
+ and not has_table_privilege('role_consolidation_worker','ops.jobs','INSERT')
+ and not has_table_privilege('role_consolidation_worker','ops.jobs','DELETE')
+ -- the backoff column joined the column-level UPDATE, and nothing else did
+ and has_column_privilege('role_consolidation_worker','ops.jobs','next_retry_at','UPDATE')
+ and not has_column_privilege('role_consolidation_worker','ops.jobs','attempt','UPDATE')
+ and not has_column_privilege('role_consolidation_worker','ops.jobs','payload','UPDATE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Reverting is: DROP the two triggers + their functions, DROP ops.claim_derived_work, REVOKE the consolidation worker's resolver EXECUTE, and ALTER POLICY jobs_tenant_isolation back to the bare tenant predicate — all recoverable from this file. Reverting returns both derived workers to a single env-pinned (tenant, reasoning_domain) pair; it does not widen any tenant's data access."
+backup_restore_requirement = "none: one ALTER POLICY, one FK re-point (no row data touched, RESTRICT -> CASCADE only relaxes a delete-time check), two new triggers, one new function, one function GRANT."

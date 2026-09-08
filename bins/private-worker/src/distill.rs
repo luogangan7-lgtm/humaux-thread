@@ -33,6 +33,7 @@ use humaux_adapters::{
         self, ClaimedEvidence, DbError, LoadedEvidence, NewMemory, OutboxTerminal,
         ProcessingRunStart,
     },
+    jobs,
     postgres::PrivateWorkerDbPool,
 };
 use humaux_application::consolidate::PrivateReasoningError;
@@ -168,6 +169,195 @@ fn memory_content(text: &str) -> Value {
         "title": text.chars().take(80).collect::<String>(),
         "key_claim": text,
     })
+}
+
+/// Deployment-owned inputs for one CROSS-TENANT dispatch pass (ADR-0036, card 14). No tenant id
+/// and no reasoning domain: both come from the claimed `DERIVED_DISTILL` job, which is what lets
+/// one private-worker process serve every tenant that has pending Evidence.
+#[derive(Debug, Clone)]
+pub struct DistillDispatchConfig {
+    /// Per-process lease owner, used for BOTH the `ops.jobs` lease and the per-tenant
+    /// `ops.outbox` lease [`run_once`] takes — one identity, so a killed process releases both
+    /// the same way.
+    pub lease_owner: String,
+    pub lease_seconds: f64,
+    /// Max `DERIVED_DISTILL` jobs one dispatch pass claims.
+    pub job_batch: i64,
+    /// Max `ops.outbox` rows the per-tenant [`run_once`] inside each job claims.
+    pub batch: i64,
+    /// At or past this many attempts a repeatedly-failing job is parked `DEAD` rather than
+    /// released for another pass.
+    pub max_attempts: i32,
+}
+
+impl DistillDispatchConfig {
+    pub fn validate(&self) -> Result<(), ErrorCode> {
+        if self.lease_owner.trim().is_empty()
+            || !self.lease_seconds.is_finite()
+            || self.lease_seconds <= 0.0
+            || self.job_batch <= 0
+            || self.batch <= 0
+            || self.max_attempts <= 0
+        {
+            return Err(ErrorCode::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
+/// What one [`dispatch_pass`] did. `claimed == 0` is the "no input" signal `--distill-once`
+/// exits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DistillDispatchReport {
+    /// `DERIVED_DISTILL` jobs claimed cross-tenant this pass.
+    pub claimed: u32,
+    pub completed: u32,
+    /// Jobs released back to PENDING after an environmental failure, with a backoff
+    /// (`adapters::jobs::retry_backoff_seconds`) rather than instantly re-claimable.
+    pub deferred: u32,
+    /// Jobs released because the per-tenant pass handed Evidence back to PENDING (no admitted
+    /// `PRIVATE_DISTILL_TEXT` route yet, provider blip): the job is NOT finished, so it must not
+    /// be settled `DONE`, and it never spends the retry budget — the 0164 enqueue trigger's
+    /// idempotency key is per `evidence_id` with `ON CONFLICT DO NOTHING`, so a `DONE`/`DEAD`
+    /// job is never re-emitted and that Evidence would be stranded forever (ADR-0036 D5).
+    pub not_ready: u32,
+    /// Jobs parked DEAD after exhausting `max_attempts`.
+    pub dead: u32,
+    /// Jobs whose `ops.jobs` lease was already reclaimed before this worker could settle them.
+    pub lost_lease: u32,
+    /// Sum of the per-tenant passes' own counters.
+    pub work: DistillPassReport,
+}
+
+impl DistillPassReport {
+    fn add(&mut self, other: DistillPassReport) {
+        self.claimed += other.claimed;
+        self.done += other.done;
+        self.failed += other.failed;
+        self.deferred += other.deferred;
+        self.lost_lease += other.lost_lease;
+        self.memories += other.memories;
+        self.rejected += other.rejected;
+    }
+}
+
+/// One cross-tenant dispatch pass (ADR-0036): claim up to `config.job_batch` `DERIVED_DISTILL`
+/// jobs through the owner SECURITY DEFINER `ops.claim_derived_work` (migration 0164 — the only
+/// cross-tenant read of `ops.jobs`), then run [`run_once`] for each claimed job under ITS OWN
+/// tenant's RLS context. Nothing after the claim is cross-tenant: every read and write goes
+/// through `distill_repo`, which installs `humaux.tenant_id` from the claimed job.
+pub async fn dispatch_pass(
+    pool: &PrivateWorkerDbPool,
+    provider: &dyn UserReasoningProvider,
+    config: ContributionReasonerConfig,
+    dispatch: &DistillDispatchConfig,
+) -> Result<DistillDispatchReport, DistillError> {
+    dispatch.validate().map_err(DistillError::Config)?;
+    let claimed = jobs::claim_derived_work_private(
+        pool,
+        &[jobs::DerivedJobType::Distill],
+        &dispatch.lease_owner,
+        dispatch.lease_seconds,
+        dispatch.job_batch,
+    )
+    .await
+    .map_err(|e| DistillError::Reasoning(PrivateReasoningError::new(e.to_string())))?;
+    let mut report = DistillDispatchReport {
+        claimed: claimed.len() as u32,
+        ..DistillDispatchReport::default()
+    };
+    for job in claimed {
+        let lease = jobs::DerivedLease::of(&job, &dispatch.lease_owner);
+        // Refresh before the provider round trip, not after it.
+        if !heartbeat(pool, &lease, dispatch.lease_seconds).await? {
+            report.lost_lease += 1;
+            continue;
+        }
+        let outcome = match payload_reasoning_domain(&job.payload) {
+            None => Err(DistillError::Config(ErrorCode::InvalidInput)),
+            Some(reasoning_domain_id) => {
+                let distill = DistillConfig {
+                    tenant_id: job.tenant_id,
+                    reasoning_domain_id,
+                    batch: dispatch.batch,
+                    lease_seconds: dispatch.lease_seconds,
+                    lease_owner: dispatch.lease_owner.clone(),
+                };
+                run_once(
+                    pool,
+                    provider,
+                    crate::inference_rpc::clone_config(&config),
+                    &distill,
+                )
+                .await
+            }
+        };
+        let settle = match outcome {
+            // `Ok` says the pass did not blow up — NOT that it distilled anything. A pass that
+            // handed every claimed `ops.outbox` row back to PENDING (`deferred`) has finished
+            // nothing; settling that `DONE` strands the Evidence, because the job is never
+            // re-emitted for it. Release the job instead, without spending an attempt.
+            Ok(pass) => {
+                let deferred = pass.deferred;
+                report.work.add(pass);
+                if deferred > 0 {
+                    report.not_ready += 1;
+                    jobs::DerivedWorkOutcome::Retry
+                } else {
+                    report.completed += 1;
+                    jobs::DerivedWorkOutcome::Done
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "humaux-private-worker: distill job {} failed: {error}",
+                    job.job_id
+                );
+                if job.attempt >= dispatch.max_attempts {
+                    report.dead += 1;
+                    jobs::DerivedWorkOutcome::Dead
+                } else {
+                    report.deferred += 1;
+                    jobs::DerivedWorkOutcome::Retry
+                }
+            }
+        };
+        if !settle_job(pool, &lease, settle, dispatch.lease_seconds).await? {
+            report.lost_lease += 1;
+        }
+    }
+    Ok(report)
+}
+
+async fn heartbeat(
+    pool: &PrivateWorkerDbPool,
+    lease: &jobs::DerivedLease<'_>,
+    lease_seconds: f64,
+) -> Result<bool, DistillError> {
+    jobs::heartbeat_derived_private(pool, lease, lease_seconds)
+        .await
+        .map_err(|e| DistillError::Reasoning(PrivateReasoningError::new(e.to_string())))
+}
+
+async fn settle_job(
+    pool: &PrivateWorkerDbPool,
+    lease: &jobs::DerivedLease<'_>,
+    outcome: jobs::DerivedWorkOutcome,
+    lease_seconds: f64,
+) -> Result<bool, DistillError> {
+    jobs::settle_derived_private(pool, lease, outcome, lease_seconds)
+        .await
+        .map_err(|e| DistillError::Reasoning(PrivateReasoningError::new(e.to_string())))
+}
+
+/// The `reasoning_domain_id` `migrations/0164_derived_work_dispatch.sql`'s
+/// `derived_distill_work_enqueue` trigger writes into the job payload.
+fn payload_reasoning_domain(payload: &Value) -> Option<Uuid> {
+    payload
+        .get("reasoning_domain_id")?
+        .as_str()?
+        .parse::<Uuid>()
+        .ok()
 }
 
 /// One pass over the tenant's pending Evidence. Never panics on a provider/parse failure —

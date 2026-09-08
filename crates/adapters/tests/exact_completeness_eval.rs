@@ -272,14 +272,27 @@ fn setup() -> Option<(Fixture, String, String)> {
 }
 
 fn new_workspace(f: &mut Fixture, name: &str) -> Uuid {
-    f.admin
+    let workspace_id: Uuid = f
+        .admin
         .query_one(
             "INSERT INTO control.workspaces (tenant_id, name) VALUES ($1, $2) \
              RETURNING workspace_id",
             &[&f.tenant_id, &name.to_string()],
         )
         .expect("insert workspace")
-        .get(0)
+        .get(0);
+    // ADR-0035 (card 13): 0163 re-points the WORKSPACE_SHARED visibility arm from
+    // control.memberships (tenant membership) to an ACTIVE control.workspace_memberships row
+    // for the row's OWN workspace. Every workspace this harness creates is later read as
+    // `f.user_id` (see `authorization_for`), so it is made an ACTIVE MEMBER here.
+    f.admin
+        .execute(
+            "INSERT INTO control.workspace_memberships (tenant_id, workspace_id, user_id, role, state) \
+             VALUES ($1, $2, $3, 'MEMBER', 'ACTIVE')",
+            &[&f.tenant_id, &workspace_id, &f.user_id],
+        )
+        .expect("insert workspace membership");
+    workspace_id
 }
 
 /// One REJECTION memory with its §8.6 evidence chain, workspace-visible (the registry

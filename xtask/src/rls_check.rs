@@ -410,11 +410,16 @@ const MATRIX: &[Cell] = &[
         "role_private_worker",
         ["SELECT", "INSERT", "UPDATE"]
     ),
+    // ADR-0036 (card 14, 0164): `next_retry_at` joined the column list so a job released after an
+    // environmental failure backs off instead of being re-claimed instantly on the next poll.
     cell!(
         "ops.jobs",
         "role_consolidation_worker",
         ["SELECT"],
-        [("UPDATE", ["status", "lease_owner", "lease_expires_at"])]
+        [(
+            "UPDATE",
+            ["status", "lease_owner", "lease_expires_at", "next_retry_at"]
+        )]
     ),
     cell!("ops.jobs", "role_public_worker", []),
     cell!(
@@ -2804,28 +2809,36 @@ pub fn check_r3_health_observation_boundary(client: &mut impl GenericClient) -> 
     if problems.is_empty() {
         pass(
             "R3 health boundary",
-            "two owner-only FORCE RLS health tables; resolver + binding lookup are private-worker-only SECURITY DEFINER".to_string(),
+            "two owner-only FORCE RLS health tables; admission resolver is private-worker-only, the 0147 binding lookup is private-worker + consolidation-worker (0164), both owner SECURITY DEFINER".to_string(),
         )
     } else {
         fail("R3 health boundary", problems.join("; "))
     }
 }
 
-/// The two narrow `control.*` SECURITY DEFINER functions `role_private_worker` alone may
-/// execute: the 0130 admission resolver and its 0147 twin that names the effective binding for
-/// `(session tenant, reasoning domain, purpose)` (ADR-0016 D1) — §6.2.2 "后续若给窄 resolver
-/// grant，必须在同一变更里同时更新本矩阵、`rls-check`".
-const R3_PRIVATE_WORKER_FUNCTIONS: &[&str] = &[
-    "control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)",
-    "control.current_reasoning_route_binding(uuid,text)",
+/// The two narrow `control.*` SECURITY DEFINER functions and their EXACT executor sets: the 0130
+/// admission resolver (`role_private_worker` alone) and its 0147 twin that names the effective
+/// binding for `(session tenant, reasoning domain, purpose)` (ADR-0016 D1), whose executor set
+/// 0164 widened to include `role_consolidation_worker` — a cross-tenant consolidation worker
+/// cannot carry an env-pinned binding id because bindings are per tenant (ADR-0036). §6.2.2
+/// "后续若给窄 resolver grant，必须在同一变更里同时更新本矩阵、`rls-check`".
+const R3_PRIVATE_WORKER_FUNCTIONS: &[(&str, &[&str])] = &[
+    (
+        "control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)",
+        &["role_private_worker"],
+    ),
+    (
+        "control.current_reasoning_route_binding(uuid,text)",
+        &["role_private_worker", "role_consolidation_worker"],
+    ),
 ];
 
 fn check_r3_health_resolver_contract(
     client: &mut impl GenericClient,
     problems: &mut Vec<String>,
 ) -> Result<(), GateResult> {
-    for signature in R3_PRIVATE_WORKER_FUNCTIONS {
-        check_r3_private_worker_function(client, problems, signature)?;
+    for (signature, executors) in R3_PRIVATE_WORKER_FUNCTIONS {
+        check_r3_private_worker_function(client, problems, signature, executors)?;
     }
     Ok(())
 }
@@ -2834,6 +2847,7 @@ fn check_r3_private_worker_function(
     client: &mut impl GenericClient,
     problems: &mut Vec<String>,
     signature: &str,
+    executors: &[&str],
 ) -> Result<(), GateResult> {
     let function = match client.query_opt(
         "SELECT pg_get_userbyid(p.proowner), p.prosecdef, coalesce(p.proconfig, ARRAY[]::text[]) \
@@ -2873,7 +2887,7 @@ fn check_r3_private_worker_function(
                 continue;
             }
         };
-        let expected = *role == "role_private_worker";
+        let expected = executors.contains(role);
         if allowed != expected {
             problems.push(format!(
                 "{signature}/{role}: expected EXECUTE={expected}, actual {allowed}"
@@ -3394,6 +3408,174 @@ fn report(results: &[GateResult]) -> i32 {
     i32::from(failed)
 }
 
+/// ADR-0036 (card 14, migration 0164): the ONE cross-tenant read of `ops.jobs`.
+///
+/// `ops.jobs` is ENABLE + FORCE ROW LEVEL SECURITY and every runtime role is NOBYPASSRLS, so a
+/// "which tenants have pending derived work" query returns zero rows from any worker session.
+/// 0164 adds the house `current_user = 'role_migration_owner'` arm (0004/0012/0112/0147/0163) to
+/// `jobs_tenant_isolation` and puts the cross-tenant claim behind ONE owner SECURITY DEFINER
+/// function. This gate pins every property that makes that safe rather than merely convenient:
+///
+/// * the policy keeps BOTH arms on BOTH legs (dropping the tenant arm would make every session
+///   see every tenant; dropping the owner arm silently breaks discovery), and `ops.jobs` stays
+///   exactly ONE permissive policy — 0012's header explains why a second permissive policy ORs
+///   in and widens access;
+/// * the function is owned by `role_migration_owner`, SECURITY DEFINER with a pinned
+///   `search_path` (an unpinned one is how a definer function gets hijacked), and
+/// * its EXECUTE list is EXACTLY the two derived-layer worker roles, with PUBLIC revoked —
+///   `current_user` inside the definer is the OWNER, so EXECUTE is the entire authorization
+///   boundary here.
+///
+/// Missing objects ⇒ `not_applicable` with the object named (§57.1).
+pub fn check_derived_work_dispatch_boundary(client: &mut impl GenericClient) -> GateResult {
+    let check = "§31/§61 derived work cross-tenant dispatch";
+    let exists: bool = match client.query_one(
+        "SELECT to_regprocedure($1) IS NOT NULL",
+        &[&DERIVED_CLAIM_FN],
+    ) {
+        Ok(row) => row.get(0),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    if !exists {
+        return not_applicable(check, format!("missing {DERIVED_CLAIM_FN}"));
+    }
+
+    let mut problems = Vec::new();
+    check_derived_claim_function(client, &mut problems);
+    check_derived_jobs_policy(client, &mut problems);
+
+    if problems.is_empty() {
+        pass(
+            check,
+            "ops.claim_derived_work: owner SECURITY DEFINER, search_path pinned, EXECUTE exactly \
+             {role_consolidation_worker, role_private_worker}, PUBLIC revoked; ops.jobs keeps one \
+             FORCE-RLS permissive policy with both the owner and tenant arms",
+        )
+    } else {
+        fail(check, problems.join("; "))
+    }
+}
+
+const DERIVED_CLAIM_FN: &str = "ops.claim_derived_work(text[],text,double precision,bigint)";
+const DERIVED_CLAIM_EXECUTORS: &[&str] = &["role_consolidation_worker", "role_private_worker"];
+
+/// Owner + definer + pinned `search_path` + the exact EXECUTE list, PUBLIC included.
+fn check_derived_claim_function(client: &mut impl GenericClient, problems: &mut Vec<String>) {
+    check_owner_definer_function(client, problems, DERIVED_CLAIM_FN, DERIVED_CLAIM_EXECUTORS);
+}
+
+/// One owner SECURITY DEFINER function whose EXECUTE list is its entire authorization boundary:
+/// owner = `role_migration_owner`, `prosecdef`, `search_path=pg_catalog`, EXECUTE held by exactly
+/// `executors` among the frozen non-owner roles, PUBLIC revoked. Shared by the 0164 derived-work
+/// claim and the 0165 public-admission release reader (same §6.2.2 "narrow definer, no table
+/// grant" shape as 0139).
+fn check_owner_definer_function(
+    client: &mut impl GenericClient,
+    problems: &mut Vec<String>,
+    function: &str,
+    executors: &[&str],
+) {
+    match client.query_one(
+        "SELECT pg_get_userbyid(p.proowner), p.prosecdef, coalesce(p.proconfig, ARRAY[]::text[]) \
+         FROM pg_proc p WHERE p.oid = to_regprocedure($1)",
+        &[&function],
+    ) {
+        Ok(row) => {
+            let owner: String = row.get(0);
+            let definer: bool = row.get(1);
+            let config: Vec<String> = row.get(2);
+            if owner != OWNER_ROLE
+                || !definer
+                || !config.iter().any(|v| v == "search_path=pg_catalog")
+            {
+                problems.push(format!(
+                    "{function}: expected owner={OWNER_ROLE}, SECURITY DEFINER, \
+                     search_path=pg_catalog; actual owner={owner}, definer={definer}, \
+                     config={config:?}"
+                ));
+            }
+        }
+        Err(error) => problems.push(format!("{function}: catalog query failed: {error}")),
+    }
+
+    for role in NON_OWNER_ROLES {
+        match client.query_one(
+            "SELECT has_function_privilege($1::text, $2::text, 'EXECUTE')",
+            &[role, &function],
+        ) {
+            Ok(row) => {
+                let allowed: bool = row.get(0);
+                let expected = executors.contains(role);
+                if allowed != expected {
+                    problems.push(format!(
+                        "{function}/{role}: expected EXECUTE={expected}, actual {allowed}"
+                    ));
+                }
+            }
+            Err(error) => problems.push(format!("{function}/{role}: probe failed: {error}")),
+        }
+    }
+
+    match client.query_one(
+        "SELECT NOT EXISTS ( \
+           SELECT 1 FROM pg_proc p, \
+             aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x \
+           WHERE p.oid = to_regprocedure($1) \
+             AND x.grantee = 0 AND x.privilege_type = 'EXECUTE' \
+         )",
+        &[&function],
+    ) {
+        Ok(row) => {
+            if !row.get::<_, bool>(0) {
+                problems.push(format!("{function}/PUBLIC: EXECUTE must be revoked"));
+            }
+        }
+        Err(error) => problems.push(format!("{function}/PUBLIC: probe failed: {error}")),
+    }
+}
+
+/// `jobs_tenant_isolation` must keep BOTH arms on BOTH legs, stay the ONLY permissive policy on
+/// `ops.jobs`, and `ops.jobs` must stay ENABLE + FORCE RLS.
+fn check_derived_jobs_policy(client: &mut impl GenericClient, problems: &mut Vec<String>) {
+    match client.query_opt(
+        "SELECT pg_get_expr(polqual, polrelid), \
+                coalesce(pg_get_expr(polwithcheck, polrelid), ''), \
+                (SELECT count(*) FROM pg_policy q \
+                 WHERE q.polrelid = 'ops.jobs'::regclass AND q.polpermissive), \
+                (SELECT c.relrowsecurity AND c.relforcerowsecurity \
+                 FROM pg_class c WHERE c.oid = 'ops.jobs'::regclass) \
+         FROM pg_policy \
+         WHERE polrelid = 'ops.jobs'::regclass AND polname = 'jobs_tenant_isolation'",
+        &[],
+    ) {
+        Ok(Some(row)) => {
+            let using: String = row.get(0);
+            let with_check: String = row.get(1);
+            let permissive: i64 = row.get(2);
+            let forced: bool = row.get(3);
+            for (leg, expr) in [("USING", &using), ("WITH CHECK", &with_check)] {
+                if !expr.contains("role_migration_owner") || !expr.contains("humaux.tenant_id") {
+                    problems.push(format!(
+                        "jobs_tenant_isolation {leg} must keep BOTH the owner arm and the tenant \
+                         arm; actual: {expr}"
+                    ));
+                }
+            }
+            if permissive != 1 {
+                problems.push(format!(
+                    "ops.jobs must carry exactly one PERMISSIVE policy (a second one ORs in and \
+                     widens access); found {permissive}"
+                ));
+            }
+            if !forced {
+                problems.push("ops.jobs must stay ENABLE + FORCE ROW LEVEL SECURITY".to_string());
+            }
+        }
+        Ok(None) => problems.push("missing policy jobs_tenant_isolation on ops.jobs".to_string()),
+        Err(error) => problems.push(format!("jobs_tenant_isolation probe failed: {error}")),
+    }
+}
+
 pub fn run(_args: &[String]) -> i32 {
     let mut results = Vec::new();
 
@@ -3421,6 +3603,7 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_w1_continuity_boundary(&mut client));
             results.push(check_w2_continuity_boundary(&mut client));
             results.push(check_subject_visibility_policy(&mut client));
+            results.push(check_derived_work_dispatch_boundary(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -3437,6 +3620,7 @@ pub fn run(_args: &[String]) -> i32 {
                 "W1 Project Continuity boundary",
                 "W2 Project Continuity read boundary",
                 "§6.1.3 subject visibility RESTRICTIVE policy",
+                "§31/§61 derived work cross-tenant dispatch",
             ] {
                 results.push(fail_for(name, &conn_err));
             }

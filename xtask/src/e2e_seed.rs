@@ -211,6 +211,15 @@ fn seed_base(
         )
         .map_err(|e| format!("insert workspace: {}", db_detail(&e)))?
         .get(0);
+    // 0163 (ADR-0035) repointed the WORKSPACE_SHARED visibility arm from `control.memberships`
+    // to the row's own workspace: without an ACTIVE `control.workspace_memberships` row the
+    // seeded principal reads and writes nothing workspace-shared and every hop 403s.
+    txn.execute(
+        "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
+         VALUES($1,$2,$3,'OWNER','ACTIVE')",
+        &[&tenant_id, &workspace_id, &user_id],
+    )
+    .map_err(|e| format!("insert workspace membership: {}", db_detail(&e)))?;
     // §11.2.4-11.2.5 R3 admission trigger requires the domain's owner_user_id to be set and
     // membership-backed (0128_reasoning_route_foundation.sql's binding-insert trigger) — the
     // lane below cannot admit through an ownerless domain.
@@ -1026,26 +1035,13 @@ pub fn run(args: &[String]) -> i32 {
     println!("embedding_region: {}", qdrant_flags.embedding_region);
     println!("dimension: {}", qdrant_flags.dimension);
     println!();
-    println!(
-        "export HUMAUX_CONSOLIDATION_WORKER_TENANT_ID={}",
-        base.tenant_id
-    );
-    println!(
-        "export HUMAUX_CONSOLIDATION_WORKER_WORKSPACE_ID={}",
-        base.workspace_id
-    );
-    println!(
-        "export HUMAUX_CONSOLIDATION_WORKER_REASONING_DOMAIN_ID={}",
-        base.reasoning_domain_id
-    );
-    println!(
-        "export HUMAUX_CONSOLIDATION_WORKER_BINDING_ID={}",
-        lane.binding_id
-    );
-    println!(
-        "export HUMAUX_CONSOLIDATION_WORKER_BINDING_VERSION={}",
-        lane.binding_version
-    );
+    // ADR-0036: the consolidation worker no longer takes a (tenant, domain, binding) pair from
+    // the environment — it claims work across tenants via `ops.claim_derived_work` and resolves
+    // the route binding per claimed tenant. What is left is the dispatch knobs; the socket path,
+    // TTLs and MAX_INPUTS stay with the deployment because the seed cannot know them.
+    println!("export HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS=120");
+    println!("export HUMAUX_CONSOLIDATION_WORKER_BATCH=8");
+    println!("export HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5");
     println!();
     println!(
         "export HUMAUX_PRIVATE_WORKER_PROVIDER_ID={}",
@@ -1099,14 +1095,10 @@ pub fn run(args: &[String]) -> i32 {
         qdrant_flags.dimension
     );
     println!();
-    println!(
-        "export HUMAUX_PRIVATE_WORKER_DISTILL_TENANT_ID={}",
-        base.tenant_id
-    );
-    println!(
-        "export HUMAUX_PRIVATE_WORKER_DISTILL_REASONING_DOMAIN_ID={}",
-        base.reasoning_domain_id
-    );
+    // ADR-0036: same for the distill hop — no tenant/domain in the environment, only the
+    // job-dispatch knobs. DISTILL_BATCH / DISTILL_LEASE_SECS remain deployment-side.
+    println!("export HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH=8");
+    println!("export HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5");
 
     0
 }

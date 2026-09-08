@@ -584,6 +584,26 @@ fn seed_control(admin: &mut Client, ids: &SeedIds) {
             )
             .unwrap();
     }
+    // ADR-0035 (card 13): 0163 re-points the WORKSPACE_SHARED visibility arm from
+    // control.memberships (tenant membership) to an ACTIVE control.workspace_memberships row
+    // for the row's OWN workspace. `ids.user` is made a member of BOTH `ids.workspace` and
+    // `ids.other_workspace` here: this is only the DB-row-visibility gate, and
+    // `direct_evidence_truth_table_is_fail_closed`'s `VisibilityHidden` case needs the raw
+    // `private.evidence_objects` SELECT in `continuity_read::validate_evidence` to still return
+    // the row (else it misclassifies as SOURCE_REVALIDATION_FAILED instead of
+    // VISIBILITY_REVALIDATION_FAILED). The actual app-level "is `other_workspace` in scope"
+    // narrowing is `fixture.read()`'s own `AuthorizationScope`, hardcoded below to
+    // `BoundedSet::new([WorkspaceId(self.workspace)])` — never `other_workspace` — so
+    // `WorkspaceHidden`/`can_read` still correctly reject it regardless of this DB-level grant.
+    for id in [ids.workspace, ids.other_workspace] {
+        admin
+            .execute(
+                "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
+                 VALUES($1,$2,$3,'MEMBER','ACTIVE')",
+                &[&ids.tenant, &id, &ids.user],
+            )
+            .unwrap();
+    }
     admin
         .execute(
             "INSERT INTO control.private_reasoning_domains( \
