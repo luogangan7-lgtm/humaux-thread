@@ -11,5 +11,5 @@ workspace = true
 humaux-adapters = { path = "../../crates/adapters" }
 humaux-domain = { path = "../../crates/domain" }
 humaux-infra-cell = { path = "../../crates/infra-cell" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 uuid = { version = "1.25.0", features = ["v7"] }

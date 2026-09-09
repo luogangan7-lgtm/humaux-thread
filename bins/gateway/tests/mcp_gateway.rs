@@ -3296,7 +3296,10 @@ fn native_mcp_gateway_commit_ack_loss_is_unknown_and_replays_the_committed_recei
 
 const GATEWAY_ENV_PREFIX: &str = "HUMAUX_GATEWAY_";
 const GATEWAY_PROCESS_START_TIMEOUT: Duration = Duration::from_secs(5);
-const GATEWAY_PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Must exceed `bins/gateway/src/main.rs`'s `DRAIN_ANNOUNCE_WINDOW` (5s): a graceful stop now
+/// deliberately keeps accepting for that window so `/readyz` can answer 503 to a supervisor that
+/// dials a fresh connection per poll.
+const GATEWAY_PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct GatewayProcessConfig {
@@ -3462,7 +3465,9 @@ impl GatewayProcess {
         }
     }
 
-    fn terminate(&mut self) -> Result<(), String> {
+    /// SIGTERM only — the process is expected to keep accepting for its drain window, which is
+    /// what `gateway_readyz_answers_503_on_a_fresh_connection_while_draining` asserts.
+    fn signal_terminate(&mut self) -> Result<(), String> {
         #[cfg(unix)]
         {
             let status = Command::new("/bin/kill")
@@ -3487,7 +3492,10 @@ impl GatewayProcess {
             .ok_or_else(|| "gateway binary is already reaped".to_owned())?
             .kill()
             .map_err(|_| "stop gateway binary".to_owned())?;
+        Ok(())
+    }
 
+    fn await_clean_exit(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + GATEWAY_PROCESS_STOP_TIMEOUT;
         let status = self.wait_for_exit(deadline)?;
         self.child.take();
@@ -3530,6 +3538,32 @@ impl Drop for GatewayProcess {
     fn drop(&mut self) {
         self.cleanup();
     }
+}
+
+/// Card 15 / ADR-0037: a plain unauthenticated `GET`, returning the HTTP status line's code.
+/// Deliberately NOT `raw_request` — the whole point of `/livez` and `/readyz` is that a
+/// supervisor reaches them with no bearer token, no MCP session and no boundary headers, so the
+/// probe used to assert them must not carry any either.
+fn supervision_probe(address: SocketAddr, path: &str) -> u16 {
+    supervision_probe_opt(address, path)
+        .unwrap_or_else(|| panic!("{path} did not answer on a fresh connection"))
+}
+
+/// Like [`supervision_probe`] but returns `None` when the connection is refused or dropped —
+/// the difference a supervisor actually sees, and the whole subject of
+/// `gateway_readyz_answers_503_on_a_fresh_connection_while_draining`.
+fn supervision_probe_opt(address: SocketAddr, path: &str) -> Option<u16> {
+    use std::io::{Read, Write};
+    let mut stream = StdTcpStream::connect_timeout(&address, Duration::from_secs(5)).ok()?;
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    response.split_whitespace().nth(1)?.parse().ok()
 }
 
 fn unused_loopback_address() -> SocketAddr {
@@ -3657,7 +3691,62 @@ fn gateway_binary_real_bootstrap_mcp_interaction_and_sigterm_acceptance() {
                     durable_counts(after_first)
                 );
             });
-            process.terminate().expect("binary exits after SIGTERM");
+            // Card 15 / ADR-0037 D4: the supervision surface answers on the SAME live process
+            // that just served real MCP traffic, with no credential of any kind.
+            //
+            // 注错: drop `.merge(supervision_routes(..))` from `bins/gateway/src/main.rs` ⇒ the
+            // MCP boundary answers 404 for both paths and these two assertions go red.
+            assert_eq!(
+                supervision_probe(process.address, "/livez"),
+                200,
+                "/livez must answer 200 on a live gateway"
+            );
+            assert_eq!(
+                supervision_probe(process.address, "/readyz"),
+                200,
+                "/readyz must answer 200 once bootstrap completed and the listener is accepting"
+            );
+
+            // ADR-0037 D4, the half that was asserted in prose only: after SIGTERM the process
+            // must keep ACCEPTING long enough for a supervisor that opens a fresh TCP connection
+            // per poll to read `503 draining`. A refused connection here is the failure mode the
+            // 503 exists to rule out — it is indistinguishable from a crash, and Baseline §4.4
+            // tells the supervisor to restart a crash and NOT to restart a drain.
+            //
+            // 注错: delete the `sleep(DRAIN_ANNOUNCE_WINDOW)` from the shutdown future in
+            // `bins/gateway/src/main.rs` ⇒ the accept loop closes in the same instant readiness
+            // flips, every poll below is refused, and this assertion goes red with "connection
+            // refused ... never 503".
+            process
+                .signal_terminate()
+                .expect("SIGTERM to the gateway binary");
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let mut observed: Vec<Option<u16>> = Vec::new();
+            let draining = loop {
+                let seen = supervision_probe_opt(process.address, "/readyz");
+                observed.push(seen);
+                if seen == Some(503) {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(50));
+            };
+            assert!(
+                draining,
+                "/readyz must answer 503 on a FRESH connection while draining; a supervisor                  polling over the pod IP saw {observed:?} instead (None = connection refused,                  which it cannot tell from a crash)"
+            );
+            // /livez keeps answering while the process is still up: "draining" is a readiness
+            // statement, not a liveness one — a supervisor must not restart it for being down.
+            assert_eq!(
+                supervision_probe(process.address, "/livez"),
+                200,
+                "/livez must stay 200 while the process drains"
+            );
+            process
+                .await_clean_exit()
+                .expect("binary exits zero after the drain window");
         },
     );
 }

@@ -966,3 +966,266 @@ fn dispatch_pass_with_no_pending_work_claims_nothing() {
         },
     );
 }
+
+// ---------------------------------------------------------------------------
+// Card 15 / ADR-0037 — graceful shutdown of the distill loop, asserted against the BINARY
+// ---------------------------------------------------------------------------
+
+/// macOS XProtect assesses a freshly linked binary on its first exec (~1 min, sometimes much
+/// longer under load); pay it once, on a run that measures nothing.
+fn warm_binary() {
+    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_humaux-private-worker"))
+        .arg("--warm-up-not-a-mode")
+        .output();
+}
+
+/// The `--distill-serve` environment, minus nothing: `bootstrap()` builds the real BYOK provider
+/// before the loop starts, so every one of its keys has to be present even though this test's
+/// pass never reaches an inference call.
+///
+/// The endpoint is a non-forbidden IP LITERAL, which `ssrf::validate_custom_endpoint` accepts
+/// without any DNS round trip — and nothing ever dials it: the only seeded work belongs to
+/// tenant C, whose route was never admitted, so the pass releases the job at the admission check
+/// (the same path `a_pass_that_distilled_nothing_releases_the_job_instead_of_completing_it`
+/// proves in process with a provider that panics if called).
+fn distill_serve_command(dsn: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_humaux-private-worker"));
+    cmd.env("PRIVATE_WORKER_PG_DSN", dsn)
+        .env(
+            "HUMAUX_PRIVATE_WORKER_CHAT_URL",
+            "https://192.88.99.1/v1/chat/completions",
+        )
+        .env("HUMAUX_PRIVATE_WORKER_PROVIDER_ID", PROVIDER_ID)
+        .env("HUMAUX_PRIVATE_WORKER_MODEL_ID", MODEL_ID)
+        .env("HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS", "5")
+        .env("HUMAUX_PRIVATE_WORKER_KEY_ENV", "HUMAUX_CARD15_TEST_SECRET")
+        .env("HUMAUX_CARD15_TEST_SECRET", "unused-by-this-path")
+        .env(
+            "HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID",
+            EGRESS_PROCESSOR_ID.to_string(),
+        )
+        .env("HUMAUX_PRIVATE_WORKER_REGION", REGION)
+        .env("HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS", "30")
+        .env("HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS", "120")
+        .env("HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH", "16")
+        .env("HUMAUX_PRIVATE_WORKER_DISTILL_BATCH", "8")
+        .env("HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS", "5")
+        .env("HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS", "1");
+    cmd
+}
+
+/// ADR-0037 D3 for the OTHER lease-holding resident worker. The review that produced this test
+/// found the acceptance item ("SIGTERM to each worker mid-poll drains and exits zero without
+/// leaving a claimed job un-released") asserted for the consolidation worker only, while the
+/// distill loop — which settles BOTH an `ops.jobs` lease and a per-tenant `ops.outbox` lease per
+/// pass (ADR-0016 D5) — had no shutdown test at all.
+///
+/// The signal is delivered once the queue shows the loop has really run a pass, so it lands
+/// either inside a pass or in the poll wait; the invariant asserted is the same in both cases
+/// and is read from `ops.jobs`, not from a log.
+///
+/// 注错: move the `shutdown.recv()` arm from the poll wait INTO `distill::dispatch_pass`
+/// (cancel a pass mid-flight) ⇒ a claimed job is left `PROCESSING` with a live lease and the
+/// final assertion goes red naming its job id. Replacing the eagerly installed
+/// `SignalKind::interrupt()` in `Shutdown` with `tokio::signal::ctrl_c()` reddens the
+/// `sigint_...` twin below the same way.
+#[test]
+fn sigterm_mid_serve_drains_and_leaves_no_job_processing_with_a_live_lease() {
+    distill_serve_drains_on(
+        "TERM",
+        "sigterm_mid_serve_drains_and_leaves_no_job_processing_with_a_live_lease",
+    );
+}
+
+/// The Ctrl-C twin: `Shutdown`'s doc promised SIGINT was latched before the first pass, and until
+/// card 15's review it was not — `tokio::signal::ctrl_c()` registers the handler on its first
+/// poll, which happens only after a pass has returned.
+#[test]
+fn sigint_mid_serve_drains_and_leaves_no_job_processing_with_a_live_lease() {
+    distill_serve_drains_on(
+        "INT",
+        "sigint_mid_serve_drains_and_leaves_no_job_processing_with_a_live_lease",
+    );
+}
+
+fn distill_serve_drains_on(signal: &str, test_name: &'static str) {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<DispatchFixture, _>(test_name, |mut handle| {
+        warm_binary();
+        // Tenant C: onboarded, no admitted PRIVATE_DISTILL_TEXT route. Its jobs are claimed and
+        // released without an inference call, which is what keeps this test hermetic.
+        for _ in 0..3 {
+            accept_evidence(&mut handle, 2);
+        }
+        let tenant_id = handle.tenants[2].tenant_id;
+        assert_eq!(jobs_of(&mut handle, 2).len(), 3, "three jobs to claim");
+
+        let dsn = dsn_as_role(&handle.dsn, "role_private_worker");
+        let mut child = distill_serve_command(&dsn)
+            .arg("--distill-serve")
+            .spawn()
+            .expect("spawn humaux-private-worker --distill-serve");
+
+        // Wait until the loop has demonstrably touched the queue (bounded, monotonic).
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let mut ran = false;
+        while std::time::Instant::now() < deadline {
+            let touched: i64 = handle
+                .admin
+                .query_one(
+                    "SELECT count(*) FROM ops.jobs \
+                     WHERE tenant_id = $1 AND (attempt > 0 OR status <> 'PENDING')",
+                    &[&tenant_id],
+                )
+                .expect("read job progress")
+                .get(0);
+            if touched > 0 {
+                ran = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !ran {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the distill loop never ran a pass — this test would assert nothing");
+        }
+
+        let signalled = std::process::Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(child.id().to_string())
+            .status()
+            .expect("send the termination signal");
+        assert!(signalled.success(), "kill -{signal} failed");
+
+        let exit_deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let status = loop {
+            match child.try_wait().expect("poll the worker") {
+                Some(status) => break status,
+                None if std::time::Instant::now() >= exit_deadline => {
+                    let _ = child.kill();
+                    panic!("the distill worker did not exit within 90s of SIG{signal}");
+                }
+                None => std::thread::sleep(Duration::from_millis(100)),
+            }
+        };
+        assert!(
+            status.success(),
+            "a worker drained by SIG{signal} must exit zero, got {status:?} — a non-zero status \
+             means the signal hit its default disposition instead of a handler"
+        );
+
+        let stuck = handle
+            .admin
+            .query(
+                "SELECT job_id FROM ops.jobs \
+                 WHERE tenant_id = $1 AND status = 'PROCESSING' \
+                   AND lease_expires_at > clock_timestamp()",
+                &[&tenant_id],
+            )
+            .expect("read leases");
+        let stuck_ids: Vec<Uuid> = stuck.iter().map(|r| r.get(0)).collect();
+        assert!(
+            stuck.is_empty(),
+            "a drained distill worker left {} job(s) PROCESSING with a live lease only expiry \
+             could free: {stuck_ids:?}",
+            stuck.len()
+        );
+        // The per-tenant ADR-0016 D5 outbox lease must be settled too — the second lease this
+        // loop holds, and the one a mid-pass cancellation would strand.
+        let leased: i64 = handle
+            .admin
+            .query_one(
+                "SELECT count(*) FROM ops.outbox \
+                 WHERE tenant_id = $1 AND lease_expires_at > clock_timestamp()",
+                &[&tenant_id],
+            )
+            .expect("read outbox leases")
+            .get(0);
+        assert_eq!(
+            leased, 0,
+            "a drained distill worker left a live ops.outbox lease behind"
+        );
+    });
+}
+
+/// ADR-0037 D3, the RPC-listener half of `bins/private-worker/src/main.rs`: `--serve-rpc` holds no
+/// lease of its own, so its drain is just "stop accepting and return zero" — but nothing asserted
+/// that it returns at all. Before the eagerly installed handlers landed, a Ctrl-C between `bind`
+/// and the first poll of the `select!` killed this listener by default disposition.
+///
+/// 注错: drop the `() = shutdown.recv()` arm from `serve_rpc`'s `select!` ⇒ the process ignores
+/// the signal and this test fails on the 60s exit deadline.
+#[test]
+fn sigterm_to_the_inference_rpc_listener_exits_zero() {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<DispatchFixture, _>(
+        "sigterm_to_the_inference_rpc_listener_exits_zero",
+        |handle| {
+            warm_binary();
+            // Short `/tmp` path: macOS's temp dir plus a uuid overruns `sockaddr_un.sun_path`.
+            let socket_path = format!("/tmp/hp15-rpc-{}.sock", Uuid::now_v7().simple());
+            let _ = std::fs::remove_file(&socket_path);
+            let dsn = dsn_as_role(&handle.dsn, "role_private_worker");
+            let mut child = distill_serve_command(&dsn)
+                .arg("--serve-rpc")
+                .env("HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH", &socket_path)
+                .env(
+                    "HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID",
+                    own_uid().to_string(),
+                )
+                .spawn()
+                .expect("spawn humaux-private-worker --serve-rpc");
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !std::path::Path::new(&socket_path).exists() {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the RPC listener never bound {socket_path}");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+
+            let signalled = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(child.id().to_string())
+                .status()
+                .expect("send SIGTERM");
+            assert!(signalled.success(), "kill -TERM failed");
+
+            let exit_deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                match child.try_wait().expect("poll the listener") {
+                    Some(status) => break status,
+                    None if std::time::Instant::now() >= exit_deadline => {
+                        let _ = child.kill();
+                        let _ = std::fs::remove_file(&socket_path);
+                        panic!("the RPC listener did not exit within 60s of SIGTERM");
+                    }
+                    None => std::thread::sleep(Duration::from_millis(100)),
+                }
+            };
+            let _ = std::fs::remove_file(&socket_path);
+            assert!(
+                status.success(),
+                "a drained RPC listener must exit zero, got {status:?}"
+            );
+        },
+    );
+}
+
+/// This process's uid, read from a file it just created — the peer-credential value
+/// `--serve-rpc` expects its caller to have (§4.2 / ADR-0037 D6). This test never dials the
+/// socket, so the value only has to parse; taking the real one keeps the environment honest
+/// without linking `libc` for one call.
+fn own_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    let marker = std::env::temp_dir().join(format!("hp15-uid-{}", Uuid::now_v7().simple()));
+    std::fs::write(&marker, b"").expect("write the uid marker file");
+    let uid = std::fs::metadata(&marker)
+        .expect("stat the uid marker file")
+        .uid();
+    let _ = std::fs::remove_file(&marker);
+    uid
+}

@@ -35,5 +35,5 @@ serde_json = "1"
 # Matches `crates/adapters`/`crates/local-secret-scan`'s existing sha2 0.11 pin — no second
 # independent version in the dependency graph.
 sha2 = "0.11"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 uuid = { version = "1.25.0", features = ["v7", "serde"] }

@@ -19,7 +19,7 @@ workspace = true
 humaux-adapters = { path = "../../crates/adapters" }
 humaux-application = { path = "../../crates/application" }
 humaux-domain = { path = "../../crates/domain" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 # `sqlx::types::Uuid` (what `consolidate_repo`'s functions take) is the literal `uuid::Uuid`
 # re-export (`crates/adapters/Cargo.toml`'s own doc comment on the H3 sqlx feature flags says
 # so) — pinning the same version directly lets this binary build/pass ids without depending on

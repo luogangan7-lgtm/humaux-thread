@@ -1116,3 +1116,282 @@ fn run_once_binary_exits_zero_promptly_with_no_input() {
         },
     );
 }
+
+// ---------------------------------------------------------------------------
+// Card 15 / ADR-0037 — readiness and graceful shutdown, asserted against the BINARY
+// ---------------------------------------------------------------------------
+
+/// macOS XProtect assesses a freshly linked binary on its first exec (~1 min, sometimes much
+/// longer under load). Every test below spawns `humaux-consolidation-worker` under a deadline,
+/// so pay that cost once, up front, on a run that measures nothing.
+fn warm_binary() {
+    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_humaux-consolidation-worker"))
+        .arg("--warm-up-not-a-mode")
+        .env_clear()
+        .output();
+}
+
+/// Short `/tmp` socket path — the same convention `tests/consolidation_hop_e2e.rs` uses, and
+/// for the same reason: macOS's `std::env::temp_dir()` (`/var/folders/…/T/`) plus a uuid
+/// overruns `sockaddr_un.sun_path` (SUN_LEN, 104 bytes) and `bind` fails with InvalidInput.
+fn socket_path(tag: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/tmp/hc15-{tag}-{}.sock", Uuid::now_v7().simple()))
+}
+
+/// The `--serve` environment card 14's `run_once_binary_exits_zero_promptly_with_no_input`
+/// established, plus the two keys resident mode adds. `socket_path` is the ONLY thing the two
+/// card-15 tests vary.
+fn serve_command(dsn: &str, socket_path: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_humaux-consolidation-worker"));
+    cmd.env("CONSOLIDATION_WORKER_PG_DSN", dsn)
+        .env("HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH", socket_path)
+        .env("HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS", "5")
+        .env("HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS", "5")
+        .env("HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS", "120")
+        .env("HUMAUX_CONSOLIDATION_WORKER_BATCH", "16")
+        .env("HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS", "1000")
+        .env("HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS", "5")
+        .env("HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS", "1");
+    cmd
+}
+
+/// (10) ADR-0037 D1: `--readyz` probes its dependencies LIVE and, when one is down, exits
+/// non-zero having NAMED it — never a bare failure and never a healthy-looking zero (§4.4 坑5
+/// applied to readiness). Both directions are asserted in one test so a probe that always
+/// passes and a probe that always fails are equally red.
+///
+/// 注错: drop the `UnixStream::connect` arm from `readyz()` (leave only the DB connect) ⇒ the
+/// first half goes green when it must be red, and this test names the socket that was not
+/// probed.
+#[test]
+fn readyz_binary_probes_its_uds_peer_and_names_it_when_down() {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<DispatchFixture, _>(
+        "readyz_binary_probes_its_uds_peer_and_names_it_when_down",
+        |handle| {
+            warm_binary();
+            let dsn = dsn_as_role(&handle.dsn, "role_consolidation_worker");
+
+            // (a) peer down: named, non-zero.
+            let down = serve_command(&dsn, "/nonexistent/humaux-card15-readyz.sock")
+                .arg("--readyz")
+                .output()
+                .expect("spawn --readyz with a dead peer");
+            let stderr = String::from_utf8_lossy(&down.stderr).to_string();
+            assert!(
+                !down.status.success(),
+                "--readyz must fail when its UDS peer is down: stderr={stderr}"
+            );
+            assert!(
+                stderr.contains("missing object") && stderr.contains("inference RPC socket"),
+                "a failed readiness probe must NAME the object that is down: stderr={stderr}"
+            );
+
+            // (b) peer up: exit zero. A bare listener is enough — readiness dials and drops,
+            // it never sends a request.
+            let socket_path = socket_path("readyz");
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+                .expect("bind the stand-in private-worker socket");
+            let accepting = std::thread::spawn(move || {
+                // One accept is all readiness makes; the thread ends with the test.
+                let _ = listener.accept();
+            });
+            let up = serve_command(&dsn, &socket_path.to_string_lossy())
+                .arg("--readyz")
+                .output()
+                .expect("spawn --readyz with a live peer");
+            let _ = accepting.join();
+            let _ = std::fs::remove_file(&socket_path);
+            assert!(
+                up.status.success(),
+                "--readyz must exit zero when every dependency answers: stderr={}",
+                String::from_utf8_lossy(&up.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&up.stdout).contains("ready"),
+                "stdout={}",
+                String::from_utf8_lossy(&up.stdout)
+            );
+        },
+    );
+}
+
+/// (10b) ADR-0037 D2, the dependency the down-path never exercised: PostgreSQL itself. The DSN
+/// points at a loopback port that was bound and released, so the connect is genuinely refused —
+/// a real absence, not a mock, and not the shared fixture container every other suite on this
+/// machine needs left running. The DB is probed FIRST, so naming it here also proves the arm at
+/// `readyz()`'s `ConsolidationDbPool::connect` actually runs.
+///
+/// Needs no database, which is the point: there is nothing listening on that port either way.
+///
+/// 注错: drop the `?` on `ConsolidationDbPool::connect` in `readyz()` ⇒ the probe exits zero
+/// against a dead database and this goes red.
+#[test]
+fn readyz_binary_names_postgresql_when_the_database_is_down() {
+    warm_binary();
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+        let port = listener.local_addr().expect("reserved port").port();
+        drop(listener);
+        port
+    };
+    let dsn = format!(
+        "postgres://role_consolidation_worker:devlocal_role_consolidation_worker@127.0.0.1:{dead}/humaux_thread_dev"
+    );
+    let output = serve_command(&dsn, "/nonexistent/humaux-card15-readyz.sock")
+        .arg("--readyz")
+        .output()
+        .expect("spawn --readyz against a dead database");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "--readyz must fail when PostgreSQL is down: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("missing object")
+            && stderr.contains("PostgreSQL as role_consolidation_worker"),
+        "a failed readiness probe must NAME the object that is down: stderr={stderr}"
+    );
+}
+
+/// (11) ADR-0037 D3, the card's acceptance item asserted against the BINARY and then against
+/// SQL: SIGTERM delivered while a pass is genuinely in flight must drain and exit ZERO, leaving
+/// no job `PROCESSING` with a live lease that only expiry could free.
+///
+/// "In flight" is made deterministic rather than hoped for: the stand-in private-worker socket
+/// ACCEPTS the connection and then never answers, so the claimed job sits in the §11.8 inference
+/// hop until `HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS` elapses. The test waits until
+/// `ops.jobs` actually shows `PROCESSING` — i.e. the claim has happened — and only then signals.
+///
+/// 注错: move the `shutdown.recv()` arm from the poll wait INTO the pass (cancel `dispatch_pass`
+/// mid-flight) ⇒ the claimed job is left `PROCESSING` with a live lease and the final assertion
+/// goes red, naming the job id.
+#[test]
+fn sigterm_mid_pass_drains_and_leaves_no_job_processing_with_a_live_lease() {
+    drain_mid_pass_leaves_no_live_lease(
+        "TERM",
+        "sigterm_mid_pass_drains_and_leaves_no_job_processing_with_a_live_lease",
+    );
+}
+
+/// (11b) The SAME invariant for Ctrl-C, which `Shutdown`'s doc claims is latched before the
+/// first pass. It was not: `tokio::signal::ctrl_c()` is an `async fn` that registers SIGINT on
+/// its FIRST POLL, and the first poll happens in the `select!` AFTER a pass returns — so a
+/// Ctrl-C during the first pass hit SIGINT's default disposition and killed the worker holding a
+/// claimed job, which is exactly the state card 15 forbids.
+///
+/// 注错: put `_ = tokio::signal::ctrl_c() => {}` back in place of the eagerly installed
+/// `SignalKind::interrupt()` stream in `Shutdown` ⇒ the worker is killed mid-pass, exits
+/// non-zero, and leaves the claimed job `PROCESSING` with a live lease: two assertions red.
+#[test]
+fn sigint_mid_pass_drains_and_leaves_no_job_processing_with_a_live_lease() {
+    drain_mid_pass_leaves_no_live_lease(
+        "INT",
+        "sigint_mid_pass_drains_and_leaves_no_job_processing_with_a_live_lease",
+    );
+}
+
+fn drain_mid_pass_leaves_no_live_lease(signal: &str, test_name: &'static str) {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<DispatchFixture, _>(test_name, |mut handle| {
+        warm_binary();
+        seed_memory(&mut handle, 0);
+        assert_eq!(job_ids(&mut handle, 0).len(), 1, "one job to claim");
+        let tenant_id = handle.tenants[0].tenant_id;
+
+        let socket_path = socket_path("sigterm");
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("bind the stand-in private-worker socket");
+        // Accept and hold: the worker's inference hop blocks here until its call TTL, which
+        // is the window this test needs the signal to land in.
+        let stalling = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                held.push(stream);
+                if held.len() > 8 {
+                    break;
+                }
+            }
+        });
+
+        let dsn = dsn_as_role(&handle.dsn, "role_consolidation_worker");
+        let mut child = serve_command(&dsn, &socket_path.to_string_lossy())
+            .arg("--serve")
+            .spawn()
+            .expect("spawn humaux-consolidation-worker --serve");
+
+        // Wait for the claim to actually have happened (bounded, monotonic).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut claimed = false;
+        while std::time::Instant::now() < deadline {
+            let processing: i64 = handle
+                .admin
+                .query_one(
+                    "SELECT count(*) FROM ops.jobs \
+                         WHERE tenant_id = $1 AND status = 'PROCESSING'",
+                    &[&tenant_id],
+                )
+                .expect("read job status")
+                .get(0);
+            if processing > 0 {
+                claimed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            claimed,
+            "the worker never claimed the seeded job — this test would assert nothing"
+        );
+
+        // The signal, mid-pass by construction.
+        let signalled = std::process::Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(child.id().to_string())
+            .status()
+            .expect("send the termination signal");
+        assert!(signalled.success(), "kill -{signal} failed");
+
+        // Drain must complete well inside the call TTL plus one poll interval; the deadline
+        // is generous but bounded, so a worker that ignores SIGTERM fails rather than hangs.
+        let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let status = loop {
+            match child.try_wait().expect("poll the worker") {
+                Some(status) => break status,
+                None if std::time::Instant::now() >= exit_deadline => {
+                    let _ = child.kill();
+                    panic!("the worker did not exit within 90s of SIG{signal}");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        };
+        drop(stalling);
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            status.success(),
+            "a worker drained by SIG{signal} must exit zero, got {status:?} — a non-zero \
+                 status here means the signal hit its default disposition instead of a handler"
+        );
+
+        // The invariant this card exists for, read from the database and not from a log.
+        let stuck = handle
+            .admin
+            .query(
+                "SELECT job_id, status, lease_owner FROM ops.jobs \
+                     WHERE tenant_id = $1 AND status = 'PROCESSING' \
+                       AND lease_expires_at > clock_timestamp()",
+                &[&tenant_id],
+            )
+            .expect("read leases");
+        let stuck_ids: Vec<Uuid> = stuck.iter().map(|r| r.get(0)).collect();
+        assert!(
+            stuck.is_empty(),
+            "a drained worker left {} job(s) PROCESSING with a live lease only expiry could \
+                 free: {stuck_ids:?}",
+            stuck.len()
+        );
+    });
+}

@@ -321,30 +321,17 @@ async fn probe_qdrant(
 }
 
 /// `sha256:`-prefixed digest of the scanned scope (§4.4: "两次结果只有 scope_hash 相同才可
-///比") — `cell_id` + the sorted resource-name set this run actually scanned.
+///比") — `cell_id` + the sorted resource-name set this run actually scanned. The digest itself
+/// is [`crate::probe::scope_hash`], shared with every other probe so two probes can never
+/// disagree on how a scope is hashed; this function only builds the canonical string.
 fn scope_hash(cell_id: CellId, resources: &[&str]) -> String {
-    use sha2::{Digest, Sha256};
     let mut sorted = resources.to_vec();
     sorted.sort_unstable();
-    let canonical = format!(
+    crate::probe::scope_hash(&format!(
         "cell.resources|cell_id={}|resources={}",
         cell_id.0,
         sorted.join(",")
-    );
-    let digest: [u8; 32] = Sha256::digest(canonical.as_bytes()).into();
-    format!(
-        "sha256:{}",
-        digest
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    )
-}
-
-fn now_rfc3339() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "unavailable".to_string())
+    ))
 }
 
 /// `q cell.resources` — returns the process exit code (module doc's fail-closed contract).
@@ -402,7 +389,7 @@ pub fn run() -> i32 {
         "value": value,
         "scanned_n": probed_resources.len(),
         "scope_hash": scope_hash(cell_id, &probed_resources),
-        "checked_at": now_rfc3339(),
+        "checked_at": crate::probe::now_rfc3339(),
         "probe_version": PROBE_VERSION,
         "resources": [report.to_json()],
     });

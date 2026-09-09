@@ -9,7 +9,13 @@
 //! * `--run-once`: ONE bounded cross-tenant dispatch pass, then exit — including when there was
 //!   nothing to claim (before ADR-0036 this flag looped forever on an env-pinned pair and never
 //!   exited on an empty tenant, which is what the deployment report flagged).
-//! * `--serve`: the same pass on `HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS` until killed.
+//! * `--serve`: the same pass on `HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS` until a
+//!   termination signal arrives ([`Shutdown`]).
+//! * `--readyz`: card 15 / ADR-0037 probe-based readiness — ONE live round trip to each
+//!   dependency this process cannot work without, then exit. Tenant-free by construction
+//!   (ADR-0036 left no tenant/domain/binding id in this environment): "can I claim at all",
+//!   never "is tenant X's pair healthy". Uses no configuration key the process does not
+//!   already need for `--serve`.
 //!
 //! ADR-0036 (card 14): there is no tenant id, reasoning domain, or route binding in this
 //! binary's environment any more. `role_consolidation_worker`'s RLS session context is still set
@@ -48,7 +54,7 @@ fn parse<T: std::str::FromStr>(name: &str) -> Result<T, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: humaux-consolidation-worker (--probe-connection | --run-once | --serve)"
+    "usage: humaux-consolidation-worker (--probe-connection | --readyz | --run-once | --serve)"
 }
 
 #[tokio::main]
@@ -63,6 +69,13 @@ async fn main() -> ExitCode {
             probe_connection().await;
             ExitCode::SUCCESS
         }
+        Some("--readyz") => match readyz().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(missing) => {
+                eprintln!("humaux-consolidation-worker: not ready — missing object: {missing}");
+                ExitCode::from(2)
+            }
+        },
         Some(mode @ ("--run-once" | "--serve")) => match dispatch_mode(mode == "--serve").await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -128,6 +141,7 @@ async fn dispatch_mode(resident: bool) -> Result<(), String> {
     let pool = ConsolidationDbPool::connect(&dsn)
         .await
         .map_err(|e| format!("consolidation worker database role connection failed: {e}"))?;
+    let mut shutdown = Shutdown::install()?;
 
     loop {
         let report = dispatch_pass(
@@ -167,6 +181,82 @@ async fn dispatch_mode(resident: bool) -> Result<(), String> {
         let Some(interval) = poll_interval else {
             return Ok(());
         };
-        tokio::time::sleep(interval).await;
+        // Card 15 / ADR-0037: the signal is only ever observed BETWEEN passes. A pass settles
+        // every job it claimed before it returns (card 14's leases), so exiting here can never
+        // leave a job PROCESSING with a live lease that only expiry could free — whereas
+        // cancelling a pass mid-flight could. The cost is that shutdown latency is bounded by
+        // one pass, not by the signal: the supervisor's grace period must exceed one pass
+        // (docs/ops/supervision.md).
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            () = shutdown.recv() => {
+                eprintln!("humaux-consolidation-worker: signal received between passes, exiting");
+                return Ok(());
+            }
+        }
     }
+}
+
+/// SIGTERM/Ctrl-C, as one awaitable. Both handlers are installed HERE, before the first pass —
+/// which is the whole point of the type. `tokio::signal::ctrl_c()` cannot be used for the SIGINT
+/// half: it is an `async fn` whose body registers the handler on its FIRST POLL, and the first
+/// poll only happens inside [`Self::recv`], i.e. after a pass has already returned. A Ctrl-C
+/// during that first pass would then hit SIGINT's default disposition and kill the process
+/// mid-pass, leaving exactly the `ops.jobs` row `PROCESSING` with a live lease this card
+/// forbids. Registering `SignalKind::interrupt()` eagerly, next to `terminate`, is what makes
+/// the doc claim true for both signals.
+struct Shutdown {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Shutdown {
+    fn install() -> Result<Self, String> {
+        Ok(Self {
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|e| format!("cannot install the SIGTERM handler: {e}"))?,
+            #[cfg(unix)]
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|e| format!("cannot install the SIGINT handler: {e}"))?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// `--readyz`: one live round trip per dependency, in start order (a dependency that is down
+/// is named, never collapsed into a bare non-zero exit — §4.4 坑5 applied to readiness).
+///
+/// 1. `role_consolidation_worker` connects AND `current_user` matches (§6.2.3 assertion E) —
+///    which is also the only "can I claim" statement this process can make without actually
+///    claiming: `ops.claim_derived_work` is a SECURITY DEFINER *write* (migration 0164), so
+///    calling it as a probe would take a real job off the queue and hand it to a process that
+///    is about to exit. Connectivity + role identity is the readable half; the callable half is
+///    proven by the first real pass.
+/// 2. The private worker's UDS peer accepts a connection — the §11.8 hop every claimed
+///    USER_REASONING job must make. Dialled and immediately dropped: no request is sent.
+async fn readyz() -> Result<(), String> {
+    let dsn = required("CONSOLIDATION_WORKER_PG_DSN")?;
+    ConsolidationDbPool::connect(&dsn)
+        .await
+        .map_err(|e| format!("PostgreSQL as role_consolidation_worker ({e})"))?;
+    let socket_path = required("HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH")?;
+    tokio::net::UnixStream::connect(&socket_path)
+        .await
+        .map_err(|e| format!("the private worker's inference RPC socket at {socket_path} ({e})"))?;
+    println!(
+        "humaux-consolidation-worker: ready db=role_consolidation_worker rpc_peer={socket_path}"
+    );
+    Ok(())
 }

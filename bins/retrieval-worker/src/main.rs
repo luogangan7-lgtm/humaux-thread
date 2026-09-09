@@ -5,6 +5,10 @@
 //! `bins/public-worker/src/main.rs`'s pattern (`required`/`parse`, one Qdrant
 //! `IntraCellResource` entry, `--run-once` flag), extended with the Postgres/Qdrant/embedder
 //! config `run_once` needs.
+//!
+//! Card 15 / ADR-0037 adds `--readyz` (one live round trip to each dependency this process
+//! cannot work without — see [`readyz`]) and graceful SIGTERM/Ctrl-C shutdown for `--serve-rpc`
+//! (axum's `with_graceful_shutdown`: the accept loop stops, in-flight embedding calls finish).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,8 +28,9 @@ use humaux_domain::egress::ProcessorId;
 use humaux_domain::error::ErrorCode;
 use humaux_domain::ids::TenantId;
 use humaux_infra_cell::{
-    CallerId, CellAccessPermit, CellId, HttpIntraCellTransport, IntraCellResource,
-    IntraCellResourceRegistry, ResourceEntry, authorize_cell_access,
+    CallerId, CellAccessPermit, CellId, HttpIntraCellTransport, IntraCellHttpTransport,
+    IntraCellMethod, IntraCellRequest, IntraCellResource, IntraCellResourceRegistry, ResourceEntry,
+    authorize_cell_access,
 };
 use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig, SealedRetrievalCard};
 use humaux_projection::serving::StreamFamily;
@@ -45,7 +50,7 @@ fn parse<T: std::str::FromStr>(name: &str) -> Result<T, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: humaux-retrieval-worker (--run-once | --serve-rpc)"
+    "usage: humaux-retrieval-worker (--readyz | --run-once | --serve-rpc)"
 }
 
 /// Local wrapper making a real [`EmbeddingProvider`] satisfy [`CardEmbedder`] — see that
@@ -104,10 +109,54 @@ async fn run() -> Result<(), Outcome> {
         return Err(Outcome::Failed(usage().to_owned()));
     }
     match args[0].as_str() {
+        "--readyz" => readyz().await,
         "--run-once" => run_once_mode().await,
         "--serve-rpc" => rpc_mode::run().await,
         _ => Err(Outcome::Failed(usage().to_owned())),
     }
+}
+
+/// `--readyz`: one live round trip per dependency this process cannot work without, each named
+/// when it is down (§4.4 坑5 applied to readiness — "unreachable" is never reported as a
+/// healthy-but-empty reading). Uses no configuration key `--run-once`/`--serve-rpc` do not
+/// already need.
+///
+/// 1. `role_retrieval_worker` connects AND `current_user` matches (§6.2.3 assertion E).
+/// 2. The Qdrant §83.4 Layer 1B cell resource answers a real HTTP call, made through the SAME
+///    registry/permit/transport the projection path uses — not a bare TCP dial, so a
+///    misconfigured CIDR or caller allowlist shows up here rather than at the first write.
+async fn readyz() -> Result<(), Outcome> {
+    let dsn = required("HUMAUX_RETRIEVAL_WORKER_PG_DSN")?;
+    RetrievalWorkerDbPool::connect(&dsn).await.map_err(|e| {
+        Outcome::Failed(format!(
+            "not ready — missing object: PostgreSQL as role_retrieval_worker ({e})"
+        ))
+    })?;
+    let (permit, transport) = build_cell_access().await?;
+    let status = transport
+        .execute(
+            &permit,
+            IntraCellRequest {
+                method: IntraCellMethod::Get,
+                path: "/".to_owned(),
+                json_body: None,
+                headers: Vec::new(),
+            },
+        )
+        .await
+        .map_err(|e| {
+            Outcome::Failed(format!(
+                "not ready — missing object: the Qdrant cell resource ({e:?})"
+            ))
+        })?
+        .status;
+    if status >= 500 {
+        return Err(Outcome::Failed(format!(
+            "not ready — missing object: the Qdrant cell resource answered {status}"
+        )));
+    }
+    println!("humaux-retrieval-worker: ready db=role_retrieval_worker qdrant_status={status}");
+    Ok(())
 }
 
 async fn run_once_mode() -> Result<(), Outcome> {
@@ -352,12 +401,38 @@ mod rpc_mode {
             format!("failed to bind retrieval embedding RPC socket {socket_path}: {error}")
         })?;
         eprintln!("humaux-retrieval-worker RPC listening on {socket_path}");
+        // Card 15 / ADR-0037: same graceful pattern the gateway has had. This listener holds no
+        // lease, so "drain" here means exactly what axum's shutdown does — stop accepting, let
+        // in-flight embedding calls finish, then return zero.
+        // Both handlers are registered HERE, before `axum::serve` is even constructed:
+        // `tokio::signal::ctrl_c()` would only register SIGINT on the shutdown future's first
+        // poll (inside `serve`), so a Ctrl-C arriving between `bind` and that first poll would
+        // hit SIGINT's default disposition and kill the listener without draining.
+        #[cfg(unix)]
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|e| format!("cannot install the SIGTERM handler: {e}"))?;
+        #[cfg(unix)]
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|e| format!("cannot install the SIGINT handler: {e}"))?;
+        let shutdown = async move {
+            #[cfg(unix)]
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            #[cfg(not(unix))]
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("humaux-retrieval-worker: signal received, RPC listener draining");
+        };
         axum::serve(
             listener,
             router(state)
                 .into_make_service_with_connect_info::<humaux_retrieval_worker::rpc::PeerIdentity>(
                 ),
         )
+        .with_graceful_shutdown(shutdown)
         .await
         .map_err(|error| format!("retrieval embedding RPC server failed: {error}"))?;
         Ok(())

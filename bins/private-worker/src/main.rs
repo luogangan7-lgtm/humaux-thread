@@ -17,6 +17,9 @@
 //!   pair `bins/consolidation-worker/tests/consolidation_hop_e2e.rs` proves in-process, so
 //!   the tests cover the accept loop production runs. Provider identity/endpoint/capabilities
 //!   are configuration (§78.1: no literal model, endpoint, or dimension in code).
+//! * `--readyz`: card 15 / ADR-0037 probe-based readiness — see [`readyz`]. Tenant-free
+//!   (ADR-0036) and provider-free: it deliberately makes NO inference call, because a readiness
+//!   probe that burns a paid provider round trip is a probe nobody dares to poll.
 //! * `--distill-once` / `--distill-serve` (ADR-0016, cross-tenant since ADR-0036): one bounded
 //!   pass / a resident loop of [`humaux_private_worker::distill::dispatch_pass`] — same
 //!   provider/config bootstrap as `--serve-rpc` ([`bootstrap`]). There is no tenant id or
@@ -54,7 +57,7 @@ fn parse<T: std::str::FromStr>(name: &str) -> Result<T, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: humaux-private-worker (--probe-connection | --serve-rpc | --distill-once | --distill-serve)"
+    "usage: humaux-private-worker (--probe-connection | --readyz | --serve-rpc | --distill-once | --distill-serve)"
 }
 
 #[tokio::main]
@@ -65,6 +68,13 @@ async fn main() -> ExitCode {
             probe_connection().await;
             ExitCode::SUCCESS
         }
+        Some("--readyz") => match readyz().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(missing) => {
+                eprintln!("humaux-private-worker: not ready — missing object: {missing}");
+                ExitCode::from(2)
+            }
+        },
         Some(mode @ ("--serve-rpc" | "--distill-once" | "--distill-serve")) => {
             let outcome = match mode {
                 "--serve-rpc" => serve_rpc().await,
@@ -99,6 +109,65 @@ async fn probe_connection() {
             Ok(_pool) => println!("humaux-private-worker: connected as role_private_worker"),
             Err(e) => eprintln!("humaux-private-worker: {e}"),
         },
+    }
+}
+
+/// `--readyz`: one live round trip to the ONE dependency this process cannot work without —
+/// `role_private_worker` connects AND `current_user` matches (§6.2.3 assertion E). A dependency
+/// that is down is NAMED, never collapsed into a bare non-zero exit (§4.4 坑5 applied to
+/// readiness).
+///
+/// Deliberately not probed here, each for a reason readiness cannot argue away:
+/// * the provider endpoint — a readiness poll must not spend a BYOK inference call, and §11.4's
+///   SSRF choke point already refuses a bad endpoint at `bootstrap()`, i.e. at start, not here;
+/// * this process's own RPC socket — it is the SERVER of that socket (`--serve-rpc` binds it),
+///   so "can I connect to it" is a statement about the previous process generation, not this
+///   one. The consolidation worker's `--readyz` is what asserts that peer is up, from the side
+///   that actually dials it.
+async fn readyz() -> Result<(), String> {
+    let dsn = required("PRIVATE_WORKER_PG_DSN")?;
+    PrivateWorkerDbPool::connect(&dsn)
+        .await
+        .map_err(|e| format!("PostgreSQL as role_private_worker ({e})"))?;
+    println!("humaux-private-worker: ready db=role_private_worker");
+    Ok(())
+}
+
+/// SIGTERM/Ctrl-C, as one awaitable. Both handlers are installed HERE, before the first pass —
+/// which is the whole point of the type. `tokio::signal::ctrl_c()` cannot be used for the SIGINT
+/// half: it is an `async fn` whose body registers the handler on its FIRST POLL, and the first
+/// poll only happens inside [`Self::recv`], i.e. after a pass has already returned. A Ctrl-C
+/// during that first pass would then hit SIGINT's default disposition and kill the process
+/// mid-pass, leaving exactly the `ops.jobs` row `PROCESSING` with a live lease this card
+/// forbids. Registering `SignalKind::interrupt()` eagerly, next to `terminate`, is what makes
+/// the doc claim true for both signals.
+struct Shutdown {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Shutdown {
+    fn install() -> Result<Self, String> {
+        Ok(Self {
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|e| format!("cannot install the SIGTERM handler: {e}"))?,
+            #[cfg(unix)]
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|e| format!("cannot install the SIGINT handler: {e}"))?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -242,9 +311,20 @@ async fn serve_rpc() -> Result<(), String> {
         format!("failed to bind private inference RPC socket {socket_path}: {error}")
     })?;
     eprintln!("humaux-private-worker RPC listening on {socket_path}");
-    serve(listener, state)
-        .await
-        .map_err(|error| format!("private inference RPC server failed: {error}"))
+    let mut shutdown = Shutdown::install()?;
+    // This listener holds no lease of its own: a call cut short by shutdown fails the caller's
+    // inference hop, and the consolidation worker settles that job's lease on its own side
+    // (card 14) rather than leaving it PROCESSING. So dropping the accept loop IS the drain
+    // here — there is no in-process state a longer wait would settle.
+    tokio::select! {
+        result = serve(listener, state) => {
+            result.map_err(|error| format!("private inference RPC server failed: {error}"))
+        }
+        () = shutdown.recv() => {
+            eprintln!("humaux-private-worker: signal received, RPC listener closing");
+            Ok(())
+        }
+    }
 }
 
 /// ADR-0016 `--distill-once` (one bounded cross-tenant pass, then exit — `claimed == 0` exits
@@ -276,6 +356,7 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
         config,
         provider,
     } = bootstrap().await?;
+    let mut shutdown = Shutdown::install()?;
     loop {
         let report = match distill::dispatch_pass(
             &pool,
@@ -290,7 +371,15 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
             // on the next poll; `--distill-once` still surfaces it as the exit status.
             Err(error) if poll_interval.is_some() => {
                 eprintln!("humaux-private-worker: distill dispatch pass failed: {error}");
-                tokio::time::sleep(poll_interval.unwrap_or_default()).await;
+                // Same interruptible wait as the success path below — a failing pass must not
+                // make the process deaf to SIGTERM for a whole poll interval.
+                tokio::select! {
+                    () = tokio::time::sleep(poll_interval.unwrap_or_default()) => {}
+                    () = shutdown.recv() => {
+                        eprintln!("humaux-private-worker: signal received after a failed pass, exiting");
+                        return Ok(());
+                    }
+                }
                 continue;
             }
             Err(error) => return Err(format!("distill dispatch pass failed: {error}")),
@@ -312,6 +401,16 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
         let Some(interval) = poll_interval else {
             return Ok(());
         };
-        tokio::time::sleep(interval).await;
+        // Card 15 / ADR-0037: observed only BETWEEN passes — a pass settles every job and every
+        // outbox row it claimed before returning (ADR-0016 D5 leases), so exiting here cannot
+        // leave one PROCESSING with a live lease. Shutdown latency is therefore bounded by one
+        // pass; the supervisor's grace period must exceed it (docs/ops/supervision.md).
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            () = shutdown.recv() => {
+                eprintln!("humaux-private-worker: signal received between passes, exiting");
+                return Ok(());
+            }
+        }
     }
 }

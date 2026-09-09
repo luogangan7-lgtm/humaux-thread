@@ -884,6 +884,39 @@ Adapters depend on Domain; Domain does not depend on Adapters.
 
 **目录例外，恰好 1 条**：`humaux-admin q mechanism.registry --render`（§1.14 的人读渲染入口）不是探针 —— 它不回答「有几条」，不产出 `{value, scanned_n, …}`，只把 `mechanism-registry` 围栏渲染成 markdown 表。它不在上表内、不受本节统一输出契约约束。除这一条外，`humaux-admin q` 的子命令集合必须与上表逐名相等，多一条少一条都红。
 
+**探针的第三态由类型承载（card 15 / ADR-0037）**：一条探针只有两种结局 —— 够到了对象并给出
+读数，或够不到并**点名缺的那一个对象**。实现上 `bins/admin/src/probe.rs` 的 `ProbeOutcome`
+是二值枚举，`MissingObject` 分支**没有 `value` 字段**，所以「够不到却报了个 0」在那个模块里
+写不出来；`Reading` 分支的 `scanned_n > 0` 由该模块的注错测试逐条守住。目录 11 条今天
+`cell.resources` 与 `deploy.binary` 两条接线，其余 9 条各自点名自己缺的对象（列未建 / 本进程
+无读能力 / 该计数根本没有进程外存储），解锁条件逐条记在 ADR-0037 —— 那 9 条**不是占位**，是
+本节自己规定的正确答案。
+
+**`deploy.binary` 的 sha 是编译期烧进去的，不是运行期读的**：运行期读环境变量意味着「换个变量
+就自称是另一个版本」，那正是坑4 要抓的「名与实对不上」本身。没烧进去时本探针拒绝作答，而不是
+印 `"unknown"` —— 一条永远答得出的 `deploy.binary` 比没有这条探针更坏。 烧进去这件事由
+`bins/admin/build.rs` 负责（环境没给 `HUMAUX_BUILD_GIT_SHA` 时用 `git rev-parse HEAD` 兜底，
+发布构建显式传入的值优先）—— 在它之前仓库里没有任何构建设过这个变量，于是本节声称 live 的探针
+在每一次 gate 里实测都走 `MissingObject`：**契约写了 live，实测是 missing，就是名与实对不上**。
+
+**存活/就绪与监管契约（§4.2 五进程）**：`humaux-gateway` 出 `GET /livez` 与 `GET /readyz`
+（收到终止信号后 `/readyz` 先转 503，**并继续 accept 一个排空窗口（5 s，`DRAIN_ANNOUNCE_WINDOW`）**
+再停止 accept，让监管方分得清「正在排空」与「进程没了」——监管方每次探测都新开一条 TCP 连接，
+两件事若同时发生，它只会收到 ECONNREFUSED，503 那条分支对它永远不可达；因此**就绪探测周期必须
+短于该窗口，而 SIGTERM→SIGKILL 宽限期必须长于该窗口加最长在途请求**）；
+四个 worker 各出 `--readyz`，对**每一个它离不开的依赖各做一次真实往返**后退出，依赖挂了就点名
+并非零退出。就绪探针**一律不认领、不写、不花 provider 调用**——`ops.claim_derived_work` 是
+SECURITY DEFINER 写（migration 0164），拿它当探针等于把真活交给一个正要退出的进程。两个常驻
+derived worker 的 SIGTERM 只在**两趟 pass 之间**被观察：一趟 pass 返回前会结清它认领的每一个
+job（card 14 / ADR-0016 的租约），所以在这里退出永远不会留下「PROCESSING + 活租约、只有过期能
+解」的行。代价是关停延迟以一趟 pass 为界，监管方的宽限期必须大于一趟 pass —— 运维细则见
+`docs/ops/supervision.md`。
+
+**四个 OS 用户是硬要求**：两条 UDS 都用内核 peer credential 认「调用进程」而非请求体
+（retrieval-worker 校 `expected_gateway_uid`，private-worker 校 `expected_consolidation_uid`）。
+gateway / retrieval-worker / private-worker / consolidation-worker 四者中任意两个共用 uid，那道
+校验就变成拿自己比自己 —— 它不会报错，只是**静默地不再是一道校验**。四者必须各自独立 OS 用户。
+
 验收：迁移后 90 天内，容器内即时解释器与临时 SQL 的使用降到 **≤3 次/日**（按运维日志中 `sh -c` + `psql -c` 计数）。未降下来判定为**目录缺项**，处理动作是把当次的临时查询登记为新探针，不是放宽阈值。
 
 ---
