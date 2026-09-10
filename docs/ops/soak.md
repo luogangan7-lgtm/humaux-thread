@@ -1,0 +1,285 @@
+# Soak runbook — `cargo xtask soak`
+
+> Scope: the endurance + crash-recovery harness (card 16, ADR-0038). The process-lifecycle half
+> — start order, probes, restart policy, drain windows — is `docs/ops/supervision.md`
+> (ADR-0037) and this file assumes it. Spec § numbers are references, never copies.
+
+## 1. What a soak run is
+
+Continuous concurrent load against the **real** four-process deployment, for a stated duration,
+while a chaos hook kills and restarts a worker — then a drain, then one verdict per assertion.
+
+The harness **starts nothing**. Bring the deployment up first (supervision runbook §4 start
+order, every process gated on its own probe), then point `soak` at it. It needs:
+
+- the gateway's MCP endpoint on loopback, and one bearer per tenant **in an environment
+  variable** (the flag names the variable; the value never appears in argv, the log or the
+  report);
+- `HUMAUX_MAINTENANCE_PG_DSN` — every table it reads is a `role_maintenance` SELECT in §6.2.2,
+  and RLS keys off `humaux.tenant_id`, which the harness installs per lane;
+- **at least two tenants.** `cargo xtask e2e-seed` provisions one tenant per invocation, so run
+  it twice and keep both tenant ids in the report. Every invocation must repeat the SAME
+  deployment-shaped lane flags — `--processor-id`, `--region`, `--endpoint-ref`, `--provider-id`,
+  `--provider-model-id`, `--model-revision` — and the same `--pepper-hex`. `--processor-id` is the
+  egress processor of the deployment (§7.3), not a per-tenant value: one private worker holds one
+  `HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID`, and a tenant seeded under a different one is
+  admitted by nothing, so its Distill hop hands every Evidence back forever. Card 16's first soak
+  ran that way for 8 minutes and the second tenant produced zero memories; the worker now names
+  the class on every deferral (`… not ready: configured provider does not match admitted route`),
+  and `cargo test -p xtask e2e_seed` pins the property that two seeded tenants share one egress
+  processor.
+
+## 2. Invocation
+
+```sh
+HUMAUX_MAINTENANCE_PG_DSN='postgres://role_maintenance:…@127.0.0.1:54329/humaux_thread_dev' \
+cargo run -q -p xtask -- soak \
+  --gateway-url http://127.0.0.1:8080/mcp \
+  --tenant "$TENANT_A:$WS_A:BEARER_A" \
+  --tenant "$TENANT_B:$WS_B:BEARER_B" \
+  --sessions-per-tenant 4 \
+  --duration-secs 900 --drain-secs 240 --think-ms 250 \
+  --probe-every-secs 15 \
+  --probe-cmd 'curl -fsS -o /dev/null http://127.0.0.1:8080/readyz' \
+  --probe-cmd './target/debug/humaux-retrieval-worker --readyz' \
+  --chaos-every-secs 180 \
+  --chaos-cmd ./chaos-retrieval-worker.sh \
+  --chaos-cmd ./chaos-distill-worker.sh \
+  --chaos-cmd ./chaos-consolidation-worker.sh \
+  --lease-secs 120 --max-rss-mib 2048 --max-db-connections 80 \
+  --report ./soak-report.json
+```
+
+Each chaos script kills **one PID the launcher recorded at spawn**, and never a pattern or a
+port — see §6. `pgrep -f "…"` in a chaos command is the shape this runbook used to publish and
+must not: it matches any process on the host whose argv happens to contain that string.
+
+Exit codes: `0` all assertions pass · `1` at least one assertion failed (read the report) ·
+`2` bad flags or a missing object (the message names it) · `3` the run could not complete.
+
+### Size the load to the distill hop's capacity, or three assertions are unwinnable
+
+`tickets_settled_after_drain`, `backlog_drained` and `ryw_replay_answered` all assume the
+pipeline can consume what the load generator produces. It usually cannot: the Distill hop makes
+**one real provider round trip per Evidence, serially**, so its throughput is the provider's, not
+the database's. Measured on this deployment (MiniMax `MiniMax-M3`, one resident
+`--distill-serve`, 2026-09-10): **0.229 Evidence/s** (n = 140 `private.processing_runs` over
+611 s). A run at `--sessions-per-tenant 2 --think-ms 500` across two tenants ingested **0.992
+tickets/s** (n = 211 over 213 s) — 4.3x capacity — and left 93 tickets in flight and 296 rows
+queued no matter how correct the code was. Those verdicts were measuring MiniMax's TPS.
+
+So: pick `--sessions-per-tenant` and `--think-ms` such that
+`tenants x sessions / (think_secs + round_trip_secs)` stays **under** the measured Evidence/s,
+and set `--drain-secs` above `peak_backlog / capacity`. Re-measure the capacity line above
+whenever the provider or the model changes — it is a property of the deployment, not a constant.
+Over-subscription also shows up on the recall side: the embedding provider is on the same
+budget, so an over-subscribed run's recalls start coming back `DEPENDENCY_UNAVAILABLE` with a
+`query_embedding_*` line in the gateway log. Read the line, not the code — since card 17 the
+gateway distinguishes `query_embedding_skipped` (the provider declined),
+`query_embedding_unavailable reason=<tag>` (the worker could not be reached or failed) and
+`query_embedding_dimension_mismatch` (the vector came back the wrong shape). Only the first two
+are ever a capacity story, and none of them is what a `limit` mismatch looks like — that is
+`limit_not_profile_top_k`, see below.
+
+### Every flag is required, on purpose
+
+§78.1: the subcommand has **no defaults**. A threshold baked into the binary moves with the
+code it grades, so the duration, the drain, the think time, the poll period, the lease, and both
+leak ceilings all come from the invocation — and all of them land in the report's `config`
+block, so a number in a report can always be traced to the run that produced it.
+
+Two flag rules are enforced at parse time rather than discovered at verdict time:
+
+- **`--drain-secs` must exceed `--lease-secs`.** A lease held by a killed worker is still live
+  until it expires; a shorter drain cannot tell a wedged worker from a crashed one (ADR-0038 D5).
+- **`--chaos-every-secs` and `--chaos-cmd` come together or not at all.** Half a chaos hook is
+  a run that silently tests nothing.
+
+`--probe-cmd` and `--chaos-cmd` may each be repeated; probes all run every poll, chaos commands
+are used round-robin.
+
+### Never send `limit`
+
+§55.1 reserves candidate depth to the registered retrieval profile: *"callers cannot supply
+`limit`, `top_k`, `cand_k`"*. `recall.schema.json` still admits `limit` as a `1..=100` integer,
+so the only value the gateway accepts is the profile's own `top_k` echoed back — every other
+value is `INVALID_INPUT`, refused before the request reaches the embedding step. Card 16's
+post-drain replay sent `"limit": <live point count>` to widen its result page; every replay was
+refused, `ryw_replay_answered` was red in every run, and because the refusal was **silent** the
+failure was read for a day as an embedding fault (the gateway's `query_embedding_unusable` line
+two steps further down, which was itself firing for an unrelated chaos-window recall). The
+gateway now logs `limit_not_profile_top_k limit=<n> profile_top_k=<n>`, and the harness sends
+no `limit` at all.
+
+The same silence hid a second refusal behind it: an expired `consistency_token` is also a bare
+`INVALID_INPUT`. The gateway now logs `consistency_token_refused reason=token_expired |
+token_malformed | token_not_issued` (the class only, never the token).
+
+## 3. The assertions, and what a red one means
+
+| id | red means | unit |
+|---|---|---|
+| `watermark_no_stall` | a stream's issued highwater grew while the projection worker's **applied** position — `max(stream_seq)` over its settled `projection.stream_log` rows — never moved: the worker is alive but no longer consuming (§15.3). Deliberately **not** measured on `projection_highwater`; see `projection_promoted` | streams |
+| `projection_promoted` | the §15.4 contiguous DONE prefix never advanced, so the §16.2 serving switch had nothing it could legally promote. **Reported, not blocking, until card 18** (`expected_red_until: card 18`) — the switch needs the live Qdrant visible count card 18 wires. `detail.reject_reasons` is **whatever `projection::serving::evaluate_switch` returned** for each candidate the database described, keyed by the rejection variant's own name and counted per candidate — not a fixed list and not a row count wearing a rejection's name (which is what this field held until it was fixed: `count(*) FROM stream_checkpoints` relabelled `VisibleUnavailable`, reported even on streams whose promotion had succeeded). On this deployment you will see `VisibleUnavailable` (§23.1②'s live Qdrant count is unavailable on the serving side — card 18) and `BenchmarkNotPass` (§69's `baseline_min`/`frozen_by` are `NOT_DECLARED`, and §69 forbids reading "not established" as a pass) on every candidate, plus `OpenGaps` on those carrying `projection.processing_gaps` rows. Each reason disappears from the report by itself when the thing it names is wired. **When card 18 lands this flips to required**: drop `.expected_red_until("card 18")` in `promotion_assertion` | streams |
+| `watermark_monotonic` | a highwater went **backwards** — a projection rebuilt from a stale checkpoint, or two writers racing one row | regressions |
+| `tickets_not_lost` | a gap in the §15.1 dense range `1..=max(stream_seq)` **of one stream**, or a `LOST` row. The census is grouped by the full `(scope_kind, scope_id, domain, projection_kind, projection_version)` key and the gap is computed per stream, then summed: a tenant-wide subtraction masks a lost seq behind a sibling stream's row count (two streams of 10 rows give `total = 20` against `max_seq = 10`, so `(10-20).max(0)` is 0 however many are missing). **A `SKIPPED_BY_POLICY` ticket is settled, not lost** | tickets |
+| `tickets_settled_after_drain` | a ticket was still in flight after the drain — the chain did not converge | tickets |
+| `tickets_applied_once` | two live `projection.private_memory_points` for one memory in one family: a double-apply (ADR-0038 D4) | memories |
+| `no_live_lease_after_drain` | an `ops.jobs` row is `PROCESSING` with a lease still live more than one `--lease-secs` after the last kill: a worker is wedged, not crashed (§31/§61) | ops.jobs rows |
+| `backlog_drained` | `ops.jobs` + `ops.outbox` still queued after the drain | queued rows |
+| `db_connections_bounded` | connection count exceeded `--max-db-connections` at some poll: a leak, or pool sizing that does not survive this concurrency | connections |
+| `rss_bounded` | some `humaux-*` process exceeded `--max-rss-mib` | MiB |
+| `probes_green` | an ADR-0037 probe exited non-zero during the run — read `docs/ops/supervision.md` §2 for that probe's meaning | failed probe runs |
+| `ryw_token_honoured` | a `consistency_token` this run minted was refused (§15.5) | rejections |
+| `ryw_replay_answered` | a lane's post-drain replay produced no answer — the write did not land, its `stream_seq` could not be resolved, or the recall itself errored. `n` = replays **attempted**, one per lane unconditionally, so a lane that bails out early lands in the denominator instead of shrinking it to zero. Kept separate from the row below on purpose: a replay that never happened tells you nothing about visibility, and reporting a transport failure as a consistency violation is a lie the harness would be telling about the system. Which half failed is one lookup away: `latency[]` for `remember.ryw_replay` (write) and `recall.ryw_replay` (read) | unanswered replays |
+| `ryw_settled_write_visible` | a `stream_seq` the replay's own token entitled it to see did not come back. The replay writes once more after the drain and uses **that** token: a `consistency_token` lives `HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS` (60 s here) and `--drain-secs` must exceed `--lease-secs` (120 s), so a token minted during the load is always expired by replay time. The witness is the §15.5 PG delta overlay's seq coverage — every `projection.stream_log` row in `(serving_highwater, token stream_seq]` must arrive as an item carrying that `stream_seq`; the token's seq is resolved from the accept envelope's `evidence_id` through `ops.outbox`. Never a marker in the content (the distill hop rewrites it through the model) and never "every live projection point" (`recall` returns top-k) | stale reads |
+| `no_cross_tenant_row` | one lane's MCP response carried another lane's sentinel, tenant id or workspace id (§6.1) | responses |
+
+## 4. Reading the report
+
+`--report` is the artifact; the console prints the same verdicts. Its shape:
+
+- `config` — every threshold the run used, so no number is orphaned from its run;
+- `timeline` — one row per poll: `issued_highwater_sum`, `applied_highwater_sum`,
+  `projection_highwater_sum`, `backlog_rows`, `db_connections`, `max_process_rss_mib`,
+  `probe_failures`. This is the evidence behind `watermark_no_stall` (the applied sum) and
+  `projection_promoted` (the projection sum): a reader can watch the two diverge rather than
+  taking the split on trust;
+- `assertions` — `{id, value, unit, n, threshold_at_most, verdict, expected_red_until, detail}`.
+  §78.2: no bare numbers. `verdict` is `PASS` / `FAIL` / `FAIL-VACUOUS` / `EXPECTED-RED`; an
+  `EXPECTED-RED` row names the card that owns the gap, is listed again under the report's
+  `expected_red`, and does **not** fail the run or change its exit code;
+- **`n = 0` is never a pass.** Every assertion here counts a bad thing that did not happen, so a
+  run in which the thing was never attempted reports `0 <= 0` and is indistinguishable from a
+  run that attempted it a thousand times and survived. Card 16's own final run shipped
+  `ryw_settled_write_visible PASS value 0.0 n 0` that way. A zero denominator is now
+  `FAIL-VACUOUS` and fails the run — the harness says "I did not measure this" instead of "this
+  is fine". Spelled differently from `FAIL` on purpose: "0 stale reads out of 0" and "1 stale
+  read out of 28" are different defects, and a reader should not have to check `n` by eye;
+- `latency` — per MCP operation `{p50, p95, n, unit: "ms", failed_calls}`, nearest-rank
+  percentiles over successful calls only. An operation whose calls **all** failed is still
+  listed, with `n: 0` and its `failed_calls` — a total failure must not be the one shape that
+  disappears from the report;
+- `tenants` — per lane: ticket census, plus two rates that are metrics rather than assertions.
+
+### The two rates that are metrics, not failures
+
+`skipped_by_policy_rate` and `recall_dependency_unavailable_rate` carry the known live-model
+non-determinism (card 24 debt D1): MiniMax sometimes classifies ordinary content above the
+origin's authority ceiling, the candidate is rejected `origin_authority_ceiling`, the ticket
+settles `SKIPPED_BY_POLICY`, projection-serve reports `rejected:[OpenGaps]`, and that item's
+recall answers `DEPENDENCY_UNAVAILABLE`. **That chain is settled work, not lost work.** Counting
+it as lost would make every honest run red for a reason this harness does not own; hiding it
+would make a real regression invisible. So it is counted, per tenant, with `n`, and the
+exactly-once assertions stay strict. A rate that climbs run over run is a model or prompt
+regression — take it to the distill hop, not to this harness.
+
+## 5. Before the timed window: warm every binary
+
+macOS assesses each freshly linked executable on first exec (XProtect / `syspolicyd`), **~98 s
+each, strictly serial**, regardless of how many you launch in parallel. A binary first executed
+inside the timed window turns that assessment into apparent latency and can blow a start
+deadline that is correctly sized in production.
+
+So: build, then warm **every binary the run will launch or probe**, before starting the clock —
+
+```sh
+cargo build -p humaux-gateway -p humaux-retrieval-worker \
+            -p humaux-private-worker -p humaux-consolidation-worker -p xtask
+for b in humaux-gateway humaux-retrieval-worker humaux-private-worker humaux-consolidation-worker; do
+  env -i ./target/debug/$b --help >/dev/null 2>&1
+done
+```
+
+and say in the report that you did. **Never widen a production timeout to absorb this** — the
+timeout would then be wrong on every host that does not have XProtect.
+
+## 6. Chaos: what to kill, and what must survive it
+
+The chaos hook is a shell command precisely so the process owner keeps process ownership
+(ADR-0038 D1). Ownership is the whole point, so it has one absolute rule:
+
+> **Kill only a PID your launcher recorded at spawn, and only after `ps -o comm= -p $PID`
+> confirms the binary.** Never `pkill -f` / `pgrep -f` (matches any process whose argv contains
+> the string) and never `lsof -ti :PORT` / `fuser -k` (matches whoever holds a port — on
+> 2026-09-09 that killed a user's chat client, which happened to hold 8080). If a port you need
+> is busy, take another one and report the conflict; never free it by force.
+
+Which means a chaos hook always has three parts: read the pidfile, confirm the binary, kill —
+then restart and **write the new PID back into the pidfile**, or the process it just created is
+unreachable by anything except another pattern-kill:
+
+```sh
+#!/bin/sh
+# chaos-retrieval-worker.sh — one worker, one pidfile, no patterns.
+p=$(cat "$PIDFILE") || exit 1
+case "$p" in ''|*[!0-9]*) echo "bad pid"; exit 1;; esac
+[ "$(ps -o comm= -p "$p" | sed 's#.*/##')" = humaux-retrieval-worker ] || exit 1
+kill -9 "$p"
+while kill -0 "$p" 2>/dev/null; do sleep 1; done
+( <the same env the launcher used>; exec ./target/debug/humaux-retrieval-worker --serve-rpc \
+    >> worker.log 2>&1 ) &
+echo $! > "$PIDFILE"
+```
+
+Use the *same* env block for the restart as for the original spawn — a chaos hook that brings
+back a differently-configured worker grades a deployment nobody ran.
+
+What matters beyond that is not which worker you pick but that the run still finishes with
+**exactly-once** results:
+
+- `kill -9` is the interesting signal. `SIGTERM` drains (supervision runbook §3): both resident
+  derived workers observe it only *between* passes, so a graceful stop can never strand a lease.
+  `kill -9` mid-pass **can**, and the lease is what makes that survivable — the row stays
+  `PROCESSING` until the lease expires, then another worker reclaims it.
+- Therefore the assertion that grades a kill is `no_live_lease_after_drain`, measured more than
+  one `--lease-secs` after the last kill. A `PROCESSING` row with a live lease at that point is
+  a worker renewing a lease it can no longer make progress on.
+- Kill **each** worker in turn across a run (round-robin `--chaos-cmd`s), not the same one
+  repeatedly: the restart path differs per process (supervision runbook §3 and §4's start order
+  — a UDS server must come back before its client can succeed). Card 16's runs shipped with
+  `"chaos_cmds": 1` for a while — only the retrieval worker — so `no_live_lease_after_drain` had
+  never been exercised against either process that actually holds an `ops.jobs` lease. The
+  rotation is now the retrieval worker, the `--distill-serve` private worker
+  (`DERIVED_DISTILL` lease) and the `--serve` consolidation worker (`DERIVED_CONSOLIDATION`
+  lease); check `config.chaos_cmds` in the report before believing a run exercised restarts.
+- Two processes are deliberately **out** of the rotation, and the reason belongs in the report,
+  not in silence: the **gateway**, whose `GET /readyz` is the only probe bound to a live process
+  (the worker probes are one-shot binaries checking PG/Qdrant), so killing it makes
+  `probes_green` grade the harness's own outage window; and the private worker's
+  **`--serve-rpc`** listener, which holds no `ops.jobs` lease and is the UDS server the
+  consolidation worker dials, so a restart races §11.8's bind rather than the lease path this
+  step exists to exercise. Both are supervision-runbook (ADR-0037) restart cases, not lease
+  cases.
+
+## 7. Negative controls — proving the harness can go red
+
+A harness nobody has seen fail is a harness nobody should trust. Three controls are hermetic
+and run in the ordinary gate chain (`cargo test -p xtask`, ADR-0038 "Negative controls"):
+stalled projection worker → `watermark_no_stall`; double-apply → `tickets_applied_once`;
+leaked connection → `db_connections_bounded`. Each also asserts its neighbour stays green, so a
+control cannot pass by turning the whole report red. A fourth,
+`a_pinned_promotion_prefix_is_not_reported_as_a_stalled_worker`, pins the other direction: a
+worker consuming every ticket behind a pinned §15.4 prefix must leave `watermark_no_stall`
+green and show up only as `projection_promoted`.
+
+Four more hermetic tests pin the checks that a review found could not observe their own failure
+— every one of them was green against a defect before it was fixed:
+
+| test (`cargo test -p xtask soak`) | pins |
+|---|---|
+| `a_lost_seq_in_one_stream_is_not_masked_by_a_sibling_streams_rows` | the §15.1 gap is per stream; the tenant-wide subtraction it replaced scored the same census as clean |
+| `an_assertion_with_no_witness_is_vacuous_not_a_pass` | `n = 0` is `FAIL-VACUOUS`, not `PASS`, and it fails the run |
+| `promote_reject_reasons_are_taken_from_evaluate_switch` | `detail.reject_reasons` comes from the real §16.3 evaluator, not from a row count |
+| `a_gap_in_the_dense_ledger_is_a_lost_ticket_but_skipped_by_policy_is_not` | the census itself, through `fold_census` rather than hand-set fields |
+
+Three more are available live at zero injection cost, because every threshold is a flag:
+
+```sh
+… --max-db-connections 1   # db_connections_bounded goes red against a healthy system
+… --max-rss-mib 1          # rss_bounded goes red
+# start everything EXCEPT the retrieval worker → watermark_no_stall goes red under real traffic
+```
+
+Run one of these whenever the harness itself has been edited. A green soak that cannot be made
+red is not evidence.

@@ -87,6 +87,10 @@ pub struct DistillPassReport {
     pub failed: u32,
     /// Rows handed back to PENDING after a retryable (reasoning-side) failure.
     pub deferred: u32,
+    /// The static class of the FIRST deferral this pass took (`PrivateReasoningError::class`),
+    /// so the job-level line in [`dispatch_pass`] can name WHY a tenant is not ready instead of
+    /// printing a bare count. `&'static str` by construction — never provider or payload text.
+    pub deferred_reason: Option<&'static str>,
     /// Rows whose lease was reclaimed before this worker could settle them (nothing written).
     pub lost_lease: u32,
     pub memories: u32,
@@ -235,6 +239,7 @@ impl DistillPassReport {
         self.done += other.done;
         self.failed += other.failed;
         self.deferred += other.deferred;
+        self.deferred_reason = self.deferred_reason.or(other.deferred_reason);
         self.lost_lease += other.lost_lease;
         self.memories += other.memories;
         self.rejected += other.rejected;
@@ -299,8 +304,19 @@ pub async fn dispatch_pass(
             // re-emitted for it. Release the job instead, without spending an attempt.
             Ok(pass) => {
                 let deferred = pass.deferred;
+                let reason = pass.deferred_reason;
                 report.work.add(pass);
                 if deferred > 0 {
+                    // Mirrors the consolidation worker's NotReady line (card 14): a tenant whose
+                    // environment is not ready is released with a backoff (`DerivedWorkOutcome::
+                    // Retry` pushes `next_retry_at` out) and NEVER parked DEAD — but it must not
+                    // be invisible either, or one tenant of a deployment silently never distils.
+                    eprintln!(
+                        "humaux-private-worker: distill job {} (tenant {}) not ready: {} ({deferred} evidence rows deferred)",
+                        job.job_id,
+                        job.tenant_id,
+                        reason.unwrap_or("unclassified private reasoning failure"),
+                    );
                     report.not_ready += 1;
                     jobs::DerivedWorkOutcome::Retry
                 } else {
@@ -390,6 +406,10 @@ pub async fn run_once(
     Ok(report)
 }
 
+/// The static deferral class for a tenant whose `(domain, PRIVATE_DISTILL_TEXT)` binding has not
+/// been admitted yet — the "onboarded before its route" case, retryable forever with a backoff.
+const NO_DISTILL_BINDING: &str = "no admitted PRIVATE_DISTILL_TEXT route binding";
+
 /// Provider-side outcome of one claimed row, before the write leg.
 struct Inferred {
     evidence: LoadedEvidence,
@@ -418,8 +438,15 @@ async fn process_claimed(
             );
             return settle_failed(pool, distill, row, report).await;
         }
-        Err(DistillError::Reasoning(_)) => {
-            return settle_deferred(pool, distill, row, report).await;
+        // Environmental, per ADR-0016 D5 — the row goes back to PENDING. The CLASS travels with
+        // it: `PrivateReasoningError`'s Display is redacted by construction, so before card 16
+        // this arm was the end of the road for the only information that mattered (why tenant B
+        // never distilled: `configured provider does not match admitted route`).
+        Err(DistillError::Reasoning(error)) => {
+            let reason = error
+                .class()
+                .unwrap_or("unclassified private reasoning failure");
+            return settle_deferred(pool, distill, row, reason, report).await;
         }
         Err(other) => return Err(other),
     };
@@ -554,7 +581,7 @@ async fn infer_claimed(
     let (binding_id, binding_version) =
         distill_repo::resolve_distill_binding(&mut txn, distill.reasoning_domain_id)
             .await?
-            .ok_or_else(|| PrivateReasoningError::new("distill route binding not found"))?;
+            .ok_or_else(|| PrivateReasoningError::classified(NO_DISTILL_BINDING))?;
     let admission = reasoner
         .admit(
             &mut txn,
@@ -659,12 +686,20 @@ async fn settle_deferred(
     pool: &PrivateWorkerDbPool,
     distill: &DistillConfig,
     row: ClaimedEvidence,
+    reason: &'static str,
     report: &mut DistillPassReport,
 ) -> Result<(), DistillError> {
+    // The deferral is not silent (card 16 P0): the static error class is on the line, the payload
+    // never is. A tenant that can never be served now says so on every pass.
+    eprintln!(
+        "humaux-private-worker: distill evidence={} tenant={} deferred: {reason}",
+        row.evidence_id, distill.tenant_id
+    );
     if distill_repo::release_outbox(pool, distill.tenant_id, row.outbox_id, &distill.lease_owner)
         .await?
     {
         report.deferred += 1;
+        report.deferred_reason = report.deferred_reason.or(Some(reason));
     } else {
         report.lost_lease += 1;
     }

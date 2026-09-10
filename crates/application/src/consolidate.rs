@@ -237,6 +237,13 @@ impl std::fmt::Debug for PrivateReasoningResult {
 pub struct PrivateReasoningError {
     message: String,
     existing_model_call_id: Option<Uuid>,
+    /// A STATIC classification chosen at the raise site (`contribution_reasoner::fail`) — never
+    /// user, tenant or provider text, so it is safe to print verbatim. `Display`/`Debug` stay
+    /// redacted on purpose; a caller that must log WHY asks for this explicitly.
+    ///
+    /// Card 16's P0 is why this exists: the Distill hop deferred every row of one tenant forever
+    /// and the only thing any log could say about it was a 4-byte fingerprint.
+    class: Option<&'static str>,
 }
 
 impl PrivateReasoningError {
@@ -244,7 +251,22 @@ impl PrivateReasoningError {
         Self {
             message: message.into(),
             existing_model_call_id: None,
+            class: None,
         }
+    }
+
+    /// A failure whose `label` is a compile-time constant, so the class can be logged.
+    pub fn classified(label: &'static str) -> Self {
+        Self {
+            message: label.to_owned(),
+            existing_model_call_id: None,
+            class: Some(label),
+        }
+    }
+
+    /// The static class, when the raise site had one.
+    pub const fn class(&self) -> Option<&'static str> {
+        self.class
     }
 
     /// Retry outcome for a logical call whose matching durable reservation already exists.
@@ -252,6 +274,7 @@ impl PrivateReasoningError {
         Self {
             message: "logical reasoning call already reserved".into(),
             existing_model_call_id: Some(model_call_id),
+            class: Some("logical reasoning call already reserved"),
         }
     }
 

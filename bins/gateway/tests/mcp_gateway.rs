@@ -2268,6 +2268,221 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
     );
 }
 
+/// §15.5 through the MCP surface, in the exact request shape `cargo xtask soak`'s post-drain
+/// replay sends (ADR-0038): a recall carrying a `consistency_token` the same run minted must
+/// **answer** — a body with items, never `DEPENDENCY_UNAVAILABLE` — and the write that token
+/// names must ride in as its overlay item.
+///
+/// The second and third legs pin the defect card 16's soak actually hit, which is why this is a
+/// test of its own rather than one more assertion inside the acceptance test above. That replay
+/// also sent `"limit": <live point count>`; §55.1 reserves candidate depth to the registered
+/// profile, so the only value a caller may send is that profile's own `top_k` echoed back, and
+/// the gateway refuses anything else **before** the embedding step. It refused silently, and
+/// that is how a `limit` mismatch was read for a day as an embedding fault two steps further
+/// down `recall::search`. So: the soak's shape answers, the shape it used to send is a clean
+/// `INVALID_INPUT`, and the profile's own `top_k` is still accepted (the check is an equality,
+/// not a blanket refusal of the field the schema advertises).
+///
+/// The accepted `top_k` is read off the first response's `provenance.profile.top_k` rather than
+/// written as a literal — §78.1: a test that hard-codes the profile depth stops grading the
+/// profile the moment it moves.
+#[test]
+#[ignore = "requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+#[allow(clippy::too_many_lines)] // One real-deployment fixture; splitting it would hide the causal chain.
+fn recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused() {
+    run_db_fixture::<Fixture, _>(
+        "recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused",
+        |mut handle| {
+            handle.assert_gateway_login();
+            let _registry_cleanup = SemanticProjectionCleanup {
+                owner: handle.owner_client().expect("semantic cleanup owner"),
+                tenant_id: handle.tenant_id,
+            };
+            let prefix = format!("ryw{}", &Uuid::now_v7().simple().to_string()[..12]);
+            let wire = format!("{prefix}.{}", "r".repeat(32));
+            let credential = handle.seed_synthetic_service_credential_and_window(
+                SyntheticCredentialScopes::RememberWriteAndContextRead,
+                &prefix,
+                &wire,
+                &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+                48,
+            );
+            let seeded = handle.seed_workspace_visible_context_record();
+            let point = Uuid::new_v4();
+            let updated = seed_semantic_registry_row(&mut handle, &seeded, point);
+            seed_semantic_checkpoint(&mut handle);
+
+            let cell = CellId(Uuid::now_v7());
+            let registry = semantic_qdrant_registry(cell, CallerId("gateway-ryw-limit".to_owned()));
+            let transport = Arc::new(
+                HttpIntraCellTransport::new(
+                    registry.clone(),
+                    Duration::from_secs(10),
+                    humaux_infra_cell::DEFAULT_MAX_RESPONSE_BYTES,
+                )
+                .expect("semantic Qdrant transport"),
+            );
+            let collection = format!("gateway_ryw_limit_{}", Uuid::now_v7().simple());
+            seed_tenant_placement(&mut handle, &collection);
+            let runtime_handle = handle.rt.handle().clone();
+            let runtime = runtime_handle
+                .block_on(handle.fresh_runtime())
+                .expect("fresh semantic Gateway runtime");
+            let gateway_uid = runtime_handle.block_on(semantic_own_uid());
+            let socket_path = runtime_handle.block_on(spawn_semantic_worker(gateway_uid));
+            let embedding_port: Arc<
+                dyn humaux_application::retrieval_embedding_port::RetrievalEmbeddingPort,
+            > = Arc::new(
+                humaux_gateway::retrieval_embedding_client::GatewayRetrievalEmbeddingClient::new(
+                    Arc::new(
+                        runtime_handle
+                            .block_on(RuntimeDbPool::connect(
+                                &std::env::var("HUMAUX_GATEWAY_PG_DSN")
+                                    .expect("fixture requires HUMAUX_GATEWAY_PG_DSN"),
+                            ))
+                            .expect("gateway runtime pool for the embedding client"),
+                    ),
+                    socket_path,
+                    registry.clone(),
+                    Duration::from_secs(30),
+                ),
+            );
+            let semantic = SemanticRecallRuntime::new(
+                semantic_scanner(),
+                embedding_port,
+                transport.clone(),
+                registry.clone(),
+                SemanticRecallVersions {
+                    embedding_version: "embed-v1".to_owned(),
+                    dimension: 4,
+                },
+                Duration::from_secs(10),
+            )
+            .expect("trusted semantic runtime");
+            let app = application(&handle, runtime).with_semantic_recall(semantic);
+            let query = "operation receipt scoped context";
+            let workspace_id = handle.workspace_id;
+            runtime_handle.block_on(async {
+                create_semantic_collection(&transport, &registry, &collection).await;
+                let permit = authorize_cell_access(
+                    &registry,
+                    IntraCellResource::QDRANT_REST,
+                    Duration::from_secs(60),
+                )
+                .expect("semantic upsert permit");
+                upsert(
+                    transport.as_ref(),
+                    &permit,
+                    &collection,
+                    &[(
+                        PointId::Uuid(point),
+                        &semantic_payload(&handle, updated),
+                        semantic_vector(query),
+                    )],
+                    ha_profile_for(QdrantOperation::NormalImmutableUpsert),
+                )
+                .await
+                .expect("real Qdrant semantic point");
+
+                let (address, server) = start(app).await;
+                let (status, remember) = raw_request(
+                    address,
+                    &tool_call_headers("remember", &credential.bearer),
+                    &rpc(
+                        1,
+                        "tools/call",
+                        call_params(
+                            "remember",
+                            json!({
+                                "operation":"put",
+                                "content":"soak-shaped write awaiting projection",
+                                "idempotency_key":format!("ryw-limit-{}", Uuid::now_v7()),
+                                "workspace_id":workspace_id,
+                            }),
+                        ),
+                    ),
+                )
+                .await;
+                assert_eq!(status, 200, "remember before the RYW recall: {remember}");
+                let token = remember["result"]["structuredContent"]["consistency_token"]
+                    .as_str()
+                    .expect("opaque consistency token")
+                    .to_owned();
+                let evidence_id = remember["result"]["structuredContent"]["evidence_id"]
+                    .as_str()
+                    .expect("remember evidence id")
+                    .to_owned();
+
+                // Leg 1 — the shape the soak's replay sends: token, no caller `limit`.
+                let (status, answered) = recall_call(
+                    address,
+                    Some(&credential.bearer),
+                    json!({
+                        "query":query,
+                        "workspace_id":workspace_id,
+                        "mode":"semantic",
+                        "consistency_token":token.clone(),
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "token recall must answer: {answered}");
+                assert_ne!(
+                    answered["result"]["structuredContent"]["code"], "DEPENDENCY_UNAVAILABLE",
+                    "a valid consistency_token must not degrade the lane: {answered}"
+                );
+                let answered = assert_tool_response(&answered, ToolName::Recall);
+                let items = answered["items"].as_array().expect("RYW items");
+                assert!(
+                    items.iter().any(|item| {
+                        item["kind"] == "temporary_evidence" && item["evidence_id"] == evidence_id
+                    }),
+                    "§15.5 overlay must carry the write the token names: {answered}"
+                );
+                let profile_top_k = answered["provenance"]["profile"]["top_k"]
+                    .as_u64()
+                    .expect("envelope reports the registered profile depth");
+
+                // Leg 2 — the shape it used to send. §55.1: not the caller's number to pick.
+                let (status, refused) = recall_call(
+                    address,
+                    Some(&credential.bearer),
+                    json!({
+                        "query":query,
+                        "workspace_id":workspace_id,
+                        "mode":"semantic",
+                        "consistency_token":token.clone(),
+                        "limit":profile_top_k + 1,
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    status, 400,
+                    "a caller-chosen limit is INVALID_INPUT, not a dependency failure: {refused}"
+                );
+
+                // Leg 3 — the profile's own depth echoed back is still accepted.
+                let (status, echoed) = recall_call(
+                    address,
+                    Some(&credential.bearer),
+                    json!({
+                        "query":query,
+                        "workspace_id":workspace_id,
+                        "mode":"semantic",
+                        "consistency_token":token,
+                        "limit":profile_top_k,
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "limit == profile top_k must answer: {echoed}");
+                assert_tool_response(&echoed, ToolName::Recall);
+
+                server.abort();
+                delete_semantic_collection(&transport, &registry, &collection).await;
+            });
+        },
+    );
+}
+
 fn assert_context_governance(value: &Value, versioned: Uuid, unversioned: Uuid, overflow: bool) {
     CanonicalCatalog::load()
         .expect("catalog")

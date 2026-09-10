@@ -206,8 +206,25 @@ pub async fn search(
     if !matches!(
         retrieval.planner_decision(),
         PlannerDecision::Class(QueryClass::Semantic)
-    ) || input.limit.is_some_and(|limit| limit != retrieval.top_k())
+    ) {
+        eprintln!("humaux-gateway: recall request_id={request_id} query_not_semantic");
+        return Err(ErrorCode::InvalidInput);
+    }
+    // §55.1: candidate depth comes only from the registered profile — a caller may not choose
+    // it. `recall.schema.json` still admits `limit` as a 1..=100 integer, so the only legal
+    // value a caller can send is the profile's own `top_k` echoed back; anything else is
+    // refused here. Refusing it *silently* is what card 16's soak paid for: its post-drain
+    // replay sent `limit = <live point count>`, got INVALID_INPUT with not one line in the
+    // gateway log, and the failure was misread for a day as an embedding fault two steps
+    // further down this function. The operator line carries both numbers, never the query.
+    if let Some(limit) = input.limit
+        && limit != retrieval.top_k()
     {
+        eprintln!(
+            "humaux-gateway: recall request_id={request_id} limit_not_profile_top_k \
+             limit={limit} profile_top_k={}",
+            retrieval.top_k()
+        );
         return Err(ErrorCode::InvalidInput);
     }
     let trusted_query = retrieval.trusted_query().ok_or(ErrorCode::Internal)?;
@@ -235,12 +252,38 @@ pub async fn search(
         } if dimension == runtime.dimension && vector.len() == runtime.dimension as usize => {
             (vector, model_id)
         }
+        // Three different failures, three different operator lines. One collapsed
+        // `query_embedding_unusable` covered all of them and cost card 16's soak a day of
+        // diagnosis: "the provider declined" (Skipped), "the worker could not be reached or
+        // failed" (Unavailable) and "the vector came back the wrong shape" (dimension
+        // mismatch) have disjoint fixes, and a log line that cannot tell them apart forces
+        // the reader to guess which one they are looking at.
+        //
         // A wrong-dimension vector is never truncated/padded to fit — ADR-0012 gateway wiring
-        // card: "mismatch ⇒ DependencyUnavailable, never truncate".
-        RetrievalEmbeddingOutcome::Embedded { .. }
-        | RetrievalEmbeddingOutcome::Skipped
-        | RetrievalEmbeddingOutcome::Unavailable { .. } => {
-            eprintln!("humaux-gateway: recall request_id={request_id} query_embedding_unusable");
+        // card: "mismatch ⇒ DependencyUnavailable, never truncate". Only the two lengths are
+        // logged, never an element of the vector.
+        RetrievalEmbeddingOutcome::Embedded {
+            vector, dimension, ..
+        } => {
+            eprintln!(
+                "humaux-gateway: recall request_id={request_id} query_embedding_dimension_mismatch \
+                 reported={dimension} vector_len={} expected={}",
+                vector.len(),
+                runtime.dimension
+            );
+            return Err(ErrorCode::DependencyUnavailable);
+        }
+        RetrievalEmbeddingOutcome::Skipped => {
+            eprintln!("humaux-gateway: recall request_id={request_id} query_embedding_skipped");
+            return Err(ErrorCode::DependencyUnavailable);
+        }
+        // `reason` is the worker's closed failure code (or this client's own transport class),
+        // never provider text and never any part of the query — ADR-0014 operator-signal rule.
+        RetrievalEmbeddingOutcome::Unavailable { reason } => {
+            eprintln!(
+                "humaux-gateway: recall request_id={request_id} query_embedding_unavailable \
+                 reason={reason}"
+            );
             return Err(ErrorCode::DependencyUnavailable);
         }
     };
@@ -308,9 +351,24 @@ pub async fn search(
         humaux_adapters::retrieve::RetrieveError::CrossTenant
         | humaux_adapters::retrieve::RetrieveError::CrossWorkspace
         | humaux_adapters::retrieve::RetrieveError::UntrustedStreamFamily => ErrorCode::Forbidden,
-        humaux_adapters::retrieve::RetrieveError::TokenMalformed(_)
+        // §15.5 token refusals are caller-fault, but they must not be *silent* caller-fault:
+        // an expired token and a malformed one produce the same `INVALID_INPUT` on the wire,
+        // and card 16's post-drain replay spent a run being refused for a TTL it had outlived
+        // with nothing in the log to say so. The reason class only — never the token.
+        error @ (humaux_adapters::retrieve::RetrieveError::TokenMalformed(_)
         | humaux_adapters::retrieve::RetrieveError::TokenExpired
-        | humaux_adapters::retrieve::RetrieveError::TokenNotIssued => ErrorCode::InvalidInput,
+        | humaux_adapters::retrieve::RetrieveError::TokenNotIssued) => {
+            let reason = match error {
+                humaux_adapters::retrieve::RetrieveError::TokenMalformed(_) => "token_malformed",
+                humaux_adapters::retrieve::RetrieveError::TokenExpired => "token_expired",
+                _ => "token_not_issued",
+            };
+            eprintln!(
+                "humaux-gateway: recall request_id={request_id} consistency_token_refused \
+                 reason={reason}"
+            );
+            ErrorCode::InvalidInput
+        }
         error => {
             // Operator signal, same discipline as the qdrant_query_failed line above: the
             // RetrieveError class only — `Db` carries driver text and is reduced to its name.

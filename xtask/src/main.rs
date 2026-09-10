@@ -22,6 +22,7 @@ mod phase;
 mod projection_serve;
 mod r4_fault_manifest;
 mod rls_check;
+mod soak;
 mod threshold_shape;
 
 fn main() {
@@ -46,9 +47,10 @@ fn main() {
         Some("e2e-seed") => e2e_seed::run(&args[2..]),
         Some("member") => member::run(&args[2..]),
         Some("projection-serve") => projection_serve::run(&args[2..]),
+        Some("soak") => soak::run(&args[2..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|r4-fault-manifest|direction-table|card-version|migrate|e2e-seed|member|projection-serve>"
+                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|r4-fault-manifest|direction-table|card-version|migrate|e2e-seed|member|projection-serve|soak>"
             );
             2
         }

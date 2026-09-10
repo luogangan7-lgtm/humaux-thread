@@ -1586,8 +1586,12 @@ impl PublicCoveragePort for ContributionReasoner<'_> {
     }
 }
 
+/// Every private-reasoning failure raised in this crate goes through here, so every one of them
+/// carries a loggable static class (`PrivateReasoningError::class`) while `Display` stays
+/// redacted. Card 16: without the class a permanently not-ready tenant's deferrals were
+/// indistinguishable from a provider blip in any log.
 pub(crate) fn fail(label: &'static str) -> PrivateReasoningError {
-    PrivateReasoningError::new(label)
+    PrivateReasoningError::classified(label)
 }
 
 #[cfg(test)]

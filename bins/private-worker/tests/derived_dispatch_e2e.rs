@@ -15,7 +15,10 @@
 //! 5. the owner arm 0164 added to `jobs_tenant_isolation` does NOT make `ops.jobs` cross-tenant
 //!    readable from a worker session — only from inside the SECURITY DEFINER claim (asserted
 //!    under RLS);
-//! 6. a pass with no input claims nothing and returns promptly (`--distill-once` exits on it).
+//! 6. a pass with no input claims nothing and returns promptly (`--distill-once` exits on it);
+//! 7. (card 16) a tenant this deployment can never admit — an admitted route bound to ANOTHER
+//!    deployment's egress processor — is released with a backoff, is never parked `DEAD`, NAMES
+//!    its reason, and does not starve the ready tenant claimed in the same pass.
 //!
 //! Three-state skip (§79.2): no DSN, unreachable DB, or the 0164 objects missing print a visible
 //! SKIP naming what was missing.
@@ -46,6 +49,17 @@ static SERIAL_GUARD: Mutex<()> = Mutex::new(());
 const REGION: &str = "cn-shanghai";
 const SERVICE_TIER: &str = "standard";
 const EGRESS_PROCESSOR_ID: Uuid = Uuid::from_u128(0x2001);
+/// A DIFFERENT deployment's egress processor. `control.provider_endpoints.egress_processor_id` is
+/// deployment identity (`HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID`), not tenant data, and
+/// `provider_matches_admission` compares the two — so a tenant whose route is fully admitted but
+/// points at another deployment's egress can never be served by THIS worker. That is card 16's
+/// P0 exactly: `xtask e2e-seed` takes the egress processor as a per-invocation `--processor-id`,
+/// the soak harness passed a fresh uuid for its second tenant, and that tenant's Distill hop then
+/// deferred every row forever without printing a word.
+const FOREIGN_EGRESS_PROCESSOR_ID: Uuid = Uuid::from_u128(0x2002);
+/// The static class `PrivateReasoningError::class` carries for that failure — asserted verbatim,
+/// because "the pass says WHY" is the half of the fix a count cannot prove.
+const FOREIGN_EGRESS_REASON: &str = "configured provider does not match admitted route";
 /// Route-graph fixture values, mirrored from `tests/distill_hop_e2e.rs` so the two files share
 /// one catalog row in the global append-only `control.processor_models`.
 const PROVIDER_ID: &str = "minimax";
@@ -317,14 +331,26 @@ impl DbIntegrationFixture for DispatchFixture {
         // not — the "tenant onboarded before its route was admitted" case, whose job must be
         // released, never settled DONE (its Evidence would be stranded: 0164's enqueue key is
         // per evidence_id with ON CONFLICT DO NOTHING).
+        // D is the card-16 shape: a COMPLETE, admitted route — but bound to another deployment's
+        // egress processor, so this worker's config can never match it.
         let mut tenants = Vec::new();
-        for (label, with_binding) in [
-            ("private derived_dispatch_e2e tenant A", true),
-            ("private derived_dispatch_e2e tenant B", true),
-            ("private derived_dispatch_e2e tenant C (no route)", false),
+        for (label, binding_egress) in [
+            (
+                "private derived_dispatch_e2e tenant A",
+                Some(EGRESS_PROCESSOR_ID),
+            ),
+            (
+                "private derived_dispatch_e2e tenant B",
+                Some(EGRESS_PROCESSOR_ID),
+            ),
+            ("private derived_dispatch_e2e tenant C (no route)", None),
+            (
+                "private derived_dispatch_e2e tenant D (foreign egress)",
+                Some(FOREIGN_EGRESS_PROCESSOR_ID),
+            ),
         ] {
             tenants.push(
-                seed_tenant(&mut admin, label, &ctx, with_binding)
+                seed_tenant(&mut admin, label, &ctx, binding_egress)
                     .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(db_detail(&e)))?,
             );
         }
@@ -349,11 +375,13 @@ impl DbIntegrationFixture for DispatchFixture {
     }
 }
 
+/// `binding_egress`: `Some(id)` seeds an admitted `PRIVATE_DISTILL_TEXT` route whose endpoint
+/// carries that egress processor; `None` seeds no route at all.
 fn seed_tenant(
     admin: &mut Client,
     label: &str,
     ctx: &SeedContext,
-    with_binding: bool,
+    binding_egress: Option<Uuid>,
 ) -> Result<SeededTenant, postgres::Error> {
     let tenant_id: Uuid = admin
         .query_one(
@@ -377,8 +405,15 @@ fn seed_tenant(
             &[&tenant_id, &label, &ctx.user_id],
         )?
         .get(0);
-    if with_binding {
-        seed_route_binding(admin, tenant_id, ctx.user_id, reasoning_domain_id, label)?;
+    if let Some(egress) = binding_egress {
+        seed_route_binding(
+            admin,
+            tenant_id,
+            ctx.user_id,
+            reasoning_domain_id,
+            label,
+            egress,
+        )?;
     }
     Ok(SeededTenant {
         tenant_id,
@@ -396,8 +431,9 @@ fn seed_route_binding(
     user_id: Uuid,
     reasoning_domain_id: Uuid,
     label: &str,
+    egress_processor_id: Uuid,
 ) -> Result<(), postgres::Error> {
-    let route = seed_reasoning_profile(admin, tenant_id, user_id, label)?;
+    let route = seed_reasoning_profile(admin, tenant_id, user_id, label, egress_processor_id)?;
     let policy: Uuid = admin
         .query_one(
             "INSERT INTO control.reasoning_route_policies \
@@ -474,6 +510,7 @@ fn seed_reasoning_profile(
     tenant_id: Uuid,
     user_id: Uuid,
     label: &str,
+    egress_processor_id: Uuid,
 ) -> Result<SeededRoute, postgres::Error> {
     let credential: Uuid = admin
         .query_one(
@@ -527,7 +564,7 @@ fn seed_reasoning_profile(
                 &REGION,
                 &SERVICE_TIER,
                 &ENDPOINT_REF,
-                &EGRESS_PROCESSOR_ID,
+                &egress_processor_id,
             ],
         )?
         .get(0);
@@ -772,6 +809,11 @@ fn a_pass_that_distilled_nothing_releases_the_job_instead_of_completing_it() {
             assert_eq!(report.not_ready, 1, "{report:?}");
             assert_eq!(report.dead, 0, "{report:?}");
             assert_eq!(report.work.deferred, 1, "{report:?}");
+            assert_eq!(
+                report.work.deferred_reason,
+                Some("no admitted PRIVATE_DISTILL_TEXT route binding"),
+                "the deferral must name its class: {report:?}"
+            );
             assert_eq!(report.work.memories, 0, "{report:?}");
             assert_eq!(memory_count(&mut handle, 2), 0);
 
@@ -806,6 +848,127 @@ fn a_pass_that_distilled_nothing_releases_the_job_instead_of_completing_it() {
                 .expect("read outbox")
                 .get(0);
             assert_eq!(pending, 1, "the pending Evidence must not be stranded");
+        },
+    );
+}
+
+/// Card 16's P0, as a test. Tenant D's `PRIVATE_DISTILL_TEXT` route is fully admitted — the
+/// binding resolves, `resolve_user_reasoning_admission` returns a locator — but its endpoint
+/// carries ANOTHER deployment's `egress_processor_id`, so `provider_matches_admission` refuses it
+/// and every claimed `ops.outbox` row comes back environmental. In the soak that condition was
+/// permanent and completely silent: one tenant of a two-tenant deployment simply never distilled,
+/// 18 identical passes in a row, no reason anywhere.
+///
+/// Three things must hold at once, and only the first was ever asserted before:
+///  1. the not-ready tenant is RELEASED with a backoff and never parked `DEAD` — an environmental
+///     condition must not consume the retry budget (0164's enqueue key is per `evidence_id` with
+///     `ON CONFLICT DO NOTHING`, so `DEAD` would strand that Evidence for good);
+///  2. the pass NAMES the reason — `PrivateReasoningError`'s Display is redacted by construction,
+///     so before this card the class never reached any log;
+///  3. the ready tenant in the SAME pass still completes. One tenant's environment must not
+///     starve the others a cross-tenant pass claimed alongside it.
+#[test]
+fn a_tenant_the_deployment_cannot_admit_is_named_and_does_not_starve_the_ready_one() {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<DispatchFixture, _>(
+        "a_tenant_the_deployment_cannot_admit_is_named_and_does_not_starve_the_ready_one",
+        |mut handle| {
+            accept_evidence(&mut handle, 0); // admitted under THIS deployment's egress
+            accept_evidence(&mut handle, 3); // admitted under a FOREIGN deployment's egress
+
+            let provider = FakeProvider::new();
+            let mut config = dispatch_config("mixed-readiness-worker", 60.0);
+            // The harshest retry budget there is: any outcome that spent an attempt would park
+            // tenant D `DEAD` on this very pass.
+            config.max_attempts = 1;
+            let report = handle
+                .rt
+                .block_on(distill::dispatch_pass(
+                    &handle.private,
+                    &provider,
+                    reasoner_config(),
+                    &config,
+                ))
+                .expect("dispatch pass");
+
+            assert_eq!(report.claimed, 2, "{report:?}");
+            assert_eq!(
+                report.completed, 1,
+                "the ready tenant completes: {report:?}"
+            );
+            assert_eq!(report.not_ready, 1, "{report:?}");
+            assert_eq!(
+                report.dead, 0,
+                "an environmental condition must never park a job DEAD: {report:?}"
+            );
+            assert_eq!(report.work.memories, 1, "{report:?}");
+            assert_eq!(report.work.deferred, 1, "{report:?}");
+            assert_eq!(
+                report.work.deferred_reason,
+                Some(FOREIGN_EGRESS_REASON),
+                "the pass must carry WHY the tenant is not ready, not just a count: {report:?}"
+            );
+            assert_eq!(
+                provider.calls(),
+                1,
+                "only the admitted tenant reaches the provider"
+            );
+
+            assert_eq!(
+                memory_count(&mut handle, 0),
+                1,
+                "the ready tenant must not be starved by the not-ready one"
+            );
+            assert_eq!(memory_count(&mut handle, 3), 0);
+            assert_eq!(jobs_of(&mut handle, 0)[0].1, "DONE");
+
+            let job = jobs_of(&mut handle, 3).remove(0);
+            assert_eq!(
+                job.1, "PENDING",
+                "the not-ready tenant's job must be released"
+            );
+            let backed_off: bool = handle
+                .admin
+                .query_one(
+                    "SELECT next_retry_at > clock_timestamp() FROM ops.jobs WHERE job_id = $1",
+                    &[&job.0],
+                )
+                .expect("read next_retry_at")
+                .get(0);
+            assert!(
+                backed_off,
+                "the release must back off: without it every --distill-serve poll re-claims the \
+                 same permanently-not-ready job with zero delay"
+            );
+
+            // Still not DEAD after a second pass, with the same one-attempt budget. This is the
+            // property `DerivedWorkOutcome::Dead` would break: the tenant's operator can fix the
+            // deployment tomorrow and the Evidence is still there to distil.
+            handle
+                .admin
+                .execute(
+                    "UPDATE ops.jobs SET next_retry_at = clock_timestamp() - interval '1 second' \
+                     WHERE job_id = $1",
+                    &[&job.0],
+                )
+                .expect("make the job claimable again");
+            let second = handle
+                .rt
+                .block_on(distill::dispatch_pass(
+                    &handle.private,
+                    &provider,
+                    reasoner_config(),
+                    &config,
+                ))
+                .expect("second dispatch pass");
+            assert_eq!(second.claimed, 1, "{second:?}");
+            assert_eq!(second.not_ready, 1, "{second:?}");
+            assert_eq!(second.dead, 0, "{second:?}");
+            assert_eq!(
+                jobs_of(&mut handle, 3)[0].1,
+                "PENDING",
+                "a permanently not-ready tenant is retried forever, never parked"
+            );
         },
     );
 }

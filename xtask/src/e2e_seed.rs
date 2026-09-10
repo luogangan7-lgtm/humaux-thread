@@ -1112,3 +1112,148 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DSN_ENV, LaneFlags, scopes_sql_array, seed_base, seed_lane, teardown};
+    use postgres::{Client, NoTls};
+    use uuid::Uuid;
+
+    /// Card 16 regression, seed side. Two `e2e-seed` invocations must produce two tenants that
+    /// ONE private-worker process can serve: each with its OWN admitted `PRIVATE_DISTILL_TEXT`
+    /// route and its OWN credential (no shared/global row standing in for a per-tenant one), and
+    /// both under the SAME `egress_processor_id` — that field is the deployment's egress identity
+    /// (`HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID`), and `provider_matches_admission` compares
+    /// the two, so a second tenant seeded under a different `--processor-id` is admitted by
+    /// nothing and its Distill hop defers forever.
+    ///
+    /// Fault injection: pass a fresh `Uuid::new_v4()` as the second lane's `egress_processor_id`
+    /// (what `rehearse.sh` did) and the last assertion goes red — which is exactly the soak's P0.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear fixture script (seed -> assert -> teardown); splitting it hides which teardown covers which seed"
+    )]
+    fn seeding_two_tenants_yields_two_independently_admitted_distill_routes() {
+        let Ok(dsn) = std::env::var(DSN_ENV) else {
+            eprintln!("e2e_seed test: not_applicable — {DSN_ENV} unset, skipping");
+            return;
+        };
+        let Ok(mut client) = Client::connect(&dsn, NoTls) else {
+            eprintln!(
+                "e2e_seed test: not_applicable — cannot reach Postgres at ${DSN_ENV}, skipping"
+            );
+            return;
+        };
+        if client
+            .query_one(
+                "SELECT to_regprocedure('control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)') IS NULL",
+                &[],
+            )
+            .map(|row| row.get::<_, bool>(0))
+            .unwrap_or(true)
+        {
+            eprintln!("e2e_seed test: not_applicable — migrations not applied, skipping");
+            return;
+        }
+
+        // One deployment: one egress processor, one endpoint. Unique per run so the assertions
+        // read only this test's rows on a shared dev database.
+        let egress = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let flags = |egress: Uuid| LaneFlags {
+            egress_processor_id: egress,
+            region: "cn-shanghai".to_string(),
+            service_tier: "standard".to_string(),
+            endpoint_ref: format!("https://xtask-e2e-seed-{run}.invalid/v1/chat/completions"),
+            provider_id: format!("xtask-e2e-seed-{run}"),
+            provider_model_id: "self-test-model".to_string(),
+            model_revision: "self-test".to_string(),
+        };
+        let scopes = scopes_sql_array("memory:write");
+
+        let mut seeded = Vec::new();
+        let mut lanes = Vec::new();
+        for _ in 0..2 {
+            let base = seed_base(&mut client, &scopes, 1000, &[7u8; 32]).expect("seed base");
+            let lane = seed_lane(
+                &mut client,
+                base.tenant_id,
+                base.user_id,
+                base.reasoning_domain_id,
+                &flags(egress),
+            )
+            .expect("seed lane");
+            seeded.push(base);
+            lanes.push(lane);
+        }
+
+        let verdict = (|| -> Result<(), String> {
+            for (base, lane) in seeded.iter().zip(&lanes) {
+                // The resolver reads RLS-protected `control.*` rows: without the tenant context
+                // the answer is an empty set for every tenant, which would make this assertion
+                // vacuously red rather than a real verdict.
+                client
+                    .batch_execute(&format!("SET humaux.tenant_id = '{}'", base.tenant_id))
+                    .map_err(|e| format!("set tenant context: {e}"))?;
+                let binding_version: i64 = client
+                    .query_one(
+                        "SELECT binding_version FROM control.reasoning_route_bindings \
+                         WHERE binding_id = $1",
+                        &[&lane.distill_binding_id],
+                    )
+                    .map_err(|e| format!("read binding version: {e}"))?
+                    .get(0);
+                let rows: i64 = client
+                    .query_one(
+                        "SELECT count(*) FROM control.resolve_user_reasoning_admission($1,$2,$3,'PRIVATE_DISTILL_TEXT')",
+                        &[
+                            &lane.distill_binding_id,
+                            &binding_version,
+                            &base.reasoning_domain_id,
+                        ],
+                    )
+                    .map_err(|e| format!("resolve admission: {e}"))?
+                    .get(0);
+                if rows != 1 {
+                    return Err(format!(
+                        "tenant {} has {rows} admitted PRIVATE_DISTILL_TEXT routes, want 1",
+                        base.tenant_id
+                    ));
+                }
+            }
+            if lanes[0].distill_binding_id == lanes[1].distill_binding_id {
+                return Err("the two tenants share one distill binding".to_string());
+            }
+            if lanes[0].credential_id == lanes[1].credential_id {
+                return Err("the two tenants share one credential".to_string());
+            }
+            let egresses: Vec<Uuid> = client
+                .query(
+                    "SELECT DISTINCT egress_processor_id FROM control.provider_endpoints \
+                     WHERE endpoint_id = ANY($1)",
+                    &[&vec![lanes[0].endpoint_id, lanes[1].endpoint_id]],
+                )
+                .map_err(|e| format!("read egress processors: {e}"))?
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            if egresses != vec![egress] {
+                return Err(format!(
+                    "the two tenants must share ONE deployment egress processor ({egress}), got \
+                     {egresses:?} — a private worker holds a single \
+                     HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID, so the odd one out is admitted by \
+                     nothing and its distill defers forever (card 16)"
+                ));
+            }
+            Ok(())
+        })();
+
+        for base in &seeded {
+            if let Err(error) = teardown(&mut client, base.tenant_id) {
+                eprintln!("e2e_seed test teardown ({}): {error}", base.tenant_id);
+            }
+        }
+        verdict.expect("two seeded tenants must both be servable by one deployment");
+    }
+}
