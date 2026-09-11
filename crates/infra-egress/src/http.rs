@@ -51,8 +51,10 @@ use humaux_domain::egress::{
     AuthorizedEgressPayload, EgressPermit, ExternalCall, PrivateDataPurpose, ProcessorId,
 };
 use humaux_domain::error::ErrorCode;
-use humaux_infra_network::http::{ClientConfig, build_client};
+use humaux_infra_network::http::ClientConfig;
 use humaux_infra_network::reqwest;
+
+use crate::resolver::{DEFAULT_PIN_TTL, SystemCheckedResolve, build_pinned_client};
 
 /// A resolved outbound credential value — e.g. the plaintext bearer token
 /// [`HttpExternalCall::call`] injects as `Authorization: Bearer <value>`. Mirrors
@@ -141,7 +143,7 @@ impl RetrievalCredentialSource for EnvCredentialSource {
 }
 
 /// [`HttpExternalCall::new`]'s failure mode — either the underlying `reqwest::Client` failed
-/// to build (TLS-backend init only, per [`build_client`]'s own doc), or `endpoint` failed the
+/// to build (TLS-backend init only, per [`build_pinned_client`]'s own doc), or `endpoint` failed the
 /// §7.4 scheme check (see [`endpoint_scheme_is_allowed`]). Kept as this crate's own small enum
 /// rather than reusing `reqwest::Error` for the second case: `reqwest::Error` has no public
 /// constructor this crate is allowed to use (this module never names `reqwest::Client::new`/
@@ -262,9 +264,19 @@ pub struct HttpExternalCall {
 
 impl HttpExternalCall {
     /// Builds the `reqwest::Client` this instance holds via Layer 0's
-    /// [`build_client`] — ADR-0003: this crate itself has not named `Client::new`/`::builder`
-    /// since the Layer 0/1A split (see module doc); ownership of the *decision* to build a
-    /// client for this `(endpoint, processor)` pair still lives here.
+    /// [`build_pinned_client`] — ADR-0003: this crate itself has not named `Client::new`/
+    /// `::builder` since the Layer 0/1A split (see module doc); ownership of the *decision* to
+    /// build a client for this `(endpoint, processor)` pair still lives here.
+    ///
+    /// ADR-0039: the client dials only through [`SystemCheckedResolve`], pinned for
+    /// [`DEFAULT_PIN_TTL`] — one lookup per host per TTL window, and the addresses that lookup
+    /// returned are the only ones the connector may dial. Unlike the BYOK path
+    /// (`crate::raw::RawHttpPost`, whose caller injects §11.4's private/reserved-range policy),
+    /// this resolver carries no address policy: `endpoint` here is operator-configured
+    /// (`retrieval-provider`'s DashScope wiring), not user-supplied SSRF input, and this crate's
+    /// own loopback test fixtures are legitimate destinations. What ADR-0039 buys on this path
+    /// is the pin itself — no second, unobserved name resolution between "the address this
+    /// process resolved" and "the address it connected to".
     ///
     /// `status_classifier` — see the field's own doc. Pass `map_dashscope_status` (or the
     /// equivalent for a future provider); this crate has no sensible universal default because
@@ -286,15 +298,20 @@ impl HttpExternalCall {
         if !endpoint_scheme_is_allowed(&endpoint) {
             return Err(HttpExternalCallError::InsecureEndpoint);
         }
-        let client = build_client(ClientConfig {
-            request_timeout: config.request_timeout,
-            // Layer 1A external egress: preserve `reqwest`'s prior default (obey
-            // `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) — an org's egress proxy is a legitimate
-            // path for traffic that is, by definition, already leaving Humaux-operated
-            // infrastructure. See `ClientConfig::trust_env_proxy`'s doc for why Layer 1B
-            // (`humaux-infra-cell`) answers this differently.
-            trust_env_proxy: true,
-        })?;
+        let client = build_pinned_client(
+            ClientConfig {
+                request_timeout: config.request_timeout,
+                // Layer 1A external egress: preserve `reqwest`'s prior default (obey
+                // `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) — an org's egress proxy is a legitimate
+                // path for traffic that is, by definition, already leaving Humaux-operated
+                // infrastructure. See `ClientConfig::trust_env_proxy`'s doc for why Layer 1B
+                // (`humaux-infra-cell`) answers this differently, and `crate::resolver`'s module
+                // doc for the ceiling this places on the pin.
+                trust_env_proxy: true,
+            },
+            std::sync::Arc::new(SystemCheckedResolve),
+            DEFAULT_PIN_TTL,
+        )?;
         Ok(Self {
             client,
             endpoint,

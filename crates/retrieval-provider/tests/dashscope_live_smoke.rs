@@ -42,15 +42,6 @@ use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
 use uuid::Uuid;
 
-/// Same `SET ROLE` trick `crates/adapters/src/postgres.rs`'s own (private, test-only) helper
-/// uses — reproduced here rather than imported (that helper is not `pub`, module doc: "Test-
-/// only: production wrappers connect with a DSN that already authenticates as the target role
-/// directly").
-fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
-    let sep = if admin_dsn.contains('?') { '&' } else { '?' };
-    format!("{admin_dsn}{sep}options=-c%20role%3D{role}")
-}
-
 fn text_embedding_v4() -> EmbeddingModelDescriptor {
     EmbeddingModelDescriptor {
         model_id: ModelId("text-embedding-v4".to_string()),
@@ -147,7 +138,16 @@ impl DbIntegrationFixture for SmokeFixture {
             )
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 
-        let role_dsn = dsn_as_role(&dsn, "role_retrieval_worker");
+        // ops.reserve_retrieval_provider_budget (0117) guards on `session_user`, not
+        // `current_user`, so a superuser connection with `SET ROLE` is refused with 42501
+        // before any HTTP leaves the process — which is why this suite had never actually
+        // run. Connect as the real LOGIN role the deployment provisions (card 17 finding).
+        let role_dsn = std::env::var("HUMAUX_RETRIEVAL_WORKER_PG_DSN").map_err(|_| {
+            DbFixtureSkipReason::IsolationSetupFailed(
+                "HUMAUX_RETRIEVAL_WORKER_PG_DSN (role_retrieval_worker LOGIN DSN) is not set"
+                    .to_owned(),
+            )
+        })?;
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let pool = rt
@@ -169,6 +169,28 @@ impl DbIntegrationFixture for SmokeFixture {
                 &[&user_id],
             )
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+
+        // ops.reserve_retrieval_provider_budget (0117) requires exactly one ACTIVE admission
+        // limit for each canonical tier — GLOBAL, REGION, TENANT, TENANT+PURPOSE — or it raises
+        // P0003 before any HTTP leaves the process. Same four rows `xtask e2e-seed` provisions
+        // for a real tenant (its RETRIEVAL_RERANK row is not needed by this embedding-only smoke).
+        for (tier_tenant, tier_region, tier_purpose) in [
+            (None::<uuid::Uuid>, None::<&str>, None::<&str>),
+            (None, Some("cn-beijing"), None),
+            (Some(tenant_id), None, None),
+            (Some(tenant_id), None, Some("RETRIEVAL_EMBEDDING")),
+        ] {
+            admin
+                .execute(
+                    "INSERT INTO control.retrieval_provider_admission_limits \
+                       (tenant_id,provider_id,region,purpose,tpm_limit,rpm_limit,effective_from) \
+                     VALUES($1,'dashscope',$2,$3,1000000000,1000000000,clock_timestamp()-interval '1 second') \
+                     ON CONFLICT (provider_id,region,tenant_id,purpose) WHERE effective_to IS NULL \
+                     DO UPDATE SET tpm_limit=EXCLUDED.tpm_limit,rpm_limit=EXCLUDED.rpm_limit",
+                    &[&tier_tenant, &tier_region, &tier_purpose],
+                )
+                .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        }
         let workspace_id: Uuid = admin
             .query_one(
                 "INSERT INTO control.workspaces(tenant_id,name) VALUES($1,'dashscope smoke workspace') RETURNING workspace_id",

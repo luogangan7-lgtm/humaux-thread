@@ -16,13 +16,14 @@
 //! HTTP 200、choices[0].message.content 带 `<think>`、usage 带 completion_tokens_details），
 //! 与 provider 发出的请求形状精确匹配；`chatcompletion_v2` 是 MiniMax 旧原生形状，不用。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use humaux_adapters::byok::{
-    CredentialDecryptor, CredentialRef, EgressHttpTransport, OpenAiCompatibleProvider,
-    PlaintextApiKey, PrivateInferenceContext, ReasoningCapability, ReasoningDomainId,
-    ReasoningProviderDescriptor, ReasoningProviderError, StructuredReasoningRequest,
-    StructuredReasoningResponse, UserReasoningProvider, ssrf, structured_request_body,
+    CredentialDecryptor, CredentialRef, OpenAiCompatibleProvider, PlaintextApiKey,
+    PrivateInferenceContext, ReasoningCapability, ReasoningDomainId, ReasoningProviderDescriptor,
+    ReasoningProviderError, StructuredReasoningRequest, StructuredReasoningResponse,
+    UserReasoningProvider, ssrf, structured_request_body,
 };
 use humaux_adapters::disclosure::{
     DeletionCapability, DisclosureOutcome, DisclosureSource, finalize_private, reserve_private,
@@ -97,23 +98,23 @@ impl humaux_adapters::byok::OpenAiCompatTransport for AlwaysFailTransport {
 }
 
 /// 固定公网 IP 的 resolver——**不是**在绕 SSRF 闸，是闸抓到了一个环境事实：
-/// 这台开发机的 DNS 被本机代理 fake-IP 接管，`api.minimaxi.com` 解析到 `198.18.0.83`
-/// （RFC 2544 基准测试保留段），`SystemDnsResolver` + 真解析在这里**必然**被
-/// `ResolvedIpForbidden` 拒——那是闸的正确行为，不是 bug。
+/// 卡 17 之后拨号也走这个 resolver（ADR-0039 判据0），所以这里再返回一个「随便挑的公网
+/// 地址」就等于把 live 外呼指到别人家去——只有在代理接管解析时才碰巧还绿。改成与生产同一
+/// 个机制：`HUMAUX_MINIMAX_DNS_PINS`（`host=ip[|ip],...`，与
+/// `HUMAUX_PRIVATE_WORKER_DNS_PINS` 同格式）。没设 = 空 pin 集 = 全量落系统 DNS，也就是
+/// CI / 无 fake-IP 环境的默认行为。
 ///
-/// 本文件两条测试的被测对象都不是 DNS 解析（G5 测披露收尾，冒烟测出境链与 envelope），
-/// SSRF 的解析腿由 `byok::ssrf` 自己的单测覆盖。真实外呼经 reqwest 走系统代理
-/// （`trust_env_proxy: true`），代理自己路由 fake-IP——与 curl 探针同一条路。
-///
-// ponytail: 在无代理的环境（CI、生产）应换回 SystemDnsResolver；何时换 = 这台机器
-// 不再 fake-IP 或测试迁到 CI 时。
-struct PinnedPublicResolver;
-impl ssrf::DnsResolver for PinnedPublicResolver {
-    fn resolve(&self, _host: &str) -> Result<Vec<std::net::IpAddr>, ssrf::SsrfError> {
-        Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-            93, 184, 216, 34,
-        ))])
-    }
+/// 这台开发机的 DNS 被本机代理 fake-IP 接管（`api.minimaxi.com` → `198.18.0.x`，RFC 2544
+/// 保留段），`SystemDnsResolver` 在这里**必然**被 `ResolvedIpForbidden` 拒——那是闸的正确
+/// 行为，不是 bug；跑本套件时给上真地址的 pin。`/tests/` 读 env 是 §78 boundary lint 的既有
+/// 豁免面。
+fn live_dns_resolver() -> Arc<dyn ssrf::DnsResolver> {
+    Arc::new(
+        ssrf::PinnedDnsResolver::parse(
+            &std::env::var("HUMAUX_MINIMAX_DNS_PINS").unwrap_or_default(),
+        )
+        .expect("HUMAUX_MINIMAX_DNS_PINS must parse as host=ip[|ip],..."),
+    )
 }
 
 #[test]
@@ -357,16 +358,15 @@ fn minimax_live_smoke() {
         let (permit, ctx) =
             permit_and_ctx(tenant, &payload, &format!("minimax-smoke-{}", Uuid::now_v7()));
 
-        let transport = EgressHttpTransport::new(Duration::from_secs(30)).expect("transport");
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = OpenAiCompatibleProvider::with_egress_transport(
             desc,
             MINIMAX_CHAT_URL.to_string(),
-            transport,
+            Duration::from_secs(30),
             EnvKeyDecryptor { key_material: key },
             ssrf::CustomEndpointPolicy::default(),
-            &PinnedPublicResolver,
+            live_dns_resolver(),
         )
-        .expect("SSRF choke point must accept the endpoint (resolver pinned — see PinnedPublicResolver)");
+        .expect("SSRF choke point must accept the endpoint (see live_dns_resolver / HUMAUX_MINIMAX_DNS_PINS)");
 
         let (disclosure_id, result) = call_with_disclosure(
             &provider,
@@ -465,7 +465,7 @@ fn g5_a_failed_call_still_finalizes_its_disclosure_row() {
                 key_material: "not-a-real-key-g5-fixture".to_string(),
             },
             ssrf::CustomEndpointPolicy::default(),
-            &PinnedPublicResolver,
+            live_dns_resolver().as_ref(),
         )
         .expect("provider");
 

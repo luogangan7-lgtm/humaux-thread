@@ -1,0 +1,6 @@
+    Checking humaux-consolidation-worker v0.1.0 (/Volumes/data/humaux-thread/bins/consolidation-worker)
+    Checking humaux-private-worker v0.1.0 (/Volumes/data/humaux-thread/bins/private-worker)
+    Checking humaux-adapters v0.1.0 (/Volumes/data/humaux-thread/crates/adapters)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 47.85s
+CLIPPY_EXIT=0
+LINT2_DONE

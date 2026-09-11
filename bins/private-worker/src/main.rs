@@ -238,26 +238,32 @@ async fn bootstrap() -> Result<Bootstrap, String> {
         format!("missing required configuration: {key_env} (HUMAUX_PRIVATE_WORKER_KEY_ENV)")
     })?;
     // §11.4 static DNS pins (optional): `host=ip[|ip],...` — for hosts whose system DNS answer
-    // is not trustworthy on this node. The forbidden-range check still runs on the pins.
-    let resolver: Box<dyn ssrf::DnsResolver> = match env::var("HUMAUX_PRIVATE_WORKER_DNS_PINS") {
-        Ok(spec) if !spec.trim().is_empty() => {
-            Box::new(ssrf::PinnedDnsResolver::parse(&spec).map_err(|e| {
-                format!("invalid configuration: HUMAUX_PRIVATE_WORKER_DNS_PINS ({e:?})")
-            })?)
-        }
-        _ => Box::new(ssrf::SystemDnsResolver),
-    };
-    let provider = OpenAiCompatibleProvider::new(
+    // is not trustworthy on this node. Unpinned hosts fall through to the system resolver
+    // inside `PinnedDnsResolver`, so an empty/absent spec is exactly the old default. The
+    // forbidden-range check still runs on the pins.
+    let resolver: Arc<dyn ssrf::DnsResolver> = Arc::new(
+        ssrf::PinnedDnsResolver::parse(
+            &env::var("HUMAUX_PRIVATE_WORKER_DNS_PINS").unwrap_or_default(),
+        )
+        .map_err(|e| format!("invalid configuration: HUMAUX_PRIVATE_WORKER_DNS_PINS ({e:?})"))?,
+    );
+    // ADR-0039 判据0: the resolver is handed over **once** — `with_egress_transport` derives
+    // both the §11.4 check and the client's dial-time resolver from this one value. Building
+    // the transport separately is what let the operator's pins reach only the check while the
+    // dial kept using system DNS (card 17 review, P0).
+    let provider = OpenAiCompatibleProvider::with_egress_transport(
         descriptor,
         chat_url,
-        EgressHttpTransport::new(http_timeout)
-            .map_err(|_| "egress transport construction failed".to_owned())?,
+        http_timeout,
         EnvCredential(key),
         ssrf::CustomEndpointPolicy::default(),
-        resolver.as_ref(),
+        Arc::clone(&resolver),
     )
-    .map_err(|_| {
-        "invalid configuration: HUMAUX_PRIVATE_WORKER_CHAT_URL rejected by the §11.4 SSRF choke point".to_owned()
+    .map_err(|e| {
+        format!(
+            "invalid configuration: HUMAUX_PRIVATE_WORKER_CHAT_URL rejected by the §11.4 SSRF \
+             choke point, or the egress transport could not be built ({e:?})"
+        )
     })?;
 
     // The Consolidate path takes prompt/schema/budget from the shared contract itself

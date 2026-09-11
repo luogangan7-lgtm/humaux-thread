@@ -339,13 +339,16 @@ fn ipv6_is_forbidden(ip: Ipv6Addr) -> bool {
 // Validation entry point
 // =============================================================================
 
-// ponytail: `resolved_ips` is computed and returned but nothing downstream pins the
-// subsequent connection to them — a transport impl that validates this endpoint and then
-// connects by hostname a second time re-opens the DNS-rebinding TOCTOU window between the two
-// lookups (as opposed to the always-rebinding fake resolver the tests below exercise, which
-// only proves the *check* rejects a rebound address, not that the *connection* cannot land on
-// one). Upgrade path: have the transport connect to one of `resolved_ips` directly (e.g. via
-// a resolver override / `SocketAddr` dial) instead of re-resolving `host` at connect time.
+// ADR-0039 (card 17) closed the gap this comment used to record: the production transport
+// (`super::EgressHttpTransport`) now installs `super::SsrfCheckedResolver` — this module's own
+// resolver plus this module's own `is_forbidden_ip` — as the *only* DNS resolver its
+// `reqwest::Client` consults, so the connect-time lookup runs the same judgment this function
+// ran, and a name that rebinds to a forbidden address is refused before any TCP connection
+// (`crates/adapters/tests/byok_egress_rebinding.rs` asserts the forbidden address's listener
+// sees nothing). `resolved_ips` therefore stays informational: it is not the pin, the shared
+// resolver is. Residual ceiling, honestly recorded: with `HTTP_PROXY`/`HTTPS_PROXY` set and the
+// destination outside `NO_PROXY`, resolution happens at the proxy and no client-side resolver
+// is consulted at all — see `humaux_infra_egress::resolver`'s module doc.
 #[derive(Debug, Clone)]
 pub struct ValidatedEndpoint {
     pub host: String,

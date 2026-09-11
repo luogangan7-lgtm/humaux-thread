@@ -14,7 +14,7 @@
 //!
 //! ADR-0003 splits the one file into two layers, this crate being the lower one:
 //! - **Layer 0 (this crate)**: the sole `reqwest::Client` construction point,
-//!   [`http::build_client`] — semantically neutral, no `OutboundPurpose`, no
+//!   [`http::build_client_with_resolver`] — semantically neutral, no `OutboundPurpose`, no
 //!   `EgressPermit`/`CellAccessPermit`, no disclosure-ledger awareness at all. It has no
 //!   opinion on *where* a caller sends bytes, only on *how many places are allowed to build the
 //!   thing that sends them*.

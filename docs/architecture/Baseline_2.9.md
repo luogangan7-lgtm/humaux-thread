@@ -2947,6 +2947,31 @@ response/body size bound
 
 普通 SaaS 用户不能借 custom endpoint 探测 Humaux 内网。Enterprise/BYOC 只有在显式 policy 允许时才能使用 private endpoint。
 
+**「DNS/IP validation」与拨号必须是同一次解析（ADR-0039，卡 17）**：上面链条里的
+`DNS/IP validation` + `private/reserved IP policy` 若只跑在**检查**上、而 HTTP client 用系统
+DNS 自己再解析一次去拨号，两次解析之间就是一个 DNS rebinding / TOCTOU 窗口（OWASP SSRF Cheat
+Sheet 的 pinning bypass）——第一次答案是公网地址骗过检查，第二次答案是 `169.254.169.254`。
+判据因此收紧为**结构性**的一条：出网 client 的**唯一** DNS resolver 就是跑上面那套判定的
+resolver（`humaux_infra_network::http::build_client_with_resolver`；无 resolver 的构造函数已
+删除，不存在第二条路），解析答案按 TTL pin 在 client 上，被判为禁止段的地址在**建立 TCP 连接
+之前**被拒——不是记一行日志。执行体：`xtask architecture-check` 的
+`ADR-0039 / §11.4 (outbound client dials only through the checked resolver)` 闸，把
+`build_client_with_resolver(` 的调用点集合钉死为
+`{crates/infra-network/src/http.rs, crates/infra-egress/src/resolver.rs, crates/infra-cell/src/transport.rs}`。
+
+**「同一次解析」不止是同一个 client，还必须是同一个实参（卡 17 复审补）**：把「检查用哪个
+resolver」和「拨号用哪个 resolver」写成两个独立实参，调用方就可以（并且确实曾经）从两个来源
+填它们——`bins/private-worker` 把运维配的 `HUMAUX_PRIVATE_WORKER_DNS_PINS` 只交给了检查，拨号
+仍走系统 DNS，缺口原样存在，而且在恰恰需要 pin 的节点上拨号会被自己的禁止段判定拒掉。判据因此
+再收一层：BYOK 出网 provider 的**唯一**生产构造入口是
+`OpenAiCompatibleProvider::with_egress_transport`，resolver **只传一次**，检查腿与拨号腿由同一个
+值派生；硬接系统 resolver 的 `EgressHttpTransport::new` 已删除。执行体：同一个闸的判据5–8（生产
+`bins/<x>/src/` 不得出现 `OpenAiCompatibleProvider::new(`；`EgressHttpTransport::with_resolver(`
+的调用点钉死为派生构造点 + rebinding 验收测试；活哨兵保证派生构造点本身不会被删掉后误绿）。
+
+残余天花板（诚实记账）：进程配了 `HTTP_PROXY`/`HTTPS_PROXY` 且目标不在 `NO_PROXY` 内时，解析
+发生在代理侧，client 侧 resolver 根本不会被问到——那是部署形态决定的面，本判据不覆盖。
+
 ## 11.5 BYOK Usage Accounting
 
 即使模型费用由用户直接向 Provider 支付，Humaux 仍记录：

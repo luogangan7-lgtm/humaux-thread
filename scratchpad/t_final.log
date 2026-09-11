@@ -1,0 +1,33 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running tests/distill_hop_e2e.rs (target/debug/deps/distill_hop_e2e-d38255131d880e64)
+
+running 8 tests
+test d2_over_ceiling_candidate_rejected_not_downgraded ... ok
+test d7_declared_subjects_reach_the_distilled_memory_with_spans ... ok
+test d4_parser_fail_closed_marks_outbox_failed ... ok
+test d6_retryable_failures_hand_the_row_back_for_a_later_pass ... ok
+test d5_two_passes_and_expired_lease_never_duplicate_memories ... ok
+test d3b_undistilled_ticket_stays_issued ... ok
+test d3_zero_memories_settles_outbox_and_ticket ... ok
+test d1_live_distill_writes_memories_and_projection_resolves_ticket ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.80s
+
+PW EXIT=0
+   Compiling humaux-consolidation-worker v0.1.0 (/Volumes/data/humaux-thread/bins/consolidation-worker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 40.60s
+     Running tests/consolidation_hop_e2e.rs (target/debug/deps/consolidation_hop_e2e-7c98b4b44abfe5a8)
+
+running 7 tests
+test t2_wrong_peer_uid_rejected_before_body ... ok
+test t4_build_rollup_cannot_mutate_base_memory ... ok
+test t7_rollup_inherits_subject_links_through_publish_rollup ... ok
+test t6_tenant_scoped_run_never_consumes_workspace_shared_inputs ... ok
+test t3_same_call_id_twice_claims_once ... ok
+test t5_manifest_mismatch_fails_closed_without_provider_call ... ok
+test t1_full_inference_hop_publishes_ticket ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.18s
+
+CW EXIT=0
+FINAL_DONE

@@ -5,3 +5,4 @@
 
 pub mod http;
 pub mod raw;
+pub mod resolver;

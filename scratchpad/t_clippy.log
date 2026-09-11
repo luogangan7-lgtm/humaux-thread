@@ -1,0 +1,5 @@
+    Checking xtask v0.1.0 (/Volumes/data/humaux-thread/xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 37.67s
+CLIPPY_EXIT=0
+FMT_EXIT=0
+LINT_DONE

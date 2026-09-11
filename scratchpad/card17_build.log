@@ -1,0 +1,10 @@
+   Compiling humaux-private-worker v0.1.0 (/Volumes/data/humaux-thread/bins/private-worker)
+   Compiling humaux-consolidation-worker v0.1.0 (/Volumes/data/humaux-thread/bins/consolidation-worker)
+   Compiling humaux-gateway v0.1.0 (/Volumes/data/humaux-thread/bins/gateway)
+   Compiling xtask v0.1.0 (/Volumes/data/humaux-thread/xtask)
+   Compiling humaux-adapters v0.1.0 (/Volumes/data/humaux-thread/crates/adapters)
+   Compiling humaux-retrieval-provider v0.1.0 (/Volumes/data/humaux-thread/crates/retrieval-provider)
+   Compiling humaux-public-worker v0.1.0 (/Volumes/data/humaux-thread/bins/public-worker)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14m 41s
+EXIT=0
+BUILD_DONE

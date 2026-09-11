@@ -46,6 +46,7 @@
 //!   that ever happens.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -825,15 +826,73 @@ pub struct EgressHttpTransport {
     raw: humaux_infra_egress::raw::RawHttpPost,
 }
 
+/// ADR-0039：把 §11.4 的判定装进出网 client 的**唯一** DNS resolver。
+///
+/// 「检查」（[`ssrf::validate_custom_endpoint`]，provider 构造时跑一次）和「拨号」
+/// （client 建连时那次解析）在此之前是两次独立的解析，答案可以不同——那就是 DNS
+/// rebinding 窗口。本类型让拨号那次解析跑的是**同一个** `DnsResolver` + **同一个**
+/// [`ssrf::is_forbidden_ip`]，所以一个骗过了构造期检查、随后改指 `169.254.169.254`
+/// 的域名，会在**建连之前**被这里拒掉（不是记一行日志）。
+///
+/// 判据与 `validate_custom_endpoint` 逐字同源：**任一**解析出的地址落在私网/保留/环回/
+/// link-local 段即整体拒——不是「有一个公网的就算过」。
+pub struct SsrfCheckedResolver {
+    inner: Arc<dyn ssrf::DnsResolver>,
+}
+
+impl SsrfCheckedResolver {
+    /// `inner` 应当就是调用方交给 [`OpenAiCompatibleProvider::new`] 的那个 resolver
+    /// （静态 DNS pin、测试替身，等等）——两处传同一个，检查与拨号才是同一套判定。
+    #[must_use]
+    pub fn new(inner: Arc<dyn ssrf::DnsResolver>) -> Self {
+        Self { inner }
+    }
+}
+
+impl humaux_infra_egress::resolver::CheckedDnsResolve for SsrfCheckedResolver {
+    fn resolve_checked(&self, host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+        let addrs = self.inner.resolve(host).map_err(|e| e.to_string())?;
+        if addrs.is_empty() {
+            return Err(ssrf::SsrfError::NoAddressResolved(host.to_string()).to_string());
+        }
+        for ip in &addrs {
+            if ssrf::is_forbidden_ip(*ip) {
+                return Err(ssrf::SsrfError::ResolvedIpForbidden {
+                    host: host.to_string(),
+                    ip: *ip,
+                }
+                .to_string());
+            }
+        }
+        Ok(addrs)
+    }
+}
+
 impl EgressHttpTransport {
-    /// 构造。`request_timeout` 语义见 `RawHttpPost::new`。
+    /// 唯一构造：`resolver` 会被 [`SsrfCheckedResolver`] 包起来装成 client 的唯一 DNS
+    /// resolver，拨号那次解析跑的就是它。
+    ///
+    /// 卡 17 的复审发现：曾经还有一个 `new(request_timeout)`，内部硬接
+    /// `ssrf::SystemDnsResolver`。它让「拨号用哪个 resolver」与「检查用哪个 resolver」变成
+    /// 两个互不相干的实参——生产唯一调用点（`bins/private-worker`）正好把运维配的
+    /// `HUMAUX_PRIVATE_WORKER_DNS_PINS` 交给了检查、把系统 DNS 留给了拨号，缺口原样还在，
+    /// 而且在**恰恰需要 pin 的那种节点上**拨号会直接被 `is_forbidden_ip` 拒掉。那个构造已
+    /// 删除；生产不要直接调本函数，调
+    /// [`OpenAiCompatibleProvider::with_egress_transport`]——那里 resolver 只传一次，检查与
+    /// 拨号由同一个值派生，分叉在类型上就不可表达。
     ///
     /// # Errors
     /// 底层 client 构造失败 ⇒ [`ReasoningProviderError::Transport`]。
-    pub fn new(request_timeout: Duration) -> Result<Self, ReasoningProviderError> {
-        humaux_infra_egress::raw::RawHttpPost::new(request_timeout)
-            .map(|raw| Self { raw })
-            .map_err(|e| ReasoningProviderError::Transport(format!("{e:?}")))
+    pub fn with_resolver(
+        request_timeout: Duration,
+        resolver: Arc<dyn ssrf::DnsResolver>,
+    ) -> Result<Self, ReasoningProviderError> {
+        humaux_infra_egress::raw::RawHttpPost::new(
+            request_timeout,
+            Arc::new(SsrfCheckedResolver::new(resolver)),
+        )
+        .map(|raw| Self { raw })
+        .map_err(|e| ReasoningProviderError::Transport(format!("{e:?}")))
     }
 }
 
@@ -871,6 +930,10 @@ impl OpenAiCompatTransport for EgressHttpTransport {
                     "response body exceeded {limit} bytes"
                 )),
                 RawSendError::Network(msg) => ReasoningProviderError::Transport(msg),
+                // ADR-0039：出网策略在建连之前拒了 —— 明确说出来，不要混进泛化的网络错误。
+                RawSendError::EgressRefused { host, reason } => ReasoningProviderError::Transport(
+                    format!("egress policy refused {host}: {reason}"),
+                ),
             })?;
         Ok(OpenAiHttpOutcome {
             status: outcome.status,
@@ -980,6 +1043,39 @@ impl<T: OpenAiCompatTransport, D: CredentialDecryptor> OpenAiCompatibleProvider<
             None => Ok(outcome.body),
             Some(err) => Err(err),
         }
+    }
+}
+
+impl<D: CredentialDecryptor> OpenAiCompatibleProvider<EgressHttpTransport, D> {
+    /// ADR-0039 判据0 —— **resolver 只传一次**：检查（[`ssrf::validate_custom_endpoint`]）和
+    /// 拨号（[`EgressHttpTransport`] 装进 client 的那个 resolver）都从这一个 `resolver` 派生，
+    /// 所以「检查过的地址」和「实际连上的地址」在类型上就不可能来自两个不同的解析器。
+    ///
+    /// 这是生产构造出网 provider 的**唯一**入口。用 [`Self::new`] + 手搭 transport 的写法把
+    /// 两个 resolver 当成两个独立实参，卡 17 的复审就是在生产唯一调用点上抓到那个分叉的
+    /// （运维的 `HUMAUX_PRIVATE_WORKER_DNS_PINS` 只到了检查侧）；`architecture-check` 的
+    /// ADR-0039 判据5/6/7 现在把这条路钉死。
+    ///
+    /// # Errors
+    /// - `base_url` 过不了 §11.4 SSRF 闸 ⇒ 与 [`Self::new`] 同款错误；
+    /// - 底层 client 构造失败 ⇒ [`ReasoningProviderError::Transport`]。
+    pub fn with_egress_transport(
+        descriptor: ReasoningProviderDescriptor,
+        base_url: String,
+        request_timeout: Duration,
+        decryptor: D,
+        policy: ssrf::CustomEndpointPolicy,
+        resolver: Arc<dyn ssrf::DnsResolver>,
+    ) -> Result<Self, ReasoningProviderError> {
+        let transport = EgressHttpTransport::with_resolver(request_timeout, Arc::clone(&resolver))?;
+        Self::new(
+            descriptor,
+            base_url,
+            transport,
+            decryptor,
+            policy,
+            resolver.as_ref(),
+        )
     }
 }
 

@@ -2093,6 +2093,301 @@ fn g80_3_outbound_choke_point(root: &Path) -> Verdict {
 }
 
 // ============================================================================
+// ADR-0039 / §11.4 — an outbound client dials only through the checked resolver.
+// ============================================================================
+
+/// ADR-0039's own sentinel files: the ONLY three `.rs` files that may name
+/// `build_client_with_resolver(` at a call site.
+///
+/// - `crates/infra-network/src/http.rs` is where the function is defined (its own unit tests
+///   call it);
+/// - `crates/infra-egress/src/resolver.rs` (Layer 1A) and `crates/infra-cell/src/transport.rs`
+///   (Layer 1B) are the two modules that install a *validating* resolver into the client.
+///
+/// A fourth call site would mean somebody built an outbound client with a resolver of their own
+/// choosing, bypassing whichever of those two modules owns that destination's policy — which is
+/// exactly the shape of the bug this gate exists for.
+const CHECKED_CLIENT_CALL_SITES: [&str; 3] = [
+    "crates/infra-network/src/http.rs",
+    "crates/infra-egress/src/resolver.rs",
+    "crates/infra-cell/src/transport.rs",
+];
+
+/// The two Layer 1 resolver modules — each must actually still contain a call (living sentinel:
+/// if a refactor drops the pinned-client construction entirely, the "no offenders" scan above
+/// would go green on an empty world).
+const LAYER1_RESOLVER_MODULES: [&str; 2] = [
+    "crates/infra-egress/src/resolver.rs",
+    "crates/infra-cell/src/transport.rs",
+];
+
+const INFRA_NETWORK_HTTP_RS_ADR_0039: &str = "crates/infra-network/src/http.rs";
+
+/// The BYOK transport's resolver may only be chosen in two places: the derived constructor
+/// (`OpenAiCompatibleProvider::with_egress_transport`, which passes one resolver to both the
+/// §11.4 check and the dial) and the rebinding acceptance test, which deliberately drives the
+/// dial leg on its own to prove the refusal happens before the connection.
+const EGRESS_TRANSPORT_RESOLVER_SITES: [&str; 2] = [
+    "crates/adapters/src/byok.rs",
+    "crates/adapters/tests/byok_egress_rebinding.rs",
+];
+
+/// The file that must keep defining the derived constructor (living sentinel for 判据8).
+const ADAPTERS_BYOK_RS_ADR_0039: &str = "crates/adapters/src/byok.rs";
+
+/// This file's own text contains every needle below as a string literal — it must be excluded
+/// or the gate reports itself (same `this_file` exclusion
+/// `crates/projection/tests/no_handwritten_filter_scan.rs` uses).
+const ARCHITECTURE_CHECK_SELF: &str = "xtask/src/architecture_check.rs";
+
+/// Non-comment occurrences of `needle` in `source`.
+fn code_occurrences(source: &str, needle: &str) -> usize {
+    let mut n = 0usize;
+    let mut from = 0usize;
+    while let Some(rel) = source[from..].find(needle) {
+        let at = from + rel;
+        if !line_is_comment_at(source, at) {
+            n += 1;
+        }
+        from = at + needle.len();
+    }
+    n
+}
+
+/// ADR-0039 判据, as a pure comparator over an already-scanned file set so tests can inject a
+/// small fixture instead of scanning the whole workspace (same shape as
+/// [`g80_3_transport_and_registry_check`]).
+///
+/// 判据1 — the resolver-less constructor stays deleted: `build_client(` must not appear as a
+/// call anywhere. While it existed, `infra-egress`'s two transports dialed with the system
+/// resolver while §11.4's SSRF gate checked with an injected one; "the address that was
+/// checked" and "the address that is connected to" were two different lookups, which is the
+/// DNS-rebinding window on the path that carries user provider API keys.
+///
+/// 判据2 — the checked constructor's call-site set ⊆ [`CHECKED_CLIENT_CALL_SITES`]: a fourth
+/// caller means an outbound client built with a resolver that answers to nobody's policy.
+///
+/// 判据3 — living sentinels: `build_client_with_resolver` still defined in
+/// `infra-network/src/http.rs`, no `pub fn build_client(` re-added there, and both Layer 1
+/// resolver modules still call it. Without these, deleting the mechanism outright reads as pass.
+///
+/// 判据4 — `.dns_resolver(` (the `reqwest::ClientBuilder` method that installs a resolver) may
+/// only be named in the Layer 0 construction point, so the "which resolver does this client
+/// dial through" decision cannot be re-made anywhere else.
+///
+/// 判据5–8 close what 判据1–4 could not observe, and which the card-17 review caught in
+/// production: 判据1–4 pin *where* an outbound client is built, never *which resolver a caller
+/// injects*. `bins/private-worker` handed the operator's `HUMAUX_PRIVATE_WORKER_DNS_PINS`
+/// resolver to `OpenAiCompatibleProvider::new` (the check) while `EgressHttpTransport::new`
+/// hardwired `ssrf::SystemDnsResolver` for the dial — two different resolvers, the exact gap
+/// this ADR exists to close, and on a DNS-pinned node also a hard availability regression.
+///
+/// 判据5 — `EgressHttpTransport::new(` is gone repo-wide: a constructor that picks the dial
+/// resolver for you is a constructor that can disagree with the check.
+///
+/// 判据6 — `EgressHttpTransport::with_resolver(` call sites ⊆
+/// [`EGRESS_TRANSPORT_RESOLVER_SITES`]: anywhere else is a caller choosing the dial resolver
+/// independently of the check resolver again.
+///
+/// 判据7 — no file under `bins/<x>/src/` calls `OpenAiCompatibleProvider::new(`: production
+/// goes through `with_egress_transport`, which takes the resolver **once** and derives both
+/// legs from it, so the two cannot be given different values.
+///
+/// 判据8 — living sentinel: `crates/adapters/src/byok.rs` still defines
+/// `pub fn with_egress_transport` and still builds its transport with
+/// `EgressHttpTransport::with_resolver(`. Delete the derived constructor and 判据5/6/7 would
+/// all go green on an empty world.
+fn checked_resolver_dial_problems(files: &[(PathBuf, String)], root: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut call_sites: BTreeSet<String> = BTreeSet::new();
+    let mut resolver_install_sites: BTreeSet<String> = BTreeSet::new();
+    let mut transport_resolver_sites: BTreeSet<String> = BTreeSet::new();
+
+    for (path, source) in files {
+        let rel = display(root, path);
+        if rel == ARCHITECTURE_CHECK_SELF {
+            continue;
+        }
+        // `build_client_with_resolver(` does not contain `build_client(` (the `_with` is in the
+        // way), so the two needles never alias each other.
+        let unchecked = code_occurrences(source, "build_client(");
+        if unchecked > 0 {
+            problems.push(format!(
+                "ADR-0039 判据1 违反: {rel} 调用了 build_client(（{unchecked} 处）—— \
+                 无 resolver 的出网 client 构造已删除，检查过的地址与拨号地址会重新分叉 \
+                 (§11.4 DNS rebinding)"
+            ));
+        }
+        if code_occurrences(source, "build_client_with_resolver(") > 0 {
+            call_sites.insert(rel.clone());
+        }
+        if code_occurrences(source, ".dns_resolver(") > 0 {
+            resolver_install_sites.insert(rel.clone());
+        }
+
+        byok_constructor_problems(&rel, source, &mut transport_resolver_sites, &mut problems);
+    }
+
+    let allowed: BTreeSet<String> = CHECKED_CLIENT_CALL_SITES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for site in &call_sites {
+        if !allowed.contains(site) {
+            problems.push(format!(
+                "ADR-0039 判据2 违反: {site} 构造了出网 client —— 构造点必须是 \
+                 {CHECKED_CLIENT_CALL_SITES:?} 之一（各自装的是那条路自己的已检查 resolver）"
+            ));
+        }
+    }
+
+    let expected_install: BTreeSet<String> =
+        std::iter::once(INFRA_NETWORK_HTTP_RS_ADR_0039.to_string()).collect();
+    if !resolver_install_sites.is_empty() && resolver_install_sites != expected_install {
+        problems.push(format!(
+            "ADR-0039 判据4 违反: .dns_resolver( 的出现点集合 != \
+             {{{INFRA_NETWORK_HTTP_RS_ADR_0039}}}，实际: {resolver_install_sites:?}"
+        ));
+    }
+
+    match files
+        .iter()
+        .find(|(p, _)| display(root, p) == INFRA_NETWORK_HTTP_RS_ADR_0039)
+    {
+        None => problems.push(format!(
+            "missing object: {INFRA_NETWORK_HTTP_RS_ADR_0039}（ADR-0039 判据3 的活哨兵对象）"
+        )),
+        Some((_, source)) => {
+            if !source.contains("pub fn build_client_with_resolver") {
+                problems.push(format!(
+                    "ADR-0039 判据3 违反: {INFRA_NETWORK_HTTP_RS_ADR_0039} 不再定义 \
+                     build_client_with_resolver —— 唯一构造点消失，本闸会在空世界上误绿"
+                ));
+            }
+            if source.contains("pub fn build_client(") {
+                problems.push(format!(
+                    "ADR-0039 判据3 违反: {INFRA_NETWORK_HTTP_RS_ADR_0039} 重新导出了无 \
+                     resolver 的 build_client —— 这正是 card 17 删掉的那条路"
+                ));
+            }
+        }
+    }
+
+    problems.extend(byok_constructor_site_problems(
+        &transport_resolver_sites,
+        files,
+        root,
+    ));
+
+    for module in LAYER1_RESOLVER_MODULES {
+        if !call_sites.contains(module) {
+            problems.push(format!(
+                "ADR-0039 判据3 违反: {module} 不再调用 build_client_with_resolver —— \
+                 Layer 1 的已检查 resolver 装配丢失（missing object，不是「没有违规」）"
+            ));
+        }
+    }
+
+    problems
+}
+
+/// 判据5/6/7 for one file (split out of [`checked_resolver_dial_problems`] only to keep that
+/// function under clippy's `too_many_lines`; the criteria are documented there).
+fn byok_constructor_problems(
+    rel: &str,
+    source: &str,
+    transport_resolver_sites: &mut BTreeSet<String>,
+    problems: &mut Vec<String>,
+) {
+    let hardwired = code_occurrences(source, "EgressHttpTransport::new(");
+    if hardwired > 0 {
+        problems.push(format!(
+            "ADR-0039 判据5 违反: {rel} 调用了 EgressHttpTransport::new(（{hardwired} 处）\
+             —— 那个构造硬接 ssrf::SystemDnsResolver，检查用的 resolver 与拨号用的 \
+             resolver 会再次分叉（§11.4 DNS rebinding，且在 DNS pin 节点上直接拨不通）"
+        ));
+    }
+    if code_occurrences(source, "EgressHttpTransport::with_resolver(") > 0 {
+        transport_resolver_sites.insert(rel.to_owned());
+    }
+    if rel.starts_with("bins/") && rel.contains("/src/") {
+        let hand_paired = code_occurrences(source, "OpenAiCompatibleProvider::new(");
+        if hand_paired > 0 {
+            problems.push(format!(
+                "ADR-0039 判据7 违反: {rel} 调用了 OpenAiCompatibleProvider::new(\
+                 （{hand_paired} 处）—— 生产必须走 with_egress_transport（resolver 只传\
+                 一次，检查与拨号由同一个值派生）；new( 把两者当成两个独立实参，正是 \
+                 card 17 复审在 bins/private-worker 抓到的 P0"
+            ));
+        }
+    }
+}
+
+/// 判据6's allowlist comparison and 判据8's living sentinel.
+fn byok_constructor_site_problems(
+    transport_resolver_sites: &BTreeSet<String>,
+    files: &[(PathBuf, String)],
+    root: &Path,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let allowed_transport_sites: BTreeSet<String> = EGRESS_TRANSPORT_RESOLVER_SITES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for site in transport_resolver_sites {
+        if !allowed_transport_sites.contains(site) {
+            problems.push(format!(
+                "ADR-0039 判据6 违反: {site} 自己挑了 BYOK transport 的拨号 resolver —— \
+                 允许的只有 {EGRESS_TRANSPORT_RESOLVER_SITES:?}（派生构造点 + rebinding 验收）"
+            ));
+        }
+    }
+
+    match files
+        .iter()
+        .find(|(p, _)| display(root, p) == ADAPTERS_BYOK_RS_ADR_0039)
+    {
+        None => problems.push(format!(
+            "missing object: {ADAPTERS_BYOK_RS_ADR_0039}（ADR-0039 判据8 的活哨兵对象）"
+        )),
+        Some((_, source)) => {
+            if !source.contains("pub fn with_egress_transport") {
+                problems.push(format!(
+                    "ADR-0039 判据8 违反: {ADAPTERS_BYOK_RS_ADR_0039} 不再定义 \
+                     with_egress_transport —— 「resolver 只传一次」的派生构造点消失，\
+                     判据5/6/7 会在空世界上误绿"
+                ));
+            }
+            if code_occurrences(source, "EgressHttpTransport::with_resolver(") == 0 {
+                problems.push(format!(
+                    "ADR-0039 判据8 违反: {ADAPTERS_BYOK_RS_ADR_0039} 的派生构造点不再用 \
+                     EgressHttpTransport::with_resolver( 造 transport —— 拨号那条腿的 \
+                     resolver 来源已经不是同一个值了"
+                ));
+            }
+        }
+    }
+
+    problems
+}
+
+/// Real-repository entry point for [`checked_resolver_dial_problems`].
+fn checked_resolver_dial_gate(root: &Path) -> Verdict {
+    let files = walk_workspace_rs(root);
+    if files.is_empty() {
+        return Verdict::NotApplicable(
+            "missing object: workspace .rs sources (crates/bins/xtask)".to_string(),
+        );
+    }
+    let problems = checked_resolver_dial_problems(&files, root);
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
+// ============================================================================
 // ADR-0012 §决定1/2 — the RPC transport must stay a Unix domain socket + kernel
 // peer-credential identity, never TCP.
 // ============================================================================
@@ -4693,6 +4988,10 @@ pub fn run(_args: &[String]) -> i32 {
             "ADR-0014 (gateway Qdrant access is QdrantReadOnly, never ReadWrite)",
             adr_0014_gateway_qdrant_read_only_gate(&root),
         ),
+        (
+            "ADR-0039 / §11.4 (outbound client dials only through the checked resolver)",
+            checked_resolver_dial_gate(&root),
+        ),
     ];
     checks.extend(provider_plane_architecture_gate_checks(&root));
 
@@ -6416,6 +6715,256 @@ mod tests {
              DEADMAN_HEALTHCHECK,\n\
          }\n"
         .to_string()
+    }
+
+    // --- ADR-0039: outbound client dials only through the checked resolver ---
+
+    /// The three files ADR-0039's gate expects to exist, in their post-card-17 shape.
+    fn adr_0039_clean_fixture(root: &Path) -> Vec<(PathBuf, String)> {
+        vec![
+            (
+                root.join("crates/infra-network/src/http.rs"),
+                "pub fn build_client_with_resolver<R>(c: ClientConfig, r: Arc<R>) -> Out {\n    \
+                 client_builder(c).dns_resolver(r).build()\n}\n\
+                 #[cfg(test)]\nmod t { fn x() { build_client_with_resolver(cfg, res); } }\n"
+                    .to_string(),
+            ),
+            (
+                root.join("crates/infra-egress/src/resolver.rs"),
+                "pub fn build_pinned_client(c: ClientConfig) -> Out {\n    \
+                 build_client_with_resolver(c, Arc::new(PinnedResolver::new()))\n}\n"
+                    .to_string(),
+            ),
+            (
+                root.join("crates/infra-cell/src/transport.rs"),
+                "fn with_resolver() { let c = build_client_with_resolver(cfg, resolver)?; }\n"
+                    .to_string(),
+            ),
+            (
+                root.join("crates/adapters/src/byok.rs"),
+                "pub fn with_egress_transport(r: Arc<dyn ssrf::DnsResolver>) -> Out {\n    \
+                 let t = EgressHttpTransport::with_resolver(timeout, Arc::clone(&r))?;\n    \
+                 Self::new(d, url, t, key, policy, r.as_ref())\n}\n"
+                    .to_string(),
+            ),
+        ]
+    }
+
+    /// Positive control: the clean fixture scans clean, so a later red is the injected fault
+    /// and not a matcher that is broken by construction.
+    #[test]
+    fn adr_0039_clean_fixture_has_no_problems() {
+        let root = PathBuf::from("/fixture-root");
+        let problems = checked_resolver_dial_problems(&adr_0039_clean_fixture(&root), &root);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// 注错 a — **the card's own fault injection**: a caller reintroduces a system-DNS dial by
+    /// calling the resolver-less `build_client(`. The scan must go red and name the file.
+    #[test]
+    fn adr_0039_fault_system_dns_dial_reintroduced_in_a_caller_is_red_and_named() {
+        let root = PathBuf::from("/fixture-root");
+        let mut files = adr_0039_clean_fixture(&root);
+        files.push((
+            root.join("crates/infra-egress/src/raw.rs"),
+            "pub fn new(t: Duration) -> Out {\n    \
+             let client = build_client(ClientConfig { request_timeout: t })?;\n    \
+             Ok(Self { client })\n}\n"
+                .to_string(),
+        ));
+        let problems = checked_resolver_dial_problems(&files, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("crates/infra-egress/src/raw.rs") && p.contains("判据1")),
+            "reintroducing build_client( must go red: {problems:?}"
+        );
+    }
+
+    /// 注错 b: a fourth crate builds its own outbound client through the checked constructor
+    /// but with a resolver of its own choosing — no Layer 1 policy owns that destination.
+    #[test]
+    fn adr_0039_fault_fourth_call_site_is_red_and_named() {
+        let root = PathBuf::from("/fixture-root");
+        let mut files = adr_0039_clean_fixture(&root);
+        files.push((
+            root.join("crates/adapters/src/dashscope.rs"),
+            "fn c() { let _ = build_client_with_resolver(cfg, Arc::new(MyOwnResolver)); }\n"
+                .to_string(),
+        ));
+        let problems = checked_resolver_dial_problems(&files, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("crates/adapters/src/dashscope.rs") && p.contains("判据2")),
+            "a fourth outbound-client construction site must go red: {problems:?}"
+        );
+    }
+
+    /// 注错 c: the resolver-less constructor is re-exported from Layer 0 (nobody calls it yet)
+    /// — the living sentinel must still go red, because the next caller is one edit away.
+    #[test]
+    fn adr_0039_fault_build_client_reexported_is_red() {
+        let root = PathBuf::from("/fixture-root");
+        let mut files = adr_0039_clean_fixture(&root);
+        files[0]
+            .1
+            .push_str("pub fn build_client(c: ClientConfig) -> Out { unimplemented!() }\n");
+        let problems = checked_resolver_dial_problems(&files, &root);
+        assert!(
+            problems.iter().any(|p| p.contains("判据3")),
+            "re-adding pub fn build_client must go red: {problems:?}"
+        );
+    }
+
+    /// 注错 d: a Layer 1 resolver module stops installing its resolver entirely. "No offender
+    /// found" must not read as pass when the mechanism itself is gone.
+    #[test]
+    fn adr_0039_fault_layer1_resolver_module_stops_calling_is_red() {
+        let root = PathBuf::from("/fixture-root");
+        let mut files = adr_0039_clean_fixture(&root);
+        files[1].1 = "pub fn build_pinned_client() { todo!() }\n".to_string();
+        let problems = checked_resolver_dial_problems(&files, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("crates/infra-egress/src/resolver.rs") && p.contains("判据3")),
+            "a Layer 1 module that stops installing its resolver must go red: {problems:?}"
+        );
+    }
+
+    /// 注错 e: `.dns_resolver(` named outside Layer 0 — the "which resolver" decision re-made
+    /// somewhere the gate does not govern.
+    #[test]
+    fn adr_0039_fault_dns_resolver_installed_outside_layer0_is_red() {
+        let root = PathBuf::from("/fixture-root");
+        let mut files = adr_0039_clean_fixture(&root);
+        files.push((
+            root.join("crates/adapters/src/qdrant.rs"),
+            "fn c(b: ClientBuilder) { let _ = b.dns_resolver(Arc::new(Whatever)); }\n".to_string(),
+        ));
+        let problems = checked_resolver_dial_problems(&files, &root);
+        assert!(
+            problems.iter().any(|p| p.contains("判据4")),
+            "installing a resolver outside Layer 0 must go red: {problems:?}"
+        );
+    }
+
+    /// Negative control: a *comment* mentioning the deleted constructor is documentation, not a
+    /// call — the gate must not be a grep that punishes rustdoc for naming what it removed.
+    #[test]
+    fn adr_0039_comments_naming_build_client_are_not_offenders() {
+        let root = PathBuf::from("/fixture-root");
+        let mut files = adr_0039_clean_fixture(&root);
+        files.push((
+            root.join("crates/infra-egress/src/raw.rs"),
+            "/// ADR-0039: the resolver-less build_client( is deleted.\n\
+             // build_client(cfg) used to live here.\n\
+             pub struct RawHttpPost;\n"
+                .to_string(),
+        ));
+        let problems = checked_resolver_dial_problems(&files, &root);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// 注错 f — **the P0 the card-17 review found in production**: a bin rebuilds the
+    /// resolver-hardwiring transport constructor's call. 判据5 must name the file.
+    #[test]
+    fn adr_0039_fault_hardwired_transport_constructor_is_red_and_named() {
+        let root = PathBuf::from("/fixture-root");
+        let mut files = adr_0039_clean_fixture(&root);
+        files.push((
+            root.join("bins/private-worker/src/main.rs"),
+            "fn boot() { let t = EgressHttpTransport::new(http_timeout)?; }\n".to_string(),
+        ));
+        let problems = checked_resolver_dial_problems(&files, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("bins/private-worker/src/main.rs") && p.contains("判据5")),
+            "reintroducing EgressHttpTransport::new( must go red: {problems:?}"
+        );
+    }
+
+    /// 注错 g: a fourth file picks the BYOK transport's dial resolver by itself — the dial
+    /// resolver and the check resolver are two independent values again.
+    #[test]
+    fn adr_0039_fault_transport_resolver_chosen_outside_the_derived_constructor_is_red() {
+        let root = PathBuf::from("/fixture-root");
+        let mut files = adr_0039_clean_fixture(&root);
+        files.push((
+            root.join("bins/consolidation-worker/src/main.rs"),
+            "fn boot() { let t = EgressHttpTransport::with_resolver(t, Arc::new(Other))?; }\n"
+                .to_string(),
+        ));
+        let problems = checked_resolver_dial_problems(&files, &root);
+        assert!(
+            problems.iter().any(
+                |p| p.contains("bins/consolidation-worker/src/main.rs") && p.contains("判据6")
+            ),
+            "choosing the dial resolver outside the derived constructor must go red: {problems:?}"
+        );
+    }
+
+    /// 注错 h — the exact production shape the review caught: a bin calls
+    /// `OpenAiCompatibleProvider::new(`, i.e. supplies the check resolver by hand next to a
+    /// separately built transport. 判据7 must go red **even though** the transport line itself
+    /// looks innocent (that is why 判据1–4 stayed green on it).
+    #[test]
+    fn adr_0039_fault_bin_hand_pairs_check_resolver_and_transport_is_red() {
+        let root = PathBuf::from("/fixture-root");
+        let mut files = adr_0039_clean_fixture(&root);
+        files.push((
+            root.join("bins/private-worker/src/main.rs"),
+            "fn boot() {\n    let p = OpenAiCompatibleProvider::new(d, url, transport, k, \
+             policy, resolver.as_ref())?;\n}\n"
+                .to_string(),
+        ));
+        let problems = checked_resolver_dial_problems(&files, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("bins/private-worker/src/main.rs") && p.contains("判据7")),
+            "a bin supplying the check resolver by hand must go red: {problems:?}"
+        );
+    }
+
+    /// 注错 i: the derived constructor is deleted. 判据5/6/7 would all be vacuously green —
+    /// the living sentinel must go red instead.
+    #[test]
+    fn adr_0039_fault_derived_constructor_deleted_is_red() {
+        let root = PathBuf::from("/fixture-root");
+        let mut files = adr_0039_clean_fixture(&root);
+        files[3].1 = "pub struct EgressHttpTransport;\n".to_string();
+        let problems = checked_resolver_dial_problems(&files, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("crates/adapters/src/byok.rs") && p.contains("判据8")),
+            "deleting with_egress_transport must go red: {problems:?}"
+        );
+    }
+
+    /// Negative control for 判据7: an integration test may still call
+    /// `OpenAiCompatibleProvider::new(` — that is how a fake transport gets injected, and the
+    /// rule is about production bins, not about every mention of the name.
+    #[test]
+    fn adr_0039_tests_may_still_call_the_generic_constructor() {
+        let root = PathBuf::from("/fixture-root");
+        let mut files = adr_0039_clean_fixture(&root);
+        files.push((
+            root.join("bins/private-worker/tests/distill_hop_e2e.rs"),
+            "fn p() { OpenAiCompatibleProvider::new(d, url, AlwaysFail, k, pol, r).unwrap() }\n"
+                .to_string(),
+        ));
+        let problems = checked_resolver_dial_problems(&files, &root);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// The real repository passes the gate.
+    #[test]
+    fn adr_0039_real_repo_is_green() {
+        assert_eq!(checked_resolver_dial_gate(&real_root()), Verdict::Pass);
     }
 
     /// §80.1 准入条件: the real repo, once T4.1 lands, must be green end to end (includes a

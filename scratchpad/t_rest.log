@@ -1,0 +1,371 @@
+##### humaux-retrieval-provider
+   Compiling hyper-rustls v0.27.9
+   Compiling lettre v0.11.23
+   Compiling reqwest v0.12.28
+   Compiling humaux-infra-network v0.1.0 (/Volumes/data/humaux-thread/crates/infra-network)
+   Compiling humaux-infra-cell v0.1.0 (/Volumes/data/humaux-thread/crates/infra-cell)
+   Compiling humaux-infra-egress v0.1.0 (/Volumes/data/humaux-thread/crates/infra-egress)
+   Compiling humaux-adapters v0.1.0 (/Volumes/data/humaux-thread/crates/adapters)
+   Compiling humaux-retrieval-provider v0.1.0 (/Volumes/data/humaux-thread/crates/retrieval-provider)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4m 30s
+     Running unittests src/lib.rs (target/debug/deps/humaux_retrieval_provider-ded505a0914715e6)
+
+running 94 tests
+test adapters::tests::dashscope_status_mapping_matches_19_2 ... ok
+test adapters::tests::admission_gate_admits_under_the_unconstrained_placeholder_budgets ... ok
+test adapters::tests::deterministic_vector_never_divides_by_zero_dimension ... ok
+test adapters::tests::deterministic_vector_is_pure_and_dimension_stable ... ok
+test adapters::tests::parse_embedding_response_rejects_a_duplicate_index_with_a_single_requested_text ... ok
+test adapters::tests::parse_embedding_response_rejects_an_out_of_range_index ... ok
+test adapters::tests::parse_embedding_response_rejects_a_duplicate_index ... ok
+test adapters::tests::parse_embedding_response_falls_back_to_estimate_when_usage_is_absent ... ok
+test adapters::tests::parse_embedding_response_rejects_fewer_docs_than_requested ... ok
+test adapters::tests::parse_embedding_response_accepts_a_clean_response_and_prefers_reported_tokens ... ok
+test adapters::tests::parse_embedding_response_rejects_more_docs_than_requested ... ok
+test adapters::tests::parse_embedding_response_rejects_wrong_embedding_length ... ok
+test adapters::tests::empty_batch_still_rejects_a_dimension_outside_model_options ... ok
+test admission::tests::accept_when_every_tier_has_room_and_provider_is_healthy ... ok
+test admission::tests::admission_budget_is_measured_in_tokens_not_request_count ... ok
+test adapters::tests::parse_embedding_response_rejects_invalid_json ... ok
+test admission::tests::degraded_health_alone_still_admits_when_tiers_have_room ... ok
+test adapters::tests::dispatched_transport_failure_consumes_budget ... ok
+test adapters::tests::persistent_budget_rejection_stops_before_transport_and_disclosure ... ok
+test adapters::tests::mark_failure_stops_before_transport_and_releases_budget ... ok
+test adapters::tests::dashscope_query_sut_commits_exact_batch_provenance_before_transport ... ok
+test admission::tests::queue_when_a_tier_is_tight_but_priority_and_deadline_allow_waiting ... ok
+test admission::tests::push_with_plan_derives_weight_and_burst_from_the_plan_entitlement ... ok
+test admission::tests::embedding_and_rerank_demand_are_scheduled_independently ... ok
+test admission::tests::burst_cap_bounds_deficit_growth_while_the_head_item_waits ... ok
+test admission::tests::reject_policy_when_plan_does_not_entitle_this_purpose ... ok
+test admission::tests::burst_cap_is_floored_at_head_cost_so_an_expensive_item_still_clears ... ok
+test admission::tests::flooding_tenant_does_not_starve_a_lower_cost_tenant ... ok
+test admission::tests::plan_weight_gives_higher_throughput_over_many_ticks ... ok
+test admission::tests::reject_quota_when_monthly_plan_ceiling_is_exhausted ... ok
+test admission::tests::reject_policy_when_provider_circuit_breaker_reports_policy_blocked ... ok
+test admission::tests::reject_quota_when_request_structurally_exceeds_a_tier_ceiling ... ok
+test admission::tests::shed_when_tier_is_tight_and_deadline_already_exceeded ... ok
+test admission::tests::shed_when_tier_is_tight_and_priority_is_low ... ok
+test admission::tests::status_2xx_is_not_an_error ... ok
+test admission::tests::status_401_splits_by_key_domain_invalid_vs_waiting_key ... ok
+test admission::tests::status_408_and_425_map_to_transient_retry_not_permanent ... ok
+test admission::tests::status_429_clamps_an_absurd_retry_after_to_max ... ok
+test admission::tests::status_429_honors_retry_after_over_the_computed_backoff ... ok
+test admission::tests::status_429_maps_to_provider_rate_limited_with_bounded_backoff ... ok
+test admission::tests::status_5xx_maps_to_transient_retry ... ok
+test cost::tests::batch_discount_only_applies_when_the_call_is_batched ... ok
+test cost::tests::output_token_price_bills_the_generated_tokens ... ok
+test cost::tests::estimated_and_actual_usage_produce_independently_correct_costs ... ok
+test cost::tests::per_million_token_pricing_scales_linearly ... ok
+test cost::tests::request_price_is_a_flat_addition ... ok
+test cost::tests::same_usage_and_pricing_snapshot_always_yields_the_same_cost ... ok
+test failover::tests::a_different_model_is_not_calibrated_by_the_old_models_profile ... ok
+test failover::tests::a_different_provider_is_not_calibrated_by_the_old_providers_profile ... ok
+test failover::tests::all_four_axes_matching_is_what_makes_it_calibrated ... ok
+test failover::tests::calibrated_path_emits_no_warn_event ... ok
+test failover::tests::calibrated_revision_gates_normally ... ok
+test failover::tests::compatible_pair_with_wrong_purpose_permit_is_rejected ... ok
+test failover::tests::never_calibrated_pair_stands_down_with_no_attempted_profile ... ok
+test failover::tests::identical_contracts_are_a_compatible_failover ... ok
+test failover::tests::dimension_change_is_rejected_as_migration_not_failover ... ok
+test failover::tests::normalization_change_requires_migration ... ok
+test failover::tests::projection_version_change_requires_migration ... ok
+test failover::tests::stand_down_loud_actually_emits_a_warn_event ... ok
+test failover::tests::uncalibrated_revision_stands_down_loudly_instead_of_reusing_old_profile ... ok
+test health::tests::every_failure_scenario_maps_to_its_documented_state_and_label ... ok
+test health::tests::health_state_and_admission_provider_health_state_round_trip_every_variant ... ok
+test admission::tests::weight_does_not_affect_completeness_or_isolation ... ok
+test health::tests::degraded_still_admits_new_calls ... ok
+test health::tests::independent_keys_do_not_share_state ... ok
+test health::tests::rate_limited_and_policy_blocked_also_open_the_breaker ... ok
+test health::tests::unavailable_opens_breaker_without_touching_unrelated_projection_state ... ok
+test health::tests::unknown_key_defaults_healthy_and_admits ... ok
+test metrics::tests::one_call_increments_all_four_families_by_the_recorded_amount ... ok
+test metrics::tests::every_frozen_result_label_value_is_independently_observable ... ok
+test metrics::tests::purpose_label_matches_frozen_values ... ok
+test pricing::tests::a_historical_timestamp_still_resolves_to_the_old_row_after_a_newer_one_is_added ... ok
+test pricing::tests::effective_to_is_exclusive ... ok
+test pricing::tests::on_an_overlap_the_newest_effective_from_wins_regardless_of_slice_order ... ok
+test pricing::tests::no_covering_window_returns_none ... ok
+test pricing::tests::open_ended_window_covers_everything_from_effective_from ... ok
+test pricing::tests::resolves_the_window_containing_at ... ok
+test router::tests::admit_closure_rejection_surfaces_as_policy_rejected ... ok
+test router::tests::effective_from_boundary_is_inclusive ... ok
+test router::tests::effective_to_boundary_is_exclusive ... ok
+test router::tests::enabled_false_never_matches ... ok
+test router::tests::incompatible_embedding_route_is_rejected_even_at_higher_priority ... ok
+test router::tests::no_candidates_reports_zero_attempted ... ok
+test router::tests::priority_breaks_ties_among_equally_specific_candidates ... ok
+test router::tests::projection_compatibility_does_not_apply_to_rerank_purpose ... ok
+test router::tests::region_specific_route_beats_region_agnostic_at_equal_priority ... ok
+test router::tests::region_specific_route_does_not_match_a_different_region_query ... ok
+test router::tests::same_provider_and_model_but_different_dimension_is_rejected ... ok
+test router::tests::tenant_specific_route_beats_global_default_at_equal_priority ... ok
+test router::tests::wrong_purpose_never_matches_regardless_of_priority ... ok
+test failover::tests::compatible_pair_with_expired_permit_is_rejected ... ok
+test health::tests::policy_blocked_never_half_opens_on_a_timer ... ok
+test health::tests::unavailable_half_opens_after_backoff_elapses ... ok
+test health::tests::rate_limited_half_opens_after_backoff_elapses ... ok
+
+test result: ok. 94 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/contract_tests.rs (target/debug/deps/contract_tests-18ce3c7d80dc7999)
+
+running 17 tests
+test provider_error_mapping_has_a_real_http_status_half_too ... ok
+test dimension_outside_model_options_is_rejected ... ok
+test empty_input_is_a_free_no_op ... ok
+test embedding_card_and_query_paths_agree_on_equal_text ... ok
+test forced_error_does_not_persist_past_one_call ... ok
+test batch_unsupported_model_rejects_more_than_one_item ... ok
+test each_declared_dimension_option_produces_a_vector_of_that_length ... ok
+test text_exactly_at_max_input_tokens_is_accepted ... ok
+test sealed_debug_redacts_query_and_card_bodies ... ok
+test embedding_input_output_shape ... ok
+test text_over_max_input_tokens_is_rejected ... ok
+test sealing_rejects_query_and_card_size_before_egress ... ok
+test unicode_text_is_not_mangled_or_byte_miscounted ... ok
+test batch_supported_model_accepts_multiple_items_in_one_call ... ok
+test rerank_orders_descending_by_score_and_preserves_original_index ... ok
+test provider_error_is_mapped_through_unaltered ... ok
+test rerank_max_token_uses_the_query_times_docs_plus_sum_formula ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/dashscope_live_smoke.rs (target/debug/deps/dashscope_live_smoke-3d8a1e1efd74c7e3)
+
+running 1 test
+test dashscope_live_smoke ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/router_rls_integration.rs (target/debug/deps/router_rls_integration-e14e3ff691ba4ee0)
+
+running 3 tests
+test route_purpose_wire_strings_match_live_db_check_constraint ... ok
+test role_gateway_has_no_write_grant_on_control_retrieval_provider_routes ... ok
+test tenant_specific_route_is_isolated_and_global_default_is_shared ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/sealed_type_gate_ui.rs (target/debug/deps/sealed_type_gate_ui-c4edfc934d980c4a)
+
+running 1 test
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.43
+    Checking rustls-webpki v0.103.15
+    Checking tokio-rustls v0.26.4
+    Checking hyper-rustls v0.27.9
+    Checking lettre v0.11.23
+    Checking reqwest v0.12.28
+    Checking humaux-infra-network v0.1.0 (/Volumes/data/humaux-thread/crates/infra-network)
+    Checking humaux-infra-cell v0.1.0 (/Volumes/data/humaux-thread/crates/infra-cell)
+    Checking humaux-infra-egress v0.1.0 (/Volumes/data/humaux-thread/crates/infra-egress)
+    Checking humaux-adapters v0.1.0 (/Volumes/data/humaux-thread/crates/adapters)
+    Checking humaux-retrieval-provider v0.1.0 (/Volumes/data/humaux-thread/crates/retrieval-provider)
+    Checking humaux-retrieval-provider-tests v0.0.0 (/Volumes/data/humaux-thread/target/tests/trybuild/humaux-retrieval-provider)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.43s
+
+
+test tests/ui/fail_embed_queries_raw_string.rs ... ok
+test tests/ui/fail_construct_sealed_query.rs ... ok
+test tests/ui/fail_construct_query_provenance.rs ... ok
+test tests/ui/fail_construct_query_wire_binding.rs ... ok
+
+
+test sealed_retrieval_query_type_narrowing ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.27s
+
+   Doc-tests humaux_retrieval_provider
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+humaux-retrieval-provider EXIT=0
+##### humaux-private-worker
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling lettre v0.11.23
+   Compiling reqwest v0.12.28
+   Compiling humaux-infra-network v0.1.0 (/Volumes/data/humaux-thread/crates/infra-network)
+   Compiling humaux-infra-egress v0.1.0 (/Volumes/data/humaux-thread/crates/infra-egress)
+   Compiling humaux-infra-cell v0.1.0 (/Volumes/data/humaux-thread/crates/infra-cell)
+   Compiling humaux-adapters v0.1.0 (/Volumes/data/humaux-thread/crates/adapters)
+   Compiling humaux-private-worker v0.1.0 (/Volumes/data/humaux-thread/bins/private-worker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 58s
+     Running unittests src/lib.rs (target/debug/deps/humaux_private_worker-6b7196625c230b5b)
+
+running 4 tests
+test distill::tests::rejection_reasons_match_the_metrics_registry_labels ... ok
+test distill::tests::config_is_closed ... ok
+test distill::tests::memory_content_carries_the_card_fields ... ok
+test tests::config_and_payload_are_closed ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/humaux_private_worker-96c5280a60addee5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contribution_execution_runner.rs (target/debug/deps/contribution_execution_runner-04520d1afbda190b)
+
+running 2 tests
+test runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths ... ignored, requires disposable PostgreSQL 18 migrated through 0131
+test runner_config_fails_closed_without_database_or_provider ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/derived_dispatch_e2e.rs (target/debug/deps/derived_dispatch_e2e-330c681a9c0e524e)
+
+running 10 tests
+test a_tenant_the_deployment_cannot_admit_is_named_and_does_not_starve_the_ready_one ... ok
+test a_pass_that_distilled_nothing_releases_the_job_instead_of_completing_it ... ok
+humaux-private-worker: distill evidence=01a08e9f-4c99-79f5-9834-7f5d605a014f tenant=01a08e9f-43a7-7a5b-b925-14b3b7179727 deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-4ca9-76ef-afb2-e7a11c81af22 tenant=01a08e9f-43a7-7a5b-b925-14b3b7179727 deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-4cb0-7603-9e9f-1449d606d605 tenant=01a08e9f-43a7-7a5b-b925-14b3b7179727 deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill job 01a08e9f-4ca4-7ac6-86d1-1207bf4984d2 (tenant 01a08e9f-43a7-7a5b-b925-14b3b7179727) not ready: no admitted PRIVATE_DISTILL_TEXT route binding (3 evidence rows deferred)
+humaux-private-worker: distill evidence=01a08e9f-4c99-79f5-9834-7f5d605a014f tenant=01a08e9f-43a7-7a5b-b925-14b3b7179727 deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-4ca9-76ef-afb2-e7a11c81af22 tenant=01a08e9f-43a7-7a5b-b925-14b3b7179727 deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-4cb0-7603-9e9f-1449d606d605 tenant=01a08e9f-43a7-7a5b-b925-14b3b7179727 deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill job 01a08e9f-4cad-72ca-a06a-a02a2a07efe5 (tenant 01a08e9f-43a7-7a5b-b925-14b3b7179727) not ready: no admitted PRIVATE_DISTILL_TEXT route binding (3 evidence rows deferred)
+humaux-private-worker: distill evidence=01a08e9f-4c99-79f5-9834-7f5d605a014f tenant=01a08e9f-43a7-7a5b-b925-14b3b7179727 deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-4ca9-76ef-afb2-e7a11c81af22 tenant=01a08e9f-43a7-7a5b-b925-14b3b7179727 deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-4cb0-7603-9e9f-1449d606d605 tenant=01a08e9f-43a7-7a5b-b925-14b3b7179727 deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill job 01a08e9f-4cb2-7898-9337-1b725b11d325 (tenant 01a08e9f-43a7-7a5b-b925-14b3b7179727) not ready: no admitted PRIVATE_DISTILL_TEXT route binding (3 evidence rows deferred)
+humaux-private-worker: distill dispatch claimed=3 completed=0 not_ready=3 deferred=0 dead=0 lost_lease=0 evidence_claimed=9 done=0 failed=0 memories=0 rejected=0
+humaux-private-worker: signal received between passes, exiting
+test sigterm_mid_serve_drains_and_leaves_no_job_processing_with_a_live_lease ... ok
+test expired_lease_is_reclaimed_and_the_stale_token_settles_nothing ... ok
+test dispatch_discovers_pending_evidence_in_two_tenants ... ok
+humaux-private-worker: distill evidence=01a08e9f-5187-75f2-9fb7-d3cd6882a094 tenant=01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-518e-7b29-99c9-b9c3d27a1bdc tenant=01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-5193-7463-bfbb-6a88904066cf tenant=01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill job 01a08e9f-518c-7336-9e68-beae9e1ab2b7 (tenant 01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a) not ready: no admitted PRIVATE_DISTILL_TEXT route binding (3 evidence rows deferred)
+humaux-private-worker: distill evidence=01a08e9f-5187-75f2-9fb7-d3cd6882a094 tenant=01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-518e-7b29-99c9-b9c3d27a1bdc tenant=01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-5193-7463-bfbb-6a88904066cf tenant=01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill job 01a08e9f-5190-7ae5-8e00-910b36ba3c37 (tenant 01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a) not ready: no admitted PRIVATE_DISTILL_TEXT route binding (3 evidence rows deferred)
+humaux-private-worker: distill evidence=01a08e9f-5187-75f2-9fb7-d3cd6882a094 tenant=01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-518e-7b29-99c9-b9c3d27a1bdc tenant=01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill evidence=01a08e9f-5193-7463-bfbb-6a88904066cf tenant=01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a deferred: no admitted PRIVATE_DISTILL_TEXT route binding
+humaux-private-worker: distill job 01a08e9f-5195-7664-b6d3-c9ef1698dcad (tenant 01a08e9f-5147-73a1-80aa-3d6d2c9d0a2a) not ready: no admitted PRIVATE_DISTILL_TEXT route binding (3 evidence rows deferred)
+humaux-private-worker: distill dispatch claimed=3 completed=0 not_ready=3 deferred=0 dead=0 lost_lease=0 evidence_claimed=9 done=0 failed=0 memories=0 rejected=0
+humaux-private-worker: signal received between passes, exiting
+test sigint_mid_serve_drains_and_leaves_no_job_processing_with_a_live_lease ... ok
+test dispatch_pass_with_no_pending_work_claims_nothing ... ok
+humaux-private-worker RPC listening on /tmp/hp15-rpc-01a08e9f53f97720a79e59c4357a00b3.sock
+humaux-private-worker: signal received, RPC listener closing
+test sigterm_to_the_inference_rpc_listener_exits_zero ... ok
+test two_racing_claims_take_each_job_exactly_once ... ok
+test worker_session_still_sees_only_its_own_tenants_jobs ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.86s
+
+     Running tests/distill_hop_e2e.rs (target/debug/deps/distill_hop_e2e-d38255131d880e64)
+
+running 8 tests
+test d2_over_ceiling_candidate_rejected_not_downgraded ... ok
+test d7_declared_subjects_reach_the_distilled_memory_with_spans ... ok
+test d4_parser_fail_closed_marks_outbox_failed ... ok
+test d6_retryable_failures_hand_the_row_back_for_a_later_pass ... ok
+test d5_two_passes_and_expired_lease_never_duplicate_memories ... ok
+test d3b_undistilled_ticket_stays_issued ... ok
+test d3_zero_memories_settles_outbox_and_ticket ... ok
+test d1_live_distill_writes_memories_and_projection_resolves_ticket ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.18s
+
+     Running tests/start_manual_contribution_command_0131.rs (target/debug/deps/start_manual_contribution_command_0131-dd6b70a1aed25746)
+
+running 1 test
+test command_owns_contracts_and_serializes_concurrent_first_creators ... ignored, requires disposable PostgreSQL 18 migrated through 0131
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests humaux_private_worker
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+humaux-private-worker EXIT=0
+##### humaux-consolidation-worker
+   Compiling humaux-consolidation-worker v0.1.0 (/Volumes/data/humaux-thread/bins/consolidation-worker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 41s
+     Running unittests src/lib.rs (target/debug/deps/humaux_consolidation_worker-ebf91845dc4d5a47)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/humaux_consolidation_worker-b12a3bb436f90767)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/consolidation_hop_e2e.rs (target/debug/deps/consolidation_hop_e2e-7c98b4b44abfe5a8)
+
+running 7 tests
+test t2_wrong_peer_uid_rejected_before_body ... ok
+test t4_build_rollup_cannot_mutate_base_memory ... ok
+test t7_rollup_inherits_subject_links_through_publish_rollup ... ok
+test t6_tenant_scoped_run_never_consumes_workspace_shared_inputs ... ok
+test t3_same_call_id_twice_claims_once ... ok
+test t5_manifest_mismatch_fails_closed_without_provider_call ... ok
+test t1_full_inference_hop_publishes_ticket ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.60s
+
+     Running tests/derived_dispatch_e2e.rs (target/debug/deps/derived_dispatch_e2e-287a5be1d6c069be)
+
+running 14 tests
+test claimed_job_context_cannot_read_the_other_tenant ... ok
+test an_unprovisioned_tenant_is_released_with_a_backoff_and_never_parked ... ok
+test dispatch_discovers_and_completes_work_in_two_tenants ... ok
+test expired_lease_is_reclaimed_and_published_exactly_once ... ok
+test dispatch_pass_with_no_pending_work_claims_nothing ... ok
+test a_lease_lost_at_publish_time_writes_no_second_rollup ... ok
+test run_once_binary_exits_zero_promptly_with_no_input ... ok
+test readyz_binary_probes_its_uds_peer_and_names_it_when_down ... ok
+humaux-consolidation-worker: job 01a08ead-d9ce-73e0-a1b1-a76d43c2e57e (tenant 01a08ead-d985-73fb-9dc4-6ba26603558e) failed: PrivateReasoningPort error (redacted, fingerprint=80be40d1)
+humaux-consolidation-worker: dispatch pass claimed=1 published=0 no_output=0 stale=0 not_ready=0 deferred=1 dead=0 lost_lease=0
+humaux-consolidation-worker: signal received between passes, exiting
+test sigint_mid_pass_drains_and_leaves_no_job_processing_with_a_live_lease ... ok
+humaux-consolidation-worker: job 01a08ead-ee8f-7c1a-8906-4ce8a51d580c (tenant 01a08ead-ee2f-7ae6-acf6-71a19697420e) failed: PrivateReasoningPort error (redacted, fingerprint=80be40d1)
+humaux-consolidation-worker: dispatch pass claimed=1 published=0 no_output=0 stale=0 not_ready=0 deferred=1 dead=0 lost_lease=0
+humaux-consolidation-worker: signal received between passes, exiting
+test sigterm_mid_pass_drains_and_leaves_no_job_processing_with_a_live_lease ... ok
+test two_racing_workers_claim_each_job_exactly_once ... ok
+test two_serialized_claims_take_each_job_exactly_once_under_a_held_lock ... ok
+test unreadable_payload_is_deferred_then_parked ... ok
+test readyz_binary_names_postgresql_when_the_database_is_down ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.08s
+
+     Running tests/run_once_e2e.rs (target/debug/deps/run_once_e2e-4fa5666b6463af97)
+
+running 3 tests
+test run_once_error_displays ... ok
+test run_once_skips_inference_when_no_inputs ... ok
+test run_once_publishes_rollup_from_inference_result ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+   Doc-tests humaux_consolidation_worker
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+humaux-consolidation-worker EXIT=0
+##### humaux-mcp-gateway
+error: package ID specification `humaux-mcp-gateway` did not match any packages
+humaux-mcp-gateway EXIT=101
+##### humaux-gateway-lib
+error: package ID specification `humaux-gateway-lib` did not match any packages
+humaux-gateway-lib EXIT=101
+REST_DONE

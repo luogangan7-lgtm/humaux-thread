@@ -28,6 +28,13 @@ zeroize = "1"
 # site (§50.1) — rather than naming `std::env::var` itself, which `xtask`'s §78 boundary lint
 # forbids outside `crates/contracts/`/`bins/*`/`xtask/`/`tests/`.
 humaux-contracts = { path = "../contracts" }
+# ADR-0039: `resolver::PinnedResolver` runs the injected (possibly blocking, e.g.
+# `SystemCheckedResolve`'s `std::net::ToSocketAddrs`) `CheckedDnsResolve` on a blocking thread
+# via `tokio::task::spawn_blocking` rather than inside the async resolver future itself —
+# `reqwest::dns::Resolve::resolve` is polled on the caller's async runtime, and a blocking
+# syscall there would stall it. "rt" is the minimum feature `spawn_blocking` needs; same
+# dependency and same reason as `humaux-infra-cell`'s (`transport::ValidatingResolver`).
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 # "net"/"io-util" back the tests' real `TcpListener` fixtures (§79: observe actual network

@@ -1,0 +1,973 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.44s
+     Running unittests src/lib.rs (target/debug/deps/humaux_adapters-bcf0d8d57ca71368)
+
+running 132 tests
+test byok::ssrf::tests::body_size_bound_enforced ... ok
+test byok::ssrf::tests::cloud_metadata_link_local_ip_is_rejected ... ok
+test byok::ssrf::tests::dns_rebinding_to_private_rfc1918_is_rejected ... ok
+test byok::ssrf::tests::dns_rebinding_to_loopback_is_rejected ... ok
+test byok::ssrf::tests::ipv6_loopback_literal_is_rejected ... ok
+test byok::ssrf::tests::ipv6_unique_local_is_forbidden ... ok
+test byok::ssrf::tests::non_https_is_rejected ... ok
+test byok::ssrf::tests::one_forbidden_address_among_several_resolved_still_rejects ... ok
+test byok::ssrf::pinned_dns_tests::malformed_specs_are_rejected ... ok
+test byok::ssrf::tests::public_https_hostname_is_accepted ... ok
+test byok::ssrf::tests::userinfo_in_authority_is_rejected ... ok
+test byok::ssrf::tests::private_rfc1918_ip_literal_is_rejected ... ok
+test byok::ssrf::tests::loopback_ip_literal_is_rejected ... ok
+test byok::ssrf::tests::explicit_port_is_parsed ... ok
+test byok::tests::classify_http_status_matches_11_3_table ... ok
+test byok::tests::context_rejects_permit_for_a_different_tenant ... ok
+test audit_sink::tests::export_batch_chains_from_genesis_when_no_previous ... ok
+test audit_sink::tests::export_batch_chains_from_previous_batch_hash ... ok
+test byok::tests::context_rejects_a_non_user_reasoning_permit ... ok
+test affect_repo::tests::parse_filter_and_mood_reject_inverted_ranges_and_unknown_labels ... ok
+test byok::tests::empty_input_is_no_processing_principal ... ok
+test byok::tests::capability_wire_form_matches_migration_check_constraint ... ok
+test byok::ssrf::pinned_dns_tests::pins_never_bypass_the_forbidden_range_check ... ok
+test byok::ssrf::pinned_dns_tests::pinned_host_returns_pins_and_others_fall_back ... ok
+test affect_repo::tests::parse_affects_accepts_closed_values_and_fails_closed_on_range ... ok
+test byok::tests::mixed_domain_input_is_rejected ... ok
+test byok::tests::huge_retry_after_from_endpoint_is_clamped_to_policy_ceiling ... ok
+test byok::tests::egress_permit_for_a_different_payload_is_rejected_before_any_send ... ok
+test byok::tests::provider_construction_rejects_ssrf_forbidden_endpoint ... ok
+test byok::tests::g3_an_unterminated_think_block_is_a_loud_schema_failure_not_silent_200 ... ok
+test byok::tests::non_json_body_is_provider_permanent_not_schema_failure ... ok
+test byok::tests::single_domain_input_is_accepted ... ok
+test byok::tests::expired_egress_permit_is_rejected_before_any_send ... ok
+test byok::tests::reasoning_content_side_field_never_reaches_the_output ... ok
+test byok::tests::plaintext_api_key_debug_never_contains_the_secret ... ok
+test byok::tests::g4_usage_fields_are_parsed_not_defaulted ... ok
+test byok::tests::failed_output_schema_after_budget_exhausted ... ok
+test byok::tests::build_openai_request_debug_never_contains_plaintext_key_material ... ok
+test byok::tests::unknown_principal_ingress_is_deterministic_only ... ok
+test byok::tests::g1_nonzero_base_resp_fails_even_with_http_200 ... ok
+test confirm_token_repo::tests::consume_predicate_is_the_full_binding ... ok
+test byok::tests::status_401_is_waiting_key_and_never_retries ... ok
+test byok::tests::g2_think_blocks_are_stripped_from_the_structured_output ... ok
+test consolidation_reasoner::tests::schema_literal_is_valid_json_object_with_the_three_keys ... ok
+test continuity_read::tests::source_pairs_reject_null_length_order_and_digest_corruption ... ok
+test contribution_entry_repo::tests::contribution_execution_production_adapter_exposes_id_free_preparation ... ok
+test byok::tests::unsupported_capability_fails_before_any_external_call ... ok
+test contribution_execution_repo::read_contract_tests::id_free_reservation_plan_rejects_invalid_metadata ... ok
+test consolidation_reasoner::tests::prompt_contract_is_stable_and_hashes_prompt_schema_and_budget ... ok
+test consolidation_reasoner::tests::manifest_hash_is_deterministic_and_covers_every_part ... ok
+test contribution_execution_repo::read_contract_tests::read_parsers_fail_closed_for_unknown_state_type_and_hash_shape ... ok
+test contribution_execution_repo::read_contract_tests::prepared_route_expectation_is_closed_and_carried_to_reservation_input ... ok
+test contribution_reasoner::tests::adversarial_private_and_public_text_stay_data_in_the_structured_envelope ... ok
+test contribution_reasoner::tests::evidence_recheck_uses_evidence_hash_not_event_json_serialization ... ok
+test contribution_reasoner::tests::exact_typed_gate_parser_rejects_unexpected_gate_values_and_keys ... ok
+test confirm_token_repo::tests::mint_contract_requires_user_positive_ttl_pair_and_tagged_audit ... ok
+test contribution_reasoner::tests::assessment_parser_canonicalizes_fixed_keys_and_stops_failed_gates_before_scan ... ok
+test consolidation_reasoner::tests::parse_rollup_output_accepts_the_contract_shape_and_dedupes_sources ... ok
+test consolidation_reasoner::tests::parse_rollup_output_fails_closed ... ok
+test contribution_reasoner::tests::malformed_public_context_fails_before_provider_dispatch ... ok
+test contribution_reasoner::tests::only_provider_permanent_is_a_definite_terminal_failure ... ok
+test contribution_reasoner::tests::coverage_parser_is_closed_nonempty_and_bounded ... ok
+test disclosure::tests::deletion_capability_wire_strings_are_stable ... ok
+test disclosure::tests::outcome_wire_strings_are_stable ... ok
+test contribution_reasoner::tests::versioned_prompt_contracts_hash_exact_prompt_and_schema_with_stage_separation ... ok
+test disclosure::tests::purpose_wire_strings_are_stable ... ok
+test distill_reasoner::tests::distill_envelope_carries_payload_as_data ... ok
+test distill_reasoner::tests::distill_contract_memory_types_exclude_the_constraint_ceiling_case ... ok
+test distill_reasoner::tests::distill_parser_accepts_the_contract_shape_including_zero_memories ... ok
+test distill_repo::contract_tests::origin_class_from_db_str_round_trips_every_check_value ... ok
+test distill_repo::contract_tests::memory_type_db_str_matches_check_list ... ok
+test email::outbox::contract_tests::delivery_event_type_matches_check_constraint ... ok
+test email::outbox::contract_tests::outbox_state_matches_check_constraint ... ok
+test email::outbox::contract_tests::stream_matches_check_constraint ... ok
+test email::outbox::contract_tests::suppression_reason_matches_check_constraint ... ok
+test email::outbox::contract_tests::suppression_scope_matches_check_constraint ... ok
+test email::tests::suppression_scope_blocks_matches_intent ... ok
+test email::tests::marketing_complaint_does_not_block_transactional ... ok
+test jobs::contract_tests::generic_claim_excludes_the_derived_namespace ... ok
+test jobs::contract_tests::derived_job_type_matches_claim_function_guard ... ok
+test distill_reasoner::tests::distill_contract_is_stable_and_hashes_prompt_schema_and_budget ... ok
+test jobs::contract_tests::enqueue_triggers_emit_only_claimable_job_types ... ok
+test memory_governance_repo::tests::lifecycle_idempotency_key_is_token_digest_hex ... ok
+test jobs::contract_tests::job_status_matches_check_constraint ... ok
+test contribution_execution_repo::read_contract_tests::read_manifest_rejects_ordinal_drift ... ok
+test memory_governance_repo::tests::status_wire_forms_match_the_g59_check_list ... ok
+test model_call_ledger::tests::outcome_wire_strings_are_stable ... ok
+test memory_governance_repo::tests::restore_validate_binds_claim_target_and_audit_lifecycle ... ok
+test distill_reasoner::tests::distill_source_hash_moves_with_prompt_hash_and_parser_version ... ok
+test model_call_ledger::tests::reasoning_request_lock_key_is_tenant_scoped ... ok
+test operation_receipt::tests::idempotency_keys_are_bounded_opaque_identifiers ... ok
+test operation_receipt::tests::private_and_workspace_visibility_must_follow_the_authorized_route ... ok
+test memory_governance_repo::tests::supersede_contract_binds_claim_target_stream_and_audit ... ok
+test exact_census::tests::scope_table_parses_the_registry_shape_and_rejects_mixed_scopes ... ok
+test distill_reasoner::tests::distill_parser_fails_closed ... ok
+test byok::tests::status_429_honors_retry_after_then_succeeds ... ok
+test private_projection_registry::tests::deterministic_point_id_changes_with_embedding_identity ... ok
+test private_projection_registry::tests::projection_point_id_has_no_memory_id_conversion ... ok
+test provider_budget::tests::only_retrieval_purposes_cross_the_budget_boundary ... ok
+test provider_budget::tests::zero_ttl_is_rejected_before_database_access ... ok
+test public_projection::tests::a_live_receipt_requires_the_named_bm25_vector ... ok
+test public_projection::tests::a_tombstone_receipt_must_match_exact_identity_and_have_no_vector ... ok
+test public_projection::tests::body_hash_is_sha256_hex ... ok
+test public_projection::tests::point_id_is_stable_and_revision_scoped ... ok
+test public_projection::tests::query_candidates_require_exact_live_identity_payload ... ok
+test qdrant::http_wiring_tests::point_id_from_json_round_trips_both_wire_forms ... ok
+test qdrant::http_wiring_tests::validate_collection_rejects_authority_rewrite_shapes ... ok
+test remember::contract_tests::origin_class_db_str_matches_check_constraint_for_every_variant ... ok
+test consolidate_repo::binding_predicate_tests::only_active_mandatory_or_pinned_bindings_freeze_a_memory ... ok
+test retrieve::contract_tests::decode_rejects_garbage ... ok
+test retrieve::contract_tests::private_read_serving_canonicalizes_ryw_overlay_without_semantic_candidates ... ok
+test retrieve::contract_tests::private_read_serving_keeps_a_caught_up_overlay_empty ... ok
+test retrieve::contract_tests::private_read_serving_requires_a_projection_registry_for_semantic_candidates ... ok
+test retrieve::contract_tests::processing_state_matches_stream_log_check_constraint ... ok
+test retrieve::contract_tests::settled_ok_matches_spec_three_variant_set ... ok
+test retrieve::contract_tests::token_round_trips_through_hex_encoding ... ok
+test retrieve::contract_tests::token_round_trips_with_no_workspace ... ok
+test retrieve::contract_tests::validate_scope_only_allows_authorized_workspace_narrowing ... ok
+test retrieve::contract_tests::validate_scope_rejects_cross_tenant ... ok
+test scheduler::tests::key_differs_by_both_inputs ... ok
+test scheduler::tests::nanosecond_precision_survives_sub_second_planned_at ... ok
+test subject_repo::tests::parse_declaration_accepts_ids_and_keys_and_rejects_garbage ... ok
+test subject_repo::tests::split_keeps_arrays_parallel ... ok
+test postgres::tests::g6_db2_maintenance_pool ... ok
+test postgres::tests::g6_db2_batch_issuer_pool ... ok
+test postgres::tests::g6_db2_retrieval_worker_pool ... ok
+test postgres::tests::g6_db2_private_worker_pool ... ok
+test postgres::tests::g6_db2_runtime_pool ... ok
+test postgres::tests::g6_db2_consolidation_pool ... ok
+test postgres::tests::role_mismatch_is_rejected ... ok
+test postgres::tests::role_match_succeeds_once_role_exists ... ok
+test retrieval_query_source::tests::mixed_scanner_attestations_are_rejected_before_reserve ... ok
+
+test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s
+
+     Running tests/auth_scope_rls.rs (target/debug/deps/auth_scope_rls-d2bbc74588221a98)
+
+running 2 tests
+test rls_tenant_context_via_set_local ... ok
+test workspace_shared_needs_workspace_membership_not_tenant_membership ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/byok_egress_rebinding.rs (target/debug/deps/byok_egress_rebinding-8cf492599c8ac0fc)
+
+running 4 tests
+test zero_addresses_is_refused_on_the_dial_path_too ... ok
+test the_dial_time_resolver_applies_the_same_policy_as_the_construction_time_check ... ok
+test the_production_constructor_hands_one_resolver_to_both_legs ... ok
+test a_rebound_endpoint_is_refused_before_the_connection_and_never_dialed ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests/consolidate_snapshot.rs (target/debug/deps/consolidate_snapshot-1f1cbb028abed0b1)
+
+running 2 tests
+test selection_excludes_cross_domain_and_user_private_memories ... ok
+test snapshot_survives_concurrent_higher_ranked_inserts ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.11s
+
+     Running tests/contribution_authorization.rs (target/debug/deps/contribution_authorization-aff1314faa322c8a)
+
+running 4 tests
+test concurrent_backing_link_change_prevents_finalize ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test concurrent_generic_grant_revocation_does_not_revoke_self_principal_finalize ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test direct_domain_owner_needs_no_headless_grant ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test valid_generic_grant_never_authorizes_delegated_contribution_entrypoints ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+
+test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contribution_execution_0131.rs (target/debug/deps/contribution_execution_0131-a90becb2e3d7664b)
+
+running 5 tests
+test r4_fg_18_business_outcome_variants_and_abort_invariants ... ignored, requires isolated PostgreSQL 18 migrated through 0131
+test r4_manifest_postcheck_supersession_is_explicit_after_0133 ... ignored, creates and removes a disposable PostgreSQL 18 database
+test r4_security_definer_function_matrix_is_exact ... ignored, requires isolated PostgreSQL 18 migrated through 0131
+test r4_sql_authority_exact_late_and_atomic_candidate ... ignored, requires isolated PostgreSQL 18 migrated through 0131
+test r4_sql_durable_evidence_subset_matches_manifest ... ok
+
+test result: ok. 1 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/contribution_execution_disclosure_sources_0131.rs (target/debug/deps/contribution_execution_disclosure_sources_0131-cbe70080e72b9108)
+
+running 1 test
+test r4_a4_reservations_atomically_disclose_exact_ordered_sources_without_duplicates ... ignored, requires isolated PostgreSQL 18 migrated through 0131
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contribution_execution_ingress_0131.rs (target/debug/deps/contribution_execution_ingress_0131-fb793939485b949c)
+
+running 1 test
+test production_core_is_atomic_v2_complete_and_v1_compatible ... ignored, requires disposable PostgreSQL 18 migrated through 0131
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contribution_execution_repo.rs (target/debug/deps/contribution_execution_repo-18a187eec49d3eb5)
+
+running 1 test
+test binds_only_the_eight_exposed_0131_functions ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contribution_execution_repo_0131.rs (target/debug/deps/contribution_execution_repo_0131-9ddc8a51984d3ca0)
+
+running 1 test
+test typed_repo_all_eight_commands_are_durable_and_provider_free ... ignored, requires disposable PostgreSQL 18 migrated through 0131
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contribution_pipeline.rs (target/debug/deps/contribution_pipeline-736b99ada49a34e2)
+
+running 6 tests
+test exact_binding_candidate_does_not_reconsult_mutable_legacy_profile ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test manual_exact_confirmation_release_is_atomic_idempotent_and_not_reactivated ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test outbox_failure_rolls_back_finalized_release_and_source_rows ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test scan_failure_or_changed_payload_creates_no_candidate_or_release ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test stale_inputs_fail_while_generic_grants_do_not_control_self_principal_finalize ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test wrong_hash_other_user_and_source_append_fail_closed ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contribution_policy_lifecycle_0132.rs (target/debug/deps/contribution_policy_lifecycle_0132-1654ee8a928b22ba)
+
+running 5 tests
+test exact_history_successor_concurrency_and_head_admission_hold ... ignored, requires isolated PostgreSQL 18 migrated through 0132 and pinned Gitleaks
+test manifest_postcheck_is_one_boolean_true ... ignored, requires isolated PostgreSQL 18 migrated through 0132
+test pre_0132_unresolved_triples_hard_stop ... ignored, requires isolated PostgreSQL 18 migrated only through 0131
+test runtime_roles_are_actually_denied_policy_mutation ... ignored, requires isolated PostgreSQL 18 migrated through 0132
+test same_key_replay_freezes_policy_authority ... ignored, requires isolated PostgreSQL 18 migrated through 0132
+
+test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contribution_reasoner.rs (target/debug/deps/contribution_reasoner-be7e7d11418b0f62)
+
+running 13 tests
+test changed_intent_or_terminal_logical_call_conflicts_without_repeat_dispatch ... ignored, requires isolated PostgreSQL
+test concurrent_same_logical_call_serializes_to_one_reservation_and_dispatch ... ignored, requires isolated PostgreSQL
+test endpoint_revision_descriptor_or_allowlist_mismatch_has_zero_side_effects ... ignored, requires isolated PostgreSQL
+test finalize_failure_never_retries_provider_and_leaves_reserved_call_for_reconciliation ... ignored, requires isolated PostgreSQL
+test legacy_infer_without_canonical_coverage_is_rejected_without_side_effects ... ignored, requires isolated PostgreSQL
+test legacy_profile_change_cannot_replace_exact_binding_admission ... ignored, requires isolated PostgreSQL
+test matching_reserved_retry_returns_original_model_call_without_dispatch_or_readmission ... ignored, requires isolated PostgreSQL
+test nil_logical_call_is_rejected_without_side_effects ... ignored, requires isolated PostgreSQL
+test provider_failure_finalizes_the_already_reserved_disclosure_as_failed ... ignored, requires isolated PostgreSQL
+test records_exact_wire_hash_and_finalizes_the_reserved_disclosure ... ignored, requires isolated PostgreSQL
+test same_logical_call_uuid_in_two_tenants_uses_distinct_advisory_locks ... ignored, requires isolated PostgreSQL
+test wrong_binding_is_denied_before_ledger_disclosure_or_provider ... ignored, requires isolated PostgreSQL
+test incomplete_configuration_fails_before_private_read_or_egress ... ok
+
+test result: ok. 1 passed; 0 failed; 12 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contribution_repo.rs (target/debug/deps/contribution_repo-ba42b8448c84c53d)
+
+running 16 tests
+test concurrent_refreshes_serialize_and_preserve_distinct_root_depth_pairs ... ok
+test cross_tenant_evidence_is_rejected_without_durable_release ... ok
+test closure_marks_removed_root_stale_and_repeat_refresh_keeps_one_pair ... ok
+test private_worker_without_tenant_context_cannot_read_fixture_release ... ok
+test concurrent_revokes_use_two_runtime_sessions_and_emit_one_revoke ... ok
+test promotion_and_closure_preserve_minimum_roots ... ok
+test memory_sources_reject_cross_tenant_api_and_composite_fk_writes ... ok
+test invalid_cycle_preserves_previous_closure ... ok
+test outbox_fault_after_release_writes_rolls_back_every_contribution_row ... ok
+test direct_sql_rejects_invalid_outbox_class_and_identity_rewrite ... ok
+test promotion_completes_before_queued_revoke_under_release_lock ... ok
+test public_worker_without_tenant_context_cannot_admit_user_source ... ok
+test reachable_unrooted_branch_keeps_previous_closure_current ... ok
+test refresh_waits_for_graph_update_then_has_stable_distinct_pairs ... ok
+test release_and_repeat_revoke_write_exactly_one_event_each ... ok
+test user_source_guard_allows_active_then_rejects_revoked_release ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.12s
+
+     Running tests/contribution_scan.rs (target/debug/deps/contribution_scan-52d323dac3c9cf94)
+
+running 9 tests
+test binary_replaced_after_construction_fails_closed ... ignored, requires pinned real Gitleaks fixture
+test deterministic_privacy_rules_block_synthetic_email_and_phone ... ignored, requires pinned real Gitleaks fixture
+test host_config_and_inline_allow_do_not_disable_scanning ... ignored, requires pinned real Gitleaks fixture
+test real_binary_hash_mismatch_fails_closed ... ignored, requires pinned real Gitleaks fixture
+test real_binary_version_mismatch_fails_closed ... ignored, requires pinned real Gitleaks fixture
+test real_binary_version_probe_honors_timeout ... ignored, requires pinned real Gitleaks fixture
+test real_gitleaks_allows_clean_fixture_and_blocks_known_secret_fixture ... ignored, requires pinned real Gitleaks fixture
+test real_gitleaks_decodes_base64_secret_before_matching ... ignored, requires pinned real Gitleaks fixture
+test missing_binary_fails_closed_without_runtime_fixture ... ok
+
+test result: ok. 1 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contribution_self_principal_authority_0133.rs (target/debug/deps/contribution_self_principal_authority_0133-129835fc4c23803d)
+
+running 6 tests
+test cutover_nonterminal_precheck_is_atomic ... ignored, creates and removes a disposable PostgreSQL 18 database
+test reservation_authority_route_replay_and_exact_root_axes ... ignored, requires isolated PostgreSQL 18 migrated through 0133
+test root_closure_seal_rejects_backing_and_direct_source_drift_without_reservation ... ignored, requires isolated PostgreSQL 18 migrated through 0133
+test workspace_authority_change_waits_for_reservation_and_then_fails_closed ... ignored, requires isolated PostgreSQL 18 migrated through 0133
+test workspace_delete_waits_for_reservation_and_cannot_remove_referenced_authority ... ignored, requires isolated PostgreSQL 18 migrated through 0133
+test migration_0133_contract_is_closed_and_serialized ... ok
+
+test result: ok. 1 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/disclosure_ledger.rs (target/debug/deps/disclosure_ledger-c2b782c0fb1290db)
+
+running 13 tests
+test reserve_rejects_empty_sources ... ok
+test reserve_rejects_a_non_recipient_classified_purpose_before_any_write ... ok
+test guard_trigger_rejects_second_deletion_requested_at_write ... ok
+test guard_trigger_rejects_identity_rewrite_refinalize_and_delete ... ok
+test reserve_rejects_payload_digest_mismatch ... ok
+test source_row_accepts_matching_single_id ... ok
+test open_reservations_older_than_finds_unfinalized_row ... ok
+test reserve_then_finalize_round_trip ... ok
+test cross_tenant_cannot_finalize_or_observe_another_tenants_disclosure ... ok
+test guard_trigger_rejects_truncate ... ok
+test source_row_rejects_zero_ids_set ... ok
+test wire_strings_match_live_db_check_constraints ... ok
+test source_row_rejects_kind_mismatch ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/email_outbox.rs (target/debug/deps/email_outbox-d384fefcfa6f70f0)
+
+running 5 tests
+test provider_failure_marks_row_failed_and_records_event ... ok
+test marketing_suppression_does_not_block_transactional_stream ... ok
+test suppressed_address_is_not_enqueued ... ok
+test enqueue_returns_immediately_and_writes_queued_row ... ok
+test provider_success_marks_row_sent_and_records_event ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+
+     Running tests/exact_completeness_eval.rs (target/debug/deps/exact_completeness_eval-51b3e1d0ef5309cf)
+
+running 4 tests
+test manifest_matches_real_dataset ... ok
+test all_cases_match_expected_readouts ... ok
+test resolution_is_measured_via_a_real_second_system_diff ... ok
+test repeated_runs_have_zero_spread ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.64s
+
+     Running tests/forget_repo.rs (target/debug/deps/forget_repo-218023db52ec915f)
+
+running 5 tests
+test stream_log_has_exactly_the_twelve_frozen_columns ... ok
+test runtime_role_direct_update_is_rejected_by_grant_not_just_trigger ... ok
+test tombstoned_unpurged_over_sla_goes_red_then_green_on_purge_step ... ok
+test purge_replay_resumes_without_repeating_completed_steps ... ok
+test legal_deletion_leaves_done_unchanged_and_deleted_equals_ten ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/g80_31_handoff.rs (target/debug/deps/g80_31_handoff-4cd2c8296f4bf1a0)
+
+running 11 tests
+test enumeration_keeps_body_grounding_and_ledger_on_one_snapshot ... ok
+test enumeration_rejects_cursor_subject_scope_and_parameter_mismatch ... ok
+test materialized_context_fails_closed_when_manifest_memory_has_secret_source ... ok
+test a_superseded_constraint_disappears_on_reassembly ... ok
+test materialized_context_overflow_has_no_bodies ... ok
+test materialized_context_reads_manifest_and_body_from_one_snapshot ... ok
+test pinned_three_with_one_low_authority_reports_expected_three_returned_two ... ok
+test direct_get_rejects_wrong_key_and_hidden_lifecycle_sources_as_not_found ... ok
+test direct_get_keeps_body_grounding_and_ledger_on_one_snapshot ... ok
+test materialized_context_rejects_authorized_but_mismatched_workspace_key ... ok
+test same_snapshot_assembles_byte_identical_handoffs_with_the_constraint_present ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/jobs_claim.rs (target/debug/deps/jobs_claim-09069d5bed6923ab)
+
+running 12 tests
+test dead_is_reachable_once_retry_budget_is_exhausted ... ok
+test same_owner_reclaim_rejects_old_attempt ... ok
+test generic_and_private_claims_preserve_public_boundary ... ok
+test heartbeat_extends_lease_expiry ... ok
+test non_retryable_failure_reaches_failed_not_dead ... ok
+test heartbeat_after_lease_lost_is_a_no_op ... ok
+test complete_transitions_processing_to_done ... ok
+test expired_lease_rejects_sensitive_transitions ... ok
+test claim_has_no_duplicate_across_concurrent_workers ... ok
+test claim_on_empty_table_returns_empty_without_blocking ... ok
+test stale_attempt_rejects_heartbeat_fail_and_complete ... ok
+test waiting_key_round_trip_does_not_increment_attempt ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.69s
+
+     Running tests/ledger_append_only.rs (target/debug/deps/ledger_append_only-1aee72d37c65fe66)
+
+running 2 tests
+test model_call_ledger_rejects_delete_and_truncate ... ok
+test credit_ledger_rejects_update_delete_and_truncate ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/mandatory_context_lane.rs (target/debug/deps/mandatory_context_lane-1aec1a8fb565401f)
+
+running 5 tests
+test project_constraints_are_selected_by_authority_not_similarity ... ok
+test revoking_a_binding_removes_it_from_the_lane ... ok
+test context_lanes_filter_visibility_lifecycle_and_binding_scope ... ok
+test a_live_unversioned_constraint_is_diverted_and_named_not_consumed ... ok
+test probe_reports_the_columns_that_are_actually_missing ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/mechanism_observation.rs (target/debug/deps/mechanism_observation-d01698f98243fde1)
+
+running 7 tests
+test admin_cli_reports_real_supported_then_quarantined_review ... ignored, requires PostgreSQL78, real admin binary and actual maintenance/admin credentials
+test e2e_receipts_reject_cross_scope_and_preserve_immutable_measurements ... ignored, requires dedicated PostgreSQL78 mechanism fixture
+test readonly_admin_is_not_a_writer_or_private_reader ... ignored, requires actual role_admin and role_maintenance login credentials
+test real_observation_freshness_and_denominator_never_use_bootstrap ... ignored, requires dedicated PostgreSQL78 mechanism fixture
+test real_public_review_records_before_after_and_quarantine_remains_visible ... ignored, requires PostgreSQL78, actual maintenance/admin credentials and pinned Gitleaks
+test recorder_rejects_other_cell_or_database_before_any_observation ... ignored, requires dedicated PostgreSQL78 fixture and real maintenance credentials
+test runtime_reader_rejects_forged_active_unlinked_delta_and_cross_target_fallback ... ignored, requires dedicated PostgreSQL78 mechanism fixture and real read-only credentials
+
+test result: ok. 0 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/membership_lifecycle.rs (target/debug/deps/membership_lifecycle-002ce77397651a28)
+
+running 1 test
+test membership_lifecycle_last_owner_atomic_epoch_bump_and_typed_edges ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/memory_affects.rs (target/debug/deps/memory_affects-9b9a4b2b2e0207a5)
+
+running 4 tests
+test affect_recheck_is_one_round_trip_for_the_whole_candidate_set ... ok
+test rows_are_immutable_and_cascade_with_memory_and_subject ... ok
+test affect_checks_match_domain_enums ... ok
+test evidence_affects_copy_onto_the_primary_memory_under_private_worker ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/memory_evidence_grounding.rs (target/debug/deps/memory_evidence_grounding-a006842f9b823eb0)
+
+running 3 tests
+test grounding_mode_check_matches_rust_enum_wire_strings ... ok
+test default_edge_is_live_without_version_and_derives_recheck_required ... ok
+test unknown_mode_is_rejected_while_a_known_one_inserts_without_a_version ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/memory_security_lifecycle_eval.rs (target/debug/deps/memory_security_lifecycle_eval-5d616ab6d6939099)
+
+running 5 tests
+test manifest_matches_dataset ... ok
+test repair_segment_forget_removes_attack_keeps_benign ... ok
+test recall_segment_all_cases_pass ... ok
+test write_segment_all_cases_pass ... ok
+test write_segment_repeated_runs_zero_hamming ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/memory_subjects_link.rs (target/debug/deps/memory_subjects_link-91e5d36604cefaee)
+
+running 5 tests
+test link_checks_match_domain_enums ... ok
+test rollup_inherits_source_subjects_under_consolidation_role ... ok
+test declared_and_key_links_carry_source_kind_and_mention_spans ... ok
+test correction_inherits_but_explicit_supersede_does_not ... ok
+test cross_tenant_subject_is_unlinkable ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/minimax_live_smoke.rs (target/debug/deps/minimax_live_smoke-abf15d86b00f4572)
+
+running 3 tests
+test dsn_as_role_accepts_both_postgres_uri_schemes ... ok
+test g5_a_failed_call_still_finalizes_its_disclosure_row ... ok
+test minimax_live_smoke ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.48s
+
+     Running tests/model_call_ledger.rs (target/debug/deps/model_call_ledger-688cd7b502d3c4fb)
+
+running 7 tests
+test a_later_pricing_update_does_not_change_a_historical_calls_cost ... ok
+test reserve_with_the_same_request_id_is_idempotent ... ok
+test reserve_then_finalize_records_estimated_and_actual_cost ... ok
+test finalized_call_can_feed_a_tenant_cost_event ... ok
+test only_the_reserve_call_wrapper_ever_produces_a_ledger_row ... ok
+test finalize_of_an_unknown_model_call_id_reports_no_change ... ok
+test a_finalized_row_rejects_a_second_finalize_and_any_delete ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/offset_pagination_positive_control.rs (target/debug/deps/offset_pagination_positive_control-0c77e31344b01be4)
+
+running 1 test
+test banned_cross_txn_offset_pagination_exhibits_both_duplicates_and_misses ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/operation_receipts.rs (target/debug/deps/operation_receipts-4cabb4cc50d8986f)
+
+running 7 tests
+test concurrent_same_key_never_commits_two_business_or_bmo_rows ... ignored, exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green
+test receipt_insert_lock_past_reservation_deadline_rolls_back_while_token_is_valid ... ignored, exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green
+test receipt_insert_lock_past_token_deadline_rolls_back_business_bmo_audit_and_receipt ... ignored, exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green
+test changed_fingerprint_and_bad_visibility_or_workspace_do_not_mutate ... ok
+test physical_evidence_deletion_keeps_nonreplayable_receipt_tombstone ... ok
+test receipt_trigger_and_finished_audit_failures_rollback_every_lane ... ok
+test successful_write_receipt_quota_audits_and_commit_response_loss_replay ... ok
+
+test result: ok. 4 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.85s
+
+     Running tests/outbox_batch_remember.rs (target/debug/deps/outbox_batch_remember-4575be942f62170c)
+
+running 5 tests
+test g23_1c_over_grant_alone_does_not_move_g23_1a ... ok
+test remember_rejects_with_batch_exhausted_once_tickets_run_out ... ok
+test g23_1a_declared_100_redeemed_97_does_not_shrink_expected ... ok
+test begin_batch_full_replay_is_idempotent ... ok
+test g23_1c_and_g23_1a_both_red_when_ticket_issuance_moves_into_remembers_transaction ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.57s
+
+     Running tests/phase9_assessed_contract.rs (target/debug/deps/phase9_assessed_contract-7064d4c3622ae460)
+
+running 2 tests
+test private_coverage_contract_returns_a_single_empty_snapshot_in_an_empty_pool ... ignored, requires isolated PostgreSQL migrated through 0127
+test public_worker_cannot_scan_sanitized_envelopes_or_forge_anonymous_admission ... ignored, requires isolated PostgreSQL migrated through 0127
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/phase9_exact_assessed_storage_binding.rs (target/debug/deps/phase9_exact_assessed_storage_binding-34a5144481d5aceb)
+
+running 2 tests
+test every_cross_row_mismatch_is_rejected ... ignored, requires isolated PostgreSQL migrated through 0126 and pinned Gitleaks
+test legal_assessed_finalize_and_legacy_expand_both_commit_with_acl_boundary ... ignored, requires isolated PostgreSQL migrated through 0126 and pinned Gitleaks
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/phase9_independence_attestation.rs (target/debug/deps/phase9_independence_attestation-91fe6d475d8e9ace)
+
+running 1 test
+test protected_independence_attestation_is_fail_closed_aggregate_and_exactly_once ... ignored, requires isolated PostgreSQL 18 migrated through 0124
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/pool_typestate.rs (target/debug/deps/pool_typestate-6f0c0322933c2318)
+
+running 1 test
+   Compiling humaux-adapters-tests v0.0.0 (/Volumes/data/humaux-thread/target/tests/trybuild/humaux-adapters)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.77s
+
+
+test tests/ui/pass_runtime_pool.rs [should pass] ... ok
+test tests/ui/pass_batch_pool.rs [should pass] ... ok
+test tests/ui/pass_consolidation_pool.rs [should pass] ... ok
+test tests/ui/pass_private_pool.rs [should pass] ... ok
+test tests/ui/pass_public_pool.rs [should pass] ... ok
+test tests/ui/fail_remember_with_batch_pool.rs [should fail to compile] ... ok
+test tests/ui/fail_begin_batch_with_runtime_pool.rs [should fail to compile] ... ok
+test tests/ui/fail_consolidation_with_private_pool.rs [should fail to compile] ... ok
+test tests/ui/fail_pool_cross_from.rs [should fail to compile] ... ok
+test tests/ui/fail_deref_inner.rs [should fail to compile] ... ok
+test tests/ui/fail_raw_pool_field.rs [should fail to compile] ... ok
+test tests/ui/fail_contribution_cross_roles.rs [should fail to compile] ... ok
+
+
+test pool_typestate_fixtures ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.66s
+
+     Running tests/private_projection_registry.rs (target/debug/deps/private_projection_registry-46506225f34b763b)
+
+running 1 test
+test private_point_registry_fails_closed_for_identity_and_permissions ... ignored, requires an isolated PostgreSQL fixture migrated through 0119 and disposable Qdrant
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/processing_runs_fingerprint_rerun.rs (target/debug/deps/processing_runs_fingerprint_rerun-0db95b521e581c63)
+
+running 1 test
+test same_fingerprint_rerun_keeps_independent_rows_never_overwritten ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/project_continuity_0136.rs (target/debug/deps/project_continuity_0136-c996d6d069cc14f4)
+
+running 13 tests
+test migration_static_contract_witnesses ... ok
+test evidence_owner_marker_matrix_is_exact_and_real_updates_are_closed ... ok
+test publish_marker_restores_before_same_transaction_0133_legacy_reader ... ok
+test registration_is_eager_exact_and_idempotent ... ok
+test different_facets_do_not_wait_on_a_project_lock ... ok
+test same_expected_has_one_winner_one_p9c01_and_real_slot_wait ... ok
+test null_scalar_and_unknown_facet_fail_closed_without_residue ... ok
+test evidence_for_share_blocks_hash_change_until_publish_commit ... ok
+test role_private_worker_enqueue_preserves_0133_legacy_workspace_shared_route ... ok
+test headless_visibility_hash_successor_and_acl_are_closed ... ok
+test owner_mutation_append_only_deferred_source_and_runtime_acl_are_enforced ... ok
+test source_for_share_blocks_change_and_marker_restores_after_error ... ok
+test terminated_precommit_backend_leaves_no_publication_residue ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests/project_continuity_read_0137.rs (target/debug/deps/project_continuity_read_0137-644c2a5f4bd565ee)
+
+running 3 tests
+test migration_and_one_rr_static_contract_are_closed ... ok
+test authorized_read_is_current_then_revoked_source_is_non_leaking_stale ... ok
+test owner_pointer_rollback_and_orphan_version_cannot_become_current_or_missing ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+     Running tests/project_continuity_read_0137_acceptance.rs (target/debug/deps/project_continuity_read_0137_acceptance-33cf7994770154d7)
+
+running 13 tests
+test restart_semantic_projection_probe ... ok
+test adapter_static_external_and_write_plane_is_zero ... ok
+test raw_parallel_array_mispairing_never_yields_current_or_complete ... ok
+test live_role_acl_and_read_only_attempt_are_exact ... ok
+test terminated_source_revalidation_is_bounded_and_has_no_residue ... ok
+test statement_timeout_is_bounded_rollback_no_partial_no_retry ... ok
+test malformed_authority_context_and_workspace_arrays_fail_closed ... ok
+test evidence_association_query_failure_is_dependency_unavailable ... ok
+test directed_fault_guard_panic_cleanup_preserves_global_acl ... ok
+test structural_damage_and_unrepresentable_corruption_fail_closed ... ok
+test two_connection_rr_revoke_and_tombstone_are_coherent ... ok
+test direct_evidence_truth_table_is_fail_closed ... ok
+test memory_eligibility_visibility_grounding_and_lifecycle_matrix ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.07s
+
+     Running tests/projection_worker.rs (target/debug/deps/projection_worker-5db16da7510873f2)
+
+running 11 tests
+test subject_visibility_policy_gates_gateway_reads_but_never_the_retrieval_worker ... ok
+test second_run_once_is_idempotent ... ok
+test happy_path_indexes_and_advances_checkpoint ... ok
+test dimension_mismatch_fails_before_reaching_qdrant ... ok
+test cross_user_dense_query_still_enforces_user_private_visibility ... ok
+test failed_row_blocks_checkpoint_past_it ... ok
+test non_tenant_shared_evidence_still_resolves_and_advances_checkpoint ... ok
+test mixed_visibility_batch_indexes_both_and_populates_payload ... ok
+test reissued_lifecycle_ticket_reprojects_the_same_point_with_current_subject_ids ... ok
+test unconfirmed_visibility_fails_row_and_blocks_checkpoint ... ok
+test subject_scoped_dense_query_returns_only_memories_about_that_subject ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.32s
+
+     Running tests/provider_budget.rs (target/debug/deps/provider_budget-676c50621b9bbd44)
+
+running 15 tests
+test concurrent_same_model_call_replays_one_reservation ... ok
+test concurrent_reserve_cannot_exceed_any_shared_tier ... ok
+test cross_tenant_and_region_scope_matches_the_canonical_limit_keys ... ok
+test budget_tables_are_function_only_for_actual_runtime_roles ... ok
+test atomic_completion_binds_identity_and_rolls_back_both_rows ... ok
+test failed_attempt_consumes_the_independent_rpm_budget ... ok
+test actual_roles_reject_null_sql_arguments_without_mutating_budget_state ... ok
+test atomic_completion_and_maintenance_recovery_close_every_crash_residue ... ok
+test concurrent_dispatch_and_atomic_completion_share_one_lock_order ... ok
+test each_canonical_tier_independently_denies_and_a_missing_tier_fails_closed ... ok
+test finalized_pre_send_failure_cannot_be_marked_dispatched_and_releases ... ok
+test overlapping_finite_limit_cannot_replace_a_missing_canonical_tier ... ok
+test replay_and_identity_mismatches_do_not_create_budget_leaks ... ok
+test strict_sixty_second_sliding_boundary_counts_59_and_excludes_61 ... ok
+test success_consumes_failure_releases_and_expiry_reclaims_idempotently ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/public_contribution_contract.rs (target/debug/deps/public_contribution_contract-36e4937612c9493a)
+
+running 5 tests
+test moderation_state_check_matches_rust_enum ... ok
+test source_type_check_matches_rust_enum ... ok
+test release_state_check_matches_rust_enum ... ok
+test release_policy_check_is_null_safe_and_excludes_disabled ... ok
+test scan_outcome_checks_match_rust_enum ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/public_projection.rs (target/debug/deps/public_projection-a7c7d5f97a7bafb3)
+
+running 5 tests
+test bm25_query_excludes_false_live_vector_and_uses_same_idf_corpus_filter ... ok
+test retiring_old_revision_does_not_touch_new_revision ... ok
+test delayed_live_rejects_corrupted_tombstone_readback ... ok
+test insert_only_live_rejects_canonical_body_hash_mismatch ... ok
+test delayed_old_live_cannot_resurrect_after_retire ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.08s
+
+     Running tests/public_provenance.rs (target/debug/deps/public_provenance-8faa6213e8c2070e)
+
+running 3 tests
+test damaged_user_root_without_release_is_detected_and_guard_restored ... ignored, requires the dedicated isolated provenance mutation database
+test typed_roots_closure_depths_and_revocation_are_target_bound ... ignored, requires isolated PostgreSQL
+test target_requires_exactly_one_non_nil_identity ... ok
+
+test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/public_provenance_revocation_eval.rs (target/debug/deps/public_provenance_revocation_eval-8b23ec5cbab3c42d)
+
+running 2 tests
+test fixed_cases_repeat_three_times_and_measure_counterfactual_resolution ... ignored, requires isolated PostgreSQL18 fixture and pinned Gitleaks
+test cancelling_flips_are_visible_and_unstable_flips_are_not_resolution ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/public_runtime.rs (target/debug/deps/public_runtime-b4368627f0d7beb3)
+
+running 11 tests
+test assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_closed ... ignored, requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks
+test assessed_release_admits_once_into_anonymous_under_review_claim ... ignored, requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks
+test assessed_revoke_before_admit_never_creates_anonymous_claim ... ignored, requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks
+test assessed_revoke_reaches_anonymous_under_review_claim_once ... ignored, requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks
+test current_eligible_projection_retires_only_older_receipts ... ignored, requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks
+test drain_release_outbox_enqueues_one_typed_public_job ... ignored, requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks
+test lease_expiry_during_projection_fences_old_done_then_replays ... ignored, requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks
+test legacy_release_admission_is_fenced_from_protected_rows ... ignored, requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks
+test public_coverage_change_after_assessed_prepare_conflicts_on_finalize ... ignored, requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks
+test revoke_reaches_under_review_claim_via_source_closure_once ... ignored, requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks
+test superseded_current_projection_is_retryable_then_replay_converges ... ignored, requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks
+
+test result: ok. 0 passed; 0 failed; 11 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/public_runtime_qdrant.rs (target/debug/deps/public_runtime_qdrant-6ea7b6d6a2227593)
+
+running 1 test
+test supported_projection_revoke_fences_hydrate_and_tombstones_old_live ... ignored, pins the retired tenant-scoped public runtime (admit_release as role_public_worker -> drain_outbox(tenant) -> run_once(tenant)); 0124 fenced that path on purpose (see public_runtime.rs legacy_release_admission_is_fenced_from_protected_rows) and the live seam is run_anonymous_once. Rewrite this Qdrant tombstone oracle onto the anonymous seam — card 23 (stale/ignored lane); disposition recorded in ADR-0036 main-line dispositions
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/public_trust.rs (target/debug/deps/public_trust-4fd437e4b57808eb)
+
+running 6 tests
+test active_global_moderator_persists_complete_immutable_supported_receipt ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test non_moderator_cannot_change_any_manual_review_state ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test quarantine_is_durable_but_not_retrievable_and_revoked_or_disabled_moderator_cannot_mutate ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test sealed_receipts_reject_runtime_rewrite_or_root_append_and_stale_requests_leave_no_trace ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test strict_gateway_and_retrieval_hydration_reject_each_wrong_identity_field ... ignored, requires isolated PostgreSQL and pinned real Gitleaks
+test legacy_receipt_basis_source_mutations_are_red ... ok
+
+test result: ok. 1 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/qdrant_contract.rs (target/debug/deps/qdrant_contract-1a2480906843f8fa)
+
+running 35 tests
+test correction_delete_supersede_is_strong_ordering ... ok
+test create_collection_body_carries_caller_supplied_size_not_a_hardcoded_one ... ok
+test dedicated_placement_collection_body_declares_custom_sharding ... ok
+test condition_to_filter_translates_scope_to_must_with_nested_visibility_disjunction ... ok
+test count_body_is_exact_and_carries_the_projection_version_clause ... ok
+test dense_query_rejects_empty_non_finite_or_zero_limit_inputs ... ok
+test dense_query_body_keeps_scope_version_tombstone_and_shard_in_one_request ... ok
+test dense_query_with_subject_ids_ands_an_any_of_should_after_tenant_and_visibility ... ok
+test dense_query_preserves_http_failure_without_candidate_fallback ... ok
+test indexable_payload_writes_sorted_deduped_subject_ids_array ... ok
+test normal_upsert_is_weak_ordering_throughput_oriented ... ok
+test non_secret_payload_becomes_indexable_and_round_trips_through_upsert_body ... ok
+test dense_query_uses_post_query_path_and_returns_typed_candidates ... ok
+test payload_authority_class_wire_is_pascalcase_verbatim ... ok
+test payload_carries_data_class_and_egress_disposition_wire_forms ... ok
+test payload_json_has_at_least_the_spec_fields ... ok
+test payload_optional_visibility_ids_are_null_when_absent ... ok
+test payload_status_wire_is_lowercase ... ok
+test dense_query_rejects_malformed_or_duplicate_candidates ... ok
+test placement_class_db_strings_match_migration_0068_literal_check_values ... ok
+test promotion_state_db_strings_match_migration_0068_literal_check_values ... ok
+test payload_visibility_class_wire_matches_dense_rs_filter_spelling ... ok
+test read_your_write_strict_path_uses_quorum_or_stronger_read_consistency ... ok
+test retrieval_family_collection_names_match_spec_verbatim ... ok
+test payload_memory_type_wire_matches_memory_records_check_constraint ... ok
+test secret_material_payload_cannot_become_an_indexable_payload ... ok
+test shard_key_body_carries_the_key_verbatim ... ok
+test subject_index_body_is_uuid_index_on_subject_ids ... ok
+test tenant_index_body_is_keyword_is_tenant ... ok
+test verify_visible_confirmation_never_carries_ids_outside_the_requested_batch ... ok
+test verify_visible_confirms_when_every_id_round_trips_a_real_search ... ok
+test verify_visible_withholds_confirmation_when_some_ids_are_not_yet_visible ... ok
+test visible_count_filter_refuses_an_empty_projection_version ... ok
+test visible_count_subtracts_tombstones_and_saturates_at_zero ... ok
+test upsert_controls_are_uri_parameters_not_point_body_fields ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/qdrant_live.rs (target/debug/deps/qdrant_live-5d17cd8fc1d90b1f)
+
+running 1 test
+test upsert_then_search_visible_round_trips_over_real_qdrant ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/quota_and_rate.rs (target/debug/deps/quota_and_rate-e0ca2de08f83c262)
+
+running 7 tests
+test concurrent_capacity_one_creates_one_and_same_request_is_idempotent ... ignored, requires migration 0113 and the dedicated request-guard PostgreSQL fixture
+test concurrent_issuer_is_single_window_and_retry_does_not_rewrite_limit ... ignored, requires migration 0113 and the dedicated request-guard PostgreSQL fixture
+test expired_reservation_is_reaped_without_charging ... ignored, requires migration 0113 and the dedicated request-guard PostgreSQL fixture
+test issuer_is_projection_only_and_runtime_cannot_issue_or_insert_window ... ignored, requires migration 0113 and the dedicated request-guard PostgreSQL fixture
+test mismatched_replay_and_invalid_inputs_fail_closed ... ignored, requires migration 0113 and the dedicated request-guard PostgreSQL fixture
+test rate_buckets_are_subject_scoped_and_quota_failure_does_not_refund_rate ... ignored, requires migration 0113 and the dedicated request-guard PostgreSQL fixture
+test reservation_capacity_replay_consumption_release_and_reap_are_terminal ... ignored, requires migration 0113 and the dedicated request-guard PostgreSQL fixture
+
+test result: ok. 0 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/reasoning_route_foundation.rs (target/debug/deps/reasoning_route_foundation-c20843cdc104583b)
+
+running 3 tests
+test route_foundation_tables_are_acl_protected_until_r2_activation ... ignored, requires isolated PostgreSQL 18 migrated through 0128
+test user_reasoning_foundation_rejects_cross_owner_trust_and_payer_edges ... ignored, requires isolated PostgreSQL 18 migrated through 0128
+test version_spines_and_policy_candidate_freeze_are_race_safe ... ignored, requires isolated PostgreSQL 18 migrated through 0128
+
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/reasoning_route_health_admission.rs (target/debug/deps/reasoning_route_health_admission-99498202e34a685d)
+
+running 4 tests
+test reasoning_attempt_ledger_disclosure_candidate_and_atomicity ... ignored, requires isolated PostgreSQL 18 migrated through 0130
+test reasoning_route_health_acl_append_only_and_null_shape ... ignored, requires isolated PostgreSQL 18 migrated through 0130
+test reasoning_route_health_admission_matrix ... ignored, requires isolated PostgreSQL 18 migrated through 0130
+test reasoning_route_health_statement_snapshot_advances_on_next_call ... ignored, requires isolated PostgreSQL 18 migrated through 0130
+
+test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/reasoning_route_shadow_bootstrap.rs (target/debug/deps/reasoning_route_shadow_bootstrap-b65fc7b322111a87)
+
+running 1 test
+test contribution_deidentify_shadow_bootstrap_is_exact_replayable_and_fail_closed ... ignored, requires isolated PostgreSQL 18 migrated through 0129
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/recall_envelope_g23.rs (target/debug/deps/recall_envelope_g23-f61040e2e3a25121)
+
+running 3 tests
+test g23_2_injection_1_bypass_tombstone_direct_delete ... ok
+test g23_2_injection_2_adapter_acks_without_verify_loses_seven ... ok
+test g23_2_legal_deletion_contrast_stays_closed_across_four_lanes ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+
+     Running tests/request_guard.rs (target/debug/deps/request_guard-a39015f0dea4b0f3)
+
+running 3 tests
+test audit_tenant_is_closed_to_authenticated_scope_or_system ... ignored, requires the dedicated request-guard PostgreSQL fixture
+test effective_entitlements_are_read_only_from_the_projected_snapshot ... ignored, requires the dedicated request-guard PostgreSQL fixture
+test gateway_audit_writer_requires_bound_force_rls_scope ... ignored, requires the dedicated request-guard PostgreSQL fixture
+
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/retrieval_query_sources.rs (target/debug/deps/retrieval_query_sources-8ce593112ff24906)
+
+running 3 tests
+test established_four_source_kinds_remain_positive_under_rewritten_constraints ... ok
+test typed_query_source_reserve_is_atomic_and_generic_paths_cannot_forge_it ... ok
+test query_source_grants_tenant_fk_and_one_way_revocation_hold_under_real_roles ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/retrieve_no_hidden_generative_recall.rs (target/debug/deps/retrieve_no_hidden_generative_recall-f6d4a0c0c5768e7d)
+
+running 2 tests
+test no_query_rewrite_ledger_entries_is_the_clean_baseline ... ok
+test injected_query_rewrite_ledger_entry_is_red ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/retrieve_read_your_writes.rs (target/debug/deps/retrieve_read_your_writes-948f2e0829970a63)
+
+running 25 tests
+test garbage_token_is_rejected_not_silently_ignored ... ok
+test fixture_cleanup_rolls_back_an_aborted_owner_transaction ... ok
+test expired_token_is_rejected ... ok
+test forged_sequence_or_unregistered_version_is_rejected ... ok
+test evidence_with_two_memories_reports_one_candidate_with_both_ids ... ok
+test final_materialize_binds_overlay_to_the_validated_projection_version ... ok
+test final_materialize_rechecks_private_evidence_for_the_current_user ... ok
+test final_materialize_returns_real_memory_and_processing_event_bodies ... ok
+test final_materialize_drops_memory_with_a_hidden_linked_source ... ok
+test final_materialize_excludes_secret_memory_source_and_marks_artifact_unavailable ... ok
+test remember_rejects_expired_policy_without_publishing_a_token ... ok
+test registered_nonserving_old_version_uses_full_pg_overlay ... ok
+test recall_overlay_decision_keeps_token_and_projection_reads_in_one_rr_snapshot ... ok
+test remember_then_recall_sees_evidence_with_processing_state_not_memory ... ok
+test settled_evidence_without_memory_link_reports_none_not_fabricated_id ... ok
+test remember_returned_token_is_accepted_by_recall ... ok
+test token_cannot_forge_a_different_trusted_stream_family ... ok
+test revoked_memory_and_tombstoned_evidence_are_finally_filtered ... ok
+test same_tenant_other_user_cannot_read_private_overlay_evidence ... ok
+test token_claims_resolve_to_the_seeded_stream_key ... ok
+test unauthorized_workspace_token_is_rejected_by_scope_narrowing ... ok
+test token_used_across_tenant_is_rejected ... ok
+test token_used_across_workspace_is_rejected ... ok
+test workspace_stream_private_evidence_token_routes_and_stays_private ... ok
+test remember_lock_wait_past_deadline_rolls_back_all_writes ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.67s
+
+     Running tests/scheduler_exactly_once.rs (target/debug/deps/scheduler_exactly_once-d551a9047da5f362)
+
+running 3 tests
+test g32_1_exactly_once_enqueue_survives_concurrent_replicas_and_leader_failover ... ok
+test g32_1_fault_injection_idempotency_key_must_include_planned_at ... ok
+test g32_1_fault_injection_unique_constraint_is_the_final_arbiter ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/selection_snapshot.rs (target/debug/deps/selection_snapshot-eb37685c8bebc2e7)
+
+running 3 tests
+test cursor_rejects_cross_tenant_reuse ... ok
+test snapshot_pagination_is_stable_under_concurrent_inserts ... ok
+test cursor_rejects_forged_ordinal ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+
+     Running tests/serving_repo.rs (target/debug/deps/serving_repo-d32fe703ac6157db)
+
+running 9 tests
+test serving_version_rejects_family_outside_authenticated_tenant ... ok
+test ux_serving_one_rejects_second_serving_row_for_same_family ... ok
+test serving_version_is_none_when_only_a_shadow_row_exists ... ok
+test switch_projection_version_rejects_when_declared_serving_version_does_not_match_db ... ok
+test serving_version_never_returns_a_shadow_only_version ... ok
+test switch_projection_version_rejects_when_shadow_has_an_open_gap ... ok
+test switch_projection_version_rejects_and_writes_nothing_when_shadow_missing_one_visible_point ... ok
+test switch_projection_version_succeeds_when_all_three_criteria_hold_and_old_row_survives ... ok
+test switch_projection_version_reports_target_missing_and_writes_nothing_when_new_version_row_absent ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/stream_repo.rs (target/debug/deps/stream_repo-eaec845e1955d2cf)
+
+running 5 tests
+test sweep_lost_never_touches_waiting_key_regardless_of_age ... ok
+test sweep_lost_sweeps_orphan_but_spares_owned_and_fresh_issued ... ok
+test advance_prefix_inconsistent_when_max_seq_disagrees_with_expected ... ok
+test advance_prefix_inconsistent_when_sum_identity_breaks ... ok
+test advance_prefix_stops_before_the_gap_100_failed_101_done ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/subject_registry_rls.rs (target/debug/deps/subject_registry_rls-a4b60ad84dc2f00d)
+
+running 7 tests
+test subject_checks_match_domain_enums ... ok
+test visibility_allowed_matches_can_read_exhaustive ... ok
+test subject_keys_unique_per_tenant_never_globally ... ok
+test unset_user_id_session_reads_tenant_shared_rows ... ok
+test subject_fks_reject_foreign_tenant_subjects ... ok
+test parity_is_fault_sensitive ... ok
+test subjects_cross_tenant_isolation_via_set_local_role ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/tenant_placements_migration.rs (target/debug/deps/tenant_placements_migration-c4650f17246a68a2)
+
+running 3 tests
+test promotion_state_check_constraint_matches_rust_enum ... ok
+test placement_class_check_constraint_matches_rust_enum ... ok
+test cross_tenant_rls_hides_other_tenants_placement_rows ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+   Doc-tests humaux_adapters
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+EXIT=0
+ADAPTERS_DONE

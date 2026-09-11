@@ -1,0 +1,48 @@
+### migrate
+migrate: skip  0158_operation_receipts_stream_scoped_key (already applied)
+migrate: skip  0159_evidence_reasoning_domain_tenant_fk (already applied)
+migrate: skip  0160_memberships_role_closed_set (already applied)
+migrate: skip  0161_membership_lifecycle_admin_path (already applied)
+migrate: skip  0162_workspace_memberships (already applied)
+migrate: skip  0163_workspace_shared_membership_arm (already applied)
+migrate: skip  0164_derived_work_dispatch (already applied)
+migrate: pass (0 applied, 132 already-applied, 132 total)
+MIGRATE_EXIT=
+### rls-check
+rls-check Admin-Plane 防泄漏: pass — no unguarded runtime-role-readable %tenant_id% table
+rls-check R3 health boundary: pass — two owner-only FORCE RLS health tables; admission resolver is private-worker-only, the 0147 binding lookup is private-worker + consolidation-worker (0164), both owner SECURITY DEFINER
+rls-check R4 execution function boundary: pass — 8 exposed private-worker APIs and 11 internal no-runtime APIs are exact
+rls-check R4 execution registry: pass — all current 0131-created relations are present and registered
+rls-check W1 Project Continuity boundary: pass — catalog/ACL/RLS/A'' marker census exact
+rls-check W2 Project Continuity read boundary: pass — exact owner/config/ACL and zero W1 direct grants
+rls-check §6.1.3 subject visibility RESTRICTIVE policy: pass — RESTRICTIVE SELECT policy TO {role_gateway, role_maintenance} only; owner definer STABLE predicate, EXECUTE to exactly those two roles (PUBLIC none)
+rls-check §31/§61 derived work cross-tenant dispatch: pass — ops.claim_derived_work: owner SECURITY DEFINER, search_path pinned, EXECUTE exactly {role_consolidation_worker, role_private_worker}, PUBLIC revoked; ops.jobs keeps one FORCE-RLS permissive policy with both the owner and tenant arms
+RLS_EXIT=
+### architecture-check
+architecture-check: pass — §20#G20-2 / G80-39 (online recall 无隐藏生成调用)
+architecture-check: pass — §23.1② (LedgerCounts 字段集恰为 6)
+architecture-check: pass — §22.5 (A1 算式全库只此一处)
+architecture-check: pass — §11.2.4–11.2.5 R3 (append-only exact-health admission contract)
+architecture-check: pass — §11.2.5 R3 (actual contribution call ledger/disclosure transaction)
+architecture-check: pass — §25.3.1 W1 (Project Continuity storage/CAS/marker boundary)
+architecture-check: pass — §25.3.1 W2 (Project Continuity native RR read boundary)
+architecture-check: pass — ADR-0012 (gateway↔retrieval-worker boundary, worker-only symbols)
+architecture-check: pass — ADR-0012 (RPC transport stays UDS + peer_cred, never TCP)
+architecture-check: pass — ADR-0014 (gateway Qdrant access is QdrantReadOnly, never ReadWrite)
+architecture-check: pass — ADR-0039 / §11.4 (outbound client dials only through the checked resolver)
+architecture-check: pass — §19 Provider Plane Architecture Gate 1/7 (Domain does not import DashScope SDK)
+architecture-check: pass — §19 Provider Plane Architecture Gate 2/7 (Application does not call DashScope directly)
+architecture-check: pass — §19 Provider Plane Architecture Gate 3/7 (Only retrieval-provider/adapters may import provider client)
+architecture-check: pass — §19 Provider Plane Architecture Gate 4/7 (Every external retrieval call passes EgressPolicy)
+architecture-check: pass — §19 Provider Plane Architecture Gate 5/7 (Every external retrieval call creates ModelCallLedger entry)
+architecture-check: pass — §19 Provider Plane Architecture Gate 6/7 (Every call participates in provider admission control)
+architecture-check: pass — §19 Embedding Provider Failover 硬规则 (decide_embedding_failover / projection_contracts_compatible sole decision point)
+architecture-check: pass — §19 Provider Plane Architecture Gate 7/7 (Embedding projection write contains provider/model/version metadata)
+architecture-check: pass — §19 DOD-028 (a) EgressSecret::expose sole call site
+architecture-check: pass — §19 DOD-028 (b) retrieval credential purpose guard exists
+architecture-check: pass — §11.10#G11-2 / G80-43 (Grounding validity / recheck debt)
+architecture-check: pass — §25.4 A1 (Candidate 唯一构造点)
+architecture-check: pass — §25.4 A2 (context_bindings 唯一写入点)
+architecture-check: pass — §25.4 A3 (authorize_mandatory/pinned 唯一调用点)
+ARCH_EXIT=
+GATES_DONE

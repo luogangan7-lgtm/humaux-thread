@@ -36,8 +36,8 @@ pub struct ClientConfig {
     pub trust_env_proxy: bool,
 }
 
-/// Shared builder setup for [`build_client`]/[`build_client_with_resolver`] — the redirect
-/// policy and timeout are identical either way; only the resolver differs.
+/// Shared builder setup for [`build_client_with_resolver`] — kept as its own function so the
+/// redirect policy and timeout live in one place independent of the resolver wiring.
 fn client_builder(config: ClientConfig) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder()
         .timeout(config.request_timeout)
@@ -49,7 +49,32 @@ fn client_builder(config: ClientConfig) -> reqwest::ClientBuilder {
     }
 }
 
-/// The workspace's one legal `reqwest::Client` construction site (ADR-0003, §83.4 G80-3).
+/// The workspace's one legal `reqwest::Client` construction site (ADR-0003, §83.4 G80-3) —
+/// and, since ADR-0039, the only one that exists at all: a caller cannot build an outbound
+/// client without naming the resolver it will dial through, because there is no overload that
+/// omits it.
+///
+/// `resolver` is installed as the client's DNS resolver
+/// (`reqwest::ClientBuilder::dns_resolver`, stable since 0.12.28) instead of `reqwest`'s
+/// default `GaiResolver`.
+///
+/// ADR-0003 second-round correction (OWASP SSRF Cheat Sheet's DNS rebinding / "TOCTOU" pinning
+/// bypass): a caller that resolves+validates a hostname itself and *then* hands the bare
+/// hostname to an HTTP client leaves a gap — the client's own connector resolves the name a
+/// second time, and nothing guarantees the second lookup returns the same addresses the first
+/// one validated. This function exists so a Layer 1 caller can make its validating resolver the
+/// *only* resolver this client ever consults: there is one lookup, not two, so "the addresses
+/// that were validated" and "the addresses that get dialed" are structurally the same call, not
+/// a discipline of remembering to re-check. TLS certificate validation still runs against the
+/// original hostname (SNI/SAN) — only address *resolution* is intercepted, so this does not
+/// degrade into dialing a bare IP and skipping hostname verification.
+///
+/// ADR-0039: the resolver-less sibling (`build_client`) that Layer 1A used to call is
+/// **deleted**, not deprecated — while it existed, `infra-egress`'s two transports dialed with
+/// the system resolver while §11.4's SSRF gate checked with an injected one, which is the
+/// rebinding window this whole mechanism exists to close. `xtask architecture-check`'s
+/// "outbound client dials only through the checked resolver" gate keeps it deleted and pins
+/// this function's call sites to the two Layer 1 resolver modules.
 ///
 /// §83.4 判据3: redirects are disabled at the client level (`Policy::none()`), not merely
 /// checked at the first-hop hostname. `reqwest`'s default policy (`Policy::limited(10)`) would
@@ -63,25 +88,6 @@ fn client_builder(config: ClientConfig) -> reqwest::ClientBuilder {
 ///
 /// Fails only if the TLS backend cannot initialize (`reqwest::Client::builder().build()`'s own
 /// failure mode) — a process-startup-time configuration error, not a per-call one.
-pub fn build_client(config: ClientConfig) -> Result<reqwest::Client, reqwest::Error> {
-    client_builder(config).build()
-}
-
-/// Same choke point as [`build_client`], but with `resolver` installed as the client's DNS
-/// resolver (`reqwest::ClientBuilder::dns_resolver`, stable since 0.12.28) instead of
-/// `reqwest`'s default `GaiResolver`.
-///
-/// ADR-0003 second-round correction (OWASP SSRF Cheat Sheet's DNS rebinding / "TOCTOU" pinning
-/// bypass): a caller that resolves+validates a hostname itself and *then* hands the bare
-/// hostname to an HTTP client leaves a gap — the client's own connector resolves the name a
-/// second time, and nothing guarantees the second lookup returns the same addresses the first
-/// one validated. This function exists so a Layer 1 caller (`humaux-infra-cell`'s
-/// `HttpIntraCellTransport` is the first) can make its validating resolver the *only* resolver
-/// this client ever consults: there is one lookup, not two, so "the addresses that were
-/// validated" and "the addresses that get dialed" are structurally the same call, not a
-/// discipline of remembering to re-check. TLS certificate validation still runs against the
-/// original hostname (SNI/SAN) — only address *resolution* is intercepted, so this does not
-/// degrade into dialing a bare IP and skipping hostname verification.
 pub fn build_client_with_resolver<R>(
     config: ClientConfig,
     resolver: std::sync::Arc<R>,
@@ -106,8 +112,7 @@ mod tests {
         }
     }
 
-    /// The custom-resolver overload builds successfully — same TLS-backend-only failure mode
-    /// as [`build_client`], now exercised with a resolver installed.
+    /// The one constructor builds successfully — its only failure mode is TLS-backend init.
     #[test]
     fn build_client_with_resolver_succeeds() {
         let client = build_client_with_resolver(
@@ -117,15 +122,6 @@ mod tests {
             },
             std::sync::Arc::new(StubResolve),
         );
-        assert!(client.is_ok());
-    }
-
-    #[test]
-    fn build_client_succeeds_with_a_real_timeout() {
-        let client = build_client(ClientConfig {
-            request_timeout: Duration::from_secs(5),
-            trust_env_proxy: false,
-        });
         assert!(client.is_ok());
     }
 
@@ -158,10 +154,16 @@ mod tests {
             let _ = socket.shutdown().await;
         });
 
-        let client = build_client(ClientConfig {
-            request_timeout: Duration::from_secs(2),
-            trust_env_proxy: false,
-        })
+        // The URL authority below is an IP literal, which `reqwest`'s connector never hands to
+        // a custom `dns_resolver` — `StubResolve` is therefore never consulted here, and this
+        // test still exercises exactly the redirect policy it is about.
+        let client = build_client_with_resolver(
+            ClientConfig {
+                request_timeout: Duration::from_secs(2),
+                trust_env_proxy: false,
+            },
+            std::sync::Arc::new(StubResolve),
+        )
         .unwrap();
         let response = client
             .get(format!("http://{origin_addr}/start"))
