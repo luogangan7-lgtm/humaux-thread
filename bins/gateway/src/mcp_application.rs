@@ -163,7 +163,14 @@ impl GatewayMcpApplication {
     /// deployments keep failing `recall.search` closed until this is configured.
     #[must_use]
     pub fn with_semantic_recall(mut self, runtime: SemanticRecallRuntime) -> Self {
-        self.semantic_recall = Some(Arc::new(runtime));
+        let runtime = Arc::new(runtime);
+        // §23.1② (card 18): the PG-only read routes (`memory.*`, `context.assemble`) hold no
+        // Qdrant transport of their own, so they borrow this one purely to take the live
+        // `visible` count. This is the only place that holds both values; without it those two
+        // routes would keep reporting `cannot_establish` / `index_count_unavailable` on every
+        // successful read while `recall.search` reported a real ratio.
+        self.context_bootstrap.attach_index_face(&runtime);
+        self.semantic_recall = Some(runtime);
         self
     }
 

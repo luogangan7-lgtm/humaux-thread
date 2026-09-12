@@ -20,8 +20,8 @@ use humaux_adapters::{
     },
     read_materialize::MaterializedItem,
     retrieve::{
-        MaterializedPrivateReadServing, materialize_private_read_serving_about,
-        private_read_projection_selector,
+        IndexFace, MaterializedPrivateReadServing, materialize_private_read_serving_about,
+        private_read_projection_selector, visible_index_count,
     },
 };
 use humaux_application::affect::rerank_by_mood;
@@ -43,12 +43,13 @@ use humaux_infra_cell::{
     authorize_cell_access,
 };
 use humaux_local_secret_scan::LocalSecretScanner;
+use humaux_projection::stream::StreamKey;
 use humaux_protocol::{
     mcp::{ToolName, ToolOutput},
     mcp_catalog::CanonicalCatalog,
 };
 use humaux_retrieval::{
-    completeness::{CensusResult, FreshnessClass},
+    completeness::{CensusResult, FreshnessClass, LedgerClosure},
     envelope::{
         CompletenessBlock, CompletenessInputs, CountScope, Envelope, EvidenceBlock, FreshnessBlock,
         KnowledgeBlock, LaneStatus, MandatoryReport, PendingEnvelope, PinnedReport, PipelineBlock,
@@ -87,6 +88,17 @@ pub struct SemanticRecallRuntime {
     handler_timeout: Duration,
 }
 
+/// `ContextBootstrap` derives `Debug` and now carries an optional handle to this runtime, so
+/// the runtime needs one. Deliberately opaque: every field here is either a credential-adjacent
+/// handle (scanner, embedding port, Qdrant transport, Cell registry) or a version string already
+/// reported in `provenance`. Formatting them would put transport/permit detail into any operator
+/// line that `{:?}`s a bootstrap.
+impl std::fmt::Debug for SemanticRecallRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SemanticRecallRuntime")
+    }
+}
+
 pub struct SemanticRecallVersions {
     pub embedding_version: String,
     pub dimension: u32,
@@ -117,6 +129,44 @@ impl SemanticRecallRuntime {
             dimension,
             handler_timeout,
         })
+    }
+
+    /// §23.1② live `visible` for the two PG-only read routes (`memory.*`, `context.assemble`),
+    /// which hold no Qdrant transport of their own. They reach this through
+    /// [`crate::context::ContextBootstrap::visible_index_count`]; `recall.search` skips it and
+    /// calls `humaux_adapters::retrieve::visible_index_count` directly, because it has already
+    /// resolved the placement and the permit for its own dense query and must not pay for a
+    /// second placement round trip. The counting rules themselves live in exactly one place —
+    /// that adapter function — not here.
+    pub(crate) async fn visible_index_count(
+        &self,
+        pool: &RuntimeDbPool,
+        authorization: &AuthorizationScope,
+        key: &StreamKey,
+        serving_version: Option<&str>,
+        ledger: &LedgerClosure,
+    ) -> Option<u64> {
+        let placement = tenant_placement(
+            pool,
+            authorization.tenant_id(),
+            RetrievalFamily::PrivateMemoryV1,
+        )
+        .await
+        .ok()??;
+        let permit = self.qdrant_permit().ok()?;
+        visible_index_count(
+            pool,
+            authorization,
+            IndexFace {
+                transport: self.qdrant.as_ref(),
+                permit: &permit,
+                collection: &placement.collection_name,
+            },
+            key,
+            serving_version,
+            ledger,
+        )
+        .await
     }
 
     fn qdrant_permit(&self) -> Result<CellAccessPermit, ErrorCode> {
@@ -392,6 +442,26 @@ pub async fn search(
                 ErrorCode::DependencyUnavailable
             })?,
     };
+    // §23.1②: the live index count, taken against the SERVING version this request actually
+    // read (`private_read_projection_selector` above), never the token's. `None` here is not a
+    // failure to handle — it is the honest "cannot establish" input `build_projection_block`
+    // already knows how to report.
+    let visible = visible_index_count(
+        &pool,
+        &authorization,
+        IndexFace {
+            transport: runtime.qdrant.as_ref(),
+            permit: &runtime.qdrant_permit()?,
+            collection: &placement.collection_name,
+        },
+        &family.with_version(projection_version.clone()),
+        Some(projection_version.as_str()),
+        &materialized.ledger,
+    )
+    .await;
+    if visible.is_none() {
+        eprintln!("humaux-gateway: recall request_id={request_id} visible_index_count_unavailable");
+    }
     accepted_output(
         materialized,
         &retrieval,
@@ -402,6 +472,7 @@ pub async fn search(
         candidates.len(),
         reranked,
         &catalog,
+        visible,
     )
 }
 
@@ -447,11 +518,12 @@ fn accepted_output(
     candidate_count: usize,
     reranked_count: u32,
     catalog: &CanonicalCatalog,
+    visible: Option<u64>,
 ) -> Result<PendingEnvelope<ToolOutput>, ErrorCode> {
     let items = render_items(materialized.bodies.items);
     let returned = u32::try_from(items.len()).map_err(|_| ErrorCode::Internal)?;
     let candidate_count = u32::try_from(candidate_count).map_err(|_| ErrorCode::Internal)?;
-    let projection = build_projection_block(&materialized.ledger, None);
+    let projection = build_projection_block(&materialized.ledger, visible);
     let pipeline = PipelineBlock {
         evidence: EvidenceBlock::no_batch(None, CountScope::AuthorizedView),
         knowledge: KnowledgeBlock {
@@ -491,7 +563,7 @@ fn accepted_output(
             ledger: &materialized.ledger,
             pipeline: &pipeline,
             provenance: &provenance,
-            visible: None,
+            visible,
             context: None,
         },
         |outcome| {

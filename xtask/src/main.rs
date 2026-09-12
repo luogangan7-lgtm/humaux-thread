@@ -23,6 +23,7 @@ mod projection_serve;
 mod r4_fault_manifest;
 mod rls_check;
 mod soak;
+mod switch_visible;
 mod threshold_shape;
 
 fn main() {

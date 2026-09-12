@@ -33,6 +33,7 @@ use humaux_domain::error::ErrorCode;
 use humaux_domain::identity::AuthorizationScope;
 use humaux_domain::ids::{TenantId, WorkspaceId};
 use humaux_domain::subject::SubjectId;
+use humaux_infra_cell::{CellAccessPermit, IntraCellHttpTransport};
 use humaux_projection::serving::StreamFamily;
 use humaux_projection::stream::StreamKey;
 use humaux_retrieval::completeness::LedgerClosure;
@@ -42,7 +43,7 @@ use crate::postgres::RuntimeDbPool;
 use crate::private_projection_registry::{
     PrivateProjectionRegistryError, ProjectionPointId, resolve_private_memory_points_in_txn,
 };
-use crate::qdrant::{DenseCandidate, PointId};
+use crate::qdrant::{DenseCandidate, PointId, VisibleCountFilter, count_visible_excluding_seqs};
 use crate::read_materialize::{MaterializedBodies, materialize_final_bodies_about_in_txn};
 use crate::serving_repo::{self, ServingRepoError};
 use crate::stream_repo::close_ledger_in_txn;
@@ -1054,6 +1055,177 @@ pub(crate) async fn recall_with_overlay_in_txn(
         contiguous_done_prefix: prefix,
         serving_version,
     })
+}
+
+// ============================================================================
+// §23.1② — the live `visible` index count the three read routes share
+// ============================================================================
+
+/// The already-authorized Qdrant face one [`visible_index_count`] call runs against: the
+/// permit-bound transport plus the tenant's own collection ([`crate::placement_repo`]'s
+/// `TenantPlacementRow::collection_name`, §17.3 — never another tenant's). Grouped into one
+/// value because these three always travel together and separately they are three more
+/// positional parameters on a function whose other four are already load-bearing.
+pub struct IndexFace<'a> {
+    pub transport: &'a dyn IntraCellHttpTransport,
+    pub permit: &'a CellAccessPermit,
+    pub collection: &'a str,
+}
+
+/// §23.1②'s `visible`, read live from Qdrant — the single producer of the `Option<u64>` every
+/// read route hands to `humaux_retrieval::envelope::build_projection_block`. Before this
+/// existed all three routes passed `None`, so every successful read reported completeness class
+/// `cannot_establish` / `index_count_unavailable` no matter how healthy the projection was.
+///
+/// Three rules, each of which has its own way of being got wrong:
+///
+/// 1. **No serving version ⇒ `None`, never `Some(0)`** (§16.2/§57.1, and this module's
+///    [`RecallEnvelope::serving_version`] doc). A family with no `serving = true` checkpoint row
+///    has no retrieval face at all, so "how many points are visible on it" has no denominator —
+///    that is `cannot_establish`, which is a different statement from "the face is empty". The
+///    `?` on `serving_version` below is that rule; §4.4 坑5 is the same rule stated once more.
+///    Its other half: the serving version must also be the version `ledger` was closed at, or
+///    A2 would compare two different faces — see the `serving_version != key.projection_version`
+///    guard's own comment.
+/// 2. **The filter comes from the shared builder, never by hand** (§17.1). [`VisibleCountFilter`]
+///    is constructed only through `projection::dense::build_dense_filter`, which unconditionally
+///    ANDs the tenant clause and the §6.1.2 visibility disjunction onto whatever it is asked to
+///    narrow by — so this count sees exactly the point set the caller is allowed to see, and a
+///    hand-written second filter (the failure `crates/projection/tests/no_handwritten_filter_scan.rs`
+///    pins) cannot arise here. It narrows by `projection_version` **only**: A2's right-hand side
+///    (`ledger.done`) is a whole-stream number that no `recall.search` argument narrows, so
+///    carrying this request's `subject_ids` / `affect` / `embedding_version` clauses into the
+///    left-hand side would shrink `visible` against an unshrunk `done` and manufacture
+///    `PROJECTION_INVISIBLE_LOSS` on every narrowed read. Same reason `visible` is compared with
+///    the *stream* ledger and not with the returned item count.
+/// 3. **Tombstones are excluded by the overlay, not by arithmetic** (§37/§23.1②). §37 step 5's
+///    physical purge is asynchronous (and, on this deployment, not wired at all), so a
+///    `TOMBSTONED` row's point is usually still in the index and still matches the filter;
+///    counting it would inflate A2's left-hand side by exactly `ledger.deleted`. The exclusion
+///    rides the same `count` request
+///    ([`crate::qdrant::count_visible_excluding_seqs`]) rather than being subtracted afterwards,
+///    so it stays correct whichever side of the purge the read lands on.
+///
+/// Returns `None` — never a fabricated number — for every failure: no serving version, an empty
+/// version string, the tombstone read failing, or the Qdrant count failing. `None` means the
+/// envelope reports `cannot_establish`, which is the honest answer; a `0` would be a claim that
+/// the index is empty.
+pub async fn visible_index_count(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    index: IndexFace<'_>,
+    key: &StreamKey,
+    serving_version: Option<&str>,
+    ledger: &LedgerClosure,
+) -> Option<u64> {
+    // Rule 1. `?`, not `unwrap_or(0)`: see this function's doc.
+    let serving_version = serving_version?;
+    // Rule 1b. Same rule, other half: `ledger` was closed at `key.projection_version`, and A2
+    // (`visible + deleted + skipped == done`) compares this count against it. Counting the
+    // family's serving face while the ledger describes a *different* version compares two
+    // different faces and manufactures a `PROJECTION_INVISIBLE_LOSS` (or an A2 overshoot, i.e.
+    // `cannot_establish`) on a perfectly healthy projection. The two strings diverge for real:
+    // `ContextBootstrap::provisioned_request_stream` derives the ledger key from this process's
+    // configured `projection_version` (ADR-0031 Q9) while reading the family's `serving = true`
+    // row separately, so a process configured at v1 during a switch to v2 lands here with
+    // `serving_version = "v2"` and `key.projection_version = "v1"`. There is no comparable
+    // measurement in that state — `None` (cannot_establish), never a number taken off the wrong
+    // face. Everything below therefore uses ONE version string for the filter, the tombstone
+    // overlay and the ledger alike.
+    if serving_version != key.projection_version {
+        return None;
+    }
+    // Rule 3 — skipped entirely when the ledger says this stream has never tombstoned anything,
+    // which is the common case and saves a PG round trip on every read.
+    let tombstoned = if ledger.counts().deleted() == 0 {
+        Vec::new()
+    } else {
+        tombstoned_source_seqs(pool, authorization, key)
+            .await
+            .ok()?
+    };
+    // Rules 2 and 3's actual arithmetic — shared verbatim with the §16.2 serve switch, see
+    // [`visible_count_of_version`].
+    visible_count_of_version(&index, authorization, serving_version, &tombstoned).await
+}
+
+/// §23.1②'s `visible` for **one declared `projection_version`** — the shared body of
+/// [`visible_index_count`] (the three read routes) and of the §16.2 serve switch's two
+/// `visible_*` inputs (`xtask::switch_visible`, which feeds
+/// `adapters::serving_repo::switch_projection_version` / `projection::serving::evaluate_switch`).
+/// One producer, so the switch cannot drift onto a second, hand-written filter: rule 2 of
+/// [`visible_index_count`]'s doc (`VisibleCountFilter` is only constructible through
+/// `projection::dense::build_dense_filter`, which unconditionally ANDs the tenant clause and the
+/// §6.1.2 visibility disjunction) and rule 3 (the §37 tombstone overlay rides the same `count`
+/// request) both live here and are therefore identical on both sides.
+///
+/// **Why this takes a bare `projection_version` rather than [`visible_index_count`]'s
+/// `serving_version` + `key` pair.** That function's `serving_version != key.projection_version
+/// ⇒ None` guard exists because its answer is compared against a `LedgerClosure` closed at
+/// `key.projection_version` (A2: `visible + deleted + skipped == done`) — two different faces
+/// there is a manufactured `PROJECTION_INVISIBLE_LOSS`. The switch compares a count against
+/// *another count*, never against a ledger, and §16.3 requires the two sides to differ in
+/// exactly the `projection_version` filter — so the serve path must count the **candidate**
+/// version for `visible_shadow` and the **serving** version for `visible_serving`, and applying
+/// the read route's same-version guard there would return `None` for every real (candidate ≠
+/// serving) promotion, i.e. `VisibleUnavailable` forever. The guard stays where it belongs, on
+/// the ledger-comparing caller.
+///
+/// `None` — never a fabricated number — when the version string is empty or the Qdrant count
+/// fails.
+pub async fn visible_count_of_version(
+    index: &IndexFace<'_>,
+    authorization: &AuthorizationScope,
+    projection_version: &str,
+    tombstoned_seqs: &[i64],
+) -> Option<u64> {
+    let filter = VisibleCountFilter::new(authorization, projection_version)?;
+    count_visible_excluding_seqs(
+        index.transport,
+        index.permit,
+        index.collection,
+        &filter,
+        tombstoned_seqs,
+    )
+    .await
+    .ok()
+}
+
+/// Every `TOMBSTONED` `stream_seq` of one stream — §37's overlay input, read under the caller's
+/// own RLS through `role_gateway` (the same role and the same table
+/// [`contiguous_done_prefix_in_txn`] reads, so no new grant is involved).
+///
+// ponytail: the seq list rides one `must_not ... match any` array, so a stream with a very large
+// tombstoned population makes a correspondingly large count request. Bounded in practice by
+// §37's own purge SLA (`forget_repo::tombstoned_unpurged_over_sla`); if that gauge is ever
+// allowed to grow without bound, switch this to a `source_stream_seq` range overlay or push the
+// exclusion into the projection worker's own delete, and keep the fault test.
+pub(crate) async fn tombstoned_source_seqs(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    key: &StreamKey,
+) -> Result<Vec<i64>, RetrieveError> {
+    let mut txn = pool.pool().begin().await?;
+    set_authorization_local(&mut txn, authorization).await?;
+    let rows = sqlx::query(
+        "SELECT stream_seq FROM projection.stream_log
+         WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3
+           AND domain = $4 AND projection_kind = $5 AND projection_version = $6
+           AND state = 'TOMBSTONED'
+         ORDER BY stream_seq",
+    )
+    .bind(key.tenant_id.0)
+    .bind(&key.scope_kind)
+    .bind(key.scope_id)
+    .bind(&key.domain)
+    .bind(&key.projection_kind)
+    .bind(&key.projection_version)
+    .fetch_all(&mut *txn)
+    .await?;
+    txn.commit().await?;
+    rows.iter()
+        .map(|row| Ok(row.try_get::<i64, _>("stream_seq")?))
+        .collect()
 }
 
 /// §78.2 "DB enum 与 Rust enum 走 contract test 对账": [`ProcessingState::ALL`] must list

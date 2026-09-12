@@ -613,6 +613,69 @@ fn seed_semantic_checkpoint(handle: &mut Handle) {
         .expect("owner seeds the trusted serving version");
 }
 
+/// Card 18 / §23.1②: the projection ledger of record for the points the semantic fixture
+/// upserts by hand. [`seed_semantic_checkpoint`] leaves `issued_highwater = 0`, which was
+/// harmless only while every read route passed `visible: None`; with the live count wired, a
+/// Qdrant face carrying `n` points over a ledger that issued nothing is a genuine A2 overshoot
+/// and the envelope would (correctly) refuse to state a ratio. These `n` settled `DONE` rows
+/// are that ledger. No `ops.outbox` row is written for them on purpose: §15.5's RYW overlay
+/// joins through `ops.outbox`, so — exactly like the already-projected points they stand for —
+/// they must not appear as overlay items.
+fn seed_semantic_projection_ledger(handle: &mut Handle, n: i64) {
+    for seq in 1..=n {
+        seed_semantic_projection_ledger_row(handle, seq);
+    }
+}
+
+/// One settled `DONE` seq plus the highwater that admits it. Used on its own to force §23.1②'s
+/// A2 `<` side: a row with no Qdrant point behind it is exactly an invisible loss.
+fn seed_semantic_projection_ledger_row(handle: &mut Handle, seq: i64) {
+    let commit_seq: i64 = handle
+        .admin
+        .query_one("SELECT nextval('ops.commit_seq_seq')", &[])
+        .expect("owner allocates fixture commit sequence")
+        .get(0);
+    handle
+        .admin
+        .execute(
+            "INSERT INTO projection.stream_log \
+               (tenant_id,scope_kind,scope_id,domain,projection_kind,projection_version, \
+                stream_seq,commit_seq,state,settled_at) \
+             VALUES($1,'workspace',$2,'knowledge','ingest','v1',$3,$4,'DONE',clock_timestamp())",
+            &[&handle.tenant_id, &handle.workspace_id, &seq, &commit_seq],
+        )
+        .expect("owner seeds the semantic fixture's settled ledger row");
+    set_semantic_issued_highwater(handle, seq);
+}
+
+/// Removes one seeded ledger row again (and lowers the highwater with it), so a leg that forced
+/// an A2 fault hands the fixture back healthy instead of leaking it into every later assertion.
+fn drop_semantic_projection_ledger_row(handle: &mut Handle, seq: i64) {
+    handle
+        .admin
+        .execute(
+            "DELETE FROM projection.stream_log \
+              WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2 \
+                AND domain='knowledge' AND projection_kind='ingest' \
+                AND projection_version='v1' AND stream_seq=$3",
+            &[&handle.tenant_id, &handle.workspace_id, &seq],
+        )
+        .expect("owner removes the forced invisible-loss ledger row");
+    set_semantic_issued_highwater(handle, seq - 1);
+}
+
+fn set_semantic_issued_highwater(handle: &mut Handle, highwater: i64) {
+    handle
+        .admin
+        .execute(
+            "UPDATE projection.stream_checkpoints SET issued_highwater=$3 \
+             WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2 \
+               AND domain='knowledge' AND projection_kind='ingest' AND projection_version='v1'",
+            &[&handle.tenant_id, &handle.workspace_id, &highwater],
+        )
+        .expect("owner sets the semantic fixture's issued highwater");
+}
+
 fn semantic_payload(
     handle: &Handle,
     source_updated_at: time::OffsetDateTime,
@@ -1693,6 +1756,8 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
             let second_updated = seed_semantic_registry_row(&mut handle, &second, second_point);
             let third_updated = seed_semantic_registry_row(&mut handle, &third, third_point);
             seed_semantic_checkpoint(&mut handle);
+            // Card 18: three points, three settled ledger rows — §23.1②'s A2 has both sides.
+            seed_semantic_projection_ledger(&mut handle, 3);
 
             let cell = CellId(Uuid::now_v7());
             let registry =
@@ -1827,6 +1892,144 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                         third.memory_id.to_string(),
                     ])
                 );
+
+                // Card 18 / §23.1② live witness. Until this card every successful read on every
+                // deployment answered `cannot_establish` / `index_count_unavailable`, because all
+                // three read routes passed `visible: None` into `build_projection_block`. A
+                // healthy projection must now state a real count and a real ratio.
+                let projection = &no_token["pipeline"]["projection"];
+                assert_eq!(projection["visible"], 3, "live Qdrant count: {no_token}");
+                assert_eq!(
+                    projection["completeness_ratio"], 1.0,
+                    "A2 closed over a whole stream ⇒ ratio 1.0, never null: {no_token}"
+                );
+                assert_eq!(projection["current"], true, "{no_token}");
+                assert_ne!(
+                    no_token["completeness"]["reason"], "index_count_unavailable",
+                    "the reason this card exists to remove — it was on EVERY successful read, \
+                     healthy projection or not: {no_token}"
+                );
+                assert!(
+                    no_token["completeness"]["degradations"]
+                        .as_array()
+                        .expect("degradations")
+                        .is_empty(),
+                    "nothing is lost here: {no_token}"
+                );
+                // What remains, pinned so the next card that moves it has to come through
+                // here. `count_unknown` is the OTHER `cannot_establish` trigger, and it is
+                // **mandated**, not tolerated: §23.3④ (`Baseline_2.9.md:5757-5759`) 「缺必要读数
+                // 为 `count_unknown` … 使完整 envelope 为 `cannot_establish`」, and the same
+                // section's 「没有独立 census 的对象读取不生成 `exact`」. No read route reads
+                // `evidence.persisted` or the four `knowledge.*` counts in
+                // `CountScope::StreamLedger`; each declares `AuthorizedView` with `None`s on
+                // purpose (a page length is not an independent pipeline census — see
+                // `accept_memory_envelope`'s own note), and §23.3④ separately forbids the one
+                // derivation that would flip this today: 「禁止填 `0`、返回条数、
+                // `issued_highwater` 或其他块的值充数」. So this assertion is not a bug being
+                // pinned; it is the census debt being held in place while §23.1②'s projection
+                // side — the block asserted just above — is fully established underneath it.
+                // Moving it requires a real evidence/knowledge census (nothing writes
+                // `stream_checkpoints.evidence_highwater` / `knowledge_highwater` today), which
+                // is a different card. See ADR-0040's Consequences.
+                assert_eq!(
+                    no_token["completeness"]["reason"], "count_unknown",
+                    "{no_token}"
+                );
+
+                // A2 InvisibleLoss, forced: one more settled ledger row with no point behind it.
+                // The ratio must MOVE and stay a number — "cannot_establish" would hide the loss
+                // and a null ratio would be the pre-card-18 answer wearing a new reason.
+                tokio::task::block_in_place(|| {
+                    seed_semantic_projection_ledger_row(&mut handle, 4);
+                });
+                let (status, lossy) = recall_call(
+                    address,
+                    Some(&credential.bearer),
+                    json!({"query":query,"workspace_id":workspace_id,"mode":"semantic"}),
+                )
+                .await;
+                assert_eq!(status, 200, "invisible-loss recall: {lossy}");
+                let lossy = assert_tool_response(&lossy, ToolName::Recall);
+                let lossy_projection = &lossy["pipeline"]["projection"];
+                assert_eq!(lossy_projection["visible"], 3, "{lossy}");
+                assert_eq!(lossy_projection["done"], 4, "{lossy}");
+                let ratio = lossy_projection["completeness_ratio"]
+                    .as_f64()
+                    .expect("an invisible loss is measured, never null");
+                assert!((ratio - 0.75).abs() < 1e-9, "3/4, not null: {lossy}");
+                assert_eq!(lossy_projection["current"], false, "{lossy}");
+                assert_eq!(
+                    lossy["completeness"]["degradations"],
+                    json!(["PROJECTION_INVISIBLE_LOSS"]),
+                    "{lossy}"
+                );
+                // Restore the fixture's healthy A2 for every leg below (which assert items, not
+                // completeness): the extra ledger row is what made it lossy.
+                tokio::task::block_in_place(|| {
+                    drop_semantic_projection_ledger_row(&mut handle, 4);
+                });
+
+                // Card 18 / §23.1②: the OTHER two read routes. `recall.search` holds its own
+                // Qdrant transport; `memory.get` / `memory.enumerate` / `context.assemble` are
+                // PG-only and reach the index through `ContextBootstrap`'s borrowed count face
+                // (`GatewayMcpApplication::with_semantic_recall`). Without a witness here,
+                // deleting that attach — or the `Some(serving_version)` argument on either route
+                // — leaves every other test in this file green, because every other fixture
+                // builds the app WITHOUT a semantic runtime and so legitimately reports `None`.
+                // This is the only fixture in the suite where the face exists at all.
+                for (route, tool, arguments) in [
+                    (
+                        "memory.get",
+                        "memory",
+                        json!({"action":"get","memory_id":first.memory_id,"workspace_id":workspace_id}),
+                    ),
+                    (
+                        "memory.enumerate",
+                        "memory",
+                        json!({"action":"enumerate","workspace_id":workspace_id,"limit":100}),
+                    ),
+                    ("context.assemble", "context", json!({"workspace_id":workspace_id})),
+                ] {
+                    let (status, response) =
+                        tool_call(address, tool, &credential.bearer, arguments).await;
+                    assert_eq!(status, 200, "{route}: {response}");
+                    let value = assert_tool_response(
+                        &response,
+                        if tool == "memory" {
+                            ToolName::Memory
+                        } else {
+                            ToolName::Context
+                        },
+                    );
+                    // `memory.get` returns the `Envelope` at the top level; `memory.enumerate`
+                    // wraps it under `content` (next to `pagination`) and `context.assemble`
+                    // under `content` (next to `handoff`). Pick the object that actually carries
+                    // the envelope rather than hard-coding three shapes.
+                    let value = if value["pipeline"].is_null() {
+                        &value["content"]
+                    } else {
+                        value
+                    };
+                    assert!(
+                        !value["pipeline"].is_null(),
+                        "{route}: no envelope found in the response shape"
+                    );
+                    let projection = &value["pipeline"]["projection"];
+                    assert_eq!(
+                        projection["visible"], 3,
+                        "{route} must report the SAME live Qdrant count recall.search does —                          it reads the same stream on the same serving version: {value}"
+                    );
+                    assert_eq!(
+                        projection["completeness_ratio"], 1.0,
+                        "{route} reported a null ratio on a healthy projection before card 18:                          {value}"
+                    );
+                    assert_eq!(projection["current"], true, "{route}: {value}");
+                    assert_ne!(
+                        value["completeness"]["reason"], "index_count_unavailable",
+                        "{route}: {value}"
+                    );
+                }
 
                 // §6.1.3/ADR-0029 D-C: subject-scoped recall through the real Gateway + real
                 // Qdrant prefilter + real PG hydrate re-check. `second` carries A in its Qdrant

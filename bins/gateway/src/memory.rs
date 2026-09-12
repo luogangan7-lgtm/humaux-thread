@@ -160,7 +160,7 @@ pub(crate) async fn get<T>(
     memory_id: MemoryId,
     accept: impl FnOnce(Envelope<MemoryItem>) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
-    let (authorization, scope, family, stream) =
+    let (authorization, scope, family, stream, serving_version) =
         read_scope(&pool, authorization, requested_workspace, &bootstrap).await?;
     let request = build_request(
         RetrievalIntent::trusted_memory_get(memory_id),
@@ -171,6 +171,15 @@ pub(crate) async fn get<T>(
         materialize_memory_get(&pool, &authorization, &scope, &family, &stream, memory_id).await?;
     let affects = affects_by_memory(&pool, &authorization, &materialized).await?;
     let archived = materialized.archived;
+    let visible = bootstrap
+        .visible_index_count(
+            &pool,
+            &authorization,
+            &stream,
+            Some(serving_version.as_str()),
+            &materialized.ledger,
+        )
+        .await;
     accept_memory_envelope(
         materialized,
         affects,
@@ -179,6 +188,7 @@ pub(crate) async fn get<T>(
         "direct_get",
         false,
         archived,
+        visible,
         accept,
     )
 }
@@ -213,7 +223,7 @@ pub(crate) async fn list_candidates(
     bootstrap: ContextBootstrap,
     limit: i64,
 ) -> Result<CandidatesResult, ErrorCode> {
-    let (authorization, _scope, _family, _stream) =
+    let (authorization, _scope, _family, _stream, _serving) =
         read_scope(&pool, authorization, requested_workspace, &bootstrap).await?;
     let workspace = requested_workspace.ok_or(ErrorCode::DependencyUnavailable)?;
     let rows =
@@ -257,7 +267,7 @@ pub(crate) async fn enumerate<T>(
     params: MemoryEnumerationParams<'_>,
     accept: impl FnOnce(EnumerationResult) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
-    let (authorization, scope, family, stream) =
+    let (authorization, scope, family, stream, serving_version) =
         read_scope(&pool, authorization, requested_workspace, &bootstrap).await?;
     let request = build_request(
         RetrievalIntent::trusted_memory_enumerate(),
@@ -272,6 +282,15 @@ pub(crate) async fn enumerate<T>(
         next_cursor: page.next_cursor,
     };
     let affects = affects_by_memory(&pool, &authorization, &page.memory).await?;
+    let visible = bootstrap
+        .visible_index_count(
+            &pool,
+            &authorization,
+            &stream,
+            Some(serving_version.as_str()),
+            &page.memory.ledger,
+        )
+        .await;
     accept_memory_envelope(
         page.memory,
         affects,
@@ -280,6 +299,7 @@ pub(crate) async fn enumerate<T>(
         "enumerate",
         pagination.next_cursor.is_some(),
         false,
+        visible,
         |content| {
             accept(EnumerationResult {
                 content,
@@ -515,7 +535,7 @@ pub(crate) async fn list_subjects(
     bootstrap: ContextBootstrap,
     limit: i64,
 ) -> Result<SubjectsResult, ErrorCode> {
-    let (authorization, _scope, _family, _stream) =
+    let (authorization, _scope, _family, _stream, _serving) =
         read_scope(&pool, authorization, requested_workspace, &bootstrap).await?;
     let rows = subject_repo::list_subjects(&pool, &authorization, limit).await?;
     Ok(SubjectsResult {
@@ -732,10 +752,12 @@ async fn read_scope(
     authorization: AuthorizationScope,
     requested_workspace: Option<WorkspaceId>,
     bootstrap: &ContextBootstrap,
-) -> Result<(AuthorizationScope, Scope, StreamFamily, StreamKey), ErrorCode> {
+) -> Result<(AuthorizationScope, Scope, StreamFamily, StreamKey, String), ErrorCode> {
     let workspace = requested_workspace.ok_or(ErrorCode::DependencyUnavailable)?;
     let authorization = authorization.narrow(workspace)?;
-    let (family, stream) = bootstrap
+    // The third element is §16.2's `serving = true` version — §23.1②'s visible count is scoped
+    // to it, not to the ledger key's process-configured version.
+    let (family, stream, serving_version) = bootstrap
         .provisioned_request_stream(pool, &authorization, workspace)
         .await?;
     let scope = Scope {
@@ -747,7 +769,7 @@ async fn read_scope(
         run_id: None,
         agent_id: None,
     };
-    Ok((authorization, scope, family, stream))
+    Ok((authorization, scope, family, stream, serving_version))
 }
 
 /// The write-route scope rule for the non-confirm-gated writers that share the memory op
@@ -778,6 +800,7 @@ fn accept_memory_envelope<T>(
     lane: &str,
     truncated: bool,
     archived: bool,
+    visible: Option<u64>,
     accept: impl FnOnce(Envelope<MemoryItem>) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
     let items = materialized
@@ -800,7 +823,7 @@ fn accept_memory_envelope<T>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let returned = u32::try_from(items.len()).map_err(|_| ErrorCode::Internal)?;
-    let projection = build_projection_block(&materialized.ledger, None);
+    let projection = build_projection_block(&materialized.ledger, visible);
     // ponytail: neither an object nor a manifest page is an independent pipeline census.
     // Keep unknown counts; a page length must never become a whole-pipeline exact claim.
     let pipeline = PipelineBlock {
@@ -825,7 +848,7 @@ fn accept_memory_envelope<T>(
             ledger: &materialized.ledger,
             pipeline: &pipeline,
             provenance: &provenance,
-            visible: None,
+            visible,
             context: None,
         },
         |final_outcome| {

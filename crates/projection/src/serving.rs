@@ -363,6 +363,63 @@ mod tests {
         );
     }
 
+    /// ADR-0040 / card 18's folded debt, stated at this module's own boundary: the serve
+    /// switch's criterion ① is `VisibleUnavailable` **only** while a count is genuinely
+    /// missing. Feed the pair the two live §23.1② counts the ops path now takes
+    /// (`xtask::switch_visible` → `adapters::retrieve::visible_count_of_version`, the same
+    /// producer the three read routes use) — the candidate version on the shadow side, the
+    /// family's serving version on the other — and that reason must be gone, while §16.3's
+    /// other two criteria are judged exactly as before. Take either count away again and the
+    /// refusal must come back: §23.1②'s `visible: null` is never backfilled.
+    #[test]
+    fn a_taken_visible_count_clears_visible_unavailable_and_a_missing_one_restores_it() {
+        // A real promotion: candidate `v2` counted against serving `v1`, equal.
+        let taken = SwitchCriteria {
+            visible_shadow: Some(("v2".to_string(), 100)),
+            visible_serving: Some(("v1".to_string(), 100)),
+            first_activation: false,
+            shadow_open_gaps: 0,
+            continuation: ContinuationVerdict::CannotEstablish,
+        };
+        assert_eq!(
+            evaluate_switch(&taken),
+            Err(vec![SwitchRejection::BenchmarkNotPass]),
+            "with both counts taken, the only surviving refusal is §69's undeclared baseline \
+             (card 20) — criterion ① must not still report VisibleUnavailable"
+        );
+
+        // ADR-0017 first activation: the candidate read-back alone is criterion ①.
+        let first = SwitchCriteria {
+            visible_serving: None,
+            first_activation: true,
+            ..taken.clone()
+        };
+        assert!(
+            !evaluate_switch(&first)
+                .unwrap_err()
+                .contains(&SwitchRejection::VisibleUnavailable)
+        );
+
+        // Either side missing on a non-first activation is still a refusal, both directions.
+        for missing in [
+            SwitchCriteria {
+                visible_shadow: None,
+                ..taken.clone()
+            },
+            SwitchCriteria {
+                visible_serving: None,
+                ..taken.clone()
+            },
+        ] {
+            assert!(
+                evaluate_switch(&missing)
+                    .unwrap_err()
+                    .contains(&SwitchRejection::VisibleUnavailable),
+                "an untaken count must stay VisibleUnavailable, never be read as 0"
+            );
+        }
+    }
+
     #[test]
     fn evaluate_switch_rejects_on_open_gaps() {
         let mut c = all_true();

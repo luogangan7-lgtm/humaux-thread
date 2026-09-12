@@ -40,9 +40,16 @@ use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use humaux_projection::serving::{ContinuationVerdict, SwitchCriteria, evaluate_switch};
+use humaux_domain::ids::TenantId;
+use humaux_projection::serving::{
+    ContinuationVerdict, StreamFamily, SwitchCriteria, evaluate_switch,
+};
 use postgres::{Client, NoTls};
 use uuid::Uuid;
+
+use crate::switch_visible::{
+    Candidate, VisibleFace, ops_scope, read_candidate_facts, visible_pair,
+};
 
 // ---------------------------------------------------------------------------------------------
 // Configuration (§78.1: required flags only, no defaults)
@@ -54,7 +61,8 @@ const USAGE: &str = "usage: cargo xtask soak \
 --sessions-per-tenant <n> --duration-secs <n> --drain-secs <n> --think-ms <n> \
 --probe-every-secs <n> --probe-cmd <sh> (repeat) \
 [--chaos-every-secs <n> --chaos-cmd <sh> (repeat)] \
---lease-secs <n> --max-rss-mib <n> --max-db-connections <n> --report <path>";
+--lease-secs <n> --max-rss-mib <n> --max-db-connections <n> --report <path> \
+[--qdrant-host 127.0.0.1] [--qdrant-port 6333]";
 
 /// One tenant lane. `bearer` is read from the env var the flag names and is never printed,
 /// logged or written to the report.
@@ -84,6 +92,11 @@ pub struct Config {
     max_rss_mib: u64,
     max_db_connections: i64,
     report_path: String,
+    /// §23.1② visible counts for the §16.2 promotion report (see [`promote_rejections`]) are
+    /// taken live against this Qdrant — the same local endpoint every other lane of the
+    /// rehearsal dials.
+    qdrant_host: String,
+    qdrant_port: u16,
 }
 
 fn values(args: &[String], flag: &str) -> Vec<String> {
@@ -187,6 +200,7 @@ pub fn parse_config(args: &[String]) -> Result<Config, String> {
     if chaos_every.is_some() != !chaos_cmds.is_empty() {
         return Err("--chaos-every-secs and --chaos-cmd must be given together".to_string());
     }
+    let (qdrant_host, qdrant_port) = crate::switch_visible::qdrant_endpoint(args)?;
     let probe_cmds = values(args, "--probe-cmd");
     if probe_cmds.is_empty() {
         return Err(format!(
@@ -212,6 +226,8 @@ pub fn parse_config(args: &[String]) -> Result<Config, String> {
         max_db_connections: i64::try_from(num(args, "--max-db-connections")?)
             .map_err(|e| format!("--max-db-connections: {e}"))?,
         report_path: one(args, "--report")?,
+        qdrant_host,
+        qdrant_port,
     })
 }
 
@@ -609,7 +625,7 @@ pub fn evaluate(series: &Series, max_rss: u64, max_conns: i64) -> Vec<Assertion>
     all
 }
 
-/// §16.2 blue/green promotion, reported and **not** blocking until card 18 lands.
+/// §16.2 blue/green promotion, reported and **not** blocking until card 20 lands.
 ///
 /// `projection_promoted` counts streams whose §15.4 contiguous DONE prefix
 /// (`projection_highwater`) never advanced across the run — the boundary the serving switch is
@@ -618,12 +634,15 @@ pub fn evaluate(series: &Series, max_rss: u64, max_conns: i64) -> Vec<Assertion>
 /// ticket while the prefix stayed pinned behind two `FAILED` rows.
 ///
 /// `reject_reasons` is whatever [`evaluate_switch`] actually returned for each candidate — see
-/// [`switch_rejections`] for how the candidates are read and why the two `visible_*` counts are
-/// a measured `None`. On this deployment that is `VisibleUnavailable` (card 18 owns the live
-/// Qdrant count) and `BenchmarkNotPass` (§69's baseline is `NOT_DECLARED`) on every candidate,
-/// plus `OpenGaps` on the ones carrying `projection.processing_gaps` rows. It is *not* a fixed
-/// list: the map is keyed by the variant name the evaluator produced, so when card 18 lands the
-/// reason disappears from the report on its own.
+/// [`switch_rejections`] and [`promote_rejections`] for how the candidates are read and where
+/// the two `visible_*` counts come from. Card 18 / ADR-0040 discharged `VisibleUnavailable`:
+/// both sides are now counted live against Qdrant through the read routes' own producer, so the
+/// reason only appears when a count genuinely could not be taken. What remains on this
+/// deployment is `BenchmarkNotPass` (§69's baseline is `NOT_DECLARED`) on every candidate, plus
+/// `OpenGaps` on the ones carrying `projection.processing_gaps` rows — both card 20's, which is
+/// where `expected_red_until` now points. It is *not* a fixed list: the map is keyed by the
+/// variant name the evaluator produced, so a reason disappears from the report on its own the
+/// moment its cause is fixed (that is exactly how card 18's landing is observable here).
 #[expect(
     clippy::cast_precision_loss,
     reason = "counts feed a report field, not an equality test"
@@ -640,7 +659,7 @@ fn promotion_assertion(series: &Series) -> Assertion {
         streams,
         0.0,
     )
-    .expected_red_until("card 18")
+    .expected_red_until("card 20")
     .with_detail(serde_json::json!({
         "reject_reasons": series.promote_rejections,
         "unit": "streams refused for this reason",
@@ -937,6 +956,15 @@ pub struct PromoteCandidate {
     /// `count(*)` from `projection.processing_gaps` for this candidate's own full stream key
     /// (§16.3 criterion ②) — the same filter `adapters::serving_repo` uses.
     pub open_gaps: i64,
+    /// §23.1②'s live Qdrant count for the **candidate** version, tagged with that version
+    /// (`crate::switch_visible`, which delegates to card 18's shared producer
+    /// `adapters::retrieve::visible_count_of_version`). `None` only when the count genuinely
+    /// could not be taken — no placement row, Qdrant unreachable, or the user-private blind
+    /// spot — never as a stand-in for "this harness has no counter".
+    pub visible_shadow: Option<(String, u64)>,
+    /// The same count for the family's current `serving` version, or `None` for a first
+    /// activation (there is no serving face to compare against yet).
+    pub visible_serving: Option<(String, u64)>,
 }
 
 /// Why the §16.2 serving switch would refuse each candidate, **taken from
@@ -944,14 +972,20 @@ pub struct PromoteCandidate {
 /// here. Counted per candidate, keyed by the `SwitchRejection` variant's own name, so a reason
 /// this harness has never seen still appears the moment the evaluator returns it.
 ///
-/// The two `visible_*` counts are `None`, and that is a **measured** `None`, not an assumed
-/// rejection: §23.1② requires the live Qdrant count on both the shadow and the serving side at
-/// one instant, and nothing in this deployment supplies the serving side yet (card 18 owns it).
-/// §23.1's own rule for an uncountable index is `visible: null`, never a backfill from another
-/// number — so `VisibleUnavailable` is what the evaluator genuinely returns for these inputs.
-/// `continuation` is [`ContinuationVerdict::CannotEstablish`] for the same kind of reason: §69's
-/// `baseline_min` / `frozen_by` are `NOT_DECLARED` on this deployment, and §69 forbids reading
-/// "not established" as a pass.
+/// The two `visible_*` counts arrive on [`PromoteCandidate`], taken live from Qdrant by
+/// [`promote_rejections`] through `crate::switch_visible` — card 18's shared producer
+/// (`adapters::retrieve::visible_count_of_version`), the same one the three read routes use, so
+/// there is no second hand-written filter for this call (§17.1,
+/// `crates/projection/tests/no_handwritten_filter_scan.rs`). Until that wiring existed this
+/// function passed a literal `None` on both sides and every candidate in every soak witness was
+/// refused `VisibleUnavailable` — a statement about the harness, not the deployment. A `None`
+/// here is now a real refusal (no placement row, Qdrant unreachable, or the user-private blind
+/// spot `switch_visible::ops_scope` documents), and §23.1's rule still holds: an uncountable
+/// index is `visible: null`, never a backfill from another number.
+///
+/// `continuation` is [`ContinuationVerdict::CannotEstablish`] for a similar reason and is **not**
+/// card 18's to move: §69's `baseline_min` / `frozen_by` are `NOT_DECLARED` on this deployment,
+/// and §69 forbids reading "not established" as a pass (card 20).
 ///
 /// The previous version of this function returned `count(*) FROM stream_checkpoints` under the
 /// label `VisibleUnavailable` without calling the evaluator at all. That is a fabricated
@@ -962,8 +996,8 @@ pub fn switch_rejections(candidates: &[PromoteCandidate]) -> BTreeMap<String, i6
     let mut counts = BTreeMap::new();
     for c in candidates {
         let criteria = SwitchCriteria {
-            visible_shadow: None,
-            visible_serving: None,
+            visible_shadow: c.visible_shadow.clone(),
+            visible_serving: c.visible_serving.clone(),
             first_activation: c.first_activation,
             shadow_open_gaps: u64::try_from(c.open_gaps).unwrap_or(u64::MAX),
             continuation: ContinuationVerdict::CannotEstablish,
@@ -977,16 +1011,30 @@ pub fn switch_rejections(candidates: &[PromoteCandidate]) -> BTreeMap<String, i6
     counts
 }
 
-/// Reads every §16.2 promotion candidate this tenant owns and grades each one through
-/// [`switch_rejections`].
-fn promote_rejections(db: &mut Client, tenant: Uuid) -> Result<BTreeMap<String, i64>, String> {
+/// Reads every §16.2 promotion candidate this tenant owns, takes both §23.1② `visible` counts
+/// for it live, and grades each one through [`switch_rejections`].
+///
+/// **Which version each side counts** (ADR-0040): `visible_shadow` is the **candidate** row's
+/// own `projection_version` — `evaluate_switch` judges the version being promoted, not the one
+/// already serving — and `visible_serving` is whatever version currently holds the family's
+/// `serving` row (`None` ⇒ ADR-0017 first activation). Card 18's read-route guard
+/// (`serving_version != key.projection_version ⇒ None`) is deliberately not applied here: it
+/// protects an A2 comparison against a `LedgerClosure` closed at one version, while §16.3's
+/// criterion ① compares two counts whose versions are *required* to differ.
+fn promote_rejections(
+    db: &mut Client,
+    tenant: Uuid,
+    face: &VisibleFace,
+    rt: &tokio::runtime::Runtime,
+) -> Result<BTreeMap<String, i64>, String> {
     set_tenant(db, tenant)?;
     let rows = db
         .query(
-            "SELECT NOT EXISTS (SELECT 1 FROM projection.stream_checkpoints s \
-                                 WHERE s.tenant_id = c.tenant_id AND s.scope_kind = c.scope_kind \
-                                   AND s.scope_id = c.scope_id AND s.domain = c.domain \
-                                   AND s.projection_kind = c.projection_kind AND s.serving), \
+            "SELECT c.scope_kind, c.scope_id, c.domain, c.projection_kind, c.projection_version, \
+                    (SELECT s.projection_version FROM projection.stream_checkpoints s \
+                      WHERE s.tenant_id = c.tenant_id AND s.scope_kind = c.scope_kind \
+                        AND s.scope_id = c.scope_id AND s.domain = c.domain \
+                        AND s.projection_kind = c.projection_kind AND s.serving), \
                     (SELECT count(*)::bigint FROM projection.processing_gaps g \
                       WHERE g.tenant_id = c.tenant_id AND g.scope_kind = c.scope_kind \
                         AND g.scope_id = c.scope_id AND g.domain = c.domain \
@@ -996,13 +1044,45 @@ fn promote_rejections(db: &mut Client, tenant: Uuid) -> Result<BTreeMap<String, 
             &[],
         )
         .map_err(|e| format!("promote candidates: {e}"))?;
-    let candidates: Vec<PromoteCandidate> = rows
-        .iter()
-        .map(|r| PromoteCandidate {
-            first_activation: r.get(0),
-            open_gaps: r.get(1),
-        })
-        .collect();
+    let mut candidates = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let family = StreamFamily::new(
+            TenantId(tenant),
+            r.get::<_, String>(0),
+            r.get::<_, Uuid>(1),
+            r.get::<_, String>(2),
+            r.get::<_, String>(3),
+        );
+        let candidate_version: String = r.get(4);
+        let serving: Option<String> = r.get(5);
+        let (visible_shadow, visible_serving) =
+            match read_candidate_facts(db, &family, &candidate_version, serving.as_deref())? {
+                Some(facts) => {
+                    let scope = ops_scope(tenant, family.scope_id)?;
+                    rt.block_on(visible_pair(
+                        face,
+                        &Candidate {
+                            scope: &scope,
+                            collection: &facts.collection,
+                            candidate_version: &candidate_version,
+                            candidate_tombstoned: &facts.candidate_tombstoned,
+                            serving_version: serving.as_deref(),
+                            serving_tombstoned: &facts.serving_tombstoned,
+                            user_private_points: facts.user_private_points,
+                        },
+                    ))
+                }
+                // No §17.3 placement row for this tenant: nothing to count against, so both
+                // sides stay the honest `None` (`VisibleUnavailable`).
+                None => (None, None),
+            };
+        candidates.push(PromoteCandidate {
+            first_activation: serving.is_none(),
+            open_gaps: r.get(6),
+            visible_shadow,
+            visible_serving,
+        });
+    }
     Ok(switch_rejections(&candidates))
 }
 
@@ -1505,6 +1585,7 @@ fn config_summary(cfg: &Config) -> serde_json::Value {
         "lease_secs": cfg.lease_secs,
         "max_rss_mib": cfg.max_rss_mib,
         "max_db_connections": cfg.max_db_connections,
+        "qdrant": format!("{}:{}", cfg.qdrant_host, cfg.qdrant_port),
     })
 }
 
@@ -1567,6 +1648,11 @@ fn finish(
     series.cross_tenant_hits = shared.cross_tenant_hits;
     series.ryw_checked = shared.ryw_checked;
     series.ryw_token_rejections = shared.ryw_token_rejections;
+    // One Qdrant face and one runtime for every lane's §23.1② counts — see
+    // [`promote_rejections`]. Built here (after the load has stopped) so nothing in the timed
+    // window pays for it.
+    let face = VisibleFace::connect(&cfg.qdrant_host, cfg.qdrant_port)?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("soak: runtime: {e}"))?;
     for (idx, lane) in cfg.tenants.iter().enumerate() {
         let mut f = tenant_final(db, lane)?;
         f.writes = shared.per_lane_writes.get(&idx).copied().unwrap_or(0);
@@ -1577,7 +1663,7 @@ fn finish(
             .copied()
             .unwrap_or(0);
         series.finals.push(f);
-        for (reason, n) in promote_rejections(db, lane.tenant_id)? {
+        for (reason, n) in promote_rejections(db, lane.tenant_id, &face, &rt)? {
             *series.promote_rejections.entry(reason).or_default() += n;
         }
     }
@@ -1724,7 +1810,7 @@ mod tests {
             .iter()
             .find(|a| a.id == "projection_promoted")
             .expect("projection_promoted must be reported");
-        assert_eq!(promoted.expected_red_until, Some("card 18"));
+        assert_eq!(promoted.expected_red_until, Some("card 20"));
         assert_eq!(promoted.verdict(), "EXPECTED-RED");
         assert!(!promoted.blocking_failure());
         assert_eq!(promoted.detail["reject_reasons"]["OpenGaps"], 1);
@@ -1857,14 +1943,18 @@ mod tests {
             PromoteCandidate {
                 first_activation: true,
                 open_gaps: 0,
+                visible_shadow: None,
+                visible_serving: None,
             },
             PromoteCandidate {
                 first_activation: false,
                 open_gaps: 3,
+                visible_shadow: None,
+                visible_serving: None,
             },
         ]);
-        // Criterion ① is unevaluable on this deployment (no live Qdrant count — card 18) and
-        // §69's baseline is NOT_DECLARED, so both candidates carry those two…
+        // Both counts unavailable ⇒ criterion ① is unevaluable, and §69's baseline is
+        // NOT_DECLARED, so both candidates carry those two…
         assert_eq!(counts.get("VisibleUnavailable"), Some(&2));
         assert_eq!(counts.get("BenchmarkNotPass"), Some(&2));
         // …and only the one that actually has `projection.processing_gaps` rows carries this,
@@ -1872,6 +1962,58 @@ mod tests {
         assert_eq!(counts.get("OpenGaps"), Some(&1));
         // No candidates ⇒ no refusals. The old code reported the stream count here.
         assert!(switch_rejections(&[]).is_empty());
+    }
+
+    /// ADR-0040 / card 18's folded debt, at the harness boundary: once the live counts reach
+    /// [`PromoteCandidate`], `VisibleUnavailable` must disappear from the tally — for a first
+    /// activation (lone candidate read-back) and for a real promotion (candidate version vs a
+    /// *different* serving version). Drop the wiring in [`promote_rejections`] back to a literal
+    /// `None` and this goes red on the first assertion; that is the injection this test exists
+    /// for. §16.3's other two criteria are untouched here — they are card 20's.
+    #[test]
+    fn a_live_visible_count_removes_visible_unavailable_from_the_promote_tally() {
+        let counts = switch_rejections(&[
+            // First activation: nothing serving yet, so the candidate read-back alone satisfies
+            // criterion ① (ADR-0017) and the only refusal left is §69's undeclared baseline.
+            PromoteCandidate {
+                first_activation: true,
+                open_gaps: 0,
+                visible_shadow: Some(("v2".to_string(), 100)),
+                visible_serving: None,
+            },
+            // A genuine promotion: two different versions, counted separately, equal.
+            PromoteCandidate {
+                first_activation: false,
+                open_gaps: 0,
+                visible_shadow: Some(("v2".to_string(), 100)),
+                visible_serving: Some(("v1".to_string(), 100)),
+            },
+        ]);
+        assert_eq!(
+            counts.get("VisibleUnavailable"),
+            None,
+            "a taken count must not still be reported as an unavailable one"
+        );
+        assert_eq!(counts.get("BenchmarkNotPass"), Some(&2));
+        assert_eq!(counts.get("OpenGaps"), None);
+
+        // The other direction, unchanged: a count that truly could not be taken (no placement
+        // row, Qdrant unreachable, the user-private blind spot) is still a refusal, on either
+        // side of the pair.
+        let shadow_missing = switch_rejections(&[PromoteCandidate {
+            first_activation: false,
+            open_gaps: 0,
+            visible_shadow: None,
+            visible_serving: Some(("v1".to_string(), 100)),
+        }]);
+        assert_eq!(shadow_missing.get("VisibleUnavailable"), Some(&1));
+        let serving_missing = switch_rejections(&[PromoteCandidate {
+            first_activation: false,
+            open_gaps: 0,
+            visible_shadow: Some(("v2".to_string(), 100)),
+            visible_serving: None,
+        }]);
+        assert_eq!(serving_missing.get("VisibleUnavailable"), Some(&1));
     }
 
     /// ADR-0038: *an assertion whose denominator can silently reach zero is not an assertion*.
@@ -2145,6 +2287,8 @@ mod tests {
             max_rss_mib: 1,
             max_db_connections: 1,
             report_path: "/dev/null".into(),
+            qdrant_host: "127.0.0.1".into(),
+            qdrant_port: 6333,
         };
         assert!(!cross_tenant_hit(
             &cfg,

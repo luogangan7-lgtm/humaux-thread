@@ -21,7 +21,7 @@ use humaux_domain::{
 use humaux_projection::{serving::StreamFamily, stream::StreamKey};
 use humaux_retrieval::{
     compiler::ContextOutcome,
-    completeness::{CensusResult, FreshnessClass},
+    completeness::{CensusResult, FreshnessClass, LedgerClosure},
     envelope::{
         CompletenessBlock, CompletenessInputs, CountScope, Envelope, EvidenceBlock, FreshnessBlock,
         KnowledgeBlock, LaneStatus, MandatoryReport, PendingEnvelope, PinnedReport, PipelineBlock,
@@ -36,7 +36,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::remember::RememberPolicy;
+use crate::{recall::SemanticRecallRuntime, remember::RememberPolicy};
 
 /// Trusted bootstrap state. Neither the stream nor the profile can come from MCP input.
 #[derive(Debug, Clone)]
@@ -45,6 +45,13 @@ pub struct ContextBootstrap {
     pub(crate) profile: RegisteredRetrievalProfile,
     pub(crate) stream: StreamKey,
     pub(crate) binary_build: String,
+    /// §23.1②: the Qdrant face the PG-only read routes borrow to take a live `visible` count.
+    /// `None` on a deployment with no semantic lane configured — the routes then pass `None`
+    /// into `build_projection_block` and report `cannot_establish`/`index_count_unavailable`,
+    /// which is exactly what "there is no index to count" means. Attached by
+    /// `GatewayMcpApplication::with_semantic_recall`, the one place that holds both this
+    /// bootstrap and the runtime; nothing here can construct one.
+    index: Option<Arc<SemanticRecallRuntime>>,
 }
 
 impl ContextBootstrap {
@@ -58,7 +65,31 @@ impl ContextBootstrap {
             profile,
             stream: write_policy.stream_key().clone(),
             binary_build: executable_fingerprint()?,
+            index: None,
         })
+    }
+
+    /// Lends this bootstrap the configured semantic runtime purely as a Qdrant *count* face
+    /// (§23.1②). Called once, from `GatewayMcpApplication::with_semantic_recall`.
+    pub(crate) fn attach_index_face(&mut self, runtime: &Arc<SemanticRecallRuntime>) {
+        self.index = Some(runtime.clone());
+    }
+
+    /// §23.1②'s `visible` for the PG-only read routes. `None` — never `0` — whenever the count
+    /// cannot be taken: no semantic lane configured, no serving version, or the count itself
+    /// failed. See `humaux_adapters::retrieve::visible_index_count` for the three rules.
+    pub(crate) async fn visible_index_count(
+        &self,
+        pool: &RuntimeDbPool,
+        authorization: &AuthorizationScope,
+        key: &StreamKey,
+        serving_version: Option<&str>,
+        ledger: &LedgerClosure,
+    ) -> Option<u64> {
+        self.index
+            .as_ref()?
+            .visible_index_count(pool, authorization, key, serving_version, ledger)
+            .await
     }
 
     pub(crate) const fn budget(&self) -> ContextBudget {
@@ -100,13 +131,18 @@ impl ContextBootstrap {
         pool: &RuntimeDbPool,
         authorization: &AuthorizationScope,
         workspace: WorkspaceId,
-    ) -> Result<(StreamFamily, StreamKey), ErrorCode> {
+    ) -> Result<(StreamFamily, StreamKey, String), ErrorCode> {
         let (family, key) = self.request_stream(authorization.tenant_id(), workspace);
-        private_read_projection_selector(pool, authorization, &family)
+        // The serving version is returned, not discarded: §23.1②'s visible count must be scoped
+        // to the family's `serving = true` version (§16.2), which is a different string from the
+        // ledger key's process-configured `projection_version` whenever a shadow backfill is mid
+        // switch. Counting against the ledger key's version there would count a face this
+        // response never read.
+        let serving = private_read_projection_selector(pool, authorization, &family)
             .await
             .map_err(|_| ErrorCode::DependencyUnavailable)?
             .ok_or(ErrorCode::DependencyUnavailable)?;
-        Ok((family, key))
+        Ok((family, key, serving))
     }
 }
 
@@ -168,7 +204,7 @@ pub async fn assemble<T>(
     let workspace = requested_workspace.ok_or(ErrorCode::DependencyUnavailable)?;
     let authorization = authorization.narrow(workspace)?;
     let pool = pool.into();
-    let (family, stream) = bootstrap
+    let (family, stream, serving_version) = bootstrap
         .provisioned_request_stream(&pool, &authorization, workspace)
         .await?;
     let scope = Scope {
@@ -191,7 +227,22 @@ pub async fn assemble<T>(
         &stream,
     )
     .await?;
-    into_result(materialized, &request, &bootstrap.binary_build, accept)
+    let visible = bootstrap
+        .visible_index_count(
+            &pool,
+            &authorization,
+            &stream,
+            Some(serving_version.as_str()),
+            &materialized.ledger,
+        )
+        .await;
+    into_result(
+        materialized,
+        &request,
+        &bootstrap.binary_build,
+        visible,
+        accept,
+    )
 }
 
 pub(crate) fn provenance(
@@ -219,6 +270,7 @@ fn into_result<T>(
     materialized: MaterializedContext,
     request: &RetrievalRequest,
     binary_build: &str,
+    visible: Option<u64>,
     accept: impl FnOnce(ContextResult) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
     let MaterializedContext {
@@ -242,7 +294,7 @@ fn into_result<T>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let returned = u32::try_from(items.len()).map_err(|_| ErrorCode::Internal)?;
-    let projection = build_projection_block(&ledger, None);
+    let projection = build_projection_block(&ledger, visible);
     // These counts were not read in an independently established authorized universe.
     // Never replace them with the number of Context items or stream rows.
     let pipeline = PipelineBlock {
@@ -281,7 +333,7 @@ fn into_result<T>(
             ledger: &ledger,
             pipeline: &pipeline,
             provenance: &provenance,
-            visible: None,
+            visible,
             context: Some(&outcome),
         },
         |final_outcome| {

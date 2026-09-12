@@ -204,6 +204,12 @@ pub fn subject_index_body() -> Value {
 /// `data_class`/`egress_disposition` are §18.2's mandatory pair: "没有 data_class/
 /// egress_disposition，SECRET_MATERIAL 在出境这一侧不可判定". A payload alone cannot prove it is
 /// safe to index — see [`Self::into_indexable`], the type that does.
+/// §17/§37's `source_stream_seq` payload field name — one spelling, shared by the index write
+/// ([`QdrantPointPayload::to_json`]) and the §37 tombstone overlay that scans by it
+/// ([`tombstoned_seq_overlay_filter`]). Two hand-typed copies of this string would silently
+/// filter nothing (§78.1: no literals at a contract boundary).
+pub const SOURCE_STREAM_SEQ_FIELD: &str = "source_stream_seq";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QdrantPointPayload {
     pub tenant_id: TenantId,
@@ -337,7 +343,10 @@ impl QdrantPointPayload {
         );
         obj.insert("embedding_version".into(), json!(self.embedding_version));
         obj.insert("projection_version".into(), json!(self.projection_version));
-        obj.insert("source_stream_seq".into(), json!(self.source_stream_seq));
+        obj.insert(
+            SOURCE_STREAM_SEQ_FIELD.into(),
+            json!(self.source_stream_seq),
+        );
         obj.insert("data_class".into(), json!(self.data_class.as_str()));
         obj.insert(
             "egress_disposition".into(),
@@ -585,18 +594,42 @@ pub fn overlay_filter(base_filter: Value, tombstoned: &[PointId]) -> Value {
     if tombstoned.is_empty() {
         return base_filter;
     }
+    let ids: Vec<Value> = tombstoned.iter().map(|id| id.to_json()).collect();
+    fold_must_not(base_filter, json!({ "has_id": ids }))
+}
+
+/// §37's *other* documented overlay key, for the callers that hold tombstoned **stream seqs**
+/// rather than point ids ([`QdrantPointPayload::source_stream_seq`]'s own doc: "§37 tombstone
+/// overlay scans by this field; point id may also be derived from it — 二选一"). Same predicate,
+/// same single `must_not` fold as [`overlay_filter`]; the two differ only in which of §37's two
+/// accepted keys the caller can name. The §23.1② read routes are exactly that caller: a
+/// `TOMBSTONED` row in `projection.stream_log` is identified by `stream_seq`, and resolving each
+/// one to its opaque projection point id would be a second registry round trip per read for an
+/// answer this key already gives. A no-op when `tombstoned_seqs` is empty.
+pub fn tombstoned_seq_overlay_filter(base_filter: Value, tombstoned_seqs: &[i64]) -> Value {
+    if tombstoned_seqs.is_empty() {
+        return base_filter;
+    }
+    fold_must_not(
+        base_filter,
+        json!({ "key": SOURCE_STREAM_SEQ_FIELD, "match": { "any": tombstoned_seqs } }),
+    )
+}
+
+/// The one `must_not` fold both overlay builders share — appending to an existing `must_not`
+/// array rather than replacing it, so folding two overlays into one filter keeps both.
+fn fold_must_not(base_filter: Value, condition: Value) -> Value {
     let mut obj = match base_filter {
         Value::Object(o) => o,
         // Any non-object base (in practice only ever `Value::Null`/`{}` from a caller with no
         // other predicate) still needs a `must_not`-bearing object to fold into.
         _ => serde_json::Map::new(),
     };
-    let ids: Vec<Value> = tombstoned.iter().map(|id| id.to_json()).collect();
     obj.entry("must_not".to_string())
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .expect("must_not is only ever constructed as an array by this function")
-        .push(json!({ "has_id": ids }));
+        .push(condition);
     Value::Object(obj)
 }
 
@@ -616,17 +649,56 @@ pub async fn count_visible(
     filter: &VisibleCountFilter,
     tombstoned: &[PointId],
 ) -> Result<u64, QdrantTransportError> {
+    count_exact(
+        transport,
+        permit,
+        collection,
+        overlay_filter(condition_to_filter(&filter.0), tombstoned),
+    )
+    .await
+}
+
+/// [`count_visible`] for the callers that name §37's tombstone overlay by `source_stream_seq`
+/// instead of by point id — see [`tombstoned_seq_overlay_filter`]. Identical in every other
+/// respect: the overlay rides the *same* `count` request as the caller's own filter, so the
+/// answer is purge-order-independent (a tombstoned seq whose point was never indexed, or was
+/// already purged, is simply not there to exclude — it is never subtracted twice).
+///
+/// This is §23.1②'s `visible` for the three read routes. Calling plain [`count`] here instead
+/// returns the raw index count *including* still-unpurged tombstoned points, which inflates
+/// A2's left-hand side by exactly `ledger.deleted` — the fault `retrieve::visible_index_count`'s
+/// own acceptance test injects.
+pub async fn count_visible_excluding_seqs(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+    filter: &VisibleCountFilter,
+    tombstoned_seqs: &[i64],
+) -> Result<u64, QdrantTransportError> {
+    count_exact(
+        transport,
+        permit,
+        collection,
+        tombstoned_seq_overlay_filter(condition_to_filter(&filter.0), tombstoned_seqs),
+    )
+    .await
+}
+
+/// The one `points/count` wire call every `visible` counter routes through. `exact: true`
+/// always (§23.1② needs a real denominator, never Qdrant's approximate fast-count path).
+async fn count_exact(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+    filter: Value,
+) -> Result<u64, QdrantTransportError> {
     validate_collection(collection)?;
-    let body = json!({
-        "filter": overlay_filter(condition_to_filter(&filter.0), tombstoned),
-        "exact": true,
-    });
     let result = call(
         transport,
         permit,
         IntraCellMethod::Post,
         format!("/collections/{collection}/points/count"),
-        Some(body),
+        Some(json!({ "filter": filter, "exact": true })),
     )
     .await?;
     result
