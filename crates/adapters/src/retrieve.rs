@@ -39,6 +39,7 @@ use humaux_projection::stream::StreamKey;
 use humaux_retrieval::completeness::LedgerClosure;
 use humaux_retrieval::envelope::GroundingBlock;
 
+use crate::context_repo::{StreamPipelineCounts, stream_pipeline_counts_in_txn};
 use crate::postgres::RuntimeDbPool;
 use crate::private_projection_registry::{
     PrivateProjectionRegistryError, ProjectionPointId, resolve_private_memory_points_in_txn,
@@ -757,6 +758,11 @@ pub struct PrivateReadServingCandidates {
 pub struct MaterializedPrivateReadServing {
     pub bodies: MaterializedBodies,
     pub ledger: LedgerClosure,
+    /// §23.3④ `stream_ledger` pipeline readings for the same six-column `StreamKey` the ledger
+    /// closed on, taken in the same snapshot (ADR-0041 D-H). Not an `Option`: no census travels
+    /// with it and `classify()` maps this route's `PlannerDecision::Class(_)` to
+    /// `SemanticBounded`, so §22.0's exact-without-a-predicate trap is not on this path.
+    pub pipeline: StreamPipelineCounts,
     pub grounding: GroundingBlock,
 }
 
@@ -868,6 +874,9 @@ pub async fn materialize_private_read_serving_about(
     .await?;
     let key = family.with_version(projection_version);
     let ledger = close_ledger_in_txn(&mut txn, &key).await?;
+    let pipeline = stream_pipeline_counts_in_txn(&mut txn, &key)
+        .await
+        .map_err(RetrieveError::FinalMaterialization)?;
     // Grounding derivation is intentionally not reconstructed from bodies here. Until the
     // claim-level resolver is joined to this semantic path, every returned item is reported as
     // not judged instead of being silently treated as current.
@@ -876,6 +885,7 @@ pub async fn materialize_private_read_serving_about(
     Ok(MaterializedPrivateReadServing {
         bodies,
         ledger,
+        pipeline,
         grounding,
     })
 }

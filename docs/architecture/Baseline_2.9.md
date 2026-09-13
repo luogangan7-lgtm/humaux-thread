@@ -5760,6 +5760,18 @@ Event payload、完全未消费索引或 RetrievalCard，可以对这四项如�
 既有 ledger / census / lane 的更具体不可判定原因不被后置检查覆盖。
 这不另造 classifier、Envelope 或统计资格，也不改 §23.1② 的 A1/A2 算法。
 
+**这两个读数的来源（ADR-0041 落地口径，不放宽上面任何一条）**：`stream_ledger` 口径的
+`evidence.persisted` 与 `knowledge.*` 读的是本请求完整六列 `StreamKey` 在
+`projection.stream_log` 上的行——§15.1/§60 在发放 `stream_seq` 的同一事务里落 Evidence 与
+`ops.outbox`，所以"该行存在"就是"该 Evidence 已完整持久化"这一读数本身；`knowledge` 的三态
+按 §15.2 状态集切分：`processed` = `DONE/SKIPPED_BY_POLICY/TOMBSTONED`，`waiting_key` =
+`WAITING_KEY`，`failed` = `FAILED/LOST`。`ISSUED/PROCESSING/RETRY_WAIT` **不进任何一态**——
+在途的工作不是"已加工"，把它算进 `processed` 正是本节禁止的充数；于是三态之和合法地小于
+`eligible`，envelope 如实 `pipeline_count_mismatch`。等式因此在两条真实轴上可判：账本行数对
+`stream_checkpoints.issued_highwater`（另行写入的水位，密集序列有洞或水位超前即红），以及
+知识三态对自身基数。`stream_checkpoints.evidence_highwater / knowledge_highwater` 仍是
+§15.3 声明的分层水位，本口径不代替它们；等它们真有推进方也可直接改读，等式与判定不变。
+
 同 workspace 内不同用户的 `USER_PRIVATE` Evidence 会进入同一流账本，但不一定
 属于当前用户的授权可见集合。因此授权 EXACT census 即使独立证明了自己的 total，
 也不能让全链闭合跨全集变成 true：可保留已验证 items 与枚举计数，完整性仍须

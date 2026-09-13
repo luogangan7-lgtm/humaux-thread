@@ -29,14 +29,16 @@ use humaux_domain::selection::{AUTHORIZED_MEMORY_ENUMERATION_V1, Cursor, query_f
 use humaux_projection::serving::StreamFamily;
 use humaux_projection::stream::StreamKey;
 use humaux_retrieval::compiler::{ContextItem, ContextOutcome};
-use humaux_retrieval::envelope::GroundingBlock;
+use humaux_retrieval::envelope::{CountScope, EvidenceBlock, GroundingBlock, KnowledgeBlock};
 use humaux_retrieval::handoff::{Handoff, assemble_with_context};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::types::Uuid;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::confirm_token_repo::{self, ConfirmationClaim};
+use crate::exact_census::{ACTIVE_FINAL, CensusInputs, census_in_txn};
 use crate::postgres::RuntimeDbPool;
 use crate::quota_repo::{self, ReservationStatus, ReserveResult};
 use crate::read_materialize::{
@@ -632,7 +634,102 @@ pub struct MaterializedMemoryPage {
     pub snapshot_id: Uuid,
     pub next_cursor: Option<String>,
     pub memory: MaterializedMemory,
+    /// §22.1 census + §23.3④ pipeline readings for THIS page, or `None` when this call had no
+    /// workspace-scoped universe to enumerate at all.
+    ///
+    /// The two travel together on purpose: §22.0 makes `class=exact` without an enumeration a
+    /// hard 5xx, and `classify()` maps this route's frozen `PlannerDecision::Enumerate` to
+    /// `Exact` as soon as the pipeline counts stop being unknown — so a caller that took the
+    /// counts without the census would 5xx, and one that took the census without the counts
+    /// would report `cannot_establish/count_unknown` while holding a proven total. One
+    /// `Option` over both makes neither half reachable on its own.
+    pub census: Option<EnumerationCensus>,
 }
+
+/// [`MaterializedMemoryPage::census`]'s payload: the §22.1 verdict for this page and the
+/// `stream_ledger`-universe pipeline counts read in the same transaction.
+pub struct EnumerationCensus {
+    pub census: humaux_retrieval::completeness::CensusResult,
+    pub pipeline: StreamPipelineCounts,
+}
+
+/// §23.3④ `pipeline.evidence` / `pipeline.knowledge` readings in the **`stream_ledger`**
+/// universe — the request's full six-column [`StreamKey`] ledger, not the caller's authorized
+/// view (§23.3④: "同一块的计数必须来自同一实际全集、同一授权与快照"; the authorized EXACT
+/// census is a different universe and may never fill these, "禁止填 `0`、返回条数、
+/// `issued_highwater` 或其他块的值充数").
+///
+/// Both blocks read `projection.stream_log` rows for that key. §15.1/§60 issue a stream_seq in
+/// the same transaction that persists its Evidence and its `ops.outbox` row, so a row's
+/// existence *is* the "Evidence fully persisted" reading; §15.2's state set is what partitions
+/// the knowledge layer. The equation §23.3④ freezes (`evidence.persisted ==
+/// knowledge.eligible == projection.expected`, and `processed + waiting_key + failed ==
+/// eligible`) therefore discriminates on two real axes: the ledger rows against
+/// `stream_checkpoints.issued_highwater` (a separately-written watermark — a hole in the dense
+/// sequence, or a watermark ahead of its rows, fails it), and the knowledge partition against
+/// its own base (anything still in flight fails it).
+// ponytail: derived from `stream_log` at read time because nothing in the workspace advances
+// `stream_checkpoints.evidence_highwater` / `knowledge_highwater` (grep: migration 0011's
+// GRANT and two fixtures). Upgrade path: when the distill/projection workers start advancing
+// those two watermarks, read them here instead — the two blocks then become genuinely
+// independent per-layer readings rather than two statements over one ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamPipelineCounts {
+    pub evidence_persisted: u64,
+    pub knowledge_eligible: u64,
+    pub knowledge_processed: u64,
+    pub knowledge_waiting_key: u64,
+    pub knowledge_failed: u64,
+}
+
+impl StreamPipelineCounts {
+    /// The §23.3④ wire pair these readings are allowed to fill, minted in ONE place for all
+    /// three read routes. §23.3④ freezes the scope label together with the numbers ("同一块的
+    /// 计数必须来自同一实际全集、同一授权与快照"), so a route that hand-wrote the two blocks
+    /// could pair a `stream_ledger` reading with an `authorized_view` label — a
+    /// `count_scope_mismatch` that no type would catch. `expected` stays `null`: §23.1①, these
+    /// routes carry no `batch_id`, and it is never backfilled from `persisted`.
+    #[must_use]
+    pub fn blocks(self) -> (EvidenceBlock, KnowledgeBlock) {
+        (
+            EvidenceBlock::no_batch(Some(self.evidence_persisted), CountScope::StreamLedger),
+            KnowledgeBlock {
+                eligible: Some(self.knowledge_eligible),
+                processed: Some(self.knowledge_processed),
+                waiting_key: Some(self.knowledge_waiting_key),
+                failed: Some(self.knowledge_failed),
+                count_scope: CountScope::StreamLedger,
+            },
+        )
+    }
+}
+
+/// §22.1 one-predicate-two-faces for `memory.enumerate`: the FROM + tenant/workspace filter
+/// (`$1` tenant, `$2` workspace) and the predicate that [`materialize_memory_enumeration`]'s
+/// own candidate query and its census denominator BOTH run. One text, two faces — a second,
+/// hand-written filter is what makes a `coverage` describe a set the page never had.
+///
+/// `visibility_workspace_id IS NULL OR = $2` is `can_read`'s own shape written in SQL:
+/// `memory_records_visibility_matches_class` (migration 0004) forces that column NOT NULL
+/// exactly for `WORKSPACE_SHARED` rows, so another workspace's shared row leaves the universe
+/// here and `USER_PRIVATE`/`TENANT_SHARED` rows (always NULL) stay in it — then
+/// [`readable_memory_ids`] applies the per-row authority (card 9/13).
+///
+/// Deliberately NOT a `control.retrieval_predicates` row: §20.1's registry is the entry point
+/// for §20.2's *surface-pattern* path, and §20.3 obliges every row there to carry ≥5 natural
+/// language questions with ≥2 near-miss negatives. This route never reaches the planner —
+/// `RetrievalIntent::trusted_memory_enumerate` hands `build_request` a frozen
+/// `PlannerDecision::Enumerate` whose id is `domain::selection`'s
+/// `AUTHORIZED_MEMORY_ENUMERATION_V1` ("Authorized Gateway enumeration, distinct from the
+/// worker's tenant-shared predicate"). Registering an NL surface for a trusted-intent
+/// predicate would make it reachable from query text, which is the opposite of what it is.
+const ENUMERATION_SCOPE: &str = "private.memory_records \
+     WHERE memory_records.tenant_id = $1 \
+       AND (memory_records.visibility_workspace_id IS NULL \
+            OR memory_records.visibility_workspace_id = $2)";
+
+/// Q3/ADR-0024 D-C: enumerate excludes archived rows, so they are outside the denominator too.
+const ENUMERATION_PREDICATE: &str = "memory_records.archived_at IS NULL";
 
 fn enumeration_fingerprint(
     authorization: &AuthorizationScope,
@@ -721,6 +818,246 @@ async fn page_grounding_in_txn(
     }
     Ok(result)
 }
+/// The six-column `StreamKey` WHERE clause, `$1..$6` (same column order `stream_repo` binds).
+const PIPELINE_KEY_WHERE: &str = "tenant_id = $1 AND scope_kind = $2 AND scope_id = $3 \
+     AND domain = $4 AND projection_kind = $5 AND projection_version = $6";
+
+fn bind_pipeline_key<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    key: &'q StreamKey,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    query
+        .bind(key.tenant_id.0)
+        .bind(&key.scope_kind)
+        .bind(key.scope_id)
+        .bind(&key.domain)
+        .bind(&key.projection_kind)
+        .bind(&key.projection_version)
+}
+
+/// Reads [`StreamPipelineCounts`] in the caller's transaction (see that type for the §23.3④
+/// derivation and its marked ceiling). Two independent statements, one per pipeline block.
+pub(crate) async fn stream_pipeline_counts_in_txn(
+    txn: &mut Txn<'_>,
+    key: &StreamKey,
+) -> Result<StreamPipelineCounts, ErrorCode> {
+    let evidence_persisted: i64 = bind_pipeline_key(
+        sqlx::query(&format!(
+            "SELECT count(*) AS n FROM projection.stream_log WHERE {PIPELINE_KEY_WHERE}"
+        )),
+        key,
+    )
+    .fetch_one(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::DependencyUnavailable)?
+    .try_get("n")
+    .map_err(|_| ErrorCode::Internal)?;
+
+    // §15.2's state set, partitioned the way §23.3④'s knowledge equation needs it: `processed`
+    // is the settled set (the same three states `stream_repo` counts as `done`), `failed` is
+    // the `processing_gaps` view's own set, `waiting_key` is its own §15.3 stall. ISSUED /
+    // PROCESSING / RETRY_WAIT are in NONE of the three on purpose — work still in flight is
+    // not processed, and reporting it as such is exactly the "填数充数" §23.3④ forbids; the
+    // sum then legitimately falls short of `eligible` and the envelope says so.
+    let knowledge = bind_pipeline_key(
+        sqlx::query(&format!(
+            "SELECT count(*) AS eligible, \
+                    count(*) FILTER (WHERE state IN ('DONE','SKIPPED_BY_POLICY','TOMBSTONED')) \
+                      AS processed, \
+                    count(*) FILTER (WHERE state = 'WAITING_KEY') AS waiting_key, \
+                    count(*) FILTER (WHERE state IN ('FAILED','LOST')) AS failed \
+             FROM projection.stream_log WHERE {PIPELINE_KEY_WHERE}"
+        )),
+        key,
+    )
+    .fetch_one(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    let read = |name: &str| -> Result<u64, ErrorCode> {
+        let value: i64 = knowledge.try_get(name).map_err(|_| ErrorCode::Internal)?;
+        u64::try_from(value).map_err(|_| ErrorCode::Internal)
+    };
+    Ok(StreamPipelineCounts {
+        evidence_persisted: u64::try_from(evidence_persisted).map_err(|_| ErrorCode::Internal)?,
+        knowledge_eligible: read("eligible")?,
+        knowledge_processed: read("processed")?,
+        knowledge_waiting_key: read("waiting_key")?,
+        knowledge_failed: read("failed")?,
+    })
+}
+
+/// §22.1 readout frozen with one enumeration manifest. `total` / `excluded_secret` describe the
+/// whole authorized universe the manifest was minted from; `returned` is per page, so it is
+/// supplied by [`Self::for_page`] rather than stored.
+struct FrozenCensus {
+    predicate_id: String,
+    total: u64,
+    excluded_secret: u64,
+}
+
+impl FrozenCensus {
+    fn for_page(&self, returned: usize) -> humaux_retrieval::completeness::CensusResult {
+        use humaux_retrieval::completeness::{CensusResult, ExactEnumeration};
+        // A page longer than its own denominator allows is the 分母内生 shape §22.1 refuses;
+        // the sole constructor rejecting our readout is §22.4 trigger 4, not a 500.
+        match ExactEnumeration::new(
+            self.predicate_id.as_str(),
+            self.total,
+            returned as u64,
+            self.excluded_secret,
+        ) {
+            Ok(enumeration) => CensusResult::enumerated(enumeration),
+            Err(_) => CensusResult::failed(),
+        }
+    }
+}
+
+/// Freezes this manifest's census readout onto its own `ops.selection_snapshots` row
+/// (migration 0165) inside the minting transaction, so every later page reads the denominator
+/// that was counted in the manifest's snapshot instead of re-counting in a younger one.
+async fn store_frozen_census_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    snapshot_id: Uuid,
+    census: &FrozenCensus,
+) -> Result<(), ErrorCode> {
+    sqlx::query(
+        "UPDATE ops.selection_snapshots \
+            SET census_predicate_id = $3, census_total = $4, census_excluded_secret = $5 \
+          WHERE selection_snapshot_id = $1 AND tenant_id = $2",
+    )
+    .bind(snapshot_id)
+    .bind(tenant_id)
+    .bind(census.predicate_id.as_str())
+    .bind(i64::try_from(census.total).map_err(|_| ErrorCode::Internal)?)
+    .bind(i64::try_from(census.excluded_secret).map_err(|_| ErrorCode::Internal)?)
+    .execute(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    Ok(())
+}
+
+/// Reads back [`store_frozen_census_in_txn`]'s readout. `None` = this manifest carries no
+/// census (three NULLs — a pre-0165 snapshot, or a mint whose census failed); the caller turns
+/// that into [`CensusResult::failed`], never into a total of `0` (§23.3④).
+async fn frozen_census_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    snapshot_id: Uuid,
+) -> Result<Option<FrozenCensus>, ErrorCode> {
+    let row = sqlx::query(
+        "SELECT census_predicate_id, census_total, census_excluded_secret \
+           FROM ops.selection_snapshots \
+          WHERE selection_snapshot_id = $1 AND tenant_id = $2",
+    )
+    .bind(snapshot_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let predicate_id: Option<String> = row
+        .try_get("census_predicate_id")
+        .map_err(|_| ErrorCode::Internal)?;
+    let total: Option<i64> = row
+        .try_get("census_total")
+        .map_err(|_| ErrorCode::Internal)?;
+    let excluded: Option<i64> = row
+        .try_get("census_excluded_secret")
+        .map_err(|_| ErrorCode::Internal)?;
+    // The 0165 CHECK makes the three all-or-nothing at the DB layer; this reads them as such
+    // rather than defaulting any one of them.
+    let (Some(predicate_id), Some(total), Some(excluded)) = (predicate_id, total, excluded) else {
+        return Ok(None);
+    };
+    Ok(Some(FrozenCensus {
+        predicate_id,
+        total: u64::try_from(total).map_err(|_| ErrorCode::Internal)?,
+        excluded_secret: u64::try_from(excluded).map_err(|_| ErrorCode::Internal)?,
+    }))
+}
+
+/// §23.1④ negative control seam (ADR-0041 D-G). Zero — the default, and the only value any
+/// production process ever holds — means the barrier below emits no statement at all.
+static CENSUS_MINT_BARRIER: AtomicI64 = AtomicI64::new(0);
+
+/// Arms [`census_mint_barrier_in_txn`] with a PostgreSQL advisory-lock key; `0` disarms it.
+///
+/// §22.1's load-bearing claim is that `total` is counted "与返回项取**同一事务快照**", and an
+/// insert that lands after a mint has already returned cannot tell that apart from a census
+/// taken in its own younger transaction — both answer with the pre-insert number. The only
+/// witness that separates them is a commit INSIDE the mint's window, which needs the mint to
+/// hold still for one. A test takes the advisory lock on a second connection, arms this key,
+/// issues the enumerate call, commits its row while the mint is parked, then releases.
+pub fn arm_census_mint_barrier(advisory_key: i64) {
+    CENSUS_MINT_BARRIER.store(advisory_key, Ordering::SeqCst);
+}
+
+/// Parks the minting transaction after its snapshot and id list are taken and before its
+/// census, when (and only when) [`arm_census_mint_barrier`] armed a key. `pg_advisory_xact_lock`
+/// releases with the transaction, so no unlock path can leak a held lock onto a pooled
+/// connection.
+async fn census_mint_barrier_in_txn(txn: &mut Txn<'_>) -> Result<(), ErrorCode> {
+    let advisory_key = CENSUS_MINT_BARRIER.load(Ordering::SeqCst);
+    if advisory_key == 0 {
+        return Ok(());
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(advisory_key)
+        .execute(&mut **txn)
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    Ok(())
+}
+
+/// Runs the §22.1 census for the authorized universe this manifest is being minted from, in
+/// the SAME transaction (and therefore the same snapshot) as `universe` — the id list
+/// `final_memory_ids_in_txn` just produced.
+///
+/// `universe` is not the source of any count (§22.1: "禁止用召回条数冒充 `total`" — the three
+/// statements inside the census do their own `count(*)`). It is the cross-check: the census
+/// and the manifest are the two faces of ONE predicate ([`ENUMERATION_SCOPE`] /
+/// [`ENUMERATION_PREDICATE`]), so their id sets must be identical. Disagreement means the two
+/// faces drifted apart — §22.4 trigger 4, reported as a failed census instead of publishing a
+/// `coverage` for a set the page never held.
+async fn mint_census_in_txn(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+    workspace: WorkspaceId,
+    stream: &StreamKey,
+    subject_id: Option<Uuid>,
+    universe: &[Uuid],
+) -> Result<Option<FrozenCensus>, ErrorCode> {
+    let outcome = census_in_txn(
+        txn,
+        &CensusInputs {
+            predicate_id: AUTHORIZED_MEMORY_ENUMERATION_V1,
+            enumerable_scope: ENUMERATION_SCOPE,
+            sql_predicate: ENUMERATION_PREDICATE,
+            authorization,
+            workspace,
+            stream,
+            subject_id,
+        },
+    )
+    .await?;
+    let Some(enumeration) = outcome.census.enumeration() else {
+        return Ok(None);
+    };
+    if outcome.returned_ids.iter().copied().collect::<HashSet<_>>()
+        != universe.iter().copied().collect::<HashSet<_>>()
+    {
+        return Ok(None);
+    }
+    Ok(Some(FrozenCensus {
+        predicate_id: enumeration.predicate_id().to_owned(),
+        total: enumeration.total(),
+        excluded_secret: enumeration.excluded_secret(),
+    }))
+}
+
 /// Materializes an authorization-bound immutable Memory page.
 #[allow(clippy::too_many_lines)] // ADR-0028 D-D: the exact enumeration predicate now carries the subject_id filter inside the same manifest SQL + fingerprint; splitting it would separate the predicate from the completeness classification it must stay honest with.
 pub async fn materialize_memory_enumeration(
@@ -750,9 +1087,9 @@ pub async fn materialize_memory_enumeration(
     .await
     .map_err(|_| ErrorCode::DependencyUnavailable)?;
     set_authorization_local(&mut txn, &authorization).await?;
-    let page = if let Some(encoded) = params.cursor {
+    let (page, frozen_census) = if let Some(encoded) = params.cursor {
         let cursor = Cursor::decode(encoded).map_err(|_| ErrorCode::InvalidInput)?;
-        fetch_authorized_snapshot_page_in_txn(
+        let page = fetch_authorized_snapshot_page_in_txn(
             &mut txn,
             authorization.tenant_id().0,
             &cursor,
@@ -760,20 +1097,27 @@ pub async fn materialize_memory_enumeration(
             params.page_size as i64,
             params.mac_key,
         )
-        .await?
+        .await?;
+        // §22.1: a later page's denominator is the one frozen WITH the manifest (migration
+        // 0165). Re-counting here would pair a younger snapshot's total with frozen items.
+        let census =
+            frozen_census_in_txn(&mut txn, authorization.tenant_id().0, page.snapshot_id).await?;
+        (page, census)
     } else {
         // §6.1.3 D-D: the subject filter is part of the EXACT manifest predicate (RLS-visible
-        // memory_subjects rows), never a post-filter over an unfiltered page.
-        let rows = sqlx::query(
-            "SELECT m.memory_id FROM private.memory_records m \
-             WHERE m.tenant_id = $1 AND m.status = 'active' AND m.superseded_by IS NULL \
-               AND m.archived_at IS NULL \
-               AND ($2::uuid IS NULL OR EXISTS (SELECT 1 FROM private.memory_subjects ms \
-                    WHERE ms.tenant_id = m.tenant_id AND ms.memory_id = m.memory_id \
-                      AND ms.subject_id = $2)) \
-             ORDER BY m.memory_id DESC",
-        )
+        // memory_subjects rows), never a post-filter over an unfiltered page. The scope +
+        // predicate are the SAME two fragments the census counts (see `ENUMERATION_SCOPE`);
+        // `$3` is the subject filter, matching `exact_census`'s own fragment.
+        let rows = sqlx::query(&format!(
+            "SELECT memory_id FROM {ENUMERATION_SCOPE} AND ({ENUMERATION_PREDICATE}) \
+               AND {ACTIVE_FINAL} \
+               AND ($3::uuid IS NULL OR EXISTS (SELECT 1 FROM private.memory_subjects ms \
+                    WHERE ms.tenant_id = memory_records.tenant_id \
+                      AND ms.memory_id = memory_records.memory_id AND ms.subject_id = $3)) \
+             ORDER BY memory_id DESC"
+        ))
         .bind(authorization.tenant_id().0)
+        .bind(scope.workspace_id.map(|workspace| workspace.0))
         .bind(params.subject_id)
         .fetch_all(&mut *txn)
         .await
@@ -783,7 +1127,28 @@ pub async fn materialize_memory_enumeration(
             .map(|row| row.try_get("memory_id").map_err(|_| ErrorCode::Internal))
             .collect::<Result<Vec<Uuid>, ErrorCode>>()?;
         let ids = final_memory_ids_in_txn(&mut txn, &authorization, &candidates, false).await?;
-        begin_authorized_snapshot_in_txn(
+        // Disarmed in production; a test parks the mint here to commit a row into the window
+        // between this id list and the census below (ADR-0041 D-G).
+        census_mint_barrier_in_txn(&mut txn).await?;
+        // Same transaction, therefore the same REPEATABLE READ snapshot as `ids` and as every
+        // read below it (§22.1's "与返回项取同一事务快照").
+        let census = match scope.workspace_id {
+            Some(workspace) => {
+                mint_census_in_txn(
+                    &mut txn,
+                    &authorization,
+                    workspace,
+                    validated_key,
+                    params.subject_id,
+                    &ids,
+                )
+                .await?
+            }
+            // No workspace means no `$2` for the enumerable scope — there is no universe to
+            // count, so nothing is claimed (never a total of 0).
+            None => None,
+        };
+        let page = begin_authorized_snapshot_in_txn(
             &mut txn,
             authorization.tenant_id().0,
             &fingerprint,
@@ -792,7 +1157,17 @@ pub async fn materialize_memory_enumeration(
             params.mac_key,
             &ids,
         )
-        .await?
+        .await?;
+        if let Some(census) = census.as_ref() {
+            store_frozen_census_in_txn(
+                &mut txn,
+                authorization.tenant_id().0,
+                page.snapshot_id,
+                census,
+            )
+            .await?;
+        }
+        (page, census)
     };
     let expected: HashSet<_> = page.items.iter().copied().collect();
     if expected.len() != page.items.len() {
@@ -824,6 +1199,18 @@ pub async fn materialize_memory_enumeration(
     let ledger = close_ledger_in_txn(&mut txn, validated_key)
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    // §23.3④: read in the same transaction as the ledger whose `expected` they are compared
+    // against. `None` census ⇒ no counts either (see `MaterializedMemoryPage::census`).
+    let census = match scope.workspace_id {
+        Some(_) => Some(EnumerationCensus {
+            census: frozen_census.as_ref().map_or_else(
+                humaux_retrieval::completeness::CensusResult::failed,
+                |census| census.for_page(page.items.len()),
+            ),
+            pipeline: stream_pipeline_counts_in_txn(&mut txn, validated_key).await?,
+        }),
+        None => None,
+    };
     txn.commit()
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
@@ -839,6 +1226,7 @@ pub async fn materialize_memory_enumeration(
             // carries one; the flag is meaningful only on memory.get.
             archived: false,
         },
+        census,
     })
 }
 
@@ -852,6 +1240,12 @@ pub struct MaterializedContext {
     pub bodies: MaterializedBodies,
     /// Stream ledger closure read in that same transaction snapshot.
     pub ledger: humaux_retrieval::completeness::LedgerClosure,
+    /// §23.3④ `stream_ledger` pipeline readings for `validated_key`, taken in that same
+    /// snapshot as the ledger and the bodies (ADR-0041 D-H). Not an `Option`: unlike
+    /// [`MaterializedMemoryPage::census`] there is no census travelling with it and
+    /// `classify()` maps this route's `PlannerDecision::Class(_)` to `SemanticBounded`, so
+    /// §22.0's exact-without-a-predicate trap is not on this path.
+    pub pipeline: StreamPipelineCounts,
     /// Actual §8.8 states retained from compiled mandatory and pinned rows.
     pub grounding: GroundingBlock,
 }
@@ -1091,6 +1485,7 @@ pub async fn assemble_materialized(
     let ledger = close_ledger_in_txn(&mut txn, validated_key)
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    let pipeline = stream_pipeline_counts_in_txn(&mut txn, validated_key).await?;
     txn.commit()
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
@@ -1099,6 +1494,7 @@ pub async fn assemble_materialized(
         outcome,
         bodies,
         ledger,
+        pipeline,
         grounding,
     })
 }

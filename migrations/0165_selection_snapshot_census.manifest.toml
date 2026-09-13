@@ -1,0 +1,53 @@
+# §46.1 migration manifest. ADR-0041 (card 19, §22.1/§20.4): freeze one `memory.enumerate`
+# manifest's EXACT census readout (predicate_id + total + excluded_secret) next to the manifest
+# itself, so page 2 reads page 1's same-snapshot denominator instead of re-counting against a
+# younger snapshot (§22.1 "与返回项取同一事务快照") or counting the frozen item rows (§22.1
+# 分母内生). Three nullable columns + one all-or-nothing CHECK on ops.selection_snapshots. No
+# new table, no new role, no new GRANT (§6.2.1 domain default already covers this table, and a
+# table-level grant extends to later columns), no RLS change, no DML. §46 forward-fix
+# (EXPAND_CONTRACT, first free number after 0164).
+
+migration_id = "0165_selection_snapshot_census"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('ops.selection_snapshots') is not null
+ and not exists (select 1 from information_schema.columns
+                  where table_schema='ops' and table_name='selection_snapshots'
+                    and column_name in ('census_predicate_id','census_total','census_excluded_secret'))
+ and not exists (select 1 from pg_constraint
+                  where conrelid='ops.selection_snapshots'::regclass
+                    and conname='selection_snapshots_census_all_or_nothing')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- all three columns landed, all three nullable (a pre-0165 snapshot row stays legal)
+ (select count(*)=3 from information_schema.columns
+   where table_schema='ops' and table_name='selection_snapshots'
+     and column_name in ('census_predicate_id','census_total','census_excluded_secret')
+     and is_nullable='YES')
+ -- the all-or-nothing CHECK exists
+ and (select count(*)=1 from pg_constraint
+       where conrelid='ops.selection_snapshots'::regclass
+         and conname='selection_snapshots_census_all_or_nothing' and contype='c')
+ -- RLS posture untouched by the ALTER
+ and (select relrowsecurity and relforcerowsecurity
+      from pg_class where oid='ops.selection_snapshots'::regclass)
+ -- the gateway keeps exactly the §6.2.1 domain-default verbs on the new columns; no verb was
+ -- widened and no other runtime role gained anything on this table
+ and has_column_privilege('role_gateway','ops.selection_snapshots','census_total','SELECT')
+ and has_column_privilege('role_gateway','ops.selection_snapshots','census_total','INSERT')
+ and has_column_privilege('role_gateway','ops.selection_snapshots','census_total','UPDATE')
+ and not has_table_privilege('role_gateway','ops.selection_snapshots','DELETE')
+ and not has_table_privilege('role_consolidation_worker','ops.selection_snapshots','UPDATE')
+ -- the CHECK's own text, so a later edit that relaxes it has to come through this manifest
+ and (select pg_get_constraintdef(oid) like '%census_excluded_secret <= census_total%'
+      from pg_constraint where conrelid='ops.selection_snapshots'::regclass
+        and conname='selection_snapshots_census_all_or_nothing')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Reverting is: ALTER TABLE ops.selection_snapshots DROP CONSTRAINT selection_snapshots_census_all_or_nothing, then DROP COLUMN census_predicate_id, census_total, census_excluded_secret — fully recoverable from this file. Reverting returns memory.enumerate's cursor pages to a manifest with no frozen census, which adapters::context_repo reads as 'no census' ⇒ cannot_establish/census_failed; it never fabricates a total and it widens no tenant's data access."
+backup_restore_requirement = "none: three ADD COLUMN (NULL default, no table rewrite) plus one CHECK over columns that are NULL on every existing row. No row data is read, written or deleted."

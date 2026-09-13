@@ -23,10 +23,9 @@ use humaux_retrieval::{
     compiler::ContextOutcome,
     completeness::{CensusResult, FreshnessClass, LedgerClosure},
     envelope::{
-        CompletenessBlock, CompletenessInputs, CountScope, Envelope, EvidenceBlock, FreshnessBlock,
-        KnowledgeBlock, LaneStatus, MandatoryReport, PendingEnvelope, PinnedReport, PipelineBlock,
-        ProfileBlock, ProvenanceBlock, ProvenanceValue, build_projection_block,
-        envelope_outcome_block,
+        CompletenessBlock, CompletenessInputs, Envelope, FreshnessBlock, LaneStatus,
+        MandatoryReport, PendingEnvelope, PinnedReport, PipelineBlock, ProfileBlock,
+        ProvenanceBlock, ProvenanceValue, build_projection_block, envelope_outcome_block,
     },
     handoff::Handoff,
     request::{RegisteredRetrievalProfile, RetrievalIntent, RetrievalRequest, build_request},
@@ -278,6 +277,7 @@ fn into_result<T>(
         outcome,
         bodies,
         ledger,
+        pipeline: counts,
         grounding,
     } = materialized;
     let items = bodies
@@ -295,17 +295,23 @@ fn into_result<T>(
         .collect::<Result<Vec<_>, _>>()?;
     let returned = u32::try_from(items.len()).map_err(|_| ErrorCode::Internal)?;
     let projection = build_projection_block(&ledger, visible);
-    // These counts were not read in an independently established authorized universe.
-    // Never replace them with the number of Context items or stream rows.
+    // §23.3④ (ADR-0041 D-H): read from `projection.stream_log` for this request's full
+    // six-column `StreamKey`, in the same RR snapshot as the manifest, the bodies and the
+    // ledger — never the number of Context items or of returned stream rows, which §23.3④
+    // names ("禁止填 `0`、返回条数、`issued_highwater` 或其他块的值充数"). This route's
+    // `PlannerDecision::Class(_)` classifies as `SemanticBounded`, so these counts carry no
+    // census with them and cannot reach §22.0's exact invariant.
+    //
+    // They do not move this route's class today, and that is not this block's fault: §22.4's
+    // lane trigger is checked inside `classify()` before `planner_output` is read, and
+    // `lane_status` below is `Failed` on every deployment because
+    // `context_repo::fetch_frozen_in_txn` cannot resolve two of §25's five selectors yet. What
+    // these counts do is make the two blocks true instead of unknown, and take `count_unknown`
+    // out of the reason chain — see ADR-0041 D-H.
+    let (evidence, knowledge) = counts.blocks();
     let pipeline = PipelineBlock {
-        evidence: EvidenceBlock::no_batch(None, CountScope::AuthorizedView),
-        knowledge: KnowledgeBlock {
-            eligible: None,
-            processed: None,
-            waiting_key: None,
-            failed: None,
-            count_scope: CountScope::AuthorizedView,
-        },
+        evidence,
+        knowledge,
         projection: projection.value,
     };
     let provenance = provenance(

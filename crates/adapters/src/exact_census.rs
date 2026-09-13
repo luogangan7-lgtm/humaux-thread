@@ -36,8 +36,8 @@ use humaux_domain::ids::WorkspaceId;
 use humaux_projection::stream::StreamKey;
 use humaux_retrieval::completeness::{CensusResult, ExactEnumeration};
 use humaux_retrieval::predicate_registry::PredicateEntry;
-use sqlx::Row;
 use sqlx::types::Uuid;
+use sqlx::{Acquire, Row};
 
 use crate::context_repo::{readable_memory_ids, set_authorization_local};
 use crate::postgres::RuntimeDbPool;
@@ -157,11 +157,32 @@ const NOT_TOMBSTONED: &str = "NOT EXISTS ( \
 
 /// Final materialization only exposes active, unsuperseded memory rows. EXACT must not report
 /// identifiers that the read path will reject after this snapshot.
-const ACTIVE_FINAL: &str =
+///
+/// `pub(crate)`: `context_repo`'s manifest candidate query runs the same conjunct, so the two
+/// faces of one predicate (§23.1②) share this text instead of restating it.
+pub(crate) const ACTIVE_FINAL: &str =
     "memory_records.status = 'active' AND memory_records.superseded_by IS NULL";
 
 /// The candidate universe has already passed context_repo's sole source-visibility authority.
 const AUTHORIZED_CANDIDATE: &str = "memory_records.memory_id = ANY($8)";
+
+/// §6.1.3 (ADR-0028 D-D) subject axis, EXACT-channel face: the bound uuid being NULL means
+/// "not subject-scoped". `{n}` is the placeholder number, filled by [`subject_scoped`] — the
+/// candidate statement binds 8 placeholders and the three readout statements bind 9, so the
+/// one fragment cannot hardcode a single `$k` (a mismatch there would silently compare the
+/// subject id against an id array).
+///
+/// It rides inside the census's own WHERE, never as a post-filter, for the same reason
+/// `context_repo`'s manifest query carries it inline: a subject-scoped page whose denominator
+/// was counted unscoped would report a `coverage` for a universe it never enumerated.
+const SUBJECT_SCOPED: &str = "(${n}::uuid IS NULL OR EXISTS ( \
+   SELECT 1 FROM private.memory_subjects ms \
+   WHERE ms.tenant_id = memory_records.tenant_id \
+     AND ms.memory_id = memory_records.memory_id AND ms.subject_id = ${n}))";
+
+fn subject_scoped(placeholder: u8) -> String {
+    SUBJECT_SCOPED.replace("{n}", &placeholder.to_string())
+}
 
 /// §18/§22.1 `SECRET_MATERIAL` linkage: a memory whose evidence chain carries secret material
 /// is excluded from `returned` and counted by `excluded_secret`.
@@ -170,17 +191,6 @@ const SECRET_LINKED: &str = "EXISTS ( \
    JOIN private.evidence_objects eo ON eo.evidence_id = me2.evidence_id \
    WHERE me2.memory_id = memory_records.memory_id \
      AND eo.data_class = 'SECRET_MATERIAL')";
-
-/// §22.4 trigger 4 exit: closes the (read-only) transaction and hands back the failed-census
-/// verdict for `classify()` to render, instead of surfacing a transport error.
-async fn census_failed(txn: Txn<'_>) -> Result<ExactCensusOutcome, ErrorCode> {
-    // Commit rather than roll back: the transaction only read.
-    let _ = txn.commit().await;
-    Ok(ExactCensusOutcome {
-        census: CensusResult::failed(),
-        returned_ids: Vec::new(),
-    })
-}
 
 async fn census_count(txn: &mut Txn<'_>, sql: &str, args: &CensusArgs<'_>) -> sqlx::Result<i64> {
     sqlx::query(sql)
@@ -192,6 +202,7 @@ async fn census_count(txn: &mut Txn<'_>, sql: &str, args: &CensusArgs<'_>) -> sq
         .bind(&args.stream.projection_kind)
         .bind(&args.stream.projection_version)
         .bind(args.authorized_ids)
+        .bind(args.subject_id)
         .fetch_one(&mut **txn)
         .await?
         .try_get(0)
@@ -202,6 +213,7 @@ struct CensusArgs<'a> {
     workspace_id: Uuid,
     stream: &'a StreamKey,
     authorized_ids: &'a [Uuid],
+    subject_id: Option<Uuid>,
 }
 
 struct CandidateQuery<'a> {
@@ -210,6 +222,7 @@ struct CandidateQuery<'a> {
     stream: &'a StreamKey,
     scope: &'a str,
     predicate: &'a str,
+    subject_id: Option<Uuid>,
 }
 
 async fn authorized_candidate_ids(
@@ -217,9 +230,11 @@ async fn authorized_candidate_ids(
     query: &CandidateQuery<'_>,
 ) -> Result<Vec<Uuid>, ErrorCode> {
     let candidates_sql = format!(
-        "SELECT memory_id FROM {} AND ({}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} \
+        "SELECT memory_id FROM {} AND ({}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} AND {} \
          ORDER BY memory_id",
-        query.scope, query.predicate,
+        query.scope,
+        query.predicate,
+        subject_scoped(8),
     );
     let candidates: Vec<Uuid> = match sqlx::query(&candidates_sql)
         .bind(query.authorization.tenant_id().0)
@@ -229,6 +244,7 @@ async fn authorized_candidate_ids(
         .bind(&query.stream.domain)
         .bind(&query.stream.projection_kind)
         .bind(&query.stream.projection_version)
+        .bind(query.subject_id)
         .fetch_all(&mut **txn)
         .await
     {
@@ -253,9 +269,10 @@ async fn census_readout(
     predicate: &str,
     args: &CensusArgs<'_>,
 ) -> Result<(i64, Vec<Uuid>, i64), ErrorCode> {
+    let subject = subject_scoped(9);
     let total_sql = format!(
         "SELECT count(*) FROM {scope} AND ({predicate}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} \
-         AND {AUTHORIZED_CANDIDATE}"
+         AND {AUTHORIZED_CANDIDATE} AND {subject}"
     );
     let total = census_count(txn, &total_sql, args)
         .await
@@ -263,7 +280,7 @@ async fn census_readout(
 
     let ids_sql = format!(
         "SELECT memory_id FROM {scope} AND ({predicate}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} \
-         AND {AUTHORIZED_CANDIDATE} AND NOT {SECRET_LINKED} ORDER BY memory_id"
+         AND {AUTHORIZED_CANDIDATE} AND {subject} AND NOT {SECRET_LINKED} ORDER BY memory_id"
     );
     let ids: Vec<Uuid> = sqlx::query(&ids_sql)
         .bind(args.tenant_id)
@@ -274,6 +291,7 @@ async fn census_readout(
         .bind(&args.stream.projection_kind)
         .bind(&args.stream.projection_version)
         .bind(args.authorized_ids)
+        .bind(args.subject_id)
         .fetch_all(&mut **txn)
         .await
         .map_err(|_| ErrorCode::Internal)?
@@ -284,7 +302,7 @@ async fn census_readout(
 
     let secret_sql = format!(
         "SELECT count(*) FROM {scope} AND ({predicate}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} \
-         AND {AUTHORIZED_CANDIDATE} AND {SECRET_LINKED}"
+         AND {AUTHORIZED_CANDIDATE} AND {subject} AND {SECRET_LINKED}"
     );
     let excluded_secret = census_count(txn, &secret_sql, args)
         .await
@@ -292,7 +310,114 @@ async fn census_readout(
     Ok((total, ids, excluded_secret))
 }
 
-/// Runs the §22.1 census for one already-established predicate (the caller has run
+/// One §22.1 census run's inputs, independent of where the `enumerable_scope` /
+/// `sql_predicate` fragments came from.
+///
+/// Both fragments are interpolated, not bound, so both callers must supply server-owned text —
+/// a `control.retrieval_predicates` row (§50 typed config, CHECK-constrained, the
+/// [`exact_enumerate`] path) or a `const` next to the query whose denominator it describes
+/// (`context_repo`'s trusted `memory.enumerate` route, whose predicate id is frozen in
+/// `domain::selection` and never reaches §20.2's surface-pattern planner). Caller input must
+/// never reach these two fields.
+pub struct CensusInputs<'a> {
+    /// §22.0: the identity that rides on the wire with the readout; blank is unconstructible.
+    pub predicate_id: &'a str,
+    /// §22.1 "计 total 的 FROM + 租户过滤" — `$1` = tenant, `$2` = workspace.
+    pub enumerable_scope: &'a str,
+    pub sql_predicate: &'a str,
+    /// Already narrowed to `workspace` by the caller; re-checked against `stream` below.
+    pub authorization: &'a AuthorizationScope,
+    pub workspace: WorkspaceId,
+    pub stream: &'a StreamKey,
+    /// §6.1.3 (ADR-0028 D-D): restrict the universe to memories linked to this subject.
+    pub subject_id: Option<Uuid>,
+}
+
+/// §22.1 census inside a transaction the caller owns (isolation level and the RLS GUCs are
+/// already installed — this function must run in the SAME snapshot as the items the readout
+/// describes, which is the whole point of it not opening its own transaction).
+///
+/// Every statement runs inside a `SAVEPOINT`: a statement-level failure (§22.4 trigger 4)
+/// aborts only the nested transaction, so the caller's outer transaction — which still has a
+/// page, bodies and a ledger to read in this snapshot — survives to return a degraded
+/// envelope instead of a transport error.
+///
+/// # Errors
+/// [`ErrorCode::Forbidden`] when `stream` is not the caller's own workspace stream.
+/// [`ErrorCode::Internal`] only when the savepoint itself cannot be opened or released.
+pub(crate) async fn census_in_txn(
+    txn: &mut Txn<'_>,
+    inputs: &CensusInputs<'_>,
+) -> Result<ExactCensusOutcome, ErrorCode> {
+    if inputs.stream.tenant_id != inputs.authorization.tenant_id()
+        || inputs.stream.scope_kind != "workspace"
+        || inputs.stream.scope_id != inputs.workspace.0
+    {
+        return Err(ErrorCode::Forbidden);
+    }
+    let mut sp = txn.begin().await.map_err(|_| ErrorCode::Internal)?;
+    let readout = census_readout_in_savepoint(&mut sp, inputs).await;
+    match readout {
+        Ok(readout) => {
+            sp.commit().await.map_err(|_| ErrorCode::Internal)?;
+            Ok(readout)
+        }
+        // The savepoint is rolled back (not committed) so the outer transaction is usable
+        // again even when the failing statement aborted this nested one.
+        Err(()) => {
+            let _ = sp.rollback().await;
+            Ok(ExactCensusOutcome {
+                census: CensusResult::failed(),
+                returned_ids: Vec::new(),
+            })
+        }
+    }
+}
+
+/// The three §22.1 statements plus the authorized-candidate narrowing. `Err(())` = §22.4
+/// trigger 4 (this census cannot be established), never a transport error to propagate.
+async fn census_readout_in_savepoint(
+    sp: &mut Txn<'_>,
+    inputs: &CensusInputs<'_>,
+) -> Result<ExactCensusOutcome, ()> {
+    let candidate_query = CandidateQuery {
+        authorization: inputs.authorization,
+        workspace_id: inputs.workspace,
+        stream: inputs.stream,
+        scope: inputs.enumerable_scope,
+        predicate: inputs.sql_predicate,
+        subject_id: inputs.subject_id,
+    };
+    let authorized_ids = authorized_candidate_ids(sp, &candidate_query)
+        .await
+        .map_err(|_| ())?;
+    let args = CensusArgs {
+        tenant_id: inputs.authorization.tenant_id().0,
+        workspace_id: inputs.workspace.0,
+        stream: inputs.stream,
+        authorized_ids: &authorized_ids,
+        subject_id: inputs.subject_id,
+    };
+    let (total, ids, excluded_secret) =
+        census_readout(sp, inputs.enumerable_scope, inputs.sql_predicate, &args)
+            .await
+            .map_err(|_| ())?;
+
+    // Negative counts cannot come out of count(*); the casts below are shape-only.
+    let total = u64::try_from(total).map_err(|_| ())?;
+    let excluded = u64::try_from(excluded_secret).map_err(|_| ())?;
+    let returned = ids.len() as u64;
+    // The constructor refusing our own readout means the three statements disagree beyond what
+    // one snapshot allows — that *is* a failed census (§22.4 trigger 4), not a transport error.
+    let enumeration =
+        ExactEnumeration::new(inputs.predicate_id, total, returned, excluded).map_err(|_| ())?;
+    Ok(ExactCensusOutcome {
+        census: CensusResult::enumerated(enumeration),
+        returned_ids: ids,
+    })
+}
+
+/// Runs the §22.1 census for one already-established registry predicate (the caller has run
 /// [`probe_predicate_inputs`] → `decide()` and got `PlannerDecision::Enumerate`; running this
 /// for an unestablished predicate measures nothing the classifier will ever consume).
 ///
@@ -320,13 +445,6 @@ pub async fn exact_enumerate(
     stream: &StreamKey,
 ) -> Result<ExactCensusOutcome, ErrorCode> {
     let authorization = authorization.narrow(requested_workspace)?;
-    if stream.tenant_id != authorization.tenant_id()
-        || stream.scope_kind != "workspace"
-        || stream.scope_id != requested_workspace.0
-    {
-        return Err(ErrorCode::Forbidden);
-    }
-
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     // 必须是本事务第一条语句：隔离级在第一个取快照的语句之后就改不了了（context_repo 同款）。
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -335,54 +453,29 @@ pub async fn exact_enumerate(
         .map_err(|_| ErrorCode::Internal)?;
     set_authorization_local(&mut txn, &authorization).await?;
 
-    let scope = entry.enumerable_scope();
-    let pred = entry.sql_predicate();
-    let tenant_id = authorization.tenant_id().0;
-    let workspace_id = requested_workspace.0;
-    let candidate_query = CandidateQuery {
-        authorization: &authorization,
-        workspace_id: requested_workspace,
-        stream,
-        scope,
-        predicate: pred,
-    };
-    let authorized_ids = match authorized_candidate_ids(&mut txn, &candidate_query).await {
-        Ok(ids) => ids,
-        Err(_) => return census_failed(txn).await,
-    };
-    let args = CensusArgs {
-        tenant_id,
-        workspace_id,
-        stream,
-        authorized_ids: &authorized_ids,
-    };
-
-    let (total, ids, excluded_secret) = match census_readout(&mut txn, scope, pred, &args).await {
-        Ok(readout) => readout,
-        Err(_) => return census_failed(txn).await,
-    };
-
-    txn.commit().await.map_err(|_| ErrorCode::Internal)?;
-
-    // Negative counts cannot come out of count(*); the casts below are shape-only.
-    let (total, returned, excluded) = (
-        u64::try_from(total).map_err(|_| ErrorCode::Internal)?,
-        ids.len() as u64,
-        u64::try_from(excluded_secret).map_err(|_| ErrorCode::Internal)?,
-    );
-
-    match ExactEnumeration::new(entry.predicate_id(), total, returned, excluded) {
-        Ok(e) => Ok(ExactCensusOutcome {
-            census: CensusResult::enumerated(e),
-            returned_ids: ids,
-        }),
-        // The constructor refusing our own readout means the three statements disagree beyond
-        // what one snapshot allows — that *is* a failed census (§22.4 trigger 4), not a
-        // transport error.
-        Err(_) => Ok(ExactCensusOutcome {
-            census: CensusResult::failed(),
-            returned_ids: Vec::new(),
-        }),
+    let outcome = census_in_txn(
+        &mut txn,
+        &CensusInputs {
+            predicate_id: entry.predicate_id(),
+            enumerable_scope: entry.enumerable_scope(),
+            sql_predicate: entry.sql_predicate(),
+            authorization: &authorization,
+            workspace: requested_workspace,
+            stream,
+            subject_id: None,
+        },
+    )
+    .await;
+    match outcome {
+        Ok(outcome) => {
+            txn.commit().await.map_err(|_| ErrorCode::Internal)?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            // Commit rather than roll back: the transaction only read.
+            let _ = txn.commit().await;
+            Err(error)
+        }
     }
 }
 

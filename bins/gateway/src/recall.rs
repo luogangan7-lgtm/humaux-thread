@@ -51,10 +51,9 @@ use humaux_protocol::{
 use humaux_retrieval::{
     completeness::{CensusResult, FreshnessClass, LedgerClosure},
     envelope::{
-        CompletenessBlock, CompletenessInputs, CountScope, Envelope, EvidenceBlock, FreshnessBlock,
-        KnowledgeBlock, LaneStatus, MandatoryReport, PendingEnvelope, PinnedReport, PipelineBlock,
-        ProfileBlock, ProvenanceBlock, ProvenanceValue, build_projection_block,
-        envelope_outcome_block,
+        CompletenessBlock, CompletenessInputs, Envelope, FreshnessBlock, LaneStatus,
+        MandatoryReport, PendingEnvelope, PinnedReport, PipelineBlock, ProfileBlock,
+        ProvenanceBlock, ProvenanceValue, build_projection_block, envelope_outcome_block,
     },
     planner::{PlannerDecision, QueryClass},
 };
@@ -524,15 +523,16 @@ fn accepted_output(
     let returned = u32::try_from(items.len()).map_err(|_| ErrorCode::Internal)?;
     let candidate_count = u32::try_from(candidate_count).map_err(|_| ErrorCode::Internal)?;
     let projection = build_projection_block(&materialized.ledger, visible);
+    // §23.3④ (ADR-0041 D-H): the request's own six-column `StreamKey` ledger, counted in the
+    // same RR snapshot that closed the ledger and hydrated the bodies. `classify()` maps this
+    // route's `PlannerDecision::Class(_)` to `SemanticBounded`, so — unlike `memory.enumerate`
+    // — no census travels with these counts and §22.0's exact-without-a-predicate trap is not
+    // on this path. What they buy is the removal of `count_unknown`: the one reading that kept
+    // a healthy semantic read at `cannot_establish` after card 18 made its ratio real.
+    let (evidence, knowledge) = materialized.pipeline.blocks();
     let pipeline = PipelineBlock {
-        evidence: EvidenceBlock::no_batch(None, CountScope::AuthorizedView),
-        knowledge: KnowledgeBlock {
-            eligible: None,
-            processed: None,
-            waiting_key: None,
-            failed: None,
-            count_scope: CountScope::AuthorizedView,
-        },
+        evidence,
+        knowledge,
         projection: projection.value,
     };
     let provenance = ProvenanceBlock {

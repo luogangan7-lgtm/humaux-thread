@@ -1252,6 +1252,35 @@ fn assert_context_response(
         binary,
         humaux_retrieval::request::RetrievalIntent::trusted_context(),
     );
+    // §23.3④ / ADR-0041 D-H: `context.assemble` reads `projection.stream_log` for the
+    // request's own six-column `StreamKey` in the manifest's snapshot. This fixture has no
+    // semantic runtime, so §23.1②'s missing index count still holds the class at
+    // `cannot_establish` — but the reason is no longer `count_unknown`, and these five are
+    // real `0`s of an empty ledger where they used to be `null`s.
+    assert_ne!(
+        content["completeness"]["reason"], "count_unknown",
+        "the pipeline half is established now — whatever still holds this fixture at \
+         cannot_establish (a failed mandatory lane, or card 18's missing index count), it is \
+         no longer a missing count: {content}"
+    );
+    for (block, field) in [
+        ("evidence", "persisted"),
+        ("knowledge", "eligible"),
+        ("knowledge", "processed"),
+        ("knowledge", "waiting_key"),
+        ("knowledge", "failed"),
+    ] {
+        assert_eq!(content["pipeline"][block][field], 0, "{content}");
+        assert_eq!(
+            content["pipeline"][block]["count_scope"], "stream_ledger",
+            "{content}"
+        );
+    }
+    assert_eq!(
+        content["pipeline"]["evidence"]["expected"],
+        Value::Null,
+        "§23.1①: no batch_id ⇒ expected stays null: {content}"
+    );
 }
 
 fn assert_memory_response(response: &Value, memory_id: Uuid, top_k: u32, binary: &std::path::Path) {
@@ -1273,6 +1302,21 @@ fn assert_memory_response(response: &Value, memory_id: Uuid, top_k: u32, binary:
         json!(["direct_get"])
     );
     assert!(content["completeness"]["exact"].is_null());
+    // §23.3④ / ADR-0041 D-D: `memory.get` is the ONE read route whose pipeline counts stay
+    // unknown, and it is not an oversight — a DirectGet establishes no census, `classify()`
+    // maps `DirectGet` to `Exact`, and §22.0 makes `exact` without a `predicate_id` a hard
+    // 5xx. Filling these five with numbers (recall and context.assemble now do, D-H) is what
+    // would put this route on that path. Pinned here so that move cannot happen quietly.
+    assert!(content["pipeline"]["evidence"]["persisted"].is_null());
+    assert!(content["pipeline"]["knowledge"]["eligible"].is_null());
+    assert_eq!(
+        content["pipeline"]["evidence"]["count_scope"],
+        "authorized_view"
+    );
+    assert_eq!(
+        content["pipeline"]["knowledge"]["count_scope"],
+        "authorized_view"
+    );
 }
 
 fn assert_tool_response(response: &Value, tool: ToolName) -> &Value {
@@ -1310,6 +1354,10 @@ fn assert_read_envelope(
         json!({"fixture":"operation receipt scoped context"})
     );
     assert_read_envelope_metadata(content, 1, top_k, binary, intent);
+    // §22.4: neither of these two routes enumerates an authorized universe, so neither
+    // publishes a proven lower bound. The pipeline half now differs between them and is
+    // asserted by each caller (ADR-0041 D-D vs D-H).
+    assert!(content["completeness"]["known_lower_bound"].is_null());
 }
 
 fn assert_read_envelope_metadata(
@@ -1322,13 +1370,13 @@ fn assert_read_envelope_metadata(
     use std::io::Read;
     assert_eq!(content["completeness"]["class"], "cannot_establish");
     assert_eq!(content["completeness"]["returned"], returned);
-    assert!(content["completeness"]["known_lower_bound"].is_null());
     assert_eq!(content["grounding"]["current"], returned);
     assert_eq!(content["grounding"]["not_judged"], 0);
+    // No semantic runtime in these fixtures ⇒ §23.1②'s index count is legitimately
+    // unavailable, so no route here can state a ratio (card 18). The census / pipeline-count
+    // half differs per route and is asserted by each caller (ADR-0041 D-D/D-E).
     assert!(content["pipeline"]["projection"]["visible"].is_null());
     assert!(content["pipeline"]["projection"]["completeness_ratio"].is_null());
-    assert!(content["pipeline"]["evidence"]["persisted"].is_null());
-    assert!(content["pipeline"]["knowledge"]["eligible"].is_null());
     assert_eq!(content["freshness"]["class"], "unknown");
     let provenance = &content["provenance"];
     for field in [
@@ -1401,6 +1449,31 @@ fn assert_enumeration_response(response: &Value, expected: &[Uuid]) -> Option<St
     );
     assert_eq!(content["mandatory"], json!({"state":"not_run"}));
     assert_eq!(content["pinned"], json!({"state":"not_run"}));
+    // §22.1 / §23.3④ (ADR-0041): this route DID count its own authorized universe in the
+    // manifest's snapshot, so §22.4's proven lower bound exists even while §23.1②'s missing
+    // index count keeps the class at cannot_establish — and both pipeline blocks are real
+    // `stream_ledger` readings of this fixture's (empty) stream ledger, not `null`s.
+    assert_eq!(
+        content["completeness"]["known_lower_bound"],
+        expected.len(),
+        "§22.4 'at least N': {response}"
+    );
+    for block in ["evidence", "knowledge"] {
+        assert_eq!(
+            content["pipeline"][block]["count_scope"], "stream_ledger",
+            "{response}"
+        );
+    }
+    assert!(
+        content["pipeline"]["evidence"]["persisted"].is_u64(),
+        "{response}"
+    );
+    for field in ["eligible", "processed", "waiting_key", "failed"] {
+        assert!(
+            content["pipeline"]["knowledge"][field].is_u64(),
+            "{response}"
+        );
+    }
     let cursor = value["pagination"]["next_cursor"]
         .as_str()
         .map(str::to_owned);
@@ -1702,7 +1775,10 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 &prefix,
                 &wire,
                 &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
-                48,
+                // 48 covered the assertion legs; ADR-0041 D-I's 2 x 30 timed calls need the
+                // headroom, and `quota_repo::issue_window` refuses to re-issue mid-test.
+                // Nothing in this test asserts exhaustion — the ceiling is not the subject.
+                200,
             );
             let first = handle.seed_workspace_visible_context_record();
             let second = handle.seed_workspace_visible_context_record();
@@ -1916,26 +1992,62 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                         .is_empty(),
                     "nothing is lost here: {no_token}"
                 );
-                // What remains, pinned so the next card that moves it has to come through
-                // here. `count_unknown` is the OTHER `cannot_establish` trigger, and it is
-                // **mandated**, not tolerated: §23.3④ (`Baseline_2.9.md:5757-5759`) 「缺必要读数
-                // 为 `count_unknown` … 使完整 envelope 为 `cannot_establish`」, and the same
-                // section's 「没有独立 census 的对象读取不生成 `exact`」. No read route reads
-                // `evidence.persisted` or the four `knowledge.*` counts in
-                // `CountScope::StreamLedger`; each declares `AuthorizedView` with `None`s on
-                // purpose (a page length is not an independent pipeline census — see
-                // `accept_memory_envelope`'s own note), and §23.3④ separately forbids the one
-                // derivation that would flip this today: 「禁止填 `0`、返回条数、
-                // `issued_highwater` 或其他块的值充数」. So this assertion is not a bug being
-                // pinned; it is the census debt being held in place while §23.1②'s projection
-                // side — the block asserted just above — is fully established underneath it.
-                // Moving it requires a real evidence/knowledge census (nothing writes
-                // `stream_checkpoints.evidence_highwater` / `knowledge_highwater` today), which
-                // is a different card. See ADR-0040's Consequences.
+                // Card 19 follow-up / ADR-0041 D-H: the other half. Card 18 made §23.1②'s
+                // ratio real and this read still answered `cannot_establish/count_unknown`,
+                // because no read route read `evidence.persisted` or the four `knowledge.*`
+                // counts in `CountScope::StreamLedger`. `recall.search` now does, in the same
+                // RR snapshot that closed its ledger and hydrated its bodies.
+                //
+                // §59 freezes the class vocabulary at four and §22.5 owns the degrade
+                // direction; `classify()`'s frozen map sends this route's
+                // `PlannerDecision::Class(_)` to `SemanticBounded` (never `Exact` — a
+                // dense-recall answer has no enumerable universe, and §22.2/§22.3 never
+                // defined a partial claim for it). So with A1/A2 closed, a live `visible`
+                // count and a §23.3④ chain that closes, `semantic_bounded` with `reason =
+                // null` is the ONE honest answer here — and §22.4 scopes `known_lower_bound`
+                // to `cannot_establish`, so it stays null.
                 assert_eq!(
-                    no_token["completeness"]["reason"], "count_unknown",
+                    no_token["completeness"]["class"], "semantic_bounded",
+                    "§59/§22.5: a bounded semantic read with every reading present is \
+                     `semantic_bounded`, not `cannot_establish`: {no_token}"
+                );
+                assert_eq!(
+                    no_token["completeness"]["reason"],
+                    Value::Null,
+                    "§22.4 attaches a reason to `cannot_establish` alone: {no_token}"
+                );
+                assert_eq!(
+                    no_token["completeness"]["exact"],
+                    Value::Null,
+                    "§22.0: only an `exact` class carries the enumeration block: {no_token}"
+                );
+                assert_eq!(
+                    no_token["completeness"]["known_lower_bound"],
+                    Value::Null,
+                    "§22.4 scopes 'at least N' to cannot_establish: {no_token}"
+                );
+                // §23.3④: real readings in the declared universe, not `0`s standing in for
+                // unknowns ("禁止填 `0`、返回条数、`issued_highwater` 或其他块的值充数") —
+                // this fixture's ledger genuinely holds three settled rows.
+                assert_eq!(
+                    no_token["pipeline"]["evidence"]["count_scope"], "stream_ledger",
                     "{no_token}"
                 );
+                assert_eq!(
+                    no_token["pipeline"]["knowledge"]["count_scope"], "stream_ledger",
+                    "{no_token}"
+                );
+                assert_eq!(
+                    no_token["pipeline"]["evidence"]["expected"],
+                    Value::Null,
+                    "§23.1①: no batch_id ⇒ expected stays null, never backfilled: {no_token}"
+                );
+                assert_eq!(no_token["pipeline"]["evidence"]["persisted"], 3, "{no_token}");
+                assert_eq!(no_token["pipeline"]["knowledge"]["eligible"], 3, "{no_token}");
+                assert_eq!(no_token["pipeline"]["knowledge"]["processed"], 3, "{no_token}");
+                assert_eq!(no_token["pipeline"]["knowledge"]["waiting_key"], 0, "{no_token}");
+                assert_eq!(no_token["pipeline"]["knowledge"]["failed"], 0, "{no_token}");
+                assert_eq!(no_token["pipeline"]["projection"]["expected"], 3, "{no_token}");
 
                 // A2 InvisibleLoss, forced: one more settled ledger row with no point behind it.
                 // The ratio must MOVE and stay a number — "cannot_establish" would hide the loss
@@ -1978,18 +2090,52 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 // — leaves every other test in this file green, because every other fixture
                 // builds the app WITHOUT a semantic runtime and so legitimately reports `None`.
                 // This is the only fixture in the suite where the face exists at all.
-                for (route, tool, arguments) in [
+                //
+                // Card 19 follow-up / ADR-0041 D-H rides along: each route's final class is
+                // pinned here too, because the three are now genuinely different and each one
+                // is mandated rather than tolerated. `memory.enumerate` is `exact` (§22.0, a
+                // registered predicate over a counted universe); `memory.get` stays
+                // `cannot_establish/count_unknown` BY CONSTRUCTION (ADR-0041 D-D: `classify()`
+                // maps DirectGet to `Exact`, §22.0 makes `exact` without a `predicate_id` a
+                // hard 5xx, so its unknown counts are the only legal answer for an object
+                // read) — whoever "finishes the job" by filling memory.get's five counts turns
+                // this row red instead of shipping a 500.
+                //
+                // `context.assemble` is the route that does NOT reach `semantic_bounded`, and
+                // the blocker is not its pipeline half: §22.4's lane trigger is checked inside
+                // `classify()` BEFORE `planner_output` is read at all, and this route's
+                // mandatory lane is `failed` on EVERY deployment because
+                // `context_repo::fetch_frozen_in_txn` emits `SelectorOutcome::Unavailable` for
+                // two of §25's five selectors (`TaskExplicitContextV1`,
+                // `RequiredCurrentStateFacetsV1`) — neither has a WHERE clause yet, so
+                // `handoff.unavailable_selectors` is never empty. That was already this
+                // route's answer before ADR-0041 D-H, which is why D-H's "both at
+                // count_unknown" reads wrong for it. What the wiring buys here is the counts
+                // asserted below plus the disappearance of `count_unknown` from the reason
+                // chain; implement those two selectors and this row becomes `semantic_bounded`
+                // with no further envelope change.
+                for (route, tool, arguments, class, reason) in [
                     (
                         "memory.get",
                         "memory",
                         json!({"action":"get","memory_id":first.memory_id,"workspace_id":workspace_id}),
+                        "cannot_establish",
+                        json!("count_unknown"),
                     ),
                     (
                         "memory.enumerate",
                         "memory",
                         json!({"action":"enumerate","workspace_id":workspace_id,"limit":100}),
+                        "exact",
+                        Value::Null,
                     ),
-                    ("context.assemble", "context", json!({"workspace_id":workspace_id})),
+                    (
+                        "context.assemble",
+                        "context",
+                        json!({"workspace_id":workspace_id}),
+                        "cannot_establish",
+                        json!("lane_failed"),
+                    ),
                 ] {
                     let (status, response) =
                         tool_call(address, tool, &credential.bearer, arguments).await;
@@ -2029,7 +2175,450 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                         value["completeness"]["reason"], "index_count_unavailable",
                         "{route}: {value}"
                     );
+                    assert_eq!(
+                        value["completeness"]["class"], class,
+                        "{route} must answer {class}: {value}"
+                    );
+                    assert_eq!(
+                        value["completeness"]["reason"], reason,
+                        "{route}: {value}"
+                    );
+                    // The two routes that moved carry real `stream_ledger` readings of this
+                    // fixture's three settled rows; `memory.get` carries none, on purpose.
+                    if route != "memory.get" {
+                        assert_ne!(
+                            value["completeness"]["reason"], "count_unknown",
+                            "{route}: ADR-0041 D-H removed the missing-count reason from the \
+                             two routes that can have counts: {value}"
+                        );
+                    }
+                    let expect_counts = route != "memory.get";
+                    assert_eq!(
+                        value["pipeline"]["evidence"]["persisted"],
+                        if expect_counts { json!(3) } else { Value::Null },
+                        "{route}: {value}"
+                    );
+                    assert_eq!(
+                        value["pipeline"]["knowledge"]["eligible"],
+                        if expect_counts { json!(3) } else { Value::Null },
+                        "{route}: {value}"
+                    );
+                    assert_eq!(
+                        value["pipeline"]["knowledge"]["processed"],
+                        if expect_counts { json!(3) } else { Value::Null },
+                        "{route}: {value}"
+                    );
+                    assert_eq!(
+                        value["pipeline"]["evidence"]["count_scope"],
+                        if expect_counts { "stream_ledger" } else { "authorized_view" },
+                        "§23.3④ pins the scope label to the numbers: {route}: {value}"
+                    );
+                    assert_eq!(
+                        value["pipeline"]["knowledge"]["count_scope"],
+                        if expect_counts { "stream_ledger" } else { "authorized_view" },
+                        "{route}: {value}"
+                    );
                 }
+
+                // ADR-0041 D-I speed record: what the two `projection.stream_log`
+                // aggregates cost these two routes end to end. Same fixture, same three
+                // settled rows; run once with the wiring and once with the counts stubbed
+                // back to `None` for the before/after pair.
+                let mut recall_samples = Vec::new();
+                let mut context_samples = Vec::new();
+                for _ in 0..30 {
+                    let start = std::time::Instant::now();
+                    let (status, timed) = recall_call(
+                        address,
+                        Some(&credential.bearer),
+                        json!({"query":query,"workspace_id":workspace_id,"mode":"semantic"}),
+                    )
+                    .await;
+                    recall_samples.push(start.elapsed());
+                    assert_eq!(status, 200, "timed recall: {timed}");
+                    let start = std::time::Instant::now();
+                    let (status, timed) = tool_call(
+                        address,
+                        "context",
+                        &credential.bearer,
+                        json!({"workspace_id":workspace_id}),
+                    )
+                    .await;
+                    context_samples.push(start.elapsed());
+                    assert_eq!(status, 200, "timed context.assemble: {timed}");
+                }
+                recall_samples.sort_unstable();
+                context_samples.sort_unstable();
+                eprintln!(
+                    "ADR-0041 D-I p50/p95 (n=30, ms): recall.search {}/{} · context.assemble \
+                     {}/{}",
+                    recall_samples[14].as_millis(),
+                    recall_samples[28].as_millis(),
+                    context_samples[14].as_millis(),
+                    context_samples[28].as_millis()
+                );
+
+                // ------------------------------------------------------------------
+                // Card 19 / ADR-0041: the §22.1 EXACT census, live.
+                //
+                // This is the ONLY fixture in the suite where every input `class = exact`
+                // needs exists at once: a real Qdrant `visible` count (card 18 — without it
+                // §23.1②'s ratio is null and the envelope is correctly
+                // `cannot_establish/index_count_unavailable` whatever the census says) AND a
+                // stream ledger whose §23.3④ evidence/knowledge counts close. Every
+                // assertion below was `cannot_establish` / `null` before this card.
+                // ------------------------------------------------------------------
+                // The whole `structuredContent` (`{content, pagination}`), schema-validated:
+                // the census assertions read `content`, the cursor legs read `pagination`.
+                let enumerate_result =
+                    |page: &Value| -> Value { assert_tool_response(page, ToolName::Memory).clone() };
+                let (status, whole) = enumerate_call(
+                    address,
+                    &credential.bearer,
+                    json!({"action":"enumerate","workspace_id":workspace_id,"limit":100}),
+                )
+                .await;
+                assert_eq!(status, 200, "unpaginated authorized enumeration: {whole}");
+                let whole = enumerate_result(&whole)["content"].clone();
+                let completeness = &whole["completeness"];
+                assert_eq!(
+                    completeness["class"], "exact",
+                    "§22.1: a registered predicate, a real count(*) in the page's own snapshot, \
+                     a closed ledger and a live index count leave exactly one honest class: \
+                     {whole}"
+                );
+                assert_eq!(completeness["reason"], Value::Null, "{whole}");
+                let returned = completeness["returned"].as_u64().expect("returned");
+                assert_eq!(returned, 3, "the fixture's three active memories: {whole}");
+                let exact = &completeness["exact"];
+                assert_eq!(
+                    exact["predicate_id"], "authorized_memory_enumeration_v1",
+                    "§22.0: the wire block names the predicate its denominator came from: \
+                     {whole}"
+                );
+                assert_eq!(
+                    exact["total"], 3,
+                    "total is its own count(*), not the page length: {whole}"
+                );
+                assert_eq!(exact["returned"], 3, "{whole}");
+                assert_eq!(exact["coverage"], 1.0, "unpaginated ⇒ coverage 1.0: {whole}");
+                assert_eq!(exact["truncated"], false, "{whole}");
+                assert_eq!(exact["excluded_secret"], 0, "{whole}");
+                assert_eq!(
+                    completeness["known_lower_bound"], Value::Null,
+                    "§22.4 scopes the lower bound to cannot_establish — an exact answer does \
+                     not also publish 'at least N': {whole}"
+                );
+                // §23.3④: the two pipeline blocks are real `stream_ledger` readings now, and
+                // the chain they must satisfy is `evidence.persisted == knowledge.eligible ==
+                // projection.expected` with `processed + waiting_key + failed == eligible`.
+                let pipeline = &whole["pipeline"];
+                assert_eq!(pipeline["evidence"]["count_scope"], "stream_ledger", "{whole}");
+                assert_eq!(
+                    pipeline["knowledge"]["count_scope"], "stream_ledger",
+                    "{whole}"
+                );
+                assert_eq!(
+                    pipeline["evidence"]["expected"], Value::Null,
+                    "§23.1①: no batch_id ⇒ expected stays null, never backfilled from \
+                     persisted: {whole}"
+                );
+                assert_eq!(pipeline["evidence"]["persisted"], 3, "{whole}");
+                assert_eq!(pipeline["knowledge"]["eligible"], 3, "{whole}");
+                assert_eq!(pipeline["knowledge"]["processed"], 3, "{whole}");
+                assert_eq!(pipeline["knowledge"]["waiting_key"], 0, "{whole}");
+                assert_eq!(pipeline["knowledge"]["failed"], 0, "{whole}");
+                assert_eq!(pipeline["projection"]["expected"], 3, "{whole}");
+
+                // §23.1④ negative control: the count and the page must come out of ONE
+                // snapshot. A memory inserted between page 1 and page 2 must NOT move the
+                // frozen manifest's total — if the census were re-counted per page (or taken
+                // outside the minting transaction) this insert would raise it to 4 and the
+                // ratio would drift across pages of one immutable manifest.
+                let (status, first_page) = enumerate_call(
+                    address,
+                    &credential.bearer,
+                    json!({"action":"enumerate","workspace_id":workspace_id,"limit":2}),
+                )
+                .await;
+                assert_eq!(status, 200, "page 1 of 2: {first_page}");
+                let first_page = enumerate_result(&first_page);
+                assert_eq!(
+                    first_page["content"]["completeness"]["class"], "exact",
+                    "{first_page}"
+                );
+                assert_eq!(
+                    first_page["content"]["completeness"]["exact"]["total"], 3,
+                    "{first_page}"
+                );
+                assert_eq!(
+                    first_page["content"]["completeness"]["exact"]["returned"], 2,
+                    "{first_page}"
+                );
+                assert_eq!(
+                    first_page["content"]["completeness"]["exact"]["truncated"], true,
+                    "§22.1: 2 of 3 returned with nothing excluded IS truncated: {first_page}"
+                );
+                let page_cursor = first_page["pagination"]["next_cursor"]
+                    .as_str()
+                    .expect("a 2-of-3 page continues")
+                    .to_owned();
+                let concurrent = tokio::task::block_in_place(|| {
+                    handle.seed_workspace_visible_context_record()
+                });
+                let (status, second_page) = enumerate_call(
+                    address,
+                    &credential.bearer,
+                    json!({"action":"enumerate","workspace_id":workspace_id,"limit":2,
+                           "cursor":page_cursor}),
+                )
+                .await;
+                assert_eq!(status, 200, "frozen continuation: {second_page}");
+                let second_page = enumerate_result(&second_page)["content"].clone();
+                assert_eq!(second_page["completeness"]["class"], "exact", "{second_page}");
+                assert_eq!(
+                    second_page["completeness"]["exact"]["total"], 3,
+                    "§22.1/§23.1④: the manifest's denominator was frozen with the manifest — a \
+                     concurrent insert does not move it: {second_page}"
+                );
+                assert_eq!(
+                    second_page["completeness"]["exact"]["returned"], 1,
+                    "{second_page}"
+                );
+                // A fresh manifest, by contrast, MUST see the insert — otherwise the frozen
+                // total above would be proving staleness rather than snapshot discipline.
+                let (status, fresh) = enumerate_call(
+                    address,
+                    &credential.bearer,
+                    json!({"action":"enumerate","workspace_id":workspace_id,"limit":100}),
+                )
+                .await;
+                assert_eq!(status, 200, "fresh manifest: {fresh}");
+                let fresh = enumerate_result(&fresh)["content"].clone();
+                assert_eq!(
+                    fresh["completeness"]["exact"]["total"], 4,
+                    "a NEW snapshot counts the concurrent insert: {fresh}"
+                );
+
+                // §22.4 trigger 4, injected: a manifest whose frozen readout is gone (a
+                // pre-0165 snapshot, or a mint whose census failed) degrades to
+                // cannot_establish/census_failed and publishes NO total — never a silent 0.
+                let (status, degrade_first) = enumerate_call(
+                    address,
+                    &credential.bearer,
+                    json!({"action":"enumerate","workspace_id":workspace_id,"limit":2}),
+                )
+                .await;
+                assert_eq!(status, 200, "census-failure page 1: {degrade_first}");
+                let degrade_first = enumerate_result(&degrade_first);
+                let degrade_cursor = degrade_first["pagination"]["next_cursor"]
+                    .as_str()
+                    .expect("continuation for the census-failure leg")
+                    .to_owned();
+                let degrade_snapshot = Uuid::parse_str(
+                    degrade_first["pagination"]["snapshot_id"]
+                        .as_str()
+                        .expect("snapshot id"),
+                )
+                .expect("snapshot uuid");
+                tokio::task::block_in_place(|| {
+                    handle
+                        .admin
+                        .execute(
+                            "UPDATE ops.selection_snapshots SET census_predicate_id=NULL, \
+                               census_total=NULL, census_excluded_secret=NULL \
+                             WHERE selection_snapshot_id=$1",
+                            &[&degrade_snapshot],
+                        )
+                        .expect("owner drops this manifest's frozen census readout");
+                });
+                let (status, censusless) = enumerate_call(
+                    address,
+                    &credential.bearer,
+                    json!({"action":"enumerate","workspace_id":workspace_id,"limit":2,
+                           "cursor":degrade_cursor}),
+                )
+                .await;
+                assert_eq!(status, 200, "censusless continuation: {censusless}");
+                let censusless = enumerate_result(&censusless)["content"].clone();
+                assert_eq!(
+                    censusless["completeness"]["class"], "cannot_establish",
+                    "{censusless}"
+                );
+                assert_eq!(
+                    censusless["completeness"]["reason"], "census_failed",
+                    "{censusless}"
+                );
+                assert_eq!(
+                    censusless["completeness"]["exact"], Value::Null,
+                    "§22.1: no census ⇒ no total, not a total of 0: {censusless}"
+                );
+                assert_eq!(
+                    censusless["completeness"]["known_lower_bound"], Value::Null,
+                    "nothing was counted, so there is no proven lower bound either: \
+                     {censusless}"
+                );
+
+                // §23.3④ pipeline fault, injected — the census debt card 18 folded in here,
+                // now measurable in both directions. ONE more issued ticket that has not
+                // settled yet (`ISSUED`, seq 4, watermark 4) keeps §23.1②'s A1 closed
+                // (`done + open_gaps + pending == expected`) and keeps A2 closed, so the
+                // projection block still states a ratio — but the knowledge partition no
+                // longer covers its own base (`processed + waiting_key + failed = 3 != 4 =
+                // eligible`), which is precisely the reading §23.3④ says must make the whole
+                // envelope cannot_establish. Work in flight is not "processed", and reporting
+                // it as such is the "填数充数" that section forbids.
+                tokio::task::block_in_place(|| {
+                    let commit_seq: i64 = handle
+                        .admin
+                        .query_one("SELECT nextval('ops.commit_seq_seq')", &[])
+                        .expect("owner allocates the in-flight commit sequence")
+                        .get(0);
+                    handle
+                        .admin
+                        .execute(
+                            "INSERT INTO projection.stream_log \
+                               (tenant_id,scope_kind,scope_id,domain,projection_kind, \
+                                projection_version,stream_seq,commit_seq,state) \
+                             VALUES($1,'workspace',$2,'knowledge','ingest','v1',4,$3,'ISSUED')",
+                            &[&handle.tenant_id, &handle.workspace_id, &commit_seq],
+                        )
+                        .expect("owner issues one not-yet-settled ticket");
+                    handle
+                        .admin
+                        .execute(
+                            "UPDATE projection.stream_checkpoints SET issued_highwater=4 \
+                             WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2 \
+                               AND domain='knowledge' AND projection_kind='ingest' \
+                               AND projection_version='v1'",
+                            &[&handle.tenant_id, &handle.workspace_id],
+                        )
+                        .expect("owner admits the in-flight ticket");
+                });
+                let (status, inflight) = enumerate_call(
+                    address,
+                    &credential.bearer,
+                    json!({"action":"enumerate","workspace_id":workspace_id,"limit":100}),
+                )
+                .await;
+                assert_eq!(status, 200, "in-flight pipeline: {inflight}");
+                let inflight = enumerate_result(&inflight)["content"].clone();
+                assert_eq!(
+                    inflight["pipeline"]["projection"]["completeness_ratio"], 0.75,
+                    "A1/A2 still hold — this fault is in the knowledge layer, not §23.1②: \
+                     {inflight}"
+                );
+                assert_eq!(
+                    inflight["pipeline"]["knowledge"]["eligible"], 4,
+                    "{inflight}"
+                );
+                assert_eq!(
+                    inflight["pipeline"]["knowledge"]["processed"], 3,
+                    "{inflight}"
+                );
+                assert_eq!(
+                    inflight["completeness"]["class"], "cannot_establish",
+                    "stop establishing the census and the class goes back where card 18 left \
+                     it: {inflight}"
+                );
+                assert_eq!(
+                    inflight["completeness"]["reason"], "pipeline_count_mismatch",
+                    "§23.3④'s own reason for a known-but-contradictory chain: {inflight}"
+                );
+                assert_eq!(inflight["completeness"]["exact"], Value::Null, "{inflight}");
+                assert_eq!(
+                    inflight["completeness"]["known_lower_bound"], 4,
+                    "§22.4: the census counted, a later trigger blocked the class — what \
+                     survives is 'at least N', never a silent 0: {inflight}"
+                );
+                // The SAME fault on the two routes ADR-0041 D-H moved. For `recall.search`
+                // this is the inversion of the whole wiring: the counts it now reads are the
+                // ONLY reason it left `cannot_establish`, so a ledger whose knowledge
+                // partition stops covering its own base must put it straight back — with
+                // §23.3④'s own reason (`pipeline_count_mismatch`: the counts are known here
+                // and they disagree, which is a different verdict from `count_unknown`) and
+                // never with a `semantic_bounded` that outlives its evidence.
+                //
+                // For `context.assemble` the class cannot move, and saying so is the point:
+                // §22.4's lane trigger already holds it at `lane_failed` (see the three-route
+                // loop above), and `classify()` checks lane before planner, so its class is
+                // insensitive to this fault by construction. What must still move are the two
+                // blocks — a route that kept reporting `eligible = 3` here would be publishing
+                // a reading it did not take.
+                for (route, tool, class, reason, arguments) in [
+                    ("recall.search", "recall", "cannot_establish", "pipeline_count_mismatch",
+                     json!({"query":query,"workspace_id":workspace_id,"mode":"semantic"})),
+                    ("context.assemble", "context", "cannot_establish", "lane_failed",
+                     json!({"workspace_id":workspace_id})),
+                ] {
+                    let (status, faulted) =
+                        tool_call(address, tool, &credential.bearer, arguments).await;
+                    assert_eq!(status, 200, "{route} under the in-flight fault: {faulted}");
+                    let faulted = assert_tool_response(
+                        &faulted,
+                        if tool == "recall" { ToolName::Recall } else { ToolName::Context },
+                    );
+                    let faulted = if faulted["pipeline"].is_null() {
+                        &faulted["content"]
+                    } else {
+                        faulted
+                    };
+                    assert_eq!(
+                        faulted["pipeline"]["projection"]["completeness_ratio"], 0.75,
+                        "A1/A2 still hold — the fault is in the knowledge layer: {faulted}"
+                    );
+                    assert_eq!(faulted["pipeline"]["evidence"]["persisted"], 4, "{faulted}");
+                    assert_eq!(faulted["pipeline"]["knowledge"]["eligible"], 4, "{faulted}");
+                    assert_eq!(faulted["pipeline"]["knowledge"]["processed"], 3, "{faulted}");
+                    assert_eq!(
+                        faulted["completeness"]["class"], class,
+                        "{route}: {faulted}"
+                    );
+                    assert_eq!(
+                        faulted["completeness"]["reason"], reason,
+                        "{route}: {faulted}"
+                    );
+                    assert_eq!(
+                        faulted["completeness"]["known_lower_bound"],
+                        Value::Null,
+                        "{route} enumerates nothing, so it proves no lower bound either: \
+                         {faulted}"
+                    );
+                }
+
+                // Hand the fixture back exactly as the legs below expect it: the in-flight
+                // ticket gone, the watermark back on its three settled rows, the
+                // concurrent-insert control row out of the authorized universe.
+                tokio::task::block_in_place(|| {
+                    handle
+                        .admin
+                        .execute(
+                            "DELETE FROM projection.stream_log \
+                              WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2 \
+                                AND domain='knowledge' AND projection_kind='ingest' \
+                                AND projection_version='v1' AND stream_seq=4",
+                            &[&handle.tenant_id, &handle.workspace_id],
+                        )
+                        .expect("owner withdraws the in-flight ticket");
+                    handle
+                        .admin
+                        .execute(
+                            "UPDATE projection.stream_checkpoints SET issued_highwater=3 \
+                             WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2 \
+                               AND domain='knowledge' AND projection_kind='ingest' \
+                               AND projection_version='v1'",
+                            &[&handle.tenant_id, &handle.workspace_id],
+                        )
+                        .expect("owner restores the fixture watermark");
+                    handle
+                        .admin
+                        .execute(
+                            "UPDATE private.memory_records SET status='revoked' \
+                             WHERE memory_id=$1",
+                            &[&concurrent.memory_id],
+                        )
+                        .expect("owner removes the concurrent-insert control row");
+                });
 
                 // §6.1.3/ADR-0029 D-C: subject-scoped recall through the real Gateway + real
                 // Qdrant prefilter + real PG hydrate re-check. `second` carries A in its Qdrant
@@ -4244,7 +4833,154 @@ async fn assert_enumeration_cursor_denials(
     );
 }
 
+/// Card 19 / ADR-0041, the half of the census that is observable WITHOUT a semantic runtime.
+/// These fixtures have none, so §23.1②'s `visible` is legitimately unavailable and the class
+/// stays `cannot_establish/index_count_unavailable` (card 18's assertion, unchanged). What the
+/// census still proves here: §22.4's lower bound exists, and §23.3④'s two pipeline blocks are
+/// real `stream_ledger` readings of this fixture's empty stream ledger instead of `null`s.
+fn assert_census_without_index_count(response: &Value, returned: u64) {
+    let envelope = &response["result"]["structuredContent"]["content"];
+    assert_eq!(
+        envelope["completeness"]["reason"], "index_count_unavailable",
+        "{response}"
+    );
+    assert_eq!(
+        envelope["completeness"]["known_lower_bound"], returned,
+        "§22.4: a census that counted before a later trigger blocked the class still proves \
+         'at least N': {response}"
+    );
+    assert_eq!(
+        envelope["completeness"]["exact"],
+        Value::Null,
+        "§22.0: a non-exact class never carries the enumeration block: {response}"
+    );
+    for (block, field) in [
+        ("evidence", "persisted"),
+        ("knowledge", "eligible"),
+        ("knowledge", "processed"),
+        ("knowledge", "waiting_key"),
+        ("knowledge", "failed"),
+    ] {
+        assert_eq!(
+            envelope["pipeline"][block][field], 0,
+            "§23.3④: {block}.{field} is a real reading of an empty ledger, not the `null` that \
+             made every read cannot_establish/count_unknown: {response}"
+        );
+        assert_eq!(
+            envelope["pipeline"][block]["count_scope"], "stream_ledger",
+            "{response}"
+        );
+    }
+}
+
+/// Waits until a minting transaction is demonstrably parked on `context_repo`'s census barrier
+/// (ADR-0041 D-G) — `pg_locks` reassembles a bigint advisory key as `classid << 32 | objid`, and
+/// the caller keeps its key below 2^31 so `classid` is `0` — then commits one more authorized
+/// memory into that window and releases. The returned row is therefore younger than the mint's
+/// snapshot and older than the census statement that follows it: the only insert that can tell
+/// "counted in the page's snapshot" apart from "counted in a fresh transaction right after it".
+fn commit_into_mint_window(handle: &mut Handle, barrier_key: i64) -> Uuid {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let parked: i64 = handle
+            .admin
+            .query_one(
+                "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted \
+                   AND ((classid::bigint << 32) | objid::bigint) = $1",
+                &[&barrier_key],
+            )
+            .expect("owner observes the parked minting transaction")
+            .get(0);
+        if parked > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the minting transaction never reached the census barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let raced = handle.seed_workspace_visible_context_record().memory_id;
+    handle
+        .admin
+        .query_one("SELECT pg_advisory_unlock($1)", &[&barrier_key])
+        .expect("release the mint barrier");
+    raced
+}
+
+/// §22.1/§23.1④ read at the source: the readout frozen ON the manifest row this response
+/// paginates (migration 0165), asserted as one all-or-nothing triple.
+fn assert_frozen_census(handle: &mut Handle, response: &Value, total: i64, why: &str) {
+    let snapshot_id = Uuid::parse_str(
+        response["result"]["structuredContent"]["pagination"]["snapshot_id"]
+            .as_str()
+            .expect("snapshot id"),
+    )
+    .expect("snapshot uuid");
+    let row = handle
+        .admin
+        .query_one(
+            "SELECT census_predicate_id,census_total,census_excluded_secret \
+               FROM ops.selection_snapshots WHERE selection_snapshot_id=$1",
+            &[&snapshot_id],
+        )
+        .expect("owner reads the frozen census readout");
+    assert_eq!(
+        (
+            row.get::<_, String>(0),
+            row.get::<_, i64>(1),
+            row.get::<_, i64>(2)
+        ),
+        ("authorized_memory_enumeration_v1".to_owned(), total, 0),
+        "{why}"
+    );
+}
+
+/// Card 19 speed record (ADR-0041, §"Speed"): the two call shapes this card created — a
+/// minting page that runs the census, and a continuation that reads the frozen readout instead
+/// of counting. Each iteration bills two billable reads, so the fixture's entitlement must
+/// cover 2n on top of its own legs.
+async fn record_enumerate_latency(address: SocketAddr, bearer: &str) {
+    let mut minting = Vec::new();
+    let mut continuation = Vec::new();
+    for _ in 0..30 {
+        let start = std::time::Instant::now();
+        let (status, page) =
+            enumerate_call(address, bearer, json!({"action":"enumerate","limit":2})).await;
+        minting.push(start.elapsed());
+        assert_eq!(status, 200, "timed minting page: {page}");
+        let cursor = page["result"]["structuredContent"]["pagination"]["next_cursor"]
+            .as_str()
+            .expect("timed page continues")
+            .to_owned();
+        let start = std::time::Instant::now();
+        let (status, page) = enumerate_call(
+            address,
+            bearer,
+            json!({"action":"enumerate","limit":2,"cursor":cursor}),
+        )
+        .await;
+        continuation.push(start.elapsed());
+        assert_eq!(status, 200, "timed continuation page: {page}");
+    }
+    minting.sort();
+    continuation.sort();
+    eprintln!(
+        "memory.enumerate p50/p95 (n=30, ms): minting (census counted) {}/{} · continuation \
+         (frozen readout, no count) {}/{}",
+        minting[14].as_millis(),
+        minting[28].as_millis(),
+        continuation[14].as_millis(),
+        continuation[28].as_millis()
+    );
+}
+
 #[test]
+// §23.1④ is ONE causal chain — freeze a manifest, insert 20 rows underneath it, page the frozen
+// manifest to exhaustion, then mint a fresh one — and the control only controls anything while
+// its steps stay in that order in one body. The three reusable pieces (the census witness, the
+// frozen readout, the latency record) are already helpers above; what is left is the chain.
+#[allow(clippy::too_many_lines)]
 fn native_mcp_memory_enumeration_freezes_snapshot_and_binds_cursor() {
     let _metrics = CONTEXT_METRIC_TEST_LOCK
         .lock()
@@ -4254,12 +4990,35 @@ fn native_mcp_memory_enumeration_freezes_snapshot_and_binds_cursor() {
         |mut handle| {
             let credential = enumeration_credential(&mut handle, "owner");
             let peer = enumeration_credential(&mut handle, "peer");
-            handle.seed_current_entitlement_and_window(64);
+            // 64 covered the snapshot/cursor legs; the card-19 latency record at the end of
+            // this test bills 60 more billable reads (30 minting + 30 continuation).
+            handle.seed_current_entitlement_and_window(160);
             let other_workspace = handle.seed_workspace();
+            // Acceptance gate, "another user's private memories never raise the authorized
+            // count": a row in THIS workspace's raw universe, owned by a peer and flipped to
+            // USER_PRIVATE. It must stay out of the page AND out of the denominator, so the
+            // frozen readout below is 5 while the table holds 6 active rows.
+            let peer_user = handle.seed_peer_user();
+            let peer_private = handle.seed_workspace_visible_context_record();
+            set_record_user_visibility(&mut handle, &peer_private, peer_user);
             let mut expected: Vec<Uuid> = (0..5)
                 .map(|_| handle.seed_workspace_visible_context_record().memory_id)
                 .collect();
             expected.sort_unstable_by(|a, b| b.cmp(a));
+            let raw_universe: i64 = handle
+                .admin
+                .query_one(
+                    "SELECT count(*) FROM private.memory_records \
+                      WHERE tenant_id=$1 AND status='active' AND superseded_by IS NULL",
+                    &[&handle.tenant_id],
+                )
+                .expect("owner counts the unfiltered universe the census counts over")
+                .get(0);
+            assert_eq!(
+                raw_universe, 6,
+                "the peer's USER_PRIVATE row is really in the table — so a denominator of 5 \
+                 below is authorization narrowing, not a missing fixture row"
+            );
             let runtime_handle = handle.rt.handle().clone();
             let runtime = runtime_handle
                 .block_on(handle.fresh_runtime())
@@ -4278,10 +5037,31 @@ fn native_mcp_memory_enumeration_freezes_snapshot_and_binds_cursor() {
                     assert_enumeration_response(&first, &expected[..1]).expect("next page");
                 let snapshot =
                     first["result"]["structuredContent"]["pagination"]["snapshot_id"].clone();
+                assert_census_without_index_count(&first, 1);
+                tokio::task::block_in_place(|| {
+                    assert_frozen_census(
+                        &mut handle,
+                        &first,
+                        5,
+                        "§22.1: total came from count(*) over the whole AUTHORIZED universe in \
+                         the minting snapshot — not from the 1-row page it returned, and not \
+                         from the 6 rows the table holds: the peer's USER_PRIVATE memory never \
+                         raises the authorized count",
+                    );
+                });
                 let inserted: Vec<Uuid> = tokio::task::block_in_place(|| {
                     (0..20)
                         .map(|_| handle.seed_workspace_visible_context_record().memory_id)
                         .collect()
+                });
+                tokio::task::block_in_place(|| {
+                    assert_frozen_census(
+                        &mut handle,
+                        &first,
+                        5,
+                        "§23.1④ negative control: 20 concurrent inserts must not move an \
+                         immutable manifest's denominator",
+                    );
                 });
                 assert!(
                     inserted.iter().all(|id| *id > expected[0]),
@@ -4339,7 +5119,121 @@ fn native_mcp_memory_enumeration_freezes_snapshot_and_binds_cursor() {
                     fresh["result"]["structuredContent"]["pagination"]["snapshot_id"],
                     snapshot
                 );
+                // ...and the fresh manifest's own frozen denominator DID move, so the
+                // assertion above is snapshot discipline rather than a stale number.
+                tokio::task::block_in_place(|| {
+                    assert_frozen_census(
+                        &mut handle,
+                        &fresh,
+                        25,
+                        "a NEW manifest counts the 20 concurrent inserts",
+                    );
+                });
+                record_enumerate_latency(address, &credential.bearer).await;
                 stop_server(server).await.expect("stop pagination server");
+            });
+        },
+    );
+}
+
+#[test]
+// §22.1/§23.1④'s load-bearing claim is that `total` is counted in the SAME snapshot the page is
+// taken from. An insert that lands after a mint has already returned cannot witness that — a
+// census taken in its own transaction right after the mint commits answers with the same
+// pre-insert number, so the "concurrent insert does not move the total" control above kills
+// "re-count per page" and nothing else. The only insert that separates the two is one committed
+// INSIDE the mint's window, which is what `arm_census_mint_barrier` (ADR-0041 D-G) buys: the
+// mint parks between its id list and its census, a second connection commits a fourth memory,
+// and the census that follows must still say 3 because its snapshot predates that commit. Move
+// the census out of that transaction and this test goes red (frozen readout absent or 4, reason
+// `census_failed`, lower bound gone) while the control above stays green.
+fn native_mcp_memory_enumeration_counts_in_the_page_snapshot() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>(
+        "native_mcp_memory_enumeration_counts_in_the_page_snapshot",
+        |mut handle| {
+            let credential = enumeration_credential(&mut handle, "snapshot");
+            handle.seed_current_entitlement_and_window(8);
+            let mut expected: Vec<Uuid> = (0..3)
+                .map(|_| handle.seed_workspace_visible_context_record().memory_id)
+                .collect();
+            expected.sort_unstable_by(|a, b| b.cmp(a));
+            // Positive and below 2^31 so PostgreSQL's split of a bigint advisory key leaves
+            // `classid = 0`, which is what the `pg_locks` predicate below reassembles.
+            let barrier_key = i64::from(
+                u32::from_be_bytes(
+                    Uuid::new_v4().as_bytes()[..4]
+                        .try_into()
+                        .expect("four bytes of key entropy"),
+                ) >> 1,
+            ) + 1;
+            let runtime_handle = handle.rt.handle().clone();
+            let runtime = runtime_handle
+                .block_on(handle.fresh_runtime())
+                .expect("checked same-snapshot runtime");
+            let app = application(&handle, runtime);
+            runtime_handle.block_on(async {
+                let (address, server) = start(app).await;
+                tokio::task::block_in_place(|| {
+                    handle
+                        .admin
+                        .query_one("SELECT pg_advisory_lock($1)", &[&barrier_key])
+                        .expect("second connection holds the mint barrier");
+                });
+                humaux_adapters::context_repo::arm_census_mint_barrier(barrier_key);
+                let bearer = credential.bearer.clone();
+                let minting = tokio::spawn(async move {
+                    enumerate_call(address, &bearer, json!({"action":"enumerate","limit":100}))
+                        .await
+                });
+                let raced = tokio::task::block_in_place(|| {
+                    commit_into_mint_window(&mut handle, barrier_key)
+                });
+                humaux_adapters::context_repo::arm_census_mint_barrier(0);
+                let (status, page) = minting.await.expect("minting page task");
+                assert_eq!(status, 200, "raced minting page: {page}");
+                assert!(
+                    assert_enumeration_response(&page, &expected).is_none(),
+                    "the page itself is the pre-race snapshot"
+                );
+                assert_census_without_index_count(&page, 3);
+                tokio::task::block_in_place(|| {
+                    assert_frozen_census(
+                        &mut handle,
+                        &page,
+                        3,
+                        "§22.1 同一事务快照: the census ran in the transaction that took the id \
+                         list, so a row committed after that snapshot and before the count is \
+                         invisible to it — a census in any younger transaction would have said 4",
+                    );
+                });
+                // Proof the race actually happened: the row was committed BEFORE the census
+                // statement ran, and the very next manifest counts it.
+                let (status, fresh) = enumerate_call(
+                    address,
+                    &credential.bearer,
+                    json!({"action":"enumerate","limit":100}),
+                )
+                .await;
+                assert_eq!(status, 200, "fresh manifest after the race: {fresh}");
+                let mut after = expected.clone();
+                after.push(raced);
+                after.sort_unstable_by(|a, b| b.cmp(a));
+                assert!(assert_enumeration_response(&fresh, &after).is_none());
+                tokio::task::block_in_place(|| {
+                    assert_frozen_census(
+                        &mut handle,
+                        &fresh,
+                        4,
+                        "the raced insert was committed and visible — so the 3 above is snapshot \
+                         discipline, not a row that never landed",
+                    );
+                });
+                stop_server(server)
+                    .await
+                    .expect("stop same-snapshot server");
             });
         },
     );

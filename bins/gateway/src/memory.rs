@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use humaux_adapters::{
     affect_repo::{self, AffectInput, AffectRow, AnnotateDone},
     context_repo::{
-        self, BindingWriteOutcome, BindingWriteRequest, MaterializedMemory,
+        self, BindingWriteOutcome, BindingWriteRequest, EnumerationCensus, MaterializedMemory,
         MemoryEnumerationParams, materialize_memory_enumeration, materialize_memory_get,
     },
     distill_repo::{
@@ -189,6 +189,8 @@ pub(crate) async fn get<T>(
         false,
         archived,
         visible,
+        // DirectGet has no enumerable universe (§23.3④) — see `accept_memory_envelope`.
+        None,
         accept,
     )
 }
@@ -291,6 +293,7 @@ pub(crate) async fn enumerate<T>(
             &page.memory.ledger,
         )
         .await;
+    let enumeration = page.census;
     accept_memory_envelope(
         page.memory,
         affects,
@@ -300,6 +303,7 @@ pub(crate) async fn enumerate<T>(
         pagination.next_cursor.is_some(),
         false,
         visible,
+        enumeration,
         |content| {
             accept(EnumerationResult {
                 content,
@@ -801,6 +805,9 @@ fn accept_memory_envelope<T>(
     truncated: bool,
     archived: bool,
     visible: Option<u64>,
+    // `Some` only for `memory.enumerate` (ADR-0041): the §22.1 census this page's manifest was
+    // minted under plus the §23.3④ `stream_ledger` pipeline counts read in that same snapshot.
+    enumeration: Option<EnumerationCensus>,
     accept: impl FnOnce(Envelope<MemoryItem>) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
     let items = materialized
@@ -824,22 +831,46 @@ fn accept_memory_envelope<T>(
         .collect::<Result<Vec<_>, _>>()?;
     let returned = u32::try_from(items.len()).map_err(|_| ErrorCode::Internal)?;
     let projection = build_projection_block(&materialized.ledger, visible);
-    // ponytail: neither an object nor a manifest page is an independent pipeline census.
-    // Keep unknown counts; a page length must never become a whole-pipeline exact claim.
-    let pipeline = PipelineBlock {
-        evidence: EvidenceBlock::no_batch(None, CountScope::AuthorizedView),
-        knowledge: KnowledgeBlock {
-            eligible: None,
-            processed: None,
-            waiting_key: None,
-            failed: None,
-            count_scope: CountScope::AuthorizedView,
-        },
-        projection: projection.value,
+    let (census, pipeline) = match enumeration {
+        // §22.1/§23.3④ (ADR-0041, card 19): `memory.enumerate` counted its own authorized
+        // universe and read the stream ledger's evidence/knowledge counts in that same
+        // snapshot. Both halves arrive together or not at all — see
+        // `MaterializedMemoryPage::census` for why neither is reachable alone.
+        Some(enumeration) => {
+            let (evidence, knowledge) = enumeration.pipeline.blocks();
+            (
+                enumeration.census,
+                PipelineBlock {
+                    evidence,
+                    knowledge,
+                    projection: projection.value,
+                },
+            )
+        }
+        // `memory.get` (§23.3④: "没有独立 census 的对象读取不生成 `exact`"): a DirectGet has no
+        // enumerable universe, so its census carries no enumeration — and §22.0 makes
+        // `class=exact` without one a hard 5xx while `classify()` maps DirectGet to `Exact`.
+        // The unknown pipeline counts are therefore not laziness here, they are the only
+        // reading that keeps this route's own answer (`cannot_establish/count_unknown`) both
+        // legal and true: an object read never established a whole-pipeline census, and a page
+        // length must never become one.
+        None => (
+            CensusResult::ok_without_enumeration(),
+            PipelineBlock {
+                evidence: EvidenceBlock::no_batch(None, CountScope::AuthorizedView),
+                knowledge: KnowledgeBlock {
+                    eligible: None,
+                    processed: None,
+                    waiting_key: None,
+                    failed: None,
+                    count_scope: CountScope::AuthorizedView,
+                },
+                projection: projection.value,
+            },
+        ),
     };
     let provenance = provenance(request, binary_build, vec![lane.to_owned()]);
     let lane_status = LaneStatus::Ok;
-    let census = CensusResult::ok_without_enumeration();
     envelope_outcome_block(
         request,
         CompletenessInputs {
