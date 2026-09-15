@@ -1,0 +1,66 @@
+# §46.1 migration manifest. ADR-0042 (card 20, §19.1/§11.6/§11.7): widen
+# `ops.model_call_ledger.purpose` so the §11.6 distill and §11.7 consolidation hops register
+# their real provider attempts on the one existing ledger instead of leaving cost invisible
+# behind a §7.4 disclosure receipt. One CHECK replaced by a strictly larger set. No new table,
+# no new column, no new role, no new GRANT (§6.2.1 domain default already covers this table and
+# `role_private_worker` already writes it for 0130's CONTRIBUTION_DEIDENTIFY reservation), no
+# RLS change, no DML. §46 forward-fix (EXPAND_CONTRACT, first free number after 0165).
+
+migration_id = "0166_model_call_ledger_private_purposes"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+ -- the constraint 0130 last rewrote is the one being widened
+ (select count(*)=1 from pg_constraint
+   where conrelid='ops.model_call_ledger'::regclass
+     and conname='model_call_ledger_purpose_known' and contype='c')
+ -- and it does not yet admit the private reasoning purposes (this is a widening, not a replay)
+ and (select pg_get_constraintdef(oid) not like '%PRIVATE_CONSOLIDATE%'
+      from pg_constraint where conrelid='ops.model_call_ledger'::regclass
+        and conname='model_call_ledger_purpose_known')
+ -- the two guards this migration deliberately leaves alone must already be in place
+ and (select count(*)=1 from pg_constraint
+       where conrelid='ops.model_call_ledger'::regclass
+         and conname='model_call_ledger_reasoning_snapshot_shape' and contype='c')
+ and to_regprocedure('ops.reasoning_model_call_validate()') is not null
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- all seven values admitted, in one CHECK, still NULL-tolerant
+ (select pg_get_constraintdef(oid) like '%query_rewrite%'
+     and pg_get_constraintdef(oid) like '%embedding%'
+     and pg_get_constraintdef(oid) like '%rerank%'
+     and pg_get_constraintdef(oid) like '%CONTRIBUTION_DEIDENTIFY%'
+     and pg_get_constraintdef(oid) like '%PRIVATE_DISTILL_TEXT%'
+     and pg_get_constraintdef(oid) like '%PRIVATE_DISTILL_VISION%'
+     and pg_get_constraintdef(oid) like '%PRIVATE_CONSOLIDATE%'
+     and pg_get_constraintdef(oid) like '%purpose IS NULL%'
+   from pg_constraint where conrelid='ops.model_call_ledger'::regclass
+     and conname='model_call_ledger_purpose_known')
+ -- exactly one purpose CHECK survives the DROP+ADD (no duplicate left behind)
+ and (select count(*)=1 from pg_constraint
+       where conrelid='ops.model_call_ledger'::regclass
+         and conname='model_call_ledger_purpose_known' and contype='c')
+ -- 0130's USER-paid arm is untouched: a private row must still carry every route column NULL
+ and (select pg_get_constraintdef(oid) like '%num_nonnulls%'
+      from pg_constraint where conrelid='ops.model_call_ledger'::regclass
+        and conname='model_call_ledger_reasoning_snapshot_shape')
+ -- append-only + one-shot finalize guard still armed (card 20 acceptance: 0094/0095 guards pass)
+ and to_regprocedure('ops.model_call_ledger_guard_mutation()') is not null
+ -- RLS posture untouched by the ALTER
+ and (select relrowsecurity and relforcerowsecurity
+      from pg_class where oid='ops.model_call_ledger'::regclass)
+ -- grant surface unchanged: the private worker already wrote this table before 0166, and no
+ -- other role gained anything
+ and has_table_privilege('role_private_worker','ops.model_call_ledger','INSERT')
+ and has_table_privilege('role_private_worker','ops.model_call_ledger','UPDATE')
+ and has_table_privilege('role_retrieval_worker','ops.model_call_ledger','INSERT')
+ and not has_table_privilege('role_private_worker','ops.model_call_ledger','DELETE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Reverting is one statement — ALTER TABLE ops.model_call_ledger DROP CONSTRAINT model_call_ledger_purpose_known, ADD CONSTRAINT model_call_ledger_purpose_known CHECK (purpose IS NULL OR purpose = ANY (ARRAY['query_rewrite','embedding','rerank','CONTRIBUTION_DEIDENTIFY']::text[])) — but it is only replayable while no PRIVATE_* row exists yet, because the narrower CHECK is validated against existing rows. After a distill/consolidation call has been ledgered the honest revert is to stop writing the new purposes (revert the Rust leg) and leave the CHECK wide; the rows are append-only receipts of real spend and must not be deleted to satisfy a constraint. Reverting widens no tenant's data access and removes no history — it only returns distill/consolidation cost to being invisible again."
+backup_restore_requirement = "none: EXPAND-only CHECK replacement. The new predicate is strictly weaker than the old one, so PostgreSQL's validation scan cannot reject any existing row, and no row is read, rewritten or deleted."

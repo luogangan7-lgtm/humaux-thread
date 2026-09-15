@@ -9,7 +9,8 @@
 use humaux_adapters::model_call_ledger::{
     self, FinalizeCall, ModelCallLedgerError, ModelCallOutcome, ReserveCall,
 };
-use humaux_adapters::postgres::RetrievalWorkerDbPool;
+use humaux_adapters::postgres::{PrivateWorkerDbPool, RetrievalWorkerDbPool};
+use humaux_domain::ledger::ModelCallPurpose;
 use humaux_retrieval_provider::cost::{UsageSnapshot, compute_cost};
 use humaux_retrieval_provider::pricing::{self, PricingVersion};
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
@@ -23,6 +24,15 @@ fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
     // rejects the older `options[role]=X` shape outright).
     let sep = if admin_dsn.contains('?') { '&' } else { '?' };
     format!("{admin_dsn}{sep}options=-c%20role%3D{role}")
+}
+
+/// The pricing row `a_later_pricing_update_does_not_change_a_historical_calls_cost` inserts is
+/// tagged with a source_ref unique to that test's fixture (its tenant id). Every fixture's Drop
+/// cleans pricing rows by source_ref, and the binary's tests run in parallel: with one shared
+/// literal, a sibling test's teardown deleted this test's row between the INSERT and the read
+/// (observed in the card-20 gate chain as "the update must actually have landed a new row").
+fn pricing_source_ref(tenant_id: uuid::Uuid) -> String {
+    format!("model_call_ledger.rs test {tenant_id}")
 }
 
 struct Handle {
@@ -66,14 +76,14 @@ impl Drop for Handle {
             .query_opt(
                 "SELECT extract(epoch FROM effective_from)::bigint \
                  FROM control.provider_pricing_versions WHERE source_ref = $1",
-                &[&"model_call_ledger.rs test"],
+                &[&pricing_source_ref(self.tenant_id)],
             )
             .ok()
             .flatten()
             .map(|row| row.get(0));
         let _ = self.admin.execute(
             "DELETE FROM control.provider_pricing_versions WHERE source_ref = $1",
-            &[&"model_call_ledger.rs test"],
+            &[&pricing_source_ref(self.tenant_id)],
         );
         if let Some(superseded_at) = superseded_at {
             let _ = self.admin.execute(
@@ -205,7 +215,7 @@ fn reserve_then_finalize_records_estimated_and_actual_cost() {
                         request_id: None,
                         tenant_id: handle.tenant_id,
                         workspace_id: None,
-                        purpose: Some("embedding".to_string()),
+                        purpose: Some(ModelCallPurpose::Embedding),
                         provider: "dashscope".to_string(),
                         model: Some("text-embedding-v4".to_string()),
                         model_revision: None,
@@ -266,7 +276,7 @@ fn reserve_with_the_same_request_id_is_idempotent() {
                 request_id: Some(request_id),
                 tenant_id: handle.tenant_id,
                 workspace_id: None,
-                purpose: Some("rerank".to_string()),
+                purpose: Some(ModelCallPurpose::Rerank),
                 provider: "dashscope".to_string(),
                 model: Some("qwen3-rerank".to_string()),
                 model_revision: None,
@@ -327,7 +337,7 @@ fn a_finalized_row_rejects_a_second_finalize_and_any_delete() {
                         request_id: None,
                         tenant_id: handle.tenant_id,
                         workspace_id: None,
-                        purpose: Some("embedding".to_string()),
+                        purpose: Some(ModelCallPurpose::Embedding),
                         provider: "dashscope".to_string(),
                         model: Some("text-embedding-v4".to_string()),
                         model_revision: None,
@@ -491,8 +501,8 @@ fn a_later_pricing_update_does_not_change_a_historical_calls_cost() {
                        (provider_id, model_id, region, pricing_version, currency, \
                         input_token_price, batch_discount, effective_from, source_ref, verified_at) \
                      VALUES ($1, $2, $3, 'test-price-update', 'CNY', 0.9, 0.5, to_timestamp($4), \
-                             'model_call_ledger.rs test', now())",
-                    &[&provider_id, &model_id, &region, &(future_from as f64)],
+                             $5, now())",
+                    &[&provider_id, &model_id, &region, &(future_from as f64), &pricing_source_ref(handle.tenant_id)],
                 )
                 .expect("insert the updated pricing row");
 
@@ -587,7 +597,7 @@ fn only_the_reserve_call_wrapper_ever_produces_a_ledger_row() {
                         request_id: None,
                         tenant_id: handle.tenant_id,
                         workspace_id: None,
-                        purpose: Some("embedding".to_string()),
+                        purpose: Some(ModelCallPurpose::Embedding),
                         provider: "dashscope".to_string(),
                         model: Some("text-embedding-v4".to_string()),
                         model_revision: None,
@@ -630,7 +640,7 @@ fn finalized_call_can_feed_a_tenant_cost_event() {
                         request_id: None,
                         tenant_id: handle.tenant_id,
                         workspace_id: None,
-                        purpose: Some("embedding".to_string()),
+                        purpose: Some(ModelCallPurpose::Embedding),
                         provider: "dashscope".to_string(),
                         model: Some("text-embedding-v4".to_string()),
                         model_revision: None,
@@ -727,4 +737,262 @@ fn finalize_of_an_unknown_model_call_id_reports_no_change() {
 #[allow(dead_code)]
 fn _assert_error_impls_are_object_safe(e: ModelCallLedgerError) {
     let _: &dyn std::error::Error = &e;
+}
+
+// ============================================================================
+// Card 20 (ADR-0042): the private reasoning purposes and the DB<->Rust closed-set contract.
+// ============================================================================
+
+/// Every single-quoted literal in a deparsed CHECK. PostgreSQL renders
+/// `CHECK (col IN ('A','B'))` as `(col = ANY (ARRAY['A'::text, 'B'::text]))`, so a test that
+/// grepped for `IN (` would pass on the authored text and fail on the catalog — this reads the
+/// literals themselves and is indifferent to which form the deparser chose.
+fn quoted_literals(constraint_def: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = constraint_def;
+    while let Some(open) = rest.find('\'') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('\'') else { break };
+        out.push(after[..close].to_string());
+        rest = &after[close + 1..];
+    }
+    out
+}
+
+fn purpose_constraint_def(handle: &mut Handle) -> String {
+    handle
+        .admin
+        .query_one(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conrelid = 'ops.model_call_ledger'::regclass \
+               AND conname = 'model_call_ledger_purpose_known'",
+            &[],
+        )
+        .expect("model_call_ledger_purpose_known must exist")
+        .get(0)
+}
+
+/// §78.2 DB enum <-> Rust enum contract. The mirror is checked in BOTH directions, so the
+/// card-20 fault injection ("emit a purpose value not present in the Rust enum and the mirror
+/// test must go red") is red whichever side drifts: a value added to
+/// `migrations/0166_model_call_ledger_private_purposes.sql` without a
+/// `humaux_domain::ledger::ModelCallPurpose` variant fails the first assert, and a variant
+/// added without widening the CHECK fails the second.
+#[test]
+fn db_purpose_check_mirrors_the_rust_closed_set() {
+    run_db_fixture::<LedgerFixture, _>(
+        "db_purpose_check_mirrors_the_rust_closed_set",
+        |mut handle| {
+            let def = purpose_constraint_def(&mut handle);
+            // Card note (e): accept both deparse forms rather than pinning one.
+            assert!(
+                def.contains("IN (") || def.contains("= ANY (ARRAY["),
+                "purpose CHECK must still be a closed set, got: {def}"
+            );
+
+            let mut in_db = quoted_literals(&def);
+            in_db.sort_unstable();
+            in_db.dedup();
+
+            let mut in_rust: Vec<String> = humaux_domain::ledger::ModelCallPurpose::ALL
+                .into_iter()
+                .map(|purpose| purpose.as_db_str().to_string())
+                .collect();
+            in_rust.sort_unstable();
+
+            assert_eq!(
+                in_db, in_rust,
+                "ops.model_call_ledger.purpose CHECK and ModelCallPurpose::ALL have drifted — \
+             widen/narrow both in one migration (§78.2)"
+            );
+        },
+    );
+}
+
+/// The DB is the enforcing side, not just the documenting one: a purpose string that has no
+/// `ModelCallPurpose` variant is rejected by the CHECK even for the owner role. Without this,
+/// the mirror test above would still pass against a CHECK that had been dropped entirely.
+#[test]
+fn purpose_outside_the_closed_set_is_rejected_by_the_database() {
+    run_db_fixture::<LedgerFixture, _>(
+        "purpose_outside_the_closed_set_is_rejected_by_the_database",
+        |mut handle| {
+            let tenant_id = handle.tenant_id;
+            let error = handle
+                .admin
+                .execute(
+                    "INSERT INTO ops.model_call_ledger (request_id, tenant_id, provider, purpose) \
+                     VALUES (gen_random_uuid(), $1, 'dashscope', 'PRIVATE_SOMETHING_ELSE')",
+                    &[&tenant_id],
+                )
+                .expect_err("an unknown purpose must not be insertable");
+            assert_eq!(
+                error.code(),
+                Some(&SqlState::CHECK_VIOLATION),
+                "expected model_call_ledger_purpose_known to reject it, got: {error}"
+            );
+        },
+    );
+}
+
+/// §11.6/§11.7: the private hops' reserve->finalize round trip on the role that actually runs
+/// them (`role_private_worker`), through the same registration point the retrieval hops use.
+/// One row per call, purpose/model/tenant persisted, token usage landed at finalize.
+#[test]
+fn private_purposes_reserve_and_finalize_on_the_private_worker_pool() {
+    run_db_fixture::<LedgerFixture, _>(
+        "private_purposes_reserve_and_finalize_on_the_private_worker_pool",
+        |mut handle| {
+            let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("fixture already required it");
+            let private_worker = handle
+                .rt
+                .block_on(PrivateWorkerDbPool::connect(&dsn_as_role(
+                    &dsn,
+                    "role_private_worker",
+                )))
+                .expect("role_private_worker pool");
+            let tenant_id = handle.tenant_id;
+            let before = ledger_row_count(&mut handle, tenant_id);
+
+            for (purpose, model) in [
+                (ModelCallPurpose::PrivateDistillText, "MiniMax-Text-01"),
+                (ModelCallPurpose::PrivateDistillVision, "MiniMax-VL-01"),
+                (ModelCallPurpose::PrivateConsolidate, "MiniMax-Text-01"),
+            ] {
+                let reserved = handle
+                    .rt
+                    .block_on(model_call_ledger::reserve_private_call(
+                        &private_worker,
+                        &ReserveCall {
+                            request_id: None,
+                            tenant_id: handle.tenant_id,
+                            workspace_id: None,
+                            purpose: Some(purpose),
+                            provider: "minimax".to_string(),
+                            model: Some(model.to_string()),
+                            model_revision: None,
+                            estimated_cost: None,
+                        },
+                    ))
+                    .expect("private purposes are admitted by the 0166 CHECK");
+                assert!(!reserved.already_reserved);
+                assert_eq!(status_of(&mut handle, reserved.model_call_id), "RESERVED");
+
+                let changed = handle
+                    .rt
+                    .block_on(model_call_ledger::finalize_private_call(
+                        &private_worker,
+                        handle.tenant_id,
+                        reserved.model_call_id,
+                        ModelCallOutcome::Succeeded,
+                        &FinalizeCall {
+                            input_tokens: Some(1234),
+                            billable_tokens: Some(1234),
+                            output_tokens: Some(5678),
+                            latency_ms: Some(42),
+                            ..Default::default()
+                        },
+                    ))
+                    .expect("finalize succeeds");
+                assert!(changed);
+
+                let row = handle
+                    .admin
+                    .query_one(
+                        "SELECT purpose, model, tenant_id, status, input_tokens, \
+                                billable_tokens, output_tokens, latency_ms, \
+                                reasoning_domain_id IS NULL AND binding_id IS NULL \
+                                AND billing_responsibility IS NULL AS route_columns_null \
+                         FROM ops.model_call_ledger WHERE model_call_id = $1",
+                        &[&reserved.model_call_id],
+                    )
+                    .expect("row must exist");
+                assert_eq!(row.get::<_, String>("purpose"), purpose.as_db_str());
+                assert_eq!(row.get::<_, String>("model"), model);
+                assert_eq!(row.get::<_, Uuid>("tenant_id"), handle.tenant_id);
+                assert_eq!(row.get::<_, String>("status"), "SUCCEEDED");
+                assert_eq!(row.get::<_, i64>("input_tokens"), 1234);
+                // §19.1 both priced dimensions (0168): a generative call bills the prompt at
+                // `input_token_price` and the completion at `output_token_price`. Persisting
+                // only the first is what left these rows unpriceable.
+                assert_eq!(row.get::<_, i64>("billable_tokens"), 1234);
+                assert_eq!(row.get::<_, i64>("output_tokens"), 5678);
+                assert_eq!(row.get::<_, i32>("latency_ms"), 42);
+                // 0130's USER-paid arm stays untouched: a platform-paid private row carries no
+                // route/billing snapshot (migrations/0166 header).
+                assert!(row.get::<_, bool>("route_columns_null"));
+            }
+
+            assert_eq!(
+                ledger_row_count(&mut handle, tenant_id) - before,
+                3,
+                "exactly one ledger row per private call — no second receipt mechanism"
+            );
+        },
+    );
+}
+
+/// Card 20 acceptance: "a failed provider call still produces a ledger row recording the
+/// failure rather than nothing." The FAILED shape has no token numbers at all and an
+/// `error_class` — and it is still one row, not zero.
+#[test]
+fn a_failed_private_call_is_ledgered_as_failed_not_absent() {
+    run_db_fixture::<LedgerFixture, _>(
+        "a_failed_private_call_is_ledgered_as_failed_not_absent",
+        |mut handle| {
+            let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("fixture already required it");
+            let private_worker = handle
+                .rt
+                .block_on(PrivateWorkerDbPool::connect(&dsn_as_role(
+                    &dsn,
+                    "role_private_worker",
+                )))
+                .expect("role_private_worker pool");
+
+            let reserved = handle
+                .rt
+                .block_on(model_call_ledger::reserve_private_call(
+                    &private_worker,
+                    &ReserveCall {
+                        request_id: None,
+                        tenant_id: handle.tenant_id,
+                        workspace_id: None,
+                        purpose: Some(ModelCallPurpose::PrivateConsolidate),
+                        provider: "minimax".to_string(),
+                        model: Some("MiniMax-Text-01".to_string()),
+                        model_revision: None,
+                        estimated_cost: None,
+                    },
+                ))
+                .expect("reserve succeeds");
+
+            let changed = handle
+                .rt
+                .block_on(model_call_ledger::finalize_private_call(
+                    &private_worker,
+                    handle.tenant_id,
+                    reserved.model_call_id,
+                    ModelCallOutcome::Failed,
+                    &FinalizeCall {
+                        latency_ms: Some(7),
+                        error_class: Some("PROVIDER_ERROR".to_string()),
+                        ..Default::default()
+                    },
+                ))
+                .expect("finalize succeeds");
+            assert!(changed);
+
+            let row = handle
+                .admin
+                .query_one(
+                    "SELECT status, error_class, input_tokens IS NULL AS no_tokens \
+                     FROM ops.model_call_ledger WHERE model_call_id = $1",
+                    &[&reserved.model_call_id],
+                )
+                .expect("a failed call still leaves its row");
+            assert_eq!(row.get::<_, String>("status"), "FAILED");
+            assert_eq!(row.get::<_, String>("error_class"), "PROVIDER_ERROR");
+            assert!(row.get::<_, bool>("no_tokens"));
+        },
+    );
 }

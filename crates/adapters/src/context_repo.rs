@@ -854,7 +854,9 @@ pub(crate) async fn stream_pipeline_counts_in_txn(
     .map_err(|_| ErrorCode::Internal)?;
 
     // §15.2's state set, partitioned the way §23.3④'s knowledge equation needs it: `processed`
-    // is the settled set (the same three states `stream_repo` counts as `done`), `failed` is
+    // is the settled set (the same states `stream_repo` counts as `done` — including the
+    // audited `RETIRED_FAILED` migration 0167 adds, or a retired ticket would fall out of all
+    // three buckets and silently shrink the equation's left side), `failed` is
     // the `processing_gaps` view's own set, `waiting_key` is its own §15.3 stall. ISSUED /
     // PROCESSING / RETRY_WAIT are in NONE of the three on purpose — work still in flight is
     // not processed, and reporting it as such is exactly the "填数充数" §23.3④ forbids; the
@@ -862,7 +864,8 @@ pub(crate) async fn stream_pipeline_counts_in_txn(
     let knowledge = bind_pipeline_key(
         sqlx::query(&format!(
             "SELECT count(*) AS eligible, \
-                    count(*) FILTER (WHERE state IN ('DONE','SKIPPED_BY_POLICY','TOMBSTONED')) \
+                    count(*) FILTER (WHERE state IN \
+                      ('DONE','SKIPPED_BY_POLICY','TOMBSTONED','RETIRED_FAILED')) \
                       AS processed, \
                     count(*) FILTER (WHERE state = 'WAITING_KEY') AS waiting_key, \
                     count(*) FILTER (WHERE state IN ('FAILED','LOST')) AS failed \

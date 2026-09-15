@@ -173,7 +173,7 @@ impl From<PrivateProjectionRegistryError> for RetrieveError {
 
 impl std::error::Error for RetrieveError {}
 
-/// §15.1 nine-state closed set, reused here as the wire value returned to callers under
+/// §15.1 ten-state closed set, reused here as the wire value returned to callers under
 /// `processing_state` for an Evidence that has not finished distillation (§15.5: "允许把该
 /// Evidence 作为带 `processing_state` 的临时上下文候选返回...但不能冒充已完成 Memory").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,10 +187,14 @@ pub enum ProcessingState {
     SkippedByPolicy,
     Failed,
     Tombstoned,
+    /// §15.2 amendment (migration `0167`, ADR-0042): an exhausted `Failed` ticket that
+    /// `role_maintenance` retired through `projection.retire_failed_ticket`, DLQ-style. Terminal
+    /// and settled; the failure itself survives in `error_class` + `retired_at`/`retired_by`.
+    RetiredFailed,
 }
 
 impl ProcessingState {
-    pub const ALL: [ProcessingState; 9] = [
+    pub const ALL: [ProcessingState; 10] = [
         Self::Issued,
         Self::Processing,
         Self::WaitingKey,
@@ -200,6 +204,7 @@ impl ProcessingState {
         Self::SkippedByPolicy,
         Self::Failed,
         Self::Tombstoned,
+        Self::RetiredFailed,
     ];
 
     pub fn as_db_str(self) -> &'static str {
@@ -213,6 +218,7 @@ impl ProcessingState {
             Self::SkippedByPolicy => "SKIPPED_BY_POLICY",
             Self::Failed => "FAILED",
             Self::Tombstoned => "TOMBSTONED",
+            Self::RetiredFailed => "RETIRED_FAILED",
         }
     }
 
@@ -223,12 +229,21 @@ impl ProcessingState {
             .ok_or_else(|| RetrieveError::UnknownProcessingState(s.to_string()))
     }
 
-    /// §15.2/§15.4 `SETTLED_OK = DONE | SKIPPED_BY_POLICY | TOMBSTONED` — an Evidence in one
-    /// of these states is safe to present as if it were a completed Memory candidate (still
-    /// carrying `processing_state` per §15.5's "不能冒充已完成 Memory", but no longer *only*
-    /// a temporary placeholder).
+    /// §15.2/§15.4 `SETTLED_OK = DONE | SKIPPED_BY_POLICY | TOMBSTONED | RETIRED_FAILED` — an
+    /// Evidence in one of these states is safe to present as if it were a completed Memory
+    /// candidate (still carrying `processing_state` per §15.5's "不能冒充已完成 Memory", but no
+    /// longer *only* a temporary placeholder).
+    ///
+    /// `RetiredFailed` is in the set by the §15.2 amendment migration `0167` carries: retirement
+    /// is the audited act of declaring an exhausted failure settled, and the whole point of it is
+    /// that §15.4's prefix stops treating that seq as a gap. It is the one member that never had
+    /// a record to show — see that migration's header for why that makes retirement an
+    /// EXECUTE-gated operator action and not something the worker that failed can do to itself.
     pub fn is_settled_ok(self) -> bool {
-        matches!(self, Self::Done | Self::SkippedByPolicy | Self::Tombstoned)
+        matches!(
+            self,
+            Self::Done | Self::SkippedByPolicy | Self::Tombstoned | Self::RetiredFailed
+        )
     }
 }
 
@@ -457,20 +472,31 @@ pub async fn contiguous_done_prefix(
     Ok(prefix)
 }
 
+/// §15.2/§15.4 `SETTLED_OK`, as the SQL literal list the §15.4 prefix formula filters on.
+///
+/// The formula has TWO copies in this workspace — [`contiguous_done_prefix_in_txn`] (read path)
+/// and `stream_repo::fetch_snapshot_in_txn` (the write path's four-number cross-check) — and
+/// card 18 stored "change only the reader's copy" as a `rejected` decision: two prefix formulas
+/// that disagree are worse than the defect either of them was fixing. Both now interpolate THIS
+/// constant, so the set cannot drift by editing one file; `settled_ok_sql_list_matches_the_enum`
+/// below pins the constant itself against [`ProcessingState::is_settled_ok`].
+pub(crate) const SETTLED_OK_SQL_LIST: &str =
+    "'DONE','SKIPPED_BY_POLICY','TOMBSTONED','RETIRED_FAILED'";
+
 pub(crate) async fn contiguous_done_prefix_in_txn(
     txn: &mut Txn<'_>,
     key: &StreamKey,
 ) -> Result<i64, RetrieveError> {
-    let row = sqlx::query(
+    let row = sqlx::query(&format!(
         "SELECT COALESCE(
-           MIN(stream_seq) FILTER (WHERE state NOT IN ('DONE','SKIPPED_BY_POLICY','TOMBSTONED')) - 1,
+           MIN(stream_seq) FILTER (WHERE state NOT IN ({SETTLED_OK_SQL_LIST})) - 1,
            MAX(stream_seq),
            0
          )::bigint AS prefix
          FROM projection.stream_log
          WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3
            AND domain = $4 AND projection_kind = $5 AND projection_version = $6",
-    )
+    ))
     .bind(key.tenant_id.0)
     .bind(&key.scope_kind)
     .bind(key.scope_id)
@@ -1245,42 +1271,50 @@ pub(crate) async fn tombstoned_source_seqs(
 mod contract_tests {
     use super::*;
 
+    /// The migration that currently *defines* `stream_log_state_check` — 0007 created it, 0167
+    /// (§15.2's `RETIRED_FAILED` amendment) replaced it. Reading 0007 after that would pin this
+    /// contract to a superseded closed set, which is the one way this mirror could go quietly
+    /// wrong.
     const MIGRATION_SQL: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../migrations/0007_projection.sql"
+        "/../../migrations/0167_retired_failed_ticket.sql"
     ));
 
-    fn stream_log_table_sql() -> &'static str {
-        let start = MIGRATION_SQL
-            .find("CREATE TABLE projection.stream_log (")
-            .expect("migration must define projection.stream_log");
-        let end = MIGRATION_SQL[start..]
-            .find(");\n")
-            .expect("unterminated projection.stream_log table definition")
-            + start;
-        &MIGRATION_SQL[start..end]
-    }
-
+    /// Card note (e): accept BOTH deparse forms — `CHECK (state IN ('A','B'))` and
+    /// `CHECK (state = ANY (ARRAY['A','B']::text[]))` — rather than pinning one. The clause is
+    /// sliced off at the next `DROP CONSTRAINT` / statement end, then every single-quoted literal
+    /// inside it is a member of the set, whichever spelling the migration used.
     fn state_check_values() -> Vec<String> {
-        let table_sql = stream_log_table_sql();
-        let needle = "state       text NOT NULL DEFAULT 'ISSUED' CHECK (state IN";
-        let after_needle = table_sql
+        let needle = "ADD CONSTRAINT stream_log_state_check";
+        let start = MIGRATION_SQL
             .find(needle)
-            .expect("projection.stream_log has no `state ... CHECK (state IN` clause")
+            .expect("0167 must (re)define stream_log_state_check")
             + needle.len();
-        let open = table_sql[after_needle..]
-            .find('(')
-            .expect("CHECK IN clause missing opening paren")
-            + after_needle
-            + 1;
-        let close = table_sql[open..]
-            .find(')')
-            .expect("unterminated CHECK IN (...) clause")
-            + open;
-        table_sql[open..close]
-            .split(',')
-            .map(|s| s.trim().trim_matches('\'').to_string())
-            .collect()
+        let rest = &MIGRATION_SQL[start..];
+        assert!(
+            rest.starts_with(" CHECK (") || rest.trim_start().starts_with("CHECK ("),
+            "stream_log_state_check must stay a CHECK constraint"
+        );
+        let end = rest
+            .find("DROP CONSTRAINT")
+            .into_iter()
+            .chain(rest.find(';'))
+            .min()
+            .expect("unterminated stream_log_state_check clause");
+        let clause = &rest[..end];
+        assert!(
+            clause.contains("IN (") || clause.contains("= ANY (ARRAY["),
+            "state CHECK must still be a closed set, got: {clause}"
+        );
+        let mut values = Vec::new();
+        let mut cursor = clause;
+        while let Some(open) = cursor.find('\'') {
+            let after = &cursor[open + 1..];
+            let Some(close) = after.find('\'') else { break };
+            values.push(after[..close].to_string());
+            cursor = &after[close + 1..];
+        }
+        values
     }
 
     #[test]
@@ -1297,15 +1331,38 @@ mod contract_tests {
     }
 
     #[test]
-    fn settled_ok_matches_spec_three_variant_set() {
-        // §15.2/§15.4 verbatim: SETTLED_OK = DONE | SKIPPED_BY_POLICY | TOMBSTONED.
+    fn settled_ok_matches_spec_four_variant_set() {
+        // §15.2/§15.4: SETTLED_OK = DONE | SKIPPED_BY_POLICY | TOMBSTONED, widened by the §15.2
+        // amendment migration 0167 carries with the audited RETIRED_FAILED.
         let settled: Vec<&str> = ProcessingState::ALL
             .iter()
             .copied()
             .filter(|s| s.is_settled_ok())
             .map(ProcessingState::as_db_str)
             .collect();
-        assert_eq!(settled, vec!["DONE", "SKIPPED_BY_POLICY", "TOMBSTONED"]);
+        assert_eq!(
+            settled,
+            vec!["DONE", "SKIPPED_BY_POLICY", "TOMBSTONED", "RETIRED_FAILED"]
+        );
+    }
+
+    /// The §15.4 prefix formula has two copies (`retrieve` / `stream_repo`) and both now filter
+    /// on [`SETTLED_OK_SQL_LIST`]. This pins that one string against the enum, so a variant that
+    /// gains `is_settled_ok` without entering the SQL list (or the reverse) is red here rather
+    /// than in a soak three days later.
+    #[test]
+    fn settled_ok_sql_list_matches_the_enum() {
+        let from_enum = ProcessingState::ALL
+            .iter()
+            .copied()
+            .filter(|s| s.is_settled_ok())
+            .map(|s| format!("'{}'", s.as_db_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            SETTLED_OK_SQL_LIST, from_enum,
+            "the prefix formula's SETTLED_OK list and ProcessingState::is_settled_ok have drifted"
+        );
     }
 
     #[test]

@@ -827,6 +827,35 @@ pub(crate) fn admitted_inference_context(
     )
 }
 
+/// §19.1's token legs for ONE successful generative call — the whole reason it is a named
+/// function is that it is the single place both priced dimensions are read off the provider's
+/// usage block, for every hop that goes through [`complete_structured_timed`] (contribution,
+/// distill, consolidation).
+///
+/// A generative call bills TWO dimensions: `prompt_tokens` at
+/// `provider_pricing_versions.input_token_price` and `completion_tokens` at
+/// `output_token_price` — and for these hops the output leg usually dominates. So:
+/// * `input_tokens` — the raw prompt count (§19.1's own column);
+/// * `billable_tokens` — the count priced at `input_token_price`. §19's rerank formula is the
+///   reason this is a separate column from `input_tokens` at all; for a chat completion the
+///   two coincide, but leaving it NULL is what made the money column unusable;
+/// * `output_tokens` — the count priced at `output_token_price` (column added by 0168; before
+///   it, `usage.output_tokens` was parsed by `byok` and then dropped on the floor here).
+///
+/// With all three landed, `retrieval_provider::cost::compute_cost` can price the row the day a
+/// pricing row exists, with no code change. A provider that reports no usage leaves them NULL —
+/// never a fabricated zero (§19.1 "unknown usage/cost stay NULL").
+fn finalize_from_usage(usage: &TokenUsage, latency_ms: Option<i32>) -> FinalizeCall {
+    let input_tokens = usage.input_tokens.and_then(|v| i64::try_from(v).ok());
+    FinalizeCall {
+        input_tokens,
+        billable_tokens: input_tokens,
+        output_tokens: usage.output_tokens.and_then(|v| i64::try_from(v).ok()),
+        latency_ms,
+        ..FinalizeCall::default()
+    }
+}
+
 /// The one provider invocation + its ledger classification: latency, disclosure outcome,
 /// model-call outcome and the finalize columns, decided identically for every dispatch path.
 pub(crate) async fn complete_structured_timed(
@@ -846,14 +875,7 @@ pub(crate) async fn complete_structured_timed(
         Ok(response) => (
             DisclosureOutcome::Success,
             ModelCallOutcome::Succeeded,
-            FinalizeCall {
-                input_tokens: response
-                    .usage
-                    .input_tokens
-                    .and_then(|v| i64::try_from(v).ok()),
-                latency_ms,
-                ..FinalizeCall::default()
-            },
+            finalize_from_usage(&response.usage, latency_ms),
         ),
         Err(_) => (
             DisclosureOutcome::Failed,
@@ -1726,5 +1748,49 @@ mod tests {
         let frozen = ContentSha256(Sha256::digest(original_content).into());
         assert_ne!(Sha256::digest(event_payload).as_slice(), frozen.0);
         assert!(evidence_source_hash_matches(&frozen.0, frozen));
+    }
+}
+
+#[cfg(test)]
+mod ledger_usage_tests {
+    use super::{TokenUsage, finalize_from_usage};
+
+    /// §19.1: BOTH priced dimensions of a generative call land on the ledger row. This is the
+    /// check that goes red if either leg is dropped again — `output_tokens` was parsed by
+    /// `byok` and discarded here, and `billable_tokens` (the column cost is computed from) was
+    /// left NULL, which is why the two most expensive hops in the system could not be priced.
+    #[test]
+    fn both_priced_dimensions_land_on_the_finalize_row() {
+        let finalize = finalize_from_usage(
+            &TokenUsage {
+                input_tokens: Some(1_200),
+                output_tokens: Some(3_400),
+                reasoning_tokens: Some(3_000),
+                cached_input_tokens: Some(64),
+            },
+            Some(42),
+        );
+        assert_eq!(finalize.input_tokens, Some(1_200));
+        assert_eq!(
+            finalize.billable_tokens,
+            Some(1_200),
+            "billable_tokens is the input-priced dimension, and must not stay NULL"
+        );
+        assert_eq!(
+            finalize.output_tokens,
+            Some(3_400),
+            "the output leg usually dominates a generative bill"
+        );
+        assert_eq!(finalize.latency_ms, Some(42));
+    }
+
+    /// A provider that reports no usage leaves the columns NULL — never a fabricated zero
+    /// (§19.1: unknown usage/cost stay NULL).
+    #[test]
+    fn absent_usage_stays_null_never_zero() {
+        let finalize = finalize_from_usage(&TokenUsage::default(), None);
+        assert_eq!(finalize.input_tokens, None);
+        assert_eq!(finalize.billable_tokens, None);
+        assert_eq!(finalize.output_tokens, None);
     }
 }

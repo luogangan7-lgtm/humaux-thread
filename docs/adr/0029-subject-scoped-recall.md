@@ -36,6 +36,6 @@
 - **RESTRICTIVE 策略覆盖 headless 角色**：0140 的 §15.7 冻结回归——见 D-B。
 
 ## 已知局限
-- 0155 回填票与既有 `MEMORY_LIFECYCLE` 票一样绑定 Evidence，而 worker 的 `resolve_memory` 按 PRIMARY-first `LIMIT 1` 解析——一个 Evidence 蒸馏出多条 memory 时只有第一条被（重）投影。这是投影解析既有的绑定方式，不是本卡引入；改成按 memory 绑定需要给 ticket 加 memory 身份（§60 字段表），由后续 card 决定。
+- ~~0155 回填票与既有 `MEMORY_LIFECYCLE` 票一样绑定 Evidence，而 worker 的 `resolve_memory` 按 PRIMARY-first `LIMIT 1` 解析——一个 Evidence 蒸馏出多条 memory 时只有第一条被（重）投影。~~ **已由卡 20 / ADR-0042 D-G 关闭**：解析改在唯一汇合点 `projection_worker::resolve_memories`（去掉 `LIMIT 1`，一次批量 `embed_cards`，逐条 `finish_row`，按 memory 折叠出该票的终态），三个发票方（`remember` / `issue_lifecycle_ticket` / 0155 回填）都不必改，ticket 也不需要 memory 身份。钉在 `crates/adapters/tests/projection_worker.rs::one_ticket_projects_every_memory_its_evidence_carries`。
 - subject 可见性今天只有「同租户」一个判据，所以 PG 侧的「未授权读者零行」在真实数据上只能由跨租户会话触发（已被 tenant policy 覆盖）；本卡把它做成**可注错的钩子**（谓词函数换成恒 false 即零行）并在真 Qdrant 面用 visibility 轴证明 AND 关系。加 subject 级 ACL 时只改 0155 的函数体 + 给 `visibility_allowed` 的三个布尔。
 - `merged_into` 非空的 subject 仍按其自身可见性计入（没有「被合并的 subject 不再 gate」的规则）；合并语义由后续 card 定。

@@ -447,12 +447,15 @@ fn tombstoned_unpurged_over_sla_goes_red_then_green_on_purge_step() {
 
 /// §37.2 architecture assertion (own-file verification — the workspace-wide
 /// architecture-check(§37.2) grep gate itself is not wired into `xtask` by this ticket, see
-/// the T4.8 report): `projection.stream_log` is exactly the 12 columns §15.1's DDL names, no
-/// `deleted_count` and no `status` (`state` is the only status-like column).
+/// the T4.8 report): `projection.stream_log` is exactly the columns §15.1's DDL names — the
+/// original 12 plus the two §15.2.1 audit columns 0167 added (`retired_at`, `retired_by`; facts
+/// about a transition, not counters derivable from `state`, which is what §37.2's freeze
+/// guards against) — no `deleted_count` and no `status` (`state` is the only status-like
+/// column). The set is asserted verbatim so a 15th column is red by name, not by count alone.
 #[test]
-fn stream_log_has_exactly_the_twelve_frozen_columns() {
+fn stream_log_has_exactly_the_frozen_columns() {
     run_db_fixture::<ForgetFixture, _>(
-        "stream_log_has_exactly_the_twelve_frozen_columns",
+        "stream_log_has_exactly_the_frozen_columns",
         |mut handle| {
             let cols: Vec<String> = handle
                 .admin
@@ -465,7 +468,29 @@ fn stream_log_has_exactly_the_twelve_frozen_columns() {
                 .iter()
                 .map(|r| r.get(0))
                 .collect();
-            assert_eq!(cols.len(), 12, "§37.2: exactly 12 columns, got {cols:?}");
+            let mut got = cols.clone();
+            got.sort();
+            let mut want = vec![
+                "tenant_id",
+                "scope_kind",
+                "scope_id",
+                "domain",
+                "projection_kind",
+                "projection_version",
+                "stream_seq",
+                "commit_seq",
+                "state",
+                "error_class",
+                "issued_at",
+                "settled_at",
+                "retired_at",
+                "retired_by",
+            ];
+            want.sort();
+            assert_eq!(
+                got, want,
+                "§37.2/§15.1: the frozen column set (12 + the two 0167 audit columns), got {cols:?}"
+            );
             assert!(
                 !cols.iter().any(|c| c == "deleted_count"),
                 "no materialized deleted_count column"

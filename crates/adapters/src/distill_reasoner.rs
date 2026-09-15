@@ -6,8 +6,12 @@
 //! `ConsolidationReasoner` already share — admission resolver → `provider_matches_admission`
 //! → `authorize_structured_egress` → `disclosure::reserve_private` → `admitted_inference_context`
 //! → `complete_structured_timed` → `disclosure::finalize_private` — with purpose `Distill`.
-//! No second provider call path; the `ops.model_call_ledger` leg stays absent for the same
-//! reason ADR-0015 D5 documents (ledger CHECKs are contribution-only; out of this hop's files).
+//! No second provider call path. Since card 20 (ADR-0042) the §19.1 ledger leg runs alongside
+//! the §7.4 disclosure leg through the SAME `model_call_ledger` registration point the
+//! retrieval and contribution hops use (`reserve_private_call`/`finalize_private_call`,
+//! purpose `PRIVATE_DISTILL_TEXT`): ADR-0015 D5's "ledger CHECKs are contribution-only" was
+//! the 0130 CHECK, which `migrations/0166` widened. A disclosure row says what left the
+//! boundary; only the ledger row says what it cost.
 //!
 //! The contract is versioned + hashed ([`distill_prompt_contract`]): its sha256 is what
 //! `private.processing_runs.prompt_hash` stores and what `humaux_projection::fingerprint::
@@ -20,7 +24,8 @@ use humaux_application::consolidate::{
     ReasoningRouteBindingId, ReasoningRouteBindingVersion,
 };
 use humaux_domain::{
-    authority::AuthorityClass, dataclass::DataClass, error::ErrorCode, memory::MemoryType,
+    authority::AuthorityClass, dataclass::DataClass, error::ErrorCode, ledger::ModelCallPurpose,
+    memory::MemoryType,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -36,6 +41,7 @@ use crate::{
         complete_structured_timed, fail, provider_matches_admission,
     },
     disclosure::{self, DisclosureSource},
+    model_call_ledger,
     postgres::PrivateWorkerDbPool,
     reasoning_route_admission::{ReasoningAdmissionLocator, resolve_user_reasoning_admission},
 };
@@ -338,6 +344,19 @@ impl<'a> DistillReasoner<'a> {
             self.config.permit_ttl,
         )
         .map_err(|_| fail("egress authorization rejected"))?;
+        // §19.1 before §7.4, the same order `ContributionReasoner::resolve_and_reserve_reasoning_call`
+        // fixes: the cost row is reserved before any byte leaves, so a worker that dies between
+        // the two legs leaves an unfinalized ledger row (visible, auditable) rather than an
+        // egress with no cost trace at all.
+        let reserved = model_call_ledger::reserve_private_call(
+            self.pool,
+            &model_call_ledger::private_reserve_call(
+                ModelCallPurpose::PrivateDistillText,
+                &admission.locator,
+            ),
+        )
+        .await
+        .map_err(|_| fail("model call reservation failed"))?;
         let disclosure_id = disclosure::reserve_private(
             self.pool,
             &permit,
@@ -357,7 +376,7 @@ impl<'a> DistillReasoner<'a> {
             disclosure_id.to_string(),
         )
         .map_err(|_| fail("private context rejected"))?;
-        let (response, disclosure_outcome, _model_outcome, _finalize) =
+        let (response, disclosure_outcome, model_outcome, finalize) =
             complete_structured_timed(self.provider, &context, request).await;
         let finalized = disclosure::finalize_private(
             self.pool,
@@ -370,6 +389,21 @@ impl<'a> DistillReasoner<'a> {
         .map_err(|_| fail("disclosure finalization failed"))?;
         if !finalized {
             return Err(fail("disclosure finalization lost"));
+        }
+        // Both outcomes finalize: a provider failure records FAILED + error_class, never an
+        // absent row (card 20 acceptance). Runs before the `response` unwrap below for that
+        // reason — the early `?` on a failed call used to be what swallowed the cost leg.
+        if !model_call_ledger::finalize_private_call(
+            self.pool,
+            tenant_id,
+            reserved.model_call_id,
+            model_outcome,
+            &finalize,
+        )
+        .await
+        .map_err(|_| fail("model call finalization failed"))?
+        {
+            return Err(fail("model call finalization lost"));
         }
         let output_bytes = response
             .map_err(|_| fail("user reasoning provider failed"))?

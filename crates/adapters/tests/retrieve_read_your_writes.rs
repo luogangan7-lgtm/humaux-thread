@@ -2008,3 +2008,125 @@ fn final_materialize_excludes_secret_memory_source_and_marks_artifact_unavailabl
         },
     );
 }
+
+/// §15.2.1 / §15.5 — what the audited retirement (migration 0167) does to the RYW overlay's lower
+/// bound, asserted rather than assumed.
+///
+/// §15.5 freezes "overlay 下界取 `contiguous_done_prefix`", and `advance_prefix` is what carries
+/// that prefix into `stream_checkpoints.projection_highwater`, which is the bound
+/// `recall_with_overlay` actually reads. So the answer to "does a retired seq still serve from the
+/// overlay?" is **no**: retirement puts the seq inside the contiguous prefix, the bound moves past
+/// it, and the record — which was never indexed either — becomes permanently invisible to recall.
+/// That is what retirement MEANS, and it is why §15.2.1 makes it an EXECUTE-gated, class-named,
+/// audited act instead of a state the failing worker can set on itself.
+///
+/// Shape: seq 1 `DONE`, seq 2 `FAILED`, seq 3 `DONE`, the serving version at the prefix.
+/// * before — prefix 1, highwater 1, the token at seq 3 takes the overlay and it contains BOTH
+///   seq 2 (the failure) and seq 3;
+/// * after  — prefix 3, highwater 3, the same token is served by the projection with an empty
+///   overlay: seq 2 is gone from the read path for good.
+///
+/// This is also the read-path half of the §15.4 formula's two copies (`retrieve.rs`): the prefix
+/// the envelope reports is computed by `contiguous_done_prefix_in_txn`, not by `stream_repo`.
+#[test]
+fn retired_seq_leaves_the_overlay_and_enters_the_contiguous_prefix() {
+    run_db_fixture::<RetrieveFixture, _>(
+        "retired_seq_leaves_the_overlay_and_enters_the_contiguous_prefix",
+        |mut handle| {
+            seed_evidence_and_stream_row(&mut handle, 1, "DONE");
+            let failed_evidence = seed_evidence_and_stream_row(&mut handle, 2, "FAILED");
+            seed_evidence_and_stream_row(&mut handle, 3, "DONE");
+            let tenant = handle.tenant_id;
+            handle
+                .admin
+                .execute(
+                    "UPDATE projection.stream_log SET error_class = 'distill_failed' \
+                     WHERE tenant_id = $1 AND stream_seq = 2",
+                    &[&tenant],
+                )
+                .expect("tag the failed ticket the way settle_row would");
+            // The serving row at the prefix the pinned stream actually has (§15.4 ⇒ 1).
+            handle
+                .admin
+                .execute(
+                    "UPDATE projection.stream_checkpoints \
+                        SET serving = true, issued_highwater = 3, projection_highwater = 1 \
+                      WHERE tenant_id = $1",
+                    &[&tenant],
+                )
+                .expect("activate the seeded version at the pinned prefix");
+
+            let claims = issued_token_claims(&mut handle, 3);
+            let token = retrieve::issue_consistency_token(&claims);
+            let before = handle
+                .rt
+                .block_on(retrieve::recall_with_overlay(
+                    &handle.gateway,
+                    &token,
+                    &handle.auth,
+                    &handle.family,
+                ))
+                .expect("recall_with_overlay must succeed");
+            assert!(!before.served_by_projection);
+            assert_eq!(
+                before.contiguous_done_prefix, 1,
+                "§15.7: the FAILED row at seq 2 pins the read path's prefix at 1 too"
+            );
+            let seqs_before: Vec<i64> = before.overlay.iter().map(|c| c.stream_seq).collect();
+            assert_eq!(
+                seqs_before,
+                vec![2, 3],
+                "the overlay's lower bound is the highwater, so the failure is still served"
+            );
+            assert!(
+                before
+                    .overlay
+                    .iter()
+                    .any(|c| c.evidence_id == failed_evidence)
+            );
+
+            let retired = handle
+                .rt
+                .block_on(humaux_adapters::stream_repo::retire_failed(
+                    &handle.maintenance,
+                    &handle.family.with_version(PROJECTION_VERSION),
+                    "distill_failed",
+                ))
+                .expect("role_maintenance retires through the 0167 definer");
+            assert_eq!(retired, vec![2]);
+            // The ops path advances the checkpoint to the new prefix; done here as the one
+            // statement `advance_prefix` would write, because this fixture holds no retrieval pool.
+            handle
+                .admin
+                .execute(
+                    "UPDATE projection.stream_checkpoints SET projection_highwater = 3 \
+                      WHERE tenant_id = $1",
+                    &[&tenant],
+                )
+                .expect("advance the serving highwater to the released prefix");
+
+            let after = handle
+                .rt
+                .block_on(retrieve::recall_with_overlay(
+                    &handle.gateway,
+                    &token,
+                    &handle.auth,
+                    &handle.family,
+                ))
+                .expect("recall_with_overlay must succeed");
+            assert_eq!(
+                after.contiguous_done_prefix, 3,
+                "RETIRED_FAILED is SETTLED_OK, so the read path's prefix runs to the end"
+            );
+            assert!(
+                after.served_by_projection,
+                "the serving highwater now covers the token's seq"
+            );
+            assert!(
+                after.overlay.is_empty(),
+                "the retired seq is below the overlay's lower bound and was never indexed — it is \
+                 out of the read path for good (§15.2.1's recorded cost)"
+            );
+        },
+    );
+}

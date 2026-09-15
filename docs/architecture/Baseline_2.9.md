@@ -1233,6 +1233,7 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
 - **派生层跨租户待办发现（0164，ADR-0036，卡 14）**：两个派生层 worker（`humaux-consolidation-worker`、`humaux-private-worker --distill-*`）不再靠环境里钉死的一对 `(tenant, reasoning_domain)` 轮询。**本表无新增表级授权**：pending work 的事件端由 0164 的两个 **invoker 权限** AFTER INSERT 触发器发 job（`ops.outbox` 的 `EVIDENCE_ACCEPTED` → `DERIVED_DISTILL`；`private.memory_evidence` 的 `role='PRIMARY'` → `DERIVED_CONSOLIDATE`），写入方会话本来就有 `ops.jobs` 的 INSERT 与该租户上下文。唯一的跨租户读写是窄 SECURITY DEFINER `ops.claim_derived_work(text[],text,double precision,bigint)`：owner `role_migration_owner`、`search_path=pg_catalog`、一条语句完成 SKIP LOCKED 领取并只返回刚领到的行，EXECUTE **仅** `role_consolidation_worker` + `role_private_worker`，PUBLIC 无；它能看见其他租户的行，靠的是同一迁移给 0012 `jobs_tenant_isolation` 两条腿各加的 `current_user = 'role_migration_owner' OR` 臂（0004/0012/0112/0147/0163 的同一形状；不加第二条 PERMISSIVE policy）。GUC 臂被显式拒绝：任何会话都能自设自定义 GUC，那是建议性的不是授权边界。claim 之后一切回到普通 RLS —— worker 用领到的 `tenant_id` 走既有 per-call `SET LOCAL`，心跳/结清只写 `(status, lease_owner, lease_expires_at, next_retry_at)`。前三列两个 worker role 本来就有；`next_retry_at` 由 0164 加进 `role_consolidation_worker` 的列级 UPDATE（`role_private_worker` 自 0011 起就是无列限制的表级 UPDATE，这一格只是把两者拉平）：环境性失败（租户的 route binding 还没准入、provider/DB 抖动）释放 job 时必须把 `next_retry_at` 往后推，否则它保持 enqueue 时那个已经过去的时刻，每次 `--serve` 轮询都会零延迟地烧掉一次 attempt —— 在 binding 准入之前上线的租户几个轮询周期内就把 job 丢成 `DEAD`。`attempt` / `payload` 等其余列仍然不给（manifest postcheck 双向断言）。同一变更把 0147 窄 resolver `control.current_reasoning_route_binding(uuid,text)` 的 EXECUTE 名单加上 `role_consolidation_worker`（binding 是 per-tenant 的，跨租户服务下不能从环境读一个），`control.reasoning_route_bindings` 的非 owner 单元仍全为 `—`；函数授权不以本表格冒充，由 0164 DDL 与 `rls-check` 的 `check_derived_work_dispatch_boundary` + `R3_PRIVATE_WORKER_FUNCTIONS`（现带精确执行者集合）双向验证。`ops.jobs.tenant_id` 的 FK 同时由 RESTRICT 改为 `ON DELETE CASCADE`：job 行是纯调度状态，删租户本就销毁它们指向的活。
 - **Membership lifecycle admin path（0161，ADR-0033，卡 12）**：`control.memberships` 从 control 域默认（所有非 owner 角色 SELECT）抬为点名表：`role_maintenance` 持 `SELECT, INSERT` + 列级 `UPDATE(state, role, updated_at)`——这是 §6.3 MembershipState 机（`domain::identity::MembershipSnapshot::apply`）经 `adapters::membership_repo` / `xtask member` 写入 membership 的**唯一**路径（invite = INSERT 一行 INVITED；activate / suspend / remove / set-role = 一条 UPDATE）；身份列（membership_id / tenant_id / user_id / created_at）无人可写，0160 的 role 触发器 + CHECK、0012 的 FORCE RLS 租户策略照旧。五个 runtime role 保持 SELECT（等于原域默认），`role_batch_issuer` / `role_admin` 为 `—`。用户的 `security_epoch` **不给列级 UPDATE**（拿到 UPDATE 也就能把 epoch 调低、复活已作废的凭据）：唯一写法是 owner SECURITY DEFINER `control.bump_user_security_epoch(uuid)`（只增不设，EXECUTE 仅 `role_maintenance`，PUBLIC 无），与 0037 `api_key_lookup` / 0041 `audit_event_insert` 同一 chokepoint 纪律；`control.audit_event_insert` 的 EXECUTE 名单同一变更加入 `role_maintenance`，每次 mutation 在同一事务内追加 §77 审计行（action `MEMBERSHIP_INVITE|ACTIVATE|SUSPEND|REMOVE|CHANGE_ROLE`）。
 - **Workspace membership（0162，ADR-0035，卡 13）**：`control.workspace_memberships`（Tenant×Workspace×User，§6.1.1）点名表：六个 runtime 读者（== `control.memberships` 的读者集）持 `SELECT`：`role_gateway` / `role_private_worker` / `role_consolidation_worker` / `role_public_worker` / `role_retrieval_worker` / `role_maintenance`——每个读 evidence_objects / memory_records / memory_rollups 的角色都要能求值 0163 重指的 WORKSPACE_SHARED EXISTS（策略表达式引用的表按查询角色鉴权，与 role-bypass OR 臂无关），加上卡 9 prefilter 与 ops。`role_batch_issuer` / `role_admin` 与所有写权限为 `—`。唯一写入路径是 owner SECURITY DEFINER `control.set_workspace_membership(uuid,uuid,uuid,text,text)`（EXECUTE 仅 `role_maintenance`，PUBLIC 无，admin 授权后调用），与 0161 `bump_user_security_epoch` 同一 chokepoint 纪律；FORCE RLS + self-read policy（tenant GUC AND user GUC 同时匹配行），请求只能读自己的 membership。role/state 为数据库闭集（`OWNER|MEMBER` / `ACTIVE|SUSPENDED|REMOVED`），composite tenant-leg FK 指向 `control.memberships` / `control.workspaces`。
+- **失败票据审计退役（0167，ADR-0042，卡 20）**：**本表无新增表级授权**——`role_maintenance` 对 `projection.stream_log` 自 0011 起就是 `SELECT, UPDATE`，本次只多一个 EXECUTE。`FAILED -> RETIRED_FAILED`（§15.2.1 新终态）唯一入口是窄 SECURITY DEFINER `projection.retire_failed_ticket(uuid, text, uuid, text, text, text, bigint, text)`：owner `role_migration_owner`、`search_path=pg_catalog`、EXECUTE **仅** `role_maintenance`，PUBLIC 与其余七个 runtime role 全无——与 0164 `ops.claim_derived_work(...)`、0161 `control.bump_user_security_epoch(...)` 同一 chokepoint 纪律。`role_retrieval_worker` 明确不在名单：它持有 `projection.stream_log` 的表级 UPDATE 且是 `FAILED` 的书写方，写失败的角色不得把自己的失败结清为 OK（理由与十六个 `error_class` 的取数见 §15.2.1）；`role_private_worker` 也不在名单：它 park `DEAD` 时票据还是 `ISSUED`，没有可退役的对象。函数授权不以本表格冒充，由 0167 DDL 与 `rls-check` 的 `check_ticket_retirement_boundary` 双向验证——后者同时钉住 0011/0167 转换触发器：新终态只在 owner 臂放行（definer 函数内 `current_user` 即 owner，不可伪造；GUC 臂同 0164 被拒），`role_retrieval_worker` 那一臂仍是 §6.2.2 逐字的 `ISSUED -> {DONE, SKIPPED_BY_POLICY, FAILED}`。审计列 `retired_at` / `retired_by` 由函数内写入（`session_user`），`error_class` 原样保留，三者由 all-or-nothing CHECK 绑定。
 
 - **R4 execution relations（0131，尚未实现）**：`private.contribution_executions`、
   `private.contribution_execution_sources` 与 `ops.contribution_execution_job_links` 显式覆盖
@@ -3701,11 +3702,14 @@ CREATE TABLE projection.stream_log (
   commit_seq  bigint NOT NULL,   -- 仅审计总序，不参与完整性判定
   state       text NOT NULL DEFAULT 'ISSUED' CHECK (state IN
     ('ISSUED','PROCESSING','WAITING_KEY','RETRY_WAIT','LOST',
-      'DONE','SKIPPED_BY_POLICY','FAILED','TOMBSTONED')),
+      'DONE','SKIPPED_BY_POLICY','FAILED','TOMBSTONED','RETIRED_FAILED')),
   error_class text,
   issued_at   timestamptz NOT NULL DEFAULT now(),
   settled_at  timestamptz,
-  CHECK ((state IN ('DONE','SKIPPED_BY_POLICY','FAILED','TOMBSTONED')) = (settled_at IS NOT NULL)),
+  retired_at  timestamptz,             -- §15.2.1（0167）：FAILED -> RETIRED_FAILED 的审计时刻
+  retired_by  text,                    -- §15.2.1（0167）：函数内取 session_user，不可伪造
+  CHECK ((state IN ('DONE','SKIPPED_BY_POLICY','FAILED','TOMBSTONED','RETIRED_FAILED')) = (settled_at IS NOT NULL)),
+  CHECK ((state = 'RETIRED_FAILED') = (retired_at IS NOT NULL AND retired_by IS NOT NULL)),
   PRIMARY KEY (tenant_id, scope_kind, scope_id, domain,
                projection_kind, projection_version, stream_seq)
 );
@@ -3727,8 +3731,8 @@ INSERT INTO outbox_event (...) VALUES (...);
 状态分档（与 §37 一致）：
 
 ```text
-TERMINAL       = DONE | SKIPPED_BY_POLICY | FAILED | TOMBSTONED
-SETTLED_OK     = DONE | SKIPPED_BY_POLICY | TOMBSTONED
+TERMINAL       = DONE | SKIPPED_BY_POLICY | FAILED | TOMBSTONED | RETIRED_FAILED
+SETTLED_OK     = DONE | SKIPPED_BY_POLICY | TOMBSTONED | RETIRED_FAILED
 GAP            = FAILED | LOST
 PENDING        = ISSUED | PROCESSING | WAITING_KEY | RETRY_WAIT
                  -- 已知仍在流水线中的状态，不等于“丢了”
@@ -3782,6 +3786,25 @@ SELECT tenant_id, scope_kind, scope_id, domain, projection_kind, projection_vers
 FROM projection.stream_log WHERE state IN ('FAILED','LOST');
 ```
 
+### 15.2.1 `RETIRED_FAILED`：耗尽失败票据的审计退役（migration 0167，ADR-0042）
+
+`FAILED` 是终态且 ∉ `SETTLED_OK`，所以**一张 `FAILED` 票据永久钉住该 stream 的 §15.4 前缀**：首个票据窗口就撞上蒸馏失败的租户永远满足不了 §16.3 判据②（`open_gaps == 0`），永远拿不到 serving 投影，此后每次 recall 都答 `no_serving_projection`（card 16 soak21：27/27）。
+
+**「把 FAILED 算进 SETTLED_OK」已被否决**：§15.7 的反例逐字冻结了相反结论，而且前缀是 §15.5 RYW overlay 的下界，跳过一个 `FAILED` seq 等于让一条从未入索引的记录从读取面静默消失，同时 envelope 还照报完整——那是重定义 offset，不是处置记录。
+
+**本节增加的是新终态**（对齐 Kafka Connect / Debezium `errors.tolerance=all` + DLQ：**移走毒记录，offset 语义不改**）：
+
+```text
+FAILED -> RETIRED_FAILED       仅 role_migration_owner（即 SECURITY DEFINER 函数内部）
+```
+
+- **唯一入口** `projection.retire_failed_ticket(uuid, text, uuid, text, text, text, bigint, text)`：owner SECURITY DEFINER、`search_path=pg_catalog`、EXECUTE 只给 `role_maintenance`、PUBLIC 无（§6.2.2 该条，`rls-check::check_ticket_retirement_boundary` 双向钉）。调用方必须逐字点名要退役的 `error_class`，点错则退役 0 行——「把失败的都退了」正是本条要堵的笼统动作。
+- **不复用 `SKIPPED_BY_POLICY`**：那个值的语义是 §18.2 `SecretMaterial` / 策略排除，压到蒸馏失败上会让两者在每一个已经分别报数的口径里（§15.6、§23.1②）无法区分。
+- **写 `FAILED` 的角色不得退役它**：`role_retrieval_worker` 在一次 pass 的**首个**错误上就落终态、不花任何重试预算，十六个 `error_class` 里多数是瞬时基础设施故障（`qdrant_upsert_failed` / `embedding_failed` / `db_commit_failed` …），所以 `FAILED` 不等于「重试已耗尽」。真正耗尽重试的是 `humaux-private-worker`（`attempt >= max_attempts ⇒ DEAD`），但它 park 时票据还是 `ISSUED`，没有可退役的对象。退役因此是 §6.3 admin 动作，与 §15.2 `ISSUED -> LOST` 巡检同属 `role_maintenance`。
+- **审计三件套**：`retired_by`（函数内取 `session_user`，不可伪造）、`retired_at`、以及**原样保留**的 `error_class`。`(state = 'RETIRED_FAILED') = (retired_at IS NOT NULL AND retired_by IS NOT NULL)` 由 CHECK 保证，无从省略。
+- **`processing_gaps` 视图不改**：上面那段冻结文本是 `state IN ('FAILED','LOST')`，退役行的 state 已经不是 `FAILED`，自动离开 `open_gaps`。再加一处「排除 RETIRED_FAILED」就是第二份要跟状态集对齐的定义。
+- **读取面后果（这是本条的全部风险，必须写明）**：退役后该 seq 进入连续前缀，§15.5 overlay 的下界越过它，而它本来就没进索引 ⇒ **该记录对检索永久不可见**。这正是「退役」的含义，也正是它必须留审计、必须 EXECUTE 收窄、必须逐条点名失败类的原因。
+
 ## 15.3 Stream Checkpoint 与四层流水线序列
 
 ```sql
@@ -3808,7 +3831,7 @@ CREATE TABLE projection.stream_checkpoints (
 
 ```text
 contiguous_done_prefix(stream)
-  = min{ s | stream_log[s].state ∉ SETTLED_OK } − 1
+  = min{ s | stream_log[s].state ∉ SETTLED_OK } − 1     -- SETTLED_OK 见 §15.2，含 RETIRED_FAILED
   = max(stream_seq)                              当上式无解
 expected = issued_highwater   done = count(SETTLED_OK)
 open_gaps = count(processing_gaps 视图)
@@ -3969,6 +3992,8 @@ stream_seq 100 FAILED / stream_seq 101 DONE
 
 原文档写下这条却无法兑现，因为「未知」在稀疏子集上没有定义。现在可兑现：`101` 之前每一个 seq 在 stream_log 里都有行，`100` 处于 `FAILED` ∉ `SETTLED_OK`，`contiguous_done_prefix = 99`，`advance_prefix` 只能写 99。**没有票的 seq 不存在，有票没销的 seq 是洞** —— 两者都不再需要推断。
 
+同一个例子接着走完（§15.2.1，migration 0167）：运维按 §6.3 admin 路径调 `projection.retire_failed_ticket(...)` 点名退役 seq `100` 的那个 `error_class` 之后，该行 state 变 `RETIRED_FAILED` ∈ `SETTLED_OK`，`contiguous_done_prefix` 从 99 跳到 101，`advance_prefix` 写 101。**前缀算式一个字没改**——变的是那一行的 state，不是 `SETTLED_OK` 对 `FAILED` 的判定；上面那条禁止仍然逐字成立：只要 seq `100` 还是 `FAILED`，watermark 就只能停在 99。代价在 §15.2.1 末条：seq `100` 那条记录从此对检索不可见，换来的是这条流不再被一张票据永久钉死。
+
 ---
 
 # 16. Projection Engine
@@ -4048,7 +4073,13 @@ AND benchmark(shadow) 未被证伪劣化于 benchmark(serving)   -- 判据形态
 
 第一条的两个 count 各带自己的 `projection_version` filter，其余 filter（tenant + scope + tombstone overlay）逐字相同、同一时刻取，口径以 §23.1② 的 `visible` 为准。这不是措辞讲究：`visible` 若只按 tenant + scope 数，回填期两代点同处一个检索面 ⇒ 两侧读到同一个数 ⇒ 第一条恒真 ⇒ 这是一个永远不会拒绝任何切换的闸，与 §23.1② 反复堵的「恒真的闸」同病。gate：注入「shadow 少回填 1 个点」，第一条必须由真变假；不变即红。
 
-三条全真才允许切换，任一为假直接拒绝，不存在“人工判断可以上”的分支。切换是一次原子 UPDATE，旧 version 行留作回滚目标：
+三条全真才允许切换，任一为假直接拒绝，不存在“人工判断可以上”的分支。
+
+**唯一的例外是「首次激活」（first activation，ADR-0017；实现处 `crates/projection/src/serving.rs::evaluate_switch`），它不是裁量口而是缺第二个操作数**：该 family 还没有 serving 行时，第一条的 `visible(serving)` 与第三条的 `benchmark(serving)` 都不存在，**没有被比较对象**。此时①③两条按「无从证伪」处理（③ 的 `CANNOT_ESTABLISH` / `INCONCLUSIVE` 不再拒绝），②`shadow.open_gaps == 0` 仍然必须为真。**被证伪的那一侧不豁免**：③ 若给出 `FAIL`（真的量出劣化）照样拒绝首次激活 —— 一条任何输入都无法使其为假的判据不是判据（§80.1），这条反例是本分支的可观察性来源（`serving.rs::first_activation_still_refuses_a_proven_degradation`）。**非首次激活的一切照旧**：有 serving 行时三条仍全真才切，`CANNOT_ESTABLISH` / `INCONCLUSIVE` 按 §69「不得表述为『不劣于基线』」继续拒绝。
+
+不写这条例外的代价是实测出来的（soak25/26/27）：每个新租户的第一次晋升都被 ③ 以 `BenchmarkNotPass` 永久拒绝 —— 拒绝的理由是「比不出来」，而被比的东西从不存在，于是该租户永远拿不到 serving projection，之后每一次 recall 都答 `no_serving_projection` ⇒ `DEPENDENCY_UNAVAILABLE`。
+
+切换是一次原子 UPDATE，旧 version 行留作回滚目标：
 
 ```sql
 BEGIN;
@@ -4334,6 +4365,7 @@ provider
 model
 model_revision
 input_tokens
+output_tokens
 billable_tokens
 candidate_count
 candidate_tokens
@@ -4345,6 +4377,15 @@ status
 error_class
 provider_request_id
 ```
+
+`billable_tokens` 与 `output_tokens` 是**两个计价维度，不是同一个数的两处写法**：前者是按
+`provider_pricing_versions.input_token_price` 计价的那一维（§19 rerank 口径
+`query_tokens * document_count + sum(document_tokens)`；chat completion 下它等于
+`input_tokens`），后者（0168 补列）是按 `output_token_price` 计价的生成维
+（`usage.completion_tokens`）。embedding / rerank 没有生成维 ⇒ `output_tokens` 为 `null`。
+**生成类调用只记入参那一维等于记不出账**：私有推理面（§11.6 distill / §11.7 consolidation）
+的输出 token 通常主导成本，只有两维都落库，`compute_cost` 才能在价格行出现的那天把这行算成钱
+而不需要改代码。
 
 R3 `CONTRIBUTION_DEIDENTIFY` 的 route/health/payer snapshot、reserve/finalize ordering、
 idempotency 与 USER payer cost-null rule 唯一见 §11.2.5；本节不复制第二份调用账本合同。
@@ -5641,7 +5682,7 @@ persisted = count(redeemed_event_id IS NOT NULL)   <- 事务 B 累加
 
 ### ② `completeness_ratio` 的分子是 `visible`，分母是 `expected - deleted`
 
-终态集合与口径以 §37 为准：`DONE` / `SKIPPED_BY_POLICY` / `FAILED` / `TOMBSTONED`；`TOMBSTONED` 同时计入 `done`（前缀可推进）与独立的 `deleted`。
+终态集合与口径以 §37 为准：`DONE` / `SKIPPED_BY_POLICY` / `FAILED` / `TOMBSTONED` / `RETIRED_FAILED`（末者由 0167 按 §15.2 补入）；`TOMBSTONED` 同时计入 `done`（前缀可推进）与独立的 `deleted`。
 
 **本章冻结，覆盖 §37.1 与本文档其它处出现的 `(done - deleted) / (expected - deleted)` 写法：**
 
@@ -5654,13 +5695,15 @@ completeness_ratio = visible / (expected - deleted)
 | 字段 | 取数面 |
 |---|---|
 | `expected` | `projection.stream_checkpoints.issued_highwater`（= `max(stream_seq)`）—— **口径以 §15.4 冻结算式为准，与 §22.5 `ledger::close` 是同一次取数**，本表不另立第二个定义；这里的 `expected` 是 `projection.expected`，不是 ① 的 `evidence.expected` |
-| `done` / `deleted` / `skipped` | `projection.stream_log`（`deleted` = `TOMBSTONED`，`skipped` = `SKIPPED_BY_POLICY`，两者都已计入 `done`） |
+| `done` / `deleted` / `skipped` | `projection.stream_log`（`deleted` = `TOMBSTONED`，`skipped` = `SKIPPED_BY_POLICY` ∪ `RETIRED_FAILED`，两者都已计入 `done`） |
 | `open_gaps` | `projection.processing_gaps` 视图（§48） |
 | `visible` | Qdrant 索引按 tenant + scope + `projection_version = serving_version(family)` 的 count，**再扣除 tombstone overlay**（§37）：`visible = count(F) − count(F ∧ seq ∈ TOMBSTONED)`，`F` = 前述 filter —— 即检索路径在同一 filter 下实际能返回的条数（§17.1 / §16.2） |
 
 **`projection.expected` 与 ① 的 `evidence.expected` 是两个量，不是同一个量的两处写法**，分居 envelope 的 `pipeline.projection` 与 `pipeline.evidence` 两块，**禁止互相回填**：后者是批次在写入开始之前声明的票数（§23.1①），前者是这条流已经发放出去的稠密序号上界（票兑成 Evidence、`remember` 事务 B 发出 `stream_seq` 之后才有）。①「分母外生」这条只管 `evidence` 层；`projection` 层分母的外生性由 §15.1 的稠密序号 + §15.2「默认状态是未证明完成」保证 —— 序号一发就跑不掉，与被测对象声不声明「我写完了」无关。把 `projection.expected` 也改取票据表会把整条流永久钉死：G23-1a 那条注入（声明 100 只写 97）之后票数 100 而 stream_log 只有 97 行，A1 恒不闭合 ⇒ 每一个未兑完的批次都永久 `cannot_establish`，一个比值都出不来。
 
 **architecture-check（与 §37.2「12 列」那道同型）**：`LedgerCounts` 的字段集恰为 6 个 —— `expected` / `done` / `deleted` / `skipped` / `open_gaps` / `pending`，多一个少一个即红；注错：加一个 `visible: u64` ⇒ `7 != 6` ⇒ 红。它守的是 §22.5 那条冻结：分子一旦被挪进账本结构体，`ledger::close` 三次取数全在 PostgreSQL，G23-2 的两条注入就再也观察不到自己失败。
+
+**`RETIRED_FAILED` 归到 `skipped` 而不是 `deleted`，也不是第四个字段（§15.2/0167 补充，与本节其余部分同级冻结）**：A1 是 `done + open_gaps + pending == expected`，退休行既不在途也不在 `processing_gaps`（0167 把 `FAILED` 改成了别的状态，视图按构造不再收它），所以它**只能**落在 `done` 里；而它按构造从未进过索引（0167 头注：「It was never indexed either」），`visible` 里也永远没有它。于是 A2 的左边必须有一项认领它，否则**任何发生过一次退休的流，`lhs` 永远比 `done` 少 1，之后每一次 recall 都以 `PROJECTION_INVISIBLE_LOSS` 弃权** —— 一个审计过的退休被读成一次静默丢失，正好是本节要区分的三种情形里最严重的那种误判。选 `skipped` 不选 `deleted`：`skipped` 的含义就是「已结算、按构造不会可见、但不是一次删除」，退休逐字符合；而 `deleted` 同时是 §37 删除传播链的计数（分母要扣掉它、§41.2 `tombstoned_unpurged_over_sla` 要按它追物理 purge），退休行没有字节要 purge，混进去会让 §65 retention job 追一个不存在的对象，且 §37.2 冻结了 `deleted` = `count(state = 'TOMBSTONED')` 这一个定义。不设第四个字段的理由同样是冻结的：`LedgerCounts` 字段集恰为 6（见上一段那道 architecture-check），第七个字段当场红。**代价如实写在这里**：退休行留在分母里，所以该流的 `completeness_ratio` 永久 < 1.0 而 `current` 为真 —— 「有一条我永远给不出来，且我知道是哪条、谁退的、什么失败类」，这正是 envelope 该说的话，与 `SKIPPED_BY_POLICY` 的既有读数口径一致。
 
 `visible` 的两个限定都不是修饰词，各堵一个具体的洞：
 
@@ -8799,7 +8842,7 @@ envelope（§23）分母随之改写为 `expected − deleted`，并新增 envel
 
 runtime role 对 `projection.stream_log` 只有 `SELECT` / `UPDATE`，**没有 `DELETE`**（并入 §48.2 role invariant 的 CI 枚举）；物理删行只在 migration owner。删除路径唯一出口 `retention::tombstone(scope, seq)`，它在同一事务里只做一件事：把 `state` 改成 `TOMBSTONED`，没有第二个函数能改这张表的 `state`。绕过它是权限错误 + 编译错误，不是评审意见。
 
-**本节冻结：不存在 `deleted_count` 列，`retention::tombstone` 不递增任何计数器。** `deleted` 是现算量 `count(state = 'TOMBSTONED')`，与 `done` / `skipped` 同取自 `projection.stream_log`（取数面见 §23.1② 那张五行表）。判据与 §15.3 删 `open_gap_count` 逐字同型：一个能从 `state` 现算出来的计数一旦落成物化列，就是同一事实的第二真源，只能靠「每次都记得一起改」保持一致 —— 而那正是本节要消灭的纪律。tombstone 事务少写一次 `deleted_count += 1`（或重放、补偿事务多写一次），`deleted` 就与 `count(state = 'TOMBSTONED')` 永久分叉；而 §23 的 A1、以及 A2 的**账本那一侧**由同一个 `LedgerCounts` 渲染（`visible` 不在其中，字段集冻结见 §22.5 与 §23.1② 的 architecture-check），两条断言会被同一个分叉一起带偏，谁都观察不到自己错了。**验收闸**：architecture-check 断言 `projection.stream_log` 的列集合逐字等于 §15.1 DDL 的 12 列，多一列少一列即红；注错：加一列 `deleted_count bigint` ⇒ 13 != 12 ⇒ 红。同一条闸顺带盯住 `status`：它同样不在这 12 列里。
+**本节冻结：不存在 `deleted_count` 列，`retention::tombstone` 不递增任何计数器。** `deleted` 是现算量 `count(state = 'TOMBSTONED')`，与 `done` / `skipped` 同取自 `projection.stream_log`（取数面见 §23.1② 那张五行表）。判据与 §15.3 删 `open_gap_count` 逐字同型：一个能从 `state` 现算出来的计数一旦落成物化列，就是同一事实的第二真源，只能靠「每次都记得一起改」保持一致 —— 而那正是本节要消灭的纪律。tombstone 事务少写一次 `deleted_count += 1`（或重放、补偿事务多写一次），`deleted` 就与 `count(state = 'TOMBSTONED')` 永久分叉；而 §23 的 A1、以及 A2 的**账本那一侧**由同一个 `LedgerCounts` 渲染（`visible` 不在其中，字段集冻结见 §22.5 与 §23.1② 的 architecture-check），两条断言会被同一个分叉一起带偏，谁都观察不到自己错了。**验收闸**：architecture-check 断言 `projection.stream_log` 的列集合逐字等于 §15.1 DDL 的列（原 12 列 + 0167 的两个 §15.2.1 审计列 `retired_at` / `retired_by`，共 14；审计列是关于一次迁移的事实，不是能从 `state` 现算的计数，故不在本节要消灭的「第二真源」之列），多一列少一列即红；注错：加一列 `deleted_count bigint` ⇒ 15 != 14 ⇒ 红。同一条闸顺带盯住 `status`：它同样不在这 14 列里。
 
 
 ## Privacy Disclosure Ledger / Deletion Propagation
@@ -15060,7 +15103,7 @@ gate-anchor-check：登记表两列必须整体是锚，且每个锚可解析（
 gate-registry-coverage：家章带 id 的闸无遗漏（G80-24，§80.1.2）
 R4 fault manifest closure（G80-44，§11.2.5.1#G11-3）
 Active anonymous safe topology（G80-45，§70.5#G70-1）
-stream_log 列集合 == §15.1 DDL 的 12 列（G80-25，§37.2）
+stream_log 列集合 == §15.1 DDL 的列集合（原 12 列 + 0167 审计列 `retired_at`/`retired_by`，共 14）（G80-25，§37.2）
 role / grant 全集枚举（G80-26，§48.2）
 诊断轴闸 G55-6（G80-27，§55.6）
 切版判据非恒真的注错测试（G80-28，§16.3）
@@ -15232,7 +15275,7 @@ G80-23  gate-anchor-check（PR）
           只做注错 a 时，一个只查 id 存在性、不查散文的实现照样全绿 —— 而本表要防的病
           恰恰是散文（同 §53.3 规则 3「本该命中的样本」）
   注错 c  把 §53.6 的标题改成 §53.7 ⇒ G80-9 的 §53.6 锚定位不到标题行 ⇒ ③ 红
-  注错 d  把 §37.2 里「注错：加一列 deleted_count bigint ⇒ 13 != 12 ⇒ 红」整句删掉，判据留着
+  注错 d  把 §37.2 里「注错：加一列 deleted_count bigint …」整句删掉，判据留着
           ⇒ §37.2 正文不再含「注错」「注入」⇒ G80-25 那行 ④ 红。
           这条钉住「锚指到的地方真的留了注错记录」，不是随便指到一节散文
   注错 e  把 G80-7 的注错出处改成 — ⇒ NOT_ADMITTED 行数 0 → 1 而存档是 0 ⇒ ⑤ 红；

@@ -3459,6 +3459,109 @@ pub fn check_derived_work_dispatch_boundary(client: &mut impl GenericClient) -> 
 const DERIVED_CLAIM_FN: &str = "ops.claim_derived_work(text[],text,double precision,bigint)";
 const DERIVED_CLAIM_EXECUTORS: &[&str] = &["role_consolidation_worker", "role_private_worker"];
 
+const RETIRE_FAILED_FN: &str =
+    "projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)";
+/// §6.3 admin path only. The projection worker WRITES `FAILED` (its sole `role_retrieval_worker`
+/// edge) on the first error of a pass, with no retry budget spent, so it must not also be able to
+/// settle that failure OK — see `migrations/0167_retired_failed_ticket.sql`'s header for the
+/// sixteen `error_class` values that reach it, most of them transient infrastructure.
+const RETIRE_FAILED_EXECUTORS: &[&str] = &["role_maintenance"];
+
+/// §15.2/§15.4 (migration 0167, ADR-0042): `FAILED -> RETIRED_FAILED` has exactly one door.
+///
+/// Two independent halves, both required:
+/// * the door itself — `projection.retire_failed_ticket` is owner-owned, SECURITY DEFINER with a
+///   pinned `search_path`, EXECUTE held by exactly `role_maintenance`, PUBLIC revoked (the same
+///   R3/0164 definer pin, via [`check_owner_definer_function`]);
+/// * the wall — `projection.stream_log_guard_state_transition` still admits the new state ONLY
+///   on the owner arm (`current_user` inside a definer function IS the owner and is not
+///   spoofable), and `role_retrieval_worker`'s arm is still the verbatim §6.2.2 triple. Without
+///   the second half the first is decoration: `role_retrieval_worker` holds table-level UPDATE on
+///   `projection.stream_log` and would simply write the state directly.
+///
+/// Missing objects ⇒ `not_applicable` with the object named (§57.1).
+pub fn check_ticket_retirement_boundary(client: &mut impl GenericClient) -> GateResult {
+    let check = "§15.2/§15.4 FAILED ticket retirement boundary";
+    let exists: bool = match client.query_one(
+        "SELECT to_regprocedure($1) IS NOT NULL",
+        &[&RETIRE_FAILED_FN],
+    ) {
+        Ok(row) => row.get(0),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    if !exists {
+        return not_applicable(check, format!("missing {RETIRE_FAILED_FN}"));
+    }
+
+    let mut problems = Vec::new();
+    check_owner_definer_function(
+        client,
+        &mut problems,
+        RETIRE_FAILED_FN,
+        RETIRE_FAILED_EXECUTORS,
+    );
+
+    match client.query_opt(
+        "SELECT pg_get_userbyid(proowner), prosrc FROM pg_proc \
+         WHERE oid = to_regprocedure('projection.stream_log_guard_state_transition()')",
+        &[],
+    ) {
+        Ok(Some(row)) => {
+            let owner: String = row.get(0);
+            let src: String = row.get(1);
+            if owner != OWNER_ROLE {
+                problems.push(format!(
+                    "stream_log_guard_state_transition: expected owner={OWNER_ROLE}, actual {owner}"
+                ));
+            }
+            if !src.contains("actor = 'role_migration_owner'")
+                || !src.contains("NEW.state = 'RETIRED_FAILED'")
+            {
+                problems.push(
+                    "stream_log_guard_state_transition: the FAILED -> RETIRED_FAILED edge must be \
+                     admitted on the owner arm only (0167)"
+                        .to_string(),
+                );
+            }
+            if !src.contains(
+                "OLD.state = 'ISSUED' AND NEW.state IN ('DONE','SKIPPED_BY_POLICY','FAILED')",
+            ) {
+                problems.push(
+                    "stream_log_guard_state_transition: role_retrieval_worker's arm is no longer \
+                     the verbatim §6.2.2 triple ISSUED -> {DONE,SKIPPED_BY_POLICY,FAILED}"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(None) => problems
+            .push("projection.stream_log_guard_state_transition() is missing (0011/0167)".into()),
+        Err(error) => problems.push(format!("transition guard probe failed: {error}")),
+    }
+
+    match client.query_opt(
+        "SELECT 1 FROM pg_trigger WHERE tgrelid = 'projection.stream_log'::regclass \
+           AND tgname = 'stream_log_guard_state_transition' AND NOT tgisinternal",
+        &[],
+    ) {
+        Ok(Some(_)) => {}
+        Ok(None) => problems
+            .push("projection.stream_log has no stream_log_guard_state_transition trigger".into()),
+        Err(error) => problems.push(format!("trigger probe failed: {error}")),
+    }
+
+    if problems.is_empty() {
+        pass(
+            check,
+            "projection.retire_failed_ticket: owner SECURITY DEFINER, search_path pinned, EXECUTE \
+             exactly {role_maintenance}, PUBLIC revoked; the stream_log transition guard admits \
+             FAILED -> RETIRED_FAILED on the owner arm only and keeps role_retrieval_worker at \
+             ISSUED -> {DONE,SKIPPED_BY_POLICY,FAILED}",
+        )
+    } else {
+        fail(check, problems.join("; "))
+    }
+}
+
 /// Owner + definer + pinned `search_path` + the exact EXECUTE list, PUBLIC included.
 fn check_derived_claim_function(client: &mut impl GenericClient, problems: &mut Vec<String>) {
     check_owner_definer_function(client, problems, DERIVED_CLAIM_FN, DERIVED_CLAIM_EXECUTORS);
@@ -3604,6 +3707,7 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_w2_continuity_boundary(&mut client));
             results.push(check_subject_visibility_policy(&mut client));
             results.push(check_derived_work_dispatch_boundary(&mut client));
+            results.push(check_ticket_retirement_boundary(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -3621,6 +3725,7 @@ pub fn run(_args: &[String]) -> i32 {
                 "W2 Project Continuity read boundary",
                 "§6.1.3 subject visibility RESTRICTIVE policy",
                 "§31/§61 derived work cross-tenant dispatch",
+                "§15.2/§15.4 FAILED ticket retirement boundary",
             ] {
                 results.push(fail_for(name, &conn_err));
             }

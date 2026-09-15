@@ -14,9 +14,12 @@
 //!
 //! ## Per-row order (§17.4, verbatim in the task card)
 //!
-//! (a) read the next ISSUED `stream_log` rows for this key: (b) resolve the bound
-//! `private.memory_records` row through `ops.outbox`/`private.memory_evidence` (c)
-//! `embed_cards` (d) reject a dimension mismatch (e) build a `QdrantPointPayload` (f)
+//! (a) read the next ISSUED `stream_log` rows for this key: (b) resolve the bound Memories —
+//! ALL `private.memory_records` rows the ticket's Evidence carries, through
+//! `ops.outbox`/`private.memory_evidence` (see `resolve_memories`: one Evidence routinely
+//! carries N memories, and card 9 reported that only the first one used to be projected) (c)
+//! `embed_cards` (one batched call for the whole Evidence) (d) reject a short batch or a
+//! dimension mismatch (e) build a `QdrantPointPayload` per memory (f)
 //! [`crate::qdrant::upsert`] (g) [`crate::private_projection_registry::register_private_memory_point`]
 //! (h) [`crate::qdrant::verify_visible_via_transport`] (i) only then mark the row `DONE` (j)
 //! [`crate::stream_repo::advance_prefix`] once for the whole batch.
@@ -182,7 +185,7 @@ pub struct RunOnceOutcome {
 /// branch. PostgreSQL's planner constant-folds that stable-function cast at *plan time*
 /// (verified: even a bare `EXPLAIN`, no `ANALYZE`, throws 22P02 on a leaked `''`) — before the
 /// executor's branch-level short-circuiting would ever get a chance to skip it — so re-pinning
-/// a valid value here every transaction is the only way to keep this worker's `resolve_memory`
+/// a valid value here every transaction is the only way to keep this worker's `resolve_memories`
 /// join from crashing on a `TENANT_SHARED`-evidence row it has every right to read.
 async fn set_worker_rls_context(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -291,16 +294,30 @@ struct ResolvedMemory {
     affects: Vec<AffectAnnotation>,
 }
 
-/// (b): resolves one `stream_log` row's bound Memory through `ops.outbox` ->
-/// `private.memory_evidence` -> `private.memory_records`/`private.evidence_objects` — see
-/// module doc for why a row this worker cannot see under RLS resolves to `Ok(None)`, not an
-/// error.
-async fn resolve_memory(
+/// (b): resolves the Memories one `stream_log` row's bound Evidence carries, through
+/// `ops.outbox` -> `private.memory_evidence` -> `private.memory_records`/
+/// `private.evidence_objects` — see module doc for why rows this worker cannot see under RLS
+/// resolve to an empty `Vec`, not an error.
+///
+/// **ALL of them, not the PRIMARY one** (card 9's reported limit, closed by card 20 / ADR-0042).
+/// A ticket binds an EVIDENCE, and one Evidence routinely carries N Memories: `distill` writes
+/// every memory it extracted against the single Evidence the `remember` ticket was issued for,
+/// `memory_governance_repo::issue_lifecycle_ticket` binds the target memory's PRIMARY Evidence,
+/// and 0155's backfill does the same. With `ORDER BY (role='PRIMARY') DESC, ordinal ASC LIMIT 1`
+/// every one of those three issuers could only ever get the FIRST memory indexed — a
+/// lifecycle change to memory #2 of an Evidence re-projected memory #1 and silently dropped
+/// itself, and a multi-output distill indexed one card out of N. Generalising the resolution
+/// here (rather than at each of the three issuers, or by adding a memory-bound ticket shape)
+/// is the single point every ticket already routes through.
+///
+/// The `ORDER BY` is kept: it makes the projection order deterministic (PRIMARY first), which
+/// is what the partial-failure retry in [`process_row`] leans on.
+async fn resolve_memories(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,
     commit_seq: i64,
-) -> Result<Option<ResolvedMemory>, sqlx::Error> {
-    let row = sqlx::query(
+) -> Result<Vec<ResolvedMemory>, sqlx::Error> {
+    let rows = sqlx::query(
         "SELECT m.memory_id, m.content, m.visibility_class, m.visibility_user_id, \
                 m.visibility_workspace_id, m.memory_type, m.status, m.authority_class, \
                 m.occurred_at, m.effective_from, m.created_at, m.updated_at, eo.data_class, \
@@ -310,15 +327,28 @@ async fn resolve_memory(
          JOIN private.memory_records m ON m.memory_id = me.memory_id \
          JOIN private.evidence_objects eo ON eo.evidence_id = ob.evidence_id \
          WHERE ob.tenant_id = $1 AND ob.commit_seq = $2 \
-         ORDER BY (me.role = 'PRIMARY') DESC, me.ordinal ASC \
-         LIMIT 1",
+         ORDER BY (me.role = 'PRIMARY') DESC, me.ordinal ASC",
     )
     .bind(tenant_id)
     .bind(commit_seq)
-    .fetch_optional(&mut **txn)
+    .fetch_all(&mut **txn)
     .await?;
-    let Some(row) = row else { return Ok(None) };
+    let mut resolved = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(memory) = parse_resolved_memory(txn, tenant_id, row).await? {
+            resolved.push(memory);
+        }
+    }
+    Ok(resolved)
+}
 
+/// One `resolve_memories` row -> [`ResolvedMemory`]; `Ok(None)` for a row whose closed-enum
+/// wire values this build does not know (same fail-soft the single-row version had).
+async fn parse_resolved_memory(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    row: sqlx::postgres::PgRow,
+) -> Result<Option<ResolvedMemory>, sqlx::Error> {
     let visibility_class: String = row.try_get("visibility_class")?;
     let Some(class) = parse_visibility_class(&visibility_class) else {
         return Ok(None);
@@ -461,22 +491,47 @@ async fn process_row(
 ) -> (RowTerminal, &'static str) {
     let workspace_id = WorkspaceId(deps.family.scope_id);
 
-    let (memory, vector) = match resolve_and_embed(deps, workspace_id, commit_seq).await {
-        Ok(pair) => pair,
+    let prepared = match resolve_and_embed(deps, workspace_id, commit_seq).await {
+        Ok(prepared) => prepared,
         Err(terminal) => return terminal,
     };
 
-    finish_row(deps, stream_seq, workspace_id, memory, vector).await
+    // One ticket, N memories (see `resolve_memories`). The row's terminal is the fold:
+    //   * the FIRST failure short-circuits the whole row to `FAILED` — §15.7 already requires
+    //     one failed seq to block the prefix, and the retry is safe because every step
+    //     `finish_row` performs is idempotent on a deterministic `point_id` (upsert,
+    //     `AlreadyRegistered`, verify), so the memories that already landed simply land again;
+    //   * `SKIPPED_BY_POLICY` is per-memory (§18.2 secret material), so it only becomes the
+    //     row's terminal when NO memory on this Evidence was indexable;
+    //   * one indexed memory makes the row `DONE`.
+    let mut any_done = false;
+    let mut skipped: Option<(RowTerminal, &'static str)> = None;
+    for (memory, vector) in prepared {
+        match finish_row(deps, stream_seq, workspace_id, memory, vector).await {
+            (RowTerminal::Done, _) => any_done = true,
+            (RowTerminal::SkippedByPolicy, class) => {
+                skipped = Some((RowTerminal::SkippedByPolicy, class));
+            }
+            other => return other,
+        }
+    }
+    if any_done {
+        (RowTerminal::Done, "")
+    } else {
+        // `resolve_and_embed` returns a non-empty vec or an `Err`, so `skipped` is `Some` here.
+        skipped.unwrap_or((RowTerminal::Failed, "no_visible_memory_record"))
+    }
 }
 
-/// (b)-(d) of the module doc's per-row order: resolve the bound Memory, build+seal its card,
-/// and embed it. Split out of [`process_row`] purely to stay under this repo's line-count
-/// lint — see that function for the full per-row order.
+/// (b)-(d) of the module doc's per-row order: resolve the bound Evidence's Memories, build+seal
+/// each card, and embed them in ONE batch. Split out of [`process_row`] purely to stay under
+/// this repo's line-count lint — see that function for the full per-row order. Returns a
+/// non-empty vec or an `Err`.
 async fn resolve_and_embed(
     deps: &ProjectionWorkerDeps,
     workspace_id: WorkspaceId,
     commit_seq: i64,
-) -> Result<(ResolvedMemory, Vec<f32>), (RowTerminal, &'static str)> {
+) -> Result<Vec<(ResolvedMemory, Vec<f32>)>, (RowTerminal, &'static str)> {
     let mut txn = deps
         .pool
         .pool()
@@ -486,10 +541,10 @@ async fn resolve_and_embed(
     set_worker_rls_context(&mut txn, deps.family.tenant_id.0)
         .await
         .map_err(|_| (RowTerminal::Failed, "db_rls_context_failed"))?;
-    let memory = resolve_memory(&mut txn, deps.family.tenant_id.0, commit_seq)
+    let memories = resolve_memories(&mut txn, deps.family.tenant_id.0, commit_seq)
         .await
         .map_err(|_| (RowTerminal::Failed, "db_resolve_failed"))?;
-    let outbox_status: Option<String> = if memory.is_none() {
+    let outbox_status: Option<String> = if memories.is_empty() {
         sqlx::query_scalar(
             "SELECT status FROM ops.outbox WHERE tenant_id = $1 AND commit_seq = $2 \
              AND event_type = 'EVIDENCE_ACCEPTED' ORDER BY created_at DESC LIMIT 1",
@@ -505,29 +560,46 @@ async fn resolve_and_embed(
     txn.commit()
         .await
         .map_err(|_| (RowTerminal::Failed, "db_commit_failed"))?;
-    let memory = memory.ok_or_else(|| terminal_for_missing_memory(outbox_status.as_deref()))?;
+    if memories.is_empty() {
+        return Err(terminal_for_missing_memory(outbox_status.as_deref()));
+    }
 
-    let input = card_input(&memory, workspace_id);
-    let card = match build_card(input, CardBudget::default()) {
-        CardBuildOutcome::Card(card) => card,
-        CardBuildOutcome::ExcludedSecret => {
-            return Err((RowTerminal::SkippedByPolicy, "secret_material"));
-        }
-        CardBuildOutcome::Unbuildable => return Err((RowTerminal::Failed, "card_unbuildable")),
-    };
+    // §18.2 `ExcludedSecret` is a property of ONE memory, not of the ticket: on an Evidence that
+    // carries a secret memory and an ordinary one, the ordinary one must still be indexed. Only
+    // an Evidence where NOTHING is indexable settles the row `SKIPPED_BY_POLICY`. `Unbuildable`
+    // stays a whole-row failure — it means the stored record itself is malformed (§18.4).
+    let mut kept: Vec<ResolvedMemory> = Vec::with_capacity(memories.len());
+    let mut sealed_cards = Vec::with_capacity(memories.len());
+    let mut memory_ids: Vec<Uuid> = Vec::with_capacity(memories.len());
+    for memory in memories {
+        let card = match build_card(card_input(&memory, workspace_id), CardBudget::default()) {
+            CardBuildOutcome::Card(card) => card,
+            CardBuildOutcome::ExcludedSecret => continue,
+            CardBuildOutcome::Unbuildable => {
+                return Err((RowTerminal::Failed, "card_unbuildable"));
+            }
+        };
+        sealed_cards.push(
+            deps.scanner
+                .seal_card(&card)
+                .map_err(|_| (RowTerminal::Failed, "secret_scan_failed"))?,
+        );
+        memory_ids.push(memory.memory_id.0);
+        kept.push(memory);
+    }
+    if kept.is_empty() {
+        return Err((RowTerminal::SkippedByPolicy, "secret_material"));
+    }
 
-    let sealed = deps
-        .scanner
-        .seal_card(&card)
-        .map_err(|_| (RowTerminal::Failed, "secret_scan_failed"))?;
-
+    // One embed call for the whole Evidence — `embed_cards` is already batch-shaped, so N
+    // memories cost one provider round trip, not N (§19.2 per-purpose budget).
     let vectors = deps
         .embedder
         .embed_cards(
             deps.family.tenant_id,
             deps.dimension,
-            &[sealed],
-            &[memory.memory_id.0],
+            &sealed_cards,
+            &memory_ids,
         )
         .await
         .map_err(|code| {
@@ -535,18 +607,18 @@ async fn resolve_and_embed(
             eprintln!("projection_worker: commit_seq={commit_seq} embedding_failed code={code:?}");
             (RowTerminal::Failed, "embedding_failed")
         })?;
-    // (d): reject a dimension mismatch — checked against the actual returned vector length,
-    // since this trait carries no separate `EmbeddingBatch::dimension` field (see
-    // `CardEmbedder`'s doc).
-    let vector = vectors
-        .into_iter()
-        .next()
-        .ok_or((RowTerminal::Failed, "embedding_batch_empty"))?;
-    if vector.len() != deps.dimension as usize {
+    // (d): reject a short batch or a dimension mismatch — checked against the actual returned
+    // vector lengths, since this trait carries no separate `EmbeddingBatch::dimension` field
+    // (see `CardEmbedder`'s doc). A provider that returns fewer vectors than cards would
+    // otherwise silently drop the tail memories of a multi-memory Evidence.
+    if vectors.len() != kept.len() {
+        return Err((RowTerminal::Failed, "embedding_batch_empty"));
+    }
+    if vectors.iter().any(|v| v.len() != deps.dimension as usize) {
         return Err((RowTerminal::Failed, "embedding_dimension_mismatch"));
     }
 
-    Ok((memory, vector))
+    Ok(kept.into_iter().zip(vectors).collect())
 }
 
 /// (e)-(h) of the module doc's per-row order: build the payload, upsert, register, verify.

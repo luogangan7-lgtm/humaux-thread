@@ -31,6 +31,7 @@ use humaux_domain::egress::{
 };
 use humaux_domain::error::ErrorCode;
 use humaux_domain::ids::TenantId;
+use humaux_domain::ledger::ModelCallPurpose;
 use humaux_infra_egress::http::{EnvCredentialSource, HttpEgressConfig, HttpExternalCall};
 use serde::{Deserialize, Serialize};
 
@@ -631,7 +632,7 @@ impl DashscopeEmbeddingProvider {
                 request_id: query_call.map(|(context, _)| context.request_id()),
                 tenant_id: tenant_id.0,
                 workspace_id: query_call.map(|(context, _)| context.workspace_id().0),
-                purpose: Some("embedding".to_string()),
+                purpose: Some(ModelCallPurpose::Embedding),
                 provider: "dashscope".to_string(),
                 model: Some(self.model.model_id.0.clone()),
                 model_revision: Some(self.model.model_revision.clone()),

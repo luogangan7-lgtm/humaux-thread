@@ -617,6 +617,18 @@ fn run_pass(
     })
 }
 
+/// This tenant's `ops.model_call_ledger` rows on the distill purposes (§19.1), as `observe`
+/// reads them back.
+#[derive(Debug, Clone)]
+struct LedgerRow {
+    rows: i64,
+    status: Option<String>,
+    purpose: Option<String>,
+    model: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+}
+
 /// Everything D1–D5 read back about one Evidence.
 struct Observed {
     memories: i64,
@@ -631,6 +643,11 @@ struct Observed {
     run_parser_version: String,
     disclosure_outcomes: Vec<String>,
     rpc_calls: i64,
+    /// Card 20's primary acceptance gate: the §19.1 cost row that must exist ALONGSIDE the §7.4
+    /// disclosure row, not instead of it. Deleting `distill_reasoner`'s `reserve_private_call` /
+    /// `finalize_private_call` makes this go red, which is what "the ledger covers this hop"
+    /// has to mean.
+    ledger: LedgerRow,
 }
 
 fn observe(f: &mut Fixture, evidence_id: Uuid) -> Observed {
@@ -642,7 +659,24 @@ fn observe(f: &mut Fixture, evidence_id: Uuid) -> Observed {
                (SELECT count(*) FROM private.memory_evidence me WHERE me.evidence_id = $1 AND me.role = 'PRIMARY' AND me.ordinal = 0) AS primary_links, \
                (SELECT coalesce(array_agg(m.authority_class), ARRAY[]::text[]) FROM private.memory_records m JOIN private.memory_evidence me ON me.memory_id = m.memory_id WHERE me.evidence_id = $1) AS classes, \
                (SELECT status FROM ops.outbox WHERE evidence_id = $1 AND event_type = 'EVIDENCE_ACCEPTED') AS outbox_status, \
-               (SELECT count(*) FROM ops.private_inference_rpc_calls c WHERE c.tenant_id = $2) AS rpc_calls",
+               (SELECT count(*) FROM ops.private_inference_rpc_calls c WHERE c.tenant_id = $2) AS rpc_calls, \
+               (SELECT count(*) FROM ops.model_call_ledger l WHERE l.tenant_id = $2 \
+                  AND l.purpose IN ('PRIVATE_DISTILL_TEXT','PRIVATE_DISTILL_VISION')) AS ledger_rows, \
+               (SELECT l.status FROM ops.model_call_ledger l WHERE l.tenant_id = $2 \
+                  AND l.purpose IN ('PRIVATE_DISTILL_TEXT','PRIVATE_DISTILL_VISION') \
+                  ORDER BY l.called_at DESC LIMIT 1) AS ledger_status, \
+               (SELECT l.purpose FROM ops.model_call_ledger l WHERE l.tenant_id = $2 \
+                  AND l.purpose IN ('PRIVATE_DISTILL_TEXT','PRIVATE_DISTILL_VISION') \
+                  ORDER BY l.called_at DESC LIMIT 1) AS ledger_purpose, \
+               (SELECT l.model FROM ops.model_call_ledger l WHERE l.tenant_id = $2 \
+                  AND l.purpose IN ('PRIVATE_DISTILL_TEXT','PRIVATE_DISTILL_VISION') \
+                  ORDER BY l.called_at DESC LIMIT 1) AS ledger_model, \
+               (SELECT l.input_tokens FROM ops.model_call_ledger l WHERE l.tenant_id = $2 \
+                  AND l.purpose IN ('PRIVATE_DISTILL_TEXT','PRIVATE_DISTILL_VISION') \
+                  ORDER BY l.called_at DESC LIMIT 1) AS ledger_input_tokens, \
+               (SELECT l.output_tokens FROM ops.model_call_ledger l WHERE l.tenant_id = $2 \
+                  AND l.purpose IN ('PRIVATE_DISTILL_TEXT','PRIVATE_DISTILL_VISION') \
+                  ORDER BY l.called_at DESC LIMIT 1) AS ledger_output_tokens",
             &[&evidence_id, &f.tenant_id],
         )
         .expect("observe");
@@ -651,6 +685,14 @@ fn observe(f: &mut Fixture, evidence_id: Uuid) -> Observed {
     let classes: Vec<String> = row.get("classes");
     let outbox_status: String = row.get("outbox_status");
     let rpc_calls: i64 = row.get("rpc_calls");
+    let ledger = LedgerRow {
+        rows: row.get("ledger_rows"),
+        status: row.get("ledger_status"),
+        purpose: row.get("ledger_purpose"),
+        model: row.get("ledger_model"),
+        input_tokens: row.get("ledger_input_tokens"),
+        output_tokens: row.get("ledger_output_tokens"),
+    };
     let visibility = f
         .admin
         .query(
@@ -697,6 +739,7 @@ fn observe(f: &mut Fixture, evidence_id: Uuid) -> Observed {
         run_parser_version: run.get("parser_version"),
         disclosure_outcomes,
         rpc_calls,
+        ledger,
     }
 }
 
@@ -976,6 +1019,33 @@ fn d1_live_distill_writes_memories_and_projection_resolves_ticket() {
     );
     assert_eq!(o.run_parser_version, DISTILL_PARSER_VERSION);
     assert_eq!(o.disclosure_outcomes, vec!["SUCCESS".to_owned()]);
+    // Card 20 acceptance, the positive half: ONE §19.1 ledger row for this provider call, with
+    // the right purpose/model/status and real token usage — BOTH it and the §7.4 disclosure row
+    // above, never either alone. Deleting `distill_reasoner::infer`'s `reserve_private_call` or
+    // `finalize_private_call` turns this red.
+    let l = &o.ledger;
+    assert_eq!(
+        l.rows, 1,
+        "exactly one ops.model_call_ledger row for the distill provider call"
+    );
+    assert_eq!(l.status.as_deref(), Some("SUCCEEDED"));
+    assert_eq!(l.purpose.as_deref(), Some("PRIVATE_DISTILL_TEXT"));
+    assert!(
+        l.model.as_deref().is_some_and(|m| !m.is_empty()),
+        "ledger row carries the admitted provider model, got {:?}",
+        l.model
+    );
+    assert!(
+        l.input_tokens.is_some_and(|v| v > 0),
+        "input_tokens from the provider's usage block, got {:?}",
+        l.input_tokens
+    );
+    assert!(
+        l.output_tokens.is_some_and(|v| v > 0),
+        "output_tokens (0168) from the provider's usage block — a generative call bills them \
+         and they used to be parsed and discarded, got {:?}",
+        l.output_tokens
+    );
     assert_eq!(
         o.rpc_calls, 0,
         "rpc-free: no ops.private_inference_rpc_calls row"
@@ -999,7 +1069,7 @@ fn d1_live_distill_writes_memories_and_projection_resolves_ticket() {
     println!(
         "D1 ASSERTION LOG: evidence={evidence_id} report={report:?} memories={} classes={:?} \
          visibility=WORKSPACE_SHARED/{} outbox={} run(completed={},output_count={:?},source_hash_len={},parser_version={},source_hash_recomputes=true) \
-         disclosures={:?} rpc_calls={} projection(done={},failed={},highwater={}) ticket=({state},{error_class:?})",
+         disclosures={:?} rpc_calls={} ledger={:?} projection(done={},failed={},highwater={}) ticket=({state},{error_class:?})",
         o.memories,
         o.classes,
         f.workspace_id,
@@ -1010,6 +1080,7 @@ fn d1_live_distill_writes_memories_and_projection_resolves_ticket() {
         o.run_parser_version,
         o.disclosure_outcomes,
         o.rpc_calls,
+        o.ledger,
         outcome.done,
         outcome.failed,
         outcome.projection_highwater,

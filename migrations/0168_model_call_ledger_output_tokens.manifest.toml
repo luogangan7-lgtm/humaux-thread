@@ -1,0 +1,61 @@
+# §46.1 migration manifest. ADR-0042 (card 20, §19.1): add the generative OUTPUT token leg to
+# `ops.model_call_ledger` so the two hops card 20 exists to meter can actually be priced —
+# `control.provider_pricing_versions.output_token_price` has existed since 0095 and
+# `retrieval_provider::cost::compute_cost` has always taken both dimensions, but the ledger had
+# nowhere to keep the second one. One nullable outcome column + the two guard functions that
+# enumerate the outcome columns by name. No new table, no new role, no new GRANT, no RLS change,
+# no DML. §46 forward-fix (EXPAND_CONTRACT, first free number after 0167).
+
+migration_id = "0168_model_call_ledger_output_tokens"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+ -- the table and its input-side sibling exist, and the new column does not yet
+ (select count(*)=1 from information_schema.columns
+   where table_schema='ops' and table_name='model_call_ledger' and column_name='billable_tokens')
+ and (select count(*)=0 from information_schema.columns
+       where table_schema='ops' and table_name='model_call_ledger' and column_name='output_tokens')
+ -- the two guards this migration rewrites are the ones currently installed
+ and to_regprocedure('ops.model_call_ledger_guard_mutation()') is not null
+ and to_regprocedure('ops.reasoning_model_call_validate()') is not null
+ -- 0166's widened purpose set is already in place (this migration is the second half of the
+ -- same ADR and must not be applied to a tree that never got the first)
+ and (select pg_get_constraintdef(oid) like '%PRIVATE_CONSOLIDATE%'
+      from pg_constraint where conrelid='ops.model_call_ledger'::regclass
+        and conname='model_call_ledger_purpose_known')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- the column exists, nullable, bigint, with the same >= 0 CHECK its three siblings carry
+ (select count(*)=1 from information_schema.columns
+   where table_schema='ops' and table_name='model_call_ledger'
+     and column_name='output_tokens' and data_type='bigint' and is_nullable='YES')
+ and (select count(*)=1 from pg_constraint
+       where conrelid='ops.model_call_ledger'::regclass and contype='c'
+         and pg_get_constraintdef(oid) like '%output_tokens%'
+         and pg_get_constraintdef(oid) like '%>= 0%')
+ -- both guards name the new column, so it is set-once like every other outcome column
+ and (select prosrc like '%OLD.output_tokens IS NOT NULL%'
+      from pg_proc where oid='ops.model_call_ledger_guard_mutation()'::regprocedure)
+ and (select prosrc like '%NEW.output_tokens%'
+      from pg_proc where oid='ops.reasoning_model_call_validate()'::regprocedure)
+ -- guard_mutation kept everything it guarded before (append-only + USER-paid cost rule)
+ and (select prosrc like '%append-only%' and prosrc like '%never record platform actual cost%'
+      from pg_proc where oid='ops.model_call_ledger_guard_mutation()'::regprocedure)
+ -- reasoning_model_call_validate is still SECURITY DEFINER owned by the migration owner
+ and (select p.prosecdef and pg_get_userbyid(p.proowner)='role_migration_owner'
+      from pg_proc p where p.oid='ops.reasoning_model_call_validate()'::regprocedure)
+ -- RLS posture and grant surface untouched by the ALTER
+ and (select relrowsecurity and relforcerowsecurity
+      from pg_class where oid='ops.model_call_ledger'::regclass)
+ and has_table_privilege('role_private_worker','ops.model_call_ledger','UPDATE')
+ and has_table_privilege('role_retrieval_worker','ops.model_call_ledger','UPDATE')
+ and not has_table_privilege('role_private_worker','ops.model_call_ledger','DELETE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. The column is additive and nullable, so a revert is ALTER TABLE ops.model_call_ledger DROP COLUMN output_tokens plus restoring 0130's two guard bodies — but that DELETES recorded spend evidence, which is the opposite of what an append-only ledger is for. The honest revert is to stop writing the column (revert the Rust leg) and leave it in place holding NULL; nothing reads it except a pricing rollup that treats NULL as 'no output dimension'."
+backup_restore_requirement = "none: ADD COLUMN of a nullable column with no default (no table rewrite in PostgreSQL 11+), plus two CREATE OR REPLACE FUNCTION bodies that differ from the installed ones only by naming one more column. No row is read, rewritten or deleted."

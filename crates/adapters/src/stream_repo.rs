@@ -27,6 +27,7 @@ use humaux_retrieval::completeness::{
 };
 
 use crate::postgres::{MaintenanceDbPool, RetrievalWorkerDbPool};
+use crate::retrieve::SETTLED_OK_SQL_LIST;
 
 type Txn<'c> = sqlx::Transaction<'c, sqlx::Postgres>;
 
@@ -144,7 +145,7 @@ async fn fetch_snapshot_in_txn(
     let agg_row = bind_key(
         sqlx::query(&format!(
             "SELECT \
-               count(*) FILTER (WHERE state IN ('DONE','SKIPPED_BY_POLICY','TOMBSTONED')) AS done, \
+               count(*) FILTER (WHERE state IN ({SETTLED_OK_SQL_LIST})) AS done, \
                count(*) FILTER (WHERE state IN ('ISSUED','PROCESSING','WAITING_KEY','RETRY_WAIT')) AS pending \
              FROM projection.stream_log WHERE {KEY_WHERE}"
         )),
@@ -187,7 +188,7 @@ async fn fetch_snapshot_in_txn(
         sqlx::query(&format!(
             "WITH first_gap AS ( \
                SELECT MIN(stream_seq) AS s FROM projection.stream_log \
-                WHERE {KEY_WHERE} AND state NOT IN ('DONE','SKIPPED_BY_POLICY','TOMBSTONED') \
+                WHERE {KEY_WHERE} AND state NOT IN ({SETTLED_OK_SQL_LIST}) \
              ) \
              SELECT COALESCE( \
                (SELECT s - 1 FROM first_gap WHERE s IS NOT NULL), \
@@ -220,10 +221,21 @@ pub(crate) async fn close_ledger_in_txn(
     key: &StreamKey,
 ) -> Result<LedgerClosure, sqlx::Error> {
     let snapshot = fetch_snapshot_in_txn(txn, key).await?;
+    // §23.1② A2 is `visible + deleted + skipped == done`, so EVERY state inside `done` must
+    // land in exactly one of the three left-hand terms or A2 is permanently one short. 0167's
+    // `RETIRED_FAILED` is inside `done` (A1 — `done + open_gaps + pending == expected` — leaves
+    // it nowhere else: a retired row is neither pending nor an open gap), and by construction it
+    // is never in the index (0167 header: "It was never indexed either"), so it belongs on the
+    // `skipped` term — the "settled, will never be visible, not a deletion" bucket
+    // `SKIPPED_BY_POLICY` already defines. Counting it anywhere else, or nowhere, makes every
+    // recall on a stream that ever had one retirement abstain with `ProjectionInvisibleLoss`
+    // forever, which is the read-side failure 0167's own header analysed only for the §15.4
+    // prefix. §23.1② amended with this citation.
     let row = bind_key(
         sqlx::query(&format!(
             "SELECT count(*) FILTER (WHERE state = 'TOMBSTONED') AS deleted, \
-                    count(*) FILTER (WHERE state = 'SKIPPED_BY_POLICY') AS skipped \
+                    count(*) FILTER (WHERE state IN ('SKIPPED_BY_POLICY','RETIRED_FAILED')) \
+                      AS skipped \
              FROM projection.stream_log WHERE {KEY_WHERE}"
         )),
         key,
@@ -258,6 +270,23 @@ pub async fn fetch_ledger_snapshot(
     Ok(snapshot)
 }
 
+/// Public, read-only entry point for [`close_ledger_in_txn`] — the §23.1② A1/A2 inputs as the
+/// envelope path reads them, same transaction shape [`fetch_ledger_snapshot`] uses. The
+/// in-request callers (`retrieve`/`context_repo`) already hold their own transaction; this is
+/// for an out-of-band reader (ops, and the closure tests that must exercise the REAL counting
+/// query rather than a fixture's copy of it — a copy is how the `RETIRED_FAILED` A2 hole got
+/// past every existing envelope test).
+pub async fn fetch_ledger_closure(
+    pool: &RetrievalWorkerDbPool,
+    key: &StreamKey,
+) -> Result<LedgerClosure, StreamRepoError> {
+    let mut txn = pool.pool().begin().await?;
+    set_tenant_local(&mut txn, key.tenant_id.0).await?;
+    let closure = close_ledger_in_txn(&mut txn, key).await?;
+    txn.commit().await?;
+    Ok(closure)
+}
+
 /// §15.4 `advance_prefix`: fetches the independent snapshot, validates it
 /// (`humaux_projection::stream::advance_prefix`), and — only if it validates — writes
 /// `stream_checkpoints.projection_highwater` monotonically (`WHERE projection_highwater <=
@@ -287,6 +316,68 @@ pub async fn advance_prefix(
     txn.commit().await?;
 
     Ok(n)
+}
+
+/// §15.2/§15.4 audited retirement (migration `0167`, ADR-0042): moves this family's exhausted
+/// `FAILED` tickets **of one named failure class** into `RETIRED_FAILED`, and returns the
+/// `stream_seq`s actually retired.
+///
+/// The write itself is `projection.retire_failed_ticket(...)`, the owner SECURITY DEFINER
+/// function 0167 creates — `role_maintenance` holds nothing but EXECUTE on it, and the 0011/0167
+/// transition trigger admits `FAILED -> RETIRED_FAILED` only when `current_user` is the owner, so
+/// this is the only path in the workspace that can produce that state. Two statements on purpose
+/// (read the candidates, then retire them one by one): the function is per-ticket because the
+/// audit is per-ticket, and a "retire everything that failed" statement is precisely the blanket
+/// action 0167's header rejects.
+///
+/// `failure_class` must equal the row's own `error_class` — naming the wrong class retires
+/// nothing rather than something else. Runs under [`MaintenanceDbPool`] with the tenant GUC
+/// installed by this function, which is also what scopes the definer's own write (0167 sets no
+/// tenant context of its own, deliberately).
+pub async fn retire_failed(
+    pool: &MaintenanceDbPool,
+    key: &StreamKey,
+    failure_class: &str,
+) -> Result<Vec<i64>, StreamRepoError> {
+    let mut txn = pool.pool().begin().await?;
+    set_tenant_local(&mut txn, key.tenant_id.0).await?;
+
+    let candidates: Vec<i64> = bind_key(
+        sqlx::query(&format!(
+            "SELECT stream_seq FROM projection.stream_log \
+              WHERE {KEY_WHERE} AND state = 'FAILED' \
+                AND error_class IS NOT DISTINCT FROM $7 \
+              ORDER BY stream_seq"
+        )),
+        key,
+    )
+    .bind(failure_class)
+    .fetch_all(&mut *txn)
+    .await?
+    .iter()
+    .map(|row| row.try_get::<i64, _>("stream_seq"))
+    .collect::<Result<_, _>>()?;
+
+    let mut retired = Vec::with_capacity(candidates.len());
+    for stream_seq in candidates {
+        let n: i64 = bind_key(
+            sqlx::query(
+                "SELECT projection.retire_failed_ticket($1,$2,$3,$4,$5,$6,$7,$8)::bigint AS n",
+            ),
+            key,
+        )
+        .bind(stream_seq)
+        .bind(failure_class)
+        .fetch_one(&mut *txn)
+        .await?
+        .try_get("n")?;
+        if n == 1 {
+            retired.push(stream_seq);
+        }
+    }
+    txn.commit().await?;
+
+    Ok(retired)
 }
 
 /// §15.2 `ISSUED -> LOST` patrol for one tenant: an orphaned ticket (no matching in-flight

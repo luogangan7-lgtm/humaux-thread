@@ -17,7 +17,10 @@
 //! (loaded via [`load_pricing_versions`] below); this module only ever persists whatever
 //! number its caller already computed.
 //!
-//! Runtime role: [`RetrievalWorkerDbPool`] (§6.2.1 `ops.* = R + W` domain default — this table
+//! Runtime roles: [`RetrievalWorkerDbPool`] for the §19/§20 retrieval hops and
+//! [`PrivateWorkerDbPool`] for the §11.6/§11.7 private reasoning hops ([`reserve_private_call`]/
+//! [`finalize_private_call`], card 20) — both reach the same `reserve_in_txn`/`finalize_in_txn`
+//! statements. (§6.2.1 `ops.* = R + W` domain default — this table
 //! is not one of §6.2.2's named tables, same reasoning `disclosure.rs` documents for
 //! `ops.data_disclosures`). `control.provider_pricing_versions` is `control.* = R`-only for
 //! every runtime role (§6.2.1) — [`load_pricing_versions`] only ever `SELECT`s it.
@@ -25,12 +28,14 @@
 use humaux_application::consolidate::{
     ContributionReasoningCallKind, LogicalReasoningCallId, ReasoningIntentSha256,
 };
+use humaux_domain::ledger::ModelCallPurpose;
 use sqlx::Row;
 use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
 use crate::{
-    postgres::RetrievalWorkerDbPool, reasoning_route_admission::ReasoningAdmissionLocator,
+    postgres::{PrivateWorkerDbPool, RetrievalWorkerDbPool},
+    reasoning_route_admission::ReasoningAdmissionLocator,
 };
 
 const REASONING_REQUEST_ADVISORY_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended('model-call-request:' || $1::uuid::text || ':' || $2::uuid::text,0))";
@@ -81,13 +86,14 @@ impl ModelCallOutcome {
 }
 
 /// [`reserve_call`]'s input — the identity/estimate columns known before the external call is
-/// made. `purpose` is caller-supplied text rather than a Rust enum: this table's closed set
-/// (`migrations/0094_model_call_ledger_fields.sql`'s `model_call_ledger_purpose_known` CHECK)
-/// is a DB-level contract this module does not re-derive a second copy of — an unknown value
-/// surfaces as a [`ModelCallLedgerError`] from the CHECK violation, the same split
-/// `disclosure.rs`'s `purpose_as_db_str` avoids needing (that one *does* mirror a Rust enum,
-/// because `PrivateDataPurpose` already exists in `domain::egress` for other reasons; no such
-/// enum exists for this table's purpose values).
+/// made. `purpose` is the closed [`ModelCallPurpose`] enum (§78.2 "禁止 stringly-typed
+/// domain"), mirrored value-for-value by `model_call_ledger_purpose_known`
+/// (`migrations/0166_model_call_ledger_private_purposes.sql`) and pinned in both directions by
+/// `crates/adapters/tests/model_call_ledger.rs::db_purpose_check_mirrors_the_rust_closed_set`.
+/// It was caller-supplied `String` until card 20: with only the three retrieval values that
+/// split was survivable, but once the private reasoning hops write the same table a free
+/// string is a second, unchecked vocabulary for the column that decides whose budget was
+/// burned — the exact drift `disclosure.rs`'s `purpose_as_db_str` already avoids.
 #[derive(Debug, Clone)]
 pub struct ReserveCall {
     /// Caller's idempotency key for the logical call — `None` mints a fresh one
@@ -98,7 +104,7 @@ pub struct ReserveCall {
     pub request_id: Option<Uuid>,
     pub tenant_id: Uuid,
     pub workspace_id: Option<Uuid>,
-    pub purpose: Option<String>,
+    pub purpose: Option<ModelCallPurpose>,
     pub provider: String,
     pub model: Option<String>,
     pub model_revision: Option<String>,
@@ -140,7 +146,7 @@ pub(crate) enum ReasoningCallLookup {
     },
 }
 
-const CONTRIBUTION_DEIDENTIFY: &str = "CONTRIBUTION_DEIDENTIFY";
+const CONTRIBUTION_DEIDENTIFY: &str = ModelCallPurpose::ContributionDeidentify.as_db_str();
 
 fn reasoning_snapshot_matches(
     row: &sqlx::postgres::PgRow,
@@ -341,7 +347,7 @@ async fn reserve_in_txn(
     .bind(request_id)
     .bind(input.tenant_id)
     .bind(input.workspace_id)
-    .bind(&input.purpose)
+    .bind(input.purpose.map(ModelCallPurpose::as_db_str))
     .bind(&input.provider)
     .bind(&input.model)
     .bind(&input.model_revision)
@@ -389,12 +395,68 @@ pub async fn reserve_call(
     Ok(reserved)
 }
 
+/// One private-reasoning [`ReserveCall`] built from the admitted route — the single place the
+/// §11.6 distill and §11.7 consolidation hops turn a resolved route into a ledger reservation,
+/// so the two cannot drift on which columns a private row carries.
+///
+/// `workspace_id` is `None` (these hops are tenant-scoped background work, not a per-request
+/// write stream) and `estimated_cost` is `None` by construction: §19/§78.1 put cost arithmetic
+/// in `humaux_retrieval_provider::cost` against a `control.provider_pricing_versions` row, and
+/// the private reasoning models carry no pricing row — a fabricated 0 would be worse than the
+/// honest NULL (§23.3④ "禁止填 `0` … 充数"). Token usage still lands at finalize.
+///
+/// Every 0130 route column stays NULL: those belong to the USER-paid CONTRIBUTION_DEIDENTIFY
+/// arm of `model_call_ledger_reasoning_snapshot_shape`, and distill/consolidation are
+/// platform-paid. See `migrations/0166_model_call_ledger_private_purposes.sql`.
+#[must_use]
+pub fn private_reserve_call(
+    purpose: ModelCallPurpose,
+    locator: &ReasoningAdmissionLocator,
+) -> ReserveCall {
+    ReserveCall {
+        request_id: None,
+        tenant_id: locator.tenant_id,
+        workspace_id: None,
+        purpose: Some(purpose),
+        provider: locator.processor_id.clone(),
+        model: Some(locator.provider_model_id.clone()),
+        model_revision: locator.model_revision.clone(),
+        estimated_cost: None,
+    }
+}
+
+/// §19.1 reserve() for the **private reasoning plane** (§11.6 distill, §11.7 consolidation) —
+/// the exact same `reserve_in_txn` INSERT [`reserve_call`] runs, reached with the pool role
+/// those hops actually hold. Two entry points, one registration point: the `PgPool` accessors
+/// on `postgres::*DbPool` are `pub(crate)` (G6-DB1 keeps the role a *type*, not a convention),
+/// so a per-role wrapper is the only way to share one write path across roles — exactly the
+/// split `disclosure::reserve_private`/`reserve_retrieval` already uses for `ops.data_disclosures`.
+///
+/// Before card 20 these hops had no ledger leg at all (`distill_reasoner.rs`/
+/// `consolidation_reasoner.rs` module docs both recorded the absence), so the two most
+/// expensive paths in the system produced a §7.4 disclosure receipt and no cost row anywhere.
+pub async fn reserve_private_call(
+    pool: &PrivateWorkerDbPool,
+    input: &ReserveCall,
+) -> Result<ReservedCall, ModelCallLedgerError> {
+    let mut txn = pool.pool().begin().await?;
+    let reserved = reserve_in_txn(&mut txn, input).await?;
+    txn.commit().await?;
+    Ok(reserved)
+}
+
 /// [`finalize_call`]'s input — the outcome columns only known after the external call
 /// returns. All optional: a `Failed` outcome from a provider that never responded (e.g.
 /// `ErrorCode::ProviderTransient`) legitimately has no token/latency numbers at all.
 #[derive(Debug, Clone, Default)]
 pub struct FinalizeCall {
     pub input_tokens: Option<i64>,
+    /// Generated tokens the provider reported (`usage.completion_tokens`, 0168). Distinct from
+    /// [`Self::billable_tokens`] on purpose: `billable_tokens` is the dimension priced at
+    /// `input_token_price`, this one is the dimension priced at `output_token_price`, and
+    /// `retrieval_provider::cost::compute_cost` has always taken both. `None` for a call with
+    /// no output dimension (embedding/rerank) or a provider that never answered.
+    pub output_tokens: Option<i64>,
     pub billable_tokens: Option<i64>,
     pub candidate_count: Option<i32>,
     pub candidate_tokens: Option<i64>,
@@ -420,7 +482,7 @@ async fn finalize_in_txn(
         "UPDATE ops.model_call_ledger \
          SET status = $3, input_tokens = $4, billable_tokens = $5, candidate_count = $6, \
              candidate_tokens = $7, cache_hit = $8, latency_ms = $9, actual_cost = $10, \
-             error_class = $11, provider_request_id = $12 \
+             error_class = $11, provider_request_id = $12, output_tokens = $13 \
          WHERE model_call_id = $1 AND tenant_id = $2 AND status = 'RESERVED'",
     )
     .bind(model_call_id)
@@ -435,6 +497,7 @@ async fn finalize_in_txn(
     .bind(finalize.actual_cost)
     .bind(&finalize.error_class)
     .bind(&finalize.provider_request_id)
+    .bind(finalize.output_tokens)
     .execute(&mut **txn)
     .await?;
     Ok(result.rows_affected() > 0)
@@ -479,6 +542,26 @@ pub(crate) async fn finalize_reasoning_call_in_txn(
 /// `bool`, matching `disclosure::finalize_in_txn`'s own convention) rather than as a write.
 pub async fn finalize_call(
     pool: &RetrievalWorkerDbPool,
+    tenant_id: Uuid,
+    model_call_id: Uuid,
+    outcome: ModelCallOutcome,
+    finalize: &FinalizeCall,
+) -> Result<bool, ModelCallLedgerError> {
+    let mut txn = pool.pool().begin().await?;
+    let changed = finalize_in_txn(&mut txn, tenant_id, model_call_id, outcome, finalize).await?;
+    txn.commit().await?;
+    Ok(changed)
+}
+
+/// §19.1 finalize() for the private reasoning plane — [`finalize_call`]'s statement, reached
+/// with `role_private_worker`. See [`reserve_private_call`] for why the pair exists.
+///
+/// A failed provider call finalizes here too (`ModelCallOutcome::Failed` + `error_class`):
+/// card 20's acceptance is explicit that a failure must leave a ledger row *recording the
+/// failure*, never nothing — a RESERVED row that is never finalized is indistinguishable from
+/// a worker that crashed mid-call.
+pub async fn finalize_private_call(
+    pool: &PrivateWorkerDbPool,
     tenant_id: Uuid,
     model_call_id: Uuid,
     outcome: ModelCallOutcome,

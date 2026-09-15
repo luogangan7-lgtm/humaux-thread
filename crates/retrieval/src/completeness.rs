@@ -438,16 +438,19 @@ pub mod ledger {
         /// `projection.stream_checkpoints.issued_highwater` — §23.1② table's
         /// `projection.expected` (not `evidence.expected`, a different quantity, §23.1②).
         pub expected: u64,
-        /// `count(state IN ('DONE','SKIPPED_BY_POLICY','TOMBSTONED'))` — the §15.2 SETTLED_OK
-        /// union, not decomposed (§23.3 worked example: `done 95 = 90 DONE + 3 TOMBSTONED + 2
-        /// SKIPPED_BY_POLICY`).
+        /// `count(state IN ('DONE','SKIPPED_BY_POLICY','TOMBSTONED','RETIRED_FAILED'))` — the
+        /// §15.2 SETTLED_OK union as 0167 widened it, not decomposed (§23.3 worked example:
+        /// `done 95 = 90 DONE + 3 TOMBSTONED + 2 SKIPPED_BY_POLICY`).
         pub done: u64,
         /// `count(state = 'TOMBSTONED')` — a subset already counted inside `done` above, also
         /// reported standalone: §23.1②'s A2 and the `visible` overlay both need it on its own.
         pub deleted: u64,
-        /// `count(state = 'SKIPPED_BY_POLICY')` — subset of `done`, reported standalone so A2
-        /// can credit it on its own left-hand term without it inflating the denominator
-        /// (§23.1②: "计入 A2 左边、不进分母").
+        /// `count(state IN ('SKIPPED_BY_POLICY','RETIRED_FAILED'))` — subset of `done`,
+        /// reported standalone so A2 can credit it on its own left-hand term without it
+        /// inflating the denominator (§23.1②: "计入 A2 左边、不进分母"). 0167's audited
+        /// retirement joins this term rather than `deleted`: it is settled and can never become
+        /// visible (so A2 needs it here), but it is not a §37 deletion (so it must not leave the
+        /// denominator, and it has no bytes for the §65 purge job to chase).
         pub skipped: u64,
         /// `count(*)` from the `projection.processing_gaps` view (`FAILED | LOST`, §15.1).
         pub open_gaps: u64,

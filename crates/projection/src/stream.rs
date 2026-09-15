@@ -101,7 +101,8 @@ impl StreamKey {
 pub struct StreamLedgerSnapshot {
     /// `stream_checkpoints.issued_highwater` (§15.4: `expected = issued_highwater`).
     pub expected: u64,
-    /// `count(state IN SETTLED_OK)` — `DONE | SKIPPED_BY_POLICY | TOMBSTONED` (§15.2).
+    /// `count(state IN SETTLED_OK)` — `DONE | SKIPPED_BY_POLICY | TOMBSTONED | RETIRED_FAILED`
+    /// (§15.2, widened by migration 0167's audited retirement).
     pub done: u64,
     /// `count(state IN PENDING)` — `ISSUED | PROCESSING | WAITING_KEY | RETRY_WAIT` (§15.2).
     pub pending: u64,

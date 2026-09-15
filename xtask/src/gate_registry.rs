@@ -1237,7 +1237,11 @@ mod tests {
     /// 注错 d: §37.2 里的注错句整句删掉，判据留着 ⇒ 正文不再含「注错」「注入」⇒ ④ 红.
     #[test]
     fn fault_d_removing_fault_sentence_is_check4_red() {
-        let text = mutate("注错：加一列 `deleted_count bigint` ⇒ 13 != 12 ⇒ 红。", "");
+        // The needle stops before the arithmetic on purpose: the column count in that
+        // sentence moves every time §15.1's DDL gains a column (0167 took it 12 -> 14), and a
+        // fixture that quotes the numbers goes red on a spec edit that did nothing wrong.
+        // Dropping the 注错 token alone is what check ④ actually observes.
+        let text = mutate("注错：加一列 `deleted_count bigint`", "");
         assert!(fails(&run_all(&text), "G80-23④"));
     }
 

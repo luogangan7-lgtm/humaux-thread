@@ -453,7 +453,7 @@ fn seed_memory_with_visibility(
 }
 
 /// Like [`seed_memory_with_visibility`] but the backing Evidence row gets its own
-/// `visibility_*` triple too. `resolve_memory` INNER JOINs `private.evidence_objects`, so a
+/// `visibility_*` triple too. `resolve_memories` INNER JOINs `private.evidence_objects`, so a
 /// memory whose PRIMARY evidence is `USER_PRIVATE`/`WORKSPACE_SHARED` is only resolvable
 /// because migration 0140 widened *both* policies for `role_retrieval_worker` — the earlier
 /// fixture always wrote `TENANT_SHARED` evidence and therefore never exercised that half of
@@ -1314,7 +1314,7 @@ fn cross_user_dense_query_still_enforces_user_private_visibility() {
     );
 }
 
-/// 0140 must widen the evidence half of `resolve_memory`'s INNER JOIN too: a memory whose
+/// 0140 must widen the evidence half of `resolve_memories`' INNER JOIN too: a memory whose
 /// PRIMARY evidence is `USER_PRIVATE`/`WORKSPACE_SHARED` (the shape `remember.rs` writes when
 /// the request says so) has to index and advance the checkpoint, not settle FAILED and freeze
 /// the tenant under §15.7. Fault F-evidence: drop the role clause from
@@ -1736,6 +1736,132 @@ fn subject_visibility_policy_gates_gateway_reads_but_never_the_retrieval_worker(
                 "insufficient_privilege, not a boolean: {denied}"
             );
             txn.rollback().expect("rollback acl probe");
+        },
+    );
+}
+
+/// Adds a SECOND memory bound to the SAME Evidence as `sibling_of`, exactly the shape
+/// `distill_repo::persist` writes when one pass extracts N memories from one Evidence
+/// (`role='PRIMARY', ordinal 0` per memory, distill_repo.rs:457) — the multi-memory Evidence
+/// every ticket issuer in the system can produce and that card 9 reported as unhandled.
+fn attach_sibling_memory(handle: &mut Handle, sibling_of: Uuid, content: &str) -> Uuid {
+    let evidence_id: Uuid = handle
+        .admin
+        .query_one(
+            "SELECT evidence_id FROM private.memory_evidence WHERE memory_id = $1 \
+             ORDER BY (role = 'PRIMARY') DESC, ordinal ASC LIMIT 1",
+            &[&sibling_of],
+        )
+        .expect("the first memory's evidence")
+        .get(0);
+    let content_json = serde_json::json!({
+        "title": format!("title: {content}"),
+        "key_claim": format!("key claim: {content}"),
+        "evidence_excerpt": content,
+    });
+    let mut txn = handle.admin.transaction().expect("sibling txn");
+    let memory_id: Uuid = txn
+        .query_one(
+            "INSERT INTO private.memory_records \
+               (tenant_id, memory_type, content, visibility_class, visibility_user_id, \
+                visibility_workspace_id, authority_class, confidence, status, asserted_at) \
+             VALUES ($1,'NOTE',$2,'TENANT_SHARED',NULL,NULL,'PrivateKnowledge',0.9,'active',now()) \
+             RETURNING memory_id",
+            &[&handle.tenant_id, &content_json],
+        )
+        .expect("insert sibling memory")
+        .get(0);
+    txn.execute(
+        "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, ordinal) \
+         VALUES ($1, $2, 'PRIMARY', 0)",
+        &[&memory_id, &evidence_id],
+    )
+    .expect("link the sibling to the same evidence");
+    txn.commit().expect("commit sibling");
+    memory_id
+}
+
+/// Card 9's reported limit, closed by card 20 (ADR-0042): a ticket binds an EVIDENCE, and one
+/// Evidence routinely carries N memories (`distill_repo` writes one `PRIMARY` row per extracted
+/// memory against the single Evidence `remember` issued the ticket for). The worker used to
+/// resolve `ORDER BY (role='PRIMARY') DESC, ordinal ASC LIMIT 1`, so memories 2..N of every
+/// multi-output distill were never indexed, and a MEMORY_LIFECYCLE / 0155-backfill ticket aimed
+/// at memory #2 silently re-projected memory #1 instead.
+///
+/// Both halves are asserted here on ONE causal chain: the remember-time ticket must index BOTH
+/// memories, and the re-issued lifecycle ticket must re-project BOTH (not just the PRIMARY-first
+/// one). Fault control: restore the `LIMIT 1` in `projection_worker::resolve_memories` and the
+/// first `point_id_for_memory(sibling)` lookup panics — there is no registered point for it.
+#[test]
+fn one_ticket_projects_every_memory_its_evidence_carries() {
+    run_db_fixture::<Fixture, _>(
+        "one_ticket_projects_every_memory_its_evidence_carries",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let (_, memory_a) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "first memory of a two-memory evidence",
+                "TENANT_SHARED",
+                None,
+                None,
+            );
+            let memory_b =
+                attach_sibling_memory(&mut handle, memory_a, "second memory of the same evidence");
+
+            let provider = Arc::new(TestDoubleProvider::new(
+                embedding_model(),
+                unused_rerank_model(),
+            ));
+            let deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("run_once succeeds");
+            assert_eq!(
+                (outcome.done, outcome.failed),
+                (1, 0),
+                "one ticket, one row settled DONE — N memories is not N rows"
+            );
+
+            let point_a = point_id_for_memory(&mut handle, memory_a);
+            let point_b = point_id_for_memory(&mut handle, memory_b);
+            assert_ne!(
+                point_a, point_b,
+                "each memory gets its own deterministic point id"
+            );
+            let permit = authorize_cell_access(
+                &handle.registry,
+                IntraCellResource::QDRANT_REST,
+                Duration::from_secs(30),
+            )
+            .expect("admin Qdrant permit");
+            let scrolled = scroll_payloads(&handle, &permit, &[point_a, point_b]);
+            let indexed = scrolled["result"]["points"].as_array().map_or(0, Vec::len);
+            assert_eq!(indexed, 2, "both memories are in the index: {scrolled}");
+
+            // Second half: a lifecycle ticket aimed at the SIBLING re-projects it, rather than
+            // resolving PRIMARY-first back to memory_a and dropping the sibling's change.
+            let reissued = reissue_lifecycle_ticket(&mut handle, scope_id, memory_b);
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("second run_once succeeds");
+            assert_eq!((outcome.done, outcome.failed), (1, 0));
+            let key = (
+                handle.tenant_id,
+                "workspace",
+                scope_id,
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            );
+            assert_eq!(stream_log_state(&mut handle, &key, reissued), "DONE");
+            assert_eq!(
+                point_id_for_memory(&mut handle, memory_b),
+                point_b,
+                "same deterministic point id: the sibling's payload was rewritten in place"
+            );
         },
     );
 }

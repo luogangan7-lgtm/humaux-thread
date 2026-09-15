@@ -114,8 +114,9 @@ pub struct SwitchCriteria {
     /// the **shadow** version's full [`StreamKey`] — §16.3's second criterion,
     /// `shadow.open_gaps == 0`.
     /// §16.2 first activation (ADR-0017): the family has NO serving version yet, so there is
-    /// nothing to compare the shadow against — the shadow read-back, zero open gaps and a
-    /// passing continuation verdict are the whole criterion. Derived by the DB layer from the
+    /// nothing to compare the shadow against — the shadow read-back and zero open gaps are the
+    /// whole criterion, and criterion ③'s comparison has no second operand either (see
+    /// [`evaluate_switch`]; a *proven* `Fail` still refuses). Derived by the DB layer from the
     /// checkpoint rows, never declared by a caller.
     pub first_activation: bool,
     pub shadow_open_gaps: u64,
@@ -199,7 +200,29 @@ pub fn evaluate_switch(criteria: &SwitchCriteria) -> Result<(), Vec<SwitchReject
         rejections.push(SwitchRejection::OpenGaps);
     }
 
-    if criteria.continuation != ContinuationVerdict::Pass {
+    // §16.3 criterion ③ is a comparison — "benchmark(shadow) 未被证伪劣化于 benchmark(serving)"
+    // (Baseline_2.9.md:4046). ADR-0017 first activation: the family has no serving version, so
+    // there is no `benchmark(serving)` to compare against and no baseline the §69 gate could have
+    // been run on. That is the SAME missing second operand criterion ① is already exempted for
+    // ten lines above; leaving it in force meant `continuation_198_v2` (NOT_DECLARED, §69:12477 —
+    // "写入前 Continuation Gate 输出 cannot_establish") refused every fresh tenant's FIRST
+    // promotion forever, which is how soak25/26/27 reported `BenchmarkNotPass` on a first
+    // activation that had nothing to be worse than.
+    //
+    // A proven `Fail` still refuses even here, and that is not decoration: it is the injection
+    // that keeps this branch observable (`first_activation_still_refuses_a_proven_degradation`).
+    // A criterion no input can ever fail is not a criterion (§80.1).
+    //
+    // Everything OFF the first-activation path is untouched: with a serving version present the
+    // gate still requires `Pass`, so `Inconclusive` / `CannotEstablish` keep refusing exactly as
+    // §69 ("INCONCLUSIVE ... 不得表述为『不劣于基线』") and the earlier card that pinned this
+    // required.
+    let benchmark_refused = if criteria.first_activation {
+        criteria.continuation == ContinuationVerdict::Fail
+    } else {
+        criteria.continuation != ContinuationVerdict::Pass
+    };
+    if benchmark_refused {
         rejections.push(SwitchRejection::BenchmarkNotPass);
     }
 
@@ -388,17 +411,16 @@ mod tests {
              (card 20) — criterion ① must not still report VisibleUnavailable"
         );
 
-        // ADR-0017 first activation: the candidate read-back alone is criterion ①.
+        // ADR-0017 first activation: the candidate read-back alone is criterion ①, and with no
+        // serving version there is no benchmark to be worse than either — so this now holds
+        // outright. That is card 20's folded debt 2: the same criteria refused `BenchmarkNotPass`
+        // before, on a promotion that had no baseline in the first place.
         let first = SwitchCriteria {
             visible_serving: None,
             first_activation: true,
             ..taken.clone()
         };
-        assert!(
-            !evaluate_switch(&first)
-                .unwrap_err()
-                .contains(&SwitchRejection::VisibleUnavailable)
-        );
+        assert_eq!(evaluate_switch(&first), Ok(()));
 
         // Either side missing on a non-first activation is still a refusal, both directions.
         for missing in [
@@ -449,6 +471,69 @@ mod tests {
             evaluate_switch(&c),
             Err(vec![SwitchRejection::BenchmarkNotPass])
         );
+    }
+
+    /// Card 20 folded debt 2, the positive half: on a FIRST activation §69's undeclared baseline
+    /// (`CannotEstablish`) and an `Inconclusive` run are both "there is no baseline", not
+    /// "shadow is worse" — criterion ③ has no second operand, exactly like criterion ①. Before
+    /// this, `continuation_198_v2` being NOT_DECLARED (§69) made a fresh tenant's first promotion
+    /// unreachable by construction, and the soak reported `BenchmarkNotPass` on switches that had
+    /// in fact succeeded through `xtask projection-serve`'s own declared verdict.
+    #[test]
+    fn first_activation_needs_no_benchmark_because_there_is_no_baseline() {
+        for verdict in [
+            ContinuationVerdict::CannotEstablish,
+            ContinuationVerdict::Inconclusive,
+            ContinuationVerdict::Pass,
+        ] {
+            let c = SwitchCriteria {
+                visible_serving: None,
+                first_activation: true,
+                continuation: verdict,
+                ..all_true()
+            };
+            assert_eq!(evaluate_switch(&c), Ok(()), "first activation, {verdict:?}");
+        }
+    }
+
+    /// …and the injection that keeps the exemption above from being a gate that can never fire:
+    /// a *proven* degradation (§69 `FAIL`) refuses a first activation too. If this ever goes
+    /// green, criterion ③ has stopped being a criterion on that path (§80.1).
+    #[test]
+    fn first_activation_still_refuses_a_proven_degradation() {
+        let c = SwitchCriteria {
+            visible_serving: None,
+            first_activation: true,
+            continuation: ContinuationVerdict::Fail,
+            ..all_true()
+        };
+        assert_eq!(
+            evaluate_switch(&c),
+            Err(vec![SwitchRejection::BenchmarkNotPass])
+        );
+    }
+
+    /// The exemption is scoped to the first activation and nothing else: with a serving version
+    /// present there IS a `benchmark(serving)`, so `CannotEstablish` and `Inconclusive` keep
+    /// refusing (the two tests above this one) — pinned here as one explicit pair so a future
+    /// widening of the `first_activation` branch cannot quietly take the normal path with it.
+    #[test]
+    fn a_real_promotion_still_requires_the_benchmark_to_pass() {
+        for verdict in [
+            ContinuationVerdict::CannotEstablish,
+            ContinuationVerdict::Inconclusive,
+            ContinuationVerdict::Fail,
+        ] {
+            let c = SwitchCriteria {
+                continuation: verdict,
+                ..all_true()
+            };
+            assert_eq!(
+                evaluate_switch(&c),
+                Err(vec![SwitchRejection::BenchmarkNotPass]),
+                "non-first activation, {verdict:?}"
+            );
+        }
     }
 
     #[test]

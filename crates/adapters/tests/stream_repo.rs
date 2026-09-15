@@ -12,6 +12,7 @@ use humaux_adapters::postgres::{MaintenanceDbPool, RetrievalWorkerDbPool};
 use humaux_adapters::stream_repo::{self, AdvanceError};
 use humaux_domain::ids::TenantId;
 use humaux_projection::stream::StreamKey;
+use humaux_retrieval::completeness::LedgerClosure;
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
 use sqlx::types::Uuid;
@@ -414,6 +415,371 @@ fn sweep_lost_sweeps_orphan_but_spares_owned_and_fresh_issued() {
                 .expect("row must exist")
                 .get(0);
             assert_eq!(error_class.as_deref(), Some("ORPHANED_PIPELINE_ITEM"));
+        },
+    );
+}
+
+// =============================================================================================
+// §15.2.1 / §15.4 — the audited FAILED -> RETIRED_FAILED retirement (migration 0167, ADR-0042).
+// =============================================================================================
+
+/// Seeds the §15.7 worked example in miniature — seq 1 `DONE`, seq 2 `FAILED` with a named
+/// `error_class`, seq 3 `DONE` — plus the checkpoint that claims all three were issued.
+fn seed_one_failed_between_two_done(handle: &mut Handle, k: &StreamKey, failure_class: &str) {
+    let now = SystemTime::now();
+    seed_log_row(&mut handle.admin, k, 1, "DONE", now);
+    seed_log_row(&mut handle.admin, k, 2, "FAILED", now);
+    seed_log_row(&mut handle.admin, k, 3, "DONE", now);
+    // `settle_row` writes the class alongside the state; the seed helper only writes the state,
+    // so the class is set here. Not a transition (state is unchanged), so the 0011/0167 guard
+    // returns early and this stays a plain owner UPDATE.
+    handle
+        .admin
+        .execute(
+            "UPDATE projection.stream_log SET error_class = $8 \
+             WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND domain=$4 \
+               AND projection_kind=$5 AND projection_version=$6 AND stream_seq=$7",
+            &[
+                &k.tenant_id.0,
+                &k.scope_kind,
+                &k.scope_id,
+                &k.domain,
+                &k.projection_kind,
+                &k.projection_version,
+                &2i64,
+                &failure_class,
+            ],
+        )
+        .expect("tag the failed ticket with its error_class");
+    seed_checkpoint(&mut handle.admin, k, 3);
+}
+
+/// The whole point of the state (card 18's debt 1, card 20's migration 0167): a settled `FAILED`
+/// ticket pins §15.4's contiguous prefix at 1 no matter how many later seqs settle OK, and the
+/// audited retirement releases it to 3.
+///
+/// This asserts the WRITE path's copy (`stream_repo::fetch_ledger_snapshot`'s four-number
+/// cross-check). The read path's copy moves with it by construction — both interpolate
+/// `retrieve::SETTLED_OK_SQL_LIST`, pinned against the enum by
+/// `retrieve::contract_tests::settled_ok_sql_list_matches_the_enum` — and is asserted live in
+/// `retrieve_read_your_writes.rs::retired_seq_leaves_the_overlay_and_enters_the_contiguous_prefix`,
+/// which needs the gateway pool this fixture does not carry. Card 18 stored "fix only the
+/// reader's copy" as a `rejected` decision; this is the other half of honouring it.
+///
+/// This test is its own fault control: take the `retire_failed` call away and the post-retirement
+/// assertions read the pre-retirement numbers (prefix 1, `open_gaps` 1) and go red.
+#[test]
+fn retirement_unpins_the_contiguous_done_prefix_in_both_copies() {
+    run_db_fixture::<StreamFixture, _>(
+        "retirement_unpins_the_contiguous_done_prefix_in_both_copies",
+        |mut handle| {
+            let k = key(&handle);
+            seed_one_failed_between_two_done(&mut handle, &k, "distill_failed");
+
+            let before = handle
+                .rt
+                .block_on(stream_repo::fetch_ledger_snapshot(&handle.retrieval, &k))
+                .expect("snapshot must read");
+            assert_eq!(
+                before.contiguous_done_prefix, 1,
+                "§15.7: the FAILED row at seq 2 pins the prefix at 1, even though seq 3 settled OK"
+            );
+            assert_eq!(
+                before.open_gaps, 1,
+                "the FAILED row is a processing_gaps row"
+            );
+            assert_eq!(before.done, 2);
+            assert_eq!(
+                handle
+                    .rt
+                    .block_on(stream_repo::advance_prefix(&handle.retrieval, &k))
+                    .expect("consistent ledger"),
+                1
+            );
+
+            let retired = handle
+                .rt
+                .block_on(stream_repo::retire_failed(
+                    &handle.maintenance,
+                    &k,
+                    "distill_failed",
+                ))
+                .expect("role_maintenance may retire through the 0167 definer");
+            assert_eq!(retired, vec![2], "exactly the exhausted ticket");
+
+            let after = handle
+                .rt
+                .block_on(stream_repo::fetch_ledger_snapshot(&handle.retrieval, &k))
+                .expect("snapshot must read");
+            assert_eq!(
+                after.contiguous_done_prefix, 3,
+                "RETIRED_FAILED is SETTLED_OK, so the prefix runs to the end of the stream"
+            );
+            assert_eq!(
+                after.open_gaps, 0,
+                "the retired row leaves processing_gaps because its state changed (§15.2.1) — \
+                 the view itself is untouched"
+            );
+            assert_eq!(after.done, 3, "settled, so it counts toward done");
+            assert_eq!(
+                handle
+                    .rt
+                    .block_on(stream_repo::advance_prefix(&handle.retrieval, &k))
+                    .expect("identity still holds after retirement"),
+                3,
+                "§15.4's four-number identity must still close after a retirement"
+            );
+        },
+    );
+}
+
+/// §23.1② A2 after a retirement — the read-side half of 0167 that the prefix tests do not see.
+///
+/// A2 is `visible + deleted + skipped == done`, so every state inside `done` needs a home on the
+/// left. A1 (`done + open_gaps + pending == expected`) leaves `RETIRED_FAILED` nowhere but
+/// `done`, and the retired record is by construction never in the index, so without a left-hand
+/// term claiming it `lhs` sits one BELOW `done` forever ⇒ `A2Closure::InvisibleLoss` ⇒
+/// `abstain(ProjectionInvisibleLoss)` on every later recall of that stream. §23.1② (amended with
+/// 0167's citation) puts it on `skipped`: settled, never indexable, but not a §37 deletion.
+///
+/// Its own fault control: drop `RETIRED_FAILED` from `close_ledger_in_txn`'s `skipped` filter and
+/// the post-retirement A2 assertion below goes red (`skipped` reads 0, `lhs` 2 vs `done` 3).
+#[test]
+fn a_retired_ticket_keeps_the_a2_closure_shut() {
+    run_db_fixture::<StreamFixture, _>(
+        "a_retired_ticket_keeps_the_a2_closure_shut",
+        |mut handle| {
+            let k = key(&handle);
+            seed_one_failed_between_two_done(&mut handle, &k, "distill_failed");
+            handle
+                .rt
+                .block_on(stream_repo::retire_failed(
+                    &handle.maintenance,
+                    &k,
+                    "distill_failed",
+                ))
+                .expect("retire");
+
+            let closure = handle
+                .rt
+                .block_on(stream_repo::fetch_ledger_closure(&handle.retrieval, &k))
+                .expect("the real envelope-side counting query, not a fixture copy");
+            let counts = match &closure {
+                LedgerClosure::Closed(counts) => counts,
+                LedgerClosure::Broken(_) => panic!("A1 must still close after a retirement"),
+            };
+            assert_eq!(counts.done(), 3);
+            assert_eq!(counts.deleted(), 0, "a retirement is not a §37 deletion");
+            assert_eq!(
+                counts.skipped(),
+                1,
+                "the retired row is the `skipped` term's second member (§23.1②/0167)"
+            );
+
+            // `visible` = the two DONE rows: the retired record was never indexed (0167 header).
+            let block = humaux_retrieval::envelope::build_projection_block(&closure, Some(2));
+            assert!(
+                block.degradations.is_empty(),
+                "a retirement must not read as ProjectionInvisibleLoss: {:?}",
+                block.degradations
+            );
+            assert!(
+                block.value.current,
+                "open_gaps == 0 and A2 closed ⇒ current"
+            );
+            assert_eq!(
+                block.value.completeness_ratio,
+                Some(2.0 / 3.0),
+                "§23.1②'s recorded cost: the retired record stays in the denominator, so the \
+                 ratio is honestly below 1.0 while `current` stays true"
+            );
+        },
+    );
+}
+
+/// Audit (§15.2.1): who / when, with the failure class preserved rather than overwritten. The
+/// row is settled, and `settled_at` is the ORIGINAL settlement time — retirement records a second
+/// decision, it does not rewrite the first.
+#[test]
+fn a_retired_ticket_records_who_when_and_keeps_its_failure_class() {
+    run_db_fixture::<StreamFixture, _>(
+        "a_retired_ticket_records_who_when_and_keeps_its_failure_class",
+        |mut handle| {
+            let k = key(&handle);
+            seed_one_failed_between_two_done(&mut handle, &k, "qdrant_upsert_failed");
+            let settled_before: SystemTime = handle
+                .admin
+                .query_one(
+                    "SELECT settled_at FROM projection.stream_log \
+                     WHERE tenant_id=$1 AND stream_seq=2",
+                    &[&k.tenant_id.0],
+                )
+                .expect("row must exist")
+                .get(0);
+
+            handle
+                .rt
+                .block_on(stream_repo::retire_failed(
+                    &handle.maintenance,
+                    &k,
+                    "qdrant_upsert_failed",
+                ))
+                .expect("retire");
+
+            let row = handle
+                .admin
+                .query_one(
+                    "SELECT state, error_class, retired_by, retired_at, settled_at \
+                     FROM projection.stream_log WHERE tenant_id=$1 AND stream_seq=2",
+                    &[&k.tenant_id.0],
+                )
+                .expect("row must exist");
+            assert_eq!(row.get::<_, String>(0), "RETIRED_FAILED");
+            assert_eq!(
+                row.get::<_, Option<String>>(1).as_deref(),
+                Some("qdrant_upsert_failed"),
+                "the failure class is the audit's third field, never overwritten"
+            );
+            // `retired_by` is `session_user`, taken inside the definer. It must be the CALLER's
+            // authenticated principal, never `role_migration_owner`: inside a SECURITY DEFINER
+            // function `current_user` IS the owner, so recording that would make every retirement
+            // look self-authorised. (In production the maintenance process logs in as
+            // `role_maintenance`; this fixture reaches that role with libpq's `options=-c role=`,
+            // which changes `current_user` and leaves `session_user` at the login role — so the
+            // assertion is on the property that matters, not on one deployment's login name.)
+            let retired_by = row.get::<_, Option<String>>(2);
+            let retired_by = retired_by.as_deref().expect("retired_by must be recorded");
+            assert_ne!(
+                retired_by, "role_migration_owner",
+                "retired_by must be the caller, not the definer's owner"
+            );
+            assert!(!retired_by.is_empty());
+            assert!(row.get::<_, Option<SystemTime>>(3).is_some(), "retired_at");
+            assert_eq!(
+                row.get::<_, SystemTime>(4),
+                settled_before,
+                "retirement must not rewrite the original settlement time"
+            );
+        },
+    );
+}
+
+/// The audit is a precondition, not a label: naming a class the ticket does not carry retires
+/// nothing at all. "Retire whatever failed" is the blanket action §15.2.1 rejects — it would let
+/// a transient `qdrant_upsert_failed` disappear behind a policy written for `distill_failed`.
+#[test]
+fn retirement_refuses_a_ticket_whose_failure_class_was_not_named() {
+    run_db_fixture::<StreamFixture, _>(
+        "retirement_refuses_a_ticket_whose_failure_class_was_not_named",
+        |mut handle| {
+            let k = key(&handle);
+            seed_one_failed_between_two_done(&mut handle, &k, "qdrant_upsert_failed");
+
+            let retired = handle
+                .rt
+                .block_on(stream_repo::retire_failed(
+                    &handle.maintenance,
+                    &k,
+                    "distill_failed",
+                ))
+                .expect("a class mismatch is 0 rows, not an error");
+            assert!(retired.is_empty());
+            assert_eq!(log_state(&mut handle.admin, &k, 2), "FAILED");
+            assert_eq!(
+                handle
+                    .rt
+                    .block_on(stream_repo::fetch_ledger_snapshot(&handle.retrieval, &k))
+                    .expect("snapshot")
+                    .contiguous_done_prefix,
+                1,
+                "nothing was retired, so nothing moved"
+            );
+        },
+    );
+}
+
+/// §6.2.2 / §15.2.1: `role_retrieval_worker` holds table-level UPDATE on `projection.stream_log`
+/// and is the role that WRITES `FAILED`, so the wall that keeps it from settling its own failure
+/// OK is the 0011/0167 transition trigger, not a missing grant. Direct `UPDATE ... SET state =
+/// 'RETIRED_FAILED'` must raise `check_violation` for it and for `role_maintenance` alike — the
+/// definer function is the only door, for everybody.
+#[test]
+fn only_the_definer_function_can_reach_retired_failed() {
+    run_db_fixture::<StreamFixture, _>(
+        "only_the_definer_function_can_reach_retired_failed",
+        |mut handle| {
+            let k = key(&handle);
+            seed_one_failed_between_two_done(&mut handle, &k, "distill_failed");
+
+            for role in ["role_retrieval_worker", "role_maintenance"] {
+                let error = handle
+                    .admin
+                    .batch_execute(&format!(
+                        "BEGIN; \
+                         SET LOCAL ROLE {role}; \
+                         SET LOCAL humaux.tenant_id = '{tenant}'; \
+                         UPDATE projection.stream_log SET state = 'RETIRED_FAILED' \
+                          WHERE tenant_id = '{tenant}' AND stream_seq = 2; \
+                         COMMIT;",
+                        tenant = k.tenant_id.0,
+                    ))
+                    .expect_err("the transition guard must refuse a direct write");
+                assert_eq!(
+                    error.code(),
+                    Some(&postgres::error::SqlState::CHECK_VIOLATION),
+                    "{role} must be refused by stream_log_guard_state_transition, got: {error}"
+                );
+                handle.admin.batch_execute("ROLLBACK").ok();
+            }
+            assert_eq!(log_state(&mut handle.admin, &k, 2), "FAILED");
+        },
+    );
+}
+
+/// §78.2 DB enum <-> Rust enum contract, against the DEPLOYED constraint rather than a migration
+/// file: `ProcessingState::ALL` must be exactly `projection.stream_log`'s `state` CHECK, both
+/// directions. Card note (e): accept both deparse forms — PostgreSQL renders `IN (…)` and
+/// `= ANY (ARRAY[…])` identically, so the parser keys on the quoted literals, not the spelling.
+#[test]
+fn deployed_state_check_mirrors_processing_state_all() {
+    run_db_fixture::<StreamFixture, _>(
+        "deployed_state_check_mirrors_processing_state_all",
+        |mut handle| {
+            let def: String = handle
+                .admin
+                .query_one(
+                    "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+                     WHERE conrelid = 'projection.stream_log'::regclass \
+                       AND conname = 'stream_log_state_check'",
+                    &[],
+                )
+                .expect("stream_log_state_check must exist")
+                .get(0);
+            assert!(
+                def.contains("IN (") || def.contains("= ANY (ARRAY["),
+                "state CHECK must still be a closed set, got: {def}"
+            );
+
+            let mut in_db: Vec<String> = def
+                .split('\'')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect();
+            in_db.sort_unstable();
+            in_db.dedup();
+
+            let mut in_rust: Vec<String> = humaux_adapters::retrieve::ProcessingState::ALL
+                .into_iter()
+                .map(|s| s.as_db_str().to_string())
+                .collect();
+            in_rust.sort_unstable();
+
+            assert_eq!(
+                in_db, in_rust,
+                "projection.stream_log's state CHECK and ProcessingState::ALL have drifted — \
+                 widen/narrow both in one migration (§78.2)"
+            );
         },
     );
 }

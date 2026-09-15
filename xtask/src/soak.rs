@@ -410,9 +410,17 @@ pub struct Series {
     /// MCP responses scanned for another lane's sentinel / ids, and hits.
     pub responses_scanned: i64,
     pub cross_tenant_hits: i64,
-    /// Why the §16.2 serving switch could not promote, counted per stream at the final
-    /// snapshot. See [`promotion_assertion`] for the two reasons and who owns each.
+    /// Why the §16.2 serving switch would refuse each pending promotion candidate, counted at the
+    /// final snapshot. See [`promotion_assertion`] / [`promote_candidate_assertion`].
     pub promote_rejections: BTreeMap<String, i64>,
+    /// `projection.stream_checkpoints` rows examined for candidacy across every lane — the
+    /// denominator of [`promote_candidate_assertion`].
+    pub promote_checkpoints_scanned: i64,
+    /// …of which were actually offerable to §16.3 (a version that is not already its family's
+    /// serving row). Reported explicitly because `0` is the honest answer on a deployment where
+    /// every family holds exactly one `projection_version`, and an empty `reject_reasons` map
+    /// cannot tell "nothing was refused" from "nothing was graded".
+    pub promote_candidates: i64,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -463,6 +471,15 @@ fn at_most(id: &'static str, value: f64, unit: &'static str, n: i64, threshold: 
 }
 
 impl Assertion {
+    /// No assertion carries this marker today — card 20 removed the last one
+    /// (`projection_promoted`) when the retirement that made it reachable landed. The mechanism
+    /// stays because the next "reported, not blocking, until card N" gap will need it, and
+    /// `expect` (not `allow`) is what makes the next user delete this line instead of inheriting
+    /// a permanent silence.
+    #[expect(
+        dead_code,
+        reason = "no assertion is expected-red right now; the marker mechanism is still the contract (ADR-0038)"
+    )]
     fn expected_red_until(mut self, card: &'static str) -> Self {
         self.expected_red_until = Some(card);
         self
@@ -588,7 +605,10 @@ pub fn fold_census(rows: &[LedgerRow], f: &mut TenantFinal) {
         entry.0 += r.rows;
         entry.1 = entry.1.max(r.max_seq);
         match r.state.as_str() {
-            "DONE" | "FAILED" | "TOMBSTONED" => f.tickets_settled += r.rows,
+            // `RETIRED_FAILED` (§15.2 amendment, migration 0167) is settled like the rest — it is
+            // a FAILED ticket an operator retired, not work still in flight. Without this arm it
+            // would fall through to `_` and be counted as in-flight forever.
+            "DONE" | "FAILED" | "TOMBSTONED" | "RETIRED_FAILED" => f.tickets_settled += r.rows,
             "SKIPPED_BY_POLICY" => {
                 f.tickets_settled += r.rows;
                 f.tickets_skipped_by_policy += r.rows;
@@ -621,11 +641,57 @@ pub fn percentile(sorted: &[f64], q: f64) -> f64 {
 pub fn evaluate(series: &Series, max_rss: u64, max_conns: i64) -> Vec<Assertion> {
     let mut all = observation_assertions(&series.observations, max_rss, max_conns);
     all.push(promotion_assertion(series));
+    all.push(promote_candidate_assertion(series));
     all.extend(settlement_assertions(series));
     all
 }
 
-/// §16.2 blue/green promotion, reported and **not** blocking until card 20 lands.
+/// §16.2's candidate set, graded separately from [`promotion_assertion`] — card 20 folded debt 3.
+///
+/// **Why this shape and not "create a second projection version to grade".** The card offered
+/// both. A promotion candidate is a version that is NOT its family's serving row; on this
+/// deployment every family holds exactly one (`HUMAUX_RETRIEVAL_WORKER_PROJECTION_VERSION` is a
+/// single value for the whole run), so the honest candidate count is 0 and the old loop's
+/// `VisibleSameVersionDeclared` tally was the harness grading a version against itself. The
+/// alternative — have the harness manufacture a `v2` checkpoint row — would grade a synthetic
+/// backfill rather than the deployment: criterion ① would compare `visible(v2) = 0` against a
+/// populated `visible(v1)` unless the whole corpus were re-projected under v2, and criterion ③
+/// cannot admit a non-first activation at all while `continuation_198_v2` is `NOT_DECLARED`
+/// (§69), so an "admitted v2" would have to be bought with a `--continuation pass` nobody can
+/// honestly declare. Either way the number would say nothing about the system under soak.
+///
+/// So the denominator here is the **population scanned** (`projection.stream_checkpoints` rows),
+/// not the candidate count: `n = 0` then means "this run never looked at a checkpoint row", which
+/// is a real FAIL-VACUOUS (ADR-0038) and cannot be reached by a healthy run, while
+/// `candidates = 0` is reported in the detail as its own explicit statement instead of hiding
+/// inside an empty `reject_reasons` map. `value` is the number of pending candidates §16.3 would
+/// refuse — falsifiable the moment a family ever does hold a non-serving version, which is
+/// exactly when this assertion has something to say. `projection_promoted` keeps its own real
+/// witness (streams whose §15.4 prefix moved, n = streams) and is now REQUIRED.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "counts feed a report field, not an equality test"
+)]
+fn promote_candidate_assertion(series: &Series) -> Assertion {
+    let refused: i64 = series.promote_rejections.values().sum();
+    at_most(
+        "promote_candidates_admitted",
+        refused as f64,
+        "candidates refused by §16.3",
+        series.promote_checkpoints_scanned,
+        0.0,
+    )
+    .with_detail(serde_json::json!({
+        "checkpoint_rows_scanned": series.promote_checkpoints_scanned,
+        "candidates_pending": series.promote_candidates,
+        "reject_reasons": series.promote_rejections,
+        "note": "a candidate is a projection_version that is NOT its family's serving row; \
+                 candidates_pending = 0 means §16.3 was not exercised this run",
+    }))
+}
+
+/// §16.2 blue/green promotion. **REQUIRED** since card 20 — the `expected_red_until` marker is
+/// gone and a red here fails the run.
 ///
 /// `projection_promoted` counts streams whose §15.4 contiguous DONE prefix
 /// (`projection_highwater`) never advanced across the run — the boundary the serving switch is
@@ -633,16 +699,20 @@ pub fn evaluate(series: &Series, max_rss: u64, max_conns: i64) -> Vec<Assertion>
 /// *promote loop*, not the projection worker: card 16's run had the worker consuming every
 /// ticket while the prefix stayed pinned behind two `FAILED` rows.
 ///
-/// `reject_reasons` is whatever [`evaluate_switch`] actually returned for each candidate — see
-/// [`switch_rejections`] and [`promote_rejections`] for how the candidates are read and where
-/// the two `visible_*` counts come from. Card 18 / ADR-0040 discharged `VisibleUnavailable`:
-/// both sides are now counted live against Qdrant through the read routes' own producer, so the
-/// reason only appears when a count genuinely could not be taken. What remains on this
-/// deployment is `BenchmarkNotPass` (§69's baseline is `NOT_DECLARED`) on every candidate, plus
-/// `OpenGaps` on the ones carrying `projection.processing_gaps` rows — both card 20's, which is
-/// where `expected_red_until` now points. It is *not* a fixed list: the map is keyed by the
-/// variant name the evaluator produced, so a reason disappears from the report on its own the
-/// moment its cause is fixed (that is exactly how card 18's landing is observable here).
+/// That pin is what card 20's migration `0167` discharges: a `FAILED` ticket is settled, so it
+/// held the prefix of its stream for the rest of the run and no amount of healthy consumption
+/// moved it. With the audited `FAILED -> RETIRED_FAILED` retirement (`xtask projection-serve
+/// --retire-failed <class>` on the ops path) the prefix advances past a retired seq and this
+/// assertion becomes a statement about the system again rather than about one unlucky ticket.
+///
+/// `reject_reasons` is whatever [`evaluate_switch`] actually returned for each **pending
+/// candidate** — see [`promote_candidate_assertion`], which owns that population and its
+/// denominator. Card 18 / ADR-0040 discharged `VisibleUnavailable`; card 20 discharged
+/// `VisibleSameVersionDeclared` (the loop no longer offers a serving version to itself),
+/// `OpenGaps` (retirement) and `BenchmarkNotPass` at a first activation (ADR-0017: no serving
+/// version ⇒ no `benchmark(serving)` to be worse than). The map is keyed by the variant name the
+/// evaluator produced, so a reason disappears from the report on its own the moment its cause is
+/// fixed.
 #[expect(
     clippy::cast_precision_loss,
     reason = "counts feed a report field, not an equality test"
@@ -659,10 +729,9 @@ fn promotion_assertion(series: &Series) -> Assertion {
         streams,
         0.0,
     )
-    .expected_red_until("card 20")
     .with_detail(serde_json::json!({
         "reject_reasons": series.promote_rejections,
-        "unit": "streams refused for this reason",
+        "unit": "streams whose §15.4 contiguous DONE prefix never advanced",
     }))
 }
 
@@ -967,6 +1036,22 @@ pub struct PromoteCandidate {
     pub visible_serving: Option<(String, u64)>,
 }
 
+/// What one tenant's promote-loop snapshot graded, and over what population — card 20 folded
+/// debt 3.
+///
+/// `scanned` is every `projection.stream_checkpoints` row the tenant owns; `candidates` is the
+/// subset that is actually offerable to §16.3, i.e. the versions that are **not** already their
+/// family's serving row. Before this split the soak offered each family's serving version back to
+/// itself every 5 s and the evaluator answered `VisibleSameVersionDeclared` — a refusal that
+/// describes the harness, not the deployment (soak27: `VisibleSameVersionDeclared` 2, one per
+/// family, each family holding exactly one `projection_version`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromoteGrading {
+    pub scanned: i64,
+    pub candidates: i64,
+    pub reject_reasons: BTreeMap<String, i64>,
+}
+
 /// Why the §16.2 serving switch would refuse each candidate, **taken from
 /// [`evaluate_switch`]** — the sole judgement point (§16.3 "无裁量口") — rather than restated
 /// here. Counted per candidate, keyed by the `SwitchRejection` variant's own name, so a reason
@@ -983,9 +1068,13 @@ pub struct PromoteCandidate {
 /// spot `switch_visible::ops_scope` documents), and §23.1's rule still holds: an uncountable
 /// index is `visible: null`, never a backfill from another number.
 ///
-/// `continuation` is [`ContinuationVerdict::CannotEstablish`] for a similar reason and is **not**
-/// card 18's to move: §69's `baseline_min` / `frozen_by` are `NOT_DECLARED` on this deployment,
-/// and §69 forbids reading "not established" as a pass (card 20).
+/// `continuation` is [`ContinuationVerdict::CannotEstablish`] for a similar reason: §69's
+/// `baseline_min` / `frozen_by` are `NOT_DECLARED` on this deployment, and §69 forbids reading
+/// "not established" as a pass. It is the same verdict `xtask projection-serve` now declares by
+/// default (card 20 folded debt 2) — before that the CLI defaulted to `Pass` and this tally
+/// reported `BenchmarkNotPass` against switches that had in fact succeeded. Note what
+/// `evaluate_switch` does with it: on a FIRST activation there is no `benchmark(serving)` to be
+/// worse than, so the verdict does not refuse; off that path it still does.
 ///
 /// The previous version of this function returned `count(*) FROM stream_checkpoints` under the
 /// label `VisibleUnavailable` without calling the evaluator at all. That is a fabricated
@@ -1026,8 +1115,15 @@ fn promote_rejections(
     tenant: Uuid,
     face: &VisibleFace,
     rt: &tokio::runtime::Runtime,
-) -> Result<BTreeMap<String, i64>, String> {
+) -> Result<PromoteGrading, String> {
     set_tenant(db, tenant)?;
+    let scanned: i64 = db
+        .query_one(
+            "SELECT count(*)::bigint FROM projection.stream_checkpoints",
+            &[],
+        )
+        .map_err(|e| format!("promote scan: {e}"))?
+        .get(0);
     let rows = db
         .query(
             "SELECT c.scope_kind, c.scope_id, c.domain, c.projection_kind, c.projection_version, \
@@ -1040,7 +1136,8 @@ fn promote_rejections(
                         AND g.scope_id = c.scope_id AND g.domain = c.domain \
                         AND g.projection_kind = c.projection_kind \
                         AND g.projection_version = c.projection_version) \
-             FROM projection.stream_checkpoints c",
+             FROM projection.stream_checkpoints c \
+             WHERE NOT c.serving",
             &[],
         )
         .map_err(|e| format!("promote candidates: {e}"))?;
@@ -1083,7 +1180,11 @@ fn promote_rejections(
             visible_serving,
         });
     }
-    Ok(switch_rejections(&candidates))
+    Ok(PromoteGrading {
+        scanned,
+        candidates: i64::try_from(candidates.len()).unwrap_or(i64::MAX),
+        reject_reasons: switch_rejections(&candidates),
+    })
 }
 
 const BACKLOG_SQL: &str = "SELECT (SELECT count(*) FROM ops.jobs \
@@ -1663,7 +1764,10 @@ fn finish(
             .copied()
             .unwrap_or(0);
         series.finals.push(f);
-        for (reason, n) in promote_rejections(db, lane.tenant_id, &face, &rt)? {
+        let grading = promote_rejections(db, lane.tenant_id, &face, &rt)?;
+        series.promote_checkpoints_scanned += grading.scanned;
+        series.promote_candidates += grading.candidates;
+        for (reason, n) in grading.reject_reasons {
             *series.promote_rejections.entry(reason).or_default() += n;
         }
     }
@@ -1737,6 +1841,11 @@ mod tests {
             ryw_replays: 1,
             ryw_resettled: 7,
             responses_scanned: 27,
+            // One checkpoint row per lane was examined for candidacy and none of them was a
+            // pending candidate (the single version each family holds is already serving) —
+            // `promote_candidates_admitted`'s healthy shape, n > 0 and nothing refused.
+            promote_checkpoints_scanned: 1,
+            promote_candidates: 0,
             ..Series::default()
         }
     }
@@ -1791,8 +1900,10 @@ mod tests {
 
     /// The defect the old measurement had: a worker consuming every ticket while one `FAILED`
     /// row pins §15.4's contiguous prefix. `watermark_no_stall` must stay GREEN (the worker is
-    /// healthy) and only `projection_promoted` may go red — and that red must be marked as
-    /// card 18's, carry the reject reasons, and not fail the run.
+    /// healthy) and `projection_promoted` must be the one that goes red — and since card 20
+    /// landed the retirement that discharges the pin, that red now **fails the run**: no
+    /// `expected_red_until` marker, `blocking_failure`, and the report verdict is FAIL with an
+    /// empty `expected_red` list.
     #[test]
     fn a_pinned_promotion_prefix_is_not_reported_as_a_stalled_worker() {
         let mut series = healthy();
@@ -1802,6 +1913,7 @@ mod tests {
         ];
         series.promote_rejections =
             BTreeMap::from([("VisibleUnavailable".into(), 2), ("OpenGaps".into(), 1)]);
+        series.promote_candidates = 3;
         assert!(verdict(&series, "watermark_no_stall"));
         assert!(!verdict(&series, "projection_promoted"));
 
@@ -1810,16 +1922,52 @@ mod tests {
             .iter()
             .find(|a| a.id == "projection_promoted")
             .expect("projection_promoted must be reported");
-        assert_eq!(promoted.expected_red_until, Some("card 20"));
-        assert_eq!(promoted.verdict(), "EXPECTED-RED");
-        assert!(!promoted.blocking_failure());
+        assert_eq!(promoted.expected_red_until, None);
+        assert_eq!(promoted.verdict(), "FAIL");
+        assert!(promoted.blocking_failure());
         assert_eq!(promoted.detail["reject_reasons"]["OpenGaps"], 1);
         assert_eq!(promoted.detail["reject_reasons"]["VisibleUnavailable"], 2);
-        // …and a run whose only red is that one still reports PASS and exits 0.
-        assert!(!assertions.iter().any(Assertion::blocking_failure));
+
         let report = report_json(&series, &assertions, serde_json::json!({}));
-        assert_eq!(report["verdict"], "PASS");
-        assert_eq!(report["expected_red"][0]["id"], "projection_promoted");
+        assert_eq!(report["verdict"], "FAIL");
+        assert_eq!(report["expected_red"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// Card 20 folded debt 3, at the evaluator boundary. `promote_candidates_admitted` grades the
+    /// candidates §16.3 would refuse over the checkpoint rows actually scanned:
+    /// * healthy deployment — one version per family, all serving ⇒ 0 refused out of 1 scanned,
+    ///   `candidates_pending` stated explicitly as 0, PASS (not a silent empty map);
+    /// * a real pending candidate the gate refuses ⇒ FAIL, with the reasons;
+    /// * a run that scanned no checkpoint row at all ⇒ FAIL-VACUOUS (ADR-0038), never PASS.
+    #[test]
+    fn promote_candidate_set_is_graded_over_the_rows_it_scanned() {
+        let healthy = healthy();
+        let a = evaluate(&healthy, 4096, 64)
+            .into_iter()
+            .find(|a| a.id == "promote_candidates_admitted")
+            .expect("assertion must exist");
+        assert_eq!(a.verdict(), "PASS");
+        assert_eq!(a.n, 1);
+        assert_eq!(a.detail["candidates_pending"], 0);
+
+        let mut refused = healthy.clone();
+        refused.promote_candidates = 1;
+        refused.promote_rejections = BTreeMap::from([("OpenGaps".into(), 1)]);
+        let a = evaluate(&refused, 4096, 64)
+            .into_iter()
+            .find(|a| a.id == "promote_candidates_admitted")
+            .expect("assertion must exist");
+        assert_eq!(a.verdict(), "FAIL");
+        assert_eq!(a.detail["reject_reasons"]["OpenGaps"], 1);
+
+        let mut blind = healthy;
+        blind.promote_checkpoints_scanned = 0;
+        let a = evaluate(&blind, 4096, 64)
+            .into_iter()
+            .find(|a| a.id == "promote_candidates_admitted")
+            .expect("assertion must exist");
+        assert_eq!(a.verdict(), "FAIL-VACUOUS");
+        assert!(a.blocking_failure());
     }
 
     /// The overlay seq range the replay is entitled to, parsed out of a real response shape.
@@ -1953,10 +2101,11 @@ mod tests {
                 visible_serving: None,
             },
         ]);
-        // Both counts unavailable ⇒ criterion ① is unevaluable, and §69's baseline is
-        // NOT_DECLARED, so both candidates carry those two…
+        // Both counts unavailable ⇒ criterion ① is unevaluable on both candidates…
         assert_eq!(counts.get("VisibleUnavailable"), Some(&2));
-        assert_eq!(counts.get("BenchmarkNotPass"), Some(&2));
+        // …while §69's undeclared baseline only refuses the one that HAS a serving version to be
+        // compared against (card 20: a first activation has no `benchmark(serving)`, ADR-0017).
+        assert_eq!(counts.get("BenchmarkNotPass"), Some(&1));
         // …and only the one that actually has `projection.processing_gaps` rows carries this,
         // counted once per candidate rather than once per gap row.
         assert_eq!(counts.get("OpenGaps"), Some(&1));
@@ -1969,7 +2118,7 @@ mod tests {
     /// activation (lone candidate read-back) and for a real promotion (candidate version vs a
     /// *different* serving version). Drop the wiring in [`promote_rejections`] back to a literal
     /// `None` and this goes red on the first assertion; that is the injection this test exists
-    /// for. §16.3's other two criteria are untouched here — they are card 20's.
+    /// for.
     #[test]
     fn a_live_visible_count_removes_visible_unavailable_from_the_promote_tally() {
         let counts = switch_rejections(&[
@@ -1994,7 +2143,9 @@ mod tests {
             None,
             "a taken count must not still be reported as an unavailable one"
         );
-        assert_eq!(counts.get("BenchmarkNotPass"), Some(&2));
+        // Card 20: the first activation is now admitted outright — no serving version means no
+        // baseline to be worse than — so only the real promotion carries §69's refusal.
+        assert_eq!(counts.get("BenchmarkNotPass"), Some(&1));
         assert_eq!(counts.get("OpenGaps"), None);
 
         // The other direction, unchanged: a count that truly could not be taken (no placement

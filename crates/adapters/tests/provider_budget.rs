@@ -11,7 +11,9 @@ use humaux_adapters::{
         reap_expired_provider_budgets, reserve_provider_budget, settle_provider_budget,
     },
 };
-use humaux_domain::{egress::PrivateDataPurpose, error::ErrorCode, ids::TenantId};
+use humaux_domain::{
+    egress::PrivateDataPurpose, error::ErrorCode, ids::TenantId, ledger::ModelCallPurpose,
+};
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls, error::SqlState};
 use sqlx::{postgres::PgConnectOptions, types::Uuid};
@@ -180,7 +182,7 @@ fn ledger_for(handle: &Handle, tenant_id: Uuid) -> model_call_ledger::ReserveCal
         request_id: None,
         tenant_id,
         workspace_id: None,
-        purpose: Some("embedding".to_string()),
+        purpose: Some(ModelCallPurpose::Embedding),
         provider: handle.provider_id.clone(),
         model: Some("provider-budget-model".to_string()),
         model_revision: None,

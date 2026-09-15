@@ -14,8 +14,12 @@
 //! Provider pipeline: the same admission resolver, provider/admission match, §7.3 egress
 //! authorization, [`crate::byok::PrivateInferenceContext`] construction and timed provider call
 //! `ContributionReasoner` uses (`crate::contribution_reasoner`'s `pub(crate)` helpers) — one
-//! provider call path, not a second one. The `ops.model_call_ledger` leg is the one piece not
-//! shared: see ADR-0015 §"ledger leg".
+//! provider call path, not a second one. Since card 20 (ADR-0042) the `ops.model_call_ledger`
+//! leg is shared too — `model_call_ledger::reserve_private_call`/`finalize_private_call` with
+//! purpose `PRIVATE_CONSOLIDATE`, the same registration point every other hop uses. ADR-0015
+//! §"ledger leg" recorded the absence as a consequence of 0130's purpose CHECK; `migrations/0166`
+//! widened it. The §7.4 disclosure row still exists alongside — it records what left the
+//! boundary, the ledger row records what it cost.
 
 use async_trait::async_trait;
 use humaux_application::consolidate::{
@@ -27,6 +31,7 @@ use humaux_domain::{
     consolidate::AutoMutableMemoryId,
     dataclass::{DataClass, join_data_class},
     error::ErrorCode,
+    ledger::ModelCallPurpose,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -41,6 +46,7 @@ use crate::{
         complete_structured_timed, fail, provider_matches_admission,
     },
     disclosure::{self, DisclosureSource},
+    model_call_ledger,
     postgres::PrivateWorkerDbPool,
     reasoning_route_admission::resolve_user_reasoning_admission,
 };
@@ -538,9 +544,22 @@ impl PrivateReasoningPort for ConsolidationReasoner<'_> {
             .iter()
             .map(|input| DisclosureSource::Memory(input.memory_id))
             .collect();
+        // §19.1 then §7.4, in that order (`ContributionReasoner`'s own resolver→ledger→disclosure
+        // sequence): the cost row is reserved before any byte leaves.
+        let reserved = model_call_ledger::reserve_private_call(
+            self.pool,
+            &model_call_ledger::private_reserve_call(
+                ModelCallPurpose::PrivateConsolidate,
+                &admission,
+            ),
+        )
+        .await
+        .map_err(|_| fail("model call reservation failed"))?;
         // §7.4: the disclosure row is reserved before the bytes leave and finalized after,
-        // success or failure alike. Its id is this attempt's durable receipt — see ADR-0015
-        // §"ledger leg" for why no `ops.model_call_ledger` row accompanies it yet.
+        // success or failure alike. Its id stays this attempt's durable receipt (ADR-0015) and
+        // stays what `model_call_id` below carries — the consolidation hop's persisted
+        // `response_model_call_id` is a disclosure reference, not a ledger reference, and card
+        // 20 adds the ledger row ALONGSIDE it rather than re-pointing that column.
         let disclosure_id = disclosure::reserve_private(
             self.pool,
             &permit,
@@ -560,7 +579,7 @@ impl PrivateReasoningPort for ConsolidationReasoner<'_> {
             disclosure_id.to_string(),
         )
         .map_err(|_| fail("private context rejected"))?;
-        let (response, disclosure_outcome, _model_outcome, _finalize) =
+        let (response, disclosure_outcome, model_outcome, finalize) =
             complete_structured_timed(self.provider, &context, request).await;
         let finalized = disclosure::finalize_private(
             self.pool,
@@ -573,6 +592,20 @@ impl PrivateReasoningPort for ConsolidationReasoner<'_> {
         .map_err(|_| fail("disclosure finalization failed"))?;
         if !finalized {
             return Err(fail("disclosure finalization lost"));
+        }
+        // Failure finalizes too (card 20 acceptance): FAILED + error_class, before the
+        // `response` unwrap below, so a provider error is a ledgered failure not a missing row.
+        if !model_call_ledger::finalize_private_call(
+            self.pool,
+            tenant_id,
+            reserved.model_call_id,
+            model_outcome,
+            &finalize,
+        )
+        .await
+        .map_err(|_| fail("model call finalization failed"))?
+        {
+            return Err(fail("model call finalization lost"));
         }
         let output_bytes = response
             .map_err(|_| fail("user reasoning provider failed"))?

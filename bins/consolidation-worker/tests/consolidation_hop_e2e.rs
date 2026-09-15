@@ -717,6 +717,52 @@ fn t1_full_inference_hop_publishes_ticket() {
         disclosure_sources, 2,
         "both inputs disclosed as Memory sources"
     );
+
+    // (e2) Card 20's primary acceptance gate, positive half: the §19.1 cost row that must exist
+    //      ALONGSIDE the §7.4 disclosure row just asserted, never instead of it. The only
+    //      ledger assertion this suite had was the NEGATIVE one on the manifest-mismatch path
+    //      (`ledger_rows == 0`), so both `consolidation_reasoner` ledger calls could be deleted
+    //      with the suite still green. Deleting either now turns this red.
+    let ledger = f
+        .admin
+        .query_one(
+            "SELECT count(*) AS rows_n, \
+                    max(l.status) AS status, \
+                    max(l.model) AS model, \
+                    max(l.input_tokens) AS input_tokens, \
+                    max(l.output_tokens) AS output_tokens \
+             FROM ops.model_call_ledger l \
+             WHERE l.tenant_id = $1 AND l.purpose = 'PRIVATE_CONSOLIDATE'",
+            &[&f.tenant_id],
+        )
+        .expect("consolidation ledger rows");
+    let ledger_rows: i64 = ledger.get("rows_n");
+    let ledger_status: Option<String> = ledger.get("status");
+    let ledger_model: Option<String> = ledger.get("model");
+    let ledger_input_tokens: Option<i64> = ledger.get("input_tokens");
+    let ledger_output_tokens: Option<i64> = ledger.get("output_tokens");
+    assert_eq!(
+        ledger_rows, 1,
+        "exactly one ops.model_call_ledger row with purpose PRIVATE_CONSOLIDATE"
+    );
+    assert_eq!(ledger_status.as_deref(), Some("SUCCEEDED"));
+    assert!(
+        ledger_model.as_deref().is_some_and(|m| !m.is_empty()),
+        "ledger row carries the admitted provider model, got {ledger_model:?}"
+    );
+    assert!(
+        ledger_input_tokens.is_some_and(|v| v > 0),
+        "input_tokens from the provider's usage block, got {ledger_input_tokens:?}"
+    );
+    assert!(
+        ledger_output_tokens.is_some_and(|v| v > 0),
+        "output_tokens (0168) from the provider's usage block — for a generative hop the output \
+         leg usually dominates the bill, got {ledger_output_tokens:?}"
+    );
+    println!(
+        "CONSOLIDATION LEDGER: rows={ledger_rows} status={ledger_status:?} model={ledger_model:?} \
+         input_tokens={ledger_input_tokens:?} output_tokens={ledger_output_tokens:?}"
+    );
     let parsed: serde_json::Value =
         serde_json::from_str(&output_json).expect("stored output is JSON");
     assert_eq!(

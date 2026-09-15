@@ -1,0 +1,101 @@
+# §46.1 migration manifest. ADR-0042 (card 20, folded debt 1 from card 18; §15.2/§15.4/§6.2.2):
+# add the terminal state `RETIRED_FAILED` plus the single audited door into it, so an exhausted
+# `FAILED` ticket stops pinning §15.4's contiguous-DONE prefix for the life of the stream. Two
+# nullable audit columns, a widened state CHECK, a widened TERMINAL/`settled_at` CHECK, one new
+# all-or-nothing retirement-audit CHECK, the 0011 transition trigger replaced with one extra
+# owner arm, and ONE new owner SECURITY DEFINER function whose EXECUTE goes to `role_maintenance`
+# alone. No new table, no new role, no new table-level GRANT (`role_maintenance` already holds
+# SELECT+UPDATE on `projection.stream_log` per §6.2.2 and needs only EXECUTE here), no RLS change,
+# no DML. §46 forward-fix (EXPAND_CONTRACT, first free number after 0166).
+
+migration_id = "0167_retired_failed_ticket"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select
+ -- the two CHECKs this migration replaces are the ones 0007 created, still unwidened
+ (select pg_get_constraintdef(oid) not like '%RETIRED_FAILED%'
+    from pg_constraint where conrelid='projection.stream_log'::regclass
+      and conname='stream_log_state_check')
+ and (select pg_get_constraintdef(oid) not like '%RETIRED_FAILED%'
+       from pg_constraint where conrelid='projection.stream_log'::regclass
+         and conname='stream_log_check')
+ -- the audit columns and the door do not exist yet (this is not a replay)
+ and not exists (select 1 from information_schema.columns
+                  where table_schema='projection' and table_name='stream_log'
+                    and column_name in ('retired_at','retired_by'))
+ and to_regprocedure('projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)') is null
+ -- the trigger being replaced is in place and owned by the migration owner
+ and to_regprocedure('projection.stream_log_guard_state_transition()') is not null
+ and exists (select 1 from pg_trigger
+              where tgrelid='projection.stream_log'::regclass
+                and tgname='stream_log_guard_state_transition' and not tgisinternal)
+ -- §15.2's gap view is the frozen two-state text; nothing here rewrites it
+ and (select pg_get_viewdef('projection.processing_gaps'::regclass) like '%FAILED%')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- ten states, and the TERMINAL/settled_at pairing carries the new one too
+ (select pg_get_constraintdef(oid) like '%RETIRED_FAILED%'
+    from pg_constraint where conrelid='projection.stream_log'::regclass
+      and conname='stream_log_state_check')
+ and (select pg_get_constraintdef(oid) like '%RETIRED_FAILED%'
+       from pg_constraint where conrelid='projection.stream_log'::regclass
+         and conname='stream_log_check')
+ -- exactly one of each survives the DROP+ADD (no duplicate left behind)
+ and (select count(*)=1 from pg_constraint
+       where conrelid='projection.stream_log'::regclass
+         and conname='stream_log_state_check' and contype='c')
+ and (select count(*)=1 from pg_constraint
+       where conrelid='projection.stream_log'::regclass
+         and conname='stream_log_check' and contype='c')
+ -- a retired row without an actor or a timestamp is unrepresentable
+ and (select count(*)=1 from pg_constraint
+       where conrelid='projection.stream_log'::regclass
+         and conname='stream_log_retirement_audit' and contype='c')
+ and (select count(*)=2 from information_schema.columns
+       where table_schema='projection' and table_name='stream_log'
+         and column_name in ('retired_at','retired_by'))
+ -- the door: owner, definer, pinned search_path
+ and (select p.prosecdef and pg_get_userbyid(p.proowner)='role_migration_owner'
+        and 'search_path=pg_catalog' = any(coalesce(p.proconfig, array[]::text[]))
+      from pg_proc p
+      where p.oid = to_regprocedure('projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)'))
+ -- EXECUTE exactly role_maintenance; PUBLIC and every other runtime role denied
+ and has_function_privilege('role_maintenance',
+       'projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)','EXECUTE')
+ and not has_function_privilege('role_retrieval_worker',
+       'projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)','EXECUTE')
+ and not has_function_privilege('role_private_worker',
+       'projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)','EXECUTE')
+ and not has_function_privilege('role_gateway',
+       'projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)','EXECUTE')
+ and not exists (
+       select 1 from pg_proc p,
+         aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+        where p.oid = to_regprocedure('projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)')
+          and x.grantee = 0 and x.privilege_type = 'EXECUTE')
+ -- the transition guard still fires, still owned by the migration owner, and now names the state
+ and exists (select 1 from pg_trigger
+              where tgrelid='projection.stream_log'::regclass
+                and tgname='stream_log_guard_state_transition' and not tgisinternal)
+ and (select pg_get_userbyid(proowner)='role_migration_owner'
+        and prosrc like '%RETIRED_FAILED%'
+      from pg_proc where oid = to_regprocedure('projection.stream_log_guard_state_transition()'))
+ -- §15.2's gap view is untouched: a retired row leaves open_gaps because its STATE changed,
+ -- not because a second place was taught to exclude it
+ and (select pg_get_viewdef('projection.processing_gaps'::regclass) not like '%RETIRED_FAILED%')
+ -- no table-level grant moved
+ and has_table_privilege('role_maintenance','projection.stream_log','UPDATE')
+ and not has_table_privilege('role_maintenance','projection.stream_log','DELETE')
+ and not has_table_privilege('role_gateway','projection.stream_log','UPDATE')
+ -- RLS posture untouched by the ALTERs
+ and (select relrowsecurity and relforcerowsecurity
+      from pg_class where oid='projection.stream_log'::regclass)
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Reverting is mechanical only while no row has been retired: DROP FUNCTION projection.retire_failed_ticket(...); restore 0011's four-arm trigger body; ALTER TABLE projection.stream_log DROP CONSTRAINT stream_log_retirement_audit, and narrow the two CHECKs back to the nine-state / four-terminal sets. Once any row sits in RETIRED_FAILED the narrower state CHECK is validated against it and the revert fails — and the honest revert is NOT to rewrite those rows: a retirement is a recorded operator decision about a real failed record, and moving it back to FAILED would re-pin the prefix it was retired to release. Revert the Rust leg (stop offering the retirement) and leave the state in place. Reverting widens no tenant's data access: the new door is EXECUTE-gated to role_maintenance and every retirement stays scoped by the caller's own tenant GUC under FORCE RLS."
+backup_restore_requirement = "none: EXPAND-only. Two nullable columns are added, the two replaced CHECKs are strictly weaker than their predecessors (so PostgreSQL's validation scan cannot reject an existing row), the third CHECK is satisfied by every pre-existing row (all have state <> 'RETIRED_FAILED' and both audit columns NULL), and no row is read, rewritten or deleted."

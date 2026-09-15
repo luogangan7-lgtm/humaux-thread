@@ -787,7 +787,7 @@ pub async fn publish_rollup(
     // VERIFIED GAP (task card §"Why"): `publish_rollup` wrote `private.memory_rollups` with no
     // matching `projection.stream_log`/`ops.outbox` row, so the projection worker (which reads
     // `stream_log` joined to `ops.outbox` by `(tenant_id, commit_seq)`, `projection_worker.rs`'s
-    // `resolve_memory`) never saw this publish at all. §15.1: the writer of a derived row is
+    // `resolve_memories`) never saw this publish at all. §15.1: the writer of a derived row is
     // its own issuer — this ticket does not describe the new rollup (rollups are not
     // `private.memory_records` rows the existing resolver can join to; §11.9 "rollup 是
     // navigation/context, never higher authority than source Memory") but re-signals the first

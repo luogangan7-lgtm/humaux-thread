@@ -42,6 +42,9 @@ struct Flags {
     workspace: Uuid,
     version: String,
     continuation: ContinuationVerdict,
+    /// `error_class` values whose exhausted `FAILED` tickets this invocation retires (§15.2's
+    /// `RETIRED_FAILED`, migration 0167) before the §16.3 criteria are read. Empty by default.
+    retire_failed: Vec<String>,
     qdrant_host: String,
     qdrant_port: u16,
 }
@@ -56,27 +59,57 @@ fn parse(args: &[String]) -> Result<Flags, String> {
     let domain = required(args, "--domain")?;
     let kind = required(args, "--projection-kind")?;
     let version = required(args, "--version")?;
+    // Card 20 folded debt 2 — the default was `pass`, "the operator's attestation that the §69
+    // gate was consulted". On this deployment that attestation cannot be true: §69:12477 freezes
+    // that until `continuation_198_v2` has its `frozen_by` written the gate "输出
+    // cannot_establish", and the set is `NOT_DECLARED` (§69:12465). A default that silently
+    // declares `Pass` is how the soak tallies and the switch disagreed — `xtask::soak::
+    // switch_rejections` grades every candidate with the honest `CannotEstablish` while this CLI
+    // handed `evaluate_switch` a `Pass`, so soak25/26/27 reported `BenchmarkNotPass` against
+    // switches that had in fact succeeded. Both sides now say the same thing; an operator who
+    // really ran the gate says so explicitly.
     let continuation = match arg(args, "--continuation").as_deref() {
-        None | Some("pass") => ContinuationVerdict::Pass,
+        None | Some("cannot_establish") => ContinuationVerdict::CannotEstablish,
+        Some("pass") => ContinuationVerdict::Pass,
         Some("fail") => ContinuationVerdict::Fail,
         Some("inconclusive") => ContinuationVerdict::Inconclusive,
-        Some(other) => return Err(format!("--continuation {other:?}: pass|fail|inconclusive")),
+        Some(other) => {
+            return Err(format!(
+                "--continuation {other:?}: pass|fail|inconclusive|cannot_establish"
+            ));
+        }
     };
+    // Comma-separated so one flag carries a family's whole retirement policy; empty ⇒ nothing is
+    // retired (§15.2/§15.4 retirement is an explicit operator act, never a side effect of asking
+    // for a promotion).
+    let retire_failed: Vec<String> = arg(args, "--retire-failed")
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let (qdrant_host, qdrant_port) = qdrant_endpoint(args)?;
     Ok(Flags {
         family: StreamFamily::new(TenantId(tenant), "workspace", workspace, domain, kind),
         workspace,
         version,
         continuation,
+        retire_failed,
         qdrant_host,
         qdrant_port,
     })
 }
 
 /// Entry point. Flags: `--tenant <uuid> --workspace <uuid> --domain <s> --projection-kind <s>
-/// --version <s>`; `--continuation pass|fail|inconclusive` (default `pass` is the operator's
-/// attestation that the §69 gate was consulted); `--qdrant-host`/`--qdrant-port` (local
-/// defaults). `--visible-shadow` is obsolete — see the module doc.
+/// --version <s>`; `--continuation pass|fail|inconclusive|cannot_establish` (default
+/// `cannot_establish`, which is what §69 says this deployment's gate outputs — an operator who
+/// actually ran it says so on the command line); `--retire-failed <class[,class…]>` retires this
+/// version's exhausted `FAILED` tickets of those `error_class`es first (§15.2/§15.4, migration
+/// 0167) so criterion ② can clear; `--qdrant-host`/`--qdrant-port` (local defaults).
+/// `--visible-shadow` is obsolete — see the module doc.
 pub fn run(args: &[String]) -> i32 {
     let flags = match parse(args) {
         Ok(v) => v,
@@ -105,7 +138,7 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let (shadow, serving) = match visible_inputs(&dsn, &flags, &rt) {
+    let ((shadow, serving), serving_version) = match visible_inputs(&dsn, &flags, &rt) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("projection-serve: {e}");
@@ -121,6 +154,42 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // §15.2/§15.4 (migration 0167): retire this version's exhausted failures BEFORE the criteria
+    // are read, because a settled `FAILED` row is simultaneously an `open_gaps` row (criterion ②)
+    // and a permanent pin on the §15.4 prefix the switch is allowed to promote to. Only the
+    // classes the operator named; a class that matches nothing retires nothing and says so.
+    let key = flags.family.with_version(flags.version.clone());
+    for class in &flags.retire_failed {
+        match rt.block_on(humaux_adapters::stream_repo::retire_failed(
+            &pool, &key, class,
+        )) {
+            Ok(seqs) if seqs.is_empty() => {
+                println!("projection-serve: retire-failed {class}: no exhausted ticket matched");
+            }
+            Ok(seqs) => {
+                println!("projection-serve: retired {class} seq {seqs:?}");
+            }
+            Err(e) => {
+                eprintln!("projection-serve: retire-failed {class}: {e}");
+                return 1;
+            }
+        }
+    }
+
+    // Card 20 folded debt 3: a version that is ALREADY this family's serving row is not a
+    // promotion candidate. Offering it to §16.3 anyway compares a count with itself, which the
+    // evaluator correctly refuses as `VisibleSameVersionDeclared` — but that refusal describes
+    // the caller, not the deployment, and a 5-second ops loop turns it into a permanent entry in
+    // every promote tally (soak25/26/27: one per family). Retirement above still ran, because a
+    // settled FAILED ticket pins the §15.4 prefix whether or not anything is left to promote.
+    if serving_version.as_deref() == Some(flags.version.as_str()) {
+        println!(
+            "projection-serve: {} is already serving for this family; nothing to promote",
+            flags.version
+        );
+        return 0;
+    }
+
     let outcome = rt.block_on(switch_projection_version(
         &pool,
         &flags.family,
@@ -161,7 +230,7 @@ fn visible_inputs(
     dsn: &str,
     flags: &Flags,
     rt: &tokio::runtime::Runtime,
-) -> Result<VisiblePair, String> {
+) -> Result<(VisiblePair, Option<String>), String> {
     let mut db = Client::connect(dsn, NoTls).map_err(|e| format!("role_maintenance: {e}"))?;
     let family = &flags.family;
     db.batch_execute(&format!("SET humaux.tenant_id = '{}'", family.tenant_id.0))
@@ -187,11 +256,11 @@ fn visible_inputs(
             "projection-serve: tenant has no private-memory placement row; visible counts \
              unavailable (§23.1②: never backfilled)"
         );
-        return Ok((None, None));
+        return Ok(((None, None), serving));
     };
     let face = VisibleFace::connect(&flags.qdrant_host, flags.qdrant_port)?;
     let scope = ops_scope(family.tenant_id.0, flags.workspace)?;
-    Ok(rt.block_on(visible_pair(
+    let pair = rt.block_on(visible_pair(
         &face,
         &Candidate {
             scope: &scope,
@@ -202,5 +271,6 @@ fn visible_inputs(
             serving_tombstoned: &facts.serving_tombstoned,
             user_private_points: facts.user_private_points,
         },
-    )))
+    ));
+    Ok((pair, serving))
 }
