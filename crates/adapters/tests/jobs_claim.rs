@@ -870,3 +870,176 @@ fn generic_and_private_claims_preserve_public_boundary() {
         },
     );
 }
+
+// ----------------------------------------------------------------------------
+// Card 21 (folded card-16 debt): a derived-work pass that outlasts its own lease.
+//
+// 2026-09-10 over-capacity soak: `lost_lease=6`. One `dispatch_pass` claimed 8 jobs / 77
+// evidence rows and worked them SERIALLY, each with a real provider round trip, while the lease
+// was renewed exactly once — before the first row. Lease = `LEASE_SECS` (120 s); work =
+// `rows × provider_latency`. Those two numbers were never related to each other, so the lease
+// expired mid-pass, another dispatcher re-claimed the job (`ops.claim_derived_work`'s
+// `status='PROCESSING' AND lease_expires_at < clock_timestamp()` arm), and the provider budget
+// was spent twice. `distill::run_once` now renews per row.
+//
+// Scoped entirely to this file's throwaway tenant: the competing claim is SIMULATED with an
+// admin UPDATE on this job (the same technique `heartbeat_after_lease_lost_is_a_no_op` uses)
+// rather than by calling the real cross-tenant `ops.claim_derived_work`, which would bump
+// `attempt` on unrelated tenants' rows in the shared dev database.
+// ----------------------------------------------------------------------------
+
+/// Seeds one `DERIVED_DISTILL` job already `PROCESSING` under `owner`, with `lease_seconds` left
+/// to run, and returns the lease a claim would have handed back.
+fn seed_leased_derived_job(handle: &mut Handle, owner: &str, lease_seconds: f64) -> Uuid {
+    handle
+        .admin
+        .query_one(
+            "INSERT INTO ops.jobs \
+               (tenant_id, job_type, idempotency_key, next_retry_at, status, attempt, \
+                lease_owner, lease_expires_at) \
+             VALUES ($1, $2, $3, now(), 'PROCESSING', 1, $4, \
+                     clock_timestamp() + make_interval(secs => $5)) \
+             RETURNING job_id",
+            &[
+                &handle.tenant_id,
+                &jobs::DerivedJobType::Distill.as_db_str(),
+                &format!("card21-{owner}-{}", Uuid::new_v4()),
+                &owner,
+                &lease_seconds,
+            ],
+        )
+        .expect("seed leased DERIVED_DISTILL job")
+        .get(0)
+}
+
+/// Exactly `ops.claim_derived_work`'s re-claim eligibility arm for a `PROCESSING` row, evaluated
+/// in the database rather than restated in Rust — so this test cannot drift away from the
+/// predicate that actually decides whether another dispatcher steals the job.
+fn reclaimable_by_another_dispatcher(handle: &mut Handle, job_id: Uuid) -> bool {
+    handle
+        .admin
+        .query_one(
+            "SELECT status = 'PROCESSING' AND lease_expires_at < clock_timestamp() \
+             FROM ops.jobs WHERE job_id = $1",
+            &[&job_id],
+        )
+        .expect("job must exist")
+        .get(0)
+}
+
+/// The fix. Four "rows" of 400 ms each — 1.6 s of work against a 1 s lease — with the lease
+/// renewed before each row. The job is never eligible for re-claim, and the settle at the end
+/// still owns it (`lost_lease` stays 0).
+#[test]
+fn a_derived_pass_longer_than_its_lease_heartbeats_per_row_and_settles() {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<JobsFixture, _>(
+        "a_derived_pass_longer_than_its_lease_heartbeats_per_row_and_settles",
+        |mut handle| {
+            let owner = format!("card21-hb-{}", Uuid::new_v4());
+            let job_id = seed_leased_derived_job(&mut handle, &owner, 1.0);
+            let lease = jobs::DerivedLease {
+                tenant_id: handle.tenant_id,
+                job_id,
+                lease_owner: &owner,
+                attempt: 1,
+            };
+            for row in 0..4 {
+                let alive = handle
+                    .rt
+                    .block_on(jobs::heartbeat_derived_private(
+                        &handle.private,
+                        &lease,
+                        1.0,
+                    ))
+                    .expect("heartbeat query must not error");
+                assert!(alive, "lease must still be held at row {row}");
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+            assert!(
+                !reclaimable_by_another_dispatcher(&mut handle, job_id),
+                "after 1.6 s of work on a 1 s lease, a per-row heartbeat must keep the job out \
+                 of ops.claim_derived_work's re-claim arm"
+            );
+            let settled = handle
+                .rt
+                .block_on(jobs::settle_derived_private(
+                    &handle.private,
+                    &lease,
+                    jobs::DerivedWorkOutcome::Done,
+                    1.0,
+                ))
+                .expect("settle query must not error");
+            assert!(settled, "lost_lease must be 0 for this pass");
+            assert_eq!(job_status(&mut handle, job_id), "DONE");
+        },
+    );
+}
+
+/// The negative control — the card-16 shape. Same work, one heartbeat before the first row (what
+/// `dispatch_pass` did on its own), then the lease expires, another dispatcher re-claims, and the
+/// original worker's settle writes nothing: that `false` is the `report.lost_lease += 1` branch.
+///
+/// Without this test the one above proves nothing — it would pass on a 10 s lease too.
+#[test]
+fn the_same_derived_pass_without_per_row_heartbeats_loses_its_lease() {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<JobsFixture, _>(
+        "the_same_derived_pass_without_per_row_heartbeats_loses_its_lease",
+        |mut handle| {
+            let owner = format!("card21-nohb-{}", Uuid::new_v4());
+            let job_id = seed_leased_derived_job(&mut handle, &owner, 1.0);
+            let lease = jobs::DerivedLease {
+                tenant_id: handle.tenant_id,
+                job_id,
+                lease_owner: &owner,
+                attempt: 1,
+            };
+            // One heartbeat before the first row, then 1.6 s of serial work with none.
+            assert!(
+                handle
+                    .rt
+                    .block_on(jobs::heartbeat_derived_private(
+                        &handle.private,
+                        &lease,
+                        1.0
+                    ))
+                    .expect("heartbeat query must not error")
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1600));
+            assert!(
+                reclaimable_by_another_dispatcher(&mut handle, job_id),
+                "the lease must be expired — this is the condition the soak hit"
+            );
+            // The competing dispatcher, simulated on this tenant's own row only.
+            handle
+                .admin
+                .execute(
+                    "UPDATE ops.jobs SET lease_owner = $2, attempt = attempt + 1, \
+                            lease_expires_at = clock_timestamp() + interval '120 seconds' \
+                     WHERE job_id = $1",
+                    &[&job_id, &"card21-other-dispatcher"],
+                )
+                .expect("simulate the re-claim");
+            let settled = handle
+                .rt
+                .block_on(jobs::settle_derived_private(
+                    &handle.private,
+                    &lease,
+                    jobs::DerivedWorkOutcome::Done,
+                    1.0,
+                ))
+                .expect("settle query must not error");
+            assert!(
+                !settled,
+                "a re-claimed job must settle nothing for the original worker — this is \
+                 lost_lease=6"
+            );
+            assert_eq!(
+                job_status(&mut handle, job_id),
+                "PROCESSING",
+                "the job belongs to the new dispatcher now; the provider spend is redone"
+            );
+        },
+    );
+}

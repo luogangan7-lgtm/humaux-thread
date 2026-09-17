@@ -1,0 +1,49 @@
+# §46.1 migration manifest. Card 21 fix pass (reviewer P1 on the ProcessorId leg): add the one
+# column that makes "a checkpoint written by one worker is attributed to it" expressible —
+# `projection.stream_checkpoints.projection_processor_id`, written by `role_retrieval_worker` in
+# the same statement as `projection_highwater`. Additive nullable column + one column-level
+# GRANT extending an existing cell. No new table, no new role, no RLS change, no DML, nothing
+# removed. §6.2.2 row + `xtask/src/rls_check.rs` MATRIX updated in the same change (§48.2).
+# §46 forward-fix (EXPAND_ONLY, first free number after 0170).
+
+migration_id = "0171_stream_checkpoint_processor_attribution"
+class = "EXPAND_ONLY"
+
+precheck = """
+select
+ -- the table 0007 created is there, without the attribution column (this is not a replay)
+ to_regclass('projection.stream_checkpoints') is not null
+ and not exists (select 1 from pg_attribute
+                  where attrelid = 'projection.stream_checkpoints'::regclass
+                    and attname = 'projection_processor_id' and not attisdropped)
+ -- 0011's column-limited UPDATE cell for the writer is in place and is the one being extended
+ and has_column_privilege('role_retrieval_worker','projection.stream_checkpoints','projection_highwater','UPDATE')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- the column exists, is uuid, and is nullable (no invented attribution for rows advanced
+ -- before this migration)
+ (select a.atttypid = 'uuid'::regtype and not a.attnotnull
+    from pg_attribute a
+   where a.attrelid = 'projection.stream_checkpoints'::regclass
+     and a.attname = 'projection_processor_id' and not a.attisdropped)
+ -- no back-fill: every pre-existing row still reads NULL
+ and not exists (select 1 from projection.stream_checkpoints where projection_processor_id is not null)
+ -- exactly one role can write it, and it is the one that owns the watermark write
+ and has_column_privilege('role_retrieval_worker','projection.stream_checkpoints','projection_processor_id','UPDATE')
+ and not has_column_privilege('role_gateway','projection.stream_checkpoints','projection_processor_id','UPDATE')
+ and not has_column_privilege('role_maintenance','projection.stream_checkpoints','projection_processor_id','UPDATE')
+ and not has_column_privilege('role_consolidation_worker','projection.stream_checkpoints','projection_processor_id','UPDATE')
+ and not has_column_privilege('role_private_worker','projection.stream_checkpoints','projection_processor_id','UPDATE')
+ -- nobody gained a whole-table UPDATE out of this (§6.2.2 column limitation still holds)
+ and not has_table_privilege('role_retrieval_worker','projection.stream_checkpoints','INSERT')
+ and not has_column_privilege('role_retrieval_worker','projection.stream_checkpoints','serving','UPDATE')
+ and not has_column_privilege('role_retrieval_worker','projection.stream_checkpoints','shadow','UPDATE')
+ -- the three highwater columns 0011 granted are untouched
+ and has_column_privilege('role_retrieval_worker','projection.stream_checkpoints','projection_highwater','UPDATE')
+ and has_column_privilege('role_retrieval_worker','projection.stream_checkpoints','evidence_highwater','UPDATE')
+ and has_column_privilege('role_retrieval_worker','projection.stream_checkpoints','knowledge_highwater','UPDATE')
+ as postcheck_ok
+"""

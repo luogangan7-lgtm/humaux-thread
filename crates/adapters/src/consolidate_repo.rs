@@ -37,6 +37,7 @@ use humaux_application::consolidate::{
 use humaux_domain::authority::{AuthorityClass, EvidenceId, MemoryId};
 use humaux_domain::consolidate::{AutoMutableMemoryId, ClassifiedMemoryId, classify};
 use humaux_domain::ids::TenantId;
+use humaux_domain::ticket_family::TicketFamily;
 use humaux_projection::stream::StreamKey;
 
 use crate::postgres::ConsolidationDbPool;
@@ -798,13 +799,18 @@ pub async fn publish_rollup(
         Some(w) => ("workspace".to_owned(), w),
         None => ("tenant".to_owned(), tenant_id),
     };
+    // §78.1 / card 21: the family triple is DERIVED from the one closed set that owns it
+    // (`domain::ticket_family`), never spelled here. Three literals at this call site were one
+    // of the three hand-aligned copies the retrieval worker had to be configured to match; a
+    // mismatch produced a ticket nobody polls, silently and forever.
+    let family = TicketFamily::PrivateMemory;
     let key = StreamKey::new(
         TenantId(tenant_id),
         scope.0,
         scope.1,
-        "private_memory".to_owned(),
-        "PRIVATE_MEMORY".to_owned(),
-        "v1".to_owned(),
+        family.domain(),
+        family.projection_kind(),
+        family.projection_version(),
     );
     let ticket_commit_seq = remember::next_commit_seq(&mut txn).await?;
     let ticket_stream_seq =

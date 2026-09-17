@@ -7,10 +7,13 @@
 //!
 //! §16.3 criterion ①'s two `visible_*` counts come from [`crate::switch_visible`] (card 18's
 //! shared producer, live against Qdrant), **not** from a number typed on the command line. The
-//! old `--visible-shadow <n>` flag is accepted and ignored: the rehearsal filled it with
-//! `count(*) FROM projection.private_memory_points`, a PostgreSQL row count that had never been
-//! compared against the index it claimed to describe, and `visible_serving` was hard-`None`, so
-//! every switch after the first activation was refused `VisibleUnavailable` (ADR-0040).
+//! old `--visible-shadow <n>` flag is a **hard error** (card 21; it was merely warned about and
+//! ignored between cards 18 and 21, while `rehearse.sh` went on passing a PostgreSQL row count
+//! to it): the rehearsal filled it with `count(*) FROM projection.private_memory_points`, a row
+//! count that had never been compared against the index it claimed to describe, and
+//! `visible_serving` was hard-`None`, so every switch after the first activation was refused
+//! `VisibleUnavailable` (ADR-0040). A flag that is silently ignored is a lie the caller cannot
+//! see — the operator keeps believing they supplied the number the §16.3 criterion uses.
 
 use humaux_adapters::postgres::MaintenanceDbPool;
 use humaux_adapters::serving_repo::{SwitchOutcome, switch_projection_version};
@@ -50,6 +53,16 @@ struct Flags {
 }
 
 fn parse(args: &[String]) -> Result<Flags, String> {
+    // Card 21: refused, not ignored. See the module doc — an ignored flag lets the caller keep
+    // believing they supplied the number §16.3 criterion ① reads.
+    if args.iter().any(|a| a == "--visible-shadow") {
+        return Err(
+            "--visible-shadow was removed (ADR-0040): §16.3 criterion ①'s visible counts are \
+             taken live from Qdrant for BOTH the candidate and the serving version \
+             (xtask::switch_visible). Drop the flag; there is nothing to pass."
+                .to_owned(),
+        );
+    }
     let tenant: Uuid = required(args, "--tenant")?
         .parse()
         .map_err(|e| format!("--tenant must be a uuid: {e}"))?;
@@ -109,7 +122,7 @@ fn parse(args: &[String]) -> Result<Flags, String> {
 /// actually ran it says so on the command line); `--retire-failed <class[,class…]>` retires this
 /// version's exhausted `FAILED` tickets of those `error_class`es first (§15.2/§15.4, migration
 /// 0167) so criterion ② can clear; `--qdrant-host`/`--qdrant-port` (local defaults).
-/// `--visible-shadow` is obsolete — see the module doc.
+/// `--visible-shadow` is removed and now a hard error — see the module doc.
 pub fn run(args: &[String]) -> i32 {
     let flags = match parse(args) {
         Ok(v) => v,
@@ -118,12 +131,6 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    if arg(args, "--visible-shadow").is_some() {
-        eprintln!(
-            "projection-serve: ignoring --visible-shadow (obsolete): §23.1②'s visible counts are \
-             now taken live from Qdrant for both the candidate and the serving version"
-        );
-    }
     let dsn = match std::env::var("HUMAUX_MAINTENANCE_PG_DSN") {
         Ok(v) => v,
         Err(_) => {
@@ -273,4 +280,61 @@ fn visible_inputs(
         },
     ));
     Ok((pair, serving))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    fn args(extra: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = [
+            "--tenant",
+            "00000000-0000-0000-0000-000000000001",
+            "--workspace",
+            "00000000-0000-0000-0000-000000000002",
+            "--domain",
+            "private_memory",
+            "--projection-kind",
+            "PRIVATE_MEMORY",
+            "--version",
+            "v1",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        v.extend(extra.iter().map(|s| (*s).to_owned()));
+        v
+    }
+
+    /// Card 21 folded debt (from card 18): `--visible-shadow` was warned about and ignored
+    /// while `rehearse.sh` kept passing a PostgreSQL row count to it. An ignored flag is
+    /// indistinguishable, from the operator's side, from an honoured one.
+    #[test]
+    fn visible_shadow_is_a_hard_error_not_a_warning() {
+        // `Flags` is not `Debug`, so unwrap the error side by hand rather than `expect_err`.
+        let err = match parse(&args(&["--visible-shadow", "42"])) {
+            Err(e) => e,
+            Ok(_) => panic!("--visible-shadow must be refused"),
+        };
+        assert!(err.contains("--visible-shadow was removed"), "{err}");
+        assert!(err.contains("switch_visible"), "{err}");
+    }
+
+    /// The flag alone is enough — even without a value, which is how a shell that lost its
+    /// substitution would spell it.
+    #[test]
+    fn visible_shadow_is_refused_even_with_no_value() {
+        assert!(parse(&args(&["--visible-shadow"])).is_err());
+    }
+
+    /// Positive control: the same command line without the flag parses.
+    #[test]
+    fn the_same_invocation_without_the_flag_parses() {
+        let flags = match parse(&args(&[])) {
+            Ok(f) => f,
+            Err(e) => panic!("must parse: {e}"),
+        };
+        assert_eq!(flags.version, "v1");
+        assert_eq!(flags.family.domain, "private_memory");
+    }
 }

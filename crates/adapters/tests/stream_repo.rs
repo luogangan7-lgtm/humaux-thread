@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use humaux_adapters::postgres::{MaintenanceDbPool, RetrievalWorkerDbPool};
 use humaux_adapters::stream_repo::{self, AdvanceError};
+use humaux_domain::egress::ProcessorId;
 use humaux_domain::ids::TenantId;
 use humaux_projection::stream::StreamKey;
 use humaux_retrieval::completeness::LedgerClosure;
@@ -21,6 +22,12 @@ use sqlx::types::Uuid;
 // `role_maintenance` — see `stream_repo`'s module doc), and every test below seeds its own
 // throwaway tenant, so no serialization guard is needed here: two tests' sweeps can never
 // touch each other's rows even running concurrently.
+
+/// Card 21 fix pass: two §7.4 worker identities. `advance_prefix` writes the caller's into
+/// `projection.stream_checkpoints.projection_processor_id` (migration 0171) — the column that
+/// makes "a checkpoint written by one worker is attributed to it" expressible at all.
+const WORKER_A: Uuid = Uuid::from_u128(0x0171_00a0);
+const WORKER_B: Uuid = Uuid::from_u128(0x0171_00b0);
 
 fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
     // libpq-standard `options=-c role=X` (URL-encoded). The older `options[role]=X` form
@@ -236,7 +243,11 @@ fn advance_prefix_stops_before_the_gap_100_failed_101_done() {
 
             let n = handle
                 .rt
-                .block_on(stream_repo::advance_prefix(&handle.retrieval, &k))
+                .block_on(stream_repo::advance_prefix(
+                    &handle.retrieval,
+                    &k,
+                    ProcessorId(WORKER_A),
+                ))
                 .expect("consistent ledger must advance");
             assert_eq!(
                 n, 99,
@@ -265,6 +276,111 @@ fn advance_prefix_stops_before_the_gap_100_failed_101_done() {
     );
 }
 
+/// Card 21 fix pass (reviewer P1): the card's own acceptance asks for "a checkpoint written by
+/// one worker is attributed to it". Before migration 0171 the table had no column that could
+/// carry the answer and the assertion was quietly replaced by an `ops.data_disclosures` one;
+/// this is the assertion the card actually asked for. Two workers advance the SAME checkpoint
+/// in turn, and each time the row names the one that moved it — not the first, not NULL.
+///
+/// Fault injection, measured (2026-09-16): dropping `projection_processor_id = $8` from
+/// `advance_prefix`'s UPDATE makes the first `expect("attributed")` panic on a NULL. Writing it
+/// in a second statement outside the monotonic `WHERE` is the other failure this pins — then the
+/// second assertion (B, not A) is what catches a row whose name and number disagree.
+#[test]
+fn a_checkpoint_carries_the_processor_id_of_the_worker_that_advanced_it() {
+    run_db_fixture::<StreamFixture, _>(
+        "a_checkpoint_carries_the_processor_id_of_the_worker_that_advanced_it",
+        |mut handle| {
+            let k = key(&handle);
+            let now = SystemTime::now();
+            for seq in 1..=3i64 {
+                seed_log_row(&mut handle.admin, &k, seq, "DONE", now);
+            }
+            seed_checkpoint(&mut handle.admin, &k, 3);
+
+            // Nothing has advanced this checkpoint yet: attribution is NULL, never a
+            // placeholder identity (0171 deliberately back-fills nothing).
+            assert_eq!(
+                attribution(&mut handle.admin, &k),
+                None,
+                "a checkpoint nobody advanced must not name a processor"
+            );
+
+            let n = handle
+                .rt
+                .block_on(stream_repo::advance_prefix(
+                    &handle.retrieval,
+                    &k,
+                    ProcessorId(WORKER_A),
+                ))
+                .expect("worker A advances");
+            assert_eq!(n, 3);
+            assert_eq!(
+                attribution(&mut handle.admin, &k).expect("attributed"),
+                WORKER_A,
+                "the checkpoint must name the worker that wrote it"
+            );
+
+            // A second, distinct worker moves the same checkpoint further.
+            for seq in 4..=5i64 {
+                seed_log_row(&mut handle.admin, &k, seq, "DONE", now);
+            }
+            handle
+                .admin
+                .execute(
+                    "UPDATE projection.stream_checkpoints SET issued_highwater=5 \
+                     WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND domain=$4 \
+                       AND projection_kind=$5 AND projection_version=$6",
+                    &[
+                        &k.tenant_id.0,
+                        &k.scope_kind,
+                        &k.scope_id,
+                        &k.domain,
+                        &k.projection_kind,
+                        &k.projection_version,
+                    ],
+                )
+                .expect("bump issued_highwater");
+
+            let n = handle
+                .rt
+                .block_on(stream_repo::advance_prefix(
+                    &handle.retrieval,
+                    &k,
+                    ProcessorId(WORKER_B),
+                ))
+                .expect("worker B advances");
+            assert_eq!(n, 5);
+            assert_eq!(
+                attribution(&mut handle.admin, &k).expect("attributed"),
+                WORKER_B,
+                "the checkpoint must name the LAST worker that moved it, not the first"
+            );
+            assert_ne!(WORKER_A, WORKER_B, "the two identities must be distinct");
+        },
+    );
+}
+
+/// `projection.stream_checkpoints.projection_processor_id` for one key (migration 0171).
+fn attribution(admin: &mut Client, key: &StreamKey) -> Option<Uuid> {
+    admin
+        .query_one(
+            "SELECT projection_processor_id FROM projection.stream_checkpoints \
+             WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND domain=$4 \
+               AND projection_kind=$5 AND projection_version=$6",
+            &[
+                &key.tenant_id.0,
+                &key.scope_kind,
+                &key.scope_id,
+                &key.domain,
+                &key.projection_kind,
+                &key.projection_version,
+            ],
+        )
+        .expect("checkpoint row must exist")
+        .get(0)
+}
+
 /// Fault injection, identity side (a): `expected == done + open_gaps + pending`. A
 /// stream_log row for seq 100 is never written at all (simulates the class of bug §15's
 /// intro names — an `INSERT` silently skipped/lost — not representable as any `state`, so it
@@ -289,7 +405,11 @@ fn advance_prefix_inconsistent_when_sum_identity_breaks() {
 
             let err = handle
                 .rt
-                .block_on(stream_repo::advance_prefix(&handle.retrieval, &k))
+                .block_on(stream_repo::advance_prefix(
+                    &handle.retrieval,
+                    &k,
+                    ProcessorId(WORKER_A),
+                ))
                 .expect_err("expected==max_stream_seq holds but expected!=done+gaps+pending");
             assert!(matches!(err, AdvanceError::Inconsistent));
         },
@@ -316,7 +436,11 @@ fn advance_prefix_inconsistent_when_max_seq_disagrees_with_expected() {
 
             let err = handle
                 .rt
-                .block_on(stream_repo::advance_prefix(&handle.retrieval, &k))
+                .block_on(stream_repo::advance_prefix(
+                    &handle.retrieval,
+                    &k,
+                    ProcessorId(WORKER_A),
+                ))
                 .expect_err("done+gaps+pending==expected holds but max_stream_seq!=expected");
             assert!(matches!(err, AdvanceError::Inconsistent));
         },
@@ -492,7 +616,11 @@ fn retirement_unpins_the_contiguous_done_prefix_in_both_copies() {
             assert_eq!(
                 handle
                     .rt
-                    .block_on(stream_repo::advance_prefix(&handle.retrieval, &k))
+                    .block_on(stream_repo::advance_prefix(
+                        &handle.retrieval,
+                        &k,
+                        ProcessorId(WORKER_A)
+                    ))
                     .expect("consistent ledger"),
                 1
             );
@@ -524,7 +652,11 @@ fn retirement_unpins_the_contiguous_done_prefix_in_both_copies() {
             assert_eq!(
                 handle
                     .rt
-                    .block_on(stream_repo::advance_prefix(&handle.retrieval, &k))
+                    .block_on(stream_repo::advance_prefix(
+                        &handle.retrieval,
+                        &k,
+                        ProcessorId(WORKER_A)
+                    ))
                     .expect("identity still holds after retirement"),
                 3,
                 "§15.4's four-number identity must still close after a retirement"

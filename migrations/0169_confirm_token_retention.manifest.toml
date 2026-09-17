@@ -1,0 +1,55 @@
+# §46.1 migration manifest. Card 21 (card 1 review P2, folded): `control.confirm_tokens`
+# retention — two partial indexes, a DELETE grant to `role_maintenance` alone, and one owner
+# SECURITY DEFINER sweep with EXECUTE to `role_maintenance`. No new table, no new role, no RLS
+# change, no DML, nothing removed. §6.2.2 row + `xtask/src/rls_check.rs` MATRIX updated in the
+# same change (§48.2). §46 forward-fix (EXPAND_ONLY, first free number after 0168).
+
+migration_id = "0169_confirm_token_retention"
+class = "EXPAND_ONLY"
+
+precheck = """
+select
+ -- the table 0148 created is there, still with no retention machinery (this is not a replay)
+ to_regclass('control.confirm_tokens') is not null
+ and not exists (select 1 from pg_class where relname='confirm_tokens_expires_at_idx')
+ and not exists (select 1 from pg_class where relname='confirm_tokens_consumed_at_idx')
+ and to_regprocedure('control.sweep_confirm_tokens(interval)') is null
+ -- nobody could delete a confirm token before this migration
+ and not has_table_privilege('role_maintenance','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_gateway','control.confirm_tokens','DELETE')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- both partial indexes exist and are partial (a full index would defeat the point)
+ (select count(*) from pg_class c join pg_index i on i.indexrelid=c.oid
+   where c.relname in ('confirm_tokens_expires_at_idx','confirm_tokens_consumed_at_idx')
+     and i.indpred is not null) = 2
+ -- DELETE goes to role_maintenance ONLY: the minter still cannot erase its own audit trail
+ and has_table_privilege('role_maintenance','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_gateway','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_private_worker','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_consolidation_worker','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_public_worker','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_retrieval_worker','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_batch_issuer','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_admin','control.confirm_tokens','DELETE')
+ -- the sweep is an owner SECURITY DEFINER door with a pinned search_path, EXECUTE to
+ -- role_maintenance only, PUBLIC revoked
+ and (select p.prosecdef and p.proconfig @> array['search_path=pg_catalog']
+        and pg_get_userbyid(p.proowner) = 'role_migration_owner'
+        from pg_proc p where p.oid = to_regprocedure('control.sweep_confirm_tokens(interval)'))
+ and has_function_privilege('role_maintenance','control.sweep_confirm_tokens(interval)','EXECUTE')
+ and not has_function_privilege('role_gateway','control.sweep_confirm_tokens(interval)','EXECUTE')
+ -- 0148's own guarantees are untouched: RLS still forced, single-use trigger still installed,
+ -- gateway still holds exactly SELECT/INSERT/UPDATE(consumed_at)
+ and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid='control.confirm_tokens'::regclass)
+ and exists (select 1 from pg_trigger where tgrelid='control.confirm_tokens'::regclass
+              and tgname='confirm_token_single_use' and not tgisinternal)
+ and has_table_privilege('role_gateway','control.confirm_tokens','SELECT')
+ and has_table_privilege('role_gateway','control.confirm_tokens','INSERT')
+ and has_column_privilege('role_gateway','control.confirm_tokens','consumed_at','UPDATE')
+ as postcheck_ok
+"""

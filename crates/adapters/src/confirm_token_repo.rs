@@ -23,7 +23,7 @@ use sqlx::types::time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    postgres::RuntimeDbPool,
+    postgres::{MaintenanceDbPool, RuntimeDbPool},
     request_guard_repo::{self, AuditTenant},
 };
 
@@ -164,6 +164,50 @@ pub async fn mint_with_audit(
     .await?;
     txn.commit().await.map_err(db_error)?;
     Ok(MintedConfirmation { expires_at })
+}
+
+/// §33.10 rule 9 / card 21 (card 1 review P2): the retention sweep — the ONLY caller-side door
+/// to `control.sweep_confirm_tokens(interval)` (migration 0169, forward-fixed by 0170).
+///
+/// Why a function call and not a `DELETE` here: `role_maintenance` holds no DELETE on the table
+/// (§6.2.1 bans that verb for every non-owner role, globally — 0169 granted it, `xtask
+/// rls-check` went red, 0170 revoked it). The predicate lives once, inside the owner SECURITY
+/// DEFINER function, rather than in every operator's shell history:
+///
+/// > deletable ⇔ `expires_at < now()` AND (`consumed_at IS NULL` OR `consumed_at < now() -
+/// > retention`)
+///
+/// i.e. a row that can no longer gate anything AND is no longer wanted as audit. A
+/// recently-consumed token is deliberately KEPT: the §9 audit answer "which confirm token
+/// authorized this destructive call" has to outlive the call. `retention` is the deployment's
+/// policy, never a literal in here or in the function (§78.1).
+///
+/// Per-tenant by construction: `control.confirm_tokens` FORCEs RLS and its policy is
+/// `tenant_id = current_setting('humaux.tenant_id')`, which the definer owner is subject to as
+/// well — a call with no tenant context matches nothing and deletes nothing. A deployment
+/// patrolling every tenant loops `control.tenants` and calls this once per tenant, exactly like
+/// [`crate::stream_repo::sweep_lost`]. Returns the number of rows deleted for that tenant.
+pub async fn sweep_expired(
+    pool: &MaintenanceDbPool,
+    tenant_id: Uuid,
+    retention: Duration,
+) -> Result<i64, ErrorCode> {
+    let mut txn = pool.pool().begin().await.map_err(db_error)?;
+    // Same technique and rationale as `stream_repo::set_tenant_local` (a `Uuid`'s `Display`
+    // only ever emits canonical lowercase hex, so this formatted string carries nothing
+    // injectable) — `SET LOCAL` takes no bind parameters.
+    sqlx::query(&format!("SET LOCAL humaux.tenant_id = '{tenant_id}'"))
+        .execute(&mut *txn)
+        .await
+        .map_err(db_error)?;
+    let deleted: i64 =
+        sqlx::query_scalar("SELECT control.sweep_confirm_tokens(make_interval(secs => $1))")
+            .bind(retention.as_secs_f64())
+            .fetch_one(&mut *txn)
+            .await
+            .map_err(db_error)?;
+    txn.commit().await.map_err(db_error)?;
+    Ok(deleted)
 }
 
 /// D-A/D-B second call: verify + consume in the caller's transaction. Exactly one row may

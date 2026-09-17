@@ -32,6 +32,7 @@ use humaux_domain::identity::{AuthorizationScope, VisibilityClass};
 use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
 use humaux_domain::memory::MemoryType;
 use humaux_domain::subject::SubjectId;
+use humaux_domain::ticket_family::TicketFamily;
 use humaux_infra_cell::{
     CellAccessPermit, IntraCellError, IntraCellHttpTransport, IntraCellMethod, IntraCellRequest,
 };
@@ -81,6 +82,22 @@ impl RetrievalFamily {
     /// rather than a type alias, even though nothing has diverged them yet.
     pub fn as_db_str(self) -> &'static str {
         self.collection_name()
+    }
+
+    /// The §15.1 ticket family whose `stream_log` rows this retrieval family indexes — the
+    /// bridge between §17's collection identity and §15.1's `(domain, projection_kind,
+    /// projection_version)` triple. `None` for the two families that carry no private ticket
+    /// stream (public knowledge / code are not `projection.stream_log` producers).
+    ///
+    /// This exists so the retrieval worker, the consolidation worker's rollup re-signal and
+    /// the seeded gateway config can all name the same family without three hand-aligned
+    /// spellings of it (card 21; §78.1). `retrieval_family_matches_ticket_family` below pins
+    /// the two names to each other.
+    pub fn ticket_family(self) -> Option<TicketFamily> {
+        match self {
+            Self::PrivateMemoryV1 => Some(TicketFamily::PrivateMemory),
+            Self::PublicKnowledgeV1 | Self::CodeV1 => None,
+        }
     }
 }
 
@@ -1472,5 +1489,42 @@ mod http_wiring_tests {
         assert!(validate_collection("../../admin").is_err());
         assert!(validate_collection("").is_err());
         assert!(validate_collection("bad\r\nHost: evil").is_err());
+    }
+}
+
+#[cfg(test)]
+mod ticket_family_tests {
+    use super::RetrievalFamily;
+    use humaux_domain::ticket_family::TicketFamily;
+
+    /// §17 × §15.1 (card 21): the Qdrant collection name and the ticket-family triple are two
+    /// renderings of ONE identity, not two hand-aligned literals. `TicketFamily::
+    /// collection_name` derives `{domain}_{projection_version}`; §17's own control point
+    /// spells the collection. If either side is edited alone this goes red — which is the
+    /// whole point of deriving the triple instead of copying it.
+    ///
+    /// Fault injection: change `TicketFamily::PrivateMemory::projection_version` to `"v2"`
+    /// without touching §17's `collection_name` ⇒ red.
+    #[test]
+    fn retrieval_family_matches_ticket_family() {
+        assert_eq!(
+            RetrievalFamily::PrivateMemoryV1.ticket_family(),
+            Some(TicketFamily::PrivateMemory)
+        );
+        assert_eq!(
+            RetrievalFamily::PrivateMemoryV1.collection_name(),
+            TicketFamily::PrivateMemory.collection_name()
+        );
+    }
+
+    /// The other two §17 families are not `projection.stream_log` producers — saying so
+    /// explicitly keeps a future family from silently inheriting the private-memory triple.
+    #[test]
+    fn only_private_memory_carries_a_ticket_family() {
+        let with_tickets: Vec<_> = RetrievalFamily::ALL
+            .into_iter()
+            .filter(|f| f.ticket_family().is_some())
+            .collect();
+        assert_eq!(with_tickets, vec![RetrievalFamily::PrivateMemoryV1]);
     }
 }

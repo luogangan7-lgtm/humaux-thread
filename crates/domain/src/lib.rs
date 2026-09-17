@@ -29,3 +29,4 @@ pub mod public;
 pub mod selection;
 pub mod subject;
 pub mod temporal;
+pub mod ticket_family;

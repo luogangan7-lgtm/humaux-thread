@@ -650,8 +650,9 @@ pub fn evaluate(series: &Series, max_rss: u64, max_conns: i64) -> Vec<Assertion>
 ///
 /// **Why this shape and not "create a second projection version to grade".** The card offered
 /// both. A promotion candidate is a version that is NOT its family's serving row; on this
-/// deployment every family holds exactly one (`HUMAUX_RETRIEVAL_WORKER_PROJECTION_VERSION` is a
-/// single value for the whole run), so the honest candidate count is 0 and the old loop's
+/// deployment every family holds exactly one (card 21: the projection version is DERIVED from
+/// `domain::ticket_family::TicketFamily` — one value for the whole build, no longer three
+/// hand-aligned env values), so the honest candidate count is 0 and the old loop's
 /// `VisibleSameVersionDeclared` tally was the harness grading a version against itself. The
 /// alternative — have the harness manufacture a `v2` checkpoint row — would grade a synthetic
 /// backfill rather than the deployment: criterion ① would compare `visible(v2) = 0` against a

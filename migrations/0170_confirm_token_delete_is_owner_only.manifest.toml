@@ -1,0 +1,44 @@
+# §46.1 migration manifest. Card 21: retract the `DELETE ON control.confirm_tokens` grant 0169
+# gave `role_maintenance`. §6.2.1 bans DELETE/TRUNCATE for every non-owner role globally, and
+# the owner SECURITY DEFINER sweep `control.sweep_confirm_tokens(interval)` needs no table-level
+# DELETE to do its work. Pure REVOKE: no DDL, no DML, nothing else touched. CONTRACT_ONLY.
+
+migration_id = "0170_confirm_token_delete_is_owner_only"
+class = "CONTRACT_ONLY"
+
+precheck = """
+select
+ -- 0169 is in place: the sweep and its indexes exist, and the grant it wrongly added is present
+ to_regprocedure('control.sweep_confirm_tokens(interval)') is not null
+ and has_table_privilege('role_maintenance','control.confirm_tokens','DELETE')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- no non-owner role holds DELETE or TRUNCATE on this table (§6.2.1, the rule rls-check
+ -- enumerates); spelled per role rather than as a loop so a new role cannot slip through
+ not has_table_privilege('role_maintenance','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_gateway','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_private_worker','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_consolidation_worker','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_public_worker','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_retrieval_worker','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_batch_issuer','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_admin','control.confirm_tokens','DELETE')
+ and not has_table_privilege('role_maintenance','control.confirm_tokens','TRUNCATE')
+ -- the retention machinery 0169 added is untouched: both partial indexes, the owner definer
+ -- sweep with its pinned search_path, EXECUTE still exactly role_maintenance
+ and (select count(*) from pg_class c join pg_index i on i.indexrelid=c.oid
+       where c.relname in ('confirm_tokens_expires_at_idx','confirm_tokens_consumed_at_idx')
+         and i.indpred is not null) = 2
+ and (select p.prosecdef and p.proconfig @> array['search_path=pg_catalog']
+        and pg_get_userbyid(p.proowner) = 'role_migration_owner'
+        from pg_proc p where p.oid = to_regprocedure('control.sweep_confirm_tokens(interval)'))
+ and has_function_privilege('role_maintenance','control.sweep_confirm_tokens(interval)','EXECUTE')
+ and not has_function_privilege('role_gateway','control.sweep_confirm_tokens(interval)','EXECUTE')
+ -- 0148's own guarantees still hold
+ and has_table_privilege('role_maintenance','control.confirm_tokens','SELECT')
+ and has_column_privilege('role_gateway','control.confirm_tokens','consumed_at','UPDATE')
+ as postcheck_ok
+"""

@@ -276,6 +276,9 @@ const MATRIX: &[Cell] = &[
         "role_private_worker",
         ["SELECT"]
     ),
+    // `projection_processor_id` (migration 0171) rides the same cell as the watermark it
+    // attributes: `advance_prefix` writes both columns in ONE statement, so the writer of the
+    // number is the writer of the name. No other role holds it.
     cell!(
         "projection.stream_checkpoints",
         "role_retrieval_worker",
@@ -285,7 +288,8 @@ const MATRIX: &[Cell] = &[
             [
                 "evidence_highwater",
                 "knowledge_highwater",
-                "projection_highwater"
+                "projection_highwater",
+                "projection_processor_id"
             ]
         )]
     ),
@@ -481,6 +485,12 @@ const MATRIX: &[Cell] = &[
         ["SELECT", "INSERT"],
         [("UPDATE", ["consumed_at"])]
     ),
+    // 0169 + 0170 (card 21, card-1 review P2): retention. The sweep is the owner SECURITY
+    // DEFINER `control.sweep_confirm_tokens(interval)` (EXECUTE to role_maintenance only), so
+    // NO runtime role holds a table DELETE — 0169 granted one, §6.2.1's global 全域禁动词 rule
+    // refused it (see `check_forbidden_verbs`), and 0170 revoked it. `role_maintenance` stays
+    // read-only here; the gateway mints and consumes and still cannot delete (§37.2: a minter
+    // that can erase its own audit trail).
     cell!("control.confirm_tokens", "role_maintenance", ["SELECT"]),
     // 0149 (ADR-0020): §36/§37.1 memory lifecycle event log. Append-only; writes go ONLY
     // through owner SECURITY DEFINER ops.append_memory_lifecycle (EXECUTE to role_gateway),

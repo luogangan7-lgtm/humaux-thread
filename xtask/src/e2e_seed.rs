@@ -32,6 +32,7 @@ use humaux_adapters::qdrant::{
 };
 use humaux_adapters::quota_repo;
 use humaux_domain::ids::TenantId;
+use humaux_domain::ticket_family::TicketFamily;
 use humaux_infra_cell::{
     CallerId, CellId, DEFAULT_MAX_RESPONSE_BYTES, HttpIntraCellTransport, IntraCellHttpTransport,
     IntraCellMethod, IntraCellRequest, IntraCellResource, IntraCellResourceRegistry, ResourceEntry,
@@ -1086,6 +1087,14 @@ pub fn run(args: &[String]) -> i32 {
         base.tenant_id
     );
     println!("export HUMAUX_RETRIEVAL_WORKER_SCOPE_KIND=workspace");
+    // Card 21, §7.4: the retrieval worker's own §7 egress identity. It used to build its
+    // embedding provider with `ProcessorId(Uuid::nil())`, so every `ops.data_disclosures` row
+    // it wrote named processor all-zeros. Emitted from the SAME `--processor-id` the private
+    // worker's identity comes from, so the deployment has one value to set, not two.
+    println!(
+        "export HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID={}",
+        lane_flags.egress_processor_id
+    );
     println!(
         "export HUMAUX_RETRIEVAL_WORKER_SCOPE_ID={}",
         base.workspace_id
@@ -1093,6 +1102,29 @@ pub fn run(args: &[String]) -> i32 {
     println!(
         "export HUMAUX_GATEWAY_EMBEDDING_DIMENSION={}",
         qdrant_flags.dimension
+    );
+    println!();
+    // Card 21, §78.1: the §15.1 ticket-family triple is EMITTED from the one closed set that
+    // owns it (`domain::ticket_family::TicketFamily`), never typed into the rehearsal script.
+    // The gateway is the issuer and the retrieval worker is the resolver; before this, the
+    // script carried `DOMAIN=…; PKIND=…; PVER=…` by hand and the retrieval worker read three
+    // env values of its own — three copies of a value that must be equal, with no runtime
+    // signal when they are not (the worker just polls a stream nobody writes, forever). The
+    // worker now derives its triple from `RetrievalFamily::PrivateMemoryV1`; the gateway's
+    // write policy is deployment configuration (§78.1 keeps it a key), so the seed fills it
+    // from the same source instead of leaving it to be hand-aligned.
+    let ticket_family = TicketFamily::PrivateMemory;
+    println!(
+        "export HUMAUX_GATEWAY_REMEMBER_DOMAIN={}",
+        ticket_family.domain()
+    );
+    println!(
+        "export HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND={}",
+        ticket_family.projection_kind()
+    );
+    println!(
+        "export HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION={}",
+        ticket_family.projection_version()
     );
     println!();
     // ADR-0036: same for the distill hop — no tenant/domain in the environment, only the

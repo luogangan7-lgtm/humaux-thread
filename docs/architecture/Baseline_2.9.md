@@ -1196,7 +1196,7 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
 | `role_private_worker` | SELECT | SELECT | SELECT, UPDATE(state,error_class) | SELECT | SELECT, UPDATE, INSERT(tenant_id,commit_seq,event_type,contribution_release_id,anonymous_source_id,candidate_envelope_sha256,anonymous_source_revision) | SELECT, INSERT, UPDATE | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT (migration 0145) | SELECT (migration 0145) | — | — | SELECT | SELECT, INSERT, UPDATE(state,revoked_at) | SELECT, INSERT | — | INSERT | — | — | — | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT | SELECT | — | — | — | — | — | — | SELECT, INSERT(contribution_release_id,tenant_id) | SELECT, INSERT(tenant_id,anonymous_source_id,sanitized_content,content_sha256,policy_version,policy_digest,assessment_outcome,assessment_digest,envelope_sha256) | — | — | SELECT, INSERT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | SELECT | SELECT | SELECT | — | — | — | — | — | SELECT, UPDATE(narrow, migration 0143) | — | — | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT, INSERT | SELECT, INSERT | — | SELECT, INSERT | SELECT | SELECT | SELECT |
 | `role_consolidation_worker` | — | — | SELECT, INSERT | SELECT, INSERT(tenant_id,scope_kind,scope_id,domain,projection_kind,projection_version), UPDATE(issued_highwater) | SELECT, INSERT(tenant_id,commit_seq,stream_seq,event_type,evidence_id) | SELECT, UPDATE(status,lease_owner,lease_expires_at) | — | SELECT | SELECT | SELECT | SELECT, INSERT, UPDATE(status,input_snapshot_seq,manifest_hash,output_digest,finished_at,error_class) | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — | — | SELECT, INSERT(narrow, migrations 0143/0145) | — | — | — | — | — | — | — | SELECT | SELECT | SELECT, INSERT | — | — | SELECT | SELECT |
 | `role_public_worker` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | — | — | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT |
-| `role_retrieval_worker` | — | — | SELECT, UPDATE | SELECT, UPDATE(evidence_highwater, knowledge_highwater, projection_highwater) | SELECT, UPDATE | SELECT, INSERT, UPDATE | — | SELECT | SELECT | SELECT | — | — | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | — | — | — | SELECT, INSERT | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | SELECT, UPDATE(narrow, migration 0141) | — | — | SELECT | — | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | — | SELECT | SELECT |
+| `role_retrieval_worker` | — | — | SELECT, UPDATE | SELECT, UPDATE(evidence_highwater, knowledge_highwater, projection_highwater, projection_processor_id) | SELECT, UPDATE | SELECT, INSERT, UPDATE | — | SELECT | SELECT | SELECT | — | — | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | — | — | — | SELECT, INSERT | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | SELECT, UPDATE(narrow, migration 0141) | — | — | SELECT | — | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | — | SELECT | SELECT |
 | `role_batch_issuer` | **INSERT, SELECT** | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 | `role_maintenance` | SELECT, UPDATE（仅 `ISSUED → EXPIRED` 巡检，§15.6） | SELECT | SELECT, UPDATE（仅 `ISSUED → LOST` 巡检 §15.2 与 `retention::tombstone` 的 `* → TOMBSTONED` §37.2） | SELECT, UPDATE(serving, shadow) | SELECT | SELECT, UPDATE(status, lease_owner, lease_expires_at) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT | SELECT | SELECT, UPDATE(revoked_at, revocation_reason) | — | — | SELECT | SELECT | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | — | — | SELECT | SELECT | SELECT, UPDATE(state) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT, UPDATE(state, role, updated_at) | SELECT |
 | `role_admin` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -1225,7 +1225,7 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
   仅 `role_private_worker` 有 EXECUTE、PUBLIC 无），与 0130 resolver 同一纪律，由 `rls-check` 的 R3 function gate
   一并钉住（`R3_PRIVATE_WORKER_FUNCTIONS`）。
 
-- **Confirm-token gate（0148，ADR-0018）**：`control.confirm_tokens` 是 §33.10 规则 9 两步确认的服务端一半，只存 sha256(nonce) 与 (tenant, user, operation, target, successor) 绑定——`successor_id` 钉住操作的第二个参数（`memory.supersede` 的 `replacement_memory_id`），确认的是「这一对」而不是单个 target。`role_gateway` 对它 `SELECT, INSERT, UPDATE(consumed_at)`：第一次调用铸 token（INSERT + 审计，无其他持久写），第二次调用在被门控的业务事务**同一事务内**核验并消费（单条 `UPDATE ... WHERE consumed_at IS NULL AND expires_at > now`，0 行即 CONFLICT）；owner 触发器只允许 `consumed_at` NULL→非 NULL 一次。`role_maintenance` 只读；其余非 owner 角色全为 `—`，无人有 DELETE。首个消费者 `memory.supersede` 同时把 `private.memory_records` 上 `role_gateway` 的列级 UPDATE 由 `(status,superseded_by)` 扩到 `(status,superseded_by,superseded_at)`（§9 的 `superseded_at` 此前无人能写），表级 UPDATE 仍不授予。
+- **Confirm-token gate（0148，ADR-0018）**：`control.confirm_tokens` 是 §33.10 规则 9 两步确认的服务端一半，只存 sha256(nonce) 与 (tenant, user, operation, target, successor) 绑定——`successor_id` 钉住操作的第二个参数（`memory.supersede` 的 `replacement_memory_id`），确认的是「这一对」而不是单个 target。`role_gateway` 对它 `SELECT, INSERT, UPDATE(consumed_at)`：第一次调用铸 token（INSERT + 审计，无其他持久写），第二次调用在被门控的业务事务**同一事务内**核验并消费（单条 `UPDATE ... WHERE consumed_at IS NULL AND expires_at > now`，0 行即 CONFLICT）；owner 触发器只允许 `consumed_at` NULL→非 NULL 一次。`role_maintenance` 只读；**没有任何 runtime 角色持有本表的 DELETE**——清扫走 owner SECURITY DEFINER 的唯一门（见下），gateway 尤其不得删：铸 token 的角色不得抹掉自己的审计痕迹（§37.2）。0148 没有留任何收缩路径（无 DELETE grant、无 `expires_at` 索引、无巡检），于是每一枚发出去的 token 永久留存——这正是 §53 INV 要抓的无条件增长形态，而 token 在过期那一刻就已毫无用处（单次使用、`nonce_sha256` UNIQUE，留下的只是那一次查找上的索引膨胀）。0169 补三样：`expires_at`（未消费）与 `consumed_at`（已消费）两个**部分索引**、唯一的巡检门 `control.sweep_confirm_tokens(interval)`（owner SECURITY DEFINER、`search_path` 钉死 `pg_catalog`、EXECUTE 只给 `role_maintenance`、PUBLIC 撤销），以及——错误地——一条给 `role_maintenance` 的表级 DELETE。**那条 grant 由 0170 撤销**：§6.2.1「全域禁动词」是无例外的全局硬约束（`xtask rls-check` 的 `check_forbidden_verbs` 逐条枚举 `role_table_grants`，当场判红），而且它本来就多余——definer 函数体内的 DELETE 以 `role_migration_owner` 身份执行，`role_maintenance` 只需要函数的 EXECUTE。**§6.2.2 的某一格不能授权 §6.2.1 全局禁掉的动词**；与 `ops.append_memory_lifecycle`、`projection.retire_failed_ticket` 同一 chokepoint 形态：动词只存在于那一扇被审计的门后面，不出现在任何 runtime 角色的授权清单里。保留判据只此一处：`expires_at < now()` **且**（从未消费 ⇒ 立即可删，什么都没发生、没有审计事件可留；或已消费且早于调用者给的 audit retention ⇒ 可删）。retention 间隔是**调用者的参数**而不是函数里的字面量（§78.1：留存期是部署策略）。该函数与其他运行期访问一样受 `confirm_tokens_tenant` policy 约束（owner 也 FORCE），所以它按租户生效；不带 tenant 上下文调用时 policy 匹配不到任何行，删 0 行，不存在「跨租户抹除」的调用形态。首个消费者 `memory.supersede` 同时把 `private.memory_records` 上 `role_gateway` 的列级 UPDATE 由 `(status,superseded_by)` 扩到 `(status,superseded_by,superseded_at)`（§9 的 `superseded_at` 此前无人能写），表级 UPDATE 仍不授予。
 
 - **Memory lifecycle log 与 restore（0149，ADR-0020）**：`ops.memory_lifecycle_events` 是 §36/§37.1 memory 级转换史（append-only，`memory_id` 无 FK 以熬过 §37 purge）。**没有任何 runtime 角色持有它的表级 INSERT/UPDATE/DELETE**：写入只经 owner SECURITY DEFINER `ops.append_memory_lifecycle(...)`（EXECUTE 仅给 `role_gateway`），与 `ops.record_deletion_plan_step` 同一 chokepoint。读：`role_gateway`/`role_retrieval_worker`/`role_maintenance` 各 `SELECT`，其余非 owner 全 `—`。同一变更把 `private.memory_records` 上 `role_gateway` 的列级 UPDATE 由 `(status,superseded_by,superseded_at)` 扩到再加 `lifecycle_head_event_id`（gateway 在翻 authority status 的同一条 UPDATE 里写头指针；表级 UPDATE 仍不授予）。`memory.supersede` 现在同事务追加一条 `SUPERSEDE` 事件并盖 `undo_deadline`（窗口来自 `HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS`，§78.1）；`memory.restore` 在窗口内把 `status='superseded'` 变回 `'active'`（清 `superseded_by`，G59-4 恒真），追加一条指向被撤 SUPERSEDE 的 `RESTORE` 事件，发**新** `MEMORY_LIFECYCLE` 票（新 stream_seq，旧行永不复活）并返回绑定新 seq 的 consistency_token。被拒的 restore 以成功形状的 `{code:CONFLICT, reason:<u16>}` 返回（`ConflictReason`，非第 19 个 `ErrorCode`，§52.1 冻结 18 不变）。forget/tombstone 仍是终态（本卡只覆盖 SUPERSEDE 的撤销）。
 
@@ -3817,11 +3817,14 @@ CREATE TABLE projection.stream_checkpoints (
   projection_highwater bigint NOT NULL DEFAULT 0,  -- 已对检索可见的边界
   serving boolean NOT NULL DEFAULT false,          -- 读路由，见 §16.2
   shadow  boolean NOT NULL DEFAULT false,
+  projection_processor_id uuid,                    -- 迁移 0171：最后推进 projection_highwater 的 §7.4 ProcessorId
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, scope_kind, scope_id, domain,
                projection_kind, projection_version)
 );
 ```
+
+`projection_processor_id`（迁移 0171，card 21 复审）：**谁**推进了水位。本表原先只答「水位是多少」（三个 highwater）与「什么时候动的」（`updated_at`，owner 触发器写），没有任何一列能回答「哪个进程动的」—— 于是「一个 worker 写的 checkpoint 归属于它」这条验收在 schema 层面根本无法断言。该列可空、不回填：0171 之前推进的行读 NULL，那正是它们的真值（发明一个归属比留空更糟）。写入面与 `projection_highwater` 同一条 `UPDATE`（§15.4 `advance_prefix`），列级 GRANT 只给 `role_retrieval_worker`（§6.2.2）：能写这个数的进程，才是能署这个名的进程；两者永远不会分叉成两条语句、两个时刻。它不是 §48.0④ 禁止的「第二真源」—— 与 `open_gap_count` / `deleted_count` 不同，「谁写的」无法从任何别处现算出来，与 0167 给 `stream_log` 加的 `retired_at` / `retired_by` 同型。
 
 三个 highwater 的单位一律是 **stream_seq**，不是 `commit_seq`；查询期由三者计算 `retrieval completeness` 与 `freshness`。某 Evidence 因 `WAITING_KEY` 未蒸馏时 `knowledge_highwater` 停在 gap 之前，后续 seq 仍可并行完成并留在 stream_log 里，不要求单游标永久阻塞。`open_gap_count` 已删除：gap 数唯一真源是 `processing_gaps` 视图的 `count(*)`。
 
@@ -4033,6 +4036,18 @@ started_at / completed_at
 ```
 
 重复 run 不覆盖前一 run。
+
+**指纹必须能从持久化的行本身重算（card 21）。** 这是 `source_hash` 作为审计指纹的全部意义：
+给定 `private.processing_runs` 的一行，只读该行的各轴列（含 `evidence_payload_sha256[]`）就必须
+能重现出存着的那 32 字节；需要去读别处、或需要重新渲染某个表示形式才能重算的，不是指纹。
+
+ADR-0016 落地时不满足这一条：Distill hop 的 evidence 轴哈希的是 `events.payload` 的**规范 jsonb
+重渲染**（remember 时的原始字节不保留，而 `EvidencePayloadSha256` 当时唯一的获得方式是「哈希点
+什么」），而同一行的 `evidence_payload_sha256[]` 存的是 `private.evidence_objects.payload_sha256`
+——Evidence 自己的 §8.1 锚。两者不是同一个值，于是 migration 0064 的列注释（「the set `source_hash`
+hashes」）为假，指纹也无法只从行重算。修法在 domain：给 `EvidencePayloadSha256` 一条**读回**路径
+（`from_stored_digest`，只校验 32 字节宽度，不哈希、不规范化、不转码），evidence 轴改读已持久化的
+摘要。§48.0① G80-22 的口径相应放宽（见该条）：读回不决定任何编码，因此不构成第二份编码。
 
 ### G16-4 / G80-34 Input Fingerprint Sensitivity
 
@@ -9857,6 +9872,13 @@ ALTER TABLE projection.stream_checkpoints DROP COLUMN open_gap_count;
 - `architecture-check` 断言：全 workspace 内构造 `EvidencePayloadSha256` 的位置**恰好 1 处**（就是该函数体内那一处），`bins/*` / `evals/*` / migration 工具出现第二处即失败。断言写成【命中数 == 1】而不是【<= 1】—— 函数体内那一处就是本 check 的正对照，写成【<= 1】时 matcher 自己写错（0 命中）也绿，又是一道恒真闸（§59.1 G59-3 同款）；
 - 注错 a：把 newtype 字段改成 `pub` 并在 `evals/` 里直接构造一次 ⇒ 命中数 1→2 ⇒ 红。注错 b：把 matcher 的类型名改成一个不存在的名字 ⇒ 命中数 1→0 ⇒ 红。
 
+**口径放宽（card 21，ADR-0016 登记的债）。** 上面第四条的「恰好 1 处」把「**读回**一枚已经落库的摘要」也一并禁掉了，而那不是它要防的东西：G80-22 防的是**第二份编码**（另一个 crate 自己决定「payload 摘要怎么算」），读回什么都不决定。这条附带禁令有实价：§16.1 的 Distill 指纹因此只能靠「哈希点什么」来拿到锚，于是哈希了 `events.payload` 的规范 jsonb 重渲染，而同一 run 行的 `evidence_payload_sha256[]` 存的是 `evidence_objects.payload_sha256`——两者不同值，§16.1.1 的「指纹可从持久化行重算」因此不成立（详见 §16.1.1）。现行口径：
+
+- 仍然只有**一个模块**可以构造该类型：`crates/domain/src/evidence.rs`；任何别处的构造点 ⇒ 红（这一条一个字没松）；
+- 该模块内构造点**恰好 2 处**：哈希器 `payload_sha256(bytes)` 与读回 `EvidencePayloadSha256::from_stored_digest(&[u8]) -> Option<Self>`。第 3 处 ⇒ 红；
+- 读回**不得哈希**：它只校验 32 字节宽度并采用这些字节（非 32 字节 ⇒ `None`，fail-closed）。`architecture-check` 对该函数体做结构探针，出现 `Sha256` / `digest(` ⇒ 红——一旦它开始哈希，它就成了第二份编码，放宽的前提就没了；
+- 注错 c：把读回改成 `Some(Self(Sha256::digest(s).into()))` ⇒ 红；注错 d：把一处构造点搬到 `bins/gateway` ⇒ 红（两条都有 `xtask/src/architecture_check.rs` 里的夹具自测，不在真仓上变异）。
+
 已登记为 §80.1 的 **G80-22**；登记表里没有它之前，§68.0 不得把这一条算作「重放优于 importer」的理由。
 
 ## 48.1 PostgreSQL Physical Layout / Partitioning
@@ -15098,7 +15120,7 @@ benchset-declaration-check（G80-16，§69）
 DEFERRED 防豁免 D2/D3（G80-17，§69）
 alert-rule-check 表达式静态校验（G80-18，§42）
 部署产物备份清单断言（G80-20，§67.4）
-payload_sha256 唯一构造点断言（G80-22，§48.0①）
+payload_sha256 构造点收敛断言：全部构造点都在 `crates/domain/src/evidence.rs`，且恰好两处——一处哈希器 `payload_sha256`、一处读回 `from_stored_digest`（读回不得哈希）（G80-22，§48.0①）
 gate-anchor-check：登记表两列必须整体是锚，且每个锚可解析（G80-23，§80.1.2）
 gate-registry-coverage：家章带 id 的闸无遗漏（G80-24，§80.1.2）
 R4 fault manifest closure（G80-44，§11.2.5.1#G11-3）
@@ -15184,7 +15206,7 @@ rollback plan
 | G80-18 `alert-rule-check` | PR（表达式静态校验）· Nightly（注错重跑） | §42 · §53.5#INV-1 · §53.5#INV-2 · §53.5#INV-3 · §53.5#INV-4 | 同左 |
 | G80-19 割接对账四条 | Release（migration rehearsal） | §68.3 | 同左 |
 | G80-20 部署产物备份清单 | PR | §67.4 | §80.1.1 |
-| G80-22 `payload_sha256` 唯一构造点 | PR | §48.0 | 同左 |
+| G80-22 `payload_sha256` 构造点收敛（口径 card 21 放宽：同一模块内哈希器 + 读回共两处） | PR | §48.0 | 同左 |
 | G80-23 `gate-anchor-check` | PR | §80.1.2 | 同左 |
 | G80-24 `gate-registry-coverage` | PR | §80.1.2 | 同左 |
 | G80-25 `stream_log` 列集合 | PR | §37.2 | 同左 |

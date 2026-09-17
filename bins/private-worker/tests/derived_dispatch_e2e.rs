@@ -144,10 +144,18 @@ fn provider() -> NeverCalledProvider {
 struct FakeProvider {
     descriptor: ReasoningProviderDescriptor,
     calls: std::sync::atomic::AtomicU32,
+    /// How long one "provider round trip" takes. Card 21 fix pass: the per-row lease heartbeat
+    /// only has anything to do with a pass whose work outlasts its lease, and the only knob
+    /// that makes a pass take real time without a network is this one.
+    delay: Duration,
 }
 
 impl FakeProvider {
     fn new() -> Self {
+        Self::with_delay(Duration::ZERO)
+    }
+
+    fn with_delay(delay: Duration) -> Self {
         Self {
             descriptor: ReasoningProviderDescriptor {
                 provider_id: PROVIDER_ID.to_string(),
@@ -157,6 +165,7 @@ impl FakeProvider {
                 custom_endpoint: Some(ENDPOINT_REF.to_string()),
             },
             calls: std::sync::atomic::AtomicU32::new(0),
+            delay,
         }
     }
 
@@ -185,6 +194,9 @@ impl UserReasoningProvider for FakeProvider {
         _request: StructuredReasoningRequest,
     ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
         Ok(StructuredReasoningResponse {
             json: ONE_MEMORY_REPLY.to_string(),
             usage: TokenUsage::default(),
@@ -767,6 +779,142 @@ fn dispatch_discovers_pending_evidence_in_two_tenants() {
                     "no double distill: the row count must not move"
                 );
             }
+        },
+    );
+}
+
+/// Card 21 fix pass (reviewer P1 on the lease leg). The folded card-16 debt was an observed
+/// production loss: the 2026-09-10 soak reported `lost_lease=6` because one dispatch pass
+/// claimed 8 jobs / 77 evidence rows and worked them serially, heartbeating the `ops.jobs` lease
+/// exactly ONCE per job — before the first provider round trip. The lease expired mid-pass,
+/// **another dispatcher re-claimed the job**, and the provider budget was spent twice.
+/// `distill::run_once` now renews the lease per row, and `DistillPassReport.heartbeats` counts
+/// the renewals. Neither had a test: the only test caller passed `None` for the lease, so
+/// deleting `Some(&lease)` from `dispatch_pass` (i.e. reverting the fix outright) left the whole
+/// tree green, and `heartbeats` was read by nothing anywhere.
+///
+/// The competing claim is not decoration — it is the defect. `jobs::settle_derived_private`'s
+/// predicate is `(job_id, tenant_id, lease_owner, attempt, status='PROCESSING')` and does NOT
+/// consult `lease_expires_at`, so a pass that overruns its lease with nobody else on the queue
+/// still settles fine. What the soak actually hit was another dispatcher reclaiming the expired
+/// lease, bumping `attempt`, and both workers paying the provider for the same rows. So this
+/// test runs a second claimer concurrently, at a wall-clock instant chosen to sit **after** the
+/// un-renewed lease would have expired and **before** the pass settles.
+///
+/// Shape: five evidence rows in ONE tenant (`job_batch: 1`, so the dispatcher takes one job and
+/// its `run_once` sweeps all five), a 1 s provider round trip, a 3 s lease — 5 s of work on a
+/// 3 s lease, with the thief claiming at t≈3.5 s. Margins are wide in both directions: the
+/// per-row renewal leaves ~2 s of slack per row (the green path cannot flake on a slow write
+/// leg), and a slower database only pushes the settle further past the un-renewed expiry.
+///
+/// Fault injection, measured (2026-09-16): with `Some(&lease)` replaced by `None`, the run
+/// fails on the `heartbeats` assertion (0, not 5) and the report it prints carries the rest of
+/// the damage — `DistillDispatchReport { claimed: 1, …, lost_lease: 1, work: { claimed: 5,
+/// done: 5, heartbeats: 0, … } }`: the thief took the in-flight job, so the original's settle
+/// matched no row and its five distilled rows were paid for by a worker that could not commit
+/// the job. Moving the heartbeat to AFTER `process_claimed` (the card-16 shape, "renew when the
+/// round trip is done") leaves the first row running on the claim-time lease — the same overrun
+/// — and is caught the same way.
+#[test]
+fn a_pass_longer_than_its_lease_heartbeats_per_row_and_settles_without_losing_it() {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<DispatchFixture, _>(
+        "a_pass_longer_than_its_lease_heartbeats_per_row_and_settles_without_losing_it",
+        |mut handle| {
+            const ROWS: u32 = 5;
+            const LEASE_SECS: f64 = 3.0;
+            const PER_ROW: Duration = Duration::from_millis(1000);
+            /// After the un-renewed lease (3 s) would have expired, before the pass settles (5 s).
+            const THIEF_AT: Duration = Duration::from_millis(3500);
+
+            for _ in 0..ROWS {
+                accept_evidence(&mut handle, 0);
+            }
+            assert_eq!(
+                jobs_of(&mut handle, 0).len(),
+                ROWS as usize,
+                "0164's trigger emits one job per accepted Evidence"
+            );
+
+            let dispatch = DistillDispatchConfig {
+                lease_owner: "private-worker-lease-probe".to_owned(),
+                lease_seconds: LEASE_SECS,
+                job_batch: 1,
+                batch: 16,
+                max_attempts: 5,
+            };
+            let provider = FakeProvider::with_delay(PER_ROW);
+            let started = std::time::Instant::now();
+            let (report, stolen) = handle.rt.block_on(async {
+                let pass = distill::dispatch_pass(
+                    &handle.private,
+                    &provider,
+                    reasoner_config(),
+                    &dispatch,
+                );
+                let thief = async {
+                    tokio::time::sleep(THIEF_AT).await;
+                    jobs::claim_derived_work_private(
+                        &handle.private,
+                        &[DerivedJobType::Distill],
+                        "private-worker-thief",
+                        LEASE_SECS,
+                        16,
+                    )
+                    .await
+                    .expect("competing claim")
+                };
+                tokio::join!(pass, thief)
+            });
+            let report = report.expect("dispatch pass");
+            let elapsed = started.elapsed();
+
+            assert_eq!(report.claimed, 1, "one job claimed: {report:?}");
+            assert_eq!(
+                report.work.claimed, ROWS,
+                "that one job's pass must sweep all five evidence rows: {report:?}"
+            );
+            assert!(
+                elapsed.as_secs_f64() > LEASE_SECS,
+                "the pass must really outlast its own lease for this test to mean anything                  (elapsed {elapsed:?}, lease {LEASE_SECS}s)"
+            );
+            assert_eq!(
+                report.work.heartbeats, ROWS,
+                "one lease renewal per row, immediately before that row's provider call:                  {report:?}"
+            );
+            assert_eq!(
+                report.work.lost_lease, 0,
+                "the per-row heartbeat must keep run_once's own lease alive: {report:?}"
+            );
+            assert_eq!(
+                report.lost_lease, 0,
+                "and the settle at the end of a 5 s pass must still hold the lease against a                  live competitor: {report:?}"
+            );
+            assert_eq!(report.completed, 1, "{report:?}");
+            assert_eq!(report.work.done, ROWS, "{report:?}");
+            assert_eq!(provider.calls(), ROWS, "one provider call per evidence row");
+            assert_eq!(
+                memory_count(&mut handle, 0),
+                ROWS as i64,
+                "every row of the over-long pass really landed"
+            );
+
+            let done: Vec<Uuid> = jobs_of(&mut handle, 0)
+                .into_iter()
+                .filter(|(_, status, _)| status == "DONE")
+                .map(|(job_id, _, _)| job_id)
+                .collect();
+            assert_eq!(
+                done.len(),
+                1,
+                "the claimed job settled DONE — a settle on a re-claimed lease writes nothing"
+            );
+            assert!(
+                !stolen.iter().any(|job| job.job_id == done[0]),
+                "the in-flight job must not be re-claimable while its pass is running: that                  re-claim IS the double-spend the soak measured (thief took {:?}, in-flight {:?})",
+                stolen.iter().map(|j| j.job_id).collect::<Vec<_>>(),
+                done[0]
+            );
         },
     );
 }

@@ -41,7 +41,7 @@ use humaux_domain::{
     authority::{AuthorityPolicy, CandidateRejection, NonEmptyVec},
     dataclass::DataClass,
     error::ErrorCode,
-    evidence::{EvidenceOriginClass, payload_sha256},
+    evidence::{EvidenceOriginClass, EvidencePayloadSha256, payload_sha256},
     ids::{Scope, TenantId, UserId, WorkspaceId},
     memory::MemoryType,
     policy::OriginBoundAuthorityPolicy,
@@ -93,6 +93,12 @@ pub struct DistillPassReport {
     pub deferred_reason: Option<&'static str>,
     /// Rows whose lease was reclaimed before this worker could settle them (nothing written).
     pub lost_lease: u32,
+    /// Card 21: per-row `ops.jobs` lease renewals this pass performed — one before each row's
+    /// provider round trip, so the pass's duration stops being a function of its batch size.
+    /// Counted (rather than assumed) because "the heartbeat happened" is the only observable
+    /// difference between this and the card-16 shape that burned the provider budget; a test
+    /// that cannot see it would pass either way.
+    pub heartbeats: u32,
     pub memories: u32,
     pub rejected: u32,
 }
@@ -241,6 +247,7 @@ impl DistillPassReport {
         self.deferred += other.deferred;
         self.deferred_reason = self.deferred_reason.or(other.deferred_reason);
         self.lost_lease += other.lost_lease;
+        self.heartbeats += other.heartbeats;
         self.memories += other.memories;
         self.rejected += other.rejected;
     }
@@ -273,7 +280,9 @@ pub async fn dispatch_pass(
     };
     for job in claimed {
         let lease = jobs::DerivedLease::of(&job, &dispatch.lease_owner);
-        // Refresh before the provider round trip, not after it.
+        // Refresh before the provider round trip, not after it. Card 21: this used to be the
+        // ONLY heartbeat for the whole job, no matter how many evidence rows it covered —
+        // `run_once` now renews it per row as well (see there).
         if !heartbeat(pool, &lease, dispatch.lease_seconds).await? {
             report.lost_lease += 1;
             continue;
@@ -293,6 +302,7 @@ pub async fn dispatch_pass(
                     provider,
                     crate::inference_rpc::clone_config(&config),
                     &distill,
+                    Some(&lease),
                 )
                 .await
             }
@@ -385,6 +395,7 @@ pub async fn run_once(
     provider: &dyn UserReasoningProvider,
     config: ContributionReasonerConfig,
     distill: &DistillConfig,
+    job_lease: Option<&jobs::DerivedLease<'_>>,
 ) -> Result<DistillPassReport, DistillError> {
     distill.validate().map_err(DistillError::Config)?;
     let reasoner = DistillReasoner::new(pool, provider, config).map_err(DistillError::Config)?;
@@ -401,6 +412,30 @@ pub async fn run_once(
         ..DistillPassReport::default()
     };
     for row in claimed {
+        // Card 21, folded card-16 debt (soak 2026-09-10: `lost_lease=6`). One dispatch pass
+        // claimed 8 jobs / 77 evidence rows and worked them SERIALLY, each with a real provider
+        // round trip, while `dispatch_pass` heartbeat the `ops.jobs` lease exactly once — before
+        // the first of them. The lease is `LEASE_SECS` (120 s in the rehearsal); the work is
+        // `rows × provider_latency`. Those two numbers were never related to each other, so the
+        // lease expired mid-pass, another dispatcher re-claimed the job, and the provider budget
+        // was spent twice on work that was already done (`tickets_applied_once` stayed green —
+        // no double-apply — but the money was gone).
+        //
+        // The fix is to relate them: the lease is renewed per row, immediately before that row's
+        // provider round trip, so pass duration stops being a function of batch size at all. The
+        // alternative the debt offered — sizing `DISTILL_BATCH × DISTILL_JOB_BATCH` from
+        // `LEASE_SECS` and a *measured* per-row latency — would have been a fourth derived value
+        // to keep hand-aligned with a provider whose latency is not ours to fix.
+        //
+        // A lease that is already gone means another worker owns this job: stop the pass rather
+        // than burn the provider on rows whose settle can no longer commit.
+        if let Some(lease) = job_lease {
+            if !heartbeat(pool, lease, distill.lease_seconds).await? {
+                report.lost_lease += 1;
+                break;
+            }
+            report.heartbeats += 1;
+        }
         process_claimed(pool, &reasoner, distill, row, &mut report).await?;
     }
     Ok(report)
@@ -568,6 +603,22 @@ async fn process_claimed(
     Ok(())
 }
 
+/// §16.1/§16.1.1 evidence axis — card 21 / ADR-0043, closing ADR-0016's registered debt.
+///
+/// Reads the **persisted** `private.evidence_objects.payload_sha256` back
+/// ([`EvidencePayloadSha256::from_stored_digest`], a read-back, not a second hasher) instead of
+/// hashing a canonical-jsonb re-rendering of `events.payload`. The re-rendering was not the
+/// value the run row records in `evidence_payload_sha256[]`, so `source_hash` could not be
+/// recomputed from the row — the one property §16.1.1 asks of a fingerprint. Now it is a pure
+/// function of columns that are all on the row. Fail-closed on a column that is not 32 bytes.
+fn evidence_axis(evidence: &LoadedEvidence) -> Result<EvidencePayloadSha256, DistillError> {
+    EvidencePayloadSha256::from_stored_digest(&evidence.payload_sha256).ok_or_else(|| {
+        DistillError::Reasoning(PrivateReasoningError::classified(
+            "evidence_objects.payload_sha256 is not a 32-byte digest",
+        ))
+    })
+}
+
 /// (a)+(b): admission, evidence load, processing-run start (committed before the call), then
 /// the provider round trip. `Ok(None)` = the Evidence is unavailable to this hop.
 async fn infer_claimed(
@@ -606,12 +657,7 @@ async fn infer_claimed(
     let context_snapshot_seq =
         distill_repo::context_snapshot_seq(&mut txn, distill.tenant_id).await?;
 
-    // §16.1 evidence axis: the payload bytes as this run reads them (canonical jsonb
-    // rendering — the raw remember bytes are not retained; their digest is stored verbatim in
-    // `evidence_payload_sha256[]` below). Sole constructor `payload_sha256` (§48.0①).
-    let payload_bytes = serde_json::to_vec(&evidence.payload)
-        .map_err(|_| PrivateReasoningError::new("evidence payload serialization"))?;
-    let evidence_hashes = [payload_sha256(&payload_bytes)];
+    let evidence_hashes = [evidence_axis(&evidence)?];
     let prompt_hash = hex::encode(contract.sha256.0);
     let prompt_version = contract.version.to_string();
     let fingerprint = source_hash(&ProcessingInputFingerprintInputs {

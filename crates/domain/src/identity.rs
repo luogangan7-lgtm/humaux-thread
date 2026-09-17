@@ -22,7 +22,7 @@
 //! shrink the scope but is structurally unable to grow it (§6.1.1: "workspace_id、user_id
 //! 若来自 MCP Tool 参数，只能进一步缩小 Auth Scope，绝不能扩大它").
 
-use crate::error::ErrorCode;
+use crate::error::{ConflictReason, ErrorCode};
 use crate::ids::{TenantId, UserId, WorkspaceId};
 use uuid::Uuid;
 
@@ -363,14 +363,35 @@ impl MembershipConflict {
         ErrorCode::Conflict
     }
 
-    /// SCREAMING_SNAKE spelling, defined once (§78.2) — what the §77 audit row of a refused
-    /// membership mutation records as its `refusal`, and what `Display` prints.
-    pub const fn as_str(self) -> &'static str {
+    /// The typed `CONFLICT` sub-reason (§52 D-B) this refusal is — the numeric code the
+    /// gateway surfaces in `structuredContent {code:"CONFLICT", reason:<u16>}`.
+    ///
+    /// Card 21: before this, membership refusals carried their own SCREAMING_SNAKE strings and
+    /// no code at all, while `ConflictReason` was the closed set that owns exactly that
+    /// taxonomy — two registries for one wire contract, the second of which the client could
+    /// not switch on. `AlreadyInState` reuses the generic `ALREADY_IN_STATE` (1201) rather than
+    /// minting a membership-specific twin; the other two are §6.3's own edges and get 1203/1204.
+    pub const fn reason(self) -> ConflictReason {
         match self {
-            Self::AlreadyInState => "ALREADY_IN_STATE",
-            Self::TransitionNotAllowed => "TRANSITION_NOT_ALLOWED",
-            Self::LastOwner => "LAST_OWNER",
+            Self::AlreadyInState => ConflictReason::ALREADY_IN_STATE,
+            Self::TransitionNotAllowed => ConflictReason::TRANSITION_NOT_ALLOWED,
+            Self::LastOwner => ConflictReason::LAST_OWNER,
         }
+    }
+
+    /// SCREAMING_SNAKE spelling — what the §77 audit row of a refused membership mutation
+    /// records as its `refusal`, and what `Display` prints.
+    ///
+    /// **Derived** from [`Self::reason`]'s label (§78.2: defined once). It used to be a second
+    /// `match` with the same three strings typed again; the labels happened to agree, which is
+    /// the only reason nobody noticed there were two tables. `expect` cannot fire: every arm of
+    /// `reason` returns a `ConflictReason` this crate defines, and
+    /// `conflict_reason_codes_and_labels_are_frozen_and_unique` proves every defined reason has
+    /// a label.
+    pub fn as_str(self) -> &'static str {
+        self.reason()
+            .label()
+            .expect("every MembershipConflict maps to a defined ConflictReason")
     }
 }
 
@@ -445,6 +466,56 @@ impl MembershipSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Card 21 (folded card-12 debt): every §6.3 membership refusal carries a TYPED
+    /// `ConflictReason`, and its audit/wire label is DERIVED from that reason rather than
+    /// typed a second time. Two registries for one taxonomy is how a wire contract grows a
+    /// second, un-switchable spelling.
+    ///
+    /// Fault injection: give `MembershipConflict::LastOwner` a `ConflictReason` this crate
+    /// does not define and `as_str` panics here; change `ConflictReason::LAST_OWNER`'s label
+    /// and the expected string below moves with it — which is the point, there is now one
+    /// place to change.
+    #[test]
+    fn every_membership_conflict_has_a_distinct_typed_reason_and_a_derived_label() {
+        const ALL: [MembershipConflict; 3] = [
+            MembershipConflict::AlreadyInState,
+            MembershipConflict::TransitionNotAllowed,
+            MembershipConflict::LastOwner,
+        ];
+        let mut codes = std::collections::HashSet::new();
+        for conflict in ALL {
+            let reason = conflict.reason();
+            assert!(
+                crate::error::ConflictReason::ALL.contains(&reason),
+                "{conflict:?} maps to an unregistered reason {reason:?}"
+            );
+            assert!(codes.insert(reason.code()), "{conflict:?} reuses a code");
+            assert_eq!(
+                conflict.as_str(),
+                reason.label().expect("registered reason has a label"),
+                "the audit label must be derived from the reason, not spelled twice"
+            );
+            assert_eq!(conflict.error_code(), ErrorCode::Conflict);
+        }
+        // The frozen codes themselves (§52 D-B: the wire contract, not an implementation note).
+        assert_eq!(MembershipConflict::AlreadyInState.reason().code(), 1201);
+        assert_eq!(
+            MembershipConflict::TransitionNotAllowed.reason().code(),
+            1203
+        );
+        assert_eq!(MembershipConflict::LastOwner.reason().code(), 1204);
+        // …and the labels callers and §77 audit rows already depend on are unchanged.
+        assert_eq!(MembershipConflict::LastOwner.as_str(), "LAST_OWNER");
+        assert_eq!(
+            MembershipConflict::TransitionNotAllowed.as_str(),
+            "TRANSITION_NOT_ALLOWED"
+        );
+        assert_eq!(
+            MembershipConflict::AlreadyInState.as_str(),
+            "ALREADY_IN_STATE"
+        );
+    }
 
     fn scope(user_id: Option<UserId>, workspaces: &[WorkspaceId]) -> AuthorizationScope {
         AuthorizationScope::new(

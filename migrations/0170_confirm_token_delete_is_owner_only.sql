@@ -1,0 +1,21 @@
+-- §6.2.1 全域禁动词 / card 21 — forward-fix of 0169's one wrong line.
+--
+-- 0169 granted `DELETE ON control.confirm_tokens` to `role_maintenance` alongside the sweep
+-- function. That grant is both **forbidden** and **unnecessary**:
+--
+--   * Forbidden: §6.2.1 is a global hard constraint with no exceptions — no non-owner role
+--     holds DELETE or TRUNCATE on any table, anywhere. `xtask rls-check`'s 全域禁动词 item
+--     enumerates `role_table_grants` for exactly this and went red on the grant, which is the
+--     gate doing its job. A per-table §6.2.2 row cannot license a verb §6.2.1 bans globally.
+--   * Unnecessary: `control.sweep_confirm_tokens(interval)` is an owner SECURITY DEFINER
+--     function. The DELETE inside it executes as `role_migration_owner`, which already owns the
+--     table; `role_maintenance` needs EXECUTE on the function and nothing else. Same chokepoint
+--     shape as `ops.append_memory_lifecycle` and `projection.retire_failed_ticket`: the verb
+--     lives behind one audited door, never on a runtime role's grant list.
+--
+-- §46: a migration is immutable once applied, so this is a new number rather than an edit to
+-- 0169. The §6.2.2 row and `xtask/src/rls_check.rs` MATRIX carry `role_maintenance` =
+-- `SELECT` for this table (0169's wider cell is retracted here, in the same change).
+-- FORCE RLS still applies to the owner, so the sweep remains per-tenant.
+
+REVOKE DELETE ON control.confirm_tokens FROM role_maintenance;

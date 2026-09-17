@@ -20,6 +20,7 @@ use humaux_adapters::qdrant::{
     create_collection_body, ha_profile_for, query_dense, subject_index_body, tenant_index_body,
 };
 use humaux_adapters::remember::{self, RememberCommand};
+use humaux_domain::egress::ProcessorId;
 use humaux_domain::error::ErrorCode;
 use humaux_domain::evidence::{EvidenceOriginClass, payload_sha256};
 use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
@@ -41,6 +42,12 @@ use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
 use sha2::{Digest, Sha256};
 use sqlx::types::Uuid;
+
+/// Card 21 fix pass: this suite's fixed §7.4 worker identity. `advance_prefix` writes it into
+/// `projection.stream_checkpoints.projection_processor_id` (migration 0171); the attribution
+/// itself is asserted in `tests/stream_repo.rs`
+/// (`a_checkpoint_carries_the_processor_id_of_the_worker_that_advanced_it`).
+const TEST_PROCESSOR_ID: Uuid = Uuid::from_u128(0x0171_0001);
 
 fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
     let sep = if admin_dsn.contains('?') { '&' } else { '?' };
@@ -686,6 +693,7 @@ async fn deps_for(
         embedding_version: "embed-v1".to_owned(),
         projection_version: "v1".to_owned(),
         dimension: 4,
+        processor_id: ProcessorId(TEST_PROCESSOR_ID),
     }
 }
 
@@ -874,6 +882,7 @@ fn dimension_mismatch_fails_before_reaching_qdrant() {
                 embedding_version: "embed-v1".to_owned(),
                 projection_version: "v1".to_owned(),
                 dimension: 4,
+                processor_id: ProcessorId(TEST_PROCESSOR_ID),
             };
 
             let outcome = handle
@@ -973,6 +982,7 @@ fn unconfirmed_visibility_fails_row_and_blocks_checkpoint() {
                 embedding_version: "embed-v1".to_owned(),
                 projection_version: "v1".to_owned(),
                 dimension: 4,
+                processor_id: ProcessorId(TEST_PROCESSOR_ID),
             };
 
             let outcome = handle

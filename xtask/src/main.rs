@@ -8,6 +8,7 @@ mod architecture_check;
 mod benchset_declaration;
 mod card_version;
 mod config_check;
+mod confirm_sweep;
 mod contract_impact;
 mod direction_table;
 mod dod_check;
@@ -48,10 +49,11 @@ fn main() {
         Some("e2e-seed") => e2e_seed::run(&args[2..]),
         Some("member") => member::run(&args[2..]),
         Some("projection-serve") => projection_serve::run(&args[2..]),
+        Some("sweep-confirm-tokens") => confirm_sweep::run(&args[2..]),
         Some("soak") => soak::run(&args[2..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|r4-fault-manifest|direction-table|card-version|migrate|e2e-seed|member|projection-serve|soak>"
+                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|r4-fault-manifest|direction-table|card-version|migrate|e2e-seed|member|projection-serve|sweep-confirm-tokens|soak>"
             );
             2
         }

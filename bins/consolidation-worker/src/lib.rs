@@ -360,9 +360,21 @@ pub async fn dispatch_pass<P: PrivateReasoningPort>(
             Err(error) => {
                 // The pass keeps going: one tenant's environmental failure must not stop the
                 // other tenants this cross-tenant pass claimed.
+                //
+                // Card 21 (card 16's lesson, applied to the second worker): `RunOnceError`'s
+                // `Display` delegates to `PrivateReasoningError`'s, which is redacted by
+                // construction — "PrivateReasoningPort error (redacted, fingerprint=abcd1234)".
+                // For the whole Reasoning arm that was the end of the road for the only
+                // information an operator needs (*why* a tenant never consolidates: e.g.
+                // `configured provider does not match admitted route`). The distill side already
+                // logs `PrivateReasoningError::class()`, the static, payload-free label the raise
+                // site supplied; so does this one now. Non-reasoning arms keep their own Display,
+                // which is not redacted.
                 eprintln!(
-                    "humaux-consolidation-worker: job {} (tenant {}) failed: {error}",
-                    job.job_id, job.tenant_id
+                    "humaux-consolidation-worker: job {} (tenant {}) failed: {}",
+                    job.job_id,
+                    job.tenant_id,
+                    error_class_for_log(error)
                 );
                 retry_or_park(config, &job, &mut report)
             }
@@ -372,6 +384,21 @@ pub async fn dispatch_pass<P: PrivateReasoningPort>(
         }
     }
     Ok(report)
+}
+
+/// Loggable description of a failed pass (card 21). The `Reasoning` arm carries a redacted
+/// `Display`, so its static [`PrivateReasoningError::class`] is what goes to the log; every other
+/// arm's `Display` already says something. `unclassified private reasoning failure` is the honest
+/// answer when the raise site used `PrivateReasoningError::new` rather than `::classified` — it
+/// says "no class", which is not the same as saying nothing.
+fn error_class_for_log(error: &RunOnceError) -> String {
+    match error {
+        RunOnceError::Reasoning(e) => e
+            .class()
+            .unwrap_or("unclassified private reasoning failure")
+            .to_owned(),
+        other => other.to_string(),
+    }
 }
 
 fn retry_or_park(
@@ -478,5 +505,43 @@ impl std::fmt::Display for RunOnceError {
             Self::Reasoning(e) => write!(f, "{e}"),
             Self::NotReady(reason) => write!(f, "{reason}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod error_log_tests {
+    use super::{RunOnceError, error_class_for_log};
+    use humaux_application::consolidate::PrivateReasoningError;
+
+    /// Card 21 (folded card-16 debt). The `Reasoning` arm's `Display` is redacted by
+    /// construction, so logging `{error}` threw away the only thing an operator can act on.
+    /// Fault injection: revert `error_class_for_log` to `error.to_string()` and this goes red
+    /// on the first assertion — the log would say `fingerprint=…` instead of the class.
+    #[test]
+    fn a_reasoning_failure_logs_its_class_not_its_redacted_display() {
+        const CLASS: &str = "configured provider does not match admitted route";
+        let classified = RunOnceError::Reasoning(PrivateReasoningError::classified(CLASS));
+        assert_eq!(error_class_for_log(&classified), CLASS);
+        // The thing it used to print, for contrast.
+        assert!(classified.to_string().contains("redacted"));
+        assert!(!error_class_for_log(&classified).contains("redacted"));
+    }
+
+    /// An unclassified reasoning failure says so out loud rather than falling back to the
+    /// redacted fingerprint — "no class" is information; a fingerprint is not.
+    #[test]
+    fn an_unclassified_reasoning_failure_says_so() {
+        let plain = RunOnceError::Reasoning(PrivateReasoningError::new("boom"));
+        assert_eq!(
+            error_class_for_log(&plain),
+            "unclassified private reasoning failure"
+        );
+    }
+
+    /// Non-reasoning arms keep their own (unredacted) `Display`.
+    #[test]
+    fn other_arms_keep_their_display() {
+        let not_ready = RunOnceError::NotReady("no admitted route binding");
+        assert_eq!(error_class_for_log(&not_ready), "no admitted route binding");
     }
 }

@@ -1044,6 +1044,113 @@ fn count_construction_calls(source: &str, needle: &str) -> usize {
     count
 }
 
+/// Counts real **call sites** of `name(` in `source`: a `name(` occurrence that is neither a
+/// definition (`fn name(`, in any file — a `tests/` helper is a definition too) nor part of a
+/// longer identifier (`other_name(`, `name_in_txn(`), nor inside a `//` comment.
+///
+/// Card 21: written because G80-4 counted the bare substring `serving_version(` and only
+/// escaped a false red through `walk_workspace_rs`'s `#[cfg(test)]` stripping — an accident
+/// one helper declaration in a `tests/` file away from breaking. A judgement that survives only
+/// because of an unrelated filter is not a judgement (ADR-0006's 「NA 不得与违规重合」, applied
+/// to false positives instead of false negatives).
+fn count_call_sites(source: &str, name: &str) -> usize {
+    let needle = format!("{name}(");
+    let bytes = source.as_bytes();
+    let mut count = 0usize;
+    let mut start = 0usize;
+    while let Some(rel) = source[start..].find(&needle) {
+        let idx = start + rel;
+        start = idx + needle.len();
+        // Left word boundary: `other_serving_version(` is a different function.
+        if idx > 0 && (bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_') {
+            continue;
+        }
+        if line_is_comment_at(source, idx) {
+            continue;
+        }
+        // A definition of ANY name is never a call site — `fn name(`, `pub fn name(`,
+        // `pub async fn name(`, `pub(crate) fn name(` all end in the token `fn`.
+        let prefix = source[..idx].trim_end();
+        if prefix.ends_with("fn") {
+            continue;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// §78.1 / §15.1 (card 21): the ticket-family triple `(domain, projection_kind,
+/// projection_version)` may be spelled in exactly ONE place — `crates/domain/src/
+/// ticket_family.rs` — and every producer and consumer of `projection.stream_log` derives it
+/// from there.
+///
+/// Why this is a gate and not a code review note: the three columns are how an issuer and a
+/// resolver find each other. Before card 21 the gateway's `remember.put`, the consolidation
+/// worker's rollup re-signal and the retrieval worker each carried their own copy (three
+/// literals in `consolidate_repo`, three `HUMAUX_RETRIEVAL_WORKER_*` env values, and a
+/// `DOMAIN=…; PKIND=…; PVER=…` line in the rehearsal script). Mis-set one and nothing fails —
+/// the worker polls a stream nobody writes, forever, silently. There is no runtime signal for
+/// that, so the signal has to be here.
+///
+/// **Scope: production source only** (`…/src/…`, with `#[cfg(test)]` modules stripped by
+/// `walk_workspace_rs`). A test that writes the literal and asserts production derives the
+/// same value is a positive control, not drift — `qdrant.rs::retrieval_family_matches_ticket_family`
+/// and `retrieval-worker`'s `ticket_triple_is_derived_from_the_projection_family` are exactly
+/// that shape, and `distill_hop_e2e` pins its own fixture constants against the derived triple.
+///
+/// **Why only two needles.** `"private_memory"` and `"PRIVATE_MEMORY"` are distinctive enough
+/// to match nothing else; `"v1"` is not (a dozen unrelated versions spell it) and a scan that
+/// matched it would be noise. The version cannot drift alone anyway: `TicketFamily::
+/// collection_name` derives `{domain}_{version}` and `retrieval_family_matches_ticket_family`
+/// pins that against §17's own Qdrant collection name, so moving the version without moving
+/// §17 is red there.
+fn g78_1_ticket_family_literals(root: &Path) -> Verdict {
+    /// The one module allowed to spell them. Exact suffix, never `contains` (G80-22.5's
+    /// 改名绕过 lesson).
+    const HOME: &str = "crates/domain/src/ticket_family.rs";
+    const NEEDLES: [&str; 2] = ["\"private_memory\"", "\"PRIVATE_MEMORY\""];
+
+    let files = walk_workspace_rs(root);
+    // §57.1: `not_applicable` only when the object under test is undelivered, and it must be
+    // named. The object here is the closed set itself.
+    if !files
+        .iter()
+        .any(|(p, src)| display(root, p).ends_with(HOME) && src.contains("pub enum TicketFamily"))
+    {
+        return Verdict::NotApplicable(format!(
+            "missing object: `domain::ticket_family::TicketFamily` ({HOME}) 尚未交付"
+        ));
+    }
+
+    let mut offenders = Vec::new();
+    for (path, source) in &files {
+        let disp = display(root, path);
+        if disp.ends_with(HOME) || !disp.contains("/src/") {
+            continue;
+        }
+        for needle in NEEDLES {
+            let hits = source
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| l.contains(needle))
+                .count();
+            if hits > 0 {
+                offenders.push(format!("{disp}: {needle} ×{hits}"));
+            }
+        }
+    }
+    if offenders.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(vec![format!(
+            "§78.1/§15.1: the ticket-family triple may only be spelled in {HOME}; production \
+             source still carries the literal: {offenders:?}. Derive it from \
+             `TicketFamily::PrivateMemory` (or, in a retrieval context, \
+             `RetrievalFamily::ticket_family()`) instead."
+        )])
+    }
+}
+
 fn g80_2_build_request_unique(root: &Path) -> Verdict {
     // Whole workspace, not just crates/: §55.1 G80-2's own 注错 names `evals/` as the second
     // construction site, which lives outside crates/ entirely.
@@ -1121,14 +1228,15 @@ fn g80_4_serving_version_sole_entry_point(root: &Path) -> Verdict {
             continue;
         }
         // The two closed spellings enter the same authoritative SQL; together they must
-        // still have exactly one consumer. Doc links lack `(` and comments are excluded.
-        let n = source
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .map(|l| {
-                l.matches("serving_version(").count() + l.matches("serving_version_in_txn(").count()
-            })
-            .sum::<usize>();
+        // still have exactly one consumer. Card 21: this used to be a raw `matches()` substring
+        // count, which counted any text ending in `serving_version(` — a `fn serving_version(`
+        // definition included. It only avoided a false red because `walk_workspace_rs` strips
+        // `#[cfg(test)]` modules, i.e. because of something G80-4 does not control: a helper
+        // declared in a `tests/` file (which is NOT a `#[cfg(test)]` module) would have turned
+        // this gate red without a single retrieval call moving. Real call-site matching now:
+        // word boundary on the left, and a `fn` definition of any name never counts.
+        let n = count_call_sites(source, "serving_version")
+            + count_call_sites(source, "serving_version_in_txn");
         if n > 0 {
             sites.push(format!("{disp}: {n}"));
             count += n;
@@ -1150,9 +1258,31 @@ fn g80_4_serving_version_sole_entry_point(root: &Path) -> Verdict {
     }
 }
 
+/// §48.0① G80-22 — **widened 口径, card 21** (ADR-0016 registered this change as the root-cause
+/// fix for its own "指纹不能只从 run 行重算" debt).
+///
+/// What G80-22 protects is that ONE place decides the §8.1 *encoding*: no second crate may
+/// re-derive "the payload digest" for itself. The old rule enforced that by counting exactly
+/// one `EvidencePayloadSha256(` construction site workspace-wide, which also — accidentally —
+/// forbade *reading back* a digest that is already persisted. That accident had a cost: the
+/// §16.1 distill fingerprint could only obtain an anchor by hashing something, so it hashed a
+/// re-rendered canonical jsonb of `events.payload` instead of the Evidence's stored
+/// `payload_sha256`, and `private.processing_runs.source_hash` stopped being recomputable from
+/// the persisted row (the §16.1.1 property the fingerprint exists for).
+///
+/// The rule now: **every** construction site lives in the one domain module, and there are
+/// exactly two — one hasher ([`payload_sha256`]) and one read-back
+/// (`EvidencePayloadSha256::from_stored_digest`, which performs no hashing and so cannot
+/// introduce a second encoding). A third site, or any site outside that module, is still red.
 fn g80_22_payload_sha256_unique(root: &Path) -> Verdict {
+    /// The single module allowed to construct the type. Exact path, not a `contains` —
+    /// substring matching is the 改名绕过 shape G80-22.5 already paid for.
+    const HOME: &str = "crates/domain/src/evidence.rs";
+    /// One hasher + one read-back. Both are in `HOME`; neither may be duplicated.
+    const EXPECTED_SITES: usize = 2;
+
     // Whole workspace, not just crates/: §48.0① names `bins/*` / `evals/*` / migration tooling
-    // as required scan territory for the second construction site.
+    // as required scan territory for a stray construction site.
     let files = walk_workspace_rs(root);
     let object_exists = files.iter().any(|(_, s)| {
         s.contains("struct EvidencePayloadSha256") || s.contains("fn payload_sha256(")
@@ -1163,21 +1293,63 @@ fn g80_22_payload_sha256_unique(root: &Path) -> Verdict {
                 .to_string(),
         );
     }
-    let mut count = 0usize;
-    let mut sites = Vec::new();
+    let mut home_count = 0usize;
+    let mut foreign = Vec::new();
     for (path, source) in &files {
         let n = count_construction_calls(source, "EvidencePayloadSha256(");
-        if n > 0 {
-            sites.push(format!("{}: {n}", display(root, path)));
+        if n == 0 {
+            continue;
         }
-        count += n;
+        let disp = display(root, path);
+        if disp.ends_with(HOME) {
+            home_count += n;
+        } else {
+            foreign.push(format!("{disp}: {n}"));
+        }
     }
-    if count == 1 {
+    let mut failures = Vec::new();
+    if !foreign.is_empty() {
+        failures.push(format!(
+            "§48.0① G80-22: `EvidencePayloadSha256( .. )` may only be constructed in {HOME}; \
+             found construction sites elsewhere: {foreign:?}"
+        ));
+    }
+    if home_count != EXPECTED_SITES {
+        failures.push(format!(
+            "§48.0① G80-22: {HOME} must hold exactly {EXPECTED_SITES} construction sites (one \
+             hasher `payload_sha256`, one read-back `from_stored_digest`), found {home_count}"
+        ));
+    }
+    // The read-back must stay a read-back: if it ever hashes, the second site becomes a second
+    // *encoding* and the whole widening is void. Cheap structural probe, same shape as
+    // `g80_2`'s content probe.
+    if let Some((_, home_src)) = files.iter().find(|(p, _)| display(root, p).ends_with(HOME)) {
+        if !home_src.contains("pub fn from_stored_digest(") {
+            failures.push(format!(
+                "§48.0① G80-22: {HOME} declares no `pub fn from_stored_digest(` — the read-back \
+                 leg of the widened 口径 is missing"
+            ));
+        }
+        let readback = home_src
+            .split("pub fn from_stored_digest(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }").next())
+            .unwrap_or("");
+        // Needles that mean "this function hashes": the hasher path (`Sha256::…`) and the crate
+        // that provides it. NOT the bare string `Sha256` — the type's own name contains it, so
+        // that needle would be red on every correct implementation (a gate that cannot be green
+        // is not a gate).
+        if readback.contains("Sha256::") || readback.contains("sha2::") {
+            failures.push(format!(
+                "§48.0① G80-22: `from_stored_digest` in {HOME} hashes — a read-back must adopt \
+                 the persisted bytes, never re-derive them (that is a second encoding)"
+            ));
+        }
+    }
+    if failures.is_empty() {
         Verdict::Pass
     } else {
-        Verdict::Fail(vec![format!(
-            "expected exactly 1 `EvidencePayloadSha256( .. )` construction site, found {count}: {sites:?}"
-        )])
+        Verdict::Fail(failures)
     }
 }
 
@@ -4933,6 +5105,10 @@ pub fn run(_args: &[String]) -> i32 {
             g80_22_payload_sha256_unique(&root),
         ),
         (
+            "§78.1/§15.1 (ticket-family triple spelled once)",
+            g78_1_ticket_family_literals(&root),
+        ),
+        (
             "§1.3/§48.0 G80-11 (source_hash sole construction point)",
             g80_11_source_hash_unique(&root),
         ),
@@ -5915,6 +6091,150 @@ mod tests {
         assert_eq!(g80_22_payload_sha256_unique(&root), Verdict::Pass);
     }
 
+    /// Card 21 self-test for [`count_call_sites`] — the G80-4 needle. A **definition** of the
+    /// function, in any file (a `tests/` helper is a definition too), is not a call site; a
+    /// longer identifier that merely ends in the name is not a call site; a doc comment is not
+    /// a call site. Exactly one of the six lines below is.
+    ///
+    /// This is the case the old raw-substring count got wrong: it scored 4 here.
+    #[test]
+    fn g80_4_needle_counts_calls_not_definitions_or_lookalikes() {
+        let src = "\
+pub async fn serving_version(f: &F) -> u8 { 0 }
+/// doc that mentions serving_version(f)
+fn other_serving_version(f: &F) -> u8 { 0 }
+fn helper() { let _ = tenant_serving_version(f); }
+fn consumer() { let _ = serving_version(&family); }
+// serving_version(&family) in a comment
+";
+        assert_eq!(count_call_sites(src, "serving_version"), 1);
+    }
+
+    /// The specific shape the card names: a **test function whose name contains the needle**
+    /// must not be an offender. `walk_workspace_rs` strips `#[cfg(test)]` modules, but a
+    /// `crates/*/tests/*.rs` integration test is not one — so before card 21 this file would
+    /// have pushed G80-4 to 2 and turned the gate red with no retrieval code changed at all.
+    #[test]
+    fn g80_4_a_test_function_named_after_the_needle_is_not_an_offender() {
+        let integration_test = "\
+#[tokio::test]
+async fn serving_version(/* the fixture under test */) {
+    let _ = 1;
+}
+#[tokio::test]
+async fn serving_version_in_txn() {}
+";
+        assert_eq!(count_call_sites(integration_test, "serving_version"), 0);
+        assert_eq!(
+            count_call_sites(integration_test, "serving_version_in_txn"),
+            0
+        );
+    }
+
+    // -- §78.1/§15.1 ticket-family triple (card 21) -----------------------------------------
+
+    #[test]
+    fn ticket_family_gate_real_repo_passes() {
+        assert_eq!(g78_1_ticket_family_literals(&real_root()), Verdict::Pass);
+    }
+
+    /// 注错: reintroduce one of the three literals into production source ⇒ red and named.
+    /// This is the card's own fault-injection requirement ("reintroduce one literal and the
+    /// scan must go red"), run as a fixture tree rather than a mutation of the real repo.
+    #[test]
+    fn ticket_family_gate_red_when_a_literal_comes_back() {
+        let tmp = fresh_tmp("ticket-family-literal");
+        let home = tmp.join("crates/domain/src");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("ticket_family.rs"),
+            "pub enum TicketFamily { PrivateMemory }\n             impl TicketFamily { pub fn domain(self) -> &'static str { \"private_memory\" } }\n",
+        )
+        .unwrap();
+        let victim = tmp.join("crates/adapters/src");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(
+            victim.join("consolidate_repo.rs"),
+            "pub fn key() -> (String, String) { (\"private_memory\".to_owned(), \"PRIVATE_MEMORY\".to_owned()) }\n",
+        )
+        .unwrap();
+        match g78_1_ticket_family_literals(&tmp) {
+            Verdict::Fail(f) => {
+                let joined = f.join(" ");
+                assert!(joined.contains("consolidate_repo.rs"), "{joined}");
+                assert!(joined.contains("private_memory"), "{joined}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        // Removing the literal returns it to green — a red that cannot go green is not a gate.
+        fs::write(
+            victim.join("consolidate_repo.rs"),
+            "pub fn key(f: TicketFamily) -> (&'static str, &'static str) { (f.domain(), f.projection_kind()) }\n",
+        )
+        .unwrap();
+        assert_eq!(g78_1_ticket_family_literals(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// ADR-0006: `not_applicable` must name the missing object and must NOT coincide with the
+    /// violation. With no `TicketFamily` at all the gate is NA, not silently green.
+    #[test]
+    fn ticket_family_gate_is_not_applicable_without_the_closed_set() {
+        let tmp = fresh_tmp("ticket-family-na");
+        let victim = tmp.join("crates/adapters/src");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(
+            victim.join("x.rs"),
+            "pub const D: &str = \"private_memory\";\n",
+        )
+        .unwrap();
+        match g78_1_ticket_family_literals(&tmp) {
+            Verdict::NotApplicable(m) => assert!(m.contains("TicketFamily"), "{m}"),
+            other => panic!("expected NotApplicable, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Card 21 G80-22 widened 口径: a construction site outside the domain module is red, and
+    /// a third site inside it is red. Fixture tree, never the real repo.
+    #[test]
+    fn g80_22_red_on_a_construction_site_outside_the_domain_module() {
+        let tmp = fresh_tmp("g80-22-foreign");
+        let home = tmp.join("crates/domain/src");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("evidence.rs"), COMPLIANT_EVIDENCE_FIXTURE).unwrap();
+        let foreign = tmp.join("bins/gateway/src");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(
+            foreign.join("main.rs"),
+            "fn f() { let _ = EvidencePayloadSha256([0u8; 32]); }\n",
+        )
+        .unwrap();
+        match g80_22_payload_sha256_unique(&tmp) {
+            Verdict::Fail(f) => assert!(f.join(" ").contains("bins/gateway/src/main.rs")),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The read-back must stay a read-back: make it hash and the widened 口径 is void.
+    #[test]
+    fn g80_22_red_when_the_read_back_hashes() {
+        let tmp = fresh_tmp("g80-22-rehash");
+        let home = tmp.join("crates/domain/src");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("evidence.rs"),
+            "pub struct EvidencePayloadSha256([u8; 32]);\n             pub fn payload_sha256(b: &[u8]) -> EvidencePayloadSha256 { EvidencePayloadSha256(h(b)) }\n             impl EvidencePayloadSha256 {\n    pub fn from_stored_digest(s: &[u8]) -> Option<Self> {\n        Some(EvidencePayloadSha256(Sha256::digest(s).into()))\n    }\n}\n",
+        )
+        .unwrap();
+        match g80_22_payload_sha256_unique(&tmp) {
+            Verdict::Fail(f) => assert!(f.join(" ").contains("read-back must adopt")),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
     // ---- G80-43 (§11.10#G11-2) 注错族：fixture 树，不在真仓上变异 ----
 
     /// 最小合规 fixture：一个 `grounding.rs`，八条夹具齐、派生点恰一处、无手改 stale。
@@ -6260,6 +6580,10 @@ mod tests {
         );
     }
 
+    /// The card-21-compliant shape of `crates/domain/src/evidence.rs`: exactly two construction
+    /// sites in the one module — the hasher and the non-hashing read-back.
+    const COMPLIANT_EVIDENCE_FIXTURE: &str = "struct EvidencePayloadSha256([u8; 32]);\npub fn payload_sha256(bytes: &[u8]) -> EvidencePayloadSha256 {\n    EvidencePayloadSha256([0; 32])\n}\nimpl EvidencePayloadSha256 {\n    pub fn from_stored_digest(s: &[u8]) -> Option<Self> {\n        Some(EvidencePayloadSha256(<[u8; 32]>::try_from(s).ok()?))\n    }\n}\n";
+
     fn fresh_tmp(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "arch-check-{label}-{}-{}",
@@ -6311,9 +6635,23 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
+    /// Card 21 widened the 口径: the compliant fixture now carries BOTH legs — the hasher and
+    /// the non-hashing read-back — and both must live in `crates/domain/src/evidence.rs`.
     #[test]
-    fn g80_22_passes_with_exactly_one_construction_site() {
+    fn g80_22_passes_with_the_hasher_and_the_read_back_in_the_domain_module() {
         let tmp = fresh_tmp("g80-22-green");
+        let dir = tmp.join("crates/domain/src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("evidence.rs"), COMPLIANT_EVIDENCE_FIXTURE).unwrap();
+        assert_eq!(g80_22_payload_sha256_unique(&tmp), Verdict::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The hasher alone is no longer enough: without the read-back leg the §16.1 fingerprint
+    /// cannot be recomputed from storage, which is the defect card 21 fixed.
+    #[test]
+    fn g80_22_red_when_the_read_back_leg_is_missing() {
+        let tmp = fresh_tmp("g80-22-red-no-readback");
         let dir = tmp.join("crates/domain/src");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -6321,7 +6659,29 @@ mod tests {
             "struct EvidencePayloadSha256([u8; 32]);\npub fn payload_sha256(bytes: &[u8]) -> EvidencePayloadSha256 {\n    EvidencePayloadSha256([0; 32])\n}\n",
         )
         .unwrap();
-        assert_eq!(g80_22_payload_sha256_unique(&tmp), Verdict::Pass);
+        match g80_22_payload_sha256_unique(&tmp) {
+            Verdict::Fail(f) => assert!(f.join(" ").contains("from_stored_digest")),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A THIRD construction site inside the home module is still red — the widening added one
+    /// named operation, it did not open the module up.
+    #[test]
+    fn g80_22_red_on_a_third_construction_site_in_the_home_module() {
+        let tmp = fresh_tmp("g80-22-red-third");
+        let dir = tmp.join("crates/domain/src");
+        fs::create_dir_all(&dir).unwrap();
+        let mut src = COMPLIANT_EVIDENCE_FIXTURE.to_string();
+        src.push_str(
+            "pub fn sneaky() -> EvidencePayloadSha256 { EvidencePayloadSha256([1; 32]) }\n",
+        );
+        fs::write(dir.join("evidence.rs"), src).unwrap();
+        match g80_22_payload_sha256_unique(&tmp) {
+            Verdict::Fail(f) => assert!(f.join(" ").contains("exactly 2 construction sites")),
+            other => panic!("expected Fail, got {other:?}"),
+        }
         fs::remove_dir_all(&tmp).ok();
     }
 
@@ -6357,11 +6717,7 @@ mod tests {
         let evals_dir = tmp.join("evals");
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(&evals_dir).unwrap();
-        fs::write(
-            dir.join("evidence.rs"),
-            "struct EvidencePayloadSha256([u8; 32]);\npub fn payload_sha256(bytes: &[u8]) -> EvidencePayloadSha256 {\n    EvidencePayloadSha256([0; 32])\n}\n",
-        )
-        .unwrap();
+        fs::write(dir.join("evidence.rs"), COMPLIANT_EVIDENCE_FIXTURE).unwrap();
         fs::write(
             evals_dir.join("probe.rs"),
             "fn shortcut() { let _ = EvidencePayloadSha256([1; 32]); }\n",

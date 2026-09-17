@@ -53,6 +53,11 @@ fn usage() -> &'static str {
     "usage: humaux-retrieval-worker (--readyz | --run-once | --serve-rpc)"
 }
 
+/// The §17 retrieval family this process projects into. Single point of truth for BOTH the
+/// §17.3 placement below and — through [`RetrievalFamily::ticket_family`] — the §15.1 ticket
+/// triple `run_once` polls for, so the two can never name different families (card 21).
+const PROJECTION_FAMILY: RetrievalFamily = RetrievalFamily::PrivateMemoryV1;
+
 /// Local wrapper making a real [`EmbeddingProvider`] satisfy [`CardEmbedder`] — see that
 /// trait's doc in `crates/adapters/src/projection_worker.rs` for why the orphan rule forces
 /// this indirection here rather than a blanket impl on the provider type in
@@ -178,9 +183,18 @@ async fn run_once_mode() -> Result<(), Outcome> {
     let tenant_id = TenantId(parse::<Uuid>("HUMAUX_RETRIEVAL_WORKER_TENANT_ID")?);
     let scope_kind = required("HUMAUX_RETRIEVAL_WORKER_SCOPE_KIND")?;
     let scope_id = parse::<Uuid>("HUMAUX_RETRIEVAL_WORKER_SCOPE_ID")?;
-    let domain = required("HUMAUX_RETRIEVAL_WORKER_DOMAIN")?;
-    let projection_kind = required("HUMAUX_RETRIEVAL_WORKER_PROJECTION_KIND")?;
-    let projection_version = required("HUMAUX_RETRIEVAL_WORKER_PROJECTION_VERSION")?;
+    // §78.1 / card 21: the ticket family triple is DERIVED from the retrieval family this
+    // process already projects into (`RetrievalFamily::PrivateMemoryV1`, five lines below in
+    // `placement`), not read from three env values an operator had to keep equal to the
+    // consolidation worker's three literals. `ticket_family()` is `None` only for the §17
+    // families that are not `stream_log` producers — this process projects the private-memory
+    // one, so `None` is a wiring bug, not a deployment shape.
+    let ticket_family = PROJECTION_FAMILY
+        .ticket_family()
+        .ok_or_else(|| format!("{PROJECTION_FAMILY:?} is not a §15.1 ticket-stream family"))?;
+    let domain = ticket_family.domain();
+    let projection_kind = ticket_family.projection_kind();
+    let projection_version = ticket_family.projection_version().to_owned();
     let embedding_version = required("HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION")?;
     let dimension = parse::<u32>("HUMAUX_RETRIEVAL_WORKER_DIMENSION")?;
     if dimension == 0 {
@@ -208,7 +222,7 @@ async fn run_once_mode() -> Result<(), Outcome> {
     // lands (tracked in coord task 7e6da2f9).
     let placement = TenantPlacementRow {
         tenant_id,
-        projection_family: RetrievalFamily::PrivateMemoryV1,
+        projection_family: PROJECTION_FAMILY,
         collection_name: required("HUMAUX_RETRIEVAL_WORKER_QDRANT_COLLECTION")?,
         shard_key: None,
         placement_class: PlacementClass::SharedFallback,
@@ -231,6 +245,12 @@ async fn run_once_mode() -> Result<(), Outcome> {
         embedding_version,
         projection_version,
         dimension,
+        // Card 21 fix pass: the SAME §7.4 identity the embedding provider discloses under —
+        // read once, here, and handed to both legs. `advance_prefix` writes it into
+        // `projection.stream_checkpoints.projection_processor_id` (migration 0171), so this
+        // worker's checkpoint names this worker. A second env var for "the projection
+        // identity" would be a fourth hand-aligned copy of the thing this card deleted.
+        processor_id: egress_processor_id()?,
     };
 
     run_once(&deps, batch as usize)
@@ -302,15 +322,36 @@ fn build_scanner() -> Result<LocalSecretScanner, Outcome> {
     })
 }
 
-/// ponytail: the Processor Registry (§7) and a per-memory `DisclosureSource` attribution both
-/// need the model catalog the "ponytail: descriptor from env" note above already names as
-/// missing — a fixed nil processor id and a fixed batch-level `DisclosureSource` stand in
-/// until that registry exists (tracked in coord task 7e6da2f9).
-/// ponytail: the Processor Registry (§7) and a per-memory `DisclosureSource` attribution both
-/// need the model catalog the "ponytail: descriptor from env" note above already names as
-/// missing — a fixed nil processor id and a fixed batch-level `DisclosureSource` stand in
-/// until that registry exists (tracked in coord task 7e6da2f9). Shared by both `--run-once`
-/// (wrapped as `CardEmbedder`) and `--serve-rpc` (used directly as `EmbeddingProvider`).
+/// This process's §7 egress identity, read from configuration exactly the way the private
+/// worker reads its own (`HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID`) — deployment identity,
+/// never tenant data.
+///
+/// Card 21: before this, the value was `ProcessorId(Uuid::nil())`, so **every**
+/// `ops.data_disclosures` row this worker wrote carried `processor_id` all-zeros. §7.4's
+/// ledger exists to answer "which processor received this private data"; a column that is the
+/// same constant for every row answers nothing, and §7.3's deletion/revocation propagation
+/// (which queries by processor) had no row it could find. `Uuid::nil()` is refused explicitly
+/// rather than accepted as "unset": a nil id is exactly the unattributed state this fixes, and
+/// §78.1 gives it no default.
+fn egress_processor_id() -> Result<ProcessorId, String> {
+    let id = parse::<Uuid>("HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID")?;
+    if id.is_nil() {
+        return Err(
+            "invalid configuration: HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID must not be \
+             the nil UUID (§7.4: a disclosure row must name a real processor)"
+                .to_owned(),
+        );
+    }
+    Ok(ProcessorId(id))
+}
+
+/// ponytail: a per-memory `DisclosureSource` attribution needs the model catalog the "ponytail:
+/// descriptor from env" note above already names as missing — a fixed batch-level
+/// `DisclosureSource` stands in until that registry exists (tracked in coord task 7e6da2f9).
+/// It is only ever reached by `embed_cards` (no memory ids); the projection path this binary
+/// actually drives calls `embed_cards_for_memories`, which builds one real
+/// `DisclosureSource::Memory` per card. Shared by both `--run-once` (wrapped as `CardEmbedder`)
+/// and `--serve-rpc` (used directly as `EmbeddingProvider`).
 async fn build_embedding_provider(
     dsn: &str,
     dimension: u32,
@@ -332,7 +373,7 @@ async fn build_embedding_provider(
     let provider = embedding_provider_for(
         &required("HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER")?,
         embedder_pool,
-        ProcessorId(Uuid::nil()),
+        egress_processor_id()?,
         model,
         required("HUMAUX_RETRIEVAL_WORKER_REGION")?,
         DisclosureSource::Memory(Uuid::nil()),
@@ -436,5 +477,71 @@ mod rpc_mode {
         .await
         .map_err(|error| format!("retrieval embedding RPC server failed: {error}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::{PROJECTION_FAMILY, egress_processor_id};
+    use humaux_domain::ticket_family::TicketFamily;
+    use uuid::Uuid;
+
+    /// Card 21, ProcessorId leg. Two deployments of this binary configured with two identities
+    /// get two distinct [`ProcessorId`](humaux_domain::egress::ProcessorId)s, and neither is
+    /// the nil placeholder every `ops.data_disclosures` row used to carry. The env var is
+    /// process-global, so the two reads are sequenced rather than parallel — this test is
+    /// `#[ignore]`-free but must stay in one thread's control of that variable, which is why it
+    /// reads both values inside one test instead of two.
+    ///
+    /// Fault injection: restore `ProcessorId(Uuid::nil())` in `build_embedding_provider` and
+    /// the rehearsal's `disclosure_processor_attributed` assertion goes red (this unit test
+    /// pins the parser; the rehearsal pins the row).
+    #[test]
+    fn two_workers_get_distinct_non_nil_processor_ids() {
+        const VAR: &str = "HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID";
+        let a = Uuid::from_u128(0x2016);
+        let b = Uuid::from_u128(0x2017);
+
+        // SAFETY: single-threaded test body; the variable is restored/removed before returning.
+        unsafe { std::env::set_var(VAR, a.to_string()) };
+        let first = egress_processor_id().expect("worker A identity");
+        unsafe { std::env::set_var(VAR, b.to_string()) };
+        let second = egress_processor_id().expect("worker B identity");
+
+        assert_eq!(first.0, a);
+        assert_eq!(second.0, b);
+        assert_ne!(first.0, second.0);
+        assert!(!first.0.is_nil() && !second.0.is_nil());
+
+        // The nil UUID is refused, not silently accepted as "unset".
+        unsafe { std::env::set_var(VAR, Uuid::nil().to_string()) };
+        let refused = egress_processor_id().expect_err("nil processor id must be refused");
+        assert!(refused.contains("must not be the nil UUID"), "{refused}");
+        assert!(refused.contains("§7.4"), "{refused}");
+
+        unsafe { std::env::remove_var(VAR) };
+        let missing = egress_processor_id().expect_err("absent processor id must be refused");
+        assert!(missing.contains(VAR), "{missing}");
+    }
+
+    /// Card 21, ticket-family leg. The triple this process polls for is derived from the §17
+    /// family it projects into — there is no `HUMAUX_RETRIEVAL_WORKER_DOMAIN` /
+    /// `_PROJECTION_KIND` / `_PROJECTION_VERSION` to keep aligned with the consolidation
+    /// worker's issuer any more. Fault injection: point `PROJECTION_FAMILY` at
+    /// `PublicKnowledgeV1` and `--run-once` fails at startup instead of polling a stream
+    /// nobody writes.
+    #[test]
+    fn ticket_triple_is_derived_from_the_projection_family() {
+        let family = PROJECTION_FAMILY
+            .ticket_family()
+            .expect("the projected family is a §15.1 ticket stream");
+        assert_eq!(family, TicketFamily::PrivateMemory);
+        assert_eq!(family.domain(), "private_memory");
+        assert_eq!(family.projection_kind(), "PRIVATE_MEMORY");
+        assert_eq!(family.projection_version(), "v1");
+        assert_eq!(
+            PROJECTION_FAMILY.collection_name(),
+            family.collection_name()
+        );
     }
 }

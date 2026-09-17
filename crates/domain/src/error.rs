@@ -165,9 +165,18 @@ impl ConflictReason {
     pub const ALREADY_IN_STATE: ConflictReason = ConflictReason(1201);
     /// The requested undo is not reversible (a RESTORE/ARCHIVE head; §36).
     pub const NOT_REVERSIBLE: ConflictReason = ConflictReason(1202);
+    /// §6.3 membership machine: no such edge (e.g. anything out of `REMOVED`, `INVITED →
+    /// SUSPENDED`). Card 21: the membership refusals had SCREAMING_SNAKE labels of their own
+    /// and no numeric reason at all, so the one closed set that owns `CONFLICT` sub-reasons did
+    /// not know about them — two spellings of the same taxonomy, which is how a wire contract
+    /// quietly grows a second registry.
+    pub const TRANSITION_NOT_ALLOWED: ConflictReason = ConflictReason(1203);
+    /// §6.3 "last OWNER cannot silently leave": the mutation would leave the tenant with no
+    /// `ACTIVE` `OWNER`.
+    pub const LAST_OWNER: ConflictReason = ConflictReason(1204);
 
     /// Every defined reason, for table-driven lookups and the label mapping.
-    pub const ALL: [ConflictReason; 8] = [
+    pub const ALL: [ConflictReason; 10] = [
         Self::UNDO_WINDOW_EXPIRED,
         Self::TARGET_NOT_CURRENT,
         Self::ERASE_TERMINAL,
@@ -176,6 +185,8 @@ impl ConflictReason {
         Self::CANDIDATE_EXPIRED,
         Self::ALREADY_IN_STATE,
         Self::NOT_REVERSIBLE,
+        Self::TRANSITION_NOT_ALLOWED,
+        Self::LAST_OWNER,
     ];
 
     /// The raw numeric reason surfaced in `structuredContent.reason`.
@@ -195,6 +206,8 @@ impl ConflictReason {
             1102 => "CANDIDATE_EXPIRED",
             1201 => "ALREADY_IN_STATE",
             1202 => "NOT_REVERSIBLE",
+            1203 => "TRANSITION_NOT_ALLOWED",
+            1204 => "LAST_OWNER",
             _ => return None,
         })
     }

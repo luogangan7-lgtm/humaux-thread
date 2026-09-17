@@ -20,6 +20,7 @@
 use sqlx::Row;
 use sqlx::types::Uuid;
 
+use humaux_domain::egress::ProcessorId;
 use humaux_projection::stream::{Inconsistent, StreamKey, StreamLedgerSnapshot};
 use humaux_retrieval::completeness::{
     LedgerClosure,
@@ -294,9 +295,18 @@ pub async fn fetch_ledger_closure(
 /// call landing after a newer one is a silent no-op here, not a corruption signal). Read and
 /// write share one transaction, so no other writer can move the checkpoint between this
 /// function's own read and write.
+///
+/// `processor` is the §7.4 [`ProcessorId`] of the worker making the call, written into
+/// `projection_processor_id` (migration 0171) in the SAME statement as the watermark — card
+/// 21's "a checkpoint written by one worker is attributed to it", which before 0171 had no
+/// column to land in. It is deliberately not a separate UPDATE: an attribution that can be
+/// written without the watermark (or a watermark without its attribution) is an attribution
+/// that will eventually name the wrong process. The monotonic `WHERE` fences both: a call whose
+/// computed prefix is behind the stored watermark writes neither.
 pub async fn advance_prefix(
     pool: &RetrievalWorkerDbPool,
     key: &StreamKey,
+    processor: ProcessorId,
 ) -> Result<u64, AdvanceError> {
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, key.tenant_id.0).await?;
@@ -305,12 +315,14 @@ pub async fn advance_prefix(
 
     bind_key(
         sqlx::query(&format!(
-            "UPDATE projection.stream_checkpoints SET projection_highwater = $7 \
+            "UPDATE projection.stream_checkpoints \
+             SET projection_highwater = $7, projection_processor_id = $8 \
              WHERE {KEY_WHERE} AND projection_highwater <= $7"
         )),
         key,
     )
     .bind(n as i64)
+    .bind(processor.0)
     .execute(&mut *txn)
     .await?;
     txn.commit().await?;

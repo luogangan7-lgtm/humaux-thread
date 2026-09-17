@@ -61,8 +61,16 @@ pub enum InstructionDisposition {
 /// there is no `pub` constructor, no `From<Vec<u8>>`, and no `Default`. All four write paths
 /// (ingest / replay §68.1 / cutover reconciliation §68.3 step 5③ / repair §65) must go through
 /// that one free function so the encoding is enforced at a single call site instead of being
-/// re-derived per caller. `architecture-check` asserts exactly one non-declaration
-/// construction site of `EvidencePayloadSha256(` workspace-wide.
+/// re-derived per caller.
+///
+/// **Widened 口径 (card 21, ADR-0016's registered debt).** There is a second, non-hashing way
+/// to obtain this type — [`EvidencePayloadSha256::from_stored_digest`], the read-back of an
+/// already-persisted digest — because a §16.1 fingerprint that cannot be recomputed from the
+/// stored row is not an audit fingerprint. `architecture-check` therefore no longer counts "one
+/// construction site" but "**every** `EvidencePayloadSha256(` construction site lives in this
+/// module, and there are exactly two: one hasher, one read-back". That still forbids what
+/// G80-22 exists to forbid — a second crate deciding the §8.1 encoding for itself — while
+/// allowing the one operation that decides nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EvidencePayloadSha256([u8; 32]);
 
@@ -71,6 +79,37 @@ impl EvidencePayloadSha256 {
     /// second construction path.
     pub fn to_hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Raw digest bytes, for writing into a `bytea` column (§8.1) — a read-only projection,
+    /// the mirror image of [`Self::from_stored_digest`].
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// **Read-back**, not a second hasher (ADR-0016's registered debt; §48.0① G80-22's
+    /// widened 口径).
+    ///
+    /// Adopts a digest that is *already persisted* — `private.evidence_objects.payload_sha256`
+    /// — so a later run can name the same Evidence anchor without re-deriving it from bytes it
+    /// no longer has. The raw remember-time bytes are not retained, so before this existed the
+    /// only way to obtain an [`EvidencePayloadSha256`] was to hash *something*, and the §16.1
+    /// distill fingerprint hashed a re-rendered canonical jsonb of `events.payload` instead.
+    /// That made `private.processing_runs.source_hash` un-recomputable from storage: the run
+    /// row's own `evidence_payload_sha256[]` (the Evidence's real §8.1 anchor) was **not** the
+    /// value the fingerprint had hashed, contradicting migration 0064's column comment ("the
+    /// set `source_hash` hashes") and voiding the §16.1.1 audit property that a fingerprint can
+    /// be reproduced from the persisted row alone.
+    ///
+    /// This function performs no hashing, no normalization and no transcoding — it only
+    /// validates width. `payload_sha256` therefore remains the sole point where the §8.1
+    /// *encoding* is decided, which is what G80-22 actually protects; a read-back cannot
+    /// introduce a second encoding because it never encodes anything. Fail-closed on any
+    /// length other than 32 bytes (`None`), so a truncated or NULL-ish column can never be
+    /// laundered into a well-typed anchor.
+    pub fn from_stored_digest(stored: &[u8]) -> Option<Self> {
+        let digest: [u8; 32] = <[u8; 32]>::try_from(stored).ok()?;
+        Some(EvidencePayloadSha256(digest))
     }
 }
 
@@ -133,6 +172,32 @@ mod tests {
         }
         assert_exhaustive(InstructionDisposition::DataOnly);
         assert_exhaustive(InstructionDisposition::BehaviorEligible);
+    }
+
+    /// The read-back is the exact inverse of the hasher's own output: no re-hashing, no
+    /// normalization. This is the property that makes §16.1's fingerprint recomputable from
+    /// `private.processing_runs` alone. Fault injection: make `from_stored_digest` hash its
+    /// argument instead of adopting it and this goes red.
+    #[test]
+    fn from_stored_digest_adopts_the_persisted_bytes_without_rehashing() {
+        let hashed = payload_sha256(b"{\"a\":1}");
+        let persisted: Vec<u8> = hashed.as_bytes().to_vec();
+        let read_back = EvidencePayloadSha256::from_stored_digest(&persisted)
+            .expect("32-byte digest reads back");
+        assert_eq!(read_back, hashed);
+        assert_eq!(read_back.to_hex(), hashed.to_hex());
+        // Not the same thing as hashing the stored digest — the difference the old fingerprint
+        // path got wrong in the other direction (it hashed a re-rendering instead of reading).
+        assert_ne!(payload_sha256(&persisted), hashed);
+    }
+
+    /// §8.1 fail-closed: anything that is not exactly 32 bytes is not an anchor.
+    #[test]
+    fn from_stored_digest_refuses_any_width_but_32() {
+        assert!(EvidencePayloadSha256::from_stored_digest(&[]).is_none());
+        assert!(EvidencePayloadSha256::from_stored_digest(&[0u8; 31]).is_none());
+        assert!(EvidencePayloadSha256::from_stored_digest(&[0u8; 33]).is_none());
+        assert!(EvidencePayloadSha256::from_stored_digest(&[0u8; 32]).is_some());
     }
 
     /// §8.1: two calls on identical bytes must produce the identical anchor.

@@ -606,11 +606,16 @@ fn run_pass(
         let pool = PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker"))
             .await
             .expect("private worker pool");
+        // Card 21: `None` — this helper drives `run_once` directly, with no `ops.jobs` lease to
+        // renew. The per-row heartbeat only exists on `dispatch_pass`'s path, and it is covered
+        // there, against a real lease, by `derived_dispatch_e2e::
+        // a_pass_longer_than_its_lease_heartbeats_per_row_and_settles_without_losing_it`.
         run_once(
             &pool,
             provider,
             contribution_config(),
             &distill_config(f, lease_owner),
+            None,
         )
         .await
         .expect("distill pass")
@@ -930,6 +935,9 @@ fn run_projection(
             embedding_version: "embed-v1".to_owned(),
             projection_version: STREAM_PROJECTION_VERSION.to_owned(),
             dimension: DIMENSION,
+            // Card 21 fix pass: the §7.4 identity `advance_prefix` attributes this hop's
+            // checkpoint to (migration 0171).
+            processor_id: ProcessorId(Uuid::from_u128(0x0171_0002)),
         };
         humaux_adapters::projection_worker::run_once(&deps, 16)
             .await
@@ -1135,13 +1143,17 @@ fn processing_runs(f: &mut Fixture, evidence_id: Uuid) -> (i64, i64) {
 /// `humaux_projection::fingerprint::source_hash` over the persisted axis columns plus the
 /// evidence axis, and `evidence_payload_sha256[]` must be the Evidence's own §8.1 anchor.
 ///
-/// Known deviation (ADR-0016 已知局限, review P1): the evidence axis the worker hashes is
-/// `payload_sha256(canonical jsonb of events.payload)`, not `evidence_objects.payload_sha256`
-/// (remember's raw-bytes digest) — `EvidencePayloadSha256` has no read-back from the stored
-/// bytea (§48.0① sole constructor), so the persisted array cannot be fed to `source_hash`.
-/// This check therefore recomputes the axis from `events.payload` and asserts the array holds
-/// the anchor, so either half drifting fails here; the seed uses non-canonical raw bytes so the
-/// two digests are provably different in this test.
+/// **Card 21 closes ADR-0016's registered deviation.** The evidence axis used to be
+/// `payload_sha256(canonical jsonb of events.payload)` — a digest of a *re-rendering* — while
+/// the run row's `evidence_payload_sha256[]` stored `evidence_objects.payload_sha256`, the
+/// Evidence's own raw-bytes anchor. Two different values, so the fingerprint could not be
+/// recomputed from the row: this helper had to go back to `private.events` to reproduce it.
+/// `EvidencePayloadSha256::from_stored_digest` (a read-back, not a second hasher) removed that
+/// need, and this check now does what §16.1.1 asks — **recompute from the run row alone**.
+///
+/// The seed still writes non-canonical raw bytes, so `anchor != canonical` remains provable
+/// here; that inequality is what makes the assertion below meaningful rather than vacuous (with
+/// the old code, feeding the stored anchor would have failed).
 fn assert_fingerprint_recomputes(f: &mut Fixture, evidence_id: Uuid) {
     let run = f
         .admin
@@ -1172,14 +1184,24 @@ fn assert_fingerprint_recomputes(f: &mut Fixture, evidence_id: Uuid) {
     let stored_axis: Vec<Vec<u8>> = run.get("evidence_payload_sha256");
     assert_eq!(
         stored_axis,
-        vec![anchor],
+        vec![anchor.clone()],
         "evidence_payload_sha256[] is the Evidence's own payload_sha256 (0064 column contract)"
     );
+    // §16.1.1 (card 21): the axis fed to the hash comes from THE ROW, read back — nothing here
+    // reaches for `events.payload`. `anchor` above is only used to prove the row's array is the
+    // Evidence's anchor; the recomputation below is a pure function of `run`.
+    let axis: Vec<humaux_domain::evidence::EvidencePayloadSha256> = stored_axis
+        .iter()
+        .map(|d| {
+            humaux_domain::evidence::EvidencePayloadSha256::from_stored_digest(d)
+                .expect("persisted digest is 32 bytes")
+        })
+        .collect();
     let embedding_version: Option<String> = run.get("embedding_version");
     let card_builder_version: Option<String> = run.get("card_builder_version");
     let context_snapshot_seq: i64 = run.get("context_snapshot_seq");
     let recomputed = source_hash(&ProcessingInputFingerprintInputs {
-        evidence_payload_sha256: &[canonical],
+        evidence_payload_sha256: &axis,
         processor_kind: run.get("processor_kind"),
         processor_version: run.get("processor_version"),
         model_provider: run.get("model_provider"),
@@ -1196,8 +1218,43 @@ fn assert_fingerprint_recomputes(f: &mut Fixture, evidence_id: Uuid) {
     assert_eq!(
         stored,
         recomputed.as_bytes().to_vec(),
-        "source_hash recomputes from the persisted axes + canonical evidence digest"
+        "§16.1.1: source_hash recomputes byte-for-byte from the persisted run row alone"
     );
+    // Fault injection, run every time rather than described in a comment: perturb ONE persisted
+    // axis (the one ADR-0016's deviation hid) and the recomputation must disagree. A check that
+    // only ever sees the matching case cannot tell "recomputable" from "always equal".
+    let mut tampered = stored_axis[0].clone();
+    tampered[0] ^= 0xff;
+    let tampered_axis = [
+        humaux_domain::evidence::EvidencePayloadSha256::from_stored_digest(&tampered)
+            .expect("still 32 bytes"),
+    ];
+    let divergent = source_hash(&ProcessingInputFingerprintInputs {
+        evidence_payload_sha256: &tampered_axis,
+        processor_kind: run.get("processor_kind"),
+        processor_version: run.get("processor_version"),
+        model_provider: run.get("model_provider"),
+        model_id: run.get("model_id"),
+        model_revision: run.get("model_revision"),
+        prompt_version: run.get("prompt_version"),
+        prompt_hash: run.get("prompt_hash"),
+        embedding_version: embedding_version.as_deref(),
+        parser_version: run.get("parser_version"),
+        card_builder_version: card_builder_version.as_deref(),
+        context_snapshot_seq: u64::try_from(context_snapshot_seq).expect("non-negative seq"),
+    });
+    assert_ne!(
+        stored,
+        divergent.as_bytes().to_vec(),
+        "changing a persisted axis must change the fingerprint"
+    );
+    // §15.1/§78.1 (card 21): this file's fixture constants are the POSITIVE CONTROL for the
+    // derived ticket family — they spell the triple, production derives it, and the two must
+    // agree. Checked here so the fixture cannot drift away from what the workers actually use.
+    let family = humaux_domain::ticket_family::TicketFamily::PrivateMemory;
+    assert_eq!(STREAM_DOMAIN, family.domain());
+    assert_eq!(STREAM_PROJECTION_KIND, family.projection_kind());
+    assert_eq!(STREAM_PROJECTION_VERSION, family.projection_version());
 }
 
 // ----------------------------------------------------------------------------

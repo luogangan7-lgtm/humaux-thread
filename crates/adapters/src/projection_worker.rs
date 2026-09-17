@@ -68,6 +68,7 @@ use std::sync::Arc;
 use humaux_domain::affect::AffectAnnotation;
 use humaux_domain::authority::{AuthorityClass, AuthorityStatus, MemoryId};
 use humaux_domain::dataclass::DataClass;
+use humaux_domain::egress::ProcessorId;
 use humaux_domain::error::ErrorCode;
 use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
 use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
@@ -152,6 +153,12 @@ pub struct ProjectionWorkerDeps {
     pub projection_version: String,
     /// The embedding vector width every card this deps instance embeds must produce.
     pub dimension: u32,
+    /// §7.4 identity of the process running this loop — the same [`ProcessorId`] its embedding
+    /// provider discloses under, taken from the deployment's own identity and never
+    /// `Uuid::nil()` (card 21). [`stream_repo::advance_prefix`] writes it into
+    /// `projection.stream_checkpoints.projection_processor_id`, so a checkpoint names the
+    /// worker that advanced it.
+    pub processor_id: ProcessorId,
 }
 
 /// [`run_once`]'s per-batch result.
@@ -857,7 +864,9 @@ pub async fn run_once(
     // done), so this call needs no special-casing here. `Inconsistent` means the ledger's own
     // §15.4 identity did not hold — a real fault, not a retry signal, so it surfaces as
     // `ErrorCode::Internal` rather than a guessed fallback number.
-    outcome.projection_highwater = stream_repo::advance_prefix(&deps.pool, &key)
+    // The watermark carries this worker's §7.4 identity into `projection_processor_id`
+    // (migration 0171): the checkpoint this process advanced says which process advanced it.
+    outcome.projection_highwater = stream_repo::advance_prefix(&deps.pool, &key, deps.processor_id)
         .await
         .map_err(|_| ErrorCode::Internal)?;
     Ok(outcome)
