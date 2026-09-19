@@ -4092,6 +4092,37 @@ AND benchmark(shadow) 未被证伪劣化于 benchmark(serving)   -- 判据形态
 
 **唯一的例外是「首次激活」（first activation，ADR-0017；实现处 `crates/projection/src/serving.rs::evaluate_switch`），它不是裁量口而是缺第二个操作数**：该 family 还没有 serving 行时，第一条的 `visible(serving)` 与第三条的 `benchmark(serving)` 都不存在，**没有被比较对象**。此时①③两条按「无从证伪」处理（③ 的 `CANNOT_ESTABLISH` / `INCONCLUSIVE` 不再拒绝），②`shadow.open_gaps == 0` 仍然必须为真。**被证伪的那一侧不豁免**：③ 若给出 `FAIL`（真的量出劣化）照样拒绝首次激活 —— 一条任何输入都无法使其为假的判据不是判据（§80.1），这条反例是本分支的可观察性来源（`serving.rs::first_activation_still_refuses_a_proven_degradation`）。**非首次激活的一切照旧**：有 serving 行时三条仍全真才切，`CANNOT_ESTABLISH` / `INCONCLUSIVE` 按 §69「不得表述为『不劣于基线』」继续拒绝。
 
+### ③ 在本部署上的实况：非首次晋升目前**一律拒绝**，这是缺 benchmark 声明，不是缺代码（card 22）
+
+上面那条例外只覆盖首次激活。非首次晋升在**这个部署**上今天必然被 ③ 拒绝，原因是量具没声明：
+§69 的 Continuation Gate 在 benchmark 集合分母 `NOT_DECLARED`（缺 `frozen_by`）时只能输出
+`cannot_establish`，而 §55.4 冻结了「不劣于」在该量具上不可断言。于是
+`crates/projection/src/serving.rs::evaluate_switch` 的非首次分支要求
+`ContinuationVerdict::Pass`，而这个部署产不出 `Pass`。
+
+**决定（card 22）：代码与 §16.3 都不动，把这条实况写明，解锁条件是去声明 benchmark 集合。**
+理由：
+
+- §16.3 自己的正文已经冻结了这一侧：「非首次激活的一切照旧：有 serving 行时三条仍全真才切，
+  `CANNOT_ESTABLISH` / `INCONCLUSIVE` 按 §69『不得表述为不劣于基线』继续拒绝」。代码逐字符合。
+- **被驳回的替代方案**：把非首次分支也改成 §69 的 FAIL 侧形态（只在 `Fail` 时拒绝，
+  `CannotEstablish` 在 §69 `NOT_DECLARED` 时通过 ③，并把理由记在切换上）。驳回，因为在一个
+  **永远不声明 benchmark** 的部署上，③ 会退化成任何输入都无法使其为假的判据 —— 正是 §80.1 与
+  §16.3 自己反复堵的「恒真闸」。首次激活能豁免是因为**缺第二个操作数**（没有 serving 行，
+  没有可比对象）；非首次激活两个操作数都在，缺的是**量具声明**，这是部署没做完，不是判据形状
+  错了。行业做法同向：baseline 无法比对时，promotion gate 的正确输出是「gate 无法评定」这一个
+  独立的非通过态，不是通过（Argo Rollouts 的 AnalysisRun / 各家 baseline gate 都如此）。
+- 两侧都有既有的可观察见证，不需要新增测试：
+  `serving.rs::evaluate_switch_rejects_when_benchmark_cannot_establish`（非首次 +
+  `CannotEstablish` ⇒ 拒绝）与 `serving.rs::first_activation_needs_no_benchmark_because_there_is_no_baseline`
+  / `first_activation_still_refuses_a_proven_degradation`（首次豁免仍然被 `Fail` 击穿）。
+  `a_real_promotion_still_requires_the_benchmark_to_pass` 钉住两者的边界。
+
+**解锁（这才是要做的事）**：按 §69 冻结 benchmark 集合分母（≥800 项、resolution ≤ 2、写上
+`frozen_by`），Continuation Gate 才能输出 `Pass`/`Fail`。在那之前，soak 的
+`promote_candidates_admitted` 在「已有第二个 version」的部署上只能观测到 0 —— 这是 metric 在
+如实反映部署状态，不是 soak 坏了；要让它在 `candidates_pending>0` 时可被跑到，先声明 benchmark。
+
 不写这条例外的代价是实测出来的（soak25/26/27）：每个新租户的第一次晋升都被 ③ 以 `BenchmarkNotPass` 永久拒绝 —— 拒绝的理由是「比不出来」，而被比的东西从不存在，于是该租户永远拿不到 serving projection，之后每一次 recall 都答 `no_serving_projection` ⇒ `DEPENDENCY_UNAVAILABLE`。
 
 切换是一次原子 UPDATE，旧 version 行留作回滚目标：
@@ -6242,6 +6273,61 @@ positive + negative fixtures
 
 因此“active UserCorrection relevant to scope”**不允许**用 embedding similarity 解释；必须有机械 scope/authority 规则。
 
+### 五个 selector 的交付实况：两个 `unavailable`，卡点是列不在，不是 WHERE 子句没写（card 22）
+
+`context.assemble` 在**每一个**部署上都答 `completeness.class = cannot_establish` /
+`reason = lane_failed`。链路是确定的：
+
+```text
+crates/adapters/src/context_repo.rs:523  probe：按 SelectorSpec.required_columns 查 information_schema
+crates/adapters/src/context_repo.rs:549  缺列 ⇒ SelectorOutcome::Unavailable，直接 continue
+crates/retrieval/src/handoff.rs:139      Unavailable ⇒ handoff.unavailable_selectors 非空
+bins/gateway/src/context.rs:322          非空 ⇒ LaneStatus::Failed
+§22.4                                    lane 触发在 classify() 里先于 planner_output ⇒ lane_failed
+```
+
+**根因不是 ADR-0041 D-I 记的那条。** 该条记的是 `context_repo.rs:558` 的 `other =>` 臂「没写
+WHERE 子句」。实测（2026-09-17，`humaux_thread_dev`）：`private.memory_records` 的 21 个列里
+**没有 `task_id`、也没有 `facet`**，而两个 selector 的 `required_columns` 正是这两列
+（`crates/domain/src/context.rs:140` / `:180`）。probe 在 WHERE 分派之前就把它们判成
+`Unavailable`，所以 `other =>` 臂今天是**不可达代码**，给它补一条 WHERE 子句不会改变任何输出。
+
+解锁条件按 selector 分开，两条都**不是**「写个 WHERE」：
+
+```text
+task_explicit_context_v1
+  缺：private.memory_records 的 task 维度（列 + migration + §6.2.2 行 + rls_check MATRIX）
+  §25.4 已给出机械规则（scope inheritance = Task，min authority = ExplicitTaskContext），
+  缺的只是承载它的列。
+
+required_current_state_facets_v1
+  缺：facet 维度的列，**以及一条 §25.2 五 facet ↔ §24 九变体的对齐条款**。
+  §25.4 今天没有这条条款 —— 本节明确：在它被写下来之前**不许猜映射**。猜错的代价是
+  G25-1 在小夹具上偶然变绿（一个看起来通过、实际没判任何东西的闸，§80.1）。
+  这条对齐条款是 spec 侧的未决项，不是实现侧的遗漏。
+```
+
+在那之前，`lane_failed` 是这条路由唯一诚实的答案：`unavailable_selectors` 具名诊断照旧按
+§25.4「Unavailable selector 保持具名诊断，此时 expected 只覆盖可用 selector 的已知候选并集，
+不能宣称完整全集已建立」交付 —— 三个可用 selector 的 lane 正常工作，只是全集没建立。见证：
+`bins/gateway/tests/mcp_gateway.rs` 的三路由断言把 `context.assemble = cannot_establish/lane_failed`
+与另外两条路由钉在一起。
+
+**这是一笔仍然打开的债（ADR-0041 D-I），card 22 只订正了它的根因、没有关掉它**（ADR-0044 D-G
+写了下一张卡的预算：migration + §6.2.2 行 + rls_check MATRIX、§25.2↔§24 对齐条款、两条 WHERE、
+以及把 live 见证翻面）。为了让这笔债不会在无人注意时腐烂，同一个 live 套件**按根因**而不是按症状
+钉住它 —— `native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance` 直接读回 lane：
+
+```text
+handoff.unavailable_selectors == [
+  ["task_explicit_context_v1",         "private.memory_records.task_id"],
+  ["required_current_state_facets_v1", "private.memory_records.facet"]
+]
+```
+
+两列中任何一列一落地，这条断言立刻变红，补 predicate 就必须与加列在同一次改动里完成；只钉
+`cannot_establish` 的话，那天套件只会报「expected cannot_establish」，看不出原因。
+
 Pinned：
 
 ```text
@@ -8211,7 +8297,7 @@ processing_status
 
 ## Tool 2 — recall
 
-统一检索入口：
+统一检索入口。**目标形态**（一个 Tool 覆盖全部 lane，不拆成四五个对外工具）：
 
 ```text
 semantic
@@ -8262,6 +8348,62 @@ public_search
 ```
 
 四五个对外工具。
+
+### Tool 2 的 v1 交付范围 = semantic lane（card 22）
+
+以上是**目标形态**，不是当前交付点。v1 只交付 **semantic 一条 lane**，其余 lane 是 future
+scope。写清楚这一条不是降低目标，是因为「文档声称有、实现诚实地 fail closed」会让每一次正确
+的拒绝看起来像缺陷 —— 便宜且正确的动作是收窄文档，不是为了对齐文档去建五条没人要过的 lane。
+
+当前交付点的逐条实况（每条都锚到实现它的 file:line，锚失效即本节失效）：
+
+```text
+mode = semantic            交付        bins/gateway/src/recall.rs:224
+mode = literal             未交付      同上 guard ⇒ DEPENDENCY_UNAVAILABLE
+mode = state               未交付      同上 guard ⇒ DEPENDENCY_UNAVAILABLE
+mode = temporal            未交付      同上 guard ⇒ DEPENDENCY_UNAVAILABLE
+mode = association         未交付      同上 guard ⇒ DEPENDENCY_UNAVAILABLE
+completeness_request = best_effort  交付（默认）
+completeness_request = required     未交付  bins/gateway/src/recall.rs:225 ⇒ DEPENDENCY_UNAVAILABLE
+```
+
+- 唯一原生 dense lane 的实现自述见 `bins/gateway/src/recall.rs`
+  （`SemanticRecallRuntime`）；planner 仍然是决定 lane 的那一处，非 `QueryClass::Semantic`
+  的判定结果在 `bins/gateway/src/recall.rs:255-261` 以 `INVALID_INPUT` 拒绝。
+- 未交付的 lane 走 `DEPENDENCY_UNAVAILABLE`（§52：契约里有、这个部署没有实现），不是
+  `INVALID_INPUT`（值非法）。合约 `contracts/mcp/recall.schema.json` 因此**保留** `mode` 的
+  五值闭集 —— 把未交付值从 enum 里删掉会让这条 guard 变成不可达代码，拒绝路径也就不再可观察
+  （§80.1：任何输入都无法使其为假的判据不是判据）。schema 上改为由
+  `x-humaux-v1-supported` 声明「这个交付点接受哪几个值」。
+- **这条声明是可证伪的，不是注解。** `xtask/src/architecture_check.rs::recall_v1_supported_lanes`
+  （闸名「§33 card 22 (Tool 2 semantic lane …)」）把 schema 的 `x-humaux-v1-supported` 与
+  `bins/gateway/src/recall.rs` 那一条 guard 逐字段对表：ACCEPT 形式（`!=` / `!matches!`）的字面量
+  集必须恰为 `x-humaux-v1-supported`，REFUSE 形式（`==` / `matches!`）的必须恰为
+  `enum − x-humaux-v1-supported`，两边任意一边单独移动都是红。注错见证：
+  `xtask/src/architecture_check.rs::recall_v1_supported_lanes_faults_every_single_place_drift`
+  （八个单点变异，含「把 `"semantic"` 从 `x-humaux-v1-supported` 删掉」——改这条闸之前那个变异
+  全绿，这正是本卡要清的那类无凭断言；另有一个正向对照：把某个值声明为已交付、同时删掉它的拒绝
+  分支，是唯一绿的出路，所以这条闸不等于「guard 必须永远拒绝」）。运行期权威仍然只有 guard 那一处；schema 的声明对客户端
+  是 advisory。
+
+**`limit` 不是调用方可选的页宽（§55.1，card 16 的实测代价）。** 候选深度只来自注册 profile：
+
+```text
+contracts/mcp/recall.schema.json    limit: integer 1..=100（保留，见下）
+crates/retrieval/src/request.rs:203 §55.1 调用方不得提供 limit / top_k / cand_k
+bins/gateway/src/recall.rs:269-278  limit != profile.top_k ⇒ INVALID_INPUT（并打一行 operator 日志）
+```
+
+所以 schema 里 `limit` 唯一合法的取值是把 profile 自己的 `top_k` 原样回声回来；schema 无法表达
+「等于一个运行期 profile 值」，因此这里保留类型与边界（信任边界上的输入校验不删），把真相写进
+`description`，并由 gateway 那一处拒绝兜底。见证：
+`bins/gateway/tests/mcp_gateway.rs::recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused`
+（同一个测试的第三条腿证明 `limit == profile top_k` 仍然答 200 —— 这就是不能把 `limit` 从
+schema 删掉的原因：删了它会变成 schema 违规，错误码从 `INVALID_INPUT` 的语义漂走）。
+
+card 16 记录的代价：这条拒绝当时是**静默**的，soak 的 post-drain replay 送
+`limit = <live point count>` 拿到 `INVALID_INPUT`，gateway 日志里一行都没有，于是被误判成两步
+之外的 embedding 故障整整一天。
 
 
 ## Tool 3 — memory
@@ -8421,6 +8563,123 @@ Handoff
 
 只是 MCP 对外合并成一个工具，减少 Tool Catalog。
 
+
+## 工具面交付实况（delivery point，card 22）
+
+上面 8 个 Tool 是**契约面**（§33.1 Canonical Tool Contract 是它们的唯一真源）。契约面不等于
+交付面：下面这张表说的是**这个交付点上哪些 operation key 真的有实现**。文档继续声称未接线的
+工具，会让 gateway 每一次诚实的 fail-closed 拒绝看起来像缺陷 —— 这一节就是为了让那种误判不
+再发生。
+
+已接线的 operation key（唯一真源是代码：`bins/gateway/src/mcp_application.rs::SUPPORTED_OPERATION_KEYS`，
+下表由 `cargo xtask architecture-check` 的 *tool surface truth* 臂双向比对，多一个少一个都是红）：
+
+<!-- humaux:wired-operation-keys:begin -->
+```text
+remember.put
+recall.search
+context.assemble
+memory.get
+memory.enumerate
+continuity.get
+memory.supersede
+memory.pin
+memory.unpin
+memory.restore
+memory.archive
+memory.unarchive
+memory.correct
+memory.confirm
+memory.reject
+memory.subject_register
+memory.subject_link_key
+memory.annotate_affect
+```
+<!-- humaux:wired-operation-keys:end -->
+
+**declared-only（合约里有，这个交付点没有实现）**：整个 Tool 6 `artifact` / Tool 7 `code` /
+Tool 8 `coordinate`，加上 `remember` 的三个批次 action。调用它们的应答是
+`DEPENDENCY_UNAVAILABLE`（`bins/gateway/src/mcp_application.rs::reject_unsupported`，走
+`invoke` 的 `_ =>` 兜底臂），这是诚实的 fail closed，不是 bug。**见证**：
+`bins/gateway/tests/mcp_gateway.rs::assert_authenticated_transport_negatives` 对 `remember.begin_batch`
+钉住 `code = DEPENDENCY_UNAVAILABLE`、durable 计数不变、拒绝被审计；其余 27 个 declared-only key 走同一条
+`_ =>` 臂但**没有逐一见证**（同臂同码，不再逐个写测试）。两点限定：① `reject_unsupported` 里的作用域 /
+授权拒绝先于 `DEPENDENCY_UNAVAILABLE` 发生，先被拒的调用拿到的是那条拒绝码，不是 `DEPENDENCY_UNAVAILABLE`；
+② 「一律」因此只对通过了前置检查的调用成立。同一臂也覆盖
+`recall.search` 的 semantic 以外的 lane（见上面 Tool 2 的 v1 交付范围 —— 那条的拒绝发生在
+`recall.rs` 的 guard，不在这里）。
+
+同样由 *tool surface truth* 臂对表：**闸断言的是集合相等**（合约面 key 集合 = 已接线集合 ∪ 下面这个 declared-only
+集合，不重不漏）；「48 = 18 + 30」只是本交付点的人工快照，不由闸维护，加 key 时以闸为准。
+
+<!-- humaux:declared-only-operation-keys:begin -->
+```text
+remember.put_batch
+remember.begin_batch
+remember.batch_status
+artifact.create_upload
+artifact.status
+artifact.get
+artifact.list
+artifact.search
+code.register_repository
+code.sync
+code.index
+code.submit_overlay
+code.clear_overlay
+code.status
+code.search
+code.impact
+code.symbol
+coordinate.task_submit
+coordinate.task_claim
+coordinate.task_heartbeat
+coordinate.task_complete
+coordinate.task_fail
+coordinate.task_block
+coordinate.task_resume
+coordinate.task_cancel
+coordinate.handoff
+coordinate.lock_acquire
+coordinate.lock_release
+coordinate.canvas_get
+coordinate.canvas_update
+```
+<!-- humaux:declared-only-operation-keys:end -->
+
+同一条纪律的第二处落点：`SUPPORTED_OPERATION_KEYS` 在 card 22 之前是一个**没有任何读者**的
+常量（只被三处字符串 pin 比对过长度），于是它自己先漂了 —— `memory.correct` /
+`memory.confirm` / `memory.reject` 从 ADR-0025 / ADR-0026 起就有可用的 dispatch 臂，数组却还
+写着 15。新臂因此同时比对 `invoke` 的 dispatch：数组 ↔ dispatch ↔ 本表，三者必须逐字相等。
+
+第四条腿（`wired ∪ declared-only == contracts/mcp 的全部 operation_key`）**对畸形合约 fail
+closed**：§57.1 第2条的 `not_applicable` 只给「对象缺失」，一份存在但形状不对的合约不是缺失。
+把 `oneOf` 改名成 `anyOf` 曾能让这条腿一声不响地不再判任何东西、而 `architecture-check` 照样
+退出 0 —— 现在读取侧把两者分开（缺文件 ⇒ `not_applicable` 并具名，存在但读不成 catalog ⇒ 红）。
+注错见证：`xtask/src/architecture_check.rs::mcp_tool_surface_truth_faults_a_present_but_malformed_contract`
+（真实树的 tempdir 副本：变异前绿、`anyOf` 红、非 JSON 红、真删文件才是 `not_applicable`）。
+
+### memory.get 的 completeness 计数是**故意缺席**的（ADR-0041 D-D）
+
+`memory.get` 永远答 `completeness.class = cannot_establish` / `reason = count_unknown`，
+`exact` 与 `known_lower_bound` 为 null。这是**构造上的正确答案**，不是没做完：
+
+```text
+crates/retrieval/src/...::classify()   DirectGet ⇒ QueryClass::Exact
+§22.0                                  exact 而没有 predicate_id/census ⇒ 硬 5xx
+```
+
+也就是说，给 `memory.get` 填上 pipeline 计数而不给它一个 census，只会把 200 变成 500。解锁条
+件是一个单独的决定：为 DirectGet 定义「universe-of-one」census（一个对象读的全集基数为 1）。
+在那之前，`count_unknown` 是唯一合法答案。
+
+见证：`bins/gateway/tests/mcp_gateway.rs` 的 card 18/19 三路由断言把
+`memory.get = cannot_establish/count_unknown`、`memory.enumerate = exact`、
+`context.assemble = cannot_establish/lane_failed` 三行一起钉死 —— 谁"顺手补完"
+`memory.get` 的五个计数，红的是这一行，而不是线上 500。
+
+`contracts/mcp/memory.output.schema.json` 的顶层 `description` 同步写明这一条，避免读 schema
+的人把 null 计数读成未实现。
 
 ## 为什么不是 17/30 个 MCP Tools
 

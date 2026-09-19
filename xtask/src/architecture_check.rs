@@ -4999,7 +4999,7 @@ fn w2_continuity_contract_from(
         );
     }
     for needle in [
-        "SUPPORTED_OPERATION_KEYS: [&str; 15]",
+        "SUPPORTED_OPERATION_KEYS: [&str; 18]",
         "\"continuity.get\" =>",
     ] {
         if !dispatch.contains(needle) {
@@ -5029,6 +5029,521 @@ fn w2_continuity_contract_from(
     } else {
         Verdict::Fail(failures)
     }
+}
+
+// ============================================================================
+// card 22 — §33 Canonical MCP Tool Details「工具面交付实况」
+// ============================================================================
+
+/// One closed operation-key family the gateway dispatches through a domain table rather than
+/// a literal (§78.2: the key is spelled once, in `domain`). `variants` is `(path, key)` where
+/// `path` is the exact Rust text the dispatch writes, e.g. `DestructiveOp::MemoryPin`.
+struct OperationKeyFamily {
+    name: &'static str,
+    variants: Vec<(String, &'static str)>,
+}
+
+/// Built from the domain's own `ALL` tables — never a second list of keys to keep in sync.
+fn operation_key_families() -> Vec<OperationKeyFamily> {
+    use humaux_domain::{affect::AffectWriteOp, confirm::DestructiveOp, subject::SubjectWriteOp};
+    vec![
+        OperationKeyFamily {
+            name: "DestructiveOp",
+            variants: DestructiveOp::ALL
+                .iter()
+                .map(|op| (format!("DestructiveOp::{op:?}"), op.operation_key()))
+                .collect(),
+        },
+        OperationKeyFamily {
+            name: "SubjectWriteOp",
+            variants: SubjectWriteOp::ALL
+                .iter()
+                .map(|op| (format!("SubjectWriteOp::{op:?}"), op.operation_key()))
+                .collect(),
+        },
+        OperationKeyFamily {
+            name: "AffectWriteOp",
+            variants: AffectWriteOp::ALL
+                .iter()
+                .map(|op| (format!("AffectWriteOp::{op:?}"), op.operation_key()))
+                .collect(),
+        },
+    ]
+}
+
+/// The `SUPPORTED_OPERATION_KEYS` array, resolved to real keys. `Err` carries the reason the
+/// array could not be read at all (a missing array, an entry neither a literal nor a known
+/// family variant, or a declared length that disagrees with the entry count).
+fn supported_operation_keys(dispatch: &str) -> Result<BTreeSet<String>, Vec<String>> {
+    let mut failures = Vec::new();
+    let Some(head) = dispatch.find("pub const SUPPORTED_OPERATION_KEYS: [&str; ") else {
+        return Err(vec!["SUPPORTED_OPERATION_KEYS array is absent".to_string()]);
+    };
+    let after = &dispatch[head + "pub const SUPPORTED_OPERATION_KEYS: [&str; ".len()..];
+    let declared: usize = after
+        .split(']')
+        .next()
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0);
+    let Some(open) = after.find("= [") else {
+        return Err(vec![
+            "SUPPORTED_OPERATION_KEYS has no array body".to_string(),
+        ]);
+    };
+    let body_start = open + "= [".len();
+    let Some(close) = after[body_start..].find("\n];") else {
+        return Err(vec![
+            "SUPPORTED_OPERATION_KEYS body is unterminated".to_string(),
+        ]);
+    };
+    let families = operation_key_families();
+    let mut keys = BTreeSet::new();
+    let mut count = 0usize;
+    for entry in after[body_start..body_start + close].split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        count += 1;
+        let resolved = if entry.starts_with('"') && entry.ends_with('"') && entry.len() >= 2 {
+            Some(entry[1..entry.len() - 1].to_string())
+        } else {
+            families
+                .iter()
+                .flat_map(|f| f.variants.iter())
+                .find(|(path, _)| entry == format!("{path}.operation_key()"))
+                .map(|(_, key)| (*key).to_string())
+        };
+        match resolved {
+            Some(key) => {
+                if !keys.insert(key.clone()) {
+                    failures.push(format!("SUPPORTED_OPERATION_KEYS repeats `{key}`"));
+                }
+            }
+            None => failures.push(format!(
+                "SUPPORTED_OPERATION_KEYS entry `{entry}` is neither a literal key nor a \
+                 closed-table `<Family>::<Variant>.operation_key()`"
+            )),
+        }
+    }
+    if declared != count {
+        failures.push(format!(
+            "SUPPORTED_OPERATION_KEYS declares [&str; {declared}] but carries {count} entries"
+        ));
+    }
+    if failures.is_empty() {
+        Ok(keys)
+    } else {
+        Err(failures)
+    }
+}
+
+/// Every operation key the `invoke` dispatch actually has an arm for, read from the same
+/// source file. The `_ =>` fallback (`reject_unsupported`) ends the scan — routes below it are
+/// exactly the declared-only surface.
+fn dispatched_operation_keys(dispatch: &str) -> Result<BTreeSet<String>, Vec<String>> {
+    let Some(head) = dispatch.find("match operation.operation_key() {") else {
+        return Err(vec!["invoke dispatch match is absent".to_string()]);
+    };
+    let body = &dispatch[head..];
+    let body = body
+        .find("\n            _ => {")
+        .map_or(body, |end| &body[..end]);
+    let mut keys = BTreeSet::new();
+    for piece in body.split(" =>") {
+        if let Some(open) = piece.rfind('"') {
+            let prefix = &piece[..open];
+            if let Some(start) = prefix.rfind('"')
+                && piece[open..].trim() == "\""
+            {
+                keys.insert(prefix[start + 1..].to_string());
+            }
+        }
+    }
+    for family in operation_key_families() {
+        let catch_all = format!("{}::parse_operation_key", family.name);
+        let pinned = format!("{}::parse_operation_key(key) == Some(", family.name);
+        for (path, key) in &family.variants {
+            let named = body.contains(&format!("{path}.operation_key()"))
+                || (body.contains(&pinned) && body.contains(path.as_str()))
+                || (body.contains(&catch_all) && !body.contains(&pinned));
+            if named {
+                keys.insert((*key).to_string());
+            }
+        }
+    }
+    if keys.is_empty() {
+        return Err(vec!["invoke dispatch names no operation key".to_string()]);
+    }
+    Ok(keys)
+}
+
+/// The keys listed inside one `<!-- humaux:<marker>:begin -->` … `:end` block of the Baseline.
+fn baseline_key_block(baseline: &str, marker: &str) -> Result<BTreeSet<String>, Vec<String>> {
+    let begin = format!("<!-- humaux:{marker}:begin -->");
+    let end = format!("<!-- humaux:{marker}:end -->");
+    let (Some(from), Some(to)) = (baseline.find(&begin), baseline.find(&end)) else {
+        return Err(vec![format!("Baseline block `{marker}` is absent")]);
+    };
+    if to < from {
+        return Err(vec![format!("Baseline block `{marker}` is inverted")]);
+    }
+    let mut keys = BTreeSet::new();
+    for line in baseline[from + begin.len()..to].lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("```") {
+            continue;
+        }
+        keys.insert(line.to_string());
+    }
+    if keys.is_empty() {
+        return Err(vec![format!("Baseline block `{marker}` lists no key")]);
+    }
+    Ok(keys)
+}
+
+fn name_diff(
+    label: &str,
+    left: &BTreeSet<String>,
+    right: &BTreeSet<String>,
+    out: &mut Vec<String>,
+) {
+    for key in left.difference(right) {
+        out.push(format!("{label}: `{key}`"));
+    }
+}
+
+/// Card 22: the delivery-point tool surface is ONE fact, and it lives in three places that
+/// must agree — the `SUPPORTED_OPERATION_KEYS` array, the `invoke` dispatch that actually has
+/// the arms, and §33's 「工具面交付实况」 table in the Baseline. Before this gate the array was
+/// read by nobody (three string pins only checked its declared length), so it had already
+/// drifted three keys behind the dispatch while the document claimed the whole 8-tool surface.
+///
+/// The fourth set closes the other direction: every key the canonical catalog admits is either
+/// wired or listed as declared-only, so a contract can never grow a route that the document
+/// silently calls delivered.
+fn mcp_tool_surface_truth_from(
+    dispatch: &str,
+    baseline: &str,
+    catalog: &BTreeSet<String>,
+) -> Verdict {
+    let mut failures = Vec::new();
+    let supported = match supported_operation_keys(dispatch) {
+        Ok(keys) => keys,
+        Err(errors) => {
+            failures.extend(errors);
+            BTreeSet::new()
+        }
+    };
+    let dispatched = match dispatched_operation_keys(dispatch) {
+        Ok(keys) => keys,
+        Err(errors) => {
+            failures.extend(errors);
+            BTreeSet::new()
+        }
+    };
+    let wired = match baseline_key_block(baseline, "wired-operation-keys") {
+        Ok(keys) => keys,
+        Err(errors) => {
+            failures.extend(errors);
+            BTreeSet::new()
+        }
+    };
+    let declared_only = match baseline_key_block(baseline, "declared-only-operation-keys") {
+        Ok(keys) => keys,
+        Err(errors) => {
+            failures.extend(errors);
+            BTreeSet::new()
+        }
+    };
+    if !supported.is_empty() && !dispatched.is_empty() {
+        name_diff(
+            "SUPPORTED_OPERATION_KEYS lists a key the invoke dispatch has no arm for",
+            &supported,
+            &dispatched,
+            &mut failures,
+        );
+        name_diff(
+            "invoke dispatch routes a key SUPPORTED_OPERATION_KEYS omits",
+            &dispatched,
+            &supported,
+            &mut failures,
+        );
+    }
+    if !supported.is_empty() && !wired.is_empty() {
+        name_diff(
+            "SUPPORTED_OPERATION_KEYS lists a key §33's wired table omits",
+            &supported,
+            &wired,
+            &mut failures,
+        );
+        name_diff(
+            "§33's wired table claims a key SUPPORTED_OPERATION_KEYS omits",
+            &wired,
+            &supported,
+            &mut failures,
+        );
+    }
+    if !wired.is_empty() && !declared_only.is_empty() {
+        for key in wired.intersection(&declared_only) {
+            failures.push(format!("§33 lists `{key}` as both wired and declared-only"));
+        }
+        let documented: BTreeSet<String> = wired.union(&declared_only).cloned().collect();
+        name_diff(
+            "§33 documents an operation key the canonical catalog does not admit",
+            &documented,
+            catalog,
+            &mut failures,
+        );
+        name_diff(
+            "the canonical catalog admits an operation key §33 documents nowhere",
+            catalog,
+            &documented,
+            &mut failures,
+        );
+    }
+    if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(failures)
+    }
+}
+
+/// Reads the four real sources. Any absent object is `not_applicable` naming it (§57.1 第2条).
+fn mcp_tool_surface_truth(root: &Path) -> Verdict {
+    let dispatch_path = root.join("bins/gateway/src/mcp_application.rs");
+    let baseline_path = root.join("docs/architecture/Baseline_2.9.md");
+    let Ok(dispatch) = fs::read_to_string(&dispatch_path) else {
+        return Verdict::NotApplicable("bins/gateway/src/mcp_application.rs".to_string());
+    };
+    let Ok(baseline) = fs::read_to_string(&baseline_path) else {
+        return Verdict::NotApplicable("docs/architecture/Baseline_2.9.md".to_string());
+    };
+    let catalog = match catalog_operation_keys(root) {
+        Ok(keys) => keys,
+        // §57.1 第2条's `not_applicable` is for an object that is ABSENT. A contract that is
+        // present but shaped differently is not absent — and letting it degrade to
+        // `not_applicable` made this arm switchable off by a contract edit (renaming `oneOf`
+        // to `anyOf` stopped the whole wired ∪ declared-only == catalog leg from judging
+        // anything while the run still exited 0). Present-but-unreadable is a red gate.
+        Err(CatalogDefect::Missing(object)) => return Verdict::NotApplicable(object),
+        Err(CatalogDefect::Malformed(object)) => {
+            return Verdict::Fail(vec![format!(
+                "canonical MCP catalog is present but unreadable, so the catalog leg of this \
+                 gate would judge nothing: {object}"
+            )]);
+        }
+    };
+    mcp_tool_surface_truth_from(&dispatch, &baseline, &catalog)
+}
+
+/// Why a contract could not be turned into a key set. `Missing` = the file is not there at all
+/// (§57.1 `not_applicable`); `Malformed` = it is there and does not have the shape the catalog
+/// is defined by (a failure — see `mcp_tool_surface_truth`).
+#[derive(Debug)]
+enum CatalogDefect {
+    Missing(String),
+    Malformed(String),
+}
+
+/// Every `x-humaux-operation.operation_key` the canonical catalog admits, read from the same
+/// `contracts/mcp` documents `protocol::mcp_catalog` embeds.
+fn catalog_operation_keys(root: &Path) -> Result<BTreeSet<String>, CatalogDefect> {
+    let dir = root.join("contracts/mcp");
+    let manifest = read_contract(&dir, "manifest.json")?;
+    let tools = manifest
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            CatalogDefect::Malformed("contracts/mcp/manifest.json#/tools".to_string())
+        })?;
+    let mut keys = BTreeSet::new();
+    for tool in tools {
+        let file = tool
+            .get("input_schema")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                CatalogDefect::Malformed(
+                    "contracts/mcp/manifest.json#/tools/*/input_schema".to_string(),
+                )
+            })?;
+        let schema = read_contract(&dir, file)?;
+        let branches = schema
+            .get("oneOf")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| CatalogDefect::Malformed(format!("contracts/mcp/{file}#/oneOf")))?;
+        for branch in branches {
+            let key = branch
+                .get("x-humaux-operation")
+                .and_then(|op| op.get("operation_key"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    CatalogDefect::Malformed(format!(
+                        "contracts/mcp/{file}#/oneOf/*/x-humaux-operation"
+                    ))
+                })?;
+            keys.insert(key.to_string());
+        }
+    }
+    Ok(keys)
+}
+
+/// Card 22 review fix: `x-humaux-v1-supported` was an inert annotation. §33 and ADR-0044 both
+/// said it was 「由 architecture-check 与 guard 对表」 and nothing in the tree read the key —
+/// deleting `"semantic"` from it left every gate green, which is the same unbacked-claim defect
+/// this card exists to remove (§80.1: a criterion no input can falsify is not a criterion).
+///
+/// This arm makes the key load-bearing in BOTH directions. The schema declares, per field,
+/// which of the closed enum's values this delivery point accepts; the guard in
+/// `bins/gateway/src/recall.rs` is the runtime authority and must name exactly the complement.
+/// Two spellings are admitted because the guard legitimately uses both: an ACCEPT clause
+/// (`!=` / `!matches!`) must name exactly `x-humaux-v1-supported`, a REFUSE clause (`==` /
+/// `matches!`) must name exactly `enum − x-humaux-v1-supported`. Either side moving alone is red.
+fn recall_v1_supported_lanes_from(schema: &str, guard_src: &str) -> Verdict {
+    let Ok(schema) = serde_json::from_str::<serde_json::Value>(schema) else {
+        return Verdict::Fail(vec![
+            "contracts/mcp/recall.schema.json is present but is not JSON".to_string(),
+        ]);
+    };
+    let Some(properties) = schema
+        .pointer("/oneOf/0/properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Verdict::Fail(vec![
+            "contracts/mcp/recall.schema.json#/oneOf/0/properties is absent or not an object"
+                .to_string(),
+        ]);
+    };
+    let Some(guard) = recall_guard_block(guard_src) else {
+        return Verdict::Fail(vec![
+            "bins/gateway/src/recall.rs: no `DependencyUnavailable` lane guard found in \
+             `pub async fn search(`"
+                .to_string(),
+        ]);
+    };
+    let mut failures = Vec::new();
+    let mut declared = 0usize;
+    for (field, spec) in properties {
+        let Some(supported) = spec.get("x-humaux-v1-supported") else {
+            continue;
+        };
+        declared += 1;
+        let (Some(supported), Some(closed)) =
+            (string_set(supported), spec.get("enum").and_then(string_set))
+        else {
+            failures.push(format!(
+                "`{field}`: `x-humaux-v1-supported` and `enum` must both be arrays of strings"
+            ));
+            continue;
+        };
+        name_diff(
+            &format!("`{field}`: x-humaux-v1-supported names a value outside the closed enum"),
+            &supported,
+            &closed,
+            &mut failures,
+        );
+        let refused: BTreeSet<String> = closed.difference(&supported).cloned().collect();
+        let clauses: Vec<&str> = guard
+            .split("||")
+            .filter(|clause| clause.contains(&format!("input.{field}")))
+            .collect();
+        // A field whose whole enum is delivered needs no clause at all — and must not have one,
+        // or the guard would be refusing a value the contract says is supported.
+        if refused.is_empty() {
+            if !clauses.is_empty() {
+                failures.push(format!(
+                    "`{field}`: every enum value is declared supported, yet the recall.rs guard \
+                     still has a clause naming `input.{field}`"
+                ));
+            }
+            continue;
+        }
+        let [clause] = clauses.as_slice() else {
+            failures.push(format!(
+                "`{field}`: the recall.rs guard must have exactly one clause naming \
+                 `input.{field}` ({} found; enum − supported = {refused:?})",
+                clauses.len()
+            ));
+            continue;
+        };
+        let named = clause_literals(clause);
+        let (expected, shape) = if clause.contains("!=") || clause.contains("!matches!") {
+            (&supported, "accepts")
+        } else {
+            (&refused, "refuses")
+        };
+        if &named != expected {
+            failures.push(format!(
+                "`{field}`: recall.rs {shape} {named:?} while recall.schema.json declares \
+                 x-humaux-v1-supported = {supported:?} (so it must {shape} {expected:?})"
+            ));
+        }
+    }
+    if declared == 0 {
+        failures.push(
+            "contracts/mcp/recall.schema.json declares no `x-humaux-v1-supported` — §33's \
+             narrowed Tool 2 claim has nothing left to check"
+                .to_string(),
+        );
+    }
+    if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(failures)
+    }
+}
+
+/// The `if … { return Err(ErrorCode::DependencyUnavailable); }` condition at the head of
+/// `recall::search` — the lane guard, and nothing else in the function.
+fn recall_guard_block(src: &str) -> Option<&str> {
+    let body = &src[src.find("pub async fn search(")?..];
+    let end = body.find("return Err(ErrorCode::DependencyUnavailable);")?;
+    let condition = &body[..end];
+    let start = condition.rfind("\n    if ")?;
+    Some(&condition[start..])
+}
+
+/// Every `"…"` literal in one guard clause.
+fn clause_literals(clause: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut rest = clause;
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('"') else { break };
+        out.insert(after[..close].to_string());
+        rest = &after[close + 1..];
+    }
+    out
+}
+
+fn string_set(value: &serde_json::Value) -> Option<BTreeSet<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// Reads the two real objects. Absent ⇒ `not_applicable` naming it; present-but-unreadable is
+/// a failure, never a silent skip (same rule as `mcp_tool_surface_truth`).
+fn recall_v1_supported_lanes(root: &Path) -> Verdict {
+    let schema_path = root.join("contracts/mcp/recall.schema.json");
+    let guard_path = root.join("bins/gateway/src/recall.rs");
+    let Ok(schema) = fs::read_to_string(&schema_path) else {
+        return Verdict::NotApplicable("contracts/mcp/recall.schema.json".to_string());
+    };
+    let Ok(guard) = fs::read_to_string(&guard_path) else {
+        return Verdict::NotApplicable("bins/gateway/src/recall.rs".to_string());
+    };
+    recall_v1_supported_lanes_from(&schema, &guard)
+}
+
+/// One contract document: absent ⇒ `Missing`, present-but-not-JSON ⇒ `Malformed`.
+fn read_contract(dir: &Path, file: &str) -> Result<serde_json::Value, CatalogDefect> {
+    let raw = fs::read_to_string(dir.join(file))
+        .map_err(|_| CatalogDefect::Missing(format!("contracts/mcp/{file}")))?;
+    serde_json::from_str(&raw)
+        .map_err(|_| CatalogDefect::Malformed(format!("contracts/mcp/{file} (not JSON)")))
 }
 
 fn w2_continuity_gate(root: &Path) -> Verdict {
@@ -5167,6 +5682,16 @@ pub fn run(_args: &[String]) -> i32 {
         (
             "ADR-0039 / §11.4 (outbound client dials only through the checked resolver)",
             checked_resolver_dial_gate(&root),
+        ),
+        (
+            "§33 card 22 (tool surface truth: SUPPORTED_OPERATION_KEYS ↔ invoke dispatch ↔ \
+             Baseline 工具面交付实况 ↔ canonical catalog)",
+            mcp_tool_surface_truth(&root),
+        ),
+        (
+            "§33 card 22 (Tool 2 semantic lane: recall.schema.json x-humaux-v1-supported ↔ the \
+             recall.rs DEPENDENCY_UNAVAILABLE guard)",
+            recall_v1_supported_lanes(&root),
         ),
     ];
     checks.extend(provider_plane_architecture_gate_checks(&root));
@@ -5346,7 +5871,7 @@ mod tests {
             (5, "WorkspaceAdmission::PreserveContinuityFilter => None"),
             (5, "operation.operation_key() != \"continuity.get\""),
             (6, "catalog.validate_output(ToolName::Continuity, &value)"),
-            (6, "SUPPORTED_OPERATION_KEYS: [&str; 15]"),
+            (6, "SUPPORTED_OPERATION_KEYS: [&str; 18]"),
             (6, "\"continuity.get\" =>"),
         ] {
             let mut broken = sources.clone();
@@ -5362,6 +5887,308 @@ mod tests {
                 "mutation removing `{needle}` must fail the actual W2 gate"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // card 22 — §33 tool surface truth
+    // ------------------------------------------------------------------
+
+    fn tool_surface_sources() -> (String, String, BTreeSet<String>) {
+        let root = real_root();
+        (
+            fs::read_to_string(root.join("bins/gateway/src/mcp_application.rs")).unwrap(),
+            fs::read_to_string(root.join("docs/architecture/Baseline_2.9.md")).unwrap(),
+            catalog_operation_keys(&root).unwrap(),
+        )
+    }
+
+    #[test]
+    fn mcp_tool_surface_truth_real_sources_are_green() {
+        let (dispatch, baseline, catalog) = tool_surface_sources();
+        assert_eq!(
+            mcp_tool_surface_truth_from(&dispatch, &baseline, &catalog),
+            Verdict::Pass
+        );
+    }
+
+    /// The array, the dispatch, the document and the catalog are four independent places; the
+    /// gate exists because one of them drifting silently is exactly what happened (card 22
+    /// found `memory.correct` / `memory.confirm` / `memory.reject` dispatched for two ADRs
+    /// while the array still said 15). Every single-place mutation must be red.
+    #[test]
+    fn mcp_tool_surface_truth_faults_every_single_place_drift() {
+        let (dispatch, baseline, catalog) = tool_surface_sources();
+
+        // (1) the array loses a key the dispatch still routes.
+        let shrunk = dispatch
+            .replace("    DestructiveOp::MemoryConfirm.operation_key(),\n", "")
+            .replace(
+                "SUPPORTED_OPERATION_KEYS: [&str; 18]",
+                "SUPPORTED_OPERATION_KEYS: [&str; 17]",
+            );
+        assert!(
+            matches!(
+                mcp_tool_surface_truth_from(&shrunk, &baseline, &catalog),
+                Verdict::Fail(_)
+            ),
+            "dropping a dispatched key from SUPPORTED_OPERATION_KEYS must fail"
+        );
+
+        // (2) the array's declared length stops matching its entries.
+        let miscounted = dispatch.replace(
+            "SUPPORTED_OPERATION_KEYS: [&str; 18]",
+            "SUPPORTED_OPERATION_KEYS: [&str; 19]",
+        );
+        assert!(
+            matches!(
+                mcp_tool_surface_truth_from(&miscounted, &baseline, &catalog),
+                Verdict::Fail(_)
+            ),
+            "a declared length that disagrees with the entries must fail"
+        );
+
+        // (3) the document drops a wired key.
+        let doc_short = baseline.replacen("\nmemory.annotate_affect\n", "\n", 1);
+        assert!(
+            matches!(
+                mcp_tool_surface_truth_from(&dispatch, &doc_short, &catalog),
+                Verdict::Fail(_)
+            ),
+            "a wired key missing from §33's table must fail"
+        );
+
+        // (4) the document calls a wired key declared-only — the exact shape that makes an
+        //     honest fail-closed refusal look like a bug, and vice versa.
+        let doc_moved = baseline.replacen("\nmemory.pin\n", "\n", 1).replacen(
+            "\nremember.put_batch\n",
+            "\nremember.put_batch\nmemory.pin\n",
+            1,
+        );
+        assert!(
+            matches!(
+                mcp_tool_surface_truth_from(&dispatch, &doc_moved, &catalog),
+                Verdict::Fail(_)
+            ),
+            "moving a wired key into the declared-only block must fail"
+        );
+
+        // (5) the catalog grows a route the document names nowhere.
+        let mut wider = catalog.clone();
+        wider.insert("coordinate.canvas_delete".to_string());
+        assert!(
+            matches!(
+                mcp_tool_surface_truth_from(&dispatch, &baseline, &wider),
+                Verdict::Fail(_)
+            ),
+            "an undocumented catalog operation key must fail"
+        );
+
+        // (6) the marked blocks themselves are load-bearing.
+        let unmarked = baseline.replacen("<!-- humaux:wired-operation-keys:begin -->", "", 1);
+        assert!(
+            matches!(
+                mcp_tool_surface_truth_from(&dispatch, &unmarked, &catalog),
+                Verdict::Fail(_)
+            ),
+            "removing the wired-key block marker must fail, not silently pass"
+        );
+    }
+
+    /// `not_applicable` (never `pass`) when a source object is absent — §57.1 第2条.
+    #[test]
+    fn mcp_tool_surface_truth_is_not_applicable_without_its_sources() {
+        assert_eq!(
+            mcp_tool_surface_truth(Path::new("/nonexistent-humaux-root")),
+            Verdict::NotApplicable("bins/gateway/src/mcp_application.rs".to_string())
+        );
+    }
+
+    /// …but a contract that is PRESENT and shaped differently is not an absent object, and
+    /// letting it degrade to `not_applicable` made the catalog leg switchable off by a contract
+    /// edit while the run still exited 0. `oneOf` → `anyOf` in one schema must be red.
+    #[test]
+    fn mcp_tool_surface_truth_faults_a_present_but_malformed_contract() {
+        let root = real_root();
+        let tmp = std::env::temp_dir().join(format!(
+            "arch-check-catalog-malformed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // A root whose non-contract sources are the real ones, so the ONLY变量 is the contract.
+        fs::create_dir_all(tmp.join("bins/gateway/src")).unwrap();
+        fs::create_dir_all(tmp.join("docs/architecture")).unwrap();
+        fs::create_dir_all(tmp.join("contracts/mcp")).unwrap();
+        for path in [
+            "bins/gateway/src/mcp_application.rs",
+            "docs/architecture/Baseline_2.9.md",
+        ] {
+            fs::copy(root.join(path), tmp.join(path)).unwrap();
+        }
+        for entry in fs::read_dir(root.join("contracts/mcp")).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().is_file() {
+                fs::copy(
+                    entry.path(),
+                    tmp.join("contracts/mcp").join(entry.file_name()),
+                )
+                .unwrap();
+            }
+        }
+        // Control: the copied tree is green before the mutation.
+        assert_eq!(mcp_tool_surface_truth(&tmp), Verdict::Pass);
+
+        let victim = tmp.join("contracts/mcp/coordinate.schema.json");
+        let mutated = fs::read_to_string(&victim)
+            .unwrap()
+            .replacen("\"oneOf\"", "\"anyOf\"", 1);
+        fs::write(&victim, mutated).unwrap();
+        let verdict = mcp_tool_surface_truth(&tmp);
+        assert!(
+            matches!(verdict, Verdict::Fail(_)),
+            "a present-but-unreadable contract must fail the gate, not switch it off: {verdict:?}"
+        );
+
+        // And unreadable-because-not-JSON is the same class.
+        fs::write(&victim, "{ not json").unwrap();
+        assert!(matches!(mcp_tool_surface_truth(&tmp), Verdict::Fail(_)));
+
+        // …while an ABSENT contract is still §57.1's not_applicable.
+        fs::remove_file(&victim).unwrap();
+        assert_eq!(
+            mcp_tool_surface_truth(&tmp),
+            Verdict::NotApplicable("contracts/mcp/coordinate.schema.json".to_string())
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // card 22 review fix — x-humaux-v1-supported ↔ the recall.rs lane guard
+    // ------------------------------------------------------------------
+
+    fn recall_lane_sources() -> (String, String) {
+        let root = real_root();
+        (
+            fs::read_to_string(root.join("contracts/mcp/recall.schema.json")).unwrap(),
+            fs::read_to_string(root.join("bins/gateway/src/recall.rs")).unwrap(),
+        )
+    }
+
+    #[test]
+    fn recall_v1_supported_lanes_real_sources_are_green() {
+        let (schema, guard) = recall_lane_sources();
+        assert_eq!(
+            recall_v1_supported_lanes_from(&schema, &guard),
+            Verdict::Pass
+        );
+    }
+
+    /// The mutation the review named: deleting `"semantic"` from `x-humaux-v1-supported` used
+    /// to leave every gate green, which is what made the key inert. Every single-place drift
+    /// between the declaration and the guard must now be red.
+    #[test]
+    fn recall_v1_supported_lanes_faults_every_single_place_drift() {
+        let (schema, guard) = recall_lane_sources();
+
+        for (label, mutated) in [
+            (
+                "the declaration drops the one supported mode",
+                schema.replacen(
+                    r#""x-humaux-v1-supported":["semantic"]"#,
+                    r#""x-humaux-v1-supported":[]"#,
+                    1,
+                ),
+            ),
+            (
+                "the declaration claims a lane the guard refuses",
+                schema.replacen(
+                    r#""x-humaux-v1-supported":["semantic"]"#,
+                    r#""x-humaux-v1-supported":["semantic","literal"]"#,
+                    1,
+                ),
+            ),
+            (
+                "the declaration claims a completeness value the guard refuses",
+                schema.replacen(
+                    r#""x-humaux-v1-supported":["best_effort"]"#,
+                    r#""x-humaux-v1-supported":["best_effort","required"]"#,
+                    1,
+                ),
+            ),
+            (
+                "x-humaux-v1-supported names a value outside the closed enum",
+                schema.replacen(
+                    r#""x-humaux-v1-supported":["semantic"]"#,
+                    r#""x-humaux-v1-supported":["semantic","sql"]"#,
+                    1,
+                ),
+            ),
+        ] {
+            let verdict = recall_v1_supported_lanes_from(&mutated, &guard);
+            assert!(matches!(verdict, Verdict::Fail(_)), "{label}: {verdict:?}");
+        }
+
+        for (label, mutated) in [
+            (
+                "the guard starts accepting a lane the declaration does not",
+                guard.replacen(
+                    r#"mode != "semantic""#,
+                    r#"!matches!(mode, "semantic" | "literal")"#,
+                    1,
+                ),
+            ),
+            (
+                "the guard stops refusing completeness_request = required",
+                guard.replacen(
+                    r#"|| input.completeness_request.as_deref() == Some("required")"#,
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "the guard refuses the only supported mode",
+                guard.replacen(r#"mode != "semantic""#, r#"mode != "literal""#, 1),
+            ),
+        ] {
+            let verdict = recall_v1_supported_lanes_from(&schema, &mutated);
+            assert!(matches!(verdict, Verdict::Fail(_)), "{label}: {verdict:?}");
+        }
+
+        // The guard itself disappearing is red, not a silent pass.
+        let no_guard = guard.replacen("return Err(ErrorCode::DependencyUnavailable);", "", 1);
+        assert!(matches!(
+            recall_v1_supported_lanes_from(&schema, &no_guard),
+            Verdict::Fail(_)
+        ));
+
+        // Positive control for the other direction — the day a lane is actually delivered, the
+        // declaration grows to the whole enum AND the clause goes away, together. That pair is
+        // the only green way out, so the gate cannot be read as "the guard must always refuse".
+        let delivered_schema = schema.replacen(
+            r#""x-humaux-v1-supported":["best_effort"]"#,
+            r#""x-humaux-v1-supported":["best_effort","required"]"#,
+            1,
+        );
+        let delivered_guard = guard.replacen(
+            r#"|| input.completeness_request.as_deref() == Some("required")"#,
+            "",
+            1,
+        );
+        assert_eq!(
+            recall_v1_supported_lanes_from(&delivered_schema, &delivered_guard),
+            Verdict::Pass,
+            "declaring a value supported and deleting its refusal in the same change is green"
+        );
+    }
+
+    #[test]
+    fn recall_v1_supported_lanes_is_not_applicable_without_its_sources() {
+        assert_eq!(
+            recall_v1_supported_lanes(Path::new("/nonexistent-humaux-root")),
+            Verdict::NotApplicable("contracts/mcp/recall.schema.json".to_string())
+        );
     }
 
     #[test]

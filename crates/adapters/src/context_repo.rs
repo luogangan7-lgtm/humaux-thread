@@ -555,6 +555,21 @@ pub(crate) async fn fetch_frozen_in_txn(
             SelectorId::ProjectActiveConstraintsV1 => PROJECT_CONSTRAINTS_WHERE,
             SelectorId::UserConfirmedCorrectionsV1 => USER_CORRECTIONS_WHERE,
             SelectorId::ExplicitMandatoryBindingsV1 => EXPLICIT_BINDINGS_WHERE,
+            // Card 22 correction: this arm is **unreachable today**, and saying so matters
+            // because ADR-0041 D-I recorded the opposite. `TaskExplicitContextV1` and
+            // `RequiredCurrentStateFacetsV1` declare `required_columns`
+            // `private.memory_records.task_id` / `.facet` (`domain::context` REGISTRY), and
+            // neither column exists — measured 2026-09-17: `private.memory_records` has 21
+            // columns and no task or facet dimension. The probe loop above therefore emits
+            // `Unavailable { missing_object: "private.memory_records.task_id" }` and
+            // `continue`s before the dispatch below ever runs, so writing a WHERE clause here
+            // would change no output. The real unlock is the two columns (migration + §6.2.2
+            // grant row + rls_check MATRIX) plus, for the facets selector, the §25.2↔§24
+            // alignment clause §25.4 still does not contain — the REGISTRY refuses to guess it
+            // on purpose (a guessed mapping makes G25-1 accidentally green, §80.1).
+            //
+            // The arm stays as the fail-closed floor: a selector that becomes column-available
+            // without a predicate here must be `Unavailable`, never a silent empty lane.
             other => {
                 out.push(SelectorOutcome::Unavailable {
                     id: other,

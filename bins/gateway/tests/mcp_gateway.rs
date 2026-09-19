@@ -35,6 +35,7 @@ use humaux_domain::{
     authority::{AuthorityClass, AuthorityStatus},
     context::ContextBudget,
     dataclass::DataClass,
+    error::ErrorCode,
     evidence::{EvidenceOriginClass, payload_sha256},
     identity::{
         AuthorizationScope, BoundedSet, MembershipConflict, MembershipMutation, MembershipRole,
@@ -2107,13 +2108,20 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 // mandatory lane is `failed` on EVERY deployment because
                 // `context_repo::fetch_frozen_in_txn` emits `SelectorOutcome::Unavailable` for
                 // two of §25's five selectors (`TaskExplicitContextV1`,
-                // `RequiredCurrentStateFacetsV1`) — neither has a WHERE clause yet, so
-                // `handoff.unavailable_selectors` is never empty. That was already this
-                // route's answer before ADR-0041 D-H, which is why D-H's "both at
-                // count_unknown" reads wrong for it. What the wiring buys here is the counts
-                // asserted below plus the disappearance of `count_unknown` from the reason
-                // chain; implement those two selectors and this row becomes `semantic_bounded`
-                // with no further envelope change.
+                // `RequiredCurrentStateFacetsV1`), so `handoff.unavailable_selectors` is never
+                // empty. That was already this route's answer before ADR-0041 D-H, which is
+                // why D-H's "both at count_unknown" reads wrong for it. What the wiring buys
+                // here is the counts asserted below plus the disappearance of `count_unknown`
+                // from the reason chain.
+                //
+                // Card 22 corrects D-I's recorded cause: it is NOT "neither has a WHERE clause
+                // yet". Both selectors declare `required_columns`
+                // `private.memory_records.task_id` / `.facet`, and neither column exists
+                // (measured 2026-09-17), so the column probe marks them Unavailable before the
+                // WHERE dispatch is reached — `context_repo.rs`'s `other =>` arm is unreachable
+                // code. Turning this row into `semantic_bounded` needs two schema columns and,
+                // for the facets selector, a §25.2↔§24 alignment clause §25.4 does not yet
+                // have — see ADR-0044 D-G, not a WHERE clause.
                 for (route, tool, arguments, class, reason) in [
                     (
                         "memory.get",
@@ -2217,6 +2225,49 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                         value["pipeline"]["knowledge"]["count_scope"],
                         if expect_counts { "stream_ledger" } else { "authorized_view" },
                         "{route}: {value}"
+                    );
+                }
+
+                // Card 22 review fix — pin the CAUSE, not just the symptom.
+                //
+                // The row above asserts `context.assemble = cannot_establish/lane_failed`.
+                // That is today's truth, but asserting only the symptom lets ADR-0041 D-I rot:
+                // the day the two columns land, the class moves and this suite goes red with
+                // "expected cannot_establish" and no hint of why. So assert what the lane
+                // actually says. `handoff.unavailable_selectors` must be exactly the two §25
+                // selectors whose `required_columns` do not exist, naming those columns —
+                // which is a live readback of ADR-0044 D-G's diagnosis rather than a repeat of
+                // its prose, and turns red the moment either column is added, forcing the
+                // `context_repo.rs` WHERE clauses to be written in the same change.
+                {
+                    let (status, response) = tool_call(
+                        address,
+                        "context",
+                        &credential.bearer,
+                        json!({"workspace_id":workspace_id}),
+                    )
+                    .await;
+                    assert_eq!(status, 200, "context.assemble cause probe: {response}");
+                    let value = assert_tool_response(&response, ToolName::Context);
+                    assert_eq!(
+                        value["handoff"]["unavailable_selectors"],
+                        json!([
+                            ["task_explicit_context_v1", "private.memory_records.task_id"],
+                            [
+                                "required_current_state_facets_v1",
+                                "private.memory_records.facet"
+                            ]
+                        ]),
+                        "§22.4's lane trigger fires because these two selectors are \
+                         column-unavailable (ADR-0044 D-G), NOT because `context_repo.rs`'s \
+                         `other =>` arm has no WHERE clause — that arm is unreachable while \
+                         the probe answers first. If this assertion fails because the columns \
+                         landed, the fix is the two selectors' predicates plus the §25.2↔§24 \
+                         alignment clause, not a looser assertion: {value}"
+                    );
+                    assert_eq!(
+                        value["content"]["completeness"]["reason"], "lane_failed",
+                        "the reason chain must still name the lane: {value}"
                     );
                 }
 
@@ -7766,7 +7817,7 @@ fn native_mcp_memory_pin_unpin_confirm_gate_acceptance() {
             );
             assert_eq!(
                 rejected.map(|outcome| outcome.binding_id),
-                Err(humaux_domain::error::ErrorCode::Conflict),
+                Err(ErrorCode::Conflict),
                 "a lease expired at finalize is rejected"
             );
             tokio::task::block_in_place(|| {
@@ -10292,6 +10343,98 @@ fn native_mcp_membership_suspend_rejects_bearer_on_next_request_and_last_owner_p
                                 "LAST_OWNER".into()
                             ),
                         ]
+                    );
+                });
+
+                // (6) Card 22 (card 21's folded debt): every §6.3 refusal carries its TYPED
+                // §52 D-B `ConflictReason` **code**, not just a SCREAMING_SNAKE label, and the
+                // code reaches a reader.
+                //
+                // Membership mutation has no MCP route — `SUPPORTED_OPERATION_KEYS` names the
+                // whole wired surface and no membership key is on it (§33 「工具面交付实况」),
+                // so there is no `structuredContent.reason` to put it in. The §77 audit row IS
+                // the observable surface of a refused membership mutation, so that is where
+                // `metadata.refusal_code` lands (`membership_repo::audit_row`).
+                //
+                // Three live refusals, one per variant, each with its own code. Fault
+                // injection: replace `error.conflict_reason().map(ConflictReason::code)` with a
+                // constant, a `None`, or a second hand-typed table and the distinctness +
+                // per-row equality assertions below go red — a label-only row cannot satisfy
+                // them, which is exactly the state card 21 left behind.
+                let mut expected_codes = Vec::new();
+                for (label, user, mutation, conflict) in [
+                    (
+                        "TRANSITION_NOT_ALLOWED",
+                        peer_user,
+                        MembershipMutation::Activate,
+                        MembershipConflict::TransitionNotAllowed,
+                    ),
+                    (
+                        "ALREADY_IN_STATE",
+                        owner_user,
+                        MembershipMutation::ChangeRole(MembershipRole::Owner),
+                        MembershipConflict::AlreadyInState,
+                    ),
+                ] {
+                    let refused =
+                        membership_apply(&handle, user, MembershipRequest::Mutate(mutation)).await;
+                    let Err(error) = refused else {
+                        panic!("{label}: expected a refusal, got {refused:?}");
+                    };
+                    assert_eq!(error.error_code(), ErrorCode::Conflict, "{label}");
+                    assert_eq!(
+                        error.conflict_reason(),
+                        Some(conflict.reason()),
+                        "{label}: the repo error must carry the typed reason"
+                    );
+                    assert!(
+                        format!("{error}").contains(&conflict.reason().code().to_string()),
+                        "{label}: Display must print the numeric code, not only the label: {error}"
+                    );
+                    expected_codes.push((
+                        label.to_string(),
+                        i32::from(conflict.reason().code()).to_string(),
+                    ));
+                }
+                // LAST_OWNER's two DENIED rows are already on the table from (5).
+                expected_codes.insert(
+                    0,
+                    (
+                        "LAST_OWNER".to_string(),
+                        i32::from(MembershipConflict::LastOwner.reason().code()).to_string(),
+                    ),
+                );
+                expected_codes.insert(0, expected_codes[0].clone());
+                tokio::task::block_in_place(|| {
+                    let rows: Vec<(String, Option<String>)> = handle
+                        .admin
+                        .query(
+                            "SELECT metadata->>'refusal', metadata->>'refusal_code' \
+                             FROM control.audit_events \
+                             WHERE tenant_id=$1 AND action LIKE 'MEMBERSHIP_%' AND result='DENIED' \
+                             ORDER BY audit_seq",
+                            &[&handle.tenant_id],
+                        )
+                        .expect("owner reads DENIED rows")
+                        .iter()
+                        .map(|r| (r.get(0), r.get(1)))
+                        .collect();
+                    let expected: Vec<(String, Option<String>)> = expected_codes
+                        .iter()
+                        .map(|(label, code)| (label.clone(), Some(code.clone())))
+                        .collect();
+                    assert_eq!(
+                        rows, expected,
+                        "every DENIED membership row carries its label AND its typed reason code"
+                    );
+                    // A mapping that answers one constant (or drops to NULL) cannot produce
+                    // three distinct codes for three distinct refusals.
+                    let distinct: BTreeSet<Option<String>> =
+                        rows.iter().map(|(_, code)| code.clone()).collect();
+                    assert_eq!(
+                        distinct.len(),
+                        3,
+                        "1201 / 1203 / 1204 must be three different numbers on the wire: {rows:?}"
                     );
                 });
                 stop_server(server).await.expect("server stops");

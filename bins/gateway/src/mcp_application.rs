@@ -51,7 +51,18 @@ use crate::{
 /// The only real MCP business routes currently available from Gateway. Confirm-gated
 /// destructive keys come from the closed `DestructiveOp` table (§78.2, ADR-0018), never a
 /// second literal.
-pub const SUPPORTED_OPERATION_KEYS: [&str; 15] = [
+///
+/// This list IS the delivery-point truth of the tool surface: the Baseline's
+/// 「工具面交付实况」 table (§33 Canonical MCP Tool Details) is checked against it by
+/// `xtask architecture-check`'s *tool surface truth* arm, in both directions, so a tool the
+/// document calls wired but this array does not carry (or the reverse) is a red gate rather
+/// than a silent drift.
+///
+/// Card 22 found it had already drifted: `memory.correct` / `memory.confirm` / `memory.reject`
+/// have had working dispatch arms since ADR-0025/ADR-0026, while this array still said 15 —
+/// nothing read it, so nothing noticed. The new gate also compares it against the `invoke`
+/// dispatch below, which is what makes that class of drift impossible to repeat.
+pub const SUPPORTED_OPERATION_KEYS: [&str; 18] = [
     "remember.put",
     "recall.search",
     "context.assemble",
@@ -64,6 +75,9 @@ pub const SUPPORTED_OPERATION_KEYS: [&str; 15] = [
     DestructiveOp::MemoryRestore.operation_key(),
     DestructiveOp::MemoryArchive.operation_key(),
     DestructiveOp::MemoryUnarchive.operation_key(),
+    DestructiveOp::MemoryCorrect.operation_key(),
+    DestructiveOp::MemoryConfirm.operation_key(),
+    DestructiveOp::MemoryReject.operation_key(),
     SubjectWriteOp::Register.operation_key(),
     SubjectWriteOp::LinkKey.operation_key(),
     AffectWriteOp::Annotate.operation_key(),

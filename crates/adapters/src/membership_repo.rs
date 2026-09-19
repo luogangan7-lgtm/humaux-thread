@@ -33,7 +33,7 @@
 //! `metadata`), `trace_id`, and `metadata.step_up_auth_context` — all supplied by the operator
 //! through [`AdminAction`], none defaulted (§78.1).
 
-use humaux_domain::error::ErrorCode;
+use humaux_domain::error::{ConflictReason, ErrorCode};
 use humaux_domain::identity::{
     MembershipConflict, MembershipMutation, MembershipRole, MembershipSnapshot, MembershipState,
     MembershipTransition,
@@ -160,6 +160,24 @@ impl MembershipRepoError {
             Self::InvalidInput | Self::Db(_) => "",
         }
     }
+
+    /// The typed §52 D-B `CONFLICT` sub-reason of a refused request, as the numeric code a
+    /// client switches on — `metadata.refusal_code` on the §77 audit row, and the number
+    /// [`Display`](std::fmt::Display) prints next to the label.
+    ///
+    /// Card 21 typed [`MembershipConflict::reason`] and card 22 puts it where a reader can see
+    /// it. Membership mutation has **no MCP route** — it is an admin-plane path
+    /// (`xtask member`, this repo), so there is no `structuredContent.reason` to carry it;
+    /// `bins/gateway/src/mcp_application.rs::SUPPORTED_OPERATION_KEYS` names the whole wired
+    /// surface and no membership key is on it. The audit row IS the observable surface of a
+    /// refused membership mutation, so that is where the code belongs. `NotFound` is
+    /// `ErrorCode::NotFound`, not a `CONFLICT`, and correctly has no reason code.
+    pub fn conflict_reason(&self) -> Option<ConflictReason> {
+        match self {
+            Self::Conflict(conflict) => Some(conflict.reason()),
+            Self::NotFound | Self::InvalidInput | Self::Db(_) => None,
+        }
+    }
 }
 
 impl From<sqlx::Error> for MembershipRepoError {
@@ -171,7 +189,12 @@ impl From<sqlx::Error> for MembershipRepoError {
 impl std::fmt::Display for MembershipRepoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Conflict(conflict) => write!(f, "CONFLICT {}", conflict.as_str()),
+            Self::Conflict(conflict) => write!(
+                f,
+                "CONFLICT {} ({})",
+                conflict.as_str(),
+                conflict.reason().code()
+            ),
             Self::NotFound => f.write_str("NOT_FOUND"),
             Self::InvalidInput => f.write_str(
                 "INVALID_INPUT: actor, reason, ticket, trace_id and step_up_auth_context must \
@@ -510,7 +533,7 @@ async fn audit_row(
     admin: AdminAction<'_>,
 ) -> Result<Uuid, MembershipRepoError> {
     let mut risk_tags = vec![AUDIT_RISK_TAG.to_string()];
-    let (result, after, user_security_epoch, refusal) = match outcome {
+    let (result, after, user_security_epoch, refusal, refusal_code) = match outcome {
         Outcome::Applied {
             after,
             user_security_epoch,
@@ -518,9 +541,24 @@ async fn audit_row(
             if after.bumps_security_epoch {
                 risk_tags.push(AUDIT_RISK_TAG_EPOCH.to_string());
             }
-            (AUDIT_RESULT_SUCCESS, Some(after), user_security_epoch, None)
+            (
+                AUDIT_RESULT_SUCCESS,
+                Some(after),
+                user_security_epoch,
+                None,
+                None,
+            )
         }
-        Outcome::Refused(error) => (AUDIT_RESULT_DENIED, None, None, Some(error.refusal_str())),
+        // Card 22: the label AND the typed §52 D-B code. Both come from the one
+        // `ConflictReason` table (§78.2) — `refusal_str` is already derived from
+        // `reason().label()`, so the row can never carry a label and a code that disagree.
+        Outcome::Refused(error) => (
+            AUDIT_RESULT_DENIED,
+            None,
+            None,
+            Some(error.refusal_str()),
+            error.conflict_reason().map(ConflictReason::code),
+        ),
     };
     let requested_role = match request {
         MembershipRequest::Invite(role)
@@ -536,6 +574,7 @@ async fn audit_row(
         "requested_role": requested_role,
         "user_security_epoch": user_security_epoch,
         "refusal": refusal,
+        "refusal_code": refusal_code,
         "reason": admin.reason,
         "ticket": admin.ticket,
         "step_up_auth_context": admin.step_up_auth_context,
