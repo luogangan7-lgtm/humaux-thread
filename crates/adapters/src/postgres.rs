@@ -507,13 +507,34 @@ mod tests {
         Some(())
     }
 
-    /// `INSERT INTO t SELECT * FROM t WHERE false` is schema-agnostic (any column list) and
-    /// inserts zero rows either way — it isolates the *permission* check (which PostgreSQL
-    /// performs before executing the query) from having to know the table's real column
-    /// values, so this file needs no dependency on the §48 DDL task's exact row shapes.
+    /// The table's **insertable** columns, comma-separated.
+    ///
+    /// The probes below used a bare `SELECT *`, which stopped being schema-agnostic the moment
+    /// a table gained a `GENERATED ALWAYS ... STORED` column (`private.memory_records.facet`,
+    /// migration 0172): `*` expands to include it and PostgreSQL refuses "cannot insert a
+    /// non-DEFAULT value into column" — a shape error that has nothing to do with the
+    /// permission these probes exist to measure. Naming the non-generated columns keeps the
+    /// probe schema-agnostic for real and keeps the failure mode pinned on permissions.
+    async fn insertable_columns(pool: &PgPool, table: &str) -> String {
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT quote_ident(a.attname) FROM pg_attribute a               WHERE a.attrelid = $1::regclass AND a.attnum > 0                 AND NOT a.attisdropped AND a.attgenerated = ''               ORDER BY a.attnum",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| panic!("column list for {table}: {e}"));
+        assert!(!columns.is_empty(), "{table} has no insertable column");
+        columns.join(", ")
+    }
+
+    /// `INSERT INTO t (cols) SELECT cols FROM t WHERE false` inserts zero rows either way — it
+    /// isolates the *permission* check (which PostgreSQL performs before executing the query)
+    /// from having to know the table's real column values, so this file needs no dependency on
+    /// the §48 DDL task's exact row shapes.
     async fn insert_probe_ok(pool: &PgPool, table: &str) {
+        let columns = insertable_columns(pool, table).await;
         sqlx::query(&format!(
-            "INSERT INTO {table} SELECT * FROM {table} WHERE false"
+            "INSERT INTO {table} ({columns}) SELECT {columns} FROM {table} WHERE false"
         ))
         .execute(pool)
         .await
@@ -541,8 +562,9 @@ mod tests {
              ..) reports true"
         );
 
+        let columns = insertable_columns(pool, table).await;
         let err = sqlx::query(&format!(
-            "INSERT INTO {table} SELECT * FROM {table} WHERE false"
+            "INSERT INTO {table} ({columns}) SELECT {columns} FROM {table} WHERE false"
         ))
         .execute(pool)
         .await

@@ -33,7 +33,7 @@ use humaux_domain::{
     affect::{AffectAnnotation, AffectKind, BasisPoints, EmotionLabel},
     audit::{AuditEvent, AuditEventId, AuditMetadata, McpAuditAction},
     authority::{AuthorityClass, AuthorityStatus},
-    context::ContextBudget,
+    context::{ContextBudget, SelectorId, SelectorOutcome},
     dataclass::DataClass,
     error::ErrorCode,
     evidence::{EvidenceOriginClass, payload_sha256},
@@ -41,7 +41,7 @@ use humaux_domain::{
         AuthorizationScope, BoundedSet, MembershipConflict, MembershipMutation, MembershipRole,
         MembershipState, PrincipalId, VisibilityClass,
     },
-    ids::{TenantId, UserId, WorkspaceId},
+    ids::{Scope, TaskId, TenantId, UserId, WorkspaceId},
     memory::MemoryType,
 };
 use humaux_gateway::{
@@ -2102,26 +2102,18 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 // read) — whoever "finishes the job" by filling memory.get's five counts turns
                 // this row red instead of shipping a 500.
                 //
-                // `context.assemble` is the route that does NOT reach `semantic_bounded`, and
-                // the blocker is not its pipeline half: §22.4's lane trigger is checked inside
-                // `classify()` BEFORE `planner_output` is read at all, and this route's
-                // mandatory lane is `failed` on EVERY deployment because
-                // `context_repo::fetch_frozen_in_txn` emits `SelectorOutcome::Unavailable` for
-                // two of §25's five selectors (`TaskExplicitContextV1`,
-                // `RequiredCurrentStateFacetsV1`), so `handoff.unavailable_selectors` is never
-                // empty. That was already this route's answer before ADR-0041 D-H, which is
-                // why D-H's "both at count_unknown" reads wrong for it. What the wiring buys
-                // here is the counts asserted below plus the disappearance of `count_unknown`
-                // from the reason chain.
-                //
-                // Card 22 corrects D-I's recorded cause: it is NOT "neither has a WHERE clause
-                // yet". Both selectors declare `required_columns`
-                // `private.memory_records.task_id` / `.facet`, and neither column exists
-                // (measured 2026-09-17), so the column probe marks them Unavailable before the
-                // WHERE dispatch is reached — `context_repo.rs`'s `other =>` arm is unreachable
-                // code. Turning this row into `semantic_bounded` needs two schema columns and,
-                // for the facets selector, a §25.2↔§24 alignment clause §25.4 does not yet
-                // have — see ADR-0044 D-G, not a WHERE clause.
+                // `context.assemble` used to be the route that could not reach
+                // `semantic_bounded`, and the blocker was never its pipeline half: §22.4's lane
+                // trigger is checked inside `classify()` BEFORE `planner_output` is read at
+                // all, and this route's mandatory lane was `failed` on EVERY deployment because
+                // `context_repo` emitted `SelectorOutcome::Unavailable` for two of §25's five
+                // selectors. Card 22 corrected ADR-0041 D-I's recorded cause (it was NOT "no
+                // WHERE clause" — the probe answers before the dispatch, so that arm was
+                // unreachable code), and card 22b (ADR-0045) closed it: migration 0172 added
+                // `private.memory_records.facet` as a STORED generated column and the task
+                // selector's dependency moved to `private.context_bindings`, so all five
+                // selectors run. This row therefore no longer pins a class literal — see the
+                // tuple below and the `unavailable_selectors == []` probe after the loop.
                 for (route, tool, arguments, class, reason) in [
                     (
                         "memory.get",
@@ -2138,11 +2130,20 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                         Value::Null,
                     ),
                     (
+                        // Card 22b (ADR-0045): this route's class is no longer pinned to a
+                        // literal here. §22.4's lane trigger used to decide it on EVERY
+                        // deployment — two selectors were column-unavailable, so the answer was
+                        // always cannot_establish/lane_failed regardless of anything else this
+                        // fixture set up. With all five selectors running, the class is decided
+                        // by the planner/pipeline legs this same fixture pins row by row above,
+                        // and pinning a second literal here would just re-assert those.
+                        // The empty `class` selects the "must not be lane_failed" branch below,
+                        // which is the actual card-22b acceptance.
                         "context.assemble",
                         "context",
                         json!({"workspace_id":workspace_id}),
-                        "cannot_establish",
-                        json!("lane_failed"),
+                        "",
+                        Value::Null,
                     ),
                 ] {
                     let (status, response) =
@@ -2183,14 +2184,25 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                         value["completeness"]["reason"], "index_count_unavailable",
                         "{route}: {value}"
                     );
-                    assert_eq!(
-                        value["completeness"]["class"], class,
-                        "{route} must answer {class}: {value}"
-                    );
-                    assert_eq!(
-                        value["completeness"]["reason"], reason,
-                        "{route}: {value}"
-                    );
+                    if class.is_empty() {
+                        // Card 22b acceptance: whatever the class is, it must not be the
+                        // structural lane failure this card removed.
+                        assert_ne!(
+                            value["completeness"]["reason"], "lane_failed",
+                            "{route}: §25's five selectors all run since migration 0172 + \
+                             ADR-0045; a lane_failed here means a selector went Unavailable \
+                             again: {value}"
+                        );
+                    } else {
+                        assert_eq!(
+                            value["completeness"]["class"], class,
+                            "{route} must answer {class}: {value}"
+                        );
+                        assert_eq!(
+                            value["completeness"]["reason"], reason,
+                            "{route}: {value}"
+                        );
+                    }
                     // The two routes that moved carry real `stream_ledger` readings of this
                     // fixture's three settled rows; `memory.get` carries none, on purpose.
                     if route != "memory.get" {
@@ -2228,17 +2240,17 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                     );
                 }
 
-                // Card 22 review fix — pin the CAUSE, not just the symptom.
+                // Card 22 pinned the CAUSE, not just the symptom; card 22b (ADR-0045) closed
+                // the cause and this block is the readback of that, in the same place.
                 //
-                // The row above asserts `context.assemble = cannot_establish/lane_failed`.
-                // That is today's truth, but asserting only the symptom lets ADR-0041 D-I rot:
-                // the day the two columns land, the class moves and this suite goes red with
-                // "expected cannot_establish" and no hint of why. So assert what the lane
-                // actually says. `handoff.unavailable_selectors` must be exactly the two §25
-                // selectors whose `required_columns` do not exist, naming those columns —
-                // which is a live readback of ADR-0044 D-G's diagnosis rather than a repeat of
-                // its prose, and turns red the moment either column is added, forcing the
-                // `context_repo.rs` WHERE clauses to be written in the same change.
+                // Before: `handoff.unavailable_selectors` named the two §25 selectors whose
+                // `required_columns` did not exist, and §22.4's lane trigger therefore answered
+                // `lane_failed` on EVERY deployment. Migration 0172 landed
+                // `private.memory_records.facet` (a STORED generated column) and the registry's
+                // task dependency moved to `private.context_bindings`, so all five selectors
+                // run. Asserting the EMPTY list — not "not the old two" — is what keeps this
+                // honest: a selector that goes unavailable for any new reason turns it red and
+                // names the object it could not find.
                 {
                     let (status, response) = tool_call(
                         address,
@@ -2251,23 +2263,14 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                     let value = assert_tool_response(&response, ToolName::Context);
                     assert_eq!(
                         value["handoff"]["unavailable_selectors"],
-                        json!([
-                            ["task_explicit_context_v1", "private.memory_records.task_id"],
-                            [
-                                "required_current_state_facets_v1",
-                                "private.memory_records.facet"
-                            ]
-                        ]),
-                        "§22.4's lane trigger fires because these two selectors are \
-                         column-unavailable (ADR-0044 D-G), NOT because `context_repo.rs`'s \
-                         `other =>` arm has no WHERE clause — that arm is unreachable while \
-                         the probe answers first. If this assertion fails because the columns \
-                         landed, the fix is the two selectors' predicates plus the §25.2↔§24 \
-                         alignment clause, not a looser assertion: {value}"
+                        json!([]),
+                        "all five §25 selectors must be column-available since 0172 + ADR-0045; \
+                         a non-empty list names the probed object that is missing — fix that \
+                         object, do not loosen this: {value}"
                     );
-                    assert_eq!(
+                    assert_ne!(
                         value["content"]["completeness"]["reason"], "lane_failed",
-                        "the reason chain must still name the lane: {value}"
+                        "the lane no longer fails structurally: {value}"
                     );
                 }
 
@@ -2590,16 +2593,18 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 // and they disagree, which is a different verdict from `count_unknown`) and
                 // never with a `semantic_bounded` that outlives its evidence.
                 //
-                // For `context.assemble` the class cannot move, and saying so is the point:
-                // §22.4's lane trigger already holds it at `lane_failed` (see the three-route
-                // loop above), and `classify()` checks lane before planner, so its class is
-                // insensitive to this fault by construction. What must still move are the two
-                // blocks — a route that kept reporting `eligible = 3` here would be publishing
-                // a reading it did not take.
+                // Card 22b (ADR-0045): `context.assemble` is no longer held at `lane_failed`
+                // by §22.4's lane trigger (all five selectors run), so `classify()` reaches the
+                // pipeline leg and this fault now moves its class exactly like recall's —
+                // §23.3④'s `pipeline_count_mismatch`. Before card 22b the class was pinned to
+                // `lane_failed` here and was insensitive to the fault by construction; that
+                // insensitivity was the structural defect, not a guarantee. The two blocks
+                // must move as well — a route that kept reporting `eligible = 3` here would be
+                // publishing a reading it did not take.
                 for (route, tool, class, reason, arguments) in [
                     ("recall.search", "recall", "cannot_establish", "pipeline_count_mismatch",
                      json!({"query":query,"workspace_id":workspace_id,"mode":"semantic"})),
-                    ("context.assemble", "context", "cannot_establish", "lane_failed",
+                    ("context.assemble", "context", "cannot_establish", "pipeline_count_mismatch",
                      json!({"workspace_id":workspace_id})),
                 ] {
                     let (status, faulted) =
@@ -3450,7 +3455,6 @@ fn native_mcp_context_preserves_governance_on_overflow_and_rejects_unimplemented
                 for arguments in [
                     json!({"workspace_id":handle.workspace_id,"query":"explicitly unsupported"}),
                     json!({"workspace_id":handle.workspace_id,"limit":1}),
-                    json!({"workspace_id":handle.workspace_id,"task_id":Uuid::now_v7()}),
                 ] {
                     CanonicalCatalog::load()
                         .expect("catalog")
@@ -3471,6 +3475,30 @@ fn native_mcp_context_preserves_governance_on_overflow_and_rejects_unimplemented
                     );
                     assert_eq!(durable_counts(blocking_counts(&mut handle)), before);
                 }
+                // `task_id` is SERVED since the card-22b review fix (it is the §25.4.A(7)
+                // TaskId the two binding-backed selectors read), so it is no longer on the
+                // fail-closed list above. It is resolved instead: this fixture seeds no
+                // `coord.tasks` row, so a fresh uuid names no task of this tenant and the
+                // route answers NOT_FOUND rather than assembling as if no task was asked for.
+                let (status, unresolved_task) = raw_request(
+                    address,
+                    &headers,
+                    &rpc(
+                        77,
+                        "tools/call",
+                        call_params(
+                            "context",
+                            json!({"workspace_id":handle.workspace_id,"task_id":Uuid::now_v7()}),
+                        ),
+                    ),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "task_id is a served argument now: {unresolved_task}"
+                );
+                assert_tool_error(&unresolved_task, "NOT_FOUND");
+
                 let before = durable_counts(blocking_counts(&mut handle));
                 let (status, invalid) = raw_request(
                     address,
@@ -7777,6 +7805,10 @@ fn native_mcp_memory_pin_unpin_confirm_gate_acceptance() {
                 reservation_ttl: Duration::from_secs(1),
                 memory: humaux_domain::authority::MemoryId(x.memory_id),
                 workspace: WorkspaceId(workspace),
+                // card 22b: pin/unpin carry no TASK dimension and no replacement (the
+                // validator rejects either on this pair).
+                task: None,
+                replaces_binding_id: None,
                 claim: humaux_adapters::confirm_token_repo::ConfirmationClaim {
                     op: humaux_domain::confirm::DestructiveOp::MemoryUnpin,
                     target_id: x.memory_id,
@@ -7875,6 +7907,776 @@ fn native_mcp_memory_pin_unpin_confirm_gate_acceptance() {
             tokio::task::block_in_place(|| assert_eq!(pinned_rows(&mut handle, x.memory_id), (0, None)));
 
             stop_server(server).await.expect("stop pin server");
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------------------
+// card 22b / §25.4.A: memory.bind, the facet projection, and the two selectors that used to
+// be column-unavailable. ADR-0045.
+// ---------------------------------------------------------------------------------------
+
+/// §78.1 registered GOLDEN (ruling §五.2), 12 entries, written out by hand. It is NOT computed
+/// from `humaux_domain::memory::facet_for` on purpose: a witness that calls the production
+/// mapping cannot notice the production mapping changing.
+const FACET_GOLDEN: [(&str, Option<&str>); 12] = [
+    ("FACT", None),
+    ("PREFERENCE", None),
+    ("DECISION", Some("decisions")),
+    ("REJECTION", Some("decisions")),
+    ("STATE", Some("state")),
+    ("ISSUE", Some("issues")),
+    ("LESSON", None),
+    ("CONSTRAINT", Some("constraints")),
+    ("PROCEDURE", None),
+    ("OUTCOME", None),
+    ("REFERENCE", None),
+    ("NOTE", None),
+];
+
+fn golden_facet(memory_type: &str) -> Option<&'static str> {
+    FACET_GOLDEN
+        .into_iter()
+        .find(|(label, _)| *label == memory_type)
+        .expect("memory_type outside the closed set")
+        .1
+}
+
+/// A real `coord.tasks` row of this tenant. §25.4.A(7)'s TaskId is RESOLVED
+/// (`context_repo::resolve_task_in_txn`) on both the bind write path and the assemble read
+/// path, so a fixture task is a row now, not just a fresh uuid.
+fn seed_task(handle: &mut Handle, title: &str) -> Uuid {
+    handle
+        .admin
+        .query_one(
+            "INSERT INTO coord.tasks(tenant_id,title) VALUES($1,$2) RETURNING task_id",
+            &[&handle.tenant_id, &title],
+        )
+        .expect("owner seeds a coord task")
+        .get(0)
+}
+
+/// A workspace-shared memory that `authorize_mandatory` can actually grant: `ProjectConstraint`
+/// authority with a `TenantAdmin` Evidence origin, which is the one §10.1 ceiling cell that
+/// reaches `ProjectConstraint` for any memory type. No binding row — `memory.bind` writes it.
+fn seed_bindable_memory(handle: &mut Handle, memory_type: &str) -> Uuid {
+    // One transaction: §8.6's DEFERRED `check_memory_has_evidence` trigger fires at COMMIT, so a
+    // Memory row committed before its `memory_evidence` link is an orphan and is refused.
+    let mut txn = handle
+        .admin
+        .transaction()
+        .expect("begin bindable-memory seed");
+    let evidence_id: Uuid = txn
+        .query_one(
+            "INSERT INTO private.evidence_objects \
+               (tenant_id,evidence_kind,payload_sha256,data_class,origin_class, \
+                visibility_class,visibility_workspace_id,reasoning_domain_id) \
+             VALUES($1,'EVENT',$2,'INTERNAL','TenantAdmin','WORKSPACE_SHARED',$3,$4) \
+             RETURNING evidence_id",
+            &[
+                &handle.tenant_id,
+                &Sha256::digest(Uuid::now_v7().as_bytes()).to_vec(),
+                &handle.workspace_id,
+                &handle.reasoning_domain_id,
+            ],
+        )
+        .expect("owner seeds tenant-admin evidence")
+        .get(0);
+    let confidence: f32 = 0.9;
+    let memory_id: Uuid = txn
+        .query_one(
+            &format!(
+                "INSERT INTO private.memory_records \
+                   (tenant_id,memory_type,content,visibility_class,visibility_workspace_id, \
+                    authority_class,confidence,status,asserted_at) \
+                 VALUES($1,'{memory_type}',$2,'WORKSPACE_SHARED',$3,'ProjectConstraint',$4, \
+                        'active',clock_timestamp()) RETURNING memory_id"
+            ),
+            &[
+                &handle.tenant_id,
+                &json!({"fixture": "card 22b selector witness", "memory_type": memory_type}),
+                &handle.workspace_id,
+                &confidence,
+            ],
+        )
+        .expect("owner seeds bindable memory")
+        .get(0);
+    txn.execute(
+        "INSERT INTO private.memory_evidence(memory_id,evidence_id,role,grounding_mode) \
+         VALUES($1,$2,'PRIMARY','SNAPSHOT')",
+        &[&memory_id, &evidence_id],
+    )
+    .expect("owner links witness memory to evidence");
+    txn.commit().expect("commit bindable-memory seed");
+    memory_id
+}
+
+// The four binding ops' full wire shape in one helper: action + memory + task + the two
+// optional arguments (`confirm_token`, `replaces_binding_id`). Splitting it would hide which
+// call carries which optional argument, which is exactly what the replacement tests assert.
+#[allow(clippy::too_many_arguments)]
+async fn task_binding_call(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    action: &str,
+    memory_id: Uuid,
+    task_id: Uuid,
+    token: Option<&str>,
+    replaces_binding_id: Option<Uuid>,
+) -> (u16, Value) {
+    let mut arguments = json!({ "action": action, "memory_id": memory_id, "task_id": task_id });
+    if let Some(token) = token {
+        arguments["confirm_token"] = Value::String(token.to_owned());
+    }
+    if let Some(replaced) = replaces_binding_id {
+        arguments["replaces_binding_id"] = Value::String(replaced.to_string());
+    }
+    raw_request(
+        address,
+        &tool_call_headers("memory", bearer),
+        &rpc(request_id, "tools/call", call_params("memory", arguments)),
+    )
+    .await
+}
+
+/// The full two-call confirm flow of `memory.bind`: mint, then execute. Returns the binding id.
+async fn bind_through_the_gate(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    memory_id: Uuid,
+    task_id: Uuid,
+) -> Uuid {
+    let (status, minted) = task_binding_call(
+        address, bearer, request_id, "bind", memory_id, task_id, None, None,
+    )
+    .await;
+    assert_eq!(status, 200, "bind mint: {minted}");
+    let structured = assert_tool_response(&minted, ToolName::Memory);
+    assert_eq!(structured["confirmation_required"], true, "{minted}");
+    assert_eq!(structured["operation"], "memory.bind", "{minted}");
+    let token = structured["confirm_token"]
+        .as_str()
+        .expect("confirm_token string")
+        .to_owned();
+
+    let (status, bound) = task_binding_call(
+        address,
+        bearer,
+        request_id + 1,
+        "bind",
+        memory_id,
+        task_id,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "bind execute: {bound}");
+    let structured = assert_tool_response(&bound, ToolName::Memory);
+    assert_eq!(structured["memory_id"], memory_id.to_string(), "{bound}");
+    assert_eq!(structured["mode"], "MANDATORY", "{bound}");
+    assert_eq!(structured["state"], "bound", "{bound}");
+    assert_eq!(structured["inserted"], true, "{bound}");
+    assert_eq!(structured["scope"]["kind"], "TASK", "{bound}");
+    assert_eq!(structured["scope"]["id"], task_id.to_string(), "{bound}");
+    Uuid::parse_str(structured["binding_id"].as_str().expect("binding_id")).expect("uuid")
+}
+
+/// Per-selector `(nominated, admitted)` id sets, read back **before the lane merges them**
+/// through the production registry + selector adapter (`context_repo::selector_outcomes`).
+///
+/// The merged `MandatoryLane` dedupes by memory identity, so "Facets(W) is exactly these three"
+/// is unreadable there — the State row nominated by two selectors survives as one. Ruling §五.3
+/// is explicit about why that matters: with only the final union asserted, breaking the STATE
+/// arm of the generated expression is masked by another lane putting the same row back.
+async fn selector_id_sets(
+    dsn: &str,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    task_id: Option<Uuid>,
+) -> BTreeMap<SelectorId, (BTreeSet<Uuid>, BTreeSet<Uuid>)> {
+    // The production selector path runs on the request pool, so read it back as the real
+    // `role_gateway` (same `options=-c role=X` helper the consolidation witness uses) — a
+    // superuser readback would bypass the RLS these selectors depend on.
+    let pool = RuntimeDbPool::connect(&dsn_as_role(dsn, "role_gateway"))
+        .await
+        .expect("runtime pool for the selector readback");
+    let authorization = AuthorizationScope::new(
+        TenantId(tenant_id),
+        PrincipalId::new(),
+        Some(UserId(user_id)),
+        BoundedSet::new([WorkspaceId(workspace_id)]).expect("bounded workspace grant set"),
+    );
+    let scope = Scope {
+        tenant_id: TenantId(tenant_id),
+        user_id: Some(UserId(user_id)),
+        workspace_id: Some(WorkspaceId(workspace_id)),
+        repository_id: None,
+        task_id: task_id.map(TaskId),
+        run_id: None,
+        agent_id: None,
+    };
+    let outcomes = humaux_adapters::context_repo::selector_outcomes(&pool, &authorization, &scope)
+        .await
+        .expect("per-selector readback");
+    outcomes
+        .into_iter()
+        .map(|outcome| match outcome {
+            SelectorOutcome::Ran {
+                id,
+                candidate_ids,
+                rows,
+                ..
+            } => (
+                id,
+                (
+                    candidate_ids.into_iter().map(|m| m.0).collect(),
+                    rows.iter().map(|row| row.memory_id().0).collect(),
+                ),
+            ),
+            SelectorOutcome::Unavailable { id, missing_object } => {
+                panic!("{id:?} is still column-unavailable ({missing_object}) — card 22b was supposed to close exactly this");
+            }
+        })
+        .collect()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One HTTP fixture carries the whole card-22b acceptance.
+fn native_mcp_memory_bind_task_and_facet_selector_exact_sets_acceptance() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>(
+        "native_mcp_memory_bind_task_and_facet_selectors",
+        |mut handle| {
+            handle.assert_gateway_login();
+            let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("fixture ran, so the DSN is set");
+            let prefix = format!("mbind{}", &Uuid::now_v7().simple().to_string()[..11]);
+            let wire = format!("{prefix}.{}", "e".repeat(32));
+            let credential = handle.seed_synthetic_service_credential_and_window(
+                SyntheticCredentialScopes::RememberWriteAndContextRead,
+                &prefix,
+                &wire,
+                &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+                64,
+            );
+
+            // Ruling §五.1's fixture. Two DIFFERENT tasks, and a third memory whose type repeats
+            // S's: without `state_u`, a selector that filtered by TYPE instead of by TASK would
+            // produce the same {S} for Task(T) by luck.
+            let task_t = seed_task(&mut handle, "card 22b task T");
+            let task_u = seed_task(&mut handle, "card 22b task U");
+            let s = seed_bindable_memory(&mut handle, "STATE");
+            let d = seed_bindable_memory(&mut handle, "DECISION");
+            let state_u = seed_bindable_memory(&mut handle, "STATE");
+            // A NOTE row: facet NULL, so it must stay OUT of the facets selector no matter how
+            // visible it is. The negative control for "facet IS NOT NULL is actually filtering".
+            let note = seed_bindable_memory(&mut handle, "NOTE");
+
+            // The stored facet of each seeded row against the independent GOLDEN, through the real
+            // generated column. Mutant `Rejection -> NULL`, or a dropped STATE arm, turns this red.
+            tokio::task::block_in_place(|| {
+                for (memory_id, memory_type) in [
+                    (s, "STATE"),
+                    (d, "DECISION"),
+                    (state_u, "STATE"),
+                    (note, "NOTE"),
+                ] {
+                    let facet: Option<String> = handle
+                        .admin
+                        .query_one(
+                            "SELECT facet FROM private.memory_records WHERE memory_id=$1",
+                            &[&memory_id],
+                        )
+                        .expect("owner reads the generated facet")
+                        .get(0);
+                    assert_eq!(
+                        facet.as_deref(),
+                        golden_facet(memory_type),
+                        "generated facet for {memory_type} disagrees with the §78.1 GOLDEN"
+                    );
+                }
+            });
+
+            let runtime_handle = handle.rt.handle().clone();
+            let runtime = runtime_handle
+                .block_on(handle.fresh_runtime())
+                .expect("checked bind runtime");
+            let app = application(&handle, runtime);
+            runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let bearer = credential.bearer.as_str();
+            let workspace = handle.workspace_id;
+            let user_id = handle.user_id;
+
+            // (a) the gate: the first call mints and writes nothing, and a token minted for a
+            // DIFFERENT op does not execute a bind. There is no raw INSERT anywhere here.
+            let (status, minted) =
+                task_binding_call(address, bearer, 1, "bind", s, task_t, None, None).await;
+            assert_eq!(status, 200, "bind mint must be a success-shaped result: {minted}");
+            let minted = assert_tool_response(&minted, ToolName::Memory);
+            assert_eq!(minted["confirmation_required"], true, "{minted}");
+            assert_eq!(minted["operation"], "memory.bind", "{minted}");
+            // §25.4.A(7)/(8): the token is bound to the PAIR, so the task is named in target.
+            assert_eq!(minted["target"]["memory_id"], s.to_string(), "{minted}");
+            assert_eq!(minted["target"]["task_id"], task_t.to_string(), "{minted}");
+            let stray = mint_binding_token(address, bearer, 2, "pin", s).await;
+            let (status, wrong_op) =
+                task_binding_call(address, bearer, 3, "bind", s, task_t, Some(&stray), None).await;
+            assert_eq!(status, 200, "{wrong_op}");
+            assert_tool_error(&wrong_op, "CONFLICT");
+            // The pair binding, load-bearing: a confirmation minted for (S, T) must not execute
+            // (S, U). Dropping `successor_id` from the gate turns this green-by-accident.
+            let pair_token = minted["confirm_token"].as_str().expect("token").to_owned();
+            let (status, wrong_task) =
+                task_binding_call(address, bearer, 4, "bind", s, task_u, Some(&pair_token), None).await;
+            assert_eq!(status, 200, "{wrong_task}");
+            assert_tool_error(&wrong_task, "CONFLICT");
+            tokio::task::block_in_place(|| {
+                let bound: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM private.context_bindings \
+                         WHERE tenant_id=$1 AND mode='MANDATORY' AND scope_kind='TASK' \
+                           AND revoked_at IS NULL",
+                        &[&handle.tenant_id],
+                    )
+                    .expect("owner counts task bindings")
+                    .get(0);
+                assert_eq!(bound, 0, "a pin confirmation must not execute a bind");
+            });
+
+            // (b) the three bindings, each THROUGH memory.bind's confirm flow.
+            let binding_s = bind_through_the_gate(address, bearer, 10, s, task_t).await;
+            bind_through_the_gate(address, bearer, 20, d, task_u).await;
+            bind_through_the_gate(address, bearer, 30, state_u, task_u).await;
+
+            // (c) per-selector EXACT id sets, before the merge.
+            let sets = selector_id_sets(&dsn, handle.tenant_id, user_id, workspace, Some(task_t)).await;
+
+            let facets = sets
+                .get(&SelectorId::RequiredCurrentStateFacetsV1)
+                .expect("facets selector ran");
+            let expected_facets: BTreeSet<Uuid> = [s, d, state_u].into_iter().collect();
+            assert_eq!(facets.1, expected_facets, "Facets(W) admitted set");
+            assert_eq!(
+                facets.0, facets.1,
+                "§25.4.A(10): facets nominated == admitted here, so unresolved is empty"
+            );
+            assert!(!facets.1.contains(&note), "a NULL-facet memory must not be nominated");
+            // observed facets, derived from the exact admitted set through the INDEPENDENT
+            // golden — §25.4.A(10): the observed set never defines the required set, so this is
+            // a readback of what came out, not a completeness claim.
+            let observed: BTreeSet<&str> = [(s, "STATE"), (d, "DECISION"), (state_u, "STATE")]
+                .into_iter()
+                .filter(|(id, _)| facets.1.contains(id))
+                .filter_map(|(_, memory_type)| golden_facet(memory_type))
+                .collect();
+            assert_eq!(
+                observed,
+                ["state", "decisions"].into_iter().collect::<BTreeSet<&str>>()
+            );
+
+            let explicit = sets
+                .get(&SelectorId::ExplicitMandatoryBindingsV1)
+                .expect("explicit bindings selector ran");
+            // THE task filter, load-bearing: task U's two targets are bound MANDATORY and are
+            // equally visible, and exactly one of the three comes back. Dropping `scope_id`
+            // from the predicate returns all three.
+            assert_eq!(
+                explicit.1,
+                [s].into_iter().collect::<BTreeSet<Uuid>>(),
+                "ExplicitMandatoryBindings(T) must carry task T's target only"
+            );
+            assert_eq!(explicit.0, explicit.1, "no unresolved binding obligations");
+
+            // The task-scoped read with NO task in scope: the same bindings, zero admitted.
+            let no_task = selector_id_sets(&dsn, handle.tenant_id, user_id, workspace, None).await;
+            assert!(
+                no_task[&SelectorId::ExplicitMandatoryBindingsV1].1.is_empty(),
+                "a request without a task must not inherit a TASK binding"
+            );
+            assert_eq!(
+                no_task[&SelectorId::RequiredCurrentStateFacetsV1].1, expected_facets,
+                "the facets selector is workspace-scoped and does not depend on the task"
+            );
+
+            // §25.4.A(7)/(8) open debt, asserted rather than assumed (ADR-0045 "Open debt"):
+            // the task selector RUNS (that is this card's unlock) but admits nothing, because
+            // §10.1's ceiling table has no producer for `ExplicitTaskContext`, which is this
+            // selector's frozen `min_authority`. When that producer lands this goes red, which
+            // is exactly when the assertion should be rewritten rather than loosened.
+            let task_selector = sets
+                .get(&SelectorId::TaskExplicitContextV1)
+                .expect("task selector ran instead of being column-unavailable");
+            assert!(
+                task_selector.1.is_empty(),
+                "no memory can legitimately hold ExplicitTaskContext today (§10.1 rule 2 has no \
+                 producer; DOD-035 phase=14). If this is red, §10.1 gained one — assert the real \
+                 admitted set here instead of relaxing this"
+            );
+            assert_eq!(
+                task_selector.0,
+                [s].into_iter().collect::<BTreeSet<Uuid>>(),
+                "§25.4.A(9): the binding obligation is still REPORTED as an unresolved \
+                 nomination, never silently filtered into 'no obligations'"
+            );
+
+            // (d) the route class. Not `cannot_establish/lane_failed` any more, and the lane
+            // names no unavailable selector.
+            let (status, assembled) = raw_request(
+                address,
+                &tool_call_headers("context", bearer),
+                &rpc(40, "tools/call", call_params("context", json!({"workspace_id": workspace}))),
+            )
+            .await;
+            assert_eq!(status, 200, "context.assemble: {assembled}");
+            let value = assert_tool_response(&assembled, ToolName::Context);
+            assert_eq!(
+                value["handoff"]["unavailable_selectors"],
+                json!([]),
+                "all five §25 selectors must run now: {value}"
+            );
+            assert_ne!(
+                value["content"]["completeness"]["reason"], "lane_failed",
+                "the lane no longer fails: {value}"
+            );
+            // Deliberately NOT asserting completeness == complete (ruling §五.3): two selectors
+            // behaving is not a completeness proof.
+
+            // (d2) the TASK on the WIRE (card-22b review fix). Before this, `context.assemble`
+            // hard-coded `task_id: None` and rejected the argument as unsupported, so the task
+            // dimension existed only through the adapter's `selector_outcomes` entry point. Now
+            // the same argument the schema always carried reaches the Scope, and §25.4.A(7)'s
+            // resolution runs: a uuid that names no task of this tenant is NOT_FOUND, never a
+            // silently task-less assemble that would read as "this task has no obligations".
+            let (status, with_task) = raw_request(
+                address,
+                &tool_call_headers("context", bearer),
+                &rpc(
+                    41,
+                    "tools/call",
+                    call_params(
+                        "context",
+                        json!({"workspace_id": workspace, "task_id": task_t}),
+                    ),
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "task-scoped assemble: {with_task}");
+            let scoped = assert_tool_response(&with_task, ToolName::Context);
+            assert_eq!(
+                scoped["handoff"]["unavailable_selectors"],
+                json!([]),
+                "the task-scoped route runs all five selectors too: {scoped}"
+            );
+            assert_ne!(
+                scoped["content"]["completeness"]["reason"], "lane_failed",
+                "{scoped}"
+            );
+            let (status, unresolvable) = raw_request(
+                address,
+                &tool_call_headers("context", bearer),
+                &rpc(
+                    42,
+                    "tools/call",
+                    call_params(
+                        "context",
+                        json!({"workspace_id": workspace, "task_id": Uuid::now_v7()}),
+                    ),
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "{unresolvable}");
+            assert_tool_error(&unresolvable, "NOT_FOUND");
+
+            // (e) unbind revokes the binding row and nothing else; the selector drops it.
+            let (status, minted) =
+                task_binding_call(address, bearer, 50, "unbind", s, task_t, None, None).await;
+            assert_eq!(status, 200, "{minted}");
+            let token = assert_tool_response(&minted, ToolName::Memory)["confirm_token"]
+                .as_str()
+                .expect("confirm_token")
+                .to_owned();
+            let (status, unbound) =
+                task_binding_call(address, bearer, 51, "unbind", s, task_t, Some(&token), None).await;
+            assert_eq!(status, 200, "{unbound}");
+            let structured = assert_tool_response(&unbound, ToolName::Memory);
+            assert_eq!(structured["state"], "unbound", "{unbound}");
+            assert_eq!(structured["binding_id"], binding_s.to_string(), "{unbound}");
+            tokio::task::block_in_place(|| {
+                let (status_after, facet_after): (String, Option<String>) = {
+                    let row = handle
+                        .admin
+                        .query_one(
+                            "SELECT status, facet FROM private.memory_records WHERE memory_id=$1",
+                            &[&s],
+                        )
+                        .expect("owner rereads the memory");
+                    (row.get(0), row.get(1))
+                };
+                assert_eq!(status_after, "active", "unbind must not touch the Memory");
+                assert_eq!(facet_after.as_deref(), Some("state"));
+            });
+            let after = selector_id_sets(&dsn, handle.tenant_id, user_id, workspace, Some(task_t)).await;
+            assert!(
+                after[&SelectorId::ExplicitMandatoryBindingsV1].1.is_empty(),
+                "a revoked binding must leave the lane immediately"
+            );
+            assert_eq!(
+                after[&SelectorId::RequiredCurrentStateFacetsV1].1, expected_facets,
+                "unbind touches the binding only — the type-driven selector is unchanged"
+            );
+
+            stop_server(server).await.expect("stop bind server");
+        });
+        },
+    );
+}
+
+/// Executes an already-minted `memory.bind` that carries `replaces_binding_id` (§25.4.A(9)).
+async fn bind_replacing(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    memory_id: Uuid,
+    task_id: Uuid,
+    replaced: Uuid,
+) -> (u16, Value) {
+    let (status, minted) = task_binding_call(
+        address, bearer, request_id, "bind", memory_id, task_id, None, None,
+    )
+    .await;
+    assert_eq!(status, 200, "replacement mint: {minted}");
+    let token = assert_tool_response(&minted, ToolName::Memory)["confirm_token"]
+        .as_str()
+        .expect("confirm_token")
+        .to_owned();
+    task_binding_call(
+        address,
+        bearer,
+        request_id + 1,
+        "bind",
+        memory_id,
+        task_id,
+        Some(&token),
+        Some(replaced),
+    )
+    .await
+}
+
+/// Whether a binding row is still active, read as the owner.
+fn binding_is_active(handle: &mut Handle, binding_id: Uuid) -> bool {
+    handle
+        .admin
+        .query_one(
+            "SELECT revoked_at IS NULL FROM private.context_bindings WHERE context_binding_id=$1",
+            &[&binding_id],
+        )
+        .expect("owner reads the binding row")
+        .get(0)
+}
+
+/// §25.4.A(9) A->B replacement, and the blast radius the argument must NOT have.
+///
+/// `replaces_binding_id` is the only binding id `memory.bind` takes from the wire, and the
+/// confirm token binds (tenant, user, op, memory, task) — not this argument. So the revoke it
+/// drives has to be scoped to the same (TASK = this task, MANDATORY) dimension the token does
+/// cover. The three negative legs are the regression: before the fix each of them revoked the
+/// named row and returned `state: "bound"` — another task's MANDATORY binding, or any PINNED
+/// row in the tenant, destroyed by one legitimately-minted bind confirmation.
+#[test]
+#[allow(clippy::too_many_lines)] // One HTTP fixture carries all seven replacement legs.
+fn native_mcp_memory_bind_replacement_is_scoped_to_the_authorized_binding() {
+    run_db_fixture::<Fixture, _>("native_mcp_memory_bind_replacement_scope", |mut handle| {
+        handle.assert_gateway_login();
+        let prefix = format!("mrepl{}", &Uuid::now_v7().simple().to_string()[..11]);
+        let wire = format!("{prefix}.{}", "e".repeat(32));
+        let credential = handle.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &prefix,
+            &wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+            64,
+        );
+        let task_t = seed_task(&mut handle, "replacement task T");
+        let task_u = seed_task(&mut handle, "replacement task U");
+        let a = seed_bindable_memory(&mut handle, "STATE");
+        let b = seed_bindable_memory(&mut handle, "STATE");
+        let c = seed_bindable_memory(&mut handle, "DECISION");
+        let victim_u = seed_bindable_memory(&mut handle, "CONSTRAINT");
+        let victim_pinned = seed_bindable_memory(&mut handle, "ISSUE");
+
+        let runtime_handle = handle.rt.handle().clone();
+        let runtime = runtime_handle
+            .block_on(handle.fresh_runtime())
+            .expect("checked replacement runtime");
+        let app = application(&handle, runtime);
+        runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let bearer = credential.bearer.as_str();
+
+            let binding_a = bind_through_the_gate(address, bearer, 10, a, task_t).await;
+            let binding_u = bind_through_the_gate(address, bearer, 20, victim_u, task_u).await;
+            // A PINNED row of the same tenant, written through memory.pin's own confirm flow.
+            let pin_token = mint_binding_token(address, bearer, 30, "pin", victim_pinned).await;
+            let (status, pinned) =
+                binding_call(address, bearer, 31, "pin", victim_pinned, Some(&pin_token)).await;
+            assert_eq!(status, 200, "pin: {pinned}");
+            let binding_pinned = Uuid::parse_str(
+                assert_tool_response(&pinned, ToolName::Memory)["binding_id"]
+                    .as_str()
+                    .expect("binding_id"),
+            )
+            .expect("uuid");
+
+            // (1) another TASK's MANDATORY binding is out of reach.
+            let (status, cross_task) =
+                bind_replacing(address, bearer, 40, b, task_t, binding_u).await;
+            assert_eq!(status, 200, "{cross_task}");
+            assert_tool_error(&cross_task, "CONFLICT");
+            // (2) a PINNED/WORKSPACE row is out of reach.
+            let (status, cross_mode) =
+                bind_replacing(address, bearer, 42, b, task_t, binding_pinned).await;
+            assert_eq!(status, 200, "{cross_mode}");
+            assert_tool_error(&cross_mode, "CONFLICT");
+            // (3) a binding id that is not a binding at all.
+            let (status, nonexistent) =
+                bind_replacing(address, bearer, 44, b, task_t, Uuid::now_v7()).await;
+            assert_eq!(status, 200, "{nonexistent}");
+            assert_tool_error(&nonexistent, "CONFLICT");
+            // (4) replacing a binding with itself would revoke the very row the idempotent
+            //     `ReturnExisting` arm reports back as bound.
+            let (status, itself) = bind_replacing(address, bearer, 46, a, task_t, binding_a).await;
+            assert_eq!(status, 200, "{itself}");
+            assert_tool_error(&itself, "CONFLICT");
+
+            tokio::task::block_in_place(|| {
+                assert!(
+                    binding_is_active(&mut handle, binding_u),
+                    "task U's binding survived"
+                );
+                assert!(
+                    binding_is_active(&mut handle, binding_pinned),
+                    "the PINNED row survived"
+                );
+                assert!(
+                    binding_is_active(&mut handle, binding_a),
+                    "A's binding survived"
+                );
+                let active: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM private.context_bindings \
+                         WHERE tenant_id=$1 AND scope_kind='TASK' AND scope_id=$2 \
+                           AND mode='MANDATORY' AND revoked_at IS NULL",
+                        &[&handle.tenant_id, &task_t],
+                    )
+                    .expect("owner counts task T's bindings")
+                    .get(0);
+                assert_eq!(
+                    active, 1,
+                    "no refused replacement created B's binding either"
+                );
+            });
+
+            // (5) the authorized replacement: A revoked and B created in ONE transaction,
+            //     exactly one active MANDATORY row left on task T.
+            let (status, replaced) =
+                bind_replacing(address, bearer, 48, b, task_t, binding_a).await;
+            assert_eq!(status, 200, "{replaced}");
+            let structured = assert_tool_response(&replaced, ToolName::Memory);
+            assert_eq!(structured["state"], "bound", "{replaced}");
+            assert_eq!(structured["inserted"], true, "{replaced}");
+            assert_eq!(structured["memory_id"], b.to_string(), "{replaced}");
+            let binding_b = Uuid::parse_str(structured["binding_id"].as_str().expect("binding_id"))
+                .expect("uuid");
+            tokio::task::block_in_place(|| {
+                assert!(
+                    !binding_is_active(&mut handle, binding_a),
+                    "A must be revoked"
+                );
+                assert!(
+                    binding_is_active(&mut handle, binding_b),
+                    "B must be active"
+                );
+                let rows: Vec<Uuid> = handle
+                    .admin
+                    .query(
+                        "SELECT context_binding_id FROM private.context_bindings \
+                         WHERE tenant_id=$1 AND scope_kind='TASK' AND scope_id=$2 \
+                           AND mode='MANDATORY' AND revoked_at IS NULL",
+                        &[&handle.tenant_id, &task_t],
+                    )
+                    .expect("owner lists task T's active bindings")
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                assert_eq!(rows, vec![binding_b], "exactly one row, and it is B's");
+            });
+
+            // (6) replaying the same replacement: A is already revoked, zero rows affected,
+            //     so the second call is a Conflict and C never gets bound.
+            let (status, replay) = bind_replacing(address, bearer, 50, c, task_t, binding_a).await;
+            assert_eq!(status, 200, "{replay}");
+            assert_tool_error(&replay, "CONFLICT");
+            tokio::task::block_in_place(|| {
+                let bound_c: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM private.context_bindings \
+                         WHERE tenant_id=$1 AND memory_id=$2 AND revoked_at IS NULL",
+                        &[&handle.tenant_id, &c],
+                    )
+                    .expect("owner counts C's bindings")
+                    .get(0);
+                assert_eq!(
+                    bound_c, 0,
+                    "a failed replacement must not create the new binding"
+                );
+            });
+
+            // (7) §25.4.A(7): a TaskId that resolves to no task of this tenant cannot carry a
+            //     binding at all — the confirm flow runs, the write refuses with NOT_FOUND, and
+            //     no row is written under the invented scope.
+            let ghost_task = Uuid::now_v7();
+            let (status, minted) =
+                task_binding_call(address, bearer, 52, "bind", c, ghost_task, None, None).await;
+            assert_eq!(status, 200, "{minted}");
+            let token = assert_tool_response(&minted, ToolName::Memory)["confirm_token"]
+                .as_str()
+                .expect("confirm_token")
+                .to_owned();
+            let (status, unresolved) = task_binding_call(
+                address,
+                bearer,
+                53,
+                "bind",
+                c,
+                ghost_task,
+                Some(&token),
+                None,
+            )
+            .await;
+            assert_eq!(status, 200, "{unresolved}");
+            assert_tool_error(&unresolved, "NOT_FOUND");
+            tokio::task::block_in_place(|| {
+                let ghost_rows: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM private.context_bindings \
+                         WHERE tenant_id=$1 AND scope_kind='TASK' AND scope_id=$2",
+                        &[&handle.tenant_id, &ghost_task],
+                    )
+                    .expect("owner counts bindings under the ghost task")
+                    .get(0);
+                assert_eq!(ghost_rows, 0, "no binding under an unresolvable task");
+            });
+
+            stop_server(server).await.expect("stop replacement server");
         });
     });
 }

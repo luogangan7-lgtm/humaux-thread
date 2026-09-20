@@ -17,7 +17,8 @@
 //!    **不含任何可返回的 Context**。「截掉后半段还声称 complete」不是不该做的操作，
 //!    是那个臂里没有那个值可以返回。
 //!
-//! 写侧：MANDATORY 见 [`ElevatedActor`]——今天**没有铸造路径**。PINNED 见
+//! 写侧：MANDATORY 见 [`ElevatedActor`]——铸造路径是 `memory.bind` / `memory.unbind` 消费
+//! confirm_token 之后（card 22b, ADR-0045）。PINNED 见
 //! [`ConfirmedUserActor`]——唯一铸造点是 §33.10 规则 9 的 confirm_token 被消费之后（ADR-0019）。
 
 use crate::authority::{
@@ -38,7 +39,7 @@ use uuid::Uuid;
 
 /// §25.4 逐字点名的五个确定性 selector。**闭集**——加一个 selector 必须改这里，
 /// 编译器会逼所有 `match` 跟着改。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SelectorId {
     /// 任务显式指定的上下文。
     TaskExplicitContextV1,
@@ -117,12 +118,17 @@ pub struct SelectorSpec {
     pub positive_fixture: &'static str,
     /// 负夹具的测试函数名。
     pub negative_fixture: &'static str,
-    /// 这个 selector 需要哪些列才跑得起来：`(schema, table, column)`。
+    /// 这个 selector 需要哪些列才跑得起来：`(schema, table, column, stored_generated)`。
     ///
     /// domain 只声明名字，**不发查询**；`adapters::context_repo::probe_selectors` 拿它去比
-    /// `information_schema.columns`。列一落地 selector 自动可用，不需要有人回来改代码——
+    /// `pg_attribute`。列一落地 selector 自动可用，不需要有人回来改代码——
     /// 这是 ADR-0006 那条「NA 的缺失对象必须是探测出来的」在本模块的落点。
-    pub required_columns: &'static [(&'static str, &'static str, &'static str)],
+    ///
+    /// 第四项 `stored_generated`（card 22b / §25.4.A(11)）：`true` 要求该列必须是
+    /// `GENERATED ALWAYS ... STORED`（`pg_attribute.attgenerated = 's'`）。存在性不是契约
+    /// ——一个同名的**可写**列意味着 facet 有了独立写入口，那正是 §25.4.A(3) 禁止的东西，
+    /// 所以它必须探测成缺失而不是被当作可用。
+    pub required_columns: &'static [(&'static str, &'static str, &'static str, bool)],
 }
 
 /// §25.4 的五个 selector。**唯一真源**——`spec()` 之外没有第二处描述它们。
@@ -136,8 +142,17 @@ pub const REGISTRY: [SelectorSpec; 5] = [
         owner: "domain::context",
         positive_fixture: "task_explicit_context_positive",
         negative_fixture: "task_explicit_context_negative",
-        // §25.4 待交付：`private.memory_records` 今天没有 task 维度。
-        required_columns: &[("private", "memory_records", "task_id")],
+        // §25.4.A(7)/(11)（card 22b, ADR-0045）：task 关联**唯一**来自有效的 ContextBinding
+        // （`scope_kind='TASK'` / `mode='MANDATORY'` / `revoked_at IS NULL`），不来自
+        // `memory_records.task_id`——那一列不存在，也**不会**被加上：provenance（这条输入是在
+        // 任务 T 里摄入的）不等于 authority（这条记忆被授权为 T 的必带上下文）。探测因此登记
+        // 真实关系上的真实列；§25.4.A(11) 明文禁止继续探测 `memory_records.task_id`。
+        required_columns: &[
+            ("private", "context_bindings", "scope_kind", false),
+            ("private", "context_bindings", "scope_id", false),
+            ("private", "context_bindings", "mode", false),
+            ("private", "context_bindings", "revoked_at", false),
+        ],
     },
     SelectorSpec {
         id: SelectorId::ProjectActiveConstraintsV1,
@@ -149,8 +164,8 @@ pub const REGISTRY: [SelectorSpec; 5] = [
         positive_fixture: "project_active_constraints_positive",
         negative_fixture: "project_active_constraints_negative",
         required_columns: &[
-            ("private", "memory_records", "authority_class"),
-            ("private", "memory_records", "status"),
+            ("private", "memory_records", "authority_class", false),
+            ("private", "memory_records", "status", false),
         ],
     },
     SelectorSpec {
@@ -164,7 +179,7 @@ pub const REGISTRY: [SelectorSpec; 5] = [
         owner: "domain::context",
         positive_fixture: "user_confirmed_corrections_positive",
         negative_fixture: "user_confirmed_corrections_negative",
-        required_columns: &[("private", "evidence_objects", "origin_class")],
+        required_columns: &[("private", "evidence_objects", "origin_class", false)],
     },
     SelectorSpec {
         id: SelectorId::RequiredCurrentStateFacetsV1,
@@ -175,9 +190,11 @@ pub const REGISTRY: [SelectorSpec; 5] = [
         owner: "domain::context",
         positive_fixture: "required_current_state_facets_positive",
         negative_fixture: "required_current_state_facets_negative",
-        // §25.4 待交付：`memory_records` 无 facet 列；且 §25.2 的五 facet 与 §24 的九变体
-        // 之间没有对齐条款——**不猜映射**，猜错会让 G25-1 在小夹具上偶然变绿。
-        required_columns: &[("private", "memory_records", "facet")],
+        // §25.4.A（card 22b, ADR-0045）：对齐条款已写下——facet 是
+        // [`crate::memory::MandatoryContextFacet`] 的数据库投影，由 `memory_type` 唯一派生，
+        // 迁移 0172 落为 `GENERATED ALWAYS ... STORED`。第四项 `true` 就是「必须是生成列」
+        // 这条契约：可写的同名列 = facet 有了独立写入口 = §25.4.A(3) 被破坏。
+        required_columns: &[("private", "memory_records", "facet", true)],
     },
     SelectorSpec {
         id: SelectorId::ExplicitMandatoryBindingsV1,
@@ -197,8 +214,8 @@ pub const REGISTRY: [SelectorSpec; 5] = [
         positive_fixture: "explicit_mandatory_bindings_positive",
         negative_fixture: "explicit_mandatory_bindings_negative",
         required_columns: &[
-            ("private", "context_bindings", "mode"),
-            ("private", "context_bindings", "revoked_at"),
+            ("private", "context_bindings", "mode", false),
+            ("private", "context_bindings", "revoked_at", false),
         ],
     },
 ];
@@ -870,21 +887,59 @@ impl BindingMode {
 
 /// 建 MANDATORY binding 所需的提权 actor。
 ///
-/// **今天没有任何铸造函数，这是刻意的，也是唯一诚实的答案。** §25.4 要求
-/// 「普通 Agent 只能 propose，不能自己 promote」，而仓里现在拿不出能表达这个区分的东西：
-/// §6 的 `Principal` 全仓零命中；[`crate::identity::AuthorizationScope`] 没有角色轴，
-/// 唯一能用的 `user_id.is_some()` **判别方向还是反的**（它的 doc 明写：代用户行动的 agent
-/// 正是 `Some`，无特定用户的服务才是 `None`）。
+/// **唯一铸造点是 [`ElevatedActor::from_consumed_confirmation`]**（card 22b, ADR-0045），
+/// 形状与 [`ConfirmedUserActor`] 逐字对称：只认 [`DestructiveOp::MemoryBind`] /
+/// [`DestructiveOp::MemoryUnbind`]，且调用方必须**刚刚在同一事务里消费了**那条 memory 的
+/// confirm_token。字段私有、无 `Default`、无字面量构造，所以 consolidation / distiller /
+/// retention 代码即便拿到 [`BindingRequest`] 也造不出它。
 ///
-/// 与其放一个判反的门假装挡住了，不如把写路径结构性关死：MANDATORY binding 今天**建不出来**。
-/// §25.4 那条攻击路径（诱导 Agent 调一次 `memory.pin` 就把低 origin 内容永久钉进 Context）
-/// 因此不成立——不是因为门够严，是因为没有门可以走。
+/// 此前这里写的是「今天没有任何铸造函数」。那在 card 22b 之前是诚实的，但也意味着
+/// `task_explicit_context_v1` 的真源（TASK/MANDATORY binding）**永远建不出来**——
+/// 裁决 §三.2 把这一条点名了：「表结构表达关系，受控写入建立关系；单有表不证明关系已经被
+/// 合法建立」。所以铸造点必须存在，而不是继续用「没有门」冒充「门够严」。
 ///
-// ponytail: 铸造点等 §6 `Principal` 落地后加，加的同时必须配一条注错证明「普通 Agent
-// 拿不到它」。在那之前不要为了「让流程跑通」而加一个 `pub fn new()`。
+/// 它不是权威证明（§25.4.A(8)）：拿到 actor 只解锁「可以请求」，
+/// [`authorize_mandatory`] 仍然要在同一事务里用库里读出的 authority/type/basis 过
+/// [`AuthorityPolicy`]，并复核 `ProjectConstraint` 下限。§25.4 那条攻击路径（诱导 Agent
+/// 调一次写就把低 origin 内容永久钉进 Context）因此仍不成立——现在是因为门够严。
 #[derive(Debug)]
 pub struct ElevatedActor {
+    memory_id: MemoryId,
     _priv: (),
+}
+
+impl ElevatedActor {
+    /// ADR-0045 D-A：只在 `op` 是 bind / unbind 时铸造。别的 op（包括同样被门控的
+    /// [`DestructiveOp::MemoryPin`]）都是 `MissingConfirmation`——pin 的确认不是 bind 的确认。
+    ///
+    /// # Errors
+    /// `op` 不是 [`DestructiveOp::MemoryBind`] / [`DestructiveOp::MemoryUnbind`]。
+    pub const fn from_consumed_confirmation(
+        op: DestructiveOp,
+        memory_id: MemoryId,
+    ) -> Result<Self, CandidateRejection> {
+        match op {
+            DestructiveOp::MemoryBind | DestructiveOp::MemoryUnbind => Ok(Self {
+                memory_id,
+                _priv: (),
+            }),
+            DestructiveOp::MemorySupersede
+            | DestructiveOp::MemoryPin
+            | DestructiveOp::MemoryUnpin
+            | DestructiveOp::MemoryRestore
+            | DestructiveOp::MemoryArchive
+            | DestructiveOp::MemoryUnarchive
+            | DestructiveOp::MemoryCorrect
+            | DestructiveOp::MemoryConfirm
+            | DestructiveOp::MemoryReject => Err(CandidateRejection::MissingConfirmation),
+        }
+    }
+
+    /// 这次确认绑定的 memory。
+    #[must_use]
+    pub const fn memory_id(&self) -> MemoryId {
+        self.memory_id
+    }
 }
 
 /// 建 PINNED binding 所需的、经过交互确认的用户 actor（ADR-0019 D-A）。
@@ -930,7 +985,10 @@ impl ConfirmedUserActor {
             | DestructiveOp::MemoryUnarchive
             | DestructiveOp::MemoryCorrect
             | DestructiveOp::MemoryConfirm
-            | DestructiveOp::MemoryReject => Err(CandidateRejection::MissingConfirmation),
+            | DestructiveOp::MemoryReject
+            // card 22b: a bind confirmation is not a pin confirmation, in this direction too.
+            | DestructiveOp::MemoryBind
+            | DestructiveOp::MemoryUnbind => Err(CandidateRejection::MissingConfirmation),
         }
     }
 
@@ -1024,7 +1082,7 @@ pub const fn authorize_supplemental(
 /// 最后一条是 §25.4 的读取侧门：MANDATORY lane 只放得下 ProjectConstraint 及以上。
 pub fn authorize_mandatory(
     policy: &dyn AuthorityPolicy,
-    _actor: &ElevatedActor,
+    actor: &ElevatedActor,
     req: BindingRequest,
     memory_authority: AuthorityClass,
     memory_type: MemoryType,
@@ -1033,6 +1091,11 @@ pub fn authorize_mandatory(
 ) -> Result<BindingGrant, CandidateRejection> {
     if !matches!(req.mode, BindingMode::Mandatory) {
         return Err(CandidateRejection::OriginAuthorityCeiling);
+    }
+    // card 22b: the actor was minted against ONE memory's consumed confirmation. Taking X's
+    // confirmation to bind Y is `MissingConfirmation`, the same rule `authorize_pinned` runs.
+    if actor.memory_id() != req.memory_id {
+        return Err(CandidateRejection::MissingConfirmation);
     }
     let authorized = policy.authorize(memory_authority, memory_type, basis, scope)?;
     if (authorized.0 as u8) < (AuthorityClass::ProjectConstraint as u8) {
@@ -1895,7 +1958,10 @@ mod tests {
     /// 注错：把那条下限判定删掉 ⇒ 本条红。
     #[test]
     fn mandatory_requires_project_constraint_or_above_even_if_policy_allows() {
-        let actor = ElevatedActor { _priv: () };
+        let request = req(BindingMode::Mandatory);
+        let actor =
+            ElevatedActor::from_consumed_confirmation(DestructiveOp::MemoryBind, request.memory_id)
+                .expect("bind confirmation mints the elevated actor");
         let scope = scope_of(Uuid::now_v7(), None, None);
         let basis = NonEmptyVec::new(vec![EvidenceOriginClass::DirectUserInput]).expect("basis");
 
@@ -1904,7 +1970,7 @@ mod tests {
             authorize_mandatory(
                 &lenient,
                 &actor,
-                req(BindingMode::Mandatory),
+                request,
                 AuthorityClass::PrivateKnowledge,
                 MemoryType::Note,
                 basis.clone(),
@@ -1919,13 +1985,50 @@ mod tests {
             authorize_mandatory(
                 &strict,
                 &actor,
-                req(BindingMode::Mandatory),
+                request,
                 AuthorityClass::ProjectConstraint,
                 MemoryType::Note,
                 basis,
                 &scope,
             )
             .is_ok()
+        );
+    }
+
+    /// card 22b / ADR-0045 D-A：`ElevatedActor` 的铸造门与 memory 绑定。
+    /// 注错：删掉 `from_consumed_confirmation` 的 op 判定，或删掉 `authorize_mandatory` 里
+    /// 的 `actor.memory_id() != req.memory_id` 复核 ⇒ 本条红。
+    #[test]
+    fn elevated_actor_is_bound_to_one_op_and_one_memory() {
+        let request = req(BindingMode::Mandatory);
+        for op in DestructiveOp::ALL {
+            let minted = ElevatedActor::from_consumed_confirmation(op, request.memory_id);
+            assert_eq!(
+                minted.is_ok(),
+                matches!(op, DestructiveOp::MemoryBind | DestructiveOp::MemoryUnbind),
+                "{} must not mint an ElevatedActor",
+                op.operation_key()
+            );
+        }
+
+        // X 的确认拿去绑 Y：MissingConfirmation，不是「反正都提权了」。
+        let other = MemoryId(Uuid::now_v7());
+        assert_ne!(other, request.memory_id);
+        let actor = ElevatedActor::from_consumed_confirmation(DestructiveOp::MemoryBind, other)
+            .expect("mint");
+        let scope = scope_of(Uuid::now_v7(), None, None);
+        let basis = NonEmptyVec::new(vec![EvidenceOriginClass::DirectUserInput]).expect("basis");
+        assert_eq!(
+            authorize_mandatory(
+                &AlwaysAuthorizes(AuthorityClass::ExplicitTaskContext),
+                &actor,
+                request,
+                AuthorityClass::ExplicitTaskContext,
+                MemoryType::State,
+                basis,
+                &scope,
+            ),
+            Err(CandidateRejection::MissingConfirmation)
         );
     }
 }

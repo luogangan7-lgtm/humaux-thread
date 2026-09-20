@@ -16,7 +16,7 @@ use humaux_domain::{
     context::ContextBudget,
     error::ErrorCode,
     identity::AuthorizationScope,
-    ids::{Scope, TenantId, WorkspaceId},
+    ids::{Scope, TaskId, TenantId, WorkspaceId},
 };
 use humaux_projection::{serving::StreamFamily, stream::StreamKey};
 use humaux_retrieval::{
@@ -197,6 +197,7 @@ pub async fn assemble<T>(
     pool: impl Into<Arc<RuntimeDbPool>>,
     authorization: AuthorizationScope,
     requested_workspace: Option<WorkspaceId>,
+    requested_task: Option<TaskId>,
     bootstrap: ContextBootstrap,
     accept: impl FnOnce(ContextResult) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
@@ -211,7 +212,12 @@ pub async fn assemble<T>(
         user_id: authorization.user_id(),
         workspace_id: Some(workspace),
         repository_id: None,
-        task_id: None,
+        // card 22b review fix: the MCP `task_id` argument reaches the Scope here, so
+        // `task_explicit_context_v1` / `explicit_mandatory_bindings_v1` see the real TaskId on
+        // the wire instead of only through the adapter's `selector_outcomes` test entry point.
+        // `context_repo::run_selectors_in_txn` resolves it against `coord.tasks` (§25.4.A(7));
+        // an unresolvable task is `NotFound`, never a silently task-less assemble.
+        task_id: requested_task,
         run_id: None,
         agent_id: None,
     };

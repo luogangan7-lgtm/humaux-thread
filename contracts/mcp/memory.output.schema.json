@@ -1,7 +1,7 @@
 {
  "$schema": "https://json-schema.org/draft/2020-12/schema",
  "title": "MemoryReadResult",
- "description": "Direct Memory Envelope, one authorized immutable enumeration page, a confirmation_required result of a gated op (memory.supersede / memory.pin / memory.unpin), a superseded result, or a pin/unpin binding result. The catalog resolves the embedded canonical Envelope without network access. memory.get's completeness counts are INTENTIONALLY absent, not unimplemented (ADR-0041 D-D, card 22): the route always answers class=cannot_establish / reason=count_unknown with exact and known_lower_bound null, because classify() maps a DirectGet to QueryClass::Exact and §22.0 makes an exact class without a predicate_id/census a hard 5xx — filling the five counts without a census would turn a correct 200 into a 500. The unlock is a separate decision: a universe-of-one census for DirectGet. memory.enumerate, which does carry a census, answers exact.",
+ "description": "Direct Memory Envelope, one authorized immutable enumeration page, a confirmation_required result of a gated op (memory.supersede / memory.pin / memory.unpin / memory.restore / memory.archive / memory.unarchive / memory.correct / memory.confirm / memory.reject / memory.bind / memory.unbind — the same closed set as ConfirmationRequired.operation), a superseded result, or a pin/unpin/bind/unbind binding result. The catalog resolves the embedded canonical Envelope without network access. memory.get's completeness counts are INTENTIONALLY absent, not unimplemented (ADR-0041 D-D, card 22): the route always answers class=cannot_establish / reason=count_unknown with exact and known_lower_bound null, because classify() maps a DirectGet to QueryClass::Exact and §22.0 makes an exact class without a predicate_id/census a hard 5xx — filling the five counts without a census would turn a correct 200 into a 500. The unlock is a separate decision: a universe-of-one census for DirectGet. memory.enumerate, which does carry a census, answers exact.",
  "type": "object",
  "$defs": {
   "Envelope": {
@@ -36,7 +36,9 @@
       "memory.unarchive",
       "memory.correct",
       "memory.confirm",
-      "memory.reject"
+      "memory.reject",
+      "memory.bind",
+      "memory.unbind"
      ]
     },
     "target": {
@@ -53,9 +55,14 @@
       "candidate_id": {
        "type": "string",
        "format": "uuid"
+      },
+      "task_id": {
+       "type": "string",
+       "format": "uuid"
       }
      },
-     "additionalProperties": false
+     "additionalProperties": false,
+     "description": "The tuple the token is bound to. memory.bind / memory.unbind bind the PAIR (memory_id, task_id) \u2014 \u00a725.4.A(7)/(8): a confirmation for binding S to task T must not execute a bind of S to task U, so the task rides the token's successor leg exactly as memory.supersede's replacement does."
     },
     "expires_at": {
      "type": "string",
@@ -162,12 +169,37 @@
        }
       }
      }
+    },
+    {
+     "if": {
+      "required": [
+       "operation"
+      ],
+      "properties": {
+       "operation": {
+        "enum": [
+         "memory.bind",
+         "memory.unbind"
+        ]
+       }
+      }
+     },
+     "then": {
+      "properties": {
+       "target": {
+        "required": [
+         "memory_id",
+         "task_id"
+        ]
+       }
+      }
+     }
     }
    ]
   },
   "BindingWritten": {
    "type": "object",
-   "description": "memory.pin / memory.unpin executed (\u00a736, ADR-0019): binding_id is the private.context_bindings row (mode=PINNED at the credential's workspace scope). pin: inserted=false when the memory was already pinned (D-C idempotent, no new row). unpin: revoked=true, the row's revoked_at is set; Evidence/Memory untouched. scope names the WORKSPACE the binding was written under (D-E, card 13).",
+   "description": "memory.pin / memory.unpin / memory.bind / memory.unbind executed (\u00a736, ADR-0019; card 22b ADR-0045 added the MANDATORY/TASK pair). binding_id is the private.context_bindings row. mode says which lane the row belongs to: PINNED at the credential's WORKSPACE scope (pin/unpin), MANDATORY at the authenticated TASK scope (bind/unbind). pin/bind: inserted=false when the binding already existed (D-C idempotent, no new row). unpin/unbind: the row's revoked_at is set; Evidence/Memory untouched. scope names the authorization scope the binding was written under (D-E, card 13). This is ONE branch, not four: the four ops differ only in mode, scope kind and state, so widening the three closed sets is the whole change and the output union stays at 15 branches.",
    "required": [
     "memory_id",
     "binding_id",
@@ -185,18 +217,26 @@
      "format": "uuid"
     },
     "mode": {
-     "const": "PINNED"
+     "type": "string",
+     "enum": [
+      "PINNED",
+      "MANDATORY"
+     ]
     },
     "scope": {
      "type": "object",
-     "description": "\u00a736/ADR-0035 (card 13, D-E): the binding's authorization scope \u2014 the credential's WORKSPACE route the pin/unpin landed on.",
+     "description": "\u00a736/ADR-0035 (card 13, D-E) + \u00a725.4.A(7): the binding's authorization scope \u2014 the credential's WORKSPACE route for pin/unpin, the authenticated TASK for bind/unbind.",
      "required": [
       "kind",
       "id"
      ],
      "properties": {
       "kind": {
-       "const": "WORKSPACE"
+       "type": "string",
+       "enum": [
+        "WORKSPACE",
+        "TASK"
+       ]
       },
       "id": {
        "type": "string",
@@ -209,7 +249,9 @@
      "type": "string",
      "enum": [
       "pinned",
-      "unpinned"
+      "unpinned",
+      "bound",
+      "unbound"
      ]
     },
     "inserted": {

@@ -1229,6 +1229,26 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
 
 - **Memory lifecycle log 与 restore（0149，ADR-0020）**：`ops.memory_lifecycle_events` 是 §36/§37.1 memory 级转换史（append-only，`memory_id` 无 FK 以熬过 §37 purge）。**没有任何 runtime 角色持有它的表级 INSERT/UPDATE/DELETE**：写入只经 owner SECURITY DEFINER `ops.append_memory_lifecycle(...)`（EXECUTE 仅给 `role_gateway`），与 `ops.record_deletion_plan_step` 同一 chokepoint。读：`role_gateway`/`role_retrieval_worker`/`role_maintenance` 各 `SELECT`，其余非 owner 全 `—`。同一变更把 `private.memory_records` 上 `role_gateway` 的列级 UPDATE 由 `(status,superseded_by,superseded_at)` 扩到再加 `lifecycle_head_event_id`（gateway 在翻 authority status 的同一条 UPDATE 里写头指针；表级 UPDATE 仍不授予）。`memory.supersede` 现在同事务追加一条 `SUPERSEDE` 事件并盖 `undo_deadline`（窗口来自 `HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS`，§78.1）；`memory.restore` 在窗口内把 `status='superseded'` 变回 `'active'`（清 `superseded_by`，G59-4 恒真），追加一条指向被撤 SUPERSEDE 的 `RESTORE` 事件，发**新** `MEMORY_LIFECYCLE` 票（新 stream_seq，旧行永不复活）并返回绑定新 seq 的 consistency_token。被拒的 restore 以成功形状的 `{code:CONFLICT, reason:<u16>}` 返回（`ConflictReason`，非第 19 个 `ErrorCode`，§52.1 冻结 18 不变）。forget/tombstone 仍是终态（本卡只覆盖 SUPERSEDE 的撤销）。
 
+- **Mandatory facet 投影列（0172，ADR-0045，card 22b）**：`private.memory_records.facet` 是
+  `GENERATED ALWAYS ... STORED` 的派生列（§25.4.A(2) 的 CASE，由 `memory_type` 唯一决定）。
+  **本矩阵的任何一格都不变**，这不是省略而是判据：`private.memory_records` 的读权限是**表级**
+  `SELECT`（gateway / private_worker / consolidation_worker / retrieval_worker / maintenance），
+  新列因此自动被恰好这些角色读到，不多不少；而生成列在 PostgreSQL 里**根本不可写**，所以
+  `role_gateway` 的列级 `UPDATE(status,superseded_by,superseded_at,lifecycle_head_event_id)`
+  与两个 INSERT 格都保持原样，没有任何角色能写 facet——§25.4.A(3)「无独立写入口」因此是引擎
+  性质而不是评审纪律。**证据取哪一条（card 22b 评审更正）**：0172 的 postcheck 原本断言
+  `has_column_privilege(...,'facet','INSERT'/'UPDATE')` 为 false——**那条断言是假的**，实测
+  （humaux_thread_dev，PostgreSQL 18.6）它对 `role_gateway` / `role_private_worker` 都是
+  **true**：表级 INSERT/UPDATE 授权在 ACL 里覆盖该表的每一列，ACL 不认识 `attgenerated`。
+  `pg_column_is_updatable` 同样不可用（实测对本列为 true，它回答的是视图可更新性）。真正的
+  保证是列自身的生成性 `attgenerated = 's'`（0172 postcheck 首条即断言）：STORED 生成列的非
+  DEFAULT 写入被 PostgreSQL 在查权限之前就拒掉，对**所有**角色成立。postcheck 现在改断言
+  「本迁移没有自己授出任何东西」（该列 `attacl IS NULL`，有效权限恒等于表级、未被本迁移改动），
+  并保留 `SELECT` 必须为 true 的那两条。改后逐字跑在 dev 上：`postcheck_ok = t`（改前 `f`）。
+  `xtask rls-check` 的 MATRIX 同样不变：它是「表 × 角色」的，没有新表、没有新角色、没有策略或
+  SECURITY DEFINER 函数引用 facet。**Task 不是租户边界**（§25.4.A(7)）：本次不加任何 task 列、
+  不加任何 task policy 臂；task 关联住在 `private.context_bindings`，其授权格早已在 §25.4 落定。
+
 - **Distill candidate queue 与 memory.confirm（0152，ADR-0026，研究问题 Q5）**：`private.distill_candidates` 是 Distill hop 为被 §10.1 origin-bound ceiling 拒绝的候选（`CandidateRejection`）落的每租户队列，让用户能把其中一条经 `memory.confirm` 提升为 `UserConfirmed` Evidence（agent 无需改代码可获得的最高 authority class）。`role_private_worker` `SELECT, INSERT`（在 Distill 写腿的同一事务里写 PENDING 候选，从不 UPDATE 候选）；`role_gateway` `SELECT` + 列级 `UPDATE(state, confirmed_memory_id)`（confirm 把候选标 CONFIRMED 并盖新 memory；reject 标 REJECTED，仅 state）；`role_maintenance` `SELECT` + 列级 `UPDATE(state)`（到期清扫 PENDING→EXPIRED；confirm 独立地对 `expires_at <= now()` fail-closed，清扫仅是 housekeeping）；其余非 owner 角色全为 `—`（NAMED 表覆盖 private 域默认 RW，absence 即 `—`）。tenant-scoped RLS；confirm 以 `(candidate_id, candidate_sha256)` 绑定被复核的候选正文，跨租户 confirm 被 RLS 拒（0 行 → NOT_FOUND），非应用代码。被拒的 confirm/reject 以成功形状的 `{code:CONFLICT, reason:<u16>}` 返回（1101 CANDIDATE_ALREADY_CONFIRMED / 1102 CANDIDATE_EXPIRED，`ConflictReason`，§52.1 冻结 18 不变）。SKIPPED_BY_POLICY（0 产出）不建候选；被批准的 memory 也不是候选。
 - **派生层跨租户待办发现（0164，ADR-0036，卡 14）**：两个派生层 worker（`humaux-consolidation-worker`、`humaux-private-worker --distill-*`）不再靠环境里钉死的一对 `(tenant, reasoning_domain)` 轮询。**本表无新增表级授权**：pending work 的事件端由 0164 的两个 **invoker 权限** AFTER INSERT 触发器发 job（`ops.outbox` 的 `EVIDENCE_ACCEPTED` → `DERIVED_DISTILL`；`private.memory_evidence` 的 `role='PRIMARY'` → `DERIVED_CONSOLIDATE`），写入方会话本来就有 `ops.jobs` 的 INSERT 与该租户上下文。唯一的跨租户读写是窄 SECURITY DEFINER `ops.claim_derived_work(text[],text,double precision,bigint)`：owner `role_migration_owner`、`search_path=pg_catalog`、一条语句完成 SKIP LOCKED 领取并只返回刚领到的行，EXECUTE **仅** `role_consolidation_worker` + `role_private_worker`，PUBLIC 无；它能看见其他租户的行，靠的是同一迁移给 0012 `jobs_tenant_isolation` 两条腿各加的 `current_user = 'role_migration_owner' OR` 臂（0004/0012/0112/0147/0163 的同一形状；不加第二条 PERMISSIVE policy）。GUC 臂被显式拒绝：任何会话都能自设自定义 GUC，那是建议性的不是授权边界。claim 之后一切回到普通 RLS —— worker 用领到的 `tenant_id` 走既有 per-call `SET LOCAL`，心跳/结清只写 `(status, lease_owner, lease_expires_at, next_retry_at)`。前三列两个 worker role 本来就有；`next_retry_at` 由 0164 加进 `role_consolidation_worker` 的列级 UPDATE（`role_private_worker` 自 0011 起就是无列限制的表级 UPDATE，这一格只是把两者拉平）：环境性失败（租户的 route binding 还没准入、provider/DB 抖动）释放 job 时必须把 `next_retry_at` 往后推，否则它保持 enqueue 时那个已经过去的时刻，每次 `--serve` 轮询都会零延迟地烧掉一次 attempt —— 在 binding 准入之前上线的租户几个轮询周期内就把 job 丢成 `DEAD`。`attempt` / `payload` 等其余列仍然不给（manifest postcheck 双向断言）。同一变更把 0147 窄 resolver `control.current_reasoning_route_binding(uuid,text)` 的 EXECUTE 名单加上 `role_consolidation_worker`（binding 是 per-tenant 的，跨租户服务下不能从环境读一个），`control.reasoning_route_bindings` 的非 owner 单元仍全为 `—`；函数授权不以本表格冒充，由 0164 DDL 与 `rls-check` 的 `check_derived_work_dispatch_boundary` + `R3_PRIVATE_WORKER_FUNCTIONS`（现带精确执行者集合）双向验证。`ops.jobs.tenant_id` 的 FK 同时由 RESTRICT 改为 `ON DELETE CASCADE`：job 行是纯调度状态，删租户本就销毁它们指向的活。
 - **Membership lifecycle admin path（0161，ADR-0033，卡 12）**：`control.memberships` 从 control 域默认（所有非 owner 角色 SELECT）抬为点名表：`role_maintenance` 持 `SELECT, INSERT` + 列级 `UPDATE(state, role, updated_at)`——这是 §6.3 MembershipState 机（`domain::identity::MembershipSnapshot::apply`）经 `adapters::membership_repo` / `xtask member` 写入 membership 的**唯一**路径（invite = INSERT 一行 INVITED；activate / suspend / remove / set-role = 一条 UPDATE）；身份列（membership_id / tenant_id / user_id / created_at）无人可写，0160 的 role 触发器 + CHECK、0012 的 FORCE RLS 租户策略照旧。五个 runtime role 保持 SELECT（等于原域默认），`role_batch_issuer` / `role_admin` 为 `—`。用户的 `security_epoch` **不给列级 UPDATE**（拿到 UPDATE 也就能把 epoch 调低、复活已作废的凭据）：唯一写法是 owner SECURITY DEFINER `control.bump_user_security_epoch(uuid)`（只增不设，EXECUTE 仅 `role_maintenance`，PUBLIC 无），与 0037 `api_key_lookup` / 0041 `audit_event_insert` 同一 chokepoint 纪律；`control.audit_event_insert` 的 EXECUTE 名单同一变更加入 `role_maintenance`，每次 mutation 在同一事务内追加 §77 审计行（action `MEMBERSHIP_INVITE|ACTIVATE|SUSPEND|REMOVE|CHANGE_ROLE`）。
@@ -6033,6 +6053,11 @@ association    budget
 
 这样避免某一路召回把其他 facet 全淹没。
 
+上面前四个 `reserve` 与 §25.4.A(1) 的 `MandatoryContextFacet` 逐名对齐；`recent` 是候选分配方式，
+`dense / sparse / code / association` 是检索路径，**都不属于** `MandatoryContextFacet`
+（§25.4.A(6)）——不要把 `Reference -> recent evidence`、`Procedure -> association`、
+`Fact -> dense` 写成「自然映射」。
+
 ---
 
 # 25. Context Products
@@ -6057,6 +6082,10 @@ issues
 procedures
 recent evidence
 ```
+
+这六个是**产品展示槽位**。其中前四个与 §25.4.A(1) 的 `MandatoryContextFacet` 同名且对齐；
+`procedures` / `recent evidence` 是产品内容类别，**不**新增隐式的 MemoryType 映射
+（§25.4.A(6)）。`private.memory_records.facet` 只是前四个的数据库投影，不代表本节的全部槽位。
 
 ## 25.3 continuity
 
@@ -6273,60 +6302,140 @@ positive + negative fixtures
 
 因此“active UserCorrection relevant to scope”**不允许**用 embedding similarity 解释；必须有机械 scope/authority 规则。
 
-### 五个 selector 的交付实况：两个 `unavailable`，卡点是列不在，不是 WHERE 子句没写（card 22）
+### 五个 selector 的交付实况：card 22 诊断，card 22b 关闭（两列之争，结论是一列 + 一张表）
 
-`context.assemble` 在**每一个**部署上都答 `completeness.class = cannot_establish` /
-`reason = lane_failed`。链路是确定的：
+card 22 的实测诊断保留，因为它订正了 ADR-0041 D-I 的错误根因，而错误根因会被下一个人重犯：
 
 ```text
-crates/adapters/src/context_repo.rs:523  probe：按 SelectorSpec.required_columns 查 information_schema
-crates/adapters/src/context_repo.rs:549  缺列 ⇒ SelectorOutcome::Unavailable，直接 continue
-crates/retrieval/src/handoff.rs:139      Unavailable ⇒ handoff.unavailable_selectors 非空
-bins/gateway/src/context.rs:322          非空 ⇒ LaneStatus::Failed
-§22.4                                    lane 触发在 classify() 里先于 planner_output ⇒ lane_failed
+crates/adapters/src/context_repo.rs  probe：按 SelectorSpec.required_columns 查列目录
+                                     缺列 ⇒ SelectorOutcome::Unavailable，直接 continue
+crates/retrieval/src/handoff.rs:139  Unavailable ⇒ handoff.unavailable_selectors 非空
+bins/gateway/src/context.rs:322      非空 ⇒ LaneStatus::Failed
+§22.4                                lane 触发在 classify() 里先于 planner_output ⇒ lane_failed
 ```
 
-**根因不是 ADR-0041 D-I 记的那条。** 该条记的是 `context_repo.rs:558` 的 `other =>` 臂「没写
-WHERE 子句」。实测（2026-09-17，`humaux_thread_dev`）：`private.memory_records` 的 21 个列里
-**没有 `task_id`、也没有 `facet`**，而两个 selector 的 `required_columns` 正是这两列
-（`crates/domain/src/context.rs:140` / `:180`）。probe 在 WHERE 分派之前就把它们判成
-`Unavailable`，所以 `other =>` 臂今天是**不可达代码**，给它补一条 WHERE 子句不会改变任何输出。
+`context.assemble` 曾在**每一个**部署上答 `cannot_establish / lane_failed`，原因不是 ADR-0041
+D-I 记的「`other =>` 臂没写 WHERE 子句」——实测（2026-09-17，`humaux_thread_dev`）
+`private.memory_records` 的 21 个列里没有 `task_id` 也没有 `facet`，probe 在 WHERE 分派**之前**
+就把两个 selector 判成 `Unavailable`，那条臂是不可达代码。补 WHERE 不会改变任何输出。
 
-解锁条件按 selector 分开，两条都**不是**「写个 WHERE」：
+card 22 同时立了一条硬规则：**在 §25.2 facet ↔ §24 变体的对齐条款被写下来之前，不许猜映射**
+（猜错的代价是 G25-1 在小夹具上偶然变绿，§80.1）。**那条条款现在写下来了，就是下面的
+§25.4.A**；本段不再复述它，猜映射的禁令也由它取代——映射不再是未决项，改它要改 §25.4.A。
+
+card 22b 的结论把「两列」收敛成「一列 + 一张已经存在的表」（ADR-0045）：
 
 ```text
 task_explicit_context_v1
-  缺：private.memory_records 的 task 维度（列 + migration + §6.2.2 行 + rls_check MATRIX）
-  §25.4 已给出机械规则（scope inheritance = Task，min authority = ExplicitTaskContext），
-  缺的只是承载它的列。
+  不加列。task 关联唯一来自 private.context_bindings(scope_kind=TASK, mode=MANDATORY,
+  revoked_at IS NULL) —— provenance（在任务 T 里摄入）不等于 authority（被授权为 T 的必带
+  上下文）。registry 的依赖登记改为 context_bindings 上的真实列；禁止继续探测
+  memory_records.task_id（§25.4.A(11)）。
+  受控写路径：memory.bind / memory.unbind（§33.10 规则 9 的同一道 confirm 门），
+  唯一能铸 ElevatedActor 的地方，且 authorize_mandatory 在同事务里复核 §10.1。
 
 required_current_state_facets_v1
-  缺：facet 维度的列，**以及一条 §25.2 五 facet ↔ §24 九变体的对齐条款**。
-  §25.4 今天没有这条条款 —— 本节明确：在它被写下来之前**不许猜映射**。猜错的代价是
-  G25-1 在小夹具上偶然变绿（一个看起来通过、实际没判任何东西的闸，§80.1）。
-  这条对齐条款是 spec 侧的未决项，不是实现侧的遗漏。
+  加一列 private.memory_records.facet：GENERATED ALWAYS ... STORED，由 memory_type 唯一派生
+  （migration 0172）。无独立写入口，因此不是第二真源。probe 断言 attgenerated='s'——
+  存在性不是契约，一个可写的同名列正是 §25.4.A(3) 禁止的东西。
 ```
 
-在那之前，`lane_failed` 是这条路由唯一诚实的答案：`unavailable_selectors` 具名诊断照旧按
-§25.4「Unavailable selector 保持具名诊断，此时 expected 只覆盖可用 selector 的已知候选并集，
-不能宣称完整全集已建立」交付 —— 三个可用 selector 的 lane 正常工作，只是全集没建立。见证：
-`bins/gateway/tests/mcp_gateway.rs` 的三路由断言把 `context.assemble = cannot_establish/lane_failed`
-与另外两条路由钉在一起。
+**仍然打开的一笔债，card 22b 测出来的**：`task_explicit_context_v1` 的 `min_authority` 是
+`ExplicitTaskContext`（§25.4 冻结的机械规则），而 §10.1 的 origin ceiling 表里**没有任何 origin
+能到达 `ExplicitTaskContext`**（最高是 `TenantAdmin` / Constraint-memory 例外的
+`ProjectConstraint`）。§10.1 硬规则 2 说这一级「只来自当前经过认证的 Task Request / Tenant
+Policy」，而 `domain::policy::OriginBoundAuthorityPolicy` 只实现了 ceiling 表，表达不了规则 2。
+后果是可测的：memory.bind 能为 `ProjectConstraint` 记忆建 TASK/MANDATORY 绑定（
+`explicit_mandatory_bindings_v1` 在 TASK 层读得到它），但 `task_explicit_context_v1` 的
+`ExplicitTaskContext` 下限今天没有合法生产者，所以它**跑得起来但恒空**。这不再是
+`lane_failed`（本卡的解锁就是这个），但它也不是「完成」：DOD-035 仍是 `[phase=14]`，规则 2 的
+生产者是下一张卡的预算，落点在 `crates/domain/src/policy.rs` / §10.1，不在本卡的可改文件里。
 
-**这是一笔仍然打开的债（ADR-0041 D-I），card 22 只订正了它的根因、没有关掉它**（ADR-0044 D-G
-写了下一张卡的预算：migration + §6.2.2 行 + rls_check MATRIX、§25.2↔§24 对齐条款、两条 WHERE、
-以及把 live 见证翻面）。为了让这笔债不会在无人注意时腐烂，同一个 live 套件**按根因**而不是按症状
-钉住它 —— `native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance` 直接读回 lane：
+### 25.4.A Selector / Facet / Task Binding Alignment v1
+
+（card 22b 裁决原文，11 条，逐字落地；ADR-0045 记录来源与被否决的替代方案。）
+
+1. `MandatoryContextFacet` 的值域固定为：state / constraints / decisions / issues。
+   `private.memory_records.facet` 仅为 `MandatoryContextFacet` 的数据库投影，不代表 §25.2、
+   §25.3 全部展示槽位，也不代表 §24 全部 CandidateVariant。
+
+2. facet 唯一由 `memory_type` 决定：
 
 ```text
-handoff.unavailable_selectors == [
-  ["task_explicit_context_v1",         "private.memory_records.task_id"],
-  ["required_current_state_facets_v1", "private.memory_records.facet"]
-]
+STATE      -> state
+CONSTRAINT -> constraints
+DECISION   -> decisions
+REJECTION  -> decisions
+ISSUE      -> issues
+FACT / PREFERENCE / LESSON / PROCEDURE / OUTCOME / REFERENCE / NOTE -> NULL
 ```
 
-两列中任何一列一落地，这条断言立刻变红，补 predicate 就必须与加列在同一次改动里完成；只钉
-`cannot_establish` 的话，那天套件只会报「expected cannot_establish」，看不出原因。
+   decisions 在本条中包含仍有效的选择与明确否决。此分组不修改原始 MemoryType，不合并
+   Continuity 的 Decision/Rejection 展示槽位。
+
+3. facet 必须是无独立写入口的派生值。禁止 API、蒸馏器、consolidation 或回填脚本独立指定
+   facet。新增 MemoryType 时必须同时裁定其映射；不得依靠 `ELSE NULL` 静默接纳新类型。
+
+4. facet 非 NULL 仅表示可由 `required_current_state_facets_v1` 提名。是否属于本次 Mandatory
+   集合，仍须满足该 selector 已冻结的 scope inheritance、authority/origin、生命周期、时间有效性
+   及冲突规则。被提名但 grounding 无法成立的必需项不得进入 behavior segment，必须保留对应的
+   缺口或待验证记录。
+
+5. facet 为 NULL 不表示该记忆禁止进入 Mandatory。合格的显式任务绑定、显式 Mandatory binding
+   或其他注册 selector，可以独立提名该记忆；不得因此绕过 AuthorityPolicy。
+
+6. §24 的 state / constraints / decisions / issues reserve 对齐本条同名 `MandatoryContextFacet`。
+   recent / dense / sparse / code / association 是候选分配或检索路径，不属于
+   `MandatoryContextFacet`。procedures / recent evidence 是产品内容类别，不新增隐式的类型映射。
+
+7. `task_explicit_context_v1` 的任务关联唯一来自有效的 ContextBinding：`scope_kind = TASK`，
+   `scope_id` = 本次已认证解析的 TaskId，`mode = MANDATORY`，`revoked_at IS NULL`。本 selector
+   不依赖 `memory_records.task_id` 或 `evidence_objects.task_id`。任务关联不能从正文、蒸馏结果、
+   请求发生时间或 supersede 关系推断。
+
+8. TASK + MANDATORY 不是权威证明。绑定必须经受控写路径，由当前认证 Task Request 或 Tenant
+   Policy 授权；selector 继续执行 `ExplicitTaskContext` 的最低权威及 origin 约束。禁止通过绑定或
+   supersede 关系修改、继承或洗白 Memory 的 Authority。
+
+9. ContextBinding 绑定具体的 Memory 权威版本。B supersede A 不自动将 A 的绑定转移给 B。授权的
+   显式替换可以在同一事务内：重新验证 B、撤销 A 的绑定、创建 B 的绑定并记录审计。未完成该替换
+   时，A 不得继续作为当前行为上下文；仍有效但指向不可用版本的 Mandatory binding 必须形成未解决
+   义务，不得被静默过滤后视为完整。
+
+10. selector 必须分别报告自己的提名、接纳与未解决结果。最终合并时按 Memory 身份去重，但保留全部
+    selector/binding provenance。observed facet 集合不定义 required facet 集合；每个 facet 返回
+    一条记忆不证明该 facet 内的必需集合完整。required / known-empty / missing / unavailable 必须
+    由冻结的 profile、scope 和完整性账本决定，不得从 returned 集合反推。
+
+11. `ContextSelectorRegistry` 的依赖必须标明实际 relation、column 和 type。task selector 的依赖
+    登记必须改为 ContextBinding 关系上的实际列；禁止继续探测 `memory_records.task_id`。数据库错误
+    或依赖缺失必须报告 `lane_failed`，不得转换为空集合或 `NotApplicable`。
+
+落点（代码侧唯一真源，本节不复制判据正文）：`humaux_domain::memory::{MandatoryContextFacet,
+facet_for}`（第 1/2/3 条）· `humaux_domain::context::REGISTRY`（第 7/11 条的依赖登记）·
+`adapters::context_repo::{probe_required_columns, run_selectors_in_txn, bind_confirmed}`（第
+10/11 条的分别报告与第 8 条的受控写路径）· migration `0172_memory_records_mandatory_facet`
+（第 2/3 条的数据库半边）。
+
+**实现边界，逐条说清（card 22b 评审后的更正，不改上面 11 条正文）**：
+
+- 第 7 条「本次**已认证解析**的 TaskId」= `adapters::context_repo::resolve_task_in_txn`：wire 上
+  的 uuid 必须在**本事务内**解析到本租户的 `coord.tasks` 行（§48；该表受 0012 的租户 RLS），否则
+  请求是 `NOT_FOUND`——读路径（`run_selectors_in_txn`，任何 selector 跑之前）与写路径
+  （`write_binding_confirmed`，绑定写入之前）都跑同一道解析，不存在「只在一边认证」。
+  **上限写在这里而不是留白**：`coord.tasks` 只建模任务的**存在与租户**，没有 owner/参与者列，
+  所以「调用者属于这个任务」在本 schema 里无处可查，也**没有**被断言。兜底的是两道确实存在的
+  门：selector 每一行仍过 `readable_memory_ids`/`can_read`，每一次绑定写仍过 §33.10 的 confirm
+  门（token 绑 (tenant, user, op, memory, task)）。升级路径：`coord.tasks` 长出参与者表之后，
+  把 per-task membership 加进同一函数。
+- 第 9 条的「授权的显式替换」只能作用于**本次显式操作授权的那一格**：`memory.bind` 的
+  `replaces_binding_id` 是唯一从 wire 取的 binding id，而 confirm token 不覆盖这个参数，所以
+  撤销语句自带 `scope_kind='TASK' AND scope_id=<本次 task> AND mode='MANDATORY'`——另一个任务的
+  MANDATORY 行、任何 WORKSPACE/PINNED 行、别的租户的行都匹配零行，按并发冲突处理（`CONFLICT`），
+  永不撤销。自替换（`replaces_binding_id` 正是本 (memory, task) 的现存绑定）同样拒绝：它会撤掉
+  幂等分支正要报回 `state:"bound"` 的那一行。恰好一行 = 成功，零行 = 冲突。
+- MCP wire：`context.assemble` 的 `task_id` 参数**已接通**到 Scope（`bins/gateway/src/context.rs`），
+  不再 hard-code `task_id: None`；task 维度因此不止在 adapter 的测试入口上可达。
 
 Pinned：
 
@@ -7251,6 +7360,13 @@ second call(confirm_token) -> execute
 ```
 
 这样 `correct/delete/export/revoke` 等安全语义不依赖某个平台的 MCP feature depth。
+
+经这道门的 operation 是闭集，唯一真源是 `humaux_domain::confirm::DestructiveOp::ALL`
+（11 项）：`memory.supersede` · `memory.pin` · `memory.unpin` · **`memory.bind` ·
+`memory.unbind`**（card 22b / §25.4.A(8)）· `memory.restore` · `memory.archive` ·
+`memory.unarchive` · `memory.correct` · `memory.confirm` · `memory.reject`。token 与 op 绑定：
+一次 pin 的确认执行不了 unpin，也铸不出 bind 需要的 `ElevatedActor`——两个 actor 类型各自
+只认自己的 op。
 
 
 ## MCP Contract Integrity / Compatibility Testing
@@ -8585,6 +8701,8 @@ continuity.get
 memory.supersede
 memory.pin
 memory.unpin
+memory.bind
+memory.unbind
 memory.restore
 memory.archive
 memory.unarchive
@@ -8610,7 +8728,7 @@ Tool 8 `coordinate`，加上 `remember` 的三个批次 action。调用它们的
 `recall.rs` 的 guard，不在这里）。
 
 同样由 *tool surface truth* 臂对表：**闸断言的是集合相等**（合约面 key 集合 = 已接线集合 ∪ 下面这个 declared-only
-集合，不重不漏）；「48 = 18 + 30」只是本交付点的人工快照，不由闸维护，加 key 时以闸为准。
+集合，不重不漏）；「50 = 20 + 30」只是本交付点的人工快照，不由闸维护，加 key 时以闸为准。
 
 <!-- humaux:declared-only-operation-keys:begin -->
 ```text
@@ -8673,10 +8791,21 @@ crates/retrieval/src/...::classify()   DirectGet ⇒ QueryClass::Exact
 件是一个单独的决定：为 DirectGet 定义「universe-of-one」census（一个对象读的全集基数为 1）。
 在那之前，`count_unknown` 是唯一合法答案。
 
-见证：`bins/gateway/tests/mcp_gateway.rs` 的 card 18/19 三路由断言把
-`memory.get = cannot_establish/count_unknown`、`memory.enumerate = exact`、
-`context.assemble = cannot_establish/lane_failed` 三行一起钉死 —— 谁"顺手补完"
-`memory.get` 的五个计数，红的是这一行，而不是线上 500。
+见证：`bins/gateway/tests/mcp_gateway.rs` 的
+`native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance` 三路由断言。card 22b
+（ADR-0045）之后它钉的是：`memory.get = cannot_establish/count_unknown`、
+`memory.enumerate = exact`，而 `context.assemble` **不再钉任何 class 字面量**，只断言
+`reason != lane_failed` —— 迁移 0172 之前 §25 的五个 selector 里有两个因缺列而 Unavailable，
+`classify()` 的 lane 触发先于 planner，于是**每个部署**都必然答 `lane_failed`，那一行钉的是
+结构缺陷不是判据；现在五个 selector 全部跑得起来，class 由这同一个夹具逐行钉住的
+planner/pipeline 腿决定，而 `lane_failed` 回来就意味着又有 selector 掉回 Unavailable。
+谁"顺手补完" `memory.get` 的五个计数，红的仍是前两行，而不是线上 500。
+
+注意 `context.assemble` 的 lane 能跑 ≠ task selector 有东西可选：`task_explicit_context_v1`
+的 `min_authority = ExplicitTaskContext`，而 §10.1 的 origin 天花板表里**没有**任何 origin
+够得到这个 class，所以在 §10.1 rule 2 的产出者被裁决之前，它的 admitted set 是**结构性空集**
+（跑完、返回空，不是失败；见 ADR-0045「Open debt this card did NOT close」，DOD-035 仍
+`[phase=14]`）。
 
 `contracts/mcp/memory.output.schema.json` 的顶层 `description` 同步写明这一条，避免读 schema
 的人把 null 计数读成未实现。

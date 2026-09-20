@@ -112,35 +112,113 @@
             "type": "object",
             "description": "§8.5.1 (ADR-0030): one affect annotation. kind EMOTION (never decays) | MOOD (decays by the frozen half-life at read time); label is the closed 12-value EmotionLabel; valence/arousal/dominance are basis points -10000..10000; intensity/confidence 0..10000. Out-of-range or unknown values are INVALID_INPUT, never clamped. target_subject_id (rule 1) or target_subject_key (rule 2) must resolve under the tenant's registry, else INVALID_INPUT — never auto-registered.",
             "properties": {
-              "kind": {"type": "string", "enum": ["EMOTION", "MOOD"]},
-              "label": {"type": "string", "enum": ["JOY", "SADNESS", "ANGER", "FEAR", "DISGUST", "SURPRISE", "AFFECTION", "ANXIETY", "FRUSTRATION", "CALM", "EXCITEMENT", "RELIEF"]},
-              "valence": {"type": "integer", "minimum": -10000, "maximum": 10000},
-              "arousal": {"type": "integer", "minimum": -10000, "maximum": 10000},
-              "dominance": {"type": "integer", "minimum": -10000, "maximum": 10000},
-              "intensity": {"type": "integer", "minimum": 0, "maximum": 10000},
-              "confidence": {"type": "integer", "minimum": 0, "maximum": 10000},
-              "target_subject_id": {"type": "string", "format": "uuid"},
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "EMOTION",
+                  "MOOD"
+                ]
+              },
+              "label": {
+                "type": "string",
+                "enum": [
+                  "JOY",
+                  "SADNESS",
+                  "ANGER",
+                  "FEAR",
+                  "DISGUST",
+                  "SURPRISE",
+                  "AFFECTION",
+                  "ANXIETY",
+                  "FRUSTRATION",
+                  "CALM",
+                  "EXCITEMENT",
+                  "RELIEF"
+                ]
+              },
+              "valence": {
+                "type": "integer",
+                "minimum": -10000,
+                "maximum": 10000
+              },
+              "arousal": {
+                "type": "integer",
+                "minimum": -10000,
+                "maximum": 10000
+              },
+              "dominance": {
+                "type": "integer",
+                "minimum": -10000,
+                "maximum": 10000
+              },
+              "intensity": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10000
+              },
+              "confidence": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10000
+              },
+              "target_subject_id": {
+                "type": "string",
+                "format": "uuid"
+              },
               "target_subject_key": {
                 "type": "object",
                 "properties": {
-                  "kind": {"type": "string", "minLength": 1, "maxLength": 32},
-                  "value": {"type": "string", "minLength": 1, "maxLength": 512}
+                  "kind": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32
+                  },
+                  "value": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  }
                 },
-                "required": ["kind", "value"],
+                "required": [
+                  "kind",
+                  "value"
+                ],
                 "additionalProperties": false
               },
               "target_scope": {
                 "type": "object",
                 "properties": {
-                  "kind": {"type": "string", "enum": ["WORKSPACE", "REPOSITORY", "TASK", "RUN", "AGENT"]},
-                  "id": {"type": "string", "format": "uuid"}
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "WORKSPACE",
+                      "REPOSITORY",
+                      "TASK",
+                      "RUN",
+                      "AGENT"
+                    ]
+                  },
+                  "id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
                 },
-                "required": ["kind", "id"],
+                "required": [
+                  "kind",
+                  "id"
+                ],
                 "additionalProperties": false
               },
-              "observed_at": {"type": "string", "format": "date-time"}
+              "observed_at": {
+                "type": "string",
+                "format": "date-time"
+              }
             },
-            "required": ["kind", "intensity", "confidence"],
+            "required": [
+              "kind",
+              "intensity",
+              "confidence"
+            ],
             "additionalProperties": false
           },
           "maxItems": 16
@@ -360,6 +438,76 @@
     },
     {
       "x-humaux-operation": {
+        "operation_key": "memory.bind",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "description": "§25.4.A(8) (card 22b, ADR-0045): create the MANDATORY context binding for this memory at the authenticated TASK scope — the controlled write path task_explicit_context_v1 reads. TASK + MANDATORY is not an authority proof: the envelope re-reads the memory's own authority_class / memory_type / Evidence origin basis in the same transaction and re-checks §10.1 before any row is written. replaces_binding_id performs the authorized A->B explicit replacement (§25.4.A(9)): the named binding is revoked and this one created in ONE transaction; a binding that is not an active binding of this tenant is a CONFLICT.",
+      "properties": {
+        "action": {
+          "const": "bind"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "replaces_binding_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "confirm_token": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "action",
+        "memory_id",
+        "task_id"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
+        "operation_key": "memory.unbind",
+        "required_scope": "memory:write",
+        "feature_key": "mcp.billable_operations.per_period",
+        "meter_kind": "ordinary1"
+      },
+      "description": "§25.4.A(9) (card 22b, ADR-0045): revoke this memory's MANDATORY binding at the authenticated TASK scope. The binding row only — Evidence and Memory are untouched (§36). Nothing bound is a CONFLICT.",
+      "properties": {
+        "action": {
+          "const": "unbind"
+        },
+        "memory_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "confirm_token": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "action",
+        "memory_id",
+        "task_id"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "x-humaux-operation": {
         "operation_key": "memory.archive",
         "required_scope": "memory:write",
         "feature_key": "mcp.billable_operations.per_period",
@@ -438,8 +586,7 @@
         "memory_id"
       ],
       "additionalProperties": false
-    }
-    ,
+    },
     {
       "x-humaux-operation": {
         "operation_key": "memory.subject_register",
@@ -545,35 +692,113 @@
             "type": "object",
             "description": "§8.5.1 (ADR-0030): one affect annotation. kind EMOTION (never decays) | MOOD (decays by the frozen half-life at read time); label is the closed 12-value EmotionLabel; valence/arousal/dominance are basis points -10000..10000; intensity/confidence 0..10000. Out-of-range or unknown values are INVALID_INPUT, never clamped. target_subject_id (rule 1) or target_subject_key (rule 2) must resolve under the tenant's registry, else INVALID_INPUT — never auto-registered.",
             "properties": {
-              "kind": {"type": "string", "enum": ["EMOTION", "MOOD"]},
-              "label": {"type": "string", "enum": ["JOY", "SADNESS", "ANGER", "FEAR", "DISGUST", "SURPRISE", "AFFECTION", "ANXIETY", "FRUSTRATION", "CALM", "EXCITEMENT", "RELIEF"]},
-              "valence": {"type": "integer", "minimum": -10000, "maximum": 10000},
-              "arousal": {"type": "integer", "minimum": -10000, "maximum": 10000},
-              "dominance": {"type": "integer", "minimum": -10000, "maximum": 10000},
-              "intensity": {"type": "integer", "minimum": 0, "maximum": 10000},
-              "confidence": {"type": "integer", "minimum": 0, "maximum": 10000},
-              "target_subject_id": {"type": "string", "format": "uuid"},
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "EMOTION",
+                  "MOOD"
+                ]
+              },
+              "label": {
+                "type": "string",
+                "enum": [
+                  "JOY",
+                  "SADNESS",
+                  "ANGER",
+                  "FEAR",
+                  "DISGUST",
+                  "SURPRISE",
+                  "AFFECTION",
+                  "ANXIETY",
+                  "FRUSTRATION",
+                  "CALM",
+                  "EXCITEMENT",
+                  "RELIEF"
+                ]
+              },
+              "valence": {
+                "type": "integer",
+                "minimum": -10000,
+                "maximum": 10000
+              },
+              "arousal": {
+                "type": "integer",
+                "minimum": -10000,
+                "maximum": 10000
+              },
+              "dominance": {
+                "type": "integer",
+                "minimum": -10000,
+                "maximum": 10000
+              },
+              "intensity": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10000
+              },
+              "confidence": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10000
+              },
+              "target_subject_id": {
+                "type": "string",
+                "format": "uuid"
+              },
               "target_subject_key": {
                 "type": "object",
                 "properties": {
-                  "kind": {"type": "string", "minLength": 1, "maxLength": 32},
-                  "value": {"type": "string", "minLength": 1, "maxLength": 512}
+                  "kind": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32
+                  },
+                  "value": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  }
                 },
-                "required": ["kind", "value"],
+                "required": [
+                  "kind",
+                  "value"
+                ],
                 "additionalProperties": false
               },
               "target_scope": {
                 "type": "object",
                 "properties": {
-                  "kind": {"type": "string", "enum": ["WORKSPACE", "REPOSITORY", "TASK", "RUN", "AGENT"]},
-                  "id": {"type": "string", "format": "uuid"}
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "WORKSPACE",
+                      "REPOSITORY",
+                      "TASK",
+                      "RUN",
+                      "AGENT"
+                    ]
+                  },
+                  "id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
                 },
-                "required": ["kind", "id"],
+                "required": [
+                  "kind",
+                  "id"
+                ],
                 "additionalProperties": false
               },
-              "observed_at": {"type": "string", "format": "date-time"}
+              "observed_at": {
+                "type": "string",
+                "format": "date-time"
+              }
             },
-            "required": ["kind", "intensity", "confidence"],
+            "required": [
+              "kind",
+              "intensity",
+              "confidence"
+            ],
             "additionalProperties": false
           },
           "minItems": 1,

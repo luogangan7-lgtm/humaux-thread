@@ -399,6 +399,10 @@ impl Drop for Handle {
                 "DELETE FROM control.api_keys WHERE tenant_id=$1",
                 "DELETE FROM control.private_reasoning_domains WHERE tenant_id=$1",
                 "DELETE FROM control.memberships WHERE tenant_id=$1",
+                // card 22b review fix: §25.4.A(7)'s TaskId is resolved against `coord.tasks`, so
+                // a fixture that binds anything to a task now owns rows in this table too, and
+                // its `tenant_id` FK blocks the tenant delete below.
+                "DELETE FROM coord.tasks WHERE tenant_id=$1",
             ] {
                 txn.execute(statement, &[&self.tenant_id])?;
             }

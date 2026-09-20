@@ -51,11 +51,22 @@ pub enum DestructiveOp {
     /// §36 `memory.reject` (ADR-0026, Card 6): mark a pending candidate REJECTED. Same gate,
     /// `target_id` is the candidate_id, no successor; writes no Evidence/Memory.
     MemoryReject,
+    /// §25.4.A(8) `memory.bind` (card 22b, ADR-0045): create one MANDATORY
+    /// `context_bindings` row at a TASK scope — the controlled write path the ruling requires
+    /// before `task_explicit_context_v1` can have anything to read. Mirrors `memory.pin`'s
+    /// gate exactly; the difference is the mode (MANDATORY) and the scope kind (TASK), and
+    /// the envelope re-reads the memory's authority/type/evidence basis in the same
+    /// transaction before `domain::context::authorize_mandatory` may mint a grant.
+    MemoryBind,
+    /// §25.4.A(9) `memory.unbind` (card 22b, ADR-0045): revoke that MANDATORY TASK binding.
+    /// Evidence/Memory untouched, same gate. The A->B authorized replacement is `memory.bind`
+    /// with `replaces_binding_id` (one transaction), not an unbind followed by a bind.
+    MemoryUnbind,
 }
 
 impl DestructiveOp {
     /// Every variant, for table-driven lookups.
-    pub const ALL: [DestructiveOp; 9] = [
+    pub const ALL: [DestructiveOp; 11] = [
         DestructiveOp::MemorySupersede,
         DestructiveOp::MemoryPin,
         DestructiveOp::MemoryUnpin,
@@ -65,6 +76,8 @@ impl DestructiveOp {
         DestructiveOp::MemoryCorrect,
         DestructiveOp::MemoryConfirm,
         DestructiveOp::MemoryReject,
+        DestructiveOp::MemoryBind,
+        DestructiveOp::MemoryUnbind,
     ];
 
     /// Canonical operation key (contracts/mcp/*.schema.json `x-humaux-operation.operation_key`).
@@ -79,6 +92,8 @@ impl DestructiveOp {
             DestructiveOp::MemoryCorrect => "memory.correct",
             DestructiveOp::MemoryConfirm => "memory.confirm",
             DestructiveOp::MemoryReject => "memory.reject",
+            DestructiveOp::MemoryBind => "memory.bind",
+            DestructiveOp::MemoryUnbind => "memory.unbind",
         }
     }
 

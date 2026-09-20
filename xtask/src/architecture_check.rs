@@ -4999,7 +4999,7 @@ fn w2_continuity_contract_from(
         );
     }
     for needle in [
-        "SUPPORTED_OPERATION_KEYS: [&str; 18]",
+        "SUPPORTED_OPERATION_KEYS: [&str; 20]",
         "\"continuity.get\" =>",
     ] {
         if !dispatch.contains(needle) {
@@ -5871,7 +5871,7 @@ mod tests {
             (5, "WorkspaceAdmission::PreserveContinuityFilter => None"),
             (5, "operation.operation_key() != \"continuity.get\""),
             (6, "catalog.validate_output(ToolName::Continuity, &value)"),
-            (6, "SUPPORTED_OPERATION_KEYS: [&str; 18]"),
+            (6, "SUPPORTED_OPERATION_KEYS: [&str; 20]"),
             (6, "\"continuity.get\" =>"),
         ] {
             let mut broken = sources.clone();
@@ -5923,8 +5923,8 @@ mod tests {
         let shrunk = dispatch
             .replace("    DestructiveOp::MemoryConfirm.operation_key(),\n", "")
             .replace(
-                "SUPPORTED_OPERATION_KEYS: [&str; 18]",
-                "SUPPORTED_OPERATION_KEYS: [&str; 17]",
+                "SUPPORTED_OPERATION_KEYS: [&str; 20]",
+                "SUPPORTED_OPERATION_KEYS: [&str; 19]",
             );
         assert!(
             matches!(
@@ -5936,8 +5936,8 @@ mod tests {
 
         // (2) the array's declared length stops matching its entries.
         let miscounted = dispatch.replace(
-            "SUPPORTED_OPERATION_KEYS: [&str; 18]",
-            "SUPPORTED_OPERATION_KEYS: [&str; 19]",
+            "SUPPORTED_OPERATION_KEYS: [&str; 20]",
+            "SUPPORTED_OPERATION_KEYS: [&str; 21]",
         );
         assert!(
             matches!(

@@ -850,9 +850,11 @@ mod tests {
             advertised["oneOf"][1]["properties"]["content"]["$ref"],
             "#/$defs/Envelope"
         );
-        // D-E (card 13, ADR-0035): BindingWritten reports the binding's scope { kind: WORKSPACE,
-        // id }. `scope` is required and closed to a WORKSPACE-kinded uuid — dropping the field or
-        // widening `kind` off the const turns this red.
+        // D-E (card 13, ADR-0035) + card 22b (ADR-0045 D-F): BindingWritten reports the
+        // binding's scope { kind, id }. `scope` is required and `kind` is a CLOSED two-value
+        // enum — WORKSPACE for pin/unpin, TASK for bind/unbind — never an open string.
+        // Dropping the field, or replacing the enum with `{"type":"string"}`, turns this red.
+        // The four ops share this one branch, which is why the union below is still 15 long.
         assert!(
             advertised["$defs"]["BindingWritten"]["required"]
                 .as_array()
@@ -862,8 +864,16 @@ mod tests {
             "BindingWritten must require scope"
         );
         assert_eq!(
-            advertised["$defs"]["BindingWritten"]["properties"]["scope"]["properties"]["kind"]["const"],
-            "WORKSPACE"
+            advertised["$defs"]["BindingWritten"]["properties"]["scope"]["properties"]["kind"]["enum"],
+            json!(["WORKSPACE", "TASK"])
+        );
+        assert_eq!(
+            advertised["$defs"]["BindingWritten"]["properties"]["mode"]["enum"],
+            json!(["PINNED", "MANDATORY"])
+        );
+        assert_eq!(
+            advertised["$defs"]["BindingWritten"]["properties"]["state"]["enum"],
+            json!(["pinned", "unpinned", "bound", "unbound"])
         );
         assert_eq!(
             advertised["$defs"]["BindingWritten"]["properties"]["scope"]["properties"]["id"]["format"],

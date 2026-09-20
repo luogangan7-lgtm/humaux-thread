@@ -1,0 +1,84 @@
+# §46.1 migration manifest. Card 22b (ADR-0045): `private.memory_records.facet`, the
+# MandatoryContextFacet projection `required_current_state_facets_v1` declares in its
+# REGISTRY `required_columns`. Additive GENERATED ALWAYS ... STORED column + one CHECK.
+# No task column anywhere, no policy change, no grant change, no DML, nothing removed.
+# §46 forward-fix (EXPAND_ONLY, first free number after 0171).
+
+migration_id = "0172_memory_records_mandatory_facet"
+class = "EXPAND_ONLY"
+
+precheck = """
+select
+ -- the table is there and does NOT yet carry the column (this is not a replay)
+ to_regclass('private.memory_records') is not null
+ and not exists (select 1 from pg_attribute
+                  where attrelid = 'private.memory_records'::regclass
+                    and attname = 'facet' and not attisdropped)
+ -- the CASE below compares these exact 12 labels: the live memory_type CHECK must still list
+ -- all of them. Matched by quoted-literal presence so the check survives PostgreSQL
+ -- deparsing `IN (...)` as `= ANY (ARRAY[...])`.
+ and (select count(*) = 12 from unnest(array[
+        'FACT','PREFERENCE','DECISION','REJECTION','STATE','ISSUE',
+        'LESSON','CONSTRAINT','PROCEDURE','OUTCOME','REFERENCE','NOTE']) as t(label)
+       where position('''' || t.label || '''' in
+             (select pg_get_constraintdef(oid) from pg_constraint
+               where conrelid = 'private.memory_records'::regclass
+                 and conname = 'memory_records_memory_type_check')) > 0)
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- the column exists, is text, nullable, and is a STORED generated column. Existence alone is
+ -- NOT the contract (§25.4.A(11)): a writable `facet` would be the second write entry the
+ -- ruling forbids, so attgenerated is asserted here and probed again at runtime.
+ (select a.atttypid = 'text'::regtype and not a.attnotnull and a.attgenerated = 's'
+    from pg_attribute a
+   where a.attrelid = 'private.memory_records'::regclass
+     and a.attname = 'facet' and not a.attisdropped)
+ -- the value-domain CHECK is in place
+ and exists (select 1 from pg_constraint
+              where conrelid = 'private.memory_records'::regclass
+                and conname = 'memory_records_facet_v1_check')
+ -- every existing row's facet equals the CASE of its own memory_type: no row was skipped by
+ -- the rewrite and no row disagrees with the mapping
+ and not exists (
+       select 1 from private.memory_records m
+        where m.facet is distinct from (case m.memory_type
+                when 'STATE' then 'state'
+                when 'CONSTRAINT' then 'constraints'
+                when 'DECISION' then 'decisions'
+                when 'REJECTION' then 'decisions'
+                when 'ISSUE' then 'issues'
+                else null end))
+ -- the seven unmapped types really are NULL (a silent ELSE-catches-everything regression
+ -- would still pass the row-equality check above if the CASE itself were rewritten, so pin
+ -- the negative side against the type labels directly)
+ and not exists (
+       select 1 from private.memory_records m
+        where m.memory_type in ('FACT','PREFERENCE','LESSON','PROCEDURE','OUTCOME','REFERENCE','NOTE')
+          and m.facet is not null)
+ -- nobody gained a write on the column. `has_column_privilege(...,'INSERT'/'UPDATE')` was
+ -- asserted false here and is WRONG (card-22b review, measured on humaux_thread_dev: it is
+ -- TRUE for role_gateway and role_private_worker) — a table-level INSERT/UPDATE grant covers
+ -- every column of the table in the ACL, and ACLs know nothing about `attgenerated`.
+ -- `pg_column_is_updatable` is equally unusable: measured TRUE for this column (it answers
+ -- for views, not for generated columns of a base table). The real guarantee is the column's
+ -- own generated-ness, asserted at the top of this postcheck (`attgenerated = 's'`):
+ -- PostgreSQL rejects a non-DEFAULT INSERT/UPDATE of a STORED generated column for EVERY
+ -- role, before privileges are consulted. What this migration can honestly assert about
+ -- grants is that it added none of its own — the column carries no column-level ACL, so the
+ -- effective privileges on it are exactly the table's, unchanged by this migration.
+ and (select a.attacl is null
+        from pg_attribute a
+       where a.attrelid = 'private.memory_records'::regclass
+         and a.attname = 'facet' and not a.attisdropped)
+ -- the roles that could read the row can read the new column (table-level SELECT, unchanged)
+ and has_column_privilege('role_gateway','private.memory_records','facet','SELECT')
+ and has_column_privilege('role_retrieval_worker','private.memory_records','facet','SELECT')
+ -- no task column was added anywhere by this migration
+ and not exists (select 1 from pg_attribute
+                  where attrelid = 'private.memory_records'::regclass
+                    and attname = 'task_id' and not attisdropped)
+ as postcheck_ok
+"""

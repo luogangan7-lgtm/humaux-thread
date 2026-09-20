@@ -706,6 +706,8 @@ pub(crate) async fn write_binding(
     stream: StreamKey,
     op: DestructiveOp,
     memory: MemoryId,
+    task: Option<humaux_domain::ids::TaskId>,
+    replaces_binding_id: Option<uuid::Uuid>,
 ) -> Result<BindingWriteOutcome, ErrorCode> {
     let workspace = write
         .request
@@ -721,6 +723,8 @@ pub(crate) async fn write_binding(
         reservation_ttl: write.reservation_ttl,
         memory,
         workspace,
+        task,
+        replaces_binding_id,
         claim: write.claim,
         finished_audit: write.finished_audit,
     };
@@ -730,6 +734,14 @@ pub(crate) async fn write_binding(
         }
         DestructiveOp::MemoryUnpin => {
             context_repo::unpin_confirmed(&pool, &authorization, request).await
+        }
+        // card 22b (ADR-0045): the MANDATORY/TASK pair. Same credential route, same confirm
+        // gate; `context_repo` re-reads §10.1 standing in the write transaction.
+        DestructiveOp::MemoryBind => {
+            context_repo::bind_confirmed(&pool, &authorization, request).await
+        }
+        DestructiveOp::MemoryUnbind => {
+            context_repo::unbind_confirmed(&pool, &authorization, request).await
         }
         DestructiveOp::MemorySupersede
         | DestructiveOp::MemoryRestore

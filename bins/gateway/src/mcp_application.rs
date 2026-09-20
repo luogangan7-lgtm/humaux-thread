@@ -25,7 +25,7 @@ use humaux_domain::{
     error::ErrorCode,
     evidence::payload_sha256,
     identity::VisibilityClass,
-    ids::WorkspaceId,
+    ids::{TaskId, WorkspaceId},
     subject::{SubjectId, SubjectKey, SubjectKeyKind, SubjectKind, SubjectRole, SubjectWriteOp},
 };
 use humaux_protocol::{
@@ -62,7 +62,7 @@ use crate::{
 /// have had working dispatch arms since ADR-0025/ADR-0026, while this array still said 15 —
 /// nothing read it, so nothing noticed. The new gate also compares it against the `invoke`
 /// dispatch below, which is what makes that class of drift impossible to repeat.
-pub const SUPPORTED_OPERATION_KEYS: [&str; 18] = [
+pub const SUPPORTED_OPERATION_KEYS: [&str; 20] = [
     "remember.put",
     "recall.search",
     "context.assemble",
@@ -72,6 +72,8 @@ pub const SUPPORTED_OPERATION_KEYS: [&str; 18] = [
     DestructiveOp::MemorySupersede.operation_key(),
     DestructiveOp::MemoryPin.operation_key(),
     DestructiveOp::MemoryUnpin.operation_key(),
+    DestructiveOp::MemoryBind.operation_key(),
+    DestructiveOp::MemoryUnbind.operation_key(),
     DestructiveOp::MemoryRestore.operation_key(),
     DestructiveOp::MemoryArchive.operation_key(),
     DestructiveOp::MemoryUnarchive.operation_key(),
@@ -302,9 +304,21 @@ impl GatewayMcpApplication {
         value: &Value,
     ) -> Result<ToolOutput, ErrorCode> {
         let requested_workspace = workspace(value)?;
+        // card 22b review fix: `task_id` IS served now — it is the §25.4.A(7) TaskId the two
+        // binding-backed selectors read, and leaving it on the fail-closed list meant the task
+        // dimension could not be exercised on the wire at all. `context_repo` resolves it
+        // against `coord.tasks` in the assemble transaction (NotFound when it names nothing).
+        let requested_task = value
+            .get("task_id")
+            .map(|raw| {
+                Uuid::parse_str(raw.as_str().ok_or(ErrorCode::InvalidInput)?)
+                    .map_err(|_| ErrorCode::InvalidInput)
+            })
+            .transpose()?
+            .map(TaskId);
         // These schema fields are valid contracts but this concrete route has no
         // semantics for them yet.  Admit/audit the request and then fail closed.
-        if ["project_id", "task_id", "query", "limit"]
+        if ["project_id", "query", "limit"]
             .iter()
             .any(|field| value.get(*field).is_some())
         {
@@ -327,6 +341,7 @@ impl GatewayMcpApplication {
                         pool,
                         request.authorization().clone(),
                         request.workspace_id(),
+                        requested_task,
                         bootstrap,
                         |result| {
                             let value =
@@ -1202,11 +1217,45 @@ impl GatewayMcpApplication {
         output(value)
     }
 
-    /// §36 `memory.pin` / `memory.unpin` through the same §33.10 confirm gate (ADR-0019).
-    /// One arm for both: identical wire shape (`memory_id` + optional `confirm_token`), the
-    /// closed `op` is the only difference, and the token is bound to it (a pin confirmation
-    /// never executes an unpin). No `workspace_id` on the wire: the route is the credential's
-    /// bound workspace (same rule as `memory.get` / `memory.supersede`).
+    /// The three closed arguments of the four binding ops (§36 + §25.4.A(7)/(9)).
+    ///
+    /// `task_id` is required by exactly the MANDATORY pair and refused on the PINNED pair; a
+    /// bind with no task is `INVALID_INPUT`, never a tenant-wide MANDATORY binding by accident.
+    /// `replaces_binding_id` is `memory.bind`'s authorized A->B replacement and is refused
+    /// everywhere else.
+    fn binding_write_arguments(
+        value: &Value,
+        op: DestructiveOp,
+    ) -> Result<(MemoryId, Option<TaskId>, Option<Uuid>), ErrorCode> {
+        let memory = MemoryId::parse(value["memory_id"].as_str().ok_or(ErrorCode::InvalidInput)?)?;
+        let uuid_arg = |name: &str| -> Result<Option<Uuid>, ErrorCode> {
+            value
+                .get(name)
+                .map(|raw| {
+                    Uuid::parse_str(raw.as_str().ok_or(ErrorCode::InvalidInput)?)
+                        .map_err(|_| ErrorCode::InvalidInput)
+                })
+                .transpose()
+        };
+        let task = uuid_arg("task_id")?.map(TaskId);
+        let replaces_binding_id = uuid_arg("replaces_binding_id")?;
+        let mandatory = matches!(op, DestructiveOp::MemoryBind | DestructiveOp::MemoryUnbind);
+        if mandatory != task.is_some() || (!mandatory && replaces_binding_id.is_some()) {
+            return Err(ErrorCode::InvalidInput);
+        }
+        Ok((memory, task, replaces_binding_id))
+    }
+
+    /// §36 `memory.pin` / `memory.unpin` and, since card 22b (ADR-0045), `memory.bind` /
+    /// `memory.unbind`, through the same §33.10 confirm gate (ADR-0019).
+    ///
+    /// One arm for all four: identical wire shape (`memory_id` + optional `confirm_token`,
+    /// plus the required `task_id` for the MANDATORY pair), the closed `op` is the only
+    /// difference, and the token is bound to it (a pin confirmation never executes an unpin,
+    /// and a bind confirmation mints neither actor for the other pair — `ElevatedActor` and
+    /// `ConfirmedUserActor` each refuse the other's ops). No `workspace_id` on the wire: the
+    /// route is the credential's bound workspace (same rule as `memory.get` /
+    /// `memory.supersede`); `task_id` IS on the wire because a task is not a credential route.
     async fn memory_binding_write(
         &self,
         context: &McpHttpContext,
@@ -1215,7 +1264,7 @@ impl GatewayMcpApplication {
         value: &Value,
         op: DestructiveOp,
     ) -> Result<ToolOutput, ErrorCode> {
-        let memory = MemoryId::parse(value["memory_id"].as_str().ok_or(ErrorCode::InvalidInput)?)?;
+        let (memory, task, replaces_binding_id) = Self::binding_write_arguments(value, op)?;
         let presented = value
             .get("confirm_token")
             .map(|token| {
@@ -1239,8 +1288,12 @@ impl GatewayMcpApplication {
                 raw_arguments,
                 ConfirmGate {
                     op,
+                    // §25.4.A(7)/(8): the MANDATORY pair's token binds the PAIR (memory, task).
+                    // The successor leg is exactly what §33.10 rule 9 reserves for an
+                    // operation's second argument (memory.supersede's replacement uses it), so
+                    // a confirmation for "bind S to T" cannot execute "bind S to U".
                     target_id: memory.0,
-                    successor_id: None,
+                    successor_id: task.map(|task| task.0),
                     presented,
                     ttl,
                 },
@@ -1248,9 +1301,17 @@ impl GatewayMcpApplication {
                     // D-E (card 13, ADR-0035): the binding lands at the request's authorized
                     // WORKSPACE route; carry it out so BindingWritten can report the scope.
                     let scope_workspace = write.request.workspace_id();
-                    memory::write_binding(pool, write, stream, op, memory)
-                        .await
-                        .map(|done| (done, scope_workspace))
+                    memory::write_binding(
+                        pool,
+                        write,
+                        stream,
+                        op,
+                        memory,
+                        task,
+                        replaces_binding_id,
+                    )
+                    .await
+                    .map(|done| (done, scope_workspace))
                 },
             )
             .await?;
@@ -1259,20 +1320,49 @@ impl GatewayMcpApplication {
                 "confirmation_required": true,
                 "confirm_token": token.encode(),
                 "operation": operation.operation_key(),
-                "target": { "memory_id": memory.0 },
+                "target": match task {
+                    Some(task) => json!({ "memory_id": memory.0, "task_id": task.0 }),
+                    None => json!({ "memory_id": memory.0 }),
+                },
                 "expires_at": rfc3339(expires_at)?,
             }),
             ConfirmedOutcome::Executed((done, scope_workspace)) => {
                 // write_binding rejects a missing workspace before it can return Ok, so this is
                 // always Some on the executed path; refuse rather than emit a scope-less binding.
                 let scope_workspace = scope_workspace.ok_or(ErrorCode::Internal)?;
+                // The four ops share one output branch and differ only in these three closed
+                // values (memory.output.schema.json `BindingWritten`).
+                let (mode, state, scope) = match op {
+                    DestructiveOp::MemoryPin => (
+                        "PINNED",
+                        "pinned",
+                        json!({"kind":"WORKSPACE","id":scope_workspace.0}),
+                    ),
+                    DestructiveOp::MemoryUnpin => (
+                        "PINNED",
+                        "unpinned",
+                        json!({"kind":"WORKSPACE","id":scope_workspace.0}),
+                    ),
+                    _ => {
+                        let task = task.ok_or(ErrorCode::Internal)?;
+                        (
+                            "MANDATORY",
+                            if op == DestructiveOp::MemoryBind {
+                                "bound"
+                            } else {
+                                "unbound"
+                            },
+                            json!({"kind":"TASK","id":task.0}),
+                        )
+                    }
+                };
                 json!({
                     "memory_id": memory.0,
                     "binding_id": done.binding_id,
-                    "mode": "PINNED",
-                    "state": if op == DestructiveOp::MemoryPin { "pinned" } else { "unpinned" },
+                    "mode": mode,
+                    "state": state,
                     "inserted": done.inserted,
-                    "scope": { "kind": "WORKSPACE", "id": scope_workspace.0 },
+                    "scope": scope,
                 })
             }
         };
@@ -1467,6 +1557,12 @@ impl McpApplication for GatewayMcpApplication {
         }
     }
 
+    // One flat arm per wired operation key, deliberately. `xtask architecture-check`'s *tool
+    // surface truth* arm PARSES this dispatch to recover the routed key set and compares it
+    // against `SUPPORTED_OPERATION_KEYS` and §33's table in both directions; folding the four
+    // binding ops (or any other family) into one predicate arm would hide those keys from the
+    // gate that exists to notice them going missing. Length is the cost of that readability.
+    #[allow(clippy::too_many_lines)]
     async fn invoke(
         &self,
         context: &McpHttpContext,
@@ -1532,6 +1628,26 @@ impl McpApplication for GatewayMcpApplication {
                     &raw_arguments,
                     &value,
                     DestructiveOp::MemoryUnpin,
+                )
+                .await
+            }
+            key if key == DestructiveOp::MemoryBind.operation_key() => {
+                self.memory_binding_write(
+                    context,
+                    &operation,
+                    &raw_arguments,
+                    &value,
+                    DestructiveOp::MemoryBind,
+                )
+                .await
+            }
+            key if key == DestructiveOp::MemoryUnbind.operation_key() => {
+                self.memory_binding_write(
+                    context,
+                    &operation,
+                    &raw_arguments,
+                    &value,
+                    DestructiveOp::MemoryUnbind,
                 )
                 .await
             }

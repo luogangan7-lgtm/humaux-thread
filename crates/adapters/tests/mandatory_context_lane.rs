@@ -1,9 +1,13 @@
 //! §25.4/§25.5 Mandatory Context Lane 的 DB 判据（DOD-020，phase=7 欠账）。
 //!
 //! 本文件打三件事：
-//! 1. **probe 的缺失对象是探测出来的**——`task_explicit_context_v1` /
-//!    `required_current_state_facets_v1` 今天报的缺失列（`task_id` / `facet`）必须与
-//!    `information_schema` 的实况一致，而不是写死的判断（ADR-0006）。
+//! 1. **probe 的缺失对象是探测出来的，而且两个方向都打**——`REGISTRY` 自己声明的依赖逐条
+//!    查目录，满足契约的列**不得**被报成缺失（`probe_reports_the_columns_that_are_actually_missing`），
+//!    而一条真的不满足的依赖**必须**被报成缺失（`an_unsatisfiable_requirement_is_reported_missing`
+//!    ：把生成列 `private.memory_records.facet` 临时换成同名可写列，种出不满足的那一侧）。
+//!    只打前一半的话 `probe_required_columns` 整个改成 `Ok(None)` 也照样绿——今天目录里
+//!    五个 selector 的依赖全部满足（ADR-0006；card 22b 之后 task 维度住在
+//!    `private.context_bindings`，facet 是生成列）。
 //! 2. **selector 是机械规则，不是相似度**——种一条 ProjectConstraint，它必须被选出来；
 //!    种一条同样文本但 authority 不够的，必须选不出来。
 //! 3. **binding 的撤销立即生效**——§25.5 的正对照，最容易漏的那条。
@@ -395,27 +399,93 @@ fn seed_memory_with_visibility(
     memory_id
 }
 
-/// probe 报的缺失对象必须与 `information_schema` 的实况一致。
+/// `pg_attribute.attgenerated` —— 列不在时 `None`，在且非生成列时 `Some("")`。
 ///
-/// 写死一个「task_id 不存在」的判断今天也会绿——所以本条**先自己去查一遍**再比对。
-/// 列一落地，probe 必须自动改口，不需要有人回来改代码（ADR-0006）。
+/// probe 自己查的就是这一列（`context_repo::probe_required_columns`）；两条判据都从这里
+/// 取「目录实况」，免得判据和被判对象各写一份 SQL 再慢慢漂开。
+fn attgenerated(admin: &mut Client, schema: &str, table: &str, column: &str) -> Option<String> {
+    admin
+        .query_opt(
+            "SELECT a.attgenerated::text FROM pg_attribute a \
+               JOIN pg_class c ON c.oid = a.attrelid \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3 \
+                AND a.attnum > 0 AND NOT a.attisdropped",
+            &[&schema, &table, &column],
+        )
+        .expect("probe truth")
+        .map(|row| row.get(0))
+}
+
+/// 目录里 facet 的生成列契约被临时换成一个**同名可写列**，`Drop` 时换回去。
+///
+/// 改名与补列在同一条 simple query 里（= 一个隐式事务，ACCESS EXCLUSIVE 锁全程持有），
+/// 所以别的会话永远看不到一个**没有 `facet` 列**的 `memory_records`——变的只是契约
+/// （可写 vs `GENERATED ALWAYS ... STORED`），引用 `m.facet` 的 selector SQL 照常编译。
+/// 还原写在 `Drop` 里而不是测试末尾：中间任何一条断言红了都不能把影子留在夹具库里。
+///
+/// ponytail: 影子窗口是进程外可见的。`cargo test` 逐个跑 test 二进制，所以同库的
+/// `facet_contract.rs` 不会撞上；换成并行 runner（nextest）要给这两个二进制加库级串行。
+struct FacetShadow {
+    admin: Client,
+}
+
+impl FacetShadow {
+    /// `dsn` 必须是 [`setup`] 已经校验过的 owner 夹具 DSN——这里做 DDL，认错库就是改生产。
+    fn arm(dsn: &str) -> Self {
+        let mut admin = Client::connect(dsn, NoTls).expect("owner login for the facet shadow");
+        admin
+            .batch_execute(
+                "ALTER TABLE private.memory_records \
+                   RENAME COLUMN facet TO facet__probe_shadow; \
+                 ALTER TABLE private.memory_records ADD COLUMN facet text;",
+            )
+            .expect("shadow private.memory_records.facet");
+        Self { admin }
+    }
+}
+
+impl Drop for FacetShadow {
+    fn drop(&mut self) {
+        // 展开中再 panic 会 abort 掉整个测试进程，所以这里只喊，不 panic。
+        if let Err(err) = self.admin.batch_execute(
+            "ALTER TABLE private.memory_records DROP COLUMN facet; \
+             ALTER TABLE private.memory_records \
+               RENAME COLUMN facet__probe_shadow TO facet;",
+        ) {
+            eprintln!(
+                "FATAL: private.memory_records.facet 的影子没能还原（{err}）——\
+                 夹具库 {REQUEST_GUARD_DB} 现在带着一个可写的 facet 列"
+            );
+        }
+    }
+}
+
+/// probe 报的缺失对象必须与目录的实况一致（**满足 ⇒ 不报**这一半）。
+///
+/// 写死一份「哪两列不存在」的清单今天也会绿——card 22b 之前这里正是那样写的
+/// （`memory_records.task_id` / `.facet` 硬编码），而那份清单在 registry 改口的同一天就
+/// 失效了。现在改成**从 `REGISTRY` 自己声明的依赖出发**逐条查目录：列一落地 probe 必须
+/// 自动改口，registry 换一张表 probe 也必须跟着换，都不需要有人回来改一行代码（ADR-0006）。
+///
+/// 第四项 `stored_generated`（§25.4.A(11)）一并核：存在性不是 facet 的契约，
+/// `attgenerated='s'` 才是；一个可写的同名列必须被判成缺失。
 #[test]
 fn probe_reports_the_columns_that_are_actually_missing() {
     let Some((mut f, dsn)) = setup() else { return };
 
     let mut truth = Vec::new();
-    for (table, column) in [("memory_records", "task_id"), ("memory_records", "facet")] {
-        let exists: bool = f
-            .admin
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-                 WHERE table_schema='private' AND table_name=$1 AND column_name=$2)",
-                &[&table, &column],
-            )
-            .expect("probe truth")
-            .get(0);
-        truth.push((format!("private.{table}.{column}"), exists));
+    for spec in &humaux_domain::context::REGISTRY {
+        for (schema, table, column, stored_generated) in spec.required_columns {
+            let attgenerated = attgenerated(&mut f.admin, schema, table, column);
+            let satisfied = match &attgenerated {
+                None => false,
+                Some(kind) => !*stored_generated || kind == "s",
+            };
+            truth.push((format!("{schema}.{table}.{column}"), satisfied));
+        }
     }
+    assert!(!truth.is_empty(), "REGISTRY declares no dependency at all");
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
     let pool = rt
@@ -425,14 +495,93 @@ fn probe_reports_the_columns_that_are_actually_missing() {
         .block_on(context_repo::probe_selectors(&pool))
         .expect("probe");
 
-    for (name, exists) in truth {
-        let reported = availability
+    for (name, satisfied) in truth {
+        // The probe reports the first unsatisfied column of a selector, and suffixes the
+        // generated-column case, so compare on the prefix rather than on equality.
+        let reported = availability.iter().any(|a| {
+            a.missing_object
+                .as_deref()
+                .is_some_and(|missing| missing.starts_with(name.as_str()))
+        });
+        assert!(
+            !(satisfied && reported),
+            "probe 报 {name} 缺失，但目录里它是满足契约的"
+        );
+    }
+    // §25.4.A(11): the task selector must never probe `memory_records.task_id` again.
+    assert!(
+        !availability.iter().any(|a| a
+            .missing_object
+            .as_deref()
+            .is_some_and(|missing| missing.contains("memory_records.task_id"))),
+        "§25.4.A(11) forbids probing private.memory_records.task_id"
+    );
+}
+
+/// 反向判据：**一条真的不满足的依赖必须被报成缺失**（ADR-0006 的另一半）。
+///
+/// 上面那条只证「满足 ⇒ 不报」。目录里五个 selector 的依赖今天全部满足，所以它的另一半
+/// 是空跑的——把 `probe_required_columns` 整个改成 `Ok(None)` 也照样绿。这条把不满足的
+/// 那一侧**种出来**再看 probe 认不认。
+///
+/// 种的正是 §25.4.A(11) 那条契约：facet 的判据不是「列在」，是 `attgenerated='s'`。
+/// 把生成列改名让位给一个同名**可写**列，probe 必须报
+/// `private.memory_records.facet (not stored-generated)`；还原之后必须不报——后半句才让
+/// 前半句说明问题（否则一个逢列必报的 probe 也能过）。
+///
+/// 注错：probe 只查存在性（去掉 `attgenerated='s'` 那一支）⇒ 影子期这条红。
+/// 注错：probe 恒报 `Ok(None)` ⇒ 影子期这条红（上面那条依旧绿）。
+#[test]
+fn an_unsatisfiable_requirement_is_reported_missing() {
+    let Some((mut f, dsn)) = setup() else { return };
+    const FACET: &str = "private.memory_records.facet";
+
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let pool = rt
+        .block_on(RuntimeDbPool::connect(&dsn))
+        .expect("gateway pool");
+    let reported_facet = |pool: &RuntimeDbPool| -> Option<String> {
+        rt.block_on(context_repo::probe_selectors(pool))
+            .expect("probe")
             .iter()
-            .any(|a| a.missing_object.as_deref() == Some(name.as_str()));
+            .find_map(|a| {
+                a.missing_object
+                    .as_deref()
+                    .filter(|missing| missing.starts_with(FACET))
+                    .map(str::to_owned)
+            })
+    };
+
+    // 夹具库还没跑 0172 时 facet 本来就不满足——那就直接用它，不必再种一个。
+    let generated = attgenerated(&mut f.admin, "private", "memory_records", "facet");
+    let shadow = (generated.as_deref() == Some("s")).then(|| {
+        // setup() 已经校验过这个 DSN 指向 127.0.0.1:61719 的隔离夹具库；DDL 只许打在那里。
+        FacetShadow::arm(&std::env::var("HUMAUX_TEST_PG_DSN").expect("owner DSN"))
+    });
+
+    let reported = reported_facet(&pool);
+    assert!(
+        reported.is_some(),
+        "{FACET} 不满足 REGISTRY 的依赖（catalog: {generated:?}，shadow: {}），\
+         probe 必须把它报成缺失——一个只会报 None 的 probe 让 NA 变成静默可用",
+        shadow.is_some()
+    );
+    if shadow.is_some() {
         assert_eq!(
-            reported, !exists,
-            "probe 对 {name} 的判断与 information_schema 不一致：\
-             列存在={exists} 而 probe 报缺失={reported}"
+            reported.as_deref(),
+            Some("private.memory_records.facet (not stored-generated)"),
+            "§25.4.A(11)：存在性不是 facet 的契约，一个可写的同名列必须被判成缺失，\
+             而且缺失对象要说清是哪一条契约破了"
+        );
+    }
+
+    drop(shadow);
+    if generated.as_deref() == Some("s") {
+        assert_eq!(
+            reported_facet(&pool),
+            None,
+            "还原之后 probe 必须改口——否则上面那一报证明不了任何事（ADR-0006：\
+             缺失对象是探测出来的，不是写死的）"
         );
     }
 }

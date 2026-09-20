@@ -16,8 +16,9 @@ use humaux_domain::audit::{AuditEvent, AuditEventId, McpAuditAction};
 use humaux_domain::authority::{AuthorityClass, MemoryId};
 use humaux_domain::confirm::{DestructiveOp, RISK_TAG_CONFIRMATION_MINTED};
 use humaux_domain::context::{
-    Admitted, BindingGrant, ConfirmedUserActor, ContextBudget, FrozenReads, MandatoryLane,
-    MandatoryRow, PinnedLane, SelectorId, SelectorOutcome, SelectorSpec, authorize_pinned, spec,
+    Admitted, BindingGrant, BindingMode, BindingRequest, ConfirmedUserActor, ContextBudget,
+    ElevatedActor, FrozenReads, MandatoryLane, MandatoryRow, PinnedLane, ScopeKind, SelectorId,
+    SelectorOutcome, SelectorSpec, authorize_mandatory, authorize_pinned, spec,
 };
 use humaux_domain::error::ErrorCode;
 use humaux_domain::grounding::{GroundingMode, RowGrounding, SnapshotEdge, classify_in_snapshot};
@@ -25,6 +26,7 @@ use humaux_domain::identity::{
     AuthorizationScope, VisibilityClass, VisibilityDescriptor, can_read,
 };
 use humaux_domain::ids::{Scope, UserId, WorkspaceId};
+use humaux_domain::memory::{MandatoryContextFacet, MemoryType};
 use humaux_domain::selection::{AUTHORIZED_MEMORY_ENUMERATION_V1, Cursor, query_fingerprint};
 use humaux_projection::serving::StreamFamily;
 use humaux_projection::stream::StreamKey;
@@ -92,10 +94,19 @@ fn canonical_scope(
     authorization: &AuthorizationScope,
     requested: &Scope,
 ) -> Result<(AuthorizationScope, Scope), ErrorCode> {
+    // card 22b / §25.4.A(7)/(8): `task_id` is carried through, the other three narrow axes are
+    // still refused. This function is pure, so the "已认证解析" half of §25.4.A(7) cannot happen
+    // here: the id is RESOLVED against `coord.tasks` in the caller's own transaction
+    // (`resolve_task_in_txn`), on both the read path (`run_selectors_in_txn`) and the write
+    // path (`write_binding_confirmed`). A TASK is a **selector association range**, not an
+    // authorization axis: it grants nothing on its own (the binding's target still runs the
+    // full authority/origin floor), and without it `task_explicit_context_v1` has no TaskId to
+    // resolve and is
+    // structurally empty on every request. repository / run / agent stay refused because no
+    // selector reads them yet, and a scope axis nothing consumes is a silent widening.
     if requested.tenant_id != authorization.tenant_id()
         || requested.user_id != authorization.user_id()
         || requested.repository_id.is_some()
-        || requested.task_id.is_some()
         || requested.run_id.is_some()
         || requested.agent_id.is_some()
     {
@@ -112,11 +123,44 @@ fn canonical_scope(
             user_id: authorization.user_id(),
             workspace_id: requested.workspace_id,
             repository_id: None,
-            task_id: None,
+            task_id: requested.task_id,
             run_id: None,
             agent_id: None,
         },
     ))
+}
+
+/// §25.4.A(7)'s "本次已认证解析的 TaskId": the wire uuid must name a real task of **this**
+/// tenant (`coord.tasks`, §48; the row is RLS tenant-isolated and this transaction already
+/// carries `humaux.tenant_id`), or the request is [`ErrorCode::NotFound`] — never a scope axis
+/// the caller invented. Both directions go through here: the read path resolves before any
+/// selector runs, the write path before a TASK binding is created or revoked.
+///
+/// Ceiling, stated rather than implied: `coord.tasks` models a task's **existence and tenant**,
+/// not its membership — it has no owner/participant column, so "the caller belongs to this
+/// task" is not checkable anywhere in this schema and is NOT asserted here. Bounded by the two
+/// gates that do exist: every selector row still passes `readable_memory_ids`/`can_read`, and
+/// every binding write still passes the §33.10 confirm gate bound to (user, memory, task).
+/// ponytail: per-task membership when `coord.tasks` gains a participant table.
+///
+/// # Errors
+/// [`ErrorCode::NotFound`] when no such task exists in this tenant; `Internal` on a DB error.
+async fn resolve_task_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    task: humaux_domain::ids::TaskId,
+) -> Result<(), ErrorCode> {
+    let exists: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM coord.tasks WHERE task_id = $1 AND tenant_id = $2")
+            .bind(task.0)
+            .bind(tenant_id)
+            .fetch_optional(&mut **txn)
+            .await
+            .map_err(|_| ErrorCode::Internal)?;
+    if exists.is_none() {
+        return Err(ErrorCode::NotFound);
+    }
+    Ok(())
 }
 
 /// 一个 selector 今天跑不跑得起来。
@@ -128,11 +172,51 @@ pub struct SelectorAvailability {
     pub missing_object: Option<String>,
 }
 
-/// 拿 [`humaux_domain::context::REGISTRY`] 声明的 `required_columns` 去比
-/// `information_schema.columns`。
+/// 一个 selector 的 `required_columns` 在**本事务的快照里**缺了什么。`None` = 齐全。
 ///
-/// NA 的缺失对象因此是**探测出来的**（`private.memory_records.task_id`），不是写死的判断
-/// ——列一落地，对应 selector 自动可用，没有人需要回来改一行代码（ADR-0006）。
+/// 探测走 `pg_attribute` 而不是 `information_schema.columns`：后者答不出
+/// `attgenerated`。§25.4.A(11)（card 22b）要求 facet 那一列的契约是「存在**且**是
+/// `GENERATED ALWAYS ... STORED`」——一个同名的可写列意味着 facet 有了独立写入口，
+/// 那是 §25.4.A(3) 禁止的东西，必须探测成缺失而不是被当作可用。
+///
+/// 缺失对象名逐字是 `schema.table.column`，生成列契约不成立时后缀 `(not stored-generated)`
+/// ——两者都是**探测出来的**，不是写死的判断（ADR-0006）。
+async fn probe_required_columns(
+    txn: &mut Txn<'_>,
+    s: &'static SelectorSpec,
+) -> Result<Option<String>, ErrorCode> {
+    for (schema, table, column, stored_generated) in s.required_columns {
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT a.attgenerated::text FROM pg_attribute a \
+               JOIN pg_class c ON c.oid = a.attrelid \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3 \
+                AND a.attnum > 0 AND NOT a.attisdropped",
+        )
+        .bind(schema)
+        .bind(table)
+        .bind(column)
+        .fetch_optional(&mut **txn)
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
+        // 第一个缺的就报出来——逐个列全部报出来对调用方没有增量信息，
+        // 补第一个的时候自然会看见第二个。
+        let Some(attgenerated) = found else {
+            return Ok(Some(format!("{schema}.{table}.{column}")));
+        };
+        if *stored_generated && attgenerated != "s" {
+            return Ok(Some(format!(
+                "{schema}.{table}.{column} (not stored-generated)"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// 拿 [`humaux_domain::context::REGISTRY`] 声明的 `required_columns` 去比 `pg_attribute`。
+///
+/// NA 的缺失对象因此是**探测出来的**，不是写死的判断——列一落地，对应 selector 自动可用，
+/// 没有人需要回来改一行代码（ADR-0006）。
 ///
 /// # Errors
 /// 库不可达时返回 [`ErrorCode::Internal`]。
@@ -141,27 +225,7 @@ pub async fn probe_selectors(pool: &RuntimeDbPool) -> Result<[SelectorAvailabili
 
     let mut out: Vec<SelectorAvailability> = Vec::with_capacity(5);
     for s in &humaux_domain::context::REGISTRY {
-        let mut missing: Option<String> = None;
-        for (schema, table, column) in s.required_columns {
-            let exists: bool = sqlx::query(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-                 WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)",
-            )
-            .bind(schema)
-            .bind(table)
-            .bind(column)
-            .fetch_one(&mut *txn)
-            .await
-            .map_err(|_| ErrorCode::Internal)?
-            .try_get(0)
-            .map_err(|_| ErrorCode::Internal)?;
-            if !exists {
-                // 第一个缺的就报出来——逐个列全部报出来对调用方没有增量信息，
-                // 补第一个的时候自然会看见第二个。
-                missing = Some(format!("{schema}.{table}.{column}"));
-                break;
-            }
-        }
+        let missing = probe_required_columns(&mut txn, s).await?;
         out.push(SelectorAvailability {
             id: s.id,
             missing_object: missing,
@@ -218,6 +282,60 @@ const EXPLICIT_BINDINGS_WHERE: &str = "m.tenant_id = $1 \
              AND COALESCE(cb.scope_id, cb.tenant_id) = request_scope.id \
          ) \
      )";
+
+/// `task_explicit_context_v1` 的**候选**（提名 / 义务）枚举。
+///
+/// 裁决 §四.3 点名的陷阱：不要一上来就 inner join + `status='ACTIVE'` 把失效的绑定目标全
+/// 丢掉——那会把「仍然有绑定义务，但目标已不可用」伪装成「没有任何义务」。所以候选只按
+/// 绑定本身枚举；生命周期与权威下限留给下面的取行 WHERE。两者之差就是**未解决义务**
+/// （§25.4.A(9)/(10)），`SelectorOutcome::Ran` 的 `candidate_ids` 减 `rows` 即是。
+const TASK_EXPLICIT_CANDIDATES_WHERE: &str = concat!(
+    "m.tenant_id = $1 AND ",
+    "EXISTS ( \
+       SELECT 1 FROM private.context_bindings cb \
+       WHERE cb.memory_id = m.memory_id \
+         AND cb.tenant_id = m.tenant_id \
+         AND cb.scope_kind = 'TASK' \
+         AND cb.scope_id = $2 \
+         AND cb.mode = 'MANDATORY' \
+         AND cb.revoked_at IS NULL \
+     )"
+);
+
+/// `task_explicit_context_v1` 的取行 WHERE：义务 + 生命周期 + `ExplicitTaskContext` 下限。
+///
+/// 下限是 spec 的 `min_authority`，SQL 侧必须先过（`MandatoryRow::from_selector` 会对低于
+/// 下限的行返回 Err，那是 `Internal` 不是「静默少带」）。绑定或 supersede 关系**不能**
+/// 提升 authority（§25.4.A(8)）：低权威目标在这里被读侧门挡掉，而不是被绑定洗白。
+const TASK_EXPLICIT_ROWS_WHERE: &str = concat!(
+    "m.tenant_id = $1 \
+     AND m.authority_class = 'ExplicitTaskContext' \
+     AND m.status = 'active' \
+     AND m.superseded_by IS NULL \
+     AND m.archived_at IS NULL AND ",
+    "EXISTS ( \
+       SELECT 1 FROM private.context_bindings cb \
+       WHERE cb.memory_id = m.memory_id \
+         AND cb.tenant_id = m.tenant_id \
+         AND cb.scope_kind = 'TASK' \
+         AND cb.scope_id = $2 \
+         AND cb.mode = 'MANDATORY' \
+         AND cb.revoked_at IS NULL \
+     )"
+);
+
+/// `required_current_state_facets_v1` 的 WHERE（§25.4.A(1)/(2)/(4)）。
+///
+/// `$2` 是 [`MandatoryContextFacet::ALL`] 的线值数组——facet 名字只有枚举序列化一处，
+/// SQL 不写字面量。`min_authority` 是 `PrivateKnowledge`，所以 SQL 侧只排除
+/// `PublicKnowledge`；scope 由 `readable_memory_ids` 的 `can_read` 判（与
+/// `project_active_constraints_v1` 同一条依据）。
+const REQUIRED_FACETS_WHERE: &str = "m.tenant_id = $1 \
+     AND m.facet = ANY($2::text[]) \
+     AND m.authority_class <> 'PublicKnowledge' \
+     AND m.status = 'active' \
+     AND m.superseded_by IS NULL \
+     AND m.archived_at IS NULL";
 
 /// 每行的估计 token 数。
 ///
@@ -330,6 +448,64 @@ pub(crate) async fn readable_memory_ids(
         .collect())
 }
 
+/// 每个 selector 的两条 SQL：候选（提名 / 义务）枚举与取行。
+///
+/// 多数 selector 两者同一条谓词；`task_explicit_context_v1` 故意不同——见
+/// [`TASK_EXPLICIT_CANDIDATES_WHERE`]。card 22 之前这里还有一条 `other =>` 兜底臂，
+/// 把「有列但没写谓词」的 selector 判成 `Unavailable`。两个缺谓词的 selector 现在都有了
+/// 谓词，match 是**闭集穷举**：再加 selector 编译器会逼这里跟着改，兜底臂反而会把那次遗漏
+/// 变成一条安静的 NA，所以删掉。
+const fn selector_sql(id: SelectorId) -> (&'static str, &'static str) {
+    match id {
+        SelectorId::TaskExplicitContextV1 => {
+            (TASK_EXPLICIT_CANDIDATES_WHERE, TASK_EXPLICIT_ROWS_WHERE)
+        }
+        SelectorId::ProjectActiveConstraintsV1 => {
+            (PROJECT_CONSTRAINTS_WHERE, PROJECT_CONSTRAINTS_WHERE)
+        }
+        SelectorId::UserConfirmedCorrectionsV1 => (USER_CORRECTIONS_WHERE, USER_CORRECTIONS_WHERE),
+        SelectorId::RequiredCurrentStateFacetsV1 => (REQUIRED_FACETS_WHERE, REQUIRED_FACETS_WHERE),
+        SelectorId::ExplicitMandatoryBindingsV1 => {
+            (EXPLICIT_BINDINGS_WHERE, EXPLICIT_BINDINGS_WHERE)
+        }
+    }
+}
+
+/// 发一条 selector SQL，按 selector 绑它自己的参数。`$1` 恒为 tenant；其余按 id。
+///
+/// 这是参数**唯一**被拼进去的地方——候选枚举与取行共用它，所以「两次枚举用的是同一组
+/// 参数」不靠两处代码各自守纪律。
+async fn fetch_selector_rows(
+    txn: &mut Txn<'_>,
+    sql: &str,
+    id: SelectorId,
+    scope: &Scope,
+) -> Result<Vec<sqlx::postgres::PgRow>, ErrorCode> {
+    let query = sqlx::query(sql).bind(scope.tenant_id.0);
+    let query = match id {
+        SelectorId::ExplicitMandatoryBindingsV1 => {
+            let (kinds, ids) = scope_chain_params(scope);
+            query.bind(kinds).bind(ids)
+        }
+        // §25.4.A(7): the one authenticated TaskId of this request, or SQL NULL when the
+        // request carries no task dimension (then the binding predicate matches nothing).
+        SelectorId::TaskExplicitContextV1 => query.bind(scope.task_id.map(|task| task.0)),
+        // §25.4.A(1): the facet wire values come from the closed enum's serialization —
+        // `MandatoryContextFacet::ALL`, never a literal list in SQL.
+        SelectorId::RequiredCurrentStateFacetsV1 => query.bind(
+            MandatoryContextFacet::ALL
+                .iter()
+                .map(|facet| facet.wire().to_owned())
+                .collect::<Vec<String>>(),
+        ),
+        SelectorId::ProjectActiveConstraintsV1 | SelectorId::UserConfirmedCorrectionsV1 => query,
+    };
+    query
+        .fetch_all(&mut **txn)
+        .await
+        .map_err(|_| ErrorCode::Internal)
+}
+
 async fn selector_candidate_ids(
     txn: &mut Txn<'_>,
     s: &'static SelectorSpec,
@@ -337,21 +513,7 @@ async fn selector_candidate_ids(
     scope: &Scope,
 ) -> Result<Vec<Uuid>, ErrorCode> {
     let sql = format!("SELECT m.memory_id FROM private.memory_records m WHERE {where_clause}");
-    let rows = if s.id == SelectorId::ExplicitMandatoryBindingsV1 {
-        let (kinds, ids) = scope_chain_params(scope);
-        sqlx::query(&sql)
-            .bind(scope.tenant_id.0)
-            .bind(kinds)
-            .bind(ids)
-            .fetch_all(&mut **txn)
-            .await
-    } else {
-        sqlx::query(&sql)
-            .bind(scope.tenant_id.0)
-            .fetch_all(&mut **txn)
-            .await
-    }
-    .map_err(|_| ErrorCode::Internal)?;
+    let rows = fetch_selector_rows(txn, &sql, s.id, scope).await?;
     rows.into_iter()
         .map(|row| row.try_get("memory_id").map_err(|_| ErrorCode::Internal))
         .collect()
@@ -362,11 +524,11 @@ async fn selector_candidate_ids(
 async fn run_selector(
     txn: &mut Txn<'_>,
     s: &'static SelectorSpec,
-    where_clause: &str,
     authorization: &AuthorizationScope,
     scope: &Scope,
 ) -> Result<SelectorOutcome, ErrorCode> {
-    let expected_candidates = selector_candidate_ids(txn, s, where_clause, scope).await?;
+    let (candidates_where, where_clause) = selector_sql(s.id);
+    let expected_candidates = selector_candidate_ids(txn, s, candidates_where, scope).await?;
     let expected_ids = readable_memory_ids(txn, authorization, &expected_candidates).await?;
 
     // ② 取行——每行带两个快照内 grounding 事实（有没有 LIVE edge / 有没有未记版本的
@@ -382,21 +544,7 @@ async fn run_selector(
                   AS has_live_unversioned \
          FROM private.memory_records m WHERE {where_clause} ORDER BY m.memory_id"
     );
-    let rows = if s.id == SelectorId::ExplicitMandatoryBindingsV1 {
-        let (kinds, ids) = scope_chain_params(scope);
-        sqlx::query(&sql)
-            .bind(scope.tenant_id.0)
-            .bind(kinds)
-            .bind(ids)
-            .fetch_all(&mut **txn)
-            .await
-    } else {
-        sqlx::query(&sql)
-            .bind(scope.tenant_id.0)
-            .fetch_all(&mut **txn)
-            .await
-    }
-    .map_err(|_| ErrorCode::Internal)?;
+    let rows = fetch_selector_rows(txn, &sql, s.id, scope).await?;
 
     let mut out = Vec::with_capacity(rows.len());
     let mut needs = Vec::new();
@@ -474,11 +622,67 @@ fn grounding_from_facts(has_live: bool, has_live_unversioned: bool) -> RowGround
     classify_in_snapshot(&edges)
 }
 
+/// §25.4 的五个 selector，**合并之前**的逐个结果：probe（同快照）→ 可用者跑自己的候选
+/// 枚举 + 取行，不可用者具名 `Unavailable`。
+///
+/// 单独抽出来不是为了复用，是为了可断言：`MandatoryLane` 按 Memory 身份去重，所以
+/// 「Task(T) 恰好是 {S}」「Facets(W) 恰好是 {S,D,State-U}」在合并后的 lane 里**读不出来**
+/// ——同一条 S 被两个 selector 提名时只剩一行。裁决 §五.3 要的正是合并前的精确集合：
+/// 只看最终并集时，Facets 的 STATE 分支坏掉仍会被 Task lane 把 S 补回去，那是假绿。
+async fn run_selectors_in_txn(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+    scope: &Scope,
+) -> Result<[SelectorOutcome; 5], ErrorCode> {
+    // §25.4.A(7): a TaskId on the read path is resolved BEFORE any selector runs — an
+    // unresolvable task must not read back as "this task has no mandatory context".
+    if let Some(task) = scope.task_id {
+        resolve_task_in_txn(txn, scope.tenant_id.0, task).await?;
+    }
+    // probe（同快照）。DDL 探测滞后于快照是接受语义——本次装配看到的世界就是这个快照的世界。
+    let mut availability: Vec<(SelectorId, Option<String>)> = Vec::with_capacity(5);
+    for sp in &humaux_domain::context::REGISTRY {
+        availability.push((sp.id, probe_required_columns(txn, sp).await?));
+    }
+
+    let mut out: Vec<SelectorOutcome> = Vec::with_capacity(5);
+    for (id, missing) in availability {
+        if let Some(missing_object) = missing {
+            out.push(SelectorOutcome::Unavailable { id, missing_object });
+            continue;
+        }
+        out.push(run_selector(txn, spec(id), authorization, scope).await?);
+    }
+    out.try_into().map_err(|_| ErrorCode::Internal)
+}
+
+/// [`run_selectors_in_txn`] on its own REPEATABLE READ transaction — the pre-merge readback
+/// the card-22b live witness asserts per-selector exact id sets against.
+///
+/// # Errors
+/// 库不可达、scope 越权、authority 线值不在闭集内 ⇒ [`ErrorCode::Internal`] / `Forbidden`。
+pub async fn selector_outcomes(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    requested_scope: &Scope,
+) -> Result<[SelectorOutcome; 5], ErrorCode> {
+    let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *txn)
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
+    let (authorization, scope) = canonical_scope(authorization, requested_scope)?;
+    set_authorization_local(&mut txn, &authorization).await?;
+    let outcomes = run_selectors_in_txn(&mut txn, &authorization, &scope).await?;
+    txn.commit().await.map_err(|_| ErrorCode::Internal)?;
+    Ok(outcomes)
+}
+
 /// §25.4 装配的**全部冻结读数**，单事务取齐——G80-31「同一 `context_snapshot_seq` 两次
 /// 装配逐字节相同」的取数半边。
 ///
 /// 一个 `REPEATABLE READ` 事务（`consolidate_repo` 的 §11.7 同款配方，只读路径不带
-/// `READ WRITE`），依次：隔离级 → 租户上下文 → probe（`information_schema` 进同快照；
+/// `READ WRITE`），依次：隔离级 → 租户上下文 → probe（`pg_attribute` 进同快照；
 /// DDL 探测滞后于快照是**接受语义**——本次装配看到的世界就是这个快照的世界）→ 各
 /// selector 的独立候选枚举 + 取行 → pinned 的独立候选枚举 + 取行 + excluded 具名 → 快照身份。
 ///
@@ -518,71 +722,7 @@ pub(crate) async fn fetch_frozen_in_txn(
 ) -> Result<FrozenReads, ErrorCode> {
     let (authorization, scope) = canonical_scope(authorization, requested_scope)?;
     set_authorization_local(txn, &authorization).await?;
-    // probe（同快照）。
-    let mut availability: Vec<(SelectorId, Option<String>)> = Vec::with_capacity(5);
-    for sp in &humaux_domain::context::REGISTRY {
-        let mut missing: Option<String> = None;
-        for (schema, table, column) in sp.required_columns {
-            let exists: bool = sqlx::query(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-                 WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)",
-            )
-            .bind(schema)
-            .bind(table)
-            .bind(column)
-            .fetch_one(&mut **txn)
-            .await
-            .map_err(|_| ErrorCode::Internal)?
-            .try_get(0)
-            .map_err(|_| ErrorCode::Internal)?;
-            if !exists {
-                missing = Some(format!("{schema}.{table}.{column}"));
-                break;
-            }
-        }
-        availability.push((sp.id, missing));
-    }
-
-    // mandatory 五个 selector。
-    let mut out: Vec<SelectorOutcome> = Vec::with_capacity(5);
-    for (id, missing) in availability {
-        if let Some(missing_object) = missing {
-            out.push(SelectorOutcome::Unavailable { id, missing_object });
-            continue;
-        }
-        let sp = spec(id);
-        let where_clause = match id {
-            SelectorId::ProjectActiveConstraintsV1 => PROJECT_CONSTRAINTS_WHERE,
-            SelectorId::UserConfirmedCorrectionsV1 => USER_CORRECTIONS_WHERE,
-            SelectorId::ExplicitMandatoryBindingsV1 => EXPLICIT_BINDINGS_WHERE,
-            // Card 22 correction: this arm is **unreachable today**, and saying so matters
-            // because ADR-0041 D-I recorded the opposite. `TaskExplicitContextV1` and
-            // `RequiredCurrentStateFacetsV1` declare `required_columns`
-            // `private.memory_records.task_id` / `.facet` (`domain::context` REGISTRY), and
-            // neither column exists — measured 2026-09-17: `private.memory_records` has 21
-            // columns and no task or facet dimension. The probe loop above therefore emits
-            // `Unavailable { missing_object: "private.memory_records.task_id" }` and
-            // `continue`s before the dispatch below ever runs, so writing a WHERE clause here
-            // would change no output. The real unlock is the two columns (migration + §6.2.2
-            // grant row + rls_check MATRIX) plus, for the facets selector, the §25.2↔§24
-            // alignment clause §25.4 still does not contain — the REGISTRY refuses to guess it
-            // on purpose (a guessed mapping makes G25-1 accidentally green, §80.1).
-            //
-            // The arm stays as the fail-closed floor: a selector that becomes column-available
-            // without a predicate here must be `Unavailable`, never a silent empty lane.
-            other => {
-                out.push(SelectorOutcome::Unavailable {
-                    id: other,
-                    missing_object: format!(
-                        "adapters::context_repo 尚未实现 {other:?} 的 WHERE 子句"
-                    ),
-                });
-                continue;
-            }
-        };
-        out.push(run_selector(txn, sp, where_clause, &authorization, &scope).await?);
-    }
-    let outcomes: [SelectorOutcome; 5] = out.try_into().map_err(|_| ErrorCode::Internal)?;
+    let outcomes = run_selectors_in_txn(txn, &authorization, &scope).await?;
     let mandatory = MandatoryLane::from_selectors(outcomes)?;
 
     let pinned = fetch_pinned_in_txn(txn, &authorization, &scope).await?;
@@ -1697,6 +1837,42 @@ pub async fn revoke_binding_in_txn(
     Ok(affected == 1)
 }
 
+/// §25.4.A(9)'s A->B replacement, the **only** site that takes a binding id from the wire:
+/// revokes exactly the binding this `memory.bind` is authorized to replace.
+///
+/// [`revoke_binding_in_txn`]'s two other callers derive their binding id in-transaction
+/// (`active_pinned_binding_in_txn` / `active_task_mandatory_binding_in_txn`), so the id there
+/// is already known to be the right row. `replaces_binding_id` is not: it arrives unvalidated
+/// from the MCP argument, and the confirm token binds only (tenant, user, op, memory, task).
+/// The extra predicates are what keeps the replacement inside the dimension the token DOES
+/// cover — the same (TASK, `scope_id`, MANDATORY) tuple this call is writing. A caller-supplied
+/// id outside it (another task's MANDATORY row, any WORKSPACE/PINNED row, another tenant's
+/// binding) matches zero rows and the call is `Conflict`; it is never revoked.
+///
+/// # Errors
+/// [`ErrorCode::Internal`] on a DB error. `Ok(false)` = no row matched (caller: `Conflict`).
+async fn revoke_task_mandatory_binding_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    task: humaux_domain::ids::TaskId,
+    binding_id: Uuid,
+) -> Result<bool, ErrorCode> {
+    let affected = sqlx::query(
+        "UPDATE private.context_bindings SET revoked_at = now() \
+         WHERE context_binding_id = $1 AND tenant_id = $2 \
+           AND scope_kind = 'TASK' AND scope_id = $3 AND mode = 'MANDATORY' \
+           AND revoked_at IS NULL",
+    )
+    .bind(binding_id)
+    .bind(tenant_id)
+    .bind(task.0)
+    .execute(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
 /// [`revoke_binding_in_txn`] in its own short transaction (non-gated callers).
 ///
 /// # Errors
@@ -1729,6 +1905,14 @@ pub struct BindingWriteRequest {
     pub memory: MemoryId,
     /// The credential's bound workspace: the PINNED row's scope (`application::pin::pin_request`).
     pub workspace: WorkspaceId,
+    /// `memory.bind` / `memory.unbind` only (§25.4.A(7)): the authenticated TASK the MANDATORY
+    /// binding is written under. `None` for pin/unpin; required (and rejected when absent) for
+    /// bind/unbind — there is no tenant-wide MANDATORY binding on this route.
+    pub task: Option<humaux_domain::ids::TaskId>,
+    /// `memory.bind` only (§25.4.A(9)): the authorized A->B explicit replacement. The named
+    /// binding is revoked and B's binding created **in this same transaction**; a binding that
+    /// is already revoked (or is not this tenant's) is `Conflict`, never a silent skip.
+    pub replaces_binding_id: Option<Uuid>,
     pub claim: ConfirmationClaim,
     pub finished_audit: AuditEvent,
 }
@@ -1762,13 +1946,49 @@ fn validate_binding_write(
     {
         return Err(ErrorCode::InvalidInput);
     }
-    humaux_application::pin::check_claim(
-        op,
-        request.claim.op,
-        request.claim.target_id,
-        request.claim.successor_id,
-        request.memory,
-    )?;
+    // §25.4.A(7): the TASK dimension is required by exactly the two ops that write a TASK
+    // binding, and must be absent on the two that write a WORKSPACE one. A bind with no task
+    // is InvalidInput, not a tenant-wide MANDATORY binding by accident.
+    match op {
+        DestructiveOp::MemoryBind | DestructiveOp::MemoryUnbind => {
+            if request.task.is_none() {
+                return Err(ErrorCode::InvalidInput);
+            }
+            if op == DestructiveOp::MemoryUnbind && request.replaces_binding_id.is_some() {
+                return Err(ErrorCode::InvalidInput);
+            }
+        }
+        _ => {
+            if request.task.is_some() || request.replaces_binding_id.is_some() {
+                return Err(ErrorCode::InvalidInput);
+            }
+        }
+    }
+    match op {
+        DestructiveOp::MemoryPin | DestructiveOp::MemoryUnpin => {
+            humaux_application::pin::check_claim(
+                op,
+                request.claim.op,
+                request.claim.target_id,
+                request.claim.successor_id,
+                request.memory,
+            )?
+        }
+        // §25.4.A(7)/(8): the MANDATORY pair's claim binds a PAIR, not a single target — the
+        // task rides the successor leg. This is not a copy of `pin::check_claim`: that one
+        // REQUIRES `successor_id` to be absent (a pin has no second argument), so the two rules
+        // are different assertions about different tuples and cannot share one implementation.
+        DestructiveOp::MemoryBind | DestructiveOp::MemoryUnbind => {
+            let task = request.task.ok_or(ErrorCode::InvalidInput)?;
+            if request.claim.op != op
+                || request.claim.target_id != request.memory.0
+                || request.claim.successor_id != Some(task.0)
+            {
+                return Err(ErrorCode::Conflict);
+            }
+        }
+        _ => return Err(ErrorCode::InvalidInput),
+    }
     let event = &request.finished_audit;
     if event.tenant_id != auth.tenant_id()
         || event.actor_id != auth.principal().0.to_string()
@@ -1807,6 +2027,82 @@ async fn active_pinned_binding_in_txn(
     .map_err(|_| ErrorCode::Internal)
 }
 
+/// The active MANDATORY row for (tenant, TASK scope, memory), if any — the same key
+/// `ux_context_bindings_active` makes unique, so at most one row can match.
+async fn active_task_mandatory_binding_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    task: humaux_domain::ids::TaskId,
+    memory: MemoryId,
+) -> Result<Option<Uuid>, ErrorCode> {
+    sqlx::query_scalar(
+        "SELECT context_binding_id FROM private.context_bindings \
+         WHERE tenant_id = $1 AND memory_id = $2 AND mode = 'MANDATORY' \
+           AND scope_kind = 'TASK' AND scope_id = $3 AND revoked_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(memory.0)
+    .bind(task.0)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)
+}
+
+/// The three facts `authorize_mandatory` re-checks §10.1 against, read **in this transaction**
+/// from the row itself (ruling §三.2: a binding request may not hand the gate its own claims).
+///
+/// A memory with no readable Evidence origin has no basis at all, so there is nothing to
+/// authorize against: `Forbidden`, not an empty-basis default.
+async fn mandatory_binding_facts_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    memory: MemoryId,
+) -> Result<
+    (
+        AuthorityClass,
+        MemoryType,
+        humaux_domain::authority::NonEmptyVec<humaux_domain::evidence::EvidenceOriginClass>,
+    ),
+    ErrorCode,
+> {
+    let row = sqlx::query(
+        "SELECT m.authority_class, m.memory_type FROM private.memory_records m \
+         WHERE m.memory_id = $1 AND m.tenant_id = $2",
+    )
+    .bind(memory.0)
+    .bind(tenant_id)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?
+    .ok_or(ErrorCode::NotFound)?;
+    let authority: String = row
+        .try_get("authority_class")
+        .map_err(|_| ErrorCode::Internal)?;
+    let memory_type: String = row
+        .try_get("memory_type")
+        .map_err(|_| ErrorCode::Internal)?;
+    let authority = parse_authority(&authority)?;
+    let memory_type = MemoryType::parse_wire(&memory_type).ok_or(ErrorCode::Internal)?;
+
+    let origins: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT eo.origin_class FROM private.memory_evidence me \
+           JOIN private.evidence_objects eo ON eo.evidence_id = me.evidence_id \
+          WHERE me.memory_id = $1 AND eo.tenant_id = $2 ORDER BY 1",
+    )
+    .bind(memory.0)
+    .bind(tenant_id)
+    .fetch_all(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?;
+    let basis = origins
+        .iter()
+        .map(|wire| crate::distill_repo::origin_class_from_db_str(wire).ok_or(ErrorCode::Internal))
+        .collect::<Result<Vec<_>, _>>()?;
+    let basis =
+        humaux_domain::authority::NonEmptyVec::new(basis).map_err(|_| ErrorCode::Forbidden)?;
+    Ok((authority, memory_type, basis))
+}
+
 fn rejection(_: humaux_domain::authority::CandidateRejection) -> ErrorCode {
     ErrorCode::Forbidden
 }
@@ -1837,6 +2133,40 @@ pub async fn unpin_confirmed(
     write_binding_confirmed(pool, auth, DestructiveOp::MemoryUnpin, request).await
 }
 
+/// `memory.bind`, confirmed call (card 22b, ADR-0045): the controlled write path the §25.4.A
+/// ruling requires before a TASK/MANDATORY `context_bindings` row can exist at all.
+///
+/// Mirrors [`pin_confirmed`] exactly except for what the binding step does: the envelope reads
+/// the memory's `authority_class` / `memory_type` / Evidence origin basis **in the same
+/// transaction** and hands them to `domain::context::authorize_mandatory`, the only way to
+/// obtain a `BindingGrant` for `BindingMode::Mandatory`. A TASK + MANDATORY request is not
+/// itself an authority proof (§25.4.A(8)).
+///
+/// # Errors
+/// `Forbidden` when §10.1 refuses the memory's own authority/origin; `Conflict` for a
+/// replayed/expired/misbound token, a lost BMO race, or a `replaces_binding_id` that is not an
+/// active binding of this tenant; `NotFound` when the memory is not visible to the caller.
+pub async fn bind_confirmed(
+    pool: &RuntimeDbPool,
+    auth: &AuthorizationScope,
+    request: BindingWriteRequest,
+) -> Result<BindingWriteOutcome, ErrorCode> {
+    write_binding_confirmed(pool, auth, DestructiveOp::MemoryBind, request).await
+}
+
+/// `memory.unbind`, confirmed call: revokes the TASK/MANDATORY row only — Evidence/Memory
+/// untouched (§36). `Conflict` when nothing is bound.
+///
+/// # Errors
+/// As [`bind_confirmed`].
+pub async fn unbind_confirmed(
+    pool: &RuntimeDbPool,
+    auth: &AuthorizationScope,
+    request: BindingWriteRequest,
+) -> Result<BindingWriteOutcome, ErrorCode> {
+    write_binding_confirmed(pool, auth, DestructiveOp::MemoryUnbind, request).await
+}
+
 /// The binding step of [`write_binding_confirmed`], past the consumed token and **in the
 /// same transaction**: D-C idempotent pin through the sole INSERT site, unpin through the
 /// sole revoke site.
@@ -1847,6 +2177,7 @@ async fn apply_binding_write(
     op: DestructiveOp,
     request: &BindingWriteRequest,
     existing: Option<Uuid>,
+    scope: &Scope,
 ) -> Result<BindingWriteOutcome, ErrorCode> {
     use humaux_application::pin::{PinAction, pin_action, pin_request, unpin_target};
     match op {
@@ -1870,6 +2201,72 @@ async fn apply_binding_write(
             }
         },
         DestructiveOp::MemoryUnpin => {
+            let binding_id = unpin_target(existing)?;
+            if !revoke_binding_in_txn(txn, tenant_id, binding_id).await? {
+                return Err(ErrorCode::Conflict);
+            }
+            Ok(BindingWriteOutcome {
+                binding_id,
+                inserted: false,
+            })
+        }
+        // card 22b / §25.4.A(8): MANDATORY at a TASK scope. Same confirm gate, different
+        // authorization — the memory's own §10.1 standing is re-read here and re-checked by
+        // `authorize_mandatory`; the binding itself grants nothing.
+        DestructiveOp::MemoryBind => {
+            let task = request.task.ok_or(ErrorCode::InvalidInput)?;
+            // §25.4.A(9): the authorized A->B replacement revokes A in THIS transaction, before
+            // B's row is created — scoped to the (TASK = this task, MANDATORY) dimension this
+            // operation is authorized for, so the wire argument cannot reach a PINNED row or
+            // another task's binding (see `revoke_task_mandatory_binding_in_txn`). Zero rows
+            // affected = already revoked, or outside that dimension: `Conflict`, never a silent
+            // continue. Replacing a binding with itself is refused before the UPDATE — it would
+            // otherwise revoke the very row the idempotent `ReturnExisting` arm below reports
+            // back as `state: "bound"`.
+            if let Some(replaced) = request.replaces_binding_id {
+                if existing == Some(replaced) {
+                    return Err(ErrorCode::Conflict);
+                }
+                if !revoke_task_mandatory_binding_in_txn(txn, tenant_id, task, replaced).await? {
+                    return Err(ErrorCode::Conflict);
+                }
+            }
+            match pin_action(existing) {
+                // Idempotent, same rule as pin (ADR-0019 D-C): already bound is not an error.
+                PinAction::ReturnExisting(binding_id) => Ok(BindingWriteOutcome {
+                    binding_id,
+                    inserted: false,
+                }),
+                PinAction::Insert => {
+                    // D-A: the actor exists only past a consumed confirmation for this memory.
+                    let actor = ElevatedActor::from_consumed_confirmation(op, request.memory)
+                        .map_err(rejection)?;
+                    let (authority, memory_type, basis) =
+                        mandatory_binding_facts_in_txn(txn, tenant_id, request.memory).await?;
+                    let grant = authorize_mandatory(
+                        &humaux_domain::policy::OriginBoundAuthorityPolicy,
+                        &actor,
+                        BindingRequest {
+                            mode: BindingMode::Mandatory,
+                            scope_kind: ScopeKind::Task,
+                            scope_id: Some(task.0),
+                            memory_id: request.memory,
+                        },
+                        authority,
+                        memory_type,
+                        basis,
+                        scope,
+                    )
+                    .map_err(rejection)?;
+                    let binding_id = insert_binding_in_txn(txn, user_id, &grant, tenant_id).await?;
+                    Ok(BindingWriteOutcome {
+                        binding_id,
+                        inserted: true,
+                    })
+                }
+            }
+        }
+        DestructiveOp::MemoryUnbind => {
             let binding_id = unpin_target(existing)?;
             if !revoke_binding_in_txn(txn, tenant_id, binding_id).await? {
                 return Err(ErrorCode::Conflict);
@@ -1944,10 +2341,30 @@ async fn write_binding_confirmed(
     {
         return Err(ErrorCode::NotFound);
     }
-    let existing =
-        active_pinned_binding_in_txn(&mut txn, tenant_id, request.workspace, request.memory)
-            .await?;
-    let outcome = apply_binding_write(&mut txn, tenant_id, user_id, op, &request, existing).await?;
+    let existing = match op {
+        DestructiveOp::MemoryBind | DestructiveOp::MemoryUnbind => {
+            let task = request.task.ok_or(ErrorCode::InvalidInput)?;
+            // §25.4.A(7): the TaskId must resolve to a task of this tenant before a binding is
+            // written under it — a wire uuid naming nothing is `NotFound`, not a new task scope.
+            resolve_task_in_txn(&mut txn, tenant_id, task).await?;
+            active_task_mandatory_binding_in_txn(&mut txn, tenant_id, task, request.memory).await?
+        }
+        _ => {
+            active_pinned_binding_in_txn(&mut txn, tenant_id, request.workspace, request.memory)
+                .await?
+        }
+    };
+    let scope = Scope {
+        tenant_id: auth.tenant_id(),
+        user_id: auth.user_id(),
+        workspace_id: Some(request.workspace),
+        repository_id: None,
+        task_id: request.task,
+        run_id: None,
+        agent_id: None,
+    };
+    let outcome =
+        apply_binding_write(&mut txn, tenant_id, user_id, op, &request, existing, &scope).await?;
 
     if quota_repo::finish_reservation_in_txn(&mut txn, auth, &reservation, true).await?
         != ReservationStatus::Consumed
