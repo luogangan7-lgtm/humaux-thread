@@ -443,7 +443,7 @@
         "feature_key": "mcp.billable_operations.per_period",
         "meter_kind": "ordinary1"
       },
-      "description": "§25.4.A(8) (card 22b, ADR-0045): create the MANDATORY context binding for this memory at the authenticated TASK scope — the controlled write path task_explicit_context_v1 reads. TASK + MANDATORY is not an authority proof: the envelope re-reads the memory's own authority_class / memory_type / Evidence origin basis in the same transaction and re-checks §10.1 before any row is written. replaces_binding_id performs the authorized A->B explicit replacement (§25.4.A(9)): the named binding is revoked and this one created in ONE transaction; a binding that is not an active binding of this tenant is a CONFLICT.",
+      "description": "§25.4.A(8) (card 22b, ADR-0045): create the MANDATORY context binding for this memory at the authenticated TASK scope — the controlled write path task_explicit_context_v1 reads. TASK + MANDATORY is not an authority proof: the envelope re-reads the memory's own authority_class / memory_type / Evidence origin basis in the same transaction and re-checks §10.1 before any row is written. replaces_binding_id performs the authorized A->B explicit replacement (§25.4.A(9)): the named binding is revoked and this one created in ONE transaction; a binding that is not an active binding of this tenant is a CONFLICT. card 22c (ADR-0046): purpose is REQUIRED and closed. REFERENCE_ONLY creates the binding only — the obligation is nominated and reported, and is rejected at read time with MISSING_TASK_AUTHORIZATION. ADOPT_TASK_INSTRUCTION additionally writes the private.task_binding_grants row in the SAME transaction, which is the only way this memory can be used at ExplicitTaskContext inside this task; the stored memory row's own authority_class is never changed (I-STORE). purpose is covered by the confirm token: it is folded into the token's successor leg, so a confirmation minted for REFERENCE_ONLY cannot execute an ADOPT_TASK_INSTRUCTION bind (CONFLICT).",
       "properties": {
         "action": {
           "const": "bind"
@@ -455,6 +455,14 @@
         "task_id": {
           "type": "string",
           "format": "uuid"
+        },
+        "purpose": {
+          "type": "string",
+          "enum": [
+            "REFERENCE_ONLY",
+            "ADOPT_TASK_INSTRUCTION"
+          ],
+          "description": "What the binding is FOR (card 22c, ADR-0046). Only ADOPT_TASK_INSTRUCTION produces a task authorization; there is no default."
         },
         "replaces_binding_id": {
           "type": "string",
@@ -469,7 +477,8 @@
       "required": [
         "action",
         "memory_id",
-        "task_id"
+        "task_id",
+        "purpose"
       ],
       "additionalProperties": false
     },

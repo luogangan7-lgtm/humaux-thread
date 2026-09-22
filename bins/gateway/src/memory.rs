@@ -700,6 +700,11 @@ pub(crate) async fn archive(
 /// scoped to the credential's bound workspace, which must be the bootstrap stream's
 /// workspace — the same rule `memory.supersede` applies — so `context.assemble` reads it back
 /// through the same scope chain.
+// Eight arguments: the four binding ops share one route, and the last three
+// (`task`, `replaces_binding_id`, `purpose`) are each required by exactly one of them.
+// Bundling them into a struct would move the same values one line up and lose the
+// compiler's per-call-site "you forgot one".
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_binding(
     pool: Arc<RuntimeDbPool>,
     write: ConfirmedWrite,
@@ -708,6 +713,9 @@ pub(crate) async fn write_binding(
     memory: MemoryId,
     task: Option<humaux_domain::ids::TaskId>,
     replaces_binding_id: Option<uuid::Uuid>,
+    // card 22c (ADR-0046): `memory.bind` only. `AdoptTaskInstruction` is the one value that
+    // writes a task authorization alongside the binding.
+    purpose: Option<humaux_domain::context::BindingPurpose>,
 ) -> Result<BindingWriteOutcome, ErrorCode> {
     let workspace = write
         .request
@@ -725,6 +733,7 @@ pub(crate) async fn write_binding(
         workspace,
         task,
         replaces_binding_id,
+        purpose,
         claim: write.claim,
         finished_audit: write.finished_audit,
     };

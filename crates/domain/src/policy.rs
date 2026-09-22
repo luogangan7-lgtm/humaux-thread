@@ -121,6 +121,39 @@ impl AuthorityPolicy for OriginBoundAuthorityPolicy {
         basis: NonEmptyVec<EvidenceOriginClass>,
         _scope: &Scope,
     ) -> Result<AuthorizedAuthority, CandidateRejection> {
+        StoredAuthority::authorize(requested, memory_type, basis)
+    }
+}
+
+/// §10.1 存储权威的唯一判定点（card 22c / ADR-0046 的 **I-STORE**）。
+///
+/// 零尺寸、无状态，和 [`OriginBoundAuthorityPolicy`] 是同一个实现的两张脸：trait 那张脸给
+/// 需要 `dyn AuthorityPolicy` 的调用方，这张脸给注错闸——「放开对 6 的拒绝」必须是**一处**
+/// 可以改的地方，否则「注错变红」证明的只是某一个调用点。
+pub struct StoredAuthority;
+
+impl StoredAuthority {
+    /// I-STORE：**存储行**可以带哪个 `AuthorityClass`。
+    ///
+    /// 两道门，顺序不可换：
+    ///
+    /// 1. `ExplicitTaskContext` **一律**拒绝。它不是一个够不够高的问题——6 根本不是内容属性，
+    ///    而是「当前任务上下文实例」的使用权威，由 `domain::context::authorize_task_item` 验过
+    ///    的一条任务绑定授权证明（I-TASK）。card 22b 之前这条只由 ceiling 表**间接**挡住
+    ///    （没有任何 origin 的天花板到得了 6）；间接的守卫会随表变动而失效，而这一条不会。
+    /// 2. 再是 §10.1 的 origin ceiling 表（`requested > ceiling` ⇒ 拒，从不静默降级）。
+    ///
+    /// # Errors
+    /// `ExplicitTaskContext`、或 `requested` 超过 basis 任一 origin 的天花板。
+    pub fn authorize(
+        requested: AuthorityClass,
+        memory_type: MemoryType,
+        basis: NonEmptyVec<EvidenceOriginClass>,
+    ) -> Result<AuthorizedAuthority, CandidateRejection> {
+        // I-STORE. 注错点：删掉这三行，`stored_authority_refuses_explicit_task_context` 判红。
+        if matches!(requested, AuthorityClass::ExplicitTaskContext) {
+            return Err(CandidateRejection::OriginAuthorityCeiling);
+        }
         // Tenant-boundary checking (`CrossTenantEvidence`) needs a tenant id per Evidence;
         // `EvidenceOriginClass` here is an opaque origin tag with no tenant field, so this
         // trait shape cannot evaluate it — that check belongs where the caller still has the
@@ -203,6 +236,69 @@ mod ceiling_table_tests {
                 "{origin:?} base ceiling mismatch"
             );
         }
+    }
+
+    /// card 22c / ADR-0046 **I-STORE**：存储权威对 `ExplicitTaskContext` 的拒绝是**直接的**，
+    /// 不是「天花板恰好够不着」的副作用。
+    ///
+    /// 两件事分开断言，因为它们会被不同的改动打断：
+    /// 1. 九个 origin × 每种 memory_type，请求 6 一律 `Err`——注错「放开
+    ///    `StoredAuthority::authorize` 对 6 的拒绝」时，这一半仍然可能被 ceiling 表挡住，
+    ///    所以第 2 条才是真正钉住这条守卫的那一条。
+    /// 2. 即便 basis 的天花板被（假设地）抬到 6，请求 6 仍然被拒——这里用一个**独立**的
+    ///    断言表达：拒绝发生在任何 ceiling 比较之前。删掉 `authorize` 顶部那三行 ⇒ 红。
+    #[test]
+    fn stored_authority_refuses_explicit_task_context() {
+        use crate::memory::MemoryType;
+        use EvidenceOriginClass::*;
+        // §10.1 的九个 origin，逐个写出（枚举没有 ALL；`base_ceiling` 的穷举 match 已经
+        // 保证新增变体编译不过，这里钉的是「每一个都被试过」）。
+        const ORIGINS: [EvidenceOriginClass; 9] = [
+            DirectUserInput,
+            UserConfirmed,
+            TenantAdmin,
+            AuthenticatedAgent,
+            TrustedConnector,
+            ToolResult,
+            UploadedArtifact,
+            ExternalContent,
+            SystemMigration,
+        ];
+        for origin in ORIGINS {
+            for memory_type in MemoryType::ALL {
+                let basis = NonEmptyVec::new(vec![origin]).expect("one origin");
+                assert_eq!(
+                    StoredAuthority::authorize(
+                        AuthorityClass::ExplicitTaskContext,
+                        memory_type,
+                        basis
+                    ),
+                    Err(CandidateRejection::OriginAuthorityCeiling),
+                    "{origin:?}/{memory_type:?} 不得存储 ExplicitTaskContext"
+                );
+            }
+        }
+        // 拒绝早于 ceiling 比较：请求 6 时，`requested <= ceiling` 这一步根本不该被走到。
+        // 用「天花板最高的那条 basis」（TenantAdmin + Constraint ⇒ ProjectConstraint(5)）作对照：
+        // 5 通过、6 被拒，且被拒的原因不依赖表里任何一格的数值。
+        let admin_basis = NonEmptyVec::new(vec![EvidenceOriginClass::TenantAdmin]).expect("basis");
+        assert!(
+            StoredAuthority::authorize(
+                AuthorityClass::ProjectConstraint,
+                MemoryType::Constraint,
+                admin_basis.clone()
+            )
+            .is_ok(),
+            "5 必须仍然可存储，否则这条注错闸会因为把所有东西都拒了而假绿"
+        );
+        assert_eq!(
+            StoredAuthority::authorize(
+                AuthorityClass::ExplicitTaskContext,
+                MemoryType::Constraint,
+                admin_basis
+            ),
+            Err(CandidateRejection::OriginAuthorityCeiling)
+        );
     }
 
     /// §10.1 rule 2: `ExplicitTaskContext` is never reachable through an Evidence-origin basis

@@ -3729,6 +3729,10 @@ fn provider_plane_architecture_gate_checks(root: &Path) -> Vec<(&'static str, Ve
             "§25.4 A3 (authorize_mandatory/pinned 唯一调用点)",
             g25_4_authorize_sole_caller(root),
         ),
+        (
+            "§25.4 A3b (task_binding_grants 唯一写入点 / 任务授权唯一铸造点)",
+            g25_4_task_grant_sole_site(root),
+        ),
     ]
 }
 
@@ -3930,6 +3934,65 @@ fn g25_4_authorize_sole_caller(root: &Path) -> Verdict {
         Verdict::Fail(strays)
     }
 }
+/// §25.4 A3b（card 22c, ADR-0046）：任务授权的两个唯一点。
+///
+/// 和 A2/A3 同一形态，钉的是 **I-TASK** 与 **I-NONINHERIT** 在源码层的可执行形态：
+///
+/// 1. **`private.task_binding_grants` 只有一个写入点**。`INSERT INTO private.task_binding_grants`
+///    与 `UPDATE private.task_binding_grants` 这两段 SQL 文本只允许出现在 `context_repo.rs`
+///    与迁移里（迁移不是 `.rs`，天然不在扫描范围）。别处多出一处 INSERT，就是多了一条
+///    能凭空造出「当前任务批准过」的路径——而那正是整张卡要关掉的东西。
+/// 2. **`VerifiedTaskGrant` / `AuthorizedTaskItem` 只有一个铸造点**。两者的字段私有，
+///    可见性在同 crate 内挡不住（`domain` 的任何模块都能写字面量），所以「只有
+///    `authorize_task_item` 能造」必须由这条 needle 钉住，而不是靠 `_priv: ()` 的善意。
+///
+/// 零调用点合法（同 A3 的方向）：本闸说的是「**只有**这里可以」，不是「必须有人这么做」。
+/// 被测对象未交付时返回 `not_applicable` 并点名（§57.1 第 2 条）。
+fn g25_4_task_grant_sole_site(root: &Path) -> Verdict {
+    /// 写入点：只有 adapters 的 context_repo（迁移是 .sql，不在 `walk_files(.., &["rs"])` 里）。
+    const WRITE_ALLOWED: [&str; 1] = ["crates/adapters/src/context_repo.rs"];
+    /// 铸造点：只有 domain 的 context 模块。**adapters 不在名单里**——它拿得到
+    /// `authorize_task_item` 的返回值，但造不出返回值本身。
+    const MINT_ALLOWED: [&str; 1] = ["crates/domain/src/context.rs"];
+
+    let files = read_files(&walk_files(root, &["rs"]));
+    if !files
+        .iter()
+        .any(|(_, s)| s.contains("pub fn authorize_task_item("))
+    {
+        return Verdict::NotApplicable(
+            "missing object: §25.4 v2 `pub fn authorize_task_item(` 尚未交付".to_string(),
+        );
+    }
+
+    let mut strays = Vec::new();
+    for needle in [
+        "INSERT INTO private.task_binding_grants",
+        "UPDATE private.task_binding_grants",
+    ] {
+        let (n, sites) = count_outside_allowed(root, needle, &WRITE_ALLOWED);
+        if n > 0 {
+            strays.push(format!(
+                "§25.4 A3b `{needle}` 的写入点越界（只允许 {WRITE_ALLOWED:?}），实得 {n} 处: {sites:?}"
+            ));
+        }
+    }
+    for needle in ["VerifiedTaskGrant {", "AuthorizedTaskItem {"] {
+        let (n, sites) = count_outside_allowed(root, needle, &MINT_ALLOWED);
+        if n > 0 {
+            strays.push(format!(
+                "§25.4 A3b `{needle}` 的铸造点越界（只允许 {MINT_ALLOWED:?}），实得 {n} 处: {sites:?}"
+            ));
+        }
+    }
+
+    if strays.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(strays)
+    }
+}
+
 /// §80.1 `G80-43` Grounding validity / recheck debt —— 判据 §11.10#G11-2。
 ///
 /// **这道闸证明结构，不证明语义。** 说清楚边界，免得有人把它当成 §11.10#G11-2 的全部：

@@ -1190,17 +1190,17 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
 
 单元格里带括号的是 PostgreSQL column-level GRANT（比对 `information_schema.column_privileges`），不带括号的是表级（比对 `role_table_grants`）。
 
-| role | `private.ingest_tickets` | `private.events` | `projection.stream_log` | `projection.stream_checkpoints` | `ops.outbox` | `ops.jobs` | `control.quota_windows` | `private.evidence_objects` | `private.memory_records` | `private.memory_evidence` | `private.memory_consolidation_runs` | `private.memory_consolidation_inputs` | `private.memory_rollups` | `private.memory_rollup_sources` | `ops.deletion_plan_steps` | `staging.contribution_releases` | `staging.contribution_release_sources` | `control.public_moderator_grants` | `ops.public_release_revocations` | `public.claim_trust_evaluations` | `public.claim_trust_evaluation_sources` | `public.poisoning_signals` | `staging.contribution_candidates` | `staging.contribution_candidate_sources` | `control.contribution_confirmations` | `ops.mechanism_observations` | `ops.mechanism_e2e_runs` | `control.usage_reservations` | `control.rate_buckets` | `control.operation_receipts` | `private.retrieval_query_sources` | `ops.retrieval_provider_budget_reservations` | `ops.retrieval_provider_budget_allocations` | `control.anonymous_source_lineage` | `staging.sanitized_public_candidates` | `public.anonymous_source_lifecycle_events` | `public.current_anonymous_source_objects` | `staging.contribution_candidate_phase9_assessments` | `ops.anonymous_public_revocations` | `public.anonymous_source_authority_events` | `control.processor_models` | `control.provider_accounts` | `control.provider_endpoints` | `control.provider_billing_accounts` | `control.provider_billing_instruments` | `control.reasoning_profiles` | `control.reasoning_route_policies` | `control.reasoning_route_candidates` | `control.reasoning_route_bindings` | `control.reasoning_credential_bindings` | `control.reasoning_route_profile_receipts` | `control.reasoning_route_domain_receipts` | `public.claim_independence_attestations` | `ops.public_anonymous_dispatches`  | `ops.reasoning_provider_health_observations` | `ops.reasoning_account_health_observations` | `private.contribution_executions` | `private.contribution_execution_sources` | `ops.contribution_execution_job_links` | `control.anonymous_claim_trust_authorities` | `public.anonymous_claim_trust_receipts` | `public._legacy_receipt_match_basis` | `public.eligible_objects` | `ops.retrieval_embedding_rpc_calls` | `ops.private_inference_rpc_calls` | `control.confirm_tokens` | `ops.memory_lifecycle_events` | `private.distill_candidates` | `private.subjects` | `private.subject_keys` | `private.subject_roles` | `private.evidence_subjects` | `private.memory_subjects` | `private.memory_subject_mentions` | `private.memory_rollup_subjects` | `private.memory_affects` | `private.evidence_affects` | `control.memberships` | `control.workspace_memberships` |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `role_gateway` | SELECT, UPDATE | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT(PK 六列), UPDATE(issued_highwater) | SELECT, INSERT(tenant_id,commit_seq,stream_seq,event_type,evidence_id) | SELECT, INSERT, UPDATE | SELECT, UPDATE(reserved, consumed) | SELECT, INSERT | SELECT, INSERT, UPDATE(status,superseded_by,superseded_at,lifecycle_head_event_id) | SELECT, INSERT | — | — | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | SELECT | SELECT | — | — | SELECT, INSERT | SELECT | SELECT | SELECT, INSERT, UPDATE(status, finished_at) | SELECT, INSERT, UPDATE(capacity, tokens, refill_per_second, updated_at, version) | SELECT, INSERT | — | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | SELECT, INSERT(narrow, migration 0141) | — | SELECT, INSERT, UPDATE(consumed_at) | SELECT | SELECT, UPDATE(state,confirmed_memory_id) | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT |
-| `role_private_worker` | SELECT | SELECT | SELECT, UPDATE(state,error_class) | SELECT | SELECT, UPDATE, INSERT(tenant_id,commit_seq,event_type,contribution_release_id,anonymous_source_id,candidate_envelope_sha256,anonymous_source_revision) | SELECT, INSERT, UPDATE | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT (migration 0145) | SELECT (migration 0145) | — | — | SELECT | SELECT, INSERT, UPDATE(state,revoked_at) | SELECT, INSERT | — | INSERT | — | — | — | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT | SELECT | — | — | — | — | — | — | SELECT, INSERT(contribution_release_id,tenant_id) | SELECT, INSERT(tenant_id,anonymous_source_id,sanitized_content,content_sha256,policy_version,policy_digest,assessment_outcome,assessment_digest,envelope_sha256) | — | — | SELECT, INSERT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | SELECT | SELECT | SELECT | — | — | — | — | — | SELECT, UPDATE(narrow, migration 0143) | — | — | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT, INSERT | SELECT, INSERT | — | SELECT, INSERT | SELECT | SELECT | SELECT |
-| `role_consolidation_worker` | — | — | SELECT, INSERT | SELECT, INSERT(tenant_id,scope_kind,scope_id,domain,projection_kind,projection_version), UPDATE(issued_highwater) | SELECT, INSERT(tenant_id,commit_seq,stream_seq,event_type,evidence_id) | SELECT, UPDATE(status,lease_owner,lease_expires_at) | — | SELECT | SELECT | SELECT | SELECT, INSERT, UPDATE(status,input_snapshot_seq,manifest_hash,output_digest,finished_at,error_class) | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — | — | SELECT, INSERT(narrow, migrations 0143/0145) | — | — | — | — | — | — | — | SELECT | SELECT | SELECT, INSERT | — | — | SELECT | SELECT |
-| `role_public_worker` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | — | — | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT |
-| `role_retrieval_worker` | — | — | SELECT, UPDATE | SELECT, UPDATE(evidence_highwater, knowledge_highwater, projection_highwater, projection_processor_id) | SELECT, UPDATE | SELECT, INSERT, UPDATE | — | SELECT | SELECT | SELECT | — | — | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | — | — | — | SELECT, INSERT | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | SELECT, UPDATE(narrow, migration 0141) | — | — | SELECT | — | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | — | SELECT | SELECT |
-| `role_batch_issuer` | **INSERT, SELECT** | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| `role_maintenance` | SELECT, UPDATE（仅 `ISSUED → EXPIRED` 巡检，§15.6） | SELECT | SELECT, UPDATE（仅 `ISSUED → LOST` 巡检 §15.2 与 `retention::tombstone` 的 `* → TOMBSTONED` §37.2） | SELECT, UPDATE(serving, shadow) | SELECT | SELECT, UPDATE(status, lease_owner, lease_expires_at) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT | SELECT | SELECT, UPDATE(revoked_at, revocation_reason) | — | — | SELECT | SELECT | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | — | — | SELECT | SELECT | SELECT, UPDATE(state) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT, UPDATE(state, role, updated_at) | SELECT |
-| `role_admin` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| `role_migration_owner` | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner  | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner |
+| role | `private.ingest_tickets` | `private.events` | `projection.stream_log` | `projection.stream_checkpoints` | `ops.outbox` | `ops.jobs` | `control.quota_windows` | `private.evidence_objects` | `private.memory_records` | `private.memory_evidence` | `private.memory_consolidation_runs` | `private.memory_consolidation_inputs` | `private.memory_rollups` | `private.memory_rollup_sources` | `ops.deletion_plan_steps` | `staging.contribution_releases` | `staging.contribution_release_sources` | `control.public_moderator_grants` | `ops.public_release_revocations` | `public.claim_trust_evaluations` | `public.claim_trust_evaluation_sources` | `public.poisoning_signals` | `staging.contribution_candidates` | `staging.contribution_candidate_sources` | `control.contribution_confirmations` | `ops.mechanism_observations` | `ops.mechanism_e2e_runs` | `control.usage_reservations` | `control.rate_buckets` | `control.operation_receipts` | `private.retrieval_query_sources` | `ops.retrieval_provider_budget_reservations` | `ops.retrieval_provider_budget_allocations` | `control.anonymous_source_lineage` | `staging.sanitized_public_candidates` | `public.anonymous_source_lifecycle_events` | `public.current_anonymous_source_objects` | `staging.contribution_candidate_phase9_assessments` | `ops.anonymous_public_revocations` | `public.anonymous_source_authority_events` | `control.processor_models` | `control.provider_accounts` | `control.provider_endpoints` | `control.provider_billing_accounts` | `control.provider_billing_instruments` | `control.reasoning_profiles` | `control.reasoning_route_policies` | `control.reasoning_route_candidates` | `control.reasoning_route_bindings` | `control.reasoning_credential_bindings` | `control.reasoning_route_profile_receipts` | `control.reasoning_route_domain_receipts` | `public.claim_independence_attestations` | `ops.public_anonymous_dispatches`  | `ops.reasoning_provider_health_observations` | `ops.reasoning_account_health_observations` | `private.contribution_executions` | `private.contribution_execution_sources` | `ops.contribution_execution_job_links` | `control.anonymous_claim_trust_authorities` | `public.anonymous_claim_trust_receipts` | `public._legacy_receipt_match_basis` | `public.eligible_objects` | `ops.retrieval_embedding_rpc_calls` | `ops.private_inference_rpc_calls` | `control.confirm_tokens` | `ops.memory_lifecycle_events` | `private.distill_candidates` | `private.subjects` | `private.subject_keys` | `private.subject_roles` | `private.evidence_subjects` | `private.memory_subjects` | `private.memory_subject_mentions` | `private.memory_rollup_subjects` | `private.memory_affects` | `private.evidence_affects` | `control.memberships` | `control.workspace_memberships` | `private.task_binding_grants` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `role_gateway` | SELECT, UPDATE | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT(PK 六列), UPDATE(issued_highwater) | SELECT, INSERT(tenant_id,commit_seq,stream_seq,event_type,evidence_id) | SELECT, INSERT, UPDATE | SELECT, UPDATE(reserved, consumed) | SELECT, INSERT | SELECT, INSERT, UPDATE(status,superseded_by,superseded_at,lifecycle_head_event_id) | SELECT, INSERT | — | — | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | SELECT | SELECT | — | — | SELECT, INSERT | SELECT | SELECT | SELECT, INSERT, UPDATE(status, finished_at) | SELECT, INSERT, UPDATE(capacity, tokens, refill_per_second, updated_at, version) | SELECT, INSERT | — | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | SELECT, INSERT(narrow, migration 0141) | — | SELECT, INSERT, UPDATE(consumed_at) | SELECT | SELECT, UPDATE(state,confirmed_memory_id) | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT | SELECT, INSERT, UPDATE(revoked_at) |
+| `role_private_worker` | SELECT | SELECT | SELECT, UPDATE(state,error_class) | SELECT | SELECT, UPDATE, INSERT(tenant_id,commit_seq,event_type,contribution_release_id,anonymous_source_id,candidate_envelope_sha256,anonymous_source_revision) | SELECT, INSERT, UPDATE | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT (migration 0145) | SELECT (migration 0145) | — | — | SELECT | SELECT, INSERT, UPDATE(state,revoked_at) | SELECT, INSERT | — | INSERT | — | — | — | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT | SELECT | — | — | — | — | — | — | SELECT, INSERT(contribution_release_id,tenant_id) | SELECT, INSERT(tenant_id,anonymous_source_id,sanitized_content,content_sha256,policy_version,policy_digest,assessment_outcome,assessment_digest,envelope_sha256) | — | — | SELECT, INSERT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | SELECT | SELECT | SELECT | — | — | — | — | — | SELECT, UPDATE(narrow, migration 0143) | — | — | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT, INSERT | SELECT, INSERT | — | SELECT, INSERT | SELECT | SELECT | SELECT | — |
+| `role_consolidation_worker` | — | — | SELECT, INSERT | SELECT, INSERT(tenant_id,scope_kind,scope_id,domain,projection_kind,projection_version), UPDATE(issued_highwater) | SELECT, INSERT(tenant_id,commit_seq,stream_seq,event_type,evidence_id) | SELECT, UPDATE(status,lease_owner,lease_expires_at) | — | SELECT | SELECT | SELECT | SELECT, INSERT, UPDATE(status,input_snapshot_seq,manifest_hash,output_digest,finished_at,error_class) | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | SELECT | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — | — | SELECT, INSERT(narrow, migrations 0143/0145) | — | — | — | — | — | — | — | SELECT | SELECT | SELECT, INSERT | — | — | SELECT | SELECT | — |
+| `role_public_worker` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | — | — | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT, INSERT | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT | — |
+| `role_retrieval_worker` | — | — | SELECT, UPDATE | SELECT, UPDATE(evidence_highwater, knowledge_highwater, projection_highwater, projection_processor_id) | SELECT, UPDATE | SELECT, INSERT, UPDATE | — | SELECT | SELECT | SELECT | — | — | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | SELECT | SELECT | — | — | — | SELECT | SELECT | — | — | — | SELECT, INSERT | — | — | — | — | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | SELECT, UPDATE(narrow, migration 0141) | — | — | SELECT | — | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | — | SELECT | SELECT | SELECT |
+| `role_batch_issuer` | **INSERT, SELECT** | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `role_maintenance` | SELECT, UPDATE（仅 `ISSUED → EXPIRED` 巡检，§15.6） | SELECT | SELECT, UPDATE（仅 `ISSUED → LOST` 巡检 §15.2 与 `retention::tombstone` 的 `* → TOMBSTONED` §37.2） | SELECT, UPDATE(serving, shadow) | SELECT | SELECT, UPDATE(status, lease_owner, lease_expires_at) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT | SELECT | SELECT, UPDATE(revoked_at, revocation_reason) | — | — | SELECT | SELECT | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | — | — | SELECT | SELECT | SELECT, UPDATE(state) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT, UPDATE(state, role, updated_at) | SELECT | — |
+| `role_admin` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `role_migration_owner` | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner  | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner |
 
 落点逐一对齐：
 
@@ -2191,6 +2191,48 @@ UNTRUSTED_INSTRUCTION
 CROSS_TENANT_EVIDENCE
 MISSING_CONFIRMATION
 ```
+
+**存储权威与任务使用权威的拆分（card 22c 裁决，2026-09-20；ADR-0046 记录来源与被否决的替代方案）。**
+
+上面的 ceiling 表与硬规则 2 在 card 22b 之前合在一起读，读出来是一个结构性空集：∀m，
+`authority_stored(m) ≤ ceiling(origin(m)) ≤ ProjectConstraint`，而硬规则 2 点名的生产者
+（「当前经过认证的 Task Request / Tenant Policy」）不是 `EvidenceOriginClass` 的任何一个取值，
+于是没有任何路径能合法产生一条 `authority_class = ExplicitTaskContext` 的记忆行。裁决的结论是
+**不给 origin 闭集加第九个之外的取值、不抬 ceiling、不降门槛**，而是把「6」从内容属性改成
+受验证的、不可继承的当前任务授权。修订后的契约（裁决 §三 逐行）：
+
+| 位置 | 修订后契约 |
+|---|---|
+| §10.1 存储权威 | `MemoryRecord.authority` 始终受原 authority-basis 的 origin ceiling 限制；存储行**不接受** `ExplicitTaskContext` |
+| §10.1 任务授权 | `ExplicitTaskContext` 是**当前任务上下文实例**的使用权威，必须由有效的任务绑定授权证明支持；不是 `EvidenceOrigin` 的新取值 |
+| §25.4 selector | task explicit lane 检查「有效任务绑定授权」，不是 `memory.authority_class >= 6`；原有可见性、origin、disposition、状态、grounding 条件仍执行 |
+| 派生与整合 | 不继承、不复制、不自动重定向任务授权；新记忆版本必须重新授权 |
+| 诊断 | 先枚举绑定义务，再分别报告授权准入、实际装配及缺失；**不得从准入结果反推义务** |
+
+三条不变量（ADR-0046 逐字保存，此处只留指针形态）：
+
+```text
+I-STORE      所有 MemoryRecord 的 authority ≤ 原 authority-basis ceiling ≤ ProjectConstraint(5)。
+I-TASK       有效上下文 authority = ExplicitTaskContext(6)
+             ⇒ 存在当前任务、精确目标版本、明确用途的有效授权证明。
+I-NONINHERIT 派生、复制、检索、重排、迁移、换任务、替换版本
+             都不能创建或继承上述授权证明。
+```
+
+授权对象是 `private.task_binding_grants`（migration 0173）：它绑定 tenant + task + task_epoch、
+具体的 ContextBinding、具体的 memory 与该 memory 规范化正文的精确摘要、用途
+`ADOPT_TASK_INSTRUCTION`、签发者类别、授权证据行、签发操作与冻结的 policy 版本，并带生效窗口与
+撤销位。**只有 `ADOPT_TASK_INSTRUCTION` 能产生 6**；`REFERENCE_ONLY` 的绑定照样是一条必带义务、
+照样被提名、照样在诊断里具名，它只是没有授权（读侧原因 `MISSING_TASK_AUTHORIZATION`）。
+授权证据行**不会**被接进目标记忆的证据链：一张任务授权收据不是通用的高权威 basis
+（裁决 §五「授权材料不洗白」）。落点：`humaux_domain::policy::StoredAuthority::authorize`
+（I-STORE 的唯一判定点）· `humaux_domain::context::authorize_task_item`（I-TASK 的唯一判定点，
+`VerifiedTaskGrant` / `AuthorizedTaskItem` 的唯一铸造点）· migration `0173_task_binding_grants`。
+
+**已知历史行**：dev 库有 4 条 fixture 生成的 `ExplicitTaskContext` 记忆行（ADR-0046 逐条列了
+memory_id / tenant / created_at）。0173 因此把存储侧 CHECK 加成 `NOT VALID`：新行一律被挡，
+旧行保留待 card 24 逐条处置后再 `VALIDATE CONSTRAINT`——**不批量降级**（裁决 §五.3：迁移不得把
+历史上的非法权威洗成一个合法的低权威）。
 
 外部/Tool 文本可以进入事实记忆，但 Context Compiler 必须按 `DATA_ONLY` 渲染，不能把其 instruction-like 文本拼到 system/developer instruction 区。
 
@@ -6351,6 +6393,12 @@ Policy」，而 `domain::policy::OriginBoundAuthorityPolicy` 只实现了 ceilin
 `lane_failed`（本卡的解锁就是这个），但它也不是「完成」：DOD-035 仍是 `[phase=14]`，规则 2 的
 生产者是下一张卡的预算，落点在 `crates/domain/src/policy.rs` / §10.1，不在本卡的可改文件里。
 
+**这笔债由 card 22c 结清，但不是按「给 6 找一个生产者」的方向结的**（ADR-0046）：裁决判定
+「6 是内容属性」这个前提本身是错的。存储侧永远到不了 6（I-STORE），而 task lane 的准入对象换成
+了一条受验证的当前任务授权（I-TASK）。因此 `task_explicit_context_v1` **退役**，登记名换成
+`task_explicit_context_v2`（v1 的记录保留在 `humaux_domain::context::RETIRED_SELECTORS` 供审计
+——裁决 §三：同名 selector 不得偷换准入对象）。见 §25.4.B。
+
 ### 25.4.A Selector / Facet / Task Binding Alignment v1
 
 （card 22b 裁决原文，11 条，逐字落地；ADR-0045 记录来源与被否决的替代方案。）
@@ -6436,6 +6484,66 @@ facet_for}`（第 1/2/3 条）· `humaux_domain::context::REGISTRY`（第 7/11 �
   幂等分支正要报回 `state:"bound"` 的那一行。恰好一行 = 成功，零行 = 冲突。
 - MCP wire：`context.assemble` 的 `task_id` 参数**已接通**到 Scope（`bins/gateway/src/context.rs`），
   不再 hard-code `task_id: None`；task 维度因此不止在 adapter 的测试入口上可达。
+
+### 25.4.B Task Authorization v2（card 22c 裁决，ADR-0046）
+
+§25.4.A 的 11 条正文不变；本节改的是第 7/8 条所指 selector 的**准入对象**，以及第 10 条「分别
+报告」的精确集合定义。
+
+1. **登记名换版**：`task_explicit_context_v1` 退役，`task_explicit_context_v2` 登记。v1 的记录
+   （退役原因 + 继任者）保留在 registry 旁边供审计。准入对象变了却沿用旧名字，是裁决 §三
+   明确禁止的一种偷换。
+   **实测未竟（2026-09-22 评审）**：换版只落在 registry，**没有落到线上**。客户端看到的名字由
+   `crates/retrieval/src/handoff.rs::selector_wire` 产出，它仍然映射
+   `TaskExplicitContextV1 => "task_explicit_context_v1"`；`SelectorSpec::registered_name` 目前
+   零个非测试读者。也就是说今天的线格式正处在本条禁止的状态：旧名字 + 新准入对象。修法是
+   `selector_wire` 改读 `registered_name`（`crates/retrieval` 不在 card 22c 的允许文件内），
+   债记在 ADR-0046「Open debt」。
+
+2. **准入对象**：v2 的 `AuthorityRequirement` 是 `VerifiedCurrentTaskBinding`，不是
+   `StoredAtLeast(ExplicitTaskContext)`。判定顺序冻结如下（顺序本身是判据的一部分：先确认义务
+   属于当前任务，再看绑定形状，再看有没有授权，再看授权指向谁，再看授权此刻是否有效，**最后**
+   才看目标本身——反过来会让「目标很干净」盖过「没有人批准过」）：
+
+```text
+当前任务（租户 + scope_id == 本次已认证解析的 TaskId）
+  -> 绑定形状（TASK / MANDATORY / 未撤销）
+  -> 授权存在                         else MISSING_TASK_AUTHORIZATION
+  -> 授权指向这一条 (租户, 任务, 绑定, memory)  else GRANT_TARGET_MISMATCH
+  -> 授权此刻有效（等级 = 6、用途 = ADOPT_TASK_INSTRUCTION、签发者、policy 版本、
+     授权证据在场、task_epoch 相等、未撤销、已生效且未过期）else TASK_AUTHORIZATION_INACTIVE
+  -> 目标存在 / 可读 / 行为资格 / active / 存储权威达下限且不是 6
+  -> 精确内容（授权里的摘要 == 目标当下正文的摘要）else TARGET_REVISION_CHANGED
+```
+
+3. **提名与准入是两个集合，不是一条 WHERE 的两侧**。提名集 N = 当前任务下未撤销的
+   TASK/MANDATORY 绑定义务，**不**按目标权威、授权存在与否、生命周期或可读性过滤；准入集 A ⊆ N
+   是逐条跑完第 2 条判定后通过的那些；实际装配 R ⊆ A。`rejected = N − A`，`missing = N − R`，
+   每条带脱敏原因。取数形状因此是 `WITH nominated AS MATERIALIZED (...) ... LEFT JOIN`：
+   一个 INNER JOIN 或一个 authority 过滤就会把「仍然成立但没被满足的义务」从诊断输入里删掉，
+   把「有 3 条必带项、2 条没授权」读成「没有任何必带项」。**completeness 不得以 A 当分母。**
+
+4. **写路径**：`memory.bind` 增加闭集参数 `purpose ∈ {REFERENCE_ONLY, ADOPT_TASK_INSTRUCTION}`，
+   无缺省。`ADOPT_TASK_INSTRUCTION` 在**同一事务**里写入绑定与授权（顺序：授权者检查 → 幂等
+   → 解析任务与 epoch → 精确 memory → 意图 → 消费与该意图绑定的 confirm token → 复核 §10.1 →
+   行为资格 → 写绑定 + 授权 → 审计）。`purpose` 由 confirm token 覆盖：§33.10 的 successor 位
+   在 MANDATORY 这一对上改为携带**整条意图**（任务 + 用途）的摘要，所以一枚为 `REFERENCE_ONLY`
+   铸出的确认执行不了 `ADOPT_TASK_INSTRUCTION` 的绑定（零行 ⇒ `CONFLICT`）。`memory.unbind`
+   在同一事务里撤销授权；§25.4.A(9) 的 A→B 显式替换同时撤销 A 的授权，B 拿到的是**新**授权，
+   不是被重定向的旧授权。
+
+5. **task_epoch**：`coord` 的任务表新增 `authorization_epoch`（0173，默认 0）。授权存的是签发
+   当时的 epoch，准入要求相等。关闭/重开任务、或任何使任务授权失效的生命周期事件，只需把这个
+   数字加一。本树今天没有任务生命周期操作，所以它有且只有一个未来写入方——加那个操作的人。
+
+6. **本卡量到的一个结构性后果，如实记下**：`ExplicitTaskContext` 不再可存储之后，
+   `explicit_mandatory_bindings_v1` 的权威下限（`ProjectConstraint`）之上只剩
+   `ProjectConstraint` 本身，而 `project_active_constraints_v1` 无条件选中租户内所有
+   active 的 `ProjectConstraint` 行。于是「只能由显式 MANDATORY 绑定交付、项目约束 selector
+   够不着」的行不再存在；PINNED lane 中能通过下限的行同样必然与 Mandatory 重叠，按既有
+   `excluding_mandatory` 规则计入 `pinned_excluded`。这不是能力缩小：那类需求（把一条**低于**
+   `ProjectConstraint` 的记忆确定性地带进 Mandatory）正是 v2 的授权路径要解决的，且它带审计、
+   带内容版本、带撤销。相关夹具已按这条事实改写，不是放宽断言。
 
 Pinned：
 
@@ -7367,6 +7475,14 @@ second call(confirm_token) -> execute
 `memory.unarchive` · `memory.correct` · `memory.confirm` · `memory.reject`。token 与 op 绑定：
 一次 pin 的确认执行不了 unpin，也铸不出 bind 需要的 `ElevatedActor`——两个 actor 类型各自
 只认自己的 op。
+
+card 22c（§25.4.B(4)）之后，`memory.bind` 的 wire 上多一个闭集参数 `purpose`
+（`REFERENCE_ONLY` | `ADOPT_TASK_INSTRUCTION`，**必填、无缺省**），执行结果多两个字段
+`purpose` 与 `task_authorization`（`granted` | `none`）。后者是写路径的**回读**而不是请求的回显：
+幂等分支什么都没写，所以「调用方要的是 ADOPT_TASK_INSTRUCTION」说明不了「授权真的在那儿」。
+op 闭集不变，仍是 11 项——`purpose` 是 `memory.bind` 的一个字段，不是第 12 个 operation。
+这一对上的 confirm token 的 successor 位因此携带整条意图（任务 + 用途）的摘要而不是裸 task id：
+token 覆盖不到的参数不得携带权限（card 22b 评审留下的教训）。
 
 
 ## MCP Contract Integrity / Compatibility Testing

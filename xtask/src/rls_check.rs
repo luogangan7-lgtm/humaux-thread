@@ -492,6 +492,29 @@ const MATRIX: &[Cell] = &[
     // read-only here; the gateway mints and consumes and still cannot delete (§37.2: a minter
     // that can erase its own audit trail).
     cell!("control.confirm_tokens", "role_maintenance", ["SELECT"]),
+    // 0173 (card 22c, ADR-0046): `private.task_binding_grants` — the verified, non-inheritable
+    // task-binding authorization. `role_gateway` SELECT + INSERT + UPDATE(revoked_at): it mints
+    // the grant inside `memory.bind`'s own transaction and revokes it in `memory.unbind`'s, and
+    // that is the whole of its power — it cannot redirect a grant (the owner trigger
+    // `task_grant_revoke_only_v2` raises 23514 on any other column change) and it cannot delete
+    // one (§6.2.1 全域禁动词; a minter that can erase its own authorization trail is §37.2's
+    // own counterexample). `role_retrieval_worker` SELECT because the §25.4 selector reads it.
+    // EVERY other role is `—`, explicitly overriding the `private` domain default (which would
+    // otherwise hand role_private_worker INSERT+UPDATE): a distiller or consolidation worker
+    // that could write this table would be §10.1 rule 2's "后台蒸馏自动生成" with a table behind
+    // it. role_maintenance is `—` for the same reason as the revoke-only trigger — a repair role
+    // that can revive a revoked authorization is not a repair role.
+    cell!(
+        "private.task_binding_grants",
+        "role_gateway",
+        ["SELECT", "INSERT"],
+        [("UPDATE", ["revoked_at"])]
+    ),
+    cell!(
+        "private.task_binding_grants",
+        "role_retrieval_worker",
+        ["SELECT"]
+    ),
     // 0149 (ADR-0020): §36/§37.1 memory lifecycle event log. Append-only; writes go ONLY
     // through owner SECURITY DEFINER ops.append_memory_lifecycle (EXECUTE to role_gateway),
     // so no runtime role holds a table INSERT/UPDATE/DELETE grant — same chokepoint shape as

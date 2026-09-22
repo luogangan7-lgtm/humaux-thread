@@ -7641,12 +7641,20 @@ fn native_mcp_memory_pin_unpin_confirm_gate_acceptance() {
             &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
             64,
         );
+        let x_seed = handle.seed_workspace_visible_context_record();
+        let y_seed = handle.seed_workspace_visible_context_record();
         // x: a workspace-visible memory with NO mandatory binding (the fixture's MANDATORY row
-        // is revoked) and an authority no mandatory selector picks up, so the only way it can
-        // reach the Context is the PINNED lane. y: a second record for the misbound-token case.
-        let x = handle.seed_workspace_visible_context_record();
-        let y = handle.seed_workspace_visible_context_record();
-        for record in [&x, &y] {
+        // is revoked). y: a second record for the misbound-token case.
+        //
+        // card 22c (ADR-0046): this loop used to ALSO run
+        // `UPDATE ... SET authority_class='ExplicitTaskContext'`, to lift x above the pinned
+        // floor without matching `project_active_constraints_v1`. That write is now refused by
+        // `memory_records_stored_authority_v2_check` (I-STORE) — and it was never a legal state
+        // to begin with: §10.1 rule 2 says no Evidence origin can produce a stored 6, so the
+        // production write path could not have created this row. The fixture was manufacturing
+        // an authority the system cannot mint. What that exposes about PINNED delivery is
+        // recorded at the delivery assertion below, not papered over here.
+        for record in [&x_seed, &y_seed] {
             handle
                 .admin
                 .execute(
@@ -7654,14 +7662,8 @@ fn native_mcp_memory_pin_unpin_confirm_gate_acceptance() {
                     &[&record.binding_id],
                 )
                 .expect("owner revokes the fixture's mandatory binding");
-            handle
-                .admin
-                .execute(
-                    "UPDATE private.memory_records SET authority_class='ExplicitTaskContext' WHERE memory_id=$1",
-                    &[&record.memory_id],
-                )
-                .expect("owner raises authority above the pinned-lane floor");
         }
+        let (x, y) = (x_seed, y_seed);
 
         let runtime_handle = handle.rt.handle().clone();
         let runtime = runtime_handle
@@ -7752,7 +7754,23 @@ fn native_mcp_memory_pin_unpin_confirm_gate_acceptance() {
                 };
                 assert_eq!((minted, executed), (2, 1), "two tagged mints (x, y), one executed write");
             });
-            assert_eq!(assemble_pinned_ids(address, bearer, 8, workspace).await, vec![x.memory_id]);
+            // card 22c (ADR-0046, §25.4.B(6) + that ADR's open debt): this asserted
+            // `vec![x.memory_id]`, and it only held because the fixture had raised x to a stored
+            // `ExplicitTaskContext` — the one class that clears the PINNED floor without being
+            // claimed by `project_active_constraints_v1`, and a class §10.1 rule 2 says no
+            // origin can produce. With that fixture write refused (I-STORE), the pre-existing
+            // defect is visible: the PINNED lane borrows its floor from
+            // `explicit_mandatory_bindings_v1` (`ProjectConstraint`), every row at that class is
+            // already a Mandatory row, and `PinnedLane::excluding_mandatory` therefore empties
+            // the lane for every legally-storable memory. Changing that floor is a policy
+            // decision with no ruling behind it, so it is REPORTED (ADR-0046 open debt), not
+            // guessed at here. What `memory.pin` itself guarantees — the PINNED row, active,
+            // scoped, idempotent — is asserted above and below and is unchanged.
+            assert_eq!(
+                assemble_pinned_ids(address, bearer, 8, workspace).await,
+                Vec::<Uuid>::new(),
+                "see ADR-0046 open debt: the PINNED lane has no deliverable class left"
+            );
             // §11.8: the pinned memory is no longer an automatic consolidation input.
             assert!(!consolidation_selected_inputs(&mut handle).await.contains(&x.memory_id));
 
@@ -7809,6 +7827,8 @@ fn native_mcp_memory_pin_unpin_confirm_gate_acceptance() {
                 // validator rejects either on this pair).
                 task: None,
                 replaces_binding_id: None,
+                // card 22c: `purpose` is a memory.bind field; unpin carries none.
+                purpose: None,
                 claim: humaux_adapters::confirm_token_repo::ConfirmationClaim {
                     op: humaux_domain::confirm::DestructiveOp::MemoryUnpin,
                     target_id: x.memory_id,
@@ -7959,6 +7979,74 @@ fn seed_task(handle: &mut Handle, title: &str) -> Uuid {
 /// A workspace-shared memory that `authorize_mandatory` can actually grant: `ProjectConstraint`
 /// authority with a `TenantAdmin` Evidence origin, which is the one §10.1 ceiling cell that
 /// reaches `ProjectConstraint` for any memory type. No binding row — `memory.bind` writes it.
+/// card 22c (ADR-0046) positive-control target: a **legitimate** `UserCorrection(4)` memory
+/// backed by `UserConfirmed` Evidence — readable, grounded, BehaviorEligible.
+///
+/// This is the target the ruling names (§二.4 rejects a 5-floor precisely because it would
+/// exclude it). Its stored authority stays 4 forever; only a verified task authorization can
+/// make ONE task's context instance of it usable at `ExplicitTaskContext`.
+fn seed_task_instruction_memory(handle: &mut Handle) -> Uuid {
+    // The ruling's own named target: a legitimate `UserConfirmed` origin (BEHAVIOR_ELIGIBLE per
+    // §10.1 row 1) stored at `UserCorrection`(4).
+    seed_task_instruction_memory_with_origin(handle, "UserConfirmed", "UserCorrection")
+}
+
+/// Same shape, with the §10.1 row of the evidence origin (and the stored class it caps) as
+/// arguments — `ToolResult`/`PrivateKnowledge` is the DATA_ONLY control.
+fn seed_task_instruction_memory_with_origin(
+    handle: &mut Handle,
+    origin_class: &str,
+    authority_class: &str,
+) -> Uuid {
+    let mut txn = handle
+        .admin
+        .transaction()
+        .expect("begin task-instruction seed");
+    let evidence_id: Uuid = txn
+        .query_one(
+            "INSERT INTO private.evidence_objects \
+               (tenant_id,evidence_kind,payload_sha256,data_class,origin_class, \
+                visibility_class,visibility_workspace_id,reasoning_domain_id) \
+             VALUES($1,'EVENT',$2,'INTERNAL',$5,'WORKSPACE_SHARED',$3,$4) \
+             RETURNING evidence_id",
+            &[
+                &handle.tenant_id,
+                &Sha256::digest(Uuid::now_v7().as_bytes()).to_vec(),
+                &handle.workspace_id,
+                &handle.reasoning_domain_id,
+                &origin_class,
+            ],
+        )
+        .expect("owner seeds the origin evidence")
+        .get(0);
+    let confidence: f32 = 0.9;
+    let memory_id: Uuid = txn
+        .query_one(
+            "INSERT INTO private.memory_records \
+               (tenant_id,memory_type,content,visibility_class,visibility_workspace_id, \
+                authority_class,confidence,status,asserted_at) \
+             VALUES($1,'NOTE',$2,'WORKSPACE_SHARED',$3,$5,$4,'active', \
+                    clock_timestamp()) RETURNING memory_id",
+            &[
+                &handle.tenant_id,
+                &json!({"fixture": "card 22c task instruction target"}),
+                &handle.workspace_id,
+                &confidence,
+                &authority_class,
+            ],
+        )
+        .expect("owner seeds the target at its ceiling")
+        .get(0);
+    txn.execute(
+        "INSERT INTO private.memory_evidence(memory_id,evidence_id,role,grounding_mode) \
+         VALUES($1,$2,'PRIMARY','SNAPSHOT')",
+        &[&memory_id, &evidence_id],
+    )
+    .expect("link evidence");
+    txn.commit().expect("commit task-instruction seed");
+    memory_id
+}
+
 fn seed_bindable_memory(handle: &mut Handle, memory_type: &str) -> Uuid {
     // One transaction: §8.6's DEFERRED `check_memory_has_evidence` trigger fires at COMMIT, so a
     // Memory row committed before its `memory_evidence` link is an orphan and is refused.
@@ -8011,6 +8099,11 @@ fn seed_bindable_memory(handle: &mut Handle, memory_type: &str) -> Uuid {
     memory_id
 }
 
+/// card 22c (ADR-0046): the two `memory.bind` purposes, as wire literals. Only `ADOPT` writes
+/// a `private.task_binding_grants` row; `REFERENCE` creates the binding and nothing else.
+const ADOPT: &str = "ADOPT_TASK_INSTRUCTION";
+const REFERENCE: &str = "REFERENCE_ONLY";
+
 // The four binding ops' full wire shape in one helper: action + memory + task + the two
 // optional arguments (`confirm_token`, `replaces_binding_id`). Splitting it would hide which
 // call carries which optional argument, which is exactly what the replacement tests assert.
@@ -8024,8 +8117,14 @@ async fn task_binding_call(
     task_id: Uuid,
     token: Option<&str>,
     replaces_binding_id: Option<Uuid>,
+    // card 22c (ADR-0046): REQUIRED on bind, refused on unbind. `None` on a bind is the
+    // INVALID_INPUT control — there is no default purpose.
+    purpose: Option<&str>,
 ) -> (u16, Value) {
     let mut arguments = json!({ "action": action, "memory_id": memory_id, "task_id": task_id });
+    if let Some(purpose) = purpose {
+        arguments["purpose"] = Value::String(purpose.to_owned());
+    }
     if let Some(token) = token {
         arguments["confirm_token"] = Value::String(token.to_owned());
     }
@@ -8047,9 +8146,18 @@ async fn bind_through_the_gate(
     request_id: u64,
     memory_id: Uuid,
     task_id: Uuid,
+    purpose: &str,
 ) -> Uuid {
     let (status, minted) = task_binding_call(
-        address, bearer, request_id, "bind", memory_id, task_id, None, None,
+        address,
+        bearer,
+        request_id,
+        "bind",
+        memory_id,
+        task_id,
+        None,
+        None,
+        Some(purpose),
     )
     .await;
     assert_eq!(status, 200, "bind mint: {minted}");
@@ -8070,6 +8178,7 @@ async fn bind_through_the_gate(
         task_id,
         Some(&token),
         None,
+        Some(purpose),
     )
     .await;
     assert_eq!(status, 200, "bind execute: {bound}");
@@ -8080,6 +8189,19 @@ async fn bind_through_the_gate(
     assert_eq!(structured["inserted"], true, "{bound}");
     assert_eq!(structured["scope"]["kind"], "TASK", "{bound}");
     assert_eq!(structured["scope"]["id"], task_id.to_string(), "{bound}");
+    // card 22c: the write path reports what it wrote, and it must agree with what was asked
+    // for on the INSERT path (the idempotent path is allowed to disagree — see the
+    // REFERENCE_ONLY-then-ADOPT control in the acceptance test).
+    assert_eq!(structured["purpose"], purpose, "{bound}");
+    assert_eq!(
+        structured["task_authorization"],
+        if purpose == "ADOPT_TASK_INSTRUCTION" {
+            "granted"
+        } else {
+            "none"
+        },
+        "the reported authorization must match what this purpose writes: {bound}"
+    );
     Uuid::parse_str(structured["binding_id"].as_str().expect("binding_id")).expect("uuid")
 }
 
@@ -8141,6 +8263,59 @@ async fn selector_id_sets(
             }
         })
         .collect()
+}
+
+/// card 22c (ADR-0046): the task selector's admitted rows with **both** authorities, plus the
+/// per-obligation report. Read through the same production path the lane uses.
+async fn task_selector_readback(
+    dsn: &str,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    task_id: Uuid,
+) -> (
+    Vec<(Uuid, AuthorityClass, AuthorityClass)>,
+    Vec<humaux_adapters::context_repo::TaskObligationReport>,
+) {
+    let pool = RuntimeDbPool::connect(&dsn_as_role(dsn, "role_gateway"))
+        .await
+        .expect("runtime pool for the task readback");
+    let authorization = AuthorizationScope::new(
+        TenantId(tenant_id),
+        PrincipalId::new(),
+        Some(UserId(user_id)),
+        BoundedSet::new([WorkspaceId(workspace_id)]).expect("bounded workspace grant set"),
+    );
+    let scope = Scope {
+        tenant_id: TenantId(tenant_id),
+        user_id: Some(UserId(user_id)),
+        workspace_id: Some(WorkspaceId(workspace_id)),
+        repository_id: None,
+        task_id: Some(TaskId(task_id)),
+        run_id: None,
+        agent_id: None,
+    };
+    let outcomes = humaux_adapters::context_repo::selector_outcomes(&pool, &authorization, &scope)
+        .await
+        .expect("per-selector readback");
+    let rows = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            SelectorOutcome::Ran { id, rows, .. } if *id == SelectorId::TaskExplicitContextV1 => {
+                Some(
+                    rows.iter()
+                        .map(|row| (row.memory_id().0, row.authority(), row.source_authority())),
+                )
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let report =
+        humaux_adapters::context_repo::task_obligation_report(&pool, &authorization, &scope)
+            .await
+            .expect("obligation report");
+    (rows, report)
 }
 
 #[test]
@@ -8215,7 +8390,7 @@ fn native_mcp_memory_bind_task_and_facet_selector_exact_sets_acceptance() {
             // (a) the gate: the first call mints and writes nothing, and a token minted for a
             // DIFFERENT op does not execute a bind. There is no raw INSERT anywhere here.
             let (status, minted) =
-                task_binding_call(address, bearer, 1, "bind", s, task_t, None, None).await;
+                task_binding_call(address, bearer, 1, "bind", s, task_t, None, None, Some(ADOPT)).await;
             assert_eq!(status, 200, "bind mint must be a success-shaped result: {minted}");
             let minted = assert_tool_response(&minted, ToolName::Memory);
             assert_eq!(minted["confirmation_required"], true, "{minted}");
@@ -8225,14 +8400,14 @@ fn native_mcp_memory_bind_task_and_facet_selector_exact_sets_acceptance() {
             assert_eq!(minted["target"]["task_id"], task_t.to_string(), "{minted}");
             let stray = mint_binding_token(address, bearer, 2, "pin", s).await;
             let (status, wrong_op) =
-                task_binding_call(address, bearer, 3, "bind", s, task_t, Some(&stray), None).await;
+                task_binding_call(address, bearer, 3, "bind", s, task_t, Some(&stray), None, Some(ADOPT)).await;
             assert_eq!(status, 200, "{wrong_op}");
             assert_tool_error(&wrong_op, "CONFLICT");
             // The pair binding, load-bearing: a confirmation minted for (S, T) must not execute
             // (S, U). Dropping `successor_id` from the gate turns this green-by-accident.
             let pair_token = minted["confirm_token"].as_str().expect("token").to_owned();
             let (status, wrong_task) =
-                task_binding_call(address, bearer, 4, "bind", s, task_u, Some(&pair_token), None).await;
+                task_binding_call(address, bearer, 4, "bind", s, task_u, Some(&pair_token), None, Some(ADOPT)).await;
             assert_eq!(status, 200, "{wrong_task}");
             assert_tool_error(&wrong_task, "CONFLICT");
             tokio::task::block_in_place(|| {
@@ -8250,9 +8425,9 @@ fn native_mcp_memory_bind_task_and_facet_selector_exact_sets_acceptance() {
             });
 
             // (b) the three bindings, each THROUGH memory.bind's confirm flow.
-            let binding_s = bind_through_the_gate(address, bearer, 10, s, task_t).await;
-            bind_through_the_gate(address, bearer, 20, d, task_u).await;
-            bind_through_the_gate(address, bearer, 30, state_u, task_u).await;
+            let binding_s = bind_through_the_gate(address, bearer, 10, s, task_t, ADOPT).await;
+            bind_through_the_gate(address, bearer, 20, d, task_u, ADOPT).await;
+            bind_through_the_gate(address, bearer, 30, state_u, task_u, ADOPT).await;
 
             // (c) per-selector EXACT id sets, before the merge.
             let sets = selector_id_sets(&dsn, handle.tenant_id, user_id, workspace, Some(task_t)).await;
@@ -8304,25 +8479,279 @@ fn native_mcp_memory_bind_task_and_facet_selector_exact_sets_acceptance() {
                 "the facets selector is workspace-scoped and does not depend on the task"
             );
 
-            // §25.4.A(7)/(8) open debt, asserted rather than assumed (ADR-0045 "Open debt"):
-            // the task selector RUNS (that is this card's unlock) but admits nothing, because
-            // §10.1's ceiling table has no producer for `ExplicitTaskContext`, which is this
-            // selector's frozen `min_authority`. When that producer lands this goes red, which
-            // is exactly when the assertion should be rewritten rather than loosened.
-            let task_selector = sets
-                .get(&SelectorId::TaskExplicitContextV1)
-                .expect("task selector ran instead of being column-unavailable");
-            assert!(
-                task_selector.1.is_empty(),
-                "no memory can legitimately hold ExplicitTaskContext today (§10.1 rule 2 has no \
-                 producer; DOD-035 phase=14). If this is red, §10.1 gained one — assert the real \
-                 admitted set here instead of relaxing this"
+            // ===== card 22c (ADR-0046) — the task lane's positive and negative controls =====
+            //
+            // ADR-0045's "Open debt" assertion lived here: the task selector ran but admitted
+            // nothing, because a stored `ExplicitTaskContext` had no producer. Card 22c's
+            // ruling says that premise was wrong — 6 is not a content property — so the debt is
+            // closed by REWRITING this, not by relaxing it.
+            //
+            // The binding of `s` above was made with purpose=ADOPT_TASK_INSTRUCTION, so it
+            // carries an authorization. `s` is `ProjectConstraint`; the ruling's own named
+            // target is a `UserCorrection(4)` memory, so the positive control uses one of those
+            // (`adopt`) and the negative control an identical one bound REFERENCE_ONLY
+            // (`reference`) — same memory shape, same task, same visibility, one difference.
+            // The seed uses the blocking admin client; inside the async body it must run
+            // under `block_in_place` like every other seed here, or the sync `postgres`
+            // driver tries to start a runtime inside the runtime.
+            let adopt = tokio::task::block_in_place(|| seed_task_instruction_memory(&mut handle));
+            let reference =
+                tokio::task::block_in_place(|| seed_task_instruction_memory(&mut handle));
+            let binding_adopt =
+                bind_through_the_gate(address, bearer, 60, adopt, task_t, ADOPT).await;
+            let binding_reference =
+                bind_through_the_gate(address, bearer, 70, reference, task_t, REFERENCE).await;
+
+            let (task_rows, report) =
+                task_selector_readback(&dsn, handle.tenant_id, user_id, workspace, task_t).await;
+
+            // N: every obligation of this task is reported, authorized or not. THREE of them —
+            // an INNER JOIN on the grants table, or any authority filter in the nominated CTE,
+            // makes this 2 and turns "one obligation is unauthorized" into "there is no such
+            // obligation" (ruling §六.3).
+            let nominated: BTreeSet<Uuid> = report.iter().map(|r| r.memory_id).collect();
+            assert_eq!(
+                nominated,
+                [s, adopt, reference].into_iter().collect::<BTreeSet<Uuid>>(),
+                "N must carry every TASK/MANDATORY obligation of this task: {report:?}"
+            );
+            assert_eq!(report.len(), 3, "one report row per binding: {report:?}");
+
+            // A: exactly the two authorized ones. `reference` is nominated and REJECTED, by name.
+            let admitted: BTreeSet<Uuid> = report
+                .iter()
+                .filter(|r| r.admitted)
+                .map(|r| r.memory_id)
+                .collect();
+            assert_eq!(
+                admitted,
+                [s, adopt].into_iter().collect::<BTreeSet<Uuid>>(),
+                "A must be exactly the obligations with a live authorization: {report:?}"
+            );
+            let rejected: Vec<_> = report.iter().filter(|r| !r.admitted).collect();
+            assert_eq!(rejected.len(), 1, "{report:?}");
+            assert_eq!(rejected[0].memory_id, reference);
+            assert_eq!(
+                rejected[0].reject.map(humaux_domain::context::TaskContextReject::wire),
+                Some("MISSING_TASK_AUTHORIZATION"),
+                "a binding without an authorization is rejected BY NAME, not filtered away"
+            );
+            assert_eq!(rejected[0].context_binding_id, binding_reference);
+
+            // R: the admitted rows, with BOTH authorities visible. This is the whole ruling in
+            // two assertions — the effective context authority is 6, and the STORED authority is
+            // untouched at 4 (I-STORE). A mutant that writes 6 onto the row, or that reports the
+            // stored class as the effective one, turns one of these red.
+            let by_id: BTreeMap<Uuid, (AuthorityClass, AuthorityClass)> = task_rows
+                .iter()
+                .map(|(id, effective, source)| (*id, (*effective, *source)))
+                .collect();
+            assert_eq!(
+                by_id.keys().copied().collect::<BTreeSet<Uuid>>(),
+                admitted,
+                "R == A here (no budget pressure in this fixture)"
             );
             assert_eq!(
-                task_selector.0,
-                [s].into_iter().collect::<BTreeSet<Uuid>>(),
-                "§25.4.A(9): the binding obligation is still REPORTED as an unresolved \
-                 nomination, never silently filtered into 'no obligations'"
+                by_id[&adopt],
+                (
+                    AuthorityClass::ExplicitTaskContext,
+                    AuthorityClass::UserCorrection
+                ),
+                "effective_context_authority = ExplicitTaskContext, source_authority = UserCorrection"
+            );
+            assert_eq!(by_id[&s].0, AuthorityClass::ExplicitTaskContext);
+            assert_eq!(by_id[&s].1, AuthorityClass::ProjectConstraint);
+
+            // I-STORE, read back from the row itself: nothing in this flow raised a stored class.
+            tokio::task::block_in_place(|| {
+                for (memory_id, expected) in
+                    [(adopt, "UserCorrection"), (reference, "UserCorrection"), (s, "ProjectConstraint")]
+                {
+                    let stored: String = handle
+                        .admin
+                        .query_one(
+                            "SELECT authority_class FROM private.memory_records WHERE memory_id=$1",
+                            &[&memory_id],
+                        )
+                        .expect("owner rereads the stored authority")
+                        .get(0);
+                    assert_eq!(
+                        stored, expected,
+                        "I-STORE: a task authorization must not change the stored authority"
+                    );
+                }
+                // And the authorization row itself exists for exactly the ADOPT bindings.
+                let granted: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM private.task_binding_grants                          WHERE tenant_id=$1 AND context_binding_id = ANY($2::uuid[])                            AND revoked_at IS NULL",
+                        &[&handle.tenant_id, &vec![binding_adopt, binding_reference]],
+                    )
+                    .expect("owner counts live authorizations")
+                    .get(0);
+                assert_eq!(granted, 1, "REFERENCE_ONLY must write no authorization");
+            });
+
+            // The confirm token covers `purpose` (ADR-0046 D-D): a confirmation minted for
+            // REFERENCE_ONLY cannot execute an ADOPT_TASK_INSTRUCTION bind. Without this, the
+            // purpose would be a permission-carrying parameter the token does not cover — the
+            // exact card-22b review finding.
+            let swap_target =
+                tokio::task::block_in_place(|| seed_task_instruction_memory(&mut handle));
+            let (status, minted_reference) = task_binding_call(
+                address, bearer, 80, "bind", swap_target, task_t, None, None, Some(REFERENCE),
+            )
+            .await;
+            assert_eq!(status, 200, "{minted_reference}");
+            let reference_token = assert_tool_response(&minted_reference, ToolName::Memory)
+                ["confirm_token"]
+                .as_str()
+                .expect("confirm_token")
+                .to_owned();
+            let (status, swapped) = task_binding_call(
+                address,
+                bearer,
+                81,
+                "bind",
+                swap_target,
+                task_t,
+                Some(&reference_token),
+                None,
+                Some(ADOPT),
+            )
+            .await;
+            assert_eq!(status, 200, "{swapped}");
+            assert_tool_error(&swapped, "CONFLICT");
+            // A bind with no purpose at all is INVALID_INPUT — there is no default. The
+            // contract itself requires `purpose` on the bind branch (memory.schema.json), so
+            // the refusal is §52.1 protocol-level (400 / -32602) before the business arm at
+            // `parse_binding_arguments` ever sees it; that arm stays as defence in depth.
+            let (status, no_purpose) = task_binding_call(
+                address, bearer, 82, "bind", swap_target, task_t, None, None, None,
+            )
+            .await;
+            assert_protocol_invalid_input(status, &no_purpose);
+            tokio::task::block_in_place(|| {
+                let leaked: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM private.context_bindings                          WHERE tenant_id=$1 AND memory_id=$2 AND revoked_at IS NULL",
+                        &[&handle.tenant_id, &swap_target],
+                    )
+                    .expect("owner counts bindings for the swap target")
+                    .get(0);
+                assert_eq!(leaked, 0, "a refused bind must write nothing");
+            });
+
+            // §10.1 row 4/5 on the WRITE path (ruling §四.4's `require_behavior_eligible_target`,
+            // review finding P1). A `ToolResult` origin can never carry BEHAVIOR_ELIGIBLE content,
+            // and `PrivateKnowledge` is exactly its ceiling — so it clears `authorize_mandatory`
+            // and, before this gate existed, was minted a live ADOPT_TASK_INSTRUCTION grant plus a
+            // `UserConfirmed` authorization Evidence. The read side rejected it
+            // (UNTRUSTED_INSTRUCTION), but the transaction still committed a durable record
+            // asserting the user approved this content AS AN INSTRUCTION. The authorization must
+            // not be mintable, not merely unreadable.
+            let data_only = tokio::task::block_in_place(|| {
+                seed_task_instruction_memory_with_origin(
+                    &mut handle,
+                    "ToolResult",
+                    "PrivateKnowledge",
+                )
+            });
+            let (status, minted_data_only) = task_binding_call(
+                address, bearer, 83, "bind", data_only, task_t, None, None, Some(ADOPT),
+            )
+            .await;
+            assert_eq!(status, 200, "{minted_data_only}");
+            let data_only_token = assert_tool_response(&minted_data_only, ToolName::Memory)
+                ["confirm_token"]
+                .as_str()
+                .expect("confirm_token")
+                .to_owned();
+            let (status, refused) = task_binding_call(
+                address,
+                bearer,
+                84,
+                "bind",
+                data_only,
+                task_t,
+                Some(&data_only_token),
+                None,
+                Some(ADOPT),
+            )
+            .await;
+            assert_eq!(status, 403, "a DATA_ONLY target must be refused: {refused}");
+            assert_eq!(refused["error"]["data"]["code"], "FORBIDDEN", "{refused}");
+            tokio::task::block_in_place(|| {
+                let written: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM private.context_bindings b                          LEFT JOIN private.task_binding_grants g                            ON g.tenant_id = b.tenant_id AND g.context_binding_id = b.context_binding_id                          WHERE b.tenant_id=$1 AND b.memory_id=$2",
+                        &[&handle.tenant_id, &data_only],
+                    )
+                    .expect("owner counts what the refused bind left behind")
+                    .get(0);
+                assert_eq!(
+                    written, 0,
+                    "no binding, and above all no authorization row, for a DATA_ONLY target"
+                );
+            });
+            // And the gate is scoped to the authorization, not to the bind: the same target
+            // still binds REFERENCE_ONLY (that purpose asserts nothing about behaviour
+            // eligibility, and the read side rejects the obligation by name anyway).
+            let binding_data_only =
+                bind_through_the_gate(address, bearer, 85, data_only, task_t, REFERENCE).await;
+            let (_, data_only_report) =
+                task_selector_readback(&dsn, handle.tenant_id, user_id, workspace, task_t).await;
+            let data_only_row = data_only_report
+                .iter()
+                .find(|r| r.context_binding_id == binding_data_only)
+                .expect("the REFERENCE_ONLY obligation is nominated");
+            assert!(!data_only_row.admitted, "{data_only_report:?}");
+            assert_eq!(
+                data_only_row
+                    .reject
+                    .map(humaux_domain::context::TaskContextReject::wire),
+                Some("MISSING_TASK_AUTHORIZATION"),
+                "{data_only_report:?}"
+            );
+
+            // `memory.unbind` revokes the authorization with the binding (I-NONINHERIT's
+            // revocation arm): the obligation disappears and so does its grant.
+            let (status, minted) = task_binding_call(
+                address, bearer, 90, "unbind", adopt, task_t, None, None, None,
+            )
+            .await;
+            assert_eq!(status, 200, "{minted}");
+            let unbind_token = assert_tool_response(&minted, ToolName::Memory)["confirm_token"]
+                .as_str()
+                .expect("confirm_token")
+                .to_owned();
+            let (status, unbound) = task_binding_call(
+                address, bearer, 91, "unbind", adopt, task_t, Some(&unbind_token), None, None,
+            )
+            .await;
+            assert_eq!(status, 200, "{unbound}");
+            tokio::task::block_in_place(|| {
+                let live: i64 = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FROM private.task_binding_grants                          WHERE tenant_id=$1 AND context_binding_id=$2 AND revoked_at IS NULL",
+                        &[&handle.tenant_id, &binding_adopt],
+                    )
+                    .expect("owner rereads the authorization")
+                    .get(0);
+                assert_eq!(live, 0, "unbind must revoke the authorization in the same call");
+            });
+            let (after_rows, after_report) =
+                task_selector_readback(&dsn, handle.tenant_id, user_id, workspace, task_t).await;
+            assert!(
+                !after_rows.iter().any(|(id, _, _)| *id == adopt),
+                "a revoked authorization leaves the lane immediately"
+            );
+            assert!(
+                !after_report.iter().any(|r| r.memory_id == adopt),
+                "and its obligation is gone with the binding"
             );
 
             // (d) the route class. Not `cannot_establish/lane_failed` any more, and the lane
@@ -8395,14 +8824,14 @@ fn native_mcp_memory_bind_task_and_facet_selector_exact_sets_acceptance() {
 
             // (e) unbind revokes the binding row and nothing else; the selector drops it.
             let (status, minted) =
-                task_binding_call(address, bearer, 50, "unbind", s, task_t, None, None).await;
+                task_binding_call(address, bearer, 50, "unbind", s, task_t, None, None, None).await;
             assert_eq!(status, 200, "{minted}");
             let token = assert_tool_response(&minted, ToolName::Memory)["confirm_token"]
                 .as_str()
                 .expect("confirm_token")
                 .to_owned();
             let (status, unbound) =
-                task_binding_call(address, bearer, 51, "unbind", s, task_t, Some(&token), None).await;
+                task_binding_call(address, bearer, 51, "unbind", s, task_t, Some(&token), None, None).await;
             assert_eq!(status, 200, "{unbound}");
             let structured = assert_tool_response(&unbound, ToolName::Memory);
             assert_eq!(structured["state"], "unbound", "{unbound}");
@@ -8447,7 +8876,15 @@ async fn bind_replacing(
     replaced: Uuid,
 ) -> (u16, Value) {
     let (status, minted) = task_binding_call(
-        address, bearer, request_id, "bind", memory_id, task_id, None, None,
+        address,
+        bearer,
+        request_id,
+        "bind",
+        memory_id,
+        task_id,
+        None,
+        None,
+        Some(ADOPT),
     )
     .await;
     assert_eq!(status, 200, "replacement mint: {minted}");
@@ -8464,6 +8901,7 @@ async fn bind_replacing(
         task_id,
         Some(&token),
         Some(replaced),
+        Some(ADOPT),
     )
     .await
 }
@@ -8519,8 +8957,9 @@ fn native_mcp_memory_bind_replacement_is_scoped_to_the_authorized_binding() {
             let (address, server) = start(app).await;
             let bearer = credential.bearer.as_str();
 
-            let binding_a = bind_through_the_gate(address, bearer, 10, a, task_t).await;
-            let binding_u = bind_through_the_gate(address, bearer, 20, victim_u, task_u).await;
+            let binding_a = bind_through_the_gate(address, bearer, 10, a, task_t, ADOPT).await;
+            let binding_u =
+                bind_through_the_gate(address, bearer, 20, victim_u, task_u, ADOPT).await;
             // A PINNED row of the same tenant, written through memory.pin's own confirm flow.
             let pin_token = mint_binding_token(address, bearer, 30, "pin", victim_pinned).await;
             let (status, pinned) =
@@ -8643,8 +9082,18 @@ fn native_mcp_memory_bind_replacement_is_scoped_to_the_authorized_binding() {
             //     binding at all — the confirm flow runs, the write refuses with NOT_FOUND, and
             //     no row is written under the invented scope.
             let ghost_task = Uuid::now_v7();
-            let (status, minted) =
-                task_binding_call(address, bearer, 52, "bind", c, ghost_task, None, None).await;
+            let (status, minted) = task_binding_call(
+                address,
+                bearer,
+                52,
+                "bind",
+                c,
+                ghost_task,
+                None,
+                None,
+                Some(ADOPT),
+            )
+            .await;
             assert_eq!(status, 200, "{minted}");
             let token = assert_tool_response(&minted, ToolName::Memory)["confirm_token"]
                 .as_str()
@@ -8659,6 +9108,7 @@ fn native_mcp_memory_bind_replacement_is_scoped_to_the_authorized_binding() {
                 ghost_task,
                 Some(&token),
                 None,
+                Some(ADOPT),
             )
             .await;
             assert_eq!(status, 200, "{unresolved}");

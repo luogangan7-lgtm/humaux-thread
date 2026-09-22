@@ -618,9 +618,14 @@ fn a_superseded_constraint_disappears_on_reassembly() {
 #[test]
 fn pinned_three_with_one_low_authority_reports_expected_three_returned_two() {
     let Some(mut f) = setup() else { return };
-    // Above the pinned authority floor without also matching project constraints.
-    // No task is requested, so these are pinned-only candidates.
-    let high = seed_many(&mut f, "ExplicitTaskContext", 2);
+    // card 22c (ADR-0046, §25.4.B(6)): these two used to be seeded at `ExplicitTaskContext`
+    // precisely because it cleared the pinned floor WITHOUT matching `project_active_constraints_v1`.
+    // A stored 6 is now refused outright (I-STORE), and `ProjectConstraint` — the only class
+    // left at or above that floor — is claimed by the constraints selector unconditionally.
+    // So "pinned-only delivery above the floor" no longer exists, and the judgment this test
+    // carries (§25.5: 钉了的每一条的去向都必须可观测，没有一条静默消失) is asserted in the
+    // shape it now has: 1 below the floor + 2 taken over by Mandatory = 3 named exclusions.
+    let high = seed_many(&mut f, "ProjectConstraint", 2);
     let low = seed_many(&mut f, "PrivateKnowledge", 1)[0];
 
     for id in high.iter().chain(std::iter::once(&low)) {
@@ -637,15 +642,22 @@ fn pinned_three_with_one_low_authority_reports_expected_three_returned_two() {
     let rt = tokio::runtime::Runtime::new().expect("rt");
     let h = rt.block_on(one_handoff(&f.dsn, f.tenant_id));
 
-    assert!(
-        h.mandatory.is_empty(),
-        "fixture must exercise pinned-only delivery"
+    // The two high rows are delivered — by the Mandatory lane, which takes precedence for a
+    // memory that both lanes reach (`PinnedLane::excluding_mandatory`). Asserting this first
+    // is what keeps the exclusion count below from reading as "two pins were dropped".
+    assert_eq!(
+        h.mandatory.len(),
+        2,
+        "两条 ProjectConstraint 由 Mandatory 承载，不是消失了"
     );
     assert_eq!(h.counts.pinned_expected, 3, "外部真值：钉了 3 条");
-    assert_eq!(h.counts.pinned_returned, 2, "低 authority 那条不进 lane");
     assert_eq!(
-        h.counts.pinned_excluded, 1,
-        "被排除的必须计数——「钉 3 带 2」不可观测就是静默截断"
+        h.counts.pinned_returned, 0,
+        "钉住的三条里，两条被 Mandatory 承载、一条低于下限——独立 Pinned 行为 0"
+    );
+    assert_eq!(
+        h.counts.pinned_excluded, 3,
+        "被排除的必须逐条计数——「钉 3 带 0」不可观测就是静默截断"
     );
 }
 

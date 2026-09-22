@@ -1,7 +1,7 @@
 {
  "$schema": "https://json-schema.org/draft/2020-12/schema",
  "title": "MemoryReadResult",
- "description": "Direct Memory Envelope, one authorized immutable enumeration page, a confirmation_required result of a gated op (memory.supersede / memory.pin / memory.unpin / memory.restore / memory.archive / memory.unarchive / memory.correct / memory.confirm / memory.reject / memory.bind / memory.unbind — the same closed set as ConfirmationRequired.operation), a superseded result, or a pin/unpin/bind/unbind binding result. The catalog resolves the embedded canonical Envelope without network access. memory.get's completeness counts are INTENTIONALLY absent, not unimplemented (ADR-0041 D-D, card 22): the route always answers class=cannot_establish / reason=count_unknown with exact and known_lower_bound null, because classify() maps a DirectGet to QueryClass::Exact and §22.0 makes an exact class without a predicate_id/census a hard 5xx — filling the five counts without a census would turn a correct 200 into a 500. The unlock is a separate decision: a universe-of-one census for DirectGet. memory.enumerate, which does carry a census, answers exact.",
+ "description": "Direct Memory Envelope, one authorized immutable enumeration page, a confirmation_required result of a gated op (memory.supersede / memory.pin / memory.unpin / memory.restore / memory.archive / memory.unarchive / memory.correct / memory.confirm / memory.reject / memory.bind / memory.unbind \u2014 the same closed set as ConfirmationRequired.operation), a superseded result, or a pin/unpin/bind/unbind binding result. The catalog resolves the embedded canonical Envelope without network access. memory.get's completeness counts are INTENTIONALLY absent, not unimplemented (ADR-0041 D-D, card 22): the route always answers class=cannot_establish / reason=count_unknown with exact and known_lower_bound null, because classify() maps a DirectGet to QueryClass::Exact and \u00a722.0 makes an exact class without a predicate_id/census a hard 5xx \u2014 filling the five counts without a census would turn a correct 200 into a 500. The unlock is a separate decision: a universe-of-one census for DirectGet. memory.enumerate, which does carry a census, answers exact.",
  "type": "object",
  "$defs": {
   "Envelope": {
@@ -199,7 +199,7 @@
   },
   "BindingWritten": {
    "type": "object",
-   "description": "memory.pin / memory.unpin / memory.bind / memory.unbind executed (\u00a736, ADR-0019; card 22b ADR-0045 added the MANDATORY/TASK pair). binding_id is the private.context_bindings row. mode says which lane the row belongs to: PINNED at the credential's WORKSPACE scope (pin/unpin), MANDATORY at the authenticated TASK scope (bind/unbind). pin/bind: inserted=false when the binding already existed (D-C idempotent, no new row). unpin/unbind: the row's revoked_at is set; Evidence/Memory untouched. scope names the authorization scope the binding was written under (D-E, card 13). This is ONE branch, not four: the four ops differ only in mode, scope kind and state, so widening the three closed sets is the whole change and the output union stays at 15 branches.",
+   "description": "memory.pin / memory.unpin / memory.bind / memory.unbind executed (\u00a736, ADR-0019; card 22b ADR-0045 added the MANDATORY/TASK pair). binding_id is the private.context_bindings row. mode says which lane the row belongs to: PINNED at the credential's WORKSPACE scope (pin/unpin), MANDATORY at the authenticated TASK scope (bind/unbind). pin/bind: inserted=false when the binding already existed (D-C idempotent, no new row). unpin/unbind: the row's revoked_at is set; Evidence/Memory untouched. scope names the authorization scope the binding was written under (D-E, card 13). This is ONE branch, not four: the four ops differ only in mode, scope kind and state, so widening the three closed sets is the whole change and the output union stays at 15 branches. card 22c (ADR-0046): bind also reports purpose and task_authorization \u2014 whether this call wrote a private.task_binding_grants row. Both are absent on pin/unpin/unbind. Still ONE branch: the output union stays at 15.",
    "required": [
     "memory_id",
     "binding_id",
@@ -256,6 +256,22 @@
     },
     "inserted": {
      "type": "boolean"
+    },
+    "purpose": {
+     "type": "string",
+     "enum": [
+      "REFERENCE_ONLY",
+      "ADOPT_TASK_INSTRUCTION"
+     ],
+     "description": "memory.bind only: the purpose this binding was written under."
+    },
+    "task_authorization": {
+     "type": "string",
+     "enum": [
+      "granted",
+      "none"
+     ],
+     "description": "memory.bind only: granted = a task authorization was written in this transaction (purpose ADOPT_TASK_INSTRUCTION); none = the binding exists with no authorization, and the obligation is reported as MISSING_TASK_AUTHORIZATION at read time."
     }
    },
    "additionalProperties": false

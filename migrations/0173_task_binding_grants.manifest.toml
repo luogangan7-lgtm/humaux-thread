@@ -1,0 +1,125 @@
+# §46.1 migration manifest. Card 22c (ADR-0046): `private.task_binding_grants` — the verified,
+# non-inheritable task-binding authorization that ExplicitTaskContext now requires — plus the
+# three additive changes it needs: the I-STORE CHECK on memory_records (NOT VALID), the
+# composite UNIQUE on context_bindings the grant's FK references, and coord.tasks'
+# authorization_epoch. Additive, NULL-safe, no DML on user rows, nothing removed.
+# §46 forward-fix (EXPAND_ONLY, first free number after 0172).
+
+migration_id = "0173_task_binding_grants"
+class = "EXPAND_ONLY"
+
+precheck = """
+select
+ -- the four tables this migration builds on are there
+ to_regclass('private.memory_records') is not null
+ and to_regclass('private.context_bindings') is not null
+ and to_regclass('private.evidence_objects') is not null
+ and to_regclass('coord.tasks') is not null
+ -- ... and none of this migration's own objects exists yet (this is not a replay)
+ and to_regclass('private.task_binding_grants') is null
+ and not exists (select 1 from pg_constraint
+                  where conrelid = 'private.memory_records'::regclass
+                    and conname = 'memory_records_stored_authority_v2_check')
+ and not exists (select 1 from pg_constraint
+                  where conrelid = 'private.context_bindings'::regclass
+                    and conname = 'context_bindings_task_grant_identity_v2_uq')
+ and not exists (select 1 from pg_attribute
+                  where attrelid = 'coord.tasks'::regclass
+                    and attname = 'authorization_epoch' and not attisdropped)
+ -- the FK this migration adds needs evidence_objects' (tenant_id, evidence_id) key to exist
+ and exists (select 1 from pg_constraint
+              where conrelid = 'private.evidence_objects'::regclass
+                and contype = 'u'
+                and pg_get_constraintdef(oid) like '%(tenant_id, evidence_id)%')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- 1. I-STORE, DB side: the CHECK exists, is NOT VALID (four legacy rows, ADR-0046), and its
+ --    text really names ExplicitTaskContext. Matched by quoted-literal presence so the check
+ --    survives PostgreSQL deparsing `<>` / `IN (...)` / `= ANY (ARRAY[...])` differently.
+ (select not convalidated
+       and position('''ExplicitTaskContext''' in pg_get_constraintdef(oid)) > 0
+    from pg_constraint
+   where conrelid = 'private.memory_records'::regclass
+     and conname = 'memory_records_stored_authority_v2_check')
+ -- 2. the offender count is REPORTED, not enforced: the four fixture-born rows recorded in
+ --    ADR-0046 stay, are never mass-downgraded, and are dispositioned in card 24 before
+ --    VALIDATE CONSTRAINT. Bounded rather than free-form so a FIFTH one cannot appear
+ --    unnoticed — under the new CHECK no new one can be written at all, so this bound is a
+ --    fact about the past, not a limit on the future.
+ and (select count(*) <= 4 from private.memory_records
+       where authority_class = 'ExplicitTaskContext')
+ -- 3. the composite key the grant FK references
+ and exists (select 1 from pg_constraint
+              where conrelid = 'private.context_bindings'::regclass
+                and conname = 'context_bindings_task_grant_identity_v2_uq'
+                and contype = 'u')
+ -- 4. the task epoch column: bigint, NOT NULL, defaulted, and NOT a generated column (it has a
+ --    real future writer, unlike memory_records.facet)
+ and (select a.atttypid = 'int8'::regtype and a.attnotnull and a.atthasdef and a.attgenerated = ''
+        from pg_attribute a
+       where a.attrelid = 'coord.tasks'::regclass
+         and a.attname = 'authorization_epoch' and not a.attisdropped)
+ and not exists (select 1 from coord.tasks where authorization_epoch is null)
+ -- 5. the table itself, with RLS ENABLED *and* FORCED (owner included)
+ and (select c.relrowsecurity and c.relforcerowsecurity
+        from pg_class c where c.oid = 'private.task_binding_grants'::regclass)
+ and (select r.rolname = 'role_migration_owner'
+        from pg_class c join pg_roles r on r.oid = c.relowner
+       where c.oid = 'private.task_binding_grants'::regclass)
+ -- 6. both policies present, by name
+ and (select count(*) = 2 from pg_policies
+       where schemaname = 'private' and tablename = 'task_binding_grants'
+         and policyname in ('task_grant_gateway_v2', 'task_grant_reader_v2'))
+ -- 7. the revoke-only trigger present and enabled
+ and exists (select 1 from pg_trigger t
+              where t.tgrelid = 'private.task_binding_grants'::regclass
+                and t.tgname = 'task_grant_revoke_only_v2'
+                and not t.tgisinternal and t.tgenabled <> 'D')
+ -- 8. the grant matrix of §6.2.2, exactly: gateway SELECT+INSERT+UPDATE(revoked_at),
+ --    retrieval_worker SELECT, and NOTHING for the six other runtime roles. A distiller or
+ --    consolidation worker that could mint or revive a grant is §10.1 rule 2's own
+ --    "后台蒸馏自动提权".
+ and has_table_privilege('role_gateway','private.task_binding_grants','SELECT')
+ and has_table_privilege('role_gateway','private.task_binding_grants','INSERT')
+ and has_column_privilege('role_gateway','private.task_binding_grants','revoked_at','UPDATE')
+ and not has_column_privilege('role_gateway','private.task_binding_grants','task_id','UPDATE')
+ and not has_table_privilege('role_gateway','private.task_binding_grants','DELETE')
+ and has_table_privilege('role_retrieval_worker','private.task_binding_grants','SELECT')
+ and not has_table_privilege('role_retrieval_worker','private.task_binding_grants','INSERT')
+ and not exists (
+       select 1 from unnest(array['role_private_worker','role_consolidation_worker',
+                                  'role_public_worker','role_batch_issuer',
+                                  'role_maintenance','role_admin']) as t(role_name)
+        where has_table_privilege(t.role_name,'private.task_binding_grants','SELECT')
+           or has_table_privilege(t.role_name,'private.task_binding_grants','INSERT')
+           or has_table_privilege(t.role_name,'private.task_binding_grants','UPDATE')
+           or has_table_privilege(t.role_name,'private.task_binding_grants','DELETE'))
+ -- 9. the two FKs, by name: the grant agrees with its binding's WHOLE shape, and its
+ --    authorization Evidence cannot be deleted out from under it.
+ and exists (select 1 from pg_constraint
+              where conrelid = 'private.task_binding_grants'::regclass
+                and conname = 'task_binding_grants_binding_fk' and contype = 'f'
+                and confrelid = 'private.context_bindings'::regclass
+                and confdeltype = 'c')
+ and exists (select 1 from pg_constraint
+              where conrelid = 'private.task_binding_grants'::regclass
+                and conname = 'task_binding_grants_authorization_evidence_fk' and contype = 'f'
+                and confrelid = 'private.evidence_objects'::regclass
+                and confdeltype = 'r')
+ -- 10. the closed-set CHECKs that make this table only ever able to express ONE authority.
+ --     Quoted-literal presence again (PostgreSQL deparses `IN (...)` as `= ANY (ARRAY[...])`).
+ and (select count(*) = 4 from unnest(array[
+        '''TASK''', '''MANDATORY''', '''ADOPT_TASK_INSTRUCTION''', '''AUTHENTICATED_TASK_REQUEST''']) as t(needle)
+       where exists (select 1 from pg_constraint
+                      where conrelid = 'private.task_binding_grants'::regclass
+                        and contype = 'c'
+                        and position(t.needle in pg_get_constraintdef(oid)) > 0))
+ and exists (select 1 from pg_constraint
+              where conrelid = 'private.task_binding_grants'::regclass
+                and contype = 'c'
+                and pg_get_constraintdef(oid) like '%grant_authority%6%')
+ as postcheck_ok
+"""

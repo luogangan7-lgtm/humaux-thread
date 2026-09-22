@@ -686,7 +686,13 @@ fn a_live_unversioned_constraint_is_diverted_and_named_not_consumed() {
 #[test]
 fn revoking_a_binding_removes_it_from_the_lane() {
     let Some((mut f, dsn)) = setup() else { return };
-    let memory_id = seed_memory(&mut f, "ExplicitTaskContext", "SNAPSHOT");
+    // card 22c (ADR-0046, §25.4.B(6)): this row used to be seeded at `ExplicitTaskContext` so
+    // that ONLY the explicit-binding selector could deliver it. A stored 6 is now refused by
+    // `memory_records_stored_authority_v2_check` (I-STORE), and `ProjectConstraint` — the only
+    // remaining class at or above the explicit selector's floor — is unconditionally claimed by
+    // `project_active_constraints_v1` as well. So the judgment is asserted where it is still
+    // observable: on the PER-SELECTOR outcomes, before the lane merges and dedups them.
+    let memory_id = seed_memory(&mut f, "ProjectConstraint", "SNAPSHOT");
     let constraint_id = seed_memory(&mut f, "ProjectConstraint", "SNAPSHOT");
     let low_authority_id = seed_memory(&mut f, "ProjectDecision", "SNAPSHOT");
     let binding_ids: Vec<Uuid> = [memory_id, constraint_id, low_authority_id]
@@ -717,20 +723,44 @@ fn revoking_a_binding_removes_it_from_the_lane() {
         ))
         .expect("fetch frozen")
     };
+    // Per-selector readback, un-merged: `selector_outcomes` is the same in-transaction path the
+    // lane uses, one `SelectorOutcome` per selector.
+    let selector_rows = |id: SelectorId| -> Vec<Uuid> {
+        let outcomes = rt
+            .block_on(context_repo::selector_outcomes(
+                &pool,
+                &authorization_for(f.tenant_id),
+                &scope_for(f.tenant_id),
+            ))
+            .expect("per-selector readback");
+        let mut ids: Vec<Uuid> = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                humaux_domain::context::SelectorOutcome::Ran {
+                    id: outcome_id,
+                    rows,
+                    ..
+                } if *outcome_id == id => Some(rows.iter().map(|row| row.memory_id().0)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        ids.sort();
+        ids
+    };
+
     let before = snapshot();
     assert_eq!(before.mandatory.expected(), 2);
+    let mut both = vec![memory_id, constraint_id];
+    both.sort();
     assert_eq!(
-        before
-            .mandatory
-            .rows()
-            .iter()
-            .map(|row| (row.memory_id().0, row.selector()))
-            .collect::<Vec<_>>(),
-        vec![
-            (constraint_id, SelectorId::ProjectActiveConstraintsV1),
-            (memory_id, SelectorId::ExplicitMandatoryBindingsV1),
-        ],
-        "高于下限的显式绑定必须返回，项目约束只返回一次，低 authority 绑定不得进入 lane"
+        selector_rows(SelectorId::ExplicitMandatoryBindingsV1),
+        both,
+        "两条达到下限的 MANDATORY 绑定必须被显式绑定 selector 选中；低 authority 那条不得进入"
+    );
+    assert!(
+        !selector_rows(SelectorId::ExplicitMandatoryBindingsV1).contains(&low_authority_id),
+        "低于下限的绑定目标不得被显式绑定 selector 选中"
     );
     for binding_id in &binding_ids[..2] {
         let revoked = rt
@@ -743,17 +773,21 @@ fn revoking_a_binding_removes_it_from_the_lane() {
         assert!(revoked, "第一次撤销必须真的改了一行");
     }
     let after = snapshot();
-    assert_eq!(after.mandatory.expected(), 1);
+    // The bindings are gone, so the binding selector delivers nothing — that is the §25.5
+    // positive control this test exists for. The same two rows are still delivered by the
+    // INDEPENDENT project-constraints selector, which is the other half: revoking a binding
+    // must not delete a row that qualifies on its own.
     assert_eq!(
-        after
-            .mandatory
-            .rows()
-            .iter()
-            .map(|row| (row.memory_id().0, row.selector()))
-            .collect::<Vec<_>>(),
-        vec![(constraint_id, SelectorId::ProjectActiveConstraintsV1)],
-        "binding-only 行撤销后消失；仍满足项目约束的同一行不可被一起删掉"
+        selector_rows(SelectorId::ExplicitMandatoryBindingsV1),
+        Vec::<Uuid>::new(),
+        "binding 撤销后显式绑定 selector 必须立即不再选中它们"
     );
+    assert_eq!(
+        selector_rows(SelectorId::ProjectActiveConstraintsV1),
+        both,
+        "仍满足项目约束的行不可被一起删掉"
+    );
+    assert_eq!(after.mandatory.expected(), 2);
 
     // 幂等：再撤一次不改行。
     let again = rt
@@ -832,14 +866,12 @@ fn seed_visibility_cases(f: &mut Fixture) -> VisibilityCases {
     let explicit_good = seed_memory_with_visibility(f, "TENANT_SHARED", None, None, f.evidence_id);
     let explicit_wrong_scope =
         seed_memory_with_visibility(f, "TENANT_SHARED", None, None, f.evidence_id);
-    // These two rows must depend on the explicit binding selector, not the project selector.
-    f.admin
-        .execute(
-            "UPDATE private.memory_records SET authority_class = 'ExplicitTaskContext' \
-             WHERE memory_id = ANY($1::uuid[])",
-            &[&vec![explicit_good, explicit_wrong_scope]],
-        )
-        .expect("make explicit-only context");
+    // card 22c (ADR-0046, §25.4.B(6)): these two used to be UPDATEd to `ExplicitTaskContext` so
+    // that only the explicit-binding selector could reach them. A stored 6 is now refused
+    // outright (I-STORE), and there is no class above the explicit selector's floor that the
+    // project selector does not also claim. They stay at the seeder's `ProjectConstraint`, and
+    // the scope judgment below is asserted on the explicit selector's OWN outcome instead of on
+    // the merged lane (where the project selector would be the representative selector).
     for (memory_id, mode, scope_kind, scope_id) in [
         (explicit_good, "MANDATORY", "USER", Some(current_user)),
         (
@@ -886,6 +918,9 @@ fn seed_visibility_cases(f: &mut Fixture) -> VisibilityCases {
 /// Real-PG authorization counterexamples: the adapter must use the authenticated scope and
 /// the real Memory/Evidence descriptors, while a binding is relevant only on `scope_chain`.
 #[test]
+// card 22c added the per-selector readback (the merged lane can no longer attribute a row to
+// the explicit-binding selector, §25.4.B(6)). One fixture, one set of counterexamples.
+#[allow(clippy::too_many_lines)]
 fn context_lanes_filter_visibility_lifecycle_and_binding_scope() {
     let Some((mut f, dsn)) = setup() else { return };
     let cases = seed_visibility_cases(&mut f);
@@ -914,12 +949,24 @@ fn context_lanes_filter_visibility_lifecycle_and_binding_scope() {
     assert!(!mandatory.contains(&cases.other_shared));
     assert!(!mandatory.contains(&cases.hidden_source));
     assert!(!mandatory.contains(&cases.revoked));
-    let explicit: Vec<Uuid> = frozen
-        .mandatory
-        .rows()
+    let outcomes = rt
+        .block_on(context_repo::selector_outcomes(
+            &pool,
+            &authorization,
+            &scope,
+        ))
+        .expect("per-selector readback");
+    let explicit: Vec<Uuid> = outcomes
         .iter()
-        .filter(|row| row.selector() == SelectorId::ExplicitMandatoryBindingsV1)
-        .map(|row| row.memory_id().0)
+        .filter_map(|outcome| match outcome {
+            humaux_domain::context::SelectorOutcome::Ran { id, rows, .. }
+                if *id == SelectorId::ExplicitMandatoryBindingsV1 =>
+            {
+                Some(rows.iter().map(|row| row.memory_id().0))
+            }
+            _ => None,
+        })
+        .flatten()
         .collect();
     assert!(explicit.contains(&cases.explicit_good));
     assert!(!explicit.contains(&cases.explicit_wrong_scope));

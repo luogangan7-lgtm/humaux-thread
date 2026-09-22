@@ -16,9 +16,12 @@ use humaux_domain::audit::{AuditEvent, AuditEventId, McpAuditAction};
 use humaux_domain::authority::{AuthorityClass, MemoryId};
 use humaux_domain::confirm::{DestructiveOp, RISK_TAG_CONFIRMATION_MINTED};
 use humaux_domain::context::{
-    Admitted, BindingGrant, BindingMode, BindingRequest, ConfirmedUserActor, ContextBudget,
-    ElevatedActor, FrozenReads, MandatoryLane, MandatoryRow, PinnedLane, ScopeKind, SelectorId,
-    SelectorOutcome, SelectorSpec, authorize_mandatory, authorize_pinned, spec,
+    Admitted, AuthenticatedTask, AuthorityRequirement, BindingGrant, BindingMode, BindingPurpose,
+    BindingRequest, ConfirmedUserActor, ContextBudget, ElevatedActor, FrozenReads, MandatoryLane,
+    MandatoryRow, PinnedLane, RawTaskGrant, ScopeKind, SelectorId, SelectorOutcome, SelectorSpec,
+    TASK_AUTHORIZATION_POLICY_VERSION, TaskBindingObligation, TaskContextReject, TaskGrantFacts,
+    TaskGrantIssuer, TaskTargetFacts, authorize_mandatory, authorize_pinned, authorize_task_item,
+    spec,
 };
 use humaux_domain::error::ErrorCode;
 use humaux_domain::grounding::{GroundingMode, RowGrounding, SnapshotEdge, classify_in_snapshot};
@@ -149,18 +152,23 @@ async fn resolve_task_in_txn(
     txn: &mut Txn<'_>,
     tenant_id: Uuid,
     task: humaux_domain::ids::TaskId,
-) -> Result<(), ErrorCode> {
-    let exists: Option<i32> =
-        sqlx::query_scalar("SELECT 1 FROM coord.tasks WHERE task_id = $1 AND tenant_id = $2")
-            .bind(task.0)
-            .bind(tenant_id)
-            .fetch_optional(&mut **txn)
-            .await
-            .map_err(|_| ErrorCode::Internal)?;
-    if exists.is_none() {
-        return Err(ErrorCode::NotFound);
-    }
-    Ok(())
+) -> Result<AuthenticatedTask, ErrorCode> {
+    // card 22c: the resolution now also reads `authorization_epoch` — the task's current
+    // authorization generation. A grant issued under an older epoch is dead the moment the
+    // task's lifecycle bumps it, and `AuthenticatedTask` is the ONLY carrier of that number
+    // into `authorize_task_item`, so "which generation is current" cannot come from the wire.
+    let epoch: Option<i64> = sqlx::query_scalar(
+        "SELECT authorization_epoch FROM coord.tasks WHERE task_id = $1 AND tenant_id = $2",
+    )
+    .bind(task.0)
+    .bind(tenant_id)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?;
+    let epoch = epoch.ok_or(ErrorCode::NotFound)?;
+    Ok(AuthenticatedTask::from_resolved_task(
+        tenant_id, task.0, epoch,
+    ))
 }
 
 /// 一个 selector 今天跑不跑得起来。
@@ -283,46 +291,74 @@ const EXPLICIT_BINDINGS_WHERE: &str = "m.tenant_id = $1 \
          ) \
      )";
 
-/// `task_explicit_context_v1` 的**候选**（提名 / 义务）枚举。
+/// `task_explicit_context_v2` 的**提名**（绑定义务）枚举 + 授权/目标事实（card 22c, ADR-0046）。
 ///
-/// 裁决 §四.3 点名的陷阱：不要一上来就 inner join + `status='ACTIVE'` 把失效的绑定目标全
-/// 丢掉——那会把「仍然有绑定义务，但目标已不可用」伪装成「没有任何义务」。所以候选只按
-/// 绑定本身枚举；生命周期与权威下限留给下面的取行 WHERE。两者之差就是**未解决义务**
-/// （§25.4.A(9)/(10)），`SelectorOutcome::Ran` 的 `candidate_ids` 减 `rows` 即是。
-const TASK_EXPLICIT_CANDIDATES_WHERE: &str = concat!(
-    "m.tenant_id = $1 AND ",
-    "EXISTS ( \
-       SELECT 1 FROM private.context_bindings cb \
-       WHERE cb.memory_id = m.memory_id \
-         AND cb.tenant_id = m.tenant_id \
-         AND cb.scope_kind = 'TASK' \
-         AND cb.scope_id = $2 \
-         AND cb.mode = 'MANDATORY' \
-         AND cb.revoked_at IS NULL \
-     )"
-);
+/// 裁决 §六.2 逐字点名的形状：`WITH nominated AS MATERIALIZED (...) ... LEFT JOIN`。
+///
+/// 是函数而不是 `const`：两个共享表达式（内容摘要、token 估算）必须与别处**同一个**常量，
+/// 而 `concat!` 只吃字面量。每次请求一次 `format!`，代价可忽略；两处各抄一遍的代价不可忽略。
+///
+/// **不许**在这条 SQL 里出现 `INNER JOIN grants`、`WHERE g.revoked_at IS NULL`、
+/// `WHERE m.status='ACTIVE'` 或任何 authority 过滤。它们都会把一条**仍然成立的义务**从诊断
+/// 输入里删掉，于是「有 3 条必带项，其中 2 条没有授权」会读成「没有任何必带项」——这正是
+/// 裁决 §六.3 禁止的「用 admitted 当分母」。准入判定全部在
+/// [`humaux_domain::context::authorize_task_item`]，SQL 只负责把事实端上来。
+///
+/// `MATERIALIZED` 不是性能提示：它阻止 planner 把外层的过滤条件下推进提名子查询，
+/// 也就是阻止优化器**重新**做掉我们刚刚拒绝做的那件事。
+fn task_nominated_sql() -> String {
+    format!(
+        "WITH nominated AS MATERIALIZED ( \
+           SELECT cb.context_binding_id, cb.tenant_id, cb.scope_kind, cb.scope_id, cb.mode, \
+                  cb.memory_id, (cb.revoked_at IS NOT NULL) AS binding_revoked \
+             FROM private.context_bindings cb \
+            WHERE cb.tenant_id = $1 AND cb.scope_kind = 'TASK' AND cb.scope_id = $2 \
+              AND cb.mode = 'MANDATORY' AND cb.revoked_at IS NULL \
+         ) \
+         SELECT n.context_binding_id, n.tenant_id, n.scope_kind, n.scope_id, n.mode, n.memory_id, \
+                n.binding_revoked, \
+                g.tenant_id AS g_tenant_id, g.task_id AS g_task_id, g.memory_id AS g_memory_id, \
+                g.scope_kind AS g_scope_kind, g.mode AS g_mode, g.task_epoch AS g_task_epoch, \
+                g.payload_sha256 AS g_payload_sha256, g.grant_authority AS g_grant_authority, \
+                g.purpose AS g_purpose, g.issuer_kind AS g_issuer_kind, \
+                g.policy_version AS g_policy_version, \
+                (g.revoked_at IS NOT NULL) AS g_revoked, \
+                EXTRACT(EPOCH FROM g.issued_at)::int8 AS g_issued_at_s, \
+                EXTRACT(EPOCH FROM g.expires_at)::int8 AS g_expires_at_s, \
+                EXISTS (SELECT 1 FROM private.evidence_objects eo \
+                         WHERE eo.tenant_id = g.tenant_id \
+                           AND eo.evidence_id = g.authorization_evidence_id) \
+                  AS g_evidence_present, \
+                m.memory_id AS m_memory_id, m.tenant_id AS m_tenant_id, \
+                m.authority_class AS m_authority_class, \
+                (m.status = 'active' AND m.superseded_by IS NULL AND m.archived_at IS NULL) \
+                  AS m_active, \
+                {CANONICAL_PAYLOAD_SHA256_EXPR} AS m_payload_sha256, \
+                {EST_TOKENS_EXPR} AS m_est_tokens, \
+                COALESCE(EXISTS(SELECT 1 FROM private.memory_evidence me \
+                       WHERE me.memory_id = m.memory_id AND me.grounding_mode = 'LIVE'), false) \
+                  AS has_live, \
+                COALESCE(EXISTS(SELECT 1 FROM private.memory_evidence me \
+                       WHERE me.memory_id = m.memory_id AND me.grounding_mode = 'LIVE' \
+                         AND me.recorded_version IS NULL), false) AS has_live_unversioned, \
+                EXTRACT(EPOCH FROM statement_timestamp())::int8 AS now_s \
+           FROM nominated n \
+           LEFT JOIN private.task_binding_grants g \
+                  ON g.tenant_id = n.tenant_id AND g.context_binding_id = n.context_binding_id \
+           LEFT JOIN private.memory_records m \
+                  ON m.tenant_id = n.tenant_id AND m.memory_id = n.memory_id \
+          ORDER BY n.context_binding_id"
+    )
+}
 
-/// `task_explicit_context_v1` 的取行 WHERE：义务 + 生命周期 + `ExplicitTaskContext` 下限。
+/// 被批准的**那一份**内容的规范化摘要，全仓唯一一处定义。
 ///
-/// 下限是 spec 的 `min_authority`，SQL 侧必须先过（`MandatoryRow::from_selector` 会对低于
-/// 下限的行返回 Err，那是 `Internal` 不是「静默少带」）。绑定或 supersede 关系**不能**
-/// 提升 authority（§25.4.A(8)）：低权威目标在这里被读侧门挡掉，而不是被绑定洗白。
-const TASK_EXPLICIT_ROWS_WHERE: &str = concat!(
-    "m.tenant_id = $1 \
-     AND m.authority_class = 'ExplicitTaskContext' \
-     AND m.status = 'active' \
-     AND m.superseded_by IS NULL \
-     AND m.archived_at IS NULL AND ",
-    "EXISTS ( \
-       SELECT 1 FROM private.context_bindings cb \
-       WHERE cb.memory_id = m.memory_id \
-         AND cb.tenant_id = m.tenant_id \
-         AND cb.scope_kind = 'TASK' \
-         AND cb.scope_id = $2 \
-         AND cb.mode = 'MANDATORY' \
-         AND cb.revoked_at IS NULL \
-     )"
-);
+/// `jsonb::text` 是 PostgreSQL 归一化过的形态（键序、空白都已规范），所以同一份内容在写侧
+/// 与读侧算出同一个摘要；`sha256` / `convert_to` 都是核心 PostgreSQL，不需要 pgcrypto。
+/// 写侧（`insert_task_binding_grant_in_txn`）与读侧（[`TASK_NOMINATED_SQL`]）共用这一个常量
+/// ——两处各写一遍的那天，「精确内容批准」会在某一次改写里静默失效。
+pub(crate) const CANONICAL_PAYLOAD_SHA256_EXPR: &str =
+    "sha256(convert_to(m.content::text, 'UTF8'))";
 
 /// `required_current_state_facets_v1` 的 WHERE（§25.4.A(1)/(2)/(4)）。
 ///
@@ -450,15 +486,21 @@ pub(crate) async fn readable_memory_ids(
 
 /// 每个 selector 的两条 SQL：候选（提名 / 义务）枚举与取行。
 ///
-/// 多数 selector 两者同一条谓词；`task_explicit_context_v1` 故意不同——见
-/// [`TASK_EXPLICIT_CANDIDATES_WHERE`]。card 22 之前这里还有一条 `other =>` 兜底臂，
+/// 四个 `StoredAtLeast` selector 两者同一条谓词。`task_explicit_context_v2` **不在这里**：
+/// 它的准入对象不是行上的 authority，而是一条验过的任务授权，取数形状因此完全不同
+/// （[`TASK_NOMINATED_SQL`] + [`authorize_task_item`]）——把它塞进这个 `(候选, 取行)` 二元组
+/// 就等于宣称「提名和准入只差一个 WHERE」，而那正是 v1 的形状。card 22 之前这里还有一条
+/// `other =>` 兜底臂，
 /// 把「有列但没写谓词」的 selector 判成 `Unavailable`。两个缺谓词的 selector 现在都有了
 /// 谓词，match 是**闭集穷举**：再加 selector 编译器会逼这里跟着改，兜底臂反而会把那次遗漏
 /// 变成一条安静的 NA，所以删掉。
 const fn selector_sql(id: SelectorId) -> (&'static str, &'static str) {
     match id {
+        // 不可达：`run_selector` 在分派到这里之前已经把 task selector 交给
+        // `run_task_explicit_selector`。留一条会 panic 的臂而不是一条“合理”的默认谓词——
+        // 一条能跑的默认谓词就是一条悄悄按存储权威准入的后门。
         SelectorId::TaskExplicitContextV1 => {
-            (TASK_EXPLICIT_CANDIDATES_WHERE, TASK_EXPLICIT_ROWS_WHERE)
+            panic!("task_explicit_context_v2 不走 selector_sql，见 run_task_explicit_selector")
         }
         SelectorId::ProjectActiveConstraintsV1 => {
             (PROJECT_CONSTRAINTS_WHERE, PROJECT_CONSTRAINTS_WHERE)
@@ -487,9 +529,11 @@ async fn fetch_selector_rows(
             let (kinds, ids) = scope_chain_params(scope);
             query.bind(kinds).bind(ids)
         }
-        // §25.4.A(7): the one authenticated TaskId of this request, or SQL NULL when the
-        // request carries no task dimension (then the binding predicate matches nothing).
-        SelectorId::TaskExplicitContextV1 => query.bind(scope.task_id.map(|task| task.0)),
+        // card 22c: unreachable for the same reason `selector_sql` is — the task selector
+        // never reaches this generic path.
+        SelectorId::TaskExplicitContextV1 => {
+            return Err(ErrorCode::Internal);
+        }
         // §25.4.A(1): the facet wire values come from the closed enum's serialization —
         // `MandatoryContextFacet::ALL`, never a literal list in SQL.
         SelectorId::RequiredCurrentStateFacetsV1 => query.bind(
@@ -590,6 +634,353 @@ async fn run_selector(
     })
 }
 
+/// 一条提名义务的**报告行**：它是不是被准入，没被准入的话原因是什么（脱敏）。
+///
+/// 裁决 §六：`rejected = N − A`，逐条具名。这不是 `SelectorOutcome` 的一个新字段——那个
+/// 枚举是 `crates/retrieval` 也在构造的闭集，本卡不改它；提名集本身已经在
+/// `SelectorOutcome::Ran::candidate_ids` 里诚实地全量保留（**不**按可读性过滤），
+/// 本结构是它旁边那份「为什么」的读数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskObligationReport {
+    /// 哪条绑定义务。
+    pub context_binding_id: Uuid,
+    /// 它指向的 memory。
+    pub memory_id: Uuid,
+    /// 准入了吗。
+    pub admitted: bool,
+    /// 没准入的原因（脱敏、不含内容）。`None` ⇔ `admitted`。
+    pub reject: Option<TaskContextReject>,
+}
+
+/// `task_explicit_context_v2` 的一次运行：提名集 + 准入集 + 逐条理由。
+struct TaskSelectorRun {
+    outcome: SelectorOutcome,
+    reports: Vec<TaskObligationReport>,
+}
+
+/// `private.memory_records.content` 的 origin basis 允许的最高 disposition，逐 memory。
+///
+/// 存在性读法（与 §10.1 rule 1 的 ceiling 一致、与 `AuthorityPolicy::authorize` 逐字同款）：
+/// basis 里**有任一** origin 允许 `BehaviorEligible` 才算 `BehaviorEligible`。origin → disposition
+/// 的表只有 `EvidenceOriginClass::max_disposition` 一处，SQL 里不复制它。
+///
+/// 没有任何可读 evidence 的 memory 得到 `DataOnly`（失败关闭）——没有 basis 就没有行为资格。
+async fn max_dispositions_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    memory_ids: &[Uuid],
+) -> Result<HashMap<Uuid, humaux_domain::evidence::InstructionDisposition>, ErrorCode> {
+    use humaux_domain::evidence::InstructionDisposition;
+    let mut out: HashMap<Uuid, InstructionDisposition> = memory_ids
+        .iter()
+        .map(|id| (*id, InstructionDisposition::DataOnly))
+        .collect();
+    if memory_ids.is_empty() {
+        return Ok(out);
+    }
+    let rows = sqlx::query(
+        "SELECT me.memory_id, eo.origin_class FROM private.memory_evidence me \
+           JOIN private.evidence_objects eo \
+             ON eo.evidence_id = me.evidence_id AND eo.tenant_id = $1 \
+          WHERE me.memory_id = ANY($2)",
+    )
+    .bind(tenant_id)
+    .bind(memory_ids)
+    .fetch_all(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?;
+    for row in rows {
+        let memory_id: Uuid = row.try_get("memory_id").map_err(|_| ErrorCode::Internal)?;
+        let origin: String = row
+            .try_get("origin_class")
+            .map_err(|_| ErrorCode::Internal)?;
+        let origin =
+            crate::distill_repo::origin_class_from_db_str(&origin).ok_or(ErrorCode::Internal)?;
+        if matches!(
+            origin.max_disposition(),
+            InstructionDisposition::BehaviorEligible
+        ) && let Some(slot) = out.get_mut(&memory_id)
+        {
+            *slot = InstructionDisposition::BehaviorEligible;
+        }
+    }
+    Ok(out)
+}
+
+/// `bytea` → `[u8; 32]`。长度不对是 `Internal`，不是补零——一个 31 字节的摘要不是摘要。
+fn digest32(raw: &[u8]) -> Result<[u8; 32], ErrorCode> {
+    <[u8; 32]>::try_from(raw).map_err(|_| ErrorCode::Internal)
+}
+
+/// `task_explicit_context_v2` 的唯一运行点（card 22c, ADR-0046）。
+///
+/// 顺序：提名（绑定义务，无过滤）→ 目标可读性 → origin disposition → 逐条
+/// [`authorize_task_item`] → 准入的行经 [`MandatoryRow::from_task_grant`] 过 DOD-093 铸造门。
+///
+/// `candidate_ids` 是**提名集**（N），不是可读集：一条目标不可读的义务仍然是一条义务，
+/// 它必须留在分母里（裁决 §六.3）。这跟其余四个 selector 不同，理由写在这里而不是靠读者
+/// 自己发现：那四个的「候选」本来就是「按谓词枚举到的可读行」，而这一个的候选是**义务**。
+async fn run_task_explicit_selector(
+    txn: &mut Txn<'_>,
+    s: &'static SelectorSpec,
+    authorization: &AuthorizationScope,
+    scope: &Scope,
+) -> Result<TaskSelectorRun, ErrorCode> {
+    let empty = |id| TaskSelectorRun {
+        outcome: SelectorOutcome::Ran {
+            id,
+            candidate_ids: Vec::new(),
+            rows: Vec::new(),
+            needs_verification: Vec::new(),
+        },
+        reports: Vec::new(),
+    };
+    // §25.4.A(7): no authenticated task in this request ⇒ no TASK obligation can be inherited.
+    let Some(task_id) = scope.task_id else {
+        return Ok(empty(s.id));
+    };
+    // The task must resolve in THIS transaction; a wire uuid naming nothing is not a task.
+    // `resolve_task_in_txn` is also the only producer of the epoch admission compares against.
+    let task = resolve_task_in_txn(txn, scope.tenant_id.0, task_id).await?;
+
+    let rows = sqlx::query(&task_nominated_sql())
+        .bind(scope.tenant_id.0)
+        .bind(task_id.0)
+        .fetch_all(&mut **txn)
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
+    if rows.is_empty() {
+        return Ok(empty(s.id));
+    }
+
+    let nominated_ids: Vec<Uuid> = rows
+        .iter()
+        .map(|r| r.try_get("memory_id").map_err(|_| ErrorCode::Internal))
+        .collect::<Result<Vec<Uuid>, _>>()?;
+    let readable = readable_memory_ids(txn, authorization, &nominated_ids).await?;
+    let dispositions = max_dispositions_in_txn(txn, scope.tenant_id.0, &nominated_ids).await?;
+    let stored_floor = s.authority.stored_floor();
+
+    let mut admitted_rows = Vec::new();
+    let mut needs = Vec::new();
+    let mut reports = Vec::with_capacity(rows.len());
+    let mut candidate_ids: Vec<MemoryId> = Vec::with_capacity(rows.len());
+
+    for r in rows {
+        let facts = task_grant_facts_from_row(&r, &readable, &dispositions)?;
+        let context_binding_id: Uuid = r
+            .try_get("context_binding_id")
+            .map_err(|_| ErrorCode::Internal)?;
+        let memory_id = facts.obligation.memory_id;
+        candidate_ids.push(memory_id);
+
+        match authorize_task_item(&task, stored_floor, &facts) {
+            Err(reject) => reports.push(TaskObligationReport {
+                context_binding_id,
+                memory_id: memory_id.0,
+                admitted: false,
+                reject: Some(reject),
+            }),
+            Ok(item) => {
+                let est_tokens: i32 = r.try_get("m_est_tokens").map_err(|_| ErrorCode::Internal)?;
+                let has_live: bool = r.try_get("has_live").map_err(|_| ErrorCode::Internal)?;
+                let has_live_unversioned: bool = r
+                    .try_get("has_live_unversioned")
+                    .map_err(|_| ErrorCode::Internal)?;
+                let grounding = grounding_from_facts(has_live, has_live_unversioned);
+                match MandatoryRow::from_task_grant(
+                    s,
+                    item,
+                    u32::try_from(est_tokens).unwrap_or(u32::MAX),
+                    grounding,
+                )
+                .map_err(|_| ErrorCode::Internal)?
+                {
+                    Admitted::Row(row) => {
+                        admitted_rows.push(row);
+                        reports.push(TaskObligationReport {
+                            context_binding_id,
+                            memory_id: memory_id.0,
+                            admitted: true,
+                            reject: None,
+                        });
+                    }
+                    Admitted::NeedsVerification(nv) => {
+                        needs.push(nv);
+                        reports.push(TaskObligationReport {
+                            context_binding_id,
+                            memory_id: memory_id.0,
+                            admitted: false,
+                            reject: Some(TaskContextReject::TargetNotActiveOrGrounded),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    candidate_ids.sort_by_key(|id| id.0);
+    candidate_ids.dedup();
+
+    Ok(TaskSelectorRun {
+        outcome: SelectorOutcome::Ran {
+            id: s.id,
+            candidate_ids,
+            rows: admitted_rows,
+            needs_verification: needs,
+        },
+        reports,
+    })
+}
+
+/// 一行 [`task_nominated_sql`] → [`TaskGrantFacts`]。**纯投影**，没有任何判定：判定全部在
+/// `authorize_task_item`。这里唯一的"决定"是把 NULL 读成 `None` 而不是读成默认值。
+// 长度来自字段数（一条 grant 要绑的东西有十几样，裁决 §二.1 逐条点名），不是来自分支。
+// 拆成几个"取一半字段"的函数不会让它更短，只会让"这一列读成了什么"散到两处。
+#[allow(clippy::too_many_lines)]
+fn task_grant_facts_from_row(
+    r: &sqlx::postgres::PgRow,
+    readable: &HashSet<Uuid>,
+    dispositions: &HashMap<Uuid, humaux_domain::evidence::InstructionDisposition>,
+) -> Result<TaskGrantFacts, ErrorCode> {
+    use humaux_domain::evidence::InstructionDisposition;
+    let get = |name: &str| -> Result<Uuid, ErrorCode> {
+        r.try_get(name).map_err(|_| ErrorCode::Internal)
+    };
+    let memory_id = MemoryId(get("memory_id")?);
+    let scope_kind: String = r.try_get("scope_kind").map_err(|_| ErrorCode::Internal)?;
+    let mode: String = r.try_get("mode").map_err(|_| ErrorCode::Internal)?;
+    let obligation = TaskBindingObligation {
+        context_binding_id: get("context_binding_id")?,
+        tenant_id: get("tenant_id")?,
+        // 线值认不出来 ⇒ 落到一个**不会**通过 `authorize_task_item` 第 2 道门的档位，
+        // 而不是静默当成 TASK/MANDATORY。
+        scope_kind: if scope_kind == "TASK" {
+            ScopeKind::Task
+        } else {
+            ScopeKind::Tenant
+        },
+        scope_id: r
+            .try_get::<Option<Uuid>, _>("scope_id")
+            .map_err(|_| ErrorCode::Internal)?,
+        mode: if mode == "MANDATORY" {
+            BindingMode::Mandatory
+        } else {
+            BindingMode::Supplemental
+        },
+        memory_id,
+        revoked: r
+            .try_get("binding_revoked")
+            .map_err(|_| ErrorCode::Internal)?,
+    };
+
+    let grant_tenant: Option<Uuid> = r.try_get("g_tenant_id").map_err(|_| ErrorCode::Internal)?;
+    let grant = match grant_tenant {
+        None => None,
+        Some(tenant_id) => {
+            let purpose: String = r.try_get("g_purpose").map_err(|_| ErrorCode::Internal)?;
+            let issuer: String = r
+                .try_get("g_issuer_kind")
+                .map_err(|_| ErrorCode::Internal)?;
+            let policy_version: String = r
+                .try_get("g_policy_version")
+                .map_err(|_| ErrorCode::Internal)?;
+            let g_scope_kind: String =
+                r.try_get("g_scope_kind").map_err(|_| ErrorCode::Internal)?;
+            let g_mode: String = r.try_get("g_mode").map_err(|_| ErrorCode::Internal)?;
+            let payload: Vec<u8> = r
+                .try_get("g_payload_sha256")
+                .map_err(|_| ErrorCode::Internal)?;
+            Some(RawTaskGrant {
+                tenant_id,
+                context_binding_id: get("context_binding_id")?,
+                task_id: get("g_task_id")?,
+                memory_id: MemoryId(get("g_memory_id")?),
+                scope_kind_is_task: g_scope_kind == "TASK",
+                mode_is_mandatory: g_mode == "MANDATORY",
+                task_epoch: r.try_get("g_task_epoch").map_err(|_| ErrorCode::Internal)?,
+                payload_sha256: digest32(&payload)?,
+                grant_authority: r
+                    .try_get("g_grant_authority")
+                    .map_err(|_| ErrorCode::Internal)?,
+                purpose: BindingPurpose::parse_wire(&purpose),
+                issuer_kind: TaskGrantIssuer::parse_wire(&issuer),
+                policy_version_matches: policy_version == TASK_AUTHORIZATION_POLICY_VERSION,
+                authorization_evidence_present: r
+                    .try_get("g_evidence_present")
+                    .map_err(|_| ErrorCode::Internal)?,
+                issued_at_epoch_s: r
+                    .try_get("g_issued_at_s")
+                    .map_err(|_| ErrorCode::Internal)?,
+                expires_at_epoch_s: r
+                    .try_get("g_expires_at_s")
+                    .map_err(|_| ErrorCode::Internal)?,
+                revoked: r.try_get("g_revoked").map_err(|_| ErrorCode::Internal)?,
+            })
+        }
+    };
+
+    let target_tenant: Option<Uuid> = r.try_get("m_tenant_id").map_err(|_| ErrorCode::Internal)?;
+    let target = match target_tenant {
+        None => None,
+        Some(tenant_id) => {
+            let authority: String = r
+                .try_get("m_authority_class")
+                .map_err(|_| ErrorCode::Internal)?;
+            let payload: Vec<u8> = r
+                .try_get("m_payload_sha256")
+                .map_err(|_| ErrorCode::Internal)?;
+            Some(TaskTargetFacts {
+                tenant_id,
+                memory_id,
+                stored_authority: parse_authority(&authority)?,
+                max_disposition: dispositions
+                    .get(&memory_id.0)
+                    .copied()
+                    .unwrap_or(InstructionDisposition::DataOnly),
+                active: r.try_get("m_active").map_err(|_| ErrorCode::Internal)?,
+                readable: readable.contains(&memory_id.0),
+                payload_sha256: digest32(&payload)?,
+            })
+        }
+    };
+
+    Ok(TaskGrantFacts {
+        obligation,
+        grant,
+        target,
+        now_epoch_s: r.try_get("now_s").map_err(|_| ErrorCode::Internal)?,
+    })
+}
+
+/// `task_explicit_context_v2` 的逐条义务报告（提名、准入、脱敏原因），在它自己的
+/// REPEATABLE READ 事务里。装配路径与本函数共用 [`run_task_explicit_selector`]，
+/// 所以「报告说的」和「lane 做的」不会是两套逻辑。
+///
+/// # Errors
+/// 库不可达、scope 越权、任务解析不到 ⇒ [`ErrorCode::Internal`] / `Forbidden` / `NotFound`。
+pub async fn task_obligation_report(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    requested_scope: &Scope,
+) -> Result<Vec<TaskObligationReport>, ErrorCode> {
+    let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *txn)
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
+    let (authorization, scope) = canonical_scope(authorization, requested_scope)?;
+    set_authorization_local(&mut txn, &authorization).await?;
+    let run = run_task_explicit_selector(
+        &mut txn,
+        spec(SelectorId::TaskExplicitContextV1),
+        &authorization,
+        &scope,
+    )
+    .await?;
+    txn.commit().await.map_err(|_| ErrorCode::Internal)?;
+    Ok(run.reports)
+}
+
 /// DB 线值 → [`AuthorityClass`]。闭集与 `migrations/0004` 的 CHECK 对齐（§78.2）。
 fn parse_authority(wire: &str) -> Result<AuthorityClass, ErrorCode> {
     match wire {
@@ -651,7 +1042,19 @@ async fn run_selectors_in_txn(
             out.push(SelectorOutcome::Unavailable { id, missing_object });
             continue;
         }
-        out.push(run_selector(txn, spec(id), authorization, scope).await?);
+        let sp = spec(id);
+        // card 22c: the requirement decides the取数 shape, not the id — so a future selector
+        // that also admits by a verified authorization cannot forget to take this branch.
+        out.push(match sp.authority {
+            AuthorityRequirement::VerifiedCurrentTaskBinding => {
+                run_task_explicit_selector(txn, sp, authorization, scope)
+                    .await?
+                    .outcome
+            }
+            AuthorityRequirement::StoredAtLeast(_) => {
+                run_selector(txn, sp, authorization, scope).await?
+            }
+        });
     }
     out.try_into().map_err(|_| ErrorCode::Internal)
 }
@@ -1873,6 +2276,177 @@ async fn revoke_task_mandatory_binding_in_txn(
     Ok(affected == 1)
 }
 
+/// The authorization Evidence row for ONE task-instruction approval (card 22c, ADR-0046).
+///
+/// What it is: a `UserConfirmed` EVENT whose `payload_sha256` is the digest of the **complete
+/// intent** that was just confirmed — tenant, task, epoch, binding, memory, that memory's exact
+/// canonical payload digest, and the purpose. Recomputing that digest from the grant row is how
+/// an auditor checks that the approval on file is the approval that happened.
+///
+/// What it is deliberately NOT: it is **never** linked into the target memory's
+/// `private.memory_evidence`. A task-authorization receipt is not a general-purpose
+/// authority basis — linking it would let the next `AuthorityPolicy::authorize` read a
+/// `UserConfirmed` origin that nobody asserted about the *content* (ruling §五, last line:
+/// 授权材料不洗白). That is why this is a plain INSERT here and not a call into the
+/// memory-evidence writers.
+///
+/// `reasoning_domain_id` is taken from the target memory's own Evidence, in this transaction:
+/// the domain is a property of where the memory lives, and re-deriving it from anywhere else
+/// would be a second source of truth for a column this row only has to be consistent with.
+///
+/// # Errors
+/// [`ErrorCode::Forbidden`] when the memory has no readable Evidence to take the domain from
+/// (no basis ⇒ nothing to authorize), `Internal` on a DB error.
+async fn insert_task_authorization_evidence_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    memory: MemoryId,
+    intent: &str,
+) -> Result<Uuid, ErrorCode> {
+    let domain: Option<Uuid> = sqlx::query_scalar(
+        "SELECT eo.reasoning_domain_id FROM private.memory_evidence me \
+           JOIN private.evidence_objects eo \
+             ON eo.evidence_id = me.evidence_id AND eo.tenant_id = $2 \
+          WHERE me.memory_id = $1 ORDER BY eo.evidence_id LIMIT 1",
+    )
+    .bind(memory.0)
+    .bind(tenant_id)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?;
+    let domain = domain.ok_or(ErrorCode::Forbidden)?;
+
+    sqlx::query_scalar(
+        "INSERT INTO private.evidence_objects \
+           (tenant_id, evidence_kind, payload_sha256, data_class, origin_class, \
+            origin_principal_id, visibility_class, visibility_user_id, reasoning_domain_id, \
+            occurred_at) \
+         VALUES ($1, 'EVENT', sha256(convert_to($2, 'UTF8')), 'INTERNAL', 'UserConfirmed', \
+                 $3, 'USER_PRIVATE', $3, $4, clock_timestamp()) \
+         RETURNING evidence_id",
+    )
+    .bind(tenant_id)
+    .bind(intent)
+    .bind(user_id)
+    .bind(domain)
+    .fetch_one(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)
+}
+
+/// The **sole** `private.task_binding_grants` INSERT site (pinned by architecture-check A3).
+///
+/// Everything it writes is either derived in this transaction from rows it just read, or a
+/// frozen constant — nothing comes from the wire:
+///
+/// * `payload_sha256` is computed by the database from the target row itself, through the one
+///   [`CANONICAL_PAYLOAD_SHA256_EXPR`] the read side also uses. The caller cannot hand in a
+///   digest, so "approve this id, then swap the content" has no writable surface.
+/// * `task_epoch` comes from the `AuthenticatedTask` the same transaction resolved.
+/// * `grant_authority` / `purpose` / `policy_version` are the frozen constants of §25.4 v2.
+/// * `operation_id` is the request's BMO operation, UNIQUE per tenant, so a replayed operation
+///   cannot mint a second grant for the same approval.
+///
+/// The `INSERT ... SELECT` reads `private.memory_records` inside the statement: if the target
+/// disappeared between the visibility check and here, zero rows are inserted and the caller
+/// sees `Conflict` rather than a grant over nothing.
+///
+/// # Errors
+/// [`ErrorCode::Conflict`] when no row was inserted; `Internal` on a DB error.
+async fn insert_task_binding_grant_in_txn(
+    txn: &mut Txn<'_>,
+    task: &AuthenticatedTask,
+    binding_id: Uuid,
+    memory: MemoryId,
+    issued_by: Uuid,
+    authorization_evidence_id: Uuid,
+    operation_id: Uuid,
+) -> Result<(), ErrorCode> {
+    let sql = format!(
+        "INSERT INTO private.task_binding_grants \
+           (tenant_id, context_binding_id, scope_kind, task_id, memory_id, mode, task_epoch, \
+            payload_sha256, grant_authority, purpose, issuer_kind, issued_by_principal_id, \
+            authorization_evidence_id, operation_id, policy_version) \
+         SELECT $1, $2, 'TASK', $3, m.memory_id, 'MANDATORY', $4, \
+                {CANONICAL_PAYLOAD_SHA256_EXPR}, $5, $6, $7, $8, $9, $10, $11 \
+           FROM private.memory_records m \
+          WHERE m.tenant_id = $1 AND m.memory_id = $12"
+    );
+    let affected = sqlx::query(&sql)
+        .bind(task.tenant_id())
+        .bind(binding_id)
+        .bind(task.task_id())
+        .bind(task.authorization_epoch())
+        .bind(humaux_domain::context::TASK_GRANT_AUTHORITY)
+        .bind(BindingPurpose::AdoptTaskInstruction.wire())
+        .bind(TaskGrantIssuer::AuthenticatedTaskRequest.wire())
+        .bind(issued_by)
+        .bind(authorization_evidence_id)
+        .bind(operation_id)
+        .bind(TASK_AUTHORIZATION_POLICY_VERSION)
+        .bind(memory.0)
+        .execute(&mut **txn)
+        .await
+        .map_err(|_| ErrorCode::Internal)?
+        .rows_affected();
+    if affected == 1 {
+        Ok(())
+    } else {
+        Err(ErrorCode::Conflict)
+    }
+}
+
+/// Is there an ACTIVE (unrevoked) task authorization for this binding right now?
+///
+/// Read-back, used by the write path to report `task_authorized` honestly instead of echoing
+/// the request's `purpose` back at the caller.
+///
+/// # Errors
+/// `Internal` on a DB error.
+async fn active_task_grant_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    binding_id: Uuid,
+) -> Result<bool, ErrorCode> {
+    let found: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM private.task_binding_grants \
+          WHERE tenant_id = $1 AND context_binding_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(binding_id)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?;
+    Ok(found.is_some())
+}
+
+/// Revokes the grant that belongs to one binding — `memory.unbind`'s half of I-NONINHERIT.
+///
+/// Revoke-only in the same sense the DB trigger enforces: a single `SET revoked_at` on a row
+/// that is still active. Zero rows is **not** an error here (a REFERENCE_ONLY binding has no
+/// grant to revoke, and an already-revoked grant stays revoked); the binding revoke above it
+/// is what decides `Conflict`. `revoked_at` is the only column any runtime role can write.
+///
+/// # Errors
+/// `Internal` on a DB error.
+async fn revoke_task_binding_grant_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    binding_id: Uuid,
+) -> Result<(), ErrorCode> {
+    sqlx::query(
+        "UPDATE private.task_binding_grants SET revoked_at = statement_timestamp() \
+          WHERE tenant_id = $1 AND context_binding_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(binding_id)
+    .execute(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?;
+    Ok(())
+}
+
 /// [`revoke_binding_in_txn`] in its own short transaction (non-gated callers).
 ///
 /// # Errors
@@ -1913,6 +2487,14 @@ pub struct BindingWriteRequest {
     /// binding is revoked and B's binding created **in this same transaction**; a binding that
     /// is already revoked (or is not this tenant's) is `Conflict`, never a silent skip.
     pub replaces_binding_id: Option<Uuid>,
+    /// `memory.bind` only (card 22c, ADR-0046): what this binding is FOR.
+    ///
+    /// [`BindingPurpose::AdoptTaskInstruction`] is the only value that writes a
+    /// `private.task_binding_grants` row — i.e. the only value that can ever make this memory
+    /// usable at `ExplicitTaskContext` inside this task. [`BindingPurpose::ReferenceOnly`]
+    /// still creates the binding, still shows up as a nominated obligation, and still gets
+    /// rejected with `MISSING_TASK_AUTHORIZATION` at read time. `None` for the other three ops.
+    pub purpose: Option<BindingPurpose>,
     pub claim: ConfirmationClaim,
     pub finished_audit: AuditEvent,
 }
@@ -1923,6 +2505,12 @@ pub struct BindingWriteOutcome {
     pub binding_id: Uuid,
     /// pin: `false` when the row already existed (nothing inserted). unpin: always `false`.
     pub inserted: bool,
+    /// card 22c (ADR-0046): does an ACTIVE task authorization exist for this binding now?
+    ///
+    /// Read back, not inferred from the request: on the idempotent `ReturnExisting` arm nothing
+    /// was written this call, so "the caller asked for ADOPT_TASK_INSTRUCTION" says nothing
+    /// about whether a grant is actually there. Always `false` for pin / unpin / unbind.
+    pub task_authorized: bool,
 }
 
 /// Pure input contract (same shape as `memory_governance_repo::validate`): a real user, a
@@ -1982,7 +2570,13 @@ fn validate_binding_write(
             let task = request.task.ok_or(ErrorCode::InvalidInput)?;
             if request.claim.op != op
                 || request.claim.target_id != request.memory.0
-                || request.claim.successor_id != Some(task.0)
+                // card 22c / ADR-0046 D-D: the successor leg is the intent digest (task +
+                // purpose) the gateway minted with the SAME domain function — never `task.0`.
+                || request.claim.successor_id
+                    != Some(humaux_domain::context::binding_confirmation_successor(
+                        task,
+                        request.purpose,
+                    ))
             {
                 return Err(ErrorCode::Conflict);
             }
@@ -2170,6 +2764,13 @@ pub async fn unbind_confirmed(
 /// The binding step of [`write_binding_confirmed`], past the consumed token and **in the
 /// same transaction**: D-C idempotent pin through the sole INSERT site, unpin through the
 /// sole revoke site.
+// Eight arguments and one long `match`, deliberately. Every argument is a fact the caller
+// resolved INSIDE this transaction (tenant, user, the resolved task + its epoch, the existing
+// binding, the narrowed scope); bundling them into a struct would move the same eight values
+// one line up and cost the compiler's "you forgot one" check at each call site. Splitting the
+// `match` per op would scatter "what one confirmed binding write does" across four functions
+// whose only shared contract is that they run on THIS transaction.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn apply_binding_write(
     txn: &mut Txn<'_>,
     tenant_id: Uuid,
@@ -2178,6 +2779,9 @@ async fn apply_binding_write(
     request: &BindingWriteRequest,
     existing: Option<Uuid>,
     scope: &Scope,
+    // card 22c: resolved from `coord.tasks` in THIS transaction by the caller, carrying the
+    // task's current `authorization_epoch`. `None` for the PINNED pair.
+    authenticated_task: Option<AuthenticatedTask>,
 ) -> Result<BindingWriteOutcome, ErrorCode> {
     use humaux_application::pin::{PinAction, pin_action, pin_request, unpin_target};
     match op {
@@ -2185,6 +2789,7 @@ async fn apply_binding_write(
             PinAction::ReturnExisting(binding_id) => Ok(BindingWriteOutcome {
                 binding_id,
                 inserted: false,
+                task_authorized: false,
             }),
             PinAction::Insert => {
                 // D-A: the actor exists only past a consumed confirmation for this memory.
@@ -2197,6 +2802,7 @@ async fn apply_binding_write(
                 Ok(BindingWriteOutcome {
                     binding_id,
                     inserted: true,
+                    task_authorized: false,
                 })
             }
         },
@@ -2208,6 +2814,7 @@ async fn apply_binding_write(
             Ok(BindingWriteOutcome {
                 binding_id,
                 inserted: false,
+                task_authorized: false,
             })
         }
         // card 22b / §25.4.A(8): MANDATORY at a TASK scope. Same confirm gate, different
@@ -2215,6 +2822,10 @@ async fn apply_binding_write(
         // `authorize_mandatory`; the binding itself grants nothing.
         DestructiveOp::MemoryBind => {
             let task = request.task.ok_or(ErrorCode::InvalidInput)?;
+            let authenticated_task = authenticated_task.ok_or(ErrorCode::Internal)?;
+            // card 22c: `purpose` is required on bind. A missing purpose is INVALID_INPUT, not
+            // a default — defaulting it either way is a policy decision made by an omission.
+            let purpose = request.purpose.ok_or(ErrorCode::InvalidInput)?;
             // §25.4.A(9): the authorized A->B replacement revokes A in THIS transaction, before
             // B's row is created — scoped to the (TASK = this task, MANDATORY) dimension this
             // operation is authorized for, so the wire argument cannot reach a PINNED row or
@@ -2230,12 +2841,21 @@ async fn apply_binding_write(
                 if !revoke_task_mandatory_binding_in_txn(txn, tenant_id, task, replaced).await? {
                     return Err(ErrorCode::Conflict);
                 }
+                // card 22c: the replaced binding's authorization goes with it. I-NONINHERIT's
+                // "授权替换在一个事务内撤销旧绑定并建立新绑定" — the new binding gets a NEW
+                // grant below (or none), never the old one redirected.
+                revoke_task_binding_grant_in_txn(txn, tenant_id, replaced).await?;
             }
             match pin_action(existing) {
                 // Idempotent, same rule as pin (ADR-0019 D-C): already bound is not an error.
+                // card 22c: read the authorization back rather than echoing the request —
+                // an already-bound REFERENCE_ONLY row does not become authorized because the
+                // second call asked for ADOPT_TASK_INSTRUCTION, and saying otherwise would be
+                // the API reporting an authorization nobody wrote.
                 PinAction::ReturnExisting(binding_id) => Ok(BindingWriteOutcome {
                     binding_id,
                     inserted: false,
+                    task_authorized: active_task_grant_in_txn(txn, tenant_id, binding_id).await?,
                 }),
                 PinAction::Insert => {
                     // D-A: the actor exists only past a consumed confirmation for this memory.
@@ -2243,6 +2863,11 @@ async fn apply_binding_write(
                         .map_err(rejection)?;
                     let (authority, memory_type, basis) =
                         mandatory_binding_facts_in_txn(txn, tenant_id, request.memory).await?;
+                    // Read now, applied after `authorize_mandatory` (the ruling §四.4 order):
+                    // `basis` is moved into the policy call below, and re-reading it from the DB
+                    // a second time would make the two checks answerable by two different rows.
+                    let behavior_eligible =
+                        humaux_domain::context::require_behavior_eligible_target(basis.as_slice());
                     let grant = authorize_mandatory(
                         &humaux_domain::policy::OriginBoundAuthorityPolicy,
                         &actor,
@@ -2258,10 +2883,68 @@ async fn apply_binding_write(
                         scope,
                     )
                     .map_err(rejection)?;
+                    // 裁决 §四.4 write order: `authorize_mandatory -> require_behavior_eligible_target
+                    // -> insert_binding_and_task_grant`. Only the ADOPT_TASK_INSTRUCTION branch
+                    // mints an authorization, so only it carries the §10.1 row 4/5 obligation:
+                    // a REFERENCE_ONLY binding asserts nothing about behaviour eligibility and
+                    // the read side rejects a DATA_ONLY target either way.
+                    if matches!(purpose, BindingPurpose::AdoptTaskInstruction) {
+                        behavior_eligible
+                            .map_err(humaux_domain::context::TaskContextReject::error_code)?;
+                    }
                     let binding_id = insert_binding_in_txn(txn, user_id, &grant, tenant_id).await?;
+                    // card 22c / ADR-0046: binding and authorization are written in ONE
+                    // transaction, and ONLY for ADOPT_TASK_INSTRUCTION. REFERENCE_ONLY stops
+                    // here with a binding and no grant — that pair IS the negative control.
+                    if matches!(purpose, BindingPurpose::AdoptTaskInstruction) {
+                        // The complete intent, digested into the authorization Evidence. It
+                        // names the exact content through the same expression the grant and the
+                        // read side use, so the receipt cannot describe a different approval
+                        // than the one the grant row records.
+                        let payload_hex: String = sqlx::query_scalar(&format!(
+                            "SELECT encode({CANONICAL_PAYLOAD_SHA256_EXPR}, 'hex')                                FROM private.memory_records m                               WHERE m.tenant_id = $1 AND m.memory_id = $2"
+                        ))
+                        .bind(tenant_id)
+                        .bind(request.memory.0)
+                        .fetch_optional(&mut **txn)
+                        .await
+                        .map_err(|_| ErrorCode::Internal)?
+                        .ok_or(ErrorCode::Conflict)?;
+                        let intent = format!(
+                            "{}|{}|{}|{}|{}|{}|{}|{}",
+                            TASK_AUTHORIZATION_POLICY_VERSION,
+                            tenant_id,
+                            authenticated_task.task_id(),
+                            authenticated_task.authorization_epoch(),
+                            binding_id,
+                            request.memory.0,
+                            payload_hex,
+                            BindingPurpose::AdoptTaskInstruction.wire(),
+                        );
+                        let evidence_id = insert_task_authorization_evidence_in_txn(
+                            txn,
+                            tenant_id,
+                            user_id,
+                            request.memory,
+                            &intent,
+                        )
+                        .await?;
+                        insert_task_binding_grant_in_txn(
+                            txn,
+                            &authenticated_task,
+                            binding_id,
+                            request.memory,
+                            user_id,
+                            evidence_id,
+                            request.request_id,
+                        )
+                        .await?;
+                    }
                     Ok(BindingWriteOutcome {
                         binding_id,
                         inserted: true,
+                        task_authorized: active_task_grant_in_txn(txn, tenant_id, binding_id)
+                            .await?,
                     })
                 }
             }
@@ -2271,9 +2954,14 @@ async fn apply_binding_write(
             if !revoke_binding_in_txn(txn, tenant_id, binding_id).await? {
                 return Err(ErrorCode::Conflict);
             }
+            // card 22c: unbind revokes the authorization too, in the same transaction. Leaving
+            // a live grant behind a revoked binding would keep an authorization alive with no
+            // obligation to observe it — the exact shape I-NONINHERIT's revocation arm forbids.
+            revoke_task_binding_grant_in_txn(txn, tenant_id, binding_id).await?;
             Ok(BindingWriteOutcome {
                 binding_id,
                 inserted: false,
+                task_authorized: false,
             })
         }
         DestructiveOp::MemorySupersede
@@ -2341,12 +3029,15 @@ async fn write_binding_confirmed(
     {
         return Err(ErrorCode::NotFound);
     }
+    let mut authenticated_task = None;
     let existing = match op {
         DestructiveOp::MemoryBind | DestructiveOp::MemoryUnbind => {
             let task = request.task.ok_or(ErrorCode::InvalidInput)?;
             // §25.4.A(7): the TaskId must resolve to a task of this tenant before a binding is
             // written under it — a wire uuid naming nothing is `NotFound`, not a new task scope.
-            resolve_task_in_txn(&mut txn, tenant_id, task).await?;
+            // card 22c: the same resolution also produces the task's current authorization
+            // epoch, which is what the grant is stamped with.
+            authenticated_task = Some(resolve_task_in_txn(&mut txn, tenant_id, task).await?);
             active_task_mandatory_binding_in_txn(&mut txn, tenant_id, task, request.memory).await?
         }
         _ => {
@@ -2363,8 +3054,17 @@ async fn write_binding_confirmed(
         run_id: None,
         agent_id: None,
     };
-    let outcome =
-        apply_binding_write(&mut txn, tenant_id, user_id, op, &request, existing, &scope).await?;
+    let outcome = apply_binding_write(
+        &mut txn,
+        tenant_id,
+        user_id,
+        op,
+        &request,
+        existing,
+        &scope,
+        authenticated_task,
+    )
+    .await?;
 
     if quota_repo::finish_reservation_in_txn(&mut txn, auth, &reservation, true).await?
         != ReservationStatus::Consumed

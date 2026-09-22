@@ -26,7 +26,7 @@ use crate::authority::{
 };
 use crate::confirm::DestructiveOp;
 use crate::error::ErrorCode;
-use crate::evidence::EvidenceOriginClass;
+use crate::evidence::{EvidenceOriginClass, InstructionDisposition};
 use crate::grounding::{GroundingState, GroundingStateKind, RowGrounding};
 use crate::ids::Scope;
 use crate::memory::MemoryType;
@@ -104,11 +104,28 @@ pub enum FreshnessRule {
 pub struct SelectorSpec {
     /// 身份。
     pub id: SelectorId,
+    /// §25.4 登记名——**版本在名字里**。裁决 §三：「同名 selector 不得偷换准入对象」，所以
+    /// 把 `task_explicit_context_v1` 的准入对象从「行上的 authority_class」换成「验过的任务
+    /// 授权」不能沿用旧名字，它登记为 `task_explicit_context_v2`，v1 的记录留在
+    /// [`RETIRED_SELECTORS`] 里供审计（[`SelectorId`] 的变体名是**槽位**标识，不是登记名——
+    /// 它被 handoff / envelope / 测试按变体名引用，改它只会制造一次无信息量的大改）。
+    pub registered_name: &'static str,
     /// scope 继承链，由窄到宽。
     pub scope_inheritance: &'static [ScopeKind],
     /// 所选 memory 的 evidence 必须至少命中其一的 origin（空 = 不约束 origin）。
     pub required_origin: &'static [EvidenceOriginClass],
-    /// 所选 memory 的 authority 下限。
+    /// §25.4 v2（card 22c, ADR-0046）：这个 selector 对候选**权威**的真实要求。
+    ///
+    /// 四个 selector 是 [`AuthorityRequirement::StoredAtLeast`]——存储行自己的
+    /// `authority_class` 就是判据。`task_explicit_context_v1` 是
+    /// [`AuthorityRequirement::VerifiedCurrentTaskBinding`]：判据不在行上，而在
+    /// [`authorize_task_item`] 验过的一条任务授权上（I-TASK）。这两件事**不是同一种门**，
+    /// 所以它们不能共用一个 `AuthorityClass` 下限字段假装是同一种门。
+    pub authority: AuthorityRequirement,
+    /// 所选 memory 的**存储** authority 下限。
+    ///
+    /// 恒等于 `authority.stored_floor()`——它是派生值，留成字段只因为调用方按字段读它。
+    /// 漂移由 `registry_min_authority_is_derived_from_requirement` 当场判红，不靠人守。
     pub min_authority: AuthorityClass,
     /// freshness 规则。
     pub freshness: FreshnessRule,
@@ -135,13 +152,15 @@ pub struct SelectorSpec {
 pub const REGISTRY: [SelectorSpec; 5] = [
     SelectorSpec {
         id: SelectorId::TaskExplicitContextV1,
+        registered_name: "task_explicit_context_v2",
         scope_inheritance: &[ScopeKind::Task],
         required_origin: &[],
-        min_authority: AuthorityClass::ExplicitTaskContext,
+        authority: AuthorityRequirement::VerifiedCurrentTaskBinding,
+        min_authority: AuthorityClass::PrivateKnowledge,
         freshness: FreshnessRule::ActiveOnly,
         owner: "domain::context",
-        positive_fixture: "task_explicit_context_positive",
-        negative_fixture: "task_explicit_context_negative",
+        positive_fixture: "task_explicit_context_v2_positive",
+        negative_fixture: "task_explicit_context_v2_negative",
         // §25.4.A(7)/(11)（card 22b, ADR-0045）：task 关联**唯一**来自有效的 ContextBinding
         // （`scope_kind='TASK'` / `mode='MANDATORY'` / `revoked_at IS NULL`），不来自
         // `memory_records.task_id`——那一列不存在，也**不会**被加上：provenance（这条输入是在
@@ -152,12 +171,21 @@ pub const REGISTRY: [SelectorSpec; 5] = [
             ("private", "context_bindings", "scope_id", false),
             ("private", "context_bindings", "mode", false),
             ("private", "context_bindings", "revoked_at", false),
+            // card 22c / ADR-0046：v2 的准入对象是**授权行**，所以探测必须落在授权表上。
+            // 探不到 `private.task_binding_grants` 时这个 selector 是 Unavailable —— 不是
+            // 「跑了但零行」：后者会把「授权机制根本没交付」伪装成「今天没有需要带的东西」。
+            ("private", "task_binding_grants", "task_epoch", false),
+            ("private", "task_binding_grants", "payload_sha256", false),
+            ("private", "task_binding_grants", "purpose", false),
+            ("private", "task_binding_grants", "revoked_at", false),
         ],
     },
     SelectorSpec {
         id: SelectorId::ProjectActiveConstraintsV1,
+        registered_name: "project_active_constraints_v1",
         scope_inheritance: &[ScopeKind::Workspace, ScopeKind::Tenant],
         required_origin: &[],
+        authority: AuthorityRequirement::StoredAtLeast(AuthorityClass::ProjectConstraint),
         min_authority: AuthorityClass::ProjectConstraint,
         freshness: FreshnessRule::ActiveOnly,
         owner: "domain::context",
@@ -170,10 +198,12 @@ pub const REGISTRY: [SelectorSpec; 5] = [
     },
     SelectorSpec {
         id: SelectorId::UserConfirmedCorrectionsV1,
+        registered_name: "user_confirmed_corrections_v1",
         scope_inheritance: &[ScopeKind::User, ScopeKind::Tenant],
         // §25.4「active UserCorrection relevant to scope 不允许用 embedding similarity
         // 解释」——机械替代品就是这一条 origin 约束。
         required_origin: &[EvidenceOriginClass::UserConfirmed],
+        authority: AuthorityRequirement::StoredAtLeast(AuthorityClass::UserCorrection),
         min_authority: AuthorityClass::UserCorrection,
         freshness: FreshnessRule::ActiveOnly,
         owner: "domain::context",
@@ -183,8 +213,10 @@ pub const REGISTRY: [SelectorSpec; 5] = [
     },
     SelectorSpec {
         id: SelectorId::RequiredCurrentStateFacetsV1,
+        registered_name: "required_current_state_facets_v1",
         scope_inheritance: &[ScopeKind::Workspace, ScopeKind::Tenant],
         required_origin: &[],
+        authority: AuthorityRequirement::StoredAtLeast(AuthorityClass::PrivateKnowledge),
         min_authority: AuthorityClass::PrivateKnowledge,
         freshness: FreshnessRule::ActiveOnly,
         owner: "domain::context",
@@ -198,6 +230,7 @@ pub const REGISTRY: [SelectorSpec; 5] = [
     },
     SelectorSpec {
         id: SelectorId::ExplicitMandatoryBindingsV1,
+        registered_name: "explicit_mandatory_bindings_v1",
         scope_inheritance: &[
             ScopeKind::Agent,
             ScopeKind::Run,
@@ -208,6 +241,7 @@ pub const REGISTRY: [SelectorSpec; 5] = [
             ScopeKind::Tenant,
         ],
         required_origin: &[],
+        authority: AuthorityRequirement::StoredAtLeast(AuthorityClass::ProjectConstraint),
         min_authority: AuthorityClass::ProjectConstraint,
         freshness: FreshnessRule::ActiveOnly,
         owner: "domain::context",
@@ -298,6 +332,12 @@ pub struct MandatoryRow {
     memory_id: MemoryId,
     selector: SelectorId,
     authority: AuthorityClass,
+    /// card 22c / ADR-0046：这条记忆**存储**的权威。
+    ///
+    /// 四个 `StoredAtLeast` selector 上它恒等于 `authority`；`task_explicit_context_v2` 上
+    /// `authority` 是被授权的使用权威（6），`source_authority` 是原样的存储权威（≤ 5）。
+    /// 两个字段并存是 I-STORE 的可观察面——只留一个就等于把「谁批准的」洗成内容属性。
+    source_authority: AuthorityClass,
     est_tokens: u32,
     grounding_state: Option<GroundingState>,
 }
@@ -347,6 +387,15 @@ impl MandatoryRow {
         est_tokens: u32,
         grounding: RowGrounding,
     ) -> Result<Admitted, ErrorCode> {
+        // card 22c: 这条入口只服务 `StoredAtLeast`。`VerifiedCurrentTaskBinding` 的准入对象
+        // 不是行上的 authority，走 [`Self::from_task_grant`]——否则「按存储权威准入」会从这里
+        // 重新长出来，而那正是 v1 的病。
+        if matches!(
+            spec.authority,
+            AuthorityRequirement::VerifiedCurrentTaskBinding
+        ) {
+            return Err(ErrorCode::InvalidInput);
+        }
         if (authority as u8) < (spec.min_authority as u8) {
             return Err(ErrorCode::InvalidInput);
         }
@@ -367,6 +416,51 @@ impl MandatoryRow {
             memory_id,
             selector: spec.id,
             authority,
+            source_authority: authority,
+            est_tokens,
+            grounding_state,
+        }))
+    }
+
+    /// card 22c / ADR-0046：[`AuthorityRequirement::VerifiedCurrentTaskBinding`] 的唯一铸造点。
+    ///
+    /// 它要一个 [`AuthorizedTaskItem`]——而那个类型只能由 [`authorize_task_item`] 造出来。
+    /// 所以「没有验过授权就把一行塞进 task lane」不是一条要靠评审拦住的路径，是一个**造不出
+    /// 参数**的调用。grounding 分流门与 [`Self::from_selector`] 逐字相同（DOD-093 不因为有
+    /// 授权就放松：批准的是「可以当指令用」，不是「不必再判它是否仍然成立」）。
+    ///
+    /// # Errors
+    /// `spec` 不是 `VerifiedCurrentTaskBinding` 时返回 [`ErrorCode::InvalidInput`]。
+    pub fn from_task_grant(
+        spec: &'static SelectorSpec,
+        item: AuthorizedTaskItem,
+        est_tokens: u32,
+        grounding: RowGrounding,
+    ) -> Result<Admitted, ErrorCode> {
+        if !matches!(
+            spec.authority,
+            AuthorityRequirement::VerifiedCurrentTaskBinding
+        ) {
+            return Err(ErrorCode::InvalidInput);
+        }
+        let grounding_state = match grounding {
+            RowGrounding::Judged(state) => {
+                if state.revokes_current_truth_assumption() {
+                    return Ok(Admitted::NeedsVerification(NeedsVerification {
+                        memory_id: item.memory_id(),
+                        selector: spec.id,
+                        state: state.kind(),
+                    }));
+                }
+                Some(state)
+            }
+            RowGrounding::NotJudged => None,
+        };
+        Ok(Admitted::Row(Self {
+            memory_id: item.memory_id(),
+            selector: spec.id,
+            authority: item.effective_context_authority(),
+            source_authority: item.source_authority(),
             est_tokens,
             grounding_state,
         }))
@@ -396,10 +490,16 @@ impl MandatoryRow {
         self.selector
     }
 
-    /// 该行的 authority。
+    /// 该行本次**使用**的 authority（task lane 上就是被授权的 `ExplicitTaskContext`）。
     #[must_use]
     pub const fn authority(&self) -> AuthorityClass {
         self.authority
+    }
+
+    /// 该行**存储**的 authority（I-STORE：≤ 5，授权不改它）。
+    #[must_use]
+    pub const fn source_authority(&self) -> AuthorityClass {
+        self.source_authority
     }
 
     /// 估计占用的 token 数（§25.5 预算依据）。
@@ -1098,7 +1198,22 @@ pub fn authorize_mandatory(
         return Err(CandidateRejection::MissingConfirmation);
     }
     let authorized = policy.authorize(memory_authority, memory_type, basis, scope)?;
-    if (authorized.0 as u8) < (AuthorityClass::ProjectConstraint as u8) {
+    // card 22c / ADR-0046 D-J: the extra floor here used to be `ProjectConstraint` — card 22b's
+    // stand-in for "this memory deserves to be in Mandatory", written when a TASK/MANDATORY
+    // binding was **itself** the admission. It no longer is: v2 admits on a verified task
+    // authorization, and the ruling (§二.4) rejects a 5-floor by name because it excludes the
+    // legitimate `UserConfirmed(4)` target the positive control uses. The floor is therefore the
+    // v2 stored floor — `PrivateKnowledge`, i.e. "not public-pool content".
+    //
+    // What did NOT move, and is why this is not a hole: `explicit_mandatory_bindings_v1`'s own
+    // SQL still admits only `ProjectConstraint`, so a lower-authority TASK binding cannot enter
+    // Mandatory through that selector; and `task_explicit_context_v2` admits it only with a
+    // grant (confirm-token-gated, epoch-bound, content-hash-bound, revocable). The §25.4 attack
+    // path — one induced write pinning low-origin content into Context forever — is closed by
+    // the authorization, not by a number.
+    if (authorized.0 as u8)
+        < (AuthorityRequirement::VerifiedCurrentTaskBinding.stored_floor() as u8)
+    {
         return Err(CandidateRejection::OriginAuthorityCeiling);
     }
     Ok(BindingGrant {
@@ -1107,6 +1222,37 @@ pub fn authorize_mandatory(
         scope_id: req.scope_id,
         memory_id: req.memory_id,
     })
+}
+
+/// 裁决 §四.4 写路径的 `require_behavior_eligible_target`：**铸任务授权之前**，目标的
+/// origin basis 必须允许行为资格（§10.1 row 4/5）。
+///
+/// 读法与 `AuthorityPolicy::authorize` 的 ceiling 一致：basis 里**有任一** origin 允许
+/// `BehaviorEligible` 才算允许；origin → disposition 的表只有
+/// [`EvidenceOriginClass::max_disposition`] 一处。
+///
+/// 为什么写路径要再查一次，而不是只靠 [`authorize_task_item`] 的读侧同款检查：读侧拒绝只让
+/// 这条义务进不了 admitted，**事务照样提交**一行 `purpose = ADOPT_TASK_INSTRUCTION` 的
+/// `task_binding_grants` 和一条 `UserConfirmed` 授权 Evidence——即一份持久的、断言「用户批准
+/// 把这段内容当指令」的记录，而 §10.1 row 4/5 说这段内容永远不能是指令。授权不得被铸造出来，
+/// 不是「铸出来以后读不到」。
+///
+/// # Errors
+/// basis 里没有任何 `BehaviorEligible` origin ⇒ [`TaskContextReject::UntrustedInstruction`]，
+/// 与读侧同一个原因码（同一条 §10.1 判据，不新开错误面）。
+pub fn require_behavior_eligible_target(
+    basis: &[EvidenceOriginClass],
+) -> Result<(), TaskContextReject> {
+    if basis.iter().any(|origin| {
+        matches!(
+            origin.max_disposition(),
+            InstructionDisposition::BehaviorEligible
+        )
+    }) {
+        Ok(())
+    } else {
+        Err(TaskContextReject::UntrustedInstruction)
+    }
 }
 
 /// PINNED binding 的唯一入口（唯一调用点由 architecture-check A3 钉在 `context_repo`）。
@@ -1133,6 +1279,531 @@ pub fn authorize_pinned(
     })
 }
 
+// =============================================================================
+// §25.4 v2 / §10.1 任务授权（card 22c, ADR-0046）
+// =============================================================================
+
+/// 一个 selector 对候选**权威**的要求。两条臂是**两种不同的门**，不是同一条数轴上的两个点。
+///
+/// - [`Self::StoredAtLeast`]：判据在行上——`memory_records.authority_class` 自己。
+/// - [`Self::VerifiedCurrentTaskBinding`]：判据**不在行上**。存储权威永远 ≤ 5（I-STORE），
+///   6 是「当前任务上下文实例」的**使用**权威，由 [`authorize_task_item`] 验过的一条
+///   任务绑定授权证明（I-TASK）。把它写成 `StoredAtLeast(ExplicitTaskContext)` 就是
+///   card 22b 留下的那个空集：∀m 存储权威 ≤ ceiling(origin) ≤ 5 < 6 ⇒ admitted 恒空。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityRequirement {
+    /// 行自己的存储权威必须达到这个下限。
+    StoredAtLeast(AuthorityClass),
+    /// 必须有一条经过验证的、指向当前任务的绑定授权。
+    VerifiedCurrentTaskBinding,
+}
+
+impl AuthorityRequirement {
+    /// 这条要求隐含的**存储**权威下限。
+    ///
+    /// `VerifiedCurrentTaskBinding` 的下限是 [`AuthorityClass::PrivateKnowledge`]：授权证明的是
+    /// 「当前任务批准把它当指令用」，不是「这条内容本身很可信」，所以它**不**追加一个高存储
+    /// 门槛（裁决 §二.4 明说 C 方案不成立：5 的门槛会把合法的 UserConfirmed(4) 目标排除掉）。
+    /// 它排除的只有 `PublicKnowledge`——公共池内容不是本租户的任务指令来源。
+    #[must_use]
+    pub const fn stored_floor(self) -> AuthorityClass {
+        match self {
+            Self::StoredAtLeast(class) => class,
+            Self::VerifiedCurrentTaskBinding => AuthorityClass::PrivateKnowledge,
+        }
+    }
+}
+
+/// 一条被 v2 取代的 selector 登记记录（裁决 §三：v1 的解释与审计记录必须保留）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredSelector {
+    /// 登记名。
+    pub registered_name: &'static str,
+    /// 取代它的登记名。
+    pub superseded_by: &'static str,
+    /// 为什么退役。
+    pub reason: &'static str,
+}
+
+/// 退役但保留的 selector 登记记录。
+pub const RETIRED_SELECTORS: [RetiredSelector; 1] = [RetiredSelector {
+    registered_name: "task_explicit_context_v1",
+    superseded_by: "task_explicit_context_v2",
+    reason: "card 22b 冻结的准入对象是 memory_records.authority_class >= ExplicitTaskContext。\
+             §10.1 的 origin ceiling 表让任何 origin 都到不了 6，于是它的 admitted 集**结构性**\
+             恒空（ADR-0045 Open debt）。card 22c 的裁决把 6 从内容属性改为受验证的当前任务\
+             授权，准入对象因此变了——裁决 §三 禁止同名 selector 偷换准入对象，所以 v1 退役、\
+             v2 登记，v1 的记录留在这里供审计。",
+}];
+
+/// `memory.bind` 的用途（裁决 §二.2）。**只有** [`Self::AdoptTaskInstruction`] 会产生授权。
+///
+/// 这不是一个可选的注释字段：`REFERENCE_ONLY` 的绑定照样是一条 MANDATORY 义务、照样被提名、
+/// 照样在诊断里出现，它只是拿不到 6。「绑定 = 授权」正是裁决点名要拆开的那一条。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingPurpose {
+    /// 带上它当参考数据，不当指令。
+    ReferenceOnly,
+    /// 当前任务批准把它当任务指令采纳——唯一能铸出 [`VerifiedTaskGrant`] 的用途。
+    AdoptTaskInstruction,
+}
+
+impl BindingPurpose {
+    /// 线值（`memory.schema.json` 与 `private.task_binding_grants.purpose` 的闭集）。
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::ReferenceOnly => "REFERENCE_ONLY",
+            Self::AdoptTaskInstruction => "ADOPT_TASK_INSTRUCTION",
+        }
+    }
+
+    /// 线值 → 枚举。未知线值是 `None`，**不是**默认值：一个认不出来的 purpose 不能悄悄
+    /// 退化成 `ReferenceOnly`（那会把一次写坏的升级读成一次温和的降级）。
+    #[must_use]
+    pub fn parse_wire(wire: &str) -> Option<Self> {
+        match wire {
+            "REFERENCE_ONLY" => Some(Self::ReferenceOnly),
+            "ADOPT_TASK_INSTRUCTION" => Some(Self::AdoptTaskInstruction),
+            _ => None,
+        }
+    }
+}
+
+/// 谁签发了这条授权（裁决 §二.3：「经过 gateway」不等于「来自有权任务请求」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskGrantIssuer {
+    /// 当前经过认证的任务请求（交互确认凭据已被消费）。
+    AuthenticatedTaskRequest,
+    /// 具体适用的租户策略。
+    TenantPolicy,
+}
+
+impl TaskGrantIssuer {
+    /// 线值（`private.task_binding_grants.issuer_kind` 的闭集）。
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::AuthenticatedTaskRequest => "AUTHENTICATED_TASK_REQUEST",
+            Self::TenantPolicy => "TENANT_POLICY",
+        }
+    }
+
+    /// 线值 → 枚举；未知线值 `None`（同 [`BindingPurpose::parse_wire`] 的理由）。
+    #[must_use]
+    pub fn parse_wire(wire: &str) -> Option<Self> {
+        match wire {
+            "AUTHENTICATED_TASK_REQUEST" => Some(Self::AuthenticatedTaskRequest),
+            "TENANT_POLICY" => Some(Self::TenantPolicy),
+            _ => None,
+        }
+    }
+}
+
+/// 本卡冻结的任务授权契约版本，写进每一条 grant 的 `policy_version`。
+pub const TASK_AUTHORIZATION_POLICY_VERSION: &str = "task_explicit_context_v2";
+
+/// grant 行上那个不许变的数：6。写成常量而不是字面量，是为了让「6 只有一个来源」成立。
+pub const TASK_GRANT_AUTHORITY: i16 = AuthorityClass::ExplicitTaskContext as i16;
+
+/// §33.10 rule 9 / ADR-0046 D-D: the successor leg of a `memory.bind` / `memory.unbind`
+/// confirm claim is the intent digest (task + purpose), not the bare task id.
+/// `control.confirm_tokens` binds (tenant, user, operation, target, successor) and has no room
+/// for a third argument, and a parameter the token does not cover must not carry permission;
+/// `purpose` decides whether the call writes an authorization at all, so it rides here. The
+/// gateway mints with this function and the adapter's confirm check compares with it — one
+/// construction, so the two sides cannot drift (card 22c's first cut-off run left them apart
+/// and every confirmed bind answered CONFLICT).
+///
+/// Domain-separated SHA-256 truncated to 16 bytes: a lookup key inside one tenant's
+/// confirm-token table, not a security boundary on its own (the row also pins tenant, user,
+/// operation and target).
+#[must_use]
+pub fn binding_confirmation_successor(
+    task: crate::ids::TaskId,
+    purpose: Option<BindingPurpose>,
+) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"humaux.memory.binding.intent.v2\0");
+    hasher.update(task.0.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(purpose.map_or("", BindingPurpose::wire).as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+/// 本次请求中**已认证解析**的任务，连同它当下的授权 epoch。
+///
+/// 字段私有、无 `Default`、无字面量构造：唯一铸造点是 [`Self::from_resolved_task`]，而
+/// `adapters::context_repo` 的唯一调用点是在同一事务里从 `coord.tasks` 解析成功之后。
+/// wire 上的一个 uuid 不是任务。
+#[derive(Debug, Clone, Copy)]
+pub struct AuthenticatedTask {
+    tenant_id: Uuid,
+    task_id: Uuid,
+    authorization_epoch: i64,
+    _priv: (),
+}
+
+impl AuthenticatedTask {
+    /// 唯一铸造点——调用方必须刚刚在同一事务里解析到这一行。
+    #[must_use]
+    pub const fn from_resolved_task(
+        tenant_id: Uuid,
+        task_id: Uuid,
+        authorization_epoch: i64,
+    ) -> Self {
+        Self {
+            tenant_id,
+            task_id,
+            authorization_epoch,
+            _priv: (),
+        }
+    }
+
+    /// 租户。
+    #[must_use]
+    pub const fn tenant_id(&self) -> Uuid {
+        self.tenant_id
+    }
+
+    /// 任务。
+    #[must_use]
+    pub const fn task_id(&self) -> Uuid {
+        self.task_id
+    }
+
+    /// 当下的授权 epoch。
+    #[must_use]
+    pub const fn authorization_epoch(&self) -> i64 {
+        self.authorization_epoch
+    }
+}
+
+/// 一条**提名**（绑定义务）的事实，从 `private.context_bindings` 逐字读出。
+///
+/// 提名集按绑定本身枚举，不按目标是否可用枚举（裁决 §六）：目标不可读、没有授权、grounding
+/// 未决都**不**能让这条义务从清单里消失。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskBindingObligation {
+    /// 绑定行。
+    pub context_binding_id: Uuid,
+    /// 租户。
+    pub tenant_id: Uuid,
+    /// `scope_kind`。
+    pub scope_kind: ScopeKind,
+    /// `scope_id`——TASK 档就是任务 id。
+    pub scope_id: Option<Uuid>,
+    /// 档位。
+    pub mode: BindingMode,
+    /// 绑定的目标。
+    pub memory_id: MemoryId,
+    /// 已撤销？
+    pub revoked: bool,
+}
+
+/// 一条 grant 行的原始字段，逐字从 `private.task_binding_grants` 读出。**未经验证**——
+/// 它只是「库里长这样」，[`authorize_task_item`] 之前它什么都不证明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawTaskGrant {
+    /// 租户。
+    pub tenant_id: Uuid,
+    /// 绑定。
+    pub context_binding_id: Uuid,
+    /// 任务。
+    pub task_id: Uuid,
+    /// 目标 memory。
+    pub memory_id: MemoryId,
+    /// `scope_kind` 是 `TASK`？
+    pub scope_kind_is_task: bool,
+    /// `mode` 是 `MANDATORY`？
+    pub mode_is_mandatory: bool,
+    /// 签发时任务的授权 epoch。
+    pub task_epoch: i64,
+    /// 被批准的**那一份**内容的规范化摘要。
+    pub payload_sha256: [u8; 32],
+    /// 行上写的授权等级（必须是 [`TASK_GRANT_AUTHORITY`]）。
+    pub grant_authority: i16,
+    /// 用途；线值认不出来时 `None`。
+    pub purpose: Option<BindingPurpose>,
+    /// 签发者类别；线值认不出来时 `None`。
+    pub issuer_kind: Option<TaskGrantIssuer>,
+    /// `policy_version` 与本卡冻结的版本一致？
+    pub policy_version_matches: bool,
+    /// 授权证据行真的存在（FK 只保证引用完整，不保证这一次读得到）。
+    pub authorization_evidence_present: bool,
+    /// 签发时刻（epoch 秒）。
+    pub issued_at_epoch_s: i64,
+    /// 过期时刻（epoch 秒）；`None` = 不按墙钟过期，由任务 epoch 与撤销决定寿命。
+    pub expires_at_epoch_s: Option<i64>,
+    /// 已撤销？
+    pub revoked: bool,
+}
+
+/// 目标 memory 在本快照里的事实。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskTargetFacts {
+    /// 租户。
+    pub tenant_id: Uuid,
+    /// memory。
+    pub memory_id: MemoryId,
+    /// 存储权威（I-STORE：这个值**不会**因为有授权而改变）。
+    pub stored_authority: AuthorityClass,
+    /// 它的 evidence origin basis 允许的最高 disposition（§10.1 row 4/5 的 DATA_ONLY 半边）。
+    pub max_disposition: InstructionDisposition,
+    /// active 且未被 supersede、未归档。
+    pub active: bool,
+    /// 本次请求可读（`can_read`，含 backing evidence 的失败关闭）。
+    pub readable: bool,
+    /// **当下**内容的规范化摘要。
+    pub payload_sha256: [u8; 32],
+}
+
+/// [`authorize_task_item`] 的全部输入：一条义务，加上围着它的三组事实。
+#[derive(Debug, Clone, Copy)]
+pub struct TaskGrantFacts {
+    /// 这条义务。
+    pub obligation: TaskBindingObligation,
+    /// 对应的 grant 行；`None` = 根本没有（LEFT JOIN 的真实结果，不是被过滤掉的）。
+    pub grant: Option<RawTaskGrant>,
+    /// 目标行；`None` = 读不到这一行。
+    pub target: Option<TaskTargetFacts>,
+    /// 判定时刻（epoch 秒），由 adapters 用库时钟取。
+    pub now_epoch_s: i64,
+}
+
+/// 准入失败的**内部**诊断原因集（裁决 §四）。对外经 [`Self::error_code`] 落到既有信封上，
+/// 在诊断块里以 [`Self::wire`] 的脱敏字符串出现——它描述的是**义务的状态**，不泄露内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskContextReject {
+    /// 这条义务不属于本次已认证的当前任务。
+    TaskNotCurrent,
+    /// 绑定本身的 tenant/scope/mode/撤销状态不对。
+    BindingScopeMismatch,
+    /// 没有授权行。**最常见的一条**，也是「绑定 ≠ 授权」的落点。
+    MissingTaskAuthorization,
+    /// 有授权行，但它指向的 (tenant, task, binding, memory) 不是这一条。
+    GrantTargetMismatch,
+    /// 授权行存在且对得上，但它此刻无效：等级/用途/签发者/policy 版本/epoch/撤销/未生效/已过期。
+    TaskAuthorizationInactive,
+    /// 目标行读不到（不存在，或 RLS 挡住）。
+    TargetMissing,
+    /// 目标行存在但本次请求无权读。
+    TargetNotReadable,
+    /// 目标的 origin 决定它只能当数据用（§10.1 row 4/5）——授权**不能**把 DATA_ONLY 改成指令。
+    UntrustedInstruction,
+    /// 目标不是 active / 已被 supersede / 已归档，或存储权威低于 selector 的存储下限。
+    TargetNotActiveOrGrounded,
+    /// 被批准的那一份内容与当下的内容不是同一份。
+    TargetRevisionChanged,
+}
+
+impl TaskContextReject {
+    /// 诊断块里的脱敏原因串。
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::TaskNotCurrent => "TASK_NOT_CURRENT",
+            Self::BindingScopeMismatch => "BINDING_SCOPE_MISMATCH",
+            Self::MissingTaskAuthorization => "MISSING_TASK_AUTHORIZATION",
+            Self::GrantTargetMismatch => "GRANT_TARGET_MISMATCH",
+            Self::TaskAuthorizationInactive => "TASK_AUTHORIZATION_INACTIVE",
+            Self::TargetMissing => "TARGET_MISSING",
+            Self::TargetNotReadable => "TARGET_NOT_READABLE",
+            Self::UntrustedInstruction => "UNTRUSTED_INSTRUCTION",
+            Self::TargetNotActiveOrGrounded => "TARGET_NOT_ACTIVE_OR_GROUNDED",
+            Self::TargetRevisionChanged => "TARGET_REVISION_CHANGED",
+        }
+    }
+
+    /// 落到既有 [`ErrorCode`] 闭集上（不新增错误码，裁决 §四「接入现有 envelope」）。
+    ///
+    /// 全部是 [`ErrorCode::Forbidden`] 只有一个例外：目标行根本读不到是 `NotFound`——
+    /// 「没有授权」和「没有这条记忆」是两件事，合并成一个码会让调试从这里开始往错的方向走。
+    #[must_use]
+    pub const fn error_code(self) -> ErrorCode {
+        match self {
+            Self::TargetMissing => ErrorCode::NotFound,
+            _ => ErrorCode::Forbidden,
+        }
+    }
+}
+
+/// 一条**验过的**任务授权。字段私有、无 `Default`、无 `Deserialize`、无字面量构造：
+/// 唯一铸造点是 [`authorize_task_item`]。拿到它就等于「I-TASK 的全部条件刚刚被逐条检查过」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedTaskGrant {
+    grant: RawTaskGrant,
+    _priv: (),
+}
+
+impl VerifiedTaskGrant {
+    /// 这条授权所属的绑定。
+    #[must_use]
+    pub const fn context_binding_id(&self) -> Uuid {
+        self.grant.context_binding_id
+    }
+
+    /// 这条授权所属的任务。
+    #[must_use]
+    pub const fn task_id(&self) -> Uuid {
+        self.grant.task_id
+    }
+
+    /// 签发时的任务 epoch。
+    #[must_use]
+    pub const fn task_epoch(&self) -> i64 {
+        self.grant.task_epoch
+    }
+
+    /// 被批准的那一份内容的摘要。
+    #[must_use]
+    pub const fn payload_sha256(&self) -> [u8; 32] {
+        self.grant.payload_sha256
+    }
+}
+
+/// 一条**当前任务上下文实例**——被授权按 [`AuthorityClass::ExplicitTaskContext`] 使用的目标。
+///
+/// 两个权威并排放着，而不是把低的那个覆盖掉：`source_authority` 是这条记忆**存储**的权威
+/// （I-STORE，永远 ≤ 5，授权不改它），`effective_context_authority()` 是这一次**使用**的权威。
+/// 把它们合成一个字段，就等于把「谁批准的」洗成「它本来就是这么可信」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizedTaskItem {
+    memory_id: MemoryId,
+    source_authority: AuthorityClass,
+    grant: VerifiedTaskGrant,
+    _priv: (),
+}
+
+impl AuthorizedTaskItem {
+    /// 目标。
+    #[must_use]
+    pub const fn memory_id(&self) -> MemoryId {
+        self.memory_id
+    }
+
+    /// 存储权威——**不变量 I-STORE 的可观察面**。
+    #[must_use]
+    pub const fn source_authority(&self) -> AuthorityClass {
+        self.source_authority
+    }
+
+    /// 本次使用的有效上下文权威。恒为 [`AuthorityClass::ExplicitTaskContext`]；它是常量而不是
+    /// 字段，因为这个类型存在的全部意义就是「这一次可以用 6」。
+    #[must_use]
+    pub const fn effective_context_authority(&self) -> AuthorityClass {
+        AuthorityClass::ExplicitTaskContext
+    }
+
+    /// 支撑它的那条授权。
+    #[must_use]
+    pub const fn grant(&self) -> VerifiedTaskGrant {
+        self.grant
+    }
+}
+
+/// I-TASK 的唯一判定点（裁决 §四.2 的顺序，逐条）。
+///
+/// 顺序即语义，且**顺序本身是判据的一部分**：先确定这条义务属于当前任务，再看绑定形状，
+/// 再看有没有授权，再看授权指向谁，再看授权此刻是否有效，最后才看目标本身。反过来先看
+/// 目标，就会让「目标很干净」把「没有人批准过」盖过去。
+///
+/// 绝不会写 `memory.authority_class = 6`，也绝不会 `max()`：本函数不修改任何东西，它只
+/// 决定「这一次能不能用 6」。找不到授权时也**不**退化成「当作低一点权威但 Mandatory 已履行」
+/// ——那条路径在返回类型里不存在。
+///
+/// # Errors
+/// [`TaskContextReject`] 的任一条；第一条不满足的检查就是返回值。
+pub fn authorize_task_item(
+    task: &AuthenticatedTask,
+    stored_floor: AuthorityClass,
+    facts: &TaskGrantFacts,
+) -> Result<AuthorizedTaskItem, TaskContextReject> {
+    let obligation = facts.obligation;
+
+    // 1. 当前任务：租户一致、scope 就是本次已认证的那个任务。
+    if obligation.tenant_id != task.tenant_id() || obligation.scope_id != Some(task.task_id()) {
+        return Err(TaskContextReject::TaskNotCurrent);
+    }
+    // 2. 绑定形状：TASK + MANDATORY + 未撤销。
+    if !matches!(obligation.scope_kind, ScopeKind::Task)
+        || !matches!(obligation.mode, BindingMode::Mandatory)
+        || obligation.revoked
+    {
+        return Err(TaskContextReject::BindingScopeMismatch);
+    }
+    // 3. 有没有授权。**绑定不是授权**——这条臂就是那句话的可执行形态。
+    let Some(grant) = facts.grant else {
+        return Err(TaskContextReject::MissingTaskAuthorization);
+    };
+    // 4. 授权指向的是不是这一条义务。
+    if grant.tenant_id != task.tenant_id()
+        || grant.task_id != task.task_id()
+        || grant.context_binding_id != obligation.context_binding_id
+        || grant.memory_id != obligation.memory_id
+        || !grant.scope_kind_is_task
+        || !grant.mode_is_mandatory
+    {
+        return Err(TaskContextReject::GrantTargetMismatch);
+    }
+    // 5. 授权此刻有效吗：等级、用途、签发者、policy 版本、证据、epoch、撤销、生效窗口。
+    let purpose_ok = matches!(grant.purpose, Some(BindingPurpose::AdoptTaskInstruction));
+    let issuer_ok = grant.issuer_kind.is_some();
+    let window_ok = grant.issued_at_epoch_s <= facts.now_epoch_s
+        && grant
+            .expires_at_epoch_s
+            .is_none_or(|expires| expires > facts.now_epoch_s);
+    if grant.grant_authority != TASK_GRANT_AUTHORITY
+        || !purpose_ok
+        || !issuer_ok
+        || !grant.policy_version_matches
+        || !grant.authorization_evidence_present
+        || grant.revoked
+        || grant.task_epoch != task.authorization_epoch()
+        || !window_ok
+    {
+        return Err(TaskContextReject::TaskAuthorizationInactive);
+    }
+    // 6. 目标本身。授权不能替目标回答「它在不在、能不能读、能不能当指令」。
+    let Some(target) = facts.target else {
+        return Err(TaskContextReject::TargetMissing);
+    };
+    if target.tenant_id != task.tenant_id() || target.memory_id != obligation.memory_id {
+        return Err(TaskContextReject::GrantTargetMismatch);
+    }
+    if !target.readable {
+        return Err(TaskContextReject::TargetNotReadable);
+    }
+    // §10.1 row 4/5：DATA_ONLY 的 origin 不因为有人批准就变成行为指令（G59-6 边界不动）。
+    if !matches!(
+        target.max_disposition,
+        InstructionDisposition::BehaviorEligible
+    ) {
+        return Err(TaskContextReject::UntrustedInstruction);
+    }
+    // I-STORE 在读侧再执行一次：存储权威仍然受 origin ceiling 约束，且仍然 ≤ 5。
+    if !target.active
+        || (target.stored_authority as u8) < (stored_floor as u8)
+        || matches!(target.stored_authority, AuthorityClass::ExplicitTaskContext)
+    {
+        return Err(TaskContextReject::TargetNotActiveOrGrounded);
+    }
+    // 7. 精确内容：被批准的那一份，不是「同一个 memory_id 的最新一份」。
+    if target.payload_sha256 != grant.payload_sha256 {
+        return Err(TaskContextReject::TargetRevisionChanged);
+    }
+    Ok(AuthorizedTaskItem {
+        memory_id: obligation.memory_id,
+        source_authority: target.stored_authority,
+        grant: VerifiedTaskGrant { grant, _priv: () },
+        _priv: (),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     //! §25.4/§25.5 的判据。三条保证各自有能红的断言；纯拓扑那条（`SelectorInput` 没有
@@ -1143,6 +1814,404 @@ mod tests {
     use crate::authority::AuthorizedAuthority;
     use crate::grounding::{GroundingInputs, derive_grounding_state};
     use crate::ids::{TenantId, UserId, WorkspaceId};
+
+    // =========================================================================
+    // card 22c / ADR-0046 —— I-TASK 与 I-NONINHERIT 的定向注错闸
+    // =========================================================================
+
+    /// §78.1 GOLDEN：`min_authority` 是 `authority.stored_floor()` 的派生值，两者不许漂。
+    /// 注错：把任一条 REGISTRY 的 `min_authority` 改成别的类 ⇒ 红。
+    #[test]
+    fn registry_min_authority_is_derived_from_requirement() {
+        for s in &REGISTRY {
+            assert_eq!(
+                s.min_authority,
+                s.authority.stored_floor(),
+                "{:?} 的 min_authority 与 authority 漂了",
+                s.id
+            );
+        }
+    }
+
+    /// 裁决 §三：v2 登记，v1 的记录保留且指向 v2。
+    #[test]
+    fn task_selector_is_registered_as_v2_and_v1_is_retired() {
+        assert_eq!(
+            spec(SelectorId::TaskExplicitContextV1).registered_name,
+            "task_explicit_context_v2"
+        );
+        assert!(matches!(
+            spec(SelectorId::TaskExplicitContextV1).authority,
+            AuthorityRequirement::VerifiedCurrentTaskBinding
+        ));
+        let retired = RETIRED_SELECTORS
+            .iter()
+            .find(|r| r.registered_name == "task_explicit_context_v1")
+            .expect("v1 的登记记录必须保留供审计");
+        assert_eq!(retired.superseded_by, "task_explicit_context_v2");
+        assert!(!retired.reason.is_empty());
+        // 登记名全集不重复——「同名 selector 偷换准入对象」在名字层就不成立。
+        let names: HashSet<&str> = REGISTRY
+            .iter()
+            .map(|s| s.registered_name)
+            .chain(RETIRED_SELECTORS.iter().map(|r| r.registered_name))
+            .collect();
+        assert_eq!(names.len(), REGISTRY.len() + RETIRED_SELECTORS.len());
+    }
+
+    const TEST_DIGEST: [u8; 32] = [7u8; 32];
+    const OTHER_DIGEST: [u8; 32] = [9u8; 32];
+
+    fn task_of(tenant: Uuid, task: Uuid, epoch: i64) -> AuthenticatedTask {
+        AuthenticatedTask::from_resolved_task(tenant, task, epoch)
+    }
+
+    fn obligation_of(
+        tenant: Uuid,
+        task: Uuid,
+        binding: Uuid,
+        memory: MemoryId,
+    ) -> TaskBindingObligation {
+        TaskBindingObligation {
+            context_binding_id: binding,
+            tenant_id: tenant,
+            scope_kind: ScopeKind::Task,
+            scope_id: Some(task),
+            mode: BindingMode::Mandatory,
+            memory_id: memory,
+            revoked: false,
+        }
+    }
+
+    fn grant_of(tenant: Uuid, task: Uuid, binding: Uuid, memory: MemoryId) -> RawTaskGrant {
+        RawTaskGrant {
+            tenant_id: tenant,
+            context_binding_id: binding,
+            task_id: task,
+            memory_id: memory,
+            scope_kind_is_task: true,
+            mode_is_mandatory: true,
+            task_epoch: 0,
+            payload_sha256: TEST_DIGEST,
+            grant_authority: TASK_GRANT_AUTHORITY,
+            purpose: Some(BindingPurpose::AdoptTaskInstruction),
+            issuer_kind: Some(TaskGrantIssuer::AuthenticatedTaskRequest),
+            policy_version_matches: true,
+            authorization_evidence_present: true,
+            issued_at_epoch_s: 1_000,
+            expires_at_epoch_s: None,
+            revoked: false,
+        }
+    }
+
+    fn target_of(tenant: Uuid, memory: MemoryId) -> TaskTargetFacts {
+        TaskTargetFacts {
+            tenant_id: tenant,
+            memory_id: memory,
+            // 正对照就是裁决点名的那一条：合法可读 grounded 的 UserConfirmed(4)。
+            stored_authority: AuthorityClass::UserCorrection,
+            max_disposition: InstructionDisposition::BehaviorEligible,
+            active: true,
+            readable: true,
+            payload_sha256: TEST_DIGEST,
+        }
+    }
+
+    /// 一套完整的正对照事实。每个注错测试从它出发，只动一处。
+    fn positive_facts(tenant: Uuid, task: Uuid, binding: Uuid, memory: MemoryId) -> TaskGrantFacts {
+        TaskGrantFacts {
+            obligation: obligation_of(tenant, task, binding, memory),
+            grant: Some(grant_of(tenant, task, binding, memory)),
+            target: Some(target_of(tenant, memory)),
+            now_epoch_s: 2_000,
+        }
+    }
+
+    fn floor() -> AuthorityClass {
+        spec(SelectorId::TaskExplicitContextV1)
+            .authority
+            .stored_floor()
+    }
+
+    /// 正对照（裁决 §七 的前置条件）：合法可读 grounded 的 UserCorrection(4) 记忆，
+    /// 经当前任务精确批准，拿到 6 —— 而**存储**权威仍然是 4。
+    #[test]
+    fn task_explicit_context_v2_positive_control() {
+        let (tenant, task, binding, memory) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            MemoryId::new(),
+        );
+        let item = authorize_task_item(
+            &task_of(tenant, task, 0),
+            floor(),
+            &positive_facts(tenant, task, binding, memory),
+        )
+        .expect("正对照必须准入");
+        assert_eq!(
+            item.effective_context_authority(),
+            AuthorityClass::ExplicitTaskContext
+        );
+        assert_eq!(item.source_authority(), AuthorityClass::UserCorrection);
+        assert_eq!(item.grant().task_id(), task);
+        assert_eq!(item.grant().payload_sha256(), TEST_DIGEST);
+
+        // 铸出的 MandatoryRow 两个权威并排，不是一个覆盖另一个。
+        let s = spec(SelectorId::TaskExplicitContextV1);
+        let admitted = MandatoryRow::from_task_grant(s, item, 10, RowGrounding::NotJudged)
+            .expect("spec 是 VerifiedCurrentTaskBinding");
+        match admitted {
+            Admitted::Row(row) => {
+                assert_eq!(row.authority(), AuthorityClass::ExplicitTaskContext);
+                assert_eq!(row.source_authority(), AuthorityClass::UserCorrection);
+            }
+            Admitted::NeedsVerification(nv) => panic!("不该被分流: {nv:?}"),
+        }
+    }
+
+    /// 「绑定 ≠ 授权」：同一条 MANDATORY/TASK 绑定，没有 grant ⇒ 不准入，原因具名。
+    /// 注错（裁决 §七「绑定≠授权」）：让 mode=MANDATORY 本身就授 6 ⇒ 本测试红。
+    #[test]
+    fn task_explicit_context_v2_negative_control_missing_authorization() {
+        let (tenant, task, binding, memory) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            MemoryId::new(),
+        );
+        let mut facts = positive_facts(tenant, task, binding, memory);
+        facts.grant = None;
+        assert_eq!(
+            authorize_task_item(&task_of(tenant, task, 0), floor(), &facts),
+            Err(TaskContextReject::MissingTaskAuthorization)
+        );
+        assert_eq!(
+            TaskContextReject::MissingTaskAuthorization.wire(),
+            "MISSING_TASK_AUTHORIZATION"
+        );
+    }
+
+    /// 裁决 §七 的其余机制闸，逐条一个定向用例。每一条只动正对照的一个字段。
+    #[test]
+    // 一条注错一段，逐条对照同一份正对照事实；拆成十几个 #[test] 只会让「改了哪一处」
+    // 从眼前消失，而这正是本测试要盯的东西。
+    #[allow(clippy::too_many_lines)]
+    fn task_authorization_rejects_each_broken_dimension() {
+        let (tenant, task, binding, memory) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            MemoryId::new(),
+        );
+        let base = positive_facts(tenant, task, binding, memory);
+        let current = task_of(tenant, task, 0);
+
+        // 用途：reference-only 的确认不是采纳指令的授权。
+        let mut f = base;
+        f.grant.as_mut().expect("grant").purpose = Some(BindingPurpose::ReferenceOnly);
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::TaskAuthorizationInactive)
+        );
+
+        // 作用域：换任务。
+        let other_task = Uuid::now_v7();
+        let mut f = base;
+        f.grant.as_mut().expect("grant").task_id = other_task;
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::GrantTargetMismatch)
+        );
+        // 同一条 grant 拿到另一个任务的读取里，也进不去。
+        assert_eq!(
+            authorize_task_item(&task_of(tenant, other_task, 0), floor(), &base),
+            Err(TaskContextReject::TaskNotCurrent)
+        );
+
+        // 作用域：关闭重开任务（epoch 变了），旧授权立即失效。
+        assert_eq!(
+            authorize_task_item(&task_of(tenant, task, 1), floor(), &base),
+            Err(TaskContextReject::TaskAuthorizationInactive)
+        );
+
+        // 跨租户。
+        assert_eq!(
+            authorize_task_item(&task_of(Uuid::now_v7(), task, 0), floor(), &base),
+            Err(TaskContextReject::TaskNotCurrent)
+        );
+
+        // 撤销：撤销后不可恢复。
+        let mut f = base;
+        f.grant.as_mut().expect("grant").revoked = true;
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::TaskAuthorizationInactive)
+        );
+
+        // 过期。
+        let mut f = base;
+        f.grant.as_mut().expect("grant").expires_at_epoch_s = Some(1_500);
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::TaskAuthorizationInactive)
+        );
+
+        // 尚未生效。
+        let mut f = base;
+        f.grant.as_mut().expect("grant").issued_at_epoch_s = 9_999;
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::TaskAuthorizationInactive)
+        );
+
+        // 等级：grant_authority 不是 6。
+        let mut f = base;
+        f.grant.as_mut().expect("grant").grant_authority = 5;
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::TaskAuthorizationInactive)
+        );
+
+        // 授权证据缺席 / policy 版本不符。
+        for mutate in [
+            (|g: &mut RawTaskGrant| g.authorization_evidence_present = false)
+                as fn(&mut RawTaskGrant),
+            |g: &mut RawTaskGrant| g.policy_version_matches = false,
+            |g: &mut RawTaskGrant| g.issuer_kind = None,
+        ] {
+            let mut f = base;
+            mutate(f.grant.as_mut().expect("grant"));
+            assert_eq!(
+                authorize_task_item(&current, floor(), &f),
+                Err(TaskContextReject::TaskAuthorizationInactive)
+            );
+        }
+
+        // 精确内容：同一个 memory_id，内容变了 ⇒ 不准入（「自动 follow latest」的注错落点）。
+        let mut f = base;
+        f.target.as_mut().expect("target").payload_sha256 = OTHER_DIGEST;
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::TargetRevisionChanged)
+        );
+
+        // 目标不可读 / 不存在 / 非 active。
+        let mut f = base;
+        f.target.as_mut().expect("target").readable = false;
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::TargetNotReadable)
+        );
+        let mut f = base;
+        f.target = None;
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::TargetMissing)
+        );
+        let mut f = base;
+        f.target.as_mut().expect("target").active = false;
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::TargetNotActiveOrGrounded)
+        );
+
+        // DATA_ONLY 边界：授权不能把只能当数据的 origin 改成行为指令（G59-6 不动）。
+        let mut f = base;
+        f.target.as_mut().expect("target").max_disposition = InstructionDisposition::DataOnly;
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::UntrustedInstruction)
+        );
+
+        // 同一条 §10.1 row 4/5 判据在**写侧**（裁决 §四.4 的
+        // `require_behavior_eligible_target`）：DATA_ONLY-only basis 连授权都不许铸出来。
+        // 存在性读法——混合 basis 里有一个 BehaviorEligible origin 就够。
+        assert_eq!(
+            require_behavior_eligible_target(&[
+                EvidenceOriginClass::ToolResult,
+                EvidenceOriginClass::ExternalContent,
+                EvidenceOriginClass::UploadedArtifact,
+                EvidenceOriginClass::SystemMigration,
+                EvidenceOriginClass::TrustedConnector,
+            ]),
+            Err(TaskContextReject::UntrustedInstruction)
+        );
+        assert_eq!(
+            require_behavior_eligible_target(&[
+                EvidenceOriginClass::ToolResult,
+                EvidenceOriginClass::UserConfirmed,
+            ]),
+            Ok(())
+        );
+        assert_eq!(
+            require_behavior_eligible_target(&[]),
+            Err(TaskContextReject::UntrustedInstruction),
+            "没有 basis 就没有行为资格——失败关闭"
+        );
+
+        // I-STORE 的读侧复核：一条**存储**着 6 的历史行不能靠授权进来。
+        let mut f = base;
+        f.target.as_mut().expect("target").stored_authority = AuthorityClass::ExplicitTaskContext;
+        assert_eq!(
+            authorize_task_item(&current, floor(), &f),
+            Err(TaskContextReject::TargetNotActiveOrGrounded)
+        );
+
+        // 绑定形状：撤销的绑定、非 TASK scope、非 MANDATORY。
+        for mutate in [
+            (|o: &mut TaskBindingObligation| o.revoked = true) as fn(&mut TaskBindingObligation),
+            |o: &mut TaskBindingObligation| o.scope_kind = ScopeKind::Workspace,
+            |o: &mut TaskBindingObligation| o.mode = BindingMode::Pinned,
+        ] {
+            let mut f = base;
+            mutate(&mut f.obligation);
+            assert_eq!(
+                authorize_task_item(&current, floor(), &f),
+                Err(TaskContextReject::BindingScopeMismatch)
+            );
+        }
+    }
+
+    /// I-NONINHERIT 的类型面：`VerifiedTaskGrant` / `AuthorizedTaskItem` 只能由
+    /// [`authorize_task_item`] 造出来，所以「consolidation 复制一条授权」写不出来；
+    /// 而 `from_selector` 拒绝为 v2 的 spec 按存储权威铸行，`from_task_grant` 拒绝为
+    /// `StoredAtLeast` 的 spec 铸行 —— 两条入口不能互相冒充。
+    #[test]
+    fn task_lane_entry_points_do_not_impersonate_each_other() {
+        let v2 = spec(SelectorId::TaskExplicitContextV1);
+        assert!(matches!(
+            MandatoryRow::from_selector(
+                v2,
+                MemoryId::new(),
+                AuthorityClass::ExplicitTaskContext,
+                10,
+                RowGrounding::NotJudged
+            ),
+            Err(ErrorCode::InvalidInput)
+        ));
+        let (tenant, task, binding, memory) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            MemoryId::new(),
+        );
+        let item = authorize_task_item(
+            &task_of(tenant, task, 0),
+            floor(),
+            &positive_facts(tenant, task, binding, memory),
+        )
+        .expect("正对照");
+        assert!(matches!(
+            MandatoryRow::from_task_grant(
+                spec(SelectorId::ProjectActiveConstraintsV1),
+                item,
+                10,
+                RowGrounding::NotJudged
+            ),
+            Err(ErrorCode::InvalidInput)
+        ));
+    }
 
     fn scope_of(tenant: Uuid, user: Option<Uuid>, workspace: Option<Uuid>) -> Scope {
         Scope {
@@ -1956,8 +3025,16 @@ mod tests {
 
     /// MANDATORY 的读取侧门：policy 即使放行，授权到的等级低于 ProjectConstraint 也不许进。
     /// 注错：把那条下限判定删掉 ⇒ 本条红。
+    /// card 22c / ADR-0046 D-J：MANDATORY 写侧的额外下限**换成**了 v2 的存储下限。
+    ///
+    /// 下限本身还在（policy 放行 ≠ 够格建 MANDATORY 绑定），但它不再是 `ProjectConstraint`
+    /// ——裁决 §二.4 点名拒绝 5-下限，因为它把正对照要用的合法 `UserCorrection(4)` 目标排除掉。
+    /// 现在的下限是 `PrivateKnowledge`：公共池内容不是本租户的任务指令来源。
+    ///
+    /// 两头都断言，否则这条闸会因为「把什么都放行」而假绿：`PublicKnowledge` 仍被拒，
+    /// `UserCorrection` 必须通过。
     #[test]
-    fn mandatory_requires_project_constraint_or_above_even_if_policy_allows() {
+    fn mandatory_write_floor_is_the_v2_stored_floor_not_project_constraint() {
         let request = req(BindingMode::Mandatory);
         let actor =
             ElevatedActor::from_consumed_confirmation(DestructiveOp::MemoryBind, request.memory_id)
@@ -1965,19 +3042,36 @@ mod tests {
         let scope = scope_of(Uuid::now_v7(), None, None);
         let basis = NonEmptyVec::new(vec![EvidenceOriginClass::DirectUserInput]).expect("basis");
 
-        let lenient = AlwaysAuthorizes(AuthorityClass::PrivateKnowledge);
+        let public = AlwaysAuthorizes(AuthorityClass::PublicKnowledge);
         assert_eq!(
             authorize_mandatory(
-                &lenient,
+                &public,
                 &actor,
                 request,
-                AuthorityClass::PrivateKnowledge,
+                AuthorityClass::PublicKnowledge,
                 MemoryType::Note,
                 basis.clone(),
                 &scope,
             ),
             Err(CandidateRejection::OriginAuthorityCeiling),
-            "policy 放行不等于够格进 MANDATORY lane"
+            "policy 放行不等于够格进 MANDATORY lane：公共池内容仍被拒"
+        );
+
+        // 正对照，也是本卡的解锁点：UserCorrection(4) 必须能被绑定，它的准入靠的是授权，
+        // 不是一个更高的存储等级。注错：把下限改回 ProjectConstraint ⇒ 本条红。
+        let correction = AlwaysAuthorizes(AuthorityClass::UserCorrection);
+        assert!(
+            authorize_mandatory(
+                &correction,
+                &actor,
+                request,
+                AuthorityClass::UserCorrection,
+                MemoryType::Note,
+                basis.clone(),
+                &scope,
+            )
+            .is_ok(),
+            "裁决 §二.4：5-下限会把合法的 UserConfirmed(4) 目标排除掉"
         );
 
         let strict = AlwaysAuthorizes(AuthorityClass::ProjectConstraint);

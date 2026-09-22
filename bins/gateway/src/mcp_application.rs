@@ -20,6 +20,7 @@ use humaux_domain::{
     affect::{AffectWriteOp, MoodHalfLife},
     authority::MemoryId,
     confirm::{ConfirmToken, DestructiveOp},
+    context::BindingPurpose,
     continuity::ProjectId,
     dataclass::DataClass,
     error::ErrorCode,
@@ -36,6 +37,17 @@ use serde::Deserialize;
 use serde_json::{Value, json, value::RawValue};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
+
+/// The closed argument set of the four binding ops (§36 + §25.4.A(7)/(9) + card 22c's `purpose`).
+///
+/// A named struct rather than a 4-tuple: the last two fields are both `Option` and both only
+/// meaningful on `memory.bind`, and a positional swap between them would compile.
+struct BindingWriteArguments {
+    memory: MemoryId,
+    task: Option<TaskId>,
+    replaces_binding_id: Option<Uuid>,
+    purpose: Option<BindingPurpose>,
+}
 
 use crate::{
     context::{self, ContextBootstrap},
@@ -1217,7 +1229,7 @@ impl GatewayMcpApplication {
         output(value)
     }
 
-    /// The three closed arguments of the four binding ops (§36 + §25.4.A(7)/(9)).
+    /// The closed arguments of the four binding ops (§36 + §25.4.A(7)/(9)).
     ///
     /// `task_id` is required by exactly the MANDATORY pair and refused on the PINNED pair; a
     /// bind with no task is `INVALID_INPUT`, never a tenant-wide MANDATORY binding by accident.
@@ -1226,7 +1238,7 @@ impl GatewayMcpApplication {
     fn binding_write_arguments(
         value: &Value,
         op: DestructiveOp,
-    ) -> Result<(MemoryId, Option<TaskId>, Option<Uuid>), ErrorCode> {
+    ) -> Result<BindingWriteArguments, ErrorCode> {
         let memory = MemoryId::parse(value["memory_id"].as_str().ok_or(ErrorCode::InvalidInput)?)?;
         let uuid_arg = |name: &str| -> Result<Option<Uuid>, ErrorCode> {
             value
@@ -1243,7 +1255,25 @@ impl GatewayMcpApplication {
         if mandatory != task.is_some() || (!mandatory && replaces_binding_id.is_some()) {
             return Err(ErrorCode::InvalidInput);
         }
-        Ok((memory, task, replaces_binding_id))
+        // card 22c / ADR-0046: `purpose` is REQUIRED on bind and refused on the other three.
+        // No default: "reference or instruction" is the whole question this field exists to
+        // answer, and a defaulted answer is one nobody gave.
+        let purpose = match value.get("purpose") {
+            Some(raw) => Some(
+                BindingPurpose::parse_wire(raw.as_str().ok_or(ErrorCode::InvalidInput)?)
+                    .ok_or(ErrorCode::InvalidInput)?,
+            ),
+            None => None,
+        };
+        if purpose.is_some() != matches!(op, DestructiveOp::MemoryBind) {
+            return Err(ErrorCode::InvalidInput);
+        }
+        Ok(BindingWriteArguments {
+            memory,
+            task,
+            replaces_binding_id,
+            purpose,
+        })
     }
 
     /// §36 `memory.pin` / `memory.unpin` and, since card 22b (ADR-0045), `memory.bind` /
@@ -1256,6 +1286,11 @@ impl GatewayMcpApplication {
     /// `ConfirmedUserActor` each refuse the other's ops). No `workspace_id` on the wire: the
     /// route is the credential's bound workspace (same rule as `memory.get` /
     /// `memory.supersede`); `task_id` IS on the wire because a task is not a credential route.
+    // card 22c added the `purpose` leg (the intent digest for the confirm gate, the closed
+    // wire value, and the two reported fields). Splitting the arm per op would duplicate the
+    // whole ConfirmGate envelope four times over three closed values; the length is the price
+    // of keeping "one confirm gate, four ops" literally one function.
+    #[allow(clippy::too_many_lines)]
     async fn memory_binding_write(
         &self,
         context: &McpHttpContext,
@@ -1264,7 +1299,12 @@ impl GatewayMcpApplication {
         value: &Value,
         op: DestructiveOp,
     ) -> Result<ToolOutput, ErrorCode> {
-        let (memory, task, replaces_binding_id) = Self::binding_write_arguments(value, op)?;
+        let BindingWriteArguments {
+            memory,
+            task,
+            replaces_binding_id,
+            purpose,
+        } = Self::binding_write_arguments(value, op)?;
         let presented = value
             .get("confirm_token")
             .map(|token| {
@@ -1293,7 +1333,12 @@ impl GatewayMcpApplication {
                     // operation's second argument (memory.supersede's replacement uses it), so
                     // a confirmation for "bind S to T" cannot execute "bind S to U".
                     target_id: memory.0,
-                    successor_id: task.map(|task| task.0),
+                    // card 22c: the successor leg is the whole intent digest (task + purpose),
+                    // not the bare task id — `humaux_domain::context::binding_confirmation_successor`,
+                    // shared with the adapter's confirm check.
+                    successor_id: task.map(|task| {
+                        humaux_domain::context::binding_confirmation_successor(task, purpose)
+                    }),
                     presented,
                     ttl,
                 },
@@ -1309,6 +1354,7 @@ impl GatewayMcpApplication {
                         memory,
                         task,
                         replaces_binding_id,
+                        purpose,
                     )
                     .await
                     .map(|done| (done, scope_workspace))
@@ -1356,14 +1402,27 @@ impl GatewayMcpApplication {
                         )
                     }
                 };
-                json!({
+                let mut value = json!({
                     "memory_id": memory.0,
                     "binding_id": done.binding_id,
                     "mode": mode,
                     "state": state,
                     "inserted": done.inserted,
                     "scope": scope,
-                })
+                });
+                // card 22c (ADR-0046): bind, and only bind, reports what it was FOR and
+                // whether an authorization actually exists now. `task_authorized` is the
+                // adapter's read-back, not an echo of `purpose` — the idempotent arm writes
+                // nothing, so the two can legitimately disagree.
+                if let Some(purpose) = purpose {
+                    value["purpose"] = json!(purpose.wire());
+                    value["task_authorization"] = json!(if done.task_authorized {
+                        "granted"
+                    } else {
+                        "none"
+                    });
+                }
+                value
             }
         };
         // Both results are branches of memory.output.schema.json (tools/list advertises it).

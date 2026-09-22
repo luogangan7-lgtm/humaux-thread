@@ -258,11 +258,24 @@ fn registry_required_columns_name_real_relations() {
 
     let task = &REGISTRY[0];
     assert_eq!(task.id, SelectorId::TaskExplicitContextV1);
-    assert!(
-        task.required_columns
-            .iter()
-            .all(|(schema, table, _, _)| *schema == "private" && *table == "context_bindings"),
-        "§25.4.A(11): the task selector's dependencies must live on the binding relation"
+    // card 22c (ADR-0046): v2 reads the obligation from `private.context_bindings` AND its
+    // authorization from `private.task_binding_grants`. Those two relations, and no third —
+    // the §25.4.A(11) ban below is the half that matters, and a wildcard here would let a
+    // future dependency on `memory_records` slip in under a different column name.
+    let task_relations: std::collections::BTreeSet<(&str, &str)> = task
+        .required_columns
+        .iter()
+        .map(|(schema, table, _, _)| (*schema, *table))
+        .collect();
+    assert_eq!(
+        task_relations,
+        [
+            ("private", "context_bindings"),
+            ("private", "task_binding_grants")
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<(&str, &str)>>(),
+        "§25.4.A(11): the task selector reads the binding obligation and its authorization"
     );
     for column in ["scope_kind", "scope_id", "mode", "revoked_at"] {
         assert!(
