@@ -5909,6 +5909,17 @@ Event payload、完全未消费索引或 RetrievalCard，可以对这四项如�
 `pipeline_count_mismatch`，缺必要读数为 `count_unknown`，跨口径为
 `count_scope_mismatch`；三者都使完整 envelope 为 `cannot_establish`。
 既有 ledger / census / lane 的更具体不可判定原因不被后置检查覆盖。
+
+**§22.4 第五个触发（card 23 / ADR-0047，补 card 22c 评审漏交付的一条）：未兑现的 Mandatory
+义务。** `handoff.counts.mandatory_missing > 0` 时 `classify()` 返回
+`cannot_establish / mandatory_not_satisfied`，判定位置在 ledger / census / lane 三条之后、
+**planner 那条之前**——planner 判的是谓词，谓词再干净也不能替一份自己知道是短的 Mandatory
+上下文背书。在此之前这个差额只作为 handoff 里的一个数字存在，而 `completeness.class` 仍答
+`semantic_bounded`：那正是 §25.5 已经拒绝过的形状（「禁止静默截掉后半段并仍声称 complete」）
+在「lane 跑完了但带回来的不全」这一侧的同一个洞。§25.5 的 `mandatory_context_overflow` 表达
+不了它——溢出是「装不下」，这条是「装下了但没装满」。§23.3 的 `reason` 闭集因此为 11 个
+（`mandatory_not_satisfied` 是第 11 个），线值与 §41.2 计数器 label 同源于
+`CompletenessClass::wire_labels`。
 这不另造 classifier、Envelope 或统计资格，也不改 §23.1② 的 A1/A2 算法。
 
 **这两个读数的来源（ADR-0041 落地口径，不放宽上面任何一条）**：`stream_ledger` 口径的
@@ -6352,6 +6363,8 @@ card 22 的实测诊断保留，因为它订正了 ADR-0041 D-I 的错误根因�
 crates/adapters/src/context_repo.rs  probe：按 SelectorSpec.required_columns 查列目录
                                      缺列 ⇒ SelectorOutcome::Unavailable，直接 continue
 crates/retrieval/src/handoff.rs:139  Unavailable ⇒ handoff.unavailable_selectors 非空
+                                     （线上的 selector 名由 §25.4 登记名给出——card 23 起
+                                     `selector_wire()` 直接读 REGISTRY，不再手抄第二张表）
 bins/gateway/src/context.rs:322      非空 ⇒ LaneStatus::Failed
 §22.4                                lane 触发在 classify() 里先于 planner_output ⇒ lane_failed
 ```
@@ -6493,12 +6506,17 @@ facet_for}`（第 1/2/3 条）· `humaux_domain::context::REGISTRY`（第 7/11 �
 1. **登记名换版**：`task_explicit_context_v1` 退役，`task_explicit_context_v2` 登记。v1 的记录
    （退役原因 + 继任者）保留在 registry 旁边供审计。准入对象变了却沿用旧名字，是裁决 §三
    明确禁止的一种偷换。
-   **实测未竟（2026-09-22 评审）**：换版只落在 registry，**没有落到线上**。客户端看到的名字由
-   `crates/retrieval/src/handoff.rs::selector_wire` 产出，它仍然映射
-   `TaskExplicitContextV1 => "task_explicit_context_v1"`；`SelectorSpec::registered_name` 目前
-   零个非测试读者。也就是说今天的线格式正处在本条禁止的状态：旧名字 + 新准入对象。修法是
-   `selector_wire` 改读 `registered_name`（`crates/retrieval` 不在 card 22c 的允许文件内），
-   债记在 ADR-0046「Open debt」。
+   **已结清（2026-09-23，card 23 / ADR-0047）**：该债的原文如下——换版曾只落在 registry，
+   没有落到线上，客户端看到的名字由 `crates/retrieval/src/handoff.rs::selector_wire` 产出，
+   它仍然手抄一张映射 `TaskExplicitContextV1 => "task_explicit_context_v1"`，而
+   `SelectorSpec::registered_name` 零个非测试读者，于是线格式正处在本条禁止的状态：旧名字 +
+   新准入对象。修法即已采用的那条：`selector_wire` 改成 `spec(id).registered_name` 的一次读，
+   第二张表随之删除——**同一批名字不存在两张表**，是这条禁令唯一可靠的落法。
+   退役字面量由 `handoff.rs::retired_selector_v1_never_reaches_the_wire` 钉住：任何 selector
+   再把 `task_explicit_context_v1` 送上线即红。`contracts/mcp/context.output.schema.json` 的
+   四个 selector 位置（`mandatory[]` / `pinned[]` / `needs_verification[]` /
+   `unavailable_selectors[0]`）同时从 `minLength:1` 自由串收成 §25.4 五个登记名的闭枚举
+   （§78.2：闭集不许是自由串）。
 
 2. **准入对象**：v2 的 `AuthorityRequirement` 是 `VerifiedCurrentTaskBinding`，不是
    `StoredAtLeast(ExplicitTaskContext)`。判定顺序冻结如下（顺序本身是判据的一部分：先确认义务

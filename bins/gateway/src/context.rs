@@ -347,6 +347,10 @@ fn into_result<T>(
             provenance: &provenance,
             visible,
             context: Some(&outcome),
+            // §25.3 / card 22c: an unmet Mandatory obligation moves `completeness` —
+            // `cannot_establish/mandatory_not_satisfied` — instead of being reported only as
+            // a number inside the handoff counts while the class still claims a sound answer.
+            mandatory_missing: handoff.counts.mandatory_missing,
         },
         |final_outcome| {
             let content = Envelope {

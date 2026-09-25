@@ -300,7 +300,7 @@ fn db_error<T>(result: Result<T, ContributionExecutionRepoError>, label: &str) {
 }
 
 #[test]
-#[ignore = "requires disposable PostgreSQL 18 migrated through 0131"]
+#[ignore = "lane(a:shared_db) requires disposable PostgreSQL 18 migrated through 0131"]
 #[allow(clippy::too_many_lines)]
 fn typed_repo_all_eight_commands_are_durable_and_provider_free() {
     if !require_db() {

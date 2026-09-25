@@ -5,7 +5,7 @@ use postgres::{Client, NoTls, error::SqlState};
 use uuid::Uuid;
 
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through 0127"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through 0127"]
 #[allow(
     clippy::too_many_lines,
     reason = "single integration scenario covers the complete assessed contract"
@@ -157,7 +157,7 @@ fn public_worker_cannot_scan_sanitized_envelopes_or_forge_anonymous_admission() 
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through 0127"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through 0127"]
 fn private_coverage_contract_returns_a_single_empty_snapshot_in_an_empty_pool() {
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL DSN");
     let mut client = Client::connect(&dsn, NoTls).expect("isolated PostgreSQL");

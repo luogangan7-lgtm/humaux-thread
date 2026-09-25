@@ -26,7 +26,7 @@ use uuid::Uuid;
 static SERIAL: Mutex<()> = Mutex::new(());
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 #[allow(
     deprecated,
     reason = "test fixture intentionally exercises the legacy prepare path"
@@ -90,7 +90,7 @@ fn manual_exact_confirmation_release_is_atomic_idempotent_and_not_reactivated() 
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 #[allow(
     deprecated,
     reason = "this failure fixture intentionally exercises legacy contribute::prepare"
@@ -133,7 +133,7 @@ fn scan_failure_or_changed_payload_creates_no_candidate_or_release() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn stale_inputs_fail_while_generic_grants_do_not_control_self_principal_finalize() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for change in [
@@ -210,7 +210,7 @@ fn stale_inputs_fail_while_generic_grants_do_not_control_self_principal_finalize
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn exact_binding_candidate_does_not_reconsult_mutable_legacy_profile() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for change in ["profile_disabled", "domain_profile_removed"] {
@@ -244,7 +244,7 @@ fn exact_binding_candidate_does_not_reconsult_mutable_legacy_profile() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn wrong_hash_other_user_and_source_append_fail_closed() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut f = Fixture::new();
@@ -322,7 +322,7 @@ fn wrong_hash_other_user_and_source_append_fail_closed() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn outbox_failure_rolls_back_finalized_release_and_source_rows() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut f = Fixture::new();

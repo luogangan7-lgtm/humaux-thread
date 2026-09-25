@@ -247,7 +247,7 @@ fn execute_manifest_postcheck(db: &mut Client, migration: &str) -> bool {
 }
 
 #[test]
-#[ignore = "creates and removes a disposable PostgreSQL 18 database"]
+#[ignore = "lane(a:disposable) creates and removes a disposable PostgreSQL 18 database"]
 fn r4_manifest_postcheck_supersession_is_explicit_after_0133() {
     let base_dsn = dsn();
     let database = format!("humaux_0131_postcheck_{}", Uuid::new_v4().simple());
@@ -301,7 +301,7 @@ fn r4_manifest_postcheck_supersession_is_explicit_after_0133() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0131"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0131"]
 fn r4_security_definer_function_matrix_is_exact() {
     let mut db = Client::connect(&dsn(), NoTls).expect("isolated PG");
     let row = db
@@ -734,7 +734,7 @@ fn expected_snapshot(
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0131"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0131"]
 #[allow(clippy::too_many_lines)] // One DB connection verifies the coupled durable bundle after every injected fault.
 fn r4_sql_authority_exact_late_and_atomic_candidate() {
     let mut fixture = ContributionFixture::new();
@@ -1283,7 +1283,7 @@ fn r4_sql_authority_exact_late_and_atomic_candidate() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0131"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0131"]
 #[allow(clippy::too_many_lines)] // The four frozen outcome variants share one isolated fixture and assertion vocabulary.
 fn r4_fg_18_business_outcome_variants_and_abort_invariants() {
     let mut fixture = ContributionFixture::new();

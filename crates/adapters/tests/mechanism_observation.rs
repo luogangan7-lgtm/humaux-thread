@@ -158,7 +158,7 @@ fn assert_admin_cli_status(
 }
 
 #[test]
-#[ignore = "requires dedicated PostgreSQL78 mechanism fixture and real read-only credentials"]
+#[ignore = "lane(a:mechanism_fixture) requires dedicated PostgreSQL78 mechanism fixture and real read-only credentials"]
 fn runtime_reader_rejects_forged_active_unlinked_delta_and_cross_target_fallback() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut client = db();
@@ -215,7 +215,7 @@ fn runtime_reader_rejects_forged_active_unlinked_delta_and_cross_target_fallback
 }
 
 #[test]
-#[ignore = "requires dedicated PostgreSQL78 mechanism fixture"]
+#[ignore = "lane(a:mechanism_fixture) requires dedicated PostgreSQL78 mechanism fixture"]
 fn real_observation_freshness_and_denominator_never_use_bootstrap() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut client = db();
@@ -249,7 +249,7 @@ fn real_observation_freshness_and_denominator_never_use_bootstrap() {
 }
 
 #[test]
-#[ignore = "requires dedicated PostgreSQL78 mechanism fixture"]
+#[ignore = "lane(a:mechanism_fixture) requires dedicated PostgreSQL78 mechanism fixture"]
 fn e2e_receipts_reject_cross_scope_and_preserve_immutable_measurements() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut client = db();
@@ -301,7 +301,7 @@ fn e2e_receipts_reject_cross_scope_and_preserve_immutable_measurements() {
 }
 
 #[test]
-#[ignore = "requires actual role_admin and role_maintenance login credentials"]
+#[ignore = "lane(a:mechanism_fixture) requires actual role_admin and role_maintenance login credentials"]
 fn readonly_admin_is_not_a_writer_or_private_reader() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _fixture = db();
@@ -496,19 +496,19 @@ fn exercise_real_public_review_records_before_after_and_quarantine(verify_cli: b
 }
 
 #[test]
-#[ignore = "requires PostgreSQL78, actual maintenance/admin credentials and pinned Gitleaks"]
+#[ignore = "lane(c) admits its fixture release through role_public_worker public_repo::admit_release (line ~413), the path migration 0124_phase9_independence_attestation:233 fenced (REVOKE SELECT ON staging.contribution_releases) and ADR-0047 Open debt forbids re-opening — the 0165 attempt was reverted as a lineage leak. Reached only once card 23 provisioned a real role_admin login (lane run 2 answered Forbidden at that call). Rebuild the public-review before/after + quarantine oracle on admit_assessed_release + run_anonymous_once before restoring it."]
 fn real_public_review_records_before_after_and_quarantine_remains_visible() {
     exercise_real_public_review_records_before_after_and_quarantine(false);
 }
 
 #[test]
-#[ignore = "requires PostgreSQL78, real admin binary and actual maintenance/admin credentials"]
+#[ignore = "lane(c) same fenced admission as real_public_review_records_before_after_and_quarantine_remains_visible: the CLI scenario seeds its supported/quarantined reviews through role_public_worker public_repo::admit_release (line ~413), which migration 0124:233 fenced and ADR-0047 Open debt names as must-not-reopen. The humaux-admin CLI readout itself is untouched; rebuild the seeding on the assessed/anonymous seam, then restore this test on lane(a:mechanism_admin_bin)."]
 fn admin_cli_reports_real_supported_then_quarantined_review() {
     exercise_real_public_review_records_before_after_and_quarantine(true);
 }
 
 #[test]
-#[ignore = "requires dedicated PostgreSQL78 fixture and real maintenance credentials"]
+#[ignore = "lane(a:mechanism_fixture) requires dedicated PostgreSQL78 fixture and real maintenance credentials"]
 fn recorder_rejects_other_cell_or_database_before_any_observation() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut admin = db();

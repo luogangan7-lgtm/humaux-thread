@@ -47,8 +47,12 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
 }
 
 fn dsn_from_args(args: &[String]) -> Option<String> {
+    flag_value(args, "--dsn")
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
-        .position(|a| a == "--dsn")
+        .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
 }
@@ -178,13 +182,33 @@ pub fn run(args: &[String]) -> i32 {
     };
 
     let migrations_dir = Path::new("migrations");
-    let migrations = match collect_migrations(migrations_dir) {
+    let mut migrations = match collect_migrations(migrations_dir) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("migrate: fail ({e})");
             return 1;
         }
     };
+    // `--through <id>` stops after the migration whose file stem starts with `<id>` — the only
+    // way to build the *pre-N* schema a migration's own hard-stop test has to assert against
+    // (`contribution_policy_lifecycle_0132.rs::pre_0132_unresolved_triples_hard_stop` re-runs
+    // 0132's SQL and requires 55000). Ordering is the filename's numeric prefix, same as
+    // `collect_migrations`; an id that matches nothing is a fail, never a silent full apply.
+    if let Some(through) = flag_value(args, "--through") {
+        let Some(last) = migrations
+            .iter()
+            .position(|m| m.migration_id.starts_with(&through))
+        else {
+            eprintln!("migrate: fail (--through {through} matches no migration file)");
+            return 1;
+        };
+        migrations.truncate(last + 1);
+        eprintln!(
+            "migrate: --through {through} — applying {} of the migration set",
+            migrations.len()
+        );
+    }
+    let migrations = migrations;
 
     let mut client = match Client::connect(&dsn, NoTls) {
         Ok(c) => c,

@@ -34,6 +34,20 @@ fn setup_failed<T>(_: T) -> DbFixtureSkipReason {
     DbFixtureSkipReason::IsolationSetupFailed("request guard fixture setup failed".into())
 }
 
+/// ADR-0047 D-D: the dedicated request-guard fixture is whatever `HUMAUX_TEST_PG_DSN` names —
+/// under `cargo xtask serial-lane` a per-run `humaux_thread_request_guard_<stamp>` database the
+/// lane provisions and migrates — and every role DSN must name that same database. The
+/// machine-local `61719 / FIXTURE_DB` pair stays an accepted legacy target.
+///
+/// Pinning *only* that pair made every test in this file report `IsolationSetupFailed` on any
+/// standard node: a printed SKIP, or a fail under `HUMAUX_REQUIRE_DB=1`. The identical rule
+/// already landed in `support/operation_receipt_fixture.rs` and `g80_31_handoff.rs`; this is a
+/// read of that rule, not a second one.
+fn same_target(role: &PgConnectOptions, owner: &PgConnectOptions) -> bool {
+    (role.get_port() == 61719 && role.get_database() == Some(FIXTURE_DB))
+        || (role.get_port() == owner.get_port() && role.get_database() == owner.get_database())
+}
+
 impl DbIntegrationFixture for Fixture {
     type Handle = Handle;
 
@@ -41,11 +55,7 @@ impl DbIntegrationFixture for Fixture {
         let admin_dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
         let admin_options = PgConnectOptions::from_str(&admin_dsn).map_err(setup_failed)?;
-        if admin_options.get_host() != "127.0.0.1"
-            || admin_options.get_port() != 61719
-            || admin_options.get_database() != Some(FIXTURE_DB)
-            || admin_dsn.contains(['?', '#'])
-        {
+        if admin_options.get_host() != "127.0.0.1" || admin_dsn.contains(['?', '#']) {
             return Err(setup_failed(()));
         }
         let mut admin = Client::connect(&admin_dsn, NoTls).map_err(setup_failed)?;
@@ -53,8 +63,7 @@ impl DbIntegrationFixture for Fixture {
         let gateway_options = PgConnectOptions::from_str(&gateway_dsn).map_err(setup_failed)?;
         if gateway_options.get_username() != "role_gateway"
             || gateway_options.get_host() != "127.0.0.1"
-            || gateway_options.get_port() != 61719
-            || gateway_options.get_database() != Some(FIXTURE_DB)
+            || !same_target(&gateway_options, &admin_options)
             || gateway_dsn.contains(['?', '#'])
         {
             return Err(setup_failed(()));
@@ -165,7 +174,7 @@ fn event(tenant_id: TenantId, request_id: &str) -> AuditEvent {
 }
 
 #[test]
-#[ignore = "requires the dedicated request-guard PostgreSQL fixture"]
+#[ignore = "lane(a:request_guard) requires the dedicated request-guard PostgreSQL fixture"]
 fn effective_entitlements_are_read_only_from_the_projected_snapshot() {
     run_db_fixture::<Fixture, _>(
         "effective_entitlements_are_read_only_from_the_projected_snapshot",
@@ -218,7 +227,7 @@ fn effective_entitlements_are_read_only_from_the_projected_snapshot() {
 }
 
 #[test]
-#[ignore = "requires the dedicated request-guard PostgreSQL fixture"]
+#[ignore = "lane(a:request_guard) requires the dedicated request-guard PostgreSQL fixture"]
 fn gateway_audit_writer_requires_bound_force_rls_scope() {
     run_db_fixture::<Fixture, _>(
         "gateway_audit_writer_requires_bound_force_rls_scope",
@@ -261,7 +270,7 @@ fn gateway_audit_writer_requires_bound_force_rls_scope() {
 }
 
 #[test]
-#[ignore = "requires the dedicated request-guard PostgreSQL fixture"]
+#[ignore = "lane(a:request_guard) requires the dedicated request-guard PostgreSQL fixture"]
 fn audit_tenant_is_closed_to_authenticated_scope_or_system() {
     run_db_fixture::<Fixture, _>(
         "audit_tenant_is_closed_to_authenticated_scope_or_system",

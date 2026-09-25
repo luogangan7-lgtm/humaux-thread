@@ -58,7 +58,7 @@ fn counts(admin: &mut Client, tenant_id: Uuid, key: &str) -> (i64, i64, i64) {
 }
 
 #[test]
-#[ignore = "requires disposable PostgreSQL 18 migrated through 0131"]
+#[ignore = "lane(a:shared_db) requires disposable PostgreSQL 18 migrated through 0131"]
 fn command_owns_contracts_and_serializes_concurrent_first_creators() {
     if !require_db() {
         eprintln!("SKIP: HUMAUX_TEST_PG_DSN is not set");

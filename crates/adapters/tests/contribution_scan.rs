@@ -24,7 +24,7 @@ fn fixture_config() -> ContributionScannerConfig {
 }
 
 #[test]
-#[ignore = "requires pinned real Gitleaks fixture"]
+#[ignore = "lane(b) requires pinned real Gitleaks fixture"]
 fn real_gitleaks_allows_clean_fixture_and_blocks_known_secret_fixture() {
     let config = fixture_config();
     let expected_version = config.expected_version.clone();
@@ -45,7 +45,7 @@ fn real_gitleaks_allows_clean_fixture_and_blocks_known_secret_fixture() {
 }
 
 #[test]
-#[ignore = "requires pinned real Gitleaks fixture"]
+#[ignore = "lane(b) requires pinned real Gitleaks fixture"]
 fn real_gitleaks_decodes_base64_secret_before_matching() {
     let scanner = ContributionScanner::new(fixture_config()).expect("verified scanner fixture");
     // Base64 of the synthetic GitHub-shaped value used above. The scanner owns
@@ -58,7 +58,7 @@ fn real_gitleaks_decodes_base64_secret_before_matching() {
 }
 
 #[test]
-#[ignore = "requires pinned real Gitleaks fixture"]
+#[ignore = "lane(b) requires pinned real Gitleaks fixture"]
 fn deterministic_privacy_rules_block_synthetic_email_and_phone() {
     let scanner = ContributionScanner::new(fixture_config()).expect("verified scanner fixture");
     assert_eq!(
@@ -79,7 +79,7 @@ fn deterministic_privacy_rules_block_synthetic_email_and_phone() {
 }
 
 #[test]
-#[ignore = "requires pinned real Gitleaks fixture"]
+#[ignore = "lane(b) requires pinned real Gitleaks fixture"]
 fn host_config_and_inline_allow_do_not_disable_scanning() {
     const TEST_NAME: &str = "host_config_and_inline_allow_do_not_disable_scanning";
     if std::env::var_os("HUMAUX_TEST_SCAN_CONFIG_CHILD").is_some() {
@@ -116,7 +116,7 @@ fn host_config_and_inline_allow_do_not_disable_scanning() {
 }
 
 #[test]
-#[ignore = "requires pinned real Gitleaks fixture"]
+#[ignore = "lane(b) requires pinned real Gitleaks fixture"]
 fn binary_replaced_after_construction_fails_closed() {
     let mut config = fixture_config();
     let copy = std::env::temp_dir().join(format!(
@@ -149,7 +149,7 @@ fn missing_binary_fails_closed_without_runtime_fixture() {
 }
 
 #[test]
-#[ignore = "requires pinned real Gitleaks fixture"]
+#[ignore = "lane(b) requires pinned real Gitleaks fixture"]
 fn real_binary_version_mismatch_fails_closed() {
     let mut mismatch = fixture_config();
     mismatch.expected_version.push_str("-mismatch");
@@ -160,7 +160,7 @@ fn real_binary_version_mismatch_fails_closed() {
 }
 
 #[test]
-#[ignore = "requires pinned real Gitleaks fixture"]
+#[ignore = "lane(b) requires pinned real Gitleaks fixture"]
 fn real_binary_hash_mismatch_fails_closed() {
     let mut mismatch = fixture_config();
     mismatch.expected_executable_sha256 = "0".repeat(64);
@@ -171,7 +171,7 @@ fn real_binary_hash_mismatch_fails_closed() {
 }
 
 #[test]
-#[ignore = "requires pinned real Gitleaks fixture"]
+#[ignore = "lane(b) requires pinned real Gitleaks fixture"]
 fn real_binary_version_probe_honors_timeout() {
     let mut timed_out = fixture_config();
     timed_out.timeout = Duration::from_nanos(1);

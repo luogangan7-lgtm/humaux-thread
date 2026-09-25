@@ -565,6 +565,7 @@ fn accepted_output(
             provenance: &provenance,
             visible,
             context: None,
+            mandatory_missing: 0,
         },
         |outcome| {
             let value = serde_json::to_value(Envelope {

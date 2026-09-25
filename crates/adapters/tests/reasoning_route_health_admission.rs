@@ -315,7 +315,7 @@ fn end_case(db: &mut Client, name: &str) {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0130"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0130"]
 #[allow(
     clippy::too_many_lines,
     reason = "matrix acceptance test enumerates the complete admission decision surface"
@@ -631,7 +631,7 @@ fn reasoning_route_health_admission_matrix() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0130"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0130"]
 #[allow(
     clippy::too_many_lines,
     reason = "ACL acceptance test covers append-only and nullable shape cases together"
@@ -786,7 +786,7 @@ fn reasoning_route_health_acl_append_only_and_null_shape() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0130"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0130"]
 #[allow(
     clippy::too_many_lines,
     reason = "ledger acceptance test verifies disclosure, candidate and atomicity invariants together"
@@ -1100,7 +1100,7 @@ fn reasoning_attempt_ledger_disclosure_candidate_and_atomicity() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0130"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0130"]
 fn reasoning_route_health_statement_snapshot_advances_on_next_call() {
     let dsn = dsn();
     let mut first = Client::connect(&dsn, NoTls).expect("first connection");

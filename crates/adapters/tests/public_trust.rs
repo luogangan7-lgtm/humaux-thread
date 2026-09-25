@@ -319,7 +319,7 @@ fn legacy_receipt_basis_source_mutations_are_red() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn non_moderator_cannot_change_any_manual_review_state() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for state in [
@@ -349,7 +349,7 @@ fn non_moderator_cannot_change_any_manual_review_state() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn active_global_moderator_persists_complete_immutable_supported_receipt() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = ContributionFixture::new();
@@ -381,7 +381,7 @@ fn active_global_moderator_persists_complete_immutable_supported_receipt() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn strict_gateway_and_retrieval_hydration_reject_each_wrong_identity_field() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = ContributionFixture::new();
@@ -469,7 +469,7 @@ fn strict_gateway_and_retrieval_hydration_reject_each_wrong_identity_field() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn quarantine_is_durable_but_not_retrievable_and_revoked_or_disabled_moderator_cannot_mutate() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for change in ["disabled", "membership"] {
@@ -532,7 +532,7 @@ fn quarantine_is_durable_but_not_retrievable_and_revoked_or_disabled_moderator_c
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn sealed_receipts_reject_runtime_rewrite_or_root_append_and_stale_requests_leave_no_trace() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = ContributionFixture::new();

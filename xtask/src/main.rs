@@ -23,6 +23,7 @@ mod phase;
 mod projection_serve;
 mod r4_fault_manifest;
 mod rls_check;
+mod serial_lane;
 mod soak;
 mod switch_visible;
 mod threshold_shape;
@@ -50,10 +51,11 @@ fn main() {
         Some("member") => member::run(&args[2..]),
         Some("projection-serve") => projection_serve::run(&args[2..]),
         Some("sweep-confirm-tokens") => confirm_sweep::run(&args[2..]),
+        Some("serial-lane") => serial_lane::run(&args[2..]),
         Some("soak") => soak::run(&args[2..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|r4-fault-manifest|direction-table|card-version|migrate|e2e-seed|member|projection-serve|sweep-confirm-tokens|soak>"
+                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|r4-fault-manifest|direction-table|card-version|migrate|e2e-seed|member|projection-serve|sweep-confirm-tokens|serial-lane|soak>"
             );
             2
         }

@@ -328,10 +328,16 @@ fn seed_ryw_overlay(handle: &mut Handle, stream_seq: i64) -> (Uuid, String) {
     handle
         .admin
         .execute(
+            // §16.2: `serving` is what `serving_repo::serving_version_in_txn` selects on, and it
+            // defaults to false. Without it the token-free
+            // `materialize_private_read_serving` leg below can only answer
+            // `ServingProjectionChanged` — the fail-closed verdict, on every database, which is
+            // not the read this fixture is here to exercise.
             "INSERT INTO projection.stream_checkpoints \
-               (tenant_id,scope_kind,scope_id,domain,projection_kind,projection_version) \
-             VALUES($1,'tenant',$1,'knowledge','dense','private-v1') \
-             ON CONFLICT DO NOTHING",
+               (tenant_id,scope_kind,scope_id,domain,projection_kind,projection_version,serving) \
+             VALUES($1,'tenant',$1,'knowledge','dense','private-v1',true) \
+             ON CONFLICT (tenant_id,scope_kind,scope_id,domain,projection_kind,projection_version) \
+             DO UPDATE SET serving = true",
             &[&handle.tenant_id],
         )
         .expect("register RYW stream");
@@ -846,7 +852,7 @@ fn assert_gateway_write_rejected(handle: &Handle) {
 }
 
 #[test]
-#[ignore = "requires an isolated PostgreSQL fixture migrated through 0119 and disposable Qdrant"]
+#[ignore = "lane(a:qdrant) requires an isolated PostgreSQL fixture migrated through 0119 and disposable Qdrant"]
 fn private_point_registry_fails_closed_for_identity_and_permissions() {
     run_db_fixture::<RegistryFixture, _>("private_point_registry", |mut handle| {
         let point = ProjectionPointId::new(Uuid::new_v4());

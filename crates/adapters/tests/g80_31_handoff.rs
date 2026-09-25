@@ -56,10 +56,24 @@ fn gateway_dsn() -> Option<String> {
         );
         return None;
     };
+    // card 23 (serial lane, class (a)): the target is whatever `HUMAUX_TEST_PG_DSN` names —
+    // the repo-wide isolated test database (§79.2) — with the machine-local `61719 /
+    // humaux_thread_request_guard_20260828` pair kept as an accepted legacy target. Pinning
+    // only that pair made all 11 tests in this file skip on every standard environment while
+    // `skip_or_fail` printed SKIP, i.e. a whole file of false green; the identical fix already
+    // landed in `support/operation_receipt_fixture.rs` on 2026-09-03 and this is a read of the
+    // same rule, not a second one.
+    let legacy_target =
+        options.get_port() == 61719 && options.get_database() == Some(REQUEST_GUARD_DB);
+    let shared_target = std::env::var("HUMAUX_TEST_PG_DSN")
+        .ok()
+        .and_then(|admin| PgConnectOptions::from_str(&admin).ok())
+        .is_some_and(|admin| {
+            options.get_port() == admin.get_port() && options.get_database() == admin.get_database()
+        });
     if options.get_username() != "role_gateway"
         || options.get_host() != "127.0.0.1"
-        || options.get_port() != 61719
-        || options.get_database() != Some(REQUEST_GUARD_DB)
+        || !(legacy_target || shared_target)
         || dsn.contains(['?', '#'])
     {
         skip_or_fail(

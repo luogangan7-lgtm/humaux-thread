@@ -89,14 +89,18 @@ pub struct Handoff {
     pub counts: HandoffCounts,
 }
 
-fn selector_wire(id: SelectorId) -> &'static str {
-    match id {
-        SelectorId::TaskExplicitContextV1 => "task_explicit_context_v1",
-        SelectorId::ProjectActiveConstraintsV1 => "project_active_constraints_v1",
-        SelectorId::UserConfirmedCorrectionsV1 => "user_confirmed_corrections_v1",
-        SelectorId::RequiredCurrentStateFacetsV1 => "required_current_state_facets_v1",
-        SelectorId::ExplicitMandatoryBindingsV1 => "explicit_mandatory_bindings_v1",
-    }
+/// Wire name of a selector = its §25.4 **registered name**, read from the registry.
+///
+/// card 22c review debt: this used to be a second hand-written table that still said
+/// `task_explicit_context_v1` on every handoff surface (`mandatory[].selector`,
+/// `pinned[].selector`, `needs_verification[].selector`, `unavailable_selectors`) while
+/// ADR-0046 had already retired that registration in favour of `task_explicit_context_v2`.
+/// Two tables of the same names is exactly how a wire name drifts from the registry, so
+/// there is now one table — [`humaux_domain::context::REGISTRY`] — and this is a read of it.
+/// [`SelectorId`]'s variant names stay slot identifiers (see `SelectorSpec::registered_name`'s
+/// own doc); the registered name is the only thing that reaches the wire.
+const fn selector_wire(id: SelectorId) -> &'static str {
+    humaux_domain::context::spec(id).registered_name
 }
 
 fn state_wire(k: GroundingStateKind) -> &'static str {
@@ -484,5 +488,39 @@ mod tests {
             "unavailable 必须改变字节——否则 partial 与 full 不可区分"
         );
         assert_eq!(h2.unavailable_selectors.len(), 1);
+    }
+
+    /// The retired registration `task_explicit_context_v1` (ADR-0046) must never reappear on
+    /// any handoff surface, and every emitted selector name must be a *registered* one.
+    ///
+    /// Fault injection: put the literal back in `selector_wire` (or point it at
+    /// `RETIRED_SELECTORS`) and this goes red on both halves.
+    #[test]
+    fn retired_selector_v1_never_reaches_the_wire() {
+        let registered: Vec<&'static str> = humaux_domain::context::REGISTRY
+            .iter()
+            .map(|s| s.registered_name)
+            .collect();
+        for id in [
+            SelectorId::TaskExplicitContextV1,
+            SelectorId::ProjectActiveConstraintsV1,
+            SelectorId::UserConfirmedCorrectionsV1,
+            SelectorId::RequiredCurrentStateFacetsV1,
+            SelectorId::ExplicitMandatoryBindingsV1,
+        ] {
+            let wire = selector_wire(id);
+            assert_ne!(
+                wire, "task_explicit_context_v1",
+                "{id:?} still emits the retired v1 registration on the wire (ADR-0046)"
+            );
+            assert!(
+                registered.contains(&wire),
+                "{id:?} emits {wire}, which is not a §25.4 registered name"
+            );
+        }
+        assert_eq!(
+            selector_wire(SelectorId::TaskExplicitContextV1),
+            "task_explicit_context_v2"
+        );
     }
 }

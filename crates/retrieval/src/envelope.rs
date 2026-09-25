@@ -239,11 +239,11 @@ pub fn build_projection_block(
 
 /// §22.4's `classify()`/[`build_projection_block`] coupling, made mechanical (major finding:
 /// "no type, no gate, no assembly function prevents an envelope with `visible: null,
-/// completeness_ratio: null, class: semantic_bounded`"). `classify()`'s frozen 4-param
+/// completeness_ratio: null, class: semantic_bounded`"). `classify()`'s
 /// signature has no `visible`/A2 input (§22.5's own module doc), so it cannot see the two
 /// projection-side cannot-establish triggers on its own; this function is the one place that
 /// downgrades its answer using the *already-computed* [`ProjectionBlock`] instead of leaving
-/// that downgrade to caller discipline. `classify()`'s own four triggers (ledger/census/
+/// that downgrade to caller discipline. `classify()`'s own triggers (ledger/census/
 /// lane/planner) still take priority when they already produced `CannotEstablish` — this only
 /// ever adds a reason, never removes one.
 // ponytail: no `application`-layer caller assembles a full envelope yet (out of this crate's
@@ -267,11 +267,13 @@ pub(crate) fn assemble_completeness_class(
         pipeline,
         visible,
         None,
+        0,
     );
 
     (class.into(), CannotEstablishReasonWire::from_class(class))
 }
 
+#[allow(clippy::too_many_arguments)] // every input is a distinct §22.4/§23.1② trigger source
 fn final_completeness_class(
     planner_output: &crate::planner::PlannerDecision,
     lane_status: LaneStatus,
@@ -280,8 +282,15 @@ fn final_completeness_class(
     pipeline: &PipelineBlock,
     visible: Option<u64>,
     context: Option<&ContextOutcome>,
+    mandatory_missing: u64,
 ) -> CompletenessClass {
-    let classified = classify(planner_output, lane_status, census_result, ledger);
+    let classified = classify(
+        planner_output,
+        lane_status,
+        census_result,
+        ledger,
+        mandatory_missing,
+    );
     // §25.5's final outcome makes a real Mandatory Context overflow the canonical reason even
     // when §22's pure classifier has already found a different failure. The `PipelineBlock` is
     // still retained by the caller as the diagnostic record; only the one final wire reason is
@@ -420,6 +429,9 @@ pub enum CannotEstablishReasonWire {
     CountScopeMismatch,
     /// Known values in the same universe disagree.
     PipelineCountMismatch,
+    /// §25.3 (card 22c)：Mandatory lane 跑完了但没带回它有义务带回的全部内容
+    /// （`handoff.counts.mandatory_missing > 0`）。
+    MandatoryNotSatisfied,
 }
 
 impl CannotEstablishReasonWire {
@@ -445,6 +457,7 @@ impl CannotEstablishReasonWire {
             "count_unknown" => Some(Self::CountUnknown),
             "count_scope_mismatch" => Some(Self::CountScopeMismatch),
             "pipeline_count_mismatch" => Some(Self::PipelineCountMismatch),
+            "mandatory_not_satisfied" => Some(Self::MandatoryNotSatisfied),
             // 到不了：`wire_labels` 是闭集。真到了说明有人加了 reason 变体却没加这里，
             // 那时 `None` 会让新 reason 在 JSON 上静默消失——所以 panic 而不是 None。
             other => unreachable!("未登记的 reason 线值: {other}"),
@@ -537,6 +550,11 @@ pub struct CompletenessInputs<'a> {
     pub provenance: &'a ProvenanceBlock,
     pub visible: Option<u64>,
     pub context: Option<&'a ContextOutcome>,
+    /// §25.3 `handoff.counts.mandatory_missing` for this request — `0` on every route that
+    /// has no Mandatory lane. Non-zero forces `cannot_establish/mandatory_not_satisfied`
+    /// (card 22c review debt): the shortfall must move `completeness.class`, not only sit in
+    /// the handoff counts.
+    pub mandatory_missing: u64,
 }
 
 /// A fully validated outcome whose final metric is still pending downstream acceptance.
@@ -577,6 +595,7 @@ pub fn envelope_outcome_block<T>(
         inputs.pipeline,
         inputs.visible,
         inputs.context,
+        inputs.mandatory_missing,
     );
     let outcome = exact_outcome_from_class(class, inputs.census)?;
     let value = accept(outcome)?;
@@ -605,7 +624,7 @@ pub(crate) fn component_exact_outcome(
     census: &crate::completeness::CensusResult,
     ledger: &crate::completeness::LedgerClosure,
 ) -> Result<ExactOutcome, humaux_domain::error::ErrorCode> {
-    let class = crate::completeness::classify(planner_output, lane_status, census, ledger);
+    let class = crate::completeness::classify(planner_output, lane_status, census, ledger, 0);
     exact_outcome_from_class(class, census)
 }
 
@@ -1015,7 +1034,7 @@ pub fn mandatory_outcome_blocks(
             )
         }
         ContextOutcome::Compiled(c) => (
-            // 装配成功时本函数不裁定 class——那由 §22 的 classify() 按它自己的四参判据决定。
+            // 装配成功时本函数不裁定 class——那由 §22 的 classify() 按它自己的判据决定。
             // 这里只报「不是 mandatory 溢出」，用 SemanticBounded 作占位会是越权裁定，
             // 所以返回 None 让调用方用 classify() 的结果填。
             CompletenessClassWire::SemanticBounded,
@@ -1214,6 +1233,7 @@ mod tests {
                 provenance: &full_provenance(),
                 visible: Some(1),
                 context: Some(&outcome),
+                mandatory_missing: 0,
             },
             Ok,
         )
@@ -1278,6 +1298,7 @@ mod tests {
                 provenance: &full_provenance(),
                 visible: Some(1),
                 context: Some(&overflow),
+                mandatory_missing: 0,
             },
             Ok,
         )
@@ -1354,6 +1375,7 @@ mod tests {
                 provenance: &full_provenance(),
                 visible: Some(1),
                 context: None,
+                mandatory_missing: 0,
             },
             Ok,
         )
@@ -2007,6 +2029,7 @@ mod tests {
                 LaneStatus::Ok,
                 &census,
                 &ledger,
+                0,
             ),
             CompletenessClass::Exact,
             "the count gate, not a census failure, downgrades this fixture"
@@ -2074,6 +2097,7 @@ mod tests {
                 provenance: &full_provenance(),
                 visible: Some(1),
                 context: None,
+                mandatory_missing: 0,
             },
             accept,
         )
@@ -2143,6 +2167,7 @@ mod tests {
                 provenance: &full_provenance(),
                 visible: Some(1),
                 context: None,
+                mandatory_missing: 0,
             },
             Ok,
         )
@@ -2171,6 +2196,7 @@ mod tests {
                 provenance: &full_provenance(),
                 visible: Some(1),
                 context: None,
+                mandatory_missing: 0,
             },
             Ok,
         )
@@ -2199,6 +2225,7 @@ mod tests {
                     provenance: &invalid,
                     visible: Some(1),
                     context: None,
+                    mandatory_missing: 0,
                 },
                 Ok::<_, humaux_domain::error::ErrorCode>,
             ),
@@ -2242,6 +2269,7 @@ mod tests {
                     provenance: &full_provenance(),
                     visible: Some(1),
                     context: None,
+                    mandatory_missing: 0,
                 },
                 Ok::<_, humaux_domain::error::ErrorCode>,
             ),

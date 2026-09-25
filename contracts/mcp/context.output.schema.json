@@ -28,7 +28,7 @@
             "required": ["memory_id","selector","authority"],
             "properties": {
               "memory_id": {"type":"string","format":"uuid"},
-              "selector": {"type":"string","minLength":1},
+              "selector": {"type":"string","enum":["task_explicit_context_v2","project_active_constraints_v1","user_confirmed_corrections_v1","required_current_state_facets_v1","explicit_mandatory_bindings_v1"]},
               "authority": {"type":"string","minLength":1}
             },
             "additionalProperties": false
@@ -41,7 +41,7 @@
             "required": ["memory_id","selector","authority"],
             "properties": {
               "memory_id": {"type":"string","format":"uuid"},
-              "selector": {"type":"string","minLength":1},
+              "selector": {"type":"string","enum":["task_explicit_context_v2","project_active_constraints_v1","user_confirmed_corrections_v1","required_current_state_facets_v1","explicit_mandatory_bindings_v1"]},
               "authority": {"type":"string","minLength":1}
             },
             "additionalProperties": false
@@ -54,7 +54,7 @@
             "required": ["memory_id","selector","state"],
             "properties": {
               "memory_id": {"type":"string","format":"uuid"},
-              "selector": {"type":"string","minLength":1},
+              "selector": {"type":"string","enum":["task_explicit_context_v2","project_active_constraints_v1","user_confirmed_corrections_v1","required_current_state_facets_v1","explicit_mandatory_bindings_v1"]},
               "state": {"enum":["current","recheck_required","unresolved","cannot_establish"]}
             },
             "additionalProperties": false
@@ -65,7 +65,7 @@
           "type": "array",
           "items": {
             "type": "array",
-            "prefixItems": [{"type":"string","minLength":1},{"type":"string","minLength":1}],
+            "prefixItems": [{"type":"string","enum":["task_explicit_context_v2","project_active_constraints_v1","user_confirmed_corrections_v1","required_current_state_facets_v1","explicit_mandatory_bindings_v1"]},{"type":"string","minLength":1}],
             "items": false,
             "minItems": 2,
             "maxItems": 2
@@ -194,7 +194,8 @@
                 "mandatory_context_overflow",
                 "count_unknown",
                 "count_scope_mismatch",
-                "pipeline_count_mismatch"
+                "pipeline_count_mismatch",
+                "mandatory_not_satisfied"
               ]
             },
             "exact": {

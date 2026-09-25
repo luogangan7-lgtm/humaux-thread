@@ -252,7 +252,7 @@ fn incomplete_configuration_fails_before_private_read_or_egress() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn legacy_infer_without_canonical_coverage_is_rejected_without_side_effects() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = Fixture::new();
@@ -288,7 +288,7 @@ fn legacy_infer_without_canonical_coverage_is_rejected_without_side_effects() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn nil_logical_call_is_rejected_without_side_effects() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = Fixture::new();
@@ -329,7 +329,7 @@ fn nil_logical_call_is_rejected_without_side_effects() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn same_logical_call_uuid_in_two_tenants_uses_distinct_advisory_locks() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut first = Fixture::new();
@@ -366,7 +366,7 @@ fn same_logical_call_uuid_in_two_tenants_uses_distinct_advisory_locks() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn endpoint_revision_descriptor_or_allowlist_mismatch_has_zero_side_effects() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = Fixture::new();
@@ -462,7 +462,7 @@ fn endpoint_revision_descriptor_or_allowlist_mismatch_has_zero_side_effects() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn wrong_binding_is_denied_before_ledger_disclosure_or_provider() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = Fixture::new();
@@ -477,7 +477,7 @@ fn wrong_binding_is_denied_before_ledger_disclosure_or_provider() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn matching_reserved_retry_returns_original_model_call_without_dispatch_or_readmission() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = Fixture::new();
@@ -542,7 +542,7 @@ fn matching_reserved_retry_returns_original_model_call_without_dispatch_or_readm
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn changed_intent_or_terminal_logical_call_conflicts_without_repeat_dispatch() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = Fixture::new();
@@ -615,7 +615,7 @@ fn changed_intent_or_terminal_logical_call_conflicts_without_repeat_dispatch() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn concurrent_same_logical_call_serializes_to_one_reservation_and_dispatch() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
@@ -658,7 +658,7 @@ fn concurrent_same_logical_call_serializes_to_one_reservation_and_dispatch() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn records_exact_wire_hash_and_finalizes_the_reserved_disclosure() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = Fixture::new();
@@ -711,7 +711,7 @@ fn records_exact_wire_hash_and_finalizes_the_reserved_disclosure() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn legacy_profile_change_cannot_replace_exact_binding_admission() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = Fixture::new();
@@ -757,7 +757,7 @@ fn legacy_profile_change_cannot_replace_exact_binding_admission() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn provider_failure_finalizes_the_already_reserved_disclosure_as_failed() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = Fixture::new();
@@ -790,7 +790,7 @@ fn provider_failure_finalizes_the_already_reserved_disclosure_as_failed() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL"]
 fn finalize_failure_never_retries_provider_and_leaves_reserved_call_for_reconciliation() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = Fixture::new();

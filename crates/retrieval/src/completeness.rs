@@ -4,8 +4,10 @@
 //! `classify()` is the sole constructor of [`CompletenessClass`]; final outcome emission is
 //! the sole increment point of `retrieval_completeness_total{class,reason}` (§22.5, §41.2).
 //! Its
-//! four parameters are the frozen signature (`planner_output` / `lane_status` /
-//! `census_result` / `ledger`); this module reuses [`crate::planner::PlannerDecision`] for
+//! parameters are `planner_output` / `lane_status` / `census_result` / `ledger` /
+//! `mandatory_missing` — §22.5's frozen four plus the §25.3 Mandatory shortfall added by card
+//! 22c's review (an unmet obligation moves `completeness`, see
+//! [`CannotEstablishReason::MandatoryNotSatisfied`]); this module reuses [`crate::planner::PlannerDecision`] for
 //! `planner_output` and [`crate::envelope::LaneStatus`] for `lane_status` rather than
 //! inventing second representations of either — only `CensusResult` is minted here, because
 //! no Authority-census type exists anywhere in the workspace yet (see its own doc for scope).
@@ -31,7 +33,7 @@
 //!    remains reachable solely through `envelope_outcome_block` after full Envelope validation.
 //! 4. `PlannerDecision::Class(_)` (every §20 wire class except `DirectGet`/`Enumerate`,
 //!    including `State` — §22.2 FACET_COMPLETE's natural source) maps to `SemanticBounded`,
-//!    not `FacetComplete`: the frozen 4-param signature carries no `covered_facets` /
+//!    not `FacetComplete`: the signature carries no `covered_facets` /
 //!    `required_facets` count, so claiming `FacetComplete` here would be an unproven
 //!    completeness claim (§22.0's "no verbal EXACT claim" invariant, generalized).
 //!    `FacetComplete` stays a real, constructible variant (exercised directly by this file's
@@ -96,10 +98,11 @@ impl CompletenessClass {
 }
 
 /// §22.4 `CANNOT_ESTABLISH` reason, a closed set (§78.2: no stringly-typed domain) covering
-/// exactly what `classify()`'s frozen 4-param signature can observe: A1 broken, Planner's own
-/// non-enumerable verdict, census failure, and lane failure. `projection lag` (also named in
-/// §22.4's trigger list) has no input path into this signature and so is not a variant here —
-/// out of scope for this constructor, not silently folded into one of these four.
+/// exactly what `classify()`'s signature can observe: A1 broken, Planner's own non-enumerable
+/// verdict, census failure, lane failure, and (card 22c) an unmet Mandatory obligation.
+/// `projection lag` (also named in §22.4's trigger list) has no input path into this signature
+/// and so is not a variant here — out of scope for this constructor, not silently folded into
+/// one of the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CannotEstablishReason {
     /// A1 broken (§22.4/§23.1②): `done + open_gaps + pending != expected`.
@@ -112,7 +115,7 @@ pub(crate) enum CannotEstablishReason {
     /// §22.4 "lane 故障".
     LaneFailed,
     /// §23.1②: A1 held but the Qdrant `visible` count could not be taken at all — a projection-
-    /// side cannot-establish `classify()`'s own 4-param signature (frozen, no `visible` input)
+    /// side cannot-establish `classify()`'s own signature (no `visible` input)
     /// cannot see; only [`crate::envelope::assemble_completeness_class`] can observe it.
     // ponytail: only constructed from that fn's own `#[cfg(test)]` callers today — no
     // `application`-layer caller exists yet to assemble a full envelope in production (out of
@@ -140,6 +143,17 @@ pub(crate) enum CannotEstablishReason {
     CountScopeMismatch,
     /// Known pipeline counts in one universe disagree.
     PipelineCountMismatch,
+    /// §22.4 / §25.3 (card 22c review debt): the Mandatory lane finished, but it did not
+    /// return everything it was obliged to return — `handoff.counts.mandatory_missing > 0`.
+    ///
+    /// An unmet **obligation** is not a weaker answer, it is an unestablished one: the caller
+    /// asked for context that §25.4 says must be present, and some of it is not. Before this
+    /// variant existed the shortfall was reported only as a number inside the handoff counts
+    /// while `completeness.class` still said `semantic_bounded` — i.e. the envelope claimed a
+    /// bounded-but-sound answer over a context it knew was short. §25.5 already refuses to
+    /// silently truncate Mandatory ([`Self::MandatoryContextOverflow`]); this is the same
+    /// refusal for the "lane ran and came back short" shape, which overflow cannot express.
+    MandatoryNotSatisfied,
 }
 
 /// §25.5 的唯一映射：Mandatory Context 溢出 ⇒ `cannot_establish`。
@@ -173,6 +187,7 @@ impl CannotEstablishReason {
             Self::CountUnknown => "count_unknown",
             Self::CountScopeMismatch => "count_scope_mismatch",
             Self::PipelineCountMismatch => "pipeline_count_mismatch",
+            Self::MandatoryNotSatisfied => "mandatory_not_satisfied",
         }
     }
 }
@@ -562,7 +577,7 @@ impl CompletenessTotal {
         "semantic_bounded",
         "cannot_establish",
     ];
-    const REASONS: [&'static str; 11] = [
+    const REASONS: [&'static str; 12] = [
         "none",
         "ledger_not_closed",
         "predicate_not_enumerable",
@@ -574,60 +589,18 @@ impl CompletenessTotal {
         "count_unknown",
         "count_scope_mismatch",
         "pipeline_count_mismatch",
+        "mandatory_not_satisfied",
     ];
     const CELLS: usize = Self::CLASSES.len() * Self::REASONS.len();
 
-    // 44 cells (4 classes × 11 reasons), hand-written: `AtomicU64` isn't `Copy`, and a `[X; N]` repeat expression
-    // needs a `const ZERO`, which trips `clippy::declare_interior_mutable_const` (same
-    // rationale `DegradeTotal::new` already documents). Update by hand if `CLASSES` or
-    // `REASONS` ever grows.
+    // One cell per (class, reason) pair. Written as an inline-`const` repeat expression so
+    // `CELLS` is the only place the length lives: the previous hand-written expansion had to
+    // be grown by hand every time `REASONS` gained a variant, and the comment saying so was
+    // the only thing enforcing it. `const { ... }` sidesteps the `AtomicU64: !Copy` problem
+    // that forced the expansion, and — unlike a `const ZERO` item — does not trip
+    // `clippy::declare_interior_mutable_const`.
     const fn new() -> Self {
-        Self([
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-        ])
+        Self([const { AtomicU64::new(0) }; Self::CELLS])
     }
 
     fn idx(class_label: &str, reason_label: &str) -> usize {
@@ -705,6 +678,7 @@ pub(crate) fn classify(
     lane_status: crate::envelope::LaneStatus,
     census_result: &CensusResult,
     ledger: &LedgerClosure,
+    mandatory_missing: u64,
 ) -> CompletenessClass {
     use crate::envelope::LaneStatus;
     use crate::planner::PlannerDecision;
@@ -720,6 +694,14 @@ pub(crate) fn classify(
     } else if lane_status == LaneStatus::Failed {
         CompletenessClass::CannotEstablish {
             reason: CannotEstablishReason::LaneFailed,
+        }
+    } else if mandatory_missing > 0 {
+        // card 22c review debt: an unmet Mandatory obligation moves `completeness`, it is not
+        // just a count in the handoff. Placed **before** the planner leg on purpose — the
+        // planner's own verdict is about the predicate, and a sound predicate over a short
+        // Mandatory context is still an answer nobody can establish.
+        CompletenessClass::CannotEstablish {
+            reason: CannotEstablishReason::MandatoryNotSatisfied,
         }
     } else {
         match planner_output {
@@ -745,8 +727,15 @@ pub fn classify_for_witness(
     lane_status: crate::envelope::LaneStatus,
     census_result: &CensusResult,
     ledger: &LedgerClosure,
+    mandatory_missing: u64,
 ) -> (&'static str, &'static str) {
-    let class = classify(planner_output, lane_status, census_result, ledger);
+    let class = classify(
+        planner_output,
+        lane_status,
+        census_result,
+        ledger,
+        mandatory_missing,
+    );
     class.wire_labels()
 }
 
@@ -781,7 +770,7 @@ mod tests {
             );
             seen.insert(idx);
         }
-        // 十个 CannotEstablish reason 逐个走一遍。少一个变体这里就少一个 idx，
+        // 十一个 CannotEstablish reason 逐个走一遍。少一个变体这里就少一个 idx，
         // 而 REASONS 与数组长度对不上时 `idx()` 会直接 panic。
         for reason in [
             CannotEstablishReason::LedgerNotClosed,
@@ -794,6 +783,7 @@ mod tests {
             CannotEstablishReason::CountUnknown,
             CannotEstablishReason::CountScopeMismatch,
             CannotEstablishReason::PipelineCountMismatch,
+            CannotEstablishReason::MandatoryNotSatisfied,
         ] {
             let (c, r) = CompletenessClass::CannotEstablish { reason }.wire_labels();
             let idx = CompletenessTotal::idx(c, r);
@@ -806,8 +796,8 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            13,
-            "十三个 (class, reason) 组合应当落在十三个不同的格子里"
+            14,
+            "十四个 (class, reason) 组合应当落在十四个不同的格子里"
         );
     }
 
@@ -881,6 +871,7 @@ mod tests {
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
             &broken_ledger(),
+            0,
         );
         assert_eq!(
             class,
@@ -897,6 +888,7 @@ mod tests {
             LaneStatus::Ok,
             &CensusResult::failed(),
             &closed_ledger(),
+            0,
         );
         assert_eq!(
             class,
@@ -913,9 +905,59 @@ mod tests {
             LaneStatus::Failed,
             &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
+            0,
         );
         assert_eq!(
             class,
+            CompletenessClass::CannotEstablish {
+                reason: CannotEstablishReason::LaneFailed
+            }
+        );
+    }
+
+    /// card 22c review debt: an unmet Mandatory obligation moves `completeness`, and it is
+    /// read **before** the planner leg — a planner verdict that would otherwise have said
+    /// `exact` or `semantic_bounded` does not get to speak over a short Mandatory context.
+    ///
+    /// Fault injection: delete the `mandatory_missing > 0` branch in `classify()` and both
+    /// halves go red (the `Enumerate` case falls back to `Exact`, the `Class` case to
+    /// `SemanticBounded`) — which is exactly the silent shape this branch exists to stop.
+    #[test]
+    fn unmet_mandatory_obligation_yields_cannot_establish_ahead_of_the_planner_leg() {
+        for decision in [
+            PlannerDecision::Enumerate {
+                predicate_id: "rejected_decisions_v1".to_string(),
+            },
+            PlannerDecision::Class(QueryClass::Semantic),
+        ] {
+            let class = classify(
+                &decision,
+                LaneStatus::Ok,
+                &CensusResult::ok_without_enumeration(),
+                &closed_ledger(),
+                1,
+            );
+            assert_eq!(
+                class,
+                CompletenessClass::CannotEstablish {
+                    reason: CannotEstablishReason::MandatoryNotSatisfied
+                },
+                "{decision:?} with mandatory_missing=1 must not claim an establishable answer"
+            );
+            assert_eq!(
+                class.wire_labels(),
+                ("cannot_establish", "mandatory_not_satisfied")
+            );
+        }
+        // The four §22.4 triggers still win: they describe a broken run, this one a short one.
+        assert_eq!(
+            classify(
+                &PlannerDecision::Class(QueryClass::Semantic),
+                LaneStatus::Failed,
+                &CensusResult::ok_without_enumeration(),
+                &closed_ledger(),
+                1,
+            ),
             CompletenessClass::CannotEstablish {
                 reason: CannotEstablishReason::LaneFailed
             }
@@ -931,6 +973,7 @@ mod tests {
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
+            0,
         );
         assert_eq!(
             class,
@@ -949,6 +992,7 @@ mod tests {
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
+            0,
         );
         assert_eq!(class, CompletenessClass::Exact);
     }
@@ -962,6 +1006,7 @@ mod tests {
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
+            0,
         );
         assert_eq!(class, CompletenessClass::Exact);
     }
@@ -975,6 +1020,7 @@ mod tests {
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
+            0,
         );
         assert_eq!(class, CompletenessClass::SemanticBounded);
     }
@@ -994,6 +1040,7 @@ mod tests {
             LaneStatus::Ok,
             &census,
             &closed_ledger(),
+            0,
         );
         assert_eq!((class_label, reason_label), ("exact", "none"));
         assert!(take_final_record_trace().is_empty());

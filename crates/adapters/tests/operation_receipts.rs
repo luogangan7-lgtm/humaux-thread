@@ -711,7 +711,7 @@ fn physical_evidence_deletion_keeps_nonreplayable_receipt_tombstone() {
 }
 
 #[test]
-#[ignore = "exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green"]
+#[ignore = "lane(c) exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green"]
 fn receipt_insert_lock_past_token_deadline_rolls_back_business_bmo_audit_and_receipt() {
     run_db_fixture::<Fixture, _>(
         "receipt_insert_lock_past_token_deadline_rolls_back_business_bmo_audit_and_receipt",
@@ -728,7 +728,7 @@ fn receipt_insert_lock_past_token_deadline_rolls_back_business_bmo_audit_and_rec
 }
 
 #[test]
-#[ignore = "exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green"]
+#[ignore = "lane(c) exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green"]
 fn receipt_insert_lock_past_reservation_deadline_rolls_back_while_token_is_valid() {
     run_db_fixture::<Fixture, _>(
         "receipt_insert_lock_past_reservation_deadline_rolls_back_while_token_is_valid",
@@ -745,7 +745,7 @@ fn receipt_insert_lock_past_reservation_deadline_rolls_back_while_token_is_valid
 }
 
 #[test]
-#[ignore = "exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green"]
+#[ignore = "lane(c) exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green"]
 fn concurrent_same_key_never_commits_two_business_or_bmo_rows() {
     run_db_fixture::<Fixture, _>(
         "concurrent_same_key_never_commits_two_business_or_bmo_rows",

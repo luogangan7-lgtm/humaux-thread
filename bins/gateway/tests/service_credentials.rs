@@ -41,6 +41,21 @@ fn setup_failed<T>(_: T) -> DbFixtureSkipReason {
     DbFixtureSkipReason::IsolationSetupFailed("service credential fixture setup failed".into())
 }
 
+/// ADR-0047 D-D: the fixture's target is whatever `HUMAUX_TEST_PG_DSN` names — the repo-wide
+/// isolated test database (§79.2), which under `cargo xtask serial-lane` is a per-run
+/// provisioned one — and every role DSN must name that same database. The machine-local
+/// `61719 / FIXTURE_DB` pair stays an accepted legacy target.
+///
+/// Pinning *only* that pair made every test in this file report `IsolationSetupFailed` on any
+/// standard node, which under `HUMAUX_REQUIRE_DB=1` is a fail and otherwise a printed SKIP —
+/// a whole file of false green. The identical rule already landed in
+/// `crates/adapters/tests/support/operation_receipt_fixture.rs` and `g80_31_handoff.rs`; this
+/// is a read of that rule, not a second one.
+fn same_target(role: &PgConnectOptions, owner: &PgConnectOptions) -> bool {
+    (role.get_port() == 61719 && role.get_database() == Some(FIXTURE_DB))
+        || (role.get_port() == owner.get_port() && role.get_database() == owner.get_database())
+}
+
 fn db_ok<T>(result: Result<T, postgres::Error>) -> T {
     result.unwrap_or_else(|error| {
         panic!(
@@ -75,11 +90,7 @@ impl DbIntegrationFixture for CredentialFixture {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
         let options = PgConnectOptions::from_str(&dsn).map_err(setup_failed)?;
-        if options.get_host() != "127.0.0.1"
-            || options.get_port() != 61719
-            || options.get_database() != Some(FIXTURE_DB)
-            || dsn.contains(['?', '#'])
-        {
+        if options.get_host() != "127.0.0.1" || dsn.contains(['?', '#']) {
             return Err(setup_failed(()));
         }
         let mut admin = Client::connect(&dsn, NoTls).map_err(setup_failed)?;
@@ -87,15 +98,14 @@ impl DbIntegrationFixture for CredentialFixture {
             .query_one("SELECT current_database()", &[])
             .map_err(setup_failed)?
             .get(0);
-        if actual_db != FIXTURE_DB {
+        if options.get_database() != Some(actual_db.as_str()) {
             return Err(setup_failed(()));
         }
         let gateway_dsn = std::env::var("HUMAUX_GATEWAY_PG_DSN").map_err(setup_failed)?;
         let gateway_options = PgConnectOptions::from_str(&gateway_dsn).map_err(setup_failed)?;
         if gateway_options.get_username() != "role_gateway"
             || gateway_options.get_host() != "127.0.0.1"
-            || gateway_options.get_port() != 61719
-            || gateway_options.get_database() != Some(FIXTURE_DB)
+            || !same_target(&gateway_options, &options)
             || gateway_dsn.contains(['?', '#'])
         {
             return Err(setup_failed(()));
@@ -219,7 +229,7 @@ impl Handle {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL fixture with migration 0112"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL fixture with migration 0112"]
 fn legacy_and_wrong_hmac_credentials_are_inert_without_usage_writes() {
     run_db_fixture::<CredentialFixture, _>("legacy and HMAC rejection", |mut f| {
         let legacy = f.key(None, None, None);
@@ -239,7 +249,7 @@ fn legacy_and_wrong_hmac_credentials_are_inert_without_usage_writes() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL fixture with migration 0112"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL fixture with migration 0112"]
 fn valid_machine_and_pat_scopes_come_only_from_database_bindings() {
     run_db_fixture::<CredentialFixture, _>("machine and PAT bindings", |mut f| {
         let machine = f.key(None, Some(f.workspace), Some(1));
@@ -280,7 +290,7 @@ fn valid_machine_and_pat_scopes_come_only_from_database_bindings() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL fixture with migration 0112"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL fixture with migration 0112"]
 fn missing_unknown_scopes_and_workspace_expansion_fail_closed() {
     run_db_fixture::<CredentialFixture, _>("scope and workspace rejection", |mut f| {
         let key = f.key(None, Some(f.workspace), Some(1));
@@ -313,7 +323,7 @@ fn missing_unknown_scopes_and_workspace_expansion_fail_closed() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL fixture with migration 0112"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL fixture with migration 0112"]
 fn each_request_checks_key_lifecycle_expiry_revocation_and_cidr() {
     run_db_fixture::<CredentialFixture, _>("live key lifecycle", |mut f| {
         let key = f.key(None, None, Some(1));
@@ -353,9 +363,23 @@ fn each_request_checks_key_lifecycle_expiry_revocation_and_cidr() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL fixture with migration 0112"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL fixture with migration 0112"]
 fn each_request_rechecks_live_accounts_membership_and_security_epochs() {
     run_db_fixture::<CredentialFixture, _>("live grant revalidation", |mut f| {
+        // §6.1.1 / migration 0162 (ADR-0035): a tenant membership no longer fans out to every
+        // workspace, and `credential_repo::load_live_workspace_ids` re-reads the on-behalf-of
+        // user's live ACTIVE `control.workspace_memberships` set on every request — so a key
+        // bound to BOTH a user and a workspace authenticates only if this row exists. It is
+        // seeded here and not in the fixture on purpose: the PAT oracle in
+        // `valid_machine_and_pat_scopes_come_only_from_database_bindings` pins that a user with
+        // no workspace membership has an empty ceiling, and that is the same row read from the
+        // other side.
+        db_ok(f.admin.execute(
+            "INSERT INTO control.workspace_memberships \
+             (tenant_id, workspace_id, user_id, role, state) \
+             VALUES ($1, $2, $3, 'MEMBER', 'ACTIVE')",
+            &[&f.tenant, &f.workspace, &f.user],
+        ));
         let key = f.key(Some(f.user), Some(f.workspace), Some(1));
         assert!(f.authenticate(&key).is_ok());
         for (invalid, reset, id) in [
@@ -413,7 +437,7 @@ fn each_request_rechecks_live_accounts_membership_and_security_epochs() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL fixture with migration 0112"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL fixture with migration 0112"]
 fn database_rejects_null_version_partial_bindings_and_cross_tenant_workspace() {
     run_db_fixture::<CredentialFixture, _>("binding constraints", |mut f| {
         let key = f.key(None, None, Some(1));
@@ -452,7 +476,7 @@ fn database_rejects_null_version_partial_bindings_and_cross_tenant_workspace() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL fixture with migration 0112"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL fixture with migration 0112"]
 fn credential_lookup_is_gateway_only_and_direct_table_reads_stay_rls_scoped() {
     run_db_fixture::<CredentialFixture, _>("credential role boundary", |mut f| {
         let key = f.key(None, None, Some(1));
@@ -513,7 +537,7 @@ fn guc_state(client: &mut Client) -> (Option<String>, Option<String>) {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL fixture with migration 0112"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL fixture with migration 0112"]
 fn bootstrap_ignores_forged_gucs_and_touch_changes_only_one_row_timestamp() {
     run_db_fixture::<CredentialFixture, _>("bootstrap GUC and touch boundary", |mut f| {
         let target = f.key(Some(f.user), Some(f.workspace), Some(1));

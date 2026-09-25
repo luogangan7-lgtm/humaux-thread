@@ -140,6 +140,7 @@ fn final_labels(
             provenance: &provenance(&request),
             visible: Some(visible),
             context: None,
+            mandatory_missing: 0,
         },
         |outcome| Ok(outcome),
     )
@@ -163,6 +164,7 @@ fn final_labels(
         Some(CannotEstablishReasonWire::CountUnknown) => "count_unknown",
         Some(CannotEstablishReasonWire::CountScopeMismatch) => "count_scope_mismatch",
         Some(CannotEstablishReasonWire::PipelineCountMismatch) => "pipeline_count_mismatch",
+        Some(CannotEstablishReasonWire::MandatoryNotSatisfied) => "mandatory_not_satisfied",
     };
     (class, reason)
 }
@@ -277,7 +279,8 @@ fn component_witness_labels_do_not_increment_final_metric() {
             request.planner_decision(),
             LaneStatus::Ok,
             &census,
-            &ledger::close(closed_ledger())
+            &ledger::close(closed_ledger()),
+            0
         ),
         ("exact", "none")
     );
@@ -299,7 +302,8 @@ fn predicate_not_enumerable_is_component_visible_but_not_metric_emittable() {
             request.planner_decision(),
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
-            &ledger::close(closed_ledger())
+            &ledger::close(closed_ledger()),
+            0
         ),
         ("cannot_establish", "predicate_not_enumerable")
     );

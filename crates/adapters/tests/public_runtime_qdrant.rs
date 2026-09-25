@@ -2,6 +2,8 @@
 
 #[path = "support/contribution_fixture.rs"]
 mod contribution_fixture;
+#[path = "support/public_anonymous_seam.rs"]
+mod public_anonymous_seam;
 #[path = "support/public_qdrant_fixture.rs"]
 mod public_qdrant_fixture;
 
@@ -14,33 +16,18 @@ use humaux_adapters::{
     public_projection::PublicProjectionAdapter,
     public_repo::{self, ProjectionIdentity},
 };
-use humaux_domain::public::ModerationState;
 use humaux_infra_cell::{IntraCellHttpTransport, IntraCellMethod, IntraCellRequest};
+use public_anonymous_seam::{
+    admit_assessed_release, drain_anonymous_queue, dsn_as_role, evaluate_anonymous_supported,
+    job_status, seed_project_job,
+};
 use public_qdrant_fixture::{create_collection, delete_collection, setup};
 use uuid::Uuid;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-fn dsn_as_role(dsn: &str, role: &str) -> String {
-    let sep = if dsn.contains('?') { '&' } else { '?' };
-    format!("{dsn}{sep}options=-c%20role%3D{role}")
-}
-
-fn approve_supported(
-    fixture: &mut ContributionFixture,
-    public: &PublicWorkerDbPool,
-    claim_id: Uuid,
-    expected_revision: i64,
-) -> (public_repo::EvaluationResult, String, [u8; 32]) {
-    fixture
-        .admin
-        .execute(
-            "INSERT INTO control.public_moderator_grants(user_id,grant_version,enabled) \
-             VALUES($1,1,true) ON CONFLICT(user_id) DO UPDATE \
-             SET grant_version=EXCLUDED.grant_version,enabled=EXCLUDED.enabled",
-            &[&fixture.auth.user_id().expect("fixture user").0],
-        )
-        .expect("active global moderator grant");
+/// Reads the exact body the projection is keyed on, plus its SHA-256, as the moderator saw it.
+fn canonical_body(fixture: &mut ContributionFixture, claim_id: Uuid) -> (String, [u8; 32]) {
     let row = fixture
         .admin
         .query_one(
@@ -49,33 +36,50 @@ fn approve_supported(
             &[&claim_id],
         )
         .expect("current public body");
-    let canonical_body: String = row.get(0);
     let hash: Vec<u8> = row.get(1);
-    let body_sha256: [u8; 32] = hash.clone().try_into().expect("SHA-256 length");
-    let evaluation = fixture
-        .rt
-        .block_on(public_repo::evaluate_claim(
-            public,
-            &fixture.auth,
-            &public_repo::EvaluateClaim {
-                claim_id,
-                expected_revision,
-                expected_body_sha256: &hash,
-                policy_version: "public-runtime-qdrant-v1",
-                rationale: "authenticated real-PG moderator evaluation",
-                target_state: ModerationState::Supported,
-            },
-        ))
-        .expect("supported evaluation");
-    (evaluation, canonical_body, body_sha256)
+    (row.get(0), hash.try_into().expect("SHA-256 length"))
 }
 
-/// A real authenticated release becomes eligible, is projected once through the typed worker,
-/// then is immediately excluded by the revoke fact before consumption. The subsequent bounded
-/// consumer writes a permanent tombstone; a delayed old LIVE cannot resurrect it.
+/// Reads one Qdrant point's `projection_live` flag straight out of the collection.
+fn projection_live(
+    fixture: &ContributionFixture,
+    qdrant: &public_qdrant_fixture::PublicQdrantFixture,
+    point: Uuid,
+) -> Option<serde_json::Value> {
+    fixture
+        .rt
+        .block_on(qdrant.transport.execute(
+            &qdrant.permit,
+            IntraCellRequest {
+                method: IntraCellMethod::Get,
+                path: format!("/collections/{}/points/{point}", qdrant.collection),
+                json_body: None,
+                headers: Vec::new(),
+            },
+        ))
+        .expect("point readback")
+        .json_body
+        .as_ref()
+        .and_then(|value| value.pointer("/result/payload/projection_live"))
+        .cloned()
+}
+
+/// A real assessed release is admitted on the **anonymous** seam, read back through
+/// `control.anonymous_source_lineage`, evaluated SUPPORTED by the protected anonymous evaluator,
+/// then projected once through the typed worker. The revoke fact excludes it from strict
+/// hydration before the dispatch is consumed; consuming it writes a permanent tombstone, and a
+/// delayed old LIVE write cannot resurrect it.
+///
+/// This oracle used to run on the tenant-scoped path (`admit_release` as `role_public_worker` ->
+/// `drain_outbox` -> `run_once`). Migration `0124_phase9_independence_attestation:233` REVOKEd
+/// that role's `SELECT` on `staging.contribution_releases` on purpose — the fence
+/// `public_runtime.rs::legacy_release_admission_is_fenced_from_protected_rows` pins — so the
+/// oracle was pinning a path the product had retired. Admission and evaluation now go through
+/// the live anonymous seam; *projection* stays tenant-scoped because it reads only
+/// `public.eligible_objects`, which carries no contributor or release link.
 #[test]
-#[ignore = "pins the retired tenant-scoped public runtime (admit_release as role_public_worker -> drain_outbox(tenant) -> run_once(tenant)); 0124 fenced that path on purpose (see public_runtime.rs legacy_release_admission_is_fenced_from_protected_rows) and the live seam is run_anonymous_once. Rewrite this Qdrant tombstone oracle onto the anonymous seam — card 23 (stale/ignored lane); disposition recorded in ADR-0036 main-line dispositions"]
-#[allow(clippy::too_many_lines)] // One end-to-end oracle keeps authenticated release, PG revoke fence, and Qdrant tombstone causally ordered.
+#[ignore = "lane(a:qdrant) needs a per-run database and the same-cell Qdrant at HUMAUX_TEST_QDRANT_PORT; admission runs on the anonymous seam (0124 fenced the tenant-scoped path)"]
+#[allow(clippy::too_many_lines)] // One end-to-end oracle keeps anonymous admission, PG revoke fence, and Qdrant tombstone causally ordered.
 fn supported_projection_revoke_fences_hydrate_and_tombstones_old_live() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(qdrant) = setup() else {
@@ -93,21 +97,28 @@ fn supported_projection_revoke_fences_hydrate_and_tombstones_old_live() {
     let adapter =
         PublicProjectionAdapter::new(&qdrant.transport, &qdrant.permit, &qdrant.collection)
             .expect("public projection adapter");
-    let release = fixture.finalize_release();
-    let admitted = fixture
-        .rt
-        .block_on(public_repo::admit_release(
-            &public,
-            fixture.auth.tenant_id(),
-            release,
-        ))
-        .expect("public admission");
-    let (evaluation, canonical_body, body_sha256) = approve_supported(
-        &mut fixture,
-        &public,
-        admitted.claim_id,
-        admitted.object_revision,
+
+    let admitted = admit_assessed_release(&mut fixture, &public, "public-runtime-qdrant-admit");
+    let lineage: i64 = fixture
+        .admin
+        .query_one(
+            "SELECT count(*) FROM control.anonymous_source_lineage \
+             WHERE contribution_release_id=$1 AND anonymous_source_id=$2",
+            &[&admitted.release_id, &admitted.source_id],
+        )
+        .expect("anonymous lineage read-back")
+        .get(0);
+    assert_eq!(
+        lineage, 1,
+        "the release reaches the public tier only through the protected lineage row"
     );
+    // Admission enqueues its own projection dispatch, pinned to the pre-evaluation revision.
+    // Consume it before the evaluation so the revoke half below counts only its own dispatches.
+    drain_anonymous_queue(&fixture, &public, "public-runtime-qdrant-admit-projection");
+
+    let evaluation =
+        evaluate_anonymous_supported(&mut fixture, admitted.claim_id, admitted.object_revision);
+    let (body, body_sha256) = canonical_body(&mut fixture, admitted.claim_id);
     let identity = ProjectionIdentity {
         object_id: admitted.claim_id,
         object_kind: "CLAIM".to_owned(),
@@ -115,16 +126,11 @@ fn supported_projection_revoke_fences_hydrate_and_tombstones_old_live() {
         evaluation_id: evaluation.evaluation_id,
         body_sha256,
     };
-    assert_eq!(
-        fixture
-            .rt
-            .block_on(public_repo::drain_outbox(
-                &public,
-                fixture.auth.tenant_id(),
-                8
-            ))
-            .expect("dispatch admission and evaluation"),
-        3
+    let job = seed_project_job(
+        &mut fixture,
+        admitted.claim_id,
+        evaluation.object_revision,
+        &format!("public-runtime-qdrant-live-{}", Uuid::now_v7()),
     );
     assert_eq!(
         fixture
@@ -137,11 +143,13 @@ fn supported_projection_revoke_fences_hydrate_and_tombstones_old_live() {
                 &adapter,
             ))
             .expect("bounded live projection"),
-        3
+        1
     );
+    assert_eq!(job_status(&mut fixture, job), "DONE");
+
     let queried_live = fixture
         .rt
-        .block_on(adapter.query_live(&canonical_body, NonZeroU32::new(8).unwrap()))
+        .block_on(adapter.query_live(&body, NonZeroU32::new(8).unwrap()))
         .expect("production public query");
     assert_eq!(queried_live.len(), 1);
     assert_eq!(queried_live[0].identity, identity);
@@ -156,37 +164,24 @@ fn supported_projection_revoke_fences_hydrate_and_tombstones_old_live() {
             .is_some()
     );
     let point = queried_live[0].point_id;
-    let live = fixture
-        .rt
-        .block_on(qdrant.transport.execute(
-            &qdrant.permit,
-            IntraCellRequest {
-                method: IntraCellMethod::Get,
-                path: format!("/collections/{}/points/{point}", qdrant.collection),
-                json_body: None,
-                headers: Vec::new(),
-            },
-        ))
-        .expect("live point readback");
     assert_eq!(
-        live.json_body
-            .as_ref()
-            .and_then(|v| v.pointer("/result/payload/projection_live")),
-        Some(&serde_json::json!(true))
+        projection_live(&fixture, &qdrant, point),
+        Some(serde_json::json!(true))
     );
+
     assert!(
         fixture
             .rt
             .block_on(contribution_repo::revoke_release(
                 &fixture.private,
                 fixture.auth.tenant_id(),
-                release,
+                admitted.release_id,
             ))
             .expect("private revoke")
     );
     let stale_candidates = fixture
         .rt
-        .block_on(adapter.query_live(&canonical_body, NonZeroU32::new(8).unwrap()))
+        .block_on(adapter.query_live(&body, NonZeroU32::new(8).unwrap()))
         .expect("stale physical candidate after revoke");
     assert_eq!(stale_candidates.len(), 1);
     assert!(
@@ -203,74 +198,35 @@ fn supported_projection_revoke_fences_hydrate_and_tombstones_old_live() {
     assert_eq!(
         fixture
             .rt
-            .block_on(public_repo::drain_outbox(
+            .block_on(public_repo::run_anonymous_once(
                 &public,
-                fixture.auth.tenant_id(),
-                8
-            ))
-            .expect("dispatch revoke"),
-        1
-    );
-    assert_eq!(
-        fixture
-            .rt
-            .block_on(public_repo::run_once(
-                &public,
-                fixture.auth.tenant_id(),
                 "public-runtime-qdrant-revoke",
                 8,
-                &adapter
+                &adapter,
             ))
-            .expect("apply revoke"),
+            .expect("apply anonymous revoke"),
         1
     );
     assert_eq!(
         fixture
             .rt
-            .block_on(public_repo::drain_outbox(
+            .block_on(public_repo::run_anonymous_once(
                 &public,
-                fixture.auth.tenant_id(),
-                8
-            ))
-            .expect("dispatch tombstone"),
-        1
-    );
-    assert_eq!(
-        fixture
-            .rt
-            .block_on(public_repo::run_once(
-                &public,
-                fixture.auth.tenant_id(),
                 "public-runtime-qdrant-tombstone",
                 8,
-                &adapter
+                &adapter,
             ))
             .expect("apply tombstone"),
         1
     );
-    let retired = fixture
-        .rt
-        .block_on(qdrant.transport.execute(
-            &qdrant.permit,
-            IntraCellRequest {
-                method: IntraCellMethod::Get,
-                path: format!("/collections/{}/points/{point}", qdrant.collection),
-                json_body: None,
-                headers: Vec::new(),
-            },
-        ))
-        .expect("tombstone readback");
     assert_eq!(
-        retired
-            .json_body
-            .as_ref()
-            .and_then(|v| v.pointer("/result/payload/projection_live")),
-        Some(&serde_json::json!(false))
+        projection_live(&fixture, &qdrant, point),
+        Some(serde_json::json!(false))
     );
     assert!(
         fixture
             .rt
-            .block_on(adapter.query_live(&canonical_body, NonZeroU32::new(8).unwrap()))
+            .block_on(adapter.query_live(&body, NonZeroU32::new(8).unwrap()))
             .expect("query after permanent tombstone")
             .is_empty()
     );
@@ -282,7 +238,7 @@ fn supported_projection_revoke_fences_hydrate_and_tombstones_old_live() {
                 admitted.claim_id,
                 evaluation.object_revision,
                 evaluation.evaluation_id,
-                &canonical_body
+                &body,
             ))
             .expect("delayed old live readback")
             .superseded

@@ -285,7 +285,7 @@ fn attest(
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0124"]
+#[ignore = "lane(a:disposable) needs a per-run database migrated through 0124: it claims from the GLOBAL ops.public_anonymous_dispatches queue, so a shared database hands it a dispatch an earlier run left PROCESSING"]
 #[allow(
     clippy::too_many_lines,
     reason = "one acceptance fixture covers aggregate independence and exactly-once behavior"

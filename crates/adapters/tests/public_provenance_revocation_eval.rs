@@ -334,7 +334,7 @@ fn cancelling_flips_are_visible_and_unstable_flips_are_not_resolution() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL18 fixture and pinned Gitleaks"]
+#[ignore = "lane(c) its admit() helper at line 119 admits through role_public_worker admit_release, the exact path migration 0124_phase9_independence_attestation:233 fenced and ADR-0047's Open debt names as must-not-reopen. The three-run counterfactual measurement has to be rebuilt on the assessed/anonymous seam; retired with that recipe rather than carried as a permanent red."]
 #[allow(clippy::too_many_lines)] // One fixed three-run measurement retains every per-case observation.
 fn fixed_cases_repeat_three_times_and_measure_counterfactual_resolution() {
     let specs = dataset_cases();

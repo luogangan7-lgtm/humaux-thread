@@ -71,7 +71,7 @@ fn assert_shadow_red(db: &mut impl GenericClient, domain: &Uuid) {
 /// The R2 test is intentionally SQL-level: the migration owner's explicit procedure is
 /// the only bootstrap writer and the resolver must remain deterministic/no-egress.
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0129"]
+#[ignore = "lane(a:disposable) needs a per-run database migrated through 0129: control.bootstrap_contribution_deidentify_shadow walks EVERY control.user_reasoning_profiles row, so one legacy profile in a shared database is a 23514"]
 #[allow(
     clippy::too_many_lines,
     reason = "single integration scenario covers the complete shadow bootstrap contract"

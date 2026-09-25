@@ -170,7 +170,7 @@ fn expect_commit_check_failure(transaction: Transaction<'_>, context: &str) {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through 0126 and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through 0126 and pinned Gitleaks"]
 fn legal_assessed_finalize_and_legacy_expand_both_commit_with_acl_boundary() {
     let _serial = SERIAL.lock().expect("serial fixture");
     let mut fixture = ContributionFixture::new();
@@ -207,7 +207,7 @@ fn legal_assessed_finalize_and_legacy_expand_both_commit_with_acl_boundary() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through 0126 and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through 0126 and pinned Gitleaks"]
 #[allow(clippy::too_many_lines)] // Each mutation is one required binding-negative case.
 fn every_cross_row_mismatch_is_rejected() {
     let _serial = SERIAL.lock().expect("serial fixture");

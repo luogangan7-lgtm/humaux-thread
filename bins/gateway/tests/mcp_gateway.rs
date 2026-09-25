@@ -111,6 +111,7 @@ fn final_completeness_count() -> u64 {
         "count_unknown",
         "count_scope_mismatch",
         "pipeline_count_mismatch",
+        "mandatory_not_satisfied",
     ];
     [
         "exact",
@@ -1758,7 +1759,7 @@ fn native_mcp_gateway_real_auth_atomic_replay_and_fail_closed_acceptance() {
 }
 
 #[test]
-#[ignore = "requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+#[ignore = "lane(a:request_guard) requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
 #[allow(clippy::too_many_lines)] // Keep the real Gateway, Qdrant, PG and serving-race causal chain together.
 fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
     run_db_fixture::<Fixture, _>(
@@ -3135,7 +3136,7 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
 /// written as a literal — §78.1: a test that hard-codes the profile depth stops grading the
 /// profile the moment it moves.
 #[test]
-#[ignore = "requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+#[ignore = "lane(a:request_guard) requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
 #[allow(clippy::too_many_lines)] // One real-deployment fixture; splitting it would hide the causal chain.
 fn recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused() {
     run_db_fixture::<Fixture, _>(
@@ -8806,6 +8807,43 @@ fn native_mcp_memory_bind_task_and_facet_selector_exact_sets_acceptance() {
                 scoped["content"]["completeness"]["reason"], "lane_failed",
                 "{scoped}"
             );
+
+            // (d3) card 23 / ADR-0047: an unmet Mandatory obligation moves `completeness`.
+            // `reference` above is bound REFERENCE_ONLY, so it is nominated and rejected by
+            // name (MISSING_TASK_AUTHORIZATION) — the lane runs and comes back short. Before
+            // this the shortfall lived only in `counts.mandatory_missing` while the class still
+            // claimed a sound answer, which is why card 22c's own negative control could assert
+            // nothing stronger than `reason != "lane_failed"` above.
+            //
+            // Asserted as the implication in BOTH directions on the live envelope, on both
+            // assemble routes: dropping the `mandatory_missing > 0` branch in
+            // `retrieval::completeness::classify` reds the first half whenever the live lane is
+            // short, and a branch that fires on a full lane reds the second. A one-sided
+            // `if missing > 0 { … }` would be a gate that passes by not running.
+            for (label, envelope) in [("workspace", &value), ("task-scoped", &scoped)] {
+                let missing = envelope["handoff"]["counts"]["mandatory_missing"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("{label}: mandatory_missing must be a number: {envelope}"));
+                let class = envelope["content"]["completeness"]["class"].as_str();
+                let reason = envelope["content"]["completeness"]["reason"].as_str();
+                eprintln!(
+                    "card23 witness [{label}]: mandatory_missing={missing} class={class:?} reason={reason:?}"
+                );
+                if missing > 0 {
+                    assert_eq!(
+                        (class, reason),
+                        (Some("cannot_establish"), Some("mandatory_not_satisfied")),
+                        "{label}: {missing} unmet Mandatory obligation(s) but the envelope still                          claims an establishable answer: {envelope}"
+                    );
+                } else {
+                    assert_ne!(
+                        reason,
+                        Some("mandatory_not_satisfied"),
+                        "{label}: nothing is missing, so this reason must not be claimed: {envelope}"
+                    );
+                }
+            }
+
             let (status, unresolvable) = raw_request(
                 address,
                 &tool_call_headers("context", bearer),
@@ -10299,7 +10337,7 @@ fn percentile_p50(samples: &mut [Duration]) -> Duration {
 /// scope_kind, scope_id, operation, idempotency_key) — no `projection_version` — so pairs'
 /// replays never collide (ADR-0031 D-C, ADR-0032 D-C).
 #[test]
-#[ignore = "requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+#[ignore = "lane(a:request_guard) requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
 #[allow(clippy::too_many_lines)] // ADR-0031: one live oracle keeps three pairs, four routes, 18 interleaved tasks and the cross-pair/unprovisioned refusals causally ordered against ONE gateway process (same precedent as the real-Qdrant live test).
 fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
     let _metrics = CONTEXT_METRIC_TEST_LOCK

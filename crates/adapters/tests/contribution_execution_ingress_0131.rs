@@ -86,7 +86,7 @@ fn assert_conflict(
 }
 
 #[test]
-#[ignore = "requires disposable PostgreSQL 18 migrated through 0131"]
+#[ignore = "lane(a:shared_db) requires disposable PostgreSQL 18 migrated through 0131"]
 #[allow(clippy::too_many_lines)]
 fn production_core_is_atomic_v2_complete_and_v1_compatible() {
     if !require_db() {

@@ -309,6 +309,21 @@ fn workspace_shared_fixture() -> (ContributionFixture, Uuid, Uuid) {
         )
         .expect("workspace")
         .get(0);
+    // §6.1.1 / migration 0163: the WORKSPACE_SHARED arm requires an ACTIVE WorkspaceMembership
+    // for THAT workspace — an ACTIVE tenant membership is no longer enough (ADR-0035). Without
+    // this row the fixture's own owner cannot read what it just shared, so both oracles below
+    // fail before reaching the reservation behaviour they measure. Written here as the
+    // superuser owner; the runtime write path is control.set_workspace_membership.
+    fixture
+        .admin
+        .execute(
+            "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
+             SELECT $1,$2,domain.owner_user_id,'MEMBER','ACTIVE' \
+             FROM control.private_reasoning_domains domain \
+             WHERE domain.reasoning_domain_id=$3",
+            &[&tenant, &workspace, &fixture.domain],
+        )
+        .expect("workspace membership for the reasoning domain owner");
     let other_tenant: Uuid = fixture
         .admin
         .query_one(
@@ -360,7 +375,7 @@ fn wait_for_advisory<T>(db: &mut Client, application_name: &str, worker: &thread
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0133"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0133"]
 fn workspace_authority_change_waits_for_reservation_and_then_fails_closed() {
     let (mut fixture, workspace, other_tenant) = workspace_shared_fixture();
     let (reserved, reserved_attempt, reserved_route) =
@@ -394,6 +409,17 @@ fn workspace_authority_change_waits_for_reservation_and_then_fails_closed() {
             )
             .expect("tag workspace mutation");
         started_tx.send(()).expect("announce workspace mutation");
+        // §6.1.1 / 0162: a WorkspaceMembership is tenant-scoped, and its (tenant_id,
+        // workspace_id) FK is `ON DELETE CASCADE` with no `ON UPDATE` action — so a workspace
+        // that leaves its tenant leaves its memberships behind. Dropping them is part of the
+        // drift this test simulates; without it the FK refuses the UPDATE outright and the
+        // oracle below never gets to measure anything.
+        client
+            .execute(
+                "DELETE FROM control.workspace_memberships WHERE workspace_id=$1",
+                &[&workspace],
+            )
+            .expect("the drifting workspace leaves its tenant-scoped memberships");
         client.execute(
             "UPDATE control.workspaces SET tenant_id=$2 WHERE workspace_id=$1",
             &[&workspace, &other_tenant],
@@ -423,7 +449,7 @@ fn workspace_authority_change_waits_for_reservation_and_then_fails_closed() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0133"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0133"]
 fn workspace_delete_waits_for_reservation_and_cannot_remove_referenced_authority() {
     let (mut fixture, workspace, _) = workspace_shared_fixture();
     let (reserved, attempt, route) = seed_ready(&mut fixture, "workspace-delete-lock-holder");
@@ -478,7 +504,7 @@ fn workspace_delete_waits_for_reservation_and_cannot_remove_referenced_authority
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0133"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0133"]
 #[allow(clippy::too_many_lines)] // One fixture proves the coupled route and no-mutation axes.
 fn reservation_authority_route_replay_and_exact_root_axes() {
     let mut fixture = ContributionFixture::new();
@@ -602,7 +628,7 @@ fn reservation_authority_route_replay_and_exact_root_axes() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0133"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0133"]
 #[allow(clippy::too_many_lines)] // One root-only PG regression keeps every V1 closure axis visible.
 fn root_closure_seal_rejects_backing_and_direct_source_drift_without_reservation() {
     let mut fixture = ContributionFixture::new();
@@ -1165,7 +1191,7 @@ fn database_dsn(base: &str, database: &str) -> String {
 }
 
 #[test]
-#[ignore = "creates and removes a disposable PostgreSQL 18 database"]
+#[ignore = "lane(a:disposable) creates and removes a disposable PostgreSQL 18 database"]
 fn cutover_nonterminal_precheck_is_atomic() {
     let base_dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL 18 DSN");
     let database = format!("humaux_0133_cutover_{}", Uuid::new_v4().simple());

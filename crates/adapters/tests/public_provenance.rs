@@ -414,7 +414,7 @@ impl Drop for UserRootFault<'_> {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL"]
+#[ignore = "lane(c) pins role_public_worker admit_release for an identity-bearing User root. Migration 0124_phase9_independence_attestation:233 REVOKEs SELECT ON staging.contribution_releases from role_public_worker on purpose, public_trust.rs pins that the same call must answer Forbidden (and passes), and ADR-0047's Open debt forbids re-opening it — the 0165 attempt was reverted as a lineage leak. Rebuild the typed-root / closure-depth / revocation oracle on admit_assessed_release + run_anonymous_once before restoring it."]
 #[allow(clippy::too_many_lines)] // One real-PG fixture establishes User, non-user, recursive, and fault boundaries.
 fn typed_roots_closure_depths_and_revocation_are_target_bound() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -684,7 +684,7 @@ fn typed_roots_closure_depths_and_revocation_are_target_bound() {
 }
 
 #[test]
-#[ignore = "requires the dedicated isolated provenance mutation database"]
+#[ignore = "lane(a:provenance_mutation) requires the dedicated isolated provenance mutation database"]
 fn damaged_user_root_without_release_is_detected_and_guard_restored() {
     assert_eq!(
         std::env::var("HUMAUX_PUBLIC_PROVENANCE_FAULT_DB").as_deref(),

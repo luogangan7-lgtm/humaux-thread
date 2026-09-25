@@ -205,7 +205,7 @@ fn seed_shadow_policy<C: GenericClient>(client: &mut C, lane: &RouteLane) -> Uui
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0128"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0128"]
 #[allow(
     clippy::too_many_lines,
     reason = "one integration scenario verifies the complete reasoning-route ownership and payer boundary"
@@ -1213,7 +1213,7 @@ fn user_reasoning_foundation_rejects_cross_owner_trust_and_payer_edges() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0128"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0128"]
 #[allow(
     clippy::too_many_lines,
     reason = "one concurrent integration scenario verifies version-spine and policy-candidate race safety"
@@ -1421,7 +1421,7 @@ fn version_spines_and_policy_candidate_freeze_are_race_safe() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0128"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0128"]
 fn route_foundation_tables_are_acl_protected_until_r2_activation() {
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL 18 DSN");
     let mut client = Client::connect(&dsn, NoTls).expect("isolated PostgreSQL 18");

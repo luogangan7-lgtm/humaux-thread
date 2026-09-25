@@ -43,6 +43,20 @@ fn setup_failed<T>(_: T) -> DbFixtureSkipReason {
     DbFixtureSkipReason::IsolationSetupFailed("quota fixture setup failed".into())
 }
 
+/// ADR-0047 D-D: the dedicated request-guard fixture is whatever `HUMAUX_TEST_PG_DSN` names —
+/// under `cargo xtask serial-lane` a per-run `humaux_thread_request_guard_<stamp>` database the
+/// lane provisions and migrates — and every role DSN must name that same database. The
+/// machine-local `61719 / FIXTURE_DB` pair stays an accepted legacy target.
+///
+/// Pinning *only* that pair made every test in this file report `IsolationSetupFailed` on any
+/// standard node: a printed SKIP, or a fail under `HUMAUX_REQUIRE_DB=1`. The identical rule
+/// already landed in `support/operation_receipt_fixture.rs` and `g80_31_handoff.rs`; this is a
+/// read of that rule, not a second one.
+fn same_target(role: &PgConnectOptions, owner: &PgConnectOptions) -> bool {
+    (role.get_port() == 61719 && role.get_database() == Some(FIXTURE_DB))
+        || (role.get_port() == owner.get_port() && role.get_database() == owner.get_database())
+}
+
 impl DbIntegrationFixture for Fixture {
     type Handle = Handle;
 
@@ -51,11 +65,7 @@ impl DbIntegrationFixture for Fixture {
         let owner_dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
         let options = PgConnectOptions::from_str(&owner_dsn).map_err(setup_failed)?;
-        if options.get_host() != "127.0.0.1"
-            || options.get_port() != 61719
-            || options.get_database() != Some(FIXTURE_DB)
-            || owner_dsn.contains(['?', '#'])
-        {
+        if options.get_host() != "127.0.0.1" || owner_dsn.contains(['?', '#']) {
             return Err(setup_failed(()));
         }
         let mut admin = Client::connect(&owner_dsn, NoTls).map_err(setup_failed)?;
@@ -105,10 +115,8 @@ impl DbIntegrationFixture for Fixture {
             || maintenance_options.get_username() != "role_maintenance"
             || gateway_options.get_host() != "127.0.0.1"
             || maintenance_options.get_host() != "127.0.0.1"
-            || gateway_options.get_port() != 61719
-            || maintenance_options.get_port() != 61719
-            || gateway_options.get_database() != Some(FIXTURE_DB)
-            || maintenance_options.get_database() != Some(FIXTURE_DB)
+            || !same_target(&gateway_options, &options)
+            || !same_target(&maintenance_options, &options)
             || gateway_dsn.contains(['?', '#'])
             || maintenance_dsn.contains(['?', '#'])
         {
@@ -264,7 +272,7 @@ fn change_period_end_preserving_start(handle: &mut Handle) {
 }
 
 #[test]
-#[ignore = "requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
+#[ignore = "lane(a:request_guard) requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
 fn concurrent_issuer_is_single_window_and_retry_does_not_rewrite_limit() {
     run_db_fixture::<Fixture, _>("quota_concurrent_issuer", |mut h| {
         snapshot(&mut h, TENANT_ID, 3);
@@ -315,7 +323,7 @@ fn concurrent_issuer_is_single_window_and_retry_does_not_rewrite_limit() {
 }
 
 #[test]
-#[ignore = "requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
+#[ignore = "lane(a:request_guard) requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
 fn concurrent_capacity_one_creates_one_and_same_request_is_idempotent() {
     run_db_fixture::<Fixture, _>("quota_concurrent_reservations", |mut h| {
         issue(&mut h, 1);
@@ -388,7 +396,7 @@ fn concurrent_capacity_one_creates_one_and_same_request_is_idempotent() {
 }
 
 #[test]
-#[ignore = "requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
+#[ignore = "lane(a:request_guard) requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
 fn issuer_is_projection_only_and_runtime_cannot_issue_or_insert_window() {
     run_db_fixture::<Fixture, _>("quota_issuer_projection_and_acl", |mut h| {
         assert!(
@@ -423,7 +431,7 @@ fn issuer_is_projection_only_and_runtime_cannot_issue_or_insert_window() {
 }
 
 #[test]
-#[ignore = "requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
+#[ignore = "lane(a:request_guard) requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
 fn reservation_capacity_replay_consumption_release_and_reap_are_terminal() {
     run_db_fixture::<Fixture, _>("quota_reservation_lifecycle", |mut h| {
         issue(&mut h, 1);
@@ -508,7 +516,7 @@ fn reservation_capacity_replay_consumption_release_and_reap_are_terminal() {
 }
 
 #[test]
-#[ignore = "requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
+#[ignore = "lane(a:request_guard) requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
 fn mismatched_replay_and_invalid_inputs_fail_closed() {
     run_db_fixture::<Fixture, _>("quota_argument_binding", |mut h| {
         issue(&mut h, 2);
@@ -564,7 +572,7 @@ fn mismatched_replay_and_invalid_inputs_fail_closed() {
 }
 
 #[test]
-#[ignore = "requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
+#[ignore = "lane(a:request_guard) requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
 fn rate_buckets_are_subject_scoped_and_quota_failure_does_not_refund_rate() {
     run_db_fixture::<Fixture, _>("rate_bucket_subjects", |mut h| {
         issue(&mut h, 0);
@@ -614,7 +622,7 @@ fn rate_buckets_are_subject_scoped_and_quota_failure_does_not_refund_rate() {
 }
 
 #[test]
-#[ignore = "requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
+#[ignore = "lane(a:request_guard) requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
 fn expired_reservation_is_reaped_without_charging() {
     run_db_fixture::<Fixture, _>("quota_expiry_reap", |mut h| {
         issue(&mut h, 1);

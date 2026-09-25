@@ -902,6 +902,7 @@ fn accept_memory_envelope<T>(
             provenance: &provenance,
             visible,
             context: None,
+            mandatory_missing: 0,
         },
         |final_outcome| {
             accept(Envelope {

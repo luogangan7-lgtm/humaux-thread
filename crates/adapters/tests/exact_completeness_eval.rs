@@ -520,7 +520,7 @@ fn component_exact_outcome(
     census: &CensusResult,
 ) -> Result<ComponentExactOutcome, String> {
     let (class_label, reason_label) =
-        classify_for_witness(decision, LaneStatus::Ok, census, &closed_ledger());
+        classify_for_witness(decision, LaneStatus::Ok, census, &closed_ledger(), 0);
     let exact = match (class_label, census.enumeration()) {
         ("exact", Some(enumeration)) => Some(component_exact_report(enumeration)),
         ("exact", None) => {

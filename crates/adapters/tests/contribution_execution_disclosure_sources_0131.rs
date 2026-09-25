@@ -169,7 +169,7 @@ fn assert_exact_sources(db: &mut Client, disclosure: Uuid, evidence: Uuid, memor
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0131"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0131"]
 #[allow(
     clippy::too_many_lines,
     reason = "single integration scenario covers atomic ordered disclosure"

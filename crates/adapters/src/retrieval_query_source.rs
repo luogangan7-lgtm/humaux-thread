@@ -417,7 +417,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use humaux_domain::egress::{self, ProcessorId};
@@ -430,18 +430,44 @@ mod tests {
     struct FakeScanner(PathBuf);
 
     impl FakeScanner {
+        /// One stable fake scanner per marker, kept beside the test binary under `target/` and
+        /// reused across runs instead of written fresh into `temp_dir()` every time.
+        ///
+        /// A newly created executable pays a macOS Gatekeeper/XProtect provenance assessment on
+        /// its first `exec`, inside `dyld` before `main` runs: sub-second on an idle box, and
+        /// measured at 32m15s on a busy one (ADR-0047). `seal()` probes the binary under the
+        /// production 2 s `LocalSecretScannerConfig.timeout`, so a per-test binary turned that
+        /// assessment into a `DependencyUnavailable` flake (cards 8 / 13 / 17). The production
+        /// timeout must not be widened (§79.2), so the fixture stops manufacturing the cost: the
+        /// file is rewritten only when its content changes, and any assessment it still owes is
+        /// paid by the unbounded warm `exec` below — never inside the timed probe.
         fn new(marker: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("humaux-query-scanner-{marker}-{}", Uuid::now_v7()));
             let script = format!(
                 "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then printf 'same-version\\n'; exit 0; fi\ncat >/dev/null\nexit 0\n# {marker}\n"
             );
-            fs::write(&path, script).expect("write fake scanner");
-            let mut permissions = fs::metadata(&path)
-                .expect("fake scanner metadata")
-                .permissions();
-            permissions.set_mode(0o700);
-            fs::set_permissions(&path, permissions).expect("make fake scanner executable");
+            let directory = std::env::current_exe()
+                .ok()
+                .and_then(|executable| executable.parent().map(Path::to_path_buf))
+                .unwrap_or_else(std::env::temp_dir);
+            let path = directory.join(format!("humaux-query-scanner-{marker}"));
+            if fs::read(&path).is_ok_and(|current| current == script.as_bytes()) {
+                // Byte-identical: reuse it, assessment included. Rewriting would forfeit both.
+            } else {
+                let staged =
+                    directory.join(format!("humaux-query-scanner-{marker}-{}", Uuid::now_v7()));
+                fs::write(&staged, &script).expect("write fake scanner");
+                let mut permissions = fs::metadata(&staged)
+                    .expect("fake scanner metadata")
+                    .permissions();
+                permissions.set_mode(0o700);
+                fs::set_permissions(&staged, permissions).expect("make fake scanner executable");
+                // Rename so a concurrent test process never execs a half-written script.
+                fs::rename(&staged, &path).expect("publish fake scanner");
+            }
+            let _ = std::process::Command::new(&path)
+                .arg("version")
+                .env_clear()
+                .output();
             Self(path)
         }
 
@@ -471,11 +497,9 @@ mod tests {
         }
     }
 
-    impl Drop for FakeScanner {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-        }
-    }
+    // No `Drop` that removes the file: deleting it is what forced the next run to create — and
+    // have macOS re-assess — a brand-new executable. It lives under `target/`, which `.gitignore`
+    // already covers and `cargo clean` reclaims.
 
     #[test]
     fn mixed_scanner_attestations_are_rejected_before_reserve() {

@@ -393,7 +393,7 @@ fn record_fault_evidence(
 }
 
 #[test]
-#[ignore = "requires disposable PostgreSQL 18 migrated through 0131"]
+#[ignore = "lane(a:shared_db) requires disposable PostgreSQL 18 migrated through 0131"]
 #[allow(clippy::too_many_lines)]
 fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
     if !require_db() {

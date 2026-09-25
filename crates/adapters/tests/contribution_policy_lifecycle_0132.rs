@@ -349,7 +349,7 @@ fn assert_pre0132_catalog_unchanged(db: &mut Client) {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated only through 0131"]
+#[ignore = "lane(a:pre_0132) requires a throwaway PostgreSQL 18 migrated only through 0131 (this test re-runs 0132 and requires its 55000 hard stop)"]
 fn pre_0132_unresolved_triples_hard_stop() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let Some(_dsn) = require_db("pre0132") else {
@@ -432,7 +432,7 @@ fn pre_0132_unresolved_triples_hard_stop() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0132"]
+#[ignore = "lane(a:post_0132) requires isolated PostgreSQL 18 migrated through 0132"]
 fn manifest_postcheck_is_one_boolean_true() {
     let Some(dsn) = require_db("post0132") else {
         return;
@@ -555,7 +555,7 @@ fn assert_idempotency_conflict(
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0132"]
+#[ignore = "lane(a:post_0132) requires isolated PostgreSQL 18 migrated through 0132"]
 fn same_key_replay_freezes_policy_authority() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let Some(_dsn) = require_db("post0132") else {
@@ -638,7 +638,7 @@ fn denied_role_probe(
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0132"]
+#[ignore = "lane(a:post_0132) requires isolated PostgreSQL 18 migrated through 0132"]
 fn runtime_roles_are_actually_denied_policy_mutation() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let Some(_dsn) = require_db("post0132") else {
@@ -723,7 +723,7 @@ fn assert_validated_exact_policy_fk(db: &mut Client, relation: &str, constraint:
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL 18 migrated through 0132 and pinned Gitleaks"]
+#[ignore = "lane(a:post_0132) requires isolated PostgreSQL 18 migrated through 0132 and pinned Gitleaks"]
 #[allow(clippy::too_many_lines)]
 fn exact_history_successor_concurrency_and_head_admission_hold() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());

@@ -89,19 +89,19 @@ fn race_input_change(change: &str) {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn concurrent_generic_grant_revocation_does_not_revoke_self_principal_finalize() {
     race_input_change("grant");
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn concurrent_backing_link_change_prevents_finalize() {
     race_input_change("backing");
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn direct_domain_owner_needs_no_headless_grant() {
     let mut f = ContributionFixture::new();
     f.admin
@@ -115,7 +115,7 @@ fn direct_domain_owner_needs_no_headless_grant() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL and pinned real Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL and pinned real Gitleaks"]
 fn valid_generic_grant_never_authorizes_delegated_contribution_entrypoints() {
     let mut f = ContributionFixture::new();
     let candidate = f.prepare();

@@ -3,6 +3,8 @@
 
 #[path = "support/contribution_fixture.rs"]
 mod contribution_fixture;
+#[path = "support/public_anonymous_seam.rs"]
+mod public_anonymous_seam;
 
 use std::{
     sync::{Arc, Mutex, mpsc},
@@ -18,40 +20,17 @@ use humaux_adapters::{
     postgres::{PublicWorkerDbPool, RuntimeDbPool},
     public_repo,
 };
-use humaux_application::{
-    consolidate::ProviderTraceRef,
-    contribute::{
-        self, ContributionAssessment, ContributionAssessmentRequest, ContributionCoverageProbe,
-        ContributionCoverageProbeRequest, ContributionGate, PublicCoverageDigest,
-        PublicCoveragePort, UserContributionAssessmentPort,
-    },
-};
-use humaux_domain::evidence::payload_sha256;
+use humaux_application::contribute;
 use humaux_domain::ids::TenantId;
 use humaux_domain::public::ModerationState;
 use postgres::{Client, NoTls};
-use sha2::Digest;
+use public_anonymous_seam::{
+    NoopProjector, admit_assessed_release, coverage_for_probe, drain_anonymous_queue, dsn_as_role,
+    evaluate_anonymous_supported, finalize_assessed_release, grant_moderator, job_status,
+    prepare_assessed_candidate, seed_project_job,
+};
 use sqlx::{Row, postgres::PgPoolOptions};
 use uuid::Uuid;
-
-struct UnusedProjector;
-
-#[async_trait]
-impl public_repo::PublicProjectionPort for UnusedProjector {
-    async fn project_live(
-        &self,
-        _: &public_repo::EligibleObject,
-    ) -> Result<public_repo::ProjectionWriteOutcome, humaux_domain::error::ErrorCode> {
-        Ok(public_repo::ProjectionWriteOutcome::Applied)
-    }
-
-    async fn retire(
-        &self,
-        _: &public_repo::ProjectionIdentity,
-    ) -> Result<(), humaux_domain::error::ErrorCode> {
-        Ok(())
-    }
-}
 
 struct RecordingProjector {
     live: Mutex<Vec<public_repo::ProjectionIdentity>>,
@@ -135,302 +114,11 @@ impl public_repo::PublicProjectionPort for BarrierProjector {
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-struct OfflineAssessmentReasoner;
-
-#[async_trait]
-impl UserContributionAssessmentPort for OfflineAssessmentReasoner {
-    async fn derive_coverage_probe(
-        &self,
-        request: ContributionCoverageProbeRequest,
-    ) -> Result<ContributionCoverageProbe, humaux_domain::error::ErrorCode> {
-        let probe = b"assessed public".to_vec();
-        ContributionCoverageProbe::new(
-            request.reasoning.input_manifest_hash,
-            probe.clone(),
-            payload_sha256(&probe),
-            ProviderTraceRef("offline-assessed-probe".into()),
-        )
-    }
-
-    async fn assess(
-        &self,
-        request: ContributionAssessmentRequest<'_>,
-    ) -> Result<ContributionAssessment, humaux_domain::error::ErrorCode> {
-        let candidate = b"Assessed public knowledge without identifying details.".to_vec();
-        let model_call_id = request
-            .reasoning
-            .contribution_attempt
-            .expect("sealed assessment attempt")
-            .logical_call_id
-            .0;
-        Ok(ContributionAssessment {
-            coverage_probe_sha256: request.coverage_probe.output_sha256(),
-            public_coverage_binding: request.public_coverage.binding(),
-            novelty: ContributionGate::Pass,
-            quality: ContributionGate::Pass,
-            generality: ContributionGate::Pass,
-            grounding: ContributionGate::Pass,
-            deidentified_candidate: humaux_application::consolidate::PrivateReasoningResult {
-                output_sha256: humaux_application::consolidate::ContentSha256(
-                    sha2::Sha256::digest(&candidate).into(),
-                ),
-                output_bytes: candidate,
-                provider_trace: ProviderTraceRef(model_call_id.to_string()),
-                model_call_id,
-                binding_id: request.reasoning.binding_id,
-                binding_version: request.reasoning.binding_version,
-            },
-        })
-    }
-}
-
-struct OfflineCoveragePort(PublicCoverageDigest);
-
-#[async_trait]
-impl PublicCoveragePort for OfflineCoveragePort {
-    async fn load_public_coverage(
-        &self,
-        _probe: &ContributionCoverageProbe,
-    ) -> Result<PublicCoverageDigest, humaux_domain::error::ErrorCode> {
-        Ok(self.0.clone())
-    }
-}
-
-fn coverage_for_probe(probe: &[u8]) -> PublicCoverageDigest {
-    let mut reader = Client::connect(
-        &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
-        NoTls,
-    )
-    .expect("isolated coverage reader");
-    let rows = reader
-        .query(
-            "SELECT snapshot_id,coverage_version,summary \
-             FROM public.phase9_public_coverage_for_probe($1,32)",
-            &[&probe],
-        )
-        .expect("private coverage contract");
-    let first = rows.first().expect("stable coverage row");
-    let snapshot_id: Uuid = first.get("snapshot_id");
-    let version: i32 = first.get("coverage_version");
-    let summaries = rows
-        .iter()
-        .filter_map(|row| row.get::<_, Option<String>>("summary"))
-        .collect();
-    PublicCoverageDigest::new(
-        snapshot_id,
-        u32::try_from(version).expect("positive version"),
-        summaries,
-    )
-    .expect("canonical current coverage")
-}
-
-fn prepare_assessed_candidate(
-    fixture: &ContributionFixture,
-) -> humaux_application::contribute::ContributionCandidateId {
-    fixture
-        .rt
-        .block_on(contribute::prepare_assessed(
-            fixture.request(),
-            &OfflineAssessmentReasoner,
-            &OfflineCoveragePort(coverage_for_probe(b"assessed public")),
-            &fixture.scanner(),
-            &humaux_adapters::contribution_entry_repo::ContributionEntryRepo::new(&fixture.private),
-        ))
-        .expect("assessed prepare")
-}
-
-fn finalize_assessed_release(fixture: &ContributionFixture) -> Uuid {
-    let candidate = prepare_assessed_candidate(fixture);
-    let confirmation = fixture.confirm(candidate);
-    fixture
-        .rt
-        .block_on(contribute::finalize(
-            confirmation,
-            &humaux_adapters::contribution_entry_repo::ContributionEntryRepo::new(&fixture.private),
-        ))
-        .expect("assessed finalize")
-        .0
-}
-
-fn drain_anonymous_queue(
-    fixture: &ContributionFixture,
-    public: &PublicWorkerDbPool,
-    lease_owner: &str,
-) {
-    loop {
-        let drained = fixture
-            .rt
-            .block_on(public_repo::run_anonymous_once(
-                public,
-                lease_owner,
-                64,
-                &UnusedProjector,
-            ))
-            .expect("drain prior global anonymous work");
-        if drained == 0 {
-            break;
-        }
-    }
-}
-
-fn admit_assessed_release(
-    fixture: &mut ContributionFixture,
-    public: &PublicWorkerDbPool,
-    lease_owner: &str,
-) -> public_repo::AdmittedRelease {
-    drain_anonymous_queue(fixture, public, lease_owner);
-    let release_id = finalize_assessed_release(fixture);
-    assert!(
-        fixture
-            .rt
-            .block_on(public_repo::run_anonymous_once(
-                public,
-                lease_owner,
-                64,
-                &UnusedProjector,
-            ))
-            .expect("anonymous assessed admission")
-            >= 1
-    );
-    let row = fixture
-        .admin
-        .query_one(
-            "SELECT source.source_id,claim.claim_id,claim.object_revision \
-             FROM public.sources source \
-             JOIN public.provenance_edges edge ON edge.source_id=source.source_id \
-             JOIN public.claims claim ON claim.claim_id=edge.claim_id \
-             JOIN control.anonymous_source_lineage lineage \
-               ON lineage.anonymous_source_id=source.source_id \
-             WHERE lineage.contribution_release_id=$1",
-            &[&release_id],
-        )
-        .expect("anonymous admitted identity");
-    public_repo::AdmittedRelease {
-        release_id,
-        source_id: row.get(0),
-        claim_id: row.get(1),
-        object_revision: row.get(2),
-    }
-}
-
-fn dsn_as_role(dsn: &str, role: &str) -> String {
-    let sep = if dsn.contains('?') { '&' } else { '?' };
-    format!("{dsn}{sep}options=-c%20role%3D{role}")
-}
-
-fn grant_moderator(fixture: &mut ContributionFixture) {
-    fixture
-        .admin
-        .execute(
-            "INSERT INTO control.public_moderator_grants(user_id,grant_version,enabled) \
-             VALUES($1,1,true) ON CONFLICT(user_id) DO UPDATE \
-             SET grant_version=EXCLUDED.grant_version,enabled=EXCLUDED.enabled",
-            &[&fixture.auth.user_id().expect("fixture user").0],
-        )
-        .expect("active global moderator grant");
-}
-
-fn evaluate_supported(
-    fixture: &mut ContributionFixture,
-    public: &PublicWorkerDbPool,
-    claim_id: Uuid,
-    expected_revision: i64,
-) -> public_repo::EvaluationResult {
-    grant_moderator(fixture);
-    let body_sha256: Vec<u8> = fixture
-        .admin
-        .query_one(
-            "SELECT sha256(convert_to(content::text,'UTF8')) FROM public.claims WHERE claim_id=$1",
-            &[&claim_id],
-        )
-        .expect("current body hash")
-        .get(0);
-    fixture
-        .rt
-        .block_on(public_repo::evaluate_claim(
-            public,
-            &fixture.auth,
-            &public_repo::EvaluateClaim {
-                claim_id,
-                expected_revision,
-                expected_body_sha256: &body_sha256,
-                policy_version: "public-runtime-test-v1",
-                rationale: "real authenticated fixture moderator evaluation",
-                target_state: ModerationState::Supported,
-            },
-        ))
-        .expect("supported evaluation")
-}
-
-fn evaluate_anonymous_supported(
-    fixture: &mut ContributionFixture,
-    claim_id: Uuid,
-    expected_revision: i64,
-) -> public_repo::EvaluationResult {
-    grant_moderator(fixture);
-    let body_sha256: Vec<u8> = fixture
-        .admin
-        .query_one(
-            "SELECT sha256(convert_to(content::text,'UTF8')) FROM public.claims WHERE claim_id=$1",
-            &[&claim_id],
-        )
-        .expect("current anonymous body hash")
-        .get(0);
-    fixture
-        .rt
-        .block_on(public_repo::evaluate_anonymous_claim(
-            &fixture.private,
-            &fixture.auth,
-            &public_repo::EvaluateClaim {
-                claim_id,
-                expected_revision,
-                expected_body_sha256: &body_sha256,
-                policy_version: "phase9-anonymous-trust-v1",
-                rationale: "protected fixture moderator rationale",
-                target_state: ModerationState::Supported,
-            },
-        ))
-        .expect("supported anonymous evaluation")
-}
-
-fn seed_project_job(
-    fixture: &mut ContributionFixture,
-    claim_id: Uuid,
-    revision: i64,
-    idempotency_key: &str,
-) -> Uuid {
-    let claim_id_text = claim_id.to_string();
-    fixture
-        .admin
-        .query_one(
-            "INSERT INTO ops.jobs(tenant_id,job_type,idempotency_key,next_retry_at,payload) \
-             VALUES($1,'PUBLIC_PROJECT',$2,clock_timestamp(), \
-               jsonb_build_object('object_id',$3::text,'object_kind','CLAIM','object_revision',$4::bigint)) \
-             RETURNING job_id",
-            &[
-                &fixture.auth.tenant_id().0,
-                &idempotency_key,
-                &claim_id_text,
-                &revision,
-            ],
-        )
-        .expect("project job")
-        .get(0)
-}
-
-fn job_status(fixture: &mut ContributionFixture, job_id: Uuid) -> String {
-    fixture
-        .admin
-        .query_one("SELECT status FROM ops.jobs WHERE job_id=$1", &[&job_id])
-        .expect("job status")
-        .get(0)
-}
-
 /// Protected lineage removed the public worker's direct staging-table capability in 0124. A
 /// legacy release may remain stored during the expand window, but it cannot bypass the anonymous
 /// assessed admission seam.
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
 fn legacy_release_admission_is_fenced_from_protected_rows() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = ContributionFixture::new();
@@ -463,7 +151,7 @@ fn legacy_release_admission_is_fenced_from_protected_rows() {
 /// generic worker claim the resulting public job. The event comes from the authenticated entry
 /// flow, so dispatch cannot be confused with a caller-seeded passed release.
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
 fn drain_release_outbox_enqueues_one_typed_public_job() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = ContributionFixture::new();
@@ -500,7 +188,7 @@ fn drain_release_outbox_enqueues_one_typed_public_job() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
 #[allow(clippy::too_many_lines)] // Replay, exact identity, and one-row lifecycle checks form one real-PG oracle.
 fn assessed_release_admits_once_into_anonymous_under_review_claim() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -539,7 +227,7 @@ fn assessed_release_admits_once_into_anonymous_under_review_claim() {
                 &public,
                 "public-runtime-anonymous-admission-fixture",
                 8,
-                &UnusedProjector,
+                &NoopProjector,
             ))
             .expect("anonymous assessed admission"),
         1
@@ -614,7 +302,7 @@ fn assessed_release_admits_once_into_anonymous_under_review_claim() {
                 &public,
                 "public-runtime-anonymous-admission-replay",
                 1,
-                &UnusedProjector,
+                &NoopProjector,
             ))
             .expect("idempotent anonymous replay"),
         1
@@ -634,7 +322,7 @@ fn assessed_release_admits_once_into_anonymous_under_review_claim() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
+#[ignore = "lane(a:disposable) needs a per-run database: its oracle counts the GLOBAL unfinished rows of ops.public_anonymous_dispatches, and a shared database carries an earlier run's PROCESSING row into that count"]
 #[allow(clippy::too_many_lines)] // Admission, evaluation, dispatch authority, and revoke share one lifecycle oracle.
 fn assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_closed() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -655,7 +343,7 @@ fn assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_c
                 &public,
                 "phase9-lifecycle-admit",
                 64,
-                &UnusedProjector,
+                &NoopProjector,
             ))
             .expect("anonymous admission")
             >= 1
@@ -668,7 +356,7 @@ fn assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_c
             &public,
             "phase9-lifecycle-admit-project",
             64,
-            &UnusedProjector,
+            &NoopProjector,
         ))
         .expect("anonymous admission projection");
     let pending: i64 = fixture
@@ -994,7 +682,7 @@ fn assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_c
                 &public,
                 "phase9-lifecycle-revoke",
                 1,
-                &UnusedProjector,
+                &NoopProjector,
             ))
             .expect("anonymous revoke"),
         1
@@ -1022,7 +710,7 @@ fn assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_c
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
 fn public_coverage_change_after_assessed_prepare_conflicts_on_finalize() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut stale = ContributionFixture::new();
@@ -1053,7 +741,7 @@ fn public_coverage_change_after_assessed_prepare_conflicts_on_finalize() {
             &public,
             "phase9-coverage-stale-fixture",
             8,
-            &UnusedProjector,
+            &NoopProjector,
         ))
         .expect("admit assessed mutation");
     let admitted = mutator
@@ -1069,7 +757,7 @@ fn public_coverage_change_after_assessed_prepare_conflicts_on_finalize() {
         .expect("admitted anonymous claim");
     let claim_id: Uuid = admitted.get(0);
     let revision: i64 = admitted.get(1);
-    evaluate_supported(&mut mutator, &public, claim_id, revision);
+    evaluate_anonymous_supported(&mut mutator, claim_id, revision);
 
     let current_snapshot = coverage_for_probe(b"assessed public").binding().digest_id();
     assert_ne!(
@@ -1088,7 +776,7 @@ fn public_coverage_change_after_assessed_prepare_conflicts_on_finalize() {
 /// Revocation is fenced in the private transaction before an anonymous release job can run.
 /// The public worker must consume both opaque events without creating a source or claim.
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
 fn assessed_revoke_before_admit_never_creates_anonymous_claim() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = ContributionFixture::new();
@@ -1122,7 +810,7 @@ fn assessed_revoke_before_admit_never_creates_anonymous_claim() {
                 &public,
                 "public-runtime-anonymous-revoke-before-admit",
                 8,
-                &UnusedProjector,
+                &NoopProjector,
             ))
             .expect("consume fenced anonymous events"),
         2
@@ -1159,7 +847,7 @@ fn assessed_revoke_before_admit_never_creates_anonymous_claim() {
 /// that claim has any trust receipt. A repeated private revoke emits no second event, so the
 /// public consumer cannot advance the object revision twice.
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
 fn revoke_reaches_under_review_claim_via_source_closure_once() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = ContributionFixture::new();
@@ -1203,7 +891,7 @@ fn revoke_reaches_under_review_claim_via_source_closure_once() {
                 &public,
                 "public-runtime-source-closure-revoke",
                 8,
-                &UnusedProjector,
+                &NoopProjector,
             ))
             .expect("apply projection and protected-mapping revoke"),
         2,
@@ -1223,7 +911,7 @@ fn revoke_reaches_under_review_claim_via_source_closure_once() {
 }
 
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
 #[allow(clippy::too_many_lines)] // Negative dispatch authority and the exact protected-mapping revoke are one oracle.
 fn assessed_revoke_reaches_anonymous_under_review_claim_once() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1248,7 +936,7 @@ fn assessed_revoke_reaches_anonymous_under_review_claim_once() {
                 &public,
                 "public-runtime-anonymous-admission-before-revoke",
                 8,
-                &UnusedProjector,
+                &NoopProjector,
             ))
             .expect("anonymous public admission"),
         1
@@ -1291,7 +979,7 @@ fn assessed_revoke_reaches_anonymous_under_review_claim_once() {
                 &public,
                 "public-runtime-anonymous-drain-admission-projection",
                 1,
-                &UnusedProjector,
+                &NoopProjector,
             ))
             .expect("drain admission projection before revoke authority check"),
         1
@@ -1381,7 +1069,7 @@ fn assessed_revoke_reaches_anonymous_under_review_claim_once() {
                 &public,
                 "public-runtime-anonymous-revoke-fixture",
                 8,
-                &UnusedProjector,
+                &NoopProjector,
             ))
             .expect("apply anonymous revoke"),
         1
@@ -1406,7 +1094,7 @@ fn assessed_revoke_reaches_anonymous_under_review_claim_once() {
 /// receipt identity. The controlled projector is only the remote seam; admission and both
 /// moderator evaluations use the authenticated real-PG path.
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
 fn current_eligible_projection_retires_only_older_receipts() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = ContributionFixture::new();
@@ -1418,18 +1106,10 @@ fn current_eligible_projection_retires_only_older_receipts() {
         )))
         .expect("public role pool");
     let admitted = admit_assessed_release(&mut fixture, &public, "public-runtime-retire-admission");
-    let first = evaluate_supported(
-        &mut fixture,
-        &public,
-        admitted.claim_id,
-        admitted.object_revision,
-    );
-    let second = evaluate_supported(
-        &mut fixture,
-        &public,
-        admitted.claim_id,
-        first.object_revision,
-    );
+    let first =
+        evaluate_anonymous_supported(&mut fixture, admitted.claim_id, admitted.object_revision);
+    let second =
+        evaluate_anonymous_supported(&mut fixture, admitted.claim_id, first.object_revision);
     let idempotency_key = format!("public-runtime-retire-earlier-receipt-{}", Uuid::now_v7());
     let job = seed_project_job(
         &mut fixture,
@@ -1466,7 +1146,7 @@ fn current_eligible_projection_retires_only_older_receipts() {
 /// A remote tombstone report for the exact current eligible identity is not terminal: a fresh
 /// strict hydration still finds it eligible, so the attempt is fenced out of DONE and replayed.
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
 fn superseded_current_projection_is_retryable_then_replay_converges() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut fixture = ContributionFixture::new();
@@ -1479,12 +1159,8 @@ fn superseded_current_projection_is_retryable_then_replay_converges() {
         .expect("public role pool");
     let admitted =
         admit_assessed_release(&mut fixture, &public, "public-runtime-superseded-admission");
-    let current = evaluate_supported(
-        &mut fixture,
-        &public,
-        admitted.claim_id,
-        admitted.object_revision,
-    );
+    let current =
+        evaluate_anonymous_supported(&mut fixture, admitted.claim_id, admitted.object_revision);
     let idempotency_key = format!("public-runtime-superseded-current-{}", Uuid::now_v7());
     let job = seed_project_job(
         &mut fixture,
@@ -1539,7 +1215,7 @@ fn superseded_current_projection_is_retryable_then_replay_converges() {
 /// completed outside PostgreSQL, but the old attempt cannot mark DONE; a requeued new attempt
 /// increments its fencing token and converges.
 #[test]
-#[ignore = "requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
+#[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through latest schema and pinned Gitleaks"]
 #[allow(clippy::too_many_lines)] // The exact lease expiry, blocked remote callback, and fenced replay share one causal real-PG oracle.
 fn lease_expiry_during_projection_fences_old_done_then_replays() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1553,12 +1229,8 @@ fn lease_expiry_during_projection_fences_old_done_then_replays() {
         .block_on(PublicWorkerDbPool::connect(&dsn))
         .expect("public role pool");
     let admitted = admit_assessed_release(&mut fixture, &public, "public-runtime-lease-admission");
-    let current = evaluate_supported(
-        &mut fixture,
-        &public,
-        admitted.claim_id,
-        admitted.object_revision,
-    );
+    let current =
+        evaluate_anonymous_supported(&mut fixture, admitted.claim_id, admitted.object_revision);
     let idempotency_key = format!("public-runtime-lease-expiry-{}", Uuid::now_v7());
     let job = seed_project_job(
         &mut fixture,
