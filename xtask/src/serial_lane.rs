@@ -352,6 +352,9 @@ fn ensure_database_through(
             .batch_execute(&format!("CREATE DATABASE \"{quoted}\""))
             .map_err(|e| format!("cannot create {database}: {e}"))?;
         eprintln!("serial-lane: provisioned database {database}");
+        if let Ok(mut created) = PROVISIONED_THIS_RUN.lock() {
+            created.push(database.to_string());
+        }
     }
     let target = dsn_with_database(admin_dsn, database)
         .ok_or_else(|| "cannot rewrite the admin DSN onto the target database".to_string())?;
@@ -365,6 +368,57 @@ fn ensure_database_through(
         Ok(())
     } else {
         Err(format!("migrate exited {code} against {database}"))
+    }
+}
+
+/// Every database THIS process created (never one it found), in creation order — the only
+/// set `--drop-provisioned` may touch. Post-delivery housekeeping (2026-09-26): each lane run
+/// left ~11 `humaux_thread_{request_guard,qdrant,disposable,pre0132,prov_fault}_<stamp>`
+/// databases on the shared container (96 by the time the user was asked to drop them), because
+/// dropping was a decision this gate did not own. It still does not own it — the flag is the
+/// decision, made per run by whoever launches the lane, and the fixed-name fixture
+/// (`humaux_thread_stable_observations`) is exempt because the next run expects it.
+static PROVISIONED_THIS_RUN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// `--drop-provisioned`: drop what this run created. Runs after the tally so a failure here
+/// cannot hide a test verdict; each drop is reported by name, and a drop that fails is a
+/// visible line, not an exit code (the tests already have theirs).
+fn drop_provisioned() {
+    let Ok(admin) = std::env::var("HUMAUX_TEST_PG_DSN") else {
+        eprintln!("serial-lane: --drop-provisioned: HUMAUX_TEST_PG_DSN unset, nothing dropped");
+        return;
+    };
+    let Some(postgres_dsn) = dsn_with_database(&admin, "postgres") else {
+        eprintln!("serial-lane: --drop-provisioned: cannot rewrite the admin DSN, nothing dropped");
+        return;
+    };
+    let created: Vec<String> = PROVISIONED_THIS_RUN
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_default();
+    if created.is_empty() {
+        println!("serial-lane: --drop-provisioned: this run created no database");
+        return;
+    }
+    let mut client = match postgres::Client::connect(&postgres_dsn, postgres::NoTls) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("serial-lane: --drop-provisioned: cannot connect: {e}; nothing dropped");
+            return;
+        }
+    };
+    for database in created {
+        if database == "humaux_thread_stable_observations" {
+            continue;
+        }
+        let quoted = database.replace('"', "\"\"");
+        // FORCE: a test that leaked a pooled connection must not keep its throwaway alive.
+        match client.batch_execute(&format!(
+            "DROP DATABASE IF EXISTS \"{quoted}\" WITH (FORCE)"
+        )) {
+            Ok(()) => println!("serial-lane: dropped provisioned database {database}"),
+            Err(e) => eprintln!("serial-lane: could not drop {database}: {e}"),
+        }
     }
 }
 
@@ -779,6 +833,7 @@ fn run_group(
 pub fn run(args: &[String]) -> i32 {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let audit_only = args.iter().any(|a| a == "--audit-only");
+    let drop_provisioned_after = args.iter().any(|a| a == "--drop-provisioned");
     let (entries, defects) = inventory(&root);
 
     println!(
@@ -932,6 +987,9 @@ pub fn run(args: &[String]) -> i32 {
     }
     for line in &tally.not_run {
         eprintln!("  NOT RUN  {line}");
+    }
+    if drop_provisioned_after {
+        drop_provisioned();
     }
     i32::from(!tally.failed.is_empty() || !tally.not_run.is_empty())
 }

@@ -6,7 +6,7 @@
 # §46 forward-fix (EXPAND_ONLY, first free number after 0172).
 
 migration_id = "0173_task_binding_grants"
-class = "EXPAND_ONLY"
+class = "FORWARD_ONLY"
 
 precheck = """
 select
@@ -123,3 +123,6 @@ select
                 and pg_get_constraintdef(oid) like '%grant_authority%6%')
  as postcheck_ok
 """
+
+rollback_or_forward_fix = "Forward fix after deployment (ADR-0046). The NOT VALID CHECK is validated by 0175 once the four legacy rows are dispositioned; DROP TABLE private.task_binding_grants / the composite UNIQUE / coord.tasks.authorization_epoch only together with retiring the ExplicitTaskContext v2 authority path in the gateway and adapters."
+backup_restore_requirement = "standard pre-migration backup of private.memory_records, private.context_bindings and coord.tasks (additive DDL + one NOT VALID CHECK; no DML on user rows)."

@@ -575,95 +575,99 @@ of the same shape as `admissible_classes`, for whichever card owns that file.
 
 ---
 
-## 7. Housekeeping — shared state that needs the user's decision
+## 7. Housekeeping — done on 2026-09-26 with the user's approval
 
-### 7.1 Databases created on the shared PG container for diagnosis
+The user approved the whole list on 2026-09-26 ("需要清理删除的进行清理删除，其他的你看着办"). Every
+destructive step below was preceded by a backup, is logged line by line in
+`delivery-cards-20260903/housekeeping_20260926.log`, and touched only what the list named.
 
-**Nothing below has been dropped. Nothing will be dropped without the user's explicit
-go-ahead.** They are listed so the decision is the user's and is informed.
+### 7.1 Databases on the shared PG container — 96 archived and dropped, 5 kept
 
-The previous revision of this list was maintained by hand and under-reported the shared
-container: it jumped soak18 → soak20 and soak23 → soak25 and omitted `fix22b_1789782760`. An
-enumerated list that under-reports shared state defeats the informed decision it exists for, so
-it is now **derived**, with the command that derives it printed next to it. Re-run the command
-before acting on the list; anything it prints that is not below was created after this pass.
+`hk_db_backup_drop.sh`: for every database not in the keep set, `pg_dump -Fc` to
+`/Volumes/data/output/humaux-thread-stable-system-20260828/db_backups_20260926/<db>.dump`,
+`pg_restore -l` to prove the archive reads back, then `DROP DATABASE` (refused if any live
+connection existed — none did). **dumped=96 dropped=96 kept=5 failed=0.** Kept, by name:
+`humaux_thread_dev` (the shared dev database), `humaux_thread_ci`, `ci_sim`,
+`humaux_thread_stable_observations` (the serial lane's fixed-name fixture, re-created on demand)
+and `postgres`. Dropped: `humaux_thread_soak16…28`, `humaux_thread_fix16`, `fix22b_*`,
+`fix22c_*` and every `humaux_thread_{request_guard,qdrant,disposable,pre0132,prov_fault}_*`
+the lane had provisioned. Re-derive the current list with:
 
 ```
 docker exec humaux-thread-pg psql -U postgres -d postgres -Atc \
   "select datname from pg_database where datname not in ('postgres','template0','template1') order by 1"
 ```
 
-Derived 2026-09-26 (82 databases on the container). Diagnosis leftovers, complete:
+**So it does not regrow:** `cargo xtask serial-lane --drop-provisioned` (new) drops, after the
+tally, exactly the databases that run created — never one it found, never the fixed-name
+fixture — one reported line per drop, `WITH (FORCE)`. The chain's `serial_lane` extra now
+passes the flag (`card24_extra_gates.env`); `docs/ops/serial-lane.md` documents it.
 
-```
-humaux_thread_fix16
-humaux_thread_soak16  humaux_thread_soak17  humaux_thread_soak18  humaux_thread_soak19
-humaux_thread_soak20  humaux_thread_soak21  humaux_thread_soak22
-humaux_thread_soak23   <- the green card-16 run
-humaux_thread_soak24
-humaux_thread_soak25  humaux_thread_soak26  humaux_thread_soak27  humaux_thread_soak28
-fix22b_1789782760
-fix22c_20260922100216  fix22c_1790030957
-humaux_thread_pre0132_1790155526
-humaux_thread_stable_observations
-humaux_thread_prov_fault_1790155632
-```
+### 7.2 The two orphan `private.evidence_objects` rows — deleted, FK validated (0174)
 
-Not diagnosis leftovers, listed so the enumeration is complete and neither is dropped by
-mistake: `humaux_thread_dev` (the shared dev database everything here runs against),
-`humaux_thread_ci`, `ci_sim`. The wildcard families
-`humaux_thread_request_guard_*` / `humaux_thread_qdrant_*` / `humaux_thread_disposable_*` /
-`humaux_thread_pre0132_*` / `humaux_thread_prov_fault_*` are per-run throwaways covered
-generically in §7.6.
+Backed up with every dependent row to `db_backups_20260926/dev_rows_before_delete.json`, then
+deleted in one transaction, children first: 2 `control.operation_receipts`, 2
+`private.events`, 2 `private.evidence_objects` (`01a0658c-8b4d-7145-8757-f872b1e505bc`,
+`01a0658c-8b80-7c69-b52a-2f7ea4c09e8a`, tenant `01a0658c-6e00…`, whose tenant row no longer
+existed). Then migration `0174_validate_evidence_reasoning_domain_fk` (`VALIDATE CONSTRAINT`,
+FORWARD_ONLY; its manifest's precheck refuses to run while a violating row exists) applied to
+the dev database: `evidence_objects_reasoning_domain_tenant_fk` is now `convalidated = true`.
 
-### 7.2 Two orphan rows block a constraint validation (needs approval)
+### 7.3 The four legacy fixture rows — deleted, stored-authority CHECK validated (0175)
 
-Migration 0159's FK `evidence_objects_reasoning_domain_tenant_fk` is still
-`convalidated = false` because the shared dev database holds **2 orphan `private.evidence_objects`
-rows** whose `(tenant_id, reasoning_domain_id)` has no `control.private_reasoning_domains` row —
-test residue. `VALIDATE CONSTRAINT` fails while they exist.
-
-The constraint already refuses every NEW write. What is missing is the historical proof and the
-planner's ability to use it. The two rows (derived 2026-09-26 from the shared dev database):
-
-| `evidence_id` | `tenant_id` | `reasoning_domain_id` | created | origin |
-|---|---|---|---|---|
-| `01a0658c-8b4d-7145-8757-f872b1e505bc` | `01a0658c-6e00-78a5-a5b6-ab483721f276` | `01a0658c-6e0b-7a32-880f-144f686ff776` | 2026-09-03 | `AuthenticatedAgent` |
-| `01a0658c-8b80-7c69-b52a-2f7ea4c09e8a` | `01a0658c-6e00-78a5-a5b6-ab483721f276` | `01a0658c-6e0b-7a32-880f-144f686ff776` | 2026-09-03 | `AuthenticatedAgent` |
-
-Their tenant row no longer exists in `control.tenants` (a throwaway test tenant whose cleanup
-missed these two), so nothing can ever reference them. Proposed path, **awaiting approval**:
-delete the two rows, then a one-line `VALIDATE CONSTRAINT` migration.
-
-### 7.3 Four legacy fixture rows block the stored-authority CHECK (needs approval)
-
-Four legacy `{"fixture": "operation receipt scoped context"}` rows on tenants `d0a7e258…` and
-`5c853c6f…` must be dispositioned before the stored-authority CHECK can be VALIDATEd. Fixture
-leftovers on the shared dev DB. **Awaiting approval.**
+The four `{"fixture": "operation receipt scoped context"}` rows carrying
+`authority_class = 'ExplicitTaskContext'` (memory ids `01a06b29-48d5…`, `01a06b29-48e6…`,
+`01a07aa2-a11f…`, `01a07aa2-a123…`) were backed up with their 4 `memory_evidence` links and 4
+`context_bindings` (0 `task_binding_grants`), then deleted in the same transaction as §7.2.
+Migration `0175_validate_memory_records_stored_authority_v2` applied:
+`memory_records_stored_authority_v2_check` is now `convalidated = true` — the I-STORE rule of
+ADR-0046 is proven for every row, not only refused for new ones. The contract test that had
+pinned the NOT VALID state as "a card-24 step still owed"
+(`task_grant_contract::stored_authority_check_refuses_explicit_task_context_in_the_database`)
+now pins `convalidated = true`, so a database migrated only through 0173 fails it by design.
 
 ### 7.4 Closed without action — the rehearsal's own probe
 
-The card-16 note that `rehearse.sh`'s `ryw_probe` step made `derived_jobs_not_done` and
-`projection_tickets_unresolved` fail as an artifact of its own in-flight write is **already
-fixed**, in the card-21 fix pass, and fixed better than the note proposed. Rather than moving
-the probe, the three assertions were re-scoped: both drain assertions exclude the probe's own
-Evidence, and a third — `the_only_undrained_write_is_the_ryw_probes_own` — pins that it is the
-ONLY undrained row, so the exclusion cannot quietly swallow a second stranded one
-(`rehearse.sh:331-334`). An un-projected write is the whole point of a read-your-writes probe;
-draining it would have deleted the test. Nothing to do here.
+Unchanged: the read-your-writes probe's own undrained write is excluded by name (now by
+`payload->>'evidence_id'`, §5.8 finding 7) and pinned as the ONLY undrained row.
 
-### 7.5 A stray build directory
+### 7.5 The stray build directories — deleted
 
-A subagent left `target-clippy/` at the repo root. Never commit it. **Ask before deleting.**
+`target-clippy/` at the repo root and the superseded external-volume `target/` (237 GB, §5.7)
+were removed after confirming no cargo or rustc process was running; the boot-volume target
+directory (`$HOME/humaux-target-boot`) is the only one every chain and rehearsal uses. Free
+space on `/Volumes/data` went from 48 GB to over 140 GB.
 
----
+### 7.6 Plaintext secrets in the Humaux memory library — redacted and deleted; keys to rotate
 
-### 7.6 The external build directory (237 GB) and the lane's provisioned databases
+The note that "memory `d38f590e` holds a plaintext Alibaba key" could not be resolved to an id
+by that prefix; a literal search of the library for key-shaped tokens found **five** entries
+holding real secrets, none from this project's own flows: a DashScope key (`sk-670638…`, old
+35-character format), two DeepSeek keys (`sk-32d11b…`, `sk-742fea…`), the same DashScope key
+again inside a Stagehand state document, and an Alibaba Cloud RAM AccessKey ID + Secret
+(`LTAI5t9Q…`) for VIAPI in a 2026-07-05 user message. Each was re-stored with its knowledge
+intact and the secret replaced by a prefix plus a "rotate" instruction
+(`memory_store(supersedes=…)`), and the original was then deleted (`memory_delete`, five
+entries) — supersession alone would have left the plaintext readable. **The user must rotate
+those four credentials**; this project's own DashScope key (`sk-ws-…`, in `.env.local`) and
+MiniMax key were never in the library and are unaffected.
 
-- `/Volumes/data/humaux-thread/target/` (237 GB) is superseded by the boot-volume target dir; deleting it frees most of the external volume. Ask before deleting.
-- Each `cargo xtask serial-lane` run provisions ~11 databases on the shared PG container and never drops them (by design): `humaux_thread_request_guard_*`, `humaux_thread_qdrant_*`, `humaux_thread_disposable_*`, `humaux_thread_pre0132_*`, `humaux_thread_prov_fault_*`, `humaux_thread_stable_observations`, plus the earlier `fix16`, `soak16–28`, `fix22c_*` lists. A reaping step is owed to the lane runbook; the drop itself waits for the user.
-- `role_admin` received a dev-local password out of band (0110 leaves it to the secrets manager); documented in `docs/ops/serial-lane.md`.
-- The Humaux memory entry `d38f590e` still holds a plaintext Alibaba Cloud key: rotate it, then approve its deletion.
+### 7.7 Still the user's — `role_admin`'s development password
+
+Unchanged: migration 0110 creates `role_admin` with LOGIN and no password ("provisioned
+externally"); the main line set a development password out of band so the mechanism group
+could run (`HUMAUX_ADMIN_PG_DSN`). A production deployment needs a real source for it
+(`docs/ops/runbook.md` §2). Not changed by this pass.
+
+### 7.8 Migration manifests brought onto the rehearsal gate's closed class set
+
+`cargo xtask migration-rehearsal` had been red since 0169 — five manifests (0169–0173) lacked
+the required `rollback_or_forward_fix` / `backup_restore_requirement` fields and used classes
+(`EXPAND_ONLY`, `CONTRACT_ONLY`) outside the gate's closed set `{REVERSIBLE, EXPAND_CONTRACT,
+FORWARD_ONLY}`. The fields were added (documentation only; the applied SQL is untouched, so
+checksums are unchanged) and the classes set to `FORWARD_ONLY`. The gate's static half is
+green again and is now a chain extra; its dynamic half (up/down/up with schema digests) is
+still `not_applicable` by its own admission — the executor is unimplemented (DOD-089).
 
 ## 8. What this pass ran, and what it did not
 

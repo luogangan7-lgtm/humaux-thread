@@ -5,7 +5,7 @@
 # same change (§48.2). §46 forward-fix (EXPAND_ONLY, first free number after 0168).
 
 migration_id = "0169_confirm_token_retention"
-class = "EXPAND_ONLY"
+class = "FORWARD_ONLY"
 
 precheck = """
 select
@@ -53,3 +53,6 @@ select
  and has_column_privilege('role_gateway','control.confirm_tokens','consumed_at','UPDATE')
  as postcheck_ok
 """
+
+rollback_or_forward_fix = "Forward fix after deployment (0170 already forward-fixed its DELETE grant). To retire the sweep: REVOKE EXECUTE and DROP FUNCTION control.sweep_confirm_tokens(interval), DROP the two indexes; the table and its rows are untouched by this migration."
+backup_restore_requirement = "none beyond the standard pre-migration backup: function, index and grant DDL only, no DML (the sweep deletes only when an operator runs it, and only expired/consumed rows past retention)."

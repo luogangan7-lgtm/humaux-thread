@@ -1,0 +1,29 @@
+# §46.1 migration manifest. Post-delivery housekeeping (2026-09-26, delivery report §7.3):
+# VALIDATE the I-STORE CHECK 0173 added NOT VALID, now that the four legacy fixture rows are
+# gone. No schema change, no grant change, no DML. §46 forward-fix (FORWARD_ONLY).
+
+migration_id = "0175_validate_memory_records_stored_authority_v2"
+class = "FORWARD_ONLY"
+
+precheck = """
+select
+ exists (select 1 from pg_constraint
+          where conrelid = 'private.memory_records'::regclass
+            and conname = 'memory_records_stored_authority_v2_check'
+            and contype = 'c')
+ -- no row may still carry the class the CHECK forbids: dispositioned by a human, never here
+ and not exists (select 1 from private.memory_records
+                  where authority_class = 'ExplicitTaskContext')
+ as precheck_ok
+"""
+
+postcheck = """
+select convalidated
+  from pg_constraint
+ where conrelid = 'private.memory_records'::regclass
+   and conname = 'memory_records_stored_authority_v2_check'
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. VALIDATE CONSTRAINT changes no schema and no rows; the CHECK itself stays as 0173 defined it."
+backup_restore_requirement = "none for the migration itself (a validation scan). The four fixture rows it depends on were exported to db_backups_20260926/dev_rows_before_delete.json before deletion."

@@ -4,7 +4,7 @@
 # DELETE to do its work. Pure REVOKE: no DDL, no DML, nothing else touched. CONTRACT_ONLY.
 
 migration_id = "0170_confirm_token_delete_is_owner_only"
-class = "CONTRACT_ONLY"
+class = "FORWARD_ONLY"
 
 precheck = """
 select
@@ -42,3 +42,6 @@ select
  and has_column_privilege('role_gateway','control.confirm_tokens','consumed_at','UPDATE')
  as postcheck_ok
 """
+
+rollback_or_forward_fix = "Forward fix (this migration IS the forward fix of 0169's one wrong line). Re-granting DELETE is forbidden by §6.2.1, so there is no reverse; the owner SECURITY DEFINER sweep is the only delete path."
+backup_restore_requirement = "none: a single REVOKE, no table DDL, no DML."

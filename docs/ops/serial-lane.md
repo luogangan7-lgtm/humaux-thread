@@ -200,3 +200,15 @@ serial-lane: n=107 run-set, passed=107, failed=0, not_run=0, retired=7 (inventor
 ```
 
 with `lane(a:qdrant): 2` and `lane(c): 7`.
+
+
+## Reaping the databases a run provisions
+
+Each run provisions its throwaway databases (`humaux_thread_{request_guard,qdrant,disposable,
+pre0132,prov_fault}_<unix stamp>`) and, by default, never drops them — dropping is a decision
+the gate does not own. `cargo xtask serial-lane --drop-provisioned` makes that decision for the
+run that carries the flag: after the tally it drops exactly the databases this process
+created (never one it found, never the fixed-name `humaux_thread_stable_observations`), one
+reported line per drop, `WITH (FORCE)` so a leaked pooled connection cannot keep a throwaway
+alive. The gate chain's `serial_lane` extra passes the flag (`card24_extra_gates.env`); an
+operator who wants to inspect a run's databases afterwards omits it.

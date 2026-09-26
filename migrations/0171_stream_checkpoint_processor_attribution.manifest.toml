@@ -7,7 +7,7 @@
 # §46 forward-fix (EXPAND_ONLY, first free number after 0170).
 
 migration_id = "0171_stream_checkpoint_processor_attribution"
-class = "EXPAND_ONLY"
+class = "FORWARD_ONLY"
 
 precheck = """
 select
@@ -47,3 +47,6 @@ select
  and has_column_privilege('role_retrieval_worker','projection.stream_checkpoints','knowledge_highwater','UPDATE')
  as postcheck_ok
 """
+
+rollback_or_forward_fix = "Forward fix after deployment: DROP COLUMN projection.stream_checkpoints.projection_processor_id and REVOKE the column UPDATE grant only together with retiring the attribution write in stream_repo::advance_prefix; the column is nullable and additive, so readers that ignore it are unaffected."
+backup_restore_requirement = "standard pre-migration backup of projection.stream_checkpoints (additive nullable column + column grant; no DML)."

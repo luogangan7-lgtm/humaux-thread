@@ -1,0 +1,33 @@
+# §46.1 migration manifest. Post-delivery housekeeping (2026-09-26, delivery report §7.2):
+# VALIDATE the FK 0159 added NOT VALID, now that the two orphan evidence_objects rows are gone.
+# No schema change, no grant change, no DML. §46 forward-fix (FORWARD_ONLY).
+
+migration_id = "0174_validate_evidence_reasoning_domain_fk"
+class = "FORWARD_ONLY"
+
+precheck = """
+select
+ -- the constraint 0159 added is there (valid or not)
+ exists (select 1 from pg_constraint
+          where conrelid = 'private.evidence_objects'::regclass
+            and conname = 'evidence_objects_reasoning_domain_tenant_fk'
+            and contype = 'f')
+ -- and nothing violates it: a violating row must be dispositioned by a human first
+ -- (delivery report §7.2), never deleted by a migration
+ and not exists (select 1 from private.evidence_objects eo
+                  where not exists (select 1 from control.private_reasoning_domains d
+                                     where d.tenant_id = eo.tenant_id
+                                       and d.reasoning_domain_id = eo.reasoning_domain_id))
+ as precheck_ok
+"""
+
+postcheck = """
+select convalidated
+  from pg_constraint
+ where conrelid = 'private.evidence_objects'::regclass
+   and conname = 'evidence_objects_reasoning_domain_tenant_fk'
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. VALIDATE CONSTRAINT changes no schema and no rows; undoing it would mean re-adding the constraint NOT VALID, which has no operational reason."
+backup_restore_requirement = "none for the migration itself (a validation scan). The two orphan rows it depends on were exported to db_backups_20260926/dev_rows_before_delete.json before deletion."

@@ -429,9 +429,11 @@ fn stored_authority_check_refuses_explicit_task_context_in_the_database() {
         return;
     };
 
-    // Present, and deliberately NOT VALID: the four legacy fixture rows of ADR-0046 are
-    // dispositioned by card 24, which then runs VALIDATE. Asserting `convalidated = false`
-    // keeps "card 24 already ran" and "someone dropped the constraint" distinguishable.
+    // Present, and — since 0175 (post-delivery housekeeping, 2026-09-26) — VALID: the four
+    // legacy fixture rows of ADR-0046 were backed up and deleted with the user's approval,
+    // then `VALIDATE CONSTRAINT` ran (delivery report §7.3). Asserting `convalidated = true`
+    // keeps "0175 applied" and "someone re-added it NOT VALID" distinguishable; a database
+    // migrated only through 0173 fails here by design (the lane migrates to head).
     let constraint = client
         .query_opt(
             "SELECT pg_get_constraintdef(oid), convalidated FROM pg_constraint \
@@ -450,8 +452,9 @@ fn stored_authority_check_refuses_explicit_task_context_in_the_database() {
         "the I-STORE constraint must name the class it refuses, got {def}"
     );
     assert!(
-        !constraint.get::<_, bool>(1),
-        "0173 ships this NOT VALID (four legacy rows, ADR-0046); VALIDATE is a card-24 step"
+        constraint.get::<_, bool>(1),
+        "0173 shipped this NOT VALID (four legacy rows, ADR-0046); 0175 validated it once the \
+         rows were dispositioned — a NOT VALID constraint here means 0175 has not been applied"
     );
 
     let insert_at = |class: &str| {

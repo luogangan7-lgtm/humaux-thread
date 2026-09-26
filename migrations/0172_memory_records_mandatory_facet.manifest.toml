@@ -5,7 +5,7 @@
 # §46 forward-fix (EXPAND_ONLY, first free number after 0171).
 
 migration_id = "0172_memory_records_mandatory_facet"
-class = "EXPAND_ONLY"
+class = "FORWARD_ONLY"
 
 precheck = """
 select
@@ -82,3 +82,6 @@ select
                     and attname = 'task_id' and not attisdropped)
  as postcheck_ok
 """
+
+rollback_or_forward_fix = "Forward fix after deployment: DROP COLUMN private.memory_records.facet (GENERATED STORED, no independent writes exist by construction) only together with retiring required_current_state_facets_v1's probe of it; §25.4.A(3) freezes the derivation, so a changed mapping is a new generated column in a new migration."
+backup_restore_requirement = "standard pre-migration backup of private.memory_records (adds a generated column, which rewrites the table once; no user-row DML)."
