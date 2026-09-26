@@ -575,6 +575,24 @@ of the same shape as `admissible_classes`, for whichever card owns that file.
 
 ---
 
+### 6.10 What the post-delivery system audit found (2026-09-26)
+
+An independent read-only audit of HEAD `72bdfa7` (3 inventory agents, 8 lenses, 2 adversarial
+refuters per P1 finding, one synthesis; report at `docs/ops/system_audit_20260926.md`) found
+**0 P0, 17 P1, about 28 P2**. The P1s that §6.1–6.9 had NOT listed and that a deployment by
+the runbook would hit first: the projection hop has no resident or multi-tenant runner
+(`humaux-retrieval-worker` offers only `--run-once` pinned to one tenant/workspace by env, so
+under the runbook new memories never reach Qdrant unless something external drives it, as the
+rehearsal's shell loop did); BYOK is not implemented (one env-held key serves every tenant);
+the eight LOGIN roles' passwords are literals in migration 0011 and the runbook rotates only
+`role_admin`; no process exports metrics; no backup/PITR and no Qdrant rebuild from
+PostgreSQL; no retention or maintenance process; 35 PostgreSQL integration tests skip
+silently inside the gate chain; recall fetches only `top_k` (5) candidates while its
+provenance claims `cand_k` (25); the query planner answers `INVALID_INPUT` to everyday words.
+The ranked list, evidence and fix sketches are in the audit report. **This report's "MET"
+verdicts stand for what the rehearsal exercised; the audit is the record of what it did
+not, and it withdraws the "ready for production" reading of §5.**
+
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 
 The user approved the whole list on 2026-09-26 ("需要清理删除的进行清理删除，其他的你看着办"). Every
@@ -610,8 +628,14 @@ deleted in one transaction, children first: 2 `control.operation_receipts`, 2
 `private.events`, 2 `private.evidence_objects` (`01a0658c-8b4d-7145-8757-f872b1e505bc`,
 `01a0658c-8b80-7c69-b52a-2f7ea4c09e8a`, tenant `01a0658c-6e00…`, whose tenant row no longer
 existed). Then migration `0174_validate_evidence_reasoning_domain_fk` (`VALIDATE CONSTRAINT`,
-FORWARD_ONLY; its manifest's precheck refuses to run while a violating row exists) applied to
-the dev database: `evidence_objects_reasoning_domain_tenant_fk` is now `convalidated = true`.
+FORWARD_ONLY) applied to the dev database: `evidence_objects_reasoning_domain_tenant_fk` is
+now `convalidated = true`. Correction (system audit 2026-09-26, DM-5): an earlier revision of
+this paragraph said the manifest's precheck "refuses to run while a violating row exists".
+That was false — `xtask migrate` executes only the `.sql` and records its checksum; nothing
+executes manifest pre/postchecks, and this manifest's postcheck was not even valid SQL until
+fixed on 2026-09-26. What refuses a violating row is PostgreSQL's `VALIDATE CONSTRAINT`
+itself, which fails the migration. All four checks of 0174/0175 now execute read-only and
+return `t`.
 
 ### 7.3 The four legacy fixture rows — deleted, stored-authority CHECK validated (0175)
 
@@ -619,7 +643,8 @@ The four `{"fixture": "operation receipt scoped context"}` rows carrying
 `authority_class = 'ExplicitTaskContext'` (memory ids `01a06b29-48d5…`, `01a06b29-48e6…`,
 `01a07aa2-a11f…`, `01a07aa2-a123…`) were backed up with their 4 `memory_evidence` links and 4
 `context_bindings` (0 `task_binding_grants`), then deleted in the same transaction as §7.2.
-Migration `0175_validate_memory_records_stored_authority_v2` applied:
+Migration `0175_validate_memory_records_stored_authority_v2` applied (same correction as
+§7.2: its manifest checks are documentation; `VALIDATE CONSTRAINT` is the enforcing step):
 `memory_records_stored_authority_v2_check` is now `convalidated = true` — the I-STORE rule of
 ADR-0046 is proven for every row, not only refused for new ones. The contract test that had
 pinned the NOT VALID state as "a card-24 step still owed"
@@ -667,7 +692,9 @@ the required `rollback_or_forward_fix` / `backup_restore_requirement` fields and
 FORWARD_ONLY}`. The fields were added (documentation only; the applied SQL is untouched, so
 checksums are unchanged) and the classes set to `FORWARD_ONLY`. The gate's static half is
 green again and is now a chain extra; its dynamic half (up/down/up with schema digests) is
-still `not_applicable` by its own admission — the executor is unimplemented (DOD-089).
+still `not_applicable` by its own admission — the executor is unimplemented (DOD-089). Note
+that "static pass" parses the TOML only: the gate does not execute `precheck`/`postcheck` SQL,
+so an invalid check passes it (0174/0175 did, until the audit caught them).
 
 ## 8. What this pass ran, and what it did not
 

@@ -22,11 +22,10 @@ select
 """
 
 postcheck = """
-select convalidated
+select convalidated as postcheck_ok
   from pg_constraint
  where conrelid = 'private.evidence_objects'::regclass
    and conname = 'evidence_objects_reasoning_domain_tenant_fk'
- as postcheck_ok
 """
 
 rollback_or_forward_fix = "Forward fix only. VALIDATE CONSTRAINT changes no schema and no rows; undoing it would mean re-adding the constraint NOT VALID, which has no operational reason."
