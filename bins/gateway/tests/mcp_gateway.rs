@@ -2885,9 +2885,12 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                     item["kind"] == "temporary_evidence" && item["evidence_id"] == evidence_id
                 }));
 
-                // §6.1.3/ADR-0029 D-A, overlay leg (placed BEFORE the supersede/restore pair below:
-                // a token minted after two lifecycle tickets bound to one Evidence trips the
-                // harness's ConflictingOverlayEvidence, the worker-less limitation the card names).
+                // §6.1.3/ADR-0029 D-A, overlay leg. (It sits BEFORE the supersede/restore pair
+                // below for historical reasons: until ADR-0049 D-B a token minted after two
+                // lifecycle tickets bound to one Evidence tripped `ConflictingOverlayEvidence`;
+                // the overlay now collapses an Evidence to its newest row, so the order no
+                // longer matters — `retrieve_read_your_writes::
+                // an_evidence_with_a_lifecycle_row_surfaces_once_as_its_newest_row` pins that.)
                 // The subject scope also governs what the RYW
                 // overlay may carry. A just-written, not-yet-projected Evidence declared about B
                 // rides in on a B-scoped recall as `temporary_evidence` and must NOT ride in on

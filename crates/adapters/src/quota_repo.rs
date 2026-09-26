@@ -490,18 +490,26 @@ pub async fn consume_rate(
     };
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     bind_tenant(&mut txn, tenant, user).await?;
-    let locked: bool =
-        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!(
-                "rate:{}:{kind}:{id}:{operation}:{bucket_key}",
-                tenant.0
-            ))
-            .fetch_one(&mut *txn)
-            .await
-            .map_err(db_error)?;
-    if !locked {
-        return Err(ErrorCode::RateLimited);
-    }
+    // Concurrent consumers of ONE bucket are serialized by waiting, not by refusing. Two
+    // simultaneous requests from one client IP (a NAT; the soak's two lanes on 127.0.0.1) both
+    // land on the pre-auth `ip` bucket, and with `pg_try_advisory_xact_lock` the loser was
+    // answered RATE_LIMITED while the bucket held 99 of 100 tokens (card 24 rehearsal4,
+    // 2026-09-26: 1–2 of ~125 calls per soak) — a lock outcome reported as the rate verdict
+    // §72.3 reserves for "秒/分钟级速率超限". The critical section is one row update; the wait
+    // is bounded by `lock_timeout`, and a timeout fails closed through `db_error`, never as a
+    // rate decision.
+    sqlx::query("SET LOCAL lock_timeout = '2s'")
+        .execute(&mut *txn)
+        .await
+        .map_err(db_error)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "rate:{}:{kind}:{id}:{operation}:{bucket_key}",
+            tenant.0
+        ))
+        .execute(&mut *txn)
+        .await
+        .map_err(db_error)?;
     sqlx::query(
         "INSERT INTO control.rate_buckets (tenant_id, subject_kind, subject_id, operation, bucket_key, capacity, tokens, refill_per_second) \
          VALUES ($1, $2, $3, $4, $5, $6, $6, $7) ON CONFLICT DO NOTHING")

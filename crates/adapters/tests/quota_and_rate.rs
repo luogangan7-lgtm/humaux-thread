@@ -712,3 +712,55 @@ fn expired_reservation_is_reaped_without_charging() {
         assert_eq!((after.get::<_, i64>(0), after.get::<_, i64>(1)), (0, 0));
     });
 }
+
+/// Card 24 soak (2026-09-26): both lanes share the pre-auth `ip` bucket, and the request that
+/// lost `pg_try_advisory_xact_lock` was answered `RATE_LIMITED` while the bucket held 99 of
+/// 100 tokens — §72.3's code for "秒/分钟级速率超限" reported for a lock race any two clients
+/// behind one NAT would hit. A contended bucket now WAITS for its holder. Fault control: put
+/// the try-lock back and this reads `Err(RateLimited)` after ~0 ms.
+#[test]
+#[ignore = "lane(a:request_guard) requires migration 0113 and the dedicated request-guard PostgreSQL fixture"]
+fn a_contended_rate_bucket_waits_for_its_holder_instead_of_answering_rate_limited() {
+    run_db_fixture::<Fixture, _>("rate_bucket_contention", |mut h| {
+        issue(&mut h, 0);
+        let policy = RatePolicy::new(100, 100).unwrap();
+        let key = format!(
+            "rate:{}:user:{}:mcp.read:default",
+            h.auth.tenant_id().0,
+            h.auth.user_id().expect("fixture auth carries a user").0
+        );
+        // Another session holds the bucket's lock for 500 ms — the shape of a concurrent
+        // request on the same bucket. Its own connection, so the wait is a real cross-session
+        // lock wait and not the pool handing the consumer the holder's connection.
+        let dsn = std::env::var("HUMAUX_GATEWAY_PG_DSN").expect("fixture env");
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let mut client = Client::connect(&dsn, NoTls).expect("holder connects");
+            let mut txn = client.transaction().expect("holder txn");
+            txn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&key],
+            )
+            .expect("hold the bucket lock");
+            held_tx.send(()).expect("signal the lock is held");
+            std::thread::sleep(Duration::from_millis(500));
+            txn.commit().expect("release the bucket lock");
+        });
+        held_rx.recv().expect("holder took the lock");
+        let started = Instant::now();
+        let result = h.rt.block_on(quota_repo::consume_rate(
+            &h.runtime,
+            RateSubject::User(&h.auth),
+            "mcp.read",
+            "default",
+            policy,
+        ));
+        let held_for = started.elapsed();
+        holder.join().expect("holder thread");
+        assert_eq!(result, Ok(()), "contention is a wait, not a rate verdict");
+        assert!(
+            held_for >= Duration::from_millis(400),
+            "the consumer waited for the holder rather than refusing: {held_for:?}"
+        );
+    });
+}

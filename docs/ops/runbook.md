@@ -1,0 +1,152 @@
+# Deploy runbook — first deployment and every one after
+
+> Scope: the **ordered** steps to stand this system up and prove it is up. It does not repeat
+> what already has a home: process/probe semantics are `docs/ops/supervision.md`, load sizing is
+> `docs/ops/soak.md`, tenant provisioning detail is `docs/ops/e2e-seed.md`, and the evidence
+> behind the delivery claim is `docs/ops/delivery_point_report.md`. Each step below says what
+> must be true before the next one runs.
+
+## 0. Before anything — the four OS users
+
+`humaux-gateway`, `humaux-retrieval-worker`, `humaux-consolidation-worker` and
+`humaux-private-worker` must run as **four distinct OS users**. UDS peer-credential checking is
+by uid (ADR-0012/0014): running two of them as the same user does not fail, it silently degrades
+the check to nothing. This is a deployment property no test on one machine can catch, so it is
+step 0, not a footnote.
+
+`humaux-public-worker` is a scheduled one-shot and may share a user with none of the above.
+
+## 1. Migrations
+
+```sh
+cargo xtask migrate
+```
+
+Exit 0 with drift 0. §46's drift gate refuses any already-applied migration whose file was
+edited — if it fires, the fix is a NEW migration, never an edit to the old one. Every migration
+ships as a pair `NNNN_name.sql` + `NNNN_name.manifest.toml`; a missing manifest is a hard
+refusal, not a warning.
+
+## 2. Roles and grants
+
+`cargo xtask rls-check` must exit 0. It walks the §6.2.2 matrix row for row; a new table or a
+new grant that is not in both the matrix and `xtask/src/rls_check.rs::MATRIX` reds it.
+
+`role_admin` is created **without a password** (`migrations/0110_mechanism_runtime_evidence.sql:70`
+— deployments set it from their secrets manager, which is outside migrations). Provision it
+before the mechanism-observation surface is used.
+
+## 3. Tenant provisioning
+
+Through the membership admin path (card 12/13), **never raw SQL**. §0117 requires all four
+admission limit layers to be present — GLOBAL/REGION shared, tenant, and tenant×purpose. In
+production this is part of tenant onboarding; `docs/ops/e2e-seed.md` describes the same shape
+for a seeded environment.
+
+Qdrant collection creation must include **both** payload indexes: the tenant index and the
+`subject_ids` uuid index. Without the second, subject-scoped recall degrades to an unindexed
+filter (card 9 P2). `cargo run -p xtask -- e2e-seed` PUTs both for every collection it creates
+(`xtask/src/e2e_seed.rs:541-548`, bodies at `crates/adapters/src/qdrant.rs:178-199`) — until
+card 24 it PUT only the tenant index, so **a collection seeded before that change does not have
+the subject index**, and the seed tool short-circuits on an existing collection rather than
+adding it. Re-create such a collection, or PUT `subject_index_body()`'s body against it by
+hand.
+
+## 4. Environment
+
+Per-process env is listed in `docs/ops/supervision.md` and the deployment's own secrets manager.
+Two rules that are not obvious from the variable names:
+
+- **Secrets go in env, never in a file that is read into a log.** The repo's own live env file
+  sources the two key files by path precisely so the values never appear in it.
+- **If the node's resolver lies about a provider host, pin it.** This dev box fake-IPs
+  `api.minimaxi.com` into `198.18.0.0/15`; §11.4 forbids that range and the checked resolver
+  correctly refuses the connection. The refusal is the resolver working, not a defect
+  (ADR-0039). Pin the host, and run proxy-free — a proxy makes the client CONNECT by hostname
+  and the resolver is never consulted at all.
+
+## 5. Start order
+
+1. `humaux-private-worker --serve-rpc` and `--distill-serve`
+2. `humaux-retrieval-worker --serve-rpc`
+3. `humaux-consolidation-worker --serve`
+4. `humaux-gateway`
+
+The order is not a preference: the consolidation worker's `--readyz` probes the private worker's
+UDS peer, and the gateway's semantic recall needs the retrieval worker's socket. Starting a
+consumer before its socket exists produces a readiness failure that names the missing socket
+(`docs/ops/supervision.md` §2) — correct behaviour, but an avoidable page.
+
+## 6. First activation — the step that is easy to miss
+
+A fresh deployment has **no serving projection version**. After the projection worker catches up:
+
+```sh
+cargo xtask projection-serve
+```
+
+ADR-0017: with no serving version, activation is an explicit operator act, not an automatic
+promotion. Later version upgrades go through the §16.2 two-version comparison instead — and see
+`docs/ops/delivery_point_report.md` §6.1 before assuming that comparison will succeed: a tenant
+with any live projected `USER_PRIVATE` point makes the switch refuse with `VisibleUnavailable`.
+
+## 7. Verify it is up
+
+```sh
+curl -fsS http://<gateway>/livez      # 200
+curl -fsS http://<gateway>/readyz     # 200; 503 with `draining` means SIGTERM, do not restart
+humaux-retrieval-worker    --readyz   # exit 0
+humaux-private-worker      --readyz   # exit 0
+humaux-consolidation-worker --readyz  # exit 0
+```
+
+A `--readyz` failure always **names the object that is down** (§4.4 坑5). Never read a probe
+failure as a zero: if a dashboard shows `0` where a probe failed, the dashboard is wrong. The
+probes emit no envelope at all on that path so a `0` cannot be manufactured downstream.
+
+Then one real round trip: `remember.put` → distill pass → projection resolve → `recall.search`
+returns the memory. This is the chain the acceptance suites exercise; a deployment that answers
+`/readyz` but cannot complete it is not up.
+
+### 7.1 Reading the private-worker dispatch line
+
+`humaux-private-worker: distill dispatch … done=N failed=N … rejected=N empty_retries=N malformed_retries=N`
+
+- `distill evidence=<id> failed: InvalidInput (<reason>)` — the parser refused the model's
+  reply. `<reason>` is structural, never payload text: `not_json`, `top_level_shape`,
+  `memories_missing`, `too_many_memories`, `item_shape`, `content_empty_or_too_long`,
+  `memory_type_unknown`, `class_unknown`, `confidence_invalid` (ADR-0048 addendum). The worker
+  re-asks once on its own (`malformed retry 1/1`, counted in `malformed_retries`); a row that
+  still fails is a `FAILED` outbox row and a `FAILED` ticket, which blocks the §15.4 prefix
+  until `role_maintenance` retires it (`projection.retire_failed_ticket`, ADR-0042). A steady
+  `memory_type_unknown` rate above a few percent means the model is ignoring rule (3) of the
+  distill prompt — check the model, not the parser.
+- `memory_candidate_rejections_total{reason="origin_authority_ceiling"} 1 …` — an over-ceiling
+  candidate persisted as PENDING (`memory.confirm` can promote it). Not a failure; the row is
+  still `done=1`.
+- A `MEMORY_LIFECYCLE` ticket for a superseded / revoked / expired memory settles `DONE` by
+  retiring its registry binding and deleting its point (ADR-0049). `registry_failed` on such a
+  ticket means the retrieval worker binary predates ADR-0049.
+
+## 8. Load sizing — read before the first real traffic
+
+The Distill hop makes **one serial provider round trip per Evidence**, so its throughput is the
+provider's, not the database's. Measured on this deployment: **0.229 Evidence/s** (n = 140
+`processing_runs` over 611 s, MiniMax, one resident `--distill-serve`). Ingest above that number
+builds a backlog no amount of correct code will drain.
+
+Size for `tenants × sessions / (think_secs + round_trip_secs) < 0.229`, and **re-measure that
+line whenever the provider or model changes** — it is a property of the deployment, not a
+constant. `docs/ops/soak.md` §"Size the load to the distill hop's capacity" has the full rule and
+what it looks like when it is violated.
+
+## 9. Operating rules that outrank convenience
+
+- **Never kill by port.** `lsof -ti :PORT | xargs kill` and `fuser -k` are banned. On 2026-09-09
+  that exact command terminated the user's WeChat, which happened to hold port 8080. Kill only
+  PIDs you started and recorded, and only after `ps -o comm= -p $PID` confirms the binary name.
+  If a port is busy, use another one and report the conflict.
+- **Never run a DELETE-class command against shared state as a smoke test.** Throwaway database
+  only. See `docs/ops/delivery_point_report.md` §5.2 for the time this rule was learned.
+- **Never stop or restart shared infrastructure containers to simulate an outage.** Point at a
+  closed loopback port or an absent socket instead.

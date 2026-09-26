@@ -920,6 +920,30 @@ fn dimension_mismatch_fails_before_reaching_qdrant() {
                 registered, 0,
                 "a wrong-dimension vector must never reach qdrant::upsert/registration"
             );
+
+            // ADR-0049 D-C, the failed half: a MEMORY_LIFECYCLE ticket that settles FAILED
+            // leaves its carrier outbox row FAILED, not DONE (card 24 review P1 — a failed
+            // lifecycle projection must not read as drained work).
+            let memory_id: Uuid = handle
+                .admin
+                .query_one(
+                    "SELECT memory_id FROM private.memory_records WHERE tenant_id = $1",
+                    &[&handle.tenant_id],
+                )
+                .expect("the one seeded memory")
+                .get(0);
+            let ticket = reissue_lifecycle_ticket(&mut handle, scope_id, memory_id);
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("second run_once succeeds");
+            assert_eq!(outcome.failed, 1, "{outcome:?}");
+            assert_eq!(stream_log_state(&mut handle, &key, ticket), "FAILED");
+            assert_eq!(
+                outbox_status(&mut handle, ticket),
+                "FAILED",
+                "the carrier mirrors the ticket's terminal"
+            );
         },
     );
 }
@@ -2041,4 +2065,185 @@ fn reissued_lifecycle_ticket_reprojects_the_same_point_with_current_subject_ids(
             );
         },
     );
+}
+
+/// ADR-0049 (card 24 rehearsal, 2026-09-26): the MEMORY_LIFECYCLE ticket a `memory.supersede`
+/// issues used to fail `registry_failed` every time — the registry binds live sources only
+/// (`current_source_matches`), and ADR-0018 §4's "re-upsert with status=superseded" predates
+/// it — which wedged the §15.4 prefix behind the ticket and broke every token-carrying recall
+/// on the stream. A dead memory's ticket now retires its binding, removes its point, and
+/// settles `DONE`. Fault control: make `resolve_and_embed` route the superseded memory through
+/// `finish_row` again and this reads `(0, 1)` with `error_class = registry_failed`.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one causal chain — project, supersede, retire, restore, revive — reads best in one place; ADR-0049"
+)]
+fn a_superseded_memory_ticket_retires_its_point_and_settles_done() {
+    run_db_fixture::<Fixture, _>(
+        "a_superseded_memory_ticket_retires_its_point_and_settles_done",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let (_, memory_a) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "the rule before it was replaced",
+                "TENANT_SHARED",
+                None,
+                None,
+            );
+            let (_, memory_b) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "the rule that replaced it",
+                "TENANT_SHARED",
+                None,
+                None,
+            );
+            let provider = Arc::new(TestDoubleProvider::new(
+                embedding_model(),
+                unused_rerank_model(),
+            ));
+            let deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("first run_once succeeds");
+            assert_eq!((outcome.done, outcome.failed), (2, 0), "{outcome:?}");
+            let point_a = point_id_for_memory(&mut handle, memory_a);
+            let point_b = point_id_for_memory(&mut handle, memory_b);
+
+            // §36 supersede, as `memory_governance_repo` writes it (G59-4: status and
+            // superseded_by flip together; `updated_at` is NOT touched — the registry identity
+            // survives, which is what makes the restore below a revive, not a new point).
+            handle
+                .admin
+                .execute(
+                    "UPDATE private.memory_records \
+                        SET status = 'superseded', superseded_by = $2, superseded_at = now() \
+                      WHERE memory_id = $1",
+                    &[&memory_a, &memory_b],
+                )
+                .expect("supersede memory_a");
+            let ticket = reissue_lifecycle_ticket(&mut handle, scope_id, memory_a);
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("second run_once succeeds");
+            assert_eq!(
+                (outcome.done, outcome.failed),
+                (1, 0),
+                "a dead memory's ticket settles DONE instead of wedging the prefix: {outcome:?}"
+            );
+            let key = (
+                handle.tenant_id,
+                "workspace",
+                scope_id,
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            );
+            assert_eq!(stream_log_state(&mut handle, &key, ticket), "DONE");
+            assert_eq!(stream_log_error_class(&mut handle, &key, ticket), None);
+            assert_eq!(
+                projection_highwater(&mut handle, &key),
+                ticket,
+                "the §15.4 prefix advances past the lifecycle ticket"
+            );
+            let live: bool = handle
+                .admin
+                .query_one(
+                    "SELECT projection_live FROM projection.private_memory_points WHERE point_id = $1",
+                    &[&point_a],
+                )
+                .expect("binding row survives, retired")
+                .get(0);
+            assert!(!live, "the superseded memory's binding is retired");
+            let permit = authorize_cell_access(
+                &handle.registry,
+                IntraCellResource::QDRANT_REST,
+                Duration::from_secs(30),
+            )
+            .expect("admin Qdrant permit");
+            let scrolled = scroll_payloads(&handle, &permit, &[point_a, point_b]);
+            let ids = scrolled["result"]["points"]
+                .as_array()
+                .map(|points| {
+                    points
+                        .iter()
+                        .filter_map(|point| point["id"].as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                ids,
+                vec![point_b.to_string()],
+                "the dead memory's point left the index, the live sibling stayed: {scrolled}"
+            );
+            assert_eq!(
+                outbox_status(&mut handle, ticket),
+                "DONE",
+                "ADR-0049 D-C: the ticket's carrier outbox row is settled with the ticket"
+            );
+
+            // ADR-0020 restore, as `restore_atomically` writes it: status back, same
+            // `updated_at`. The re-issued ticket must bring the SAME point back (identity
+            // unchanged → the retired binding is revived, ADR-0049) — the rehearsal's
+            // `restored_memory_is_servable_again = 0` shape is this leg failing.
+            handle
+                .admin
+                .execute(
+                    "UPDATE private.memory_records \
+                        SET status = 'active', superseded_by = NULL, superseded_at = NULL \
+                      WHERE memory_id = $1",
+                    &[&memory_a],
+                )
+                .expect("restore memory_a");
+            let restore_ticket = reissue_lifecycle_ticket(&mut handle, scope_id, memory_a);
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("third run_once succeeds");
+            assert_eq!((outcome.done, outcome.failed), (1, 0), "{outcome:?}");
+            assert_eq!(stream_log_state(&mut handle, &key, restore_ticket), "DONE");
+            assert_eq!(outbox_status(&mut handle, restore_ticket), "DONE");
+            assert_eq!(
+                point_id_for_memory(&mut handle, memory_a),
+                point_a,
+                "same identity, same deterministic point id"
+            );
+            let live: bool = handle
+                .admin
+                .query_one(
+                    "SELECT projection_live FROM projection.private_memory_points WHERE point_id = $1",
+                    &[&point_a],
+                )
+                .expect("binding row")
+                .get(0);
+            assert!(
+                live,
+                "the restored memory's binding is live again (revived)"
+            );
+            let scrolled = scroll_payloads(&handle, &permit, &[point_a, point_b]);
+            assert_eq!(
+                scrolled["result"]["points"].as_array().map_or(0, Vec::len),
+                2,
+                "the restored memory's point is back in the index: {scrolled}"
+            );
+        },
+    );
+}
+
+/// `ops.outbox.status` of the carrier row behind one ticket of the fixture's `v1` workspace
+/// stream (ADR-0049 D-C).
+fn outbox_status(handle: &mut Handle, stream_seq: i64) -> String {
+    handle
+        .admin
+        .query_one(
+            "SELECT status FROM ops.outbox WHERE tenant_id = $1 AND stream_seq = $2 \
+               AND event_type = 'MEMORY_LIFECYCLE'",
+            &[&handle.tenant_id, &stream_seq],
+        )
+        .expect("carrier outbox row")
+        .get(0)
 }

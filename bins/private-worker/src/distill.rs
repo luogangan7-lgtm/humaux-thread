@@ -27,7 +27,8 @@ use humaux_adapters::{
     contribution_reasoner::ContributionReasonerConfig,
     distill_reasoner::{
         DISTILL_PARSER_VERSION, DISTILL_PROCESSOR_KIND, DISTILL_PROCESSOR_VERSION,
-        DistillEnvelopeInput, DistillReasoner, distill_prompt_contract, parse_distill_output,
+        DistillEnvelopeInput, DistillReasoner, distill_prompt_contract,
+        parse_distill_output_detailed,
     },
     distill_repo::{
         self, ClaimedEvidence, DbError, LoadedEvidence, NewMemory, OutboxTerminal,
@@ -101,6 +102,15 @@ pub struct DistillPassReport {
     pub heartbeats: u32,
     pub memories: u32,
     pub rejected: u32,
+    /// ADR-0048 (card 24): provider round trips this pass spent re-asking after a CLEAN parse
+    /// returned zero candidates. Counted, not assumed — "the retry happened" is the only
+    /// observable difference between the fixed hop and the 2026-09-19 / 2026-09-20 shape where
+    /// `done: 1, memories: 0` settled silently, and a test that cannot see it passes either way.
+    pub empty_retries: u32,
+    /// ADR-0048 addendum (card 24 soak, 2026-09-26): provider round trips this pass spent
+    /// re-asking after a reply the parser refused. Same reason `empty_retries` exists — counted
+    /// so the retry is visible in the pass line, not inferred.
+    pub malformed_retries: u32,
 }
 
 #[derive(Debug)]
@@ -250,6 +260,8 @@ impl DistillPassReport {
         self.heartbeats += other.heartbeats;
         self.memories += other.memories;
         self.rejected += other.rejected;
+        self.empty_retries += other.empty_retries;
+        self.malformed_retries += other.malformed_retries;
     }
 }
 
@@ -464,37 +476,107 @@ async fn process_claimed(
     row: ClaimedEvidence,
     report: &mut DistillPassReport,
 ) -> Result<(), DistillError> {
-    let inferred = match infer_claimed(pool, reasoner, distill, row).await {
-        Ok(Some(inferred)) => inferred,
-        Ok(None) => {
-            eprintln!(
-                "humaux-private-worker: distill evidence={} failed: no_output",
-                row.evidence_id
-            );
-            return settle_failed(pool, distill, row, report).await;
+    // ADR-0048 (card 24), the backstop half of option (c). The menu fix in
+    // `distill_prompt_contract` removes the model's REASON to answer nothing; this removes the
+    // silence when it does anyway. A pass that parses clean but yields ZERO candidates is
+    // re-asked once — a second provider round trip with its own `processing_runs` row, its own
+    // disclosure and its own ledger leg, so the retry is auditable rather than inferred. After
+    // the budget the empty answer is accepted as §15.5's legitimate "0 of 0/1/N": the parser is
+    // NOT made to fail on `{"memories":[]}` (that would reverse §15.5 and the pinned
+    // `distill_parser_accepts_the_contract_shape_including_zero_memories`), the worker just
+    // stops treating an empty answer as unremarkable.
+    // ponytail: one flat retry, no backoff and no per-evidence memory of past emptiness —
+    // upgrade path is a jitter/backoff budget if a corpus ever makes the second call expensive.
+    const DISTILL_EMPTY_RETRY_BUDGET: u32 = 1;
+    let mut empty_retries = 0_u32;
+    const DISTILL_MALFORMED_RETRY_BUDGET: u32 = 1;
+    let mut malformed_retries = 0_u32;
+    let (inferred, candidates) = loop {
+        let inferred = match infer_claimed(pool, reasoner, distill, row).await {
+            Ok(Some(inferred)) => inferred,
+            Ok(None) => {
+                eprintln!(
+                    "humaux-private-worker: distill evidence={} failed: no_output",
+                    row.evidence_id
+                );
+                return settle_failed(pool, distill, row, report).await;
+            }
+            // Environmental, per ADR-0016 D5 — the row goes back to PENDING. The CLASS travels
+            // with it: `PrivateReasoningError`'s Display is redacted by construction, so before
+            // card 16 this arm was the end of the road for the only information that mattered
+            // (why tenant B never distilled: `configured provider does not match admitted
+            // route`).
+            Err(DistillError::Reasoning(error)) => {
+                let reason = error
+                    .class()
+                    .unwrap_or("unclassified private reasoning failure");
+                return settle_deferred(pool, distill, row, reason, report).await;
+            }
+            Err(other) => return Err(other),
+        };
+        let candidates = match parse_distill_output_detailed(&inferred.output_bytes) {
+            Ok(candidates) => candidates,
+            Err(reason) => {
+                // Structural class only (`DistillParseError`), never payload text. Card 24 soak
+                // (2026-09-26): 8 of 29 live distills failed here as a bare `InvalidInput`,
+                // undiagnosable until a live probe showed every one was
+                // `memory_type: "Requirement"` — a type rule (1) primed and the menu never
+                // offered. The prompt now names the mapping; this is the backstop for the model
+                // that ignores it anyway: one more round trip (its own run / disclosure / ledger
+                // rows), then the row fails exactly as before. The abandoned attempt keeps
+                // ADR-0016 D4's failure marker (`completed_at IS NULL`) — unlike the empty
+                // retry below, a reply the parser refused IS a failed attempt.
+                if malformed_retries < DISTILL_MALFORMED_RETRY_BUDGET {
+                    malformed_retries += 1;
+                    report.malformed_retries += 1;
+                    eprintln!(
+                        "humaux-private-worker: distill evidence={} malformed reply ({reason}), retry {malformed_retries}/{DISTILL_MALFORMED_RETRY_BUDGET}",
+                        row.evidence_id
+                    );
+                    continue;
+                }
+                eprintln!(
+                    "humaux-private-worker: distill evidence={} failed: InvalidInput ({reason})",
+                    row.evidence_id
+                );
+                return settle_failed(pool, distill, row, report).await;
+            }
+        };
+        if !candidates.is_empty() || empty_retries >= DISTILL_EMPTY_RETRY_BUDGET {
+            break (inferred, candidates);
         }
-        // Environmental, per ADR-0016 D5 — the row goes back to PENDING. The CLASS travels with
-        // it: `PrivateReasoningError`'s Display is redacted by construction, so before card 16
-        // this arm was the end of the road for the only information that mattered (why tenant B
-        // never distilled: `configured provider does not match admitted route`).
-        Err(DistillError::Reasoning(error)) => {
-            let reason = error
-                .class()
-                .unwrap_or("unclassified private reasoning failure");
-            return settle_deferred(pool, distill, row, reason, report).await;
-        }
-        Err(other) => return Err(other),
-    };
-    let candidates = match parse_distill_output(&inferred.output_bytes) {
-        Ok(candidates) => candidates,
-        Err(error) => {
-            // Wire-level class only (ErrorCode / redacted reasoning error), never payload text.
-            eprintln!(
-                "humaux-private-worker: distill evidence={} failed: {error:?}",
-                row.evidence_id
-            );
-            return settle_failed(pool, distill, row, report).await;
-        }
+        // Card 24 review P1: the abandoned attempt is a provider call that SUCCEEDED and
+        // yielded zero candidates, not a failed one. Leaving its row `completed_at IS NULL`
+        // would claim the ADR-0016 D4 failure marker (`distill_repo::finish_processing_run`
+        // doc) and make an empty-retry byte-identical to d6's deferred-provider-failure shape.
+        // Close it with its own digest and `output_count = 0` — 0064's
+        // `processing_runs_completed_has_output` is satisfied and the retry reads as two
+        // completed attempts, the second of which produced the memories.
+        let abandoned_digest: [u8; 32] = Sha256::digest(&inferred.output_bytes).into();
+        // `begin_write_context` — its doc names `finish_processing_run` as one of the three
+        // write-leg statements, so the abandoned close runs in the same context the final one
+        // does rather than in the read context that merely opened the run.
+        let mut abandoned_txn = distill_repo::begin_write_context(
+            pool,
+            distill.tenant_id,
+            inferred.evidence.rls_user_id,
+        )
+        .await?;
+        distill_repo::finish_processing_run(
+            &mut abandoned_txn,
+            inferred.processing_run_id,
+            &abandoned_digest,
+            0,
+            Some(&inferred.disclosure_id.to_string()),
+        )
+        .await?;
+        abandoned_txn.commit().await?;
+        empty_retries += 1;
+        report.empty_retries += 1;
+        eprintln!(
+            "humaux-private-worker: distill evidence={} returned zero candidates, retry {empty_retries}/{DISTILL_EMPTY_RETRY_BUDGET}",
+            row.evidence_id
+        );
     };
 
     let evidence = &inferred.evidence;
@@ -627,7 +709,6 @@ async fn infer_claimed(
     distill: &DistillConfig,
     row: ClaimedEvidence,
 ) -> Result<Option<Inferred>, DistillError> {
-    let contract = distill_prompt_contract();
     let mut txn = distill_repo::begin_read_context(pool, distill.tenant_id).await?;
     let (binding_id, binding_version) =
         distill_repo::resolve_distill_binding(&mut txn, distill.reasoning_domain_id)
@@ -656,6 +737,13 @@ async fn infer_claimed(
     };
     let context_snapshot_seq =
         distill_repo::context_snapshot_seq(&mut txn, distill.tenant_id).await?;
+
+    // ADR-0048: ONE ceiling, resolved once here, feeds both the rendered contract (the class
+    // menu the model reads) and the envelope's `max_class`. They cannot drift apart because
+    // they are the same value; before card 24 the contract was ceiling-blind and the envelope
+    // carried a constraint the prompt asked the model to enforce on itself.
+    let ceiling = evidence.origin_class.authority_ceiling(MemoryType::Fact);
+    let contract = distill_prompt_contract(ceiling);
 
     let evidence_hashes = [evidence_axis(&evidence)?];
     let prompt_hash = hex::encode(contract.sha256.0);
@@ -697,7 +785,7 @@ async fn infer_claimed(
 
     let envelope = DistillEnvelopeInput {
         origin_class: &evidence.origin_class_wire,
-        max_class: evidence.origin_class.authority_ceiling(MemoryType::Fact),
+        max_class: ceiling,
         occurred_at: evidence.occurred_at,
         payload: &evidence.payload,
     };
@@ -772,6 +860,25 @@ async fn settle_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Card 24 review P1: `dispatch_pass` folds the per-tenant reports with `add`, so a counter
+    /// `add` forgets is structurally zero on the only line production prints — which is what
+    /// `malformed_retries` was until this test existed.
+    #[test]
+    fn add_folds_every_retry_counter() {
+        let mut total = DistillPassReport::default();
+        total.add(DistillPassReport {
+            empty_retries: 2,
+            malformed_retries: 3,
+            ..DistillPassReport::default()
+        });
+        total.add(DistillPassReport {
+            empty_retries: 1,
+            malformed_retries: 1,
+            ..DistillPassReport::default()
+        });
+        assert_eq!((total.empty_retries, total.malformed_retries), (3, 4));
+    }
 
     #[test]
     fn config_is_closed() {

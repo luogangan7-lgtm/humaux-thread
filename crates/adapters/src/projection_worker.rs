@@ -88,11 +88,13 @@ use sqlx::types::time::OffsetDateTime;
 use crate::postgres::RetrievalWorkerDbPool;
 use crate::private_projection_registry::{
     self, PrivateMemoryPointRegistration, PrivateProjectionRegistryError, RegistrationOutcome,
+    retire_points_for_memory,
 };
 use crate::qdrant::{
-    self, PointId, QdrantOperation, QdrantPointPayload, TenantPlacementRow, ha_profile_for,
-    verify_visible_via_transport,
+    self, PointId, QdrantOperation, QdrantPointPayload, TenantPlacementRow, delete_points,
+    ha_profile_for, verify_visible_via_transport,
 };
+use crate::remember;
 use crate::stream_repo;
 
 /// The dense-write embedding call this worker needs, shaped like
@@ -510,10 +512,18 @@ async fn process_row(
     //     `AlreadyRegistered`, verify), so the memories that already landed simply land again;
     //   * `SKIPPED_BY_POLICY` is per-memory (§18.2 secret material), so it only becomes the
     //     row's terminal when NO memory on this Evidence was indexable;
-    //   * one indexed memory makes the row `DONE`.
+    //   * one indexed memory makes the row `DONE`;
+    //   * a memory that is no longer live (ADR-0049) is retired instead of indexed, and a
+    //     retirement that lands counts toward `DONE` like an index write.
     let mut any_done = false;
     let mut skipped: Option<(RowTerminal, &'static str)> = None;
-    for (memory, vector) in prepared {
+    for memory in prepared.dead {
+        match retire_row(deps, workspace_id, &memory).await {
+            (RowTerminal::Done, _) => any_done = true,
+            other => return other,
+        }
+    }
+    for (memory, vector) in prepared.live {
         match finish_row(deps, stream_seq, workspace_id, memory, vector).await {
             (RowTerminal::Done, _) => any_done = true,
             (RowTerminal::SkippedByPolicy, class) => {
@@ -530,6 +540,13 @@ async fn process_row(
     }
 }
 
+/// What [`resolve_and_embed`] hands [`process_row`]: the live memories with their vectors, and
+/// the memories whose ticket means retirement (ADR-0049). Never both empty.
+struct Prepared {
+    live: Vec<(ResolvedMemory, Vec<f32>)>,
+    dead: Vec<ResolvedMemory>,
+}
+
 /// (b)-(d) of the module doc's per-row order: resolve the bound Evidence's Memories, build+seal
 /// each card, and embed them in ONE batch. Split out of [`process_row`] purely to stay under
 /// this repo's line-count lint — see that function for the full per-row order. Returns a
@@ -538,7 +555,7 @@ async fn resolve_and_embed(
     deps: &ProjectionWorkerDeps,
     workspace_id: WorkspaceId,
     commit_seq: i64,
-) -> Result<Vec<(ResolvedMemory, Vec<f32>)>, (RowTerminal, &'static str)> {
+) -> Result<Prepared, (RowTerminal, &'static str)> {
     let mut txn = deps
         .pool
         .pool()
@@ -570,6 +587,14 @@ async fn resolve_and_embed(
     if memories.is_empty() {
         return Err(terminal_for_missing_memory(outbox_status.as_deref()));
     }
+    // ADR-0049: a memory that stopped being live (superseded / revoked / expired) gets no card,
+    // no vector and no registration — the registry binds live sources only
+    // (`current_source_matches`), so the ticket's consequence for it is retirement
+    // (`retire_row`). Before this the supersede ticket failed `registry_failed` every time
+    // (card 24 rehearsal 2026-09-26) and wedged the §15.4 prefix behind it.
+    let (dead, memories): (Vec<ResolvedMemory>, Vec<ResolvedMemory>) = memories
+        .into_iter()
+        .partition(|memory| memory.status != AuthorityStatus::Active);
 
     // §18.2 `ExcludedSecret` is a property of ONE memory, not of the ticket: on an Evidence that
     // carries a secret memory and an ordinary one, the ordinary one must still be indexed. Only
@@ -595,7 +620,13 @@ async fn resolve_and_embed(
         kept.push(memory);
     }
     if kept.is_empty() {
-        return Err((RowTerminal::SkippedByPolicy, "secret_material"));
+        if dead.is_empty() {
+            return Err((RowTerminal::SkippedByPolicy, "secret_material"));
+        }
+        return Ok(Prepared {
+            live: Vec::new(),
+            dead,
+        });
     }
 
     // One embed call for the whole Evidence — `embed_cards` is already batch-shaped, so N
@@ -625,7 +656,10 @@ async fn resolve_and_embed(
         return Err((RowTerminal::Failed, "embedding_dimension_mismatch"));
     }
 
-    Ok(kept.into_iter().zip(vectors).collect())
+    Ok(Prepared {
+        live: kept.into_iter().zip(vectors).collect(),
+        dead,
+    })
 }
 
 /// (e)-(h) of the module doc's per-row order: build the payload, upsert, register, verify.
@@ -701,7 +735,11 @@ async fn finish_row(
     )
     .await
     {
-        Ok(RegistrationOutcome::Inserted | RegistrationOutcome::AlreadyRegistered) => {}
+        Ok(
+            RegistrationOutcome::Inserted
+            | RegistrationOutcome::AlreadyRegistered
+            | RegistrationOutcome::Revived,
+        ) => {}
         Err(PrivateProjectionRegistryError::PointIdCollision)
         | Err(PrivateProjectionRegistryError::IdentityAlreadyBound)
         | Err(PrivateProjectionRegistryError::RegistryRaceLost) => {
@@ -722,6 +760,53 @@ async fn finish_row(
         _ => return (RowTerminal::Failed, "visibility_not_confirmed"),
     }
 
+    (RowTerminal::Done, "")
+}
+
+/// ADR-0049: the projection consequence of a memory that is no longer live. The registry binds
+/// live sources only, so the memory's bindings in this family are retired and every point ever
+/// bound for it (live or already retired — retry-safe) leaves the index. `DONE` settles the
+/// ticket and lets the §15.4 prefix advance past it; the reader's PG re-check
+/// (`resolve_private_memory_points`) never served the dead memory anyway, so this is hygiene
+/// plus settlement, not a visibility change.
+async fn retire_row(
+    deps: &ProjectionWorkerDeps,
+    workspace_id: WorkspaceId,
+    memory: &ResolvedMemory,
+) -> (RowTerminal, &'static str) {
+    let authorization = worker_authorization_scope(&deps.family, workspace_id);
+    let points = match retire_points_for_memory(
+        &deps.pool,
+        &authorization,
+        &deps.family,
+        &deps.projection_version,
+        &deps.embedding_version,
+        memory.memory_id,
+    )
+    .await
+    {
+        Ok(points) => points,
+        Err(_) => return (RowTerminal::Failed, "registry_failed"),
+    };
+    if points.is_empty() {
+        return (RowTerminal::Done, "");
+    }
+    let ids = points
+        .iter()
+        .map(|point| PointId::Uuid(point.as_uuid()))
+        .collect::<Vec<_>>();
+    if delete_points(
+        deps.transport.as_ref(),
+        &deps.permit,
+        &deps.placement.collection_name,
+        &ids,
+        ha_profile_for(QdrantOperation::CorrectionDeleteSupersede),
+    )
+    .await
+    .is_err()
+    {
+        return (RowTerminal::Failed, "qdrant_delete_failed");
+    }
     (RowTerminal::Done, "")
 }
 
@@ -791,6 +876,7 @@ async fn settle_row(
     pool: &RetrievalWorkerDbPool,
     key: &StreamKey,
     stream_seq: i64,
+    commit_seq: i64,
     terminal: RowTerminal,
     error_class: &str,
 ) -> Result<(), ErrorCode> {
@@ -823,6 +909,31 @@ async fn settle_row(
     .execute(&mut *txn)
     .await
     .map_err(|_| ErrorCode::Internal)?;
+    // ADR-0049 D-C: the ticket's carrier row. A MEMORY_LIFECYCLE / MEMORY_PUBLISHED outbox row
+    // exists to bind `evidence_id` to this ticket (ADR-0018 §4); no distiller ever claims it,
+    // so until now it stayed PENDING forever and every "backlog drained" measure (the soak's
+    // `backlog_drained`, the rehearsal's undrained-writes assertion) counted it as open work.
+    // The settled ticket is its completion, and the carrier MIRRORS the ticket's terminal:
+    // DONE / SKIPPED_BY_POLICY settle it DONE, a FAILED ticket leaves it FAILED — a failed
+    // lifecycle projection must not read as drained work (card 24 review P1). EVIDENCE_ACCEPTED
+    // rows belong to the distiller and are kept apart by the event_type filter, not by status.
+    let carrier_status = if terminal == RowTerminal::Failed {
+        "FAILED"
+    } else {
+        "DONE"
+    };
+    sqlx::query(
+        "UPDATE ops.outbox SET status = $4, processed_at = now() \
+         WHERE tenant_id = $1 AND commit_seq = $2 AND event_type = ANY($3) \
+           AND status = 'PENDING'",
+    )
+    .bind(key.tenant_id.0)
+    .bind(commit_seq)
+    .bind(vec![remember::MEMORY_LIFECYCLE, remember::MEMORY_PUBLISHED])
+    .bind(carrier_status)
+    .execute(&mut *txn)
+    .await
+    .map_err(|_| ErrorCode::Internal)?;
     txn.commit().await.map_err(|_| ErrorCode::Internal)?;
     Ok(())
 }
@@ -849,7 +960,15 @@ pub async fn run_once(
     let mut outcome = RunOnceOutcome::default();
     for (stream_seq, commit_seq) in rows {
         let (terminal, error_class) = process_row(deps, stream_seq, commit_seq).await;
-        settle_row(&deps.pool, &key, stream_seq, terminal, error_class).await?;
+        settle_row(
+            &deps.pool,
+            &key,
+            stream_seq,
+            commit_seq,
+            terminal,
+            error_class,
+        )
+        .await?;
         match terminal {
             RowTerminal::Done => outcome.done += 1,
             RowTerminal::SkippedByPolicy => outcome.skipped_by_policy += 1,

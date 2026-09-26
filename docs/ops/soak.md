@@ -287,3 +287,19 @@ Three more are available live at zero injection cost, because every threshold is
 
 Run one of these whenever the harness itself has been edited. A green soak that cannot be made
 red is not evidence.
+
+## Failed calls
+
+`latency[]` carries `failed_calls` per operation — a call that returned non-200, `isError:true`
+or a transport error. No verdict is keyed to it, so it is easy to read past; since card 24
+(2026-09-26) every failed call also prints one stderr line the moment it happens:
+
+```
+soak: remember failed on lane soak-sentinel-<tenant> after 42ms: RATE_LIMITED
+```
+
+The head of the reply (240 chars) is what makes a failed call investigable. That line is how
+rehearsal4 found that the request guard answered `RATE_LIMITED` on advisory-lock contention
+between the two lanes' shared pre-auth `ip` bucket (fixed in `quota_repo::consume_rate` — the
+bucket now waits for its holder). A soak whose `failed_calls` are not zero owes an explanation
+per line in its evidence, not a threshold.

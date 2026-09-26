@@ -1022,19 +1022,41 @@ fn d1_live_distill_writes_memories_and_projection_resolves_ticket() {
     assert_eq!(o.run_source_hash_len, 32);
     assert_eq!(
         o.run_prompt_hash,
-        hex::encode(distill_prompt_contract().sha256.0),
+        hex::encode(
+            distill_prompt_contract(humaux_domain::authority::AuthorityClass::PrivateKnowledge)
+                .sha256
+                .0
+        ),
         "prompt_hash column is the contract sha256"
     );
     assert_eq!(o.run_parser_version, DISTILL_PARSER_VERSION);
-    assert_eq!(o.disclosure_outcomes, vec!["SUCCESS".to_owned()]);
-    // Card 20 acceptance, the positive half: ONE §19.1 ledger row for this provider call, with
+    // ADR-0048: one round trip per attempt, and the ADR-0048 empty-retry is an attempt. The
+    // expected count is derived from the report's own counter rather than hard-coded at 1, so
+    // the §7.4 / §19.1 "every call leaves a receipt" invariant is still what is being tested —
+    // a retry that left NO disclosure or NO ledger row still goes red.
+    // …and so is a malformed-reply retry (ADR-0048 addendum D-D): the live model answered
+    // `memory_type: "Requirement"` 8 of 29 times on 2026-09-26, and a retry that is not counted
+    // here turns this test red for a fixed hop (card 24 review P1).
+    let attempts = 1 + report.empty_retries as i64 + report.malformed_retries as i64;
+    assert_eq!(
+        o.disclosure_outcomes.len(),
+        attempts as usize,
+        "one §7.4 disclosure per attempt: {report:?} {:?}",
+        o.disclosure_outcomes
+    );
+    assert!(
+        o.disclosure_outcomes.iter().all(|o| o == "SUCCESS"),
+        "{:?}",
+        o.disclosure_outcomes
+    );
+    // Card 20 acceptance, the positive half: ONE §19.1 ledger row per provider call, with
     // the right purpose/model/status and real token usage — BOTH it and the §7.4 disclosure row
     // above, never either alone. Deleting `distill_reasoner::infer`'s `reserve_private_call` or
     // `finalize_private_call` turns this red.
     let l = &o.ledger;
     assert_eq!(
-        l.rows, 1,
-        "exactly one ops.model_call_ledger row for the distill provider call"
+        l.rows, attempts,
+        "one ops.model_call_ledger row per distill provider call: {report:?}"
     );
     assert_eq!(l.status.as_deref(), Some("SUCCEEDED"));
     assert_eq!(l.purpose.as_deref(), Some("PRIVATE_DISTILL_TEXT"));
@@ -1344,13 +1366,29 @@ fn d3_zero_memories_settles_outbox_and_ticket() {
     };
     let (evidence_id, _, stream_seq) = seed_evidence(&mut f, "hi there");
     let rt = tokio::runtime::Runtime::new().expect("rt");
-    let provider = FakeProvider::new(vec![r#"{"memories":[]}"#]);
+    // ADR-0048 (card 24): an empty answer is re-asked ONCE before it settles, so the fixture
+    // must hand out two replies and the pass must report exactly one `empty_retries`. This is
+    // the observable that the 2026-09-19 / 2026-09-20 `done: 1, memories: 0` chains lacked.
+    let provider = FakeProvider::new(vec![r#"{"memories":[]}"#, r#"{"memories":[]}"#]);
     let report = run_pass(&rt, &f, &provider, "d3-worker");
     assert_eq!(report.done, 1, "{report:?}");
+    assert_eq!(
+        report.empty_retries, 1,
+        "one bounded retry, then settle: {report:?}"
+    );
+    assert_eq!(provider.calls(), 2, "the retry is a real second round trip");
     let o = observe(&mut f, evidence_id);
     assert_eq!(o.memories, 0);
     assert_eq!(o.outbox_status, "DONE");
     assert_eq!(o.run_output_count, Some(0));
+    // Card 24 review P1 sentinel: BOTH attempts are closed. If the abandoned first run is ever
+    // left `completed_at IS NULL` again this reads (2, 1) — d6's deferred-provider-FAILURE
+    // shape at :1607 — i.e. a succeeded-but-empty provider call recorded as a failed one.
+    assert_eq!(
+        processing_runs(&mut f, evidence_id),
+        (2, 2),
+        "empty-retry: two run rows, both completed (neither is a failure marker)"
+    );
 
     // ADR-0026 (Card 6) D-B: a SKIPPED_BY_POLICY pass (0 outputs) is NOT a rejected candidate —
     // it creates no queue row. FAULT SENTINEL: goes red if a 0-output pass ever persists a
@@ -1424,9 +1462,14 @@ fn d4_parser_fail_closed_marks_outbox_failed() {
     let (bad_enum, _, _) = seed_evidence(&mut f, "bad enum evidence");
     let (extra_key, _, _) = seed_evidence(&mut f, "extra key evidence");
     let rt = tokio::runtime::Runtime::new().expect("rt");
-    // Claim order is commit_seq ascending, so the replies line up with the two rows.
+    // ADR-0048 addendum (card 24 soak): a refused reply is re-asked ONCE, so each row consumes
+    // two replies (`FakeProvider::new` serves them in vec order; claim order is commit_seq
+    // ascending). Both attempts of each row are malformed here, so both rows still fail closed
+    // — with the retry counted.
     let provider = FakeProvider::new(vec![
         r#"{"memories":[{"content":"c","memory_type":"Constraint","class":"PrivateKnowledge","confidence":0.5}]}"#,
+        r#"{"memories":[{"content":"c","memory_type":"Constraint","class":"PrivateKnowledge","confidence":0.5}]}"#,
+        r#"{"memories":[{"content":"c","memory_type":"Fact","class":"PrivateKnowledge","confidence":0.5,"leak":"x"}]}"#,
         r#"{"memories":[{"content":"c","memory_type":"Fact","class":"PrivateKnowledge","confidence":0.5,"leak":"x"}]}"#,
     ]);
     let report = run_pass(&rt, &f, &provider, "d4-worker");
@@ -1434,6 +1477,15 @@ fn d4_parser_fail_closed_marks_outbox_failed() {
     assert_eq!(report.failed, 2, "{report:?}");
     assert_eq!(report.done, 0);
     assert_eq!(report.memories, 0);
+    assert_eq!(
+        report.malformed_retries, 2,
+        "one bounded retry per refused row, then fail closed: {report:?}"
+    );
+    assert_eq!(
+        provider.calls(),
+        4,
+        "each retry is a real second round trip"
+    );
     for evidence_id in [bad_enum, extra_key] {
         let o = observe(&mut f, evidence_id);
         assert_eq!(o.memories, 0, "fail-closed parse writes no memory row");
@@ -1449,14 +1501,55 @@ fn d4_parser_fail_closed_marks_outbox_failed() {
         );
         assert_eq!(
             o.disclosure_outcomes,
-            vec!["SUCCESS".to_owned()],
-            "bytes did leave; the reply was the problem"
+            vec!["SUCCESS".to_owned(), "SUCCESS".to_owned()],
+            "bytes did leave twice; the replies were the problem"
         );
     }
     // FAILED is terminal (input-bound rejection): a second pass claims nothing.
     let again = run_pass(&rt, &f, &FakeProvider::new(vec![]), "d4-worker-2");
     assert_eq!(again.claimed, 0);
     println!("D4 ASSERTION LOG: report={report:?} second_pass={again:?}");
+}
+
+/// ADR-0048 addendum (card 24 soak, 2026-09-26): a reply the parser refuses is re-asked ONCE.
+/// The live model wrote `memory_type: "Requirement"` in 8 of 29 soak distills, and every one
+/// became a permanent `FAILED` ticket that wedged the §15.4 prefix. The abandoned attempt keeps
+/// ADR-0016 D4's failure marker — it WAS a failed attempt, unlike d3's succeeded-but-empty one.
+#[test]
+fn d4b_a_malformed_reply_is_re_asked_once_then_settles() {
+    let Some(mut f) = setup_db("d4b_a_malformed_reply_is_re_asked_once_then_settles") else {
+        return;
+    };
+    let (evidence_id, _, _) = seed_evidence(&mut f, "a rule the model first mistyped");
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    // Vec order is call order: the invented type first, the contract shape second.
+    let provider = FakeProvider::new(vec![
+        r#"{"memories":[{"content":"c","memory_type":"Requirement","class":"PrivateKnowledge","confidence":0.9}]}"#,
+        r#"{"memories":[{"content":"c","memory_type":"Decision","class":"PrivateKnowledge","confidence":0.9}]}"#,
+    ]);
+    let report = run_pass(&rt, &f, &provider, "d4b-worker");
+    assert_eq!(report.done, 1, "{report:?}");
+    assert_eq!(report.failed, 0, "{report:?}");
+    assert_eq!(report.malformed_retries, 1, "one bounded retry: {report:?}");
+    assert_eq!(provider.calls(), 2, "the retry is a real second round trip");
+    let o = observe(&mut f, evidence_id);
+    assert_eq!(o.memories, 1);
+    assert_eq!(o.outbox_status, "DONE");
+    assert!(
+        o.run_completed,
+        "the attempt that produced the memory is closed"
+    );
+    assert_eq!(
+        processing_runs(&mut f, evidence_id),
+        (2, 1),
+        "two attempts: the refused one keeps D4's failure marker, the second completed"
+    );
+    assert_eq!(
+        o.disclosure_outcomes.len(),
+        2,
+        "one §7.4 disclosure per attempt"
+    );
+    println!("D4B ASSERTION LOG: report={report:?}");
 }
 
 // ----------------------------------------------------------------------------

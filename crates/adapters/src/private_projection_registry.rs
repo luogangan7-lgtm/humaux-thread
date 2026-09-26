@@ -100,6 +100,9 @@ impl PrivateMemoryPointRegistration {
 pub enum RegistrationOutcome {
     Inserted,
     AlreadyRegistered,
+    /// ADR-0049: the identical binding existed but was retired (the memory had been
+    /// superseded); the source is live again under the same identity, so the binding is too.
+    Revived,
 }
 
 /// A candidate whose Qdrant point identity and current PG source both passed validation.
@@ -361,8 +364,25 @@ pub async fn register_private_memory_point(
 
     if let Some(existing) = point_binding_in_txn(&mut txn, registration.point_id).await? {
         if binding_matches(&existing, registration)? {
+            // ADR-0049: an identical registration of a RETIRED binding is a restore — the
+            // source is live again under the same identity (`memory.restore` flips status
+            // back without touching `updated_at`), so the binding comes back with it rather
+            // than staying retired behind an `AlreadyRegistered` nobody could resolve
+            // (card 24 rehearsal 2026-09-26: `restored_memory_is_servable_again = 0`).
+            let revived = sqlx::query(
+                "UPDATE projection.private_memory_points \
+                    SET projection_live = true, retired_at = NULL \
+                  WHERE point_id = $1 AND NOT projection_live",
+            )
+            .bind(registration.point_id.0)
+            .execute(&mut *txn)
+            .await?;
             txn.commit().await?;
-            return Ok(RegistrationOutcome::AlreadyRegistered);
+            return Ok(if revived.rows_affected() == 1 {
+                RegistrationOutcome::Revived
+            } else {
+                RegistrationOutcome::AlreadyRegistered
+            });
         }
         return Err(PrivateProjectionRegistryError::PointIdCollision);
     }
@@ -409,6 +429,59 @@ pub async fn retire_private_memory_point(
     .await?;
     txn.commit().await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// ADR-0049: the projection consequence of a memory that stopped being live (superseded,
+/// revoked, expired). Every binding this family/version holds for it is retired, and every
+/// point id ever bound for it — live or already retired — is returned, so the caller's Qdrant
+/// delete is safe to repeat after a failure between the two writes.
+pub async fn retire_points_for_memory(
+    pool: &RetrievalWorkerDbPool,
+    authorization: &AuthorizationScope,
+    family: &StreamFamily,
+    projection_version: &str,
+    embedding_version: &str,
+    memory_id: MemoryId,
+) -> Result<Vec<ProjectionPointId>, PrivateProjectionRegistryError> {
+    validate_family(authorization, family, projection_version, embedding_version)?;
+    let mut txn = pool.pool().begin().await?;
+    set_authorization_local(&mut txn, authorization).await?;
+    let point_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT point_id FROM projection.private_memory_points \
+          WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3 AND domain = $4 \
+            AND projection_kind = $5 AND projection_version = $6 AND embedding_version = $7 \
+            AND memory_id = $8 \
+          ORDER BY created_at, point_id",
+    )
+    .bind(family.tenant_id.0)
+    .bind(&family.scope_kind)
+    .bind(family.scope_id)
+    .bind(&family.domain)
+    .bind(&family.projection_kind)
+    .bind(projection_version)
+    .bind(embedding_version)
+    .bind(memory_id.0)
+    .fetch_all(&mut *txn)
+    .await?;
+    sqlx::query(
+        "UPDATE projection.private_memory_points \
+            SET projection_live = false, retired_at = now() \
+          WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3 AND domain = $4 \
+            AND projection_kind = $5 AND projection_version = $6 AND embedding_version = $7 \
+            AND memory_id = $8 AND projection_live",
+    )
+    .bind(family.tenant_id.0)
+    .bind(&family.scope_kind)
+    .bind(family.scope_id)
+    .bind(&family.domain)
+    .bind(&family.projection_kind)
+    .bind(projection_version)
+    .bind(embedding_version)
+    .bind(memory_id.0)
+    .execute(&mut *txn)
+    .await?;
+    txn.commit().await?;
+    Ok(point_ids.into_iter().map(ProjectionPointId::new).collect())
 }
 
 /// Resolves only current, live candidate bindings.  Unknown, wrong-family/version, retired,

@@ -1326,7 +1326,7 @@ fn timed(cfg: &Config, lane: &TenantLane, tool: &str, args: &str) -> (Sample, St
     let started = Instant::now();
     let result = call(cfg, lane, tool, args);
     let ms = started.elapsed().as_secs_f64() * 1000.0;
-    match result {
+    let (sample, body) = match result {
         Ok((status, body)) => (
             Sample {
                 op: tool.to_string(),
@@ -1343,7 +1343,19 @@ fn timed(cfg: &Config, lane: &TenantLane, tool: &str, args: &str) -> (Sample, St
             },
             format!("{{\"transport_error\":\"{e}\"}}"),
         ),
+    };
+    // Card 24 rehearsal4 run 1: `remember failed_calls = 1` with nothing anywhere saying
+    // what the reply was. A failed call is a finding; a finding without its shape is
+    // uninvestigable, so the head of the reply goes to stderr (the soak's own log), never
+    // into the report.
+    if !sample.ok {
+        let head: String = body.chars().take(240).collect();
+        eprintln!(
+            "soak: {tool} failed on lane {} after {ms:.0}ms: {head}",
+            lane.sentinel
+        );
     }
+    (sample, body)
 }
 
 fn json_field(body: &str, key: &str) -> Option<String> {

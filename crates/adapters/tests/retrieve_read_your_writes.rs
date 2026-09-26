@@ -2130,3 +2130,95 @@ fn retired_seq_leaves_the_overlay_and_enters_the_contiguous_prefix() {
         },
     );
 }
+
+/// A second `stream_log`/`ops.outbox` row for an Evidence that already has one — the shape
+/// every `memory.supersede` / `memory.restore` / `memory.archive` leaves behind (ADR-0018 §4:
+/// one MEMORY_LIFECYCLE ticket bound to the memory's PRIMARY Evidence).
+fn append_lifecycle_row(handle: &mut Handle, evidence_id: Uuid, stream_seq: i64, state: &str) {
+    let commit_seq: i64 = handle
+        .admin
+        .query_one("SELECT nextval('ops.commit_seq_seq')", &[])
+        .expect("next commit_seq")
+        .get(0);
+    let settled = matches!(
+        state,
+        "DONE" | "SKIPPED_BY_POLICY" | "FAILED" | "TOMBSTONED"
+    );
+    handle
+        .admin
+        .execute(
+            &format!(
+                "INSERT INTO projection.stream_log \
+                   (tenant_id, scope_kind, scope_id, domain, projection_kind, projection_version, \
+                    stream_seq, commit_seq, state{settled_col}) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9{settled_val})",
+                settled_col = if settled { ", settled_at" } else { "" },
+                settled_val = if settled { ", now()" } else { "" },
+            ),
+            &[
+                &handle.tenant_id,
+                &SCOPE_KIND,
+                &handle.tenant_id,
+                &DOMAIN,
+                &PROJECTION_KIND,
+                &PROJECTION_VERSION,
+                &stream_seq,
+                &commit_seq,
+                &state,
+            ],
+        )
+        .expect("insert lifecycle stream_log row");
+    handle
+        .admin
+        .execute(
+            "INSERT INTO ops.outbox (tenant_id, commit_seq, stream_seq, event_type, evidence_id) \
+             VALUES ($1, $2, $3, 'MEMORY_LIFECYCLE', $4)",
+            &[&handle.tenant_id, &commit_seq, &stream_seq, &evidence_id],
+        )
+        .expect("insert lifecycle outbox row");
+}
+
+/// ADR-0049 (card 24 rehearsal, 2026-09-26): an Evidence with a MEMORY_LIFECYCLE row behind it
+/// is ONE overlay object described by its newest row — not a "conflicting copy". Before this,
+/// every token-carrying recall on a stream that had ever superseded a memory failed with
+/// `ConflictingOverlayEvidence` (33 of 33 soak recalls in the rehearsal's tenant A).
+#[test]
+fn an_evidence_with_a_lifecycle_row_surfaces_once_as_its_newest_row() {
+    run_db_fixture::<RetrieveFixture, _>(
+        "an_evidence_with_a_lifecycle_row_surfaces_once_as_its_newest_row",
+        |mut handle| {
+            let evidence_id = seed_evidence_and_stream_row(&mut handle, 1, "DONE");
+            append_lifecycle_row(&mut handle, evidence_id, 2, "ISSUED");
+            let claims = issued_token_claims(&mut handle, 2);
+            let token = retrieve::issue_consistency_token(&claims);
+
+            let envelope = handle
+                .rt
+                .block_on(retrieve::recall_with_overlay(
+                    &handle.gateway,
+                    &token,
+                    &handle.auth,
+                    &handle.family,
+                ))
+                .expect("two rows for one Evidence are not a conflict");
+
+            assert_eq!(
+                envelope.overlay.len(),
+                1,
+                "one object per Evidence: {:?}",
+                envelope.overlay
+            );
+            let candidate = &envelope.overlay[0];
+            assert_eq!(candidate.evidence_id, evidence_id);
+            assert_eq!(candidate.stream_seq, 2, "the newest row describes it");
+            assert_eq!(
+                candidate.processing_state,
+                ProcessingState::Issued,
+                "and its state is the newest ticket's settledness"
+            );
+            let serving = retrieve::private_read_serving_candidates(&[], &envelope)
+                .expect("the serving seam accepts the collapsed overlay");
+            assert_eq!(serving.overlay.len(), 1);
+        },
+    );
+}

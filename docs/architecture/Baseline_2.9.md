@@ -2209,6 +2209,25 @@ MISSING_CONFIRMATION
 | 派生与整合 | 不继承、不复制、不自动重定向任务授权；新记忆版本必须重新授权 |
 | 诊断 | 先枚举绑定义务，再分别报告授权准入、实际装配及缺失；**不得从准入结果反推义务** |
 
+**Ceiling 也是提示词的菜单，不只是拒绝的依据（card 24 / ADR-0048）。** Distill 契约 v1 把
+七个 `AuthorityClass` 全部摆给模型看，再用散文要求它自己遵守一条否定约束（「不得高于
+`max_class`」）。这在实测里不成立：2026-09-08 / 09-09 / 09-19 / 09-20 四次主线 chain 上，
+`d1_live_distill_writes_memories_and_projection_resolves_ticket` 各红一次，两种形状 ——
+越顶被拒（`origin_authority_ceiling`）与干脆空答（`{"memories":[]}`）—— 都是同一个原因：模型
+判定证据配得上一个它被禁止使用的 class 时，只有这两条退路。
+
+契约 v2 起，system prompt 的 class 清单与 JSON schema 的 `class` enum **都由 origin 的 §10.1
+ceiling 渲染**（`crates/adapters/src/distill_reasoner.rs::admissible_classes`）：模型读得到的
+每一个取值都是它可以合法断言的取值，高于 ceiling 的取值不出现在它能看到的任何地方。
+`ExplicitTaskContext` 在**任何** ceiling 下都不入菜单 —— 不是因为没有 origin 够得着 6，而是因为
+I-STORE 无条件拒绝它（上表第一行）。ceiling 的 wire 名折进契约 sha256，所以
+`private.processing_runs.prompt_hash` 随 ceiling 变化，两个不同 ceiling 的 run 不会共享 §16.1
+`source_hash`。
+
+这条**不**改硬规则 3：越顶候选仍然是拒绝，从不静默降级，由
+`distill_hop_e2e::d2_over_ceiling_candidate_rejected_not_downgraded` 钉住。v2 改的是模型面对的
+选项集，不是存储闸的判定。
+
 三条不变量（ADR-0046 逐字保存，此处只留指针形态）：
 
 ```text

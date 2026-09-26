@@ -784,6 +784,37 @@ async fn assert_cross_tenant_collision_and_retirement(
         .unwrap()
         .is_empty()
     );
+    // ADR-0049: an identical registration after retirement (a `memory.restore`, which keeps
+    // the source's identity) revives the binding instead of answering `AlreadyRegistered`
+    // for a row nobody could resolve.
+    assert_eq!(
+        register_private_memory_point(&handle.worker, &handle.authorization, first_registration,)
+            .await
+            .unwrap(),
+        RegistrationOutcome::Revived
+    );
+    assert_eq!(
+        resolve_private_memory_points(
+            &handle.runtime,
+            &handle.authorization,
+            &handle.family,
+            "private-v1",
+            "embed-v1",
+            &[point],
+        )
+        .await
+        .unwrap()
+        .len(),
+        1,
+        "revived = resolvable again"
+    );
+    assert_eq!(
+        register_private_memory_point(&handle.worker, &handle.authorization, first_registration,)
+            .await
+            .unwrap(),
+        RegistrationOutcome::AlreadyRegistered,
+        "a second identical registration of the live binding is the plain no-op"
+    );
 }
 
 fn assert_hash_invalidation(handle: &mut Handle) {

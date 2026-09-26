@@ -90,8 +90,10 @@ pub enum RetrieveError {
     /// A caught-up envelope cannot carry an overlay. Treat a contradictory input as a failed
     /// invariant rather than returning Evidence whose status cannot be explained.
     CaughtUpEnvelopeHasOverlay,
-    /// The authoritative overlay has one object identity per Evidence. Conflicting copies
-    /// cannot be deterministically merged without inventing a processing state.
+    /// The authoritative overlay has one object identity per Evidence. Two rows for one
+    /// Evidence are NOT a conflict (a MEMORY_LIFECYCLE ticket behind its EVIDENCE_ACCEPTED row,
+    /// ADR-0049: the newest row describes it); the SAME row carrying two different facts is,
+    /// and cannot be merged without inventing a processing state.
     ConflictingOverlayEvidence,
     /// The Qdrant candidate query used a version that stopped being the serving projection
     /// before the authoritative PostgreSQL snapshot began. The caller must retry from routing.
@@ -715,19 +717,30 @@ pub(crate) async fn pg_delta_overlay_in_txn(
     .fetch_all(&mut **txn)
     .await?;
 
-    rows.iter()
-        .map(|row| {
-            let state: String = row.try_get("state")?;
-            Ok(OverlayCandidate {
-                stream_seq: row.try_get("stream_seq")?,
-                evidence_id: row.try_get("evidence_id")?,
-                processing_state: ProcessingState::parse(&state)?,
-                memory_ids: row
-                    .try_get::<Option<Vec<Uuid>>, _>("memory_ids")?
-                    .unwrap_or_default(),
-            })
-        })
-        .collect()
+    let mut newest_by_evidence = BTreeMap::<Uuid, OverlayCandidate>::new();
+    for row in &rows {
+        let state: String = row.try_get("state")?;
+        let candidate = OverlayCandidate {
+            stream_seq: row.try_get("stream_seq")?,
+            evidence_id: row.try_get("evidence_id")?,
+            processing_state: ProcessingState::parse(&state)?,
+            memory_ids: row
+                .try_get::<Option<Vec<Uuid>>, _>("memory_ids")?
+                .unwrap_or_default(),
+        };
+        // ADR-0049: one Evidence legitimately owns several rows in the range — its
+        // EVIDENCE_ACCEPTED row plus one MEMORY_LIFECYCLE row per supersede/restore/archive
+        // (ADR-0018 §4). The overlay's identity is the Evidence, and the row that describes it
+        // is the NEWEST one: its state is the settledness of the latest ticket, and
+        // `memory_ids` is the same live-memory set on every row (read from PG, not the row).
+        // `ORDER BY sl.stream_seq` makes the last insert the newest. Before this, every
+        // token-carrying recall on a stream that had ever superseded a memory failed with
+        // `ConflictingOverlayEvidence` (card 24 rehearsal 2026-09-26: 33 of 33 soak recalls).
+        newest_by_evidence.insert(candidate.evidence_id, candidate);
+    }
+    let mut overlay = newest_by_evidence.into_values().collect::<Vec<_>>();
+    overlay.sort_by_key(|candidate| (candidate.stream_seq, candidate.evidence_id));
+    Ok(overlay)
 }
 
 /// One `recall`/`context` read-your-writes decision (§15.5). `served_by_projection = true`
@@ -817,14 +830,20 @@ pub fn private_read_serving_candidates(
         let mut candidate = candidate.clone();
         candidate.memory_ids.sort_unstable();
         candidate.memory_ids.dedup();
-        if let Some(existing) = overlay_by_evidence.get(&candidate.evidence_id) {
-            if existing.stream_seq != candidate.stream_seq
-                || existing.processing_state != candidate.processing_state
-                || existing.memory_ids != candidate.memory_ids
+        match overlay_by_evidence.get(&candidate.evidence_id) {
+            // ADR-0049: a newer row for the same Evidence (a lifecycle ticket) supersedes the
+            // older description — `pg_delta_overlay_in_txn` already collapses to the newest
+            // row; this keeps the seam itself honest for any other producer.
+            Some(existing) if existing.stream_seq < candidate.stream_seq => {}
+            Some(existing) if existing.stream_seq > candidate.stream_seq => continue,
+            Some(existing)
+                if existing.processing_state != candidate.processing_state
+                    || existing.memory_ids != candidate.memory_ids =>
             {
                 return Err(RetrieveError::ConflictingOverlayEvidence);
             }
-            continue;
+            Some(_) => continue,
+            None => {}
         }
         overlay_by_evidence.insert(candidate.evidence_id, candidate);
     }

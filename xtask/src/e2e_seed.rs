@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use humaux_adapters::postgres::MaintenanceDbPool;
 use humaux_adapters::qdrant::{
-    Distance, ShardingMethod, create_collection_body, tenant_index_body,
+    Distance, ShardingMethod, create_collection_body, subject_index_body, tenant_index_body,
 };
 use humaux_adapters::quota_repo;
 use humaux_domain::ids::TenantId;
@@ -517,6 +517,39 @@ fn qdrant_registry(host: &str, port: u16) -> Result<IntraCellResourceRegistry, S
 /// Mirrors `semantic_recall_wiring.rs::create_collection` verbatim: `GET` first (already
 /// provisioned → skip, per the card), else the same two `PUT`s the wiring test issues, reusing
 /// `adapters::qdrant`'s body constructors rather than hand-writing the JSON.
+/// The exact `PUT` sequence that brings one collection into existence: the collection itself,
+/// then BOTH payload indexes §17.1 / §6.1.3 require.
+///
+/// Extracted from [`ensure_qdrant_collection`] so it can be asserted without a live Qdrant —
+/// card 9 P2 sat open because the `subject_ids` uuid index was simply never PUT and nothing
+/// anywhere could see that it was missing.
+fn collection_setup_puts(collection: &str, dimension: u32) -> Vec<(String, serde_json::Value)> {
+    vec![
+        (
+            format!("/collections/{collection}"),
+            create_collection_body(
+                dimension.into(),
+                Distance::Cosine,
+                1,
+                1,
+                1,
+                ShardingMethod::Auto,
+            ),
+        ),
+        (
+            format!("/collections/{collection}/index"),
+            tenant_index_body(),
+        ),
+        // Card 9 P2 (folded into card 24): without the `subject_ids` uuid payload index the
+        // §6.1.3 any-of subject prefilter degrades to an unindexed payload scan on every seeded
+        // collection. docs/ops/runbook.md names both indexes as a deploy step.
+        (
+            format!("/collections/{collection}/index"),
+            subject_index_body(),
+        ),
+    ]
+}
+
 fn ensure_qdrant_collection(
     rt: &tokio::runtime::Runtime,
     host: &str,
@@ -554,23 +587,7 @@ fn ensure_qdrant_collection(
             return Ok(());
         }
 
-        for (path, body) in [
-            (
-                format!("/collections/{collection}"),
-                create_collection_body(
-                    dimension.into(),
-                    Distance::Cosine,
-                    1,
-                    1,
-                    1,
-                    ShardingMethod::Auto,
-                ),
-            ),
-            (
-                format!("/collections/{collection}/index"),
-                tenant_index_body(),
-            ),
-        ] {
+        for (path, body) in collection_setup_puts(collection, dimension) {
             let permit = authorize_cell_access(
                 &registry,
                 IntraCellResource::QDRANT_REST,
@@ -1147,9 +1164,31 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DSN_ENV, LaneFlags, scopes_sql_array, seed_base, seed_lane, teardown};
+    use super::{
+        DSN_ENV, LaneFlags, collection_setup_puts, scopes_sql_array, seed_base, seed_lane, teardown,
+    };
     use postgres::{Client, NoTls};
     use uuid::Uuid;
+
+    /// Card 9 P2 / card 24. FAULT SENTINEL: goes red the moment a seeded collection stops
+    /// getting the `subject_ids` uuid payload index, which is the state this repo shipped in
+    /// while `docs/ops/runbook.md` already told operators both indexes were created.
+    #[test]
+    fn a_seeded_collection_gets_both_payload_indexes() {
+        let puts = collection_setup_puts("c", 1024);
+        assert_eq!(puts.len(), 3, "collection + tenant index + subject index");
+        assert_eq!(puts[0].0, "/collections/c");
+        let fields: Vec<&str> = puts[1..]
+            .iter()
+            .map(|(path, body)| {
+                assert_eq!(path, "/collections/c/index");
+                body["field_name"].as_str().expect("field_name")
+            })
+            .collect();
+        assert_eq!(fields, vec!["tenant_id", "subject_ids"]);
+        assert_eq!(puts[1].1["field_schema"]["is_tenant"], true);
+        assert_eq!(puts[2].1["field_schema"]["type"], "uuid");
+    }
 
     /// Card 16 regression, seed side. Two `e2e-seed` invocations must produce two tenants that
     /// ONE private-worker process can serve: each with its OWN admitted `PRIVATE_DISTILL_TEXT`

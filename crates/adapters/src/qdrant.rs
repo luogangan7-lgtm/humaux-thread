@@ -1384,6 +1384,33 @@ pub async fn upsert(
     Ok(())
 }
 
+/// `POST /collections/{name}/points/delete` by id — ADR-0049's index side of retiring a memory
+/// that stopped being live. Same `wait=true` + `ordering` controls as [`upsert`]; the caller
+/// passes the §17.5 correction/delete/supersede profile (strong ordering, so a concurrent
+/// weak-ordered upsert of the same id cannot land after the delete).
+pub async fn delete_points(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+    points: &[PointId],
+    ha_profile: HaConsistencyProfile,
+) -> Result<(), QdrantTransportError> {
+    validate_collection(collection)?;
+    let body = json!({ "points": points.iter().map(|id| id.to_json()).collect::<Vec<_>>() });
+    call(
+        transport,
+        permit,
+        IntraCellMethod::Post,
+        qdrant_path(
+            format!("/collections/{collection}/points/delete"),
+            &[QdrantRequestControl::Wait, ha_profile.write_control()],
+        ),
+        Some(body),
+    )
+    .await?;
+    Ok(())
+}
+
 /// §17.4's real search-path visibility probe: `POST /collections/{name}/points/scroll` with a
 /// `has_id` filter — scroll reads from the same searchable index a real query does (unlike a
 /// bare "does this id exist" point-get), so an id it returns is genuinely search-visible, not

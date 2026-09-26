@@ -391,7 +391,7 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
             Err(error) => return Err(format!("distill dispatch pass failed: {error}")),
         };
         println!(
-            "humaux-private-worker: distill dispatch claimed={} completed={} not_ready={} deferred={} dead={} lost_lease={} evidence_claimed={} done={} failed={} memories={} rejected={}",
+            "humaux-private-worker: distill dispatch claimed={} completed={} not_ready={} deferred={} dead={} lost_lease={} evidence_claimed={} done={} failed={} memories={} rejected={} empty_retries={} malformed_retries={}",
             report.claimed,
             report.completed,
             report.not_ready,
@@ -402,7 +402,12 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
             report.work.done,
             report.work.failed,
             report.work.memories,
-            report.work.rejected
+            report.work.rejected,
+            // ADR-0048 D-C: the retry is only "observable in the pass report" if the running
+            // worker prints it. Without this field an empty-answer retry is silent in
+            // production — the exact 2026-09-19 / 09-20 shape this card exists to end.
+            report.work.empty_retries,
+            report.work.malformed_retries
         );
         let Some(interval) = poll_interval else {
             return Ok(());
