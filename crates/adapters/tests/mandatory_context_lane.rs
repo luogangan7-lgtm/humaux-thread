@@ -14,6 +14,15 @@
 //!
 //! 三态（§79.2）由 `testkit::skip_or_fail` 统一判定；CI 声明 `HUMAUX_REQUIRE_DB=1` 时
 //! 跳过即失败（ADR-0005）。
+//!
+//! depends-on: Postgres at `HUMAUX_TEST_PG_DSN` (owner, any loopback port/database — ADR-0047
+//! D-D, ADR-0050 D-B) + `HUMAUX_GATEWAY_PG_DSN` (role_gateway, same target or the legacy
+//! 61719 pair); private.memory_records/context_bindings, control.* seed tables.
+//! called-by: `cargo test -p humaux-adapters --test mandatory_context_lane` (chain `adapters_tests`).
+//! invariants: every fixture holds the database advisory lock `FACET_SHADOW_ADVISORY_LOCK`
+//! (HXFACETS) for its whole life, across processes; `FacetShadow` exists only inside one and is
+//! restored in `Drop`; a killed run's residue is repaired by `setup` under that lock, so the
+//! repair can never see a live shadow (ADR-0050 D-B).
 
 use humaux_adapters::context_repo;
 use humaux_adapters::postgres::RuntimeDbPool;
@@ -49,19 +58,31 @@ fn gateway_dsn() -> Option<String> {
         );
         return None;
     };
+    // ADR-0047 D-D (ADR-0050 D-B): the owner `HUMAUX_TEST_PG_DSN` defines the target; the
+    // gateway DSN must name the same port and database, or the legacy `61719 /
+    // REQUEST_GUARD_DB` pair. A read of that rule (same predicate as
+    // `request_guard.rs::same_target`), not a second one.
+    let legacy_target =
+        options.get_port() == 61719 && options.get_database() == Some(REQUEST_GUARD_DB);
+    let same_target = std::env::var("HUMAUX_TEST_PG_DSN")
+        .ok()
+        .and_then(|owner| PgConnectOptions::from_str(&owner).ok())
+        .is_some_and(|owner| {
+            options.get_port() == owner.get_port() && options.get_database() == owner.get_database()
+        });
     if options.get_username() != "role_gateway"
         || options.get_host() != "127.0.0.1"
-        || options.get_port() != 61719
-        || options.get_database() != Some(REQUEST_GUARD_DB)
+        || !(legacy_target || same_target)
         || dsn.contains(['?', '#'])
     {
         skip_or_fail(
             NAME,
-            "invalid object: isolated role_gateway fixture DSN",
+            "invalid object: role_gateway DSN on the owner fixture target",
             ExternalDep::Postgres,
         );
         return None;
     }
+    // dep: Postgres (role_gateway, HUMAUX_GATEWAY_PG_DSN) — identity probe: LOGIN, non-superuser, non-bypassrls.
     let Ok(mut gateway) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(
             NAME,
@@ -99,6 +120,24 @@ struct Fixture {
     evidence_id: Uuid,
     user_ids: Vec<Uuid>,
 }
+
+/// ADR-0050 D-B: the database-level lock every fixture of this binary holds on its `admin`
+/// session for its whole life (released when that session closes, so a killed run cannot leave
+/// it held). `FacetShadow` rewrites the catalog contract of `private.memory_records.facet` for
+/// every session of the shared `HUMAUX_TEST_PG_DSN` database, so:
+/// - a sibling test, or this binary in another process (a second chain or agent), never probes
+///   or selects inside another fixture's shadow window;
+/// - [`repair_facet_shadow_residue`] runs only under this lock, so a `facet__probe_shadow` it
+///   sees can never be a live shadow — only a killed run's residue.
+///
+/// Fixed bigint with no meaning (ASCII "HXFACETS"), same style as `migrate.rs`'s HXMIGRAT.
+/// ponytail: only this binary takes it; `facet_contract.rs` reads the same catalog unlocked
+/// (outside card 25's files) — it takes `pg_advisory_lock_shared` on this key when touched.
+const FACET_SHADOW_ADVISORY_LOCK: i64 = 0x4858_4641_4345_5453;
+
+/// How long a fixture waits for another fixture's [`FACET_SHADOW_ADVISORY_LOCK`]. The whole
+/// binary runs in ~1.5 s (ADR-0050), so reaching this means a stuck holder: red, not a hang.
+const FIXTURE_LOCK_WAIT: &str = "120s";
 
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -138,22 +177,30 @@ fn setup() -> Option<(Fixture, String)> {
         );
         return None;
     };
-    if options.get_host() != "127.0.0.1"
-        || options.get_port() != 61719
-        || options.get_database() != Some(REQUEST_GUARD_DB)
-        || dsn.contains(['?', '#'])
-    {
+    // ADR-0047 D-D / ADR-0050 D-B: the owner DSN defines the target (any loopback port and
+    // database). Loopback stays enforced because `FacetShadow` runs DDL as this owner.
+    if options.get_host() != "127.0.0.1" || dsn.contains(['?', '#']) {
         skip_or_fail(
             NAME,
-            "invalid object: isolated owner fixture DSN",
+            "invalid object: loopback owner fixture DSN",
             ExternalDep::Postgres,
         );
         return None;
     }
+    // dep: Postgres (owner, HUMAUX_TEST_PG_DSN) — seeds/cleans the fixture and holds the facet-shadow advisory lock.
     let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;
     };
+    // A lock wait past FIXTURE_LOCK_WAIT is 55P03 → panic (red), never a skip. The timeout stays
+    // on this session, so the residue repair's DDL below is bounded too.
+    admin
+        .batch_execute(&format!(
+            "SET lock_timeout = '{FIXTURE_LOCK_WAIT}'; \
+             SELECT pg_advisory_lock({FACET_SHADOW_ADVISORY_LOCK});"
+        ))
+        .expect("take the facet-shadow advisory lock (another fixture holds it too long)");
+    repair_facet_shadow_residue(&mut admin);
     let gateway_dsn = gateway_dsn()?;
     // 迁移未应用这条腿点名 0102 的产物。注意：**触发器/列在不在是断言不是 skip 条件**
     // 的那条规矩（ADR-0006）针对的是「被测判据本身」；这里 `mode` 列是**被测对象所在的
@@ -424,19 +471,24 @@ fn attgenerated(admin: &mut Client, schema: &str, table: &str, column: &str) -> 
 /// （可写 vs `GENERATED ALWAYS ... STORED`），引用 `m.facet` 的 selector SQL 照常编译。
 /// 还原写在 `Drop` 里而不是测试末尾：中间任何一条断言红了都不能把影子留在夹具库里。
 ///
-/// ponytail: 影子窗口是进程外可见的。`cargo test` 逐个跑 test 二进制，所以同库的
-/// `facet_contract.rs` 不会撞上；换成并行 runner（nextest）要给这两个二进制加库级串行。
+/// 影子窗口是进程外可见的：它只在持有 [`FACET_SHADOW_ADVISORY_LOCK`] 的 fixture 生命期内
+/// 存在（`f` 先于影子声明、后于影子析构），所以本二进制的其它 fixture——同进程或另一个
+/// 进程——都等在库级锁上，看不到它。DDL 带 `lock_timeout`：共享 dev 库上有别的会话持着
+/// `memory_records` 的锁时，ACCESS EXCLUSIVE 等不到就红，不无限排队、不把后来者全堵在身后。
 struct FacetShadow {
     admin: Client,
 }
 
 impl FacetShadow {
     /// `dsn` 必须是 [`setup`] 已经校验过的 owner 夹具 DSN——这里做 DDL，认错库就是改生产。
+    /// 调用方必须持有一个活着的 [`Fixture`]（它的会话拿着 [`FACET_SHADOW_ADVISORY_LOCK`]）。
     fn arm(dsn: &str) -> Self {
+        // dep: Postgres (owner) — DDL on private.memory_records needs the table owner.
         let mut admin = Client::connect(dsn, NoTls).expect("owner login for the facet shadow");
         admin
             .batch_execute(
-                "ALTER TABLE private.memory_records \
+                "SET lock_timeout = '10s'; \
+                 ALTER TABLE private.memory_records \
                    RENAME COLUMN facet TO facet__probe_shadow; \
                  ALTER TABLE private.memory_records ADD COLUMN facet text;",
             )
@@ -445,17 +497,42 @@ impl FacetShadow {
     }
 }
 
+/// ADR-0050 D-B: a previous run killed mid-test (SIGKILL / tool timeout) never ran
+/// `FacetShadow::drop` and left the shadow behind. `setup` calls this before any test reads the
+/// catalog: a residue makes `facet` look unsatisfied, so the shadow test would never arm (a
+/// repair inside `arm` is never reached) while every probe read the shadow. Same SQL as `Drop`.
+fn repair_facet_shadow_residue(admin: &mut Client) {
+    let leftover: bool = admin
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute \
+              WHERE attrelid = 'private.memory_records'::regclass \
+                AND attname = 'facet__probe_shadow' AND NOT attisdropped)",
+            &[],
+        )
+        .expect("facet shadow residue probe")
+        .get(0);
+    if leftover {
+        eprintln!(
+            "mandatory_context_lane: repairing a leftover facet__probe_shadow from a killed run"
+        );
+        admin
+            .batch_execute(RESTORE_FACET_SQL)
+            .expect("repair leftover facet shadow");
+    }
+}
+
+/// The one restore statement, shared by `Drop` and [`repair_facet_shadow_residue`].
+const RESTORE_FACET_SQL: &str = "ALTER TABLE private.memory_records DROP COLUMN facet; \
+     ALTER TABLE private.memory_records RENAME COLUMN facet__probe_shadow TO facet;";
+
 impl Drop for FacetShadow {
     fn drop(&mut self) {
         // 展开中再 panic 会 abort 掉整个测试进程，所以这里只喊，不 panic。
-        if let Err(err) = self.admin.batch_execute(
-            "ALTER TABLE private.memory_records DROP COLUMN facet; \
-             ALTER TABLE private.memory_records \
-               RENAME COLUMN facet__probe_shadow TO facet;",
-        ) {
+        if let Err(err) = self.admin.batch_execute(RESTORE_FACET_SQL) {
             eprintln!(
                 "FATAL: private.memory_records.facet 的影子没能还原（{err}）——\
-                 夹具库 {REQUEST_GUARD_DB} 现在带着一个可写的 facet 列"
+                 HUMAUX_TEST_PG_DSN 指向的夹具库现在带着一个可写的 facet 列；\
+                 下次 setup 会先修复它"
             );
         }
     }
@@ -488,6 +565,7 @@ fn probe_reports_the_columns_that_are_actually_missing() {
     assert!(!truth.is_empty(), "REGISTRY declares no dependency at all");
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
+    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");
@@ -537,6 +615,7 @@ fn an_unsatisfiable_requirement_is_reported_missing() {
     const FACET: &str = "private.memory_records.facet";
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
+    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");
@@ -555,7 +634,8 @@ fn an_unsatisfiable_requirement_is_reported_missing() {
     // 夹具库还没跑 0172 时 facet 本来就不满足——那就直接用它，不必再种一个。
     let generated = attgenerated(&mut f.admin, "private", "memory_records", "facet");
     let shadow = (generated.as_deref() == Some("s")).then(|| {
-        // setup() 已经校验过这个 DSN 指向 127.0.0.1:61719 的隔离夹具库；DDL 只许打在那里。
+        // setup() 已经校验过这个 DSN：the loopback fixture target named by HUMAUX_TEST_PG_DSN；
+        // DDL 只许打在那里。
         FacetShadow::arm(&std::env::var("HUMAUX_TEST_PG_DSN").expect("owner DSN"))
     });
 
@@ -599,6 +679,7 @@ fn project_constraints_are_selected_by_authority_not_similarity() {
     let _note = seed_memory(&mut f, "PrivateKnowledge", "SNAPSHOT");
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
+    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");
@@ -644,6 +725,7 @@ fn a_live_unversioned_constraint_is_diverted_and_named_not_consumed() {
     let admitted = seed_memory(&mut f, "ProjectConstraint", "SNAPSHOT");
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
+    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");
@@ -711,6 +793,7 @@ fn revoking_a_binding_removes_it_from_the_lane() {
         .collect();
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
+    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");
@@ -820,6 +903,19 @@ fn seed_visibility_cases(f: &mut Fixture) -> VisibilityCases {
     let other_user = seed_user(f);
     let allowed_workspace = seed_workspace(f, "allowed");
     let other_workspace = seed_workspace(f, "other");
+    // ADR-0035 / migration 0163 (§6.1.1): WORKSPACE_SHARED(W) is readable iff the reader holds
+    // an ACTIVE WorkspaceMembership for W — a tenant membership alone no longer suffices. This
+    // fixture predates 0163 and skipped on every run since (ADR-0050 context §1), so "allowed"
+    // never carried the membership that makes it allowed. The owner seeds it (superuser bypasses
+    // FORCE RLS); `other_workspace` deliberately gets none. Cleanup cascades from
+    // control.memberships / control.workspaces in `Fixture::drop`.
+    f.admin
+        .execute(
+            "INSERT INTO control.workspace_memberships(tenant_id, workspace_id, user_id, role, state) \
+             VALUES ($1, $2, $3, 'MEMBER', 'ACTIVE')",
+            &[&f.tenant_id, &allowed_workspace, &current_user],
+        )
+        .expect("seed the allowed workspace membership");
     let current_private_evidence = seed_evidence(f, "USER_PRIVATE", Some(current_user), None);
     let current_private = seed_memory_with_visibility(
         f,
@@ -932,6 +1028,7 @@ fn context_lanes_filter_visibility_lifecycle_and_binding_scope() {
         Some(cases.allowed_workspace),
     );
     let rt = tokio::runtime::Runtime::new().expect("rt");
+    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");

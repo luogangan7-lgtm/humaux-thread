@@ -22,7 +22,7 @@ select
   exists (
     select 1 from information_schema.columns
     where table_schema = 'control' and table_name = 'audit_events' and column_name = 'audit_seq'
-      and is_nullable = 'YES'
+      and is_identity = 'YES' and is_nullable = 'NO'
   )
   and exists (
     select 1 from pg_constraint

@@ -1,4 +1,11 @@
 //! Real-role acceptance for migration 0117's persistent sliding provider budget.
+//!
+//! depends-on: Postgres at `HUMAUX_TEST_PG_DSN` (owner, any loopback port/database — ADR-0047
+//! D-D, ADR-0050 D-B) plus `HUMAUX_{RETRIEVAL_WORKER,MAINTENANCE,GATEWAY}_PG_DSN` on the same
+//! target (or the legacy 61719 pair); ops provider-budget functions from migration 0117.
+//! called-by: `cargo test -p humaux-adapters --test provider_budget` (gate chain `adapters_tests`).
+//! invariants: every fixture row is tenant-scoped to a throwaway tenant; skips route through
+//! `run_db_fixture` so `HUMAUX_REQUIRE_DB=1` turns an unreachable DB into a red.
 
 use std::{str::FromStr, thread, time::Duration};
 
@@ -41,13 +48,26 @@ fn setup_error(stage: &str) -> DbFixtureSkipReason {
     ))
 }
 
+/// The owner (`HUMAUX_TEST_PG_DSN`, `expected_role = None`) defines the fixture target; a role
+/// DSN must name the same port and database as the owner, or the legacy
+/// `61719 / FIXTURE_DB` pair. This is a read of ADR-0047 D-D (ADR-0050 D-B), the same
+/// predicate as `request_guard.rs::same_target`, not a second rule. Loopback and a
+/// query-free DSN stay enforced for every DSN.
 fn checked_dsn(name: &str, expected_role: Option<&str>) -> Result<String, DbFixtureSkipReason> {
     let dsn = std::env::var(name).map_err(|_| setup_error("required DSN"))?;
     let options = PgConnectOptions::from_str(&dsn).map_err(|_| setup_error("DSN parse"))?;
+    let same_target = expected_role.is_none()
+        || (options.get_port() == 61719 && options.get_database() == Some(FIXTURE_DB))
+        || std::env::var("HUMAUX_TEST_PG_DSN")
+            .ok()
+            .and_then(|owner| PgConnectOptions::from_str(&owner).ok())
+            .is_some_and(|owner| {
+                options.get_port() == owner.get_port()
+                    && options.get_database() == owner.get_database()
+            });
     if expected_role.is_some_and(|role| options.get_username() != role)
         || options.get_host() != "127.0.0.1"
-        || options.get_port() != 61719
-        || options.get_database() != Some(FIXTURE_DB)
+        || !same_target
         || dsn.contains(['?', '#'])
     {
         return Err(setup_error("DSN boundary validation"));
@@ -56,6 +76,7 @@ fn checked_dsn(name: &str, expected_role: Option<&str>) -> Result<String, DbFixt
 }
 
 fn role_login_ok(dsn: &str, role: &str) -> Result<(), DbFixtureSkipReason> {
+    // dep: Postgres (the named runtime role) — login probe of the actual role before any seed.
     let mut client = Client::connect(dsn, NoTls).map_err(|_| setup_error("actual role login"))?;
     let ok: bool = client
         .query_one(
@@ -83,6 +104,7 @@ impl DbIntegrationFixture for Fixture {
         role_login_ok(&retrieval_dsn, "role_retrieval_worker")?;
         role_login_ok(&maintenance_dsn, "role_maintenance")?;
         role_login_ok(&gateway_dsn, "role_gateway")?;
+        // dep: Postgres (owner, HUMAUX_TEST_PG_DSN) — seeds and cleans the fixture tenant, limits and budget rows.
         let mut admin =
             Client::connect(&owner_dsn, NoTls).map_err(|_| setup_error("owner login"))?;
         let ready: bool = admin
@@ -108,9 +130,11 @@ impl DbIntegrationFixture for Fixture {
         let region = "provider-budget-region".to_string();
         seed_four_limits(&mut admin, tenant_id, &provider_id, &region, 10, 10)?;
         let rt = tokio::runtime::Runtime::new().map_err(|_| setup_error("runtime"))?;
+        // dep: Postgres (role_retrieval_worker) — RetrievalWorkerDbPool under test.
         let retrieval = rt
             .block_on(RetrievalWorkerDbPool::connect(&retrieval_dsn))
             .map_err(|_| setup_error("retrieval worker pool"))?;
+        // dep: Postgres (role_maintenance) — MaintenanceDbPool under test.
         let maintenance = rt
             .block_on(MaintenanceDbPool::connect(&maintenance_dsn))
             .map_err(|_| setup_error("maintenance pool"))?;
@@ -1477,9 +1501,12 @@ fn assert_same_request_replays(
 #[test]
 fn budget_tables_are_function_only_for_actual_runtime_roles() {
     run_db_fixture::<Fixture, _>("provider_budget_acl", |handle| {
+        // dep: Postgres (role_retrieval_worker) — direct ACL probe of the budget tables.
         let mut retrieval = Client::connect(&handle.retrieval_dsn, NoTls).expect("retrieval login");
+        // dep: Postgres (role_maintenance) — direct ACL probe of the budget tables.
         let mut maintenance =
             Client::connect(&handle.maintenance_dsn, NoTls).expect("maintenance login");
+        // dep: Postgres (role_gateway) — direct ACL probe of the budget tables.
         let mut gateway = Client::connect(&handle.gateway_dsn, NoTls).expect("gateway login");
         for client in [&mut retrieval, &mut maintenance, &mut gateway] {
             for statement in [
@@ -1597,6 +1624,7 @@ fn assert_actual_role_null_calls(handle: &Handle, reservation_id: Uuid, model_ca
     let null_uuid: Option<Uuid> = None;
     let null_text: Option<&str> = None;
     let null_i32: Option<i32> = None;
+    // dep: Postgres (role_retrieval_worker) — NULL-argument calls as the actual role.
     let mut retrieval = Client::connect(&handle.retrieval_dsn, NoTls)
         .expect("actual retrieval-worker login for null probes");
     retrieval
@@ -1641,6 +1669,7 @@ fn assert_actual_role_null_calls(handle: &Handle, reservation_id: Uuid, model_ca
         reservation_id,
         model_call_id,
     );
+    // dep: Postgres (role_maintenance) — NULL-argument calls as the actual role.
     let mut maintenance = Client::connect(&handle.maintenance_dsn, NoTls)
         .expect("actual maintenance login for null probes");
     maintenance

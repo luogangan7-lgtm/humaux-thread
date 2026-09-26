@@ -33,3 +33,9 @@ rand = "0.9"
 # e2e-seed.rs 追加2: Qdrant collection provisioning reuses the real IntraCellResource::QDRANT_REST
 # transport instead of a hand-rolled HTTP client (§83.4/ADR-0003 — Qdrant is same-Cell, not egress).
 humaux-infra-cell = { path = "../crates/infra-cell" }
+
+[dev-dependencies]
+# ADR-0050 D-D: the throwaway-DB migrate tests skip through `skip_or_fail(ExternalDep::Postgres)`
+# so `HUMAUX_REQUIRE_DB=1` turns a missing database into a red instead of a silent pass.
+# testkit has zero normal dependencies, so this adds no cycle.
+humaux-testkit = { path = "../crates/testkit" }

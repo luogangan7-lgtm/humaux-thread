@@ -2,6 +2,12 @@
 //!
 //! Every runtime write uses an actual `role_gateway` login. The owner connection exists only
 //! to seed and remove this fixture's unique tenant rows; it never masquerades as the gateway.
+//!
+//! depends-on: Postgres at `HUMAUX_TEST_PG_DSN` + `HUMAUX_GATEWAY_PG_DSN` (read by
+//! `support/operation_receipt_fixture.rs`, ADR-0047 D-D); control.operation_receipts and the
+//! remember.put business/BMO/audit tables.
+//! called-by: `cargo test -p humaux-adapters --test operation_receipts` (chain `adapters_tests`);
+//! the three `lane(a:request_guard)` witnesses run under `cargo xtask serial-lane` (ADR-0050 D-J).
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
@@ -299,6 +305,7 @@ fn assert_receipt_lock_deadline_rollback(
         let actor = std::thread::spawn(move || {
             let outcome = (|| -> Result<_, String> {
                 let rt = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+                // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
                 let pool = rt
                     .block_on(RuntimeDbPool::connect(&actor_dsn))
                     .map_err(|error| error.to_string())?;
@@ -711,7 +718,7 @@ fn physical_evidence_deletion_keeps_nonreplayable_receipt_tombstone() {
 }
 
 #[test]
-#[ignore = "lane(c) exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green"]
+#[ignore = "lane(a:request_guard) ADR-0050 D-J: observes a relation-lock wait on the receipt insert, so it needs a per-run database no concurrent chain test writes to; runs in the serial lane on the provisioned request-guard database"]
 fn receipt_insert_lock_past_token_deadline_rolls_back_business_bmo_audit_and_receipt() {
     run_db_fixture::<Fixture, _>(
         "receipt_insert_lock_past_token_deadline_rolls_back_business_bmo_audit_and_receipt",
@@ -728,7 +735,7 @@ fn receipt_insert_lock_past_token_deadline_rolls_back_business_bmo_audit_and_rec
 }
 
 #[test]
-#[ignore = "lane(c) exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green"]
+#[ignore = "lane(a:request_guard) ADR-0050 D-J: observes a relation-lock wait on the receipt insert, so it needs a per-run database no concurrent chain test writes to; runs in the serial lane on the provisioned request-guard database"]
 fn receipt_insert_lock_past_reservation_deadline_rolls_back_while_token_is_valid() {
     run_db_fixture::<Fixture, _>(
         "receipt_insert_lock_past_reservation_deadline_rolls_back_while_token_is_valid",
@@ -745,7 +752,7 @@ fn receipt_insert_lock_past_reservation_deadline_rolls_back_while_token_is_valid
 }
 
 #[test]
-#[ignore = "lane(c) exposed by the fixture DSN fix (2026-09-03): the relation-lock wait observation (pg_stat_activity wait_event=relation) was only ever exercised on the 61719 side container and does not reproduce on the standard HUMAUX_TEST_PG_DSN database; tracked as a separate card, do not treat as green"]
+#[ignore = "lane(a:request_guard) ADR-0050 D-J: the same-key concurrency witness ADR-0032 relies on (two actors, one committed row); runs in the serial lane on the provisioned request-guard database"]
 fn concurrent_same_key_never_commits_two_business_or_bmo_rows() {
     run_db_fixture::<Fixture, _>(
         "concurrent_same_key_never_commits_two_business_or_bmo_rows",
@@ -779,6 +786,7 @@ fn concurrent_same_key_never_commits_two_business_or_bmo_rows() {
                     let outcome = (|| -> Result<_, String> {
                         let rt =
                             tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+                        // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
                         let pool = rt
                             .block_on(RuntimeDbPool::connect(&dsn))
                             .map_err(|error| error.to_string())?;

@@ -17,7 +17,7 @@ select to_regclass('control.workspaces') is not null
  and to_regprocedure('control.set_workspace_membership(uuid,uuid,uuid,text,text)') is null
  -- both composite FK targets already exist (no UNIQUE added here)
  and exists(select 1 from pg_constraint where conrelid='control.workspaces'::regclass
-            and contype='u' and conkey = (
+            and contype='u' and (select array_agg(k order by k) from unnest(conkey) k) = (
               select array_agg(attnum order by attnum) from pg_attribute
               where attrelid='control.workspaces'::regclass and attname in ('tenant_id','workspace_id')))
  and exists(select 1 from pg_constraint where conrelid='control.memberships'::regclass

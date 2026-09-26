@@ -1,4 +1,10 @@
 //! Real-role acceptance for migration 0115's metadata-only retrieval-query source.
+//!
+//! depends-on: Postgres at `HUMAUX_TEST_PG_DSN` (owner, any loopback port/database — ADR-0047
+//! D-D, ADR-0050 D-B) plus `HUMAUX_{RETRIEVAL_WORKER,MAINTENANCE}_PG_DSN` on the same target
+//! (or the legacy 61719 pair); retrieval-query source functions from migration 0115.
+//! called-by: `cargo test -p humaux-adapters --test retrieval_query_sources` (chain `adapters_tests`).
+//! invariants: fixture rows live under a throwaway tenant; skips route through `run_db_fixture`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -83,13 +89,26 @@ fn seed_memory_and_link(
     Ok(memory_id)
 }
 
+/// The owner (`HUMAUX_TEST_PG_DSN`, `expected_role = None`) defines the fixture target; a role
+/// DSN must name the same port and database as the owner, or the legacy
+/// `61719 / FIXTURE_DB` pair. This is a read of ADR-0047 D-D (ADR-0050 D-B), the same
+/// predicate as `request_guard.rs::same_target`, not a second rule. Loopback and a
+/// query-free DSN stay enforced for every DSN.
 fn checked_dsn(name: &str, expected_role: Option<&str>) -> Result<String, DbFixtureSkipReason> {
     let dsn = std::env::var(name).map_err(|_| setup_error("required DSN"))?;
     let options = PgConnectOptions::from_str(&dsn).map_err(|_| setup_error("DSN parse"))?;
+    let same_target = expected_role.is_none()
+        || (options.get_port() == 61719 && options.get_database() == Some(FIXTURE_DB))
+        || std::env::var("HUMAUX_TEST_PG_DSN")
+            .ok()
+            .and_then(|owner| PgConnectOptions::from_str(&owner).ok())
+            .is_some_and(|owner| {
+                options.get_port() == owner.get_port()
+                    && options.get_database() == owner.get_database()
+            });
     if expected_role.is_some_and(|role| options.get_username() != role)
         || options.get_host() != "127.0.0.1"
-        || options.get_port() != 61719
-        || options.get_database() != Some(FIXTURE_DB)
+        || !same_target
         || dsn.contains(['?', '#'])
     {
         return Err(setup_error("DSN boundary validation"));
@@ -98,6 +117,7 @@ fn checked_dsn(name: &str, expected_role: Option<&str>) -> Result<String, DbFixt
 }
 
 fn role_login_ok(dsn: &str, role: &str) -> Result<(), DbFixtureSkipReason> {
+    // dep: Postgres (the named runtime role) — login probe of the actual role before any seed.
     let mut client = Client::connect(dsn, NoTls)
         .map_err(|_| setup_error(&format!("actual role login for {role}")))?;
     let ok: bool = client
@@ -254,6 +274,7 @@ impl DbIntegrationFixture for Fixture {
         let maintenance_dsn = checked_dsn("HUMAUX_MAINTENANCE_PG_DSN", Some("role_maintenance"))?;
         role_login_ok(&retrieval_dsn, "role_retrieval_worker")?;
         role_login_ok(&maintenance_dsn, "role_maintenance")?;
+        // dep: Postgres (owner, HUMAUX_TEST_PG_DSN) — seeds and cleans the fixture tenant and authorization context.
         let mut admin =
             Client::connect(&owner_dsn, NoTls).map_err(|_| setup_error("owner login"))?;
         let ready: bool = admin
@@ -271,9 +292,11 @@ impl DbIntegrationFixture for Fixture {
         }
         let seed = seed_authorization_context(&mut admin)?;
         let rt = tokio::runtime::Runtime::new().map_err(|_| setup_error("test runtime"))?;
+        // dep: Postgres (role_retrieval_worker) — RetrievalWorkerDbPool under test.
         let retrieval = rt
             .block_on(RetrievalWorkerDbPool::connect(&retrieval_dsn))
             .map_err(|_| setup_error("retrieval worker pool"))?;
+        // dep: Postgres (role_maintenance) — MaintenanceDbPool under test.
         let maintenance = rt
             .block_on(MaintenanceDbPool::connect(&maintenance_dsn))
             .map_err(|_| setup_error("maintenance pool"))?;
@@ -502,6 +525,7 @@ fn assert_query_reserve_negative_gates(
 
 fn assert_negative_query_ordinal_rejected(handle: &mut Handle, query_source_id: Uuid) {
     let before = source_and_disclosure_counts(&mut handle.admin, handle.tenant_id);
+    // dep: Postgres (role_retrieval_worker) — direct call as the actual role (negative ordinal).
     let mut retrieval = Client::connect(&handle.retrieval_dsn, NoTls)
         .expect("real retrieval-worker login for negative ordinal probe");
     let mut probe = retrieval
@@ -793,6 +817,7 @@ fn assert_revoked_source_cannot_attach(
     query_source_id: Uuid,
     payload: &AuthorizedEgressPayload,
 ) {
+    // dep: Postgres (role_retrieval_worker) — direct call as the actual role.
     let mut retrieval_client = Client::connect(&handle.retrieval_dsn, NoTls)
         .expect("real retrieval-worker login for revoked-source probe");
     let mut revoked_probe = retrieval_client

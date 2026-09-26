@@ -12,7 +12,7 @@ postcheck = """
 select to_regclass('ops.private_inference_rpc_calls') is not null
    and (select relrowsecurity and relforcerowsecurity from pg_class
         where oid = 'ops.private_inference_rpc_calls'::regclass)
-   and has_table_privilege('role_consolidation_worker', 'ops.private_inference_rpc_calls', 'INSERT')
+   and has_any_column_privilege('role_consolidation_worker', 'ops.private_inference_rpc_calls', 'INSERT')
    and has_table_privilege('role_consolidation_worker', 'ops.private_inference_rpc_calls', 'SELECT')
    and not has_table_privilege('role_consolidation_worker', 'ops.private_inference_rpc_calls', 'UPDATE')
    and not has_table_privilege('role_consolidation_worker', 'ops.private_inference_rpc_calls', 'DELETE')

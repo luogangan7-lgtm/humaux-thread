@@ -12,7 +12,7 @@ select to_regprocedure('public.carry_forward_anonymous_claim_lifecycle(uuid,bigi
     'public.carry_forward_anonymous_claim_lifecycle(uuid,bigint,bigint)','EXECUTE')
   and not has_function_privilege('role_gateway',
     'public.carry_forward_anonymous_claim_lifecycle(uuid,bigint,bigint)','EXECUTE')
-  and not has_function_privilege('role_public_worker','control.anonymous_source_lineage','SELECT')
+  and not has_table_privilege('role_public_worker','control.anonymous_source_lineage','SELECT')
   and (select prosecdef and provolatile='v' and prorettype='void'::regtype
        from pg_proc where oid='public.carry_forward_anonymous_claim_lifecycle(uuid,bigint,bigint)'::regprocedure)
   as postcheck_ok

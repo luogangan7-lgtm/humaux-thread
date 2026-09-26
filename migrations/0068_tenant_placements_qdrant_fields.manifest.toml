@@ -64,7 +64,7 @@ select
       and column_name = 'cell_id' and is_nullable = 'YES'
   )
   and (
-    select array_agg(a.attname order by a.attnum) = array['tenant_id','projection_family']
+    select array_agg(a.attname::text order by a.attnum) = array['tenant_id','projection_family']
     from pg_constraint c
     join unnest(c.conkey) with ordinality as k(attnum, ord) on true
     join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum

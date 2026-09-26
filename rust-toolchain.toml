@@ -1,0 +1,7 @@
+# ADR-0050 D-G (Baseline 2.9 §70: Rust 1.98 / Edition 2024). The exact patch version is pinned so
+# "`rustc --version` matches this file" is a string comparison. Installed explicitly with
+# `rustup toolchain install 1.98.1 --profile minimal -c clippy -c rustfmt`.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

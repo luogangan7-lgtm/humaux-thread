@@ -6,11 +6,24 @@
 //! `rollback_or_forward_fix`/`backup_restore_requirement`). Missing manifest, orphan
 //! manifest, or an illegal field ⇒ `fail`, each error names its file (§57.1 rule 2).
 //!
+//! Check-SQL side (ADR-0050 D-E, runs when `HUMAUX_TEST_PG_DSN`/`DATABASE_URL` is set): one
+//! `BEGIN READ ONLY` transaction; every manifest's `precheck`/`postcheck` is `EXPLAIN`ed
+//! (syntax + semantic analysis, no execution) and `prepare`d (result shape: exactly one `bool`
+//! column), then ROLLBACK. Any error or shape mismatch is a `fail` naming
+//! `<manifest> <field>: <message>`. A DSN that is set but unreachable is a `fail`. This proves
+//! syntax and shape against the HEAD schema only; `migrate`'s throwaway 0001→head test proves
+//! each precheck true in its pre-state.
+//!
 //! Execution side (spin up Postgres, run `up -> down -> up`, diff
-//! `schema_digest_before/after`) needs live DB infrastructure Phase 0 does not have —
-//! per §57.1 rule 3 it reports `not_applicable` naming the missing object, never a
-//! silent skip.
+//! `schema_digest_before/after`) is still not built — per §57.1 rule 3 it reports
+//! `not_applicable` naming the missing object, never a silent skip.
+//!
+//! depends-on: `migrations/*.sql` + `*.manifest.toml`; optionally Postgres (read-only).
+//! called-by: `cargo xtask migration-rehearsal` (chain extra gate `migration_rehearsal`);
+//! `migrate::collect_migrations` reuses [`parse_manifest`].
 
+use postgres::types::Type;
+use postgres::{Client, NoTls};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -43,18 +56,19 @@ impl MigrationClass {
 ///
 /// `schema_digest_before/after` are computed at rehearsal-execution time, not authored
 /// statically, so they are not part of this struct.
-// ponytail: precheck/postcheck/rollback_or_forward_fix/backup_restore_requirement are
-// validated-present but only read by the rehearsal *execution* runner (not built this
-// phase, §57.1 rule 3) — allow(dead_code) instead of dropping the fields now and
-// re-adding them later.
-#[derive(Debug)]
-#[allow(dead_code)]
+///
+/// `precheck`/`postcheck` are executed by `xtask migrate` (ADR-0050 D-D) and syntax/shape
+/// checked by [`check_sql`] here (D-E).
+#[derive(Debug, Clone)]
 pub struct Manifest {
     pub migration_id: String,
     pub class: MigrationClass,
     pub precheck: String,
     pub postcheck: String,
+    // Validated-present only: read by the rehearsal *execution* runner (DOD-089, not built).
+    #[allow(dead_code)]
     pub rollback_or_forward_fix: String,
+    #[allow(dead_code)]
     pub backup_restore_requirement: String,
 }
 
@@ -261,8 +275,91 @@ pub fn run(_args: &[String]) -> i32 {
     for m in &manifests {
         eprintln!("  {} class={:?}", m.migration_id, m.class);
     }
-    eprintln!("{}", rehearsal_execution_verdict(database_dsn().is_some()));
-    0
+    let dsn = database_dsn();
+    let code = match &dsn {
+        None => {
+            eprintln!(
+                "migration-rehearsal: check-sql not_applicable (missing object: \
+                 HUMAUX_TEST_PG_DSN / DATABASE_URL)"
+            );
+            0
+        }
+        // dep: Postgres — read-only EXPLAIN/prepare of every manifest check (ADR-0050 D-E).
+        Some(dsn) => match Client::connect(dsn, NoTls) {
+            Err(e) => {
+                eprintln!(
+                    "migration-rehearsal: check-sql fail (a DSN is set but the database is \
+                     unreachable: {e})"
+                );
+                1
+            }
+            Ok(mut client) => match check_sql(&mut client, &manifests) {
+                Ok((checked, invalid)) if invalid.is_empty() => {
+                    eprintln!("migration-rehearsal: check-sql pass ({checked} checks, 0 invalid)");
+                    0
+                }
+                Ok((checked, invalid)) => {
+                    eprintln!(
+                        "migration-rehearsal: check-sql fail ({checked} checks, {} invalid)",
+                        invalid.len()
+                    );
+                    for line in &invalid {
+                        eprintln!("  {line}");
+                    }
+                    1
+                }
+                Err(e) => {
+                    eprintln!("migration-rehearsal: check-sql fail ({e})");
+                    1
+                }
+            },
+        },
+    };
+    eprintln!("{}", rehearsal_execution_verdict(dsn.is_some()));
+    code
+}
+
+/// ADR-0050 D-E: `EXPLAIN` + `prepare` every manifest check inside one read-only
+/// transaction that is always rolled back. Each check runs under its own savepoint so one
+/// invalid check does not abort the rest. Returns `(checks run, invalid lines)` where each
+/// line is `<migration_id>.manifest.toml <field>: <message>`; `Err` only for a transaction
+/// that cannot be opened at all.
+fn check_sql(client: &mut Client, manifests: &[Manifest]) -> Result<(usize, Vec<String>), String> {
+    let mut tx = client
+        .build_transaction()
+        .read_only(true)
+        .start()
+        .map_err(|e| format!("cannot open a read-only transaction: {e}"))?;
+    let mut checked = 0usize;
+    let mut invalid = Vec::new();
+    for m in manifests {
+        for (field, sql) in [("precheck", &m.precheck), ("postcheck", &m.postcheck)] {
+            checked += 1;
+            let verdict = (|| -> Result<(), String> {
+                let mut sp = tx.transaction().map_err(|e| e.to_string())?;
+                let text = |e: postgres::Error| {
+                    e.as_db_error()
+                        .map_or_else(|| e.to_string(), |db| db.message().to_string())
+                };
+                sp.batch_execute(&format!("EXPLAIN {sql}")).map_err(text)?;
+                let stmt = sp.prepare(sql).map_err(text)?;
+                match stmt.columns() {
+                    [col] if *col.type_() == Type::BOOL => Ok(()),
+                    [col] => Err(format!("returns {}, expected one bool column", col.type_())),
+                    cols => Err(format!(
+                        "returns {} columns, expected one bool column",
+                        cols.len()
+                    )),
+                }
+                // `sp` drops here → ROLLBACK TO SAVEPOINT, so an error never poisons `tx`.
+            })();
+            if let Err(msg) = verdict {
+                invalid.push(format!("{}.manifest.toml {field}: {msg}", m.migration_id));
+            }
+        }
+    }
+    tx.rollback().map_err(|e| format!("rollback: {e}"))?;
+    Ok((checked, invalid))
 }
 
 /// 本次运行有没有可用的库 DSN。§78 的 env 扫描把 `xtask/` 整个豁免（它是 CI 闸工具本身），
@@ -444,5 +541,52 @@ backup_restore_requirement = "restore point before apply"
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0050 D-E: a valid check passes; an invalid-SQL check and a non-boolean check are
+    /// each listed by manifest and field. Read-only against `HUMAUX_TEST_PG_DSN`.
+    #[test]
+    fn check_sql_pass_flags_invalid_and_non_boolean_manifests() {
+        const TEST: &str = "check_sql_pass_flags_invalid_and_non_boolean_manifests";
+        let Some(dsn) = database_dsn() else {
+            humaux_testkit::skip_or_fail(
+                TEST,
+                "missing object: HUMAUX_TEST_PG_DSN",
+                humaux_testkit::ExternalDep::Postgres,
+            );
+            return;
+        };
+        // dep: Postgres (HUMAUX_TEST_PG_DSN) — read-only EXPLAIN of scratch manifest checks.
+        let mut client = Client::connect(&dsn, NoTls).expect("connect (DSN is set)");
+        let manifest = |id: &str, pre: &str, post: &str| Manifest {
+            migration_id: id.to_string(),
+            class: MigrationClass::ForwardOnly,
+            precheck: pre.to_string(),
+            postcheck: post.to_string(),
+            rollback_or_forward_fix: String::new(),
+            backup_restore_requirement: String::new(),
+        };
+        let manifests = [
+            manifest(
+                "0001_ok",
+                "select true",
+                "select to_regclass('pg_class') IS NOT NULL",
+            ),
+            manifest("0002_bad", "selec true", "select true"),
+            manifest("0003_int", "select true", "select 1"),
+        ];
+        let (checked, invalid) = check_sql(&mut client, &manifests).expect("read-only txn");
+        assert_eq!(checked, 6);
+        assert_eq!(invalid.len(), 2, "{invalid:?}");
+        assert!(
+            invalid[0].starts_with("0002_bad.manifest.toml precheck:")
+                && invalid[0].contains("syntax error"),
+            "{invalid:?}"
+        );
+        assert!(
+            invalid[1].starts_with("0003_int.manifest.toml postcheck:")
+                && invalid[1].contains("int4"),
+            "{invalid:?}"
+        );
     }
 }

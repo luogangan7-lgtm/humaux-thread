@@ -42,11 +42,16 @@ cargo run -q -p xtask -- soak \
   --probe-every-secs 15 \
   --probe-cmd 'curl -fsS -o /dev/null http://127.0.0.1:8080/readyz' \
   --probe-cmd './target/debug/humaux-retrieval-worker --readyz' \
-  --chaos-every-secs 180 \
+  --watch-pidfile gateway=$S/gw.pid \
+  --watch-pidfile retrieval-worker=$S/rw.pid \
+  --watch-pidfile distill-worker=$S/ds.pid \
+  --watch-pidfile consolidation-worker=$S/cw.pid \
+  --chaos-every-secs 180 --chaos-grace-secs 60 \
   --chaos-cmd ./chaos-retrieval-worker.sh \
   --chaos-cmd ./chaos-distill-worker.sh \
   --chaos-cmd ./chaos-consolidation-worker.sh \
   --lease-secs 120 --max-rss-mib 2048 --max-db-connections 80 \
+  --max-op-failure-rate 0.05 \
   --report ./soak-report.json
 ```
 
@@ -94,6 +99,15 @@ Two flag rules are enforced at parse time rather than discovered at verdict time
   until it expires; a shorter drain cannot tell a wedged worker from a crashed one (ADR-0038 D5).
 - **`--chaos-every-secs` and `--chaos-cmd` come together or not at all.** Half a chaos hook is
   a run that silently tests nothing.
+- **`--chaos-grace-secs` is required when, and only when, chaos is configured** (card 25,
+  ADR-0050 D-I). It is the window after each chaos step's start in which a watched process may
+  be absent. Size it to cover kill plus restart plus the restarted binary's first-exec cost.
+- **`--watch-pidfile <name>=<path>` is required, at least once** (card 25). Name every process
+  the launcher started, using the pidfiles the launcher and its chaos scripts already keep
+  current. The harness still takes no PIDs as arguments and reads nothing from the workers'
+  env.
+- **`--max-op-failure-rate <0..1>` is required** (card 25). It is the ceiling on any one
+  operation's `failed / n`.
 
 `--probe-cmd` and `--chaos-cmd` may each be repeated; probes all run every poll, chaos commands
 are used round-robin.
@@ -129,8 +143,10 @@ token_malformed | token_not_issued` (the class only, never the token).
 | `no_live_lease_after_drain` | an `ops.jobs` row is `PROCESSING` with a lease still live more than one `--lease-secs` after the last kill: a worker is wedged, not crashed (§31/§61) | ops.jobs rows |
 | `backlog_drained` | `ops.jobs` + `ops.outbox` still queued after the drain | queued rows |
 | `db_connections_bounded` | connection count exceeded `--max-db-connections` at some poll: a leak, or pool sizing that does not survive this concurrency | connections |
-| `rss_bounded` | some `humaux-*` process exceeded `--max-rss-mib` | MiB |
-| `probes_green` | an ADR-0037 probe exited non-zero during the run — read `docs/ops/supervision.md` §2 for that probe's meaning | failed probe runs |
+| `rss_bounded` | some `humaux-*` process exceeded `--max-rss-mib`. Only real readings are scored, and `n` counts them. An observation whose `ps` failed contributes no reading, never `0 MiB`, so a run with no reading at all is `FAIL-VACUOUS` | MiB |
+| `probes_green` | an ADR-0037 probe exited non-zero during the run, **or** a watched process was absent outside every chaos grace window (card 25, ADR-0050 D-I). Read `docs/ops/supervision.md` §2 for the probe's meaning. `--probe-cmd '<worker> --readyz'` starts a fresh process and stays green while the resident worker is dead, so each observation also runs one `ps -axo pid=,rss=,comm=` and looks up every `--watch-pidfile`'s current pid. A process counts as present only if that pid is listed with a `humaux-` command; a reused pid running something else counts as absent. An absence inside `[chaos_start, chaos_start + --chaos-grace-secs]` is an **expected** absence: it is reported in `detail.expected_absent_in_chaos_window` and the timeline, and is not a failure. Any other absence is **unexpected** and is a failure. `n` = probe runs + process look-ups | failed probe runs + unexpected absences |
+| `ps_observed` | `ps` could not run, exited non-zero, or returned an empty table at some observation (card 25). A `ps` failure is an assertion failure. It is never RSS 0 and never "everything present" | observations whose ps failed |
+| `op_failure_rate` | some operation's `failed / n` exceeded `--max-op-failure-rate` (card 25). `value` is the worst operation's rate, so a healthy operation cannot dilute a failing one. `detail` lists every op's `{op, n, failed, rate}`, so a red names its op. `n` = all samples, which makes a run with no load `FAIL-VACUOUS`. Failures inside chaos windows **are** counted: excusing them needs chaos-to-op attribution, which card 54 owns | fraction of calls failed (worst op) |
 | `ryw_token_honoured` | a `consistency_token` this run minted was refused (§15.5) | rejections |
 | `ryw_replay_answered` | a lane's post-drain replay produced no answer — the write did not land, its `stream_seq` could not be resolved, or the recall itself errored. `n` = replays **attempted**, one per lane unconditionally, so a lane that bails out early lands in the denominator instead of shrinking it to zero. Kept separate from the row below on purpose: a replay that never happened tells you nothing about visibility, and reporting a transport failure as a consistency violation is a lie the harness would be telling about the system. Which half failed is one lookup away: `latency[]` for `remember.ryw_replay` (write) and `recall.ryw_replay` (read) | unanswered replays |
 | `ryw_settled_write_visible` | a `stream_seq` the replay's own token entitled it to see did not come back. The replay writes once more after the drain and uses **that** token: a `consistency_token` lives `HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS` (60 s here) and `--drain-secs` must exceed `--lease-secs` (120 s), so a token minted during the load is always expired by replay time. The witness is the §15.5 PG delta overlay's seq coverage — every `projection.stream_log` row in `(serving_highwater, token stream_seq]` must arrive as an item carrying that `stream_seq`; the token's seq is resolved from the accept envelope's `evidence_id` through `ops.outbox`. Never a marker in the content (the distill hop rewrites it through the model) and never "every live projection point" (`recall` returns top-k) | stale reads |

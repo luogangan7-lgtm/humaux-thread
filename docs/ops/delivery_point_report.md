@@ -636,6 +636,7 @@ executes manifest pre/postchecks, and this manifest's postcheck was not even val
 fixed on 2026-09-26. What refuses a violating row is PostgreSQL's `VALIDATE CONSTRAINT`
 itself, which fails the migration. All four checks of 0174/0175 now execute read-only and
 return `t`.
+Pointer (card 25): manifest checks execute in `xtask migrate` from ADR-0050 D-D on (docs/adr/0050-gate-chain-truth.md).
 
 ### 7.3 The four legacy fixture rows — deleted, stored-authority CHECK validated (0175)
 

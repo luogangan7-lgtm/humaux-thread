@@ -7,6 +7,13 @@
 //! 是前置没满足——判据与环境噪声分开。
 //!
 //! 三态照 `testkit::skip_or_fail`（CI 声明 HUMAUX_REQUIRE_DB=1 时跳过即失败）。
+//!
+//! depends-on: Postgres at `HUMAUX_TEST_PG_DSN` (owner; any loopback port/database — ADR-0047
+//! D-D, ADR-0050 D-B) + `HUMAUX_GATEWAY_PG_DSN` (role_gateway, same port/database as the owner
+//! or the legacy `61719 / humaux_thread_request_guard_20260828` pair); tables control.tenants,
+//! private.memory_records/evidence/context_bindings, ops.selection_snapshots, projection.stream_*.
+//! called-by: `cargo test -p humaux-adapters --test g80_31_handoff` (gate chain `adapters_tests`).
+//! invariants: owner DDL (a tenant-scoped RESTRICTIVE policy) is dropped in `Fixture::drop`.
 //! NA 的唯一主语是 probe 探测的具名缺失对象；字节不同 / mandatory 被淘汰 /
 //! needs_verification 空 **永远是红**，与 NA 零重合（ADR-0006）。
 
@@ -83,6 +90,7 @@ fn gateway_dsn() -> Option<String> {
         );
         return None;
     }
+    // dep: Postgres (role_gateway, HUMAUX_GATEWAY_PG_DSN) — identity probe: LOGIN, non-superuser, non-bypassrls.
     let Ok(mut gateway) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(
             NAME,
@@ -120,7 +128,17 @@ struct Fixture {
     evidence_id: Uuid,
     dsn: String,
     direct_get_barrier: Option<String>,
+    /// Held for the fixture's whole life (dropped after `Drop::drop` cleans up). The snapshot
+    /// token is the cluster-wide `pg_current_snapshot()`, so the byte-identity precondition
+    /// needs a quiet cluster: sibling tests of this binary must not commit between the two
+    /// assemblies. On the dedicated 61719 container the binary never ran in parallel with
+    /// anything that mattered; on the shared `HUMAUX_TEST_PG_DSN` target (ADR-0050 D-B) this
+    /// lock restores the "本 harness 独占" precondition the module doc states.
+    _quiet: std::sync::MutexGuard<'static, ()>,
 }
+
+/// One fixture at a time inside this binary — see [`Fixture::_quiet`].
+static QUIET: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -161,6 +179,10 @@ impl Drop for Fixture {
 }
 
 fn setup() -> Option<Fixture> {
+    // A test that panicked while holding the lock poisons it; the next fixture is still valid.
+    let quiet = QUIET
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Ok(dsn) = std::env::var("HUMAUX_TEST_PG_DSN") else {
         skip_or_fail(NAME, "missing object: Postgres DSN", ExternalDep::Postgres);
         return None;
@@ -173,18 +195,19 @@ fn setup() -> Option<Fixture> {
         );
         return None;
     };
-    if options.get_host() != "127.0.0.1"
-        || options.get_port() != 61719
-        || options.get_database() != Some(REQUEST_GUARD_DB)
-        || dsn.contains(['?', '#'])
-    {
+    // ADR-0047 D-D / ADR-0050 D-B: the owner DSN *defines* the fixture target (any loopback
+    // port/database); only loopback and a query-free DSN are enforced here, because this
+    // fixture installs a RESTRICTIVE policy as the owner. Role DSNs must then name the same
+    // target (`gateway_dsn`).
+    if options.get_host() != "127.0.0.1" || dsn.contains(['?', '#']) {
         skip_or_fail(
             NAME,
-            "invalid object: isolated owner fixture DSN",
+            "invalid object: loopback owner fixture DSN",
             ExternalDep::Postgres,
         );
         return None;
     }
+    // dep: Postgres (owner, HUMAUX_TEST_PG_DSN) — seeds/cleans the fixture tenant and installs the barrier policy.
     let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;
@@ -229,6 +252,7 @@ fn setup() -> Option<Fixture> {
         evidence_id,
         dsn: gateway_dsn,
         direct_get_barrier: None,
+        _quiet: quiet,
     })
 }
 
@@ -295,6 +319,7 @@ fn budget() -> ContextBudget {
 /// 每次装配自己连一个 pool：typed pool 刻意无 `Clone`（§6.2.3 闭集），测试迁就它
 /// 而不是撬开它——两次装配本来就该是两个独立事务。
 async fn one_handoff(dsn: &str, tenant: Uuid) -> Handoff {
+    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
     let pool = RuntimeDbPool::connect(dsn).await.expect("pool");
     let adapter = ContextReadAdapter::new(pool, authorization_for(tenant));
     assemble_handoff(&adapter, &scope_for(tenant), budget())
@@ -370,6 +395,7 @@ async fn one_materialized(
     budget: ContextBudget,
     family: &StreamFamily,
 ) -> Result<MaterializedContext, ErrorCode> {
+    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
     let pool = RuntimeDbPool::connect(dsn).await.expect("pool");
     let key = family.with_version("v1");
     assemble_materialized(&pool, authorization, scope, budget, family, &key).await
@@ -382,6 +408,7 @@ async fn one_direct_memory(
     family: &StreamFamily,
     memory_id: Uuid,
 ) -> Result<MaterializedMemory, ErrorCode> {
+    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
     let pool = RuntimeDbPool::connect(dsn).await.expect("pool");
     let key = family.with_version("v1");
     materialize_memory_get(
@@ -403,6 +430,7 @@ async fn one_enumerated(
     cursor: Option<&str>,
     page_size: u16,
 ) -> Result<humaux_adapters::context_repo::MaterializedMemoryPage, ErrorCode> {
+    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
     let pool = RuntimeDbPool::connect(dsn).await.expect("pool");
     let key = family.with_version("v1");
     materialize_memory_enumeration(
@@ -904,6 +932,7 @@ fn direct_get_keeps_body_grounding_and_ledger_on_one_snapshot() {
     let scope = scope_for(fixture.tenant_id);
     let actor_family = family.clone();
 
+    // dep: Postgres (role_gateway) — holds the advisory barrier the actor blocks on.
     let mut holder = Client::connect(&fixture.dsn, NoTls).expect("gateway lock holder");
     let holder_pid: i32 = holder
         .query_one("SELECT pg_backend_pid()", &[])
@@ -915,6 +944,7 @@ fn direct_get_keeps_body_grounding_and_ledger_on_one_snapshot() {
     let actor = std::thread::spawn(move || -> Result<_, String> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|error| format!("direct-get actor runtime: {error}"))?;
+        // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
         let pool = runtime
             .block_on(RuntimeDbPool::connect(&actor_dsn))
             .map_err(|error| format!("direct-get actor pool: {error}"))?;
@@ -1076,6 +1106,7 @@ fn enumeration_keeps_body_grounding_and_ledger_on_one_snapshot() {
     let scope = scope_for(fixture.tenant_id);
     let actor_family = family.clone();
 
+    // dep: Postgres (role_gateway) — holds the advisory barrier the actor blocks on.
     let mut holder = Client::connect(&fixture.dsn, NoTls).expect("gateway lock holder");
     let holder_pid: i32 = holder
         .query_one("SELECT pg_backend_pid()", &[])
@@ -1087,6 +1118,7 @@ fn enumeration_keeps_body_grounding_and_ledger_on_one_snapshot() {
     let actor = std::thread::spawn(move || -> Result<_, String> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|error| format!("enumeration actor runtime: {error}"))?;
+        // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
         let pool = runtime
             .block_on(RuntimeDbPool::connect(&actor_dsn))
             .map_err(|error| format!("enumeration actor pool: {error}"))?;

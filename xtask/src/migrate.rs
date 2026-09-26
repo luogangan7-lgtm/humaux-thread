@@ -5,17 +5,46 @@
 //! here — no earlier migration can create the table this runner needs before it runs) so a
 //! second run is idempotent (0 applied, not an error).
 //!
-//! Each `migrations/<stem>.sql` file is sent as one PostgreSQL simple-query message via
-//! [`postgres::Client::batch_execute`]: per the wire protocol, multiple statements in a single
-//! simple-query message run as one implicit transaction unless the file itself contains
-//! `BEGIN`/`COMMIT` — so a file either applies completely or not at all, no partial DDL.
+//! Each PENDING migration runs in one explicit transaction (ADR-0050 D-D, Baseline 2.9 §46.1):
+//! its manifest `precheck` (must return exactly 1 row × 1 `bool` column, value `true`), the
+//! unchanged `.sql` bytes via [`postgres::Transaction::batch_execute`], its `postcheck` (same
+//! shape rule), and the `ops.schema_migrations` row — then COMMIT. A false / non-boolean /
+//! invalid check refuses the migration with the check's name and the server's text, the
+//! transaction rolls back (drift 0: no object, no record), and the run stops. One log line per
+//! check. A pending migration with no manifest is refused. Already-applied migrations are
+//! never re-checked (a precheck is false after apply by construction); their drift is the
+//! checksum's job.
+//!
+//! One migrator per database (ADR-0050 D-F, audit DM-6): the whole run holds the session-level
+//! advisory lock [`MIGRATE_ADVISORY_LOCK`] ("HXMIGRAT"), taken after `SET lock_timeout` and
+//! before the bootstrap DDL, so a second `migrate` waits up to [`LOCK_TIMEOUT`] and then
+//! refuses with `55P03` and 0 applied. The same `lock_timeout` bounds every migration's DDL,
+//! so a migration queued behind a live worker's lock is refused with drift 0 instead of
+//! stalling traffic (runbook §1: stop the workers first).
+//!
+//! depends-on: Postgres (`--dsn` or `HUMAUX_TEST_PG_DSN`), `migrations/*.sql` and their
+//! `*.manifest.toml` (parsed by `migration_rehearsal::parse_manifest`), table
+//! `ops.schema_migrations` (self-bootstrapped).
+//! called-by: `cargo xtask migrate` (gate chain `migrate`), `serial_lane::provision`.
 
-use postgres::{Client, NoTls};
+use crate::migration_rehearsal::{self, Manifest};
+use postgres::error::SqlState;
+use postgres::types::Type;
+use postgres::{Client, GenericClient, NoTls};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
 const DSN_ENV: &str = "HUMAUX_TEST_PG_DSN";
+
+/// ADR-0050 D-F: the one advisory key every `migrate` run holds, ASCII "HXMIGRAT". A fixed
+/// bigint with no meaning, same style as `testkit::DISCLOSURE_LEDGER_ADVISORY_LOCK`; advisory
+/// locks are per database, so per-run lane databases never contend with the dev database.
+pub(crate) const MIGRATE_ADVISORY_LOCK: i64 = 0x4858_4D49_4752_4154;
+
+/// ADR-0050 D-F: how long a second migrator waits for [`MIGRATE_ADVISORY_LOCK`], and how long
+/// any migration's DDL may queue behind another session's lock, before refusing (`55P03`).
+const LOCK_TIMEOUT: &str = "30s";
 
 /// Bootstrap table this runner owns; not a `migrations/*.sql` file itself because it must
 /// exist *before* the first migration can be recorded (chicken-and-egg on migration 0001).
@@ -57,15 +86,19 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
-/// One `migrations/*.sql` file in filename order, paired with its already-loaded contents.
+/// One `migrations/*.sql` file in filename order, paired with its already-loaded contents and
+/// its sibling manifest (`None` when the file has none — refused only if it is pending).
+#[derive(Clone)]
 struct PendingMigration {
     migration_id: String,
     sql: String,
+    manifest: Option<Manifest>,
 }
 
 /// Enumerates `migrations_dir/*.sql` sorted by filename (the numeric prefix is the ordering
-/// key, §46 "按序应用"). Manifest presence/shape is `migration-rehearsal`'s job, not this
-/// runner's — a `.sql` file with no manifest still applies here.
+/// key, §46 "按序应用") and loads each sibling `<stem>.manifest.toml` with the one manifest
+/// parser (`migration_rehearsal::parse_manifest`). An unparsable manifest is an error here; a
+/// missing one is carried as `None` and refused by [`apply_all`] only if that file is pending.
 fn collect_migrations(migrations_dir: &Path) -> Result<Vec<PendingMigration>, String> {
     let mut paths: Vec<_> = fs::read_dir(migrations_dir)
         .map_err(|e| format!("cannot read {}: {e}", migrations_dir.display()))?
@@ -85,15 +118,109 @@ fn collect_migrations(migrations_dir: &Path) -> Result<Vec<PendingMigration>, St
                 .to_string();
             let sql = fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            Ok(PendingMigration { migration_id, sql })
+            let manifest_path = path.with_extension("manifest.toml");
+            let manifest = match fs::read_to_string(&manifest_path) {
+                Ok(text) => {
+                    let name = format!("{migration_id}.manifest.toml");
+                    Some(
+                        migration_rehearsal::parse_manifest(&name, &text)
+                            .map_err(|e| e.to_string())?,
+                    )
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("cannot read {}: {e}", manifest_path.display())),
+            };
+            Ok(PendingMigration {
+                migration_id,
+                sql,
+                manifest,
+            })
         })
         .collect()
 }
 
-/// Applies every not-yet-recorded migration in order; stops at the first failure (a later
-/// migration may depend on an earlier one's objects, so partial-then-continue would mask
-/// the real error behind a cascade of unrelated ones). Returns `(applied, skipped)` counts.
+/// The server's own complaint: `Display` alone can collapse to a bare "db error"; the text
+/// lives in `DbError` (falls back to `{e:?}` for non-server errors like a dropped connection).
+fn db_error_text(e: &postgres::Error) -> String {
+    e.as_db_error()
+        .map(|db| {
+            format!(
+                "{} {} — {}",
+                db.code().code(),
+                db.message(),
+                db.detail().unwrap_or("")
+            )
+        })
+        .unwrap_or_else(|| format!("{e:?}"))
+}
+
+/// Runs one manifest check inside the migration's transaction. It must return exactly one
+/// row with one `bool` column whose value is `true`; anything else is an `Err` naming the
+/// migration, the check, and why (server text, `returned false`, `returned <type>`, …).
+fn run_check(
+    tx: &mut impl GenericClient,
+    migration_id: &str,
+    field: &str,
+    sql: &str,
+) -> Result<(), String> {
+    let refuse = |why: String| format!("{migration_id}: {field} refused the migration — {why}");
+    let rows = tx.query(sql, &[]).map_err(|e| refuse(db_error_text(&e)))?;
+    let [row] = rows.as_slice() else {
+        return Err(refuse(format!("returned {} rows, expected 1", rows.len())));
+    };
+    if row.columns().len() != 1 {
+        return Err(refuse(format!(
+            "returned {} columns, expected 1",
+            row.columns().len()
+        )));
+    }
+    let ty = row.columns()[0].type_();
+    if *ty != Type::BOOL {
+        return Err(refuse(format!("returned {ty}, expected bool")));
+    }
+    match row.get::<_, Option<bool>>(0) {
+        Some(true) => {
+            eprintln!("migrate: {field} {migration_id} ok");
+            Ok(())
+        }
+        Some(false) => Err(refuse("returned false".to_string())),
+        None => Err(refuse("returned NULL".to_string())),
+    }
+}
+
+/// Applies every not-yet-recorded migration in order under [`MIGRATE_ADVISORY_LOCK`]; stops
+/// at the first failure (a later migration may depend on an earlier one's objects, so
+/// partial-then-continue would mask the real error behind a cascade of unrelated ones).
+/// `lock_timeout` is a PostgreSQL interval literal ([`LOCK_TIMEOUT`] in production; tests
+/// pass `1s`). Returns `(applied, skipped)` counts.
 fn apply_all(
+    client: &mut Client,
+    migrations: &[PendingMigration],
+    lock_timeout: &str,
+) -> Result<(usize, usize), String> {
+    client
+        .batch_execute(&format!("SET lock_timeout = '{lock_timeout}'"))
+        .map_err(|e| format!("cannot set lock_timeout: {}", db_error_text(&e)))?;
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&MIGRATE_ADVISORY_LOCK])
+        .map_err(|e| {
+            if e.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) {
+                format!(
+                    "another migrate holds HXMIGRAT (advisory lock {MIGRATE_ADVISORY_LOCK:#x}, \
+                     55P03 lock_not_available after {lock_timeout}); refused, 0 applied"
+                )
+            } else {
+                format!("cannot take HXMIGRAT advisory lock: {}", db_error_text(&e))
+            }
+        })?;
+    let result = apply_locked(client, migrations);
+    // Explicit release; a dropped connection releases it too. An unlock error cannot change
+    // what was applied, so it never masks `result`.
+    let _ = client.execute("SELECT pg_advisory_unlock($1)", &[&MIGRATE_ADVISORY_LOCK]);
+    result
+}
+
+fn apply_locked(
     client: &mut Client,
     migrations: &[PendingMigration],
 ) -> Result<(usize, usize), String> {
@@ -138,29 +265,35 @@ fn apply_all(
             continue;
         }
 
-        client.batch_execute(&m.sql).map_err(|e| {
-            // `Display` alone can collapse to a bare "db error" with no message; the
-            // server's actual complaint lives in `DbError` (falls back to `{e:?}` for
-            // non-server errors like a connection drop mid-batch).
-            let detail = e
-                .as_db_error()
-                .map(|db| format!("{} — {}", db.message(), db.detail().unwrap_or("")))
-                .unwrap_or_else(|| format!("{e:?}"));
-            format!("{}: {detail}", m.migration_id)
-        })?;
-
+        let Some(manifest) = &m.manifest else {
+            return Err(format!(
+                "{0}: refused — no manifest {0}.manifest.toml; migrate cannot execute a \
+                 precheck/postcheck it does not have (§46.1, ADR-0050 D-D)",
+                m.migration_id
+            ));
+        };
+        // ADR-0050 D-D: precheck, body, postcheck and the ledger row commit together or not
+        // at all. Dropping `tx` on any `?` below rolls everything back.
+        let mut tx = client
+            .transaction()
+            .map_err(|e| format!("{}: cannot begin: {}", m.migration_id, db_error_text(&e)))?;
+        run_check(&mut tx, &m.migration_id, "precheck", &manifest.precheck)?;
+        tx.batch_execute(&m.sql)
+            .map_err(|e| format!("{}: {}", m.migration_id, db_error_text(&e)))?;
+        run_check(&mut tx, &m.migration_id, "postcheck", &manifest.postcheck)?;
         let checksum = fnv1a_hex(m.sql.as_bytes());
-        client
-            .execute(
-                "INSERT INTO ops.schema_migrations (migration_id, checksum) VALUES ($1, $2)",
-                &[&m.migration_id, &checksum],
+        tx.execute(
+            "INSERT INTO ops.schema_migrations (migration_id, checksum) VALUES ($1, $2)",
+            &[&m.migration_id, &checksum],
+        )
+        .map_err(|e| {
+            format!(
+                "{}: cannot record in ops.schema_migrations: {e}",
+                m.migration_id
             )
-            .map_err(|e| {
-                format!(
-                    "{}: cannot record in ops.schema_migrations: {e}",
-                    m.migration_id
-                )
-            })?;
+        })?;
+        tx.commit()
+            .map_err(|e| format!("{}: commit: {}", m.migration_id, db_error_text(&e)))?;
 
         applied += 1;
         eprintln!("migrate: apply {}", m.migration_id);
@@ -210,6 +343,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     let migrations = migrations;
 
+    // dep: Postgres — the target database this run migrates.
     let mut client = match Client::connect(&dsn, NoTls) {
         Ok(c) => c,
         Err(e) => {
@@ -218,7 +352,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
-    match apply_all(&mut client, &migrations) {
+    match apply_all(&mut client, &migrations, LOCK_TIMEOUT) {
         Ok((applied, skipped)) => {
             eprintln!(
                 "migrate: pass ({applied} applied, {skipped} already-applied, {} total)",
@@ -236,8 +370,110 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration_rehearsal::MigrationClass;
+    use humaux_testkit::{ExternalDep, skip_or_fail};
     use postgres::{Client, types::Type};
     use std::fs;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    /// A minimal in-memory manifest: only the two checks matter to `apply_all`.
+    fn manifest(id: &str, precheck: &str, postcheck: &str) -> Manifest {
+        Manifest {
+            migration_id: id.to_string(),
+            class: MigrationClass::ForwardOnly,
+            precheck: precheck.to_string(),
+            postcheck: postcheck.to_string(),
+            rollback_or_forward_fix: "test fixture".to_string(),
+            backup_restore_requirement: "test fixture".to_string(),
+        }
+    }
+
+    fn migration(id: &str, sql: &str) -> PendingMigration {
+        PendingMigration {
+            migration_id: id.to_string(),
+            sql: sql.to_string(),
+            manifest: Some(manifest(id, "select true", "select true")),
+        }
+    }
+
+    /// Writes `<stem>.sql` and (when `checks` is given) a full `<stem>.manifest.toml`.
+    fn write_migration(dir: &Path, stem: &str, sql: &str, checks: Option<(&str, &str)>) {
+        fs::write(dir.join(format!("{stem}.sql")), sql).unwrap();
+        if let Some((pre, post)) = checks {
+            fs::write(
+                dir.join(format!("{stem}.manifest.toml")),
+                format!(
+                    "migration_id = \"{stem}\"\nclass = \"FORWARD_ONLY\"\n\
+                     precheck = \"{pre}\"\npostcheck = \"{post}\"\n\
+                     rollback_or_forward_fix = \"test\"\nbackup_restore_requirement = \"test\"\n"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    fn scratch_dir(purpose: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "xtask_migrate_c25_{purpose}_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `HUMAUX_TEST_PG_DSN`, or a `testkit::skip_or_fail` (a red under `HUMAUX_REQUIRE_DB=1`).
+    fn base_dsn(test: &str) -> Option<String> {
+        match std::env::var(DSN_ENV) {
+            Ok(dsn) => Some(dsn),
+            Err(_) => {
+                skip_or_fail(
+                    test,
+                    "missing object: HUMAUX_TEST_PG_DSN",
+                    ExternalDep::Postgres,
+                );
+                None
+            }
+        }
+    }
+
+    /// Creates `humaux_thread_c25_<purpose>_<pid>` (dropped `WITH (FORCE)` by the guard) and
+    /// returns the guard plus a DSN onto it. `None` = skipped through `skip_or_fail`.
+    fn throwaway(test: &str, purpose: &str) -> Option<(DisposableDatabase, String)> {
+        let base = base_dsn(test)?;
+        // dep: Postgres (superuser from HUMAUX_TEST_PG_DSN) — CREATE/DROP DATABASE.
+        let mut admin = match Client::connect(&base, NoTls) {
+            Ok(client) => client,
+            Err(e) => {
+                skip_or_fail(
+                    test,
+                    &format!("missing object: live Postgres at ${DSN_ENV}: {e}"),
+                    ExternalDep::Postgres,
+                );
+                return None;
+            }
+        };
+        let name = format!("humaux_thread_c25_{purpose}_{}", std::process::id());
+        admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .expect("drop a leftover throwaway of this pid");
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .expect("create throwaway database");
+        let dsn = database_dsn(&base, &name);
+        Some((
+            DisposableDatabase {
+                admin_dsn: base,
+                name,
+            },
+            dsn,
+        ))
+    }
+
+    fn scalar_bool(client: &mut Client, sql: &str) -> bool {
+        client.query_one(sql, &[]).unwrap().get(0)
+    }
 
     fn database_dsn(base: &str, database: &str) -> String {
         let (without_query, query) = base
@@ -281,6 +517,7 @@ mod tests {
 
     impl Drop for DisposableDatabase {
         fn drop(&mut self) {
+            // dep: Postgres (superuser from HUMAUX_TEST_PG_DSN) — DROP DATABASE of the disposable database.
             if let Ok(mut admin) = Client::connect(&self.admin_dsn, NoTls) {
                 let _ = admin.batch_execute(&format!("DROP DATABASE {} WITH (FORCE)", self.name));
             }
@@ -293,19 +530,47 @@ mod tests {
             std::env::temp_dir().join(format!("xtask_migrate_collect_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("0002_b.sql"), "-- second").unwrap();
-        fs::write(dir.join("0001_a.sql"), "-- first").unwrap();
-        // Manifest files must be ignored by the runner (that's migration-rehearsal's
-        // domain, §46.1) — a stray .toml here must not appear in the applied set.
-        fs::write(
-            dir.join("0001_a.manifest.toml"),
-            "migration_id = \"0001_a\"",
-        )
-        .unwrap();
+        write_migration(
+            &dir,
+            "0002_b",
+            "-- second",
+            Some(("select true", "select true")),
+        );
+        write_migration(
+            &dir,
+            "0001_a",
+            "-- first",
+            Some(("select true", "select false")),
+        );
 
+        // Manifests are loaded beside their `.sql` (ADR-0050 D-D), never applied as
+        // migrations themselves: the applied set is the `.sql` files only.
         let migrations = collect_migrations(&dir).expect("dir reads cleanly");
         let ids: Vec<&str> = migrations.iter().map(|m| m.migration_id.as_str()).collect();
         assert_eq!(ids, vec!["0001_a", "0002_b"]);
+        assert_eq!(
+            migrations[0]
+                .manifest
+                .as_ref()
+                .map(|m| m.postcheck.as_str()),
+            Some("select false"),
+            "each migration carries its own sibling manifest"
+        );
+
+        // A missing manifest is carried as `None` (refused only if pending); an unparsable
+        // one is an error naming the file.
+        write_migration(&dir, "0003_c", "-- third", None);
+        let migrations = collect_migrations(&dir).expect("missing manifest is not a read error");
+        assert!(migrations[2].manifest.is_none());
+        fs::write(
+            dir.join("0003_c.manifest.toml"),
+            "migration_id = \"0003_c\"",
+        )
+        .unwrap();
+        let err = collect_migrations(&dir)
+            .err()
+            .expect("an incomplete manifest must not load");
+        assert!(err.contains("0003_c.manifest.toml"), "{err}");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -316,13 +581,14 @@ mod tests {
     /// main schemas (硬规则④).
     #[test]
     fn apply_all_is_idempotent_and_atomic_on_a_bad_file() {
-        let Ok(dsn) = std::env::var(DSN_ENV) else {
-            eprintln!("migrate test: not_applicable — {DSN_ENV} unset, skipping");
-            return;
-        };
+        const TEST: &str = "apply_all_is_idempotent_and_atomic_on_a_bad_file";
+        let Some(dsn) = base_dsn(TEST) else { return };
+        // dep: Postgres (HUMAUX_TEST_PG_DSN) — apply_all against the disposable database.
         let Ok(mut client) = Client::connect(&dsn, NoTls) else {
-            eprintln!(
-                "migrate test: not_applicable — cannot reach Postgres at ${DSN_ENV}, skipping"
+            skip_or_fail(
+                TEST,
+                "missing object: live Postgres at HUMAUX_TEST_PG_DSN",
+                ExternalDep::Postgres,
             );
             return;
         };
@@ -353,17 +619,12 @@ mod tests {
         let id_ok2 = format!("test_{run_id}_0002_ok");
         let id_bad = format!("test_{run_id}_0003_bad");
         let migrations = vec![
-            PendingMigration {
-                migration_id: id_ok1.clone(),
-                sql: format!("CREATE TABLE {schema}.t (id int)"),
-            },
-            PendingMigration {
-                migration_id: id_ok2.clone(),
-                sql: format!("INSERT INTO {schema}.t VALUES (1)"),
-            },
+            migration(&id_ok1, &format!("CREATE TABLE {schema}.t (id int)")),
+            migration(&id_ok2, &format!("INSERT INTO {schema}.t VALUES (1)")),
         ];
 
-        let (applied, skipped) = apply_all(&mut client, &migrations).expect("clean apply");
+        let (applied, skipped) =
+            apply_all(&mut client, &migrations, LOCK_TIMEOUT).expect("clean apply");
         assert_eq!((applied, skipped), (2, 0), "first run applies both");
         let migration_table_owner: String = client
             .query_one(
@@ -378,7 +639,8 @@ mod tests {
             "migration bootstrap must converge to the Canonical owner once that role exists"
         );
 
-        let (applied, skipped) = apply_all(&mut client, &migrations).expect("idempotent re-apply");
+        let (applied, skipped) =
+            apply_all(&mut client, &migrations, LOCK_TIMEOUT).expect("idempotent re-apply");
         assert_eq!(
             (applied, skipped),
             (0, 2),
@@ -394,11 +656,11 @@ mod tests {
         // and this test would still pass against a server that wrapped nothing in a
         // transaction. `1/0` only fails once the engine actually executes it, after the
         // preceding CREATE TABLE has already run — only rollback can explain it vanishing.
-        let bad = vec![PendingMigration {
-            migration_id: id_bad.clone(),
-            sql: format!("CREATE TABLE {schema}.u (id int); INSERT INTO {schema}.u VALUES (1/0);"),
-        }];
-        let err = apply_all(&mut client, &bad)
+        let bad = vec![migration(
+            &id_bad,
+            &format!("CREATE TABLE {schema}.u (id int); INSERT INTO {schema}.u VALUES (1/0);"),
+        )];
+        let err = apply_all(&mut client, &bad, LOCK_TIMEOUT)
             .expect_err("a runtime-failing statement must fail, not silently pass");
         assert!(
             err.contains(&id_bad),
@@ -442,37 +704,11 @@ mod tests {
 
     #[test]
     fn final_0137_candidate_runtime_failure_has_zero_residue() {
-        let Ok(base_dsn) = std::env::var(DSN_ENV) else {
-            eprintln!("migrate test: not_applicable — {DSN_ENV} unset, skipping");
+        const TEST: &str = "final_0137_candidate_runtime_failure_has_zero_residue";
+        let Some((_database, test_dsn)) = throwaway(TEST, "migrate_0137") else {
             return;
         };
-        let run_id = format!(
-            "{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock after epoch")
-                .as_nanos()
-        );
-        let database = format!("humaux_w2_0137_{run_id}");
-        let test_dsn = database_dsn(&base_dsn, &database);
-        let mut admin = match Client::connect(&base_dsn, NoTls) {
-            Ok(client) => client,
-            Err(error) => {
-                eprintln!(
-                    "migrate test: not_applicable — cannot reach Postgres at ${DSN_ENV}: {error}, skipping"
-                );
-                return;
-            }
-        };
-        admin
-            .batch_execute(&format!("CREATE DATABASE {database}"))
-            .expect("create disposable PostgreSQL 18 database");
-        let _database = DisposableDatabase {
-            admin_dsn: base_dsn,
-            name: database,
-        };
-        drop(admin);
+        let run_id = std::process::id();
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let migrations = collect_migrations(&root.join("migrations")).expect("collect migrations");
@@ -483,8 +719,10 @@ mod tests {
         let before = &migrations[..split];
         let exact = &migrations[split];
         assert_eq!(exact.migration_id, "0137_project_continuity_read");
+        // dep: Postgres (disposable database) — split apply up to 0137.
         let mut client = Client::connect(&test_dsn, NoTls).expect("connect disposable database");
-        let (applied, skipped) = apply_all(&mut client, before).expect("apply through 0136");
+        let (applied, skipped) =
+            apply_all(&mut client, before, LOCK_TIMEOUT).expect("apply through 0136");
         assert_eq!(
             (applied, skipped),
             (before.len(), 0),
@@ -500,8 +738,10 @@ mod tests {
                 "{}\nCREATE TABLE {probe} (id integer);\nSELECT 1/0;",
                 exact.sql
             ),
+            manifest: exact.manifest.clone(),
         };
-        let error = apply_all(&mut client, &[failed]).expect_err("exact 0137 candidate must fail");
+        let error = apply_all(&mut client, &[failed], LOCK_TIMEOUT)
+            .expect_err("exact 0137 candidate must fail");
         assert!(
             error.contains(&failed_id),
             "failure names exact candidate: {error}"
@@ -525,7 +765,7 @@ mod tests {
             "failed candidate must not enter ledger"
         );
 
-        let (applied, skipped) = apply_all(&mut client, std::slice::from_ref(exact))
+        let (applied, skipped) = apply_all(&mut client, std::slice::from_ref(exact), LOCK_TIMEOUT)
             .expect("apply untouched exact 0137");
         assert_eq!((applied, skipped), (1, 0), "untouched 0137 applies once");
         assert_exact_manifest_boolean(&mut client, "postcheck", true);
@@ -534,19 +774,242 @@ mod tests {
         // later migration would show up as a fresh apply during the replay and turn the
         // zero-apply assertion red for a reason that has nothing to do with 0137's residue.
         let after = &migrations[split + 1..];
-        let (applied, skipped) =
-            apply_all(&mut client, after).expect("apply migrations authored after 0137");
+        let (applied, skipped) = apply_all(&mut client, after, LOCK_TIMEOUT)
+            .expect("apply migrations authored after 0137");
         assert_eq!(
             (applied, skipped),
             (after.len(), 0),
             "post-0137 migrations apply exactly once"
         );
         let (applied, skipped) =
-            apply_all(&mut client, &migrations).expect("replay exact migration set");
+            apply_all(&mut client, &migrations, LOCK_TIMEOUT).expect("replay exact migration set");
         assert_eq!(
             (applied, skipped),
             (0, migrations.len()),
             "replay is zero-apply"
         );
+    }
+
+    /// ADR-0050 D-D stop condition: a fresh database built 0001→head with every manifest's
+    /// precheck (in its migration's PRE-state) and postcheck executed. This is the only place
+    /// the prechecks are proven true where they are meant to hold.
+    #[test]
+    fn migrate_throwaway_db_applies_0001_to_head_executing_every_manifest_check() {
+        const TEST: &str =
+            "migrate_throwaway_db_applies_0001_to_head_executing_every_manifest_check";
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let migrations = collect_migrations(&root.join("migrations")).expect("collect migrations");
+        assert!(
+            migrations.len() >= 143,
+            "the repo holds at least the 143 migrations of 2026-09-26, got {}",
+            migrations.len()
+        );
+        let missing: Vec<&str> = migrations
+            .iter()
+            .filter(|m| m.manifest.is_none())
+            .map(|m| m.migration_id.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "migrations without a manifest: {missing:?}"
+        );
+        let Some((_db, dsn)) = throwaway(TEST, "migrate_head") else {
+            return;
+        };
+        // dep: Postgres (throwaway c25 database) — apply 0001→head executing every manifest check.
+        let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
+        let started = Instant::now();
+        let (applied, skipped) = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+            .unwrap_or_else(|e| panic!("0001→head with every manifest check: {e}"));
+        eprintln!(
+            "migrate test: 0001→head applied {applied} migrations, {} checks, in {:.1}s",
+            2 * applied,
+            started.elapsed().as_secs_f64()
+        );
+        assert_eq!((applied, skipped), (migrations.len(), 0));
+        let recorded: i64 = client
+            .query_one("SELECT count(*) FROM ops.schema_migrations", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            recorded as usize,
+            migrations.len(),
+            "one ledger row per migration"
+        );
+    }
+
+    /// A false postcheck and an invalid-SQL precheck each refuse their migration, name the
+    /// check and carry the reason, and leave drift 0 (no object, no ledger row).
+    #[test]
+    fn migrate_refuses_false_postcheck_and_invalid_check_sql_with_drift_0() {
+        const TEST: &str = "migrate_refuses_false_postcheck_and_invalid_check_sql_with_drift_0";
+        let Some((_db, dsn)) = throwaway(TEST, "migrate_refuse") else {
+            return;
+        };
+        // dep: Postgres (throwaway c25 database) — refusal on false/invalid scratch checks.
+        let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
+        let cases = [
+            (
+                "false_post",
+                "select true",
+                "select false",
+                "postcheck",
+                "returned false",
+            ),
+            (
+                "invalid_pre",
+                "selec true",
+                "select true",
+                "precheck",
+                "syntax error",
+            ),
+        ];
+        for (purpose, pre, post, field, reason) in cases {
+            let dir = scratch_dir(purpose);
+            let stem = format!("0001_c25_{purpose}");
+            let table = format!("c25_scratch_{purpose}");
+            write_migration(
+                &dir,
+                &stem,
+                &format!("CREATE TABLE {table} (id int)"),
+                Some((pre, post)),
+            );
+            let migrations = collect_migrations(&dir).expect("scratch dir");
+            let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+                .expect_err("a failing check must refuse the migration");
+            assert!(
+                err.contains(&stem) && err.contains(field) && err.contains(reason),
+                "{purpose}: error must name the migration, the check and the reason: {err}"
+            );
+            assert!(
+                scalar_bool(
+                    &mut client,
+                    &format!(
+                        "SELECT to_regclass('{table}') IS NULL AND NOT EXISTS \
+                         (SELECT 1 FROM ops.schema_migrations WHERE migration_id = '{stem}')"
+                    )
+                ),
+                "{purpose}: drift must be 0 — no object, no ledger row"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn migrate_refuses_non_boolean_check() {
+        const TEST: &str = "migrate_refuses_non_boolean_check";
+        let Some((_db, dsn)) = throwaway(TEST, "migrate_nonbool") else {
+            return;
+        };
+        // dep: Postgres (throwaway c25 database) — refusal on a non-boolean check.
+        let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
+        let mut m = migration("0001_c25_nonbool", "CREATE TABLE c25_nonbool (id int)");
+        m.manifest = Some(manifest(&m.migration_id, "select 1", "select true"));
+        let err = apply_all(&mut client, &[m], LOCK_TIMEOUT).expect_err("int is not a verdict");
+        assert!(
+            err.contains("precheck") && err.contains("expected bool"),
+            "{err}"
+        );
+        assert!(scalar_bool(
+            &mut client,
+            "SELECT to_regclass('c25_nonbool') IS NULL"
+        ));
+    }
+
+    #[test]
+    fn migrate_refuses_pending_migration_without_manifest() {
+        const TEST: &str = "migrate_refuses_pending_migration_without_manifest";
+        let dir = scratch_dir("nomanifest");
+        write_migration(
+            &dir,
+            "0001_c25_nomanifest",
+            "CREATE TABLE c25_nomanifest (id int)",
+            None,
+        );
+        let migrations = collect_migrations(&dir).expect("scratch dir");
+        let Some((_db, dsn)) = throwaway(TEST, "migrate_nomanifest") else {
+            return;
+        };
+        // dep: Postgres (throwaway c25 database) — apply_all under the advisory lock.
+        let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
+        let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+            .expect_err("a pending migration without a manifest is refused");
+        assert!(err.contains("no manifest"), "{err}");
+        assert!(scalar_bool(
+            &mut client,
+            "SELECT to_regclass('c25_nomanifest') IS NULL AND NOT EXISTS \
+             (SELECT 1 FROM ops.schema_migrations WHERE migration_id = '0001_c25_nomanifest')"
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0050 D-F: while client A holds HXMIGRAT, client B's migrate refuses with 55P03 and
+    /// records nothing; after A releases, B applies. Two concurrent migrators on a slow
+    /// migration apply each id exactly once.
+    #[test]
+    fn migrate_advisory_lock_second_client_waits_or_refuses_with_drift_0() {
+        const TEST: &str = "migrate_advisory_lock_second_client_waits_or_refuses_with_drift_0";
+        let Some((_db, dsn)) = throwaway(TEST, "migrate_lock") else {
+            return;
+        };
+        // dep: Postgres (throwaway c25 database) — client A holds HXMIGRAT.
+        let mut a = Client::connect(&dsn, NoTls).expect("client A");
+        // dep: Postgres (throwaway c25 database) — client B must wait or refuse with drift 0.
+        let mut b = Client::connect(&dsn, NoTls).expect("client B");
+        a.execute("SELECT pg_advisory_lock($1)", &[&MIGRATE_ADVISORY_LOCK])
+            .expect("A takes HXMIGRAT");
+        let ms = [migration("0001_c25_lock", "CREATE TABLE c25_lock (id int)")];
+        let err = apply_all(&mut b, &ms, "1s").expect_err("B must not interleave with A");
+        assert!(err.contains("55P03") && err.contains("0 applied"), "{err}");
+        assert!(
+            scalar_bool(&mut b, "SELECT to_regclass('c25_lock') IS NULL"),
+            "B refused before touching anything: drift 0"
+        );
+        a.execute("SELECT pg_advisory_unlock($1)", &[&MIGRATE_ADVISORY_LOCK])
+            .expect("A releases");
+        assert_eq!(
+            apply_all(&mut b, &ms, "1s").expect("B applies after A"),
+            (1, 0)
+        );
+
+        // Two real migrators racing on a slow migration: the lock serialises them, so one
+        // applies and the other finds it recorded.
+        let slow = vec![migration(
+            "0002_c25_slow",
+            "SELECT pg_sleep(2); CREATE TABLE c25_slow (id int)",
+        )];
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let dsn = dsn.clone();
+                let slow = slow.clone();
+                std::thread::spawn(move || {
+                    // dep: Postgres (throwaway c25 database) — one of the concurrent migrate racers.
+                    let mut c = Client::connect(&dsn, NoTls).expect("racer connects");
+                    apply_all(&mut c, &slow, LOCK_TIMEOUT)
+                })
+            })
+            .collect();
+        let mut outcomes: Vec<(usize, usize)> = racers
+            .into_iter()
+            .map(|r| {
+                r.join()
+                    .expect("racer thread")
+                    .expect("racer applies or skips")
+            })
+            .collect();
+        outcomes.sort_unstable();
+        assert_eq!(
+            outcomes,
+            vec![(0, 1), (1, 0)],
+            "exactly one apply of 0002_c25_slow"
+        );
+        let rows: i64 = b
+            .query_one(
+                "SELECT count(*) FROM ops.schema_migrations WHERE migration_id = '0002_c25_slow'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(rows, 1);
     }
 }

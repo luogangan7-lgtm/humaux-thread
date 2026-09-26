@@ -146,6 +146,22 @@ tail. A group can fail eight tests at once, and a twelve-line tail is then libte
 with every panic message already scrolled past — a log that names failures it cannot explain
 sends the next reader back to re-run the group by hand.
 
+## The operation-receipt witnesses run here (card 25, ADR-0050 D-J)
+
+The three same-key concurrency witnesses in `crates/adapters/tests/operation_receipts.rs` were
+changed from `lane(c)` (retired, not run) to `lane(a:request_guard)` on 2026-09-26:
+
+- `receipt_insert_lock_past_token_deadline_rolls_back_business_bmo_audit_and_receipt`
+- `receipt_insert_lock_past_reservation_deadline_rolls_back_while_token_is_valid`
+- `concurrent_same_key_never_commits_two_business_or_bmo_rows`
+
+`Resource::RequestGuard` provisions a per-run database with every role DSN repointed, and
+`support/operation_receipt_fixture.rs` already accepts it (ADR-0047 D-D). The old reason said
+the relation-lock wait observation "does not reproduce" on the standard database. That was
+never tried on a quiet per-run database. The third test does not observe a relation lock at
+all; it is the only same-key witness ADR-0032 relies on. The disposition lives in the ignore
+reason, not in a second table. The lane's `request_guard` group reports each test by name.
+
 ## Process discipline
 
 The lane never kills a process it did not spawn and never frees a port by force (a `lsof -ti

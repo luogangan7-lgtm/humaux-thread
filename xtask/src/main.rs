@@ -2,7 +2,7 @@
 //!
 //! 子命令与闸的对应：architecture-check(G80-1/2/3/22…) · mechanism-registry(G80-10)
 //! · migration-rehearsal(G80-37) · metrics-registry(G80-6) · contract-impact(G80-42)
-//! · config-check(G80-41) · rls-check(§48.2)。判据正文以家章为唯一真源。
+//! · config-check(G80-41) · rls-check(§48.2) · gate-truth(§79.2, ADR-0050 D-C)。判据正文以家章为唯一真源。
 
 mod architecture_check;
 mod benchset_declaration;
@@ -14,6 +14,7 @@ mod direction_table;
 mod dod_check;
 mod e2e_seed;
 mod gate_registry;
+mod gate_truth;
 mod mechanism_registry;
 mod member;
 mod metrics_registry;
@@ -53,9 +54,10 @@ fn main() {
         Some("sweep-confirm-tokens") => confirm_sweep::run(&args[2..]),
         Some("serial-lane") => serial_lane::run(&args[2..]),
         Some("soak") => soak::run(&args[2..]),
+        Some("gate-truth") => gate_truth::run(&args[2..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|r4-fault-manifest|direction-table|card-version|migrate|e2e-seed|member|projection-serve|sweep-confirm-tokens|serial-lane|soak>"
+                "usage: cargo xtask <architecture-check|mechanism-registry|migration-rehearsal|metrics-registry|contract-impact|config-check|rls-check|threshold-shape|benchset-declaration|gate-registry|dod-check|phase-check|r4-fault-manifest|direction-table|card-version|migrate|e2e-seed|member|projection-serve|sweep-confirm-tokens|serial-lane|soak|gate-truth>"
             );
             2
         }

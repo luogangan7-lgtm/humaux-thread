@@ -186,10 +186,10 @@ pub fn parse_target_args(args: &[String]) -> Result<ObservationTarget, String> {
     }
     let mut deployment_id = None;
     let mut cell_id = None;
-    for pair in args.chunks_exact(2) {
-        match pair[0].as_str() {
-            "--deployment" if deployment_id.is_none() => deployment_id = Some(pair[1].clone()),
-            "--cell" if cell_id.is_none() => cell_id = Some(pair[1].clone()),
+    for [flag, value] in args.as_chunks::<2>().0 {
+        match flag.as_str() {
+            "--deployment" if deployment_id.is_none() => deployment_id = Some(value.clone()),
+            "--cell" if cell_id.is_none() => cell_id = Some(value.clone()),
             _ => return Err("unknown or duplicate mechanism scope argument".into()),
         }
     }

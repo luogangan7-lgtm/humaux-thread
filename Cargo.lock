@@ -3822,6 +3822,7 @@ dependencies = [
  "humaux-infra-cell",
  "humaux-projection",
  "humaux-protocol",
+ "humaux-testkit",
  "postgres",
  "rand 0.9.5",
  "serde_json",

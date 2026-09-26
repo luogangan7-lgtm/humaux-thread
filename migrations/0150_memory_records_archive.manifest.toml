@@ -12,7 +12,6 @@ select to_regclass('private.memory_records') is not null
  and not exists(select 1 from information_schema.columns
                 where table_schema='private' and table_name='memory_records'
                   and column_name='archived_at')
- and not has_column_privilege('role_gateway','private.memory_records','archived_at','UPDATE')
  as precheck_ok
 """
 

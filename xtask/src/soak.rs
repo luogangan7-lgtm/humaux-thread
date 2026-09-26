@@ -18,14 +18,22 @@
 //! * §6.1 isolation: no tenant's MCP response ever contains another tenant's sentinel or id;
 //! * ADR-0037 probes (`GET /readyz`, `<worker> --readyz`) stay green throughout — polled as the
 //!   real probes through `--probe-cmd`, never re-implemented here;
-//! * bounded RSS and bounded PostgreSQL connection count (leak detection).
+//! * every process the launcher started is actually alive (ADR-0050 D-I, audit TH-4): each
+//!   observation runs ONE `ps -axo pid=,rss=,comm=` and looks up every `--watch-pidfile`'s current
+//!   pid. Absent inside `[chaos_start, chaos_start + --chaos-grace-secs]` is an *expected* absence
+//!   (reported, not a failure); any other absence is a probe failure. A `ps` that cannot run,
+//!   exits non-zero or returns an empty table is an assertion failure (`ps_observed`), never an
+//!   RSS of 0;
+//! * per-operation failure rate at most `--max-op-failure-rate` (`op_failure_rate`);
+//! * bounded RSS (only real readings are scored) and bounded PostgreSQL connection count.
 //!
 //! §78.1: **no literal thresholds and no defaults.** Every duration, ceiling and endpoint is a
 //! required flag; a soak whose thresholds were baked in would move with the code it grades.
 //! Every number in the report carries its `n` and its `unit` for the same reason.
 //!
 //! Process ownership stays with the script that started the processes: `--chaos-cmd` and
-//! `--probe-cmd` are shell commands, so the harness never needs the PIDs or the workers' env
+//! `--probe-cmd` are shell commands, and `--watch-pidfile` names the pidfiles the launcher (and
+//! its chaos steps) keep current, so the harness never takes PIDs as arguments or the workers' env
 //! (which carries the BYOK key material). Nothing here reads or prints a credential: the bearer
 //! for each tenant is named by an env var and stays in process memory.
 //!
@@ -33,10 +41,16 @@
 //! raw-client rule binds `reqwest`/`hyper` construction in the product's egress lane; this is a
 //! test driver on 127.0.0.1 and adding an HTTP dependency to `xtask` would itself trip the
 //! §83.4 manifest gate.
+//!
+//! depends-on: the gateway (loopback HTTP), Postgres as role_maintenance
+//! (`HUMAUX_MAINTENANCE_PG_DSN`), Qdrant (visible counts), `ps`, the launcher's pidfiles.
+//! called-by: `cargo xtask soak` from the rehearsal launcher (`rehearse_v2.sh`, TW).
+//! spec: §15.1/§15.3/§15.5, §16.2, §31/§61, §6.1, ADR-0037, ADR-0038 (vacuous = FAIL), ADR-0050 D-I.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -60,8 +74,10 @@ const USAGE: &str = "usage: cargo xtask soak \
 --tenant <tenant_uuid>:<workspace_uuid>:<BEARER_ENV_VAR> (repeat, >= 2) \
 --sessions-per-tenant <n> --duration-secs <n> --drain-secs <n> --think-ms <n> \
 --probe-every-secs <n> --probe-cmd <sh> (repeat) \
-[--chaos-every-secs <n> --chaos-cmd <sh> (repeat)] \
---lease-secs <n> --max-rss-mib <n> --max-db-connections <n> --report <path> \
+--watch-pidfile <name>=<path> (repeat, >= 1) \
+[--chaos-every-secs <n> --chaos-grace-secs <n> --chaos-cmd <sh> (repeat)] \
+--lease-secs <n> --max-rss-mib <n> --max-db-connections <n> --max-op-failure-rate <0..1> \
+--report <path> \
 [--qdrant-host 127.0.0.1] [--qdrant-port 6333]";
 
 /// One tenant lane. `bearer` is read from the env var the flag names and is never printed,
@@ -86,11 +102,17 @@ pub struct Config {
     think: Duration,
     probe_every: Duration,
     probe_cmds: Vec<String>,
+    /// `(name, pidfile)` for every process the launcher started (ADR-0050 D-I).
+    watch_pidfiles: Vec<(String, PathBuf)>,
     chaos_every: Option<Duration>,
+    /// How long after a chaos step starts an absent watched process is expected.
+    chaos_grace: Option<Duration>,
     chaos_cmds: Vec<String>,
     lease_secs: u64,
     max_rss_mib: u64,
     max_db_connections: i64,
+    /// Ceiling on any one operation's `failed / n` (fraction, 0..=1).
+    max_op_failure_rate: f64,
     report_path: String,
     /// §23.1② visible counts for the §16.2 promotion report (see [`promote_rejections`]) are
     /// taken live against this Qdrant — the same local endpoint every other lane of the
@@ -200,6 +222,40 @@ pub fn parse_config(args: &[String]) -> Result<Config, String> {
     if chaos_every.is_some() != !chaos_cmds.is_empty() {
         return Err("--chaos-every-secs and --chaos-cmd must be given together".to_string());
     }
+    let chaos_grace = values(args, "--chaos-grace-secs")
+        .first()
+        .map(|v| v.parse::<u64>().map(Duration::from_secs))
+        .transpose()
+        .map_err(|e| format!("--chaos-grace-secs must be an integer: {e}"))?;
+    if chaos_every.is_some() != chaos_grace.is_some() {
+        return Err(
+            "--chaos-grace-secs is required with --chaos-every-secs (and only then): without it \
+             a chaos-killed process cannot be told from an unexpected death"
+                .to_string(),
+        );
+    }
+    let watch_pidfiles = values(args, "--watch-pidfile")
+        .iter()
+        .map(|raw| {
+            raw.split_once('=')
+                .filter(|(name, path)| !name.is_empty() && !path.is_empty())
+                .map(|(name, path)| (name.to_string(), PathBuf::from(path)))
+                .ok_or_else(|| format!("--watch-pidfile {raw:?}: expected <name>=<path>"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if watch_pidfiles.is_empty() {
+        return Err(format!(
+            "--watch-pidfile is required (ADR-0050 D-I: a probe must see the resident process)\n{USAGE}"
+        ));
+    }
+    let max_op_failure_rate: f64 = one(args, "--max-op-failure-rate")?
+        .parse()
+        .map_err(|e| format!("--max-op-failure-rate must be a number: {e}"))?;
+    if !(0.0..=1.0).contains(&max_op_failure_rate) {
+        return Err(format!(
+            "--max-op-failure-rate {max_op_failure_rate} must be a fraction in 0..=1"
+        ));
+    }
     let (qdrant_host, qdrant_port) = crate::switch_visible::qdrant_endpoint(args)?;
     let probe_cmds = values(args, "--probe-cmd");
     if probe_cmds.is_empty() {
@@ -219,12 +275,15 @@ pub fn parse_config(args: &[String]) -> Result<Config, String> {
         think: Duration::from_millis(num(args, "--think-ms")?),
         probe_every: Duration::from_secs(num(args, "--probe-every-secs")?),
         probe_cmds,
+        watch_pidfiles,
         chaos_every,
+        chaos_grace,
         chaos_cmds,
         lease_secs,
         max_rss_mib: num(args, "--max-rss-mib")?,
         max_db_connections: i64::try_from(num(args, "--max-db-connections")?)
             .map_err(|e| format!("--max-db-connections: {e}"))?,
+        max_op_failure_rate,
         report_path: one(args, "--report")?,
         qdrant_host,
         qdrant_port,
@@ -302,6 +361,7 @@ pub fn mcp_request(host_port: &str, path: &str, origin: &str, tool: &str, args: 
 fn call(cfg: &Config, lane: &TenantLane, tool: &str, args: &str) -> Result<(u16, String), String> {
     let wire = mcp_request(&cfg.host_port, &cfg.path, &cfg.origin, tool, args)
         .replace("{BEARER}", &lane.bearer);
+    // dep: humaux-gateway MCP HTTP (cfg.host_port) — one soak op on a fresh loopback socket.
     let mut sock = TcpStream::connect(&cfg.host_port).map_err(|e| format!("connect: {e}"))?;
     sock.set_read_timeout(Some(Duration::from_secs(120)))
         .and_then(|()| sock.set_write_timeout(Some(Duration::from_secs(30))))
@@ -346,9 +406,19 @@ pub struct Observation {
     pub watermarks: Vec<StreamWatermark>,
     pub backlog: i64,
     pub db_connections: i64,
-    pub rss_mib: u64,
+    /// Largest `humaux-*` RSS in this observation's `ps` table; `None` when `ps` failed or
+    /// listed no `humaux-*` process — never a default `0` that would pass `rss_bounded`.
+    pub rss_mib: Option<u64>,
     pub probe_failures: usize,
     pub probes_run: usize,
+    /// `ps` ran, exited 0 and returned a non-empty table (ADR-0050 D-I).
+    pub ps_ok: bool,
+    /// Watched processes looked up in this observation's `ps` table (0 when `ps` failed).
+    pub watched: usize,
+    /// Watched processes absent outside every chaos grace window — a probe failure.
+    pub unexpected_absent: usize,
+    /// Watched processes absent inside a chaos grace window — reported, not a failure.
+    pub expected_absent: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -638,8 +708,14 @@ pub fn percentile(sorted: &[f64], q: f64) -> f64 {
     sorted[rank - 1]
 }
 
-pub fn evaluate(series: &Series, max_rss: u64, max_conns: i64) -> Vec<Assertion> {
+pub fn evaluate(
+    series: &Series,
+    max_rss: u64,
+    max_conns: i64,
+    max_op_failure_rate: f64,
+) -> Vec<Assertion> {
     let mut all = observation_assertions(&series.observations, max_rss, max_conns);
+    all.push(op_failure_rate(&series.samples, max_op_failure_rate));
     all.push(promotion_assertion(series));
     all.push(promote_candidate_assertion(series));
     all.extend(settlement_assertions(series));
@@ -768,21 +844,70 @@ fn observation_assertions(obs: &[Observation], max_rss: u64, max_conns: i64) -> 
             n_obs,
             max_conns as f64,
         ),
+        // Only real readings are scored; `n` counts them, so a run where `ps` never produced
+        // one is FAIL-VACUOUS (ADR-0038), not "0 MiB <= ceiling".
         at_most(
             "rss_bounded",
-            obs.iter().map(|o| o.rss_mib).max().unwrap_or(0) as f64,
+            obs.iter().filter_map(|o| o.rss_mib).max().unwrap_or(0) as f64,
             "MiB",
-            n_obs,
+            obs.iter().filter(|o| o.rss_mib.is_some()).count() as i64,
             max_rss as f64,
         ),
         at_most(
             "probes_green",
-            obs.iter().map(|o| o.probe_failures as i64).sum::<i64>() as f64,
-            "failed probe runs",
-            obs.iter().map(|o| o.probes_run as i64).sum::<i64>(),
+            obs.iter()
+                .map(|o| (o.probe_failures + o.unexpected_absent) as i64)
+                .sum::<i64>() as f64,
+            "failed probe runs + unexpected process absences",
+            obs.iter()
+                .map(|o| (o.probes_run + o.watched) as i64)
+                .sum::<i64>(),
+            0.0,
+        )
+        .with_detail(serde_json::json!({
+            "failed_probe_runs": obs.iter().map(|o| o.probe_failures).sum::<usize>(),
+            "unexpected_absent": obs.iter().map(|o| o.unexpected_absent).sum::<usize>(),
+            "expected_absent_in_chaos_window": obs.iter().map(|o| o.expected_absent).sum::<usize>(),
+        })),
+        at_most(
+            "ps_observed",
+            obs.iter().filter(|o| !o.ps_ok).count() as f64,
+            "observations whose ps failed",
+            n_obs,
             0.0,
         ),
     ]
+}
+
+/// ADR-0050 D-I: value = the worst operation's `failed / n`, so a red names its op in
+/// `detail`; `n` = every sample, so a run with no load is FAIL-VACUOUS (ADR-0038). Chaos-window
+/// failures count: excusing them needs chaos-to-op attribution (card 54).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "counts feed a report field, not an equality test"
+)]
+pub fn op_failure_rate(samples: &[Sample], threshold: f64) -> Assertion {
+    let mut per_op: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
+    for s in samples {
+        let e = per_op.entry(s.op.as_str()).or_default();
+        e.0 += 1;
+        e.1 += i64::from(!s.ok);
+    }
+    let rate = |(n, failed): (i64, i64)| failed as f64 / n as f64;
+    let worst = per_op.values().map(|v| rate(*v)).fold(0.0, f64::max);
+    at_most(
+        "op_failure_rate",
+        worst,
+        "fraction of calls failed (worst op)",
+        samples.len() as i64,
+        threshold,
+    )
+    .with_detail(serde_json::Value::Array(
+        per_op
+            .iter()
+            .map(|(op, v)| serde_json::json!({"op": op, "n": v.0, "failed": v.1, "rate": rate(*v)}))
+            .collect(),
+    ))
 }
 
 /// Everything only the post-drain snapshot can answer: the §15.1 ledger, exactly-once, the
@@ -935,6 +1060,8 @@ pub fn report_json(
                 "backlog_rows": o.backlog, "db_connections": o.db_connections,
                 "max_process_rss_mib": o.rss_mib,
                 "probe_failures": o.probe_failures, "probes_run": o.probes_run,
+                "ps_ok": o.ps_ok, "watched": o.watched,
+                "unexpected_absent": o.unexpected_absent, "expected_absent": o.expected_absent,
             })
         })
         .collect();
@@ -1192,24 +1319,113 @@ const BACKLOG_SQL: &str = "SELECT (SELECT count(*) FROM ops.jobs \
      WHERE status IN ('PENDING','PROCESSING','RETRY_WAIT','WAITING_KEY')) \
    + (SELECT count(*) FROM ops.outbox WHERE status IN ('PENDING','PROCESSING'))";
 
-/// `ps` is the portable way to read another process's RSS; the harness deliberately does not
-/// take the workers' PIDs (see the module doc — process ownership stays with the launcher).
-fn max_rss_mib() -> u64 {
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-axo", "rss=,comm="])
-        .output()
-    else {
-        return 0;
-    };
-    String::from_utf8_lossy(&out.stdout)
+/// `pid -> (rss_kib, comm)` from one `ps -axo pid=,rss=,comm=` run. A non-zero exit or an
+/// empty table is an `Err` (ADR-0050 D-I: a `ps` failure is an assertion failure, never RSS 0).
+pub fn parse_ps_table(
+    stdout: &str,
+    status_ok: bool,
+) -> Result<BTreeMap<u32, (u64, String)>, String> {
+    if !status_ok {
+        return Err("ps exited non-zero".to_string());
+    }
+    let table: BTreeMap<u32, (u64, String)> = stdout
         .lines()
-        .filter(|l| l.contains("humaux-"))
-        .filter_map(|l| l.split_whitespace().next()?.parse::<u64>().ok())
-        .max()
-        .map_or(0, |kib| kib / 1024)
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse().ok()?;
+            let rss = parts.next()?.parse().ok()?;
+            let comm = parts.collect::<Vec<_>>().join(" ");
+            Some((pid, (rss, comm)))
+        })
+        .collect();
+    if table.is_empty() {
+        return Err("ps returned an empty table".to_string());
+    }
+    Ok(table)
+}
+
+/// Whether one watched process is alive at one observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Present,
+    /// Absent inside `[chaos_start, chaos_start + grace]` of some chaos step.
+    ExpectedAbsent,
+    UnexpectedAbsent,
+}
+
+/// A watched process is present only when its pidfile names a pid that `ps` lists with a
+/// `humaux-` command (a reused pid running something else is absent).
+pub fn classify_presence(
+    pidfile_pid: Option<u32>,
+    table: &BTreeMap<u32, (u64, String)>,
+    now: Instant,
+    chaos_starts: &[Instant],
+    grace: Option<Duration>,
+) -> Presence {
+    let alive = pidfile_pid
+        .and_then(|pid| table.get(&pid))
+        .is_some_and(|(_, comm)| comm.contains("humaux-"));
+    if alive {
+        return Presence::Present;
+    }
+    let in_window = grace.is_some_and(|grace| {
+        chaos_starts
+            .iter()
+            .any(|start| *start <= now && now <= *start + grace)
+    });
+    if in_window {
+        Presence::ExpectedAbsent
+    } else {
+        Presence::UnexpectedAbsent
+    }
+}
+
+/// One `ps` run → `ps_ok`, `rss_mib`, and a presence verdict per watched pidfile.
+fn observe_processes(cfg: &Config, chaos_starts: &Mutex<Vec<Instant>>, obs: &mut Observation) {
+    // dep: ps — the portable way to read other processes' liveness and RSS without taking PIDs.
+    let table = std::process::Command::new("ps")
+        .args(["-axo", "pid=,rss=,comm="])
+        .output()
+        .map_err(|e| format!("ps could not run: {e}"))
+        .and_then(|out| {
+            parse_ps_table(&String::from_utf8_lossy(&out.stdout), out.status.success())
+        });
+    let table = match table {
+        Ok(table) => table,
+        Err(e) => {
+            eprintln!("soak: ps_observed fail at {}s: {e}", obs.at_secs);
+            return;
+        }
+    };
+    obs.ps_ok = true;
+    obs.rss_mib = table
+        .values()
+        .filter(|(_, comm)| comm.contains("humaux-"))
+        .map(|(kib, _)| kib / 1024)
+        .max();
+    let starts = chaos_starts.lock().map(|s| s.clone()).unwrap_or_default();
+    let now = Instant::now();
+    for (name, pidfile) in &cfg.watch_pidfiles {
+        let pid = std::fs::read_to_string(pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        obs.watched += 1;
+        match classify_presence(pid, &table, now, &starts, cfg.chaos_grace) {
+            Presence::Present => {}
+            Presence::ExpectedAbsent => obs.expected_absent += 1,
+            Presence::UnexpectedAbsent => {
+                eprintln!(
+                    "soak: {name} absent at {}s outside any chaos window",
+                    obs.at_secs
+                );
+                obs.unexpected_absent += 1;
+            }
+        }
+    }
 }
 
 fn run_shell(cmd: &str) -> bool {
+    // dep: sh — runs the operator-supplied chaos command.
     std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -1217,10 +1433,14 @@ fn run_shell(cmd: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-fn observe(cfg: &Config, db: &mut Client, at_secs: u64) -> Result<Observation, String> {
+fn observe(
+    cfg: &Config,
+    db: &mut Client,
+    at_secs: u64,
+    chaos_starts: &Mutex<Vec<Instant>>,
+) -> Result<Observation, String> {
     let mut obs = Observation {
         at_secs,
-        rss_mib: max_rss_mib(),
         db_connections: scalar(
             db,
             "SELECT count(*)::bigint FROM pg_stat_activity WHERE datname = current_database()",
@@ -1238,6 +1458,7 @@ fn observe(cfg: &Config, db: &mut Client, at_secs: u64) -> Result<Observation, S
             obs.probe_failures += 1;
         }
     }
+    observe_processes(cfg, chaos_starts, &mut obs);
     Ok(obs)
 }
 
@@ -1638,6 +1859,7 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
+    // dep: Postgres (role_maintenance, HUMAUX_MAINTENANCE_PG_DSN) — end-of-soak ledger reads.
     let mut db = match Client::connect(&dsn, NoTls) {
         Ok(c) => c,
         Err(e) => {
@@ -1652,7 +1874,12 @@ pub fn run(args: &[String]) -> i32 {
             return 3;
         }
     };
-    let assertions = evaluate(&series, cfg.max_rss_mib, cfg.max_db_connections);
+    let assertions = evaluate(
+        &series,
+        cfg.max_rss_mib,
+        cfg.max_db_connections,
+        cfg.max_op_failure_rate,
+    );
     let report = report_json(&series, &assertions, config_summary(&cfg));
     series.samples.clear();
     let rendered = serde_json::to_string_pretty(&report)
@@ -1696,6 +1923,9 @@ fn config_summary(cfg: &Config) -> serde_json::Value {
         "probe_cmds": cfg.probe_cmds.len(),
         "chaos_cmds": cfg.chaos_cmds.len(),
         "chaos_every_secs": cfg.chaos_every.map(|d| d.as_secs()),
+        "chaos_grace_secs": cfg.chaos_grace.map(|d| d.as_secs()),
+        "watch_pidfiles": cfg.watch_pidfiles.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        "max_op_failure_rate": cfg.max_op_failure_rate,
         "lease_secs": cfg.lease_secs,
         "max_rss_mib": cfg.max_rss_mib,
         "max_db_connections": cfg.max_db_connections,
@@ -1705,6 +1935,7 @@ fn config_summary(cfg: &Config) -> serde_json::Value {
 
 fn drive(cfg: &Config, db: &mut Client) -> Result<Series, String> {
     let shared = Mutex::new(Shared::default());
+    let chaos_starts: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
     let started = Instant::now();
     let load_deadline = started + cfg.duration;
     let mut series = Series::default();
@@ -1716,12 +1947,16 @@ fn drive(cfg: &Config, db: &mut Client) -> Result<Series, String> {
             }
         }
         if let Some(every) = cfg.chaos_every {
+            let chaos_starts = &chaos_starts;
             scope.spawn(move || {
                 let mut turn = 0usize;
                 while Instant::now() + every < load_deadline {
                     std::thread::sleep(every);
                     let cmd = &cfg.chaos_cmds[turn % cfg.chaos_cmds.len()];
                     turn += 1;
+                    if let Ok(mut starts) = chaos_starts.lock() {
+                        starts.push(Instant::now());
+                    }
                     println!("soak: chaos step {turn}: exit_ok={}", run_shell(cmd));
                 }
             });
@@ -1729,7 +1964,7 @@ fn drive(cfg: &Config, db: &mut Client) -> Result<Series, String> {
         // The monitor stays on this thread: it owns the only PostgreSQL client.
         while Instant::now() < load_deadline {
             std::thread::sleep(cfg.probe_every);
-            match observe(cfg, db, started.elapsed().as_secs()) {
+            match observe(cfg, db, started.elapsed().as_secs(), &chaos_starts) {
                 Ok(o) => series.observations.push(o),
                 Err(e) => eprintln!("soak: observation skipped: {e}"),
             }
@@ -1739,7 +1974,7 @@ fn drive(cfg: &Config, db: &mut Client) -> Result<Series, String> {
     let drain_end = Instant::now() + cfg.drain;
     while Instant::now() < drain_end {
         std::thread::sleep(cfg.probe_every.min(drain_end - Instant::now()));
-        match observe(cfg, db, started.elapsed().as_secs()) {
+        match observe(cfg, db, started.elapsed().as_secs(), &chaos_starts) {
             Ok(o) => series.observations.push(o),
             Err(e) => eprintln!("soak: drain observation skipped: {e}"),
         }
@@ -1765,6 +2000,7 @@ fn finish(
     // One Qdrant face and one runtime for every lane's §23.1② counts — see
     // [`promote_rejections`]. Built here (after the load has stopped) so nothing in the timed
     // window pays for it.
+    // dep: Qdrant (cfg.qdrant_host:port) — §23.1② visible-face counts after the load stops.
     let face = VisibleFace::connect(&cfg.qdrant_host, cfg.qdrant_port)?;
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("soak: runtime: {e}"))?;
     for (idx, lane) in cfg.tenants.iter().enumerate() {
@@ -1821,9 +2057,13 @@ mod tests {
             }],
             backlog: 0,
             db_connections: conns,
-            rss_mib: rss,
+            rss_mib: Some(rss),
             probe_failures: 0,
             probes_run: 2,
+            ps_ok: true,
+            watched: 3,
+            unexpected_absent: 0,
+            expected_absent: 0,
         }
     }
 
@@ -1873,7 +2113,7 @@ mod tests {
     }
 
     fn verdict(series: &Series, id: &str) -> bool {
-        evaluate(series, 4096, 64)
+        evaluate(series, 4096, 64, 0.0)
             .into_iter()
             .find(|a| a.id == id)
             .expect("assertion id must exist")
@@ -1883,7 +2123,7 @@ mod tests {
     #[test]
     fn a_healthy_run_passes_every_assertion() {
         let series = healthy();
-        let assertions = evaluate(&series, 4096, 64);
+        let assertions = evaluate(&series, 4096, 64, 0.0);
         assert!(
             assertions.iter().all(|a| a.pass),
             "unexpected failures: {:?}",
@@ -1930,7 +2170,7 @@ mod tests {
         assert!(verdict(&series, "watermark_no_stall"));
         assert!(!verdict(&series, "projection_promoted"));
 
-        let assertions = evaluate(&series, 4096, 64);
+        let assertions = evaluate(&series, 4096, 64, 0.0);
         let promoted = assertions
             .iter()
             .find(|a| a.id == "projection_promoted")
@@ -1955,7 +2195,7 @@ mod tests {
     #[test]
     fn promote_candidate_set_is_graded_over_the_rows_it_scanned() {
         let healthy = healthy();
-        let a = evaluate(&healthy, 4096, 64)
+        let a = evaluate(&healthy, 4096, 64, 0.0)
             .into_iter()
             .find(|a| a.id == "promote_candidates_admitted")
             .expect("assertion must exist");
@@ -1966,7 +2206,7 @@ mod tests {
         let mut refused = healthy.clone();
         refused.promote_candidates = 1;
         refused.promote_rejections = BTreeMap::from([("OpenGaps".into(), 1)]);
-        let a = evaluate(&refused, 4096, 64)
+        let a = evaluate(&refused, 4096, 64, 0.0)
             .into_iter()
             .find(|a| a.id == "promote_candidates_admitted")
             .expect("assertion must exist");
@@ -1975,7 +2215,7 @@ mod tests {
 
         let mut blind = healthy;
         blind.promote_checkpoints_scanned = 0;
-        let a = evaluate(&blind, 4096, 64)
+        let a = evaluate(&blind, 4096, 64, 0.0)
             .into_iter()
             .find(|a| a.id == "promote_candidates_admitted")
             .expect("assertion must exist");
@@ -2188,7 +2428,7 @@ mod tests {
         // Every lane's post-drain replay bailed out before the overlay range was computed.
         series.ryw_resettled = 0;
         series.ryw_stale = 0;
-        let assertions = evaluate(&series, 4096, 64);
+        let assertions = evaluate(&series, 4096, 64, 0.0);
         let a = assertions
             .iter()
             .find(|a| a.id == "ryw_settled_write_visible")
@@ -2267,7 +2507,11 @@ mod tests {
             ms: 9.0,
             ok: false,
         });
-        let report = report_json(&series, &evaluate(&series, 4096, 64), serde_json::json!({}));
+        let report = report_json(
+            &series,
+            &evaluate(&series, 4096, 64, 1.0),
+            serde_json::json!({}),
+        );
         let row = report["latency"]
             .as_array()
             .expect("latency")
@@ -2289,7 +2533,7 @@ mod tests {
     #[test]
     fn the_report_carries_n_and_unit_for_every_number_and_keeps_skips_out_of_lost() {
         let series = healthy();
-        let assertions = evaluate(&series, 4096, 64);
+        let assertions = evaluate(&series, 4096, 64, 0.0);
         let report = report_json(&series, &assertions, serde_json::json!({}));
         assert_eq!(report["verdict"], "PASS");
         for a in report["assertions"].as_array().expect("assertions array") {
@@ -2321,7 +2565,8 @@ mod tests {
             "--sessions-per-tenant", "2", "--duration-secs", "60", "--drain-secs", "10",
             "--think-ms", "100", "--probe-every-secs", "5", "--probe-cmd", "true",
             "--lease-secs", "120", "--max-rss-mib", "4096", "--max-db-connections", "64",
-            "--report", "/dev/null",
+            "--report", "/dev/null", "--watch-pidfile", "gateway=/tmp/soak-test-gw.pid",
+            "--max-op-failure-rate", "0.05",
         ]
         .iter()
         .map(|s| (*s).to_string())
@@ -2357,6 +2602,156 @@ mod tests {
             "chaos cmd without period must be refused",
         );
         assert!(err.contains("must be given together"), "{err}");
+
+        // ADR-0050 D-I: chaos without a grace window, a missing watch list and a missing
+        // failure-rate ceiling are each refused, never defaulted.
+        let mut no_grace = ok.clone();
+        no_grace.extend(["--chaos-cmd", "true", "--chaos-every-secs", "30"].map(String::from));
+        let err = err_of(
+            parse_config(&no_grace),
+            "chaos without grace must be refused",
+        );
+        assert!(err.contains("--chaos-grace-secs"), "{err}");
+        let mut graced = no_grace.clone();
+        graced.extend(["--chaos-grace-secs", "20"].map(String::from));
+        assert!(parse_config(&graced).is_ok(), "chaos + grace must parse");
+
+        let without = |flag: &str| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut skip = false;
+            for a in &ok {
+                if skip {
+                    skip = false;
+                } else if a == flag {
+                    skip = true;
+                } else {
+                    out.push(a.clone());
+                }
+            }
+            out
+        };
+        let err = err_of(
+            parse_config(&without("--watch-pidfile")),
+            "no watched process must be refused",
+        );
+        assert!(err.contains("--watch-pidfile"), "{err}");
+        let err = err_of(
+            parse_config(&without("--max-op-failure-rate")),
+            "no failure-rate ceiling must be refused",
+        );
+        assert!(err.contains("--max-op-failure-rate"), "{err}");
+    }
+
+    fn ps_table(rows: &[(u32, u64, &str)]) -> BTreeMap<u32, (u64, String)> {
+        rows.iter()
+            .map(|(pid, rss, comm)| (*pid, (*rss, (*comm).to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn soak_ps_failure_is_an_assertion_failure_not_rss_zero() {
+        assert!(parse_ps_table("  101 2048 humaux-gateway\n", false).is_err());
+        assert!(
+            parse_ps_table("", true).is_err(),
+            "empty table is a failure"
+        );
+        let table = parse_ps_table("  101 2048 humaux-gateway\n  7 10 /sbin/launchd\n", true)
+            .expect("a real table parses");
+        assert_eq!(table[&101], (2048, "humaux-gateway".to_string()));
+
+        let mut series = healthy();
+        for o in &mut series.observations {
+            o.ps_ok = false;
+            o.rss_mib = None;
+            o.watched = 0;
+        }
+        assert!(!verdict(&series, "ps_observed"));
+        let rss = evaluate(&series, 4096, 64, 0.0)
+            .into_iter()
+            .find(|a| a.id == "rss_bounded")
+            .expect("rss_bounded");
+        assert!(
+            !rss.pass && rss.n == 0,
+            "no reading is FAIL-VACUOUS, never 0 MiB = pass"
+        );
+    }
+
+    #[test]
+    fn soak_expected_chaos_absence_is_not_a_probe_failure() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(5);
+        let table = ps_table(&[(101, 2048, "humaux-gateway")]);
+        let grace = Some(Duration::from_secs(10));
+        assert_eq!(
+            classify_presence(Some(202), &table, now, &[start], grace),
+            Presence::ExpectedAbsent
+        );
+        assert_eq!(
+            classify_presence(Some(101), &table, now, &[start], grace),
+            Presence::Present
+        );
+        let mut series = healthy();
+        series.observations[0].expected_absent = 1;
+        assert!(verdict(&series, "probes_green"));
+    }
+
+    #[test]
+    fn soak_unexpected_absence_is_a_probe_failure() {
+        let start = Instant::now();
+        let table = ps_table(&[(101, 2048, "humaux-gateway")]);
+        // After the grace window, and with no chaos at all, an absence is unexpected.
+        let late = start + Duration::from_secs(30);
+        let grace = Some(Duration::from_secs(10));
+        assert_eq!(
+            classify_presence(Some(202), &table, late, &[start], grace),
+            Presence::UnexpectedAbsent
+        );
+        assert_eq!(
+            classify_presence(None, &table, late, &[], None),
+            Presence::UnexpectedAbsent
+        );
+        let mut series = healthy();
+        series.observations[1].unexpected_absent = 1;
+        assert!(!verdict(&series, "probes_green"));
+    }
+
+    #[test]
+    fn soak_reused_pid_with_foreign_comm_counts_as_absent() {
+        let table = ps_table(&[(101, 2048, "/usr/bin/some-other-daemon")]);
+        assert_eq!(
+            classify_presence(Some(101), &table, Instant::now(), &[], None),
+            Presence::UnexpectedAbsent
+        );
+    }
+
+    fn sample(op: &str, ok: bool) -> Sample {
+        Sample {
+            op: op.into(),
+            ms: 1.0,
+            ok,
+        }
+    }
+
+    #[test]
+    fn soak_op_failure_rate_scored_per_op_against_threshold() {
+        // 1/10 recalls failed, 0/10 writes: the worst op (recall) is what is scored, so a
+        // healthy op cannot dilute a failing one.
+        let mut samples: Vec<Sample> = (0..10).map(|_| sample("remember", true)).collect();
+        samples.extend((0..9).map(|_| sample("recall", true)));
+        samples.push(sample("recall", false));
+        let a = op_failure_rate(&samples, 0.05);
+        assert!(!a.pass, "{a:?}");
+        assert!((a.value - 0.1).abs() < 1e-9);
+        assert_eq!(a.n, 20);
+        assert!(a.detail.to_string().contains("\"op\":\"recall\""));
+        assert!(op_failure_rate(&samples, 0.1).pass);
+    }
+
+    #[test]
+    fn soak_op_failure_rate_with_zero_samples_is_vacuous_fail() {
+        let a = op_failure_rate(&[], 1.0);
+        assert!(!a.pass && a.n == 0);
+        assert_eq!(a.verdict(), "FAIL-VACUOUS");
     }
 
     #[test]
@@ -2445,11 +2840,14 @@ mod tests {
             think: Duration::from_millis(1),
             probe_every: Duration::from_secs(1),
             probe_cmds: vec!["true".into()],
+            watch_pidfiles: vec![("gateway".into(), PathBuf::from("/dev/null"))],
             chaos_every: None,
+            chaos_grace: None,
             chaos_cmds: vec![],
             lease_secs: 1,
             max_rss_mib: 1,
             max_db_connections: 1,
+            max_op_failure_rate: 0.0,
             report_path: "/dev/null".into(),
             qdrant_host: "127.0.0.1".into(),
             qdrant_port: 6333,

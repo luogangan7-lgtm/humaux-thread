@@ -27,6 +27,22 @@ edited — if it fires, the fix is a NEW migration, never an edit to the old one
 ships as a pair `NNNN_name.sql` + `NNNN_name.manifest.toml`; a missing manifest is a hard
 refusal, not a warning.
 
+Since card 25 (ADR-0050 D-D/D-F), migrate also enforces the following:
+
+- **The checks run.** Each *pending* migration runs in one transaction: manifest `precheck` →
+  the `.sql` → manifest `postcheck` → the `ops.schema_migrations` row → COMMIT. Each check must
+  return one row with one `bool` column whose value is `true`. The log prints one line per check
+  (`migrate: precheck <id> ok`). A false, non-boolean or invalid check refuses the migration with
+  the check's name and the server's text, and the transaction rolls back, leaving drift 0 (no
+  object and no record). Already-applied migrations are not re-checked.
+- **One migrator at a time.** Migrate holds the advisory lock `HXMIGRAT`
+  (`0x4858_4D49_4752_4154`) for the whole run and sets `lock_timeout = 30s`. A second migrate
+  waits up to 30 s and then refuses with `55P03`, having applied 0.
+- **Stop the workers before migrating.** The same 30 s `lock_timeout` bounds every migration's
+  DDL. A migration that queues behind a live worker's lock is refused, leaving drift 0, rather
+  than stalling traffic behind an `ACCESS EXCLUSIVE` request. Stop the workers, migrate, then
+  start them in §5 order.
+
 ## 2. Roles and grants
 
 `cargo xtask rls-check` must exit 0. It walks the §6.2.2 matrix row for row; a new table or a
