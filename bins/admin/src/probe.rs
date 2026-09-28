@@ -1,4 +1,11 @@
-//! `humaux-admin q <name>` —— §4.4 即时探针目录。
+//! `admin::probe` — `humaux-admin q <name>` —— §4.4 即时探针目录。
+//! Depends-on: crates=[serde_json, sha2, time]; services=[PostgreSQL(role_admin) r=[ops.jobs, ops.outbox,
+//!   private.artifacts, projection.stream_checkpoints, public.claims, public.consensus_ready,
+//!   public.corroborated]]; env=[CARGO_PKG_NAME, CARGO_PKG_VERSION,
+//!   HUMAUX_BUILD_GIT_SHA, HUMAUX_BUILD_TIME]; modules=[admin::cell_resources]
+//! Called-by: [admin::cell_resources, admin::main]
+//! Invariants: [the probe is read-only against every table it names; it never writes ops.jobs/ops.outbox/private.artifacts itself]
+//! Spec: Baseline §4.4; §1.14; ADR-0037
 //!
 //! 统一输出契约（§4.4）：`{value, scanned_n, scope_hash, checked_at, probe_version}`。
 //!

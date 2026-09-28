@@ -1,4 +1,13 @@
-//! memory_security_lifecycle eval harness (§45.2 Private Memory Poisoning，ADR-0007 分段声明)。
+//! `adapters::tests::memory_security_lifecycle_eval` — memory_security_lifecycle eval harness (§45.2 Private Memory
+//!   Poisoning，ADR-0007 分段声明)。
+//! Depends-on: crates=[humaux-domain, humaux-testkit, postgres, serde_json, sha2, uuid]; services=[PostgreSQL(any)
+//!   w=[control.private_reasoning_domains, control.tenants, private.events, private.evidence_objects,
+//!   private.memory_evidence, private.memory_records]]; env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN];
+//!   modules=[domain::authority, domain::evidence, domain::ids, domain::memory, domain::policy, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [Write/Recall/Repair stages are measured against the SUT; the Action stage stays BLOCKED_ON_SUT and is
+//!   not filled here; an origin ceiling is never laundered by content; a missing DB goes through skip_or_fail]
+//! Spec: Baseline §45.2; ADR-0007; §55.3.2; §79.2
 //!
 //! 按 ADR-0007 §55.3.2 分段：Write / Recall / Repair 三段现在有 SUT 可测，各自实测七字段；
 //! Action 段（Context Renderer 分流 + privileged action probe）SUT 由 DOD-036 排 phase=14，
@@ -178,6 +187,7 @@ fn run_write_case(admin: &mut Client, tenant_id: Uuid, rd: Uuid, c: &Case) -> Ca
             )
             .ok()?
             .get(0);
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "INSERT INTO private.events (event_id, event_kind, payload) \
              VALUES ($1, 'USER_MESSAGE', '{}'::jsonb)",
@@ -195,6 +205,7 @@ fn run_write_case(admin: &mut Client, tenant_id: Uuid, rd: Uuid, c: &Case) -> Ca
             )
             .ok()?
             .get(0);
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, grounding_mode) \
              VALUES ($1, $2, 'PRIMARY', 'SNAPSHOT')",
@@ -299,6 +310,7 @@ fn setup() -> Option<Fixture> {
         skip_or_fail(NAME, "missing object: Postgres DSN", ExternalDep::Postgres);
         return None;
     };
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;
@@ -465,6 +477,7 @@ fn seed_active_memory(admin: &mut Client, tenant_id: Uuid, rd: Uuid, c: &Case) -
         )
         .expect("insert evidence")
         .get(0);
+    // dep: PostgreSQL(any) — pool/txn query execution
     txn.execute(
         "INSERT INTO private.events (event_id, event_kind, payload) \
          VALUES ($1, 'USER_MESSAGE', '{}'::jsonb)",
@@ -482,6 +495,7 @@ fn seed_active_memory(admin: &mut Client, tenant_id: Uuid, rd: Uuid, c: &Case) -
         )
         .expect("insert memory")
         .get(0);
+    // dep: PostgreSQL(any) — pool/txn query execution
     txn.execute(
         "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, grounding_mode) \
          VALUES ($1, $2, 'PRIMARY', 'SNAPSHOT')",

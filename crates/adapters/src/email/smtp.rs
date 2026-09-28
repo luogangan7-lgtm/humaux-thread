@@ -1,6 +1,13 @@
-//! `email::smtp` — the SMTP reference adapter for [`super::EmailProvider`] (§74.6:
-//! "Reference adapters: SMTP / SES / Postmark / Resend 等, 不写死供应商" — this is the SMTP
-//! one; SES/Postmark/Resend are HTTP-API adapters and out of this task's scope). Built on
+//! `adapters::email::smtp` — the SMTP reference adapter for [`super::EmailProvider`] (§74.6: "Reference adapters:
+//!   SMTP / SES / Postmark / Resend 等, 不写死供应商" — this is the SMTP one; SES/Postmark/Resend are HTTP-API adapters and
+//!   out of this task's scope).
+//! Depends-on: crates=[async-trait, lettre]; services=[]; env=[]; modules=[adapters::email]
+//! Called-by: []
+//! Invariants: [configuration comes only from the SmtpConfig parameter, never from env; an SMTP refusal is
+//!   EmailError::Rejected and a transport failure is surfaced, never retried silently here]
+//! Spec: none
+//!
+//! Built on
 //! `lettre`'s async tokio transport so `send` is one non-blocking network round trip.
 //!
 //! [`SmtpConfig`] is a plain struct filled in by the caller — this module never reads an

@@ -1,4 +1,19 @@
-//! Phase 9 real PostgreSQL acceptance for public trust decisions and typed serving hydration.
+//! `adapters::tests::public_trust` — Phase 9 real PostgreSQL acceptance for public trust decisions and typed serving
+//!   hydration.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, postgres, uuid]; services=[PostgreSQL(any)
+//!   r=[control.anonymous_source_lineage, ops.outbox, ops.public_release_revocations, public.eligible_objects,
+//!   public.poisoning_signals, public.public_receipt_matches] w=[control.memberships,
+//!   control.public_moderator_grants, public.claim_trust_evaluation_sources, public.claim_trust_evaluations,
+//!   public.claims, public.provenance_edges, public.source_closure, public.sources] x=[public.current_public_roots,
+//!   public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal],
+//!   PostgreSQL(role_gateway), PostgreSQL(role_migration_owner), PostgreSQL(role_public_worker),
+//!   PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_repo,
+//!   adapters::postgres, adapters::public_repo, adapters::tests::support::contribution_fixture, domain::authority,
+//!   domain::error, domain::public]
+//! Called-by: [cargo-test]
+//! Invariants: [only an active global moderator persists a complete immutable supported receipt; wrong identity
+//!   fields, quarantined claims and stale requests are rejected with no trace; the PG tests are #[ignore] lane tests]
+//! Spec: Baseline §12.6; §79.2
 
 #[path = "support/contribution_fixture.rs"]
 mod contribution_fixture;
@@ -32,6 +47,7 @@ fn dsn_as_role(dsn: &str, role: &str) -> String {
 fn public_pool(fixture: &ContributionFixture) -> PublicWorkerDbPool {
     fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -78,6 +94,7 @@ fn admit(
         .admin
         .transaction()
         .expect("legacy enclave transaction");
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `admit`
     tx.batch_execute("SET LOCAL ROLE role_migration_owner")
         .expect("legacy enclave owner");
     let source_id: Uuid = tx
@@ -99,11 +116,13 @@ fn admit(
         )
         .expect("legacy compatibility claim")
         .get(0);
+    // dep: PostgreSQL(any) — pool/txn query execution
     tx.execute(
         "INSERT INTO public.provenance_edges(claim_id,source_id) VALUES($1,$2)",
         &[&claim_id, &source_id],
     )
     .expect("legacy direct provenance");
+    // dep: PostgreSQL(any) — pool/txn query execution
     tx.execute(
         "INSERT INTO public.source_closure(claim_id,root_source_id,depth,is_current) \
          VALUES($1,$2,1,true)",
@@ -402,16 +421,19 @@ fn strict_gateway_and_retrieval_hydration_reject_each_wrong_identity_field() {
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG");
     let gateway = fixture
         .rt
+        // dep: PostgreSQL(role_gateway) — open a role-scoped PG connection/pool for this test
         .block_on(RuntimeDbPool::connect(&dsn_as_role(&dsn, "role_gateway")))
         .unwrap();
     let retrieval = fixture
         .rt
+        // dep: PostgreSQL(role_retrieval_worker) — open a role-scoped PG connection/pool for this test
         .block_on(RetrievalWorkerDbPool::connect(&dsn_as_role(
             &dsn,
             "role_retrieval_worker",
         )))
         .unwrap();
     let mut public_runtime =
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         Client::connect(&dsn_as_role(&dsn, "role_public_worker"), NoTls).unwrap();
     assert!(
         public_runtime
@@ -520,6 +542,7 @@ fn quarantine_is_durable_but_not_retrievable_and_revoked_or_disabled_moderator_c
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").unwrap();
     let gateway = fixture
         .rt
+        // dep: PostgreSQL(role_gateway) — open a role-scoped PG connection/pool for this test
         .block_on(RuntimeDbPool::connect(&dsn_as_role(&dsn, "role_gateway")))
         .unwrap();
     assert!(
@@ -551,6 +574,7 @@ fn sealed_receipts_reject_runtime_rewrite_or_root_append_and_stale_requests_leav
     .unwrap();
     let sealed = counts(&mut fixture, admitted.claim_id);
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").unwrap();
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut runtime = Client::connect(&dsn_as_role(&dsn, "role_public_worker"), NoTls).unwrap();
     assert_runtime_receipt_acl(&mut fixture, &mut runtime, &admitted, &supported);
     assert_runtime_receipt_relations(&dsn, &admitted);
@@ -648,6 +672,7 @@ fn assert_runtime_receipt_acl(
     assert!(predicate.get::<_, bool>(0));
     assert!(predicate.get::<_, bool>(1));
     let mut owner_context = fixture.admin.transaction().unwrap();
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `assert_runtime_receipt_acl`
     owner_context
         .batch_execute("SET LOCAL ROLE role_migration_owner")
         .unwrap();
@@ -673,6 +698,7 @@ fn assert_runtime_receipt_relations(dsn: &str, admitted: &public_repo::AdmittedR
         "role_public_worker",
         "role_retrieval_worker",
     ] {
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut denied = Client::connect(&dsn_as_role(dsn, role), NoTls).unwrap();
         for relation in [
             "public.claim_trust_evaluations",

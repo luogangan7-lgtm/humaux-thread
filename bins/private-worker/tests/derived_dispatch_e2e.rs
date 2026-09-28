@@ -1,5 +1,27 @@
-//! ADR-0036 (card 14) acceptance, distill side: cross-tenant pending-work discovery for
-//! `humaux-private-worker --distill-once` / `--distill-serve`.
+//! `private-worker::tests::derived_dispatch_e2e` — ADR-0036 (card 14) acceptance, distill side: cross-tenant
+//!   pending-work discovery for `humaux-private-worker --distill-once` / `--distill-serve`.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, tokio,
+//!   uuid]; services=[PostgreSQL(role_private_worker) r=[ops.claim_derived_work, ops.commit_seq_seq,
+//!   private.memory_records] w=[control.credentials, control.memberships, control.private_reasoning_domains,
+//!   control.processor_models, control.provider_accounts, control.provider_endpoints,
+//!   control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings,
+//!   control.reasoning_route_candidates, control.reasoning_route_policies, control.tenants, control.users, ops.jobs,
+//!   ops.outbox, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations,
+//!   private.events, private.evidence_objects, private.memory_evidence] x=[ops.claim_derived_work],
+//!   subprocess(humaux-private-worker), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-private-worker,
+//!   HUMAUX_CARD15_TEST_SECRET, HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID,
+//!   HUMAUX_PRIVATE_WORKER_DISTILL_BATCH, HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH,
+//!   HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS,
+//!   HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS, HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID,
+//!   HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_KEY_ENV, HUMAUX_PRIVATE_WORKER_MODEL_ID,
+//!   HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_PROVIDER_ID, HUMAUX_PRIVATE_WORKER_REGION,
+//!   HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, HUMAUX_TEST_PG_DSN, PRIVATE_WORKER_PG_DSN]; modules=[adapters::byok,
+//!   adapters::contribution_reasoner, adapters::disclosure, adapters::jobs, adapters::postgres, domain::egress,
+//!   humaux-testkit, private-worker::distill]
+//! Called-by: [cargo-test]
+//! Invariants: [a tenant-less pass discovers work in both tenants, each DERIVED_DISTILL job is claimed once, a dead
+//!   worker's stale fencing token settles nothing, and ops.jobs stays tenant-isolated from worker sessions]
+//! Spec: Baseline §16.1.1; §10.1; §79.2
 //!
 //! The Distill hop's own behaviour (route admission, §16.1.1 fingerprint, §10.1 ceiling, the
 //! lease-fenced write transaction) is `tests/distill_hop_e2e.rs`' subject and is NOT re-proved
@@ -301,6 +323,7 @@ impl DbIntegrationFixture for DispatchFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(role_private_worker) — role-scoped pool call
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -370,6 +393,7 @@ impl DbIntegrationFixture for DispatchFixture {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let private = rt
+            // dep: PostgreSQL(role_private_worker) — role-scoped pool call
             .block_on(PrivateWorkerDbPool::connect(&dsn_as_role(
                 &dsn,
                 "role_private_worker",
@@ -1217,6 +1241,7 @@ fn worker_session_still_sees_only_its_own_tenants_jobs() {
             let (a, b) = (handle.tenants[0].tenant_id, handle.tenants[1].tenant_id);
 
             let mut worker =
+                // dep: PostgreSQL(role_private_worker) — role-scoped pool call
                 Client::connect(&dsn_as_role(&handle.dsn, "role_private_worker"), NoTls)
                     .expect("connect as role_private_worker");
             let mut txn = worker.transaction().expect("begin");
@@ -1285,6 +1310,7 @@ fn dispatch_pass_with_no_pending_work_claims_nothing() {
 /// macOS XProtect assesses a freshly linked binary on its first exec (~1 min, sometimes much
 /// longer under load); pay it once, on a run that measures nothing.
 fn warm_binary() {
+    // dep: subprocess(humaux-private-worker) — spawns the private-worker binary under test
     let _ = std::process::Command::new(env!("CARGO_BIN_EXE_humaux-private-worker"))
         .arg("--warm-up-not-a-mode")
         .output();
@@ -1300,6 +1326,7 @@ fn warm_binary() {
 /// (the same path `a_pass_that_distilled_nothing_releases_the_job_instead_of_completing_it`
 /// proves in process with a provider that panics if called).
 fn distill_serve_command(dsn: &str) -> std::process::Command {
+    // dep: subprocess(humaux-private-worker) — spawns the private-worker binary under test
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_humaux-private-worker"));
     cmd.env("PRIVATE_WORKER_PG_DSN", dsn)
         .env(
@@ -1402,6 +1429,7 @@ fn distill_serve_drains_on(signal: &str, test_name: &'static str) {
             panic!("the distill loop never ran a pass — this test would assert nothing");
         }
 
+        // dep: subprocess(kill) — spawns external process
         let signalled = std::process::Command::new("kill")
             .arg(format!("-{signal}"))
             .arg(child.id().to_string())
@@ -1498,6 +1526,7 @@ fn sigterm_to_the_inference_rpc_listener_exits_zero() {
                 std::thread::sleep(Duration::from_millis(100));
             }
 
+            // dep: subprocess(kill) — spawns external process
             let signalled = std::process::Command::new("kill")
                 .arg("-TERM")
                 .arg(child.id().to_string())

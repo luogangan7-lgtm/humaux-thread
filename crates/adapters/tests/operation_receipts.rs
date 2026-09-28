@@ -1,4 +1,15 @@
-//! §34.0.1 actual PostgreSQL acceptance for atomic `remember.put` operation receipts.
+//! `adapters::tests::operation_receipts` — §34.0.1 actual PostgreSQL acceptance for atomic `remember.put` operation
+//!   receipts.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, sqlx, time, tokio];
+//!   services=[PostgreSQL(role_gateway) r=[control.audit_events, control.operation_receipts, control.quota_windows,
+//!   control.usage_reservations] w=[ops.outbox, private.events, private.evidence_objects, projection.stream_log]];
+//!   env=[]; modules=[adapters::operation_receipt, adapters::postgres, adapters::quota_repo, adapters::remember,
+//!   adapters::tests::support::operation_receipt_fixture, domain::audit, domain::error, domain::evidence,
+//!   domain::identity, domain::ids, domain::subject, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [every runtime write uses a real role_gateway login; the owner connection only seeds and removes this
+//!   fixture's tenant rows; the request_guard witnesses are #[ignore] lane tests run by xtask serial-lane]
+//! Spec: ADR-0047; ADR-0050
 //!
 //! Every runtime write uses an actual `role_gateway` login. The owner connection exists only
 //! to seed and remove this fixture's unique tenant rows; it never masquerades as the gateway.
@@ -305,7 +316,8 @@ fn assert_receipt_lock_deadline_rollback(
         let actor = std::thread::spawn(move || {
             let outcome = (|| -> Result<_, String> {
                 let rt = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-                // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+                // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+                // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `assert_receipt_lock_deadline_rollback`
                 let pool = rt
                     .block_on(RuntimeDbPool::connect(&actor_dsn))
                     .map_err(|error| error.to_string())?;
@@ -786,7 +798,8 @@ fn concurrent_same_key_never_commits_two_business_or_bmo_rows() {
                     let outcome = (|| -> Result<_, String> {
                         let rt =
                             tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-                        // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+                        // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+                        // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `concurrent_same_key_never_commits_two_business_or_bmo_rows`
                         let pool = rt
                             .block_on(RuntimeDbPool::connect(&dsn))
                             .map_err(|error| error.to_string())?;

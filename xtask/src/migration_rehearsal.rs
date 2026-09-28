@@ -1,3 +1,9 @@
+//! `xtask::migration_rehearsal` — G46-1 / G80-37 migration rehearsal contract: static manifest checks.
+//! Depends-on: crates=[humaux-testkit, postgres, toml]; services=[PostgreSQL(owner)]; env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN]; modules=[]
+//! Called-by: [tests, xtask::main, xtask::migrate]
+//! Invariants: [missing manifest, orphan manifest, or an illegal required field ⇒ fail, each error names its file (§57.1 rule 2)]
+//! Spec: Baseline §46.1
+//!
 //! xtask `migration-rehearsal` — G46-1 / G80-37 (§46.1 Migration Rehearsal Contract).
 //!
 //! Static side (this module, always runs): enumerate `migrations/*.sql`, assert each
@@ -135,6 +141,15 @@ pub fn parse_manifest(file: &str, contents: &str) -> Result<Manifest, CheckError
         fields.insert(*key, v.to_string());
     }
 
+    for key in ["precheck", "postcheck"] {
+        if let Some(at) = statement_separator(&fields[key]) {
+            return Err(err(format!(
+                "`{key}` has a `;` statement separator at byte {at}: a check is exactly one \
+                 SQL statement (ADR-0051 D-L)"
+            )));
+        }
+    }
+
     let class_raw = table
         .get("class")
         .and_then(|v| v.as_str())
@@ -157,6 +172,75 @@ pub fn parse_manifest(file: &str, contents: &str) -> Result<Manifest, CheckError
             .remove("backup_restore_requirement")
             .expect("checked above"),
     })
+}
+
+/// Byte offset of the first `;` in `sql` that is outside `--` / nested `/* */` comments,
+/// `'…'` literals (`''` escape), `"…"` identifiers and `$tag$…$tag$` bodies — i.e. a real
+/// statement separator. Checks are single statements by contract; a second statement would
+/// otherwise ride along with `EXPLAIN` over the simple-query protocol.
+fn statement_separator(sql: &str) -> Option<usize> {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b';' => return Some(i),
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut depth = 0usize;
+                while i < b.len() {
+                    if b[i..].starts_with(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if b.get(i + 1) == Some(&q) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'$' => {
+                let end = b[i + 1..]
+                    .iter()
+                    .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+                    .map(|n| i + 1 + n)
+                    .filter(|e| b[*e] == b'$');
+                if let Some(end) = end {
+                    let tag = &b[i..=end];
+                    let body = end + 1;
+                    i = b[body..]
+                        .windows(tag.len())
+                        .position(|w| w == tag)
+                        .map_or(b.len(), |n| body + n + tag.len());
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Static side of G46-1 / G80-37: enumerate `migrations_dir/*.sql`, assert each has
@@ -284,7 +368,7 @@ pub fn run(_args: &[String]) -> i32 {
             );
             0
         }
-        // dep: Postgres — read-only EXPLAIN/prepare of every manifest check (ADR-0050 D-E).
+        // dep: PostgreSQL(any) — read-only EXPLAIN/prepare of every manifest check (ADR-0050 D-E).
         Some(dsn) => match Client::connect(dsn, NoTls) {
             Err(e) => {
                 eprintln!(
@@ -325,6 +409,7 @@ pub fn run(_args: &[String]) -> i32 {
 /// line is `<migration_id>.manifest.toml <field>: <message>`; `Err` only for a transaction
 /// that cannot be opened at all.
 fn check_sql(client: &mut Client, manifests: &[Manifest]) -> Result<(usize, Vec<String>), String> {
+    // dep: PostgreSQL(owner) — READ ONLY transaction, rolled back at the end.
     let mut tx = client
         .build_transaction()
         .read_only(true)
@@ -341,7 +426,9 @@ fn check_sql(client: &mut Client, manifests: &[Manifest]) -> Result<(usize, Vec<
                     e.as_db_error()
                         .map_or_else(|| e.to_string(), |db| db.message().to_string())
                 };
-                sp.batch_execute(&format!("EXPLAIN {sql}")).map_err(text)?;
+                // Extended protocol: the server rejects a second command outright instead of
+                // executing it after the EXPLAIN (ADR-0051 D-L; parse_manifest refuses `;` early).
+                sp.query(&format!("EXPLAIN {sql}"), &[]).map_err(text)?;
                 let stmt = sp.prepare(sql).map_err(text)?;
                 match stmt.columns() {
                     [col] if *col.type_() == Type::BOOL => Ok(()),
@@ -543,6 +630,86 @@ backup_restore_requirement = "restore point before apply"
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn manifest_with_precheck(precheck: &str) -> String {
+        format!(
+            "migration_id = \"0001_x\"\nclass = \"REVERSIBLE\"\nprecheck = '''{precheck}'''\n\
+             postcheck = \"select true\"\nrollback_or_forward_fix = \"n/a\"\n\
+             backup_restore_requirement = \"n/a\"\n"
+        )
+    }
+
+    #[test]
+    fn manifest_check_with_semicolon_outside_comments_is_refused() {
+        let e = parse_manifest(
+            "0001_x.manifest.toml",
+            &manifest_with_precheck("select true; drop table x"),
+        )
+        .expect_err("two statements must be refused");
+        assert!(
+            e.reason.contains("`precheck`") && e.reason.contains(';'),
+            "{e}"
+        );
+        assert_eq!(statement_separator("select 1;"), Some(8));
+    }
+
+    #[test]
+    fn manifest_check_semicolon_inside_comment_or_literal_is_allowed() {
+        for sql in [
+            "select 1 -- a; b\n",
+            "select 1 /* a; /* nested; */ b; */",
+            "select 'it''s; fine' = 'x'",
+            "select \"a;b\" from t",
+            "select $f$ a; b $f$ = $$c;$$",
+        ] {
+            assert_eq!(statement_separator(sql), None, "{sql}");
+            parse_manifest("0001_x.manifest.toml", &manifest_with_precheck(sql)).expect(sql);
+        }
+        // The real manifests whose `;` sits in `--` comments (0155 0161 0164 0165 0167 0170,
+        // seven checks) still parse.
+        let real = Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations");
+        let (manifests, errors) = check_static(&real);
+        assert!(errors.is_empty(), "{errors:?}");
+        let with_semicolon = manifests
+            .iter()
+            .flat_map(|m| [&m.precheck, &m.postcheck])
+            .filter(|sql| sql.contains(';'))
+            .count();
+        assert_eq!(with_semicolon, 7);
+    }
+
+    /// The EXPLAIN runs over the extended protocol: a two-statement check errors instead of
+    /// executing its second statement.
+    #[test]
+    fn explain_uses_extended_protocol_multi_statement_rejected() {
+        const TEST: &str = "explain_uses_extended_protocol_multi_statement_rejected";
+        let Some(dsn) = database_dsn() else {
+            humaux_testkit::skip_or_fail(
+                TEST,
+                "missing object: HUMAUX_TEST_PG_DSN",
+                humaux_testkit::ExternalDep::Postgres,
+            );
+            return;
+        };
+        // dep: PostgreSQL(owner) — read-only EXPLAIN of a two-statement check.
+        let mut client = Client::connect(&dsn, NoTls).expect("connect (DSN is set)");
+        let m = Manifest {
+            migration_id: "0001_two".to_string(),
+            class: MigrationClass::ForwardOnly,
+            precheck: "select true; select 1/0 = 1".to_string(),
+            postcheck: "select true".to_string(),
+            rollback_or_forward_fix: String::new(),
+            backup_restore_requirement: String::new(),
+        };
+        let (checked, invalid) = check_sql(&mut client, &[m]).expect("read-only txn");
+        assert_eq!(checked, 2);
+        assert_eq!(invalid.len(), 1, "{invalid:?}");
+        assert!(
+            invalid[0].starts_with("0001_two.manifest.toml precheck:")
+                && !invalid[0].contains("division by zero"),
+            "second statement must not execute: {invalid:?}"
+        );
+    }
+
     /// ADR-0050 D-E: a valid check passes; an invalid-SQL check and a non-boolean check are
     /// each listed by manifest and field. Read-only against `HUMAUX_TEST_PG_DSN`.
     #[test]
@@ -556,7 +723,7 @@ backup_restore_requirement = "restore point before apply"
             );
             return;
         };
-        // dep: Postgres (HUMAUX_TEST_PG_DSN) — read-only EXPLAIN of scratch manifest checks.
+        // dep: PostgreSQL(any) — HUMAUX_TEST_PG_DSN — read-only EXPLAIN of scratch manifest checks.
         let mut client = Client::connect(&dsn, NoTls).expect("connect (DSN is set)");
         let manifest = |id: &str, pre: &str, post: &str| Manifest {
             migration_id: id.to_string(),

@@ -1,4 +1,9 @@
-//! Typed role_gateway bindings for migration 0136's two Project Continuity commands.
+//! `adapters::continuity_repo` — Typed role_gateway bindings for migration 0136's two Project Continuity commands.
+//! Depends-on: crates=[humaux-domain, serde_json, sqlx, uuid]; services=[PostgreSQL(any) x=[private.publish_continuity_facet, private.register_continuity_project]]; env=[]; modules=[adapters::postgres, domain::continuity, domain::error, domain::identity, domain::ids]
+//! Called-by: []
+//! Invariants: [registration and facet publication go only through the two SECURITY DEFINER functions; their
+//!   SQLSTATEs map to Conflict/Forbidden/InvalidInput, never a silent retry]
+//! Spec: none
 
 use crate::postgres::RuntimeDbPool;
 use humaux_domain::{
@@ -87,6 +92,7 @@ pub async fn register_project(
     command: &RegisterContinuityProject<'_>,
 ) -> Result<ProjectId, ErrorCode> {
     let narrowed = authorization.narrow(command.workspace_id)?;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut tx = pool.pool().begin().await.map_err(map_db_error)?;
     install_context(&mut tx, &narrowed, command.workspace_id).await?;
     let user = narrowed.user_id().map(|id| id.0);
@@ -112,6 +118,7 @@ pub async fn publish_facet(
     command: &PublishContinuityFacet<'_>,
 ) -> Result<ContinuityPublishResult, ErrorCode> {
     let narrowed = authorization.narrow(command.workspace_id)?;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut tx = pool.pool().begin().await.map_err(map_db_error)?;
     install_context(&mut tx, &narrowed, command.workspace_id).await?;
     let user = narrowed.user_id().map(|id| id.0);

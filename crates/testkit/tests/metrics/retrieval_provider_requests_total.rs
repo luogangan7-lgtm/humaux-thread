@@ -1,6 +1,13 @@
 // witness: family=retrieval_provider_requests_total labels=provider,purpose,region,result
-//! Metric Witness for `retrieval_provider_requests_total{provider,purpose,region,result}`
-//! (§80.2 W-side; registry row §41.2; §19 Provider Plane Observability).
+//! `testkit::tests::metrics::retrieval_provider_requests_total` — Metric Witness for
+//!   `retrieval_provider_requests_total{provider,purpose,region,result}` (§80.2 W-side; registry row §41.2; §19
+//!   Provider Plane Observability).
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[retrieval-provider::admission, retrieval-provider::health,
+//!   retrieval-provider::metrics]
+//! Called-by: []
+//! Invariants: [triggers the real record_provider_call and asserts a counter delta per
+//!   {provider,purpose,region,result}, including the circuit_open value a completed call never produces]
+//! Spec: Baseline §19
 //!
 //! Actively triggers the family's real production emit point,
 //! `retrieval_provider::metrics::record_provider_call` — the sole `.inc(`/`.observe(` call

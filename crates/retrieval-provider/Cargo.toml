@@ -1,6 +1,7 @@
 [package]
 name = "humaux-retrieval-provider"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -24,55 +25,72 @@ workspace = true
 # all, and `metrics.rs`'s `purpose_label` reuses `PrivateDataPurpose` rather than a parallel
 # enum. One entry, not two/three — merged after concurrent-edit conflicts across this task's
 # parallel T7.x agents (admission.rs / T7.1 / failover-health-metrics-gate).
+# why: domain error/id/egress types shared by every module in this crate; used-by: [retrieval-provider::adapters, retrieval-provider::admission, retrieval-provider::contract, retrieval-provider::failover, retrieval-provider::router]
 humaux-domain = { path = "../domain" }
 # Concrete pinned local scanner owns sealed egress construction.
+# why: sealed egress query/card construction the DashScope adapter and contract types require; used-by: [retrieval-provider::adapters, retrieval-provider::contract]
 humaux-local-secret-scan = { path = "../local-secret-scan" }
 # T7.1 (§19 Architecture Gate "Every external retrieval call passes EgressPolicy"): the real
 # DashScope adapter's sole HTTP transport — Layer 1A `ExternalCall`/`HttpExternalCall`. This
 # crate does not depend on `humaux-infra-network`/`reqwest` directly (no raw-client
 # construction site here at all, ADR-0003 §83.4).
+# why: sole HTTP transport for the real DashScope adapter; used-by: [retrieval-provider::adapters]
 humaux-infra-egress = { path = "../infra-egress" }
 # §7.4/hard-rule⑤: every real external retrieval call must reserve+finalize an
 # `ops.data_disclosures` row (`disclosure::reserve_retrieval`/`finalize_retrieval`) via
 # `RetrievalWorkerDbPool` — both live in `humaux-adapters` (normal adapters-depend-on-adapters
 # direction already established elsewhere in this workspace's dependency graph; nothing in
 # `humaux-adapters` depends back on this crate).
+# why: RetrievalWorkerDbPool + disclosure reserve/finalize repo calls; used-by: [retrieval-provider::adapters, retrieval-provider::contract]
 humaux-adapters = { path = "../adapters" }
 # `EmbeddingProvider`/`RerankProvider` are `#[async_trait]` so a caller can hold
 # `Arc<dyn EmbeddingProvider>` — same macro already used by `humaux-domain::egress::ExternalCall`.
+# why: object-safe async provider traits (EmbeddingProvider/RerankProvider); used-by: [retrieval-provider::adapters, retrieval-provider::contract]
 async-trait = "0.1"
 # DashScope embeddings request/response JSON bodies (adapters.rs).
+# why: DashScope request/response body (de)serialization; used-by: [retrieval-provider::adapters]
 serde = { version = "1", features = ["derive"] }
+# why: DashScope request/response JSON bodies; used-by: [retrieval-provider::adapters]
 serde_json = "1"
 # T7.2 router.rs: `RouteCandidate::route_id`/`ResolvedRoute::route_id` hold an already-parsed
 # `control.retrieval_provider_routes.route_id` value (adapters-crate reads it, this module
 # never issues SQL — router.rs module doc). No `v4`/`v7` feature: production code here never
 # mints a new `Uuid`, only stores/compares/returns ones handed in. Same version pin already
 # used by this crate's own `[dev-dependencies]` uuid entry below (one resolved copy).
+# why: route_id/ProcessorId value type threaded through adapters/contract/failover/router; used-by: [retrieval-provider::adapters, retrieval-provider::contract, retrieval-provider::failover, retrieval-provider::router]
 uuid = "1.25.0"
 # §19 Rerank Failover: `failover.rs`'s loud calibration stand-down (`tracing::warn!`) —
 # already a workspace dependency (`humaux-telemetry`, `humaux-infra-egress`).
+# why: loud calibration stand-down warnings in the rerank failover path; used-by: [retrieval-provider::failover]
 tracing = "0.1.44"
 
 [dev-dependencies]
+# why: fixture card type shared by contract_tests's test double; used-by: [tests]
 humaux-projection = { path = "../projection" }
+# why: SealedRetrievalQuery request construction reused by adapters/contract_tests/dashscope_live_smoke; used-by: [retrieval-provider::adapters, tests]
 humaux-retrieval = { path = "../retrieval" }
 # Contract Tests (§19) drive the `#[async_trait]` methods from plain `#[test]` fns.
+# why: async executor to drive #[async_trait] provider methods from #[test] fns; used-by: [retrieval-provider::adapters, tests]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # `dashscope_live_smoke`'s state-1 (key-present) gate reads `DASHSCOPE_API_KEY` through the
 # same `config_registry::read_env_var` the production `EnvCredentialSource` uses (filters an
 # empty value), instead of a second, looser `std::env::var(..).is_ok()` predicate that could
 # drift from it (§79.2).
+# why: config_registry::read_env_var for the DASHSCOPE_API_KEY key-present gate; used-by: [tests]
 humaux-contracts = { path = "../contracts" }
 # T4.1's own trybuild pattern (`crates/domain/tests/egress_topology_ui.rs`) reused here for the
 # `SealedRetrievalQuery`/`SealedRetrievalCard` type-narrowing compile-fail proof (§1.2.3/§41.4).
+# why: compile-fail UI harness for sealed_type_gate_ui.rs; used-by: [tests]
 trybuild = "1"
 # `v4`: T7.1 fixtures. `v7`: failover.rs/health.rs tests mint `ProcessorId(Uuid::now_v7())`
 # fixtures directly, matching `infra-egress`'s own test convention.
+# why: v4/v7 uuid fixture minting in tests; used-by: [tests]
 uuid = { version = "1.25.0", features = ["v4", "v7"] }
 # `dashscope_live_smoke`'s three-state DB half (§79.2 `run_db_fixture`), same shape
 # `crates/adapters/tests/disclosure_ledger.rs` already uses: throwaway `control.tenants` +
 # `private.evidence_objects` rows seeded via the blocking `postgres` client, real disclosure
 # write via `RetrievalWorkerDbPool` (role-scoped DSN, `SET ROLE` trick — that module's own doc).
+# why: blocking Client for throwaway tenant/evidence fixture rows and RLS assertions; used-by: [retrieval-provider::adapters, tests]
 postgres = { version = "0.19", features = ["with-uuid-1"] }
+# why: DB-bound fixture skip/fail and advisory-lock helpers for the three-state DB tests; used-by: [retrieval-provider::adapters, tests]
 humaux-testkit = { path = "../testkit" }

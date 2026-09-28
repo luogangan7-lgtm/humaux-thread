@@ -1,6 +1,7 @@
 [package]
 name = "humaux-public-worker"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -8,8 +9,13 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# why: typed PG pools, repositories and wire adapters this package drives; used-by: [public-worker::main]
 humaux-adapters = { path = "../../crates/adapters" }
+# why: domain ids, errors and value types shared across layers; used-by: [public-worker::main]
 humaux-domain = { path = "../../crates/domain" }
+# why: same-Cell transport and CellAccessPermit for Qdrant/UDS calls; used-by: [public-worker::main]
 humaux-infra-cell = { path = "../../crates/infra-cell" }
+# why: async runtime; used-by: [public-worker::main]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+# why: UUID ids (v7) and parsing; used-by: [public-worker::main]
 uuid = { version = "1.25.0", features = ["v7"] }

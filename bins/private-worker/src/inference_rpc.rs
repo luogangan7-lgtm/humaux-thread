@@ -1,5 +1,13 @@
-//! §11.8 ADR-0012-pattern inference-only RPC — the Unix-domain-socket side
-//! `humaux-private-worker` serves for `humaux-consolidation-worker`. Mirrors
+//! `private-worker::inference_rpc` — §11.8 ADR-0012-pattern inference-only RPC — the Unix-domain-socket side
+//!   `humaux-private-worker` serves for `humaux-consolidation-worker`.
+//! Depends-on: crates=[axum, hex, humaux-adapters, humaux-application, humaux-domain, serde, tokio, uuid]; services=[PostgreSQL(role_private_worker), UDS(serve)]; env=[]; modules=[adapters::byok, adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::disclosure, adapters::postgres, adapters::private_inference_rpc, application::consolidate, domain::egress]
+//! Called-by: [private-worker::distill, private-worker::main, tests]
+//! Invariants: [the caller is authenticated by kernel peer credential before the body is read; every field reasoned
+//!   over comes from the claimed ops.private_inference_rpc_calls row, never the wire body; unknown or expired calls
+//!   are NotFound/Expired]
+//! Spec: Baseline §11.8; ADR-0015
+//!
+//! Mirrors
 //! `bins/retrieval-worker/src/rpc.rs` verbatim in shape: the worker authenticates the **caller
 //! process** via the kernel peer credential (`UnixStream::peer_cred()`), not the request body,
 //! before the JSON body extractor for that request ever runs (§决定2 ordering), and every field
@@ -132,6 +140,7 @@ pub fn router(state: Arc<RpcState>) -> Router {
 /// synchronously before spawning the accept loop — the first dial must never race it.
 pub fn bind_socket(socket_path: &std::path::Path) -> std::io::Result<tokio::net::UnixListener> {
     let _ = std::fs::remove_file(socket_path);
+    // dep: UDS(serve) — unix-socket RPC
     tokio::net::UnixListener::bind(socket_path)
 }
 

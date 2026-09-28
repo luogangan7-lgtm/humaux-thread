@@ -1,8 +1,29 @@
-//! §11.8 consolidation<->private-worker inference hop — spawns the real
-//! `humaux-private-worker` `inference_rpc` axum app in-process on a temp UDS path (same shape
-//! `bins/gateway/tests/query_embedding_rpc.rs` already uses for the sibling ADR-0012 RPC) and
-//! drives `run_once_bound` through the real `humaux_consolidation_worker::inference_client::
-//! UdsInferenceClient` against the real MiniMax provider (ADR-0015).
+//! `consolidation-worker::tests::consolidation_hop_e2e` — §11.8 consolidation<->private-worker inference hop — spawns
+//!   the real `humaux-private-worker` `inference_rpc` axum app in-process on a temp UDS path (same shape
+//!   `bins/gateway/tests/query_embedding_rpc.rs` already uses for the sibling ADR-0012 RPC) and drives
+//!   `run_once_bound` through the real `humaux_consolidation_worker::inference_client::UdsInferenceClient` against
+//!   the real MiniMax provider (ADR-0015).
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-private-worker,
+//!   humaux-testkit, postgres, serde_json, tokio, uuid]; services=[PostgreSQL(role_consolidation_worker),
+//!   PostgreSQL(role_private_worker) r=[ops.data_disclosure_sources, ops.data_disclosures, ops.model_call_ledger,
+//!   ops.outbox, ops.private_inference_rpc_calls, private.memory_consolidation_runs, private.memory_rollup_subjects,
+//!   private.memory_rollups, projection.stream_log] w=[control.credentials, control.memberships,
+//!   control.private_reasoning_domains, control.processor_models, control.provider_accounts,
+//!   control.provider_endpoints, control.reasoning_credential_bindings, control.reasoning_profiles,
+//!   control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_policies,
+//!   control.tenants, control.users, control.workspaces, ops.reasoning_account_health_observations,
+//!   ops.reasoning_provider_health_observations, private.events, private.evidence_objects,
+//!   private.memory_consolidation_inputs, private.memory_evidence, private.memory_records,
+//!   private.memory_rollup_sources, private.subjects] x=[private.link_memory_subjects], MiniMax, UDS(private-worker),
+//!   UDS(serve)]; env=[HUMAUX_MINIMAX_DNS_PINS, HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY]; modules=[adapters::byok,
+//!   adapters::byok::ssrf, adapters::consolidate_repo, adapters::consolidation_reasoner,
+//!   adapters::contribution_reasoner, adapters::disclosure, adapters::postgres, adapters::private_inference_rpc,
+//!   application::consolidate, consolidation-worker::inference_client, domain::authority, domain::egress,
+//!   humaux-consolidation-worker, humaux-testkit, private-worker::inference_rpc]
+//! Called-by: [cargo-test]
+//! Invariants: [no key -> visible SKIP for the live-MiniMax tests only; no DB -> SKIP for all;
+//!   HUMAUX_REQUIRE_MINIMAX/HUMAUX_REQUIRE_DB turn either skip into a panic via skip_or_fail (ADR-0005)]
+//! Spec: ADR-0005
 //!
 //! Four states, mirroring `crates/adapters/tests/minimax_live_smoke.rs`'s own doc:
 //! 1. `MINIMAX_API_KEY` missing (env + `.env` fallback) ⇒ visible SKIP for T1/T5 only (T2-T4
@@ -157,7 +178,9 @@ fn temp_socket_path(tag: &str) -> std::path::PathBuf {
 /// `bins/gateway/tests/query_embedding_rpc.rs::own_uid` uses, no `libc`/`nix` dependency.
 async fn own_uid() -> u32 {
     let path = temp_socket_path("uidprobe");
+    // dep: UDS(serve) — unix-socket RPC
     let listener = UnixListener::bind(&path).expect("bind uid probe socket");
+    // dep: UDS(private-worker) — test dials its own probe socket to read the peer uid
     let client = UnixStream::connect(&path).await.expect("connect uid probe");
     let (server_side, _) = listener.accept().await.expect("accept uid probe");
     let uid = server_side.peer_cred().expect("peer credential").uid();
@@ -268,6 +291,7 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
         );
         return None;
     };
+    // dep: PostgreSQL(role_private_worker) — role-scoped pool call
     let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(
             test_name,
@@ -576,12 +600,14 @@ fn t1_full_inference_hop_publishes_ticket() {
         let uid = own_uid().await;
         let socket_path = temp_socket_path("t1");
         let private_pool =
+            // dep: PostgreSQL(role_private_worker) — role-scoped pool call
             PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker"))
                 .await
                 .expect("private worker pool");
         spawn_private_worker(&socket_path, uid, private_pool, key).await;
 
         let consolidation_pool =
+            // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
             ConsolidationDbPool::connect(&dsn_as_role(&f.dsn, "role_consolidation_worker"))
                 .await
                 .expect("consolidation pool");
@@ -796,6 +822,7 @@ fn t1_full_inference_hop_publishes_ticket() {
 
     // (d) the projection hop's read (0140 path): as role_retrieval_worker with ONLY
     //     humaux.tenant_id set, the memory + evidence the ticket points at are visible.
+    // dep: PostgreSQL(role_private_worker) — role-scoped pool call
     let mut retrieval = Client::connect(&dsn_as_role(&f.dsn, "role_retrieval_worker"), NoTls)
         .expect("retrieval worker client");
     retrieval
@@ -856,6 +883,7 @@ fn t2_wrong_peer_uid_rejected_before_body() {
         let uid = own_uid().await;
         let socket_path = temp_socket_path("t2");
         let private_pool =
+            // dep: PostgreSQL(role_private_worker) — role-scoped pool call
             PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker"))
                 .await
                 .expect("private worker pool");
@@ -870,6 +898,7 @@ fn t2_wrong_peer_uid_rejected_before_body() {
         .await;
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // dep: UDS(private-worker) — test dials the private worker's inference RPC socket
         let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
         let body = b"{}";
         let head = format!(
@@ -904,10 +933,12 @@ fn t3_same_call_id_twice_claims_once() {
     let rt = tokio::runtime::Runtime::new().expect("rt");
     let call_id = rt.block_on(async {
         let private_pool =
+            // dep: PostgreSQL(role_private_worker) — role-scoped pool call
             PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker"))
                 .await
                 .expect("private worker pool");
         let consolidation_pool =
+            // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
             ConsolidationDbPool::connect(&dsn_as_role(&f.dsn, "role_consolidation_worker"))
                 .await
                 .expect("consolidation pool");
@@ -990,6 +1021,7 @@ fn t4_build_rollup_cannot_mutate_base_memory() {
     let before = read_memory_snapshot(&mut f.admin, memory_id);
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
+    // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
     let consolidation_pool = rt.block_on(ConsolidationDbPool::connect(&dsn_as_role(
         &f.dsn,
         "role_consolidation_worker",
@@ -1044,6 +1076,7 @@ impl PrivateReasoningPort for TamperThenDial<'_> {
         let dsn = self.admin_dsn.clone();
         let run_id = self.run_id;
         let tampered = tokio::task::spawn_blocking(move || {
+            // dep: PostgreSQL(role_private_worker) — role-scoped pool call
             let mut admin = Client::connect(&dsn, NoTls).expect("admin client");
             admin
                 .execute(
@@ -1084,11 +1117,13 @@ fn t5_manifest_mismatch_fails_closed_without_provider_call() {
         let uid = own_uid().await;
         let socket_path = temp_socket_path("t5");
         let private_pool =
+            // dep: PostgreSQL(role_private_worker) — role-scoped pool call
             PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker"))
                 .await
                 .expect("private worker pool");
         spawn_private_worker(&socket_path, uid, private_pool, key).await;
         let consolidation_pool =
+            // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
             ConsolidationDbPool::connect(&dsn_as_role(&f.dsn, "role_consolidation_worker"))
                 .await
                 .expect("consolidation pool");
@@ -1180,6 +1215,7 @@ fn t6_tenant_scoped_run_never_consumes_workspace_shared_inputs() {
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
     let consolidation_pool = rt
+        // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
         .block_on(ConsolidationDbPool::connect(&dsn_as_role(
             &f.dsn,
             "role_consolidation_worker",
@@ -1291,6 +1327,7 @@ fn t7_rollup_inherits_subject_links_through_publish_rollup() {
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
     let consolidation_pool = rt
+        // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
         .block_on(ConsolidationDbPool::connect(&dsn_as_role(
             &f.dsn,
             "role_consolidation_worker",

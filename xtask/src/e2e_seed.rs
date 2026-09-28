@@ -1,3 +1,24 @@
+//! `xtask::e2e_seed` — persistent tenant/credential/quota seed for deployment-point rehearsals.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, humaux-protocol, postgres, rand,
+//!   serde_json, tokio, uuid]; services=[PostgreSQL(any) w=[control.api_keys, control.credentials,
+//!   control.entitlement_snapshots, control.memberships, control.private_reasoning_domains, control.processor_models,
+//!   control.provider_accounts, control.provider_endpoints, control.quota_windows,
+//!   control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings,
+//!   control.reasoning_route_candidates, control.reasoning_route_policies,
+//!   control.retrieval_provider_admission_limits, control.tenants, control.users, control.workspace_memberships,
+//!   control.workspaces, ops.data_disclosure_sources, ops.data_disclosures, ops.model_call_ledger, ops.outbox,
+//!   ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations,
+//!   ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, private.events,
+//!   private.evidence_objects, private.memory_evidence, private.memory_records, private.processing_runs,
+//!   private.retrieval_query_sources, projection.private_memory_points, projection.stream_checkpoints,
+//!   projection.stream_log, projection.tenant_placements] x=[control.resolve_user_reasoning_admission],
+//!   PostgreSQL(role_maintenance), Qdrant(*)]; env=[HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::postgres, adapters::qdrant, adapters::quota_repo, domain::ids, domain::ticket_family,
+//!   infra-cell::permit, infra-cell::resource, infra-cell::transport, protocol::edge]
+//! Called-by: [xtask::main]
+//! Invariants: [reuses real primitives (compute_api_key_hash, issue_window) instead of re-deriving hashing/quota logic; --teardown removes seeded rows explicitly]
+//! Spec: Baseline §73.5
+//!
 //! xtask `e2e-seed` — persistent tenant/credential/quota seed for deployment-point
 //! rehearsals (an ops tool, not a test fixture: rows outlive the process, teardown is
 //! explicit via `--teardown`).
@@ -575,6 +596,7 @@ fn ensure_qdrant_collection(
         let existing = transport
             .execute(
                 &get_permit,
+                // dep: Qdrant(*) — placement upsert for the seeded tenant
                 IntraCellRequest {
                     method: IntraCellMethod::Get,
                     path: format!("/collections/{collection}"),
@@ -597,6 +619,7 @@ fn ensure_qdrant_collection(
             let response = transport
                 .execute(
                     &permit,
+                    // dep: Qdrant(*) — placement upsert for the seeded tenant
                     IntraCellRequest {
                         method: IntraCellMethod::Put,
                         path,
@@ -639,6 +662,7 @@ fn drop_qdrant_collection(
         transport
             .execute(
                 &permit,
+                // dep: Qdrant(*) — placement upsert for the seeded tenant
                 IntraCellRequest {
                     method: IntraCellMethod::Delete,
                     path: format!("/collections/{collection}"),
@@ -855,6 +879,7 @@ pub fn run(args: &[String]) -> i32 {
         return 1;
     }
 
+    // dep: PostgreSQL(any) — seed target database (HUMAUX_MAINTENANCE_PG_DSN/HUMAUX_TEST_PG_DSN)
     let mut client = match Client::connect(&dsn, NoTls) {
         Ok(c) => c,
         Err(e) => {
@@ -979,6 +1004,7 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // dep: PostgreSQL(role_maintenance) — seed target database (HUMAUX_MAINTENANCE_PG_DSN/HUMAUX_TEST_PG_DSN)
     let maintenance = match rt.block_on(MaintenanceDbPool::connect(&maintenance_dsn)) {
         Ok(p) => p,
         Err(e) => {
@@ -1210,6 +1236,7 @@ mod tests {
             eprintln!("e2e_seed test: not_applicable — {DSN_ENV} unset, skipping");
             return;
         };
+        // dep: PostgreSQL(any) — seed target database (HUMAUX_MAINTENANCE_PG_DSN/HUMAUX_TEST_PG_DSN)
         let Ok(mut client) = Client::connect(&dsn, NoTls) else {
             eprintln!(
                 "e2e_seed test: not_applicable — cannot reach Postgres at ${DSN_ENV}, skipping"

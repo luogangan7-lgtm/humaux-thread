@@ -1,8 +1,15 @@
-//! T7.2 DB integration test — proves `migrations/0088_retrieval_provider_routes.sql`'s
-//! nullable-`tenant_id` RLS design against a *real* `control.retrieval_provider_routes` table
-//! (not a synthetic scratch schema, unlike `crates/adapters/tests/auth_scope_rls.rs`'s own
-//! fixture — this task's design decision is specifically about this table's real policy and
-//! FK-driven column set, so the test exercises the table itself):
+//! `retrieval-provider::tests::router_rls_integration` — T7.2 DB integration test — proves
+//!   `migrations/0088_retrieval_provider_routes.sql`'s nullable-`tenant_id` RLS design against a *real*
+//!   `control.retrieval_provider_routes` table (not a synthetic scratch schema, unlike
+//!   `crates/adapters/tests/auth_scope_rls.rs`'s own fixture — this task's design decision is specifically about this
+//!   table's real policy and FK-driven column set, so the test exercises the table itself).
+//! Depends-on: crates=[humaux-testkit, postgres, uuid]; services=[PostgreSQL(owner)
+//!   w=[control.retrieval_provider_routes, control.tenants], PostgreSQL(role_gateway)]; env=[HUMAUX_TEST_PG_DSN];
+//!   modules=[humaux-testkit, retrieval-provider::router]
+//! Called-by: [cargo-test]
+//! Invariants: [a tenant route is visible only to its tenant, a NULL-tenant default to every tenant, and role_gateway
+//!   can SELECT but never INSERT; seeding uses the owner connection only]
+//! Spec: §6.2.0; §6.2.1; §79.2
 //!
 //! - A tenant-specific row is visible only to its own tenant, never a different one
 //!   (cross-tenant isolation — the migration's stated leak concern).
@@ -39,6 +46,7 @@ impl Drop for RlsHandle {
     fn drop(&mut self) {
         // Best-effort, id-scoped cleanup — never a schema-wide DELETE/TRUNCATE against the
         // real `control` schema.
+        // dep: PostgreSQL(owner) — admin fixture insert for the RLS integration test.
         let _ = self.client.execute(
             "DELETE FROM control.retrieval_provider_routes WHERE route_id = ANY($1)",
             &[&vec![
@@ -47,6 +55,7 @@ impl Drop for RlsHandle {
                 self.route_global,
             ]],
         );
+        // dep: PostgreSQL(owner) — admin fixture insert for the RLS integration test.
         let _ = self.client.execute(
             "DELETE FROM control.tenants WHERE tenant_id = ANY($1)",
             &[&vec![self.tenant_a, self.tenant_b]],
@@ -62,6 +71,7 @@ impl DbIntegrationFixture for RlsFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — connects with the exact HUMAUX_TEST_PG_DSN guard this fixture requires.
         let mut client = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -112,6 +122,7 @@ impl DbIntegrationFixture for RlsFixture {
 /// `control` schema §6.2.1 domain-default SELECT grant, real RLS policy from migration 0088.
 fn visible_route_ids(client: &mut Client, tenant_id: Uuid) -> Vec<Uuid> {
     let mut txn = client.transaction().expect("begin read transaction");
+    // dep: PostgreSQL(role_gateway) — role switch before the scoped statements for `visible_route_ids`
     txn.batch_execute(&format!(
         "SET LOCAL ROLE role_gateway;
          SET LOCAL humaux.tenant_id = '{tenant_id}';"
@@ -166,12 +177,14 @@ fn role_gateway_has_no_write_grant_on_control_retrieval_provider_routes() {
         "role_gateway_has_no_write_grant_on_control_retrieval_provider_routes",
         |mut handle| {
             let mut txn = handle.client.transaction().expect("begin transaction");
+            // dep: PostgreSQL(role_gateway) — role switch before the scoped statements for `role_gateway_has_no_write_grant_on_control_retrieval_provider_routes`
             txn.batch_execute(&format!(
                 "SET LOCAL ROLE role_gateway;
                  SET LOCAL humaux.tenant_id = '{}';",
                 handle.tenant_a
             ))
             .expect("set local role/tenant context");
+            // dep: PostgreSQL(owner) — real control.retrieval_provider_routes write inside the open transaction, proving the migration's RLS policy.
             let result = txn.execute(
                 "INSERT INTO control.retrieval_provider_routes
                    (tenant_id, purpose, embedding_provider_id, embedding_model_id)

@@ -1,4 +1,23 @@
-//! Shared isolated PostgreSQL/Gitleaks fixture for authenticated contribution entry tests.
+//! `adapters::tests::support::contribution_fixture` — Shared isolated PostgreSQL/Gitleaks fixture for authenticated
+//!   contribution entry tests.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, postgres, sha2, tokio, uuid];
+//!   services=[PostgreSQL(owner) r=[ops.outbox, staging.contribution_candidates, staging.contribution_releases]
+//!   w=[control.contribution_policies, control.credentials, control.memberships, control.private_reasoning_domains,
+//!   control.processor_models, control.provider_accounts, control.provider_endpoints,
+//!   control.reasoning_credential_bindings, control.reasoning_domain_grants, control.reasoning_profiles,
+//!   control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_policies,
+//!   control.tenants, control.users, ops.data_disclosures, ops.model_call_ledger,
+//!   ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, private.events,
+//!   private.evidence_objects, private.memory_evidence, private.memory_records], PostgreSQL(role_gateway),
+//!   PostgreSQL(role_private_worker)]; env=[HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
+//!   HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_entry_repo,
+//!   adapters::contribution_scan, adapters::postgres, application::consolidate, application::contribute,
+//!   domain::authority, domain::identity, domain::ids, domain::public]
+//! Called-by: [adapters::tests::contribution_authorization, adapters::tests::contribution_execution_0131, adapters::tests::contribution_execution_disclosure_sources_0131, adapters::tests::contribution_execution_ingress_0131, adapters::tests::contribution_execution_repo_0131, adapters::tests::contribution_pipeline, adapters::tests::contribution_policy_lifecycle_0132, adapters::tests::contribution_reasoner, adapters::tests::contribution_self_principal_authority_0133, adapters::tests::mechanism_observation, adapters::tests::phase9_exact_assessed_storage_binding, adapters::tests::phase9_independence_attestation, adapters::tests::project_continuity_0136, adapters::tests::public_provenance, adapters::tests::public_provenance_revocation_eval, adapters::tests::public_runtime, adapters::tests::public_runtime_qdrant, adapters::tests::public_trust, adapters::tests::support::public_anonymous_seam, private-worker::tests::contribution_execution_runner, private-worker::tests::start_manual_contribution_command_0131]
+//! Invariants: [seeds the contribution graph as owner and exercises it through the role_gateway/role_private_worker
+//!   pools; fixtures stay in the disposable isolated database for post-failure forensics]
+//! Spec: none
+//!
 //! Fixtures remain in the disposable isolated database for post-failure forensics.
 #![allow(dead_code)]
 
@@ -47,6 +66,7 @@ impl ContributionFixture {
     #[allow(clippy::too_many_lines)] // One real-PG setup must atomically expose the full authenticated release path to integration tests.
     pub fn new() -> Self {
         let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("explicit isolated PG fixture");
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&dsn, NoTls).expect("isolated PG");
         let tenant: Uuid = admin
             .query_one(
@@ -214,9 +234,11 @@ impl ContributionFixture {
             )
         };
         let private = rt
+            // dep: PostgreSQL(role_private_worker) — test opens a direct PG connection for setup/verification
             .block_on(PrivateWorkerDbPool::connect(&role("role_private_worker")))
             .expect("private role pool");
         let gateway = rt
+            // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
             .block_on(RuntimeDbPool::connect(&role("role_gateway")))
             .expect("gateway role pool");
         let auth = AuthorizationScope::new(

@@ -1,3 +1,9 @@
+//! `xtask::dod_check` — G80-33 DoD verifier closure + G80-17.D2 BootstrapDeferredSpec key-set equality.
+//! Depends-on: crates=[]; services=[subprocess(cargo)]; env=[CARGO_MANIFEST_DIR]; modules=[xtask::phase]
+//! Called-by: [xtask::main]
+//! Invariants: [reads gate criteria files as data only, never links humaux-testkit as a dependency]
+//! Spec: Baseline §69; §1.14; §1.14.1
+//!
 //! xtask `dod-check` — G80-33 DoD verifier closure + G80-17.D2 BootstrapDeferredSpec key-set
 //! equality (§69 DoD Verifier Contract, §69 Bootstrap Deferred Manifest / D1–D3, §1.14 /
 //! §1.14.1). Judgment criteria live only in those spec sections (repo CLAUDE.md hard
@@ -326,6 +332,7 @@ fn parse_registry(text: &str) -> Vec<RegistryEntry> {
 /// every `architecture-check::<name>` verifier this run needs can be resolved from a single
 /// invocation rather than one subprocess per DoD id.
 fn run_architecture_check() -> Result<String, String> {
+    // dep: subprocess(cargo) — cargo metadata / test discovery for DoD closure
     let output = Command::new("cargo")
         .args(["run", "--quiet", "-p", "xtask", "--", "architecture-check"])
         .current_dir(workspace_root())
@@ -373,6 +380,7 @@ fn resolve_verifier(
     // `test-ignored::` explicitly runs resource-dependent tests; `test::` must not
     // silently skip them and report green. Zero executed tests remains Fail.
     if let Some(args) = test_verifier_args(verifier_ref)? {
+        // dep: subprocess(cargo) — cargo metadata / test discovery for DoD closure
         let out = std::process::Command::new("cargo")
             .args(args)
             .output()

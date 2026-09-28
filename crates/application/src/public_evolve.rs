@@ -1,4 +1,9 @@
-//! Deterministic public-root support assessment (§12.6).
+//! `application::public_evolve` — Deterministic public-root support assessment (§12.6).
+//! Depends-on: crates=[humaux-domain, uuid]; services=[];
+//!   env=[]; modules=[domain::error]
+//! Called-by: [adapters::public_repo]
+//! Invariants: []
+//! Spec: §12.6
 //!
 //! This module consumes server-validated identity metadata only. It performs no
 //! I/O and deliberately returns counts rather than a composite trust score.

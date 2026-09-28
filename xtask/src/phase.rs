@@ -1,3 +1,9 @@
+//! `xtask::phase` — single source of truth for the repo's current delivery Phase (PHASE file).
+//! Depends-on: crates=[]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[]
+//! Called-by: [xtask::benchset_declaration, xtask::dod_check, xtask::main]
+//! Invariants: [PHASE file is the only input; no subcommand may default an unset --phase to 0]
+//! Spec: Baseline §1.14; §69
+//!
 //! 「当前相位」的唯一真源：仓库根的 `PHASE` 文件（单行整数）。
 //!
 //! **为什么要有这个文件**：G80-16 / G80-33 都把「当前 Phase」当判定输入，但先前它只是

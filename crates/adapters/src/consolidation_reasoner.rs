@@ -1,8 +1,14 @@
-//! §11.6–11.9 Consolidate inference — the private-worker side of the §11.8 hop
-//! (`bins/private-worker/src/inference_rpc.rs` dispatches `PrivateReasoningPurpose::Consolidate`
-//! here) plus the contract both hop ends share (§78 single-source): the input manifest hash
-//! ([`compute_input_manifest_hash`]), the prompt/schema contract
-//! ([`consolidation_prompt_contract`]) and the rollup output parser ([`parse_rollup_output`]).
+//! `adapters::consolidation_reasoner` — §11.6–11.9 Consolidate inference — the private-worker side of the §11.8 hop
+//!   (`bins/private-worker/src/inference_rpc.rs` dispatches `PrivateReasoningPurpose::Consolidate` here) plus the
+//!   contract both hop ends share (§78 single-source): the input manifest hash ([`compute_input_manifest_hash`]), the
+//!   prompt/schema contract ([`consolidation_prompt_contract`]) and the rollup output parser
+//!   ([`parse_rollup_output`]).
+//! Depends-on: crates=[async-trait, humaux-application, humaux-domain, serde_json, sha2, sqlx, uuid]; services=[PostgreSQL(any) r=[control.memberships, control.private_reasoning_domains, control.tenants, control.users, private.evidence_objects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records]]; env=[]; modules=[adapters::byok, adapters::consolidate_repo, adapters::contribution_reasoner, adapters::disclosure, adapters::model_call_ledger, adapters::postgres, adapters::reasoning_route_admission, application::consolidate, domain::authority, domain::consolidate, domain::dataclass, domain::error, domain::ledger]
+//! Called-by: [adapters::distill_reasoner, humaux-consolidation-worker, private-worker::inference_rpc, private-worker::main, tests]
+//! Invariants: [reads only under role_private_worker's SELECT grants and writes only §7.4 disclosure-ledger rows; the
+//!   run is located by the registered call id, never a caller-supplied memory id; admission or provider failure
+//!   returns an error with no private.* write]
+//! Spec: Baseline §11.6; §7.4; ADR-0015; §7.3; ADR-0042
 //!
 //! §11.6 MUST NOTs held by construction: this adapter reads runs / inputs / memory_records /
 //! evidence classes under `role_private_worker`'s SELECT-only grants (migration 0145) and
@@ -484,6 +490,7 @@ impl PrivateReasoningPort for ConsolidationReasoner<'_> {
         let mut txn = self
             .pool
             .pool()
+            // dep: PostgreSQL(any) — opens a PostgreSQL transaction
             .begin()
             .await
             .map_err(|_| fail("private database unavailable"))?;

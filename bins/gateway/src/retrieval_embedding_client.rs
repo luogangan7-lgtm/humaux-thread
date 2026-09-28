@@ -1,6 +1,14 @@
-//! ADR-0012 Gateway-side `RetrievalEmbeddingPort` — registers a call row on
-//! [`RuntimeDbPool`] (`role_gateway`), then RPCs `humaux-retrieval-worker` over the ADR-0012
-//! Unix domain socket. §决定3: authorization for the RPC still flows through the one closed
+//! `gateway::retrieval_embedding_client` — ADR-0012 Gateway-side `RetrievalEmbeddingPort` — registers a call row on
+//!   [`RuntimeDbPool`] (`role_gateway`), then RPCs `humaux-retrieval-worker` over the ADR-0012 Unix domain socket.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-infra-cell, serde,
+//!   serde_json, sha2, tokio, uuid]; services=[UDS(retrieval-worker)]; env=[]; modules=[adapters::postgres,
+//!   adapters::retrieval_embedding_rpc, application::retrieval_embedding_port, domain::error, infra-cell::permit,
+//!   infra-cell::resource]
+//! Called-by: [gateway::bootstrap, tests]
+//! Invariants: [the RPC still flows through the one closed IntraCellResource::RETRIEVAL_EMBEDDING_RPC registry/permit even though the dial bypasses IntraCellHttpTransport (a UDS path plus kernel peer-credential auth)]
+//! Spec: Baseline §2; §83.4; ADR-0012
+//!
+//! §决定3: authorization for the RPC still flows through the one closed
 //! `IntraCellResource::RETRIEVAL_EMBEDDING_RPC` registry/permit — [`GatewayRetrievalEmbeddingClient`]
 //! mints a [`CellAccessPermit`] every call, even though the actual dial (§决定1/2) bypasses
 //! `IntraCellHttpTransport` entirely (that transport is TCP/CIDR-shaped; this resource's
@@ -231,6 +239,7 @@ impl GatewayRetrievalEmbeddingClient {
         &self,
         wire: &QueryEmbeddingRpcRequest,
     ) -> Result<QueryEmbeddingRpcEnvelope, String> {
+        // dep: UDS(retrieval-worker) — dials humaux-retrieval-worker's ADR-0012 embedding RPC socket
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(|_| "TRANSPORT".to_owned())?;

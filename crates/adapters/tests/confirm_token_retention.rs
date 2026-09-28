@@ -1,6 +1,14 @@
-//! §33.10 rule 9 / card 21 (card 1 review P2, folded) — `control.sweep_confirm_tokens`
-//! against a real Postgres, through the one caller-side door
-//! (`confirm_token_repo::sweep_expired`) and the maintenance role that owns it.
+//! `adapters::tests::confirm_token_retention` — §33.10 rule 9 / card 21 (card 1 review P2, folded) —
+//!   `control.sweep_confirm_tokens` against a real Postgres, through the one caller-side door
+//!   (`confirm_token_repo::sweep_expired`) and the maintenance role that owns it.
+//! Depends-on: crates=[humaux-adapters, humaux-testkit, postgres, sha2, sqlx, tokio]; services=[PostgreSQL(any)
+//!   w=[control.confirm_tokens, control.tenants, control.users] x=[control.sweep_confirm_tokens],
+//!   PostgreSQL(role_maintenance)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::confirm_token_repo,
+//!   adapters::postgres, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [four rows cover the sweep predicate's truth table and a fifth in another tenant proves RLS scoping;
+//!   no DSN, unreachable DB or 0169 missing is a visible SKIP]
+//! Spec: Baseline §79.2
 //!
 //! What this pins that the migration manifests cannot: 0169/0170's manifests assert the sweep
 //! *exists* with the right owner, `search_path` and EXECUTE set. They never assert what it
@@ -60,6 +68,7 @@ impl DbIntegrationFixture for ConfirmTokenFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `isolate`
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -102,6 +111,7 @@ impl DbIntegrationFixture for ConfirmTokenFixture {
 
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        // dep: PostgreSQL(role_maintenance) — opens the role-scoped connection for `isolate`
         let maintenance = rt
             .block_on(MaintenanceDbPool::connect(&dsn_as_role(
                 &dsn,
@@ -278,6 +288,7 @@ fn the_maintenance_role_cannot_delete_a_confirm_token_directly() {
             seed_token(&mut handle, tenant_id, "gone.by_hand", -60, None);
 
             let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("checked by the fixture");
+            // dep: PostgreSQL(any) — opens the role-scoped connection for `the_maintenance_role_cannot_delete_a_confirm_token_directly`
             let mut maintenance = Client::connect(&dsn_as_role(&dsn, "role_maintenance"), NoTls)
                 .expect("role_maintenance connects");
             maintenance

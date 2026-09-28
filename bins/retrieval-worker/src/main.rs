@@ -1,4 +1,23 @@
-//! `humaux-retrieval-worker` 进程入口（最小必要进程集见 §4.2；admin 探针契约见 §4.4）。
+//! `retrieval-worker::main` — `humaux-retrieval-worker` 进程入口（最小必要进程集见 §4.2；admin 探针契约见 §4.4）。
+//! Depends-on: crates=[async-trait, axum, humaux-adapters, humaux-domain, humaux-infra-cell,
+//!   humaux-local-secret-scan, humaux-projection, humaux-retrieval-provider, tokio, uuid];
+//!   services=[PostgreSQL(role_retrieval_worker), Qdrant(*), UDS(serve)]; env=[HUMAUX_RETRIEVAL_WORKER_BATCH,
+//!   HUMAUX_RETRIEVAL_WORKER_CALLER, HUMAUX_RETRIEVAL_WORKER_CELL_ID, HUMAUX_RETRIEVAL_WORKER_DIMENSION,
+//!   HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID, HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL,
+//!   HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER, HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION,
+//!   HUMAUX_RETRIEVAL_WORKER_GATEWAY_UID, HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN,
+//!   HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256, HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION,
+//!   HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS, HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION,
+//!   HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR, HUMAUX_RETRIEVAL_WORKER_QDRANT_COLLECTION,
+//!   HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST, HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT, HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS,
+//!   HUMAUX_RETRIEVAL_WORKER_REGION, HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH, HUMAUX_RETRIEVAL_WORKER_SCOPE_ID,
+//!   HUMAUX_RETRIEVAL_WORKER_SCOPE_KIND, HUMAUX_RETRIEVAL_WORKER_TENANT_ID]; modules=[adapters::disclosure,
+//!   adapters::postgres, adapters::projection_worker, adapters::qdrant, domain::egress, domain::error, domain::ids,
+//!   humaux-local-secret-scan, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::serving,
+//!   retrieval-provider::adapters, retrieval-provider::contract, retrieval-worker::rpc]
+//! Called-by: [process(humaux-retrieval-worker)]
+//! Invariants: [the UDS server binds only the configured socket path; a peer without kernel peer-credential auth is refused before any request is read]
+//! Spec: Baseline §4.2; §4.4; §17.3; ADR-0012; ADR-0037
 //!
 //! §4.2 (line 818): the owning process of `humaux_adapters::projection_worker::run_once` —
 //! there is no separate `projection-worker` process. Env wiring mirrors
@@ -132,6 +151,7 @@ async fn run() -> Result<(), Outcome> {
 ///    misconfigured CIDR or caller allowlist shows up here rather than at the first write.
 async fn readyz() -> Result<(), Outcome> {
     let dsn = required("HUMAUX_RETRIEVAL_WORKER_PG_DSN")?;
+    // dep: PostgreSQL(role_retrieval_worker) — readyz: one live connect as role_retrieval_worker
     RetrievalWorkerDbPool::connect(&dsn).await.map_err(|e| {
         Outcome::Failed(format!(
             "not ready — missing object: PostgreSQL as role_retrieval_worker ({e})"
@@ -141,6 +161,7 @@ async fn readyz() -> Result<(), Outcome> {
     let status = transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — opens the retrieval-worker's Qdrant client
             IntraCellRequest {
                 method: IntraCellMethod::Get,
                 path: "/".to_owned(),
@@ -212,6 +233,7 @@ async fn run_once_mode() -> Result<(), Outcome> {
     let (permit, transport) = build_cell_access().await?;
 
     let dsn = required("HUMAUX_RETRIEVAL_WORKER_PG_DSN")?;
+    // dep: PostgreSQL(role_retrieval_worker) — reconnects the pool after a lease-loop error
     let pool = RetrievalWorkerDbPool::connect(&dsn)
         .await
         .map_err(|_| "retrieval worker database role connection failed".to_owned())?;
@@ -365,6 +387,7 @@ async fn build_embedding_provider(
         dense_supported: true,
         sparse_supported: false,
     };
+    // dep: PostgreSQL(role_retrieval_worker) — opens a pool for the RPC server's request handling
     let embedder_pool = RetrievalWorkerDbPool::connect(dsn).await.map_err(|_| {
         "retrieval worker database role connection failed (embedder pool)".to_owned()
     })?;
@@ -423,6 +446,7 @@ mod rpc_mode {
         let embedder: Arc<dyn humaux_retrieval_provider::contract::EmbeddingProvider> =
             build_embedding_provider(&dsn, dimension).await?;
         let scanner = Arc::new(build_scanner()?);
+        // dep: PostgreSQL(role_retrieval_worker) — opens a pool for the readiness check
         let calls = RetrievalWorkerDbPool::connect(&dsn).await.map_err(|_| {
             "retrieval worker database role connection failed (rpc pool)".to_owned()
         })?;
@@ -438,6 +462,7 @@ mod rpc_mode {
         });
 
         let _ = std::fs::remove_file(&socket_path);
+        // dep: UDS(serve) — binds the ADR-0012 embedding RPC socket
         let listener = tokio::net::UnixListener::bind(&socket_path).map_err(|error| {
             format!("failed to bind retrieval embedding RPC socket {socket_path}: {error}")
         })?;

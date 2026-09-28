@@ -1,7 +1,10 @@
-//! Burns the revision this binary was built from into `HUMAUX_BUILD_GIT_SHA`, which is the ONE
-//! input `humaux-admin q deploy.binary` (§4.4) has and cannot obtain at runtime — reading it
-//! from the process environment would make "set a variable, claim to be another build" true,
-//! which is §4.4 坑4 itself.
+//! `admin::build` — Burns the revision this binary was built from into `HUMAUX_BUILD_GIT_SHA`, which is the ONE input
+//!   `humaux-admin q deploy.binary` (§4.4) has and cannot obtain at runtime — reading it from the process environment
+//!   would make "set a variable, claim to be another build" true, which is §4.4 坑4 itself.
+//! Depends-on: crates=[]; services=[subprocess(git)]; env=[HUMAUX_BUILD_GIT_SHA]; modules=[]
+//! Called-by: [cargo-build]
+//! Invariants: [a build without a resolvable git SHA still succeeds with a placeholder value, it never fails the build]
+//! Spec: Baseline §4.4
 //!
 //! Before this script existed nothing in the repository ever set that variable, so the probe
 //! that Baseline §4.4 and docs/ops/supervision.md both list as *live* answered `missing object`
@@ -38,6 +41,7 @@ fn main() {
 }
 
 fn git(args: &[&str]) -> Option<String> {
+    // dep: subprocess(git) — runs `git rev-parse` to read the build SHA
     let output = Command::new("git").args(args).output().ok()?;
     if !output.status.success() {
         return None;

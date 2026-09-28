@@ -1,7 +1,14 @@
-//! `adapters::subject_repo` — SQL half of the §6.1.3 Subject / Aboutness axis (ADR-0028, card 8):
-//! resolving an explicit [`SubjectDeclaration`] under the caller's tenant RLS, and the Rust face
-//! of the ONE deterministic resolve hook (`private.link_memory_subjects` /
-//! `private.link_rollup_subjects`, migration 0154).
+//! `adapters::subject_repo` — SQL half of the §6.1.3 Subject / Aboutness axis (ADR-0028, card 8): resolving an
+//!   explicit [`SubjectDeclaration`] under the caller's tenant RLS, and the Rust face of the ONE deterministic
+//!   resolve hook (`private.link_memory_subjects` / `private.link_rollup_subjects`, migration 0154).
+//! Depends-on: crates=[humaux-domain, serde_json, sqlx]; services=[PostgreSQL(role_gateway)
+//!   r=[private.memory_subjects] w=[private.evidence_subjects, private.subject_keys, private.subject_roles,
+//!   private.subjects] x=[private.link_memory_subjects, private.link_rollup_subjects]]; env=[];
+//!   modules=[adapters::confirm_token_repo, adapters::postgres, domain::error, domain::identity, domain::subject]
+//! Called-by: [adapters::affect_repo, adapters::consolidate_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::remember, gateway::mcp_application, gateway::memory]
+//! Invariants: [the only Rust caller of the SQL subject-link hook; declarations commit with the write they belong to
+//!   or not at all; resolution never calls a model and an unknown id/key is InvalidInput]
+//! Spec: Baseline §6.1.3; ADR-0028
 //!
 //! The hook has exactly one implementation (SQL) and this module is its only Rust caller. The
 //! production memory writers all reach it through [`crate::distill_repo::insert_memory`] (the
@@ -295,6 +302,7 @@ pub async fn list_subjects(
     auth: &AuthorizationScope,
     limit: i64,
 ) -> Result<Vec<SubjectListing>, ErrorCode> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `list_subjects`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
     let rows = select_subjects_in_txn(&mut txn, auth.tenant_id().0, None, limit).await?;
@@ -315,6 +323,7 @@ pub async fn register_subject(
     roles: &[SubjectRole],
 ) -> Result<SubjectListing, ErrorCode> {
     let tenant_id = auth.tenant_id().0;
+    // dep: PostgreSQL(role_gateway) — transaction entry for `register_subject`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
     let subject_id: Uuid = sqlx::query_scalar(
@@ -358,6 +367,7 @@ pub async fn link_key(
     key: &SubjectKey,
 ) -> Result<SubjectListing, ErrorCode> {
     let tenant_id = auth.tenant_id().0;
+    // dep: PostgreSQL(role_gateway) — transaction entry for `link_key`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
     let target = SubjectDeclaration::new(vec![subject_id], Vec::new())?;

@@ -1,5 +1,24 @@
-//! `projection_worker::run_once` integration test (§17.4/§15.7) against a real Postgres and a
-//! real Qdrant. Same convention as `outbox_batch_remember.rs`/`stream_repo.rs`: throwaway
+//! `adapters::tests::projection_worker` — `projection_worker::run_once` integration test (§17.4/§15.7) against a real
+//!   Postgres and a real Qdrant.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-domain, humaux-infra-cell, humaux-local-secret-scan,
+//!   humaux-projection, humaux-retrieval-provider, humaux-testkit, postgres, serde_json, sha2, sqlx, time, tokio];
+//!   services=[PostgreSQL(any) r=[ops.commit_seq_seq, private.ingest_tickets] w=[control.memberships,
+//!   control.private_reasoning_domains, control.tenants, control.users, control.workspace_memberships,
+//!   control.workspaces, ops.outbox, private.events, private.evidence_objects, private.memory_evidence,
+//!   private.memory_records, private.memory_subjects, private.subjects, projection.private_memory_points,
+//!   projection.stream_checkpoints, projection.stream_log] x=[private.memory_subject_visibility_ok],
+//!   PostgreSQL(role_batch_issuer), PostgreSQL(role_gateway), PostgreSQL(role_retrieval_worker), Qdrant(*),
+//!   subprocess(gitleaks)]; env=[HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_PG_DSN,
+//!   HUMAUX_TEST_QDRANT_URL]; modules=[adapters::postgres, adapters::projection_worker, adapters::qdrant,
+//!   adapters::remember, domain::egress, domain::error, domain::evidence, domain::identity, domain::ids,
+//!   domain::subject, humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource,
+//!   infra-cell::transport, projection::serving, retrieval-provider::adapters, retrieval-provider::contract]
+//! Called-by: [cargo-test]
+//! Invariants: [uses a throwaway tenant and Qdrant collection cleaned up on Drop; a ticket is marked done only after
+//!   search-visible confirmation; no DSN, unreachable PG/Qdrant or no local gitleaks is a visible SKIP]
+//! Spec: Baseline §17.4; §15.7; §79.2
+//!
+//! Same convention as `outbox_batch_remember.rs`/`stream_repo.rs`: throwaway
 //! `control.tenants` row + throwaway Qdrant collection, cleaned up on `Drop`.
 //!
 //! Three-state skip (§79.2): no DSN, unreachable Postgres/Qdrant, or a missing local gitleaks
@@ -80,6 +99,7 @@ fn discover_gitleaks() -> Option<(std::path::PathBuf, String, String)> {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
+        // dep: subprocess(gitleaks) — spawn a child process for this fixture
         let output = Command::new(&path)
             .arg("version")
             .stdin(Stdio::null())
@@ -149,6 +169,7 @@ impl Drop for Handle {
                     let _ = transport
                         .execute(
                             &permit,
+                            // dep: Qdrant(*) — Qdrant wire call for this fixture
                             IntraCellRequest {
                                 method: IntraCellMethod::Delete,
                                 path: format!("/collections/{collection}"),
@@ -222,6 +243,7 @@ async fn setup_qdrant_collection() -> Result<
         transport
             .execute(
                 &permit,
+                // dep: Qdrant(*) — Qdrant wire call for this fixture
                 IntraCellRequest {
                     method: IntraCellMethod::Put,
                     path,
@@ -243,6 +265,7 @@ impl DbIntegrationFixture for Fixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -298,6 +321,7 @@ impl DbIntegrationFixture for Fixture {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let gateway = rt
+            // dep: PostgreSQL(role_gateway) — open a role-scoped PG connection/pool for this test
             .block_on(RuntimeDbPool::connect(&dsn_as_role(&dsn, "role_gateway")))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 
@@ -538,6 +562,7 @@ fn seed_memory_with_visibility_and_evidence(
         )
         .expect("insert memory_records row")
         .get(0);
+    // dep: PostgreSQL(any) — pool/txn query execution
     txn.execute(
         "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, ordinal) \
          VALUES ($1, $2, 'PRIMARY', 0)",
@@ -592,6 +617,7 @@ fn scroll_payloads(
         .rt
         .block_on(handle.transport.execute(
             permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
             IntraCellRequest {
                 method: IntraCellMethod::Post,
                 path: format!("/collections/{}/points/scroll", handle.collection),
@@ -658,6 +684,7 @@ async fn deps_for(
 ) -> ProjectionWorkerDeps {
     let retrieval_dsn = std::env::var("HUMAUX_RETRIEVAL_WORKER_PG_DSN")
         .expect("HUMAUX_RETRIEVAL_WORKER_PG_DSN must be set for this test");
+    // dep: PostgreSQL(role_retrieval_worker) — open a role-scoped PG connection/pool for this test
     let pool = RetrievalWorkerDbPool::connect(&retrieval_dsn)
         .await
         .expect("role_retrieval_worker connects");
@@ -848,6 +875,7 @@ fn dimension_mismatch_fails_before_reaching_qdrant() {
                 .expect("HUMAUX_RETRIEVAL_WORKER_PG_DSN must be set for this test");
             let pool = handle
                 .rt
+                // dep: PostgreSQL(role_retrieval_worker) — open a role-scoped PG connection/pool for this test
                 .block_on(RetrievalWorkerDbPool::connect(&retrieval_dsn))
                 .expect("role_retrieval_worker connects");
             let permit = authorize_cell_access(
@@ -969,6 +997,7 @@ fn unconfirmed_visibility_fails_row_and_blocks_checkpoint() {
                 .expect("HUMAUX_RETRIEVAL_WORKER_PG_DSN must be set for this test");
             let pool = handle
                 .rt
+                // dep: PostgreSQL(role_retrieval_worker) — open a role-scoped PG connection/pool for this test
                 .block_on(RetrievalWorkerDbPool::connect(&retrieval_dsn))
                 .expect("role_retrieval_worker connects");
             let permit = authorize_cell_access(
@@ -1652,6 +1681,7 @@ fn subject_scoped_dense_query_returns_only_memories_about_that_subject() {
 /// rolled-back transaction on the superuser fixture connection.
 fn count_as_role(handle: &mut Handle, role: &str, tenant: Uuid, memory_id: Uuid) -> i64 {
     let mut txn = handle.admin.transaction().expect("txn");
+    // dep: PostgreSQL(any) — role switch before the scoped statements for `count_as_role`
     txn.batch_execute(&format!(
         "SET LOCAL ROLE {role}; SET LOCAL humaux.tenant_id = '{tenant}'; SET LOCAL humaux.user_id = '';"
     ))
@@ -1717,6 +1747,7 @@ fn subject_visibility_policy_gates_gateway_reads_but_never_the_retrieval_worker(
             .expect("fault the predicate");
             let count_in = |txn: &mut postgres::Transaction<'_>, role: &str| -> i64 {
                 let mut sp = txn.savepoint("role_probe").expect("savepoint");
+                // dep: PostgreSQL(any) — role switch before the scoped statements for `subject_visibility_policy_gates_gateway_reads_but_never_the_retrieval_worker`
                 sp.batch_execute(&format!(
                     "SET LOCAL ROLE {role}; SET LOCAL humaux.tenant_id = '{tenant}'; \
                      SET LOCAL humaux.user_id = '';"
@@ -1754,6 +1785,7 @@ fn subject_visibility_policy_gates_gateway_reads_but_never_the_retrieval_worker(
             // has USAGE on schema private and no grant on the subject tables — a direct call
             // must be a permission error, never a boolean (the one-bit oracle the review found).
             let mut txn = handle.admin.transaction().expect("acl txn");
+            // dep: PostgreSQL(role_batch_issuer) — role switch before the scoped statements for `subject_visibility_policy_gates_gateway_reads_but_never_the_retrieval_worker`
             txn.batch_execute(&format!(
                 "SET LOCAL ROLE role_batch_issuer; SET LOCAL humaux.tenant_id = '{tenant}';"
             ))
@@ -1805,6 +1837,7 @@ fn attach_sibling_memory(handle: &mut Handle, sibling_of: Uuid, content: &str) -
         )
         .expect("insert sibling memory")
         .get(0);
+    // dep: PostgreSQL(any) — pool/txn query execution
     txn.execute(
         "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, ordinal) \
          VALUES ($1, $2, 'PRIMARY', 0)",
@@ -1929,6 +1962,7 @@ fn reissue_lifecycle_ticket(handle: &mut Handle, scope_id: Uuid, memory_id: Uuid
         )
         .expect("bump issued_highwater")
         .get(0);
+    // dep: PostgreSQL(any) — pool/txn query execution
     txn.execute(
         "INSERT INTO projection.stream_log \
            (tenant_id, scope_kind, scope_id, domain, projection_kind, projection_version, \
@@ -1937,6 +1971,7 @@ fn reissue_lifecycle_ticket(handle: &mut Handle, scope_id: Uuid, memory_id: Uuid
         &[&handle.tenant_id, &scope_id, &stream_seq, &commit_seq],
     )
     .expect("stream_log row");
+    // dep: PostgreSQL(any) — pool/txn query execution
     txn.execute(
         "INSERT INTO ops.outbox (tenant_id, commit_seq, stream_seq, event_type, evidence_id) \
          VALUES ($1, $2, $3, 'MEMORY_LIFECYCLE', $4)",

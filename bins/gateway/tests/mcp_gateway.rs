@@ -1,4 +1,48 @@
-//! Native MCP -> Gateway actual PostgreSQL acceptance.
+//! `gateway::tests::mcp_gateway` — Native MCP -> Gateway actual PostgreSQL acceptance.
+//! Depends-on: crates=[async-trait, axum, hex, humaux-adapters, humaux-application, humaux-contracts, humaux-domain,
+//!   humaux-infra-cell, humaux-local-secret-scan, humaux-projection, humaux-protocol, humaux-retrieval,
+//!   humaux-retrieval-provider, humaux-retrieval-worker, humaux-testkit, postgres, serde_json, sha2, time, tokio,
+//!   uuid]; services=[PostgreSQL(role_consolidation_worker), PostgreSQL(role_gateway) r=[control.audit_events,
+//!   control.quota_windows, control.usage_reservations, control.users, ops.commit_seq_seq, private.events,
+//!   private.evidence_affects, private.evidence_subjects, private.subject_keys, private.task_binding_grants,
+//!   public.humaux_test_restore_fault_, public.humaux_test_supersede_fault_] w=[control.api_keys,
+//!   control.confirm_tokens, control.memberships, control.operation_receipts, control.private_reasoning_domains,
+//!   control.tenants, control.workspace_memberships, coord.tasks, ops.memory_lifecycle_events, ops.outbox,
+//!   ops.selection_snapshots, private.context_bindings, private.distill_candidates, private.evidence_objects,
+//!   private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs,
+//!   private.memory_evidence, private.memory_records, private.memory_subjects, private.subjects,
+//!   projection.private_memory_points, projection.stream_checkpoints, projection.stream_log,
+//!   projection.tenant_placements], PostgreSQL(role_retrieval_worker), Qdrant(*), UDS(retrieval-worker), UDS(serve),
+//!   subprocess(humaux-gateway), subprocess(kill), HTTP(gateway)]; env=[CARGO_BIN_EXE_humaux-gateway,
+//!   HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS, HUMAUX_GATEWAY_BIND_ADDR,
+//!   HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS,
+//!   HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX,
+//!   HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
+//!   HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST, HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS,
+//!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES, HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS,
+//!   HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN,
+//!   HUMAUX_GATEWAY_REMEMBER_EVENT_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND,
+//!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION, HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID,
+//!   HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND, HUMAUX_GATEWAY_REMEMBER_TENANT_ID,
+//!   HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS,
+//!   HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID, HUMAUX_GATEWAY_REPLAY_TTL_SECONDS, HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS, HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS,
+//!   HUMAUX_GATEWAY_UNKNOWN, HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
+//!   HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN, HUMAUX_TEST_QDRANT_PORT];
+//!   modules=[adapters::confirm_token_repo, adapters::consolidate_repo, adapters::context_repo,
+//!   adapters::forget_repo, adapters::membership_repo, adapters::operation_receipt, adapters::postgres,
+//!   adapters::qdrant, adapters::quota_repo, adapters::remember, adapters::tests::support::operation_receipt_fixture,
+//!   application::retrieval_embedding_port, contracts::retrieval_config, domain::affect, domain::audit,
+//!   domain::authority, domain::confirm, domain::context, domain::dataclass, domain::error, domain::evidence,
+//!   domain::identity, domain::ids, domain::memory, domain::selection, domain::subject, gateway::context,
+//!   gateway::guard, gateway::mcp_application, gateway::recall, gateway::remember,
+//!   gateway::retrieval_embedding_client, humaux-local-secret-scan, humaux-testkit, infra-cell::permit,
+//!   infra-cell::resource, infra-cell::transport, projection::card, projection::stream, protocol::edge,
+//!   protocol::mcp, protocol::mcp_catalog, retrieval-provider::adapters, retrieval-provider::contract,
+//!   retrieval-worker::rpc, retrieval::completeness, retrieval::request]
+//! Called-by: [cargo-test]
+//! Invariants: [each test wires its own PostgreSQL/Qdrant/UDS fixtures and gateway subprocess; no test depends on state left by another test]
+//! Spec: Baseline §33.10; §34.0.1; ADR-0030; ADR-0031
 //!
 //! The database fixture owns only isolated seed and cleanup rows. Every request below travels
 //! through the loopback native MCP adapter and a real `role_gateway` runtime pool.
@@ -355,7 +399,9 @@ fn semantic_rpc_socket_path(tag: &str) -> PathBuf {
 /// credential — mirrors `tests/query_embedding_rpc.rs`'s identical helper.
 async fn semantic_own_uid() -> u32 {
     let path = semantic_rpc_socket_path("uid-probe");
+    // dep: UDS(serve) — test binds a probe socket to read the peer uid
     let listener = tokio::net::UnixListener::bind(&path).expect("bind uid probe socket");
+    // dep: UDS(retrieval-worker) — test dials the probe socket as the retrieval-worker client would
     let client = tokio::net::UnixStream::connect(&path)
         .await
         .expect("connect uid probe");
@@ -373,6 +419,7 @@ async fn semantic_own_uid() -> u32 {
 /// `tests/query_embedding_rpc.rs`'s `spawn_worker`).
 async fn spawn_semantic_worker(expected_gateway_uid: u32) -> String {
     let socket_path = semantic_rpc_socket_path("worker");
+    // dep: PostgreSQL(role_retrieval_worker) — test fixture pool for the mcp_gateway end-to-end suite
     let calls = humaux_adapters::postgres::RetrievalWorkerDbPool::connect(
         &std::env::var("HUMAUX_RETRIEVAL_WORKER_PG_DSN")
             .expect("semantic Gateway fixture requires HUMAUX_RETRIEVAL_WORKER_PG_DSN"),
@@ -387,6 +434,7 @@ async fn spawn_semantic_worker(expected_gateway_uid: u32) -> String {
         dimension: 4,
         provider_id: "gateway-test-provider".to_owned(),
     });
+    // dep: UDS(serve) — test serves the real retrieval-worker RPC router on a temp socket
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind worker rpc socket");
     let app = humaux_retrieval_worker::rpc::router(state);
     tokio::spawn(async move {
@@ -429,6 +477,7 @@ async fn create_semantic_collection(
         let response = transport
             .execute(
                 &permit,
+                // dep: Qdrant(*) — test issues a Qdrant REST request against the fixture collection
                 IntraCellRequest {
                     method: IntraCellMethod::Put,
                     path,
@@ -460,6 +509,7 @@ async fn delete_semantic_collection(
     let response = transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — test issues a Qdrant REST request against the fixture collection
             IntraCellRequest {
                 method: IntraCellMethod::Delete,
                 path: format!("/collections/{collection}"),
@@ -856,6 +906,7 @@ async fn try_raw_request(
     headers: &[(&str, &str)],
     body: &str,
 ) -> Result<(u16, Value), String> {
+    // dep: HTTP(gateway) — test helper dials the gateway's own HTTP listener
     let mut stream = TcpStream::connect(address)
         .await
         .map_err(|_| "connect loopback MCP".to_owned())?;
@@ -999,6 +1050,7 @@ async fn proxy_postgres_connection(
                 .map(|(authority, _)| authority.to_owned())
         })
         .expect("HUMAUX_GATEWAY_PG_DSN must be postgres://<user>:<pw>@<host>:<port>/<db>");
+    // dep: HTTP(gateway) — test helper dials the gateway's own HTTP listener as an upstream proxy hop
     let upstream = TcpStream::connect(upstream_authority.as_str())
         .await
         .map_err(|_| "connect isolated PostgreSQL from proxy".to_owned())?;
@@ -1862,6 +1914,7 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 humaux_gateway::retrieval_embedding_client::GatewayRetrievalEmbeddingClient::new(
                     Arc::new(
                         runtime_handle
+                            // dep: PostgreSQL(role_gateway) — test fixture pool for the mcp_gateway end-to-end suite
                             .block_on(RuntimeDbPool::connect(
                                 &std::env::var("HUMAUX_GATEWAY_PG_DSN").expect(
                                     "semantic Gateway fixture requires HUMAUX_GATEWAY_PG_DSN",
@@ -3188,6 +3241,7 @@ fn recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused(
                 humaux_gateway::retrieval_embedding_client::GatewayRetrievalEmbeddingClient::new(
                     Arc::new(
                         runtime_handle
+                            // dep: PostgreSQL(role_gateway) — test fixture pool for the mcp_gateway end-to-end suite
                             .block_on(RuntimeDbPool::connect(
                                 &std::env::var("HUMAUX_GATEWAY_PG_DSN")
                                     .expect("fixture requires HUMAUX_GATEWAY_PG_DSN"),
@@ -4060,6 +4114,7 @@ fn assert_local_read_final_metric_after_settlement(
             _ => panic!("unsupported local-read test route"),
         };
         let params = call_params(tool, arguments);
+        // dep: PostgreSQL(role_gateway) — test fixture pool for the mcp_gateway end-to-end suite
         let mut settlement_blocker = postgres::Client::connect(
             &handle.gateway_application_dsn("local-read-settlement-barrier"),
             postgres::NoTls,
@@ -4496,6 +4551,7 @@ impl GatewayProcessConfig {
     }
 
     fn command(&self) -> Command {
+        // dep: subprocess(humaux-gateway) — spawns the humaux-gateway binary under test
         let mut command = Command::new(env!("CARGO_BIN_EXE_humaux-gateway"));
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with(GATEWAY_ENV_PREFIX) {
@@ -4532,6 +4588,7 @@ impl GatewayProcess {
     fn wait_for_listener(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + GATEWAY_PROCESS_START_TIMEOUT;
         loop {
+            // dep: HTTP(gateway) — readiness poll against the spawned gateway subprocess
             if StdTcpStream::connect_timeout(&self.address, Duration::from_millis(25)).is_ok() {
                 return Ok(());
             }
@@ -4560,6 +4617,7 @@ impl GatewayProcess {
     fn signal_terminate(&mut self) -> Result<(), String> {
         #[cfg(unix)]
         {
+            // dep: subprocess(kill) — sends SIGTERM to the spawned gateway child
             let status = Command::new("/bin/kill")
                 .args([
                     "-TERM",
@@ -4644,6 +4702,7 @@ fn supervision_probe(address: SocketAddr, path: &str) -> u16 {
 /// `gateway_readyz_answers_503_on_a_fresh_connection_while_draining`.
 fn supervision_probe_opt(address: SocketAddr, path: &str) -> Option<u16> {
     use std::io::{Read, Write};
+    // dep: HTTP(gateway) — supervision probe against the spawned gateway subprocess
     let mut stream = StdTcpStream::connect_timeout(&address, Duration::from_secs(5)).ok()?;
     stream
         .write_all(
@@ -7561,6 +7620,7 @@ fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
 /// the selected memory ids.
 async fn consolidation_selected_inputs(handle: &mut Handle) -> Vec<Uuid> {
     let admin_dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("fixture ran, so the DSN is set");
+    // dep: PostgreSQL(role_consolidation_worker) — test fixture pool for the mcp_gateway end-to-end suite
     let pool = humaux_adapters::postgres::ConsolidationDbPool::connect(&dsn_as_role(
         &admin_dsn,
         "role_consolidation_worker",
@@ -8226,6 +8286,7 @@ async fn selector_id_sets(
     // The production selector path runs on the request pool, so read it back as the real
     // `role_gateway` (same `options=-c role=X` helper the consolidation witness uses) — a
     // superuser readback would bypass the RLS these selectors depend on.
+    // dep: PostgreSQL(role_gateway) — test fixture pool for the mcp_gateway end-to-end suite
     let pool = RuntimeDbPool::connect(&dsn_as_role(dsn, "role_gateway"))
         .await
         .expect("runtime pool for the selector readback");
@@ -8281,6 +8342,7 @@ async fn task_selector_readback(
     Vec<(Uuid, AuthorityClass, AuthorityClass)>,
     Vec<humaux_adapters::context_repo::TaskObligationReport>,
 ) {
+    // dep: PostgreSQL(role_gateway) — test fixture pool for the mcp_gateway end-to-end suite
     let pool = RuntimeDbPool::connect(&dsn_as_role(dsn, "role_gateway"))
         .await
         .expect("runtime pool for the task readback");
@@ -10444,6 +10506,7 @@ fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
                         humaux_gateway::retrieval_embedding_client::GatewayRetrievalEmbeddingClient::new(
                             Arc::new(
                                 runtime_handle
+                                    // dep: PostgreSQL(role_gateway) — test fixture pool for the mcp_gateway end-to-end suite
                                     .block_on(RuntimeDbPool::connect(
                                         &std::env::var("HUMAUX_GATEWAY_PG_DSN")
                                             .expect("fixture requires HUMAUX_GATEWAY_PG_DSN"),

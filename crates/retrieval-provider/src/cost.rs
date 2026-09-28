@@ -1,5 +1,12 @@
-//! §19 `费用计算：ModelCallLedger + PricingVersion` — pure cost arithmetic, no SQLx/DB access
-//! (§3/§78.3). [`compute_cost`] is the one function that turns a measured/estimated usage
+//! `retrieval-provider::cost` — §19 `费用计算：ModelCallLedger + PricingVersion` — pure cost arithmetic, no SQLx/DB access
+//!   (§3/§78.3).
+//! Depends-on: crates=[]; services=[];
+//!   env=[]; modules=[retrieval-provider::pricing]
+//! Called-by: [tests]
+//! Invariants: []
+//! Spec: §19; §3; §78.3; §19.1
+//!
+//! [`compute_cost`] is the one function that turns a measured/estimated usage
 //! snapshot plus a [`crate::pricing::PricingVersion`] into a cost number; every caller (the
 //! reserve-time estimate and the finalize-time actual in
 //! `crates/adapters/src/model_call_ledger.rs`) goes through it, so "estimated_cost" and

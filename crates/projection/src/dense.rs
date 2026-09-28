@@ -1,5 +1,10 @@
-//! `projection::dense` — dense lane 查询构造：自动注入 `tenant + §6.1 AuthorizationScope
-//! visibility filter`（§17.1）。
+//! `projection::dense` — dense lane 查询构造：自动注入 `tenant + §6.1 AuthorizationScope visibility filter`（§17.1）。
+//! Depends-on: crates=[humaux-domain]; services=[]; env=[]; modules=[domain::affect, domain::identity,
+//!   domain::subject]
+//! Called-by: [adapters::qdrant, projection::sparse, tests]
+//! Invariants: [DenseQueryFilter can only be built by build_dense_filter from a mandatory &AuthorizationScope, so
+//!   every private dense query carries the tenant + visibility filter (§17.1)]
+//! Spec: Baseline §17.1; §6.1.1; §3; §78.3
 //!
 //! §17.1 冻结："所有 private query adapter 必须自动注入 tenant + AuthorizationScope
 //! visibility filter；业务层不得手写可选 filter。" 本模块的落实方式是类型级的，不是靠约定：

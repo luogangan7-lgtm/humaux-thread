@@ -1,7 +1,16 @@
-//! `adapters::stream_repo` — §15 `projection.stream_log` / `stream_checkpoints` SQL: T3.3's
-//! `advance_prefix` (three/four independent reads + monotonic watermark write, both through
-//! [`RetrievalWorkerDbPool`]) and T3.4's `ISSUED -> LOST` patrol (through
-//! [`MaintenanceDbPool`]). The consistency arithmetic itself lives in
+//! `adapters::stream_repo` — §15 `projection.stream_log` / `stream_checkpoints` SQL: T3.3's `advance_prefix`
+//!   (three/four independent reads + monotonic watermark write, both through [`RetrievalWorkerDbPool`]) and T3.4's
+//!   `ISSUED -> LOST` patrol (through [`MaintenanceDbPool`]).
+//! Depends-on: crates=[humaux-domain, humaux-projection, humaux-retrieval, sqlx]; services=[PostgreSQL(any)
+//!   r=[ops.jobs, projection.processing_gaps] w=[projection.stream_checkpoints, projection.stream_log]
+//!   x=[projection.retire_failed_ticket], PostgreSQL(role_maintenance), PostgreSQL(role_retrieval_worker)]; env=[];
+//!   modules=[adapters::postgres, adapters::retrieve, domain::egress, projection::stream, retrieval::completeness]
+//! Called-by: [adapters::context_repo, adapters::projection_worker, adapters::retrieve, tests, xtask::projection_serve]
+//! Invariants: [every function opens its own transaction and sets humaux.tenant_id before touching FORCE-RLS stream
+//!   tables (otherwise it would silently see zero rows); consistency arithmetic lives in humaux_projection::stream]
+//! Spec: Baseline §6.2.0; §11; §15.2
+//!
+//! The consistency arithmetic itself lives in
 //! `humaux_projection::stream` (no IO, unit-tested there); this module only fetches the
 //! numbers, calls it, and writes the result.
 //!
@@ -264,6 +273,7 @@ pub async fn fetch_ledger_snapshot(
     pool: &RetrievalWorkerDbPool,
     key: &StreamKey,
 ) -> Result<StreamLedgerSnapshot, StreamRepoError> {
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `fetch_ledger_snapshot`
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, key.tenant_id.0).await?;
     let snapshot = fetch_snapshot_in_txn(&mut txn, key).await?;
@@ -281,6 +291,7 @@ pub async fn fetch_ledger_closure(
     pool: &RetrievalWorkerDbPool,
     key: &StreamKey,
 ) -> Result<LedgerClosure, StreamRepoError> {
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `fetch_ledger_closure`
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, key.tenant_id.0).await?;
     let closure = close_ledger_in_txn(&mut txn, key).await?;
@@ -308,6 +319,7 @@ pub async fn advance_prefix(
     key: &StreamKey,
     processor: ProcessorId,
 ) -> Result<u64, AdvanceError> {
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `advance_prefix`
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, key.tenant_id.0).await?;
     let snapshot = fetch_snapshot_in_txn(&mut txn, key).await?;
@@ -351,6 +363,7 @@ pub async fn retire_failed(
     key: &StreamKey,
     failure_class: &str,
 ) -> Result<Vec<i64>, StreamRepoError> {
+    // dep: PostgreSQL(role_maintenance) — transaction entry for `retire_failed`
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, key.tenant_id.0).await?;
 
@@ -411,6 +424,7 @@ pub async fn sweep_lost(
     tenant_id: Uuid,
     sla: std::time::Duration,
 ) -> Result<u64, StreamRepoError> {
+    // dep: PostgreSQL(role_maintenance) — transaction entry for `sweep_lost`
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
 

@@ -1,5 +1,19 @@
-//! G80-31（§57.1 Phase 8 出场判据）端到端：**同一快照两次装配 handoff 逐字节相同**，
-//! 且 Mandatory 的选取是机械规则、撤销立即生效、pinned 的「钉 3 带 2」可观测。
+//! `adapters::tests::g80_31_handoff` — G80-31（§57.1 Phase 8 出场判据）端到端：**同一快照两次装配 handoff 逐字节相同**， 且 Mandatory
+//!   的选取是机械规则、撤销立即生效、pinned 的「钉 3 带 2」可观测。
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, humaux-projection, humaux-retrieval,
+//!   humaux-testkit, postgres, serde_json, sqlx, tokio, uuid]; services=[PostgreSQL(any)
+//!   w=[control.private_reasoning_domains, control.tenants, ops.selection_snapshot_items, ops.selection_snapshots,
+//!   private.context_bindings, private.events, private.evidence_objects, private.memory_evidence,
+//!   private.memory_records, projection.stream_checkpoints, projection.stream_log], PostgreSQL(owner),
+//!   PostgreSQL(role_gateway)]; env=[HUMAUX_GATEWAY_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[adapters::context_repo,
+//!   adapters::postgres, adapters::read_materialize, application::continuity, domain::authority, domain::context,
+//!   domain::error, domain::identity, domain::ids, humaux-testkit, projection::serving, projection::stream,
+//!   retrieval::compiler, retrieval::handoff]
+//! Called-by: [cargo-test]
+//! Invariants: [two assemblies of one snapshot must be byte-identical, with snapshot-token equality asserted first (a
+//!   concurrent writer is a precondition failure, not a regression); skip_or_fail turns a missing DB into a failure
+//!   under HUMAUX_REQUIRE_DB]
+//! Spec: ADR-0047; ADR-0050; ADR-0006
 //!
 //! 快照身份语义（`FrozenReads` doc）：两次装配各开各的 REPEATABLE READ 事务——静默
 //! fixture 库（本 harness 独占本租户的写权）里两个事务看到同一世界。**前置显式断言
@@ -90,7 +104,8 @@ fn gateway_dsn() -> Option<String> {
         );
         return None;
     }
-    // dep: Postgres (role_gateway, HUMAUX_GATEWAY_PG_DSN) — identity probe: LOGIN, non-superuser, non-bypassrls.
+    // dep: PostgreSQL(role_gateway) — HUMAUX_GATEWAY_PG_DSN: identity probe: LOGIN, non-superuser, non-bypassrls.
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `gateway_dsn`
     let Ok(mut gateway) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(
             NAME,
@@ -207,7 +222,8 @@ fn setup() -> Option<Fixture> {
         );
         return None;
     }
-    // dep: Postgres (owner, HUMAUX_TEST_PG_DSN) — seeds/cleans the fixture tenant and installs the barrier policy.
+    // dep: PostgreSQL(owner) — HUMAUX_TEST_PG_DSN: seeds/cleans the fixture tenant and installs the barrier policy.
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `setup`
     let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;
@@ -278,6 +294,7 @@ fn seed_many(f: &mut Fixture, authority: &str, n: usize) -> Vec<Uuid> {
             )
             .expect("insert memory")
             .get(0);
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, grounding_mode) \
              VALUES ($1, $2, 'PRIMARY', 'SNAPSHOT')",
@@ -319,7 +336,8 @@ fn budget() -> ContextBudget {
 /// 每次装配自己连一个 pool：typed pool 刻意无 `Clone`（§6.2.3 闭集），测试迁就它
 /// 而不是撬开它——两次装配本来就该是两个独立事务。
 async fn one_handoff(dsn: &str, tenant: Uuid) -> Handoff {
-    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `one_handoff`
     let pool = RuntimeDbPool::connect(dsn).await.expect("pool");
     let adapter = ContextReadAdapter::new(pool, authorization_for(tenant));
     assemble_handoff(&adapter, &scope_for(tenant), budget())
@@ -395,7 +413,8 @@ async fn one_materialized(
     budget: ContextBudget,
     family: &StreamFamily,
 ) -> Result<MaterializedContext, ErrorCode> {
-    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `one_materialized`
     let pool = RuntimeDbPool::connect(dsn).await.expect("pool");
     let key = family.with_version("v1");
     assemble_materialized(&pool, authorization, scope, budget, family, &key).await
@@ -408,7 +427,8 @@ async fn one_direct_memory(
     family: &StreamFamily,
     memory_id: Uuid,
 ) -> Result<MaterializedMemory, ErrorCode> {
-    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `one_direct_memory`
     let pool = RuntimeDbPool::connect(dsn).await.expect("pool");
     let key = family.with_version("v1");
     materialize_memory_get(
@@ -430,7 +450,8 @@ async fn one_enumerated(
     cursor: Option<&str>,
     page_size: u16,
 ) -> Result<humaux_adapters::context_repo::MaterializedMemoryPage, ErrorCode> {
-    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `one_enumerated`
     let pool = RuntimeDbPool::connect(dsn).await.expect("pool");
     let key = family.with_version("v1");
     materialize_memory_enumeration(
@@ -932,7 +953,8 @@ fn direct_get_keeps_body_grounding_and_ledger_on_one_snapshot() {
     let scope = scope_for(fixture.tenant_id);
     let actor_family = family.clone();
 
-    // dep: Postgres (role_gateway) — holds the advisory barrier the actor blocks on.
+    // dep: PostgreSQL(role_gateway) — holds the advisory barrier the actor blocks on.
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `direct_get_keeps_body_grounding_and_ledger_on_one_snapshot`
     let mut holder = Client::connect(&fixture.dsn, NoTls).expect("gateway lock holder");
     let holder_pid: i32 = holder
         .query_one("SELECT pg_backend_pid()", &[])
@@ -944,7 +966,8 @@ fn direct_get_keeps_body_grounding_and_ledger_on_one_snapshot() {
     let actor = std::thread::spawn(move || -> Result<_, String> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|error| format!("direct-get actor runtime: {error}"))?;
-        // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+        // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+        // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `direct_get_keeps_body_grounding_and_ledger_on_one_snapshot`
         let pool = runtime
             .block_on(RuntimeDbPool::connect(&actor_dsn))
             .map_err(|error| format!("direct-get actor pool: {error}"))?;
@@ -1106,7 +1129,8 @@ fn enumeration_keeps_body_grounding_and_ledger_on_one_snapshot() {
     let scope = scope_for(fixture.tenant_id);
     let actor_family = family.clone();
 
-    // dep: Postgres (role_gateway) — holds the advisory barrier the actor blocks on.
+    // dep: PostgreSQL(role_gateway) — holds the advisory barrier the actor blocks on.
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `enumeration_keeps_body_grounding_and_ledger_on_one_snapshot`
     let mut holder = Client::connect(&fixture.dsn, NoTls).expect("gateway lock holder");
     let holder_pid: i32 = holder
         .query_one("SELECT pg_backend_pid()", &[])
@@ -1118,7 +1142,8 @@ fn enumeration_keeps_body_grounding_and_ledger_on_one_snapshot() {
     let actor = std::thread::spawn(move || -> Result<_, String> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|error| format!("enumeration actor runtime: {error}"))?;
-        // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+        // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+        // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `enumeration_keeps_body_grounding_and_ledger_on_one_snapshot`
         let pool = runtime
             .block_on(RuntimeDbPool::connect(&actor_dsn))
             .map_err(|error| format!("enumeration actor pool: {error}"))?;

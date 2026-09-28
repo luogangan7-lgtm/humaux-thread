@@ -1,11 +1,14 @@
-//! `adapters::forget_repo` — T4.8 §37/§37.2 physical IO: the sole `UPDATE
-//! projection.stream_log SET state = 'TOMBSTONED'` in this workspace
-//! ([`tombstone`]), the §37 `DeletionPlan` step-completion writer ([`record_step`]), §65's
-//! idempotent purge-replay loop ([`replay_pending_steps`]), the current-computed
-//! `tombstoned_unpurged_over_sla` gauge ([`tombstoned_unpurged_over_sla`]), and — §23.4 G23-2 —
-//! the two PG-side overlay reads a literal/EXACT-channel lane needs
-//! ([`count_excluding_tombstoned`], [`state_of`]), sharing this module's own `state <>
-//! 'TOMBSTONED'` knowledge instead of a caller re-deriving it.
+//! `adapters::forget_repo` — T4.8 §37/§37.2 physical IO: the sole `UPDATE projection.stream_log SET state =
+//!   'TOMBSTONED'` in this workspace ([`tombstone`]), the §37 `DeletionPlan` step-completion writer
+//!   ([`record_step`]), §65's idempotent purge-replay loop ([`replay_pending_steps`]), the current-computed
+//!   `tombstoned_unpurged_over_sla` gauge ([`tombstoned_unpurged_over_sla`]), and — §23.4 G23-2 — the two PG-side
+//!   overlay reads a literal/EXACT-channel lane needs ([`count_excluding_tombstoned`], [`state_of`]), sharing this
+//!   module's own `state <> 'TOMBSTONED'` knowledge instead of a caller re-deriving it.
+//! Depends-on: crates=[humaux-application, humaux-projection, sqlx]; services=[PostgreSQL(any) r=[control.deletion_requests, ops.deletion_plan_steps] w=[projection.stream_log] x=[ops.record_deletion_plan_step]]; env=[]; modules=[adapters::postgres, application::forget, projection::stream]
+//! Called-by: [tests]
+//! Invariants: [every call opens its own transaction and sets humaux.tenant_id first; the * -> TOMBSTONED edge and
+//!   plan-step bookkeeping run only on role_maintenance; a PG error aborts the step so the plan stays resumable]
+//! Spec: Baseline §3; §78.3
 //!
 //! `humaux_application::forget` decides *what* to delete and *in what order* (pure, no IO,
 //! §3/§78.3); this module is the only place that decision turns into SQL — same split as
@@ -82,6 +85,7 @@ pub async fn tombstone(
     key: &StreamKey,
     seq: u64,
 ) -> Result<bool, ForgetRepoError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, key.tenant_id.0).await?;
 
@@ -117,6 +121,7 @@ pub async fn count_excluding_tombstoned(
     seq_lo: u64,
     seq_hi: u64,
 ) -> Result<i64, ForgetRepoError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, key.tenant_id.0).await?;
 
@@ -150,6 +155,7 @@ pub async fn state_of(
     key: &StreamKey,
     seq: u64,
 ) -> Result<Option<String>, ForgetRepoError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, key.tenant_id.0).await?;
 
@@ -185,6 +191,7 @@ pub async fn record_step(
     outcome: &str,
     detail: Option<&str>,
 ) -> Result<bool, ForgetRepoError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
 
@@ -252,6 +259,7 @@ pub async fn replay_pending_steps<F>(
 where
     F: FnMut(DeletionStep) -> (&'static str, Option<String>),
 {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
     let done = completed_steps(&mut txn, tenant_id, deletion_request_id).await?;
@@ -286,6 +294,7 @@ pub async fn tombstoned_unpurged_over_sla(
     tenant_id: Uuid,
     sla: std::time::Duration,
 ) -> Result<i64, ForgetRepoError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
 

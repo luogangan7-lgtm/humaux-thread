@@ -1,4 +1,15 @@
-//! Native authenticated semantic recall wiring.
+//! `gateway::recall` — Native authenticated semantic recall wiring.
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, humaux-infra-cell,
+//!   humaux-local-secret-scan, humaux-projection, humaux-protocol, humaux-retrieval, serde_json, time,
+//!   uuid]; services=[]; env=[]; modules=[adapters::affect_repo, adapters::placement_repo, adapters::postgres,
+//!   adapters::qdrant, adapters::read_materialize, adapters::retrieve, application::affect,
+//!   application::retrieval_embedding_port, application::retrieve, domain::affect, domain::error, domain::identity,
+//!   domain::ids, domain::subject, gateway::context, humaux-local-secret-scan, infra-cell::permit,
+//!   infra-cell::resource, infra-cell::transport, projection::stream, protocol::mcp, protocol::mcp_catalog,
+//!   retrieval::completeness, retrieval::envelope, retrieval::planner, retrieval::request]
+//! Called-by: [gateway::bootstrap, gateway::context, gateway::mcp_application, tests]
+//! Invariants: [this module owns no alternate search or body fallback path; a Qdrant or provider failure surfaces as the typed retrieval error, never a degraded silent result]
+//! Spec: Baseline §17.3; §55.1; §78.1; ADR-0029; ADR-0031
 //!
 //! This module composes the existing request builder, sealed provider query, same-Cell Qdrant
 //! candidate lookup, and the sole PostgreSQL final hydration boundary. It owns no alternate

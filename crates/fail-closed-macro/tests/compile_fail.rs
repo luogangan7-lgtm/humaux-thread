@@ -1,4 +1,11 @@
-//! Trybuild-style compile-fail check for `#[fail_closed]` (§53.6: 缺 threat 参数编译不过).
+//! `fail-closed-macro::tests::compile_fail` — Trybuild-style compile-fail check for `#[fail_closed]` (§53.6: 缺 threat
+//!   参数编译不过).
+//! Depends-on: crates=[]; services=[subprocess(cargo)]; env=[CARGO_MANIFEST_DIR]; modules=[]
+//! Called-by: [cargo-test]
+//! Invariants: [builds a throwaway two-crate workspace in a tempdir with copied sources (real repo files never
+//!   written); the misuse must fail cargo build with the expected diagnostic, a successful build is red]
+//! Spec: none
+//!
 //! No `trybuild` dependency exists in this crate, and adding one only for this single check
 //! would be exactly the one-implementation dependency ponytail forbids when
 //! `Command::new("cargo")` already does the job — see
@@ -64,6 +71,7 @@ fn try_build(name: &str, attr: &str) -> (bool, String) {
     )
     .unwrap();
 
+    // dep: subprocess(cargo) — spawns external process
     let output = Command::new("cargo")
         .args(["build", "--quiet"])
         .current_dir(&root)

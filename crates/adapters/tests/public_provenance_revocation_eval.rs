@@ -1,4 +1,14 @@
-//! Fixed four case local synthetic benchmark for §69 `public_provenance_revocation`.
+//! `adapters::tests::public_provenance_revocation_eval` — Fixed four case local synthetic benchmark for §69
+//!   `public_provenance_revocation`.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, postgres, sha2, uuid]; services=[PostgreSQL(any)
+//!   r=[public.claim_trust_evaluations, public.claims] w=[control.public_moderator_grants, public.provenance_edges],
+//!   PostgreSQL(role_public_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_repo,
+//!   adapters::postgres, adapters::public_provenance, adapters::public_repo,
+//!   adapters::tests::support::contribution_fixture, domain::public]
+//! Called-by: [cargo-test]
+//! Invariants: [a measurement harness, not a production applicability test: cancelling flips must stay visible and
+//!   unstable flips never count as resolution; the three-run counterfactual test is lane(c) retired]
+//! Spec: Baseline §69; §79.2
 //!
 //! This is deliberately a measurement harness, not a production applicability or DOD-054 test.
 
@@ -105,6 +115,7 @@ fn dsn_as_role(dsn: &str, role: &str) -> String {
 fn public_pool(fixture: &ContributionFixture) -> PublicWorkerDbPool {
     fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -200,6 +211,7 @@ fn supported_hydrates(
 
 fn counterfactual_supported(_fixture: &ContributionFixture, claim_id: Uuid) -> bool {
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG");
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut client = Client::connect(&dsn_as_role(&dsn, "role_public_worker"), NoTls)
         .expect("public SQL counterfactual");
     client

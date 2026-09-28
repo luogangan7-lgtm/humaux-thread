@@ -1,4 +1,8 @@
 //! `infra-network::http` — ADR-0003 / §83.4 G80-3 判据1's real raw-client construction point.
+//! Depends-on: crates=[reqwest, tokio]; services=[HTTP(loopback)]; env=[]; modules=[]
+//! Called-by: [infra-cell::transport, infra-egress::http, infra-egress::raw, infra-egress::resolver]
+//! Invariants: [egress HTTP failure surfaces as a transport error to the caller; no silent retry across trust boundaries]
+//! Spec: none
 //!
 //! Every other `.rs` file in the workspace is forbidden from naming `reqwest::Client::new`/
 //! `::builder` (or `hyper::Client::new`/`::builder`) directly, fully-qualified or via a bare
@@ -167,6 +171,7 @@ mod tests {
         .unwrap();
         let response = client
             .get(format!("http://{origin_addr}/start"))
+            // dep: HTTP(loopback) — outbound http call
             .send()
             .await
             .unwrap();

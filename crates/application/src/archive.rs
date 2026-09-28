@@ -1,5 +1,9 @@
-//! `application::archive` — §36 `memory.archive` / `memory.unarchive` use case, pure half
-//! (ADR-0024, Q3).
+//! `application::archive` — §36 `memory.archive` / `memory.unarchive` use case, pure half (ADR-0024, Q3).
+//! Depends-on: crates=[humaux-domain]; services=[];
+//!   env=[]; modules=[domain::confirm, domain::error]
+//! Called-by: [adapters::memory_governance_repo]
+//! Invariants: []
+//! Spec: §36; ADR-0024
 //!
 //! Archive is a visibility flag (`private.memory_records.archived_at`), not a fifth
 //! AuthorityStatus — an archived Memory keeps its authority `status` and G59-4 pairing intact,

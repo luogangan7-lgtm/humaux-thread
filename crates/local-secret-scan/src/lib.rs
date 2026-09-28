@@ -1,4 +1,11 @@
-//! Shared local, fail-closed scanner for bytes before external retrieval egress or contribution disclosure.
+//! `humaux-local-secret-scan` — Shared local, fail-closed scanner for bytes before external retrieval egress or
+//!   contribution disclosure.
+//! Depends-on: crates=[humaux-domain, humaux-projection, humaux-retrieval, serde_json, sha2, uuid];
+//!   services=[subprocess(gitleaks)]; env=[]; modules=[domain::dataclass, domain::error, domain::evidence,
+//!   projection::card, retrieval::request]
+//! Called-by: [crate(humaux-adapters), crate(humaux-gateway), crate(humaux-private-worker), crate(humaux-retrieval-provider), crate(humaux-retrieval-worker)]
+//! Invariants: [gitleaks subprocess failure or non-zero exit surfaces as an error to the caller, no silent pass; no fallback scanner]
+//! Spec: none
 //!
 //! Configuration is supplied explicitly by trusted wiring. The scanner never reads an
 //! environment variable, never invokes a shell, and never returns scanner stdout/stderr or input
@@ -490,6 +497,7 @@ enum ScanExit {
 }
 
 fn run_version(config: &LocalSecretScannerConfig) -> Result<String, ErrorCode> {
+    // dep: subprocess(gitleaks) — runs the pinned gitleaks binary to verify its version
     let mut child = Command::new(&config.executable)
         .arg("version")
         .stdin(Stdio::null())
@@ -526,6 +534,7 @@ fn run_gitleaks(config: &LocalSecretScannerConfig, bytes: &[u8]) -> Result<ScanE
     // A private empty working directory excludes repository allowlists/config. Explicitly
     // discard configuration from the parent environment and disable inline allow comments.
     let directory = ScanDirectory::new()?;
+    // dep: subprocess(gitleaks) — runs the pinned gitleaks scanner over the payload on stdin
     let mut child = Command::new(&config.executable)
         .arg("stdin")
         .arg("--ignore-gitleaks-allow")

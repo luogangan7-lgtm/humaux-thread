@@ -1,4 +1,16 @@
-//! T3.3+T3.4 integration test — `stream_repo` (§15) against a real Postgres. Same convention
+//! `adapters::tests::stream_repo` — T3.3+T3.4 integration test — `stream_repo` (§15) against a real Postgres.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, humaux-retrieval, humaux-testkit, postgres,
+//!   sqlx, tokio]; services=[PostgreSQL(owner) r=[projection.processing_gaps] w=[control.tenants, ops.jobs,
+//!   projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_maintenance),
+//!   PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres, adapters::retrieve,
+//!   adapters::stream_repo, domain::egress, domain::ids, humaux-testkit, projection::stream, retrieval::completeness,
+//!   retrieval::envelope]
+//! Called-by: [cargo-test]
+//! Invariants: [advance_prefix/sweep_lost run per tenant under FORCE RLS on real projection tables scoped to a
+//!   throwaway tenant; no DSN, unreachable DB or projection.stream_log missing is a visible SKIP]
+//! Spec: Baseline §79.2
+//!
+//! Same convention
 //! as `jobs_claim.rs`/`email_outbox.rs`: the tables are shared (`0007_projection.sql`,
 //! `0008_ops_core.sql`), not a scratch schema, so every test scopes rows to a throwaway
 //! `control.tenants` row this file owns and cleans up on `Drop`.
@@ -68,6 +80,7 @@ impl DbIntegrationFixture for StreamFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -99,12 +112,14 @@ impl DbIntegrationFixture for StreamFixture {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let retrieval = rt
+            // dep: PostgreSQL(role_retrieval_worker) — test opens a direct PG connection for setup/verification
             .block_on(RetrievalWorkerDbPool::connect(&dsn_as_role(
                 &dsn,
                 "role_retrieval_worker",
             )))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let maintenance = rt
+            // dep: PostgreSQL(role_maintenance) — test opens a direct PG connection for setup/verification
             .block_on(MaintenanceDbPool::connect(&dsn_as_role(
                 &dsn,
                 "role_maintenance",
@@ -847,6 +862,7 @@ fn only_the_definer_function_can_reach_retired_failed() {
                 let error = handle
                     .admin
                     .batch_execute(&format!(
+                        // dep: PostgreSQL(owner) — test switches PG role to exercise RLS
                         "BEGIN; \
                          SET LOCAL ROLE {role}; \
                          SET LOCAL humaux.tenant_id = '{tenant}'; \

@@ -1,6 +1,13 @@
-//! §19 "Provider Plane 测试 · Contract Tests" (spec lines ~4120-4131), run against
-//! [`TestDoubleProvider`] — network-free, deterministic, must stay green independent of any
-//! live credential (task brief: "Contract/Failure/Cost/Migration 四类测试全部用 test double").
+//! `retrieval-provider::tests::contract_tests` — §19 "Provider Plane 测试 · Contract Tests" (spec lines ~4120-4131),
+//!   run against [`TestDoubleProvider`] — network-free, deterministic, must stay green independent of any live
+//!   credential (task brief: "Contract/Failure/Cost/Migration 四类测试全部用 test double").
+//! Depends-on: crates=[humaux-domain, humaux-local-secret-scan, humaux-projection, humaux-retrieval, tokio, uuid];
+//!   services=[]; env=[CARGO_MANIFEST_DIR]; modules=[domain::authority, domain::dataclass, domain::error,
+//!   domain::evidence, domain::identity, domain::ids, domain::memory, humaux-local-secret-scan, projection::card,
+//!   retrieval-provider::adapters, retrieval-provider::contract, retrieval::request]
+//! Called-by: [cargo-test]
+//! Invariants: [network-free and credential-free; CARGO_MANIFEST_DIR only locates repo fixtures, a missing fixture fails the test]
+//! Spec: §19
 //!
 //! The eight bullets are the spec's own list, verbatim: embedding input/output · dimension ·
 //! batch semantics · empty input · Unicode · max token · rerank ordering · provider error

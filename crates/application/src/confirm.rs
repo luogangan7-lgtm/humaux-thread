@@ -1,4 +1,9 @@
 //! `application::confirm` — §36/§10.1 `memory.confirm` use case, pure half (ADR-0026, Card 6).
+//! Depends-on: crates=[humaux-domain, uuid]; services=[];
+//!   env=[]; modules=[domain::authority, domain::evidence, domain::ids, domain::memory, domain::policy]
+//! Called-by: [adapters::distill_repo]
+//! Invariants: []
+//! Spec: §36; §10.1; ADR-0026
 //!
 //! `memory.confirm` promotes a `private.distill_candidates` row (a distill output the §10.1
 //! origin-bound ceiling rejected for its source origin) into a `UserConfirmed` Evidence + a new

@@ -1,4 +1,9 @@
 //! `adapters::byok::ssrf` — §11.4 Custom / OpenAI-compatible Endpoint Security.
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [adapters::byok, private-worker::main, tests]
+//! Invariants: [every custom endpoint URL and every redirect hop passes validate_custom_endpoint; a forbidden or
+//!   unresolvable address is an SsrfError before any connection is made (§11.4)]
+//! Spec: Baseline §11.4; §83.4
 //!
 //! A user-supplied custom `base_url` (BYOK "bring your own OpenAI-compatible endpoint") is
 //! untrusted SSRF input: "普通 SaaS 用户不能借 custom endpoint 探测 Humaux 内网" (§11.4). This

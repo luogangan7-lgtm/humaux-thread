@@ -1,6 +1,7 @@
 [package]
 name = "xtask"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -9,33 +10,46 @@ workspace = true
 
 [dependencies]
 # §46.1 manifest parsing (migration_rehearsal.rs) — no serde derive needed, toml::Value suffices.
+# why: parse migration manifests and dep-map header lists; used-by: [tests, xtask::architecture_check, xtask::dep_map, xtask::migrate, xtask::migration_rehearsal, xtask::r4_fault_manifest]
 toml = "1"
 # §50.1 config-check.rs: reuses contracts::feature_registry parsing, no second parser.
+# why: reuse the typed features.toml parser instead of a second one; used-by: [xtask::config_check, xtask::mechanism_registry]
 humaux-contracts = { path = "../crates/contracts" }
+# why: reuse the real Postgres/Qdrant repo adapters instead of re-typing SQL/wire calls; used-by: [xtask::confirm_sweep, xtask::e2e_seed, xtask::mechanism_registry, xtask::member, xtask::projection_serve, xtask::switch_visible]
 humaux-adapters = { path = "../crates/adapters" }
+# why: async runtime for the ops subcommands that call async adapters; used-by: [tests, xtask::confirm_sweep, xtask::e2e_seed, xtask::mechanism_registry, xtask::member, xtask::projection_serve, xtask::soak, xtask::switch_visible]
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # Parsing `cargo metadata` output for dependency-rule checks (§78.3) and gate reports.
+# why: parse cargo metadata / gate report JSON; used-by: [tests, xtask::architecture_check, xtask::e2e_seed, xtask::soak]
 serde_json = "1"
 # Phase 1: migration runner (migrate.rs) + live-DB enumerations (rls_check.rs, §48.2).
+# why: direct Postgres client for migrations, rehearsal and RLS/grant enumeration; used-by: [tests, xtask::confirm_sweep, xtask::dep_map, xtask::e2e_seed, xtask::migrate, xtask::migration_rehearsal, xtask::projection_serve, xtask::rls_check, xtask::serial_lane, xtask::soak, xtask::switch_visible]
 postgres = { version = "0.19", features = ["with-uuid-1"] }
 # e2e-seed.rs: same Uuid type postgres::Client's with-uuid-1 feature binds against.
+# why: id type shared with postgres's with-uuid-1 binding; used-by: [tests, xtask::confirm_sweep, xtask::e2e_seed, xtask::member, xtask::projection_serve, xtask::soak, xtask::switch_visible]
 uuid = { version = "1.25.0", features = ["v4"] }
 # T5.8 card_version.rs: calls the real `projection::card::{assemble, CARD_TEMPLATE_HASH,
 # template_fingerprint}` instead of re-deriving/hardcoding a second copy of the template shape
 # — reuse, not a second implementation to keep in sync by hand.
+# why: reuse the real RetrievalCard builder/template-hash instead of a second copy; used-by: [xtask::card_version, xtask::projection_serve, xtask::soak, xtask::switch_visible]
 humaux-projection = { path = "../crates/projection" }
 # e2e-seed.rs: reuses the real keyed-hash function instead of re-deriving it (§73.5, binding rule).
+# why: reuse compute_api_key_hash instead of re-deriving the keyed hash; used-by: [xtask::e2e_seed]
 humaux-protocol = { path = "../crates/protocol" }
 # e2e-seed.rs: TenantId/UserId/WorkspaceId newtypes for quota_repo::issue_window's signature.
+# why: typed ids shared with adapters::quota_repo::issue_window's signature; used-by: [xtask::architecture_check, xtask::e2e_seed, xtask::member, xtask::projection_serve, xtask::soak, xtask::switch_visible]
 humaux-domain = { path = "../crates/domain" }
 # e2e-seed.rs: 32-char alphanumeric secret generation (getrandom-backed, workspace's existing line).
+# why: getrandom-backed secret generation for seeded API keys; used-by: [xtask::e2e_seed]
 rand = "0.9"
 # e2e-seed.rs 追加2: Qdrant collection provisioning reuses the real IntraCellResource::QDRANT_REST
 # transport instead of a hand-rolled HTTP client (§83.4/ADR-0003 — Qdrant is same-Cell, not egress).
+# why: reuse the real IntraCellResource transport instead of a hand-rolled HTTP client; used-by: [xtask::e2e_seed, xtask::switch_visible]
 humaux-infra-cell = { path = "../crates/infra-cell" }
 
 [dev-dependencies]
 # ADR-0050 D-D: the throwaway-DB migrate tests skip through `skip_or_fail(ExternalDep::Postgres)`
 # so `HUMAUX_REQUIRE_DB=1` turns a missing database into a red instead of a silent pass.
 # testkit has zero normal dependencies, so this adds no cycle.
+# why: skip_or_fail(ExternalDep::Postgres) so a missing DB is red, not a silent skip; used-by: [tests, xtask::dep_map, xtask::migrate, xtask::migration_rehearsal]
 humaux-testkit = { path = "../crates/testkit" }

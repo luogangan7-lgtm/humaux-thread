@@ -1,4 +1,8 @@
 //! `domain::selection` — §20.4 Stable Selection / Pagination Contract (T6.3, G20-1/G80-32).
+//! Depends-on: crates=[sha2, uuid]; services=[]; env=[]; modules=[]
+//! Called-by: [adapters::context_repo, adapters::selection_repo, gateway::guard, retrieval::request, tests]
+//! Invariants: []
+//! Spec: Baseline §3; §15.5; §20.1
 //!
 //! Pure types only (§3/§78.3: Domain never imports SQLx/HTTP/ENV) — the DB-side snapshot
 //! materialization and page reads live in `adapters::selection_repo`; this module holds the

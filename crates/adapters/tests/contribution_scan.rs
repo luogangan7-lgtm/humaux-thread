@@ -1,4 +1,13 @@
-//! Real binary tests for the contribution scanner's fail-closed boundaries.
+//! `adapters::tests::contribution_scan` — Real binary tests for the contribution scanner's fail-closed boundaries.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, uuid]; services=[subprocess(current_exe)];
+//!   env=[GITLEAKS_CONFIG, GITLEAKS_CONFIG_TOML, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
+//!   HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_SCAN_CONFIG_CHILD]; modules=[adapters::contribution_scan,
+//!   domain::error]
+//! Called-by: [cargo-test]
+//! Invariants: [the pinned gitleaks binary comes from HUMAUX_TEST_GITLEAKS_* (production reads typed config, never
+//!   these); a missing or unverifiable scanner is DependencyUnavailable, never a clean scan; child-config cases
+//!   re-exec the test binary]
+//! Spec: none
 //!
 //! The runner supplies the pinned binary fixture through environment variables. Production
 //! receives the same fields from typed configuration; it never reads these variables.
@@ -98,6 +107,7 @@ fn host_config_and_inline_allow_do_not_disable_scanning() {
     let config = "title = 'synthetic hostile override'\n[extend]\nuseDefault = true\n[allowlist]\nregexes = ['.*']\n";
     let config_path = directory.join(".gitleaks.toml");
     std::fs::write(&config_path, config).unwrap();
+    // dep: subprocess(current_exe) — spawns for `host_config_and_inline_allow_do_not_disable_scanning`
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", TEST_NAME, "--ignored", "--nocapture"])
         .env("HUMAUX_TEST_SCAN_CONFIG_CHILD", "1")

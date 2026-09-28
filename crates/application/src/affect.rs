@@ -1,6 +1,11 @@
-//! `application::affect` — pure read-side policy of the §8.5.1 affect axis (ADR-0030 D-D):
-//! evaluating an explicit [`AffectFilter`] over observed annotations and the bounded
-//! mood-congruent late rerank. No I/O, no clock: callers hand in `now` and the rows.
+//! `application::affect` — pure read-side policy of the §8.5.1 affect axis (ADR-0030 D-D): evaluating an explicit
+//!   [`AffectFilter`] over observed annotations and the bounded mood-congruent late rerank.
+//! Depends-on: crates=[humaux-domain, uuid]; services=[]; env=[]; modules=[domain::affect]
+//! Called-by: [adapters::affect_repo, adapters::read_materialize, gateway::recall]
+//! Invariants: []
+//! Spec: §8.5.1; ADR-0030
+//!
+//! No I/O, no clock: callers hand in `now` and the rows.
 //!
 //! Two invariants live here so every caller (the PG hydrate re-check in
 //! `adapters::read_materialize`, the gateway's `recall.search` rerank) shares one definition:

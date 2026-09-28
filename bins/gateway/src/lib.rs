@@ -1,4 +1,8 @@
-//! Trusted gateway entry points shared by HTTP and MCP transports.
+//! `humaux-gateway` — Trusted gateway entry points shared by HTTP and MCP transports.
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: []
+//! Invariants: []
+//! Spec: none
 
 pub mod auth;
 pub mod bootstrap;

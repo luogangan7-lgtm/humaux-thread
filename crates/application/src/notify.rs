@@ -1,4 +1,8 @@
-//! H4: §74.7 Notification Plane.
+//! `application::notify` — H4: §74.7 Notification Plane.
+//! Depends-on: crates=[humaux-domain, serde, serde_json]; services=[]; env=[]; modules=[domain::ids]
+//! Called-by: []
+//! Invariants: []
+//! Spec: §74.7; §6.2.3; §74.6
 //!
 //! Platform-authoritative user notification, decoupled from delivery channel: Email/future
 //! Webhook/Push are adapters, `control.notifications` is the record of truth (§74.7 "建立

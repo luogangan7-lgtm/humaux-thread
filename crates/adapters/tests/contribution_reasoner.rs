@@ -1,4 +1,17 @@
-//! §12.1.1 contribution reasoner boundary. The PG cases use a recording provider: no user key
+//! `adapters::tests::contribution_reasoner` — §12.1.1 contribution reasoner boundary.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, postgres, sha2, tokio, uuid];
+//!   services=[PostgreSQL(any) r=[ops.data_disclosure_sources] w=[control.credentials,
+//!   control.private_reasoning_domains, control.user_reasoning_profiles, ops.data_disclosures, ops.model_call_ledger,
+//!   ops.reasoning_provider_health_observations] x=[control.resolve_user_reasoning_admission]];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::byok, adapters::contribution_entry_repo,
+//!   adapters::contribution_reasoner, adapters::disclosure, adapters::tests::support::contribution_fixture,
+//!   application::consolidate, application::contribute, domain::egress, domain::error]
+//! Called-by: [cargo-test]
+//! Invariants: [uses a recording provider (no user key, no network) over the real private pool and disclosure ledger;
+//!   a failed admission or wrong binding leaves no ledger/disclosure side effect; PG cases are #[ignore] lane tests]
+//! Spec: none
+//!
+//! The PG cases use a recording provider: no user key
 //! or external network is involved, but the real private pool and disclosure ledger are used.
 
 #[path = "support/contribution_fixture.rs"]
@@ -201,6 +214,7 @@ impl UserReasoningProvider for RecordingProvider {
             let tenant_id = context.tenant_id().0;
             let model_call_id = Uuid::parse_str(context.trace_id()).expect("model call trace");
             tokio::task::spawn_blocking(move || {
+                // dep: PostgreSQL(any) — opens the role-scoped connection for `complete_structured`
                 let mut admin =
                     postgres::Client::connect(&dsn, postgres::NoTls).expect("fault-injection admin");
                 admin

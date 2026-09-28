@@ -1,5 +1,12 @@
-//! `protocol::error_map` — the MCP/REST adapter's `ErrorCode` mapping
-//! (§52.1: "MCP/REST adapter 负责映射，Domain 不产生 HTTP status"). Domain
+//! `protocol::error_map` — the MCP/REST adapter's `ErrorCode` mapping (§52.1: "MCP/REST adapter 负责映射，Domain 不产生 HTTP
+//!   status").
+//! Depends-on: crates=[humaux-domain]; services=[];
+//!   env=[]; modules=[domain::error]
+//! Called-by: [protocol::mcp]
+//! Invariants: []
+//! Spec: §52.1; §52.4
+//!
+//! Domain
 //! itself never chooses an HTTP status or a JSON-RPC error code — this
 //! module is where that choice lives.
 //!

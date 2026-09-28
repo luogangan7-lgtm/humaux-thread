@@ -1,5 +1,13 @@
-//! `adapters::selection_repo` — §20.4 Stable Selection / Pagination Contract SQL (T6.3,
-//! G20-1/G80-32). The worker API uses [`RetrievalWorkerDbPool`]; crate-private manifest
+//! `adapters::selection_repo` — §20.4 Stable Selection / Pagination Contract SQL (T6.3, G20-1/G80-32).
+//! Depends-on: crates=[humaux-domain, sqlx]; services=[PostgreSQL(role_retrieval_worker) r=[private.memory_records]
+//!   w=[ops.selection_snapshot_items, ops.selection_snapshots]]; env=[]; modules=[adapters::postgres, domain::error,
+//!   domain::selection]
+//! Called-by: [adapters::context_repo, tests]
+//! Invariants: [page 1 materializes the whole enumeration in one REPEATABLE READ transaction; later pages read only
+//!   the immutable manifest behind a MAC-signed cursor; a mismatched query or unknown snapshot is a typed error]
+//! Spec: Baseline §20.4
+//!
+//! The worker API uses [`RetrievalWorkerDbPool`]; crate-private manifest
 //! helpers also let `context_repo` authorize and materialize Gateway pages in one RR.
 //!
 //! [`begin_enumeration_snapshot`] is the Mode B "page 1" recipe: one `REPEATABLE READ
@@ -162,6 +170,7 @@ pub async fn begin_enumeration_snapshot(
 ) -> Result<SnapshotPage, SelectionRepoError> {
     let fingerprint = query_fingerprint(ENUMERATE_ACTIVE_MEMORY_RECORDS_V1, tenant_id);
 
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `begin_enumeration_snapshot`
     let mut txn = pool.pool().begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ WRITE")
         .execute(&mut *txn)
@@ -268,6 +277,7 @@ async fn fetch_page_from_manifest(
     page_size: i64,
     mac_key: &[u8],
 ) -> Result<SnapshotPage, SelectionRepoError> {
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `fetch_page_from_manifest`
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
 

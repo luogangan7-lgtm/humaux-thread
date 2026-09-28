@@ -1,4 +1,9 @@
-//! Retrieval request construction (§55.1): one typed path shared by every future lane.
+//! `retrieval::request` — Retrieval request construction (§55.1): one typed path shared by every future lane.
+//! Depends-on: crates=[humaux-contracts, humaux-domain, serde]; services=[];
+//!   env=[]; modules=[contracts::config_registry, contracts::retrieval_config, domain::authority, domain::selection, retrieval::planner, retrieval::predicate_registry]
+//! Called-by: [application::retrieve, gateway::context, gateway::memory, gateway::recall, humaux-local-secret-scan, retrieval-worker::rpc, retrieval::envelope, tests]
+//! Invariants: []
+//! Spec: §55.1
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

@@ -1,9 +1,14 @@
-//! `humaux-consolidation-worker`'s orchestration logic (§11.7/§11.8 T4.6+T4.7), split into a
-//! library target so `tests/run_once_e2e.rs` can drive [`run_once`] against a real
-//! `ConsolidationDbPool` — a binary-only crate has no target integration tests can link
-//! against, which is exactly why no test ever exercised this function before this review
-//! (major finding: `run_once` had zero callers and zero test coverage anywhere in the
-//! workspace). `src/main.rs` is now the thin process-entry shell; this file is the tested part.
+//! `humaux-consolidation-worker` — `humaux-consolidation-worker`'s orchestration logic (§11.7/§11.8 T4.6+T4.7), split
+//!   into a library target so `tests/run_once_e2e.rs` can drive [`run_once`] against a real `ConsolidationDbPool` — a
+//!   binary-only crate has no target integration tests can link against, which is exactly why no test ever exercised
+//!   this function before this review (major finding: `run_once` had zero callers and zero test coverage anywhere in
+//!   the workspace).
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, serde_json, uuid]; services=[]; env=[]; modules=[adapters::consolidate_repo, adapters::consolidation_reasoner, adapters::jobs, adapters::postgres, application::consolidate, domain::authority, domain::consolidate]
+//! Called-by: [consolidation-worker::main, tests]
+//! Invariants: []
+//! Spec: Baseline §11.8; §78
+//!
+//! `src/main.rs` is now the thin process-entry shell; this file is the tested part.
 //!
 //! §11.8 hard boundary this crate's dependency graph enforces structurally (see `Cargo.toml`'s
 //! doc comment): it owns [`ConsolidationDbPool`] and nothing else capability-shaped — no

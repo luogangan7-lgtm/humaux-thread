@@ -1,4 +1,18 @@
-//! Phase 9 R4-A durable SQL authority gates.
+//! `adapters::tests::contribution_execution_0131` — Phase 9 R4-A durable SQL authority gates.
+//! Depends-on: crates=[postgres, serde_json, toml, uuid]; services=[PostgreSQL(any) r=[control.contribution_policies,
+//!   control.private_reasoning_domains, ops.contribution_execution_job_links, ops.data_disclosures,
+//!   ops.model_call_ledger, private.contribution_execution_sources, private.memory_records] w=[ops.jobs,
+//!   private.contribution_executions, staging.contribution_candidates] x=[control.resolve_user_reasoning_admission,
+//!   private.commit_contribution_candidate, private.complete_contribution_a_exact,
+//!   private.complete_contribution_b_exact, private.enqueue_contribution_execution,
+//!   private.mark_contribution_reconciliation_required, private.require_contribution_execution_lease,
+//!   private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call,
+//!   private.settle_contribution_job_if_live, private.settle_contribution_terminal_job]]; env=[CARGO_MANIFEST_DIR,
+//!   HUMAUX_TEST_PG_DSN]; modules=[adapters::tests::support::contribution_fixture]
+//! Called-by: [cargo-test]
+//! Invariants: [the manifest SQL subset is pinned without a DB; the migration-0131 postcheck and SECURITY DEFINER
+//!   matrix tests are #[ignore] lane tests needing a disposable/shared PostgreSQL 18]
+//! Spec: none
 
 #![allow(deprecated)] // Shared fixture intentionally covers the legacy preparation boundary.
 
@@ -91,6 +105,7 @@ impl SqlDurableEvidence {
             key.0,
             key.1
         );
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `observe`
         let mut db = Client::connect(&dsn(), NoTls).expect("fresh durable-observation PG");
         assertion(&mut db);
         println!(
@@ -252,12 +267,14 @@ fn r4_manifest_postcheck_supersession_is_explicit_after_0133() {
     let base_dsn = dsn();
     let database = format!("humaux_0131_postcheck_{}", Uuid::new_v4().simple());
     let test_dsn = database_dsn(&base_dsn, &database);
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `r4_manifest_postcheck_supersession_is_explicit_after_0133`
     let mut admin = Client::connect(&base_dsn, NoTls).expect("admin DB");
     admin
         .batch_execute(&format!("CREATE DATABASE {database}"))
         .expect("create disposable postcheck DB");
 
     let (postcheck_0131, postcheck_0133) = {
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `r4_manifest_postcheck_supersession_is_explicit_after_0133`
         let mut db = Client::connect(&test_dsn, NoTls).expect("postcheck DB");
         let migration_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
@@ -303,6 +320,7 @@ fn r4_manifest_postcheck_supersession_is_explicit_after_0133() {
 #[test]
 #[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0131"]
 fn r4_security_definer_function_matrix_is_exact() {
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `r4_security_definer_function_matrix_is_exact`
     let mut db = Client::connect(&dsn(), NoTls).expect("isolated PG");
     let row = db
         .query_one(
@@ -750,6 +768,7 @@ fn r4_sql_authority_exact_late_and_atomic_candidate() {
                 let barrier = Arc::clone(&barrier);
                 let execution = execution.clone();
                 scope.spawn(move || {
+                    // dep: PostgreSQL(any) — opens the role-scoped connection for `r4_sql_authority_exact_late_and_atomic_candidate`
                     let mut db = Client::connect(&dsn(), NoTls).expect("concurrent enqueue DB");
                     barrier.wait();
                     let row = enqueue(&mut db, &execution, &execution.fingerprint)
@@ -1262,6 +1281,7 @@ fn r4_sql_authority_exact_late_and_atomic_candidate() {
     });
 
     // R4-FG-07/BASE: direct legal-looking mutation is unavailable to runtime.
+    // dep: PostgreSQL(any) — opens the role-scoped connection
     let mut worker = Client::connect(
         &format!("{}?options=-c%20role%3Drole_private_worker", dsn()),
         NoTls,

@@ -1,5 +1,13 @@
-//! §15.5 / §16.1.1 / §10.1 Distill inference (ADR-0016) — the private-worker reasoner that
-//! turns ONE accepted Evidence into 0..N memory candidates. Contract half of the hop
+//! `adapters::distill_reasoner` — §15.5 / §16.1.1 / §10.1 Distill inference (ADR-0016) — the private-worker reasoner
+//!   that turns ONE accepted Evidence into 0..N memory candidates.
+//! Depends-on: crates=[hex, humaux-application, humaux-domain, humaux-projection, serde_json, sha2, sqlx, uuid]; services=[]; env=[]; modules=[adapters::byok, adapters::consolidate_repo, adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::disclosure, adapters::model_call_ledger, adapters::postgres, adapters::reasoning_route_admission, application::consolidate, domain::authority, domain::dataclass, domain::error, domain::ledger, domain::memory]
+//! Called-by: [private-worker::distill, tests]
+//! Invariants: [reuses the shared provider pipeline (admission -> egress permit -> disclosure reserve -> provider ->
+//!   finalize) with purpose Distill and the same model_call_ledger leg; no second provider path; any step failing
+//!   returns an error before memories are written]
+//! Spec: ADR-0042; §19.1; §7.4; ADR-0015; §10.1; ADR-0048
+//!
+//! Contract half of the hop
 //! (`crate::distill_repo` is the SQL half; `bins/private-worker/src/distill.rs` drives both).
 //!
 //! Provider pipeline: exactly the `pub(crate)` steps `ContributionReasoner`/

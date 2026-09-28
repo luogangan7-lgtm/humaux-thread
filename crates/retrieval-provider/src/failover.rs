@@ -1,5 +1,9 @@
-//! `retrieval-provider::failover` — §19 **Embedding Provider Failover 硬规则** and
-//! **Rerank Provider Failover 规则**.
+//! `retrieval-provider::failover` — §19 **Embedding Provider Failover 硬规则** and **Rerank Provider Failover 规则**.
+//! Depends-on: crates=[humaux-domain, tracing, uuid]; services=[]; env=[]; modules=[domain::egress, domain::error,
+//!   retrieval-provider::contract]
+//! Called-by: [retrieval-provider::router, tests]
+//! Invariants: []
+//! Spec: §19; §41.2
 //!
 //! Embedding and rerank are *not* symmetric here (§19 states this explicitly): embedding
 //! writes a durable, provider-specific vector space, so only a **request-level failover

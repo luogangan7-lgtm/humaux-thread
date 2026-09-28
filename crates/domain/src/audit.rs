@@ -1,8 +1,11 @@
-//! `domain::audit` — §77 双轨审计: `AuditEvent` minimal field set, the `AuditMetadata`
-//! allowlist type, `SensitiveAdminAction`, the closed `McpAuditAction` set, and the
-//! `AuditBatch` hash-chain (construction + verification only — no IO, no ObjectStore; the
-//! adapter-layer export port lives in `adapters::audit_sink`, §3/§78.3 keeps this crate free
-//! of it).
+//! `domain::audit` — §77 双轨审计: `AuditEvent` minimal field set, the `AuditMetadata` allowlist type,
+//!   `SensitiveAdminAction`, the closed `McpAuditAction` set, and the `AuditBatch` hash-chain (construction +
+//!   verification only — no IO, no ObjectStore; the adapter-layer export port lives in `adapters::audit_sink`,
+//!   §3/§78.3 keeps this crate free of it).
+//! Depends-on: crates=[sha2, uuid]; services=[]; env=[]; modules=[domain::error, domain::ids]
+//! Called-by: [adapters::audit_sink, adapters::confirm_token_repo, adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::quota_repo, adapters::request_guard_repo, application::auth, gateway::guard, tests]
+//! Invariants: []
+//! Spec: Baseline §77
 //!
 //! §77 draws three log kinds apart (Application Logs / Security Audit Events / Financial
 //! Ledger) and, within Security Audit, two further layers: **Operational Audit** (PostgreSQL

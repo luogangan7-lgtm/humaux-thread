@@ -1,6 +1,12 @@
-//! T5.1 integration test — §16.1.1 "同一 fingerprint 可以有多次 processing run / 不同 output
-//! digest；旧输出不被覆盖" against a real Postgres, on `migrations/0062_processing_runs_
-//! fingerprint_fields.sql`'s real `private.processing_runs` columns.
+//! `adapters::tests::processing_runs_fingerprint_rerun` — T5.1 integration test — §16.1.1 "同一 fingerprint 可以有多次
+//!   processing run / 不同 output digest；旧输出不被覆盖" against a real Postgres, on `migrations/0062_processing_runs_
+//!   fingerprint_fields.sql`'s real `private.processing_runs` columns.
+//! Depends-on: crates=[humaux-domain, humaux-projection, humaux-testkit, postgres, sqlx]; services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, private.events, private.evidence_objects, private.observations, private.processing_runs]];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[domain::evidence, humaux-testkit, projection::fingerprint]
+//! Called-by: [cargo-test]
+//! Invariants: [two runs sharing one source_hash keep their own processing_run_id and output_digest (the second
+//!   INSERT is never an UPDATE in disguise); no DSN, unreachable DB or migration missing is a visible SKIP]
+//! Spec: Baseline §16.1.1; §79.2
 //!
 //! This is a DB-layer assertion, not a re-test of `humaux_projection::fingerprint::source_hash`
 //! itself (that function's per-axis sensitivity is covered by `crates/projection/src/
@@ -50,6 +56,7 @@ impl DbIntegrationFixture for ProcessingRunsFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 

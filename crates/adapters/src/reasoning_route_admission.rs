@@ -1,4 +1,10 @@
-//! Phase 9 R3 narrow Binding-only USER_REASONING admission adapter.
+//! `adapters::reasoning_route_admission` — Phase 9 R3 narrow Binding-only USER_REASONING admission adapter.
+//! Depends-on: crates=[humaux-application, humaux-domain, sqlx, uuid]; services=[PostgreSQL(any) x=[control.resolve_user_reasoning_admission]];
+//!   env=[]; modules=[application::consolidate, domain::egress]
+//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_entry_repo, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::model_call_ledger]
+//! Invariants: [the private worker never reads route/health/credential tables directly; it calls the frozen SECURITY
+//!   DEFINER resolver with one binding and gets one typed locator or none; a malformed locator is InvalidLocator]
+//! Spec: none
 //!
 //! The private worker has no direct read path to route, health, or credential authority tables.
 //! It supplies one exact Binding identity to the frozen security-definer resolver and receives

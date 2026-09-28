@@ -1,5 +1,16 @@
-//! Card 7 integration tests — §6.1.3 subject registry + §6.1.1 `private.visibility_allowed`
-//! (migration 0153, ADR-0027). Everything here runs against the *real* `private` objects the
+//! `adapters::tests::subject_registry_rls` — Card 7 integration tests — §6.1.3 subject registry + §6.1.1
+//!   `private.visibility_allowed` (migration 0153, ADR-0027).
+//! Depends-on: crates=[humaux-domain, humaux-testkit, postgres, uuid]; services=[PostgreSQL(owner)
+//!   w=[control.private_reasoning_domains, control.tenants, control.users, private.evidence_objects,
+//!   private.memory_consolidation_runs, private.memory_records, private.memory_rollups, private.subject_keys,
+//!   private.subject_roles, private.subjects] x=[private.visibility_allowed], PostgreSQL(role_gateway)];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[domain::identity, domain::ids, domain::subject, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [the SQL visibility predicate agrees with domain::identity::can_read over the whole scope x class
+//!   matrix, and reverting the USER_PRIVATE arm must turn both the parity and the policy read red]
+//! Spec: Baseline §6.1.1; §6.1.3; §78.2; ADR-0027
+//!
+//! Everything here runs against the *real* `private` objects the
 //! migration created (not a scratch schema like `auth_scope_rls.rs` — this card's acceptance is
 //! specifically that the extracted predicate and the real registry behave correctly):
 //!
@@ -64,6 +75,7 @@ impl DbIntegrationFixture for SubjectFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut client = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
         // Migration 0153 must be on the tree; if not, skip rather than fail spuriously.
@@ -268,6 +280,7 @@ fn parity_is_fault_sensitive() {
 
         // Baseline: with the real predicate, U2 sees none of U1's private rows.
         txn.batch_execute(&format!(
+            // dep: PostgreSQL(role_gateway) — test switches PG role to exercise RLS
             "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant}'; \
              SET LOCAL humaux.user_id = '{intruder}';"
         ))
@@ -310,6 +323,7 @@ fn parity_is_fault_sensitive() {
 
         // (b) the isolation read goes red: the widened arm leaks U1's row to U2 through every
         // re-pointed policy (the GUCs set above are transaction-scoped and still in force).
+        // dep: PostgreSQL(role_gateway) — test switches PG role to exercise RLS
         txn.batch_execute("SET LOCAL ROLE role_gateway")
             .expect("gateway/U2 context under fault");
         let leaked = count_policed(&mut txn);
@@ -341,6 +355,7 @@ fn unset_user_id_session_reads_tenant_shared_rows() {
         let mut txn = handle.client.transaction().expect("begin");
         seed_policed_rows(&mut txn, tenant, "TENANT_SHARED", None);
         txn.batch_execute(&format!(
+            // dep: PostgreSQL(role_gateway) — test switches PG role to exercise RLS
             "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant}'; \
              SET LOCAL humaux.user_id = '';"
         ))
@@ -432,6 +447,7 @@ fn subjects_cross_tenant_isolation_via_set_local_role() {
         {
             let mut txn = handle.client.transaction().expect("begin register");
             txn.batch_execute(&format!(
+                // dep: PostgreSQL(role_gateway) — test switches PG role to exercise RLS
                 "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant_a}';"
             ))
             .expect("set gateway/tenant-A context");
@@ -471,6 +487,7 @@ fn subjects_cross_tenant_isolation_via_set_local_role() {
         {
             let mut txn = handle.client.transaction().expect("begin read A");
             txn.batch_execute(&format!(
+                // dep: PostgreSQL(role_gateway) — test switches PG role to exercise RLS
                 "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant_a}';"
             ))
             .expect("ctx A");
@@ -494,6 +511,7 @@ fn subjects_cross_tenant_isolation_via_set_local_role() {
         {
             let mut txn = handle.client.transaction().expect("begin read B");
             txn.batch_execute(&format!(
+                // dep: PostgreSQL(role_gateway) — test switches PG role to exercise RLS
                 "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant_b}';"
             ))
             .expect("ctx B");
@@ -541,6 +559,7 @@ fn subject_fks_reject_foreign_tenant_subjects() {
         let mut txn = handle.client.transaction().expect("begin");
         let a_subject = seed_two_tenants_one_subject(&mut txn, tenant_a, tenant_b);
         txn.batch_execute(&format!(
+            // dep: PostgreSQL(role_gateway) — test switches PG role to exercise RLS
             "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant_b}';"
         ))
         .expect("gateway/tenant-B context");
@@ -603,6 +622,7 @@ fn subject_keys_unique_per_tenant_never_globally() {
                            VALUES ($1, $2, 'CRM', 'CRM-DUP')";
 
         txn.batch_execute(&format!(
+            // dep: PostgreSQL(role_gateway) — test switches PG role to exercise RLS
             "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant_a}';"
         ))
         .expect("gateway/tenant-A context");

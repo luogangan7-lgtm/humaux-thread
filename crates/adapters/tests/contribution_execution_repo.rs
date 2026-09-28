@@ -1,4 +1,10 @@
-//! Provider-free static guard for the B2 typed SQL binding surface.
+//! `adapters::tests::contribution_execution_repo` — Provider-free static guard for the B2 typed SQL binding surface.
+//! Depends-on: crates=[]; services=[];
+//!   env=[CARGO_MANIFEST_DIR]; modules=[]
+//! Called-by: [cargo-test]
+//! Invariants: [no DB: pins the repository's source-level contract from the crate sources located via
+//!   CARGO_MANIFEST_DIR; a missing source fails the test]
+//! Spec: none
 
 #[test]
 fn binds_only_the_eight_exposed_0131_functions() {
@@ -29,6 +35,10 @@ fn binds_only_the_eight_exposed_0131_functions() {
             "must not bind internal {name}"
         );
     }
+    // dep-map: allow table-write — static source-text guard; no DB connection
+    // dep-map: allow table-undeclared — static source-text guard; no DB connection
     assert!(!source.contains("INSERT INTO private.contribution_executions"));
+    // dep-map: allow table-write — static source-text guard; no DB connection
+    // dep-map: allow table-undeclared — static source-text guard; no DB connection
     assert!(!source.contains("UPDATE ops.model_call_ledger"));
 }

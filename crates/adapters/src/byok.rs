@@ -1,6 +1,12 @@
 //! `adapters::byok` — T4.4/T4.5: `UserReasoningProvider` contract, `PrivateInferenceContext`,
-//! `UserReasoningProfile`/`PrivateReasoningDomain` DB-facing types, the §11.3 Provider Error
-//! state machine, and the §11.4 custom-endpoint SSRF guard chain.
+//!   `UserReasoningProfile`/`PrivateReasoningDomain` DB-facing types, the §11.3 Provider Error state machine, and the
+//!   §11.4 custom-endpoint SSRF guard chain.
+//! Depends-on: crates=[async-trait, humaux-domain, humaux-infra-egress, serde_json, tokio, uuid]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::byok::ssrf, domain::egress, domain::error, domain::evidence, domain::ids, infra-egress::raw, infra-egress::resolver]
+//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::distill_reasoner, private-worker::distill, private-worker::inference_rpc, private-worker::main, tests]
+//! Invariants: [the plaintext BYOK key never becomes a struct field and never prints (only CredentialFingerprint
+//!   does); permit tenant/purpose/payload mismatches are refused before any provider call; provider failures surface
+//!   as typed ReasoningProviderError]
+//! Spec: Baseline §11.1; §48.0; §83.4; §11.3; §4.2
 //!
 //! ## Plaintext key discipline (§11.1, this Phase's security red line)
 //!

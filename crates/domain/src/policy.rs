@@ -1,5 +1,9 @@
-//! `domain::policy` — `AuthorityPolicy`'s concrete origin-bound ceiling implementation
-//! (§10.1 Origin-bound Authority Ceiling; the frozen G59-6 注错矩阵 in §59.1).
+//! `domain::policy` — `AuthorityPolicy`'s concrete origin-bound ceiling implementation (§10.1 Origin-bound Authority
+//!   Ceiling; the frozen G59-6 注错矩阵 in §59.1).
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[domain::authority, domain::evidence, domain::ids, domain::memory]
+//! Called-by: [adapters::context_repo, application::confirm, application::correct, private-worker::distill, tests]
+//! Invariants: []
+//! Spec: Baseline §7.5; §8.7; §10.1; ADR-0046
 //!
 //! §10.1's table maps each `EvidenceOriginClass` to the highest `AuthorityClass` a Memory
 //! built on it may automatically reach, "防止总结后洗白" — a Candidate above its origin's

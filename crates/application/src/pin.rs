@@ -1,4 +1,9 @@
 //! `application::pin` — §36 `memory.pin` / `memory.unpin` use case, pure half (ADR-0019).
+//! Depends-on: crates=[humaux-domain, uuid]; services=[];
+//!   env=[]; modules=[domain::authority, domain::confirm, domain::context, domain::error, domain::ids]
+//! Called-by: [adapters::context_repo]
+//! Invariants: []
+//! Spec: §36; ADR-0019
 //!
 //! The IO order (reserve BMO -> consume token -> visibility -> binding write -> COMMIT) lives
 //! in `adapters::context_repo`; what is pure and unit-tested here:

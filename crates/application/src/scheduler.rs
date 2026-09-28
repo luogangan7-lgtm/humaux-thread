@@ -1,4 +1,8 @@
 //! `application::scheduler` — Tenant Fair Scheduler 三层限流骨架 + cost 模型（§32.0）。
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: []
+//! Invariants: []
+//! Spec: §32.0; §78.1
 //!
 //! Leadership 与 exactly-once enqueue 的 DB 逻辑不在本模块：`RuntimeDbPool::pool()` 是
 //! `pub(crate)`（`crates/adapters/src/postgres.rs`），Domain/Application 层拿不到裸

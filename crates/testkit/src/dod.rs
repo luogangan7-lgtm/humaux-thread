@@ -1,4 +1,10 @@
-//! DoD verifier registry (G80-33, §69 DoD Verifier Contract). Wave3: Phase 0 only.
+//! `testkit::dod` — DoD verifier registry (G80-33, §69 DoD Verifier Contract).
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: []
+//! Invariants: []
+//! Spec: Baseline §69
+//!
+//! Wave3: Phase 0 only.
 //!
 //! §69's `#[dod(id = "DOD-xxx", phase = N, fault = "...", kind = "...")]` is written as a
 //! sketch of what a Rust attribute *would* look like; this repo does not build a proc-macro

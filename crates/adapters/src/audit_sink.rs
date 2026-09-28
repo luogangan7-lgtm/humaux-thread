@@ -1,4 +1,9 @@
 //! `adapters::audit_sink` — §77 Immutable Audit Sink export path.
+//! Depends-on: crates=[humaux-domain]; services=[]; env=[]; modules=[domain::audit]
+//! Called-by: []
+//! Invariants: [pure port: no object-store client ships here yet; the export call site writes through ObjectStore
+//!   only, so no audit bytes are placed anywhere until a real WORM adapter implements it]
+//! Spec: Baseline §3; §78.3
 //!
 //! The hash-chain itself (`AuditBatch`, `batch_hash`, `verify_chain`) is pure logic and
 //! lives in `humaux_domain::audit` — Domain never touches an object store (§3/§78.3). This

@@ -1,4 +1,8 @@
 //! `retrieval-provider::health` — §19 **Provider Health / Circuit Breaker**.
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[retrieval-provider::admission, retrieval-provider::contract]
+//! Called-by: [tests]
+//! Invariants: []
+//! Spec: §19
 //!
 //! Every `(provider, model, region)` triple carries its own independent five-state health
 //! value ([`HealthState`]). The circuit breaker built on top of it

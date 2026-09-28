@@ -1,5 +1,8 @@
-//! `domain::lifecycle` — §36/§37.1 memory lifecycle transitions and the `memory.restore`
-//! undo decision (ADR-0020).
+//! `domain::lifecycle` — §36/§37.1 memory lifecycle transitions and the `memory.restore` undo decision (ADR-0020).
+//! Depends-on: crates=[uuid]; services=[]; env=[]; modules=[domain::authority, domain::error]
+//! Called-by: [adapters::memory_governance_repo]
+//! Invariants: []
+//! Spec: Baseline §78.2
 //!
 //! Three closed enums mirror the `ops.memory_lifecycle_events` DB CHECK sets verbatim
 //! (§78.2 DB<->Rust contract; no stringly-typed domain state), and one pure decision

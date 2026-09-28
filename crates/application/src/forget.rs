@@ -1,5 +1,9 @@
-//! `application::forget` — T4.8: §37 `DeletionPlan` step order, deletion state machine, and
-//! `DeletionGraph` provenance closure.
+//! `application::forget` — T4.8: §37 `DeletionPlan` step order, deletion state machine, and `DeletionGraph`
+//!   provenance closure.
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [adapters::forget_repo, tests]
+//! Invariants: []
+//! Spec: §37; §3; §78.3; §37.2
 //!
 //! Pure, no I/O — same rule as every other module in this crate (see `scheduler.rs`'s doc:
 //! `humaux-application`'s `Cargo.toml` carries no SQL/HTTP driver dependency, §3/§78.3).

@@ -1,4 +1,8 @@
-//! `humaux-admin` 进程入口（最小必要进程集见 §4.2；探针契约见 §4.4）。
+//! `admin::main` — `humaux-admin` 进程入口（最小必要进程集见 §4.2；探针契约见 §4.4）。
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[admin::mechanism, admin::probe, admin::render]
+//! Called-by: [process(humaux-admin)]
+//! Invariants: []
+//! Spec: Baseline §1.14; §4.2; §4.4; ADR-0003
 //!
 //! 子命令：
 //! - `render mechanism-registry` —— 读 §1.14 canonical md 的 `mechanism-registry` 围栏并渲染

@@ -1,6 +1,17 @@
-//! `retrieve` — §15.5 Read-your-writes (`consistency_token` issue/decode/scope-check) and
-//! the PostgreSQL delta overlay `recall`/`context` fall back to when serving Qdrant has not
-//! yet caught up to a token's write (T3.8).
+//! `adapters::retrieve` — §15.5 Read-your-writes (`consistency_token` issue/decode/scope-check) and the PostgreSQL
+//!   delta overlay `recall`/`context` fall back to when serving Qdrant has not yet caught up to a token's write
+//!   (T3.8).
+//! Depends-on: crates=[humaux-domain, humaux-infra-cell, humaux-projection, humaux-retrieval, sqlx];
+//!   services=[PostgreSQL(role_gateway) r=[ops.outbox, private.evidence_objects, private.memory_evidence,
+//!   private.memory_records, projection.stream_checkpoints, projection.stream_log]]; env=[CARGO_MANIFEST_DIR];
+//!   modules=[adapters::context_repo, adapters::postgres, adapters::private_projection_registry, adapters::qdrant,
+//!   adapters::read_materialize, adapters::serving_repo, adapters::stream_repo, domain::affect, domain::error,
+//!   domain::identity, domain::ids, domain::subject, infra-cell::permit, infra-cell::transport, projection::serving,
+//!   projection::stream, retrieval::completeness, retrieval::envelope]
+//! Called-by: [adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::read_materialize, adapters::remember, adapters::stream_repo, gateway::context, gateway::recall, tests, xtask::switch_visible]
+//! Invariants: [read-your-writes on role_gateway: an expired token, cross-tenant/workspace scope or a changed serving
+//!   projection is a typed RetrieveError, never a stale answer passed off as caught up]
+//! Spec: Baseline §6.2.3
 //!
 //! **Why this lives in `humaux-adapters`, not `humaux-application`**: every function below
 //! that touches PostgreSQL needs `&RuntimeDbPool`, and [`crate::postgres::RuntimeDbPool`]'s
@@ -467,6 +478,7 @@ pub async fn contiguous_done_prefix(
     authorization: &AuthorizationScope,
     key: &StreamKey,
 ) -> Result<i64, RetrieveError> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `contiguous_done_prefix`
     let mut txn = pool.pool().begin().await?;
     set_authorization_local(&mut txn, authorization).await?;
     let prefix = contiguous_done_prefix_in_txn(&mut txn, key).await?;
@@ -529,6 +541,7 @@ pub async fn serving_projection_highwater(
     authorization: &AuthorizationScope,
     key: &StreamKey,
 ) -> Result<i64, RetrieveError> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `serving_projection_highwater`
     let mut txn = pool.pool().begin().await?;
     set_authorization_local(&mut txn, authorization).await?;
     let highwater = serving_projection_highwater_in_txn(&mut txn, key).await?;
@@ -652,6 +665,7 @@ pub async fn pg_delta_overlay(
     serving_highwater: i64,
     up_to_stream_seq_inclusive: i64,
 ) -> Result<Vec<OverlayCandidate>, RetrieveError> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `pg_delta_overlay`
     let mut txn = pool.pool().begin().await?;
     set_authorization_local(&mut txn, authorization).await?;
     let overlay = pg_delta_overlay_in_txn(
@@ -901,6 +915,7 @@ pub async fn materialize_private_read_serving_about(
     subject_ids: &[SubjectId],
     affect: Option<&AffectFilter>,
 ) -> Result<MaterializedPrivateReadServing, RetrieveError> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `materialize_private_read_serving_about`
     let mut txn = pool.pool().begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *txn)
@@ -943,6 +958,7 @@ pub async fn private_read_projection_selector(
     authorization: &AuthorizationScope,
     family: &StreamFamily,
 ) -> Result<Option<String>, RetrieveError> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `private_read_projection_selector`
     let mut txn = pool.pool().begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *txn)
@@ -1051,6 +1067,7 @@ pub async fn recall_with_overlay(
     authorization: &AuthorizationScope,
     family: &StreamFamily,
 ) -> Result<RecallEnvelope, RetrieveError> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `recall_with_overlay`
     let mut txn = pool.pool().begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *txn)
@@ -1260,6 +1277,7 @@ pub(crate) async fn tombstoned_source_seqs(
     authorization: &AuthorizationScope,
     key: &StreamKey,
 ) -> Result<Vec<i64>, RetrieveError> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `tombstoned_source_seqs`
     let mut txn = pool.pool().begin().await?;
     set_authorization_local(&mut txn, authorization).await?;
     let rows = sqlx::query(

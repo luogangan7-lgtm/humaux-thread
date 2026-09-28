@@ -1,4 +1,9 @@
 //! `retrieval::compiler` — §25.4 冻结装配的步骤 6+7。
+//! Depends-on: crates=[humaux-domain]; services=[];
+//!   env=[]; modules=[domain::authority, domain::context, retrieval::candidate]
+//! Called-by: [adapters::context_repo, gateway::context, retrieval::envelope, retrieval::handoff, tests]
+//! Invariants: []
+//! Spec: §25.4
 //!
 //! **这是 G25-1 真正的被测对象**：全仓唯一同时握着 Mandatory/Pinned 两条 lane 与
 //! semantic 候选池的地方，也因此是唯一能把「Mandatory 被 rerank 淘汰」这个注错写进去的

@@ -1,4 +1,13 @@
-//! Authenticated Memory reads through the existing final-body and Envelope boundaries.
+//! `gateway::memory` — Authenticated Memory reads through the existing final-body and Envelope boundaries.
+//! Depends-on: crates=[hex, humaux-adapters, humaux-domain, humaux-projection, humaux-retrieval, serde, serde_json,
+//!   time, uuid]; services=[]; env=[]; modules=[adapters::affect_repo, adapters::context_repo,
+//!   adapters::distill_repo, adapters::memory_governance_repo, adapters::postgres, adapters::read_materialize,
+//!   adapters::subject_repo, domain::affect, domain::authority, domain::confirm, domain::context, domain::error,
+//!   domain::evidence, domain::identity, domain::ids, domain::subject, gateway::context, gateway::guard,
+//!   projection::serving, projection::stream, retrieval::completeness, retrieval::envelope, retrieval::request]
+//! Called-by: [gateway::mcp_application]
+//! Invariants: [a read that cannot reach its final-body boundary returns the application error, never a partially materialized memory]
+//! Spec: Baseline §22.0; §23.1; §36; ADR-0025; ADR-0026
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 

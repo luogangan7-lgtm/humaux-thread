@@ -1,3 +1,19 @@
+//! `adapters::tests::reasoning_route_shadow_bootstrap` — Lane test for control.bootstrap_contribution_deidentify_shadow on a disposable database migrated through 0129.
+//! Depends-on: crates=[postgres, uuid]; services=[PostgreSQL(owner)
+//!   r=[control.bootstrap_contribution_deidentify_shadow, control.reasoning_profiles] w=[control.credentials,
+//!   control.memberships, control.private_reasoning_domains, control.processor_models, control.provider_accounts,
+//!   control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints,
+//!   control.reasoning_credential_bindings, control.reasoning_route_bindings, control.reasoning_route_candidates,
+//!   control.reasoning_route_domain_receipts, control.reasoning_route_policies,
+//!   control.reasoning_route_profile_receipts, control.tenants, control.user_reasoning_profiles, control.users]
+//!   x=[control.assert_reasoning_route_shadow_receipts, control.bootstrap_contribution_deidentify_shadow,
+//!   control.reasoning_route_profile_receipt_fingerprint, control.resolve_contribution_deidentify_shadow]];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[]
+//! Called-by: [cargo-test]
+//! Invariants: [the contribution de-identify shadow bootstrap must be exact, replayable and fail closed; it walks
+//!   every user reasoning domain, so it runs only as a lane(a:disposable) #[ignore] test]
+//! Spec: none
+//!
 use postgres::{Client, GenericClient, NoTls};
 use uuid::Uuid;
 
@@ -81,6 +97,7 @@ fn contribution_deidentify_shadow_bootstrap_is_exact_replayable_and_fail_closed(
         eprintln!("not_applicable: HUMAUX_TEST_PG_DSN unset");
         return;
     };
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut db = Client::connect(&dsn, NoTls).expect("isolated PostgreSQL 18");
     let mut tx = db.transaction().expect("fixture transaction");
     let tenant = Uuid::new_v4();

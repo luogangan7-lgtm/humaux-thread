@@ -1,5 +1,8 @@
-//! `domain::temporal` — the sole entry point for reading a Memory row's seven timestamp
-//! fields (§9).
+//! `domain::temporal` — the sole entry point for reading a Memory row's seven timestamp fields (§9).
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [tests]
+//! Invariants: []
+//! Spec: Baseline §9; §9.1
 //!
 //! §9 freezes exactly seven fields, each with a declared retrieval role — the failure mode
 //! this guards against is the old system's `valid_from`/`valid_to`, which sat at 0 live rows

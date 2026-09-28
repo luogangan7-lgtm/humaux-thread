@@ -1,4 +1,11 @@
 //! `adapters::serving_repo` — §16.2 换代期读路由 SQL + §16.3 无裁量切换事务(T5.2/T5.3).
+//! Depends-on: crates=[humaux-domain, humaux-projection, sqlx]; services=[PostgreSQL(any)
+//!   r=[projection.processing_gaps] w=[projection.stream_checkpoints], PostgreSQL(role_gateway),
+//!   PostgreSQL(role_maintenance)]; env=[]; modules=[adapters::postgres, domain::identity, projection::serving]
+//! Called-by: [adapters::retrieve, tests, xtask::projection_serve]
+//! Invariants: [only fetches the numbers and performs the atomic serving switch UPDATE; the switch decision is
+//!   humaux_projection::serving's pure arithmetic; cross-tenant or unauthenticated calls are typed errors]
+//! Spec: Baseline §23.1; §69; §17; §55; §16.3; §16.2; §57.1; ADR-0006
 //!
 //! Pure arithmetic ([`humaux_projection::serving::evaluate_switch`], the "无裁量口" itself)
 //! lives in `humaux_projection::serving` (no IO, unit-tested there); this module only fetches
@@ -155,6 +162,7 @@ pub async fn serving_version(
     authorization: &AuthorizationScope,
     family: &StreamFamily,
 ) -> Result<Option<String>, ServingRepoError> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `serving_version`
     let mut txn = pool.pool().begin().await?;
     set_authorization_local(&mut txn, authorization).await?;
     let version = serving_version_in_txn(&mut txn, authorization, family).await?;
@@ -240,6 +248,7 @@ pub async fn switch_projection_version(
     visible_serving: Option<(String, u64)>,
     continuation: ContinuationVerdict,
 ) -> Result<SwitchOutcome, ServingRepoError> {
+    // dep: PostgreSQL(role_maintenance) — transaction entry for `switch_projection_version`
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, family.tenant_id.0).await?;
 

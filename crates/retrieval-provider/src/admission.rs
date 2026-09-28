@@ -1,5 +1,9 @@
-//! `retrieval-provider::admission` — §19 Provider Admission Controller, §19.2 Provider Budget,
-//! §19 Provider Tenant Fairness (T7.3).
+//! `retrieval-provider::admission` — §19 Provider Admission Controller, §19.2 Provider Budget, §19 Provider Tenant
+//!   Fairness (T7.3).
+//! Depends-on: crates=[humaux-domain]; services=[]; env=[]; modules=[domain::egress, domain::error, domain::ids]
+//! Called-by: [retrieval-provider::adapters, retrieval-provider::health, retrieval-provider::metrics, tests]
+//! Invariants: []
+//! Spec: §19; §19.2; §32.0; §78.1
 //!
 //! Three pieces, in the order a caller uses them:
 //!

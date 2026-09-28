@@ -1,4 +1,9 @@
 //! `application::supersede` — §36 `memory.supersede` use case, pure half (ADR-0018).
+//! Depends-on: crates=[humaux-domain, rand]; services=[];
+//!   env=[]; modules=[domain::authority, domain::confirm, domain::error]
+//! Called-by: [adapters::memory_governance_repo, gateway::guard]
+//! Invariants: []
+//! Spec: §36; ADR-0018
 //!
 //! Two things live here and nowhere else:
 //! - the RNG contract for a confirm token (D-A: 32 random bytes; the domain type has no RNG,

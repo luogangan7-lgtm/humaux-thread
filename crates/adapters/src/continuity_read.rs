@@ -1,4 +1,9 @@
-//! Project Continuity W2 PostgreSQL reader.
+//! `adapters::continuity_read` — Project Continuity W2 PostgreSQL reader.
+//! Depends-on: crates=[async-trait, hex, humaux-application, humaux-domain, humaux-retrieval, sha2, sqlx, uuid]; services=[PostgreSQL(any) r=[ops.outbox, private.evidence_objects, private.memory_evidence, private.memory_records, projection.stream_log] x=[private.read_continuity_project_storage_v1]]; env=[]; modules=[adapters::context_repo, adapters::postgres, adapters::read_materialize, application::continuity, domain::context, domain::continuity, domain::error, domain::grounding, domain::identity, domain::ids, retrieval::handoff]
+//! Called-by: [gateway::continuity, tests]
+//! Invariants: [the whole read is one REPEATABLE READ READ ONLY gateway transaction; only an authorized parent
+//!   installs the workspace; an incomplete read is CannotEstablishCompleteness, an unauthorized one NotFound]
+//! Spec: none
 //!
 //! The whole read is one Gateway-owned, repeatable-read, read-only transaction. The project
 //! lookup runs with a nil workspace GUC; only an authorized returned parent can install the
@@ -459,6 +464,7 @@ impl ContinuityReadPort for PostgresContinuityReadPort {
         let mut tx = self
             .pool
             .pool()
+            // dep: PostgreSQL(any) — opens a PostgreSQL transaction
             .begin()
             .await
             .map_err(|_| ErrorCode::DependencyUnavailable)?;

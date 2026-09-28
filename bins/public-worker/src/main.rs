@@ -1,4 +1,14 @@
-//! `humaux-public-worker` explicit bounded Phase 9 runner (§14 / §31).
+//! `public-worker::main` — `humaux-public-worker` explicit bounded Phase 9 runner (§14 / §31).
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, tokio, uuid];
+//!   services=[PostgreSQL(role_public_worker), Qdrant(*)]; env=[HUMAUX_PUBLIC_WORKER_CALLER,
+//!   HUMAUX_PUBLIC_WORKER_CELL_ID, HUMAUX_PUBLIC_WORKER_LEASE_OWNER, HUMAUX_PUBLIC_WORKER_LIMIT,
+//!   HUMAUX_PUBLIC_WORKER_PG_DSN, HUMAUX_PUBLIC_WORKER_QDRANT_CIDR, HUMAUX_PUBLIC_WORKER_QDRANT_COLLECTION,
+//!   HUMAUX_PUBLIC_WORKER_QDRANT_HOST, HUMAUX_PUBLIC_WORKER_QDRANT_PORT, HUMAUX_PUBLIC_WORKER_QDRANT_TLS,
+//!   HUMAUX_PUBLIC_WORKER_TENANT_ID]; modules=[adapters::postgres, adapters::public_projection,
+//!   adapters::public_repo, domain::ids, infra-cell::permit, infra-cell::resource, infra-cell::transport]
+//! Called-by: [process(humaux-public-worker)]
+//! Invariants: [a worker that cannot reach PostgreSQL or Qdrant exits non-zero rather than silently skipping its lease]
+//! Spec: Baseline §4.2; §4.4; §31; ADR-0037
 //!
 //! Phase10 resident evolution is not enabled — this binary has no poll loop, so its whole
 //! lifetime is one bounded pass.
@@ -106,6 +116,7 @@ impl ShutdownLatch {
 ///    registry/permit/transport the projection path uses.
 async fn readyz() -> Result<(), String> {
     let dsn = required("HUMAUX_PUBLIC_WORKER_PG_DSN")?;
+    // dep: PostgreSQL(role_public_worker) — opens the role_public_worker pool for the projection loop
     PublicWorkerDbPool::connect(&dsn).await.map_err(|e| {
         format!("not ready — missing object: PostgreSQL as role_public_worker ({e})")
     })?;
@@ -113,6 +124,7 @@ async fn readyz() -> Result<(), String> {
     let status = transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — opens the public-visibility Qdrant client
             IntraCellRequest {
                 method: IntraCellMethod::Get,
                 path: "/".to_owned(),
@@ -210,6 +222,7 @@ async fn run() -> Result<(), String> {
     let projection = PublicProjectionAdapter::new(&transport, &permit, &collection)
         .map_err(|_| "invalid Qdrant collection configuration".to_owned())?;
     let dsn = required("HUMAUX_PUBLIC_WORKER_PG_DSN")?;
+    // dep: PostgreSQL(role_public_worker) — reconnects the pool after a lease-loop error
     let pool = PublicWorkerDbPool::connect(&dsn)
         .await
         .map_err(|_| "public worker database role connection failed".to_owned())?;

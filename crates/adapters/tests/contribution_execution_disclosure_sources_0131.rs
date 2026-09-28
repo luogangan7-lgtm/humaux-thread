@@ -1,4 +1,11 @@
-//! Live proof that each R4-A/B reservation atomically records its exact source disclosure.
+//! `adapters::tests::contribution_execution_disclosure_sources_0131` — Live proof that each R4-A/B reservation
+//!   atomically records its exact source disclosure.
+//! Depends-on: crates=[postgres, serde_json, uuid]; services=[PostgreSQL(any) r=[control.contribution_policies, control.private_reasoning_domains, ops.data_disclosure_sources, private.evidence_objects, private.memory_evidence, private.memory_records] w=[ops.jobs] x=[control.resolve_user_reasoning_admission, private.complete_contribution_a_exact, private.enqueue_contribution_execution]];
+//!   env=[]; modules=[adapters::tests::support::contribution_fixture]
+//! Called-by: [cargo-test]
+//! Invariants: [disclosure sources for a 0131 execution are exact and complete; the PG tests are #[ignore] lane tests
+//!   run by xtask serial-lane]
+//! Spec: none
 
 #[path = "support/contribution_fixture.rs"]
 mod contribution_fixture;

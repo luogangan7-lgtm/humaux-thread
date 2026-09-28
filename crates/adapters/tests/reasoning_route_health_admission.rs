@@ -1,4 +1,18 @@
-//! Focused PostgreSQL 18 gates for Phase 9 R3 exact Binding-only admission.
+//! `adapters::tests::reasoning_route_health_admission` — Focused PostgreSQL 18 gates for Phase 9 R3 exact
+//!   Binding-only admission.
+//! Depends-on: crates=[postgres, uuid]; services=[PostgreSQL(owner) w=[control.contribution_policies,
+//!   control.credentials, control.memberships, control.private_reasoning_domains, control.processor_models,
+//!   control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments,
+//!   control.provider_endpoints, control.reasoning_credential_bindings, control.reasoning_profiles,
+//!   control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_policies,
+//!   control.tenants, control.users, ops.data_disclosures, ops.model_call_ledger,
+//!   ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations,
+//!   staging.contribution_candidates] x=[control.resolve_user_reasoning_admission], PostgreSQL(role_private_worker)];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[]
+//! Called-by: [cargo-test]
+//! Invariants: [route health and admission are decided only by the SECURITY DEFINER resolver as role_private_worker;
+//!   unhealthy or unbound routes admit nothing; the tests are #[ignore] lane tests]
+//! Spec: none
 
 use postgres::{Client, GenericClient, NoTls};
 use uuid::Uuid;
@@ -321,6 +335,7 @@ fn end_case(db: &mut Client, name: &str) {
     reason = "matrix acceptance test enumerates the complete admission decision surface"
 )]
 fn reasoning_route_health_admission_matrix() {
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut db = Client::connect(&dsn(), NoTls).expect("PostgreSQL 18");
     let lane = seed_lane(&mut db, "matrix", true, true, true);
     set_tenant(&mut db, lane.tenant);
@@ -638,6 +653,7 @@ fn reasoning_route_health_admission_matrix() {
 )]
 fn reasoning_route_health_acl_append_only_and_null_shape() {
     let dsn = dsn();
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut owner = Client::connect(&dsn, NoTls).expect("PostgreSQL 18");
     let lane = seed_lane(&mut owner, "acl", false, true, true);
     set_tenant(&mut owner, lane.tenant);
@@ -736,8 +752,10 @@ fn reasoning_route_health_acl_append_only_and_null_shape() {
         "one captured wall clock"
     );
 
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut worker = Client::connect(&dsn, NoTls).expect("worker connection");
     worker
+        // dep: PostgreSQL(role_private_worker) — test switches PG role to exercise RLS
         .batch_execute("BEGIN; SET LOCAL ROLE role_private_worker")
         .expect("worker role");
     worker
@@ -792,14 +810,17 @@ fn reasoning_route_health_acl_append_only_and_null_shape() {
     reason = "ledger acceptance test verifies disclosure, candidate and atomicity invariants together"
 )]
 fn reasoning_attempt_ledger_disclosure_candidate_and_atomicity() {
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut db = Client::connect(&dsn(), NoTls).expect("PostgreSQL 18");
     let lane = seed_lane(&mut db, "ledger", true, true, true);
     let egress = lane.egress_processor.expect("provisioned recipient");
     set_tenant(&mut db, lane.tenant);
     insert_fresh_pair(&mut db, &lane);
 
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut worker = Client::connect(&dsn(), NoTls).expect("private worker connection");
     worker
+        // dep: PostgreSQL(role_private_worker) — test switches PG role to exercise RLS
         .batch_execute("BEGIN; SET LOCAL ROLE role_private_worker")
         .expect("private worker reserve transaction");
     worker
@@ -841,6 +862,7 @@ fn reasoning_attempt_ledger_disclosure_candidate_and_atomicity() {
 
     let request_id = Uuid::new_v4();
 
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut contender = Client::connect(&dsn(), NoTls).expect("idempotency contender");
     db.batch_execute("BEGIN").expect("hold request namespace");
     db.query_one(
@@ -1103,6 +1125,7 @@ fn reasoning_attempt_ledger_disclosure_candidate_and_atomicity() {
 #[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0130"]
 fn reasoning_route_health_statement_snapshot_advances_on_next_call() {
     let dsn = dsn();
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut first = Client::connect(&dsn, NoTls).expect("first connection");
     let lane = seed_lane(&mut first, "snapshot", false, true, true);
     set_tenant(&mut first, lane.tenant);
@@ -1116,6 +1139,7 @@ fn reasoning_route_health_statement_snapshot_advances_on_next_call() {
         "first statement sees fresh HEALTHY"
     );
 
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut second = Client::connect(&dsn, NoTls).expect("second connection");
     insert_provider(&mut second, &lane, "UNAVAILABLE", 0, 300);
     assert_eq!(

@@ -1,5 +1,15 @@
-//! T3.6+T3.7 integration test — §32.1 Scheduler Singleton/Failover Gate, G32-1/G80-38
-//! Scheduler Exactly-once Enqueue. **This file is G80-38's execution body**: §80.1 registers
+//! `adapters::tests::scheduler_exactly_once` — T3.6+T3.7 integration test — §32.1 Scheduler Singleton/Failover Gate,
+//!   G32-1/G80-38 Scheduler Exactly-once Enqueue.
+//! Depends-on: crates=[humaux-adapters, humaux-testkit, postgres, serde_json, sqlx, tokio];
+//!   services=[PostgreSQL(owner) r=[ops.ops_jobs_idempotency_key_key] w=[control.tenants, ops.jobs,
+//!   ops.scheduler_leases], PostgreSQL(role_gateway)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres,
+//!   adapters::scheduler, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [G80-38's execution body: concurrent replicas racing claim_and_enqueue produce exactly one job per due
+//!   tick, and a killed leader needs no special handling; an isolation setup failure is a fixture error]
+//! Spec: Baseline §32.1; §79.2; §80.1
+//!
+//! **This file is G80-38's execution body**: §80.1 registers
 //! G80-38 against `§32.1#G32-1` and the task brief is explicit that this test *is* that gate,
 //! not a second independent one.
 //!
@@ -89,6 +99,7 @@ impl DbIntegrationFixture for SchedulerFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -163,6 +174,7 @@ fn race_claim_and_enqueue(
                 scope.spawn(move || {
                     let rt = tokio::runtime::Runtime::new().expect("tokio runtime per thread");
                     rt.block_on(async {
+                        // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
                         let pool = RuntimeDbPool::connect(&dsn)
                             .await
                             .unwrap_or_else(|e| panic!("connect for {owner} must succeed: {e}"));
@@ -303,6 +315,7 @@ impl DbIntegrationFixture for FaultFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut client = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -374,6 +387,7 @@ fn g32_1_fault_injection_unique_constraint_is_the_final_arbiter() {
                         let dsn = dsn.clone();
                         let barrier = &barrier;
                         scope.spawn(move || {
+                            // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
                             let mut c = Client::connect(&dsn, NoTls).expect("racer connect");
                             barrier.wait();
                             try_insert(&mut c, key).map_err(|e| e.to_string())
@@ -407,6 +421,7 @@ fn g32_1_fault_injection_unique_constraint_is_the_final_arbiter() {
                 ))
                 .expect("drop constraint (fault injection) must succeed");
 
+            // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
             let mut post_fault = Client::connect(&dsn, NoTls).expect("post-fault connect");
             let err = try_insert(&mut post_fault, "dup-key-red").expect_err(
                 "ON CONFLICT (idempotency_key) must fail once no unique constraint matches it",

@@ -1,5 +1,11 @@
-//! G59-6 / Private Authority Boundary injected-fault matrix (§59.1 "### G59-6 / Private
-//! Authority Boundary", moved here from §10 per ADR-0001). The four cases A/B/C/D below must all
+//! `domain::tests::authority_policy_g59_6` — G59-6 / Private Authority Boundary injected-fault matrix (§59.1 "###
+//!   G59-6 / Private Authority Boundary", moved here from §10 per ADR-0001).
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[domain::authority, domain::evidence, domain::ids, domain::memory, domain::policy]
+//! Called-by: [cargo-test]
+//! Invariants: []
+//! Spec: Baseline §10; §10.1; §53.3; ADR-0001
+//!
+//! The four cases A/B/C/D below must all
 //! stay present together — dropping the positive controls (C, and D's outcome half) would let a
 //! blanket-reject implementation pass the malicious cases too (§53.3 规则 3).
 //!

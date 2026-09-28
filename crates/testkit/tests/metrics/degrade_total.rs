@@ -1,5 +1,10 @@
 // witness: family=degrade_total labels=code
-//! Metric Witness for `degrade_total{code}` (§80.2 W-side; registry row §41.2).
+//! `testkit::tests::metrics::degrade_total` — Metric Witness for `degrade_total{code}` (§80.2 W-side; registry row
+//!   §41.2).
+//! Depends-on: crates=[humaux-telemetry]; services=[]; env=[]; modules=[telemetry::degrade]
+//! Called-by: []
+//! Invariants: []
+//! Spec: Baseline §53.1
 //!
 //! Actively triggers the family's minimal positive path — one `abstain()` per
 //! `DegradeCode` variant — and asserts a real observed delta per label value.

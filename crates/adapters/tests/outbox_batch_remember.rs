@@ -1,5 +1,17 @@
-//! T3.1+T3.2 integration test — `batch::begin_batch` / `remember::remember` (§34/§34.1/§60/
-//! §60.1) against a real Postgres. Same convention as `jobs_claim.rs`/`email_outbox.rs`: runs
+//! `adapters::tests::outbox_batch_remember` — T3.1+T3.2 integration test — `batch::begin_batch` /
+//!   `remember::remember` (§34/§34.1/§60/ §60.1) against a real Postgres.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, sqlx, tokio];
+//!   services=[PostgreSQL(any) r=[ops.commit_seq_seq] w=[control.private_reasoning_domains, control.tenants,
+//!   ops.outbox, private.events, private.evidence_objects, private.ingest_tickets, projection.stream_checkpoints,
+//!   projection.stream_log], PostgreSQL(role_batch_issuer), PostgreSQL(role_gateway)]; env=[HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::batch, adapters::postgres, adapters::remember, domain::evidence, domain::subject,
+//!   humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [the two §60.1 fault injections stay two separate tests; rows are scoped to a throwaway tenant; no
+//!   DSN, unreachable DB or private.ingest_tickets missing is a visible SKIP]
+//! Spec: Baseline §34; §34.1; §60; §60.1; §79.2
+//!
+//! Same convention as `jobs_claim.rs`/`email_outbox.rs`: runs
 //! on the real canonical tables, scoped to a throwaway `control.tenants` row this file owns
 //! and cleans up on drop (repo `CLAUDE.md` hard rule ④ — never touches the shared schema
 //! itself).
@@ -84,6 +96,7 @@ impl DbIntegrationFixture for Fixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -122,6 +135,7 @@ impl DbIntegrationFixture for Fixture {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let batch_issuer = rt
+            // dep: PostgreSQL(role_batch_issuer) — open a role-scoped PG connection/pool for this test
             .block_on(BatchIssuerDbPool::connect(&dsn_as_role(
                 &dsn,
                 "role_batch_issuer",
@@ -129,6 +143,7 @@ impl DbIntegrationFixture for Fixture {
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let gateway_dsn = dsn_as_role(&dsn, "role_gateway");
         let gateway = rt
+            // dep: PostgreSQL(role_gateway) — open a role-scoped PG connection/pool for this test
             .block_on(RuntimeDbPool::connect(&gateway_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 
@@ -518,6 +533,7 @@ fn g23_1c_and_g23_1a_both_red_when_ticket_issuance_moves_into_remembers_transact
             // role/grants `remember()` would, without a backdoor into the crate-private
             // `.pool()` accessor.
             let raw_gateway = rt
+                // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
                 .block_on(sqlx::postgres::PgPoolOptions::new().connect(&handle.gateway_dsn))
                 .expect("connect raw role_gateway pool for the merged-transaction counterfactual");
             let mut batch_id: Option<Uuid> = None;
@@ -589,11 +605,13 @@ async fn merged_insert_and_redeem(input: MergedInsertAndRedeem<'_>) -> Uuid {
     let digest = payload_sha256(input.content.as_bytes()).to_hex();
     let payload = serde_json::json!({ "content": input.content });
 
+    // dep: PostgreSQL(any) — transaction entry for `merged_insert_and_redeem`
     let mut txn = input.pool.begin().await.expect("begin merged txn");
     sqlx::query(&format!(
         "SET LOCAL humaux.tenant_id = '{}'",
         input.tenant_id
     ))
+    // dep: PostgreSQL(any) — pool/txn query execution
     .execute(&mut *txn)
     .await
     .expect("set tenant context");
@@ -609,6 +627,7 @@ async fn merged_insert_and_redeem(input: MergedInsertAndRedeem<'_>) -> Uuid {
     .bind(input.tenant_id)
     .bind(&digest)
     .bind(input.reasoning_domain_id)
+    // dep: PostgreSQL(any) — pool/txn query execution
     .fetch_one(&mut *txn)
     .await
     .expect("insert evidence_objects");
@@ -617,6 +636,7 @@ async fn merged_insert_and_redeem(input: MergedInsertAndRedeem<'_>) -> Uuid {
     )
     .bind(evidence_id)
     .bind(&payload)
+    // dep: PostgreSQL(any) — pool/txn query execution
     .execute(&mut *txn)
     .await
     .expect("insert events");
@@ -627,6 +647,7 @@ async fn merged_insert_and_redeem(input: MergedInsertAndRedeem<'_>) -> Uuid {
     let batch_id: Uuid = match input.batch_id_so_far {
         Some(existing) => existing,
         None => sqlx::query_scalar("SELECT uuidv7()")
+            // dep: PostgreSQL(any) — pool/txn query execution
             .fetch_one(&mut *txn)
             .await
             .expect("mint batch id"),
@@ -643,6 +664,7 @@ async fn merged_insert_and_redeem(input: MergedInsertAndRedeem<'_>) -> Uuid {
     .bind(input.client_batch_id)
     .bind(input.ordinal)
     .bind(evidence_id)
+    // dep: PostgreSQL(any) — pool/txn query execution
     .execute(&mut *txn)
     .await
     .expect("insert-and-redeem ticket in the same transaction");

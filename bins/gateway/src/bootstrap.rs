@@ -1,9 +1,39 @@
-//! Process bootstrap: the process-wide stream family `(scope_kind, domain, projection_kind,
-//! projection_version)` that the read routes AND `remember.put` attach to each request's own
-//! `(tenant, workspace)` (ADR-0031 D-A / ADR-0032 D-A, §34.0.1 Q9: one process serves every
-//! pair; no registry table, no per-process stream cache), plus the default write pair
-//! (`REMEMBER_TENANT_ID` / `REMEMBER_WORKSPACE_ID`) a put without `workspace_id` lands on and
-//! the confirm-gated governance writers still compare against.
+//! `gateway::bootstrap` — Process bootstrap: the process-wide stream family `(scope_kind, domain, projection_kind,
+//!   projection_version)` that the read routes AND `remember.put` attach to each request's own `(tenant, workspace)`
+//!   (ADR-0031 D-A / ADR-0032 D-A, §34.0.1 Q9: one process serves every pair; no registry table, no per-process
+//!   stream cache), plus the default write pair (`REMEMBER_TENANT_ID` / `REMEMBER_WORKSPACE_ID`) a put without
+//!   `workspace_id` lands on and the confirm-gated governance writers still compare against.
+//! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-contracts, humaux-domain, humaux-infra-cell,
+//!   humaux-local-secret-scan, humaux-projection, humaux-protocol, tokio,
+//!   uuid]; services=[PostgreSQL(role_gateway)]; env=[HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS,
+//!   HUMAUX_GATEWAY_BIND_ADDR, HUMAUX_GATEWAY_CALLER_ID, HUMAUX_GATEWAY_CELL_ID,
+//!   HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS,
+//!   HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX, HUMAUX_GATEWAY_EMBEDDING_DIMENSION,
+//!   HUMAUX_GATEWAY_EMBEDDING_VERSION, HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GITLEAKS_BIN,
+//!   HUMAUX_GATEWAY_GITLEAKS_SHA256, HUMAUX_GATEWAY_GITLEAKS_VERSION, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
+//!   HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST, HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS,
+//!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES,
+//!   HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS, HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_QDRANT_CIDR,
+//!   HUMAUX_GATEWAY_QDRANT_HOST, HUMAUX_GATEWAY_QDRANT_PORT, HUMAUX_GATEWAY_QDRANT_TLS,
+//!   HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN, HUMAUX_GATEWAY_REMEMBER_EVENT_KIND,
+//!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION,
+//!   HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID, HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND,
+//!   HUMAUX_GATEWAY_REMEMBER_TENANT_ID, HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS, HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID,
+//!   HUMAUX_GATEWAY_REPLAY_TTL_SECONDS, HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_PRODUCTION_ENABLED, HUMAUX_GATEWAY_RETRIEVAL_PROFILE_QUERY_TRANSFORM,
+//!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K, HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS,
+//!   HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS, HUMAUX_GATEWAY_UNKNOWN, HUMAUX_TEST_GITLEAKS_BIN,
+//!   HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION]; modules=[adapters::postgres, adapters::quota_repo,
+//!   application::retrieval_embedding_port, contracts::config_registry, contracts::retrieval_config,
+//!   domain::context, domain::dataclass, domain::identity, domain::ids, gateway::context, gateway::guard,
+//!   gateway::mcp_application, gateway::recall, gateway::remember, gateway::retrieval_embedding_client,
+//!   humaux-local-secret-scan, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::stream,
+//!   protocol::edge, protocol::mcp, protocol::mcp_catalog]
+//! Called-by: [gateway::main]
+//! Invariants: [one process serves every (tenant, workspace) pair with no per-process stream cache or registry table; GuardSettings::tenant_network stays empty until a separate authorization approves a tenant-specific network policy]
+//! Spec: Baseline §34.0.1; §78.1; ADR-0031; ADR-0032
 //!
 //! This module owns process configuration only. Tool arguments never select a
 //! stream version, credential verifier, listener, or rate policy; a tool argument selects a
@@ -178,6 +208,7 @@ impl GatewayBootstrap {
     /// Guard/application/adapter chain. No caller can inject an alternate pool
     /// or a per-request write policy.
     pub async fn build(self) -> Result<GatewayRuntime, BootstrapError> {
+        // dep: PostgreSQL(role_gateway) — opens the role_gateway pool the rest of bootstrap wires into the app state
         let pool = RuntimeDbPool::connect(&self.pg_dsn)
             .await
             .map_err(|_| BootstrapError::new("HUMAUX_GATEWAY_PG_DSN", "connection rejected"))?;
@@ -1117,6 +1148,7 @@ mod tests {
             .expect("valid guard")
             .handler_timeout;
         let pool = Arc::new(
+            // dep: PostgreSQL(role_gateway) — opens a fresh pool for the drain/shutdown health check
             RuntimeDbPool::connect(
                 &std::env::var("HUMAUX_GATEWAY_PG_DSN")
                     .expect("semantic recall bootstrap test requires HUMAUX_GATEWAY_PG_DSN"),

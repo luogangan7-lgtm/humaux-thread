@@ -1,4 +1,9 @@
-//! `infra-network` — ADR-0003 / §83.4 Layer 0: the workspace's sole **protocol** choke point.
+//! `humaux-infra-network` — ADR-0003 / §83.4 Layer 0: the workspace's sole **protocol** choke point.
+//! Depends-on: crates=[reqwest]; services=[]; env=[]; modules=[]
+//! Called-by: [crate(humaux-infra-cell), crate(humaux-infra-egress)]
+//! Invariants: [the workspace's sole reqwest construction point (G80-3); protocol construction is separate from
+//!   egress permission, so same-Cell Qdrant never goes through the external-egress wrapper]
+//! Spec: Baseline §83.4; ADR-0003; §7.4
 //!
 //! §83.4 originally froze one raw-HTTP-transport choke point living inside
 //! `crates/infra-egress/src/http.rs` (T4.1, G80-3). Reviewing that decision against ADR-0003's

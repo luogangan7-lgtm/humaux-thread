@@ -1,4 +1,9 @@
 //! `humaux-adapters` — Humaux Thread workspace crate（布局见 §58）。
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [crate(humaux-admin), crate(humaux-consolidation-worker), crate(humaux-gateway), crate(humaux-private-worker), crate(humaux-public-worker), crate(humaux-retrieval-provider), crate(humaux-retrieval-worker), crate(xtask)]
+//! Invariants: [crate root only (module list); Domain/Application never import this crate's HTTP/SQL/Qdrant drivers
+//!   (§3/§78.3)]
+//! Spec: Baseline §3; §78.3
 //!
 //! 本 crate 的职责边界与依赖规则以 docs/architecture/Baseline_2.9.md 为唯一规范真源；
 //! Domain 永不 import HTTP / SQLx / Qdrant / Provider SDK / ENV（§3 / §78.3）。

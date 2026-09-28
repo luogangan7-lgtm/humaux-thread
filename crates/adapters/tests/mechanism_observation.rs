@@ -1,4 +1,20 @@
-//! §1.14 actual database reads, least-privilege admin and real reviewed-public execution.
+//! `adapters::tests::mechanism_observation` — §1.14 actual database reads, least-privilege admin and real
+//!   reviewed-public execution.
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-contracts, humaux-domain, humaux-infra-cell,
+//!   postgres, serde_json, tokio, uuid]; services=[PostgreSQL(role_admin), PostgreSQL(role_maintenance),
+//!   PostgreSQL(role_public_worker) r=[private.memory_records, public.claims, staging.contribution_releases]
+//!   w=[control.public_moderator_grants, ops.mechanism_e2e_runs, ops.mechanism_observations, public.provenance_edges,
+//!   public.source_closure, public.sources] x=[ops.audit_batch_insert], subprocess(humaux-admin)];
+//!   env=[HUMAUX_ADMIN_PG_DSN, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MECHANISM_ADMIN_BIN, HUMAUX_MECHANISM_FIXTURE,
+//!   HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_entry_repo, adapters::mechanism_observation,
+//!   adapters::postgres, adapters::public_repo, adapters::tests::support::contribution_fixture,
+//!   application::contribute, contracts::mechanism_registry, domain::public, infra-cell::permit,
+//!   infra-cell::resource]
+//! Called-by: [cargo-test]
+//! Invariants: [seeded observations exercise the verifier and the review test the writer (humaux-admin subprocess);
+//!   needs role_admin/role_maintenance DSNs, so the tests are #[ignore] lane tests]
+//! Spec: Baseline §1.14; §79.2
+//!
 //! Seeded observations test the verifier; the separate review test exercises the writer.
 
 #[path = "support/contribution_fixture.rs"]
@@ -30,6 +46,7 @@ fn db() -> Client {
         Ok("humaux_thread_stable_observations"),
         "this suite only writes the dedicated mechanism fixture"
     );
+    // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
     Client::connect(
         &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG DSN"),
         NoTls,
@@ -68,6 +85,7 @@ fn spec(ch: u32) -> MechanismSpec {
 }
 
 fn admin_pool(rt: &tokio::runtime::Runtime) -> AdminDbPool {
+    // dep: PostgreSQL(role_admin) — open a role-scoped PG connection/pool for this test
     rt.block_on(AdminDbPool::connect(
         &std::env::var("HUMAUX_ADMIN_PG_DSN").expect("real read-only credentials"),
     ))
@@ -109,6 +127,7 @@ fn assert_admin_cli_status(
     );
     let admin_dsn = std::env::var("HUMAUX_ADMIN_PG_DSN")
         .expect("real CLI test requires the existing role_admin DSN");
+    // dep: subprocess(humaux-admin) — spawn a child process for this fixture
     let output = Command::new(binary)
         .env_clear()
         .env("HUMAUX_ADMIN_PG_DSN", admin_dsn)
@@ -305,6 +324,7 @@ fn e2e_receipts_reject_cross_scope_and_preserve_immutable_measurements() {
 fn readonly_admin_is_not_a_writer_or_private_reader() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _fixture = db();
+    // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
     let mut admin = Client::connect(&std::env::var("HUMAUX_ADMIN_PG_DSN").unwrap(), NoTls)
         .expect("real admin login");
     let role = admin
@@ -318,6 +338,7 @@ fn readonly_admin_is_not_a_writer_or_private_reader() {
             &[],
         )
         .expect("allowed SELECT");
+    // dep: PostgreSQL(role_maintenance) — role switch before the scoped statements for `readonly_admin_is_not_a_writer_or_private_reader`
     for query in [
         "UPDATE ops.mechanism_observations SET value=value",
         "DELETE FROM ops.mechanism_e2e_runs",
@@ -337,6 +358,7 @@ fn readonly_admin_is_not_a_writer_or_private_reader() {
     );
     let rt = runtime();
     assert!(
+        // dep: PostgreSQL(role_admin) — open a role-scoped PG connection/pool for this test
         rt.block_on(AdminDbPool::connect(
             &std::env::var("HUMAUX_MAINTENANCE_PG_DSN").unwrap()
         ))
@@ -352,12 +374,14 @@ fn exercise_real_public_review_records_before_after_and_quarantine(verify_cli: b
     let super_dsn = std::env::var("HUMAUX_TEST_PG_DSN").unwrap();
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&format!(
             "{super_dsn}?options=-c%20role%3Drole_public_worker"
         )))
         .unwrap();
     let writer = fixture
         .rt
+        // dep: PostgreSQL(role_maintenance) — open a role-scoped PG connection/pool for this test
         .block_on(MaintenanceDbPool::connect(
             &std::env::var("HUMAUX_MAINTENANCE_PG_DSN").unwrap(),
         ))
@@ -516,11 +540,13 @@ fn recorder_rejects_other_cell_or_database_before_any_observation() {
     let target = target();
     let super_dsn = std::env::var("HUMAUX_TEST_PG_DSN").unwrap();
     let public = rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&format!(
             "{super_dsn}?options=-c%20role%3Drole_public_worker"
         )))
         .unwrap();
     let writer = rt
+        // dep: PostgreSQL(role_maintenance) — open a role-scoped PG connection/pool for this test
         .block_on(MaintenanceDbPool::connect(
             &std::env::var("HUMAUX_MAINTENANCE_PG_DSN").unwrap(),
         ))
@@ -543,6 +569,7 @@ fn recorder_rejects_other_cell_or_database_before_any_observation() {
     // identity is queried. No schema or data is written to it.
     let base = super_dsn.rsplit_once('/').expect("validated fixture URI").0;
     let wrong_database = rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&format!(
             "{base}/postgres?options=-c%20role%3Drole_public_worker"
         )))

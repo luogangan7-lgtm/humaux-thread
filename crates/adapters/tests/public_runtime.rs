@@ -1,4 +1,23 @@
-//! Phase 9 public-runtime real PostgreSQL tests.  Public admission is exercised only after the
+//! `adapters::tests::public_runtime` — Phase 9 public-runtime real PostgreSQL tests.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, postgres, sqlx, tokio, uuid];
+//!   services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage,
+//!   ops.outbox, public.anonymous_source_lifecycle_events, public.claim_independence_attestations,
+//!   public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.claims,
+//!   public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals,
+//!   public.provenance_edges, public.sources, staging.contribution_candidate_phase9_assessments] w=[ops.jobs,
+//!   ops.public_anonymous_dispatches, public.anonymous_claim_trust_receipts]
+//!   x=[ops.claim_global_anonymous_public_dispatches, ops.enqueue_public_projection_from_anonymous_dispatch,
+//!   public.evaluate_anonymous_claim, public.revoke_anonymous_dispatch], PostgreSQL(role_gateway),
+//!   PostgreSQL(role_public_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_entry_repo,
+//!   adapters::contribution_repo, adapters::postgres, adapters::public_repo,
+//!   adapters::tests::support::contribution_fixture, adapters::tests::support::public_anonymous_seam,
+//!   application::contribute, domain::error, domain::ids, domain::public]
+//! Called-by: [cargo-test]
+//! Invariants: [public admission is exercised only after the authenticated prepare -> confirm -> finalize entry flow;
+//!   forbidden or duplicate admissions are Forbidden/Conflict; the tests are #[ignore] lane tests]
+//! Spec: Baseline §12.6; §79.2
+//!
+//! Public admission is exercised only after the
 //! authenticated contribution prepare -> confirmation -> finalize entry flow.
 
 #[path = "support/contribution_fixture.rs"]
@@ -124,6 +143,7 @@ fn legacy_release_admission_is_fenced_from_protected_rows() {
     let mut fixture = ContributionFixture::new();
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -157,6 +177,7 @@ fn drain_release_outbox_enqueues_one_typed_public_job() {
     let mut fixture = ContributionFixture::new();
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -195,6 +216,7 @@ fn assessed_release_admits_once_into_anonymous_under_review_claim() {
     let mut fixture = ContributionFixture::new();
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -329,6 +351,7 @@ fn assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_c
     let mut fixture = ContributionFixture::new();
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -415,6 +438,7 @@ fn assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_c
     let mut spoof_scope = ContributionFixture::new();
     grant_moderator(&mut spoof_scope);
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG");
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut raw_private = Client::connect(&dsn_as_role(&dsn, "role_private_worker"), NoTls)
         .expect("raw private worker for scope-spoof fault");
     let mut spoof_transaction = raw_private.transaction().expect("scope-spoof transaction");
@@ -512,6 +536,7 @@ fn assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_c
         "role_gateway",
         "role_retrieval_worker",
     ] {
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut denied = Client::connect(&dsn_as_role(&dsn, role), NoTls)
             .unwrap_or_else(|error| panic!("{role} connection: {error}"));
         for relation in [
@@ -532,6 +557,7 @@ fn assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_c
 
     let gateway = fixture
         .rt
+        // dep: PostgreSQL(role_gateway) — open a role-scoped PG connection/pool for this test
         .block_on(RuntimeDbPool::connect(&dsn_as_role(&dsn, "role_gateway")))
         .expect("gateway pool");
     let body_sha256: [u8; 32] = initial_body_sha256
@@ -624,6 +650,7 @@ fn assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_c
     let raw_public = fixture
         .rt
         .block_on(
+            // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
             PgPoolOptions::new()
                 .max_connections(1)
                 .connect(&dsn_as_role(
@@ -729,6 +756,7 @@ fn public_coverage_change_after_assessed_prepare_conflicts_on_finalize() {
     let mut mutator = ContributionFixture::new();
     let public = mutator
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -782,6 +810,7 @@ fn assessed_revoke_before_admit_never_creates_anonymous_claim() {
     let mut fixture = ContributionFixture::new();
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -853,6 +882,7 @@ fn revoke_reaches_under_review_claim_via_source_closure_once() {
     let mut fixture = ContributionFixture::new();
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -918,6 +948,7 @@ fn assessed_revoke_reaches_anonymous_under_review_claim_once() {
     let mut fixture = ContributionFixture::new();
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -987,6 +1018,7 @@ fn assessed_revoke_reaches_anonymous_under_review_claim_once() {
     let raw_public = fixture
         .rt
         .block_on(
+            // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
             PgPoolOptions::new()
                 .max_connections(1)
                 .connect(&dsn_as_role(
@@ -1100,6 +1132,7 @@ fn current_eligible_projection_retires_only_older_receipts() {
     let mut fixture = ContributionFixture::new();
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -1152,6 +1185,7 @@ fn superseded_current_projection_is_retryable_then_replay_converges() {
     let mut fixture = ContributionFixture::new();
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",
@@ -1226,6 +1260,7 @@ fn lease_expiry_during_projection_fences_old_done_then_replays() {
     );
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn))
         .expect("public role pool");
     let admitted = admit_assessed_release(&mut fixture, &public, "public-runtime-lease-admission");
@@ -1252,6 +1287,7 @@ fn lease_expiry_during_projection_fences_old_done_then_replays() {
     let old = thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("old worker runtime");
         let pool = rt
+            // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
             .block_on(PublicWorkerDbPool::connect(&old_dsn))
             .expect("old public worker pool");
         rt.block_on(public_repo::run_once(

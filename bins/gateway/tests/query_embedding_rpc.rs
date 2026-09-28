@@ -1,7 +1,17 @@
-//! ADR-0012 query-embedding RPC boundary test — spawns the real
-//! `humaux-retrieval-worker` axum app (`humaux_retrieval_worker::rpc`) in-process on a
-//! temporary Unix domain socket and drives it through the real
-//! `humaux_gateway::retrieval_embedding_client::GatewayRetrievalEmbeddingClient`.
+//! `gateway::tests::query_embedding_rpc` — ADR-0012 query-embedding RPC boundary test — spawns the real
+//!   `humaux-retrieval-worker` axum app (`humaux_retrieval_worker::rpc`) in-process on a temporary Unix domain socket
+//!   and drives it through the real `humaux_gateway::retrieval_embedding_client::GatewayRetrievalEmbeddingClient`.
+//! Depends-on: crates=[async-trait, axum, humaux-adapters, humaux-application, humaux-domain, humaux-infra-cell,
+//!   humaux-local-secret-scan, humaux-retrieval-provider, humaux-retrieval-worker, serde_json, sha2, tokio, uuid];
+//!   services=[PostgreSQL(role_gateway), PostgreSQL(role_retrieval_worker), UDS(retrieval-worker), UDS(serve)];
+//!   env=[HUMAUX_GATEWAY_PG_DSN, HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN,
+//!   HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION]; modules=[adapters::postgres,
+//!   adapters::retrieval_embedding_rpc, application::retrieval_embedding_port, domain::error, domain::identity,
+//!   domain::ids, gateway::retrieval_embedding_client, humaux-local-secret-scan, infra-cell::permit,
+//!   infra-cell::resource, retrieval-provider::adapters, retrieval-provider::contract, retrieval-worker::rpc]
+//! Called-by: [cargo-test]
+//! Invariants: [each test dials its own retrieval-worker UDS fixture and PostgreSQL pool; a fixture failure fails the test, it is never skipped silently]
+//! Spec: Baseline §2; ADR-0012
 //!
 //! A separate-binary (two real OS processes) test is a later card; this proves the wire
 //! protocol, the peer-credential authentication ordering, and the DB-backed idempotency
@@ -56,7 +66,9 @@ fn temp_socket_path(tag: &str) -> std::path::PathBuf {
 /// credential — no `libc`/`nix` dependency needed just for one integer.
 async fn own_uid() -> u32 {
     let path = temp_socket_path("probe");
+    // dep: UDS(serve) — test binds a probe socket to read the peer uid
     let listener = UnixListener::bind(&path).expect("bind uid probe socket");
+    // dep: UDS(retrieval-worker) — test dials the probe socket as the retrieval-worker client would
     let client = UnixStream::connect(&path).await.expect("connect uid probe");
     let (server_side, _) = listener.accept().await.expect("accept uid probe");
     let uid = server_side.peer_cred().expect("peer credential").uid();
@@ -137,6 +149,7 @@ impl EmbeddingProvider for CountingEmbedder {
 
 async fn spawn_worker(expected_gateway_uid: u32, embedder: Arc<dyn EmbeddingProvider>) -> String {
     let socket_path = temp_socket_path("worker");
+    // dep: PostgreSQL(role_retrieval_worker) — test fixture pool for the query-embedding RPC suite
     let calls = RetrievalWorkerDbPool::connect(&required("HUMAUX_RETRIEVAL_WORKER_PG_DSN"))
         .await
         .expect("retrieval worker db pool");
@@ -148,6 +161,7 @@ async fn spawn_worker(expected_gateway_uid: u32, embedder: Arc<dyn EmbeddingProv
         dimension: 4,
         provider_id: "test-provider".to_owned(),
     });
+    // dep: UDS(serve) — test serves the real retrieval-worker RPC router on a temp socket
     let listener = UnixListener::bind(&socket_path).expect("bind worker rpc socket");
     let app = router(state);
     tokio::spawn(async move {
@@ -207,6 +221,7 @@ fn profile_fingerprint() -> String {
 
 async fn runtime_pool() -> Arc<RuntimeDbPool> {
     Arc::new(
+        // dep: PostgreSQL(role_gateway) — test fixture pool for the query-embedding RPC suite
         RuntimeDbPool::connect(&required("HUMAUX_GATEWAY_PG_DSN"))
             .await
             .expect("runtime db pool"),
@@ -308,6 +323,7 @@ async fn raw_rpc_call(
     tenant_hint: Uuid,
     query: &str,
 ) -> serde_json::Value {
+    // dep: UDS(retrieval-worker) — test dials the fake retrieval-worker UDS listener
     let mut stream = UnixStream::connect(socket_path)
         .await
         .expect("connect worker socket");
@@ -441,6 +457,7 @@ async fn completed_replay_with_mismatched_query_is_rejected_not_served_stale() {
     // COMPLETED, not fall into the replay branch and serve the original query's vector back
     // under this different query.
     let mismatched_query = "a completely different query, same call_id";
+    // dep: UDS(retrieval-worker) — test dials the fake retrieval-worker UDS listener
     let mut stream = UnixStream::connect(&socket_path)
         .await
         .expect("connect worker socket");

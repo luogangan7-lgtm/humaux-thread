@@ -1,4 +1,15 @@
-//! Real PostgreSQL + same-cell Qdrant acceptance for the Phase 9 bounded public worker.
+//! `adapters::tests::public_runtime_qdrant` — Real PostgreSQL + same-cell Qdrant acceptance for the Phase 9 bounded
+//!   public worker.
+//! Depends-on: crates=[humaux-adapters, humaux-infra-cell, serde_json, uuid];
+//!   services=[PostgreSQL(role_public_worker) r=[control.anonymous_source_lineage, public.claims], Qdrant(*)];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_repo, adapters::postgres, adapters::public_projection,
+//!   adapters::public_repo, adapters::tests::support::contribution_fixture,
+//!   adapters::tests::support::public_anonymous_seam, adapters::tests::support::public_qdrant_fixture,
+//!   infra-cell::transport]
+//! Called-by: [cargo-test]
+//! Invariants: [public runtime projection is checked end to end on role_public_worker plus a real Qdrant; the tests
+//!   are #[ignore] lane tests]
+//! Spec: Baseline §12.6; §17; §79.2
 
 #[path = "support/contribution_fixture.rs"]
 mod contribution_fixture;
@@ -50,6 +61,7 @@ fn projection_live(
         .rt
         .block_on(qdrant.transport.execute(
             &qdrant.permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
             IntraCellRequest {
                 method: IntraCellMethod::Get,
                 path: format!("/collections/{}/points/{point}", qdrant.collection),
@@ -88,6 +100,7 @@ fn supported_projection_revoke_fences_hydrate_and_tombstones_old_live() {
     let mut fixture = ContributionFixture::new();
     let public = fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
             "role_public_worker",

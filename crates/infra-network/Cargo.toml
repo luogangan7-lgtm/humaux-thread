@@ -1,6 +1,7 @@
 [package]
 name = "humaux-infra-network"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -20,10 +21,12 @@ workspace = true
 # capability wrapper needs the type, not just the construction call.
 # `json` feature: both Layer 1A (§7.3 JSON payload bodies where applicable) and Layer 1B
 # (`humaux-infra-cell`, Qdrant's REST API, §17) need `RequestBuilder::json`/`Response::json`.
+# why: reqwest dependency; used-by: [humaux-infra-network, infra-network::http, tests]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 # §83.4 判据3 regression (`redirect_is_never_followed_to_a_second_host`): "net"/"io-util" back
 # the test's real `TcpListener` fixtures, "rt-multi-thread"/"macros" back `#[tokio::test]`,
 # "time" backs the settle-then-assert sleep.
+# why: tokio dependency; used-by: [infra-network::http, tests]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

@@ -1,6 +1,12 @@
-//! Integration coverage for `domain::temporal` (§9): `rank_time` reads only `occurred_at`,
-//! and the three audit-only fields (`observed_at`/`created_at`/`updated_at`) never move a
-//! row's rank no matter how far apart they are. Lives under `tests/` (not `#[cfg(test)]`
+//! `domain::tests::temporal_semantics` — Integration coverage for `domain::temporal` (§9): `rank_time` reads only
+//!   `occurred_at`, and the three audit-only fields (`observed_at`/`created_at`/`updated_at`) never move a row's rank
+//!   no matter how far apart they are.
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[domain::temporal]
+//! Called-by: [cargo-test]
+//! Invariants: []
+//! Spec: Baseline §9
+//!
+//! Lives under `tests/` (not `#[cfg(test)]`
 //! inside `src/temporal.rs`) so it also exercises the module's public surface exactly the way
 //! an outside crate would — the same compilation boundary the `pub(crate)` fields are meant
 //! to hold against (see the `compile_fail` doctest in `src/temporal.rs` for the negative case).

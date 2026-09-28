@@ -1,4 +1,9 @@
 //! `adapters::batch` — T3.1 `begin_batch` (§15.6.1 / §34.2 / §60 transaction A).
+//! Depends-on: crates=[sqlx]; services=[PostgreSQL(any) w=[private.ingest_tickets]]; env=[]; modules=[adapters::postgres]
+//! Called-by: [tests]
+//! Invariants: [the only writer of private.ingest_tickets batch rows, on BatchIssuerDbPool (role_batch_issuer) only,
+//!   never the gateway pool; declared_count is taken as given (§15.6.1); a PG error aborts the batch transaction]
+//! Spec: Baseline §34.2; §60.1; §15.6.1; §15.6; §15.2
 //!
 //! **This is the only writer of `private.ingest_tickets.batch_id`/`ordinal`/`redeemed_event_id
 //! = NULL` rows in the workspace.** [`begin_batch`] runs against [`BatchIssuerDbPool`]
@@ -103,6 +108,7 @@ pub async fn begin_batch(
     pool: &BatchIssuerDbPool,
     cmd: BeginBatchCommand,
 ) -> Result<BatchIssued, BatchError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
 
     // §62: forced RLS on private.ingest_tickets keys off humaux.tenant_id. `role_batch_issuer`

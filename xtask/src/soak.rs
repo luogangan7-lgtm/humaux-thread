@@ -1,3 +1,13 @@
+//! `xtask::soak` — endurance + crash-recovery harness driving continuous load against the four-process deployment.
+//! Depends-on: crates=[humaux-domain, humaux-projection, postgres, serde_json, tokio, uuid];
+//!   services=[PostgreSQL(role_maintenance) r=[ops.jobs, ops.outbox, projection.private_memory_points,
+//!   projection.processing_gaps, projection.stream_checkpoints, projection.stream_log], Qdrant(*), subprocess(ps),
+//!   subprocess(sh), HTTP(gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_SOAK_TEST_BEARER];
+//!   modules=[domain::ids, projection::serving, xtask::switch_visible]
+//! Called-by: [xtask::main]
+//! Invariants: [continuous concurrent load against the real four-process deployment while a chaos hook kills/restarts a worker; every read is asserted live against the database]
+//! Spec: Baseline §15.1; §15.3; §15.5; §31; §61; §6.1; ADR-0037; ADR-0050
+//!
 //! `cargo xtask soak` — the endurance + crash-recovery harness (card 16).
 //!
 //! Every correctness claim before this card rests on single-shot tests. This subcommand drives
@@ -361,7 +371,7 @@ pub fn mcp_request(host_port: &str, path: &str, origin: &str, tool: &str, args: 
 fn call(cfg: &Config, lane: &TenantLane, tool: &str, args: &str) -> Result<(u16, String), String> {
     let wire = mcp_request(&cfg.host_port, &cfg.path, &cfg.origin, tool, args)
         .replace("{BEARER}", &lane.bearer);
-    // dep: humaux-gateway MCP HTTP (cfg.host_port) — one soak op on a fresh loopback socket.
+    // dep: HTTP(gateway) — cfg.host_port, one soak op on a fresh loopback socket.
     let mut sock = TcpStream::connect(&cfg.host_port).map_err(|e| format!("connect: {e}"))?;
     sock.set_read_timeout(Some(Duration::from_secs(120)))
         .and_then(|()| sock.set_write_timeout(Some(Duration::from_secs(30))))
@@ -1354,7 +1364,9 @@ pub enum Presence {
 }
 
 /// A watched process is present only when its pidfile names a pid that `ps` lists with a
-/// `humaux-` command (a reused pid running something else is absent).
+/// command whose executable **basename** starts with `humaux-` (a reused pid running something
+/// else is absent). Basename, not substring: macOS `ps -o comm=` prints the full path, and any
+/// binary built under `…/humaux-target-boot/…` would otherwise count as alive (ADR-0051 D-L).
 pub fn classify_presence(
     pidfile_pid: Option<u32>,
     table: &BTreeMap<u32, (u64, String)>,
@@ -1364,7 +1376,11 @@ pub fn classify_presence(
 ) -> Presence {
     let alive = pidfile_pid
         .and_then(|pid| table.get(&pid))
-        .is_some_and(|(_, comm)| comm.contains("humaux-"));
+        .is_some_and(|(_, comm)| {
+            std::path::Path::new(comm)
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("humaux-"))
+        });
     if alive {
         return Presence::Present;
     }
@@ -1382,7 +1398,7 @@ pub fn classify_presence(
 
 /// One `ps` run → `ps_ok`, `rss_mib`, and a presence verdict per watched pidfile.
 fn observe_processes(cfg: &Config, chaos_starts: &Mutex<Vec<Instant>>, obs: &mut Observation) {
-    // dep: ps — the portable way to read other processes' liveness and RSS without taking PIDs.
+    // dep: subprocess(ps) — the portable way to read other processes' liveness and RSS without taking PIDs.
     let table = std::process::Command::new("ps")
         .args(["-axo", "pid=,rss=,comm="])
         .output()
@@ -1425,7 +1441,7 @@ fn observe_processes(cfg: &Config, chaos_starts: &Mutex<Vec<Instant>>, obs: &mut
 }
 
 fn run_shell(cmd: &str) -> bool {
-    // dep: sh — runs the operator-supplied chaos command.
+    // dep: subprocess(sh) — runs the operator-supplied chaos command.
     std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -1859,7 +1875,7 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    // dep: Postgres (role_maintenance, HUMAUX_MAINTENANCE_PG_DSN) — end-of-soak ledger reads.
+    // dep: PostgreSQL(role_maintenance) — HUMAUX_MAINTENANCE_PG_DSN — end-of-soak ledger reads.
     let mut db = match Client::connect(&dsn, NoTls) {
         Ok(c) => c,
         Err(e) => {
@@ -2000,7 +2016,7 @@ fn finish(
     // One Qdrant face and one runtime for every lane's §23.1② counts — see
     // [`promote_rejections`]. Built here (after the load has stopped) so nothing in the timed
     // window pays for it.
-    // dep: Qdrant (cfg.qdrant_host:port) — §23.1② visible-face counts after the load stops.
+    // dep: Qdrant(*) — cfg.qdrant_host:port, §23.1② visible-face counts after the load stops.
     let face = VisibleFace::connect(&cfg.qdrant_host, cfg.qdrant_port)?;
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("soak: runtime: {e}"))?;
     for (idx, lane) in cfg.tenants.iter().enumerate() {
@@ -2032,6 +2048,69 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Card 26 (folded card-25 debt): the rehearsal's soak invocation must satisfy the real
+    /// parser — every required flag (`--watch-pidfile`, `--chaos-grace-secs`,
+    /// `--max-op-failure-rate`) — or card 27's rehearsal dies at argument parsing. The shell
+    /// words are taken from `docs/ops/rehearse.sh` itself (TW `rehearse_v2.sh` differs from it
+    /// only on the work-dir line); `${X:-d}` becomes `d`, ids become uuids, and the bearer
+    /// variable becomes `PATH` (always set) so no test touches the environment.
+    #[test]
+    fn rehearse_script_soak_invocation_parses() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/ops/rehearse.sh"),
+        )
+        .expect("docs/ops/rehearse.sh");
+        let start = script
+            .find("cargo run -q -p xtask -- soak")
+            .expect("soak invocation");
+        let end = start + script[start..].find(" 2>&1").expect("end of invocation");
+        let mut text = script[start..end].replace("\\\n", " ");
+        while let Some(i) = text.find("${") {
+            let close = i + text[i..].find('}').expect("closing brace");
+            let inner = &text[i + 2..close];
+            let default = inner.split_once(":-").map_or("", |(_, d)| d).to_string();
+            text.replace_range(i..=close, &default);
+        }
+        let uuid = |n: u8| format!("00000000-0000-0000-0000-0000000000{n:02}");
+        for (var, val) in [
+            ("$TENANT_B", uuid(3)),
+            ("$TENANT", uuid(1)),
+            ("$WS_B", uuid(4)),
+            ("$WS", uuid(2)),
+            ("$SOAK_SECS", "600".to_string()),
+            ("$S", "/tmp/s".to_string()),
+            ("$EV", "/tmp/ev".to_string()),
+            ("BEARER_A", "PATH".to_string()),
+            ("BEARER_B", "PATH".to_string()),
+        ] {
+            text = text.replace(var, &val);
+        }
+        let mut words = Vec::new();
+        let mut cur = String::new();
+        let mut quoted = false;
+        for ch in text.chars() {
+            match ch {
+                '"' => quoted = !quoted,
+                c if c.is_whitespace() && !quoted => {
+                    if !cur.is_empty() {
+                        words.push(std::mem::take(&mut cur));
+                    }
+                }
+                c => cur.push(c),
+            }
+        }
+        words.push(cur);
+        let args: Vec<String> = words
+            .into_iter()
+            .skip_while(|w| w != "soak")
+            .skip(1)
+            .collect();
+        let cfg = parse_config(&args).unwrap_or_else(|e| panic!("{e}\nargs: {args:?}"));
+        let names: Vec<&str> = cfg.watch_pidfiles.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["gw", "rw", "pw", "ds", "cw"]);
+        assert!(cfg.chaos_grace.is_some() && cfg.max_op_failure_rate > 0.0);
+    }
 
     /// `applied` and `projected` move together in the healthy fixture; the tests that care
     /// about the split set them apart explicitly through [`obs_split`].
@@ -2722,6 +2801,27 @@ mod tests {
             classify_presence(Some(101), &table, Instant::now(), &[], None),
             Presence::UnexpectedAbsent
         );
+    }
+
+    #[test]
+    fn presence_matches_executable_basename_not_path() {
+        let table = ps_table(&[
+            (101, 2048, "/Users/x/humaux-target-boot/debug/deps/foo-1a2b"),
+            (
+                102,
+                2048,
+                "/Users/x/humaux-target-boot/debug/humaux-gateway",
+            ),
+            (103, 2048, "humaux-retrieva"),
+        ]);
+        let at = |pid| classify_presence(Some(pid), &table, Instant::now(), &[], None);
+        assert_eq!(
+            at(101),
+            Presence::UnexpectedAbsent,
+            "path contains humaux-, basename does not"
+        );
+        assert_eq!(at(102), Presence::Present);
+        assert_eq!(at(103), Presence::Present, "Linux 15-char comm");
     }
 
     fn sample(op: &str, ok: bool) -> Sample {

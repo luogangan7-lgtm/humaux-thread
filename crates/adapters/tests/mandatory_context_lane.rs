@@ -1,4 +1,15 @@
-//! §25.4/§25.5 Mandatory Context Lane 的 DB 判据（DOD-020，phase=7 欠账）。
+//! `adapters::tests::mandatory_context_lane` — §25.4/§25.5 Mandatory Context Lane 的 DB 判据（DOD-020，phase=7 欠账）。
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, sqlx, tokio, uuid];
+//!   services=[PostgreSQL(any) w=[control.memberships, control.private_reasoning_domains, control.tenants,
+//!   control.users, control.workspace_memberships, control.workspaces, private.context_bindings, private.events,
+//!   private.evidence_objects, private.memory_evidence, private.memory_records], PostgreSQL(owner),
+//!   PostgreSQL(role_gateway)]; env=[HUMAUX_GATEWAY_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[adapters::context_repo,
+//!   adapters::postgres, domain::context, domain::error, domain::identity, domain::ids, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [probe must report exactly the missing columns in both directions; selectors are mechanical rules,
+//!   never similarity; unauthorized pins are Forbidden; skip_or_fail turns a missing DB into a failure under
+//!   HUMAUX_REQUIRE_DB]
+//! Spec: Baseline §25.4; §25.5; ADR-0006; §79.2; ADR-0005; ADR-0047; ADR-0050
 //!
 //! 本文件打三件事：
 //! 1. **probe 的缺失对象是探测出来的，而且两个方向都打**——`REGISTRY` 自己声明的依赖逐条
@@ -82,7 +93,8 @@ fn gateway_dsn() -> Option<String> {
         );
         return None;
     }
-    // dep: Postgres (role_gateway, HUMAUX_GATEWAY_PG_DSN) — identity probe: LOGIN, non-superuser, non-bypassrls.
+    // dep: PostgreSQL(role_gateway) — HUMAUX_GATEWAY_PG_DSN: identity probe: LOGIN, non-superuser, non-bypassrls.
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `gateway_dsn`
     let Ok(mut gateway) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(
             NAME,
@@ -187,7 +199,8 @@ fn setup() -> Option<(Fixture, String)> {
         );
         return None;
     }
-    // dep: Postgres (owner, HUMAUX_TEST_PG_DSN) — seeds/cleans the fixture and holds the facet-shadow advisory lock.
+    // dep: PostgreSQL(owner) — HUMAUX_TEST_PG_DSN: seeds/cleans the fixture and holds the facet-shadow advisory lock.
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `setup`
     let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;
@@ -295,6 +308,7 @@ fn seed_memory(f: &mut Fixture, authority: &str, grounding_mode: &str) -> Uuid {
         )
         .expect("insert memory")
         .get(0);
+    // dep: PostgreSQL(any) — pool/txn query execution
     txn.execute(
         "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, grounding_mode) \
          VALUES ($1, $2, 'PRIMARY', $3)",
@@ -436,6 +450,7 @@ fn seed_memory_with_visibility(
         )
         .expect("insert memory")
         .get(0);
+    // dep: PostgreSQL(any) — pool/txn query execution
     txn.execute(
         "INSERT INTO private.memory_evidence(memory_id, evidence_id, role, grounding_mode) \
          VALUES ($1, $2, 'PRIMARY', 'SNAPSHOT')",
@@ -483,7 +498,8 @@ impl FacetShadow {
     /// `dsn` 必须是 [`setup`] 已经校验过的 owner 夹具 DSN——这里做 DDL，认错库就是改生产。
     /// 调用方必须持有一个活着的 [`Fixture`]（它的会话拿着 [`FACET_SHADOW_ADVISORY_LOCK`]）。
     fn arm(dsn: &str) -> Self {
-        // dep: Postgres (owner) — DDL on private.memory_records needs the table owner.
+        // dep: PostgreSQL(owner) — DDL on private.memory_records needs the table owner.
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `arm`
         let mut admin = Client::connect(dsn, NoTls).expect("owner login for the facet shadow");
         admin
             .batch_execute(
@@ -565,7 +581,8 @@ fn probe_reports_the_columns_that_are_actually_missing() {
     assert!(!truth.is_empty(), "REGISTRY declares no dependency at all");
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
-    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `probe_reports_the_columns_that_are_actually_missing`
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");
@@ -615,7 +632,8 @@ fn an_unsatisfiable_requirement_is_reported_missing() {
     const FACET: &str = "private.memory_records.facet";
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
-    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `an_unsatisfiable_requirement_is_reported_missing`
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");
@@ -679,7 +697,8 @@ fn project_constraints_are_selected_by_authority_not_similarity() {
     let _note = seed_memory(&mut f, "PrivateKnowledge", "SNAPSHOT");
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
-    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `project_constraints_are_selected_by_authority_not_similarity`
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");
@@ -725,7 +744,8 @@ fn a_live_unversioned_constraint_is_diverted_and_named_not_consumed() {
     let admitted = seed_memory(&mut f, "ProjectConstraint", "SNAPSHOT");
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
-    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `a_live_unversioned_constraint_is_diverted_and_named_not_consumed`
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");
@@ -793,7 +813,8 @@ fn revoking_a_binding_removes_it_from_the_lane() {
         .collect();
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
-    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `revoking_a_binding_removes_it_from_the_lane`
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");
@@ -1028,7 +1049,8 @@ fn context_lanes_filter_visibility_lifecycle_and_binding_scope() {
         Some(cases.allowed_workspace),
     );
     let rt = tokio::runtime::Runtime::new().expect("rt");
-    // dep: Postgres (role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
+    // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `context_lanes_filter_visibility_lifecycle_and_binding_scope`
     let pool = rt
         .block_on(RuntimeDbPool::connect(&dsn))
         .expect("gateway pool");

@@ -1,5 +1,15 @@
-//! T-card integration test for `migrations/0100_memory_evidence_grounding.sql` — §8.8's two
-//! per-edge columns on `private.memory_evidence`, against a real Postgres.
+//! `adapters::tests::memory_evidence_grounding` — T-card integration test for
+//!   `migrations/0100_memory_evidence_grounding.sql` — §8.8's two per-edge columns on `private.memory_evidence`,
+//!   against a real Postgres.
+//! Depends-on: crates=[humaux-domain, humaux-testkit, postgres, uuid]; services=[PostgreSQL(owner)
+//!   w=[control.private_reasoning_domains, control.tenants, private.events, private.evidence_objects,
+//!   private.memory_evidence, private.memory_records]]; env=[HUMAUX_TEST_PG_DSN]; modules=[domain::grounding,
+//!   humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [a default-written memory_evidence edge reads back LIVE with no version and derives RECHECK_REQUIRED,
+//!   never CURRENT; the DB CHECK literals equal the Rust closed set (§78.2); an isolation setup failure is a fixture
+//!   error]
+//! Spec: Baseline §8.8; §78.2; §79.2
 //!
 //! Three things only a live DB can settle, none of which `domain::grounding`'s own
 //! `#[cfg(test)]` fixtures A–H can see (they compare compiled Rust against compiled Rust):
@@ -90,6 +100,7 @@ impl DbIntegrationFixture for MemoryEvidenceGroundingFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — opens the admin fixture connection on HUMAUX_TEST_PG_DSN
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 

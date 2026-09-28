@@ -1,4 +1,17 @@
-//! Real-PostgreSQL acceptance for migration 0126's exact assessed storage chain.
+//! `adapters::tests::phase9_exact_assessed_storage_binding` — Real-PostgreSQL acceptance for migration 0126's exact
+//!   assessed storage chain.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, postgres, sha2, uuid];
+//!   services=[PostgreSQL(role_private_worker) r=[ops.commit_seq_seq] w=[control.anonymous_source_lineage,
+//!   ops.outbox, ops.public_anonymous_dispatches, staging.contribution_candidate_phase9_assessments,
+//!   staging.contribution_candidates, staging.contribution_releases, staging.sanitized_public_candidates]
+//!   x=[public.phase9_public_coverage_for_probe, staging.assert_phase9_exact_assessed_release]]; env=[];
+//!   modules=[adapters::contribution_entry_repo, adapters::tests::support::contribution_fixture,
+//!   application::consolidate, application::contribute, domain::error, domain::evidence]
+//! Called-by: [cargo-test]
+//! Invariants: [omissions, mismatches and rebinding of the assessed storage chain are rejected; R3 authenticates a
+//!   field-identical chain separately; the tests are #[ignore] lane tests]
+//! Spec: Baseline §12; §79.2
+//!
 //! It rejects omissions, mismatches and rebinding; R3 separately authenticates a field-identical
 //! chain against the frozen reasoning route and ModelCallLedger receipt.
 
@@ -224,6 +237,7 @@ fn every_cross_row_mismatch_is_rejected() {
             ],
         )
         .expect("private tenant and user scope");
+    // dep: PostgreSQL(role_private_worker) — role switch before the scoped statements for `every_cross_row_mismatch_is_rejected`
     transaction
         .batch_execute("SET LOCAL ROLE role_private_worker")
         .expect("private worker hand-assembly role");

@@ -1,4 +1,14 @@
 //! `infra-egress::http` — ADR-0003 / §83.4 Layer 1A: external-egress HTTP transport.
+//! Depends-on: crates=[async-trait, humaux-contracts, humaux-domain, humaux-infra-network, tokio, uuid, zeroize];
+//!   services=[HTTP(loopback), HTTP(provider)];
+//!   env=[HUMAUX_TEST_INFRA_EGRESS_ENV_CREDENTIAL_SOURCE_FAILS_CLOSED_WHEN_UNSET,
+//!   HUMAUX_TEST_INFRA_EGRESS_ENV_CREDENTIAL_SOURCE_READS_A_SET_VARIABLE]; modules=[contracts::config_registry,
+//!   domain::egress, domain::error, humaux-infra-network, infra-egress::resolver, infra-network::http]
+//! Called-by: [retrieval-provider::adapters]
+//! Invariants: [the only holder of a reqwest client for external destinations (built via infra-network, never
+//!   Client::new here); non-HTTPS endpoints are refused; provider HTTP statuses map to typed ErrorCodes (401
+//!   Unauthorized, 429 RateLimited, 5xx Transient)]
+//! Spec: Baseline §7.4; ADR-0003; §19; §7.3; §73.5
 //!
 //! Raw `reqwest::Client` construction lives one layer down, in `humaux-infra-network` (the
 //! sole workspace-wide **protocol** choke point, `xtask architecture-check`'s G80-3 判据1) —
@@ -382,6 +392,7 @@ impl ExternalCall for HttpExternalCall {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::AUTHORIZATION, auth_value)
             .body(payload.bytes().to_vec())
+            // dep: HTTP(provider) — outbound http call
             .send()
             .await
             .map_err(|e| {
@@ -489,6 +500,7 @@ mod tests {
         let swapped = AuthorizedEgressPayload::new(b"a different payload entirely".to_vec());
 
         let call = call_at(addr, processor);
+        // dep: HTTP(loopback) — outbound http call
         let result = call.call(&permit, &swapped).await;
         assert_eq!(result, Err(ErrorCode::Forbidden));
 
@@ -520,6 +532,7 @@ mod tests {
         .unwrap();
 
         let call = call_at(addr, processor);
+        // dep: HTTP(loopback) — outbound http call
         let call_task = tokio::spawn(async move { call.call(&permit, &payload).await });
 
         let (socket, _) = tokio::time::timeout(StdDuration::from_secs(2), listener.accept())
@@ -553,6 +566,7 @@ mod tests {
         tokio::time::sleep(StdDuration::from_millis(5)).await;
 
         let call = call_at("127.0.0.1:1".parse().unwrap(), processor);
+        // dep: HTTP(loopback) — outbound http call
         let result = call.call(&permit, &payload).await;
         assert_eq!(result, Err(ErrorCode::Forbidden));
     }
@@ -577,6 +591,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let call = call_at(addr, wired_to);
+        // dep: HTTP(loopback) — outbound http call
         let result = call.call(&permit, &payload).await;
         assert_eq!(result, Err(ErrorCode::Forbidden));
 
@@ -608,6 +623,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let call = call_at(addr, processor);
+        // dep: HTTP(loopback) — outbound http call
         let result = call.call(&permit, &payload).await;
         assert_eq!(result, Err(ErrorCode::Forbidden));
 
@@ -684,6 +700,7 @@ mod tests {
             )
             .unwrap();
             let call = call_at(addr, processor);
+            // dep: HTTP(loopback) — outbound http call
             let result = call.call(&permit, &payload).await;
             server.abort();
             result
@@ -741,6 +758,7 @@ mod tests {
         )
         .unwrap();
 
+        // dep: HTTP(loopback) — outbound http call
         let result = tokio::time::timeout(StdDuration::from_secs(5), call.call(&permit, &payload))
             .await
             .expect("the transport's own timeout must fire well before this outer bound");
@@ -794,6 +812,7 @@ mod tests {
         )
         .unwrap();
 
+        // dep: HTTP(loopback) — outbound http call
         let result = call.call(&permit, &payload).await;
         assert_eq!(result, Err(ErrorCode::ProviderPermanent));
         server.abort();
@@ -849,6 +868,7 @@ mod tests {
             test_status_classifier,
         )
         .unwrap();
+        // dep: HTTP(loopback) — outbound http call
         let result = call.call(&permit, &payload).await;
         assert_eq!(result, Err(ErrorCode::Internal));
 

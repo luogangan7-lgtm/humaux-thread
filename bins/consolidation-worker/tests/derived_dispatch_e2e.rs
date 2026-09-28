@@ -1,5 +1,27 @@
-//! ADR-0036 (card 14) acceptance: cross-tenant pending-work discovery for the consolidation
-//! worker. Every test here drives [`dispatch_pass`] with NO tenant id, reasoning domain, or route
+//! `consolidation-worker::tests::derived_dispatch_e2e` — ADR-0036 (card 14) acceptance: cross-tenant pending-work
+//!   discovery for the consolidation worker.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-testkit, postgres, tokio, uuid];
+//!   services=[PostgreSQL(role_consolidation_worker) r=[ops.claim_derived_work, private.memory_consolidation_runs,
+//!   private.memory_rollups] w=[control.credentials, control.memberships, control.private_reasoning_domains,
+//!   control.processor_models, control.provider_accounts, control.provider_endpoints,
+//!   control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings,
+//!   control.reasoning_route_candidates, control.reasoning_route_policies, control.tenants, control.users, ops.jobs,
+//!   private.events, private.evidence_objects, private.memory_consolidation_inputs, private.memory_evidence,
+//!   private.memory_records, private.memory_rollup_sources] x=[ops.claim_derived_work], UDS(serve),
+//!   subprocess(humaux-consolidation-worker), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-consolidation-worker,
+//!   CONSOLIDATION_WORKER_PG_DSN, HUMAUX_CONSOLIDATION_WORKER_BATCH, HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS,
+//!   HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS, HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS,
+//!   HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS, HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS,
+//!   HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS, HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH,
+//!   HUMAUX_TEST_PG_DSN]; modules=[adapters::consolidate_repo, adapters::jobs, adapters::postgres,
+//!   application::consolidate, humaux-consolidation-worker, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [one tenant-less pass completes both tenants' work, claims each job exactly once under RLS, and a
+//!   killed worker's expired lease is re-claimed with the result written once; an isolation-setup failure is a
+//!   fixture error, not a pass]
+//! Spec: ADR-0036; §79.2
+//!
+//! Every test here drives [`dispatch_pass`] with NO tenant id, reasoning domain, or route
 //! binding of its own — exactly what the binary now has in its environment (none of the three) —
 //! and proves the five properties the card's acceptance gate names:
 //!
@@ -188,6 +210,7 @@ impl DbIntegrationFixture for DispatchFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -244,6 +267,7 @@ impl DbIntegrationFixture for DispatchFixture {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let consolidation = rt
+            // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
             .block_on(ConsolidationDbPool::connect(&dsn_as_role(
                 &dsn,
                 "role_consolidation_worker",
@@ -596,6 +620,7 @@ fn claimed_job_context_cannot_read_the_other_tenant() {
 
             let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("dsn");
             let mut worker =
+                // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
                 Client::connect(&dsn_as_role(&dsn, "role_consolidation_worker"), NoTls)
                     .expect("connect as role_consolidation_worker");
             let mut txn = worker.transaction().expect("begin");
@@ -1023,6 +1048,7 @@ fn two_serialized_claims_take_each_job_exactly_once_under_a_held_lock() {
             let worker_dsn = dsn_as_role(&handle.dsn, "role_consolidation_worker");
             let kinds = vec!["DERIVED_CONSOLIDATE".to_owned()];
             let mut holder =
+                // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
                 Client::connect(&worker_dsn, NoTls).expect("connect the holding session");
             let mut txn = holder.transaction().expect("begin holder txn");
             let held = txn
@@ -1037,6 +1063,7 @@ fn two_serialized_claims_take_each_job_exactly_once_under_a_held_lock() {
             let racer_kinds = kinds.clone();
             let racer = std::thread::spawn(move || {
                 let mut client =
+                    // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
                     Client::connect(&racer_dsn, NoTls).expect("connect the racing session");
                 client
                     .query(
@@ -1073,6 +1100,7 @@ fn run_once_binary_exits_zero_promptly_with_no_input() {
             // Nothing seeded: the enqueue triggers never fired, so the queue is empty.
             let started = std::time::Instant::now();
             let output =
+                // dep: subprocess(humaux-consolidation-worker) — spawns the consolidation-worker binary under test
                 std::process::Command::new(env!("CARGO_BIN_EXE_humaux-consolidation-worker"))
                     .arg("--run-once")
                     .env(
@@ -1125,6 +1153,7 @@ fn run_once_binary_exits_zero_promptly_with_no_input() {
 /// longer under load). Every test below spawns `humaux-consolidation-worker` under a deadline,
 /// so pay that cost once, up front, on a run that measures nothing.
 fn warm_binary() {
+    // dep: subprocess(humaux-consolidation-worker) — spawns the consolidation-worker binary under test
     let _ = std::process::Command::new(env!("CARGO_BIN_EXE_humaux-consolidation-worker"))
         .arg("--warm-up-not-a-mode")
         .env_clear()
@@ -1142,6 +1171,7 @@ fn socket_path(tag: &str) -> std::path::PathBuf {
 /// established, plus the two keys resident mode adds. `socket_path` is the ONLY thing the two
 /// card-15 tests vary.
 fn serve_command(dsn: &str, socket_path: &str) -> std::process::Command {
+    // dep: subprocess(humaux-consolidation-worker) — spawns the consolidation-worker binary under test
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_humaux-consolidation-worker"));
     cmd.env("CONSOLIDATION_WORKER_PG_DSN", dsn)
         .env("HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH", socket_path)
@@ -1191,6 +1221,7 @@ fn readyz_binary_probes_its_uds_peer_and_names_it_when_down() {
             // it never sends a request.
             let socket_path = socket_path("readyz");
             let _ = std::fs::remove_file(&socket_path);
+            // dep: UDS(serve) — unix-socket RPC
             let listener = std::os::unix::net::UnixListener::bind(&socket_path)
                 .expect("bind the stand-in private-worker socket");
             let accepting = std::thread::spawn(move || {
@@ -1302,6 +1333,7 @@ fn drain_mid_pass_leaves_no_live_lease(signal: &str, test_name: &'static str) {
 
         let socket_path = socket_path("sigterm");
         let _ = std::fs::remove_file(&socket_path);
+        // dep: UDS(serve) — unix-socket RPC
         let listener = std::os::unix::net::UnixListener::bind(&socket_path)
             .expect("bind the stand-in private-worker socket");
         // Accept and hold: the worker's inference hop blocks here until its call TTL, which
@@ -1347,6 +1379,7 @@ fn drain_mid_pass_leaves_no_live_lease(signal: &str, test_name: &'static str) {
         );
 
         // The signal, mid-pass by construction.
+        // dep: subprocess(kill) — spawns external process
         let signalled = std::process::Command::new("kill")
             .arg(format!("-{signal}"))
             .arg(child.id().to_string())

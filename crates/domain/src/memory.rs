@@ -1,4 +1,8 @@
 //! `domain::memory` — `MemoryType` (§8.5 / §59).
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [adapters::context_repo, adapters::distill_reasoner, adapters::distill_repo, adapters::memory_governance_repo, adapters::projection_worker, adapters::qdrant, application::confirm, application::correct, domain::authority, domain::context, domain::policy, private-worker::distill, projection::card, retrieval::signals, tests]
+//! Invariants: []
+//! Spec: Baseline §8.5; §24; §25.2; ADR-0045
 //!
 //! §8.5 freezes 12 fixed types: `PROCEDURE` is retrievable procedural knowledge that does
 //! not guarantee the Agent auto-executes it; `OUTCOME` holds Action -> Result -> Validation,

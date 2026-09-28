@@ -1,4 +1,9 @@
 //! `retrieval::predicate_registry` — §20.1 Predicate Registry types + fail-loud loader (§50).
+//! Depends-on: crates=[]; services=[];
+//!   env=[]; modules=[]
+//! Called-by: [adapters::exact_census, retrieval::planner, retrieval::predicate_eval, retrieval::request, tests]
+//! Invariants: []
+//! Spec: §20.1; §50; §48
 //!
 //! Storage: `control.retrieval_predicates` (migrations 0077/0078; see 0077's header note for
 //! why this deviates from §20.1's literal dotted example `retrieval.predicates` — no
@@ -165,6 +170,7 @@ mod tests {
                 "superseded_at".to_string(),
                 "visibility_workspace_id".to_string(),
             ],
+            // dep-map: allow table-undeclared — predicate scope metadata; SQL is executed by adapters::exact_census
             enumerable_scope: "private.memory_records WHERE visibility_workspace_id = $1"
                 .to_string(),
             surface_patterns: vec![

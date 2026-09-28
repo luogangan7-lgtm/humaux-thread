@@ -1,6 +1,10 @@
-//! §53.4 注错测试：`DegradeCode::ProjectionInvisibleLoss` 的一条注错记录（每个 reason
-//! 必须有一条测试，从未触发过的 reason 不许合并，§53.3 规则2 的三数相等
-//! 把这句话变成 CI 事实）。
+//! `testkit::tests::fault::projection_invisible_loss` — §53.4 注错测试：`DegradeCode::ProjectionInvisibleLoss` 的一条注错记录（每个
+//!   reason 必须有一条测试，从未触发过的 reason 不许合并，§53.3 规则2 的三数相等 把这句话变成 CI 事实）。
+//! Depends-on: crates=[humaux-telemetry]; services=[]; env=[]; modules=[humaux-testkit, telemetry::degrade]
+//! Called-by: [testkit::tests::fault_main]
+//! Invariants: [injects ProjectionInvisibleLoss through abstain(), the single emit point (§53.3 rule 2); the
+//!   registered real-Qdrant injection (delete 10 points) is not implemented here]
+//! Spec: Baseline §53.4; §23.4; §53.1; §53.3
 //!
 //! §53.4 登记项（尚未按登记语义实现，见下方 ponytail 标注）：绕过
 //! `retention::tombstone` 直接从 Qdrant 删 10 个 point（= §23.4 G23-2 注入 1）；

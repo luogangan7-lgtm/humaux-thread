@@ -1,4 +1,11 @@
-//! Gateway-only read adapter for §73.5.1 service credential bindings.
+//! `adapters::credential_repo` — Gateway-only read adapter for §73.5.1 service credential bindings.
+//! Depends-on: crates=[humaux-domain, sqlx]; services=[PostgreSQL(any) r=[control.workspace_memberships] x=[control.api_key_lookup, control.api_key_touch_last_used]]; env=[]; modules=[adapters::postgres, domain::error, domain::identity]
+//! Called-by: [gateway::auth, tests]
+//! Invariants: [returns database facts only (HMAC and authorization stay in the auth layer); the workspace-ceiling
+//!   read runs only after a user-bound key validates, so a bad key does no membership work; a PG error is
+//!   DependencyUnavailable]
+//! Spec: Baseline §6.1.1; ADR-0035
+//!
 //! This module returns database facts only; HMAC and authorization decisions remain in
 //! the protocol/authentication layer.
 //!
@@ -164,6 +171,7 @@ pub async fn lookup(
            FROM control.api_key_lookup($1)"#,
     )
     .bind(prefix)
+    // dep: PostgreSQL(any) — executes a query against the pool
     .fetch_optional(pool.pool())
     .await
     .map_err(db_error)?;
@@ -212,6 +220,7 @@ pub async fn load_live_workspace_ids(
     tenant_id: Uuid,
     user_id: Uuid,
 ) -> Result<Vec<Uuid>, ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     sqlx::query(
         "SELECT set_config('humaux.tenant_id', $1, true), set_config('humaux.user_id', $2, true)",
@@ -247,6 +256,7 @@ pub async fn load_live_workspace_ids(
 pub async fn mark_used(pool: &RuntimeDbPool, api_key_id: Uuid) -> Result<(), ErrorCode> {
     sqlx::query("SELECT control.api_key_touch_last_used($1)")
         .bind(api_key_id)
+        // dep: PostgreSQL(any) — executes a query against the pool
         .execute(pool.pool())
         .await
         .map_err(db_error)?;

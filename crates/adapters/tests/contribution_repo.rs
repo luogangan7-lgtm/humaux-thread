@@ -1,4 +1,18 @@
-//! §12/§13 real-Postgres integration coverage for contribution repository IO.  These tests
+//! `adapters::tests::contribution_repo` — §12/§13 real-Postgres integration coverage for contribution repository IO.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, sqlx, tokio];
+//!   services=[PostgreSQL(any) r=[ops.card_c_outbox_fault_, ops.commit_seq_seq] w=[control.private_reasoning_domains,
+//!   control.tenants, ops.outbox, ops.public_release_revocations, private.events, private.evidence_objects,
+//!   private.memory_evidence, private.memory_records, public.claims, public.provenance_edges, public.source_closure,
+//!   public.sources, public.syntheses, public.synthesis_inputs, staging.contribution_release_sources,
+//!   staging.contribution_releases], PostgreSQL(role_private_worker), PostgreSQL(role_public_worker)];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_repo, adapters::postgres, domain::authority,
+//!   domain::error, domain::ids, domain::public, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [exercises a checked PublicWorkerDbPool (schema setup/cleanup is admin-only); tenant and visibility
+//!   violations must be TenantBoundary/Forbidden; an isolation setup failure is a fixture error]
+//! Spec: none
+//!
+//! These tests
 //! deliberately exercise a checked `PublicWorkerDbPool`; schema setup/cleanup is admin-only.
 
 use std::{
@@ -126,6 +140,7 @@ impl DbIntegrationFixture for Fixture {
     fn isolate() -> Result<Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `isolate`
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
         let ready: bool = admin.query_one(
@@ -193,9 +208,11 @@ impl DbIntegrationFixture for Fixture {
         let public_dsn = dsn_as_role(&dsn, "role_public_worker");
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        // dep: PostgreSQL(role_public_worker) — opens the role-scoped connection for `isolate`
         let public = rt
             .block_on(PublicWorkerDbPool::connect(&public_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        // dep: PostgreSQL(role_private_worker) — opens the role-scoped connection for `isolate`
         let private = rt
             .block_on(PrivateWorkerDbPool::connect(&dsn_as_role(
                 &dsn,
@@ -232,6 +249,7 @@ fn release_with_sources(sources: Vec<ReleaseSource>) -> ContributionRelease {
 }
 
 fn admit_contribution_source(dsn: &str, tenant_id: Uuid, release_id: Uuid) -> Uuid {
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `admit_contribution_source`
     let mut source_client = Client::connect(&dsn_as_role(dsn, "role_public_worker"), NoTls)
         .expect("public role source client");
     let mut source_tx = source_client.transaction().expect("source transaction");
@@ -551,6 +569,7 @@ fn private_worker_without_tenant_context_cannot_read_fixture_release() {
             ))
             .expect("create");
         let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("test dsn");
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `private_worker_without_tenant_context_cannot_read_fixture_release`
         let mut worker = Client::connect(&dsn_as_role(&dsn, "role_private_worker"), NoTls)
             .expect("private role client");
         let visible: i64 = worker
@@ -577,6 +596,7 @@ fn public_worker_without_tenant_context_cannot_admit_user_source() {
             ))
             .expect("create release");
         let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("test dsn");
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `public_worker_without_tenant_context_cannot_admit_user_source`
         let mut worker = Client::connect(&dsn_as_role(&dsn, "role_public_worker"), NoTls)
             .expect("public role client");
         let error = worker
@@ -626,6 +646,7 @@ fn user_source_guard_allows_active_then_rejects_revoked_release() {
             ))
             .expect("create");
         let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("test dsn");
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `user_source_guard_allows_active_then_rejects_revoked_release`
         let mut worker = Client::connect(&dsn_as_role(&dsn, "role_public_worker"), NoTls)
             .expect("public role client");
         let mut tx = worker.transaction().expect("source transaction");
@@ -839,9 +860,11 @@ fn concurrent_revokes_use_two_runtime_sessions_and_emit_one_revoke() {
         let private_dsn = dsn_as_role(&dsn, "role_private_worker");
         let tenant_id = TenantId(h.tenant_id);
         let (left, right) = h.rt.block_on(async {
+            // dep: PostgreSQL(role_private_worker) — opens the role-scoped connection for `concurrent_revokes_use_two_runtime_sessions_and_emit_one_revoke`
             let left = PrivateWorkerDbPool::connect(&private_dsn)
                 .await
                 .expect("left role pool");
+            // dep: PostgreSQL(role_private_worker) — opens the role-scoped connection for `concurrent_revokes_use_two_runtime_sessions_and_emit_one_revoke`
             let right = PrivateWorkerDbPool::connect(&private_dsn)
                 .await
                 .expect("right role pool");
@@ -875,6 +898,7 @@ fn promotion_completes_before_queued_revoke_under_release_lock() {
         let source_id = admit_contribution_source(&dsn, h.tenant_id, release_id);
         h.source_ids.push(source_id);
 
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `promotion_completes_before_queued_revoke_under_release_lock`
         let mut lock_client = Client::connect(&dsn_as_role(&dsn, "role_public_worker"), NoTls)
             .expect("public lock client");
         let mut source_lock_tx = lock_client.transaction().expect("source lock transaction");
@@ -895,6 +919,7 @@ fn promotion_completes_before_queued_revoke_under_release_lock() {
         let promotion_tenant = TenantId(h.tenant_id);
         let promotion = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("promotion runtime");
+            // dep: PostgreSQL(role_public_worker) — opens the role-scoped connection for `promotion_completes_before_queued_revoke_under_release_lock`
             let pool = rt
                 .block_on(PublicWorkerDbPool::connect(&public_dsn))
                 .expect("promotion pool");
@@ -926,6 +951,7 @@ fn promotion_completes_before_queued_revoke_under_release_lock() {
             let tenant_id = TenantId(h.tenant_id);
             thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().expect("revoke runtime");
+                // dep: PostgreSQL(role_private_worker) — opens the role-scoped connection for `promotion_completes_before_queued_revoke_under_release_lock`
                 let pool = rt
                     .block_on(PrivateWorkerDbPool::connect(&private_dsn))
                     .expect("revoke pool");
@@ -1066,6 +1092,7 @@ fn refresh_waits_for_graph_update_then_has_stable_distinct_pairs() {
             dsn_as_role_with_application(&dsn, "role_public_worker", &writer_application);
         let second_claim = h.claim_ids[1];
         let writer = thread::spawn(move || {
+            // dep: PostgreSQL(any) — opens the role-scoped connection for `refresh_waits_for_graph_update_then_has_stable_distinct_pairs`
             let mut writer = Client::connect(&writer_dsn, NoTls).expect("public graph writer");
             let mut tx = writer.transaction().expect("graph writer transaction");
             tx.batch_execute("LOCK TABLE public.synthesis_inputs IN ROW EXCLUSIVE MODE")
@@ -1090,6 +1117,7 @@ fn refresh_waits_for_graph_update_then_has_stable_distinct_pairs() {
             dsn_as_role_with_application(&dsn, "role_public_worker", &refresher_application);
         let refresher = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("refresh runtime");
+            // dep: PostgreSQL(role_public_worker) — opens the role-scoped connection for `refresh_waits_for_graph_update_then_has_stable_distinct_pairs`
             let pool = rt
                 .block_on(PublicWorkerDbPool::connect(&public_dsn))
                 .expect("refresh pool");
@@ -1147,6 +1175,7 @@ fn concurrent_refreshes_serialize_and_preserve_distinct_root_depth_pairs() {
         let suffix = Uuid::new_v4().simple().to_string();
         let first_application = format!("card_c_refresh_one_{suffix}");
         let second_application = format!("card_c_refresh_two_{suffix}");
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `concurrent_refreshes_serialize_and_preserve_distinct_root_depth_pairs`
         let mut holder = Client::connect(
             &dsn_as_role_with_application(
                 &dsn,
@@ -1165,6 +1194,7 @@ fn concurrent_refreshes_serialize_and_preserve_distinct_root_depth_pairs() {
             dsn_as_role_with_application(&dsn, "role_public_worker", &first_application);
         let first = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("first refresh runtime");
+            // dep: PostgreSQL(role_public_worker) — opens the role-scoped connection for `concurrent_refreshes_serialize_and_preserve_distinct_root_depth_pairs`
             let pool = rt
                 .block_on(PublicWorkerDbPool::connect(&first_dsn))
                 .expect("first refresh pool");
@@ -1174,6 +1204,7 @@ fn concurrent_refreshes_serialize_and_preserve_distinct_root_depth_pairs() {
             dsn_as_role_with_application(&dsn, "role_public_worker", &second_application);
         let second = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("second refresh runtime");
+            // dep: PostgreSQL(role_public_worker) — opens the role-scoped connection for `concurrent_refreshes_serialize_and_preserve_distinct_root_depth_pairs`
             let pool = rt
                 .block_on(PublicWorkerDbPool::connect(&second_dsn))
                 .expect("second refresh pool");

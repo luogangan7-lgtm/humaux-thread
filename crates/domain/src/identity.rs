@@ -1,5 +1,9 @@
-//! `domain::identity` — `AuthorizationScope`, `VisibilityDescriptor`, and the sole
-//! visibility judge `can_read` (§6.1.1).
+//! `domain::identity` — `AuthorizationScope`, `VisibilityDescriptor`, and the sole visibility judge `can_read`
+//!   (§6.1.1).
+//! Depends-on: crates=[uuid]; services=[]; env=[]; modules=[domain::error, domain::ids]
+//! Called-by: [adapters::affect_repo, adapters::confirm_token_repo, adapters::context_repo, adapters::continuity_read, adapters::continuity_repo, adapters::contribution_entry_repo, adapters::credential_repo, adapters::distill_repo, adapters::exact_census, adapters::mechanism_observation, adapters::membership_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::private_projection_registry, adapters::projection_worker, adapters::public_repo, adapters::qdrant, adapters::quota_repo, adapters::read_materialize, adapters::request_guard_repo, adapters::retrieval_query_source, adapters::retrieve, adapters::serving_repo, adapters::subject_repo, application::continuity, application::contribute, application::retrieval_embedding_port, gateway::auth, gateway::bootstrap, gateway::context, gateway::continuity, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, projection::dense, projection::sparse, retrieval-worker::rpc, tests, xtask::member, xtask::switch_visible]
+//! Invariants: []
+//! Spec: Baseline §6; §6.1; §6.1.1; ADR-0033; ADR-0035
 //!
 //! §6.1.1 freezes: tenant isolation (PostgreSQL RLS, `SET LOCAL humaux.tenant_id/user_id`,
 //! §6.1/§62) is not the end of multi-user isolation — inside one tenant, three visibility

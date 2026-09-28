@@ -1,5 +1,18 @@
-//! exact_completeness eval harness (§55.3 benchset declaration for the `exact_completeness`
-//! set; owner=Retrieval, Phase 6+).
+//! `adapters::tests::exact_completeness_eval` — exact_completeness eval harness (§55.3 benchset declaration for the
+//!   `exact_completeness` set; owner=Retrieval, Phase 6+).
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, humaux-retrieval, humaux-testkit, postgres,
+//!   serde_json, sha2, tokio, uuid]; services=[PostgreSQL(any) r=[control.retrieval_predicates, public.pool]
+//!   w=[control.memberships, control.private_reasoning_domains, control.tenants, control.users,
+//!   control.workspace_memberships, control.workspaces, ops.outbox, private.events, private.evidence_objects,
+//!   private.memory_evidence, private.memory_records, projection.stream_log], PostgreSQL(role_gateway),
+//!   PostgreSQL(role_maintenance)]; env=[CARGO_MANIFEST_DIR, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::exact_census, adapters::forget_repo, adapters::postgres, domain::error, domain::identity,
+//!   domain::ids, humaux-testkit, projection::stream, retrieval::completeness, retrieval::envelope,
+//!   retrieval::planner, retrieval::predicate_registry]
+//! Called-by: [cargo-test]
+//! Invariants: [runs the real probe -> decide -> census -> classify chain per fixture case with exact-equality
+//!   readouts and the §55.3 spread/resolution measurements; a missing dependency goes through skip_or_fail]
+//! Spec: Baseline §55.3; §23.1; §23.4; §79.2; ADR-0005
 //!
 //! Runs the real chain per fixture case — [`humaux_adapters::exact_census::
 //! probe_predicate_inputs`] → `planner::decide` → [`humaux_adapters::exact_census::
@@ -71,6 +84,7 @@ fn verified_maintenance_dsn() -> Option<String> {
         );
         return None;
     };
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `verified_maintenance_dsn`
     let Ok(mut probe) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(
             NAME,
@@ -195,6 +209,7 @@ fn setup() -> Option<(Fixture, String, String)> {
         skip_or_fail(NAME, "missing object: Postgres DSN", ExternalDep::Postgres);
         return None;
     };
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `setup`
     let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;
@@ -831,9 +846,11 @@ fn run_battery(
 
     // --- async phase 2: every case up to and including the tombstone boundary --------------
     rt.block_on(async {
+        // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `run_battery`
         let pool = RuntimeDbPool::connect(&dsn_as_role(dsn, "role_gateway"))
             .await
             .expect("runtime pool");
+        // dep: PostgreSQL(role_maintenance) — opens the role-scoped connection for `run_battery`
         let maint = MaintenanceDbPool::connect(maintenance_dsn)
             .await
             .expect("maintenance pool");
@@ -1132,6 +1149,7 @@ fn run_battery(
 
     // --- async phase 4: the purge-boundary sample (§37: purge must not move any readout) ---
     rt.block_on(async {
+        // dep: PostgreSQL(role_gateway) — opens the role-scoped connection
         let pool = RuntimeDbPool::connect(&dsn_as_role(dsn, "role_gateway"))
             .await
             .expect("runtime pool");

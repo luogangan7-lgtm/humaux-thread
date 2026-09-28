@@ -1,4 +1,13 @@
-//! Typed metadata-only source for native private retrieval-query disclosures.
+//! `adapters::retrieval_query_source` — Typed metadata-only source for native private retrieval-query disclosures.
+//! Depends-on: crates=[hex, humaux-domain, humaux-local-secret-scan, humaux-retrieval, serde_json, sha2, sqlx];
+//!   services=[PostgreSQL(any) w=[private.retrieval_query_sources], PostgreSQL(role_maintenance),
+//!   PostgreSQL(role_retrieval_worker), subprocess(fake-gitleaks)]; env=[]; modules=[adapters::disclosure,
+//!   adapters::postgres, domain::dataclass, domain::egress, domain::identity, domain::ids, humaux-local-secret-scan]
+//! Called-by: [retrieval-provider::adapters, tests]
+//! Invariants: [never accepts free query text or wire bytes: sealed-query and serialized-wire metadata are derived
+//!   here, the principal comes from the trusted AuthorizationScope, and the single RETRIEVAL_QUERY attach goes
+//!   through the disclosure transaction]
+//! Spec: none
 //!
 //! This module never accepts free query text, digests, byte counts, profile identity, or provider
 //! wire bytes. It derives sealed-query and exact serialized-wire metadata separately, derives
@@ -265,6 +274,7 @@ pub async fn reserve_retrieval_query_batch(
     validate_call(context, wire, permit)?;
     let queries = wire.queries;
     let payload = wire.payload();
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `reserve_retrieval_query_batch`
     let mut txn = pool.pool().begin().await?;
     let (tenant_id, user_id, principal_id) =
         set_authorization_local(&mut txn, context.authorization).await?;
@@ -329,6 +339,7 @@ pub async fn get_retrieval_query_source(
     authorization: &AuthorizationScope,
     query_source_id: Uuid,
 ) -> Result<Option<RetrievalQuerySource>, RetrievalQuerySourceError> {
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `get_retrieval_query_source`
     let mut txn = pool.pool().begin().await?;
     let (tenant_id, user_id, principal_id) =
         set_authorization_local(&mut txn, authorization).await?;
@@ -391,6 +402,7 @@ pub async fn revoke_retrieval_query_source(
     if reason.trim().is_empty() {
         return Err(RetrievalQuerySourceError::InvalidMetadata);
     }
+    // dep: PostgreSQL(role_maintenance) — transaction entry for `revoke_retrieval_query_source`
     let mut txn = pool.pool().begin().await?;
     sqlx::query("SELECT set_config('humaux.tenant_id', $1, true)")
         .bind(tenant_id.to_string())
@@ -464,6 +476,7 @@ mod tests {
                 // Rename so a concurrent test process never execs a half-written script.
                 fs::rename(&staged, &path).expect("publish fake scanner");
             }
+            // dep: subprocess(fake-gitleaks) — spawns for `new`
             let _ = std::process::Command::new(&path)
                 .arg("version")
                 .env_clear()

@@ -1,4 +1,10 @@
-//! `infra_egress::resolver` — Layer 1A 的「检查即拨号」解析器：**出网 client 的唯一构造点**。
+//! `infra-egress::resolver` — Layer 1A 的「检查即拨号」解析器：**出网 client 的唯一构造点**。
+//! Depends-on: crates=[humaux-infra-network, tokio]; services=[HTTP(loopback)]; env=[];
+//!   modules=[humaux-infra-network, infra-network::http]
+//! Called-by: [adapters::byok, infra-egress::http, infra-egress::raw, tests]
+//! Invariants: [the only outbound client constructor: the address the SSRF check approved is the address that is
+//!   dialed (one resolution, ADR-0039); behind an operator proxy the pin does not hold, a documented residual]
+//! Spec: ADR-0039; §11.4; §83.4
 //!
 //! ## 这个模块存在的理由（ADR-0039 / §11.4 / §83.4 判据3）
 //!
@@ -316,6 +322,7 @@ mod tests {
         let client = client_for(resolver, Duration::ZERO);
         let err = client
             .get(format!("http://pinned.test:{port}/x"))
+            // dep: HTTP(loopback) — outbound http call
             .send()
             .await
             .expect_err("拨号必须被拒");
@@ -362,6 +369,7 @@ mod tests {
         let client = client_for(resolver, DEFAULT_PIN_TTL);
         let response = client
             .get(format!("http://pinned.test:{port}/x"))
+            // dep: HTTP(loopback) — outbound http call
             .send()
             .await
             .expect("允许地址必须连得上");
@@ -397,6 +405,7 @@ mod tests {
             let started = Instant::now();
             let response = client
                 .get(format!("http://pinned.test:{port}/x"))
+                // dep: HTTP(loopback) — outbound http call
                 .send()
                 .await
                 .expect("TTL 窗口内每次都该用 pin 住的答案");
@@ -428,6 +437,7 @@ mod tests {
         let client = client_for(Arc::new(Empty), DEFAULT_PIN_TTL);
         let err = client
             .get("http://nowhere.test:9/x")
+            // dep: HTTP(loopback) — outbound http call
             .send()
             .await
             .expect_err("零地址必须拒");

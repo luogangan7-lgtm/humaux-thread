@@ -1,5 +1,11 @@
-//! `jobs` — `ops.jobs` SKIP LOCKED claim, lease heartbeat, and terminal-state transitions
-//! (§31 Durable Jobs / §61 SKIP LOCKED Claim SQL).
+//! `adapters::jobs` — `ops.jobs` SKIP LOCKED claim, lease heartbeat, and terminal-state transitions (§31 Durable Jobs
+//!   / §61 SKIP LOCKED Claim SQL).
+//! Depends-on: crates=[serde_json, sqlx]; services=[PostgreSQL(any) r=[ops.claim_derived_work] w=[ops.jobs] x=[ops.claim_derived_work]]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::postgres]
+//! Called-by: [adapters::consolidate_repo, humaux-consolidation-worker, humaux-private-worker, private-worker::distill, tests]
+//! Invariants: [one tenant per call: each function opens a transaction and sets humaux.tenant_id before touching
+//!   FORCE-RLS ops.jobs; claims use SKIP LOCKED with a lease; a PG error returns to the caller with no job state
+//!   change]
+//! Spec: Baseline §31; §6.1; §48.2; §62; §32; §61
 //!
 //! `ops.jobs` already carries every column §31 lists (`migrations/0008_ops_core.sql`) and its
 //! `status` CHECK constraint already enumerates all seven states — this module adds no
@@ -241,6 +247,7 @@ pub async fn claim(
     lease_seconds: f64,
     limit: i64,
 ) -> Result<Vec<ClaimedJob>, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let claimed = claim_in_txn(
         &mut txn,
@@ -265,6 +272,7 @@ pub async fn private_claim(
     lease_seconds: f64,
     limit: i64,
 ) -> Result<Vec<ClaimedJob>, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let claimed = claim_in_txn(
         &mut txn,
@@ -364,6 +372,7 @@ pub async fn claim_derived_work_consolidation(
     lease_seconds: f64,
     limit: i64,
 ) -> Result<Vec<ClaimedJob>, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let claimed =
         claim_derived_work_in_txn(&mut txn, kinds, lease_owner, lease_seconds, limit).await?;
@@ -379,6 +388,7 @@ pub async fn claim_derived_work_private(
     lease_seconds: f64,
     limit: i64,
 ) -> Result<Vec<ClaimedJob>, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let claimed =
         claim_derived_work_in_txn(&mut txn, kinds, lease_owner, lease_seconds, limit).await?;
@@ -470,6 +480,7 @@ pub async fn heartbeat_derived_consolidation(
     lease: &DerivedLease<'_>,
     lease_seconds: f64,
 ) -> Result<bool, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let changed = heartbeat_in_txn(
         &mut txn,
@@ -489,6 +500,7 @@ pub async fn heartbeat_derived_private(
     lease: &DerivedLease<'_>,
     lease_seconds: f64,
 ) -> Result<bool, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let changed = heartbeat_in_txn(
         &mut txn,
@@ -509,6 +521,7 @@ pub async fn settle_derived_consolidation(
     outcome: DerivedWorkOutcome,
     lease_seconds: f64,
 ) -> Result<bool, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let settled = settle_derived_in_txn(&mut txn, lease, outcome, lease_seconds).await?;
     txn.commit().await?;
@@ -521,6 +534,7 @@ pub async fn settle_derived_private(
     outcome: DerivedWorkOutcome,
     lease_seconds: f64,
 ) -> Result<bool, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let settled = settle_derived_in_txn(&mut txn, lease, outcome, lease_seconds).await?;
     txn.commit().await?;
@@ -584,6 +598,7 @@ pub async fn heartbeat(
     attempt: i32,
     lease_seconds: f64,
 ) -> Result<bool, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let changed = heartbeat_in_txn(
         &mut txn,
@@ -631,6 +646,7 @@ pub async fn complete(
     lease_owner: &str,
     attempt: i32,
 ) -> Result<bool, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let done = complete_in_txn(&mut txn, tenant_id, job_id, lease_owner, attempt).await?;
     txn.commit().await?;
@@ -685,6 +701,7 @@ pub async fn fail(
     tenant_id: Uuid,
     input: FailInput<'_>,
 ) -> Result<Option<JobStatus>, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let status = fail_in_txn(&mut txn, tenant_id, input).await?;
     txn.commit().await?;
@@ -738,6 +755,7 @@ pub async fn mark_waiting_key(
     lease_owner: &str,
     attempt: i32,
 ) -> Result<bool, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
     let result = sqlx::query(
@@ -766,6 +784,7 @@ pub async fn resume_from_waiting_key(
     tenant_id: Uuid,
     job_id: Uuid,
 ) -> Result<bool, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
 

@@ -1,6 +1,7 @@
 [package]
 name = "humaux-protocol"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -8,20 +9,33 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# why: domain ErrorCode/DegradeCode mapping and error types; used-by: [protocol::error_map, protocol::mcp, protocol::mcp_catalog, tests]
 humaux-domain = { version = "0.1.0", path = "../domain" }
 # §73.5: API key keyed-hash verifier (HMAC-SHA256). Same sha2 line as `humaux-domain`
 # (§8.1/§48.0①); hmac reused from the workspace's own already-resolved dependency graph
 # (paired digest 0.11.x, see Cargo.lock) rather than introducing a second major line.
+# why: control.api_keys.key_hash keyed-hash verifier; used-by: [protocol::edge]
 hmac = "0.13"
+# why: paired digest for the HMAC-SHA256 key-hash verifier; used-by: [protocol::edge]
 sha2 = "0.11"
 # §33: SDK and HTTP wire types stay inside the Protocol adapter.
 # Native 2026-07-28 only; no provider/client/auth SDK feature is enabled.
+# why: MCP-over-HTTP server framework this adapter owns; used-by: [protocol::mcp]
 rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-streamable-http-server"] }
+# why: HTTP router the native MCP adapter is built on; used-by: [protocol::mcp, tests]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# why: object-safe async traits at the rmcp/Axum boundary; used-by: [protocol::mcp, tests]
 async-trait = "0.1"
+# why: MCP tool schema and JSON-RPC (de)serialization; used-by: [protocol::mcp, protocol::mcp_catalog]
 serde = { version = "1", features = ["derive"] }
+# why: JSON-RPC bodies and the embedded contracts/mcp catalog documents; used-by: [protocol::mcp, protocol::mcp_catalog, tests]
 serde_json = { version = "1", features = ["raw_value"] }
+# why: validates the embedded contracts/mcp catalog documents at load time; used-by: [protocol::mcp_catalog]
 jsonschema = { version = "=0.52.0", default-features = false }
+# why: async runtime the Axum/rmcp server and its tests run on; used-by: [tests]
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync"] }
+# dep-map: allow cargo-usedby — declared but named by no module today; kept for the Axum server's transitive requirement (removal is a code change, out of card 26 scope)
+# why: not currently named by any module in this crate; used-by: [none]
 tokio-util = "0.7"
+# why: MCP request/session id generation; used-by: [protocol::mcp, tests]
 uuid = { version = "1.25.0", features = ["v7"] }

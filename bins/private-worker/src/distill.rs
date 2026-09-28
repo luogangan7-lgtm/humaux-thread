@@ -1,7 +1,13 @@
-//! The Distill hop (§15.5 / §16.1.1 / §10.1, ADR-0016): accepted Evidence → 0..N
-//! `private.memory_records`, owned by this process because §6.2.2 already gives
-//! `role_private_worker` both the provider capability and the only INSERT on
-//! `memory_records`/`memory_evidence` (no RPC needed, contrast ADR-0015's Consolidate hop).
+//! `private-worker::distill` — The Distill hop (§15.5 / §16.1.1 / §10.1, ADR-0016): accepted Evidence → 0..N
+//!   `private.memory_records`, owned by this process because §6.2.2 already gives `role_private_worker` both the
+//!   provider capability and the only INSERT on `memory_records`/`memory_evidence` (no RPC needed, contrast
+//!   ADR-0015's Consolidate hop).
+//! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-domain, humaux-projection, serde_json, sha2, uuid]; services=[]; env=[HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS]; modules=[adapters::byok, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::distill_repo, adapters::jobs, adapters::postgres, application::consolidate, domain::authority, domain::dataclass, domain::error, domain::evidence, domain::ids, domain::memory, domain::policy, private-worker::inference_rpc, projection::fingerprint]
+//! Called-by: [private-worker::main, tests]
+//! Invariants: [a candidate over the §10.1 origin-bound ceiling is rejected, never downgraded; only input-bound
+//!   failures settle the row FAILED, reasoning-side failures leave it for retry; memories, run completion and outbox
+//!   DONE commit in one lease-fenced transaction]
+//! Spec: Baseline §16.1.1; §10.1; ADR-0016; §15.7
 //!
 //! One [`run_once`] = one pass: claim up to `batch` `EVIDENCE_ACCEPTED` outbox rows, and per row
 //! (a) resolve the admitted Distill route, load the Evidence, record the §16.1.1 processing

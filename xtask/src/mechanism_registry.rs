@@ -1,3 +1,11 @@
+//! `xtask::mechanism_registry` — G0-G2 static-side gate for §1.14 mechanism registry.
+//! Depends-on: crates=[humaux-adapters, humaux-contracts, tokio]; services=[PostgreSQL(role_admin)
+//!   r=[ops.mechanism_observations]]; env=[CARGO_MANIFEST_DIR, HUMAUX_ADMIN_PG_DSN];
+//!   modules=[adapters::mechanism_observation, adapters::postgres, contracts::mechanism_registry]
+//! Called-by: [xtask::main]
+//! Invariants: [static-only invocations report missing target configuration explicitly, never assert an unqueried table is absent]
+//! Spec: Baseline §1.14; §1.14.1; §80.1
+//!
 //! xtask `mechanism-registry` — G0–G2 静态侧闸（§1.14 全文 + §1.14.1；对应 §80.1 G80-10 的
 //! 静态侧，见 extract_digest.md p0-gov）。
 //!
@@ -238,6 +246,7 @@ fn read_runtime(text: &str, args: &[String]) -> Result<Vec<GateResult>, String> 
         .build()
         .map_err(|_| "cannot start database runtime")?;
     let observations = runtime.block_on(async {
+        // dep: PostgreSQL(role_admin) — HUMAUX_ADMIN_PG_DSN, mechanism registry read
         let pool = AdminDbPool::connect(&dsn)
             .await
             .map_err(|_| "cannot connect as role_admin")?;

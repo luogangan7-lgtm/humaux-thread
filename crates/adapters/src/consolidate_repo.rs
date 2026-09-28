@@ -1,5 +1,12 @@
-//! `adapters::consolidate_repo` — §11.6/§11.7 Private Memory Consolidation SQL, through
-//! [`ConsolidationDbPool`] only. The invariants themselves (`ConsolidationRunState`,
+//! `adapters::consolidate_repo` — §11.6/§11.7 Private Memory Consolidation SQL, through [`ConsolidationDbPool`] only.
+//! Depends-on: crates=[humaux-application, humaux-domain, humaux-projection, humaux-testkit, postgres, serde_json, sha2, sqlx]; services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, private.context_bindings, private.events, private.evidence_objects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollups] x=[control.current_reasoning_route_binding]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::jobs, adapters::postgres, adapters::remember, adapters::subject_repo, application::consolidate, domain::authority, domain::consolidate, domain::ids, domain::ticket_family, projection::stream]
+//! Called-by: [adapters::consolidation_reasoner, adapters::distill_reasoner, adapters::distill_repo, humaux-consolidation-worker, tests]
+//! Invariants: [input selection and materialization happen in ONE REPEATABLE READ READ WRITE transaction (§11.7), so
+//!   no concurrent insert can leak into a run; a lost lease is LostRace and an unknown source UnknownSource, never a
+//!   partial publish]
+//! Spec: Baseline §3; §78.3; §11.7
+//!
+//! The invariants themselves (`ConsolidationRunState`,
 //! `AutoMutableMemoryId`/`classify`, the rollup-authority ceiling) are pure Rust in
 //! `humaux_domain::consolidate` (§3/§78.3 — no I/O there); this module fetches rows, applies
 //! them, and writes results.
@@ -191,6 +198,7 @@ pub async fn resolve_consolidate_binding(
     tenant_id: Uuid,
     reasoning_domain_id: Uuid,
 ) -> Result<Option<(ReasoningRouteBindingId, ReasoningRouteBindingVersion)>, ConsolidateRepoError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
     let row = sqlx::query(
@@ -314,6 +322,7 @@ pub async fn create_run(
     // next (same reasoning `jobs`/`stream_repo`/every other repo module in this crate already
     // follows: every RLS-scoped statement runs inside its own transaction, never on a bare
     // acquired connection).
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
     // `started_at` is set here, at INSERT time (unrestricted by column-level GRANT), rather
@@ -376,6 +385,7 @@ pub async fn select_and_materialize_inputs(
     workspace_id: Option<Uuid>,
     max_inputs: i64,
 ) -> Result<Vec<MaterializedInput>, ConsolidateRepoError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     // §11.7 "READ WRITE 是硬修正，不是风格选择": `READ ONLY` rejects the INSERT below with
     // SQLSTATE 25006. Set isolation before any query or data modification can establish
@@ -685,6 +695,7 @@ pub async fn publish_rollup(
     sources: &[(AutoMutableMemoryId, EvidenceId)],
     fence: Option<&crate::jobs::DerivedLease<'_>>,
 ) -> Result<PublishOutcome, ConsolidateRepoError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     // §11.7-style consistency guard for the re-validation loop below — see doc comment.
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ WRITE")
@@ -960,6 +971,7 @@ mod binding_predicate_tests {
             );
             return;
         };
+        // dep: PostgreSQL(any) — connects to PostgreSQL
         let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
             skip_or_fail(
                 "only_active_mandatory_or_pinned_bindings_freeze_a_memory",

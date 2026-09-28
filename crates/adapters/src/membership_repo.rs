@@ -1,4 +1,10 @@
 //! `adapters::membership_repo` — the §6.3 membership lifecycle admin path (ADR-0033, card 12).
+//! Depends-on: crates=[humaux-domain, serde_json, sqlx, uuid]; services=[PostgreSQL(any) r=[control.users] w=[control.memberships] x=[control.audit_event_insert, control.bump_user_security_epoch]]; env=[]; modules=[adapters::postgres, domain::error, domain::identity, domain::ids]
+//! Called-by: [tests, xtask::member]
+//! Invariants: [sole writer of control.memberships, on role_maintenance from xtask member only; one transaction locks
+//!   the target and the tenant's other ACTIVE OWNERs so the last OWNER cannot be removed; a domain refusal writes
+//!   nothing]
+//! Spec: Baseline §6.3; §77; §78.1
 //!
 //! The only code in the workspace that writes `control.memberships`. It runs under
 //! [`MaintenanceDbPool`] (`role_maintenance` — migration 0161 grants that role, and only that
@@ -293,6 +299,7 @@ pub async fn apply(
     admin: AdminAction<'_>,
 ) -> Result<MembershipOutcome, MembershipRepoError> {
     admin.validate()?;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
 

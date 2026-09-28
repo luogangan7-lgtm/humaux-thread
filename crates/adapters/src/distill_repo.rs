@@ -1,6 +1,12 @@
-//! `adapters::distill_repo` — SQL half of the Distill hop (ADR-0016), through
-//! [`PrivateWorkerDbPool`] only: claim `EVIDENCE_ACCEPTED` outbox rows, load one Evidence, record
-//! the §16.1.1 processing run, insert the authorized memories, settle the outbox row.
+//! `adapters::distill_repo` — SQL half of the Distill hop (ADR-0016), through [`PrivateWorkerDbPool`] only: claim
+//!   `EVIDENCE_ACCEPTED` outbox rows, load one Evidence, record the §16.1.1 processing run, insert the authorized
+//!   memories, settle the outbox row.
+//! Depends-on: crates=[hex, humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time]; services=[PostgreSQL(any) r=[control.memberships, private.events, private.evidence_objects] w=[ops.outbox, private.distill_candidates, private.memory_evidence, private.memory_records, private.processing_runs] x=[control.current_reasoning_route_binding]]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::confirm_token_repo, adapters::consolidate_repo, adapters::postgres, adapters::quota_repo, adapters::remember, adapters::request_guard_repo, adapters::retrieve, adapters::subject_repo, application::confirm, application::consolidate, domain::audit, domain::authority, domain::confirm, domain::error, domain::evidence, domain::identity, domain::ids, domain::memory, domain::subject, projection::stream]
+//! Called-by: [adapters::context_repo, adapters::memory_governance_repo, gateway::mcp_application, gateway::memory, private-worker::distill]
+//! Invariants: [memories, run completion and the outbox DONE flip commit in ONE transaction fenced on lease_owner, so
+//!   a reclaimed worker's inserts roll back; every read runs under role_private_worker grants + RLS with the acting
+//!   user installed first]
+//! Spec: Baseline §15.5; §14; ADR-0016; §6.1.1
 //!
 //! §15.5: one Evidence → 0/1/N `private.memory_records`; §14: the `ops.outbox` row remember wrote
 //! is the work item (PENDING → PROCESSING with a lease → DONE | FAILED, or back to PENDING when
@@ -54,6 +60,7 @@ pub async fn begin_read_context(
     pool: &PrivateWorkerDbPool,
     tenant_id: Uuid,
 ) -> Result<DbTransaction<'_>, DbError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_rls_context(&mut txn, tenant_id, Uuid::nil()).await?;
     Ok(txn)
@@ -66,6 +73,7 @@ pub async fn begin_write_context(
     tenant_id: Uuid,
     user_id: Uuid,
 ) -> Result<DbTransaction<'_>, DbError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_rls_context(&mut txn, tenant_id, user_id).await?;
     Ok(txn)
@@ -132,6 +140,7 @@ pub async fn active_member(
     tenant_id: Uuid,
     user_id: Uuid,
 ) -> Result<bool, DbError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_rls_context(&mut txn, tenant_id, user_id).await?;
     let ok: bool = sqlx::query_scalar(
@@ -173,6 +182,7 @@ pub async fn claim_pending_evidence(
     batch: i64,
     lease_seconds: f64,
 ) -> Result<Vec<ClaimedEvidence>, sqlx::Error> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_rls_context(&mut txn, tenant_id, Uuid::nil()).await?;
     let rows = sqlx::query(
@@ -514,6 +524,7 @@ pub async fn release_outbox(
     outbox_id: Uuid,
     lease_owner: &str,
 ) -> Result<bool, sqlx::Error> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_rls_context(&mut txn, tenant_id, Uuid::nil()).await?;
     let result = sqlx::query(
@@ -537,6 +548,7 @@ pub async fn fail_outbox(
     outbox_id: Uuid,
     lease_owner: &str,
 ) -> Result<bool, sqlx::Error> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_rls_context(&mut txn, tenant_id, Uuid::nil()).await?;
     let fenced = complete_outbox(&mut txn, outbox_id, lease_owner, OutboxTerminal::Failed).await?;
@@ -897,6 +909,7 @@ pub async fn confirm_candidate_atomically(
     if request.stream.tenant_id != auth.tenant_id() {
         return Err(ErrorCode::TenantBoundary);
     }
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(candidate_db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
 
@@ -1209,6 +1222,7 @@ pub async fn reject_candidate_atomically(
         request.candidate_id,
         &request.finished_audit,
     )?;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(candidate_db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
 
@@ -1302,6 +1316,7 @@ pub async fn list_pending_candidates(
     workspace: WorkspaceId,
     limit: i64,
 ) -> Result<Vec<PendingCandidate>, ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(candidate_db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
     let user_id = auth.user_id().map_or_else(Uuid::nil, |u| u.0);

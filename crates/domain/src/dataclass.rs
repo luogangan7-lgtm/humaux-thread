@@ -1,6 +1,9 @@
-//! `domain::dataclass` — `DataClass`, the monotonic safety lattice that cuts across
-//! Evidence / Observation / Memory / MemoryRollup / RetrievalCard / Query (§7.5.1), and its
-//! sole combinator `join_data_class` (§7.5.1 "唯一组合函数").
+//! `domain::dataclass` — `DataClass`, the monotonic safety lattice that cuts across Evidence / Observation / Memory /
+//!   MemoryRollup / RetrievalCard / Query (§7.5.1), and its sole combinator `join_data_class` (§7.5.1 "唯一组合函数").
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::projection_worker, adapters::qdrant, adapters::retrieval_query_source, domain::egress, gateway::bootstrap, gateway::mcp_application, gateway::remember, humaux-local-secret-scan, private-worker::distill, projection::card, retrieval-provider::adapters, tests]
+//! Invariants: []
+//! Spec: Baseline §7.5; §7.5.1; §78.2
 //!
 //! Closed set, five variants, **no** `Unknown` / `Other` / `#[non_exhaustive]` — §7.5.1's own
 //! text: "判不出来的结果是 `SECRET_MATERIAL`，不是放行". A caller that cannot classify

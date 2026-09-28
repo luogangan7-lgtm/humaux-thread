@@ -1,5 +1,12 @@
-//! RequestGuard's first PostgreSQL persistence seam: effective-entitlement reads and
-//! FORCE-RLS operational-audit writes.
+//! `adapters::request_guard_repo` — RequestGuard's first PostgreSQL persistence seam: effective-entitlement reads and
+//!   FORCE-RLS operational-audit writes.
+//! Depends-on: crates=[humaux-domain, serde_json, sqlx]; services=[PostgreSQL(role_gateway)
+//!   r=[control.entitlement_snapshots] x=[control.audit_event_insert]]; env=[]; modules=[adapters::postgres,
+//!   adapters::quota_repo, domain::audit, domain::error, domain::identity]
+//! Called-by: [adapters::confirm_token_repo, adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, gateway::guard, tests]
+//! Invariants: [policy stays in RequestGuard; this reads the effective entitlement snapshot and commits quota
+//!   transitions together with the §77 audit row in one transaction; a missing entitlement is EntitlementRequired]
+//! Spec: Baseline §77
 //!
 //! Policy stays in RequestGuard. This adapter reads the effective snapshot and commits
 //! read-request quota transitions together with §77's audit writer, preserving the rule
@@ -96,6 +103,7 @@ pub async fn read_effective_entitlements(
     pool: &RuntimeDbPool,
     authorization: &AuthorizationScope,
 ) -> Result<EffectiveEntitlementFacts, ErrorCode> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `read_effective_entitlements`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     set_authorization_local(&mut txn, authorization).await?;
     let row = sqlx::query(
@@ -138,6 +146,7 @@ pub async fn audit_event_insert(
     tenant: AuditTenant<'_>,
     event: &AuditEvent,
 ) -> Result<AuditEventId, ErrorCode> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `audit_event_insert`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     let id = audit_event_insert_in_txn(&mut txn, tenant, event).await?;
     txn.commit().await.map_err(db_error)?;
@@ -239,6 +248,7 @@ pub async fn reserve_read_with_audit(
     if reserved_audit.resource_id != operation || reserved_audit.result != "OK" {
         return Err(ErrorCode::InvalidInput);
     }
+    // dep: PostgreSQL(role_gateway) — transaction entry for `reserve_read_with_audit`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     let reservation = match quota_repo::reserve_bmo_in_txn(
         &mut txn,
@@ -273,6 +283,7 @@ pub async fn settle_read_with_audit(
     if reservation.is_some_and(|r| r.request_id() != request_id) {
         return Err(ErrorCode::Conflict);
     }
+    // dep: PostgreSQL(role_gateway) — transaction entry for `settle_read_with_audit`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     let mut consumed = false;
     if let Some(reservation) = reservation {

@@ -1,5 +1,16 @@
-//! Card E1 integration tests — §8.5.1 affect annotation axis (migration 0156, ADR-0030) against
-//! the *real* `private.memory_affects` under the real runtime roles (`SET LOCAL ROLE`):
+//! `adapters::tests::memory_affects` — Card E1 integration tests — §8.5.1 affect annotation axis (migration 0156,
+//!   ADR-0030) against the *real* `private.memory_affects` under the real runtime roles (`SET LOCAL ROLE`).
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, uuid]; services=[PostgreSQL(any)
+//!   w=[control.memberships, control.private_reasoning_domains, control.tenants, control.users, private.events,
+//!   private.evidence_affects, private.evidence_objects, private.memory_affects, private.memory_evidence,
+//!   private.memory_records, private.subjects] x=[private.memory_affects_inherit_from_evidence,
+//!   private.reject_memory_affect_update], PostgreSQL(role_gateway), PostgreSQL(role_private_worker)];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::affect_repo, domain::affect, domain::ids, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [affect CHECK sets equal the closed enums and out-of-range basis points are rejected, never clamped;
+//!   rows are immutable (UPDATE 23514, DELETE 42501) and cascade with memory/subject; an isolation setup failure is a
+//!   fixture error]
+//! Spec: Baseline §8.5.1; ADR-0030; §78.2; §37; §79.2
 //!
 //!  1. `affect_checks_match_domain_enums` — the `affect_kind` / `label` / `target_scope_kind`
 //!     CHECK literal sets equal the closed `AffectKind` / `EmotionLabel` /
@@ -44,6 +55,7 @@ impl DbIntegrationFixture for AffectFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut client = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
         let ready: bool = client
@@ -335,6 +347,7 @@ fn rows_are_immutable_and_cascade_with_memory_and_subject() {
             .get(0);
 
         // role_gateway annotates (INSERT grant + RLS WITH CHECK through the parent memory).
+        // dep: PostgreSQL(role_gateway) — role switch before the scoped statements for `rows_are_immutable_and_cascade_with_memory_and_subject`
         txn.batch_execute(&format!(
             "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant}'; \
              SET LOCAL humaux.user_id = '{user}';"
@@ -462,6 +475,7 @@ fn rows_are_immutable_and_cascade_with_memory_and_subject() {
 
         // §37 subject ERASE: the affect about the person is terminal, the memory (and the
         // MOOD row, which targets nobody) survive.
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "DELETE FROM private.subjects WHERE subject_id = $1",
             &[&person],
@@ -481,6 +495,7 @@ fn rows_are_immutable_and_cascade_with_memory_and_subject() {
             .get(0);
         assert_eq!(memory_alive, 1);
         // Memory purge cascades the rest (the cascade is the owner's DELETE, not a role's).
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "DELETE FROM private.memory_records WHERE memory_id = $1",
             &[&memory],
@@ -521,6 +536,7 @@ fn affect_recheck_is_one_round_trip_for_the_whole_candidate_set() {
             memory_ids.push(memory);
         }
         // The read exactly as the gateway's hydrate gate issues it: role_gateway + tenant GUCs.
+        // dep: PostgreSQL(role_gateway) — role switch before the scoped statements for `affect_recheck_is_one_round_trip_for_the_whole_candidate_set`
         txn.batch_execute(&format!(
             "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant}'; \
              SET LOCAL humaux.user_id = '{user}';"
@@ -567,6 +583,7 @@ fn evidence_affects_copy_onto_the_primary_memory_under_private_worker() {
             .get(0);
 
         // remember.put's transaction: role_gateway declares the affects on the Evidence.
+        // dep: PostgreSQL(role_gateway) — role switch before the scoped statements for `evidence_affects_copy_onto_the_primary_memory_under_private_worker`
         txn.batch_execute(&format!(
             "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant}'; \
              SET LOCAL humaux.user_id = '{user}';"
@@ -661,18 +678,21 @@ fn evidence_affects_copy_onto_the_primary_memory_under_private_worker() {
         // SELECT(evidence_affects) + INSERT(memory_affects) grants and RLS.
         let born = seed_memory_record(&mut txn, tenant);
         let supporting = seed_memory_record(&mut txn, tenant);
+        // dep: PostgreSQL(role_private_worker) — role switch before the scoped statements for `evidence_affects_copy_onto_the_primary_memory_under_private_worker`
         txn.batch_execute(&format!(
             "SET LOCAL ROLE role_private_worker; SET LOCAL humaux.tenant_id = '{tenant}'; \
              SET LOCAL humaux.user_id = '{}';",
             Uuid::nil()
         ))
         .expect("private worker context");
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, ordinal) \
              VALUES ($1, $2, 'PRIMARY', 0)",
             &[&born, &evidence],
         )
         .expect("private_worker links the PRIMARY evidence");
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, ordinal) \
              VALUES ($1, $2, 'SUPPORTING', 0)",

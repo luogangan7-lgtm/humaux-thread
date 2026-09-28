@@ -1,5 +1,9 @@
-//! `domain::authority` — `Authority` value object, its four-tier adjudication order, and the
-//! `AuthorityClass` / `AuthorityStatus` / `Confidence` types it is built from (§59 / §59.1).
+//! `domain::authority` — `Authority` value object, its four-tier adjudication order, and the `AuthorityClass` /
+//!   `AuthorityStatus` / `Confidence` types it is built from (§59 / §59.1).
+//! Depends-on: crates=[uuid]; services=[]; env=[]; modules=[domain::error, domain::evidence, domain::ids, domain::memory]
+//! Called-by: [adapters::affect_repo, adapters::consolidate_repo, adapters::consolidation_reasoner, adapters::context_repo, adapters::contribution_entry_repo, adapters::distill_reasoner, adapters::distill_repo, adapters::memory_governance_repo, adapters::private_projection_registry, adapters::projection_worker, adapters::qdrant, adapters::read_materialize, application::confirm, application::consolidate, application::correct, application::pin, application::supersede, domain::consolidate, domain::context, domain::lifecycle, domain::policy, domain::public, gateway::mcp_application, gateway::memory, humaux-consolidation-worker, private-worker::distill, projection::card, retrieval::compiler, retrieval::request, tests]
+//! Invariants: []
+//! Spec: Baseline §8.7; §10; §10.1
 //!
 //! §59.1 freezes: this section promotes §10's "recommended" `authority_class`/`confidence`/
 //! `status` to required. §10's priority chain itself is unchanged, it merely gains typed

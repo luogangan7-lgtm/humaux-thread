@@ -1,5 +1,22 @@
-//! `retrieval-provider::adapters` — T7.1: §19 "dashscope" and "custom" adapter slots (spec's
-//! own `retrieval-provider/` tree, line ~3483) plus the Contract Tests' test double.
+//! `retrieval-provider::adapters` — T7.1: §19 "dashscope" and "custom" adapter slots (spec's own
+//!   `retrieval-provider/` tree, line ~3483) plus the Contract Tests' test double.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-domain, humaux-infra-egress, humaux-local-secret-scan,
+//!   humaux-retrieval, humaux-testkit, postgres, serde, serde_json, tokio, uuid]; services=[PostgreSQL(any)
+//!   r=[ops.data_disclosure_sources, ops.data_disclosures, ops.model_call_ledger,
+//!   ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations,
+//!   private.retrieval_query_sources] w=[control.memberships, control.private_reasoning_domains,
+//!   control.retrieval_provider_admission_limits, control.tenants, control.users, control.workspaces, private.events,
+//!   private.evidence_objects], PostgreSQL(owner), PostgreSQL(role_retrieval_worker), DashScope];
+//!   env=[HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
+//!   HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN]; modules=[adapters::disclosure, adapters::model_call_ledger,
+//!   adapters::postgres, adapters::provider_budget, adapters::retrieval_query_source, domain::dataclass,
+//!   domain::egress, domain::error, domain::ids, domain::ledger, infra-egress::http, retrieval-provider::admission,
+//!   retrieval-provider::contract, retrieval-provider::metrics]
+//! Called-by: [retrieval-worker::main, tests]
+//! Invariants: [the only module naming DashScope wire shapes (§19 gate); every call reserves budget/ledger first and
+//!   a refused reservation is CostBudgetExceeded with no dispatch; provider failures map to
+//!   ProviderTransient/Permanent]
+//! Spec: §19; §7
 //!
 //! §19 Architecture Gate: "Only retrieval-provider/adapters may import provider client" — this
 //! file (and the crate it lives in) is the one place in the workspace that names DashScope's
@@ -846,6 +863,7 @@ impl DashscopeEmbeddingProvider {
             return Err(err);
         }
         let started_at = Instant::now();
+        // dep: DashScope — test double's transport.call dispatches the fake DashScope embedding response.
         let call_result = self.transport.call(permit, payload).await;
         let latency = started_at.elapsed();
 
@@ -1182,6 +1200,7 @@ mod tests {
             if let Some((dsn, tenant_id, logical_call_id)) = pre_send_probe {
                 let count = tokio::task::spawn_blocking(move || {
                     let mut client =
+                        // dep: PostgreSQL(role_retrieval_worker) — connects with the exact 127.0.0.1:61719 guard DSN this fixture requires.
                         Client::connect(&dsn, NoTls).map_err(|_| ErrorCode::Internal)?;
                     Ok::<i64, ErrorCode>(
                         client
@@ -1269,6 +1288,7 @@ mod tests {
             (Some(tenant_id), None, Some("RETRIEVAL_EMBEDDING")),
         ] {
             admin
+                // dep: PostgreSQL(owner) — seeds control.retrieval_provider_admission_limits so the query provider fixture never rate-limits itself.
                 .execute(
                     "INSERT INTO control.retrieval_provider_admission_limits \
                        (tenant_id,provider_id,region,purpose,tpm_limit,rpm_limit,effective_from) \
@@ -1310,6 +1330,7 @@ mod tests {
                 "HUMAUX_RETRIEVAL_WORKER_PG_DSN",
                 Some("role_retrieval_worker"),
             )?;
+            // dep: PostgreSQL(owner) — admin connection used to seed the query-provider integration fixture.
             let mut admin = Client::connect(&owner_dsn, NoTls)
                 .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
             let ready: bool = admin
@@ -1327,6 +1348,7 @@ mod tests {
                     "migration 0118 is not applied".into(),
                 ));
             }
+            // dep: PostgreSQL(role_retrieval_worker) — connects to verify the worker role identity guard before the fixture proceeds.
             let role_ok: bool = Client::connect(&retrieval_dsn, NoTls)
                 .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?
                 .query_one(
@@ -1344,6 +1366,7 @@ mod tests {
             let tenant_id = seed_query_provider_tenant(&mut admin)?;
             let user_id = uuid::Uuid::now_v7();
             admin
+                // dep: PostgreSQL(owner) — seeds control.users for the query-provider fixture.
                 .execute(
                     "INSERT INTO control.users(user_id,state) VALUES($1,'ACTIVE')",
                     &[&user_id],
@@ -1357,6 +1380,7 @@ mod tests {
                 .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
                 .get(0);
             admin
+                // dep: PostgreSQL(owner) — seeds control.memberships for the query-provider fixture.
                 .execute(
                     "INSERT INTO control.memberships(tenant_id,user_id,role,state) VALUES($1,$2,'member','ACTIVE')",
                     &[&tenant_id, &user_id],
@@ -1379,6 +1403,7 @@ mod tests {
                 .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
                 .get(0);
             admin
+                // dep: PostgreSQL(owner) — seeds private.events for the query-provider fixture.
                 .execute(
                     "INSERT INTO private.events(event_id,event_kind,payload) VALUES($1,'TOOL_CALL','{}'::jsonb)",
                     &[&evidence_id],
@@ -1386,6 +1411,7 @@ mod tests {
                 .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+            // dep: PostgreSQL(role_retrieval_worker) — opens the role-scoped connection for `isolate`
             let pool = rt
                 .block_on(RetrievalWorkerDbPool::connect(&retrieval_dsn))
                 .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
@@ -1690,6 +1716,7 @@ mod tests {
         run_db_fixture::<QueryProviderFixture, _>("dashscope_budget_rejection", |mut handle| {
             handle
                 .admin
+                // dep: PostgreSQL(owner) — seeds control.retrieval_provider_admission_limits for the admission-limit contract test.
                 .execute(
                     "UPDATE control.retrieval_provider_admission_limits SET tpm_limit=1 \
                      WHERE tenant_id=$1 AND provider_id='dashscope' \

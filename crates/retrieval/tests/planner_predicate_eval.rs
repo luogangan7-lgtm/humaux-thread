@@ -1,4 +1,11 @@
-//! §20.3 `planner_predicate` eval harness. Reads `evals/planner_predicate/dataset.tsv` and
+//! `retrieval::tests::planner_predicate_eval` — §20.3 `planner_predicate` eval harness.
+//! Depends-on: crates=[sha2]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[retrieval::planner,
+//!   retrieval::predicate_eval, retrieval::predicate_registry]
+//! Called-by: [cargo-test]
+//! Invariants: [no DB or network; CARGO_MANIFEST_DIR only locates the migrations it parses, a missing file fails the test]
+//! Spec: §20.3; §55.3; §3; §78.3
+//!
+//! Reads `evals/planner_predicate/dataset.tsv` and
 //! asserts the frozen asymmetric judgement: 漏判 (miss) ≤ 15% scored against the judged base
 //! (expected-positive rows — see `confusion_matrix_meets_frozen_thresholds`), 误判 (wrong) == 0
 //! exactly (§20.3). Also enforces §20.3's closing sentence — a registry row needs ≥5 related
@@ -208,6 +215,8 @@ mod migration_fixture {
     /// the primary key; this parser does not need to model that failure, only mirror what a
     /// successful migration sequence leaves behind).
     fn parse_inserted_rows(sql: &str) -> BTreeMap<String, PredicateRow> {
+        // dep-map: allow table-write — parses migration SQL text; no DB connection
+        // dep-map: allow table-undeclared — parses migration SQL text; no DB connection
         let marker = "INSERT INTO control.retrieval_predicates";
         let mut rows = BTreeMap::new();
         let mut rest = sql.to_string();
@@ -339,6 +348,7 @@ mod migration_fixture {
     /// before migration 0079, {memory_id, tenant_id, visibility_workspace_id, memory_type,
     /// superseded_at} after).
     pub fn indexed_columns() -> BTreeSet<String> {
+        // dep-map: allow table-undeclared — parses migration SQL text; no DB connection
         let marker = "ON private.memory_records (";
         let mut cols = BTreeSet::new();
         for (path, sql) in all_migration_sql() {

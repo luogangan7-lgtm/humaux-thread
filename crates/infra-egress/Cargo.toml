@@ -1,6 +1,7 @@
 [package]
 name = "humaux-infra-egress"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -14,19 +15,24 @@ workspace = true
 # through `humaux_infra_network::reqwest` — it deliberately does NOT list `reqwest` directly,
 # so `xtask architecture-check`'s manifest-level check stays a strict
 # `{crates/infra-network/Cargo.toml}` equality.
+# why: humaux-infra-network dependency; used-by: [infra-egress::http, infra-egress::raw, infra-egress::resolver]
 humaux-infra-network = { path = "../infra-network" }
 # `ExternalCall` (§7.3, `humaux-domain`) is declared `#[async_trait]` there; this crate's impl
 # of it needs the identical macro.
+# why: async-trait dependency; used-by: [infra-egress::http, tests]
 async-trait = "0.1"
+# why: humaux-domain dependency; used-by: [infra-egress::http, tests]
 humaux-domain = { path = "../domain" }
 # `EgressSecret` (http.rs): zeroizes its backing buffer on drop. Already resolved transitively
 # (aes-gcm et al. depend on it, see Cargo.lock) — named directly here rather than hand-rolling
 # volatile-write zeroing, which this crate has no other reason to get subtly wrong.
+# why: zeroize dependency; used-by: [infra-egress::http]
 zeroize = "1"
 # `EnvCredentialSource` (http.rs) reads its named variable through this crate's
 # `config_registry::read_env_var` — the workspace's one sanctioned raw `std::env::var` call
 # site (§50.1) — rather than naming `std::env::var` itself, which `xtask`'s §78 boundary lint
 # forbids outside `crates/contracts/`/`bins/*`/`xtask/`/`tests/`.
+# why: humaux-contracts dependency; used-by: [infra-egress::http]
 humaux-contracts = { path = "../contracts" }
 # ADR-0039: `resolver::PinnedResolver` runs the injected (possibly blocking, e.g.
 # `SystemCheckedResolve`'s `std::net::ToSocketAddrs`) `CheckedDnsResolve` on a blocking thread
@@ -34,12 +40,15 @@ humaux-contracts = { path = "../contracts" }
 # `reqwest::dns::Resolve::resolve` is polled on the caller's async runtime, and a blocking
 # syscall there would stall it. "rt" is the minimum feature `spawn_blocking` needs; same
 # dependency and same reason as `humaux-infra-cell`'s (`transport::ValidatingResolver`).
+# why: tokio dependency; used-by: [infra-egress::http, infra-egress::raw, infra-egress::resolver, tests]
 tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 # "net"/"io-util" back the tests' real `TcpListener` fixtures (§79: observe actual network
 # behavior instead of inferring it from an error-code side channel); "time" backs
 # `tokio::time::{sleep,timeout}`.
+# why: tokio dependency; used-by: [infra-egress::http, infra-egress::raw, infra-egress::resolver, tests]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 # tests below mint throwaway `ProcessorId(Uuid::now_v7())` fixtures directly.
+# why: uuid dependency; used-by: [infra-egress::http, tests]
 uuid = { version = "1.25.0", features = ["v7"] }

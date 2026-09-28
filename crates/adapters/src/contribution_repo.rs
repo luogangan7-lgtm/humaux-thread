@@ -1,4 +1,15 @@
 //! `adapters::contribution_repo` — §12/§13 physical IO for public contributions.
+//! Depends-on: crates=[humaux-domain, serde_json, sqlx]; services=[PostgreSQL(any)
+//!   r=[control.anonymous_source_lineage, private.evidence_objects, private.memory_records, public.sources,
+//!   public.syntheses, public.synthesis_inputs, staging.sanitized_public_candidates] w=[ops.outbox, public.claims,
+//!   public.provenance_edges, public.source_closure, staging.contribution_release_sources,
+//!   staging.contribution_releases] x=[staging.assert_active_release_rights, staging.lock_contribution_release]];
+//!   env=[]; modules=[adapters::postgres, adapters::remember, domain::error, domain::ids, domain::public]
+//! Called-by: [tests]
+//! Invariants: [private releases are written only on role_private_worker and public promotion only on
+//!   role_public_worker (§12/§13); there is no raw-pool entry point; tenant or visibility failures are
+//!   TenantBoundary/NotFound]
+//! Spec: Baseline §12; §13
 //!
 //! The typed pools are part of this module's contract: private releases are written only by
 //! `role_private_worker`, while public promotion and closure work are written only by
@@ -50,6 +61,7 @@ pub async fn create_release(
     tenant_id: TenantId,
     release: &ContributionRelease,
 ) -> Result<Uuid, ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     set_tenant_local(&mut txn, tenant_id).await?;
 
@@ -159,6 +171,7 @@ pub async fn revoke_release(
     tenant_id: TenantId,
     release_id: Uuid,
 ) -> Result<bool, ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     set_tenant_local(&mut txn, tenant_id).await?;
     sqlx::query("SELECT staging.lock_contribution_release($1, true)")
@@ -259,6 +272,7 @@ pub async fn promote_claim(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     set_tenant_local(&mut txn, tenant_id).await?;
 
@@ -351,6 +365,7 @@ pub async fn recompute_source_closure(
     pool: &PublicWorkerDbPool,
     synthesis_id: Uuid,
 ) -> Result<u64, ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *txn)

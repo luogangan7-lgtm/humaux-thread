@@ -1,4 +1,21 @@
-//! Shared, isolated §34.0.1 PostgreSQL fixture for adapter and gateway integration tests.
+//! `adapters::tests::support::operation_receipt_fixture` — Shared, isolated §34.0.1 PostgreSQL fixture for adapter
+//!   and gateway integration tests.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, sqlx, tokio];
+//!   services=[PostgreSQL(owner) w=[control.api_keys, control.audit_events, control.entitlement_snapshots,
+//!   control.memberships, control.operation_receipts, control.private_reasoning_domains, control.quota_windows,
+//!   control.rate_buckets, control.tenants, control.usage_reservations, control.users, control.workspace_memberships,
+//!   control.workspaces, coord.tasks, ops.outbox, ops.selection_snapshot_items, ops.selection_snapshots,
+//!   private.context_bindings, private.continuity_facet_evidence_links, private.continuity_facet_memory_links,
+//!   private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.events,
+//!   private.evidence_objects, private.memory_evidence, private.memory_records, projection.private_memory_points,
+//!   projection.stream_checkpoints, projection.stream_log, projection.tenant_placements]
+//!   x=[control.check_operation_receipt], PostgreSQL(role_gateway), PostgreSQL(role_maintenance)];
+//!   env=[HUMAUX_GATEWAY_PG_DSN, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres,
+//!   adapters::quota_repo, domain::identity, domain::ids, humaux-testkit]
+//! Called-by: [adapters::tests::auth_scope_rls, adapters::tests::membership_lifecycle, adapters::tests::operation_receipts, gateway::mcp_application, gateway::tests::continuity_get, gateway::tests::mcp_gateway, gateway::tests::semantic_recall_wiring]
+//! Invariants: [test-only, included by #[path]; runtime writes are real role_gateway logins and the owner connection
+//!   only seeds/cleans the fixture tenant; an isolation setup failure is a fixture error]
+//! Spec: Baseline §25.4; §34.0.1; §79.2; ADR-0035
 //!
 //! This module is test-only and included by relative path; it is not an adapters export or a
 //! replacement for `humaux_testkit`. Runtime writes remain actual `role_gateway` logins.
@@ -171,6 +188,7 @@ impl DbIntegrationFixture for Fixture {
         };
         let (admin_dsn, gateway_dsn, maintenance_dsn) = fixture_dsns()?;
 
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&admin_dsn, NoTls).map_err(setup_failed)?;
         let required: bool = admin
             .query_one(
@@ -187,6 +205,7 @@ impl DbIntegrationFixture for Fixture {
             ));
         }
 
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut gateway = Client::connect(&gateway_dsn, NoTls).map_err(setup_failed)?;
         let gateway_is_real_login: bool = gateway
             .query_one(
@@ -207,9 +226,11 @@ impl DbIntegrationFixture for Fixture {
         let reasoning_domain_id = Uuid::new_v4();
         let rt = tokio::runtime::Runtime::new().map_err(setup_failed)?;
         let runtime = rt
+            // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
             .block_on(RuntimeDbPool::connect(&gateway_dsn))
             .map_err(setup_failed)?;
         let maintenance = rt
+            // dep: PostgreSQL(role_maintenance) — test opens a direct PG connection for setup/verification
             .block_on(MaintenanceDbPool::connect(&maintenance_dsn))
             .map_err(setup_failed)?;
         let auth = AuthorizationScope::new(
@@ -679,6 +700,7 @@ impl Handle {
     /// Opens a second real gateway-login client for a lock-holder test; it never derives a role
     /// or password from the owner connection.
     pub(crate) fn gateway_client(&self) -> Result<Client, postgres::Error> {
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         Client::connect(&self.gateway_dsn, NoTls)
     }
 
@@ -714,6 +736,7 @@ impl Handle {
             .map(|(_, db)| db)
             .ok_or_else(|| "validated gateway DSN lost its database".to_owned())?;
         let proxied = format!("{credential}@127.0.0.1:{proxy_port}/{database}?sslmode=disable");
+        // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
         RuntimeDbPool::connect(&proxied)
             .await
             .map_err(|_| "loopback proxy gateway login rejected".to_owned())
@@ -721,6 +744,7 @@ impl Handle {
 
     /// Opens another checked role_gateway pool without exposing fixture credentials to a test.
     pub(crate) async fn fresh_runtime(&self) -> Result<RuntimeDbPool, String> {
+        // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
         RuntimeDbPool::connect(&self.gateway_dsn)
             .await
             .map_err(|_| "fresh gateway login rejected".to_owned())
@@ -729,6 +753,7 @@ impl Handle {
     /// Opens a second owner client for relation-lock tests; this is fixture teardown identity,
     /// never a request-path identity.
     pub(crate) fn owner_client(&self) -> Result<Client, postgres::Error> {
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         Client::connect(&self.admin_dsn, NoTls)
     }
 }

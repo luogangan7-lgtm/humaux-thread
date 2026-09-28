@@ -1,5 +1,8 @@
-//! `contracts::feature_registry` — `FeatureActivationKind` 闭集 + `config/features.toml` 解析
-//! （§50.1）。
+//! `contracts::feature_registry` — `FeatureActivationKind` 闭集 + `config/features.toml` 解析 （§50.1）。
+//! Depends-on: crates=[serde, toml]; services=[]; env=[]; modules=[]
+//! Called-by: [tests, xtask::config_check]
+//! Invariants: []
+//! Spec: Baseline §1.14; §50; §50.1
 //!
 //! 唯一静态真源：`config/features.toml`。本模块只做纯文本 → 类型解析与结构校验，不接触文件
 //! 系统、也不比对 §1.14 mechanism-registry 围栏块本体——那一步需要读取

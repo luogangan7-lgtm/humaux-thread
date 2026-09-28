@@ -1,5 +1,11 @@
-//! `adapters::scheduler` — §32.0 Distributed Scheduler Leadership + §32.1 Scheduler
-//! Singleton/Failover Gate (G32-1/G80-38).
+//! `adapters::scheduler` — §32.0 Distributed Scheduler Leadership + §32.1 Scheduler Singleton/Failover Gate
+//!   (G32-1/G80-38).
+//! Depends-on: crates=[serde_json, sqlx]; services=[PostgreSQL(role_gateway) w=[ops.jobs, ops.scheduler_leases]];
+//!   env=[]; modules=[adapters::postgres]
+//! Called-by: [tests]
+//! Invariants: [a periodic enqueue needs both the logical lease (one INSERT into ops.scheduler_leases, 23505 =
+//!   HeldByOther) and the ops.jobs idempotency constraint (§32.1); a dead replica simply stops racing]
+//! Spec: Baseline §32.1; §80.1
 //!
 //! Two DB-backed layers, both required (§32.1 "周期 enqueue 必须同时有逻辑 lease 和数据库
 //! 幂等约束"):
@@ -230,6 +236,7 @@ pub async fn claim_and_enqueue(
     due: &DueSchedule,
 ) -> Result<Option<EnqueueOutcome>, SchedulerError> {
     let key = idempotency_key(&due.schedule_id, due.planned_at);
+    // dep: PostgreSQL(role_gateway) — transaction entry for `claim_and_enqueue`
     let mut tx = pool.pool().begin().await?;
 
     let lease = claim_lease(&mut tx, owner, ttl_seconds, due, &key).await?;

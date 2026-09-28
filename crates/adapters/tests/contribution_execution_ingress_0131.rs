@@ -1,4 +1,11 @@
-//! Focused PostgreSQL 18 gate for the real Phase 9 production-core start command.
+//! `adapters::tests::contribution_execution_ingress_0131` — Focused PostgreSQL 18 gate for the real Phase 9
+//!   production-core start command.
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-testkit, postgres, tokio, uuid]; services=[PostgreSQL(any) r=[ops.contribution_execution_job_links, ops.jobs, private.contribution_execution_sources, private.contribution_executions] w=[control.contribution_policies]];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_entry_repo, adapters::contribution_execution_ingress, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::tests::support::contribution_fixture, application::consolidate, application::contribute, application::contribution_execution, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [enters through ContributionExecutionIngress::start_manual only (one direct enqueue seeds a legacy-v1
+//!   root); no provider runs; without a DB it SKIPs unless HUMAUX_REQUIRE_DB, then panics]
+//! Spec: none
 //!
 //! The test enters through `ContributionExecutionIngress::start_manual`; direct repository
 //! enqueue is used once only to seed a legacy-v1 compatibility root. No provider or Phase 10
@@ -25,14 +32,10 @@ use humaux_application::{
 use postgres::Client;
 use uuid::Uuid;
 
+/// Env probe only; the skip goes through `humaux_testkit::skip_or_fail`, which turns a
+/// missing DSN into a failure under `HUMAUX_REQUIRE_DB=1` (§79.2, ADR-0051 D-K).
 fn require_db() -> bool {
-    match std::env::var("HUMAUX_TEST_PG_DSN") {
-        Ok(_) => true,
-        Err(_) if std::env::var("HUMAUX_REQUIRE_DB").as_deref() == Ok("1") => {
-            panic!("HUMAUX_REQUIRE_DB=1 requires HUMAUX_TEST_PG_DSN")
-        }
-        Err(_) => false,
-    }
+    std::env::var("HUMAUX_TEST_PG_DSN").is_ok()
 }
 
 fn assert_same_ids(expected: EnqueuedContributionExecution, actual: EnqueuedContributionExecution) {
@@ -90,7 +93,11 @@ fn assert_conflict(
 #[allow(clippy::too_many_lines)]
 fn production_core_is_atomic_v2_complete_and_v1_compatible() {
     if !require_db() {
-        eprintln!("SKIP: HUMAUX_TEST_PG_DSN is not set");
+        humaux_testkit::skip_or_fail(
+            "production_core_is_atomic_v2_complete_and_v1_compatible",
+            "HUMAUX_TEST_PG_DSN",
+            humaux_testkit::ExternalDep::Postgres,
+        );
         return;
     }
 

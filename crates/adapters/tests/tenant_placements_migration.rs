@@ -1,5 +1,12 @@
-//! T5.4+T5.6 integration test — `projection.tenant_placements` (§17.3, migration 0068)
-//! against a real Postgres. Same convention as `stream_repo.rs`: shared table, each test
+//! `adapters::tests::tenant_placements_migration` — T5.4+T5.6 integration test — `projection.tenant_placements`
+//!   (§17.3, migration 0068) against a real Postgres.
+//! Depends-on: crates=[humaux-adapters, humaux-testkit, postgres, sqlx]; services=[PostgreSQL(owner) w=[control.tenants, projection.tenant_placements]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::qdrant, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [rows are scoped to a throwaway tenant; the 0068 CHECK/unique constraints are asserted on the live
+//!   table; the Qdrant-side cross-tenant proof lives in qdrant_live.rs; a missing DB goes through skip_or_fail]
+//! Spec: Baseline §6.1; §6.2.1; §17.1
+//!
+//! Same convention as `stream_repo.rs`: shared table, each test
 //! scopes rows to its own throwaway `control.tenants` row cleaned up on drop.
 //!
 //! Three-state skip (§79.2): no `HUMAUX_TEST_PG_DSN`, unreachable DB, or migration 0068 not
@@ -52,6 +59,7 @@ impl DbIntegrationFixture for PlacementFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -186,6 +194,7 @@ fn cross_tenant_rls_hides_other_tenants_placement_rows() {
                 .expect("seed tenant B row");
 
             let worker_dsn = dsn_as_role(&h.dsn, "role_retrieval_worker");
+            // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
             let mut worker = match Client::connect(&worker_dsn, NoTls) {
                 Ok(c) => c,
                 Err(e) => {

@@ -1,5 +1,12 @@
-//! `email::test_double` — an in-memory [`EmailProvider`] for tests (task brief item 1:
-//! "一个 test double"). Never dials out; every `send` call is recorded and answered from a
+//! `adapters::email::test_double` — an in-memory [`EmailProvider`] for tests (task brief item 1: "一个 test double").
+//! Depends-on: crates=[async-trait]; services=[]; env=[]; modules=[adapters::email]
+//! Called-by: [tests]
+//! Invariants: [never dials out; each send is recorded and answered from the configured outcome queue, so provider
+//!   failures propagate to the caller exactly as scripted]
+//! Spec: none
+//! dep-map: allow table-undeclared — panic message text names ops.email_outbox for diagnostics only, no DB access here
+//!
+//! Never dials out; every `send` call is recorded and answered from a
 //! caller-configured outcome queue, so a test can assert both what was sent and how a
 //! provider failure propagates without a real SMTP server.
 

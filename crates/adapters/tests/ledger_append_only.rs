@@ -1,5 +1,10 @@
-//! §75.2 / §19.1 append-only：两个账本的守卫在 UPDATE / DELETE / TRUNCATE 三条路径上都
-//! 必须拒绝。
+//! `adapters::tests::ledger_append_only` — §75.2 / §19.1 append-only：两个账本的守卫在 UPDATE / DELETE / TRUNCATE 三条路径上都 必须拒绝。
+//! Depends-on: crates=[humaux-testkit, postgres, uuid]; services=[PostgreSQL(any) w=[control.credit_ledger,
+//!   control.tenants, ops.model_call_ledger]]; env=[HUMAUX_TEST_PG_DSN]; modules=[humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [UPDATE, DELETE and TRUNCATE on control.credit_ledger and ops.model_call_ledger must all be refused,
+//!   TRUNCATE included (0101's statement trigger); an isolation setup failure is a fixture error, not a pass]
+//! Spec: Baseline §75.2; §19.1; §80.1; §79.2
 //!
 //! **这个文件存在的理由是它此前不存在。** `control.credit_ledger` 的
 //! `credit_ledger_reject_mutation` 触发器从 0032 写下起，全仓 `tests/` 里一次都没被碰过——
@@ -50,6 +55,7 @@ impl DbIntegrationFixture for LedgerFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 

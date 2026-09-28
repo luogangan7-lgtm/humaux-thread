@@ -1,6 +1,6 @@
 # Humaux Thread — 企业级开源 Agent Persistent Context Infrastructure
 
-> 版本：Architecture Baseline 2.8 Product-Named Development Handoff（2.3 用户调整版 + 2026-08-25 外部实现/规范复核）  
+> 版本：Architecture Baseline 2.9 Product-Named Development Handoff（2.3 用户调整版 + 2026-08-25 外部实现/规范复核）  
 > 日期：2026-08-25  
 > 主语言：Rust 1.98 / Edition 2024  
 > 目标：从 0→1 开发 Humaux Thread，不延续旧系统的模块边界；保留必要数据兼容与行为契约。

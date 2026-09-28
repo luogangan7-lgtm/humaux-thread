@@ -8,8 +8,8 @@ members = ["crates/*", "bins/*", "xtask"]
 edition = "2024"
 version = "0.1.0"
 license = "Apache-2.0"
-# ADR-0050 D-G: declared MSRV (§70). Enforced pin is rust-toolchain.toml; members apply this only
-# once they declare `rust-version.workspace = true` (open item).
+# ADR-0050 D-G: declared MSRV (§70). Enforced pin is rust-toolchain.toml; every member declares
+# `rust-version.workspace = true` (ADR-0051 D-L, closed the ADR-0050 open item).
 rust-version = "1.98"
 repository = "https://github.com/luogangan7-lgtm/humaux-thread"
 

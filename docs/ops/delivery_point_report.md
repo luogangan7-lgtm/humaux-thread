@@ -593,6 +593,18 @@ The ranked list, evidence and fix sketches are in the audit report. **This repor
 verdicts stand for what the rehearsal exercised; the audit is the record of what it did
 not, and it withdraws the "ready for production" reading of §5.**
 
+### 6.11 Folded debts closed by card 26 (ADR-0051 D-L)
+
+- **ARCH-7, second half.** `Baseline_2.9.md` line 3 now reads "Architecture Baseline 2.9" (was still "2.8" after
+  card 25 pinned the toolchain); every member `Cargo.toml` carries `rust-version.workspace = true`.
+- **Gate-truth breadth (review P2, card 25).** The DB-bound set is now computed from the dependency map itself
+  (`dep_map::test_target_services`, ADR-0051 D-K) instead of the 4-marker allowlist: 28 raw-DSN/raw-Qdrant
+  integration binaries that were invisible to `HUMAUX_REQUIRE_DB` are now covered, and the 4 ad-hoc `SKIP:` paths
+  were converted to `skip_or_fail` calls.
+- **`migration_rehearsal.rs:344` and `soak.rs:1366` (review P2, card 25).** Fixed under ADR-0051 D-L: manifest
+  checks containing `;` outside comments/literals are refused at parse time and EXPLAIN goes over the extended
+  protocol; the reused-pid defence matches the executable basename, not the full `ps` path.
+
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 
 The user approved the whole list on 2026-09-26 ("需要清理删除的进行清理删除，其他的你看着办"). Every

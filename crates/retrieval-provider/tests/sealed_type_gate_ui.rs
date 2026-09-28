@@ -1,5 +1,13 @@
-//! §1.2.3/§41.4 compile-time sentinel: `EmbeddingProvider::embed_queries`'s `&[SealedRetrievalQuery]`
-//! parameter rejects a raw `Vec<String>` at compile time. Construction belongs only to the
+//! `retrieval-provider::tests::sealed_type_gate_ui` — §1.2.3/§41.4 compile-time sentinel:
+//!   `EmbeddingProvider::embed_queries`'s `&[SealedRetrievalQuery]` parameter rejects a raw `Vec<String>` at compile
+//!   time.
+//! Depends-on: crates=[trybuild]; services=[];
+//!   env=[]; modules=[]
+//! Called-by: [cargo-test]
+//! Invariants: []
+//! Spec: §1.2.3; §41.4
+//!
+//! Construction belongs only to the
 //! canonical pinned scanner path, so this UI gate deliberately has no positive constructor case.
 //! `crates/domain/tests/egress_topology_ui.rs` already uses for `EgressPermit`'s own topology.
 

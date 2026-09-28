@@ -1,4 +1,10 @@
-//! Real-PostgreSQL R4-C worker coverage with an in-process recording provider.
+//! `private-worker::tests::contribution_execution_runner` — Real-PostgreSQL R4-C worker coverage with an in-process
+//!   recording provider.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-testkit, postgres, serde_json, sha2, uuid]; services=[PostgreSQL(owner) r=[ops.contribution_execution_job_links, private.contribution_executions, staging.contribution_candidates] w=[ops.jobs]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::byok, adapters::contribution_entry_repo, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::contribution_scan, adapters::disclosure, adapters::jobs, adapters::tests::support::contribution_fixture, application::contribute, application::contribution_execution, domain::egress, domain::error, humaux-private-worker, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [no external model or production credential; admin SQL only seeds, injects faults and observes,
+//!   mutations go through the typed runner; without a DB the test SKIPs unless HUMAUX_REQUIRE_DB, then panics]
+//! Spec: none
 //!
 //! No external model or production credential is used. Admin SQL is limited to fixture setup,
 //! fault injection, and durable observation; contribution mutations go through the typed runner.
@@ -54,14 +60,10 @@ use uuid::Uuid;
 static SERIAL: Mutex<()> = Mutex::new(());
 static SCANNER_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+/// Env probe only; the skip goes through `humaux_testkit::skip_or_fail`, which turns a
+/// missing DSN into a failure under `HUMAUX_REQUIRE_DB=1` (§79.2, ADR-0051 D-K).
 fn require_db() -> bool {
-    match std::env::var("HUMAUX_TEST_PG_DSN") {
-        Ok(_) => true,
-        Err(_) if std::env::var("HUMAUX_REQUIRE_DB").as_deref() == Ok("1") => {
-            panic!("HUMAUX_REQUIRE_DB=1 requires HUMAUX_TEST_PG_DSN")
-        }
-        Err(_) => false,
-    }
+    std::env::var("HUMAUX_TEST_PG_DSN").is_ok()
 }
 
 enum ProviderStep {
@@ -327,6 +329,7 @@ fn reserve_a_without_dispatch(
 }
 
 fn reconnected_admin() -> Client {
+    // dep: PostgreSQL(owner) — role-scoped pool call
     Client::connect(
         &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL 18 DSN"),
         NoTls,
@@ -397,7 +400,11 @@ fn record_fault_evidence(
 #[allow(clippy::too_many_lines)]
 fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
     if !require_db() {
-        eprintln!("SKIP: HUMAUX_TEST_PG_DSN is not set");
+        humaux_testkit::skip_or_fail(
+            "runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths",
+            "HUMAUX_TEST_PG_DSN",
+            humaux_testkit::ExternalDep::Postgres,
+        );
         return;
     }
     let _serial = SERIAL

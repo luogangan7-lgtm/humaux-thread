@@ -1,4 +1,19 @@
-//! Real-role acceptance for migration 0117's persistent sliding provider budget.
+//! `adapters::tests::provider_budget` — Real-role acceptance for migration 0117's persistent sliding provider budget.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, sqlx, tokio];
+//!   services=[PostgreSQL(any) r=[ops.model_call_ledger] w=[control.retrieval_provider_admission_limits,
+//!   control.tenants, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations]
+//!   x=[ops.finalize_retrieval_provider_budget, ops.mark_retrieval_provider_budget_dispatched,
+//!   ops.reap_expired_retrieval_provider_budget, ops.reserve_retrieval_provider_budget,
+//!   ops.settle_retrieval_provider_budget], PostgreSQL(owner), PostgreSQL(role_gateway),
+//!   PostgreSQL(role_maintenance), PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_GATEWAY_PG_DSN,
+//!   HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::model_call_ledger, adapters::postgres, adapters::provider_budget, domain::egress,
+//!   domain::error, domain::ids, domain::ledger, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [every fixture row is scoped to a throwaway tenant; over-budget reservations are CostBudgetExceeded
+//!   and double settlement Conflict; skips go through run_db_fixture so HUMAUX_REQUIRE_DB=1 turns an unreachable DB
+//!   red]
+//! Spec: ADR-0047; ADR-0050
 //!
 //! depends-on: Postgres at `HUMAUX_TEST_PG_DSN` (owner, any loopback port/database — ADR-0047
 //! D-D, ADR-0050 D-B) plus `HUMAUX_{RETRIEVAL_WORKER,MAINTENANCE,GATEWAY}_PG_DSN` on the same
@@ -76,7 +91,8 @@ fn checked_dsn(name: &str, expected_role: Option<&str>) -> Result<String, DbFixt
 }
 
 fn role_login_ok(dsn: &str, role: &str) -> Result<(), DbFixtureSkipReason> {
-    // dep: Postgres (the named runtime role) — login probe of the actual role before any seed.
+    // dep: PostgreSQL(any) — login probe of the actual role before any seed.
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `role_login_ok`
     let mut client = Client::connect(dsn, NoTls).map_err(|_| setup_error("actual role login"))?;
     let ok: bool = client
         .query_one(
@@ -104,7 +120,8 @@ impl DbIntegrationFixture for Fixture {
         role_login_ok(&retrieval_dsn, "role_retrieval_worker")?;
         role_login_ok(&maintenance_dsn, "role_maintenance")?;
         role_login_ok(&gateway_dsn, "role_gateway")?;
-        // dep: Postgres (owner, HUMAUX_TEST_PG_DSN) — seeds and cleans the fixture tenant, limits and budget rows.
+        // dep: PostgreSQL(owner) — HUMAUX_TEST_PG_DSN: seeds and cleans the fixture tenant, limits and budget rows.
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `isolate`
         let mut admin =
             Client::connect(&owner_dsn, NoTls).map_err(|_| setup_error("owner login"))?;
         let ready: bool = admin
@@ -130,11 +147,13 @@ impl DbIntegrationFixture for Fixture {
         let region = "provider-budget-region".to_string();
         seed_four_limits(&mut admin, tenant_id, &provider_id, &region, 10, 10)?;
         let rt = tokio::runtime::Runtime::new().map_err(|_| setup_error("runtime"))?;
-        // dep: Postgres (role_retrieval_worker) — RetrievalWorkerDbPool under test.
+        // dep: PostgreSQL(role_retrieval_worker) — RetrievalWorkerDbPool under test.
+        // dep: PostgreSQL(role_retrieval_worker) — opens the role-scoped connection for `isolate`
         let retrieval = rt
             .block_on(RetrievalWorkerDbPool::connect(&retrieval_dsn))
             .map_err(|_| setup_error("retrieval worker pool"))?;
-        // dep: Postgres (role_maintenance) — MaintenanceDbPool under test.
+        // dep: PostgreSQL(role_maintenance) — MaintenanceDbPool under test.
+        // dep: PostgreSQL(role_maintenance) — opens the role-scoped connection for `isolate`
         let maintenance = rt
             .block_on(MaintenanceDbPool::connect(&maintenance_dsn))
             .map_err(|_| setup_error("maintenance pool"))?;
@@ -1501,12 +1520,15 @@ fn assert_same_request_replays(
 #[test]
 fn budget_tables_are_function_only_for_actual_runtime_roles() {
     run_db_fixture::<Fixture, _>("provider_budget_acl", |handle| {
-        // dep: Postgres (role_retrieval_worker) — direct ACL probe of the budget tables.
+        // dep: PostgreSQL(role_retrieval_worker) — direct ACL probe of the budget tables.
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `budget_tables_are_function_only_for_actual_runtime_roles`
         let mut retrieval = Client::connect(&handle.retrieval_dsn, NoTls).expect("retrieval login");
-        // dep: Postgres (role_maintenance) — direct ACL probe of the budget tables.
+        // dep: PostgreSQL(role_maintenance) — direct ACL probe of the budget tables.
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `budget_tables_are_function_only_for_actual_runtime_roles`
         let mut maintenance =
             Client::connect(&handle.maintenance_dsn, NoTls).expect("maintenance login");
-        // dep: Postgres (role_gateway) — direct ACL probe of the budget tables.
+        // dep: PostgreSQL(role_gateway) — direct ACL probe of the budget tables.
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `budget_tables_are_function_only_for_actual_runtime_roles`
         let mut gateway = Client::connect(&handle.gateway_dsn, NoTls).expect("gateway login");
         for client in [&mut retrieval, &mut maintenance, &mut gateway] {
             for statement in [
@@ -1624,7 +1646,8 @@ fn assert_actual_role_null_calls(handle: &Handle, reservation_id: Uuid, model_ca
     let null_uuid: Option<Uuid> = None;
     let null_text: Option<&str> = None;
     let null_i32: Option<i32> = None;
-    // dep: Postgres (role_retrieval_worker) — NULL-argument calls as the actual role.
+    // dep: PostgreSQL(role_retrieval_worker) — NULL-argument calls as the actual role.
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `assert_actual_role_null_calls`
     let mut retrieval = Client::connect(&handle.retrieval_dsn, NoTls)
         .expect("actual retrieval-worker login for null probes");
     retrieval
@@ -1669,7 +1692,8 @@ fn assert_actual_role_null_calls(handle: &Handle, reservation_id: Uuid, model_ca
         reservation_id,
         model_call_id,
     );
-    // dep: Postgres (role_maintenance) — NULL-argument calls as the actual role.
+    // dep: PostgreSQL(role_maintenance) — NULL-argument calls as the actual role.
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `assert_actual_role_null_calls`
     let mut maintenance = Client::connect(&handle.maintenance_dsn, NoTls)
         .expect("actual maintenance login for null probes");
     maintenance

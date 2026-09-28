@@ -1,6 +1,7 @@
 [package]
 name = "humaux-testkit"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -12,9 +13,14 @@ workspace = true
 # §79.8 Coverage 之后的未编号章节，非 §79.7 Mutation Testing): quota
 # reservation invariants, scope normalization, cache keys, ID generation,
 # completeness aggregation, public provenance closure.
+# dep-map: allow cargo-usedby — no module in this crate imports proptest directly today; kept
+#   available for property-based fault/pair test authors per crates/testkit/README.md
+# why: proptest dependency; used-by: [tests]
 proptest = "1.11.0"
 # T0.4 §53.4 / G52-5 注错测试需要真实的 abstain() / DegradeCode / ErrorCode
 # —— testkit 本身仍不依赖 domain/telemetry（见 src/lib.rs 顶部说明），这两
 # 条只挂在 dev-dependencies，只有 tests/fault、tests/pair 用得到。
+# why: humaux-domain dependency; used-by: [testkit::tests::pair::cannot_establish_completeness_degraded, testkit::tests::pair::cannot_establish_completeness_terminal, testkit::tests::pair::projection_lag_degraded, testkit::tests::pair::projection_lag_terminal, tests]
 humaux-domain = { version = "0.1.0", path = "../domain" }
+# why: humaux-telemetry dependency; used-by: [testkit::tests::fault::completeness_unknown, testkit::tests::fault::egress_denied, testkit::tests::fault::embed_provider_timeout, testkit::tests::fault::graph_expand_capped, testkit::tests::fault::projection_invisible_loss, testkit::tests::fault::projection_lag, testkit::tests::fault::rerank_model_mismatch, testkit::tests::fault::rerank_provider_timeout, testkit::tests::fault::state_pin_ambiguous, testkit::tests::fault::state_pin_missing, testkit::tests::metrics::degrade_total, testkit::tests::pair::cannot_establish_completeness_degraded, testkit::tests::pair::cannot_establish_completeness_terminal, testkit::tests::pair::projection_lag_degraded, testkit::tests::pair::projection_lag_terminal, tests]
 humaux-telemetry = { version = "0.1.0", path = "../telemetry" }

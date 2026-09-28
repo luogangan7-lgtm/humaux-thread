@@ -1,4 +1,8 @@
 //! `domain::grounding` — §8.8 Grounding Validity：把「证据变了」与「事实错了」分开。
+//! Depends-on: crates=[async-trait]; services=[]; env=[]; modules=[domain::evidence]
+//! Called-by: [adapters::context_repo, adapters::continuity_read, domain::context, retrieval::envelope, retrieval::handoff, retrieval::signals, tests]
+//! Invariants: []
+//! Spec: Baseline §3; §8.1; §8.8; ADR-0006
 //!
 //! 这个模块只回答一个问题：**当初支持这条 Memory 的可变来源，还是同一个版本吗？**
 //! 它不回答「这条 Memory 有多旧」——那是 [`crate::temporal`] 的 `TemporalFreshness`。

@@ -1,6 +1,7 @@
 [package]
 name = "humaux-contracts"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -9,7 +10,10 @@ workspace = true
 
 [dependencies]
 # §50.1: config/features.toml 解析（唯一静态真源）。
+# why: derive (de)serialization for wire/DTO types; used-by: [contracts::feature_registry, contracts::mechanism_registry]
 serde = { version = "1", features = ["derive"] }
+# why: parses the embedded feature registry TOML; used-by: [contracts::feature_registry]
 toml = "1"
 # §50: effective config fingerprint（规范序列化后 sha256）。
+# why: sha256 digests for hashes, fingerprints and scope_hash; used-by: [contracts::config_registry]
 sha2 = "0.11"

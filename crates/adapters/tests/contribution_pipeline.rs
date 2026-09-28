@@ -1,4 +1,19 @@
-//! §12.1.1 real PG/Gitleaks acceptance. The inference fixture is deliberately offline;
+//! `adapters::tests::contribution_pipeline` — §12.1.1 real PG/Gitleaks acceptance.
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, postgres, uuid]; services=[PostgreSQL(any)
+//!   r=[control.contribution_policies, ops.outbox, staging.contribution_candidates,
+//!   staging.contribution_release_sources, staging.contribution_releases] w=[control.memberships,
+//!   control.private_reasoning_domains, control.reasoning_domain_grants, control.user_reasoning_profiles,
+//!   control.users, control.workspaces, private.events, private.evidence_objects, private.memory_records,
+//!   staging.contribution_candidate_sources] x=[control.append_contribution_policy_successor],
+//!   PostgreSQL(role_private_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_entry_repo,
+//!   adapters::contribution_repo, adapters::tests::support::contribution_fixture, application::consolidate,
+//!   application::contribute, domain::error, domain::evidence, domain::identity, domain::ids]
+//! Called-by: [cargo-test]
+//! Invariants: [the inference fixture is offline (no live model call is claimed); a re-finalization is Conflict; the
+//!   PG tests are #[ignore] lane tests run by the isolated runner]
+//! Spec: none
+//!
+//! The inference fixture is deliberately offline;
 //! these tests do not claim a live model call. Run ignored tests with the isolated runner.
 
 #[path = "support/contribution_fixture.rs"]
@@ -291,7 +306,9 @@ fn wrong_hash_other_user_and_source_append_fail_closed() {
             let _ = f.confirm(id);
         }
         let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG");
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `wrong_hash_other_user_and_source_append_fail_closed`
         let mut private = Client::connect(&dsn, NoTls).expect("admin fixture client");
+        // dep: PostgreSQL(role_private_worker) — role switch before the scoped statements for `wrong_hash_other_user_and_source_append_fail_closed`
         private
             .batch_execute(&format!(
                 "BEGIN; SET LOCAL ROLE role_private_worker; \

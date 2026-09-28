@@ -1,4 +1,11 @@
-//! Guarded gateway entry point for one authenticated `remember` operation.
+//! `gateway::remember` — Guarded gateway entry point for one authenticated `remember` operation.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, serde_json, sqlx, time,
+//!   uuid]; services=[]; env=[]; modules=[adapters::affect_repo, adapters::postgres, adapters::remember,
+//!   domain::affect, domain::dataclass, domain::error, domain::evidence, domain::identity, domain::ids,
+//!   domain::subject, projection::stream]
+//! Called-by: [gateway::bootstrap, gateway::context, gateway::mcp_application, tests]
+//! Invariants: [the protocol layer decodes wire input and the request guard produces the AuthorizationScope; this module never deserializes either boundary itself]
+//! Spec: Baseline §11.2.1; §15.5; §78.2; ADR-0020; ADR-0032
 //!
 //! The protocol layer decodes wire input and the request guard produces the
 //! [`AuthorizationScope`]. This module does not deserialize either of them.

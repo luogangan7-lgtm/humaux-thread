@@ -1,4 +1,9 @@
 //! `retrieval-provider::router` — §19 Provider Route resolution (T7.2).
+//! Depends-on: crates=[humaux-domain, uuid]; services=[]; env=[]; modules=[domain::ids, retrieval-provider::contract,
+//!   retrieval-provider::failover]
+//! Called-by: [tests]
+//! Invariants: []
+//! Spec: §19; §3; §78.3
 //!
 //! Pure decision logic only: [`resolve`] takes an already-fetched candidate row set (no SQLx
 //! import here — §3/§78.3 "Domain 永不 import HTTP/SQLx/Qdrant/Provider SDK/ENV"; reading

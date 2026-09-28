@@ -1,4 +1,15 @@
-//! T4.6/T4.7 integration test — `consolidate_repo` (§11.7) against a real Postgres.
+//! `adapters::tests::consolidate_snapshot` — T4.6/T4.7 integration test — `consolidate_repo` (§11.7) against a real
+//!   Postgres.
+//! Depends-on: crates=[humaux-adapters, humaux-testkit, postgres, serde_json, sha2, sqlx, tokio];
+//!   services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, control.users, private.events,
+//!   private.evidence_objects, private.memory_consolidation_inputs, private.memory_consolidation_runs,
+//!   private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollups],
+//!   PostgreSQL(role_consolidation_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::consolidate_repo,
+//!   adapters::postgres, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [G11-1/G80-29: 10 runs with 60 concurrent higher-ranked inserts each must yield duplicate-free,
+//!   complete, hash-stable inputs; an isolation setup failure is a fixture error, not a pass]
+//! Spec: Baseline §11.9; §11.7; §80.1; §46; §79.2
 //!
 //! **G11-1 / G80-29 "Consolidation Snapshot Integrity"** (§11.9's own anchor for both gate
 //! numbers): seed 100 eligible memories, start selection, concurrently insert 60 higher-ranked
@@ -135,6 +146,7 @@ impl DbIntegrationFixture for ConsolidateFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `isolate`
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -195,6 +207,7 @@ impl DbIntegrationFixture for ConsolidateFixture {
         let consolidation_dsn = dsn_as_role(&dsn, "role_consolidation_worker");
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        // dep: PostgreSQL(role_consolidation_worker) — opens the role-scoped connection for `isolate`
         let consolidation = rt
             .block_on(ConsolidationDbPool::connect(&consolidation_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
@@ -256,6 +269,7 @@ fn insert_concurrent_higher_ranked_memories(
     tenant_id: Uuid,
     evidence_id: Uuid,
 ) -> Result<(), String> {
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `insert_concurrent_higher_ranked_memories`
     let mut client = Client::connect(admin_dsn, NoTls)
         .map_err(|error| format!("concurrent inserter connects: {error}"))?;
     let mut txn = client
@@ -365,6 +379,7 @@ fn run_one_iteration(handle: &mut Handle, iteration: usize) -> Vec<u8> {
     // This fixture-held SHARE lock is a durable barrier, unlike the old brief run-row lock.
     // The selector has already established its REPEATABLE READ snapshot and read all eligible
     // memory rows before its first INSERT into this table requests the blocked RowExclusiveLock.
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `run_one_iteration`
     let mut holder = Client::connect(&admin_dsn, NoTls).expect("connect materialization holder");
     let mut holder_txn = holder
         .transaction()
@@ -376,6 +391,7 @@ fn run_one_iteration(handle: &mut Handle, iteration: usize) -> Vec<u8> {
     let selector = thread::spawn(move || {
         let actor_rt = tokio::runtime::Runtime::new()
             .map_err(|error| format!("create selector runtime: {error}"))?;
+        // dep: PostgreSQL(role_consolidation_worker) — opens the role-scoped connection for `run_one_iteration`
         let actor_pool = actor_rt
             .block_on(ConsolidationDbPool::connect(&selector_dsn))
             .map_err(|error| format!("connect selector pool: {error}"))?;

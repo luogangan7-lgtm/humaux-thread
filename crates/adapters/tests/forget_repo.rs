@@ -1,4 +1,16 @@
-//! T4.8 integration test — `forget_repo` (§37/§37.1/§37.2/§65) against a real Postgres. Same
+//! `adapters::tests::forget_repo` — T4.8 integration test — `forget_repo` (§37/§37.1/§37.2/§65) against a real
+//!   Postgres.
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, humaux-projection, humaux-testkit,
+//!   postgres, sqlx, tokio]; services=[PostgreSQL(any) w=[control.deletion_requests, control.tenants,
+//!   ops.deletion_plan_steps, projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_maintenance)];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::forget_repo, adapters::postgres, application::forget, domain::ids,
+//!   humaux-testkit, projection::stream]
+//! Called-by: [cargo-test]
+//! Invariants: [rows are scoped to a throwaway tenant cleaned up on Drop; the TOMBSTONED edge and plan steps run on
+//!   role_maintenance; no DSN, unreachable DB or missing table/function is a visible SKIP]
+//! Spec: Baseline §79.2
+//!
+//! Same
 //! convention as `stream_repo.rs`: shared tables, not a scratch schema, every test scopes
 //! rows to a throwaway `control.tenants` row this file owns and cleans up on `Drop`.
 //!
@@ -56,6 +68,7 @@ impl DbIntegrationFixture for ForgetFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `isolate`
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -85,12 +98,14 @@ impl DbIntegrationFixture for ForgetFixture {
 
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        // dep: PostgreSQL(role_maintenance) — opens the role-scoped connection for `isolate`
         let maintenance = rt
             .block_on(MaintenanceDbPool::connect(&dsn_as_role(
                 &dsn,
                 "role_maintenance",
             )))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        // dep: PostgreSQL(role_maintenance) — opens the role-scoped connection for `isolate`
         let gateway = Client::connect(&dsn_as_role(&dsn, "role_gateway"), NoTls)
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 

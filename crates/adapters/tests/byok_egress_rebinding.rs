@@ -1,4 +1,9 @@
-//! ADR-0039 / §11.4 — BYOK 出网的「检查即拨号」验收：**同一套判定既跑在检查上也跑在拨号上**。
+//! `adapters::tests::byok_egress_rebinding` — ADR-0039 / §11.4 — BYOK 出网的「检查即拨号」验收：**同一套判定既跑在检查上也跑在拨号上**。
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-domain, humaux-infra-egress, tokio, uuid]; services=[]; env=[NO_PROXY, no_proxy]; modules=[adapters::byok, adapters::byok::ssrf, domain::dataclass, domain::egress, domain::ids, infra-egress::resolver]
+//! Called-by: [cargo-test]
+//! Invariants: [the rebinding resolver answers public first, loopback second; the listener on the forbidden address
+//!   must receive zero connections, so the refusal happens before TCP connect, not in a log line]
+//! Spec: Baseline §11.4
 //!
 //! 卡 17 之前的形态：`OpenAiCompatibleProvider::new` 用调用方注入的 `ssrf::DnsResolver` 跑
 //! `validate_custom_endpoint`（检查），`EgressHttpTransport` 底下的 `RawHttpPost` 用**系统

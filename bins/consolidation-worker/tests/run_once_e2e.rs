@@ -1,7 +1,14 @@
-//! Fixer-review G11-R1/§79.2 integration coverage for `run_once` — before this review, `grep`
-//! over the whole workspace for `run_once` found no caller and no test, and the crate's own
-//! "positive sentinel" only asserted a fact about its own `FakePort` fixture 15 lines above it
-//! (a change to any production file could never turn it red). This drives the real call site
+//! `consolidation-worker::tests::run_once_e2e` — Fixer-review G11-R1/§79.2 integration coverage for `run_once` —
+//!   before this review, `grep` over the whole workspace for `run_once` found no caller and no test, and the crate's
+//!   own "positive sentinel" only asserted a fact about its own `FakePort` fixture 15 lines above it (a change to any
+//!   production file could never turn it red).
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-testkit, postgres, serde_json, tokio, uuid]; services=[PostgreSQL(role_consolidation_worker) w=[control.private_reasoning_domains, control.tenants, private.events, private.evidence_objects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollups]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::consolidate_repo, adapters::postgres, application::consolidate, domain::authority, humaux-consolidation-worker, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [run_once against a real ConsolidationDbPool: empty input makes no provider call (§11.5.1) and the
+//!   publish path leaves exactly the §11.7-§11.9 rows; no DSN / unreachable / unmigrated DB is a visible SKIP]
+//! Spec: Baseline §11.5.1; §11.7; §11.8; §11.9; §79.2
+//!
+//! This drives the real call site
 //! against a real `ConsolidationDbPool`: empty-input skip (no wasted BYOK call, §11.5.1) and
 //! the full inference->publish path (§11.7/§11.8/§11.9's persisted side effects).
 //!
@@ -92,6 +99,7 @@ impl DbIntegrationFixture for RunOnceFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -150,6 +158,7 @@ impl DbIntegrationFixture for RunOnceFixture {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let consolidation = rt
+            // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
             .block_on(ConsolidationDbPool::connect(&consolidation_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 

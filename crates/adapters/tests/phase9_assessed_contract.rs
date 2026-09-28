@@ -1,4 +1,16 @@
-//! Real-PG negative gates for the additive Phase 9 assessed-candidate seam.
+//! `adapters::tests::phase9_assessed_contract` — Real-PG negative gates for the additive Phase 9 assessed-candidate
+//!   seam.
+//! Depends-on: crates=[postgres, uuid]; services=[PostgreSQL(any) r=[ops.jobs, ops.outbox,
+//!   staging.sanitized_public_candidates] w=[public.sources] x=[ops.claim_global_anonymous_public_dispatches,
+//!   ops.enqueue_public_projection_from_anonymous_dispatch, public.admit_anonymous_dispatch,
+//!   public.admit_anonymous_source, public.phase9_public_coverage_for_probe, public.revoke_anonymous_source,
+//!   staging.read_sanitized_public_candidate], PostgreSQL(role_private_worker), PostgreSQL(role_public_worker)];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[]
+//! Called-by: [cargo-test]
+//! Invariants: [the assessed release contract is checked on role_private_worker/role_public_worker pools against a
+//!   PG18 fixture migrated through 0127; the tests are #[ignore] lane tests]
+//! Spec: Baseline §12; §79.2
+//!
 //! Run after applying migrations through 0127 to an isolated PG18 fixture.
 
 use postgres::{Client, NoTls, error::SqlState};
@@ -12,6 +24,7 @@ use uuid::Uuid;
 )]
 fn public_worker_cannot_scan_sanitized_envelopes_or_forge_anonymous_admission() {
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL DSN");
+    // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
     let mut client = Client::connect(&dsn, NoTls).expect("isolated PostgreSQL");
     let mut txn = client.transaction().expect("transaction");
     txn.batch_execute("SET LOCAL ROLE role_public_worker")
@@ -100,6 +113,7 @@ fn public_worker_cannot_scan_sanitized_envelopes_or_forge_anonymous_admission() 
     let envelope = vec![7_u8; 32];
     txn.batch_execute("SAVEPOINT deny_anonymous_insert")
         .expect("savepoint");
+    // dep: PostgreSQL(any) — pool/txn query execution
     assert!(txn.execute(
         "INSERT INTO public.sources(source_id,source_type,content_hash,rights_basis,trust_class,lineage_mode,anonymous_envelope_sha256) \
          VALUES($1,'ANONYMOUS_USER_CONTRIBUTION','forged','forged','forged','ANONYMOUS_RELEASE',$2)",
@@ -160,6 +174,7 @@ fn public_worker_cannot_scan_sanitized_envelopes_or_forge_anonymous_admission() 
 #[ignore = "lane(a:shared_db) requires isolated PostgreSQL migrated through 0127"]
 fn private_coverage_contract_returns_a_single_empty_snapshot_in_an_empty_pool() {
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL DSN");
+    // dep: PostgreSQL(role_private_worker) — open a role-scoped PG connection/pool for this test
     let mut client = Client::connect(&dsn, NoTls).expect("isolated PostgreSQL");
     let mut txn = client.transaction().expect("transaction");
     txn.batch_execute("SET LOCAL ROLE role_private_worker")

@@ -1,3 +1,9 @@
+//! `xtask::switch_visible` — §16.2 serve switch: live visible_* counts taken from Qdrant/Postgres.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, humaux-projection, postgres, tokio, uuid]; services=[PostgreSQL(any) r=[private.memory_records, projection.private_memory_points, projection.stream_checkpoints, projection.stream_log, projection.tenant_placements]]; env=[]; modules=[adapters::qdrant, adapters::retrieve, domain::identity, domain::ids, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::serving]
+//! Called-by: [xtask::projection_serve, xtask::soak]
+//! Invariants: [visible_serving/visible_shadow are real Qdrant/Postgres counts, never operator-supplied numbers]
+//! Spec: Baseline §16.2; §16.3; §23.1②
+//!
 //! §16.2 serve switch — the two `visible_*` counts, taken live from Qdrant.
 //!
 //! Both ops-side callers of `projection::serving::evaluate_switch`

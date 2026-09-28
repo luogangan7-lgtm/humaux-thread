@@ -1,3 +1,9 @@
+//! `xtask::threshold_shape` — G80-15 threshold-shape-check: bare-ratio and 不劣于 sweep over §55/§69.
+//! Depends-on: crates=[]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[]
+//! Called-by: [xtask::main]
+//! Invariants: [a bare ratio with no adjoining dimension word, or a 不劣于 with no adjoining negation/deprecation marker, is fail]
+//! Spec: Baseline §55; §69
+//!
 //! xtask `threshold-shape` — G80-15 threshold-shape-check.
 //! 判据以 §69 Continuation Gate 冻结块的 CI 两条为唯一真源（spec 行 11048–11052，
 //! `threshold-shape-check` 段）：①逐行扫 §55 与 §69，命中裸比例且同行无量纲词 ⇒ 红；

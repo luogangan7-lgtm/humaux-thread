@@ -1,5 +1,11 @@
-//! `adapters::private_inference_rpc` — §11.8 ADR-0012-pattern repository for
-//! `ops.private_inference_rpc_calls` (migration 0143).
+//! `adapters::private_inference_rpc` — §11.8 ADR-0012-pattern repository for `ops.private_inference_rpc_calls`
+//!   (migration 0143).
+//! Depends-on: crates=[humaux-application, sqlx]; services=[PostgreSQL(any) w=[ops.private_inference_rpc_calls]]; env=[]; modules=[adapters::postgres, application::consolidate]
+//! Called-by: [consolidation-worker::inference_client, private-worker::inference_rpc, tests]
+//! Invariants: [the consolidation side only INSERTs/SELECTs its registrations (role_consolidation_worker) and the
+//!   private-worker side only claims/finishes them (role_private_worker); both set humaux.tenant_id first; bad input
+//!   is InvalidInput]
+//! Spec: none
 //!
 //! One module for both sides of the RPC, same reasoning
 //! `crate::retrieval_embedding_rpc`'s module doc gives for its own identical split:
@@ -107,6 +113,7 @@ impl<'a> ConsolidationRegistrations<'a> {
         if call.binding_version <= 0 || call.ttl.is_zero() {
             return Err(PrivateInferenceRpcError::InvalidInput);
         }
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, call.tenant_id).await?;
         sqlx::query(
@@ -203,6 +210,7 @@ impl<'a> PrivateWorkerInferenceCalls<'a> {
         tenant_hint: Uuid,
         claimed_by: &str,
     ) -> Result<ClaimOutcome, PrivateInferenceRpcError> {
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_hint).await?;
         let row = sqlx::query(
@@ -280,6 +288,7 @@ impl<'a> PrivateWorkerInferenceCalls<'a> {
         tenant_id: Uuid,
         outcome: FinishOutcome,
     ) -> Result<(), PrivateInferenceRpcError> {
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_id).await?;
         match outcome {

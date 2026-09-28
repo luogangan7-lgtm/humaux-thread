@@ -1,4 +1,9 @@
-//! 主线独立复现：ADR-0003 二轮审查报告的 IP 字面量绕过是否真被堵住。
+//! `infra-cell::tests::mainline_ssrf_probe` — 主线独立复现：ADR-0003 二轮审查报告的 IP 字面量绕过是否真被堵住。
+//! Depends-on: crates=[tokio, uuid]; services=[Qdrant(*)]; env=[]; modules=[infra-cell::permit, infra-cell::resource, infra-cell::transport]
+//! Called-by: [cargo-test]
+//! Invariants: [an IP-literal registry host bypasses the custom resolver, so §83.4 criterion 3 must hold at dial
+//!   time: a refused address receives zero connections (connecting and then erroring does not count)]
+//! Spec: Baseline §83.4
 //!
 //! 攻击面：`reqwest`/`hyper` 在 URL authority 是 IP 字面量时**不会**调用自定义
 //! `dns_resolver`，所以 §83.4 判据3 若只挂在 resolver 上，对 `host="127.0.0.1"` 这种
@@ -63,6 +68,7 @@ async fn call(reg: IntraCellResourceRegistry, path: &str) -> Result<(), String> 
     transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — qdrant wire call
             IntraCellRequest {
                 method: IntraCellMethod::Get,
                 path: path.to_string(),

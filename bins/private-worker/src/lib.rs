@@ -1,4 +1,8 @@
-//! Bounded Phase 9 private contribution worker orchestration.
+//! `humaux-private-worker` — Bounded Phase 9 private contribution worker orchestration.
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, serde_json, sha2, uuid]; services=[]; env=[]; modules=[adapters::contribution_execution_ingress, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::contribution_scan, adapters::jobs, adapters::postgres, application::consolidate, application::contribute, application::contribution_execution, domain::error, domain::evidence]
+//! Called-by: [crate(humaux-consolidation-worker), tests]
+//! Invariants: []
+//! Spec: ADR-0012; ADR-0016
 //!
 //! `pub mod inference_rpc` exists on this lib target (not only inside `src/main.rs`) for the
 //! same reason `bins/retrieval-worker/src/lib.rs` exports its own ADR-0012 `rpc` module:

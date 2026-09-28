@@ -1,6 +1,7 @@
 [package]
 name = "humaux-projection"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -12,10 +13,13 @@ workspace = true
 # not a second tenant-id type) and needs `Uuid` for `scope_id`/`stream_key_text` encoding —
 # no new feature flags beyond the crate's own default (Display/FromStr only, no `v7` minting
 # here: this module never mints an id, only carries and formats one).
+# why: humaux-domain dependency; used-by: [projection::card, projection::dense, projection::fingerprint, projection::serving, projection::sparse, projection::stream, tests]
 humaux-domain = { path = "../domain" }
+# why: uuid dependency; used-by: [projection::card, projection::serving, projection::stream, tests]
 uuid = "1.25.0"
 # T5.1 (§16.1.1/G80-11): fingerprint::source_hash hashes the canonical processing-input
 # encoding. Same `sha2 = "0.11"` line every other workspace crate already carries
 # (humaux-domain::evidence::payload_sha256, humaux-contracts::config_registry, etc.) — no
 # new crate introduced to the dependency graph.
+# why: sha2 dependency; used-by: [projection::card, projection::fingerprint]
 sha2 = "0.11"

@@ -1,4 +1,10 @@
 //! `application::continuity` — §25.3 continuity 产品的装配入口（G80-31 的被测调用路径）。
+//! Depends-on: crates=[async-trait, hex, humaux-domain, humaux-retrieval, serde, serde_json, sha2, uuid];
+//!   services=[]; env=[]; modules=[domain::context, domain::continuity, domain::error, domain::identity, domain::ids,
+//!   retrieval::handoff]
+//! Called-by: [adapters::context_repo, adapters::continuity_read, gateway::continuity, tests]
+//! Invariants: []
+//! Spec: §25.3
 //!
 //! 端口反转的原因是依赖方向：`adapters` 依赖本 crate（不能反过来 import
 //! `adapters::context_repo`），所以取数以 [`ContextReadPort`] 注入——`adapters` 侧实现它、

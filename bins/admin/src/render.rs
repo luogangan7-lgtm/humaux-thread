@@ -1,4 +1,9 @@
-//! `humaux-admin render mechanism-registry` —— §1.14 canonical md 围栏的人读渲染。
+//! `admin::render` — `humaux-admin render mechanism-registry` —— §1.14 canonical md 围栏的人读渲染。
+//! Depends-on: crates=[humaux-contracts]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[admin::mechanism,
+//!   contracts::mechanism_registry]
+//! Called-by: [admin::main]
+//! Invariants: [reading CARGO_MANIFEST_DIR at build/run resolves the template asset path relative to the crate root, never the process cwd]
+//! Spec: Baseline §1.14; §4.4
 //!
 //! **不是探针**（见 main.rs 模块文档）：不产出 §4.4 的 `{value, scanned_n, scope_hash,
 //! checked_at, probe_version}` JSON 契约，只把 static spec 的 `mechanism-registry` 围栏

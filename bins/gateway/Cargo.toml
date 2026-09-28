@@ -1,39 +1,63 @@
 [package]
 name = "humaux-gateway"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
+# why: typed PG pools, repositories and wire adapters this package drives; used-by: [gateway::auth, gateway::bootstrap, gateway::context, gateway::continuity, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, gateway::retrieval_embedding_client, tests]
 humaux-adapters = { path = "../../crates/adapters" }
+# why: use-case layer (ports + orchestration) this package wires; used-by: [gateway::bootstrap, gateway::continuity, gateway::guard, gateway::recall, gateway::retrieval_embedding_client, tests]
 humaux-application = { path = "../../crates/application" }
+# why: config/feature/mechanism registries and contract types; used-by: [gateway::bootstrap, gateway::mcp_application, tests]
 humaux-contracts = { path = "../../crates/contracts" }
+# why: domain ids, errors and value types shared across layers; used-by: [gateway::auth, gateway::bootstrap, gateway::context, gateway::continuity, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, gateway::retrieval_embedding_client, tests]
 humaux-domain = { path = "../../crates/domain" }
+# why: MCP/HTTP edge protocol types and middleware; used-by: [gateway::auth, gateway::bootstrap, gateway::guard, gateway::mcp_application, gateway::recall, tests]
 humaux-protocol = { path = "../../crates/protocol" }
+# why: projection cards/serving types for recall and ingest; used-by: [gateway::bootstrap, gateway::context, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, tests]
 humaux-projection = { path = "../../crates/projection" }
+# why: retrieval request/envelope/planner (sole request constructor, §55.1); used-by: [gateway::context, gateway::memory, gateway::recall, tests]
 humaux-retrieval = { path = "../../crates/retrieval" }
+# why: same-Cell transport and CellAccessPermit for Qdrant/UDS calls; used-by: [gateway::bootstrap, gateway::recall, gateway::retrieval_embedding_client, tests]
 humaux-infra-cell = { path = "../../crates/infra-cell" }
+# why: pinned local secret scanner that seals egress payloads; used-by: [gateway::bootstrap, gateway::recall, tests]
 humaux-local-secret-scan = { path = "../../crates/local-secret-scan" }
+# why: object-safe async traits for ports and transports; used-by: [gateway::mcp_application, gateway::retrieval_embedding_client, tests]
 async-trait = "0.1"
+# why: HTTP/UDS server framework; used-by: [gateway::main, gateway::mcp_application, tests]
 axum = "0.8"
+# why: derive (de)serialization for wire/DTO types; used-by: [gateway::context, gateway::mcp_application, gateway::memory, gateway::retrieval_embedding_client]
 serde = { version = "1", features = ["derive"] }
+# why: JSON payloads and envelopes; used-by: [gateway::context, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, gateway::retrieval_embedding_client, tests]
 serde_json = { version = "1", features = ["raw_value"] }
+# why: sha256 digests for hashes, fingerprints and scope_hash; used-by: [gateway::context, gateway::guard, gateway::retrieval_embedding_client, tests]
 sha2 = "0.10"
+# why: hex encoding of digests and tokens; used-by: [gateway::bootstrap, gateway::guard, gateway::mcp_application, gateway::memory, tests]
 hex = "0.4"
+# why: timestamps (OffsetDateTime, RFC3339); used-by: [gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, tests]
 time = { version = "0.3", features = ["parsing"] }
+# why: async runtime; used-by: [gateway::bootstrap, gateway::guard, gateway::main, gateway::mcp_application, gateway::retrieval_embedding_client, tests]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "signal"] }
+# why: UUID ids (v7) and parsing; used-by: [gateway::bootstrap, gateway::context, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, gateway::retrieval_embedding_client, tests]
 uuid = { version = "1.25.0", features = ["v7", "serde"] }
+# why: runtime SQL through the typed per-role pools; used-by: [gateway::remember, tests]
 sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "uuid", "time"] }
 
 [dev-dependencies]
+# why: shared DB-bound test harness (skip_or_fail, fixtures); used-by: [gateway::mcp_application, tests]
 humaux-testkit = { path = "../../crates/testkit" }
 # §4.2 / ADR-0012: the gateway binary itself never links the provider/model-descriptor code —
 # only its test doubles (TestDoubleProvider) are used, and only by tests.
+# why: embedding provider router/adapters; used-by: [tests]
 humaux-retrieval-provider = { path = "../../crates/retrieval-provider" }
+# why: sync PG client for DB-bound test fixtures; used-by: [gateway::mcp_application, tests]
 postgres = { version = "0.19", features = ["with-uuid-1", "with-serde_json-1"] }
 # tests/query_embedding_rpc.rs: spawns the real worker RPC app in-process rather than
 # reimplementing (and drifting from) its handler — see that test file's own module doc and
 # bins/retrieval-worker/src/lib.rs's doc for why this crate now has a lib target too.
+# why: retrieval-worker RPC server exercised end to end in tests; used-by: [tests]
 humaux-retrieval-worker = { path = "../retrieval-worker" }
 
 [lints]

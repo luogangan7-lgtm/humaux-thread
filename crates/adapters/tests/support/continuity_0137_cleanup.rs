@@ -1,3 +1,10 @@
+//! `adapters::tests::support::continuity_0137_cleanup` — Cleanup owner for the 0137 continuity fixtures: deletes every registered seeded row in dependency order.
+//! Depends-on: crates=[postgres, serde_json, uuid]; services=[PostgreSQL(any) r=[private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects] w=[control.memberships, control.private_reasoning_domains, control.tenants, control.users, control.workspaces, ops.outbox, private.evidence_objects, private.memory_evidence, private.memory_records, projection.stream_log]]; env=[]; modules=[]
+//! Called-by: [adapters::tests::project_continuity_read_0137, adapters::tests::support::continuity_0137_fixture]
+//! Invariants: [deletes only rows whose ids the fixture registered, in dependency order, so a failed test never
+//!   erases another tenant's continuity data]
+//! Spec: Baseline §25.3.1
+//!
 #![allow(dead_code)]
 
 use postgres::{Client, NoTls};
@@ -185,6 +192,7 @@ impl CleanupOwner {
             return Ok(());
         }
         let ledger = self.ledger.lock().expect("cleanup ledger mutex").clone();
+        // dep: PostgreSQL(any) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&self.admin_dsn, NoTls)
             .map_err(|error| format!("connect admin for continuity cleanup: {error}"))?;
         let cleanup = (|| {
@@ -214,6 +222,7 @@ impl CleanupOwner {
 
     pub fn counts(&self) -> Result<Vec<i64>, String> {
         let ledger = self.ledger.lock().expect("cleanup ledger mutex").clone();
+        // dep: PostgreSQL(any) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&self.admin_dsn, NoTls)
             .map_err(|error| format!("connect admin for continuity census: {error}"))?;
         let row = admin

@@ -1,3 +1,9 @@
+//! `xtask::r4_fault_manifest` — parses and validates contracts/r4_fault_manifest.toml.
+//! Depends-on: crates=[toml]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[]
+//! Called-by: [xtask::main]
+//! Invariants: [every fault_case entry must carry all ROOT_KEYS; a missing key names the file and the key]
+//! Spec: Baseline §11.2.5.1; ADR-0008
+//!
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 const MANIFEST_PATH: &str = "contracts/r4_fault_manifest.toml";

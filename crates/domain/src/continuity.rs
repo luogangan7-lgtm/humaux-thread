@@ -1,4 +1,8 @@
-//! Project Continuity W1 identities and the closed source-backed facet set (§25.3.1).
+//! `domain::continuity` — Project Continuity W1 identities and the closed source-backed facet set (§25.3.1).
+//! Depends-on: crates=[uuid]; services=[]; env=[]; modules=[domain::error]
+//! Called-by: [adapters::continuity_read, adapters::continuity_repo, application::continuity, gateway::continuity, gateway::mcp_application, tests]
+//! Invariants: []
+//! Spec: Baseline §25.3.1
 
 use crate::error::ErrorCode;
 use std::str::FromStr;

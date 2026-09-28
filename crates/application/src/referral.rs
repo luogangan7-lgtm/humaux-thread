@@ -1,4 +1,8 @@
-//! H5: §75 Invitation/Referral 双轨（Phase 2 wave 实现；判据出处见 spec 家章）.
+//! `application::referral` — H5: §75 Invitation/Referral 双轨（Phase 2 wave 实现；判据出处见 spec 家章）.
+//! Depends-on: crates=[hex, humaux-domain, rand, sha2]; services=[]; env=[]; modules=[domain::error, domain::ids]
+//! Called-by: []
+//! Invariants: []
+//! Spec: §75; §75.1; §75.2; §3; §78.3
 //!
 //! §75 frozen: Team Invitation (security object, §75.1) and Referral (marketing/value
 //! object, §75.2) never share a table or a code path — this module keeps them as two

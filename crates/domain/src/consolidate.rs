@@ -1,4 +1,9 @@
 //! `domain::consolidate` — Private Memory Consolidation invariants (§11.6-§11.9, T4.6+T4.7).
+//! Depends-on: crates=[]; services=[PostgreSQL(any) r=[private.memory_consolidation_runs]]; env=[CARGO_MANIFEST_DIR]; modules=[domain::authority]
+//! Called-by: [adapters::consolidate_repo, adapters::consolidation_reasoner, humaux-consolidation-worker, tests]
+//! Invariants: [pure types: an automatic run can never mint a mutation handle for a memory with an active context
+//!   binding, and a rollup's authority never outranks its sources (RollupAuthorityViolation); no IO here]
+//! Spec: Baseline §3; §11.6; §11.7
 //!
 //! Pure types only (§3/§78.3: Domain never imports SQLx/HTTP/ENV). The DB-side snapshot-bound
 //! selection SQL lives in `adapters::consolidate_repo`; this module holds the two invariants

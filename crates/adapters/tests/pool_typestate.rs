@@ -1,6 +1,10 @@
-//! G6-DB1 compile-time sentinels (§6.2.3 assertions C/D): the seven typed pool wrappers
-//! must be usable through a correctly-typed port (`pass_*`) and must NOT be substitutable
-//! for each other or bypassable via `From`/`Deref`/raw field access (`fail_*`).
+//! `adapters::tests::pool_typestate` — G6-DB1 compile-time sentinels (§6.2.3 assertions C/D): the seven typed pool
+//!   wrappers must be usable through a correctly-typed port (`pass_*`) and must NOT be substitutable for each other
+//!   or bypassable via `From`/`Deref`/raw field access (`fail_*`).
+//! Depends-on: crates=[trybuild]; services=[]; env=[]; modules=[]
+//! Called-by: [cargo-test]
+//! Invariants: [compile-time only: no runtime services; failure = a wrapper became cross-substitutable or bypassable]
+//! Spec: Baseline §6.2.3
 //!
 //! `tests/ui/pass_*.rs` covers five wrappers currently used by compile-time ports;
 //! role-match runtime coverage covers all seven roles.

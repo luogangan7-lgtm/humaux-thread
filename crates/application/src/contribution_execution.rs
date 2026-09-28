@@ -1,4 +1,10 @@
-//! Phase 9 R4 application contract for one durable two-stage contribution execution.
+//! `application::contribution_execution` — Phase 9 R4 application contract for one durable two-stage contribution
+//!   execution.
+//! Depends-on: crates=[humaux-domain, serde_json, sha2, uuid]; services=[];
+//!   env=[]; modules=[application::consolidate, application::contribute, domain::error, domain::evidence]
+//! Called-by: [adapters::contribution_execution_ingress, adapters::contribution_execution_repo, adapters::contribution_reasoner, humaux-private-worker, tests]
+//! Invariants: []
+//! Spec: none
 //!
 //! This module is deliberately pure. PostgreSQL owns the state machine and coupled writes; the
 //! application layer carries caller-supplied identities and exact completion evidence without

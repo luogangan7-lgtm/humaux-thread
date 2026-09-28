@@ -1,5 +1,11 @@
-//! §52.2 概念对登记表 row 2（`ErrorCode::CannotEstablishCompleteness` /
-//! `DegradeCode::CompletenessUnknown`）的降级侧，G52-5 成对测试。terminal
+//! `testkit::tests::pair::cannot_establish_completeness_degraded` — §52.2 概念对登记表 row
+//!   2（`ErrorCode::CannotEstablishCompleteness` / `DegradeCode::CompletenessUnknown`）的降级侧，G52-5 成对测试。
+//! Depends-on: crates=[humaux-domain, humaux-telemetry]; services=[]; env=[]; modules=[domain::error, telemetry::degrade]
+//! Called-by: [testkit::tests::pair_main]
+//! Invariants: []
+//! Spec: Baseline §52.2
+//!
+//! terminal
 //! 侧见同目录 `cannot_establish_completeness_terminal.rs`。
 //!
 //! 分界判据（§52.2 表）：调用方不要求 completeness class 达标，已返回结果

@@ -1,4 +1,16 @@
-//! T5.2+T5.3 integration test — `serving_repo` (§16.2/§16.3) against a real Postgres. Same
+//! `adapters::tests::serving_repo` — T5.2+T5.3 integration test — `serving_repo` (§16.2/§16.3) against a real
+//!   Postgres.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, humaux-testkit, postgres, sqlx, tokio];
+//!   services=[PostgreSQL(owner) r=[projection.processing_gaps, projection.ux_serving_one] w=[control.memberships,
+//!   control.tenants, control.users, projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_gateway),
+//!   PostgreSQL(role_maintenance)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres, adapters::serving_repo,
+//!   domain::identity, domain::ids, humaux-testkit, projection::serving]
+//! Called-by: [cargo-test]
+//! Invariants: [the serving switch is atomic and gated by open processing gaps; rows are scoped to a throwaway
+//!   tenant; no DSN, unreachable DB or ux_serving_one missing is a visible SKIP]
+//! Spec: Baseline §16.2; §16.3; §79.2
+//!
+//! Same
 //! convention as `stream_repo.rs`: shared tables (`0007_projection.sql`, migration `0065`'s
 //! `ux_serving_one`), not a scratch schema — every test scopes rows to a throwaway
 //! `control.tenants` row this file owns and cleans up on `Drop`.
@@ -62,6 +74,7 @@ impl DbIntegrationFixture for ServingFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -130,9 +143,11 @@ impl DbIntegrationFixture for ServingFixture {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let runtime = rt
+            // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
             .block_on(RuntimeDbPool::connect(&dsn_as_role(&dsn, "role_gateway")))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let maintenance = rt
+            // dep: PostgreSQL(role_maintenance) — test opens a direct PG connection for setup/verification
             .block_on(MaintenanceDbPool::connect(&dsn_as_role(
                 &dsn,
                 "role_maintenance",

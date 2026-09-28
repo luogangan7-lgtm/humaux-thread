@@ -1,3 +1,11 @@
+//! `protocol::tests::mcp_http` — integration test: spins up `protocol::mcp`'s Axum router on a real loopback TCP listener and drives it as an HTTP client, covering dual-output raw arguments, stateless transport, legacy/malformed request rejection, and authorization-error status codes.
+//! Depends-on: crates=[async-trait, axum, humaux-domain, serde_json, tokio, uuid]; services=[HTTP(loopback)]; env=[];
+//!   modules=[domain::error, protocol::mcp]
+//! Called-by: [cargo-test]
+//! Invariants: [drives protocol::mcp's router over a real loopback listener: malformed/legacy transport is rejected
+//!   before invoke and authorization errors set the HTTP status before dispatch]
+//! Spec: none
+//!
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
@@ -136,6 +144,7 @@ async fn request(
     headers: &[(&str, &str)],
     body: &str,
 ) -> (u16, String, BTreeMap<String, String>) {
+    // dep: HTTP(loopback) — connects to the Axum router this test just started on a real TCP listener.
     let mut stream = TcpStream::connect(address).await.expect("connect loopback");
     let mut request = format!(
         "{method} /mcp HTTP/1.1\r\nConnection: close\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",

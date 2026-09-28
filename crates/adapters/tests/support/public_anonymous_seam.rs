@@ -1,6 +1,17 @@
-//! Shared helpers for the Phase 9 **anonymous** public seam: assessed prepare -> confirm ->
-//! finalize -> `run_anonymous_once` admission -> `control.anonymous_source_lineage` read-back ->
-//! `evaluate_anonymous_claim`.
+//! `adapters::tests::support::public_anonymous_seam` — Shared helpers for the Phase 9 **anonymous** public seam:
+//!   assessed prepare -> confirm -> finalize -> `run_anonymous_once` admission -> `control.anonymous_source_lineage`
+//!   read-back -> `evaluate_anonymous_claim`.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, postgres, sha2, uuid];
+//!   services=[PostgreSQL(owner) r=[control.anonymous_source_lineage, public.claims, public.provenance_edges,
+//!   public.sources] w=[control.public_moderator_grants, ops.jobs] x=[public.phase9_public_coverage_for_probe]];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_entry_repo, adapters::postgres, adapters::public_repo,
+//!   adapters::tests::support::contribution_fixture, application::consolidate, application::contribute,
+//!   domain::error, domain::evidence, domain::public]
+//! Called-by: [adapters::tests::public_runtime, adapters::tests::public_runtime_qdrant]
+//! Invariants: [the only live public-tier seam since 0124 revoked role_public_worker's read of
+//!   staging.contribution_releases; admit_release must never be reopened for that role (ADR-0047); callers declare
+//!   the fixture module themselves]
+//! Spec: Baseline §13; ADR-0047
 //!
 //! Migration 0124 (`0124_phase9_independence_attestation:233`) REVOKEd
 //! `SELECT ON staging.contribution_releases` from `role_public_worker` on purpose: the anonymous
@@ -127,6 +138,7 @@ impl PublicCoveragePort for OfflineCoveragePort {
 /// Reads the canonical current public coverage for a probe straight from the database, so the
 /// offline port returns the same digest `contribute::finalize` will re-check.
 pub fn coverage_for_probe(probe: &[u8]) -> PublicCoverageDigest {
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut reader = Client::connect(
         &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
         NoTls,

@@ -1,4 +1,13 @@
 //! `adapters::qdrant` — Qdrant multitenant placement adapter (§17, T5.4+T5.6).
+//! Depends-on: crates=[humaux-domain, humaux-infra-cell, humaux-projection, serde_json, sqlx, uuid];
+//!   services=[Qdrant(*)]; env=[]; modules=[domain::affect, domain::authority, domain::dataclass, domain::identity,
+//!   domain::ids, domain::memory, domain::subject, domain::ticket_family, infra-cell::permit, infra-cell::transport,
+//!   projection::card, projection::dense]
+//! Called-by: [adapters::placement_repo, adapters::projection_worker, adapters::public_projection, adapters::retrieve, gateway::recall, retrieval-worker::main, tests, xtask::e2e_seed, xtask::switch_visible]
+//! Invariants: [every wire call takes &dyn IntraCellHttpTransport carrying a CellAccessPermit; Qdrant down ->
+//!   QdrantTransportError to the caller, no fallback search; tombstoned points are filtered by the overlay, never
+//!   counted as visible]
+//! Spec: Baseline §17; §17.5; §17.4; §23.1; §23.4; ADR-0003; §83.4; §7.0
 //!
 //! Implements every part of §17: collection/index request-body shaping, payload encoding, the
 //! [`Condition`](humaux_projection::dense::Condition) → Qdrant filter JSON translation, the
@@ -1087,6 +1096,7 @@ async fn call(
     path: String,
     json_body: Option<Value>,
 ) -> Result<Value, QdrantTransportError> {
+    // dep: Qdrant(*) — Qdrant REST call for `call`
     let response = transport
         .execute(
             permit,

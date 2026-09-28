@@ -1,4 +1,19 @@
-//! Real native MCP -> Gateway -> application -> one PostgreSQL RR continuity.get witness.
+//! `gateway::tests::continuity_get` — Real native MCP -> Gateway -> application -> one PostgreSQL RR continuity.get
+//!   witness.
+//! Depends-on: crates=[axum, humaux-adapters, humaux-contracts, humaux-domain, humaux-projection, humaux-protocol,
+//!   humaux-testkit, postgres, serde_json, sha2, time, tokio, uuid]; services=[PostgreSQL(role_gateway)
+//!   r=[control.audit_events, control.usage_reservations, private.memory_records] w=[control.api_keys,
+//!   control.memberships, control.tenants, control.workspaces, private.continuity_facet_evidence_links,
+//!   private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions,
+//!   private.continuity_projects] x=[private.publish_continuity_facet, private.register_continuity_project],
+//!   HTTP(gateway)]; env=[HUMAUX_CONTINUITY_W2_FORCE_NATIVE_CLEANUP_FAILURE,
+//!   HUMAUX_CONTINUITY_W2_FORCE_NATIVE_PANIC]; modules=[adapters::postgres, adapters::quota_repo,
+//!   adapters::tests::support::operation_receipt_fixture, contracts::retrieval_config, domain::context,
+//!   domain::dataclass, domain::identity, domain::ids, gateway::context, gateway::guard, gateway::mcp_application,
+//!   gateway::remember, humaux-testkit, projection::stream, protocol::edge, protocol::mcp, protocol::mcp_catalog]
+//! Called-by: [cargo-test]
+//! Invariants: [each test connects, seeds and tears down its own PostgreSQL fixture; no test shares state across HUMAUX_CONTINUITY_W2_* fault-injection runs]
+//! Spec: Baseline §73.5.1; ADR-0035
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -585,6 +600,7 @@ async fn request(
         ("Mcp-Name", "continuity"),
         ("Authorization", bearer),
     ];
+    // dep: HTTP(gateway) — test helper dials the gateway's own HTTP listener
     let mut stream = TcpStream::connect(address).await.unwrap();
     let mut wire = format!(
         "POST /mcp HTTP/1.1\r\nHost: {HOST}\r\nOrigin: {ORIGIN}\r\nConnection: close\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
@@ -738,6 +754,7 @@ fn native_gateway_preserves_raw_workspace_non_disclosure_and_validates_output() 
                 );
                 let runtime_handle = handle.rt.handle().clone();
                 let runtime = runtime_handle
+                    // dep: PostgreSQL(role_gateway) — test fixture pool for the continuity.get integration test
                     .block_on(RuntimeDbPool::connect(&polluted_dsn))
                     .expect("checked polluted Gateway pool");
                 let app = application(&handle, runtime);

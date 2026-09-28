@@ -1,4 +1,16 @@
-//! Real-PG18 negative gates for the inert USER_REASONING route foundation.
+//! `adapters::tests::reasoning_route_foundation` — Real-PG18 negative gates for the inert USER_REASONING route
+//!   foundation.
+//! Depends-on: crates=[postgres, uuid]; services=[PostgreSQL(owner) w=[control.credentials, control.memberships,
+//!   control.private_reasoning_domains, control.processor_models, control.provider_accounts,
+//!   control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints,
+//!   control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings,
+//!   control.reasoning_route_candidates, control.reasoning_route_policies, control.tenants, control.users]];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[]
+//! Called-by: [cargo-test]
+//! Invariants: [R1 proves ownership, trust, payer and ACL constraints on the route tables without activating a
+//!   router; the tests are #[ignore] lane tests on an isolated database]
+//! Spec: none
+//!
 //! R1 proves ownership, trust, payer, and ACL constraints without activating a router.
 
 use postgres::{Client, GenericClient, NoTls, error::SqlState};
@@ -112,6 +124,7 @@ fn spawn_transaction_statement(
     let (pid_tx, pid_rx) = mpsc::channel();
     let dsn = dsn.to_owned();
     let actor = std::thread::spawn(move || {
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut client = Client::connect(&dsn, NoTls).expect("race PostgreSQL connection");
         client
             .batch_execute(
@@ -170,6 +183,7 @@ fn assert_cross_spine_successor_waits_then_rejects(
     first_version: String,
     cross_spine_successor: String,
 ) {
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut first = Client::connect(dsn, NoTls).expect("first spine connection");
     first
         .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED")
@@ -179,6 +193,7 @@ fn assert_cross_spine_successor_waits_then_rejects(
         .execute(&first_version, &[])
         .expect("uncommitted first spine version");
     let (successor_pid, successor) = spawn_transaction_statement(dsn, cross_spine_successor);
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut observer = Client::connect(dsn, NoTls).expect("spine lock observer");
     wait_for_ungranted_lock(&mut observer, successor_pid, true);
     first.batch_execute("COMMIT").expect("publish first spine");
@@ -212,6 +227,7 @@ fn seed_shadow_policy<C: GenericClient>(client: &mut C, lane: &RouteLane) -> Uui
 )]
 fn user_reasoning_foundation_rejects_cross_owner_trust_and_payer_edges() {
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL 18 DSN");
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut client = Client::connect(&dsn, NoTls).expect("isolated PostgreSQL 18");
     let version: i32 = client
         .query_one("SHOW server_version_num", &[])
@@ -1220,6 +1236,7 @@ fn user_reasoning_foundation_rejects_cross_owner_trust_and_payer_edges() {
 )]
 fn version_spines_and_policy_candidate_freeze_are_race_safe() {
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL 18 DSN");
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut seed = Client::connect(&dsn, NoTls).expect("isolated PostgreSQL 18");
     let version: i32 = seed
         .query_one("SHOW server_version_num", &[])
@@ -1259,6 +1276,7 @@ fn version_spines_and_policy_candidate_freeze_are_race_safe() {
         ("REPEATABLE READ", "repeatable read", "rr"),
         ("SERIALIZABLE", "serializable", "serial"),
     ] {
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut isolated = Client::connect(&dsn, NoTls).expect("non-RC gate connection");
         isolated
             .batch_execute(&format!("BEGIN ISOLATION LEVEL {isolation_sql}"))
@@ -1384,6 +1402,7 @@ fn version_spines_and_policy_candidate_freeze_are_race_safe() {
         ),
     );
 
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut transition = Client::connect(&dsn, NoTls).expect("transition race connection");
     transition
         .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED")
@@ -1402,6 +1421,7 @@ fn version_spines_and_policy_candidate_freeze_are_race_safe() {
             lane_a.tenant, lane_a.profile
         ),
     );
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut observer = Client::connect(&dsn, NoTls).expect("candidate lock observer");
     wait_for_ungranted_lock(&mut observer, candidate_pid, false);
     transition
@@ -1424,6 +1444,7 @@ fn version_spines_and_policy_candidate_freeze_are_race_safe() {
 #[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0128"]
 fn route_foundation_tables_are_acl_protected_until_r2_activation() {
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL 18 DSN");
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut client = Client::connect(&dsn, NoTls).expect("isolated PostgreSQL 18");
     let mut txn = client.transaction().expect("fixture transaction");
     for role in [
@@ -1439,6 +1460,7 @@ fn route_foundation_tables_are_acl_protected_until_r2_activation() {
             "reasoning_credential_bindings",
         ] {
             txn.batch_execute("SAVEPOINT acl").expect("savepoint");
+            // dep: PostgreSQL(owner) — test switches PG role to exercise RLS
             txn.batch_execute(&format!("SET LOCAL ROLE {role}"))
                 .expect("known runtime role");
             let denied = txn

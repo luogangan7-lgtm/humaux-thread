@@ -1,5 +1,13 @@
-//! §78.2 DB↔Rust contract tests for the §12 public-contribution closed sets (migration 0103
-//! vs `domain::public`). Same pattern as `tenant_placements_migration.rs`: read the live CHECK
+//! `adapters::tests::public_contribution_contract` — §78.2 DB↔Rust contract tests for the §12 public-contribution
+//!   closed sets (migration 0103 vs `domain::public`).
+//! Depends-on: crates=[humaux-domain, humaux-testkit, postgres]; services=[PostgreSQL(any)
+//!   r=[staging.contribution_releases]]; env=[HUMAUX_TEST_PG_DSN]; modules=[domain::public, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [reads the live CHECK definitions and asserts every Rust variant appears; ContributionPolicy::Disabled
+//!   is a legal policy but must not be a legal release snapshot; a missing DB goes through skip_or_fail]
+//! Spec: Baseline §78.2; §12; §12.1; §79.2
+//!
+//! Same pattern as `tenant_placements_migration.rs`: read the live CHECK
 //! constraint definition via `pg_get_constraintdef`, assert every Rust variant's `as_db_str`
 //! appears — Rust-side renames or DB-side edits can no longer drift apart silently (the exact
 //! gap the wave-1 review named: five new closed sets with consistency held only by a manual
@@ -24,6 +32,7 @@ fn connect() -> Option<Client> {
         skip_or_fail(NAME, "missing object: Postgres DSN", ExternalDep::Postgres);
         return None;
     };
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;

@@ -1,4 +1,14 @@
 //! `adapters::remember` — T3.2 `remember` (§34 / §34.1 / §60 transaction B).
+//! Depends-on: crates=[humaux-domain, humaux-projection, serde_json, sqlx]; services=[PostgreSQL(role_gateway)
+//!   r=[control.private_reasoning_domains, ops.commit_seq_seq] w=[ops.outbox, private.events,
+//!   private.evidence_objects, private.ingest_tickets, projection.stream_checkpoints, projection.stream_log]];
+//!   env=[CARGO_MANIFEST_DIR]; modules=[adapters::affect_repo, adapters::postgres, adapters::retrieve,
+//!   adapters::subject_repo, domain::affect, domain::error, domain::evidence, domain::ids, domain::subject,
+//!   projection::stream]
+//! Called-by: [adapters::affect_repo, adapters::consolidate_repo, adapters::contribution_entry_repo, adapters::contribution_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::projection_worker, gateway::guard, gateway::remember, tests]
+//! Invariants: [role_gateway's single Evidence write path, one transaction in §60 order; ingest tickets are only
+//!   UPDATEd (no INSERT grant); an exhausted batch or non-future token expiry is a RememberError and nothing commits]
+//! Spec: Baseline §34.2; §60.1; §60; §34.1
 //!
 //! [`remember`] is `role_gateway`'s single write path for Evidence acceptance. It runs against
 //! [`RuntimeDbPool`] — never [`crate::batch::begin_batch`]'s [`crate::postgres::BatchIssuerDbPool`]
@@ -634,6 +644,7 @@ pub async fn remember(
     if cmd.consistency_token_expires_at <= OffsetDateTime::now_utc() {
         return Err(RememberError::ConsistencyTokenExpiryNotFuture);
     }
+    // dep: PostgreSQL(role_gateway) — transaction entry for `remember`
     let mut txn = pool.pool().begin().await?;
     let pending = remember_in_txn(&mut txn, cmd).await?;
     txn.commit().await?;

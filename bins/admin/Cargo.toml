@@ -1,6 +1,7 @@
 [package]
 name = "humaux-admin"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -15,19 +16,27 @@ workspace = true
 # check (`xtask architecture-check`) freezes that crate's dependent-manifest set to exactly
 # `{crates/infra-egress/Cargo.toml, crates/infra-cell/Cargo.toml}`; this crate reaches
 # `reqwest`'s types only transitively, through `humaux-infra-cell`'s own re-export.
+# why: same-Cell transport and CellAccessPermit for Qdrant/UDS calls; used-by: [admin::cell_resources]
 humaux-infra-cell = { path = "../../crates/infra-cell" }
+# why: typed PG pools, repositories and wire adapters this package drives; used-by: [admin::mechanism]
 humaux-adapters = { path = "../../crates/adapters" }
+# why: config/feature/mechanism registries and contract types; used-by: [admin::mechanism, admin::render]
 humaux-contracts = { path = "../../crates/contracts" }
 # `HttpIntraCellTransport::execute` is async; `main` stays sync (this binary has exactly one
 # probe that needs a runtime so far) — `cell_resources::run` opens a small dedicated runtime
 # rather than making every subcommand async.
+# why: async runtime; used-by: [admin::cell_resources, admin::mechanism]
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # §4.4 envelope `{value, scanned_n, scope_hash, checked_at, probe_version}` plus this probe's
 # per-resource breakdown — same JSON shape every adapter in this workspace already emits with.
+# why: JSON payloads and envelopes; used-by: [admin::cell_resources, admin::probe]
 serde_json = "1"
 # `scope_hash` (§4.4: "扫描范围规范化后的 sha256") — same crate/version domain already pins.
+# why: sha256 digests for hashes, fingerprints and scope_hash; used-by: [admin::probe]
 sha2 = "0.11"
 # `checked_at` RFC3339 timestamp.
+# why: timestamps (OffsetDateTime, RFC3339); used-by: [admin::probe]
 time = { version = "0.3", features = ["formatting"] }
 # `HUMAUX_CELL_ID` env var parsing.
+# why: UUID ids (v7) and parsing; used-by: [admin::cell_resources, tests]
 uuid = "1.25.0"

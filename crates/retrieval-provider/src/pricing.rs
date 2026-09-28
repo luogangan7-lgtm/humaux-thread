@@ -1,7 +1,13 @@
-//! §19 Pricing Registry — pure snapshot resolution over `control.provider_pricing_versions`
-//! rows (§19 "字段": provider_id/model_id/region/pricing_version/currency/
-//! input_token_price/output_token_price?/request_price?/batch_discount?/effective_from/
-//! effective_to/source_ref/verified_at). "模型价格不能硬编码在 Rust" (§19/§78.1) — every price
+//! `retrieval-provider::pricing` — §19 Pricing Registry — pure snapshot resolution over
+//!   `control.provider_pricing_versions` rows (§19 "字段": provider_id/model_id/region/pricing_version/currency/
+//!   input_token_price/output_token_price?/request_price?/batch_discount?/effective_from/
+//!   effective_to/source_ref/verified_at).
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [retrieval-provider::cost, tests]
+//! Invariants: []
+//! Spec: §19; §78.1; §3; §78.3
+//!
+//! "模型价格不能硬编码在 Rust" (§19/§78.1) — every price
 //! this module ever sees arrives as a [`PricingVersion`] value the caller loaded from that
 //! table; nothing here contains a numeric literal for a real provider's price.
 //!

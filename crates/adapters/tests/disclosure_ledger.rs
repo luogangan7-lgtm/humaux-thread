@@ -1,7 +1,16 @@
-//! T4.2 integration test — `disclosure` (§7.4) against a real Postgres, on
-//! `migrations/0047_data_disclosure_ledger.sql`'s real `ops.data_disclosures` /
-//! `ops.data_disclosure_sources` tables (same convention as `jobs_claim.rs`: shared tables,
-//! each test scopes rows to its own throwaway `control.tenants` row cleaned up on drop).
+//! `adapters::tests::disclosure_ledger` — T4.2 integration test — `disclosure` (§7.4) against a real Postgres, on
+//!   `migrations/0047_data_disclosure_ledger.sql`'s real `ops.data_disclosures` / `ops.data_disclosure_sources`
+//!   tables (same convention as `jobs_claim.rs`: shared tables, each test scopes rows to its own throwaway
+//!   `control.tenants` row cleaned up on drop).
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, sqlx, tokio];
+//!   services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, ops.data_disclosure_sources,
+//!   ops.data_disclosures, private.evidence_objects], PostgreSQL(role_maintenance), PostgreSQL(role_private_worker)];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::disclosure, adapters::postgres, domain::dataclass, domain::egress,
+//!   domain::ids, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [reserve writes the ledger row and its sources before the call and finalize records the outcome; no
+//!   DSN, unreachable DB or migration missing is a visible SKIP]
+//! Spec: Baseline §79.2
 //!
 //! Three-state skip (§79.2): no DSN, unreachable DB, or the migration not yet applied all
 //! print a visible SKIP and return.
@@ -73,6 +82,7 @@ impl DbIntegrationFixture for DisclosureFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `isolate`
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -115,9 +125,11 @@ impl DbIntegrationFixture for DisclosureFixture {
         let maintenance_dsn = dsn_as_role(&dsn, "role_maintenance");
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        // dep: PostgreSQL(role_private_worker) — opens the role-scoped connection for `isolate`
         let private_worker = rt
             .block_on(PrivateWorkerDbPool::connect(&private_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        // dep: PostgreSQL(role_maintenance) — opens the role-scoped connection for `isolate`
         let maintenance = rt
             .block_on(MaintenanceDbPool::connect(&maintenance_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;

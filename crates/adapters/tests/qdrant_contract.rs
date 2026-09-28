@@ -1,4 +1,14 @@
-//! T5.4+T5.6 — `adapters::qdrant` (§17) pure-logic tests. No DB, no network: everything this
+//! `adapters::tests::qdrant_contract` — T5.4+T5.6 — `adapters::qdrant` (§17) pure-logic tests.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-domain, humaux-infra-cell, humaux-projection, serde_json,
+//!   sqlx, tokio, uuid]; services=[]; env=[]; modules=[adapters::qdrant, domain::authority, domain::dataclass,
+//!   domain::identity, domain::ids, domain::memory, domain::subject, infra-cell::permit, infra-cell::resource,
+//!   infra-cell::transport, projection::card, projection::dense]
+//! Called-by: [cargo-test]
+//! Invariants: [no DB and no network: only request/response JSON shaping and the §17.4 confirmation contract;
+//!   unexpected shapes and non-success statuses must map to the typed QdrantTransportError]
+//! Spec: Baseline §17.4; §17.1; §23.4
+//!
+//! No DB, no network: everything this
 //! file exercises is request/response JSON shaping and the §17.4 confirmation contract, none
 //! of which needs the still-missing HTTP client (see `crates/adapters/src/qdrant.rs`'s module
 //! doc for why that dependency is not in this build). The genuinely Qdrant-reachability-gated

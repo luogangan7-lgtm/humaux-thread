@@ -886,9 +886,12 @@ cargo run -q -p xtask -- soak \
   --probe-cmd "curl -fsS -o /dev/null http://127.0.0.1:8080/readyz" \
   --probe-cmd "$S/soak_probe_rw.sh" \
   --probe-cmd "$S/soak_probe_pw.sh" \
-  --chaos-every-secs ${SOAK_CHAOS_SECS:-90} \
+  --watch-pidfile gw=$S/gw.pid --watch-pidfile rw=$S/rw.pid --watch-pidfile pw=$S/pw.pid \
+  --watch-pidfile ds=$S/ds.pid --watch-pidfile cw=$S/cw.pid \
+  --chaos-every-secs ${SOAK_CHAOS_SECS:-90} --chaos-grace-secs ${SOAK_CHAOS_GRACE:-60} \
   --chaos-cmd "$S/soak_chaos_rw.sh" --chaos-cmd "$S/soak_chaos_ds.sh" --chaos-cmd "$S/soak_chaos_cw.sh" \
   --lease-secs 120 --max-rss-mib ${SOAK_MAX_RSS_MIB:-2048} --max-db-connections ${SOAK_MAX_CONNS:-120} \
+  --max-op-failure-rate ${SOAK_MAX_OP_FAIL:-0.01} \
   --report $EV/soak-report.json 2>&1 | tee -a $EV/rehearsal.log
 SOAK_RC=${pipestatus[1]}   # zsh: the tee at the end of the pipe is NOT the verdict
 rm -f $S/soak_project.on

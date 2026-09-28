@@ -1,4 +1,9 @@
 //! `retrieval::handoff` — §25.3 continuity handoff 的**字节域**（G80-31）。
+//! Depends-on: crates=[humaux-domain, serde, serde_json, sha2]; services=[];
+//!   env=[]; modules=[domain::context, domain::grounding, retrieval::compiler]
+//! Called-by: [adapters::context_repo, adapters::continuity_read, application::continuity, gateway::context, tests]
+//! Invariants: []
+//! Spec: §25.3; §57.1
 //!
 //! §57.1 Phase 8 出场判据前半：「同一 `context_snapshot_seq` 两次装配 handoff 逐字节相同」。
 //! 本模块的策略是**类型即比较域**——凡是会让两次装配字节不同的东西，[`Handoff`] 在结构上
@@ -453,6 +458,7 @@ mod tests {
         lane_outcomes.mandatory = MandatoryLane::from_selectors([
             SelectorOutcome::Unavailable {
                 id: SelectorId::TaskExplicitContextV1,
+                // dep-map: allow table-undeclared — selector metadata names the missing column; SQL runs in adapters
                 missing_object: "private.memory_records.task_id".into(),
             },
             SelectorOutcome::Ran {

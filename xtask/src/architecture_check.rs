@@ -1,3 +1,9 @@
+//! `xtask::architecture_check` — CI gate family for §53.3 / §55.1 / §48.0① / §59.1 / §78.3 architecture boundary lints.
+//! Depends-on: crates=[humaux-domain, serde_json, toml]; services=[PostgreSQL(any) r=[ops.model_call_ledger, ops.provider_health_current, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project] w=[private.context_bindings, private.processing_runs, private.task_binding_grants] x=[control.resolve_user_reasoning_admission, ops.reasoning_health_observation_reject_mutation, ops.reasoning_model_call_validate, private.publish_continuity_facet, private.read_continuity_project_storage_v1], subprocess(cargo)]; env=[CARGO_MANIFEST_DIR]; modules=[domain::affect, domain::confirm, domain::subject]
+//! Called-by: [xtask::direction_table, xtask::main]
+//! Invariants: [each sub-check reports pass/fail/not_applicable independently; not_applicable names the missing object (§57.1); exit 1 iff any sub-check fails]
+//! Spec: Baseline §53.3; §55.1; §59.1; §78.3; §78; §52.4
+//!
 //! xtask `architecture-check` — the CI gate family for §53.3 (Outcome fallback rule +
 //! positive sentinels), §55.1 / §48.0① / §59.1 (unique construction points), §78.3
 //! (Workspace Dependency Rule), the §78 Architecture Boundary Lints, and §52.4 G52-1.
@@ -828,6 +834,7 @@ fn check_package_deps(
 }
 
 fn dependency_rule_check(root: &Path) -> Verdict {
+    // dep: subprocess(cargo) — cargo metadata, workspace dependency graph read
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(root)
@@ -2226,6 +2233,7 @@ fn g80_3_outbound_choke_point(root: &Path) -> Verdict {
     // workspace sentinel below reports that as `Fail` with the three named-missing-object
     // lines it already produces, instead of the vacuous "nothing to scan, so nothing is wrong"
     // `NotApplicable` a directory-existence early-return would produce.
+    // dep: subprocess(cargo) — cargo metadata, workspace dependency graph read
     let metadata_json = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(root)
@@ -8550,6 +8558,7 @@ async fn serving_version_in_txn() {}
     #[test]
     fn g80_3_manifest_dependency_check_real_repo_is_clean() {
         let root = real_root();
+        // dep: subprocess(cargo) — positive-control real-repo cargo metadata read
         let output = Command::new("cargo")
             .args(["metadata", "--no-deps", "--format-version", "1"])
             .current_dir(&root)
@@ -8588,6 +8597,7 @@ async fn serving_version_in_txn() {}
     #[test]
     fn g80_3_infra_network_dependents_check_real_repo_is_clean() {
         let root = real_root();
+        // dep: subprocess(cargo) — positive-control real-repo cargo metadata read
         let output = Command::new("cargo")
             .args(["metadata", "--no-deps", "--format-version", "1"])
             .current_dir(&root)

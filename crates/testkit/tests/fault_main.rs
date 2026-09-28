@@ -1,4 +1,8 @@
-//! Cargo integration-test entry point for `tests/fault/` (§53.4).
+//! `testkit::tests::fault_main` — Cargo integration-test entry point for `tests/fault/` (§53.4).
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[testkit::tests::fault::completeness_unknown, testkit::tests::fault::egress_denied, testkit::tests::fault::embed_provider_timeout, testkit::tests::fault::graph_expand_capped, testkit::tests::fault::projection_invisible_loss, testkit::tests::fault::projection_lag, testkit::tests::fault::rerank_model_mismatch, testkit::tests::fault::rerank_provider_timeout, testkit::tests::fault::state_pin_ambiguous, testkit::tests::fault::state_pin_missing]
+//! Called-by: [cargo-test]
+//! Invariants: []
+//! Spec: none
 //!
 //! Cargo only auto-discovers `*.rs` files directly under `tests/`; files in
 //! a subdirectory (`tests/fault/*.rs`) are invisible to it unless pulled in

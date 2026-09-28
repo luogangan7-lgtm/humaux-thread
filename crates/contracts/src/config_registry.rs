@@ -1,4 +1,8 @@
 //! `contracts::config_registry` — Typed Config Registry + effective config fingerprint (§50).
+//! Depends-on: crates=[sha2]; services=[]; env=[]; modules=[]
+//! Called-by: [contracts::retrieval_config, gateway::bootstrap, infra-egress::http, retrieval::request, tests]
+//! Invariants: []
+//! Spec: Baseline §50; §50.1; §78
 //!
 //! §50: 所有配置集中 typed registry，字段 name/type/default/scope/secret?/reloadability/owner
 //! module；垃圾值 fail-loud；生产运行必须记录 effective config fingerprint，而不是只看 `.env`。

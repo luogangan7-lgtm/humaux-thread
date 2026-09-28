@@ -1,4 +1,8 @@
 //! `domain::evidence` — `EvidenceOriginClass` / `InstructionDisposition` (§8.7 / §59).
+//! Depends-on: crates=[sha2]; services=[]; env=[]; modules=[]
+//! Called-by: [adapters::byok, adapters::context_repo, adapters::contribution_entry_repo, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::remember, application::confirm, application::contribute, application::contribution_execution, application::correct, domain::authority, domain::context, domain::grounding, domain::policy, gateway::mcp_application, gateway::memory, gateway::remember, humaux-local-secret-scan, humaux-private-worker, private-worker::distill, projection::fingerprint, tests]
+//! Invariants: []
+//! Spec: Baseline §8.1; §8.7; §16.1; ADR-0016
 //!
 //! §8.7: `origin_class` is stamped by **ingress path + AuthContext**, never self-reported by
 //! the client/model through a JSON parameter — this is the first boundary against private

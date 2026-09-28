@@ -1,4 +1,9 @@
-//! H2: §74 注册/登录/重置/变更状态机（Argon2id+security epoch）（Phase 2 wave 实现；判据出处见 spec 家章）。
+//! `application::auth` — H2: §74 注册/登录/重置/变更状态机（Argon2id+security epoch）（Phase 2 wave 实现；判据出处见 spec 家章）。
+//! Depends-on: crates=[argon2, hex, hmac, humaux-domain, rand, sha2]; services=[]; env=[]; modules=[domain::audit,
+//!   domain::error, domain::ids]
+//! Called-by: []
+//! Invariants: []
+//! Spec: §74; §3; §78.3; §74.6
 //!
 //! This module is deliberately pure: `humaux-application`'s own `Cargo.toml` carries no
 //! SQL/HTTP driver dependency, so nothing here touches Postgres or the network directly
@@ -486,6 +491,7 @@ impl UserLifecycleState {
             "PENDING_VERIFICATION" => Self::PendingVerification,
             "ACTIVE" => Self::Active,
             "SUSPENDED" | "DEACTIVATED" | "PENDING_DELETE" | "DELETED" => Self::Other,
+            // dep-map: allow table-undeclared — names the table only in a panic message; no DB access here
             other => panic!("unrecognized control.users.state value: {other}"),
         }
     }

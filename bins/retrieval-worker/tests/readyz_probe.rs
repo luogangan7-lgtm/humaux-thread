@@ -1,5 +1,13 @@
-//! Card 15 / ADR-0037 — `humaux-retrieval-worker --readyz` asserted against the BINARY, in both
-//! directions, with each dependency really taken away.
+//! `retrieval-worker::tests::readyz_probe` — Card 15 / ADR-0037 — `humaux-retrieval-worker --readyz` asserted against
+//!   the BINARY, in both directions, with each dependency really taken away.
+//! Depends-on: crates=[]; services=[subprocess(humaux-retrieval-worker)]; env=[CARGO_BIN_EXE_humaux-retrieval-worker,
+//!   HUMAUX_REQUIRE_DB, HUMAUX_RETRIEVAL_WORKER_CALLER, HUMAUX_RETRIEVAL_WORKER_CELL_ID,
+//!   HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR, HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST,
+//!   HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT, HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS, HUMAUX_TEST_PG_DSN,
+//!   HUMAUX_TEST_QDRANT_PORT]; modules=[]
+//! Called-by: [cargo-test]
+//! Invariants: [the probe test spawns its own humaux-retrieval-worker subprocess against HUMAUX_TEST_PG_DSN/HUMAUX_TEST_QDRANT_PORT and fails, not skips, when HUMAUX_REQUIRE_DB is set and the DB is unreachable]
+//! Spec: Baseline §79.2; ADR-0037
 //!
 //! The review this file answers found the readiness contract's down-path asserted for exactly
 //! one dependency of one worker: nothing anywhere ran a `--readyz` against a down PostgreSQL or
@@ -20,6 +28,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_humaux-retrieval-worker");
 
 /// macOS XProtect assesses a freshly linked binary on its first exec; pay that once.
 fn warm_binary() {
+    // dep: subprocess(humaux-retrieval-worker) — spawns the humaux-retrieval-worker binary under test
     let _ = Command::new(BIN).arg("--warm-up-not-a-mode").output();
 }
 
@@ -55,6 +64,7 @@ fn role_dsn() -> Option<String> {
 
 /// `--readyz` with the whole environment it needs; the caller varies exactly one dependency.
 fn readyz(dsn: &str, qdrant_host: &str, qdrant_port: u16) -> Output {
+    // dep: subprocess(humaux-retrieval-worker) — spawns the humaux-retrieval-worker binary under test
     Command::new(BIN)
         .arg("--readyz")
         .env("HUMAUX_RETRIEVAL_WORKER_PG_DSN", dsn)

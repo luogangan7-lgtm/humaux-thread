@@ -1,3 +1,9 @@
+//! `xtask::migrate` — applies migrations/*.sql in filename order against a live PostgreSQL instance (§46).
+//! Depends-on: crates=[humaux-testkit, postgres, toml]; services=[PostgreSQL(any) w=[ops.schema_migrations] x=[private.read_continuity_project_storage_v1]]; env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN]; modules=[xtask::migration_rehearsal]
+//! Called-by: [xtask::main, xtask::serial_lane]
+//! Invariants: [each PENDING migration runs in one explicit transaction (ADR-0050 D-D); DSN missing ⇒ not_applicable naming the missing object, never a silent skip; a second run is idempotent]
+//! Spec: Baseline §46; ADR-0050
+//!
 //! xtask `migrate` — applies `migrations/*.sql` in filename order against a live PostgreSQL
 //! instance (§46 migration safety). DSN comes from `--dsn <url>` or `HUMAUX_TEST_PG_DSN`;
 //! neither present ⇒ `not_applicable` naming the missing object (§57.1 rule 2), never a
@@ -343,7 +349,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     let migrations = migrations;
 
-    // dep: Postgres — the target database this run migrates.
+    // dep: PostgreSQL(any) — the target database this run migrates.
     let mut client = match Client::connect(&dsn, NoTls) {
         Ok(c) => c,
         Err(e) => {
@@ -442,7 +448,7 @@ mod tests {
     /// returns the guard plus a DSN onto it. `None` = skipped through `skip_or_fail`.
     fn throwaway(test: &str, purpose: &str) -> Option<(DisposableDatabase, String)> {
         let base = base_dsn(test)?;
-        // dep: Postgres (superuser from HUMAUX_TEST_PG_DSN) — CREATE/DROP DATABASE.
+        // dep: PostgreSQL(any) — superuser from HUMAUX_TEST_PG_DSN — CREATE/DROP DATABASE.
         let mut admin = match Client::connect(&base, NoTls) {
             Ok(client) => client,
             Err(e) => {
@@ -517,7 +523,7 @@ mod tests {
 
     impl Drop for DisposableDatabase {
         fn drop(&mut self) {
-            // dep: Postgres (superuser from HUMAUX_TEST_PG_DSN) — DROP DATABASE of the disposable database.
+            // dep: PostgreSQL(any) — superuser from HUMAUX_TEST_PG_DSN — DROP DATABASE of the disposable database.
             if let Ok(mut admin) = Client::connect(&self.admin_dsn, NoTls) {
                 let _ = admin.batch_execute(&format!("DROP DATABASE {} WITH (FORCE)", self.name));
             }
@@ -583,7 +589,7 @@ mod tests {
     fn apply_all_is_idempotent_and_atomic_on_a_bad_file() {
         const TEST: &str = "apply_all_is_idempotent_and_atomic_on_a_bad_file";
         let Some(dsn) = base_dsn(TEST) else { return };
-        // dep: Postgres (HUMAUX_TEST_PG_DSN) — apply_all against the disposable database.
+        // dep: PostgreSQL(any) — HUMAUX_TEST_PG_DSN — apply_all against the disposable database.
         let Ok(mut client) = Client::connect(&dsn, NoTls) else {
             skip_or_fail(
                 TEST,
@@ -719,7 +725,7 @@ mod tests {
         let before = &migrations[..split];
         let exact = &migrations[split];
         assert_eq!(exact.migration_id, "0137_project_continuity_read");
-        // dep: Postgres (disposable database) — split apply up to 0137.
+        // dep: PostgreSQL(any) — disposable database — split apply up to 0137.
         let mut client = Client::connect(&test_dsn, NoTls).expect("connect disposable database");
         let (applied, skipped) =
             apply_all(&mut client, before, LOCK_TIMEOUT).expect("apply through 0136");
@@ -816,7 +822,7 @@ mod tests {
         let Some((_db, dsn)) = throwaway(TEST, "migrate_head") else {
             return;
         };
-        // dep: Postgres (throwaway c25 database) — apply 0001→head executing every manifest check.
+        // dep: PostgreSQL(any) — throwaway c25 database — apply 0001→head executing every manifest check.
         let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
         let started = Instant::now();
         let (applied, skipped) = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
@@ -846,7 +852,7 @@ mod tests {
         let Some((_db, dsn)) = throwaway(TEST, "migrate_refuse") else {
             return;
         };
-        // dep: Postgres (throwaway c25 database) — refusal on false/invalid scratch checks.
+        // dep: PostgreSQL(any) — throwaway c25 database — refusal on false/invalid scratch checks.
         let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
         let cases = [
             (
@@ -901,7 +907,7 @@ mod tests {
         let Some((_db, dsn)) = throwaway(TEST, "migrate_nonbool") else {
             return;
         };
-        // dep: Postgres (throwaway c25 database) — refusal on a non-boolean check.
+        // dep: PostgreSQL(any) — throwaway c25 database — refusal on a non-boolean check.
         let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
         let mut m = migration("0001_c25_nonbool", "CREATE TABLE c25_nonbool (id int)");
         m.manifest = Some(manifest(&m.migration_id, "select 1", "select true"));
@@ -930,7 +936,7 @@ mod tests {
         let Some((_db, dsn)) = throwaway(TEST, "migrate_nomanifest") else {
             return;
         };
-        // dep: Postgres (throwaway c25 database) — apply_all under the advisory lock.
+        // dep: PostgreSQL(any) — throwaway c25 database — apply_all under the advisory lock.
         let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
         let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
             .expect_err("a pending migration without a manifest is refused");
@@ -952,9 +958,9 @@ mod tests {
         let Some((_db, dsn)) = throwaway(TEST, "migrate_lock") else {
             return;
         };
-        // dep: Postgres (throwaway c25 database) — client A holds HXMIGRAT.
+        // dep: PostgreSQL(any) — throwaway c25 database — client A holds HXMIGRAT.
         let mut a = Client::connect(&dsn, NoTls).expect("client A");
-        // dep: Postgres (throwaway c25 database) — client B must wait or refuse with drift 0.
+        // dep: PostgreSQL(any) — throwaway c25 database — client B must wait or refuse with drift 0.
         let mut b = Client::connect(&dsn, NoTls).expect("client B");
         a.execute("SELECT pg_advisory_lock($1)", &[&MIGRATE_ADVISORY_LOCK])
             .expect("A takes HXMIGRAT");
@@ -983,7 +989,7 @@ mod tests {
                 let dsn = dsn.clone();
                 let slow = slow.clone();
                 std::thread::spawn(move || {
-                    // dep: Postgres (throwaway c25 database) — one of the concurrent migrate racers.
+                    // dep: PostgreSQL(any) — throwaway c25 database — one of the concurrent migrate racers.
                     let mut c = Client::connect(&dsn, NoTls).expect("racer connects");
                     apply_all(&mut c, &slow, LOCK_TIMEOUT)
                 })

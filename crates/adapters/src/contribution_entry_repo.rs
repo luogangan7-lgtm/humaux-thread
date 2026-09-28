@@ -1,4 +1,20 @@
-//! §12.1.1: authenticated private candidate storage and exact-byte manual finalization.
+//! `adapters::contribution_entry_repo` — §12.1.1: authenticated private candidate storage and exact-byte manual
+//!   finalization.
+//! Depends-on: crates=[async-trait, hex, humaux-application, humaux-domain, serde_json, sha2, sqlx];
+//!   services=[PostgreSQL(any) r=[control.contribution_policies, control.memberships,
+//!   control.private_reasoning_domains, control.tenants, control.users, ops.model_call_ledger,
+//!   private.evidence_objects, private.memory_evidence, private.memory_records] w=[control.anonymous_source_lineage,
+//!   control.contribution_confirmations, ops.outbox, staging.contribution_candidate_phase9_assessments,
+//!   staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources,
+//!   staging.contribution_releases, staging.sanitized_public_candidates] x=[ops.lock_contribution_inputs,
+//!   public.phase9_public_coverage_for_probe]]; env=[]; modules=[adapters::contribution_scan, adapters::postgres,
+//!   adapters::reasoning_route_admission, adapters::remember, application::consolidate, application::contribute,
+//!   domain::authority, domain::error, domain::evidence, domain::identity, domain::ids, domain::public]
+//! Called-by: [adapters::contribution_execution_ingress, adapters::contribution_reasoner, tests]
+//! Invariants: [provider/scanner work runs outside the short input lock; every durable step re-checks policy,
+//!   membership, profile and source hashes; no public pool can read candidates; a failed re-check is
+//!   Conflict/Forbidden with no candidate row]
+//! Spec: none
 //!
 //! Provider/scanner work happens outside the short input lock. Every durable step rechecks
 //! the actual policy, membership, profile and source hashes. No public pool can read candidates.
@@ -518,6 +534,7 @@ impl ContributionCandidatePort for ContributionEntryRepo<'_> {
         &self,
         request: &ContributionPreparationInput,
     ) -> Result<PreparationSnapshot, ErrorCode> {
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await.map_err(db_error)?;
         let result = load_execution_preparation_in_txn(&mut txn, request).await?;
         txn.commit().await.map_err(db_error)?;
@@ -529,6 +546,7 @@ impl ContributionCandidatePort for ContributionEntryRepo<'_> {
         candidate: StoredCandidate<'_, Self::ScanReceipt>,
     ) -> Result<ContributionCandidateId, ErrorCode> {
         let saved = candidate.preparation;
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await.map_err(db_error)?;
         scope(&mut txn, &saved.authorization).await?;
         let current_request = PrepareContribution {
@@ -613,6 +631,7 @@ impl ContributionCandidatePort for ContributionEntryRepo<'_> {
         confirmation: ConfirmContribution,
     ) -> Result<ContributionReleaseId, ErrorCode> {
         let auth = &confirmation.authorization;
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await.map_err(db_error)?;
         scope(&mut txn, auth).await?;
         let candidate =
@@ -880,6 +899,7 @@ impl AssessedContributionCandidatePort for ContributionEntryRepo<'_> {
             "candidate_payload_sha256": candidate_hash,
             "novelty":"PASS", "quality":"PASS", "generality":"PASS", "grounding":"PASS",
         });
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await.map_err(db_error)?;
         let id = store_assessed_candidate_in_txn(&mut txn, candidate).await?;
         sqlx::query(
@@ -938,6 +958,7 @@ pub async fn preview(
     auth: &AuthorizationScope,
     id: ContributionCandidateId,
 ) -> Result<CandidatePreview, ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     scope(&mut txn, auth).await?;
     let row=sqlx::query("SELECT disclosed_payload,disclosed_payload_sha256,policy_version FROM staging.contribution_candidates WHERE candidate_id=$1")
@@ -972,6 +993,7 @@ pub async fn record_confirmation(
     if seconds <= 0 || policy_version <= 0 {
         return Err(ErrorCode::InvalidInput);
     }
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     scope(&mut txn, auth).await?;
     let receipt:Uuid=sqlx::query_scalar("INSERT INTO control.contribution_confirmations(tenant_id,user_id,candidate_id, \

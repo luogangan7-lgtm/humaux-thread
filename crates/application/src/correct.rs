@@ -1,4 +1,9 @@
 //! `application::correct` — §Q4 `memory.correct` use case, pure half (ADR-0025).
+//! Depends-on: crates=[humaux-domain, uuid]; services=[];
+//!   env=[]; modules=[domain::authority, domain::evidence, domain::ids, domain::memory, domain::policy]
+//! Called-by: [adapters::memory_governance_repo]
+//! Invariants: []
+//! Spec: ADR-0025
 //!
 //! Spec :8568 states the hard rule (a user edit writes a Correction Event plus a NEW version
 //! and never edits historical Evidence in place) but defines no shape; research question 4's

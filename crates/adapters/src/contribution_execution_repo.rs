@@ -1,4 +1,10 @@
-//! Typed bindings for migration 0131's eight exposed contribution execution commands.
+//! `adapters::contribution_execution_repo` — Typed bindings for migration 0131's eight exposed contribution execution
+//!   commands.
+//! Depends-on: crates=[hex, humaux-application, humaux-domain, serde_json, sha2, sqlx]; services=[PostgreSQL(any) r=[private.contribution_execution_sources, private.contribution_executions, private.reserve_contribution_a, private.reserve_contribution_b] x=[private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.reserve_contribution_a, private.reserve_contribution_b, private.settle_contribution_terminal_job]]; env=[]; modules=[adapters::disclosure, adapters::postgres, adapters::reasoning_route_admission, application::consolidate, application::contribute, application::contribution_execution, domain::dataclass, domain::evidence, domain::public]
+//! Called-by: [adapters::contribution_execution_ingress, adapters::contribution_reasoner, humaux-private-worker, tests]
+//! Invariants: [execution state transitions are read back from PostgreSQL; an unknown state or invalid input is a
+//!   typed ContributionExecutionRepoError, never assumed progress]
+//! Spec: none
 
 use humaux_application::{
     consolidate::{
@@ -377,6 +383,7 @@ impl<'a> ContributionExecutionRepo<'a> {
         tenant_id: Uuid,
         execution_id: ContributionExecutionId,
     ) -> Result<Option<ContributionExecutionRead>, ContributionExecutionRepoError> {
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_id).await?;
         let root = sqlx::query(
@@ -516,6 +523,7 @@ impl<'a> ContributionExecutionRepo<'a> {
         if !scan_receipt.is_object() {
             return Err(ContributionExecutionRepoError::InvalidInput);
         }
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_id).await?;
         let digest: Vec<u8> =
@@ -539,6 +547,7 @@ impl<'a> ContributionExecutionRepo<'a> {
         let preparation = input.preparation();
         let tenant_id = preparation.authorization.tenant_id().0;
         let fingerprint = enqueue_fingerprint_v1(input)?;
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_id).await?;
         let returned = self
@@ -779,6 +788,7 @@ impl<'a> ContributionExecutionRepo<'a> {
             .prepared_route
             .as_ref()
             .ok_or(ContributionExecutionRepoError::InvalidInput)?;
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_id).await?;
         let row = sqlx::query(sql)
@@ -932,6 +942,7 @@ impl<'a> ContributionExecutionRepo<'a> {
         humaux_application::contribution_execution::ContributionExecutionState,
         ContributionExecutionRepoError,
     > {
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_id).await?;
         let state: String = sqlx::query_scalar("SELECT private.complete_contribution_a_exact($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)::text")
@@ -1023,6 +1034,7 @@ impl<'a> ContributionExecutionRepo<'a> {
                 Some(failure.error_class()),
             ),
         };
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_id).await?;
         let state: String = sqlx::query_scalar("SELECT private.complete_contribution_b_exact($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)::text")
@@ -1067,6 +1079,7 @@ impl<'a> ContributionExecutionRepo<'a> {
         execution_id: ContributionExecutionId,
         lease: &ContributionJobLease,
     ) -> Result<bool, ContributionExecutionRepoError> {
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_id).await?;
         let result = sqlx::query_scalar(
@@ -1089,6 +1102,7 @@ impl<'a> ContributionExecutionRepo<'a> {
         execution_id: ContributionExecutionId,
         lease: &ContributionJobLease,
     ) -> Result<Uuid, ContributionExecutionRepoError> {
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_id).await?;
         let result = sqlx::query_scalar(sql)
@@ -1109,6 +1123,7 @@ impl<'a> ContributionExecutionRepo<'a> {
         execution_id: ContributionExecutionId,
         lease: &ContributionJobLease,
     ) -> Result<String, ContributionExecutionRepoError> {
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_id).await?;
         let result = sqlx::query_scalar(sql)

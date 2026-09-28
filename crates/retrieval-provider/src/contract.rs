@@ -1,5 +1,10 @@
-//! `retrieval-provider::contract` — T7.1: §19 "Retrieval Provider Descriptor" / "Provider
-//! Credential 边界" / "Provider Plane 测试 · Contract Tests" (spec lines ~3465-4131).
+//! `retrieval-provider::contract` — T7.1: §19 "Retrieval Provider Descriptor" / "Provider Credential 边界" / "Provider
+//!   Plane 测试 · Contract Tests" (spec lines ~3465-4131).
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-domain, humaux-local-secret-scan, uuid]; services=[];
+//!   env=[]; modules=[domain::egress, domain::error, domain::ids]
+//! Called-by: [retrieval-provider::adapters, retrieval-provider::failover, retrieval-provider::health, retrieval-provider::router, retrieval-worker::main, retrieval-worker::rpc, tests]
+//! Invariants: []
+//! Spec: §19; §17.6; §1.2.3; §41.4
 //!
 //! Scope, verbatim from §19 "Retrieval Provider Plane": this module (and the whole
 //! `retrieval-provider` crate) covers only **external managed neural retrieval** — dense

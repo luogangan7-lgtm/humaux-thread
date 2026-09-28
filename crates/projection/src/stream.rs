@@ -1,5 +1,9 @@
-//! `projection::stream` — §15 stream identity + the pure (no-IO) half of T3.3's
-//! `advance_prefix` three-way ledger consistency check.
+//! `projection::stream` — §15 stream identity + the pure (no-IO) half of T3.3's `advance_prefix` three-way ledger
+//!   consistency check.
+//! Depends-on: crates=[humaux-domain, uuid]; services=[]; env=[]; modules=[domain::ids, domain::ledger]
+//! Called-by: [adapters::affect_repo, adapters::consolidate_repo, adapters::context_repo, adapters::distill_repo, adapters::exact_census, adapters::forget_repo, adapters::memory_governance_repo, adapters::projection_worker, adapters::read_materialize, adapters::remember, adapters::retrieve, adapters::stream_repo, gateway::bootstrap, gateway::context, gateway::memory, gateway::recall, gateway::remember, projection::serving, tests]
+//! Invariants: []
+//! Spec: Baseline §15.4; §6.2.3; §15
 //!
 //! This module deliberately holds no SQL and no async: the three/four independent reads
 //! §15.4 requires (`stream_log_agg`, `count_open_gaps` via the `processing_gaps` view,

@@ -1,8 +1,13 @@
-//! `adapters::affect_repo` — SQL half of the §8.5.1 affect annotation axis (ADR-0030, card E1):
-//! the ONE write path onto `private.memory_affects` ([`annotate`]) and the ONE set-based read
-//! ([`AFFECTS_FOR_MEMORIES_SQL`] / [`affects_for_memories_in_txn`]) every reader shares — the
-//! PG hydrate re-check (`read_materialize`), the projection worker's payload build, and
-//! `memory.get` / `memory.enumerate` / the recall rerank.
+//! `adapters::affect_repo` — SQL half of the §8.5.1 affect annotation axis (ADR-0030, card E1): the ONE write path
+//!   onto `private.memory_affects` ([`annotate`]) and the ONE set-based read ([`AFFECTS_FOR_MEMORIES_SQL`] /
+//!   [`affects_for_memories_in_txn`]) every reader shares — the PG hydrate re-check (`read_materialize`), the
+//!   projection worker's payload build, and `memory.get` / `memory.enumerate` / the recall rerank.
+//! Depends-on: crates=[humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time]; services=[PostgreSQL(any) r=[private.memory_evidence, private.memory_records] w=[private.evidence_affects, private.memory_affects]]; env=[]; modules=[adapters::confirm_token_repo, adapters::postgres, adapters::remember, adapters::subject_repo, application::affect, domain::affect, domain::authority, domain::error, domain::identity, domain::subject, projection::stream]
+//! Called-by: [adapters::memory_governance_repo, adapters::projection_worker, adapters::read_materialize, adapters::remember, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, tests]
+//! Invariants: [affect rows are INSERT-only through insert_in_txn and never decayed on write; everything runs under
+//!   the caller's role + RLS, so another tenant's memory is NOT_FOUND like an unknown id; a PG error propagates as
+//!   ErrorCode, no fallback]
+//! Spec: Baseline §60
 //!
 //! Rows are immutable (0156 owner trigger; no UPDATE/DELETE grant): a write is INSERT-only through
 //! the ONE row issuer [`insert_in_txn`] (`memory.annotate_affect` on its own transaction,
@@ -192,6 +197,7 @@ pub async fn affects_for_memories(
     if memory_ids.is_empty() {
         return Ok(Vec::new());
     }
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
     let rows = affects_for_memories_in_txn(&mut txn, auth.tenant_id().0, memory_ids)
@@ -353,6 +359,7 @@ pub async fn annotate(
         return Err(ErrorCode::InvalidInput);
     }
     let tenant_id = auth.tenant_id().0;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
 

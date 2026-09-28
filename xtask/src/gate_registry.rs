@@ -1,3 +1,9 @@
+//! `xtask::gate_registry` — G80-23 gate-anchor-check + G80-24 gate-registry-coverage.
+//! Depends-on: crates=[]; services=[PostgreSQL(any) r=[ops.column_vitality]]; env=[CARGO_MANIFEST_DIR]; modules=[]
+//! Called-by: [xtask::main]
+//! Invariants: [G80-23 catches a registry cell whose anchor no longer resolves; G80-24 catches an id present in a home chapter but never registered]
+//! Spec: Baseline §80.1.2; §57.1
+//!
 //! xtask `gate-registry` — G80-23 `gate-anchor-check` + G80-24 `gate-registry-coverage`
 //! (§80.1.2 is the home chapter for both; judgement prose lives there and in §57.1 for
 //! G80-24③ — this module cites § numbers, it does not restate the rules).

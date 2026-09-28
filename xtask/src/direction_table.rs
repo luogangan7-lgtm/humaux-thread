@@ -1,3 +1,9 @@
+//! `xtask::direction_table` — G80-9: §53.6 direction table generated-vs-handwritten parity.
+//! Depends-on: crates=[]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[xtask::architecture_check]
+//! Called-by: [xtask::main]
+//! Invariants: [generated table (DegradeCode variants + #[fail_closed] scan) must set-equal telemetry::direction::DIRECTION_TABLE]
+//! Spec: Baseline §53.6; §53.2
+//!
 //! xtask `direction-table` — G80-9: §53.6 direction table generated-vs-handwritten parity.
 //!
 //! Generation source: `DegradeCode`'s variant list (§53.2, fail-open side) + every

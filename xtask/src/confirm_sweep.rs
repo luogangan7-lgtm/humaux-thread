@@ -1,3 +1,11 @@
+//! `xtask::confirm_sweep` — operator door for control.sweep_confirm_tokens retention sweep (migration 0169/0170).
+//! Depends-on: crates=[humaux-adapters, postgres, tokio, uuid]; services=[PostgreSQL(any) r=[control.tenants],
+//!   PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::confirm_token_repo, adapters::postgres]
+//! Called-by: [xtask::main]
+//! Invariants: [runs the owner SECURITY DEFINER sweep function; retention predicate stays inside that function, never re-typed here]
+//! Spec: Baseline §33.10 rule 9; migration 0169; 0170
+//!
 //! `cargo xtask sweep-confirm-tokens` — the operator door to `control.sweep_confirm_tokens`
 //! (migration 0169, forward-fixed by 0170; §33.10 rule 9, card 1 review P2 folded into card 21).
 //!
@@ -70,6 +78,7 @@ fn parse(args: &[String]) -> Result<(Vec<Uuid>, std::time::Duration), String> {
 fn all_tenants() -> Result<Vec<Uuid>, String> {
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN")
         .map_err(|_| "--all-tenants needs HUMAUX_TEST_PG_DSN to enumerate control.tenants")?;
+    // dep: PostgreSQL(any) — sweep target database (--dsn or HUMAUX_MAINTENANCE_PG_DSN/HUMAUX_TEST_PG_DSN)
     let mut client = Client::connect(&dsn, NoTls).map_err(|e| format!("connect: {e}"))?;
     let rows = client
         .query(
@@ -114,6 +123,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     let result = rt.block_on(async {
+        // dep: PostgreSQL(role_maintenance) — sweep target database (--dsn or HUMAUX_MAINTENANCE_PG_DSN/HUMAUX_TEST_PG_DSN)
         let pool = MaintenanceDbPool::connect(&dsn)
             .await
             .map_err(|e| format!("maintenance pool: {e}"))?;

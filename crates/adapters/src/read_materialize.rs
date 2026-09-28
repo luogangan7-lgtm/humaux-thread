@@ -1,4 +1,15 @@
-//! Final PostgreSQL body materialization after authorization and token-ledger validation.
+//! `adapters::read_materialize` — Final PostgreSQL body materialization after authorization and token-ledger
+//!   validation.
+//! Depends-on: crates=[humaux-application, humaux-domain, humaux-projection, serde_json, sha2, sqlx];
+//!   services=[PostgreSQL(role_gateway) r=[ops.outbox, private.events, private.evidence_objects,
+//!   private.evidence_subjects, private.memory_evidence, private.memory_records, private.memory_subjects,
+//!   projection.stream_log]]; env=[]; modules=[adapters::affect_repo, adapters::context_repo, adapters::postgres,
+//!   adapters::retrieve, application::affect, domain::affect, domain::authority, domain::error, domain::identity,
+//!   domain::ids, domain::subject, projection::serving, projection::stream]
+//! Called-by: [adapters::context_repo, adapters::continuity_read, adapters::retrieve, gateway::context, gateway::memory, gateway::recall, tests]
+//! Invariants: [read-only on role_gateway under RLS; an invisible or unknown source is NotFound/Forbidden, never
+//!   partially materialized; a PG error is DependencyUnavailable]
+//! Spec: none
 
 use std::collections::{HashMap, HashSet};
 
@@ -432,6 +443,7 @@ pub async fn materialize_final_bodies(
     overlay: &[OverlayCandidate],
 ) -> Result<MaterializedBodies, ErrorCode> {
     let _ = effective_authorization(authorization, expected_family, validated_key)?;
+    // dep: PostgreSQL(role_gateway) — transaction entry for `materialize_final_bodies`
     let mut txn = pool
         .pool()
         .begin()

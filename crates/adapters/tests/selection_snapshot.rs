@@ -1,4 +1,13 @@
-//! T6.3 integration test — `selection_repo` (§20.4) against a real Postgres.
+//! `adapters::tests::selection_snapshot` — T6.3 integration test — `selection_repo` (§20.4) against a real Postgres.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, sqlx, tokio];
+//!   services=[PostgreSQL(owner) w=[control.private_reasoning_domains, control.tenants, ops.selection_snapshot_items,
+//!   ops.selection_snapshots, private.events, private.evidence_objects, private.memory_evidence,
+//!   private.memory_records], PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::postgres, adapters::selection_repo, domain::selection, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [G20-1/G80-32: pages of a Mode B snapshot are duplicate-free, miss nothing from the base set and never
+//!   contain rows inserted during or after page 1; a tampered cursor is SelectionRepoError::Cursor]
+//! Spec: Baseline §8.1; §8.6; §20
 //!
 //! **G20-1 / G80-32 "Stable Selection Snapshot Integrity"** (§20.4's own anchor for both gate
 //! numbers, `§20#G20-1`): seed 30 eligible memories, page through a §20.4 Mode B snapshot at
@@ -128,6 +137,7 @@ impl DbIntegrationFixture for SelectionFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -197,6 +207,7 @@ impl DbIntegrationFixture for SelectionFixture {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let retrieval = rt
+            // dep: PostgreSQL(role_retrieval_worker) — test opens a direct PG connection for setup/verification
             .block_on(RetrievalWorkerDbPool::connect(&retrieval_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 
@@ -262,6 +273,7 @@ fn insert_concurrent_batch(
     count: usize,
     tag: &str,
 ) -> Result<(), String> {
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut client = Client::connect(admin_dsn, NoTls)
         .map_err(|error| format!("concurrent inserter connects: {error}"))?;
     let mut txn = client
@@ -318,6 +330,7 @@ fn snapshot_pagination_is_stable_under_concurrent_inserts() {
 
             // The real actor fixes its RR snapshot with the first `selection_snapshots` INSERT,
             // reads the live source, then blocks only when materializing into this held target.
+            // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
             let mut holder = Client::connect(&admin_dsn, NoTls)
                 .expect("connect snapshot materialization holder");
             let mut holder_txn = holder
@@ -331,6 +344,7 @@ fn snapshot_pagination_is_stable_under_concurrent_inserts() {
                 let actor_rt = tokio::runtime::Runtime::new()
                     .map_err(|error| format!("create snapshot actor runtime: {error}"))?;
                 let actor_pool = actor_rt
+                    // dep: PostgreSQL(role_retrieval_worker) — test opens a direct PG connection for setup/verification
                     .block_on(RetrievalWorkerDbPool::connect(&snapshot_dsn))
                     .map_err(|error| format!("connect snapshot actor pool: {error}"))?;
                 actor_rt

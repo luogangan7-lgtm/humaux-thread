@@ -1,4 +1,20 @@
-//! Real-role acceptance for migration 0115's metadata-only retrieval-query source.
+//! `adapters::tests::retrieval_query_sources` — Real-role acceptance for migration 0115's metadata-only
+//!   retrieval-query source.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-local-secret-scan, humaux-retrieval, humaux-testkit,
+//!   postgres, sqlx, tokio]; services=[PostgreSQL(owner) r=[ops.commit_seq_seq] w=[control.memberships,
+//!   control.private_reasoning_domains, control.tenants, control.users, control.workspaces,
+//!   ops.data_disclosure_sources, ops.data_disclosures, ops.outbox, private.events, private.evidence_objects,
+//!   private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollups,
+//!   private.retrieval_query_sources, staging.contribution_release_sources, staging.contribution_releases]
+//!   x=[ops.attach_retrieval_query_source], PostgreSQL(role_maintenance), PostgreSQL(role_migration_owner),
+//!   PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_RETRIEVAL_WORKER_PG_DSN,
+//!   HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::disclosure, adapters::postgres, adapters::retrieval_query_source, domain::dataclass,
+//!   domain::egress, domain::identity, domain::ids, humaux-local-secret-scan, humaux-testkit, retrieval::request]
+//! Called-by: [cargo-test]
+//! Invariants: [fixture rows live under a throwaway tenant; attaching a query source with the wrong permit is
+//!   WrongPermit; skips route through run_db_fixture so HUMAUX_REQUIRE_DB=1 makes an unreachable DB red]
+//! Spec: ADR-0047; ADR-0050
 //!
 //! depends-on: Postgres at `HUMAUX_TEST_PG_DSN` (owner, any loopback port/database — ADR-0047
 //! D-D, ADR-0050 D-B) plus `HUMAUX_{RETRIEVAL_WORKER,MAINTENANCE}_PG_DSN` on the same target
@@ -117,7 +133,8 @@ fn checked_dsn(name: &str, expected_role: Option<&str>) -> Result<String, DbFixt
 }
 
 fn role_login_ok(dsn: &str, role: &str) -> Result<(), DbFixtureSkipReason> {
-    // dep: Postgres (the named runtime role) — login probe of the actual role before any seed.
+    // dep: PostgreSQL(owner) — legacy tag rewritten to convention grammar
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut client = Client::connect(dsn, NoTls)
         .map_err(|_| setup_error(&format!("actual role login for {role}")))?;
     let ok: bool = client
@@ -274,8 +291,9 @@ impl DbIntegrationFixture for Fixture {
         let maintenance_dsn = checked_dsn("HUMAUX_MAINTENANCE_PG_DSN", Some("role_maintenance"))?;
         role_login_ok(&retrieval_dsn, "role_retrieval_worker")?;
         role_login_ok(&maintenance_dsn, "role_maintenance")?;
-        // dep: Postgres (owner, HUMAUX_TEST_PG_DSN) — seeds and cleans the fixture tenant and authorization context.
+        // dep: PostgreSQL(owner) — legacy tag rewritten to convention grammar
         let mut admin =
+            // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
             Client::connect(&owner_dsn, NoTls).map_err(|_| setup_error("owner login"))?;
         let ready: bool = admin
             .query_one(
@@ -292,12 +310,14 @@ impl DbIntegrationFixture for Fixture {
         }
         let seed = seed_authorization_context(&mut admin)?;
         let rt = tokio::runtime::Runtime::new().map_err(|_| setup_error("test runtime"))?;
-        // dep: Postgres (role_retrieval_worker) — RetrievalWorkerDbPool under test.
+        // dep: PostgreSQL(owner) — legacy tag rewritten to convention grammar
         let retrieval = rt
+            // dep: PostgreSQL(role_retrieval_worker) — test opens a direct PG connection for setup/verification
             .block_on(RetrievalWorkerDbPool::connect(&retrieval_dsn))
             .map_err(|_| setup_error("retrieval worker pool"))?;
-        // dep: Postgres (role_maintenance) — MaintenanceDbPool under test.
+        // dep: PostgreSQL(owner) — legacy tag rewritten to convention grammar
         let maintenance = rt
+            // dep: PostgreSQL(role_maintenance) — test opens a direct PG connection for setup/verification
             .block_on(MaintenanceDbPool::connect(&maintenance_dsn))
             .map_err(|_| setup_error("maintenance pool"))?;
         let auth = AuthorizationScope::new(
@@ -525,7 +545,8 @@ fn assert_query_reserve_negative_gates(
 
 fn assert_negative_query_ordinal_rejected(handle: &mut Handle, query_source_id: Uuid) {
     let before = source_and_disclosure_counts(&mut handle.admin, handle.tenant_id);
-    // dep: Postgres (role_retrieval_worker) — direct call as the actual role (negative ordinal).
+    // dep: PostgreSQL(owner) — legacy tag rewritten to convention grammar
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut retrieval = Client::connect(&handle.retrieval_dsn, NoTls)
         .expect("real retrieval-worker login for negative ordinal probe");
     let mut probe = retrieval
@@ -745,6 +766,7 @@ fn assert_cross_tenant_source_relation_rejected(handle: &mut Handle, query_sourc
         )
         .expect("scope injection to source tenant");
     cross_tenant
+        // dep: PostgreSQL(role_migration_owner) — test switches PG role to exercise RLS
         .batch_execute("SET LOCAL ROLE role_migration_owner")
         .expect("exercise FK beneath query-source insert guard");
     let injection = cross_tenant.execute(
@@ -817,7 +839,8 @@ fn assert_revoked_source_cannot_attach(
     query_source_id: Uuid,
     payload: &AuthorizedEgressPayload,
 ) {
-    // dep: Postgres (role_retrieval_worker) — direct call as the actual role.
+    // dep: PostgreSQL(owner) — legacy tag rewritten to convention grammar
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut retrieval_client = Client::connect(&handle.retrieval_dsn, NoTls)
         .expect("real retrieval-worker login for revoked-source probe");
     let mut revoked_probe = retrieval_client

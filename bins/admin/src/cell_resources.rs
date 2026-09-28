@@ -1,6 +1,11 @@
-//! `humaux-admin q cell.resources` — §4.4 live probe: cross-checks §83.4's
-//! `intra-cell-resource-registry` DECLARATION against what each [`IntraCellResource`]'s
-//! registered hostname ACTUALLY, LIVE, resolves to and answers on.
+//! `admin::cell_resources` — §4.4 live probe: cross-checks §83.4's `intra-cell-resource-registry` DECLARATION against
+//!   what each [`IntraCellResource`]'s registered hostname ACTUALLY, LIVE, resolves to and answers on.
+//! Depends-on: crates=[humaux-infra-cell, serde_json, tokio, uuid]; services=[Qdrant(*)]; env=[HUMAUX_CELL_CALLER_ID,
+//!   HUMAUX_CELL_ID, HUMAUX_QDRANT_CIDR, HUMAUX_QDRANT_HOST, HUMAUX_QDRANT_PORT, HUMAUX_QDRANT_TLS];
+//!   modules=[admin::probe, infra-cell::permit, infra-cell::resource, infra-cell::transport]
+//! Called-by: [admin::probe]
+//! Invariants: [every Qdrant call here goes through the same CellAccessPermit as production code, so the probe cannot mask a permit regression]
+//! Spec: Baseline §57.1; §78.1; §83.4; ADR-0003
 //!
 //! Humaux's own "不要拿声明校验声明" principle (旧系统坑5，全局适用): "the registry says this
 //! resource lives in this Cell" is a deploy-time claim; "the resource's hostname currently
@@ -282,6 +287,7 @@ async fn probe_qdrant(
     let reachable = transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — Qdrant REST request for the admin diagnostic probe
             IntraCellRequest {
                 method: IntraCellMethod::Get,
                 path: "/".to_string(),

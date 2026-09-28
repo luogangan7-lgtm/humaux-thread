@@ -1,4 +1,10 @@
 //! `adapters::disclosure` — `ops.data_disclosures` two-phase ledger writer (§7.4, T4.2).
+//! Depends-on: crates=[humaux-domain, sqlx]; services=[PostgreSQL(any) w=[ops.data_disclosure_sources, ops.data_disclosures] x=[ops.attach_retrieval_query_source]]; env=[]; modules=[adapters::postgres, domain::boundary, domain::egress]
+//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::retrieval_query_source, private-worker::inference_rpc, private-worker::main, retrieval-provider::adapters, retrieval-worker::main, tests]
+//! Invariants: [sole writer of ops.data_disclosures and its sources: reserve inserts the ledger row plus >=1 source
+//!   in one transaction before any external call, finalize records the outcome; empty sources or a payload mismatch
+//!   is a DisclosureError, no sampling]
+//! Spec: Baseline §7.4; §7.0; §83.4; §11; §19; §6.2.1; §6.2.2; §6.2.3
 //!
 //! §7.4: "`ops.data_disclosures` 是唯一权威出境账本... 每一次，不采样". This module is the
 //! sole write path to both `ops.data_disclosures` and its normalized source relation
@@ -458,6 +464,7 @@ pub async fn reserve_private(
     scope: Option<DisclosureScope>,
     sources: &[DisclosureSource],
 ) -> Result<Uuid, DisclosureError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let disclosure_id = reserve_in_txn(
         &mut txn, None, permit, region, payload, scope, sources, false,
@@ -477,6 +484,7 @@ pub async fn reserve_retrieval(
     scope: Option<DisclosureScope>,
     sources: &[DisclosureSource],
 ) -> Result<Uuid, DisclosureError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let disclosure_id = reserve_in_txn(
         &mut txn, None, permit, region, payload, scope, sources, false,
@@ -494,6 +502,7 @@ pub async fn finalize_private(
     outcome: DisclosureOutcome,
     deletion_capability: DeletionCapability,
 ) -> Result<bool, DisclosureError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let changed = finalize_in_txn(
         &mut txn,
@@ -515,6 +524,7 @@ pub async fn finalize_retrieval(
     outcome: DisclosureOutcome,
     deletion_capability: DeletionCapability,
 ) -> Result<bool, DisclosureError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let changed = finalize_in_txn(
         &mut txn,
@@ -557,6 +567,7 @@ pub async fn open_reservations_older_than(
     tenant_id: Uuid,
     staleness_seconds: f64,
 ) -> Result<Vec<StaleReservation>, DisclosureError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
 

@@ -1,6 +1,11 @@
 // witness: family=retrieval_completeness_total labels=class,reason
-//! Metric Witness for `retrieval_completeness_total{class,reason}` (§80.2 W-side; registry
-//! row §41.2; §22.5 sole-constructor gate, §80.1 G80-6).
+//! `testkit::tests::metrics::retrieval_completeness_total` — Metric Witness for
+//!   `retrieval_completeness_total{class,reason}` (§80.2 W-side; registry row §41.2; §22.5 sole-constructor gate,
+//!   §80.1 G80-6).
+//! Depends-on: crates=[]; services=[PostgreSQL(owner) r=[private.memory_records]]; env=[]; modules=[retrieval::completeness, retrieval::envelope, retrieval::planner, retrieval::predicate_registry, retrieval::request]
+//! Called-by: []
+//! Invariants: [reads private.memory_records to synthesize completeness fixtures; no fail-closed behaviour, test-only fixture]
+//! Spec: none
 //!
 //! Each case builds a real typed request plus valid provenance, pipeline/A2, and no-overflow
 //! context before calling `envelope_outcome_block`. The public `classify_for_witness` remains a

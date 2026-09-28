@@ -1,5 +1,10 @@
-//! `retrieval::signals` — §21 检索质量信号，按 §21.5 逐条点名的六个轴：Similarity /
-//! Relevance / Association / Completeness / Temporal Freshness / Grounding State.
+//! `retrieval::signals` — §21 检索质量信号，按 §21.5 逐条点名的六个轴：Similarity / Relevance / Association / Completeness / Temporal
+//!   Freshness / Grounding State.
+//! Depends-on: crates=[humaux-domain, serde, serde_json]; services=[]; env=[]; modules=[domain::grounding,
+//!   domain::memory, retrieval::completeness, retrieval::envelope]
+//! Called-by: []
+//! Invariants: []
+//! Spec: §21; §21.5; §8.8; §20; §80.1
 //!
 //! 最后一个轴与 Temporal Freshness **正交**（§8.8「Temporal Freshness 与 Grounding Validity
 //! 正交」）：前者答「这条状态有多旧」，后者答「当初支持它的可变来源还是同一版本吗」。§8.8

@@ -1,5 +1,18 @@
-//! `humaux-consolidation-worker` process entry (§4.2 minimal process set; §4.4 admin probe
-//! contract; §11.7/§11.8 T4.6+T4.7). The actual orchestration ([`run_once`] and friends) lives
+//! `consolidation-worker::main` — `humaux-consolidation-worker` process entry (§4.2 minimal process set; §4.4 admin
+//!   probe contract; §11.7/§11.8 T4.6+T4.7).
+//! Depends-on: crates=[humaux-adapters, tokio, uuid]; services=[PostgreSQL(role_consolidation_worker),
+//!   UDS(private-worker)]; env=[CONSOLIDATION_WORKER_PG_DSN, HUMAUX_CONSOLIDATION_WORKER_BATCH,
+//!   HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS, HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS,
+//!   HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS, HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS,
+//!   HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS, HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS,
+//!   HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH]; modules=[adapters::postgres,
+//!   consolidation-worker::inference_client, humaux-consolidation-worker]
+//! Called-by: [process(humaux-consolidation-worker)]
+//! Invariants: [missing/invalid env or an unreachable role_consolidation_worker DSN exits non-zero before any claim;
+//!   `--readyz` fails unless both PG and the private worker's inference socket answer one live round trip]
+//! Spec: ADR-0036; ADR-0037; §11.6
+//!
+//! The actual orchestration ([`run_once`] and friends) lives
 //! in `src/lib.rs` — see that module's doc comment for why: a binary-only crate has no target
 //! `tests/*.rs` can link against, so splitting it out is what makes `tests/run_once_e2e.rs`
 //! and `tests/consolidation_hop_e2e.rs` possible at all.
@@ -99,6 +112,7 @@ async fn probe_connection() {
                 "humaux-consolidation-worker: CONSOLIDATION_WORKER_PG_DSN not set, not wired yet (Phase 4 scaffold)"
             );
         }
+        // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
         Ok(dsn) => match ConsolidationDbPool::connect(&dsn).await {
             Ok(_pool) => {
                 println!("humaux-consolidation-worker: connected as role_consolidation_worker")
@@ -138,6 +152,7 @@ async fn dispatch_mode(resident: bool) -> Result<(), String> {
         None
     };
 
+    // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
     let pool = ConsolidationDbPool::connect(&dsn)
         .await
         .map_err(|e| format!("consolidation worker database role connection failed: {e}"))?;
@@ -248,10 +263,12 @@ impl Shutdown {
 ///    USER_REASONING job must make. Dialled and immediately dropped: no request is sent.
 async fn readyz() -> Result<(), String> {
     let dsn = required("CONSOLIDATION_WORKER_PG_DSN")?;
+    // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
     ConsolidationDbPool::connect(&dsn)
         .await
         .map_err(|e| format!("PostgreSQL as role_consolidation_worker ({e})"))?;
     let socket_path = required("HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH")?;
+    // dep: UDS(private-worker) — readyz dials the private worker's inference RPC socket
     tokio::net::UnixStream::connect(&socket_path)
         .await
         .map_err(|e| format!("the private worker's inference RPC socket at {socket_path} ({e})"))?;

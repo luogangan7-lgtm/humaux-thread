@@ -1,4 +1,19 @@
-//! PostgreSQL 18 acceptance for the Phase 9 contribution-policy append-only lifecycle.
+//! `adapters::tests::contribution_policy_lifecycle_0132` — PostgreSQL 18 acceptance for the Phase 9
+//!   contribution-policy append-only lifecycle.
+//! Depends-on: crates=[humaux-adapters, humaux-application, postgres, serde_json, toml, uuid];
+//!   services=[PostgreSQL(any) r=[control.contribution_policies_one_open_head_per_tenant,
+//!   control.private_reasoning_domains, ops.contribution_execution_job_links, ops.jobs, ops.schema_migrations,
+//!   private.contribution_execution_sources, private.memory_records] w=[control.contribution_policies,
+//!   control.tenants, private.contribution_executions, staging.contribution_candidate_sources,
+//!   staging.contribution_candidates, staging.contribution_releases] x=[control.append_contribution_policy_successor,
+//!   private.enqueue_contribution_execution]]; env=[CARGO_MANIFEST_DIR, HUMAUX_0132_GATE_MODE, HUMAUX_REQUIRE_DB,
+//!   HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_entry_repo, adapters::contribution_execution_ingress,
+//!   adapters::contribution_execution_repo, adapters::contribution_reasoner,
+//!   adapters::tests::support::contribution_fixture, application::contribute]
+//! Called-by: [cargo-test]
+//! Invariants: [HUMAUX_0132_GATE_MODE selects the gate variant; without a DB the tests print SKIP unless
+//!   HUMAUX_REQUIRE_DB=1, then fail; the lifecycle tests are #[ignore] lane tests]
+//! Spec: none
 
 #[allow(deprecated)]
 #[path = "support/contribution_fixture.rs"]
@@ -70,6 +85,7 @@ fn append_v2_race(
     designated_first: usize,
 ) -> Vec<Result<i64, String>> {
     assert!(designated_first < 2);
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `append_v2_race`
     let clients = [
         Client::connect(dsn, NoTls).expect("first successor connection"),
         Client::connect(dsn, NoTls).expect("second successor connection"),
@@ -442,6 +458,7 @@ fn manifest_postcheck_is_one_boolean_true() {
         .get("postcheck")
         .and_then(toml::Value::as_str)
         .expect("0132 postcheck string");
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `manifest_postcheck_is_one_boolean_true`
     let mut db = Client::connect(&dsn, NoTls).expect("isolated PostgreSQL 18");
     assert_one_boolean(&mut db, postcheck, true, "exact 0132 postcheck");
 }
@@ -659,6 +676,7 @@ fn runtime_roles_are_actually_denied_policy_mutation() {
     ];
     for role in roles {
         let mut txn = fixture.admin.transaction().expect("role probe transaction");
+        // dep: PostgreSQL(any) — role switch before the scoped statements for `runtime_roles_are_actually_denied_policy_mutation`
         txn.batch_execute(&format!("SET LOCAL ROLE {role}"))
             .expect("assume exact runtime role");
         denied_role_probe(

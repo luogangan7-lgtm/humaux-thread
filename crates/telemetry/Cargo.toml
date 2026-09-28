@@ -1,6 +1,7 @@
 [package]
 name = "humaux-telemetry"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -8,8 +9,12 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# why: domain ids, errors and value types shared across layers; used-by: [telemetry::degrade, tests]
 humaux-domain = { version = "0.1.0", path = "../domain" }
 # §53.6 fail-closed generation source (G80-9): telemetry::direction's one demo annotation.
+# why: proc-macro that makes direction enums fail closed; used-by: [telemetry::direction]
 humaux-fail-closed-macro = { version = "0.1.0", path = "../fail-closed-macro" }
+# why: inline small vectors for degrade code sets; used-by: [telemetry::degrade]
 smallvec = "1.15.2"
+# why: structured logs/spans; used-by: [telemetry::degrade]
 tracing = "0.1.44"

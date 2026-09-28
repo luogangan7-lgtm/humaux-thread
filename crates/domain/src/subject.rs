@@ -1,4 +1,8 @@
 //! `domain::subject` — the §6.1.3 Subject / Aboutness axis domain types (ADR-0027, card 7).
+//! Depends-on: crates=[uuid]; services=[]; env=[]; modules=[domain::error]
+//! Called-by: [adapters::affect_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::projection_worker, adapters::qdrant, adapters::read_materialize, adapters::remember, adapters::retrieve, adapters::subject_repo, domain::affect, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, projection::dense, tests, xtask::architecture_check]
+//! Invariants: []
+//! Spec: Baseline §6.1.1; §6.1.3; §49; ADR-0027; ADR-0028
 //!
 //! Visibility (§6.1.1, [`crate::identity`]) answers "who may see this memory"; the Subject axis
 //! answers the orthogonal question "who is this memory *about*". The two never substitute for one

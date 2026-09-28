@@ -1,5 +1,12 @@
-//! §17.1 architecture-check 风格扫描："所有 private query adapter 必须自动注入 tenant +
-//! AuthorizationScope visibility filter；业务层不得手写可选 filter。"
+//! `projection::tests::no_handwritten_filter_scan` — §17.1 architecture-check 风格扫描："所有 private query adapter 必须自动注入
+//!   tenant + AuthorizationScope visibility filter；业务层不得手写可选 filter。
+//! Depends-on: crates=[]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[]
+//! Called-by: [cargo-test]
+//! Invariants: [source scan: outside dense.rs no code builds a Condition tree or a DenseQueryFilter literal; an
+//!   unlocatable workspace root prints SKIP rather than passing silently]
+//! Spec: none
+//!
+//! "
 //!
 //! `dense::Condition`/`dense::DenseQueryFilter` 的私有字段已经是编译期的类型级证明——
 //! `DenseQueryFilter` 的唯一构造点是 `dense::build_dense_filter`（见该模块的 rustdoc）；本文件

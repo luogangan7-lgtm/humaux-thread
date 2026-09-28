@@ -1,5 +1,11 @@
-//! §78.2 DB<->Rust contract for the §25.4.A(1)/(2) Mandatory facet projection, plus the
-//! §25.4.A(11) registry-dependency contract (card 22b, ADR-0045).
+//! `adapters::tests::facet_contract` — §78.2 DB<->Rust contract for the §25.4.A(1)/(2) Mandatory facet projection,
+//!   plus the §25.4.A(11) registry-dependency contract (card 22b, ADR-0045).
+//! Depends-on: crates=[humaux-domain, humaux-testkit, postgres]; services=[PostgreSQL(any) r=[private.context_bindings, private.memory_records]];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[domain::context, domain::memory, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [judges the expression the database computes (pg_get_expr), round-trips both closed label sets by set
+//!   equality, and checks REGISTRY columns exist; missing DB goes through skip_or_fail]
+//! Spec: Baseline §25.4; §78.1; §79.2
 //!
 //! Three things are pinned here, each with a different failure mode:
 //!
@@ -50,6 +56,7 @@ fn client() -> Option<Client> {
         skip_or_fail(NAME, "missing object: Postgres DSN", ExternalDep::Postgres);
         return None;
     };
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `client`
     let Ok(client) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;

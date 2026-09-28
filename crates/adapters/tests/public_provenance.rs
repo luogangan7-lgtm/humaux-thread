@@ -1,3 +1,16 @@
+//! `adapters::tests::public_provenance` — Real-PostgreSQL tests of the public provenance target contract and its typed-root closure.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, postgres, uuid]; services=[PostgreSQL(any)
+//!   r=[staging.contribution_releases] w=[control.public_moderator_grants, public.claims, public.provenance_edges,
+//!   public.source_closure, public.sources, public.syntheses, public.synthesis_inputs]
+//!   x=[public.current_public_roots], PostgreSQL(role_private_worker), PostgreSQL(role_public_worker)];
+//!   env=[HUMAUX_PUBLIC_PROVENANCE_FAULT_DB, HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_repo,
+//!   adapters::postgres, adapters::public_provenance, adapters::public_repo,
+//!   adapters::tests::support::contribution_fixture, domain::ids, domain::public]
+//! Called-by: [cargo-test]
+//! Invariants: [a provenance target carries exactly one non-nil identity (runs everywhere); the typed-root closure
+//!   and damaged-root guard tests need dedicated databases and are #[ignore] lane tests]
+//! Spec: Baseline §12.6; §79.2; ADR-0047
+//!
 #[path = "support/contribution_fixture.rs"]
 mod contribution_fixture;
 
@@ -43,6 +56,7 @@ fn dsn_as_role(dsn: &str, role: &str) -> String {
 fn public_pool(fixture: &ContributionFixture) -> PublicWorkerDbPool {
     fixture
         .rt
+        // dep: PostgreSQL(role_public_worker) — open a role-scoped PG connection/pool for this test
         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
             &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL"),
             "role_public_worker",
@@ -175,10 +189,12 @@ fn direct_graph_roots(
 }
 
 fn private_release_exists(dsn: &str, tenant_id: TenantId, release_id: Uuid) -> bool {
+    // dep: PostgreSQL(role_private_worker) — open a role-scoped PG connection/pool for this test
     let mut client = Client::connect(dsn, NoTls).expect("private role client");
     let mut txn = client.transaction().expect("private transaction");
     txn.batch_execute("SET LOCAL ROLE role_private_worker")
         .expect("private worker role");
+    // dep: PostgreSQL(any) — pool/txn query execution
     txn.execute(
         "SELECT set_config('humaux.tenant_id',$1,true)",
         &[&tenant_id.0.to_string()],

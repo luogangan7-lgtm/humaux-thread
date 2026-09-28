@@ -1,4 +1,14 @@
-//! T3.5 integration test — `jobs` (§31/§61) against a real Postgres. Runs on
+//! `adapters::tests::jobs_claim` — T3.5 integration test — `jobs` (§31/§61) against a real Postgres.
+//! Depends-on: crates=[humaux-adapters, humaux-testkit, postgres, sqlx, tokio]; services=[PostgreSQL(any)
+//!   r=[ops.claim_derived_work] w=[control.tenants, ops.jobs], PostgreSQL(role_gateway),
+//!   PostgreSQL(role_private_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::jobs, adapters::postgres,
+//!   humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [runs on the real ops.jobs with rows scoped to a throwaway tenant; SKIP LOCKED claims never hand one
+//!   job to two claimers; no DSN, unreachable DB or ops.jobs missing is a visible SKIP]
+//! Spec: Baseline §31; §61; §79.2
+//!
+//! Runs on
 //! `migrations/0008_ops_core.sql`'s real `ops.jobs` table (same convention as
 //! `email_outbox.rs`: the table is shared, not a scratch schema, so every test scopes rows to
 //! a throwaway `control.tenants` row this file owns and cleans up on drop).
@@ -64,6 +74,7 @@ impl DbIntegrationFixture for JobsFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -91,9 +102,11 @@ impl DbIntegrationFixture for JobsFixture {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let gateway = rt
+            // dep: PostgreSQL(role_gateway) — open a role-scoped PG connection/pool for this test
             .block_on(RuntimeDbPool::connect(&gateway_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let private = rt
+            // dep: PostgreSQL(role_private_worker) — open a role-scoped PG connection/pool for this test
             .block_on(PrivateWorkerDbPool::connect(&dsn_as_role(
                 &dsn,
                 "role_private_worker",
@@ -176,6 +189,7 @@ fn claim_has_no_duplicate_across_concurrent_workers() {
                             let rt =
                                 tokio::runtime::Runtime::new().expect("tokio runtime per thread");
                             rt.block_on(async {
+                                // dep: PostgreSQL(role_gateway) — open a role-scoped PG connection/pool for this test
                                 let pool = RuntimeDbPool::connect(&dsn).await.unwrap_or_else(|e| {
                                     panic!("connect for {owner} must succeed: {e}")
                                 });

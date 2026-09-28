@@ -1,3 +1,17 @@
+//! `adapters::tests::project_continuity_read_0137` — Real-PostgreSQL acceptance for migration 0137's project continuity read path through read_project_continuity.
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, postgres, serde_json, tokio, uuid];
+//!   services=[PostgreSQL(any) r=[private.continuity_facet_versions] w=[control.memberships,
+//!   control.private_reasoning_domains, control.tenants, control.users, control.workspaces,
+//!   private.continuity_facet_slots, private.evidence_objects, private.memory_evidence, private.memory_records]
+//!   x=[private.publish_continuity_facet, private.register_continuity_project], PostgreSQL(role_gateway)];
+//!   env=[HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[adapters::continuity_read, adapters::postgres,
+//!   adapters::tests::support::continuity_0137_cleanup, application::continuity, domain::context, domain::continuity,
+//!   domain::error, domain::identity, domain::ids]
+//! Called-by: [cargo-test]
+//! Invariants: [an authorized read is current, a revoked source makes it non-leaking stale, and a rolled-back owner
+//!   pointer or orphan version never reads as current or missing; a missing DB fails when HUMAUX_REQUIRE_DB=1]
+//! Spec: Baseline §25.3.1; §79.2
+//!
 use humaux_adapters::{continuity_read::PostgresContinuityReadPort, postgres::RuntimeDbPool};
 use humaux_application::continuity::read_project_continuity;
 use humaux_domain::{
@@ -133,6 +147,7 @@ impl Fixture {
             evidence,
         );
         let content = json!({"w2":"authoritative memory"});
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&admin_dsn, NoTls).expect("admin connect");
         admin
             .execute(
@@ -205,6 +220,7 @@ impl Fixture {
             )
             .unwrap()
             .get(0);
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut gateway = Client::connect(&gateway_dsn, NoTls).expect("gateway connect");
         gateway.batch_execute("BEGIN").unwrap();
         set_context(&mut gateway, tenant, workspace, principal, Some(user));
@@ -259,6 +275,7 @@ impl Fixture {
     }
 
     fn publish_successor(&self) {
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&self.admin_dsn, NoTls).unwrap();
         let memory_hash: Vec<u8> = admin
             .query_one(
@@ -268,6 +285,7 @@ impl Fixture {
             )
             .unwrap()
             .get(0);
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut gateway = Client::connect(&self.gateway_dsn, NoTls).unwrap();
         gateway.batch_execute("BEGIN").unwrap();
         set_context(
@@ -353,6 +371,7 @@ fn authorized_read_is_current_then_revoked_source_is_non_leaking_stale() {
         .unwrap();
     let pool = Arc::new(
         runtime
+            // dep: PostgreSQL(role_gateway) — open a role-scoped PG connection/pool for this test
             .block_on(RuntimeDbPool::connect(&fixture.gateway_dsn))
             .expect("checked Gateway pool"),
     );
@@ -404,6 +423,7 @@ fn authorized_read_is_current_then_revoked_source_is_non_leaking_stale() {
         ErrorCode::NotFound
     );
 
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut admin = Client::connect(&fixture.admin_dsn, NoTls).unwrap();
     admin
         .execute(
@@ -442,6 +462,7 @@ fn owner_pointer_rollback_and_orphan_version_cannot_become_current_or_missing() 
         if fault == "rollback" {
             fixture.publish_successor();
         }
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&fixture.admin_dsn, NoTls).unwrap();
         if fault == "rollback" {
             let v1: Uuid = admin
@@ -472,6 +493,7 @@ fn owner_pointer_rollback_and_orphan_version_cannot_become_current_or_missing() 
                 .unwrap();
         }
         runtime.block_on(async {
+            // dep: PostgreSQL(role_gateway) — open a role-scoped PG connection/pool for this test
             let pool = Arc::new(RuntimeDbPool::connect(&fixture.gateway_dsn).await.unwrap());
             let adapter = PostgresContinuityReadPort::new(pool);
             let result = read_project_continuity(

@@ -1,5 +1,19 @@
-//! Card 8 integration tests — §6.1.3 memory↔subject linkage + the deterministic resolve hook
-//! (migration 0154, ADR-0028). Everything runs against the *real* `private` objects the migration
+//! `adapters::tests::memory_subjects_link` — Card 8 integration tests — §6.1.3 memory↔subject linkage + the
+//!   deterministic resolve hook (migration 0154, ADR-0028).
+//! Depends-on: crates=[humaux-domain, humaux-testkit, postgres, serde_json, uuid]; services=[PostgreSQL(any)
+//!   r=[private.memory_rollup_subjects, private.memory_subject_mentions, private.memory_subjects]
+//!   w=[control.memberships, control.private_reasoning_domains, control.tenants, control.users, private.events,
+//!   private.evidence_objects, private.evidence_subjects, private.memory_consolidation_runs, private.memory_evidence,
+//!   private.memory_records, private.memory_rollup_sources, private.memory_rollups, private.subject_keys,
+//!   private.subjects] x=[private.link_memory_subjects, private.link_rollup_subjects],
+//!   PostgreSQL(role_consolidation_worker), PostgreSQL(role_gateway), PostgreSQL(role_private_worker)];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[domain::ids, domain::subject, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [runs on the real private objects under the runtime roles via SET LOCAL ROLE (no superuser shortcut
+//!   for the assertion); link CHECK sets equal the Rust enums; an isolation setup failure is a fixture error]
+//! Spec: Baseline §6.1.3; ADR-0028; §78.2; §79.2
+//!
+//! Everything runs against the *real* `private` objects the migration
 //! created, under the real runtime roles via `SET LOCAL ROLE` (never a superuser shortcut for the
 //! assertion under test):
 //!
@@ -40,6 +54,7 @@ impl DbIntegrationFixture for LinkFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut client = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
         let ready: bool = client
@@ -216,6 +231,7 @@ fn declared_and_key_links_carry_source_kind_and_mention_spans() {
         let (user, domain) = seed_tenant(&mut txn, tenant, "links");
         let person = seed_subject(&mut txn, tenant, "PERSON", "Ada Lovelace");
         let org = seed_subject(&mut txn, tenant, "ORGANISATION", "Analytical Engines Ltd");
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "INSERT INTO private.subject_keys (tenant_id, subject_id, key_kind, key_value) \
              VALUES ($1, $2, 'CRM', 'CRM-1001')",
@@ -228,6 +244,7 @@ fn declared_and_key_links_carry_source_kind_and_mention_spans() {
         });
         let (evidence, memory) = seed_memory(&mut txn, tenant, domain, "USER_MESSAGE", &content);
         // The org was declared on the Evidence by exact external key (what remember.put writes).
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "INSERT INTO private.evidence_subjects (tenant_id, evidence_id, subject_id, source_kind) \
              VALUES ($1, $2, $3, 'EXTERNAL_KEY')",
@@ -236,6 +253,7 @@ fn declared_and_key_links_carry_source_kind_and_mention_spans() {
         .expect("evidence declaration");
 
         // The hook, as the Distill hop runs it: role_private_worker, tenant + acting user GUCs.
+        // dep: PostgreSQL(role_private_worker) — role switch before the scoped statements for `declared_and_key_links_carry_source_kind_and_mention_spans`
         txn.batch_execute(&format!(
             "SET LOCAL ROLE role_private_worker; SET LOCAL humaux.tenant_id = '{tenant}'; \
              SET LOCAL humaux.user_id = '{user}';"
@@ -328,6 +346,7 @@ fn cross_tenant_subject_is_unlinkable() {
             &serde_json::json!({"key_claim": "tenant B memory"}),
         );
 
+        // dep: PostgreSQL(role_private_worker) — role switch before the scoped statements for `cross_tenant_subject_is_unlinkable`
         txn.batch_execute(&format!(
             "SET LOCAL ROLE role_private_worker; SET LOCAL humaux.tenant_id = '{tenant_b}'; \
              SET LOCAL humaux.user_id = '{user_b}';"
@@ -380,6 +399,7 @@ fn correction_inherits_but_explicit_supersede_does_not() {
         let body =
             serde_json::json!({"key_claim": "Grace Hopper prefers COBOL reviews on Fridays."});
         let (_e1, m1) = seed_memory(&mut txn, tenant, domain, "USER_MESSAGE", &body);
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "SELECT private.link_memory_subjects($1, $2, ARRAY[$3]::uuid[], ARRAY['DECLARED']::text[])",
             &[&tenant, &m1, &person],
@@ -396,6 +416,7 @@ fn correction_inherits_but_explicit_supersede_does_not() {
 
         // The arbiter UPDATE, as role_gateway runs it (column-scoped UPDATE grant, RLS with the
         // correcting user installed) — the 0154 trigger fires here.
+        // dep: PostgreSQL(role_gateway) — role switch before the scoped statements for `correction_inherits_but_explicit_supersede_does_not`
         txn.batch_execute(&format!(
             "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant}'; \
              SET LOCAL humaux.user_id = '{user}';"
@@ -440,6 +461,7 @@ fn correction_inherits_but_explicit_supersede_does_not() {
             "USER_MESSAGE",
             &serde_json::json!({"key_claim": "unrelated replacement"}),
         );
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "UPDATE private.memory_records SET status = 'superseded', superseded_by = $2 \
              WHERE memory_id = $1",
@@ -468,6 +490,7 @@ fn rollup_inherits_source_subjects_under_consolidation_role() {
             "USER_MESSAGE",
             &serde_json::json!({"key_claim": "Babbage & Co renewed."}),
         );
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "SELECT private.link_memory_subjects($1, $2, ARRAY[$3]::uuid[], ARRAY['DECLARED']::text[])",
             &[&tenant, &memory, &org],
@@ -490,6 +513,7 @@ fn rollup_inherits_source_subjects_under_consolidation_role() {
             )
             .expect("rollup")
             .get(0);
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "INSERT INTO private.memory_rollup_sources (rollup_id, memory_id, evidence_id) \
              VALUES ($1, $2, $3)",
@@ -497,6 +521,7 @@ fn rollup_inherits_source_subjects_under_consolidation_role() {
         )
         .expect("rollup source");
 
+        // dep: PostgreSQL(role_consolidation_worker) — role switch before the scoped statements for `rollup_inherits_source_subjects_under_consolidation_role`
         txn.batch_execute(&format!(
             "SET LOCAL ROLE role_consolidation_worker; SET LOCAL humaux.tenant_id = '{tenant}';"
         ))

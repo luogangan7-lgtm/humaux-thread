@@ -1,4 +1,11 @@
-//! `infra_egress::raw` — Layer 1A 的原始 HTTPS POST 出口，给 **BYOK 域**（§11）用。
+//! `infra-egress::raw` — Layer 1A 的原始 HTTPS POST 出口，给 **BYOK 域**（§11）用。
+//! Depends-on: crates=[humaux-infra-network, tokio]; services=[HTTP(provider)]; env=[];
+//!   modules=[humaux-infra-network, infra-egress::resolver, infra-network::http]
+//! Called-by: [adapters::byok]
+//! Invariants: [the BYOK-domain raw HTTPS POST: it injects no Authorization and classifies no status (both belong to
+//!   adapters::byok); non-HTTPS endpoints and oversize bodies are RawSendErrors; dialing goes through the checked
+//!   resolver]
+//! Spec: Baseline §19; §11.1; §11.3; §83.4; ADR-0039; §11.4
 //!
 //! 为什么不是复用 [`crate::http::HttpExternalCall`]：那是 **PlatformManaged 域**（§19）的
 //! 出口——它自己注 `Authorization`（凭据来自 `RetrievalCredentialSource`）、自己按
@@ -133,6 +140,7 @@ impl RawHttpPost {
         for (name, value) in headers {
             req = req.header(name.as_str(), value.as_str());
         }
+        // dep: HTTP(provider) — outbound http call
         let mut response = req.send().await.map_err(classify_transport_error)?;
 
         let status = response.status().as_u16();

@@ -1,6 +1,10 @@
-//! `adapters::email` — H3: §74.6 `EmailProvider` trait + SMTP adapter + the Email
-//! Deliverability Plane (outbox / delivery events / suppression / domain / provider
-//! health).
+//! `adapters::email` — H3: §74.6 `EmailProvider` trait + SMTP adapter + the Email Deliverability Plane (outbox /
+//!   delivery events / suppression / domain / provider health).
+//! Depends-on: crates=[async-trait]; services=[]; env=[]; modules=[]
+//! Called-by: [adapters::email::outbox, adapters::email::smtp, adapters::email::test_double, tests]
+//! Invariants: [no caller outside smtp/test_double names a concrete provider; everything else takes &dyn
+//!   EmailProvider (§74.6), so swapping the provider never touches the outbox or handlers]
+//! Spec: Baseline §74.6
 //!
 //! Module layout: this file (trait + wire enums), [`smtp`] (lettre-backed SMTP adapter,
 //! config from parameters — never reads env directly, §74.6 task brief), [`test_double`]

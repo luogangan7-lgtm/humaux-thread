@@ -1,4 +1,11 @@
-//! `retrieval::envelope` — §23 Recall Result Envelope. Assembles the five blocks
+//! `retrieval::envelope` — §23 Recall Result Envelope.
+//! Depends-on: crates=[humaux-domain, humaux-telemetry, serde, serde_json]; services=[];
+//!   env=[]; modules=[domain::context, domain::error, domain::grounding, retrieval::compiler, retrieval::completeness, retrieval::planner, retrieval::request, telemetry::degrade]
+//! Called-by: [adapters::context_repo, adapters::retrieve, gateway::context, gateway::memory, gateway::recall, retrieval::completeness, retrieval::signals, tests]
+//! Invariants: []
+//! Spec: §23; §23.1
+//!
+//! Assembles the five blocks
 //! (`pipeline` / `completeness` / `provenance` / `freshness` / `grounding`) and, most
 //! load-bearing, the §23.1② A1/A2 arithmetic that turns a
 //! [`LedgerClosure`](crate::completeness) plus an independently-read Qdrant `visible` count
@@ -1660,6 +1667,7 @@ mod tests {
         };
         assert!(
             pipeline.chaining_consistent(),
+            // dep-map: allow table-undeclared — unit-test string naming a table/pipeline stage; retrieval has no DB access
             "evidence.persisted == knowledge.eligible == projection.expected must all be 98"
         );
         // §23.3: swapping in `knowledge.processed` (95) instead of `eligible` (98) must break
@@ -2390,6 +2398,7 @@ mod tests {
         };
         use std::collections::BTreeSet;
 
+        // dep-map: allow table-undeclared — unit-test string naming a table/pipeline stage; retrieval has no DB access
         let scope = "private.memory_records WHERE tenant_id = $1 AND visibility_workspace_id = $2";
         let columns = ["memory_type", "superseded_at", "visibility_workspace_id"];
         let registry = load_registry(vec![PredicateRow {

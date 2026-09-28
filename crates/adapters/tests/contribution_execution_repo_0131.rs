@@ -1,4 +1,11 @@
-//! Provider-free PostgreSQL 18 coverage for migration 0131's eight typed repository commands.
+//! `adapters::tests::contribution_execution_repo_0131` — Provider-free PostgreSQL 18 coverage for migration 0131's
+//!   eight typed repository commands.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-testkit, serde_json, sha2, uuid]; services=[PostgreSQL(any) r=[ops.contribution_execution_job_links, ops.data_disclosures, ops.model_call_ledger, private.contribution_execution_sources, private.contribution_executions, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates] w=[ops.jobs]];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::byok, adapters::contribution_entry_repo, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::disclosure, adapters::tests::support::contribution_fixture, application::consolidate, application::contribute, application::contribution_execution, domain::egress, domain::evidence, domain::identity, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [admin SQL only seeds, simulates leases/faults and observes; every coupled mutation goes through
+//!   ContributionExecutionRepo; without a DB it SKIPs unless HUMAUX_REQUIRE_DB, then panics]
+//! Spec: none
 //!
 //! Admin SQL is limited to fixture setup, lease/fault simulation, and durable observations.
 //! Every coupled contribution mutation goes through `ContributionExecutionRepo`.
@@ -47,14 +54,10 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// Env probe only; the skip goes through `humaux_testkit::skip_or_fail`, which turns a
+/// missing DSN into a failure under `HUMAUX_REQUIRE_DB=1` (§79.2, ADR-0051 D-K).
 fn require_db() -> bool {
-    match std::env::var("HUMAUX_TEST_PG_DSN") {
-        Ok(_) => true,
-        Err(_) if std::env::var("HUMAUX_REQUIRE_DB").as_deref() == Ok("1") => {
-            panic!("HUMAUX_REQUIRE_DB=1 requires HUMAUX_TEST_PG_DSN")
-        }
-        Err(_) => false,
-    }
+    std::env::var("HUMAUX_TEST_PG_DSN").is_ok()
 }
 
 fn direct_request(
@@ -304,7 +307,11 @@ fn db_error<T>(result: Result<T, ContributionExecutionRepoError>, label: &str) {
 #[allow(clippy::too_many_lines)]
 fn typed_repo_all_eight_commands_are_durable_and_provider_free() {
     if !require_db() {
-        eprintln!("SKIP: HUMAUX_TEST_PG_DSN is not set");
+        humaux_testkit::skip_or_fail(
+            "typed_repo_all_eight_commands_are_durable_and_provider_free",
+            "HUMAUX_TEST_PG_DSN",
+            humaux_testkit::ExternalDep::Postgres,
+        );
         return;
     }
 

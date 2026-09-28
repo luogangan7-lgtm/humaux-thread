@@ -1,7 +1,15 @@
-//! §11.8 `UdsInferenceClient` — `humaux-consolidation-worker`'s
-//! [`PrivateReasoningPort`] implementation: registers a call row on
-//! [`ConsolidationDbPool`] (`role_consolidation_worker`), then RPCs `humaux-private-worker`
-//! over the ADR-0012 Unix domain socket. Mirrors
+//! `consolidation-worker::inference_client` — §11.8 `UdsInferenceClient` — `humaux-consolidation-worker`'s
+//!   [`PrivateReasoningPort`] implementation: registers a call row on [`ConsolidationDbPool`]
+//!   (`role_consolidation_worker`), then RPCs `humaux-private-worker` over the ADR-0012 Unix domain socket.
+//! Depends-on: crates=[async-trait, hex, humaux-adapters, humaux-application, serde, serde_json, sha2, tokio, uuid];
+//!   services=[UDS(private-worker)]; env=[]; modules=[adapters::postgres, adapters::private_inference_rpc,
+//!   application::consolidate]
+//! Called-by: [consolidation-worker::main, tests]
+//! Invariants: [one fresh UDS connection per call to the private worker's inference socket; a dial/IO/parse failure
+//!   is TRANSPORT/INVALID_RESPONSE mapped to PrivateReasoningError, never a local fallback inference]
+//! Spec: none
+//!
+//! Mirrors
 //! `bins/gateway/src/retrieval_embedding_client.rs::GatewayRetrievalEmbeddingClient` verbatim
 //! in transport shape (§决定1: hand-rolled HTTP/1.1 framing over a fresh UDS connection per
 //! call, no generic RPC framework) — see that module's doc for the full reasoning this one
@@ -93,6 +101,7 @@ impl<'a> UdsInferenceClient<'a> {
         &self,
         wire: &PrivateInferenceRpcRequest,
     ) -> Result<PrivateInferenceRpcEnvelope, String> {
+        // dep: UDS(private-worker) — dials the private worker's inference RPC socket (ADR-0012)
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(|_| "TRANSPORT".to_owned())?;

@@ -1,4 +1,8 @@
 //! `domain::ticket_family` — the §15.1 stream-ticket family triple, in one place.
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [adapters::consolidate_repo, adapters::qdrant, tests, xtask::e2e_seed]
+//! Invariants: []
+//! Spec: Baseline §3; §15.1; §16.2
 //!
 //! A `projection.stream_log` row is addressed by six columns (§15.1); three of them —
 //! `domain` / `projection_kind` / `projection_version` — identify the *family* rather than the

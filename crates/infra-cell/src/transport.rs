@@ -1,4 +1,11 @@
 //! `infra-cell::transport` — ADR-0003 / §83.4 Layer 1B: the same-Cell HTTP capability wrapper.
+//! Depends-on: crates=[async-trait, humaux-infra-network, serde_json, tokio, url, uuid]; services=[Qdrant(*)];
+//!   env=[]; modules=[humaux-infra-network, infra-cell::permit, infra-cell::resource, infra-network::http]
+//! Called-by: [adapters::projection_worker, adapters::public_projection, adapters::qdrant, adapters::retrieve, admin::cell_resources, gateway::bootstrap, gateway::recall, public-worker::main, retrieval-worker::main, tests, xtask::e2e_seed, xtask::switch_visible]
+//! Invariants: [execute takes a resource-relative path plus a CellAccessPermit, never a URL; paths are validated,
+//!   resolved addresses must be in-Cell and not metadata/link-local, redirects are refused; every failure is a typed
+//!   IntraCellError]
+//! Spec: Baseline §83.4; ADR-0003
 //!
 //! [`IntraCellHttpTransport::execute`] takes an [`IntraCellRequest`] (a resource-relative
 //! path + optional JSON body) plus a [`CellAccessPermit`], not a bare URL. [`validate_path`]
@@ -87,6 +94,7 @@ pub enum IntraCellMethod {
 /// caller from the Cell's own secret store, never a literal (README "Intra-cell network deploy
 /// gate").
 #[derive(Debug, Clone)]
+// dep: Qdrant(*) — qdrant wire call
 pub struct IntraCellRequest {
     pub method: IntraCellMethod,
     /// Must start with `/`, and must not contain `@`, `//`, a `..` path segment, or
@@ -510,6 +518,7 @@ impl IntraCellHttpTransport for HttpIntraCellTransport {
         }
         // §83.4 判据3 single-resolver fix: DNS resolution — and its metadata/link-local/CIDR
         // judgment — happens *inside* this `send()`, via `ValidatingResolver`, not before it.
+        // dep: Qdrant(*) — outbound http call
         let mut response = match builder.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -575,7 +584,9 @@ mod tests {
         .unwrap()
     }
 
+    // dep: Qdrant(*) — qdrant wire call
     fn plain_request(path: &str) -> IntraCellRequest {
+        // dep: Qdrant(*) — qdrant wire call
         IntraCellRequest {
             method: IntraCellMethod::Get,
             path: path.to_string(),
@@ -1191,7 +1202,9 @@ mod tests {
         IntraCellResourceRegistry::new(entries, cell, CallerId("retrieval-worker".to_string()))
     }
 
+    // dep: Qdrant(*) — qdrant wire call
     fn request(method: IntraCellMethod, path: &str) -> IntraCellRequest {
+        // dep: Qdrant(*) — qdrant wire call
         IntraCellRequest {
             method,
             path: path.to_string(),

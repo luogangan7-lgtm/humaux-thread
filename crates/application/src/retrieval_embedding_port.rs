@@ -1,5 +1,10 @@
-//! `application::retrieval_embedding_port` — ADR-0012's sole cross-process boundary type the
-//! Gateway depends on for query embedding.
+//! `application::retrieval_embedding_port` — ADR-0012's sole cross-process boundary type the Gateway depends on for
+//!   query embedding.
+//! Depends-on: crates=[async-trait, humaux-domain, uuid]; services=[]; env=[]; modules=[domain::error,
+//!   domain::identity, domain::ids]
+//! Called-by: [gateway::bootstrap, gateway::recall, gateway::retrieval_embedding_client, tests]
+//! Invariants: []
+//! Spec: ADR-0012; §4.2; §2
 //!
 //! §4.2 keeps `role_gateway`/`bins/gateway` free of the PLATFORM_RETRIEVAL provider credential
 //! and the `role_retrieval_worker` DB pool (both live only behind

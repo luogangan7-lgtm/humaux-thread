@@ -1,5 +1,20 @@
-//! T7.1 real-network smoke test — §19 production embedding model is `text-embedding-v4`
-//! (1024-dim default). `infra-egress::http` now injects `Authorization: Bearer <key>` +
+//! `retrieval-provider::tests::dashscope_live_smoke` — T7.1 real-network smoke test — §19 production embedding model
+//!   is `text-embedding-v4` (1024-dim default).
+//! Depends-on: crates=[humaux-adapters, humaux-contracts, humaux-domain, humaux-local-secret-scan, humaux-retrieval,
+//!   humaux-testkit, postgres, tokio, uuid]; services=[PostgreSQL(owner) w=[control.memberships,
+//!   control.private_reasoning_domains, control.retrieval_provider_admission_limits, control.tenants, control.users,
+//!   control.workspaces, private.evidence_objects], PostgreSQL(role_retrieval_worker), DashScope];
+//!   env=[HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
+//!   HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN]; modules=[adapters::disclosure, adapters::postgres,
+//!   contracts::config_registry, domain::egress, domain::identity, domain::ids, humaux-local-secret-scan,
+//!   humaux-testkit, retrieval-provider::adapters, retrieval-provider::admission, retrieval-provider::contract,
+//!   retrieval-provider::metrics, retrieval::request]
+//! Called-by: [cargo-test]
+//! Invariants: [no DASHSCOPE_API_KEY -> SKIP naming the missing object; key but no DB -> SKIP via run_db_fixture;
+//!   HUMAUX_REQUIRE_DASHSCOPE/HUMAUX_REQUIRE_DB turn either into a failure; with both present the call is real]
+//! Spec: §19; §79.2
+//!
+//! `infra-egress::http` now injects `Authorization: Bearer <key>` +
 //! `Content-Type: application/json` on every call (`crates/infra-egress/src/http.rs` module
 //! doc, "Credential injection") via `EnvCredentialSource` reading this same
 //! `DASHSCOPE_API_KEY` variable, so state 3 below is a real, network-verified call, not a
@@ -104,10 +119,12 @@ impl Drop for Handle {
         // Best-effort cleanup (repo CLAUDE.md hard rule ④) — `ops.data_disclosures` itself is
         // append-only (§7.4) and its FK'd `control.tenants` row can therefore never be deleted
         // either, same permanent-leak shape `disclosure_ledger.rs`'s own Drop documents.
+        // dep: PostgreSQL(owner) — admin fixture insert, isolate() DB-bound half of the three-state smoke test.
         let _ = self.admin.execute(
             "DELETE FROM private.evidence_objects WHERE tenant_id = $1",
             &[&self.tenant_id],
         );
+        // dep: PostgreSQL(owner) — admin fixture insert, isolate() DB-bound half of the three-state smoke test.
         let _ = self.admin.execute(
             "DELETE FROM control.private_reasoning_domains WHERE tenant_id = $1",
             &[&self.tenant_id],
@@ -123,6 +140,7 @@ impl DbIntegrationFixture for SmokeFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — connects with the exact HUMAUX_TEST_PG_DSN guard this fixture requires.
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -132,6 +150,7 @@ impl DbIntegrationFixture for SmokeFixture {
         // `humaux_testkit::DISCLOSURE_LEDGER_ADVISORY_LOCK` 的 doc）。两个 binary 并行跑，
         // 交叉加锁即成环——实测过一次真 40P01。取共享锁，只在那一条测试跑时让路。
         admin
+            // dep: PostgreSQL(owner) — seeds the tenant/workspace/membership rows the live smoke test needs.
             .execute(
                 "SELECT pg_advisory_lock_shared($1)",
                 &[&humaux_testkit::DISCLOSURE_LEDGER_ADVISORY_LOCK],
@@ -150,6 +169,7 @@ impl DbIntegrationFixture for SmokeFixture {
         })?;
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        // dep: PostgreSQL(role_retrieval_worker) — opens the role-scoped connection for `isolate`
         let pool = rt
             .block_on(RetrievalWorkerDbPool::connect(&role_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
@@ -164,6 +184,7 @@ impl DbIntegrationFixture for SmokeFixture {
             .get(0);
         let user_id = Uuid::now_v7();
         admin
+            // dep: PostgreSQL(owner) — seeds the evidence/disclosure rows the live smoke test needs.
             .execute(
                 "INSERT INTO control.users(user_id,state) VALUES($1,'ACTIVE')",
                 &[&user_id],
@@ -181,6 +202,7 @@ impl DbIntegrationFixture for SmokeFixture {
             (Some(tenant_id), None, Some("RETRIEVAL_EMBEDDING")),
         ] {
             admin
+                // dep: PostgreSQL(owner) — seeds the reserved-budget row the live smoke test needs.
                 .execute(
                     "INSERT INTO control.retrieval_provider_admission_limits \
                        (tenant_id,provider_id,region,purpose,tpm_limit,rpm_limit,effective_from) \
@@ -199,6 +221,7 @@ impl DbIntegrationFixture for SmokeFixture {
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
             .get(0);
         admin
+            // dep: DashScope — the real network call this smoke test proves state 3 against.
             .execute(
                 "INSERT INTO control.memberships(tenant_id,user_id,role,state) VALUES($1,$2,'member','ACTIVE')",
                 &[&tenant_id, &user_id],

@@ -1,6 +1,7 @@
 [package]
 name = "humaux-retrieval"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -10,19 +11,25 @@ workspace = true
 [dependencies]
 # §23 envelope / §21 signals wire format — same version pin `humaux-contracts`/
 # `humaux-application` already use.
+# why: envelope/signals/completeness/handoff/request DTO (de)serialization; used-by: [retrieval::completeness, retrieval::envelope, retrieval::handoff, retrieval::request, retrieval::signals]
 serde = { version = "1", features = ["derive"] }
 # §53.1: `abstain()`/`DegradeCode`/`Outcome` — the single fail-open exit point (§23.1②'s
 # `ProjectionInvisibleLoss`, §23's `degradations`); already a workspace-wide dependency.
+# why: the sole fail-open exit point (abstain/DegradeCode); used-by: [retrieval::envelope]
 humaux-telemetry = { path = "../telemetry" }
 # §21.5's freshness policy is keyed by `MemoryType` (§8.5) — no SQLx/HTTP import, just this
 # pure enum, so this stays within §3/§78.3's "Domain 永不 import HTTP/SQLx" rule (the
 # dependency direction the other way — pure type consumed by a pure crate).
+# why: pure domain types (MemoryType, authority, selection) this crate's logic is keyed on; used-by: [retrieval::compiler, retrieval::completeness, retrieval::envelope, retrieval::handoff, retrieval::request, retrieval::signals]
 humaux-domain = { path = "../domain" }
+# why: typed retrieval config registry entries request.rs assembles against; used-by: [retrieval::request]
 humaux-contracts = { path = "../contracts" }
 # §25.3 Handoff::canonical_bytes 的唯一序列化入口（G80-31 字节域）——生产依赖，
 # 不再只是 dev；envelope 的 Serialize 早已用 serde，这里补上到字节的那一步。
+# why: Handoff::canonical_bytes' sole serialization step (G80-31 byte domain); used-by: [retrieval::envelope, retrieval::handoff, retrieval::signals]
 serde_json = "1"
 # Handoff::sha256（G80-31 的字节指纹）。与全 workspace 其它生产 sha2 同版本钉。
+# why: Handoff::sha256 byte fingerprint (G80-31); used-by: [retrieval::handoff]
 sha2 = "0.11"
 
 [dev-dependencies]
@@ -31,4 +38,5 @@ sha2 = "0.11"
 # `fixture_sha256`. Same version pin every other workspace crate's production `sha2`
 # dependency already uses (contracts/application/adapters/domain/protocol/projection); dev-only
 # here since it is test-fixture verification, not runtime hashing.
+# why: dataset.tsv sha256 manifest verification in the eval harness; used-by: [retrieval::tests::planner_predicate_eval]
 sha2 = "0.11"

@@ -1,4 +1,10 @@
 //! `humaux-testkit` — 测试基建：DB fixture、注错（fault injection）夹具、正哨兵样本。
+//! Depends-on: crates=[]; services=[]; env=[HUMAUX_REQUIRE_DASHSCOPE, HUMAUX_REQUIRE_DB, HUMAUX_REQUIRE_MINIMAX,
+//!   HUMAUX_REQUIRE_QDRANT]; modules=[]
+//! Called-by: [crate(humaux-adapters), crate(humaux-consolidation-worker), crate(humaux-gateway), crate(humaux-private-worker), crate(humaux-retrieval-provider), crate(xtask), tests]
+//! Invariants: [skip_or_fail prints a visible SKIP naming the missing object, or panics when the matching
+//!   HUMAUX_REQUIRE_* is set (a skip is not a pass, §79.2); the crate depends on no domain/adapters type]
+//! Spec: Baseline §53.3; §80.2; §53.4; §52.4; §78.3
 //!
 //! 目录契约：`sentinels/`（§53.3 规则3 正哨兵）· `tests/metrics/`（§80.2 Metric Witness）
 //! · `tests/fault/`（§53.4 每个 DegradeCode reason 一条注错）· `tests/pair/`（§52.4 G52-5 成对测试）。

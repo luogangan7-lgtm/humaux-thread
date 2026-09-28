@@ -1,5 +1,9 @@
 //! `domain::boundary` — ADR-0003 second-round correction: the disclosure-ledger judgment is a
-//! legal/organizational-entity question, not a network-topology one.
+//!   legal/organizational-entity question, not a network-topology one.
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [adapters::disclosure, domain::egress, infra-cell::resource, tests]
+//! Invariants: []
+//! Spec: Baseline §7.3; §7.4; §83.4; ADR-0003
 //!
 //! §83.4/ADR-0003's first round (Layer 0 protocol choke point / Layer 1A external egress /
 //! Layer 1B intra-Cell access) split the *code topology* correctly, but its own prose risked

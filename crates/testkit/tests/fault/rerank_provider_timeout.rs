@@ -1,6 +1,9 @@
-//! §53.4 注错测试：`DegradeCode::RerankProviderTimeout` 的一条注错记录（每个 reason
-//! 必须有一条测试，从未触发过的 reason 不许合并，§53.3 规则2 的三数相等
-//! 把这句话变成 CI 事实）。
+//! `testkit::tests::fault::rerank_provider_timeout` — §53.4 注错测试：`DegradeCode::RerankProviderTimeout` 的一条注错记录（每个
+//!   reason 必须有一条测试，从未触发过的 reason 不许合并，§53.3 规则2 的三数相等 把这句话变成 CI 事实）。
+//! Depends-on: crates=[humaux-telemetry]; services=[]; env=[]; modules=[humaux-testkit, telemetry::degrade]
+//! Called-by: [testkit::tests::fault_main]
+//! Invariants: []
+//! Spec: Baseline §53.4; §19; §23.3; §53.1; §53.3
 //!
 //! §53.4 登记项（尚未按登记语义实现，见下方 ponytail 标注）：rerank
 //! provider 注入读超时，按 §19 走 fallback ranking 仍返回结果（items 非空）；

@@ -1,6 +1,10 @@
-//! `infra-cell::resource` — ADR-0003 / §83.4 `intra-cell-resource-registry`: the closed set of
-//! same-Cell resources a caller may ever name, and the deploy-supplied table that resolves one
-//! to an actual endpoint.
+//! `infra-cell::resource` — ADR-0003 / §83.4 `intra-cell-resource-registry`: the closed set of same-Cell resources a
+//!   caller may ever name, and the deploy-supplied table that resolves one to an actual endpoint.
+//! Depends-on: crates=[humaux-domain, uuid]; services=[]; env=[]; modules=[domain::boundary, infra-cell::permit]
+//! Called-by: [adapters::mechanism_observation, admin::cell_resources, gateway::bootstrap, gateway::recall, gateway::retrieval_embedding_client, infra-cell::permit, infra-cell::transport, public-worker::main, retrieval-worker::main, tests, xtask::e2e_seed, xtask::switch_visible]
+//! Invariants: [a caller can name only an IntraCellResource variant (no raw URL escape hatch); the
+//!   host/port/CIDR/caller allowlist comes from the registry populated at bootstrap, never a literal here]
+//! Spec: Baseline §83.4; §78.1
 //!
 //! §83.4 判据1 (registry membership): a caller can only ever hand
 //! [`IntraCellHttpTransport::execute`](crate::transport::IntraCellHttpTransport::execute) an

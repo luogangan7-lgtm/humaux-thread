@@ -1,6 +1,17 @@
-//! §23.4 G23-2 — "分子取 `visible`" fault injection, against a **real** Postgres ledger and a
-//! **real** Qdrant index (both required; three-state skip, §79.2/§57.1, prints which object is
-//! missing rather than silently passing).
+//! `adapters::tests::recall_envelope_g23` — §23.4 G23-2 — "分子取 `visible`" fault injection, against a **real**
+//!   Postgres ledger and a **real** Qdrant index (both required; three-state skip, §79.2/§57.1, prints which object
+//!   is missing rather than silently passing).
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, humaux-projection, humaux-retrieval,
+//!   humaux-telemetry, humaux-testkit, postgres, serde_json, sqlx, tokio, uuid]; services=[PostgreSQL(owner)
+//!   r=[projection.processing_gaps] w=[control.tenants, projection.stream_checkpoints, projection.stream_log],
+//!   PostgreSQL(role_maintenance), Qdrant(*)]; env=[HUMAUX_TEST_PG_DSN, HUMAUX_TEST_QDRANT_PORT];
+//!   modules=[adapters::forget_repo, adapters::postgres, adapters::qdrant, domain::authority, domain::dataclass,
+//!   domain::identity, domain::ids, domain::memory, humaux-testkit, infra-cell::permit, infra-cell::resource,
+//!   infra-cell::transport, projection::card, projection::sparse, projection::stream, retrieval::completeness,
+//!   retrieval::envelope, telemetry::degrade]
+//! Called-by: [cargo-test]
+//! Invariants: [PostgreSQL unreachable or role denied -> the call fails and surfaces the error to the caller; no silent fallback; Qdrant unreachable -> QdrantTransportError to the caller, no fallback search]
+//! Spec: Baseline §15.2; §17.4; §17.6
 //!
 //! Every ledger read below is independent, hand-rolled SQL against the admin connection —
 //! mirroring `stream_repo.rs`'s own `seed_log_row`/`seed_checkpoint`/`log_state` helpers,
@@ -91,6 +102,7 @@ fn qdrant_addr() -> String {
 }
 
 fn qdrant_reachable() -> bool {
+    // dep: Qdrant(*) — reachability probe before running the Qdrant-dependent test
     TcpStream::connect_timeout(&qdrant_addr().parse().unwrap(), Duration::from_millis(500)).is_ok()
 }
 
@@ -108,6 +120,7 @@ fn skip_unless_both_reachable(test_name: &str) -> Option<(String, Client)> {
         );
         return None;
     };
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let admin = match Client::connect(&dsn, NoTls) {
         Ok(c) => c,
         Err(e) => {
@@ -356,6 +369,7 @@ async fn setup_collection(
     transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
             IntraCellRequest {
                 method: IntraCellMethod::Put,
                 path: format!("/collections/{collection}"),
@@ -368,6 +382,7 @@ async fn setup_collection(
     transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
             IntraCellRequest {
                 method: IntraCellMethod::Put,
                 path: format!("/collections/{collection}/index"),
@@ -425,6 +440,7 @@ async fn teardown_collection(
     let _ = transport
         .execute(
             permit,
+            // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
             IntraCellRequest {
                 method: IntraCellMethod::Delete,
                 path: format!("/collections/{collection}"),
@@ -485,6 +501,7 @@ fn g23_2_injection_1_bypass_tombstone_direct_delete() {
         ids[0..10].iter().map(|id| point_id_json(*id)).collect();
     rt.block_on(transport.execute(
         &permit,
+        // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
         IntraCellRequest {
             method: IntraCellMethod::Post,
             path: format!("/collections/{collection}/points/delete?wait=true"),
@@ -645,6 +662,7 @@ fn g23_2_legal_deletion_contrast_stays_closed_across_four_lanes() {
     // production tombstone-write path check.
     let deleted_ids = ids[0..10].to_vec();
     let maintenance = rt.block_on(async {
+        // dep: PostgreSQL(role_maintenance) — test opens a direct PG connection for setup/verification
         let maintenance = MaintenanceDbPool::connect(&dsn_as_role(&dsn, "role_maintenance"))
             .await
             .expect("maintenance pool");
@@ -718,6 +736,7 @@ fn g23_2_legal_deletion_contrast_stays_closed_across_four_lanes() {
     let dense_result = rt
         .block_on(transport.execute(
             &permit,
+            // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
             IntraCellRequest {
                 method: IntraCellMethod::Post,
                 path: format!("/collections/{collection}/points/scroll"),
@@ -775,6 +794,7 @@ fn g23_2_legal_deletion_contrast_stays_closed_across_four_lanes() {
     let sparse_result = rt
         .block_on(transport.execute(
             &permit,
+            // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
             IntraCellRequest {
                 method: IntraCellMethod::Post,
                 path: format!("/collections/{collection}/points/scroll"),
@@ -835,6 +855,7 @@ fn g23_2_legal_deletion_contrast_stays_closed_across_four_lanes() {
         deleted_ids.iter().map(|id| point_id_json(*id)).collect();
     rt.block_on(transport.execute(
         &permit,
+        // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
         IntraCellRequest {
             method: IntraCellMethod::Post,
             path: format!("/collections/{collection}/points/delete?wait=true"),

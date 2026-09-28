@@ -1,4 +1,10 @@
-//! Native `continuity.get` application handler.
+//! `gateway::continuity` — Native `continuity.get` application handler.
+//! Depends-on: crates=[humaux-adapters, humaux-application,
+//!   humaux-domain]; services=[]; env=[]; modules=[adapters::continuity_read, adapters::postgres,
+//!   application::continuity, domain::context, domain::continuity, domain::error, domain::identity, domain::ids]
+//! Called-by: [gateway::mcp_application]
+//! Invariants: [an unknown or unpublished continuity project yields the application-layer NotFound error, never a partial facet list]
+//! Spec: none
 
 use std::sync::Arc;
 

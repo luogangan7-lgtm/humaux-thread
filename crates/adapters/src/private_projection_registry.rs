@@ -1,4 +1,13 @@
-//! PostgreSQL-only identity binding for private Qdrant candidates.
+//! `adapters::private_projection_registry` — PostgreSQL-only identity binding for private Qdrant candidates.
+//! Depends-on: crates=[humaux-domain, humaux-projection, sha2, sqlx]; services=[PostgreSQL(any)
+//!   r=[private.memory_records] w=[projection.private_memory_points], PostgreSQL(role_gateway),
+//!   PostgreSQL(role_retrieval_worker)]; env=[]; modules=[adapters::postgres, domain::authority, domain::identity,
+//!   domain::ids, projection::serving]
+//! Called-by: [adapters::projection_worker, adapters::retrieve, tests]
+//! Invariants: [sole private point-id resolver: binds a Qdrant point id to a Memory in PostgreSQL and re-checks the
+//!   source fence; no Qdrant IO here; cross-tenant/workspace, collisions and lost races are typed errors, never a
+//!   guessed binding]
+//! Spec: none
 //!
 //! Qdrant returns an opaque point id plus a score.  This module is the sole private-plane
 //! point-id resolver: it binds that id to a Memory through PostgreSQL and then rechecks the
@@ -333,6 +342,7 @@ pub async fn register_private_memory_point(
     registration: &PrivateMemoryPointRegistration,
 ) -> Result<RegistrationOutcome, PrivateProjectionRegistryError> {
     validate_input(authorization, registration)?;
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `register_private_memory_point`
     let mut txn = pool.pool().begin().await?;
     set_authorization_local(&mut txn, authorization).await?;
     current_source_matches(&mut txn, registration).await?;
@@ -407,6 +417,7 @@ pub async fn retire_private_memory_point(
     point_id: ProjectionPointId,
 ) -> Result<bool, PrivateProjectionRegistryError> {
     validate_family(authorization, family, projection_version, embedding_version)?;
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `retire_private_memory_point`
     let mut txn = pool.pool().begin().await?;
     set_authorization_local(&mut txn, authorization).await?;
     let result = sqlx::query(
@@ -444,6 +455,7 @@ pub async fn retire_points_for_memory(
     memory_id: MemoryId,
 ) -> Result<Vec<ProjectionPointId>, PrivateProjectionRegistryError> {
     validate_family(authorization, family, projection_version, embedding_version)?;
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `retire_points_for_memory`
     let mut txn = pool.pool().begin().await?;
     set_authorization_local(&mut txn, authorization).await?;
     let point_ids: Vec<Uuid> = sqlx::query_scalar(
@@ -495,6 +507,7 @@ pub async fn resolve_private_memory_points(
     embedding_version: &str,
     point_ids: &[ProjectionPointId],
 ) -> Result<Vec<ResolvedPrivateMemoryPoint>, PrivateProjectionRegistryError> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `resolve_private_memory_points`
     let mut txn = pool.pool().begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *txn)

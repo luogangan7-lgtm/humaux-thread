@@ -1,5 +1,10 @@
-//! `retrieval::completeness` — `LedgerCounts` / `CompletenessClass` / `FreshnessClass` / the
-//! `ledger::close` and `classify()` sole constructors (§22.4 / §22.5 / §59).
+//! `retrieval::completeness` — `LedgerCounts` / `CompletenessClass` / `FreshnessClass` / the `ledger::close` and
+//!   `classify()` sole constructors (§22.4 / §22.5 / §59).
+//! Depends-on: crates=[humaux-domain, serde]; services=[];
+//!   env=[]; modules=[domain::context, domain::ledger, retrieval::envelope, retrieval::planner]
+//! Called-by: [adapters::context_repo, adapters::exact_census, adapters::retrieve, adapters::stream_repo, gateway::context, gateway::memory, gateway::recall, retrieval::envelope, retrieval::signals, tests]
+//! Invariants: []
+//! Spec: §22.4; §22.5; §59; §41.2; §25.3; §78.2
 //!
 //! `classify()` is the sole constructor of [`CompletenessClass`]; final outcome emission is
 //! the sole increment point of `retrieval_completeness_total{class,reason}` (§22.5, §41.2).

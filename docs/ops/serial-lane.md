@@ -162,6 +162,22 @@ never tried on a quiet per-run database. The third test does not observe a relat
 all; it is the only same-key witness ADR-0032 relies on. The disposition lives in the ignore
 reason, not in a second table. The lane's `request_guard` group reports each test by name.
 
+## Known flake source: `g80_31_handoff` (card 25 review P2, recorded card 26)
+
+`crates/adapters/tests/g80_31_handoff.rs` stays in the default chain (`adapters_tests`), not in
+this lane. Its byte-identity precondition is **cluster-wide**: two assemblies of one snapshot are
+compared only after asserting their `pg_current_snapshot()` tokens are equal. The `QUIET` mutex
+in that file serialises fixtures **inside the one test binary only**. Another test binary, lane
+group or agent committing on the shared `HUMAUX_TEST_PG_DSN` cluster between the two reads makes
+the tokens differ, and the test fails on its precondition. It does not fail on a byte regression.
+
+- Diagnosis: a failure whose message is the snapshot-token precondition, not a byte diff, is
+  this flake. A byte diff with equal tokens is a real regression.
+- Disposition: while it has not flaked in a chain, it stays where it is. If it flakes in a card's
+  chain, move the affected tests to `lane(b)` with the reason "cluster-wide snapshot precondition;
+  QUIET is binary-local". Do not widen the lock or retry the test.
+- Status on card 26: it did not flake. The card-25 main-line chain passed with 11 tests in 3.22 s.
+
 ## Process discipline
 
 The lane never kills a process it did not spawn and never frees a port by force (a `lsof -ti

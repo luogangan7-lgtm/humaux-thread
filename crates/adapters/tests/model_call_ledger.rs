@@ -1,6 +1,17 @@
-//! T7.4 integration test — `model_call_ledger` (§19.1) against a real Postgres, on
-//! `migrations/0094_model_call_ledger_fields.sql` / `0095_provider_pricing_versions.sql` /
-//! `0096_tenant_cost_events.sql`. Same convention as `disclosure_ledger.rs`: shared tables,
+//! `adapters::tests::model_call_ledger` — T7.4 integration test — `model_call_ledger` (§19.1) against a real
+//!   Postgres, on `migrations/0094_model_call_ledger_fields.sql` / `0095_provider_pricing_versions.sql` /
+//!   `0096_tenant_cost_events.sql`.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-retrieval-provider, humaux-testkit, postgres, sqlx,
+//!   tokio, uuid]; services=[PostgreSQL(any) w=[control.provider_pricing_versions, control.tenants,
+//!   ops.model_call_ledger, ops.tenant_cost_events], PostgreSQL(role_private_worker),
+//!   PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::model_call_ledger,
+//!   adapters::postgres, domain::ledger, humaux-testkit, retrieval-provider::cost, retrieval-provider::pricing]
+//! Called-by: [cargo-test]
+//! Invariants: [each test scopes rows to its own throwaway tenant; reserve/finalize pairs and cost events are
+//!   asserted on real rows; no DSN, unreachable DB or migrations missing is a visible SKIP]
+//! Spec: Baseline §19.1; §79.2
+//!
+//! Same convention as `disclosure_ledger.rs`: shared tables,
 //! each test scopes rows to its own throwaway `control.tenants` row.
 //!
 //! Three-state skip (§79.2): no DSN, unreachable DB, or the migrations not yet applied all
@@ -106,6 +117,7 @@ impl DbIntegrationFixture for LedgerFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -141,6 +153,7 @@ impl DbIntegrationFixture for LedgerFixture {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let retrieval_worker = rt
+            // dep: PostgreSQL(role_retrieval_worker) — open a role-scoped PG connection/pool for this test
             .block_on(RetrievalWorkerDbPool::connect(&retrieval_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 
@@ -846,6 +859,7 @@ fn private_purposes_reserve_and_finalize_on_the_private_worker_pool() {
             let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("fixture already required it");
             let private_worker = handle
                 .rt
+                // dep: PostgreSQL(role_private_worker) — open a role-scoped PG connection/pool for this test
                 .block_on(PrivateWorkerDbPool::connect(&dsn_as_role(
                     &dsn,
                     "role_private_worker",
@@ -943,6 +957,7 @@ fn a_failed_private_call_is_ledgered_as_failed_not_absent() {
             let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("fixture already required it");
             let private_worker = handle
                 .rt
+                // dep: PostgreSQL(role_private_worker) — open a role-scoped PG connection/pool for this test
                 .block_on(PrivateWorkerDbPool::connect(&dsn_as_role(
                     &dsn,
                     "role_private_worker",

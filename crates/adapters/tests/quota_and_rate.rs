@@ -1,4 +1,16 @@
-//! §72.2.1 acceptance candidates for quota reservations and independent rate buckets.
+//! `adapters::tests::quota_and_rate` — §72.2.1 acceptance candidates for quota reservations and independent rate
+//!   buckets.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, sqlx, tokio];
+//!   services=[PostgreSQL(any) w=[control.entitlement_snapshots, control.memberships, control.quota_windows,
+//!   control.rate_buckets, control.tenants, control.usage_reservations, control.users]
+//!   x=[control.issue_quota_window], PostgreSQL(role_gateway), PostgreSQL(role_maintenance)];
+//!   env=[HUMAUX_GATEWAY_PG_DSN, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres,
+//!   adapters::quota_repo, domain::error, domain::identity, domain::ids, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [needs the dedicated RequestGuard fixture after migration 0113 (gateway + maintenance DSNs); exhausted
+//!   windows are QuotaExhausted/RateLimited, never an allow; the fixture tests are #[ignore] lane tests]
+//! Spec: Baseline §72.2.1; §79.2
+//!
 //! These tests intentionally require the dedicated RequestGuard fixture after migration 0113.
 
 use std::future::Future;
@@ -68,6 +80,7 @@ impl DbIntegrationFixture for Fixture {
         if options.get_host() != "127.0.0.1" || owner_dsn.contains(['?', '#']) {
             return Err(setup_failed(()));
         }
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&owner_dsn, NoTls).map_err(setup_failed)?;
         let ready: bool = admin
             .query_one(
@@ -122,6 +135,7 @@ impl DbIntegrationFixture for Fixture {
         {
             return Err(setup_failed(()));
         }
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut gateway = Client::connect(&gateway_dsn, NoTls).map_err(setup_failed)?;
         let role_ok: bool = gateway
             .query_one(
@@ -136,9 +150,11 @@ impl DbIntegrationFixture for Fixture {
         }
         let rt = tokio::runtime::Runtime::new().map_err(setup_failed)?;
         let runtime = rt
+            // dep: PostgreSQL(role_gateway) — open a role-scoped PG connection/pool for this test
             .block_on(RuntimeDbPool::connect(&gateway_dsn))
             .map_err(setup_failed)?;
         let maintenance = rt
+            // dep: PostgreSQL(role_maintenance) — open a role-scoped PG connection/pool for this test
             .block_on(MaintenanceDbPool::connect(&maintenance_dsn))
             .map_err(setup_failed)?;
         let auth = AuthorizationScope::new(
@@ -735,6 +751,7 @@ fn a_contended_rate_bucket_waits_for_its_holder_instead_of_answering_rate_limite
         let dsn = std::env::var("HUMAUX_GATEWAY_PG_DSN").expect("fixture env");
         let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
+            // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
             let mut client = Client::connect(&dsn, NoTls).expect("holder connects");
             let mut txn = client.transaction().expect("holder txn");
             txn.execute(

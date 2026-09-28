@@ -1,3 +1,18 @@
+//! `adapters::tests::project_continuity_0136` — Real-PostgreSQL acceptance for migration 0136's project continuity registration and facet publication.
+//! Depends-on: crates=[postgres, serde_json, uuid]; services=[PostgreSQL(any) r=[control.contribution_policies,
+//!   private.continuity_] w=[control.memberships, control.private_reasoning_domains, control.tenants, control.users,
+//!   control.workspace_memberships, control.workspaces, private.continuity_facet_memory_links,
+//!   private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects,
+//!   private.evidence_objects, private.memory_evidence, private.memory_records]
+//!   x=[private.compute_contribution_source_backing_closure_v1, private.enqueue_contribution_execution,
+//!   private.publish_continuity_facet, private.register_continuity_project], PostgreSQL(role_gateway),
+//!   PostgreSQL(role_migration_owner)]; env=[HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::tests::support::contribution_fixture]
+//! Called-by: [cargo-test]
+//! Invariants: [registration is eager and idempotent; null/unknown facets, ACL violations and a terminated pre-commit
+//!   backend leave no residue; one winner per expected version; a missing DB fails when HUMAUX_REQUIRE_DB=1]
+//! Spec: Baseline §25.3.1; §79.2; ADR-0035
+//!
 use postgres::{Client, Error, GenericClient, NoTls, Row, types::ToSql};
 use serde_json::{Value, json};
 use std::{
@@ -95,6 +110,7 @@ impl Fixture {
         let cross_workspace_evidence = Uuid::now_v7();
         let evidence_hash = vec![0x5a; 32];
         let content = json!({"continuity":"source"});
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&admin_dsn, NoTls).expect("admin connect");
         admin
             .execute(
@@ -240,10 +256,12 @@ impl Fixture {
 
     fn gateway(&self, app: &str) -> Client {
         let dsn = self.gateway_dsn.replace("continuity_gateway", app);
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         Client::connect(&dsn, NoTls).expect("gateway connect")
     }
 
     fn admin(&self) -> Client {
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         Client::connect(&self.admin_dsn, NoTls).expect("admin connect")
     }
 
@@ -792,6 +810,7 @@ fn headless_visibility_hash_successor_and_acl_are_closed() {
         "devlocal_role_private_worker",
         "continuity_private_denied",
     );
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut private = Client::connect(&private_dsn, NoTls).unwrap();
     private.batch_execute("BEGIN").unwrap();
     set_context(&mut private, f.tenant, f.workspace, f.principal, None);
@@ -900,6 +919,7 @@ fn owner_mutation_append_only_deferred_source_and_runtime_acl_are_enforced() {
         .get(0);
     assert_eq!(gateway_execute_count, 2);
 
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `owner_mutation_append_only_deferred_source_and_runtime_acl_are_enforced`
     admin
         .batch_execute("BEGIN; SET LOCAL ROLE role_migration_owner")
         .unwrap();
@@ -954,6 +974,7 @@ fn owner_mutation_append_only_deferred_source_and_runtime_acl_are_enforced() {
     admin.batch_execute("COMMIT").unwrap();
 
     let orphan_version = Uuid::now_v7();
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `owner_mutation_append_only_deferred_source_and_runtime_acl_are_enforced`
     admin
         .batch_execute("BEGIN; SET LOCAL ROLE role_migration_owner")
         .unwrap();
@@ -985,6 +1006,7 @@ fn owner_mutation_append_only_deferred_source_and_runtime_acl_are_enforced() {
         .get(0);
     assert_eq!(orphan_count, 0);
 
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `owner_mutation_append_only_deferred_source_and_runtime_acl_are_enforced`
     admin
         .batch_execute("BEGIN; SET LOCAL ROLE role_migration_owner")
         .unwrap();
@@ -1051,6 +1073,7 @@ fn same_expected_has_one_winner_one_p9c01_and_real_slot_wait() {
     let memory_hash = f.memory_hash.clone();
     let ids = (f.tenant, f.workspace, project, f.principal, f.memory);
     let worker = thread::spawn(move || {
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut second = Client::connect(&second_dsn, NoTls).unwrap();
         let result = publish(
             &mut second,
@@ -1140,6 +1163,7 @@ fn different_facets_do_not_wait_on_a_project_lock() {
     let hash = f.memory_hash.clone();
     let (sent, received) = mpsc::channel();
     let worker = thread::spawn(move || {
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut second = Client::connect(&second_dsn, NoTls).unwrap();
         sent.send(
             publish(
@@ -1252,6 +1276,7 @@ fn source_for_share_blocks_change_and_marker_restores_after_error() {
     let admin_dsn = f.admin_dsn.clone();
     let memory = f.memory;
     let updater = thread::spawn(move || {
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut client = Client::connect(&admin_dsn, NoTls).unwrap();
         client
             .execute(
@@ -1353,6 +1378,7 @@ fn publish_marker_restores_before_same_transaction_0133_legacy_reader() {
     let f = Fixture::new(dsn);
     let project = f.project("legacy-0133");
     let mut admin = f.admin();
+    // dep: PostgreSQL(role_gateway) — role switch before the scoped statements for `publish_marker_restores_before_same_transaction_0133_legacy_reader`
     admin
         .batch_execute("BEGIN; SET LOCAL ROLE role_gateway")
         .unwrap();
@@ -1376,6 +1402,7 @@ fn publish_marker_restores_before_same_transaction_0133_legacy_reader() {
     admin
         .query_one("SELECT set_config('humaux.workspace_id','',true)", &[])
         .unwrap();
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `publish_marker_restores_before_same_transaction_0133_legacy_reader`
     admin
         .batch_execute("SET LOCAL ROLE role_migration_owner")
         .unwrap();
@@ -1471,6 +1498,7 @@ fn role_private_worker_enqueue_preserves_0133_legacy_workspace_shared_route() {
         "devlocal_role_private_worker",
         "continuity_legacy_enqueue",
     );
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut private = Client::connect(&private_dsn, NoTls).unwrap();
     let snapshot =
         json!({"policy":"MANUAL","principal_id":user.to_string(),"allowed_workspace_ids":[]});
@@ -1515,6 +1543,7 @@ fn evidence_owner_marker_matrix_is_exact_and_real_updates_are_closed() {
 
     admin.batch_execute("BEGIN").unwrap();
     set_context(&mut admin, f.tenant, f.workspace, f.principal, Some(f.user));
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `evidence_owner_marker_matrix_is_exact_and_real_updates_are_closed`
     admin
         .batch_execute("SET LOCAL ROLE role_migration_owner")
         .unwrap();
@@ -1544,6 +1573,7 @@ fn evidence_owner_marker_matrix_is_exact_and_real_updates_are_closed() {
 
     admin.batch_execute("BEGIN").unwrap();
     set_context(&mut admin, f.tenant, f.workspace, f.principal, None);
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `evidence_owner_marker_matrix_is_exact_and_real_updates_are_closed`
     admin
         .batch_execute(
             "SET LOCAL humaux.continuity_publish='1'; SET LOCAL ROLE role_migration_owner",
@@ -1576,6 +1606,7 @@ fn evidence_owner_marker_matrix_is_exact_and_real_updates_are_closed() {
 
     admin.batch_execute("BEGIN").unwrap();
     set_context(&mut admin, f.tenant, f.workspace, f.principal, None);
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `evidence_owner_marker_matrix_is_exact_and_real_updates_are_closed`
     admin
         .batch_execute("SET LOCAL ROLE role_migration_owner")
         .unwrap();
@@ -1591,6 +1622,7 @@ fn evidence_owner_marker_matrix_is_exact_and_real_updates_are_closed() {
 
     admin.batch_execute("BEGIN").unwrap();
     set_context(&mut admin, f.tenant, f.workspace, f.principal, Some(f.user));
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `evidence_owner_marker_matrix_is_exact_and_real_updates_are_closed`
     admin
         .batch_execute(
             "SET LOCAL humaux.continuity_publish='1'; SET LOCAL ROLE role_migration_owner",
@@ -1654,6 +1686,7 @@ fn evidence_for_share_blocks_hash_change_until_publish_commit() {
     let admin_dsn = f.admin_dsn.clone();
     let evidence = f.evidence;
     let worker = thread::spawn(move || {
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&admin_dsn, NoTls).unwrap();
         admin
             .execute(

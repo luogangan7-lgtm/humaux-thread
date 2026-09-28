@@ -1,5 +1,14 @@
-//! §78.2 DB<->Rust contract for the card-22c task authorization (ADR-0046), plus the §25.4.B(1)
-//! registry-dependency contract and the DB-side privilege boundary.
+//! `adapters::tests::task_grant_contract` — §78.2 DB<->Rust contract for the card-22c task authorization (ADR-0046),
+//!   plus the §25.4.B(1) registry-dependency contract and the DB-side privilege boundary.
+//! Depends-on: crates=[humaux-domain, humaux-testkit, postgres]; services=[PostgreSQL(owner)
+//!   w=[control.private_reasoning_domains, control.tenants, control.users, private.context_bindings,
+//!   private.evidence_objects, private.memory_evidence, private.memory_records, private.task_binding_grants],
+//!   PostgreSQL(role_private_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[domain::context, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [grant closed sets round-trip by set equality against the Rust enums; revoke-only is enforced by
+//!   trigger (revoked_at is the only writable column); role_private_worker gets permission denied on INSERT; a
+//!   missing DB goes through skip_or_fail]
+//! Spec: Baseline §6.2.2; §7.3; §10.1; ADR-0046
 //!
 //! What each block pins, and the failure mode it exists for:
 //!
@@ -73,6 +82,7 @@ fn client() -> Option<Client> {
         skip_or_fail(NAME, "missing object: Postgres DSN", ExternalDep::Postgres);
         return None;
     };
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let Ok(client) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;
@@ -297,6 +307,7 @@ fn task_explicit_context_v2_negative_control_authorization_cannot_be_forged() {
     // The low-privilege boundary, attempted rather than asserted from the catalog. Inside an
     // aborted sub-transaction so nothing durable happens either way.
     let mut txn = client.transaction().expect("txn");
+    // dep: PostgreSQL(role_private_worker) — test switches PG role to exercise RLS
     txn.batch_execute("SET LOCAL ROLE role_private_worker")
         .expect("drop to the distillation role");
     // Positive control FIRST: the role is alive and can do its ordinary read. Without this, a

@@ -1,6 +1,13 @@
 // witness: family=retrieval_provider_latency_seconds labels=provider,purpose,region
-//! Metric Witness for `retrieval_provider_latency_seconds{provider,purpose,region}` (§80.2
-//! W-side; registry row §41.2; §19 Provider Health / Circuit Breaker's own latency input).
+//! `testkit::tests::metrics::retrieval_provider_latency_seconds` — Metric Witness for
+//!   `retrieval_provider_latency_seconds{provider,purpose,region}` (§80.2 W-side; registry row §41.2; §19 Provider
+//!   Health / Circuit Breaker's own latency input).
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[retrieval-provider::admission, retrieval-provider::health,
+//!   retrieval-provider::metrics]
+//! Called-by: []
+//! Invariants: [triggers the real record_provider_call and asserts observed sample-count and sum deltas per
+//!   {provider,purpose,region}]
+//! Spec: none
 //!
 //! Actively triggers `retrieval_provider::metrics::record_provider_call` — the same sole
 //! emit point [`retrieval_provider_requests_total`'s witness](../retrieval_provider_requests_total.rs)

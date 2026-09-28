@@ -1,4 +1,12 @@
-//! ADR-0012 query-embedding RPC — the Unix-domain-socket side `humaux-retrieval-worker` serves.
+//! `retrieval-worker::rpc` — ADR-0012 query-embedding RPC — the Unix-domain-socket side `humaux-retrieval-worker`
+//!   serves.
+//! Depends-on: crates=[axum, humaux-adapters, humaux-domain, humaux-local-secret-scan, humaux-retrieval,
+//!   humaux-retrieval-provider, serde, sha2, tokio, tracing,
+//!   uuid]; services=[]; env=[]; modules=[adapters::postgres, adapters::retrieval_embedding_rpc, domain::identity,
+//!   domain::ids, humaux-local-secret-scan, retrieval-provider::contract, retrieval::request]
+//! Called-by: [retrieval-worker::main, tests]
+//! Invariants: [a malformed or unauthenticated RPC frame is rejected before it reaches the embedding provider call]
+//! Spec: Baseline §2; §6; ADR-0012
 //!
 //! §决定2: the worker authenticates the **caller process** via the kernel peer credential
 //! (`UnixStream::peer_cred()`), not the request body — [`PeerIdentity::connect_info`] captures

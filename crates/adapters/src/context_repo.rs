@@ -1,4 +1,10 @@
 //! `adapters::context_repo` — §25.4 Mandatory Context Lane 的 SQL 侧。
+//! Depends-on: crates=[async-trait, humaux-application, humaux-domain, humaux-projection, humaux-retrieval, sha2, sqlx]; services=[PostgreSQL(any) r=[coord.tasks, private.memory_evidence, private.memory_records, private.memory_subjects, projection.stream_log] w=[ops.selection_snapshots, private.context_bindings, private.evidence_objects, private.task_binding_grants]]; env=[]; modules=[adapters::confirm_token_repo, adapters::distill_repo, adapters::exact_census, adapters::postgres, adapters::quota_repo, adapters::read_materialize, adapters::request_guard_repo, adapters::selection_repo, adapters::stream_repo, application::continuity, application::pin, domain::audit, domain::authority, domain::confirm, domain::context, domain::error, domain::evidence, domain::grounding, domain::identity, domain::ids, domain::memory, domain::policy, domain::selection, projection::serving, projection::stream, retrieval::compiler, retrieval::completeness, retrieval::envelope, retrieval::handoff]
+//! Called-by: [adapters::continuity_read, adapters::exact_census, adapters::memory_governance_repo, adapters::read_materialize, adapters::retrieve, gateway::context, gateway::mcp_application, gateway::memory, tests]
+//! Invariants: [pure reads on role_gateway; each selector enumerates twice without LIMIT so expected is never derived
+//!   from returned rows; both passes go through the same can_read re-check; a PG error is
+//!   DependencyUnavailable/Internal, never an empty context]
+//! Spec: Baseline §25.4; §16.2; §6.2.3
 //!
 //! 判定与类型在 [`humaux_domain::context`]（零 IO），本模块只负责发查询。分工的理由不是
 //! 洁癖：§25.4 那条「不许用 embedding similarity 解释」之所以是拓扑保证，靠的是
@@ -229,6 +235,7 @@ async fn probe_required_columns(
 /// # Errors
 /// 库不可达时返回 [`ErrorCode::Internal`]。
 pub async fn probe_selectors(pool: &RuntimeDbPool) -> Result<[SelectorAvailability; 5], ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
 
     let mut out: Vec<SelectorAvailability> = Vec::with_capacity(5);
@@ -963,6 +970,7 @@ pub async fn task_obligation_report(
     authorization: &AuthorizationScope,
     requested_scope: &Scope,
 ) -> Result<Vec<TaskObligationReport>, ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *txn)
@@ -1069,6 +1077,7 @@ pub async fn selector_outcomes(
     authorization: &AuthorizationScope,
     requested_scope: &Scope,
 ) -> Result<[SelectorOutcome; 5], ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *txn)
@@ -1102,6 +1111,7 @@ pub async fn fetch_frozen(
 ) -> Result<FrozenReads, ErrorCode> {
     let _ = canonical_scope(authorization, requested_scope)?;
 
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     // 必须是本事务第一条语句：隔离级在第一个取快照的语句之后就改不了了。
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
@@ -1635,6 +1645,7 @@ pub async fn materialize_memory_enumeration(
     let fingerprint = enumeration_fingerprint(&authorization, &scope, params.subject_id);
     let mut txn = pool
         .pool()
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         .begin()
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
@@ -1955,6 +1966,7 @@ pub async fn materialize_memory_get(
     materialized_identity(scope, expected_family, validated_key)?;
     let mut txn = pool
         .pool()
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         .begin()
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
@@ -2014,6 +2026,7 @@ pub async fn assemble_materialized(
     materialized_identity(scope, expected_family, validated_key)?;
     let mut txn = pool
         .pool()
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         .begin()
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
@@ -2207,6 +2220,7 @@ pub async fn insert_binding(
     grant: &BindingGrant,
     tenant_id: Uuid,
 ) -> Result<Uuid, ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     set_tenant_local(&mut txn, tenant_id)
         .await
@@ -2456,6 +2470,7 @@ pub async fn revoke_binding(
     tenant_id: Uuid,
     binding_id: Uuid,
 ) -> Result<bool, ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     set_tenant_local(&mut txn, tenant_id)
         .await
@@ -2994,6 +3009,7 @@ async fn write_binding_confirmed(
     validate_binding_write(auth, op, &request)?;
     let user_id = auth.user_id().ok_or(ErrorCode::Unauthorized)?.0;
     let tenant_id = auth.tenant_id().0;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     set_authorization_local(&mut txn, auth).await?;
 

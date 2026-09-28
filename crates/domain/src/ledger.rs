@@ -1,4 +1,8 @@
-//! §23.1② / §22.5 的 **A1 恒等式唯一实现处**。
+//! `domain::ledger` — §23.1② / §22.5 的 **A1 恒等式唯一实现处**。
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [adapters::consolidation_reasoner, adapters::distill_reasoner, adapters::model_call_ledger, projection::stream, retrieval-provider::adapters, retrieval::completeness, tests]
+//! Invariants: []
+//! Spec: Baseline §22.5; §15.4; §78.3
 //!
 //! §22.5 冻结：「§15.4 的 `advance_prefix` 改为复用同一个 `ledger::close`…那三行内联断言
 //! 随之删掉：**A1 的算式全库只此一处**，不会两边各写一遍再漂移。」

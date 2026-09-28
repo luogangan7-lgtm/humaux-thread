@@ -1,4 +1,8 @@
-//! H5: §76 Entitlement Projector（Phase 2 wave 实现；判据出处见 spec 家章）.
+//! `application::entitlement` — H5: §76 Entitlement Projector（Phase 2 wave 实现；判据出处见 spec 家章）.
+//! Depends-on: crates=[humaux-domain, serde_json]; services=[]; env=[]; modules=[domain::ids]
+//! Called-by: []
+//! Invariants: []
+//! Spec: §76
 //!
 //! §76 pipeline: Payment/Subscription feeds Base Entitlements, joined by Promotion/Coupon,
 //! Referral Reward, and Manual Admin Grant; all four flow into one Effective Entitlement

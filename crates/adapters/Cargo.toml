@@ -1,6 +1,7 @@
 [package]
 name = "humaux-adapters"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -26,36 +27,45 @@ test-support = ["humaux-domain/test-support"]
 # columns `email::outbox` binds (outbox_id/user_id uuid, expires_at timestamptz, payload
 # jsonb) — `sqlx::types::Uuid` is the literal `uuid::Uuid` re-export, so no separate `uuid`
 # crate entry is needed either.
+# why: typed per-role PG pools and runtime queries; used-by: [adapters::postgres, adapters::jobs, adapters::context_repo]
 sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "uuid", "time", "json"] }
 # audit_sink.rs (§77): translates humaux_domain::audit::AuditBatch to/from export bytes —
 # adapters depending on domain (not the reverse) is the normal hexagonal direction, already
 # established by humaux-application; this crate previously only pulled humaux-domain in as a
 # dev-dependency (test fixtures), promoted here to a real one for the same reason.
+# why: pure domain types this adapter reads/writes against; used-by: [adapters::postgres, adapters::affect_repo, adapters::context_repo]
 humaux-domain = { path = "../domain" }
+# why: shared contract types for the mechanism-observation adapter; used-by: [adapters::mechanism_observation]
 humaux-contracts = { path = "../contracts" }
 # `exact_census` (§22.1 census wiring): constructs `completeness::CensusResult` /
 # `ExactEnumeration` and consumes `predicate_registry::PredicateEntry` — the
 # adapters-constructs-the-pure-crate's-types direction those types' own rustdoc anticipates.
+# why: retrieval compiler/handoff types this adapter serves; used-by: [adapters::context_repo, adapters::retrieve]
 humaux-retrieval = { path = "../retrieval" }
 # Shared concrete local pinned scanner; adapter wraps it for the contribution application port.
+# why: shared pinned local secret scanner wrapped by contribution_scan; used-by: [adapters::contribution_scan]
 humaux-local-secret-scan = { path = "../local-secret-scan" }
 # §11.1 BYOK 域的生产 transport（byok.rs::EgressHttpTransport -> infra-egress raw 出口）。
 # G80-3 把 infra-network 的依赖方钉死为 {infra-egress, infra-cell}，adapters 只能间接触达。
+# why: BYOK egress transport (byok.rs); used-by: [adapters::byok]
 humaux-infra-egress = { path = "../infra-egress" }
 # T4.8 `forget_repo.rs`: `DeletionStep`/`DeletionPlan` (§37) are pure types+logic that live in
 # humaux-application so they stay unit-testable without a database (§3/§78.3 — same
 # adapters-wraps-the-pure-crate direction as `humaux-projection` below for `stream_repo.rs`).
+# why: pure application-layer types/logic this adapter wraps in SQL; used-by: [adapters::affect_repo, adapters::context_repo]
 humaux-application = { path = "../application" }
 # T3.3+T3.4 `stream_repo.rs`: `StreamKey`/`StreamLedgerSnapshot`/`advance_prefix`/
 # `StreamSlaConfig` (§15) are pure types+logic that live in humaux-projection so they stay
 # unit-testable without a database (§3/§78.3 — this crate is where the SQL wrapping them
 # belongs, not the other way around).
+# why: pure projection types/logic this adapter wraps in SQL; used-by: [adapters::affect_repo, adapters::context_repo]
 humaux-projection = { path = "../projection" }
 # ADR-0003 / §83.4 Layer 1B: `qdrant.rs`'s real upsert/search/count/verify_visible wiring goes
 # through `IntraCellHttpTransport` — this crate still does NOT depend on `reqwest` directly
 # (G80-3's manifest check stays a strict `{crates/infra-network/Cargo.toml}` equality); the
 # transport is injected by the caller (`Arc<dyn IntraCellHttpTransport>`), same DI shape
 # `humaux-domain::egress::ExternalCall` already establishes for Layer 1A.
+# why: same-Cell HTTP transport (Qdrant/mechanism-observation); used-by: [adapters::mechanism_observation]
 humaux-infra-cell = { path = "../infra-cell" }
 # H3 (§74.6) `EmailProvider` trait: the spec's own code block names this macro verbatim
 # (`#[async_trait::async_trait]`) — already resolved in the workspace lockfile (pulled in
@@ -63,16 +73,20 @@ humaux-infra-cell = { path = "../infra-cell" }
 # crate; adding it here so `email::mod` can `use` it directly instead of hand-rolling a
 # boxed-future trait (which would also lose dyn-compatibility, needed so `outbox::run_once`
 # can take `&dyn EmailProvider`).
+# why: dyn-compatible async trait objects (EmailProvider et al.); used-by: [adapters::email, adapters::context_repo]
 async-trait = "0.1"
 # H3 SMTP reference adapter (task brief item 1: "SMTP adapter（lettre...)"). `rustls` over
 # `native-tls` to avoid an OpenSSL build dependency, matching this crate's existing TLS
 # posture (sqlx above also carries no tls-* feature; production TLS choice stays a config-
 # layer decision, not a compile-time default).
+# why: SMTP reference adapter transport; used-by: [adapters::email::smtp]
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "pool"] }
 # H3 `ops.email_outbox.payload` / `ops.email_delivery_events.detail` are jsonb columns bound
 # as `serde_json::Value` (sqlx's `json` feature above only enables the Encode/Decode impls,
 # it does not re-export the crate or its `json!` macro).
+# why: jsonb column binding; used-by: [adapters::jobs, adapters::consolidate_repo]
 serde_json = "1"
+# why: timestamptz column binding; used-by: [adapters::affect_repo, adapters::distill_repo]
 time = "0.3"
 # T4.6/T4.7 `consolidate_repo.rs` (§11.7): per-row change-detection fingerprint for
 # `memory_consolidation_inputs.source_hash` (staleness check at publish time). Plain digest,
@@ -80,13 +94,16 @@ time = "0.3"
 # `domain::evidence::payload_sha256` (§48.0①/§78 "唯一构造点"); reusing it here for an
 # unrelated fingerprint would blur what it identifies. Same version pin as
 # `humaux-domain`/`humaux-application`'s existing `sha2` uses.
+# why: content fingerprint hashing; used-by: [adapters::consolidate_repo, adapters::context_repo]
 sha2 = "0.11"
 # §12.1.1: printable scanner artifact and payload digests; already resolved in the lockfile.
+# why: printable digest/scanner-artifact encoding; used-by: [adapters::contribution_entry_repo]
 hex = "0.4"
 # T4.4/T4.5 `byok.rs` (§11.1/§11.2.1): `CredentialRef`/`ReasoningDomainId` mint new ids
 # directly via `Uuid::now_v7()`, same minting convention `domain::ids`'s `uuid_newtype!` macro
 # uses — promoted from dev-only (below) to a real dependency for that reason. `v4` (dev-only
 # feature) stays alongside for test fixtures; `v7` is what production code here calls.
+# why: id minting/binding; used-by: [adapters::confirm_token_repo, adapters::byok]
 uuid = { version = "1.25.0", features = ["v7"] }
 
 [dev-dependencies]
@@ -94,12 +111,14 @@ uuid = { version = "1.25.0", features = ["v7"] }
 # active for this crate's own test builds (unit tests in src/ *and* integration tests in
 # tests/) but never for a normal `cargo build`/production build of this crate, since
 # dev-dependencies are not pulled in outside test targets. See `[features]` above.
+# why: self-reference for test-support feature; used-by: [tests]
 humaux-adapters = { path = ".", features = ["test-support"] }
 # tests/recall_envelope_g23.rs (§23.4 G23-2): `DegradeCode` to assert the exact
 # `ProjectionInvisibleLoss` fired. Dev-only — production `adapters` has no telemetry dep.
 # (`humaux-retrieval` moved to [dependencies]: `exact_census` constructs
 # `completeness::CensusResult`/`ExactEnumeration` in production code, the crate-boundary the
 # retrieval types' own docs anticipate — "adapters is this type's eventual constructor".)
+# why: DegradeCode assertions in tests; used-by: [tests]
 humaux-telemetry = { path = "../telemetry" }
 # tests/model_call_ledger.rs (T7.4, §19.1): `humaux_retrieval_provider::{cost,pricing}` — the
 # pure cost/pricing computation this crate's own `model_call_ledger` module deliberately does
@@ -108,30 +127,37 @@ humaux-telemetry = { path = "../telemetry" }
 # real build cycle; Cargo permits it here only because dev-dependencies are excluded from a
 # normal `cargo build` of this crate's library — same accepted pattern this file's own
 # `humaux-retrieval`/`humaux-telemetry` dev-deps already establish above).
+# why: cost/pricing computation used by model_call_ledger tests; used-by: [adapters::tests::model_call_ledger, tests]
 humaux-retrieval-provider = { path = "../retrieval-provider" }
 # T1.5 crates/adapters/tests/auth_scope_rls.rs: blocking client for the §62 RLS integration
 # test (same crate/version xtask already pins for its live-DB checks, no new dependency).
 # `with-serde_json-1` added for T4.6/T4.7's `tests/consolidate_snapshot.rs`: seeding
 # `private.memory_records.content` (jsonb) needs `serde_json::Value: ToSql`.
+# why: blocking client for real-Postgres integration tests; used-by: [adapters::postgres, tests]
 postgres = { version = "0.19", features = ["with-uuid-1", "with-serde_json-1"] }
 # tests/contribution_execution_0131.rs executes the exact migration manifest postcheck.
+# why: migration manifest postcheck in tests; used-by: [tests]
 toml = "1"
 # H3 `tests/email_outbox.rs`: `sqlx::types::Uuid` (the crate's own production-code alias,
 # see the `sqlx` entry above) has no random-generation feature turned on by sqlx's minimal
 # `uuid` flag — this dev-only entry adds `v4` for test fixtures' throwaway ids, matching
 # `humaux-domain`'s existing `uuid = "1.25.0"` pin so cargo resolves one shared copy.
+# why: id minting/binding; used-by: [adapters::confirm_token_repo, adapters::byok]
 uuid = { version = "1.25.0", features = ["v4"] }
 # humaux-domain (TenantId/UserId in auth_scope_rls.rs, humaux_domain::audit in audit_sink.rs
 # tests) is now a real [dependencies] entry above — available to tests without a separate
 # dev-dependency line.
 # §79.2 three-state DB fixture skip contract (DbIntegrationFixture/run_db_fixture).
+# why: three-state DB fixture skip contract; used-by: [adapters::postgres, tests]
 humaux-testkit = { path = "../testkit" }
 # G6-DB1 compile-pass/compile-fail fixtures (§6.2.3): four wrapper types must not be
 # cross-constructible / Deref'able / field-accessible outside pools.rs.
+# why: compile-pass/compile-fail fixtures; used-by: [tests]
 trybuild = "1"
 # Drives the async `sqlx` pool-connect fixtures (§6.2.3 assertion E, G6-DB2) from plain
 # `#[test]` functions via `Runtime::block_on`, alongside the sync `postgres` fixtures above.
 # `macros` added for T4.6/T4.7's `tests/consolidate_snapshot.rs`: `tokio::join!` (racing the
 # snapshot-bound selection against 60 concurrent inserts on a real thread) and
 # `tokio::task::spawn_blocking` both need it.
+# why: async runtime driving pool-connect fixtures; used-by: [adapters::postgres, tests]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

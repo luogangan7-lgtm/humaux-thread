@@ -1,4 +1,14 @@
-//! PostgreSQL 18 gate for the private-worker-owned MANUAL contribution command.
+//! `private-worker::tests::start_manual_contribution_command_0131` — PostgreSQL 18 gate for the private-worker-owned
+//!   MANUAL contribution command.
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-testkit, postgres, tokio, uuid];
+//!   services=[PostgreSQL(owner) r=[ops.contribution_execution_job_links, ops.jobs,
+//!   private.contribution_executions]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_execution_repo,
+//!   adapters::contribution_reasoner, adapters::tests::support::contribution_fixture, application::contribute,
+//!   humaux-private-worker, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [entering through StartManualContributionCommand, concurrent first creators share one migration-0131
+//!   root; no provider or scanner runs; without a DB it SKIPs unless HUMAUX_REQUIRE_DB, then panics]
+//! Spec: none
 //!
 //! This test enters through `StartManualContributionCommand`, proving that the production-core
 //! owner supplies the canonical prompt contracts and that concurrent first creators share the
@@ -23,14 +33,10 @@ use uuid::Uuid;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
+/// Env probe only; the skip goes through `humaux_testkit::skip_or_fail`, which turns a
+/// missing DSN into a failure under `HUMAUX_REQUIRE_DB=1` (§79.2, ADR-0051 D-K).
 fn require_db() -> bool {
-    match std::env::var("HUMAUX_TEST_PG_DSN") {
-        Ok(_) => true,
-        Err(_) if std::env::var("HUMAUX_REQUIRE_DB").as_deref() == Ok("1") => {
-            panic!("HUMAUX_REQUIRE_DB=1 requires HUMAUX_TEST_PG_DSN")
-        }
-        Err(_) => false,
-    }
+    std::env::var("HUMAUX_TEST_PG_DSN").is_ok()
 }
 
 fn assert_same_ids(expected: EnqueuedContributionExecution, actual: EnqueuedContributionExecution) {
@@ -61,7 +67,11 @@ fn counts(admin: &mut Client, tenant_id: Uuid, key: &str) -> (i64, i64, i64) {
 #[ignore = "lane(a:shared_db) requires disposable PostgreSQL 18 migrated through 0131"]
 fn command_owns_contracts_and_serializes_concurrent_first_creators() {
     if !require_db() {
-        eprintln!("SKIP: HUMAUX_TEST_PG_DSN is not set");
+        humaux_testkit::skip_or_fail(
+            "command_owns_contracts_and_serializes_concurrent_first_creators",
+            "HUMAUX_TEST_PG_DSN",
+            humaux_testkit::ExternalDep::Postgres,
+        );
         return;
     }
     let _serial = SERIAL.lock().expect("serialize private-worker DB gate");

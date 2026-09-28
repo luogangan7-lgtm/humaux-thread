@@ -1,4 +1,8 @@
-//! `humaux-gateway` 进程入口（最小必要进程集见 §4.2；admin 探针契约见 §4.4）。
+//! `gateway::main` — `humaux-gateway` 进程入口（最小必要进程集见 §4.2；admin 探针契约见 §4.4）。
+//! Depends-on: crates=[axum, tokio]; services=[]; env=[]; modules=[gateway::bootstrap]
+//! Called-by: [process(humaux-gateway)]
+//! Invariants: [/readyz flips to 503 and the accept loop keeps draining for DRAIN_ANNOUNCE_WINDOW before closing, so a k8s readinessProbe never sees ECONNREFUSED confused with a crash]
+//! Spec: Baseline §4.2; §4.4; ADR-0037
 //!
 //! ## Supervision surface (card 15, ADR-0037)
 //!

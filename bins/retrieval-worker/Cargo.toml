@@ -1,6 +1,7 @@
 [package]
 name = "humaux-retrieval-worker"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -8,32 +9,48 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# why: typed PG pools, repositories and wire adapters this package drives; used-by: [retrieval-worker::main, retrieval-worker::rpc]
 humaux-adapters = { path = "../../crates/adapters" }
+# why: domain ids, errors and value types shared across layers; used-by: [retrieval-worker::main, retrieval-worker::rpc, tests]
 humaux-domain = { path = "../../crates/domain" }
+# why: same-Cell transport and CellAccessPermit for Qdrant/UDS calls; used-by: [retrieval-worker::main]
 humaux-infra-cell = { path = "../../crates/infra-cell" }
 # T7.1 `EmbeddingProvider`/`embedding_provider_for`/`EmbeddingModelDescriptor` — this
 # binary is the one legal place to name both `humaux-adapters` and `humaux-retrieval-provider`
 # together (no cycle: neither depends on this crate) — see
 # `crates/adapters/src/projection_worker.rs`'s `CardEmbedder` doc for why `humaux-adapters`
 # itself cannot.
+# why: embedding provider router/adapters; used-by: [retrieval-worker::main, retrieval-worker::rpc]
 humaux-retrieval-provider = { path = "../../crates/retrieval-provider" }
+# why: pinned local secret scanner that seals egress payloads; used-by: [retrieval-worker::main, retrieval-worker::rpc]
 humaux-local-secret-scan = { path = "../../crates/local-secret-scan" }
 # Same pin as crates/retrieval-provider and crates/telemetry — no [workspace.dependencies]
 # refactor (query_embed_rpc card §6 resolution).
+# why: structured logs/spans; used-by: [retrieval-worker::rpc]
 tracing = "0.1.44"
+# why: projection cards/serving types for recall and ingest; used-by: [retrieval-worker::main]
 humaux-projection = { path = "../../crates/projection" }
 # ADR-0012 `rpc.rs`: `humaux_retrieval::request::{RetrievalIntent, build_request,
 # resolve_registered_retrieval_profile}` — sealing the RPC's raw query text needs the same
 # sole request constructor every other caller uses (§55.1), not a worker-local shortcut.
+# why: retrieval request/envelope/planner (sole request constructor, §55.1); used-by: [retrieval-worker::rpc]
 humaux-retrieval = { path = "../../crates/retrieval" }
+# why: object-safe async traits for ports and transports; used-by: [retrieval-worker::main]
 async-trait = "0.1"
 # ADR-0012: `axum::serve` over a `tokio::net::UnixListener` (axum 0.8 native `Listener` impl)
 # is this binary's RPC transport — same pin sibling bins already use.
+# why: HTTP/UDS server framework; used-by: [retrieval-worker::main, retrieval-worker::rpc]
 axum = "0.8.9"
+# why: derive (de)serialization for wire/DTO types; used-by: [retrieval-worker::rpc]
 serde = { version = "1", features = ["derive"] }
+# dep-map: allow cargo-usedby — declared but named by no module today (removal is a code change, out of card 26 scope)
+# why: JSON payloads and envelopes; used-by: [none]
 serde_json = "1"
 # Matches `crates/adapters`/`crates/local-secret-scan`'s existing sha2 0.11 pin — no second
 # independent version in the dependency graph.
+# why: sha256 digests for hashes, fingerprints and scope_hash; used-by: [retrieval-worker::rpc]
 sha2 = "0.11"
+# why: async runtime; used-by: [retrieval-worker::main, retrieval-worker::rpc]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+# why: UUID ids (v7) and parsing; used-by: [retrieval-worker::main, retrieval-worker::rpc, tests]
 uuid = { version = "1.25.0", features = ["v7", "serde"] }

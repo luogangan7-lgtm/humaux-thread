@@ -1,4 +1,15 @@
-//! Real PostgreSQL races for §12.1.1. Input mutation must serialize with finalization;
+//! `adapters::tests::contribution_authorization` — Real PostgreSQL races for §12.1.1.
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, postgres, tokio, uuid];
+//!   services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.reasoning_domain_grants, private.events,
+//!   private.evidence_objects, private.memory_evidence], PostgreSQL(role_private_worker)]; env=[HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::contribution_entry_repo, adapters::postgres, adapters::tests::support::contribution_fixture,
+//!   application::contribute, domain::identity]
+//! Called-by: [cargo-test]
+//! Invariants: [input mutation serializes with finalization and generic reasoning grants never authorize or revoke a
+//!   self-principal contribution; the PG tests are #[ignore] lane tests run by xtask serial-lane]
+//! Spec: none
+//!
+//! Input mutation must serialize with finalization;
 //! generic reasoning grants never authorize or revoke a self-principal contribution.
 
 #[path = "support/contribution_fixture.rs"]
@@ -24,6 +35,7 @@ fn race_input_change(change: &str) {
     let candidate = f.prepare();
     let confirmation = f.confirm(candidate);
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL fixture");
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `race_input_change`
     let mut writer = Client::connect(&dsn, NoTls).unwrap();
     let bad_evidence = if change == "backing" {
         let other_domain:Uuid=writer.query_one("INSERT INTO control.private_reasoning_domains(tenant_id,name) VALUES($1,'other-domain') RETURNING reasoning_domain_id",&[&f.auth.tenant_id().0]).unwrap().get(0);
@@ -49,6 +61,7 @@ fn race_input_change(change: &str) {
     let worker = thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            // dep: PostgreSQL(role_private_worker) — opens the role-scoped connection for `race_input_change`
             let pool = PrivateWorkerDbPool::connect(&role_dsn).await.unwrap();
             ready.send(()).unwrap();
             ContributionEntryRepo::new(&pool)

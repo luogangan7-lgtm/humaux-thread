@@ -1,4 +1,8 @@
 //! `projection::fingerprint` — processing input fingerprint (§16.1 / §16.1.1).
+//! Depends-on: crates=[humaux-domain, sha2]; services=[]; env=[]; modules=[domain::evidence]
+//! Called-by: [private-worker::distill, tests]
+//! Invariants: []
+//! Spec: Baseline §1.2.1; §11; §36; §16.1.1
 //!
 //! `source_hash` proves the *processing input* (Evidence set + processor/model/prompt/parser
 //! versions + context snapshot) was identical between two runs — it does **not** prove the

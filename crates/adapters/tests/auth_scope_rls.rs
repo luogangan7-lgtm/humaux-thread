@@ -1,7 +1,15 @@
-//! T1.5 integration test — §6.1/§62 RLS defense in depth: a request transaction sets
-//! `SET LOCAL humaux.tenant_id`/`humaux.user_id`, and PostgreSQL Row Level Security enforces
-//! tenant isolation independently of the application-layer `can_read` predicate
-//! (`humaux_domain::identity::can_read`, unit-tested in that crate).
+//! `adapters::tests::auth_scope_rls` — T1.5 integration test — §6.1/§62 RLS defense in depth: a request transaction
+//!   sets `SET LOCAL humaux.tenant_id`/`humaux.user_id`, and PostgreSQL Row Level Security enforces tenant isolation
+//!   independently of the application-layer `can_read` predicate (`humaux_domain::identity::can_read`, unit-tested in
+//!   that crate).
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, uuid];
+//!   services=[PostgreSQL(any) w=[control.workspace_memberships, private.evidence_objects, private.memory_evidence,
+//!   private.memory_records]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::credential_repo,
+//!   adapters::tests::support::operation_receipt_fixture, domain::ids, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [builds and drops its own scratch schema and role (the real private schema is never touched); no DSN,
+//!   unreachable DB or failed fixture DDL is a visible SKIP (DbFixtureSkipReason, §79.2)]
+//! Spec: Baseline §62; §6.1; §79.2
 //!
 //! Self-contained fixture: builds its own scratch schema, table, non-superuser test role,
 //! and the exact §62 policy shape, instead of depending on canonical DDL from the sibling
@@ -54,6 +62,7 @@ impl DbIntegrationFixture for RlsFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `isolate`
         let mut client = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -99,6 +108,7 @@ fn rls_tenant_context_via_set_local() {
         // context — proves "正确 tenant 可读写自己的行" also covers the write side.
         {
             let mut txn = handle.client.transaction().expect("begin seed transaction");
+            // dep: PostgreSQL(any) — role switch before the scoped statements for `rls_tenant_context_via_set_local`
             txn.batch_execute(&format!(
                 "SET LOCAL ROLE {ROLE};
                  SET LOCAL humaux.tenant_id = '{tenant_a}';
@@ -121,6 +131,7 @@ fn rls_tenant_context_via_set_local() {
                 .client
                 .transaction()
                 .expect("begin cross-tenant transaction");
+            // dep: PostgreSQL(any) — role switch before the scoped statements for `rls_tenant_context_via_set_local`
             txn.batch_execute(&format!(
                 "SET LOCAL ROLE {ROLE};
                  SET LOCAL humaux.tenant_id = '{tenant_b}';"
@@ -158,6 +169,7 @@ fn rls_tenant_context_via_set_local() {
                 .client
                 .transaction()
                 .expect("begin no-context transaction");
+            // dep: PostgreSQL(any) — role switch before the scoped statements for `rls_tenant_context_via_set_local`
             txn.batch_execute(&format!("SET LOCAL ROLE {ROLE};"))
                 .expect("set local role only, no tenant context");
             let row = txn
@@ -177,6 +189,7 @@ fn rls_tenant_context_via_set_local() {
                 .client
                 .transaction()
                 .expect("begin own-tenant read transaction");
+            // dep: PostgreSQL(any) — role switch before the scoped statements for `rls_tenant_context_via_set_local`
             txn.batch_execute(&format!(
                 "SET LOCAL ROLE {ROLE};
                  SET LOCAL humaux.tenant_id = '{tenant_a}';"

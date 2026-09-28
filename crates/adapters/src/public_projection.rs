@@ -1,4 +1,11 @@
-//! Public Qdrant projection writes (§17.6).
+//! `adapters::public_projection` — Public Qdrant projection writes (§17.6).
+//! Depends-on: crates=[async-trait, hex, humaux-domain, humaux-infra-cell, serde_json, sha2, uuid];
+//!   services=[Qdrant(*)]; env=[]; modules=[adapters::public_repo, adapters::qdrant, domain::error,
+//!   infra-cell::permit, infra-cell::transport]
+//! Called-by: [public-worker::main, tests]
+//! Invariants: [writes only the public payload contract through the same-cell transport; no dense vector, private
+//!   payload, tenant or database seam; a Qdrant failure is DependencyUnavailable]
+//! Spec: none
 //!
 //! This adapter is deliberately narrow: it writes only the public payload contract through the
 //! same-cell HTTP transport. It has no dense vector, private payload, tenant, or database seam.
@@ -86,6 +93,7 @@ impl<'a> PublicProjectionAdapter<'a> {
         }
         let live_filter = json!({"must":[{"key":"projection_live","match":{"value":true}}]});
         let body = json!({"query":{"text":text,"model":"qdrant/bm25"},"using":"bm25","limit":limit.get(),"with_payload":true,"with_vector":false,"filter":live_filter.clone(),"params":{"idf":{"corpus":live_filter}}});
+        // dep: Qdrant(*) — Qdrant REST call for `query_live`
         let response = self
             .transport
             .execute(
@@ -198,6 +206,7 @@ impl<'a> PublicProjectionAdapter<'a> {
         if insert_only {
             request["update_mode"] = json!("insert_only");
         }
+        // dep: Qdrant(*) — Qdrant REST call for `write`
         let response = self
             .transport
             .execute(
@@ -216,6 +225,7 @@ impl<'a> PublicProjectionAdapter<'a> {
                 body: response.json_body,
             });
         }
+        // dep: Qdrant(*) — Qdrant REST call for `write`
         let verify = self
             .transport
             .execute(

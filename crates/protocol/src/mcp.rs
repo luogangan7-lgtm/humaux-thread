@@ -1,4 +1,9 @@
-//! Native, stateless MCP-over-HTTP adapter.
+//! `protocol::mcp` — Native, stateless MCP-over-HTTP adapter.
+//! Depends-on: crates=[async-trait, axum, humaux-domain, rmcp, serde, serde_json, uuid]; services=[]; env=[];
+//!   modules=[domain::error, protocol::error_map]
+//! Called-by: [gateway::bootstrap, gateway::guard, gateway::mcp_application, gateway::recall, protocol::mcp_catalog, tests]
+//! Invariants: []
+//! Spec: none
 //!
 //! This module owns the rmcp/Axum boundary.  It deliberately exposes a
 //! small application port instead of routing directly into a domain handler:

@@ -1,5 +1,10 @@
-//! `humaux-private-worker` process entry (§4.2 minimal process set; §4.4 admin probe
-//! contract; §11/§11.1 T4.4+T4.5; §11.8 ADR-0015 inference RPC).
+//! `private-worker::main` — `humaux-private-worker` process entry (§4.2 minimal process set; §4.4 admin probe
+//!   contract; §11/§11.1 T4.4+T4.5; §11.8 ADR-0015 inference RPC).
+//! Depends-on: crates=[humaux-adapters, humaux-domain, tokio, uuid]; services=[PostgreSQL(role_private_worker)]; env=[HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_DISTILL_BATCH, HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH, HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS, HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_KEY_ENV, HUMAUX_PRIVATE_WORKER_MODEL_ID, HUMAUX_PRIVATE_WORKER_MODEL_REVISION, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_PROVIDER_ID, HUMAUX_PRIVATE_WORKER_REGION, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, PRIVATE_WORKER_PG_DSN]; modules=[adapters::byok, adapters::byok::ssrf, adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::disclosure, adapters::postgres, domain::egress, private-worker::distill, private-worker::inference_rpc]
+//! Called-by: [process(humaux-private-worker)]
+//! Invariants: [the only process holding both role_private_worker DB write and BYOK decrypt capability (§11.1); a
+//!   missing/invalid env value or unreachable DSN exits non-zero before serving]
+//! Spec: Baseline §11.1; §11.8; §78.1; ADR-0037; ADR-0036; ADR-0016
 //!
 //! §11.1: "仅 humaux-private-worker 在最贴近 adapter 处解密" — this is the one process in the
 //! workspace permitted to hold both DB write capability (`PrivateWorkerDbPool`,
@@ -105,6 +110,7 @@ async fn probe_connection() {
                 "humaux-private-worker: PRIVATE_WORKER_PG_DSN not set, not wired yet (Phase 4 scaffold)"
             );
         }
+        // dep: PostgreSQL(role_private_worker) — role-scoped pool call
         Ok(dsn) => match PrivateWorkerDbPool::connect(&dsn).await {
             Ok(_pool) => println!("humaux-private-worker: connected as role_private_worker"),
             Err(e) => eprintln!("humaux-private-worker: {e}"),
@@ -126,6 +132,7 @@ async fn probe_connection() {
 ///   that actually dials it.
 async fn readyz() -> Result<(), String> {
     let dsn = required("PRIVATE_WORKER_PG_DSN")?;
+    // dep: PostgreSQL(role_private_worker) — role-scoped pool call
     PrivateWorkerDbPool::connect(&dsn)
         .await
         .map_err(|e| format!("PostgreSQL as role_private_worker ({e})"))?;
@@ -287,6 +294,7 @@ async fn bootstrap() -> Result<Bootstrap, String> {
         .validate()
         .map_err(|code| format!("invalid configuration: {code:?}"))?;
 
+    // dep: PostgreSQL(role_private_worker) — role-scoped pool call
     let pool = PrivateWorkerDbPool::connect(&dsn)
         .await
         .map_err(|e| format!("private worker database role connection failed: {e}"))?;

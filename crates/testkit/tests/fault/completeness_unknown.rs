@@ -1,6 +1,9 @@
-//! §53.4 注错测试：`DegradeCode::CompletenessUnknown` 的一条注错记录（每个 reason
-//! 必须有一条测试，从未触发过的 reason 不许合并，§53.3 规则2 的三数相等
-//! 把这句话变成 CI 事实）。
+//! `testkit::tests::fault::completeness_unknown` — §53.4 注错测试：`DegradeCode::CompletenessUnknown` 的一条注错记录（每个 reason
+//!   必须有一条测试，从未触发过的 reason 不许合并，§53.3 规则2 的三数相等 把这句话变成 CI 事实）。
+//! Depends-on: crates=[humaux-telemetry]; services=[]; env=[]; modules=[humaux-testkit, telemetry::degrade]
+//! Called-by: [testkit::tests::fault_main]
+//! Invariants: []
+//! Spec: Baseline §52.2; §53.4; §53.1
 //!
 //! 结果返回但完备性类别无法确定（§52.2 与 ErrorCode::CannotEstablishCompleteness 概念对，§53.4 照变体语义注入）。
 //!

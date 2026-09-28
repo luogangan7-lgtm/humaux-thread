@@ -1,9 +1,16 @@
-//! ADR-0003 / §83.4 Layer 1B real-connectivity smoke test: upsert → search-visible confirmation
-//! against a real Qdrant instance on loopback, through the full
-//! `IntraCellResourceRegistry` → `authorize_cell_access` → `HttpIntraCellTransport` path — no
-//! mock transport, no injected DNS resolver, exactly the production wiring
-//! `crates/adapters/src/qdrant.rs`'s `upsert`/`scroll_by_ids`/`verify_visible_via_transport`
-//! callers would use.
+//! `adapters::tests::qdrant_live` — ADR-0003 / §83.4 Layer 1B real-connectivity smoke test: upsert → search-visible
+//!   confirmation against a real Qdrant instance on loopback, through the full `IntraCellResourceRegistry` →
+//!   `authorize_cell_access` → `HttpIntraCellTransport` path — no mock transport, no injected DNS resolver, exactly
+//!   the production wiring `crates/adapters/src/qdrant.rs`'s `upsert`/`scroll_by_ids`/`verify_visible_via_transport`
+//!   callers would use.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, humaux-projection, humaux-testkit, sqlx,
+//!   tokio, uuid]; services=[Qdrant(*)]; env=[HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::qdrant, domain::authority,
+//!   domain::dataclass, domain::identity, domain::ids, domain::memory, humaux-testkit, infra-cell::permit,
+//!   infra-cell::resource, infra-cell::transport, projection::card]
+//! Called-by: [cargo-test]
+//! Invariants: [§57.1 three-state gate: an unreachable Qdrant prints the missing object and returns not_applicable
+//!   via skip_or_fail (red under HUMAUX_REQUIRE_QDRANT); cross-tenant filters are proven against the real cluster]
+//! Spec: Baseline §57.1
 //!
 //! §57.1: a three-state gate, not pass/fail — if Qdrant is unreachable at the configured loopback port this
 //! prints which object is missing and returns (`not_applicable`) instead of failing the suite.
@@ -54,6 +61,7 @@ fn qdrant_addr() -> String {
 }
 
 fn qdrant_reachable() -> bool {
+    // dep: Qdrant(*) — reachability probe for `qdrant_reachable`
     TcpStream::connect_timeout(&qdrant_addr().parse().unwrap(), Duration::from_millis(500)).is_ok()
 }
 
@@ -84,6 +92,7 @@ async fn delete_test_collection(
     let response = transport
         .execute(
             permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
             IntraCellRequest {
                 method: IntraCellMethod::Delete,
                 path: format!("/collections/{collection}"),
@@ -166,6 +175,7 @@ async fn upsert_then_search_visible_round_trips_over_real_qdrant() {
         let root = transport
             .execute(
                 &permit,
+                // dep: Qdrant(*) — Qdrant wire call for this fixture
                 IntraCellRequest {
                     method: IntraCellMethod::Get,
                     path: "/".to_string(),
@@ -193,6 +203,7 @@ async fn upsert_then_search_visible_round_trips_over_real_qdrant() {
         let create = transport
             .execute(
                 &permit,
+                // dep: Qdrant(*) — Qdrant wire call for this fixture
                 IntraCellRequest {
                     method: IntraCellMethod::Put,
                     path: format!("/collections/{body_collection}"),
@@ -210,6 +221,7 @@ async fn upsert_then_search_visible_round_trips_over_real_qdrant() {
         let index = transport
             .execute(
                 &permit,
+                // dep: Qdrant(*) — Qdrant wire call for this fixture
                 IntraCellRequest {
                     method: IntraCellMethod::Put,
                     path: format!("/collections/{body_collection}/index"),
@@ -227,6 +239,7 @@ async fn upsert_then_search_visible_round_trips_over_real_qdrant() {
         let subject_index = transport
             .execute(
                 &permit,
+                // dep: Qdrant(*) — Qdrant wire call for this fixture
                 IntraCellRequest {
                     method: IntraCellMethod::Put,
                     path: format!("/collections/{body_collection}/index"),

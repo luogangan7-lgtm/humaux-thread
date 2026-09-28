@@ -1,6 +1,9 @@
-//! §53.4 注错测试：`DegradeCode::StatePinMissing` 的一条注错记录（每个 reason
-//! 必须有一条测试，从未触发过的 reason 不许合并，§53.3 规则2 的三数相等
-//! 把这句话变成 CI 事实）。
+//! `testkit::tests::fault::state_pin_missing` — §53.4 注错测试：`DegradeCode::StatePinMissing` 的一条注错记录（每个 reason
+//!   必须有一条测试，从未触发过的 reason 不许合并，§53.3 规则2 的三数相等 把这句话变成 CI 事实）。
+//! Depends-on: crates=[humaux-telemetry]; services=[]; env=[]; modules=[humaux-testkit, telemetry::degrade]
+//! Called-by: [testkit::tests::fault_main]
+//! Invariants: []
+//! Spec: Baseline §53.4; §53.1
 //!
 //! 调用没有可用的 state_pin（§53.4 照变体语义注入）。
 //!

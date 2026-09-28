@@ -1,4 +1,11 @@
-//! §34.0.1 local `remember.put`: one transaction for business, BMO, audit, and receipt.
+//! `adapters::operation_receipt` — §34.0.1 local `remember.put`: one transaction for business, BMO, audit, and
+//!   receipt.
+//! Depends-on: crates=[humaux-domain, sqlx, time, uuid]; services=[PostgreSQL(any) r=[control.memberships, control.tenants, control.users, private.evidence_objects, projection.stream_log] w=[control.operation_receipts]]; env=[]; modules=[adapters::postgres, adapters::quota_repo, adapters::remember, adapters::request_guard_repo, adapters::retrieve, domain::audit, domain::error, domain::evidence, domain::identity, domain::ids]
+//! Called-by: [gateway::guard, tests]
+//! Invariants: [receipts are written in the operation's own transaction; a failed COMMIT response is an unknown
+//!   outcome, never permission to repeat the write; tenant/visibility failures are TenantBoundary/NotFound]
+//! Spec: none
+//!
 //! A failed COMMIT response is an unknown outcome, never permission to repeat a write.
 
 use std::time::Duration;
@@ -182,6 +189,7 @@ pub async fn remember_atomically(
     let auth = validate(auth, &request)?;
     let replay_duration =
         time::Duration::try_from(request.replay_ttl).map_err(|_| ErrorCode::InvalidInput)?;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     let prior = lock_and_find_receipt(&mut txn, &auth, &request).await?;
     if let Some(prior) = prior {

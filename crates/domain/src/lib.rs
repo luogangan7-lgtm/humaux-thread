@@ -1,4 +1,8 @@
 //! `humaux-domain` — Humaux Thread workspace crate（布局见 §58）。
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [crate(humaux-adapters), crate(humaux-application), crate(humaux-consolidation-worker), crate(humaux-gateway), crate(humaux-infra-cell), crate(humaux-infra-egress), crate(humaux-local-secret-scan), crate(humaux-private-worker), crate(humaux-projection), crate(humaux-protocol), crate(humaux-public-worker), crate(humaux-retrieval), crate(humaux-retrieval-provider), crate(humaux-retrieval-worker), crate(humaux-telemetry), crate(humaux-testkit), crate(xtask)]
+//! Invariants: []
+//! Spec: Baseline §3; §58; §78.3
 //!
 //! 本 crate 的职责边界与依赖规则以 docs/architecture/Baseline_2.9.md 为唯一规范真源；
 //! Domain 永不 import HTTP / SQLx / Qdrant / Provider SDK / ENV（§3 / §78.3）。

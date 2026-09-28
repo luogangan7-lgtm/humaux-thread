@@ -1,5 +1,11 @@
-//! `adapters::memory_governance_repo` — §36 `memory.supersede`, the first confirm-gated
-//! governance write (ADR-0018, D-C).
+//! `adapters::memory_governance_repo` — §36 `memory.supersede`, the first confirm-gated governance write (ADR-0018,
+//!   D-C).
+//! Depends-on: crates=[hex, humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time, uuid]; services=[PostgreSQL(any) r=[ops.memory_lifecycle_events, private.evidence_objects, private.memory_evidence] w=[private.memory_records] x=[ops.append_memory_lifecycle]]; env=[]; modules=[adapters::affect_repo, adapters::confirm_token_repo, adapters::context_repo, adapters::distill_repo, adapters::postgres, adapters::quota_repo, adapters::remember, adapters::request_guard_repo, adapters::retrieve, adapters::subject_repo, application::archive, application::correct, application::supersede, domain::affect, domain::audit, domain::authority, domain::confirm, domain::error, domain::evidence, domain::identity, domain::ids, domain::lifecycle, domain::memory, domain::subject, projection::stream]
+//! Called-by: [gateway::mcp_application, gateway::memory]
+//! Invariants: [one role_gateway transaction: BMO reserve -> confirm token consume -> visibility -> successor rule ->
+//!   conditional UPDATE -> lifecycle ticket; the UPDATE's WHERE is the only status judge (0 rows = Conflict); any
+//!   failure rolls back everything]
+//! Spec: Baseline §7; §15; ADR-0018; ADR-0020
 //!
 //! One `role_gateway` transaction, in this order, every step rolling the whole thing back:
 //! reserve BMO -> consume the confirm token ([`crate::confirm_token_repo::consume_in_txn`],
@@ -317,6 +323,7 @@ pub async fn supersede_atomically(
     request: SupersedeRequest,
 ) -> Result<SupersedeOutcome, ErrorCode> {
     validate(auth, &request)?;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
 
@@ -608,6 +615,7 @@ pub async fn restore_atomically(
 ) -> Result<RestoreResult, ErrorCode> {
     validate_restore(auth, &request)?;
     let idempotency_key = lifecycle_idempotency_key(&request.claim);
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
 
@@ -949,6 +957,7 @@ pub async fn archive_or_unarchive_atomically(
     validate_archive(auth, &request)?;
     let op = request.op;
     let idempotency_key = lifecycle_idempotency_key(&request.claim);
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
 
@@ -1334,6 +1343,7 @@ pub async fn correct_atomically(
 ) -> Result<CorrectDone, ErrorCode> {
     validate_correct(auth, &request)?;
     let idempotency_key = lifecycle_idempotency_key(&request.claim);
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
 

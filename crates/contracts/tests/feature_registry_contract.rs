@@ -1,5 +1,10 @@
-//! Contract test for `config/features.toml`（§50.1 每条 feature 的 `contract_test` 字段指向此
-//! 文件；G50-1 第 5 条要求该文件存在且没有 `#[ignore]`）。
+//! `contracts::tests::feature_registry_contract` — Contract test for `config/features.toml`（§50.1 每条 feature 的
+//!   `contract_test` 字段指向此 文件；G50-1 第 5 条要求该文件存在且没有 `#[ignore]`）。
+//! Depends-on: crates=[]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[contracts::feature_registry]
+//! Called-by: [cargo-test]
+//! Invariants: [the real config/features.toml must parse and its Phase 17 closed set must be exactly the nine §50.1
+//!   feature ids; a missing file fails the test]
+//! Spec: Baseline §50.1
 //!
 //! 校验对象是仓库里真实的 `config/features.toml`：它必须能被
 //! `humaux_contracts::feature_registry::parse_features_toml` 解析成功，且 Phase 17 初始闭集

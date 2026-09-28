@@ -1,4 +1,14 @@
-//! Actual §1.14 runtime observations and immutable E2E execution receipts.
+//! `adapters::mechanism_observation` — Actual §1.14 runtime observations and immutable E2E execution receipts.
+//! Depends-on: crates=[humaux-contracts, humaux-domain, humaux-infra-cell, serde_json, sha2, sqlx];
+//!   services=[PostgreSQL(any) r=[public.claim_trust_evaluations, public.claims, public.consensus_ready,
+//!   public.corroborated, public.eligible_objects] w=[ops.mechanism_e2e_runs, ops.mechanism_observations]]; env=[];
+//!   modules=[adapters::postgres, adapters::public_repo, contracts::mechanism_registry, domain::error,
+//!   domain::identity, infra-cell::resource]
+//! Called-by: [admin::mechanism, tests, xtask::mechanism_registry]
+//! Invariants: [reads use the dedicated read-only identity; recording runs on role_maintenance through an existing
+//!   authorized operation; no SQL or shell executor is exposed; bad input is InvalidInput]
+//! Spec: none
+//!
 //! Reading uses the dedicated read-only identity. Recording uses maintenance and
 //! calls an existing authorized business operation; it exposes no SQL/shell executor.
 
@@ -126,6 +136,7 @@ pub async fn read_target(
 ) -> Result<RuntimeObservations, ErrorCode> {
     let deployment_id = uuid(&target.deployment_id)?;
     let cell_id = uuid(&target.cell_id)?;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *txn)
@@ -215,6 +226,7 @@ async fn public_scan(
            clock_timestamp() AS measured_at \
          FROM public.eligible_objects p JOIN public.claims c ON c.claim_id=p.object_id AND p.object_kind='CLAIM' \
          JOIN public.claim_trust_evaluations e ON e.evaluation_id=c.current_evaluation_id")
+        // dep: PostgreSQL(any) — executes a query against the pool
         .fetch_one(pool.pool()).await.map_err(db_error)?;
     Ok((
         row.try_get("scanned_n").map_err(db_error)?,
@@ -311,6 +323,7 @@ async fn observe_public_review(
     }
     let specs = parse_registry(SPEC_TEXT).map_err(|_| ErrorCode::Internal)?;
     let started: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        // dep: PostgreSQL(any) — executes a query against the pool
         .fetch_one(writer.pool())
         .await
         .map_err(db_error)?;
@@ -318,9 +331,11 @@ async fn observe_public_review(
     let result = crate::public_repo::evaluate_claim(business, authorization, input).await?;
     let after = public_scan(writer).await?;
     let completed: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        // dep: PostgreSQL(any) — executes a query against the pool
         .fetch_one(writer.pool())
         .await
         .map_err(db_error)?;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = writer.pool().begin().await.map_err(db_error)?;
     for (ch, before_value, after_value, name) in [
         (12, before.1, after.1, "public.consensus_ready@1"),

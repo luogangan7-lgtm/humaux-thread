@@ -1,3 +1,16 @@
+//! `xtask::serial_lane` — card 23 serial isolated lane runner for #[ignore]d DB/Qdrant tests.
+//! Depends-on: crates=[postgres]; services=[PostgreSQL(any), Qdrant(*), subprocess(cargo), subprocess(humaux-*)];
+//!   env=[CARGO, CARGO_MANIFEST_DIR, CARGO_TARGET_DIR, HUMAUX_0132_GATE_MODE, HUMAUX_ADMIN_PG_DSN,
+//!   HUMAUX_GATEWAY_PG_DSN, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MECHANISM_ADMIN_BIN, HUMAUX_MECHANISM_FIXTURE,
+//!   HUMAUX_PUBLIC_PROVENANCE_FAULT_DB, HUMAUX_REQUIRE_DB, HUMAUX_RETRIEVAL_WORKER_PG_DSN,
+//!   HUMAUX_SERIAL_LANE_WARM_SECS, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_PG_DSN, HUMAUX_TEST_QDRANT_PORT];
+//!   modules=[xtask::migrate]
+//! Called-by: [xtask::main]
+//! Invariants: [every #[ignore] carries lane(a|b|c) in its reason and an ignored test without one reds the gate;
+//!   lane(a) resources are provisioned before the run; a missing dependency is a failure under HUMAUX_REQUIRE_DB,
+//!   never a SKIP]
+//! Spec: Baseline §79.2; ADR-0047
+//!
 //! `cargo xtask serial-lane` — card 23's serial isolated lane for the `#[ignore]`d tests.
 //!
 //! # Why this exists
@@ -340,6 +353,7 @@ fn ensure_database_through(
 ) -> Result<(), String> {
     let postgres_dsn = dsn_with_database(admin_dsn, "postgres")
         .ok_or_else(|| "cannot rewrite the admin DSN onto the `postgres` database".to_string())?;
+    // dep: PostgreSQL(any) — postgres_dsn, serial lane target database
     let mut client = postgres::Client::connect(&postgres_dsn, postgres::NoTls)
         .map_err(|e| format!("cannot connect to provision {database}: {e}"))?;
     let exists = client
@@ -400,6 +414,7 @@ fn drop_provisioned() {
         println!("serial-lane: --drop-provisioned: this run created no database");
         return;
     }
+    // dep: PostgreSQL(any) — postgres_dsn, serial lane target database
     let mut client = match postgres::Client::connect(&postgres_dsn, postgres::NoTls) {
         Ok(client) => client,
         Err(e) => {
@@ -465,6 +480,7 @@ fn admin_binary() -> Result<PathBuf, String> {
         std::env::var("CARGO_TARGET_DIR").map_or_else(|_| root.join("target"), PathBuf::from);
     let path = target_dir.join("debug").join("humaux-admin");
     if !path.is_file() {
+        // dep: subprocess(cargo) — cargo build/test invocation for the serial lane
         let built = Command::new(env!("CARGO"))
             .args(["build", "-p", "humaux-admin"])
             .current_dir(root)
@@ -511,6 +527,7 @@ fn provision(resource: Resource) -> Result<EnvOverrides, String> {
         Resource::Qdrant => {
             let port = std::env::var("HUMAUX_TEST_QDRANT_PORT")
                 .map_err(|_| "missing object: HUMAUX_TEST_QDRANT_PORT".to_string())?;
+            // dep: Qdrant(*) — HUMAUX_TEST_QDRANT_PORT reachability probe
             std::net::TcpStream::connect_timeout(
                 &format!("127.0.0.1:{port}")
                     .parse()
@@ -576,6 +593,7 @@ fn provision(resource: Resource) -> Result<EnvOverrides, String> {
             let login_target = dsn_with_database(&admin_login, DB).ok_or_else(|| {
                 "cannot rewrite HUMAUX_ADMIN_PG_DSN onto the fixture database".to_string()
             })?;
+            // dep: PostgreSQL(any) — login_target, credential check
             postgres::Client::connect(&login_target, postgres::NoTls).map_err(|e| {
                 format!("missing object: HUMAUX_ADMIN_PG_DSN (role_admin login): {e}")
             })?;
@@ -625,6 +643,7 @@ fn provision(resource: Resource) -> Result<EnvOverrides, String> {
 /// A binary that cannot be warmed is not fatal: it still gets its real run, it just keeps the
 /// host risk it had before.
 fn warm(binary: &Path, args: &[&str]) -> Option<std::process::Child> {
+    // dep: subprocess(humaux-*) — launches the watched process by its resolved binary path
     Command::new(binary)
         .args(args)
         .env_clear()
@@ -651,6 +670,7 @@ fn warm_up(packages: &[String], targets: &BTreeSet<String>) -> Duration {
         children.extend(warm(Path::new(&scanner), &["version"]));
     }
     for package in packages {
+        // dep: subprocess(cargo) — cargo build/test invocation for the serial lane
         let out = Command::new(env!("CARGO"))
             .arg("test")
             .arg("-p")
@@ -743,6 +763,7 @@ fn run_group(
     tests: &[&Entry],
     tally: &mut Tally,
 ) {
+    // dep: subprocess(cargo) — cargo build/test invocation for the serial lane
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args(["test", "-p", package]);
     match target {

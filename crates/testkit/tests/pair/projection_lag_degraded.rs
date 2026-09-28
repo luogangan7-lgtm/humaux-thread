@@ -1,5 +1,11 @@
-//! §52.2 概念对登记表 row 1（`ErrorCode::ProjectionLag` / `DegradeCode::ProjectionLag`）
-//! 的降级侧，G52-5 成对测试。terminal 侧见同目录 `projection_lag_terminal.rs`。
+//! `testkit::tests::pair::projection_lag_degraded` — §52.2 概念对登记表 row 1（`ErrorCode::ProjectionLag` /
+//!   `DegradeCode::ProjectionLag`） 的降级侧，G52-5 成对测试。
+//! Depends-on: crates=[humaux-domain, humaux-telemetry]; services=[]; env=[]; modules=[domain::error, telemetry::degrade]
+//! Called-by: [testkit::tests::pair_main]
+//! Invariants: []
+//! Spec: Baseline §52.2
+//!
+//! terminal 侧见同目录 `projection_lag_terminal.rs`。
 //!
 //! 分界判据（§52.2 表）：不要求 read-your-write 且已返回滞后结果 ⇒ 降级。
 

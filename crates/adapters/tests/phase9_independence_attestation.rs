@@ -1,4 +1,19 @@
-//! Real-PostgreSQL acceptance for the protected Phase 9 anti-Sybil aggregate.
+//! `adapters::tests::phase9_independence_attestation` — Real-PostgreSQL acceptance for the protected Phase 9
+//!   anti-Sybil aggregate.
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, postgres, sha2, uuid];
+//!   services=[PostgreSQL(any) r=[control.anonymous_source_lineage, ops.public_anonymous_dispatches, public.claims,
+//!   staging.contribution_releases, staging.sanitized_public_candidates] w=[public.anonymous_source_authority_events,
+//!   public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.provenance_edges,
+//!   public.source_closure, public.sources] x=[ops.claim_global_anonymous_public_dispatches,
+//!   public.admit_anonymous_dispatch, public.attest_current_claim_independence, public.current_public_roots,
+//!   public.phase9_public_coverage_for_probe], PostgreSQL(role_migration_owner)]; env=[HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::contribution_entry_repo, adapters::tests::support::contribution_fixture,
+//!   application::consolidate, application::contribute, domain::error, domain::evidence]
+//! Called-by: [cargo-test]
+//! Invariants: [the fixture uses the real assessed prepare -> confirm -> finalize -> anonymous admit path, never a
+//!   seeded shortcut; the tests are #[ignore] lane tests]
+//! Spec: Baseline §12; §79.2
+//!
 //! The fixture uses the real assessed prepare -> confirm -> finalize -> anonymous admit path.
 
 #[path = "support/contribution_fixture.rs"]
@@ -168,6 +183,7 @@ fn publish(fixture: &mut ContributionFixture, candidate: &str) -> Root {
     let source_id: Uuid = binding.get(0);
     let envelope: Vec<u8> = binding.get(1);
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL");
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut public = Client::connect(&dsn_as_role(&dsn, "role_public_worker"), NoTls)
         .expect("public-worker setup connection");
     let lease_owner = "phase9-independence-attestation";
@@ -221,6 +237,7 @@ fn merge_roots(admin: &mut Client, target: Uuid, roots: &[&Root]) {
         .expect("target claim")
         .get(0);
     let mut transaction = admin.transaction().expect("root merge transaction");
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `merge_roots`
     transaction
         .batch_execute("SET LOCAL ROLE role_migration_owner")
         .expect("migration-owner fixture path");
@@ -294,6 +311,7 @@ fn protected_independence_attestation_is_fail_closed_aggregate_and_exactly_once(
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL through 0124");
     let role_dsn = dsn_as_role(&dsn, "role_public_worker");
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut public = Client::connect(&role_dsn, NoTls).expect("public-worker connection");
 
     let mut principal_a = ContributionFixture::new();
@@ -352,6 +370,7 @@ fn protected_independence_attestation_is_fail_closed_aggregate_and_exactly_once(
             let thread_barrier = Arc::clone(&barrier);
             let thread_body = distinct_body.clone();
             std::thread::spawn(move || {
+                // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
                 let mut connection = Client::connect(&thread_dsn, NoTls).unwrap();
                 thread_barrier.wait();
                 attest(
@@ -403,6 +422,7 @@ fn protected_independence_attestation_is_fail_closed_aggregate_and_exactly_once(
     let missing_source = Uuid::new_v4();
     let missing_envelope = vec![71_u8; 32];
     let mut missing = principal_b.admin.transaction().unwrap();
+    // dep: PostgreSQL(role_migration_owner) — role switch before the scoped statements for `protected_independence_attestation_is_fail_closed_aggregate_and_exactly_once`
     missing
         .batch_execute("SET LOCAL ROLE role_migration_owner")
         .unwrap();

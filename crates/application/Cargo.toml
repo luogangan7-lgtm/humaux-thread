@@ -1,6 +1,7 @@
 [package]
 name = "humaux-application"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -9,28 +10,41 @@ workspace = true
 
 [dependencies]
 # Phase 2 identity/entitlement modules (§74/§75/§76). Versions: latest stable.
+# why: domain types every use case reads/returns; used-by: [application::affect, application::archive, application::auth, application::confirm, application::consolidate, application::continuity, application::contribute, application::contribution_execution, application::correct, application::entitlement, application::notify, application::pin, application::public_evolve, application::referral, application::retrieval_embedding_port, application::supersede]
 humaux-domain = { path = "../domain" }
 # §25.3 continuity：assemble_handoff 产出 retrieval::handoff::Handoff（G80-31 字节域）。
 # retrieval 只依赖 domain+telemetry，无环。
+# why: assemble_handoff's return type crosses into retrieval::handoff; used-by: [application::continuity, application::retrieve]
 humaux-retrieval = { path = "../retrieval" }
+# why: password hashing for auth.rs's H2 state machine; used-by: [application::auth]
 argon2 = "0.5"
+# why: token/RNG source for auth, referral codes and supersede confirm tokens; used-by: [application::auth, application::referral, application::supersede]
 rand = "0.9"
 # §74.2/§73.5: HMAC-SHA256 keyed hash for verification codes, same construction and version
 # pins as `crates/protocol` already resolved for `control.api_keys.key_hash` — reused, not a
 # second independent version in the dependency graph.
+# why: verification-code HMAC; used-by: [application::auth]
 hmac = "0.13"
+# why: token/handoff sha256 digests; used-by: [application::auth, application::consolidate, application::continuity, application::contribute, application::contribution_execution, application::referral]
 sha2 = "0.11"
+# why: hex-encoding digest/token bytes for storage and comparison; used-by: [application::auth, application::consolidate, application::continuity, application::contribute, application::referral]
 hex = "0.4"
+# why: wire/DTO (de)serialization for continuity handoff and notify payloads; used-by: [application::continuity, application::notify]
 serde = { version = "1", features = ["derive"] }
+# why: JSON payload construction for continuity/contribution_execution/entitlement/notify; used-by: [application::continuity, application::contribution_execution, application::entitlement, application::notify]
 serde_json = "1"
+# dep-map: allow cargo-usedby — declared but named by no module today; kept for the use-case error type (removal is a code change, out of card 26 scope)
+# why: not currently named by any module in this crate; used-by: [none]
 thiserror = "2"
 # T4.6/T4.7 §11.8: `PrivateReasoningPort` is the spec's own verbatim code block, `#[async_trait]`
 # included — same macro already resolved in the workspace lockfile via `humaux-adapters`'s
 # `email::EmailProvider` trait (its Cargo.toml doc explains the object-safety reason: a plain
 # `async fn` in a trait is not `dyn`-compatible, and callers need `&dyn PrivateReasoningPort`).
+# why: object-safe async ports (PrivateReasoningPort et al.); used-by: [application::consolidate, application::continuity, application::contribute, application::retrieval_embedding_port]
 async-trait = "0.1"
 # `consolidate::PrivateReasoningDomainId`'s inner id — same pin as `humaux-domain`'s existing
 # `uuid = "1.25.0"`, no new independent version in the dependency graph.
+# why: entity ids threaded through every use case; used-by: [application::affect, application::confirm, application::consolidate, application::continuity, application::contribute, application::contribution_execution, application::correct, application::pin, application::public_evolve, application::retrieval_embedding_port]
 uuid = "1.25.0"
 
 [dev-dependencies]
@@ -39,4 +53,5 @@ uuid = "1.25.0"
 # dev-dependency version pin (that crate drives its async fixtures via `Runtime::block_on`
 # instead of this macro — either is fine, `#[tokio::test]` is simply the smaller diff for a
 # single self-contained async test with no cross-test runtime sharing to worry about).
+# why: async executor for #[tokio::test] fixtures of async ports; used-by: [tests]
 tokio = { version = "1", features = ["macros", "rt"] }

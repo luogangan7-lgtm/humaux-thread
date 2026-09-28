@@ -1,4 +1,9 @@
 //! `retrieval::candidate` — §24 Candidate Builder + §63 rerank token-budget pack.
+//! Depends-on: crates=[]; services=[];
+//!   env=[]; modules=[]
+//! Called-by: [retrieval::compiler, tests]
+//! Invariants: []
+//! Spec: §24; §63
 //!
 //! §24: "不要直接取 RRF top-N" — coverage-aware allocation reserves budget per facet *before*
 //! ranking, so one loud recall lane (typically `dense`) cannot flood out every other facet's

@@ -1,3 +1,9 @@
+//! `xtask::benchset_declaration` — G80-16 benchset-declaration-check: §69 benchmark set-denominator declaration table shape.
+//! Depends-on: crates=[]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[xtask::phase]
+//! Called-by: [xtask::main]
+//! Invariants: [missing any of the 7 §55.3 fields ⇒ NOT_DECLARED; an owning phase past due while still NOT_DECLARED ⇒ fail]
+//! Spec: Baseline §69; §55
+//!
 //! xtask `benchset-declaration` — G80-16 benchset-declaration-check.
 //! 判据以 §69「Benchmark 集合分母声明」节为唯一真源：表恰 10 行、
 //! `set_id` 与 §55 集合清单逐名对齐、「判定」格禁现 legacy `NO_DOD_ITEM`、§55.3 七字段

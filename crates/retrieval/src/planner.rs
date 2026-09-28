@@ -1,4 +1,9 @@
 //! `retrieval::planner` — deterministic Retrieval Planner (§20).
+//! Depends-on: crates=[]; services=[];
+//!   env=[]; modules=[retrieval::predicate_registry]
+//! Called-by: [gateway::recall, retrieval::completeness, retrieval::envelope, retrieval::predicate_eval, retrieval::request, tests]
+//! Invariants: []
+//! Spec: §20; §20.0; §20.2; §20.1; §22.5
 //!
 //! §20.0: online recall/context/continuity must never implicitly call an LLM/VLM
 //! (USER_REASONING · PLATFORM_PUBLIC · private consolidation · HyDE/generative rewrite ·
@@ -306,6 +311,7 @@ mod tests {
     /// The real scope string, post migration 0079's tenant-filter fix (`enumerable_scope`
     /// column value; see that migration's header note).
     const SCOPE: &str =
+        // dep-map: allow table-undeclared — predicate scope metadata; SQL is executed by adapters::exact_census
         "private.memory_records WHERE tenant_id = $1 AND visibility_workspace_id = $2";
 
     /// Built through [`load_registry`] rather than a `PredicateEntry { .. }` struct literal —

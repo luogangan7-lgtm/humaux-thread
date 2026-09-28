@@ -1,3 +1,9 @@
+//! `xtask::card_version` — §18.4 CI gate: RetrievalCard builder-version to template-hash uniqueness.
+//! Depends-on: crates=[humaux-projection]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[projection::card]
+//! Called-by: [xtask::main]
+//! Invariants: [one (card_builder_version, card_template_hash) pair workspace-wide; a hash mismatch against the real template ⇒ fail]
+//! Spec: Baseline §18.4
+//!
 //! xtask `card-version` — §18.4 CI 闸: RetrievalCard's single version axis
 //! (`card_builder_version`) must pair with exactly one `card_template_hash` workspace-wide,
 //! and `card_template_hash` must actually match the template it claims to fingerprint.

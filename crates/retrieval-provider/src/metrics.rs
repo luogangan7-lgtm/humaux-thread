@@ -1,6 +1,9 @@
-//! `retrieval-provider::metrics` — §19 **Provider Plane Observability** / §41.2 registry: the
-//! four `retrieval_provider_*` families.
-//!
+//! `retrieval-provider::metrics` — §19 **Provider Plane Observability** / §41.2 registry: the four
+//!   `retrieval_provider_*` families.
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[retrieval-provider::admission]
+//! Called-by: [retrieval-provider::adapters, tests]
+//! Invariants: []
+//! Spec: §19; §41.2
 // ponytail: process-local `Mutex<HashMap<..>>` counters, not a real `prometheus::*Vec`
 // registration — this workspace has no Prometheus client dependency anywhere yet (see
 // `telemetry::degrade`'s `DEGRADE_TOTAL`, the one precedent, whose own doc names the same

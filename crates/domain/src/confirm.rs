@@ -1,6 +1,10 @@
-//! `domain::confirm` — §33.10 rule 9: destructive MCP actions must not assume the client
-//! supports MRTR; the two-step fallback is `first call -> confirmation_required +
-//! confirm_token`, `second call(confirm_token) -> execute` (ADR-0018).
+//! `domain::confirm` — §33.10 rule 9: destructive MCP actions must not assume the client supports MRTR; the two-step
+//!   fallback is `first call -> confirmation_required + confirm_token`, `second call(confirm_token) -> execute`
+//!   (ADR-0018).
+//! Depends-on: crates=[sha2]; services=[]; env=[]; modules=[domain::error]
+//! Called-by: [adapters::confirm_token_repo, adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, application::archive, application::pin, application::supersede, domain::context, gateway::guard, gateway::mcp_application, gateway::memory, tests, xtask::architecture_check]
+//! Invariants: []
+//! Spec: Baseline §78.2; §52.1
 //!
 //! Two closed types, no strings (§78.2):
 //! - [`DestructiveOp`] is the closed set of operations that go through the gate. Its

@@ -1,4 +1,11 @@
-//! Transactional production core for an explicit MANUAL contribution start command.
+//! `adapters::contribution_execution_ingress` — Transactional production core for an explicit MANUAL contribution
+//!   start command.
+//! Depends-on: crates=[humaux-application, humaux-domain, sqlx]; services=[PostgreSQL(any)]; env=[]; modules=[adapters::contribution_entry_repo, adapters::contribution_execution_repo, adapters::postgres, application::contribute, application::contribution_execution, domain::error]
+//! Called-by: [humaux-private-worker, tests]
+//! Invariants: [accepts only an already-verified authorization scope plus an ID-free request and idempotency key;
+//!   PostgreSQL stays the authority for policy, rights, hashes, admission and the job chain; malformed input is
+//!   InvalidInput before any write]
+//! Spec: none
 //!
 //! External authentication and transport stay deployment-owned. This adapter accepts only an
 //! already-verified authorization scope plus the ID-free preparation request and caller
@@ -90,6 +97,7 @@ impl<'a> ContributionExecutionIngress<'a> {
             return Err(ErrorCode::InvalidInput.into());
         }
 
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         let mut txn = self.pool.pool().begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .execute(&mut *txn)

@@ -1,5 +1,16 @@
-//! §11 BYOK 域的 live 冒烟：MiniMax M3 经 `OpenAiCompatibleProvider` + `EgressHttpTransport`
-//! 真打一次，全链 = 铸 permit → 披露 reserve → 外呼 → 披露 finalize → 断言。
+//! `adapters::tests::minimax_live_smoke` — §11 BYOK 域的 live 冒烟：MiniMax M3 经 `OpenAiCompatibleProvider` +
+//!   `EgressHttpTransport` 真打一次，全链 = 铸 permit → 披露 reserve → 外呼 → 披露 finalize → 断言。
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, tokio,
+//!   uuid]; services=[PostgreSQL(any) r=[ops.data_disclosures] w=[control.private_reasoning_domains, control.tenants,
+//!   private.events, private.evidence_objects], PostgreSQL(role_private_worker), MiniMax];
+//!   env=[HUMAUX_MINIMAX_DNS_PINS, HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY]; modules=[adapters::byok,
+//!   adapters::byok::ssrf, adapters::disclosure, adapters::postgres, domain::dataclass, domain::egress, domain::ids,
+//!   humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [no key -> SKIP (ExternalDep::MiniMax); key but no DB -> SKIP;
+//!   HUMAUX_REQUIRE_MINIMAX/HUMAUX_REQUIRE_DB with the dependency missing -> panic (ADR-0005); with both present any
+//!   Err panics (fail-loud)]
+//! Spec: Baseline §19; §11.3; §11.1; ADR-0005
 //!
 //! 与 §19 的 `dashscope_live_smoke` 是姊妹：那条走 PlatformManaged 域
 //! （`HttpExternalCall`，401 = `Unauthorized`），本条走 BYOK 域（明文 key 唯一展开点在
@@ -176,6 +187,7 @@ fn setup_db() -> Option<Fixture> {
         );
         return None;
     };
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;
@@ -334,6 +346,7 @@ fn minimax_live_smoke() {
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
     let rt_result = rt.block_on(async {
+        // dep: PostgreSQL(role_private_worker) — open a role-scoped PG connection/pool for this test
         let pool = PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker"))
             .await
             .expect("private worker pool");
@@ -419,6 +432,7 @@ fn minimax_live_smoke() {
     // 披露行校验在 async 块**外**：同步 `postgres::Client` 内部自起 tokio runtime，
     // 放在 block_on 里是 runtime 套 runtime，当场 panic（实测踩过）。
     let disclosure_id = rt_result;
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut admin2 = Client::connect(&f.dsn, NoTls).expect("verify conn");
     let row = admin2
         .query_one(
@@ -441,6 +455,7 @@ fn g5_a_failed_call_still_finalizes_its_disclosure_row() {
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
     let rt_result = rt.block_on(async {
+        // dep: PostgreSQL(role_private_worker) — open a role-scoped PG connection/pool for this test
         let pool = PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker"))
             .await
             .expect("private worker pool");
@@ -485,6 +500,7 @@ fn g5_a_failed_call_still_finalizes_its_disclosure_row() {
 
     // 同主冒烟：同步 Client 必须在 block_on 之外。
     let disclosure_id = rt_result;
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut admin2 = Client::connect(&f.dsn, NoTls).expect("verify conn");
     let row = admin2
         .query_one(

@@ -1,5 +1,11 @@
-//! `adapters::retrieval_embedding_rpc` — ADR-0012 repository for
-//! `ops.retrieval_embedding_rpc_calls` (migration 0141).
+//! `adapters::retrieval_embedding_rpc` — ADR-0012 repository for `ops.retrieval_embedding_rpc_calls` (migration
+//!   0141).
+//! Depends-on: crates=[sqlx]; services=[PostgreSQL(any) w=[ops.retrieval_embedding_rpc_calls]];
+//!   env=[]; modules=[adapters::postgres]
+//! Called-by: [gateway::retrieval_embedding_client, retrieval-worker::rpc, tests]
+//! Invariants: [the gateway side only INSERTs/SELECTs registrations and the retrieval-worker side only
+//!   claims/finishes them (disjoint column GRANTs, 0141); both set humaux.tenant_id first; bad input is InvalidInput]
+//! Spec: none
 //!
 //! One module for both sides of the RPC because they share one row shape under one RLS-scoped
 //! table with disjoint column GRANTs (migration 0141): [`GatewayRetrievalEmbeddingRegistrations`]
@@ -99,6 +105,7 @@ impl<'a> GatewayRetrievalEmbeddingRegistrations<'a> {
         {
             return Err(RetrievalEmbeddingRpcError::InvalidInput);
         }
+        // dep: PostgreSQL(any) — transaction entry for `register`
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, call.tenant_id).await?;
         let inserted = sqlx::query(
@@ -212,6 +219,7 @@ impl<'a> RetrievalWorkerEmbeddingCalls<'a> {
         query_sha256: [u8; 32],
         claimed_by: &str,
     ) -> Result<ClaimOutcome, RetrievalEmbeddingRpcError> {
+        // dep: PostgreSQL(any) — transaction entry for `load_and_claim`
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_hint).await?;
         let row = sqlx::query(
@@ -328,6 +336,7 @@ impl<'a> RetrievalWorkerEmbeddingCalls<'a> {
                     Some(failure_code),
                 ),
             };
+        // dep: PostgreSQL(any) — transaction entry for `finish`
         let mut txn = self.pool.pool().begin().await?;
         set_tenant_local(&mut txn, tenant_id).await?;
         sqlx::query(

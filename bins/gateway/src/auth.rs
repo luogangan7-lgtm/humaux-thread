@@ -1,4 +1,12 @@
-//! §73.5.1 headless authentication. Credentials and live grants come from the
+//! `gateway::auth` — §73.5.1 headless authentication.
+//! Depends-on: crates=[humaux-adapters, humaux-domain,
+//!   humaux-protocol]; services=[]; env=[]; modules=[adapters::credential_repo, adapters::postgres, domain::error,
+//!   domain::identity, domain::ids, protocol::edge]
+//! Called-by: [gateway::guard, tests]
+//! Invariants: [a PAT's allowed_workspace_ids is always an intersection of the live ACTIVE membership set with the credential's bound workspace; a stale binding whose membership was revoked yields Forbidden, never a silent tenant-wide downgrade]
+//! Spec: Baseline §73.5.1; §6.1.1; §33; ADR-0035
+//!
+//! Credentials and live grants come from the
 //! database; tool arguments never supply a principal, user, or workspace grant.
 //!
 //! §6.1.1 / ADR-0035 (card 13): a PAT's `allowed_workspace_ids` is derived per request from the

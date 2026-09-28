@@ -1,5 +1,11 @@
-//! `#[fail_closed(threat = "...")]` marks a function as fail-closed for a named threat
-//! model (§53.6: "每个 fail-closed 必须有明确 threat model"). This is §53.6's fail-closed
+//! `humaux-fail-closed-macro` — `#[fail_closed(threat = "...")]` marks a function as fail-closed for a named threat
+//!   model (§53.6: "每个 fail-closed 必须有明确 threat model").
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[]
+//! Called-by: [crate(humaux-telemetry)]
+//! Invariants: []
+//! Spec: Baseline §53.6
+//!
+//! This is §53.6's fail-closed
 //! generation source for `cargo xtask direction-table` (G80-9) — that gate reads workspace
 //! source text directly (like every other xtask gate in this repo; see
 //! `xtask/src/architecture_check.rs`), not this macro's expanded output, so the only thing

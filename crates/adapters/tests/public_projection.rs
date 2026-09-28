@@ -1,4 +1,10 @@
-//! Real Qdrant acceptance tests for the public projection adapter (§17.6).
+//! `adapters::tests::public_projection` — Real Qdrant acceptance tests for the public projection adapter (§17.6).
+//! Depends-on: crates=[humaux-adapters, humaux-infra-cell, humaux-testkit, serde_json, tokio, uuid]; services=[Qdrant(*)];
+//!   env=[HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::public_projection, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport]
+//! Called-by: [cargo-test]
+//! Invariants: [writes only the public payload contract into a throwaway collection; no Qdrant port goes through
+//!   skip_or_fail (red under HUMAUX_REQUIRE_QDRANT)]
+//! Spec: Baseline §17.6; §79.2
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::TcpStream;
@@ -32,6 +38,7 @@ fn setup() -> Option<(
     humaux_infra_cell::CellAccessPermit,
     String,
 )> {
+    // dep: Qdrant(*) — reachability probe for `setup`
     if TcpStream::connect_timeout(
         &format!("127.0.0.1:{}", qdrant_port()).parse().unwrap(),
         Duration::from_millis(500),
@@ -91,6 +98,7 @@ async fn create_collection(
     let response = transport
         .execute(
             permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
             IntraCellRequest {
                 method: IntraCellMethod::Put,
                 path: format!("/collections/{collection}"),
@@ -114,6 +122,7 @@ async fn create_collection(
         "body_sha256",
         "projection_live",
     ] {
+        // dep: Qdrant(*) — Qdrant wire call for this fixture
         let response = transport.execute(permit, IntraCellRequest {
             method: IntraCellMethod::Put,
             path: format!("/collections/{collection}/index"),
@@ -135,6 +144,7 @@ async fn delete_collection(
     let response = transport
         .execute(
             permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
             IntraCellRequest {
                 method: IntraCellMethod::Delete,
                 path: format!("/collections/{collection}"),
@@ -260,6 +270,7 @@ async fn delayed_live_rejects_corrupted_tombstone_readback() {
     let corrupt = transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
             IntraCellRequest {
                 method: IntraCellMethod::Put,
                 path: format!("/collections/{collection}/points?wait=true"),
@@ -335,6 +346,7 @@ async fn bm25_query_excludes_false_live_vector_and_uses_same_idf_corpus_filter()
     let poisoned = transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
             IntraCellRequest {
                 method: IntraCellMethod::Put,
                 path: format!("/collections/{collection}/points?wait=true"),
@@ -371,6 +383,7 @@ async fn bm25_query_excludes_false_live_vector_and_uses_same_idf_corpus_filter()
     let global = transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
             IntraCellRequest {
                 method: IntraCellMethod::Post,
                 path: format!("/collections/{collection}/points/query"),

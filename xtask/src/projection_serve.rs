@@ -1,3 +1,12 @@
+//! `xtask::projection_serve` — §16.2 blue/green switch: flips which projection version recall reads.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, postgres, tokio, uuid];
+//!   services=[PostgreSQL(any), PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_PG_DSN];
+//!   modules=[adapters::postgres, adapters::serving_repo, adapters::stream_repo, domain::ids, projection::serving,
+//!   xtask::switch_visible]
+//! Called-by: [xtask::main]
+//! Invariants: [runs under HUMAUX_MAINTENANCE_PG_DSN, the only role with UPDATE(serving, shadow) on the checkpoint row (§6.2.2)]
+//! Spec: Baseline §16.2; §16.3; §6.2.2
+//!
 //! `cargo xtask projection-serve` — the §16.2 blue/green switch that makes a projection
 //! version the one `recall` reads (`projection.stream_checkpoints.serving`). Ops action, not a
 //! test fixture: the projection worker only advances highwaters, it never flips `serving`;
@@ -154,6 +163,7 @@ pub fn run(args: &[String]) -> i32 {
     };
     println!("projection-serve: visible shadow={shadow:?} serving={serving:?}");
 
+    // dep: PostgreSQL(role_maintenance) — HUMAUX_MAINTENANCE_PG_DSN, serve-switch target database
     let pool = match rt.block_on(MaintenanceDbPool::connect(&dsn)) {
         Ok(p) => p,
         Err(e) => {
@@ -238,6 +248,7 @@ fn visible_inputs(
     flags: &Flags,
     rt: &tokio::runtime::Runtime,
 ) -> Result<(VisiblePair, Option<String>), String> {
+    // dep: PostgreSQL(role_maintenance) — HUMAUX_MAINTENANCE_PG_DSN connect
     let mut db = Client::connect(dsn, NoTls).map_err(|e| format!("role_maintenance: {e}"))?;
     let family = &flags.family;
     db.batch_execute(&format!("SET humaux.tenant_id = '{}'", family.tenant_id.0))

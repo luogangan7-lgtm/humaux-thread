@@ -1,4 +1,14 @@
-//! §83: one business admission path for every canonical MCP operation.
+//! `gateway::guard` — §83: one business admission path for every canonical MCP operation.
+//! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-domain, humaux-protocol, serde_json, sha2,
+//!   time, tokio, uuid]; services=[]; env=[]; modules=[adapters::confirm_token_repo, adapters::operation_receipt,
+//!   adapters::postgres, adapters::quota_repo, adapters::remember, adapters::request_guard_repo,
+//!   application::supersede, domain::affect, domain::audit, domain::confirm, domain::error, domain::identity,
+//!   domain::ids, domain::selection, domain::subject, gateway::auth, protocol::edge, protocol::mcp,
+//!   protocol::mcp_catalog]
+//! Called-by: [gateway::bootstrap, gateway::mcp_application, gateway::memory, tests]
+//! Invariants: [transport owns HTTP validation only; this layer is the sole place that authenticates, authorizes and admits a request, so an operation that bypasses it is a bug, not a variant path]
+//! Spec: Baseline §83; §52.1; ADR-0018; ADR-0028; ADR-0030
+//!
 //! Transport owns HTTP validation; this layer owns authentication through finalization.
 
 use std::{

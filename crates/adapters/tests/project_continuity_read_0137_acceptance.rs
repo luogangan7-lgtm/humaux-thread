@@ -1,3 +1,15 @@
+//! `adapters::tests::project_continuity_read_0137_acceptance` — Hostile-state acceptance for 0137 continuity reads: ACL, malformed authority context and storage damage all fail closed.
+//! Depends-on: crates=[humaux-domain, postgres, serde_json, uuid]; services=[PostgreSQL(any) r=[control.tenants,
+//!   ops.outbox, private.continuity_projects] w=[private.continuity_facet_memory_links,
+//!   private.continuity_facet_slots, private.continuity_facet_versions, private.evidence_objects,
+//!   private.memory_evidence, private.memory_records] x=[private.read_continuity_project_storage_v1]];
+//!   env=[HUMAUX_CONTINUITY_RESTART_PHASE, HUMAUX_CONTINUITY_RESTART_STATE];
+//!   modules=[adapters::tests::support::continuity_0137_fixture, domain::error]
+//! Called-by: [cargo-test]
+//! Invariants: [the live role ACL is exact and read-only attempts fail; malformed authority context, structural
+//!   damage and array mispairing all fail closed as CannotEstablishCompleteness, never current/complete]
+//! Spec: Baseline §25.3.1; §79.2
+//!
 #[path = "support/continuity_0137_fixture.rs"]
 mod continuity_0137_fixture;
 
@@ -1092,6 +1104,7 @@ fn directed_fault_guard_panic_cleanup_preserves_global_acl() {
         move || Fixture::panic_after_partial_seed(dsn, partial_tenant)
     }));
     assert!(partial_panic.is_err());
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut partial_admin = Client::connect(&dsn, NoTls).expect("partial-seed census connect");
     let partial_remaining: i64 = partial_admin
         .query_one(
@@ -1151,6 +1164,7 @@ fn directed_fault_guard_panic_cleanup_preserves_global_acl() {
 
     drop(admin);
     let mut admin =
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         Client::connect(&target_admin_dsn, NoTls).expect("unwind cleanup census connect");
     let residues: (i64, i64) = {
         let row = admin

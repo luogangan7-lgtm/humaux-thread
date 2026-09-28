@@ -1,5 +1,10 @@
-//! `retrieval::predicate_eval` — §20.3 confusion-matrix calculator for the `planner_predicate`
-//! eval set (`evals/planner_predicate/dataset.tsv`).
+//! `retrieval::predicate_eval` — §20.3 confusion-matrix calculator for the `planner_predicate` eval set
+//!   (`evals/planner_predicate/dataset.tsv`).
+//! Depends-on: crates=[]; services=[];
+//!   env=[]; modules=[retrieval::planner, retrieval::predicate_registry]
+//! Called-by: [tests]
+//! Invariants: []
+//! Spec: §20.3
 //!
 //! §20.3 freezes the judgement as asymmetric:
 //! - **漏判 (miss)**: expected a `predicate_id`, [`crate::planner::decide`] returned none —
@@ -100,6 +105,7 @@ mod tests {
     use crate::predicate_registry::{PredicateEntry, PredicateRow, load_registry};
 
     const SCOPE: &str =
+        // dep-map: allow table-undeclared — predicate scope metadata; SQL is executed by adapters::exact_census
         "private.memory_records WHERE tenant_id = $1 AND visibility_workspace_id = $2";
 
     /// Built through [`load_registry`] rather than a `PredicateEntry { .. }` struct literal —

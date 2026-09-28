@@ -1,4 +1,15 @@
-//! §73.5.1 real PostgreSQL acceptance. Only a dedicated loopback fixture is writable.
+//! `gateway::tests::service_credentials` — §73.5.1 real PostgreSQL acceptance.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, humaux-testkit, postgres, sqlx, tokio];
+//!   services=[PostgreSQL(role_gateway), PostgreSQL(role_migration_owner) w=[control.api_keys, control.memberships,
+//!   control.tenants, control.users, control.workspace_memberships, control.workspaces] x=[control.api_key_lookup,
+//!   control.api_key_touch_last_used], PostgreSQL(role_public_worker)]; env=[HUMAUX_GATEWAY_PG_DSN,
+//!   HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres, domain::error, domain::ids, gateway::auth, humaux-testkit,
+//!   protocol::edge]
+//! Called-by: [cargo-test]
+//! Invariants: [each test provisions its own PostgreSQL role/credential rows and tears them down; no test relies on another test's credential state]
+//! Spec: Baseline §73.5.1; §6.1.1; ADR-0035
+//!
+//! Only a dedicated loopback fixture is writable.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
@@ -93,6 +104,7 @@ impl DbIntegrationFixture for CredentialFixture {
         if options.get_host() != "127.0.0.1" || dsn.contains(['?', '#']) {
             return Err(setup_failed(()));
         }
+        // dep: PostgreSQL(role_migration_owner) — test fixture pool for the service-credentials suite
         let mut admin = Client::connect(&dsn, NoTls).map_err(setup_failed)?;
         let actual_db: String = admin
             .query_one("SELECT current_database()", &[])
@@ -110,6 +122,7 @@ impl DbIntegrationFixture for CredentialFixture {
         {
             return Err(setup_failed(()));
         }
+        // dep: PostgreSQL(role_migration_owner) — test fixture pool for the service-credentials suite
         let mut gateway = Client::connect(&gateway_dsn, NoTls).map_err(setup_failed)?;
         let identity = gateway
             .query_one(
@@ -124,6 +137,7 @@ impl DbIntegrationFixture for CredentialFixture {
         }
         let rt = tokio::runtime::Runtime::new().map_err(setup_failed)?;
         let runtime = rt
+            // dep: PostgreSQL(role_gateway) — test fixture pool for the service-credentials suite
             .block_on(RuntimeDbPool::connect(&gateway_dsn))
             .map_err(setup_failed)?;
         let tenant = Uuid::now_v7();
@@ -512,10 +526,12 @@ fn credential_lookup_is_gateway_only_and_direct_table_reads_stay_rls_scoped() {
         );
         let error = f
             .gateway
+            // dep: PostgreSQL(role_migration_owner) — SET ROLE to role_migration_owner to seed the credential fixture
             .batch_execute("SET ROLE role_migration_owner")
             .expect_err("gateway login cannot become the trusted owner");
         assert_eq!(error.code().map(|code| code.code()), Some("42501"));
         let mut txn = db_ok(f.admin.transaction());
+        // dep: PostgreSQL(role_public_worker) — SET LOCAL ROLE back after seeding
         db_ok(txn.batch_execute("SET LOCAL ROLE role_public_worker"));
         let error = txn
             .query(

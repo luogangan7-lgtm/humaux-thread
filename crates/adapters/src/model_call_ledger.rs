@@ -1,8 +1,16 @@
-//! `adapters::model_call_ledger` — `ops.model_call_ledger` two-phase ledger writer (§19.1,
-//! T7.4), same reserve()->finalize() shape as `adapters::disclosure` (§7.4): [`reserve_call`]
-//! inserts identity columns + a pre-call cost estimate before the external provider call is
-//! made, `status='RESERVED'`; [`finalize_call`] fills in the token/latency/actual-cost/
-//! error columns and flips `status` to `SUCCEEDED`/`FAILED` after the call returns. Every
+//! `adapters::model_call_ledger` — `ops.model_call_ledger` two-phase ledger writer (§19.1, T7.4), same
+//!   reserve()->finalize() shape as `adapters::disclosure` (§7.4): [`reserve_call`] inserts identity columns + a
+//!   pre-call cost estimate before the external provider call is made, `status='RESERVED'`; [`finalize_call`] fills
+//!   in the token/latency/actual-cost/ error columns and flips `status` to `SUCCEEDED`/`FAILED` after the call
+//!   returns.
+//! Depends-on: crates=[humaux-application, humaux-domain, sqlx]; services=[PostgreSQL(any) r=[control.provider_pricing_versions, ops.data_disclosures] w=[ops.model_call_ledger, ops.tenant_cost_events]]; env=[]; modules=[adapters::postgres, adapters::reasoning_route_admission, application::consolidate, domain::ledger]
+//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::provider_budget, retrieval-provider::adapters, tests]
+//! Invariants: [every real provider call is bracketed by reserve_call/finalize_call (a skipped reserve leaves no row,
+//!   which the 0094 guard cannot see); costs are persisted as given, never computed here; a reservation conflict is a
+//!   typed error, not a second attempt identity]
+//! Spec: Baseline §19; §78.1; §20; §11.6; §11.7; §6.2.1; §6.2.2
+//!
+//! Every
 //! caller that makes a real `EmbeddingProvider`/`RerankProvider` call (§19 Retrieval Provider
 //! Plane) is expected to bracket it with these two — a caller that skips `reserve_call` for
 //! "just this one call" produces no ledger row at all
@@ -389,6 +397,7 @@ pub async fn reserve_call(
     pool: &RetrievalWorkerDbPool,
     input: &ReserveCall,
 ) -> Result<ReservedCall, ModelCallLedgerError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let reserved = reserve_in_txn(&mut txn, input).await?;
     txn.commit().await?;
@@ -439,6 +448,7 @@ pub async fn reserve_private_call(
     pool: &PrivateWorkerDbPool,
     input: &ReserveCall,
 ) -> Result<ReservedCall, ModelCallLedgerError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let reserved = reserve_in_txn(&mut txn, input).await?;
     txn.commit().await?;
@@ -547,6 +557,7 @@ pub async fn finalize_call(
     outcome: ModelCallOutcome,
     finalize: &FinalizeCall,
 ) -> Result<bool, ModelCallLedgerError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let changed = finalize_in_txn(&mut txn, tenant_id, model_call_id, outcome, finalize).await?;
     txn.commit().await?;
@@ -567,6 +578,7 @@ pub async fn finalize_private_call(
     outcome: ModelCallOutcome,
     finalize: &FinalizeCall,
 ) -> Result<bool, ModelCallLedgerError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     let changed = finalize_in_txn(&mut txn, tenant_id, model_call_id, outcome, finalize).await?;
     txn.commit().await?;
@@ -612,6 +624,7 @@ pub async fn load_pricing_versions(
     .bind(provider_id)
     .bind(model_id)
     .bind(region)
+    // dep: PostgreSQL(any) — executes a query against the pool
     .fetch_all(pool.pool())
     .await?;
 
@@ -648,6 +661,7 @@ pub async fn record_external_model_cost_event(
     cost: f64,
     period: sqlx::types::time::Date,
 ) -> Result<(), ModelCallLedgerError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
 

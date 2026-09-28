@@ -1,5 +1,9 @@
-//! `adapters::exact_census` — §22.1 EXACT enumeration census: the physical IO behind
-//! `completeness::CensusResult`.
+//! `adapters::exact_census` — §22.1 EXACT enumeration census: the physical IO behind `completeness::CensusResult`.
+//! Depends-on: crates=[humaux-domain, humaux-projection, humaux-retrieval, sqlx]; services=[PostgreSQL(any) r=[ops.outbox, private.evidence_objects, private.memory_evidence, private.memory_records, private.memory_subjects, projection.stream_log, public.pool]]; env=[]; modules=[adapters::context_repo, adapters::postgres, domain::error, domain::identity, domain::ids, projection::stream, retrieval::completeness, retrieval::predicate_registry]
+//! Called-by: [adapters::context_repo, tests]
+//! Invariants: [total, returned items and the probe snapshot come from ONE REPEATABLE READ transaction (§22.1); total
+//!   is its own count(*), never the recall length; a census failure is trigger 4 (Internal), never a guessed total]
+//! Spec: Baseline §22.4; §22.1; §23.4; §23.1; §60
 //!
 //! Split of responsibilities (frozen by the pure crates' own docs):
 //! - `retrieval::predicate_registry` validates rows but "does not import sqlx or issue any
@@ -75,6 +79,7 @@ pub async fn probe_predicate_inputs(
     pool: &RuntimeDbPool,
     entry: &PredicateEntry,
 ) -> Result<(BTreeSet<String>, BTreeSet<String>), ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
 
     let mut indexed: BTreeSet<String> = BTreeSet::new();
@@ -355,6 +360,7 @@ pub(crate) async fn census_in_txn(
     {
         return Err(ErrorCode::Forbidden);
     }
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut sp = txn.begin().await.map_err(|_| ErrorCode::Internal)?;
     let readout = census_readout_in_savepoint(&mut sp, inputs).await;
     match readout {
@@ -445,6 +451,7 @@ pub async fn exact_enumerate(
     stream: &StreamKey,
 ) -> Result<ExactCensusOutcome, ErrorCode> {
     let authorization = authorization.narrow(requested_workspace)?;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     // 必须是本事务第一条语句：隔离级在第一个取快照的语句之后就改不了了（context_repo 同款）。
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")

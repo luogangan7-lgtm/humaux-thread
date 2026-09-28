@@ -1,6 +1,11 @@
-//! `projection::sparse` — 本地 BM25 lane 的查询构造（§17.6 标准路径：Qdrant Cluster 内置
-//! `qdrant/bm25`，Data Cell 内处理，不是外部 Managed Retrieval Provider）+
-//! tenant-scoped IDF corpus（§17.2）。
+//! `projection::sparse` — 本地 BM25 lane 的查询构造（§17.6 标准路径：Qdrant Cluster 内置 `qdrant/bm25`，Data Cell 内处理，不是外部 Managed
+//!   Retrieval Provider）+ tenant-scoped IDF corpus（§17.2）。
+//! Depends-on: crates=[humaux-domain]; services=[]; env=[]; modules=[domain::identity, domain::ids,
+//!   projection::dense]
+//! Called-by: [tests]
+//! Invariants: [the BM25 IDF corpus is never wider than the AuthorizationScope: documents failing tenant + can_read
+//!   are dropped before df is counted, so other users' private term frequencies never affect ranking (§17.2)]
+//! Spec: Baseline §17.2; §6.1.1; §17.6; §3; §78.3
 //!
 //! §17.2 冻结："IDF corpus 不得比 AuthorizationScope 更宽，否则虽然结果行被过滤，其他用户
 //! 私人词频仍会影响当前用户排名。" 授权可见 corpus 的判定是

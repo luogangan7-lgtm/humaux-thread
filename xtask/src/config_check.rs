@@ -1,3 +1,9 @@
+//! `xtask::config_check` — G50-1 / G80-41 gate: config/features.toml contract check.
+//! Depends-on: crates=[humaux-contracts]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[contracts::feature_registry]
+//! Called-by: [xtask::main]
+//! Invariants: [config/features.toml always exists; this gate is pass/fail only, never not_applicable (§57.1 第2条)]
+//! Spec: Baseline §50.1; §57.1
+//!
 //! xtask `config-check` — G50-1 / G80-41: `config/features.toml` 契约闸（§50.1）。
 //! G50-1/G80-41 登记在 Phase 0 must-pass 列（line 9837），只有 pass/fail 两态，永远不允许
 //! not_applicable（§57.1 第2条：not_applicable 仅在被测对象本 Phase 未上线时合法，本闸的被测

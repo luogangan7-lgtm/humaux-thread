@@ -1,3 +1,9 @@
+//! `xtask::rls_check` — G80-26 (§48.2) runtime DB role invariant CI enumeration gate.
+//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.current_reasoning_route_binding, control.resolve_user_reasoning_admission, ops.claim_derived_work, ops.contribution_reservation_authority_validate, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.retire_failed_ticket, projection.stream_log_guard_state_transition, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal]]; env=[CARGO_MANIFEST_DIR, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
+//! Called-by: [xtask::dep_map, xtask::main]
+//! Invariants: [any catalog cell that disagrees with §48.2 / §62 grants is fail, named by role and table]
+//! Spec: Baseline §48.2; §62
+//!
 //! xtask `rls-check` — G80-26 (§48.2 Runtime DB Role Invariant CI enumeration gate),
 //! folding in §62's tenant RLS policy template. §48.2's own text: "上面四项只覆盖 RLS
 //! 面。表级授权进同一次枚举" — so the RLS four-item enumeration and the five §48.2
@@ -21,7 +27,7 @@ use std::fs;
 
 /// The seven §5.1 logical schemas — shared by the backtick table-name scanner and the
 /// §6.2.1 domain-default matrix's column order.
-const SCHEMAS: &[&str] = &[
+pub(crate) const SCHEMAS: &[&str] = &[
     "control",
     "private",
     "staging",
@@ -1960,6 +1966,7 @@ const DSN_ENV: &str = "HUMAUX_TEST_PG_DSN";
 fn connect() -> Result<Client, GateResult> {
     let dsn = std::env::var(DSN_ENV)
         .map_err(|_| fail("db-connection", format!("env var {DSN_ENV} not set")))?;
+    // dep: PostgreSQL(any) — HUMAUX_TEST_PG_DSN, RLS/grant enumeration target database
     let client = Client::connect(&dsn, NoTls).map_err(|e| {
         fail(
             "db-connection",
@@ -3822,6 +3829,7 @@ mod tests {
                 eprintln!("rls-check test: not_applicable — {DSN_ENV} unset, skipping");
                 return;
             };
+            // dep: PostgreSQL(any) — HUMAUX_TEST_PG_DSN, RLS/grant enumeration target database
             let Ok(mut $client) = Client::connect(&dsn, NoTls) else {
                 assert!(
                     !skip_is_a_failure(),
@@ -4421,6 +4429,7 @@ mod tests {
             panic!("{DSN_ENV} must be a PostgreSQL URL with an authority");
         };
         let gateway_dsn = format!("postgres://role_gateway:devlocal_role_gateway@{authority}");
+        // dep: PostgreSQL(any) — gateway_dsn, gateway role positive control
         let mut gateway = Client::connect(&gateway_dsn, NoTls).unwrap_or_else(|error| {
             panic!("role_gateway must be reachable for W2 runtime boundary proof: {error}")
         });

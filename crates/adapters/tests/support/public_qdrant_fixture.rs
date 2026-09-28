@@ -1,3 +1,9 @@
+//! `adapters::tests::support::public_qdrant_fixture` — Per-run Qdrant collection fixture for the public runtime tests.
+//! Depends-on: crates=[humaux-infra-cell, humaux-testkit, serde_json, uuid]; services=[Qdrant(*)]; env=[HUMAUX_TEST_QDRANT_PORT]; modules=[humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport]
+//! Called-by: [adapters::tests::public_runtime_qdrant]
+//! Invariants: [Qdrant unreachable -> QdrantTransportError to the caller, no fallback search]
+//! Spec: Baseline §17; §79.2
+//!
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -24,6 +30,7 @@ pub fn setup() -> Option<PublicQdrantFixture> {
                 .expect("HUMAUX_TEST_QDRANT_PORT must be a u16")
         })
         .unwrap_or(6333);
+    // dep: Qdrant(*) — reachability probe before running the Qdrant-dependent test
     if TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}")
             .parse()
@@ -79,6 +86,7 @@ pub async fn create_collection(fixture: &PublicQdrantFixture) {
         .transport
         .execute(
             &fixture.permit,
+            // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
             IntraCellRequest {
                 method: IntraCellMethod::Put,
                 path: format!("/collections/{}", fixture.collection),
@@ -102,6 +110,7 @@ pub async fn create_collection(fixture: &PublicQdrantFixture) {
         "body_sha256",
         "projection_live",
     ] {
+        // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
         let response = fixture.transport.execute(&fixture.permit, IntraCellRequest {
             method: IntraCellMethod::Put,
             path: format!("/collections/{}/index", fixture.collection),
@@ -120,6 +129,7 @@ pub async fn delete_collection(fixture: &PublicQdrantFixture) {
         .transport
         .execute(
             &fixture.permit,
+            // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
             IntraCellRequest {
                 method: IntraCellMethod::Delete,
                 path: format!("/collections/{}", fixture.collection),

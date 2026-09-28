@@ -1,6 +1,13 @@
 // witness: family=retrieval_provider_tokens_total labels=provider,purpose
-//! Metric Witness for `retrieval_provider_tokens_total{provider,purpose}` (§80.2 W-side;
-//! registry row §41.2; §19 Retrieval Provider Plane's token-denominated budget/quota input).
+//! `testkit::tests::metrics::retrieval_provider_tokens_total` — Metric Witness for
+//!   `retrieval_provider_tokens_total{provider,purpose}` (§80.2 W-side; registry row §41.2; §19 Retrieval Provider
+//!   Plane's token-denominated budget/quota input).
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[retrieval-provider::admission, retrieval-provider::health,
+//!   retrieval-provider::metrics]
+//! Called-by: []
+//! Invariants: [triggers the real record_provider_call and asserts a counter delta equal to the recorded token amount
+//!   (not +1) per {provider,purpose}]
+//! Spec: none
 //!
 //! Actively triggers `retrieval_provider::metrics::record_provider_call` — the same sole
 //! emit point the sibling `retrieval_provider_*` witnesses exercise — and asserts a real

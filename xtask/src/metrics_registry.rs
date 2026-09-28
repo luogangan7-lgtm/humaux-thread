@@ -1,3 +1,9 @@
+//! `xtask::metrics_registry` — G80-6 metrics-registry-check: Registry/Code/Witness three-way falsification.
+//! Depends-on: crates=[]; services=[subprocess(cargo)]; env=[CARGO_MANIFEST_DIR]; modules=[]
+//! Called-by: [xtask::main]
+//! Invariants: [each Witness file is really compiled and run in a throwaway probe package; missing/failing/timed-out witnesses count as 0 passed, never substituted by comment]
+//! Spec: Baseline §80.2; §41.2
+//!
 //! xtask `metrics-registry` — G80-6 `metrics-registry-check`：Registry(R) / Code(C) /
 //! Witness(W) 三方证伪（§80.2 全文）。R 解析 §41.2 注册表；C 静态扫 `crates/**/src/**/*.rs`
 //! 的发射点；W 枚举 `crates/testkit/tests/metrics/<family>.rs`（文件名从 family 确定性派生，
@@ -513,6 +519,7 @@ fn run_witness_probe(
         return (0, 0);
     }
 
+    // dep: subprocess(cargo) — compiles and runs the witness probe package
     let mut child = match std::process::Command::new("cargo")
         .arg("test")
         .arg("--manifest-path")

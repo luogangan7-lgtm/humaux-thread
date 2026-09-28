@@ -1,7 +1,15 @@
-//! H3 (§74.6) integration test — `email::outbox` against a real Postgres, exercising the
-//! three literal task-brief acceptance behaviors: enqueue never blocks on SMTP, a suppressed
-//! address never gets enqueued (same outcome type either way — unified safety semantics),
-//! and a provider failure lands the row in `FAILED` with a matching delivery event.
+//! `adapters::tests::email_outbox` — H3 (§74.6) integration test — `email::outbox` against a real Postgres,
+//!   exercising the three literal task-brief acceptance behaviors: enqueue never blocks on SMTP, a suppressed address
+//!   never gets enqueued (same outcome type either way — unified safety semantics), and a provider failure lands the
+//!   row in `FAILED` with a matching delivery event.
+//! Depends-on: crates=[humaux-adapters, humaux-testkit, postgres, serde_json, sqlx, tokio]; services=[PostgreSQL(any)
+//!   w=[control.users, ops.email_delivery_events, ops.email_outbox, ops.email_suppressions],
+//!   PostgreSQL(role_gateway), PostgreSQL(role_private_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::email,
+//!   adapters::email::outbox, adapters::email::test_double, adapters::postgres, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [runs on 0038's real tables and claims only its own user's rows; a suppressed address is never
+//!   enqueued and a provider rejection is recorded as a delivery event; no DSN/DB/migration is a visible SKIP]
+//! Spec: Baseline §79.2
 //!
 //! Runs against `migrations/0038_email_deliverability.sql`'s real tables (not a self-built
 //! scratch schema like T1.5's `auth_scope_rls.rs`) — `email::outbox`'s SQL names
@@ -79,6 +87,7 @@ impl DbIntegrationFixture for OutboxFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `isolate`
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -106,7 +115,9 @@ impl DbIntegrationFixture for OutboxFixture {
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let (gateway, worker) = rt
             .block_on(async {
+                // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `isolate`
                 let gw = RuntimeDbPool::connect(&dsn_as_role(&dsn, "role_gateway")).await?;
+                // dep: PostgreSQL(role_private_worker) — opens the role-scoped connection for `isolate`
                 let wk =
                     PrivateWorkerDbPool::connect(&dsn_as_role(&dsn, "role_private_worker")).await?;
                 Ok::<_, humaux_adapters::postgres::PoolInitError>((gw, wk))

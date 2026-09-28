@@ -1,3 +1,18 @@
+//! `adapters::tests::support::continuity_0137_fixture` — Shared seed, role-DSN and run-bound diagnostic fixture for the 0137 continuity tests.
+//! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-domain, postgres, serde_json, sha2, tokio,
+//!   uuid]; services=[PostgreSQL(owner) r=[ops.commit_seq_seq] w=[control.memberships,
+//!   control.private_reasoning_domains, control.tenants, control.users, control.workspace_memberships,
+//!   control.workspaces, ops.outbox, private.evidence_objects, private.memory_evidence, private.memory_records,
+//!   projection.stream_log] x=[private.publish_continuity_facet, private.register_continuity_project],
+//!   PostgreSQL(role_gateway)]; env=[HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN, HUMAUX_W2_V4_DIAGNOSTIC,
+//!   HUMAUX_W2_V4_DIAGNOSTIC_DIR, HUMAUX_W2_V4_DIAGNOSTIC_RUN_UUID]; modules=[adapters::continuity_read,
+//!   adapters::postgres, adapters::tests::support::continuity_0137_cleanup, application::continuity, domain::context,
+//!   domain::continuity, domain::error, domain::identity, domain::ids]
+//! Called-by: [adapters::tests::project_continuity_read_0137_acceptance]
+//! Invariants: [seeds control, source and continuity rows as owner and reads back as role_gateway; every seeded id is
+//!   registered for cleanup; diagnostic output is bound to one run UUID; a missing DB fails when HUMAUX_REQUIRE_DB=1]
+//! Spec: ADR-0035
+//!
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
@@ -779,6 +794,7 @@ impl Fixture {
     pub fn panic_after_partial_seed(admin_dsn: String, tenant: Uuid) -> ! {
         let cleanup = Arc::new(CleanupOwner::new(admin_dsn.clone()));
         cleanup.register_tenant(tenant);
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&admin_dsn, NoTls).expect("partial-seed admin connect");
         admin
             .execute(
@@ -882,6 +898,7 @@ impl Fixture {
         role: &str,
         application_name: Option<&str>,
     ) -> Result<Client, postgres::Error> {
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut client = Client::connect(dsn, NoTls)?;
         if let (Some(diagnostic), Some(application_name)) = (diagnostic, application_name) {
             let backend_pid = client.query_one("SELECT pg_backend_pid()", &[])?.get(0);
@@ -975,6 +992,7 @@ impl Fixture {
             .unwrap();
         let pool = runtime.block_on(async {
             Arc::new(
+                // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
                 RuntimeDbPool::connect(&self.gateway_dsn)
                     .await
                     .expect("checked gateway pool"),

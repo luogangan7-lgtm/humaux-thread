@@ -1,6 +1,13 @@
-//! T6.2 (§20.0 / §20#G20-2 / G80-39) e2e integration test — the `ModelCallLedger` half of the
-//! "online recall 无隐藏生成调用" gate: recall/context/continuity must never leave a
-//! `purpose='query_rewrite'` row in `ops.model_call_ledger` (§19.1). Complements
+//! `adapters::tests::retrieve_no_hidden_generative_recall` — T6.2 (§20.0 / §20#G20-2 / G80-39) e2e integration test —
+//!   the `ModelCallLedger` half of the "online recall 无隐藏生成调用" gate: recall/context/continuity must never leave a
+//!   `purpose='query_rewrite'` row in `ops.model_call_ledger` (§19.1).
+//! Depends-on: crates=[humaux-testkit, postgres, sqlx]; services=[PostgreSQL(owner) w=[control.tenants, ops.model_call_ledger]]; env=[HUMAUX_TEST_PG_DSN]; modules=[humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [recall/context/continuity must leave no query_rewrite row in ops.model_call_ledger (the injected
+//!   fault row must be detected); no DSN, unreachable DB or migration missing is a visible SKIP]
+//! Spec: Baseline §19.1; §20; §20.0
+//!
+//! Complements
 //! `xtask architecture-check`'s static G20-2/G80-39 sub-check (`application::retrieve`'s own
 //! doc comment), which proves the *code* never names a reasoning provider; this proves the
 //! *ledger* never records the call such a provider would have made, on a real Postgres —
@@ -45,6 +52,7 @@ impl DbIntegrationFixture for LedgerFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 

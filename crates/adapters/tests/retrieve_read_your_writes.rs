@@ -1,4 +1,19 @@
-//! T3.8 (§15.5) integration test — `retrieve::recall_with_overlay` against a real Postgres.
+//! `adapters::tests::retrieve_read_your_writes` — T3.8 (§15.5) integration test — `retrieve::recall_with_overlay`
+//!   against a real Postgres.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, humaux-testkit, postgres, serde_json, sqlx,
+//!   tokio]; services=[PostgreSQL(owner) r=[ops.commit_seq_seq] w=[control.memberships,
+//!   control.private_reasoning_domains, control.tenants, control.users, control.workspaces, ops.outbox,
+//!   private.artifacts, private.events, private.evidence_objects, private.memory_evidence, private.memory_records,
+//!   projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_gateway), PostgreSQL(role_maintenance),
+//!   PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::forget_repo, adapters::postgres, adapters::read_materialize, adapters::remember,
+//!   adapters::retrieve, adapters::stream_repo, domain::error, domain::evidence, domain::identity, domain::ids,
+//!   domain::subject, humaux-testkit, projection::serving, projection::stream]
+//! Called-by: [cargo-test]
+//! Invariants: [seeded rows match exactly what remember() writes; expired, malformed or unissued tokens and
+//!   cross-tenant/workspace scopes are typed RetrieveErrors; no DSN, unreachable DB or migrations before 0046 is a
+//!   visible SKIP, never a pass]
+//! Spec: Baseline §60; §79.2
 //!
 //! Some focused read-side cases seed `private.evidence_objects` / `private.events` /
 //! `projection.stream_log` / `ops.outbox` directly with SQL through the admin connection
@@ -61,6 +76,7 @@ fn verified_maintenance_pool(
 ) -> Result<MaintenanceDbPool, DbFixtureSkipReason> {
     let dsn = std::env::var("HUMAUX_MAINTENANCE_PG_DSN")
         .map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut probe = Client::connect(&dsn, NoTls)
         .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
     let role_ok: bool = probe
@@ -76,6 +92,7 @@ fn verified_maintenance_pool(
             "HUMAUX_MAINTENANCE_PG_DSN is not a non-bypass role_maintenance LOGIN".to_string(),
         ));
     }
+    // dep: PostgreSQL(role_maintenance) — test opens a direct PG connection for setup/verification
     rt.block_on(MaintenanceDbPool::connect(&dsn))
         .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))
 }
@@ -163,6 +180,7 @@ impl DbIntegrationFixture for RetrieveFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
 
@@ -235,6 +253,7 @@ impl DbIntegrationFixture for RetrieveFixture {
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let gateway_dsn = dsn_as_role(&dsn, "role_gateway");
         let gateway = rt
+            // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
             .block_on(RuntimeDbPool::connect(&gateway_dsn))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
         let maintenance = verified_maintenance_pool(&rt)?;
@@ -489,6 +508,7 @@ fn mark_stream_done_as_retrieval_worker(handle: &mut Handle, evidence_id: Uuid) 
     handle
         .admin
         .batch_execute(&format!(
+            // dep: PostgreSQL(role_retrieval_worker) — test switches PG role to exercise RLS
             "BEGIN; \
              SET LOCAL ROLE role_retrieval_worker; \
              SET LOCAL humaux.tenant_id = '{tenant}'; \
@@ -538,6 +558,7 @@ fn advance_stream_highwater_as_retrieval_worker(handle: &mut Handle, commit_seq:
     handle
         .admin
         .batch_execute(&format!(
+            // dep: PostgreSQL(role_retrieval_worker) — test switches PG role to exercise RLS
             "BEGIN; \
              SET LOCAL ROLE role_retrieval_worker; \
              SET LOCAL humaux.tenant_id = '{tenant}'; \
@@ -859,6 +880,7 @@ fn remember_lock_wait_past_deadline_rolls_back_all_writes() {
             let application_name = format!("remember-expiry-{}", Uuid::new_v4().simple());
             let actor_dsn = dsn_with_application_name(&handle.gateway_dsn, &application_name);
 
+            // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
             let mut holder = Client::connect(&handle.gateway_dsn, NoTls)
                 .expect("connect role_gateway checkpoint lock holder");
             let holder_backend_pid: i32 = holder
@@ -893,6 +915,7 @@ fn remember_lock_wait_past_deadline_rolls_back_all_writes() {
                 let runtime = tokio::runtime::Runtime::new()
                     .map_err(|error| format!("create remember actor runtime: {error}"))?;
                 let pool = runtime
+                    // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
                     .block_on(RuntimeDbPool::connect(&actor_dsn))
                     .map_err(|error| format!("connect remember actor pool: {error}"))?;
                 Ok(runtime.block_on(remember::remember(&pool, command)))
@@ -991,6 +1014,7 @@ fn recall_overlay_decision_keeps_token_and_projection_reads_in_one_rr_snapshot()
             let auth = handle.auth.clone();
             let family = handle.family.clone();
             let (done_tx, done_rx) = mpsc::sync_channel(1);
+            // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
             let mut holder = Client::connect(
                 &std::env::var("HUMAUX_TEST_PG_DSN").expect("test owner DSN is present"),
                 NoTls,
@@ -1007,6 +1031,7 @@ fn recall_overlay_decision_keeps_token_and_projection_reads_in_one_rr_snapshot()
                     let runtime = tokio::runtime::Runtime::new()
                         .map_err(|error| format!("create recall actor runtime: {error}"))?;
                     let pool = runtime
+                        // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
                         .block_on(RuntimeDbPool::connect(&actor_dsn))
                         .map_err(|error| format!("connect recall actor pool: {error}"))?;
                     Ok(runtime.block_on(retrieve::recall_with_overlay(

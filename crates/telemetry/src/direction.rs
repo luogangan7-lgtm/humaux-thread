@@ -1,5 +1,11 @@
-//! `telemetry::direction` — §53.6 direction table: hand-written data checked for parity
-//! against its own generation source by `cargo xtask direction-table` (G80-9). "由代码生成
+//! `telemetry::direction` — §53.6 direction table: hand-written data checked for parity against its own generation
+//!   source by `cargo xtask direction-table` (G80-9).
+//! Depends-on: crates=[humaux-fail-closed-macro]; services=[]; env=[]; modules=[humaux-fail-closed-macro]
+//! Called-by: []
+//! Invariants: []
+//! Spec: Baseline §53.2; §53.3; §53.4
+//!
+//! "由代码生成
 //! 而非手写" (§53.6) means this const is the *reference* copy, not the source of truth —
 //! `cargo xtask direction-table` regenerates the same shape from `degrade::DegradeCode`
 //! (fail-open side) and every `#[fail_closed(threat = "...")]`-annotated function in the

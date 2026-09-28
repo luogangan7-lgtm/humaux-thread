@@ -1,7 +1,31 @@
-//! ADR-0016 Distill hop — accepted Evidence → 0..N `private.memory_records` by the private
-//! worker itself (`humaux_private_worker::distill::run_once`, the `--distill-once` code path),
-//! then the remember-time `projection.stream_log` ticket resolved by the real
-//! `humaux_adapters::projection_worker::run_once`.
+//! `private-worker::tests::distill_hop_e2e` — ADR-0016 Distill hop — accepted Evidence → 0..N
+//!   `private.memory_records` by the private worker itself (`humaux_private_worker::distill::run_once`, the
+//!   `--distill-once` code path), then the remember-time `projection.stream_log` ticket resolved by the real
+//!   `humaux_adapters::projection_worker::run_once`.
+//! Depends-on: crates=[async-trait, hex, humaux-adapters, humaux-domain, humaux-infra-cell, humaux-local-secret-scan,
+//!   humaux-projection, humaux-testkit, postgres, serde_json, sha2, tokio, uuid]; services=[PostgreSQL(role_gateway)
+//!   r=[control.current_reasoning_route_binding, ops.commit_seq_seq, ops.data_disclosure_sources,
+//!   ops.data_disclosures, ops.model_call_ledger, ops.private_inference_rpc_calls, private.distill_candidates,
+//!   private.memory_records, private.memory_subject_mentions, private.memory_subjects, private.processing_runs]
+//!   w=[control.credentials, control.memberships, control.private_reasoning_domains, control.processor_models,
+//!   control.provider_accounts, control.provider_endpoints, control.reasoning_credential_bindings,
+//!   control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates,
+//!   control.reasoning_route_policies, control.tenants, control.users, control.workspace_memberships,
+//!   control.workspaces, ops.outbox, ops.reasoning_account_health_observations,
+//!   ops.reasoning_provider_health_observations, private.events, private.evidence_objects, private.evidence_subjects,
+//!   private.memory_evidence, private.subject_keys, private.subjects, projection.stream_checkpoints,
+//!   projection.stream_log] x=[control.current_reasoning_route_binding], PostgreSQL(role_private_worker),
+//!   PostgreSQL(role_retrieval_worker), MiniMax, subprocess(gitleaks)]; env=[HUMAUX_MINIMAX_DNS_PINS,
+//!   HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY];
+//!   modules=[adapters::byok, adapters::byok::ssrf, adapters::contribution_reasoner, adapters::disclosure,
+//!   adapters::distill_reasoner, adapters::postgres, adapters::projection_worker, adapters::qdrant,
+//!   domain::authority, domain::egress, domain::error, domain::evidence, domain::ids, domain::ticket_family,
+//!   humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
+//!   private-worker::distill, projection::fingerprint, projection::serving]
+//! Called-by: [cargo-test]
+//! Invariants: [no MINIMAX_API_KEY -> SKIP for the live test only; no DB (or not migrated to 0147) -> SKIP for all;
+//!   HUMAUX_REQUIRE_MINIMAX/HUMAUX_REQUIRE_DB make either a panic via skip_or_fail]
+//! Spec: ADR-0005
 //!
 //! Four states, mirroring `bins/consolidation-worker/tests/consolidation_hop_e2e.rs`:
 //! 1. `MINIMAX_API_KEY` missing (env + `.env` fallback) ⇒ visible SKIP for D1 only (D2–D6 use a
@@ -312,6 +336,7 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
         );
         return None;
     };
+    // dep: PostgreSQL(role_gateway) — role-scoped pool call
     let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(
             test_name,
@@ -603,6 +628,7 @@ fn run_pass(
     lease_owner: &str,
 ) -> DistillPassReport {
     rt.block_on(async {
+        // dep: PostgreSQL(role_private_worker) — role-scoped pool call
         let pool = PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker"))
             .await
             .expect("private worker pool");
@@ -772,6 +798,7 @@ fn discover_gitleaks() -> Option<(std::path::PathBuf, String, String)> {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
+        // dep: subprocess(gitleaks) — runs a candidate gitleaks binary to read its version
         let output = Command::new(&path)
             .arg("version")
             .stdin(Stdio::null())
@@ -906,6 +933,7 @@ fn run_projection(
         upserted: Mutex::new(Vec::new()),
     });
     let outcome = rt.block_on(async {
+        // dep: PostgreSQL(role_retrieval_worker) — role-scoped pool call
         let pool = RetrievalWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_retrieval_worker"))
             .await
             .expect("retrieval worker pool");
@@ -1732,6 +1760,7 @@ fn seed_subject_declaration(f: &mut Fixture, evidence_id: Uuid) -> (Uuid, Uuid) 
     // itself carries the rule that produced it.
     let mut txn = f.admin.transaction().expect("begin declare");
     txn.batch_execute(&format!(
+        // dep: PostgreSQL(role_gateway) — role-scoped pool call
         "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{}'; SET LOCAL humaux.user_id = '{}';",
         f.tenant_id, f.user_id
     ))

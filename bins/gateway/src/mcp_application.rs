@@ -1,4 +1,18 @@
-//! Gateway implementation of the native MCP application port.
+//! `gateway::mcp_application` — Gateway implementation of the native MCP application port.
+//! Depends-on: crates=[async-trait, axum, hex, humaux-adapters, humaux-contracts, humaux-domain, humaux-projection,
+//!   humaux-protocol, humaux-testkit, postgres, serde, serde_json, time, tokio, uuid];
+//!   services=[PostgreSQL(role_gateway) r=[control.rate_buckets, private.memory_records]
+//!   w=[control.w2_test_request_intervals] x=[private.publish_continuity_facet, private.register_continuity_project],
+//!   HTTP(gateway)]; env=[HUMAUX_CONTINUITY_DIRECT_PREAUTH_SAME_KEY, HUMAUX_CONTINUITY_W2_BARRIER_RUN_ID,
+//!   HUMAUX_CONTINUITY_W2_BARRIER_SIDE]; modules=[adapters::affect_repo, adapters::context_repo,
+//!   adapters::distill_repo, adapters::memory_governance_repo, adapters::postgres, adapters::subject_repo,
+//!   domain::affect, domain::authority, domain::confirm, domain::context, domain::continuity, domain::dataclass,
+//!   domain::error, domain::evidence, domain::identity, domain::ids, domain::subject, gateway::context,
+//!   gateway::continuity, gateway::guard, gateway::memory, gateway::recall, gateway::remember, protocol::mcp,
+//!   protocol::mcp_catalog]
+//! Called-by: [gateway::bootstrap, tests]
+//! Invariants: [the canonical catalog validates wire arguments before dispatch runs; a valid contract with no local implementation is denied by GatewayGuard, never silently no-op'd]
+//! Spec: Baseline §33.10; §34.0.1; §78.1; ADR-0030; ADR-0031
 //!
 //! The canonical catalog validates wire arguments before this fixed dispatch
 //! table runs.  Only routes with a complete local implementation appear here;
@@ -2172,6 +2186,7 @@ mod tests {
             return;
         };
         tokio::task::spawn_blocking(move || {
+            // dep: PostgreSQL(role_gateway) — test fixture pool for a §33.10 dispatch-table integration test
             let mut client = Client::connect(&dsn, NoTls)
                 .unwrap_or_else(|error| panic!("W2 barrier connect failed: {error}"));
             let side = side.as_str();
@@ -2280,6 +2295,7 @@ mod tests {
             ("Mcp-Name", "continuity"),
             ("Authorization", bearer),
         ];
+        // dep: HTTP(gateway) — test helper dials the gateway's own HTTP listener to exercise the wire contract
         let mut stream = TcpStream::connect(address).await.unwrap();
         let mut wire = format!(
             "POST /mcp HTTP/1.1\r\nHost: {HOST}\r\nOrigin: {ORIGIN}\r\nConnection: close\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
@@ -2563,6 +2579,7 @@ mod tests {
                 }
                 let runtime_handle = handle.rt.handle().clone();
                 let first_only = runtime_handle.block_on(async {
+                    // dep: PostgreSQL(role_gateway) — test fixture pool for a dispatch-table integration test
                     let runtime = RuntimeDbPool::connect(&dsn).await.unwrap();
                     let scope = humaux_domain::identity::AuthorizationScope::new(
                         TenantId(handle.tenant_id),
@@ -2600,6 +2617,7 @@ mod tests {
                     assert_eq!(row.get::<_, i64>(1), 10_000);
                 }
                 let first = runtime_handle.block_on(async {
+                    // dep: PostgreSQL(role_gateway) — test fixture pool for a dispatch-table integration test
                     let runtime = RuntimeDbPool::connect(&dsn).await.unwrap();
                     let (address, server) =
                         start(test_application(&handle, runtime, scope_a_then_b)).await;
@@ -2630,6 +2648,7 @@ mod tests {
                     }
                 });
                 let second = runtime_handle.block_on(async {
+                    // dep: PostgreSQL(role_gateway) — test fixture pool for a dispatch-table integration test
                     let runtime = RuntimeDbPool::connect(&dsn).await.unwrap();
                     let (address, server) =
                         start(test_application(&handle, runtime, scope_b_then_a)).await;

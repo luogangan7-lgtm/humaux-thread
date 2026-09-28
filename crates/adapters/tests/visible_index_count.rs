@@ -1,5 +1,16 @@
-//! Card 18 / §23.1② — `retrieve::visible_index_count`, the one producer of the live Qdrant
-//! `visible` number the three read routes hand to `envelope::build_projection_block`.
+//! `adapters::tests::visible_index_count` — Card 18 / §23.1② — `retrieve::visible_index_count`, the one producer of
+//!   the live Qdrant `visible` number the three read routes hand to `envelope::build_projection_block`.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, humaux-projection, humaux-retrieval,
+//!   humaux-telemetry, humaux-testkit, postgres, serde_json, sqlx, tokio, uuid]; services=[PostgreSQL(owner)
+//!   r=[projection.processing_gaps] w=[control.tenants, projection.stream_checkpoints, projection.stream_log],
+//!   PostgreSQL(role_gateway), PostgreSQL(role_maintenance), Qdrant(*)]; env=[HUMAUX_TEST_PG_DSN,
+//!   HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::forget_repo, adapters::postgres, adapters::qdrant,
+//!   adapters::retrieve, domain::authority, domain::dataclass, domain::identity, domain::ids, domain::memory,
+//!   humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::card,
+//!   projection::stream, retrieval::completeness, retrieval::envelope, telemetry::degrade]
+//! Called-by: [cargo-test]
+//! Invariants: [PostgreSQL unreachable or role denied -> the call fails and surfaces the error to the caller; no silent fallback; Qdrant unreachable -> QdrantTransportError to the caller, no fallback search]
+//! Spec: Baseline §4.4; §15.2; §16.2; ADR-0031
 //!
 //! Against a **real** Postgres ledger and a **real** Qdrant index (both required; three-state
 //! skip, §79.2/§57.1, prints which object is missing rather than passing silently). The
@@ -99,6 +110,7 @@ fn skip_unless_both_reachable() -> Option<(String, Client)> {
         );
         return None;
     };
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let admin = match Client::connect(&dsn, NoTls) {
         Ok(c) => c,
         Err(e) => {
@@ -110,6 +122,7 @@ fn skip_unless_both_reachable() -> Option<(String, Client)> {
             return None;
         }
     };
+    // dep: Qdrant(*) — reachability probe before running the Qdrant-dependent test
     if TcpStream::connect_timeout(&qdrant_addr().parse().unwrap(), Duration::from_millis(500))
         .is_err()
     {
@@ -376,6 +389,7 @@ fn visible_index_count_is_the_live_denominator_input() {
         transport
             .execute(
                 &permit,
+                // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
                 IntraCellRequest {
                     method: IntraCellMethod::Put,
                     path: format!("/collections/{collection}"),
@@ -395,6 +409,7 @@ fn visible_index_count_is_the_live_denominator_input() {
         transport
             .execute(
                 &permit,
+                // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
                 IntraCellRequest {
                     method: IntraCellMethod::Put,
                     path: format!("/collections/{collection}/index"),
@@ -420,6 +435,7 @@ fn visible_index_count_is_the_live_denominator_input() {
             .await
             .expect("upsert");
         }
+        // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
         RuntimeDbPool::connect(&dsn_as_role(&dsn, "role_gateway"))
             .await
             .expect("role_gateway runtime pool")
@@ -549,6 +565,7 @@ fn visible_index_count_is_the_live_denominator_input() {
 
     // ---- Leg 2: §37 step 1 (tombstone) with step 5 (physical purge) not run. ---------------
     let maintenance = rt.block_on(async {
+        // dep: PostgreSQL(role_maintenance) — test opens a direct PG connection for setup/verification
         let maintenance = MaintenanceDbPool::connect(&dsn_as_role(&dsn, "role_maintenance"))
             .await
             .expect("maintenance pool");
@@ -624,6 +641,7 @@ fn visible_index_count_is_the_live_denominator_input() {
         .collect();
     rt.block_on(transport.execute(
         &permit,
+        // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
         IntraCellRequest {
             method: IntraCellMethod::Post,
             path: format!("/collections/{collection}/points/delete?wait=true"),
@@ -685,6 +703,7 @@ fn visible_index_count_is_the_live_denominator_input() {
         let _ = transport
             .execute(
                 &permit,
+                // dep: Qdrant(*) — Qdrant REST call for fixture setup/assertion
                 IntraCellRequest {
                     method: IntraCellMethod::Delete,
                     path: format!("/collections/{collection}"),

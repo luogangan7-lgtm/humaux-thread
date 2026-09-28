@@ -1,5 +1,17 @@
-//! Persistent §19.2 provider-budget admission backed by the four narrow SQL functions from
-//! migration 0117.  Callers must first create a matching `ModelCallLedger` reservation; this
+//! `adapters::provider_budget` — Persistent §19.2 provider-budget admission backed by the four narrow SQL functions
+//!   from migration 0117.
+//! Depends-on: crates=[humaux-domain, sqlx]; services=[PostgreSQL(any) x=[ops.finalize_retrieval_provider_budget,
+//!   ops.mark_retrieval_provider_budget_dispatched, ops.reap_expired_retrieval_provider_budget,
+//!   ops.reserve_retrieval_provider_budget, ops.settle_retrieval_provider_budget], PostgreSQL(role_maintenance),
+//!   PostgreSQL(role_retrieval_worker)]; env=[]; modules=[adapters::model_call_ledger, adapters::postgres,
+//!   domain::egress, domain::error, domain::ids]
+//! Called-by: [retrieval-provider::adapters, tests]
+//! Invariants: [budget reservations are made only through the ops.*_retrieval_provider_budget functions after a
+//!   matching ModelCallLedger reservation; exhaustion is CostBudgetExceeded; no second provider-attempt identity is
+//!   created]
+//! Spec: none
+//!
+//! Callers must first create a matching `ModelCallLedger` reservation; this
 //! module never creates a second provider-attempt identity.
 
 use std::time::Duration;
@@ -122,6 +134,7 @@ pub async fn reserve_provider_budget(
     request: &ProviderBudgetRequest<'_>,
 ) -> Result<ProviderBudgetReservation, ErrorCode> {
     let (tokens, ttl, purpose) = validate_request(request)?;
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `reserve_provider_budget`
     let mut txn = pool.pool().begin().await.map_err(map_db_error)?;
     set_tenant_local(&mut txn, request.tenant_id).await?;
     let row = sqlx::query(
@@ -166,6 +179,7 @@ pub async fn mark_provider_budget_dispatched(
     if tenant_id.0.is_nil() || reservation_id.is_nil() {
         return Err(ErrorCode::InvalidInput);
     }
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `mark_provider_budget_dispatched`
     let mut txn = pool.pool().begin().await.map_err(map_db_error)?;
     set_tenant_local(&mut txn, tenant_id).await?;
     let dispatched_at =
@@ -188,6 +202,7 @@ pub async fn settle_provider_budget(
     if tenant_id.0.is_nil() || reservation_id.is_nil() {
         return Err(ErrorCode::InvalidInput);
     }
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `settle_provider_budget`
     let mut txn = pool.pool().begin().await.map_err(map_db_error)?;
     set_tenant_local(&mut txn, tenant_id).await?;
     let status: String = sqlx::query_scalar("SELECT ops.settle_retrieval_provider_budget($1, $2)")
@@ -214,6 +229,7 @@ pub async fn finalize_and_settle_provider_budget(
     if tenant_id.0.is_nil() || reservation_id.is_nil() || model_call_id.is_nil() {
         return Err(ErrorCode::InvalidInput);
     }
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `finalize_and_settle_provider_budget`
     let mut txn = pool.pool().begin().await.map_err(map_db_error)?;
     set_tenant_local(&mut txn, tenant_id).await?;
     let status: String = sqlx::query_scalar(
@@ -253,6 +269,7 @@ pub async fn reap_expired_provider_budgets(
     if tenant_id.0.is_nil() || limit <= 0 {
         return Err(ErrorCode::InvalidInput);
     }
+    // dep: PostgreSQL(role_maintenance) — transaction entry for `reap_expired_provider_budgets`
     let mut txn = pool.pool().begin().await.map_err(map_db_error)?;
     set_tenant_local(&mut txn, tenant_id).await?;
     let reaped: i32 =

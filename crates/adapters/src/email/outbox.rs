@@ -1,5 +1,13 @@
-//! `email::outbox` — DB-backed queue + worker for `ops.email_outbox`
-//! (`migrations/0038_email_deliverability.sql`). Two entry points:
+//! `adapters::email::outbox` — DB-backed queue + worker for `ops.email_outbox`
+//!   (`migrations/0038_email_deliverability.sql`).
+//! Depends-on: crates=[serde_json, sqlx]; services=[PostgreSQL(any) w=[ops.email_delivery_events, ops.email_outbox, ops.email_suppressions]]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::email, adapters::postgres]
+//! Called-by: [tests]
+//! Invariants: [enqueue is one suppression check + one INSERT and never calls send, so a request handler never blocks
+//!   on SMTP; run_once claims with FOR UPDATE SKIP LOCKED and records every outcome as a state change plus a delivery
+//!   event]
+//! Spec: Baseline §74.6
+//!
+//! Two entry points:
 //!
 //! - [`enqueue`]: runs on the request path (gateway handler, e.g. "send verification code").
 //!   Does a suppression check plus one `INSERT` and returns — it never holds a
@@ -87,6 +95,7 @@ pub async fn is_suppressed(
          WHERE email = $1 AND (expires_at IS NULL OR expires_at > now())",
     )
     .bind(email)
+    // dep: PostgreSQL(any) — executes a query against the pool
     .fetch_all(pool.pool())
     .await?;
 
@@ -125,6 +134,7 @@ pub async fn enqueue(
     .bind(&req.template_id)
     .bind(&req.subject)
     .bind(&req.payload)
+    // dep: PostgreSQL(any) — executes a query against the pool
     .execute(pool.pool())
     .await?;
 
@@ -158,6 +168,7 @@ pub async fn run_once(
     limit: i64,
     claim_user_id: Option<Uuid>,
 ) -> Result<usize, OutboxError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
 
     let rows = sqlx::query(
@@ -289,6 +300,7 @@ pub async fn record_suppression(
     .bind(scope.as_db_str())
     .bind(provider)
     .bind(expires_at)
+    // dep: PostgreSQL(any) — executes a query against the pool
     .execute(pool.pool())
     .await?;
     Ok(())

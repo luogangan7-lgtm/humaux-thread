@@ -1,4 +1,9 @@
 //! `adapters::confirm_token_repo` — `control.confirm_tokens` (migration 0148, ADR-0018).
+//! Depends-on: crates=[humaux-domain, sqlx, uuid]; services=[PostgreSQL(any) w=[control.confirm_tokens] x=[control.sweep_confirm_tokens]]; env=[]; modules=[adapters::postgres, adapters::request_guard_repo, domain::audit, domain::confirm, domain::error, domain::identity]
+//! Called-by: [adapters::affect_repo, adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::subject_repo, gateway::guard, tests, xtask::confirm_sweep]
+//! Invariants: [tokens store only sha256(nonce) and are consumed by one UPDATE inside the caller's transaction;
+//!   replayed, expired or mis-bound tokens are one indistinguishable Conflict, never a silent success]
+//! Spec: Baseline §33.10
 //!
 //! Two writes, both `role_gateway`, both FORCE-RLS tenant-scoped:
 //! - [`mint_with_audit`]: first call of a §33.10 two-step destructive action. One
@@ -138,6 +143,7 @@ pub async fn mint_with_audit(
 ) -> Result<MintedConfirmation, ErrorCode> {
     let (user_id, ttl_seconds) =
         validate_mint(auth, op, target_id, successor_id, ttl, finished_audit)?;
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     set_authorization_local(&mut txn, auth).await?;
     let expires_at: OffsetDateTime = sqlx::query_scalar(
@@ -192,6 +198,7 @@ pub async fn sweep_expired(
     tenant_id: Uuid,
     retention: Duration,
 ) -> Result<i64, ErrorCode> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     // Same technique and rationale as `stream_repo::set_tenant_local` (a `Uuid`'s `Display`
     // only ever emits canonical lowercase hex, so this formatted string carries nothing

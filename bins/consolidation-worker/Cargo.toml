@@ -1,6 +1,7 @@
 [package]
 name = "humaux-consolidation-worker"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
@@ -16,9 +17,13 @@ workspace = true
 # below reaches `humaux_adapters::byok`). Its only inference capability is the
 # `PrivateReasoningPort` trait object from `humaux-application` — the sealed mTLS RPC client
 # that will implement it for real lives in a later task, out of this binary's file scope.
+# why: humaux-adapters dependency; used-by: [consolidation-worker::inference_client, consolidation-worker::main, consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::derived_dispatch_e2e, consolidation-worker::tests::run_once_e2e, humaux-consolidation-worker, tests]
 humaux-adapters = { path = "../../crates/adapters" }
+# why: humaux-application dependency; used-by: [consolidation-worker::inference_client, consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::derived_dispatch_e2e, consolidation-worker::tests::run_once_e2e, humaux-consolidation-worker, tests]
 humaux-application = { path = "../../crates/application" }
+# why: humaux-domain dependency; used-by: [consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::run_once_e2e, humaux-consolidation-worker, tests]
 humaux-domain = { path = "../../crates/domain" }
+# why: tokio dependency; used-by: [consolidation-worker::inference_client, consolidation-worker::main, consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::derived_dispatch_e2e, consolidation-worker::tests::run_once_e2e, tests]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 # `sqlx::types::Uuid` (what `consolidate_repo`'s functions take) is the literal `uuid::Uuid`
 # re-export (`crates/adapters/Cargo.toml`'s own doc comment on the H3 sqlx feature flags says
@@ -26,18 +31,24 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # `sqlx` itself (kept out of this Cargo.toml on purpose, same reasoning as the byok/openbao
 # comment above: the fewer capability-shaped things this binary can name, the fewer things it
 # could accidentally acquire).
+# why: uuid dependency; used-by: [consolidation-worker::inference_client, consolidation-worker::main, consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::derived_dispatch_e2e, consolidation-worker::tests::run_once_e2e, humaux-consolidation-worker, tests]
 uuid = { version = "1.25.0", features = ["v7", "serde"] }
+# why: serde dependency; used-by: [consolidation-worker::inference_client]
 serde = { version = "1", features = ["derive"] }
+# why: serde_json dependency; used-by: [consolidation-worker::inference_client, consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::run_once_e2e, humaux-consolidation-worker, tests]
 serde_json = "1"
 # §11.8 `input_manifest_hash`: SHA-256 over this run's own materialized
 # `(memory_id, input_version, source_hash, ordinal)` tuples — same version pin as every other
 # sha2 use in this workspace (`crates/domain`/`application`/`adapters`/`protocol`/`contracts`
 # Cargo.toml, all "0.11"), not a second independent one.
+# why: sha2 dependency; used-by: [consolidation-worker::inference_client]
 sha2 = "0.11"
+# why: hex dependency; used-by: [consolidation-worker::inference_client]
 hex = "0.4"
 # `inference_client::UdsInferenceClient` implements `PrivateReasoningPort`, which is itself
 # declared with `#[async_trait::async_trait]` — same version pin
 # `crates/application`/`crates/adapters` already use.
+# why: async-trait dependency; used-by: [consolidation-worker::inference_client, consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::derived_dispatch_e2e, consolidation-worker::tests::run_once_e2e, humaux-consolidation-worker, tests]
 async-trait = "0.1"
 
 [dev-dependencies]
@@ -45,13 +56,20 @@ async-trait = "0.1"
 # this task neither existed anywhere in the workspace). Same version/feature pins
 # `crates/adapters/Cargo.toml`'s dev-dependencies already use for the equivalent seeding job in
 # `tests/consolidate_snapshot.rs`, not a second independent choice.
+# why: postgres dependency; used-by: [consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::derived_dispatch_e2e, consolidation-worker::tests::run_once_e2e, tests]
 postgres = { version = "0.19", features = ["with-uuid-1", "with-serde_json-1"] }
+# why: uuid dependency; used-by: [consolidation-worker::inference_client, consolidation-worker::main, consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::derived_dispatch_e2e, consolidation-worker::tests::run_once_e2e, humaux-consolidation-worker, tests]
 uuid = { version = "1.25.0", features = ["v4"] }
+# why: humaux-testkit dependency; used-by: [consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::derived_dispatch_e2e, consolidation-worker::tests::run_once_e2e, tests]
 humaux-testkit = { path = "../../crates/testkit" }
 # `tests/consolidation_hop_e2e.rs` spawns the real `humaux-private-worker` RPC app in-process
 # (its own lib target) rather than reimplementing (and drifting from) its handler — same
 # reasoning `bins/gateway/Cargo.toml`'s doc gives for linking `humaux-retrieval-worker`.
+# why: humaux-private-worker dependency; used-by: [consolidation-worker::tests::consolidation_hop_e2e, tests]
 humaux-private-worker = { path = "../private-worker" }
 # Builds the same real BYOK provider `crates/adapters/tests/minimax_live_smoke.rs:361`
 # constructs — endpoint/model from env, never a literal in src (§78.1).
+# dep-map: allow cargo-usedby — no code in this crate imports axum; referenced only in a
+#   tests/consolidation_hop_e2e.rs doc comment describing the private-worker RPC shape it exercises
+# why: axum dependency; used-by: [tests]
 axum = "0.8.9"

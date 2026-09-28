@@ -1,4 +1,21 @@
-//! ADR-0012/ADR-0014 gateway semantic-recall wiring acceptance.
+//! `gateway::tests::semantic_recall_wiring` — ADR-0012/ADR-0014 gateway semantic-recall wiring acceptance.
+//! Depends-on: crates=[async-trait, axum, humaux-adapters, humaux-application, humaux-contracts, humaux-domain,
+//!   humaux-infra-cell, humaux-local-secret-scan, humaux-projection, humaux-protocol, humaux-retrieval-provider,
+//!   humaux-retrieval-worker, humaux-testkit, postgres, serde_json, time, tokio, uuid];
+//!   services=[PostgreSQL(role_gateway) r=[private.memory_records] w=[projection.private_memory_points,
+//!   projection.stream_checkpoints, projection.tenant_placements], PostgreSQL(role_retrieval_worker), Qdrant(*),
+//!   UDS(retrieval-worker), UDS(serve)]; env=[CARGO_MANIFEST_DIR, HUMAUX_GATEWAY_PG_DSN,
+//!   HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
+//!   HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::postgres, adapters::qdrant,
+//!   adapters::tests::support::operation_receipt_fixture, application::retrieval_embedding_port,
+//!   contracts::retrieval_config, domain::authority, domain::context, domain::dataclass, domain::error,
+//!   domain::identity, domain::ids, domain::memory, gateway::context, gateway::recall, gateway::remember,
+//!   gateway::retrieval_embedding_client, humaux-local-secret-scan, humaux-testkit, infra-cell::permit,
+//!   infra-cell::resource, infra-cell::transport, projection::card, projection::stream, protocol::mcp_catalog,
+//!   retrieval-provider::adapters, retrieval-provider::contract, retrieval-worker::rpc]
+//! Called-by: [cargo-test]
+//! Invariants: [each test wires its own PostgreSQL/Qdrant/UDS fixtures; a missing fixture fails the test rather than skipping it]
+//! Spec: ADR-0012; ADR-0014
 //!
 //! Drives `humaux_gateway::recall::search` directly (no HTTP/MCP layer — that surface is
 //! already covered by `tests/mcp_gateway.rs`'s native MCP acceptance tests) against a real
@@ -88,7 +105,9 @@ fn temp_socket_path(tag: &str) -> std::path::PathBuf {
 /// Mirrors `tests/query_embedding_rpc.rs`'s identical helper (separate test binary).
 async fn own_uid() -> u32 {
     let path = temp_socket_path("uid-probe");
+    // dep: UDS(serve) — test binds a probe socket to read the peer uid
     let listener = tokio::net::UnixListener::bind(&path).expect("bind uid probe socket");
+    // dep: UDS(retrieval-worker) — test dials the probe socket as the retrieval-worker client would
     let client = tokio::net::UnixStream::connect(&path)
         .await
         .expect("connect uid probe");
@@ -141,6 +160,7 @@ fn scanner() -> Arc<LocalSecretScanner> {
 /// `tests/query_embedding_rpc.rs`'s `spawn_worker`.
 async fn spawn_worker(expected_gateway_uid: u32) -> String {
     let socket_path = temp_socket_path("worker");
+    // dep: PostgreSQL(role_retrieval_worker) — test fixture pool for the semantic recall wiring suite
     let calls = RetrievalWorkerDbPool::connect(&required("HUMAUX_RETRIEVAL_WORKER_PG_DSN"))
         .await
         .expect("retrieval worker db pool");
@@ -152,6 +172,7 @@ async fn spawn_worker(expected_gateway_uid: u32) -> String {
         dimension: DIMENSION,
         provider_id: "wiring-test-provider".to_owned(),
     });
+    // dep: UDS(serve) — test serves the real retrieval-worker RPC router on a temp socket
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind worker rpc socket");
     let app = humaux_retrieval_worker::rpc::router(state);
     tokio::spawn(async move {
@@ -300,6 +321,7 @@ async fn create_collection(
         let response = transport
             .execute(
                 &permit,
+                // dep: Qdrant(*) — test issues a Qdrant REST request against the fixture collection
                 IntraCellRequest {
                     method: IntraCellMethod::Put,
                     path,
@@ -331,6 +353,7 @@ async fn delete_collection(
     let _ = transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — test issues a Qdrant REST request against the fixture collection
             IntraCellRequest {
                 method: IntraCellMethod::Delete,
                 path: format!("/collections/{collection}"),
@@ -549,6 +572,7 @@ fn happy_path_placement_and_point_hit() {
             let gateway_uid = own_uid().await;
             let socket_path = spawn_worker(gateway_uid).await;
             let pool = Arc::new(
+                // dep: PostgreSQL(role_gateway) — test fixture pool for the semantic recall wiring suite
                 humaux_adapters::postgres::RuntimeDbPool::connect(&required(
                     "HUMAUX_GATEWAY_PG_DSN",
                 ))
@@ -632,6 +656,7 @@ fn tenant_with_no_placement_degrades_closed_without_calling_qdrant() {
 
         rt.block_on(async {
             let pool = Arc::new(
+                // dep: PostgreSQL(role_gateway) — test fixture pool for the semantic recall wiring suite
                 humaux_adapters::postgres::RuntimeDbPool::connect(&required(
                     "HUMAUX_GATEWAY_PG_DSN",
                 ))
@@ -691,6 +716,7 @@ async fn dead_socket_path_degrades_closed_without_hanging() {
     let registry = cell_registry(cell, caller);
     let transport = qdrant_transport(&registry);
     let pool = Arc::new(
+        // dep: PostgreSQL(role_gateway) — test fixture pool for the semantic recall wiring suite
         humaux_adapters::postgres::RuntimeDbPool::connect(&required("HUMAUX_GATEWAY_PG_DSN"))
             .await
             .expect("real role_gateway pool"),
@@ -771,6 +797,7 @@ async fn gateway_transport_denies_a_write_under_the_read_only_permit() {
     let result = transport
         .execute(
             &permit,
+            // dep: Qdrant(*) — test issues a Qdrant REST request against the fixture collection
             IntraCellRequest {
                 method: IntraCellMethod::Put,
                 path: "/collections/whatever-tenant-forgot-to-check/points".to_owned(),
@@ -806,6 +833,7 @@ fn wrong_dimension_vector_from_port_is_never_hydrated() {
 
         rt.block_on(async {
             let pool = Arc::new(
+                // dep: PostgreSQL(role_gateway) — test fixture pool for the semantic recall wiring suite
                 humaux_adapters::postgres::RuntimeDbPool::connect(&required(
                     "HUMAUX_GATEWAY_PG_DSN",
                 ))

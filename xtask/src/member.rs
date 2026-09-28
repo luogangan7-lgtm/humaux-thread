@@ -1,3 +1,11 @@
+//! `xtask::member` — §6.3 membership lifecycle admin path (invite/activate/suspend/remove/set-role).
+//! Depends-on: crates=[humaux-adapters, humaux-domain, tokio, uuid]; services=[PostgreSQL(role_maintenance)];
+//!   env=[HUMAUX_MAINTENANCE_PG_DSN]; modules=[adapters::membership_repo, adapters::postgres, domain::identity,
+//!   domain::ids]
+//! Called-by: [xtask::main]
+//! Invariants: [domain refuses illegal role edges and the last-OWNER rule; every action (including a refusal) appends its §77 audit row in the same transaction]
+//! Spec: Baseline §6.3; §77; §78.1; ADR-0033
+//!
 //! xtask `member` — the §6.3 membership lifecycle admin path (ADR-0033, card 12): invite /
 //! activate / suspend / remove / set-role for one `(tenant, user)` through
 //! `humaux_adapters::membership_repo` under `role_maintenance` (`HUMAUX_MAINTENANCE_PG_DSN`).
@@ -98,6 +106,7 @@ fn run_inner(args: &[String]) -> Result<String, String> {
         .map_err(|_| format!("missing object: ${MAINTENANCE_DSN_ENV} env var"))?;
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
     rt.block_on(async {
+        // dep: PostgreSQL(role_maintenance) — HUMAUX_MAINTENANCE_PG_DSN, membership admin path
         let pool = MaintenanceDbPool::connect(&dsn)
             .await
             .map_err(|e| format!("cannot connect to ${MAINTENANCE_DSN_ENV}: {e}"))?;

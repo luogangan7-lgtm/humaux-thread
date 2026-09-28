@@ -1,4 +1,9 @@
 //! `application::contribute` — explicit private-to-public contribution entry workflow.
+//! Depends-on: crates=[async-trait, hex, humaux-domain, sha2, tokio, uuid]; services=[]; env=[];
+//!   modules=[application::consolidate, domain::error, domain::evidence, domain::identity, domain::public]
+//! Called-by: [adapters::contribution_entry_repo, adapters::contribution_execution_ingress, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::contribution_scan, application::contribution_execution, humaux-private-worker, tests]
+//! Invariants: []
+//! Spec: none
 //!
 //! Preparation derives candidate bytes through sealed `USER_REASONING`, hashes those exact bytes
 //! at the canonical domain construction point, scans them with an injected adapter, and stores an

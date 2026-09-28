@@ -1,4 +1,15 @@
-//! RequestGuard persistence acceptance against the dedicated real gateway-login fixture.
+//! `adapters::tests::request_guard` — RequestGuard persistence acceptance against the dedicated real gateway-login
+//!   fixture.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, sqlx, tokio];
+//!   services=[PostgreSQL(owner) r=[control.audit_events] w=[control.entitlement_snapshots, control.memberships,
+//!   control.tenants, control.users] x=[control.audit_event_insert], PostgreSQL(role_gateway)];
+//!   env=[HUMAUX_GATEWAY_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres, adapters::request_guard_repo,
+//!   domain::audit, domain::error, domain::identity, domain::ids, humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [the effective entitlement snapshot gates every read request (missing = EntitlementRequired,
+//!   cross-tenant = TenantBoundary) and the §77 audit row commits with the quota transition; the gateway tests are
+//!   #[ignore] lane tests]
+//! Spec: ADR-0047
 
 use std::str::FromStr;
 use std::time::SystemTime;
@@ -58,6 +69,7 @@ impl DbIntegrationFixture for Fixture {
         if admin_options.get_host() != "127.0.0.1" || admin_dsn.contains(['?', '#']) {
             return Err(setup_failed(()));
         }
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut admin = Client::connect(&admin_dsn, NoTls).map_err(setup_failed)?;
         let gateway_dsn = std::env::var("HUMAUX_GATEWAY_PG_DSN").map_err(setup_failed)?;
         let gateway_options = PgConnectOptions::from_str(&gateway_dsn).map_err(setup_failed)?;
@@ -68,6 +80,7 @@ impl DbIntegrationFixture for Fixture {
         {
             return Err(setup_failed(()));
         }
+        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
         let mut gateway = Client::connect(&gateway_dsn, NoTls).map_err(setup_failed)?;
         let role_ok: bool = gateway
             .query_one(
@@ -113,6 +126,7 @@ impl DbIntegrationFixture for Fixture {
             .map_err(setup_failed)?;
         let rt = tokio::runtime::Runtime::new().map_err(setup_failed)?;
         let runtime = rt
+            // dep: PostgreSQL(role_gateway) — test opens a direct PG connection for setup/verification
             .block_on(RuntimeDbPool::connect(&gateway_dsn))
             .map_err(setup_failed)?;
         let authorization = AuthorizationScope::new(

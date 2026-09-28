@@ -1,5 +1,10 @@
-//! `adapters::placement_repo` — the gateway's read-only lookup of §17.3
-//! `projection.tenant_placements` (migration 0068).
+//! `adapters::placement_repo` — the gateway's read-only lookup of §17.3 `projection.tenant_placements` (migration
+//!   0068).
+//! Depends-on: crates=[humaux-domain, sqlx]; services=[PostgreSQL(any) r=[projection.tenant_placements]]; env=[]; modules=[adapters::postgres, adapters::qdrant, domain::error, domain::ids]
+//! Called-by: [gateway::recall]
+//! Invariants: [SELECT-only on projection.tenant_placements under role_gateway; a missing row means not indexed yet
+//!   and the caller must answer DependencyUnavailable, never fall back to another tenant's placement]
+//! Spec: Baseline §6.2.1
 //!
 //! `role_gateway` holds only `SELECT` on this table (§6.2.1 domain default; `adapters::qdrant`'s
 //! own module doc names itself the sole writer, worker-side) — this module never issues an
@@ -32,6 +37,7 @@ pub async fn tenant_placement(
     // explicit transaction it reverts before the next statement runs, so the following SELECT
     // would see `humaux.tenant_id` unset and RLS would deny every row. Both statements must
     // run inside one transaction (mirrors `retrieval_embedding_rpc::set_tenant_local`).
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     sqlx::query("SELECT set_config('humaux.tenant_id', $1, true)")
         .bind(tenant_id.0.to_string())

@@ -1,4 +1,14 @@
 //! `adapters::postgres` — the sole encapsulation point for `sqlx::PgPool` (§6.2.3).
+//! Depends-on: crates=[humaux-domain, humaux-testkit, postgres, sqlx, tokio]; services=[PostgreSQL(any)
+//!   r=[private.events, private.ingest_tickets, private.memory_consolidation_inputs, private.memory_evidence,
+//!   private.memory_records, projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_batch_issuer),
+//!   PostgreSQL(role_consolidation_worker), PostgreSQL(role_gateway), PostgreSQL(role_maintenance),
+//!   PostgreSQL(role_private_worker), PostgreSQL(role_public_worker), PostgreSQL(role_retrieval_worker)];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[domain::error]
+//! Called-by: [adapters::affect_repo, adapters::batch, adapters::confirm_token_repo, adapters::consolidate_repo, adapters::consolidation_reasoner, adapters::context_repo, adapters::continuity_read, adapters::continuity_repo, adapters::contribution_entry_repo, adapters::contribution_execution_ingress, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::contribution_repo, adapters::credential_repo, adapters::disclosure, adapters::distill_reasoner, adapters::distill_repo, adapters::email::outbox, adapters::exact_census, adapters::forget_repo, adapters::jobs, adapters::mechanism_observation, adapters::membership_repo, adapters::memory_governance_repo, adapters::model_call_ledger, adapters::operation_receipt, adapters::placement_repo, adapters::private_inference_rpc, adapters::private_projection_registry, adapters::projection_worker, adapters::provider_budget, adapters::public_provenance, adapters::public_repo, adapters::quota_repo, adapters::read_materialize, adapters::remember, adapters::request_guard_repo, adapters::retrieval_embedding_rpc, adapters::retrieval_query_source, adapters::retrieve, adapters::scheduler, adapters::selection_repo, adapters::serving_repo, adapters::stream_repo, adapters::subject_repo, admin::mechanism, consolidation-worker::inference_client, consolidation-worker::main, gateway::auth, gateway::bootstrap, gateway::context, gateway::continuity, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, gateway::retrieval_embedding_client, humaux-consolidation-worker, humaux-private-worker, private-worker::distill, private-worker::inference_rpc, private-worker::main, public-worker::main, retrieval-provider::adapters, retrieval-worker::main, retrieval-worker::rpc, tests, xtask::confirm_sweep, xtask::e2e_seed, xtask::mechanism_registry, xtask::member, xtask::projection_serve]
+//! Invariants: [the only file that names sqlx::PgPool: eight typed pools, one per role (§6.2.3), each connect checks
+//!   current_user and fails with PoolInitError::RoleMismatch on a wrong role; no raw-pool accessor leaves the crate]
+//! Spec: Baseline §58; §6.2.3; §15.4; §15.2; §6.2.2
 //!
 //! Spec canonical path is `crates/adapters/postgres/src/pools.rs`; this repo's crate layout
 //! (§58) flattens adapters into `crates/adapters/src/<name>.rs` modules, so **this file IS
@@ -88,11 +98,13 @@ impl std::error::Error for PoolInitError {
 /// handing back a pool (§6.2.3 assertion E). This is the *only* place in the crate that
 /// constructs a bare [`PgPool`] — every wrapper's `connect` calls through here.
 async fn connect_checked(dsn: &str, expected_role: &'static str) -> Result<PgPool, PoolInitError> {
+    // dep: PostgreSQL(any) — connects to PostgreSQL
     let pool = PgPoolOptions::new()
         .connect(dsn)
         .await
         .map_err(PoolInitError::Connect)?;
     let row = sqlx::query("SELECT current_user")
+        // dep: PostgreSQL(any) — executes a query against the pool
         .fetch_one(&pool)
         .await
         .map_err(PoolInitError::Connect)?;
@@ -266,6 +278,7 @@ pub(crate) async fn public_observation_database_matches(
 
 async fn database_identity(pool: &PgPool) -> Result<(String, String, i32), ErrorCode> {
     let row = sqlx::query("SELECT current_database() AS db, inet_server_addr()::text AS addr, inet_server_port() AS port")
+        // dep: PostgreSQL(any) — executes a query against the pool
         .fetch_one(pool).await.map_err(|_| ErrorCode::Internal)?;
     let db: String = row.try_get("db").map_err(|_| ErrorCode::Internal)?;
     let addr: Option<String> = row.try_get("addr").map_err(|_| ErrorCode::Internal)?;
@@ -315,6 +328,7 @@ mod tests {
         fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
             let dsn = std::env::var("HUMAUX_TEST_PG_DSN")
                 .map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+            // dep: PostgreSQL(any) — connects to PostgreSQL
             let client = Client::connect(&dsn, NoTls)
                 .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
             Ok((dsn, client))
@@ -347,6 +361,7 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime for sqlx connect");
             for wrong_role in [ROLE_GATEWAY, ROLE_PRIVATE_WORKER] {
                 let mismatch = rt
+                    // dep: PostgreSQL(role_public_worker) — connects to PostgreSQL
                     .block_on(PublicWorkerDbPool::connect(&dsn_as_role(&dsn, wrong_role)))
                     .err()
                     .unwrap_or_else(|| panic!("public worker must reject {wrong_role} DSN"));
@@ -400,6 +415,7 @@ mod tests {
                 .is_some()
                 {
                     let pool = rt
+                        // dep: PostgreSQL(role_public_worker) — connects to PostgreSQL
                         .block_on(PublicWorkerDbPool::connect(&dsn_as_role(
                             &dsn,
                             ROLE_PUBLIC_WORKER,
@@ -520,6 +536,7 @@ mod tests {
             "SELECT quote_ident(a.attname) FROM pg_attribute a               WHERE a.attrelid = $1::regclass AND a.attnum > 0                 AND NOT a.attisdropped AND a.attgenerated = ''               ORDER BY a.attnum",
         )
         .bind(table)
+        // dep: PostgreSQL(any) — executes a query against the pool
         .fetch_all(pool)
         .await
         .unwrap_or_else(|e| panic!("column list for {table}: {e}"));
@@ -536,6 +553,7 @@ mod tests {
         sqlx::query(&format!(
             "INSERT INTO {table} ({columns}) SELECT {columns} FROM {table} WHERE false"
         ))
+        // dep: PostgreSQL(any) — executes a query against the pool
         .execute(pool)
         .await
         .unwrap_or_else(|e| panic!("expected INSERT on {table} to succeed (0-row probe): {e}"));
@@ -553,6 +571,7 @@ mod tests {
         let has_insert: bool =
             sqlx::query_scalar("SELECT has_table_privilege(current_user, $1, 'INSERT')")
                 .bind(table)
+                // dep: PostgreSQL(any) — executes a query against the pool
                 .fetch_one(pool)
                 .await
                 .unwrap_or_else(|e| panic!("has_table_privilege check failed for {table}: {e}"));
@@ -566,6 +585,7 @@ mod tests {
         let err = sqlx::query(&format!(
             "INSERT INTO {table} ({columns}) SELECT {columns} FROM {table} WHERE false"
         ))
+        // dep: PostgreSQL(any) — executes a query against the pool
         .execute(pool)
         .await
         .expect_err(&format!(
@@ -608,6 +628,7 @@ mod tests {
         )
         .bind(schema)
         .bind(bare_table)
+        // dep: PostgreSQL(any) — executes a query against the pool
         .fetch_one(pool)
         .await
         .unwrap_or_else(|e| panic!("column_privileges query failed for {table}: {e}"));
@@ -617,6 +638,7 @@ mod tests {
         );
 
         let err = sqlx::query(&format!("UPDATE {table} SET {col} = {col} WHERE false"))
+            // dep: PostgreSQL(any) — executes a query against the pool
             .execute(pool)
             .await
             .expect_err(&format!(
@@ -644,6 +666,7 @@ mod tests {
             };
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime for sqlx connect");
             rt.block_on(async {
+                // dep: PostgreSQL(role_batch_issuer) — connects to PostgreSQL
                 let pool = BatchIssuerDbPool::connect(&dsn_as_role(&dsn, ROLE_BATCH_ISSUER))
                     .await
                     .expect("connect as role_batch_issuer");
@@ -668,6 +691,7 @@ mod tests {
             };
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime for sqlx connect");
             rt.block_on(async {
+                // dep: PostgreSQL(role_gateway) — connects to PostgreSQL
                 let pool = RuntimeDbPool::connect(&dsn_as_role(&dsn, ROLE_GATEWAY))
                     .await
                     .expect("connect as role_gateway");
@@ -700,6 +724,7 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime for sqlx connect");
             rt.block_on(async {
                 let pool =
+                    // dep: PostgreSQL(role_consolidation_worker) — connects to PostgreSQL
                     ConsolidationDbPool::connect(&dsn_as_role(&dsn, ROLE_CONSOLIDATION_WORKER))
                         .await
                         .expect("connect as role_consolidation_worker");
@@ -728,6 +753,7 @@ mod tests {
             };
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime for sqlx connect");
             rt.block_on(async {
+                // dep: PostgreSQL(role_private_worker) — connects to PostgreSQL
                 let pool = PrivateWorkerDbPool::connect(&dsn_as_role(&dsn, ROLE_PRIVATE_WORKER))
                     .await
                     .expect("connect as role_private_worker");
@@ -746,6 +772,7 @@ mod tests {
     /// table" assertion cannot express.
     async fn update_column_probe_ok(pool: &PgPool, table: &str, col: &str) {
         sqlx::query(&format!("UPDATE {table} SET {col} = {col} WHERE false"))
+            // dep: PostgreSQL(any) — executes a query against the pool
             .execute(pool)
             .await
             .unwrap_or_else(|e| {
@@ -761,6 +788,7 @@ mod tests {
         )
         .bind(table)
         .bind(col)
+        // dep: PostgreSQL(any) — executes a query against the pool
         .fetch_one(pool)
         .await
         .unwrap_or_else(|e| panic!("has_column_privilege check failed for {table}.{col}: {e}"));
@@ -770,6 +798,7 @@ mod tests {
         );
 
         let err = sqlx::query(&format!("UPDATE {table} SET {col} = {col} WHERE false"))
+            // dep: PostgreSQL(any) — executes a query against the pool
             .execute(pool)
             .await
             .expect_err(&format!(
@@ -799,6 +828,7 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime for sqlx connect");
             rt.block_on(async {
                 let pool =
+                    // dep: PostgreSQL(role_retrieval_worker) — connects to PostgreSQL
                     RetrievalWorkerDbPool::connect(&dsn_as_role(&dsn, ROLE_RETRIEVAL_WORKER))
                         .await
                         .expect("connect as role_retrieval_worker");
@@ -834,6 +864,7 @@ mod tests {
             };
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime for sqlx connect");
             rt.block_on(async {
+                // dep: PostgreSQL(role_maintenance) — connects to PostgreSQL
                 let pool = MaintenanceDbPool::connect(&dsn_as_role(&dsn, ROLE_MAINTENANCE))
                     .await
                     .expect("connect as role_maintenance");

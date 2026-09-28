@@ -1,5 +1,9 @@
-//! §52.2 概念对登记表 row 1（`ErrorCode::ProjectionLag` / `DegradeCode::ProjectionLag`）
-//! 的终止侧，G52-5 成对测试。
+//! `testkit::tests::pair::projection_lag_terminal` — §52.2 概念对登记表 row 1（`ErrorCode::ProjectionLag` /
+//!   `DegradeCode::ProjectionLag`） 的终止侧，G52-5 成对测试。
+//! Depends-on: crates=[humaux-domain, humaux-telemetry]; services=[]; env=[]; modules=[domain::error, telemetry::degrade]
+//! Called-by: [testkit::tests::pair_main]
+//! Invariants: []
+//! Spec: Baseline §52.2
 //!
 //! 分界判据（§52.2 表）：请求要求 read-your-write 而投影未追上 ⇒ 终止；
 //! 不要求且已返回滞后结果 ⇒ 降级（降级侧见同目录 `projection_lag_degraded.rs`）。

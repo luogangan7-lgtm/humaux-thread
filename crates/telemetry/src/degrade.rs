@@ -1,5 +1,11 @@
-//! `telemetry::degrade` — `DegradeCode`, `Outcome<T>`, and `abstain()`: the
-//! single fail-open topology for the whole workspace (§53). Every fail-open
+//! `telemetry::degrade` — `DegradeCode`, `Outcome<T>`, and `abstain()`: the single fail-open topology for the whole
+//!   workspace (§53).
+//! Depends-on: crates=[humaux-domain, smallvec, tracing]; services=[]; env=[]; modules=[domain::error]
+//! Called-by: [retrieval::envelope, tests]
+//! Invariants: []
+//! Spec: Baseline §53.3
+//!
+//! Every fail-open
 //! / degrade / abstain path goes through `abstain()`; a caller that returns
 //! a fallback value any other way is what §53.3 rule 1 exists to catch.
 

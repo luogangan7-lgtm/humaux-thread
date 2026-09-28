@@ -1,4 +1,10 @@
-//! §20.4 禁掉的「活集合上的跨事务 OFFSET 分页」——**可执行的坏变体**（DOD-012 的具名注错）。
+//! `adapters::tests::offset_pagination_positive_control` — §20.4 禁掉的「活集合上的跨事务 OFFSET 分页」——**可执行的坏变体**（DOD-012 的具名注错）。
+//! Depends-on: crates=[humaux-testkit, postgres, serde_json, uuid]; services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, private.events, private.evidence_objects, private.memory_evidence, private.memory_records]];
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[humaux-testkit]
+//! Called-by: [cargo-test]
+//! Invariants: [pins the forbidden cross-transaction OFFSET/LIMIT variant as an executable positive control that must
+//!   go wrong when rows land between pages; a missing DB goes through skip_or_fail]
+//! Spec: Baseline §20.4; §80.1; §79.2
 //!
 //! `consolidate_snapshot.rs` 与 `selection_snapshot.rs` 各自的模块注释都声称做过红转绿：
 //! 「本地把实现换成朴素 OFFSET/LIMIT 跨事务分页，测试红了，换回来绿了，坏变体刻意不提交」。
@@ -49,6 +55,7 @@ fn setup() -> Option<Fixture> {
         skip_or_fail(NAME, "missing object: Postgres DSN", ExternalDep::Postgres);
         return None;
     };
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let Ok(mut admin) = Client::connect(&dsn, NoTls) else {
         skip_or_fail(NAME, "missing object: live Postgres", ExternalDep::Postgres);
         return None;
@@ -115,6 +122,7 @@ fn seed_batch(f: &mut Fixture, n: usize) -> Vec<Uuid> {
             )
             .expect("insert memory")
             .get(0);
+        // dep: PostgreSQL(any) — pool/txn query execution
         txn.execute(
             "INSERT INTO private.memory_evidence (memory_id, evidence_id, role) \
              VALUES ($1, $2, 'PRIMARY')",

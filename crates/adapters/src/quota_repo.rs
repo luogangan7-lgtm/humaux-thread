@@ -1,4 +1,13 @@
-//! §72.2.1: durable, tenant-bound quota reservations and independent rate buckets.
+//! `adapters::quota_repo` — §72.2.1: durable, tenant-bound quota reservations and independent rate buckets.
+//! Depends-on: crates=[humaux-domain, sqlx, time, uuid]; services=[PostgreSQL(any) w=[control.quota_windows,
+//!   control.rate_buckets, control.usage_reservations] x=[control.issue_quota_window,
+//!   control.reap_quota_reservations], PostgreSQL(role_gateway), PostgreSQL(role_maintenance)]; env=[];
+//!   modules=[adapters::postgres, domain::audit, domain::error, domain::identity, domain::ids]
+//! Called-by: [adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::request_guard_repo, gateway::bootstrap, gateway::guard, tests, xtask::e2e_seed]
+//! Invariants: [the gateway only consumes existing quota windows; only role_maintenance can issue or reap them;
+//!   exhaustion is QuotaExhausted/RateLimited and a PG error DependencyUnavailable, never an allow]
+//! Spec: none
+//!
 //! The gateway consumes existing windows; only maintenance can invoke their issuer.
 
 use std::{net::IpAddr, time::Duration};
@@ -150,6 +159,7 @@ pub async fn issue_window(
     if tenant.0.is_nil() {
         return Err(ErrorCode::InvalidInput);
     }
+    // dep: PostgreSQL(role_maintenance) — transaction entry for `issue_window`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     bind_tenant(&mut txn, tenant, None).await?;
     let row = sqlx::query("SELECT * FROM control.issue_quota_window($1, $2)")
@@ -173,6 +183,7 @@ pub async fn reserve_bmo(
     request_fingerprint: &str,
     ttl: Duration,
 ) -> Result<ReserveResult, ErrorCode> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `reserve_bmo`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     let result = reserve_bmo_in_txn(
         &mut txn,
@@ -317,6 +328,7 @@ pub async fn finish_reservation(
     reservation: &QuotaReservation,
     consume: bool,
 ) -> Result<ReservationStatus, ErrorCode> {
+    // dep: PostgreSQL(role_gateway) — transaction entry for `finish_reservation`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     let status = finish_reservation_in_txn(&mut txn, auth, reservation, consume).await?;
     txn.commit().await.map_err(db_error)?;
@@ -402,6 +414,7 @@ pub async fn reap_expired(
     if tenant.0.is_nil() || limit <= 0 {
         return Err(ErrorCode::InvalidInput);
     }
+    // dep: PostgreSQL(role_maintenance) — transaction entry for `reap_expired`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     bind_tenant(&mut txn, tenant, None).await?;
     let reaped = sqlx::query_scalar("SELECT control.reap_quota_reservations($1, $2)")
@@ -488,6 +501,7 @@ pub async fn consume_rate(
             )
         }
     };
+    // dep: PostgreSQL(role_gateway) — transaction entry for `consume_rate`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
     bind_tenant(&mut txn, tenant, user).await?;
     // Concurrent consumers of ONE bucket are serialized by waiting, not by refusing. Two

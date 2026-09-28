@@ -1,4 +1,12 @@
-//! Authenticated Context result: stable handoff diagnostics plus same-snapshot bodies.
+//! `gateway::context` — Authenticated Context result: stable handoff diagnostics plus same-snapshot bodies.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, humaux-retrieval, serde, serde_json, sha2,
+//!   uuid]; services=[]; env=[]; modules=[adapters::context_repo, adapters::postgres, adapters::read_materialize,
+//!   adapters::retrieve, domain::context, domain::error, domain::identity, domain::ids, gateway::recall,
+//!   gateway::remember, projection::serving, projection::stream, retrieval::compiler, retrieval::completeness,
+//!   retrieval::envelope, retrieval::handoff, retrieval::request]
+//! Called-by: [gateway::bootstrap, gateway::mcp_application, gateway::memory, gateway::recall, tests]
+//! Invariants: [every field in a returned Context is read from the same snapshot; a partial read never yields a body silently missing a section]
+//! Spec: Baseline §22.0; §23.1; §25; ADR-0024; ADR-0031
 
 use std::{
     collections::BTreeMap,

@@ -1,4 +1,18 @@
-//! Phase 9 migration 0133: final self-principal reservation authority gate.
+//! `adapters::tests::contribution_self_principal_authority_0133` — Phase 9 migration 0133: final self-principal
+//!   reservation authority gate.
+//! Depends-on: crates=[postgres, serde_json, uuid]; services=[PostgreSQL(any) r=[control.contribution_policies,
+//!   ops.data_disclosures, ops.model_call_ledger] w=[control.private_reasoning_domains, control.tenants,
+//!   control.workspace_memberships, control.workspaces, ops.jobs, ops.reasoning_provider_health_observations,
+//!   private.contribution_execution_sources, private.contribution_executions, private.events,
+//!   private.evidence_objects, private.memory_evidence, private.memory_records]
+//!   x=[control.resolve_user_reasoning_admission, ops.guard_contribution_input_change, ops.lock_contribution_inputs,
+//!   private.assert_contribution_prepared_route_shape, private.enqueue_contribution_execution,
+//!   private.reserve_contribution_a]]; env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::tests::support::contribution_fixture]
+//! Called-by: [cargo-test]
+//! Invariants: [the 0133 contract is pinned statically; authority changes and deletes must wait for the reservation
+//!   and then fail closed; the PG tests are #[ignore] lane tests needing PostgreSQL 18 migrated through 0133]
+//! Spec: none
 
 #[path = "support/contribution_fixture.rs"]
 mod contribution_fixture;
@@ -382,6 +396,7 @@ fn workspace_authority_change_waits_for_reservation_and_then_fails_closed() {
         seed_ready(&mut fixture, "workspace-lock-holder");
     let (stale, stale_attempt, stale_route) = seed_ready(&mut fixture, "workspace-stale");
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL fixture");
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `workspace_authority_change_waits_for_reservation_and_then_fails_closed`
     let mut reservation_client = Client::connect(&dsn, NoTls).expect("reservation connection");
     let mut reservation_tx = reservation_client
         .transaction()
@@ -401,6 +416,7 @@ fn workspace_authority_change_waits_for_reservation_and_then_fails_closed() {
     let mutation_dsn = dsn.clone();
     let mutation_application = application_name.clone();
     let mutation = thread::spawn(move || {
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `workspace_authority_change_waits_for_reservation_and_then_fails_closed`
         let mut client = Client::connect(&mutation_dsn, NoTls).expect("workspace mutation client");
         client
             .query_one(
@@ -454,6 +470,7 @@ fn workspace_delete_waits_for_reservation_and_cannot_remove_referenced_authority
     let (mut fixture, workspace, _) = workspace_shared_fixture();
     let (reserved, attempt, route) = seed_ready(&mut fixture, "workspace-delete-lock-holder");
     let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL fixture");
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `workspace_delete_waits_for_reservation_and_cannot_remove_referenced_authority`
     let mut reservation_client = Client::connect(&dsn, NoTls).expect("reservation connection");
     let mut reservation_tx = reservation_client
         .transaction()
@@ -468,6 +485,7 @@ fn workspace_delete_waits_for_reservation_and_cannot_remove_referenced_authority
     let (started_tx, started_rx) = mpsc::channel();
     let mutation_application = application_name.clone();
     let mutation = thread::spawn(move || {
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `workspace_delete_waits_for_reservation_and_cannot_remove_referenced_authority`
         let mut client = Client::connect(&dsn, NoTls).expect("workspace delete client");
         client
             .query_one(
@@ -1196,12 +1214,14 @@ fn cutover_nonterminal_precheck_is_atomic() {
     let base_dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL 18 DSN");
     let database = format!("humaux_0133_cutover_{}", Uuid::new_v4().simple());
     let test_dsn = database_dsn(&base_dsn, &database);
+    // dep: PostgreSQL(any) — opens the role-scoped connection for `cutover_nonterminal_precheck_is_atomic`
     let mut admin = Client::connect(&base_dsn, NoTls).expect("admin DB");
     admin
         .batch_execute(&format!("CREATE DATABASE {database}"))
         .expect("create disposable cutover DB");
 
     {
+        // dep: PostgreSQL(any) — opens the role-scoped connection for `cutover_nonterminal_precheck_is_atomic`
         let mut db = Client::connect(&test_dsn, NoTls).expect("cutover DB");
         let migration_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");

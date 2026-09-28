@@ -1,3 +1,9 @@
+//! `xtask::contract_impact` — G80-42 contract-impact-check: contract-changed blocks run their mandatory checkers.
+//! Depends-on: crates=[]; services=[subprocess(git)]; env=[CARGO_MANIFEST_DIR, CI, GITHUB_ACTIONS]; modules=[]
+//! Called-by: [xtask::main]
+//! Invariants: [canonical block ids and the block→checker map are parsed live from spec §80.3, never hardcoded here]
+//! Spec: Baseline §80.3; §80.1
+//!
 //! xtask `contract-impact` — G80-42 `contract-impact-check` (§80.3).
 //!
 //! 不重新定义各业务判据；只保证「承重契约改动后，对应 checker 被一起执行」（§80.3 开篇：
@@ -377,6 +383,7 @@ fn evaluate_checker(
 
 /// `git diff --name-only <base>` -> 改动文件的仓库相对路径集合。
 fn git_changed_files(base: &str) -> Result<BTreeSet<String>, String> {
+    // dep: subprocess(git) — diff the changed files for this run
     let out = Command::new("git")
         .args(["diff", "--name-only", base])
         .output()
@@ -398,6 +405,7 @@ fn git_changed_files(base: &str) -> Result<BTreeSet<String>, String> {
 /// `git diff --unified=0 <base> -- <file>` -> 该文件在「新版」坐标系下被改动触及的行号集合。
 /// hunk 头 `@@ -a,b +c,d @@` 取 `+c,d`：`d==0`（纯删除）记 `c`（插入点附近），否则记 `c..c+d-1`。
 fn git_changed_lines(base: &str, file: &str) -> Result<BTreeSet<usize>, String> {
+    // dep: subprocess(git) — diff the changed files for this run
     let out = Command::new("git")
         .args(["diff", "--unified=0", base, "--", file])
         .output()

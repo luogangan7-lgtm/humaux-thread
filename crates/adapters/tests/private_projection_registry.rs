@@ -1,4 +1,19 @@
-//! Ignored real-PostgreSQL acceptance for the private Qdrant point registry.
+//! `adapters::tests::private_projection_registry` — Ignored real-PostgreSQL acceptance for the private Qdrant point
+//!   registry.
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, humaux-projection, humaux-testkit,
+//!   postgres, serde_json, sqlx, tokio]; services=[PostgreSQL(any) r=[ops.commit_seq_seq] w=[control.memberships,
+//!   control.private_reasoning_domains, control.reasoning_domain_grants, control.tenants, control.users, ops.outbox,
+//!   private.events, private.evidence_objects, private.memory_evidence, private.memory_records,
+//!   projection.private_memory_points, projection.stream_checkpoints, projection.stream_log],
+//!   PostgreSQL(role_gateway), PostgreSQL(role_retrieval_worker), Qdrant(*)]; env=[HUMAUX_TEST_PG_DSN,
+//!   HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::postgres, adapters::private_projection_registry, adapters::qdrant,
+//!   adapters::read_materialize, adapters::retrieve, domain::authority, domain::dataclass, domain::identity,
+//!   domain::ids, domain::memory, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
+//!   projection::card, projection::serving]
+//! Called-by: [cargo-test]
+//! Invariants: [point ids bind to exactly one memory; cross-workspace, collision and unsupported point ids are typed
+//!   errors; needs the isolated migrated PG + Qdrant fixture, so the tests are #[ignore] lane tests]
+//! Spec: Baseline §17.4; §79.2
 //!
 //! Run explicitly against the isolated migrated fixture:
 //! `cargo test -p humaux-adapters --test private_projection_registry -- --ignored`.
@@ -77,6 +92,7 @@ async fn delete_qdrant_collection(
     let response = transport
         .execute(
             permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
             IntraCellRequest {
                 method: IntraCellMethod::Delete,
                 path: format!("/collections/{collection}"),
@@ -201,6 +217,7 @@ fn seed_memory(
     )?;
     let memory_id: Uuid = row.get(0);
     let body_sha256: Vec<u8> = row.get(1);
+    // dep: PostgreSQL(any) — pool/txn query execution
     txn.execute(
         "INSERT INTO private.memory_evidence(memory_id,evidence_id,role) VALUES($1,$2,'SUPPORTING')",
         &[&memory_id, &evidence_id],
@@ -215,6 +232,7 @@ impl DbIntegrationFixture for RegistryFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
         let ready: bool = admin
@@ -257,9 +275,11 @@ impl DbIntegrationFixture for RegistryFixture {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(format!("{e:?}")))?;
         let runtime = rt
+            // dep: PostgreSQL(role_gateway) — open a role-scoped PG connection/pool for this test
             .block_on(RuntimeDbPool::connect(&dsn_as_role(&dsn, "role_gateway")))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(format!("{e:?}")))?;
         let worker = rt
+            // dep: PostgreSQL(role_retrieval_worker) — open a role-scoped PG connection/pool for this test
             .block_on(RetrievalWorkerDbPool::connect(&dsn_as_role(
                 &dsn,
                 "role_retrieval_worker",
@@ -388,6 +408,7 @@ async fn create_qdrant_collection(
     let create = transport
         .execute(
             permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
             IntraCellRequest {
                 method: IntraCellMethod::Put,
                 path: format!("/collections/{collection}"),
@@ -410,6 +431,7 @@ async fn create_qdrant_collection(
     let index = transport
         .execute(
             permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
             IntraCellRequest {
                 method: IntraCellMethod::Put,
                 path: format!("/collections/{collection}/index"),
@@ -863,6 +885,7 @@ fn assert_hash_invalidation(handle: &mut Handle) {
 }
 
 fn assert_gateway_write_rejected(handle: &Handle) {
+    // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut gateway = Client::connect(&dsn_as_role(&handle.dsn, "role_gateway"), NoTls).unwrap();
     let direct_write = gateway.batch_execute(&format!(
         "BEGIN; SET LOCAL humaux.tenant_id = '{}'; SET LOCAL humaux.user_id = '{}'; \

@@ -1,4 +1,8 @@
-//! Typed retrieval-profile configuration (§50 / §55.6).
+//! `contracts::retrieval_config` — Typed retrieval-profile configuration (§50 / §55.6).
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[contracts::config_registry]
+//! Called-by: [gateway::bootstrap, retrieval::request, tests]
+//! Invariants: []
+//! Spec: Baseline §50; §55.1; §55.6
 //!
 //! This is the sole bootstrap boundary for retrieval depth. A request caller receives an
 //! already-resolved [`RegisteredRetrievalProfile`] and therefore cannot turn a request-local

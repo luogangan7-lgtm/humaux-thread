@@ -1,7 +1,21 @@
-//! `adapters::projection_worker` — T-projection-worker: makes `humaux-retrieval-worker`
-//! actually index private memories per §17.4's contract, restated verbatim in the task card:
-//! "upsert -> await/verify search-visible according to adapter policy -> commit stream
-//! checkpoint". §4.2 (line 818): there is no separate `projection-worker` process — this is
+//! `adapters::projection_worker` — T-projection-worker: makes `humaux-retrieval-worker` actually index private
+//!   memories per §17.4's contract, restated verbatim in the task card: "upsert -> await/verify search-visible
+//!   according to adapter policy -> commit stream checkpoint".
+//! Depends-on: crates=[async-trait, humaux-domain, humaux-infra-cell, humaux-local-secret-scan, humaux-projection,
+//!   serde_json, sqlx]; services=[PostgreSQL(any) r=[private.evidence_objects, private.memory_evidence,
+//!   private.memory_records, private.memory_subjects] w=[ops.outbox, projection.stream_log],
+//!   PostgreSQL(role_retrieval_worker)]; env=[]; modules=[adapters::affect_repo, adapters::postgres,
+//!   adapters::private_projection_registry, adapters::qdrant, adapters::remember, adapters::stream_repo,
+//!   domain::affect, domain::authority, domain::dataclass, domain::egress, domain::error, domain::identity,
+//!   domain::ids, domain::memory, domain::subject, humaux-local-secret-scan, infra-cell::permit,
+//!   infra-cell::transport, projection::card, projection::serving, projection::stream]
+//! Called-by: [retrieval-worker::main, tests]
+//! Invariants: [one run_once handles exactly one stream key; per row: resolve bound memories, upsert, verify
+//!   search-visible, then advance the ticket; a Qdrant or PG failure leaves the ticket ISSUED for retry, never marked
+//!   done]
+//! Spec: Baseline §4.2; §15.1; §17.4; §18.2; §15.7; §6.1.2
+//!
+//! §4.2 (line 818): there is no separate `projection-worker` process — this is
 //! `humaux-retrieval-worker`'s own consumer loop, owned by `role_retrieval_worker`.
 //!
 //! ## What one [`run_once`] call processes
@@ -556,6 +570,7 @@ async fn resolve_and_embed(
     workspace_id: WorkspaceId,
     commit_seq: i64,
 ) -> Result<Prepared, (RowTerminal, &'static str)> {
+    // dep: PostgreSQL(any) — transaction entry for `resolve_and_embed`
     let mut txn = deps
         .pool
         .pool()
@@ -835,6 +850,7 @@ async fn fetch_issued_rows(
     key: &StreamKey,
     batch: i64,
 ) -> Result<Vec<(i64, i64)>, ErrorCode> {
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `fetch_issued_rows`
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     set_worker_rls_context(&mut txn, key.tenant_id.0)
         .await
@@ -886,6 +902,7 @@ async fn settle_row(
         RowTerminal::Failed => "FAILED",
         RowTerminal::Pending => return Ok(()),
     };
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `settle_row`
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     set_worker_rls_context(&mut txn, key.tenant_id.0)
         .await

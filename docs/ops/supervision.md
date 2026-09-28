@@ -5,6 +5,12 @@
 > `docs/adr/0037-liveness-readiness-and-supervision.md`. Spec § numbers are references, never
 > copies — judgement text lives in `docs/architecture/Baseline_2.9.md`.
 
+**Environment variables.** This runbook does not list them. The one complete list is
+[`docs/architecture/env_vars.md`](../architecture/env_vars.md), generated from the code by
+`cargo xtask dep-map --write`. It covers every variable, which process and module reads it, and
+whether the typed registry declares it. `cargo xtask dep-map --check` fails when the list and the
+code drift apart. Look a variable up there rather than copying it here.
+
 ## 1. The five processes and how each answers "are you up"
 
 | process | liveness | readiness | resident? |
@@ -134,8 +140,8 @@ peer credential (`UnixStream::peer_cred()`):
 
 | socket | server | accepts only uid | checked in |
 |---|---|---|---|
-| query-embedding RPC | `humaux-retrieval-worker` | `HUMAUX_RETRIEVAL_WORKER_GATEWAY_UID` | `bins/retrieval-worker/src/rpc.rs` |
-| private inference RPC | `humaux-private-worker` | `HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID` | `bins/private-worker/src/inference_rpc.rs` |
+| query-embedding RPC | `humaux-retrieval-worker` | the gateway's uid (its `*_GATEWAY_UID` row in env_vars.md) | `bins/retrieval-worker/src/rpc.rs` |
+| private inference RPC | `humaux-private-worker` | the consolidation worker's uid (its `*_CONSOLIDATION_UID` row in env_vars.md) | `bins/private-worker/src/inference_rpc.rs` |
 
 **Therefore the gateway, the retrieval worker, the private worker and the consolidation worker
 MUST each run as a distinct OS user.** If any two of the four share a uid, the peer-credential
@@ -166,8 +172,8 @@ or exits non-zero having **named the object it could not reach**. There is no th
 | `deploy.binary` | live: the git sha / build time burned in at compile time, plus the crate version |
 | the other 9 | each names the specific object it lacks (a column that is GA-建 and not yet migrated, a read grant this process does not hold, a counter store that does not exist outside the emitting process). ADR-0037 §"What is not wired" lists the unlock condition for each |
 
-`deploy.binary` answers only when the build burned in `HUMAUX_BUILD_GIT_SHA` (and, optionally,
-`HUMAUX_BUILD_TIME`). `bins/admin/build.rs` fills it from `git rev-parse HEAD` when the build
+`deploy.binary` answers only when the build burned in the git sha (build-time variables of
+`admin::build`, see env_vars.md). `bins/admin/build.rs` fills it from `git rev-parse HEAD` when the build
 environment did not supply one, so an ordinary `cargo build` inside a checkout already answers.
 **Release builds should still set it explicitly** — the build then does not depend on a `.git`
 directory being present, and an explicit value always wins:
