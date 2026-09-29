@@ -1,14 +1,20 @@
 //! `adapters::stream_repo` — §15 `projection.stream_log` / `stream_checkpoints` SQL: T3.3's `advance_prefix`
 //!   (three/four independent reads + monotonic watermark write, both through [`RetrievalWorkerDbPool`]) and T3.4's
 //!   `ISSUED -> LOST` patrol (through [`MaintenanceDbPool`]).
-//! Depends-on: crates=[humaux-domain, humaux-projection, humaux-retrieval, sqlx]; services=[PostgreSQL(any)
+//! Depends-on: crates=[humaux-domain, humaux-projection, humaux-retrieval, humaux-testkit, sqlx, tokio];
+//!   services=[PostgreSQL(any)
 //!   r=[ops.jobs, projection.processing_gaps] w=[projection.stream_checkpoints, projection.stream_log]
-//!   x=[projection.retire_failed_ticket], PostgreSQL(role_maintenance), PostgreSQL(role_retrieval_worker)]; env=[];
-//!   modules=[adapters::postgres, adapters::retrieve, domain::egress, projection::stream, retrieval::completeness]
-//! Called-by: [adapters::context_repo, adapters::projection_worker, adapters::retrieve, tests, xtask::projection_serve]
+//!   x=[projection.retire_failed_ticket], PostgreSQL(role_maintenance), PostgreSQL(role_retrieval_worker)
+//!   x=[projection.claim_issued_tickets, projection.unplaced_issued_tickets]]; env=[HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::placement_repo, adapters::postgres, adapters::qdrant, adapters::retrieve, domain::egress,
+//!   projection::stream, retrieval::completeness]
+//! Called-by: [adapters::context_repo, adapters::projection_worker, adapters::retrieve, retrieval-worker::main, tests,
+//!   xtask::projection_serve]
 //! Invariants: [every function opens its own transaction and sets humaux.tenant_id before touching FORCE-RLS stream
-//!   tables (otherwise it would silently see zero rows); consistency arithmetic lives in humaux_projection::stream]
-//! Spec: Baseline §6.2.0; §11; §15.2
+//!   tables (otherwise it would silently see zero rows) — except the two ADR-0052 definer calls, which are the only
+//!   cross-tenant reads/claims of stream_log; every settle/retry/release write is fenced on (lease_owner, attempts), so
+//!   a worker whose lease was reclaimed writes 0 rows; consistency arithmetic lives in humaux_projection::stream]
+//! Spec: Baseline §6.2.0; §11; §15.2; ADR-0052
 //!
 //! The consistency arithmetic itself lives in
 //! `humaux_projection::stream` (no IO, unit-tested there); this module only fetches the
@@ -37,6 +43,7 @@ use humaux_retrieval::completeness::{
 };
 
 use crate::postgres::{MaintenanceDbPool, RetrievalWorkerDbPool};
+use crate::qdrant::{RetrievalFamily, TenantPlacementRow};
 use crate::retrieve::SETTLED_OK_SQL_LIST;
 
 type Txn<'c> = sqlx::Transaction<'c, sqlx::Postgres>;
@@ -453,4 +460,377 @@ pub async fn sweep_lost(
     txn.commit().await?;
 
     Ok(result.rows_affected())
+}
+
+/// ADR-0052 D-B: "RETRY" is not a state. A ticket backing off after a transient failure is
+/// `ISSUED` with a spent attempt, a future `next_attempt_at` and no lease — this predicate, named
+/// once here and used by the rehearsal and the tests, is the whole definition. The state stays
+/// `ISSUED` so the 0011/0167 transition guard and the §6.2.2 verbatim triple for
+/// `role_retrieval_worker` do not change.
+pub const RETRY_PREDICATE: &str =
+    "state = 'ISSUED' AND attempts >= 1 AND next_attempt_at > now() AND lease_owner IS NULL";
+
+/// One ticket [`claim_issued`] leased, with the tenant's §17.3 placement row the claim joined
+/// (ADR-0052 D-C: the worker needs no placement lookup and no placement cache).
+#[derive(Debug, Clone)]
+pub struct ClaimedTicket {
+    pub key: StreamKey,
+    pub stream_seq: i64,
+    pub commit_seq: i64,
+    /// `attempts` after the claim's increment — the fence every later write of this ticket uses.
+    pub attempts: i32,
+    pub placement: TenantPlacementRow,
+}
+
+/// Who may settle, retry or release a ticket (ADR-0052 D-D). Every such write carries
+/// `lease_owner IS NOT DISTINCT FROM <owner> AND attempts = <attempts>`: a worker whose lease
+/// expired and was re-claimed by another (which bumped `attempts`) writes 0 rows — reported as a
+/// lost lease, never an error. No `lease_expires_at > now()` in the fence (ADR-0036 D4: a settle
+/// that lands just after expiry, before anyone re-claimed, is still the only writer).
+#[derive(Debug, Clone, Copy)]
+pub struct TicketFence<'a> {
+    /// The claim's lease owner; `None` for the legacy unleased single-key read (`run_once`).
+    pub lease_owner: Option<&'a str>,
+    /// `attempts` as the claim (or the legacy read) returned it.
+    pub attempts: i32,
+}
+
+/// ADR-0052 D-E backoff: the n-th transient failure waits `min(base * 2^(n-1), max)` seconds.
+#[derive(Debug, Clone, Copy)]
+pub struct Backoff {
+    pub base_secs: f64,
+    pub max_secs: f64,
+}
+
+/// The §15.1 ticket triple a claim takes plus the §17.3 placement family its tenants must be
+/// placed in. [`ClaimFamily::of`] derives both from one [`RetrievalFamily`] (card 21's single
+/// source); the fields are open so a test can claim a throwaway `projection_version` that no real
+/// ticket carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimFamily {
+    pub domain: String,
+    pub projection_kind: String,
+    pub projection_version: String,
+    pub placement: RetrievalFamily,
+}
+
+impl ClaimFamily {
+    /// `None` for a §17 family that is not a `projection.stream_log` producer.
+    pub fn of(placement: RetrievalFamily) -> Option<Self> {
+        let ticket = placement.ticket_family()?;
+        Some(Self {
+            domain: ticket.domain().to_owned(),
+            projection_kind: ticket.projection_kind().to_owned(),
+            projection_version: ticket.projection_version().to_owned(),
+            placement,
+        })
+    }
+}
+
+/// A ticket [`claim_issued`] leased whose placement row this build could not parse (a
+/// CHECK-constrained column carrying a value it does not know — deploy skew, e.g. a newer
+/// migration's `promotion_state`). The caller parks it ([`release_for_retry`] with
+/// `spend = false`); it is never processed without a placement and never counts toward
+/// `transient_exhausted`. The stream key comes as its raw columns — the caller types it.
+#[derive(Debug, Clone)]
+pub struct UnplaceableTicket {
+    pub tenant_id: Uuid,
+    pub scope_kind: String,
+    pub scope_id: Uuid,
+    pub domain: String,
+    pub projection_kind: String,
+    pub projection_version: String,
+    pub stream_seq: i64,
+    pub attempts: i32,
+}
+
+/// What one [`claim_issued`] leased, split per row (review 2026-09-29 P1: one unparsable row
+/// used to fail the whole already-committed claim and strand every co-claimed ticket).
+#[derive(Debug, Default)]
+pub struct ClaimBatch {
+    pub tickets: Vec<ClaimedTicket>,
+    pub unplaceable: Vec<UnplaceableTicket>,
+}
+
+/// ADR-0052 D-C: leases up to `limit` ISSUED tickets of `family`'s triple across every tenant that
+/// has a placement row for `family.placement` — at most `per_tenant_cap` per tenant, one family never to two workers —
+/// through the owner definer `projection.claim_issued_tickets` (migration 0176, EXECUTE:
+/// `role_retrieval_worker` only). Autocommit on purpose: the function takes a transaction-scoped
+/// advisory lock and requires READ COMMITTED, so the lock is released the moment the claim commits.
+/// The leases are committed before any row is parsed, so rows are parsed one by one
+/// ([`parse_claim_rows`]): a bad row costs only itself.
+pub async fn claim_issued(
+    pool: &RetrievalWorkerDbPool,
+    family: &ClaimFamily,
+    lease_owner: &str,
+    lease_seconds: f64,
+    limit: i64,
+    per_tenant_cap: i64,
+) -> Result<ClaimBatch, StreamRepoError> {
+    let rows = sqlx::query(
+        "SELECT * FROM projection.claim_issued_tickets($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(&family.domain)
+    .bind(&family.projection_kind)
+    .bind(&family.projection_version)
+    .bind(family.placement.as_db_str())
+    .bind(lease_owner)
+    .bind(lease_seconds)
+    .bind(limit)
+    .bind(per_tenant_cap)
+    // dep: PostgreSQL(role_retrieval_worker) — the cross-tenant ticket claim definer (0176)
+    .fetch_all(pool.pool())
+    .await?;
+    Ok(parse_claim_rows(&rows))
+}
+
+/// Per-row parse of the claim's result. A row whose placement does not parse becomes an
+/// [`UnplaceableTicket`]; a row whose stream key itself does not parse (only possible if the
+/// definer's `RETURNS TABLE` drifted from this build) is logged and left to its lease expiry —
+/// it cannot even be addressed for a release.
+fn parse_claim_rows(rows: &[sqlx::postgres::PgRow]) -> ClaimBatch {
+    let mut batch = ClaimBatch::default();
+    for row in rows {
+        let head = (|| -> Result<UnplaceableTicket, sqlx::Error> {
+            Ok(UnplaceableTicket {
+                tenant_id: row.try_get("tenant_id")?,
+                scope_kind: row.try_get("scope_kind")?,
+                scope_id: row.try_get("scope_id")?,
+                domain: row.try_get("domain")?,
+                projection_kind: row.try_get("projection_kind")?,
+                projection_version: row.try_get("projection_version")?,
+                stream_seq: row.try_get("stream_seq")?,
+                attempts: row.try_get("attempts")?,
+            })
+        })();
+        let (head, commit_seq) = match head.and_then(|h| Ok((h, row.try_get("commit_seq")?))) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!("stream_repo: claimed row without a readable stream key: {error}");
+                continue;
+            }
+        };
+        match crate::placement_repo::from_row(row) {
+            // The claim's one `tenant_id` column is the ticket's and, by the join, the
+            // placement's; the parsed placement row carries it typed.
+            Ok(placement) => batch.tickets.push(ClaimedTicket {
+                key: StreamKey::new(
+                    placement.tenant_id,
+                    head.scope_kind,
+                    head.scope_id,
+                    head.domain,
+                    head.projection_kind,
+                    head.projection_version,
+                ),
+                stream_seq: head.stream_seq,
+                commit_seq,
+                attempts: head.attempts,
+                placement,
+            }),
+            Err(_) => batch.unplaceable.push(head),
+        }
+    }
+    batch
+}
+
+/// ADR-0052 D-C: per tenant, the ISSUED workspace tickets of `family`'s triple that
+/// [`claim_issued`] will never take because the tenant has no placement row — the worker's
+/// `placement_missing` line. Read-only owner definer `projection.unplaced_issued_tickets` (0176).
+pub async fn unplaced_issued(
+    pool: &RetrievalWorkerDbPool,
+    family: &ClaimFamily,
+) -> Result<Vec<(Uuid, i64)>, StreamRepoError> {
+    let rows = sqlx::query("SELECT * FROM projection.unplaced_issued_tickets($1, $2, $3, $4)")
+        .bind(&family.domain)
+        .bind(&family.projection_kind)
+        .bind(&family.projection_version)
+        .bind(family.placement.as_db_str())
+        // dep: PostgreSQL(role_retrieval_worker) — the cross-tenant unplaced-ticket count definer (0176)
+        .fetch_all(pool.pool())
+        .await?;
+    rows.iter()
+        .map(|row| Ok((row.try_get("tenant_id")?, row.try_get("tickets")?)))
+        .collect()
+}
+
+/// ADR-0052 D-D heartbeat (ADR-0043's per-row cadence): extends every live lease `lease_owner`
+/// holds on `key`'s family by `lease_seconds`, under the family's own tenant GUC and the role's
+/// existing table-level UPDATE (no definer, no new grant). Returns the `stream_seq`s renewed; a
+/// ticket missing from it lost its lease (expired and possibly re-claimed) and must not settle.
+pub async fn renew_family_leases(
+    pool: &RetrievalWorkerDbPool,
+    key: &StreamKey,
+    lease_owner: &str,
+    lease_seconds: f64,
+) -> Result<Vec<i64>, StreamRepoError> {
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `renew_family_leases`
+    let mut txn = pool.pool().begin().await?;
+    set_tenant_local(&mut txn, key.tenant_id.0).await?;
+    let renewed = bind_key(
+        sqlx::query(&format!(
+            "UPDATE projection.stream_log \
+                SET lease_expires_at = clock_timestamp() + make_interval(secs => $8) \
+              WHERE {KEY_WHERE} AND state = 'ISSUED' AND lease_owner = $7 \
+                AND lease_expires_at > clock_timestamp() \
+             RETURNING stream_seq"
+        )),
+        key,
+    )
+    .bind(lease_owner)
+    .bind(lease_seconds)
+    .fetch_all(&mut *txn)
+    .await?
+    .iter()
+    .map(|row| row.try_get::<i64, _>("stream_seq"))
+    .collect::<Result<Vec<_>, _>>()?;
+    txn.commit().await?;
+    Ok(renewed)
+}
+
+/// ADR-0052 D-D retry: a transient failure returns the ticket to the pool — lease cleared, the
+/// failure class kept in `error_class` (the next DONE settle writes NULL over it) and, with a
+/// `backoff`, `next_attempt_at = now + min(base * 2^(attempts-1), max)` so the claim skips it
+/// until then. `spend` says whether this failure counts toward `max_attempts`: a leased ticket
+/// already spent its attempt at the claim, so `spend = false` gives it back — but never below 1,
+/// so a ticket that has failed is always visibly a retry ([`RETRY_PREDICATE`]) and backs off at
+/// least `base`. The legacy unleased read (`fence.lease_owner == None`) spends it here. Returns
+/// `false` when the fence matched nothing (the lease was lost).
+pub async fn release_for_retry(
+    pool: &RetrievalWorkerDbPool,
+    key: &StreamKey,
+    stream_seq: i64,
+    fence: TicketFence<'_>,
+    error_class: &str,
+    backoff: Option<Backoff>,
+    spend: bool,
+) -> Result<bool, StreamRepoError> {
+    // attempts after this write = greatest(attempts + delta, 1): the claim's increment is undone
+    // unless the failure is charged, and the unleased read charges here.
+    let delta: i32 = i32::from(spend) - i32::from(fence.lease_owner.is_some());
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `release_for_retry`
+    let mut txn = pool.pool().begin().await?;
+    set_tenant_local(&mut txn, key.tenant_id.0).await?;
+    let n = bind_key(
+        sqlx::query(&format!(
+            "UPDATE projection.stream_log \
+                SET lease_owner = NULL, lease_expires_at = NULL, error_class = $10, \
+                    attempts = greatest(attempts + $11, 1), \
+                    next_attempt_at = CASE WHEN $12::double precision IS NULL THEN NULL \
+                      ELSE clock_timestamp() + make_interval(secs => least( \
+                        $12::double precision * power(2, greatest(attempts + $11, 1) - 1), \
+                        $13::double precision)) END \
+              WHERE {KEY_WHERE} AND stream_seq = $7 AND state = 'ISSUED' \
+                AND lease_owner IS NOT DISTINCT FROM $8 AND attempts = $9"
+        )),
+        key,
+    )
+    .bind(stream_seq)
+    .bind(fence.lease_owner)
+    .bind(fence.attempts)
+    .bind(error_class)
+    .bind(delta)
+    .bind(backoff.map(|b| b.base_secs))
+    .bind(backoff.map(|b| b.max_secs))
+    .execute(&mut *txn)
+    .await?
+    .rows_affected();
+    txn.commit().await?;
+    Ok(n == 1)
+}
+
+/// ADR-0052 D-D pending release: the ticket's Evidence is still being distilled (the claim's
+/// distill-closed predicate lost a race). The lease is cleared and the claim's attempt is given
+/// back, so a distill delay never counts toward `transient_exhausted`. Returns `false` when the
+/// fence matched nothing (the lease was lost).
+pub async fn release_pending(
+    pool: &RetrievalWorkerDbPool,
+    key: &StreamKey,
+    stream_seq: i64,
+    fence: TicketFence<'_>,
+) -> Result<bool, StreamRepoError> {
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `release_pending`
+    let mut txn = pool.pool().begin().await?;
+    set_tenant_local(&mut txn, key.tenant_id.0).await?;
+    let n = bind_key(
+        sqlx::query(&format!(
+            "UPDATE projection.stream_log \
+                SET lease_owner = NULL, lease_expires_at = NULL, next_attempt_at = NULL, \
+                    attempts = greatest(attempts - 1, 0) \
+              WHERE {KEY_WHERE} AND stream_seq = $7 AND state = 'ISSUED' \
+                AND lease_owner IS NOT DISTINCT FROM $8 AND attempts = $9"
+        )),
+        key,
+    )
+    .bind(stream_seq)
+    .bind(fence.lease_owner)
+    .bind(fence.attempts)
+    .execute(&mut *txn)
+    .await?
+    .rows_affected();
+    txn.commit().await?;
+    Ok(n == 1)
+}
+
+#[cfg(test)]
+mod claim_parse_tests {
+    use super::parse_claim_rows;
+    use crate::postgres::RetrievalWorkerDbPool;
+    use humaux_testkit::{ExternalDep, skip_or_fail};
+
+    /// Review 2026-09-29 P1: the claim's leases are committed before its rows are parsed, so one
+    /// row whose placement this build cannot parse (deploy skew: the CHECK constraints admit
+    /// only values this build knows today) must cost only itself. Two rows shaped exactly like
+    /// `projection.claim_issued_tickets`' `RETURNS TABLE`, one with an unknown
+    /// `promotion_state`: the good one is a ticket, the bad one an addressable
+    /// `UnplaceableTicket`. Fault injection: collect with `?` as before ⇒ both are lost.
+    #[test]
+    fn one_unparsable_placement_row_costs_only_itself() {
+        const TEST: &str = "one_unparsable_placement_row_costs_only_itself";
+        let Ok(dsn) = std::env::var("HUMAUX_TEST_PG_DSN") else {
+            skip_or_fail(
+                TEST,
+                "missing object: HUMAUX_TEST_PG_DSN",
+                ExternalDep::Postgres,
+            );
+            return;
+        };
+        let sep = if dsn.contains('?') { '&' } else { '?' };
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let rows = rt.block_on(async {
+            // dep: PostgreSQL(role_retrieval_worker) — a literal SELECT shaped like the claim's rows
+            let pool = RetrievalWorkerDbPool::connect(&format!(
+                "{dsn}{sep}options=-c%20role%3Drole_retrieval_worker"
+            ))
+            .await
+            .expect("role_retrieval_worker connects");
+            sqlx::query(
+                "SELECT v.tenant_id, 'workspace'::text AS scope_kind, v.scope_id, \
+                        'private_memory'::text AS domain, 'PRIVATE_MEMORY'::text AS projection_kind, \
+                        'v1'::text AS projection_version, v.stream_seq, v.stream_seq + 100 AS commit_seq, \
+                        v.attempts, 'private_memory_v1'::text AS projection_family, \
+                        'c'::text AS collection_name, NULL::text AS shard_key, \
+                        'SHARED_FALLBACK'::text AS placement_class, 0::bigint AS point_count, \
+                        0::bigint AS bytes_estimate, v.promotion_state \
+                   FROM (VALUES \
+                     ('00000000-0000-0000-0000-00000000000a'::uuid, '00000000-0000-0000-0000-0000000000a1'::uuid, 1::bigint, 1, 'STABLE'), \
+                     ('00000000-0000-0000-0000-00000000000b'::uuid, '00000000-0000-0000-0000-0000000000b1'::uuid, 7::bigint, 3, 'NOT_A_KNOWN_STATE') \
+                   ) AS v(tenant_id, scope_id, stream_seq, attempts, promotion_state)",
+            )
+            // dep: PostgreSQL(role_retrieval_worker) — fabricated claim-shaped rows
+            .fetch_all(pool.pool())
+            .await
+            .expect("fabricated rows")
+        });
+        let batch = parse_claim_rows(&rows);
+        assert_eq!(batch.tickets.len(), 1, "{batch:?}");
+        assert_eq!(batch.tickets[0].stream_seq, 1);
+        assert_eq!(batch.tickets[0].commit_seq, 101);
+        assert_eq!(batch.unplaceable.len(), 1, "{batch:?}");
+        let bad = &batch.unplaceable[0];
+        assert_eq!((bad.stream_seq, bad.attempts), (7, 3));
+        assert_eq!(
+            bad.tenant_id.to_string(),
+            "00000000-0000-0000-0000-00000000000b"
+        );
+    }
 }

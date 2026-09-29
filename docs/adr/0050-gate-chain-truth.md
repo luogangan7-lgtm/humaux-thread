@@ -353,6 +353,19 @@ Fault runs, each observed red:
    The 1 s-timeout test variant refuses with `55P03` and 0 applied.
 5. `rustc --version` equals the pin.
 
+
+## Amendment (card 27, 2026-09-29) — per-test floor
+
+The fixed 0.05 s floor flagged `facet_contract` (4 genuine DB tests, 0.04 s on a warm run) in
+card 27's verify pass — the flake this ADR's Consequences predicted. `gate-truth` now uses the
+SMALLER of the fixed floor and 3 ms × passed tests (`PER_TEST_FLOOR_SECS`): a skipped test costs
+microseconds, a real one at least one loopback PostgreSQL round trip, so a binary whose passed
+tests average under 3 ms each cannot have reached its database, while the fixed floor still
+bounds large binaries. Replaying `gates_card27_rerun.log` now passes with 0 offenders; a 4-test
+binary at 0.00 s and a 40-test binary at 0.04 s are still offenders (unit test
+`gate_truth_per_test_floor_keeps_a_fast_genuine_small_binary_green`). The skip ledger remains the
+upgrade path for a real single-test binary under 3 ms.
+
 ## Consequences and limits
 
 - gate-truth sees **whole-binary** skips only. A binary where some tests skip and others do real

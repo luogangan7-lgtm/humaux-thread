@@ -1,0 +1,34 @@
+# §46.1 migration manifest. Card 27 / ADR-0052 D-H (audit DM-7): VALIDATE the three NOT VALID
+# presence CHECKs on private.context_bindings. No schema change, no grant change, no DML.
+# §46 forward-fix (FORWARD_ONLY, 0175 precedent).
+
+migration_id = "0184_validate_context_bindings_checks"
+class = "FORWARD_ONLY"
+
+precheck = """
+select
+ (select count(*) = 3 from pg_constraint
+   where conrelid = 'private.context_bindings'::regclass and contype = 'c'
+     and conname in ('context_bindings_created_by_present',
+                     'context_bindings_memory_id_present',
+                     'context_bindings_scope_id_present'))
+ -- no row violates the exact negation of any of the three: dispositioned by a human, never here
+ and not exists (select 1 from private.context_bindings
+                  where not (created_by is not null)
+                     or not (memory_id is not null)
+                     or not ((scope_kind = 'TENANT') or (scope_id is not null)))
+ as precheck_ok
+"""
+
+postcheck = """
+select count(*) = 3 as postcheck_ok
+  from pg_constraint
+ where conrelid = 'private.context_bindings'::regclass
+   and conname in ('context_bindings_created_by_present',
+                   'context_bindings_memory_id_present',
+                   'context_bindings_scope_id_present')
+   and convalidated
+"""
+
+rollback_or_forward_fix = "Forward fix only. VALIDATE CONSTRAINT changes no schema and no rows; the three CHECKs stay exactly as defined. A violating row found later is dispositioned by a human in a new migration."
+backup_restore_requirement = "none: a validation scan, no row data touched."

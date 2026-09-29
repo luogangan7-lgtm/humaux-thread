@@ -46,14 +46,27 @@ cargo run -q -p xtask -- soak \
   --watch-pidfile retrieval-worker=$S/rw.pid \
   --watch-pidfile distill-worker=$S/ds.pid \
   --watch-pidfile consolidation-worker=$S/cw.pid \
+  --watch-pidfile projection-runner=$S/rp.pid \
   --chaos-every-secs 180 --chaos-grace-secs 60 \
   --chaos-cmd ./chaos-retrieval-worker.sh \
   --chaos-cmd ./chaos-distill-worker.sh \
   --chaos-cmd ./chaos-consolidation-worker.sh \
+  --chaos-cmd ./chaos-projection-runner.sh \
   --lease-secs 120 --max-rss-mib 2048 --max-db-connections 80 \
   --max-op-failure-rate 0.05 \
   --report ./soak-report.json
 ```
+
+Card 27 / ADR-0052: the rotation includes the resident projection runner
+(`humaux-retrieval-worker --serve`). It replaced the per-tenant `--run-once` loop the rehearsal
+used to run beside the soak; there is no projection loop any more, and its kill -9 is what
+`no_live_ticket_lease_after_drain` grades. Its chaos script is the retrieval worker's with the
+`--serve` env block (the seven pass keys) and `rp.pid` — both processes are the
+`humaux-retrieval-worker` binary, so the pidfile, not the name, says which one dies.
+`docs/ops/rehearse.sh` lists the runner's hook first, so a short soak (`SOAK_SECS=120`, 90 s chaos
+period) fires exactly that hook; the card-27 gate ran it with `SOAK_SESSIONS=1 SOAK_THINK_MS=10000
+SOAK_DRAIN=300` (card 24's shape) — with the default load, one resident distiller cannot drain three
+tenants' writes inside a 150 s drain and `backlog_drained` grades distill throughput, not the soak.
 
 Each chaos script kills **one PID the launcher recorded at spawn**, and never a pattern or a
 port — see §6. `pgrep -f "…"` in a chaos command is the shape this runbook used to publish and
@@ -141,6 +154,7 @@ token_malformed | token_not_issued` (the class only, never the token).
 | `tickets_settled_after_drain` | a ticket was still in flight after the drain — the chain did not converge | tickets |
 | `tickets_applied_once` | two live `projection.private_memory_points` for one memory in one family: a double-apply (ADR-0038 D4) | memories |
 | `no_live_lease_after_drain` | an `ops.jobs` row is `PROCESSING` with a lease still live more than one `--lease-secs` after the last kill: a worker is wedged, not crashed (§31/§61) | ops.jobs rows |
+| `no_live_ticket_lease_after_drain` | a `projection.stream_log` ticket of a run tenant still holds a live `--serve` lease (`lease_owner IS NOT NULL AND lease_expires_at > now()`) after the drain: the runner's kill -9 left leases the restarted runner never re-claimed and settled, or a runner is wedged (ADR-0052). The sibling of `no_live_lease_after_drain` for ticket leases | stream_log tickets |
 | `backlog_drained` | `ops.jobs` + `ops.outbox` still queued after the drain | queued rows |
 | `db_connections_bounded` | connection count exceeded `--max-db-connections` at some poll: a leak, or pool sizing that does not survive this concurrency | connections |
 | `rss_bounded` | some `humaux-*` process exceeded `--max-rss-mib`. Only real readings are scored, and `n` counts them. An observation whose `ps` failed contributes no reading, never `0 MiB`, so a run with no reading at all is `FAIL-VACUOUS` | MiB |

@@ -6,7 +6,7 @@
 //!   control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings,
 //!   control.reasoning_route_candidates, control.reasoning_route_policies,
 //!   control.retrieval_provider_admission_limits, control.tenants, control.users, control.workspace_memberships,
-//!   control.workspaces, ops.data_disclosure_sources, ops.data_disclosures, ops.model_call_ledger, ops.outbox,
+//!   control.workspaces, ops.data_disclosure_sources, ops.data_disclosures, ops.jobs, ops.model_call_ledger, ops.outbox,
 //!   ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations,
 //!   ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, private.events,
 //!   private.evidence_objects, private.memory_evidence, private.memory_records, private.processing_runs,
@@ -39,6 +39,12 @@
 //! `IntraCellResource::QDRANT_REST` transport, never a hand-rolled HTTP client) plus its
 //! `projection.tenant_placements` row — without both, `tenant_placement(...)` resolves to
 //! `None` and semantic recall degrades closed with `DependencyUnavailable`.
+//!
+//! Card 27 (ADR-0052): `--workspaces <n>` (default 1) adds workspaces 2..=n to the seeded
+//! tenant, each with its own membership and workspace-bound key, printed as `workspace_id_<k>:` /
+//! `bearer_<k>:` lines (the rehearsal's 3 tenants × 2 workspaces). The retrieval worker's
+//! tenant/scope/collection exports are gone: its `--serve` / `--run-once` claim tickets across
+//! tenants and read each ticket's placement from the claim.
 //!
 //! Refuses to run against anything but a local disposable database (binding rule): DSN
 //! host must be `127.0.0.1` and the database name must start with `humaux_thread_`.
@@ -269,22 +275,13 @@ fn seed_base(
     )
     .map_err(|e| format!("insert entitlement snapshot: {}", db_detail(&e)))?;
 
-    let prefix = format!("e2e{}", random_hex_suffix(&mut rng, 12));
-    let secret = random_secret();
-    let wire = format!("{prefix}.{secret}");
-    let key_hash = compute_api_key_hash(pepper, &wire);
-    let api_key_id: Uuid = txn
-        .query_one(
-            &format!(
-                "INSERT INTO control.api_keys \
-                 (tenant_id,prefix,key_hash,status,scopes,authorization_version,user_id,workspace_id,\
-                  tenant_security_epoch,user_security_epoch) \
-                 VALUES($1,$2,$3,'ACTIVE',{scopes_sql_array},1,$4,$5,0,0) RETURNING api_key_id"
-            ),
-            &[&tenant_id, &prefix, &key_hash, &user_id, &workspace_id],
-        )
-        .map_err(|e| format!("insert api key: {}", db_detail(&e)))?
-        .get(0);
+    let (api_key_id, prefix, wire) = insert_api_key(
+        &mut txn,
+        &mut rng,
+        (tenant_id, user_id, workspace_id),
+        scopes_sql_array,
+        pepper,
+    )?;
 
     txn.commit()
         .map_err(|e| format!("commit seed txn: {}", db_detail(&e)))?;
@@ -298,6 +295,77 @@ fn seed_base(
         prefix,
         wire,
     })
+}
+
+/// One ACTIVE workspace-bound API key for `(tenant, user, workspace)`; returns
+/// `(api_key_id, prefix, wire)`. The key hash is the real §73.5 primitive.
+fn insert_api_key(
+    txn: &mut postgres::Transaction<'_>,
+    rng: &mut impl Rng,
+    (tenant_id, user_id, workspace_id): (Uuid, Uuid, Uuid),
+    scopes_sql_array: &str,
+    pepper: &[u8],
+) -> Result<(Uuid, String, String), String> {
+    let prefix = format!("e2e{}", random_hex_suffix(rng, 12));
+    let wire = format!("{prefix}.{}", random_secret());
+    let key_hash = compute_api_key_hash(pepper, &wire);
+    let api_key_id: Uuid = txn
+        .query_one(
+            &format!(
+                "INSERT INTO control.api_keys \
+                 (tenant_id,prefix,key_hash,status,scopes,authorization_version,user_id,workspace_id,\
+                  tenant_security_epoch,user_security_epoch) \
+                 VALUES($1,$2,$3,'ACTIVE',{scopes_sql_array},1,$4,$5,0,0) RETURNING api_key_id"
+            ),
+            &[&tenant_id, &prefix, &key_hash, &user_id, &workspace_id],
+        )
+        .map_err(|e| format!("insert api key: {}", db_detail(&e)))?
+        .get(0);
+    Ok((api_key_id, prefix, wire))
+}
+
+/// Card 27 (`--workspaces <n>`): workspaces 2..=n of the seeded tenant, each with an ACTIVE
+/// OWNER workspace membership for the seeded user (0163's WORKSPACE_SHARED arm) and its own
+/// workspace-bound API key. Returns `(workspace_id, wire)` per extra workspace. Teardown already
+/// removes them by tenant.
+fn seed_extra_workspaces(
+    client: &mut Client,
+    base: &BaseSeed,
+    extra: usize,
+    scopes_sql_array: &str,
+    pepper: &[u8],
+) -> Result<Vec<(Uuid, String)>, String> {
+    let mut rng = rand::rng();
+    let mut txn = client
+        .transaction()
+        .map_err(|e| format!("begin workspace txn: {}", db_detail(&e)))?;
+    let mut out = Vec::with_capacity(extra);
+    for k in 0..extra {
+        let workspace_id: Uuid = txn
+            .query_one(
+                "INSERT INTO control.workspaces(tenant_id,name) VALUES($1,$2) RETURNING workspace_id",
+                &[&base.tenant_id, &format!("e2e-seed workspace {}", k + 2)],
+            )
+            .map_err(|e| format!("insert workspace: {}", db_detail(&e)))?
+            .get(0);
+        txn.execute(
+            "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
+             VALUES($1,$2,$3,'OWNER','ACTIVE')",
+            &[&base.tenant_id, &workspace_id, &base.user_id],
+        )
+        .map_err(|e| format!("insert workspace membership: {}", db_detail(&e)))?;
+        let (_, _, wire) = insert_api_key(
+            &mut txn,
+            &mut rng,
+            (base.tenant_id, base.user_id, workspace_id),
+            scopes_sql_array,
+            pepper,
+        )?;
+        out.push((workspace_id, wire));
+    }
+    txn.commit()
+        .map_err(|e| format!("commit workspace txn: {}", db_detail(&e)))?;
+    Ok(out)
 }
 
 /// One route policy (pinned candidate over `profile_id`, promoted SHADOW → SERVING) + its
@@ -828,6 +896,9 @@ fn teardown(client: &mut Client, tenant_id: Uuid) -> Result<(), String> {
            (SELECT memory_id FROM private.memory_records WHERE tenant_id=$1)",
         "DELETE FROM private.memory_records WHERE tenant_id=$1",
         "DELETE FROM private.processing_runs WHERE tenant_id=$1",
+        // Card 27: the 0164 enqueue triggers give every seeded tenant ops.jobs rows, and the
+        // replica-mode delete below skips the ON DELETE CASCADE, so they were left orphaned.
+        "DELETE FROM ops.jobs WHERE tenant_id=$1",
         "DELETE FROM ops.outbox WHERE tenant_id=$1",
         "DELETE FROM private.events WHERE event_id IN \
            (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id=$1)",
@@ -976,10 +1047,33 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
+    // Card 27: `--workspaces <n>` (absent = 1, so every existing caller is unchanged).
+    let workspaces = match arg(args, "--workspaces").map(|v| v.parse::<usize>()) {
+        None => 1,
+        Some(Ok(n)) if n >= 1 => n,
+        Some(_) => {
+            eprintln!("e2e-seed: fail (--workspaces must be a positive integer)");
+            return 1;
+        }
+    };
+
     let base = match seed_base(&mut client, &scopes_sql_array(&scopes), limit, &pepper) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("e2e-seed: fail (base seed: {e})");
+            return 1;
+        }
+    };
+    let extra_workspaces = match seed_extra_workspaces(
+        &mut client,
+        &base,
+        workspaces - 1,
+        &scopes_sql_array(&scopes),
+        &pepper,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("e2e-seed: fail (extra workspaces: {e})");
             return 1;
         }
     };
@@ -1065,6 +1159,10 @@ pub fn run(args: &[String]) -> i32 {
     println!("api_key_id: {}", base.api_key_id);
     println!("api_key_prefix: {}", base.prefix);
     println!("Authorization: Bearer {}", base.wire);
+    for (k, (workspace_id, wire)) in extra_workspaces.iter().enumerate() {
+        println!("workspace_id_{}: {workspace_id}", k + 2);
+        println!("bearer_{}: {wire}", k + 2);
+    }
     println!("binding_id: {}", lane.binding_id);
     println!("binding_version: {}", lane.binding_version);
     println!("distill_binding_id: {}", lane.distill_binding_id);
@@ -1118,18 +1216,9 @@ pub fn run(args: &[String]) -> i32 {
         qdrant_flags.embedding_region
     );
     println!(
-        "export HUMAUX_RETRIEVAL_WORKER_QDRANT_COLLECTION={}",
-        qdrant_flags.collection
-    );
-    println!(
         "export HUMAUX_RETRIEVAL_WORKER_DIMENSION={}",
         qdrant_flags.dimension
     );
-    println!(
-        "export HUMAUX_RETRIEVAL_WORKER_TENANT_ID={}",
-        base.tenant_id
-    );
-    println!("export HUMAUX_RETRIEVAL_WORKER_SCOPE_KIND=workspace");
     // Card 21, §7.4: the retrieval worker's own §7 egress identity. It used to build its
     // embedding provider with `ProcessorId(Uuid::nil())`, so every `ops.data_disclosures` row
     // it wrote named processor all-zeros. Emitted from the SAME `--processor-id` the private
@@ -1137,10 +1226,6 @@ pub fn run(args: &[String]) -> i32 {
     println!(
         "export HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID={}",
         lane_flags.egress_processor_id
-    );
-    println!(
-        "export HUMAUX_RETRIEVAL_WORKER_SCOPE_ID={}",
-        base.workspace_id
     );
     println!(
         "export HUMAUX_GATEWAY_EMBEDDING_DIMENSION={}",

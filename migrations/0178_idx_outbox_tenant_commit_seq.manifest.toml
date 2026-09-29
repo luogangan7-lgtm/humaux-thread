@@ -1,0 +1,20 @@
+# §46.1 migration manifest. Card 27 / ADR-0052 D-G: one CONCURRENTLY index, run outside a transaction
+# (`transaction = "none"`, honoured by xtask migrate). Index-only, no data touched, safely droppable.
+
+migration_id = "0178_idx_outbox_tenant_commit_seq"
+class = "REVERSIBLE"
+transaction = "none"
+
+precheck = """
+select to_regclass('ops.outbox_tenant_commit_seq_uidx') is null
+ and not exists (select 1 from ops.outbox where commit_seq is not null
+                 group by tenant_id, commit_seq having count(*) > 1) as precheck_ok
+"""
+
+postcheck = """
+select coalesce((select indisvalid and indisready and indisunique and pg_get_expr(indpred, indrelid) like '%commit_seq IS NOT NULL%'
+                   from pg_index where indexrelid = to_regclass('ops.outbox_tenant_commit_seq_uidx')), false) as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP INDEX CONCURRENTLY IF EXISTS ops.outbox_tenant_commit_seq_uidx; (also the fix for an INVALID leftover of a failed build, which the precheck refuses by name)"
+backup_restore_requirement = "none: index-only DDL built CONCURRENTLY, no row data touched, safely droppable"

@@ -98,7 +98,7 @@ cargo build -p humaux-gateway -p humaux-retrieval-worker -p humaux-consolidation
 
 # ---------- 1. seed (stdout kept in a variable only) ----------
 step seed
-SEED_OUT=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 \
+SEED_OUT=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 --workspaces 2 \
   --processor-id $EGRESS_PROC --region $MM_REGION --service-tier $MM_TIER --endpoint-ref $MM_URL \
   --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV \
   --collection $COLLECTION --dimension $EMB_DIM --embedding-provider dashscope --embedding-region $EMB_REGION 2>$EV/seed.stderr)
@@ -113,7 +113,7 @@ DOMAIN=${HUMAUX_GATEWAY_REMEMBER_DOMAIN:-}; PKIND=${HUMAUX_GATEWAY_REMEMBER_PROJ
 [ -z "${HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID:-}" ] && { echo "seed: retrieval worker egress identity not emitted" | tee -a $EV/rehearsal.log; exit 2; }
 echo "ticket family (derived): $DOMAIN/$PKIND/$PVER" | tee -a $EV/rehearsal.log
 [ -z "$BEARER" ] && { echo "seed: no bearer parsed" | tee -a $EV/rehearsal.log; exit 2; }
-print -r -- "$SEED_OUT" | grep -vE 'Bearer|export' | tee -a $EV/seed_ids.txt >/dev/null   # ids only, no secret
+print -r -- "$SEED_OUT" | grep -vE 'Bearer|bearer_|export' | tee -a $EV/seed_ids.txt >/dev/null   # ids only, no secret
 echo "seed ok tenant=$TENANT ws=$WS domain=$RDOM" | tee -a $EV/rehearsal.log
 
 # ---------- 1b. seed tenant B (card 24 acceptance gate: TWO tenants on ONE gateway) ----------
@@ -124,7 +124,7 @@ echo "seed ok tenant=$TENANT ws=$WS domain=$RDOM" | tee -a $EV/rehearsal.log
 # --processor-id is the DEPLOYMENT's egress processor (§7.3), not a per-tenant value: both
 # tenants get $EGRESS_PROC or tenant B's distill defers every row forever, silently (card 16 P0).
 step seed_b
-SEED_OUT_B=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 \
+SEED_OUT_B=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 --workspaces 2 \
   --processor-id $EGRESS_PROC --region $MM_REGION --service-tier $MM_TIER --endpoint-ref $MM_URL \
   --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV \
   --collection $COLLECTION --dimension $EMB_DIM --embedding-provider dashscope --embedding-region $EMB_REGION 2>$EV/seed_b.stderr)
@@ -132,10 +132,31 @@ valb() { print -r -- "$SEED_OUT_B" | grep -iE "^[[:space:]]*$1[[:space:]]*[:=]" 
 export BEARER_A="$BEARER"
 export BEARER_B=$(print -r -- "$SEED_OUT_B" | sed -n 's/^Authorization: Bearer //p' | head -1)
 TENANT_B=$(valb tenant_id); WS_B=$(valb workspace_id); USERID_B=$(valb user_id)
-print -r -- "$SEED_OUT_B" | grep -vE 'Bearer|export' | tee -a $EV/seed_ids.txt >/dev/null
+print -r -- "$SEED_OUT_B" | grep -vE 'Bearer|bearer_|export' | tee -a $EV/seed_ids.txt >/dev/null
 [ -z "$BEARER_B" ] && { echo "seed_b: no bearer for tenant B" | tee -a $EV/rehearsal.log; exit 2; }
 [ "$TENANT_B" = "$TENANT" ] && { echo "seed_b: tenant B is tenant A — isolation cannot be witnessed" | tee -a $EV/rehearsal.log; exit 2; }
 echo "tenants: A=$TENANT/$WS  B=$TENANT_B/$WS_B" | tee -a $EV/rehearsal.log
+
+# ---------- 1c. seed tenant C + second workspaces (card 27: 3 tenants × 2 workspaces) ----------
+# ADR-0052's gate needs >= 3 tenants × 2 workspaces behind ONE tenant-free --serve process.
+# `--workspaces 2` (above, and here) gives each tenant a second workspace with its own membership
+# and workspace-bound key; `bearer_2:` lines are secrets and never reach seed_ids.txt.
+step seed_c
+SEED_OUT_C=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 --workspaces 2 \
+  --processor-id $EGRESS_PROC --region $MM_REGION --service-tier $MM_TIER --endpoint-ref $MM_URL \
+  --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV \
+  --collection $COLLECTION --dimension $EMB_DIM --embedding-provider dashscope --embedding-region $EMB_REGION 2>$EV/seed_c.stderr)
+print -r -- "$SEED_OUT_C" | grep -vE 'Bearer|bearer_|export' | tee -a $EV/seed_ids.txt >/dev/null
+seedval() { print -r -- "$1" | grep -iE "^[[:space:]]*$2[[:space:]]*[:=]" | head -1 | sed -E 's/^[^:=]*[:=][[:space:]]*//' | tr -d ' '; }
+TENANT_C=$(seedval "$SEED_OUT_C" tenant_id); WS_C=$(seedval "$SEED_OUT_C" workspace_id)
+export BEARER_C=$(print -r -- "$SEED_OUT_C" | sed -n 's/^Authorization: Bearer //p' | head -1)
+WS_A2=$(seedval "$SEED_OUT" workspace_id_2); WS_B2=$(seedval "$SEED_OUT_B" workspace_id_2); WS_C2=$(seedval "$SEED_OUT_C" workspace_id_2)
+export BEARER_A2=$(seedval "$SEED_OUT" bearer_2) BEARER_B2=$(seedval "$SEED_OUT_B" bearer_2) BEARER_C2=$(seedval "$SEED_OUT_C" bearer_2)
+for v in TENANT_C WS_C BEARER_C WS_A2 WS_B2 WS_C2 BEARER_A2 BEARER_B2 BEARER_C2; do
+  [ -z "${(P)v}" ] && { echo "seed_c: $v not parsed from e2e-seed --workspaces 2" | tee -a $EV/rehearsal.log; exit 2; }
+done
+SEEDED="'$TENANT','$TENANT_B','$TENANT_C'"
+echo "tenants: C=$TENANT_C/$WS_C  second workspaces: A2=$WS_A2 B2=$WS_B2 C2=$WS_C2" | tee -a $EV/rehearsal.log
 
 # ---------- 2. processes ----------
 step processes
@@ -158,15 +179,35 @@ start_rw() {
     HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH=$SOCK/retrieval.sock HUMAUX_RETRIEVAL_WORKER_GATEWAY_UID=$MYUID \
     HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER=dashscope HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL=$EMB_MODEL HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION=$EMB_REV \
     HUMAUX_RETRIEVAL_WORKER_DIMENSION=$EMB_DIM HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
-    HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=6333 HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false HUMAUX_RETRIEVAL_WORKER_QDRANT_COLLECTION=$COLLECTION \
+    HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=6333 HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
     HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID HUMAUX_RETRIEVAL_WORKER_CALLER=retrieval-worker \
-    HUMAUX_RETRIEVAL_WORKER_TENANT_ID=$TENANT HUMAUX_RETRIEVAL_WORKER_SCOPE_KIND=workspace HUMAUX_RETRIEVAL_WORKER_SCOPE_ID=$WS HUMAUX_RETRIEVAL_WORKER_BATCH=50 \
     HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER
   set -a; source $R/.env.local; set +a
   exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --serve-rpc >> $EV/retrieval-worker.log 2>&1 ) &
 own_pid rw $!
 }
 start_rw; RW_PID=$(cat $S/rw.pid)
+# card 27 / ADR-0052: the fifth resident process — ONE tenant-free projection runner for every
+# placed tenant. It reads no tenant, workspace or collection (the claim hands each ticket its
+# placement); the seven pass keys are its only projection configuration. $1 (optional) overrides
+# the Qdrant port: step projection_serve_multi_tenant points it at a closed loopback port to
+# simulate a Qdrant outage without touching the shared container.
+RP_PASS_ENV="HUMAUX_RETRIEVAL_WORKER_BATCH=16 HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP=8 HUMAUX_RETRIEVAL_WORKER_LEASE_SECS=60 \
+HUMAUX_RETRIEVAL_WORKER_POLL_INTERVAL_SECS=1 HUMAUX_RETRIEVAL_WORKER_MAX_ATTEMPTS=6 \
+HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS=30 HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS=300"
+start_rp() {
+( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:devlocal_role_retrieval_worker@$PG/$DB" \
+    HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER=dashscope HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL=$EMB_MODEL HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION=$EMB_REV \
+    HUMAUX_RETRIEVAL_WORKER_DIMENSION=$EMB_DIM HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
+    HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=${1:-6333} HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
+    HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID HUMAUX_RETRIEVAL_WORKER_CALLER=retrieval-worker \
+    HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER
+  eval "export $RP_PASS_ENV"
+  set -a; source $R/.env.local; set +a
+  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --serve >> $EV/projection-runner.log 2>&1 ) &
+own_pid rp $!
+}
+start_rp; RP_PID=$(cat $S/rp.pid)
 start_gw() {
 ( export HUMAUX_GATEWAY_PG_DSN="postgres://role_gateway:devlocal_role_gateway@$PG/$DB" HUMAUX_GATEWAY_BIND_ADDR=127.0.0.1:8080 \
     HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX=$PEPPER_HEX HUMAUX_GATEWAY_ALLOWED_HOSTS=127.0.0.1:8080 HUMAUX_GATEWAY_ALLOWED_ORIGINS=http://127.0.0.1:8080 \
@@ -189,7 +230,7 @@ own_pid gw $!
 }
 start_gw; GW_PID=$(cat $S/gw.pid)
 for i in $(seq 1 30); do code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/mcp -H 'Origin: http://127.0.0.1:8080' --data '{}' 2>/dev/null); [ "$code" != "000" ] && break; sleep 1; done
-echo "gateway http=$code pw=$PW_PID rw=$RW_PID gw=$GW_PID" | tee -a $EV/rehearsal.log
+echo "gateway http=$code pw=$PW_PID rw=$RW_PID rp=$RP_PID gw=$GW_PID" | tee -a $EV/rehearsal.log
 ls -la $SOCK | tee -a $EV/rehearsal.log
 
 # ---------- 2b. readiness gate (card 15 / ADR-0037; docs/ops/supervision.md §1) ----------
@@ -221,6 +262,10 @@ wait_ready() { # $1=label $2=probe function name; polls until exit 0 or 90s
 }
 wait_ready private-worker pw_readyz
 wait_ready retrieval-worker rw_readyz
+# The projection runner's own readiness: its process is alive (a --serve that died on config is
+# not ready) AND the dependencies it needs answer the same one-shot probe (ADR-0037).
+rp_readyz() { kill -0 "$(cat $S/rp.pid)" 2>/dev/null || { echo "projection runner pid $(cat $S/rp.pid) is not running"; return 1; }; rw_readyz; }
+wait_ready projection-runner rp_readyz
 wait_ready consolidation-worker cw_readyz   # dials the private worker's UDS from the side that uses it
 wait_ready gateway gw_readyz
 READY_BAD_BEFORE_TRAFFIC=$READY_BAD   # frozen here; step kill9_rotation reuses wait_ready
@@ -300,20 +345,19 @@ PGQ "select 'rpc='||outcome||' run_bound='||(consolidation_run_id is not null) f
 
 # ---------- 5. projection (third hop, real DashScope) ----------
 step projection
-# The projection worker IS tenant-bound (§17.1 / ADR-0036): one pass per (tenant, workspace).
-project_tenant() { # $1=tenant $2=workspace
-( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:devlocal_role_retrieval_worker@$PG/$DB" \
-    HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER=dashscope HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL=$EMB_MODEL HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION=$EMB_REV \
-    HUMAUX_RETRIEVAL_WORKER_DIMENSION=$EMB_DIM HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
-    HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=6333 HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false HUMAUX_RETRIEVAL_WORKER_QDRANT_COLLECTION=$COLLECTION \
-    HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID HUMAUX_RETRIEVAL_WORKER_CALLER=retrieval-worker \
-    HUMAUX_RETRIEVAL_WORKER_TENANT_ID=$1 HUMAUX_RETRIEVAL_WORKER_SCOPE_KIND=workspace HUMAUX_RETRIEVAL_WORKER_SCOPE_ID=$2 HUMAUX_RETRIEVAL_WORKER_BATCH=50 \
-    HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER
-  set -a; source $R/.env.local; set +a
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --run-once ) 2>&1 | tee -a $EV/projection.log | tail -3
+# Card 27 / ADR-0052: nothing here projects any more — the resident `--serve` runner (step
+# processes) claims every placed tenant's tickets. This only WAITS until no ticket of the seeded
+# tenants is left that the runner could claim (ISSUED, distill closed), bounded.
+wait_projection_idle() { # $1=timeout secs
+  local i=0 n=
+  while [ $i -lt ${1:-120} ]; do
+    n=$(PGQ "select count(*) from projection.stream_log s where s.tenant_id in ($SEEDED) and s.state='ISSUED' and s.scope_kind='workspace' and not exists (select 1 from ops.outbox o where o.tenant_id=s.tenant_id and o.commit_seq=s.commit_seq and o.event_type='EVIDENCE_ACCEPTED' and o.status in ('PENDING','PROCESSING'))")
+    [ "$n" = "0" ] && { echo "projection idle after ${i}s" | tee -a $EV/rehearsal.log; return 0; }
+    sleep 1; i=$((i+1))
+  done
+  echo "projection NOT idle after ${i}s: $n claimable ISSUED tickets in the seeded tenants" | tee -a $EV/rehearsal.log; return 1
 }
-project_tenant $TENANT $WS
-project_tenant $TENANT_B $WS_B
+wait_projection_idle 180
 PGQ "select 'tickets: '||string_agg(stream_seq||':'||state||'/'||coalesce(error_class,'-'), ', ' order by stream_seq) from projection.stream_log where tenant_id='$TENANT'" | tee -a $EV/rehearsal.log
 PGQ "select 'ledger: '||coalesce(string_agg(purpose||'/'||status||'/'||coalesce(error_class,'-'), ', '),'none') from ops.model_call_ledger where tenant_id='$TENANT'" | tee -a $EV/rehearsal.log
 PGQ "select 'checkpoint issued_highwater='||coalesce(max(issued_highwater)::text,'none') from projection.stream_checkpoints where tenant_id='$TENANT'" | tee -a $EV/rehearsal.log
@@ -347,8 +391,7 @@ consolidate_once() {
 drain_all() {
   distill_once
   consolidate_once
-  project_tenant $TENANT $WS
-  project_tenant $TENANT_B $WS_B
+  wait_projection_idle 180
   serve_switch_tenant $TENANT $WS
   serve_switch_tenant $TENANT_B $WS_B
 }
@@ -561,6 +604,7 @@ step kill9_rotation
 READY_BAD_BEFORE_CHAOS=$READY_BAD
 own_signal $S/gw.pid humaux-gateway 9 15; start_gw; wait_ready gateway-after-kill9 gw_readyz
 own_signal $S/rw.pid humaux-retrieval-worker 9 15; start_rw; wait_ready retrieval-worker-after-kill9 rw_readyz
+own_signal $S/rp.pid humaux-retrieval-worker 9 15; start_rp; wait_ready projection-runner-after-kill9 rp_readyz
 own_signal $S/pw.pid humaux-private-worker 9 15; start_pw
 # The private worker's own --readyz is a one-shot PG check and would be green with the resident
 # process dead. cw_readyz dials its UDS from the side that uses it, so it grades the listener.
@@ -575,6 +619,8 @@ try: print('1' if json.load(sys.stdin)['result'].get('isError') else '0')
 except Exception: print('1')")
 drain_all
 K9_STRANDED=$(PGQ "select count(*) from ops.jobs where tenant_id in ('$TENANT','$TENANT_B') and status='PROCESSING' and lease_expires_at is not null and lease_expires_at > now()")
+# …and the projection runner's own leases (ADR-0052): after the drain none may still be live.
+K9_STRANDED=$((K9_STRANDED + $(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and lease_owner is not null and lease_expires_at > now() and state='ISSUED'")))
 # Exactly-once after a mid-flight kill: a re-run hop may NOT index the same memory twice into the
 # same live projection slot. (Different versions/scopes are different slots by design, so the
 # grouping is the slot, not the memory.)
@@ -702,12 +748,438 @@ assert_eq "no_stranded_lease_after_kill9" "$K9_STRANDED" 0
 assert_eq "exactly_once_no_duplicate_live_points_after_kill9" "$K9_DUP_POINTS" 0
 echo "ASSERTIONS $A_OK passed, $A_BAD failed" | tee -a $EV/rehearsal.log
 
+# ============================================================================
+# card 27 / ADR-0052 — step projection_serve_multi_tenant
+# ONE tenant-free `humaux-retrieval-worker --serve` (start_rp, no tenant env) projects 3 tenants
+# × 2 workspaces on live MiniMax distill + live DashScope + real Qdrant. Every assertion prints
+# its n. Gate counts are scoped to the three seeded tenants ($SEEDED); dev leftovers in other
+# tenants are counted once, up front, and never enter a gate. Runs after the card-24 table so its
+# load cannot move those assertions. FAULT=revoke_claim: REVOKE the claim's EXECUTE before the
+# timed load (a trap re-GRANTs on any exit) — projection_lag_within_120s must go red and the
+# REHEARSAL VERDICT must fail; the rest of the run is skipped.
+# ============================================================================
+step projection_serve_multi_tenant
+zmodload zsh/datetime
+PST=$EV/pst; mkdir -p $PST
+CLAIM_FN="projection.claim_issued_tickets(text,text,text,text,text,double precision,bigint,bigint)"
+FAMS=("$TENANT $WS BEARER_A" "$TENANT $WS_A2 BEARER_A2" "$TENANT_B $WS_B BEARER_B" "$TENANT_B $WS_B2 BEARER_B2" "$TENANT_C $WS_C BEARER_C" "$TENANT_C $WS_C2 BEARER_C2")
+echo "pst: rp config (one process, no tenant env): $RP_PASS_ENV" | tr -d '\\' | tr -s ' ' | tee -a $EV/rehearsal.log
+echo "pst: dev leftovers outside the seeded tenants: $(PGQ "select count(*) from projection.stream_log where state='ISSUED' and tenant_id not in ($SEEDED)") ISSUED (never counted below)" | tee -a $EV/rehearsal.log
+assert_eq "no_tenant_env_for_the_projection_runner" \
+  "$(sed -n '/^start_rp() {/,/^}/p' $0 | grep -cE 'HUMAUX_RETRIEVAL_WORKER_(TENANT_ID|SCOPE_ID|SCOPE_KIND|QDRANT_COLLECTION)=')" 0
+# The resident distiller for this step (the gate's deployment runs distill resident; the earlier
+# steps drive it one pass at a time). Stopped at the end of the step; the soak starts its own.
+( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB" \
+    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+    HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-pst.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
+    HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
+    HUMAUX_PRIVATE_WORKER_DISTILL_BATCH=50 HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=120 HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH=8 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 \
+    HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=1
+  set -a; source /Volumes/data/viral-skill-eval/.env; set +a
+  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-private-worker --distill-serve >> $EV/pst-distill.log 2>&1 ) &
+own_pid ds $!
+# …and the resident consolidation worker: every distilled load memory enqueues a
+# DERIVED_CONSOLIDATE job (0164), and a step that left ~100 of them behind would sit, FIFO, in
+# front of the next rehearsal's own jobs (run 2026-09-29 #2: derived_jobs_not_done red for exactly
+# that reason). The step drains what it created before it ends.
+( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:devlocal_role_consolidation_worker@$PG/$DB" \
+    HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS=120 HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS=10 \
+    HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS=50 HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS=120 HUMAUX_CONSOLIDATION_WORKER_BATCH=8 HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5 \
+    HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS=1
+  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-consolidation-worker --serve >> $EV/pst-consolidation.log 2>&1 ) &
+own_pid cw $!
+pst_put() { # $1=bearer var $2=workspace $3=content $4=tsv — one remember.put, recorded with its put time
+  local t0=$EPOCHREALTIME ev=
+  ev=$(mcp_as "${(P)1}" remember "{\"operation\":\"put\",\"content\":\"$3\",\"idempotency_key\":\"$(uuidgen | tr A-Z a-z)\",\"workspace_id\":\"$2\"}" | head -1 | python3 -c "import sys,json
+try: print(json.load(sys.stdin)['result']['structuredContent']['evidence_id'])
+except Exception: print('')")
+  if [ -n "$ev" ]; then print -r -- "$ev	$1	$2	$t0	$3" >> $4; else echo "pst: put refused ($1 $2)" | tee -a $EV/rehearsal.log; fi
+}
+ev_list() { awk -F'\t' '{printf "%s'"'"'%s'"'"'", (NR>1?",":""), $1}' $1; }
+# settled/total tickets of the Evidence in $1
+tickets_settled() { PGQ "select count(*) filter (where s.state in ('DONE','SKIPPED_BY_POLICY'))||'/'||count(*) from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id and s.commit_seq=o.commit_seq where o.event_type='EVIDENCE_ACCEPTED' and o.evidence_id in ($(ev_list $1))"; }
+wait_settled() { # $1=tsv $2=deadline secs; echoes seconds waited, 0 status when every ticket settled OK
+  local i=0 st= want=$(wc -l < $1 | tr -d ' ')
+  while [ $i -lt $2 ]; do
+    st=$(tickets_settled $1)
+    [ "$st" = "$want/$want" ] && { echo $i; return 0; }
+    sleep 1; i=$((i+1))
+  done
+  echo "$i ($st)"; return 1
+}
+# Contents carry no uuid: gitleaks' generic-key rule flags one inside a distilled memory, and that
+# card then fails `secret_scan_rejected` (run 2026-09-29 #3 — the load would grade the scanner).
+NOUNS=(billing search ledger inventory payroll gateway audit catalog shipping pricing)
+DAYS=(Monday Tuesday Wednesday Thursday Friday Saturday Sunday Monday Tuesday Wednesday)
+
+# ---- 1. warm-up + first activation (an operator act until card 28, logged as such) ----
+: > $PST/warm.tsv
+f=0; for fam in $FAMS; do f=$((f+1)); set -- ${=fam}
+  pst_put $3 $2 "Card27 warm-up family $f: the ${NOUNS[$f]} team owns the on-call rota for its own service." $PST/warm.tsv
+done
+W=$(wait_settled $PST/warm.tsv 600); echo "pst warm-up: $(wc -l < $PST/warm.tsv | tr -d ' ') tickets settled after ${W}s" | tee -a $EV/rehearsal.log
+for fam in $FAMS; do set -- ${=fam}
+  echo "pst: first activation of ($1, $2) — operator act until card 28 (ADR-0017)" | tee -a $EV/rehearsal.log
+  cargo run -q -p xtask -- projection-serve --tenant $1 --workspace $2 --domain $DOMAIN --projection-kind $PKIND --version $PVER --retire-failed distill_failed,no_visible_memory_record 2>&1 | tail -1 | tee -a $EV/rehearsal.log
+done
+
+# ---- 2. timed load: 10 remember.put per family = 60 ----
+if [ "${FAULT:-}" = "revoke_claim" ]; then
+  trap "docker exec humaux-thread-pg psql -U postgres -d $DB -qc \"GRANT EXECUTE ON FUNCTION $CLAIM_FN TO role_retrieval_worker\"" EXIT
+  PGQ "REVOKE EXECUTE ON FUNCTION $CLAIM_FN FROM role_retrieval_worker" >/dev/null
+  echo "pst FAULT=revoke_claim: EXECUTE on the claim revoked from role_retrieval_worker (trap re-grants)" | tee -a $EV/rehearsal.log
+fi
+: > $PST/load.tsv
+LOAD_T0=$EPOCHREALTIME
+f=0; for fam in $FAMS; do f=$((f+1)); set -- ${=fam}
+  for k in $(seq 1 10); do
+    pst_put $3 $2 "Card27 family $f note $k: the ${NOUNS[$k]} service of team $f listens on port $((7000 + 100*f + k)) and ships every ${DAYS[$k]}." $PST/load.tsv
+  done
+done
+LOAD_T1=$EPOCHREALTIME
+N_LOAD=$(wc -l < $PST/load.tsv | tr -d ' ')
+echo "pst load: $N_LOAD puts over 6 families in $(printf '%.1f' $((LOAD_T1 - LOAD_T0)))s" | tee -a $EV/rehearsal.log
+# recall poller, concurrent with the drain: NO consistency_token, until every distilled memory is seen
+cat > $S/pst_visible.py <<'PYEOF'
+import json, os, subprocess, sys, time, urllib.request, uuid
+from concurrent.futures import ThreadPoolExecutor
+tsv, db, deadline = sys.argv[1], sys.argv[2], time.time() + float(sys.argv[3])
+rows = [l.rstrip("\n").split("\t") for l in open(tsv) if l.strip()]
+def pg(sql):
+    return subprocess.run(["docker","exec","humaux-thread-pg","psql","-U","postgres","-d",db,"-Atc",sql],
+                          capture_output=True, text=True).stdout.split()
+def recall(bearer, ws, query):
+    body = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"query":query,"workspace_id":ws,"mode":"semantic"},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"rehearsal","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}
+    req = urllib.request.Request("http://127.0.0.1:8080/mcp", data=json.dumps(body).encode(), method="POST", headers={
+        "Content-Type":"application/json","Accept":"application/json, text/event-stream","MCP-Protocol-Version":"2026-07-28",
+        "Mcp-Method":"tools/call","Mcp-Name":"recall","Origin":"http://127.0.0.1:8080","Authorization":"Bearer "+os.environ[bearer]})
+    try:
+        d = json.load(urllib.request.urlopen(req, timeout=30))
+        return {i.get("memory_id") for i in d["result"].get("structuredContent",{}).get("items",[])}
+    except Exception as e:
+        print("recall error:", type(e).__name__, file=sys.stderr)
+        return set()
+seen = {}          # memory_id -> seconds from its put
+mem_of = {}        # evidence -> [memory_id]
+no_memory = set()
+query_of = {}      # memory_id -> its key claim
+errors = 0
+while time.time() < deadline:
+    evs = ",".join("'%s'" % r[0] for r in rows)
+    # the query for a memory is its own distilled key claim: recall is top_k (5), and near-twin
+    # memories of one family ("ships every Monday") would otherwise crowd a put's text out of it
+    for line in subprocess.run(["docker","exec","humaux-thread-pg","psql","-U","postgres","-d",db,"-AtF","\t","-c",
+            f"select me.evidence_id, me.memory_id, coalesce(m.content->>'key_claim', m.content->>'title', m.content::text) from private.memory_evidence me join private.memory_records m on m.memory_id=me.memory_id where m.status='active' and me.evidence_id in ({evs})"],
+            capture_output=True, text=True).stdout.splitlines():
+        e, m, claim = line.split("\t", 2); mem_of.setdefault(e, set()).add(m); query_of[m] = claim
+    for e in pg(f"select o.evidence_id from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id and s.commit_seq=o.commit_seq where o.event_type='EVIDENCE_ACCEPTED' and o.evidence_id in ({evs}) and s.state='SKIPPED_BY_POLICY'"):
+        no_memory.add(e)
+    pending = [(r, m) for r in rows for m in mem_of.get(r[0], ()) if m not in seen]
+    if not pending and all(r[0] in mem_of or r[0] in no_memory for r in rows):
+        break
+    def probe(item):
+        r, m = item
+        if m in recall(r[1], r[2], query_of.get(m, r[4])):
+            return m, time.time() - float(r[3])
+        return None
+    with ThreadPoolExecutor(8) as pool:
+        for hit in pool.map(probe, pending):
+            if hit: seen[hit[0]] = hit[1]
+    time.sleep(1)
+lat = sorted(seen.values())
+pct = lambda q: round(lat[min(len(lat)-1, int(q*len(lat)))], 1) if lat else None
+total = sum(len(v) for v in mem_of.values())
+print(json.dumps({"memories": total, "visible": len(seen), "missing": total - len(seen),
+                  "evidence_without_memory": len(no_memory), "n": len(lat), "p50_s": pct(0.5), "p95_s": pct(0.95),
+                  "max_s": round(lat[-1],1) if lat else None}))
+PYEOF
+python3 $S/pst_visible.py $PST/load.tsv $DB $([ "${FAULT:-}" = "revoke_claim" ] && echo 150 || echo 900) > $PST/visible.json 2>$PST/visible.stderr &
+VIS_PID=$!
+DRAIN=$(wait_settled $PST/load.tsv $([ "${FAULT:-}" = "revoke_claim" ] && echo 150 || echo 900)); DRAIN_RC=$?
+wait $VIS_PID
+# per ticket: put → DONE, and distill-complete → DONE (the §42 projection lag the runner owns)
+LOAD_STATS=$(PGQ "select coalesce(string_agg(o.evidence_id||'|'||extract(epoch from s.settled_at)||'|'||extract(epoch from coalesce((select min(m.created_at) from private.memory_evidence me join private.memory_records m on m.memory_id=me.memory_id where me.evidence_id=o.evidence_id), o.processed_at)), ' '),'') from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id and s.commit_seq=o.commit_seq where o.event_type='EVIDENCE_ACCEPTED' and s.settled_at is not null and o.evidence_id in ($(ev_list $PST/load.tsv))")
+LAG=$(python3 - "$PST/load.tsv" "$LOAD_STATS" <<'PYEOF'
+import sys, json
+put = {l.split("\t")[0]: float(l.split("\t")[3]) for l in open(sys.argv[1]) if l.strip()}
+p2d, lag = [], []
+for rec in sys.argv[2].split():
+    e, done, ready = rec.split("|"); done, ready = float(done), float(ready)
+    p2d.append(done - put[e]); lag.append(done - ready)
+def s(v):
+    v = sorted(v)
+    return {"n": len(v), "p50": round(v[len(v)//2],1), "p95": round(v[min(len(v)-1,int(0.95*len(v)))],1), "max": round(v[-1],1)} if v else {"n": 0}
+print(json.dumps({"put_to_done_s": s(p2d), "distill_done_to_ticket_done_s": s(lag)}))
+PYEOF
+)
+echo "pst drain: waited ${DRAIN}s for $N_LOAD tickets; $LAG" | tee -a $EV/rehearsal.log
+echo "pst recall (no consistency_token): $(cat $PST/visible.json)" | tee -a $EV/rehearsal.log
+LAG_MAX=$(print -r -- "$LAG" | python3 -c "import sys,json; d=json.load(sys.stdin)['distill_done_to_ticket_done_s']; print(d.get('max', 9999))")
+SETTLED=$(tickets_settled $PST/load.tsv)
+# The assertion grades the runner's own share (distill done → ticket DONE, the §42 projection
+# lag) and is named for exactly that. The card's literal gate "all tickets DONE within 120 s" of
+# the puts is NOT graded here: put→DONE is bounded by live MiniMax distill (one resident
+# distiller), which card 27 does not change. It is printed as GATE-LITERAL, MET or NOT MET, and
+# never folded into the verdict under another name — the main line decides it (review 2026-09-29).
+assert_eq "projection_lag_within_120s(n=$N_LOAD settled=$SETTLED lag_max_s=$LAG_MAX)" \
+  "$([ "$SETTLED" = "$N_LOAD/$N_LOAD" ] && python3 -c "print(1 if float('$LAG_MAX') <= 120 else 0)" || echo 0)" 1
+PUT_DONE=$(print -r -- "$LAG" | python3 -c "import sys,json; d=json.load(sys.stdin)['put_to_done_s']; print('n=%s p95=%s max=%s' % (d.get('n'), d.get('p95'), d.get('max')))")
+PUT_MAX=$(print -r -- "$LAG" | python3 -c "import sys,json; print(json.load(sys.stdin)['put_to_done_s'].get('max', 9999))")
+echo "GATE-LITERAL all_tickets_done_within_120s_of_put: $([ "$SETTLED" = "$N_LOAD/$N_LOAD" ] && python3 -c "print('MET' if float('$PUT_MAX') <= 120 else 'NOT MET')" || echo 'NOT MET') (put->DONE $PUT_DONE settled=$SETTLED; main-line decision, not in the verdict)" | tee -a $EV/rehearsal.log
+if [ "${FAULT:-}" = "revoke_claim" ]; then
+  own_signal $S/ds.pid humaux-private-worker TERM 90; own_signal $S/cw.pid humaux-consolidation-worker TERM 90
+  echo "pst FAULT=revoke_claim: stopping here (steps 3-6 and the soak need a working claim)" | tee -a $EV/rehearsal.log
+  own_signal $S/gw.pid humaux-gateway TERM 30; own_signal $S/rw.pid humaux-retrieval-worker TERM 30
+  own_signal $S/rp.pid humaux-retrieval-worker TERM 90; own_signal $S/pw.pid humaux-private-worker TERM 30
+  echo "REHEARSAL VERDICT: $A_OK passed, $A_BAD failed" | tee -a $EV/rehearsal.log
+  [ "${A_BAD:-1}" -eq 0 ] || exit 1
+  exit 0
+fi
+VIS=$(cat $PST/visible.json)
+assert_eq "recall_without_token_returns_every_memory(n=$(print -r -- "$VIS" | python3 -c "import sys,json; print(json.load(sys.stdin)['memories'])"))" \
+  "$(print -r -- "$VIS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['missing'] if d['memories'] > 0 else -1)")" 0
+
+# ---- 3. crash: SIGKILL the runner mid-batch, restart, converge ----
+: > $PST/crash.tsv
+CRASH_N=(3 2 3 2)   # 10 puts on tenants A + B, both workspaces each
+for j in 1 2 3 4; do set -- ${=FAMS[$j]}
+  for k in $(seq 1 ${CRASH_N[$j]}); do pst_put $3 $2 "Card27 crash note $k for family $j: the rollout of build $((100*j + k)) waits for a green canary." $PST/crash.tsv; done
+done
+i=0; LIVE=0
+while [ $i -lt 3000 ]; do   # 0.2 s polls, bounded at 600 s
+  LIVE=$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and lease_owner is not null and lease_expires_at > now()")
+  [ "$LIVE" -gt 0 ] && break; sleep 0.2; i=$((i+1))
+done
+echo "pst crash: $LIVE live leases held by rp pid $(cat $S/rp.pid) — SIGKILL" | tee -a $EV/rehearsal.log
+own_signal $S/rp.pid humaux-retrieval-worker 9 15 | tee -a $EV/rehearsal.log
+start_rp; wait_ready projection-runner-after-crash rp_readyz
+C_WAIT=$(wait_settled $PST/crash.tsv 600)
+echo "pst crash: all $(wc -l < $PST/crash.tsv | tr -d ' ') tickets settled ${C_WAIT}s after restart" | tee -a $EV/rehearsal.log
+assert_eq "crash_killed_the_runner_mid_batch(n=$LIVE live leases)" "$([ "$LIVE" -gt 0 ] && echo 1 || echo 0)" 1
+assert_eq "duplicate_live_points(n=3 tenants)" "$(PGQ "select count(*) from (select memory_id from projection.private_memory_points where tenant_id in ($SEEDED) and projection_live and retired_at is null group by memory_id, scope_id, projection_version, embedding_version having count(*) > 1) t")" 0
+assert_eq "stranded_leases(n=$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED)") tickets)" "$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and lease_owner is not null and (state <> 'ISSUED' or lease_expires_at < now())")" 0
+assert_eq "crash_tickets_all_done(n=$(wc -l < $PST/crash.tsv | tr -d ' '))" "$(tickets_settled $PST/crash.tsv | awk -F/ '{print ($1==$2)?1:0}')" 1
+
+# ---- 4. Qdrant unreachable for 30 s (a closed loopback port; the container is never touched) ----
+DEAD_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); p=s.getsockname()[1]; s.close(); print(p)")
+own_signal $S/rp.pid humaux-retrieval-worker TERM 90 | tee -a $EV/rehearsal.log
+start_rp $DEAD_PORT
+echo "pst outage: rp restarted with Qdrant at 127.0.0.1:$DEAD_PORT (closed)" | tee -a $EV/rehearsal.log
+: > $PST/outage.tsv
+for j in 3 4; do set -- ${=FAMS[$j]}
+  for k in 1 2; do pst_put $3 $2 "Card27 outage note $k for family $j: invoices are reconciled against the bank feed at $((k+1)) am." $PST/outage.tsv; done
+done
+N_OUT=$(wc -l < $PST/outage.tsv | tr -d ' ')
+OUT_Q="from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id and s.commit_seq=o.commit_seq where o.event_type='EVIDENCE_ACCEPTED' and o.evidence_id in ($(ev_list $PST/outage.tsv))"
+# Each ticket is graded at the moment its FIRST attempt has failed (the four distill at different
+# times, so one global snapshot could catch an early one already on attempt 2 after its 30 s
+# backoff): ISSUED, attempts 1, lease cleared, backing off, class qdrant_upsert_failed.
+typeset -A OUT_SEEN; OUT_T0=; i=0
+while [ $i -lt 600 ] && [ ${#OUT_SEEN} -lt $N_OUT ]; do
+  for seq in $(PGQ "select s.tenant_id||':'||s.stream_seq $OUT_Q and s.state='ISSUED' and s.attempts=1 and s.next_attempt_at > now() and s.lease_owner is null and s.error_class='qdrant_upsert_failed'"); do
+    OUT_SEEN[$seq]=1; [ -z "$OUT_T0" ] && OUT_T0=$EPOCHREALTIME
+  done
+  sleep 1; i=$((i+1))
+done
+[ -z "$OUT_T0" ] && OUT_T0=$EPOCHREALTIME
+assert_eq "outage_tickets_retry_with_attempts_1(n=$N_OUT)" "${#OUT_SEEN}" "$N_OUT"
+assert_eq "no_ticket_failed_during_outage(n=$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED)") tickets)" "$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and state='FAILED'")" 0
+sleep $(( 30 - (EPOCHREALTIME - OUT_T0) > 0 ? 30 - (EPOCHREALTIME - OUT_T0) : 0 ))
+own_signal $S/rp.pid humaux-retrieval-worker TERM 90 | tee -a $EV/rehearsal.log
+start_rp; wait_ready projection-runner-after-outage rp_readyz
+O_WAIT=$(wait_settled $PST/outage.tsv 120); O_RC=$?
+echo "pst outage: restored after $(printf '%.0f' $((EPOCHREALTIME - OUT_T0)))s; $N_OUT tickets settled ${O_WAIT}s after restore" | tee -a $EV/rehearsal.log
+assert_eq "outage_tickets_done_after_restore(n=$N_OUT within 120s)" "$O_RC" 0
+
+# ---- 5. permanent fault, last and on its own family (C / ws2) ----
+own_signal $S/rp.pid humaux-retrieval-worker TERM 90 | tee -a $EV/rehearsal.log
+: > $PST/perm.tsv
+pst_put BEARER_C2 $WS_C2 "Card27 permanent fault: the archive bucket keeps snapshots for ninety days." $PST/perm.tsv
+PERM_EV=$(cut -f1 $PST/perm.tsv)
+i=0; while [ $i -lt 600 ]; do [ "$(PGQ "select status from ops.outbox where evidence_id='$PERM_EV' and event_type='EVIDENCE_ACCEPTED'")" = "DONE" ] && break; sleep 1; i=$((i+1)); done
+PERM_SEQ=$(PGQ "select s.stream_seq from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id and s.commit_seq=o.commit_seq where o.evidence_id='$PERM_EV' and o.event_type='EVIDENCE_ACCEPTED'")
+# --run-once claims across ALL tenants: it must find nothing claimable but this one ticket, or the
+# 512-d fault would land on someone else's ticket. Checked, never assumed.
+PERM_OTHERS=$(PGQ "select count(*) from projection.stream_log s join projection.tenant_placements p on p.tenant_id=s.tenant_id and p.projection_family='private_memory_v1' where s.state='ISSUED' and s.scope_kind='workspace' and s.domain='$DOMAIN' and s.projection_kind='$PKIND' and s.projection_version='$PVER' and (s.lease_expires_at is null or s.lease_expires_at < now()) and (s.next_attempt_at is null or s.next_attempt_at <= now()) and not exists (select 1 from ops.outbox o where o.tenant_id=s.tenant_id and o.commit_seq=s.commit_seq and o.event_type='EVIDENCE_ACCEPTED' and o.status in ('PENDING','PROCESSING')) and not (s.tenant_id='$TENANT_C' and s.scope_id='$WS_C2' and s.stream_seq=${PERM_SEQ:-0})")
+PTS_BEFORE=$(curl -s -X POST "http://127.0.0.1:6333/collections/$COLLECTION/points/count" -H 'Content-Type: application/json' --data "{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"tenant_id\",\"match\":{\"value\":\"$TENANT_C\"}},{\"key\":\"workspace_id\",\"match\":{\"value\":\"$WS_C2\"}}]}}" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['count'])")
+if [ "$PERM_OTHERS" = "0" ]; then
+  ( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:devlocal_role_retrieval_worker@$PG/$DB" \
+      HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER=dashscope HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL=$EMB_MODEL HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION=$EMB_REV \
+      HUMAUX_RETRIEVAL_WORKER_DIMENSION=512 HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
+      HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=6333 HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
+      HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID HUMAUX_RETRIEVAL_WORKER_CALLER=retrieval-worker \
+      HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER
+    eval "export $RP_PASS_ENV"; export HUMAUX_RETRIEVAL_WORKER_BATCH=1 HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP=1
+    set -a; source $R/.env.local; set +a
+    exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --run-once ) 2>&1 | tee -a $EV/projection-runner.log | tail -2 | tee -a $EV/rehearsal.log
+else
+  echo "pst permanent fault NOT injected: $PERM_OTHERS other claimable ticket(s) exist and would take the fault" | tee -a $EV/rehearsal.log
+fi
+PERM_ROW=$(PGQ "select state||'|'||coalesce(error_class,'-') from projection.stream_log where tenant_id='$TENANT_C' and scope_id='$WS_C2' and stream_seq=${PERM_SEQ:-0}")
+PTS_AFTER=$(curl -s -X POST "http://127.0.0.1:6333/collections/$COLLECTION/points/count" -H 'Content-Type: application/json' --data "{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"tenant_id\",\"match\":{\"value\":\"$TENANT_C\"}},{\"key\":\"workspace_id\",\"match\":{\"value\":\"$WS_C2\"}}]}}" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['count'])")
+PERM_REG=$(PGQ "select count(*) from projection.private_memory_points p join private.memory_evidence me on me.memory_id=p.memory_id where me.evidence_id='$PERM_EV' and p.retired_at is null")
+echo "pst permanent: ticket seq=$PERM_SEQ row=$PERM_ROW others_claimable=$PERM_OTHERS qdrant_points(C/ws2) before=$PTS_BEFORE after=$PTS_AFTER live_registry_rows=$PERM_REG" | tee -a $EV/rehearsal.log
+assert_eq "permanent_fault_ticket_failed_with_class(n=1)" "$PERM_ROW" "FAILED|qdrant_upsert_rejected"
+assert_eq "permanent_fault_memory_has_no_point(n=1 memory: registry rows, new qdrant points)" "$PERM_REG|$((PTS_AFTER - PTS_BEFORE))" "0|0"
+assert_eq "other_tickets_unaffected(n=$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED)") tickets)" \
+  "$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and state not in ('DONE','SKIPPED_BY_POLICY','RETIRED_FAILED') and not (tenant_id='$TENANT_C' and scope_id='$WS_C2' and stream_seq=${PERM_SEQ:-0})")" 0
+cargo run -q -p xtask -- projection-serve --tenant $TENANT_C --workspace $WS_C2 --domain $DOMAIN --projection-kind $PKIND --version $PVER --retire-failed qdrant_upsert_rejected 2>&1 | tail -1 | tee -a $EV/rehearsal.log
+start_rp; wait_ready projection-runner-after-permanent rp_readyz
+
+# ---- 6. EXPLAIN: no Seq Scan on ops.outbox / ops.jobs / private.memory_evidence ----
+cat > $S/explain_gate.py <<'PYEOF'
+#!/usr/bin/env python3
+# card 27 EXPLAIN gate: plans of the projection claim, the 0164 job claim (both via auto_explain,
+# inside BEGIN..ROLLBACK), the retrieve.rs RYW overlay and the distill_repo claim (EXPLAIN only).
+# usage: explain_gate.py <db> <tenant> <workspace> <out_dir> [--no-projection-claim]
+# prints one line per plan: "plan=<name> nodes=<n> seq_scan_hot=<k> <tables>" and a summary.
+import json, re, subprocess, sys, uuid
+
+db, tenant, ws, out = sys.argv[1:5]
+with_proj = "--no-projection-claim" not in sys.argv
+HOT = {("ops", "outbox"), ("ops", "jobs"), ("private", "memory_evidence")}
+U = str(uuid.UUID(int=0))
+
+overlay = f"""SELECT sl.stream_seq, sl.state, ob.evidence_id,
+       array_agg(DISTINCT mr.memory_id) FILTER (WHERE mr.memory_id IS NOT NULL) AS memory_ids
+FROM projection.stream_log sl
+JOIN ops.outbox ob ON ob.tenant_id = sl.tenant_id AND ob.commit_seq = sl.commit_seq
+JOIN private.evidence_objects evidence
+  ON evidence.evidence_id = ob.evidence_id AND evidence.tenant_id = sl.tenant_id
+LEFT JOIN private.memory_evidence me ON me.evidence_id = evidence.evidence_id
+LEFT JOIN private.memory_records mr
+  ON mr.memory_id = me.memory_id AND mr.tenant_id = sl.tenant_id
+ AND mr.status = 'active'
+ AND (mr.visibility_class = 'TENANT_SHARED'
+   OR (mr.visibility_class = 'USER_PRIVATE' AND mr.visibility_user_id = '{U}')
+   OR (mr.visibility_class = 'WORKSPACE_SHARED' AND mr.visibility_workspace_id = ANY(ARRAY['{ws}']::uuid[])))
+WHERE sl.tenant_id = '{tenant}' AND sl.scope_kind = 'workspace' AND sl.scope_id = '{ws}'
+  AND sl.domain = 'private_memory' AND sl.projection_kind = 'PRIVATE_MEMORY' AND sl.projection_version = 'v1'
+  AND sl.stream_seq > 0 AND sl.stream_seq <= 1000000 AND sl.state <> 'TOMBSTONED'
+  AND (evidence.visibility_class = 'TENANT_SHARED'
+    OR (evidence.visibility_class = 'USER_PRIVATE' AND evidence.visibility_user_id = '{U}')
+    OR (evidence.visibility_class = 'WORKSPACE_SHARED' AND evidence.visibility_workspace_id = ANY(ARRAY['{ws}']::uuid[])))
+GROUP BY sl.stream_seq, sl.state, ob.evidence_id
+ORDER BY sl.stream_seq"""
+
+distill = f"""WITH picked AS (
+  SELECT outbox_id FROM ops.outbox
+  WHERE tenant_id = '{tenant}' AND event_type = 'EVIDENCE_ACCEPTED' AND evidence_id IS NOT NULL
+    AND (status = 'PENDING' OR (status = 'PROCESSING' AND lease_expires_at < clock_timestamp()))
+  ORDER BY commit_seq
+  FOR UPDATE SKIP LOCKED
+  LIMIT 50
+)
+UPDATE ops.outbox o
+SET status = 'PROCESSING', lease_owner = 'explain-probe',
+    lease_expires_at = clock_timestamp() + make_interval(secs => 120)
+FROM picked WHERE o.outbox_id = picked.outbox_id
+RETURNING o.outbox_id, o.evidence_id, o.commit_seq, o.stream_seq"""
+
+proj = ("SELECT count(*) FROM projection.claim_issued_tickets('private_memory','PRIVATE_MEMORY','v1',"
+        "'private_memory_v1','explain-probe',1,1,1);\n") if with_proj else ""
+script = f"""\\set ON_ERROR_STOP on
+LOAD 'auto_explain';
+SET auto_explain.log_min_duration = 0;
+SET auto_explain.log_nested_statements = on;
+SET auto_explain.log_level = notice;
+SET auto_explain.log_format = json;
+SET auto_explain.log_verbose = on;
+SET client_min_messages = notice;
+BEGIN;
+SELECT '@@claim_derived_work';
+SELECT count(*) FROM ops.claim_derived_work(ARRAY['DERIVED_DISTILL','DERIVED_CONSOLIDATE'], 'explain-probe', 1, 1);
+SELECT '@@claim_issued_tickets';
+{proj}ROLLBACK;
+SET auto_explain.log_min_duration = -1;
+BEGIN;
+SET LOCAL ROLE role_gateway;
+SELECT set_config('humaux.tenant_id', '{tenant}', true), set_config('humaux.user_id', '{U}', true);
+EXPLAIN (FORMAT JSON, VERBOSE) {overlay};
+ROLLBACK;
+BEGIN;
+SET LOCAL ROLE role_private_worker;
+SELECT set_config('humaux.tenant_id', '{tenant}', true), set_config('humaux.user_id', '{U}', true);
+EXPLAIN (FORMAT JSON, VERBOSE) {distill};
+ROLLBACK;
+"""
+p = subprocess.run(["docker", "exec", "-i", "humaux-thread-pg", "psql", "-U", "postgres", "-d", db, "-At"],
+                   input=script, capture_output=True, text=True)
+if p.returncode != 0:
+    print("explain_gate: psql failed:", p.stderr[-800:]); sys.exit(2)
+
+def objs(text, opener):
+    dec = json.JSONDecoder(); res = []
+    for m in re.finditer(r"(?m)^" + re.escape(opener), text):
+        try: res.append(dec.raw_decode(text, m.start())[0])
+        except ValueError: pass
+    return res
+
+notices = objs(p.stderr, "{")          # auto_explain (nested statements of the two definers)
+explains = objs(p.stdout, "[")         # EXPLAIN results: [ {Plan..} ]
+plans = {}
+for n in notices:
+    q = n.get("Query Text", "")
+    if "ops.jobs j" in q and "UPDATE ops.jobs" in q: plans["job_claim"] = n["Plan"]
+    if "projection.stream_log s" in q and "UPDATE projection.stream_log" in q: plans["projection_claim"] = n["Plan"]
+ex = [e[0]["Plan"] for e in explains if isinstance(e, list)]
+if len(ex) >= 2: plans["overlay"], plans["distill_claim"] = ex[0], ex[1]
+
+def walk(pl, acc):
+    acc.append(pl)
+    for c in pl.get("Plans", []): walk(c, acc)
+    return acc
+
+total_hot = 0
+for name in ["projection_claim", "job_claim", "overlay", "distill_claim"]:
+    if name not in plans:
+        print(f"plan={name} MISSING"); total_hot += 0 if (name == "projection_claim" and not with_proj) else 1000; continue
+    nodes = walk(plans[name], [])
+    json.dump(plans[name], open(f"{out}/plan_{name}.json", "w"), indent=1)
+    hot = [f"{x.get('Schema')}.{x.get('Relation Name')}" for x in nodes
+           if x.get("Node Type") == "Seq Scan" and (x.get("Schema"), x.get("Relation Name")) in HOT]
+    kinds = sorted({f"{x['Node Type']}:{x.get('Schema','')}.{x.get('Relation Name','')}" for x in nodes if x.get("Relation Name")})
+    print(f"plan={name} nodes={len(nodes)} seq_scan_hot={len(hot)} {hot} scans={kinds}")
+    total_hot += len(hot)
+print(f"explain_gate: plans={len(plans)} seq_scan_on_outbox_jobs_memory_evidence={total_hot}")
+PYEOF
+docker exec humaux-thread-pg psql -U postgres -d $DB -qc "ANALYZE ops.outbox; ANALYZE ops.jobs; ANALYZE private.memory_evidence; ANALYZE projection.stream_log"
+mkdir -p $PST/plans
+python3 $S/explain_gate.py $DB $TENANT $WS $PST/plans 2>&1 | tee -a $EV/rehearsal.log
+EXPLAIN_HOT=$(grep -oE 'seq_scan_on_outbox_jobs_memory_evidence=[0-9]+' $EV/rehearsal.log | tail -1 | cut -d= -f2)
+EXPLAIN_N=$(grep -oE 'explain_gate: plans=[0-9]+' $EV/rehearsal.log | tail -1 | cut -d= -f2)
+assert_eq "no_seq_scan_on_outbox_jobs_memory_evidence(n=${EXPLAIN_N:-0} plans)" "${EXPLAIN_N:-0}|${EXPLAIN_HOT:-x}" "4|0"
+# A plan cannot pin an index (at dev data sizes the planner has another path for 4 of the 6 P1-15
+# indexes — review 2026-09-29, fault f_delete_p1_15_index), so the catalog does: all seven exist,
+# valid and ready. The exact definitions are pinned by crates/adapters/tests/hot_path_indexes.rs.
+P1_15_IDX="'stream_log_issued_claim_idx','outbox_tenant_commit_seq_uidx','outbox_tenant_evidence_idx','outbox_evidence_claim_idx','memory_evidence_evidence_idx','jobs_claim_active_idx','memory_records_superseded_by_idx'"
+assert_eq "p1_15_indexes_present_valid_ready(n=7 indexes)" \
+  "$(PGQ "select count(*) from pg_index i join pg_class c on c.oid=i.indexrelid where c.relname in ($P1_15_IDX) and i.indisvalid and i.indisready")" 7
+
+# ---- claim latency, one sample per pass ----
+CLAIM=$(grep -oE 'projection pass claimed=[0-9]+ .* claim_ms=[0-9]+' $EV/projection-runner.log | python3 -c "
+import sys
+v=sorted(int(l.rsplit('claim_ms=',1)[1]) for l in sys.stdin)
+print('n=%d p50=%sms p95=%sms max=%sms' % (len(v), v[len(v)//2] if v else '-', v[min(len(v)-1,int(0.95*len(v)))] if v else '-', v[-1] if v else '-'))")
+echo "pst claim_issued_tickets wall time per pass: $CLAIM" | tee -a $EV/rehearsal.log
+# drain the derived work this step created (see the cw start above), bounded
+i=0; while [ $i -lt 600 ]; do
+  PST_BACKLOG=$(PGQ "select count(*) from ops.jobs where tenant_id in ($SEEDED) and left(job_type,8)='DERIVED_' and status in ('PENDING','RETRY_WAIT','PROCESSING')")
+  [ "$PST_BACKLOG" = "0" ] && break; sleep 2; i=$((i+2))
+done
+echo "pst derived backlog of the seeded tenants after ${i}s: $PST_BACKLOG" | tee -a $EV/rehearsal.log
+assert_eq "pst_leaves_no_derived_backlog(n=$(PGQ "select count(*) from ops.jobs where tenant_id in ($SEEDED) and left(job_type,8)='DERIVED_'") jobs)" "$PST_BACKLOG" 0
+own_signal $S/ds.pid humaux-private-worker TERM 90 | tee -a $EV/rehearsal.log
+own_signal $S/cw.pid humaux-consolidation-worker TERM 90 | tee -a $EV/rehearsal.log
+echo "ASSERTIONS (incl. projection_serve_multi_tenant) $A_OK passed, $A_BAD failed" | tee -a $EV/rehearsal.log
+
 # ---------- 6c. soak (card 16 / ADR-0038) — only when SOAK_SECS is set ----------
 # Two tenants (e2e-seed provisions ONE per invocation, so it runs twice with the SAME pepper —
 # one gateway serves N (tenant, workspace) pairs per request since cards 10/11/13), concurrent
-# sessions on both, a chaos hook that kill -9s and restarts the retrieval worker, and one
-# projection loop per tenant (the projection worker IS tenant-bound; only the two DERIVED
-# workers are tenant-free, ADR-0036).
+# sessions on both, a chaos hook that kill -9s and restarts each resident worker in turn — the
+# tenant-free projection runner (`--serve`, ADR-0052) included. There is no projection loop any
+# more: the runner that serves the whole rehearsal serves the soak.
 if [ "${SOAK_SECS:-0}" -gt 0 ]; then
 step soak
 # --processor-id is the DEPLOYMENT's egress processor (§7.3), not a per-tenant value: the private
@@ -724,14 +1196,13 @@ echo "soak tenants: A=$TENANT/$WS  B=$TENANT_B/$WS_B" | tee -a $EV/rehearsal.log
 RW_ENV="export HUMAUX_RETRIEVAL_WORKER_PG_DSN='postgres://role_retrieval_worker:devlocal_role_retrieval_worker@$PG/$DB' \
 HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=6333 \
 HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
-HUMAUX_RETRIEVAL_WORKER_QDRANT_COLLECTION=$COLLECTION HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID \
+HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID \
 HUMAUX_RETRIEVAL_WORKER_CALLER=retrieval-worker HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH=$SOCK/retrieval.sock \
 HUMAUX_RETRIEVAL_WORKER_GATEWAY_UID=$MYUID HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER=dashscope \
 HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL=$EMB_MODEL HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION=$EMB_REV \
 HUMAUX_RETRIEVAL_WORKER_DIMENSION=$EMB_DIM HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER \
 HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
-HUMAUX_RETRIEVAL_WORKER_SCOPE_KIND=workspace \
-HUMAUX_RETRIEVAL_WORKER_BATCH=50 HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN \
+HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN \
 HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER"
 
 # One definition per worker, used by BOTH the resident spawn below and its chaos restart, so a
@@ -825,36 +1296,26 @@ echo \$! > $S/cw.pid
 sleep 3
 exit 0
 EOF
-# one projection pass per tenant, then the §16.2 serving switch for that tenant
-cat > $S/soak_project.sh <<EOF
+# …and the projection runner (ADR-0052) holds projection.stream_log ticket leases — kill -9
+# mid-batch is what `no_live_ticket_lease_after_drain` grades. Same $RW_ENV + $RP_PASS_ENV as
+# start_rp: the restarted runner is the runner the rehearsal ran.
+cat > $S/soak_chaos_rp.sh <<EOF
 #!/bin/sh
 cd $R || exit 1
-HUMAUX_MAINTENANCE_PG_DSN='postgres://role_maintenance:devlocal_role_maintenance@$PG/$DB'
-export HUMAUX_MAINTENANCE_PG_DSN
-while [ -f $S/soak_project.on ]; do
-  for t_w in "$TENANT|$WS" "$TENANT_B|$WS_B"; do
-    t=\$(echo "\$t_w" | cut -d'|' -f1); w=\$(echo "\$t_w" | cut -d'|' -f2)
-    (
+. $S/own_signal.sh
+own_signal $S/rp.pid humaux-retrieval-worker 9 || exit 1
+(
 $RW_ENV
-    export HUMAUX_RETRIEVAL_WORKER_TENANT_ID=\$t HUMAUX_RETRIEVAL_WORKER_SCOPE_ID=\$w
-    set -a; . $R/.env.local; set +a
-    "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --run-once >> $EV/soak-projection.log 2>&1
-    ) 
-    n=\$(docker exec humaux-thread-pg psql -U postgres -d $DB -Atc "select count(*) from projection.private_memory_points where tenant_id='\$t'")
-    # card 20: retire this version's exhausted FAILED tickets (§15.2.1) so the §15.4 prefix
-    # projection_promoted grades can move, and offer the version to §16.3 only when it is not
-    # already this family's serving row — projection-serve short-circuits that case itself, so the
-    # loop no longer re-offers v1 to itself every 5 s (VisibleSameVersionDeclared, soak25/26/27).
-    "${CARGO_TARGET_DIR:-target}"/debug/xtask projection-serve --tenant \$t --workspace \$w --domain $DOMAIN \
-      --projection-kind $PKIND --version $PVER \
-      --retire-failed distill_failed,no_visible_memory_record \
-      >> $EV/soak-projection.log 2>&1
-  done
-  sleep 5
-done
+export $RP_PASS_ENV
+set -a; . $R/.env.local; set +a
+exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --serve >> $EV/projection-runner.log 2>&1
+) &
+echo \$! > $S/rp.pid
+sleep 3
+exit 0
 EOF
-chmod +x $S/soak_probe_rw.sh $S/soak_probe_pw.sh $S/soak_project.sh \
-         $S/soak_chaos_rw.sh $S/soak_chaos_ds.sh $S/soak_chaos_cw.sh
+chmod +x $S/soak_probe_rw.sh $S/soak_probe_pw.sh \
+         $S/soak_chaos_rw.sh $S/soak_chaos_ds.sh $S/soak_chaos_cw.sh $S/soak_chaos_rp.sh
 
 # macOS XProtect assesses each freshly linked binary on FIRST exec (~98 s, strictly serial).
 # Warm every binary the soak launches or probes BEFORE the timed window; never widen a
@@ -875,11 +1336,13 @@ SOAK_DS_PID=$!; own_pid ds $SOAK_DS_PID
 ( eval "$CW_ENV"
   exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-consolidation-worker --serve > $EV/soak-consolidation.log 2>&1 ) &
 SOAK_CW_PID=$!; own_pid cw $SOAK_CW_PID
-touch $S/soak_project.on; $S/soak_project.sh & SOAK_PROJ_PID=$!
 
+# The runner's chaos hook runs FIRST: a SOAK_SECS=120 run with a 90 s chaos period fires exactly one
+# hook, and the card-27 gate is the runner's kill -9 (the retrieval worker's restart window fails a
+# handful of recalls, which op_failure_rate counts at 1%; longer soaks rotate through all four).
 cargo run -q -p xtask -- soak \
   --gateway-url http://127.0.0.1:8080/mcp \
-  --tenant "$TENANT:$WS:BEARER_A" --tenant "$TENANT_B:$WS_B:BEARER_B" \
+  --tenant "$TENANT:$WS:BEARER_A" --tenant "$TENANT_B:$WS_B:BEARER_B" --tenant "$TENANT_C:$WS_C:BEARER_C" \
   --sessions-per-tenant ${SOAK_SESSIONS:-2} \
   --duration-secs $SOAK_SECS --drain-secs ${SOAK_DRAIN:-150} --think-ms ${SOAK_THINK_MS:-500} \
   --probe-every-secs 15 \
@@ -887,15 +1350,13 @@ cargo run -q -p xtask -- soak \
   --probe-cmd "$S/soak_probe_rw.sh" \
   --probe-cmd "$S/soak_probe_pw.sh" \
   --watch-pidfile gw=$S/gw.pid --watch-pidfile rw=$S/rw.pid --watch-pidfile pw=$S/pw.pid \
-  --watch-pidfile ds=$S/ds.pid --watch-pidfile cw=$S/cw.pid \
+  --watch-pidfile ds=$S/ds.pid --watch-pidfile cw=$S/cw.pid --watch-pidfile rp=$S/rp.pid \
   --chaos-every-secs ${SOAK_CHAOS_SECS:-90} --chaos-grace-secs ${SOAK_CHAOS_GRACE:-60} \
-  --chaos-cmd "$S/soak_chaos_rw.sh" --chaos-cmd "$S/soak_chaos_ds.sh" --chaos-cmd "$S/soak_chaos_cw.sh" \
+  --chaos-cmd "$S/soak_chaos_rp.sh" --chaos-cmd "$S/soak_chaos_rw.sh" --chaos-cmd "$S/soak_chaos_ds.sh" --chaos-cmd "$S/soak_chaos_cw.sh" \
   --lease-secs 120 --max-rss-mib ${SOAK_MAX_RSS_MIB:-2048} --max-db-connections ${SOAK_MAX_CONNS:-120} \
   --max-op-failure-rate ${SOAK_MAX_OP_FAIL:-0.01} \
   --report $EV/soak-report.json 2>&1 | tee -a $EV/rehearsal.log
 SOAK_RC=${pipestatus[1]}   # zsh: the tee at the end of the pipe is NOT the verdict
-rm -f $S/soak_project.on
-kill $SOAK_PROJ_PID 2>/dev/null              # the projection loop is this script's own zsh child
 # …the two resident workers go through the pidfiles: a chaos step may have restarted them, so
 # $SOAK_DS_PID / $SOAK_CW_PID can be stale, and a stale PID is exactly what must never be killed.
 own_signal $S/ds.pid humaux-private-worker TERM 30
@@ -933,6 +1394,7 @@ step stop
 # so $RW_PID is stale by here. own_signal confirms `ps -o comm=` before signalling anything.
 own_signal $S/gw.pid humaux-gateway TERM 30
 own_signal $S/rw.pid humaux-retrieval-worker TERM 30
+own_signal $S/rp.pid humaux-retrieval-worker TERM 90
 own_signal $S/pw.pid humaux-private-worker TERM 30
 sleep 1
 echo "done; tenant kept for inspection: $TENANT (teardown: cargo run -q -p xtask -- e2e-seed --teardown $TENANT)" | tee -a $EV/rehearsal.log

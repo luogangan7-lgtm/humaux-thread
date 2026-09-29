@@ -1,23 +1,28 @@
 //! `retrieval-worker::main` — `humaux-retrieval-worker` 进程入口（最小必要进程集见 §4.2；admin 探针契约见 §4.4）。
 //! Depends-on: crates=[async-trait, axum, humaux-adapters, humaux-domain, humaux-infra-cell,
-//!   humaux-local-secret-scan, humaux-projection, humaux-retrieval-provider, tokio, uuid];
-//!   services=[PostgreSQL(role_retrieval_worker), Qdrant(*), UDS(serve)]; env=[HUMAUX_RETRIEVAL_WORKER_BATCH,
-//!   HUMAUX_RETRIEVAL_WORKER_CALLER, HUMAUX_RETRIEVAL_WORKER_CELL_ID, HUMAUX_RETRIEVAL_WORKER_DIMENSION,
-//!   HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID, HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL,
-//!   HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER, HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION,
-//!   HUMAUX_RETRIEVAL_WORKER_GATEWAY_UID, HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN,
-//!   HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256, HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION,
-//!   HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS, HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION,
-//!   HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR, HUMAUX_RETRIEVAL_WORKER_QDRANT_COLLECTION,
+//!   humaux-local-secret-scan, humaux-retrieval-provider, tokio, uuid];
+//!   services=[PostgreSQL(role_retrieval_worker), Qdrant(*), UDS(serve)]; env=[HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS,
+//!   HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS, HUMAUX_RETRIEVAL_WORKER_BATCH, HUMAUX_RETRIEVAL_WORKER_CALLER,
+//!   HUMAUX_RETRIEVAL_WORKER_CELL_ID, HUMAUX_RETRIEVAL_WORKER_DIMENSION, HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID,
+//!   HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL, HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER,
+//!   HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION, HUMAUX_RETRIEVAL_WORKER_GATEWAY_UID,
+//!   HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN, HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256,
+//!   HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION, HUMAUX_RETRIEVAL_WORKER_LEASE_SECS,
+//!   HUMAUX_RETRIEVAL_WORKER_MAX_ATTEMPTS, HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS,
+//!   HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION, HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP, HUMAUX_RETRIEVAL_WORKER_PG_DSN,
+//!   HUMAUX_RETRIEVAL_WORKER_POLL_INTERVAL_SECS, HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR,
 //!   HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST, HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT, HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS,
-//!   HUMAUX_RETRIEVAL_WORKER_REGION, HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH, HUMAUX_RETRIEVAL_WORKER_SCOPE_ID,
-//!   HUMAUX_RETRIEVAL_WORKER_SCOPE_KIND, HUMAUX_RETRIEVAL_WORKER_TENANT_ID]; modules=[adapters::disclosure,
-//!   adapters::postgres, adapters::projection_worker, adapters::qdrant, domain::egress, domain::error, domain::ids,
-//!   humaux-local-secret-scan, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::serving,
-//!   retrieval-provider::adapters, retrieval-provider::contract, retrieval-worker::rpc]
+//!   HUMAUX_RETRIEVAL_WORKER_REGION, HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH]; modules=[adapters::disclosure,
+//!   adapters::postgres, adapters::projection_worker, adapters::qdrant, adapters::stream_repo, domain::egress,
+//!   domain::error, domain::ids, humaux-local-secret-scan, infra-cell::permit, infra-cell::resource,
+//!   infra-cell::transport, retrieval-provider::adapters, retrieval-provider::contract, retrieval-worker::rpc]
 //! Called-by: [process(humaux-retrieval-worker)]
-//! Invariants: [the UDS server binds only the configured socket path; a peer without kernel peer-credential auth is refused before any request is read]
-//! Spec: Baseline §4.2; §4.4; §17.3; ADR-0012; ADR-0037
+//! Invariants: [the UDS server binds only the configured socket path; a peer without kernel peer-credential auth is
+//!   refused before any request is read; --serve / --run-once read no tenant, workspace or collection from the
+//!   environment (ADR-0052: the claim supplies ticket and placement); a missing/zero pass key exits non-zero before
+//!   any claim; --serve observes SIGTERM/SIGINT only between passes and a DB outage is a logged failed pass, not an
+//!   exit]
+//! Spec: Baseline §4.2; §4.4; §17.3; ADR-0012; ADR-0037; ADR-0052
 //!
 //! §4.2 (line 818): the owning process of `humaux_adapters::projection_worker::run_once` —
 //! there is no separate `projection-worker` process. Env wiring mirrors
@@ -28,31 +33,39 @@
 //! Card 15 / ADR-0037 adds `--readyz` (one live round trip to each dependency this process
 //! cannot work without — see [`readyz`]) and graceful SIGTERM/Ctrl-C shutdown for `--serve-rpc`
 //! (axum's `with_graceful_shutdown`: the accept loop stops, in-flight embedding calls finish).
+//!
+//! Card 27 / ADR-0052 adds `--serve`: the resident, tenant-free projection runner — one
+//! `projection_worker::run_claimed_pass` every `HUMAUX_RETRIEVAL_WORKER_POLL_INTERVAL_SECS`, the
+//! consolidation worker's `--serve` shape ([`Shutdown`], the signal observed between passes only,
+//! so every claimed ticket is settled, retried or released before exit). `--run-once` is one such
+//! pass (nothing claimable = exit 0). Neither reads a tenant, workspace or collection from the
+//! environment: the claim hands each ticket its placement.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     process::ExitCode,
+    sync::atomic::AtomicBool,
     time::Duration,
 };
 
 use async_trait::async_trait;
 use humaux_adapters::disclosure::DisclosureSource;
 use humaux_adapters::postgres::RetrievalWorkerDbPool;
-use humaux_adapters::projection_worker::{CardEmbedder, ProjectionWorkerDeps, run_once};
-use humaux_adapters::qdrant::{
-    PlacementClass, PromotionState, RetrievalFamily, TenantPlacementRow,
+use humaux_adapters::projection_worker::{
+    CardEmbedder, PassConfig, PassOutcome, SharedProjectionDeps, run_claimed_pass,
 };
+use humaux_adapters::qdrant::RetrievalFamily;
+use humaux_adapters::stream_repo::{Backoff, ClaimFamily};
 use humaux_domain::egress::ProcessorId;
 use humaux_domain::error::ErrorCode;
 use humaux_domain::ids::TenantId;
 use humaux_infra_cell::{
-    CallerId, CellAccessPermit, CellId, HttpIntraCellTransport, IntraCellHttpTransport,
-    IntraCellMethod, IntraCellRequest, IntraCellResource, IntraCellResourceRegistry, ResourceEntry,
+    CallerId, CellId, HttpIntraCellTransport, IntraCellHttpTransport, IntraCellMethod,
+    IntraCellRequest, IntraCellResource, IntraCellResourceRegistry, ResourceEntry,
     authorize_cell_access,
 };
 use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig, SealedRetrievalCard};
-use humaux_projection::serving::StreamFamily;
 use humaux_retrieval_provider::adapters::embedding_provider_for;
 use humaux_retrieval_provider::contract::{EmbeddingModelDescriptor, EmbeddingProvider, ModelId};
 use std::sync::Arc;
@@ -69,12 +82,90 @@ fn parse<T: std::str::FromStr>(name: &str) -> Result<T, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: humaux-retrieval-worker (--readyz | --run-once | --serve-rpc)"
+    "usage: humaux-retrieval-worker (--readyz | --run-once | --serve | --serve-rpc)"
+}
+
+/// Lifetime of each Qdrant permit (pre-existing value; ADR-0052 D-F mints one per ticket, so a
+/// resident process never outlives the permit it writes with).
+const PERMIT_TTL: Duration = Duration::from_secs(60);
+
+/// ADR-0052 D-F: the seven pass keys (§78, required, no defaults — ADR-0036 precedent: the typed
+/// registry has no retrieval-worker table). Read through `lookup` so the unit tests exercise the
+/// real parser without touching process-global environment.
+#[derive(Debug, Clone, PartialEq)]
+struct ServeConfig {
+    batch: i64,
+    poll_interval: Duration,
+    lease_secs: u64,
+    per_tenant_cap: i64,
+    max_attempts: i32,
+    backoff_base_secs: u64,
+    backoff_max_secs: u64,
+}
+
+impl ServeConfig {
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let positive = |name: &str| -> Result<u64, String> {
+            let raw =
+                lookup(name).ok_or_else(|| format!("missing required configuration: {name}"))?;
+            match raw.parse::<u64>() {
+                Ok(n) if n > 0 => Ok(n),
+                _ => Err(format!(
+                    "invalid configuration: {name} (a positive integer)"
+                )),
+            }
+        };
+        let narrow = |name: &str, n: u64| -> Result<i64, String> {
+            i64::try_from(n).map_err(|_| format!("invalid configuration: {name}"))
+        };
+        let batch = positive("HUMAUX_RETRIEVAL_WORKER_BATCH")?;
+        let config = Self {
+            batch: narrow("HUMAUX_RETRIEVAL_WORKER_BATCH", batch)?,
+            poll_interval: Duration::from_secs(positive(
+                "HUMAUX_RETRIEVAL_WORKER_POLL_INTERVAL_SECS",
+            )?),
+            lease_secs: positive("HUMAUX_RETRIEVAL_WORKER_LEASE_SECS")?,
+            per_tenant_cap: narrow(
+                "HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP",
+                positive("HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP")?,
+            )?,
+            max_attempts: i32::try_from(positive("HUMAUX_RETRIEVAL_WORKER_MAX_ATTEMPTS")?)
+                .map_err(|_| "invalid configuration: HUMAUX_RETRIEVAL_WORKER_MAX_ATTEMPTS")?,
+            backoff_base_secs: positive("HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS")?,
+            backoff_max_secs: positive("HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS")?,
+        };
+        if config.backoff_max_secs < config.backoff_base_secs {
+            return Err(
+                "invalid configuration: HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS must be \
+                 >= HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS"
+                    .to_owned(),
+            );
+        }
+        Ok(config)
+    }
+
+    /// The pass knobs under this process's own lease owner. `claim` is derived from
+    /// [`PROJECTION_FAMILY`] (card 21: no triple in the environment).
+    fn pass(&self, claim: ClaimFamily, lease_owner: String) -> PassConfig {
+        PassConfig {
+            claim,
+            lease_owner,
+            lease_secs: self.lease_secs as f64,
+            batch: self.batch,
+            per_tenant_cap: self.per_tenant_cap,
+            max_attempts: self.max_attempts,
+            backoff: Backoff {
+                base_secs: self.backoff_base_secs as f64,
+                max_secs: self.backoff_max_secs as f64,
+            },
+        }
+    }
 }
 
 /// The §17 retrieval family this process projects into. Single point of truth for BOTH the
-/// §17.3 placement below and — through [`RetrievalFamily::ticket_family`] — the §15.1 ticket
-/// triple `run_once` polls for, so the two can never name different families (card 21).
+/// §17.3 placement family the ADR-0052 claim joins and — through
+/// [`RetrievalFamily::ticket_family`] — the §15.1 ticket triple it claims, so the two can never
+/// name different families (card 21).
 const PROJECTION_FAMILY: RetrievalFamily = RetrievalFamily::PrivateMemoryV1;
 
 /// Local wrapper making a real [`EmbeddingProvider`] satisfy [`CardEmbedder`] — see that
@@ -134,7 +225,8 @@ async fn run() -> Result<(), Outcome> {
     }
     match args[0].as_str() {
         "--readyz" => readyz().await,
-        "--run-once" => run_once_mode().await,
+        "--run-once" => projection_mode(false).await,
+        "--serve" => projection_mode(true).await,
         "--serve-rpc" => rpc_mode::run().await,
         _ => Err(Outcome::Failed(usage().to_owned())),
     }
@@ -157,7 +249,9 @@ async fn readyz() -> Result<(), Outcome> {
             "not ready — missing object: PostgreSQL as role_retrieval_worker ({e})"
         ))
     })?;
-    let (permit, transport) = build_cell_access().await?;
+    let (registry, transport) = build_cell_access()?;
+    let permit = authorize_cell_access(&registry, IntraCellResource::QDRANT_REST, PERMIT_TTL)
+        .map_err(|_| "retrieval worker is not authorized for the Qdrant cell".to_owned())?;
     let status = transport
         .execute(
             &permit,
@@ -185,7 +279,9 @@ async fn readyz() -> Result<(), Outcome> {
     Ok(())
 }
 
-async fn run_once_mode() -> Result<(), Outcome> {
+/// `--run-once` (`resident == false`: one pass, then exit — nothing claimable exits 0) and
+/// `--serve` (the same pass every poll interval until SIGTERM/SIGINT). ADR-0052 D-F.
+async fn projection_mode(resident: bool) -> Result<(), Outcome> {
     // Gate: the embedding-model descriptor is config-driven (§78.1 bans a hardcoded model/
     // dim/endpoint), and the catalog that would otherwise supply it does not exist yet
     // (`crates/retrieval-provider/src/contract.rs`'s own T7.1 scope note).
@@ -200,91 +296,185 @@ async fn run_once_mode() -> Result<(), Outcome> {
             return Err(Outcome::NotApplicable(format!("missing {var}")));
         }
     }
-
-    let tenant_id = TenantId(parse::<Uuid>("HUMAUX_RETRIEVAL_WORKER_TENANT_ID")?);
-    let scope_kind = required("HUMAUX_RETRIEVAL_WORKER_SCOPE_KIND")?;
-    let scope_id = parse::<Uuid>("HUMAUX_RETRIEVAL_WORKER_SCOPE_ID")?;
-    // §78.1 / card 21: the ticket family triple is DERIVED from the retrieval family this
-    // process already projects into (`RetrievalFamily::PrivateMemoryV1`, five lines below in
-    // `placement`), not read from three env values an operator had to keep equal to the
-    // consolidation worker's three literals. `ticket_family()` is `None` only for the §17
-    // families that are not `stream_log` producers — this process projects the private-memory
-    // one, so `None` is a wiring bug, not a deployment shape.
-    let ticket_family = PROJECTION_FAMILY
-        .ticket_family()
+    // §78.1 / card 21: the ticket triple is DERIVED from the retrieval family this process
+    // projects into; `None` would be a wiring bug, not a deployment shape.
+    let claim = ClaimFamily::of(PROJECTION_FAMILY)
         .ok_or_else(|| format!("{PROJECTION_FAMILY:?} is not a §15.1 ticket-stream family"))?;
-    let domain = ticket_family.domain();
-    let projection_kind = ticket_family.projection_kind();
-    let projection_version = ticket_family.projection_version().to_owned();
-    let embedding_version = required("HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION")?;
+    let config = ServeConfig::from_lookup(|name| env::var(name).ok())?;
     let dimension = parse::<u32>("HUMAUX_RETRIEVAL_WORKER_DIMENSION")?;
     if dimension == 0 {
         return Err(Outcome::Failed(
             "invalid configuration: HUMAUX_RETRIEVAL_WORKER_DIMENSION".to_owned(),
         ));
     }
-    let batch = parse::<i64>("HUMAUX_RETRIEVAL_WORKER_BATCH")?;
-    if batch <= 0 {
-        return Err(Outcome::Failed(
-            "invalid configuration: HUMAUX_RETRIEVAL_WORKER_BATCH".to_owned(),
-        ));
-    }
-
-    let (permit, transport) = build_cell_access().await?;
-
+    let embedding_version = required("HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION")?;
     let dsn = required("HUMAUX_RETRIEVAL_WORKER_PG_DSN")?;
-    // dep: PostgreSQL(role_retrieval_worker) — reconnects the pool after a lease-loop error
-    let pool = RetrievalWorkerDbPool::connect(&dsn)
-        .await
-        .map_err(|_| "retrieval worker database role connection failed".to_owned())?;
+    let processor_id = egress_processor_id()?;
+    let (registry, transport) = build_cell_access()?;
+    let scanner = Arc::new(build_scanner()?);
+    // Per-process owner: every settle/retry/release is fenced on it plus the claim's attempts,
+    // so two resident workers never both write one ticket.
+    let pass = config.pass(claim, format!("humaux-retrieval-worker/{}", Uuid::now_v7()));
 
-    // ponytail: `TenantPlacementRow` is not yet read from `projection.tenant_placements` (the
-    // write path is blocked on the same missing HTTP client `qdrant.rs`'s module doc already
-    // names) — a single shared-fallback placement at the configured collection until that
-    // lands (tracked in coord task 7e6da2f9).
-    let placement = TenantPlacementRow {
-        tenant_id,
-        projection_family: PROJECTION_FAMILY,
-        collection_name: required("HUMAUX_RETRIEVAL_WORKER_QDRANT_COLLECTION")?,
-        shard_key: None,
-        placement_class: PlacementClass::SharedFallback,
-        point_count: 0,
-        bytes_estimate: 0,
-        promotion_state: PromotionState::Stable,
-    };
-
-    let scanner = build_scanner()?;
-    let embedder = build_embedder(&dsn, dimension).await?;
-
-    let deps = ProjectionWorkerDeps {
-        pool,
-        embedder,
-        scanner: std::sync::Arc::new(scanner),
-        transport,
-        permit,
-        placement,
-        family: StreamFamily::new(tenant_id, scope_kind, scope_id, domain, projection_kind),
-        embedding_version,
-        projection_version,
-        dimension,
-        // Card 21 fix pass: the SAME §7.4 identity the embedding provider discloses under —
-        // read once, here, and handed to both legs. `advance_prefix` writes it into
-        // `projection.stream_checkpoints.projection_processor_id` (migration 0171), so this
-        // worker's checkpoint names this worker. A second env var for "the projection
-        // identity" would be a fourth hand-aligned copy of the thing this card deleted.
-        processor_id: egress_processor_id()?,
-    };
-
-    run_once(&deps, batch as usize)
-        .await
-        .map_err(|error| format!("run_once failed: {error}"))?;
-    Ok(())
+    // Both handlers are installed before the first pass (the consolidation worker's reason:
+    // a signal during pass one must not hit the default disposition mid-pass).
+    let mut shutdown = Shutdown::install()?;
+    // Connected lazily and kept: a database that is down at start (or later) is a logged failed
+    // pass in `--serve`, retried next poll — never a crash loop the supervisor has to absorb.
+    let mut shared: Option<SharedProjectionDeps> = None;
+    loop {
+        if shared.is_none() {
+            match connect_shared(
+                &dsn,
+                dimension,
+                &embedding_version,
+                processor_id,
+                &registry,
+                &transport,
+                &scanner,
+            )
+            .await
+            {
+                Ok(deps) => shared = Some(deps),
+                Err(error) if resident => {
+                    eprintln!("humaux-retrieval-worker: projection pass failed: {error}")
+                }
+                Err(error) => return Err(Outcome::Failed(error)),
+            }
+        }
+        if let Some(deps) = &shared {
+            match run_claimed_pass(deps, &pass).await {
+                Ok(outcome) => println!("humaux-retrieval-worker: {}", pass_line(&outcome)),
+                Err(error) if resident => {
+                    eprintln!("humaux-retrieval-worker: projection pass failed: {error}")
+                }
+                Err(error) => {
+                    return Err(Outcome::Failed(format!("projection pass failed: {error}")));
+                }
+            }
+        }
+        if !resident {
+            return Ok(());
+        }
+        // ADR-0037: the signal is only ever observed BETWEEN passes. A pass settles, retries or
+        // releases every ticket it claimed before it returns, so exiting here never leaves a live
+        // lease only expiry could free. Shutdown latency is one pass: the supervisor's grace must
+        // exceed BATCH × worst-case ticket time (docs/ops/supervision.md).
+        tokio::select! {
+            () = tokio::time::sleep(config.poll_interval) => {}
+            () = shutdown.recv() => {
+                eprintln!("humaux-retrieval-worker: signal received between passes, exiting");
+                return Ok(());
+            }
+        }
+    }
 }
 
-/// Wires the Qdrant `IntraCellResource` entry, its permit, and the HTTP transport —
-/// mirrors `bins/public-worker/src/main.rs`'s identical block.
-async fn build_cell_access()
--> Result<(CellAccessPermit, std::sync::Arc<HttpIntraCellTransport>), Outcome> {
+/// One line per pass (ADR-0052 D-F); `claim_ms` is the claim-latency sample the ADR reports.
+fn pass_line(o: &PassOutcome) -> String {
+    format!(
+        "projection pass claimed={} done={} skipped={} failed={} retried={} refunded={} \
+         pending={} lost_lease={} placement_missing={} placement_invalid={} claim_ms={}",
+        o.claimed,
+        o.done,
+        o.skipped,
+        o.failed,
+        o.retried,
+        o.refunded,
+        o.pending,
+        o.lost_lease,
+        o.placement_missing,
+        o.placement_invalid,
+        o.claim_ms
+    )
+}
+
+/// The database-bound half of [`SharedProjectionDeps`]: the worker pool and the embedder (whose
+/// disclosure ledger needs its own pool). Everything else was validated before the loop.
+async fn connect_shared(
+    dsn: &str,
+    dimension: u32,
+    embedding_version: &str,
+    processor_id: ProcessorId,
+    registry: &IntraCellResourceRegistry,
+    transport: &Arc<HttpIntraCellTransport>,
+    scanner: &Arc<LocalSecretScanner>,
+) -> Result<SharedProjectionDeps, String> {
+    // dep: PostgreSQL(role_retrieval_worker) — the projection runner's claim/settle pool
+    let pool = RetrievalWorkerDbPool::connect(dsn)
+        .await
+        .map_err(|e| format!("retrieval worker database role connection failed: {e}"))?;
+    let embedder = build_embedder(dsn, dimension)
+        .await
+        .map_err(|outcome| match outcome {
+            Outcome::NotApplicable(reason) | Outcome::Failed(reason) => reason,
+        })?;
+    let transport: Arc<dyn IntraCellHttpTransport> = transport.clone();
+    let registry = registry.clone();
+    Ok(SharedProjectionDeps {
+        pool,
+        embedder,
+        scanner: scanner.clone(),
+        transport,
+        // ADR-0052 D-F: one permit per ticket, so no permit outlives its PERMIT_TTL.
+        mint_permit: Arc::new(move || {
+            authorize_cell_access(&registry, IntraCellResource::QDRANT_REST, PERMIT_TTL).ok()
+        }),
+        embedding_version: embedding_version.to_owned(),
+        dimension,
+        // Card 21: the SAME §7.4 identity the embedding provider discloses under; advance_prefix
+        // writes it into projection.stream_checkpoints.projection_processor_id (0171).
+        processor_id,
+        // The pass's background lease heartbeat waits on this process's runtime timer.
+        sleep: Arc::new(|period| Box::pin(tokio::time::sleep(period))),
+        dependency_down: AtomicBool::new(false),
+    })
+}
+
+/// SIGTERM/Ctrl-C, as one awaitable — copied from `bins/consolidation-worker/src/main.rs` (a
+/// binary cannot import another binary). Both handlers are installed eagerly: `ctrl_c()` would
+/// register SIGINT only on its first poll, i.e. after pass one, and a Ctrl-C during that pass
+/// would kill the process with its claimed tickets still leased.
+struct Shutdown {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Shutdown {
+    fn install() -> Result<Self, String> {
+        Ok(Self {
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|e| format!("cannot install the SIGTERM handler: {e}"))?,
+            #[cfg(unix)]
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|e| format!("cannot install the SIGINT handler: {e}"))?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Wires the Qdrant `IntraCellResource` registry and the HTTP transport — mirrors
+/// `bins/public-worker/src/main.rs`'s identical block. Returns the registry, not a permit:
+/// ADR-0052 D-F mints one permit per ticket from it.
+fn build_cell_access() -> Result<
+    (
+        IntraCellResourceRegistry,
+        std::sync::Arc<HttpIntraCellTransport>,
+    ),
+    Outcome,
+> {
     let cell_id = CellId(parse::<Uuid>("HUMAUX_RETRIEVAL_WORKER_CELL_ID")?);
     let caller = CallerId(required("HUMAUX_RETRIEVAL_WORKER_CALLER")?);
     let host = required("HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST")?;
@@ -313,19 +503,15 @@ async fn build_cell_access()
         .map_err(|_| "invalid Qdrant cell resource configuration".to_owned())?,
     );
     let registry = IntraCellResourceRegistry::new(entries, cell_id, caller);
-    let permit = authorize_cell_access(
-        &registry,
-        IntraCellResource::QDRANT_REST,
-        Duration::from_secs(60),
-    )
-    .map_err(|_| "retrieval worker is not authorized for the Qdrant cell".to_owned())?;
+    authorize_cell_access(&registry, IntraCellResource::QDRANT_REST, PERMIT_TTL)
+        .map_err(|_| "retrieval worker is not authorized for the Qdrant cell".to_owned())?;
     let transport = HttpIntraCellTransport::new(
         registry.clone(),
         Duration::from_secs(10),
         humaux_infra_cell::DEFAULT_MAX_RESPONSE_BYTES,
     )
     .map_err(|_| "could not construct Qdrant cell transport".to_owned())?;
-    Ok((permit, std::sync::Arc::new(transport)))
+    Ok((registry, std::sync::Arc::new(transport)))
 }
 
 fn build_scanner() -> Result<LocalSecretScanner, Outcome> {
@@ -507,9 +693,80 @@ mod rpc_mode {
 
 #[cfg(test)]
 mod config_tests {
-    use super::{PROJECTION_FAMILY, egress_processor_id};
+    use super::{ClaimFamily, PROJECTION_FAMILY, ServeConfig, egress_processor_id};
     use humaux_domain::ticket_family::TicketFamily;
+    use std::collections::HashMap;
     use uuid::Uuid;
+
+    const PASS_KEYS: [&str; 7] = [
+        "HUMAUX_RETRIEVAL_WORKER_BATCH",
+        "HUMAUX_RETRIEVAL_WORKER_POLL_INTERVAL_SECS",
+        "HUMAUX_RETRIEVAL_WORKER_LEASE_SECS",
+        "HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP",
+        "HUMAUX_RETRIEVAL_WORKER_MAX_ATTEMPTS",
+        "HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS",
+        "HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS",
+    ];
+
+    fn full() -> HashMap<String, String> {
+        PASS_KEYS
+            .iter()
+            .zip(["16", "1", "60", "8", "6", "30", "300"])
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// ADR-0052 D-F / §78: every pass key is required, positive, and has no default. Each key
+    /// in turn is removed, zeroed and made non-numeric; each refusal names that key. Fault
+    /// injection: give any key a default (`.unwrap_or("1")`) ⇒ its missing case goes red.
+    #[test]
+    fn serve_config_refuses_each_missing_or_zero_key() {
+        let ok = ServeConfig::from_lookup(|k| full().get(k).cloned()).expect("full config");
+        assert_eq!(ok.batch, 16);
+        assert_eq!(ok.per_tenant_cap, 8);
+        assert_eq!(ok.max_attempts, 6);
+        for key in PASS_KEYS {
+            for bad in [None, Some("0"), Some("-3"), Some("x")] {
+                let mut env = full();
+                match bad {
+                    None => {
+                        env.remove(key);
+                    }
+                    Some(v) => {
+                        env.insert(key.to_string(), v.to_string());
+                    }
+                }
+                let err = ServeConfig::from_lookup(|k| env.get(k).cloned())
+                    .expect_err("a missing or non-positive pass key is refused");
+                assert!(err.contains(key), "{key} {bad:?}: {err}");
+            }
+        }
+        let mut inverted = full();
+        inverted.insert(PASS_KEYS[6].to_string(), "10".to_string());
+        let err = ServeConfig::from_lookup(|k| inverted.get(k).cloned())
+            .expect_err("max backoff below base backoff is refused");
+        assert!(err.contains("BACKOFF_MAX_SECS"), "{err}");
+    }
+
+    /// ADR-0052 D-F: `--run-once` / `--serve` take no tenant, workspace or collection from the
+    /// environment. Structural half: the pass config parses with those keys absent, and the pass
+    /// it builds carries no tenant. Source half: none of the four deleted keys is read anywhere in
+    /// this binary (the names are assembled here so this test cannot match itself). Fault
+    /// injection: restore `parse::<Uuid>("…TENANT_ID")` in the projection mode ⇒ red.
+    #[test]
+    fn run_once_reads_no_tenant_pin() {
+        let claim = ClaimFamily::of(PROJECTION_FAMILY).expect("a ticket family");
+        let pass = ServeConfig::from_lookup(|k| full().get(k).cloned())
+            .expect("no tenant key needed")
+            .pass(claim.clone(), "owner".to_owned());
+        assert_eq!(pass.claim, claim);
+        assert_eq!(claim.projection_version, "v1");
+        let source = include_str!("main.rs");
+        for suffix in ["TENANT_ID", "SCOPE_KIND", "SCOPE_ID", "QDRANT_COLLECTION"] {
+            let name = format!("{}{suffix}", "HUMAUX_RETRIEVAL_WORKER_");
+            assert!(!source.contains(&name), "{name} is still read");
+        }
+    }
 
     /// Card 21, ProcessorId leg. Two deployments of this binary configured with two identities
     /// get two distinct [`ProcessorId`](humaux_domain::egress::ProcessorId)s, and neither is

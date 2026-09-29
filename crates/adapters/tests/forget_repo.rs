@@ -500,11 +500,16 @@ fn stream_log_has_exactly_the_frozen_columns() {
                 "settled_at",
                 "retired_at",
                 "retired_by",
+                "lease_owner",
+                "lease_expires_at",
+                "attempts",
+                "next_attempt_at",
             ];
             want.sort();
             assert_eq!(
                 got, want,
-                "§37.2/§15.1: the frozen column set (12 + the two 0167 audit columns), got {cols:?}"
+                "§37.2/§15.1: the frozen column set (12 + the two 0167 audit columns + the four \
+                 0176 lease/attempt columns, ADR-0052), got {cols:?}"
             );
             assert!(
                 !cols.iter().any(|c| c == "deleted_count"),

@@ -1,7 +1,7 @@
 //! `adapters::placement_repo` — the gateway's read-only lookup of §17.3 `projection.tenant_placements` (migration
 //!   0068).
 //! Depends-on: crates=[humaux-domain, sqlx]; services=[PostgreSQL(any) r=[projection.tenant_placements]]; env=[]; modules=[adapters::postgres, adapters::qdrant, domain::error, domain::ids]
-//! Called-by: [gateway::recall]
+//! Called-by: [adapters::stream_repo, gateway::recall]
 //! Invariants: [SELECT-only on projection.tenant_placements under role_gateway; a missing row means not indexed yet
 //!   and the caller must answer DependencyUnavailable, never fall back to another tenant's placement]
 //! Spec: Baseline §6.2.1
@@ -59,7 +59,10 @@ pub async fn tenant_placement(
     row.as_ref().map(from_row).transpose()
 }
 
-fn from_row(row: &PgRow) -> Result<TenantPlacementRow, ErrorCode> {
+/// The one parser of a `projection.tenant_placements` row shape. `pub(crate)` so
+/// `stream_repo::claim_issued` (ADR-0052 D-C) parses the placement columns the claim returns
+/// with this same function instead of a second copy of the three enum parsers.
+pub(crate) fn from_row(row: &PgRow) -> Result<TenantPlacementRow, ErrorCode> {
     let projection_family: String = row
         .try_get("projection_family")
         .map_err(|_| ErrorCode::Internal)?;

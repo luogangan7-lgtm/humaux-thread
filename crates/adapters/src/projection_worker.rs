@@ -10,10 +10,13 @@
 //!   domain::ids, domain::memory, domain::subject, humaux-local-secret-scan, infra-cell::permit,
 //!   infra-cell::transport, projection::card, projection::serving, projection::stream]
 //! Called-by: [retrieval-worker::main, tests]
-//! Invariants: [one run_once handles exactly one stream key; per row: resolve bound memories, upsert, verify
-//!   search-visible, then advance the ticket; a Qdrant or PG failure leaves the ticket ISSUED for retry, never marked
-//!   done]
-//! Spec: Baseline §4.2; §15.1; §17.4; §18.2; §15.7; §6.1.2
+//! Invariants: [run_claimed_pass claims across tenants by lease and processes one family's tickets sequentially in one
+//!   worker; every family a pass holds is lease-renewed while any of them is worked; per row: resolve bound memories,
+//!   upsert, verify search-visible, then settle; a transient failure returns the ticket to ISSUED with backoff
+//!   (bounded by max attempts, then FAILED transient_exhausted), except that a dependency-outage failure while the
+//!   dependency is already known down spends no attempt; a permanent one settles FAILED at once; every settle/retry/release is fenced on (lease_owner, attempts); a DONE is never written
+//!   before search-visible confirmation]
+//! Spec: Baseline §4.2; §15.1; §17.4; §18.2; §15.7; §6.1.2; ADR-0052
 //!
 //! §4.2 (line 818): there is no separate `projection-worker` process — this is
 //! `humaux-retrieval-worker`'s own consumer loop, owned by `role_retrieval_worker`.
@@ -38,18 +41,39 @@
 //! (h) [`crate::qdrant::verify_visible_via_transport`] (i) only then mark the row `DONE` (j)
 //! [`crate::stream_repo::advance_prefix`] once for the whole batch.
 //!
-//! A failure at (b)-(h) marks that one row `FAILED` (or `SKIPPED_BY_POLICY` for the two cases
-//! §18.2 defines as a policy exclusion, not a failure — `DataClass::SecretMaterial` and
-//! `CardBuildOutcome::Unbuildable`'s sibling `ExcludedSecret`) and moves on to the next row
-//! *without* touching the checkpoint — §15.7: one `FAILED` seq blocks every later seq from
-//! ever crossing it, so a batch that fails row N and settles row N+1 must still leave
-//! `projection_highwater` at `N-1` after this function's own [`stream_repo::advance_prefix`]
-//! call. `migrations/0011_roles_and_grants.sql`'s
-//! `projection.stream_log_guard_state_transition` trigger only allows `role_retrieval_worker`
-//! to move `ISSUED -> {DONE,SKIPPED_BY_POLICY,FAILED}` — there is no legal in-between "leased"
-//! state for this role (unlike `role_private_worker`'s `ISSUED -> PROCESSING`), so this module
-//! never attempts one; a row is read, fully processed end-to-end (Qdrant calls included), and
-//! written straight to its terminal state in one final `UPDATE`.
+//! A failure at (b)-(h) is classified (ADR-0052 D-E, card 27 — before it, every failure was a
+//! permanent `FAILED`, audit C4). A **permanent** one (a 4xx schema/payload refusal, a dimension
+//! mismatch, an unbuildable card, a registry conflict, a terminally failed distill) settles the
+//! row `FAILED` with its `error_class`; a **transient** one (PG connection/serialization/lock,
+//! Qdrant transport/5xx/timeout, a provider 429/5xx, a lost registry race, an unconfirmed
+//! visibility probe) returns it to the pool still `ISSUED` ([`stream_repo::release_for_retry`]),
+//! with backoff, until `max_attempts` turns it into `FAILED` `transient_exhausted` — never an
+//! unbounded retry (ADR-0048). `SKIPPED_BY_POLICY` stays the §18.2 policy exclusion. Either way
+//! the next row runs *without* the checkpoint crossing this one — §15.7: one not-yet-DONE seq
+//! blocks every later seq, so a batch that fails row N and settles row N+1 still leaves
+//! `projection_highwater` at `N-1` after [`stream_repo::advance_prefix`].
+//! `migrations/0011_roles_and_grants.sql`'s `projection.stream_log_guard_state_transition`
+//! trigger only allows `role_retrieval_worker` to move `ISSUED -> {DONE,SKIPPED_BY_POLICY,FAILED}`;
+//! the lease, the attempt counter and the backoff (migration 0176) are column writes with
+//! `OLD.state = NEW.state`, which the guard admits, so a leased or backing-off ticket is still
+//! `ISSUED` and there is still no in-between state for this role.
+//!
+//! ## The resident path: [`run_claimed_pass`] (ADR-0052)
+//!
+//! `humaux-retrieval-worker --serve` / `--run-once` call [`run_claimed_pass`]: the unplaced count
+//! ([`stream_repo::unplaced_issued`], one `placement_missing` line), one cross-tenant claim
+//! ([`stream_repo::claim_issued`], which also returns each ticket's placement; a ticket whose
+//! placement does not parse is parked, never processed), then per family —
+//! one worker holds a family at a time (D-A) and runs its tickets in `stream_seq` order — per
+//! ticket: the exhaustion check, the family heartbeat ([`stream_repo::renew_family_leases`]; a
+//! ticket not renewed was lost and is not settled), a freshly minted Qdrant permit, the same
+//! [`process_row`] as below, and a fenced settle / retry / release; then one
+//! [`stream_repo::advance_prefix`] per family. For the whole pass a background heartbeat renews
+//! every claimed family each `lease_secs / 3`, so a family waiting behind a slow one keeps its
+//! lease. A dependency-outage failure (Qdrant, provider incl. quota/budget, scanner, PG
+//! connection) while [`SharedProjectionDeps::dependency_down`] is already set is released
+//! without spending an attempt; the flag clears on the next `DONE`. [`run_once`] (one key, no lease) stays for the
+//! adapter tests and keeps its signature.
 //!
 //! ## RLS and visibility
 //!
@@ -77,7 +101,12 @@
 //! "stream-routing binding, not Evidence visibility" reasoning). A `"tenant"`-scoped family is
 //! rejected with [`ErrorCode::InvalidInput`] before any row is touched.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
+use std::time::Duration;
 
 use humaux_domain::affect::AffectAnnotation;
 use humaux_domain::authority::{AuthorityClass, AuthorityStatus, MemoryId};
@@ -109,7 +138,7 @@ use crate::qdrant::{
     ha_profile_for, verify_visible_via_transport,
 };
 use crate::remember;
-use crate::stream_repo;
+use crate::stream_repo::{self, Backoff, ClaimFamily, ClaimedTicket, TicketFence};
 
 /// The dense-write embedding call this worker needs, shaped like
 /// `humaux_retrieval_provider::contract::EmbeddingProvider::embed_cards` but declared locally
@@ -186,11 +215,131 @@ pub struct RunOnceOutcome {
     pub skipped_by_policy: u64,
     /// Rows this call settled `FAILED`.
     pub failed: u64,
+    /// Rows returned to `ISSUED` after a transient failure, one attempt spent (ADR-0052 D-E).
+    pub retried: u64,
     /// Rows left `ISSUED` because their Evidence is not distilled yet (ADR-0016 D6).
     pub pending: u64,
     /// `projection_highwater` after this call's [`stream_repo::advance_prefix`] — unchanged
     /// from before the call if nothing in this batch was contiguous-done-eligible (§15.7).
     pub projection_highwater: u64,
+}
+
+/// Everything [`run_claimed_pass`] shares across tenants (ADR-0052 D-F). No tenant, no placement,
+/// no family and no permit: the claim supplies the first three per ticket, and a permit is
+/// minted per ticket by `mint_permit` (a resident process outlives any single permit's TTL).
+pub struct SharedProjectionDeps {
+    /// `role_retrieval_worker`'s pool — claim, heartbeat, settle and every per-row read.
+    pub pool: RetrievalWorkerDbPool,
+    /// The dense-write embedding call (see [`CardEmbedder`]).
+    pub embedder: Arc<dyn CardEmbedder>,
+    /// §1.2.3: every card is sealed by the local scanner before it is embedded.
+    pub scanner: Arc<LocalSecretScanner>,
+    /// ADR-0003/§83.4 Layer 1B: the injected Qdrant transport.
+    pub transport: Arc<dyn IntraCellHttpTransport>,
+    /// Mints a fresh Qdrant permit (the bin closes over its cell registry and TTL); `None` = the
+    /// registry refused, which the pass treats as a transient failure of that ticket.
+    pub mint_permit: Arc<dyn Fn() -> Option<CellAccessPermit> + Send + Sync>,
+    /// §17 `embedding_version` payload field.
+    pub embedding_version: String,
+    /// The embedding width every card must produce.
+    pub dimension: u32,
+    /// §7.4 identity of this process; written into `projection_processor_id` by `advance_prefix`.
+    pub processor_id: ProcessorId,
+    /// The async timer the pass's background lease heartbeat waits on (the bin's
+    /// `tokio::time::sleep`). Injected like `mint_permit` because this crate has no async-runtime
+    /// dependency (the `byok.rs` precedent).
+    pub sleep: Arc<dyn Fn(Duration) -> Sleep + Send + Sync>,
+    /// Review 2026-09-29 P1 (dependency-level breaker): `true` once a ticket failed on a
+    /// dependency outage (Qdrant, embedding provider incl. quota/budget, scanner process, PG
+    /// connection) and no ticket has reached `DONE` since. While it is `true`, further outage
+    /// failures do not spend attempts. Starts `false`; the process owns it across passes.
+    pub dependency_down: AtomicBool,
+}
+
+/// What [`SharedProjectionDeps::sleep`] returns.
+pub type Sleep = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// One pass's knobs (ADR-0052 D-F). Every value comes from a required
+/// `HUMAUX_RETRIEVAL_WORKER_*` key (§78); nothing here has a default.
+#[derive(Debug, Clone)]
+pub struct PassConfig {
+    /// The §15.1 triple claimed and the §17.3 placement family its tenants must have
+    /// ([`ClaimFamily::of`] of the one family the process projects).
+    pub claim: ClaimFamily,
+    /// `humaux-retrieval-worker/<uuid v7>`, one per process — the fence of every write.
+    pub lease_owner: String,
+    /// Lease length. A background heartbeat renews every family the pass holds each
+    /// `lease_secs / 3`, and each ticket's family once more right before it is processed.
+    pub lease_secs: f64,
+    /// Tickets per claim (`HUMAUX_RETRIEVAL_WORKER_BATCH`).
+    pub batch: i64,
+    /// Tickets per tenant per claim (fairness).
+    pub per_tenant_cap: i64,
+    /// A transient failure at `attempts >= max_attempts` settles `FAILED` `transient_exhausted`.
+    pub max_attempts: i32,
+    /// Transient-failure backoff.
+    pub backoff: Backoff,
+}
+
+/// [`run_claimed_pass`]'s counters — one log line per pass (ADR-0052 D-F).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PassOutcome {
+    /// Tickets the claim leased.
+    pub claimed: u64,
+    /// Settled `DONE`.
+    pub done: u64,
+    /// Settled `SKIPPED_BY_POLICY`.
+    pub skipped: u64,
+    /// Settled `FAILED` (permanent, or `transient_exhausted`).
+    pub failed: u64,
+    /// Returned to `ISSUED` with backoff after a transient failure (charged or not).
+    pub retried: u64,
+    /// Of `retried`: outage failures while the dependency was already down — no attempt spent.
+    pub refunded: u64,
+    /// Released because the Evidence is still being distilled (attempt given back).
+    pub pending: u64,
+    /// Tickets not settled because the heartbeat or a fenced write found the lease gone.
+    pub lost_lease: u64,
+    /// ISSUED tickets whose tenant has no placement row (never claimed).
+    pub placement_missing: u64,
+    /// Claimed tickets whose placement row this build could not parse — parked with backoff,
+    /// attempt given back, never processed.
+    pub placement_invalid: u64,
+    /// Wall time of the claim call alone.
+    pub claim_ms: u64,
+}
+
+/// The borrowed view every per-row step reads. [`run_once`] builds it from one
+/// [`ProjectionWorkerDeps`]; [`run_claimed_pass`] builds one per family from
+/// [`SharedProjectionDeps`] plus the claimed ticket's key and placement.
+struct RowCtx<'a> {
+    pool: &'a RetrievalWorkerDbPool,
+    embedder: &'a dyn CardEmbedder,
+    scanner: &'a LocalSecretScanner,
+    transport: &'a dyn IntraCellHttpTransport,
+    permit: &'a CellAccessPermit,
+    placement: &'a TenantPlacementRow,
+    family: &'a StreamFamily,
+    embedding_version: &'a str,
+    projection_version: &'a str,
+    dimension: u32,
+}
+
+impl<'a> RowCtx<'a> {
+    fn of(deps: &'a ProjectionWorkerDeps) -> Self {
+        Self {
+            pool: &deps.pool,
+            embedder: deps.embedder.as_ref(),
+            scanner: deps.scanner.as_ref(),
+            transport: deps.transport.as_ref(),
+            permit: &deps.permit,
+            placement: &deps.placement,
+            family: &deps.family,
+            embedding_version: &deps.embedding_version,
+            projection_version: &deps.projection_version,
+            dimension: deps.dimension,
+        }
+    }
 }
 
 /// Sets `humaux.tenant_id` for the remainder of `txn` — same technique as
@@ -475,25 +624,110 @@ fn card_input(memory: &ResolvedMemory, workspace_id: WorkspaceId) -> CardInput {
     }
 }
 
-/// One row's terminal disposition, decided before any `stream_log` write (module doc's per-row
-/// order (i)) — `stream_seq`/`error_class` are supplied by the caller, this only carries the
-/// state.
+/// One row's disposition, decided before any `stream_log` write (module doc's per-row order
+/// (i)) — `stream_seq`/`error_class` are supplied by the caller, this only carries the state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowTerminal {
     Done,
     SkippedByPolicy,
+    /// Permanent: the identical attempt would fail again (ADR-0052 D-E).
     Failed,
+    /// Transient: back to the pool, still `ISSUED`, one attempt spent (ADR-0052 D-E). Never a
+    /// terminal state; bounded by `max_attempts` in [`run_claimed_pass`].
+    Retry,
     /// Not a terminal: the Evidence behind this ticket has not been distilled yet (its
     /// `ops.outbox` row is still PENDING/PROCESSING, ADR-0016 D6) — the row stays `ISSUED` and
-    /// is re-read next pass. Never written to `stream_log`.
+    /// is re-read next pass. Never written as a state.
     Pending,
+}
+
+/// ADR-0052 D-E, PG half: a lost connection, an exhausted or closed pool, a serialization
+/// failure, a deadlock, a lock timeout, an admin shutdown or a resource shortage can succeed on
+/// retry; a data or constraint error cannot.
+fn pg_is_transient(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => true,
+        sqlx::Error::Database(db) => db.code().is_some_and(|code| {
+            code.starts_with("08")
+                || code.starts_with("57P")
+                || code.starts_with("53")
+                || matches!(code.as_ref(), "40001" | "40P01" | "55P03")
+        }),
+        _ => false,
+    }
+}
+
+/// A PG failure at `class`'s site, classified.
+fn pg_failure(error: &sqlx::Error, class: &'static str) -> (RowTerminal, &'static str) {
+    if pg_is_transient(error) {
+        (RowTerminal::Retry, class)
+    } else {
+        (RowTerminal::Failed, class)
+    }
+}
+
+/// ADR-0052 D-E, `ErrorCode` half (embedding provider and local secret scanner): the callee
+/// refused this input or this caller — retrying the identical call cannot help — versus
+/// everything else (rate limits, 5xx, budget, key pending, a scanner process that did not run).
+fn code_is_transient(code: ErrorCode) -> bool {
+    !matches!(
+        code,
+        ErrorCode::ProviderPermanent
+            | ErrorCode::InvalidInput
+            | ErrorCode::Forbidden
+            | ErrorCode::Unauthorized
+            | ErrorCode::EntitlementRequired
+            | ErrorCode::TenantBoundary
+            | ErrorCode::NotFound
+    )
+}
+
+/// Review 2026-09-29 P1: of the transient classes, the ones that say "a dependency this worker
+/// needs for every ticket is unavailable" — Qdrant (transport, 5xx, 429, and a refused permit),
+/// the embedding provider (429/5xx, quota, cost budget, key pending), the scanner process, a lost
+/// PG connection — as opposed to a race or probe about this one ticket (`registry_failed`,
+/// `visibility_not_confirmed`, `embedding_batch_empty`), which always spends.
+fn is_dependency_outage(class: &str) -> bool {
+    matches!(
+        class,
+        "qdrant_upsert_failed" | "qdrant_delete_failed" | "embedding_failed" | "secret_scan_failed"
+    ) || class.starts_with("db_")
+}
+
+/// ADR-0052 D-E, registry half. A source that stopped being live or changed, a lost race and a
+/// transient DB error resolve on the next attempt (which re-reads the memory's current state);
+/// an identity conflict, a scope violation or a data error does not.
+fn registry_failure(error: &PrivateProjectionRegistryError) -> (RowTerminal, &'static str) {
+    match error {
+        PrivateProjectionRegistryError::SourceNotLive
+        | PrivateProjectionRegistryError::SourceChanged
+        | PrivateProjectionRegistryError::RegistryRaceLost => {
+            (RowTerminal::Retry, "registry_failed")
+        }
+        PrivateProjectionRegistryError::Db(e) => pg_failure(e, "registry_failed"),
+        PrivateProjectionRegistryError::PointIdCollision
+        | PrivateProjectionRegistryError::IdentityAlreadyBound => {
+            (RowTerminal::Failed, "registry_conflict")
+        }
+        PrivateProjectionRegistryError::CrossTenant
+        | PrivateProjectionRegistryError::CrossWorkspace
+        | PrivateProjectionRegistryError::InvalidInput
+        | PrivateProjectionRegistryError::MissingAuthenticatedUser => {
+            (RowTerminal::Failed, "registry_failed")
+        }
+    }
 }
 
 /// ADR-0016 D6: what a ticket whose `ops.outbox` row resolves to no memory means, decided from
 /// that row's own status. Distill is asynchronous to remember (§15.5 "0/1/N later"), so "no
 /// memory yet" is only a gap while the row is still open; a DONE row with no memory is the
 /// legitimate 0-memory outcome and settles as a no-op (`SKIPPED_BY_POLICY`, counted toward the
-/// contiguous prefix like every policy exclusion), and a FAILED row fails the ticket.
+/// contiguous prefix like every policy exclusion), and a FAILED row fails the ticket
+/// (permanently: 0167's retirable classes).
 fn terminal_for_missing_memory(outbox_status: Option<&str>) -> (RowTerminal, &'static str) {
     match outbox_status {
         Some("DONE") => (RowTerminal::SkippedByPolicy, "no_memory_distilled"),
@@ -504,25 +738,25 @@ fn terminal_for_missing_memory(outbox_status: Option<&str>) -> (RowTerminal, &'s
 }
 
 /// Runs (b)-(h) of the module doc's per-row order for exactly one `stream_seq`, given its
-/// `commit_seq`. Never returns an `Err` — every failure mode short-circuits into a
-/// [`RowTerminal::Failed`]/[`RowTerminal::SkippedByPolicy`] outcome plus a fixed `error_class`
-/// tag, because a row failure must never abort the batch (module doc).
+/// `commit_seq`. Never returns an `Err` — every failure mode short-circuits into a classified
+/// [`RowTerminal`] plus a fixed `error_class` tag, because a row failure must never abort the
+/// batch (module doc).
 async fn process_row(
-    deps: &ProjectionWorkerDeps,
+    ctx: &RowCtx<'_>,
     stream_seq: i64,
     commit_seq: i64,
 ) -> (RowTerminal, &'static str) {
-    let workspace_id = WorkspaceId(deps.family.scope_id);
+    let workspace_id = WorkspaceId(ctx.family.scope_id);
 
-    let prepared = match resolve_and_embed(deps, workspace_id, commit_seq).await {
+    let prepared = match resolve_and_embed(ctx, workspace_id, commit_seq).await {
         Ok(prepared) => prepared,
         Err(terminal) => return terminal,
     };
 
-    // One ticket, N memories (see `resolve_memories`). The row's terminal is the fold:
-    //   * the FIRST failure short-circuits the whole row to `FAILED` — §15.7 already requires
-    //     one failed seq to block the prefix, and the retry is safe because every step
-    //     `finish_row` performs is idempotent on a deterministic `point_id` (upsert,
+    // One ticket, N memories (see `resolve_memories`). The row's disposition is the fold:
+    //   * the FIRST failure short-circuits the whole row (Retry or Failed as classified) — §15.7
+    //     already requires one unsettled seq to block the prefix, and the retry is safe because
+    //     every step `finish_row` performs is idempotent on a deterministic `point_id` (upsert,
     //     `AlreadyRegistered`, verify), so the memories that already landed simply land again;
     //   * `SKIPPED_BY_POLICY` is per-memory (§18.2 secret material), so it only becomes the
     //     row's terminal when NO memory on this Evidence was indexable;
@@ -532,13 +766,13 @@ async fn process_row(
     let mut any_done = false;
     let mut skipped: Option<(RowTerminal, &'static str)> = None;
     for memory in prepared.dead {
-        match retire_row(deps, workspace_id, &memory).await {
+        match retire_row(ctx, workspace_id, &memory).await {
             (RowTerminal::Done, _) => any_done = true,
             other => return other,
         }
     }
     for (memory, vector) in prepared.live {
-        match finish_row(deps, stream_seq, workspace_id, memory, vector).await {
+        match finish_row(ctx, stream_seq, workspace_id, memory, vector).await {
             (RowTerminal::Done, _) => any_done = true,
             (RowTerminal::SkippedByPolicy, class) => {
                 skipped = Some((RowTerminal::SkippedByPolicy, class));
@@ -566,39 +800,39 @@ struct Prepared {
 /// this repo's line-count lint — see that function for the full per-row order. Returns a
 /// non-empty vec or an `Err`.
 async fn resolve_and_embed(
-    deps: &ProjectionWorkerDeps,
+    ctx: &RowCtx<'_>,
     workspace_id: WorkspaceId,
     commit_seq: i64,
 ) -> Result<Prepared, (RowTerminal, &'static str)> {
     // dep: PostgreSQL(any) — transaction entry for `resolve_and_embed`
-    let mut txn = deps
+    let mut txn = ctx
         .pool
         .pool()
         .begin()
         .await
-        .map_err(|_| (RowTerminal::Failed, "db_begin_failed"))?;
-    set_worker_rls_context(&mut txn, deps.family.tenant_id.0)
+        .map_err(|e| pg_failure(&e, "db_begin_failed"))?;
+    set_worker_rls_context(&mut txn, ctx.family.tenant_id.0)
         .await
-        .map_err(|_| (RowTerminal::Failed, "db_rls_context_failed"))?;
-    let memories = resolve_memories(&mut txn, deps.family.tenant_id.0, commit_seq)
+        .map_err(|e| pg_failure(&e, "db_rls_context_failed"))?;
+    let memories = resolve_memories(&mut txn, ctx.family.tenant_id.0, commit_seq)
         .await
-        .map_err(|_| (RowTerminal::Failed, "db_resolve_failed"))?;
+        .map_err(|e| pg_failure(&e, "db_resolve_failed"))?;
     let outbox_status: Option<String> = if memories.is_empty() {
         sqlx::query_scalar(
             "SELECT status FROM ops.outbox WHERE tenant_id = $1 AND commit_seq = $2 \
              AND event_type = 'EVIDENCE_ACCEPTED' ORDER BY created_at DESC LIMIT 1",
         )
-        .bind(deps.family.tenant_id.0)
+        .bind(ctx.family.tenant_id.0)
         .bind(commit_seq)
         .fetch_optional(&mut *txn)
         .await
-        .map_err(|_| (RowTerminal::Failed, "db_resolve_failed"))?
+        .map_err(|e| pg_failure(&e, "db_resolve_failed"))?
     } else {
         None
     };
     txn.commit()
         .await
-        .map_err(|_| (RowTerminal::Failed, "db_commit_failed"))?;
+        .map_err(|e| pg_failure(&e, "db_commit_failed"))?;
     if memories.is_empty() {
         return Err(terminal_for_missing_memory(outbox_status.as_deref()));
     }
@@ -614,7 +848,7 @@ async fn resolve_and_embed(
     // §18.2 `ExcludedSecret` is a property of ONE memory, not of the ticket: on an Evidence that
     // carries a secret memory and an ordinary one, the ordinary one must still be indexed. Only
     // an Evidence where NOTHING is indexable settles the row `SKIPPED_BY_POLICY`. `Unbuildable`
-    // stays a whole-row failure — it means the stored record itself is malformed (§18.4).
+    // stays a whole-row permanent failure — the stored record itself is malformed (§18.4).
     let mut kept: Vec<ResolvedMemory> = Vec::with_capacity(memories.len());
     let mut sealed_cards = Vec::with_capacity(memories.len());
     let mut memory_ids: Vec<Uuid> = Vec::with_capacity(memories.len());
@@ -626,11 +860,16 @@ async fn resolve_and_embed(
                 return Err((RowTerminal::Failed, "card_unbuildable"));
             }
         };
-        sealed_cards.push(
-            deps.scanner
-                .seal_card(&card)
-                .map_err(|_| (RowTerminal::Failed, "secret_scan_failed"))?,
-        );
+        // ADR-0052 D-E: a scanner process that did not run (`DependencyUnavailable`) is
+        // environmental; a gitleaks finding (`Forbidden`) or an unsealable card (`InvalidInput`)
+        // is a verdict on this card and would be the same verdict on every retry.
+        sealed_cards.push(ctx.scanner.seal_card(&card).map_err(|code| {
+            if code_is_transient(code) {
+                (RowTerminal::Retry, "secret_scan_failed")
+            } else {
+                (RowTerminal::Failed, "secret_scan_rejected")
+            }
+        })?);
         memory_ids.push(memory.memory_id.0);
         kept.push(memory);
     }
@@ -646,11 +885,11 @@ async fn resolve_and_embed(
 
     // One embed call for the whole Evidence — `embed_cards` is already batch-shaped, so N
     // memories cost one provider round trip, not N (§19.2 per-purpose budget).
-    let vectors = deps
+    let vectors = ctx
         .embedder
         .embed_cards(
-            deps.family.tenant_id,
-            deps.dimension,
+            ctx.family.tenant_id,
+            ctx.dimension,
             &sealed_cards,
             &memory_ids,
         )
@@ -658,16 +897,21 @@ async fn resolve_and_embed(
         .map_err(|code| {
             // Operator signal only: the wire `ErrorCode` variant, never provider text (§7.x).
             eprintln!("projection_worker: commit_seq={commit_seq} embedding_failed code={code:?}");
-            (RowTerminal::Failed, "embedding_failed")
+            if code_is_transient(code) {
+                (RowTerminal::Retry, "embedding_failed")
+            } else {
+                (RowTerminal::Failed, "embedding_rejected")
+            }
         })?;
     // (d): reject a short batch or a dimension mismatch — checked against the actual returned
     // vector lengths, since this trait carries no separate `EmbeddingBatch::dimension` field
     // (see `CardEmbedder`'s doc). A provider that returns fewer vectors than cards would
-    // otherwise silently drop the tail memories of a multi-memory Evidence.
+    // otherwise silently drop the tail memories of a multi-memory Evidence. A short batch is a
+    // provider blip (transient); a wrong width is configuration (permanent).
     if vectors.len() != kept.len() {
-        return Err((RowTerminal::Failed, "embedding_batch_empty"));
+        return Err((RowTerminal::Retry, "embedding_batch_empty"));
     }
-    if vectors.iter().any(|v| v.len() != deps.dimension as usize) {
+    if vectors.iter().any(|v| v.len() != ctx.dimension as usize) {
         return Err((RowTerminal::Failed, "embedding_dimension_mismatch"));
     }
 
@@ -680,14 +924,14 @@ async fn resolve_and_embed(
 /// (e)-(h) of the module doc's per-row order: build the payload, upsert, register, verify.
 /// Split out of [`process_row`] purely to stay under this repo's line-count lint.
 async fn finish_row(
-    deps: &ProjectionWorkerDeps,
+    ctx: &RowCtx<'_>,
     stream_seq: i64,
     workspace_id: WorkspaceId,
     memory: ResolvedMemory,
     vector: Vec<f32>,
 ) -> (RowTerminal, &'static str) {
     let payload = QdrantPointPayload {
-        tenant_id: deps.family.tenant_id,
+        tenant_id: ctx.family.tenant_id,
         workspace_id,
         visibility_class: memory.visibility.class,
         visibility_user_id: memory.visibility.user_id,
@@ -701,8 +945,8 @@ async fn finish_row(
             .effective_from
             .or(memory.occurred_at)
             .unwrap_or(memory.created_at),
-        embedding_version: deps.embedding_version.clone(),
-        projection_version: deps.projection_version.clone(),
+        embedding_version: ctx.embedding_version.to_owned(),
+        projection_version: ctx.projection_version.to_owned(),
         source_stream_seq: stream_seq,
         data_class: memory.data_class,
         egress_disposition: egress_disposition_for(memory.data_class),
@@ -720,31 +964,40 @@ async fn finish_row(
         .with_affects(memory.affects);
 
     let registration = PrivateMemoryPointRegistration::deterministic(
-        deps.family.clone(),
-        deps.projection_version.clone(),
-        deps.embedding_version.clone(),
+        ctx.family.clone(),
+        ctx.projection_version.to_owned(),
+        ctx.embedding_version.to_owned(),
         memory.memory_id,
         memory.updated_at,
         memory.body_sha256,
     );
     let point_id = PointId::Uuid(registration.point_id.as_uuid());
 
-    if qdrant::upsert(
-        deps.transport.as_ref(),
-        &deps.permit,
-        &deps.placement.collection_name,
+    if let Err(error) = qdrant::upsert(
+        ctx.transport,
+        ctx.permit,
+        &ctx.placement.collection_name,
         &[(point_id, &indexable, vector)],
         ha_profile_for(QdrantOperation::NormalImmutableUpsert),
     )
     .await
-    .is_err()
     {
-        return (RowTerminal::Failed, "qdrant_upsert_failed");
+        // ADR-0052 D-E: 400/422 (payload, schema, vector width) is permanent; transport, 5xx,
+        // 404, 408, 409, 429 are transient. Operator signal: the status class only.
+        eprintln!(
+            "projection_worker: stream_seq={stream_seq} qdrant_upsert transient={}",
+            error.is_transient()
+        );
+        return if error.is_transient() {
+            (RowTerminal::Retry, "qdrant_upsert_failed")
+        } else {
+            (RowTerminal::Failed, "qdrant_upsert_rejected")
+        };
     }
 
-    let authorization = worker_authorization_scope(&deps.family, workspace_id);
+    let authorization = worker_authorization_scope(ctx.family, workspace_id);
     match private_projection_registry::register_private_memory_point(
-        &deps.pool,
+        ctx.pool,
         &authorization,
         &registration,
     )
@@ -755,24 +1008,43 @@ async fn finish_row(
             | RegistrationOutcome::AlreadyRegistered
             | RegistrationOutcome::Revived,
         ) => {}
-        Err(PrivateProjectionRegistryError::PointIdCollision)
-        | Err(PrivateProjectionRegistryError::IdentityAlreadyBound)
-        | Err(PrivateProjectionRegistryError::RegistryRaceLost) => {
-            return (RowTerminal::Failed, "registry_conflict");
+        Err(error) => {
+            let (terminal, class) = registry_failure(&error);
+            // ADR-0052 D-E (b): the upsert above landed a point the registry refused to bind, so
+            // no later retirement could ever find it (retirement walks registered points only,
+            // D-A's race). Delete that deterministic id before returning — except on a point-id
+            // collision, where the id IS registered, to another source, and deleting it would
+            // take that source's live point with it. A failed compensation is transient: the
+            // retry re-upserts the same id and tries again.
+            if !matches!(error, PrivateProjectionRegistryError::PointIdCollision)
+                && delete_points(
+                    ctx.transport,
+                    ctx.permit,
+                    &ctx.placement.collection_name,
+                    &[point_id],
+                    ha_profile_for(QdrantOperation::CorrectionDeleteSupersede),
+                )
+                .await
+                .is_err()
+            {
+                return (RowTerminal::Retry, class);
+            }
+            return (terminal, class);
         }
-        Err(_) => return (RowTerminal::Failed, "registry_failed"),
     }
 
     match verify_visible_via_transport(
-        deps.transport.as_ref(),
-        &deps.permit,
-        &deps.placement.collection_name,
+        ctx.transport,
+        ctx.permit,
+        &ctx.placement.collection_name,
         &[point_id],
     )
     .await
     {
         Ok(Some(confirmation)) if confirmation.contains(&point_id) => {}
-        _ => return (RowTerminal::Failed, "visibility_not_confirmed"),
+        // ADR-0052 D-E: not yet observed is a retry, not a verdict — the point is registered,
+        // so the next attempt re-upserts the same id and probes again.
+        _ => return (RowTerminal::Retry, "visibility_not_confirmed"),
     }
 
     (RowTerminal::Done, "")
@@ -785,23 +1057,23 @@ async fn finish_row(
 /// (`resolve_private_memory_points`) never served the dead memory anyway, so this is hygiene
 /// plus settlement, not a visibility change.
 async fn retire_row(
-    deps: &ProjectionWorkerDeps,
+    ctx: &RowCtx<'_>,
     workspace_id: WorkspaceId,
     memory: &ResolvedMemory,
 ) -> (RowTerminal, &'static str) {
-    let authorization = worker_authorization_scope(&deps.family, workspace_id);
+    let authorization = worker_authorization_scope(ctx.family, workspace_id);
     let points = match retire_points_for_memory(
-        &deps.pool,
+        ctx.pool,
         &authorization,
-        &deps.family,
-        &deps.projection_version,
-        &deps.embedding_version,
+        ctx.family,
+        ctx.projection_version,
+        ctx.embedding_version,
         memory.memory_id,
     )
     .await
     {
         Ok(points) => points,
-        Err(_) => return (RowTerminal::Failed, "registry_failed"),
+        Err(error) => return registry_failure(&error),
     };
     if points.is_empty() {
         return (RowTerminal::Done, "");
@@ -810,17 +1082,20 @@ async fn retire_row(
         .iter()
         .map(|point| PointId::Uuid(point.as_uuid()))
         .collect::<Vec<_>>();
-    if delete_points(
-        deps.transport.as_ref(),
-        &deps.permit,
-        &deps.placement.collection_name,
+    if let Err(error) = delete_points(
+        ctx.transport,
+        ctx.permit,
+        &ctx.placement.collection_name,
         &ids,
         ha_profile_for(QdrantOperation::CorrectionDeleteSupersede),
     )
     .await
-    .is_err()
     {
-        return (RowTerminal::Failed, "qdrant_delete_failed");
+        return if error.is_transient() {
+            (RowTerminal::Retry, "qdrant_delete_failed")
+        } else {
+            (RowTerminal::Failed, "qdrant_delete_rejected")
+        };
     }
     (RowTerminal::Done, "")
 }
@@ -841,24 +1116,28 @@ fn worker_authorization_scope(
     )
 }
 
-/// Reads up to `batch` `ISSUED` `stream_log` rows for `key`, ascending `stream_seq` — no lease
-/// column exists for `role_retrieval_worker` (module doc), so this is a plain read; a second
+/// The legacy single-key read: up to `batch` `ISSUED` rows for `key`, ascending `stream_seq`,
+/// returning `(stream_seq, commit_seq, attempts)`. Unleased on purpose — it takes only rows no
+/// `--serve` process holds (`lease_owner IS NULL`) and whose backoff has elapsed; a second
 /// concurrent `run_once` against the same key would race it (single-worker-per-key assumption,
-/// same as `humaux_adapters::public_repo`'s own `run_once`).
+/// same as `humaux_adapters::public_repo`'s own `run_once`). The resident path claims instead
+/// ([`stream_repo::claim_issued`]).
 async fn fetch_issued_rows(
     pool: &RetrievalWorkerDbPool,
     key: &StreamKey,
     batch: i64,
-) -> Result<Vec<(i64, i64)>, ErrorCode> {
+) -> Result<Vec<(i64, i64, i32)>, ErrorCode> {
     // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `fetch_issued_rows`
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
     set_worker_rls_context(&mut txn, key.tenant_id.0)
         .await
         .map_err(|_| ErrorCode::Internal)?;
     let rows = sqlx::query(
-        "SELECT stream_seq, commit_seq FROM projection.stream_log \
+        "SELECT stream_seq, commit_seq, attempts FROM projection.stream_log \
          WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3 AND domain = $4 \
            AND projection_kind = $5 AND projection_version = $6 AND state = 'ISSUED' \
+           AND lease_owner IS NULL \
+           AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()) \
          ORDER BY stream_seq ASC LIMIT $7",
     )
     .bind(key.tenant_id.0)
@@ -879,6 +1158,8 @@ async fn fetch_issued_rows(
                     .map_err(|_| ErrorCode::Internal)?,
                 row.try_get::<i64, _>("commit_seq")
                     .map_err(|_| ErrorCode::Internal)?,
+                row.try_get::<i32, _>("attempts")
+                    .map_err(|_| ErrorCode::Internal)?,
             ))
         })
         .collect()
@@ -886,8 +1167,9 @@ async fn fetch_issued_rows(
 
 /// Writes one row's terminal state — the sole legal `role_retrieval_worker` transition,
 /// `ISSUED -> {DONE,SKIPPED_BY_POLICY,FAILED}` (`migrations/0011_roles_and_grants.sql`'s
-/// `stream_log_guard_state_transition`). A no-op (0 rows) if the row already left `ISSUED`
-/// (concurrent settlement) — not an error.
+/// `stream_log_guard_state_transition`) — and clears the lease in the same statement. Fenced on
+/// `fence` (ADR-0052 D-D): returns `false`, not an error, when the fence matched nothing (the
+/// row already left `ISSUED`, or its lease was re-claimed by another worker).
 async fn settle_row(
     pool: &RetrievalWorkerDbPool,
     key: &StreamKey,
@@ -895,12 +1177,13 @@ async fn settle_row(
     commit_seq: i64,
     terminal: RowTerminal,
     error_class: &str,
-) -> Result<(), ErrorCode> {
+    fence: TicketFence<'_>,
+) -> Result<bool, ErrorCode> {
     let state = match terminal {
         RowTerminal::Done => "DONE",
         RowTerminal::SkippedByPolicy => "SKIPPED_BY_POLICY",
         RowTerminal::Failed => "FAILED",
-        RowTerminal::Pending => return Ok(()),
+        RowTerminal::Retry | RowTerminal::Pending => return Ok(false),
     };
     // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `settle_row`
     let mut txn = pool.pool().begin().await.map_err(|_| ErrorCode::Internal)?;
@@ -908,11 +1191,14 @@ async fn settle_row(
         .await
         .map_err(|_| ErrorCode::Internal)?;
     let error_class = (!error_class.is_empty()).then_some(error_class);
-    sqlx::query(
-        "UPDATE projection.stream_log SET state = $8, error_class = $7 \
+    let settled = sqlx::query(
+        "UPDATE projection.stream_log \
+            SET state = $8, error_class = $7, \
+                lease_owner = NULL, lease_expires_at = NULL, next_attempt_at = NULL \
          WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3 AND domain = $4 \
            AND projection_kind = $5 AND projection_version = $6 AND stream_seq = $9 \
-           AND state = 'ISSUED'",
+           AND state = 'ISSUED' \
+           AND lease_owner IS NOT DISTINCT FROM $10 AND attempts = $11",
     )
     .bind(key.tenant_id.0)
     .bind(&key.scope_kind)
@@ -923,9 +1209,17 @@ async fn settle_row(
     .bind(error_class)
     .bind(state)
     .bind(stream_seq)
+    .bind(fence.lease_owner)
+    .bind(fence.attempts)
     .execute(&mut *txn)
     .await
-    .map_err(|_| ErrorCode::Internal)?;
+    .map_err(|_| ErrorCode::Internal)?
+    .rows_affected()
+        == 1;
+    if !settled {
+        txn.commit().await.map_err(|_| ErrorCode::Internal)?;
+        return Ok(false);
+    }
     // ADR-0049 D-C: the ticket's carrier row. A MEMORY_LIFECYCLE / MEMORY_PUBLISHED outbox row
     // exists to bind `evidence_id` to this ticket (ADR-0018 §4); no distiller ever claims it,
     // so until now it stayed PENDING forever and every "backlog drained" measure (the soak's
@@ -952,11 +1246,13 @@ async fn settle_row(
     .await
     .map_err(|_| ErrorCode::Internal)?;
     txn.commit().await.map_err(|_| ErrorCode::Internal)?;
-    Ok(())
+    Ok(true)
 }
 
-/// The full consumer loop, one batch: see module doc for the per-row order and the §15.7
-/// checkpoint discipline.
+/// The legacy single-key consumer loop, one batch: see module doc for the per-row order and the
+/// §15.7 checkpoint discipline. No lease and no `max_attempts` of its own — nothing resident
+/// drives it any more (the binary's `--run-once` is one [`run_claimed_pass`]); a transient row is
+/// returned with one attempt spent and no backoff, and the next caller decides.
 pub async fn run_once(
     deps: &ProjectionWorkerDeps,
     batch: usize,
@@ -972,38 +1268,427 @@ pub async fn run_once(
         deps.family.projection_kind.clone(),
         deps.projection_version.clone(),
     );
+    let ctx = RowCtx::of(deps);
 
     let rows = fetch_issued_rows(&deps.pool, &key, batch as i64).await?;
     let mut outcome = RunOnceOutcome::default();
-    for (stream_seq, commit_seq) in rows {
-        let (terminal, error_class) = process_row(deps, stream_seq, commit_seq).await;
-        settle_row(
-            &deps.pool,
-            &key,
-            stream_seq,
-            commit_seq,
-            terminal,
-            error_class,
-        )
-        .await?;
+    for (stream_seq, commit_seq, attempts) in rows {
+        let fence = TicketFence {
+            lease_owner: None,
+            attempts,
+        };
+        let (terminal, error_class) = process_row(&ctx, stream_seq, commit_seq).await;
+        match terminal {
+            RowTerminal::Retry => {
+                stream_repo::release_for_retry(
+                    &deps.pool,
+                    &key,
+                    stream_seq,
+                    fence,
+                    error_class,
+                    None,
+                    true,
+                )
+                .await
+                .map_err(|_| ErrorCode::Internal)?;
+            }
+            RowTerminal::Pending => {}
+            _ => {
+                settle_row(
+                    &deps.pool,
+                    &key,
+                    stream_seq,
+                    commit_seq,
+                    terminal,
+                    error_class,
+                    fence,
+                )
+                .await?;
+            }
+        }
         match terminal {
             RowTerminal::Done => outcome.done += 1,
             RowTerminal::SkippedByPolicy => outcome.skipped_by_policy += 1,
             RowTerminal::Failed => outcome.failed += 1,
+            RowTerminal::Retry => outcome.retried += 1,
             RowTerminal::Pending => outcome.pending += 1,
         }
     }
 
-    // (j): one `advance_prefix` call for the whole batch. §15.7: a `FAILED` seq blocks every
-    // later seq — that discipline lives entirely inside `advance_prefix`'s own
-    // `contiguous_done_prefix` arithmetic (a `FAILED` row counts as an open gap, never as
-    // done), so this call needs no special-casing here. `Inconsistent` means the ledger's own
-    // §15.4 identity did not hold — a real fault, not a retry signal, so it surfaces as
-    // `ErrorCode::Internal` rather than a guessed fallback number.
+    // (j): one `advance_prefix` call for the whole batch. §15.7: a not-yet-DONE seq blocks
+    // every later seq — that discipline lives entirely inside `advance_prefix`'s own
+    // `contiguous_done_prefix` arithmetic, so this call needs no special-casing here.
+    // `Inconsistent` means the ledger's own §15.4 identity did not hold — a real fault, not a
+    // retry signal, so it surfaces as `ErrorCode::Internal` rather than a guessed fallback.
     // The watermark carries this worker's §7.4 identity into `projection_processor_id`
     // (migration 0171): the checkpoint this process advanced says which process advanced it.
     outcome.projection_highwater = stream_repo::advance_prefix(&deps.pool, &key, deps.processor_id)
         .await
         .map_err(|_| ErrorCode::Internal)?;
     Ok(outcome)
+}
+
+/// ADR-0052 D-F: one resident pass across every placed tenant — see the module doc's "resident
+/// path" section for the order. Returns `Err` only when the database is unreachable for the
+/// unplaced count or the claim itself (the caller logs it and polls again); a per-ticket failure
+/// is classified and counted, never propagated. A settle/retry/release that cannot reach the
+/// database either leaves the ticket leased, and the lease expiry returns it (the expired-lease
+/// arm of the claim).
+pub async fn run_claimed_pass(
+    shared: &SharedProjectionDeps,
+    cfg: &PassConfig,
+) -> Result<PassOutcome, ErrorCode> {
+    let mut outcome = PassOutcome::default();
+
+    let unplaced = stream_repo::unplaced_issued(&shared.pool, &cfg.claim)
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    outcome.placement_missing = unplaced.iter().map(|(_, n)| *n as u64).sum();
+    if let Some((first, _)) = unplaced.first() {
+        // One line per pass, not per tenant: a poll every second must not flood the log.
+        eprintln!(
+            "projection_worker: placement_missing tenants={} tickets={} first_tenant={first}",
+            unplaced.len(),
+            outcome.placement_missing
+        );
+    }
+
+    let started = std::time::Instant::now();
+    let batch = stream_repo::claim_issued(
+        &shared.pool,
+        &cfg.claim,
+        &cfg.lease_owner,
+        cfg.lease_secs,
+        cfg.batch,
+        cfg.per_tenant_cap,
+    )
+    .await
+    .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    outcome.claim_ms = started.elapsed().as_millis() as u64;
+    let mut claimed = batch.tickets;
+    outcome.claimed = (claimed.len() + batch.unplaceable.len()) as u64;
+    // Review 2026-09-29 P1: a placement this build cannot parse (deploy skew) parks only its own
+    // tickets — lease cleared, attempt given back, backoff so it is not re-claimed every poll —
+    // and every co-claimed ticket is processed as usual.
+    for ticket in batch.unplaceable {
+        eprintln!(
+            "projection_worker: placement_invalid tenant={} stream_seq={}",
+            ticket.tenant_id, ticket.stream_seq
+        );
+        let key = StreamKey::new(
+            TenantId(ticket.tenant_id),
+            ticket.scope_kind,
+            ticket.scope_id,
+            ticket.domain,
+            ticket.projection_kind,
+            ticket.projection_version,
+        );
+        let fence = TicketFence {
+            lease_owner: Some(&cfg.lease_owner),
+            attempts: ticket.attempts,
+        };
+        let parked = stream_repo::release_for_retry(
+            &shared.pool,
+            &key,
+            ticket.stream_seq,
+            fence,
+            "placement_invalid",
+            Some(cfg.backoff),
+            false,
+        )
+        .await;
+        if parked.is_ok_and(|written| written) {
+            outcome.placement_invalid += 1;
+        } else {
+            outcome.lost_lease += 1;
+        }
+    }
+
+    // D-A: one family, one worker, `stream_seq` order. `RETURNING` has no order of its own.
+    claimed.sort_by(|a, b| {
+        (a.key.tenant_id.0, a.key.scope_id, a.stream_seq).cmp(&(
+            b.key.tenant_id.0,
+            b.key.scope_id,
+            b.stream_seq,
+        ))
+    });
+    let families: Vec<&[ClaimedTicket]> = claimed.chunk_by(|a, b| a.key == b.key).collect();
+    // ponytail: families run one after another inside a pass; run them concurrently if the
+    // projection-lag p95 (ADR-0052 measurements) says a pass is the bottleneck.
+    let work = async {
+        for family in &families {
+            run_family(shared, cfg, family, &mut outcome).await;
+        }
+    };
+    // Review 2026-09-29 P0: every family this pass holds is renewed while ANY of them is being
+    // worked, so the tail of a slow batch keeps its leases (before this, only the family in
+    // hand was renewed and later families expired, were re-claimed, and burned attempts to
+    // `transient_exhausted` without ever being tried). The lease is a liveness signal: it has
+    // to outlast `lease_secs / 3` plus one renew round, not the batch.
+    let heartbeat = async {
+        loop {
+            (shared.sleep)(Duration::from_secs_f64(cfg.lease_secs / 3.0)).await;
+            for family in &families {
+                // A failed renew is not acted on here: the per-ticket renew in `run_family`
+                // sees the lost lease and stops that family before any write.
+                let _ = stream_repo::renew_family_leases(
+                    &shared.pool,
+                    &family[0].key,
+                    &cfg.lease_owner,
+                    cfg.lease_secs,
+                )
+                .await;
+            }
+        }
+    };
+    while_running(work, heartbeat).await;
+    Ok(outcome)
+}
+
+/// Drives `work` to completion while also polling `side` (a loop that never finishes); `side` is
+/// dropped the moment `work` is done. std-only: this crate has no async runtime dependency.
+async fn while_running(work: impl Future<Output = ()>, side: impl Future<Output = ()>) {
+    let mut work = std::pin::pin!(work);
+    let mut side = std::pin::pin!(side);
+    let mut side_done = false;
+    std::future::poll_fn(|cx| {
+        if work.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        if !side_done {
+            side_done = side.as_mut().poll(cx).is_ready();
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// One claimed family of [`run_claimed_pass`]: per ticket exhaustion → heartbeat → fresh permit →
+/// [`process_row`] → fenced settle / retry / release, then one `advance_prefix`.
+async fn run_family(
+    shared: &SharedProjectionDeps,
+    cfg: &PassConfig,
+    tickets: &[ClaimedTicket],
+    outcome: &mut PassOutcome,
+) {
+    let Some(first) = tickets.first() else {
+        return;
+    };
+    let key = &first.key;
+    let family = StreamFamily::new(
+        key.tenant_id,
+        key.scope_kind.clone(),
+        key.scope_id,
+        key.domain.clone(),
+        key.projection_kind.clone(),
+    );
+    for (index, ticket) in tickets.iter().enumerate() {
+        let fence = TicketFence {
+            lease_owner: Some(&cfg.lease_owner),
+            attempts: ticket.attempts,
+        };
+        // A worker that dies on this ticket every time never reaches the retry branch below;
+        // the claim's increment is what still bounds it.
+        if ticket.attempts > cfg.max_attempts {
+            tally(
+                outcome,
+                settle_exhausted(shared, ticket, fence).await,
+                RowTerminal::Failed,
+            );
+            continue;
+        }
+        let renewed =
+            stream_repo::renew_family_leases(&shared.pool, key, &cfg.lease_owner, cfg.lease_secs)
+                .await;
+        if !renewed.is_ok_and(|seqs| seqs.contains(&ticket.stream_seq)) {
+            // The lease is gone (expired, maybe re-claimed): nothing of this family may be
+            // written by this worker any more.
+            outcome.lost_lease += (tickets.len() - index) as u64;
+            break;
+        }
+        process_and_write(shared, cfg, &family, ticket, fence, outcome).await;
+    }
+    // One watermark move per family (j). A failure here is logged: the next pass over this
+    // family (or the next write) moves it, and the settled rows above stay settled.
+    if let Err(error) = stream_repo::advance_prefix(&shared.pool, key, shared.processor_id).await {
+        eprintln!(
+            "projection_worker: advance_prefix failed tenant={} scope={}: {error}",
+            key.tenant_id.0, key.scope_id
+        );
+    }
+}
+
+/// One leased, heartbeated ticket of [`run_family`]: a fresh permit, [`process_row`], then the
+/// fenced write its disposition calls for, counted into `outcome` ([`tally`]).
+async fn process_and_write(
+    shared: &SharedProjectionDeps,
+    cfg: &PassConfig,
+    family: &StreamFamily,
+    ticket: &ClaimedTicket,
+    fence: TicketFence<'_>,
+    outcome: &mut PassOutcome,
+) {
+    let key = &ticket.key;
+    // A permit the cell registry refused is a Qdrant-side outage of this ticket like any other.
+    let (terminal, class) = match (shared.mint_permit)() {
+        Some(permit) => {
+            let ctx = RowCtx {
+                pool: &shared.pool,
+                embedder: shared.embedder.as_ref(),
+                scanner: shared.scanner.as_ref(),
+                transport: shared.transport.as_ref(),
+                permit: &permit,
+                placement: &ticket.placement,
+                family,
+                embedding_version: &shared.embedding_version,
+                projection_version: &key.projection_version,
+                dimension: shared.dimension,
+            };
+            process_row(&ctx, ticket.stream_seq, ticket.commit_seq).await
+        }
+        None => (RowTerminal::Retry, "qdrant_upsert_failed"),
+    };
+    if terminal == RowTerminal::Done {
+        // Every dependency answered: the next outage failure is charged again.
+        shared.dependency_down.store(false, Ordering::Relaxed);
+    }
+    // Review 2026-09-29 P1: an outage failure while the dependency is already known down is not
+    // evidence against this ticket, so it spends no attempt and cannot exhaust — a Qdrant or
+    // provider outage (or a quota/budget window) longer than the backoff series no longer FAILs
+    // every ticket written during it. The first outage failure after a DONE is charged like any
+    // transient, so a ticket that fails alone while others succeed is still bounded
+    // (ADR-0048); the backoff still spaces the uncharged retries.
+    let refund = terminal == RowTerminal::Retry
+        && is_dependency_outage(class)
+        && shared.dependency_down.swap(true, Ordering::Relaxed);
+    let written = match terminal {
+        RowTerminal::Retry if !refund && ticket.attempts >= cfg.max_attempts => {
+            eprintln!(
+                "projection_worker: stream_seq={} transient_exhausted last_class={class}",
+                ticket.stream_seq
+            );
+            tally(
+                outcome,
+                settle_exhausted(shared, ticket, fence).await,
+                RowTerminal::Failed,
+            );
+            return;
+        }
+        RowTerminal::Retry => stream_repo::release_for_retry(
+            &shared.pool,
+            key,
+            ticket.stream_seq,
+            fence,
+            class,
+            Some(cfg.backoff),
+            !refund,
+        )
+        .await
+        .ok(),
+        RowTerminal::Pending => {
+            stream_repo::release_pending(&shared.pool, key, ticket.stream_seq, fence)
+                .await
+                .ok()
+        }
+        _ => settle_row(
+            &shared.pool,
+            key,
+            ticket.stream_seq,
+            ticket.commit_seq,
+            terminal,
+            class,
+            fence,
+        )
+        .await
+        .ok(),
+    };
+    if refund && written == Some(true) {
+        outcome.refunded += 1;
+    }
+    tally(outcome, written, terminal);
+}
+
+/// Settles `ticket` `FAILED` `transient_exhausted` (ADR-0052 D-E); `Some(false)` = lease lost.
+async fn settle_exhausted(
+    shared: &SharedProjectionDeps,
+    ticket: &ClaimedTicket,
+    fence: TicketFence<'_>,
+) -> Option<bool> {
+    settle_row(
+        &shared.pool,
+        &ticket.key,
+        ticket.stream_seq,
+        ticket.commit_seq,
+        RowTerminal::Failed,
+        "transient_exhausted",
+        fence,
+    )
+    .await
+    .ok()
+}
+
+/// Counts one ticket's written outcome: `Some(true)` under its disposition, `Some(false)` (the
+/// fence matched nothing) as a lost lease, `None` (the write itself failed; the lease expiry
+/// returns the ticket) as a lost lease too — this worker no longer owns what happens to it.
+fn tally(outcome: &mut PassOutcome, written: Option<bool>, terminal: RowTerminal) {
+    if written != Some(true) {
+        outcome.lost_lease += 1;
+        return;
+    }
+    match terminal {
+        RowTerminal::Done => outcome.done += 1,
+        RowTerminal::SkippedByPolicy => outcome.skipped += 1,
+        RowTerminal::Failed => outcome.failed += 1,
+        RowTerminal::Retry => outcome.retried += 1,
+        RowTerminal::Pending => outcome.pending += 1,
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::{RowTerminal, code_is_transient, pg_is_transient, terminal_for_missing_memory};
+    use humaux_domain::error::ErrorCode;
+
+    /// ADR-0052 D-E, the `ErrorCode` (embedding + secret scanner) and PG halves of the table (the
+    /// Qdrant half is pinned in `qdrant.rs`). `Forbidden` is the scanner's gitleaks finding: the
+    /// 2026-09-29 rehearsal retried one to `transient_exhausted` before this row existed. Fault
+    /// injection: classify `ProviderPermanent` as transient ⇒ red, and a provider 4xx would retry
+    /// to `transient_exhausted` instead of failing `embedding_rejected`.
+    #[test]
+    fn embedding_and_pg_errors_classify_per_the_adr_0052_table() {
+        for transient in [
+            ErrorCode::ProviderRateLimited,
+            ErrorCode::ProviderTransient,
+            ErrorCode::DependencyUnavailable,
+            ErrorCode::RateLimited,
+            ErrorCode::QuotaExhausted,
+            ErrorCode::CostBudgetExceeded,
+            ErrorCode::WaitingKey,
+            ErrorCode::Internal,
+        ] {
+            assert!(code_is_transient(transient), "{transient:?}");
+        }
+        for permanent in [
+            ErrorCode::ProviderPermanent,
+            ErrorCode::InvalidInput,
+            ErrorCode::Forbidden,
+            ErrorCode::Unauthorized,
+            ErrorCode::EntitlementRequired,
+            ErrorCode::TenantBoundary,
+        ] {
+            assert!(!code_is_transient(permanent), "{permanent:?}");
+        }
+        assert!(pg_is_transient(&sqlx::Error::PoolTimedOut));
+        assert!(pg_is_transient(&sqlx::Error::PoolClosed));
+        assert!(!pg_is_transient(&sqlx::Error::RowNotFound));
+        // 0167's retirable classes stay permanent; an open distill is not a failure at all.
+        assert_eq!(
+            terminal_for_missing_memory(Some("FAILED")).0,
+            RowTerminal::Failed
+        );
+        assert_eq!(
+            terminal_for_missing_memory(Some("PENDING")).0,
+            RowTerminal::Pending
+        );
+    }
 }

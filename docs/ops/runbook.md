@@ -85,8 +85,27 @@ Two rules that are not obvious from the variable names:
 
 1. `humaux-private-worker --serve-rpc` and `--distill-serve`
 2. `humaux-retrieval-worker --serve-rpc`
-3. `humaux-consolidation-worker --serve`
-4. `humaux-gateway`
+3. `humaux-retrieval-worker --serve` — the fifth resident process, card 27 / ADR-0052: ONE
+   tenant-free projection runner for every placed tenant (same OS user as `--serve-rpc`). Its
+   keys beyond the `--serve-rpc` set (DSN, embedding descriptor, Qdrant cell, gitleaks pin,
+   egress processor id) are the seven pass keys, all required, no defaults:
+   `HUMAUX_RETRIEVAL_WORKER_BATCH`, `_POLL_INTERVAL_SECS`, `_LEASE_SECS`, `_PER_TENANT_CAP`,
+   `_MAX_ATTEMPTS`, `_BACKOFF_BASE_SECS`, `_BACKOFF_MAX_SECS` (meaning and readers:
+   `docs/architecture/env_vars.md`). There is no tenant, workspace or collection key: the claim
+   hands each ticket its tenant's `projection.tenant_placements` row, and a tenant without a
+   placement is never claimed (the runner logs `placement_missing tenants=<n> tickets=<m>`).
+   Readiness: the process is alive AND `--readyz` exits 0 (`docs/ops/supervision.md` §4 rule 3).
+4. `humaux-consolidation-worker --serve`
+5. `humaux-gateway`
+
+Before card 27 nothing in this runbook drove projection at all: tickets stayed `ISSUED` and recall
+never saw a new memory (audit P1-1). One line per pass shows the runner working:
+`projection pass claimed= done= skipped= failed= retried= refunded= pending= lost_lease= placement_missing= placement_invalid= claim_ms=`.
+`refunded` counts retries that spent no attempt because the dependency (Qdrant, the embedding
+provider incl. its quota/budget, the scanner, PostgreSQL) was already known down — an outage
+parks tickets, it does not exhaust them. `placement_invalid` counts tickets parked because their
+tenant's placement row carries a value this build does not know (deploy skew): fix the build or
+the row, and they are claimed again after the backoff.
 
 The order is not a preference: the consolidation worker's `--readyz` probes the private worker's
 UDS peer, and the gateway's semantic recall needs the retrieval worker's socket. Starting a
@@ -95,12 +114,24 @@ consumer before its socket exists produces a readiness failure that names the mi
 
 ## 6. First activation — the step that is easy to miss
 
-A fresh deployment has **no serving projection version**. After the projection worker catches up:
+A fresh deployment has **no serving projection version**. After the projection runner
+(`--serve`, §5 step 3) has caught up on a (tenant, workspace) family, activate it — all five
+flags are required (`xtask/src/projection_serve.rs`):
 
 ```sh
-cargo xtask projection-serve
+cargo xtask projection-serve --tenant <tenant_id> --workspace <workspace_id> \
+  --domain private_memory --projection-kind PRIVATE_MEMORY --version v1 \
+  [--retire-failed distill_failed,no_visible_memory_record]
 ```
 
+`--retire-failed <classes>` first moves that family's `FAILED` tickets of exactly those classes
+to `RETIRED_FAILED` (0167, audited), because one `FAILED` ticket pins the §15.4 prefix. Since
+card 27 a transient failure is a bounded retry, not `FAILED`; what still lands in `FAILED` is a
+permanent class (`qdrant_upsert_rejected`, `embedding_rejected`, `embedding_dimension_mismatch`,
+`card_unbuildable`, `secret_scan_rejected`, `registry_conflict`, `distill_failed`, …) or `transient_exhausted`.
+
+**First activation stays an operator act until card 28** — per (tenant, workspace), once. The
+runner projects a family whether or not it is serving; recall reads only the serving version.
 ADR-0017: with no serving version, activation is an explicit operator act, not an automatic
 promotion. Later version upgrades go through the §16.2 two-version comparison instead — and see
 `docs/ops/delivery_point_report.md` §6.1 before assuming that comparison will succeed: a tenant

@@ -6,7 +6,7 @@
 //!   modules=[domain::ids, projection::serving, xtask::switch_visible]
 //! Called-by: [xtask::main]
 //! Invariants: [continuous concurrent load against the real four-process deployment while a chaos hook kills/restarts a worker; every read is asserted live against the database]
-//! Spec: Baseline §15.1; §15.3; §15.5; §31; §61; §6.1; ADR-0037; ADR-0050
+//! Spec: Baseline §15.1; §15.3; §15.5; §31; §61; §6.1; ADR-0037; ADR-0050; ADR-0052
 //!
 //! `cargo xtask soak` — the endurance + crash-recovery harness (card 16).
 //!
@@ -22,6 +22,8 @@
 //! * §15.3 `projection.stream_checkpoints` watermarks never go backwards and never stall;
 //! * §15.5 read-your-writes: a `consistency_token` this run minted is never rejected, and a
 //!   settled write is visible to a recall carrying its own token;
+//! * ADR-0052: after the drain, no `projection.stream_log` ticket still holds a live `--serve`
+//!   lease (`no_live_ticket_lease_after_drain`; the rotation kills and restarts the runner);
 //! * §31/§61 leases: after the drain, no `ops.jobs` row is `PROCESSING` with a *live* lease —
 //!   a `kill -9` mid-pass leaves the row leased, and only lease expiry may free it, so a live
 //!   lease surviving `drain > LEASE_SECS` means a worker is wedged, not crashed;
@@ -179,8 +181,25 @@ fn parse_lane(raw: &str) -> Result<TenantLane, String> {
         tenant_id,
         workspace_id,
         bearer,
-        sentinel: format!("soak-sentinel-{}", &tenant_id.simple().to_string()[..12]),
+        sentinel: format!(
+            "soak-sentinel-{}",
+            digit_free(&tenant_id.simple().to_string()[..12])
+        ),
     })
+}
+
+/// Hex with its digits spelled as letters (`0`→`g` … `9`→`p`): unique like the hex, but it can
+/// never hold the 7-digit run the local scanner's deterministic phone rule rejects. Soak content
+/// is distilled by a live model that may copy the marker into a memory's key claim; a random hex
+/// nonce did (2026-09-29 review-fix chain: `…3831887…` ⇒ `secret_scan_rejected`, a FAILED ticket
+/// pinning its stream's prefix, `projection_promoted` red) — a harness artefact, not a finding.
+fn digit_free(hex: &str) -> String {
+    hex.chars()
+        .map(|c| match c.to_digit(10) {
+            Some(d) => char::from(b'g' + d as u8),
+            None => c,
+        })
+        .collect()
 }
 
 /// Split `http://host:port/path` into the pieces the loopback client needs. Only plain `http`
@@ -457,6 +476,9 @@ pub struct TenantFinal {
     pub tickets_lost_state: i64,
     pub double_applied_memories: i64,
     pub live_leases_processing: i64,
+    /// ADR-0052: `projection.stream_log` tickets still holding a live `--serve` lease after the
+    /// drain (the sibling of `live_leases_processing` for the resident projection runner).
+    pub live_ticket_leases: i64,
     pub backlog: i64,
     pub writes: i64,
     pub recall_dependency_unavailable: i64,
@@ -959,6 +981,13 @@ fn settlement_assertions(series: &Series) -> Vec<Assertion> {
             0.0,
         ),
         at_most(
+            "no_live_ticket_lease_after_drain",
+            sum(|f| f.live_ticket_leases),
+            "stream_log tickets",
+            tickets,
+            0.0,
+        ),
+        at_most(
             "backlog_drained",
             sum(|f| f.backlog),
             "queued rows",
@@ -1122,10 +1151,18 @@ fn scalar(db: &mut Client, sql: &str) -> Result<i64, String> {
 /// holds it: §15.3 stores the *prefix*, and the worker's consumption position is only derivable
 /// from the ledger's settled rows (`settled_at IS NOT NULL` is the §15.1 CHECK's own definition
 /// of the four terminal states, so this cannot drift from that closed set).
+/// One stream's label: the tenant plus the five other §15.1 key columns (scope kind, scope id,
+/// domain, projection kind, version). Card 27: without the scope a tenant with two workspaces
+/// folded two checkpoint rows into one label, and every observation compared workspace 1's
+/// watermark with workspace 2's — 53 spurious "regressions" in the first 3 × 2 soak.
+fn stream_label(tenant: Uuid, key: [&str; 5]) -> String {
+    format!("{tenant}|{}", key.join("|"))
+}
+
 fn watermarks(db: &mut Client, tenant: Uuid) -> Result<Vec<StreamWatermark>, String> {
     db.query(
         "SELECT c.domain, c.projection_kind, c.projection_version, c.issued_highwater, \
-                c.projection_highwater, \
+                c.projection_highwater, c.scope_kind, c.scope_id::text, \
                 COALESCE((SELECT max(l.stream_seq) FROM projection.stream_log l \
                            WHERE l.tenant_id = c.tenant_id AND l.scope_kind = c.scope_kind \
                              AND l.scope_id = c.scope_id AND l.domain = c.domain \
@@ -1139,15 +1176,19 @@ fn watermarks(db: &mut Client, tenant: Uuid) -> Result<Vec<StreamWatermark>, Str
     .map(|rows| {
         rows.iter()
             .map(|r| StreamWatermark {
-                stream: format!(
-                    "{tenant}|{}|{}|{}",
-                    r.get::<_, String>(0),
-                    r.get::<_, String>(1),
-                    r.get::<_, String>(2)
+                stream: stream_label(
+                    tenant,
+                    [
+                        &r.get::<_, String>(5),
+                        &r.get::<_, String>(6),
+                        &r.get::<_, String>(0),
+                        &r.get::<_, String>(1),
+                        &r.get::<_, String>(2),
+                    ],
                 ),
                 issued: r.get(3),
                 projected: r.get(4),
-                applied: r.get(5),
+                applied: r.get(7),
             })
             .collect()
     })
@@ -1520,6 +1561,15 @@ fn tenant_final(db: &mut Client, lane: &TenantLane) -> Result<TenantFinal, Strin
         "SELECT count(*)::bigint FROM ops.jobs WHERE status = 'PROCESSING' \
          AND lease_expires_at IS NOT NULL AND lease_expires_at > now()",
     )?;
+    // ADR-0052: the resident projection runner leases tickets on stream_log itself. A --serve
+    // process killed mid-batch leaves leases that expire after LEASE_SECS and are re-claimed; a
+    // lease still live after the drain means a runner that is wedged or was never replaced.
+    // Scoped to this lane's tenant by the RLS context `set_tenant` installed above.
+    f.live_ticket_leases = scalar(
+        db,
+        "SELECT count(*)::bigint FROM projection.stream_log \
+         WHERE lease_owner IS NOT NULL AND lease_expires_at > now()",
+    )?;
     // Exactly-once at the projection registry: the UNIQUE constraint already refuses a
     // byte-identical replay, so the observable double-apply is a SECOND live point for the
     // same memory in the same family — which is what negative control (b) injects.
@@ -1610,8 +1660,9 @@ fn session(cfg: &Config, lane_idx: usize, deadline: Instant, shared: &Mutex<Shar
     let lane = &cfg.tenants[lane_idx];
     while Instant::now() < deadline {
         let nonce = Uuid::new_v4().simple().to_string();
+        let marker = digit_free(&nonce);
         let content = format!(
-            "{} {nonce}: the soak lane records that a backend service must publish a readiness \
+            "{} {marker}: the soak lane records that a backend service must publish a readiness \
              probe before traffic reaches it.",
             lane.sentinel
         );
@@ -1791,10 +1842,12 @@ fn replay_ryw(cfg: &Config, db: &mut Client, series: &mut Series) -> Result<(), 
         series.ryw_replays += 1;
         let nonce = Uuid::new_v4().simple().to_string();
         let put = format!(
-            "{{\"operation\":\"put\",\"content\":\"{} {nonce}: the post-drain replay records that \
+            "{{\"operation\":\"put\",\"content\":\"{} {}: the post-drain replay records that \
              a backend service must publish a readiness probe before traffic reaches it.\",\
              \"idempotency_key\":\"soak-replay-{nonce}\",\"workspace_id\":\"{}\"}}",
-            lane.sentinel, lane.workspace_id
+            lane.sentinel,
+            digit_free(&nonce),
+            lane.workspace_id
         );
         let (put_sample, put_body) = timed(cfg, lane, "remember", &put);
         series.samples.push(Sample {
@@ -2075,14 +2128,17 @@ mod tests {
         let uuid = |n: u8| format!("00000000-0000-0000-0000-0000000000{n:02}");
         for (var, val) in [
             ("$TENANT_B", uuid(3)),
+            ("$TENANT_C", uuid(5)),
             ("$TENANT", uuid(1)),
             ("$WS_B", uuid(4)),
+            ("$WS_C", uuid(6)),
             ("$WS", uuid(2)),
             ("$SOAK_SECS", "600".to_string()),
             ("$S", "/tmp/s".to_string()),
             ("$EV", "/tmp/ev".to_string()),
             ("BEARER_A", "PATH".to_string()),
             ("BEARER_B", "PATH".to_string()),
+            ("BEARER_C", "PATH".to_string()),
         ] {
             text = text.replace(var, &val);
         }
@@ -2108,8 +2164,16 @@ mod tests {
             .collect();
         let cfg = parse_config(&args).unwrap_or_else(|e| panic!("{e}\nargs: {args:?}"));
         let names: Vec<&str> = cfg.watch_pidfiles.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["gw", "rw", "pw", "ds", "cw"]);
+        assert_eq!(names, ["gw", "rw", "pw", "ds", "cw", "rp"]);
         assert!(cfg.chaos_grace.is_some() && cfg.max_op_failure_rate > 0.0);
+        // card 27 / ADR-0052: the projection runner is in the kill rotation, and the soak grades
+        // all three tenants the rehearsal seeds.
+        assert!(
+            cfg.chaos_cmds
+                .iter()
+                .any(|c| c.ends_with("soak_chaos_rp.sh"))
+        );
+        assert_eq!(cfg.tenants.len(), 3);
     }
 
     /// `applied` and `projected` move together in the healthy fixture; the tests that care
@@ -2540,6 +2604,44 @@ mod tests {
         assert!(!verdict(&series, "no_live_lease_after_drain"));
     }
 
+    /// Card 27: two workspaces of one tenant are two streams, never one label — otherwise the
+    /// monotonic check compares one workspace's watermark with the other's.
+    #[test]
+    fn two_workspaces_of_one_tenant_are_two_stream_labels() {
+        let t = Uuid::from_u128(27);
+        let a = stream_label(
+            t,
+            [
+                "workspace",
+                "ws-1",
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            ],
+        );
+        let b = stream_label(
+            t,
+            [
+                "workspace",
+                "ws-2",
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            ],
+        );
+        assert_ne!(a, b);
+    }
+
+    /// ADR-0052: a projection ticket still leased after the drain fails the run (the kill
+    /// rotation's `--serve` restart must have re-claimed and settled everything its victim held).
+    #[test]
+    fn a_live_ticket_lease_after_the_drain_is_a_failure() {
+        let mut series = healthy();
+        assert!(verdict(&series, "no_live_ticket_lease_after_drain"));
+        series.finals[0].live_ticket_leases = 1;
+        assert!(!verdict(&series, "no_live_ticket_lease_after_drain"));
+    }
+
     #[test]
     fn a_watermark_that_goes_backwards_is_a_regression() {
         let mut series = healthy();
@@ -2912,6 +3014,19 @@ mod tests {
         let refused = b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n";
         assert_eq!(parse_http(refused).expect("503").0, 503);
         assert!(parse_http(b"garbage").is_err());
+    }
+
+    #[test]
+    fn soak_markers_never_carry_a_phone_like_digit_run() {
+        // The nonce that failed the 2026-09-29 chain; its `3831887` is 7 digits.
+        let marker = super::digit_free("2faf14fe7d5243c3831887ce21e2447d");
+        assert!(!marker.chars().any(|c| c.is_ascii_digit()), "{marker}");
+        assert_eq!(marker.len(), 32);
+        assert_ne!(
+            super::digit_free("0a"),
+            super::digit_free("1a"),
+            "stays injective"
+        );
     }
 
     #[test]

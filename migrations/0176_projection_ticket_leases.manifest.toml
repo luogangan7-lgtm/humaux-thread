@@ -1,0 +1,105 @@
+# §46.1 migration manifest. ADR-0052 (card 27, §15.2/§17.4/§31 leases, §6.2.2 function grants):
+# one resident, tenant-free projection runner claims ISSUED tickets by lease. Four lease/attempt
+# columns + two CHECKs on projection.stream_log; the `current_user = 'role_migration_owner'` arm on
+# stream_log_tenant_isolation and tenant_placements_tenant_isolation (tenant arm byte-identical to
+# the live expression); projection.retire_failed_ticket re-stated with an explicit installed-tenant
+# predicate (the owner arm would otherwise make it cross-tenant); two owner SECURITY DEFINER
+# functions, projection.claim_issued_tickets and projection.unplaced_issued_tickets, EXECUTE to
+# role_retrieval_worker only. No new table, no new role, no new table grant (role_retrieval_worker
+# already holds table-level UPDATE on stream_log since 0011), no DML.
+# §46 forward-fix (EXPAND_CONTRACT, first free number after 0175).
+
+migration_id = "0176_projection_ticket_leases"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('projection.stream_log') is not null
+ and to_regclass('projection.tenant_placements') is not null
+ -- the four columns do not exist yet (this is not a replay)
+ and not exists (select 1 from pg_attribute
+                  where attrelid = 'projection.stream_log'::regclass and not attisdropped
+                    and attname in ('lease_owner','lease_expires_at','attempts','next_attempt_at'))
+ and to_regprocedure('projection.claim_issued_tickets(text,text,text,text,text,double precision,bigint,bigint)') is null
+ and to_regprocedure('projection.unplaced_issued_tickets(text,text,text,text)') is null
+ -- 0167's door exists (it is re-stated here, not created)
+ and to_regprocedure('projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)') is not null
+ -- both policies are still the bare tenant form (no owner arm yet)
+ and (select pg_get_expr(polqual,polrelid) not like '%role_migration_owner%'
+        and pg_get_expr(polwithcheck,polrelid) not like '%role_migration_owner%'
+      from pg_policy where polrelid='projection.stream_log'::regclass
+        and polname='stream_log_tenant_isolation')
+ and (select pg_get_expr(polqual,polrelid) not like '%role_migration_owner%'
+        and pg_get_expr(polwithcheck,polrelid) not like '%role_migration_owner%'
+      from pg_policy where polrelid='projection.tenant_placements'::regclass
+        and polname='tenant_placements_tenant_isolation')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- the four columns with their exact types, nullability and default
+ (select count(*) = 4 from pg_attribute a
+   where a.attrelid = 'projection.stream_log'::regclass and not a.attisdropped
+     and ( (a.attname = 'lease_owner' and a.atttypid = 'text'::regtype and not a.attnotnull)
+        or (a.attname = 'lease_expires_at' and a.atttypid = 'timestamptz'::regtype and not a.attnotnull)
+        or (a.attname = 'attempts' and a.atttypid = 'int4'::regtype and a.attnotnull
+            and pg_get_expr((select d.adbin from pg_attrdef d where d.adrelid = a.attrelid
+                                and d.adnum = a.attnum), a.attrelid) = '0')
+        or (a.attname = 'next_attempt_at' and a.atttypid = 'timestamptz'::regtype and not a.attnotnull)))
+ and (select count(*) = 2 from pg_constraint
+       where conrelid = 'projection.stream_log'::regclass and contype = 'c'
+         and conname in ('stream_log_lease_pair','stream_log_attempts_nonneg'))
+ -- owner arm AND tenant arm on both legs of both policies
+ and (select pg_get_expr(polqual,polrelid) like '%role_migration_owner%'
+        and pg_get_expr(polqual,polrelid) like '%humaux.tenant_id%'
+        and pg_get_expr(polwithcheck,polrelid) like '%role_migration_owner%'
+        and pg_get_expr(polwithcheck,polrelid) like '%humaux.tenant_id%'
+      from pg_policy where polrelid='projection.stream_log'::regclass
+        and polname='stream_log_tenant_isolation')
+ and (select pg_get_expr(polqual,polrelid) like '%role_migration_owner%'
+        and pg_get_expr(polqual,polrelid) like '%humaux.tenant_id%'
+        and pg_get_expr(polwithcheck,polrelid) like '%role_migration_owner%'
+        and pg_get_expr(polwithcheck,polrelid) like '%humaux.tenant_id%'
+      from pg_policy where polrelid='projection.tenant_placements'::regclass
+        and polname='tenant_placements_tenant_isolation')
+ -- still exactly one permissive policy each, FORCE on
+ and (select count(*) = 1 from pg_policy where polrelid='projection.stream_log'::regclass and polpermissive)
+ and (select count(*) = 1 from pg_policy where polrelid='projection.tenant_placements'::regclass and polpermissive)
+ and (select bool_and(relrowsecurity and relforcerowsecurity) from pg_class
+       where oid in ('projection.stream_log'::regclass, 'projection.tenant_placements'::regclass))
+ -- both definers: owner, SECURITY DEFINER, pinned search_path
+ and (select count(*) = 2 from pg_proc
+       where oid in ('projection.claim_issued_tickets(text,text,text,text,text,double precision,bigint,bigint)'::regprocedure,
+                     'projection.unplaced_issued_tickets(text,text,text,text)'::regprocedure)
+         and pg_get_userbyid(proowner) = 'role_migration_owner' and prosecdef
+         and proconfig @> ARRAY['search_path=pg_catalog'])
+ -- EXECUTE: role_retrieval_worker and nobody else among the eight runtime roles
+ and (select bool_and(has_function_privilege(r, f, 'EXECUTE') = (r = 'role_retrieval_worker'))
+      from unnest(ARRAY['role_gateway','role_private_worker','role_consolidation_worker',
+                        'role_public_worker','role_retrieval_worker','role_batch_issuer',
+                        'role_maintenance','role_admin']) r,
+           unnest(ARRAY['projection.claim_issued_tickets(text,text,text,text,text,double precision,bigint,bigint)',
+                        'projection.unplaced_issued_tickets(text,text,text,text)']) f)
+ -- and not PUBLIC
+ and not exists (select 1 from pg_proc p,
+                 aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                 where p.oid in ('projection.claim_issued_tickets(text,text,text,text,text,double precision,bigint,bigint)'::regprocedure,
+                                 'projection.unplaced_issued_tickets(text,text,text,text)'::regprocedure)
+                   and x.grantee = 0 and x.privilege_type = 'EXECUTE')
+ -- the retirement door now carries the installed-tenant predicate, and its EXECUTE set is unchanged
+ and pg_get_functiondef('projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)'::regprocedure)
+       like '%humaux.tenant_id%'
+ and has_function_privilege('role_maintenance',
+       'projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)', 'EXECUTE')
+ and not has_function_privilege('role_retrieval_worker',
+       'projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)', 'EXECUTE')
+ -- no grant widened: role_private_worker stays column-limited, role_retrieval_worker keeps table UPDATE
+ and not has_column_privilege('role_private_worker', 'projection.stream_log', 'attempts', 'UPDATE')
+ and not has_column_privilege('role_private_worker', 'projection.stream_log', 'lease_owner', 'UPDATE')
+ and not has_column_privilege('role_private_worker', 'projection.stream_log', 'next_attempt_at', 'UPDATE')
+ and has_table_privilege('role_retrieval_worker', 'projection.stream_log', 'UPDATE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Reverting is: DROP FUNCTION projection.claim_issued_tickets(text,text,text,text,text,double precision,bigint,bigint) and projection.unplaced_issued_tickets(text,text,text,text); CREATE OR REPLACE projection.retire_failed_ticket with 0167's body; ALTER POLICY stream_log_tenant_isolation and tenant_placements_tenant_isolation back to the bare tenant predicate; ALTER TABLE projection.stream_log DROP CONSTRAINT stream_log_lease_pair, DROP CONSTRAINT stream_log_attempts_nonneg, DROP COLUMN lease_owner, lease_expires_at, attempts, next_attempt_at — all recoverable from this file and 0167. Reverting returns projection to the per-(tenant, workspace) --run-once driver; it widens no tenant's access."
+backup_restore_requirement = "none: metadata-only ADD COLUMN (constant defaults), two ALTER POLICY, one CREATE OR REPLACE of an existing function, two new functions and their grants; no row data touched."

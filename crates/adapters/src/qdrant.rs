@@ -3,7 +3,7 @@
 //!   services=[Qdrant(*)]; env=[]; modules=[domain::affect, domain::authority, domain::dataclass, domain::identity,
 //!   domain::ids, domain::memory, domain::subject, domain::ticket_family, infra-cell::permit, infra-cell::transport,
 //!   projection::card, projection::dense]
-//! Called-by: [adapters::placement_repo, adapters::projection_worker, adapters::public_projection, adapters::retrieve, gateway::recall, retrieval-worker::main, tests, xtask::e2e_seed, xtask::switch_visible]
+//! Called-by: [adapters::placement_repo, adapters::projection_worker, adapters::public_projection, adapters::retrieve, adapters::stream_repo, gateway::recall, retrieval-worker::main, tests, xtask::e2e_seed, xtask::switch_visible]
 //! Invariants: [every wire call takes &dyn IntraCellHttpTransport carrying a CellAccessPermit; Qdrant down ->
 //!   QdrantTransportError to the caller, no fallback search; tombstoned points are filtered by the overlay, never
 //!   counted as visible]
@@ -1038,6 +1038,22 @@ impl std::fmt::Display for QdrantTransportError {
 
 impl std::error::Error for QdrantTransportError {}
 
+impl QdrantTransportError {
+    /// ADR-0052 D-E: whether retrying the same request later can succeed. The projection worker
+    /// turns `true` into a bounded retry of the ticket and `false` into an immediate FAILED.
+    /// Transport failures (connect, DNS, timeout, an expired permit, a cell-registry refusal),
+    /// 5xx / 404 / 408 / 409 / 429 and a malformed 2xx body are transient; 400 / 422 (payload,
+    /// schema, vector dimension) and an invalid collection name or dense query are permanent — the
+    /// identical request would be refused again.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Transport(_) | Self::UnexpectedResponseShape(_) => true,
+            Self::NonSuccessStatus { status, .. } => !matches!(status, 400 | 422),
+            Self::InvalidCollectionName(_) | Self::InvalidDenseQuery(_) => false,
+        }
+    }
+}
+
 impl From<IntraCellError> for QdrantTransportError {
     fn from(e: IntraCellError) -> Self {
         Self::Transport(e)
@@ -1503,6 +1519,29 @@ pub async fn verify_visible_via_transport(
 #[cfg(test)]
 mod http_wiring_tests {
     use super::*;
+
+    /// ADR-0052 D-E: the Qdrant half of the transient/permanent table, row by row. Fault
+    /// injection: classify 400 as transient ⇒ red here, and the live permanent-fault rehearsal
+    /// step retries a dimension-mismatch upsert until `transient_exhausted` instead of failing it
+    /// `qdrant_upsert_rejected` on the first attempt.
+    #[test]
+    fn qdrant_error_is_transient_matches_the_adr_0052_table() {
+        let status = |status| QdrantTransportError::NonSuccessStatus { status, body: None };
+        for transient in [404, 408, 409, 429, 500, 502, 503, 504] {
+            assert!(status(transient).is_transient(), "HTTP {transient}");
+        }
+        for permanent in [400, 422] {
+            assert!(!status(permanent).is_transient(), "HTTP {permanent}");
+        }
+        assert!(QdrantTransportError::Transport(IntraCellError::ExpiredPermit).is_transient());
+        assert!(
+            QdrantTransportError::Transport(IntraCellError::RequestFailed("connect".into()))
+                .is_transient()
+        );
+        assert!(QdrantTransportError::UnexpectedResponseShape("x".into()).is_transient());
+        assert!(!QdrantTransportError::InvalidCollectionName("x".into()).is_transient());
+        assert!(!QdrantTransportError::InvalidDenseQuery("x".into()).is_transient());
+    }
 
     #[test]
     fn point_id_from_json_round_trips_both_wire_forms() {

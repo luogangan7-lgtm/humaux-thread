@@ -28,8 +28,6 @@ humaux-local-secret-scan = { path = "../../crates/local-secret-scan" }
 # refactor (query_embed_rpc card §6 resolution).
 # why: structured logs/spans; used-by: [retrieval-worker::rpc]
 tracing = "0.1.44"
-# why: projection cards/serving types for recall and ingest; used-by: [retrieval-worker::main]
-humaux-projection = { path = "../../crates/projection" }
 # ADR-0012 `rpc.rs`: `humaux_retrieval::request::{RetrievalIntent, build_request,
 # resolve_registered_retrieval_profile}` — sealing the RPC's raw query text needs the same
 # sole request constructor every other caller uses (§55.1), not a worker-local shortcut.

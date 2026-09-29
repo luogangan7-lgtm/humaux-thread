@@ -16,7 +16,7 @@ code drift apart. Look a variable up there rather than copying it here.
 | process | liveness | readiness | resident? |
 |---|---|---|---|
 | `humaux-gateway` | `GET /livez` → 200 | `GET /readyz` → 200 / 503 | yes (HTTP accept loop) |
-| `humaux-retrieval-worker` | process alive | `--readyz` exit 0 | `--serve-rpc` yes; `--run-once` no |
+| `humaux-retrieval-worker` | process alive | `--readyz` exit 0 | `--serve-rpc` yes; `--serve` yes (the projection runner, ADR-0052); `--run-once` no |
 | `humaux-private-worker` | process alive | `--readyz` exit 0 | `--serve-rpc` / `--distill-serve` yes |
 | `humaux-consolidation-worker` | process alive | `--readyz` exit 0 | `--serve` yes |
 | `humaux-public-worker` | process alive | `--readyz` exit 0 | no — one bounded pass per invocation |
@@ -60,13 +60,14 @@ that path, precisely so a `0` can never be manufactured downstream.
 |---|---|---|
 | `humaux-gateway` | always restart | ≥ **5 s drain window** + the longest request timeout |
 | `humaux-retrieval-worker --serve-rpc` | always restart | ≥ one embedding call |
+| `humaux-retrieval-worker --serve` | always restart | **≥ one projection pass** = `HUMAUX_RETRIEVAL_WORKER_BATCH` × worst-case ticket time (embed timeout + 3 × the 10 s Qdrant timeout + PG) |
 | `humaux-private-worker --serve-rpc` | always restart | ≥ one inference call |
 | `humaux-private-worker --distill-serve` | always restart | **≥ one distill pass** |
 | `humaux-consolidation-worker --serve` | always restart | **≥ one dispatch pass** |
 | `humaux-public-worker --run-once` | on-failure only; it is a scheduled one-shot, exit 0 is success | ≥ one outbox pass |
 
-The two bolded rows are the ones that matter. Both resident derived-layer workers observe the
-termination signal **only between passes**, on purpose: a pass settles every job it claimed
+The bolded rows are the ones that matter. The resident derived-layer workers and the projection
+runner observe the termination signal **only between passes**, on purpose: a pass settles every job it claimed
 before it returns (card 14 / ADR-0016 leases), so exiting between passes can never leave a job
 `PROCESSING` with a live lease that only expiry could free. Cancelling a pass mid-flight could.
 The cost is that shutdown latency is bounded by one pass, not by the signal —
@@ -74,6 +75,19 @@ The cost is that shutdown latency is bounded by one pass, not by the signal —
 SIGKILL is exactly the case the leases exist to survive** (the job stays `PROCESSING` until its
 lease expires, then another worker reclaims it). That is safe but slow; sizing the grace period
 correctly is what makes it fast.
+
+The projection runner (`--serve`, card 27 / ADR-0052) follows the same rule for its
+`projection.stream_log` ticket leases: a pass settles, retries (backoff) or releases every ticket
+it claimed before it returns. A SIGKILL leaves the batch leased for `HUMAUX_RETRIEVAL_WORKER_LEASE_SECS`,
+after which the restarted runner re-claims it (the claim's expired-lease arm). The lease is a
+liveness signal, not a time budget: while a pass runs, a background heartbeat renews EVERY family
+it claimed each `LEASE_SECS / 3` (and each ticket's family once more before it is processed), so
+the lease only has to outlast `LEASE_SECS / 3` plus one renew round — it is NOT tied to `BATCH` or
+to a ticket's worst case. (Before the 2026-09-29 review fix only the family in hand was renewed, so
+a batch slower than one lease lost its tail; "above one ticket's worst case" was the wrong rule.)
+`LEASE_SECS` is also how long a SIGKILLed batch waits before it is re-claimed. A database outage
+is not an exit: the runner logs `projection pass failed` and polls again, so the supervisor never
+crash-loops it against an unhealthy PostgreSQL.
 
 `humaux-public-worker` has no loop at all: its whole lifetime is one bounded pass. A signal
 during that pass is latched and logged, and the pass is allowed to settle its `ops.outbox` lease
@@ -111,8 +125,8 @@ becomes a connection-storm against the database that is already unhealthy.
 ## 4. Dependency start order
 
 ```
-PostgreSQL ──┬─> humaux-retrieval-worker --serve-rpc ──> humaux-gateway
-             │        (binds the query-embedding UDS)     (dials it)
+PostgreSQL ──┬─> humaux-retrieval-worker --serve-rpc ──> humaux-retrieval-worker --serve ──> humaux-gateway
+             │        (binds the query-embedding UDS)     (projection runner, ADR-0052)   (dials the UDS)
 Qdrant ──────┘
              ├─> humaux-private-worker --serve-rpc ─────> humaux-consolidation-worker --serve
              │        (binds the inference UDS)             (dials it)
@@ -126,10 +140,15 @@ Rules:
 2. **A UDS server starts before its client.** The gateway's semantic-recall path dials the
    retrieval worker's socket; the consolidation worker dials the private worker's socket. Start
    the server, wait for its `--readyz` to pass, then start the client.
-3. Order within the derived layer is otherwise free: the two derived workers discover work
+3. **The projection runner starts after `--serve-rpc` and before the gateway**, gated on its own
+   readiness: the process is alive AND `--readyz` (same PostgreSQL + Qdrant round trips) exits 0.
+   It holds no start-time tenant binding (no tenant, workspace or collection in its
+   environment); first activation of a (tenant, workspace) serving projection stays an operator
+   act (`cargo xtask projection-serve`, runbook §6) until card 28.
+4. Order within the derived layer is otherwise free: the two derived workers discover work
    cross-tenant through `ops.claim_derived_work` and hold no start-time tenant binding
    (ADR-0036).
-4. A supervisor that cannot express ordering can start everything at once and rely on restart:
+5. A supervisor that cannot express ordering can start everything at once and rely on restart:
    the client's first calls fail, the job's lease releases it, and the next pass succeeds. That
    is correct but noisy — prefer readiness-gated ordering.
 

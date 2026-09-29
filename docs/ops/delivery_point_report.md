@@ -489,6 +489,10 @@ counting two sides that agree only by absence, the §16.2 switch **refuses with
 While §69 is `NOT_DECLARED`, criterion ③ cannot be satisfied, so non-first promotions are
 refused. Unlock: a §69 unfreeze at ≥800 items with resolution ≤ 2.
 
+Since card 27 (ADR-0052) a transient projection failure no longer lands in `FAILED` — it is a
+bounded retry, and `FAILED` means a permanent class or `transient_exhausted` (§6.12) — so a
+`FAILED` pin on the §15.4 prefix now always names something an operator should look at.
+
 Related, and operator-visible: **RETIRED_FAILED tickets are permanently invisible to recall**
 (§15.2.1 — they were never indexed). This is a consequence of retirement, not loss of anything
 that was ever served.
@@ -604,6 +608,42 @@ not, and it withdraws the "ready for production" reading of §5.**
 - **`migration_rehearsal.rs:344` and `soak.rs:1366` (review P2, card 25).** Fixed under ADR-0051 D-L: manifest
   checks containing `;` outside comments/literals are refused at parse time and EXPLAIN goes over the extended
   protocol; the reused-pid defence matches the executable basename, not the full `ps` path.
+
+### 6.12 Closed by card 27 (ADR-0052)
+
+- **P1-1 is closed by card 27.** The projection hop now has a resident, tenant-free runner:
+  `humaux-retrieval-worker --serve` (runbook §5 step 3, supervision.md §4 rule 3) claims ISSUED
+  tickets across every placed tenant through the owner definer `projection.claim_issued_tickets`
+  (migration 0176). The rehearsal's per-tenant `--run-once` shell loop is deleted; the rehearsal
+  and the soak run the same single `--serve` process, with no tenant in its environment. First
+  activation of a (tenant, workspace) serving projection stays an operator act until card 28.
+- **C4 is closed: a transient projection failure is now a bounded retry.** Qdrant transport/5xx,
+  provider 429/5xx, PG connection/serialization/lock errors, a lost registry race and an
+  unconfirmed visibility probe return the ticket to `ISSUED` with exponential backoff
+  (`attempts`, `next_attempt_at`); after `HUMAUX_RETRIEVAL_WORKER_MAX_ATTEMPTS` it settles
+  `FAILED` `transient_exhausted`. `FAILED` now means **permanent** (`qdrant_upsert_rejected`,
+  `embedding_rejected`, `embedding_dimension_mismatch`, `card_unbuildable`, `secret_scan_rejected`, `registry_conflict`,
+  `distill_failed`, `no_visible_memory_record`, …) or `transient_exhausted` — it no longer means
+  "one Qdrant blip". A dashboard that counted `FAILED` as blips will see fewer rows and four new
+  classes (`qdrant_upsert_rejected`, `embedding_rejected`, `secret_scan_rejected`, `transient_exhausted`).
+  A **dependency outage** (Qdrant, the embedding provider including a quota/budget window, the
+  scanner, a PG connection) spends at most one attempt per ticket however long it lasts: while the
+  runner has seen no `DONE` since the first outage failure, further outage failures are uncharged
+  retries with backoff (`refunded=` on the pass line), so an outage longer than the backoff series
+  no longer exhausts every ticket written during it (review 2026-09-29).
+- **P1-15 and DM-7 are closed**: six hot-path indexes (0178–0183, built `CONCURRENTLY` through
+  `xtask migrate`'s new `transaction = "none"` manifest key) plus the claim's own (0177); the three
+  `private.context_bindings` presence CHECKs are validated (0184). The seven indexes are pinned in
+  the catalog (present, valid, exact definition) by `crates/adapters/tests/hot_path_indexes.rs` —
+  the EXPLAIN assertion alone caught only 2 of 6 dropped indexes at dev data sizes.
+- **Open for the main line:** the card's literal gate "all tickets DONE within 120 s" of the puts
+  is NOT met (put→DONE p95 143.9 s, max 146.1 s, n=60 — bounded by live distill, not projection);
+  the rehearsal grades `projection_lag_within_120s` and prints the literal as a `GATE-LITERAL` line.
+- **120 s line, main-line reading (ADR-0052 Measurements):** all tickets settled (60/60) and projection lag
+  p95 < 120 s (p95 3.0 s, n=60). Put->DONE p95 143.9 s / 169.6 s is owned by card 32 (distill throughput),
+  not by projection.
+- **Measurements** (n and unit per row, before/after plans): ADR-0052 §Measurements, from the
+  rehearsal step `projection_serve_multi_tenant`.
 
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 

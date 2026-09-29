@@ -28,6 +28,14 @@
 //!
 //! Upgrade path if a real DB binary ever runs under the floor: a skip ledger written by
 //! `skip_or_fail`, not a higher floor.
+//!
+//! Card 27 (2026-09-29): the fixed 0.05 s floor flagged `facet_contract` (4 real DB tests in
+//! 0.04 s) on a warm run, exactly the flake ADR-0050 predicted. The floor is now the SMALLER
+//! of the fixed floor and [`PER_TEST_FLOOR_SECS`] × passed: a skipped test costs microseconds,
+//! a real one at least one PostgreSQL round trip, so a binary whose passed tests average under
+//! 3 ms each did not reach its database. The fixed floor still bounds large binaries. A real
+//! single-test binary that finishes under 3 ms would still be flagged — the ledger stays the
+//! upgrade path for that case.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -38,6 +46,16 @@ use crate::dep_map::{self, Service};
 /// A DB-bound binary that passed tests faster than this did not touch a database. The
 /// fastest genuine DB binary on card 24 was `facet_contract` at 0.06 s.
 const FLOOR_SECS: f64 = 0.05;
+
+/// Per-passed-test floor (card 27): one PostgreSQL round trip is ≥ ~3 ms on the loopback dev
+/// cluster; a skipped test costs microseconds. The effective floor is
+/// `min(FLOOR_SECS, PER_TEST_FLOOR_SECS * passed)`.
+const PER_TEST_FLOOR_SECS: f64 = 0.003;
+
+/// The floor a binary with `passed` tests must exceed to count as having reached its database.
+fn floor_for(passed: u64) -> f64 {
+    FLOOR_SECS.min(PER_TEST_FLOOR_SECS * passed as f64)
+}
 
 /// One integration-test binary result: `(stem, passed, ignored, secs)`.
 type BinResult = (String, u64, u64, f64);
@@ -141,7 +159,7 @@ fn db_bound_stems(root: &Path) -> BTreeSet<String> {
 }
 
 fn is_fast_db_pass((stem, passed, _, secs): &BinResult, db_bound: &BTreeSet<String>) -> bool {
-    db_bound.contains(stem) && *passed > 0 && *secs < FLOOR_SECS
+    db_bound.contains(stem) && *passed > 0 && *secs < floor_for(*passed)
 }
 
 /// Fast passes of binaries whose default run is DB-bound — the whole-binary skip shape. The
@@ -183,6 +201,21 @@ mod tests {
         assert_eq!(results, vec![("provider_budget".to_string(), 15, 0, 0.0)]);
         let bad = offenders(&results, &set(&["provider_budget"]));
         assert_eq!(bad.len(), 1);
+    }
+
+    /// Card 27: `facet_contract` really ran 4 DB tests in 0.04 s on a warm run (under the fixed
+    /// 0.05 s floor) — a per-test floor keeps it green while a 4-test binary at 0.00 s stays red.
+    #[test]
+    fn gate_truth_per_test_floor_keeps_a_fast_genuine_small_binary_green() {
+        let real = parse_results(&block("facet_contract", 4, "0.04"));
+        assert!(offenders(&real, &set(&["facet_contract"])).is_empty());
+        let skipped = parse_results(&block("facet_contract", 4, "0.00"));
+        assert_eq!(offenders(&skipped, &set(&["facet_contract"])).len(), 1);
+        // The fixed floor still bounds large binaries: 40 tests in 0.04 s is 1 ms per test.
+        let big = parse_results(&block("g80_31_handoff", 40, "0.04"));
+        assert_eq!(offenders(&big, &set(&["g80_31_handoff"])).len(), 1);
+        assert!((floor_for(4) - 0.012).abs() < 1e-9);
+        assert!((floor_for(40) - 0.05).abs() < 1e-9);
     }
 
     #[test]

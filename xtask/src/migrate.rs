@@ -1,8 +1,10 @@
 //! `xtask::migrate` — applies migrations/*.sql in filename order against a live PostgreSQL instance (§46).
 //! Depends-on: crates=[humaux-testkit, postgres, toml]; services=[PostgreSQL(any) w=[ops.schema_migrations] x=[private.read_continuity_project_storage_v1]]; env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN]; modules=[xtask::migration_rehearsal]
 //! Called-by: [xtask::main, xtask::serial_lane]
-//! Invariants: [each PENDING migration runs in one explicit transaction (ADR-0050 D-D); DSN missing ⇒ not_applicable naming the missing object, never a silent skip; a second run is idempotent]
-//! Spec: Baseline §46; ADR-0050
+//! Invariants: [each PENDING migration runs in one explicit transaction (ADR-0050 D-D) unless its manifest says
+//!   transaction = "none" (only that value, only for a CONCURRENTLY body; ADR-0052 D-G); DSN missing ⇒ not_applicable
+//!   naming the missing object, never a silent skip; a second run is idempotent]
+//! Spec: Baseline §46; ADR-0050; ADR-0052
 //!
 //! xtask `migrate` — applies `migrations/*.sql` in filename order against a live PostgreSQL
 //! instance (§46 migration safety). DSN comes from `--dsn <url>` or `HUMAUX_TEST_PG_DSN`;
@@ -20,6 +22,17 @@
 //! check. A pending migration with no manifest is refused. Already-applied migrations are
 //! never re-checked (a precheck is false after apply by construction); their drift is the
 //! checksum's job.
+//!
+//! The one exception (ADR-0052 D-G, card 27): a manifest may say `transaction = "none"` — the only
+//! accepted value; anything else refuses the migration. Such a body must contain `CONCURRENTLY`
+//! outside `--` comments (so the key is not a way to escape atomicity for ordinary DDL), and runs
+//! precheck → body → postcheck → ledger row in autocommit, because `CREATE INDEX CONCURRENTLY` is
+//! illegal inside a transaction block. PostgreSQL itself refuses `CONCURRENTLY` in a
+//! multi-statement simple-query string (an implicit transaction block), so the one-statement rule
+//! is enforced by the server. Not atomic with the ledger: a failed build leaves an INVALID index
+//! that the rerun's precheck (`to_regclass(<name>) IS NULL`) refuses by name, and the manifest's
+//! `rollback_or_forward_fix` names the `DROP INDEX CONCURRENTLY IF EXISTS` that clears it. The key
+//! is read here from the manifest text (`toml`), so `migration_rehearsal::Manifest` is untouched.
 //!
 //! One migrator per database (ADR-0050 D-F, audit DM-6): the whole run holds the session-level
 //! advisory lock [`MIGRATE_ADVISORY_LOCK`] ("HXMIGRAT"), taken after `SET lock_timeout` and
@@ -99,6 +112,28 @@ struct PendingMigration {
     migration_id: String,
     sql: String,
     manifest: Option<Manifest>,
+    /// The manifest's raw `transaction` key (ADR-0052 D-G); `None` = the default one-transaction
+    /// apply. Validated by [`apply_locked`] before anything of that migration runs.
+    transaction: Option<String>,
+}
+
+/// ADR-0052 D-G: the manifest's `transaction` key as written — absent ⇒ `None`, a string ⇒ that
+/// string, any other TOML type ⇒ its rendering (so [`apply_locked`] refuses it by value).
+fn manifest_transaction(text: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(text).ok()?;
+    value.get("transaction").map(|v| match v {
+        toml::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    })
+}
+
+/// The body with `--` line comments removed, for the `CONCURRENTLY` rule: a comment that merely
+/// mentions the word must not qualify ordinary DDL for a transaction-less apply.
+fn body_without_line_comments(sql: &str) -> String {
+    sql.lines()
+        .map(|line| line.split_once("--").map_or(line, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Enumerates `migrations_dir/*.sql` sorted by filename (the numeric prefix is the ordering
@@ -125,21 +160,25 @@ fn collect_migrations(migrations_dir: &Path) -> Result<Vec<PendingMigration>, St
             let sql = fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             let manifest_path = path.with_extension("manifest.toml");
-            let manifest = match fs::read_to_string(&manifest_path) {
+            let (manifest, transaction) = match fs::read_to_string(&manifest_path) {
                 Ok(text) => {
                     let name = format!("{migration_id}.manifest.toml");
-                    Some(
-                        migration_rehearsal::parse_manifest(&name, &text)
-                            .map_err(|e| e.to_string())?,
+                    (
+                        Some(
+                            migration_rehearsal::parse_manifest(&name, &text)
+                                .map_err(|e| e.to_string())?,
+                        ),
+                        manifest_transaction(&text),
                     )
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
                 Err(e) => return Err(format!("cannot read {}: {e}", manifest_path.display())),
             };
             Ok(PendingMigration {
                 migration_id,
                 sql,
                 manifest,
+                transaction,
             })
         })
         .collect()
@@ -278,6 +317,22 @@ fn apply_locked(
                 m.migration_id
             ));
         };
+        let checksum = fnv1a_hex(m.sql.as_bytes());
+        match m.transaction.as_deref() {
+            None => {}
+            Some("none") => {
+                apply_outside_transaction(client, m, manifest, &checksum)?;
+                applied += 1;
+                continue;
+            }
+            Some(other) => {
+                return Err(format!(
+                    "{}: refused — manifest transaction = {other:?}; the only accepted value is \
+                     \"none\" (ADR-0052 D-G), 0 statements run",
+                    m.migration_id
+                ));
+            }
+        }
         // ADR-0050 D-D: precheck, body, postcheck and the ledger row commit together or not
         // at all. Dropping `tx` on any `?` below rolls everything back.
         let mut tx = client
@@ -287,7 +342,6 @@ fn apply_locked(
         tx.batch_execute(&m.sql)
             .map_err(|e| format!("{}: {}", m.migration_id, db_error_text(&e)))?;
         run_check(&mut tx, &m.migration_id, "postcheck", &manifest.postcheck)?;
-        let checksum = fnv1a_hex(m.sql.as_bytes());
         tx.execute(
             "INSERT INTO ops.schema_migrations (migration_id, checksum) VALUES ($1, $2)",
             &[&m.migration_id, &checksum],
@@ -306,6 +360,51 @@ fn apply_locked(
     }
 
     Ok((applied, skipped))
+}
+
+/// ADR-0052 D-G: a `transaction = "none"` migration — precheck, body, postcheck and the ledger row
+/// each in autocommit, because `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block.
+/// The body must contain `CONCURRENTLY` outside `--` comments or nothing runs. A failure after the
+/// body leaves what the body built (an INVALID index for a failed CIC) and no ledger row; the
+/// rerun's precheck refuses by name and the manifest names the `DROP INDEX CONCURRENTLY` fix.
+fn apply_outside_transaction(
+    client: &mut Client,
+    m: &PendingMigration,
+    manifest: &Manifest,
+    checksum: &str,
+) -> Result<(), String> {
+    if !body_without_line_comments(&m.sql)
+        .to_ascii_uppercase()
+        .contains("CONCURRENTLY")
+    {
+        return Err(format!(
+            "{}: refused — transaction = \"none\" requires a CONCURRENTLY body (ADR-0052 D-G); \
+             0 statements run",
+            m.migration_id
+        ));
+    }
+    eprintln!(
+        "migrate: mode  {} transaction=none (CONCURRENTLY, outside a transaction block)",
+        m.migration_id
+    );
+    run_check(client, &m.migration_id, "precheck", &manifest.precheck)?;
+    client
+        .batch_execute(&m.sql)
+        .map_err(|e| format!("{}: {}", m.migration_id, db_error_text(&e)))?;
+    run_check(client, &m.migration_id, "postcheck", &manifest.postcheck)?;
+    client
+        .execute(
+            "INSERT INTO ops.schema_migrations (migration_id, checksum) VALUES ($1, $2)",
+            &[&m.migration_id, &checksum],
+        )
+        .map_err(|e| {
+            format!(
+                "{}: cannot record in ops.schema_migrations: {e}",
+                m.migration_id
+            )
+        })?;
+    eprintln!("migrate: apply {} (transaction=none)", m.migration_id);
+    Ok(())
 }
 
 /// `cargo xtask migrate [--dsn <url>]` — three-state: `not_applicable` (no DSN configured,
@@ -400,6 +499,7 @@ mod tests {
             migration_id: id.to_string(),
             sql: sql.to_string(),
             manifest: Some(manifest(id, "select true", "select true")),
+            transaction: None,
         }
     }
 
@@ -745,6 +845,7 @@ mod tests {
                 exact.sql
             ),
             manifest: exact.manifest.clone(),
+            transaction: None,
         };
         let error = apply_all(&mut client, &[failed], LOCK_TIMEOUT)
             .expect_err("exact 0137 candidate must fail");
@@ -947,6 +1048,153 @@ mod tests {
              (SELECT 1 FROM ops.schema_migrations WHERE migration_id = '0001_c25_nomanifest')"
         ));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Writes `<stem>.sql` + a manifest carrying `transaction = <tx>` (ADR-0052 D-G).
+    fn write_migration_tx(dir: &Path, stem: &str, sql: &str, tx: &str) {
+        fs::write(dir.join(format!("{stem}.sql")), sql).unwrap();
+        fs::write(
+            dir.join(format!("{stem}.manifest.toml")),
+            format!(
+                "migration_id = \"{stem}\"\nclass = \"REVERSIBLE\"\ntransaction = {tx}\n\
+                 precheck = \"select true\"\npostcheck = \"select true\"\n\
+                 rollback_or_forward_fix = \"test\"\nbackup_restore_requirement = \"test\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// ADR-0052 D-G: a `transaction = "none"` file builds its CONCURRENTLY index outside any
+    /// transaction block, is recorded once, and is idempotent. Fault injection: the identical body
+    /// WITHOUT the key goes through the default transactional path and PostgreSQL refuses it
+    /// (25001), drift 0 — which is exactly why the key exists.
+    #[test]
+    fn migrate_applies_a_transaction_none_concurrent_index_outside_a_transaction() {
+        const TEST: &str =
+            "migrate_applies_a_transaction_none_concurrent_index_outside_a_transaction";
+        let Some((_db, dsn)) = throwaway(TEST, "migrate_txnone") else {
+            return;
+        };
+        // dep: PostgreSQL(any) — throwaway c25 database — transaction = "none" CIC apply.
+        let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
+        let dir = scratch_dir("txnone");
+        write_migration(
+            &dir,
+            "0001_c27_table",
+            "CREATE TABLE c27_t (id int, v int)",
+            Some(("select true", "select true")),
+        );
+        let cic = "-- one statement\nCREATE INDEX CONCURRENTLY c27_t_v_idx ON c27_t (v);";
+        // the fault first: same body, default (transactional) path
+        write_migration(
+            &dir,
+            "0002_c27_cic",
+            cic,
+            Some(("select true", "select true")),
+        );
+        let migrations = collect_migrations(&dir).expect("scratch dir");
+        let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+            .expect_err("CIC inside a transaction block must be refused by the server");
+        assert!(
+            err.contains("0002_c27_cic") && err.contains("25001"),
+            "{err}"
+        );
+        assert!(scalar_bool(
+            &mut client,
+            "SELECT to_regclass('c27_t_v_idx') IS NULL AND NOT EXISTS \
+             (SELECT 1 FROM ops.schema_migrations WHERE migration_id = '0002_c27_cic')"
+        ));
+        // the key: the same file now applies outside a transaction
+        write_migration_tx(&dir, "0002_c27_cic", cic, "\"none\"");
+        let migrations = collect_migrations(&dir).expect("scratch dir");
+        assert_eq!(migrations[1].transaction.as_deref(), Some("none"));
+        let (applied, skipped) =
+            apply_all(&mut client, &migrations, LOCK_TIMEOUT).expect("transaction=none applies");
+        assert_eq!((applied, skipped), (1, 1));
+        assert!(scalar_bool(
+            &mut client,
+            "SELECT coalesce((SELECT indisvalid FROM pg_index \
+                              WHERE indexrelid = to_regclass('c27_t_v_idx')), false) \
+             AND (SELECT count(*) = 1 FROM ops.schema_migrations WHERE migration_id = '0002_c27_cic')"
+        ));
+        assert_eq!(
+            apply_all(&mut client, &migrations, LOCK_TIMEOUT).expect("replay"),
+            (0, 2),
+            "a second run applies nothing"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0052 D-G: `transaction = "none"` is not a way to escape atomicity for ordinary DDL — a
+    /// body without CONCURRENTLY (outside comments) is refused before any statement runs.
+    #[test]
+    fn migrate_refuses_transaction_none_without_concurrently_with_drift_0() {
+        const TEST: &str = "migrate_refuses_transaction_none_without_concurrently_with_drift_0";
+        let Some((_db, dsn)) = throwaway(TEST, "migrate_txnone_plain") else {
+            return;
+        };
+        // dep: PostgreSQL(any) — throwaway c25 database — refusal of a non-CONCURRENTLY transaction = "none" body.
+        let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
+        let dir = scratch_dir("txnone_plain");
+        write_migration_tx(
+            &dir,
+            "0001_c27_plain",
+            "-- CONCURRENTLY only in a comment\nCREATE TABLE c27_plain (id int);",
+            "\"none\"",
+        );
+        let migrations = collect_migrations(&dir).expect("scratch dir");
+        let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+            .expect_err("a non-CONCURRENTLY transaction=none body is refused");
+        assert!(
+            err.contains("0001_c27_plain") && err.contains("requires a CONCURRENTLY body"),
+            "{err}"
+        );
+        assert!(scalar_bool(
+            &mut client,
+            "SELECT to_regclass('c27_plain') IS NULL AND NOT EXISTS \
+             (SELECT 1 FROM ops.schema_migrations WHERE migration_id = '0001_c27_plain')"
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0052 D-G: the only accepted `transaction` value is "none"; anything else (another
+    /// string, a boolean) refuses the migration with drift 0.
+    #[test]
+    fn migrate_refuses_an_unknown_transaction_value() {
+        const TEST: &str = "migrate_refuses_an_unknown_transaction_value";
+        let Some((_db, dsn)) = throwaway(TEST, "migrate_txunknown") else {
+            return;
+        };
+        // dep: PostgreSQL(any) — throwaway c25 database — refusal of an unknown transaction value.
+        let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
+        for (purpose, value) in [("auto", "\"auto\""), ("bool", "false")] {
+            let dir = scratch_dir(&format!("txunknown_{purpose}"));
+            let stem = format!("0001_c27_{purpose}");
+            write_migration_tx(
+                &dir,
+                &stem,
+                &format!(
+                    "CREATE INDEX CONCURRENTLY c27_{purpose}_idx ON ops.schema_migrations (checksum)"
+                ),
+                value,
+            );
+            let migrations = collect_migrations(&dir).expect("scratch dir");
+            let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+                .expect_err("an unknown transaction value is refused");
+            assert!(
+                err.contains(&stem) && err.contains("the only accepted value"),
+                "{purpose}: {err}"
+            );
+            let index = format!("{}.c27_{purpose}_idx", "ops");
+            assert!(scalar_bool(
+                &mut client,
+                &format!(
+                    "SELECT to_regclass('{index}') IS NULL AND NOT EXISTS \
+                     (SELECT 1 FROM ops.schema_migrations WHERE migration_id = '{stem}')"
+                )
+            ));
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     /// ADR-0050 D-F: while client A holds HXMIGRAT, client B's migrate refuses with 55P03 and

@@ -664,6 +664,49 @@ fn stream_log_error_class(
         .get(0)
 }
 
+fn stream_log_attempts(
+    handle: &mut Handle,
+    key: &(Uuid, &str, Uuid, &str, &str, &str),
+    stream_seq: i64,
+) -> i32 {
+    handle
+        .admin
+        .query_one(
+            "SELECT attempts FROM projection.stream_log \
+             WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND domain=$4 \
+               AND projection_kind=$5 AND projection_version=$6 AND stream_seq=$7",
+            &[&key.0, &key.1, &key.2, &key.3, &key.4, &key.5, &stream_seq],
+        )
+        .expect("stream_log row must exist")
+        .get(0)
+}
+
+/// Exact point count of the fixture's throwaway collection.
+fn collection_point_count(handle: &Handle) -> u64 {
+    let permit = authorize_cell_access(
+        &handle.registry,
+        IntraCellResource::QDRANT_REST,
+        Duration::from_secs(30),
+    )
+    .expect("count permit");
+    handle
+        .rt
+        .block_on(handle.transport.execute(
+            &permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
+            IntraCellRequest {
+                method: IntraCellMethod::Post,
+                path: format!("/collections/{}/points/count", handle.collection),
+                json_body: Some(serde_json::json!({ "exact": true })),
+                headers: Vec::new(),
+            },
+        ))
+        .expect("count succeeds")
+        .json_body
+        .and_then(|body| body["result"]["count"].as_u64())
+        .expect("count response carries result.count")
+}
+
 fn projection_highwater(handle: &mut Handle, key: &(Uuid, &str, Uuid, &str, &str, &str)) -> i64 {
     handle
         .admin
@@ -977,14 +1020,15 @@ fn dimension_mismatch_fails_before_reaching_qdrant() {
 }
 
 /// (5): the visibility probe reports the point as not (yet) observed after a successful upsert —
-/// must settle `FAILED` with `error_class = 'visibility_not_confirmed'` and must not advance the
-/// checkpoint past it, proving `finish_row` actually awaits/branches on
-/// `verify_visible_via_transport`'s result rather than unconditionally marking `Done` once the
-/// upsert call itself succeeds. Regression test for F1.
+/// ADR-0052 D-E: that is a retry, not a verdict. The row stays `ISSUED` with one attempt spent
+/// and `error_class = 'visibility_not_confirmed'`, and the checkpoint does not cross it, proving
+/// `finish_row` actually awaits/branches on `verify_visible_via_transport`'s result rather than
+/// unconditionally marking `Done` once the upsert call itself succeeds (F1). Before card 27 this
+/// settled `FAILED` for good (audit C4).
 #[test]
-fn unconfirmed_visibility_fails_row_and_blocks_checkpoint() {
+fn unconfirmed_visibility_retries_row_and_blocks_checkpoint() {
     run_db_fixture::<Fixture, _>(
-        "unconfirmed_visibility_fails_row_and_blocks_checkpoint",
+        "unconfirmed_visibility_retries_row_and_blocks_checkpoint",
         |mut handle| {
             let scope_id = Uuid::new_v4();
             let stream_seq = seed_memory(&mut handle, scope_id, "never visible memory");
@@ -1042,7 +1086,8 @@ fn unconfirmed_visibility_fails_row_and_blocks_checkpoint() {
                 .rt
                 .block_on(run_once(&deps, 10))
                 .expect("run_once succeeds even with an unconfirmed visibility probe");
-            assert_eq!(outcome.failed, 1);
+            assert_eq!(outcome.retried, 1, "{outcome:?}");
+            assert_eq!(outcome.failed, 0);
             assert_eq!(outcome.done, 0);
             assert_eq!(
                 outcome.projection_highwater, 0,
@@ -1057,7 +1102,8 @@ fn unconfirmed_visibility_fails_row_and_blocks_checkpoint() {
                 "PRIVATE_MEMORY",
                 "v1",
             );
-            assert_eq!(stream_log_state(&mut handle, &key, stream_seq), "FAILED");
+            assert_eq!(stream_log_state(&mut handle, &key, stream_seq), "ISSUED");
+            assert_eq!(stream_log_attempts(&mut handle, &key, stream_seq), 1);
             assert_eq!(
                 stream_log_error_class(&mut handle, &key, stream_seq),
                 Some("visibility_not_confirmed".to_owned())
@@ -1066,10 +1112,189 @@ fn unconfirmed_visibility_fails_row_and_blocks_checkpoint() {
     );
 }
 
+/// ADR-0052 D-E fixture: an embedder whose vectors are exactly as wide as the worker asks for —
+/// so the worker's own dimension check passes and the width reaches Qdrant, whose 4-d fixture
+/// collection refuses an 8-d point with HTTP 400.
+struct WideEmbedder;
+
+#[async_trait]
+impl CardEmbedder for WideEmbedder {
+    async fn embed_cards(
+        &self,
+        _tenant_id: TenantId,
+        dimension: u32,
+        cards: &[SealedRetrievalCard],
+        _memory_ids: &[Uuid],
+    ) -> Result<Vec<Vec<f32>>, ErrorCode> {
+        Ok(cards
+            .iter()
+            .map(|_| vec![0.25_f32; dimension as usize])
+            .collect())
+    }
+}
+
+/// ADR-0052 D-E: a permanent Qdrant refusal (HTTP 400, here a vector-width mismatch between the
+/// worker's configured dimension and the collection's) settles the ticket `FAILED`
+/// `qdrant_upsert_rejected` on the FIRST attempt — no retry budget spent on a request that can
+/// never succeed — and leaves no point and no registry row. Fault injection: classify 400 as
+/// transient in `QdrantTransportError::is_transient` ⇒ the row stays `ISSUED` and this is red.
+#[test]
+fn permanent_qdrant_400_fails_immediately_and_leaves_no_point() {
+    run_db_fixture::<Fixture, _>(
+        "permanent_qdrant_400_fails_immediately_and_leaves_no_point",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let stream_seq = seed_memory(&mut handle, scope_id, "eight wide vector");
+            let provider = Arc::new(TestDoubleProvider::new(
+                embedding_model(),
+                unused_rerank_model(),
+            ));
+            let mut deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
+            deps.embedder = Arc::new(WideEmbedder);
+            deps.dimension = 8;
+
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("run_once succeeds with a per-row Qdrant refusal");
+            assert_eq!((outcome.failed, outcome.retried, outcome.done), (1, 0, 0));
+            let key = (
+                handle.tenant_id,
+                "workspace",
+                scope_id,
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            );
+            assert_eq!(stream_log_state(&mut handle, &key, stream_seq), "FAILED");
+            assert_eq!(
+                stream_log_error_class(&mut handle, &key, stream_seq),
+                Some("qdrant_upsert_rejected".to_owned())
+            );
+            assert_eq!(stream_log_attempts(&mut handle, &key, stream_seq), 0);
+            let registered: i64 = handle
+                .admin
+                .query_one(
+                    "SELECT count(*) FROM projection.private_memory_points WHERE tenant_id = $1",
+                    &[&handle.tenant_id],
+                )
+                .expect("registry query")
+                .get(0);
+            assert_eq!(registered, 0, "a refused upsert registers nothing");
+            assert_eq!(collection_point_count(&handle), 0, "and leaves no point");
+        },
+    );
+}
+
+/// ADR-0052 D-E (b) fixture: forwards everything to the real transport, and right after the
+/// upsert PUT lands it moves the memory's `updated_at` — so the registration that follows sees
+/// the source changed (`SourceChanged`, D-A's race in miniature) and refuses to bind the point
+/// the upsert just wrote.
+struct SourceChangesAfterUpsert {
+    inner: Arc<HttpIntraCellTransport>,
+    admin_dsn: String,
+    memory_id: std::sync::Mutex<Option<Uuid>>,
+}
+
+#[async_trait]
+impl IntraCellHttpTransport for SourceChangesAfterUpsert {
+    async fn execute(
+        &self,
+        permit: &CellAccessPermit,
+        request: IntraCellRequest,
+    ) -> Result<IntraCellResponse, IntraCellError> {
+        let is_upsert = matches!(request.method, IntraCellMethod::Put)
+            && request.path.contains("/points")
+            && !request.path.contains("/points/");
+        let response = self.inner.execute(permit, request).await?;
+        let memory_id = *self.memory_id.lock().expect("fixture mutex");
+        if let (true, Some(memory_id)) = (is_upsert, memory_id) {
+            // A fresh OS thread: the sync client runs its own runtime, which it may not do on
+            // this async task's thread.
+            let dsn = self.admin_dsn.clone();
+            std::thread::spawn(move || {
+                // dep: PostgreSQL(any) — the fixture's owner client moves the source mid-row
+                let mut admin = Client::connect(&dsn, NoTls).expect("owner connects");
+                admin
+                    .execute(
+                        "UPDATE private.memory_records \
+                         SET updated_at = updated_at + interval '1 second' WHERE memory_id = $1",
+                        &[&memory_id],
+                    )
+                    .expect("move the source");
+            })
+            .join()
+            .expect("owner thread");
+        }
+        Ok(response)
+    }
+}
+
+/// ADR-0052 D-E (b): when the upsert landed but the registry refused the binding, `finish_row`
+/// deletes the point it just wrote — otherwise that point is live in Qdrant and bound to nothing,
+/// so no later retirement could ever find it. The refusal here (`SourceChanged`) is transient, so
+/// the ticket is retried (ISSUED, attempts 1, `registry_failed`). Fault injection: delete the
+/// compensating `delete_points` call ⇒ the collection keeps one orphan point and this is red.
+#[test]
+fn upsert_then_registry_refusal_deletes_the_orphan_point() {
+    run_db_fixture::<Fixture, _>(
+        "upsert_then_registry_refusal_deletes_the_orphan_point",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let (stream_seq, memory_id) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "source moves after upsert",
+                "TENANT_SHARED",
+                None,
+                None,
+            );
+            let admin_dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("fixture DSN");
+            let provider = Arc::new(TestDoubleProvider::new(
+                embedding_model(),
+                unused_rerank_model(),
+            ));
+            let mut deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
+            deps.transport = Arc::new(SourceChangesAfterUpsert {
+                inner: handle.transport.clone(),
+                admin_dsn,
+                memory_id: std::sync::Mutex::new(Some(memory_id)),
+            });
+
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("run_once succeeds with a refused registration");
+            assert_eq!((outcome.retried, outcome.failed, outcome.done), (1, 0, 0));
+            let key = (
+                handle.tenant_id,
+                "workspace",
+                scope_id,
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            );
+            assert_eq!(stream_log_state(&mut handle, &key, stream_seq), "ISSUED");
+            assert_eq!(stream_log_attempts(&mut handle, &key, stream_seq), 1);
+            assert_eq!(
+                stream_log_error_class(&mut handle, &key, stream_seq),
+                Some("registry_failed".to_owned())
+            );
+            assert_eq!(
+                collection_point_count(&handle),
+                0,
+                "the point the refused registration would have bound is deleted"
+            );
+        },
+    );
+}
+
 /// (3): a batch of two rows (seq 1, seq 2) where the embedder is forced to fail on the first
 /// call — since `run_once` processes ascending `stream_seq`, that is seq 1. §15.7: seq 1
 /// settles `FAILED`, seq 2 may settle `DONE`, but `projection_highwater` must stay at 0 (the
-/// prefix before the first gap), never cross the `FAILED` row.
+/// prefix before the first gap), never cross the `FAILED` row. The forced error is a PERMANENT
+/// one (`ProviderPermanent`): since ADR-0052 a transient provider error is a retry and the row
+/// would stay `ISSUED` (which blocks the prefix just the same, but is not what this test pins).
 #[test]
 fn failed_row_blocks_checkpoint_past_it() {
     run_db_fixture::<Fixture, _>("failed_row_blocks_checkpoint_past_it", |mut handle| {
@@ -1082,7 +1307,7 @@ fn failed_row_blocks_checkpoint_past_it() {
             embedding_model(),
             unused_rerank_model(),
         ));
-        provider.force_next_error(ErrorCode::ProviderTransient);
+        provider.force_next_error(ErrorCode::ProviderPermanent);
         let deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
 
         let outcome = handle
@@ -1105,6 +1330,10 @@ fn failed_row_blocks_checkpoint_past_it() {
             "v1",
         );
         assert_eq!(stream_log_state(&mut handle, &key, seq1), "FAILED");
+        assert_eq!(
+            stream_log_error_class(&mut handle, &key, seq1),
+            Some("embedding_rejected".to_owned())
+        );
         assert_eq!(stream_log_state(&mut handle, &key, seq2), "DONE");
         assert_eq!(
             projection_highwater(&mut handle, &key),

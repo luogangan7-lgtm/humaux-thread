@@ -1,7 +1,7 @@
 //! `adapters::tests::exact_completeness_eval` — exact_completeness eval harness (§55.3 benchset declaration for the
 //!   `exact_completeness` set; owner=Retrieval, Phase 6+).
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, humaux-retrieval, humaux-testkit, postgres,
-//!   serde_json, sha2, tokio, uuid]; services=[PostgreSQL(any) r=[control.retrieval_predicates, public.pool]
+//!   serde_json, sha2, tokio, uuid]; services=[PostgreSQL(any) r=[control.retrieval_predicates, ops.commit_seq_seq, public.pool]
 //!   w=[control.memberships, control.private_reasoning_domains, control.tenants, control.users,
 //!   control.workspace_memberships, control.workspaces, ops.outbox, private.events, private.evidence_objects,
 //!   private.memory_evidence, private.memory_records, projection.stream_log], PostgreSQL(role_gateway),
@@ -729,11 +729,20 @@ fn run_battery(
     }
     seed_rejection(f, ws_sup, false, sup_target);
 
+    // Card 27 (0178): `ops.outbox (tenant_id, commit_seq)` is UNIQUE, as the global
+    // `ops.commit_seq_seq` always made it in production. Every seeding of this fixture in one
+    // tenant (the second-system and repeat-run tests seed it more than once) therefore draws its
+    // own commit identities from one fresh sequence value instead of reusing 1..=12 / 700.
+    let commit_base: i64 = f
+        .admin
+        .query_one("SELECT nextval('ops.commit_seq_seq') * 1000", &[])
+        .expect("commit identity base")
+        .get(0);
     let ws_tour = new_workspace(f, &format!("tour-{run_tag}"));
     let real_key = tour_key(tenant_id, ws_tour);
     let mut tour: Vec<(Uuid, i64)> = Vec::new();
     for seq in 1..=12i64 {
-        let (m, _) = seed_tour_memory(f, ws_tour, &real_key, seq, seq, seq);
+        let (m, _) = seed_tour_memory(f, ws_tour, &real_key, seq, seq, commit_base + seq);
         tour.push((m, seq));
     }
     let tombstoned: Vec<(Uuid, i64)> = tour[..3].to_vec();
@@ -747,7 +756,7 @@ fn run_battery(
     // later must affect the row through commit_seq, not the mismatching stream_seq.
     let ws_commit = new_workspace(f, &format!("commit-{run_tag}"));
     let commit_key = tour_key(tenant_id, ws_commit);
-    let (commit_memory, _) = seed_tour_memory(f, ws_commit, &commit_key, 8, 9, 700);
+    let (commit_memory, _) = seed_tour_memory(f, ws_commit, &commit_key, 8, 9, commit_base + 700);
     let version_decoy = StreamKey::new(
         TenantId(tenant_id),
         "workspace",
@@ -761,7 +770,7 @@ fn run_battery(
             "INSERT INTO projection.stream_log \
                (tenant_id, scope_kind, scope_id, domain, projection_kind, projection_version, \
                 stream_seq, commit_seq, state, settled_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, 8, 700, 'TOMBSTONED', now())",
+             VALUES ($1, $2, $3, $4, $5, $6, 8, $7, 'TOMBSTONED', now())",
             &[
                 &f.tenant_id,
                 &version_decoy.scope_kind,
@@ -769,6 +778,7 @@ fn run_battery(
                 &version_decoy.domain,
                 &version_decoy.projection_kind,
                 &version_decoy.projection_version,
+                &(commit_base + 700),
             ],
         )
         .expect("insert cross-version tombstone decoy");
