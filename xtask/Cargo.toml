@@ -20,7 +20,7 @@ humaux-adapters = { path = "../crates/adapters" }
 # why: async runtime for the ops subcommands that call async adapters; used-by: [tests, xtask::confirm_sweep, xtask::e2e_seed, xtask::mechanism_registry, xtask::member, xtask::projection_serve, xtask::soak, xtask::switch_visible]
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # Parsing `cargo metadata` output for dependency-rule checks (§78.3) and gate reports.
-# why: parse cargo metadata / gate report JSON; used-by: [tests, xtask::architecture_check, xtask::e2e_seed, xtask::soak]
+# why: parse cargo metadata / gate report JSON; used-by: [tests, xtask::architecture_check, xtask::e2e_onboard, xtask::soak]
 serde_json = "1"
 # Phase 1: migration runner (migrate.rs) + live-DB enumerations (rls_check.rs, §48.2).
 # why: direct Postgres client for migrations, rehearsal and RLS/grant enumeration; used-by: [tests, xtask::confirm_sweep, xtask::dep_map, xtask::e2e_seed, xtask::migrate, xtask::migration_rehearsal, xtask::projection_serve, xtask::rls_check, xtask::serial_lane, xtask::soak, xtask::switch_visible]
@@ -44,8 +44,12 @@ humaux-domain = { path = "../crates/domain" }
 rand = "0.9"
 # e2e-seed.rs 追加2: Qdrant collection provisioning reuses the real IntraCellResource::QDRANT_REST
 # transport instead of a hand-rolled HTTP client (§83.4/ADR-0003 — Qdrant is same-Cell, not egress).
-# why: reuse the real IntraCellResource transport instead of a hand-rolled HTTP client; used-by: [xtask::e2e_seed, xtask::switch_visible]
+# why: reuse the real IntraCellResource transport instead of a hand-rolled HTTP client; used-by: [xtask::switch_visible]
 humaux-infra-cell = { path = "../crates/infra-cell" }
+
+# Card 28: the seed's entitlement period (now .. now + 1 h) for provisioning::onboard_tenant.
+# why: entitlement period timestamps for the onboarding library; used-by: [xtask::e2e_seed]
+time = "0.3"
 
 [dev-dependencies]
 # ADR-0050 D-D: the throwaway-DB migrate tests skip through `skip_or_fail(ExternalDep::Postgres)`

@@ -156,6 +156,7 @@ fn final_completeness_count() -> u64 {
         "count_scope_mismatch",
         "pipeline_count_mismatch",
         "mandatory_not_satisfied",
+        "no_serving_projection",
     ];
     [
         "exact",
@@ -10396,8 +10397,10 @@ fn percentile_p50(samples: &mut [Duration]) -> Duration {
 /// one here); pair C is another tenant. Interleaved concurrent requests for all three never
 /// bleed; a pair-A credential naming B's or C's workspace is `FORBIDDEN`; a same-tenant
 /// memory named under the wrong workspace is `NOT_FOUND`; a same-tenant workspace with
-/// membership but no serving projection is `DEPENDENCY_UNAVAILABLE` on all four routes (never
-/// a synthetic empty stream, ADR-0031 D-A); a body `tenant_id` is rejected by the closed
+/// membership but no initialised ledger key is `DEPENDENCY_UNAVAILABLE` on all four routes
+/// (never a synthetic empty stream, ADR-0031 D-A), and one with a checkpoint but no serving
+/// version is PG-served for get/enumerate and B-shaped for recall/context (ADR-0053 D-E); a
+/// body `tenant_id` is rejected by the closed
 /// schemas before dispatch; and the §34.0.1 receipt key pins to (tenant, principal,
 /// scope_kind, scope_id, operation, idempotency_key) — no `projection_version` — so pairs'
 /// replays never collide (ADR-0031 D-C, ADR-0032 D-C).
@@ -10433,13 +10436,34 @@ fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
                         with_workspace(&mut handle, b_workspace, |handle| {
                             seed_pair(handle, "pair B", "b", true)
                         });
-                    // Pair D: same tenant, real membership, but NO serving projection — the
-                    // unprovisioned control for the serving gate.
+                    // Pair D: same tenant, real membership, but NO checkpoint row at all — the
+                    // unprovisioned control (ADR-0053 D-E: an uninitialised ledger key).
                     let d_workspace = handle.seed_workspace();
                     let (pair_d, _d_point, _d_payload) =
                         with_workspace(&mut handle, d_workspace, |handle| {
                             seed_pair(handle, "pair D", "d", false)
                         });
+                    // Pair E (ADR-0053 D-E): same tenant, an initialised checkpoint row but NO
+                    // serving version — the onboarding PROVISIONING window / a LEGACY pair never
+                    // activated. get/enumerate serve from PostgreSQL; recall/context answer B.
+                    let e_workspace = handle.seed_workspace();
+                    let (pair_e, _e_point, _e_payload) = with_workspace(
+                        &mut handle,
+                        e_workspace,
+                        |handle| {
+                            let seeded = seed_pair(handle, "pair E", "e", false);
+                            handle
+                                .admin
+                                .execute(
+                                    "INSERT INTO projection.stream_checkpoints \
+                                       (tenant_id,scope_kind,scope_id,domain,projection_kind,projection_version,serving) \
+                                     VALUES($1,'workspace',$2,'knowledge','ingest','v1',false)",
+                                    &[&handle.tenant_id, &handle.workspace_id],
+                                )
+                                .expect("owner seeds pair E's unserved checkpoint");
+                            seeded
+                        },
+                    );
                     assert_eq!(pair_a.workspace_id, handle.workspace_id);
                     assert_ne!(pair_a.workspace_id, pair_b.workspace_id);
                     assert_ne!(handle.tenant_id, pair_c_handle.tenant_id);
@@ -10666,8 +10690,8 @@ fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
                             );
                             assert_memory_not_found(&response);
                         }
-                        // Pair D: membership and a real credential, but the family has no
-                        // serving projection — every route fails closed, none fabricates a
+                        // Pair D: membership and a real credential, but the ledger key was
+                        // never initialised — every route fails closed, none fabricates a
                         // complete ledger over the tenant's rows.
                         assert_pair_tool_errors(
                             "unprovisioned same-tenant pair D",
@@ -10681,6 +10705,47 @@ fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
                             .await,
                             "DEPENDENCY_UNAVAILABLE",
                         );
+                        // Pair E: initialised but unserved — get/enumerate are PG-served (its
+                        // own memory, never an `exact` census over an uncounted index), recall /
+                        // context are the B-shaped explicit read.
+                        let e_reads = pair_reads(
+                            address,
+                            &pair_e.bearer,
+                            pair_e.workspace_id,
+                            pair_e.memory_id,
+                            query,
+                        )
+                        .await;
+                        for (route, (status, response)) in PAIR_READ_ROUTES.iter().zip(&e_reads) {
+                            assert_eq!(*status, 200, "pair E {route}: {response}");
+                            let (tool, content) = match *route {
+                                "memory.get" | "memory.enumerate" => (ToolName::Memory, None),
+                                "context" => (ToolName::Context, Some("content")),
+                                _ => (ToolName::Recall, Some("")),
+                            };
+                            let value = assert_tool_response(response, tool);
+                            match (*route, content) {
+                                ("memory.get", _) => assert_eq!(
+                                    value["items"][0]["memory_id"],
+                                    pair_e.memory_id.to_string(),
+                                    "pair E get is PG-served: {response}"
+                                ),
+                                ("memory.enumerate", _) => assert_ne!(
+                                    value["content"]["completeness"]["class"], "exact",
+                                    "pair E enumerate never claims a complete census: {response}"
+                                ),
+                                (_, Some(pointer)) => {
+                                    let envelope =
+                                        if pointer.is_empty() { value } else { &value[pointer] };
+                                    assert_eq!(envelope["items"], json!([]), "pair E {route}");
+                                    assert_eq!(
+                                        envelope["completeness"]["reason"], "no_serving_projection",
+                                        "pair E {route}: {response}"
+                                    );
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
                         // A workspace outside the credential's membership on any route still
                         // fails closed (403).
                         let unprovisioned = Uuid::now_v7();

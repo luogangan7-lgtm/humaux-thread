@@ -3,7 +3,7 @@
 //!   services=[Qdrant(*)]; env=[]; modules=[domain::affect, domain::authority, domain::dataclass, domain::identity,
 //!   domain::ids, domain::memory, domain::subject, domain::ticket_family, infra-cell::permit, infra-cell::transport,
 //!   projection::card, projection::dense]
-//! Called-by: [adapters::placement_repo, adapters::projection_worker, adapters::public_projection, adapters::retrieve, adapters::stream_repo, gateway::recall, retrieval-worker::main, tests, xtask::e2e_seed, xtask::switch_visible]
+//! Called-by: [adapters::placement_repo, adapters::projection_worker, adapters::provisioning, adapters::public_projection, adapters::retrieve, adapters::stream_repo, gateway::recall, retrieval-worker::main, tests, xtask::switch_visible]
 //! Invariants: [every wire call takes &dyn IntraCellHttpTransport carrying a CellAccessPermit; Qdrant down ->
 //!   QdrantTransportError to the caller, no fallback search; tombstoned points are filtered by the overlay, never
 //!   counted as visible]
@@ -587,6 +587,33 @@ impl VisibleCountFilter {
                 field: "projection_version",
                 value: projection_version.to_string(),
             }],
+        )))
+    }
+
+    /// ADR-0053 D-D: the empty-activation probe of ONE workspace family — [`Self::new`] plus a
+    /// `workspace_id` term, because `build_dense_filter`'s TENANT_SHARED arm is tenant-wide and
+    /// would count another workspace's tenant-shared points (refusing every second workspace of
+    /// an active tenant).
+    pub fn family_probe(
+        scope: &AuthorizationScope,
+        workspace_id: WorkspaceId,
+        projection_version: &str,
+    ) -> Option<Self> {
+        if projection_version.is_empty() {
+            return None;
+        }
+        Some(Self(build_dense_filter(
+            scope,
+            &[
+                FieldMatch {
+                    field: "workspace_id",
+                    value: workspace_id.0.to_string(),
+                },
+                FieldMatch {
+                    field: "projection_version",
+                    value: projection_version.to_string(),
+                },
+            ],
         )))
     }
 }

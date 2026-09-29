@@ -1,0 +1,56 @@
+# §46.1 migration manifest. ADR-0053 D-C / D-D (card 28): the eight owner SECURITY DEFINER doors of
+# production onboarding — control.ensure_admission_tier, control.ensure_user, control.onboard_tenant,
+# control.onboard_workspace, control.issue_api_key, control.revoke_api_key,
+# projection.ensure_tenant_placement, projection.activate_empty_family. Each: owner
+# role_migration_owner, search_path pinned to pg_catalog, PUBLIC has no EXECUTE, role_maintenance
+# is the only non-owner role with EXECUTE. No table grant, no DML. §46 forward-fix
+# (EXPAND_CONTRACT, first free after 0185).
+
+migration_id = "0186_onboarding_definers"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('control.onboard_tenant(text,uuid,text,text,bigint,timestamptz,timestamptz,text,text,bigint,bigint,text[])') is null
+ and to_regprocedure('control.onboard_workspace(uuid,text,uuid,text[])') is null
+ and to_regprocedure('control.ensure_user(text,text)') is null
+ and to_regprocedure('control.ensure_admission_tier(text,text,uuid,text,bigint,bigint)') is null
+ and to_regprocedure('control.issue_api_key(uuid,uuid,uuid,text,bytea,text[])') is null
+ and to_regprocedure('control.revoke_api_key(uuid,text)') is null
+ and to_regprocedure('projection.ensure_tenant_placement(uuid,text,text)') is null
+ and to_regprocedure('projection.activate_empty_family(uuid,uuid,text,text,text,text,text,uuid,bigint,timestamptz)') is null
+ and to_regprocedure('control.set_workspace_membership(uuid,uuid,uuid,text,text)') is not null
+ and to_regclass('projection.family_activations') is not null
+ and exists (select 1 from pg_attribute where attrelid='control.workspaces'::regclass
+              and attname='lifecycle' and not attisdropped)
+ as precheck_ok
+"""
+
+postcheck = """
+select coalesce(bool_and(
+   pg_get_userbyid(p.proowner)='role_migration_owner' and p.prosecdef
+   and 'search_path=pg_catalog'=any(coalesce(p.proconfig,'{}'))
+   and has_function_privilege('role_maintenance',p.oid,'EXECUTE')
+   and not has_function_privilege('role_gateway',p.oid,'EXECUTE')
+   and not has_function_privilege('role_retrieval_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_private_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_consolidation_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_public_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_batch_issuer',p.oid,'EXECUTE')
+   and not has_function_privilege('role_admin',p.oid,'EXECUTE')
+   and not exists (select 1 from aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) x
+                    where x.grantee=0 and x.privilege_type='EXECUTE')),false)
+ and count(*)=8 as postcheck_ok
+from pg_proc p
+where p.oid in (
+  to_regprocedure('control.ensure_admission_tier(text,text,uuid,text,bigint,bigint)'),
+  to_regprocedure('control.ensure_user(text,text)'),
+  to_regprocedure('control.onboard_tenant(text,uuid,text,text,bigint,timestamptz,timestamptz,text,text,bigint,bigint,text[])'),
+  to_regprocedure('control.onboard_workspace(uuid,text,uuid,text[])'),
+  to_regprocedure('control.issue_api_key(uuid,uuid,uuid,text,bytea,text[])'),
+  to_regprocedure('control.revoke_api_key(uuid,text)'),
+  to_regprocedure('projection.ensure_tenant_placement(uuid,text,text)'),
+  to_regprocedure('projection.activate_empty_family(uuid,uuid,text,text,text,text,text,uuid,bigint,timestamptz)'))
+"""
+
+rollback_or_forward_fix = "DROP FUNCTION the eight definers. After that no non-owner path writes the onboarding tables (role_maintenance holds no table grant on them)."
+backup_restore_requirement = "none: functions only."

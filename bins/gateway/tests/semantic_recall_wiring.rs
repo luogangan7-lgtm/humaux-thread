@@ -824,12 +824,15 @@ fn wrong_dimension_vector_from_port_is_never_hydrated() {
             inner,
             calls: AtomicUsize::new(0),
         });
-        // A placement row must exist, or `recall::search` degrades at the placement step
-        // (before ever calling the embedding port) and the assertions below would pass
-        // vacuously without ever exercising the dimension guard this test targets.
+        // A placement row and a serving family must exist, or `recall::search` degrades at the
+        // placement step or (ADR-0053 D-E: the serving read now runs BEFORE the query embedding)
+        // at the family read — before ever calling the embedding port — and the assertions
+        // below would pass vacuously without ever exercising the dimension guard this test
+        // targets.
         let collection = format!("wiring_wrong_dim_{}", Uuid::now_v7().simple());
         let mut admin = handle.owner_client().expect("owner client for placement");
         seed_tenant_placement(&mut admin, handle.tenant_id, &collection);
+        seed_checkpoint(&mut admin, handle.tenant_id, handle.workspace_id);
 
         rt.block_on(async {
             let pool = Arc::new(

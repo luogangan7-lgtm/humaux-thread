@@ -1,7 +1,7 @@
 //! `protocol::edge` — H1: §73 Edge/Trusted-Proxy/IP Policy/ClientNetworkIdentity/API key/session/CSRF 中间件类型 （Phase 2
 //!   wave 实现；判据出处见 spec 家章）。
 //! Depends-on: crates=[hmac, sha2]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[]
-//! Called-by: [gateway::auth, gateway::bootstrap, gateway::guard, tests, xtask::e2e_seed]
+//! Called-by: [gateway::auth, gateway::bootstrap, gateway::guard, maintenance::main, tests, xtask::e2e_seed]
 //! Invariants: [no runtime env or service read; CARGO_MANIFEST_DIR is build-time (`env!`) in the unit tests only, to embed migration 0037 for the contract checks]
 //! Spec: §73; §73.2
 //!

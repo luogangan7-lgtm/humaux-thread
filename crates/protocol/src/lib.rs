@@ -1,7 +1,7 @@
 //! `humaux-protocol` — Humaux Thread workspace crate（布局见 §58）。
 //! Depends-on: crates=[]; services=[];
 //!   env=[]; modules=[]
-//! Called-by: [crate(humaux-gateway), crate(xtask)]
+//! Called-by: [crate(humaux-gateway), crate(humaux-maintenance), crate(xtask)]
 //! Invariants: []
 //! Spec: §58; §3; §78.3
 //!

@@ -1,6 +1,6 @@
 //! `humaux-adapters` — Humaux Thread workspace crate（布局见 §58）。
 //! Depends-on: crates=[]; services=[]; env=[]; modules=[]
-//! Called-by: [crate(humaux-admin), crate(humaux-consolidation-worker), crate(humaux-gateway), crate(humaux-private-worker), crate(humaux-public-worker), crate(humaux-retrieval-provider), crate(humaux-retrieval-worker), crate(xtask)]
+//! Called-by: [crate(humaux-admin), crate(humaux-consolidation-worker), crate(humaux-gateway), crate(humaux-maintenance), crate(humaux-private-worker), crate(humaux-public-worker), crate(humaux-retrieval-provider), crate(humaux-retrieval-worker), crate(xtask)]
 //! Invariants: [crate root only (module list); Domain/Application never import this crate's HTTP/SQL/Qdrant drivers
 //!   (§3/§78.3)]
 //! Spec: Baseline §3; §78.3
@@ -45,6 +45,7 @@ pub mod private_inference_rpc;
 pub mod private_projection_registry;
 pub mod projection_worker;
 pub mod provider_budget;
+pub mod provisioning;
 pub mod public_projection;
 pub mod public_provenance;
 pub mod public_repo;

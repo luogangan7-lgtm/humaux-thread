@@ -1,11 +1,13 @@
 //! `adapters::serving_repo` — §16.2 换代期读路由 SQL + §16.3 无裁量切换事务(T5.2/T5.3).
-//! Depends-on: crates=[humaux-domain, humaux-projection, sqlx]; services=[PostgreSQL(any)
+//! Depends-on: crates=[humaux-domain, humaux-projection, humaux-retrieval, sqlx]; services=[PostgreSQL(any)
 //!   r=[projection.processing_gaps] w=[projection.stream_checkpoints], PostgreSQL(role_gateway),
-//!   PostgreSQL(role_maintenance)]; env=[]; modules=[adapters::postgres, domain::identity, projection::serving]
-//! Called-by: [adapters::retrieve, tests, xtask::projection_serve]
+//!   PostgreSQL(role_maintenance)]; env=[]; modules=[adapters::context_repo, adapters::postgres, adapters::stream_repo,
+//!   domain::error, domain::identity, projection::serving, projection::stream, retrieval::completeness]
+//! Called-by: [adapters::retrieve, gateway::context, gateway::recall, tests, xtask::projection_serve]
 //! Invariants: [only fetches the numbers and performs the atomic serving switch UPDATE; the switch decision is
-//!   humaux_projection::serving's pure arithmetic; cross-tenant or unauthenticated calls are typed errors]
-//! Spec: Baseline §23.1; §69; §17; §55; §16.3; §16.2; §57.1; ADR-0006
+//!   humaux_projection::serving's pure arithmetic; cross-tenant or unauthenticated calls are typed errors;
+//!   family_read_state reads initialised/serving (and, unserved, the real ledger) in one RR READ ONLY snapshot]
+//! Spec: Baseline §23.1; §69; §17; §55; §16.3; §16.2; §57.1; ADR-0006; ADR-0053
 //!
 //! Pure arithmetic ([`humaux_projection::serving::evaluate_switch`], the "无裁量口" itself)
 //! lives in `humaux_projection::serving` (no IO, unit-tested there); this module only fetches
@@ -39,12 +41,17 @@
 
 use humaux_domain::identity::AuthorizationScope;
 use humaux_projection::serving::{
-    ContinuationVerdict, StreamFamily, SwitchCriteria, SwitchRejection, evaluate_switch,
+    ActivationEvidence, ContinuationVerdict, StreamFamily, SwitchCriteria, SwitchRejection,
+    evaluate_switch,
 };
+use humaux_projection::stream::StreamKey;
+use humaux_retrieval::completeness::LedgerClosure;
 use sqlx::Row;
 use sqlx::types::Uuid;
 
+use crate::context_repo::{self, StreamPipelineCounts};
 use crate::postgres::{MaintenanceDbPool, RuntimeDbPool};
+use crate::stream_repo;
 
 type Txn<'c> = sqlx::Transaction<'c, sqlx::Postgres>;
 
@@ -55,6 +62,8 @@ pub enum ServingRepoError {
     Db(sqlx::Error),
     CrossTenant,
     MissingAuthenticatedUser,
+    /// [`family_read_state`]'s §23.3④ pipeline read failed (its own typed code).
+    Pipeline(humaux_domain::error::ErrorCode),
 }
 
 impl From<sqlx::Error> for ServingRepoError {
@@ -71,6 +80,7 @@ impl std::fmt::Display for ServingRepoError {
             Self::MissingAuthenticatedUser => {
                 write!(f, "serving read requires an authenticated user")
             }
+            Self::Pipeline(code) => write!(f, "pipeline count read failed: {code:?}"),
         }
     }
 }
@@ -198,6 +208,76 @@ pub(crate) async fn serving_version_in_txn(
     .map_err(ServingRepoError::Db)
 }
 
+/// ADR-0053 D-E: what the PG-authoritative read routes need to know about one ledger key —
+/// whether the key was ever initialised (a checkpoint row exists) and which version of its
+/// family serves, if any.
+#[derive(Debug, Clone)]
+pub struct FamilyReadState {
+    /// A `projection.stream_checkpoints` row exists for the full six-column key. `false` means
+    /// the (tenant, workspace) pair was never provisioned: the routes stay
+    /// `DEPENDENCY_UNAVAILABLE`, never a synthetic empty stream (§15.4 reads 0 for a missing row).
+    pub initialized: bool,
+    /// §16.2's `serving = true` version of the key's family, `None` before its first activation.
+    pub serving: Option<String>,
+    /// Only when `initialized && serving.is_none()`: the key's real §15.4 ledger and §23.3④
+    /// pipeline counts from the same snapshot — what the B-shaped recall/context read reports
+    /// (never an invented 0).
+    pub unserved: Option<(LedgerClosure, StreamPipelineCounts)>,
+}
+
+/// ADR-0053 D-E: [`FamilyReadState`] for `key`, both facts read in one REPEATABLE READ, READ ONLY
+/// snapshot under `role_gateway` (table-level SELECT on `stream_checkpoints`, §6.2.2). Same
+/// cross-tenant / unauthenticated refusals as [`serving_version`].
+pub async fn family_read_state(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    key: &StreamKey,
+) -> Result<FamilyReadState, ServingRepoError> {
+    let family = StreamFamily::new(
+        key.tenant_id,
+        key.scope_kind.clone(),
+        key.scope_id,
+        key.domain.clone(),
+        key.projection_kind.clone(),
+    );
+    if authorization.tenant_id() != family.tenant_id {
+        return Err(ServingRepoError::CrossTenant);
+    }
+    // dep: PostgreSQL(role_gateway) — transaction entry for `family_read_state`
+    let mut txn = pool.pool().begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *txn)
+        .await?;
+    set_authorization_local(&mut txn, authorization).await?;
+    let initialized: bool = bind_family(
+        sqlx::query(&format!(
+            "SELECT EXISTS (SELECT 1 FROM projection.stream_checkpoints \
+             WHERE {FAMILY_WHERE} AND projection_version = $6) AS initialized"
+        )),
+        &family,
+    )
+    .bind(&key.projection_version)
+    .fetch_one(&mut *txn)
+    .await?
+    .try_get("initialized")?;
+    let serving = serving_version_in_txn(&mut txn, authorization, &family).await?;
+    let unserved = if initialized && serving.is_none() {
+        let ledger = stream_repo::close_ledger_in_txn(&mut txn, key).await?;
+        let pipeline = context_repo::stream_pipeline_counts_in_txn(&mut txn, key)
+            .await
+            .map_err(ServingRepoError::Pipeline)?;
+        Some((ledger, pipeline))
+    } else {
+        None
+    };
+    txn.commit().await?;
+    Ok(FamilyReadState {
+        initialized,
+        serving,
+        unserved,
+    })
+}
+
 /// Composes the single `bigint` key `pg_advisory_xact_lock` takes from a family's five
 /// identity columns — same columns as `FAMILY_WHERE`, joined with a prefix and separator that
 /// never collide with a `Uuid`'s hyphen-hex form or the closed-set identifiers
@@ -312,7 +392,7 @@ pub async fn switch_projection_version(
     };
 
     let criteria = SwitchCriteria {
-        visible_shadow: checked_shadow,
+        shadow: ActivationEvidence::VisibleThrough(checked_shadow),
         visible_serving: checked_serving,
         // ADR-0017: no serving row for this family ⇒ first activation of a projection version.
         first_activation: current_serving_version.is_none(),

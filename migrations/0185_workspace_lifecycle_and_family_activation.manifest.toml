@@ -1,0 +1,58 @@
+# §46.1 migration manifest. ADR-0053 (card 28): control.workspaces.lifecycle (LEGACY | PROVISIONING |
+# READY, default LEGACY so no existing row or fixture is gated) + the onboarded-name partial unique
+# index; control.tenants.onboarding_name + its unique index (the onboard idempotency key);
+# projection.family_activations (VerifiedEmpty receipt, FK to the checkpoint row, owner-owned,
+# FORCE RLS, role_maintenance SELECT only); the owner-owned SECURITY INVOKER write gate
+# projection.stream_checkpoints_workspace_write_gate() and its BEFORE UPDATE OF issued_highwater
+# trigger (SQLSTATE 55000 on a PROVISIONING workspace). ux_serving_one (0065) is reused as the
+# one-serving-version-per-family index. §46 forward-fix (EXPAND_CONTRACT, first free after 0184).
+
+migration_id = "0185_workspace_lifecycle_and_family_activation"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.workspaces') is not null
+ and to_regclass('control.tenants') is not null
+ and to_regclass('projection.stream_checkpoints') is not null
+ and not exists (select 1 from pg_attribute where attrelid='control.workspaces'::regclass
+                  and attname='lifecycle' and not attisdropped)
+ and not exists (select 1 from pg_attribute where attrelid='control.tenants'::regclass
+                  and attname='onboarding_name' and not attisdropped)
+ and to_regclass('projection.family_activations') is null
+ and to_regprocedure('projection.stream_checkpoints_workspace_write_gate()') is null
+ and exists (select 1 from pg_indexes where schemaname='projection' and indexname='ux_serving_one'
+              and indexdef ilike '%WHERE serving%')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ (select a.attnotnull and pg_get_expr(d.adbin,d.adrelid)='''LEGACY''::text'
+    from pg_attribute a join pg_attrdef d on d.adrelid=a.attrelid and d.adnum=a.attnum
+   where a.attrelid='control.workspaces'::regclass and a.attname='lifecycle' and not a.attisdropped)
+ and exists (select 1 from pg_constraint where conrelid='control.workspaces'::regclass
+              and conname='workspaces_lifecycle_known' and contype='c' and convalidated)
+ and exists (select 1 from pg_indexes where schemaname='control' and indexname='workspaces_onboarded_name_uniq'
+              and indexdef ilike '%UNIQUE%' and indexdef ilike '%LEGACY%')
+ and exists (select 1 from pg_indexes where schemaname='control' and indexname='tenants_onboarding_name_uniq'
+              and indexdef ilike '%UNIQUE%')
+ and (select relrowsecurity and relforcerowsecurity from pg_class
+       where oid='projection.family_activations'::regclass)
+ and pg_get_userbyid((select relowner from pg_class where oid='projection.family_activations'::regclass))='role_migration_owner'
+ and has_table_privilege('role_maintenance','projection.family_activations','SELECT')
+ and not has_table_privilege('role_maintenance','projection.family_activations','INSERT,UPDATE,DELETE')
+ and not has_table_privilege('role_retrieval_worker','projection.family_activations','SELECT,INSERT,UPDATE')
+ and not has_table_privilege('role_gateway','projection.family_activations','SELECT')
+ and exists (select 1 from pg_trigger t join pg_proc p on p.oid=t.tgfoid
+              where t.tgrelid='projection.stream_checkpoints'::regclass
+                and t.tgname='stream_checkpoints_workspace_write_gate' and not t.tgisinternal
+                and t.tgenabled='O' and not p.prosecdef
+                and pg_get_userbyid(p.proowner)='role_migration_owner'
+                and 'search_path=pg_catalog'=any(coalesce(p.proconfig,'{}'))
+                and p.prosrc like '%55000%')
+ and exists (select 1 from pg_indexes where schemaname='projection' and indexname='ux_serving_one')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "DROP TRIGGER stream_checkpoints_workspace_write_gate ON projection.stream_checkpoints, DROP FUNCTION projection.stream_checkpoints_workspace_write_gate(), DROP TABLE projection.family_activations, DROP INDEX control.workspaces_onboarded_name_uniq and control.tenants_onboarding_name_uniq, DROP COLUMN control.workspaces.lifecycle and control.tenants.onboarding_name. Drop 0186's definers first. A rollback loses only activation receipts."
+backup_restore_requirement = "none: the ADD COLUMNs are metadata-only with constant defaults, no row data is touched; functions, trigger, index and an empty table otherwise."

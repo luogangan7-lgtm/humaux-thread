@@ -8,7 +8,7 @@
 //!   adapters::read_materialize, adapters::serving_repo, adapters::stream_repo, domain::affect, domain::error,
 //!   domain::identity, domain::ids, domain::subject, infra-cell::permit, infra-cell::transport, projection::serving,
 //!   projection::stream, retrieval::completeness, retrieval::envelope]
-//! Called-by: [adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::read_materialize, adapters::remember, adapters::stream_repo, gateway::context, gateway::recall, tests, xtask::switch_visible]
+//! Called-by: [adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::read_materialize, adapters::remember, adapters::stream_repo, gateway::recall, tests, xtask::switch_visible]
 //! Invariants: [read-your-writes on role_gateway: an expired token, cross-tenant/workspace scope or a changed serving
 //!   projection is a typed RetrieveError, never a stale answer passed off as caught up]
 //! Spec: Baseline §6.2.3
@@ -980,6 +980,10 @@ async fn private_read_projection_selector_in_txn(
             ServingRepoError::Db(error) => RetrieveError::Db(error),
             ServingRepoError::CrossTenant => RetrieveError::CrossTenant,
             ServingRepoError::MissingAuthenticatedUser => RetrieveError::MissingAuthenticatedUser,
+            // Only `family_read_state` produces it; this path never reads pipeline counts.
+            ServingRepoError::Pipeline(_) => {
+                RetrieveError::Db(sqlx::Error::Protocol("pipeline count read".to_owned()))
+            }
         })
 }
 

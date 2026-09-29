@@ -1,7 +1,7 @@
 //! `application::auth` — H2: §74 注册/登录/重置/变更状态机（Argon2id+security epoch）（Phase 2 wave 实现；判据出处见 spec 家章）。
 //! Depends-on: crates=[argon2, hex, hmac, humaux-domain, rand, sha2]; services=[]; env=[]; modules=[domain::audit,
 //!   domain::error, domain::ids]
-//! Called-by: []
+//! Called-by: [adapters::provisioning]
 //! Invariants: []
 //! Spec: §74; §3; §78.3; §74.6
 //!

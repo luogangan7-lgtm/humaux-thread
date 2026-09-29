@@ -1,6 +1,6 @@
 //! `projection::serving` — §16.2 换代期读路由 identity + §16.3 无裁量切换判据 (T5.2/T5.3).
 //! Depends-on: crates=[humaux-domain, uuid]; services=[]; env=[]; modules=[domain::ids, projection::stream]
-//! Called-by: [adapters::context_repo, adapters::private_projection_registry, adapters::projection_worker, adapters::read_materialize, adapters::retrieve, adapters::serving_repo, gateway::context, gateway::memory, tests, xtask::projection_serve, xtask::soak, xtask::switch_visible]
+//! Called-by: [adapters::context_repo, adapters::private_projection_registry, adapters::projection_worker, adapters::provisioning, adapters::read_materialize, adapters::retrieve, adapters::serving_repo, gateway::context, gateway::memory, tests, xtask::projection_serve, xtask::soak, xtask::switch_visible]
 //! Invariants: [pure half of the serving switch: the three-criteria evaluator never reuses one query result for two
 //!   independent checks; the SQL and the role_maintenance-only UPDATE live in adapters::serving_repo]
 //! Spec: Baseline §6.2.2
@@ -91,6 +91,42 @@ pub enum ContinuationVerdict {
     CannotEstablish,
 }
 
+/// ADR-0053: an opaque physical-generation identity of the collection a family's points live
+/// in — `"<collection_name>@<sha256 hex of its canonical config subset>"`, taken by
+/// `adapters::provisioning` from `GET /collections/{c}`.
+// ponytail: a config digest stands in for a physical generation counter (a drop-and-recreate
+// with an identical config is not detected); card 37 replaces it with a
+// `tenant_placements.collection_generation` column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationId(pub String);
+
+/// ADR-0053 D-D: the evidence that a family has no input at all and that the physical index
+/// holds nothing for it — the only way a family that never received a write can be activated.
+/// Every field is a fact the DB layer or the probe produced, never a caller declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedEmpty {
+    /// The family's `issued_highwater`, read under the checkpoint row lock (§15.1 `expected`).
+    pub initialized_head: u64,
+    /// The collection generation the probe counted against (re-read before commit).
+    pub target_generation: GenerationId,
+    /// The probe's identity, recorded on the activation receipt.
+    pub probe_id: Uuid,
+    /// The probe's own count of points for the family in that generation. A criterion no input
+    /// can fail is not a criterion (§80.1), so the probe's number is judged here too.
+    pub probe_visible: u64,
+}
+
+/// §16.3 criterion ①'s evidence for the candidate (shadow) side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationEvidence {
+    /// §23.1②'s live `visible` count of the candidate version, tagged with the version it was
+    /// counted against (ADR-0040). `None` when the count could not be taken (§23.1②: never
+    /// backfilled).
+    VisibleThrough(Option<(String, u64)>),
+    /// ADR-0053: the family is empty and first-activated by onboarding.
+    VerifiedEmpty(VerifiedEmpty),
+}
+
 /// §16.3's three independently-taken inputs to [`evaluate_switch`]. None of these are computed
 /// by this module — that is the entire point of "无裁量口": the *inputs* come from real
 /// measurements (Qdrant `visible` counts per §23.1②, `projection.processing_gaps` per §15.1,
@@ -98,17 +134,13 @@ pub enum ContinuationVerdict {
 /// evaluator can't quietly accept a partial or substituted set.
 #[derive(Debug, Clone)]
 pub struct SwitchCriteria {
-    /// §23.1②'s `visible` value for the **shadow** side, tagged with the `projection_version`
-    /// it was counted against: Qdrant count filtered by `tenant + scope + projection_version =
-    /// <shadow version>`, minus the tombstone overlay. `None` when the index count could not
-    /// be taken (§23.1②: "索引 count 取不到时输出 `visible: null`" — the same rule applies
-    /// here, not only to the envelope; a missing count is never backfilled from another
-    /// number). The version tag is what lets [`evaluate_switch`] catch a caller that
-    /// (accidentally or not) counted the *same* `projection_version` on both sides — see
-    /// [`SwitchRejection::VisibleSameVersionDeclared`].
-    pub visible_shadow: Option<(String, u64)>,
-    /// Same computation as `visible_shadow`, filtered by `projection_version = <serving
-    /// version>` instead — the spec's own warning is that this and `visible_shadow` must
+    /// Criterion ①'s evidence for the candidate side — one of two mutually exclusive forms
+    /// (ADR-0053: an empty family cannot be read back, so "visible = Some(0)" is not
+    /// expressible; the empty form is its own type). See [`ActivationEvidence`].
+    pub shadow: ActivationEvidence,
+    /// Same computation as [`ActivationEvidence::VisibleThrough`], filtered by
+    /// `projection_version = <serving version>` instead — the spec's own warning is that this
+    /// and the shadow count must
     /// differ **only** in that one filter, taken at the same instant (§16.3, §23.1②); this
     /// type cannot enforce "same instant" across an IO boundary, but the version tag lets it
     /// refuse a declared-but-not-actually-distinct pair, and lets the DB-layer caller
@@ -154,6 +186,12 @@ pub enum SwitchRejection {
     VisibleVersionMismatch,
     /// `shadow.open_gaps != 0`.
     OpenGaps,
+    /// ADR-0053: [`ActivationEvidence::VerifiedEmpty`] offered for a family that already has
+    /// (or declared) a serving version — emptiness only ever proves a first activation.
+    EmptyEvidenceOffFirstActivation,
+    /// ADR-0053: [`ActivationEvidence::VerifiedEmpty`] whose `initialized_head` or
+    /// `probe_visible` is not zero.
+    EmptyEvidenceNotEmpty,
     /// The §69 Continuation Gate did not return `Pass` (§16.3's判据③: `Fail` proves
     /// degradation; `Inconclusive` / `CannotEstablish` are both "not proven not-worse" and per
     /// §69 must not be read as a pass — see [`ContinuationVerdict`]'s doc).
@@ -176,7 +214,7 @@ pub enum SwitchRejection {
 /// fields rather than a pre-reduced `bool`.
 ///
 /// **G80-28 status (honest, not "已过")**: the test below injects the shortfall by mutating
-/// `SwitchCriteria.visible_shadow` directly, one layer below where the real defect could occur
+/// `SwitchCriteria.shadow` (its `VisibleThrough` count) directly, one layer below where the real defect could occur
 /// (a `count()` query built without a `projection_version` filter). It is a genuine positive
 /// control for *this* pure function, but it cannot catch a future `visible` implementation
 /// that ignores the filter and still happens to return equal numbers by construction — G80-28
@@ -186,19 +224,36 @@ pub enum SwitchRejection {
 pub fn evaluate_switch(criteria: &SwitchCriteria) -> Result<(), Vec<SwitchRejection>> {
     let mut rejections = Vec::new();
 
-    match (&criteria.visible_shadow, &criteria.visible_serving) {
-        (Some(_), None) if criteria.first_activation => {}
-        (Some((shadow_version, _)), Some((serving_version, _)))
-            if shadow_version == serving_version =>
-        {
-            // §23.1②/§16.3: a genuine comparison requires two *different* versions. Equal
-            // counts here would always agree with themselves — the 恒真闸 shape — so this is
-            // rejected before the counts are even looked at.
-            rejections.push(SwitchRejection::VisibleSameVersionDeclared);
+    match &criteria.shadow {
+        ActivationEvidence::VerifiedEmpty(empty) => {
+            // ADR-0053 D-D: only the family's FIRST activation may rest on emptiness — once a
+            // version serves, "empty" says nothing about the next version (R-28: no re-switch
+            // after the first batch).
+            if !criteria.first_activation || criteria.visible_serving.is_some() {
+                rejections.push(SwitchRejection::EmptyEvidenceOffFirstActivation);
+            }
+            // The DB-derived expected and the probe's own count must both be zero.
+            if empty.initialized_head != 0 || empty.probe_visible != 0 {
+                rejections.push(SwitchRejection::EmptyEvidenceNotEmpty);
+            }
         }
-        (Some((_, shadow_count)), Some((_, serving_count))) if shadow_count == serving_count => {}
-        (Some(_), Some(_)) => rejections.push(SwitchRejection::VisibleMismatch),
-        _ => rejections.push(SwitchRejection::VisibleUnavailable),
+        ActivationEvidence::VisibleThrough(visible_shadow) => {
+            match (visible_shadow, &criteria.visible_serving) {
+                (Some(_), None) if criteria.first_activation => {}
+                (Some((shadow_version, _)), Some((serving_version, _)))
+                    if shadow_version == serving_version =>
+                {
+                    // §23.1②/§16.3: a genuine comparison requires two *different* versions.
+                    // Equal counts here would always agree with themselves — the 恒真闸 shape —
+                    // so this is rejected before the counts are even looked at.
+                    rejections.push(SwitchRejection::VisibleSameVersionDeclared);
+                }
+                (Some((_, shadow_count)), Some((_, serving_count)))
+                    if shadow_count == serving_count => {}
+                (Some(_), Some(_)) => rejections.push(SwitchRejection::VisibleMismatch),
+                _ => rejections.push(SwitchRejection::VisibleUnavailable),
+            }
+        }
     }
 
     if criteria.shadow_open_gaps != 0 {
@@ -254,12 +309,141 @@ mod tests {
 
     fn all_true() -> SwitchCriteria {
         SwitchCriteria {
-            visible_shadow: Some(("v2".to_string(), 10)),
+            shadow: ActivationEvidence::VisibleThrough(Some(("v2".to_string(), 10))),
             visible_serving: Some(("v1".to_string(), 10)),
             first_activation: false,
             shadow_open_gaps: 0,
             continuation: ContinuationVerdict::Pass,
         }
+    }
+
+    /// ADR-0053: a VerifiedEmpty first activation — no serving version, head 0, probe 0.
+    fn verified_empty() -> SwitchCriteria {
+        SwitchCriteria {
+            shadow: ActivationEvidence::VerifiedEmpty(VerifiedEmpty {
+                initialized_head: 0,
+                target_generation: GenerationId("c@0f".to_string()),
+                probe_id: Uuid::now_v7(),
+                probe_visible: 0,
+            }),
+            visible_serving: None,
+            first_activation: true,
+            shadow_open_gaps: 0,
+            continuation: ContinuationVerdict::CannotEstablish,
+        }
+    }
+
+    fn with_empty(mut c: SwitchCriteria, f: impl FnOnce(&mut VerifiedEmpty)) -> SwitchCriteria {
+        if let ActivationEvidence::VerifiedEmpty(empty) = &mut c.shadow {
+            f(empty);
+        }
+        c
+    }
+
+    #[test]
+    fn verified_empty_is_accepted_on_first_activation_with_zero_head_and_zero_probe() {
+        assert_eq!(evaluate_switch(&verified_empty()), Ok(()));
+    }
+
+    /// Fault injection: accept VerifiedEmpty regardless of `first_activation` ⇒ this goes red.
+    #[test]
+    fn verified_empty_off_first_activation_is_refused() {
+        let c = SwitchCriteria {
+            first_activation: false,
+            ..verified_empty()
+        };
+        assert_eq!(
+            evaluate_switch(&c),
+            Err(vec![
+                SwitchRejection::EmptyEvidenceOffFirstActivation,
+                SwitchRejection::BenchmarkNotPass
+            ])
+        );
+    }
+
+    #[test]
+    fn verified_empty_with_nonzero_initialized_head_is_refused() {
+        let c = with_empty(verified_empty(), |e| e.initialized_head = 1);
+        assert_eq!(
+            evaluate_switch(&c),
+            Err(vec![SwitchRejection::EmptyEvidenceNotEmpty])
+        );
+    }
+
+    #[test]
+    fn verified_empty_with_nonzero_probe_visible_is_refused() {
+        let c = with_empty(verified_empty(), |e| e.probe_visible = 1);
+        assert_eq!(
+            evaluate_switch(&c),
+            Err(vec![SwitchRejection::EmptyEvidenceNotEmpty])
+        );
+    }
+
+    #[test]
+    fn verified_empty_still_refuses_open_gaps() {
+        let c = SwitchCriteria {
+            shadow_open_gaps: 1,
+            ..verified_empty()
+        };
+        assert_eq!(evaluate_switch(&c), Err(vec![SwitchRejection::OpenGaps]));
+    }
+
+    /// A serving count next to VerifiedEmpty means a serving version exists: never a first
+    /// activation, whatever the caller claims.
+    #[test]
+    fn verified_empty_with_a_serving_count_is_refused() {
+        let c = SwitchCriteria {
+            visible_serving: Some(("v1".to_string(), 0)),
+            ..verified_empty()
+        };
+        assert_eq!(
+            evaluate_switch(&c),
+            Err(vec![SwitchRejection::EmptyEvidenceOffFirstActivation])
+        );
+    }
+
+    /// The pre-ADR-0053 first-activation rules, restated on the enum: a VisibleThrough read-back
+    /// without a serving version holds; no read-back or open gaps refuse; a proven benchmark
+    /// `Fail` refuses; everything off the first-activation path still needs a count pair.
+    #[test]
+    fn visible_through_first_activation_behaviour_is_unchanged() {
+        let first = SwitchCriteria {
+            visible_serving: None,
+            first_activation: true,
+            continuation: ContinuationVerdict::CannotEstablish,
+            ..all_true()
+        };
+        assert_eq!(evaluate_switch(&first), Ok(()));
+        let no_read_back = SwitchCriteria {
+            shadow: ActivationEvidence::VisibleThrough(None),
+            ..first.clone()
+        };
+        assert_eq!(
+            evaluate_switch(&no_read_back),
+            Err(vec![SwitchRejection::VisibleUnavailable])
+        );
+        let gaps = SwitchCriteria {
+            shadow_open_gaps: 2,
+            ..first.clone()
+        };
+        assert_eq!(evaluate_switch(&gaps), Err(vec![SwitchRejection::OpenGaps]));
+        let proven_worse = SwitchCriteria {
+            continuation: ContinuationVerdict::Fail,
+            ..first.clone()
+        };
+        assert_eq!(
+            evaluate_switch(&proven_worse),
+            Err(vec![SwitchRejection::BenchmarkNotPass])
+        );
+        let not_first = SwitchCriteria {
+            first_activation: false,
+            ..first
+        };
+        assert!(
+            evaluate_switch(&not_first)
+                .unwrap_err()
+                .contains(&SwitchRejection::VisibleUnavailable)
+        );
     }
 
     #[test]
@@ -275,7 +459,7 @@ mod tests {
     #[test]
     fn first_activation_still_needs_the_shadow_read_back_and_no_open_gaps() {
         let no_shadow = SwitchCriteria {
-            visible_shadow: None,
+            shadow: ActivationEvidence::VisibleThrough(None),
             visible_serving: None,
             first_activation: true,
             ..all_true()
@@ -340,8 +524,11 @@ mod tests {
         );
 
         let mut injected = baseline.clone();
-        let (version, count) = baseline.visible_shadow.unwrap();
-        injected.visible_shadow = Some((version, count - 1));
+        let ActivationEvidence::VisibleThrough(Some((version, count))) = baseline.shadow.clone()
+        else {
+            unreachable!("all_true() carries a VisibleThrough count")
+        };
+        injected.shadow = ActivationEvidence::VisibleThrough(Some((version, count - 1)));
 
         let result = evaluate_switch(&injected);
         assert_ne!(
@@ -360,7 +547,7 @@ mod tests {
     #[test]
     fn evaluate_switch_rejects_when_both_sides_declare_the_same_version() {
         let c = SwitchCriteria {
-            visible_shadow: Some(("v1".to_string(), 10)),
+            shadow: ActivationEvidence::VisibleThrough(Some(("v1".to_string(), 10))),
             visible_serving: Some(("v1".to_string(), 10)),
             first_activation: false,
             shadow_open_gaps: 0,
@@ -377,7 +564,7 @@ mod tests {
     #[test]
     fn evaluate_switch_rejects_when_visible_unavailable_on_either_side() {
         let mut c = all_true();
-        c.visible_shadow = None;
+        c.shadow = ActivationEvidence::VisibleThrough(None);
         assert_eq!(
             evaluate_switch(&c),
             Err(vec![SwitchRejection::VisibleUnavailable])
@@ -403,7 +590,7 @@ mod tests {
     fn a_taken_visible_count_clears_visible_unavailable_and_a_missing_one_restores_it() {
         // A real promotion: candidate `v2` counted against serving `v1`, equal.
         let taken = SwitchCriteria {
-            visible_shadow: Some(("v2".to_string(), 100)),
+            shadow: ActivationEvidence::VisibleThrough(Some(("v2".to_string(), 100))),
             visible_serving: Some(("v1".to_string(), 100)),
             first_activation: false,
             shadow_open_gaps: 0,
@@ -430,7 +617,7 @@ mod tests {
         // Either side missing on a non-first activation is still a refusal, both directions.
         for missing in [
             SwitchCriteria {
-                visible_shadow: None,
+                shadow: ActivationEvidence::VisibleThrough(None),
                 ..taken.clone()
             },
             SwitchCriteria {
@@ -558,7 +745,7 @@ mod tests {
     #[test]
     fn evaluate_switch_reports_every_failing_criterion_at_once() {
         let c = SwitchCriteria {
-            visible_shadow: Some(("v2".to_string(), 9)),
+            shadow: ActivationEvidence::VisibleThrough(Some(("v2".to_string(), 9))),
             visible_serving: Some(("v1".to_string(), 10)),
             first_activation: false,
             shadow_open_gaps: 3,

@@ -66,7 +66,8 @@ fn db_error(error: sqlx::Error) -> ErrorCode {
         sqlx::Error::Database(ref database) => match database.code().as_deref() {
             Some("42501") => ErrorCode::Forbidden,
             Some("23503") => ErrorCode::TenantBoundary,
-            Some("23505" | "40001" | "40P01" | "55P03") => ErrorCode::Conflict,
+            // 55000: the ADR-0053 PROVISIONING write gate (a definite, rolled-back refusal).
+            Some("23505" | "40001" | "40P01" | "55P03" | "55000") => ErrorCode::Conflict,
             Some("22023" | "22P02" | "22003") => ErrorCode::InvalidInput,
             _ => ErrorCode::Internal,
         },

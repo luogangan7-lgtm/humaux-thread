@@ -8,8 +8,7 @@
 //!   x=[projection.claim_issued_tickets, projection.unplaced_issued_tickets]]; env=[HUMAUX_TEST_PG_DSN];
 //!   modules=[adapters::placement_repo, adapters::postgres, adapters::qdrant, adapters::retrieve, domain::egress,
 //!   projection::stream, retrieval::completeness]
-//! Called-by: [adapters::context_repo, adapters::projection_worker, adapters::retrieve, retrieval-worker::main, tests,
-//!   xtask::projection_serve]
+//! Called-by: [adapters::context_repo, adapters::projection_worker, adapters::retrieve, adapters::serving_repo, retrieval-worker::main, tests, xtask::projection_serve]
 //! Invariants: [every function opens its own transaction and sets humaux.tenant_id before touching FORCE-RLS stream
 //!   tables (otherwise it would silently see zero rows) — except the two ADR-0052 definer calls, which are the only
 //!   cross-tenant reads/claims of stream_log; every settle/retry/release write is fenced on (lease_owner, attempts), so

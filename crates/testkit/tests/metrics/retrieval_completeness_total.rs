@@ -170,6 +170,7 @@ fn final_labels(
         Some(CannotEstablishReasonWire::CountScopeMismatch) => "count_scope_mismatch",
         Some(CannotEstablishReasonWire::PipelineCountMismatch) => "pipeline_count_mismatch",
         Some(CannotEstablishReasonWire::MandatoryNotSatisfied) => "mandatory_not_satisfied",
+        Some(CannotEstablishReasonWire::NoServingProjection) => "no_serving_projection",
     };
     (class, reason)
 }

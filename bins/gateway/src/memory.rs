@@ -185,7 +185,7 @@ pub(crate) async fn get<T>(
             &pool,
             &authorization,
             &stream,
-            Some(serving_version.as_str()),
+            serving_version.as_deref(),
             &materialized.ledger,
         )
         .await;
@@ -298,7 +298,7 @@ pub(crate) async fn enumerate<T>(
             &pool,
             &authorization,
             &stream,
-            Some(serving_version.as_str()),
+            serving_version.as_deref(),
             &page.memory.ledger,
         )
         .await;
@@ -776,24 +776,37 @@ pub(crate) async fn write_binding(
 /// workspace (`Forbidden` outside the credential's set — the guard's `credential.authorize`
 /// already narrowed on the wire path, so this `narrow` is defense in depth for in-process
 /// callers, not the load-bearing gate), then derive the stream per request from the
-/// credential's tenant + that workspace and admit it only if that family has a `serving`
-/// projection (`ContextBootstrap::provisioned_request_stream`, ADR-0031 D-A / §16.2). The
-/// bootstrap stream's tenant/workspace are not compared against the request here — one
-/// process serves every provisioned pair; an unprovisioned one is `DEPENDENCY_UNAVAILABLE`
-/// from that serving read, and an invisible object stays `NOT_FOUND`.
+/// credential's tenant + that workspace and admit it only if its ledger key was initialised
+/// (`ContextBootstrap::provisioned_request_stream`, ADR-0031 D-A / ADR-0053 D-E). The routes
+/// are PostgreSQL-authoritative and do not need a serving version (it only scopes the §23.1②
+/// visible count). The bootstrap stream's tenant/workspace are not compared against the
+/// request here — one process serves every provisioned pair; an uninitialised one is
+/// `DEPENDENCY_UNAVAILABLE`, and an invisible object stays `NOT_FOUND`.
 async fn read_scope(
     pool: &RuntimeDbPool,
     authorization: AuthorizationScope,
     requested_workspace: Option<WorkspaceId>,
     bootstrap: &ContextBootstrap,
-) -> Result<(AuthorizationScope, Scope, StreamFamily, StreamKey, String), ErrorCode> {
+) -> Result<
+    (
+        AuthorizationScope,
+        Scope,
+        StreamFamily,
+        StreamKey,
+        Option<String>,
+    ),
+    ErrorCode,
+> {
     let workspace = requested_workspace.ok_or(ErrorCode::DependencyUnavailable)?;
     let authorization = authorization.narrow(workspace)?;
-    // The third element is §16.2's `serving = true` version — §23.1②'s visible count is scoped
-    // to it, not to the ledger key's process-configured version.
-    let (family, stream, serving_version) = bootstrap
+    // The last element is §16.2's `serving = true` version (ADR-0053 D-E: `None` before the
+    // family's first activation — these routes serve from PostgreSQL regardless, and the
+    // visible count is then `null`). §23.1②'s count is scoped to it, not to the ledger key's
+    // process-configured version.
+    let (family, stream, state) = bootstrap
         .provisioned_request_stream(pool, &authorization, workspace)
         .await?;
+    let serving_version = state.serving;
     let scope = Scope {
         tenant_id: authorization.tenant_id(),
         user_id: authorization.user_id(),

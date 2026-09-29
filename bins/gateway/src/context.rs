@@ -1,9 +1,6 @@
 //! `gateway::context` — Authenticated Context result: stable handoff diagnostics plus same-snapshot bodies.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, humaux-retrieval, serde, serde_json, sha2,
-//!   uuid]; services=[]; env=[]; modules=[adapters::context_repo, adapters::postgres, adapters::read_materialize,
-//!   adapters::retrieve, domain::context, domain::error, domain::identity, domain::ids, gateway::recall,
-//!   gateway::remember, projection::serving, projection::stream, retrieval::compiler, retrieval::completeness,
-//!   retrieval::envelope, retrieval::handoff, retrieval::request]
+//!   uuid]; services=[]; env=[]; modules=[adapters::context_repo, adapters::postgres, adapters::read_materialize, adapters::serving_repo, domain::context, domain::error, domain::identity, domain::ids, gateway::recall, gateway::remember, projection::serving, projection::stream, retrieval::compiler, retrieval::completeness, retrieval::envelope, retrieval::handoff, retrieval::request]
 //! Called-by: [gateway::bootstrap, gateway::mcp_application, gateway::memory, gateway::recall, tests]
 //! Invariants: [every field in a returned Context is read from the same snapshot; a partial read never yields a body silently missing a section]
 //! Spec: Baseline §22.0; §23.1; §25; ADR-0024; ADR-0031
@@ -18,7 +15,7 @@ use humaux_adapters::{
     context_repo::{MaterializedContext, assemble_materialized},
     postgres::RuntimeDbPool,
     read_materialize::MaterializedItem,
-    retrieve::private_read_projection_selector,
+    serving_repo::{FamilyReadState, family_read_state},
 };
 use humaux_domain::{
     context::ContextBudget,
@@ -34,6 +31,7 @@ use humaux_retrieval::{
         CompletenessBlock, CompletenessInputs, Envelope, FreshnessBlock, LaneStatus,
         MandatoryReport, PendingEnvelope, PinnedReport, PipelineBlock, ProfileBlock,
         ProvenanceBlock, ProvenanceValue, build_projection_block, envelope_outcome_block,
+        no_serving_projection_envelope,
     },
     handoff::Handoff,
     request::{RegisteredRetrievalProfile, RetrievalIntent, RetrievalRequest, build_request},
@@ -125,31 +123,33 @@ impl ContextBootstrap {
         (family, key)
     }
 
-    /// [`Self::request_stream`] admitted through §16.2's read routing: the derived family must
-    /// have a `serving` projection (`private_read_projection_selector`, the same lookup
-    /// `recall.search` already runs) or the pair is unprovisioned and the read fails closed with
-    /// `DependencyUnavailable` — never a synthetic empty stream whose ledger closes "complete"
-    /// because no `stream_checkpoints` row exists for it (§15.4 reads 0 for a missing row).
-    /// This is the one PG round trip the derivation adds, and it is the existing serving read
-    /// ADR-0031 D-A names, not a new lookup. The ledger key keeps the process-configured
-    /// `projection_version` (Q9 ruling); the serving value only proves the pair exists.
+    /// [`Self::request_stream`] admitted through the ledger key's initialisation (ADR-0053 D-E):
+    /// the derived key must have a `projection.stream_checkpoints` row or the pair is
+    /// unprovisioned and the read fails closed with `DependencyUnavailable` — never a synthetic
+    /// empty stream whose ledger closes "complete" because no row exists for it (§15.4 reads 0
+    /// for a missing row). The family's `serving` version rides along as an `Option`: the
+    /// PG-authoritative routes serve without it (the visible count is then `null`), and
+    /// recall/context answer the B-shaped read when it is absent. One REPEATABLE READ round
+    /// trip (`serving_repo::family_read_state`). The ledger key keeps the process-configured
+    /// `projection_version` (Q9 ruling).
     pub(crate) async fn provisioned_request_stream(
         &self,
         pool: &RuntimeDbPool,
         authorization: &AuthorizationScope,
         workspace: WorkspaceId,
-    ) -> Result<(StreamFamily, StreamKey, String), ErrorCode> {
+    ) -> Result<(StreamFamily, StreamKey, FamilyReadState), ErrorCode> {
         let (family, key) = self.request_stream(authorization.tenant_id(), workspace);
         // The serving version is returned, not discarded: §23.1②'s visible count must be scoped
         // to the family's `serving = true` version (§16.2), which is a different string from the
         // ledger key's process-configured `projection_version` whenever a shadow backfill is mid
-        // switch. Counting against the ledger key's version there would count a face this
-        // response never read.
-        let serving = private_read_projection_selector(pool, authorization, &family)
+        // switch.
+        let state = family_read_state(pool, authorization, &key)
             .await
-            .map_err(|_| ErrorCode::DependencyUnavailable)?
-            .ok_or(ErrorCode::DependencyUnavailable)?;
-        Ok((family, key, serving))
+            .map_err(|_| ErrorCode::DependencyUnavailable)?;
+        if !state.initialized {
+            return Err(ErrorCode::DependencyUnavailable);
+        }
+        Ok((family, key, state))
     }
 }
 
@@ -198,9 +198,10 @@ fn executable_fingerprint() -> Result<String, ErrorCode> {
 /// Reads the stream derived from the credential's tenant and the requested workspace
 /// (`ContextBootstrap::provisioned_request_stream`, ADR-0031 D-A). A workspace outside the
 /// credential's membership is `Forbidden` (the guard's `credential.authorize` already
-/// narrowed; the `narrow` here is defense in depth for in-process callers); a pair without a
-/// serving projection is `DependencyUnavailable`, never a synthetic empty stream; a client
-/// cannot select a version or broaden authorization.
+/// narrowed; the `narrow` here is defense in depth for in-process callers); an uninitialised
+/// pair is `DependencyUnavailable`, never a synthetic empty stream; an initialised pair without
+/// a serving version answers the ADR-0053 B-shaped read; a client cannot select a version or
+/// broaden authorization.
 pub async fn assemble<T>(
     pool: impl Into<Arc<RuntimeDbPool>>,
     authorization: AuthorizationScope,
@@ -212,7 +213,7 @@ pub async fn assemble<T>(
     let workspace = requested_workspace.ok_or(ErrorCode::DependencyUnavailable)?;
     let authorization = authorization.narrow(workspace)?;
     let pool = pool.into();
-    let (family, stream, serving_version) = bootstrap
+    let (family, stream, state) = bootstrap
         .provisioned_request_stream(&pool, &authorization, workspace)
         .await?;
     let scope = Scope {
@@ -240,12 +241,28 @@ pub async fn assemble<T>(
         &stream,
     )
     .await?;
+    // ADR-0053 D-E: an initialised key whose family has no serving version answers the
+    // B-shaped explicit read (same snapshot's handoff, no items), never DEPENDENCY_UNAVAILABLE.
+    if let (None, Some((ledger, pipeline))) = (&state.serving, &state.unserved) {
+        eprintln!("humaux-gateway: context no_serving_projection");
+        let (evidence, knowledge) = pipeline.blocks();
+        let handoff = materialized.handoff;
+        return no_serving_projection_envelope(
+            &request,
+            &bootstrap.binary_build,
+            vec!["mandatory".to_owned(), "pinned".to_owned()],
+            ledger,
+            evidence,
+            knowledge,
+            |content| accept(ContextResult { handoff, content }),
+        );
+    }
     let visible = bootstrap
         .visible_index_count(
             &pool,
             &authorization,
             &stream,
-            Some(serving_version.as_str()),
+            state.serving.as_deref(),
             &materialized.ledger,
         )
         .await;

@@ -439,6 +439,8 @@ pub enum CannotEstablishReasonWire {
     /// §25.3 (card 22c)：Mandatory lane 跑完了但没带回它有义务带回的全部内容
     /// （`handoff.counts.mandatory_missing > 0`）。
     MandatoryNotSatisfied,
+    /// ADR-0053 D-E：账本已初始化但该 family 尚无 serving version。
+    NoServingProjection,
 }
 
 impl CannotEstablishReasonWire {
@@ -465,6 +467,7 @@ impl CannotEstablishReasonWire {
             "count_scope_mismatch" => Some(Self::CountScopeMismatch),
             "pipeline_count_mismatch" => Some(Self::PipelineCountMismatch),
             "mandatory_not_satisfied" => Some(Self::MandatoryNotSatisfied),
+            "no_serving_projection" => Some(Self::NoServingProjection),
             // 到不了：`wire_labels` 是闭集。真到了说明有人加了 reason 变体却没加这里，
             // 那时 `None` 会让新 reason 在 JSON 上静默消失——所以 panic 而不是 None。
             other => unreachable!("未登记的 reason 线值: {other}"),
@@ -1064,6 +1067,81 @@ pub enum PinnedReport {
         /// 实际进入 Context 几条。
         returned: u64,
     },
+}
+
+// ============================================================================
+// ADR-0053 D-E — the B-shaped explicit read of an unactivated family
+// ============================================================================
+
+/// ADR-0053 D-E: the one success envelope for `recall.search` / `context.assemble` on a family
+/// whose ledger key is initialised but which has no serving version — `items: []`,
+/// `completeness = cannot_establish / no_serving_projection` with lane `semantic: failed`,
+/// `projection.visible = null` and `current = false` (from the real ledger through
+/// [`build_projection_block`], never invented), `provenance.projection_version =
+/// cannot_establish`, `embedding_model_id = not_applicable`, freshness `unknown`.
+///
+/// It bypasses [`envelope_outcome_block`] on purpose: that path refuses a `cannot_establish`
+/// provenance (G23-6), and this read's provenance is exactly that. The class it records on
+/// [`PendingEnvelope::finish`] is the one it serialises. B is a protocol state for the optional
+/// semantic lanes only — the PG-authoritative routes (`memory.get` / `memory.enumerate`) never
+/// use it (R-28: never get → NOT_FOUND, never enumerate → a complete empty set).
+pub fn no_serving_projection_envelope<I, T>(
+    request: &RetrievalRequest,
+    binary_build: &str,
+    profile_lanes: Vec<String>,
+    ledger: &LedgerClosure,
+    evidence: EvidenceBlock,
+    knowledge: KnowledgeBlock,
+    accept: impl FnOnce(Envelope<I>) -> Result<T, humaux_domain::error::ErrorCode>,
+) -> Result<PendingEnvelope<T>, humaux_domain::error::ErrorCode> {
+    let class = CompletenessClass::CannotEstablish {
+        reason: CannotEstablishReason::NoServingProjection,
+    };
+    let projection = build_projection_block(ledger, None);
+    let envelope = Envelope {
+        items: Vec::new(),
+        pipeline: PipelineBlock {
+            evidence,
+            knowledge,
+            projection: projection.value,
+        },
+        completeness: CompletenessBlock {
+            class: CompletenessClassWire::from(class),
+            reason: CannotEstablishReasonWire::from_class(class),
+            exact: None,
+            known_lower_bound: None,
+            lanes: BTreeMap::from([("semantic".to_owned(), LaneStatus::Failed)]),
+            candidate_count: 0,
+            reranked_count: 0,
+            returned: 0,
+            truncated: false,
+            degradations: Vec::new(),
+        },
+        provenance: ProvenanceBlock {
+            binary_build: binary_build.to_owned(),
+            projection_version: ProvenanceValue::CannotEstablish {},
+            embedding_model_id: ProvenanceValue::NotApplicable {},
+            rerank_model_id: ProvenanceValue::NotApplicable {},
+            card_builder_version: ProvenanceValue::NotApplicable {},
+            profile_fingerprint: request.profile_fingerprint_identity().clone(),
+            profile: ProfileBlock {
+                top_k: request.top_k(),
+                cand_k: request.cand_k(),
+                cand_k_formula: request.cand_k_formula(),
+                lanes: profile_lanes,
+            },
+        },
+        freshness: FreshnessBlock {
+            class: FreshnessClass::Unknown,
+            latest_evidence_at: None,
+            state_age_seconds: None,
+        },
+        grounding: GroundingBlock::tally(std::iter::empty()),
+        mandatory: MandatoryReport::NotRun,
+        pinned: PinnedReport::NotRun,
+    };
+    let value = accept(envelope)?;
+    Ok(PendingEnvelope { value, class })
 }
 
 // ============================================================================

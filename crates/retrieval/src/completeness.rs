@@ -2,7 +2,7 @@
 //!   `classify()` sole constructors (§22.4 / §22.5 / §59).
 //! Depends-on: crates=[humaux-domain, serde]; services=[];
 //!   env=[]; modules=[domain::context, domain::ledger, retrieval::envelope, retrieval::planner]
-//! Called-by: [adapters::context_repo, adapters::exact_census, adapters::retrieve, adapters::stream_repo, gateway::context, gateway::memory, gateway::recall, retrieval::envelope, retrieval::signals, tests]
+//! Called-by: [adapters::context_repo, adapters::exact_census, adapters::retrieve, adapters::serving_repo, adapters::stream_repo, gateway::context, gateway::memory, gateway::recall, retrieval::envelope, retrieval::signals, tests]
 //! Invariants: []
 //! Spec: §22.4; §22.5; §59; §41.2; §25.3; §78.2
 //!
@@ -159,6 +159,12 @@ pub(crate) enum CannotEstablishReason {
     /// silently truncate Mandatory ([`Self::MandatoryContextOverflow`]); this is the same
     /// refusal for the "lane ran and came back short" shape, which overflow cannot express.
     MandatoryNotSatisfied,
+    /// ADR-0053 D-E: the family's ledger key is initialised but no version of the family
+    /// serves yet (the onboarding PROVISIONING window, or a LEGACY pair never activated) —
+    /// the semantic lane has no index face to read. Produced only by
+    /// [`crate::envelope::no_serving_projection_envelope`] (recall/context, the optional
+    /// lanes); never mapped to get → NOT_FOUND or enumerate → a complete empty set.
+    NoServingProjection,
 }
 
 /// §25.5 的唯一映射：Mandatory Context 溢出 ⇒ `cannot_establish`。
@@ -193,6 +199,7 @@ impl CannotEstablishReason {
             Self::CountScopeMismatch => "count_scope_mismatch",
             Self::PipelineCountMismatch => "pipeline_count_mismatch",
             Self::MandatoryNotSatisfied => "mandatory_not_satisfied",
+            Self::NoServingProjection => "no_serving_projection",
         }
     }
 }
@@ -582,7 +589,7 @@ impl CompletenessTotal {
         "semantic_bounded",
         "cannot_establish",
     ];
-    const REASONS: [&'static str; 12] = [
+    const REASONS: [&'static str; 13] = [
         "none",
         "ledger_not_closed",
         "predicate_not_enumerable",
@@ -595,6 +602,7 @@ impl CompletenessTotal {
         "count_scope_mismatch",
         "pipeline_count_mismatch",
         "mandatory_not_satisfied",
+        "no_serving_projection",
     ];
     const CELLS: usize = Self::CLASSES.len() * Self::REASONS.len();
 
@@ -775,7 +783,7 @@ mod tests {
             );
             seen.insert(idx);
         }
-        // 十一个 CannotEstablish reason 逐个走一遍。少一个变体这里就少一个 idx，
+        // 十二个 CannotEstablish reason 逐个走一遍。少一个变体这里就少一个 idx，
         // 而 REASONS 与数组长度对不上时 `idx()` 会直接 panic。
         for reason in [
             CannotEstablishReason::LedgerNotClosed,
@@ -789,6 +797,7 @@ mod tests {
             CannotEstablishReason::CountScopeMismatch,
             CannotEstablishReason::PipelineCountMismatch,
             CannotEstablishReason::MandatoryNotSatisfied,
+            CannotEstablishReason::NoServingProjection,
         ] {
             let (c, r) = CompletenessClass::CannotEstablish { reason }.wire_labels();
             let idx = CompletenessTotal::idx(c, r);
@@ -801,8 +810,8 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            14,
-            "十四个 (class, reason) 组合应当落在十四个不同的格子里"
+            15,
+            "十五个 (class, reason) 组合应当落在十五个不同的格子里"
         );
     }
 

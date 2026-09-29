@@ -1,23 +1,26 @@
 //! `xtask::e2e_seed` — persistent tenant/credential/quota seed for deployment-point rehearsals.
-//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, humaux-protocol, postgres, rand,
-//!   serde_json, tokio, uuid]; services=[PostgreSQL(any) w=[control.api_keys, control.credentials,
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, postgres, rand, time, tokio, uuid];
+//!   services=[PostgreSQL(any) w=[control.api_keys, control.audit_events, control.credentials,
 //!   control.entitlement_snapshots, control.memberships, control.private_reasoning_domains, control.processor_models,
 //!   control.provider_accounts, control.provider_endpoints, control.quota_windows,
 //!   control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings,
 //!   control.reasoning_route_candidates, control.reasoning_route_policies,
-//!   control.retrieval_provider_admission_limits, control.tenants, control.users, control.workspace_memberships,
-//!   control.workspaces, ops.data_disclosure_sources, ops.data_disclosures, ops.jobs, ops.model_call_ledger, ops.outbox,
-//!   ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations,
-//!   ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, private.events,
-//!   private.evidence_objects, private.memory_evidence, private.memory_records, private.processing_runs,
-//!   private.retrieval_query_sources, projection.private_memory_points, projection.stream_checkpoints,
-//!   projection.stream_log, projection.tenant_placements] x=[control.resolve_user_reasoning_admission],
-//!   PostgreSQL(role_maintenance), Qdrant(*)]; env=[HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
-//!   modules=[adapters::postgres, adapters::qdrant, adapters::quota_repo, domain::ids, domain::ticket_family,
-//!   infra-cell::permit, infra-cell::resource, infra-cell::transport, protocol::edge]
-//! Called-by: [xtask::main]
-//! Invariants: [reuses real primitives (compute_api_key_hash, issue_window) instead of re-deriving hashing/quota logic; --teardown removes seeded rows explicitly]
-//! Spec: Baseline §73.5
+//!   control.retrieval_provider_admission_limits, control.tenants, control.user_emails, control.users,
+//!   control.workspace_memberships, control.workspaces, ops.data_disclosure_sources, ops.data_disclosures, ops.jobs,
+//!   ops.model_call_ledger, ops.outbox, ops.reasoning_account_health_observations,
+//!   ops.reasoning_provider_health_observations, ops.retrieval_provider_budget_allocations,
+//!   ops.retrieval_provider_budget_reservations, private.events, private.evidence_objects, private.memory_evidence,
+//!   private.memory_records, private.processing_runs, private.retrieval_query_sources, projection.family_activations,
+//!   projection.private_memory_points, projection.stream_checkpoints, projection.stream_log,
+//!   projection.tenant_placements] x=[control.onboard_tenant, control.resolve_user_reasoning_admission],
+//!   PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::membership_repo, adapters::postgres, adapters::provisioning, adapters::quota_repo, domain::ids,
+//!   domain::ticket_family, protocol::edge]
+//! Called-by: [xtask::e2e_onboard, xtask::main]
+//! Invariants: [a thin wrapper over adapters::provisioning (the same onboarding doors humaux-maintenance uses, no INSERT
+//!   of its own for tenant/workspace/key/tier/placement/collection); refuses any DSN host but 127.0.0.1 and any database
+//!   not named humaux_thread_*; --teardown removes seeded rows explicitly]
+//! Spec: Baseline §73.5; ADR-0053
 //!
 //! xtask `e2e-seed` — persistent tenant/credential/quota seed for deployment-point
 //! rehearsals (an ops tool, not a test fixture: rows outlive the process, teardown is
@@ -46,26 +49,25 @@
 //! tenant/scope/collection exports are gone: its `--serve` / `--run-once` claim tickets across
 //! tenants and read each ticket's placement from the claim.
 //!
+//! Card 28 (ADR-0053 D-G): the tenant, workspaces, keys, tiers, placement, collection and the
+//! VerifiedEmpty first activation now come from `humaux_adapters::provisioning` — the doors
+//! `humaux-maintenance` uses — so a seeded workspace is READY and serving before any write, and
+//! a later `xtask projection-serve` for the same version prints "already serving". Only the BYOK
+//! distill lane (`seed_lane`, TEST health rows) stays seed-only (card 52). Printed lines are
+//! unchanged.
+//!
 //! Refuses to run against anything but a local disposable database (binding rule): DSN
 //! host must be `127.0.0.1` and the database name must start with `humaux_thread_`.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::time::Duration;
 
+use humaux_adapters::membership_repo::AdminAction;
 use humaux_adapters::postgres::MaintenanceDbPool;
-use humaux_adapters::qdrant::{
-    Distance, ShardingMethod, create_collection_body, subject_index_body, tenant_index_body,
-};
+use humaux_adapters::provisioning::{self, NewApiKey, QdrantFace, TenantReceipt, TenantRequest};
 use humaux_adapters::quota_repo;
 use humaux_domain::ids::TenantId;
 use humaux_domain::ticket_family::TicketFamily;
-use humaux_infra_cell::{
-    CallerId, CellId, DEFAULT_MAX_RESPONSE_BYTES, HttpIntraCellTransport, IntraCellHttpTransport,
-    IntraCellMethod, IntraCellRequest, IntraCellResource, IntraCellResourceRegistry, ResourceEntry,
-    authorize_cell_access,
-};
-use humaux_protocol::edge::compute_api_key_hash;
+use humaux_protocol::edge::{api_key_log_fingerprint, compute_api_key_hash};
 use postgres::{Client, NoTls};
 use rand::Rng;
 use uuid::Uuid;
@@ -143,27 +145,16 @@ fn random_hex_suffix(rng: &mut impl Rng, n: usize) -> String {
     out
 }
 
-/// The base six ids this seed produces, plus the bearer material — printed exactly once.
-struct BaseSeed {
-    tenant_id: Uuid,
-    user_id: Uuid,
-    workspace_id: Uuid,
-    reasoning_domain_id: Uuid,
-    api_key_id: Uuid,
-    prefix: String,
-    wire: String,
-}
-
 /// Flags for the PRIVATE_CONSOLIDATE R3 admission lane (§78.1: no literal defaults —
 /// every provider-shaped value comes from the CLI, none baked in).
-struct LaneFlags {
-    egress_processor_id: Uuid,
-    region: String,
-    service_tier: String,
-    endpoint_ref: String,
-    provider_id: String,
-    provider_model_id: String,
-    model_revision: String,
+pub(crate) struct LaneFlags {
+    pub(crate) egress_processor_id: Uuid,
+    pub(crate) region: String,
+    pub(crate) service_tier: String,
+    pub(crate) endpoint_ref: String,
+    pub(crate) provider_id: String,
+    pub(crate) provider_model_id: String,
+    pub(crate) model_revision: String,
 }
 
 fn parse_lane_flags(args: &[String]) -> Result<LaneFlags, String> {
@@ -186,7 +177,7 @@ fn parse_lane_flags(args: &[String]) -> Result<LaneFlags, String> {
 
 /// The lane's own ids, printed alongside the base six + used to build the two paste-ready
 /// env blocks the 2026-09-03 addition asks for.
-struct LaneSeed {
+pub(crate) struct LaneSeed {
     binding_id: Uuid,
     binding_version: i64,
     /// ADR-0016 D7: the `PRIVATE_DISTILL_TEXT` binding over the same profile — resolved by
@@ -198,174 +189,6 @@ struct LaneSeed {
     endpoint_id: Uuid,
     profile_id: Uuid,
     policy_id: Uuid,
-}
-
-fn seed_base(
-    client: &mut Client,
-    scopes_sql_array: &str,
-    limit: i64,
-    pepper: &[u8],
-) -> Result<BaseSeed, String> {
-    let mut rng = rand::rng();
-    let mut txn = client
-        .transaction()
-        .map_err(|e| format!("begin seed txn: {}", db_detail(&e)))?;
-
-    let tenant_id: Uuid = txn
-        .query_one(
-            "INSERT INTO control.tenants(name,state) VALUES($1,'ACTIVE') RETURNING tenant_id",
-            &[&format!("e2e-seed-{}", Uuid::new_v4())],
-        )
-        .map_err(|e| format!("insert tenant: {}", db_detail(&e)))?
-        .get(0);
-    let user_id: Uuid = txn
-        .query_one(
-            "INSERT INTO control.users(state) VALUES('ACTIVE') RETURNING user_id",
-            &[],
-        )
-        .map_err(|e| format!("insert user: {}", db_detail(&e)))?
-        .get(0);
-    txn.execute(
-        // role='OWNER': mirrors consolidation_hop_e2e.rs::setup_db (2026-09-03 addendum) —
-        // the seeded user must own the reasoning domain below for the R3 admission trigger.
-        "INSERT INTO control.memberships(tenant_id,user_id,role,state) VALUES($1,$2,'OWNER','ACTIVE')",
-        &[&tenant_id, &user_id],
-    )
-    .map_err(|e| format!("insert membership: {}", db_detail(&e)))?;
-    let workspace_id: Uuid = txn
-        .query_one(
-            "INSERT INTO control.workspaces(tenant_id,name) VALUES($1,'e2e-seed workspace') RETURNING workspace_id",
-            &[&tenant_id],
-        )
-        .map_err(|e| format!("insert workspace: {}", db_detail(&e)))?
-        .get(0);
-    // 0163 (ADR-0035) repointed the WORKSPACE_SHARED visibility arm from `control.memberships`
-    // to the row's own workspace: without an ACTIVE `control.workspace_memberships` row the
-    // seeded principal reads and writes nothing workspace-shared and every hop 403s.
-    txn.execute(
-        "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
-         VALUES($1,$2,$3,'OWNER','ACTIVE')",
-        &[&tenant_id, &workspace_id, &user_id],
-    )
-    .map_err(|e| format!("insert workspace membership: {}", db_detail(&e)))?;
-    // §11.2.4-11.2.5 R3 admission trigger requires the domain's owner_user_id to be set and
-    // membership-backed (0128_reasoning_route_foundation.sql's binding-insert trigger) — the
-    // lane below cannot admit through an ownerless domain.
-    let reasoning_domain_id: Uuid = txn
-        .query_one(
-            "INSERT INTO control.private_reasoning_domains(tenant_id,name,owner_user_id,status) \
-             VALUES($1,'default',$2,'ACTIVE') RETURNING reasoning_domain_id",
-            &[&tenant_id, &user_id],
-        )
-        .map_err(|e| format!("insert reasoning domain: {}", db_detail(&e)))?
-        .get(0);
-
-    let effective = format!(
-        "jsonb_build_object('mcp.billable_operations.per_period', jsonb_build_object(\
-         'limit',{limit},'period','subscription_period','charge_policy','success_only',\
-         'period_start',to_char((clock_timestamp()-interval '1 second') AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),\
-         'period_end',to_char((clock_timestamp()+interval '1 hour') AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')))"
-    );
-    txn.execute(
-        &format!(
-            "INSERT INTO control.entitlement_snapshots(tenant_id,effective,source_grant_ids,computed_at) \
-             VALUES($1,{effective},ARRAY[$2]::uuid[],clock_timestamp())"
-        ),
-        &[&tenant_id, &Uuid::new_v4()],
-    )
-    .map_err(|e| format!("insert entitlement snapshot: {}", db_detail(&e)))?;
-
-    let (api_key_id, prefix, wire) = insert_api_key(
-        &mut txn,
-        &mut rng,
-        (tenant_id, user_id, workspace_id),
-        scopes_sql_array,
-        pepper,
-    )?;
-
-    txn.commit()
-        .map_err(|e| format!("commit seed txn: {}", db_detail(&e)))?;
-
-    Ok(BaseSeed {
-        tenant_id,
-        user_id,
-        workspace_id,
-        reasoning_domain_id,
-        api_key_id,
-        prefix,
-        wire,
-    })
-}
-
-/// One ACTIVE workspace-bound API key for `(tenant, user, workspace)`; returns
-/// `(api_key_id, prefix, wire)`. The key hash is the real §73.5 primitive.
-fn insert_api_key(
-    txn: &mut postgres::Transaction<'_>,
-    rng: &mut impl Rng,
-    (tenant_id, user_id, workspace_id): (Uuid, Uuid, Uuid),
-    scopes_sql_array: &str,
-    pepper: &[u8],
-) -> Result<(Uuid, String, String), String> {
-    let prefix = format!("e2e{}", random_hex_suffix(rng, 12));
-    let wire = format!("{prefix}.{}", random_secret());
-    let key_hash = compute_api_key_hash(pepper, &wire);
-    let api_key_id: Uuid = txn
-        .query_one(
-            &format!(
-                "INSERT INTO control.api_keys \
-                 (tenant_id,prefix,key_hash,status,scopes,authorization_version,user_id,workspace_id,\
-                  tenant_security_epoch,user_security_epoch) \
-                 VALUES($1,$2,$3,'ACTIVE',{scopes_sql_array},1,$4,$5,0,0) RETURNING api_key_id"
-            ),
-            &[&tenant_id, &prefix, &key_hash, &user_id, &workspace_id],
-        )
-        .map_err(|e| format!("insert api key: {}", db_detail(&e)))?
-        .get(0);
-    Ok((api_key_id, prefix, wire))
-}
-
-/// Card 27 (`--workspaces <n>`): workspaces 2..=n of the seeded tenant, each with an ACTIVE
-/// OWNER workspace membership for the seeded user (0163's WORKSPACE_SHARED arm) and its own
-/// workspace-bound API key. Returns `(workspace_id, wire)` per extra workspace. Teardown already
-/// removes them by tenant.
-fn seed_extra_workspaces(
-    client: &mut Client,
-    base: &BaseSeed,
-    extra: usize,
-    scopes_sql_array: &str,
-    pepper: &[u8],
-) -> Result<Vec<(Uuid, String)>, String> {
-    let mut rng = rand::rng();
-    let mut txn = client
-        .transaction()
-        .map_err(|e| format!("begin workspace txn: {}", db_detail(&e)))?;
-    let mut out = Vec::with_capacity(extra);
-    for k in 0..extra {
-        let workspace_id: Uuid = txn
-            .query_one(
-                "INSERT INTO control.workspaces(tenant_id,name) VALUES($1,$2) RETURNING workspace_id",
-                &[&base.tenant_id, &format!("e2e-seed workspace {}", k + 2)],
-            )
-            .map_err(|e| format!("insert workspace: {}", db_detail(&e)))?
-            .get(0);
-        txn.execute(
-            "INSERT INTO control.workspace_memberships(tenant_id,workspace_id,user_id,role,state) \
-             VALUES($1,$2,$3,'OWNER','ACTIVE')",
-            &[&base.tenant_id, &workspace_id, &base.user_id],
-        )
-        .map_err(|e| format!("insert workspace membership: {}", db_detail(&e)))?;
-        let (_, _, wire) = insert_api_key(
-            &mut txn,
-            &mut rng,
-            (base.tenant_id, base.user_id, workspace_id),
-            scopes_sql_array,
-            pepper,
-        )?;
-        out.push((workspace_id, wire));
-    }
-    txn.commit()
-        .map_err(|e| format!("commit workspace txn: {}", db_detail(&e)))?;
-    Ok(out)
 }
 
 /// One route policy (pinned candidate over `profile_id`, promoted SHADOW → SERVING) + its
@@ -417,7 +240,7 @@ fn seed_route(
 /// Mirrors `bins/consolidation-worker/tests/consolidation_hop_e2e.rs::setup_db`'s R3
 /// admission-lane graph verbatim (2026-09-03 card addition — 逐字镜像, not a rederivation).
 #[allow(clippy::too_many_lines)]
-fn seed_lane(
+pub(crate) fn seed_lane(
     client: &mut Client,
     tenant_id: Uuid,
     user_id: Uuid,
@@ -576,135 +399,6 @@ fn parse_qdrant_flags(args: &[String]) -> Result<QdrantFlags, String> {
     })
 }
 
-/// The one-entry `IntraCellResource::QDRANT_REST` registry this ops tool dials directly with —
-/// a plain `ReadWrite` registry (default `ResourceEntry` access mode), mirroring
-/// `bins/gateway/tests/semantic_recall_wiring.rs::setup_registry`'s own "seeding a collection
-/// needs PUT" registry, not the read-only one `bins/gateway/src/bootstrap.rs` constructs
-/// (ADR-0014's read-only rule binds gateway's own runtime registry, not this standalone tool).
-fn qdrant_registry(host: &str, port: u16) -> Result<IntraCellResourceRegistry, String> {
-    let cell = CellId(Uuid::new_v4());
-    let caller = CallerId("xtask-e2e-seed".to_string());
-    let cidr = format!("{host}/32")
-        .parse()
-        .map_err(|e| format!("qdrant cidr {host}/32: {e:?}"))?;
-    let mut entries = BTreeMap::new();
-    entries.insert(
-        IntraCellResource::QDRANT_REST,
-        ResourceEntry::new(
-            host,
-            port,
-            cell,
-            vec![cidr],
-            BTreeSet::from([caller.clone()]),
-            false,
-        )
-        .map_err(|e| format!("qdrant resource entry: {e}"))?,
-    );
-    Ok(IntraCellResourceRegistry::new(entries, cell, caller))
-}
-
-/// Mirrors `semantic_recall_wiring.rs::create_collection` verbatim: `GET` first (already
-/// provisioned → skip, per the card), else the same two `PUT`s the wiring test issues, reusing
-/// `adapters::qdrant`'s body constructors rather than hand-writing the JSON.
-/// The exact `PUT` sequence that brings one collection into existence: the collection itself,
-/// then BOTH payload indexes §17.1 / §6.1.3 require.
-///
-/// Extracted from [`ensure_qdrant_collection`] so it can be asserted without a live Qdrant —
-/// card 9 P2 sat open because the `subject_ids` uuid index was simply never PUT and nothing
-/// anywhere could see that it was missing.
-fn collection_setup_puts(collection: &str, dimension: u32) -> Vec<(String, serde_json::Value)> {
-    vec![
-        (
-            format!("/collections/{collection}"),
-            create_collection_body(
-                dimension.into(),
-                Distance::Cosine,
-                1,
-                1,
-                1,
-                ShardingMethod::Auto,
-            ),
-        ),
-        (
-            format!("/collections/{collection}/index"),
-            tenant_index_body(),
-        ),
-        // Card 9 P2 (folded into card 24): without the `subject_ids` uuid payload index the
-        // §6.1.3 any-of subject prefilter degrades to an unindexed payload scan on every seeded
-        // collection. docs/ops/runbook.md names both indexes as a deploy step.
-        (
-            format!("/collections/{collection}/index"),
-            subject_index_body(),
-        ),
-    ]
-}
-
-fn ensure_qdrant_collection(
-    rt: &tokio::runtime::Runtime,
-    host: &str,
-    port: u16,
-    collection: &str,
-    dimension: u32,
-) -> Result<(), String> {
-    let registry = qdrant_registry(host, port)?;
-    let transport = HttpIntraCellTransport::new(
-        registry.clone(),
-        Duration::from_secs(10),
-        DEFAULT_MAX_RESPONSE_BYTES,
-    )
-    .map_err(|e| format!("qdrant transport: {e}"))?;
-
-    rt.block_on(async {
-        let get_permit = authorize_cell_access(
-            &registry,
-            IntraCellResource::QDRANT_REST,
-            Duration::from_secs(60),
-        )
-        .map_err(|e| format!("qdrant permit: {e:?}"))?;
-        let existing = transport
-            .execute(
-                &get_permit,
-                // dep: Qdrant(*) — placement upsert for the seeded tenant
-                IntraCellRequest {
-                    method: IntraCellMethod::Get,
-                    path: format!("/collections/{collection}"),
-                    json_body: None,
-                    headers: Vec::new(),
-                },
-            )
-            .await;
-        if matches!(existing, Ok(ref r) if r.status == 200) {
-            return Ok(());
-        }
-
-        for (path, body) in collection_setup_puts(collection, dimension) {
-            let permit = authorize_cell_access(
-                &registry,
-                IntraCellResource::QDRANT_REST,
-                Duration::from_secs(60),
-            )
-            .map_err(|e| format!("qdrant permit: {e:?}"))?;
-            let response = transport
-                .execute(
-                    &permit,
-                    // dep: Qdrant(*) — placement upsert for the seeded tenant
-                    IntraCellRequest {
-                        method: IntraCellMethod::Put,
-                        path,
-                        json_body: Some(body),
-                        headers: Vec::new(),
-                    },
-                )
-                .await
-                .map_err(|e| format!("qdrant PUT: {e:?}"))?;
-            if !(200..300).contains(&response.status) {
-                return Err(format!("qdrant PUT returned {}", response.status));
-            }
-        }
-        Ok(())
-    })
-}
-
 /// `--teardown --drop-collection <name>`: explicit-only deletion (default teardown never drops
 /// the collection, per the card — it may be shared with another tenant's placement row).
 fn drop_qdrant_collection(
@@ -713,100 +407,168 @@ fn drop_qdrant_collection(
     port: u16,
     collection: &str,
 ) -> Result<(), String> {
-    let registry = qdrant_registry(host, port)?;
-    let transport = HttpIntraCellTransport::new(
-        registry.clone(),
-        Duration::from_secs(10),
-        DEFAULT_MAX_RESPONSE_BYTES,
+    let face = QdrantFace::new(host, port, &format!("{host}/32")).map_err(|e| e.to_string())?;
+    rt.block_on(face.delete_collection(collection))
+        .map_err(|e| e.to_string())
+}
+
+/// The seed's §77 operator identity (a local disposable database; the rows are torn down).
+const SEED_ADMIN: AdminAction<'static> = AdminAction {
+    actor: "xtask-e2e-seed",
+    reason: "deployment-point rehearsal seed (local disposable database)",
+    ticket: "e2e-seed",
+    trace_id: "e2e-seed",
+    step_up_auth_context: "local-127.0.0.1-only",
+};
+
+/// One `e2e…` API key: random prefix (the seed's printed shape), the §73.5 hash, the wire key.
+fn seed_key(pepper: &[u8]) -> (NewApiKey, String) {
+    let prefix = format!("e2e{}", random_hex_suffix(&mut rand::rng(), 12));
+    let wire = format!("{prefix}.{}", random_secret());
+    let key_hash = compute_api_key_hash(pepper, &wire);
+    let fingerprint = api_key_log_fingerprint(&prefix, &key_hash);
+    (
+        NewApiKey {
+            prefix,
+            key_hash,
+            fingerprint,
+        },
+        wire,
     )
-    .map_err(|e| format!("qdrant transport: {e}"))?;
-    rt.block_on(async {
-        let permit = authorize_cell_access(
-            &registry,
-            IntraCellResource::QDRANT_REST,
-            Duration::from_secs(60),
-        )
-        .map_err(|e| format!("qdrant permit: {e:?}"))?;
-        transport
-            .execute(
-                &permit,
-                // dep: Qdrant(*) — placement upsert for the seeded tenant
-                IntraCellRequest {
-                    method: IntraCellMethod::Delete,
-                    path: format!("/collections/{collection}"),
-                    json_body: None,
-                    headers: Vec::new(),
-                },
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("qdrant DELETE: {e:?}"))
-    })
 }
 
-/// `projection.tenant_placements` row the 追加2 card names — `SHARED_FALLBACK` placement class,
-/// zero point/byte counts (a fresh collection), `STABLE` promotion state.
-/// §19 retrieval-provider admission limits for the rehearsal tenant. `ops.reserve_retrieval_
-/// provider_budget` (0117) demands exactly ONE active limit row for each canonical tier —
-/// GLOBAL (tenant NULL, region NULL, purpose NULL), REGION (tenant NULL, region, purpose NULL),
-/// TENANT (tenant, region NULL, purpose NULL) and TENANT+PURPOSE (tenant, region NULL,
-/// purpose RETRIEVAL_EMBEDDING / RETRIEVAL_RERANK) — otherwise it raises P0003 and every
-/// projection ticket ends `embedding_failed` with a ledger row FAILED/Conflict (rehearsal-
-/// verified). The two shared tiers are created only when missing and are NEVER torn down
-/// (they are cross-tenant catalog rows, like processor_models); the tenant tiers are.
-fn seed_embedding_admission(
-    client: &mut Client,
-    tenant_id: Uuid,
-    provider_id: &str,
-    region: &str,
-) -> Result<(), String> {
-    let tiers: [(Option<Uuid>, Option<&str>, Option<&str>); 5] = [
-        (None, None, None),
-        (None, Some(region), None),
-        (Some(tenant_id), None, None),
-        (Some(tenant_id), None, Some("RETRIEVAL_EMBEDDING")),
-        (Some(tenant_id), None, Some("RETRIEVAL_RERANK")),
-    ];
-    for (tier_tenant, tier_region, tier_purpose) in tiers {
-        client
-            .execute(
-                "INSERT INTO control.retrieval_provider_admission_limits \
-                   (tenant_id,provider_id,region,purpose,tpm_limit,rpm_limit,effective_from) \
-                 VALUES($1,$2,$3,$4,1000000000,1000000000,clock_timestamp()-interval '1 second') \
-                 ON CONFLICT (provider_id,region,tenant_id,purpose) WHERE effective_to IS NULL \
-                 DO UPDATE SET tpm_limit=EXCLUDED.tpm_limit,rpm_limit=EXCLUDED.rpm_limit",
-                &[&tier_tenant, &provider_id, &tier_region, &tier_purpose],
-            )
-            .map_err(|e| {
-                format!(
-                    "seed admission limit (tenant={tier_tenant:?}, region={tier_region:?}, purpose={tier_purpose:?}): {}",
-                    db_detail(&e)
-                )
-            })?;
+/// What one seed run provisioned through the onboarding library (ADR-0053 D-G).
+struct Seeded {
+    tenant: TenantReceipt,
+    api_key_id: Uuid,
+    prefix: String,
+    wire: String,
+    /// Card 27 `--workspaces <n>`: `(workspace_id, wire)` of workspaces 2..=n.
+    extra_workspaces: Vec<(Uuid, String)>,
+}
+
+/// The seed as a thin wrapper over `humaux_adapters::provisioning` — the same doors
+/// `humaux-maintenance` uses, no INSERT of its own: deploy tiers (1e9, never torn down), the
+/// tenant (random `e2e-seed-<uuid>` name, a throwaway `@e2e.invalid` owner), the quota window,
+/// the extra workspaces with their own keys, the collection and the VerifiedEmpty activation of
+/// every workspace (so the later `projection-serve` calls print "already serving").
+#[allow(clippy::too_many_lines)] // the seed's onboarding sequence, one step per library call
+async fn provision(
+    maintenance: &MaintenanceDbPool,
+    qdrant: &QdrantFlags,
+    scopes: &[String],
+    limit: i64,
+    pepper: &[u8],
+    workspaces: usize,
+) -> Result<Seeded, String> {
+    const SEED_TIER_LIMIT: i64 = 1_000_000_000;
+    let run = Uuid::new_v4();
+    provisioning::deploy_init(
+        maintenance,
+        &qdrant.embedding_provider,
+        &qdrant.embedding_region,
+        SEED_TIER_LIMIT,
+        SEED_TIER_LIMIT,
+        &SEED_ADMIN,
+    )
+    .await
+    .map_err(|e| format!("deploy_init: {e}"))?;
+    let now = time::OffsetDateTime::now_utc();
+    let mut minted = None;
+    let mut mint = |_tenant: Uuid| {
+        let (key, wire) = seed_key(pepper);
+        minted = Some((key.prefix.clone(), wire));
+        key
+    };
+    let tenant = provisioning::onboard_tenant(
+        maintenance,
+        &TenantRequest {
+            name: &format!("e2e-seed-{run}"),
+            owner_email: &format!("e2e-seed-{run}@e2e.invalid"),
+            workspace_name: "e2e-seed workspace",
+            reasoning_domain_name: "default",
+            plan_limit: limit,
+            period_start: now - time::Duration::seconds(1),
+            period_end: now + time::Duration::hours(1),
+            provider_id: &qdrant.embedding_provider,
+            region: &qdrant.embedding_region,
+            tenant_tpm: SEED_TIER_LIMIT,
+            tenant_rpm: SEED_TIER_LIMIT,
+            scopes,
+            collection: &qdrant.collection,
+        },
+        &mut mint,
+        &SEED_ADMIN,
+    )
+    .await
+    .map_err(|e| format!("onboard_tenant: {e}"))?;
+    let api_key_id = tenant
+        .api_key
+        .as_ref()
+        .map(|k| k.api_key_id)
+        .ok_or("onboard_tenant created no key (tenant name collision?)")?;
+    let (prefix, wire) = minted.ok_or("no key minted")?;
+    quota_repo::issue_window(maintenance, TenantId(tenant.tenant_id))
+        .await
+        .map_err(|e| format!("issue_window: {e:?}"))?;
+
+    let mut extra_workspaces = Vec::with_capacity(workspaces.saturating_sub(1));
+    for k in 2..=workspaces {
+        let workspace = provisioning::onboard_workspace(
+            maintenance,
+            tenant.tenant_id,
+            &format!("e2e-seed workspace {k}"),
+            tenant.owner_user_id,
+            &SEED_ADMIN,
+        )
+        .await
+        .map_err(|e| format!("onboard_workspace: {e}"))?;
+        let (key, wire) = seed_key(pepper);
+        provisioning::issue_api_key(
+            maintenance,
+            tenant.tenant_id,
+            tenant.owner_user_id,
+            workspace.workspace_id,
+            &key,
+            scopes,
+            &SEED_ADMIN,
+        )
+        .await
+        .map_err(|e| format!("issue_api_key: {e}"))?;
+        extra_workspaces.push((workspace.workspace_id, wire));
     }
-    Ok(())
-}
 
-fn seed_placement(client: &mut Client, tenant_id: Uuid, collection: &str) -> Result<(), String> {
-    client
-        .execute(
-            "INSERT INTO projection.tenant_placements \
-             (tenant_id,projection_family,collection_name,shard_key,placement_class,\
-              point_count,bytes_estimate,promotion_state) \
-             VALUES ($1,'private_memory_v1',$2,NULL,'SHARED_FALLBACK',0,0,'STABLE')",
-            &[&tenant_id, &collection],
+    let face = QdrantFace::new(&qdrant.host, qdrant.port, &format!("{}/32", qdrant.host))
+        .map_err(|e| format!("qdrant face: {e}"))?;
+    provisioning::ensure_collection(&face, &qdrant.collection, qdrant.dimension)
+        .await
+        .map_err(|e| format!("qdrant collection: {e}"))?;
+    let workspace_ids = std::iter::once(tenant.workspace_id)
+        .chain(extra_workspaces.iter().map(|(id, _)| *id))
+        .collect::<Vec<_>>();
+    for workspace_id in workspace_ids {
+        let activation = provisioning::activate_workspace(
+            maintenance,
+            &face,
+            tenant.tenant_id,
+            workspace_id,
+            qdrant.dimension,
+            None,
+            &SEED_ADMIN,
         )
-        .map_err(|e| format!("insert tenant placement: {}", db_detail(&e)))?;
-    Ok(())
-}
-
-fn scopes_sql_array(scopes: &str) -> String {
-    let list = scopes
-        .split(',')
-        .map(|s| format!("'{}'", s.trim().replace('\'', "''")))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("ARRAY[{list}]")
+        .await
+        .map_err(|e| format!("activate: {e}"))?;
+        if let Some(reason) = activation.refusal() {
+            return Err(format!("activate {workspace_id}: refused {reason}"));
+        }
+    }
+    Ok(Seeded {
+        tenant,
+        api_key_id,
+        prefix,
+        wire,
+        extra_workspaces,
+    })
 }
 
 /// Deletes one tenant's rows in dependency-reverse order — base fixture tables (mirrors
@@ -881,6 +643,8 @@ fn teardown(client: &mut Client, tenant_id: Uuid) -> Result<(), String> {
         "DELETE FROM projection.private_memory_points WHERE tenant_id=$1",
         "DELETE FROM projection.tenant_placements WHERE tenant_id=$1",
         "DELETE FROM projection.stream_log WHERE tenant_id=$1",
+        // Card 28 (ADR-0053): the VerifiedEmpty receipts reference the checkpoint rows.
+        "DELETE FROM projection.family_activations WHERE tenant_id=$1",
         "DELETE FROM projection.stream_checkpoints WHERE tenant_id=$1",
         // Distill-hop outputs (ADR-0016) the rehearsal wrote for this tenant after seeding:
         // disclosure receipts, memories + their PRIMARY links, processing runs, then the
@@ -906,6 +670,10 @@ fn teardown(client: &mut Client, tenant_id: Uuid) -> Result<(), String> {
         "DELETE FROM control.api_keys WHERE tenant_id=$1",
         "DELETE FROM control.entitlement_snapshots WHERE tenant_id=$1",
         "DELETE FROM control.quota_windows WHERE tenant_id=$1",
+        // Card 28: replica mode skips the ON DELETE CASCADE from memberships/workspaces, and
+        // onboarding now writes §77 audit rows for the tenant.
+        "DELETE FROM control.workspace_memberships WHERE tenant_id=$1",
+        "DELETE FROM control.audit_events WHERE tenant_id=$1",
         "DELETE FROM control.memberships WHERE tenant_id=$1",
         "DELETE FROM control.workspaces WHERE tenant_id=$1",
         "DELETE FROM control.private_reasoning_domains WHERE tenant_id=$1",
@@ -913,6 +681,11 @@ fn teardown(client: &mut Client, tenant_id: Uuid) -> Result<(), String> {
         txn.execute(sql, &[&tenant_id])
             .map_err(|e| format!("teardown ({sql}): {}", db_detail(&e)))?;
     }
+    txn.execute(
+        "DELETE FROM control.user_emails WHERE user_id = ANY($1)",
+        &[&user_ids],
+    )
+    .map_err(|e| format!("teardown user emails: {}", db_detail(&e)))?;
     txn.execute(
         "DELETE FROM control.users WHERE user_id = ANY($1)",
         &[&user_ids],
@@ -1057,27 +830,6 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
-    let base = match seed_base(&mut client, &scopes_sql_array(&scopes), limit, &pepper) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("e2e-seed: fail (base seed: {e})");
-            return 1;
-        }
-    };
-    let extra_workspaces = match seed_extra_workspaces(
-        &mut client,
-        &base,
-        workspaces - 1,
-        &scopes_sql_array(&scopes),
-        &pepper,
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("e2e-seed: fail (extra workspaces: {e})");
-            return 1;
-        }
-    };
-
     let maintenance_dsn = match std::env::var(MAINTENANCE_DSN_ENV) {
         Ok(v) => v,
         Err(_) => {
@@ -1106,18 +858,31 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = rt.block_on(quota_repo::issue_window(
+    let scopes: Vec<String> = scopes
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let seeded = match rt.block_on(provision(
         &maintenance,
-        TenantId(base.tenant_id),
+        &qdrant_flags,
+        &scopes,
+        limit,
+        &pepper,
+        workspaces,
     )) {
-        eprintln!("e2e-seed: fail (issue_window: {e:?})");
-        return 1;
-    }
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("e2e-seed: fail (onboarding: {e})");
+            return 1;
+        }
+    };
+    let base = &seeded.tenant;
 
     let lane = match seed_lane(
         &mut client,
         base.tenant_id,
-        base.user_id,
+        base.owner_user_id,
         base.reasoning_domain_id,
         &lane_flags,
     ) {
@@ -1128,38 +893,14 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
-    if let Err(e) = ensure_qdrant_collection(
-        &rt,
-        &qdrant_flags.host,
-        qdrant_flags.port,
-        &qdrant_flags.collection,
-        qdrant_flags.dimension,
-    ) {
-        eprintln!("e2e-seed: fail (qdrant collection: {e})");
-        return 1;
-    }
-    if let Err(e) = seed_embedding_admission(
-        &mut client,
-        base.tenant_id,
-        &qdrant_flags.embedding_provider,
-        &qdrant_flags.embedding_region,
-    ) {
-        eprintln!("e2e-seed: {e}");
-        return 1;
-    }
-    if let Err(e) = seed_placement(&mut client, base.tenant_id, &qdrant_flags.collection) {
-        eprintln!("e2e-seed: fail ({e})");
-        return 1;
-    }
-
     println!("tenant_id: {}", base.tenant_id);
-    println!("user_id: {}", base.user_id);
+    println!("user_id: {}", base.owner_user_id);
     println!("workspace_id: {}", base.workspace_id);
     println!("reasoning_domain_id: {}", base.reasoning_domain_id);
-    println!("api_key_id: {}", base.api_key_id);
-    println!("api_key_prefix: {}", base.prefix);
-    println!("Authorization: Bearer {}", base.wire);
-    for (k, (workspace_id, wire)) in extra_workspaces.iter().enumerate() {
+    println!("api_key_id: {}", seeded.api_key_id);
+    println!("api_key_prefix: {}", seeded.prefix);
+    println!("Authorization: Bearer {}", seeded.wire);
+    for (k, (workspace_id, wire)) in seeded.extra_workspaces.iter().enumerate() {
         println!("workspace_id_{}: {workspace_id}", k + 2);
         println!("bearer_{}: {wire}", k + 2);
     }
@@ -1276,29 +1017,27 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DSN_ENV, LaneFlags, collection_setup_puts, scopes_sql_array, seed_base, seed_lane, teardown,
+        DSN_ENV, LaneFlags, MAINTENANCE_DSN_ENV, QdrantFlags, guard_local_test_db, seed_lane,
+        teardown,
     };
+    use humaux_adapters::postgres::MaintenanceDbPool;
     use postgres::{Client, NoTls};
     use uuid::Uuid;
 
-    /// Card 9 P2 / card 24. FAULT SENTINEL: goes red the moment a seeded collection stops
-    /// getting the `subject_ids` uuid payload index, which is the state this repo shipped in
-    /// while `docs/ops/runbook.md` already told operators both indexes were created.
+    /// Card 28 fault (e): the guard stays — a hostname (even `localhost`) is refused, only the
+    /// literal `127.0.0.1` and a `humaux_thread_*` database pass.
     #[test]
-    fn a_seeded_collection_gets_both_payload_indexes() {
-        let puts = collection_setup_puts("c", 1024);
-        assert_eq!(puts.len(), 3, "collection + tenant index + subject index");
-        assert_eq!(puts[0].0, "/collections/c");
-        let fields: Vec<&str> = puts[1..]
-            .iter()
-            .map(|(path, body)| {
-                assert_eq!(path, "/collections/c/index");
-                body["field_name"].as_str().expect("field_name")
-            })
-            .collect();
-        assert_eq!(fields, vec!["tenant_id", "subject_ids"]);
-        assert_eq!(puts[1].1["field_schema"]["is_tenant"], true);
-        assert_eq!(puts[2].1["field_schema"]["type"], "uuid");
+    fn guard_refuses_hostname_dsn() {
+        assert!(
+            guard_local_test_db(DSN_ENV, "postgres://u:p@localhost:5432/humaux_thread_x").is_err()
+        );
+        assert!(
+            guard_local_test_db(DSN_ENV, "postgres://u:p@db.prod:5432/humaux_thread_x").is_err()
+        );
+        assert!(guard_local_test_db(DSN_ENV, "postgres://u:p@127.0.0.1:5432/prod").is_err());
+        assert!(
+            guard_local_test_db(DSN_ENV, "postgres://u:p@127.0.0.1:5432/humaux_thread_x").is_ok()
+        );
     }
 
     /// Card 16 regression, seed side. Two `e2e-seed` invocations must produce two tenants that
@@ -1309,6 +1048,9 @@ mod tests {
     /// the two, so a second tenant seeded under a different `--processor-id` is admitted by
     /// nothing and its Distill hop defers forever.
     ///
+    /// Card 28: the tenants come from the onboarding library over `HUMAUX_MAINTENANCE_PG_DSN`
+    /// (the seed's own path), the lane from the owner DSN as before.
+    ///
     /// Fault injection: pass a fresh `Uuid::new_v4()` as the second lane's `egress_processor_id`
     /// (what `rehearse.sh` did) and the last assertion goes red — which is exactly the soak's P0.
     #[test]
@@ -1317,8 +1059,12 @@ mod tests {
         reason = "one linear fixture script (seed -> assert -> teardown); splitting it hides which teardown covers which seed"
     )]
     fn seeding_two_tenants_yields_two_independently_admitted_distill_routes() {
-        let Ok(dsn) = std::env::var(DSN_ENV) else {
-            eprintln!("e2e_seed test: not_applicable — {DSN_ENV} unset, skipping");
+        let (Ok(dsn), Ok(maintenance_dsn)) =
+            (std::env::var(DSN_ENV), std::env::var(MAINTENANCE_DSN_ENV))
+        else {
+            eprintln!(
+                "e2e_seed test: not_applicable — {DSN_ENV} / {MAINTENANCE_DSN_ENV} unset, skipping"
+            );
             return;
         };
         // dep: PostgreSQL(any) — seed target database (HUMAUX_MAINTENANCE_PG_DSN/HUMAUX_TEST_PG_DSN)
@@ -1330,7 +1076,7 @@ mod tests {
         };
         if client
             .query_one(
-                "SELECT to_regprocedure('control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)') IS NULL",
+                "SELECT to_regprocedure('control.onboard_tenant(text,uuid,text,text,bigint,timestamptz,timestamptz,text,text,bigint,bigint,text[])') IS NULL",
                 &[],
             )
             .map(|row| row.get::<_, bool>(0))
@@ -1339,6 +1085,11 @@ mod tests {
             eprintln!("e2e_seed test: not_applicable — migrations not applied, skipping");
             return;
         }
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        // dep: PostgreSQL(role_maintenance) — the seed's onboarding pool
+        let maintenance = rt
+            .block_on(MaintenanceDbPool::connect(&maintenance_dsn))
+            .expect("maintenance pool");
 
         // One deployment: one egress processor, one endpoint. Unique per run so the assertions
         // read only this test's rows on a shared dev database.
@@ -1353,31 +1104,37 @@ mod tests {
             provider_model_id: "self-test-model".to_string(),
             model_revision: "self-test".to_string(),
         };
-        let scopes = scopes_sql_array("memory:write");
+        // This test never touches Qdrant: it onboards through the PostgreSQL-only library steps
+        // (`onboard_pg_only`); the Qdrant half of `provision` runs in `cargo xtask e2e-onboard`.
+        let qdrant = QdrantFlags {
+            collection: format!("xtask_e2e_seed_{run}"),
+            dimension: 8,
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            embedding_provider: format!("xtask-e2e-seed-{run}"),
+            embedding_region: "cn-shanghai".to_string(),
+        };
+        let scopes = vec!["memory:write".to_string()];
 
         let mut seeded = Vec::new();
         let mut lanes = Vec::new();
         for _ in 0..2 {
-            let base = seed_base(&mut client, &scopes, 1000, &[7u8; 32]).expect("seed base");
-            let lane = seed_lane(
-                &mut client,
-                base.tenant_id,
-                base.user_id,
-                base.reasoning_domain_id,
-                &flags(egress),
-            )
-            .expect("seed lane");
-            seeded.push(base);
+            let tenant = rt
+                .block_on(onboard_pg_only(&maintenance, &qdrant, &scopes))
+                .expect("onboard");
+            let lane = seed_lane(&mut client, tenant.0, tenant.1, tenant.2, &flags(egress))
+                .expect("seed lane");
+            seeded.push(tenant);
             lanes.push(lane);
         }
 
         let verdict = (|| -> Result<(), String> {
-            for (base, lane) in seeded.iter().zip(&lanes) {
+            for ((tenant_id, _, reasoning_domain_id), lane) in seeded.iter().zip(&lanes) {
                 // The resolver reads RLS-protected `control.*` rows: without the tenant context
                 // the answer is an empty set for every tenant, which would make this assertion
                 // vacuously red rather than a real verdict.
                 client
-                    .batch_execute(&format!("SET humaux.tenant_id = '{}'", base.tenant_id))
+                    .batch_execute(&format!("SET humaux.tenant_id = '{tenant_id}'"))
                     .map_err(|e| format!("set tenant context: {e}"))?;
                 let binding_version: i64 = client
                     .query_one(
@@ -1390,18 +1147,13 @@ mod tests {
                 let rows: i64 = client
                     .query_one(
                         "SELECT count(*) FROM control.resolve_user_reasoning_admission($1,$2,$3,'PRIVATE_DISTILL_TEXT')",
-                        &[
-                            &lane.distill_binding_id,
-                            &binding_version,
-                            &base.reasoning_domain_id,
-                        ],
+                        &[&lane.distill_binding_id, &binding_version, reasoning_domain_id],
                     )
                     .map_err(|e| format!("resolve admission: {e}"))?
                     .get(0);
                 if rows != 1 {
                     return Err(format!(
-                        "tenant {} has {rows} admitted PRIVATE_DISTILL_TEXT routes, want 1",
-                        base.tenant_id
+                        "tenant {tenant_id} has {rows} admitted PRIVATE_DISTILL_TEXT routes, want 1"
                     ));
                 }
             }
@@ -1432,11 +1184,66 @@ mod tests {
             Ok(())
         })();
 
-        for base in &seeded {
-            if let Err(error) = teardown(&mut client, base.tenant_id) {
-                eprintln!("e2e_seed test teardown ({}): {error}", base.tenant_id);
+        for (tenant_id, _, _) in &seeded {
+            if let Err(error) = teardown(&mut client, *tenant_id) {
+                eprintln!("e2e_seed test teardown ({tenant_id}): {error}");
             }
         }
+        // The deployment tiers of this run's unique provider are this test's own rows.
+        let _ = client.execute(
+            "DELETE FROM control.retrieval_provider_admission_limits WHERE provider_id = $1",
+            &[&qdrant.embedding_provider],
+        );
         verdict.expect("two seeded tenants must both be servable by one deployment");
+    }
+
+    /// The PostgreSQL half of [`provision`] (deploy tiers + one tenant), so the lane test above
+    /// needs no Qdrant. Returns `(tenant, owner user, reasoning domain)`.
+    async fn onboard_pg_only(
+        maintenance: &MaintenanceDbPool,
+        qdrant: &QdrantFlags,
+        scopes: &[String],
+    ) -> Result<(Uuid, Uuid, Uuid), String> {
+        use humaux_adapters::provisioning::{self, TenantRequest};
+        humaux_adapters::provisioning::deploy_init(
+            maintenance,
+            &qdrant.embedding_provider,
+            &qdrant.embedding_region,
+            1_000,
+            1_000,
+            &super::SEED_ADMIN,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let now = time::OffsetDateTime::now_utc();
+        let run = Uuid::new_v4();
+        let mut mint = |_| super::seed_key(&[7u8; 32]).0;
+        let tenant = provisioning::onboard_tenant(
+            maintenance,
+            &TenantRequest {
+                name: &format!("e2e-seed-{run}"),
+                owner_email: &format!("e2e-seed-{run}@e2e.invalid"),
+                workspace_name: "e2e-seed workspace",
+                reasoning_domain_name: "default",
+                plan_limit: 1000,
+                period_start: now - time::Duration::seconds(1),
+                period_end: now + time::Duration::hours(1),
+                provider_id: &qdrant.embedding_provider,
+                region: &qdrant.embedding_region,
+                tenant_tpm: 1_000,
+                tenant_rpm: 1_000,
+                scopes,
+                collection: &qdrant.collection,
+            },
+            &mut mint,
+            &super::SEED_ADMIN,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok((
+            tenant.tenant_id,
+            tenant.owner_user_id,
+            tenant.reasoning_domain_id,
+        ))
     }
 }

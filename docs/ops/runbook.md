@@ -54,19 +54,57 @@ before the mechanism-observation surface is used.
 
 ## 3. Tenant provisioning
 
-Through the membership admin path (card 12/13), **never raw SQL**. §0117 requires all four
-admission limit layers to be present — GLOBAL/REGION shared, tenant, and tenant×purpose. In
-production this is part of tenant onboarding; `docs/ops/e2e-seed.md` describes the same shape
-for a seeded environment.
+Card 28 / ADR-0053: onboarding is `humaux-maintenance` (the §4.2 operator-write process),
+**never raw SQL and never `xtask e2e-seed`** (the seed refuses any host but `127.0.0.1`). Every
+subcommand is one-shot and idempotent, prints ONE JSON receipt on stdout, and exits `0`
+created/existing, `3` refused (a named `reason`, nothing written), `2` usage, `1` infrastructure.
+Environment (no defaults): `HUMAUX_MAINTENANCE_PG_DSN` (role_maintenance),
+`HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX` (= the gateway's `HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX`),
+`HUMAUX_MAINTENANCE_QDRANT_{HOST,PORT,CIDR}`, `HUMAUX_MAINTENANCE_EMBEDDING_DIMENSION`,
+`HUMAUX_MAINTENANCE_PRIVATE_MEMORY_COLLECTION`. Every writing subcommand needs the §77 fields
+`--actor --reason --ticket --step-up-auth` (`--trace-id` optional).
 
-Qdrant collection creation must include **both** payload indexes: the tenant index and the
-`subject_ids` uuid index. Without the second, subject-scoped recall degrades to an unindexed
-filter (card 9 P2). `cargo run -p xtask -- e2e-seed` PUTs both for every collection it creates
-(`xtask/src/e2e_seed.rs:541-548`, bodies at `crates/adapters/src/qdrant.rs:178-199`) — until
-card 24 it PUT only the tenant index, so **a collection seeded before that change does not have
-the subject index**, and the seed tool short-circuits on an existing collection rather than
-adding it. Re-create such a collection, or PUT `subject_index_body()`'s body against it by
-hand.
+Once per deployment and embedding provider — the GLOBAL and REGION §0117 tiers (onboarding
+refuses with `deployment_admission_missing` until they exist):
+
+```sh
+humaux-maintenance deploy-init --provider dashscope --region <region> --tpm <n> --rpm <n> \
+  --actor <who> --reason <why> --ticket <ref> --step-up-auth <evidence>
+```
+
+Per tenant — one command does it all:
+
+```sh
+humaux-maintenance onboard tenant --name <unique name> --owner-email <email> \
+  --plan-limit <n> --period-end <RFC 3339> --scopes memory:write,context:read --key-name <name> \
+  --provider dashscope --region <region> --tenant-tpm <n> --tenant-rpm <n> [--workspace <name>] \
+  --actor <who> --reason <why> --ticket <ref> --step-up-auth <evidence>
+```
+
+It writes, in ONE transaction, the owner user (email stored unverified, §74 is post-go-live),
+the tenant (`onboarding_name` = `--name`, the idempotency key), the OWNER membership, the
+reasoning domain, the entitlement snapshot, the TENANT + two PURPOSE tiers, the workspace in
+`PROVISIONING` with its OWNER workspace membership and zeroed checkpoint rows, the placement row
+and — only when the tenant was created — the API key; then issues the quota window, ensures the
+Qdrant collection with **both** payload indexes (`tenant_id`, `subject_ids`), and performs the
+VerifiedEmpty first activation (§6), which flips the workspace to `READY`. The receipt lists
+`tenant_id`, `workspace_id`, `owner_user_id`, `reasoning_domain_id`, `api_key.fingerprint` (prefix +
+first four hash bytes), `admission_tiers` (GLOBAL, REGION, TENANT, PURPOSE ×2), `placements`,
+`collection` (+ `payload_indexes`, `generation`), `activations[]` (`evidence: "VerifiedEmpty"`,
+probe latency) and `lifecycle`. **The API key is printed once**, as the line
+`Authorization: Bearer <prefix>.<secret>` before the JSON, only when it was created. A re-run with
+the same `--name` writes nothing, prints `"outcome":"existing"` and no key: a lost key is revoked
+(`apikey revoke --tenant <id> --key-name <name>`) and a new one issued
+(`apikey issue --tenant --user --workspace --scopes --key-name <new name>`).
+
+More workspaces and users: `onboard workspace --tenant <id> --name <n> --owner <user id>`,
+`onboard user --tenant <id> --email <e> --role OWNER|ADMIN|MEMBER [--workspace <id>]`. Repair
+steps if a run was interrupted: `placement ensure --tenant <id>`, `collection ensure`,
+`activate --tenant <id> --workspace <id>`; `status --tenant <id>` shows workspaces + lifecycle,
+families (serving, highwaters), activation receipts, placement, key prefixes and tiers.
+
+A collection created before card 24 lacks the `subject_ids` index; `collection ensure` PUTs both
+indexes idempotently, so running it once fixes such a collection.
 
 ## 4. Environment
 
@@ -112,15 +150,32 @@ UDS peer, and the gateway's semantic recall needs the retrieval worker's socket.
 consumer before its socket exists produces a readiness failure that names the missing socket
 (`docs/ops/supervision.md` §2) — correct behaviour, but an avoidable page.
 
-## 6. First activation — the step that is easy to miss
+## 6. First activation — performed by onboarding (ADR-0053)
 
-A fresh deployment has **no serving projection version**. After the projection runner
-(`--serve`, §5 step 3) has caught up on a (tenant, workspace) family, activate it — all five
-flags are required (`xtask/src/projection_serve.rs`):
+A family (tenant, workspace, `private_memory`/`PRIVATE_MEMORY`/`v1`) is first activated by
+`onboard tenant` / `onboard workspace` themselves, with **VerifiedEmpty** evidence: the family's
+checkpoint row, stream log, outbox, point registry and gaps are all zero (derived by the DB, never
+declared), a Qdrant count of the family in the collection's current generation is zero, and the
+workspace is still `PROVISIONING` — which also means no write could have landed: while a workspace
+is `PROVISIONING`, every stream-issuing write (`remember.put`, the governance tickets, distill,
+consolidation) is refused with `CONFLICT` (SQLSTATE 55000 `workspace_provisioning`). The receipt
+lands in `projection.family_activations`; when the last family of the workspace serves, it becomes
+`READY`. From that moment `memory.get` answers `NOT_FOUND`, `memory.enumerate` an exact empty
+census, `recall.search` an empty result with `current = true`, `context.assemble` an empty
+envelope — no `DEPENDENCY_UNAVAILABLE` — and the resident runner's projections are read as they
+land, with no further operator action. `humaux-maintenance activate --tenant <id> --workspace <id>`
+repeats it idempotently (`existing` once done) or finishes a run that crashed between the
+PostgreSQL transaction and the activation (the workspace then stays `PROVISIONING`: writes
+closed, `memory.get`/`enumerate` PG-served, recall/context the explicit B read with reason
+`no_serving_projection`).
+
+`cargo xtask projection-serve` is now only for **version upgrades** (and for `LEGACY` pairs made
+before card 28, which are never gated and never auto-activated) — for the version onboarding
+activated it prints "already serving" and exits 0:
 
 ```sh
 cargo xtask projection-serve --tenant <tenant_id> --workspace <workspace_id> \
-  --domain private_memory --projection-kind PRIVATE_MEMORY --version v1 \
+  --domain private_memory --projection-kind PRIVATE_MEMORY --version <v> \
   [--retire-failed distill_failed,no_visible_memory_record]
 ```
 
@@ -129,13 +184,9 @@ to `RETIRED_FAILED` (0167, audited), because one `FAILED` ticket pins the §15.4
 card 27 a transient failure is a bounded retry, not `FAILED`; what still lands in `FAILED` is a
 permanent class (`qdrant_upsert_rejected`, `embedding_rejected`, `embedding_dimension_mismatch`,
 `card_unbuildable`, `secret_scan_rejected`, `registry_conflict`, `distill_failed`, …) or `transient_exhausted`.
-
-**First activation stays an operator act until card 28** — per (tenant, workspace), once. The
-runner projects a family whether or not it is serving; recall reads only the serving version.
-ADR-0017: with no serving version, activation is an explicit operator act, not an automatic
-promotion. Later version upgrades go through the §16.2 two-version comparison instead — and see
-`docs/ops/delivery_point_report.md` §6.1 before assuming that comparison will succeed: a tenant
-with any live projected `USER_PRIVATE` point makes the switch refuse with `VisibleUnavailable`.
+Version upgrades go through the §16.2 two-version comparison — see
+`docs/ops/delivery_point_report.md` §6.1 before assuming it will succeed: a tenant with any live
+projected `USER_PRIVATE` point makes the switch refuse with `VisibleUnavailable`.
 
 ## 7. Verify it is up
 

@@ -616,7 +616,7 @@ not, and it withdraws the "ready for production" reading of §5.**
   tickets across every placed tenant through the owner definer `projection.claim_issued_tickets`
   (migration 0176). The rehearsal's per-tenant `--run-once` shell loop is deleted; the rehearsal
   and the soak run the same single `--serve` process, with no tenant in its environment. First
-  activation of a (tenant, workspace) serving projection stays an operator act until card 28.
+  activation of a (tenant, workspace) serving projection stayed an operator act until card 28 (§6.13).
 - **C4 is closed: a transient projection failure is now a bounded retry.** Qdrant transport/5xx,
   provider 429/5xx, PG connection/serialization/lock errors, a lost registry race and an
   unconfirmed visibility probe return the ticket to `ISSUED` with exponential backoff
@@ -644,6 +644,41 @@ not, and it withdraws the "ready for production" reading of §5.**
   not by projection.
 - **Measurements** (n and unit per row, before/after plans): ADR-0052 §Measurements, from the
   rehearsal step `projection_serve_multi_tenant`.
+
+### 6.13 Closed by card 28 (ADR-0053)
+
+- **"There is no production onboarding path" is closed.** `humaux-maintenance` (the §4.2
+  operator-write process) is a real CLI: `deploy-init` (GLOBAL/REGION §0117 tiers), `onboard
+  tenant|workspace|user`, `apikey issue|revoke`, `placement ensure`, `collection ensure`, `activate`,
+  `status` — each one-shot, idempotent (a re-run writes nothing and answers `existing`), one JSON
+  receipt, exit 0/3/2/1, the API key printed once and nowhere else. Every write goes through eight
+  owner SECURITY DEFINER functions (migration 0186) executable by `role_maintenance` only; the
+  provisioning code moved out of `xtask e2e-seed` into `crates/adapters/src/provisioning.rs`, which the
+  seed now wraps (its 127.0.0.1 guard kept). Runbook §3.
+- **"Reads are DEPENDENCY_UNAVAILABLE until a manual projection-serve" is closed.** Onboarding
+  performs the first activation itself with VerifiedEmpty evidence (a new `ActivationEvidence` form,
+  ADR-0017 amended; the family's DB-derived head is 0 and the Qdrant family probe counts 0), and the
+  workspace is `READY` before its first write; while `PROVISIONING`, every stream-issuing write is
+  refused `CONFLICT` by an invoker trigger on the `issued_highwater` increment (migration 0185).
+  `memory.get` / `memory.enumerate` no longer need a serving version at all (PostgreSQL is the
+  authority; the visible count is then `null` and the census never claims `exact`), and
+  `recall.search` / `context.assemble` on an initialised but unserved family answer the explicit
+  B-shaped read (`cannot_establish / no_serving_projection`, `current = false`) instead of
+  `DEPENDENCY_UNAVAILABLE`; recall does it before paying for a query embedding. An uninitialised pair
+  (no checkpoint row) is still `DEPENDENCY_UNAVAILABLE`. Runbook §6.
+- **Acceptance** (`cargo xtask e2e-onboard`, fresh database 0001→head, release binaries, live DashScope
+  and MiniMax): the onboard receipt carries every field of the gate; immediately after it the four read
+  routes answer NOT_FOUND / exact total 0 / 0 items `current=true` / empty context, none
+  `DEPENDENCY_UNAVAILABLE`; 5 `remember.put` were recalled 35 s later with no operator action and no
+  `projection-serve`; a re-onboard wrote nothing; the five faults (non-empty family, missing placement,
+  write while PROVISIONING, concurrent onboard of one name, e2e-seed on a hostname DSN) were each
+  refused as specified. Measurements: ADR-0053 §Measurements.
+- **Known limits (ADR-0053):** the collection generation is a config digest (card 37 adds a real
+  generation column); `LEGACY` workspaces (every pre-0185 row) are never gated and are still activated
+  by `projection-serve`; the entitlement period and quota window are issued at onboarding only (renewal
+  is card 35's `--serve` job, until then a tenant past `--period-end` gets QUOTA/ENTITLEMENT); the owner
+  email is stored unverified (§74 is post-go-live); the BYOK distill lane is not part of onboarding
+  (card 52).
 
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 

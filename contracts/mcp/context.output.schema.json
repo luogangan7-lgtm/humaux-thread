@@ -195,7 +195,8 @@
                 "count_unknown",
                 "count_scope_mismatch",
                 "pipeline_count_mismatch",
-                "mandatory_not_satisfied"
+                "mandatory_not_satisfied",
+                "no_serving_projection"
               ]
             },
             "exact": {

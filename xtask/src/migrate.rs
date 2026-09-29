@@ -1,6 +1,6 @@
 //! `xtask::migrate` — applies migrations/*.sql in filename order against a live PostgreSQL instance (§46).
 //! Depends-on: crates=[humaux-testkit, postgres, toml]; services=[PostgreSQL(any) w=[ops.schema_migrations] x=[private.read_continuity_project_storage_v1]]; env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN]; modules=[xtask::migration_rehearsal]
-//! Called-by: [xtask::main, xtask::serial_lane]
+//! Called-by: [xtask::e2e_onboard, xtask::main, xtask::serial_lane]
 //! Invariants: [each PENDING migration runs in one explicit transaction (ADR-0050 D-D) unless its manifest says
 //!   transaction = "none" (only that value, only for a CONCURRENTLY body; ADR-0052 D-G); DSN missing ⇒ not_applicable
 //!   naming the missing object, never a silent skip; a second run is idempotent]

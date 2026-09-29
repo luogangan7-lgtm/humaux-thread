@@ -903,6 +903,7 @@ dependencies = [
  "humaux-testkit",
  "lettre",
  "postgres",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
@@ -1068,6 +1069,19 @@ dependencies = [
 [[package]]
 name = "humaux-maintenance"
 version = "0.1.0"
+dependencies = [
+ "humaux-adapters",
+ "humaux-domain",
+ "humaux-protocol",
+ "humaux-testkit",
+ "postgres",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "humaux-private-worker"
@@ -3825,6 +3839,7 @@ dependencies = [
  "postgres",
  "rand 0.9.5",
  "serde_json",
+ "time",
  "tokio",
  "toml",
  "uuid",

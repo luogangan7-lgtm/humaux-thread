@@ -1,12 +1,7 @@
 //! `gateway::recall` — Native authenticated semantic recall wiring.
 //! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, humaux-infra-cell,
 //!   humaux-local-secret-scan, humaux-projection, humaux-protocol, humaux-retrieval, serde_json, time,
-//!   uuid]; services=[]; env=[]; modules=[adapters::affect_repo, adapters::placement_repo, adapters::postgres,
-//!   adapters::qdrant, adapters::read_materialize, adapters::retrieve, application::affect,
-//!   application::retrieval_embedding_port, application::retrieve, domain::affect, domain::error, domain::identity,
-//!   domain::ids, domain::subject, gateway::context, humaux-local-secret-scan, infra-cell::permit,
-//!   infra-cell::resource, infra-cell::transport, projection::stream, protocol::mcp, protocol::mcp_catalog,
-//!   retrieval::completeness, retrieval::envelope, retrieval::planner, retrieval::request]
+//!   uuid]; services=[]; env=[]; modules=[adapters::affect_repo, adapters::placement_repo, adapters::postgres, adapters::qdrant, adapters::read_materialize, adapters::retrieve, adapters::serving_repo, application::affect, application::retrieval_embedding_port, application::retrieve, domain::affect, domain::error, domain::identity, domain::ids, domain::subject, gateway::context, humaux-local-secret-scan, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::stream, protocol::mcp, protocol::mcp_catalog, retrieval::completeness, retrieval::envelope, retrieval::planner, retrieval::request]
 //! Called-by: [gateway::bootstrap, gateway::context, gateway::mcp_application, tests]
 //! Invariants: [this module owns no alternate search or body fallback path; a Qdrant or provider failure surfaces as the typed retrieval error, never a degraded silent result]
 //! Spec: Baseline §17.3; §55.1; §78.1; ADR-0029; ADR-0031
@@ -32,8 +27,9 @@ use humaux_adapters::{
     read_materialize::MaterializedItem,
     retrieve::{
         IndexFace, MaterializedPrivateReadServing, materialize_private_read_serving_about,
-        private_read_projection_selector, visible_index_count,
+        visible_index_count,
     },
+    serving_repo::family_read_state,
 };
 use humaux_application::affect::rerank_by_mood;
 use humaux_application::{
@@ -65,6 +61,7 @@ use humaux_retrieval::{
         CompletenessBlock, CompletenessInputs, Envelope, FreshnessBlock, LaneStatus,
         MandatoryReport, PendingEnvelope, PinnedReport, PipelineBlock, ProfileBlock,
         ProvenanceBlock, ProvenanceValue, build_projection_block, envelope_outcome_block,
+        no_serving_projection_envelope,
     },
     planner::{PlannerDecision, QueryClass},
 };
@@ -259,7 +256,7 @@ pub async fn search(
         eprintln!("humaux-gateway: recall request_id={request_id} placement_missing");
         ErrorCode::DependencyUnavailable
     })?;
-    let (family, _) = bootstrap.request_stream(authorization.tenant_id(), input.workspace_id);
+    let (family, key) = bootstrap.request_stream(authorization.tenant_id(), input.workspace_id);
     let intent = RetrievalIntent::new(input.query, Vec::new(), BTreeSet::new(), BTreeSet::new())
         .map_err(|_| ErrorCode::InvalidInput)?;
     let retrieval = prepare_request(intent, &bootstrap.profile).map_err(|_| ErrorCode::Internal)?;
@@ -287,6 +284,47 @@ pub async fn search(
         );
         return Err(ErrorCode::InvalidInput);
     }
+    // ADR-0053 D-E: the serving read comes BEFORE the query embedding — an unactivated family
+    // cannot use a vector, so it pays no provider egress and no provider budget. Uninitialised
+    // key ⇒ DEPENDENCY_UNAVAILABLE (unchanged); initialised but unserved ⇒ the B-shaped read.
+    let state = family_read_state(&pool, &authorization, &key)
+        .await
+        .map_err(|_| {
+            eprintln!("humaux-gateway: recall request_id={request_id} projection_selector_failed");
+            ErrorCode::DependencyUnavailable
+        })?;
+    if !state.initialized {
+        eprintln!("humaux-gateway: recall request_id={request_id} stream_uninitialized");
+        return Err(ErrorCode::DependencyUnavailable);
+    }
+    let projection_version = match (state.serving, state.unserved) {
+        (Some(version), _) => version,
+        (None, Some((ledger, pipeline))) => {
+            eprintln!("humaux-gateway: recall request_id={request_id} no_serving_projection");
+            let (evidence, knowledge) = pipeline.blocks();
+            return no_serving_projection_envelope(
+                &retrieval,
+                &bootstrap.binary_build,
+                vec!["dense".to_owned()],
+                &ledger,
+                evidence,
+                knowledge,
+                |envelope: Envelope<Value>| {
+                    let value = serde_json::to_value(envelope).map_err(|_| ErrorCode::Internal)?;
+                    catalog.validate_output(ToolName::Recall, &value)?;
+                    let text = serde_json::to_string(&value).map_err(|_| ErrorCode::Internal)?;
+                    Ok(ToolOutput {
+                        text,
+                        structured_content: value,
+                    })
+                },
+            );
+        }
+        (None, None) => {
+            eprintln!("humaux-gateway: recall request_id={request_id} no_serving_projection");
+            return Err(ErrorCode::DependencyUnavailable);
+        }
+    };
     let trusted_query = retrieval.trusted_query().ok_or(ErrorCode::Internal)?;
     // Defense-in-depth local scan before the raw text crosses the wire to
     // `humaux-retrieval-worker` (which independently scans/seals it worker-side, ADR-0012 §2's
@@ -347,16 +385,6 @@ pub async fn search(
             return Err(ErrorCode::DependencyUnavailable);
         }
     };
-    let projection_version = private_read_projection_selector(&pool, &authorization, &family)
-        .await
-        .map_err(|_| {
-            eprintln!("humaux-gateway: recall request_id={request_id} projection_selector_failed");
-            ErrorCode::DependencyUnavailable
-        })?
-        .ok_or_else(|| {
-            eprintln!("humaux-gateway: recall request_id={request_id} no_serving_projection");
-            ErrorCode::DependencyUnavailable
-        })?;
     let dense = DenseQuery::new(
         &authorization,
         &placement,
@@ -453,7 +481,7 @@ pub async fn search(
             })?,
     };
     // §23.1②: the live index count, taken against the SERVING version this request actually
-    // read (`private_read_projection_selector` above), never the token's. `None` here is not a
+    // read (`family_read_state` above), never the token's. `None` here is not a
     // failure to handle — it is the honest "cannot establish" input `build_projection_block`
     // already knows how to report.
     let visible = visible_index_count(

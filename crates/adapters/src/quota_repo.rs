@@ -3,7 +3,7 @@
 //!   control.rate_buckets, control.usage_reservations] x=[control.issue_quota_window,
 //!   control.reap_quota_reservations], PostgreSQL(role_gateway), PostgreSQL(role_maintenance)]; env=[];
 //!   modules=[adapters::postgres, domain::audit, domain::error, domain::identity, domain::ids]
-//! Called-by: [adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::request_guard_repo, gateway::bootstrap, gateway::guard, tests, xtask::e2e_seed]
+//! Called-by: [adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::request_guard_repo, gateway::bootstrap, gateway::guard, maintenance::main, tests, xtask::e2e_seed]
 //! Invariants: [the gateway only consumes existing quota windows; only role_maintenance can issue or reap them;
 //!   exhaustion is QuotaExhausted/RateLimited and a PG error DependencyUnavailable, never an allow]
 //! Spec: none

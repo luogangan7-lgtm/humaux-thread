@@ -46,12 +46,22 @@ Prints, once, to stdout:
 Nothing is written to a file, logged, or stored — the bearer's secret half only ever
 appears in this one stdout line.
 
-Seeding also provisions the Qdrant collection this tenant recalls against (mirroring
-`bins/gateway/tests/semantic_recall_wiring.rs::create_collection` — `GET` first, skip if
-already provisioned, else the two `PUT`s: create-collection then the tenant keyword
-index) and inserts its `projection.tenant_placements` row
-(`placement_class='SHARED_FALLBACK'`). Without both, `tenant_placement(...)` resolves to
-`None` and semantic recall degrades closed with `DependencyUnavailable`.
+Card 28 (ADR-0053): the seed is a thin wrapper over the production onboarding library
+(`crates/adapters/src/provisioning.rs`, the same owner-definer doors `humaux-maintenance` uses —
+no INSERT of its own for tenant, users, workspaces, keys, tiers or placement). It runs
+`deploy-init` (GLOBAL/REGION tiers for `--embedding-provider`/`--embedding-region`, 1e9, never
+torn down), onboards a tenant named `e2e-seed-<uuid>` (owner `e2e-seed-<uuid>@e2e.invalid`,
+stored unverified), issues the quota window, adds `--workspaces` 2..n with their own keys,
+ensures the Qdrant collection with **both** payload indexes (`tenant_id`, `subject_ids`) and then
+**activates every workspace empty (VerifiedEmpty)** — a seeded workspace is `READY` and serving
+before any write, so the rehearsal's later `projection-serve` calls print "already serving" and
+exit 0. Only the BYOK distill lane (`seed_lane`, TEST health rows, not production) is still
+inserted by the seed itself (card 52). The printed lines are unchanged. The 127.0.0.1 /
+`humaux_thread_*` guard stays on both DSNs: production onboarding is `humaux-maintenance`
+(`docs/ops/runbook.md` §3), never this tool.
+
+Teardown additionally removes the tenant's `projection.family_activations`, workspace memberships,
+§77 audit rows and the owner's `control.user_emails` row.
 
 ## Teardown
 

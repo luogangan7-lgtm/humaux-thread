@@ -4,7 +4,7 @@
 //!   projection.processing_gaps, projection.stream_checkpoints, projection.stream_log], Qdrant(*), subprocess(ps),
 //!   subprocess(sh), HTTP(gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_SOAK_TEST_BEARER];
 //!   modules=[domain::ids, projection::serving, xtask::switch_visible]
-//! Called-by: [xtask::main]
+//! Called-by: [xtask::e2e_onboard, xtask::main]
 //! Invariants: [continuous concurrent load against the real four-process deployment while a chaos hook kills/restarts a worker; every read is asserted live against the database]
 //! Spec: Baseline §15.1; §15.3; §15.5; §31; §61; §6.1; ADR-0037; ADR-0050; ADR-0052
 //!
@@ -68,7 +68,7 @@ use std::time::{Duration, Instant};
 
 use humaux_domain::ids::TenantId;
 use humaux_projection::serving::{
-    ContinuationVerdict, StreamFamily, SwitchCriteria, evaluate_switch,
+    ActivationEvidence, ContinuationVerdict, StreamFamily, SwitchCriteria, evaluate_switch,
 };
 use postgres::{Client, NoTls};
 use uuid::Uuid;
@@ -1264,7 +1264,7 @@ pub fn switch_rejections(candidates: &[PromoteCandidate]) -> BTreeMap<String, i6
     let mut counts = BTreeMap::new();
     for c in candidates {
         let criteria = SwitchCriteria {
-            visible_shadow: c.visible_shadow.clone(),
+            shadow: ActivationEvidence::VisibleThrough(c.visible_shadow.clone()),
             visible_serving: c.visible_serving.clone(),
             first_activation: c.first_activation,
             shadow_open_gaps: u64::try_from(c.open_gaps).unwrap_or(u64::MAX),

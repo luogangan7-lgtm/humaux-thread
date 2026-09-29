@@ -20,6 +20,15 @@ code drift apart. Look a variable up there rather than copying it here.
 | `humaux-private-worker` | process alive | `--readyz` exit 0 | `--serve-rpc` / `--distill-serve` yes |
 | `humaux-consolidation-worker` | process alive | `--readyz` exit 0 | `--serve` yes |
 | `humaux-public-worker` | process alive | `--readyz` exit 0 | no — one bounded pass per invocation |
+| `humaux-maintenance` | — | — | no — CLI mode only (card 28); the resident `--serve` job is card 35 |
+
+`humaux-maintenance` (§4.2, the operator-write process) is not supervised: every subcommand
+(`deploy-init`, `onboard tenant|workspace|user`, `apikey issue|revoke`, `placement ensure`,
+`collection ensure`, `activate`, `status`) is one-shot, idempotent and prints one JSON receipt;
+exit `0` created/existing, `3` refused with a named reason, `2` usage, `1` infrastructure (the
+database or Qdrant it names is down — retry once it is up; a re-run never duplicates a row).
+It runs as its own OS user with `role_maintenance`'s DSN and the credential pepper, which no
+resident process except the gateway holds. Operating it: `docs/ops/runbook.md` §3 and §6.
 
 The four workers have no HTTP surface, so their readiness is an **exec probe**: run the binary
 with `--readyz`, exit 0 = ready. It performs one live round trip per dependency and exits; it

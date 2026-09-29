@@ -1,5 +1,5 @@
 //! `xtask::rls_check` — G80-26 (§48.2) runtime DB role invariant CI enumeration gate.
-//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.current_reasoning_route_binding, control.resolve_user_reasoning_admission, ops.claim_derived_work, ops.contribution_reservation_authority_validate, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.claim_issued_tickets, projection.retire_failed_ticket, projection.stream_log_guard_state_transition, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal]]; env=[CARGO_MANIFEST_DIR, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
+//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant, control.onboard_workspace, control.resolve_user_reasoning_admission, control.revoke_api_key, ops.claim_derived_work, ops.contribution_reservation_authority_validate, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal]]; env=[CARGO_MANIFEST_DIR, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
 //! Called-by: [xtask::dep_map, xtask::main]
 //! Invariants: [any catalog cell that disagrees with §48.2 / §62 grants is fail, named by role and table]
 //! Spec: Baseline §48.2; §62
@@ -304,6 +304,14 @@ const MATRIX: &[Cell] = &[
         "role_maintenance",
         ["SELECT"],
         [("UPDATE", ["serving", "shadow"])]
+    ),
+    // projection.family_activations (0185, ADR-0053): the VerifiedEmpty receipt. Written only by
+    // the owner definer projection.activate_empty_family; `status` reads it as maintenance. Every
+    // other non-owner role is `—` (overrides the projection-domain default).
+    cell!(
+        "projection.family_activations",
+        "role_maintenance",
+        ["SELECT"]
     ),
     // role_consolidation_worker (migration 0144): same column-scoped INSERT+UPDATE shape as
     // role_gateway's own bootstrap-then-increment issuer grant, for its own private_memory
@@ -3836,6 +3844,119 @@ pub fn check_projection_claim_boundary(client: &mut impl GenericClient) -> GateR
     }
 }
 
+/// ADR-0053 (migrations 0185/0186, card 28): the eight onboarding doors, all executable by
+/// `role_maintenance` only.
+const ONBOARDING_FUNCTIONS: [&str; 8] = [
+    "control.ensure_admission_tier(text,text,uuid,text,bigint,bigint)",
+    "control.ensure_user(text,text)",
+    "control.onboard_tenant(text,uuid,text,text,bigint,timestamptz,timestamptz,text,text,bigint,bigint,text[])",
+    "control.onboard_workspace(uuid,text,uuid,text[])",
+    "control.issue_api_key(uuid,uuid,uuid,text,bytea,text[])",
+    "control.revoke_api_key(uuid,text)",
+    "projection.ensure_tenant_placement(uuid,text,text)",
+    "projection.activate_empty_family(uuid,uuid,text,text,text,text,text,uuid,bigint,timestamptz)",
+];
+const ONBOARDING_EXECUTORS: &[&str] = &["role_maintenance"];
+const WRITE_GATE_FN: &str = "projection.stream_checkpoints_workspace_write_gate()";
+
+/// ADR-0053 (migrations 0185/0186, card 28): production onboarding's boundary.
+///
+/// * the eight doors are owner-owned, SECURITY DEFINER, `search_path=pg_catalog`, EXECUTE held
+///   by exactly `role_maintenance`, PUBLIC revoked;
+/// * the PROVISIONING write gate: trigger `stream_checkpoints_workspace_write_gate` exists on
+///   `projection.stream_checkpoints` and is enabled; its function is owner-owned, SECURITY
+///   INVOKER, `search_path=pg_catalog`, and raises 55000;
+/// * no non-owner role can write `control.workspaces` at table or column level — the two doors
+///   (`onboard_workspace` → PROVISIONING, `activate_empty_family` → READY) are the only way the
+///   lifecycle moves.
+///
+/// Missing objects ⇒ `not_applicable` with the object named (§57.1).
+pub fn check_onboarding_boundary(client: &mut impl GenericClient) -> GateResult {
+    let check = "ADR-0053 onboarding doors and PROVISIONING write gate";
+    let present: bool = match client.query_one(
+        "SELECT bool_and(to_regprocedure(f) IS NOT NULL) AND to_regprocedure($2) IS NOT NULL \
+         FROM unnest($1::text[]) AS f",
+        &[&ONBOARDING_FUNCTIONS.to_vec(), &WRITE_GATE_FN],
+    ) {
+        Ok(row) => row.get::<_, Option<bool>>(0).unwrap_or(false),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    if !present {
+        return not_applicable(
+            check,
+            format!("missing one of the 0186 onboarding functions or {WRITE_GATE_FN}"),
+        );
+    }
+
+    let mut problems = Vec::new();
+    for function in ONBOARDING_FUNCTIONS {
+        check_owner_definer_function(client, &mut problems, function, ONBOARDING_EXECUTORS);
+    }
+    match client.query_opt(
+        "SELECT t.tgenabled::text, pg_get_userbyid(p.proowner), p.prosecdef, \
+                coalesce(p.proconfig, ARRAY[]::text[]), p.prosrc \
+         FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid \
+         WHERE t.tgrelid = 'projection.stream_checkpoints'::regclass \
+           AND t.tgname = 'stream_checkpoints_workspace_write_gate' AND NOT t.tgisinternal",
+        &[],
+    ) {
+        Ok(Some(row)) => {
+            let enabled: String = row.get(0);
+            let owner: String = row.get(1);
+            let definer: bool = row.get(2);
+            let config: Vec<String> = row.get(3);
+            let source: String = row.get(4);
+            if enabled != "O"
+                || owner != OWNER_ROLE
+                || definer
+                || !config.iter().any(|v| v == "search_path=pg_catalog")
+                || !source.contains("55000")
+            {
+                problems.push(format!(
+                    "write gate: expected enabled trigger, owner={OWNER_ROLE}, SECURITY INVOKER, \
+                     search_path=pg_catalog, raising 55000; actual enabled={enabled}, \
+                     owner={owner}, definer={definer}, config={config:?}, raises_55000={}",
+                    source.contains("55000")
+                ));
+            }
+        }
+        Ok(None) => problems.push(
+            "missing trigger stream_checkpoints_workspace_write_gate on projection.stream_checkpoints"
+                .to_string(),
+        ),
+        Err(error) => problems.push(format!("write gate probe failed: {error}")),
+    }
+    for role in NON_OWNER_ROLES {
+        match client.query_one(
+            "SELECT has_table_privilege($1::text, 'control.workspaces', 'INSERT,UPDATE') \
+                 OR has_any_column_privilege($1::text, 'control.workspaces', 'INSERT,UPDATE')",
+            &[role],
+        ) {
+            Ok(row) => {
+                if row.get::<_, bool>(0) {
+                    problems.push(format!(
+                        "{role} can write control.workspaces: the lifecycle would move outside \
+                         the two onboarding doors"
+                    ));
+                }
+            }
+            Err(error) => problems.push(format!("control.workspaces/{role} probe failed: {error}")),
+        }
+    }
+
+    if problems.is_empty() {
+        pass(
+            check,
+            "8 onboarding definers: owner SECURITY DEFINER, search_path pinned, EXECUTE exactly \
+             {role_maintenance}, PUBLIC revoked; stream_checkpoints_workspace_write_gate enabled, \
+             owner-owned invoker, search_path pinned, raises 55000; no non-owner role writes \
+             control.workspaces",
+        )
+    } else {
+        fail(check, problems.join("; "))
+    }
+}
+
 pub fn run(_args: &[String]) -> i32 {
     let mut results = Vec::new();
 
@@ -3866,6 +3987,7 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_derived_work_dispatch_boundary(&mut client));
             results.push(check_ticket_retirement_boundary(&mut client));
             results.push(check_projection_claim_boundary(&mut client));
+            results.push(check_onboarding_boundary(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -3885,6 +4007,7 @@ pub fn run(_args: &[String]) -> i32 {
                 "§31/§61 derived work cross-tenant dispatch",
                 "§15.2/§15.4 FAILED ticket retirement boundary",
                 "ADR-0052 projection ticket cross-tenant claim",
+                "ADR-0053 onboarding doors and PROVISIONING write gate",
             ] {
                 results.push(fail_for(name, &conn_err));
             }
