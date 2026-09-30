@@ -1276,7 +1276,7 @@ pub async fn visible_count_of_version(
 // §37's own purge SLA (`forget_repo::tombstoned_unpurged_over_sla`); if that gauge is ever
 // allowed to grow without bound, switch this to a `source_stream_seq` range overlay or push the
 // exclusion into the projection worker's own delete, and keep the fault test.
-pub(crate) async fn tombstoned_source_seqs(
+pub async fn tombstoned_source_seqs(
     pool: &RuntimeDbPool,
     authorization: &AuthorizationScope,
     key: &StreamKey,

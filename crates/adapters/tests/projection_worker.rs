@@ -4,8 +4,8 @@
 //!   humaux-projection, humaux-retrieval-provider, humaux-testkit, postgres, serde_json, sha2, sqlx, time, tokio];
 //!   services=[PostgreSQL(any) r=[ops.commit_seq_seq, private.ingest_tickets] w=[control.memberships,
 //!   control.private_reasoning_domains, control.tenants, control.users, control.workspace_memberships,
-//!   control.workspaces, ops.outbox, private.events, private.evidence_objects, private.memory_evidence,
-//!   private.memory_records, private.memory_subjects, private.subjects, projection.private_memory_points,
+//!   control.workspaces, ops.outbox, private.events, private.evidence_objects, private.memory_affects,
+//!   private.memory_evidence, private.memory_records, private.memory_subjects, private.subjects, projection.private_memory_points,
 //!   projection.stream_checkpoints, projection.stream_log] x=[private.memory_subject_visibility_ok],
 //!   PostgreSQL(role_batch_issuer), PostgreSQL(role_gateway), PostgreSQL(role_retrieval_worker), Qdrant(*),
 //!   subprocess(gitleaks)]; env=[HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_PG_DSN,
@@ -16,7 +16,7 @@
 //! Called-by: [cargo-test]
 //! Invariants: [uses a throwaway tenant and Qdrant collection cleaned up on Drop; a ticket is marked done only after
 //!   search-visible confirmation; no DSN, unreachable PG/Qdrant or no local gitleaks is a visible SKIP]
-//! Spec: Baseline §17.4; §15.7; §79.2
+//! Spec: Baseline §17.4; §15.7; §79.2; ADR-0055
 //!
 //! Same convention as `outbox_batch_remember.rs`/`stream_repo.rs`: throwaway
 //! `control.tenants` row + throwaway Qdrant collection, cleaned up on `Drop`.
@@ -2510,4 +2510,274 @@ fn outbox_status(handle: &mut Handle, stream_seq: i64) -> String {
         )
         .expect("carrier outbox row")
         .get(0)
+}
+
+// ---- ADR-0055 D-B: the `archived` payload flag follows the PG row on every ticket ----
+
+/// The (`archived`, `status`) payload pair of one point, read back through a raw payload scroll.
+/// `None` for `archived` = the point carries no flag (never the case after card 30).
+fn lifecycle_flags(handle: &Handle, point: Uuid) -> (Option<bool>, String) {
+    let permit = authorize_cell_access(
+        &handle.registry,
+        IntraCellResource::QDRANT_REST,
+        Duration::from_secs(30),
+    )
+    .expect("admin Qdrant permit");
+    let scrolled = scroll_payloads(handle, &permit, &[point]);
+    let payload = &scrolled["result"]["points"][0]["payload"];
+    assert!(
+        payload.is_object(),
+        "point {point} is in the index: {scrolled}"
+    );
+    (
+        payload["archived"].as_bool(),
+        payload["status"].as_str().unwrap_or_default().to_owned(),
+    )
+}
+
+/// One lifecycle step the way `memory_governance_repo` performs it: the PG write, then the
+/// existing MEMORY_LIFECYCLE ticket bound to the memory's PRIMARY Evidence, then one worker pass.
+fn lifecycle_step(
+    handle: &mut Handle,
+    deps: &ProjectionWorkerDeps,
+    scope_id: Uuid,
+    memory_id: Uuid,
+    sql: &str,
+) {
+    handle
+        .admin
+        .execute(sql, &[&memory_id])
+        .expect("lifecycle PG write");
+    reissue_lifecycle_ticket(handle, scope_id, memory_id);
+    let outcome = handle.rt.block_on(run_once(deps, 10)).expect("run_once");
+    assert_eq!(outcome.failed, 0, "{outcome:?}");
+}
+
+const ARCHIVE: &str = "UPDATE private.memory_records SET archived_at = now() WHERE memory_id = $1";
+const UNARCHIVE: &str = "UPDATE private.memory_records SET archived_at = NULL WHERE memory_id = $1";
+
+/// Seeds `n` TENANT_SHARED memories in a fresh scope, projects them once, and returns the scope,
+/// the worker deps and the memory ids.
+fn projected_memories(handle: &mut Handle, n: usize) -> (Uuid, ProjectionWorkerDeps, Vec<Uuid>) {
+    let scope_id = Uuid::new_v4();
+    let memories: Vec<Uuid> = (0..n)
+        .map(|i| {
+            seed_memory_with_visibility(
+                handle,
+                scope_id,
+                &format!("card 30 lifecycle fixture memory {i}"),
+                "TENANT_SHARED",
+                None,
+                None,
+            )
+            .1
+        })
+        .collect();
+    let provider = Arc::new(TestDoubleProvider::new(
+        embedding_model(),
+        unused_rerank_model(),
+    ));
+    let deps = handle.rt.block_on(deps_for(handle, scope_id, provider));
+    let outcome = handle
+        .rt
+        .block_on(run_once(&deps, 10))
+        .expect("first run_once");
+    assert_eq!(
+        (outcome.done, outcome.failed),
+        (u64::try_from(n).expect("n"), 0),
+        "{outcome:?}"
+    );
+    (scope_id, deps, memories)
+}
+
+#[test]
+fn archive_ticket_reupserts_the_same_point_with_archived_true() {
+    run_db_fixture::<Fixture, _>(
+        "archive_ticket_reupserts_the_same_point_with_archived_true",
+        |mut handle| {
+            let (scope_id, deps, memories) = projected_memories(&mut handle, 1);
+            let point = point_id_for_memory(&mut handle, memories[0]);
+            assert_eq!(
+                lifecycle_flags(&handle, point),
+                (Some(false), "active".to_owned())
+            );
+            lifecycle_step(&mut handle, &deps, scope_id, memories[0], ARCHIVE);
+            assert_eq!(
+                point_id_for_memory(&mut handle, memories[0]),
+                point,
+                "same point id"
+            );
+            assert_eq!(
+                lifecycle_flags(&handle, point),
+                (Some(true), "active".to_owned())
+            );
+        },
+    );
+}
+
+#[test]
+fn unarchive_ticket_reupserts_the_same_point_with_archived_false() {
+    run_db_fixture::<Fixture, _>(
+        "unarchive_ticket_reupserts_the_same_point_with_archived_false",
+        |mut handle| {
+            let (scope_id, deps, memories) = projected_memories(&mut handle, 1);
+            let point = point_id_for_memory(&mut handle, memories[0]);
+            lifecycle_step(&mut handle, &deps, scope_id, memories[0], ARCHIVE);
+            assert_eq!(lifecycle_flags(&handle, point).0, Some(true));
+            lifecycle_step(&mut handle, &deps, scope_id, memories[0], UNARCHIVE);
+            assert_eq!(
+                point_id_for_memory(&mut handle, memories[0]),
+                point,
+                "same point id"
+            );
+            assert_eq!(
+                lifecycle_flags(&handle, point),
+                (Some(false), "active".to_owned())
+            );
+        },
+    );
+}
+
+/// ADR-0055 lifecycle matrix: archive survives supersede → restore. The superseded memory's
+/// point is retired (ADR-0049); the restore revives the SAME point and the flag is read from the
+/// row again — still archived, because restore never touches `archived_at`.
+#[test]
+fn restore_of_an_archived_memory_revives_the_point_with_archived_true() {
+    run_db_fixture::<Fixture, _>(
+        "restore_of_an_archived_memory_revives_the_point_with_archived_true",
+        |mut handle| {
+            let (scope_id, deps, memories) = projected_memories(&mut handle, 2);
+            let (a, b) = (memories[0], memories[1]);
+            let point = point_id_for_memory(&mut handle, a);
+            lifecycle_step(&mut handle, &deps, scope_id, a, ARCHIVE);
+            handle
+                .admin
+                .execute(
+                    "UPDATE private.memory_records \
+                        SET status = 'superseded', superseded_by = $2, superseded_at = now() \
+                      WHERE memory_id = $1",
+                    &[&a, &b],
+                )
+                .expect("supersede a");
+            reissue_lifecycle_ticket(&mut handle, scope_id, a);
+            handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("retire pass");
+            let permit = authorize_cell_access(
+                &handle.registry,
+                IntraCellResource::QDRANT_REST,
+                Duration::from_secs(30),
+            )
+            .expect("admin Qdrant permit");
+            assert_eq!(
+                scroll_payloads(&handle, &permit, &[point])["result"]["points"]
+                    .as_array()
+                    .map_or(0, Vec::len),
+                0,
+                "superseded ⇒ retired point"
+            );
+            lifecycle_step(
+                &mut handle,
+                &deps,
+                scope_id,
+                a,
+                "UPDATE private.memory_records \
+                    SET status = 'active', superseded_by = NULL, superseded_at = NULL \
+                  WHERE memory_id = $1",
+            );
+            assert_eq!(
+                point_id_for_memory(&mut handle, a),
+                point,
+                "revived, same point id"
+            );
+            assert_eq!(
+                lifecycle_flags(&handle, point),
+                (Some(true), "active".to_owned())
+            );
+        },
+    );
+}
+
+/// An unrelated re-projection (affect annotate re-issues MEMORY_LIFECYCLE) must carry the
+/// archive flag from PG, never reset it to the default.
+#[test]
+fn annotate_ticket_on_an_archived_memory_keeps_archived_true() {
+    run_db_fixture::<Fixture, _>(
+        "annotate_ticket_on_an_archived_memory_keeps_archived_true",
+        |mut handle| {
+            let (scope_id, deps, memories) = projected_memories(&mut handle, 1);
+            let point = point_id_for_memory(&mut handle, memories[0]);
+            lifecycle_step(&mut handle, &deps, scope_id, memories[0], ARCHIVE);
+            lifecycle_step(
+                &mut handle,
+                &deps,
+                scope_id,
+                memories[0],
+                "INSERT INTO private.memory_affects \
+                   (tenant_id, memory_id, affect_kind, label, valence_bp, arousal_bp, intensity_bp, \
+                    confidence_bp, evidence_id, observed_at) \
+                 SELECT m.tenant_id, m.memory_id, 'EMOTION', 'JOY', 5000, 2000, 6000, 10000, \
+                        me.evidence_id, now() \
+                 FROM private.memory_records m \
+                 JOIN private.memory_evidence me ON me.memory_id = m.memory_id \
+                 WHERE m.memory_id = $1 LIMIT 1",
+            );
+            let permit = authorize_cell_access(
+                &handle.registry,
+                IntraCellResource::QDRANT_REST,
+                Duration::from_secs(30),
+            )
+            .expect("admin Qdrant permit");
+            let scrolled = scroll_payloads(&handle, &permit, &[point]);
+            assert_eq!(
+                scrolled["result"]["points"][0]["payload"]["affect_kinds"],
+                serde_json::json!(["EMOTION"]),
+                "the annotate ticket really re-projected: {scrolled}"
+            );
+            assert_eq!(
+                lifecycle_flags(&handle, point),
+                (Some(true), "active".to_owned())
+            );
+        },
+    );
+}
+
+/// `memory.correct`: M1 (archived, projected) is superseded by a freshly inserted M2 whose own
+/// ticket projects it. M2's point is live — `archived=false`, `status="active"` — whatever M1's
+/// flags were (the flag is per memory row, never inherited).
+#[test]
+fn correct_ticket_projects_the_successor_with_archived_false_and_status_active() {
+    run_db_fixture::<Fixture, _>(
+        "correct_ticket_projects_the_successor_with_archived_false_and_status_active",
+        |mut handle| {
+            let (scope_id, deps, memories) = projected_memories(&mut handle, 1);
+            let m1 = memories[0];
+            lifecycle_step(&mut handle, &deps, scope_id, m1, ARCHIVE);
+            let (_, m2) = seed_memory_with_visibility(
+                &mut handle,
+                scope_id,
+                "card 30 corrected successor",
+                "TENANT_SHARED",
+                None,
+                None,
+            );
+            handle
+                .admin
+                .execute(
+                    "UPDATE private.memory_records \
+                        SET status = 'superseded', superseded_by = $2, superseded_at = now() \
+                      WHERE memory_id = $1",
+                    &[&m1, &m2],
+                )
+                .expect("m2 corrects m1");
+            let outcome = handle.rt.block_on(run_once(&deps, 10)).expect("m2 pass");
+            assert_eq!(outcome.failed, 0, "{outcome:?}");
+            let point = point_id_for_memory(&mut handle, m2);
+            assert_eq!(
+                lifecycle_flags(&handle, point),
+                (Some(false), "active".to_owned())
+            );
+        },
+    );
 }

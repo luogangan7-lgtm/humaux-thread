@@ -6645,8 +6645,10 @@ mod tests {
         let root = real_root();
         let src = fs::read_to_string(root.join("crates/telemetry/src/degrade.rs")).unwrap();
         let variants = parse_degrade_variant_names(&src);
-        assert_eq!(variants.len(), 10, "{variants:?}");
+        // card 30 (ADR-0055 D-C) added `LaneSubstituted`: Baseline §53.2 now lists 11 variants.
+        assert_eq!(variants.len(), 11, "{variants:?}");
         assert!(variants.contains(&"ProjectionInvisibleLoss".to_string()));
+        assert!(variants.contains(&"LaneSubstituted".to_string()));
         assert!(variants.contains(&"RerankProviderTimeout".to_string()));
     }
 

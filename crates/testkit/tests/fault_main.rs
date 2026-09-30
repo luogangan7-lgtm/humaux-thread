@@ -1,5 +1,5 @@
 //! `testkit::tests::fault_main` — Cargo integration-test entry point for `tests/fault/` (§53.4).
-//! Depends-on: crates=[]; services=[]; env=[]; modules=[testkit::tests::fault::completeness_unknown, testkit::tests::fault::egress_denied, testkit::tests::fault::embed_provider_timeout, testkit::tests::fault::graph_expand_capped, testkit::tests::fault::projection_invisible_loss, testkit::tests::fault::projection_lag, testkit::tests::fault::rerank_model_mismatch, testkit::tests::fault::rerank_provider_timeout, testkit::tests::fault::state_pin_ambiguous, testkit::tests::fault::state_pin_missing]
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[testkit::tests::fault::completeness_unknown, testkit::tests::fault::egress_denied, testkit::tests::fault::embed_provider_timeout, testkit::tests::fault::graph_expand_capped, testkit::tests::fault::lane_substituted, testkit::tests::fault::projection_invisible_loss, testkit::tests::fault::projection_lag, testkit::tests::fault::rerank_model_mismatch, testkit::tests::fault::rerank_provider_timeout, testkit::tests::fault::state_pin_ambiguous, testkit::tests::fault::state_pin_missing]
 //! Called-by: [cargo-test]
 //! Invariants: []
 //! Spec: none
@@ -19,6 +19,8 @@ mod egress_denied;
 mod embed_provider_timeout;
 #[path = "fault/graph_expand_capped.rs"]
 mod graph_expand_capped;
+#[path = "fault/lane_substituted.rs"]
+mod lane_substituted;
 #[path = "fault/projection_invisible_loss.rs"]
 mod projection_invisible_loss;
 #[path = "fault/projection_lag.rs"]

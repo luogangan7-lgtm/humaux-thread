@@ -109,6 +109,7 @@ fn no_source_file_outside_dense_rs_constructs_condition_directly() {
         "Condition::Eq {",
         "Condition::In {",
         "Condition::Range {",
+        "Condition::NotTrue {",
         "DenseQueryFilter(",
     ];
 
@@ -169,6 +170,7 @@ fn construction_detector_still_finds_the_real_constructions_in_dense_rs() {
         "Condition::Eq {",
         "Condition::In {",
         "Condition::Range {",
+        "Condition::NotTrue {",
     ]
     .iter()
     .map(|p| construction_hits(&source, p))

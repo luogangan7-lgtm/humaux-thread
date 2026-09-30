@@ -3,6 +3,12 @@
 set -u
 S=${HUMAUX_REHEARSE_WORK:-${TMPDIR:-/tmp}/humaux-rehearsal}   # work dir: pidfiles, helpers, evidence (override with HUMAUX_REHEARSE_WORK)
 EV=$S/e2e_evidence; SOCK=/tmp/hq-e2e; mkdir -p $EV $SOCK
+# Card 30 (ADR-0055 D-E): one build profile for every binary this script builds, spawns, probes
+# or writes into a chaos hook. `release` is what the recall stage timing is measured on; the
+# default stays `debug` so every earlier gate keeps its shape.
+REHEARSE_PROFILE=${REHEARSE_PROFILE:-debug}
+case $REHEARSE_PROFILE in debug|release) ;; *) echo "REHEARSE_PROFILE must be debug or release"; exit 2;; esac
+BIN_DIR="${CARGO_TARGET_DIR:-target}/$REHEARSE_PROFILE"
 R=/Volumes/data/humaux-thread; cd $R
 PG=127.0.0.1:54329; DB=${HUMAUX_REHEARSE_DB:-humaux_thread_dev}; MYUID=$(id -u)
 export HUMAUX_TEST_PG_DSN="postgres://postgres:devlocal@$PG/$DB" HUMAUX_MAINTENANCE_PG_DSN="postgres://role_maintenance:devlocal_role_maintenance@$PG/$DB"
@@ -94,7 +100,9 @@ print('' if v is None else (json.dumps(v) if isinstance(v,(dict,list)) else v))"
 
 # ---------- 0. build ----------
 step build
-cargo build -p humaux-gateway -p humaux-retrieval-worker -p humaux-consolidation-worker -p humaux-private-worker -p xtask 2>&1 | tail -2 | tee -a $EV/rehearsal.log
+BUILD_FLAGS=(); [ "$REHEARSE_PROFILE" = release ] && BUILD_FLAGS=(--release)
+cargo build $BUILD_FLAGS -p humaux-gateway -p humaux-retrieval-worker -p humaux-consolidation-worker -p humaux-private-worker -p xtask 2>&1 | tail -2 | tee -a $EV/rehearsal.log
+echo "build profile: $REHEARSE_PROFILE ($BIN_DIR)" | tee -a $EV/rehearsal.log
 
 # ---------- 1. seed (stdout kept in a variable only) ----------
 step seed
@@ -170,7 +178,7 @@ start_pw() {
     HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
     HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS"
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-private-worker --serve-rpc >> $EV/private-worker.log 2>&1 ) &
+  exec "$BIN_DIR"/humaux-private-worker --serve-rpc >> $EV/private-worker.log 2>&1 ) &
 own_pid pw $!
 }
 start_pw; PW_PID=$(cat $S/pw.pid)
@@ -183,7 +191,7 @@ start_rw() {
     HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID HUMAUX_RETRIEVAL_WORKER_CALLER=retrieval-worker \
     HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER
   set -a; source $R/.env.local; set +a
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --serve-rpc >> $EV/retrieval-worker.log 2>&1 ) &
+  exec "$BIN_DIR"/humaux-retrieval-worker --serve-rpc >> $EV/retrieval-worker.log 2>&1 ) &
 own_pid rw $!
 }
 start_rw; RW_PID=$(cat $S/rw.pid)
@@ -204,7 +212,7 @@ start_rp() {
     HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER
   eval "export $RP_PASS_ENV"
   set -a; source $R/.env.local; set +a
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --serve >> $EV/projection-runner.log 2>&1 ) &
+  exec "$BIN_DIR"/humaux-retrieval-worker --serve >> $EV/projection-runner.log 2>&1 ) &
 own_pid rp $!
 }
 start_rp; RP_PID=$(cat $S/rp.pid)
@@ -225,7 +233,7 @@ start_gw() {
     HUMAUX_GATEWAY_CELL_ID=$CELL_ID HUMAUX_GATEWAY_CALLER_ID=gateway \
     HUMAUX_GATEWAY_RATE_PREAUTH_IP_CAPACITY=100 HUMAUX_GATEWAY_RATE_PREAUTH_IP_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_CREDENTIAL_CAPACITY=100 HUMAUX_GATEWAY_RATE_CREDENTIAL_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_USER_CAPACITY=100 HUMAUX_GATEWAY_RATE_USER_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_TENANT_CAPACITY=100 HUMAUX_GATEWAY_RATE_TENANT_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_OPERATION_CAPACITY=100 HUMAUX_GATEWAY_RATE_OPERATION_REFILL_PER_SECOND=100 \
     HUMAUX_GATEWAY_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_GATEWAY_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_GATEWAY_GITLEAKS_VERSION=$GITLEAKS_VER
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-gateway >> $EV/gateway.log 2>&1 ) &
+  exec "$BIN_DIR"/humaux-gateway >> $EV/gateway.log 2>&1 ) &
 own_pid gw $!
 }
 start_gw; GW_PID=$(cat $S/gw.pid)
@@ -243,12 +251,12 @@ rw_readyz() { ( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval
     HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=6333 \
     HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
     HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID HUMAUX_RETRIEVAL_WORKER_CALLER=retrieval-worker
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --readyz ) }
+  exec "$BIN_DIR"/humaux-retrieval-worker --readyz ) }
 pw_readyz() { ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB"
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-private-worker --readyz ) }
+  exec "$BIN_DIR"/humaux-private-worker --readyz ) }
 cw_readyz() { ( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:devlocal_role_consolidation_worker@$PG/$DB" \
     HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-consolidation-worker --readyz ) }
+  exec "$BIN_DIR"/humaux-consolidation-worker --readyz ) }
 gw_readyz() { curl -fsS -o /dev/null http://127.0.0.1:8080/readyz; }
 READY_OK=0; READY_BAD=0
 wait_ready() { # $1=label $2=probe function name; polls until exit 0 or 90s
@@ -300,7 +308,7 @@ distill_once() {
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
     HUMAUX_PRIVATE_WORKER_DISTILL_BATCH=50 HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=120 HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH=8 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-private-worker --distill-once ) 2>&1 | tee -a $EV/distill.log | tail -3
+  exec "$BIN_DIR"/humaux-private-worker --distill-once ) 2>&1 | tee -a $EV/distill.log | tail -3
 }
 distill_once
 PGQ "select 'memory_records='||(select count(*) from private.memory_records where tenant_id='$TENANT')||' memory_evidence='||(select count(*) from private.memory_evidence me join private.memory_records m on m.memory_id=me.memory_id where m.tenant_id='$TENANT')||' processing_runs='||(select count(*) from private.processing_runs where tenant_id='$TENANT' and completed_at is not null)||' outbox_done='||(select count(*) from ops.outbox where tenant_id='$TENANT' and status='DONE')" | tee -a $EV/rehearsal.log
@@ -318,7 +326,7 @@ step sigterm_mid_load
     HUMAUX_PRIVATE_WORKER_DISTILL_BATCH=50 HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=120 HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH=8 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 \
     HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=3
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-private-worker --distill-serve > $EV/distill-serve.log 2>&1 ) &
+  exec "$BIN_DIR"/humaux-private-worker --distill-serve > $EV/distill-serve.log 2>&1 ) &
 DS_PID=$!
 mcp remember "{\"operation\":\"put\",\"content\":\"Deploys are frozen on the last working day of each quarter.\",\"idempotency_key\":\"$(uuidgen | tr A-Z a-z)\",\"workspace_id\":\"$WS\"}" >/dev/null 2>&1
 sleep 5
@@ -337,7 +345,7 @@ step consolidation
 ( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:devlocal_role_consolidation_worker@$PG/$DB" \
     HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS=120 HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS=10 \
     HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS=50 HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS=120 HUMAUX_CONSOLIDATION_WORKER_BATCH=8 HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-consolidation-worker --run-once ) > $EV/consolidation.log 2>&1 &
+  exec "$BIN_DIR"/humaux-consolidation-worker --run-once ) > $EV/consolidation.log 2>&1 &
 CW_PID=$!; for i in $(seq 1 180); do kill -0 $CW_PID 2>/dev/null || break; grep -q "published\|Published\|rollup" $EV/consolidation.log 2>/dev/null && sleep 3 && break; sleep 1; done; kill $CW_PID 2>/dev/null; tail -n 3 $EV/consolidation.log
 PGQ "select 'rollups='||count(*) from private.memory_rollups where tenant_id='$TENANT'" | tee -a $EV/rehearsal.log
 PGQ "select 'derived_jobs: '||coalesce(string_agg(job_type||'/'||status||'='||n, ', ' order by job_type, status),'none') from (select job_type, status, count(*) n from ops.jobs where tenant_id='$TENANT' and left(job_type,8)='DERIVED_' group by 1,2) t" | tee -a $EV/rehearsal.log
@@ -386,7 +394,7 @@ consolidate_once() {
 ( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:devlocal_role_consolidation_worker@$PG/$DB" \
     HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS=120 HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS=10 \
     HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS=50 HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS=120 HUMAUX_CONSOLIDATION_WORKER_BATCH=8 HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-consolidation-worker --run-once ) >> $EV/consolidation.log 2>&1
+  exec "$BIN_DIR"/humaux-consolidation-worker --run-once ) >> $EV/consolidation.log 2>&1
 }
 drain_all() {
   distill_once
@@ -564,14 +572,23 @@ except Exception: d={}
 s=json.dumps(d)
 print('true' if ('\"archived\": true' in s or d.get('archived_at')) else 'false')")
   gated_as "$BEARER" memory "{\"action\":\"unarchive\",\"memory_id\":\"$AR_TARGET\"}" > $EV/unarchive.json 2>&1
-  mcp recall "{\"query\":\"which language do we prefer for backend services?\",\"workspace_id\":\"$WS\",\"mode\":\"semantic\"}" > $EV/recall_after_unarchive.json 2>&1
-  AR_RECALL_AFTER_UNARCHIVE=$(head -1 $EV/recall_after_unarchive.json | python3 -c "
+  # Card 30 (ADR-0055 D-B): the Qdrant prefilter drops `archived == true` points, so an unarchived
+  # memory serves again once its MEMORY_LIFECYCLE ticket has re-projected the point with
+  # `archived=false` — projection lag, no longer instant through the PG gate alone. Poll (bounded
+  # at 60 s) and report the lag instead of asserting on the first recall after the write.
+  AR_T0=$(date +%s); AR_RECALL_AFTER_UNARCHIVE=0
+  while [ "$AR_RECALL_AFTER_UNARCHIVE" = 0 ] && [ $(( $(date +%s) - AR_T0 )) -lt 60 ]; do
+    mcp recall "{\"query\":\"which language do we prefer for backend services?\",\"workspace_id\":\"$WS\",\"mode\":\"semantic\"}" > $EV/recall_after_unarchive.json 2>&1
+    AR_RECALL_AFTER_UNARCHIVE=$(head -1 $EV/recall_after_unarchive.json | python3 -c "
 import sys,json
 try: d=json.load(sys.stdin)['result'].get('structuredContent',{})
 except Exception: d={}
 print(json.dumps(d, ensure_ascii=False).count(sys.argv[1]))" "$AR_TARGET")
+    [ "$AR_RECALL_AFTER_UNARCHIVE" = 0 ] && sleep 1
+  done
+  AR_UNARCHIVE_LAG_S=$(( $(date +%s) - AR_T0 ))
   drain_all
-  echo "archive: recall_hits_while_archived=$AR_RECALL_WHILE_ARCHIVED get_reports_archived=$AR_GET_ARCHIVED recall_hits_after_unarchive=$AR_RECALL_AFTER_UNARCHIVE" | tee -a $EV/rehearsal.log
+  echo "archive: recall_hits_while_archived=$AR_RECALL_WHILE_ARCHIVED get_reports_archived=$AR_GET_ARCHIVED recall_hits_after_unarchive=$AR_RECALL_AFTER_UNARCHIVE unarchive_to_served_s=$AR_UNARCHIVE_LAG_S (bounded 60)" | tee -a $EV/rehearsal.log
 else
   echo "archive: no target (lifecycle step had no pair)" | tee -a $EV/rehearsal.log
 fi
@@ -717,6 +734,36 @@ print('leg B: isError=%s items=%d overlay_seqs=%s top_k=%s' % (
 echo "--- gateway operator lines this probe produced ---" | tee -a $EV/rehearsal.log
 tail -n +$((GWLOG_BEFORE+1)) $EV/gateway.log | tee -a $EV/rehearsal.log
 
+# ---------- 6a3. card 30 planner lane substitution (ADR-0055 D-C) ----------
+# Everyday queries the §20 planner classes as STATE/TEMPORAL/ASSOCIATION/LITERAL/DIRECT_GET used
+# to be refused INVALID_INPUT (`query_not_semantic`). With no `mode`, dense answers each one and
+# says so (`LANE_SUBSTITUTED` + `provenance.planner_class`); an explicit undelivered `mode` is the
+# one refusal left, and it is the schema-documented DEPENDENCY_UNAVAILABLE.
+step lane_substitution
+LS_OK=0; LS_N=0
+# A fixed UUID with no run of >= 7 digits: the gateway's local-secret-scan phone-like rule refuses a
+# query holding 7+ digits (dashes do not break the run) with FORBIDDEN, so a random uuidgen value
+# would make this leg flaky (card 30 finding, ADR-0055 Known limits).
+LS_UUID=a1b2c3d4-e5f6-4a7b-8c9d-e0f1a2b3c4d5
+for q in "目前项目进度" "客户张三最近的情绪怎么样" "和支付相关的决定" 'the "frozen contract" decision' "$LS_UUID"; do
+  LS_ARGS=$(python3 -c "import sys,json; print(json.dumps({'query':sys.argv[1],'workspace_id':sys.argv[2]}, ensure_ascii=False))" "$q" "$WS")
+  LS_OUT=$(mcp recall "$LS_ARGS")
+  LS_N=$((LS_N+1))
+  LS_V=$(print -r -- "$LS_OUT" | head -1 | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)['result']; sc=d.get('structuredContent',{})
+    pc=sc.get('provenance',{}).get('planner_class')
+    ok=(not d.get('isError')) and 'LANE_SUBSTITUTED' in sc.get('completeness',{}).get('degradations',[]) and pc not in (None,'SEMANTIC')
+    print('%d %s' % (ok, pc))
+except Exception: print('0 unparsed')")
+  echo "lane substitution: planner_class=${LS_V#* } answered=${LS_V%% *} $(print -r -- "$LS_OUT" | tail -1)" | tee -a $EV/rehearsal.log
+  [ "${LS_V%% *}" = 1 ] && LS_OK=$((LS_OK+1))
+done
+mcp recall "{\"query\":\"readiness probe before traffic\",\"workspace_id\":\"$WS\",\"mode\":\"literal\"}" > $EV/recall_mode_literal.json 2>&1
+LIT_CODE=$(head -1 $EV/recall_mode_literal.json | grep -oE '"code":"[A-Z_]+"' | head -1 | sed -E 's/.*:"([A-Z_]+)"/\1/')
+echo "explicit mode literal: code=$LIT_CODE $(tail -1 $EV/recall_mode_literal.json)" | tee -a $EV/rehearsal.log
+
 # ---------- 6b. assertions (ADR-0036 / card 14 witness) ----------
 step assertions
 A_OK=0; A_BAD=0
@@ -734,6 +781,9 @@ assert_eq "no_tenant_env_in_seed_exports" \
 assert_eq "no_tenant_env_in_worker_blocks" \
   "$(sed -n '/3b. distill/,/5. projection/p' $0 | grep -cE 'HUMAUX_(CONSOLIDATION_WORKER|PRIVATE_WORKER_DISTILL)_(TENANT_ID|REASONING_DOMAIN_ID|BINDING_ID|BINDING_VERSION)=')" 0
 # The two derived hops claimed and settled this tenant's work cross-tenant.
+# card 30 (ADR-0055 D-C): dense answers every planner class; only an explicit undelivered mode refuses.
+assert_eq "recall_everyday_queries_answered_with_lane_substituted" "$LS_OK/$LS_N" "5/5"
+assert_eq "recall_explicit_literal_mode_refused_dependency_unavailable" "$LIT_CODE" "DEPENDENCY_UNAVAILABLE"
 assert_gt "derived_jobs_total" "$(PGQ "select count(*) from ops.jobs where tenant_id='$TENANT' and left(job_type,8)='DERIVED_'")" 0
 # The RYW probe (step 6a2) deliberately writes a memory and does NOT drain it — an un-projected
 # write is the entire point of a read-your-writes overlay probe. Both drain assertions therefore
@@ -852,7 +902,7 @@ assert_eq "no_tenant_env_for_the_projection_runner" \
     HUMAUX_PRIVATE_WORKER_DISTILL_BATCH=50 HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=120 HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH=8 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 \
     HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=1
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-private-worker --distill-serve >> $EV/pst-distill.log 2>&1 ) &
+  exec "$BIN_DIR"/humaux-private-worker --distill-serve >> $EV/pst-distill.log 2>&1 ) &
 own_pid ds $!
 # …and the resident consolidation worker: every distilled load memory enqueues a
 # DERIVED_CONSOLIDATE job (0164), and a step that left ~100 of them behind would sit, FIFO, in
@@ -862,7 +912,7 @@ own_pid ds $!
     HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS=120 HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS=10 \
     HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS=50 HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS=120 HUMAUX_CONSOLIDATION_WORKER_BATCH=8 HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5 \
     HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS=1
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-consolidation-worker --serve >> $EV/pst-consolidation.log 2>&1 ) &
+  exec "$BIN_DIR"/humaux-consolidation-worker --serve >> $EV/pst-consolidation.log 2>&1 ) &
 own_pid cw $!
 pst_put() { # $1=bearer var $2=workspace $3=content $4=tsv — one remember.put, recorded with its put time
   local t0=$EPOCHREALTIME ev=
@@ -1088,7 +1138,7 @@ if [ "$PERM_OTHERS" = "0" ]; then
       HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER
     eval "export $RP_PASS_ENV"; export HUMAUX_RETRIEVAL_WORKER_BATCH=1 HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP=1
     set -a; source $R/.env.local; set +a
-    exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --run-once ) 2>&1 | tee -a $EV/projection-runner.log | tail -2 | tee -a $EV/rehearsal.log
+    exec "$BIN_DIR"/humaux-retrieval-worker --run-once ) 2>&1 | tee -a $EV/projection-runner.log | tail -2 | tee -a $EV/rehearsal.log
 else
   echo "pst permanent fault NOT injected: $PERM_OTHERS other claimable ticket(s) exist and would take the fault" | tee -a $EV/rehearsal.log
 fi
@@ -1301,14 +1351,14 @@ cat > $S/soak_probe_rw.sh <<EOF
 #!/bin/sh
 cd $R || exit 1
 $RW_ENV
-exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --readyz
+exec "$BIN_DIR"/humaux-retrieval-worker --readyz
 EOF
 cat > $S/soak_probe_pw.sh <<EOF
 #!/bin/sh
 cd $R || exit 1
 PRIVATE_WORKER_PG_DSN='postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB'
 export PRIVATE_WORKER_PG_DSN
-exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-private-worker --readyz
+exec "$BIN_DIR"/humaux-private-worker --readyz
 EOF
 # kill -9 each resident worker in turn and bring it back: the exact case the leases exist to
 # survive. SIGTERM would drain, which is the case that is already safe by construction.
@@ -1336,7 +1386,7 @@ own_signal $S/rw.pid humaux-retrieval-worker 9 || exit 1
 (
 $RW_ENV
 set -a; . $R/.env.local; set +a
-exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --serve-rpc >> $EV/retrieval-worker.log 2>&1
+exec "$BIN_DIR"/humaux-retrieval-worker --serve-rpc >> $EV/retrieval-worker.log 2>&1
 ) &
 echo \$! > $S/rw.pid
 sleep 3
@@ -1352,7 +1402,7 @@ own_signal $S/ds.pid humaux-private-worker 9 || exit 1
 (
 $DS_ENV
 set -a; . /Volumes/data/viral-skill-eval/.env; set +a
-exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-private-worker --distill-serve >> $EV/soak-distill.log 2>&1
+exec "$BIN_DIR"/humaux-private-worker --distill-serve >> $EV/soak-distill.log 2>&1
 ) &
 echo \$! > $S/ds.pid
 sleep 3
@@ -1366,7 +1416,7 @@ cd $R || exit 1
 own_signal $S/cw.pid humaux-consolidation-worker 9 || exit 1
 (
 $CW_ENV
-exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-consolidation-worker --serve >> $EV/soak-consolidation.log 2>&1
+exec "$BIN_DIR"/humaux-consolidation-worker --serve >> $EV/soak-consolidation.log 2>&1
 ) &
 echo \$! > $S/cw.pid
 sleep 3
@@ -1384,7 +1434,7 @@ own_signal $S/rp.pid humaux-retrieval-worker 9 || exit 1
 $RW_ENV
 export $RP_PASS_ENV
 set -a; . $R/.env.local; set +a
-exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-retrieval-worker --serve >> $EV/projection-runner.log 2>&1
+exec "$BIN_DIR"/humaux-retrieval-worker --serve >> $EV/projection-runner.log 2>&1
 ) &
 echo \$! > $S/rp.pid
 sleep 3
@@ -1396,10 +1446,25 @@ chmod +x $S/soak_probe_rw.sh $S/soak_probe_pw.sh \
 # macOS XProtect assesses each freshly linked binary on FIRST exec (~98 s, strictly serial).
 # Warm every binary the soak launches or probes BEFORE the timed window; never widen a
 # production timeout to absorb this (docs/ops/soak.md §5).
+# Card 30: e2e-seed's TEST health observations are valid for 30 minutes from the seed. A soak
+# sized for n >= 300 recalls (docs/ops/soak.md "Sizing a latency measurement") outlives them, and
+# every distill after that defers with "reasoning route not admitted" — the settlement verdicts
+# would then grade the seed's clock, not the soak. Re-observe the seeded tenants' latest verdicts
+# once, before the timed window, for the soak's own span (the same rows a health prober writes;
+# append-only, nothing rewritten). A default-length soak finishes inside the original window.
+HEALTH_SECS=$(( SOAK_SECS + ${SOAK_DRAIN:-150} + 900 ))
+PGQ "insert into ops.reasoning_provider_health_observations(tenant_id,processor_id,processor_model_id,provider_model_id,model_revision,provider_endpoint_id,endpoint_ref,region,service_tier,source_kind,reason_code,verdict,observed_at,valid_until)
+select distinct on (tenant_id,processor_id,processor_model_id,provider_endpoint_id) tenant_id,processor_id,processor_model_id,provider_model_id,model_revision,provider_endpoint_id,endpoint_ref,region,service_tier,source_kind,reason_code,verdict,clock_timestamp()-interval '1 second',clock_timestamp()+make_interval(secs=>$HEALTH_SECS)
+from ops.reasoning_provider_health_observations where tenant_id in ($SEEDED) order by tenant_id,processor_id,processor_model_id,provider_endpoint_id,observed_at desc" | tee -a $EV/rehearsal.log
+PGQ "insert into ops.reasoning_account_health_observations(tenant_id,provider_account_id,credential_ref,billing_account_id,billing_instrument_id,source_kind,reason_code,account_verdict,credential_verdict,billing_account_verdict,billing_instrument_verdict,observed_at,valid_until)
+select distinct on (tenant_id,provider_account_id) tenant_id,provider_account_id,credential_ref,billing_account_id,billing_instrument_id,source_kind,reason_code,account_verdict,credential_verdict,billing_account_verdict,billing_instrument_verdict,clock_timestamp()-interval '1 second',clock_timestamp()+make_interval(secs=>$HEALTH_SECS)
+from ops.reasoning_account_health_observations where tenant_id in ($SEEDED) order by tenant_id,provider_account_id,observed_at desc" | tee -a $EV/rehearsal.log
+echo "soak health re-observation: valid for ${HEALTH_SECS}s" | tee -a $EV/rehearsal.log
+
 step soak_warmup
 W0=$(date +%s)
 for b in humaux-gateway humaux-retrieval-worker humaux-private-worker humaux-consolidation-worker xtask; do
-  env -i "${CARGO_TARGET_DIR:-target}"/debug/$b --help >/dev/null 2>&1
+  env -i "$BIN_DIR"/$b --help >/dev/null 2>&1
 done
 echo "soak warm-up: $(( $(date +%s) - W0 ))s for 5 binaries (XProtect first-exec assessment)" | tee -a $EV/rehearsal.log
 
@@ -1407,10 +1472,10 @@ echo "soak warm-up: $(( $(date +%s) - W0 ))s for 5 binaries (XProtect first-exec
 # Same $DS_ENV / $CW_ENV the chaos restarts use — one definition, no drift.
 ( eval "$DS_ENV"
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-private-worker --distill-serve > $EV/soak-distill.log 2>&1 ) &
+  exec "$BIN_DIR"/humaux-private-worker --distill-serve > $EV/soak-distill.log 2>&1 ) &
 SOAK_DS_PID=$!; own_pid ds $SOAK_DS_PID
 ( eval "$CW_ENV"
-  exec "${CARGO_TARGET_DIR:-target}"/debug/humaux-consolidation-worker --serve > $EV/soak-consolidation.log 2>&1 ) &
+  exec "$BIN_DIR"/humaux-consolidation-worker --serve > $EV/soak-consolidation.log 2>&1 ) &
 SOAK_CW_PID=$!; own_pid cw $SOAK_CW_PID
 
 # The runner's chaos hook runs FIRST: a SOAK_SECS=120 run with a 90 s chaos period fires exactly one
@@ -1451,6 +1516,21 @@ print(' | '.join('%s n=%s p50=%sms p95=%sms failed=%s' % (
   for o in lat) or 'no latency rows')
 " $EV/soak-report.json)
 echo "soak thresholds: $SOAK_SUMMARY" | tee -a $EV/rehearsal.log
+# card 30 (ADR-0055 D-E): `provenance.stage_ms` partitions recall's search(); its per-recall sum
+# must carry >= 90% of the end-to-end recall p50 the soak measured over the wire, or the gap sits
+# outside search() (guard/HTTP) and the stage table cannot attribute it.
+STAGE_COVER=$(python3 -c "
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: print('0 unreadable'); raise SystemExit
+lat={o.get('operation'): o for o in d.get('latency',[])}
+r=lat.get('recall',{}); s=lat.get('recall.stage_sum',{})
+ok=bool(r.get('p50')) and bool(s.get('n')) and s.get('p50') is not None and s['p50'] >= 0.9*r['p50']
+print('%d recall_p50=%sms(n=%s) stage_sum_p50=%sms(n=%s)' % (ok, r.get('p50'), r.get('n'), s.get('p50'), s.get('n')))
+print(' | '.join('%s p50=%s p95=%s' % (k, o.get('p50'), o.get('p95')) for k,o in sorted(lat.items()) if k.startswith('recall.stage')), file=sys.stderr)
+" $EV/soak-report.json 2>>$EV/rehearsal.log)
+echo "recall stage coverage: $STAGE_COVER" | tee -a $EV/rehearsal.log
+assert_eq "recall_stage_sum_covers_90pct_of_recall_p50" "${STAGE_COVER%% *}" 1
 assert_eq "soak_report_carries_latency_rows_with_n" \
   "$(python3 -c "
 import json,sys

@@ -15,7 +15,7 @@
 //!   retrieval-provider::adapters, retrieval-provider::contract, retrieval-worker::rpc]
 //! Called-by: [cargo-test]
 //! Invariants: [each test wires its own PostgreSQL/Qdrant/UDS fixtures; a missing fixture fails the test rather than skipping it]
-//! Spec: ADR-0012; ADR-0014
+//! Spec: ADR-0012; ADR-0014; ADR-0055
 //!
 //! Drives `humaux_gateway::recall::search` directly (no HTTP/MCP layer — that surface is
 //! already covered by `tests/mcp_gateway.rs`'s native MCP acceptance tests) against a real
@@ -887,6 +887,157 @@ fn wrong_dimension_vector_from_port_is_never_hydrated() {
         });
         // See the happy-path test's identical cleanup comment: `control.tenants` teardown
         // would otherwise fail on the `tenant_placements_tenant_id_fkey` FK.
+        admin
+            .execute(
+                "DELETE FROM projection.tenant_placements WHERE tenant_id=$1",
+                &[&handle.tenant_id],
+            )
+            .expect("cleanup seeded tenant placement row");
+    });
+}
+
+/// A [`FixedOutcomePort`] that sleeps before answering — makes the `embed` stage observably
+/// slow, so a `.await` left outside every stage lap would show up as missing wall time.
+struct DelayedPort {
+    delay: Duration,
+    outcome: RetrievalEmbeddingOutcome,
+}
+
+#[async_trait]
+impl RetrievalEmbeddingPort for DelayedPort {
+    async fn embed_query(
+        &self,
+        _input: RetrievalEmbeddingInput<'_>,
+    ) -> Result<RetrievalEmbeddingOutcome, ErrorCode> {
+        tokio::time::sleep(self.delay).await;
+        Ok(self.outcome.clone())
+    }
+}
+
+/// (7) ADR-0055 D-E: `provenance.stage_ms` partitions `recall::search` exhaustively — the eight
+/// stages sum to at least 90% of the in-process wall time around the call, `total` never
+/// exceeds it, and the port's injected 200 ms lands in `embed`. Fault: move one `.await` (e.g.
+/// the embedding call) outside every lap ⇒ the sum loses ≥ 200 ms ⇒ red.
+#[test]
+#[allow(clippy::too_many_lines)] // one fixture: placement → point → timed search → stage arithmetic.
+fn recall_stage_ms_cover_at_least_ninety_percent_of_in_process_search_time() {
+    run_db_fixture::<Fixture, _>("semantic_recall_wiring_stage_ms", |mut handle| {
+        handle.assert_gateway_login();
+        let context_row = handle.seed_workspace_visible_context_record();
+        let point_id = Uuid::new_v4();
+        let rt = handle.rt.handle().clone();
+        let mut admin = handle.owner_client().expect("owner client for setup");
+        seed_registry_row(
+            &mut admin,
+            handle.tenant_id,
+            handle.workspace_id,
+            context_row.memory_id,
+            point_id,
+        );
+        seed_checkpoint(&mut admin, handle.tenant_id, handle.workspace_id);
+        let source_updated_at = time::OffsetDateTime::now_utc();
+        let collection = format!("c30_wiring_stage_{}", Uuid::now_v7().simple());
+        let cell = CellId(Uuid::now_v7());
+        let caller = CallerId("gateway-wiring-test".to_owned());
+        let setup_registry = setup_registry(cell, caller.clone());
+        let setup_transport = qdrant_transport(&setup_registry);
+        let registry = cell_registry(cell, caller);
+        let transport = qdrant_transport(&registry);
+        seed_tenant_placement(&mut admin, handle.tenant_id, &collection);
+        let query = "operation receipt scoped context";
+        let delay = Duration::from_millis(200);
+
+        rt.block_on(async {
+            create_collection(&setup_transport, &setup_registry, &collection).await;
+            let permit = authorize_cell_access(
+                &setup_registry,
+                IntraCellResource::QDRANT_REST,
+                Duration::from_secs(60),
+            )
+            .expect("setup upsert permit");
+            let point_payload = payload(handle.tenant_id, handle.workspace_id, source_updated_at);
+            upsert(
+                setup_transport.as_ref(),
+                &permit,
+                &collection,
+                &[(PointId::Uuid(point_id), &point_payload, fixed_vector(query))],
+                ha_profile_for(QdrantOperation::NormalImmutableUpsert),
+            )
+            .await
+            .expect("real Qdrant upsert");
+            let pool = Arc::new(
+                // dep: PostgreSQL(role_gateway) — test fixture pool for the semantic recall wiring suite
+                humaux_adapters::postgres::RuntimeDbPool::connect(&required(
+                    "HUMAUX_GATEWAY_PG_DSN",
+                ))
+                .await
+                .expect("real role_gateway pool"),
+            );
+            let embedding_port: Arc<dyn RetrievalEmbeddingPort> = Arc::new(DelayedPort {
+                delay,
+                outcome: RetrievalEmbeddingOutcome::Embedded {
+                    vector: fixed_vector(query),
+                    provider_id: "wiring-test-provider".to_owned(),
+                    model_id: "wiring-test-embedding".to_owned(),
+                    model_revision: "v1".to_owned(),
+                    dimension: DIMENSION,
+                },
+            });
+            let runtime = Arc::new(
+                SemanticRecallRuntime::new(
+                    scanner(),
+                    embedding_port,
+                    transport,
+                    registry,
+                    SemanticRecallVersions {
+                        embedding_version: EMBEDDING_VERSION.to_owned(),
+                        dimension: DIMENSION,
+                    },
+                    Duration::from_secs(10),
+                )
+                .expect("trusted semantic runtime"),
+            );
+            let catalog = Arc::new(CanonicalCatalog::load().expect("catalog"));
+            let bootstrap = context_bootstrap(&handle);
+            let started = std::time::Instant::now();
+            let result = recall::search(
+                pool,
+                runtime,
+                catalog,
+                handle.auth.clone(),
+                Uuid::now_v7(),
+                bootstrap,
+                recall_request(query, handle.workspace_id),
+            )
+            .await;
+            let wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let output = result.expect("semantic recall answers").finish();
+            let stage_ms = &output.structured_content["provenance"]["stage_ms"];
+            let stage = |name: &str| {
+                stage_ms[name]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("stage_ms.{name} missing: {stage_ms}"))
+            };
+            let names = [
+                "route", "planner", "scan", "embed", "qdrant", "hydrate", "rerank", "assemble",
+            ];
+            let sum: f64 = names.iter().map(|name| stage(name)).sum();
+            eprintln!("stage_ms={stage_ms} sum={sum:.1} wall={wall_ms:.1}");
+            assert!(
+                stage("embed") >= 200.0,
+                "the injected 200 ms must land in `embed`: {stage_ms}"
+            );
+            assert!(
+                stage("total") <= wall_ms + 0.1,
+                "total {} exceeds the wall time {wall_ms}",
+                stage("total")
+            );
+            assert!(
+                sum >= 0.9 * wall_ms,
+                "stages cover {sum:.1} of {wall_ms:.1} ms — an .await sits outside every stage"
+            );
+            delete_collection(&setup_transport, &setup_registry, &collection).await;
+        });
         admin
             .execute(
                 "DELETE FROM projection.tenant_placements WHERE tenant_id=$1",

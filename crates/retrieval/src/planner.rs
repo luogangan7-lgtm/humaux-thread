@@ -558,4 +558,29 @@ mod tests {
             );
         }
     }
+
+    /// ADR-0055 D-C: the card-30 everyday queries keep their planner class — recall records it
+    /// (`provenance.planner_class`) and answers with dense + `LANE_SUBSTITUTED` instead of
+    /// refusing, so the class itself must stay stable for that record to mean anything.
+    #[test]
+    fn everyday_queries_keep_their_planner_class() {
+        let cases: &[(&str, QueryClass)] = &[
+            ("目前项目进度", QueryClass::State),
+            ("客户张三最近的情绪怎么样", QueryClass::Temporal),
+            ("和支付相关的决定", QueryClass::Association),
+            ("the \"frozen contract\" decision", QueryClass::Literal),
+            (
+                "0190f7a8-0000-7000-8000-000000000001",
+                QueryClass::DirectGet,
+            ),
+        ];
+        for (query, expected) in cases {
+            let decision = decide(query, &[], &BTreeSet::new(), &BTreeSet::new());
+            assert_eq!(
+                decision.wire_class(),
+                Some(*expected),
+                "query {query:?} expected {expected:?}, got {decision:?}"
+            );
+        }
+    }
 }

@@ -8629,18 +8629,22 @@ scope。写清楚这一条不是降低目标，是因为「文档声称有、实
 当前交付点的逐条实况（每条都锚到实现它的 file:line，锚失效即本节失效）：
 
 ```text
-mode = semantic            交付        bins/gateway/src/recall.rs:224
+mode = semantic            交付        bins/gateway/src/recall.rs:298
 mode = literal             未交付      同上 guard ⇒ DEPENDENCY_UNAVAILABLE
 mode = state               未交付      同上 guard ⇒ DEPENDENCY_UNAVAILABLE
 mode = temporal            未交付      同上 guard ⇒ DEPENDENCY_UNAVAILABLE
 mode = association         未交付      同上 guard ⇒ DEPENDENCY_UNAVAILABLE
 completeness_request = best_effort  交付（默认）
-completeness_request = required     未交付  bins/gateway/src/recall.rs:225 ⇒ DEPENDENCY_UNAVAILABLE
+completeness_request = required     未交付  bins/gateway/src/recall.rs:299 ⇒ DEPENDENCY_UNAVAILABLE
 ```
 
 - 唯一原生 dense lane 的实现自述见 `bins/gateway/src/recall.rs`
-  （`SemanticRecallRuntime`）；planner 仍然是决定 lane 的那一处，非 `QueryClass::Semantic`
-  的判定结果在 `bins/gateway/src/recall.rs:255-261` 以 `INVALID_INPUT` 拒绝。
+  （`SemanticRecallRuntime`）。planner 的判定只被记录（`provenance.planner_class`），不再决定拒绝：
+  dense 是唯一已交付 lane 期间，任何判定都由 dense 作答；调用方未指定 `mode` 且判定不是 `SEMANTIC`
+  时，`completeness.degradations` 追加 `LANE_SUBSTITUTED`（§53.2 `LaneSubstituted`，ADR-0055 D-C）。
+  只有显式 `mode` 指名未交付 lane 才拒绝，错误码仍是 `DEPENDENCY_UNAVAILABLE`（本节上表，不变）。
+  原锚点 `recall.rs:255-261 ⇒ INVALID_INPUT` 作废。见证：
+  `bins/gateway/tests/mcp_gateway.rs::recall_everyday_queries_are_answered_by_dense_with_lane_substituted`。
 - 未交付的 lane 走 `DEPENDENCY_UNAVAILABLE`（§52：契约里有、这个部署没有实现），不是
   `INVALID_INPUT`（值非法）。合约 `contracts/mcp/recall.schema.json` 因此**保留** `mode` 的
   五值闭集 —— 把未交付值从 enum 里删掉会让这条 guard 变成不可达代码，拒绝路径也就不再可观察
@@ -8657,20 +8661,23 @@ completeness_request = required     未交付  bins/gateway/src/recall.rs:225 �
   分支，是唯一绿的出路，所以这条闸不等于「guard 必须永远拒绝」）。运行期权威仍然只有 guard 那一处；schema 的声明对客户端
   是 advisory。
 
-**`limit` 不是调用方可选的页宽（§55.1，card 16 的实测代价）。** 候选深度只来自注册 profile：
+**`limit` 只能缩短返回，不能加深候选（§55.1 + §33.5，ADR-0055 D-D 修订 card 16 的「必须相等」）。**
+候选深度（`cand_k`）与 `top_k` 只来自注册 profile：
 
 ```text
 contracts/mcp/recall.schema.json    limit: integer 1..=100（保留，见下）
-crates/retrieval/src/request.rs:203 §55.1 调用方不得提供 limit / top_k / cand_k
-bins/gateway/src/recall.rs:269-278  limit != profile.top_k ⇒ INVALID_INPUT（并打一行 operator 日志）
+crates/retrieval/src/request.rs:203 §55.1 调用方不得提供 top_k / cand_k
+bins/gateway/src/recall.rs:341-350  limit > profile.top_k ⇒ INVALID_INPUT（并打一行 operator 日志）
 ```
 
-所以 schema 里 `limit` 唯一合法的取值是把 profile 自己的 `top_k` 原样回声回来；schema 无法表达
-「等于一个运行期 profile 值」，因此这里保留类型与边界（信任边界上的输入校验不删），把真相写进
-`description`，并由 gateway 那一处拒绝兜底。见证：
+`limit ∈ 1..=top_k` 被接受，只截短返回的 memory 条目（§33.5 的有界输出；RYW overlay 条目不截），
+Qdrant 仍按 profile 的 `cand_k` 取候选，profile 指纹不含 `limit`；`returned = min(limit, 幸存数)`、
+`truncated = candidate_count > returned` 如实上报。schema 无法表达「不超过一个运行期 profile 值」，
+因此保留类型与边界（信任边界上的输入校验不删），把真相写进 `description`，并由 gateway 那一处拒绝
+兜底。见证：
 `bins/gateway/tests/mcp_gateway.rs::recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused`
-（同一个测试的第三条腿证明 `limit == profile top_k` 仍然答 200 —— 这就是不能把 `limit` 从
-schema 删掉的原因：删了它会变成 schema 违规，错误码从 `INVALID_INPUT` 的语义漂走）。
+（第二条腿 `top_k + 1` 仍是 `INVALID_INPUT`，第三条腿 `limit == top_k` 答 200，第四条腿
+`limit: 1` 答 200、恰 1 条 memory、`truncated == true`）。
 
 card 16 记录的代价：这条拒绝当时是**静默**的，soak 的 post-drain replay 送
 `limit = <live point count>` 拿到 `INVALID_INPUT`，gateway 日志里一行都没有，于是被误判成两步
@@ -9701,7 +9708,7 @@ retrieval_provider_requests_total.result   ok | http_401 | http_429 | http_5xx |
 memory_candidate_rejections_total.reason  origin_authority_ceiling | untrusted_instruction | cross_tenant_evidence | missing_confirmation
 data_disclosures_reserved_unfinalized.age_bucket   le_10s | le_60s | gt_60s
 mcp_auth_attempts_total.result             ok | bad_credential | expired | locked
-degrade_total.code                         §53.2 `DegradeCode` 全部变体的 PascalCase 变体名逐字（当前 10 个），
+degrade_total.code                         §53.2 `DegradeCode` 全部变体的 PascalCase 变体名逐字（当前 11 个），
                                            一一对应，不多不少；SCREAMING_SNAKE 线格式只用于 §23 envelope，
                                            不得出现在本 label —— 两种形式并存会让 §53.3 规则 2 的
                                            「标签基数」翻倍（形式与映射冻结在 §53.2）
@@ -10880,10 +10887,11 @@ pub enum DegradeCode {
     EmbedProviderTimeout, EgressDenied, StatePinMissing, StatePinAmbiguous,
     CompletenessUnknown, ProjectionLag, GraphExpandCapped,
     ProjectionInvisibleLoss,   // §23.1② A2：账本说结清、索引里没有
+    LaneSubstituted,           // §33 Tool 2（ADR-0055 D-C）：planner 选的车道未交付且调用方未带 mode，dense 代答
 }
 ```
 
-共 10 个变体。`ProjectionInvisibleLoss` 由 §23.1② 的 A2 可见闭合断言引入，注错方式与读数变化登记在 §53.4。
+共 11 个变体。`ProjectionInvisibleLoss` 由 §23.1② 的 A2 可见闭合断言引入，注错方式与读数变化登记在 §53.4。`LaneSubstituted` 由 §33 Tool 2 的车道替代引入（ADR-0055 D-C，card 30）：只经 `abstain()` 发出，结果照常返回（§52.3 Q1），注错测试同样登记在 §53.4。
 
 可降级函数一律返回 `Outcome<T>`，不返回裸 `T`。
 
@@ -10927,7 +10935,7 @@ fold(x) = 在 x 的每个非首位大写字母前插 "_"，再整体大写
 testkit/fault/<variant_snake_case>.rs   —— 文件名 == lower(fold(变体名))，与变体一一对应
 ```
 
-当前 10 个变体 ⇒ 10 个文件。其中两条的注入方式不能从变体名直接读出，在此登记（其余照变体语义注入）：
+当前 11 个变体 ⇒ 11 个文件。其中三条的注入方式不能从变体名直接读出，在此登记（其余照变体语义注入）：
 
 ```text
 projection_invisible_loss.rs   绕过 retention::tombstone 直接从 Qdrant 删 10 个 point（= §23.4 G23-2 注入 1）
@@ -10935,7 +10943,10 @@ projection_invisible_loss.rs   绕过 retention::tombstone 直接从 Qdrant 删 
                                degrade_total{code="ProjectionInvisibleLoss"} 0 → 1
 rerank_provider_timeout.rs     rerank provider 注入读超时，按 §19 走 fallback ranking 仍返回结果
                                degrade_total{code="RerankProviderTimeout"} 0 → 1，items 非空
-                               （§23.3 示例早先写的 RERANK_TIMEOUT_PARTIAL 就是这一条，不是第十一个变体）
+                               （§23.3 示例早先写的 RERANK_TIMEOUT_PARTIAL 就是这一条，不是另一个变体）
+lane_substituted.rs            planner 判为非 SEMANTIC 类且请求未带 mode ⇒ dense 车道代答（ADR-0055 D-C）
+                               degrade_total{code="LaneSubstituted"} 0 → 1，degradations[] 含 LANE_SUBSTITUTED；
+                               显式 mode:"semantic" 不触发（只记 planner_class）
 ```
 
 **从未被触发过的 reason 不许合并。** 53.3 规则 2 的等式把这句话变成 CI 事实：加了变体没加测试 ⇒ 三个数字不等 ⇒ 红。

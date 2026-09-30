@@ -464,6 +464,9 @@ struct ResolvedMemory {
     /// transaction (role_retrieval_worker's own SELECT) through the ONE set-based read
     /// (`affect_repo::affects_for_memories_in_txn`), flattened into the payload by `finish_row`.
     affects: Vec<AffectAnnotation>,
+    /// ADR-0055 D-B: `archived_at IS NOT NULL`, read here so every ticket that re-projects the
+    /// memory writes the current flag (no transition-specific ticket exists or is needed).
+    archived: bool,
 }
 
 /// (b): resolves the Memories one `stream_log` row's bound Evidence carries, through
@@ -493,6 +496,7 @@ async fn resolve_memories(
         "SELECT m.memory_id, m.content, m.visibility_class, m.visibility_user_id, \
                 m.visibility_workspace_id, m.memory_type, m.status, m.authority_class, \
                 m.occurred_at, m.effective_from, m.created_at, m.updated_at, eo.data_class, \
+                m.archived_at IS NOT NULL AS archived, \
                 sha256(convert_to(m.content::text, 'UTF8')) AS body_sha256 \
          FROM ops.outbox ob \
          JOIN private.memory_evidence me ON me.evidence_id = ob.evidence_id \
@@ -578,6 +582,7 @@ async fn parse_resolved_memory(
         body_sha256: row.try_get("body_sha256")?,
         subject_ids,
         affects,
+        archived: row.try_get("archived")?,
     }))
 }
 
@@ -923,6 +928,7 @@ async fn resolve_and_embed(
 
 /// (e)-(h) of the module doc's per-row order: build the payload, upsert, register, verify.
 /// Split out of [`process_row`] purely to stay under this repo's line-count lint.
+#[allow(clippy::too_many_lines)] // 101: ADR-0055's `with_archived` is one more payload builder step.
 async fn finish_row(
     ctx: &RowCtx<'_>,
     stream_seq: i64,
@@ -961,7 +967,9 @@ async fn finish_row(
     let indexable = indexable
         .with_subject_ids(memory.subject_ids)
         // ADR-0030 D-D: affect annotations ride the same payload (six flat array fields).
-        .with_affects(memory.affects);
+        .with_affects(memory.affects)
+        // ADR-0055 D-B: the lifecycle prefilter flag, from the PG row this ticket resolved.
+        .with_archived(memory.archived);
 
     let registration = PrivateMemoryPointRegistration::deterministic(
         ctx.family.clone(),

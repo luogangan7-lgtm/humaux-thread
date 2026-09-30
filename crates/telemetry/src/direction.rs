@@ -40,7 +40,7 @@ pub struct DirectionRow {
     pub direction: Direction,
 }
 
-/// §53.6 direction table. Fail-open side: all 10 `DegradeCode` variants (§53.2), each
+/// §53.6 direction table. Fail-open side: all 11 `DegradeCode` variants (§53.2), each
 /// `FailOpen` — this half never needs a manual edit beyond staying in sync with
 /// `degrade::DegradeCode`, which `cargo xtask direction-table` verifies mechanically.
 /// Fail-closed side: Phase 0 production code carries no `#[fail_closed]` annotations yet,
@@ -89,6 +89,10 @@ pub const DIRECTION_TABLE: &[DirectionRow] = &[
         direction: Direction::FailOpen,
     },
     DirectionRow {
+        subject: "LaneSubstituted",
+        direction: Direction::FailOpen,
+    },
+    DirectionRow {
         subject: "example_fail_closed_check",
         direction: Direction::FailClosed,
     },
@@ -109,7 +113,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direction_table_has_ten_fail_open_rows_and_one_fail_closed_row() {
+    fn direction_table_has_eleven_fail_open_rows_and_one_fail_closed_row() {
         let fail_open = DIRECTION_TABLE
             .iter()
             .filter(|r| r.direction == Direction::FailOpen)
@@ -118,7 +122,7 @@ mod tests {
             .iter()
             .filter(|r| r.direction == Direction::FailClosed)
             .count();
-        assert_eq!(fail_open, 10);
+        assert_eq!(fail_open, 11);
         assert_eq!(fail_closed, 1);
     }
 

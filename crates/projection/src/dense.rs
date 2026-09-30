@@ -1,10 +1,10 @@
 //! `projection::dense` — dense lane 查询构造：自动注入 `tenant + §6.1 AuthorizationScope visibility filter`（§17.1）。
 //! Depends-on: crates=[humaux-domain]; services=[]; env=[]; modules=[domain::affect, domain::identity,
-//!   domain::subject]
+//!   domain::ids, domain::subject]
 //! Called-by: [adapters::qdrant, projection::sparse, tests]
 //! Invariants: [DenseQueryFilter can only be built by build_dense_filter from a mandatory &AuthorizationScope, so
-//!   every private dense query carries the tenant + visibility filter (§17.1)]
-//! Spec: Baseline §17.1; §6.1.1; §3; §78.3
+//!   every private dense query carries the tenant + visibility filter (§17.1); servable() and in_workspace() only narrow (ADR-0055)]
+//! Spec: Baseline §17.1; §6.1.1; §3; §78.3; ADR-0055
 //!
 //! §17.1 冻结："所有 private query adapter 必须自动注入 tenant + AuthorizationScope
 //! visibility filter；业务层不得手写可选 filter。" 本模块的落实方式是类型级的，不是靠约定：
@@ -24,6 +24,7 @@
 
 use humaux_domain::affect::{AffectFilter, BasisPointRange, BasisPoints};
 use humaux_domain::identity::AuthorizationScope;
+use humaux_domain::ids::WorkspaceId;
 use humaux_domain::subject::SubjectId;
 
 /// §6.1.3 / ADR-0029: the Qdrant payload field carrying a point's linked subject ids
@@ -47,6 +48,21 @@ pub const AFFECT_AROUSAL_FIELD: &str = "affect_arousal_bp";
 pub const AFFECT_DOMINANCE_FIELD: &str = "affect_dominance_bp";
 pub const AFFECT_INTENSITY_FIELD: &str = "affect_intensity_bp";
 
+/// ADR-0055 D-B: the payload field carrying the memory's §59.1 lifecycle status (lowercase wire,
+/// `adapters::qdrant::QdrantPointPayload::to_json` writes it). [`DenseQueryFilter::servable`]
+/// requires [`STATUS_ACTIVE`].
+pub const STATUS_FIELD: &str = "status";
+/// The one servable value of [`STATUS_FIELD`].
+pub const STATUS_ACTIVE: &str = "active";
+/// ADR-0055 D-B: the payload bool mirroring `private.memory_records.archived_at IS NOT NULL`
+/// (`adapters::qdrant::IndexablePayload::with_archived` writes it). Points projected before
+/// card 30 lack it, which [`Condition::NotTrue`] reads as "not archived".
+pub const ARCHIVED_FIELD: &str = "archived";
+/// The payload field naming the workspace stream a point was projected from
+/// (`adapters::projection_worker` writes the family's `scope_id`). [`DenseQueryFilter::in_workspace`]
+/// matches it.
+pub const WORKSPACE_ID_FIELD: &str = "workspace_id";
+
 /// Adapter-中立的 payload 条件树。`pub`：`adapters::qdrant` 需要遍历它来生成 Qdrant 的 wire
 /// JSON filter；但业务层不应该把它当"随手拼一个 filter"的入口——真正进入检索调用的值类型是
 /// [`DenseQueryFilter`]，它的字段私有，只能经 [`build_dense_filter`] 产出。
@@ -65,6 +81,9 @@ pub enum Condition {
         gte: i64,
         lte: i64,
     },
+    /// `field` is missing, null or `false` — i.e. NOT `field == true` (ADR-0055 D-B: a legacy
+    /// point without the flag must pass, so this is never spelled as `Eq { field, "false" }`).
+    NotTrue { field: &'static str },
     /// 全部子条件为真。
     And(Vec<Condition>),
     /// 任一子条件为真。
@@ -186,6 +205,42 @@ impl DenseQueryFilter {
         }
         DenseQueryFilter(Condition::And(clauses))
     }
+
+    /// ADR-0055 D-B: narrow a serving read to lifecycle-servable points — `status == "active"`
+    /// AND NOT `archived == true` — ANDed after tenant + visibility, never in place of them.
+    /// A prefilter only: the PG hydrate gate (`read_materialize::final_memory_ids_about_in_txn`)
+    /// stays the authority, so a stale flag can cost fill but never leak a row.
+    pub fn servable(self) -> Self {
+        let mut clauses = match self.0 {
+            Condition::And(clauses) => clauses,
+            other => vec![other],
+        };
+        clauses.push(Condition::Eq {
+            field: STATUS_FIELD,
+            value: STATUS_ACTIVE.to_owned(),
+        });
+        clauses.push(Condition::NotTrue {
+            field: ARCHIVED_FIELD,
+        });
+        DenseQueryFilter(Condition::And(clauses))
+    }
+
+    /// ADR-0055 D-B: narrow to the points of ONE workspace stream (`workspace_id == W`), ANDed
+    /// after tenant + visibility, never in place of them. A workspace-stream read can only
+    /// hydrate points registered under its own `scope_id`, so a tenant-shared point of another
+    /// workspace would only occupy a candidate slot — and collide with this stream's
+    /// per-workspace `source_stream_seq` tombstone overlay.
+    pub fn in_workspace(self, workspace_id: WorkspaceId) -> Self {
+        let mut clauses = match self.0 {
+            Condition::And(clauses) => clauses,
+            other => vec![other],
+        };
+        clauses.push(Condition::Eq {
+            field: WORKSPACE_ID_FIELD,
+            value: workspace_id.0.to_string(),
+        });
+        DenseQueryFilter(Condition::And(clauses))
+    }
 }
 
 /// 构造 dense lane 的查询 filter：`tenant_id == scope.tenant_id()` AND
@@ -291,6 +346,7 @@ mod tests {
                 .get(field)
                 .and_then(|raw| raw.parse::<i64>().ok())
                 .is_some_and(|v| v >= *gte && v <= *lte),
+            Condition::NotTrue { field } => fields.get(field).map(String::as_str) != Some("true"),
         }
     }
 
@@ -459,6 +515,116 @@ mod tests {
         assert_eq!(
             build_dense_filter(&s, &[]).with_affect(Some(&AffectFilter::default())),
             build_dense_filter(&s, &[])
+        );
+    }
+
+    // ---- ADR-0055 D-B: servable() lifecycle prefilter ----
+
+    fn tenant_shared_point(
+        s: &AuthorizationScope,
+    ) -> std::collections::HashMap<&'static str, String> {
+        std::collections::HashMap::from([
+            ("tenant_id", s.tenant_id().0.to_string()),
+            ("visibility_class", "TENANT_SHARED".to_owned()),
+            (STATUS_FIELD, STATUS_ACTIVE.to_owned()),
+        ])
+    }
+
+    #[test]
+    fn servable_filter_excludes_archived_true_and_non_active_status() {
+        let s = scope(None, &[]);
+        let filter = build_dense_filter(&s, &[]).servable();
+        let mut point = tenant_shared_point(&s);
+        point.insert(ARCHIVED_FIELD, "false".to_owned());
+        assert!(
+            eval(filter.as_condition(), &point),
+            "active + archived=false serves"
+        );
+        point.insert(ARCHIVED_FIELD, "true".to_owned());
+        assert!(
+            !eval(filter.as_condition(), &point),
+            "archived=true never serves"
+        );
+        point.insert(ARCHIVED_FIELD, "false".to_owned());
+        for status in ["superseded", "revoked", "expired"] {
+            point.insert(STATUS_FIELD, status.to_owned());
+            assert!(
+                !eval(filter.as_condition(), &point),
+                "{status} never serves"
+            );
+        }
+        point.remove(STATUS_FIELD);
+        assert!(
+            !eval(filter.as_condition(), &point),
+            "a point without status never serves"
+        );
+    }
+
+    #[test]
+    fn in_workspace_filter_drops_another_workspaces_tenant_shared_point() {
+        let s = scope(None, &[]);
+        let mine = WorkspaceId::new();
+        let filter = build_dense_filter(&s, &[]).in_workspace(mine);
+        let mut point = tenant_shared_point(&s);
+        point.insert(WORKSPACE_ID_FIELD, mine.0.to_string());
+        assert!(eval(filter.as_condition(), &point), "own workspace serves");
+        point.insert(WORKSPACE_ID_FIELD, WorkspaceId::new().0.to_string());
+        assert!(
+            eval(build_dense_filter(&s, &[]).as_condition(), &point),
+            "tenant-wide without the narrowing"
+        );
+        assert!(
+            !eval(filter.as_condition(), &point),
+            "another workspace's tenant-shared point never serves"
+        );
+    }
+
+    #[test]
+    fn servable_filter_passes_a_point_with_no_archived_field() {
+        let s = scope(None, &[]);
+        let point = tenant_shared_point(&s);
+        assert!(!point.contains_key(ARCHIVED_FIELD));
+        assert!(eval(
+            build_dense_filter(&s, &[]).servable().as_condition(),
+            &point
+        ));
+    }
+
+    #[test]
+    fn servable_filter_keeps_tenant_and_visibility_first() {
+        let s = scope(None, &[]);
+        let plain = build_dense_filter(&s, &[]);
+        let Condition::And(base) = plain.as_condition().clone() else {
+            panic!("expected And")
+        };
+        let Condition::And(clauses) = plain.servable().as_condition().clone() else {
+            panic!("expected And")
+        };
+        assert_eq!(
+            clauses[..2],
+            base[..2],
+            "tenant + visibility stay first, untouched"
+        );
+        assert_eq!(
+            clauses[2..],
+            [
+                Condition::Eq {
+                    field: STATUS_FIELD,
+                    value: STATUS_ACTIVE.to_owned()
+                },
+                Condition::NotTrue {
+                    field: ARCHIVED_FIELD
+                },
+            ]
+        );
+        let mut foreign = tenant_shared_point(&s);
+        foreign.insert("tenant_id", TenantId::new().0.to_string());
+        assert!(
+            !eval(
+                build_dense_filter(&s, &[]).servable().as_condition(),
+                &foreign
+            ),
+            "servable() never widens past the tenant clause"
         );
     }
 

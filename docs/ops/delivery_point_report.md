@@ -212,7 +212,7 @@ not, and quoting the percentile alone would hide them.
 | Operation | soak23 p50 / p95 (n, failed) | soak26 p50 / p95 (n, failed) | soak27 p50 / p95 (n, failed) | soak28 p50 / p95 (n, failed) |
 |---|---|---|---|---|
 | `remember` | 70.5 / 539.6 (43, 1) | 67.8 / 618.7 (60, 4) | 68.9 / 515.0 (63, 1) | 70.5 / 556.5 (63, 1) |
-| `memory` (get) | 36.5 / 54.7 (41, 3) | 41.8 / 64.7 (63, 1) | 39.0 / 60.2 (62, 2) | 49.4 / 71.4 (61, 3) |
+| `memory.enumerate` (reported as `memory`; relabelled by card 30) | 36.5 / 54.7 (41, 3) | 41.8 / 64.7 (63, 1) | 39.0 / 60.2 (62, 2) | 49.4 / 71.4 (61, 3) |
 | `recall` | 1778.3 / 2285.4 (41, 3) | 1636.7 / 2289.8 (62, 2) | 1671.0 / 1841.5 (62, 2) | 1805.3 / 2048.1 (60, 4) |
 | `recall.ryw_replay` | 1468.1 / 1564.3 (2, 0) | 1397.3 / 1664.6 (2, 0) | 1416.4 / 1639.7 (2, 0) | 1448.4 / 1646.1 (2, 0) |
 | `remember.ryw_replay` | 36.4 / 40.3 (2, 0) | 35.0 / 47.6 (2, 0) | 22.3 / 32.8 (2, 0) | 27.9 / 40.0 (2, 0) |
@@ -236,7 +236,7 @@ rather than quietly dropped:
 
 | Operation | Status | What would produce a number |
 |---|---|---|
-| `memory.enumerate` | **not measured** | the soak driver issues no `enumerate` call, so no `latency[]` row exists; adding it to `xtask soak`'s operation mix is the whole change |
+| `memory.get` | **not measured before card 30** | the soak driver's `"memory"` bucket was `memory.enumerate` all along (`xtask/src/soak.rs` sent `{"action":"enumerate"}`); card 30 renamed it and added a real `memory.get` bucket — see §4.5 |
 | `context.assemble` | **not measured** | same — and see §6's completeness entry: the route answers `cannot_establish/lane_failed` until the two §25 selectors land, so a p50 today would time a degraded lane |
 | `--readyz` (each of the four probes) | **not measured** | the soak runs them as `--probe-cmd` for liveness only; the runner records pass/fail, not duration |
 | admin probe | **not measured** | no timed harness exists for `humaux-admin` |
@@ -254,11 +254,12 @@ SQL-language predicate or a per-query CTE — **not** dropping the guard.
 
 Reading the table:
 
-- `recall` is ~1.7 s p50 and it is **provider-bound, not database-bound**: the hop makes a real
-  DashScope embedding call per query. `memory.get` (no provider call) is 37–49 ms p50 on the
-  same runs — that ~1.6 s gap is the embedding round trip, and it is where any recall speed
-  work has to go. Nothing in the local stack accounts for it.
-- Regression check vs the previous card's numbers: soak28 `memory` p50 49.4 ms vs soak27's
+- `recall` is ~1.7 s p50. **Correction (card 30):** this bullet used to read the `memory` row as
+  `memory.get` and attribute the ~1.6 s gap to the embedding round trip. Both halves were wrong:
+  the row is `memory.enumerate`, and the ledger's query-embedding p50 on the same deployment is
+  228.5 ms (n = 368), so at most ~0.23 s of the gap is the provider. The per-stage attribution
+  that replaces the guess is §4.5 (ADR-0055 D-E).
+- Regression check vs the previous card's numbers: soak28 `memory.enumerate` p50 49.4 ms vs soak27's
   39.0 ms is **+27%**, above the 20% bar this card sets. n = 61/62, and p95 moved 60.2 → 71.4
   (+19%), so it is a whole-distribution shift, not one outlier. It is **not** explained in this
   report and is carried as an open item (§8).
@@ -285,6 +286,39 @@ The `recall.search` p50 is dominated by the provider round trip for the query em
 PG/Qdrant work behind it is the `memory.enumerate`-class tens of milliseconds. This is the
 first soak series on the tree after §5.8's fixes; it is not directly comparable with
 soak23/26/27/28 above (different tree, different tenants), and is presented as its own baseline.
+
+#### 4.5 Card 30 release rehearsal: recall per-stage attribution (2026-09-30, n = 351)
+
+One release-profile rehearsal (`REHEARSE_PROFILE=release SOAK_SECS=1800 SOAK_SESSIONS=1
+SOAK_THINK_MS=14000 SOAK_DRAIN=300 SOAK_CHAOS_SECS=400`, three tenants, evidence
+`card30_rehearsal_evidence/measure_run3_n351/`). Stage rows are each recall's own
+`provenance.stage_ms`; `failed_calls = 0` on every row.
+
+| Operation / stage | n | p50 ms | p95 ms |
+|---|---|---|---|
+| `recall` (over the wire) | 351 | 934.6 | 2430.7 |
+| `recall.stage_sum` (8 stages of `search()`) | 351 | 892.9 | 2279.3 |
+| `recall.stage.scan` (gateway gitleaks seal) | 351 | 247.5 | 577.1 |
+| `recall.stage.embed` (worker seal + provider + ledger) | 351 | 604.2 | 1490.1 |
+| `recall.stage.hydrate` / `qdrant` / `route` / `assemble` | 351 | 15.2 / 4.8 / 2.7 / 2.2 | 76.6 / 23.1 / 51.5 / 7.5 |
+| `recall.stage.planner` / `rerank` | 351 | 0.0 / 0.0 | 0.0 / 0.0 |
+| provider query embedding (ledger, same window) | 342 | 245.5 | 506.8 |
+| `memory.get` (never timed before) | 351 | 34.5 | 271.5 |
+| `memory.enumerate` | 351 | 92.5 | 595.8 |
+| `remember` | 351 | 86.8 | 380.2 |
+
+The stage sum covers 95.5 % of the wire p50 (rehearsal gate ≥ 90 %: PASS). A second run with the
+same parameters (`card30_rehearsal_evidence/chain/`, `79 passed, 0 failed`) gave recall p50 1103.2 /
+p95 2384.1 ms (n = 345), stage_sum 95.4 %, scan 270.7, embed 716.1, provider 225.0 (n = 339). The old "~1.6 s is
+the embedding" reading is replaced by: debug build (1778 → 935 ms p50 in release), then two local
+secret scans per recall (≈ 2 × 248 ms: a 21.3 MB SHA-256 twice plus one `gitleaks` spawn each),
+then the provider (≈ 245 ms). Fixes are filed in ADR-0055 §Measurements (outside card 30's files).
+
+Verify-2 release rehearsal (`card30_rehearsal_evidence/verify2/`, 2026-09-30 22:27-23:10, `79 passed, 0 failed`):
+recall p50 1010.4 / p95 1731.9 ms (n = 351, failed 0); stage_sum 950.2 / 1607.4 (94.0 %, gate PASS);
+scan 251.8 / 389.6, embed 643.4 / 1161.7, hydrate 17.1 / 58.9, qdrant 5.3 / 21.2, route 3.0 / 250.1,
+assemble 2.3 / 6.0; all 351 recalls carried all eight stage keys; `memory.get` 37.2 / 121.1,
+`memory.enumerate` 103.0 / 316.2, `remember` 82.7 / 327.3. Closes system_audit P1-6, P1-7 and RQ-5.
 
 ### Capacity: ingest vs distill
 
@@ -721,6 +755,39 @@ not, and it withdraws the "ready for production" reading of §5.**
 - **Open:** `memory.confirm` on a PROVISIONING workspace answers `INTERNAL` instead of `CONFLICT`
   (`distill_repo`'s error map lacks the ADR-0053 `55000` arm, outside this card's files; the gate
   itself holds — nothing is written); `xtask e2e-onboard` still passes the two ignored keys.
+
+### 6.15 Closed by card 30 (ADR-0055)
+
+| Change | Before | After (ADR-0055) | Witness |
+|---|---|---|---|
+| Candidate depth | Qdrant asked for `top_k` (5); `cand_k` (25) only printed | Qdrant asked for `cand_k`; PG gate → cut to `top_k` → mood rerank (a permutation of that visible set, ADR-0030 D-D kept) → cut to `limit`; `candidate_count` is the real Qdrant count | `recall_archive_fixture_fills_top_k_from_cand_k_over_fetch`, `recall_mood_rerank_permutes_only_the_visible_top_k` |
+| Candidate scope | tenant-wide: another workspace's tenant-shared points took candidate slots (the registry never resolves them for this stream) and collided with this stream's per-workspace tombstoned seqs | `workspace_id == request workspace` ANDed with the seq overlay in one builder (`DenseQuery::in_workspace_stream`) | `recall_candidate_set_is_scoped_to_the_request_workspace_stream` |
+| Lifecycle prefilter | none — archived/superseded points took candidate slots, the PG gate dropped them, recall under-filled | payload `status == "active"` AND NOT `archived == true` (nested `must_not`, so a flagless legacy point passes); `archived` derived from `archived_at` on every ticket; TOMBSTONED seqs reach the overlay | `dense_query_never_returns_an_archived_or_non_active_point`, the five `projection_worker` flag tests, `recall_tombstoned_seq_never_reaches_the_candidate_set` |
+| Planner lane substitution (**LANE_SUBSTITUTED**) | any non-SEMANTIC class (最近/相关/目前/quotes/UUID …) was `INVALID_INPUT` | dense answers every class; `provenance.planner_class` recorded; `completeness.degradations ∋ LANE_SUBSTITUTED` when no `mode` was sent (new `DegradeCode::LaneSubstituted`, §53.4 fault file); an explicit undelivered `mode` stays `DEPENDENCY_UNAVAILABLE` | `recall_everyday_queries_are_answered_by_dense_with_lane_substituted`, `recall_explicit_undelivered_mode_is_refused_and_explicit_semantic_is_not_substituted`, rehearsal `recall_everyday_queries_answered_with_lane_substituted` |
+| `limit` | must equal `top_k` | `1..=top_k` accepted, only shortens the returned list; `> top_k` stays `INVALID_INPUT` | `recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused` leg 4 |
+| Flagless legacy points | — | no backfill, no `projection_version` bump, no migration: every pre-card-30 point lacks `archived` and still serves; a memory archived before card 30 keeps a flagless point until its next ticket (the PG gate excludes it, the 5× over-fetch absorbs the fill loss) | live count 2026-09-30: 3447/3447 e2e points flagless |
+| Per-stage timing | none; the §4.1 bucket was mislabelled | `provenance.stage_ms` (8 stages + total, reported only when every lap followed the fixed lap sequence) and soak buckets `recall.stage.*`, `recall.stage_sum`, `memory.get`, `memory.enumerate` | `recall_stage_ms_cover_at_least_ninety_percent_of_in_process_search_time`, `recall::tests::stage_clock_reports_every_stage_only_for_the_full_lap_sequence`, §4.5 |
+
+- **Spec text amended by the main line (2026-09-30):** Baseline §53.2 (variant list), §53.4 (fault
+  file list, `lane_substituted.rs` registered) and §41 (`degrade_total.code` cardinality) now read
+  11 variants, matching `crates/telemetry/src/degrade.rs`; the xtask self-test
+  `parse_degrade_variant_names_matches_real_degrade_rs` pins 11 and asserts `LaneSubstituted`.
+- **Open:** `correct`'s M1 keeps its point until card 31's retire ticket; the tombstone overlay keys
+  on `source_stream_seq`, which a later lifecycle re-upsert rewrites (the PG gate stays exact).
+- **Behaviour change to know:** `memory.unarchive` is now visible to recall only after its lifecycle
+  ticket re-projects the point (projection lag; the prefilter still sees `archived=true` until
+  then). The rehearsal's card-4 witness polls for it and reports `unarchive_to_served_s`.
+- **Finding (pre-existing, outside card 30):** the §23.1② `visible` count
+  (`retrieve::visible_count_of_version` → `VisibleCountFilter::new`, shared with the §16.2 serve
+  switch in `xtask/src/switch_visible.rs`) is tenant-wide while the ledger it is compared with is
+  one workspace stream, so another workspace's tenant-shared points inflate it and the seq overlay
+  subtracts their colliding seqs: the card-30 two-workspace fixture reads `visible = 29` against
+  `done = 6` ⇒ `a2_overshoot_beyond_pending` / `cannot_establish`. Fix belongs with the switch
+  (`VisibleCountFilter::family_probe` on both sides). ADR-0055 Known limits.
+- **Finding (pre-existing, outside card 30):** a recall query holding ≥ 7 digits (a random UUID such
+  as `…-79869668a78d`, a date `2026-09-30`, an order number) is refused `FORBIDDEN` by the gateway's
+  `seal_query` — `local-secret-scan`'s contribution-privacy phone heuristic
+  (`crates/local-secret-scan/src/lib.rs:479-492`) runs on recall queries. ADR-0055 Known limits.
 
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 

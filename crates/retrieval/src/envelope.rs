@@ -594,11 +594,53 @@ pub fn envelope_outcome_block<T>(
     inputs: CompletenessInputs<'_>,
     accept: impl FnOnce(ExactOutcome) -> Result<T, humaux_domain::error::ErrorCode>,
 ) -> Result<PendingEnvelope<T>, humaux_domain::error::ErrorCode> {
+    outcome_block_under(request.planner_decision(), request, inputs, accept)
+}
+
+/// ADR-0055 D-C: [`envelope_outcome_block`] for a `recall.search` answer the dense lane produced
+/// whatever the planner decided. The dense lane's answer is `semantic_bounded` by construction,
+/// so it is classified under `Class(Semantic)`, not the request's own decision — classifying a
+/// substituted `DirectGet` as `Exact` would demand a census this lane never runs and turn the
+/// answer into §22.0's `Internal`.
+pub fn dense_lane_outcome_block<T>(
+    request: &RetrievalRequest,
+    inputs: CompletenessInputs<'_>,
+    accept: impl FnOnce(ExactOutcome) -> Result<T, humaux_domain::error::ErrorCode>,
+) -> Result<PendingEnvelope<T>, humaux_domain::error::ErrorCode> {
+    outcome_block_under(
+        &PlannerDecision::Class(QueryClass::Semantic),
+        request,
+        inputs,
+        accept,
+    )
+}
+
+/// ADR-0055 D-C / §53.1: the one place `LANE_SUBSTITUTED` fires — through `abstain()` — when the
+/// planner's decision names a lane other than dense and the caller sent no `mode`. An explicit
+/// `mode` (only `semantic` reaches here) means the caller chose dense: nothing was substituted.
+pub fn dense_lane_substitution(
+    decision: &PlannerDecision,
+    explicit_mode: bool,
+) -> Vec<DegradeCode> {
+    if explicit_mode || *decision == PlannerDecision::Class(QueryClass::Semantic) {
+        return Vec::new();
+    }
+    abstain(DegradeCode::LaneSubstituted, ())
+        .degradations
+        .into_vec()
+}
+
+fn outcome_block_under<T>(
+    decision: &PlannerDecision,
+    request: &RetrievalRequest,
+    inputs: CompletenessInputs<'_>,
+    accept: impl FnOnce(ExactOutcome) -> Result<T, humaux_domain::error::ErrorCode>,
+) -> Result<PendingEnvelope<T>, humaux_domain::error::ErrorCode> {
     if !inputs.provenance.is_valid(request) {
         return Err(humaux_domain::error::ErrorCode::Internal);
     }
     let class = final_completeness_class(
-        request.planner_decision(),
+        decision,
         *inputs.lane_status,
         inputs.census,
         inputs.ledger,
@@ -2967,5 +3009,91 @@ mod tests {
         assert_eq!(out.class, CompletenessClassWire::SemanticBounded);
         assert_eq!(out.exact, None);
         assert_eq!(out.known_lower_bound, None);
+    }
+
+    // ---- ADR-0055 D-C: dense lane substitution ----
+
+    #[test]
+    fn dense_lane_substitution_is_empty_for_semantic_or_explicit_mode_and_lane_substituted_otherwise()
+     {
+        let semantic = PlannerDecision::Class(QueryClass::Semantic);
+        let temporal = PlannerDecision::Class(QueryClass::Temporal);
+        let direct = PlannerDecision::DirectGet(crate::planner::DirectGetLocator::MemoryId(
+            "0190f7a8-0000-7000-8000-000000000001".to_string(),
+        ));
+        assert!(dense_lane_substitution(&semantic, false).is_empty());
+        assert!(dense_lane_substitution(&semantic, true).is_empty());
+        assert!(
+            dense_lane_substitution(&temporal, true).is_empty(),
+            "an explicit mode chose dense: nothing was substituted"
+        );
+        let before = humaux_telemetry::degrade::degrade_total_count(DegradeCode::LaneSubstituted);
+        assert_eq!(
+            dense_lane_substitution(&temporal, false),
+            vec![DegradeCode::LaneSubstituted]
+        );
+        assert_eq!(
+            dense_lane_substitution(&direct, false),
+            vec![DegradeCode::LaneSubstituted]
+        );
+        assert!(
+            humaux_telemetry::degrade::degrade_total_count(DegradeCode::LaneSubstituted)
+                >= before + 2,
+            "the substitution must go through abstain() (§53.1)"
+        );
+        assert_eq!(
+            DegradeCode::LaneSubstituted.line_format(),
+            "LANE_SUBSTITUTED"
+        );
+    }
+
+    #[test]
+    fn dense_lane_outcome_classifies_direct_get_as_semantic_bounded_not_exact() {
+        let request = provenance_request("0190f7a8-0000-7000-8000-000000000001", 5, true);
+        assert!(matches!(
+            request.planner_decision(),
+            PlannerDecision::DirectGet(_)
+        ));
+        let ledger = closed(LedgerReads {
+            expected: 1,
+            done: 1,
+            deleted: 0,
+            skipped: 0,
+            open_gaps: 0,
+            pending: 0,
+        });
+        let pipeline = PipelineBlock {
+            evidence: EvidenceBlock::no_batch(Some(1), CountScope::StreamLedger),
+            knowledge: KnowledgeBlock {
+                eligible: Some(1),
+                processed: Some(1),
+                waiting_key: Some(0),
+                failed: Some(0),
+                count_scope: CountScope::StreamLedger,
+            },
+            projection: build_projection_block(&ledger, Some(1)).value,
+        };
+        let provenance = full_provenance();
+        let census = CensusResult::ok_without_enumeration();
+        let inputs = || CompletenessInputs {
+            lane_status: &LaneStatus::Ok,
+            census: &census,
+            ledger: &ledger,
+            pipeline: &pipeline,
+            provenance: &provenance,
+            visible: Some(1),
+            context: None,
+            mandatory_missing: 0,
+        };
+        // The request's own decision (DirectGet ⇒ Exact without a census) is §22.0's 5xx.
+        assert!(matches!(
+            envelope_outcome_block(&request, inputs(), Ok),
+            Err(humaux_domain::error::ErrorCode::Internal)
+        ));
+        let out = dense_lane_outcome_block(&request, inputs(), Ok)
+            .expect("dense lane answer")
+            .finish();
+        assert_eq!(out.class, CompletenessClassWire::SemanticBounded);
+        assert!(out.exact.is_none());
     }
 }

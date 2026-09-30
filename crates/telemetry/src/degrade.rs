@@ -70,6 +70,10 @@ degrade_code! {
     /// §23.1② A2: the ledger says a record is closed but the index does not
     /// have it — visible under-count with no matching ledger movement.
     ProjectionInvisibleLoss,
+    /// §33 Tool 2 / ADR-0055 D-C: the planner routed the query to a lane this
+    /// deployment has not delivered and the caller named no `mode`, so the dense
+    /// lane answered in its place (result returned, §52.3 Q1).
+    LaneSubstituted,
 }
 
 impl DegradeCode {
@@ -183,14 +187,15 @@ pub type Response<T> = Result<Outcome<T>, ErrorCode>;
 struct DegradeTotal([AtomicU64; DegradeCode::ALL.len()]);
 
 impl DegradeTotal {
-    // ponytail: 10 literal AtomicU64::new(0) instead of a `[X; N]` repeat
+    // ponytail: 11 literal AtomicU64::new(0) instead of a `[X; N]` repeat
     // expression — AtomicU64 isn't Copy, and naming a `const ZERO` for the
     // repeat trips clippy::declare_interior_mutable_const (a const with
     // interior mutability silently re-evaluates per use site, which is
     // exactly wrong for a shared atomic). Update the count by hand if
-    // DegradeCode ever grows past 10.
+    // DegradeCode ever grows past 11.
     const fn new() -> Self {
         DegradeTotal([
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -253,11 +258,11 @@ mod tests {
 
     /// left operand of §53.3 rule 2 and of the fold-injectivity check.
     /// `ALL` is macro-derived from the enum's variant list (see
-    /// `degrade_code!` above), so this can no longer silently pass while an
-    /// 11th variant exists.
+    /// `degrade_code!` above), so this can no longer silently pass while a
+    /// 12th variant exists.
     #[test]
-    fn all_has_10_entries() {
-        assert_eq!(DegradeCode::ALL.len(), 10);
+    fn all_has_11_entries() {
+        assert_eq!(DegradeCode::ALL.len(), 11);
     }
 
     /// §53.2: variant names have no digits and no consecutive uppercase
@@ -294,7 +299,7 @@ mod tests {
             assert!(seen.insert(folded.clone()), "fold collision on {folded}");
             assert_eq!(unfold(&folded), name, "fold({name}) does not round-trip");
         }
-        assert_eq!(seen.len(), 10);
+        assert_eq!(seen.len(), 11);
     }
 
     /// §53.2 worked example, verbatim: `ProjectionInvisibleLoss` folds to

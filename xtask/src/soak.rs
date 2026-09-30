@@ -6,7 +6,7 @@
 //!   modules=[domain::ids, projection::serving, xtask::switch_visible]
 //! Called-by: [xtask::e2e_onboard, xtask::main]
 //! Invariants: [continuous concurrent load against the real four-process deployment while a chaos hook kills/restarts a worker; every read is asserted live against the database]
-//! Spec: Baseline §15.1; §15.3; §15.5; §31; §61; §6.1; ADR-0037; ADR-0050; ADR-0052
+//! Spec: Baseline §15.1; §15.3; §15.5; §31; §61; §6.1; ADR-0037; ADR-0050; ADR-0052; ADR-0055
 //!
 //! `cargo xtask soak` — the endurance + crash-recovery harness (card 16).
 //!
@@ -920,7 +920,12 @@ fn observation_assertions(obs: &[Observation], max_rss: u64, max_conns: i64) -> 
 )]
 pub fn op_failure_rate(samples: &[Sample], threshold: f64) -> Assertion {
     let mut per_op: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
-    for s in samples {
+    // ADR-0055 D-E: `recall.stage*` samples are derived from a successful recall, not calls.
+    let calls: Vec<&Sample> = samples
+        .iter()
+        .filter(|s| !s.op.starts_with(RECALL_STAGE_PREFIX))
+        .collect();
+    for s in &calls {
         let e = per_op.entry(s.op.as_str()).or_default();
         e.0 += 1;
         e.1 += i64::from(!s.ok);
@@ -931,7 +936,7 @@ pub fn op_failure_rate(samples: &[Sample], threshold: f64) -> Assertion {
         "op_failure_rate",
         worst,
         "fraction of calls failed (worst op)",
-        samples.len() as i64,
+        calls.len() as i64,
         threshold,
     )
     .with_detail(serde_json::Value::Array(
@@ -1609,14 +1614,29 @@ fn cross_tenant_hit(cfg: &Config, lane_idx: usize, body: &str) -> bool {
     })
 }
 
-fn timed(cfg: &Config, lane: &TenantLane, tool: &str, args: &str) -> (Sample, String) {
+/// Latency bucket of the `memory` tool's `enumerate` action (card 30: this bucket was reported
+/// as plain `"memory"` and misread as `memory.get` in delivery_point_report §4.1).
+const OP_MEMORY_ENUMERATE: &str = "memory.enumerate";
+/// Latency bucket of the `memory` tool's `get` action — never timed before card 30.
+const OP_MEMORY_GET: &str = "memory.get";
+/// Prefix of the derived per-stage recall samples (ADR-0055 D-E): one `recall.stage.<name>` per
+/// stage and one `recall.stage_sum` per successful recall. Derived from a call, not calls.
+const RECALL_STAGE_PREFIX: &str = "recall.stage";
+/// `provenance.stage_ms` keys `recall.search` reports (bins/gateway/src/recall.rs `STAGE_NAMES`).
+const RECALL_STAGES: [&str; 8] = [
+    "route", "planner", "scan", "embed", "qdrant", "hydrate", "rerank", "assemble",
+];
+
+/// `op` is the latency bucket, `tool` the MCP tool dialed — they differ for the `memory` tool,
+/// whose two actions are bucketed separately.
+fn timed(cfg: &Config, lane: &TenantLane, op: &str, tool: &str, args: &str) -> (Sample, String) {
     let started = Instant::now();
     let result = call(cfg, lane, tool, args);
     let ms = started.elapsed().as_secs_f64() * 1000.0;
     let (sample, body) = match result {
         Ok((status, body)) => (
             Sample {
-                op: tool.to_string(),
+                op: op.to_string(),
                 ms,
                 ok: status == 200 && !body.contains("\"isError\":true"),
             },
@@ -1624,7 +1644,7 @@ fn timed(cfg: &Config, lane: &TenantLane, tool: &str, args: &str) -> (Sample, St
         ),
         Err(e) => (
             Sample {
-                op: tool.to_string(),
+                op: op.to_string(),
                 ms,
                 ok: false,
             },
@@ -1638,7 +1658,7 @@ fn timed(cfg: &Config, lane: &TenantLane, tool: &str, args: &str) -> (Sample, St
     if !sample.ok {
         let head: String = body.chars().take(240).collect();
         eprintln!(
-            "soak: {tool} failed on lane {} after {ms:.0}ms: {head}",
+            "soak: {op} failed on lane {} after {ms:.0}ms: {head}",
             lane.sentinel
         );
     }
@@ -1671,7 +1691,7 @@ fn session(cfg: &Config, lane_idx: usize, deadline: Instant, shared: &Mutex<Shar
              \"workspace_id\":\"{}\"}}",
             lane.workspace_id
         );
-        let (s_put, put_body) = timed(cfg, lane, "remember", &put);
+        let (s_put, put_body) = timed(cfg, lane, "remember", "remember", &put);
         let token = json_field(&put_body, "consistency_token");
         let recall_args = token.as_ref().map_or_else(
             || {
@@ -1688,38 +1708,92 @@ fn session(cfg: &Config, lane_idx: usize, deadline: Instant, shared: &Mutex<Shar
                 )
             },
         );
-        let (s_recall, recall_body) = timed(cfg, lane, "recall", &recall_args);
+        let (s_recall, recall_body) = timed(cfg, lane, "recall", "recall", &recall_args);
         let enumerate = format!(
             "{{\"action\":\"enumerate\",\"workspace_id\":\"{}\",\"limit\":10}}",
             lane.workspace_id
         );
-        let (s_enum, enum_body) = timed(cfg, lane, "memory", &enumerate);
-        record(
-            cfg,
-            lane_idx,
-            shared,
-            [
-                (s_put, put_body),
-                (s_recall, recall_body),
-                (s_enum, enum_body),
-            ],
-            token.is_some(),
-        );
+        let (s_enum, enum_body) = timed(cfg, lane, OP_MEMORY_ENUMERATE, "memory", &enumerate);
+        // Skipped (no sample), not failed, when this session's recall returned no memory item.
+        let got = memory_get_args(&recall_body, &lane.workspace_id.to_string())
+            .map(|args| timed(cfg, lane, OP_MEMORY_GET, "memory", &args));
+        let mut calls = vec![
+            (s_put, put_body),
+            (s_recall, recall_body),
+            (s_enum, enum_body),
+        ];
+        calls.extend(got);
+        record(cfg, lane_idx, shared, calls, token.is_some());
         std::thread::sleep(cfg.think);
     }
+}
+
+/// `memory.get` arguments for the first memory item of a recall response, `None` when the
+/// recall returned no memory item (or failed).
+fn memory_get_args(recall_body: &str, workspace_id: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(recall_body).ok()?;
+    let id = v
+        .pointer("/result/structuredContent/items")?
+        .as_array()?
+        .iter()
+        .find(|item| item["kind"] == "memory")?["memory_id"]
+        .as_str()?
+        .to_owned();
+    Some(format!(
+        "{{\"action\":\"get\",\"memory_id\":\"{id}\",\"workspace_id\":\"{workspace_id}\"}}"
+    ))
+}
+
+/// ADR-0055 D-E: one `recall.stage.<name>` sample per stage plus one `recall.stage_sum`, read
+/// from a successful recall's `provenance.stage_ms`. A failed recall, or one without all eight
+/// stages, yields none — a missing stage is not a zero.
+fn recall_stage_samples(recall: &Sample, body: &str) -> Vec<Sample> {
+    if !recall.ok {
+        return Vec::new();
+    }
+    let Some(stage_ms) = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/result/structuredContent/provenance/stage_ms")
+                .cloned()
+        })
+    else {
+        return Vec::new();
+    };
+    let Some(values) = RECALL_STAGES
+        .iter()
+        .map(|name| stage_ms.get(name).and_then(serde_json::Value::as_f64))
+        .collect::<Option<Vec<f64>>>()
+    else {
+        return Vec::new();
+    };
+    let sample = |op: String, ms: f64| Sample { op, ms, ok: true };
+    let mut out: Vec<Sample> = RECALL_STAGES
+        .iter()
+        .zip(&values)
+        .map(|(name, ms)| sample(format!("{RECALL_STAGE_PREFIX}.{name}"), *ms))
+        .collect();
+    out.push(sample(
+        format!("{RECALL_STAGE_PREFIX}_sum"),
+        values.iter().sum(),
+    ));
+    out
 }
 
 fn record(
     cfg: &Config,
     lane_idx: usize,
     shared: &Mutex<Shared>,
-    calls: [(Sample, String); 3],
+    // `[remember, recall, memory.enumerate, memory.get?]` — the recall is always `calls[1]`.
+    calls: Vec<(Sample, String)>,
     // Whether the `remember.put` above handed back a `consistency_token`, i.e. whether the
     // recall in `calls[1]` carried one.
     token_issued: bool,
 ) {
     let Ok(mut g) = shared.lock() else { return };
     let recall_body = calls[1].1.clone();
+    let stages = recall_stage_samples(&calls[1].0, &recall_body);
+    g.samples.extend(stages);
     for (sample, body) in calls {
         g.responses_scanned += 1;
         if cross_tenant_hit(cfg, lane_idx, &body) {
@@ -1849,7 +1923,7 @@ fn replay_ryw(cfg: &Config, db: &mut Client, series: &mut Series) -> Result<(), 
             digit_free(&nonce),
             lane.workspace_id
         );
-        let (put_sample, put_body) = timed(cfg, lane, "remember", &put);
+        let (put_sample, put_body) = timed(cfg, lane, "remember", "remember", &put);
         series.samples.push(Sample {
             op: "remember.ryw_replay".to_string(),
             ..put_sample
@@ -1884,7 +1958,7 @@ fn replay_ryw(cfg: &Config, db: &mut Client, series: &mut Series) -> Result<(), 
              \"mode\":\"semantic\",\"consistency_token\":\"{token}\"}}",
             lane.workspace_id,
         );
-        let (sample, body) = timed(cfg, lane, "recall", &args);
+        let (sample, body) = timed(cfg, lane, "recall", "recall", &args);
         let sample_ok = sample.ok;
         series.samples.push(Sample {
             op: "recall.ryw_replay".to_string(),
@@ -2947,6 +3021,71 @@ mod tests {
         assert_eq!(a.n, 20);
         assert!(a.detail.to_string().contains("\"op\":\"recall\""));
         assert!(op_failure_rate(&samples, 0.1).pass);
+    }
+
+    #[test]
+    fn soak_buckets_split_memory_get_from_memory_enumerate() {
+        assert_ne!(OP_MEMORY_GET, OP_MEMORY_ENUMERATE);
+        let recall = r#"{"result":{"structuredContent":{"items":[
+            {"kind":"temporary_evidence","evidence_id":"e1"},
+            {"kind":"memory","memory_id":"m1"},{"kind":"memory","memory_id":"m2"}]}}}"#;
+        let args = memory_get_args(recall, "w1").expect("first memory item");
+        let parsed: serde_json::Value = serde_json::from_str(&args).expect("json args");
+        assert_eq!(parsed["action"], "get");
+        assert_eq!(parsed["memory_id"], "m1");
+        assert_eq!(parsed["workspace_id"], "w1");
+        let empty = r#"{"result":{"structuredContent":{"items":[]}}}"#;
+        assert_eq!(memory_get_args(empty, "w1"), None, "skipped, not failed");
+        let series = Series {
+            samples: vec![
+                sample(OP_MEMORY_ENUMERATE, true),
+                sample(OP_MEMORY_GET, true),
+            ],
+            ..Series::default()
+        };
+        let report = report_json(&series, &[], serde_json::json!({}));
+        let ops: Vec<&str> = report["latency"]
+            .as_array()
+            .expect("latency")
+            .iter()
+            .map(|row| row["operation"].as_str().expect("op"))
+            .collect();
+        assert_eq!(ops, vec![OP_MEMORY_ENUMERATE, OP_MEMORY_GET]);
+        assert!(
+            !ops.contains(&"memory"),
+            "the §4.1 mislabelled bucket is gone"
+        );
+    }
+
+    #[test]
+    fn recall_stage_samples_come_from_provenance_stage_ms_and_skip_failed_recalls() {
+        let body = serde_json::json!({"result":{"structuredContent":{"provenance":{"stage_ms":{
+            "route":1.0,"planner":0.5,"scan":200.0,"embed":250.0,"qdrant":10.0,
+            "hydrate":20.0,"rerank":0.5,"assemble":18.0,"total":500.0}}}}})
+        .to_string();
+        let got = recall_stage_samples(&sample("recall", true), &body);
+        assert_eq!(got.len(), 9);
+        assert_eq!(got[2].op, "recall.stage.scan");
+        assert!((got[2].ms - 200.0).abs() < 1e-9);
+        assert_eq!(got[8].op, "recall.stage_sum");
+        assert!((got[8].ms - 500.0).abs() < 1e-9);
+        assert!(recall_stage_samples(&sample("recall", false), &body).is_empty());
+        let partial = body.replace("\"rerank\":0.5,", "");
+        assert!(
+            recall_stage_samples(&sample("recall", true), &partial).is_empty(),
+            "a missing stage is not a zero"
+        );
+    }
+
+    #[test]
+    fn op_failure_rate_ignores_derived_stage_samples() {
+        let mut samples: Vec<Sample> = (0..10).map(|_| sample("recall", true)).collect();
+        samples.extend((0..90).map(|_| sample("recall.stage.scan", true)));
+        samples.push(sample("recall.stage_sum", false));
+        let a = op_failure_rate(&samples, 0.0);
+        assert!(a.pass, "{a:?}");
+        assert_eq!(a.n, 10);
+        assert!(!a.detail.to_string().contains("recall.stage"));
     }
 
     #[test]

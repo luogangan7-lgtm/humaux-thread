@@ -6,7 +6,7 @@
 //! Called-by: [cargo-test]
 //! Invariants: [no DB and no network: only request/response JSON shaping and the §17.4 confirmation contract;
 //!   unexpected shapes and non-success statuses must map to the typed QdrantTransportError]
-//! Spec: Baseline §17.4; §17.1; §23.4
+//! Spec: Baseline §17.4; §17.1; §23.4; ADR-0055
 //!
 //! No DB, no network: everything this
 //! file exercises is request/response JSON shaping and the §17.4 confirmation contract, none
@@ -403,10 +403,11 @@ fn dense_query_with_subject_ids_ands_an_any_of_should_after_tenant_and_visibilit
     let query = dense_query(&s, vec![0.1, 0.2], 3).with_subject_ids(&[a, b]);
     let body = dense_query_body(&query);
     let must = body["filter"]["must"].as_array().expect("must");
-    // tenant + visibility + projection_version + embedding_version + subject any-of.
-    assert_eq!(must.len(), 5);
+    // tenant + visibility + projection_version + embedding_version + ADR-0055 servable pair
+    // (status, NOT archived) + subject any-of.
+    assert_eq!(must.len(), 7);
     assert_eq!(must[0]["key"], "tenant_id");
-    let any_of = must[4]["should"]
+    let any_of = must[6]["should"]
         .as_array()
         .expect("subject any-of is a should");
     assert_eq!(any_of.len(), 2);
@@ -512,6 +513,17 @@ fn dense_query_body_keeps_scope_version_tombstone_and_shard_in_one_request() {
     assert_eq!(must[2]["match"]["value"], "v1");
     assert_eq!(must[3]["key"], "embedding_version");
     assert_eq!(must[3]["match"]["value"], "embed-v1");
+    // ADR-0055 D-B: every dense query is a serving read — status active, and a NESTED
+    // must_not on archived so a legacy point without the flag still passes.
+    assert_eq!(
+        must[4],
+        serde_json::json!({"key":"status","match":{"value":"active"}})
+    );
+    assert_eq!(
+        must[5],
+        serde_json::json!({"must_not":[{"key":"archived","match":{"value":true}}]})
+    );
+    assert_eq!(must.len(), 6);
     assert_eq!(body["filter"]["must_not"][0]["has_id"][0], 99);
 }
 

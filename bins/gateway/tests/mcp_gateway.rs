@@ -730,6 +730,19 @@ fn semantic_payload(
     handle: &Handle,
     source_updated_at: time::OffsetDateTime,
 ) -> humaux_adapters::qdrant::IndexablePayload {
+    semantic_payload_with(handle, source_updated_at, AuthorityStatus::Active, 0)
+        // ADR-0055 D-B: the worker writes the flag on every upsert; a live fixture row is `false`.
+        .with_archived(false)
+}
+
+/// [`semantic_payload`] with the lifecycle status and `source_stream_seq` a card-30 fixture needs
+/// (a superseded-payload point, a tombstoned seq).
+fn semantic_payload_with(
+    handle: &Handle,
+    source_updated_at: time::OffsetDateTime,
+    status: AuthorityStatus,
+    source_stream_seq: i64,
+) -> humaux_adapters::qdrant::IndexablePayload {
     QdrantPointPayload {
         tenant_id: TenantId(handle.tenant_id),
         workspace_id: WorkspaceId(handle.workspace_id),
@@ -738,13 +751,13 @@ fn semantic_payload(
         visibility_workspace_id: Some(WorkspaceId(handle.workspace_id)),
         object_type: "memory_record".to_owned(),
         memory_type: MemoryType::Note,
-        status: AuthorityStatus::Active,
+        status,
         authority: AuthorityClass::ProjectConstraint,
         created_at: source_updated_at,
         effective_at: source_updated_at,
         embedding_version: "embed-v1".to_owned(),
         projection_version: "v1".to_owned(),
-        source_stream_seq: 0,
+        source_stream_seq,
         data_class: DataClass::Internal,
         egress_disposition: EgressDisposition::Allowed,
     }
@@ -2895,6 +2908,21 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 );
                 assert_eq!(no_token["completeness"]["reranked_count"], 0);
                 assert_eq!(no_token["provenance"]["profile"]["lanes"], json!(["dense"]));
+                // ADR-0055 D-C/D-E: recall-only provenance — the planner's class, recorded, and the
+                // exhaustive per-stage partition of search() in ms.
+                assert_eq!(no_token["provenance"]["planner_class"], "SEMANTIC");
+                let stage_ms = no_token["provenance"]["stage_ms"]
+                    .as_object()
+                    .expect("provenance.stage_ms");
+                for key in [
+                    "route", "planner", "scan", "embed", "qdrant", "hydrate", "rerank", "assemble",
+                    "total",
+                ] {
+                    assert!(
+                        stage_ms.get(key).and_then(Value::as_f64).is_some_and(|ms| ms >= 0.0),
+                        "stage_ms.{key}: {no_token}"
+                    );
+                }
 
                 let remember_args = json!({
                     "operation":"put",
@@ -3213,6 +3241,17 @@ fn recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused(
             let seeded = handle.seed_workspace_visible_context_record();
             let point = Uuid::new_v4();
             let updated = seed_semantic_registry_row(&mut handle, &seeded, point);
+            // ADR-0055 D-D leg 4: two more candidates, so `limit: 1` visibly truncates.
+            let extra: Vec<(Uuid, time::OffsetDateTime)> = (0..2)
+                .map(|_| {
+                    let record = handle.seed_workspace_visible_context_record();
+                    let point = Uuid::new_v4();
+                    (
+                        point,
+                        seed_semantic_registry_row(&mut handle, &record, point),
+                    )
+                })
+                .collect();
             seed_semantic_checkpoint(&mut handle);
 
             let cell = CellId(Uuid::now_v7());
@@ -3287,6 +3326,21 @@ fn recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused(
                 )
                 .await
                 .expect("real Qdrant semantic point");
+                for (i, (extra_point, extra_updated)) in extra.iter().enumerate() {
+                    upsert(
+                        transport.as_ref(),
+                        &permit,
+                        &collection,
+                        &[(
+                            PointId::Uuid(*extra_point),
+                            &semantic_payload(&handle, *extra_updated),
+                            nudged(&semantic_vector(query), i + 1, 0.5),
+                        )],
+                        ha_profile_for(QdrantOperation::NormalImmutableUpsert),
+                    )
+                    .await
+                    .expect("real Qdrant extra semantic point");
+                }
 
                 let (address, server) = start(app).await;
                 let (status, remember) = raw_request(
@@ -3380,8 +3434,890 @@ fn recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused(
                 assert_eq!(status, 200, "limit == profile top_k must answer: {echoed}");
                 assert_tool_response(&echoed, ToolName::Recall);
 
+                // Leg 4 — ADR-0055 D-D: a limit below top_k only shortens the returned list
+                // (§33.5); candidate depth still comes from the profile.
+                let (status, shortened) = recall_call(
+                    address,
+                    Some(&credential.bearer),
+                    json!({"query":query,"workspace_id":workspace_id,"mode":"semantic","limit":1}),
+                )
+                .await;
+                assert_eq!(status, 200, "limit 1 <= top_k answers: {shortened}");
+                let shortened = assert_tool_response(&shortened, ToolName::Recall);
+                assert_eq!(recalled_memory_ids(shortened).len(), 1, "{shortened}");
+                assert_eq!(
+                    shortened["completeness"]["candidate_count"], 3,
+                    "{shortened}"
+                );
+                assert_eq!(shortened["completeness"]["returned"], 1, "{shortened}");
+                assert_eq!(shortened["completeness"]["truncated"], true, "{shortened}");
+
                 server.abort();
                 delete_semantic_collection(&transport, &registry, &collection).await;
+            });
+        },
+    );
+}
+
+/// Card 30 (ADR-0055) harness: the real gateway → retrieval-worker → Qdrant/PG wiring of
+/// [`recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused`], built once
+/// for the recall-correctness fixtures below. The Qdrant collection is created and deleted by
+/// each test's own async body ([`create_semantic_collection`] / [`delete_semantic_collection`]).
+struct RecallHarness {
+    transport: Arc<HttpIntraCellTransport>,
+    registry: IntraCellResourceRegistry,
+    collection: String,
+    bearer: String,
+    app: Option<GatewayMcpApplication>,
+}
+
+fn recall_harness(handle: &mut Handle, tag: &str) -> RecallHarness {
+    let prefix = format!("c30{}", &Uuid::now_v7().simple().to_string()[..12]);
+    let wire = format!("{prefix}.{}", "c".repeat(32));
+    let credential = handle.seed_synthetic_service_credential_and_window(
+        SyntheticCredentialScopes::RememberWriteAndContextRead,
+        &prefix,
+        &wire,
+        &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+        48,
+    );
+    seed_semantic_checkpoint(handle);
+    let cell = CellId(Uuid::now_v7());
+    let registry = semantic_qdrant_registry(cell, CallerId(format!("gateway-{tag}")));
+    let transport = Arc::new(
+        HttpIntraCellTransport::new(
+            registry.clone(),
+            Duration::from_secs(10),
+            humaux_infra_cell::DEFAULT_MAX_RESPONSE_BYTES,
+        )
+        .expect("semantic Qdrant transport"),
+    );
+    let collection = format!("c30_{tag}_{}", Uuid::now_v7().simple());
+    seed_tenant_placement(handle, &collection);
+    let runtime_handle = handle.rt.handle().clone();
+    let runtime = runtime_handle
+        .block_on(handle.fresh_runtime())
+        .expect("fresh semantic Gateway runtime");
+    let gateway_uid = runtime_handle.block_on(semantic_own_uid());
+    let socket_path = runtime_handle.block_on(spawn_semantic_worker(gateway_uid));
+    let embedding_port: Arc<
+        dyn humaux_application::retrieval_embedding_port::RetrievalEmbeddingPort,
+    > = Arc::new(
+        humaux_gateway::retrieval_embedding_client::GatewayRetrievalEmbeddingClient::new(
+            Arc::new(
+                runtime_handle
+                    // dep: PostgreSQL(role_gateway) — test fixture pool for the mcp_gateway end-to-end suite
+                    .block_on(RuntimeDbPool::connect(
+                        &std::env::var("HUMAUX_GATEWAY_PG_DSN")
+                            .expect("fixture requires HUMAUX_GATEWAY_PG_DSN"),
+                    ))
+                    .expect("gateway runtime pool for the embedding client"),
+            ),
+            socket_path,
+            registry.clone(),
+            Duration::from_secs(30),
+        ),
+    );
+    let semantic = SemanticRecallRuntime::new(
+        semantic_scanner(),
+        embedding_port,
+        transport.clone(),
+        registry.clone(),
+        SemanticRecallVersions {
+            embedding_version: "embed-v1".to_owned(),
+            dimension: 4,
+        },
+        Duration::from_secs(10),
+    )
+    .expect("trusted semantic runtime");
+    let app = application(handle, runtime).with_semantic_recall(semantic);
+    RecallHarness {
+        transport,
+        registry,
+        collection,
+        bearer: credential.bearer,
+        app: Some(app),
+    }
+}
+
+/// One fixture memory the harness indexes: the PG row, its opaque point, and the vector and
+/// payload flags the projection worker would have written.
+struct RecallPoint {
+    record: ScopedContextRecord,
+    point: Uuid,
+    vector: Vec<f32>,
+    status: AuthorityStatus,
+    archived: bool,
+    seq: i64,
+}
+
+/// Seeds `vectors.len()` workspace-visible memories + registry rows, in order. `archived` rows
+/// get `archived_at` in PG BEFORE registration, so the registry's `source_updated_at` matches
+/// the row the hydrate gate reads.
+fn seed_recall_points(handle: &mut Handle, vectors: Vec<(Vec<f32>, bool)>) -> Vec<RecallPoint> {
+    vectors
+        .into_iter()
+        .map(|(vector, archived)| {
+            let record = handle.seed_workspace_visible_context_record();
+            if archived {
+                handle
+                    .admin
+                    .execute(
+                        "UPDATE private.memory_records SET archived_at=clock_timestamp() \
+                         WHERE tenant_id=$1 AND memory_id=$2",
+                        &[&handle.tenant_id, &record.memory_id],
+                    )
+                    .expect("owner archives fixture memory");
+            }
+            let point = Uuid::new_v4();
+            seed_semantic_registry_row(handle, &record, point);
+            RecallPoint {
+                record,
+                point,
+                vector,
+                status: AuthorityStatus::Active,
+                archived,
+                seq: 0,
+            }
+        })
+        .collect()
+}
+
+async fn upsert_recall_points(harness: &RecallHarness, handle: &Handle, points: &[RecallPoint]) {
+    let permit = authorize_cell_access(
+        &harness.registry,
+        IntraCellResource::QDRANT_REST,
+        Duration::from_secs(60),
+    )
+    .expect("semantic upsert permit");
+    let now = time::OffsetDateTime::now_utc();
+    let payloads: Vec<humaux_adapters::qdrant::IndexablePayload> = points
+        .iter()
+        .map(|p| semantic_payload_with(handle, now, p.status, p.seq).with_archived(p.archived))
+        .collect();
+    let rows: Vec<_> = points
+        .iter()
+        .zip(&payloads)
+        .map(|(p, payload)| (PointId::Uuid(p.point), payload, p.vector.clone()))
+        .collect();
+    upsert(
+        harness.transport.as_ref(),
+        &permit,
+        &harness.collection,
+        &rows,
+        ha_profile_for(QdrantOperation::NormalImmutableUpsert),
+    )
+    .await
+    .expect("real Qdrant fixture points");
+}
+
+/// `base` plus `delta` on one axis: a near-duplicate for small `delta`, a filler for large.
+fn nudged(base: &[f32], axis: usize, delta: f32) -> Vec<f32> {
+    let mut v = base.to_vec();
+    let axis = axis % v.len();
+    v[axis] += delta;
+    v
+}
+
+fn recalled_memory_ids(structured: &Value) -> Vec<String> {
+    structured["items"]
+        .as_array()
+        .expect("recall items")
+        .iter()
+        .filter(|item| item["kind"] == "memory")
+        .map(|item| item["memory_id"].as_str().expect("memory id").to_owned())
+        .collect()
+}
+
+/// Card 30 acceptance (ADR-0055 D-A/D-B), the §23.3 fixture the gateway used to fail: 30
+/// near-duplicates, 25 of them archived (PG `archived_at` AND payload `archived=true`) and ranked
+/// highest (their vector IS the query's), 5 live near-duplicates, 20 live fillers further away.
+/// `recall(top_k=5)` must return exactly the 5 live near-duplicates with
+/// `candidate_count == 25 == cand_k`; the mood rerank permutes the visible top_k only
+/// (`reranked_count == 5`, ADR-0030 D-D).
+/// Faults: fetch `top_k` instead of `cand_k` ⇒ candidate_count 5 ⇒ red; drop `servable()` ⇒ the
+/// 25 archived points (the query's own vector) fill the candidate set, the PG gate drops them
+/// all ⇒ returned 0 ⇒ red — the "no archived id in the candidate set" witness.
+#[test]
+#[ignore = "lane(a:request_guard) requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+fn recall_archive_fixture_fills_top_k_from_cand_k_over_fetch() {
+    run_db_fixture::<Fixture, _>(
+        "recall_archive_fixture_fills_top_k_from_cand_k_over_fetch",
+        |mut handle| {
+            handle.assert_gateway_login();
+            let _registry_cleanup = SemanticProjectionCleanup {
+                owner: handle.owner_client().expect("semantic cleanup owner"),
+                tenant_id: handle.tenant_id,
+            };
+            let mut harness = recall_harness(&mut handle, "archive");
+            let query = "operation receipt scoped context";
+            let q = semantic_vector(query);
+            let mut shapes: Vec<(Vec<f32>, bool)> = (0..25).map(|_| (q.clone(), true)).collect();
+            shapes.extend((0..5).map(|i| (nudged(&q, 0, 0.001 * (i as f32 + 1.0)), false)));
+            shapes.extend((0..20).map(|i| (nudged(&q, 1, 1.0 + 0.05 * i as f32), false)));
+            let points = seed_recall_points(&mut handle, shapes);
+            seed_semantic_projection_ledger(&mut handle, 50);
+            let archived: BTreeSet<String> = points[..25]
+                .iter()
+                .map(|p| p.record.memory_id.to_string())
+                .collect();
+            let live_near: BTreeSet<String> = points[25..30]
+                .iter()
+                .map(|p| p.record.memory_id.to_string())
+                .collect();
+            let runtime_handle = handle.rt.handle().clone();
+            runtime_handle.block_on(async {
+                create_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+                upsert_recall_points(&harness, &handle, &points).await;
+                let (address, server) =
+                    start(harness.app.take().expect("one gateway per harness")).await;
+                let (status, response) = recall_call(
+                    address,
+                    Some(&harness.bearer),
+                    json!({"query":query,"workspace_id":handle.workspace_id,"mode":"semantic",
+                           "mood_congruence":{"valence":0,"arousal":0}}),
+                )
+                .await;
+                assert_eq!(status, 200, "archive fixture recall: {response}");
+                let body = assert_tool_response(&response, ToolName::Recall);
+                let returned = recalled_memory_ids(body);
+                assert!(
+                    !returned.is_empty(),
+                    "the fixture must answer at all: {body}"
+                );
+                let completeness = &body["completeness"];
+                let profile = &body["provenance"]["profile"];
+                assert_eq!(profile["top_k"], 5, "{body}");
+                assert_eq!(
+                    returned.len(),
+                    5,
+                    "top_k filled from the over-fetch: {body}"
+                );
+                assert_eq!(
+                    returned.iter().cloned().collect::<BTreeSet<_>>(),
+                    live_near,
+                    "exactly the 5 live near-duplicates: {body}"
+                );
+                assert!(returned.iter().all(|id| !archived.contains(id)), "{body}");
+                assert_eq!(
+                    completeness["candidate_count"], 25,
+                    "Qdrant was asked for cand_k: {body}"
+                );
+                assert_eq!(completeness["candidate_count"], profile["cand_k"], "{body}");
+                assert_eq!(
+                    completeness["reranked_count"], 5,
+                    "the mood rerank permutes the visible top_k only: {body}"
+                );
+                assert_eq!(completeness["returned"], 5, "{body}");
+                assert_eq!(completeness["truncated"], true, "{body}");
+                server.abort();
+                delete_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+            });
+        },
+    );
+}
+
+/// Card 30 acceptance: a supersede chain of six (M1→…→M6; M1..M5 superseded in PG, their points
+/// left in place as the pre-retire race — three carry payload `status="superseded"`, two still
+/// `active`) ranked highest, plus 24 live fillers. Recall never returns M1..M5 and still fills
+/// `top_k`: M6 plus four fillers.
+#[test]
+#[ignore = "lane(a:request_guard) requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+fn recall_supersede_chain_of_six_never_returns_a_superseded_row_and_fills_top_k() {
+    run_db_fixture::<Fixture, _>(
+        "recall_supersede_chain_of_six_never_returns_a_superseded_row_and_fills_top_k",
+        |mut handle| {
+            handle.assert_gateway_login();
+            let _registry_cleanup = SemanticProjectionCleanup {
+                owner: handle.owner_client().expect("semantic cleanup owner"),
+                tenant_id: handle.tenant_id,
+            };
+            let mut harness = recall_harness(&mut handle, "supersede");
+            let query = "operation receipt scoped context";
+            let q = semantic_vector(query);
+            let mut shapes: Vec<(Vec<f32>, bool)> = (0..6).map(|_| (q.clone(), false)).collect();
+            shapes.extend((0..24).map(|i| (nudged(&q, 1, 1.0 + 0.05 * i as f32), false)));
+            let mut points = seed_recall_points(&mut handle, shapes);
+            for i in 0..5 {
+                handle
+                    .admin
+                    .execute(
+                        "UPDATE private.memory_records SET status='superseded', superseded_by=$3 \
+                         WHERE tenant_id=$1 AND memory_id=$2",
+                        &[
+                            &handle.tenant_id,
+                            &points[i].record.memory_id,
+                            &points[i + 1].record.memory_id,
+                        ],
+                    )
+                    .expect("owner supersedes chain link");
+                if i < 3 {
+                    points[i].status = AuthorityStatus::Superseded;
+                }
+            }
+            seed_semantic_projection_ledger(&mut handle, 30);
+            let superseded: BTreeSet<String> = points[..5]
+                .iter()
+                .map(|p| p.record.memory_id.to_string())
+                .collect();
+            let head = points[5].record.memory_id.to_string();
+            let runtime_handle = handle.rt.handle().clone();
+            runtime_handle.block_on(async {
+                create_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+                upsert_recall_points(&harness, &handle, &points).await;
+                let (address, server) =
+                    start(harness.app.take().expect("one gateway per harness")).await;
+                let (status, response) = recall_call(
+                    address,
+                    Some(&harness.bearer),
+                    json!({"query":query,"workspace_id":handle.workspace_id,"mode":"semantic"}),
+                )
+                .await;
+                assert_eq!(status, 200, "supersede chain recall: {response}");
+                let body = assert_tool_response(&response, ToolName::Recall);
+                let returned = recalled_memory_ids(body);
+                assert_eq!(returned.len(), 5, "top_k filled despite the chain: {body}");
+                assert!(returned.contains(&head), "the chain head is served: {body}");
+                assert!(
+                    returned.iter().all(|id| !superseded.contains(id)),
+                    "no superseded row is ever returned: {body}"
+                );
+                assert_eq!(body["completeness"]["candidate_count"], 25, "{body}");
+                server.abort();
+                delete_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+            });
+        },
+    );
+}
+
+/// Card 30 acceptance (ADR-0055 D-C): the everyday queries the planner classes away from
+/// SEMANTIC used to be INVALID_INPUT (`query_not_semantic`). With no `mode`, dense answers each
+/// one, `provenance.planner_class` records the class and `completeness.degradations` carries
+/// `LANE_SUBSTITUTED`; a bare UUID (planner `DIRECT_GET`) answers `semantic_bounded`, never the
+/// §22.0 `Exact`-without-census 500. Fault: restore the planner refusal ⇒ 400 ⇒ red.
+#[test]
+#[ignore = "lane(a:request_guard) requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+fn recall_everyday_queries_are_answered_by_dense_with_lane_substituted() {
+    run_db_fixture::<Fixture, _>(
+        "recall_everyday_queries_are_answered_by_dense_with_lane_substituted",
+        |mut handle| {
+            handle.assert_gateway_login();
+            let _registry_cleanup = SemanticProjectionCleanup {
+                owner: handle.owner_client().expect("semantic cleanup owner"),
+                tenant_id: handle.tenant_id,
+            };
+            let mut harness = recall_harness(&mut handle, "everyday");
+            let points = seed_recall_points(
+                &mut handle,
+                vec![(semantic_vector("operation receipt scoped context"), false)],
+            );
+            seed_semantic_projection_ledger(&mut handle, 1);
+            // A fixed UUID with no run of >= 7 digits: `local-secret-scan`'s deterministic
+            // phone-like rule (7+ digits, `-` not a separator break) refuses e.g. `…-79869668a78d`
+            // with FORBIDDEN before the planner is reached, so a random v4 makes this leg flaky.
+            let uuid_query = "a1b2c3d4-e5f6-4a7b-8c9d-e0f1a2b3c4d5".to_owned();
+            let cases = [
+                ("目前项目进度", "STATE"),
+                ("客户张三最近的情绪怎么样", "TEMPORAL"),
+                ("和支付相关的决定", "ASSOCIATION"),
+                ("the \"frozen contract\" decision", "LITERAL"),
+                (uuid_query.as_str(), "DIRECT_GET"),
+            ];
+            let runtime_handle = handle.rt.handle().clone();
+            runtime_handle.block_on(async {
+                create_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+                upsert_recall_points(&harness, &handle, &points).await;
+                let (address, server) =
+                    start(harness.app.take().expect("one gateway per harness")).await;
+                for (query, class) in cases {
+                    let (status, response) = recall_call(
+                        address,
+                        Some(&harness.bearer),
+                        json!({"query":query,"workspace_id":handle.workspace_id}),
+                    )
+                    .await;
+                    assert_eq!(status, 200, "{query}: never INVALID_INPUT: {response}");
+                    let body = assert_tool_response(&response, ToolName::Recall);
+                    assert!(
+                        !recalled_memory_ids(body).is_empty(),
+                        "{query}: dense answered: {body}"
+                    );
+                    assert_eq!(
+                        body["provenance"]["planner_class"], class,
+                        "{query}: {body}"
+                    );
+                    assert!(
+                        body["completeness"]["degradations"]
+                            .as_array()
+                            .expect("degradations")
+                            .contains(&json!("LANE_SUBSTITUTED")),
+                        "{query}: {body}"
+                    );
+                    assert_eq!(
+                        body["completeness"]["class"], "semantic_bounded",
+                        "{query}: {body}"
+                    );
+                }
+                server.abort();
+                delete_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+            });
+        },
+    );
+}
+
+/// Card 30 (ADR-0055 D-C): an explicit `mode` naming an undelivered lane is the one refusal left,
+/// and it stays the schema-documented `DEPENDENCY_UNAVAILABLE` (§52; ADR-0044 D-A;
+/// architecture-check `recall_v1_supported_lanes`). An explicit `mode:"semantic"` names the lane
+/// that runs: a TEMPORAL query answers with its class recorded and NO `LANE_SUBSTITUTED`.
+#[test]
+#[ignore = "lane(a:request_guard) requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+fn recall_explicit_undelivered_mode_is_refused_and_explicit_semantic_is_not_substituted() {
+    run_db_fixture::<Fixture, _>(
+        "recall_explicit_undelivered_mode_is_refused_and_explicit_semantic_is_not_substituted",
+        |mut handle| {
+            handle.assert_gateway_login();
+            let _registry_cleanup = SemanticProjectionCleanup {
+                owner: handle.owner_client().expect("semantic cleanup owner"),
+                tenant_id: handle.tenant_id,
+            };
+            let mut harness = recall_harness(&mut handle, "mode");
+            let points = seed_recall_points(
+                &mut handle,
+                vec![(semantic_vector("operation receipt scoped context"), false)],
+            );
+            seed_semantic_projection_ledger(&mut handle, 1);
+            let runtime_handle = handle.rt.handle().clone();
+            runtime_handle.block_on(async {
+                create_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+                upsert_recall_points(&harness, &handle, &points).await;
+                let (address, server) =
+                    start(harness.app.take().expect("one gateway per harness")).await;
+                for mode in ["literal", "state", "temporal", "association"] {
+                    let (_, refused) = recall_call(
+                        address,
+                        Some(&harness.bearer),
+                        json!({"query":"readiness probe before traffic",
+                               "workspace_id":handle.workspace_id,"mode":mode}),
+                    )
+                    .await;
+                    assert_tool_error(&refused, "DEPENDENCY_UNAVAILABLE");
+                }
+                let (status, response) = recall_call(
+                    address,
+                    Some(&harness.bearer),
+                    json!({"query":"上周我们讨论过的部署方案是什么",
+                           "workspace_id":handle.workspace_id,"mode":"semantic"}),
+                )
+                .await;
+                assert_eq!(status, 200, "explicit semantic answers: {response}");
+                let body = assert_tool_response(&response, ToolName::Recall);
+                assert_eq!(body["provenance"]["planner_class"], "TEMPORAL", "{body}");
+                assert!(
+                    !body["completeness"]["degradations"]
+                        .as_array()
+                        .expect("degradations")
+                        .contains(&json!("LANE_SUBSTITUTED")),
+                    "the caller chose dense: nothing was substituted: {body}"
+                );
+                server.abort();
+                delete_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+            });
+        },
+    );
+}
+
+/// Card 30 (ADR-0055 D-B / §37): a `TOMBSTONED` stream seq reaches the Qdrant overlay, so its
+/// point never occupies a candidate slot. 26 points; the best-scoring one's `source_stream_seq`
+/// is `TOMBSTONED` in `projection.stream_log` (and has no outbox row, so the PG gate cannot see
+/// the tombstone — only the overlay excludes it). Fault: drop `in_workspace_stream` ⇒ the
+/// tombstoned memory is returned first ⇒ red.
+#[test]
+#[ignore = "lane(a:request_guard) requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+fn recall_tombstoned_seq_never_reaches_the_candidate_set() {
+    run_db_fixture::<Fixture, _>(
+        "recall_tombstoned_seq_never_reaches_the_candidate_set",
+        |mut handle| {
+            handle.assert_gateway_login();
+            let _registry_cleanup = SemanticProjectionCleanup {
+                owner: handle.owner_client().expect("semantic cleanup owner"),
+                tenant_id: handle.tenant_id,
+            };
+            let mut harness = recall_harness(&mut handle, "tombstone");
+            let query = "operation receipt scoped context";
+            let q = semantic_vector(query);
+            let mut shapes = vec![(q.clone(), false)];
+            shapes.extend((0..25).map(|i| (nudged(&q, 1, 1.0 + 0.05 * i as f32), false)));
+            let mut points = seed_recall_points(&mut handle, shapes);
+            for (i, point) in points.iter_mut().enumerate() {
+                point.seq = i64::try_from(i).expect("seq") + 1;
+            }
+            // Seq 1 is born TOMBSTONED (the §6.2.2 transition guard refuses an owner-side
+            // DONE -> TOMBSTONED rewrite; forget_repo is the only real writer of that edge).
+            let commit_seq: i64 = handle
+                .admin
+                .query_one("SELECT nextval('ops.commit_seq_seq')", &[])
+                .expect("owner allocates fixture commit sequence")
+                .get(0);
+            handle
+                .admin
+                .execute(
+                    "INSERT INTO projection.stream_log \
+                       (tenant_id,scope_kind,scope_id,domain,projection_kind,projection_version, \
+                        stream_seq,commit_seq,state,settled_at) \
+                     VALUES($1,'workspace',$2,'knowledge','ingest','v1',1,$3,'TOMBSTONED', \
+                            clock_timestamp())",
+                    &[&handle.tenant_id, &handle.workspace_id, &commit_seq],
+                )
+                .expect("owner seeds the tombstoned seq of the best-scoring point");
+            for seq in 2..=26 {
+                seed_semantic_projection_ledger_row(&mut handle, seq);
+            }
+            let tombstoned = points[0].record.memory_id.to_string();
+            let runtime_handle = handle.rt.handle().clone();
+            runtime_handle.block_on(async {
+                create_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+                upsert_recall_points(&harness, &handle, &points).await;
+                let (address, server) =
+                    start(harness.app.take().expect("one gateway per harness")).await;
+                let (status, response) = recall_call(
+                    address,
+                    Some(&harness.bearer),
+                    json!({"query":query,"workspace_id":handle.workspace_id,"mode":"semantic",
+                           "mood_congruence":{"valence":0,"arousal":0}}),
+                )
+                .await;
+                assert_eq!(status, 200, "tombstone fixture recall: {response}");
+                let body = assert_tool_response(&response, ToolName::Recall);
+                let returned = recalled_memory_ids(body);
+                assert_eq!(returned.len(), 5, "{body}");
+                assert!(
+                    !returned.contains(&tombstoned),
+                    "tombstoned seq was served: {body}"
+                );
+                assert_eq!(body["completeness"]["candidate_count"], 25, "{body}");
+                assert_eq!(body["completeness"]["reranked_count"], 5, "{body}");
+                server.abort();
+                delete_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+            });
+        },
+    );
+}
+
+/// Card 30 verify-2 (ADR-0030 D-D, kept by ADR-0055 D-A): the mood rerank permutes the visible
+/// `top_k` only — it never selects among all `cand_k` survivors. Real affect rows: the dense
+/// rank-5 live memory and the rank-25 filler both carry a FRUSTRATION annotation that exactly
+/// matches the reader's mood (congruence 10000; everything else scores the 5000 midpoint).
+/// Without mood the rank-5 memory is not first; with mood it is, and the rank-25 filler never
+/// enters the answer. Fault: rerank before the `top_k` cut ⇒ the filler takes a top-5 slot ⇒ red.
+#[test]
+#[ignore = "lane(a:request_guard) requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+#[allow(clippy::too_many_lines)] // one fixture: points → affect rows → plain vs mood recall.
+fn recall_mood_rerank_permutes_only_the_visible_top_k() {
+    run_db_fixture::<Fixture, _>(
+        "recall_mood_rerank_permutes_only_the_visible_top_k",
+        |mut handle| {
+            handle.assert_gateway_login();
+            let _registry_cleanup = SemanticProjectionCleanup {
+                owner: handle.owner_client().expect("semantic cleanup owner"),
+                tenant_id: handle.tenant_id,
+            };
+            let mut harness = recall_harness(&mut handle, "moodwindow");
+            let query = "operation receipt scoped context";
+            let q = semantic_vector(query);
+            let mut shapes: Vec<(Vec<f32>, bool)> = (0..5)
+                .map(|i| (nudged(&q, 0, 0.05 * (i as f32 + 1.0)), false))
+                .collect();
+            shapes.extend((0..20).map(|i| (nudged(&q, 1, 1.0 + 0.05 * i as f32), false)));
+            let points = seed_recall_points(&mut handle, shapes);
+            seed_semantic_projection_ledger(&mut handle, 25);
+            let visible_congruent = points[4].record.memory_id.to_string();
+            let deep_congruent = points[24].record.memory_id.to_string();
+            for point in [&points[4], &points[24]] {
+                seed_affect_row(
+                    &mut handle,
+                    &point.record,
+                    "EMOTION",
+                    "FRUSTRATION",
+                    -8_000,
+                    5_000,
+                    9_000,
+                    None,
+                    0.0,
+                    None,
+                );
+            }
+            let near: BTreeSet<String> = points[..5]
+                .iter()
+                .map(|p| p.record.memory_id.to_string())
+                .collect();
+            let runtime_handle = handle.rt.handle().clone();
+            runtime_handle.block_on(async {
+                create_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+                upsert_recall_points(&harness, &handle, &points).await;
+                let (address, server) =
+                    start(harness.app.take().expect("one gateway per harness")).await;
+                let (status, plain) = recall_call(
+                    address,
+                    Some(&harness.bearer),
+                    json!({"query":query,"workspace_id":handle.workspace_id,"mode":"semantic"}),
+                )
+                .await;
+                assert_eq!(status, 200, "plain recall: {plain}");
+                let plain = assert_tool_response(&plain, ToolName::Recall);
+                let plain_ids = recalled_memory_ids(plain);
+                assert_eq!(
+                    plain_ids.iter().cloned().collect::<BTreeSet<_>>(),
+                    near,
+                    "dense top_k = the 5 near memories: {plain}"
+                );
+                assert_ne!(
+                    plain_ids[0], visible_congruent,
+                    "without mood the rank-5 memory is not first: {plain}"
+                );
+                let (status, ranked) = recall_call(
+                    address,
+                    Some(&harness.bearer),
+                    json!({"query":query,"workspace_id":handle.workspace_id,"mode":"semantic",
+                           "mood_congruence":{"valence":-8000,"arousal":5000}}),
+                )
+                .await;
+                assert_eq!(status, 200, "mood recall: {ranked}");
+                let ranked = assert_tool_response(&ranked, ToolName::Recall);
+                let ranked_ids = recalled_memory_ids(ranked);
+                assert_eq!(
+                    ranked_ids[0], visible_congruent,
+                    "the congruent visible memory is reranked first: {ranked}"
+                );
+                assert!(
+                    !ranked_ids.contains(&deep_congruent),
+                    "a congruent rank-25 candidate never evicts a top_k hit: {ranked}"
+                );
+                assert_eq!(
+                    ranked_ids.iter().cloned().collect::<BTreeSet<_>>(),
+                    near,
+                    "the rerank is a permutation of the visible set: {ranked}"
+                );
+                assert_eq!(ranked["completeness"]["reranked_count"], 5, "{ranked}");
+                assert_eq!(ranked["completeness"]["candidate_count"], 25, "{ranked}");
+                server.abort();
+                delete_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+            });
+        },
+    );
+}
+
+/// A tenant-shared point of ANOTHER workspace stream of the same tenant: payload `workspace_id`
+/// is that stream's `scope_id`, exactly as the projection worker writes it.
+fn foreign_tenant_shared_payload(
+    handle: &Handle,
+    workspace: Uuid,
+    source_stream_seq: i64,
+) -> humaux_adapters::qdrant::IndexablePayload {
+    let now = time::OffsetDateTime::now_utc();
+    QdrantPointPayload {
+        tenant_id: TenantId(handle.tenant_id),
+        workspace_id: WorkspaceId(workspace),
+        visibility_class: VisibilityClass::TenantShared,
+        visibility_user_id: None,
+        visibility_workspace_id: None,
+        object_type: "memory_record".to_owned(),
+        memory_type: MemoryType::Note,
+        status: AuthorityStatus::Active,
+        authority: AuthorityClass::ProjectConstraint,
+        created_at: now,
+        effective_at: now,
+        embedding_version: "embed-v1".to_owned(),
+        projection_version: "v1".to_owned(),
+        source_stream_seq,
+        data_class: DataClass::Internal,
+        egress_disposition: EgressDisposition::Allowed,
+    }
+    .into_indexable()
+    .expect("non-secret foreign fixture payload")
+    .with_archived(false)
+}
+
+/// Card 30 verify-2 (ADR-0055 D-B): `stream_seq` counts from 1 in every workspace stream, so the
+/// `TOMBSTONED`-seq overlay is only meaningful over the request workspace's own points — and
+/// only those can hydrate (the registry resolves points under the request's `scope_id`). Another
+/// workspace's 25 tenant-shared points sit ON the query vector (seqs 1..=25, one colliding with
+/// this stream's tombstoned seq 1); this workspace has the tombstoned seq-1 point and 5 live
+/// points further away. Recall returns the 5 live points and only they are candidates.
+/// Faults: drop the workspace narrowing ⇒ the foreign points fill `cand_k` and hydrate drops them
+/// ⇒ returned ≤ 1 ⇒ red; drop the seq overlay ⇒ the tombstoned point is served ⇒ red.
+#[test]
+#[ignore = "lane(a:request_guard) requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+#[allow(clippy::too_many_lines)] // one fixture: two workspaces' points → tombstone → recall.
+fn recall_candidate_set_is_scoped_to_the_request_workspace_stream() {
+    run_db_fixture::<Fixture, _>(
+        "recall_candidate_set_is_scoped_to_the_request_workspace_stream",
+        |mut handle| {
+            handle.assert_gateway_login();
+            let _registry_cleanup = SemanticProjectionCleanup {
+                owner: handle.owner_client().expect("semantic cleanup owner"),
+                tenant_id: handle.tenant_id,
+            };
+            let mut harness = recall_harness(&mut handle, "workspace");
+            let query = "operation receipt scoped context";
+            let q = semantic_vector(query);
+            let mut shapes = vec![(nudged(&q, 0, 0.01), false)];
+            shapes.extend((0..5).map(|i| (nudged(&q, 1, 1.0 + 0.05 * i as f32), false)));
+            let mut points = seed_recall_points(&mut handle, shapes);
+            for (i, point) in points.iter_mut().enumerate() {
+                point.seq = i64::try_from(i).expect("seq") + 1;
+            }
+            let commit_seq: i64 = handle
+                .admin
+                .query_one("SELECT nextval('ops.commit_seq_seq')", &[])
+                .expect("owner allocates fixture commit sequence")
+                .get(0);
+            handle
+                .admin
+                .execute(
+                    "INSERT INTO projection.stream_log \
+                       (tenant_id,scope_kind,scope_id,domain,projection_kind,projection_version, \
+                        stream_seq,commit_seq,state,settled_at) \
+                     VALUES($1,'workspace',$2,'knowledge','ingest','v1',1,$3,'TOMBSTONED', \
+                            clock_timestamp())",
+                    &[&handle.tenant_id, &handle.workspace_id, &commit_seq],
+                )
+                .expect("owner seeds this stream's tombstoned seq 1");
+            for seq in 2..=6 {
+                seed_semantic_projection_ledger_row(&mut handle, seq);
+            }
+            let tombstoned = points[0].record.memory_id.to_string();
+            let live: BTreeSet<String> = points[1..]
+                .iter()
+                .map(|p| p.record.memory_id.to_string())
+                .collect();
+            let foreign_workspace = Uuid::new_v4();
+            let foreign: Vec<(Uuid, humaux_adapters::qdrant::IndexablePayload)> = (1..=25)
+                .map(|seq| {
+                    (
+                        Uuid::new_v4(),
+                        foreign_tenant_shared_payload(&handle, foreign_workspace, seq),
+                    )
+                })
+                .collect();
+            let runtime_handle = handle.rt.handle().clone();
+            runtime_handle.block_on(async {
+                create_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+                upsert_recall_points(&harness, &handle, &points).await;
+                let permit = authorize_cell_access(
+                    &harness.registry,
+                    IntraCellResource::QDRANT_REST,
+                    Duration::from_secs(60),
+                )
+                .expect("semantic upsert permit");
+                let rows: Vec<_> = foreign
+                    .iter()
+                    .map(|(point, payload)| (PointId::Uuid(*point), payload, q.clone()))
+                    .collect();
+                upsert(
+                    harness.transport.as_ref(),
+                    &permit,
+                    &harness.collection,
+                    &rows,
+                    ha_profile_for(QdrantOperation::NormalImmutableUpsert),
+                )
+                .await
+                .expect("real Qdrant foreign-workspace points");
+                let (address, server) =
+                    start(harness.app.take().expect("one gateway per harness")).await;
+                let (status, response) = recall_call(
+                    address,
+                    Some(&harness.bearer),
+                    json!({"query":query,"workspace_id":handle.workspace_id,"mode":"semantic"}),
+                )
+                .await;
+                assert_eq!(status, 200, "workspace-scoped recall: {response}");
+                let body = assert_tool_response(&response, ToolName::Recall);
+                let returned = recalled_memory_ids(body);
+                assert!(
+                    !returned.contains(&tombstoned),
+                    "this stream's tombstoned seq was served: {body}"
+                );
+                assert_eq!(
+                    returned.iter().cloned().collect::<BTreeSet<_>>(),
+                    live,
+                    "the 5 live points of this workspace fill top_k: {body}"
+                );
+                assert_eq!(
+                    body["completeness"]["candidate_count"], 5,
+                    "no foreign-workspace or tombstoned point is a candidate: {body}"
+                );
+                server.abort();
+                delete_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
             });
         },
     );

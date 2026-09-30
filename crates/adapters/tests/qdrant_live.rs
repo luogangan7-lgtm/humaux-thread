@@ -3,14 +3,14 @@
 //!   `authorize_cell_access` → `HttpIntraCellTransport` path — no mock transport, no injected DNS resolver, exactly
 //!   the production wiring `crates/adapters/src/qdrant.rs`'s `upsert`/`scroll_by_ids`/`verify_visible_via_transport`
 //!   callers would use.
-//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, humaux-projection, humaux-testkit, sqlx,
-//!   tokio, uuid]; services=[Qdrant(*)]; env=[HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::qdrant, domain::authority,
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, humaux-projection, humaux-testkit,
+//!   serde_json, sqlx, tokio, uuid]; services=[Qdrant(*)]; env=[HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::qdrant, domain::authority,
 //!   domain::dataclass, domain::identity, domain::ids, domain::memory, humaux-testkit, infra-cell::permit,
 //!   infra-cell::resource, infra-cell::transport, projection::card]
 //! Called-by: [cargo-test]
 //! Invariants: [§57.1 three-state gate: an unreachable Qdrant prints the missing object and returns not_applicable
 //!   via skip_or_fail (red under HUMAUX_REQUIRE_QDRANT); cross-tenant filters are proven against the real cluster]
-//! Spec: Baseline §57.1
+//! Spec: Baseline §57.1; ADR-0055
 //!
 //! §57.1: a three-state gate, not pass/fail — if Qdrant is unreachable at the configured loopback port this
 //! prints which object is missing and returns (`not_applicable`) instead of failing the suite.
@@ -436,4 +436,218 @@ async fn upsert_then_search_visible_round_trips_over_real_qdrant() {
             panic!("qdrant live test task was cancelled: {error}");
         }
     }
+}
+
+/// ADR-0055 D-B live witness — "no archived id in the candidate set": 10 equally-scoring points
+/// for one scope, 4 with payload `archived=true`, 2 with `status="superseded"`, 4 legacy points
+/// written WITHOUT the `archived` field (every pre-card-30 point). A dense query asking for all 10
+/// must return exactly the 4 legacy ids: the nested `must_not[archived == true]` passes a missing
+/// flag, and `status == "active"` drops the superseded pair. Fault: drop `.servable()` from
+/// `DenseQuery::new` ⇒ 10 candidates ⇒ red.
+#[allow(clippy::too_many_lines)] // one live narrative: create → flagged + legacy upsert → query → cleanup.
+#[tokio::test]
+async fn dense_query_never_returns_an_archived_or_non_active_point() {
+    if !qdrant_reachable() {
+        skip_or_fail(
+            "dense_query_never_returns_an_archived_or_non_active_point",
+            &format!("missing object: live Qdrant server at {}", qdrant_addr()),
+            ExternalDep::Qdrant,
+        );
+        return;
+    }
+    let registry = registry(
+        CellId(Uuid::now_v7()),
+        CallerId("qdrant-live-test".to_string()),
+    );
+    let transport = Arc::new(
+        HttpIntraCellTransport::new(
+            registry.clone(),
+            Duration::from_secs(10),
+            humaux_infra_cell::DEFAULT_MAX_RESPONSE_BYTES,
+        )
+        .expect("client builds"),
+    );
+    let permit = authorize_cell_access(
+        &registry,
+        IntraCellResource::QDRANT_REST,
+        Duration::from_secs(60),
+    )
+    .expect("same-cell, allowlisted caller must mint");
+    let collection = format!("c30_live_{}", Uuid::now_v7().simple());
+    let (body_transport, body_registry, body_collection) =
+        (Arc::clone(&transport), registry.clone(), collection.clone());
+    let primary = tokio::spawn(async move {
+        let (transport, collection) = (body_transport, body_collection);
+        let permit = authorize_cell_access(
+            &body_registry,
+            IntraCellResource::QDRANT_REST,
+            Duration::from_secs(60),
+        )
+        .expect("body permit");
+        put_json(
+            &transport,
+            &permit,
+            format!("/collections/{collection}"),
+            create_collection_body(4, Distance::Cosine, 1, 1, 1, ShardingMethod::Auto),
+        )
+        .await;
+        put_json(
+            &transport,
+            &permit,
+            format!("/collections/{collection}/index"),
+            tenant_index_body(),
+        )
+        .await;
+
+        let tenant_id = TenantId::new();
+        let payload = |status: AuthorityStatus| QdrantPointPayload {
+            tenant_id,
+            workspace_id: WorkspaceId::new(),
+            visibility_class: VisibilityClass::TenantShared,
+            visibility_user_id: None,
+            visibility_workspace_id: None,
+            object_type: "memory_record".to_string(),
+            memory_type: MemoryType::Fact,
+            status,
+            authority: AuthorityClass::PrivateKnowledge,
+            created_at: OffsetDateTime::now_utc(),
+            effective_at: OffsetDateTime::now_utc(),
+            embedding_version: "v1".to_string(),
+            projection_version: "v1".to_string(),
+            source_stream_seq: 1,
+            data_class: DataClass::Internal,
+            egress_disposition: EgressDisposition::Allowed,
+        };
+        let vector = vec![0.1, 0.2, 0.3, 0.4];
+        let archived = payload(AuthorityStatus::Active)
+            .into_indexable()
+            .expect("indexable")
+            .with_archived(true);
+        let superseded = payload(AuthorityStatus::Superseded)
+            .into_indexable()
+            .expect("indexable");
+        let ids = |n: usize| {
+            (0..n)
+                .map(|_| PointId::Uuid(Uuid::now_v7()))
+                .collect::<Vec<_>>()
+        };
+        let (archived_ids, superseded_ids, legacy_ids) = (ids(4), ids(2), ids(4));
+        let rows: Vec<_> = archived_ids
+            .iter()
+            .map(|id| (*id, &archived, vector.clone()))
+            .chain(
+                superseded_ids
+                    .iter()
+                    .map(|id| (*id, &superseded, vector.clone())),
+            )
+            .collect();
+        upsert(
+            transport.as_ref(),
+            &permit,
+            &collection,
+            &rows,
+            ha_profile_for(QdrantOperation::NormalImmutableUpsert),
+        )
+        .await
+        .expect("flagged points upsert");
+        // Legacy shape: the payload as it was written before card 30 — no `archived` key at all.
+        let legacy = payload(AuthorityStatus::Active)
+            .into_indexable()
+            .expect("indexable");
+        let points: Vec<serde_json::Value> = legacy_ids
+            .iter()
+            .map(|id| {
+                let mut point = humaux_adapters::qdrant::upsert_point_body(*id, &legacy);
+                let body = point.as_object_mut().expect("point object");
+                body["payload"]
+                    .as_object_mut()
+                    .expect("payload object")
+                    .remove("archived")
+                    .expect("card-30 payloads carry the flag");
+                body.insert("vector".to_owned(), serde_json::json!(vector));
+                point
+            })
+            .collect();
+        put_json(
+            &transport,
+            &permit,
+            format!("/collections/{collection}/points?wait=true"),
+            serde_json::json!({ "points": points }),
+        )
+        .await;
+
+        let scope = AuthorizationScope::new(
+            tenant_id,
+            PrincipalId::new(),
+            None,
+            BoundedSet::new(Vec::<WorkspaceId>::new()).expect("empty workspace set is valid"),
+        );
+        let placement = TenantPlacementRow {
+            tenant_id,
+            projection_family: humaux_adapters::qdrant::RetrievalFamily::PrivateMemoryV1,
+            collection_name: collection.clone(),
+            shard_key: None,
+            placement_class: humaux_adapters::qdrant::PlacementClass::SharedFallback,
+            point_count: 10,
+            bytes_estimate: 0,
+            promotion_state: humaux_adapters::qdrant::PromotionState::Stable,
+        };
+        let candidates = query_dense(
+            transport.as_ref(),
+            &permit,
+            &DenseQuery::new(
+                &scope,
+                &placement,
+                DenseQueryVersions {
+                    projection: "v1",
+                    embedding: "v1",
+                },
+                vector.clone(),
+                10,
+                vec![],
+                ha_profile_for(QdrantOperation::ReadYourWriteStrict),
+            )
+            .expect("typed dense query"),
+        )
+        .await
+        .expect("dense query over real transport must succeed");
+        let got: BTreeSet<String> = candidates
+            .iter()
+            .map(|c| format!("{:?}", c.point_id))
+            .collect();
+        let want: BTreeSet<String> = legacy_ids.iter().map(|id| format!("{id:?}")).collect();
+        assert_eq!(
+            got, want,
+            "only the flagless legacy points may be candidates (no archived, no superseded)"
+        );
+    });
+    let primary = primary.await;
+    let cleanup = delete_test_collection(&transport, &permit, &collection).await;
+    match primary {
+        Ok(()) => cleanup.expect("test collection cleanup must succeed"),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => panic!("qdrant live test task was cancelled: {error}"),
+    }
+}
+
+async fn put_json(
+    transport: &HttpIntraCellTransport,
+    permit: &humaux_infra_cell::CellAccessPermit,
+    path: String,
+    body: serde_json::Value,
+) {
+    let response = transport
+        .execute(
+            permit,
+            // dep: Qdrant(*) — Qdrant wire call for this fixture
+            IntraCellRequest {
+                method: IntraCellMethod::Put,
+                path,
+                json_body: Some(body),
+                headers: Vec::new(),
+            },
+        )
+        .await
+        .expect("Qdrant setup request");
+    assert!((200..300).contains(&response.status), "{response:?}");
 }

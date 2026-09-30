@@ -7,7 +7,7 @@
 //! Invariants: [every wire call takes &dyn IntraCellHttpTransport carrying a CellAccessPermit; Qdrant down ->
 //!   QdrantTransportError to the caller, no fallback search; tombstoned points are filtered by the overlay, never
 //!   counted as visible]
-//! Spec: Baseline §17; §17.5; §17.4; §23.1; §23.4; ADR-0003; §83.4; §7.0
+//! Spec: Baseline §17; §17.5; §17.4; §23.1; §23.4; ADR-0003; §83.4; §7.0; ADR-0055
 //!
 //! Implements every part of §17: collection/index request-body shaping, payload encoding, the
 //! [`Condition`](humaux_projection::dense::Condition) → Qdrant filter JSON translation, the
@@ -48,8 +48,8 @@ use humaux_infra_cell::{
 use humaux_projection::card::EgressDisposition;
 use humaux_projection::dense::{
     AFFECT_AROUSAL_FIELD, AFFECT_DOMINANCE_FIELD, AFFECT_INTENSITY_FIELD, AFFECT_KINDS_FIELD,
-    AFFECT_LABELS_FIELD, AFFECT_VALENCE_FIELD, Condition, DenseQueryFilter, FieldMatch,
-    SUBJECT_IDS_FIELD, build_dense_filter,
+    AFFECT_LABELS_FIELD, AFFECT_VALENCE_FIELD, ARCHIVED_FIELD, Condition, DenseQueryFilter,
+    FieldMatch, SUBJECT_IDS_FIELD, build_dense_filter,
 };
 use serde_json::{Value, json};
 use sqlx::types::time::OffsetDateTime;
@@ -393,6 +393,7 @@ impl QdrantPointPayload {
             payload: self,
             subject_ids: Vec::new(),
             affects: Vec::new(),
+            archived: false,
         })
     }
 }
@@ -411,6 +412,10 @@ pub struct IndexablePayload {
     /// parallel array fields at index time (`AFFECT_*_FIELD`). Same reasoning as `subject_ids`:
     /// annotation, not a property of the memory row, index-write path only.
     affects: Vec<AffectAnnotation>,
+    /// ADR-0055 D-B: `private.memory_records.archived_at IS NOT NULL` at resolve time, written
+    /// as the JSON bool [`ARCHIVED_FIELD`] on every upsert. Not a [`QdrantPointPayload`] field so
+    /// its constructors stay untouched; default `false`.
+    archived: bool,
 }
 
 impl IndexablePayload {
@@ -434,6 +439,14 @@ impl IndexablePayload {
     /// read-time derivation, never a payload fact.
     pub fn with_affects(mut self, affects: Vec<AffectAnnotation>) -> Self {
         self.affects = affects;
+        self
+    }
+
+    /// ADR-0055 D-B: the memory's archive flag, derived from the PG row by the projection worker
+    /// on every re-projection, so any ticket writes the current truth. The serving prefilter
+    /// (`DenseQueryFilter::servable`) drops `archived == true`; the PG gate stays the authority.
+    pub fn with_archived(mut self, archived: bool) -> Self {
+        self.archived = archived;
         self
     }
 
@@ -474,6 +487,7 @@ impl IndexablePayload {
             AFFECT_INTENSITY_FIELD.into(),
             column(|a| json!(a.intensity.get())),
         );
+        obj.insert(ARCHIVED_FIELD.into(), json!(self.archived));
         json
     }
 }
@@ -551,6 +565,11 @@ fn condition_to_wire(condition: &Condition) -> Value {
         Condition::In { field, values } => json!({ "key": field, "match": { "any": values } }),
         Condition::Range { field, gte, lte } => {
             json!({ "key": field, "range": { "gte": gte, "lte": lte } })
+        }
+        // ADR-0055 D-B: a nested `must_not` — Qdrant passes a point whose field is missing or
+        // null here, which `match false` would not (every pre-card-30 point lacks the flag).
+        Condition::NotTrue { field } => {
+            json!({ "must_not": [{ "key": field, "match": { "value": true } }] })
         }
         Condition::And(clauses) => {
             json!({ "must": clauses.iter().map(condition_to_wire).collect::<Vec<_>>() })
@@ -1214,6 +1233,8 @@ pub struct DenseQuery {
     vector: Vec<f32>,
     limit: u32,
     tombstoned: Vec<PointId>,
+    /// ADR-0055 D-B: §37 `TOMBSTONED` stream seqs, folded as the `source_stream_seq` overlay.
+    tombstoned_seqs: Vec<i64>,
     ha_profile: HaConsistencyProfile,
 }
 
@@ -1277,10 +1298,13 @@ impl DenseQuery {
                         value: versions.embedding.to_owned(),
                     },
                 ],
-            ),
+            )
+            // ADR-0055 D-B: every dense query is a serving read.
+            .servable(),
             vector,
             limit,
             tombstoned,
+            tombstoned_seqs: Vec::new(),
             ha_profile,
         })
     }
@@ -1305,6 +1329,25 @@ impl DenseQuery {
         self.filter = self.filter.with_affect(filter);
         self
     }
+
+    /// ADR-0055 D-B / §37: scope the candidate set to ONE workspace stream
+    /// (`DenseQueryFilter::in_workspace`) and exclude that stream's `TOMBSTONED` seqs
+    /// (`retrieve::tombstoned_source_seqs`) through the one [`tombstoned_seq_overlay_filter`]
+    /// fold. One call on purpose: `stream_seq` counts from 1 in every workspace stream, so a
+    /// seq overlay over a tenant-wide candidate set would also drop another workspace's
+    /// tenant-shared point that happens to carry the same seq. The narrowing loses nothing: the
+    /// PG gate only resolves points registered under the request's own `scope_id`, which is the
+    /// payload `workspace_id` the projection worker writes. Prefilter only — the PG gate
+    /// re-checks tombstones by Evidence.
+    pub fn in_workspace_stream(
+        mut self,
+        workspace_id: WorkspaceId,
+        tombstoned_seqs: Vec<i64>,
+    ) -> Self {
+        self.filter = self.filter.in_workspace(workspace_id);
+        self.tombstoned_seqs = tombstoned_seqs;
+        self
+    }
 }
 
 /// Qdrant's documented points/query dense-vector shape.
@@ -1312,7 +1355,10 @@ impl DenseQuery {
 pub fn dense_query_body(query: &DenseQuery) -> Value {
     let mut body = json!({
         "query": query.vector,
-        "filter": overlay_filter(condition_to_filter(&query.filter), &query.tombstoned),
+        "filter": tombstoned_seq_overlay_filter(
+            overlay_filter(condition_to_filter(&query.filter), &query.tombstoned),
+            &query.tombstoned_seqs,
+        ),
         "limit": query.limit,
         "with_payload": false,
         "with_vector": false,
@@ -1592,6 +1638,128 @@ mod http_wiring_tests {
         assert!(validate_collection("../../admin").is_err());
         assert!(validate_collection("").is_err());
         assert!(validate_collection("bad\r\nHost: evil").is_err());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_prefilter_tests {
+    use super::*;
+    use humaux_domain::identity::{BoundedSet, PrincipalId};
+
+    fn payload() -> QdrantPointPayload {
+        let now = OffsetDateTime::now_utc();
+        QdrantPointPayload {
+            tenant_id: TenantId::new(),
+            workspace_id: WorkspaceId::new(),
+            visibility_class: VisibilityClass::TenantShared,
+            visibility_user_id: None,
+            visibility_workspace_id: None,
+            object_type: "memory_record".to_owned(),
+            memory_type: MemoryType::Note,
+            status: AuthorityStatus::Active,
+            authority: AuthorityClass::PrivateKnowledge,
+            created_at: now,
+            effective_at: now,
+            embedding_version: "embed-v1".to_owned(),
+            projection_version: "v1".to_owned(),
+            source_stream_seq: 7,
+            data_class: DataClass::Internal,
+            egress_disposition: EgressDisposition::Allowed,
+        }
+    }
+
+    fn query() -> DenseQuery {
+        let scope = AuthorizationScope::new(
+            TenantId::new(),
+            PrincipalId::new(),
+            None,
+            BoundedSet::new(Vec::<WorkspaceId>::new()).expect("empty workspace set"),
+        );
+        let placement = TenantPlacementRow {
+            tenant_id: scope.tenant_id(),
+            projection_family: RetrievalFamily::PrivateMemoryV1,
+            collection_name: "private_memory_v1".to_owned(),
+            shard_key: None,
+            placement_class: PlacementClass::SharedFallback,
+            point_count: 0,
+            bytes_estimate: 0,
+            promotion_state: PromotionState::Stable,
+        };
+        DenseQuery::new(
+            &scope,
+            &placement,
+            DenseQueryVersions {
+                projection: "v1",
+                embedding: "embed-v1",
+            },
+            vec![0.1, 0.2],
+            25,
+            vec![PointId::Num(99)],
+            ha_profile_for(QdrantOperation::ReadYourWriteStrict),
+        )
+        .expect("valid dense query")
+    }
+
+    #[test]
+    fn indexable_payload_writes_archived_false_by_default() {
+        let body = upsert_point_body(PointId::Num(1), &payload().into_indexable().expect("idx"));
+        assert_eq!(body["payload"][ARCHIVED_FIELD], json!(false));
+        assert_eq!(body["payload"]["status"], "active");
+    }
+
+    #[test]
+    fn indexable_payload_with_archived_true_writes_json_true() {
+        let indexable = payload().into_indexable().expect("idx").with_archived(true);
+        let body = upsert_point_body(PointId::Num(1), &indexable);
+        assert_eq!(body["payload"][ARCHIVED_FIELD], json!(true));
+    }
+
+    #[test]
+    fn dense_query_body_requires_status_active_and_nests_must_not_archived_true() {
+        let body = dense_query_body(&query());
+        let must = body["filter"]["must"].as_array().expect("must");
+        assert_eq!(
+            must[4],
+            json!({ "key": "status", "match": { "value": "active" } })
+        );
+        assert_eq!(
+            must[5],
+            json!({ "must_not": [{ "key": ARCHIVED_FIELD, "match": { "value": true } }] }),
+            "a nested must_not, so a point with no flag passes"
+        );
+        assert!(
+            !must
+                .iter()
+                .any(|c| c == &json!({ "key": ARCHIVED_FIELD, "match": { "value": false } })),
+            "a positive archived==false clause would blank every legacy point"
+        );
+    }
+
+    #[test]
+    fn dense_query_body_folds_tombstoned_seq_overlay_next_to_has_id_overlay() {
+        let query = query();
+        let plain = dense_query_body(&query);
+        assert_eq!(
+            plain["filter"]["must_not"].as_array().map(Vec::len),
+            Some(1)
+        );
+        let workspace = WorkspaceId::new();
+        let body = dense_query_body(&query.in_workspace_stream(workspace, vec![3, 5]));
+        let must_not = body["filter"]["must_not"].as_array().expect("must_not");
+        assert_eq!(must_not[0]["has_id"][0], 99);
+        assert_eq!(
+            must_not[1],
+            json!({ "key": SOURCE_STREAM_SEQ_FIELD, "match": { "any": [3, 5] } })
+        );
+        // The seq overlay is per workspace stream, so the candidate set is too: the only
+        // change to `must` is the trailing workspace term.
+        let must = body["filter"]["must"].as_array().expect("must");
+        let plain_must = plain["filter"]["must"].as_array().expect("plain must");
+        assert_eq!(must[..plain_must.len()], plain_must[..]);
+        assert_eq!(
+            must[plain_must.len()..],
+            [json!({ "key": "workspace_id", "match": { "value": workspace.0.to_string() } })]
+        );
     }
 }
 

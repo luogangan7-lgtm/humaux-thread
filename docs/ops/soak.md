@@ -88,7 +88,19 @@ queued no matter how correct the code was. Those verdicts were measuring MiniMax
 
 So: pick `--sessions-per-tenant` and `--think-ms` such that
 `tenants x sessions / (think_secs + round_trip_secs)` stays **under** the measured Evidence/s,
-and set `--drain-secs` above `peak_backlog / capacity`. Re-measure the capacity line above
+and set `--drain-secs` above `peak_backlog / capacity`.
+
+**Sizing a latency measurement (card 30).** `docs/ops/rehearse.sh` runs three tenants, so a run
+needs `recalls = 3 x SOAK_SESSIONS x SOAK_SECS / (think_secs + round_trip_secs)` for its `n`,
+under the same ceiling `3 x SOAK_SESSIONS / (think_secs + round_trip_secs) < 0.229`. With
+`SOAK_SESSIONS=1 SOAK_THINK_MS=14000` the round trip (remember + recall + enumerate + get, ~1 s
+in release, ~2.5 s in debug) gives ~0.2 loops/s: `SOAK_SECS=1800` ⇒ ≥ 330 recalls at ~0.2
+Evidence/s, `SOAK_DRAIN=300`, and `SOAK_CHAOS_SECS=400` so each of the four chaos hooks fires
+about once (every retrieval-worker kill fails the recalls in its restart window, and the default
+90 s period over a 30-minute run would spend the 1 % `op_failure_rate` budget on chaos alone). Measure latency on `REHEARSE_PROFILE=release` (the rehearsal
+builds and runs every binary from `$CARGO_TARGET_DIR/release`); a debug build inflates exactly
+the CPU-bound stages (`scan`) the stage table exists to attribute, so a debug number is a
+build-profile artifact, not a deployment baseline. Re-measure the capacity line above
 whenever the provider or the model changes — it is a property of the deployment, not a constant.
 Over-subscription also shows up on the recall side: the embedding provider is on the same
 budget, so an over-subscribed run's recalls start coming back `DEPENDENCY_UNAVAILABLE` with a
@@ -128,9 +140,9 @@ are used round-robin.
 ### Never send `limit`
 
 §55.1 reserves candidate depth to the registered retrieval profile: *"callers cannot supply
-`limit`, `top_k`, `cand_k`"*. `recall.schema.json` still admits `limit` as a `1..=100` integer,
-so the only value the gateway accepts is the profile's own `top_k` echoed back — every other
-value is `INVALID_INPUT`, refused before the request reaches the embedding step. Card 16's
+`top_k`, `cand_k`"*. Since card 30 (ADR-0055 D-D) a `limit` in `1..=top_k` is accepted and only
+shortens the returned list; anything above `top_k` is `INVALID_INPUT`, refused before the request
+reaches the embedding step. The harness still sends none — it measures the default depth. Card 16's
 post-drain replay sent `"limit": <live point count>` to widen its result page; every replay was
 refused, `ryw_replay_answered` was red in every run, and because the refusal was **silent** the
 failure was read for a day as an embedding fault (the gateway's `query_embedding_unusable` line
@@ -190,7 +202,17 @@ token_malformed | token_not_issued` (the class only, never the token).
 - `latency` — per MCP operation `{p50, p95, n, unit: "ms", failed_calls}`, nearest-rank
   percentiles over successful calls only. An operation whose calls **all** failed is still
   listed, with `n: 0` and its `failed_calls` — a total failure must not be the one shape that
-  disappears from the report;
+  disappears from the report. Buckets (card 30, ADR-0055 D-E): `remember`, `recall`,
+  `memory.enumerate` (reported as plain `memory` before card 30 — delivery_point_report §4.1
+  misread it as `memory.get`), `memory.get` (new: the session's first recalled `memory_id`;
+  **skipped, not failed**, when its recall returned no memory item), the post-drain
+  `remember.ryw_replay` / `recall.ryw_replay`, and two **derived** families read from each
+  successful recall's `provenance.stage_ms`: `recall.stage.<route|planner|scan|embed|qdrant|
+  hydrate|rerank|assemble>` and `recall.stage_sum` (the eight summed). A failed recall adds no
+  stage sample (a missing stage is not a zero), and `op_failure_rate` ignores both derived
+  families — they are not calls. `recall.stage_sum` p50 against `recall` p50 is how much of the
+  wire latency `search()` itself accounts for; `docs/ops/rehearse.sh` asserts ≥ 90 %
+  (`recall_stage_sum_covers_90pct_of_recall_p50`);
 - `tenants` — per lane: ticket census, plus two rates that are metrics rather than assertions.
 
 ### The two rates that are metrics, not failures

@@ -12,8 +12,8 @@
 tests/fault/<variant_snake_case>.rs
 ```
 
-文件名 = `lower(fold(变体名))`，与 `DegradeCode` 变体一一对应。当前 10 个
-变体 ⇒ 10 个文件。两条注入方式不能从变体名直接读出，登记于 §53.4：
+文件名 = `lower(fold(变体名))`，与 `DegradeCode` 变体一一对应。当前 11 个
+变体 ⇒ 11 个文件。两条注入方式不能从变体名直接读出，登记于 §53.4：
 
 ```text
 projection_invisible_loss.rs   绕过 retention::tombstone 直接从 Qdrant 删 10 个 point

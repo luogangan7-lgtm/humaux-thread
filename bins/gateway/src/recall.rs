@@ -3,8 +3,8 @@
 //!   humaux-local-secret-scan, humaux-projection, humaux-protocol, humaux-retrieval, serde_json, time,
 //!   uuid]; services=[]; env=[]; modules=[adapters::affect_repo, adapters::placement_repo, adapters::postgres, adapters::qdrant, adapters::read_materialize, adapters::retrieve, adapters::serving_repo, application::affect, application::retrieval_embedding_port, application::retrieve, domain::affect, domain::error, domain::identity, domain::ids, domain::subject, gateway::context, humaux-local-secret-scan, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::stream, protocol::mcp, protocol::mcp_catalog, retrieval::completeness, retrieval::envelope, retrieval::planner, retrieval::request]
 //! Called-by: [gateway::bootstrap, gateway::context, gateway::mcp_application, tests]
-//! Invariants: [this module owns no alternate search or body fallback path; a Qdrant or provider failure surfaces as the typed retrieval error, never a degraded silent result]
-//! Spec: Baseline §17.3; §55.1; §78.1; ADR-0029; ADR-0031
+//! Invariants: [this module owns no alternate search or body fallback path; a Qdrant or provider failure surfaces as the typed retrieval error, never a degraded silent result; Qdrant is asked for cand_k for this request's workspace stream only; memory items are cut to top_k after the PG gate, the mood rerank permutes only that visible set (ADR-0030 D-D), then limit shortens it; every planner class is answered by dense (LANE_SUBSTITUTED unless the caller named a mode), only an explicit undelivered mode refuses; stage_ms partitions search() exhaustively and is reported only when every lap followed LAP_SEQUENCE]
+//! Spec: Baseline §17.3; §23.3; §33; §55.1; §78.1; ADR-0029; ADR-0031; ADR-0055
 //!
 //! This module composes the existing request builder, sealed provider query, same-Cell Qdrant
 //! candidate lookup, and the sole PostgreSQL final hydration boundary. It owns no alternate
@@ -13,7 +13,7 @@
 use std::{
     collections::BTreeSet,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use humaux_adapters::{
@@ -27,7 +27,7 @@ use humaux_adapters::{
     read_materialize::MaterializedItem,
     retrieve::{
         IndexFace, MaterializedPrivateReadServing, materialize_private_read_serving_about,
-        visible_index_count,
+        tombstoned_source_seqs, visible_index_count,
     },
     serving_repo::family_read_state,
 };
@@ -60,10 +60,10 @@ use humaux_retrieval::{
     envelope::{
         CompletenessBlock, CompletenessInputs, Envelope, FreshnessBlock, LaneStatus,
         MandatoryReport, PendingEnvelope, PinnedReport, PipelineBlock, ProfileBlock,
-        ProvenanceBlock, ProvenanceValue, build_projection_block, envelope_outcome_block,
-        no_serving_projection_envelope,
+        ProvenanceBlock, ProvenanceValue, build_projection_block, dense_lane_outcome_block,
+        dense_lane_substitution, no_serving_projection_envelope,
     },
-    planner::{PlannerDecision, QueryClass},
+    planner::QueryClass,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -219,6 +219,104 @@ pub struct RecallSearchRequest {
     pub mood_congruence: Option<MoodPoint>,
 }
 
+/// ADR-0055 D-E: the fixed, exhaustive partition of [`search`] reported as
+/// `provenance.stage_ms` — every `.await` belongs to exactly one stage, so the stage sum accounts
+/// for the request's own wall time (RQ-5 attribution).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// narrow + placement + `family_read_state`.
+    Route,
+    /// intent + `prepare_request` + the `limit` check.
+    Planner,
+    /// the gateway's own `seal_query` (local gitleaks scan).
+    Scan,
+    /// the `embed_query` RPC (worker scan + provider + ledger).
+    Embed,
+    /// tombstoned-seq read + `query_dense`.
+    Qdrant,
+    /// `materialize_private_read_serving_about` (the PG gate).
+    Hydrate,
+    /// truncation to `top_k` + `mood_rerank` + truncation to `limit`.
+    Rerank,
+    /// `visible_index_count` + envelope build.
+    Assemble,
+}
+
+const STAGE_NAMES: [&str; 8] = [
+    "route", "planner", "scan", "embed", "qdrant", "hydrate", "rerank", "assemble",
+];
+
+/// The one lap order [`search`] takes on its success path (route is entered twice: before and
+/// after the planner). A lap is attributed "time since the previous lap", so a dropped or moved
+/// lap would silently fold its stage into the next one and keep the sum whole; [`StageClock`]
+/// therefore checks every lap against this sequence.
+const LAP_SEQUENCE: [Stage; 9] = [
+    Stage::Route,
+    Stage::Planner,
+    Stage::Route,
+    Stage::Scan,
+    Stage::Embed,
+    Stage::Qdrant,
+    Stage::Hydrate,
+    Stage::Rerank,
+    Stage::Assemble,
+];
+
+/// Monotonic lap clock over [`Stage`]; a stage entered twice (route) accumulates.
+struct StageClock {
+    start: Instant,
+    last: Instant,
+    ms: [f64; 8],
+    /// Laps taken so far, or `None` once a lap broke [`LAP_SEQUENCE`].
+    laps: Option<usize>,
+}
+
+impl StageClock {
+    fn start() -> Self {
+        let now = Instant::now();
+        Self {
+            start: now,
+            last: now,
+            ms: [0.0; 8],
+            laps: Some(0),
+        }
+    }
+
+    fn lap(&mut self, stage: Stage) {
+        let now = Instant::now();
+        self.ms[stage as usize] += now.duration_since(self.last).as_secs_f64() * 1_000.0;
+        self.last = now;
+        self.laps = self
+            .laps
+            .filter(|&n| LAP_SEQUENCE.get(n) == Some(&stage))
+            .map(|n| n + 1);
+    }
+
+    /// `{route, …, assemble, total}` in ms at 0.1 ms resolution; `total` = entry → now.
+    /// A clock whose laps did not follow [`LAP_SEQUENCE`] exactly reports `total` only: its
+    /// per-stage split would misattribute time, and a missing key is what the stage tests and
+    /// the soak's `recall.stage.*` sampler refuse (no fake zeros).
+    fn to_json(&self) -> Value {
+        let round = |ms: f64| (ms * 10.0).round() / 10.0;
+        let mut map = serde_json::Map::with_capacity(9);
+        if self.laps == Some(LAP_SEQUENCE.len()) {
+            for (name, ms) in STAGE_NAMES.iter().zip(self.ms) {
+                map.insert((*name).to_owned(), json!(round(ms)));
+            }
+        } else {
+            eprintln!(
+                "humaux-gateway: recall stage_clock_out_of_sequence laps={:?}",
+                self.laps
+            );
+        }
+        map.insert(
+            "total".to_owned(),
+            json!(round(self.start.elapsed().as_secs_f64() * 1_000.0)),
+        );
+        Value::Object(map)
+    }
+}
+
 #[allow(clippy::too_many_lines)] // Keep the one native semantic-recall request/response chain together.
 pub async fn search(
     pool: Arc<RuntimeDbPool>,
@@ -229,6 +327,7 @@ pub async fn search(
     bootstrap: ContextBootstrap,
     input: RecallSearchRequest,
 ) -> Result<PendingEnvelope<ToolOutput>, ErrorCode> {
+    let mut clock = StageClock::start();
     if input.mode.as_deref().is_some_and(|mode| mode != "semantic")
         || input.completeness_request.as_deref() == Some("required")
     {
@@ -257,25 +356,23 @@ pub async fn search(
         ErrorCode::DependencyUnavailable
     })?;
     let (family, key) = bootstrap.request_stream(authorization.tenant_id(), input.workspace_id);
+    clock.lap(Stage::Route);
     let intent = RetrievalIntent::new(input.query, Vec::new(), BTreeSet::new(), BTreeSet::new())
         .map_err(|_| ErrorCode::InvalidInput)?;
     let retrieval = prepare_request(intent, &bootstrap.profile).map_err(|_| ErrorCode::Internal)?;
-    if !matches!(
-        retrieval.planner_decision(),
-        PlannerDecision::Class(QueryClass::Semantic)
-    ) {
-        eprintln!("humaux-gateway: recall request_id={request_id} query_not_semantic");
-        return Err(ErrorCode::InvalidInput);
-    }
-    // §55.1: candidate depth comes only from the registered profile — a caller may not choose
-    // it. `recall.schema.json` still admits `limit` as a 1..=100 integer, so the only legal
-    // value a caller can send is the profile's own `top_k` echoed back; anything else is
-    // refused here. Refusing it *silently* is what card 16's soak paid for: its post-drain
-    // replay sent `limit = <live point count>`, got INVALID_INPUT with not one line in the
-    // gateway log, and the failure was misread for a day as an embedding fault two steps
-    // further down this function. The operator line carries both numbers, never the query.
+    // ADR-0055 D-C (amends §33 / ADR-0044 D-A): the planner decision is recorded
+    // (`provenance.planner_class`), never a refusal — while dense is the only delivered lane it
+    // answers every class; `accepted_output` adds `LANE_SUBSTITUTED` when no `mode` was sent.
+    // Only an explicit undelivered `mode` refuses (DEPENDENCY_UNAVAILABLE, above).
+    //
+    // §55.1: candidate depth (`cand_k`) and `top_k` come only from the registered profile.
+    // ADR-0055 D-D (amends ADR-0044 D-B): a `limit` in 1..=top_k only shortens the returned
+    // list (§33.5's bounded output); above `top_k` stays INVALID_INPUT. Refusing it *silently*
+    // is what card 16's soak paid for — its replay sent `limit = <live point count>` and the
+    // refusal was misread for a day as an embedding fault — so the operator line carries both
+    // numbers, never the query.
     if let Some(limit) = input.limit
-        && limit != retrieval.top_k()
+        && (limit == 0 || limit > retrieval.top_k())
     {
         eprintln!(
             "humaux-gateway: recall request_id={request_id} limit_not_profile_top_k \
@@ -284,6 +381,7 @@ pub async fn search(
         );
         return Err(ErrorCode::InvalidInput);
     }
+    clock.lap(Stage::Planner);
     // ADR-0053 D-E: the serving read comes BEFORE the query embedding — an unactivated family
     // cannot use a vector, so it pays no provider egress and no provider budget. Uninitialised
     // key ⇒ DEPENDENCY_UNAVAILABLE (unchanged); initialised but unserved ⇒ the B-shaped read.
@@ -325,11 +423,13 @@ pub async fn search(
             return Err(ErrorCode::DependencyUnavailable);
         }
     };
+    clock.lap(Stage::Route);
     let trusted_query = retrieval.trusted_query().ok_or(ErrorCode::Internal)?;
     // Defense-in-depth local scan before the raw text crosses the wire to
     // `humaux-retrieval-worker` (which independently scans/seals it worker-side, ADR-0012 §2's
     // "raw query text ... never a sealed query" crossing the boundary).
     let sealed = runtime.scanner.seal_query(&trusted_query)?;
+    clock.lap(Stage::Scan);
     let embedding_input = RetrievalEmbeddingInput {
         authorization: &authorization,
         workspace_id: input.workspace_id,
@@ -385,6 +485,20 @@ pub async fn search(
             return Err(ErrorCode::DependencyUnavailable);
         }
     };
+    clock.lap(Stage::Embed);
+    // ADR-0055 D-B / §37: TOMBSTONED seqs of the serving stream reach the Qdrant overlay, so a
+    // tombstoned point cannot occupy a candidate slot (the PG gate re-checks by Evidence). The
+    // seqs are this workspace stream's, so the candidate set is scoped to it as well.
+    let serving_key = family.with_version(projection_version.clone());
+    let tombstoned_seqs = tombstoned_source_seqs(&pool, &authorization, &serving_key)
+        .await
+        .map_err(|_| {
+            eprintln!("humaux-gateway: recall request_id={request_id} tombstone_read_failed");
+            ErrorCode::DependencyUnavailable
+        })?;
+    // §23.3 / ADR-0055 D-A: ask Qdrant for `cand_k`, not `top_k` — the PG gate below drops
+    // archived/superseded/secret/tombstoned rows, and truncation to the returned depth happens
+    // only after it and the mood rerank.
     let dense = DenseQuery::new(
         &authorization,
         &placement,
@@ -393,7 +507,7 @@ pub async fn search(
             embedding: &runtime.embedding_version,
         },
         vector,
-        retrieval.top_k(),
+        retrieval.cand_k(),
         Vec::new(),
         ha_profile_for(QdrantOperation::ReadYourWriteStrict),
     )
@@ -402,7 +516,8 @@ pub async fn search(
         ErrorCode::DependencyUnavailable
     })?
     .with_subject_ids(&input.subject_ids)
-    .with_affect_filter(input.affect.as_ref());
+    .with_affect_filter(input.affect.as_ref())
+    .in_workspace_stream(input.workspace_id, tombstoned_seqs);
     let candidates = query_dense(runtime.qdrant.as_ref(), &runtime.qdrant_permit()?, &dense)
         .await
         .map_err(|error| {
@@ -423,6 +538,7 @@ pub async fn search(
                 ErrorCode::DependencyUnavailable
             }
         })?;
+    clock.lap(Stage::Qdrant);
     let mut materialized = materialize_private_read_serving_about(
         &pool,
         input.consistency_token.as_deref(),
@@ -471,6 +587,12 @@ pub async fn search(
             ErrorCode::DependencyUnavailable
         }
     })?;
+    clock.lap(Stage::Hydrate);
+    // ADR-0030 D-D (kept by ADR-0055 D-A): the mood rerank is a permutation of the visible set
+    // — the first profile `top_k` survivors in dense order — never a selection over all
+    // `cand_k` survivors, where a congruent deep candidate would evict a relevant top hit
+    // (no-affect memories score the 5000 midpoint). `limit` then shortens the reranked list.
+    truncate_memory_items(&mut materialized.bodies.items, retrieval.top_k());
     let reranked = match input.mood_congruence {
         None => 0,
         Some(mood) => mood_rerank(&pool, &authorization, &mut materialized.bodies.items, mood)
@@ -480,6 +602,11 @@ pub async fn search(
                 ErrorCode::DependencyUnavailable
             })?,
     };
+    truncate_memory_items(
+        &mut materialized.bodies.items,
+        input.limit.unwrap_or_else(|| retrieval.top_k()),
+    );
+    clock.lap(Stage::Rerank);
     // §23.1②: the live index count, taken against the SERVING version this request actually
     // read (`family_read_state` above), never the token's. `None` here is not a
     // failure to handle — it is the honest "cannot establish" input `build_projection_block`
@@ -511,7 +638,23 @@ pub async fn search(
         reranked,
         &catalog,
         visible,
+        input.mode.is_some(),
+        clock,
     )
+}
+
+/// ADR-0055 D-A: keeps the first `keep` memory items (current order) and every overlay item
+/// — a §15.5 read-your-writes item is bounded by its token's range, and dropping one would break
+/// RYW.
+fn truncate_memory_items(items: &mut Vec<MaterializedItem>, keep: u32) {
+    let mut memories = 0_u32;
+    items.retain(|item| match item {
+        MaterializedItem::Memory { .. } => {
+            memories += 1;
+            memories <= keep
+        }
+        _ => true,
+    });
 }
 
 /// ADR-0030 D-D late rerank: reorders the visible Memory items by mood congruence
@@ -545,7 +688,7 @@ async fn mood_rerank(
     u32::try_from(order.len()).map_err(|_| ErrorCode::Internal)
 }
 
-#[allow(clippy::too_many_arguments)] // One envelope-assembly step over the request's own fixed field set.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One envelope-assembly step over the request's own fixed field set.
 fn accepted_output(
     materialized: MaterializedPrivateReadServing,
     request: &humaux_retrieval::request::RetrievalRequest,
@@ -557,6 +700,8 @@ fn accepted_output(
     reranked_count: u32,
     catalog: &CanonicalCatalog,
     visible: Option<u64>,
+    explicit_mode: bool,
+    mut clock: StageClock,
 ) -> Result<PendingEnvelope<ToolOutput>, ErrorCode> {
     let items = render_items(materialized.bodies.items);
     let returned = u32::try_from(items.len()).map_err(|_| ErrorCode::Internal)?;
@@ -594,7 +739,12 @@ fn accepted_output(
     };
     let lane_status = LaneStatus::Ok;
     let census = CensusResult::ok_without_enumeration();
-    envelope_outcome_block(
+    let planner_class = request
+        .planner_decision()
+        .wire_class()
+        .map_or("CANNOT_ESTABLISH", QueryClass::as_wire_name);
+    let substituted = dense_lane_substitution(request.planner_decision(), explicit_mode);
+    dense_lane_outcome_block(
         request,
         CompletenessInputs {
             lane_status: &lane_status,
@@ -622,6 +772,7 @@ fn accepted_output(
                     degradations: projection
                         .degradations
                         .iter()
+                        .chain(&substituted)
                         .map(|code| code.line_format())
                         .collect(),
                 },
@@ -637,6 +788,16 @@ fn accepted_output(
                 pinned: PinnedReport::NotRun,
             })
             .map_err(|_| ErrorCode::Internal)?;
+            clock.lap(Stage::Assemble);
+            // ADR-0055 D-C/D-E: recall-only provenance keys, inserted here rather than on the
+            // shared `ProvenanceBlock` (context/memory schemas are additionalProperties:false).
+            let mut value = value;
+            let provenance = value
+                .get_mut("provenance")
+                .and_then(Value::as_object_mut)
+                .ok_or(ErrorCode::Internal)?;
+            provenance.insert("planner_class".to_owned(), json!(planner_class));
+            provenance.insert("stage_ms".to_owned(), clock.to_json());
             catalog.validate_output(ToolName::Recall, &value)?;
             let text = serde_json::to_string(&value).map_err(|_| ErrorCode::Internal)?;
             Ok(ToolOutput {
@@ -684,4 +845,51 @@ fn render_items(items: Vec<MaterializedItem>) -> Vec<Value> {
             }),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clock_after(laps: &[Stage]) -> Value {
+        let mut clock = StageClock::start();
+        for stage in laps {
+            clock.lap(*stage);
+        }
+        clock.to_json()
+    }
+
+    #[test]
+    fn stage_clock_reports_every_stage_only_for_the_full_lap_sequence() {
+        let full = clock_after(&LAP_SEQUENCE);
+        for name in STAGE_NAMES.iter().chain(&["total"]) {
+            assert!(full[name].is_f64(), "{name} missing: {full}");
+        }
+        // A dropped inner lap (hydrate), a dropped first route lap, a dropped final assemble lap
+        // and a doubled lap all fold time into a neighbour — each must lose the split.
+        let without = |skip: usize| {
+            let laps: Vec<Stage> = LAP_SEQUENCE
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != skip)
+                .map(|(_, s)| *s)
+                .collect();
+            clock_after(&laps)
+        };
+        let mut doubled = LAP_SEQUENCE.to_vec();
+        doubled.insert(4, Stage::Embed);
+        for (label, broken) in [
+            ("no hydrate lap", without(6)),
+            ("no first route lap", without(0)),
+            ("no assemble lap", without(8)),
+            ("doubled embed lap", clock_after(&doubled)),
+        ] {
+            let object = broken.as_object().expect("stage_ms object");
+            assert_eq!(
+                object.keys().collect::<Vec<_>>(),
+                ["total"],
+                "{label}: {broken}"
+            );
+        }
+    }
 }
