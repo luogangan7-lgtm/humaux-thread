@@ -2,7 +2,7 @@
 //!   `control.sweep_confirm_tokens` against a real Postgres, through the one caller-side door
 //!   (`confirm_token_repo::sweep_expired`) and the maintenance role that owns it.
 //! Depends-on: crates=[humaux-adapters, humaux-testkit, postgres, sha2, sqlx, tokio]; services=[PostgreSQL(any)
-//!   w=[control.confirm_tokens, control.tenants, control.users] x=[control.sweep_confirm_tokens],
+//!   w=[control.confirm_tokens, control.tenants, control.users, control.workspaces] x=[control.sweep_confirm_tokens],
 //!   PostgreSQL(role_maintenance)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::confirm_token_repo,
 //!   adapters::postgres, humaux-testkit]
 //! Called-by: [cargo-test]
@@ -53,6 +53,7 @@ impl Drop for Handle {
         // DELETEs are spelled anyway so a failure to cascade is not silently tolerated.
         let _ = self.admin.batch_execute(&format!(
             "DELETE FROM control.confirm_tokens WHERE tenant_id IN ('{0}','{1}'); \
+             DELETE FROM control.workspaces WHERE tenant_id IN ('{0}','{1}'); \
              DELETE FROM control.users WHERE user_id = '{2}'; \
              DELETE FROM control.tenants WHERE tenant_id IN ('{0}','{1}');",
             self.tenant_id, self.other_tenant_id, self.user_id
@@ -153,10 +154,15 @@ fn seed_token(
     handle
         .admin
         .execute(
-            "INSERT INTO control.confirm_tokens \
+            // ADR-0054 D-C (migration 0187): an ADR-0054 gateway names the workspace every token
+            // was minted for — the rows seeded here have that shape, one workspace per token.
+            "WITH w AS (INSERT INTO control.workspaces (tenant_id, name) \
+                          VALUES ($1, 'confirm_token_retention.rs workspace') RETURNING workspace_id) \
+             INSERT INTO control.confirm_tokens \
                (tenant_id, user_id, operation, target_id, nonce_sha256, issued_at, expires_at, \
-                consumed_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                consumed_at, workspace_id) \
+             SELECT $1, $2::uuid, $3::text, $4::uuid, $5::bytea, $6::timestamptz, $7::timestamptz, \
+                    $8::timestamptz, w.workspace_id FROM w",
             &[
                 &tenant_id,
                 &user_id,

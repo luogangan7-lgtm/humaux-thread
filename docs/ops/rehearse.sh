@@ -131,7 +131,7 @@ SEED_OUT_B=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes
 valb() { print -r -- "$SEED_OUT_B" | grep -iE "^[[:space:]]*$1[[:space:]]*[:=]" | head -1 | sed -E 's/^[^:=]*[:=][[:space:]]*//' | tr -d ' '; }
 export BEARER_A="$BEARER"
 export BEARER_B=$(print -r -- "$SEED_OUT_B" | sed -n 's/^Authorization: Bearer //p' | head -1)
-TENANT_B=$(valb tenant_id); WS_B=$(valb workspace_id); USERID_B=$(valb user_id)
+TENANT_B=$(valb tenant_id); WS_B=$(valb workspace_id); USERID_B=$(valb user_id); RDOM_B=$(valb reasoning_domain_id)
 print -r -- "$SEED_OUT_B" | grep -vE 'Bearer|bearer_|export' | tee -a $EV/seed_ids.txt >/dev/null
 [ -z "$BEARER_B" ] && { echo "seed_b: no bearer for tenant B" | tee -a $EV/rehearsal.log; exit 2; }
 [ "$TENANT_B" = "$TENANT" ] && { echo "seed_b: tenant B is tenant A — isolation cannot be witnessed" | tee -a $EV/rehearsal.log; exit 2; }
@@ -214,7 +214,7 @@ start_gw() {
     HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES=1048576 HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS= HUMAUX_GATEWAY_MAX_FORWARDED_HOPS=1 HUMAUX_GATEWAY_GLOBAL_DENYLIST= HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST= \
     HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS=30 HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS=20 HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS=5 HUMAUX_GATEWAY_REPLAY_TTL_SECONDS=60 \
     HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS=300 HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS=86400 HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS=21600 \
-    HUMAUX_GATEWAY_REMEMBER_TENANT_ID=$TENANT HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID=$WS HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND=workspace \
+    HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND=workspace \
     HUMAUX_GATEWAY_REMEMBER_DOMAIN=$DOMAIN HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND=$PKIND HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION=$PVER \
     HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID=$RDOM HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS=60 HUMAUX_GATEWAY_REMEMBER_DATA_CLASS=INTERNAL \
     HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS=WORKSPACE_SHARED HUMAUX_GATEWAY_REMEMBER_EVENT_KIND=USER_MESSAGE \
@@ -401,7 +401,9 @@ PGQ "select 'serving='||serving||' projected='||coalesce(projection_highwater::t
 # no_serving_projection for the rest of the run. That is a live-model flake landing in the first
 # ticket window (card 24 D1), not something a 10-minute soak can recover from — so fail here,
 # at 3 minutes, instead of discovering it in the assertion table at 13.
-if [ "$(PGQ "select count(*) from projection.stream_checkpoints where tenant_id='$TENANT' and serving")" != "1" ]; then
+# Card 29: scoped to lane A's workspace — since card 28 the seed activates EVERY seeded workspace
+# (WS and WS_A2 are both serving), so a tenant-wide count is 2 on a healthy run.
+if [ "$(PGQ "select count(*) from projection.stream_checkpoints where tenant_id='$TENANT' and scope_id='$WS' and serving")" != "1" ]; then
   echo "serve_switch: tenant A has no serving projection (first switch refused; see soak-projection reject reasons). This run cannot measure lane A - re-seed." | tee -a $EV/rehearsal.log
   kill $GW_PID $RW_PID $PW_PID 2>/dev/null
   exit 2
@@ -596,6 +598,63 @@ walk(d)
 print(found[0] if found else '')")
 echo "completeness: memory.enumerate class='${CMP_CLASS:-<absent>}'" | tee -a $EV/rehearsal.log
 
+# ---------- 6a1d2. card 29 / ADR-0054: governance on BOTH seeded tenants, ONE gateway, no default pair ----------
+# start_gw passes no (tenant, workspace): every governance / subject / affect write derives its
+# pair per request. One leg per seeded tenant, each on its own bearer and workspace: supersede ->
+# restore -> archive -> unarchive -> pin -> bind (REFERENCE_ONLY) -> annotate_affect. Fixture
+# writes (superuser PGQ, no product path creates them — ADR-0044): one coord.tasks row per tenant,
+# and one bindable memory per leg (ProjectConstraint + TenantAdmin evidence — distilled memories are
+# PrivateKnowledge, which §10.1 never lets bind MANDATORY). The leg's tickets must land on its own
+# (tenant, 'workspace', workspace) stream and on no other seeded stream.
+step governance_both_tenants
+typeset -gA GOV
+PGQ "insert into coord.tasks(tenant_id,title) values ('$TENANT','card29 rehearsal task'),('$TENANT_B','card29 rehearsal task')" >/dev/null
+governance_leg() { # $1=label $2=bearer $3=tenant $4=workspace $5=reasoning domain
+  local L=$1 b=$2 t=$3 w=$4 rd=$5
+  local pick=($(PGQ "select memory_id from private.memory_records where tenant_id='$t' and status='active' and visibility_workspace_id='$w' and memory_id <> '${LC_TARGET:-00000000-0000-0000-0000-000000000000}' order by created_at desc limit 2"))
+  local tgt=${pick[1]:-} repl=${pick[2]:-}
+  local task=$(PGQ "select task_id from coord.tasks where tenant_id='$t' and title='card29 rehearsal task' limit 1")
+  local bindable=$(PGQ "with e as (insert into private.evidence_objects (tenant_id,evidence_kind,payload_sha256,data_class,origin_class,visibility_class,visibility_workspace_id,reasoning_domain_id) values ('$t','EVENT',sha256(gen_random_uuid()::text::bytea),'INTERNAL','TenantAdmin','WORKSPACE_SHARED','$w','$rd') returning evidence_id), m as (insert into private.memory_records (tenant_id,memory_type,content,visibility_class,visibility_workspace_id,authority_class,confidence,status,asserted_at) values ('$t','NOTE','{\"rehearsal\":\"card29 bind target\"}','WORKSPACE_SHARED','$w','ProjectConstraint',0.9,'active',clock_timestamp()) returning memory_id), l as (insert into private.memory_evidence (memory_id,evidence_id,role,grounding_mode) select m.memory_id, e.evidence_id, 'PRIMARY', 'SNAPSHOT' from m, e returning memory_id) select memory_id from l")
+  local own0=$(PGQ "select count(*) from projection.stream_log where tenant_id='$t' and scope_kind='workspace' and scope_id='$w'")
+  local foreign0=$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and not (tenant_id='$t' and scope_kind='workspace' and scope_id='$w')")
+  echo "governance $L: tenant=$t ws=$w target=${tgt:-<none>} replacement=${repl:-<none>} bindable=${bindable:-<none>} task=${task:-<none>}" | tee -a $EV/rehearsal.log
+  if [ -n "$tgt" ] && [ -n "$repl" ] && [ -n "$bindable" ] && [ -n "$task" ]; then
+    gated_as "$b" memory "{\"action\":\"supersede\",\"memory_id\":\"$tgt\",\"replacement_memory_id\":\"$repl\"}" > $EV/gov_${L}_supersede.json 2>&1
+    gated_as "$b" memory "{\"action\":\"restore\",\"memory_id\":\"$tgt\"}" > $EV/gov_${L}_restore.json 2>&1
+    gated_as "$b" memory "{\"action\":\"archive\",\"memory_id\":\"$tgt\"}" > $EV/gov_${L}_archive.json 2>&1
+    gated_as "$b" memory "{\"action\":\"unarchive\",\"memory_id\":\"$tgt\"}" > $EV/gov_${L}_unarchive.json 2>&1
+    gated_as "$b" memory "{\"action\":\"pin\",\"memory_id\":\"$tgt\"}" > $EV/gov_${L}_pin.json 2>&1
+    gated_as "$b" memory "{\"action\":\"bind\",\"memory_id\":\"$bindable\",\"task_id\":\"$task\",\"purpose\":\"REFERENCE_ONLY\"}" > $EV/gov_${L}_bind.json 2>&1
+    mcp_as "$b" memory "{\"action\":\"annotate_affect\",\"memory_id\":\"$tgt\",\"workspace_id\":\"$w\",\"affects\":[{\"kind\":\"EMOTION\",\"intensity\":5000,\"confidence\":9000}]}" > $EV/gov_${L}_annotate.json 2>&1
+  fi
+  for op in supersede restore archive unarchive pin bind annotate; do
+    echo "governance $L $op: http=$(tail -1 $EV/gov_${L}_$op.json 2>/dev/null) isError=$(head -1 $EV/gov_${L}_$op.json 2>/dev/null | python3 -c "import sys,json
+try: print(json.load(sys.stdin)['result'].get('isError', False))
+except Exception: print('?')")" | tee -a $EV/rehearsal.log
+  done
+  GOV[${L}_target]=${tgt:-none}
+  GOV[${L}_supersede]=$(PGQ "select count(*) from ops.memory_lifecycle_events where tenant_id='$t' and op='SUPERSEDE' and memory_id='${tgt:-00000000-0000-0000-0000-000000000000}'")
+  GOV[${L}_restore]=$(PGQ "select count(*) from ops.memory_lifecycle_events r join ops.memory_lifecycle_events s on s.event_id=r.undoes_event_id where r.tenant_id='$t' and r.op='RESTORE' and s.op='SUPERSEDE' and s.memory_id='${tgt:-00000000-0000-0000-0000-000000000000}'")
+  GOV[${L}_archive]=$(PGQ "select count(*) from ops.memory_lifecycle_events e where e.tenant_id='$t' and e.memory_id='${tgt:-00000000-0000-0000-0000-000000000000}' and (e.op='ARCHIVE' or (e.op='RESTORE' and exists (select 1 from ops.memory_lifecycle_events a where a.event_id=e.undoes_event_id and a.op='ARCHIVE')))")
+  GOV[${L}_pin]=$(PGQ "select count(*) from private.context_bindings where tenant_id='$t' and memory_id='${tgt:-00000000-0000-0000-0000-000000000000}' and mode='PINNED' and scope_kind='WORKSPACE' and scope_id='$w' and revoked_at is null")
+  GOV[${L}_bind]=$(PGQ "select count(*) from private.context_bindings where tenant_id='$t' and memory_id='${bindable:-00000000-0000-0000-0000-000000000000}' and mode='MANDATORY' and scope_kind='TASK' and scope_id='${task:-00000000-0000-0000-0000-000000000000}' and revoked_at is null")
+  GOV[${L}_affects]=$(PGQ "select count(*) from private.memory_affects where tenant_id='$t' and memory_id='${tgt:-00000000-0000-0000-0000-000000000000}'")
+  GOV[${L}_own]=$(( $(PGQ "select count(*) from projection.stream_log where tenant_id='$t' and scope_kind='workspace' and scope_id='$w'") - own0 ))
+  GOV[${L}_foreign]=$(( $(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and not (tenant_id='$t' and scope_kind='workspace' and scope_id='$w')") - foreign0 ))
+  echo "governance $L: supersede=${GOV[${L}_supersede]} restore=${GOV[${L}_restore]} archive+unarchive=${GOV[${L}_archive]} pin=${GOV[${L}_pin]} bind=${GOV[${L}_bind]} affects=${GOV[${L}_affects]} own_tickets=${GOV[${L}_own]} foreign_tickets=${GOV[${L}_foreign]}" | tee -a $EV/rehearsal.log
+}
+governance_leg A "$BEARER" "$TENANT" "$WS" "$RDOM"
+governance_leg B "$BEARER_B" "$TENANT_B" "$WS_B" "$RDOM_B"
+GOV[tenants]=$(PGQ "select count(distinct tenant_id) from ops.memory_lifecycle_events where op='SUPERSEDE' and tenant_id in ('$TENANT','$TENANT_B') and memory_id in ('${GOV[A_target]/none/00000000-0000-0000-0000-000000000000}','${GOV[B_target]/none/00000000-0000-0000-0000-000000000000}')")
+# Live replay witness (ADR-0054 D-C): tenant A's user mints `pin` in WS with $BEARER and presents
+# the token with $BEARER_A2 (WS_A2, same user, second workspace) — one indistinguishable CONFLICT.
+GOV_REPLAY_TARGET=${GOV[A_target]}
+GOV_MINT=$(mcp_as "$BEARER" memory "{\"action\":\"pin\",\"memory_id\":\"$GOV_REPLAY_TARGET\"}")
+GOV_TOKEN=$(print -r -- "$GOV_MINT" | head -1 | sc confirm_token)
+GOV[replay]=$(mcp_as "$BEARER_A2" memory "{\"action\":\"pin\",\"memory_id\":\"$GOV_REPLAY_TARGET\",\"confirm_token\":\"$GOV_TOKEN\"}" | head -1 | sc code)
+echo "governance: tenants_exercised=${GOV[tenants]} cross_workspace_replay=${GOV[replay]:-<none>}" | tee -a $EV/rehearsal.log
+drain_all
+
 # ---------- 6a1e. kill -9 every resident worker and recover (acceptance item 6) ----------
 # SIGTERM drains, which is the case that is safe by construction; kill -9 is the case the leases
 # exist to survive. Each worker is signalled ONLY through its own pidfile via own_signal, which
@@ -746,6 +805,23 @@ assert_eq "every_worker_recovered_after_kill9" "$K9_RECOVERY_BAD" 0
 assert_eq "recall_serves_again_after_kill9" "$K9_RECALL_ERROR" 0
 assert_eq "no_stranded_lease_after_kill9" "$K9_STRANDED" 0
 assert_eq "exactly_once_no_duplicate_live_points_after_kill9" "$K9_DUP_POINTS" 0
+# (7) card 29 / ADR-0054: governance ops on BOTH seeded tenants through one gateway that was started
+#     without a default write pair; each leg's tickets on its own stream only; a token minted in one
+#     workspace is refused in another. The boot witness greps this script's own gateway block; the
+#     pattern cannot match this line (after REMEMBER_ comes a parenthesis here, not the key name).
+assert_eq "gateway_boots_without_a_default_write_pair" "$(grep -cE 'HUMAUX_GATEWAY_REMEMBER_(TENANT|WORKSPACE)_ID=' $0)" 0
+for L in A B; do
+  assert_eq "gov_${L}_supersede_in_lifecycle_log" "${GOV[${L}_supersede]}" 1
+  assert_eq "gov_${L}_restore_undoes_supersede" "${GOV[${L}_restore]}" 1
+  assert_eq "gov_${L}_archive_and_unarchive_events" "${GOV[${L}_archive]}" 2
+  assert_eq "gov_${L}_pin_binding_row" "${GOV[${L}_pin]}" 1
+  assert_eq "gov_${L}_bind_binding_row" "${GOV[${L}_bind]}" 1
+  assert_gt "gov_${L}_affect_rows" "${GOV[${L}_affects]}" 0
+  assert_gt "gov_${L}_tickets_on_own_stream" "${GOV[${L}_own]}" 0
+  assert_eq "gov_${L}_tickets_on_foreign_streams" "${GOV[${L}_foreign]}" 0
+done
+assert_eq "governance_tenants_exercised" "${GOV[tenants]}" 2
+assert_eq "cross_workspace_token_replay_is_conflict" "${GOV[replay]}" "CONFLICT"
 echo "ASSERTIONS $A_OK passed, $A_BAD failed" | tee -a $EV/rehearsal.log
 
 # ============================================================================

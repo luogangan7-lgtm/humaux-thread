@@ -7,12 +7,13 @@
 //!   private.evidence_affects, private.evidence_subjects, private.subject_keys, private.task_binding_grants,
 //!   public.humaux_test_restore_fault_, public.humaux_test_supersede_fault_] w=[control.api_keys,
 //!   control.confirm_tokens, control.memberships, control.operation_receipts, control.private_reasoning_domains,
-//!   control.tenants, control.workspace_memberships, coord.tasks, ops.memory_lifecycle_events, ops.outbox,
+//!   control.tenants, control.workspace_memberships, control.workspaces, coord.tasks, ops.memory_lifecycle_events, ops.outbox,
 //!   ops.selection_snapshots, private.context_bindings, private.distill_candidates, private.evidence_objects,
 //!   private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs,
 //!   private.memory_evidence, private.memory_records, private.memory_subjects, private.subjects,
 //!   projection.private_memory_points, projection.stream_checkpoints, projection.stream_log,
-//!   projection.tenant_placements], PostgreSQL(role_retrieval_worker), Qdrant(*), UDS(retrieval-worker), UDS(serve),
+//!   projection.tenant_placements] x=[control.bump_user_security_epoch, control.onboard_workspace,
+//!   control.set_workspace_membership], PostgreSQL(role_retrieval_worker), Qdrant(*), UDS(retrieval-worker), UDS(serve),
 //!   subprocess(humaux-gateway), subprocess(kill), HTTP(gateway)]; env=[CARGO_BIN_EXE_humaux-gateway,
 //!   HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS, HUMAUX_GATEWAY_BIND_ADDR,
 //!   HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS,
@@ -23,15 +24,15 @@
 //!   HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN,
 //!   HUMAUX_GATEWAY_REMEMBER_EVENT_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND,
 //!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION, HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID,
-//!   HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND, HUMAUX_GATEWAY_REMEMBER_TENANT_ID,
+//!   HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND,
 //!   HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS,
-//!   HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID, HUMAUX_GATEWAY_REPLAY_TTL_SECONDS, HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_REPLAY_TTL_SECONDS, HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS,
 //!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS, HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS,
 //!   HUMAUX_GATEWAY_UNKNOWN, HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
 //!   HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN, HUMAUX_TEST_QDRANT_PORT];
 //!   modules=[adapters::confirm_token_repo, adapters::consolidate_repo, adapters::context_repo,
 //!   adapters::forget_repo, adapters::membership_repo, adapters::operation_receipt, adapters::postgres,
-//!   adapters::qdrant, adapters::quota_repo, adapters::remember, adapters::tests::support::operation_receipt_fixture,
+//!   adapters::qdrant, adapters::quota_repo, adapters::remember, adapters::subject_repo, adapters::tests::support::operation_receipt_fixture,
 //!   application::retrieval_embedding_port, contracts::retrieval_config, domain::affect, domain::audit,
 //!   domain::authority, domain::confirm, domain::context, domain::dataclass, domain::error, domain::evidence,
 //!   domain::identity, domain::ids, domain::memory, domain::selection, domain::subject, gateway::context,
@@ -42,7 +43,7 @@
 //!   retrieval-worker::rpc, retrieval::completeness, retrieval::request]
 //! Called-by: [cargo-test]
 //! Invariants: [each test wires its own PostgreSQL/Qdrant/UDS fixtures and gateway subprocess; no test depends on state left by another test]
-//! Spec: Baseline §33.10; §34.0.1; ADR-0030; ADR-0031
+//! Spec: Baseline §33.10; §34.0.1; ADR-0030; ADR-0031; ADR-0054
 //!
 //! The database fixture owns only isolated seed and cleanup rows. Every request below travels
 //! through the loopback native MCP adapter and a real `role_gateway` runtime pool.
@@ -77,6 +78,7 @@ use humaux_domain::{
     affect::{AffectAnnotation, AffectKind, BasisPoints, EmotionLabel},
     audit::{AuditEvent, AuditEventId, AuditMetadata, McpAuditAction},
     authority::{AuthorityClass, AuthorityStatus},
+    confirm::DestructiveOp,
     context::{ContextBudget, SelectorId, SelectorOutcome},
     dataclass::DataClass,
     error::ErrorCode,
@@ -93,7 +95,7 @@ use humaux_gateway::{
     guard::{GatewayGuard, GuardRatePolicies, GuardSettings},
     mcp_application::GatewayMcpApplication,
     recall::{SemanticRecallRuntime, SemanticRecallVersions},
-    remember::{RememberEventKind, RememberPolicy},
+    remember::{ProcessFamily, RememberEventKind, RememberPolicy},
 };
 use humaux_infra_cell::{
     CallerId, CellId, HttpIntraCellTransport, IntraCellHttpTransport, IntraCellMethod,
@@ -258,17 +260,12 @@ fn application_with_budget(
     runtime: RuntimeDbPool,
     budget: ContextBudget,
 ) -> GatewayMcpApplication {
-    // The in-process fixture app's bootstrap pair is provisioned like a deployed one.
+    // The fixture handle's pair is provisioned like a deployed one (governance writes admit
+    // provisioned pairs only, ADR-0054 D-A).
     provision_stream_pair(handle, handle.workspace_id);
     let policy = RememberPolicy::new(
-        StreamKey::new(
-            TenantId(handle.tenant_id),
-            "workspace",
-            handle.workspace_id,
-            "knowledge",
-            "ingest",
-            "v1",
-        ),
+        // ADR-0054 D-D: the family only — no default (tenant, workspace) pair.
+        ProcessFamily::new("workspace", "knowledge", "ingest", "v1").expect("trusted family"),
         handle.reasoning_domain_id,
         Duration::from_secs(60),
         DataClass::Internal,
@@ -4491,16 +4488,8 @@ impl GatewayProcessConfig {
                 "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS".into(),
                 "21600".into(),
             ),
-            // ADR-0031 D-B: bind the WRITE route only (read routes derive their stream per
-            // request from the credential's tenant + requested workspace).
-            (
-                "HUMAUX_GATEWAY_REMEMBER_TENANT_ID".into(),
-                handle.tenant_id.to_string(),
-            ),
-            (
-                "HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID".into(),
-                handle.workspace_id.to_string(),
-            ),
+            // ADR-0054 D-D: no REMEMBER_TENANT_ID / REMEMBER_WORKSPACE_ID — the binary boots
+            // without a default write pair; every route derives (tenant, workspace) per request.
             (
                 "HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND".into(),
                 "workspace".into(),
@@ -7868,7 +7857,8 @@ fn native_mcp_memory_pin_unpin_confirm_gate_acceptance() {
                 ts: std::time::SystemTime::now(),
                 tenant_id: TenantId(handle.tenant_id),
                 actor_type: "user".into(),
-                actor_id: handle.principal_id.to_string(),
+                // ADR-0054 D-B: the direct call's principal is the bearer's credential row.
+                actor_id: credential.api_key_id.to_string(),
                 action: humaux_domain::audit::McpAuditAction::McpRequestFinished.as_str().into(),
                 resource_type: "mcp".into(),
                 resource_id: "memory.unpin".into(),
@@ -7913,8 +7903,17 @@ fn native_mcp_memory_pin_unpin_confirm_gate_acceptance() {
                 .expect("owner locks the PINNED row");
                 txn
             });
+            // ADR-0054 D-B: the adapter rechecks the write scope in-transaction against the real
+            // credential row, so the direct call carries the bearer's own principal (the fixture's
+            // `handle.auth` principal is not a credential) narrowed to the pinned workspace.
+            let direct_auth = AuthorizationScope::new(
+                TenantId(handle.tenant_id),
+                PrincipalId(credential.api_key_id),
+                Some(UserId(handle.user_id)),
+                BoundedSet::new([WorkspaceId(workspace)]).expect("one workspace"),
+            );
             let (rejected, ()) = tokio::join!(
-                humaux_adapters::context_repo::unpin_confirmed(&handle.runtime, &handle.auth, request),
+                humaux_adapters::context_repo::unpin_confirmed(&handle.runtime, &direct_auth, request),
                 async move {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     tokio::task::block_in_place(|| {
@@ -10200,6 +10199,9 @@ struct StreamPair {
     workspace_id: Uuid,
     bearer: String,
     memory_id: Uuid,
+    /// The credential row behind `bearer` — the principal an in-transaction write-scope
+    /// recheck (ADR-0054 D-B) resolves; used by the direct-adapter witnesses.
+    api_key_id: Uuid,
 }
 
 /// The four read routes for one bearer / workspace / target, in a fixed order.
@@ -10378,10 +10380,172 @@ fn seed_pair(
             workspace_id: handle.workspace_id,
             bearer: credential.bearer,
             memory_id: record.memory_id,
+            api_key_id: credential.api_key_id,
         },
         point,
         semantic_payload(handle, updated),
     )
+}
+
+/// ADR-0054 D-F write-phase seeds for one pair, all in the pair's own workspace: a supersede
+/// (target, successor) pair of workspace-shared records and one `memory.bind`-able memory;
+/// `task` is the pair tenant's one `coord.tasks` row.
+struct PairWrites {
+    tenant_id: Uuid,
+    supersede_target: Uuid,
+    supersede_successor: Uuid,
+    bindable: Uuid,
+    task: Uuid,
+}
+
+fn seed_pair_writes(handle: &mut Handle, workspace_id: Uuid, task: Uuid) -> PairWrites {
+    with_workspace(handle, workspace_id, |handle| {
+        let supersede_target = handle.seed_workspace_visible_context_record().memory_id;
+        let supersede_successor = handle.seed_workspace_visible_context_record().memory_id;
+        PairWrites {
+            tenant_id: handle.tenant_id,
+            supersede_target,
+            supersede_successor,
+            bindable: seed_bindable_memory(handle, "NOTE"),
+            task,
+        }
+    })
+}
+
+/// `projection.stream_log` rows of one `(tenant, 'workspace', workspace)` — the ticket ledger a
+/// governance write must land on (ADR-0054 D-A). Owner view (RLS bypassed), any tenant.
+fn stream_log_rows(handle: &mut Handle, tenant_id: Uuid, workspace_id: Uuid) -> i64 {
+    handle
+        .admin
+        .query_one(
+            "SELECT count(*) FROM projection.stream_log \
+             WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2",
+            &[&tenant_id, &workspace_id],
+        )
+        .expect("owner counts stream_log rows")
+        .get(0)
+}
+
+/// `projection.stream_checkpoints` rows (ledger keys) of one `(tenant, workspace)`.
+fn checkpoint_rows(handle: &mut Handle, tenant_id: Uuid, workspace_id: Uuid) -> i64 {
+    handle
+        .admin
+        .query_one(
+            "SELECT count(*) FROM projection.stream_checkpoints \
+             WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2",
+            &[&tenant_id, &workspace_id],
+        )
+        .expect("owner counts checkpoint rows")
+        .get(0)
+}
+
+/// `(consumed, workspace_id)` of one presented token's row (ADR-0054 D-C binding).
+fn confirm_token_binding(handle: &mut Handle, wire: &str) -> Option<(bool, Option<Uuid>)> {
+    let digest = humaux_domain::confirm::ConfirmToken::decode(wire)
+        .expect("wire token decodes")
+        .sha256()
+        .to_vec();
+    handle
+        .admin
+        .query_opt(
+            "SELECT consumed_at IS NOT NULL, workspace_id FROM control.confirm_tokens \
+             WHERE nonce_sha256=$1",
+            &[&digest],
+        )
+        .expect("owner reads token row")
+        .map(|row| (row.get(0), row.get(1)))
+}
+
+fn confirm_token_rows(handle: &mut Handle, tenant_id: Uuid) -> i64 {
+    handle
+        .admin
+        .query_one(
+            "SELECT count(*) FROM control.confirm_tokens WHERE tenant_id=$1",
+            &[&tenant_id],
+        )
+        .expect("owner counts token rows")
+        .get(0)
+}
+
+/// `memory.annotate_affect` naming its workspace explicitly (the op's schema carries one).
+async fn annotate_in(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    workspace_id: Uuid,
+    memory_id: Uuid,
+) -> (u16, Value) {
+    memory_call(
+        address,
+        bearer,
+        request_id,
+        json!({"action":"annotate_affect","memory_id":memory_id,"workspace_id":workspace_id,
+               "affects":[{"kind":"EMOTION","intensity":5000,"confidence":9000}]}),
+    )
+    .await
+}
+
+/// A success-shaped tool result (HTTP 200, not `isError`).
+fn assert_executed(label: &str, status: u16, response: &Value) {
+    assert_eq!(status, 200, "{label}: {response}");
+    assert_ne!(response["result"]["isError"], true, "{label}: {response}");
+}
+
+/// The narrowed scope an authenticated request of `api_key_id` would carry — for the
+/// direct-adapter witnesses that bypass HTTP authentication (ADR-0054 D-B in-tx recheck).
+fn direct_write_scope(
+    tenant_id: Uuid,
+    api_key_id: Uuid,
+    user_id: Uuid,
+    workspace_id: Uuid,
+) -> AuthorizationScope {
+    AuthorizationScope::new(
+        TenantId(tenant_id),
+        PrincipalId(api_key_id),
+        Some(UserId(user_id)),
+        BoundedSet::new([WorkspaceId(workspace_id)]).expect("one workspace"),
+    )
+}
+
+/// The mint-tagged finished audit `confirm_token_repo::mint_with_audit` requires.
+fn direct_mint_audit(auth: &AuthorizationScope, op: DestructiveOp) -> AuditEvent {
+    AuditEvent {
+        event_id: AuditEventId::new(),
+        ts: std::time::SystemTime::now(),
+        tenant_id: auth.tenant_id(),
+        actor_type: "user".into(),
+        actor_id: auth.principal().0.to_string(),
+        action: McpAuditAction::McpRequestFinished.as_str().into(),
+        resource_type: "mcp".into(),
+        resource_id: op.operation_key().into(),
+        result: "OK".into(),
+        request_id: Uuid::now_v7().to_string(),
+        trace_id: String::new(),
+        client_ip: "127.0.0.1".into(),
+        user_agent_hash: String::new(),
+        risk_tags: vec![humaux_domain::confirm::RISK_TAG_CONFIRMATION_MINTED.to_owned()],
+        before_fingerprint: None,
+        after_fingerprint: None,
+        metadata: AuditMetadata::new(),
+    }
+}
+
+/// Deletes the workspace `control.onboard_workspace` created (the fixture only tracks the
+/// workspaces it seeded itself). A local, so it drops before the fixture handle's teardown.
+struct OnboardedWorkspaceCleanup {
+    owner: postgres::Client,
+    workspace_id: Uuid,
+}
+
+impl Drop for OnboardedWorkspaceCleanup {
+    fn drop(&mut self) {
+        if let Err(error) = self.owner.execute(
+            "DELETE FROM control.workspaces WHERE workspace_id=$1",
+            &[&self.workspace_id],
+        ) {
+            eprintln!("onboarded workspace cleanup failed: {error:?}");
+        }
+    }
 }
 
 fn percentile_p50(samples: &mut [Duration]) -> Duration {
@@ -10389,9 +10553,14 @@ fn percentile_p50(samples: &mut [Duration]) -> Duration {
     samples[samples.len() / 2]
 }
 
-/// Card 10 acceptance gate: ONE gateway process (bootstrap write stream = pair A) serves three
+/// Card 10 acceptance gate, extended by card 29 (ADR-0054) to the writes: ONE gateway process —
+/// built with a stream family only, no default (tenant, workspace) write pair — serves three
 /// distinct provisioned (tenant, workspace) pairs on every read route with strictly disjoint
-/// data. Pair B shares pair A's TENANT — the configuration this card newly enables, where the
+/// data, and then on the governance writes (W1–W11 below: per-pair pin / supersede / bind /
+/// annotate with tickets on the pair's own stream only, cross-workspace and cross-tenant token
+/// replay refused, another workspace's distill candidate NOT_FOUND to reject / confirm, an unbound PAT's receipts per workspace, unprovisioned and PROVISIONING pairs
+/// refused, and the in-transaction membership / epoch recheck witnessed through direct adapter
+/// calls that bypass authentication). Pair B shares pair A's TENANT — the configuration this card newly enables, where the
 /// enumerate candidate predicate is tenant-wide and isolation rests on the per-request
 /// workspace half of the stream identity (a tenant-level regression cannot mask a workspace
 /// one here); pair C is another tenant. Interleaved concurrent requests for all three never
@@ -10467,6 +10636,55 @@ fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
                     assert_eq!(pair_a.workspace_id, handle.workspace_id);
                     assert_ne!(pair_a.workspace_id, pair_b.workspace_id);
                     assert_ne!(handle.tenant_id, pair_c_handle.tenant_id);
+                    // ADR-0054 write-phase identities that do not touch any pair's read set:
+                    // pair F — a workspace onboarded through card 28's owner door
+                    // (`control.onboard_workspace`: PROVISIONING, U as OWNER, an initialised but
+                    // never-activated checkpoint row) — and an UNBOUND PAT of the same user U
+                    // (A's and B's credentials are U's too: one user, two bound workspaces).
+                    let f_workspace: Uuid = {
+                        let mut txn = handle.admin.transaction().expect("owner onboarding txn");
+                        txn.execute(
+                            "SELECT set_config('humaux.tenant_id', $1, true)",
+                            &[&handle.tenant_id.to_string()],
+                        )
+                        .expect("owner installs the onboarding tenant");
+                        let workspace: Uuid = txn
+                            .query_one(
+                                "SELECT workspace_id FROM control.onboard_workspace(\
+                                   $1, $2, $3, ARRAY['knowledge','ingest','v1'])",
+                                &[
+                                    &handle.tenant_id,
+                                    &format!("card29 provisioning {}", Uuid::now_v7()),
+                                    &handle.user_id,
+                                ],
+                            )
+                            .expect("owner onboards pair F (PROVISIONING)")
+                            .get(0);
+                        txn.commit().expect("commit pair F onboarding");
+                        workspace
+                    };
+                    let _f_cleanup = OnboardedWorkspaceCleanup {
+                        owner: handle.owner_client().expect("pair F cleanup owner"),
+                        workspace_id: f_workspace,
+                    };
+                    let unbound = {
+                        let prefix = format!("u{}", &Uuid::now_v7().simple().to_string()[..12]);
+                        let wire = format!("{prefix}.{}", "u".repeat(32));
+                        let credential = handle.seed_synthetic_service_credential(
+                            SyntheticCredentialScopes::RememberWriteAndContextRead,
+                            &prefix,
+                            &wire,
+                            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+                        );
+                        handle
+                            .admin
+                            .execute(
+                                "UPDATE control.api_keys SET workspace_id=NULL WHERE api_key_id=$1",
+                                &[&credential.api_key_id],
+                            )
+                            .expect("owner unbinds U's second PAT");
+                        credential
+                    };
 
                     // ADR-0031 D-C / ADR-0032 D-C: the receipt key is (tenant, principal,
                     // scope_kind, scope_id, operation, idempotency_key) + request_fingerprint;
@@ -10554,7 +10772,7 @@ fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
                         Duration::from_secs(10),
                     )
                     .expect("trusted semantic runtime");
-                    // The ONE process: its bootstrap write stream is pair A's.
+                    // The ONE process: family only, no default write pair (ADR-0054 D-D).
                     let app = application(&handle, runtime).with_semantic_recall(semantic);
                     let query = "operation receipt scoped context";
                     let pairs = [pair_a.clone(), pair_b.clone(), pair_c.clone()];
@@ -10776,6 +10994,579 @@ fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
                             );
                         }
 
+                        // ===== ADR-0054 write phase: the SAME process, built with NO default
+                        // (tenant, workspace) pair (`application()` hands it a ProcessFamily
+                        // only — W0 holds by construction). Seeded only now so that no extra
+                        // memory / binding touches the read assertions above.
+                        let user_u = handle.user_id;
+                        let (writes_a, writes_b, writes_c, private) =
+                            tokio::task::block_in_place(|| {
+                                let task_t1 = seed_task(&mut handle, "card29 governance task");
+                                let task_t2 =
+                                    seed_task(&mut pair_c_handle, "card29 governance task");
+                                let writes_a =
+                                    seed_pair_writes(&mut handle, pair_a.workspace_id, task_t1);
+                                let writes_b =
+                                    seed_pair_writes(&mut handle, pair_b.workspace_id, task_t1);
+                                let writes_c = seed_pair_writes(
+                                    &mut pair_c_handle,
+                                    pair_c.workspace_id,
+                                    task_t2,
+                                );
+                                // U's USER_PRIVATE memory: readable from W_A and W_B alike.
+                                let private = handle.seed_workspace_visible_context_record();
+                                set_record_user_visibility(&mut handle, &private, user_u);
+                                (writes_a, writes_b, writes_c, private.memory_id)
+                            });
+                        let ledger_keys = [
+                            (writes_a.tenant_id, pair_a.workspace_id),
+                            (writes_b.tenant_id, pair_b.workspace_id),
+                            (writes_c.tenant_id, pair_c.workspace_id),
+                        ];
+                        let ledgers = |handle: &mut Handle| {
+                            ledger_keys.map(|(tenant, workspace)| {
+                                stream_log_rows(handle, tenant, workspace)
+                            })
+                        };
+                        let mut rid: u64 = 5_000;
+
+                        // W1–W4: pin, supersede, bind (REFERENCE_ONLY) and annotate_affect all
+                        // EXECUTE for A, B (same tenant + user as A) and C (other tenant); every
+                        // ticket lands on the pair's own (tenant, 'workspace', workspace) stream
+                        // and the other two pairs' ledgers do not move.
+                        for (index, (pair, writes)) in
+                            [(&pair_a, &writes_a), (&pair_b, &writes_b), (&pair_c, &writes_c)]
+                                .into_iter()
+                                .enumerate()
+                        {
+                            let label = pair.label;
+                            let before = tokio::task::block_in_place(|| ledgers(&mut handle));
+                            rid += 10;
+                            let token =
+                                mint_binding_token(address, &pair.bearer, rid, "pin", pair.memory_id)
+                                    .await;
+                            let (status, pinned) = binding_call(
+                                address,
+                                &pair.bearer,
+                                rid + 1,
+                                "pin",
+                                pair.memory_id,
+                                Some(&token),
+                            )
+                            .await;
+                            assert_executed(&format!("{label} pin"), status, &pinned);
+                            tokio::task::block_in_place(|| {
+                                let scope: Uuid = handle
+                                    .admin
+                                    .query_one(
+                                        "SELECT scope_id FROM private.context_bindings \
+                                         WHERE tenant_id=$1 AND memory_id=$2 AND mode='PINNED' \
+                                           AND revoked_at IS NULL",
+                                        &[&writes.tenant_id, &pair.memory_id],
+                                    )
+                                    .expect("owner reads the PINNED row")
+                                    .get(0);
+                                assert_eq!(scope, pair.workspace_id, "{label} PINNED scope");
+                                assert_eq!(
+                                    confirm_token_binding(&mut handle, &token),
+                                    Some((true, Some(pair.workspace_id))),
+                                    "{label}: the token binds and consumed in its own workspace"
+                                );
+                            });
+                            let token = mint_supersede_token(
+                                address,
+                                &pair.bearer,
+                                rid + 2,
+                                writes.supersede_target,
+                                writes.supersede_successor,
+                            )
+                            .await;
+                            let (status, superseded) = supersede_call(
+                                address,
+                                &pair.bearer,
+                                rid + 3,
+                                writes.supersede_target,
+                                writes.supersede_successor,
+                                Some(&token),
+                            )
+                            .await;
+                            assert_executed(&format!("{label} supersede"), status, &superseded);
+                            bind_through_the_gate(
+                                address,
+                                &pair.bearer,
+                                rid + 4,
+                                writes.bindable,
+                                writes.task,
+                                REFERENCE,
+                            )
+                            .await;
+                            let (status, annotated) = annotate_in(
+                                address,
+                                &pair.bearer,
+                                rid + 6,
+                                pair.workspace_id,
+                                pair.memory_id,
+                            )
+                            .await;
+                            assert_executed(&format!("{label} annotate_affect"), status, &annotated);
+                            let after = tokio::task::block_in_place(|| ledgers(&mut handle));
+                            for other in 0..3 {
+                                if other == index {
+                                    assert!(
+                                        after[other] >= before[other] + 2,
+                                        "{label}: supersede + annotate tickets on its own stream \
+                                         ({before:?} -> {after:?})"
+                                    );
+                                } else {
+                                    assert_eq!(
+                                        after[other], before[other],
+                                        "{label}: no ticket on another pair's stream"
+                                    );
+                                }
+                            }
+                        }
+
+                        // Card 29 speed record (D-J, n=9, uncontended): the pin second leg and
+                        // annotate_affect of pair A on the per-request write scope.
+                        let mut pin_leg = Vec::new();
+                        let mut annotate = Vec::new();
+                        for _ in 0..9 {
+                            rid += 3;
+                            let token =
+                                mint_binding_token(address, &pair_a.bearer, rid, "pin", pair_a.memory_id)
+                                    .await;
+                            let started = Instant::now();
+                            let (status, again) = binding_call(
+                                address,
+                                &pair_a.bearer,
+                                rid + 1,
+                                "pin",
+                                pair_a.memory_id,
+                                Some(&token),
+                            )
+                            .await;
+                            pin_leg.push(started.elapsed());
+                            assert_executed("A re-pin", status, &again);
+                            let started = Instant::now();
+                            let (status, annotated) = annotate_in(
+                                address,
+                                &pair_a.bearer,
+                                rid + 2,
+                                pair_a.workspace_id,
+                                pair_a.memory_id,
+                            )
+                            .await;
+                            annotate.push(started.elapsed());
+                            assert_executed("A annotate", status, &annotated);
+                        }
+                        eprintln!(
+                            "card29 p50 pin second leg: {:?} (n={}); annotate_affect: {:?} (n={})",
+                            percentile_p50(&mut pin_leg),
+                            pin_leg.len(),
+                            percentile_p50(&mut annotate),
+                            annotate.len()
+                        );
+
+                        // W5: cross-workspace replay. U mints `pin` on its USER_PRIVATE memory
+                        // with bearer A (W_A); bearer B (W_B, same user) presents it ⇒ CONFLICT,
+                        // the row stays unconsumed and bound to W_A; bearer A then executes it.
+                        rid += 10;
+                        let token =
+                            mint_binding_token(address, &pair_a.bearer, rid, "pin", private).await;
+                        let (status, replay) = binding_call(
+                            address,
+                            &pair_b.bearer,
+                            rid + 1,
+                            "pin",
+                            private,
+                            Some(&token),
+                        )
+                        .await;
+                        assert_eq!(status, 200, "cross-workspace replay: {replay}");
+                        assert_tool_error(&replay, "CONFLICT");
+                        tokio::task::block_in_place(|| {
+                            assert_eq!(
+                                confirm_token_binding(&mut handle, &token),
+                                Some((false, Some(pair_a.workspace_id))),
+                                "a W_B presentation must not consume a W_A token"
+                            );
+                        });
+                        let (status, own) = binding_call(
+                            address,
+                            &pair_a.bearer,
+                            rid + 2,
+                            "pin",
+                            private,
+                            Some(&token),
+                        )
+                        .await;
+                        assert_executed("W5 own-workspace execute", status, &own);
+
+                        // W6: cross-tenant. Bearer C presents a token A minted ⇒ CONFLICT (the
+                        // row is invisible to C's tenant); A naming W_C or W_B ⇒ 403 FORBIDDEN.
+                        let token = mint_binding_token(
+                            address,
+                            &pair_a.bearer,
+                            rid + 3,
+                            "pin",
+                            writes_a.supersede_successor,
+                        )
+                        .await;
+                        let (status, foreign) = binding_call(
+                            address,
+                            &pair_c.bearer,
+                            rid + 4,
+                            "pin",
+                            writes_a.supersede_successor,
+                            Some(&token),
+                        )
+                        .await;
+                        assert_eq!(status, 200, "cross-tenant replay: {foreign}");
+                        assert_tool_error(&foreign, "CONFLICT");
+                        tokio::task::block_in_place(|| {
+                            assert_eq!(
+                                confirm_token_binding(&mut handle, &token),
+                                Some((false, Some(pair_a.workspace_id)))
+                            );
+                        });
+                        for (offset, other) in [(5, &pair_c), (6, &pair_b)] {
+                            let (status, response) = annotate_in(
+                                address,
+                                &pair_a.bearer,
+                                rid + offset,
+                                other.workspace_id,
+                                pair_a.memory_id,
+                            )
+                            .await;
+                            assert_eq!(status, 403, "A annotates in {}: {response}", other.label);
+                            assert_eq!(
+                                response["error"]["data"]["code"], "FORBIDDEN",
+                                "A annotates in {}: {response}",
+                                other.label
+                            );
+                        }
+
+                        // W6b: candidate scope (ADR-0054 D-B). A WORKSPACE_SHARED candidate of
+                        // W_A: bearer B (same tenant + user, routed to W_B) rejects and confirms
+                        // it by id (+ sha) ⇒ NOT_FOUND, nothing written, tokens unconsumed; bearer
+                        // A then rejects it (the refusal is the scope, not the candidate).
+                        rid += 10;
+                        let candidate_body =
+                            json!({"title":"card29 W_A candidate","key_claim":"scoped to W_A"});
+                        let (candidate, candidate_sha) = tokio::task::block_in_place(|| {
+                            with_workspace(&mut handle, pair_a.workspace_id, |handle| {
+                                let source = handle.seed_workspace_visible_context_record();
+                                seed_pending_candidate(
+                                    handle,
+                                    source.evidence_id,
+                                    "UserPreference",
+                                    "PREFERENCE",
+                                    &candidate_body,
+                                )
+                            })
+                        });
+                        let reject_token = mint_candidate_token(
+                            "memory.reject",
+                            candidate,
+                            reject_call(address, &pair_b.bearer, rid, candidate, None).await,
+                        );
+                        let (status, response) = reject_call(
+                            address,
+                            &pair_b.bearer,
+                            rid + 1,
+                            candidate,
+                            Some(&reject_token),
+                        )
+                        .await;
+                        assert_eq!(status, 200, "W_B rejects a W_A candidate: {response}");
+                        assert_tool_error(&response, "NOT_FOUND");
+                        let confirm_token = mint_candidate_token(
+                            "memory.confirm",
+                            candidate,
+                            confirm_call(
+                                address,
+                                &pair_b.bearer,
+                                rid + 2,
+                                candidate,
+                                &candidate_sha,
+                                None,
+                            )
+                            .await,
+                        );
+                        let (status, response) = confirm_call(
+                            address,
+                            &pair_b.bearer,
+                            rid + 3,
+                            candidate,
+                            &candidate_sha,
+                            Some(&confirm_token),
+                        )
+                        .await;
+                        assert_eq!(status, 200, "W_B confirms a W_A candidate: {response}");
+                        assert_tool_error(&response, "NOT_FOUND");
+                        tokio::task::block_in_place(|| {
+                            let state: String = handle
+                                .admin
+                                .query_one(
+                                    "SELECT state FROM private.distill_candidates \
+                                     WHERE candidate_id=$1",
+                                    &[&candidate],
+                                )
+                                .expect("owner reads the candidate")
+                                .get(0);
+                            assert_eq!(state, "PENDING", "an out-of-scope write changed nothing");
+                            for token in [&reject_token, &confirm_token] {
+                                assert_eq!(
+                                    confirm_token_binding(&mut handle, token),
+                                    Some((false, Some(pair_b.workspace_id))),
+                                    "an out-of-scope candidate consumes no token"
+                                );
+                            }
+                        });
+                        let own_token = mint_candidate_token(
+                            "memory.reject",
+                            candidate,
+                            reject_call(address, &pair_a.bearer, rid + 4, candidate, None).await,
+                        );
+                        let (status, response) = reject_call(
+                            address,
+                            &pair_a.bearer,
+                            rid + 5,
+                            candidate,
+                            Some(&own_token),
+                        )
+                        .await;
+                        assert_executed("W6b own-workspace reject", status, &response);
+
+                        // W7: U's unbound PAT. A confirm-gated op (no workspace in its schema)
+                        // has no route ⇒ DEPENDENCY_UNAVAILABLE at the mint, no token row; and
+                        // one idempotency_key in W_A and in W_B is two receipts, never a replay
+                        // across workspaces (§34.0.1 key carries scope_id).
+                        rid += 10;
+                        let tokens_before = tokio::task::block_in_place(|| {
+                            confirm_token_rows(&mut handle, writes_a.tenant_id)
+                        });
+                        let (status, refused) =
+                            binding_call(address, &unbound.bearer, rid, "pin", pair_a.memory_id, None)
+                                .await;
+                        assert_eq!(status, 200, "unbound pin mint: {refused}");
+                        assert_tool_error(&refused, "DEPENDENCY_UNAVAILABLE");
+                        tokio::task::block_in_place(|| {
+                            assert_eq!(
+                                confirm_token_rows(&mut handle, writes_a.tenant_id),
+                                tokens_before,
+                                "an unroutable mint writes no token row"
+                            );
+                        });
+                        let key = format!("card29-cross-workspace-{}", Uuid::now_v7());
+                        let mut evidence = BTreeSet::new();
+                        for workspace in [pair_a.workspace_id, pair_b.workspace_id] {
+                            let arguments = json!({"operation":"put",
+                                "content":format!("card29 receipt in {workspace}"),
+                                "idempotency_key":key,"workspace_id":workspace});
+                            let (status, first) =
+                                tool_call(address, "remember", &unbound.bearer, arguments.clone())
+                                    .await;
+                            assert_executed("W7 put", status, &first);
+                            let (status, replay) =
+                                tool_call(address, "remember", &unbound.bearer, arguments).await;
+                            assert_executed("W7 replay", status, &replay);
+                            let (first, replay) = (
+                                &first["result"]["structuredContent"],
+                                &replay["result"]["structuredContent"],
+                            );
+                            assert_eq!(first["replayed"], false, "{first}");
+                            assert_eq!(replay["replayed"], true, "{replay}");
+                            assert_eq!(first["evidence_id"], replay["evidence_id"]);
+                            evidence.insert(first["evidence_id"].to_string());
+                        }
+                        assert_eq!(evidence.len(), 2, "two workspaces, two commits: {evidence:?}");
+                        tokio::task::block_in_place(|| {
+                            let row = handle
+                                .admin
+                                .query_one(
+                                    "SELECT count(*), count(DISTINCT scope_id) \
+                                     FROM control.operation_receipts \
+                                     WHERE tenant_id=$1 AND principal_id=$2 AND idempotency_key=$3",
+                                    &[&writes_a.tenant_id, &unbound.api_key_id, &key],
+                                )
+                                .expect("owner counts receipts");
+                            assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (2, 2));
+                        });
+
+                        // W8: pair D (membership, no ledger key): annotate and a pin second leg
+                        // ⇒ DEPENDENCY_UNAVAILABLE, and no write initialised D's ledger key.
+                        rid += 10;
+                        let (status, response) = annotate_in(
+                            address,
+                            &pair_d.bearer,
+                            rid,
+                            pair_d.workspace_id,
+                            pair_d.memory_id,
+                        )
+                        .await;
+                        assert_eq!(status, 200, "pair D annotate: {response}");
+                        assert_tool_error(&response, "DEPENDENCY_UNAVAILABLE");
+                        let token =
+                            mint_binding_token(address, &pair_d.bearer, rid + 1, "pin", pair_d.memory_id)
+                                .await;
+                        let (status, response) = binding_call(
+                            address,
+                            &pair_d.bearer,
+                            rid + 2,
+                            "pin",
+                            pair_d.memory_id,
+                            Some(&token),
+                        )
+                        .await;
+                        assert_eq!(status, 200, "pair D pin: {response}");
+                        assert_tool_error(&response, "DEPENDENCY_UNAVAILABLE");
+                        tokio::task::block_in_place(|| {
+                            assert_eq!(
+                                checkpoint_rows(&mut handle, writes_a.tenant_id, pair_d.workspace_id),
+                                0,
+                                "a governance write never initialises an unprovisioned pair"
+                            );
+                        });
+
+                        // W9: pair F (onboarded, PROVISIONING, never activated): the ticket
+                        // reaches the ADR-0053 write gate ⇒ CONFLICT, nothing on F's ledger.
+                        let (status, response) =
+                            annotate_in(address, &unbound.bearer, rid + 3, f_workspace, private)
+                                .await;
+                        assert_eq!(status, 200, "pair F annotate: {response}");
+                        assert_tool_error(&response, "CONFLICT");
+                        tokio::task::block_in_place(|| {
+                            assert_eq!(
+                                stream_log_rows(&mut handle, writes_a.tenant_id, f_workspace),
+                                0
+                            );
+                            assert_eq!(
+                                checkpoint_rows(&mut handle, writes_a.tenant_id, f_workspace),
+                                1
+                            );
+                        });
+
+                        // W10: the in-transaction recheck, authentication bypassed. The owner
+                        // suspends U's W_B workspace membership; direct adapter writes with the
+                        // B-narrowed scope ⇒ Forbidden; over HTTP bearer B ⇒ 403, bearer A still
+                        // writes (no over-refusal).
+                        tokio::task::block_in_place(|| {
+                            let mut txn = handle.admin.transaction().expect("owner suspend txn");
+                            txn.execute(
+                                "SELECT set_config('humaux.tenant_id', $1, true), \
+                                        set_config('humaux.user_id', $2, true)",
+                                &[&writes_b.tenant_id.to_string(), &user_u.to_string()],
+                            )
+                            .expect("owner installs the admin GUCs");
+                            txn.execute(
+                                "SELECT control.set_workspace_membership($1,$2,$3,'MEMBER','SUSPENDED')",
+                                &[&writes_b.tenant_id, &pair_b.workspace_id, &user_u],
+                            )
+                            .expect("owner suspends U in W_B");
+                            txn.commit().expect("commit W_B suspension");
+                        });
+                        let scope_b = direct_write_scope(
+                            writes_b.tenant_id,
+                            pair_b.api_key_id,
+                            user_u,
+                            pair_b.workspace_id,
+                        );
+                        assert_eq!(
+                            humaux_adapters::subject_repo::register_subject(
+                                &handle.runtime,
+                                &scope_b,
+                                humaux_domain::subject::SubjectKind::Person,
+                                "card29 suspended writer",
+                                &[],
+                            )
+                            .await
+                            .map(|_| ()),
+                            Err(ErrorCode::Forbidden),
+                            "in-tx recheck: suspended workspace membership"
+                        );
+                        assert_eq!(
+                            humaux_adapters::confirm_token_repo::mint_with_audit(
+                                &handle.runtime,
+                                &scope_b,
+                                DestructiveOp::MemoryPin,
+                                pair_b.memory_id,
+                                None,
+                                Duration::from_secs(60),
+                                Sha256::digest(Uuid::now_v7().as_bytes()).into(),
+                                &direct_mint_audit(&scope_b, DestructiveOp::MemoryPin),
+                            )
+                            .await
+                            .map(|_| ()),
+                            Err(ErrorCode::Forbidden),
+                            "in-tx recheck on the mint"
+                        );
+                        let (status, response) = annotate_in(
+                            address,
+                            &pair_b.bearer,
+                            rid + 4,
+                            pair_b.workspace_id,
+                            pair_b.memory_id,
+                        )
+                        .await;
+                        assert_eq!(status, 403, "suspended W_B write: {response}");
+                        let (status, response) = annotate_in(
+                            address,
+                            &pair_a.bearer,
+                            rid + 5,
+                            pair_a.workspace_id,
+                            pair_a.memory_id,
+                        )
+                        .await;
+                        assert_executed("A after W_B suspension", status, &response);
+
+                        // W11: the owner advances U's security epoch; a direct adapter write
+                        // with the A-narrowed scope ⇒ Unauthorized; bearer A ⇒ 401 on the next
+                        // request; the other tenant's bearer C is untouched.
+                        tokio::task::block_in_place(|| {
+                            handle
+                                .admin
+                                .execute("SELECT control.bump_user_security_epoch($1)", &[&user_u])
+                                .expect("owner bumps U's epoch");
+                        });
+                        let scope_a = direct_write_scope(
+                            writes_a.tenant_id,
+                            pair_a.api_key_id,
+                            user_u,
+                            pair_a.workspace_id,
+                        );
+                        assert_eq!(
+                            humaux_adapters::subject_repo::register_subject(
+                                &handle.runtime,
+                                &scope_a,
+                                humaux_domain::subject::SubjectKind::Person,
+                                "card29 stale epoch writer",
+                                &[],
+                            )
+                            .await
+                            .map(|_| ()),
+                            Err(ErrorCode::Unauthorized),
+                            "in-tx recheck: advanced user epoch"
+                        );
+                        let (status, response) = annotate_in(
+                            address,
+                            &pair_a.bearer,
+                            rid + 6,
+                            pair_a.workspace_id,
+                            pair_a.memory_id,
+                        )
+                        .await;
+                        assert_eq!(status, 401, "stale-epoch write: {response}");
+                        let (status, response) = annotate_in(
+                            address,
+                            &pair_c.bearer,
+                            rid + 7,
+                            pair_c.workspace_id,
+                            pair_c.memory_id,
+                        )
+                        .await;
+                        assert_executed("C after U's epoch bump", status, &response);
+
                         stop_server(server).await.expect("stop multi-pair server");
                         delete_semantic_collection(&transport, &registry, &collection).await;
                     });
@@ -10961,7 +11752,8 @@ fn direct_receipt_request(
     }
 }
 
-/// Card 11 acceptance gate (ADR-0032): ONE gateway process (bootstrap write pair = A).
+/// Card 11 acceptance gate (ADR-0032): ONE gateway process (no default write pair since
+/// ADR-0054; A is simply the fixture handle's pair).
 /// D-B — two `remember.put` calls in the same session land `USER_PRIVATE` and
 /// `WORKSPACE_SHARED` rows (per-call `data_class` / `event_kind` too, defaults when absent); a
 /// third asking for `TENANT_SHARED` as a plain member is `INVALID_INPUT` with nothing written
@@ -11909,7 +12701,7 @@ fn native_mcp_workspace_membership_scope() {
             let workspace_a = handle.workspace_id;
             let workspace_b = handle.seed_workspace();
             // Both pairs are provisioned (serving projection, ADR-0031 D-A); the
-            // bootstrap pair A is provisioned by `application()` itself.
+            // fixture handle's pair A is provisioned by `application()` itself.
             provision_stream_pair(&handle, workspace_b);
             // The multi-workspace human: an ACTIVE member of the tenant (§6.3), never
             // the fixture owner (its credentials keep the single-workspace shape).

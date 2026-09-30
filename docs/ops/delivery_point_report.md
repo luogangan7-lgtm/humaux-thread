@@ -680,6 +680,48 @@ not, and it withdraws the "ready for production" reading of §5.**
   email is stored unverified (§74 is post-go-live); the BYOK distill lane is not part of onboarding
   (card 52).
 
+### 6.14 Closed by card 29 (ADR-0054)
+
+- **Audit C5 ("governance ops only work for the bootstrap (tenant, workspace)") is closed.** The 14
+  governance / subject / affect ops — `memory.supersede/restore/correct/confirm/reject/archive/
+  unarchive/pin/unpin/bind/unbind` (confirm-gated) and `subject_register/subject_link_key/
+  annotate_affect` — derive their write stream per request exactly like the reads (ADR-0031 D-A):
+  the credential's tenant + the requested or bound workspace, narrowed by live membership, admitted
+  only when the pair's ledger key was provisioned. The bootstrap comparison is deleted and the
+  gateway holds no (tenant, workspace) at all; `HUMAUX_GATEWAY_REMEMBER_TENANT_ID / _WORKSPACE_ID`
+  are optional and ignored (runbook §4). ADR-0031 D-B is retired.
+- **In-transaction recheck.** Every one of those write transactions (both confirm legs) calls the
+  owner definer `control.assert_write_scope(api_key_id, workspace_id)` (migration 0188, EXECUTE
+  `role_gateway` only): credential unrevoked, tenant and user ACTIVE at their snapshotted epochs,
+  tenant and workspace membership ACTIVE and held `FOR SHARE` — a suspend, removal or epoch bump
+  that commits between authentication and the write's COMMIT now stops the write (`FORBIDDEN` /
+  `UNAUTHORIZED`). Ceiling: the tenants / api_keys rows are rechecked but not locked.
+- **Confirm tokens bind the workspace** (migration 0187, expand only: nullable
+  `control.confirm_tokens.workspace_id` + composite FK to `control.workspaces`). A token minted in W1
+  and presented in W2 of the same tenant answers `CONFLICT` and stays usable in W1; an unbound PAT has
+  no route for a confirm-gated op (`DEPENDENCY_UNAVAILABLE`, no token row).
+- **Candidates are scoped.** `memory.confirm` / `memory.reject` lock a distill candidate only inside
+  the narrowed write scope (TENANT_SHARED, WORKSPACE_SHARED of the routed workspace, or the caller's
+  USER_PRIVATE — the `memory.enumerate {candidates:true}` predicate); another workspace's candidate
+  is `NOT_FOUND` with nothing written (ADR-0054 D-B′, three-pair W6b).
+- **Deploy note (§46.1 expand).** Order: migrate 0187/0188, then roll the gateway binary; the old
+  binary runs unchanged on the expanded schema (NULL `workspace_id`, nothing CHECKs it). Rollback:
+  binary first, then drop the FK and the column. NULL rows (pre-0187, or minted by an old binary
+  during the rollout) can never be consumed by the new binary — a client in the middle of a two-step
+  call sees one `CONFLICT` and re-mints (TTL 300 s). The CONTRACT migration
+  (`CHECK (workspace_id IS NOT NULL) NOT VALID`, then `VALIDATE` once `control.sweep_confirm_tokens`
+  has removed every NULL row) is a follow-up after the observation window; its rollback drops the
+  CHECK before the binary.
+- **Acceptance:** `native_mcp_one_process_serves_three_stream_pairs_per_request` (one in-process
+  gateway without a default pair: A/B same tenant + user, C other tenant; W1–W11 + W6b) and the rehearsal's
+  governance steps for both seeded tenants (`governance_tenants_exercised=2`,
+  `gateway_boots_without_a_default_write_pair=0`, `cross_workspace_token_replay_is_conflict=CONFLICT`).
+  Rehearsal 2026-09-29: `REHEARSAL VERDICT: 74 passed, 0 failed` (the governance legs ran for both
+  seeded tenants). Measurements: ADR-0054 §Measurements.
+- **Open:** `memory.confirm` on a PROVISIONING workspace answers `INTERNAL` instead of `CONFLICT`
+  (`distill_repo`'s error map lacks the ADR-0053 `55000` arm, outside this card's files; the gate
+  itself holds — nothing is written); `xtask e2e-onboard` still passes the two ignored keys.
+
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 
 The user approved the whole list on 2026-09-26 ("需要清理删除的进行清理删除，其他的你看着办"). Every

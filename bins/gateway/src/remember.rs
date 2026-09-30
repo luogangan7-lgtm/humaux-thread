@@ -1,11 +1,11 @@
 //! `gateway::remember` — Guarded gateway entry point for one authenticated `remember` operation.
-//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, serde_json, sqlx, time,
-//!   uuid]; services=[]; env=[]; modules=[adapters::affect_repo, adapters::postgres, adapters::remember,
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, serde_json, time,
+//!   uuid]; services=[]; env=[]; modules=[adapters::affect_repo, adapters::remember,
 //!   domain::affect, domain::dataclass, domain::error, domain::evidence, domain::identity, domain::ids,
 //!   domain::subject, projection::stream]
 //! Called-by: [gateway::bootstrap, gateway::context, gateway::mcp_application, tests]
 //! Invariants: [the protocol layer decodes wire input and the request guard produces the AuthorizationScope; this module never deserializes either boundary itself]
-//! Spec: Baseline §11.2.1; §15.5; §78.2; ADR-0020; ADR-0032
+//! Spec: Baseline §11.2.1; §15.5; §78.2; ADR-0020; ADR-0032; ADR-0054
 //!
 //! The protocol layer decodes wire input and the request guard produces the
 //! [`AuthorizationScope`]. This module does not deserialize either of them.
@@ -13,8 +13,7 @@
 use std::time::Duration;
 
 use humaux_adapters::affect_repo::AffectInput;
-use humaux_adapters::postgres::RuntimeDbPool;
-use humaux_adapters::remember::{self, RememberAccepted, RememberCommand};
+use humaux_adapters::remember::RememberCommand;
 use humaux_domain::affect::MoodHalfLife;
 use humaux_domain::dataclass::DataClass;
 use humaux_domain::error::ErrorCode;
@@ -135,20 +134,56 @@ pub struct PutClassification {
     pub event_kind: RememberEventKind,
 }
 
+/// ADR-0054 D-D: the process-wide stream family — everything of a [`StreamKey`] except the
+/// `(tenant, workspace)` pair, which every request supplies itself (principal tenant + the
+/// membership-narrowed workspace, `ContextBootstrap::request_stream`). Nothing in the process can
+/// name a tenant or a workspace, so no route can compare a request against a "default pair".
+/// Only workspace-scoped families are enabled; another scope needs a separately reviewed op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessFamily {
+    pub(crate) scope_kind: String,
+    pub(crate) domain: String,
+    pub(crate) projection_kind: String,
+    pub(crate) projection_version: String,
+}
+
+impl ProcessFamily {
+    /// Validated constructor: every part non-empty, `scope_kind == "workspace"`.
+    pub fn new(
+        scope_kind: impl Into<String>,
+        domain: impl Into<String>,
+        projection_kind: impl Into<String>,
+        projection_version: impl Into<String>,
+    ) -> Result<Self, ErrorCode> {
+        let family = Self {
+            scope_kind: scope_kind.into(),
+            domain: domain.into(),
+            projection_kind: projection_kind.into(),
+            projection_version: projection_version.into(),
+        };
+        if family.scope_kind != "workspace"
+            || family.domain.is_empty()
+            || family.projection_kind.is_empty()
+            || family.projection_version.is_empty()
+        {
+            return Err(ErrorCode::InvalidInput);
+        }
+        Ok(family)
+    }
+}
+
 /// Bootstrap-owned immutable configuration for the gateway write route.
 ///
-/// Since ADR-0032 (card 11) the `stream` here is the process family plus the *default* pair:
-/// `remember.put` derives its own `StreamKey` per request (principal tenant + requested
-/// workspace + this family's `(scope_kind, domain, projection_kind, projection_version)`,
-/// the same derivation the read routes use) and falls back to this pair's workspace only when
-/// the call names none; the confirm-gated governance writers still compare against it. The
-/// reasoning domain and token lifetime are never supplied by a tool argument; `data_class`
-/// and `visibility_class` are the per-call defaults (a `TENANT_SHARED` default is refused —
-/// that class is per-call and membership-gated only). Only workspace-scoped stream families
-/// are enabled here; another scope requires a separately reviewed operation.
+/// Since ADR-0032 (card 11) `remember.put` derives its own `StreamKey` per request (principal
+/// tenant + the guard-routed workspace + this [`ProcessFamily`], the same derivation the read
+/// routes use); since ADR-0054 there is no process default pair at all — a put without
+/// `workspace_id` lands on the credential's bound workspace. The reasoning domain and token
+/// lifetime are never supplied by a tool argument; `data_class` and `visibility_class` are the
+/// per-call defaults (a `TENANT_SHARED` default is refused — that class is per-call and
+/// membership-gated only).
 #[derive(Debug, Clone)]
 pub struct RememberPolicy {
-    stream: StreamKey,
+    family: ProcessFamily,
     reasoning_domain_id: Uuid,
     consistency_token_ttl: time::Duration,
     data_class: DataClass,
@@ -156,12 +191,8 @@ pub struct RememberPolicy {
 }
 
 impl RememberPolicy {
-    pub(crate) fn stream_key(&self) -> &StreamKey {
-        &self.stream
-    }
-
-    pub(crate) fn workspace_id(&self) -> WorkspaceId {
-        WorkspaceId(self.stream.scope_id)
+    pub(crate) fn family(&self) -> &ProcessFamily {
+        &self.family
     }
 
     /// The per-call `visibility_class` default (`HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS`).
@@ -180,28 +211,22 @@ impl RememberPolicy {
         Duration::try_from(self.consistency_token_ttl).unwrap_or(Duration::from_secs(0))
     }
 
-    /// Builds a policy after bootstrap has selected its trusted stream and expiry.
+    /// Builds a policy after bootstrap has selected its trusted family and expiry.
     pub fn new(
-        stream: StreamKey,
+        family: ProcessFamily,
         reasoning_domain_id: Uuid,
         consistency_token_ttl: Duration,
         data_class: DataClass,
         visibility_class: VisibilityClass,
     ) -> Result<Self, ErrorCode> {
-        if stream.tenant_id.0.is_nil()
-            || stream.scope_kind != "workspace"
-            || stream.scope_id.is_nil()
-            || stream.domain.is_empty()
-            || stream.projection_kind.is_empty()
-            || stream.projection_version.is_empty()
-            || reasoning_domain_id.is_nil()
+        if reasoning_domain_id.is_nil()
             || consistency_token_ttl.is_zero()
             || visibility_class == VisibilityClass::TenantShared
         {
             return Err(ErrorCode::InvalidInput);
         }
         Ok(Self {
-            stream,
+            family,
             reasoning_domain_id,
             consistency_token_ttl: consistency_token_ttl
                 .try_into()
@@ -236,41 +261,6 @@ impl PreparedEvidencePayload {
     pub fn raw_json(&self) -> &[u8] {
         &self.raw_json
     }
-}
-
-/// Accepts one already-guarded event through the real Evidence/outbox transaction.
-///
-/// `authorization` must come from gateway authentication and authorization, not a
-/// tool request. The raw payload is neither trimmed, normalized, nor reconstructed
-/// from its parsed JSON value before it is hashed.
-pub async fn put(
-    pool: &RuntimeDbPool,
-    authorization: &AuthorizationScope,
-    policy: &RememberPolicy,
-    content: PreparedEvidencePayload,
-    event_kind: RememberEventKind,
-    occurred_at: Option<OffsetDateTime>,
-    now: OffsetDateTime,
-) -> Result<RememberAccepted, ErrorCode> {
-    let cmd = command(
-        authorization,
-        policy,
-        policy.stream_key(),
-        content,
-        PutClassification {
-            visibility_class: policy.visibility_class,
-            data_class: policy.data_class,
-            event_kind,
-        },
-        occurred_at,
-        now,
-        SubjectDeclaration::default(),
-        Vec::new(),
-        None,
-    )?;
-    remember::remember(pool, cmd)
-        .await
-        .map_err(map_remember_error)
 }
 
 /// Builds the guarded [`RememberCommand`] for one put.
@@ -348,26 +338,6 @@ pub(crate) fn command(
     })
 }
 
-fn map_remember_error(error: remember::RememberError) -> ErrorCode {
-    match error {
-        remember::RememberError::ConsistencyTokenExpiryNotFuture => ErrorCode::InvalidInput,
-        remember::RememberError::BatchExhausted => ErrorCode::Conflict,
-        remember::RememberError::Subject(code) | remember::RememberError::Affect(code) => code,
-        remember::RememberError::ReasoningDomainUnresolved => ErrorCode::DependencyUnavailable,
-        remember::RememberError::Db(error) => match error {
-            sqlx::Error::RowNotFound => ErrorCode::NotFound,
-            sqlx::Error::Database(ref database) => match database.code().as_deref() {
-                Some("23503") => ErrorCode::TenantBoundary,
-                Some("42501") => ErrorCode::Forbidden,
-                Some("23505") | Some("40001") | Some("40P01") => ErrorCode::Conflict,
-                Some("22023") | Some("22P02") | Some("23514") => ErrorCode::InvalidInput,
-                _ => ErrorCode::Internal,
-            },
-            _ => ErrorCode::DependencyUnavailable,
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,20 +357,21 @@ mod tests {
         )
     }
 
-    fn policy(
-        tenant: TenantId,
-        workspace: WorkspaceId,
-        visibility_class: VisibilityClass,
-    ) -> RememberPolicy {
+    /// ADR-0054 D-D: the policy holds only the family; a test names its pair explicitly.
+    fn stream(tenant: TenantId, workspace: WorkspaceId) -> StreamKey {
+        StreamKey::new(
+            tenant,
+            "workspace",
+            workspace.0,
+            "reasoning",
+            "memory",
+            "v1",
+        )
+    }
+
+    fn policy(visibility_class: VisibilityClass) -> RememberPolicy {
         RememberPolicy::new(
-            StreamKey::new(
-                tenant,
-                "workspace",
-                workspace.0,
-                "reasoning",
-                "memory",
-                "v1",
-            ),
+            ProcessFamily::new("workspace", "reasoning", "memory", "v1").unwrap(),
             Uuid::now_v7(),
             Duration::from_secs(60),
             DataClass::Private,
@@ -428,11 +399,11 @@ mod tests {
         assert!(matches!(
             command(
                 &authorization(tenant, None, workspace),
-                &policy(tenant, workspace, VisibilityClass::UserPrivate),
-                policy(tenant, workspace, VisibilityClass::UserPrivate).stream_key(),
+                &policy(VisibilityClass::UserPrivate),
+                &stream(tenant, workspace),
                 payload(Value::Null),
                 classify(
-                    &policy(tenant, workspace, VisibilityClass::UserPrivate),
+                    &policy(VisibilityClass::UserPrivate),
                     RememberEventKind::ManualNote
                 ),
                 None,
@@ -452,11 +423,11 @@ mod tests {
         assert!(matches!(
             command(
                 &authorization(tenant, Some(UserId::new()), granted),
-                &policy(tenant, granted, VisibilityClass::UserPrivate),
-                policy(tenant, WorkspaceId::new(), VisibilityClass::UserPrivate).stream_key(),
+                &policy(VisibilityClass::UserPrivate),
+                &stream(tenant, WorkspaceId::new()),
                 payload(Value::Null),
                 classify(
-                    &policy(tenant, granted, VisibilityClass::UserPrivate),
+                    &policy(VisibilityClass::UserPrivate),
                     RememberEventKind::ManualNote
                 ),
                 None,
@@ -474,11 +445,11 @@ mod tests {
         let tenant = TenantId::new();
         let workspace = WorkspaceId::new();
         let user = UserId::new();
-        let policy = policy(tenant, workspace, VisibilityClass::UserPrivate);
+        let policy = policy(VisibilityClass::UserPrivate);
         let cmd = command(
             &authorization(tenant, Some(user), workspace),
             &policy,
-            policy.stream_key(),
+            &stream(tenant, workspace),
             payload(Value::Null),
             classify(&policy, RememberEventKind::UserMessage),
             None,
@@ -502,11 +473,11 @@ mod tests {
         let payload = PreparedEvidencePayload::new(raw.clone(), value.clone()).unwrap();
         let tenant = TenantId::new();
         let workspace = WorkspaceId::new();
-        let policy = policy(tenant, workspace, VisibilityClass::UserPrivate);
+        let policy = policy(VisibilityClass::UserPrivate);
         let cmd = command(
             &authorization(tenant, Some(UserId::new()), workspace),
             &policy,
-            policy.stream_key(),
+            &stream(tenant, workspace),
             payload,
             classify(&policy, RememberEventKind::UserMessage),
             None,
@@ -538,7 +509,7 @@ mod tests {
         let tenant = TenantId::new();
         let workspace = WorkspaceId::new();
         let user = UserId::new();
-        let policy = policy(tenant, workspace, VisibilityClass::UserPrivate);
+        let policy = policy(VisibilityClass::UserPrivate);
         let authorization = authorization(tenant, Some(user), workspace);
         for (class, expect_user, expect_workspace) in [
             (VisibilityClass::UserPrivate, Some(user.0), None),
@@ -548,7 +519,7 @@ mod tests {
             let cmd = command(
                 &authorization,
                 &policy,
-                policy.stream_key(),
+                &stream(tenant, workspace),
                 payload(Value::Null),
                 PutClassification {
                     visibility_class: class,
@@ -619,17 +590,5 @@ mod tests {
             assert_eq!(parse_data_class(class.as_str()), Ok(class));
         }
         assert_eq!(parse_data_class("private"), Err(ErrorCode::InvalidInput));
-    }
-
-    #[test]
-    fn maps_terminal_remember_errors_without_exposing_details() {
-        assert_eq!(
-            map_remember_error(remember::RememberError::ConsistencyTokenExpiryNotFuture),
-            ErrorCode::InvalidInput
-        );
-        assert_eq!(
-            map_remember_error(remember::RememberError::BatchExhausted),
-            ErrorCode::Conflict
-        );
     }
 }

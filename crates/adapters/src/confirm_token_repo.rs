@@ -1,9 +1,11 @@
 //! `adapters::confirm_token_repo` — `control.confirm_tokens` (migration 0148, ADR-0018).
-//! Depends-on: crates=[humaux-domain, sqlx, uuid]; services=[PostgreSQL(any) w=[control.confirm_tokens] x=[control.sweep_confirm_tokens]]; env=[]; modules=[adapters::postgres, adapters::request_guard_repo, domain::audit, domain::confirm, domain::error, domain::identity]
+//! Depends-on: crates=[humaux-domain, sqlx, uuid]; services=[PostgreSQL(any) w=[control.confirm_tokens] x=[control.sweep_confirm_tokens, control.assert_write_scope]]; env=[]; modules=[adapters::postgres, adapters::request_guard_repo, domain::audit, domain::confirm, domain::error, domain::identity, domain::ids]
 //! Called-by: [adapters::affect_repo, adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::subject_repo, gateway::guard, tests, xtask::confirm_sweep]
 //! Invariants: [tokens store only sha256(nonce) and are consumed by one UPDATE inside the caller's transaction;
-//!   replayed, expired or mis-bound tokens are one indistinguishable Conflict, never a silent success]
-//! Spec: Baseline §33.10
+//!   replayed, expired or mis-bound tokens — including one minted for another workspace — are one indistinguishable
+//!   Conflict, never a silent success; every write transaction rechecks its principal and its one workspace
+//!   through control.assert_write_scope before it writes]
+//! Spec: Baseline §33.10; ADR-0018; ADR-0054
 //!
 //! Two writes, both `role_gateway`, both FORCE-RLS tenant-scoped:
 //! - [`mint_with_audit`]: first call of a §33.10 two-step destructive action. One
@@ -13,8 +15,12 @@
 //! - [`consume_in_txn`]: second call. One `UPDATE ... WHERE <full binding> AND consumed_at
 //!   IS NULL AND expires_at > now RETURNING` inside the *caller's* transaction, so the
 //!   token is consumed atomically with the mutation it gates. Zero rows — replayed, expired,
-//!   or bound to another (tenant, user, operation, target, successor) — is one indistinguishable
-//!   `Conflict` (D-B: never a silent success, never an existence oracle).
+//!   or bound to another (tenant, workspace, user, operation, target, successor) — is one
+//!   indistinguishable `Conflict` (D-B: never a silent success, never an existence oracle).
+//! - [`set_write_authorization_local`] (ADR-0054 D-B): the one write-scope door every
+//!   governance / subject / affect write transaction opens with — the RLS GUCs plus the
+//!   in-transaction recheck `control.assert_write_scope(principal, workspace)` (stale principal ⇒
+//!   `Unauthorized`, workspace not granted ⇒ `Forbidden`, membership rows held FOR SHARE).
 
 use std::time::Duration;
 
@@ -23,6 +29,7 @@ use humaux_domain::{
     confirm::{DestructiveOp, RISK_TAG_CONFIRMATION_MINTED},
     error::ErrorCode,
     identity::AuthorizationScope,
+    ids::WorkspaceId,
 };
 use sqlx::types::time::OffsetDateTime;
 use uuid::Uuid;
@@ -47,12 +54,14 @@ pub struct ConfirmationClaim {
 }
 
 /// The only consume predicate: the full binding, unconsumed, unexpired. `successor_id` uses
-/// `IS NOT DISTINCT FROM` so a NULL-bound token matches only a NULL claim. Pinned by
+/// `IS NOT DISTINCT FROM` so a NULL-bound token matches only a NULL claim; `workspace_id` uses
+/// plain `=` so a pre-0187 (NULL) row never matches (ADR-0054 D-C). Pinned by
 /// `consume_predicate_is_the_full_binding` — the owner trigger in 0148 masks a dropped
 /// expiry/consumed clause at the DB layer, so the adapter predicate needs its own witness.
 const CONSUME_SQL: &str = "UPDATE control.confirm_tokens SET consumed_at = clock_timestamp() \
      WHERE nonce_sha256 = $1 AND tenant_id = $2 AND user_id = $3 \
        AND operation = $4 AND target_id = $5 AND successor_id IS NOT DISTINCT FROM $6 \
+       AND workspace_id = $7 \
        AND consumed_at IS NULL AND expires_at > clock_timestamp() \
      RETURNING confirm_token_id";
 
@@ -67,6 +76,8 @@ fn db_error(error: sqlx::Error) -> ErrorCode {
         sqlx::Error::RowNotFound => ErrorCode::NotFound,
         sqlx::Error::Database(ref db) => match db.code().as_deref() {
             Some("42501") => ErrorCode::Forbidden,
+            // control.assert_write_scope: the principal went stale since authentication.
+            Some("28000") => ErrorCode::Unauthorized,
             Some("23503") => ErrorCode::TenantBoundary,
             Some("23505" | "40001" | "40P01" | "55P03" | "23514") => ErrorCode::Conflict,
             Some("22023" | "22P02" | "22003") => ErrorCode::InvalidInput,
@@ -94,6 +105,35 @@ pub(crate) async fn set_authorization_local(
     .await
     .map_err(db_error)?;
     Ok(())
+}
+
+/// ADR-0054 D-B: a write scope names exactly one workspace — the narrowed request route. An
+/// unnarrowed scope (an unbound PAT's whole member set) or an empty one is `Forbidden`.
+pub(crate) fn sole_workspace(auth: &AuthorizationScope) -> Result<WorkspaceId, ErrorCode> {
+    let set = auth.allowed_workspace_ids();
+    match (set.len(), set.iter().next()) {
+        (1, Some(workspace)) => Ok(*workspace),
+        _ => Err(ErrorCode::Forbidden),
+    }
+}
+
+/// ADR-0054 D-B: the GUCs of [`set_authorization_local`] plus the in-transaction recheck of
+/// the principal and its one workspace (`control.assert_write_scope`, 0188). Every governance /
+/// subject / affect write transaction opens with this; reads keep [`set_authorization_local`].
+pub(crate) async fn set_write_authorization_local(
+    txn: &mut Txn<'_>,
+    auth: &AuthorizationScope,
+) -> Result<WorkspaceId, ErrorCode> {
+    let workspace = sole_workspace(auth)?;
+    set_authorization_local(txn, auth).await?;
+    // dep: PostgreSQL(any) — control.assert_write_scope recheck inside the caller's write transaction
+    sqlx::query("SELECT control.assert_write_scope($1, $2)")
+        .bind(auth.principal().0)
+        .bind(workspace.0)
+        .execute(&mut **txn)
+        .await
+        .map_err(db_error)?;
+    Ok(workspace)
 }
 
 /// Pure input contract of [`mint_with_audit`]: a token is always bound to a real user
@@ -145,11 +185,12 @@ pub async fn mint_with_audit(
         validate_mint(auth, op, target_id, successor_id, ttl, finished_audit)?;
     // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
-    set_authorization_local(&mut txn, auth).await?;
+    let workspace = set_write_authorization_local(&mut txn, auth).await?;
     let expires_at: OffsetDateTime = sqlx::query_scalar(
         "INSERT INTO control.confirm_tokens \
-           (tenant_id, user_id, operation, target_id, successor_id, nonce_sha256, expires_at) \
-         VALUES ($1, $2, $3, $4, $7, $5, clock_timestamp() + make_interval(secs => $6)) \
+           (tenant_id, user_id, operation, target_id, successor_id, nonce_sha256, expires_at, \
+            workspace_id) \
+         VALUES ($1, $2, $3, $4, $7, $5, clock_timestamp() + make_interval(secs => $6), $8) \
          RETURNING expires_at",
     )
     .bind(auth.tenant_id().0)
@@ -159,6 +200,7 @@ pub async fn mint_with_audit(
     .bind(nonce_sha256.as_slice())
     .bind(ttl_seconds)
     .bind(successor_id)
+    .bind(workspace.0)
     .fetch_one(&mut *txn)
     .await
     .map_err(db_error)?;
@@ -218,14 +260,15 @@ pub async fn sweep_expired(
 }
 
 /// D-A/D-B second call: verify + consume in the caller's transaction. Exactly one row may
-/// match the full binding while unconsumed and unexpired; anything else is `Conflict`.
+/// match the full binding — including the scope's one workspace (ADR-0054) — while unconsumed
+/// and unexpired; anything else is `Conflict`. The write-scope recheck runs first.
 pub async fn consume_in_txn(
     txn: &mut Txn<'_>,
     auth: &AuthorizationScope,
     claim: &ConfirmationClaim,
 ) -> Result<(), ErrorCode> {
     let user_id = auth.user_id().ok_or(ErrorCode::Unauthorized)?.0;
-    set_authorization_local(txn, auth).await?;
+    let workspace = set_write_authorization_local(txn, auth).await?;
     let consumed: Option<Uuid> = sqlx::query_scalar(CONSUME_SQL)
         .bind(claim.nonce_sha256.as_slice())
         .bind(auth.tenant_id().0)
@@ -233,6 +276,7 @@ pub async fn consume_in_txn(
         .bind(claim.op.operation_key())
         .bind(claim.target_id)
         .bind(claim.successor_id)
+        .bind(workspace.0)
         .fetch_optional(&mut **txn)
         .await
         .map_err(db_error)?;
@@ -347,6 +391,7 @@ mod tests {
             "operation = $4",
             "target_id = $5",
             "successor_id IS NOT DISTINCT FROM $6",
+            "workspace_id = $7",
             "consumed_at IS NULL",
             "expires_at > clock_timestamp()",
             "RETURNING confirm_token_id",
@@ -360,5 +405,26 @@ mod tests {
             CONSUME_SQL
                 .starts_with("UPDATE control.confirm_tokens SET consumed_at = clock_timestamp()")
         );
+    }
+
+    /// ADR-0054 D-B: the token and the recheck bind exactly one workspace — an unnarrowed or
+    /// empty scope is refused before any statement.
+    #[test]
+    fn sole_workspace_requires_a_singleton_scope() {
+        let (tenant, principal, user) = (
+            TenantId(Uuid::now_v7()),
+            PrincipalId(Uuid::now_v7()),
+            Some(UserId(Uuid::now_v7())),
+        );
+        let (w1, w2) = (WorkspaceId(Uuid::now_v7()), WorkspaceId(Uuid::now_v7()));
+        let with = |set: Vec<WorkspaceId>| {
+            AuthorizationScope::new(tenant, principal, user, BoundedSet::new(set).unwrap())
+        };
+        assert_eq!(sole_workspace(&with(vec![w1])), Ok(w1));
+        assert_eq!(
+            sole_workspace(&with(vec![w1, w2])),
+            Err(ErrorCode::Forbidden)
+        );
+        assert_eq!(sole_workspace(&with(Vec::new())), Err(ErrorCode::Forbidden));
     }
 }

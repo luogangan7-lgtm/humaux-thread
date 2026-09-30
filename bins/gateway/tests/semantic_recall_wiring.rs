@@ -11,7 +11,7 @@
 //!   contracts::retrieval_config, domain::authority, domain::context, domain::dataclass, domain::error,
 //!   domain::identity, domain::ids, domain::memory, gateway::context, gateway::recall, gateway::remember,
 //!   gateway::retrieval_embedding_client, humaux-local-secret-scan, humaux-testkit, infra-cell::permit,
-//!   infra-cell::resource, infra-cell::transport, projection::card, projection::stream, protocol::mcp_catalog,
+//!   infra-cell::resource, infra-cell::transport, projection::card, protocol::mcp_catalog,
 //!   retrieval-provider::adapters, retrieval-provider::contract, retrieval-worker::rpc]
 //! Called-by: [cargo-test]
 //! Invariants: [each test wires its own PostgreSQL/Qdrant/UDS fixtures; a missing fixture fails the test rather than skipping it]
@@ -70,7 +70,7 @@ use humaux_domain::{
 use humaux_gateway::{
     context::ContextBootstrap,
     recall::{self, RecallSearchRequest, SemanticRecallRuntime, SemanticRecallVersions},
-    remember::RememberPolicy,
+    remember::{ProcessFamily, RememberPolicy},
     retrieval_embedding_client::GatewayRetrievalEmbeddingClient,
 };
 use humaux_infra_cell::{
@@ -80,7 +80,6 @@ use humaux_infra_cell::{
 };
 use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig};
 use humaux_projection::card::EgressDisposition;
-use humaux_projection::stream::StreamKey;
 use humaux_protocol::mcp_catalog::CanonicalCatalog;
 use humaux_retrieval_provider::{
     adapters::TestDoubleProvider,
@@ -473,14 +472,8 @@ fn fixed_vector(text: &str) -> Vec<f32> {
 
 fn context_bootstrap(handle: &Handle) -> ContextBootstrap {
     let policy = RememberPolicy::new(
-        StreamKey::new(
-            TenantId(handle.tenant_id),
-            "workspace",
-            handle.workspace_id,
-            "knowledge",
-            "ingest",
-            "v1",
-        ),
+        // ADR-0054 D-D: the family only — no default (tenant, workspace) pair.
+        ProcessFamily::new("workspace", "knowledge", "ingest", "v1").expect("trusted family"),
         handle.reasoning_domain_id,
         Duration::from_secs(60),
         DataClass::Internal,

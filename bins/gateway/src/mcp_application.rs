@@ -1,6 +1,5 @@
 //! `gateway::mcp_application` — Gateway implementation of the native MCP application port.
-//! Depends-on: crates=[async-trait, axum, hex, humaux-adapters, humaux-contracts, humaux-domain, humaux-projection,
-//!   humaux-protocol, humaux-testkit, postgres, serde, serde_json, time, tokio, uuid];
+//! Depends-on: crates=[async-trait, axum, hex, humaux-adapters, humaux-contracts, humaux-domain, humaux-protocol, humaux-testkit, postgres, serde, serde_json, time, tokio, uuid];
 //!   services=[PostgreSQL(role_gateway) r=[control.rate_buckets, private.memory_records]
 //!   w=[control.w2_test_request_intervals] x=[private.publish_continuity_facet, private.register_continuity_project],
 //!   HTTP(gateway)]; env=[HUMAUX_CONTINUITY_DIRECT_PREAUTH_SAME_KEY, HUMAUX_CONTINUITY_W2_BARRIER_RUN_ID,
@@ -118,7 +117,6 @@ pub struct GatewayMcpApplication {
     guard: Arc<GatewayGuard>,
     runtime_pool: Arc<RuntimeDbPool>,
     remember_policy: RememberPolicy,
-    remember_workspace: WorkspaceId,
     remember_event_kind: RememberEventKind,
     context_bootstrap: ContextBootstrap,
     semantic_recall: Option<Arc<SemanticRecallRuntime>>,
@@ -145,13 +143,11 @@ impl GatewayMcpApplication {
         context_bootstrap: ContextBootstrap,
     ) -> Self {
         let runtime_pool = guard.runtime_pool();
-        let remember_workspace = remember_policy.workspace_id();
         Self {
             catalog: Arc::new(catalog),
             guard,
             runtime_pool,
             remember_policy,
-            remember_workspace,
             remember_event_kind,
             context_bootstrap,
             semantic_recall: None,
@@ -275,7 +271,9 @@ impl GatewayMcpApplication {
             data_class: wire.data_class.unwrap_or(self.remember_policy.data_class()),
             event_kind: wire.event_kind.unwrap_or(self.remember_event_kind),
         };
-        let workspace = wire.workspace_id.unwrap_or(self.remember_workspace);
+        // ADR-0054 D-D: no process default pair — an omitted `workspace_id` routes to the
+        // credential's bound workspace (the guard's `requested.or(bound)`).
+        let requested_workspace = wire.workspace_id;
         let policy = self.remember_policy.clone();
         let bootstrap = self.context_bootstrap.clone();
         let result = self
@@ -283,13 +281,14 @@ impl GatewayMcpApplication {
             .run_atomic_remember(
                 context,
                 operation,
-                Some(workspace),
+                requested_workspace,
                 raw_arguments,
                 wire.idempotency_key,
                 move |request| {
-                    if request.workspace_id() != Some(workspace) {
-                        return Err(ErrorCode::Forbidden);
-                    }
+                    // An unbound PAT naming no workspace has no route: nothing to write to.
+                    let workspace = request
+                        .workspace_id()
+                        .ok_or(ErrorCode::DependencyUnavailable)?;
                     // ADR-0032 D-A (§34.0.1 Q9): the write stream is derived per request at
                     // the read routes' single derivation point — principal tenant + the
                     // membership-narrowed requested workspace + the process family. Pure, no
@@ -818,10 +817,9 @@ impl GatewayMcpApplication {
     }
 
     /// §36 `memory.supersede` through the shared §33.10 confirm gate (ADR-0018). The
-    /// schema carries no `workspace_id`: the route is the credential's bound workspace,
-    /// which must be the bootstrap projection stream's workspace (the confirm-gated governance
-    /// writers stay bootstrap-bound; `remember.put` and the reads derive their stream per
-    /// request, ADR-0031 / ADR-0032).
+    /// schema carries no `workspace_id`: the route is the credential's bound workspace, and the
+    /// write stream is derived per request from it exactly like the reads and `remember.put`
+    /// (ADR-0031 / ADR-0032 / ADR-0054 — no process-bound pair); the token binds that workspace.
     async fn memory_supersede(
         &self,
         context: &McpHttpContext,
@@ -848,7 +846,7 @@ impl GatewayMcpApplication {
             return self.reject_unsupported(context, operation, None).await;
         };
         let pool = self.runtime_pool.clone();
-        let stream = self.context_bootstrap.stream.clone();
+        let bootstrap = self.context_bootstrap.clone();
         let outcome = self
             .guard
             .run_confirmed_write(
@@ -864,7 +862,7 @@ impl GatewayMcpApplication {
                     ttl,
                 },
                 move |write| async move {
-                    memory::supersede(pool, write, stream, target, successor, undo_window).await
+                    memory::supersede(pool, write, bootstrap, target, successor, undo_window).await
                 },
             )
             .await?;
@@ -944,7 +942,7 @@ impl GatewayMcpApplication {
             (false, None) => return self.reject_unsupported(context, operation, None).await,
         };
         let pool = self.runtime_pool.clone();
-        let stream = self.context_bootstrap.stream.clone();
+        let bootstrap = self.context_bootstrap.clone();
         let consistency_token_ttl = self.remember_policy.consistency_token_ttl();
         let outcome = self
             .guard
@@ -964,7 +962,7 @@ impl GatewayMcpApplication {
                     memory::correct(
                         pool,
                         write,
-                        stream,
+                        bootstrap,
                         target,
                         content,
                         digest,
@@ -1029,7 +1027,7 @@ impl GatewayMcpApplication {
             return self.reject_unsupported(context, operation, None).await;
         };
         let pool = self.runtime_pool.clone();
-        let stream = self.context_bootstrap.stream.clone();
+        let bootstrap = self.context_bootstrap.clone();
         let consistency_token_ttl = self.remember_policy.consistency_token_ttl();
         let outcome = self
             .guard
@@ -1046,7 +1044,7 @@ impl GatewayMcpApplication {
                     ttl,
                 },
                 move |write| async move {
-                    memory::restore(pool, write, stream, target, consistency_token_ttl).await
+                    memory::restore(pool, write, bootstrap, target, consistency_token_ttl).await
                 },
             )
             .await?;
@@ -1118,7 +1116,7 @@ impl GatewayMcpApplication {
         };
         let subjects = subject_repo::parse_declaration(value)?;
         let pool = self.runtime_pool.clone();
-        let stream = self.context_bootstrap.stream.clone();
+        let bootstrap = self.context_bootstrap.clone();
         let consistency_token_ttl = self.remember_policy.consistency_token_ttl();
         let outcome = self
             .guard
@@ -1138,7 +1136,7 @@ impl GatewayMcpApplication {
                     memory::confirm(
                         pool,
                         write,
-                        stream,
+                        bootstrap,
                         candidate_id,
                         candidate_sha256,
                         consistency_token_ttl,
@@ -1203,24 +1201,26 @@ impl GatewayMcpApplication {
             return self.reject_unsupported(context, operation, None).await;
         };
         let pool = self.runtime_pool.clone();
-        let stream = self.context_bootstrap.stream.clone();
-        let outcome = self
-            .guard
-            .run_confirmed_write(
-                context,
-                operation,
-                None,
-                raw_arguments,
-                ConfirmGate {
-                    op: DestructiveOp::MemoryReject,
-                    target_id: candidate_id,
-                    successor_id: None,
-                    presented,
-                    ttl,
-                },
-                move |write| async move { memory::reject(pool, write, stream, candidate_id).await },
-            )
-            .await?;
+        let bootstrap = self.context_bootstrap.clone();
+        let outcome =
+            self.guard
+                .run_confirmed_write(
+                    context,
+                    operation,
+                    None,
+                    raw_arguments,
+                    ConfirmGate {
+                        op: DestructiveOp::MemoryReject,
+                        target_id: candidate_id,
+                        successor_id: None,
+                        presented,
+                        ttl,
+                    },
+                    move |write| async move {
+                        memory::reject(pool, write, bootstrap, candidate_id).await
+                    },
+                )
+                .await?;
         let value = match outcome {
             ConfirmedOutcome::ConfirmationRequired { token, expires_at } => json!({
                 "confirmation_required": true,
@@ -1332,7 +1332,7 @@ impl GatewayMcpApplication {
             return self.reject_unsupported(context, operation, None).await;
         };
         let pool = self.runtime_pool.clone();
-        let stream = self.context_bootstrap.stream.clone();
+        let bootstrap = self.context_bootstrap.clone();
         let outcome = self
             .guard
             .run_confirmed_write(
@@ -1363,7 +1363,7 @@ impl GatewayMcpApplication {
                     memory::write_binding(
                         pool,
                         write,
-                        stream,
+                        bootstrap,
                         op,
                         memory,
                         task,
@@ -1474,24 +1474,26 @@ impl GatewayMcpApplication {
             return self.reject_unsupported(context, operation, None).await;
         };
         let pool = self.runtime_pool.clone();
-        let stream = self.context_bootstrap.stream.clone();
-        let outcome = self
-            .guard
-            .run_confirmed_write(
-                context,
-                operation,
-                None,
-                raw_arguments,
-                ConfirmGate {
-                    op,
-                    target_id: memory.0,
-                    successor_id: None,
-                    presented,
-                    ttl,
-                },
-                move |write| async move { memory::archive(pool, write, stream, op, memory).await },
-            )
-            .await?;
+        let bootstrap = self.context_bootstrap.clone();
+        let outcome =
+            self.guard
+                .run_confirmed_write(
+                    context,
+                    operation,
+                    None,
+                    raw_arguments,
+                    ConfirmGate {
+                        op,
+                        target_id: memory.0,
+                        successor_id: None,
+                        presented,
+                        ttl,
+                    },
+                    move |write| async move {
+                        memory::archive(pool, write, bootstrap, op, memory).await
+                    },
+                )
+                .await?;
         let changed_field = if op == DestructiveOp::MemoryArchive {
             "archived_at"
         } else {
@@ -1990,14 +1992,7 @@ mod tests {
         scope: humaux_domain::identity::AuthorizationScope,
     ) -> GatewayMcpApplication {
         let policy = RememberPolicy::new(
-            humaux_projection::stream::StreamKey::new(
-                TenantId(handle.tenant_id),
-                "workspace",
-                handle.workspace_id,
-                "knowledge",
-                "ingest",
-                "v1",
-            ),
+            crate::remember::ProcessFamily::new("workspace", "knowledge", "ingest", "v1").unwrap(),
             handle.reasoning_domain_id,
             Duration::from_secs(60),
             DataClass::Internal,

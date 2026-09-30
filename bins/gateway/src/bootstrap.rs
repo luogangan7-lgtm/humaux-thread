@@ -1,10 +1,10 @@
 //! `gateway::bootstrap` — Process bootstrap: the process-wide stream family `(scope_kind, domain, projection_kind,
 //!   projection_version)` that the read routes AND `remember.put` attach to each request's own `(tenant, workspace)`
 //!   (ADR-0031 D-A / ADR-0032 D-A, §34.0.1 Q9: one process serves every pair; no registry table, no per-process
-//!   stream cache), plus the default write pair (`REMEMBER_TENANT_ID` / `REMEMBER_WORKSPACE_ID`) a put without
-//!   `workspace_id` lands on and the confirm-gated governance writers still compare against.
+//!   stream cache) — the same family the 14 governance / subject / affect writes attach to since ADR-0054, so
+//!   the process holds no default write pair at all.
 //! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-contracts, humaux-domain, humaux-infra-cell,
-//!   humaux-local-secret-scan, humaux-projection, humaux-protocol, tokio,
+//!   humaux-local-secret-scan, humaux-protocol, tokio,
 //!   uuid]; services=[PostgreSQL(role_gateway)]; env=[HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS,
 //!   HUMAUX_GATEWAY_BIND_ADDR, HUMAUX_GATEWAY_CALLER_ID, HUMAUX_GATEWAY_CELL_ID,
 //!   HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS,
@@ -27,13 +27,12 @@
 //!   HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS, HUMAUX_GATEWAY_UNKNOWN, HUMAUX_TEST_GITLEAKS_BIN,
 //!   HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION]; modules=[adapters::postgres, adapters::quota_repo,
 //!   application::retrieval_embedding_port, contracts::config_registry, contracts::retrieval_config,
-//!   domain::context, domain::dataclass, domain::identity, domain::ids, gateway::context, gateway::guard,
+//!   domain::context, domain::dataclass, domain::identity, gateway::context, gateway::guard,
 //!   gateway::mcp_application, gateway::recall, gateway::remember, gateway::retrieval_embedding_client,
-//!   humaux-local-secret-scan, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::stream,
-//!   protocol::edge, protocol::mcp, protocol::mcp_catalog]
+//!   humaux-local-secret-scan, infra-cell::permit, infra-cell::resource, infra-cell::transport, protocol::edge, protocol::mcp, protocol::mcp_catalog]
 //! Called-by: [gateway::main]
 //! Invariants: [one process serves every (tenant, workspace) pair with no per-process stream cache or registry table; GuardSettings::tenant_network stays empty until a separate authorization approves a tenant-specific network policy]
-//! Spec: Baseline §34.0.1; §78.1; ADR-0031; ADR-0032
+//! Spec: Baseline §34.0.1; §78.1; ADR-0031; ADR-0032; ADR-0054
 //!
 //! This module owns process configuration only. Tool arguments never select a
 //! stream version, credential verifier, listener, or rate policy; a tool argument selects a
@@ -57,15 +56,12 @@ use humaux_contracts::config_registry::{
 use humaux_contracts::retrieval_config::{
     resolve_registered_retrieval_profile, retrieval_profile_registry,
 };
-use humaux_domain::{
-    context::ContextBudget, dataclass::DataClass, identity::VisibilityClass, ids::TenantId,
-};
+use humaux_domain::{context::ContextBudget, dataclass::DataClass, identity::VisibilityClass};
 use humaux_infra_cell::{
     CallerId, CellAccessMode, CellCidr, CellId, DEFAULT_MAX_RESPONSE_BYTES, HttpIntraCellTransport,
     IntraCellResource, IntraCellResourceRegistry, ResourceEntry,
 };
 use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig};
-use humaux_projection::stream::StreamKey;
 use humaux_protocol::{
     edge::{Cidr, TrustedProxyConfig},
     mcp::{McpAdapter, McpHttpConfig},
@@ -78,7 +74,7 @@ use crate::{
     guard::{GatewayGuard, GuardRatePolicies, GuardSettings},
     mcp_application::GatewayMcpApplication,
     recall::{SemanticRecallRuntime, SemanticRecallVersions},
-    remember::{self, RememberEventKind, RememberPolicy},
+    remember::{self, ProcessFamily, RememberEventKind, RememberPolicy},
     retrieval_embedding_client::GatewayRetrievalEmbeddingClient,
 };
 
@@ -393,14 +389,21 @@ fn parse_guard(effective: &BTreeMap<String, String>) -> Result<GuardSettings, Bo
 fn parse_remember_policy(
     effective: &BTreeMap<String, String>,
 ) -> Result<RememberPolicy, BootstrapError> {
-    let tenant = TenantId(uuid(
-        required(effective, "HUMAUX_GATEWAY_REMEMBER_TENANT_ID")?,
+    // ADR-0054 D-D: the former default write pair is optional and unused. A present value must
+    // still be a UUID (fail closed on garbage); it only earns one startup line. The keys stay
+    // registered because `xtask e2e-onboard` still passes them.
+    for key in [
         "HUMAUX_GATEWAY_REMEMBER_TENANT_ID",
-    )?);
-    let workspace = uuid(
-        required(effective, "HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID")?,
         "HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID",
-    )?;
+    ] {
+        let value = present(effective, key)?;
+        if !value.trim().is_empty() {
+            uuid(value, key)?;
+            eprintln!(
+                "gateway bootstrap: {key} ignored since ADR-0054 (writes derive (tenant, workspace) per request)"
+            );
+        }
+    }
     let scope_kind = required(effective, "HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND")?;
     if scope_kind != "workspace" {
         return Err(BootstrapError::new(
@@ -408,24 +411,24 @@ fn parse_remember_policy(
             "only workspace is enabled",
         ));
     }
+    let family = ProcessFamily::new(
+        scope_kind,
+        nonempty(
+            required(effective, "HUMAUX_GATEWAY_REMEMBER_DOMAIN")?,
+            "HUMAUX_GATEWAY_REMEMBER_DOMAIN",
+        )?,
+        nonempty(
+            required(effective, "HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND")?,
+            "HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND",
+        )?,
+        nonempty(
+            required(effective, "HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION")?,
+            "HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION",
+        )?,
+    )
+    .map_err(|_| BootstrapError::new("HUMAUX_GATEWAY_REMEMBER_*", "invalid stream family"))?;
     RememberPolicy::new(
-        StreamKey::new(
-            tenant,
-            scope_kind,
-            workspace,
-            nonempty(
-                required(effective, "HUMAUX_GATEWAY_REMEMBER_DOMAIN")?,
-                "HUMAUX_GATEWAY_REMEMBER_DOMAIN",
-            )?,
-            nonempty(
-                required(effective, "HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND")?,
-                "HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND",
-            )?,
-            nonempty(
-                required(effective, "HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION")?,
-                "HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION",
-            )?,
-        ),
+        family,
         uuid(
             required(effective, "HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID")?,
             "HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID",
@@ -661,12 +664,6 @@ fn registry() -> Vec<ConfigEntry> {
         ("CONFIRM_TOKEN_TTL_SECONDS", "u64", false),
         ("UNDO_WINDOW_SECONDS", "u64", false),
         ("MOOD_HALF_LIFE_SECONDS", "u64", false),
-        // ADR-0032 (card 11): these two are the DEFAULT write pair — `remember.put` derives
-        // its stream per request like the reads (ADR-0031) and lands here only when the call
-        // omits `workspace_id`; the confirm-gated governance writers still compare against
-        // them. Still required at boot (fail-closed bootstrap, ADR-0031 D-B).
-        ("REMEMBER_TENANT_ID", "uuid", false),
-        ("REMEMBER_WORKSPACE_ID", "uuid", false),
         ("REMEMBER_SCOPE_KIND", "enum:workspace", false),
         ("REMEMBER_DOMAIN", "string", false),
         ("REMEMBER_PROJECTION_KIND", "string", false),
@@ -690,6 +687,16 @@ fn registry() -> Vec<ConfigEntry> {
     .into_iter()
     .map(|(suffix, type_name, secret)| entry(&format!("{PREFIX}{suffix}"), type_name, secret))
     .collect::<Vec<_>>();
+    // ADR-0054 D-D: the former default write pair. No write compares against it and no put
+    // falls back to it any more — every route derives (tenant, workspace) per request — so both
+    // are optional (default "") and ignored; a present value must still parse as a UUID. Kept
+    // registered only because `xtask e2e-onboard` still passes them; the follow-up that drops
+    // them there deletes these two entries (their presence then becomes a boot error).
+    entries.extend(
+        ["REMEMBER_TENANT_ID", "REMEMBER_WORKSPACE_ID"]
+            .into_iter()
+            .map(|suffix| entry_with_default(&format!("{PREFIX}{suffix}"), "uuid", false, "")),
+    );
     // Semantic-recall wiring keys: gated as a group by `RETRIEVAL_RPC_SOCKET_PATH`
     // (`parse_semantic_recall`'s doc) — absent is a valid, expected deployment shape (semantic
     // recall stays disabled), so each gets `default: ""` rather than `None`. `None` would make
@@ -1016,6 +1023,31 @@ mod tests {
         let mut values = raw();
         values.insert("HUMAUX_GATEWAY_BIND_ADDR".into(), "0.0.0.0:8080".into());
         assert!(GatewayBootstrap::from_raw(values).is_err());
+    }
+
+    /// ADR-0054 D-D: the former default write pair is optional — the process boots without
+    /// both keys (every write derives its pair per request) — but a present value must still be
+    /// a UUID, so a typo fails closed instead of being silently ignored.
+    #[test]
+    fn bootstrap_starts_without_the_default_write_pair() {
+        let mut values = raw();
+        values.remove("HUMAUX_GATEWAY_REMEMBER_TENANT_ID");
+        values.remove("HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID");
+        assert!(GatewayBootstrap::from_raw(values).is_ok());
+
+        let mut values = raw();
+        values.insert("HUMAUX_GATEWAY_REMEMBER_TENANT_ID".into(), String::new());
+        values.insert("HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID".into(), String::new());
+        assert!(GatewayBootstrap::from_raw(values).is_ok());
+
+        for key in [
+            "HUMAUX_GATEWAY_REMEMBER_TENANT_ID",
+            "HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID",
+        ] {
+            let mut values = raw();
+            values.insert(key.into(), "not-a-uuid".into());
+            assert!(GatewayBootstrap::from_raw(values).is_err(), "{key}");
+        }
     }
 
     #[test]

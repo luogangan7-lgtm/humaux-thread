@@ -5,7 +5,7 @@
 //!   r=[private.memory_subjects] w=[private.evidence_subjects, private.subject_keys, private.subject_roles,
 //!   private.subjects] x=[private.link_memory_subjects, private.link_rollup_subjects]]; env=[];
 //!   modules=[adapters::confirm_token_repo, adapters::postgres, domain::error, domain::identity, domain::subject]
-//! Called-by: [adapters::affect_repo, adapters::consolidate_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::remember, gateway::mcp_application, gateway::memory]
+//! Called-by: [adapters::affect_repo, adapters::consolidate_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::remember, gateway::mcp_application, gateway::memory, tests]
 //! Invariants: [the only Rust caller of the SQL subject-link hook; declarations commit with the write they belong to
 //!   or not at all; resolution never calls a model and an unknown id/key is InvalidInput]
 //! Spec: Baseline §6.1.3; ADR-0028
@@ -325,7 +325,8 @@ pub async fn register_subject(
     let tenant_id = auth.tenant_id().0;
     // dep: PostgreSQL(role_gateway) — transaction entry for `register_subject`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
-    confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
+    // ADR-0054 D-B: the write-scope recheck (principal + its one workspace) inside this txn.
+    confirm_token_repo::set_write_authorization_local(&mut txn, auth).await?;
     let subject_id: Uuid = sqlx::query_scalar(
         "INSERT INTO private.subjects (tenant_id, kind, display_name) \
          VALUES ($1, $2, $3) RETURNING subject_id",
@@ -369,7 +370,8 @@ pub async fn link_key(
     let tenant_id = auth.tenant_id().0;
     // dep: PostgreSQL(role_gateway) — transaction entry for `link_key`
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
-    confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
+    // ADR-0054 D-B: the write-scope recheck (principal + its one workspace) inside this txn.
+    confirm_token_repo::set_write_authorization_local(&mut txn, auth).await?;
     let target = SubjectDeclaration::new(vec![subject_id], Vec::new())?;
     resolve_declaration_in_txn(&mut txn, tenant_id, &target).await?;
     sqlx::query(

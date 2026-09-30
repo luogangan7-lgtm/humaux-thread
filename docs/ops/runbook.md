@@ -118,6 +118,16 @@ Two rules that are not obvious from the variable names:
   correctly refuses the connection. The refusal is the resolver working, not a defect
   (ADR-0039). Pin the host, and run proxy-free — a proxy makes the client CONNECT by hostname
   and the resolver is never consulted at all.
+- **The gateway has no default write pair** (card 29 / ADR-0054).
+  `HUMAUX_GATEWAY_REMEMBER_TENANT_ID` / `HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID` are not required and
+  are ignored (a present value must still be a UUID; the gateway prints one
+  `ignored since ADR-0054` line). They remain accepted only because `xtask e2e-onboard` still
+  passes them. Every write — `remember.put` and the 14 governance / subject / affect ops
+  (supersede, restore, correct, confirm, reject, archive, unarchive, pin, unpin, bind, unbind,
+  subject_register, subject_link_key, annotate_affect) — lands on the caller's own
+  (tenant, workspace): the credential's tenant plus the requested or bound workspace, provisioned
+  pairs only. A confirm token is bound to the workspace it was minted in; presented in another
+  workspace it answers `CONFLICT` and stays usable where it was minted.
 
 ## 5. Start order
 

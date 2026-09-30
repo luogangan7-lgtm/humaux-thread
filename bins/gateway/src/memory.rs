@@ -7,7 +7,7 @@
 //!   projection::serving, projection::stream, retrieval::completeness, retrieval::envelope, retrieval::request]
 //! Called-by: [gateway::mcp_application]
 //! Invariants: [a read that cannot reach its final-body boundary returns the application error, never a partially materialized memory]
-//! Spec: Baseline §22.0; §23.1; §36; ADR-0025; ADR-0026
+//! Spec: Baseline §22.0; §23.1; §36; ADR-0025; ADR-0026; ADR-0054
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -325,26 +325,19 @@ pub(crate) async fn enumerate<T>(
 /// Bootstrap policy for this cursor protocol; callers cannot extend it in MCP arguments.
 pub(crate) const ENUMERATION_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// §36 `memory.supersede`, second (confirmed) call. The bound workspace must be the
-/// bootstrap stream's workspace (write routes stay bootstrap-bound until card 11; the read
-/// routes derive their stream per request, ADR-0031) so the lifecycle ticket lands on the
-/// stream whose ledger the reads consult.
+/// §36 `memory.supersede`, second (confirmed) call. The write stream is derived per request
+/// (`write_scope`, ADR-0054 D-A: principal tenant + the guard-routed workspace, provisioned
+/// pairs only) so the lifecycle ticket lands on the stream whose ledger that pair's reads
+/// consult.
 pub(crate) async fn supersede(
     pool: Arc<RuntimeDbPool>,
     write: ConfirmedWrite,
-    stream: StreamKey,
+    bootstrap: ContextBootstrap,
     target: MemoryId,
     successor: MemoryId,
     undo_window: Duration,
 ) -> Result<SupersedeOutcome, ErrorCode> {
-    let workspace = write
-        .request
-        .workspace_id()
-        .ok_or(ErrorCode::DependencyUnavailable)?;
-    let authorization = write.request.authorization().narrow(workspace)?;
-    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
-        return Err(ErrorCode::DependencyUnavailable);
-    }
+    let (authorization, stream) = confirmed_write_scope(&pool, &write, &bootstrap).await?;
     memory_governance_repo::supersede_atomically(
         &pool,
         &authorization,
@@ -363,23 +356,16 @@ pub(crate) async fn supersede(
     .await
 }
 
-/// §36 `memory.restore`, second (confirmed) call (ADR-0020). Same `read_scope` workspace rule
-/// as `memory.supersede`: the lifecycle ticket lands on the bootstrap stream's workspace.
+/// §36 `memory.restore`, second (confirmed) call (ADR-0020). Same `write_scope` rule as
+/// `memory.supersede`: the lifecycle ticket lands on the request's own (tenant, workspace) stream.
 pub(crate) async fn restore(
     pool: Arc<RuntimeDbPool>,
     write: ConfirmedWrite,
-    stream: StreamKey,
+    bootstrap: ContextBootstrap,
     target: MemoryId,
     consistency_token_ttl: Duration,
 ) -> Result<RestoreResult, ErrorCode> {
-    let workspace = write
-        .request
-        .workspace_id()
-        .ok_or(ErrorCode::DependencyUnavailable)?;
-    let authorization = write.request.authorization().narrow(workspace)?;
-    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
-        return Err(ErrorCode::DependencyUnavailable);
-    }
+    let (authorization, stream) = confirmed_write_scope(&pool, &write, &bootstrap).await?;
     memory_governance_repo::restore_atomically(
         &pool,
         &authorization,
@@ -399,7 +385,7 @@ pub(crate) async fn restore(
 
 /// §Q4 `memory.correct`, second (confirmed) call (ADR-0025). One transaction inserts a new
 /// DirectUserInput Evidence + a new Memory version and supersedes the original with reason
-/// USER_CORRECTION. Same `read_scope` workspace rule as the other governance writes. The
+/// USER_CORRECTION. Same `write_scope` rule as the other governance writes. The
 /// corrected content arrives already hashed (`payload_sha256`) through the sole constructor.
 ///
 /// §6.1.3 (ADR-0028): the new version inherits the original's subjects inside that transaction
@@ -414,7 +400,7 @@ pub(crate) async fn restore(
 pub(crate) async fn correct(
     pool: Arc<RuntimeDbPool>,
     write: ConfirmedWrite,
-    stream: StreamKey,
+    bootstrap: ContextBootstrap,
     target: MemoryId,
     content: serde_json::Value,
     payload_sha256: humaux_domain::evidence::EvidencePayloadSha256,
@@ -424,14 +410,7 @@ pub(crate) async fn correct(
     affects: Vec<AffectInput>,
     mood_half_life: Option<MoodHalfLife>,
 ) -> Result<CorrectDone, ErrorCode> {
-    let workspace = write
-        .request
-        .workspace_id()
-        .ok_or(ErrorCode::DependencyUnavailable)?;
-    let authorization = write.request.authorization().narrow(workspace)?;
-    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
-        return Err(ErrorCode::DependencyUnavailable);
-    }
+    let (authorization, stream) = confirmed_write_scope(&pool, &write, &bootstrap).await?;
     memory_governance_repo::correct_atomically(
         &pool,
         &authorization,
@@ -457,26 +436,19 @@ pub(crate) async fn correct(
 
 /// §36/§10.1 `memory.confirm`, second (confirmed) call (ADR-0026, Card 6). One transaction
 /// promotes a `private.distill_candidates` row into a new UserConfirmed Evidence + a new Memory
-/// version. Same `read_scope` workspace rule as the other governance writes: the lifecycle ticket
-/// lands on the bootstrap stream's workspace. `candidate_sha256` binds the confirm to the exact
+/// version. Same `write_scope` rule as the other governance writes: the lifecycle ticket lands on
+/// the request's own (tenant, workspace) stream. `candidate_sha256` binds the confirm to the exact
 /// body the user reviewed.
 pub(crate) async fn confirm(
     pool: Arc<RuntimeDbPool>,
     write: ConfirmedWrite,
-    stream: StreamKey,
+    bootstrap: ContextBootstrap,
     candidate_id: Uuid,
     candidate_sha256: Vec<u8>,
     consistency_token_ttl: Duration,
     subjects: SubjectDeclaration,
 ) -> Result<ConfirmOutcome, ErrorCode> {
-    let workspace = write
-        .request
-        .workspace_id()
-        .ok_or(ErrorCode::DependencyUnavailable)?;
-    let authorization = write.request.authorization().narrow(workspace)?;
-    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
-        return Err(ErrorCode::DependencyUnavailable);
-    }
+    let (authorization, stream) = confirmed_write_scope(&pool, &write, &bootstrap).await?;
     distill_repo::confirm_candidate_atomically(
         &pool,
         &authorization,
@@ -569,7 +541,8 @@ pub(crate) async fn register_subject(
     display_name: String,
     roles: Vec<SubjectRole>,
 ) -> Result<SubjectItem, ErrorCode> {
-    let authorization = write_scope(authorization, requested_workspace, &bootstrap)?;
+    let (authorization, _stream) =
+        write_scope(&pool, authorization, requested_workspace, &bootstrap).await?;
     subject_repo::register_subject(&pool, &authorization, kind, &display_name, &roles)
         .await
         .map(SubjectItem::from)
@@ -586,7 +559,8 @@ pub(crate) async fn link_subject_key(
     subject_id: SubjectId,
     key: SubjectKey,
 ) -> Result<SubjectItem, ErrorCode> {
-    let authorization = write_scope(authorization, requested_workspace, &bootstrap)?;
+    let (authorization, _stream) =
+        write_scope(&pool, authorization, requested_workspace, &bootstrap).await?;
     subject_repo::link_key(&pool, &authorization, subject_id, &key)
         .await
         .map(SubjectItem::from)
@@ -614,7 +588,7 @@ impl From<AnnotateDone> for AnnotateResult {
 
 /// §8.5.1 / ADR-0030 D-C `memory.annotate_affect`: appends immutable affect rows to the visible
 /// active head `memory_id` (provenance = its PRIMARY Evidence) and issues the re-projection
-/// ticket on the bootstrap stream. Same workspace rule as `memory.supersede` (`write_scope`);
+/// ticket on the request's own (tenant, workspace) stream (`write_scope`, ADR-0054);
 /// the tenant is the credential's. Not confirm-gated: nothing is deleted, superseded or hidden.
 /// Also the sole path `memory.correct {affects}` re-supplies the new version's affects through.
 pub(crate) async fn annotate_affect(
@@ -626,11 +600,12 @@ pub(crate) async fn annotate_affect(
     inputs: Vec<AffectInput>,
     mood_half_life: MoodHalfLife,
 ) -> Result<AnnotateResult, ErrorCode> {
-    let authorization = write_scope(authorization, requested_workspace, &bootstrap)?;
+    let (authorization, stream) =
+        write_scope(&pool, authorization, requested_workspace, &bootstrap).await?;
     affect_repo::annotate(
         &pool,
         &authorization,
-        &bootstrap.stream,
+        &stream,
         memory_id,
         &inputs,
         mood_half_life,
@@ -644,17 +619,11 @@ pub(crate) async fn annotate_affect(
 pub(crate) async fn reject(
     pool: Arc<RuntimeDbPool>,
     write: ConfirmedWrite,
-    stream: StreamKey,
+    bootstrap: ContextBootstrap,
     candidate_id: Uuid,
 ) -> Result<RejectOutcome, ErrorCode> {
-    let workspace = write
-        .request
-        .workspace_id()
-        .ok_or(ErrorCode::DependencyUnavailable)?;
-    let authorization = write.request.authorization().narrow(workspace)?;
-    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
-        return Err(ErrorCode::DependencyUnavailable);
-    }
+    // No ticket is issued, but the same scope gate (and the pair's provisioning) applies.
+    let (authorization, _stream) = confirmed_write_scope(&pool, &write, &bootstrap).await?;
     distill_repo::reject_candidate_atomically(
         &pool,
         &authorization,
@@ -671,23 +640,16 @@ pub(crate) async fn reject(
 }
 
 /// §36 `memory.archive` / `memory.unarchive`, second (confirmed) call (ADR-0024). Same
-/// `read_scope` workspace rule as the other governance writes: the lifecycle ticket lands on
-/// the bootstrap stream's workspace. `op` is `MemoryArchive` or `MemoryUnarchive`.
+/// `write_scope` rule as the other governance writes: the lifecycle ticket lands on the
+/// request's own (tenant, workspace) stream. `op` is `MemoryArchive` or `MemoryUnarchive`.
 pub(crate) async fn archive(
     pool: Arc<RuntimeDbPool>,
     write: ConfirmedWrite,
-    stream: StreamKey,
+    bootstrap: ContextBootstrap,
     op: DestructiveOp,
     target: MemoryId,
 ) -> Result<ArchiveResult, ErrorCode> {
-    let workspace = write
-        .request
-        .workspace_id()
-        .ok_or(ErrorCode::DependencyUnavailable)?;
-    let authorization = write.request.authorization().narrow(workspace)?;
-    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
-        return Err(ErrorCode::DependencyUnavailable);
-    }
+    let (authorization, stream) = confirmed_write_scope(&pool, &write, &bootstrap).await?;
     memory_governance_repo::archive_or_unarchive_atomically(
         &pool,
         &authorization,
@@ -706,9 +668,8 @@ pub(crate) async fn archive(
 }
 
 /// §36 `memory.pin` / `memory.unpin`, second (confirmed) call (ADR-0019). The PINNED row is
-/// scoped to the credential's bound workspace, which must be the bootstrap stream's
-/// workspace — the same rule `memory.supersede` applies — so `context.assemble` reads it back
-/// through the same scope chain.
+/// scoped to the guard-routed, narrowed and provisioned workspace (`write_scope`, the rule
+/// `memory.supersede` applies) so `context.assemble` reads it back through the same scope chain.
 // Eight arguments: the four binding ops share one route, and the last three
 // (`task`, `replaces_binding_id`, `purpose`) are each required by exactly one of them.
 // Bundling them into a struct would move the same values one line up and lose the
@@ -717,7 +678,7 @@ pub(crate) async fn archive(
 pub(crate) async fn write_binding(
     pool: Arc<RuntimeDbPool>,
     write: ConfirmedWrite,
-    stream: StreamKey,
+    bootstrap: ContextBootstrap,
     op: DestructiveOp,
     memory: MemoryId,
     task: Option<humaux_domain::ids::TaskId>,
@@ -726,14 +687,9 @@ pub(crate) async fn write_binding(
     // writes a task authorization alongside the binding.
     purpose: Option<humaux_domain::context::BindingPurpose>,
 ) -> Result<BindingWriteOutcome, ErrorCode> {
-    let workspace = write
-        .request
-        .workspace_id()
-        .ok_or(ErrorCode::DependencyUnavailable)?;
-    let authorization = write.request.authorization().narrow(workspace)?;
-    if stream.tenant_id != authorization.tenant_id() || stream.scope_id != workspace.0 {
-        return Err(ErrorCode::DependencyUnavailable);
-    }
+    let (authorization, stream) = confirmed_write_scope(&pool, &write, &bootstrap).await?;
+    // The PINNED / MANDATORY row is scoped to the narrowed, provisioned request workspace.
+    let workspace = WorkspaceId(stream.scope_id);
     let request = BindingWriteRequest {
         request_id: write.request.request_id(),
         request_fingerprint: write.request_fingerprint,
@@ -779,9 +735,9 @@ pub(crate) async fn write_binding(
 /// credential's tenant + that workspace and admit it only if its ledger key was initialised
 /// (`ContextBootstrap::provisioned_request_stream`, ADR-0031 D-A / ADR-0053 D-E). The routes
 /// are PostgreSQL-authoritative and do not need a serving version (it only scopes the §23.1②
-/// visible count). The bootstrap stream's tenant/workspace are not compared against the
-/// request here — one process serves every provisioned pair; an uninitialised one is
-/// `DEPENDENCY_UNAVAILABLE`, and an invisible object stays `NOT_FOUND`.
+/// visible count). No process pair exists to compare against (ADR-0054 D-D) — one process serves
+/// every provisioned pair; an uninitialised one is `DEPENDENCY_UNAVAILABLE`, and an invisible
+/// object stays `NOT_FOUND`.
 async fn read_scope(
     pool: &RuntimeDbPool,
     authorization: AuthorizationScope,
@@ -819,23 +775,40 @@ async fn read_scope(
     Ok((authorization, scope, family, stream, serving_version))
 }
 
-/// The write-route scope rule for the non-confirm-gated writers that share the memory op
-/// (`subject_register`, `subject_link_key`, `annotate_affect`): until card 11 lifts the write
-/// route, a write may only land on the one bootstrap-configured stream, so the request's
-/// (tenant, workspace) must still equal it — the constant comparison the read routes dropped.
-fn write_scope(
+/// The write-route scope rule (ADR-0054 D-A) for all 14 governance / subject / affect writes: the
+/// read routes' derivation minus the serving version — membership-narrow to the requested
+/// workspace (`Forbidden` outside `live ∩ bound ∩ requested`), then the per-request stream of the
+/// principal's tenant + that workspace, admitted only if its ledger key was initialised
+/// (`provisioned_request_stream`, uninitialised ⇒ `DEPENDENCY_UNAVAILABLE`). Deliberately not the
+/// pure `request_stream` remember.put uses: ticket issuance INSERTs a missing checkpoint row, so a
+/// governance write would otherwise initialise a pair no one provisioned. There is no process
+/// pair to compare against; the in-transaction recheck is the adapter's
+/// (`confirm_token_repo::set_write_authorization_local`).
+async fn write_scope(
+    pool: &RuntimeDbPool,
     authorization: AuthorizationScope,
     requested_workspace: Option<WorkspaceId>,
     bootstrap: &ContextBootstrap,
-) -> Result<AuthorizationScope, ErrorCode> {
-    let workspace = requested_workspace.ok_or(ErrorCode::DependencyUnavailable)?;
-    let authorization = authorization.narrow(workspace)?;
-    if bootstrap.stream.tenant_id != authorization.tenant_id()
-        || bootstrap.stream.scope_id != workspace.0
-    {
-        return Err(ErrorCode::DependencyUnavailable);
-    }
-    Ok(authorization)
+) -> Result<(AuthorizationScope, StreamKey), ErrorCode> {
+    let (authorization, _scope, _family, stream, _serving) =
+        read_scope(pool, authorization, requested_workspace, bootstrap).await?;
+    Ok((authorization, stream))
+}
+
+/// [`write_scope`] for a confirmed second leg: the guard-routed workspace (requested, else the
+/// credential's binding) of the admitted request.
+async fn confirmed_write_scope(
+    pool: &RuntimeDbPool,
+    write: &ConfirmedWrite,
+    bootstrap: &ContextBootstrap,
+) -> Result<(AuthorizationScope, StreamKey), ErrorCode> {
+    write_scope(
+        pool,
+        write.request.authorization().clone(),
+        write.request.workspace_id(),
+        bootstrap,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)] // One envelope assembly over the read's fixed inputs + the affect axis.

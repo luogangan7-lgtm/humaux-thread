@@ -1,0 +1,38 @@
+# §46.1 migration manifest. ADR-0054 D-C (card 29): control.confirm_tokens.workspace_id (nullable
+# uuid) and the composite FK (tenant_id, workspace_id) -> control.workspaces. The EXPAND half only:
+# the old and the new gateway binary both run against it; the NOT NULL CHECK is a later CONTRACT
+# migration after the observation window (ADR-0054 D-H). No grant change, no DML.
+# §46 forward-fix (EXPAND_CONTRACT, first free after 0186).
+
+migration_id = "0187_confirm_tokens_workspace_binding"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.confirm_tokens') is not null
+ and not exists (select 1 from pg_attribute where attrelid = to_regclass('control.confirm_tokens')
+                  and attname = 'workspace_id' and not attisdropped)
+ and exists (select 1 from pg_constraint where conrelid = to_regclass('control.workspaces')
+              and conname = 'workspaces_tenant_workspace_key' and contype = 'u')
+ as precheck_ok
+"""
+
+postcheck = """
+select exists (select 1 from pg_attribute a where a.attrelid = to_regclass('control.confirm_tokens')
+                and a.attname = 'workspace_id' and a.atttypid = 'uuid'::regtype
+                and not a.attnotnull and not a.attisdropped)
+ and not exists (select 1 from pg_constraint c where c.conrelid = to_regclass('control.confirm_tokens')
+              and c.contype = 'c' and pg_get_constraintdef(c.oid) like '%workspace_id%')
+ and exists (select 1 from pg_constraint c where c.conrelid = to_regclass('control.confirm_tokens')
+              and c.conname = 'confirm_tokens_tenant_workspace_fk' and c.contype = 'f'
+              and c.confrelid = to_regclass('control.workspaces'))
+ and has_column_privilege('role_gateway','control.confirm_tokens','workspace_id','INSERT')
+ and not has_column_privilege('role_gateway','control.confirm_tokens','workspace_id','UPDATE')
+ and has_column_privilege('role_gateway','control.confirm_tokens','consumed_at','UPDATE')
+ and not has_table_privilege('role_gateway','control.confirm_tokens','DELETE')
+ and exists (select 1 from pg_trigger where tgrelid = to_regclass('control.confirm_tokens')
+              and tgname = 'confirm_token_single_use' and not tgisinternal)
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Roll back the gateway binary first (the ADR-0054 binary INSERTs and matches workspace_id; the pre-card-29 binary runs unchanged on this expand-only schema because the column is nullable and nothing CHECKs it), then ALTER TABLE control.confirm_tokens DROP CONSTRAINT confirm_tokens_tenant_workspace_fk, DROP COLUMN workspace_id. Tokens minted by the new binary are then unbound again (expire within the confirm TTL). Once the later CONTRACT migration has added the NOT NULL CHECK, its rollback is the reverse: DROP that CHECK first (the new binary keeps working), then roll back the binary."
+backup_restore_requirement = "none: DDL only, no DML; dropping the column loses only the per-token workspace binding of short-lived rows."

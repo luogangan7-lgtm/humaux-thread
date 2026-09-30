@@ -82,7 +82,9 @@ fn db_error(error: sqlx::Error) -> ErrorCode {
         sqlx::Error::Database(ref db) => match db.code().as_deref() {
             Some("42501") => ErrorCode::Forbidden,
             Some("23503") => ErrorCode::TenantBoundary,
-            Some("23505" | "40001" | "40P01" | "55P03" | "23514") => ErrorCode::Conflict,
+            // 55000: the ADR-0053 PROVISIONING write gate — reachable since ADR-0054 lands the
+            // annotate ticket on the request's own pair (a definite, rolled-back refusal).
+            Some("23505" | "40001" | "40P01" | "55P03" | "23514" | "55000") => ErrorCode::Conflict,
             Some("22023" | "22P02" | "22003") => ErrorCode::InvalidInput,
             _ => ErrorCode::Internal,
         },
@@ -361,7 +363,8 @@ pub async fn annotate(
     let tenant_id = auth.tenant_id().0;
     // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
-    confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
+    // ADR-0054 D-B: the write-scope recheck (principal + its one workspace) inside this txn.
+    confirm_token_repo::set_write_authorization_local(&mut txn, auth).await?;
 
     let head: Option<(String, Option<Uuid>)> = sqlx::query_as(
         "SELECT status, superseded_by FROM private.memory_records \

@@ -16,7 +16,7 @@ humaux-contracts = { path = "../../crates/contracts" }
 humaux-domain = { path = "../../crates/domain" }
 # why: MCP/HTTP edge protocol types and middleware; used-by: [gateway::auth, gateway::bootstrap, gateway::guard, gateway::mcp_application, gateway::recall, tests]
 humaux-protocol = { path = "../../crates/protocol" }
-# why: projection cards/serving types for recall and ingest; used-by: [gateway::bootstrap, gateway::context, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, tests]
+# why: projection cards/serving types for recall and ingest; used-by: [gateway::context, gateway::memory, gateway::recall, gateway::remember, tests]
 humaux-projection = { path = "../../crates/projection" }
 # why: retrieval request/envelope/planner (sole request constructor, §55.1); used-by: [gateway::context, gateway::memory, gateway::recall, tests]
 humaux-retrieval = { path = "../../crates/retrieval" }
@@ -42,7 +42,7 @@ time = { version = "0.3", features = ["parsing"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "signal"] }
 # why: UUID ids (v7) and parsing; used-by: [gateway::bootstrap, gateway::context, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, gateway::retrieval_embedding_client, tests]
 uuid = { version = "1.25.0", features = ["v7", "serde"] }
-# why: runtime SQL through the typed per-role pools; used-by: [gateway::remember, tests]
+# why: runtime SQL through the typed per-role pools; used-by: [tests]
 sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "uuid", "time"] }
 
 [dev-dependencies]

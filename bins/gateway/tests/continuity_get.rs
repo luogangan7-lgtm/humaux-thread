@@ -1,6 +1,6 @@
 //! `gateway::tests::continuity_get` — Real native MCP -> Gateway -> application -> one PostgreSQL RR continuity.get
 //!   witness.
-//! Depends-on: crates=[axum, humaux-adapters, humaux-contracts, humaux-domain, humaux-projection, humaux-protocol,
+//! Depends-on: crates=[axum, humaux-adapters, humaux-contracts, humaux-domain, humaux-protocol,
 //!   humaux-testkit, postgres, serde_json, sha2, time, tokio, uuid]; services=[PostgreSQL(role_gateway)
 //!   r=[control.audit_events, control.usage_reservations, private.memory_records] w=[control.api_keys,
 //!   control.memberships, control.tenants, control.workspaces, private.continuity_facet_evidence_links,
@@ -9,8 +9,8 @@
 //!   HTTP(gateway)]; env=[HUMAUX_CONTINUITY_W2_FORCE_NATIVE_CLEANUP_FAILURE,
 //!   HUMAUX_CONTINUITY_W2_FORCE_NATIVE_PANIC]; modules=[adapters::postgres, adapters::quota_repo,
 //!   adapters::tests::support::operation_receipt_fixture, contracts::retrieval_config, domain::context,
-//!   domain::dataclass, domain::identity, domain::ids, gateway::context, gateway::guard, gateway::mcp_application,
-//!   gateway::remember, humaux-testkit, projection::stream, protocol::edge, protocol::mcp, protocol::mcp_catalog]
+//!   domain::dataclass, domain::identity, gateway::context, gateway::guard, gateway::mcp_application,
+//!   gateway::remember, humaux-testkit, protocol::edge, protocol::mcp, protocol::mcp_catalog]
 //! Called-by: [cargo-test]
 //! Invariants: [each test connects, seeds and tears down its own PostgreSQL fixture; no test shares state across HUMAUX_CONTINUITY_W2_* fault-injection runs]
 //! Spec: Baseline §73.5.1; ADR-0035
@@ -25,16 +25,13 @@ use std::{
 };
 
 use humaux_adapters::{postgres::RuntimeDbPool, quota_repo::RatePolicy};
-use humaux_domain::{
-    context::ContextBudget, dataclass::DataClass, identity::VisibilityClass, ids::TenantId,
-};
+use humaux_domain::{context::ContextBudget, dataclass::DataClass, identity::VisibilityClass};
 use humaux_gateway::{
     context::ContextBootstrap,
     guard::{GatewayGuard, GuardRatePolicies, GuardSettings},
     mcp_application::GatewayMcpApplication,
-    remember::{RememberEventKind, RememberPolicy},
+    remember::{ProcessFamily, RememberEventKind, RememberPolicy},
 };
-use humaux_projection::stream::StreamKey;
 use humaux_protocol::{
     edge::{Cidr, TrustedProxyConfig, compute_api_key_hash},
     mcp::{McpAdapter, McpHttpConfig, ToolName},
@@ -101,14 +98,8 @@ fn guard(runtime: RuntimeDbPool) -> Arc<GatewayGuard> {
 
 fn application(handle: &Handle, runtime: RuntimeDbPool) -> GatewayMcpApplication {
     let policy = RememberPolicy::new(
-        StreamKey::new(
-            TenantId(handle.tenant_id),
-            "workspace",
-            handle.workspace_id,
-            "knowledge",
-            "ingest",
-            "v1",
-        ),
+        // ADR-0054 D-D: the family only — no default (tenant, workspace) pair.
+        ProcessFamily::new("workspace", "knowledge", "ingest", "v1").expect("trusted family"),
         handle.reasoning_domain_id,
         Duration::from_secs(60),
         DataClass::Internal,

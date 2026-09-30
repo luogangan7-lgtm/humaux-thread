@@ -91,10 +91,10 @@
 | `HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION` | runtime | process(cargo-xtask), process(humaux-gateway) | `gateway::bootstrap`, `gateway::tests::mcp_gateway`, `xtask::e2e_onboard` | literal | gateway |
 | `HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID` | runtime | process(cargo-xtask), process(humaux-gateway) | `gateway::bootstrap`, `gateway::tests::mcp_gateway`, `xtask::e2e_onboard` | literal | gateway |
 | `HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND` | runtime | process(cargo-xtask), process(humaux-gateway) | `gateway::bootstrap`, `gateway::tests::mcp_gateway`, `xtask::e2e_onboard` | literal | gateway |
-| `HUMAUX_GATEWAY_REMEMBER_TENANT_ID` | runtime | process(cargo-xtask), process(humaux-gateway) | `gateway::bootstrap`, `gateway::tests::mcp_gateway`, `xtask::e2e_onboard` | literal | gateway |
+| `HUMAUX_GATEWAY_REMEMBER_TENANT_ID` | runtime | process(cargo-xtask), process(humaux-gateway) | `gateway::bootstrap`, `xtask::e2e_onboard` | literal | gateway |
 | `HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS` | runtime | process(cargo-xtask), process(humaux-gateway) | `gateway::bootstrap`, `gateway::tests::mcp_gateway`, `xtask::e2e_onboard` | literal | gateway |
 | `HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS` | runtime | process(cargo-xtask), process(humaux-gateway) | `gateway::bootstrap`, `gateway::tests::mcp_gateway`, `xtask::e2e_onboard` | literal | gateway |
-| `HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID` | runtime | process(cargo-xtask), process(humaux-gateway) | `gateway::bootstrap`, `gateway::tests::mcp_gateway`, `xtask::e2e_onboard` | literal | gateway |
+| `HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID` | runtime | process(cargo-xtask), process(humaux-gateway) | `gateway::bootstrap`, `xtask::e2e_onboard` | literal | gateway |
 | `HUMAUX_GATEWAY_REPLAY_TTL_SECONDS` | runtime | process(cargo-xtask), process(humaux-gateway) | `gateway::bootstrap`, `gateway::tests::mcp_gateway`, `xtask::e2e_onboard` | literal | gateway |
 | `HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS` | runtime | process(cargo-xtask), process(humaux-gateway) | `gateway::bootstrap`, `gateway::tests::mcp_gateway`, `xtask::e2e_onboard` | literal | gateway |
 | `HUMAUX_GATEWAY_RETRIEVAL_PROFILE_PRODUCTION_ENABLED` | runtime | process(humaux-gateway) | `gateway::bootstrap` | literal | gateway |

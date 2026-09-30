@@ -9,7 +9,10 @@
 [`docs/architecture/env_vars.md`](../architecture/env_vars.md), generated from the code by
 `cargo xtask dep-map --write`. It covers every variable, which process and module reads it, and
 whether the typed registry declares it. `cargo xtask dep-map --check` fails when the list and the
-code drift apart. Look a variable up there rather than copying it here.
+code drift apart. Look a variable up there rather than copying it here. One gateway fact that
+list cannot show: since card 29 (ADR-0054) the gateway needs **no default write pair** — every
+write derives (tenant, workspace) per request, and the two `REMEMBER_TENANT_ID` /
+`REMEMBER_WORKSPACE_ID` keys are accepted-and-ignored (e2e tooling only).
 
 ## 1. The five processes and how each answers "are you up"
 
@@ -51,7 +54,7 @@ never report a healthy-but-empty reading — §4.4 坑5, "没有" ≠ "没扫到
 
 | symptom | means | action |
 |---|---|---|
-| `/livez` connection refused | the gateway process is gone or never bound | restart; check bootstrap stderr for the missing configuration key |
+| `/livez` connection refused | the gateway process is gone or never bound | restart; check bootstrap stderr for the missing configuration key. A default write pair is **not** one of them since card 29 (ADR-0054): `HUMAUX_GATEWAY_REMEMBER_TENANT_ID` / `_WORKSPACE_ID` are optional and ignored (a present value must still be a UUID — a malformed one is the only way they fail boot) |
 | `/readyz` → 503 `draining` | SIGTERM was received; the process is finishing in-flight requests | take it out of rotation; do **not** restart it, it will exit on its own |
 | `/readyz` connection refused, `/livez` too | the drain window already elapsed, or the process died | treat as gone; restart per §3 |
 | `--readyz` names `PostgreSQL as role_*` | the DB is down, the DSN is wrong, or the role does not exist / does not match `current_user` | do not restart the worker in a loop — it will fail identically. Fix PostgreSQL or the DSN first |

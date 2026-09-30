@@ -7,7 +7,7 @@
 //!   protocol::mcp_catalog]
 //! Called-by: [gateway::bootstrap, gateway::mcp_application, gateway::memory, tests]
 //! Invariants: [transport owns HTTP validation only; this layer is the sole place that authenticates, authorizes and admits a request, so an operation that bypasses it is a bug, not a variant path]
-//! Spec: Baseline §83; §52.1; ADR-0018; ADR-0028; ADR-0030
+//! Spec: Baseline §83; §52.1; ADR-0018; ADR-0028; ADR-0030; ADR-0054
 //!
 //! Transport owns HTTP validation; this layer owns authentication through finalization.
 
@@ -742,7 +742,8 @@ impl GatewayGuard {
     /// A confirm-gated local write (§33.10 rule 9, ADR-0018). Same admission as every other
     /// route; the first call mints a token (one transaction: token row + finished audit, no
     /// other durable write, no BMO); the second call runs `handler` under the handler
-    /// timeout with the claim it must consume in its own transaction.
+    /// timeout with the claim it must consume in its own transaction. The token binds the
+    /// routed workspace (ADR-0054): presented in another workspace it matches nothing (CONFLICT).
     pub(crate) async fn run_confirmed_write<T, F, Fut>(
         &self,
         context: &McpHttpContext,
@@ -841,19 +842,27 @@ impl GatewayGuard {
         result
     }
 
-    /// D-B first call: mint the nonce, persist only its digest + the finished audit.
+    /// D-B first call: mint the nonce, persist only its digest + the finished audit. ADR-0054
+    /// D-C: the token binds the routed workspace — an admitted request without one (an unbound
+    /// PAT on a confirm-gated op, whose schema carries no `workspace_id`) is refused before any
+    /// row is written, with the code its second leg would answer.
     async fn mint_confirmation(
         &self,
         admitted: &AdmittedOperation,
         gate: &ConfirmGate,
         finished_audit: &AuditEvent,
     ) -> Result<(ConfirmToken, OffsetDateTime), ErrorCode> {
+        let workspace = admitted
+            .request
+            .workspace_id()
+            .ok_or(ErrorCode::DependencyUnavailable)?;
+        let authorization = admitted.request.authorization().narrow(workspace)?;
         let token = humaux_application::supersede::mint_confirm_token();
         let minted = tokio::time::timeout(
             self.settings.handler_timeout,
             confirm_token_repo::mint_with_audit(
                 &self.pool,
-                admitted.request.authorization(),
+                &authorization,
                 gate.op,
                 gate.target_id,
                 gate.successor_id,

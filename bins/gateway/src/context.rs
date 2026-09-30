@@ -3,7 +3,7 @@
 //!   uuid]; services=[]; env=[]; modules=[adapters::context_repo, adapters::postgres, adapters::read_materialize, adapters::serving_repo, domain::context, domain::error, domain::identity, domain::ids, gateway::recall, gateway::remember, projection::serving, projection::stream, retrieval::compiler, retrieval::completeness, retrieval::envelope, retrieval::handoff, retrieval::request]
 //! Called-by: [gateway::bootstrap, gateway::mcp_application, gateway::memory, gateway::recall, tests]
 //! Invariants: [every field in a returned Context is read from the same snapshot; a partial read never yields a body silently missing a section]
-//! Spec: Baseline §22.0; §23.1; §25; ADR-0024; ADR-0031
+//! Spec: Baseline §22.0; §23.1; §25; ADR-0024; ADR-0031; ADR-0054
 
 use std::{
     collections::BTreeMap,
@@ -41,14 +41,19 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{recall::SemanticRecallRuntime, remember::RememberPolicy};
+use crate::{
+    recall::SemanticRecallRuntime,
+    remember::{ProcessFamily, RememberPolicy},
+};
 
-/// Trusted bootstrap state. Neither the stream nor the profile can come from MCP input.
+/// Trusted bootstrap state. Neither the stream family nor the profile can come from MCP input;
+/// the (tenant, workspace) half of every stream key is the request's own (ADR-0031 D-A,
+/// ADR-0054 D-D) — this state holds no pair.
 #[derive(Debug, Clone)]
 pub struct ContextBootstrap {
     budget: ContextBudget,
     pub(crate) profile: RegisteredRetrievalProfile,
-    pub(crate) stream: StreamKey,
+    family: ProcessFamily,
     pub(crate) binary_build: String,
     /// §23.1②: the Qdrant face the PG-only read routes borrow to take a live `visible` count.
     /// `None` on a deployment with no semantic lane configured — the routes then pass `None`
@@ -68,7 +73,7 @@ impl ContextBootstrap {
         Ok(Self {
             budget,
             profile,
-            stream: write_policy.stream_key().clone(),
+            family: write_policy.family().clone(),
             binary_build: executable_fingerprint()?,
             index: None,
         })
@@ -105,8 +110,8 @@ impl ContextBootstrap {
     /// principal tenant + the requested (already membership-narrowed) workspace + this process's
     /// `(scope_kind, domain, projection_kind, projection_version)`. No registry table and no
     /// process-wide cache: the six-tuple itself is the identity, and computing it costs no PG
-    /// round trip. The bootstrap `stream`'s own `tenant_id` / `scope_id` are deliberately not
-    /// consulted here — they bind only the write route until card 11 lifts it.
+    /// round trip. The process holds no (tenant, workspace) pair of its own (ADR-0054 D-D): the
+    /// reads, `remember.put` and the governance / subject / affect writes all derive here.
     pub(crate) fn request_stream(
         &self,
         tenant_id: TenantId,
@@ -114,12 +119,12 @@ impl ContextBootstrap {
     ) -> (StreamFamily, StreamKey) {
         let family = StreamFamily::new(
             tenant_id,
-            self.stream.scope_kind.clone(),
+            self.family.scope_kind.clone(),
             workspace.0,
-            self.stream.domain.clone(),
-            self.stream.projection_kind.clone(),
+            self.family.domain.clone(),
+            self.family.projection_kind.clone(),
         );
-        let key = family.with_version(self.stream.projection_version.clone());
+        let key = family.with_version(self.family.projection_version.clone());
         (family, key)
     }
 

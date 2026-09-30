@@ -5,8 +5,9 @@
 //! Called-by: [adapters::context_repo, adapters::memory_governance_repo, gateway::mcp_application, gateway::memory, private-worker::distill]
 //! Invariants: [memories, run completion and the outbox DONE flip commit in ONE transaction fenced on lease_owner, so
 //!   a reclaimed worker's inserts roll back; every read runs under role_private_worker grants + RLS with the acting
-//!   user installed first]
-//! Spec: Baseline §15.5; §14; ADR-0016; §6.1.1
+//!   user installed first; memory.confirm / memory.reject lock a candidate only inside the narrowed write scope
+//!   (its visibility against the scope's one workspace and user, ADR-0054)]
+//! Spec: Baseline §15.5; §14; ADR-0016; §6.1.1; ADR-0054
 //!
 //! §15.5: one Evidence → 0/1/N `private.memory_records`; §14: the `ops.outbox` row remember wrote
 //! is the work item (PENDING → PROCESSING with a lease → DONE | FAILED, or back to PENDING when
@@ -814,31 +815,50 @@ fn validate_candidate_write(
     Ok(())
 }
 
-/// Reads the candidate by (candidate_id, sha) under the caller's tenant RLS. `None` = no such
-/// row visible to this tenant (invisible/cross-tenant/sha-mismatch) → the caller returns
-/// NOT_FOUND. Uses `FOR UPDATE` to serialize concurrent confirm/reject on the same row.
+/// ADR-0054 D-B: a candidate is writable only inside the narrowed write scope — the same
+/// visibility disjunction [`list_pending_candidates`] lists by (`$ws` = the scope's one
+/// workspace, `$user` = its user). The table's RLS is tenant-only (0152: visibility is data), so
+/// without this a member routed to W2 could reject / confirm a W1 WORKSPACE_SHARED (or another
+/// user's USER_PRIVATE) candidate by id. Out of scope reads as absent (NOT_FOUND, no oracle).
+fn candidate_in_scope(ws: &str, user: &str) -> String {
+    format!(
+        "(visibility_class = 'TENANT_SHARED' \
+          OR (visibility_class = 'WORKSPACE_SHARED' AND visibility_workspace_id = {ws}) \
+          OR (visibility_class = 'USER_PRIVATE' AND visibility_user_id = {user}))"
+    )
+}
+
+/// Reads the candidate by (candidate_id, sha) under the caller's tenant RLS and write scope
+/// ([`candidate_in_scope`]). `None` = no such row visible to this scope
+/// (invisible/cross-tenant/other-workspace/sha-mismatch) → the caller returns NOT_FOUND. Uses
+/// `FOR UPDATE` to serialize concurrent confirm/reject on the same row.
 async fn lock_candidate(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    tenant_id: Uuid,
+    auth: &AuthorizationScope,
+    workspace: WorkspaceId,
     candidate_id: Uuid,
     sha256: &[u8],
 ) -> Result<Option<LockedCandidate>, ErrorCode> {
-    let Some(row) = sqlx::query(
+    let sql = format!(
         "SELECT state, expires_at <= clock_timestamp() AS expired, source_evidence_id, \
                 candidate_body, \
                 candidate_sha256, requested_class, memory_type, confidence, data_class, \
                 visibility_class, visibility_user_id, visibility_workspace_id, \
                 reasoning_domain_id, occurred_at \
          FROM private.distill_candidates \
-         WHERE tenant_id = $1 AND candidate_id = $2 AND candidate_sha256 = $3 \
+         WHERE tenant_id = $1 AND candidate_id = $2 AND candidate_sha256 = $3 AND {} \
          FOR UPDATE",
-    )
-    .bind(tenant_id)
-    .bind(candidate_id)
-    .bind(sha256)
-    .fetch_optional(&mut **txn)
-    .await
-    .map_err(candidate_db_error)?
+        candidate_in_scope("$4", "$5")
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(auth.tenant_id().0)
+        .bind(candidate_id)
+        .bind(sha256)
+        .bind(workspace.0)
+        .bind(auth.user_id().map_or_else(Uuid::nil, |u| u.0))
+        .fetch_optional(&mut **txn)
+        .await
+        .map_err(candidate_db_error)?
     else {
         return Ok(None);
     };
@@ -911,11 +931,12 @@ pub async fn confirm_candidate_atomically(
     }
     // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(candidate_db_error)?;
-    confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
+    let workspace = confirm_token_repo::set_write_authorization_local(&mut txn, auth).await?;
 
     let Some(candidate) = lock_candidate(
         &mut txn,
-        auth.tenant_id().0,
+        auth,
+        workspace,
         request.candidate_id,
         &request.candidate_sha256,
     )
@@ -1224,18 +1245,23 @@ pub async fn reject_candidate_atomically(
     )?;
     // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(candidate_db_error)?;
-    confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
+    let workspace = confirm_token_repo::set_write_authorization_local(&mut txn, auth).await?;
 
-    // Read state (tenant RLS) to distinguish the refusal reason before any write.
-    let Some(row) = sqlx::query(
+    // Read state (tenant RLS + the write scope, ADR-0054) to distinguish the refusal reason
+    // before any write; a candidate outside the scope is NOT_FOUND.
+    let sql = format!(
         "SELECT state FROM private.distill_candidates \
-         WHERE tenant_id = $1 AND candidate_id = $2 FOR UPDATE",
-    )
-    .bind(auth.tenant_id().0)
-    .bind(request.candidate_id)
-    .fetch_optional(&mut *txn)
-    .await
-    .map_err(candidate_db_error)?
+         WHERE tenant_id = $1 AND candidate_id = $2 AND {} FOR UPDATE",
+        candidate_in_scope("$3", "$4")
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(auth.tenant_id().0)
+        .bind(request.candidate_id)
+        .bind(workspace.0)
+        .bind(auth.user_id().map_or_else(Uuid::nil, |u| u.0))
+        .fetch_optional(&mut *txn)
+        .await
+        .map_err(candidate_db_error)?
     else {
         return Err(ErrorCode::NotFound);
     };
@@ -1320,23 +1346,23 @@ pub async fn list_pending_candidates(
     let mut txn = pool.pool().begin().await.map_err(candidate_db_error)?;
     confirm_token_repo::set_authorization_local(&mut txn, auth).await?;
     let user_id = auth.user_id().map_or_else(Uuid::nil, |u| u.0);
-    let rows = sqlx::query(
+    let sql = format!(
         "SELECT candidate_id, candidate_sha256, candidate_body, requested_class, memory_type, \
                 rejection_reason, confidence, source_evidence_id, created_at, expires_at \
          FROM private.distill_candidates \
          WHERE tenant_id = $1 AND state = 'PENDING' AND expires_at > clock_timestamp() \
-           AND (visibility_class = 'TENANT_SHARED' \
-                OR (visibility_class = 'WORKSPACE_SHARED' AND visibility_workspace_id = $2) \
-                OR (visibility_class = 'USER_PRIVATE' AND visibility_user_id = $3)) \
+           AND {} \
          ORDER BY created_at DESC LIMIT $4",
-    )
-    .bind(auth.tenant_id().0)
-    .bind(workspace.0)
-    .bind(user_id)
-    .bind(limit)
-    .fetch_all(&mut *txn)
-    .await
-    .map_err(candidate_db_error)?;
+        candidate_in_scope("$2", "$3")
+    );
+    let rows = sqlx::query(&sql)
+        .bind(auth.tenant_id().0)
+        .bind(workspace.0)
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&mut *txn)
+        .await
+        .map_err(candidate_db_error)?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         out.push(PendingCandidate {

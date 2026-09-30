@@ -1,16 +1,15 @@
 //! `gateway::tests::read_decoupling` — ADR-0053 D-E wire tests: PG-authoritative reads without a serving version, the
 //!   B-shaped read, and the PROVISIONING write gate.
 //! Depends-on: crates=[async-trait, axum, humaux-adapters, humaux-application, humaux-contracts, humaux-domain,
-//!   humaux-infra-cell, humaux-local-secret-scan, humaux-projection, humaux-protocol, humaux-testkit, serde_json,
+//!   humaux-infra-cell, humaux-local-secret-scan, humaux-protocol, humaux-testkit, serde_json,
 //!   tokio, uuid]; services=[HTTP(gateway), PostgreSQL(owner) r=[ops.commit_seq_seq, ops.outbox, private.evidence_objects]
 //!   w=[control.workspaces, projection.stream_checkpoints, projection.stream_log, projection.tenant_placements],
 //!   Qdrant(*)]; env=[HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION,
 //!   HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::postgres, adapters::qdrant, adapters::quota_repo,
 //!   adapters::tests::support::operation_receipt_fixture, application::retrieval_embedding_port,
-//!   contracts::retrieval_config, domain::context, domain::dataclass, domain::error, domain::identity, domain::ids,
-//!   gateway::context, gateway::guard, gateway::mcp_application, gateway::recall, gateway::remember,
+//!   contracts::retrieval_config, domain::context, domain::dataclass, domain::error, domain::identity, gateway::context, gateway::guard, gateway::mcp_application, gateway::recall, gateway::remember,
 //!   humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
-//!   projection::stream, protocol::edge, protocol::mcp, protocol::mcp_catalog]
+//!   protocol::edge, protocol::mcp, protocol::mcp_catalog]
 //! Called-by: [cargo-test]
 //! Invariants: [each test runs against the isolated operation-receipt fixture tenant (torn down by the fixture); the
 //!   embedding port is a counting double, so "no embedding call on B" is observed; the READY test deletes its own
@@ -46,14 +45,13 @@ use humaux_application::retrieval_embedding_port::{
 };
 use humaux_domain::{
     context::ContextBudget, dataclass::DataClass, error::ErrorCode, identity::VisibilityClass,
-    ids::TenantId,
 };
 use humaux_gateway::{
     context::ContextBootstrap,
     guard::{GatewayGuard, GuardRatePolicies, GuardSettings},
     mcp_application::GatewayMcpApplication,
     recall::{SemanticRecallRuntime, SemanticRecallVersions},
-    remember::{RememberEventKind, RememberPolicy},
+    remember::{ProcessFamily, RememberEventKind, RememberPolicy},
 };
 use humaux_infra_cell::{
     CallerId, CellId, DEFAULT_MAX_RESPONSE_BYTES, HttpIntraCellTransport, IntraCellHttpTransport,
@@ -61,7 +59,6 @@ use humaux_infra_cell::{
     authorize_cell_access,
 };
 use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig};
-use humaux_projection::stream::StreamKey;
 use humaux_protocol::{
     edge::{TrustedProxyConfig, compute_api_key_hash},
     mcp::{McpAdapter, McpHttpConfig, ToolName},
@@ -199,14 +196,8 @@ struct Gateway {
 
 fn gateway(handle: &Handle) -> Gateway {
     let policy = RememberPolicy::new(
-        StreamKey::new(
-            TenantId(handle.tenant_id),
-            "workspace",
-            handle.workspace_id,
-            "knowledge",
-            "ingest",
-            "v1",
-        ),
+        // ADR-0054 D-D: the family only — no default (tenant, workspace) pair.
+        ProcessFamily::new("workspace", "knowledge", "ingest", "v1").expect("trusted family"),
         handle.reasoning_domain_id,
         Duration::from_secs(60),
         DataClass::Internal,

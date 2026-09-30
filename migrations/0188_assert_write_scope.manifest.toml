@@ -1,0 +1,41 @@
+# §46.1 migration manifest. ADR-0054 D-B (card 29): control.assert_write_scope(uuid,uuid), the
+# owner SECURITY DEFINER in-transaction recheck every governance / subject / affect write runs
+# after installing its RLS GUCs. Owner role_migration_owner, VOLATILE, search_path pinned to
+# pg_catalog, PUBLIC has no EXECUTE, role_gateway is the only non-owner role with EXECUTE. No table
+# grant, no DML. §46 forward-fix (EXPAND_CONTRACT, first free after 0187).
+
+migration_id = "0188_assert_write_scope"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('control.assert_write_scope(uuid,uuid)') is null
+ and to_regclass('control.workspace_memberships') is not null
+ and to_regclass('control.memberships') is not null
+ and exists (select 1 from pg_attribute where attrelid = to_regclass('control.api_keys')
+              and attname = 'user_security_epoch' and not attisdropped)
+ and exists (select 1 from pg_attribute where attrelid = to_regclass('control.api_keys')
+              and attname = 'tenant_security_epoch' and not attisdropped)
+ as precheck_ok
+"""
+
+postcheck = """
+select coalesce(bool_and(
+   pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef and p.provolatile = 'v'
+   and 'search_path=pg_catalog' = any(coalesce(p.proconfig,'{}'))
+   and has_function_privilege('role_gateway', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_maintenance', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_private_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_consolidation_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_public_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_retrieval_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_batch_issuer', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_admin', p.oid, 'EXECUTE')
+   and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                    where x.grantee = 0 and x.privilege_type = 'EXECUTE')), false)
+ and count(*) = 1 as postcheck_ok
+from pg_proc p
+where p.oid = to_regprocedure('control.assert_write_scope(uuid,uuid)')
+"""
+
+rollback_or_forward_fix = "Roll back the gateway binary first (the ADR-0054 adapters call the function in every governance write transaction), then DROP FUNCTION control.assert_write_scope(uuid, uuid)."
+backup_restore_requirement = "none: function only."
