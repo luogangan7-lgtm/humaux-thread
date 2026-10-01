@@ -4,13 +4,12 @@
 //!   stream cache) — the same family the 14 governance / subject / affect writes attach to since ADR-0054, so
 //!   the process holds no default write pair at all.
 //! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-contracts, humaux-domain, humaux-infra-cell,
-//!   humaux-local-secret-scan, humaux-protocol, tokio,
+//!   humaux-protocol, tokio,
 //!   uuid]; services=[PostgreSQL(role_gateway)]; env=[HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS,
 //!   HUMAUX_GATEWAY_BIND_ADDR, HUMAUX_GATEWAY_CALLER_ID, HUMAUX_GATEWAY_CELL_ID,
 //!   HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS,
 //!   HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX, HUMAUX_GATEWAY_EMBEDDING_DIMENSION,
-//!   HUMAUX_GATEWAY_EMBEDDING_VERSION, HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GITLEAKS_BIN,
-//!   HUMAUX_GATEWAY_GITLEAKS_SHA256, HUMAUX_GATEWAY_GITLEAKS_VERSION, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
+//!   HUMAUX_GATEWAY_EMBEDDING_VERSION, HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
 //!   HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST, HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS,
 //!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES,
 //!   HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS, HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_QDRANT_CIDR,
@@ -24,12 +23,11 @@
 //!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_PRODUCTION_ENABLED, HUMAUX_GATEWAY_RETRIEVAL_PROFILE_QUERY_TRANSFORM,
 //!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K, HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS,
 //!   HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS,
-//!   HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS, HUMAUX_GATEWAY_UNKNOWN, HUMAUX_TEST_GITLEAKS_BIN,
-//!   HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION]; modules=[adapters::postgres, adapters::quota_repo,
+//!   HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS, HUMAUX_GATEWAY_UNKNOWN]; modules=[adapters::postgres, adapters::quota_repo,
 //!   application::retrieval_embedding_port, contracts::config_registry, contracts::retrieval_config,
 //!   domain::context, domain::dataclass, domain::identity, gateway::context, gateway::guard,
 //!   gateway::mcp_application, gateway::recall, gateway::remember, gateway::retrieval_embedding_client,
-//!   humaux-local-secret-scan, infra-cell::permit, infra-cell::resource, infra-cell::transport, protocol::edge, protocol::mcp, protocol::mcp_catalog]
+//!   infra-cell::permit, infra-cell::resource, infra-cell::transport, protocol::edge, protocol::mcp, protocol::mcp_catalog]
 //! Called-by: [gateway::main]
 //! Invariants: [one process serves every (tenant, workspace) pair with no per-process stream cache or registry table; GuardSettings::tenant_network stays empty until a separate authorization approves a tenant-specific network policy]
 //! Spec: Baseline §34.0.1; §78.1; ADR-0031; ADR-0032; ADR-0054
@@ -61,7 +59,6 @@ use humaux_infra_cell::{
     CallerId, CellAccessMode, CellCidr, CellId, DEFAULT_MAX_RESPONSE_BYTES, HttpIntraCellTransport,
     IntraCellResource, IntraCellResourceRegistry, ResourceEntry,
 };
-use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig};
 use humaux_protocol::{
     edge::{Cidr, TrustedProxyConfig},
     mcp::{McpAdapter, McpHttpConfig},
@@ -135,8 +132,8 @@ pub struct GatewayBootstrap {
 }
 
 /// Parsed `HUMAUX_GATEWAY_RETRIEVAL_RPC_*` / `HUMAUX_GATEWAY_EMBEDDING_*` /
-/// `HUMAUX_GATEWAY_QDRANT_*` / `HUMAUX_GATEWAY_CELL_ID` / `HUMAUX_GATEWAY_CALLER_ID` /
-/// `HUMAUX_GATEWAY_GITLEAKS_*` configuration — present only when
+/// `HUMAUX_GATEWAY_QDRANT_*` / `HUMAUX_GATEWAY_CELL_ID` / `HUMAUX_GATEWAY_CALLER_ID`
+/// configuration — present only when
 /// `HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH` is non-empty (`parse_semantic_recall`'s doc).
 struct SemanticRecallConfig {
     socket_path: String,
@@ -149,9 +146,6 @@ struct SemanticRecallConfig {
     qdrant_tls: bool,
     cell_id: CellId,
     caller_id: CallerId,
-    gitleaks_bin: String,
-    gitleaks_version: String,
-    gitleaks_sha256: String,
 }
 
 /// Ready-to-serve components for `main`: bind [`Self::bind_addr`], then serve
@@ -483,7 +477,7 @@ fn parse_context_bootstrap(
 /// `HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH` gates the whole feature: empty (not merely
 /// "unset" — see [`registry`]'s doc on why every declared key must literally be present, even
 /// blank) means semantic recall stays disabled and every other `HUMAUX_GATEWAY_{RETRIEVAL_RPC,
-/// EMBEDDING,QDRANT,CELL_ID,CALLER_ID,GITLEAKS}_*` key may itself be blank. A non-empty socket
+/// EMBEDDING,QDRANT,CELL_ID,CALLER_ID}_*` key may itself be blank. A non-empty socket
 /// path requires all of them filled in.
 fn parse_semantic_recall(
     effective: &BTreeMap<String, String>,
@@ -544,9 +538,6 @@ fn parse_semantic_recall(
             )?
             .to_owned(),
         ),
-        gitleaks_bin: required(effective, "HUMAUX_GATEWAY_GITLEAKS_BIN")?.to_owned(),
-        gitleaks_version: required(effective, "HUMAUX_GATEWAY_GITLEAKS_VERSION")?.to_owned(),
-        gitleaks_sha256: required(effective, "HUMAUX_GATEWAY_GITLEAKS_SHA256")?.to_owned(),
     }))
 }
 
@@ -611,21 +602,8 @@ fn build_semantic_recall_runtime(
             registry.clone(),
             config.permit_ttl,
         ));
-    let scanner = Arc::new(
-        LocalSecretScanner::new(LocalSecretScannerConfig {
-            executable: config.gitleaks_bin.into(),
-            expected_version: config.gitleaks_version,
-            expected_executable_sha256: config.gitleaks_sha256,
-            timeout: Duration::from_secs(5),
-            max_payload_bytes: 64 * 1024,
-            finding_exit_code: 1,
-        })
-        .map_err(|_| {
-            BootstrapError::new("HUMAUX_GATEWAY_GITLEAKS_*", "invalid local secret scanner")
-        })?,
-    );
+    // ADR-0056 D-C: no scanner here — the retrieval worker's `seal_query` is the one query seal.
     SemanticRecallRuntime::new(
-        scanner,
         embedding_port,
         qdrant_transport,
         registry,
@@ -714,9 +692,6 @@ fn registry() -> Vec<ConfigEntry> {
             ("QDRANT_TLS", "bool", false),
             ("CELL_ID", "uuid", false),
             ("CALLER_ID", "string", false),
-            ("GITLEAKS_BIN", "path", false),
-            ("GITLEAKS_VERSION", "string", false),
-            ("GITLEAKS_SHA256", "string", false),
         ]
         .into_iter()
         .map(|(suffix, type_name, secret)| {
@@ -993,10 +968,7 @@ mod tests {
                 | "HUMAUX_GATEWAY_QDRANT_CIDR"
                 | "HUMAUX_GATEWAY_QDRANT_TLS"
                 | "HUMAUX_GATEWAY_CELL_ID"
-                | "HUMAUX_GATEWAY_CALLER_ID"
-                | "HUMAUX_GATEWAY_GITLEAKS_BIN"
-                | "HUMAUX_GATEWAY_GITLEAKS_VERSION"
-                | "HUMAUX_GATEWAY_GITLEAKS_SHA256" => String::new(),
+                | "HUMAUX_GATEWAY_CALLER_ID" => String::new(),
                 key if key.contains("_CAPACITY") || key.contains("_REFILL_PER_SECOND") => {
                     "100".into()
                 }
@@ -1120,28 +1092,11 @@ mod tests {
             values.insert(key.into(), value.into());
         }
         values.insert("HUMAUX_GATEWAY_CELL_ID".into(), cell_id);
-        for (key, env) in [
-            ("HUMAUX_GATEWAY_GITLEAKS_BIN", "HUMAUX_TEST_GITLEAKS_BIN"),
-            (
-                "HUMAUX_GATEWAY_GITLEAKS_VERSION",
-                "HUMAUX_TEST_GITLEAKS_VERSION",
-            ),
-            (
-                "HUMAUX_GATEWAY_GITLEAKS_SHA256",
-                "HUMAUX_TEST_GITLEAKS_SHA256",
-            ),
-        ] {
-            values.insert(
-                key.into(),
-                std::env::var(env)
-                    .unwrap_or_else(|_| panic!("semantic recall bootstrap test requires {env}")),
-            );
-        }
         values
     }
 
     /// A non-empty `HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH` requires every other
-    /// `HUMAUX_GATEWAY_{RETRIEVAL_RPC,EMBEDDING,QDRANT,CELL_ID,CALLER_ID,GITLEAKS}_*` key —
+    /// `HUMAUX_GATEWAY_{RETRIEVAL_RPC,EMBEDDING,QDRANT,CELL_ID,CALLER_ID}_*` key —
     /// dropping any one of them must fail closed, never silently disable the lane.
     #[test]
     fn semantic_recall_requires_every_field_once_the_socket_path_is_set() {
@@ -1154,7 +1109,6 @@ mod tests {
             "HUMAUX_GATEWAY_QDRANT_CIDR",
             "HUMAUX_GATEWAY_CELL_ID",
             "HUMAUX_GATEWAY_CALLER_ID",
-            "HUMAUX_GATEWAY_GITLEAKS_BIN",
         ] {
             let mut broken = values.clone();
             broken.insert(key.into(), String::new());

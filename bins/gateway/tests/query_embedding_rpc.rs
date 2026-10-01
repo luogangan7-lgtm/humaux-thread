@@ -11,7 +11,7 @@
 //!   infra-cell::resource, retrieval-provider::adapters, retrieval-provider::contract, retrieval-worker::rpc]
 //! Called-by: [cargo-test]
 //! Invariants: [each test dials its own retrieval-worker UDS fixture and PostgreSQL pool; a fixture failure fails the test, it is never skipped silently]
-//! Spec: Baseline §2; ADR-0012
+//! Spec: Baseline §2; §7.5; ADR-0012; ADR-0056
 //!
 //! A separate-binary (two real OS processes) test is a later card; this proves the wire
 //! protocol, the peer-credential authentication ordering, and the DB-backed idempotency
@@ -148,6 +148,14 @@ impl EmbeddingProvider for CountingEmbedder {
 }
 
 async fn spawn_worker(expected_gateway_uid: u32, embedder: Arc<dyn EmbeddingProvider>) -> String {
+    spawn_worker_with(expected_gateway_uid, embedder, Arc::new(scanner())).await
+}
+
+async fn spawn_worker_with(
+    expected_gateway_uid: u32,
+    embedder: Arc<dyn EmbeddingProvider>,
+    scanner: Arc<LocalSecretScanner>,
+) -> String {
     let socket_path = temp_socket_path("worker");
     // dep: PostgreSQL(role_retrieval_worker) — test fixture pool for the query-embedding RPC suite
     let calls = RetrievalWorkerDbPool::connect(&required("HUMAUX_RETRIEVAL_WORKER_PG_DSN"))
@@ -156,7 +164,7 @@ async fn spawn_worker(expected_gateway_uid: u32, embedder: Arc<dyn EmbeddingProv
     let state = Arc::new(RpcState {
         expected_gateway_uid,
         calls,
-        scanner: Arc::new(scanner()),
+        scanner,
         embedder,
         dimension: 4,
         provider_id: "test-provider".to_owned(),
@@ -583,4 +591,128 @@ async fn gateway_retry_with_same_logical_call_id_replays_not_reregisters() {
         1,
         "a retry must never dispatch a second real provider call"
     );
+}
+
+/// Synthetic GitHub-shaped fixture (`crates/adapters/tests/contribution_scan.rs`), not a
+/// credential: the pinned gitleaks' finding for the ADR-0056 FORBIDDEN path.
+const FAKE_GITHUB_TOKEN: &str = "ghp_RkqFzVpLwNyHtBvDgXsWuCePjMoTnAiSyEkl";
+
+/// One `embed_query` through the real client, with fresh ids unless a logical call is given.
+async fn embed_once(
+    client: &GatewayRetrievalEmbeddingClient,
+    query: &str,
+    logical_call_id: Uuid,
+) -> RetrievalEmbeddingOutcome {
+    let workspace_id = WorkspaceId::new();
+    let authorization = authorization(workspace_id);
+    let fingerprint = profile_fingerprint();
+    client
+        .embed_query(RetrievalEmbeddingInput {
+            authorization: &authorization,
+            workspace_id,
+            request_id: Uuid::now_v7(),
+            logical_call_id,
+            attempt_no: 1,
+            profile_fingerprint: &fingerprint,
+            dimension: 4,
+            query,
+            deadline_unix_ms: deadline_unix_ms(),
+        })
+        .await
+        .expect("typed outcome")
+}
+
+async fn counting_worker(
+    scanner: Arc<LocalSecretScanner>,
+) -> (Arc<CountingEmbedder>, GatewayRetrievalEmbeddingClient) {
+    let counting = Arc::new(CountingEmbedder {
+        inner: TestDoubleProvider::new(embedding_model(), rerank_model()),
+        calls: AtomicUsize::new(0),
+    });
+    let embedder: Arc<dyn EmbeddingProvider> = counting.clone();
+    let socket_path = spawn_worker_with(own_uid().await, embedder, scanner).await;
+    let client = GatewayRetrievalEmbeddingClient::new(
+        runtime_pool().await,
+        socket_path,
+        cell_registry(),
+        Duration::from_secs(30),
+    );
+    (counting, client)
+}
+
+/// ADR-0056 D-C: the worker's seal is the one query seal. A gitleaks finding comes back as
+/// `SCAN_REJECTED` (the gateway's FORBIDDEN), the provider is never called — so nothing is
+/// disclosed and no query source is written — and a retry of the same logical call replays the
+/// stored refusal. Fault: map every seal error to SCANNER_UNAVAILABLE ⇒ red.
+#[tokio::test]
+async fn worker_refuses_a_credential_query_as_scan_rejected_and_the_gateway_client_surfaces_it() {
+    let (counting, client) = counting_worker(Arc::new(scanner())).await;
+    let query = format!("why does the CI bot use {FAKE_GITHUB_TOKEN} for releases?");
+    let logical_call_id = Uuid::now_v7();
+    for attempt in ["first", "retry"] {
+        let outcome = embed_once(&client, &query, logical_call_id).await;
+        assert_eq!(
+            outcome,
+            RetrievalEmbeddingOutcome::Unavailable {
+                reason: "SCAN_REJECTED".to_owned()
+            },
+            "{attempt}"
+        );
+    }
+    assert_eq!(
+        counting.calls.load(Ordering::SeqCst),
+        0,
+        "a refused query never reaches the provider"
+    );
+}
+
+/// ADR-0056 D-A: the contribution-privacy shapes are ordinary private queries on the seal path.
+/// Fault: privacy rules back on `seal_query` ⇒ SCAN_REJECTED ⇒ red.
+#[tokio::test]
+async fn worker_embeds_queries_with_date_email_phone_number_and_uuid() {
+    let (counting, client) = counting_worker(Arc::new(scanner())).await;
+    let queries = [
+        "what is due on 2026-10-15?",
+        "what did a@example.test ask about the invoice?",
+        "who answers +1 (415) 555-0123?",
+        "where is order 123456789012?",
+        "what closed incident 3f0c9a4e-1b7d-4c55-9e21-79869668a78d?",
+    ];
+    for query in queries {
+        let outcome = embed_once(&client, query, Uuid::now_v7()).await;
+        assert!(
+            matches!(outcome, RetrievalEmbeddingOutcome::Embedded { .. }),
+            "{query}: {outcome:?}"
+        );
+    }
+    assert_eq!(counting.calls.load(Ordering::SeqCst), queries.len());
+}
+
+/// A scanner that cannot run is not a verdict on the query: the pinned binary swapped after
+/// `new()` answers SCANNER_UNAVAILABLE (the gateway's DEPENDENCY_UNAVAILABLE), never
+/// SCAN_REJECTED.
+#[tokio::test]
+async fn worker_scanner_outage_is_scanner_unavailable_not_scan_rejected() {
+    let copy = std::env::temp_dir().join(format!("c30b-gitleaks-{}", Uuid::now_v7().simple()));
+    std::fs::copy(required("HUMAUX_TEST_GITLEAKS_BIN"), &copy).expect("copy pinned gitleaks");
+    let scanner = LocalSecretScanner::new(LocalSecretScannerConfig {
+        executable: copy.clone(),
+        expected_version: required("HUMAUX_TEST_GITLEAKS_VERSION"),
+        expected_executable_sha256: required("HUMAUX_TEST_GITLEAKS_SHA256"),
+        timeout: Duration::from_secs(5),
+        max_payload_bytes: 64 * 1024,
+        finding_exit_code: 1,
+    })
+    .expect("copied scanner verifies");
+    std::fs::write(&copy, b"changed executable bytes").expect("swap the binary");
+    let (counting, client) = counting_worker(Arc::new(scanner)).await;
+    let outcome = embed_once(&client, "an ordinary query", Uuid::now_v7()).await;
+    let _ = std::fs::remove_file(&copy);
+    assert_eq!(
+        outcome,
+        RetrievalEmbeddingOutcome::Unavailable {
+            reason: "SCANNER_UNAVAILABLE".to_owned()
+        }
+    );
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 0);
 }

@@ -3,9 +3,11 @@
 //! Depends-on: crates=[humaux-domain, humaux-projection, humaux-retrieval, serde_json, sha2, uuid];
 //!   services=[subprocess(gitleaks)]; env=[]; modules=[domain::dataclass, domain::error, domain::evidence,
 //!   projection::card, retrieval::request]
-//! Called-by: [crate(humaux-adapters), crate(humaux-gateway), crate(humaux-private-worker), crate(humaux-retrieval-provider), crate(humaux-retrieval-worker)]
-//! Invariants: [gitleaks subprocess failure or non-zero exit surfaces as an error to the caller, no silent pass; no fallback scanner]
-//! Spec: none
+//! Called-by: [crate(humaux-adapters), crate(humaux-gateway), crate(humaux-private-worker), crate(humaux-retrieval-provider), crate(humaux-retrieval-worker), tests]
+//! Invariants: [gitleaks subprocess failure or non-zero exit surfaces as an error to the caller, no silent pass; no fallback scanner;
+//!   the retrieval seal path (seal_query/seal_card) applies no contribution-privacy rule, only size/DataClass checks and the
+//!   pinned gitleaks scan; the pinned binary is hashed at construction and re-hashed whenever its stat tuple changes]
+//! Spec: Baseline §7.5; §12.1.1; ADR-0056
 //!
 //! Configuration is supplied explicitly by trusted wiring. The scanner never reads an
 //! environment variable, never invokes a shell, and never returns scanner stdout/stderr or input
@@ -20,8 +22,9 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
@@ -129,7 +132,9 @@ impl LocalSecretScanReceipt {
         self.payload_sha256
     }
 
-    /// Version of the built-in deterministic privacy rules.
+    /// Version of the deterministic rule set this scan applied: `contribution-privacy-v2` on the
+    /// §12 contribution path (e-mail/phone rules, then gitleaks); `retrieval-seal-secrets-v1` on
+    /// the §7.5 retrieval seal path, which applies none beyond gitleaks (ADR-0056 D-B).
     pub fn privacy_rules_version(&self) -> &'static str {
         self.privacy_rules_version
     }
@@ -195,6 +200,9 @@ impl LocalSecretScanReceipt {
 /// candidate can pass.
 pub struct LocalSecretScanner {
     config: LocalSecretScannerConfig,
+    /// Stat tuple of the pinned binary at its last successful full hash (ADR-0056 D-D). `None`
+    /// (non-unix, or never verified) forces a full re-hash on every check.
+    verified: Mutex<Option<ExeStamp>>,
 }
 
 impl LocalSecretScanner {
@@ -209,16 +217,25 @@ impl LocalSecretScanner {
         {
             return Err(ErrorCode::InvalidInput);
         }
+        let before = exe_stamp(&config.executable)?;
         let executable =
             fs::read(&config.executable).map_err(|_| ErrorCode::DependencyUnavailable)?;
         if sha256_hex(&executable) != config.expected_executable_sha256 {
             return Err(ErrorCode::Conflict);
         }
+        // The file changed under the hash: the bytes hashed are not provably the bytes stamped.
+        let stamp = exe_stamp(&config.executable)?;
+        if stamp != before {
+            return Err(ErrorCode::DependencyUnavailable);
+        }
         let version = run_version(&config)?;
         if version != config.expected_version {
             return Err(ErrorCode::Conflict);
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            verified: Mutex::new(stamp),
+        })
     }
 
     /// Runs deterministic privacy checks and the pinned gitleaks stdin scan.
@@ -229,14 +246,67 @@ impl LocalSecretScanner {
         if privacy_rejection(bytes)? {
             return Ok(LocalSecretScanOutcome::Reject(self.receipt(
                 bytes,
+                LOCAL_SECRET_RULES_VERSION,
                 LocalSecretScanDisposition::Reject,
                 LocalSecretScanRejectionStage::DeterministicPrivacy,
             )));
         }
-        verify_executable(&self.config)?;
-        let result = run_gitleaks(&self.config, bytes)?;
-        verify_executable(&self.config)?;
+        let result = self.run_checked(bytes)?;
         Ok(self.outcome_for_exit(bytes, result))
+    }
+
+    /// §7.5 B/C retrieval egress seal: size check and the pinned gitleaks scan only — no
+    /// contribution-privacy rule (ADR-0056 D-A). A finding is `Forbidden`; a scanner that did not
+    /// run cleanly is `DependencyUnavailable`, never a pass.
+    fn scan_secrets_only(&self, bytes: &[u8]) -> Result<LocalSecretScanReceipt, ErrorCode> {
+        if bytes.is_empty() || bytes.len() > self.config.max_payload_bytes {
+            return Err(ErrorCode::InvalidInput);
+        }
+        match self.run_checked(bytes)? {
+            ScanExit::Clean => Ok(self.receipt(
+                bytes,
+                RETRIEVAL_SEAL_RULES_VERSION,
+                LocalSecretScanDisposition::Pass,
+                LocalSecretScanRejectionStage::None,
+            )),
+            ScanExit::Finding => Err(ErrorCode::Forbidden),
+        }
+    }
+
+    /// The pinned binary is verified before the spawn and again after the exit.
+    // ponytail: a swap between this check and `exec` runs unverified once (the post-exit check
+    // then discards its verdict), ADR-0056 D-D; spawn from a held fd if the binary path ever
+    // stops being root-owned 0555 on a read-only mount.
+    fn run_checked(&self, bytes: &[u8]) -> Result<ScanExit, ErrorCode> {
+        self.verify_executable()?;
+        let result = run_gitleaks(&self.config, bytes)?;
+        self.verify_executable()?;
+        Ok(result)
+    }
+
+    /// ADR-0056 D-D: an unchanged `(dev, ino, len, mtime, ctime)` since the last full hash is
+    /// accepted; any change forces a re-read and re-hash. A mismatch is `DependencyUnavailable`
+    /// and leaves the cached stamp as it was, so every later check re-hashes and fails again.
+    fn verify_executable(&self) -> Result<(), ErrorCode> {
+        let before = exe_stamp(&self.config.executable)?;
+        let mut verified = self
+            .verified
+            .lock()
+            .map_err(|_| ErrorCode::DependencyUnavailable)?;
+        if before.is_some() && *verified == before {
+            return Ok(());
+        }
+        let bytes =
+            fs::read(&self.config.executable).map_err(|_| ErrorCode::DependencyUnavailable)?;
+        if sha256_hex(&bytes) != self.config.expected_executable_sha256 {
+            return Err(ErrorCode::DependencyUnavailable);
+        }
+        let after = exe_stamp(&self.config.executable)?;
+        if after != before {
+            return Err(ErrorCode::DependencyUnavailable);
+        }
+        *verified = after;
+        Ok(())
     }
 
     /// Legacy compatibility entrypoint: callers that only accept approved bytes continue to see
@@ -252,11 +322,13 @@ impl LocalSecretScanner {
         match exit {
             ScanExit::Clean => LocalSecretScanOutcome::Pass(self.receipt(
                 bytes,
+                LOCAL_SECRET_RULES_VERSION,
                 LocalSecretScanDisposition::Pass,
                 LocalSecretScanRejectionStage::None,
             )),
             ScanExit::Finding => LocalSecretScanOutcome::Reject(self.receipt(
                 bytes,
+                LOCAL_SECRET_RULES_VERSION,
                 LocalSecretScanDisposition::Reject,
                 LocalSecretScanRejectionStage::Gitleaks,
             )),
@@ -266,12 +338,13 @@ impl LocalSecretScanner {
     fn receipt(
         &self,
         bytes: &[u8],
+        rules_version: &'static str,
         disposition: LocalSecretScanDisposition,
         rejection_stage: LocalSecretScanRejectionStage,
     ) -> LocalSecretScanReceipt {
         LocalSecretScanReceipt {
             payload_sha256: humaux_domain::evidence::payload_sha256(bytes),
-            privacy_rules_version: LOCAL_SECRET_RULES_VERSION,
+            privacy_rules_version: rules_version,
             privacy_rules_digest: sha256_hex(include_bytes!("lib.rs")),
             gitleaks_version: self.config.expected_version.clone(),
             gitleaks_binary_sha256: self.config.expected_executable_sha256.clone(),
@@ -366,8 +439,10 @@ impl SealedRetrievalCard {
 
 impl LocalSecretScanner {
     /// Seals only a text query minted by retrieval's sole `build_request` path. Query input is
-    /// tenant-private by policy, never a caller-selected grade. This local scan does not replace
-    /// authorization, EgressPermit issuance, disclosure reservation/finalization, or send gates.
+    /// tenant-private by policy, never a caller-selected grade. §7.5 C: secret/credential
+    /// classification only (the pinned gitleaks scan), no contribution-privacy rule (ADR-0056).
+    /// This local scan does not replace authorization, EgressPermit issuance, disclosure
+    /// reservation/finalization, or send gates.
     pub fn seal_query(
         &self,
         query: &TrustedRetrievalQuery<'_>,
@@ -378,7 +453,7 @@ impl LocalSecretScanner {
         {
             return Err(ErrorCode::InvalidInput);
         }
-        let receipt = self.scan(text.as_bytes())?;
+        let receipt = self.scan_secrets_only(text.as_bytes())?;
         let scanner_attestation_fingerprint = receipt.attestation_fingerprint();
         Ok(SealedRetrievalQuery {
             text: text.to_owned(),
@@ -389,14 +464,15 @@ impl LocalSecretScanner {
         })
     }
 
-    /// Seals only the actual `build_card` result, retaining its actual data class.
+    /// Seals only the actual `build_card` result, retaining its actual data class. §7.5 B:
+    /// SECRET_MATERIAL never leaves; otherwise the pinned gitleaks scan only (ADR-0056).
     pub fn seal_card(&self, card: &RetrievalCard) -> Result<SealedRetrievalCard, ErrorCode> {
         if card.data_class == DataClass::SecretMaterial
             || card.card_text.len() > SEALED_RETRIEVAL_MAX_BYTES
         {
             return Err(ErrorCode::InvalidInput);
         }
-        let receipt = self.scan(card.card_text.as_bytes())?;
+        let receipt = self.scan_secrets_only(card.card_text.as_bytes())?;
         Ok(SealedRetrievalCard {
             text: card.card_text.clone(),
             data_class: card.data_class,
@@ -411,13 +487,39 @@ pub const RETRIEVAL_QUERY_MAX_CHARS: usize = 4_096;
 pub const SEALED_RETRIEVAL_MAX_BYTES: usize = 16 * 1024;
 
 const LOCAL_SECRET_RULES_VERSION: &str = "contribution-privacy-v2";
+/// ADR-0056 D-B: the seal path's rule identity — gitleaks only, no deterministic privacy rule.
+const RETRIEVAL_SEAL_RULES_VERSION: &str = "retrieval-seal-secrets-v1";
 
-fn verify_executable(config: &LocalSecretScannerConfig) -> Result<(), ErrorCode> {
-    let bytes = fs::read(&config.executable).map_err(|_| ErrorCode::DependencyUnavailable)?;
-    if sha256_hex(&bytes) != config.expected_executable_sha256 {
-        return Err(ErrorCode::DependencyUnavailable);
-    }
-    Ok(())
+/// `(dev, ino, len, mtime s/ns, ctime s/ns)` of the pinned binary (ADR-0056 D-D). A content swap
+/// changes `ctime` (not settable from userspace); a path swap changes `ino`/`dev`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExeStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+#[cfg(unix)]
+fn exe_stamp(path: &Path) -> Result<Option<ExeStamp>, ErrorCode> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).map_err(|_| ErrorCode::DependencyUnavailable)?;
+    Ok(Some(ExeStamp {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        len: meta.len(),
+        mtime: (meta.mtime(), meta.mtime_nsec()),
+        ctime: (meta.ctime(), meta.ctime_nsec()),
+    }))
+}
+
+/// No portable ctime/inode: `None` never matches the cache, so every check re-hashes.
+#[cfg(not(unix))]
+fn exe_stamp(path: &Path) -> Result<Option<ExeStamp>, ErrorCode> {
+    fs::metadata(path)
+        .map(|_| None)
+        .map_err(|_| ErrorCode::DependencyUnavailable)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -643,7 +745,121 @@ mod tests {
                 max_payload_bytes: 1024,
                 finding_exit_code: 1,
             },
+            verified: Mutex::new(None),
         }
+    }
+
+    /// The five identifier shapes the contribution rules refuse: a date, an e-mail address, a
+    /// phone number, a 12-digit order number and a random UUID (ADR-0056 acceptance).
+    const IDENTIFIERS: [&str; 5] = [
+        "the billing cutover is on 2026-10-15",
+        "write to a@example.test about the invoice",
+        "call +1 (415) 555-0123 for the on-call rota",
+        "order 123456789012 shipped late",
+        "incident 3f0c9a4e-1b7d-4c55-9e21-79869668a78d is closed",
+    ];
+
+    fn trusted_request(text: &str) -> humaux_retrieval::request::RetrievalRequest {
+        let intent = humaux_retrieval::request::RetrievalIntent::new(
+            text.to_owned(),
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+        )
+        .expect("intent");
+        let profile =
+            humaux_retrieval::request::resolve_registered_retrieval_profile(&Default::default())
+                .expect("default profile");
+        humaux_retrieval::request::build_request(intent, &profile).expect("request")
+    }
+
+    fn card(text: &str, data_class: DataClass) -> RetrievalCard {
+        let humaux_projection::card::CardBuildOutcome::Card(mut card) =
+            humaux_projection::card::build_card(
+                humaux_projection::card::CardInput {
+                    memory_id: humaux_domain::authority::MemoryId(uuid::Uuid::now_v7()),
+                    memory_type: humaux_domain::memory::MemoryType::Fact,
+                    data_class: DataClass::Internal,
+                    egress_disposition: humaux_projection::card::EgressDisposition::Allowed,
+                    workspace_id: None,
+                    topic: None,
+                    effective_from: std::time::SystemTime::now(),
+                    title: text.to_owned(),
+                    key_claim: Some(text.to_owned()),
+                    entities: Vec::new(),
+                    evidence_excerpt: Some(text.to_owned()),
+                },
+                humaux_projection::card::CardBudget::default(),
+            )
+        else {
+            panic!("fixture card builds");
+        };
+        card.data_class = data_class;
+        *card
+    }
+
+    /// ADR-0056 D-A: the seal path never reaches `privacy_rejection`. With no runnable gitleaks
+    /// the only possible answer is `DependencyUnavailable`; `Forbidden` here means a
+    /// contribution-privacy rule ran first. Fault: re-add `privacy_rejection` to the seal ⇒ red.
+    #[test]
+    fn seal_path_never_runs_contribution_privacy_rules() {
+        let scanner = scanner_without_runtime_fixture();
+        for text in IDENTIFIERS {
+            assert_eq!(
+                scanner.scan(text.as_bytes()),
+                Err(ErrorCode::Forbidden),
+                "the contribution path still rejects {text:?}"
+            );
+            let request = trusted_request(text);
+            let query = request.trusted_query().expect("text query");
+            assert_eq!(
+                scanner.seal_query(&query).map(|_| ()),
+                Err(ErrorCode::DependencyUnavailable),
+                "seal_query({text:?})"
+            );
+            assert_eq!(
+                scanner
+                    .seal_card(&card(text, DataClass::Private))
+                    .map(|_| ()),
+                Err(ErrorCode::DependencyUnavailable),
+                "seal_card({text:?})"
+            );
+        }
+    }
+
+    /// §7.5 B: SECRET_MATERIAL is refused before any scan, fixture-less.
+    #[test]
+    fn seal_card_refuses_secret_material_before_any_scan() {
+        let scanner = scanner_without_runtime_fixture();
+        assert_eq!(
+            scanner
+                .seal_card(&card("an otherwise clean card", DataClass::SecretMaterial))
+                .map(|_| ()),
+            Err(ErrorCode::InvalidInput)
+        );
+    }
+
+    /// ADR-0056 D-B: a seal receipt names the seal rule set, and its attestation differs from a
+    /// contribution receipt for the same bytes.
+    #[test]
+    fn seal_receipt_names_the_seal_rule_set() {
+        let scanner = scanner_without_runtime_fixture();
+        let seal = scanner.receipt(
+            b"same",
+            RETRIEVAL_SEAL_RULES_VERSION,
+            LocalSecretScanDisposition::Pass,
+            LocalSecretScanRejectionStage::None,
+        );
+        let LocalSecretScanOutcome::Pass(contribution) =
+            scanner.outcome_for_exit(b"same", ScanExit::Clean)
+        else {
+            panic!("clean exit passes");
+        };
+        assert_eq!(seal.privacy_rules_version(), "retrieval-seal-secrets-v1");
+        assert_ne!(
+            seal.attestation_fingerprint(),
+            contribution.attestation_fingerprint()
+        );
     }
 
     #[test]

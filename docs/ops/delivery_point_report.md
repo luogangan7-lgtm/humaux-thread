@@ -320,6 +320,31 @@ scan 251.8 / 389.6, embed 643.4 / 1161.7, hydrate 17.1 / 58.9, qdrant 5.3 / 21.2
 assemble 2.3 / 6.0; all 351 recalls carried all eight stage keys; `memory.get` 37.2 / 121.1,
 `memory.enumerate` 103.0 / 316.2, `remember` 82.7 / 327.3. Closes system_audit P1-6, P1-7 and RQ-5.
 
+#### 4.6 Card 30b release rehearsal: one query seal, gitleaks only, hash once (2026-10-01, n = 368)
+
+Same harness and parameters as §4.5 (`c30b_rehearse.sh measure`, evidence
+`card30b_rehearsal_evidence/measure/`, 06:09–06:52). ADR-0056 §Measurements carries the reading.
+
+| Operation / stage | card 30 p50 / p95 (n = 351) | card 30b p50 / p95 (n = 368) |
+|---|---|---|
+| `recall` (over the wire) | 934.6 / 2430.7 | **486.6 / 604.6** (failed 1: one `TRANSPORT` in a worker chaos restart) |
+| `recall.stage_sum` | 892.9 / 2279.3 | 462.5 / 584.7 (95.0 % of the wire p50) |
+| `recall.stage.scan` | 247.5 / 577.1 | **0.0 / 0.0** (no gateway seal; `trusted_query()` only) |
+| `recall.stage.embed` (worker seal + provider + ledger) | 604.2 / 1490.1 | 435.5 / 564.2 |
+| provider query embedding (ledger ⋈ `ops.retrieval_embedding_rpc_calls`, same window) | 245.5 / 506.8 (n = 342) | 176.0 / 326.6 (n = 362) |
+| `recall.stage.hydrate` / `qdrant` / `route` / `assemble` | 15.2 / 4.8 / 2.7 / 2.2 | 17.9 / 5.3 / 2.0 / 2.2 |
+| `memory.get` | 34.5 / 271.5 | 25.5 / 34.2 |
+| `memory.enumerate` | 92.5 / 595.8 | 74.6 / 113.7 |
+| `remember` | 86.8 / 380.2 | 48.2 / 55.9 |
+
+Recall p50 −448 ms against card 30. What remains in `embed` beyond the provider (≈ 260 ms p50) is
+the worker's one gitleaks spawn, the UDS RPC and the ledger reserve/settle; a resident scanner is
+the next lever (ADR-0056 Known limits). The rehearsal's first run of the new pst item 7 was
+`83 passed, 1 failed`: the credential leg demanded a terminal ticket, but live MiniMax distilled
+the credential put into a clean memory ("contains the credential used by the release bot"), which
+correctly projected `DONE`. The assertion now grades "no live projected card carries the token"
+and the terminal ticket only when the distilled card carries it (ADR-0056 §Measurements).
+
 ### Capacity: ingest vs distill
 
 | Quantity | Value | n | Source |
@@ -788,6 +813,28 @@ not, and it withdraws the "ready for production" reading of §5.**
   as `…-79869668a78d`, a date `2026-09-30`, an order number) is refused `FORBIDDEN` by the gateway's
   `seal_query` — `local-secret-scan`'s contribution-privacy phone heuristic
   (`crates/local-secret-scan/src/lib.rs:479-492`) runs on recall queries. ADR-0055 Known limits.
+  **Closed by card 30b (§6.16).**
+
+### 6.16 Closed by card 30b (ADR-0056)
+
+| Change | Before | After (ADR-0056) | Witness |
+|---|---|---|---|
+| Retrieval seal rule set (§7.5 B/C) | `seal_query`/`seal_card` ran the §12 contribution-privacy e-mail/phone rules: a date, e-mail, phone, 7+ digit run or random UUID failed a card `secret_scan_rejected` and a query `FORBIDDEN` | size/DataClass checks + pinned gitleaks only; seal receipts carry `retrieval-seal-secrets-v1`; the contribution path (`scan`/`scan_outcome`) is unchanged | `seal_path_never_runs_contribution_privacy_rules`, `seal_rules.rs` lane(b), `cards_with_date_email_phone_number_and_uuid_project_done`, `worker_embeds_queries_with_date_email_phone_number_and_uuid`, `recall_answers_identifier_bearing_queries_and_refuses_a_credential_query`, rehearsal pst item 7 |
+| Seals per recall | two (gateway + worker), each 2 hashes + 1 spawn | one, in the worker (the egress process); the gateway has no scanner, no `HUMAUX_GATEWAY_GITLEAKS_*` keys and only a dev-dependency on the crate | gate `gateway_no_scanner_dep`; soak `recall.stage.scan` p50 0.0 ms |
+| Credential query | gateway `FORBIDDEN` | worker `SCAN_REJECTED` → gateway `FORBIDDEN` (operator line `query_scan_rejected`); a broken scanner is `SCANNER_UNAVAILABLE` → `DEPENDENCY_UNAVAILABLE` (it used to read `SCAN_REJECTED`) | `worker_refuses_a_credential_query_as_scan_rejected_and_the_gateway_client_surfaces_it`, `worker_scanner_outage_is_scanner_unavailable_not_scan_rejected` |
+| Pinned-binary check | `fs::read` + SHA-256 of 21.3 MB twice per scan | hashed at `new()`, re-hashed only when `(dev, ino, len, mtime, ctime)` changes; a mismatch stays `DependencyUnavailable` | `swapped_binary_by_content_is_detected`, `swapped_binary_by_path_is_detected`, `touched_binary_with_identical_bytes_still_scans` |
+| Blocking scan on the async path | gateway `seal_query` inside `async fn search` | worker seal under `spawn_blocking` | §4.6 |
+
+- **Operator-visible:** `HUMAUX_GATEWAY_GITLEAKS_*` removed; a deployment env still setting them fails
+  gateway boot (unknown key). Runbook §4.
+- **What now leaves for private retrieval:** e-mail addresses, phone numbers, dates and long numbers in
+  private memories and queries reach the retrieval provider (the disclosed ExternalProcessor). The
+  main line should confirm the tenant disclosure text covers PII in private retrieval.
+- **Known limits:** the contribution path still rejects dates / UUID tails / long numbers (fail-closed
+  by design); the stat check misses a rewrite that preserves all five fields (root, shared `mmap`,
+  coarse-timestamp FS) — the control is a root-owned 0555 binary on a read-only path;
+  `egress_chars_total` has no production emit (G80-6), so "one seal per recall" is pinned
+  structurally, not by the metric.
 
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 

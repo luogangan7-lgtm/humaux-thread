@@ -14,9 +14,9 @@
 //! ## Sealed egress types (§1.2.3 / §41.4)
 //!
 //! [`SealedRetrievalQuery`] / [`SealedRetrievalCard`] are canonical scanner-attested values
-//! from `humaux-local-secret-scan`. Sealing performs only the pinned local privacy/Gitleaks
-//! scan; it neither authorizes data access nor substitutes for the egress permit, disclosure
-//! reserve/finalize path, or provider call gates that this crate owns.
+//! from `humaux-local-secret-scan`. Sealing performs only size/DataClass checks and the pinned
+//! Gitleaks scan (ADR-0056); it neither authorizes data access nor substitutes for the egress
+//! permit, disclosure reserve/finalize path, or provider call gates that this crate owns.
 
 //!
 //! ## Provider identifiers

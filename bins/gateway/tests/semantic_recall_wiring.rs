@@ -581,7 +581,6 @@ fn happy_path_placement_and_point_hit() {
                 ));
             let runtime = Arc::new(
                 SemanticRecallRuntime::new(
-                    scanner(),
                     embedding_port,
                     transport,
                     registry,
@@ -666,7 +665,6 @@ fn tenant_with_no_placement_degrades_closed_without_calling_qdrant() {
                 }));
             let runtime = Arc::new(
                 SemanticRecallRuntime::new(
-                    scanner(),
                     embedding_port,
                     counting.clone(),
                     registry,
@@ -849,7 +847,6 @@ fn wrong_dimension_vector_from_port_is_never_hydrated() {
             let embedding_port: Arc<dyn RetrievalEmbeddingPort> = port.clone();
             let runtime = Arc::new(
                 SemanticRecallRuntime::new(
-                    scanner(),
                     embedding_port,
                     counting.clone(),
                     registry,
@@ -985,7 +982,6 @@ fn recall_stage_ms_cover_at_least_ninety_percent_of_in_process_search_time() {
             });
             let runtime = Arc::new(
                 SemanticRecallRuntime::new(
-                    scanner(),
                     embedding_port,
                     transport,
                     registry,

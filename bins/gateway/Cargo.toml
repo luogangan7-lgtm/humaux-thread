@@ -22,8 +22,6 @@ humaux-projection = { path = "../../crates/projection" }
 humaux-retrieval = { path = "../../crates/retrieval" }
 # why: same-Cell transport and CellAccessPermit for Qdrant/UDS calls; used-by: [gateway::bootstrap, gateway::recall, gateway::retrieval_embedding_client, tests]
 humaux-infra-cell = { path = "../../crates/infra-cell" }
-# why: pinned local secret scanner that seals egress payloads; used-by: [gateway::bootstrap, gateway::recall, tests]
-humaux-local-secret-scan = { path = "../../crates/local-secret-scan" }
 # why: object-safe async traits for ports and transports; used-by: [gateway::mcp_application, gateway::retrieval_embedding_client, tests]
 async-trait = "0.1"
 # why: HTTP/UDS server framework; used-by: [gateway::main, gateway::mcp_application, tests]
@@ -59,6 +57,10 @@ postgres = { version = "0.19", features = ["with-uuid-1", "with-serde_json-1"] }
 # bins/retrieval-worker/src/lib.rs's doc for why this crate now has a lib target too.
 # why: retrieval-worker RPC server exercised end to end in tests; used-by: [tests]
 humaux-retrieval-worker = { path = "../retrieval-worker" }
+# ADR-0056 D-C: dev-only, so gateway production code cannot mint a SealedRetrievalQuery — the
+# retrieval worker's seal is the recall path's one query seal.
+# why: pinned scanner for the in-process retrieval-worker test fixtures; used-by: [tests]
+humaux-local-secret-scan = { path = "../../crates/local-secret-scan" }
 
 [lints]
 workspace = true

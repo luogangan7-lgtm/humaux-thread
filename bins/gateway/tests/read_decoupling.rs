@@ -1,14 +1,13 @@
 //! `gateway::tests::read_decoupling` — ADR-0053 D-E wire tests: PG-authoritative reads without a serving version, the
 //!   B-shaped read, and the PROVISIONING write gate.
 //! Depends-on: crates=[async-trait, axum, humaux-adapters, humaux-application, humaux-contracts, humaux-domain,
-//!   humaux-infra-cell, humaux-local-secret-scan, humaux-protocol, humaux-testkit, serde_json,
+//!   humaux-infra-cell, humaux-protocol, humaux-testkit, serde_json,
 //!   tokio, uuid]; services=[HTTP(gateway), PostgreSQL(owner) r=[ops.commit_seq_seq, ops.outbox, private.evidence_objects]
 //!   w=[control.workspaces, projection.stream_checkpoints, projection.stream_log, projection.tenant_placements],
-//!   Qdrant(*)]; env=[HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION,
-//!   HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::postgres, adapters::qdrant, adapters::quota_repo,
+//!   Qdrant(*)]; env=[HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::postgres, adapters::qdrant, adapters::quota_repo,
 //!   adapters::tests::support::operation_receipt_fixture, application::retrieval_embedding_port,
 //!   contracts::retrieval_config, domain::context, domain::dataclass, domain::error, domain::identity, gateway::context, gateway::guard, gateway::mcp_application, gateway::recall, gateway::remember,
-//!   humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
+//!   humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
 //!   protocol::edge, protocol::mcp, protocol::mcp_catalog]
 //! Called-by: [cargo-test]
 //! Invariants: [each test runs against the isolated operation-receipt fixture tenant (torn down by the fixture); the
@@ -25,7 +24,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -58,7 +56,6 @@ use humaux_infra_cell::{
     IntraCellMethod, IntraCellRequest, IntraCellResource, IntraCellResourceRegistry, ResourceEntry,
     authorize_cell_access,
 };
-use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig};
 use humaux_protocol::{
     edge::{TrustedProxyConfig, compute_api_key_hash},
     mcp::{McpAdapter, McpHttpConfig, ToolName},
@@ -145,25 +142,6 @@ impl RetrievalEmbeddingPort for CountingPort {
     }
 }
 
-fn scanner() -> Arc<LocalSecretScanner> {
-    Arc::new(
-        LocalSecretScanner::new(LocalSecretScannerConfig {
-            executable: PathBuf::from(
-                std::env::var("HUMAUX_TEST_GITLEAKS_BIN")
-                    .expect("read_decoupling requires HUMAUX_TEST_GITLEAKS_BIN"),
-            ),
-            expected_version: std::env::var("HUMAUX_TEST_GITLEAKS_VERSION")
-                .expect("read_decoupling requires HUMAUX_TEST_GITLEAKS_VERSION"),
-            expected_executable_sha256: std::env::var("HUMAUX_TEST_GITLEAKS_SHA256")
-                .expect("read_decoupling requires HUMAUX_TEST_GITLEAKS_SHA256"),
-            timeout: Duration::from_secs(5),
-            max_payload_bytes: 64 * 1024,
-            finding_exit_code: 1,
-        })
-        .expect("pinned scanner"),
-    )
-}
-
 fn qdrant_registry() -> IntraCellResourceRegistry {
     let cell = CellId(Uuid::now_v7());
     let caller = CallerId("gateway-read-decoupling".to_owned());
@@ -230,7 +208,6 @@ fn gateway(handle: &Handle) -> Gateway {
         calls: AtomicUsize::new(0),
     });
     let semantic = SemanticRecallRuntime::new(
-        scanner(),
         port.clone(),
         transport.clone(),
         registry.clone(),

@@ -422,6 +422,9 @@ Rehearsal (`docs/ops/rehearse.sh`): `recall_everyday_queries_answered_with_lane_
   fixture and the rehearsal pin `a1b2c3d4-e5f6-4a7b-8c9d-e0f1a2b3c4d5` (max digit run 2). File:
   recall's query should get a query-specific privacy rule (or the rejection a typed
   `INVALID_INPUT`/degradation), not the contribution-privacy phone heuristic's `FORBIDDEN`.
+  **Resolved by ADR-0056 (card 30b):** the retrieval seal runs no contribution-privacy rule, so a
+  date, an e-mail address, a phone number, a long number or a random UUID in a query or card is
+  sealed; only a gitleaks finding is `FORBIDDEN`.
 - **Rehearsal health window.** `xtask e2e-seed` writes TEST provider/account health observations
   valid for 30 minutes; a soak sized for n ≥ 300 outlives them and every later distill defers
   ("reasoning route not admitted"). `docs/ops/rehearse.sh` now re-observes the seeded tenants'
@@ -493,3 +496,12 @@ before any egress) or keep one resident scanner — saves ≈ 240 ms per recall;
 `seal_query` synchronously inside `async fn search`, blocking a Tokio worker for the whole scan —
 `TrustedRetrievalQuery<'_>` borrows the request, so `spawn_blocking` needs an owned query type
 from `humaux-retrieval`/`local-secret-scan`; filed with (2).
+
+**Status of the filed items (card 30b, ADR-0056).** (1) **done** — ADR-0056 D-D: hashed once at
+`new()`, re-hashed only when `(dev, ino, len, mtime, ctime)` changes. (2) **done** — ADR-0056 D-C:
+the gateway seal is deleted, the worker's is the one query seal per recall; the "keep the
+deterministic privacy rules" wording is superseded by ADR-0056 D-A (the seal path runs gitleaks
+only). (3) **done in the worker** — the gateway no longer scans; the worker's seal runs under
+`tokio::task::spawn_blocking` on the owned request, no new query type needed. From 30b on the
+`scan` stage times `trusted_query()` only and reads ≈ 0 ms; the worker's seal stays inside
+`embed`.

@@ -231,8 +231,7 @@ start_gw() {
     HUMAUX_GATEWAY_EMBEDDING_DIMENSION=$EMB_DIM HUMAUX_GATEWAY_EMBEDDING_VERSION=$EMB_VER \
     HUMAUX_GATEWAY_QDRANT_HOST=127.0.0.1 HUMAUX_GATEWAY_QDRANT_PORT=6333 HUMAUX_GATEWAY_QDRANT_CIDR=127.0.0.1/32 HUMAUX_GATEWAY_QDRANT_TLS=false \
     HUMAUX_GATEWAY_CELL_ID=$CELL_ID HUMAUX_GATEWAY_CALLER_ID=gateway \
-    HUMAUX_GATEWAY_RATE_PREAUTH_IP_CAPACITY=100 HUMAUX_GATEWAY_RATE_PREAUTH_IP_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_CREDENTIAL_CAPACITY=100 HUMAUX_GATEWAY_RATE_CREDENTIAL_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_USER_CAPACITY=100 HUMAUX_GATEWAY_RATE_USER_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_TENANT_CAPACITY=100 HUMAUX_GATEWAY_RATE_TENANT_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_OPERATION_CAPACITY=100 HUMAUX_GATEWAY_RATE_OPERATION_REFILL_PER_SECOND=100 \
-    HUMAUX_GATEWAY_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_GATEWAY_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_GATEWAY_GITLEAKS_VERSION=$GITLEAKS_VER
+    HUMAUX_GATEWAY_RATE_PREAUTH_IP_CAPACITY=100 HUMAUX_GATEWAY_RATE_PREAUTH_IP_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_CREDENTIAL_CAPACITY=100 HUMAUX_GATEWAY_RATE_CREDENTIAL_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_USER_CAPACITY=100 HUMAUX_GATEWAY_RATE_USER_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_TENANT_CAPACITY=100 HUMAUX_GATEWAY_RATE_TENANT_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_OPERATION_CAPACITY=100 HUMAUX_GATEWAY_RATE_OPERATION_REFILL_PER_SECOND=100
   exec "$BIN_DIR"/humaux-gateway >> $EV/gateway.log 2>&1 ) &
 own_pid gw $!
 }
@@ -741,9 +740,8 @@ tail -n +$((GWLOG_BEFORE+1)) $EV/gateway.log | tee -a $EV/rehearsal.log
 # one refusal left, and it is the schema-documented DEPENDENCY_UNAVAILABLE.
 step lane_substitution
 LS_OK=0; LS_N=0
-# A fixed UUID with no run of >= 7 digits: the gateway's local-secret-scan phone-like rule refuses a
-# query holding 7+ digits (dashes do not break the run) with FORBIDDEN, so a random uuidgen value
-# would make this leg flaky (card 30 finding, ADR-0055 Known limits).
+# A fixed UUID keeps this leg reproducible. Since ADR-0056 a random one is no longer refused
+# (the seal runs no phone-like rule); step pst item 7 recalls with a random UUID on purpose.
 LS_UUID=a1b2c3d4-e5f6-4a7b-8c9d-e0f1a2b3c4d5
 for q in "目前项目进度" "客户张三最近的情绪怎么样" "和支付相关的决定" 'the "frozen contract" decision' "$LS_UUID"; do
   LS_ARGS=$(python3 -c "import sys,json; print(json.dumps({'query':sys.argv[1],'workspace_id':sys.argv[2]}, ensure_ascii=False))" "$q" "$WS")
@@ -1283,6 +1281,105 @@ P1_15_IDX="'stream_log_issued_claim_idx','outbox_tenant_commit_seq_uidx','outbox
 assert_eq "p1_15_indexes_present_valid_ready(n=7 indexes)" \
   "$(PGQ "select count(*) from pg_index i join pg_class c on c.oid=i.indexrelid where c.relname in ($P1_15_IDX) and i.indisvalid and i.indisready")" 7
 
+
+# ---- 7. card 30b (ADR-0056): identifier-bearing memories and queries; a credential stays refused ----
+# Five memories on C/ws1 carry a date, an e-mail address, a phone number, a 12-digit order number and
+# a random UUID — each one used to be refused by the contribution-privacy phone/e-mail rules on the
+# seal path. Each must project DONE and be returned by a recall whose QUERY carries the same
+# identifier (the put text itself). One put on C/ws2 carries the fake GitHub-shaped vector of
+# crates/adapters/tests/contribution_scan.rs (never a live key); a recall query carrying it is
+# FORBIDDEN, and no projected card may carry it. Live MiniMax decides whether the distilled memory
+# keeps the token (measure run 2026-10-01: it wrote "contains the credential" and dropped it), so
+# the ticket verdict is graded only when the card does carry it; the deterministic card-side witness
+# is projection_worker::a_card_with_a_real_gitleaks_finding_settles_failed_secret_scan_rejected.
+: > $PST/ident.tsv; : > $PST/cred.tsv
+ID_UUID=$(uuidgen | tr A-Z a-z)
+ID_TEXTS=(
+  "Card30b date: the billing cutover of team seven is scheduled for 2026-10-15."
+  "Card30b email: invoice questions for the shipping team go to billing-desk@example.test."
+  "Card30b phone: the payroll on-call line of team seven is +1 (415) 555-0123."
+  "Card30b order: purchase order 482913570264 covers the new warehouse scanners."
+  "Card30b uuid: incident $ID_UUID was the catalog outage of last spring."
+)
+for t in $ID_TEXTS; do pst_put BEARER_C $WS_C "$t" $PST/ident.tsv; done
+CRED_FAKE=ghp_RkqFzVpLwNyHtBvDgXsWuCePjMoTnAiSyEkl
+pst_put BEARER_C2 $WS_C2 "Card30b credential: the release bot uses $CRED_FAKE to publish builds." $PST/cred.tsv
+ID_W=$(wait_settled $PST/ident.tsv 600); echo "c30b identifiers: tickets settled after ${ID_W}s" | tee -a $EV/rehearsal.log
+CRED_EV=$(cut -f1 $PST/cred.tsv)
+CRED_ROW=
+i=0; while [ $i -lt 600 ]; do
+  CRED_ROW=$(PGQ "select s.state||'|'||coalesce(s.error_class,'-') from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id and s.commit_seq=o.commit_seq where o.event_type='EVIDENCE_ACCEPTED' and o.evidence_id='${CRED_EV:-00000000-0000-0000-0000-000000000000}'")
+  case "$CRED_ROW" in FAILED*|SKIPPED_BY_POLICY*|DONE*) break;; esac
+  sleep 2; i=$((i+2))
+done
+ID_STATES=$(PGQ "select count(*) filter (where s.state='DONE')||'/'||count(*)||' secret_scan_rejected='||count(*) filter (where s.error_class='secret_scan_rejected') from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id and s.commit_seq=o.commit_seq where o.event_type='EVIDENCE_ACCEPTED' and o.evidence_id in ($(ev_list $PST/ident.tsv))")
+cat > $S/c30b_ident.py <<'PYEOF'
+# card 30b: recall each identifier memory with its own put text (which carries the identifier) as
+# the query; poll until returned (projection -> Qdrant lag), record any error code.
+import json, os, subprocess, sys, time, urllib.request
+tsv, db, deadline = sys.argv[1], sys.argv[2], time.time() + float(sys.argv[3])
+rows = [l.rstrip("\n").split("\t") for l in open(tsv) if l.strip()]
+def pg(sql):
+    return subprocess.run(["docker","exec","humaux-thread-pg","psql","-U","postgres","-d",db,"-AtF","\t","-c",sql],
+                          capture_output=True, text=True).stdout.splitlines()
+def recall(bearer, ws, query):
+    body = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"query":query,"workspace_id":ws},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"rehearsal","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}
+    req = urllib.request.Request("http://127.0.0.1:8080/mcp", data=json.dumps(body).encode(), method="POST", headers={
+        "Content-Type":"application/json","Accept":"application/json, text/event-stream","MCP-Protocol-Version":"2026-07-28",
+        "Mcp-Method":"tools/call","Mcp-Name":"recall","Origin":"http://127.0.0.1:8080","Authorization":"Bearer "+os.environ[bearer]})
+    try:
+        d = json.load(urllib.request.urlopen(req, timeout=30))
+    except urllib.error.HTTPError as e:
+        try: d = json.load(e)
+        except Exception: return set(), "HTTP_%d" % e.code
+    except Exception as e:
+        return set(), type(e).__name__
+    if "error" in d: return set(), (d["error"].get("data") or {}).get("code", "PROTOCOL_ERROR")
+    sc = d["result"].get("structuredContent", {})
+    if d["result"].get("isError"): return set(), sc.get("code", "TOOL_ERROR")
+    return {i.get("memory_id") for i in sc.get("items", [])}, None
+out = {"n": len(rows), "returned": 0, "forbidden": 0, "codes": [], "identifier_in_memory": 0}
+marks = ["2026-10-15", "billing-desk@example.test", "555-0123", "482913570264", None]
+for k, (ev, bearer, ws, _t0, text) in enumerate(rows):
+    mark = marks[k] if k < len(marks) and marks[k] else text.split("incident ")[-1].split(" ")[0]
+    found = [l.split("\t", 1) for l in pg(f"select me.memory_id, m.content::text from private.memory_evidence me join private.memory_records m on m.memory_id=me.memory_id where m.status='active' and me.evidence_id='{ev}'")]
+    mems = {m for m, _ in found}
+    # informational: the distiller may paraphrase the identifier away; the seal verdict is graded by the ticket
+    out["identifier_in_memory"] += any(mark in c for _, c in found)
+    code, hit = None, False
+    while time.time() < deadline and not hit:
+        got, code = recall(bearer, ws, text)
+        if code == "FORBIDDEN": break
+        hit = bool(mems & got)
+        if not hit: time.sleep(2)
+    out["returned"] += hit
+    out["forbidden"] += code == "FORBIDDEN"
+    out["codes"].append(code or "-")
+print(json.dumps(out))
+PYEOF
+ID_RECALL=$(python3 $S/c30b_ident.py $PST/ident.tsv $DB 300 2>>$EV/rehearsal.log)
+CRED_IN_CARD=$(PGQ "select count(*) from private.memory_evidence me join private.memory_records m on m.memory_id=me.memory_id where me.evidence_id='${CRED_EV:-00000000-0000-0000-0000-000000000000}' and position('$CRED_FAKE' in m.content::text) > 0")
+CRED_LEAKED=$(PGQ "select count(*) from projection.private_memory_points p join private.memory_records m on m.memory_id=p.memory_id and m.tenant_id=p.tenant_id where p.tenant_id='$TENANT_C' and p.retired_at is null and position('$CRED_FAKE' in m.content::text) > 0")
+CRED_Q=$(python3 -c "import sys,json; print(json.dumps({'query':'what does the release bot use '+sys.argv[1]+' for?','workspace_id':sys.argv[2]}))" "$CRED_FAKE" "$WS_C2")
+CRED_CODE=$(mcp_as "$BEARER_C2" recall "$CRED_Q" | head -1 | python3 -c "import sys,json
+try:
+    d=json.load(sys.stdin); print((d.get('error',{}).get('data') or {}).get('code') or d.get('result',{}).get('structuredContent',{}).get('code','none'))
+except Exception: print('unparsed')")
+echo "c30b identifiers: tickets=$ID_STATES recall=$ID_RECALL | credential ticket=$CRED_ROW token_in_distilled_memory=$CRED_IN_CARD live_points_carrying_token=$CRED_LEAKED query_code=$CRED_CODE" | tee -a $EV/rehearsal.log
+assert_eq "c30b_identifier_memories_project_done(n=5: date,email,phone,order,uuid)" "$ID_STATES" "5/5 secret_scan_rejected=0"
+assert_eq "c30b_identifier_queries_return_their_memory_never_forbidden(n=5)" \
+  "$(print -r -- "$ID_RECALL" | python3 -c "import sys,json
+try: d=json.load(sys.stdin); print('%d/%d forbidden=%d' % (d['returned'], d['n'], d['forbidden']))
+except Exception: print('unparsed')")" "5/5 forbidden=0"
+CRED_VERDICT=ok
+[ "${CRED_IN_CARD:-0}" -gt 0 ] && case "$CRED_ROW" in 'FAILED|secret_scan_rejected'|SKIPPED_BY_POLICY*) ;; *) CRED_VERDICT="carried-but-$CRED_ROW";; esac
+assert_eq "c30b_no_projected_card_carries_the_credential(n=1 put: token_in_card=$CRED_IN_CARD ticket=$CRED_ROW)" "$CRED_VERDICT|$CRED_LEAKED" "ok|0"
+assert_eq "c30b_credential_query_forbidden(n=1)" "$CRED_CODE" "FORBIDDEN"
+# ADR-0056 D-E: the operator act for a secret_scan_rejected ticket (FAILED is terminal and pins the
+# §15.4 prefix); the soak does not use C/ws2, this keeps the family promotable for the next run.
+case "$CRED_ROW" in FAILED*) cargo run -q -p xtask -- projection-serve --tenant $TENANT_C --workspace $WS_C2 --domain $DOMAIN --projection-kind $PKIND --version $PVER --retire-failed secret_scan_rejected,distill_failed,no_visible_memory_record 2>&1 | tail -1 | tee -a $EV/rehearsal.log;; esac
+
 # ---- claim latency, one sample per pass ----
 CLAIM=$(grep -oE 'projection pass claimed=[0-9]+ .* claim_ms=[0-9]+' $EV/projection-runner.log | python3 -c "
 import sys
@@ -1531,6 +1628,12 @@ print(' | '.join('%s p50=%s p95=%s' % (k, o.get('p50'), o.get('p95')) for k,o in
 " $EV/soak-report.json 2>>$EV/rehearsal.log)
 echo "recall stage coverage: $STAGE_COVER" | tee -a $EV/rehearsal.log
 assert_eq "recall_stage_sum_covers_90pct_of_recall_p50" "${STAGE_COVER%% *}" 1
+# card 30b (ADR-0056 D-C): the gateway no longer seals, so its `scan` lap is trusted_query() only.
+SCAN_P50=$(python3 -c "
+import json,sys
+try: print({o.get('operation'): o for o in json.load(open(sys.argv[1])).get('latency',[])}.get('recall.stage.scan',{}).get('p50','none'))
+except Exception: print('unreadable')" $EV/soak-report.json)
+assert_eq "recall_stage_scan_p50_below_5ms(p50=${SCAN_P50}ms)" "$(python3 -c "import sys; print(1 if float(sys.argv[1]) < 5 else 0)" "$SCAN_P50" 2>/dev/null || echo 0)" 1
 assert_eq "soak_report_carries_latency_rows_with_n" \
   "$(python3 -c "
 import json,sys

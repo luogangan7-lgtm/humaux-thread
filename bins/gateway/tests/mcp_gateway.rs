@@ -43,7 +43,7 @@
 //!   retrieval-worker::rpc, retrieval::completeness, retrieval::request]
 //! Called-by: [cargo-test]
 //! Invariants: [each test wires its own PostgreSQL/Qdrant/UDS fixtures and gateway subprocess; no test depends on state left by another test]
-//! Spec: Baseline §33.10; §34.0.1; ADR-0030; ADR-0031; ADR-0054
+//! Spec: Baseline §33.10; §34.0.1; ADR-0030; ADR-0031; ADR-0054; ADR-0056
 //!
 //! The database fixture owns only isolated seed and cleanup rows. Every request below travels
 //! through the loopback native MCP adapter and a real `role_gateway` runtime pool.
@@ -1939,7 +1939,6 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 ),
             );
             let semantic = SemanticRecallRuntime::new(
-                semantic_scanner(),
                 embedding_port.clone(),
                 transport.clone(),
                 registry.clone(),
@@ -3165,7 +3164,6 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                     .await
                     .expect("fresh serving-race Gateway runtime");
                 let race_semantic = SemanticRecallRuntime::new(
-                    semantic_scanner(),
                     embedding_port.clone(),
                     switch_transport.clone(),
                     registry.clone(),
@@ -3291,7 +3289,6 @@ fn recall_with_a_consistency_token_answers_and_a_caller_chosen_limit_is_refused(
                 ),
             );
             let semantic = SemanticRecallRuntime::new(
-                semantic_scanner(),
                 embedding_port,
                 transport.clone(),
                 registry.clone(),
@@ -3519,7 +3516,6 @@ fn recall_harness(handle: &mut Handle, tag: &str) -> RecallHarness {
         ),
     );
     let semantic = SemanticRecallRuntime::new(
-        semantic_scanner(),
         embedding_port,
         transport.clone(),
         registry.clone(),
@@ -3832,9 +3828,9 @@ fn recall_everyday_queries_are_answered_by_dense_with_lane_substituted() {
                 vec![(semantic_vector("operation receipt scoped context"), false)],
             );
             seed_semantic_projection_ledger(&mut handle, 1);
-            // A fixed UUID with no run of >= 7 digits: `local-secret-scan`'s deterministic
-            // phone-like rule (7+ digits, `-` not a separator break) refuses e.g. `…-79869668a78d`
-            // with FORBIDDEN before the planner is reached, so a random v4 makes this leg flaky.
+            // A fixed UUID keeps the leg reproducible; since ADR-0056 a random one (a 7+ digit run)
+            // is no longer refused, see
+            // `recall_answers_identifier_bearing_queries_and_refuses_a_credential_query`.
             let uuid_query = "a1b2c3d4-e5f6-4a7b-8c9d-e0f1a2b3c4d5".to_owned();
             let cases = [
                 ("目前项目进度", "STATE"),
@@ -3883,6 +3879,109 @@ fn recall_everyday_queries_are_answered_by_dense_with_lane_substituted() {
                         "{query}: {body}"
                     );
                 }
+                server.abort();
+                delete_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+            });
+        },
+    );
+}
+
+/// Card 30b acceptance (ADR-0056 D-A/D-C): five memories whose text carries a date, an e-mail
+/// address, a phone number, a 12-digit order number and a random UUID are each answered by a
+/// recall whose QUERY carries the same identifier — 200 with that memory ranked first, never
+/// FORBIDDEN — while a query carrying a gitleaks finding (the fake GitHub-shaped vector of
+/// `crates/adapters/tests/contribution_scan.rs`) is still the §52 FORBIDDEN. The one seal is the
+/// worker's (the gateway has no scanner).
+/// Faults: privacy rules back on `seal_query` ⇒ five FORBIDDEN ⇒ red; gitleaks removed from the
+/// seal path ⇒ the credential query answers 200 ⇒ red; the gateway's SCAN_REJECTED arm removed
+/// ⇒ DEPENDENCY_UNAVAILABLE instead of FORBIDDEN ⇒ red.
+#[test]
+#[ignore = "lane(a:request_guard) requires the isolated request-guard PostgreSQL fixture, pinned scanner and disposable Qdrant"]
+fn recall_answers_identifier_bearing_queries_and_refuses_a_credential_query() {
+    run_db_fixture::<Fixture, _>(
+        "recall_answers_identifier_bearing_queries_and_refuses_a_credential_query",
+        |mut handle| {
+            handle.assert_gateway_login();
+            let _registry_cleanup = SemanticProjectionCleanup {
+                owner: handle.owner_client().expect("semantic cleanup owner"),
+                tenant_id: handle.tenant_id,
+            };
+            let mut harness = recall_harness(&mut handle, "identifier");
+            let queries = [
+                "what is scheduled for 2026-10-15?",
+                "what did a@example.test ask about the invoice?",
+                "who answers +1 (415) 555-0123 on call?",
+                "where is order 123456789012 now?",
+                "what closed incident 3f0c9a4e-1b7d-4c55-9e21-79869668a78d?",
+            ];
+            // Each record's text carries its identifier (set BEFORE registration, so the
+            // registry's `source_updated_at` matches the row the hydrate gate reads); its point
+            // vector is its own query's, so the query ranks it first.
+            let points: Vec<RecallPoint> = queries
+                .iter()
+                .map(|query| {
+                    let record = handle.seed_workspace_visible_context_record();
+                    handle
+                        .admin
+                        .execute(
+                            "UPDATE private.memory_records SET content=jsonb_build_object('fixture',$3::text) \
+                             WHERE tenant_id=$1 AND memory_id=$2",
+                            &[&handle.tenant_id, &record.memory_id, query],
+                        )
+                        .expect("owner writes the identifier-bearing text");
+                    let point = Uuid::new_v4();
+                    seed_semantic_registry_row(&mut handle, &record, point);
+                    RecallPoint {
+                        record,
+                        point,
+                        vector: semantic_vector(query),
+                        status: AuthorityStatus::Active,
+                        archived: false,
+                        seq: 0,
+                    }
+                })
+                .collect();
+            seed_semantic_projection_ledger(&mut handle, 5);
+            let runtime_handle = handle.rt.handle().clone();
+            runtime_handle.block_on(async {
+                create_semantic_collection(
+                    &harness.transport,
+                    &harness.registry,
+                    &harness.collection,
+                )
+                .await;
+                upsert_recall_points(&harness, &handle, &points).await;
+                let (address, server) =
+                    start(harness.app.take().expect("one gateway per harness")).await;
+                for (query, point) in queries.iter().zip(&points) {
+                    let (status, response) = recall_call(
+                        address,
+                        Some(&harness.bearer),
+                        json!({"query":query,"workspace_id":handle.workspace_id,"mode":"semantic"}),
+                    )
+                    .await;
+                    assert_eq!(status, 200, "{query}: never FORBIDDEN: {response}");
+                    let body = assert_tool_response(&response, ToolName::Recall);
+                    assert_eq!(
+                        recalled_memory_ids(body).first(),
+                        Some(&point.record.memory_id.to_string()),
+                        "{query}: its memory ranks first: {body}"
+                    );
+                }
+                let (status, refused) = recall_call(
+                    address,
+                    Some(&harness.bearer),
+                    json!({"query":"why does the CI bot use ghp_RkqFzVpLwNyHtBvDgXsWuCePjMoTnAiSyEkl?",
+                           "workspace_id":handle.workspace_id,"mode":"semantic"}),
+                )
+                .await;
+                assert_eq!(status, 403, "credential query: {refused}");
+                assert_eq!(refused["error"]["data"]["code"], "FORBIDDEN", "{refused}");
                 server.abort();
                 delete_semantic_collection(
                     &harness.transport,
@@ -11697,7 +11796,6 @@ fn native_mcp_one_process_serves_three_stream_pairs_per_request() {
                         ),
                     );
                     let semantic = SemanticRecallRuntime::new(
-                        semantic_scanner(),
                         embedding_port,
                         transport.clone(),
                         registry.clone(),

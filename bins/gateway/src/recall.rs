@@ -1,14 +1,13 @@
 //! `gateway::recall` — Native authenticated semantic recall wiring.
 //! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, humaux-infra-cell,
-//!   humaux-local-secret-scan, humaux-projection, humaux-protocol, humaux-retrieval, serde_json, time,
-//!   uuid]; services=[]; env=[]; modules=[adapters::affect_repo, adapters::placement_repo, adapters::postgres, adapters::qdrant, adapters::read_materialize, adapters::retrieve, adapters::serving_repo, application::affect, application::retrieval_embedding_port, application::retrieve, domain::affect, domain::error, domain::identity, domain::ids, domain::subject, gateway::context, humaux-local-secret-scan, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::stream, protocol::mcp, protocol::mcp_catalog, retrieval::completeness, retrieval::envelope, retrieval::planner, retrieval::request]
+//!   humaux-projection, humaux-protocol, humaux-retrieval, serde_json, time, uuid]; services=[]; env=[]; modules=[adapters::affect_repo, adapters::placement_repo, adapters::postgres, adapters::qdrant, adapters::read_materialize, adapters::retrieve, adapters::serving_repo, application::affect, application::retrieval_embedding_port, application::retrieve, domain::affect, domain::error, domain::identity, domain::ids, domain::subject, gateway::context, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::stream, protocol::mcp, protocol::mcp_catalog, retrieval::completeness, retrieval::envelope, retrieval::planner, retrieval::request]
 //! Called-by: [gateway::bootstrap, gateway::context, gateway::mcp_application, tests]
 //! Invariants: [this module owns no alternate search or body fallback path; a Qdrant or provider failure surfaces as the typed retrieval error, never a degraded silent result; Qdrant is asked for cand_k for this request's workspace stream only; memory items are cut to top_k after the PG gate, the mood rerank permutes only that visible set (ADR-0030 D-D), then limit shortens it; every planner class is answered by dense (LANE_SUBSTITUTED unless the caller named a mode), only an explicit undelivered mode refuses; stage_ms partitions search() exhaustively and is reported only when every lap followed LAP_SEQUENCE]
-//! Spec: Baseline §17.3; §23.3; §33; §55.1; §78.1; ADR-0029; ADR-0031; ADR-0055
+//! Spec: Baseline §17.3; §23.3; §33; §55.1; §78.1; ADR-0029; ADR-0031; ADR-0055; ADR-0056
 //!
-//! This module composes the existing request builder, sealed provider query, same-Cell Qdrant
-//! candidate lookup, and the sole PostgreSQL final hydration boundary. It owns no alternate
-//! search or body fallback.
+//! This module composes the existing request builder, the retrieval-worker query embedding
+//! (which alone seals the query, ADR-0056 D-C), same-Cell Qdrant candidate lookup, and the sole
+//! PostgreSQL final hydration boundary. It owns no alternate search or body fallback.
 
 use std::{
     collections::BTreeSet,
@@ -49,7 +48,6 @@ use humaux_infra_cell::{
     CellAccessPermit, IntraCellHttpTransport, IntraCellResource, IntraCellResourceRegistry,
     authorize_cell_access,
 };
-use humaux_local_secret_scan::LocalSecretScanner;
 use humaux_projection::stream::StreamKey;
 use humaux_protocol::{
     mcp::{ToolName, ToolOutput},
@@ -83,7 +81,6 @@ use crate::context::ContextBootstrap;
 /// implementation (`crate::retrieval_embedding_client::GatewayRetrievalEmbeddingClient`) RPCs
 /// `humaux-retrieval-worker`, which alone calls the real provider.
 pub struct SemanticRecallRuntime {
-    scanner: Arc<LocalSecretScanner>,
     port: Arc<dyn RetrievalEmbeddingPort>,
     qdrant: Arc<dyn IntraCellHttpTransport>,
     cell_registry: IntraCellResourceRegistry,
@@ -97,7 +94,7 @@ pub struct SemanticRecallRuntime {
 
 /// `ContextBootstrap` derives `Debug` and now carries an optional handle to this runtime, so
 /// the runtime needs one. Deliberately opaque: every field here is either a credential-adjacent
-/// handle (scanner, embedding port, Qdrant transport, Cell registry) or a version string already
+/// handle (embedding port, Qdrant transport, Cell registry) or a version string already
 /// reported in `provenance`. Formatting them would put transport/permit detail into any operator
 /// line that `{:?}`s a bootstrap.
 impl std::fmt::Debug for SemanticRecallRuntime {
@@ -113,7 +110,6 @@ pub struct SemanticRecallVersions {
 
 impl SemanticRecallRuntime {
     pub fn new(
-        scanner: Arc<LocalSecretScanner>,
         port: Arc<dyn RetrievalEmbeddingPort>,
         qdrant: Arc<dyn IntraCellHttpTransport>,
         cell_registry: IntraCellResourceRegistry,
@@ -128,7 +124,6 @@ impl SemanticRecallRuntime {
             return Err(ErrorCode::InvalidInput);
         }
         Ok(Self {
-            scanner,
             port,
             qdrant,
             cell_registry,
@@ -228,7 +223,10 @@ enum Stage {
     Route,
     /// intent + `prepare_request` + the `limit` check.
     Planner,
-    /// the gateway's own `seal_query` (local gitleaks scan).
+    /// `trusted_query()` only: since ADR-0056 D-C the gateway does not scan (the worker's one
+    /// seal is inside `embed`), so this reads about 0 ms.
+    // ponytail: key kept at ~0 ms so xtask soak.rs RECALL_STAGES still parses every recall; drop
+    // it together with that list when a card owns xtask.
     Scan,
     /// the `embed_query` RPC (worker scan + provider + ledger).
     Embed,
@@ -424,11 +422,9 @@ pub async fn search(
         }
     };
     clock.lap(Stage::Route);
+    // ADR-0056 D-C / ADR-0012 §2: raw query text crosses the same-entity UDS; the worker's
+    // `seal_query` is the one egress seal, and its gitleaks verdict comes back as SCAN_REJECTED.
     let trusted_query = retrieval.trusted_query().ok_or(ErrorCode::Internal)?;
-    // Defense-in-depth local scan before the raw text crosses the wire to
-    // `humaux-retrieval-worker` (which independently scans/seals it worker-side, ADR-0012 §2's
-    // "raw query text ... never a sealed query" crossing the boundary).
-    let sealed = runtime.scanner.seal_query(&trusted_query)?;
     clock.lap(Stage::Scan);
     let embedding_input = RetrievalEmbeddingInput {
         authorization: &authorization,
@@ -438,7 +434,7 @@ pub async fn search(
         attempt_no: 1,
         profile_fingerprint: retrieval.profile_fingerprint_identity().as_str(),
         dimension: runtime.dimension,
-        query: sealed.as_str(),
+        query: trusted_query.text(),
         deadline_unix_ms: runtime.deadline_unix_ms()?,
     };
     let (vector, embedding_model_id) = match runtime.port.embed_query(embedding_input).await? {
@@ -474,6 +470,12 @@ pub async fn search(
         RetrievalEmbeddingOutcome::Skipped => {
             eprintln!("humaux-gateway: recall request_id={request_id} query_embedding_skipped");
             return Err(ErrorCode::DependencyUnavailable);
+        }
+        // §7.5 C / §52: a gitleaks finding on the query is the caller's FORBIDDEN, as it was
+        // when the gateway sealed it itself (ADR-0056 D-C); only the request id is logged.
+        RetrievalEmbeddingOutcome::Unavailable { reason } if reason == "SCAN_REJECTED" => {
+            eprintln!("humaux-gateway: recall request_id={request_id} query_scan_rejected");
+            return Err(ErrorCode::Forbidden);
         }
         // `reason` is the worker's closed failure code (or this client's own transport class),
         // never provider text and never any part of the query — ADR-0014 operator-signal rule.

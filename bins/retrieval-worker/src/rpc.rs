@@ -2,11 +2,11 @@
 //!   serves.
 //! Depends-on: crates=[axum, humaux-adapters, humaux-domain, humaux-local-secret-scan, humaux-retrieval,
 //!   humaux-retrieval-provider, serde, sha2, tokio, tracing,
-//!   uuid]; services=[]; env=[]; modules=[adapters::postgres, adapters::retrieval_embedding_rpc, domain::identity,
-//!   domain::ids, humaux-local-secret-scan, retrieval-provider::contract, retrieval::request]
+//!   uuid]; services=[]; env=[]; modules=[adapters::postgres, adapters::retrieval_embedding_rpc, domain::error,
+//!   domain::identity, domain::ids, humaux-local-secret-scan, retrieval-provider::contract, retrieval::request]
 //! Called-by: [retrieval-worker::main, tests]
 //! Invariants: [a malformed or unauthenticated RPC frame is rejected before it reaches the embedding provider call]
-//! Spec: Baseline §2; §6; ADR-0012
+//! Spec: Baseline §2; §6; §7.5; ADR-0012; ADR-0056
 //!
 //! §决定2: the worker authenticates the **caller process** via the kernel peer credential
 //! (`UnixStream::peer_cred()`), not the request body — [`PeerIdentity::connect_info`] captures
@@ -31,6 +31,7 @@ use humaux_adapters::postgres::RetrievalWorkerDbPool;
 use humaux_adapters::retrieval_embedding_rpc::{
     ClaimOutcome, ClaimedRegistration, FinishOutcome, RetrievalWorkerEmbeddingCalls, StoredOutcome,
 };
+use humaux_domain::error::ErrorCode;
 use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
 use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
 use humaux_local_secret_scan::LocalSecretScanner;
@@ -299,11 +300,21 @@ async fn embed(
     let Ok(request) = humaux_retrieval::request::build_request(intent, &profile) else {
         return unavailable_envelope(call_id, "INVALID_QUERY");
     };
-    let Some(trusted_query) = request.trusted_query() else {
-        return unavailable_envelope(call_id, "INVALID_QUERY");
-    };
-    let Ok(sealed) = state.scanner.seal_query(&trusted_query) else {
-        return unavailable_envelope(call_id, "SCAN_REJECTED");
+    // ADR-0056 D-C: the recall path's one query seal (§7.5 C, the gateway no longer scans). It
+    // blocks on the pinned gitleaks spawn, so it runs off the async workers (ADR-0055 item 3).
+    // Only a gitleaks finding is SCAN_REJECTED (the gateway's FORBIDDEN); a scanner that did not
+    // run is SCANNER_UNAVAILABLE, never a verdict on the query.
+    let scanner = Arc::clone(&state.scanner);
+    let sealed = match tokio::task::spawn_blocking(move || {
+        let trusted_query = request.trusted_query().ok_or(ErrorCode::InvalidInput)?;
+        scanner.seal_query(&trusted_query)
+    })
+    .await
+    {
+        Ok(Ok(sealed)) => sealed,
+        Ok(Err(ErrorCode::Forbidden)) => return unavailable_envelope(call_id, "SCAN_REJECTED"),
+        Ok(Err(ErrorCode::InvalidInput)) => return unavailable_envelope(call_id, "INVALID_QUERY"),
+        Ok(Err(_)) | Err(_) => return unavailable_envelope(call_id, "SCANNER_UNAVAILABLE"),
     };
     match state
         .embedder

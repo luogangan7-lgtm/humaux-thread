@@ -128,6 +128,23 @@ Two rules that are not obvious from the variable names:
   (tenant, workspace): the credential's tenant plus the requested or bound workspace, provisioned
   pairs only. A confirm token is bound to the workspace it was minted in; presented in another
   workspace it answers `CONFLICT` and stays usable where it was minted.
+- **The gateway holds no secret scanner** (card 30b / ADR-0056). `HUMAUX_GATEWAY_GITLEAKS_BIN`,
+  `HUMAUX_GATEWAY_GITLEAKS_VERSION` and `HUMAUX_GATEWAY_GITLEAKS_SHA256` are removed. The gateway
+  refuses unknown `HUMAUX_GATEWAY_*` keys, so a deployment env (`.env`, compose/helm values, an
+  operator shell) that still sets any of the three fails gateway boot until the lines are
+  deleted. The retrieval worker's `HUMAUX_RETRIEVAL_WORKER_GITLEAKS_*` stay: its `seal_query` /
+  `seal_card` is the one egress seal. A query carrying a gitleaks finding still answers
+  `FORBIDDEN` (the worker returns `SCAN_REJECTED`; operator line `query_scan_rejected`); a scanner
+  that cannot run is `SCANNER_UNAVAILABLE` → `DEPENDENCY_UNAVAILABLE`.
+- **The pinned gitleaks binary is root-owned, mode 0555, on a read-only path.** Since ADR-0056 D-D
+  the scanner hashes it once at start and re-hashes only when its `(dev, ino, len, mtime, ctime)`
+  changes, so a rewrite that preserves all five fields (root, a shared `mmap` write, or a
+  coarse-timestamp filesystem) is no longer caught per scan. File ownership is the control; the
+  stat check detects tampering, it does not prevent it.
+- **Private retrieval egress runs gitleaks only** (ADR-0056 D-A). E-mail addresses, phone numbers,
+  dates and long numbers in private memories and recall queries are sent to the retrieval provider
+  (the disclosed ExternalProcessor, recorded in `ops.data_disclosures`). The e-mail/phone rules
+  still apply to the §12 contribution path.
 
 ## 5. Start order
 

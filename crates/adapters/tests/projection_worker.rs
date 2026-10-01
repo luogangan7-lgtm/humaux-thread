@@ -16,7 +16,7 @@
 //! Called-by: [cargo-test]
 //! Invariants: [uses a throwaway tenant and Qdrant collection cleaned up on Drop; a ticket is marked done only after
 //!   search-visible confirmation; no DSN, unreachable PG/Qdrant or no local gitleaks is a visible SKIP]
-//! Spec: Baseline §17.4; §15.7; §79.2; ADR-0055
+//! Spec: Baseline §17.4; §15.7; §79.2; ADR-0052; ADR-0055; ADR-0056
 //!
 //! Same convention as `outbox_batch_remember.rs`/`stream_repo.rs`: throwaway
 //! `control.tenants` row + throwaway Qdrant collection, cleaned up on `Drop`.
@@ -1182,6 +1182,96 @@ fn permanent_qdrant_400_fails_immediately_and_leaves_no_point() {
                 .get(0);
             assert_eq!(registered, 0, "a refused upsert registers nothing");
             assert_eq!(collection_point_count(&handle), 0, "and leaves no point");
+        },
+    );
+}
+
+/// Card 30b (ADR-0056 D-A): memories whose card text carries a date, an e-mail address, a phone
+/// number, a 12-digit order number and a random UUID are ordinary private cards on the §7.5 B
+/// seal — all five project `DONE`, none settles `secret_scan_rejected`. Fault: the
+/// contribution-privacy rules back on `seal_card` ⇒ five FAILED ⇒ red.
+#[test]
+fn cards_with_date_email_phone_number_and_uuid_project_done() {
+    run_db_fixture::<Fixture, _>(
+        "cards_with_date_email_phone_number_and_uuid_project_done",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let seqs: Vec<i64> = [
+                "the billing cutover is on 2026-10-15",
+                "write to a@example.test about the invoice",
+                "call +1 (415) 555-0123 for the on-call rota",
+                "order 123456789012 shipped late",
+                "incident 3f0c9a4e-1b7d-4c55-9e21-79869668a78d is closed",
+            ]
+            .into_iter()
+            .map(|content| seed_memory(&mut handle, scope_id, content))
+            .collect();
+            let provider = Arc::new(TestDoubleProvider::new(
+                embedding_model(),
+                unused_rerank_model(),
+            ));
+            let deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("run_once succeeds");
+            assert_eq!((outcome.done, outcome.failed, outcome.retried), (5, 0, 0));
+            let key = (
+                handle.tenant_id,
+                "workspace",
+                scope_id,
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            );
+            for seq in seqs {
+                assert_eq!(stream_log_state(&mut handle, &key, seq), "DONE");
+                assert_eq!(stream_log_error_class(&mut handle, &key, seq), None);
+            }
+            assert_eq!(collection_point_count(&handle), 5);
+        },
+    );
+}
+
+/// ADR-0052 D-E, unchanged by ADR-0056: a card carrying a real gitleaks finding (the fake
+/// GitHub-shaped vector of `contribution_scan.rs`) is a verdict on the card — `FAILED
+/// secret_scan_rejected`, no retry, no point. Fault: gitleaks removed from the seal path ⇒ DONE
+/// ⇒ red.
+#[test]
+fn a_card_with_a_real_gitleaks_finding_settles_failed_secret_scan_rejected() {
+    run_db_fixture::<Fixture, _>(
+        "a_card_with_a_real_gitleaks_finding_settles_failed_secret_scan_rejected",
+        |mut handle| {
+            let scope_id = Uuid::new_v4();
+            let seq = seed_memory(
+                &mut handle,
+                scope_id,
+                "the CI bot uses ghp_RkqFzVpLwNyHtBvDgXsWuCePjMoTnAiSyEkl for releases",
+            );
+            let provider = Arc::new(TestDoubleProvider::new(
+                embedding_model(),
+                unused_rerank_model(),
+            ));
+            let deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("run_once succeeds with a per-row refusal");
+            assert_eq!((outcome.failed, outcome.retried, outcome.done), (1, 0, 0));
+            let key = (
+                handle.tenant_id,
+                "workspace",
+                scope_id,
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            );
+            assert_eq!(stream_log_state(&mut handle, &key, seq), "FAILED");
+            assert_eq!(
+                stream_log_error_class(&mut handle, &key, seq),
+                Some("secret_scan_rejected".to_owned())
+            );
+            assert_eq!(collection_point_count(&handle), 0, "not projected");
         },
     );
 }
