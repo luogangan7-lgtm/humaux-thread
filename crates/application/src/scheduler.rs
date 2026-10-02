@@ -71,11 +71,11 @@ impl Counter {
         }
     }
 
-    /// `current < max` 时 +1 返回 `true`；否则不变返回 `false`。用 `fetch_update` 一次
+    /// `current < max` 时 +1 返回 `true`；否则不变返回 `false`。用 `try_update` 一次
     /// compare-and-swap 完成，避免 `load` 之后再 `fetch_add` 之间的检查-再用竞态。
     fn try_admit(&self) -> bool {
         self.current
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 (cur < self.max).then_some(cur + 1)
             })
             .is_ok()
@@ -85,7 +85,7 @@ impl Counter {
         // 饱和减法：release 多调用一次不应该把计数器绕到 usize::MAX。
         let _ = self
             .current
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 Some(cur.saturating_sub(1))
             });
     }

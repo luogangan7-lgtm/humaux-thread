@@ -1,0 +1,39 @@
+# §46.1 migration manifest. Card 32 / ADR-0058 ruling R4 (plan v2 OPS-3): the operator re-drive
+# ops.requeue_dead_distill — re-arms DEAD DERIVED_DISTILL jobs and their FAILED outbox rows in one
+# transaction (PENDING, attempt 0, last_error_class kept, scheduler row admitted). Owner
+# role_migration_owner, SECURITY DEFINER, search_path pinned to pg_catalog, PUBLIC has no EXECUTE,
+# role_maintenance is the only non-owner role with EXECUTE. No table grant, no DML. §46 forward-fix
+# (EXPAND_CONTRACT, first free after 0196).
+
+migration_id = "0197_requeue_dead_distill"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('ops.requeue_dead_distill(uuid,uuid,text)') is null
+ and to_regclass('ops.distill_tenant_scheduler') is not null
+ and exists (select 1 from pg_attribute where attrelid='ops.jobs'::regclass
+              and attname='abandoned_claims' and not attisdropped)
+ as precheck_ok
+"""
+
+postcheck = """
+select coalesce(bool_and(
+   pg_get_userbyid(p.proowner)='role_migration_owner' and p.prosecdef
+   and 'search_path=pg_catalog'=any(coalesce(p.proconfig,'{}'))
+   and has_function_privilege('role_maintenance',p.oid,'EXECUTE')
+   and not has_function_privilege('role_gateway',p.oid,'EXECUTE')
+   and not has_function_privilege('role_retrieval_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_private_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_consolidation_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_public_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_batch_issuer',p.oid,'EXECUTE')
+   and not has_function_privilege('role_admin',p.oid,'EXECUTE')
+   and not exists (select 1 from aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) x
+                    where x.grantee=0 and x.privilege_type='EXECUTE')),false)
+ and count(*)=1 as postcheck_ok
+from pg_proc p
+where p.oid = to_regprocedure('ops.requeue_dead_distill(uuid,uuid,text)')
+"""
+
+rollback_or_forward_fix = "DROP FUNCTION ops.requeue_dead_distill(uuid,uuid,text). After that a DEAD distill job is revived only by owner SQL again (role_maintenance holds no grant on ops.jobs / ops.outbox)."
+backup_restore_requirement = "none: one new function; no row data is changed."

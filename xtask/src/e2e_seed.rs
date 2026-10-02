@@ -14,8 +14,8 @@
 //!   projection.private_memory_points, projection.stream_checkpoints, projection.stream_log,
 //!   projection.tenant_placements] x=[control.onboard_tenant, control.resolve_user_reasoning_admission],
 //!   PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
-//!   modules=[adapters::membership_repo, adapters::postgres, adapters::provisioning, adapters::quota_repo, domain::ids,
-//!   domain::ticket_family, protocol::edge]
+//!   modules=[adapters::membership_repo, adapters::postgres, adapters::provisioning, adapters::quota_repo,
+//!   domain::identity, domain::ids, domain::ticket_family, protocol::edge]
 //! Called-by: [xtask::e2e_onboard, xtask::main]
 //! Invariants: [a thin wrapper over adapters::provisioning (the same onboarding doors humaux-maintenance uses, no INSERT
 //!   of its own for tenant/workspace/key/tier/placement/collection); refuses any DSN host but 127.0.0.1 and any database
@@ -56,6 +56,12 @@
 //! distill lane (`seed_lane`, TEST health rows) stays seed-only (card 52). Printed lines are
 //! unchanged.
 //!
+//! Card 32 (ADR-0058 M8 rehearsal twin): `--second-domain` adds a second user (through
+//! `provisioning::onboard_user`, a member of the tenant and its base workspace), the reasoning
+//! domain that user owns, that user's own seed lane and key (`bearer_d2:`), so remember.put lands
+//! one tenant's Evidence in two domains. The domain row is the one seed-only INSERT besides the
+//! lane (no provisioning door creates a second domain today).
+//!
 //! Refuses to run against anything but a local disposable database (binding rule): DSN
 //! host must be `127.0.0.1` and the database name must start with `humaux_thread_`.
 
@@ -65,6 +71,7 @@ use humaux_adapters::membership_repo::AdminAction;
 use humaux_adapters::postgres::MaintenanceDbPool;
 use humaux_adapters::provisioning::{self, NewApiKey, QdrantFace, TenantReceipt, TenantRequest};
 use humaux_adapters::quota_repo;
+use humaux_domain::identity::MembershipRole;
 use humaux_domain::ids::TenantId;
 use humaux_domain::ticket_family::TicketFamily;
 use humaux_protocol::edge::{api_key_log_fingerprint, compute_api_key_hash};
@@ -349,6 +356,73 @@ pub(crate) fn seed_lane(
         endpoint_id,
         profile_id,
         policy_id,
+    })
+}
+
+/// What [`seed_second_domain`] provisioned: a second user of the seeded tenant, the ACTIVE
+/// reasoning domain that user owns, and that user's key on the base workspace (`wire` is a secret,
+/// printed only as `bearer_d2:`).
+pub(crate) struct SecondDomain {
+    user_id: Uuid,
+    reasoning_domain_id: Uuid,
+    wire: String,
+}
+
+/// ADR-0058 M8, rehearsal twin (card 32 `--second-domain`): one tenant whose Evidence lands in
+/// TWO reasoning domains. §11.2.1 / `adapters::remember::resolve_reasoning_domain`: a put is
+/// processed under the on-behalf-of user's own domain, so the second domain needs a second user
+/// (member of the tenant and the base workspace, through the same `onboard_user` door
+/// `humaux-maintenance` uses), that user's ACTIVE domain, its own admitted lane ([`seed_lane`],
+/// owned by that user — the policy-owner check wants the domain owner) and its own key.
+pub(crate) fn seed_second_domain(
+    rt: &tokio::runtime::Runtime,
+    maintenance: &MaintenanceDbPool,
+    client: &mut Client,
+    tenant: &TenantReceipt,
+    flags: &LaneFlags,
+    scopes: &[String],
+    pepper: &[u8],
+) -> Result<SecondDomain, String> {
+    let user = rt
+        .block_on(provisioning::onboard_user(
+            maintenance,
+            tenant.tenant_id,
+            &format!("e2e-seed-d2-{}@e2e.invalid", Uuid::new_v4()),
+            MembershipRole::Member,
+            Some(tenant.workspace_id),
+            &SEED_ADMIN,
+        ))
+        .map_err(|e| format!("onboard_user: {e}"))?;
+    let reasoning_domain_id: Uuid = client
+        .query_one(
+            "INSERT INTO control.private_reasoning_domains(tenant_id,name,owner_user_id,status) \
+             VALUES($1,'second',$2,'ACTIVE') RETURNING reasoning_domain_id",
+            &[&tenant.tenant_id, &user.user_id],
+        )
+        .map_err(|e| format!("insert second reasoning domain: {}", db_detail(&e)))?
+        .get(0);
+    seed_lane(
+        client,
+        tenant.tenant_id,
+        user.user_id,
+        reasoning_domain_id,
+        flags,
+    )?;
+    let (key, wire) = seed_key(pepper);
+    rt.block_on(provisioning::issue_api_key(
+        maintenance,
+        tenant.tenant_id,
+        user.user_id,
+        tenant.workspace_id,
+        &key,
+        scopes,
+        &SEED_ADMIN,
+    ))
+    .map_err(|e| format!("issue_api_key (second domain): {e}"))?;
+    Ok(SecondDomain {
+        user_id: user.user_id,
+        reasoning_domain_id,
+        wire,
     })
 }
 
@@ -706,7 +780,8 @@ fn teardown(client: &mut Client, tenant_id: Uuid) -> Result<(), String> {
 /// `cargo xtask e2e-seed --pepper-hex <hex> --scopes <a,b> [--limit 1000] \
 ///   --processor-id <uuid> --region <s> --service-tier <s> --endpoint-ref <url> \
 ///   --provider-id <s> --provider-model-id <s> --model-revision <s> \
-///   --collection <name> --dimension <u32> [--qdrant-host 127.0.0.1] [--qdrant-port 6333]`
+///   --collection <name> --dimension <u32> [--qdrant-host 127.0.0.1] [--qdrant-port 6333] \
+///   [--workspaces <n>] [--second-domain]`
 /// or `cargo xtask e2e-seed --teardown <tenant_id> [--drop-collection <name>] \
 ///   [--qdrant-host 127.0.0.1] [--qdrant-port 6333]`.
 #[allow(clippy::too_many_lines)]
@@ -893,6 +968,27 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
+    // Card 32 `--second-domain`: the M8 rehearsal twin (one tenant, two reasoning domains).
+    let second_domain = if args.iter().any(|a| a == "--second-domain") {
+        match seed_second_domain(
+            &rt,
+            &maintenance,
+            &mut client,
+            base,
+            &lane_flags,
+            &scopes,
+            &pepper,
+        ) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("e2e-seed: fail (second domain: {e})");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
     println!("tenant_id: {}", base.tenant_id);
     println!("user_id: {}", base.owner_user_id);
     println!("workspace_id: {}", base.workspace_id);
@@ -903,6 +999,11 @@ pub fn run(args: &[String]) -> i32 {
     for (k, (workspace_id, wire)) in seeded.extra_workspaces.iter().enumerate() {
         println!("workspace_id_{}: {workspace_id}", k + 2);
         println!("bearer_{}: {wire}", k + 2);
+    }
+    if let Some(d) = &second_domain {
+        println!("second_user_id: {}", d.user_id);
+        println!("second_reasoning_domain_id: {}", d.reasoning_domain_id);
+        println!("bearer_d2: {}", d.wire);
     }
     println!("binding_id: {}", lane.binding_id);
     println!("binding_version: {}", lane.binding_version);
@@ -997,8 +1098,8 @@ pub fn run(args: &[String]) -> i32 {
     );
     println!();
     // ADR-0036: same for the distill hop — no tenant/domain in the environment, only the
-    // job-dispatch knobs. DISTILL_BATCH / DISTILL_LEASE_SECS remain deployment-side.
-    println!("export HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH=8");
+    // dispatch knobs (ADR-0058 D-K). LEASE / HARD_DEADLINE remain deployment-side.
+    println!("export HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4");
     println!("export HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5");
 
     0

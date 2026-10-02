@@ -1,11 +1,11 @@
 //! `adapters::contribution_reasoner` — §12.1.1 production bridge from a sealed contribution request to
 //!   USER_REASONING.
-//! Depends-on: crates=[async-trait, hex, humaux-application, humaux-domain, serde_json, sha2, sqlx, uuid]; services=[PostgreSQL(any) r=[control.memberships, control.private_reasoning_domains, control.tenants, control.users, private.events, private.evidence_objects, private.memory_evidence, private.memory_records] x=[ops.lock_contribution_inputs, public.phase9_public_coverage_for_probe]]; env=[]; modules=[adapters::byok, adapters::contribution_entry_repo, adapters::contribution_execution_repo, adapters::disclosure, adapters::model_call_ledger, adapters::postgres, adapters::reasoning_route_admission, application::consolidate, application::contribute, application::contribution_execution, domain::dataclass, domain::egress, domain::error, domain::evidence, domain::ids, domain::public]
+//! Depends-on: crates=[async-trait, hex, humaux-application, humaux-domain, serde_json, sha2, sqlx, uuid]; services=[PostgreSQL(any) r=[control.memberships, control.private_reasoning_domains, control.tenants, control.users, private.events, private.evidence_objects, private.memory_evidence, private.memory_records] x=[ops.lock_contribution_inputs, public.phase9_public_coverage_for_probe]]; env=[]; modules=[adapters::byok, adapters::contribution_entry_repo, adapters::contribution_execution_repo, adapters::disclosure, adapters::model_call_ledger, adapters::postgres, adapters::reasoning_route_admission, application::consolidate, application::contribute, application::contribution_execution, domain::dataclass, domain::egress, domain::error, domain::evidence, domain::ids, domain::ledger, domain::public]
 //! Called-by: [adapters::consolidation_reasoner, adapters::distill_reasoner, humaux-private-worker, private-worker::distill, private-worker::inference_rpc, private-worker::main, tests]
 //! Invariants: [private-worker only: source identifiers are reloaded and validated under the authenticated scope
 //!   before any outbound body is built; callers cannot inject private text; an existing reservation or failed
 //!   admission returns an error without a provider call]
-//! Spec: none
+//! Spec: ADR-0058
 //!
 //! This private-worker-only adapter owns the original source identifiers. It reloads and
 //! validates them under the authenticated scope before it ever builds an outbound body; callers
@@ -38,6 +38,7 @@ use humaux_domain::{
     error::ErrorCode,
     evidence::payload_sha256,
     ids::{TenantId, UserId},
+    ledger::ModelCallPurpose,
     public::ReleaseSource,
 };
 use serde_json::Value;
@@ -47,9 +48,9 @@ use uuid::Uuid;
 
 use crate::{
     byok::{
-        CredentialRef, PrivateInferenceContext, ReasoningCapability, ReasoningDomainId,
-        ReasoningProviderError, StructuredReasoningRequest, TokenUsage, UserReasoningProvider,
-        structured_request_body,
+        CredentialRef, OutputChannel, PrivateInferenceContext, ReasoningCapability,
+        ReasoningDomainId, ReasoningProviderError, StructuredReasoningRequest, TokenUsage,
+        UserReasoningProvider, json_has_nul, structured_request_body,
     },
     contribution_entry_repo,
     contribution_execution_repo::{
@@ -463,6 +464,7 @@ impl<'a> ContributionReasoner<'a> {
             user_prompt,
             json_schema: schema.to_owned(),
             max_output_tokens: self.config.max_output_tokens,
+            output: OutputChannel::Content,
         };
         let (wire_payload, egress_permit) = authorize_structured_egress(
             execution.tenant_id,
@@ -647,6 +649,7 @@ impl<'a> ContributionReasoner<'a> {
             user_prompt,
             json_schema,
             max_output_tokens: self.config.max_output_tokens,
+            output: OutputChannel::Content,
         };
         let (wire_payload, permit) = authorize_structured_egress(
             request.authorization.tenant_id().0,
@@ -774,7 +777,19 @@ impl<'a> ContributionReasoner<'a> {
         self.finalize_reasoning_call(&reserved, disclosure_outcome, model_outcome, &finalize)
             .await?;
         let output_bytes = response
-            .map_err(|_| fail("user reasoning provider failed"))?
+            .map_err(|error| {
+                eprintln!(
+                    "{}",
+                    provider_failure_line(
+                        ModelCallPurpose::ContributionDeidentify,
+                        reserved.tenant_id,
+                        reserved.model_call_id,
+                        &finalize,
+                        &error,
+                    )
+                );
+                fail(error.class())
+            })?
             .json
             .into_bytes();
         Ok(PrivateReasoningResult {
@@ -898,6 +913,29 @@ pub(crate) async fn complete_structured_timed(
         ),
     };
     (response, disclosure_outcome, model_outcome, finalize)
+}
+
+/// ADR-0058 D-N: the ONE operator line for a failed provider call, printed by every dispatch path
+/// (contribution, distill, consolidation). It carries what the ledger row holds — the static
+/// class, the latency and the `model_call_id` to join on — so a timeout (`RETRY_WAIT` with
+/// latency ≈ the transport timeout), a 429/5xx (`RETRY_WAIT`, short) and a refusal
+/// (`PROVIDER_PERMANENT`) are told apart without a SQL session. Never the provider message: it
+/// may carry provider or user text.
+pub(crate) fn provider_failure_line(
+    purpose: ModelCallPurpose,
+    tenant_id: Uuid,
+    model_call_id: Uuid,
+    finalize: &FinalizeCall,
+    error: &ReasoningProviderError,
+) -> String {
+    let latency_ms = finalize
+        .latency_ms
+        .map_or_else(|| "-".to_owned(), |ms| ms.to_string());
+    format!(
+        "humaux-reasoning: provider call failed purpose={} tenant={tenant_id} model_call_id={model_call_id} error_class={} latency_ms={latency_ms}",
+        purpose.as_db_str(),
+        error.class()
+    )
 }
 
 struct MaterializedSources {
@@ -1358,8 +1396,17 @@ fn parse_json_string(bytes: &[u8], cursor: &mut usize) -> Result<String, ErrorCo
         } else if byte == b'\\' {
             escaped = true;
         } else if byte == b'"' {
-            return serde_json::from_slice(&bytes[start..*cursor])
-                .map_err(|_| ErrorCode::InvalidInput);
+            // ADR-0058 R8: PostgreSQL cannot store U+0000 — a malformed reply, refused here
+            // (every key and value of the closed object passes through this function).
+            let decoded: Value = serde_json::from_slice(&bytes[start..*cursor])
+                .map_err(|_| ErrorCode::InvalidInput)?;
+            if json_has_nul(&decoded) {
+                return Err(ErrorCode::InvalidInput);
+            }
+            return decoded
+                .as_str()
+                .map(str::to_owned)
+                .ok_or(ErrorCode::InvalidInput);
         }
     }
     Err(ErrorCode::InvalidInput)
@@ -1508,6 +1555,10 @@ impl UserContributionAssessmentPort for ContributionReasoner<'_> {
             .map_err(|_| ErrorCode::DependencyUnavailable)?;
         let value: Value =
             serde_json::from_slice(&result.output_bytes).map_err(|_| ErrorCode::InvalidInput)?;
+        // ADR-0058 R8: U+0000 anywhere in the reply is a malformed reply.
+        if json_has_nul(&value) {
+            return Err(ErrorCode::InvalidInput);
+        }
         let object = value
             .as_object()
             .filter(|object| object.len() == 1)
@@ -1545,6 +1596,10 @@ impl UserContributionAssessmentPort for ContributionReasoner<'_> {
             .map_err(|_| ErrorCode::DependencyUnavailable)?;
         let value: Value =
             serde_json::from_slice(&result.output_bytes).map_err(|_| ErrorCode::InvalidInput)?;
+        // ADR-0058 R8: U+0000 anywhere in the reply is a malformed reply.
+        if json_has_nul(&value) {
+            return Err(ErrorCode::InvalidInput);
+        }
         let object = value
             .as_object()
             .filter(|object| object.len() == 5)
@@ -1630,6 +1685,44 @@ pub(crate) fn fail(label: &'static str) -> PrivateReasoningError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0058 D-N — fault: drop `latency_ms=` (or the class / id) from the line.
+    #[test]
+    fn provider_failure_line_names_class_latency_and_model_call_id() {
+        let tenant = Uuid::from_u128(1);
+        let call = Uuid::from_u128(2);
+        let line = provider_failure_line(
+            ModelCallPurpose::PrivateDistillText,
+            tenant,
+            call,
+            &FinalizeCall {
+                latency_ms: Some(120_004),
+                ..FinalizeCall::default()
+            },
+            &ReasoningProviderError::RetryWait { retry_after: None },
+        );
+        assert_eq!(
+            line,
+            format!(
+                "humaux-reasoning: provider call failed purpose=PRIVATE_DISTILL_TEXT tenant={tenant} model_call_id={call} error_class=RETRY_WAIT latency_ms=120004"
+            )
+        );
+        let secret = ReasoningProviderError::ProviderPermanent {
+            message: "provider said: user text".to_owned(),
+        };
+        let line = provider_failure_line(
+            ModelCallPurpose::PrivateConsolidate,
+            tenant,
+            call,
+            &FinalizeCall::default(),
+            &secret,
+        );
+        assert!(
+            line.ends_with("error_class=PROVIDER_PERMANENT latency_ms=-"),
+            "{line}"
+        );
+        assert!(!line.contains("user text"), "never the provider message");
+    }
 
     #[test]
     fn adversarial_private_and_public_text_stay_data_in_the_structured_envelope() {
@@ -1729,6 +1822,22 @@ mod tests {
         assert!(parse_assessment(br#"{"novelty":"PASS","quality":"PASS","generality":"PASS","grounding":"MAYBE","candidate":"safe"}"#).is_err());
         assert!(parse_assessment(br#"{"novelty":"PASS","quality":"PASS","generality":"PASS","grounding":"PASS","candidate":"safe","extra":true}"#).is_err());
         assert!(parse_assessment(br#"{"novelty":"PASS","novelty":"FAIL","quality":"PASS","generality":"PASS","grounding":"PASS","candidate":"safe"}"#).is_err());
+    }
+
+    /// ADR-0058 R8 — fault: drop the `json_has_nul` refusal in `parse_json_string` ⇒ both
+    /// replies are accepted (red).
+    #[test]
+    fn contribution_parsers_refuse_u0000_in_any_string() {
+        assert_eq!(
+            parse_coverage_probe(br#"{"probe":"safe\u0000probe"}"#).unwrap_err(),
+            ErrorCode::InvalidInput
+        );
+        assert_eq!(
+            parse_assessment(br#"{"novelty":"PASS","quality":"PASS","generality":"PASS","grounding":"PASS","candidate":"sa\u0000fe"}"#)
+                .unwrap_err(),
+            ErrorCode::InvalidInput
+        );
+        assert!(parse_coverage_probe(br#"{"probe":"safe probe"}"#).is_ok());
     }
 
     #[test]

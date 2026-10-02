@@ -1,5 +1,5 @@
 //! `xtask::rls_check` — G80-26 (§48.2) runtime DB role invariant CI enumeration gate.
-//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.assert_write_scope, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant, control.onboard_workspace, control.resolve_user_reasoning_admission, control.revoke_api_key, ops.claim_derived_work, ops.contribution_reservation_authority_validate, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal]]; env=[CARGO_MANIFEST_DIR, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
+//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.distill_calls, ops.distill_tenant_scheduler, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.provider_arbiters, ops.provider_slots, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.assert_write_scope, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant, control.onboard_workspace, control.resolve_user_reasoning_admission, control.revoke_api_key, ops.admit_distill_budget, ops.begin_call, ops.claim_derived_work, ops.claim_derived_work_v2, ops.distill_slots_all_bound, ops.contribution_reservation_authority_validate, ops.distill_scheduler_admit, ops.finish_derived_work_v2, ops.renew_lease, ops.requeue_dead_distill, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal]]; env=[CARGO_MANIFEST_DIR, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
 //! Called-by: [xtask::dep_map, xtask::main]
 //! Invariants: [any catalog cell that disagrees with §48.2 / §62 grants is fail, named by role and table]
 //! Spec: Baseline §48.2; §62
@@ -1425,6 +1425,12 @@ const NAMED_NO_NON_OWNER_GRANTS: &[&str] = &[
     "control.reasoning_route_domain_receipts",
     // 0135 receipt predicate SSOT is readable only through owner-rights consumers.
     "public._legacy_receipt_match_basis",
+    // 0190 (ADR-0058) distill dispatch scheduling state: reachable only through the four owner
+    // definers checked by check_distill_dispatch_v2_boundary.
+    "ops.provider_arbiters",
+    "ops.provider_slots",
+    "ops.distill_tenant_scheduler",
+    "ops.distill_calls",
 ];
 
 /// The §6.2.2 column set — "T" in the §48.2 "表集合派生" check's `S \ T == ∅`. Single
@@ -3474,9 +3480,10 @@ fn report(results: &[GateResult]) -> i32 {
 ///   in and widens access;
 /// * the function is owned by `role_migration_owner`, SECURITY DEFINER with a pinned
 ///   `search_path` (an unpinned one is how a definer function gets hijacked), and
-/// * its EXECUTE list is EXACTLY the two derived-layer worker roles, with PUBLIC revoked —
-///   `current_user` inside the definer is the OWNER, so EXECUTE is the entire authorization
-///   boundary here.
+/// * its EXECUTE list is EXACTLY `role_consolidation_worker` (ADR-0058 D-L: 0193 took
+///   `role_private_worker` off it — distill is claimed only through the v2 slots, and the v1 body
+///   refuses `DERIVED_DISTILL`), with PUBLIC revoked — `current_user` inside the definer is the
+///   OWNER, so EXECUTE is the entire authorization boundary here.
 ///
 /// Missing objects ⇒ `not_applicable` with the object named (§57.1).
 pub fn check_derived_work_dispatch_boundary(client: &mut impl GenericClient) -> GateResult {
@@ -3500,8 +3507,8 @@ pub fn check_derived_work_dispatch_boundary(client: &mut impl GenericClient) -> 
         pass(
             check,
             "ops.claim_derived_work: owner SECURITY DEFINER, search_path pinned, EXECUTE exactly \
-             {role_consolidation_worker, role_private_worker}, PUBLIC revoked; ops.jobs keeps one \
-             FORCE-RLS permissive policy with both the owner and tenant arms",
+             {role_consolidation_worker}, PUBLIC revoked; ops.jobs keeps one FORCE-RLS permissive \
+             policy with both the owner and tenant arms",
         )
     } else {
         fail(check, problems.join("; "))
@@ -3509,7 +3516,8 @@ pub fn check_derived_work_dispatch_boundary(client: &mut impl GenericClient) -> 
 }
 
 const DERIVED_CLAIM_FN: &str = "ops.claim_derived_work(text[],text,double precision,bigint)";
-const DERIVED_CLAIM_EXECUTORS: &[&str] = &["role_consolidation_worker", "role_private_worker"];
+// ADR-0058 D-L: the private worker claims distill only through ops.claim_derived_work_v2.
+const DERIVED_CLAIM_EXECUTORS: &[&str] = &["role_consolidation_worker"];
 
 const RETIRE_FAILED_FN: &str =
     "projection.retire_failed_ticket(uuid,text,uuid,text,text,text,bigint,text)";
@@ -4003,6 +4011,142 @@ pub fn check_stream_point_ledger_boundary(client: &mut impl GenericClient) -> Ga
     }
 }
 
+/// ADR-0058 (migrations 0190 + 0196, card 32): the four distill dispatch doors and the §72.3
+/// tenant budget in front of `begin_call` (D-T).
+const DISTILL_DISPATCH_V2_FUNCTIONS: [&str; 6] = [
+    "ops.claim_derived_work_v2(text,double precision,double precision)",
+    "ops.distill_slots_all_bound()",
+    "ops.admit_distill_budget(uuid,double precision,integer)",
+    "ops.begin_call(uuid,uuid,text,integer,uuid,double precision)",
+    "ops.renew_lease(uuid,uuid,text,integer,double precision)",
+    "ops.finish_derived_work_v2(uuid,uuid,text,integer,text,text,double precision,double precision)",
+];
+/// The private worker is the only distill dispatcher (ADR-0058 D-I).
+const DISTILL_DISPATCH_V2_EXECUTORS: &[&str] = &["role_private_worker"];
+const DISTILL_SCHEDULER_ADMIT_FN: &str = "ops.distill_scheduler_admit()";
+/// ADR-0058 R4 (0197): the operator re-drive of DEAD distill jobs, the §4.2 operator-write role's
+/// door (`humaux-maintenance jobs requeue-dead`) — never a worker's.
+const DISTILL_REQUEUE_DEAD_FN: &str = "ops.requeue_dead_distill(uuid,uuid,text)";
+const DISTILL_REQUEUE_DEAD_EXECUTORS: &[&str] = &["role_maintenance"];
+
+/// ADR-0058 (migrations 0190 + 0196 + 0197 + 0199, card 32): distill dispatch v2's boundary.
+///
+/// * the four doors, `admit_distill_budget` (0196) and the drain's slot probe
+///   `distill_slots_all_bound` (0199, ruling R5) are owner-owned, SECURITY DEFINER,
+///   `search_path=pg_catalog`, EXECUTE held by exactly `role_private_worker`, PUBLIC revoked —
+///   `current_user` inside them is the owner, so EXECUTE is the whole boundary;
+/// * `requeue_dead_distill` (0197, ruling R4) is the same shape with EXECUTE held by exactly
+///   `role_maintenance`;
+/// * the scheduler-admit trigger function is an owner definer nobody may EXECUTE, and its trigger
+///   is enabled on `ops.jobs`;
+/// * `ops.distill_tenant_scheduler` and `ops.distill_calls` keep one FORCE-RLS permissive policy
+///   with the owner and tenant arms on both legs;
+/// * §67.2: exactly four provider slots numbered 1..4 and one arbiter row (a fifth slot is a
+///   migration, never a runtime insert).
+///
+/// Table privileges on the four tables are `—` for every non-owner role via
+/// [`NAMED_NO_NON_OWNER_GRANTS`]. Missing objects ⇒ `not_applicable` with the object named (§57.1).
+pub fn check_distill_dispatch_v2_boundary(client: &mut impl GenericClient) -> GateResult {
+    let check = "ADR-0058 distill dispatch v2 boundary";
+    let present: bool = match client.query_one(
+        "SELECT bool_and(to_regprocedure(f) IS NOT NULL) AND to_regprocedure($2) IS NOT NULL \
+                AND to_regprocedure($3) IS NOT NULL \
+         FROM unnest($1::text[]) AS f",
+        &[
+            &DISTILL_DISPATCH_V2_FUNCTIONS.to_vec(),
+            &DISTILL_SCHEDULER_ADMIT_FN,
+            &DISTILL_REQUEUE_DEAD_FN,
+        ],
+    ) {
+        Ok(row) => row.get::<_, Option<bool>>(0).unwrap_or(false),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    if !present {
+        return not_applicable(
+            check,
+            format!(
+                "missing one of {}, {DISTILL_SCHEDULER_ADMIT_FN} or {DISTILL_REQUEUE_DEAD_FN}",
+                DISTILL_DISPATCH_V2_FUNCTIONS.join(", ")
+            ),
+        );
+    }
+
+    let mut problems = Vec::new();
+    let definers = DISTILL_DISPATCH_V2_FUNCTIONS
+        .iter()
+        .map(|f| (*f, DISTILL_DISPATCH_V2_EXECUTORS))
+        .chain([
+            (DISTILL_SCHEDULER_ADMIT_FN, &[][..]),
+            (DISTILL_REQUEUE_DEAD_FN, DISTILL_REQUEUE_DEAD_EXECUTORS),
+        ]);
+    for (function, executors) in definers {
+        check_owner_definer_function(client, &mut problems, function, executors);
+    }
+    match client.query_opt(
+        "SELECT t.tgenabled::text FROM pg_trigger t \
+         WHERE t.tgrelid = 'ops.jobs'::regclass AND t.tgname = 'derived_distill_scheduler_admit' \
+           AND NOT t.tgisinternal",
+        &[],
+    ) {
+        Ok(Some(row)) => {
+            let enabled: String = row.get(0);
+            if enabled != "O" {
+                problems.push(format!(
+                    "derived_distill_scheduler_admit must be enabled, tgenabled={enabled}"
+                ));
+            }
+        }
+        Ok(None) => problems.push("ops.jobs has no derived_distill_scheduler_admit trigger".into()),
+        Err(error) => problems.push(format!("admit trigger probe failed: {error}")),
+    }
+    check_owner_arm_policy(
+        client,
+        &mut problems,
+        "ops.distill_tenant_scheduler",
+        "distill_tenant_scheduler_tenant_isolation",
+    );
+    check_owner_arm_policy(
+        client,
+        &mut problems,
+        "ops.distill_calls",
+        "distill_calls_tenant_isolation",
+    );
+    match client.query_one(
+        "SELECT (SELECT count(*) FROM ops.provider_slots), \
+                (SELECT coalesce(min(slot_no), 0)::int FROM ops.provider_slots), \
+                (SELECT coalesce(max(slot_no), 0)::int FROM ops.provider_slots), \
+                (SELECT count(*) FROM ops.provider_arbiters)",
+        &[],
+    ) {
+        Ok(row) => {
+            let (slots, min, max, arbiters): (i64, i32, i32, i64) =
+                (row.get(0), row.get(1), row.get(2), row.get(3));
+            if (slots, min, max, arbiters) != (4, 1, 4, 1) {
+                problems.push(format!(
+                    "§67.2: expected 4 provider slots numbered 1..4 and 1 arbiter row; found \
+                     {slots} slot(s) {min}..{max}, {arbiters} arbiter row(s)"
+                ));
+            }
+        }
+        Err(error) => problems.push(format!("slot/arbiter probe failed: {error}")),
+    }
+
+    if problems.is_empty() {
+        pass(
+            check,
+            "claim_derived_work_v2 / distill_slots_all_bound / admit_distill_budget / begin_call / \
+             renew_lease / finish_derived_work_v2: owner \
+             SECURITY DEFINER, search_path pinned, EXECUTE exactly {role_private_worker}, PUBLIC \
+             revoked; requeue_dead_distill: owner SECURITY DEFINER, search_path pinned, EXECUTE \
+             exactly {role_maintenance}; scheduler admit trigger enabled, its definer executable by \
+             nobody; scheduler and distill_calls keep one FORCE-RLS policy with both arms; 4 slots, \
+             1 arbiter",
+        )
+    } else {
+        fail(check, problems.join("; "))
+    }
+}
+
 pub fn run(_args: &[String]) -> i32 {
     let mut results = Vec::new();
 
@@ -4035,6 +4179,7 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_projection_claim_boundary(&mut client));
             results.push(check_onboarding_boundary(&mut client));
             results.push(check_stream_point_ledger_boundary(&mut client));
+            results.push(check_distill_dispatch_v2_boundary(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -4056,6 +4201,7 @@ pub fn run(_args: &[String]) -> i32 {
                 "ADR-0052 projection ticket cross-tenant claim",
                 "ADR-0053 onboarding doors and PROVISIONING write gate",
                 "ADR-0057 A2 point-ledger definer",
+                "ADR-0058 distill dispatch v2 boundary",
             ] {
                 results.push(fail_for(name, &conn_err));
             }

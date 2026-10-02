@@ -1,0 +1,26 @@
+# §46.1 migration manifest. Card 32 / ADR-0058 D-T (guard (d) of main-line ruling E1): the §72.3
+# tenant distill budget ops.admit_distill_budget (owner definer, EXECUTE role_private_worker only) in
+# front of ops.begin_call, plus the (tenant_id, begun_at) index its sliding window reads. §46
+# forward-fix (EXPAND_CONTRACT, first free after 0195).
+
+migration_id = "0196_distill_call_budget"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('ops.admit_distill_budget(uuid,double precision,integer)') is null
+ and to_regprocedure('ops.begin_call(uuid,uuid,text,integer,uuid,double precision)') is not null
+ and to_regclass('ops.distill_calls_tenant_begun_idx') is null
+ as precheck_ok
+"""
+
+postcheck = """
+select to_regclass('ops.distill_calls_tenant_begun_idx') is not null
+ and (select prosecdef and proowner = 'role_migration_owner'::regrole
+        from pg_proc where oid = 'ops.admit_distill_budget(uuid,double precision,integer)'::regprocedure)
+ and has_function_privilege('role_private_worker', 'ops.admit_distill_budget(uuid,double precision,integer)', 'EXECUTE')
+ and not has_function_privilege('role_gateway', 'ops.admit_distill_budget(uuid,double precision,integer)', 'EXECUTE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Reverting is DROP FUNCTION ops.admit_distill_budget(uuid,double precision,integer); DROP INDEX ops.distill_calls_tenant_begun_idx; safe only while no private-worker binary that calls it runs."
+backup_restore_requirement = "none: one index build on ops.distill_calls (small, owner-only) and one new function; no row data is changed."

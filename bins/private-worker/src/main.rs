@@ -1,10 +1,10 @@
 //! `private-worker::main` — `humaux-private-worker` process entry (§4.2 minimal process set; §4.4 admin probe
 //!   contract; §11/§11.1 T4.4+T4.5; §11.8 ADR-0015 inference RPC).
-//! Depends-on: crates=[humaux-adapters, humaux-domain, tokio, uuid]; services=[PostgreSQL(role_private_worker)]; env=[HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_DISTILL_BATCH, HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH, HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS, HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_KEY_ENV, HUMAUX_PRIVATE_WORKER_MODEL_ID, HUMAUX_PRIVATE_WORKER_MODEL_REVISION, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_PROVIDER_ID, HUMAUX_PRIVATE_WORKER_REGION, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, PRIVATE_WORKER_PG_DSN]; modules=[adapters::byok, adapters::byok::ssrf, adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::disclosure, adapters::postgres, domain::egress, private-worker::distill, private-worker::inference_rpc]
+//! Depends-on: crates=[humaux-adapters, humaux-domain, tokio, uuid]; services=[PostgreSQL(role_private_worker)]; env=[HUMAUX_PRIVATE_WORKER_CAPABILITIES, HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT, HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS, HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS, HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_KEY_ENV, HUMAUX_PRIVATE_WORKER_MODEL_ID, HUMAUX_PRIVATE_WORKER_MODEL_REVISION, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_PROVIDER_ID, HUMAUX_PRIVATE_WORKER_REGION, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, PRIVATE_WORKER_PG_DSN]; modules=[adapters::byok, adapters::byok::ssrf, adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::disclosure, adapters::jobs, adapters::postgres, domain::authority, domain::egress, private-worker::distill, private-worker::inference_rpc]
 //! Called-by: [process(humaux-private-worker)]
 //! Invariants: [the only process holding both role_private_worker DB write and BYOK decrypt capability (§11.1); a
 //!   missing/invalid env value or unreachable DSN exits non-zero before serving]
-//! Spec: Baseline §11.1; §11.8; §78.1; ADR-0037; ADR-0036; ADR-0016
+//! Spec: Baseline §11.1; §11.8; §78.1; ADR-0037; ADR-0036; ADR-0016; ADR-0058
 //!
 //! §11.1: "仅 humaux-private-worker 在最贴近 adapter 处解密" — this is the one process in the
 //! workspace permitted to hold both DB write capability (`PrivateWorkerDbPool`,
@@ -25,16 +25,19 @@
 //! * `--readyz`: card 15 / ADR-0037 probe-based readiness — see [`readyz`]. Tenant-free
 //!   (ADR-0036) and provider-free: it deliberately makes NO inference call, because a readiness
 //!   probe that burns a paid provider round trip is a probe nobody dares to poll.
-//! * `--distill-once` / `--distill-serve` (ADR-0016, cross-tenant since ADR-0036): one bounded
-//!   pass / a resident loop of [`humaux_private_worker::distill::dispatch_pass`] — same
-//!   provider/config bootstrap as `--serve-rpc` ([`bootstrap`]). There is no tenant id or
-//!   reasoning domain in the environment any more: both come from the `DERIVED_DISTILL` job the
-//!   pass claims through the owner SECURITY DEFINER `ops.claim_derived_work` (migration 0164),
-//!   and everything after the claim runs under that job's own tenant context.
+//! * `--distill-once` / `--distill-serve` (ADR-0016, cross-tenant since ADR-0036, seats since
+//!   ADR-0058): IN_FLIGHT seats drain the backlog once
+//!   ([`humaux_private_worker::distill::dispatch_pass`]) / stay resident
+//!   ([`humaux_private_worker::distill::dispatch_serve`]) — same provider/config bootstrap as
+//!   `--serve-rpc` ([`bootstrap`]). There is no tenant id or reasoning domain in the environment:
+//!   both come from each `DERIVED_DISTILL` job claimed through the owner SECURITY DEFINER
+//!   `ops.claim_derived_work_v2` (migration 0190), and everything after the claim runs under that
+//!   job's own tenant context.
 
 use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use humaux_adapters::byok::{
@@ -45,7 +48,9 @@ use humaux_adapters::byok::{
 use humaux_adapters::consolidation_reasoner::consolidation_prompt_contract;
 use humaux_adapters::contribution_reasoner::ContributionReasonerConfig;
 use humaux_adapters::disclosure::DeletionCapability;
+use humaux_adapters::jobs;
 use humaux_adapters::postgres::PrivateWorkerDbPool;
+use humaux_domain::authority::AuthorityClass;
 use humaux_domain::egress::ProcessorId;
 use humaux_private_worker::distill::{self, DistillDispatchConfig};
 use humaux_private_worker::inference_rpc::{RpcState, bind_socket, clone_config, serve};
@@ -59,6 +64,19 @@ fn parse<T: std::str::FromStr>(name: &str) -> Result<T, String> {
     required(name)?
         .parse()
         .map_err(|_| format!("invalid configuration: {name}"))
+}
+
+/// A required comma list from the §11.2 capability closed set ([`ReasoningCapability::parse`]);
+/// empty, unknown or repeated values are a configuration error.
+fn capabilities(name: &str) -> Result<Vec<ReasoningCapability>, String> {
+    let mut out = Vec::new();
+    for raw in required(name)?.split(',') {
+        match ReasoningCapability::parse(raw.trim()) {
+            Some(c) if !out.contains(&c) => out.push(c),
+            _ => return Err(format!("invalid configuration: {name}")),
+        }
+    }
+    Ok(out)
 }
 
 fn usage() -> &'static str {
@@ -215,6 +233,9 @@ struct Bootstrap {
     pool: PrivateWorkerDbPool,
     config: ContributionReasonerConfig,
     provider: OpenAiCompatibleProvider<EgressHttpTransport, EnvCredential>,
+    /// The provider transport timeout; the distill dispatcher sizes `ops.begin_call`'s window
+    /// from it (ADR-0058 D-K).
+    http_timeout: Duration,
 }
 
 async fn bootstrap() -> Result<Bootstrap, String> {
@@ -226,21 +247,18 @@ async fn bootstrap() -> Result<Bootstrap, String> {
         model_revision: env::var("HUMAUX_PRIVATE_WORKER_MODEL_REVISION")
             .ok()
             .filter(|v| !v.is_empty()),
-        // Not deployment config: this listener's only provider call is `complete_structured`,
-        // and `UserReasoningProvider` refuses that before any network round trip unless the
-        // descriptor declares the capability (§11.3) — a deployment that cannot promise it has
-        // nothing this RPC can serve.
-        capabilities: vec![ReasoningCapability::StructuredOutput],
+        // ADR-0058 D-M (main-line ruling 2026-10-02 10:35): what the bound endpoint can do is
+        // deployment configuration, never a literal or a provider name — the distill output
+        // channel and any provider-specific request field follow these declared capabilities.
+        capabilities: capabilities("HUMAUX_PRIVATE_WORKER_CAPABILITIES")?,
         custom_endpoint: Some(chat_url.clone()),
     };
     let http_timeout =
         Duration::from_secs(parse::<u64>("HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS")?);
-    // The NAME of the variable holding the key is configurable; the key itself is read once,
-    // here, and only ever leaves this scope inside `EnvCredential`.
-    let key_env = env::var("HUMAUX_PRIVATE_WORKER_KEY_ENV")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "MINIMAX_API_KEY".to_owned());
+    // The NAME of the variable holding the key is configuration (required: a default would name a
+    // provider in code, §78.1); the key itself is read once, here, and only ever leaves this scope
+    // inside `EnvCredential`.
+    let key_env = required("HUMAUX_PRIVATE_WORKER_KEY_ENV")?;
     let key = env::var(&key_env).map_err(|_| {
         format!("missing required configuration: {key_env} (HUMAUX_PRIVATE_WORKER_KEY_ENV)")
     })?;
@@ -276,7 +294,8 @@ async fn bootstrap() -> Result<Bootstrap, String> {
     // The Consolidate path takes prompt/schema/budget from the shared contract itself
     // (`ConsolidationReasoner`, ADR-0015 D2); these three fields only have to satisfy
     // `ContributionReasonerConfig::validate` for the config to be accepted at all.
-    let contract = consolidation_prompt_contract();
+    // ADR-0058 D-O: any ceiling satisfies `validate`; the highest storable one is the widest menu.
+    let contract = consolidation_prompt_contract(AuthorityClass::ProjectConstraint);
     let config = ContributionReasonerConfig {
         allowed_egress_processor_id: ProcessorId(parse::<Uuid>(
             "HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID",
@@ -286,8 +305,8 @@ async fn bootstrap() -> Result<Bootstrap, String> {
         // ponytail: no deployment has told us the endpoint's deletion semantics yet; make it
         // env-driven when a provider that does promise deletion is onboarded.
         deletion_capability: DeletionCapability::Unknown,
-        system_prompt: contract.system_prompt.to_owned(),
-        json_schema: contract.json_schema.to_owned(),
+        system_prompt: contract.system_prompt,
+        json_schema: contract.json_schema,
         max_output_tokens: contract.max_output_tokens,
     };
     config
@@ -302,6 +321,7 @@ async fn bootstrap() -> Result<Bootstrap, String> {
         pool,
         config,
         provider,
+        http_timeout,
     })
 }
 
@@ -313,6 +333,7 @@ async fn serve_rpc() -> Result<(), String> {
         pool,
         config,
         provider,
+        ..
     } = bootstrap().await?;
     let state = Arc::new(RpcState {
         expected_consolidation_uid: consolidation_uid,
@@ -341,23 +362,13 @@ async fn serve_rpc() -> Result<(), String> {
     }
 }
 
-/// ADR-0016 `--distill-once` (one bounded cross-tenant pass, then exit — `claimed == 0` exits
-/// zero promptly) / `--distill-serve` (the same pass on
-/// `HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS` until killed). The route binding is still
-/// resolved by `(tenant, reasoning_domain, purpose = PRIVATE_DISTILL_TEXT)` inside the pass.
+/// ADR-0016 `--distill-once` (IN_FLIGHT seats drain the cross-tenant backlog, then exit — an empty
+/// backlog exits zero promptly) / `--distill-serve` (the same seats, resident: a seat sleeps
+/// `HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS` only after its own claim came back empty).
+/// ADR-0058: jobs are claimed one at a time through `ops.claim_derived_work_v2` (four provider
+/// slots, least-recently-served tenant first); the route binding is still resolved by
+/// `(tenant, reasoning_domain, purpose = PRIVATE_DISTILL_TEXT)` per job.
 async fn distill_mode(resident: bool) -> Result<(), String> {
-    let dispatch = DistillDispatchConfig {
-        // Per-process owner: both the ops.jobs lease and the per-tenant ops.outbox lease are
-        // fenced on it, so two resident workers never both settle one row (ADR-0016 D5).
-        lease_owner: format!("humaux-private-worker/{}", Uuid::now_v7()),
-        lease_seconds: parse::<u64>("HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS")? as f64,
-        job_batch: parse::<i64>("HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH")?,
-        batch: parse::<i64>("HUMAUX_PRIVATE_WORKER_DISTILL_BATCH")?,
-        max_attempts: parse::<i32>("HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS")?,
-    };
-    dispatch.validate().map_err(|code| {
-        format!("invalid configuration: HUMAUX_PRIVATE_WORKER_DISTILL_* ({code:?})")
-    })?;
     let poll_interval = if resident {
         Some(Duration::from_secs(parse::<u64>(
             "HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS",
@@ -369,67 +380,65 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
         pool,
         config,
         provider,
+        http_timeout,
     } = bootstrap().await?;
-    let mut shutdown = Shutdown::install()?;
-    loop {
-        let report = match distill::dispatch_pass(
-            &pool,
-            &provider,
-            clone_config(&config),
-            &dispatch,
+    let dispatch = DistillDispatchConfig {
+        // Per-process owner: the job lease and the outbox row a job takes are both fenced on it,
+        // together with the claim generation (ADR-0058 D-E).
+        lease_owner: format!("humaux-private-worker/{}", Uuid::now_v7()),
+        lease_seconds: parse::<u64>("HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS")? as f64,
+        in_flight: parse::<u32>("HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT")?,
+        hard_deadline_seconds: parse::<u64>("HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS")?
+            as f64,
+        http_timeout_seconds: http_timeout.as_secs_f64(),
+        not_ready_park_seconds: parse::<u64>("HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS")?
+            as f64,
+        max_attempts: parse::<i32>("HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS")?,
+        budget: jobs::DistillCallBudget {
+            window_seconds: parse::<u64>("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS")?
+                as f64,
+            max_calls: parse::<i32>("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS")?,
+        },
+    };
+    dispatch.validate().map_err(|code| {
+        format!(
+            "invalid configuration: HUMAUX_PRIVATE_WORKER_DISTILL_* ({code:?}; HARD_DEADLINE_SECS \
+             must be >= 2 x (HTTP_TIMEOUT_SECS + LEASE_SECS); BUDGET_WINDOW_SECS and \
+             BUDGET_MAX_CALLS must be >= 1)"
         )
-        .await
-        {
-            Ok(report) => report,
-            // Resident mode: one failed pass (transient DB/provider blip) is logged and retried
-            // on the next poll; `--distill-once` still surfaces it as the exit status.
-            Err(error) if poll_interval.is_some() => {
-                eprintln!("humaux-private-worker: distill dispatch pass failed: {error}");
-                // Same interruptible wait as the success path below — a failing pass must not
-                // make the process deaf to SIGTERM for a whole poll interval.
-                tokio::select! {
-                    () = tokio::time::sleep(poll_interval.unwrap_or_default()) => {}
-                    () = shutdown.recv() => {
-                        eprintln!("humaux-private-worker: signal received after a failed pass, exiting");
-                        return Ok(());
-                    }
-                }
-                continue;
-            }
-            Err(error) => return Err(format!("distill dispatch pass failed: {error}")),
-        };
-        println!(
-            "humaux-private-worker: distill dispatch claimed={} completed={} not_ready={} deferred={} dead={} lost_lease={} evidence_claimed={} done={} failed={} memories={} rejected={} empty_retries={} malformed_retries={}",
-            report.claimed,
-            report.completed,
-            report.not_ready,
-            report.deferred,
-            report.dead,
-            report.lost_lease,
-            report.work.claimed,
-            report.work.done,
-            report.work.failed,
-            report.work.memories,
-            report.work.rejected,
-            // ADR-0048 D-C: the retry is only "observable in the pass report" if the running
-            // worker prints it. Without this field an empty-answer retry is silent in
-            // production — the exact 2026-09-19 / 09-20 shape this card exists to end.
-            report.work.empty_retries,
-            report.work.malformed_retries
-        );
-        let Some(interval) = poll_interval else {
-            return Ok(());
-        };
-        // Card 15 / ADR-0037: observed only BETWEEN passes — a pass settles every job and every
-        // outbox row it claimed before returning (ADR-0016 D5 leases), so exiting here cannot
-        // leave one PROCESSING with a live lease. Shutdown latency is therefore bounded by one
-        // pass; the supervisor's grace period must exceed it (docs/ops/supervision.md).
-        tokio::select! {
-            () = tokio::time::sleep(interval) => {}
-            () = shutdown.recv() => {
-                eprintln!("humaux-private-worker: signal received between passes, exiting");
-                return Ok(());
-            }
+    })?;
+    let mut shutdown = Shutdown::install()?;
+    let Some(poll) = poll_interval else {
+        let report = distill::dispatch_pass(&pool, &provider, clone_config(&config), &dispatch)
+            .await
+            .map_err(|error| format!("distill dispatch failed: {error}"))?;
+        println!("{}", report.summary_line());
+        return Ok(());
+    };
+    // Card 15 / ADR-0037: a signal stops every seat after the job it holds (each job settles or,
+    // for a call whose outcome is unknown, is reconciled by its hard deadline), so exiting cannot
+    // leave a CLAIMED job with a live lease. Shutdown latency is bounded by one job (at most the
+    // HTTP timeout plus the post-call legs); the supervisor's grace period must exceed it
+    // (docs/ops/supervision.md).
+    let stop = AtomicBool::new(false);
+    let serve = distill::dispatch_serve(
+        &pool,
+        &provider,
+        clone_config(&config),
+        &dispatch,
+        poll,
+        &stop,
+    );
+    tokio::pin!(serve);
+    let report = tokio::select! {
+        report = &mut serve => report,
+        () = shutdown.recv() => {
+            eprintln!("humaux-private-worker: signal received, seats finish their current job");
+            stop.store(true, Ordering::SeqCst);
+            serve.await
         }
     }
+    .map_err(|error| format!("distill dispatch failed: {error}"))?;
+    println!("{}", report.summary_line());
+    Ok(())
 }

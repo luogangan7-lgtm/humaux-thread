@@ -5055,10 +5055,9 @@ fn w2_continuity_contract_from(
             failures.push(format!("Gateway continuity route missing `{needle}`"));
         }
     }
-    for needle in ["WorkspaceAdmission::PreserveContinuityFilter => None"] {
-        if !guard.contains(needle) {
-            failures.push(format!("Gateway continuity guard missing `{needle}`"));
-        }
+    let needle = "WorkspaceAdmission::PreserveContinuityFilter => None";
+    if !guard.contains(needle) {
+        failures.push(format!("Gateway continuity guard missing `{needle}`"));
     }
     if guard
         .matches("operation.operation_key() != \"continuity.get\"")

@@ -1,7 +1,7 @@
 //! `application::affect` — pure read-side policy of the §8.5.1 affect axis (ADR-0030 D-D): evaluating an explicit
 //!   [`AffectFilter`] over observed annotations and the bounded mood-congruent late rerank.
 //! Depends-on: crates=[humaux-domain, uuid]; services=[]; env=[]; modules=[domain::affect]
-//! Called-by: [adapters::affect_repo, adapters::read_materialize, gateway::recall]
+//! Called-by: [adapters::affect_repo, adapters::read_materialize, gateway::recall, tests]
 //! Invariants: []
 //! Spec: §8.5.1; ADR-0030
 //!

@@ -74,7 +74,7 @@ that path, precisely so a `0` can never be manufactured downstream.
 | `humaux-retrieval-worker --serve-rpc` | always restart | ≥ one embedding call |
 | `humaux-retrieval-worker --serve` | always restart | **≥ one projection pass** = `HUMAUX_RETRIEVAL_WORKER_BATCH` × worst-case ticket time (embed timeout + 3 × the 10 s Qdrant timeout + PG) |
 | `humaux-private-worker --serve-rpc` | always restart | ≥ one inference call |
-| `humaux-private-worker --distill-serve` | always restart | **≥ one distill pass** |
+| `humaux-private-worker --distill-serve` | always restart | **≥ one distill job** = `HTTP_TIMEOUT_SECS` + one `DISTILL_LEASE_SECS` (ADR-0058) |
 | `humaux-consolidation-worker --serve` | always restart | **≥ one dispatch pass** |
 | `humaux-public-worker --run-once` | on-failure only; it is a scheduled one-shot, exit 0 is success | ≥ one outbox pass |
 
@@ -87,6 +87,16 @@ The cost is that shutdown latency is bounded by one pass, not by the signal —
 SIGKILL is exactly the case the leases exist to survive** (the job stays `PROCESSING` until its
 lease expires, then another worker reclaims it). That is safe but slow; sizing the grace period
 correctly is what makes it fast.
+
+`--distill-serve` (ADR-0058) has no pass: IN_FLIGHT seats each claim one job (one Evidence),
+work it and claim again. On the signal every seat finishes the job it holds and claims no more,
+so the grace period is one job — the HTTP window plus the post-call legs — not a batch. A SIGKILL
+mid-call is survived differently from a lease: a job whose request was admitted
+(`DISPATCH_INTENT`) is NOT re-sent when its lease expires; it turns `EXECUTION_UNCERTAIN` and
+keeps its provider slot until `HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS` (≥ 2 × (HTTP +
+lease)), then is re-queued with backoff, classed and counted. Four SIGKILLs mid-call therefore
+hold all four slots of the deployment for at most one hard deadline. A job killed before its
+request was admitted (`CLAIMED`) is re-queued one lease after the kill.
 
 The projection runner (`--serve`, card 27 / ADR-0052) follows the same rule for its
 `projection.stream_log` ticket leases: a pass settles, retries (backoff) or releases every ticket

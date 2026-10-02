@@ -1,0 +1,31 @@
+# §46.1 migration manifest. Card 32 / ADR-0058 D-M (main-line ruling 2026-10-02 10:35): the §11.2
+# capability closed set gains TOOL_CALLS and REASONING_SPLIT on the three capability CHECKs (0048,
+# 0128 x2). Same constraint names, no row or grant change. §46 forward-fix (EXPAND_CONTRACT, first
+# free after 0194).
+
+migration_id = "0195_reasoning_capabilities_tool_calls"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select (select count(*) from pg_constraint
+         where conname in ('user_reasoning_profiles_capabilities_known',
+                           'processor_models_capabilities_check',
+                           'reasoning_profiles_capabilities_check')
+           and pg_get_constraintdef(oid) like '%STRUCTURED_OUTPUT%'
+           and pg_get_constraintdef(oid) not like '%TOOL_CALLS%') = 3
+ as precheck_ok
+"""
+
+postcheck = """
+select (select count(*) from pg_constraint
+         where conname in ('user_reasoning_profiles_capabilities_known',
+                           'processor_models_capabilities_check',
+                           'reasoning_profiles_capabilities_check')
+           and convalidated
+           and pg_get_constraintdef(oid) like '%''TOOL_CALLS''%'
+           and pg_get_constraintdef(oid) like '%''REASONING_SPLIT''%') = 3
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Reverting re-adds the three CHECKs with the four 0048/0128 values; safe only while no profile row declares TOOL_CALLS or REASONING_SPLIT (the ADD would fail its scan otherwise)."
+backup_restore_requirement = "none: three CHECK replacements with a verification scan each; no row data is changed."

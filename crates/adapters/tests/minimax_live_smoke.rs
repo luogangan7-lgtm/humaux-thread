@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use humaux_adapters::byok::{
-    CredentialDecryptor, CredentialRef, OpenAiCompatibleProvider, PlaintextApiKey,
+    CredentialDecryptor, CredentialRef, OpenAiCompatibleProvider, OutputChannel, PlaintextApiKey,
     PrivateInferenceContext, ReasoningCapability, ReasoningDomainId, ReasoningProviderDescriptor,
     ReasoningProviderError, StructuredReasoningRequest, StructuredReasoningResponse,
     UserReasoningProvider, ssrf, structured_request_body,
@@ -361,6 +361,7 @@ fn minimax_live_smoke() {
             // M3 的 reasoning 计入 completion 预算（实测：8 个 token 全被思考吃掉、
             // answer 为空而 HTTP 200）——给足余量。
             max_output_tokens: 2048,
+            output: OutputChannel::Content,
         };
 
         // 铸 permit：与 provider 内部将要发送的字节**同源**（同一个 pub 函数算出来），
@@ -466,6 +467,7 @@ fn g5_a_failed_call_still_finalizes_its_disclosure_row() {
             user_prompt: "u".to_string(),
             json_schema: "{}".to_string(),
             max_output_tokens: 8,
+            output: OutputChannel::Content,
         };
         let body = structured_request_body(&desc, &request);
         let payload = AuthorizedEgressPayload::new(body);

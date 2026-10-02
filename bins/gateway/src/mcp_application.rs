@@ -3,7 +3,7 @@
 //!   services=[PostgreSQL(role_gateway) r=[control.rate_buckets, private.memory_records]
 //!   w=[control.w2_test_request_intervals] x=[private.publish_continuity_facet, private.register_continuity_project],
 //!   HTTP(gateway)]; env=[HUMAUX_CONTINUITY_DIRECT_PREAUTH_SAME_KEY, HUMAUX_CONTINUITY_W2_BARRIER_RUN_ID,
-//!   HUMAUX_CONTINUITY_W2_BARRIER_SIDE]; modules=[adapters::affect_repo, adapters::context_repo,
+//!   HUMAUX_CONTINUITY_W2_BARRIER_SIDE]; modules=[adapters::affect_repo, adapters::byok, adapters::context_repo,
 //!   adapters::distill_repo, adapters::memory_governance_repo, adapters::postgres, adapters::subject_repo,
 //!   domain::affect, domain::authority, domain::confirm, domain::context, domain::continuity, domain::dataclass,
 //!   domain::error, domain::evidence, domain::identity, domain::ids, domain::subject, gateway::context,
@@ -23,6 +23,7 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use humaux_adapters::{
     affect_repo,
+    byok::json_has_nul,
     context_repo::MemoryEnumerationParams,
     distill_repo::{ConfirmOutcome, RejectOutcome},
     memory_governance_repo::{ArchiveResult, RestoreResult},
@@ -219,6 +220,11 @@ impl GatewayMcpApplication {
     ) -> Result<(OperationDescriptor, String, Value), ErrorCode> {
         let decoded = Value::Object(arguments.decoded().clone());
         let descriptor = self.catalog.validate(tool, &decoded)?;
+        // ADR-0058 R8 (b): PostgreSQL cannot store U+0000; every operation passes here before any
+        // transaction opens, so no handler sees it (it surfaced as INTERNAL from the write before).
+        if json_has_nul(&decoded) {
+            return Err(ErrorCode::InvalidInput);
+        }
         let raw = arguments.raw_json().ok_or(ErrorCode::InvalidInput)?;
         let raw_value: Value = serde_json::from_str(raw).map_err(|_| ErrorCode::InvalidInput)?;
         if raw_value != decoded {

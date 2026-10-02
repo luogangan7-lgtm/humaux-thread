@@ -1,21 +1,22 @@
-//! `adapters::provisioning` — the single home of production onboarding writes (ADR-0053).
+//! `adapters::provisioning` — the single home of production onboarding writes (ADR-0053) and of the operator
+//!   re-drive of DEAD distill jobs (ADR-0058 R4).
 //! Depends-on: crates=[hex, humaux-application, humaux-domain, humaux-infra-cell, humaux-projection, serde, serde_json,
 //!   sha2, sqlx, uuid]; services=[PostgreSQL(role_maintenance) r=[control.api_keys, control.memberships,
 //!   control.retrieval_provider_admission_limits, control.tenants, control.workspaces, projection.family_activations,
 //!   projection.stream_checkpoints, projection.tenant_placements] x=[control.audit_event_insert,
 //!   control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant,
-//!   control.onboard_workspace, control.revoke_api_key, control.set_workspace_membership,
+//!   control.onboard_workspace, control.revoke_api_key, control.set_workspace_membership, ops.requeue_dead_distill,
 //!   projection.activate_empty_family, projection.ensure_tenant_placement], Qdrant(*)]; env=[];
 //!   modules=[adapters::membership_repo, adapters::postgres, adapters::qdrant, adapters::retrieve, application::auth, domain::audit,
 //!   domain::identity, domain::ids, domain::ticket_family, infra-cell::permit, infra-cell::resource,
 //!   infra-cell::transport, projection::serving]
 //! Called-by: [maintenance::main, tests, xtask::e2e_seed]
-//! Invariants: [every write goes through a 0186 owner definer as role_maintenance, no table INSERT here; one transaction
+//! Invariants: [every write goes through a 0186 / 0197 owner definer as role_maintenance, no table INSERT here; one transaction
 //!   per tenant (onboard_tenant installs the tenant GUC for the caller's transaction); the Qdrant probe runs outside any
 //!   transaction and the activation commits only if evaluate_switch accepts the DB-returned facts and the collection
 //!   generation is unchanged; a refusal writes nothing but its DENIED audit row; Qdrant or PostgreSQL down -> a typed
 //!   ProvisioningError (exit 1), never a partial activation; no receipt carries a wire key or the pepper]
-//! Spec: Baseline §4.2; §6.2.2; §16.2; §16.3; §17.3; §77; ADR-0017; ADR-0053; ADR-0057
+//! Spec: Baseline §4.2; §6.2.2; §16.2; §16.3; §17.3; §77; ADR-0017; ADR-0053; ADR-0057; ADR-0058
 //!
 //! Every onboarding write runs as `role_maintenance` ([`MaintenanceDbPool`]) through the eight
 //! owner SECURITY DEFINER doors of migration 0186 — this module holds no table INSERT of its own.
@@ -344,13 +345,38 @@ async fn set_tenant(txn: &mut Txn<'_>, tenant_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-/// One §77 row through `control.audit_event_insert` (the only audit writer, 0161) — same shape
-/// as `membership_repo`'s rows. The tenant GUC must already be installed.
+/// One onboarding §77 row (risk tag [`AUDIT_RISK_TAG`]); see [`audit_tagged`].
 #[allow(clippy::too_many_arguments)] // one audit row = these facts, in one place
 async fn audit(
     txn: &mut Txn<'_>,
     tenant_id: Uuid,
     action: &str,
+    resource_type: &str,
+    resource_id: &str,
+    result: &str,
+    admin: &AdminAction<'_>,
+    metadata: Value,
+) -> Result<Uuid> {
+    audit_tagged(
+        txn,
+        tenant_id,
+        (action, AUDIT_RISK_TAG),
+        resource_type,
+        resource_id,
+        result,
+        admin,
+        metadata,
+    )
+    .await
+}
+
+/// One §77 row through `control.audit_event_insert` (the only audit writer, 0161) — same shape
+/// as `membership_repo`'s rows; `(action, risk_tag)`. The tenant GUC must already be installed.
+#[allow(clippy::too_many_arguments)] // one audit row = these facts, in one place
+async fn audit_tagged(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    (action, risk_tag): (&str, &str),
     resource_type: &str,
     resource_id: &str,
     result: &str,
@@ -381,7 +407,7 @@ async fn audit(
     .bind(admin.ticket)
     .bind(admin.trace_id)
     .bind(AUDIT_ABSENT)
-    .bind(vec![AUDIT_RISK_TAG.to_owned()])
+    .bind(vec![risk_tag.to_owned()])
     .bind(metadata)
     .fetch_one(&mut **txn)
     .await?;
@@ -393,19 +419,19 @@ async fn audit(
 async fn audit_denied(
     pool: &MaintenanceDbPool,
     tenant_id: Uuid,
-    action: &str,
-    resource_id: &str,
+    (action, risk_tag): (&str, &str),
+    (resource_type, resource_id): (&str, &str),
     reason: &str,
     admin: &AdminAction<'_>,
 ) -> Result<Uuid> {
     // dep: PostgreSQL(role_maintenance) — the DENIED audit row of a rolled-back refusal
     let mut txn = pool.pool().begin().await?;
     set_tenant(&mut txn, tenant_id).await?;
-    let id = audit(
+    let id = audit_tagged(
         &mut txn,
         tenant_id,
-        action,
-        "workspace",
+        (action, risk_tag),
+        resource_type,
         resource_id,
         AUDIT_RESULT_DENIED,
         admin,
@@ -963,6 +989,175 @@ pub async fn onboard_user(
     })
 }
 
+// ============================================================================
+// Operator re-drive of DEAD distill jobs (ADR-0058 R4, migration 0197)
+// ============================================================================
+
+/// §77 risk tag of the distill re-drive rows (not an onboarding step).
+const REDRIVE_RISK_TAG: &str = "distill_redrive";
+const REDRIVE_ACTION: &str = "DISTILL_REQUEUE_DEAD";
+const REDRIVE_RESOURCE: &str = "distill_job";
+
+/// Which DEAD `DERIVED_DISTILL` jobs of one tenant `jobs requeue-dead` re-arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequeueTarget<'a> {
+    /// Exactly this job; anything but a DEAD job of the tenant is refused.
+    Job(Uuid),
+    /// Every DEAD job of the tenant whose `last_error_class` equals this one exactly (the class a
+    /// worker stored; ADR-0058 R4: chosen after the cause was fixed).
+    ErrorClass(&'a str),
+}
+
+/// One job `jobs requeue-dead` re-armed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RequeuedJob {
+    pub job_id: Uuid,
+    pub evidence_id: Uuid,
+    /// Kept on the re-armed row (plan v2 OPS-3).
+    pub last_error_class: Option<String>,
+    /// The counted provider requests the job had spent when it died (reset to 0).
+    pub attempt_spent: i32,
+}
+
+/// Why class-mode `jobs requeue-dead` left a matching DEAD job DEAD (ADR-0058 ruling 2026-10-02
+/// 20:30: the skip is reported, never silent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequeueSkipReason {
+    /// The Evidence has no outbox row: a re-armed job could only die again.
+    EvidenceGone,
+    /// The Evidence's outbox row is already DONE.
+    OutboxSettled,
+}
+
+impl RequeueSkipReason {
+    /// The definer's `skipped` value (0200).
+    fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "evidence_gone" => Some(Self::EvidenceGone),
+            "outbox_settled" => Some(Self::OutboxSettled),
+            _ => None,
+        }
+    }
+}
+
+/// One matching DEAD job class-mode `jobs requeue-dead` left DEAD.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedJob {
+    pub job_id: Uuid,
+    /// `None` when the job's payload names no Evidence.
+    pub evidence_id: Option<Uuid>,
+    pub last_error_class: Option<String>,
+    pub attempt_spent: i32,
+    pub reason: RequeueSkipReason,
+}
+
+/// `jobs requeue-dead`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RequeueReceipt {
+    /// `requeued`, or `nothing_requeued` when every matching DEAD job was skipped.
+    pub outcome: &'static str,
+    pub tenant_id: Uuid,
+    pub requeued: Vec<RequeuedJob>,
+    /// Class mode only (job mode refuses instead): the matching DEAD jobs left DEAD, with why.
+    pub skipped: Vec<SkippedJob>,
+    pub audit_event_id: Uuid,
+}
+
+/// `jobs requeue-dead` (ADR-0058 R4): one transaction re-arms the selected DEAD jobs and their
+/// FAILED outbox rows through `ops.requeue_dead_distill` (PENDING, attempt 0, class kept,
+/// scheduler row admitted) and appends the §77 row; in class mode the receipt and that row also
+/// name every matching DEAD job it skipped, with the reason (0200). A refusal (`job_not_found`,
+/// `job_not_dead`, `evidence_gone` / `outbox_settled` in job mode, `no_dead_job`) writes nothing
+/// but its DENIED row.
+pub async fn requeue_dead_distill(
+    pool: &MaintenanceDbPool,
+    tenant_id: Uuid,
+    target: RequeueTarget<'_>,
+    admin: &AdminAction<'_>,
+) -> Result<RequeueReceipt> {
+    require_admin(admin)?;
+    let (job_id, error_class, resource_id) = match target {
+        RequeueTarget::Job(job_id) => (Some(job_id), None, job_id.to_string()),
+        RequeueTarget::ErrorClass(class) => (None, Some(class), format!("error_class:{class}")),
+    };
+    // dep: PostgreSQL(role_maintenance) — requeue-dead transaction (definer + audit row)
+    let mut txn = pool.pool().begin().await?;
+    set_tenant(&mut txn, tenant_id).await?;
+    let rows = sqlx::query(
+        "SELECT job_id, evidence_id, last_error_class, attempt_spent, skipped \
+         FROM ops.requeue_dead_distill($1, $2, $3)",
+    )
+    .bind(tenant_id)
+    .bind(job_id)
+    .bind(error_class)
+    .fetch_all(&mut *txn)
+    .await;
+    let rows = match rows.map_err(ProvisioningError::from) {
+        Ok(rows) => rows,
+        Err(ProvisioningError::Refused(reason)) => {
+            txn.rollback().await?;
+            audit_denied(
+                pool,
+                tenant_id,
+                (REDRIVE_ACTION, REDRIVE_RISK_TAG),
+                (REDRIVE_RESOURCE, &resource_id),
+                &reason,
+                admin,
+            )
+            .await?;
+            return Err(ProvisioningError::Refused(reason));
+        }
+        Err(error) => return Err(error),
+    };
+    let (mut requeued, mut skipped) = (Vec::new(), Vec::new());
+    for row in &rows {
+        let job_id = row.try_get("job_id")?;
+        let last_error_class = row.try_get("last_error_class")?;
+        let attempt_spent = row.try_get("attempt_spent")?;
+        match row.try_get::<Option<String>, _>("skipped")? {
+            None => requeued.push(RequeuedJob {
+                job_id,
+                evidence_id: row.try_get("evidence_id")?,
+                last_error_class,
+                attempt_spent,
+            }),
+            Some(reason) => skipped.push(SkippedJob {
+                job_id,
+                evidence_id: row.try_get("evidence_id")?,
+                last_error_class,
+                attempt_spent,
+                reason: RequeueSkipReason::from_db(&reason).ok_or_else(|| {
+                    sqlx::Error::Decode(format!("unknown requeue skip reason {reason}").into())
+                })?,
+            }),
+        }
+    }
+    let audit_event_id = audit_tagged(
+        &mut txn,
+        tenant_id,
+        (REDRIVE_ACTION, REDRIVE_RISK_TAG),
+        REDRIVE_RESOURCE,
+        &resource_id,
+        AUDIT_RESULT_SUCCESS,
+        admin,
+        json!({ "requeued": requeued, "skipped": skipped }),
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(RequeueReceipt {
+        outcome: if requeued.is_empty() {
+            "nothing_requeued"
+        } else {
+            "requeued"
+        },
+        tenant_id,
+        requeued,
+        skipped,
+        audit_event_id,
+    })
+}
+
 /// `status --tenant`: read-only facts of one tenant (maintenance SELECTs under its tenant GUC).
 #[allow(clippy::too_many_lines)] // one read-only snapshot, one row mapper per table
 pub async fn status(pool: &MaintenanceDbPool, tenant_id: Uuid) -> Result<Value> {
@@ -1450,8 +1645,8 @@ async fn refuse(
         audit_denied(
             pool,
             tenant_id,
-            "FAMILY_ACTIVATE",
-            &workspace_id.to_string(),
+            ("FAMILY_ACTIVATE", AUDIT_RISK_TAG),
+            ("workspace", &workspace_id.to_string()),
             &reason,
             admin,
         )

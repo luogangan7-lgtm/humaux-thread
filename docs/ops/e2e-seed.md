@@ -86,19 +86,37 @@ starts with `humaux_thread_` — this never touches a production database.
 ## Distill hop (remember → private-worker → memory_records, ADR-0016)
 
 With the seeded bearer and the `HUMAUX_PRIVATE_WORKER_*` + `HUMAUX_PRIVATE_WORKER_DISTILL_*`
-exports in the shell (plus `HUMAUX_PRIVATE_WORKER_DISTILL_BATCH`,
-`HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS` and, for `--distill-serve`,
-`HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS` — deployment values, no defaults):
+exports in the shell (the seed prints `_DISTILL_IN_FLIGHT` and `_DISTILL_MAX_ATTEMPTS`), the
+private worker's distill mode also requires these deployment values — none has a code default
+(§78.1), a missing one refuses to boot (ADR-0058 D-K / D-M / D-T; rehearsal values in brackets):
+
+- `HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS` [30] — one claim's lease, renewed every lease/3;
+- `HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS` [300] — end of one claim; must be
+  `>= 2 x (HTTP_TIMEOUT_SECS + LEASE_SECS)`;
+- `HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS` [600] — not-ready age before a job parks
+  `WAITING_KEY`, and its re-check interval;
+- `HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT` [4] — seats, `1..=4` (the four `ops.provider_slots`);
+- `HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS` [5] — counted provider requests before DEAD;
+- `HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS` [60] / `_BUDGET_MAX_CALLS` [120] — the §72.3
+  per-tenant sliding window of admitted requests;
+- `HUMAUX_PRIVATE_WORKER_CAPABILITIES` [`STRUCTURED_OUTPUT,TOOL_CALLS,REASONING_SPLIT`] — what the
+  configured provider supports; declaring `TOOL_CALLS` selects the distill tool channel. The rehearsal
+  profile keeps it by measurement (ADR-0058 R10: live A/B `distill_channel_ab_live`, n=100 per channel,
+  tool dead=0 / malformed=1 vs content dead=1 / malformed=6); another provider is measured the same way;
+- `HUMAUX_PRIVATE_WORKER_KEY_ENV` — the NAME of the variable that holds the provider key (the key
+  itself is never a `HUMAUX_*` value);
+- `HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS` — `--distill-serve` only.
 
 ```sh
 target/debug/humaux-private-worker --distill-once    # one pass over pending EVIDENCE_ACCEPTED rows
 target/debug/humaux-private-worker --distill-serve   # resident loop on the poll interval
 ```
 
-Write Evidence through the gateway's `remember.put` first. One pass claims the tenant's
-`ops.outbox` `EVIDENCE_ACCEPTED` rows (PENDING → PROCESSING → DONE, FAILED only for an
-unusable Evidence or a fail-closed parse; a not-yet-admitted route or a provider 429/5xx hands
-the row back to PENDING for the next pass), leaves one
+Write Evidence through the gateway's `remember.put` first. One pass claims `DERIVED_DISTILL`
+jobs (one per Evidence, tenant-fair, at most four in flight) and each job takes its own
+`ops.outbox` `EVIDENCE_ACCEPTED` row (PENDING → PROCESSING → DONE; FAILED only when the job dies
+— see `docs/ops/runbook.md` §7.1, which also covers `humaux-maintenance jobs requeue-dead`; a
+not-yet-admitted route or a provider 429/5xx hands the row back to PENDING), leaves one
 `private.processing_runs` row per Evidence (fingerprint recorded before the provider call),
 and 0..N `private.memory_records` + PRIMARY `memory_evidence` rows whose visibility is the
 Evidence's own. The remember-time `projection.stream_log` ticket then resolves in the

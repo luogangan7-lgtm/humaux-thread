@@ -241,6 +241,7 @@ impl UserReasoningProvider for RecordingProvider {
         Ok(StructuredReasoningResponse {
             json: r#"{"text":"generalized"}"#.into(),
             usage: TokenUsage::default(),
+            channel_fallback: false,
         })
     }
 

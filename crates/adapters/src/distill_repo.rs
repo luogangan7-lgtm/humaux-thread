@@ -1,20 +1,22 @@
-//! `adapters::distill_repo` — SQL half of the Distill hop (ADR-0016), through [`PrivateWorkerDbPool`] only: claim
-//!   `EVIDENCE_ACCEPTED` outbox rows, load one Evidence, record the §16.1.1 processing run, insert the authorized
-//!   memories, settle the outbox row.
-//! Depends-on: crates=[hex, humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time]; services=[PostgreSQL(any) r=[control.memberships, private.events, private.evidence_objects] w=[ops.outbox, private.distill_candidates, private.memory_evidence, private.memory_records, private.processing_runs] x=[control.current_reasoning_route_binding]]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::confirm_token_repo, adapters::consolidate_repo, adapters::postgres, adapters::quota_repo, adapters::remember, adapters::request_guard_repo, adapters::retrieve, adapters::subject_repo, application::confirm, application::consolidate, domain::audit, domain::authority, domain::confirm, domain::error, domain::evidence, domain::identity, domain::ids, domain::memory, domain::subject, projection::stream]
-//! Called-by: [adapters::context_repo, adapters::memory_governance_repo, gateway::mcp_application, gateway::memory, private-worker::distill]
-//! Invariants: [memories, run completion and the outbox DONE flip commit in ONE transaction fenced on lease_owner, so
-//!   a reclaimed worker's inserts roll back; every read runs under role_private_worker grants + RLS with the acting
+//! `adapters::distill_repo` — SQL half of the Distill hop (ADR-0016), through [`PrivateWorkerDbPool`] only: take the
+//!   one `EVIDENCE_ACCEPTED` outbox row of a claimed `DERIVED_DISTILL` job (ADR-0058), load that Evidence, record the
+//!   §16.1.1 processing run, insert the authorized memories, settle the job and its outbox row together.
+//! Depends-on: crates=[hex, humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time]; services=[PostgreSQL(any) r=[control.memberships, ops.jobs, private.events, private.evidence_affects, private.evidence_objects] w=[ops.outbox, private.distill_candidates, private.memory_evidence, private.memory_records, private.processing_runs] x=[control.current_reasoning_route_binding]]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::confirm_token_repo, adapters::consolidate_repo, adapters::jobs, adapters::postgres, adapters::quota_repo, adapters::remember, adapters::request_guard_repo, adapters::retrieve, adapters::subject_repo, application::confirm, application::consolidate, domain::audit, domain::authority, domain::confirm, domain::error, domain::evidence, domain::identity, domain::ids, domain::memory, domain::subject, projection::stream]
+//! Called-by: [adapters::context_repo, adapters::memory_governance_repo, gateway::mcp_application, gateway::memory, private-worker::distill, tests]
+//! Invariants: [memories, run completion, the job settle and the outbox flip commit in ONE transaction whose first
+//!   statement is the job's generation-fenced finish (ADR-0058 D-E), so a superseded worker's inserts roll back; a job
+//!   only ever takes the outbox row of its own Evidence; every read runs under role_private_worker grants + RLS with the acting
 //!   user installed first; memory.confirm / memory.reject lock a candidate only inside the narrowed write scope
 //!   (its visibility against the scope's one workspace and user, ADR-0054)]
-//! Spec: Baseline §15.5; §14; ADR-0016; §6.1.1; ADR-0054
+//! Spec: Baseline §15.5; §14; ADR-0016; §6.1.1; ADR-0054; ADR-0058
 //!
 //! §15.5: one Evidence → 0/1/N `private.memory_records`; §14: the `ops.outbox` row remember wrote
-//! is the work item (PENDING → PROCESSING with a lease → DONE | FAILED, or back to PENDING when
-//! the attempt was retryable), expired PROCESSING leases are reclaimable. Idempotency (ADR-0016
-//! D5): memory rows, the run's completion and the outbox DONE flip commit in ONE transaction
-//! fenced on the claimer's `lease_owner`, so a late worker whose lease was reclaimed rolls its
-//! inserts back rather than duplicating them.
+//! is the work item (PENDING → PROCESSING → DONE | FAILED, or back to PENDING when the attempt was
+//! retryable). ADR-0058 D-C: the row is reached only through its `DERIVED_DISTILL` job's current
+//! claim ([`take_outbox_row`]); nothing reclaims outbox rows by lease expiry. Idempotency
+//! (ADR-0016 D5, ADR-0058 D-E): memory rows, the run's completion, the job settle and the outbox
+//! flip commit in ONE transaction opened by the generation-fenced [`finish_job_in_txn`], so a late
+//! worker whose claim was superseded rolls its inserts back rather than duplicating them.
 //!
 //! Every SELECT/INSERT here runs under `role_private_worker`'s grants and RLS: `private.events`
 //! keeps the §6.1.1 visibility disjunction inline (no headless bypass), so [`load_evidence`]
@@ -68,7 +70,8 @@ pub async fn begin_read_context(
 }
 
 /// Opens the write-leg transaction with the tenant + acting user installed
-/// ([`insert_memory`], [`finish_processing_run`], [`complete_outbox`]).
+/// ([`finish_job_in_txn`] first, then [`insert_memory`], [`finish_processing_run`],
+/// [`settle_outbox_in_txn`]).
 pub async fn begin_write_context(
     pool: &PrivateWorkerDbPool,
     tenant_id: Uuid,
@@ -173,53 +176,92 @@ async fn set_rls_context(
     Ok(())
 }
 
-/// PENDING (or lease-expired PROCESSING) `EVIDENCE_ACCEPTED` rows of one tenant, oldest
-/// `commit_seq` first, `FOR UPDATE SKIP LOCKED` (same recipe as `jobs::claim_in_txn`), flipped
-/// to PROCESSING under `lease_owner` for `lease_seconds`.
-pub async fn claim_pending_evidence(
+/// ADR-0058 D-C: what [`take_outbox_row`] found for a claimed job's one Evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakenOutbox {
+    /// The row is this claim's to work (now `PROCESSING`, leased until the claim's `hard_deadline`).
+    Taken(ClaimedEvidence),
+    /// No open row: the Evidence was already settled (DONE/FAILED) — the job has nothing to do.
+    AlreadySettled,
+    /// The claim's generation was superseded (or the job settled): nothing was touched.
+    LeaseLost,
+}
+
+/// ADR-0058 D-C: takes exactly the `EVIDENCE_ACCEPTED` row of the job's own Evidence, in a
+/// transaction that first locks the job row under its generation fence — the only door to an
+/// outbox row is the job's current claim, so no batch and no second process can take it mid-run
+/// (C7). The outbox lease is the claim's `hard_deadline`: nothing reclaims outbox rows by lease
+/// expiry any more, the job's generation does.
+pub async fn take_outbox_row(
     pool: &PrivateWorkerDbPool,
-    tenant_id: Uuid,
-    lease_owner: &str,
-    batch: i64,
-    lease_seconds: f64,
-) -> Result<Vec<ClaimedEvidence>, sqlx::Error> {
+    lease: &crate::jobs::DistillLease<'_>,
+    evidence_id: Uuid,
+    hold_until: OffsetDateTime,
+) -> Result<TakenOutbox, sqlx::Error> {
     // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
-    set_rls_context(&mut txn, tenant_id, Uuid::nil()).await?;
-    let rows = sqlx::query(
-        "WITH picked AS ( \
-           SELECT outbox_id FROM ops.outbox \
-           WHERE tenant_id = $1 AND event_type = $2 AND evidence_id IS NOT NULL \
-             AND (status = 'PENDING' \
-                  OR (status = 'PROCESSING' AND lease_expires_at < clock_timestamp())) \
-           ORDER BY commit_seq \
-           FOR UPDATE SKIP LOCKED \
-           LIMIT $3 \
-         ) \
-         UPDATE ops.outbox o \
-         SET status = 'PROCESSING', lease_owner = $4, \
-             lease_expires_at = clock_timestamp() + make_interval(secs => $5) \
-         FROM picked WHERE o.outbox_id = picked.outbox_id \
-         RETURNING o.outbox_id, o.evidence_id, o.commit_seq, o.stream_seq",
+    set_rls_context(&mut txn, lease.tenant_id, Uuid::nil()).await?;
+    let fenced = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM ops.jobs \
+         WHERE job_id = $1 AND tenant_id = $2 AND lease_owner = $3 AND claim_generation = $4 \
+           AND status = 'PROCESSING' \
+         FOR UPDATE",
     )
-    .bind(tenant_id)
+    .bind(lease.job_id)
+    .bind(lease.tenant_id)
+    .bind(lease.lease_owner)
+    .bind(lease.claim_generation)
+    .fetch_optional(&mut *txn)
+    .await?;
+    if fenced.is_none() {
+        txn.rollback().await?;
+        return Ok(TakenOutbox::LeaseLost);
+    }
+    // Served by outbox_tenant_evidence_idx (tenant_id, evidence_id).
+    let row = sqlx::query(
+        "UPDATE ops.outbox \
+         SET status = 'PROCESSING', lease_owner = $4, lease_expires_at = $5 \
+         WHERE tenant_id = $1 AND event_type = $2 AND evidence_id = $3 \
+           AND status IN ('PENDING', 'PROCESSING') \
+         RETURNING outbox_id, evidence_id, commit_seq, stream_seq",
+    )
+    .bind(lease.tenant_id)
     .bind(EVIDENCE_ACCEPTED)
-    .bind(batch)
-    .bind(lease_owner)
-    .bind(lease_seconds)
-    .fetch_all(&mut *txn)
+    .bind(evidence_id)
+    .bind(lease.lease_owner)
+    .bind(hold_until)
+    .fetch_optional(&mut *txn)
     .await?;
     txn.commit().await?;
-    rows.iter()
-        .map(|row| {
-            Ok(ClaimedEvidence {
-                outbox_id: row.try_get("outbox_id")?,
-                evidence_id: row.try_get("evidence_id")?,
-                commit_seq: row.try_get("commit_seq")?,
-                stream_seq: row.try_get("stream_seq")?,
-            })
-        })
-        .collect()
+    let Some(row) = row else {
+        return Ok(TakenOutbox::AlreadySettled);
+    };
+    Ok(TakenOutbox::Taken(ClaimedEvidence {
+        outbox_id: row.try_get("outbox_id")?,
+        evidence_id: row.try_get("evidence_id")?,
+        commit_seq: row.try_get("commit_seq")?,
+        stream_seq: row.try_get("stream_seq")?,
+    }))
+}
+
+/// ADR-0058 D-D: the reasoning domain the Evidence itself names (`None` = the Evidence is gone).
+/// Compared with the job payload's domain BEFORE any binding of that domain is used, so no
+/// Evidence is ever sent through another domain's route; `load_evidence` keeps its own domain
+/// predicate as the second layer.
+pub async fn evidence_domain(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    evidence_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let domain: Option<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT reasoning_domain_id FROM private.evidence_objects \
+         WHERE evidence_id = $1 AND tenant_id = $2",
+    )
+    .bind(evidence_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **txn)
+    .await?;
+    Ok(domain.flatten())
 }
 
 /// §16.1 `context_snapshot_seq`: the highest `commit_seq` this tenant has issued (the memory
@@ -344,6 +386,24 @@ pub async fn load_evidence(
         payload: event.try_get("payload")?,
         rls_user_id,
     }))
+}
+
+/// ADR-0058 D-P: whether `evidence_id` carries declared `private.evidence_affects` rows — the 0157
+/// PRIMARY trigger copies those onto every memory born from it as EXPLICIT, so distill offers no
+/// affect menu for it. Runs in the [`load_evidence`] transaction (its RLS context).
+pub async fn evidence_has_declared_affects(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    evidence_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM private.evidence_affects \
+                        WHERE tenant_id = $1 AND evidence_id = $2)",
+    )
+    .bind(tenant_id)
+    .bind(evidence_id)
+    .fetch_one(&mut **txn)
+    .await
 }
 
 /// §16.1.1 processing-run fingerprint columns, written at start (before the provider call).
@@ -478,83 +538,71 @@ pub async fn insert_memory(
     Ok(memory_id)
 }
 
-/// Terminal outbox state for one claimed row.
+/// How a settle leaves the job's one outbox row (ADR-0058 D-C/D-F).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutboxTerminal {
+pub enum OutboxSettle {
+    /// Memories (or "nothing memorable") committed: the ticket resolves.
     Done,
+    /// Input-bound rejection or DEAD: the ticket ends as `distill_failed` (§15.7 gap).
     Failed,
+    /// Handed back for a later claim of the same job (retry, not ready, parked).
+    Pending,
 }
 
-/// Flips the claimed row to its terminal state, fenced on the lease: `false` (0 rows) means the
-/// lease was reclaimed by another worker — the caller must roll its transaction back.
-pub async fn complete_outbox(
+/// Flips the job's taken row, fenced on `status = 'PROCESSING' AND lease_owner`: `false` means
+/// the row is no longer this owner's — the caller rolls back. Runs AFTER
+/// [`finish_job_in_txn`] in the same transaction, whose generation fence is the real one (two
+/// generations may share one `lease_owner` string).
+pub async fn settle_outbox_in_txn(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     outbox_id: Uuid,
     lease_owner: &str,
-    terminal: OutboxTerminal,
+    settle: OutboxSettle,
 ) -> Result<bool, sqlx::Error> {
-    let status = match terminal {
-        OutboxTerminal::Done => "DONE",
-        OutboxTerminal::Failed => "FAILED",
+    let (status, processed) = match settle {
+        OutboxSettle::Done => ("DONE", true),
+        OutboxSettle::Failed => ("FAILED", true),
+        OutboxSettle::Pending => ("PENDING", false),
     };
     let result = sqlx::query(
         "UPDATE ops.outbox \
-         SET status = $2, processed_at = now(), lease_owner = NULL, lease_expires_at = NULL \
+         SET status = $2, processed_at = CASE WHEN $4 THEN now() ELSE processed_at END, \
+             lease_owner = NULL, lease_expires_at = NULL \
          WHERE outbox_id = $1 AND status = 'PROCESSING' AND lease_owner = $3",
     )
     .bind(outbox_id)
     .bind(status)
     .bind(lease_owner)
+    .bind(processed)
     .execute(&mut **txn)
     .await?;
     Ok(result.rows_affected() == 1)
 }
 
-/// Hands a claimed row back (PROCESSING → PENDING, lease cleared) in its own transaction, fenced
-/// on the lease like [`complete_outbox`]: the retryable paths (route not yet bound / not
-/// admitted, provider 429/5xx, disclosure ledger hiccup) must not spend the row — FAILED is
-/// terminal for [`claim_pending_evidence`] and for the ticket (`projection_worker`
-/// `distill_failed`), so it is reserved for input-bound rejections (ADR-0016 D4/D5).
-/// `false` = the lease was already reclaimed; nothing to hand back.
-// ponytail: unbounded retry — `ops.outbox` carries no attempts counter, so a poison row is
-// re-claimed every pass (one DB round trip, no egress when admission fails). Add
-// attempts + a DEAD terminal via a forward-fix migration when one is observed in production.
-pub async fn release_outbox(
-    pool: &PrivateWorkerDbPool,
-    tenant_id: Uuid,
-    outbox_id: Uuid,
-    lease_owner: &str,
+/// ADR-0058 T3 as the FIRST statement of a settle transaction (it locks and fences the job row
+/// on its generation and frees the claim's slot). `false` = superseded: the caller rolls back
+/// every business write of the transaction.
+pub async fn finish_job_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    lease: &crate::jobs::DistillLease<'_>,
+    finish: crate::jobs::DistillFinish,
+    error_class: Option<&str>,
+    backoff_seconds: f64,
+    park_seconds: f64,
 ) -> Result<bool, sqlx::Error> {
-    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
-    let mut txn = pool.pool().begin().await?;
-    set_rls_context(&mut txn, tenant_id, Uuid::nil()).await?;
-    let result = sqlx::query(
-        "UPDATE ops.outbox \
-         SET status = 'PENDING', lease_owner = NULL, lease_expires_at = NULL \
-         WHERE outbox_id = $1 AND status = 'PROCESSING' AND lease_owner = $2",
+    crate::jobs::finish_distill_in_txn(
+        txn,
+        lease,
+        finish,
+        error_class,
+        backoff_seconds,
+        park_seconds,
     )
-    .bind(outbox_id)
-    .bind(lease_owner)
-    .execute(&mut *txn)
-    .await?;
-    txn.commit().await?;
-    Ok(result.rows_affected() == 1)
-}
-
-/// Settles a claimed row FAILED in its own transaction — only for input-bound rejections
-/// (Evidence unavailable to this hop, parser fail-closed); see [`release_outbox`] for the rest.
-pub async fn fail_outbox(
-    pool: &PrivateWorkerDbPool,
-    tenant_id: Uuid,
-    outbox_id: Uuid,
-    lease_owner: &str,
-) -> Result<bool, sqlx::Error> {
-    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
-    let mut txn = pool.pool().begin().await?;
-    set_rls_context(&mut txn, tenant_id, Uuid::nil()).await?;
-    let fenced = complete_outbox(&mut txn, outbox_id, lease_owner, OutboxTerminal::Failed).await?;
-    txn.commit().await?;
-    Ok(fenced)
+    .await
+    .map_err(|e| match e {
+        crate::jobs::JobsError::Db(e) => e,
+        other => sqlx::Error::Protocol(other.to_string()),
+    })
 }
 
 // ============================================================================

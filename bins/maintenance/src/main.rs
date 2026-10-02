@@ -1,5 +1,5 @@
 //! `maintenance::main` — `humaux-maintenance`, the operator-write CLI (§4.2): onboarding, API keys, placement,
-//!   activation.
+//!   activation, re-drive of DEAD distill jobs.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, rand, serde, serde_json, time, tokio, uuid];
 //!   services=[PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX,
 //!   HUMAUX_MAINTENANCE_EMBEDDING_DIMENSION, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MAINTENANCE_PRIVATE_MEMORY_COLLECTION,
@@ -10,12 +10,15 @@
 //! Invariants: [one-shot, one JSON receipt on stdout per run; exit 0 created/existing, 3 refused, 2 usage, 1
 //!   infrastructure (PostgreSQL/Qdrant down); the wire key is printed once on stdout only when created, never on
 //!   stderr or in a receipt; no flag or env var has a literal default]
-//! Spec: Baseline §4.2; §6.2.2; §73.5; §77; §78.1; ADR-0053
+//! Spec: Baseline §4.2; §6.2.2; §73.5; §77; §78.1; ADR-0053; ADR-0058
 //!
 //! Subcommand mode (card 28; the resident `--serve` job is card 35). Every subcommand is
 //! one-shot, idempotent (a re-run writes nothing and answers `existing`), and prints exactly ONE
 //! JSON receipt on stdout. Exit codes (ADR-0053 D-F): 0 created/existing, 3 refused (a named
-//! reason, nothing written), 2 usage, 1 infrastructure.
+//! reason, nothing written), 2 usage, 1 infrastructure. `jobs requeue-dead` (ADR-0058 R4) answers
+//! `requeued` (`nothing_requeued` when class mode skipped every match; class mode lists each skipped
+//! DEAD job with `evidence_gone` / `outbox_settled`, exit 0); its re-run is refused `job_not_dead` /
+//! `no_dead_job` (exit 3), never a second re-arm.
 //!
 //! Secrets: the pepper comes from the environment only. A newly minted API key is printed ONCE,
 //! as the single line `Authorization: Bearer <prefix>.<secret>` on stdout before the JSON, only
@@ -32,7 +35,8 @@ use std::process::ExitCode;
 use humaux_adapters::membership_repo::AdminAction;
 use humaux_adapters::postgres::MaintenanceDbPool;
 use humaux_adapters::provisioning::{
-    self, NewApiKey, ProvisioningError, QdrantFace, TenantRequest, WorkspaceActivation,
+    self, NewApiKey, ProvisioningError, QdrantFace, RequeueTarget, TenantRequest,
+    WorkspaceActivation,
 };
 use humaux_adapters::quota_repo;
 use humaux_domain::identity::MembershipRole;
@@ -46,7 +50,8 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 const USAGE: &str = "usage: humaux-maintenance <deploy-init | onboard tenant|workspace|user | \
-apikey issue|revoke | placement ensure | collection ensure | activate | status> [flags]";
+apikey issue|revoke | placement ensure | collection ensure | activate | status | \
+jobs requeue-dead --tenant ID (--job ID | --error-class CLASS)> [flags]";
 
 /// A failure before or outside the provisioning library.
 enum Failure {
@@ -492,6 +497,28 @@ async fn activate(args: &Args) -> Result<Output> {
     Ok(Output::activation(receipt, &activation))
 }
 
+/// ADR-0058 R4: re-arms DEAD distill jobs (one `--job`, or every DEAD job of the tenant with one
+/// exact `--error-class`) and prints the re-armed jobs in the receipt, and in class mode the
+/// matching DEAD jobs it skipped with the reason (ADR-0058 ruling 2026-10-02 20:30, 0200).
+async fn jobs_requeue_dead(args: &Args) -> Result<Output> {
+    let admin = Admin::from(args)?;
+    let tenant_id = uuid_flag(args, "--tenant")?;
+    let class = args.get("--error-class");
+    let target = match (args.get("--job"), class.as_deref()) {
+        (Some(_), None) => RequeueTarget::Job(uuid_flag(args, "--job")?),
+        (None, Some(class)) if !class.trim().is_empty() => RequeueTarget::ErrorClass(class),
+        _ => {
+            return Err(Failure::Usage(
+                "jobs requeue-dead takes exactly one of --job or --error-class".to_owned(),
+            ));
+        }
+    };
+    let pool = pool().await?;
+    let receipt =
+        provisioning::requeue_dead_distill(&pool, tenant_id, target, &admin.action()).await?;
+    Ok(Output::ok(to_json(&receipt)?))
+}
+
 async fn status(args: &Args) -> Result<Output> {
     let tenant_id = uuid_flag(args, "--tenant")?;
     let pool = pool().await?;
@@ -511,6 +538,7 @@ async fn run(args: Args) -> Result<Output> {
         ["collection", "ensure"] => collection_ensure().await,
         ["activate", ..] => activate(&args).await,
         ["status", ..] => status(&args).await,
+        ["jobs", "requeue-dead"] => jobs_requeue_dead(&args).await,
         _ => Err(Failure::Usage(USAGE.to_owned())),
     }
 }

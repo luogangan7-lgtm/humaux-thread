@@ -248,12 +248,69 @@ returns the memory. This is the chain the acceptance suites exercise; a deployme
 
 ### 7.1 Reading the private-worker dispatch line
 
-`humaux-private-worker: distill dispatch … done=N failed=N … rejected=N empty_retries=N malformed_retries=N`
+`humaux-private-worker: distill dispatch claimed=N completed=N failed=N not_ready=N parked=N deferred=N dead=N lost_lease=N errors=N heartbeat_lost=N attempts=N unknown=N memories=N rejected=N empty_retries=N malformed_retries=N affects_dropped=N channel_fallback=N stopped=no_work|no_slot|-`
 
+One line per pass (`--distill-once`) or per resident run (`--distill-serve`, printed at exit).
+ADR-0058: `claimed` = jobs claimed (one job = one Evidence), `attempts` = admitted provider
+requests (`ops.begin_call`), `deferred` = failed calls backed off for a retry, `parked` = jobs
+parked `WAITING_KEY`, `unknown` = calls cut at the HTTP window whose outcome is unknown,
+`lost_lease` / `heartbeat_lost` = a job's generation was superseded (its late result is discarded,
+its cost still ledgered) — fence refusals only; `errors` = jobs an error escaped (a database, reasoner or
+membership failure the job could not settle; the claim is reconciled by the sweep), each named on its job
+line. `affects_dropped` = written replies whose inferred affects were discarded as invalid (the memories
+were kept). `channel_fallback` (ADR-0058 R9) = written replies that, on the tool channel, came back
+with no tool call and the answer object in `content`; the same parser accepted them, so they are not
+malformed — a steady rate says the model often ignores the tool and the content channel may measure
+better (R10). `stopped` (ADR-0058 R5) = why a `--distill-once` pass ended: `no_work` = a provider slot was
+free and no READY job was left for it; `no_slot` = all four slots were bound (another dispatcher holds
+them), so READY work may be left for the next pass; `-` for `--distill-serve`, which never stops on an
+empty claim. A healthy run reads `lost_lease=0 errors=0 heartbeat_lost=0`.
+
+Every job also prints one line:
+`humaux-private-worker: distill job=<uuid> tenant=<uuid> evidence=<uuid> gen=<n> outcome=<DONE|RETRY|NOT_READY|PARKED|DEAD|LEASE_LOST|ERROR|UNKNOWN> attempt=<n>/<max> error_class=<class|-> next_retry_s=<n|-> channel_fallback=<0|1>`
+(`channel_fallback=1`: the written reply arrived in `content` on the tool channel, ADR-0058 R9)
+
+- `outcome=NOT_READY error_class=<reason>` — nothing was sent (no admitted binding, the
+  deployment's provider does not match the admitted route, or `DOMAIN_MISMATCH`); no attempt is
+  spent. Past `HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS` the job is `PARKED`
+  (`ops.jobs.status = 'WAITING_KEY'`, re-checked once per park interval): fix the tenant's
+  binding; the job resumes by itself.
+- `outcome=NOT_READY error_class=PROVIDER_BUDGET` — the tenant spent its §72.3 distill budget
+  (`HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS` admitted requests in the last
+  `_BUDGET_WINDOW_SECS`, counted in `ops.distill_calls`, ADR-0058 D-T); nothing was sent and no
+  attempt spent. Every request passes it, including the resend after `EXECUTION_UNCERTAIN`.
+- `outcome=RETRY error_class=WORKER_DB_ERROR` after a counted call — a database error after the
+  provider answered; the job was settled at once in a fresh transaction (slot freed), never left
+  to the hard deadline (ADR-0058 D-E).
+- `outcome=ERROR error_class=<class>` — an error escaped the job before it could settle (e.g.
+  `WORKER_DB_ERROR` on taking the outbox row); the job stays claimed until the sweep reconciles it (an
+  unexpired lease first). Never counted as a lost lease (ADR-0058 R3).
+- `outcome=DONE error_class=affect_invalid` — the reply's memories were written, but an inferred affect
+  was outside the menu (unknown key, MOOD, target, out of range, confidence over 5 000 bp), so every
+  inferred affect of that reply was dropped (ADR-0058 R1). Not a failure; a steady rate is a prompt/model
+  issue.
+- `outcome=PARKED error_class=WAITING_KEY` — the provider answered 401: the tenant's key is
+  invalid. Never DEAD, the attempt is not counted (§11); rotate the key.
+- `outcome=DEAD` — `attempt` reached `HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS` real provider
+  requests (or `ATTEMPTS_EXHAUSTED` / `PRE_DISPATCH_ABANDONED` / `FAILED_OUTPUT_SCHEMA`); the
+  outbox row is `FAILED` in the same transaction and the ticket ends `distill_failed`. The
+  tenant's other Evidence keeps flowing.
+- `re-claimed after EXECUTION_UNCERTAIN (T6) uncertain_model_call_id=<uuid>` — a worker died (or
+  stalled past `HARD_DEADLINE_SECS`) mid-call; the slot was held until the hard deadline, then
+  the job was re-queued with backoff and this call counted. The named ledger row stays
+  `RESERVED` (its outcome is unknown, ADR-0058 L5).
+- `humaux-reasoning: provider call failed purpose=PRIVATE_DISTILL_TEXT tenant=<uuid>
+  model_call_id=<uuid> error_class=<class> latency_ms=<n>` — `RETRY_WAIT` with latency ≈
+  `HTTP_TIMEOUT_SECS` is a timeout, with a short latency a 429/5xx; `PROVIDER_PERMANENT` is a
+  refusal.
+- In-flight is bounded by the four rows of `ops.provider_slots` across every process (§67.2):
+  `select slot_no, job_id, bound_until from ops.provider_slots` shows who holds them.
 - `distill evidence=<id> failed: InvalidInput (<reason>)` — the parser refused the model's
   reply. `<reason>` is structural, never payload text: `not_json`, `top_level_shape`,
   `memories_missing`, `too_many_memories`, `item_shape`, `content_empty_or_too_long`,
-  `memory_type_unknown`, `class_unknown`, `confidence_invalid` (ADR-0048 addendum). The worker
+  `memory_type_unknown`, `class_unknown`, `confidence_invalid` (ADR-0048 addendum), `nul_character`
+  (ADR-0058 R8), `tool_call_shape` (tool channel: two calls, another name, a truncated reply, or no
+  call and no JSON object in `content`, ADR-0058 D-M/R9). The worker
   re-asks once on its own (`malformed retry 1/1`, counted in `malformed_retries`); a row that
   still fails is a `FAILED` outbox row and a `FAILED` ticket, which blocks the §15.4 prefix
   until `role_maintenance` retires it (`projection.retire_failed_ticket`, ADR-0042). A steady
@@ -265,6 +322,77 @@ returns the memory. This is the chain the acceptance suites exercise; a deployme
 - A `MEMORY_LIFECYCLE` ticket for a superseded / revoked / expired memory settles `DONE` by
   retiring its registry binding and deleting its point (ADR-0049). `registry_failed` on such a
   ticket means the retrieval worker binary predates ADR-0049.
+
+#### Operator procedure for a terminal or stuck distill job (ADR-0058 R4)
+
+Read the state first (database owner session; no runtime role reads these tables):
+`select job_id, status, dispatch_state, attempt, abandoned_claims, last_error_class, next_retry_at,
+hard_deadline from ops.jobs where tenant_id = '<tenant>' and job_type = 'DERIVED_DISTILL' and status
+in ('DEAD', 'WAITING_KEY', 'PROCESSING') order by status, last_error_class`.
+
+- **DEAD** — terminal; nothing retries it. 1) Inspect the class (`last_error_class`, the job line's
+  `error_class`, and the `humaux-reasoning: provider call failed` lines of the same `tenant=`):
+  `RETRY_WAIT` / `TRANSPORT` = provider outage or timeout, `PROVIDER_PERMANENT` = refusal,
+  `FAILED_OUTPUT_SCHEMA` = the model kept breaking the output contract, `ATTEMPTS_EXHAUSTED` /
+  `PRE_DISPATCH_ABANDONED` = a crash loop, `WORKER_DB_ERROR` = the database. 2) Fix the cause
+  (provider back, model/prompt fixed, worker stable) — re-driving an unfixed cause spends
+  `MAX_ATTEMPTS` more billed requests and dies again. 3) Re-drive with the §77 fields:
+
+  ```
+  humaux-maintenance jobs requeue-dead --tenant <tenant> --job <job_id> \
+    --actor <you> --reason "<why>" --ticket <T-n> --step-up-auth <ctx>
+  humaux-maintenance jobs requeue-dead --tenant <tenant> --error-class RETRY_WAIT \
+    --actor <you> --reason "<why>" --ticket <T-n> --step-up-auth <ctx>
+  ```
+
+  Exactly one of `--job` / `--error-class` (exit 2 otherwise); `--error-class` matches the stored
+  class exactly and re-arms only that tenant's DEAD jobs. One transaction (`ops.requeue_dead_distill`,
+  0197): job `PENDING`, `attempt 0`, `last_error_class` kept as the record, the Evidence's outbox row
+  `FAILED -> PENDING`, the tenant's scheduler row admitted; the next pass claims it. When the
+  Evidence's projection ticket had already settled `FAILED distill_failed` (or was retired / `LOST`),
+  the same transaction issues a successor ticket on that stream (0198): it waits while the job is
+  open and indexes the re-distilled memories once it is DONE. The old `FAILED` ticket stays an open
+  gap until you retire it — `projection-serve ... --retire-failed distill_failed` — which is safe now,
+  since the successor carries the Evidence. The receipt lists
+  every re-armed `job_id` / `evidence_id` / `last_error_class` / `attempt_spent` under `requeued`
+  and the §77 audit id. With `--error-class` it also lists, under `skipped`, every matching DEAD job
+  it left DEAD (0200), each with `reason`: `evidence_gone` (the Evidence has no outbox row: a
+  re-armed job could only die again) or `outbox_settled` (the Evidence is already DONE — nothing to
+  re-drive); the SUCCESS audit row carries the same `skipped` list. `outcome` is `requeued`, or
+  `nothing_requeued` when every match was skipped (exit 0 both; read `skipped` to see why):
+
+  ```
+  {"outcome":"requeued","tenant_id":"…","requeued":[{"job_id":"…","evidence_id":"…",
+   "last_error_class":"FAILED_OUTPUT_SCHEMA","attempt_spent":3}],
+   "skipped":[{"job_id":"…","evidence_id":"…","last_error_class":"FAILED_OUTPUT_SCHEMA",
+   "attempt_spent":3,"reason":"evidence_gone"}],"audit_event_id":"…"}
+  ```
+
+  Exit 3 = refused, nothing written but a DENIED audit row: `job_not_found` (wrong tenant or id),
+  `job_not_dead`, `evidence_gone` / `outbox_settled` (`--job` only — the same reasons as above),
+  `no_dead_job` (no DEAD job with that class at all). A re-run is refused `job_not_dead` (`--job`)
+  or answers only what is still DEAD (`--error-class`), never a second re-arm.
+- **WAITING_KEY** (`outcome=PARKED`) — never DEAD and never re-driven by hand: rotate the tenant's
+  provider key (`error_class=WAITING_KEY`, a 401) or bind/admit its `PRIVATE_DISTILL_TEXT` route
+  profile (any other NOT_READY class). The claim re-checks it once per
+  `HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS` and it resumes by itself; no attempt is spent.
+- **EXECUTION_UNCERTAIN** (`status = 'PROCESSING'`, `dispatch_state = 'EXECUTION_UNCERTAIN'`) — a worker
+  died or stalled mid-call; its slot stays bound on purpose. Wait for `hard_deadline`: the next claim
+  re-queues it with backoff (`last_error_class = 'EXECUTION_UNCERTAIN'`, the uncertain call counted)
+  and the resend is automatic, admitted by the tenant budget, and printed as `re-claimed after
+  EXECUTION_UNCERTAIN (T6) uncertain_model_call_id=<uuid>`. Do not edit the row or free the slot.
+- **A ledger row left `RESERVED`** (ADR-0058 L5) — a provider request whose outcome is unknown (the
+  worker died before finalizing it). For billing it means: the provider may or may not have charged the
+  tenant's account for it; Humaux's ledger holds only the pre-call `estimated_cost`, never an
+  `actual_cost`, and nothing finalizes it later. The resend after `EXECUTION_UNCERTAIN` is a separate,
+  counted, ledgered request — so one Evidence can show one `RESERVED` row plus one `SUCCEEDED` row (at
+  most one extra billed call per uncertain claim, bounded by `MAX_ATTEMPTS`). List them (owner session):
+  `select l.model_call_id, l.tenant_id, l.called_at, l.estimated_cost, c.job_id, c.attempt from
+  ops.model_call_ledger l left join ops.distill_calls c using (model_call_id) where l.purpose =
+  'PRIVATE_DISTILL_TEXT' and l.status = 'RESERVED' and l.called_at < now() - interval '<hard deadline>'
+  order by l.called_at`. Reconcile against the provider's usage console by time window when a tenant
+  disputes a charge; a `RESERVED` row with no `distill_calls` row was reserved but never admitted by
+  `ops.begin_call` (a crash between the two, ADR-0058 L13): no request was sent.
 
 ### 7.2 What `PROJECTION_LAG` means and what to do (ADR-0057 D-E)
 

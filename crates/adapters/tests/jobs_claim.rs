@@ -1,7 +1,7 @@
 //! `adapters::tests::jobs_claim` — T3.5 integration test — `jobs` (§31/§61) against a real Postgres.
 //! Depends-on: crates=[humaux-adapters, humaux-testkit, postgres, sqlx, tokio]; services=[PostgreSQL(any)
-//!   r=[ops.claim_derived_work] w=[control.tenants, ops.jobs], PostgreSQL(role_gateway),
-//!   PostgreSQL(role_private_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::jobs, adapters::postgres,
+//!   r=[ops.claim_derived_work] w=[control.tenants, ops.jobs], PostgreSQL(role_consolidation_worker),
+//!   PostgreSQL(role_gateway), PostgreSQL(role_private_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::jobs, adapters::postgres,
 //!   humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [runs on the real ops.jobs with rows scoped to a throwaway tenant; SKIP LOCKED claims never hand one
@@ -19,7 +19,7 @@
 use std::sync::Mutex;
 
 use humaux_adapters::jobs::{self, FailInput, JobStatus};
-use humaux_adapters::postgres::{PrivateWorkerDbPool, RuntimeDbPool};
+use humaux_adapters::postgres::{ConsolidationDbPool, PrivateWorkerDbPool, RuntimeDbPool};
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
 use sqlx::types::Uuid;
@@ -44,6 +44,8 @@ struct Handle {
     rt: tokio::runtime::Runtime,
     gateway: RuntimeDbPool,
     private: PrivateWorkerDbPool,
+    /// ADR-0058 D-L: the v1 derived claim/heartbeat/settle serve `role_consolidation_worker` only.
+    consolidation: ConsolidationDbPool,
     admin: Client,
     tenant_id: Uuid,
     /// `role_gateway` DSN, kept around so the concurrency test below can open one independent
@@ -112,11 +114,19 @@ impl DbIntegrationFixture for JobsFixture {
                 "role_private_worker",
             )))
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+        let consolidation = rt
+            // dep: PostgreSQL(role_consolidation_worker) — open a role-scoped PG connection/pool for this test
+            .block_on(ConsolidationDbPool::connect(&dsn_as_role(
+                &dsn,
+                "role_consolidation_worker",
+            )))
+            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
 
         Ok(Handle {
             rt,
             gateway,
             private,
+            consolidation,
             admin,
             tenant_id,
             gateway_dsn,
@@ -894,7 +904,9 @@ fn generic_and_private_claims_preserve_public_boundary() {
 // `rows × provider_latency`. Those two numbers were never related to each other, so the lease
 // expired mid-pass, another dispatcher re-claimed the job (`ops.claim_derived_work`'s
 // `status='PROCESSING' AND lease_expires_at < clock_timestamp()` arm), and the provider budget
-// was spent twice. `distill::run_once` now renews per row.
+// was spent twice. `distill::run_once` then renewed per row; since ADR-0058 distill runs on the
+// v2 slots (its own heartbeat per job, `distill_dispatch_v2.rs` T6) and these two tests pin the v1
+// heartbeat/settle shape the consolidation worker still uses (`DERIVED_CONSOLIDATE`).
 //
 // Scoped entirely to this file's throwaway tenant: the competing claim is SIMULATED with an
 // admin UPDATE on this job (the same technique `heartbeat_after_lease_lost_is_a_no_op` uses)
@@ -902,8 +914,8 @@ fn generic_and_private_claims_preserve_public_boundary() {
 // `attempt` on unrelated tenants' rows in the shared dev database.
 // ----------------------------------------------------------------------------
 
-/// Seeds one `DERIVED_DISTILL` job already `PROCESSING` under `owner`, with `lease_seconds` left
-/// to run, and returns the lease a claim would have handed back.
+/// Seeds one `DERIVED_CONSOLIDATE` job already `PROCESSING` under `owner`, with `lease_seconds`
+/// left to run, and returns the lease a claim would have handed back.
 fn seed_leased_derived_job(handle: &mut Handle, owner: &str, lease_seconds: f64) -> Uuid {
     handle
         .admin
@@ -916,13 +928,13 @@ fn seed_leased_derived_job(handle: &mut Handle, owner: &str, lease_seconds: f64)
              RETURNING job_id",
             &[
                 &handle.tenant_id,
-                &jobs::DerivedJobType::Distill.as_db_str(),
+                &jobs::DerivedJobType::Consolidate.as_db_str(),
                 &format!("card21-{owner}-{}", Uuid::new_v4()),
                 &owner,
                 &lease_seconds,
             ],
         )
-        .expect("seed leased DERIVED_DISTILL job")
+        .expect("seed leased DERIVED_CONSOLIDATE job")
         .get(0)
 }
 
@@ -961,8 +973,8 @@ fn a_derived_pass_longer_than_its_lease_heartbeats_per_row_and_settles() {
             for row in 0..4 {
                 let alive = handle
                     .rt
-                    .block_on(jobs::heartbeat_derived_private(
-                        &handle.private,
+                    .block_on(jobs::heartbeat_derived_consolidation(
+                        &handle.consolidation,
                         &lease,
                         1.0,
                     ))
@@ -977,8 +989,8 @@ fn a_derived_pass_longer_than_its_lease_heartbeats_per_row_and_settles() {
             );
             let settled = handle
                 .rt
-                .block_on(jobs::settle_derived_private(
-                    &handle.private,
+                .block_on(jobs::settle_derived_consolidation(
+                    &handle.consolidation,
                     &lease,
                     jobs::DerivedWorkOutcome::Done,
                     1.0,
@@ -1013,8 +1025,8 @@ fn the_same_derived_pass_without_per_row_heartbeats_loses_its_lease() {
             assert!(
                 handle
                     .rt
-                    .block_on(jobs::heartbeat_derived_private(
-                        &handle.private,
+                    .block_on(jobs::heartbeat_derived_consolidation(
+                        &handle.consolidation,
                         &lease,
                         1.0
                     ))
@@ -1037,8 +1049,8 @@ fn the_same_derived_pass_without_per_row_heartbeats_loses_its_lease() {
                 .expect("simulate the re-claim");
             let settled = handle
                 .rt
-                .block_on(jobs::settle_derived_private(
-                    &handle.private,
+                .block_on(jobs::settle_derived_consolidation(
+                    &handle.consolidation,
                     &lease,
                     jobs::DerivedWorkOutcome::Done,
                     1.0,

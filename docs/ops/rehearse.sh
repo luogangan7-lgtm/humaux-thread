@@ -24,6 +24,11 @@ COLLECTION=humaux_private_memory_v1_e2e
 CELL_ID=$(uuidgen | tr 'A-Z' 'a-z'); PEPPER_HEX=$(openssl rand -hex 32)
 # MiniMax lane（值须与种子一致；provider_id/model 由 seed flags 决定）
 MM_URL=https://api.minimaxi.com/v1/chat/completions; MM_PROVIDER=minimax; MM_MODEL=MiniMax-M3; MM_REV=2026-08; MM_REGION=cn-shanghai; MM_TIER=standard
+# ADR-0058 R10: the rehearsal profile's distill channel, chosen by the live A/B probe
+# `distill_channel_ab_live` (rule: TOOL_CALLS only if the tool channel's DEAD count and first-reply
+# malformed rate are not higher than the content channel's). 2026-10-03, n=100 each: tool dead=0
+# malformed=1, content dead=1 malformed=6 -> TOOL_CALLS. One definition for every worker below.
+PW_CAPABILITIES=STRUCTURED_OUTPUT,TOOL_CALLS,REASONING_SPLIT
 EGRESS_PROC=$(uuidgen | tr 'A-Z' 'a-z')
 step() { echo "### STEP $1 $(date +%T)" | tee -a $EV/rehearsal.log; }
 doh_ips() { curl -s "https://dns.alidns.com/resolve?name=$1&type=A" | python3 -c "import sys,json; d=json.load(sys.stdin); print('|'.join(a['data'] for a in d.get('Answer',[]) if a.get('type')==1))"; }
@@ -168,7 +173,9 @@ echo "tenants: A=$TENANT/$WS  B=$TENANT_B/$WS_B" | tee -a $EV/rehearsal.log
 # `--workspaces 2` (above, and here) gives each tenant a second workspace with its own membership
 # and workspace-bound key; `bearer_2:` lines are secrets and never reach seed_ids.txt.
 step seed_c
-SEED_OUT_C=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 --workspaces 2 \
+# Card 32 (ADR-0058 M8 twin): tenant C also gets a second user who owns a second reasoning domain
+# with its own admitted lane and key (`bearer_d2:`, a secret) — one tenant, two domains.
+SEED_OUT_C=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 --workspaces 2 --second-domain \
   --processor-id $EGRESS_PROC --region $MM_REGION --service-tier $MM_TIER --endpoint-ref $MM_URL \
   --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV \
   --collection $COLLECTION --dimension $EMB_DIM --embedding-provider dashscope --embedding-region $EMB_REGION 2>$EV/seed_c.stderr)
@@ -178,7 +185,8 @@ TENANT_C=$(seedval "$SEED_OUT_C" tenant_id); WS_C=$(seedval "$SEED_OUT_C" worksp
 export BEARER_C=$(print -r -- "$SEED_OUT_C" | sed -n 's/^Authorization: Bearer //p' | head -1)
 WS_A2=$(seedval "$SEED_OUT" workspace_id_2); WS_B2=$(seedval "$SEED_OUT_B" workspace_id_2); WS_C2=$(seedval "$SEED_OUT_C" workspace_id_2)
 export BEARER_A2=$(seedval "$SEED_OUT" bearer_2) BEARER_B2=$(seedval "$SEED_OUT_B" bearer_2) BEARER_C2=$(seedval "$SEED_OUT_C" bearer_2)
-for v in TENANT_C WS_C BEARER_C WS_A2 WS_B2 WS_C2 BEARER_A2 BEARER_B2 BEARER_C2; do
+export BEARER_C_D2=$(seedval "$SEED_OUT_C" bearer_d2); RDOM_C2=$(seedval "$SEED_OUT_C" second_reasoning_domain_id)
+for v in TENANT_C WS_C BEARER_C WS_A2 WS_B2 WS_C2 BEARER_A2 BEARER_B2 BEARER_C2 BEARER_C_D2 RDOM_C2; do
   [ -z "${(P)v}" ] && { echo "seed_c: $v not parsed from e2e-seed --workspaces 2" | tee -a $EV/rehearsal.log; exit 2; }
 done
 SEEDED="'$TENANT','$TENANT_B','$TENANT_C'"
@@ -193,7 +201,7 @@ rm -f $SOCK/*.sock
 start_pw() {
 ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB" \
     HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
-    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
     HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS"
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
   exec "$BIN_DIR"/humaux-private-worker --serve-rpc >> $EV/private-worker.log 2>&1 ) &
@@ -320,13 +328,29 @@ bounded() { # $1=seconds, rest=command ; runs in background and kills after the 
   if kill -0 $pid 2>/dev/null; then echo "bounded: killing after ${secs}s" ; kill $pid; fi; wait $pid 2>/dev/null; return $?
 }
 # One definition, called by this step AND by `drain_all` after every later write. ADR-0036: the
-# distill dispatch is tenant-free, so ONE pass settles both tenants' work.
+# distill dispatch is tenant-free, so one pass serves every tenant (ADR-0058: four seats, lease 30,
+# hard deadline 300 = 2 x (HTTP 120 + lease 30)). One pass does NOT settle a job whose call hit a
+# provider transient: ADR-0058 D-F settles it RETRY (PENDING, attempt counted, class RETRY_WAIT,
+# backoff 30/60 s). The chain run of 2026-10-02 lost tenant B's whole corpus that way (two fast
+# RETRY_WAITs in the first burst, 9 assertions red), so further passes run while a seeded tenant
+# has such a retry due within 70 s — at most 3, never for a NOT_READY, parked or DEAD job.
 distill_once() {
+  local pass due
+  for pass in 1 2 3 4; do
+    distill_pass
+    [ $pass = 4 ] && break
+    due=$(PGQ "select ceil(greatest(0, extract(epoch from min(next_retry_at) - now()))) from ops.jobs where job_type='DERIVED_DISTILL' and tenant_id in ($SEEDED) and status='PENDING' and attempt > 0 and last_error_class='RETRY_WAIT' and next_retry_at < now() + interval '70 seconds'")
+    [ -z "$due" ] && break
+    echo "distill: a seeded RETRY_WAIT job is due in ${due}s — pass $((pass + 1))"
+    sleep $due
+  done
+}
+distill_pass() {
 ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB" \
-    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
     HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-distill.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
-    HUMAUX_PRIVATE_WORKER_DISTILL_BATCH=50 HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=120 HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH=8 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5
+    HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
   exec "$BIN_DIR"/humaux-private-worker --distill-once ) 2>&1 | tee -a $EV/distill.log | tail -3
 }
@@ -340,10 +364,10 @@ PGQ "select 'memory: '||authority_class||' '||visibility_class||' '||left(conten
 # ops.jobs row may still be PROCESSING with a live lease.
 step sigterm_mid_load
 ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB" \
-    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
     HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-drain.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
-    HUMAUX_PRIVATE_WORKER_DISTILL_BATCH=50 HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=120 HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH=8 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 \
+    HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120 \
     HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=3
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
   exec "$BIN_DIR"/humaux-private-worker --distill-serve > $EV/distill-serve.log 2>&1 ) &
@@ -1022,10 +1046,10 @@ assert_eq "no_tenant_env_for_the_projection_runner" \
 # The resident distiller for this step (the gate's deployment runs distill resident; the earlier
 # steps drive it one pass at a time). Stopped at the end of the step; the soak starts its own.
 ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB" \
-    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
     HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-pst.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
-    HUMAUX_PRIVATE_WORKER_DISTILL_BATCH=50 HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=120 HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH=8 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 \
+    HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120 \
     HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=1
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
   exec "$BIN_DIR"/humaux-private-worker --distill-serve >> $EV/pst-distill.log 2>&1 ) &
@@ -1192,6 +1216,71 @@ VIS=$(cat $PST/visible.json)
 assert_eq "recall_without_token_returns_every_memory(n=$(print -r -- "$VIS" | python3 -c "import sys,json; print(json.load(sys.stdin)['memories'])"))" \
   "$(print -r -- "$VIS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['missing'] if d['memories'] > 0 else -1)")" 0
 
+# ---- 2b. card 32 (ADR-0058 §7) twins of the live gate `distill_fairness_live` ----
+# M2: tenant A queues 40 puts, then tenant B puts ONE row; the tenant-fair claim (least-recently-
+# served tenant first, four slots) must finish B within 60 s of its put whatever A's queue. The
+# queue depth at B's put is graded too, so a drained queue cannot make the assertion vacuous.
+: > $PST/fair_a.tsv; : > $PST/fair_b.tsv
+for k in $(seq 1 40); do
+  pst_put BEARER_A $WS "Card32 fairness queue note $k: the ${NOUNS[$(( (k - 1) % 10 + 1 ))]} batch of shard $k closes at $(( k % 12 + 1 )) pm." $PST/fair_a.tsv
+done
+pst_put BEARER_B $WS_B "Card32 fairness single note: the tenant B billing export runs every Friday at noon." $PST/fair_b.tsv
+FAIR_B=$(cut -f1 $PST/fair_b.tsv | head -1); FAIR_B_T0=$(cut -f4 $PST/fair_b.tsv | head -1)
+FAIR_A_AT_PUT=$(PGQ "select count(*) from ops.outbox where evidence_id in ($(ev_list $PST/fair_a.tsv)) and status in ('PENDING','PROCESSING')")
+for i in $(seq 1 180); do
+  [ "$(PGQ "select status in ('DONE','FAILED') from ops.outbox where evidence_id='${FAIR_B:-00000000-0000-0000-0000-000000000000}'")" = t ] && break
+  sleep 1
+done
+FAIR_B_LAT=$(PGQ "select coalesce(round((extract(epoch from processed_at) - ${FAIR_B_T0:-0})::numeric, 1)::text, '9999') from ops.outbox where evidence_id='${FAIR_B:-00000000-0000-0000-0000-000000000000}' and status = 'DONE'")
+FAIR_A_AT_DONE=$(PGQ "select count(*) from ops.outbox a, ops.outbox b where b.evidence_id='${FAIR_B:-00000000-0000-0000-0000-000000000000}' and a.evidence_id in ($(ev_list $PST/fair_a.tsv)) and (a.processed_at is null or a.processed_at > b.processed_at)")
+echo "pst fairness: tenant B single row put->DONE ${FAIR_B_LAT:-none}s; tenant A queue at B's put=$FAIR_A_AT_PUT at B's DONE=$FAIR_A_AT_DONE" | tee -a $EV/rehearsal.log
+assert_gt "tenantA_has_queue_at_tenantB_put" "$FAIR_A_AT_PUT" 0
+assert_eq "tenantB_single_row_done_within_60s_while_A_has_queue(latency_s=${FAIR_B_LAT:-none} a_queue_at_done=$FAIR_A_AT_DONE)" \
+  "$(python3 -c "print(1 if float('${FAIR_B_LAT:-9999}' or 9999) <= 60 else 0)")" 1
+# M8: tenant C's two reasoning domains (seed_c --second-domain): three puts per domain user, every
+# Evidence distilled, none FAILED (P1-4: a job only ever takes its own Evidence, by its own domain).
+: > $PST/twodom.tsv
+for k in 1 2 3; do
+  pst_put BEARER_C $WS_C "Card32 domain one note $k: the ${NOUNS[$k]} rollout of team C needs sign-off by $(( k + 8 )) am." $PST/twodom.tsv
+  pst_put BEARER_C_D2 $WS_C "Card32 domain two note $k: the ${NOUNS[$(( k + 3 ))]} review of team C is booked on ${DAYS[$k]}." $PST/twodom.tsv
+done
+# M7: five puts that carry feelings. The gateway stamps every remember.put AuthenticatedAgent
+# (bins/gateway/src/remember.rs, `origin_class`); ADR-0058 D-P (amended by the card-32 review) offers
+# the affect menu to that origin, so this ingress must yield inferred (origin DISTILL) rows, an
+# affect-filtered recall must return one of their memories, and no row may pass the 5000 bp ceiling.
+# All three are in the verdict. Rehearsal profile: $PW_CAPABILITIES (ADR-0058 R10),
+# §72.3 distill budget 120 calls per tenant per 60 s (ADR-0058 D-M / D-T).
+: > $PST/affect.tsv
+for t in "I am thrilled: the migration finished two days early and the whole team celebrated together." \
+         "Honestly I feel anxious about tomorrow's launch; the load tests kept failing all week." \
+         "I was furious when the vendor cancelled our contract without any warning yesterday." \
+         "I feel deeply grateful to Maria for staying late to fix the billing outage with me." \
+         "Losing the Hamburg customer left me sad and exhausted after months of work on that account."; do
+  pst_put BEARER_B $WS_B "$t" $PST/affect.tsv
+done
+cat $PST/fair_a.tsv $PST/fair_b.tsv $PST/twodom.tsv $PST/affect.tsv > $PST/c32.tsv
+C32_WAIT=$(wait_settled $PST/c32.tsv 600)
+echo "pst card32 twins: $(wc -l < $PST/c32.tsv | tr -d ' ') tickets settled after ${C32_WAIT}s" | tee -a $EV/rehearsal.log
+TWODOM=$(PGQ "select count(distinct e.reasoning_domain_id)||' '||count(*) filter (where o.status='DONE')||' '||count(*) filter (where o.status='FAILED') from ops.outbox o join private.evidence_objects e using (evidence_id) where o.evidence_id in ($(ev_list $PST/twodom.tsv))")
+echo "pst two domains (tenant C, second domain $RDOM_C2): domains done failed = $TWODOM" | tee -a $EV/rehearsal.log
+assert_eq "one_tenant_two_domains_all_distilled_none_failed(n=$(wc -l < $PST/twodom.tsv | tr -d ' '))" "$TWODOM" "2 6 0"
+AFF_MEM=$(PGQ "select me.memory_id from private.memory_affects a join private.memory_evidence me on me.memory_id = a.memory_id where a.tenant_id='$TENANT_B' and a.origin='DISTILL' and me.evidence_id in ($(ev_list $PST/affect.tsv)) order by a.created_at limit 1")
+AFF_ROWS=$(PGQ "select count(*)||' '||count(*) filter (where a.confidence_bp > 5000) from private.memory_affects a join private.memory_evidence me on me.memory_id = a.memory_id where a.tenant_id='$TENANT_B' and a.origin='DISTILL' and me.evidence_id in ($(ev_list $PST/affect.tsv))")
+AFF_HIT=0
+if [ -n "$AFF_MEM" ]; then
+  AFF_Q=$(PGQ "select coalesce(content->>'key_claim', content->>'title', content::text) from private.memory_records where memory_id='$AFF_MEM'" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))")
+  mcp_as "$BEARER_B" recall "{\"query\":$AFF_Q,\"workspace_id\":\"$WS_B\",\"mode\":\"semantic\",\"affect\":{\"kinds\":[\"EMOTION\"]}}" > $PST/affect_recall.json 2>&1
+  AFF_HIT=$(head -1 $PST/affect_recall.json | python3 -c "
+import sys,json
+try: print(int('$AFF_MEM' in {i.get('memory_id') for i in json.load(sys.stdin)['result']['structuredContent'].get('items',[])}))
+except Exception: print(0)")
+fi
+echo "pst inferred affect: rows over_ceiling = ${AFF_ROWS:-none}; memory ${AFF_MEM:-none}; recall(affect EMOTION) hit=$AFF_HIT" | tee -a $EV/rehearsal.log
+AFF_ORIGINS=$(PGQ "select string_agg(distinct origin_class, ',') from private.evidence_objects where evidence_id in ($(ev_list $PST/affect.tsv))")
+assert_gt "rehearsal_inferred_affect_rows(evidence_origin=$AFF_ORIGINS)" "${AFF_ROWS%% *}" 0
+assert_eq "rehearsal_inferred_affect_row_recalled_by_affect_filter(memory=${AFF_MEM:-none})" "$AFF_HIT" 1
+assert_eq "inferred_affect_within_ceiling" "${AFF_ROWS##* }" 0
+
 # ---- 3. crash: SIGKILL the runner mid-batch, restart, converge ----
 : > $PST/crash.tsv
 CRASH_N=(3 2 3 2)   # 10 puts on tenants A + B, both workspaces each
@@ -1236,7 +1325,9 @@ while [ $i -lt 600 ] && [ ${#OUT_SEEN} -lt $N_OUT ]; do
 done
 [ -z "$OUT_T0" ] && OUT_T0=$EPOCHREALTIME
 assert_eq "outage_tickets_retry_with_attempts_1(n=$N_OUT)" "${#OUT_SEEN}" "$N_OUT"
-assert_eq "no_ticket_failed_during_outage(n=$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED)") tickets)" "$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and state='FAILED'")" 0
+# ADR-0058 R11: the two outage witnesses count tickets FAILED by the projection path (every class
+# except `distill_failed`); a distill that died is graded under its own name by `distill_dead` below.
+assert_eq "no_ticket_failed_during_outage(n=$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED)") tickets)" "$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and state='FAILED' and error_class is distinct from 'distill_failed'")" 0
 sleep $(( 30 - (EPOCHREALTIME - OUT_T0) > 0 ? 30 - (EPOCHREALTIME - OUT_T0) : 0 ))
 own_signal $S/rp.pid humaux-retrieval-worker TERM 90 | tee -a $EV/rehearsal.log
 start_rp; wait_ready projection-runner-after-outage rp_readyz
@@ -1275,15 +1366,16 @@ echo "pst permanent: ticket seq=$PERM_SEQ row=$PERM_ROW others_claimable=$PERM_O
 assert_eq "permanent_fault_ticket_failed_with_class(n=1)" "$PERM_ROW" "FAILED|qdrant_upsert_rejected"
 assert_eq "permanent_fault_memory_has_no_point(n=1 memory: registry rows, new qdrant points)" "$PERM_REG|$((PTS_AFTER - PTS_BEFORE))" "0|0"
 assert_eq "other_tickets_unaffected(n=$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED)") tickets)" \
-  "$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and state not in ('DONE','SKIPPED_BY_POLICY','RETIRED_FAILED') and not (tenant_id='$TENANT_C' and scope_id='$WS_C2' and stream_seq=${PERM_SEQ:-0})")" 0
+  "$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and state not in ('DONE','SKIPPED_BY_POLICY','RETIRED_FAILED') and not (state='FAILED' and error_class='distill_failed') and not (tenant_id='$TENANT_C' and scope_id='$WS_C2' and stream_seq=${PERM_SEQ:-0})")" 0
 cargo run -q -p xtask -- projection-serve --tenant $TENANT_C --workspace $WS_C2 --domain $DOMAIN --projection-kind $PKIND --version $PVER --retire-failed qdrant_upsert_rejected 2>&1 | tail -1 | tee -a $EV/rehearsal.log
 start_rp; wait_ready projection-runner-after-permanent rp_readyz
 
 # ---- 6. EXPLAIN: no Seq Scan on ops.outbox / ops.jobs / private.memory_evidence ----
 cat > $S/explain_gate.py <<'PYEOF'
 #!/usr/bin/env python3
-# card 27 EXPLAIN gate: plans of the projection claim, the 0164 job claim (both via auto_explain,
-# inside BEGIN..ROLLBACK), the retrieve.rs RYW overlay and the distill_repo claim (EXPLAIN only).
+# card 27 EXPLAIN gate: plans of the projection claim, the 0164 job claim (consolidation only since
+# 0193; both via auto_explain, inside BEGIN..ROLLBACK), the retrieve.rs RYW overlay, the distill
+# job's own outbox take and the v2 claim's tenant/job picks (card 32, EXPLAIN only).
 # usage: explain_gate.py <db> <tenant> <workspace> <out_dir> [--no-projection-claim]
 # prints one line per plan: "plan=<name> nodes=<n> seq_scan_hot=<k> <tables>" and a summary.
 import json, re, subprocess, sys, uuid
@@ -1315,19 +1407,23 @@ WHERE sl.tenant_id = '{tenant}' AND sl.scope_kind = 'workspace' AND sl.scope_id 
 GROUP BY sl.stream_seq, sl.state, ob.evidence_id
 ORDER BY sl.stream_seq"""
 
-distill = f"""WITH picked AS (
-  SELECT outbox_id FROM ops.outbox
-  WHERE tenant_id = '{tenant}' AND event_type = 'EVIDENCE_ACCEPTED' AND evidence_id IS NOT NULL
-    AND (status = 'PENDING' OR (status = 'PROCESSING' AND lease_expires_at < clock_timestamp()))
-  ORDER BY commit_seq
-  FOR UPDATE SKIP LOCKED
-  LIMIT 50
-)
-UPDATE ops.outbox o
-SET status = 'PROCESSING', lease_owner = 'explain-probe',
-    lease_expires_at = clock_timestamp() + make_interval(secs => 120)
-FROM picked WHERE o.outbox_id = picked.outbox_id
-RETURNING o.outbox_id, o.evidence_id, o.commit_seq, o.stream_seq"""
+# ADR-0058 D-C: a distill job takes exactly its own Evidence's outbox row
+# (distill_repo::take_outbox_row; the tenant-batch claim is gone).
+distill = f"""UPDATE ops.outbox
+SET status = 'PROCESSING', lease_owner = 'explain-probe', lease_expires_at = clock_timestamp() + make_interval(secs => 120)
+WHERE tenant_id = '{tenant}' AND event_type = 'EVIDENCE_ACCEPTED' AND evidence_id = '00000000-0000-0000-0000-000000000000'
+  AND status IN ('PENDING', 'PROCESSING')
+RETURNING outbox_id, evidence_id, commit_seq, stream_seq"""
+
+# ADR-0058 D-B: the v2 claim's two ops.jobs reads (0193 ops.claim_derived_work_v2), run as its owner.
+tenant_pick = """SELECT t.tenant_id FROM ops.distill_tenant_scheduler t
+WHERE EXISTS (SELECT 1 FROM ops.jobs j WHERE j.tenant_id = t.tenant_id AND j.job_type = 'DERIVED_DISTILL'
+  AND j.status IN ('PENDING', 'RETRY_WAIT', 'WAITING_KEY') AND j.next_retry_at <= clock_timestamp())
+ORDER BY t.last_served_turn, t.tenant_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED"""
+job_pick = f"""SELECT j.job_id FROM ops.jobs j
+WHERE j.tenant_id = '{tenant}' AND j.job_type = 'DERIVED_DISTILL'
+  AND j.status IN ('PENDING', 'RETRY_WAIT', 'WAITING_KEY') AND j.next_retry_at <= clock_timestamp()
+ORDER BY j.created_at, j.job_id LIMIT 1 FOR UPDATE SKIP LOCKED"""
 
 proj = ("SELECT count(*) FROM projection.claim_issued_tickets('private_memory','PRIVATE_MEMORY','v1',"
         "'private_memory_v1','explain-probe',1,1,1);\n") if with_proj else ""
@@ -1341,7 +1437,7 @@ SET auto_explain.log_verbose = on;
 SET client_min_messages = notice;
 BEGIN;
 SELECT '@@claim_derived_work';
-SELECT count(*) FROM ops.claim_derived_work(ARRAY['DERIVED_DISTILL','DERIVED_CONSOLIDATE'], 'explain-probe', 1, 1);
+SELECT count(*) FROM ops.claim_derived_work(ARRAY['DERIVED_CONSOLIDATE'], 'explain-probe', 1, 1);
 SELECT '@@claim_issued_tickets';
 {proj}ROLLBACK;
 SET auto_explain.log_min_duration = -1;
@@ -1354,6 +1450,11 @@ BEGIN;
 SET LOCAL ROLE role_private_worker;
 SELECT set_config('humaux.tenant_id', '{tenant}', true), set_config('humaux.user_id', '{U}', true);
 EXPLAIN (FORMAT JSON, VERBOSE) {distill};
+ROLLBACK;
+BEGIN;
+SET LOCAL ROLE role_migration_owner;
+EXPLAIN (FORMAT JSON, VERBOSE) {tenant_pick};
+EXPLAIN (FORMAT JSON, VERBOSE) {job_pick};
 ROLLBACK;
 """
 p = subprocess.run(["docker", "exec", "-i", "humaux-thread-pg", "psql", "-U", "postgres", "-d", db, "-At"],
@@ -1376,7 +1477,7 @@ for n in notices:
     if "ops.jobs j" in q and "UPDATE ops.jobs" in q: plans["job_claim"] = n["Plan"]
     if "projection.stream_log s" in q and "UPDATE projection.stream_log" in q: plans["projection_claim"] = n["Plan"]
 ex = [e[0]["Plan"] for e in explains if isinstance(e, list)]
-if len(ex) >= 2: plans["overlay"], plans["distill_claim"] = ex[0], ex[1]
+if len(ex) >= 4: plans["overlay"], plans["distill_claim"], plans["distill_tenant_pick"], plans["distill_job_pick"] = ex[:4]
 
 def walk(pl, acc):
     acc.append(pl)
@@ -1384,7 +1485,7 @@ def walk(pl, acc):
     return acc
 
 total_hot = 0
-for name in ["projection_claim", "job_claim", "overlay", "distill_claim"]:
+for name in ["projection_claim", "job_claim", "overlay", "distill_claim", "distill_tenant_pick", "distill_job_pick"]:
     if name not in plans:
         print(f"plan={name} MISSING"); total_hot += 0 if (name == "projection_claim" and not with_proj) else 1000; continue
     nodes = walk(plans[name], [])
@@ -1401,7 +1502,7 @@ mkdir -p $PST/plans
 python3 $S/explain_gate.py $DB $TENANT $WS $PST/plans 2>&1 | tee -a $EV/rehearsal.log
 EXPLAIN_HOT=$(grep -oE 'seq_scan_on_outbox_jobs_memory_evidence=[0-9]+' $EV/rehearsal.log | tail -1 | cut -d= -f2)
 EXPLAIN_N=$(grep -oE 'explain_gate: plans=[0-9]+' $EV/rehearsal.log | tail -1 | cut -d= -f2)
-assert_eq "no_seq_scan_on_outbox_jobs_memory_evidence(n=${EXPLAIN_N:-0} plans)" "${EXPLAIN_N:-0}|${EXPLAIN_HOT:-x}" "4|0"
+assert_eq "no_seq_scan_on_outbox_jobs_memory_evidence(n=${EXPLAIN_N:-0} plans)" "${EXPLAIN_N:-0}|${EXPLAIN_HOT:-x}" "6|0"
 # A plan cannot pin an index (at dev data sizes the planner has another path for 4 of the 6 P1-15
 # indexes — review 2026-09-29, fault f_delete_p1_15_index), so the catalog does: all seven exist,
 # valid and ready. The exact definitions are pinned by crates/adapters/tests/hot_path_indexes.rs.
@@ -1560,11 +1661,12 @@ HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GI
 # restarted process is the same process — a chaos hook that starts a differently-configured
 # worker grades a deployment nobody ran.
 DS_ENV="export PRIVATE_WORKER_PG_DSN='postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB' \
-HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
 HUMAUX_PRIVATE_WORKER_DNS_PINS='$MM_PINS' HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-soak.sock \
 HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
-HUMAUX_PRIVATE_WORKER_DISTILL_BATCH=50 HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=120 \
-HUMAUX_PRIVATE_WORKER_DISTILL_JOB_BATCH=8 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 \
+HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 \
+HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 \
+HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120 \
 HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=3"
 CW_ENV="export CONSOLIDATION_WORKER_PG_DSN='postgres://role_consolidation_worker:devlocal_role_consolidation_worker@$PG/$DB' \
 HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS=120 \
@@ -1693,6 +1795,33 @@ for b in humaux-gateway humaux-retrieval-worker humaux-private-worker humaux-con
 done
 echo "soak warm-up: $(( $(date +%s) - W0 ))s for 5 binaries (XProtect first-exec assessment)" | tee -a $EV/rehearsal.log
 
+# ADR-0058 R11 — the harness is the operator during the soak. A DEAD distill (job line
+# `outcome=DEAD`) settles its Evidence's ticket FAILED `distill_failed`, which pins that stream's
+# §15.4 prefix for the rest of the run; the runbook's answer to a DEAD job is the audited
+# `--retire-failed distill_failed` (re-driving it with `jobs requeue-dead` needs the cause fixed
+# first, which a soak cannot do). Chain run 2 (2026-10-03): tenant B's ws stream was pinned at seq 20
+# by a DEAD from the pst step BEFORE the soak (no retirement ran after it), so `projection_promoted`
+# saw its prefix never move. So: retire once before the timed window, then every
+# SOAK_RETIRE_SECS while the soak runs. Only `distill_failed` — any other FAILED class is a
+# projection-path failure and stays for `projection_promoted` to grade; the distill death itself is
+# graded by `distill_dead`.
+soak_retire_distill_failed() {
+  local fam
+  for fam in "$TENANT $WS" "$TENANT_B $WS_B" "$TENANT_C $WS_C"; do set -- ${=fam}
+    "$BIN_DIR"/xtask projection-serve --tenant $1 --workspace $2 --domain $DOMAIN --projection-kind $PKIND --version $PVER --retire-failed distill_failed 2>&1 \
+      | grep -E '^projection-serve: (retired|retire-failed)' | sed "s|^|soak operator $1/$2: |" >> $EV/soak-operator.log
+  done
+}
+: > $EV/soak-operator.log
+soak_retire_distill_failed
+rm -f $S/soak_retire.stop
+( while [ ! -f $S/soak_retire.stop ]; do
+    i=0; while [ $i -lt ${SOAK_RETIRE_SECS:-60} ] && [ ! -f $S/soak_retire.stop ]; do sleep 1; i=$((i+1)); done
+    [ -f $S/soak_retire.stop ] || soak_retire_distill_failed
+  done ) &
+SOAK_RETIRE_PID=$!
+echo "soak operator: pre-soak retirement $(grep -c ': projection-serve: retired' $EV/soak-operator.log) retired line(s); every ${SOAK_RETIRE_SECS:-60}s during the soak (log soak-operator.log)" | tee -a $EV/rehearsal.log
+
 # resident derived workers for the soak window (both tenant-free, ADR-0036).
 # Same $DS_ENV / $CW_ENV the chaos restarts use — one definition, no drift.
 ( eval "$DS_ENV"
@@ -1723,6 +1852,8 @@ cargo run -q -p xtask -- soak \
   --max-op-failure-rate ${SOAK_MAX_OP_FAIL:-0.01} \
   --report $EV/soak-report.json 2>&1 | tee -a $EV/rehearsal.log
 SOAK_RC=${pipestatus[1]}   # zsh: the tee at the end of the pipe is NOT the verdict
+touch $S/soak_retire.stop; wait $SOAK_RETIRE_PID 2>/dev/null
+echo "soak operator: $(grep -c ': projection-serve: retired' $EV/soak-operator.log) retired line(s) in total: $(grep ': projection-serve: retired' $EV/soak-operator.log | tr '\n' ';')" | tee -a $EV/rehearsal.log
 # …the two resident workers go through the pidfiles: a chaos step may have restarted them, so
 # $SOAK_DS_PID / $SOAK_CW_PID can be stale, and a stale PID is exactly what must never be killed.
 own_signal $S/ds.pid humaux-private-worker TERM 30
@@ -1774,6 +1905,26 @@ fi
 # A rehearsal that skipped the soak must SAY so in its own verdict; silence is how "no soak ran
 # in this pass" ended up only in the report's §8.2 instead of in the evidence file.
 [ "${SOAK_RAN:-0}" = "1" ] || echo "NOTE: SOAK_SECS unset — acceptance item (5) NOT witnessed by this run" | tee -a $EV/rehearsal.log
+
+# ADR-0058 R11: every DEAD distill of the run, graded under its own name. Classes are the job's
+# `last_error_class` plus, for a refused reply, the parser/tool-shape reason the worker printed
+# (`distill evidence=<id> failed: InvalidInput (<reason>)`).
+DD_N=$(PGQ "select count(*) from ops.outbox where tenant_id in ($SEEDED) and event_type='EVIDENCE_ACCEPTED'")
+# `dead` is the database's own count(*): a PGQ that fails (docker exec, psql, fork EAGAIN) leaves it
+# empty and the assertion red. The row query below only labels the classes.
+DD_K=$(PGQ "select count(*) from ops.jobs where tenant_id in ($SEEDED) and job_type='DERIVED_DISTILL' and status='DEAD'")
+DD_ROWS=$(PGQ "select coalesce(payload->>'evidence_id','-')||' '||coalesce(last_error_class,'-') from ops.jobs where tenant_id in ($SEEDED) and job_type='DERIVED_DISTILL' and status='DEAD' order by created_at")
+DD_CLASSES=$(print -r -- "$DD_ROWS" | while read dd_ev dd_cls; do
+    [ -n "$dd_ev" ] || continue
+    dd_r=$(cat $EV/*.log 2>/dev/null | grep -oE "distill evidence=$dd_ev failed: InvalidInput \([a-z_]+\)" | tail -1 | sed -E 's/.*\(([a-z_]+)\)/\1/')
+    print -r -- "$dd_cls${dd_r:+/$dd_r}"
+  done | sort | uniq -c | awk '{printf "%s%s:%s", (NR>1?",":""), $2, $1}')
+# Bound, not zero: a live model's reply can be refused twice for one Evidence (measured: 0-2 per rehearsal,
+# ADR-0058 R11 amendment). The run is red above 1 % of its Evidence — the soak's own op-failure bound — and on
+# any count the database did not answer. Every death is still printed with its class.
+DD_MAX=$(( ${DD_N:-0} / 100 )) 2>/dev/null || DD_MAX=0
+case "$DD_N$DD_K" in ''|*[!0-9]*) DD_OK=0 ;; *) [ -n "$DD_N" ] && [ -n "$DD_K" ] && [ "$DD_K" -le "$DD_MAX" ] && DD_OK=1 || DD_OK=0 ;; esac
+assert_eq "distill_dead(n=$DD_N, dead=$DD_K, at_most=$DD_MAX = 1% of n, classes=${DD_CLASSES:--})" "$DD_OK" 1
 
 # ---------- 7. stop ----------
 step stop

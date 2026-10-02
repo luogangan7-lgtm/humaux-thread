@@ -3,16 +3,20 @@
 //!   [`affects_for_memories_in_txn`]) every reader shares — the PG hydrate re-check (`read_materialize`), the
 //!   projection worker's payload build, and `memory.get` / `memory.enumerate` / the recall rerank.
 //! Depends-on: crates=[humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time]; services=[PostgreSQL(any) r=[private.memory_evidence, private.memory_records] w=[private.evidence_affects, private.memory_affects]]; env=[]; modules=[adapters::confirm_token_repo, adapters::memory_governance_repo, adapters::postgres, adapters::remember, adapters::subject_repo, application::affect, domain::affect, domain::authority, domain::error, domain::identity, domain::subject, projection::stream]
-//! Called-by: [adapters::memory_governance_repo, adapters::projection_worker, adapters::read_materialize, adapters::remember, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, tests]
-//! Invariants: [affect rows are INSERT-only through insert_in_txn and never decayed on write; everything runs under
+//! Called-by: [adapters::distill_reasoner, adapters::memory_governance_repo, adapters::projection_worker, adapters::read_materialize, adapters::remember, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, private-worker::distill, tests]
+//! Invariants: [affect rows are INSERT-only through the one row issuer insert_rows (declared rows via insert_in_txn,
+//!   inferred DISTILL rows via insert_inferred_in_txn) and never decayed on write; the one read lets an EXPLICIT row
+//!   shadow every DISTILL row of its memory; everything runs under
 //!   the caller's role + RLS, so another tenant's memory is NOT_FOUND like an unknown id; a PG error propagates as
 //!   ErrorCode, no fallback; the annotate re-projection ticket lands on the memory's home stream (ADR-0057 D-M)]
-//! Spec: Baseline §60; ADR-0057
+//! Spec: Baseline §60; ADR-0057; ADR-0058
 //!
 //! Rows are immutable (0156 owner trigger; no UPDATE/DELETE grant): a write is INSERT-only through
-//! the ONE row issuer [`insert_in_txn`] (`memory.annotate_affect` on its own transaction,
-//! `memory.correct` inside `correct_atomically`, `remember.put` inside `remember_in_txn` onto the
-//! 0157 `evidence_affects` carrier) and, for a live memory, ends with one `MEMORY_LIFECYCLE` ticket on the memory's home stream (ADR-0057 D-M; the §60 issuers `remember`
+//! the ONE row issuer `insert_rows` — declared rows through [`insert_in_txn`]
+//! (`memory.annotate_affect` on its own transaction, `memory.correct` inside `correct_atomically`,
+//! `remember.put` inside `remember_in_txn` onto the 0157 `evidence_affects` carrier), inferred rows
+//! through [`insert_inferred_in_txn`] (the distill hop's write transaction, ADR-0058 D-P; that
+//! transaction's outbox DONE flip is the projection ticket) — and, for an annotated live memory, ends with one `MEMORY_LIFECYCLE` ticket on the memory's home stream (ADR-0057 D-M; the §60 issuers `remember`
 //! owns, verbatim — the same ticket `memory.supersede`/`restore`/`archive` issue) so the worker
 //! re-projects the SAME deterministic point with the fresh affect payload. Decay is never
 //! written: [`observed`] derives `effective_intensity(now)` from the raw row at read time.
@@ -24,8 +28,9 @@
 
 use humaux_application::affect::{ObservedAffect, effective_intensity_at};
 use humaux_domain::affect::{
-    AffectAnnotation, AffectFilter, AffectKind, AffectTargetScope, AffectTargetScopeKind,
-    BasisPointRange, BasisPoints, EmotionLabel, MoodHalfLife, MoodPoint,
+    AffectAnnotation, AffectFilter, AffectKind, AffectOrigin, AffectTargetScope,
+    AffectTargetScopeKind, BasisPointRange, BasisPoints, EmotionLabel,
+    INFERRED_CONFIDENCE_CEILING_BP, MoodHalfLife, MoodPoint,
 };
 use humaux_domain::authority::MemoryId;
 use humaux_domain::error::ErrorCode;
@@ -106,11 +111,20 @@ fn remember_error(error: RememberError) -> ErrorCode {
 /// The ONE read statement: every affect row of every memory in `$2`, one round trip whatever the
 /// candidate count (the card E1 speed goal; `tests/memory_affects.rs` pins it to one table scan).
 /// Ordered so a memory's annotations come back in write order.
+///
+/// ADR-0058 D-P (explicit remains authoritative): a memory's `DISTILL` (inferred) rows are dropped
+/// when that memory has any `EXPLICIT` row — decided by a window over the SAME single scan, so the
+/// recall filter, the mood rerank, `memory.get` and the projection payload all see one answer.
 pub const AFFECTS_FOR_MEMORIES_SQL: &str = "SELECT affect_id, memory_id, evidence_id, affect_kind, label, valence_bp, arousal_bp, \
             dominance_bp, intensity_bp, confidence_bp, target_subject_id, target_scope_kind, \
             target_scope_id, observed_at, half_life_seconds \
-     FROM private.memory_affects \
-     WHERE tenant_id = $1 AND memory_id = ANY($2) \
+     FROM (SELECT affect_id, memory_id, evidence_id, affect_kind, label, valence_bp, arousal_bp, \
+                  dominance_bp, intensity_bp, confidence_bp, target_subject_id, target_scope_kind, \
+                  target_scope_id, observed_at, half_life_seconds, created_at, origin, \
+                  bool_or(origin = 'EXPLICIT') OVER (PARTITION BY memory_id) AS has_explicit \
+           FROM private.memory_affects \
+           WHERE tenant_id = $1 AND memory_id = ANY($2)) a \
+     WHERE a.origin = 'EXPLICIT' OR NOT a.has_explicit \
      ORDER BY memory_id, created_at, affect_id";
 
 fn decode_error(what: &str) -> sqlx::Error {
@@ -264,10 +278,11 @@ pub async fn resolve_targets_in_txn(
     Ok(targets)
 }
 
-/// The ONE row issuer onto `memory_affects` / `evidence_affects`: `targets` come from
+/// The declared-affect entry onto `memory_affects` / `evidence_affects`: `targets` come from
 /// [`resolve_targets_in_txn`] (same length, same order); `mood_half_life` is the frozen policy
 /// stamped onto every MOOD row (`None` with a MOOD input ⇒ `DEPENDENCY_UNAVAILABLE`: the
-/// deployment has not declared the policy). INSERT-only; nothing here commits.
+/// deployment has not declared the policy). Rows are [`AffectOrigin::Explicit`]. INSERT-only;
+/// nothing here commits.
 pub async fn insert_in_txn(
     txn: &mut Txn<'_>,
     tenant_id: Uuid,
@@ -277,6 +292,76 @@ pub async fn insert_in_txn(
     targets: &[Option<Uuid>],
     mood_half_life: Option<MoodHalfLife>,
 ) -> Result<Vec<Uuid>, ErrorCode> {
+    insert_rows(
+        txn,
+        tenant_id,
+        parent,
+        evidence_id,
+        inputs,
+        targets,
+        mood_half_life,
+        AffectOrigin::Explicit,
+    )
+    .await
+}
+
+/// ADR-0058 D-P: the distill hop's inferred affects of ONE memory it just inserted, in the hop's
+/// write transaction. Only an untargeted `EMOTION` (event-bound, no half-life) whose confidence is
+/// at most [`INFERRED_CONFIDENCE_CEILING_BP`] is accepted — anything else is `INVALID_INPUT`, never
+/// clamped (the parser already refused it; the store CHECK refuses it a third time). Rows are
+/// [`AffectOrigin::Distill`].
+pub async fn insert_inferred_in_txn(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    memory_id: Uuid,
+    evidence_id: Uuid,
+    inferred: &[AffectAnnotation],
+) -> Result<Vec<Uuid>, ErrorCode> {
+    let mut inputs = Vec::with_capacity(inferred.len());
+    for annotation in inferred {
+        if annotation.kind != AffectKind::Emotion
+            || annotation.target_subject.is_some()
+            || annotation.target_scope.is_some()
+            || annotation.confidence.get() > INFERRED_CONFIDENCE_CEILING_BP
+        {
+            return Err(ErrorCode::InvalidInput);
+        }
+        inputs.push(AffectInput {
+            annotation: annotation.clone(),
+            observed_at: None,
+            target_subject_key: None,
+        });
+    }
+    insert_rows(
+        txn,
+        tenant_id,
+        AffectParent::Memory(memory_id),
+        evidence_id,
+        &inputs,
+        &vec![None; inputs.len()],
+        None,
+        AffectOrigin::Distill,
+    )
+    .await
+}
+
+/// The ONE row issuer onto `memory_affects` / `evidence_affects` behind [`insert_in_txn`] and
+/// [`insert_inferred_in_txn`]. `evidence_affects` has no origin column: an Evidence-carried affect
+/// is declared by construction, so a non-EXPLICIT row on that arm inserts nothing and fails.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the row issuer's inputs are exactly the row's parents, its values and its origin"
+)]
+async fn insert_rows(
+    txn: &mut Txn<'_>,
+    tenant_id: Uuid,
+    parent: AffectParent,
+    evidence_id: Uuid,
+    inputs: &[AffectInput],
+    targets: &[Option<Uuid>],
+    mood_half_life: Option<MoodHalfLife>,
+    origin: AffectOrigin,
+) -> Result<Vec<Uuid>, ErrorCode> {
     if inputs.len() != targets.len() {
         return Err(ErrorCode::Internal);
     }
@@ -285,8 +370,8 @@ pub async fn insert_in_txn(
             "INSERT INTO private.memory_affects \
                (tenant_id, memory_id, affect_kind, label, valence_bp, arousal_bp, dominance_bp, \
                 intensity_bp, confidence_bp, evidence_id, target_subject_id, target_scope_kind, \
-                target_scope_id, observed_at, half_life_seconds) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, coalesce($14, now()), $15) \
+                target_scope_id, observed_at, half_life_seconds, origin) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, coalesce($14, now()), $15, $16) \
              RETURNING affect_id"
         }
         AffectParent::Evidence => {
@@ -295,7 +380,7 @@ pub async fn insert_in_txn(
                 intensity_bp, confidence_bp, evidence_id, target_subject_id, target_scope_kind, \
                 target_scope_id, observed_at, half_life_seconds) \
              SELECT $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, coalesce($14, now()), $15 \
-             WHERE $2::uuid IS NULL /* no memory yet: same 15 binds as the memory arm */ \
+             WHERE $2::uuid IS NULL AND $16::text = 'EXPLICIT' /* no memory yet: same 16 binds as the memory arm */ \
              RETURNING affect_id"
         }
     };
@@ -334,6 +419,7 @@ pub async fn insert_in_txn(
             .bind(a.target_scope.map(|s| s.id))
             .bind(input.observed_at)
             .bind(half_life_seconds)
+            .bind(origin.as_str())
             .fetch_one(&mut **txn)
             .await
             .map_err(db_error)?;

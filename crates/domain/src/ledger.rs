@@ -1,6 +1,6 @@
 //! `domain::ledger` — §23.1② / §22.5 的 **A1 恒等式唯一实现处**。
 //! Depends-on: crates=[]; services=[]; env=[]; modules=[]
-//! Called-by: [adapters::consolidation_reasoner, adapters::distill_reasoner, adapters::model_call_ledger, projection::stream, retrieval-provider::adapters, retrieval::completeness, tests]
+//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::model_call_ledger, projection::stream, retrieval-provider::adapters, retrieval::completeness, tests]
 //! Invariants: []
 //! Spec: Baseline §22.5; §15.4; §78.3
 //!

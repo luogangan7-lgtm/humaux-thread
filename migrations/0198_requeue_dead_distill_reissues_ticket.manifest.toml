@@ -1,0 +1,38 @@
+# §46.1 migration manifest. Card 32 / ADR-0058 D-U amendment (review P0 on ruling R4):
+# ops.requeue_dead_distill also issues a successor projection ticket (MEMORY_LIFECYCLE carrier on
+# the remember ticket's own stream) when the Evidence's remember ticket is FAILED / RETIRED_FAILED /
+# LOST. CREATE OR REPLACE of 0197's function: same signature, owner, SECURITY DEFINER, pinned
+# search_path and grants. §46 forward-fix (EXPAND_CONTRACT, first free after 0197).
+
+migration_id = "0198_requeue_dead_distill_reissues_ticket"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select coalesce(bool_and(position('MEMORY_LIFECYCLE' in p.prosrc) = 0), false)
+ and count(*) = 1 as precheck_ok
+from pg_proc p
+where p.oid = to_regprocedure('ops.requeue_dead_distill(uuid,uuid,text)')
+"""
+
+postcheck = """
+select coalesce(bool_and(
+   position('MEMORY_LIFECYCLE' in p.prosrc) > 0
+   and pg_get_userbyid(p.proowner)='role_migration_owner' and p.prosecdef
+   and 'search_path=pg_catalog'=any(coalesce(p.proconfig,'{}'))
+   and has_function_privilege('role_maintenance',p.oid,'EXECUTE')
+   and not has_function_privilege('role_gateway',p.oid,'EXECUTE')
+   and not has_function_privilege('role_retrieval_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_private_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_consolidation_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_public_worker',p.oid,'EXECUTE')
+   and not has_function_privilege('role_batch_issuer',p.oid,'EXECUTE')
+   and not has_function_privilege('role_admin',p.oid,'EXECUTE')
+   and not exists (select 1 from aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) x
+                    where x.grantee=0 and x.privilege_type='EXECUTE')),false)
+ and count(*)=1 as postcheck_ok
+from pg_proc p
+where p.oid = to_regprocedure('ops.requeue_dead_distill(uuid,uuid,text)')
+"""
+
+rollback_or_forward_fix = "Re-run 0197's CREATE body as CREATE OR REPLACE (restores the re-drive without the successor ticket). Successor tickets already issued stay valid stream rows and settle normally."
+backup_restore_requirement = "none: replaces one function body; no row data is changed."

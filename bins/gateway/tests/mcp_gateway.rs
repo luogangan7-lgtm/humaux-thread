@@ -14017,3 +14017,210 @@ fn native_mcp_workspace_membership_scope() {
         });
     });
 }
+
+// ===========================================================================================
+// ADR-0058 R8 (b): U+0000 is refused at ingress
+// ===========================================================================================
+
+/// One MCP call driven to its end: a `confirmation_required` answer is confirmed once with its
+/// own token. Returns the wire code the caller finally saw (`OK` for a success result).
+async fn nul_call_outcome(
+    address: SocketAddr,
+    bearer: &str,
+    request_id: u64,
+    tool: &str,
+    mut arguments: Value,
+) -> String {
+    let mut request_id = request_id;
+    loop {
+        let (status, response) = raw_request(
+            address,
+            &tool_call_headers(tool, bearer),
+            &rpc(
+                request_id,
+                "tools/call",
+                call_params(tool, arguments.clone()),
+            ),
+        )
+        .await;
+        let structured = &response["result"]["structuredContent"];
+        if status != 200 {
+            return response["error"]["data"]["code"]
+                .as_str()
+                .map_or_else(|| format!("HTTP_{status}"), str::to_owned);
+        }
+        if response["result"]["isError"] == true {
+            return structured["code"]
+                .as_str()
+                .unwrap_or("TOOL_ERROR")
+                .to_owned();
+        }
+        match structured["confirm_token"].as_str() {
+            Some(token) if arguments.get("confirm_token").is_none() => {
+                arguments["confirm_token"] = Value::String(token.to_owned());
+                request_id += 1000;
+            }
+            _ => return "OK".to_owned(),
+        }
+    }
+}
+
+/// Every caller-owned row a refused write must leave untouched, for one tenant.
+fn nul_ingress_rows(handle: &mut Handle) -> Vec<i64> {
+    let row: Row = handle
+        .admin
+        .query_one(
+            "SELECT \
+               (SELECT count(*) FROM private.evidence_objects WHERE tenant_id=$1), \
+               (SELECT count(*) FROM ops.outbox WHERE tenant_id=$1), \
+               (SELECT count(*) FROM control.operation_receipts WHERE tenant_id=$1), \
+               (SELECT count(*) FROM control.usage_reservations WHERE tenant_id=$1), \
+               (SELECT count(*) FROM control.confirm_tokens WHERE tenant_id=$1), \
+               (SELECT count(*) FROM private.subjects WHERE tenant_id=$1), \
+               (SELECT count(*) FROM private.subject_keys WHERE tenant_id=$1), \
+               (SELECT count(*) FROM private.memory_affects WHERE tenant_id=$1), \
+               (SELECT count(*) FROM private.memory_records WHERE tenant_id=$1)",
+            &[&handle.tenant_id],
+        )
+        .expect("owner reads the tenant's rows");
+    (0..9).map(|i| row.get(i)).collect()
+}
+
+/// ADR-0058 R8 (b): every gateway write that stores caller text refuses a string carrying
+/// U+0000 with INVALID_INPUT at validation, before any transaction: no Evidence, receipt,
+/// reservation, confirm token, subject, key, affect or memory row. Each operation's outcome is
+/// printed (`R8b <operation> -> <code>`) — the red is today's behaviour per operation. Fault:
+/// drop the NUL check from the shared validation step.
+#[test]
+#[allow(clippy::too_many_lines)] // one fixture, one row per write operation that stores caller text
+fn every_text_storing_write_refuses_u0000_at_ingress() {
+    let _metrics = CONTEXT_METRIC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_db_fixture::<Fixture, _>("native_mcp_nul_ingress", |mut handle| {
+        handle.assert_gateway_login();
+        let prefix = format!("mcnu{}", &Uuid::now_v7().simple().to_string()[..12]);
+        let wire = format!("{prefix}.{}", "n".repeat(32));
+        let credential = handle.seed_synthetic_service_credential_and_window(
+            SyntheticCredentialScopes::RememberWriteAndContextRead,
+            &prefix,
+            &wire,
+            &compute_api_key_hash(SYNTHETIC_CREDENTIAL_PEPPER, &wire),
+            96,
+        );
+        let workspace = handle.workspace_id;
+        let record = handle.seed_workspace_visible_context_record();
+        let body = json!({ "title": "Renewal", "key_claim": "renews in Q4" });
+        let (candidate_id, candidate_sha) = tokio::task::block_in_place(|| {
+            seed_pending_candidate(
+                &mut handle,
+                record.evidence_id,
+                "ProjectDecision",
+                "DECISION",
+                &body,
+            )
+        });
+        let runtime_handle = handle.rt.handle().clone();
+        let runtime = runtime_handle
+            .block_on(handle.fresh_runtime())
+            .expect("nul ingress runtime");
+        let app = application(&handle, runtime);
+        runtime_handle.block_on(async {
+            let (address, server) = start(app).await;
+            let bearer = credential.bearer.as_str();
+            let person = register_subject(address, bearer, 1, "PERSON", "Ada Lovelace", &[]).await;
+            let nul = "before\u{0}after";
+            let nul_key = json!([{ "kind": "CRM", "value": nul }]);
+            let cases: Vec<(&str, &str, Value)> = vec![
+                (
+                    "remember.put",
+                    "remember",
+                    json!({
+                        "operation": "put",
+                        "content": nul,
+                        "idempotency_key": format!("r8b-{}", Uuid::now_v7()),
+                        "workspace_id": workspace,
+                    }),
+                ),
+                (
+                    "remember.put (subject_keys)",
+                    "remember",
+                    json!({
+                        "operation": "put",
+                        "content": "clean text",
+                        "idempotency_key": format!("r8b-{}", Uuid::now_v7()),
+                        "workspace_id": workspace,
+                        "subject_keys": nul_key,
+                    }),
+                ),
+                (
+                    "memory.correct",
+                    "memory",
+                    json!({ "action": "correct", "memory_id": record.memory_id, "text": nul }),
+                ),
+                (
+                    "memory.confirm (subject_keys)",
+                    "memory",
+                    json!({
+                        "action": "confirm",
+                        "candidate_id": candidate_id,
+                        "candidate_sha256": candidate_sha,
+                        "subject_keys": nul_key,
+                    }),
+                ),
+                (
+                    "memory.subject_register",
+                    "memory",
+                    json!({
+                        "action": "subject_register",
+                        "kind": "PERSON",
+                        "display_name": nul,
+                        "roles": [],
+                    }),
+                ),
+                (
+                    "memory.subject_link_key",
+                    "memory",
+                    json!({
+                        "action": "subject_link_key",
+                        "subject_id": person,
+                        "kind": "CRM",
+                        "value": nul,
+                    }),
+                ),
+                (
+                    "memory.annotate_affect",
+                    "memory",
+                    json!({
+                        "action": "annotate_affect",
+                        "memory_id": record.memory_id,
+                        "affects": [{
+                            "kind": "EMOTION", "label": "JOY", "valence": 5000,
+                            "intensity": 5000, "confidence": 9000,
+                            "target_subject_key": { "kind": "CRM", "value": nul },
+                        }],
+                    }),
+                ),
+            ];
+            let mut outcomes = Vec::new();
+            for (request_id, (operation, tool, arguments)) in (10_u64..).zip(cases) {
+                let before = tokio::task::block_in_place(|| nul_ingress_rows(&mut handle));
+                let outcome = nul_call_outcome(address, bearer, request_id, tool, arguments).await;
+                let after = tokio::task::block_in_place(|| nul_ingress_rows(&mut handle));
+                println!(
+                    "R8b {operation} -> {outcome} rows_changed={}",
+                    before != after
+                );
+                outcomes.push((operation, outcome, before == after));
+            }
+            stop_server(server).await.expect("stop nul ingress server");
+            for (operation, outcome, unchanged) in &outcomes {
+                assert_eq!(
+                    (outcome.as_str(), *unchanged),
+                    ("INVALID_INPUT", true),
+                    "{operation}: every outcome {outcomes:?}"
+                );
+            }
+        });
+    });
+}

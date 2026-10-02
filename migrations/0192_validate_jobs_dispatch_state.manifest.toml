@@ -1,0 +1,27 @@
+# §46.1 migration manifest. Card 32 / ADR-0058 D-A: VALIDATE the NOT VALID dispatch-state CHECK 0190
+# added to ops.jobs. No schema change, no grant change, no DML. §46 forward-fix (FORWARD_ONLY, 0184
+# precedent).
+
+migration_id = "0192_validate_jobs_dispatch_state"
+class = "FORWARD_ONLY"
+
+precheck = """
+select exists (select 1 from pg_constraint
+                where conrelid = 'ops.jobs'::regclass and conname = 'jobs_dispatch_state_check'
+                  and not convalidated)
+ -- no row violates the exact negation of the CHECK: dispositioned by a human, never here
+ and not exists (select 1 from ops.jobs
+                  where not (dispatch_state is null
+                             or (status = 'PROCESSING' and job_type = 'DERIVED_DISTILL'
+                                 and dispatch_state in ('CLAIMED', 'DISPATCH_INTENT', 'EXECUTION_UNCERTAIN'))))
+ as precheck_ok
+"""
+
+postcheck = """
+select exists (select 1 from pg_constraint
+                where conrelid = 'ops.jobs'::regclass and conname = 'jobs_dispatch_state_check'
+                  and convalidated) as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. VALIDATE CONSTRAINT changes no schema and no rows; the CHECK stays exactly as 0190 defined it. A violating row found later is dispositioned by a human in a new migration."
+backup_restore_requirement = "none: a validation scan, no row data touched."

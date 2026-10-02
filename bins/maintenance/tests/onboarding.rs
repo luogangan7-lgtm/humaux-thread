@@ -3,8 +3,9 @@
 //! Depends-on: crates=[humaux-protocol, humaux-testkit, postgres, serde_json, uuid]; services=[PostgreSQL(owner)
 //!   r=[control.api_keys, control.audit_events, control.entitlement_snapshots, control.memberships,
 //!   control.private_reasoning_domains, control.quota_windows, control.retrieval_provider_admission_limits,
-//!   control.tenants, control.user_emails, control.users, control.workspace_memberships, projection.family_activations,
-//!   projection.tenant_placements] w=[control.workspaces, projection.stream_checkpoints, projection.stream_log]
+//!   control.tenants, control.user_emails, control.users, control.workspace_memberships, ops.commit_seq_seq,
+//!   projection.family_activations, projection.tenant_placements] w=[control.workspaces, ops.jobs, ops.outbox,
+//!   private.evidence_objects, projection.stream_checkpoints, projection.stream_log]
 //!   x=[control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant,
 //!   control.onboard_workspace, control.revoke_api_key, projection.activate_empty_family,
 //!   projection.ensure_tenant_placement], PostgreSQL(role_gateway), PostgreSQL(role_maintenance), Qdrant(*),
@@ -16,7 +17,7 @@
 //! Called-by: [cargo-test]
 //! Invariants: [each test owns its throwaway database humaux_thread_c28_mtest_<pid>_<n> and Qdrant collection
 //!   humaux_c28_mtest_<pid>_<n>, both removed by the fixture's Drop even on panic; missing env -> §79.2 skip_or_fail]
-//! Spec: Baseline §4.2; §6.2.2; §16.3; §73.5; §77; §79.2; ADR-0053
+//! Spec: Baseline §4.2; §6.2.2; §16.3; §73.5; §77; §79.2; ADR-0053; ADR-0058
 //!
 //! Every test runs the release-shaped binary (`CARGO_BIN_EXE_humaux-maintenance`) against its own
 //! throwaway database `humaux_thread_c28_mtest_<pid>_<n>` (created from the migration files here,
@@ -1176,4 +1177,220 @@ fn cli_refuses_missing_flags_without_defaults() {
     let out = run(&["frobnicate"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(stdout(&out).is_empty());
+}
+
+/// One accepted Evidence of `tenant` in its `default` reasoning domain, settled DEAD with `class`
+/// the way a DEAD distill settle leaves it (job DEAD, outbox FAILED). Returns the job id.
+fn dead_distill_job(f: &mut Fixture, tenant: Uuid, class: &str) -> Uuid {
+    let mut txn = f.db().transaction().expect("txn");
+    let evidence: Uuid = txn
+        .query_one(
+            "INSERT INTO private.evidence_objects \
+               (tenant_id, evidence_kind, payload_sha256, data_class, origin_class, \
+                visibility_class, reasoning_domain_id) \
+             SELECT $1, 'EVENT', sha256(convert_to(gen_random_uuid()::text, 'UTF8')), \
+                    'INTERNAL', 'DirectUserInput', 'TENANT_SHARED', d.reasoning_domain_id \
+             FROM control.private_reasoning_domains d WHERE d.tenant_id = $1 \
+             RETURNING evidence_id",
+            &[&tenant],
+        )
+        .expect("evidence")
+        .get(0);
+    // The 0164 enqueue trigger writes the DERIVED_DISTILL job for the outbox row.
+    txn.execute(
+        "INSERT INTO ops.outbox (tenant_id, commit_seq, stream_seq, event_type, evidence_id) \
+         VALUES ($1, nextval('ops.commit_seq_seq'), 1, 'EVIDENCE_ACCEPTED', $2)",
+        &[&tenant, &evidence],
+    )
+    .expect("outbox");
+    txn.execute(
+        "UPDATE ops.outbox SET status = 'FAILED', processed_at = now() WHERE evidence_id = $1",
+        &[&evidence],
+    )
+    .expect("outbox FAILED");
+    let job: Uuid = txn
+        .query_one(
+            "UPDATE ops.jobs SET status = 'DEAD', attempt = 3, last_error_class = $2 \
+             WHERE job_type = 'DERIVED_DISTILL' AND payload ->> 'evidence_id' = $1::uuid::text \
+             RETURNING job_id",
+            &[&evidence, &class],
+        )
+        .expect("job DEAD")
+        .get(0);
+    txn.commit().expect("commit");
+    job
+}
+
+/// ADR-0058 R4 through the binary: `jobs requeue-dead` takes exactly one of `--job` /
+/// `--error-class` (usage otherwise), prints what it re-armed, re-arms by exact class only, and
+/// refuses a re-run (exit 3, `job_not_dead`) with its DENIED audit row. Fault: the CLI accepts
+/// both flags (takes `--job`) ⇒ the usage step exits 0 (red).
+#[test]
+fn jobs_requeue_dead_prints_what_it_rearmed_and_refuses_a_rerun() {
+    let Some(mut f) = fixture("jobs_requeue_dead_prints_what_it_rearmed_and_refuses_a_rerun")
+    else {
+        return;
+    };
+    let (tenant, _, _) = f.provisioning_tenant("c32-r4-cli");
+    let j1 = dead_distill_job(&mut f, tenant, "RETRY_WAIT");
+    let j2 = dead_distill_job(&mut f, tenant, "RETRY_WAIT");
+    let j3 = dead_distill_job(&mut f, tenant, "FAILED_OUTPUT_SCHEMA");
+    let (t, j1s) = (tenant.to_string(), j1.to_string());
+    let requeue = |extra: &[&str]| {
+        let mut args = vec!["jobs", "requeue-dead", "--tenant", t.as_str()];
+        args.extend(extra);
+        f.run_admin(&args)
+    };
+
+    let out = requeue(&["--job", &j1s, "--error-class", "RETRY_WAIT"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "both selectors: {}",
+        stdout(&out)
+    );
+    let out = requeue(&[]);
+    assert_eq!(out.status.code(), Some(2), "no selector: {}", stdout(&out));
+
+    let out = requeue(&["--job", &j1s]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let r = receipt(&out);
+    assert_eq!(r["outcome"], "requeued");
+    assert_eq!(r["requeued"].as_array().map(Vec::len), Some(1), "{r}");
+    assert_eq!(uuid_of(&r["requeued"][0], "job_id"), j1);
+    assert_eq!(r["requeued"][0]["last_error_class"], "RETRY_WAIT");
+    assert_eq!(r["requeued"][0]["attempt_spent"], 3);
+
+    let out = requeue(&["--job", &j1s]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert_eq!(receipt(&out)["reason"], "job_not_dead");
+
+    let out = requeue(&["--error-class", "RETRY_WAIT"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let r = receipt(&out);
+    let ids: Vec<Uuid> = r["requeued"]
+        .as_array()
+        .expect("requeued")
+        .iter()
+        .map(|j| uuid_of(j, "job_id"))
+        .collect();
+    assert_eq!(ids, vec![j2], "exact class only, DEAD only");
+
+    let states: Vec<(Uuid, String, i32, Option<String>)> = f
+        .db()
+        .query(
+            "SELECT job_id, status, attempt, last_error_class FROM ops.jobs \
+             WHERE job_id = ANY($1) ORDER BY created_at",
+            &[&vec![j1, j2, j3]],
+        )
+        .expect("jobs")
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    assert_eq!(
+        states,
+        vec![
+            (j1, "PENDING".into(), 0, Some("RETRY_WAIT".into())),
+            (j2, "PENDING".into(), 0, Some("RETRY_WAIT".into())),
+            (j3, "DEAD".into(), 3, Some("FAILED_OUTPUT_SCHEMA".into())),
+        ]
+    );
+    assert_eq!(
+        f.count(
+            "SELECT count(*) FROM ops.outbox o JOIN ops.jobs j \
+               ON j.payload ->> 'evidence_id' = o.evidence_id::text \
+             WHERE j.status = 'PENDING' AND o.status = 'PENDING'"
+        ),
+        2,
+        "each re-armed job's outbox row is open again"
+    );
+    assert_eq!(
+        f.count(
+            "SELECT count(*) FROM control.audit_events WHERE action = 'DISTILL_REQUEUE_DEAD' \
+             AND result = 'SUCCESS'"
+        ),
+        2
+    );
+    assert_eq!(
+        f.count(
+            "SELECT count(*) FROM control.audit_events WHERE action = 'DISTILL_REQUEUE_DEAD' \
+             AND result = 'DENIED'"
+        ),
+        1
+    );
+}
+
+/// ADR-0058 ruling 2026-10-02 20:30 (migration 0200) through the binary: class mode prints, in its
+/// receipt, every matching DEAD job it skipped with the reason, and the SUCCESS audit row carries
+/// the same list; a class whose every match is skipped still exits 0 (`nothing_requeued`). Fault:
+/// the adapter leaves `skipped` out of the audit metadata ⇒ red.
+#[test]
+fn jobs_requeue_dead_prints_and_audits_the_dead_jobs_it_skipped() {
+    let Some(mut f) = fixture("jobs_requeue_dead_prints_and_audits_the_dead_jobs_it_skipped")
+    else {
+        return;
+    };
+    let (tenant, _, _) = f.provisioning_tenant("c32-r4-skip");
+    let live = dead_distill_job(&mut f, tenant, "FAILED_OUTPUT_SCHEMA");
+    let gone = dead_distill_job(&mut f, tenant, "FAILED_OUTPUT_SCHEMA");
+    let settled = dead_distill_job(&mut f, tenant, "FAILED_OUTPUT_SCHEMA");
+    f.db()
+        .batch_execute(&format!(
+            "DELETE FROM ops.outbox o USING ops.jobs j \
+               WHERE j.job_id = '{gone}' AND o.evidence_id::text = j.payload ->> 'evidence_id'; \
+             UPDATE ops.outbox o SET status = 'DONE' FROM ops.jobs j \
+               WHERE j.job_id = '{settled}' AND o.evidence_id::text = j.payload ->> 'evidence_id'"
+        ))
+        .expect("one Evidence gone, one settled");
+    let t = tenant.to_string();
+    let requeue = |f: &Fixture| {
+        f.run_admin(&[
+            "jobs",
+            "requeue-dead",
+            "--tenant",
+            t.as_str(),
+            "--error-class",
+            "FAILED_OUTPUT_SCHEMA",
+        ])
+    };
+
+    let out = requeue(&f);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let r = receipt(&out);
+    assert_eq!(r["outcome"], "requeued", "{r}");
+    assert_eq!(uuid_of(&r["requeued"][0], "job_id"), live, "{r}");
+    let skipped: Vec<(Uuid, String)> = r["skipped"]
+        .as_array()
+        .expect("skipped")
+        .iter()
+        .map(|j| {
+            (
+                uuid_of(j, "job_id"),
+                j["reason"].as_str().unwrap_or("-").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        skipped,
+        vec![
+            (gone, "evidence_gone".to_owned()),
+            (settled, "outbox_settled".to_owned())
+        ],
+        "{r}"
+    );
+    let audited: Value = f
+        .db()
+        .query_one(
+            "SELECT metadata FROM control.audit_events WHERE audit_event_id = $1::text::uuid",
+            &[&r["audit_event_id"].as_str().expect("audit_event_id")],
+        )
+        .expect("audit row")
+        .get(0);
+    assert_eq!(audited["skipped"], r["skipped"], "{audited}");
+
+    let out = requeue(&f);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let r = receipt(&out);
+    assert_eq!(r["outcome"], "nothing_requeued", "{r}");
+    assert_eq!(r["skipped"].as_array().map(Vec::len), Some(2), "{r}");
 }

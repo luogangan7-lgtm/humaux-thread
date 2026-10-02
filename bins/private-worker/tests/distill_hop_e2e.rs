@@ -1,31 +1,36 @@
 //! `private-worker::tests::distill_hop_e2e` — ADR-0016 Distill hop — accepted Evidence → 0..N
-//!   `private.memory_records` by the private worker itself (`humaux_private_worker::distill::run_once`, the
-//!   `--distill-once` code path), then the remember-time `projection.stream_log` ticket resolved by the real
-//!   `humaux_adapters::projection_worker::run_once`.
-//! Depends-on: crates=[async-trait, hex, humaux-adapters, humaux-domain, humaux-infra-cell, humaux-local-secret-scan,
+//!   `private.memory_records` by the private worker itself (`humaux_private_worker::distill::dispatch_pass`, the
+//!   `--distill-once` code path, ADR-0058 slots + generation fence), then the remember-time `projection.stream_log`
+//!   ticket resolved by the real `humaux_adapters::projection_worker::run_once`.
+//! Depends-on: crates=[async-trait, hex, humaux-adapters, humaux-application, humaux-domain, humaux-infra-cell, humaux-local-secret-scan,
 //!   humaux-projection, humaux-testkit, postgres, serde_json, sha2, tokio, uuid]; services=[PostgreSQL(role_gateway)
-//!   r=[control.current_reasoning_route_binding, ops.commit_seq_seq, ops.data_disclosure_sources,
+//!   r=[control.current_reasoning_route_binding, ops.claim_derived_work_v2, ops.commit_seq_seq, ops.data_disclosure_sources,
 //!   ops.data_disclosures, ops.model_call_ledger, ops.private_inference_rpc_calls, private.distill_candidates,
-//!   private.memory_records, private.memory_subject_mentions, private.memory_subjects, private.processing_runs]
+//!   private.memory_affects, private.memory_records, private.memory_subject_mentions, private.memory_subjects, private.processing_runs]
 //!   w=[control.credentials, control.memberships, control.private_reasoning_domains, control.processor_models,
 //!   control.provider_accounts, control.provider_endpoints, control.reasoning_credential_bindings,
 //!   control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates,
 //!   control.reasoning_route_policies, control.tenants, control.users, control.workspace_memberships,
 //!   control.workspaces, ops.outbox, ops.reasoning_account_health_observations,
-//!   ops.reasoning_provider_health_observations, private.events, private.evidence_objects, private.evidence_subjects,
+//!   ops.reasoning_provider_health_observations, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects,
 //!   private.memory_evidence, private.subject_keys, private.subjects, projection.stream_checkpoints,
-//!   projection.stream_log] x=[control.current_reasoning_route_binding], PostgreSQL(role_private_worker),
+//!   projection.stream_log, ops.jobs, ops.provider_slots] x=[control.current_reasoning_route_binding,
+//!   ops.claim_derived_work_v2], PostgreSQL(role_private_worker), PostgreSQL(owner), PostgreSQL(role_maintenance),
 //!   PostgreSQL(role_retrieval_worker), MiniMax, subprocess(gitleaks)]; env=[HUMAUX_MINIMAX_DNS_PINS,
 //!   HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY];
-//!   modules=[adapters::byok, adapters::byok::ssrf, adapters::contribution_reasoner, adapters::disclosure,
-//!   adapters::distill_reasoner, adapters::postgres, adapters::projection_worker, adapters::qdrant,
-//!   domain::authority, domain::egress, domain::error, domain::evidence, domain::ids, domain::ticket_family,
-//!   humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
-//!   private-worker::distill, projection::fingerprint, projection::serving]
+//!   modules=[adapters::affect_repo, adapters::byok, adapters::byok::ssrf, adapters::contribution_reasoner, adapters::disclosure,
+//!   adapters::distill_reasoner, adapters::membership_repo, adapters::postgres, adapters::projection_worker,
+//!   adapters::provisioning, adapters::qdrant,
+//!   adapters::distill_repo, adapters::jobs, application::affect, domain::affect, domain::authority, domain::egress,
+//!   domain::error, domain::evidence, domain::identity, domain::ids, domain::ticket_family, humaux-local-secret-scan, humaux-testkit, infra-cell::permit,
+//!   infra-cell::resource, infra-cell::transport, private-worker::distill,
+//!   private-worker::tests::support::dispatch_fence, private-worker::tests::support::live_minimax, projection::fingerprint, projection::serving]
 //! Called-by: [cargo-test]
-//! Invariants: [no MINIMAX_API_KEY -> SKIP for the live test only; no DB (or not migrated to 0147) -> SKIP for all;
-//!   HUMAUX_REQUIRE_MINIMAX/HUMAUX_REQUIRE_DB make either a panic via skip_or_fail]
-//! Spec: ADR-0005
+//! Invariants: [no MINIMAX_API_KEY -> SKIP for the live test only; no DB (or not migrated to 0190) -> SKIP for all;
+//!   HUMAUX_REQUIRE_MINIMAX/HUMAUX_REQUIRE_DB make either a panic via skip_or_fail; tests run one at a time and
+//!   foreign scheduler rows are fenced, so the cross-tenant claim only serves the fixture tenant; cleanup deletes
+//!   jobs, slots and data in one printed batch and the tenant row in a separate best-effort batch]
+//! Spec: ADR-0005; ADR-0058
 //!
 //! Four states, mirroring `bins/consolidation-worker/tests/consolidation_hop_e2e.rs`:
 //! 1. `MINIMAX_API_KEY` missing (env + `.env` fallback) ⇒ visible SKIP for D1 only (D2–D6 use a
@@ -42,35 +47,45 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use humaux_adapters::affect_repo;
 use humaux_adapters::byok::{
-    CredentialDecryptor, CredentialRef, EgressHttpTransport, OpenAiCompatibleProvider,
-    PlaintextApiKey, PrivateInferenceContext, ReasoningCapability, ReasoningProviderDescriptor,
-    ReasoningProviderError, StructuredReasoningRequest, StructuredReasoningResponse, TokenUsage,
-    UserReasoningProvider, VisionReasoningRequest, VisionReasoningResponse, ssrf,
+    OpenAiCompatTransport, OpenAiCompatibleProvider, OpenAiHttpOutcome, OpenAiHttpRequest,
+    PrivateInferenceContext, ReasoningProviderDescriptor, ReasoningProviderError,
+    StructuredReasoningRequest, StructuredReasoningResponse, TokenUsage, UserReasoningProvider,
+    VisionReasoningRequest, VisionReasoningResponse, ssrf,
 };
 use humaux_adapters::contribution_reasoner::ContributionReasonerConfig;
 use humaux_adapters::disclosure::DeletionCapability;
 use humaux_adapters::distill_reasoner::{DISTILL_PARSER_VERSION, distill_prompt_contract};
-use humaux_adapters::postgres::{PrivateWorkerDbPool, RetrievalWorkerDbPool};
+use humaux_adapters::distill_repo;
+use humaux_adapters::jobs::{self, DistillLease};
+use humaux_adapters::membership_repo::AdminAction;
+use humaux_adapters::postgres::RuntimeDbPool;
+use humaux_adapters::postgres::{MaintenanceDbPool, PrivateWorkerDbPool, RetrievalWorkerDbPool};
 use humaux_adapters::projection_worker::{CardEmbedder, ProjectionWorkerDeps, RunOnceOutcome};
+use humaux_adapters::provisioning::{self, RequeueTarget};
 use humaux_adapters::qdrant::{
     PlacementClass, PromotionState, RetrievalFamily, TenantPlacementRow,
 };
+use humaux_application::affect::{ObservedAffect, memories_matching};
+use humaux_domain::affect::{AffectFilter, EmotionLabel};
 use humaux_domain::egress::ProcessorId;
 use humaux_domain::error::ErrorCode;
 use humaux_domain::evidence::payload_sha256;
-use humaux_domain::ids::TenantId;
+use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
+use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
 use humaux_infra_cell::{
     CallerId, CellAccessPermit, CellId, IntraCellError, IntraCellHttpTransport, IntraCellRequest,
     IntraCellResource, IntraCellResourceRegistry, IntraCellResponse, ResourceEntry,
     authorize_cell_access,
 };
 use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig, SealedRetrievalCard};
-use humaux_private_worker::distill::{DistillConfig, DistillPassReport, run_once};
+use humaux_private_worker::distill::{DistillDispatchConfig, DistillDispatchReport, dispatch_pass};
 use humaux_projection::fingerprint::{ProcessingInputFingerprintInputs, source_hash};
 use humaux_projection::serving::StreamFamily;
 use humaux_testkit::{ExternalDep, skip_or_fail};
@@ -78,13 +93,28 @@ use postgres::{Client, NoTls};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[path = "support/dispatch_fence.rs"]
+mod dispatch_fence;
+#[path = "support/live_minimax.rs"]
+mod live_minimax;
+
+use live_minimax::{
+    EnvKeyDecryptor, MINIMAX_CHAT_URL, MINIMAX_MODEL, descriptor, live_provider, load_minimax_key,
+};
+
+/// The claim is cross-tenant: tests of this file never overlap (one fixture at a time).
+static SERIAL: Mutex<()> = Mutex::new(());
 const NAME: &str = "distill_hop_e2e";
-const MINIMAX_CHAT_URL: &str = "https://api.minimaxi.com/v1/chat/completions";
-const MINIMAX_MODEL: &str = "MiniMax-M3";
 const EGRESS_PROCESSOR_ID: Uuid = Uuid::from_u128(0x2016);
 const REGION: &str = "cn-shanghai";
 const SERVICE_TIER: &str = "standard";
 const PURPOSE_DB: &str = "PRIVATE_DISTILL_TEXT";
+/// ADR-0058 D-T: a §72.3 budget no test in this file reaches (the budget gate has its own test,
+/// distill_dispatch_v2 T21).
+const TEST_BUDGET: jobs::DistillCallBudget = jobs::DistillCallBudget {
+    window_seconds: 60.0,
+    max_calls: 10_000,
+};
 const EVIDENCE_TEXT: &str =
     "New backend services must expose a health endpoint before any traffic is routed to them.";
 /// The remember-side stream identity (`consolidate_repo::publish_rollup` / `projection_worker`
@@ -107,71 +137,6 @@ fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
     format!("postgres://{role}:devlocal_{role}@{}", &rest[at + 1..])
 }
 
-/// Same env + `/Volumes/data/viral-skill-eval/.env` fallback `minimax_live_smoke.rs` uses.
-/// Zero println/panic-message exposure of the value.
-fn load_minimax_key() -> Option<String> {
-    if let Some(v) = std::env::var("MINIMAX_API_KEY")
-        .ok()
-        .filter(|v| !v.is_empty())
-    {
-        return Some(v);
-    }
-    let raw = std::fs::read_to_string("/Volumes/data/viral-skill-eval/.env").ok()?;
-    for line in raw.lines() {
-        let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
-        if let Some(v) = line.strip_prefix("MINIMAX_API_KEY=") {
-            let v = v.trim().trim_matches('"').trim_matches('\'');
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
-}
-
-struct EnvKeyDecryptor {
-    key_material: String,
-}
-
-#[async_trait]
-impl CredentialDecryptor for EnvKeyDecryptor {
-    async fn resolve(
-        &self,
-        _credential_ref: CredentialRef,
-    ) -> Result<PlaintextApiKey, ReasoningProviderError> {
-        Ok(PlaintextApiKey::new(self.key_material.clone()))
-    }
-}
-
-/// 卡 17 之后拨号也走这个 resolver（ADR-0039 判据0），所以这里再返回一个「随便挑的公网
-/// 地址」就等于把 live 外呼指到别人家去——只有在代理接管解析时才碰巧还绿。改成与生产同一
-/// 个机制：`HUMAUX_MINIMAX_DNS_PINS`（`host=ip[|ip],...`，与
-/// `HUMAUX_PRIVATE_WORKER_DNS_PINS` 同格式）。没设 = 空 pin 集 = 全量落系统 DNS，也就是
-/// CI / 无 fake-IP 环境的默认行为。
-///
-/// 这台开发机的 DNS 被本机代理 fake-IP 接管（`api.minimaxi.com` → `198.18.0.x`，RFC 2544
-/// 保留段），`SystemDnsResolver` 在这里**必然**被 `ResolvedIpForbidden` 拒——那是闸的正确
-/// 行为，不是 bug；跑本套件时给上真地址的 pin。`/tests/` 读 env 是 §78 boundary lint 的既有
-/// 豁免面。
-fn live_dns_resolver() -> Arc<dyn ssrf::DnsResolver> {
-    Arc::new(
-        ssrf::PinnedDnsResolver::parse(
-            &std::env::var("HUMAUX_MINIMAX_DNS_PINS").unwrap_or_default(),
-        )
-        .expect("HUMAUX_MINIMAX_DNS_PINS must parse as host=ip[|ip],..."),
-    )
-}
-
-fn descriptor() -> ReasoningProviderDescriptor {
-    ReasoningProviderDescriptor {
-        provider_id: "minimax".to_string(),
-        model_id: MINIMAX_MODEL.to_string(),
-        model_revision: None,
-        capabilities: vec![ReasoningCapability::StructuredOutput],
-        custom_endpoint: Some(MINIMAX_CHAT_URL.to_string()),
-    }
-}
-
 fn contribution_config() -> ContributionReasonerConfig {
     ContributionReasonerConfig {
         allowed_egress_processor_id: ProcessorId(EGRESS_PROCESSOR_ID),
@@ -186,18 +151,6 @@ fn contribution_config() -> ContributionReasonerConfig {
     }
 }
 
-fn live_provider(key: String) -> OpenAiCompatibleProvider<EgressHttpTransport, EnvKeyDecryptor> {
-    OpenAiCompatibleProvider::with_egress_transport(
-        descriptor(),
-        MINIMAX_CHAT_URL.to_string(),
-        Duration::from_secs(120),
-        EnvKeyDecryptor { key_material: key },
-        ssrf::CustomEndpointPolicy::default(),
-        live_dns_resolver(),
-    )
-    .expect("SSRF choke point must accept the endpoint (see live_dns_resolver / HUMAUX_MINIMAX_DNS_PINS)")
-}
-
 /// Key-free provider for D2–D5: answers with canned JSON, matches the seeded admission lane
 /// exactly (`provider_matches_admission` compares provider id / model / revision / endpoint).
 /// A reply string starting with this prefix is returned as a provider `RetryWait` (429/5xx)
@@ -208,6 +161,8 @@ struct FakeProvider {
     descriptor: ReasoningProviderDescriptor,
     replies: Mutex<Vec<String>>,
     calls: Mutex<u32>,
+    /// The `json_schema` of every request, in call order (the rendered menu the model saw).
+    schemas: Mutex<Vec<String>>,
 }
 
 impl FakeProvider {
@@ -216,11 +171,16 @@ impl FakeProvider {
             descriptor: descriptor(),
             replies: Mutex::new(replies.into_iter().rev().map(str::to_owned).collect()),
             calls: Mutex::new(0),
+            schemas: Mutex::new(Vec::new()),
         }
     }
 
     fn calls(&self) -> u32 {
         *self.calls.lock().expect("calls")
+    }
+
+    fn schemas(&self) -> Vec<String> {
+        self.schemas.lock().expect("schemas").clone()
     }
 }
 
@@ -241,9 +201,13 @@ impl UserReasoningProvider for FakeProvider {
     async fn complete_structured(
         &self,
         _context: &PrivateInferenceContext,
-        _request: StructuredReasoningRequest,
+        request: StructuredReasoningRequest,
     ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
         *self.calls.lock().expect("calls") += 1;
+        self.schemas
+            .lock()
+            .expect("schemas")
+            .push(request.json_schema);
         let json = self
             .replies
             .lock()
@@ -256,6 +220,7 @@ impl UserReasoningProvider for FakeProvider {
         Ok(StructuredReasoningResponse {
             json,
             usage: TokenUsage::default(),
+            channel_fallback: false,
         })
     }
 
@@ -270,17 +235,23 @@ impl UserReasoningProvider for FakeProvider {
 
 struct Fixture {
     admin: Client,
+    /// Holds every pre-existing scheduler row FOR UPDATE (`dispatch_fence`); released on drop.
+    fence: Client,
     dsn: String,
     tenant_id: Uuid,
     user_id: Uuid,
     reasoning_domain_id: Uuid,
     workspace_id: Uuid,
+    /// Dropped last: the next test's fixture starts only after this one is cleaned up.
+    _serial: MutexGuard<'static, ()>,
 }
 
 impl Drop for Fixture {
-    /// Throwaway-tenant cleanup — same generic sweep `consolidation_hop_e2e.rs` uses, plus the
-    /// child tables that key through a parent (memory_evidence, events).
+    /// Throwaway-tenant cleanup — the generic sweep `consolidation_hop_e2e.rs` uses, plus the child
+    /// tables that key through a parent. Card-31 lesson: jobs (with the slots they hold) and data
+    /// rows in ONE printed batch; the tenant and user rows in a separate best-effort batch.
     fn drop(&mut self) {
+        let _ = self.fence.batch_execute("ROLLBACK");
         let tenant = self.tenant_id;
         let Ok(rows) = self.admin.query(
             "SELECT table_schema, table_name FROM information_schema.columns \
@@ -289,15 +260,18 @@ impl Drop for Fixture {
              ORDER BY table_schema, table_name",
             &[],
         ) else {
+            eprintln!("{NAME}: fixture cleanup for tenant {tenant}: table list failed");
             return;
         };
-        let mut sql = String::from("SET session_replication_role = replica; ");
-        sql.push_str(&format!(
-            "DELETE FROM private.memory_evidence WHERE memory_id IN \
+        let mut sql = format!(
+            "SET session_replication_role = replica; \
+             UPDATE ops.provider_slots SET job_id = NULL, claim_generation = NULL, bound_until = NULL \
+               WHERE job_id IN (SELECT job_id FROM ops.jobs WHERE tenant_id = '{tenant}'); \
+             DELETE FROM private.memory_evidence WHERE memory_id IN \
                (SELECT memory_id FROM private.memory_records WHERE tenant_id = '{tenant}'); \
              DELETE FROM private.events WHERE event_id IN \
                (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id = '{tenant}'); "
-        ));
+        );
         for row in rows {
             let schema: String = row.get(0);
             let table: String = row.get(1);
@@ -305,14 +279,16 @@ impl Drop for Fixture {
                 "DELETE FROM {schema}.{table} WHERE tenant_id = '{tenant}'; "
             ));
         }
-        sql.push_str(&format!(
-            "DELETE FROM control.tenants WHERE tenant_id = '{tenant}'; \
-             DELETE FROM control.users WHERE user_id = '{}'; \
-             SET session_replication_role = DEFAULT;",
-            self.user_id
-        ));
+        sql.push_str("SET session_replication_role = DEFAULT;");
         if let Err(error) = self.admin.batch_execute(&sql) {
-            eprintln!("{NAME}: fixture cleanup for tenant {tenant} failed: {error}");
+            eprintln!("{NAME}: fixture cleanup (jobs/data) for tenant {tenant} failed: {error}");
+        }
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{tenant}'; \
+             DELETE FROM control.users WHERE user_id = '{}';",
+            self.user_id
+        )) {
+            eprintln!("{NAME}: fixture cleanup (tenant, best effort) for {tenant} failed: {error}");
         }
     }
 }
@@ -321,6 +297,7 @@ impl Drop for Fixture {
 /// `PRIVATE_DISTILL_TEXT` over the MiniMax descriptor (mirrors consolidation_hop_e2e::setup_db).
 #[allow(clippy::too_many_lines)]
 fn setup_db(test_name: &str) -> Option<Fixture> {
+    let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     // ADR-0026: the distill producer reads the candidate TTL from env (§78.1, no literal). Every
     // distill test that reaches a rejection needs it; set it here for all of them.
     // SAFETY: the mandated distill_hop_e2e run is --test-threads=1; every writer sets the same
@@ -347,7 +324,8 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
     };
     let migrated: bool = admin
         .query_one(
-            "SELECT to_regprocedure('control.current_reasoning_route_binding(uuid,text)') IS NOT NULL",
+            "SELECT to_regprocedure('control.current_reasoning_route_binding(uuid,text)') IS NOT NULL \
+                AND to_regprocedure('ops.claim_derived_work_v2(text,double precision,double precision)') IS NOT NULL",
             &[],
         )
         .ok()?
@@ -355,11 +333,22 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
     if !migrated {
         skip_or_fail(
             test_name,
-            "missing object: control.current_reasoning_route_binding — run `cargo xtask migrate` (0147)",
+            "missing object: control.current_reasoning_route_binding / ops.claim_derived_work_v2 — run `cargo xtask migrate` (0190)",
             ExternalDep::Postgres,
         );
         return None;
     }
+    let fence = match dispatch_fence::open(&mut admin, &dsn) {
+        Ok(fence) => fence,
+        Err(missing) => {
+            skip_or_fail(
+                test_name,
+                &format!("missing object: {missing}"),
+                ExternalDep::Postgres,
+            );
+            return None;
+        }
+    };
 
     let suffix = Uuid::now_v7();
     let tenant_id: Uuid = admin
@@ -510,11 +499,13 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
 
     Some(Fixture {
         admin,
+        fence,
         dsn,
         tenant_id,
         user_id,
         reasoning_domain_id,
         workspace_id,
+        _serial: serial,
     })
 }
 
@@ -522,6 +513,11 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
 /// AuthenticatedAgent origin, WORKSPACE_SHARED in the fixture workspace, `USER_MESSAGE` event
 /// whose payload is `{"text": <text>}`. Returns `(evidence_id, commit_seq, stream_seq)`.
 fn seed_evidence(f: &mut Fixture, text: &str) -> (Uuid, i64, i64) {
+    seed_evidence_as(f, text, "AuthenticatedAgent")
+}
+
+/// [`seed_evidence`] with another `origin_class` (the DB CHECK literal).
+fn seed_evidence_as(f: &mut Fixture, text: &str, origin_class: &str) -> (Uuid, i64, i64) {
     let payload = serde_json::json!({ "text": text });
     // `gateway::remember` hashes the request's raw JSON bytes without normalizing them
     // (`raw_json_bytes_are_hashed_without_normalization`); a pretty-printed body is what a
@@ -538,7 +534,7 @@ fn seed_evidence(f: &mut Fixture, text: &str) -> (Uuid, i64, i64) {
             "INSERT INTO private.evidence_objects \
                (tenant_id, evidence_kind, payload_sha256, data_class, origin_class, \
                 origin_principal_id, visibility_class, visibility_workspace_id, reasoning_domain_id, occurred_at) \
-             VALUES ($1, 'EVENT', decode($2, 'hex'), 'PRIVATE', 'AuthenticatedAgent', $3, \
+             VALUES ($1, 'EVENT', decode($2, 'hex'), 'PRIVATE', $6, $3, \
                      'WORKSPACE_SHARED', $4, $5, now()) \
              RETURNING evidence_id",
             &[
@@ -547,6 +543,7 @@ fn seed_evidence(f: &mut Fixture, text: &str) -> (Uuid, i64, i64) {
                 &f.user_id,
                 &f.workspace_id,
                 &f.reasoning_domain_id,
+                &origin_class,
             ],
         )
         .expect("insert evidence")
@@ -611,41 +608,78 @@ fn seed_evidence(f: &mut Fixture, text: &str) -> (Uuid, i64, i64) {
     (evidence_id, commit_seq, stream_seq)
 }
 
-fn distill_config(f: &Fixture, lease_owner: &str) -> DistillConfig {
-    DistillConfig {
-        tenant_id: f.tenant_id,
-        reasoning_domain_id: f.reasoning_domain_id,
-        batch: 10,
-        lease_seconds: 120.0,
+/// ADR-0058 D-K config with one seat (the fake provider serves replies in call order).
+fn dispatch_config(lease_owner: &str, lease_seconds: f64) -> DistillDispatchConfig {
+    DistillDispatchConfig {
         lease_owner: lease_owner.to_owned(),
+        lease_seconds,
+        in_flight: 1,
+        hard_deadline_seconds: 2.0 * (5.0 + lease_seconds),
+        http_timeout_seconds: 5.0,
+        not_ready_park_seconds: 600.0,
+        max_attempts: 5,
+        budget: TEST_BUDGET,
     }
 }
 
+fn private_pool(rt: &tokio::runtime::Runtime, f: &Fixture) -> PrivateWorkerDbPool {
+    rt.block_on(
+        // dep: PostgreSQL(role_private_worker) — role-scoped pool call
+        PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker")),
+    )
+    .expect("private worker pool")
+}
+
+/// One `--distill-once` drain over the fixture tenant (foreign tenants are fenced).
 fn run_pass(
     rt: &tokio::runtime::Runtime,
     f: &Fixture,
     provider: &dyn UserReasoningProvider,
     lease_owner: &str,
-) -> DistillPassReport {
-    rt.block_on(async {
-        // dep: PostgreSQL(role_private_worker) — role-scoped pool call
-        let pool = PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker"))
-            .await
-            .expect("private worker pool");
-        // Card 21: `None` — this helper drives `run_once` directly, with no `ops.jobs` lease to
-        // renew. The per-row heartbeat only exists on `dispatch_pass`'s path, and it is covered
-        // there, against a real lease, by `derived_dispatch_e2e::
-        // a_pass_longer_than_its_lease_heartbeats_per_row_and_settles_without_losing_it`.
-        run_once(
-            &pool,
-            provider,
-            contribution_config(),
-            &distill_config(f, lease_owner),
-            None,
+) -> DistillDispatchReport {
+    let pool = private_pool(rt, f);
+    rt.block_on(dispatch_pass(
+        &pool,
+        provider,
+        contribution_config(),
+        &dispatch_config(lease_owner, 30.0),
+    ))
+    .expect("distill dispatch pass")
+}
+
+/// The Evidence's `DERIVED_DISTILL` job (0164's idempotency key).
+fn job_of(f: &mut Fixture, evidence_id: Uuid) -> Uuid {
+    f.admin
+        .query_one(
+            "SELECT job_id FROM ops.jobs WHERE idempotency_key = 'derived-work:DERIVED_DISTILL:' || $1::uuid::text",
+            &[&evidence_id],
         )
-        .await
-        .expect("distill pass")
-    })
+        .expect("one job per Evidence")
+        .get(0)
+}
+
+/// `(status, attempt, claim_generation, last_error_class)` of the Evidence's job.
+fn job_state(f: &mut Fixture, evidence_id: Uuid) -> (String, i32, i32, Option<String>) {
+    let job = job_of(f, evidence_id);
+    let r = f
+        .admin
+        .query_one(
+            "SELECT status, attempt, claim_generation, last_error_class FROM ops.jobs WHERE job_id = $1",
+            &[&job],
+        )
+        .expect("job row");
+    (r.get(0), r.get(1), r.get(2), r.get(3))
+}
+
+/// Makes the Evidence's backed-off job claimable now.
+fn ready_now(f: &mut Fixture, evidence_id: Uuid) {
+    let job = job_of(f, evidence_id);
+    f.admin
+        .execute(
+            "UPDATE ops.jobs SET next_retry_at = clock_timestamp() - interval '1 second' WHERE job_id = $1",
+            &[&job],
+        )
+        .expect("ready now");
 }
 
 /// This tenant's `ops.model_call_ledger` rows on the distill purposes (§19.1), as `observe`
@@ -1016,13 +1050,51 @@ fn d1_live_distill_writes_memories_and_projection_resolves_ticket() {
     };
     let (evidence_id, _commit_seq, stream_seq) = seed_evidence(&mut f, EVIDENCE_TEXT);
     let rt = tokio::runtime::Runtime::new().expect("rt");
-    let provider = live_provider(key);
-    let report = run_pass(&rt, &f, &provider, "d1-worker");
+    // ADR-0058 D-K: the dispatch window is sized from the provider's own transport timeout. The
+    // fake-provider `dispatch_config` (5 s) would cut a live call — or a live malformed re-ask —
+    // at `hard_deadline − lease` = 40 s and leave the job UNKNOWN instead of DONE.
+    const LIVE_HTTP_SECS: u64 = 120;
+    let provider = live_provider(key, MINIMAX_MODEL, Duration::from_secs(LIVE_HTTP_SECS));
+    let live_config = DistillDispatchConfig {
+        http_timeout_seconds: LIVE_HTTP_SECS as f64,
+        hard_deadline_seconds: 2.0 * (LIVE_HTTP_SECS as f64 + 30.0),
+        ..dispatch_config("d1-worker", 30.0)
+    };
+    // ADR-0058 D-F: a live provider transient settles RETRY with a backoff instead of failing the
+    // pass (main-line chain 2026-10-02: one RETRY_WAIT after 3.9 s made a single-pass assertion
+    // red). The product path is exercised as it is: a deferred job is made due and claimed again,
+    // within the job's own attempt budget; only the wall-clock backoff is skipped.
+    const LIVE_PASSES: u32 = 3;
+    let mut report = None;
+    for pass in 1..=LIVE_PASSES {
+        let r = rt
+            .block_on(dispatch_pass(
+                &private_pool(&rt, &f),
+                &provider,
+                contribution_config(),
+                &live_config,
+            ))
+            .expect("distill dispatch pass");
+        assert_eq!(
+            r.claimed, 1,
+            "pass {pass}: one DERIVED_DISTILL job claimed: {r:?}"
+        );
+        let done = r.completed == 1;
+        assert!(
+            done || r.deferred == 1,
+            "pass {pass}: the job is DONE or deferred by a provider transient, nothing else: {r:?}"
+        );
+        report = Some(r);
+        if done {
+            break;
+        }
+        ready_now(&mut f, evidence_id);
+    }
+    let report = report.expect("at least one pass ran");
     assert_eq!(
-        report.claimed, 1,
-        "one PENDING outbox row claimed: {report:?}"
+        report.completed, 1,
+        "the live job must settle DONE within {LIVE_PASSES} passes: {report:?}"
     );
-    assert_eq!(report.done, 1, "live pass must settle DONE: {report:?}");
 
     let o = observe(&mut f, evidence_id);
     assert!(
@@ -1051,9 +1123,15 @@ fn d1_live_distill_writes_memories_and_projection_resolves_ticket() {
     assert_eq!(
         o.run_prompt_hash,
         hex::encode(
-            distill_prompt_contract(humaux_domain::authority::AuthorityClass::PrivateKnowledge)
-                .sha256
-                .0
+            // AuthenticatedAgent origin with no declared affect: the menu is offered (ADR-0058
+            // D-P amendment); the channel is the one the live descriptor declares (D-M).
+            distill_prompt_contract(
+                humaux_domain::authority::AuthorityClass::PrivateKnowledge,
+                true,
+                humaux_adapters::distill_reasoner::distill_output_channel(&descriptor()),
+            )
+            .sha256
+            .0
         ),
         "prompt_hash column is the contract sha256"
     );
@@ -1323,7 +1401,7 @@ fn d2_over_ceiling_candidate_rejected_not_downgraded() {
     ]);
     let report = run_pass(&rt, &f, &provider, "d2-worker");
     assert_eq!(provider.calls(), 1);
-    assert_eq!(report.done, 1, "{report:?}");
+    assert_eq!(report.completed, 1, "{report:?}");
     assert_eq!(report.rejected, 1, "rejection counted: {report:?}");
     assert_eq!(report.memories, 0);
     let o = observe(&mut f, evidence_id);
@@ -1399,7 +1477,7 @@ fn d3_zero_memories_settles_outbox_and_ticket() {
     // the observable that the 2026-09-19 / 2026-09-20 `done: 1, memories: 0` chains lacked.
     let provider = FakeProvider::new(vec![r#"{"memories":[]}"#, r#"{"memories":[]}"#]);
     let report = run_pass(&rt, &f, &provider, "d3-worker");
-    assert_eq!(report.done, 1, "{report:?}");
+    assert_eq!(report.completed, 1, "{report:?}");
     assert_eq!(
         report.empty_retries, 1,
         "one bounded retry, then settle: {report:?}"
@@ -1503,7 +1581,8 @@ fn d4_parser_fail_closed_marks_outbox_failed() {
     let report = run_pass(&rt, &f, &provider, "d4-worker");
     assert_eq!(report.claimed, 2, "{report:?}");
     assert_eq!(report.failed, 2, "{report:?}");
-    assert_eq!(report.done, 0);
+    assert_eq!(report.dead, 2, "{report:?}");
+    assert_eq!(report.completed, 0);
     assert_eq!(report.memories, 0);
     assert_eq!(
         report.malformed_retries, 2,
@@ -1515,6 +1594,13 @@ fn d4_parser_fail_closed_marks_outbox_failed() {
         "each retry is a real second round trip"
     );
     for evidence_id in [bad_enum, extra_key] {
+        // ADR-0048 D-D / ADR-0058 D-F: after its re-ask budget the job is DEAD with the class and
+        // its outbox row FAILED in the same transaction (two counted calls, never re-claimed).
+        let (status, attempt, _, class) = job_state(&mut f, evidence_id);
+        assert_eq!(
+            (status.as_str(), attempt, class.as_deref()),
+            ("DEAD", 2, Some("FAILED_OUTPUT_SCHEMA"))
+        );
         let o = observe(&mut f, evidence_id);
         assert_eq!(o.memories, 0, "fail-closed parse writes no memory row");
         assert_eq!(o.outbox_status, "FAILED");
@@ -1533,7 +1619,7 @@ fn d4_parser_fail_closed_marks_outbox_failed() {
             "bytes did leave twice; the replies were the problem"
         );
     }
-    // FAILED is terminal (input-bound rejection): a second pass claims nothing.
+    // DEAD is terminal: a second pass claims nothing.
     let again = run_pass(&rt, &f, &FakeProvider::new(vec![]), "d4-worker-2");
     assert_eq!(again.claimed, 0);
     println!("D4 ASSERTION LOG: report={report:?} second_pass={again:?}");
@@ -1556,7 +1642,7 @@ fn d4b_a_malformed_reply_is_re_asked_once_then_settles() {
         r#"{"memories":[{"content":"c","memory_type":"Decision","class":"PrivateKnowledge","confidence":0.9}]}"#,
     ]);
     let report = run_pass(&rt, &f, &provider, "d4b-worker");
-    assert_eq!(report.done, 1, "{report:?}");
+    assert_eq!(report.completed, 1, "{report:?}");
     assert_eq!(report.failed, 0, "{report:?}");
     assert_eq!(report.malformed_retries, 1, "one bounded retry: {report:?}");
     assert_eq!(provider.calls(), 2, "the retry is a real second round trip");
@@ -1581,8 +1667,9 @@ fn d4b_a_malformed_reply_is_re_asked_once_then_settles() {
 }
 
 // ----------------------------------------------------------------------------
-// D5 — idempotency: DONE rows are not re-claimed; an expired PROCESSING lease is retried
-// without duplicate rows.
+// D5 — idempotency under the ADR-0058 generation fence: a DONE job is never re-claimed; a claim
+// that crashed after taking its outbox row is reclaimed (T4) and distilled once; a live claim is
+// not stolen.
 // ----------------------------------------------------------------------------
 
 #[test]
@@ -1594,33 +1681,47 @@ fn d5_two_passes_and_expired_lease_never_duplicate_memories() {
     let (evidence_a, _, _) = seed_evidence(&mut f, EVIDENCE_TEXT);
     let rt = tokio::runtime::Runtime::new().expect("rt");
     let first = run_pass(&rt, &f, &FakeProvider::new(vec![reply]), "d5-worker");
-    assert_eq!(first.done, 1, "{first:?}");
+    assert_eq!(first.completed, 1, "{first:?}");
     assert_eq!(observe(&mut f, evidence_a).memories, 1);
     assert_fingerprint_recomputes(&mut f, evidence_a);
     let second = run_pass(&rt, &f, &FakeProvider::new(vec![]), "d5-worker");
     assert_eq!(
         second.claimed, 0,
-        "DONE rows are never re-claimed: {second:?}"
+        "a DONE job is never re-claimed: {second:?}"
     );
     assert_eq!(observe(&mut f, evidence_a).memories, 1);
 
-    // A worker that crashed mid-flight: the row sits PROCESSING under a dead lease.
+    // A worker that crashed mid-flight: its claim took the outbox row, then its lease expired.
     let (evidence_b, _, _) = seed_evidence(&mut f, "crashed lease evidence");
+    let pool = private_pool(&rt, &f);
+    let crashed = rt
+        .block_on(jobs::claim_distill(&pool, "dead-worker", 30.0, 70.0))
+        .expect("claim")
+        .expect("the job is READY");
+    let taken = rt
+        .block_on(distill_repo::take_outbox_row(
+            &pool,
+            &DistillLease::of(&crashed, "dead-worker"),
+            evidence_b,
+            crashed.hard_deadline,
+        ))
+        .expect("take");
+    assert!(matches!(taken, distill_repo::TakenOutbox::Taken(_)));
     f.admin
         .execute(
-            "UPDATE ops.outbox SET status = 'PROCESSING', lease_owner = 'dead-worker', \
-                    lease_expires_at = clock_timestamp() - interval '1 second' \
-             WHERE evidence_id = $1",
-            &[&evidence_b],
+            "UPDATE ops.jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE job_id = $1",
+            &[&crashed.job_id],
         )
-        .expect("simulate expired lease");
+        .expect("simulate the crash");
     let retry = run_pass(&rt, &f, &FakeProvider::new(vec![reply]), "d5-worker-2");
     assert_eq!(
         retry.claimed, 1,
-        "expired PROCESSING lease is reclaimable: {retry:?}"
+        "the expired claim is READY again (T4): {retry:?}"
     );
-    assert_eq!(retry.done, 1);
+    assert_eq!(retry.completed, 1, "{retry:?}");
     assert_eq!(observe(&mut f, evidence_b).memories, 1);
+    let (status, attempt, generation, _) = job_state(&mut f, evidence_b);
+    assert_eq!((status.as_str(), attempt, generation), ("DONE", 1, 2));
     let after = run_pass(&rt, &f, &FakeProvider::new(vec![]), "d5-worker-3");
     assert_eq!(after.claimed, 0);
     assert_eq!(
@@ -1630,24 +1731,194 @@ fn d5_two_passes_and_expired_lease_never_duplicate_memories() {
     );
     assert_eq!(observe(&mut f, evidence_a).memories, 1);
 
-    // A live lease is not reclaimable: a concurrent worker sees nothing.
+    // A live claim is not stolen: a concurrent worker sees nothing.
     let (evidence_c, _, _) = seed_evidence(&mut f, "live lease evidence");
-    f.admin
-        .execute(
-            "UPDATE ops.outbox SET status = 'PROCESSING', lease_owner = 'busy-worker', \
-                    lease_expires_at = clock_timestamp() + interval '10 minutes' \
-             WHERE evidence_id = $1",
-            &[&evidence_c],
-        )
-        .expect("simulate live lease");
+    let busy = rt
+        .block_on(jobs::claim_distill(&pool, "busy-worker", 600.0, 600.0))
+        .expect("claim")
+        .expect("the job is READY");
     let contended = run_pass(&rt, &f, &FakeProvider::new(vec![]), "d5-worker-4");
     assert_eq!(
         contended.claimed, 0,
-        "live lease must not be stolen: {contended:?}"
+        "a live claim must not be stolen: {contended:?}"
     );
+    assert_eq!(job_state(&mut f, evidence_c).2, busy.claim_generation);
     println!(
         "D5 ASSERTION LOG: first={first:?} second={second:?} retry={retry:?} after={after:?} contended={contended:?}"
     );
+}
+
+/// A provider whose first call blocks until `gate_one` opens and second call until `gate_two`
+/// opens; both then answer one admissible memory.
+struct GatedProvider {
+    descriptor: ReasoningProviderDescriptor,
+    calls: AtomicU32,
+    gate_one: AtomicBool,
+    gate_two: AtomicBool,
+}
+
+#[async_trait]
+impl UserReasoningProvider for GatedProvider {
+    fn descriptor(&self) -> &ReasoningProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn endpoint_ref(&self) -> &str {
+        MINIMAX_CHAT_URL
+    }
+
+    fn model_revision(&self) -> Option<&str> {
+        None
+    }
+
+    async fn complete_structured(
+        &self,
+        _context: &PrivateInferenceContext,
+        _request: StructuredReasoningRequest,
+    ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let gate = if n == 1 {
+            &self.gate_one
+        } else {
+            &self.gate_two
+        };
+        while !gate.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(StructuredReasoningResponse {
+            json: r#"{"memories":[{"content":"Health endpoint before traffic.","memory_type":"Decision","class":"PrivateKnowledge","confidence":0.9}]}"#.to_string(),
+            usage: TokenUsage::default(),
+            channel_fallback: false,
+        })
+    }
+
+    async fn analyze_vision(
+        &self,
+        _context: &PrivateInferenceContext,
+        _request: VisionReasoningRequest,
+    ) -> Result<VisionReasoningResponse, ReasoningProviderError> {
+        unreachable!("distill never calls vision")
+    }
+}
+
+/// One admin statement on its own thread (the sync `postgres` client must not run inside the
+/// test's async runtime).
+fn admin_exec(dsn: &str, sql: &'static str, id: Uuid) {
+    let dsn = dsn.to_owned();
+    std::thread::spawn(move || {
+        // dep: PostgreSQL(owner) — admin statement from inside the async test body
+        let mut admin = Client::connect(&dsn, NoTls).expect("admin connection");
+        admin.batch_execute("SELECT 1").expect("ping");
+        admin.execute(sql, &[&id]).expect("admin statement");
+    })
+    .join()
+    .expect("admin thread");
+}
+
+/// D5b (card TH-3, ADR-0058 D-E/D-J) — a late worker. W1 is blocked inside its provider call;
+/// the admin moves W1's lease and `hard_deadline` (and its slot's `bound_until`) into the past, a
+/// sweep reconciles the claim (T6), and W2 — with the SAME `lease_owner` string — claims
+/// generation 2 and enters its own call. W1 is released first: its heartbeat has found the lease
+/// gone, its settle is refused by the generation fence, and its call is still ledgered. Then W2
+/// finishes. ⇒ one memory, two finalized ledger rows, W1 `lost_lease == 1` and
+/// `heartbeat_lost == 1`, job DONE in generation 2 with attempt 2.
+/// Faults: (a) drop the generation predicate in `ops.finish_derived_work_v2` ⇒ W1's settle lands
+/// (W1 `lost_lease == 0`); (b) drop the generation / hard-deadline predicates in
+/// `ops.renew_lease` ⇒ W1's heartbeat renews generation 2's live lease (`heartbeat_lost == 0`).
+#[test]
+fn d5b_a_late_worker_loses_its_lease_writes_nothing_and_its_cost_is_ledgered() {
+    let Some(mut f) =
+        setup_db("d5b_a_late_worker_loses_its_lease_writes_nothing_and_its_cost_is_ledgered")
+    else {
+        return;
+    };
+    let (evidence, _, _) = seed_evidence(&mut f, EVIDENCE_TEXT);
+    let job = job_of(&mut f, evidence);
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let (pool_one, pool_two, sweeper) = (
+        private_pool(&rt, &f),
+        private_pool(&rt, &f),
+        private_pool(&rt, &f),
+    );
+    let provider = GatedProvider {
+        descriptor: descriptor(),
+        calls: AtomicU32::new(0),
+        gate_one: AtomicBool::new(false),
+        gate_two: AtomicBool::new(false),
+    };
+    // Lease 6 s: a heartbeat every 2 s, so W1's next renew lands after generation 2 exists.
+    let config = dispatch_config("d5b-worker", 6.0);
+    let w1_done = AtomicBool::new(false);
+    let dsn = f.dsn.clone();
+    let (w1, w2) = rt.block_on(async {
+        let w1 = async {
+            let r = dispatch_pass(&pool_one, &provider, contribution_config(), &config).await;
+            w1_done.store(true, Ordering::SeqCst);
+            r
+        };
+        let controller = async {
+            while provider.calls.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            admin_exec(
+                &dsn,
+                "WITH j AS (UPDATE ops.jobs SET lease_expires_at = clock_timestamp() - interval '2 seconds', \
+                                hard_deadline = clock_timestamp() - interval '1 second' \
+                            WHERE job_id = $1 RETURNING job_id) \
+                 UPDATE ops.provider_slots SET bound_until = clock_timestamp() - interval '1 second' \
+                 WHERE job_id IN (SELECT job_id FROM j)",
+                job,
+            );
+            let swept = jobs::claim_distill(&sweeper, "d5b-sweeper", 6.0, 22.0)
+                .await
+                .expect("sweep");
+            assert!(swept.is_none(), "T6 re-queued the job with a backoff");
+            admin_exec(
+                &dsn,
+                "UPDATE ops.jobs SET next_retry_at = clock_timestamp() - interval '1 second' WHERE job_id = $1",
+                job,
+            );
+            let w2 = dispatch_pass(&pool_two, &provider, contribution_config(), &config);
+            let release = async {
+                while provider.calls.load(Ordering::SeqCst) < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                // Two of W1's heartbeat periods while generation 2 holds the job.
+                tokio::time::sleep(Duration::from_millis(4500)).await;
+                provider.gate_one.store(true, Ordering::SeqCst);
+                while !w1_done.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                provider.gate_two.store(true, Ordering::SeqCst);
+            };
+            tokio::join!(w2, release).0
+        };
+        tokio::join!(w1, controller)
+    });
+    let (w1, w2) = (w1.expect("W1 pass"), w2.expect("W2 pass"));
+    println!("D5B ASSERTION LOG: w1={w1:?} w2={w2:?}");
+    assert_eq!((w1.lost_lease, w1.heartbeat_lost), (1, 1), "W1: {w1:?}");
+    assert_eq!(w1.memories, 0, "W1 wrote nothing: {w1:?}");
+    assert_eq!((w2.completed, w2.memories), (1, 1), "W2: {w2:?}");
+    let o = observe(&mut f, evidence);
+    assert_eq!(o.memories, 1, "exactly one memory set");
+    assert_eq!(o.outbox_status, "DONE");
+    assert_eq!(
+        o.ledger.rows, 2,
+        "the late call's cost is still ledgered: {:?}",
+        o.ledger
+    );
+    let finalized: i64 = f
+        .admin
+        .query_one(
+            "SELECT count(*) FROM ops.model_call_ledger WHERE tenant_id = $1 AND status = 'SUCCEEDED'",
+            &[&f.tenant_id],
+        )
+        .expect("ledger")
+        .get(0);
+    assert_eq!(finalized, 2, "both calls finalized");
+    let (status, attempt, generation, _) = job_state(&mut f, evidence);
+    assert_eq!((status.as_str(), attempt, generation), ("DONE", 2, 2));
 }
 
 // ----------------------------------------------------------------------------
@@ -1672,7 +1943,7 @@ fn d6_retryable_failures_hand_the_row_back_for_a_later_pass() {
     observe_provider_health(&mut f, "UNAVAILABLE");
     let unadmitted = run_pass(&rt, &f, &FakeProvider::new(vec![]), "d6-worker");
     assert_eq!(unadmitted.claimed, 1, "{unadmitted:?}");
-    assert_eq!(unadmitted.deferred, 1, "{unadmitted:?}");
+    assert_eq!(unadmitted.not_ready, 1, "{unadmitted:?}");
     assert_eq!(unadmitted.failed, 0, "{unadmitted:?}");
     assert_eq!(
         outbox_lease(&mut f, evidence_id),
@@ -1681,6 +1952,7 @@ fn d6_retryable_failures_hand_the_row_back_for_a_later_pass() {
     );
     assert_eq!(processing_runs(&mut f, evidence_id), (0, 0));
     observe_provider_health(&mut f, "HEALTHY");
+    ready_now(&mut f, evidence_id);
 
     // (2) Provider 429/5xx after the fingerprint was recorded: run row stays open, row PENDING.
     let throttled = run_pass(
@@ -1702,10 +1974,11 @@ fn d6_retryable_failures_hand_the_row_back_for_a_later_pass() {
         "attempt marker: one run row, completed_at NULL"
     );
 
-    // (3) The next healthy pass distills it exactly once.
+    // (3) The next healthy pass (after the RETRY backoff) distills it exactly once.
+    ready_now(&mut f, evidence_id);
     let recovered = run_pass(&rt, &f, &FakeProvider::new(vec![reply]), "d6-worker");
     assert_eq!(recovered.claimed, 1, "{recovered:?}");
-    assert_eq!(recovered.done, 1, "{recovered:?}");
+    assert_eq!(recovered.completed, 1, "{recovered:?}");
     let o = observe(&mut f, evidence_id);
     assert_eq!(o.memories, 1);
     assert_eq!(o.outbox_status, "DONE");
@@ -1793,7 +2066,7 @@ fn d7_declared_subjects_reach_the_distilled_memory_with_spans() {
         r#"{"memories":[{"content":"Ada Lovelace wants the CRM-1001 renewal moved to Q4.","memory_type":"Decision","class":"PrivateKnowledge","confidence":0.9}]}"#,
     ]);
     let report = run_pass(&rt, &f, &provider, "d7-worker");
-    assert_eq!(report.done, 1, "{report:?}");
+    assert_eq!(report.completed, 1, "{report:?}");
     assert_eq!(report.memories, 1, "{report:?}");
     let o = observe(&mut f, evidence_id);
     assert_eq!(o.memories, 1);
@@ -1872,4 +2145,462 @@ fn d7_declared_subjects_reach_the_distilled_memory_with_spans() {
         "D7 ASSERTION LOG: report={report:?} links={rows:?} mentions={}",
         mentions.len()
     );
+}
+
+// ----------------------------------------------------------------------------
+// D8 / D9 — card 32 slice 3 (ADR-0058 D-M / D-P).
+// ----------------------------------------------------------------------------
+
+/// A transport that answers with scripted chat envelopes and records every request body, so the
+/// REAL `OpenAiCompatibleProvider` (tool body + tool-call parse) sits between the worker and it.
+struct ScriptedTransport {
+    bodies: Mutex<Vec<&'static str>>,
+    sent: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait]
+impl OpenAiCompatTransport for ScriptedTransport {
+    async fn send(
+        &self,
+        request: OpenAiHttpRequest,
+        _policy: &ssrf::CustomEndpointPolicy,
+    ) -> Result<OpenAiHttpOutcome, ReasoningProviderError> {
+        self.sent
+            .lock()
+            .expect("sent")
+            .push(serde_json::from_slice(&request.body).expect("the request body is JSON"));
+        let body = self
+            .bodies
+            .lock()
+            .expect("bodies")
+            .pop()
+            .expect("scripted transport has a reply for every send");
+        Ok(OpenAiHttpOutcome {
+            status: 200,
+            retry_after: None,
+            body: body.as_bytes().to_vec(),
+        })
+    }
+}
+
+/// The bodies this provider's transport was sent, in order.
+type Sent = Arc<Mutex<Vec<serde_json::Value>>>;
+
+fn scripted_provider(
+    bodies: Vec<&'static str>,
+) -> (
+    OpenAiCompatibleProvider<ScriptedTransport, EnvKeyDecryptor>,
+    Sent,
+) {
+    let sent = Sent::default();
+    // No socket is ever opened: the transport is scripted. The pin only lets the §11.4 choke
+    // point accept the real endpoint string the admission lane names.
+    let resolver = ssrf::PinnedDnsResolver::parse("api.minimaxi.com=93.184.216.34").expect("pin");
+    let provider = OpenAiCompatibleProvider::new(
+        descriptor(),
+        MINIMAX_CHAT_URL.to_string(),
+        ScriptedTransport {
+            bodies: Mutex::new(bodies.into_iter().rev().collect()),
+            sent: Arc::clone(&sent),
+        },
+        EnvKeyDecryptor {
+            key_material: "scripted-not-a-key".to_owned(),
+        },
+        ssrf::CustomEndpointPolicy::default(),
+        &resolver,
+    )
+    .expect("the endpoint passes the SSRF choke point");
+    (provider, sent)
+}
+
+const TOOL_OVER_CEILING: &str = r#"{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"emit_distillation","arguments":"{\"memories\":[{\"content\":\"Health endpoint before traffic.\",\"memory_type\":\"Decision\",\"class\":\"ProjectConstraint\",\"confidence\":0.9}]}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":5},"base_resp":{"status_code":0,"status_msg":""}}"#;
+const TOOL_TWO_CALLS: &str = r#"{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"emit_distillation","arguments":"{\"memories\":[{\"content\":\"Health endpoint before traffic.\",\"memory_type\":\"Decision\",\"class\":\"PrivateKnowledge\",\"confidence\":0.9}]}"}},{"id":"c2","type":"function","function":{"name":"emit_distillation","arguments":"{\"memories\":[]}"}}]}}],"base_resp":{"status_code":0,"status_msg":""}}"#;
+
+/// ADR-0058 D-M: the tool call is a transport, never the validation. (a) One well-formed call
+/// whose arguments carry an over-ceiling class still meets §10.1's authorize — rejected PENDING,
+/// never downgraded (d2's rule, through the real provider). (b) A reply with two calls is a
+/// schema failure that spends the malformed re-ask (ADR-0048 D-D) and then fails closed: DEAD
+/// `FAILED_OUTPUT_SCHEMA`, outbox FAILED, nothing written. Fault: accept the first of two tool
+/// calls ⇒ (b) writes a memory.
+#[test]
+fn d8_tool_call_reply_goes_through_the_fail_closed_parser() {
+    let Some(mut f) = setup_db("d8_tool_call_reply_goes_through_the_fail_closed_parser") else {
+        return;
+    };
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+
+    let (over, _, _) = seed_evidence(&mut f, EVIDENCE_TEXT);
+    let (provider, sent) = scripted_provider(vec![TOOL_OVER_CEILING]);
+    let report = run_pass(&rt, &f, &provider, "d8-worker-a");
+    assert_eq!(report.rejected, 1, "{report:?}");
+    let o = observe(&mut f, over);
+    assert_eq!(
+        o.memories, 0,
+        "an over-ceiling class is rejected, never downgraded"
+    );
+    assert_eq!(o.outbox_status, "DONE");
+    let requested: String = f
+        .admin
+        .query_one(
+            "SELECT requested_class FROM private.distill_candidates WHERE source_evidence_id = $1",
+            &[&over],
+        )
+        .expect("one PENDING candidate")
+        .get(0);
+    assert_eq!(requested, "ProjectConstraint");
+    let sent = sent.lock().expect("sent").clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["tools"][0]["function"]["name"], "emit_distillation");
+    assert_eq!(sent[0]["reasoning_split"], true);
+    assert!(sent[0].get("tool_choice").is_none(), "W1: never sent");
+
+    let (two, _, _) = seed_evidence(&mut f, "two tool calls evidence");
+    let (provider, sent) = scripted_provider(vec![TOOL_TWO_CALLS, TOOL_TWO_CALLS]);
+    let report = run_pass(&rt, &f, &provider, "d8-worker-b");
+    assert_eq!(
+        sent.lock().expect("sent").len(),
+        2,
+        "one counted re-ask: {report:?}"
+    );
+    assert_eq!(report.malformed_retries, 1, "{report:?}");
+    assert_eq!(report.memories, 0, "{report:?}");
+    let (status, attempt, _, class) = job_state(&mut f, two);
+    assert_eq!(
+        (status.as_str(), attempt, class.as_deref()),
+        ("DEAD", 2, Some("FAILED_OUTPUT_SCHEMA"))
+    );
+    let o = observe(&mut f, two);
+    assert_eq!(o.memories, 0, "the first of two calls is never taken");
+    assert_eq!(o.outbox_status, "FAILED");
+    assert_eq!(
+        o.ledger.status.as_deref(),
+        Some("FAILED"),
+        "the refused reply is a ledgered failed call"
+    );
+    println!(
+        "D8 ASSERTION LOG: report={report:?} memories={} outbox={}",
+        o.memories, o.outbox_status
+    );
+}
+
+/// `(origin, label, confidence_bp)` of every affect row of the memories born from `evidence_id`.
+fn affect_rows_of(f: &mut Fixture, evidence_id: Uuid) -> Vec<(String, Option<String>, i16)> {
+    f.admin
+        .query(
+            "SELECT a.origin, a.label, a.confidence_bp FROM private.memory_affects a \
+             JOIN private.memory_evidence me ON me.memory_id = a.memory_id \
+             WHERE me.evidence_id = $1 ORDER BY a.created_at, a.affect_id",
+            &[&evidence_id],
+        )
+        .expect("affect rows")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect()
+}
+
+/// ADR-0058 D-P (amended by the card-32 review): an Evidence of the gateway's own ingress origin
+/// (`remember.put` stamps `AuthenticatedAgent`) is offered the affect menu, its inferred EMOTION is
+/// written as `origin = 'DISTILL'` within the confidence ceiling, and the recall final gate's affect
+/// re-check (`affect_repo::affects_for_memories` under role_gateway + `memories_matching`, the
+/// composition `read_materialize::final_memory_ids_about_in_txn` runs) selects its memory by that
+/// inferred label. An Evidence that DECLARED an affect is offered no menu, and its memory carries
+/// only the declared (EXPLICIT) row the 0157 trigger copied. Faults: write inferred rows through
+/// `insert_in_txn` (EXPLICIT); offer the menu to user origins only (the reply's `affects` is then an
+/// extra key and the hop writes no inferred row).
+#[test]
+fn d9_inferred_affect_rows_carry_origin_distill_and_explicit_affects_suppress_them() {
+    let Some(mut f) =
+        setup_db("d9_inferred_affect_rows_carry_origin_distill_and_explicit_affects_suppress_them")
+    else {
+        return;
+    };
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let (inferred, _, _) = seed_evidence_as(
+        &mut f,
+        "Finally shipped the release, what a relief.",
+        "AuthenticatedAgent",
+    );
+    let provider = FakeProvider::new(vec![
+        r#"{"memories":[{"content":"The release shipped.","memory_type":"State","class":"PrivateKnowledge","confidence":0.9,"affects":[{"kind":"EMOTION","label":"RELIEF","valence":7000,"arousal":-2000,"intensity":6000,"confidence":4500}]}]}"#,
+    ]);
+    let report = run_pass(&rt, &f, &provider, "d9-worker-a");
+    assert_eq!(report.memories, 1, "{report:?}");
+    assert!(
+        provider.schemas()[0].contains("\"affects\""),
+        "an AuthenticatedAgent (remember.put) Evidence is offered the affect menu"
+    );
+    assert_eq!(
+        affect_rows_of(&mut f, inferred),
+        vec![("DISTILL".to_owned(), Some("RELIEF".to_owned()), 4500)]
+    );
+    let memory: Uuid = f
+        .admin
+        .query_one(
+            "SELECT memory_id FROM private.memory_evidence WHERE evidence_id = $1",
+            &[&inferred],
+        )
+        .expect("the inferred row's memory")
+        .get(0);
+    let gateway = rt
+        // dep: PostgreSQL(role_gateway) — the recall path's role-scoped pool
+        .block_on(RuntimeDbPool::connect(&dsn_as_role(&f.dsn, "role_gateway")))
+        .expect("gateway pool");
+    let auth = AuthorizationScope::new(
+        TenantId(f.tenant_id),
+        PrincipalId::new(),
+        Some(UserId(f.user_id)),
+        BoundedSet::new([WorkspaceId(f.workspace_id)]).expect("one workspace"),
+    );
+    let rows = rt
+        .block_on(affect_repo::affects_for_memories(
+            &gateway,
+            &auth,
+            &[memory],
+        ))
+        .expect("the recall gate's one affect read");
+    // An EMOTION does not decay (ADR-0030 D-B): its effective intensity is the stored one.
+    let observed: Vec<ObservedAffect> = rows
+        .iter()
+        .map(|row| ObservedAffect {
+            memory_id: row.memory_id,
+            annotation: row.annotation.clone(),
+            effective_intensity: row.annotation.intensity,
+        })
+        .collect();
+    let relief = AffectFilter {
+        labels_any: vec![EmotionLabel::Relief],
+        ..AffectFilter::default()
+    };
+    assert!(
+        memories_matching(&relief, &observed).contains(&memory),
+        "an affect-filtered recall selects the memory by its inferred (DISTILL) row"
+    );
+
+    let (declared, _, _) = seed_evidence_as(
+        &mut f,
+        "This flaky build again, I am furious.",
+        "DirectUserInput",
+    );
+    f.admin
+        .execute(
+            "INSERT INTO private.evidence_affects \
+               (tenant_id, affect_kind, label, valence_bp, intensity_bp, confidence_bp, evidence_id, observed_at) \
+             VALUES ($1, 'EMOTION', 'FRUSTRATION', -8000, 9000, 9000, $2, now())",
+            &[&f.tenant_id, &declared],
+        )
+        .expect("declare an affect on the Evidence (remember.put's carrier)");
+    let provider = FakeProvider::new(vec![
+        r#"{"memories":[{"content":"The build is flaky.","memory_type":"Issue","class":"PrivateKnowledge","confidence":0.9}]}"#,
+    ]);
+    let report = run_pass(&rt, &f, &provider, "d9-worker-b");
+    assert_eq!(report.memories, 1, "{report:?}");
+    assert!(
+        !provider.schemas()[0].contains("\"affects\""),
+        "an Evidence with a declared affect is offered no inference menu"
+    );
+    assert_eq!(
+        affect_rows_of(&mut f, declared),
+        vec![("EXPLICIT".to_owned(), Some("FRUSTRATION".to_owned()), 9000)],
+        "only the declared row, copied by the PRIMARY trigger"
+    );
+    println!("D9 ASSERTION LOG: report={report:?}");
+}
+
+/// ADR-0058 R1: an inferred affect over the ceiling costs the Evidence nothing but its inferred
+/// affects — the reply is accepted, the memory written with zero `origin = 'DISTILL'` rows, the
+/// job DONE on its first call, nothing re-asked, `affects_dropped = 1`. Fault: treat the dropped
+/// affects as a malformed reply → the hop re-asks (attempt 2, `malformed_retries = 1`) and, the
+/// re-ask carrying the same affect, the job is DEAD with no memory.
+#[test]
+fn d10_an_invalid_inferred_affect_drops_the_affects_and_keeps_the_memory() {
+    let Some(mut f) =
+        setup_db("d10_an_invalid_inferred_affect_drops_the_affects_and_keeps_the_memory")
+    else {
+        return;
+    };
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let (evidence, _, _) = seed_evidence_as(
+        &mut f,
+        "Finally shipped the release, what a relief.",
+        "AuthenticatedAgent",
+    );
+    const OVER_CEILING: &str = r#"{"memories":[{"content":"The release shipped.","memory_type":"State","class":"PrivateKnowledge","confidence":0.9,"affects":[{"kind":"EMOTION","label":"RELIEF","intensity":6000,"confidence":9000}]}]}"#;
+    let provider = FakeProvider::new(vec![OVER_CEILING, OVER_CEILING]);
+    let report = run_pass(&rt, &f, &provider, "d10-worker");
+    assert_eq!(
+        (
+            report.memories,
+            report.affects_dropped,
+            report.malformed_retries,
+            report.attempts
+        ),
+        (1, 1, 0, 1),
+        "{report:?}"
+    );
+    assert!(
+        report.summary_line().contains(" affects_dropped=1"),
+        "{report:?}"
+    );
+    let (status, attempt, _, _) = job_state(&mut f, evidence);
+    assert_eq!((status.as_str(), attempt), ("DONE", 1));
+    let o = observe(&mut f, evidence);
+    assert_eq!((o.memories, o.outbox_status.as_str()), (1, "DONE"));
+    assert!(
+        affect_rows_of(&mut f, evidence).is_empty(),
+        "nothing invalid is stored and nothing is clamped"
+    );
+    println!("D10 ASSERTION LOG: report={report:?}");
+}
+
+/// The Evidence's successor tickets (`MEMORY_LIFECYCLE` carriers), `(stream_seq, state,
+/// error_class)` in stream order.
+fn successor_tickets(f: &mut Fixture, evidence_id: Uuid) -> Vec<(i64, String, Option<String>)> {
+    f.admin
+        .query(
+            "SELECT sl.stream_seq, sl.state, sl.error_class FROM ops.outbox o \
+             JOIN projection.stream_log sl ON sl.tenant_id = o.tenant_id AND sl.commit_seq = o.commit_seq \
+             WHERE o.tenant_id = $1 AND o.evidence_id = $2 AND o.event_type = 'MEMORY_LIFECYCLE' \
+             ORDER BY sl.stream_seq",
+            &[&f.tenant_id, &evidence_id],
+        )
+        .expect("successor tickets")
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect()
+}
+
+/// ADR-0058 D-U (review P0 on ruling R4): a DEAD Evidence whose remember ticket already settled
+/// FAILED `distill_failed` is re-driven by `jobs requeue-dead`, and its re-distilled memory reaches
+/// the index through the successor ticket the definer issues — which waits while the re-armed job
+/// is open instead of failing. Faults: the definer issues no successor (0197's body) → red at the
+/// successor count; the projection worker reads the distill state by the ticket's own commit_seq
+/// (the pre-fix lookup) → red, the successor fails `no_visible_memory_record` before the re-run.
+#[test]
+fn d11_a_requeued_dead_evidence_is_projected_by_a_successor_ticket() {
+    let test_name = "d11_a_requeued_dead_evidence_is_projected_by_a_successor_ticket";
+    let Some(mut f) = setup_db(test_name) else {
+        return;
+    };
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let (evidence, _, stream_seq) = seed_evidence(&mut f, "Health endpoint before traffic.");
+    const MALFORMED: &str = r#"{"memories":[{"content":"c","memory_type":"Constraint","class":"PrivateKnowledge","confidence":0.5}]}"#;
+    const VALID: &str = r#"{"memories":[{"content":"Health endpoint before traffic.","memory_type":"Decision","class":"PrivateKnowledge","confidence":0.9}]}"#;
+    let provider = FakeProvider::new(vec![MALFORMED, MALFORMED, VALID]);
+
+    let report = run_pass(&rt, &f, &provider, "d11-worker");
+    assert_eq!(report.dead, 1, "{report:?}");
+    assert_eq!(observe(&mut f, evidence).outbox_status, "FAILED");
+    let Some((outcome, _)) = run_projection(&rt, &f, test_name) else {
+        return;
+    };
+    assert_eq!(outcome.failed, 1, "{outcome:?}");
+    assert_eq!(
+        ticket_state(&mut f, stream_seq),
+        ("FAILED".to_owned(), Some("distill_failed".to_owned()))
+    );
+
+    let job = job_of(&mut f, evidence);
+    let receipt = rt
+        .block_on(async {
+            // dep: PostgreSQL(role_maintenance) — the operator pool of `jobs requeue-dead`
+            let pool = MaintenanceDbPool::connect(&dsn_as_role(&f.dsn, "role_maintenance"))
+                .await
+                .expect("maintenance pool");
+            provisioning::requeue_dead_distill(
+                &pool,
+                f.tenant_id,
+                RequeueTarget::Job(job),
+                &AdminAction {
+                    actor: "c32-d11-test",
+                    reason: "card 32 D-U successor ticket test",
+                    ticket: "T-32-DU",
+                    trace_id: "c32-d11-trace",
+                    step_up_auth_context: "test-mfa",
+                },
+            )
+            .await
+        })
+        .expect("requeue-dead");
+    assert_eq!(receipt.requeued.len(), 1, "{receipt:?}");
+    let successors = successor_tickets(&mut f, evidence);
+    assert_eq!(successors.len(), 1, "one successor ticket: {successors:?}");
+    let (successor, state, _) = successors[0].clone();
+    assert!(successor > stream_seq, "issued after the remember ticket");
+    assert_eq!(state, "ISSUED");
+    assert_eq!(
+        ticket_state(&mut f, stream_seq).0,
+        "FAILED",
+        "the old row is left for the operator's audited retirement"
+    );
+
+    let Some((waiting, _)) = run_projection(&rt, &f, test_name) else {
+        return;
+    };
+    assert_eq!((waiting.pending, waiting.failed), (1, 0), "{waiting:?}");
+    assert_eq!(
+        ticket_state(&mut f, successor),
+        ("ISSUED".to_owned(), None),
+        "the successor waits for the re-armed job"
+    );
+
+    let rerun = run_pass(&rt, &f, &provider, "d11-worker");
+    assert_eq!((rerun.completed, rerun.memories), (1, 1), "{rerun:?}");
+    let Some((indexed, upserts)) = run_projection(&rt, &f, test_name) else {
+        return;
+    };
+    assert_eq!(
+        upserts, 1,
+        "the re-distilled memory reaches the index: {indexed:?}"
+    );
+    assert_eq!(ticket_state(&mut f, successor).0, "DONE");
+    println!(
+        "D11 ASSERTION LOG: dead={report:?} successor={successor} waiting={waiting:?} rerun={rerun:?} indexed={indexed:?} upserts={upserts}"
+    );
+}
+
+/// A tool-channel reply with NO tool call whose `content` (reasoning block included) carries a
+/// valid answer object (ADR-0058 R9).
+const TOOL_CHANNEL_CONTENT_ANSWER: &str = r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"<think>one decision</think>{\"memories\":[{\"content\":\"Health endpoint before traffic.\",\"memory_type\":\"Decision\",\"class\":\"PrivateKnowledge\",\"confidence\":0.9}]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5},"base_resp":{"status_code":0,"status_msg":""}}"#;
+
+/// ADR-0058 R9 (main-line ruling after chain run 2): on the tool channel, a reply with no tool call
+/// whose `content` is a valid answer object goes through the same ADR-0048 parser and is accepted
+/// on the first call — no re-ask, the memory written, `channel_fallback=1` on the dispatch line.
+/// Fault: no fallback (zero tool calls is always a schema failure) → the hop re-asks
+/// (`malformed_retries=1`, two sends) and the job dies DEAD `FAILED_OUTPUT_SCHEMA`.
+#[test]
+fn d12_a_tool_channel_reply_in_content_is_parsed_and_accepted_once() {
+    let Some(mut f) = setup_db("d12_a_tool_channel_reply_in_content_is_parsed_and_accepted_once")
+    else {
+        return;
+    };
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let (evidence, _, _) = seed_evidence(&mut f, EVIDENCE_TEXT);
+    let (provider, sent) = scripted_provider(vec![
+        TOOL_CHANNEL_CONTENT_ANSWER,
+        TOOL_CHANNEL_CONTENT_ANSWER,
+    ]);
+    let report = run_pass(&rt, &f, &provider, "d12-worker");
+    let sends = sent.lock().expect("sent").len();
+    let (status, attempt, _, class) = job_state(&mut f, evidence);
+    let o = observe(&mut f, evidence);
+    println!(
+        "D12 ASSERTION LOG: sends={sends} status={status} attempt={attempt} class={class:?} memories={} outbox={} line={}",
+        o.memories,
+        o.outbox_status,
+        report.summary_line()
+    );
+    assert_eq!(sends, 1, "accepted on the first call, never re-asked");
+    assert_eq!(
+        (report.malformed_retries, report.channel_fallback),
+        (0, 1),
+        "{report:?}"
+    );
+    assert!(
+        report.summary_line().contains(" channel_fallback=1 "),
+        "{}",
+        report.summary_line()
+    );
+    assert_eq!((status.as_str(), attempt), ("DONE", 1));
+    assert_eq!(o.memories, 1);
+    assert_eq!(o.outbox_status, "DONE");
 }

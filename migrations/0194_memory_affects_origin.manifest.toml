@@ -1,0 +1,34 @@
+# §46.1 migration manifest. Card 32 / ADR-0058 D-P (scope 6, ADR-0030 D-C): private.memory_affects
+# gains `origin` (EXPLICIT | DISTILL, default EXPLICIT) and a CHECK capping an inferred row's
+# confidence at 5000 bp. No grant change, no row rewritten. §46 forward-fix (EXPAND_CONTRACT, first
+# free after 0193).
+
+migration_id = "0194_memory_affects_origin"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select not exists (select 1 from information_schema.columns
+                    where table_schema = 'private' and table_name = 'memory_affects'
+                      and column_name = 'origin')
+ and not exists (select 1 from pg_constraint
+                  where conrelid = 'private.memory_affects'::regclass
+                    and conname in ('memory_affects_origin_check',
+                                    'memory_affects_inferred_confidence_ceiling'))
+ as precheck_ok
+"""
+
+postcheck = """
+select exists (select 1 from information_schema.columns
+                where table_schema = 'private' and table_name = 'memory_affects'
+                  and column_name = 'origin' and is_nullable = 'NO'
+                  and column_default = '''EXPLICIT''::text')
+ and (select count(*) from pg_constraint
+       where conrelid = 'private.memory_affects'::regclass and convalidated
+         and conname in ('memory_affects_origin_check',
+                         'memory_affects_inferred_confidence_ceiling')) = 2
+ and not exists (select 1 from private.memory_affects where origin <> 'EXPLICIT')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Reverting is: ALTER TABLE private.memory_affects DROP CONSTRAINT memory_affects_inferred_confidence_ceiling, DROP CONSTRAINT memory_affects_origin_check, DROP COLUMN origin. Safe only while no private-worker binary of card 32 slice 3+ runs (it writes origin = 'DISTILL') and no gateway reads the shadowing AFFECTS_FOR_MEMORIES_SQL."
+backup_restore_requirement = "none: fast-default ADD COLUMN plus two CHECK verification scans; no existing row data is changed."

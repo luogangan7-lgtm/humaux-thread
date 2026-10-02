@@ -21,10 +21,10 @@ use std::time::Duration;
 
 use humaux_adapters::byok::{
     CredentialDecryptor, CredentialRef, EgressHttpTransport, HeaderValue, OpenAiCompatTransport,
-    OpenAiCompatibleProvider, OpenAiHttpRequest, PlaintextApiKey, PrivateInferenceContext,
-    ReasoningCapability, ReasoningDomainId, ReasoningProviderDescriptor, ReasoningProviderError,
-    SsrfCheckedResolver, StructuredReasoningRequest, UserReasoningProvider, ssrf,
-    structured_request_body,
+    OpenAiCompatibleProvider, OpenAiHttpRequest, OutputChannel, PlaintextApiKey,
+    PrivateInferenceContext, ReasoningCapability, ReasoningDomainId, ReasoningProviderDescriptor,
+    ReasoningProviderError, SsrfCheckedResolver, StructuredReasoningRequest, UserReasoningProvider,
+    ssrf, structured_request_body,
 };
 use humaux_domain::dataclass::DataClass;
 use humaux_domain::egress::{AuthorizedEgressPayload, PrivateDataPurpose, ProcessorId, authorize};
@@ -266,6 +266,7 @@ async fn the_production_constructor_hands_one_resolver_to_both_legs() {
         user_prompt: "u".to_string(),
         json_schema: "{}".to_string(),
         max_output_tokens: 8,
+        output: OutputChannel::Content,
     };
     // permit 与 provider 将要发送的字节同源（手抄必漂移 ⇒ EgressPermitPayloadMismatch，
     // 那会在拨号之前就返回，测不到这条判据）。

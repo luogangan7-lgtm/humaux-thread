@@ -737,7 +737,7 @@ fn registry_failure(error: &PrivateProjectionRegistryError) -> (RowTerminal, &'s
 }
 
 /// ADR-0016 D6: what a ticket whose `ops.outbox` row resolves to no memory means, decided from
-/// that row's own status. Distill is asynchronous to remember (§15.5 "0/1/N later"), so "no
+/// the status of its Evidence's `EVIDENCE_ACCEPTED` row (ADR-0058 D-U). Distill is asynchronous to remember (§15.5 "0/1/N later"), so "no
 /// memory yet" is only a gap while the row is still open; a DONE row with no memory is the
 /// legitimate 0-memory outcome and settles as a no-op (`SKIPPED_BY_POLICY`, counted toward the
 /// contiguous prefix like every policy exclusion), and a FAILED row fails the ticket
@@ -831,10 +831,15 @@ async fn resolve_and_embed(
     let memories = resolve_memories(&mut txn, ctx.family.tenant_id.0, commit_seq)
         .await
         .map_err(|e| pg_failure(&e, "db_resolve_failed"))?;
+    // ADR-0058 D-U: the distill state of the Evidence the ticket's carrier binds, whichever
+    // carrier it is — a remember ticket's own EVIDENCE_ACCEPTED row, or the MEMORY_LIFECYCLE
+    // successor `ops.requeue_dead_distill` issues, which must wait for the re-armed job, not fail.
     let outbox_status: Option<String> = if memories.is_empty() {
         sqlx::query_scalar(
-            "SELECT status FROM ops.outbox WHERE tenant_id = $1 AND commit_seq = $2 \
-             AND event_type = 'EVIDENCE_ACCEPTED' ORDER BY created_at DESC LIMIT 1",
+            "SELECT ea.status FROM ops.outbox c \
+             JOIN ops.outbox ea ON ea.tenant_id = c.tenant_id AND ea.evidence_id = c.evidence_id \
+              AND ea.event_type = 'EVIDENCE_ACCEPTED' \
+             WHERE c.tenant_id = $1 AND c.commit_seq = $2 ORDER BY ea.created_at DESC LIMIT 1",
         )
         .bind(ctx.family.tenant_id.0)
         .bind(commit_seq)

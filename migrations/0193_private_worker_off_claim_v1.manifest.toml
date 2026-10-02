@@ -1,0 +1,71 @@
+# §46.1 migration manifest. ADR-0058 D-L (card 32, slice 2): role_private_worker loses EXECUTE on the
+# v1 claim ops.claim_derived_work, which now refuses DERIVED_DISTILL for every caller (consolidation
+# keeps it); ops.claim_derived_work_v2's T6 re-queue backs off on the capped retry schedule with
+# jitter (CREATE OR REPLACE, signature/owner/ACL unchanged); the `adr0058-cutover` block re-opens every
+# Evidence v1 stranded (legacy PROCESSING reset, DEAD-with-open-outbox re-arm, job backfill for open
+# outbox rows without a job, counters reset, scheduler admit). Deploy order: stop private-worker ->
+# migrate -> start. §46 forward-fix (EXPAND_CONTRACT, first free after 0192).
+
+migration_id = "0193_private_worker_off_claim_v1"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('ops.claim_derived_work(text[],text,double precision,bigint)') is not null
+ and to_regprocedure('ops.claim_derived_work_v2(text,double precision,double precision)') is not null
+ and exists (select 1 from pg_constraint where conrelid = 'ops.jobs'::regclass
+              and conname = 'jobs_dispatch_state_check' and convalidated)
+ and has_function_privilege('role_private_worker',
+       'ops.claim_derived_work(text[],text,double precision,bigint)', 'EXECUTE')
+ and position('ADR-0058' in pg_get_functiondef(
+       'ops.claim_derived_work(text[],text,double precision,bigint)'::regprocedure)) = 0
+ -- every Evidence the backfill must cover resolves a reasoning domain (else it would stay stranded)
+ and not exists (select 1 from ops.outbox o
+                 where o.event_type = 'EVIDENCE_ACCEPTED' and o.status in ('PENDING', 'PROCESSING')
+                   and not exists (select 1 from ops.jobs j
+                                   where j.idempotency_key = 'derived-work:DERIVED_DISTILL:' || o.evidence_id::text)
+                   and not exists (select 1 from private.evidence_objects e
+                                   where e.evidence_id = o.evidence_id and e.tenant_id = o.tenant_id
+                                     and e.reasoning_domain_id is not null))
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ not has_function_privilege('role_private_worker',
+       'ops.claim_derived_work(text[],text,double precision,bigint)', 'EXECUTE')
+ and has_function_privilege('role_consolidation_worker',
+       'ops.claim_derived_work(text[],text,double precision,bigint)', 'EXECUTE')
+ and position('claimed only by ops.claim_derived_work_v2 (ADR-0058)' in pg_get_functiondef(
+       'ops.claim_derived_work(text[],text,double precision,bigint)'::regprocedure)) > 0
+ -- v1 owner/definer/search_path survive CREATE OR REPLACE
+ and (select pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+        and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+      from pg_proc p where p.oid = 'ops.claim_derived_work(text[],text,double precision,bigint)'::regprocedure)
+ -- v2: still an owner definer, EXECUTE role_private_worker only, now with the jittered T6 backoff
+ and (select pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+        and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+        and has_function_privilege('role_private_worker', p.oid, 'EXECUTE')
+        and not has_function_privilege('role_consolidation_worker', p.oid, 'EXECUTE')
+        and not has_function_privilege('role_gateway', p.oid, 'EXECUTE')
+        and position('random()' in pg_get_functiondef(p.oid)) > 0
+      from pg_proc p where p.oid = 'ops.claim_derived_work_v2(text,double precision,double precision)'::regprocedure)
+ and not exists (select 1 from ops.jobs
+                 where job_type = 'DERIVED_DISTILL' and status = 'PROCESSING' and dispatch_state is null)
+ and not exists (select 1 from ops.outbox o
+                 where o.event_type = 'EVIDENCE_ACCEPTED' and o.status in ('PENDING', 'PROCESSING')
+                   and not exists (select 1 from ops.jobs j
+                                   where j.idempotency_key = 'derived-work:DERIVED_DISTILL:' || o.evidence_id::text
+                                     and j.status in ('PENDING', 'RETRY_WAIT', 'WAITING_KEY', 'PROCESSING')))
+ and not exists (select 1 from ops.jobs
+                 where job_type = 'DERIVED_DISTILL'
+                   and status in ('PENDING', 'RETRY_WAIT', 'WAITING_KEY', 'PROCESSING')
+                   and (attempt > 0 or abandoned_claims > 0))
+ and not exists (select 1 from ops.jobs j
+                 where j.job_type = 'DERIVED_DISTILL'
+                   and j.status in ('PENDING', 'RETRY_WAIT', 'WAITING_KEY', 'PROCESSING')
+                   and not exists (select 1 from ops.distill_tenant_scheduler t where t.tenant_id = j.tenant_id))
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only. The grant half reverts with GRANT EXECUTE ON FUNCTION ops.claim_derived_work(text[],text,double precision,bigint) TO role_private_worker plus 0164's function body, and 0190's claim_derived_work_v2 body restores the T6 backoff of one lease; never revert the grant while a slice-2 private-worker runs (v1 would claim distill outside the slots). The data repair is not reverted: the re-armed/backfilled jobs are the open work v1 should have kept, and a re-armed row that should stay closed is settled by the worker (FAILED with its outbox row) or parked WAITING_KEY by readiness."
+backup_restore_requirement = "logical backup of ops.jobs (DERIVED_DISTILL rows) before applying in an environment with real tenants: the cutover rewrites status/attempt/abandoned_claims/last_error_class of DEAD and PROCESSING distill rows and inserts jobs. Dev and production-without-data: none."

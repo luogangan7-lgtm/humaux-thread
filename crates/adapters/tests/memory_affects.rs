@@ -1,16 +1,16 @@
 //! `adapters::tests::memory_affects` — Card E1 integration tests — §8.5.1 affect annotation axis (migration 0156,
 //!   ADR-0030) against the *real* `private.memory_affects` under the real runtime roles (`SET LOCAL ROLE`).
-//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, uuid]; services=[PostgreSQL(any)
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, humaux-testkit, postgres, uuid]; services=[PostgreSQL(any)
 //!   w=[control.memberships, control.private_reasoning_domains, control.tenants, control.users, private.events,
 //!   private.evidence_affects, private.evidence_objects, private.memory_affects, private.memory_evidence,
 //!   private.memory_records, private.subjects] x=[private.memory_affects_inherit_from_evidence,
 //!   private.reject_memory_affect_update], PostgreSQL(role_gateway), PostgreSQL(role_private_worker)];
-//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::affect_repo, domain::affect, domain::ids, humaux-testkit]
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::affect_repo, application::affect, domain::affect, domain::ids, humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [affect CHECK sets equal the closed enums and out-of-range basis points are rejected, never clamped;
 //!   rows are immutable (UPDATE 23514, DELETE 42501) and cascade with memory/subject; an isolation setup failure is a
 //!   fixture error]
-//! Spec: Baseline §8.5.1; ADR-0030; §78.2; §37; §79.2
+//! Spec: Baseline §8.5.1; ADR-0030; §78.2; §37; §79.2; ADR-0058
 //!
 //!  1. `affect_checks_match_domain_enums` — the `affect_kind` / `label` / `target_scope_kind`
 //!     CHECK literal sets equal the closed `AffectKind` / `EmotionLabel` /
@@ -29,6 +29,16 @@
 //!     are immutable like `memory_affects`, and the PRIMARY `memory_evidence` INSERT performed by
 //!     `role_private_worker` (the Distill hop's role, its own grants + RLS) copies them verbatim
 //!     onto the newborn memory — a SUPPORTING link copies nothing (D-C, main-line ruling 2).
+//!  5. `affect_origin_closed_set_and_inferred_ceiling_match_the_checks` — 0194's `origin` CHECK
+//!     equals `AffectOrigin::ALL` and its ceiling CHECK names `INFERRED_CONFIDENCE_CEILING_BP`
+//!     (ADR-0058 D-P, §78.2).
+//!  6. `an_inferred_affect_over_the_ceiling_is_rejected_by_the_store` — a DISTILL row over the
+//!     ceiling (or an unknown origin) is `23514` under `role_private_worker`, the ceiling itself is
+//!     accepted, and an EXPLICIT row keeps the full range.
+//!  7. `explicit_annotation_shadows_inferred_rows_in_the_one_read` — a memory with a DISTILL row
+//!     and an EXPLICIT row comes back from `AFFECTS_FOR_MEMORIES_SQL` with the EXPLICIT row only,
+//!     so `application::affect::memories_matching` cannot match it on the inferred value; a memory
+//!     with only a DISTILL row still returns it; one scan still (ADR-0058 D-P).
 //!
 //! Skip contract (`humaux_testkit`, §79.2): no DSN / unreachable / 0156+0157 not applied ⇒ visible SKIP.
 //! Every test runs inside one rolled-back transaction, so a passing run leaves the dev DB clean.
@@ -36,7 +46,11 @@
 use std::time::Instant;
 
 use humaux_adapters::affect_repo::AFFECTS_FOR_MEMORIES_SQL;
-use humaux_domain::affect::{AffectKind, AffectTargetScopeKind, BasisPoints, EmotionLabel};
+use humaux_application::affect::{ObservedAffect, memories_matching};
+use humaux_domain::affect::{
+    AffectAnnotation, AffectFilter, AffectKind, AffectOrigin, AffectTargetScopeKind,
+    BasisPointRange, BasisPoints, EmotionLabel, INFERRED_CONFIDENCE_CEILING_BP,
+};
 use humaux_domain::ids::{TenantId, UserId};
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::error::SqlState;
@@ -63,14 +77,17 @@ impl DbIntegrationFixture for AffectFixture {
                 "SELECT to_regclass('private.memory_affects') IS NOT NULL \
                  AND to_regprocedure('private.reject_memory_affect_update()') IS NOT NULL \
                  AND to_regclass('private.evidence_affects') IS NOT NULL \
-                 AND to_regprocedure('private.memory_affects_inherit_from_evidence()') IS NOT NULL",
+                 AND to_regprocedure('private.memory_affects_inherit_from_evidence()') IS NOT NULL \
+                 AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'private' \
+                             AND table_name = 'memory_affects' AND column_name = 'origin')",
                 &[],
             )
             .map(|r| r.get(0))
             .unwrap_or(false);
         if !ready {
             return Err(DbFixtureSkipReason::IsolationSetupFailed(
-                "migrations 0156_memory_affects / 0157_evidence_affects not applied".to_string(),
+                "migrations 0156_memory_affects / 0157_evidence_affects / 0194_memory_affects_origin not applied"
+                    .to_string(),
             ));
         }
         Ok(AffectHandle { client })
@@ -713,6 +730,198 @@ fn evidence_affects_copy_onto_the_primary_memory_under_private_worker() {
         // Provenance of the copy is the Evidence itself, and the target subject survived the copy.
         assert!(inherited.iter().all(|t| t.4 == evidence));
         assert_eq!(inherited[0].5, Some(person));
+        txn.rollback().expect("rollback");
+    });
+}
+
+/// One `memory_affects` row with an explicit `origin`: `(valence, confidence)` of an EMOTION.
+const INSERT_AFFECT_WITH_ORIGIN: &str = "INSERT INTO private.memory_affects \
+       (tenant_id, memory_id, affect_kind, valence_bp, arousal_bp, intensity_bp, confidence_bp, \
+        evidence_id, observed_at, origin) \
+     VALUES ($1, $2, 'EMOTION', $3, 0, 6000, $4, $5, now(), $6) RETURNING affect_id";
+
+/// ADR-0058 D-P (§78.2) — fault: add a Rust variant only / change the Rust ceiling.
+#[test]
+fn affect_origin_closed_set_and_inferred_ceiling_match_the_checks() {
+    run_db_fixture::<AffectFixture, _>("affect_origin_closed_set", |mut handle| {
+        let def: String = handle
+            .client
+            .query_one(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+                 WHERE conrelid = 'private.memory_affects'::regclass \
+                   AND conname = 'memory_affects_origin_check'",
+                &[],
+            )
+            .expect("origin CHECK")
+            .get(0);
+        assert!(
+            def.contains("IN (") || def.contains("= ANY (ARRAY["),
+            "closed-set CHECK shape: {def}"
+        );
+        for origin in AffectOrigin::ALL {
+            assert!(def.contains(&format!("'{}'", origin.as_str())), "{def}");
+        }
+        assert_eq!(
+            def.matches('\'').count() / 2,
+            AffectOrigin::ALL.len(),
+            "origin CHECK literal count != enum size: {def}"
+        );
+        let ceiling: String = handle
+            .client
+            .query_one(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+                 WHERE conrelid = 'private.memory_affects'::regclass \
+                   AND conname = 'memory_affects_inferred_confidence_ceiling'",
+                &[],
+            )
+            .expect("ceiling CHECK")
+            .get(0);
+        assert!(
+            ceiling.contains(&format!(
+                "confidence_bp <= {INFERRED_CONFIDENCE_CEILING_BP}"
+            )),
+            "the store ceiling is the Rust ceiling: {ceiling}"
+        );
+        assert!(
+            ceiling.contains("'EXPLICIT'"),
+            "only DISTILL is capped: {ceiling}"
+        );
+    });
+}
+
+/// ADR-0058 D-P — fault: drop `memory_affects_inferred_confidence_ceiling`.
+#[test]
+fn an_inferred_affect_over_the_ceiling_is_rejected_by_the_store() {
+    run_db_fixture::<AffectFixture, _>("inferred_affect_over_ceiling", |mut handle| {
+        let tenant = TenantId::new().0;
+        let mut txn = handle.client.transaction().expect("begin");
+        let (user, domain) = seed_tenant(&mut txn, tenant, "ceiling");
+        let (evidence, memory) = seed_memory(&mut txn, tenant, domain);
+        // The distill hop's role and context (its own grants + RLS).
+        // dep: PostgreSQL(role_private_worker) — role switch before the scoped statements for `an_inferred_affect_over_the_ceiling_is_rejected_by_the_store`
+        txn.batch_execute(&format!(
+            "SET LOCAL ROLE role_private_worker; SET LOCAL humaux.tenant_id = '{tenant}'; \
+             SET LOCAL humaux.user_id = '{user}';"
+        ))
+        .expect("private worker context");
+        let over = INFERRED_CONFIDENCE_CEILING_BP + 1000;
+        for (origin, confidence, refused) in [
+            ("DISTILL", over, true),
+            ("BOGUS", 1000, true),
+            ("DISTILL", INFERRED_CONFIDENCE_CEILING_BP, false),
+            ("EXPLICIT", 10_000, false),
+        ] {
+            let mut sp = txn.savepoint("origin").expect("savepoint");
+            let result = sp.query_one(
+                INSERT_AFFECT_WITH_ORIGIN,
+                &[&tenant, &memory, &7_000i16, &confidence, &evidence, &origin],
+            );
+            if refused {
+                let err = result.expect_err("refused by the store, never clamped");
+                assert_eq!(
+                    sqlstate(&err),
+                    Some(SqlState::CHECK_VIOLATION),
+                    "{origin}/{confidence}: {err}"
+                );
+            } else {
+                result.unwrap_or_else(|e| panic!("{origin}/{confidence} accepted: {e}"));
+                sp.commit().expect("release savepoint");
+                continue;
+            }
+            drop(sp);
+        }
+        assert_eq!(affects_of(&mut txn, memory), 2);
+        txn.batch_execute("RESET ROLE").expect("superuser");
+        txn.rollback().expect("rollback");
+    });
+}
+
+/// ADR-0058 D-P (explicit remains authoritative at recall) — fault: drop the `has_explicit`
+/// predicate from `AFFECTS_FOR_MEMORIES_SQL`.
+#[test]
+fn explicit_annotation_shadows_inferred_rows_in_the_one_read() {
+    run_db_fixture::<AffectFixture, _>("explicit_shadows_inferred", |mut handle| {
+        let tenant = TenantId::new().0;
+        let mut txn = handle.client.transaction().expect("begin");
+        let (user, domain) = seed_tenant(&mut txn, tenant, "shadow");
+        let (evidence, shadowed) = seed_memory(&mut txn, tenant, domain);
+        let (evidence_only, inferred_only) = seed_memory(&mut txn, tenant, domain);
+        for (memory, ev, valence, origin) in [
+            (shadowed, evidence, 8_000i16, "DISTILL"),
+            (shadowed, evidence, -8_000, "EXPLICIT"),
+            (inferred_only, evidence_only, 8_000, "DISTILL"),
+        ] {
+            txn.query_one(
+                INSERT_AFFECT_WITH_ORIGIN,
+                &[&tenant, &memory, &valence, &4_000i16, &ev, &origin],
+            )
+            .expect("seed affect");
+        }
+        // The read exactly as the gateway's recall filter issues it.
+        // dep: PostgreSQL(role_gateway) — role switch before the scoped statements for `explicit_annotation_shadows_inferred_rows_in_the_one_read`
+        txn.batch_execute(&format!(
+            "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{tenant}'; \
+             SET LOCAL humaux.user_id = '{user}';"
+        ))
+        .expect("gateway context");
+        let before = affect_table_scans(&mut txn);
+        let rows = txn
+            .query(
+                AFFECTS_FOR_MEMORIES_SQL,
+                &[&tenant, &vec![shadowed, inferred_only]],
+            )
+            .expect("one set-based read");
+        assert_eq!(affect_table_scans(&mut txn) - before, 1, "still one scan");
+        let observed: Vec<ObservedAffect> = rows
+            .iter()
+            .map(|row| ObservedAffect {
+                memory_id: row.get("memory_id"),
+                annotation: AffectAnnotation {
+                    kind: AffectKind::Emotion,
+                    label: None,
+                    valence: row
+                        .get::<_, Option<i16>>("valence_bp")
+                        .map(|v| BasisPoints::signed(v).expect("valence")),
+                    arousal: None,
+                    dominance: None,
+                    intensity: BasisPoints::unit(row.get("intensity_bp")).expect("intensity"),
+                    confidence: BasisPoints::unit(row.get("confidence_bp")).expect("confidence"),
+                    target_subject: None,
+                    target_scope: None,
+                },
+                effective_intensity: BasisPoints::unit(row.get("intensity_bp")).expect("intensity"),
+            })
+            .collect();
+        let of = |memory: Uuid| -> Vec<i16> {
+            observed
+                .iter()
+                .filter(|o| o.memory_id == memory)
+                .filter_map(|o| o.annotation.valence.map(BasisPoints::get))
+                .collect()
+        };
+        assert_eq!(
+            of(shadowed),
+            vec![-8_000],
+            "the EXPLICIT row shadows the inferred one"
+        );
+        assert_eq!(
+            of(inferred_only),
+            vec![8_000],
+            "an unshadowed inferred row is read"
+        );
+        let positive = AffectFilter {
+            valence: Some(
+                BasisPointRange::new(BasisPoints::ZERO, BasisPoints::MAX).expect("range"),
+            ),
+            ..AffectFilter::default()
+        };
+        let matched = memories_matching(&positive, &observed);
+        assert!(
+            !matched.contains(&shadowed),
+            "recall must not match a memory on an inferred value its explicit annotation contradicts"
+        );
+        assert!(matched.contains(&inferred_only));
+        txn.batch_execute("RESET ROLE").expect("superuser");
         txn.rollback().expect("rollback");
     });
 }

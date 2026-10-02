@@ -635,6 +635,13 @@ class among the **supplied** inputs, and that maximum is known before the call â
 be cut to it regardless of which subset the model ends up using. That is a one-function change
 of the same shape as `admissible_classes`, for whichever card owns that file.
 
+**Resolved in card 32 (ADR-0058 D-O).** `consolidation_prompt_contract(ceiling)` renders rule (4)
+and the schema's `class` enum from `admissible_classes(ceiling)`, where the ceiling is the highest
+class among the run's supplied inputs; the "must NOT rank above" negative constraint is gone and
+`CONSOLIDATION_PROMPT_CONTRACT_VERSION` is 2. `validate_rollup_before_publish` still rejects an
+over-ceiling rollup (never clamps). Gate: `consolidation_reasoner::consolidation_menu_is_the_ceiling`
+(fault: render all seven â‡’ red).
+
 ### 6.9 Provider and host dependence
 
 - The delivery path depends on **real DashScope** (embeddings) and **real MiniMax** (distill,

@@ -1,8 +1,8 @@
 //! `domain::affect` — the §8.5.1 affect annotation axis (ADR-0030, card E1).
 //! Depends-on: crates=[uuid]; services=[]; env=[]; modules=[domain::error, domain::subject]
-//! Called-by: [adapters::affect_repo, adapters::memory_governance_repo, adapters::projection_worker, adapters::qdrant, adapters::read_materialize, adapters::remember, adapters::retrieve, application::affect, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, projection::dense, tests, xtask::architecture_check]
+//! Called-by: [adapters::affect_repo, adapters::distill_reasoner, adapters::memory_governance_repo, adapters::projection_worker, adapters::qdrant, adapters::read_materialize, adapters::remember, adapters::retrieve, application::affect, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, projection::dense, tests, xtask::architecture_check]
 //! Invariants: []
-//! Spec: Baseline §8.5.1; §33.10; §59; ADR-0030
+//! Spec: Baseline §8.5.1; §33.10; §59; ADR-0030; ADR-0058
 //!
 //! A Memory says *what* (`MemoryType`), is *about* someone (`subject`), is believed *because*
 //! (Authority / Evidence) and is *currently valid or not* (lifecycle). This module adds the fourth
@@ -32,6 +32,11 @@
 //! | [`EmotionLabel`]           | `label` (12 values)                        |
 //! | [`AffectTargetScopeKind`]  | `target_scope_kind` (5 `§59` scope layers) |
 //! | [`BasisPoints`]            | `*_bp` smallint range CHECKs               |
+//! | [`AffectOrigin`]           | `origin` (`EXPLICIT` / `DISTILL`, 0194)    |
+//!
+//! ADR-0058 D-P: distill may INFER an affect for a user-origin Evidence. Such a row is
+//! [`AffectOrigin::Distill`], its confidence never exceeds [`INFERRED_CONFIDENCE_CEILING_BP`]
+//! (a store CHECK), and any `EXPLICIT` row of the same memory shadows it in the one affect read.
 
 use std::time::Duration;
 
@@ -371,6 +376,39 @@ pub fn memory_congruence<'a>(
         .unwrap_or(NEUTRAL_CONGRUENCE)
 }
 
+/// Who asserted an affect row (ADR-0058 D-P). Frozen closed set; wire form =
+/// `private.memory_affects.origin`'s CHECK (0194).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AffectOrigin {
+    /// Declared by a principal (`memory.annotate_affect`, `memory.correct`, `remember.put`).
+    Explicit,
+    /// Inferred by the distill hop from a user-origin Evidence; lower authority by construction:
+    /// capped confidence, shadowed by any `Explicit` row of its memory.
+    Distill,
+}
+
+impl AffectOrigin {
+    /// All variants — the §78.2 contract-test surface.
+    pub const ALL: [AffectOrigin; 2] = [AffectOrigin::Explicit, AffectOrigin::Distill];
+
+    /// Wire string frozen on `private.memory_affects.origin`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AffectOrigin::Explicit => "EXPLICIT",
+            AffectOrigin::Distill => "DISTILL",
+        }
+    }
+
+    /// Parse a wire string; unknown input is `None`.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+}
+
+/// ADR-0058 D-P: the highest `confidence_bp` an [`AffectOrigin::Distill`] row may carry — a schema
+/// invariant (`memory_affects_inferred_confidence_ceiling`, pinned by contract test), not a tunable.
+pub const INFERRED_CONFIDENCE_CEILING_BP: i16 = 5_000;
+
 /// The non-destructive affect write (ADR-0030 D-C): `memory.annotate_affect` appends affect
 /// rows to an existing visible memory. Ordinary admitted write, NO confirm gate (§33.10 gates
 /// destructive ops only; annotating deletes/hides nothing). Frozen closed set, same shape as
@@ -400,6 +438,15 @@ impl AffectWriteOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affect_origin_round_trips_and_rejects_unknown() {
+        for origin in AffectOrigin::ALL {
+            assert_eq!(AffectOrigin::parse(origin.as_str()), Some(origin));
+        }
+        assert_eq!(AffectOrigin::parse("explicit"), None);
+        assert!(BasisPoints::unit(INFERRED_CONFIDENCE_CEILING_BP).is_ok());
+    }
 
     fn bp(v: i16) -> BasisPoints {
         BasisPoints::signed(v).expect("in range")

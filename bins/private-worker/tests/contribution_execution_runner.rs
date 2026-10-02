@@ -138,6 +138,7 @@ impl UserReasoningProvider for RecordingProvider {
             ProviderStep::Json(json) => Ok(StructuredReasoningResponse {
                 json,
                 usage: TokenUsage::default(),
+                channel_fallback: false,
             }),
             ProviderStep::RemoveThenJson(path, json) => {
                 fs::remove_file(path)
@@ -145,6 +146,7 @@ impl UserReasoningProvider for RecordingProvider {
                 Ok(StructuredReasoningResponse {
                     json,
                     usage: TokenUsage::default(),
+                    channel_fallback: false,
                 })
             }
             ProviderStep::SleepThenJson(duration, json) => {
@@ -152,6 +154,7 @@ impl UserReasoningProvider for RecordingProvider {
                 Ok(StructuredReasoningResponse {
                     json,
                     usage: TokenUsage::default(),
+                    channel_fallback: false,
                 })
             }
             ProviderStep::Permanent => Err(ReasoningProviderError::ProviderPermanent {

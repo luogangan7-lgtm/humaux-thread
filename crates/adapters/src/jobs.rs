@@ -1,11 +1,13 @@
 //! `adapters::jobs` — `ops.jobs` SKIP LOCKED claim, lease heartbeat, and terminal-state transitions (§31 Durable Jobs
 //!   / §61 SKIP LOCKED Claim SQL).
-//! Depends-on: crates=[serde_json, sqlx]; services=[PostgreSQL(any) r=[ops.claim_derived_work] w=[ops.jobs] x=[ops.claim_derived_work]]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::postgres]
-//! Called-by: [adapters::consolidate_repo, humaux-consolidation-worker, humaux-private-worker, private-worker::distill, tests]
-//! Invariants: [one tenant per call: each function opens a transaction and sets humaux.tenant_id before touching
-//!   FORCE-RLS ops.jobs; claims use SKIP LOCKED with a lease; a PG error returns to the caller with no job state
-//!   change]
-//! Spec: Baseline §31; §6.1; §48.2; §62; §32; §61
+//! Depends-on: crates=[serde_json, sqlx]; services=[PostgreSQL(any) r=[ops.claim_derived_work] w=[ops.jobs] x=[ops.admit_distill_budget, ops.begin_call, ops.claim_derived_work, ops.claim_derived_work_v2, ops.distill_slots_all_bound, ops.finish_derived_work_v2, ops.renew_lease]]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::postgres]
+//! Called-by: [adapters::consolidate_repo, adapters::distill_repo, humaux-consolidation-worker, humaux-private-worker, private-worker::distill, private-worker::main, tests]
+//! Invariants: [one tenant per call: each table-level function opens a transaction and sets humaux.tenant_id before
+//!   touching FORCE-RLS ops.jobs; claims use SKIP LOCKED with a lease; a PG error returns to the caller with no job
+//!   state change; distill claims go only through the four ADR-0058 owner definers, which filter by tenant and job
+//!   themselves; for DERIVED_DISTILL the attempt moves at begin_call, never at claim, a request is admitted only
+//!   within the tenant's §72.3 budget (same transaction as begin_call), and a WAITING_KEY finish reverts its attempt]
+//! Spec: Baseline §31; §6.1; §48.2; §62; §32; §61; §67.2; §11; ADR-0058
 //!
 //! `ops.jobs` already carries every column §31 lists (`migrations/0008_ops_core.sql`) and its
 //! `status` CHECK constraint already enumerates all seven states — this module adds no
@@ -17,9 +19,9 @@
 //! (§48.2 "所有 runtime role: NOBYPASSRLS"). Each call opens its own transaction, sets
 //! `SET LOCAL humaux.tenant_id` (cleared automatically on commit/rollback, §62), then runs its
 //! query — mirroring the transaction-scoped tenant context §62 requires for every application
-//! transaction. Tenant fairness *across* tenants (round-robining `claim` calls with cost
-//! weighting) is §32's Tenant Fair Scheduler, a separate task; this module is the primitive it
-//! will call once per eligible tenant.
+//! transaction. Tenant fairness *across* tenants exists for `DERIVED_DISTILL` only: ADR-0058's
+//! [`claim_distill`] serves the least-recently-served tenant through four provider slots (§67.2);
+//! cost weighting (§32 DRR) is not built (ADR-0058 L2).
 //!
 //! Enqueueing (`INSERT INTO ops.jobs`) is out of this module's scope. One consequence worth
 //! flagging for that future task: §61's claim SQL filters `next_retry_at <= now()` verbatim,
@@ -380,38 +382,328 @@ pub async fn claim_derived_work_consolidation(
     Ok(claimed)
 }
 
-/// `role_private_worker`'s entry point to [`claim_derived_work_in_txn`].
-pub async fn claim_derived_work_private(
-    pool: &PrivateWorkerDbPool,
-    kinds: &[DerivedJobType],
-    lease_owner: &str,
-    lease_seconds: f64,
-    limit: i64,
-) -> Result<Vec<ClaimedJob>, JobsError> {
-    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
-    let mut txn = pool.pool().begin().await?;
-    let claimed =
-        claim_derived_work_in_txn(&mut txn, kinds, lease_owner, lease_seconds, limit).await?;
-    txn.commit().await?;
-    Ok(claimed)
-}
+/// The cap of [`retry_backoff_seconds`]. ADR-0058: `ops.claim_derived_work_v2`'s T6 re-queue
+/// (0193) applies the same capped schedule in SQL; the contract test pins the two to one value.
+pub const RETRY_BACKOFF_CAP_SECONDS: f64 = 300.0;
 
-/// Post-claim lease refresh and terminal transition. Both run under NORMAL RLS with the claimed
-/// job's own tenant installed — that is the whole point of the split: only the discovery read is
-/// privileged, everything after it is tenant-scoped again.
 /// Capped exponential backoff for a job this pass is handing back, in seconds.
 ///
-/// `attempt` is the claim's own monotonic fencing token, so the delay grows with the number of
-/// times the row has already been tried; `lease_seconds` is the base because it is the operator's
+/// `attempt` is the number of times the row has already been tried (for `DERIVED_DISTILL`: admitted
+/// provider calls, ADR-0058 D-F); `lease_seconds` is the base because it is the operator's
 /// existing "how long is one attempt worth" dial — a released job that becomes eligible again
 /// sooner than one lease could ever complete is just a spin. Without this the row kept the
 /// enqueue trigger's `next_retry_at` (already in the past), so every poll burned one attempt with
 /// zero delay and a tenant whose environment was not ready yet exhausted `max_attempts` in
 /// seconds (ADR-0036 D5).
-fn retry_backoff_seconds(lease_seconds: f64, attempt: i32) -> f64 {
-    const CAP_SECONDS: f64 = 300.0;
+pub fn retry_backoff_seconds(lease_seconds: f64, attempt: i32) -> f64 {
     let doublings = attempt.clamp(1, 16) - 1;
-    (lease_seconds * f64::from(2i32.pow(u32::try_from(doublings).unwrap_or(0)))).min(CAP_SECONDS)
+    (lease_seconds * f64::from(2i32.pow(u32::try_from(doublings).unwrap_or(0))))
+        .min(RETRY_BACKOFF_CAP_SECONDS)
+}
+
+/// ADR-0058 D-A closed set (§78.2): the call state of a claimed `DERIVED_DISTILL` job while it is
+/// `PROCESSING`, in `ops.jobs_dispatch_state_check`'s order (pinned by contract test).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchState {
+    /// Claimed, no provider request admitted yet (R-32 CLAIMED_NOT_DISPATCHED).
+    Claimed,
+    /// `ops.begin_call` admitted a request; the slot is held until a finish or `hard_deadline`.
+    DispatchIntent,
+    /// The lease expired while a request was admitted: the outcome is unknown and the slot is
+    /// kept until `hard_deadline` (ADR-0058 D-G).
+    ExecutionUncertain,
+}
+
+impl DispatchState {
+    /// Every variant, in the CHECK constraint's order.
+    pub const ALL: [DispatchState; 3] = [
+        Self::Claimed,
+        Self::DispatchIntent,
+        Self::ExecutionUncertain,
+    ];
+
+    /// The `ops.jobs.dispatch_state` spelling.
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Claimed => "CLAIMED",
+            Self::DispatchIntent => "DISPATCH_INTENT",
+            Self::ExecutionUncertain => "EXECUTION_UNCERTAIN",
+        }
+    }
+}
+
+/// ADR-0058 D-E/D-F/D-H closed set (§78.2): how `ops.finish_derived_work_v2` settles a distill
+/// claim, pinned against the function's own `ARRAY[...]` guard by contract test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistillFinish {
+    /// The business writes committed in the same transaction; the job is finished.
+    Done,
+    /// A counted call failed; back off by the given seconds.
+    Retry,
+    /// Nothing was dispatched (no usable binding, domain mismatch, refused first call); backs off,
+    /// and parks as `WAITING_KEY` once not ready for the park age.
+    NotReady,
+    /// §11: provider 401 — parked, the call's attempt reverted, never DEAD.
+    WaitingKey,
+    /// Attempts exhausted or a fail-closed refusal; terminal with its class.
+    Dead,
+}
+
+impl DistillFinish {
+    /// Every variant, in the SQL guard's order.
+    pub const ALL: [DistillFinish; 5] = [
+        Self::Done,
+        Self::Retry,
+        Self::NotReady,
+        Self::WaitingKey,
+        Self::Dead,
+    ];
+
+    /// The `p_outcome` spelling `ops.finish_derived_work_v2` accepts.
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Done => "DONE",
+            Self::Retry => "RETRY",
+            Self::NotReady => "NOT_READY",
+            Self::WaitingKey => "WAITING_KEY",
+            Self::Dead => "DEAD",
+        }
+    }
+}
+
+/// One `DERIVED_DISTILL` job as the v2 claim returned it (`PROCESSING` / `CLAIMED`).
+#[derive(Debug, Clone)]
+pub struct DistillClaim {
+    /// The claimed job.
+    pub job_id: Uuid,
+    /// Its tenant; every later read/write installs this tenant (§62).
+    pub tenant_id: Uuid,
+    /// ADR-0058 D-E fencing token of this claim.
+    pub claim_generation: i32,
+    /// Provider requests admitted so far (counted at `begin_call`, never at claim).
+    pub attempt: i32,
+    /// Claims that expired before any request was admitted (D-F pre-dispatch cap).
+    pub abandoned_claims: i32,
+    /// The 0164 enqueue payload (`reasoning_domain_id`, `evidence_id`).
+    pub payload: serde_json::Value,
+    /// Lease end as claimed.
+    pub lease_expires_at: OffsetDateTime,
+    /// End of this claim: the lease never passes it.
+    pub hard_deadline: OffsetDateTime,
+    /// Class of the previous settle, if any.
+    pub last_error_class: Option<String>,
+    /// Since when the job has been not ready (D-H park age), if it is.
+    pub not_ready_since: Option<OffsetDateTime>,
+    /// The ledger row of the claim's last admitted request — after a T6 re-queue, the call whose
+    /// outcome stayed unknown.
+    pub dispatch_model_call_id: Option<Uuid>,
+}
+
+impl DistillClaim {
+    fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, JobsError> {
+        Ok(Self {
+            job_id: row.try_get("job_id")?,
+            tenant_id: row.try_get("tenant_id")?,
+            claim_generation: row.try_get("claim_generation")?,
+            attempt: row.try_get("attempt")?,
+            abandoned_claims: row.try_get("abandoned_claims")?,
+            payload: row.try_get("payload")?,
+            lease_expires_at: row.try_get("lease_expires_at")?,
+            hard_deadline: row.try_get("hard_deadline")?,
+            last_error_class: row.try_get("last_error_class")?,
+            not_ready_since: row.try_get("not_ready_since")?,
+            dispatch_model_call_id: row.try_get("dispatch_model_call_id")?,
+        })
+    }
+}
+
+/// The exact distill lease a seat holds: identity plus the claim generation (ADR-0058 D-E).
+#[derive(Debug, Clone, Copy)]
+pub struct DistillLease<'a> {
+    /// The claimed job.
+    pub job_id: Uuid,
+    /// Its tenant.
+    pub tenant_id: Uuid,
+    /// This process's `lease_owner`.
+    pub lease_owner: &'a str,
+    /// The generation the claim returned; a superseded one renews, dispatches and settles nothing.
+    pub claim_generation: i32,
+}
+
+impl<'a> DistillLease<'a> {
+    /// The lease exactly as [`claim_distill`] handed it back.
+    pub fn of(claim: &DistillClaim, lease_owner: &'a str) -> Self {
+        Self {
+            job_id: claim.job_id,
+            tenant_id: claim.tenant_id,
+            lease_owner,
+            claim_generation: claim.claim_generation,
+        }
+    }
+}
+
+/// ADR-0058 T1: claims at most one `DERIVED_DISTILL` job through the tenant-fair, slot-bounded
+/// owner definer (which also sweeps expired claims). `None` = no free slot or no READY work.
+pub async fn claim_distill(
+    pool: &PrivateWorkerDbPool,
+    lease_owner: &str,
+    lease_seconds: f64,
+    hard_deadline_seconds: f64,
+) -> Result<Option<DistillClaim>, JobsError> {
+    // dep: PostgreSQL(any) — executes ops.claim_derived_work_v2 against the pool
+    let row = sqlx::query("SELECT * FROM ops.claim_derived_work_v2($1, $2, $3)")
+        .bind(lease_owner)
+        .bind(lease_seconds)
+        .bind(hard_deadline_seconds)
+        .fetch_optional(pool.pool())
+        .await?;
+    row.as_ref().map(DistillClaim::from_row).transpose()
+}
+
+/// ADR-0058 R5: whether every provider slot was bound when read (MVCC, no lock) — the drain's
+/// reason for an empty [`claim_distill`] answer (`no_slot`), as opposed to no READY job it could
+/// take (`no_work`).
+pub async fn distill_slots_all_bound(pool: &PrivateWorkerDbPool) -> Result<bool, JobsError> {
+    // dep: PostgreSQL(any) — executes ops.distill_slots_all_bound against the pool
+    Ok(sqlx::query_scalar("SELECT ops.distill_slots_all_bound()")
+        .fetch_one(pool.pool())
+        .await?)
+}
+
+/// ADR-0058 T7: generation-fenced heartbeat. `Ok(None)` = the lease is lost (superseded
+/// generation, expired lease, or `hard_deadline` reached); `Err` = transient DB failure.
+pub async fn renew_distill_lease(
+    pool: &PrivateWorkerDbPool,
+    lease: &DistillLease<'_>,
+    lease_seconds: f64,
+) -> Result<Option<OffsetDateTime>, JobsError> {
+    // dep: PostgreSQL(any) — executes ops.renew_lease against the pool
+    let until: Option<OffsetDateTime> =
+        sqlx::query_scalar("SELECT ops.renew_lease($1, $2, $3, $4, $5)")
+            .bind(lease.job_id)
+            .bind(lease.tenant_id)
+            .bind(lease.lease_owner)
+            .bind(lease.claim_generation)
+            .bind(lease_seconds)
+            .fetch_one(pool.pool())
+            .await?;
+    Ok(until)
+}
+
+/// §72.3 tenant distill budget (ADR-0058 D-T): at most `max_calls` admitted requests of one tenant
+/// whose `ops.distill_calls.begun_at` lies in the last `window_seconds`. Deployment configuration
+/// (`HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_*`, §78.1), passed into `ops.admit_distill_budget`.
+// ponytail: one deployment-wide window/limit counting requests, not tokens (ADR-0058 L18); per-plan
+// limits from the entitlement snapshot and ledger-token weighting when card 38 adds the breaker.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DistillCallBudget {
+    /// Length of the sliding window, seconds (> 0).
+    pub window_seconds: f64,
+    /// Admitted requests of one tenant allowed inside the window (>= 1).
+    pub max_calls: i32,
+}
+
+/// What [`begin_distill_call`] decided about one provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallAdmission {
+    /// The request may leave; the job's attempt count after counting it.
+    Admitted(i32),
+    /// The claim's fence refused it (owner, generation, lease, slot or deadline): no request.
+    Refused,
+    /// The tenant's §72.3 budget is spent for now: no request, nothing counted, no row written.
+    OverBudget,
+}
+
+/// ADR-0058 T2 behind the D-T budget: ONE transaction runs `ops.admit_distill_budget` (which holds
+/// the tenant's budget lock to commit) and then `ops.begin_call` (attempt + 1, `DISPATCH_INTENT`,
+/// one `ops.distill_calls` row naming `model_call_id`). Every request of a claim passes here — the
+/// first one, a re-ask and the T6 resend after `EXECUTION_UNCERTAIN` (main-line ruling E1 guard d).
+/// `min_remaining_seconds` is the HTTP window plus one lease for the post-call legs (D-J).
+pub async fn begin_distill_call(
+    pool: &PrivateWorkerDbPool,
+    lease: &DistillLease<'_>,
+    model_call_id: Uuid,
+    min_remaining_seconds: f64,
+    budget: DistillCallBudget,
+) -> Result<CallAdmission, JobsError> {
+    // dep: PostgreSQL(any) — opens the admission transaction
+    let mut txn = pool.pool().begin().await?;
+    // dep: PostgreSQL(any) — executes ops.admit_distill_budget inside the admission transaction
+    let within: bool = sqlx::query_scalar("SELECT ops.admit_distill_budget($1, $2, $3)")
+        .bind(lease.tenant_id)
+        .bind(budget.window_seconds)
+        .bind(budget.max_calls)
+        .fetch_one(&mut *txn)
+        .await?;
+    if !within {
+        txn.rollback().await?;
+        return Ok(CallAdmission::OverBudget);
+    }
+    // dep: PostgreSQL(any) — executes ops.begin_call inside the admission transaction
+    let attempt: Option<i32> = sqlx::query_scalar("SELECT ops.begin_call($1, $2, $3, $4, $5, $6)")
+        .bind(lease.job_id)
+        .bind(lease.tenant_id)
+        .bind(lease.lease_owner)
+        .bind(lease.claim_generation)
+        .bind(model_call_id)
+        .bind(min_remaining_seconds)
+        .fetch_one(&mut *txn)
+        .await?;
+    txn.commit().await?;
+    Ok(attempt.map_or(CallAdmission::Refused, CallAdmission::Admitted))
+}
+
+/// ADR-0058 T3 inside a CALLER-owned transaction: the first statement of the worker's settle
+/// transaction, so the business writes and the settle commit or roll back together. `false` =
+/// the generation was superseded (or the job already settled): the caller must roll back.
+/// Frees the claim's slot. `error_class` is ignored for [`DistillFinish::Done`].
+pub(crate) async fn finish_distill_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    lease: &DistillLease<'_>,
+    outcome: DistillFinish,
+    error_class: Option<&str>,
+    backoff_seconds: f64,
+    park_seconds: f64,
+) -> Result<bool, JobsError> {
+    // dep: PostgreSQL(any) — executes ops.finish_derived_work_v2 against the pool
+    let settled: bool =
+        sqlx::query_scalar("SELECT ops.finish_derived_work_v2($1, $2, $3, $4, $5, $6, $7, $8)")
+            .bind(lease.job_id)
+            .bind(lease.tenant_id)
+            .bind(lease.lease_owner)
+            .bind(lease.claim_generation)
+            .bind(outcome.as_db_str())
+            .bind(error_class)
+            .bind(backoff_seconds)
+            .bind(park_seconds)
+            .fetch_one(&mut **txn)
+            .await?;
+    Ok(settled)
+}
+
+/// ADR-0058 T3 for a settle that carries no business write (RETRY, NOT_READY, WAITING_KEY, a
+/// DEAD whose outbox row is settled elsewhere): [`finish_distill_in_txn`] in its own transaction.
+pub async fn finish_distill(
+    pool: &PrivateWorkerDbPool,
+    lease: &DistillLease<'_>,
+    outcome: DistillFinish,
+    error_class: Option<&str>,
+    backoff_seconds: f64,
+    park_seconds: f64,
+) -> Result<bool, JobsError> {
+    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
+    let mut txn = pool.pool().begin().await?;
+    let settled = finish_distill_in_txn(
+        &mut txn,
+        lease,
+        outcome,
+        error_class,
+        backoff_seconds,
+        park_seconds,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(settled)
 }
 
 /// The `lease_owner` + `attempt` pair IS the fence: the claim bumps `attempt` and rewrites
@@ -461,7 +753,7 @@ pub struct DerivedLease<'a> {
 }
 
 impl<'a> DerivedLease<'a> {
-    /// The lease exactly as [`claim_derived_work_consolidation`]/[`claim_derived_work_private`]
+    /// The lease exactly as [`claim_derived_work_consolidation`]
     /// handed it back, so no call site can retype the fencing token by hand.
     pub fn of(job: &ClaimedJob, lease_owner: &'a str) -> Self {
         Self {
@@ -495,41 +787,8 @@ pub async fn heartbeat_derived_consolidation(
     Ok(changed)
 }
 
-pub async fn heartbeat_derived_private(
-    pool: &PrivateWorkerDbPool,
-    lease: &DerivedLease<'_>,
-    lease_seconds: f64,
-) -> Result<bool, JobsError> {
-    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
-    let mut txn = pool.pool().begin().await?;
-    let changed = heartbeat_in_txn(
-        &mut txn,
-        lease.tenant_id,
-        lease.job_id,
-        lease.lease_owner,
-        lease.attempt,
-        lease_seconds,
-    )
-    .await?;
-    txn.commit().await?;
-    Ok(changed)
-}
-
 pub async fn settle_derived_consolidation(
     pool: &ConsolidationDbPool,
-    lease: &DerivedLease<'_>,
-    outcome: DerivedWorkOutcome,
-    lease_seconds: f64,
-) -> Result<bool, JobsError> {
-    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
-    let mut txn = pool.pool().begin().await?;
-    let settled = settle_derived_in_txn(&mut txn, lease, outcome, lease_seconds).await?;
-    txn.commit().await?;
-    Ok(settled)
-}
-
-pub async fn settle_derived_private(
-    pool: &PrivateWorkerDbPool,
     lease: &DerivedLease<'_>,
     outcome: DerivedWorkOutcome,
     lease_seconds: f64,
@@ -877,6 +1136,48 @@ mod contract_tests {
             db, rust,
             "DerivedJobType::ALL must list exactly ops.claim_derived_work's accepted types"
         );
+    }
+
+    const CUTOVER_MIGRATION_SQL: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../migrations/0193_private_worker_off_claim_v1.sql"
+    ));
+
+    /// ADR-0058 D-L: 0193 replaces the v1 claim with a body that refuses `DERIVED_DISTILL` before
+    /// any row is read, and takes the private worker off its EXECUTE list.
+    #[test]
+    fn v1_claim_refuses_distill_after_the_cutover() {
+        let v1 = &CUTOVER_MIGRATION_SQL[CUTOVER_MIGRATION_SQL
+            .find("CREATE OR REPLACE FUNCTION ops.claim_derived_work(")
+            .expect("0193 must replace ops.claim_derived_work")..];
+        let refusal = v1
+            .find("IF 'DERIVED_DISTILL' = ANY (p_job_types) THEN")
+            .expect("0193 must refuse DERIVED_DISTILL in the v1 claim");
+        assert!(
+            refusal < v1.find("RETURN QUERY").expect("v1 claim body"),
+            "the refusal must run before the claim statement"
+        );
+        assert!(CUTOVER_MIGRATION_SQL.contains(
+            "REVOKE EXECUTE ON FUNCTION ops.claim_derived_work(text[], text, double precision, bigint)\nFROM role_private_worker;"
+        ));
+        assert_eq!(
+            DerivedJobType::Distill.as_db_str(),
+            "DERIVED_DISTILL",
+            "the refused literal is the Rust spelling"
+        );
+    }
+
+    /// ADR-0058 E1 guard (b): the T6 re-queue uses the same cap as [`retry_backoff_seconds`].
+    #[test]
+    fn t6_requeue_uses_the_retry_backoff_cap() {
+        let cap = format!("16) - 1), {})", RETRY_BACKOFF_CAP_SECONDS as i64);
+        assert!(
+            CUTOVER_MIGRATION_SQL.contains(&cap),
+            "0193's T6 backoff must be capped at RETRY_BACKOFF_CAP_SECONDS ({cap})"
+        );
+        assert_eq!(retry_backoff_seconds(30.0, 1), 30.0);
+        assert_eq!(retry_backoff_seconds(30.0, 3), 120.0);
+        assert_eq!(retry_backoff_seconds(30.0, 9), RETRY_BACKOFF_CAP_SECONDS);
     }
 
     /// Both enqueue triggers must emit a `job_type` the claim guard accepts — otherwise a row is

@@ -1,0 +1,92 @@
+# §46.1 migration manifest. ADR-0058 D-A/D-B/D-E/D-G (card 32, §31/§61 durable jobs, §32 tenant-fair
+# scheduling, §67.2 private reasoning in-flight 4): six ops.jobs columns (claim_generation,
+# hard_deadline, dispatch_state, dispatch_model_call_id, not_ready_since, abandoned_claims) with a
+# NOT VALID dispatch-state CHECK (validated by 0192); four owner-only tables (ops.provider_arbiters
+# seeded with one row, ops.provider_slots seeded with exactly four rows, ops.distill_tenant_scheduler
+# and ops.distill_calls with ENABLE+FORCE RLS and one owner/tenant policy each); one owner trigger
+# admitting a tenant's scheduler row on DERIVED_DISTILL enqueue; four owner SECURITY DEFINER doors
+# (claim_derived_work_v2, begin_call, renew_lease, finish_derived_work_v2) with EXECUTE to
+# role_private_worker only. No runtime role gets any table privilege. §46 forward-fix
+# (EXPAND_CONTRACT, first free after 0189).
+
+migration_id = "0190_distill_dispatch_v2"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('ops.jobs') is not null
+ and to_regclass('ops.provider_arbiters') is null
+ and to_regclass('ops.provider_slots') is null
+ and to_regclass('ops.distill_tenant_scheduler') is null
+ and to_regclass('ops.distill_calls') is null
+ and to_regprocedure('ops.claim_derived_work_v2(text,double precision,double precision)') is null
+ and to_regprocedure('ops.begin_call(uuid,uuid,text,integer,uuid,double precision)') is null
+ and to_regprocedure('ops.renew_lease(uuid,uuid,text,integer,double precision)') is null
+ and to_regprocedure('ops.finish_derived_work_v2(uuid,uuid,text,integer,text,text,double precision,double precision)') is null
+ and not exists (select 1 from information_schema.columns
+                 where table_schema = 'ops' and table_name = 'jobs' and column_name = 'claim_generation')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ (select count(*) = 4 and min(slot_no) = 1 and max(slot_no) = 4 and bool_and(job_id is null)
+    from ops.provider_slots)
+ and (select count(*) = 1 from ops.provider_arbiters where budget = 'PRIVATE_REASONING')
+ -- the four doors: owner definer, pinned search_path, EXECUTE exactly {role_private_worker}, PUBLIC revoked
+ and (select count(*) = 4 and bool_and(
+        pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+        and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+        and has_function_privilege('role_private_worker', p.oid, 'EXECUTE')
+        and not has_function_privilege('role_gateway', p.oid, 'EXECUTE')
+        and not has_function_privilege('role_consolidation_worker', p.oid, 'EXECUTE')
+        and not has_function_privilege('role_public_worker', p.oid, 'EXECUTE')
+        and not has_function_privilege('role_retrieval_worker', p.oid, 'EXECUTE')
+        and not has_function_privilege('role_batch_issuer', p.oid, 'EXECUTE')
+        and not has_function_privilege('role_maintenance', p.oid, 'EXECUTE')
+        and not has_function_privilege('role_admin', p.oid, 'EXECUTE')
+        and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                         where x.grantee = 0 and x.privilege_type = 'EXECUTE'))
+      from pg_proc p
+      where p.oid in (to_regprocedure('ops.claim_derived_work_v2(text,double precision,double precision)'),
+                      to_regprocedure('ops.begin_call(uuid,uuid,text,integer,uuid,double precision)'),
+                      to_regprocedure('ops.renew_lease(uuid,uuid,text,integer,double precision)'),
+                      to_regprocedure('ops.finish_derived_work_v2(uuid,uuid,text,integer,text,text,double precision,double precision)')))
+ -- the admit trigger function: owner definer, nobody holds EXECUTE
+ and (select pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+        and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+        and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                         where x.grantee <> p.proowner and x.privilege_type = 'EXECUTE')
+      from pg_proc p where p.oid = to_regprocedure('ops.distill_scheduler_admit()'))
+ and exists (select 1 from pg_trigger where tgrelid = 'ops.jobs'::regclass
+              and tgname = 'derived_distill_scheduler_admit' and not tgisinternal)
+ -- owner-only tables: owner role_migration_owner, no non-owner privilege at all
+ and (select bool_and(pg_get_userbyid(c.relowner) = 'role_migration_owner')
+      from pg_class c where c.oid in ('ops.provider_arbiters'::regclass, 'ops.provider_slots'::regclass,
+                                      'ops.distill_tenant_scheduler'::regclass, 'ops.distill_calls'::regclass))
+ and not exists (select 1 from information_schema.role_table_grants g
+                 where g.table_schema = 'ops'
+                   and g.table_name in ('provider_arbiters', 'provider_slots', 'distill_tenant_scheduler', 'distill_calls')
+                   and g.grantee <> 'role_migration_owner')
+ -- the two tenant tables: ENABLE + FORCE, exactly one permissive policy carrying both arms on both legs
+ and (select bool_and(c.relrowsecurity and c.relforcerowsecurity
+        and (select count(*) = 1 from pg_policy q where q.polrelid = c.oid and q.polpermissive)
+        and (select bool_and(pg_get_expr(q.polqual, q.polrelid) like '%role_migration_owner%'
+                         and pg_get_expr(q.polqual, q.polrelid) like '%humaux.tenant_id%'
+                         and pg_get_expr(q.polwithcheck, q.polrelid) like '%role_migration_owner%'
+                         and pg_get_expr(q.polwithcheck, q.polrelid) like '%humaux.tenant_id%')
+             from pg_policy q where q.polrelid = c.oid))
+      from pg_class c where c.oid in ('ops.distill_tenant_scheduler'::regclass, 'ops.distill_calls'::regclass))
+ -- ops.jobs keeps its one 0164 policy
+ and (select count(*) = 1 from pg_policy where polrelid = 'ops.jobs'::regclass and polpermissive)
+ and exists (select 1 from pg_constraint where conrelid = 'ops.jobs'::regclass
+              and conname = 'jobs_dispatch_state_check' and not convalidated)
+ -- every tenant with open distill work has a scheduler row
+ and not exists (select 1 from ops.jobs j
+                 where j.job_type = 'DERIVED_DISTILL'
+                   and j.status in ('PENDING', 'RETRY_WAIT', 'WAITING_KEY', 'PROCESSING')
+                   and not exists (select 1 from ops.distill_tenant_scheduler t where t.tenant_id = j.tenant_id))
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Reverting is: DROP TRIGGER derived_distill_scheduler_admit ON ops.jobs; DROP FUNCTION ops.distill_scheduler_admit(), ops.claim_derived_work_v2(text,double precision,double precision), ops.begin_call(uuid,uuid,text,integer,uuid,double precision), ops.renew_lease(uuid,uuid,text,integer,double precision), ops.finish_derived_work_v2(uuid,uuid,text,integer,text,text,double precision,double precision); DROP TABLE ops.distill_calls, ops.distill_tenant_scheduler, ops.provider_slots, ops.provider_arbiters; ALTER TABLE ops.jobs DROP CONSTRAINT jobs_dispatch_state_check, DROP COLUMN claim_generation, hard_deadline, dispatch_state, dispatch_model_call_id, not_ready_since, abandoned_claims. Safe only while no private-worker binary of slice 2+ runs (v1 never reads these objects)."
+backup_restore_requirement = "none: metadata-only ALTER of ops.jobs (fast defaults, NOT VALID check), four new tables seeded with five constant rows plus a scheduler backfill derived from ops.jobs, five new functions, one trigger. No existing row data is changed."

@@ -2,11 +2,11 @@
 //!   `UserReasoningProfile`/`PrivateReasoningDomain` DB-facing types, the §11.3 Provider Error state machine, and the
 //!   §11.4 custom-endpoint SSRF guard chain.
 //! Depends-on: crates=[async-trait, humaux-domain, humaux-infra-egress, serde_json, tokio, uuid]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::byok::ssrf, domain::egress, domain::error, domain::evidence, domain::ids, infra-egress::raw, infra-egress::resolver]
-//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::distill_reasoner, private-worker::distill, private-worker::inference_rpc, private-worker::main, tests]
+//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::distill_reasoner, gateway::mcp_application, private-worker::distill, private-worker::inference_rpc, private-worker::main, tests]
 //! Invariants: [the plaintext BYOK key never becomes a struct field and never prints (only CredentialFingerprint
 //!   does); permit tenant/purpose/payload mismatches are refused before any provider call; provider failures surface
 //!   as typed ReasoningProviderError]
-//! Spec: Baseline §11.1; §48.0; §83.4; §11.3; §4.2
+//! Spec: Baseline §11.1; §48.0; §83.4; §11.3; §4.2; ADR-0058
 //!
 //! ## Plaintext key discipline (§11.1, this Phase's security red line)
 //!
@@ -68,34 +68,47 @@ pub mod ssrf;
 // §11.2 capability closed set
 // =============================================================================
 
-/// §11.2 "能力至少" closed set. `<=` DB CHECK on `control.user_reasoning_profiles.capabilities`
-/// (`migrations/0048_user_reasoning_profiles.sql`) — [`ReasoningCapability::as_str`] /
-/// [`ReasoningCapability::parse`] are the §78.2 contract-test surface for that column.
+/// §11.2 "能力至少" closed set. `==` the capability CHECKs of `control.user_reasoning_profiles`,
+/// `control.processor_models` and `control.reasoning_profiles` (last widened by
+/// `migrations/0195_reasoning_capabilities_tool_calls.sql`) — [`ReasoningCapability::as_str`] /
+/// [`ReasoningCapability::parse`] are the §78.2 contract-test surface for those columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReasoningCapability {
     Text,
     Vision,
     StructuredOutput,
     TokenUsage,
+    /// ADR-0058 D-M: the endpoint answers through one declared `tools` function (`tool_calls`).
+    ToolCalls,
+    /// ADR-0058 D-M: the endpoint accepts `"reasoning_split": true` and keeps its reasoning out of
+    /// the answer.
+    ReasoningSplit,
 }
 
 impl ReasoningCapability {
-    pub const ALL: [ReasoningCapability; 4] = [
+    /// Every variant, in the order of the 0195 CHECK arrays.
+    pub const ALL: [ReasoningCapability; 6] = [
         ReasoningCapability::Text,
         ReasoningCapability::Vision,
         ReasoningCapability::StructuredOutput,
         ReasoningCapability::TokenUsage,
+        ReasoningCapability::ToolCalls,
+        ReasoningCapability::ReasoningSplit,
     ];
 
+    /// The wire / DB value.
     pub const fn as_str(self) -> &'static str {
         match self {
             ReasoningCapability::Text => "TEXT",
             ReasoningCapability::Vision => "VISION",
             ReasoningCapability::StructuredOutput => "STRUCTURED_OUTPUT",
             ReasoningCapability::TokenUsage => "TOKEN_USAGE",
+            ReasoningCapability::ToolCalls => "TOOL_CALLS",
+            ReasoningCapability::ReasoningSplit => "REASONING_SPLIT",
         }
     }
 
+    /// Inverse of [`Self::as_str`]; `None` for any value outside the closed set.
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|c| c.as_str() == s)
     }
@@ -448,12 +461,32 @@ pub struct StructuredReasoningRequest {
     /// Observation Candidate schema is finalized and a validator dependency is justified.
     pub json_schema: String,
     pub max_output_tokens: u32,
+    /// Where the provider is asked to put the structured answer (ADR-0058 D-M).
+    pub output: OutputChannel,
+}
+
+/// The channel a structured answer travels on (ADR-0058 D-M).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputChannel {
+    /// `choices[0].message.content`, `<think>` blocks stripped — the v1 wire body, byte-identical.
+    Content,
+    /// Exactly one call of this side-effect-free function whose `parameters` are
+    /// [`StructuredReasoningRequest::json_schema`]; its `arguments` string is the answer. Only for a
+    /// descriptor that declares [`ReasoningCapability::ToolCalls`] (ADR-0058 D-M: the channel is
+    /// chosen from capabilities, never from a provider name). No `tool_choice` is sent: measured
+    /// live (ADR-0058 W1) a named-function `tool_choice` was accepted but not honoured. The
+    /// arguments still go through the caller's fail-closed parser — the tool call is a transport,
+    /// never the validation.
+    Tool(&'static str),
 }
 
 #[derive(Debug, Clone)]
 pub struct StructuredReasoningResponse {
     pub json: String,
     pub usage: TokenUsage,
+    /// ADR-0058 R9: on [`OutputChannel::Tool`] the reply carried no tool call and `json` is its
+    /// `content` object instead. Always `false` on [`OutputChannel::Content`].
+    pub channel_fallback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -524,6 +557,34 @@ pub enum ReasoningProviderError {
     /// error, etc.) — surfaced by [`OpenAiCompatTransport`] impls for anything that isn't a
     /// clean HTTP status response.
     Transport(String),
+}
+
+impl ReasoningProviderError {
+    /// The class of [`Self::WaitingKey`] (§11: known blocked — a worker parks the job and never
+    /// counts the call toward DEAD, ADR-0058 D-F/D-H).
+    pub const WAITING_KEY_CLASS: &'static str = "WAITING_KEY";
+    /// The class of [`Self::FailedOutputSchema`]: a worker spends its malformed re-ask budget on it
+    /// exactly as on a reply its own parser refused (ADR-0048 D-D, ADR-0058 D-M).
+    pub const FAILED_OUTPUT_SCHEMA_CLASS: &'static str = "FAILED_OUTPUT_SCHEMA";
+
+    /// ADR-0058 D-N: one static class per variant (closed set; never provider or payload text) — what
+    /// a worker logs and stores as `last_error_class`, so an operator can tell a 401 from a timeout
+    /// from a refusal without a SQL session.
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::WaitingKey { .. } => Self::WAITING_KEY_CLASS,
+            Self::ProviderPermanent { .. } => "PROVIDER_PERMANENT",
+            Self::RetryWait { .. } => "RETRY_WAIT",
+            Self::FailedOutputSchema { .. } => Self::FAILED_OUTPUT_SCHEMA_CLASS,
+            Self::UnsupportedCapability(_) => "UNSUPPORTED_CAPABILITY",
+            Self::MixedReasoningDomain => "MIXED_REASONING_DOMAIN",
+            Self::NoProcessingPrincipal => "NO_PROCESSING_PRINCIPAL",
+            Self::EndpointRejected(_) => "ENDPOINT_REJECTED",
+            Self::EgressPermitExpired => "EGRESS_PERMIT_EXPIRED",
+            Self::EgressPermitPayloadMismatch => "EGRESS_PERMIT_PAYLOAD_MISMATCH",
+            Self::Transport(_) => "TRANSPORT",
+        }
+    }
 }
 
 impl fmt::Display for ReasoningProviderError {
@@ -715,6 +776,8 @@ pub trait OpenAiCompatTransport: Send + Sync {
 struct ChatEnvelope {
     content: String,
     usage: TokenUsage,
+    /// ADR-0058 R9: [`tool_arguments`] took the answer from `content`.
+    channel_fallback: bool,
 }
 
 /// 解析 OpenAI 形状的 chat envelope，**顺序即语义**：
@@ -723,14 +786,21 @@ struct ChatEnvelope {
 ///    注意这与旧行为不同：旧代码把"body 不是 JSON"判成 `FailedOutputSchema`——那是把
 ///    端点故障算在模型输出头上，bounded repair 会白白重试一个坏端点。
 /// 2. `base_resp` 存在且 `status_code != 0` ⇒ [`classify_base_resp`]，**绝不往下走**。
-///    这是 MiniMax 的独立错误通道：HTTP 200 + 非零 status_code 是失败（实测：限流走
+///    这是部分 provider 的独立错误通道：HTTP 200 + 非零 status_code 是失败（实测：限流走
 ///    200 + 2062，不走 429）。字段缺席（真 OpenAI 端点）⇒ 无害通过——判据是
 ///    「存在且非零 = 错」这条**通用规则**，不引 provider-name 分支。
 /// 3. 取 `choices[0].message.content`；缺 ⇒ `ProviderPermanent`。
 ///    **显式忽略 `message.reasoning_content`**：M3 实测 reasoning 可能落在这个独立字段，
 ///    它绝不许漏进结构化输出。
 /// 4. 解析 usage 四字段（缺哪个哪个 `None`，不编造）。
-fn parse_chat_envelope(body: &[u8]) -> Result<ChatEnvelope, ReasoningProviderError> {
+///
+/// ADR-0058 D-M: on [`OutputChannel::Tool`] step 3 reads the one tool call instead
+/// ([`tool_arguments`]); a tool-call reply carries no `content` key at all (measured live, W1).
+/// ADR-0058 R9: a reply with no tool call may carry the answer object in `content`.
+fn parse_chat_envelope(
+    body: &[u8],
+    channel: OutputChannel,
+) -> Result<ChatEnvelope, ReasoningProviderError> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| ReasoningProviderError::ProviderPermanent {
             message: "malformed envelope: response body is not JSON".to_string(),
@@ -749,16 +819,21 @@ fn parse_chat_envelope(body: &[u8]) -> Result<ChatEnvelope, ReasoningProviderErr
         }
     }
 
-    let content = v
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| ReasoningProviderError::ProviderPermanent {
-            message: "malformed envelope: choices[0].message.content missing".to_string(),
-        })?
-        .to_string();
+    let choice = v.get("choices").and_then(|c| c.get(0));
+    let (content, channel_fallback) = match channel {
+        OutputChannel::Content => (
+            choice
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ReasoningProviderError::ProviderPermanent {
+                    message: "malformed envelope: choices[0].message.content missing".to_string(),
+                })?
+                .to_string(),
+            false,
+        ),
+        OutputChannel::Tool(name) => tool_arguments(choice, name)?,
+    };
 
     let usage = v.get("usage");
     let get = |path: &[&str]| -> Option<u64> {
@@ -770,6 +845,7 @@ fn parse_chat_envelope(body: &[u8]) -> Result<ChatEnvelope, ReasoningProviderErr
     };
     Ok(ChatEnvelope {
         content,
+        channel_fallback,
         usage: TokenUsage {
             input_tokens: get(&["prompt_tokens"]),
             output_tokens: get(&["completion_tokens"]),
@@ -779,7 +855,63 @@ fn parse_chat_envelope(body: &[u8]) -> Result<ChatEnvelope, ReasoningProviderErr
     })
 }
 
-/// MiniMax `base_resp.status_code` ⇒ §11.3 语义。**不加新枚举变体**，闭集复用：
+/// ADR-0058 D-M: the `arguments` string of the ONE `function` call named `name` in `choice`
+/// (`.1 == false`). A truncated reply (`finish_reason == "length"`), two calls, another name or
+/// non-string arguments is the model failing the output contract — `FailedOutputSchema`, which
+/// the caller re-asks once like any malformed reply (ADR-0048 D-D). A missing `choices[0]` is an
+/// endpoint fault, as on the content channel.
+///
+/// ADR-0058 R9: a reply with NO tool call whose `content` (reasoning blocks stripped) is a JSON
+/// object returns that object (`.1 == true`) — the same payload arriving in the other place, for
+/// the caller's one fail-closed parser to accept or refuse. Zero calls with any other content is
+/// `FailedOutputSchema`.
+fn tool_arguments(
+    choice: Option<&serde_json::Value>,
+    name: &str,
+) -> Result<(String, bool), ReasoningProviderError> {
+    use serde_json::Value;
+    let schema_failure = || ReasoningProviderError::FailedOutputSchema { attempts: 1 };
+    let choice = choice.ok_or_else(|| ReasoningProviderError::ProviderPermanent {
+        message: "malformed envelope: choices[0] missing".to_string(),
+    })?;
+    if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
+        return Err(schema_failure());
+    }
+    let calls = choice
+        .get("message")
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if calls.is_empty() {
+        let content = choice
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .map(strip_think_blocks)
+            .ok_or_else(schema_failure)?;
+        return match serde_json::from_str::<Value>(&content) {
+            Ok(Value::Object(_)) => Ok((content, true)),
+            _ => Err(schema_failure()),
+        };
+    }
+    let [call] = calls else {
+        return Err(schema_failure());
+    };
+    let function = call.get("function");
+    if call.get("type").and_then(Value::as_str) != Some("function")
+        || function.and_then(|f| f.get("name")).and_then(Value::as_str) != Some(name)
+    {
+        return Err(schema_failure());
+    }
+    function
+        .and_then(|f| f.get("arguments"))
+        .and_then(Value::as_str)
+        .map(|arguments| (arguments.to_owned(), false))
+        .ok_or_else(schema_failure)
+}
+
+/// `base_resp.status_code`（一种 HTTP 200 内的错误信封）⇒ §11.3 语义。**不加新枚举变体**，闭集复用：
 ///
 /// - `1004`（鉴权失败）⇒ [`ReasoningProviderError::WaitingKey`]——BYOK 域里它与 HTTP 401
 ///   同语义（§11.3：key 无效不是平台故障，是等新 key）。
@@ -1093,14 +1225,36 @@ impl<D: CredentialDecryptor> OpenAiCompatibleProvider<EgressHttpTransport, D> {
 /// ponytail: hand-built minimal JSON, no serde_json struct — this crate already depends on
 /// serde_json (email.rs) but the OpenAI chat-completions body shape is not yet frozen by any
 /// spec section this task owns; upgrade to a typed request struct once that shape is.
+///
+/// ADR-0058 D-M: [`OutputChannel::Content`] is the v1 body byte for byte; [`OutputChannel::Tool`]
+/// appends one function whose `parameters` are `json_schema` verbatim (it must be a JSON object —
+/// the rendered contracts are). `"reasoning_split":true` is a provider-specific field: it is sent
+/// only on the tool channel and only when the descriptor declares
+/// [`ReasoningCapability::ReasoningSplit`] — an endpoint that validates its body rejects an
+/// unknown field.
 pub fn structured_request_body(
     descriptor: &ReasoningProviderDescriptor,
     request: &StructuredReasoningRequest,
 ) -> Vec<u8> {
-    format!(
-        "{{\"model\":{:?},\"messages\":[{{\"role\":\"system\",\"content\":{:?}}},{{\"role\":\"user\",\"content\":{:?}}}],\"max_tokens\":{}}}",
+    let head = format!(
+        "{{\"model\":{:?},\"messages\":[{{\"role\":\"system\",\"content\":{:?}}},{{\"role\":\"user\",\"content\":{:?}}}],\"max_tokens\":{}",
         descriptor.model_id, request.system_prompt, request.user_prompt, request.max_output_tokens
-    )
+    );
+    match request.output {
+        OutputChannel::Content => format!("{head}}}"),
+        OutputChannel::Tool(name) => format!(
+            "{head},\"tools\":[{{\"type\":\"function\",\"function\":{{\"name\":{name:?},\"parameters\":{}}}}}]{}}}",
+            request.json_schema,
+            if descriptor
+                .capabilities
+                .contains(&ReasoningCapability::ReasoningSplit)
+            {
+                ",\"reasoning_split\":true"
+            } else {
+                ""
+            }
+        ),
+    }
     .into_bytes()
 }
 
@@ -1143,12 +1297,22 @@ impl<T: OpenAiCompatTransport, D: CredentialDecryptor> UserReasoningProvider
     ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
         self.descriptor
             .require_capability(ReasoningCapability::StructuredOutput)?;
+        if let OutputChannel::Tool(_) = request.output {
+            self.descriptor
+                .require_capability(ReasoningCapability::ToolCalls)?;
+        }
         let body = structured_request_body(&self.descriptor, &request);
         let bytes = self.send_once(ctx, body).await?;
-        // envelope 解析（含 MiniMax base_resp 独立错误通道——HTTP 200 不等于成功）。
-        let envelope = parse_chat_envelope(&bytes)?;
-        // 剥 <think> 块（含未闭合形态：reasoning 吃光 max_tokens 的实测静默失败）。
-        let json = strip_think_blocks(&envelope.content);
+        // envelope 解析（含 base_resp 独立错误通道——HTTP 200 不等于成功）。
+        let envelope = parse_chat_envelope(&bytes, request.output)?;
+        let json = match request.output {
+            // 剥 <think> 块（含未闭合形态：reasoning 吃光 max_tokens 的实测静默失败）。
+            OutputChannel::Content => strip_think_blocks(&envelope.content),
+            // ADR-0058 D-M: the reasoning never reaches the arguments string (it travels in
+            // `reasoning_content` under REASONING_SPLIT, and a tool call's arguments carry no
+            // `<think>` block); an R9 `content` answer was stripped by `tool_arguments`.
+            OutputChannel::Tool(_) => envelope.content,
+        };
         // §11.3 "invalid structured output -> schema validation failure"：剥后必须还是
         // JSON。剥后的空串在这里自然失败——不单设空检查，同一条判据覆盖两种坏法。
         if serde_json::from_str::<serde_json::Value>(&json).is_err() {
@@ -1157,6 +1321,7 @@ impl<T: OpenAiCompatTransport, D: CredentialDecryptor> UserReasoningProvider
         Ok(StructuredReasoningResponse {
             json,
             usage: envelope.usage,
+            channel_fallback: envelope.channel_fallback,
         })
     }
 
@@ -1250,9 +1415,71 @@ fn backoff_for_attempt(attempt: u32) -> Duration {
     base * 2u32.pow(attempt.min(4))
 }
 
+/// ADR-0058 R8: whether any string of `value` — object keys included, at any depth — carries
+/// U+0000, which PostgreSQL `text`/`jsonb` cannot store. Every model-reply parser refuses such a
+/// reply as malformed before any write (refused, never stripped: ADR-0048), and the gateway
+/// refuses such caller input as `INVALID_INPUT` at validation.
+pub fn json_has_nul(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => text.contains('\0'),
+        Value::Array(items) => items.iter().any(json_has_nul),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, item)| key.contains('\0') || json_has_nul(item)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0058 R8 — fault: `Value::String` answers `false`.
+    #[test]
+    fn json_has_nul_finds_u0000_in_any_string_or_key_at_any_depth() {
+        for nul in [
+            serde_json::json!("a\u{0}b"),
+            serde_json::json!({ "memories": [{ "affects": [{ "label": "\u{0}" }] }] }),
+            serde_json::json!({ "k\u{0}": 1 }),
+            serde_json::json!([[["\u{0}"]]]),
+        ] {
+            assert!(json_has_nul(&nul), "{nul}");
+        }
+        for clean in [
+            serde_json::json!({ "content": "a\\u0000b", "n": 0, "b": false, "x": null }),
+            serde_json::json!("\u{1}"),
+        ] {
+            assert!(!json_has_nul(&clean), "{clean}");
+        }
+    }
+
+    /// ADR-0058 D-N — fault: map two variants to one class.
+    #[test]
+    fn every_provider_error_variant_has_its_own_class() {
+        let all = [
+            ReasoningProviderError::WaitingKey { fingerprint: None },
+            ReasoningProviderError::ProviderPermanent {
+                message: String::new(),
+            },
+            ReasoningProviderError::RetryWait { retry_after: None },
+            ReasoningProviderError::FailedOutputSchema { attempts: 1 },
+            ReasoningProviderError::UnsupportedCapability(ReasoningCapability::Vision),
+            ReasoningProviderError::MixedReasoningDomain,
+            ReasoningProviderError::NoProcessingPrincipal,
+            ReasoningProviderError::EndpointRejected(ssrf::SsrfError::NonHttps),
+            ReasoningProviderError::EgressPermitExpired,
+            ReasoningProviderError::EgressPermitPayloadMismatch,
+            ReasoningProviderError::Transport(String::new()),
+        ];
+        let classes: std::collections::BTreeSet<&str> = all.iter().map(|e| e.class()).collect();
+        assert_eq!(classes.len(), all.len(), "one class per variant");
+        assert_eq!(
+            all[0].class(),
+            ReasoningProviderError::WAITING_KEY_CLASS,
+            "the 401 class is the constant workers compare with"
+        );
+    }
     use humaux_domain::egress::{ProcessorId, authorize};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Mutex;
@@ -1452,9 +1679,18 @@ mod tests {
             capabilities: vec![
                 ReasoningCapability::StructuredOutput,
                 ReasoningCapability::Vision,
+                ReasoningCapability::ToolCalls,
+                ReasoningCapability::ReasoningSplit,
             ],
             custom_endpoint: None,
         }
+    }
+
+    /// The same descriptor minus `capability`.
+    fn descriptor_without(capability: ReasoningCapability) -> ReasoningProviderDescriptor {
+        let mut d = descriptor();
+        d.capabilities.retain(|c| *c != capability);
+        d
     }
 
     fn structured_request() -> StructuredReasoningRequest {
@@ -1463,6 +1699,7 @@ mod tests {
             user_prompt: "u".to_string(),
             json_schema: "{}".to_string(),
             max_output_tokens: 64,
+            output: OutputChannel::Content,
         }
     }
 
@@ -1890,36 +2127,45 @@ mod tests {
 
     /// §78.2 "DB enum 与 Rust enum 走 contract test 对账": runs against the real migration
     /// file text (same `include_str!` pattern as `jobs.rs::contract_tests`), not a hardcoded
-    /// copy of the CHECK list — editing 0048's constraint now fails this test.
-    const MIGRATION_0048_SQL: &str = include_str!(concat!(
+    /// copy of the CHECK list. 0195 is the migration that last defines all three capability
+    /// CHECKs; the live constraints are compared too (`byok_egress_rebinding.rs`, real PG).
+    const MIGRATION_0195_SQL: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../migrations/0048_user_reasoning_profiles.sql"
+        "/../../migrations/0195_reasoning_capabilities_tool_calls.sql"
     ));
 
-    fn migration_0048_capabilities_check_values() -> Vec<String> {
+    fn migration_0195_capability_checks() -> Vec<Vec<String>> {
         let needle = "capabilities <@ ARRAY[";
-        let start = MIGRATION_0048_SQL
-            .find(needle)
-            .expect("0048 must define the capabilities <@ ARRAY[...] CHECK")
-            + needle.len();
-        let end = MIGRATION_0048_SQL[start..]
-            .find(']')
-            .expect("unterminated capabilities ARRAY[...] literal")
-            + start;
-        MIGRATION_0048_SQL[start..end]
-            .split(',')
-            .map(|s| s.trim().trim_matches('\'').to_string())
+        MIGRATION_0195_SQL
+            .match_indices(needle)
+            .map(|(at, _)| {
+                let start = at + needle.len();
+                let end = MIGRATION_0195_SQL[start..]
+                    .find(']')
+                    .expect("unterminated capabilities ARRAY[...] literal")
+                    + start;
+                MIGRATION_0195_SQL[start..end]
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('\'').to_string())
+                    .collect()
+            })
             .collect()
     }
 
     #[test]
     fn capability_wire_form_matches_migration_check_constraint() {
-        let db = migration_0048_capabilities_check_values();
+        let checks = migration_0195_capability_checks();
+        assert_eq!(checks.len(), 3, "0048 + two 0128 tables");
         let wire: Vec<String> = ReasoningCapability::ALL
             .iter()
             .map(|c| c.as_str().to_string())
             .collect();
-        assert_eq!(wire, db);
+        for db in checks {
+            assert_eq!(wire, db);
+        }
+        for c in ReasoningCapability::ALL {
+            assert_eq!(ReasoningCapability::parse(c.as_str()), Some(c));
+        }
     }
 
     #[test]
@@ -2098,6 +2344,239 @@ mod tests {
                 Err(ReasoningProviderError::RetryWait { retry_after: Some(d) })
                     if d == Duration::from_secs(5)
             ));
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // ADR-0058 D-M: the emit_distillation tool channel.
+    // -------------------------------------------------------------------
+
+    const TOOL: &str = "emit_distillation";
+
+    fn tool_request() -> StructuredReasoningRequest {
+        StructuredReasoningRequest {
+            json_schema: r#"{"type":"object"}"#.to_string(),
+            output: OutputChannel::Tool(TOOL),
+            ..structured_request()
+        }
+    }
+
+    async fn call_tool_canned(
+        body: &'static [u8],
+    ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
+        let resolver = resolver_for(example_public_ip());
+        let provider = OpenAiCompatibleProvider::new(
+            descriptor(),
+            "https://api.example.com/v1/chat/completions".to_string(),
+            CannedTransport(body),
+            StaticDecryptor,
+            ssrf::CustomEndpointPolicy::default(),
+            &resolver,
+        )
+        .expect("valid endpoint");
+        let tenant = TenantId::new();
+        let body = structured_request_body(&descriptor(), &tool_request());
+        let c = ctx_with_permit(
+            tenant,
+            permit_for_payload(tenant, &body, Duration::from_secs(60)),
+        );
+        provider.complete_structured(&c, tool_request()).await
+    }
+
+    /// Fault: omit `reasoning_split` (or the tool) from the Tool body.
+    #[test]
+    fn tool_channel_body_carries_one_tool_and_reasoning_split() {
+        let body: serde_json::Value =
+            serde_json::from_slice(&structured_request_body(&descriptor(), &tool_request()))
+                .expect("the tool body is JSON");
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], TOOL);
+        assert_eq!(
+            tools[0]["function"]["parameters"],
+            serde_json::json!({"type":"object"})
+        );
+        assert_eq!(body["reasoning_split"], true);
+        // W1 (ADR-0058): a named tool_choice is accepted but not honoured, so it is never sent.
+        assert!(body.get("tool_choice").is_none());
+        assert_eq!(body["max_tokens"], 64);
+    }
+
+    /// ADR-0058 D-M (ruling 2026-10-02 10:35, test 2) — fault: send `reasoning_split`
+    /// unconditionally on the tool channel.
+    #[test]
+    fn tool_channel_without_reasoning_split_capability_sends_no_reasoning_split() {
+        let body: serde_json::Value = serde_json::from_slice(&structured_request_body(
+            &descriptor_without(ReasoningCapability::ReasoningSplit),
+            &tool_request(),
+        ))
+        .expect("the tool body is JSON");
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+        assert!(body.get("reasoning_split").is_none());
+    }
+
+    /// ADR-0058 D-M — fault: drop the TOOL_CALLS gate in `complete_structured`. A tool request to a
+    /// provider that does not declare tool calls fails before any byte is sent.
+    #[test]
+    fn a_tool_request_without_tool_calls_capability_fails_before_the_network() {
+        rt().block_on(async {
+            let resolver = resolver_for(example_public_ip());
+            let provider = OpenAiCompatibleProvider::new(
+                descriptor_without(ReasoningCapability::ToolCalls),
+                "https://api.example.com/v1/chat/completions".to_string(),
+                CannedTransport(b"{}"),
+                StaticDecryptor,
+                ssrf::CustomEndpointPolicy::default(),
+                &resolver,
+            )
+            .expect("valid endpoint");
+            let tenant = TenantId::new();
+            let body = structured_request_body(
+                &descriptor_without(ReasoningCapability::ToolCalls),
+                &tool_request(),
+            );
+            let c = ctx_with_permit(
+                tenant,
+                permit_for_payload(tenant, &body, Duration::from_secs(60)),
+            );
+            assert!(matches!(
+                provider.complete_structured(&c, tool_request()).await,
+                Err(ReasoningProviderError::UnsupportedCapability(
+                    ReasoningCapability::ToolCalls
+                ))
+            ));
+        });
+    }
+
+    /// Fault: emit `tools` on the Content channel.
+    #[test]
+    fn content_channel_body_is_byte_identical_to_v1() {
+        assert_eq!(
+            String::from_utf8(structured_request_body(
+                &descriptor(),
+                &structured_request()
+            ))
+            .expect("utf-8"),
+            r#"{"model":"test-model","messages":[{"role":"system","content":"s"},{"role":"user","content":"u"}],"max_tokens":64}"#
+        );
+    }
+
+    /// Fault: take `tool_calls[0]` without the count / name check. ADR-0058 R9: two calls or another
+    /// name stay a schema failure even when `content` carries a valid object, and zero calls are one
+    /// only when `content` is not a JSON object.
+    #[test]
+    fn zero_two_or_misnamed_tool_calls_are_a_schema_failure() {
+        rt().block_on(async {
+            let ok = call_tool_canned(
+                br#"{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"type":"function","function":{"name":"emit_distillation","arguments":"{\"memories\":[]}"}}]}}],"base_resp":{"status_code":0}}"#,
+            )
+            .await
+            .expect("one named call is the answer");
+            assert_eq!(ok.json, r#"{"memories":[]}"#);
+            assert!(!ok.channel_fallback);
+            for (label, body) in [
+                (
+                    "zero calls, content not JSON",
+                    &br#"{"choices":[{"finish_reason":"stop","message":{"content":"memories: none"}}]}"#[..],
+                ),
+                (
+                    "zero calls, content a JSON array",
+                    br#"{"choices":[{"finish_reason":"stop","message":{"content":"[{\"memories\":[]}]"}}]}"#,
+                ),
+                (
+                    "zero calls, no content",
+                    br#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant"}}]}"#,
+                ),
+                (
+                    "two calls",
+                    br#"{"choices":[{"message":{"content":"{\"memories\":[]}","tool_calls":[{"type":"function","function":{"name":"emit_distillation","arguments":"{\"memories\":[]}"}},{"type":"function","function":{"name":"emit_distillation","arguments":"{\"memories\":[]}"}}]}}]}"#,
+                ),
+                (
+                    "other name",
+                    br#"{"choices":[{"message":{"content":"{\"memories\":[]}","tool_calls":[{"type":"function","function":{"name":"run_shell","arguments":"{\"memories\":[]}"}}]}}]}"#,
+                ),
+                (
+                    "arguments not a string",
+                    br#"{"choices":[{"message":{"tool_calls":[{"type":"function","function":{"name":"emit_distillation","arguments":{"memories":[]}}}]}}]}"#,
+                ),
+                (
+                    "arguments not JSON",
+                    br#"{"choices":[{"message":{"tool_calls":[{"type":"function","function":{"name":"emit_distillation","arguments":"memories: none"}}]}}]}"#,
+                ),
+            ] {
+                assert!(
+                    matches!(
+                        call_tool_canned(body).await,
+                        Err(ReasoningProviderError::FailedOutputSchema { attempts: 1 })
+                    ),
+                    "{label}"
+                );
+            }
+        });
+    }
+
+    /// ADR-0058 R9 — fault: no fallback (zero tool calls is always a schema failure). A reply with no
+    /// tool call whose `content`, reasoning block stripped, is a JSON object answers from `content`
+    /// and says so; an empty `tool_calls` array is zero calls.
+    #[test]
+    fn a_tool_reply_without_a_tool_call_answers_from_its_content_object() {
+        rt().block_on(async {
+            for body in [
+                &br#"{"choices":[{"finish_reason":"stop","message":{"content":"<think>plan</think>{\"memories\":[]}"}}],"base_resp":{"status_code":0}}"#[..],
+                br#"{"choices":[{"finish_reason":"stop","message":{"content":"{\"memories\":[]}","tool_calls":[]}}]}"#,
+            ] {
+                let answer = call_tool_canned(body)
+                    .await
+                    .expect("the content object is the answer");
+                assert_eq!(answer.json, r#"{"memories":[]}"#);
+                assert!(answer.channel_fallback);
+            }
+        });
+    }
+
+    /// Fault: drop the `finish_reason == "length"` check (a truncated reply whose one call
+    /// happens to parse would be taken as the answer).
+    #[test]
+    fn finish_reason_length_is_a_schema_failure() {
+        rt().block_on(async {
+            assert!(matches!(
+                call_tool_canned(
+                    br#"{"choices":[{"finish_reason":"length","message":{"tool_calls":[{"type":"function","function":{"name":"emit_distillation","arguments":"{\"memories\":[]}"}}]}}]}"#,
+                )
+                .await,
+                Err(ReasoningProviderError::FailedOutputSchema { attempts: 1 })
+            ));
+        });
+    }
+
+    /// R-32 (a) "disable implicit retries": one `complete_structured` = one transport send, even
+    /// on a retryable status. Fault: wrap `send_once` in a retry loop.
+    #[test]
+    fn complete_structured_sends_exactly_once_on_retry_wait() {
+        rt().block_on(async {
+            let resolver = resolver_for(example_public_ip());
+            let provider = OpenAiCompatibleProvider::new(
+                descriptor(),
+                "https://api.example.com/v1/chat/completions".to_string(),
+                CountingTransport {
+                    calls: AtomicU32::new(0),
+                    status: 503,
+                },
+                StaticDecryptor,
+                ssrf::CustomEndpointPolicy::default(),
+                &resolver,
+            )
+            .expect("valid endpoint");
+            let tenant = TenantId::new();
+            let result = provider
+                .complete_structured(&ctx(tenant), structured_request())
+                .await;
+            assert!(matches!(
+                result,
+                Err(ReasoningProviderError::RetryWait { .. })
+            ));
+            assert_eq!(provider.transport.calls.load(Ordering::SeqCst), 1);
         });
     }
 }
