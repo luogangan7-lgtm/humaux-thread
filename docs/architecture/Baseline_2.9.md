@@ -1256,6 +1256,7 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
 - **失败票据审计退役（0167，ADR-0042，卡 20）**：**本表无新增表级授权**——`role_maintenance` 对 `projection.stream_log` 自 0011 起就是 `SELECT, UPDATE`，本次只多一个 EXECUTE。`FAILED -> RETIRED_FAILED`（§15.2.1 新终态）唯一入口是窄 SECURITY DEFINER `projection.retire_failed_ticket(uuid, text, uuid, text, text, text, bigint, text)`：owner `role_migration_owner`、`search_path=pg_catalog`、EXECUTE **仅** `role_maintenance`，PUBLIC 与其余七个 runtime role 全无——与 0164 `ops.claim_derived_work(...)`、0161 `control.bump_user_security_epoch(...)` 同一 chokepoint 纪律。`role_retrieval_worker` 明确不在名单：它持有 `projection.stream_log` 的表级 UPDATE 且是 `FAILED` 的书写方，写失败的角色不得把自己的失败结清为 OK（理由与十六个 `error_class` 的取数见 §15.2.1）；`role_private_worker` 也不在名单：它 park `DEAD` 时票据还是 `ISSUED`，没有可退役的对象。函数授权不以本表格冒充，由 0167 DDL 与 `rls-check` 的 `check_ticket_retirement_boundary` 双向验证——后者同时钉住 0011/0167 转换触发器：新终态只在 owner 臂放行（definer 函数内 `current_user` 即 owner，不可伪造；GUC 臂同 0164 被拒），`role_retrieval_worker` 那一臂仍是 §6.2.2 逐字的 `ISSUED -> {DONE, SKIPPED_BY_POLICY, FAILED}`。审计列 `retired_at` / `retired_by` 由函数内写入（`session_user`），`error_class` 原样保留，三者由 all-or-nothing CHECK 绑定。
 - **投影票据跨租户领取（0176，ADR-0052，卡 27）**：常驻、不带租户环境的 `humaux-retrieval-worker --serve` 跨所有已放置租户按租约领取 ISSUED 投影票据。**本表无新增表级授权**：`role_retrieval_worker` 对 `projection.stream_log` 自 0011 起就是表级 `SELECT, UPDATE`，0176 新增的四列（`lease_owner`、`lease_expires_at`、`attempts`、`next_attempt_at`）上的心跳、结清、退避重试、distill-pending 释放全是 `OLD.state = NEW.state` 的列写，0011/0167 转换触发器提前放行，`role_retrieval_worker` 那一臂仍是逐字的 `ISSUED -> {DONE, SKIPPED_BY_POLICY, FAILED}`（票据在租约与退避期间都保持 `ISSUED`，没有新状态）；`role_private_worker` 的列级 UPDATE 仍只有 `(state, error_class)`，不含新列（0176 postcheck 与 `rls-check` 双向钉）。唯一的跨租户读写是两个窄 SECURITY DEFINER：`projection.claim_issued_tickets(text,text,text,text,text,double precision,bigint,bigint)`（一把全局 advisory xact 锁后一条 SKIP LOCKED 语句：每租户上限、同一 family 不同时交给两个 worker、无 placement 行的租户不领、distill 未完成的票据不领，返回票据与该租户的 placement 行）与 `projection.unplaced_issued_tickets(text,text,text,text)`（只读计数，喂 `placement_missing`）；两者 owner `role_migration_owner`、`search_path=pg_catalog`、EXECUTE **仅** `role_retrieval_worker`，PUBLIC 与其余七个 runtime role 全无。它们能看见其他租户，靠的是 0176 给 `stream_log_tenant_isolation` 与 `tenant_placements_tenant_isolation` 两条腿各加的 `current_user = 'role_migration_owner' OR` 臂（0004/0012/0112/0147/0163/0164 同一形状，租户臂逐字保留，不加第二条 PERMISSIVE policy；GUC 臂同 0164 被拒）。**同一迁移处理了这个臂的后果**：`projection.retire_failed_ticket` 原先靠 FORCE RLS 把 owner 限在调用方已装的租户里，owner 臂会让它静默变成跨租户——0176 以同一签名重述它，函数体多一个显式谓词 `tenant_id = NULLIF(current_setting('humaux.tenant_id', true), '')::uuid`，EXECUTE 仍仅 `role_maintenance`（`projection_claim.rs::retire_failed_ticket_still_refuses_a_tenant_other_than_the_installed_one` 钉住）。函数授权不以本表格冒充，由 0176 DDL 与 `rls-check` 的 `check_projection_claim_boundary` 双向验证。
 - **生产 onboarding 与 VerifiedEmpty 首次激活（0185/0186，ADR-0053，卡 28）**：新点名表 `projection.family_activations`（VerifiedEmpty 激活回执，六列 family+version 主键，FK 到 checkpoint 行，owner `role_migration_owner`，ENABLE+FORCE RLS 租户 policy）：`role_maintenance` 仅 `SELECT`，其余七个 non-owner role 全为 `—`（覆盖 projection 域默认），见上表末列。onboarding 的全部写入走八个窄 owner SECURITY DEFINER：`control.ensure_admission_tier(text,text,uuid,text,bigint,bigint)`、`control.ensure_user(text,text)`、`control.onboard_tenant(text,uuid,text,text,bigint,timestamptz,timestamptz,text,text,bigint,bigint,text[])`、`control.onboard_workspace(uuid,text,uuid,text[])`、`control.issue_api_key(uuid,uuid,uuid,text,bytea,text[])`、`control.revoke_api_key(uuid,text)`、`projection.ensure_tenant_placement(uuid,text,text)`、`projection.activate_empty_family(uuid,uuid,text,text,text,text,text,uuid,bigint,timestamptz)`；全部 owner `role_migration_owner`、`search_path=pg_catalog`、EXECUTE **仅** `role_maintenance`，PUBLIC 与七个 runtime role 全无；除 `onboard_tenant`（自装租户 GUC）外每个函数先断言入参租户等于已装的 `humaux.tenant_id`。**本表无新增表级授权**：`role_maintenance` 仍不直写 tenants/users/workspaces/api_keys/placement 等 onboarding 表；工作区生命周期列 `lifecycle`（`LEGACY | PROVISIONING | READY`，默认 `LEGACY`）只经 `onboard_workspace`（写 `PROVISIONING`）与 `activate_empty_family`（写 `READY`）两个函数改变，任何 non-owner role 对工作区表都无写权（`rls-check` 的 `check_onboarding_boundary` 钉住）。写闸是 owner 所有、SECURITY INVOKER、`search_path=pg_catalog` 的触发器函数 `projection.stream_checkpoints_workspace_write_gate()`，挂在 checkpoint 表 `issued_highwater` 的自增上：`PROVISIONING` 工作区一律 SQLSTATE 55000 `workspace_provisioning`（§52 映射 `CONFLICT`），它不授予任何权限，只用调用方已有的读权。函数授权不以本表格冒充，由 0185/0186 的执行型 postcheck 与 `rls-check` 双向验证。
+- **A2 点账本读取（0189，ADR-0057 D-L，卡 31）**：**本表无新增表级授权**。§23.1② A2 的 PostgreSQL 一侧改按「点」计数，唯一入口是窄 SECURITY DEFINER `projection.stream_point_ledger(uuid,text,uuid,text,text,text,text,uuid[])`：owner `role_migration_owner`、STABLE（在调用方的 RR 快照里读）、`search_path=pg_catalog`、EXECUTE **仅** `role_gateway` 与 `role_retrieval_worker`（关账本的两个角色），PUBLIC 与其余六个 runtime role 全无。它以 owner 身份读 `stream_log / outbox / memory_evidence / memory_records`，首句断言 `p_tenant_id` 等于已装的租户 GUC（0176 教训：owner 臂是跨租户的），对 memory 行施加与 Qdrant 计数同一个 §6.1 可见性谓词（`private.visibility_allowed` + 0163 成员资格测试，user 只取自 GUC，workspace 数组只能收窄），唯一不施加的是 0155 subject 限制项（Qdrant 无镜像）；只返回四个计数，不返回 id。函数授权不以本表格冒充，由 0189 DDL/manifest 与 `rls-check` 的 `check_stream_point_ledger_boundary` 双向验证。
 
 - **R4 execution relations（0131，尚未实现）**：`private.contribution_executions`、
   `private.contribution_execution_sources` 与 `ops.contribution_execution_job_links` 显式覆盖
@@ -4169,7 +4170,7 @@ AND shadow.open_gaps == 0
 AND benchmark(shadow) 未被证伪劣化于 benchmark(serving)   -- 判据形态取 §69 Continuation Gate 的 FAIL 侧，n 与阈值取自 §55；「不劣于」在该量具上不可断言（§55.4），本行不得写回比较级措辞
 ```
 
-第一条的两个 count 各带自己的 `projection_version` filter，其余 filter（tenant + scope + tombstone overlay）逐字相同、同一时刻取，口径以 §23.1② 的 `visible` 为准。这不是措辞讲究：`visible` 若只按 tenant + scope 数，回填期两代点同处一个检索面 ⇒ 两侧读到同一个数 ⇒ 第一条恒真 ⇒ 这是一个永远不会拒绝任何切换的闸，与 §23.1② 反复堵的「恒真的闸」同病。gate：注入「shadow 少回填 1 个点」，第一条必须由真变假；不变即红。
+第一条的两个 count 各带自己的 `projection_version` filter，其余 filter（tenant + scope + tombstone overlay）逐字相同、同一时刻取，口径以 §23.1② 的 `visible` 为准；两个 count 走 §17.1 的 ops 只计数例外 `StreamCountFilter`，数该 workspace 流的全部可见性类（ADR-0057 D-C：按 ops 身份的可见性数，任一 USER_PRIVATE 点都会让两侧数不全、切换永远被拒）。这不是措辞讲究：`visible` 若只按 tenant + scope 数，回填期两代点同处一个检索面 ⇒ 两侧读到同一个数 ⇒ 第一条恒真 ⇒ 这是一个永远不会拒绝任何切换的闸，与 §23.1② 反复堵的「恒真的闸」同病。gate：注入「shadow 少回填 1 个点」，第一条必须由真变假；不变即红。
 
 三条全真才允许切换，任一为假直接拒绝，不存在“人工判断可以上”的分支。
 
@@ -4262,7 +4263,7 @@ is_tenant = true
 
 这让 Qdrant 能将同 tenant 数据进行 co-location，并优化按 tenant filter 的磁盘读取。
 
-所有 private query adapter 必须自动注入 `tenant + §6.1 AuthorizationScope visibility` filter；业务层不得手写可选 filter。
+所有 private query adapter 必须自动注入 `tenant + §6.1 AuthorizationScope visibility` filter；业务层不得手写可选 filter。**唯一例外是 ops 的只计数面（ADR-0057 D-C）**：§16.2 切换、soak 与 ADR-0053 provisioning 探针用 `projection::dense::StreamCountFilter`（tenant + workspace + `projection_version`，不带可见性析取）只做 count —— 只返回一个数、从不返回 id 或正文，类型上不能转成 `DenseQueryFilter` 到达 search；请求路径一律用带 §6.1 可见性的 `family_probe`。
 
 ## 17.2 Sparse / BM25 必须 Tenant-scoped IDF
 
@@ -5713,6 +5714,8 @@ envelope 跨块计数无法同口径闭合（唯一判据与 reason 见 §23.1�
 
 **账本闭合 A1 不成立**（`done + open_gaps + pending != expected`，§23.1②；等价于 §15.4 `advance_prefix` 判出的 `Inconsistent`）：两路账本互相矛盾，不知道真值是哪一边 ⇒ 不输出任何比值。此前这条只写在 §15.4 与 §23.1② 两处、本表漏列，于是 §22.5 的构造器签名里也没有它的位置，这个裁决只能靠调用方自觉执行 —— 修法见下节新增的第四个入参。
 
+**projection lag 超过门槛**（ADR-0057 D-D/D-E）：读数是本 stream 最老一张 `ISSUED` / `PROCESSING` / `RETRY_WAIT` 票据的年龄（DB 时钟，与账本同一快照；`WAITING_KEY` 不计——它等的是密钥不是 runner，DOD-014 另有信号），门槛是 `HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS`（§78.1，无默认值）。严格超过门槛 ⇒ `classify()` 返回 `cannot_establish / projection_lag`（位置紧随 A1，先于 census），同时经 `abstain()` 追加 `PROJECTION_LAG`（§52.2）；与 `PROJECTION_INVISIBLE_LOSS` 同时成立时两码都报、loss 在前。`current` 的冻结公式不变。
+
 **A2（可见闭合）不在本表内，且不许被加进来**：它的处置是照算比值 + `current = false` + `PROJECTION_INVISIBLE_LOSS`（§23.1②）。A1 是「不知道真值」，A2 是「知道真值就是索引那个」；把 A2 判成 `cannot_establish` 等于把真实的丢失藏进「测不出来」。
 
 **谓词不可枚举**包含四种，任一成立即触发：
@@ -5738,13 +5741,17 @@ EXACT 前置任一不满足        =>  CANNOT_ESTABLISH
 机制而非纪律：`CompletenessClass` 是私有类型，只能由唯一构造器产出：
 
 ```rust
-// 第四个入参是本轮新增。没有它，§22.4 新列的「A1 不成立 ⇒ cannot_establish」
+// 第四个入参（ledger）没有它，§22.4 新列的「A1 不成立 ⇒ cannot_establish」
 // 在类型里根本构造不出来，只能靠调用方自觉 —— 那正是本节要消灭的东西。
+// 第五、六个入参：§25.3 Mandatory 差额（card 22c / ADR-0047）与 §22.4 projection lag
+// 门槛（ADR-0057 D-E，结清 ADR-0047 的参数个数债：本块与代码同为六参）。
 pub(crate) fn classify(
-    planner_output: &PlannerOutput,
-    lane_status:    &LaneStatus,
-    census_result:  &CensusResult,
-    ledger:         &LedgerClosure,
+    planner_output:    &PlannerOutput,
+    lane_status:       &LaneStatus,
+    census_result:     &CensusResult,
+    ledger:            &LedgerClosure,
+    mandatory_missing: u64,
+    lag_threshold:     Duration,
 ) -> CompletenessClass;
 
 /// 私有类型，唯一构造器 `ledger::close(repo, stream_key)`：它按 §15.4 的三次
@@ -5763,7 +5770,7 @@ pub(crate) enum LedgerClosure { Closed(LedgerCounts), Broken(LedgerCounts) }
 
 EXACT 分支的错误路径在类型里只有 `CannotEstablish` 一个变体，**枚举里根本不存在 EXACT → SemanticBounded 的转移，写不出来**，不是评审时才发现。
 
-`classify` 保留上述四参签名及 A1 优先分支，但只做纯判定，不提前记账。Envelope 在同一出口完成 A2、§23.1④ 计数口径、§23.1③ provenance 与 mandatory overflow 校验后，才把最终 `class/reason/exact/known_lower_bound` 一起交付；不得先记 `exact`，再向调用方返回 `cannot_establish`。若本次确实产生 §25.5 `ContextOutcome::Overflow`，最终 reason 为 `mandatory_context_overflow`，同时保留真实 projection/账本诊断；不得改写账本或把非 overflow 结果改成该 reason。`known_lower_bound` 仅取真实 census 已知下界，未知为 `null`，不得用正文条数回填。`envelope_outcome_block` 是唯一 prepare：完成上述判定，并通过接纳回调组装、序列化及校验实际输出，返回字段私有、不可 Clone 的 `PendingEnvelope<T>`，此时不记指标。Gateway 还须完成配额与审计结算，全部成功后才消费 `pending.finish(self)` 返回已准备的输出；`finish` 是 `completeness::record_final_classification` 的全 workspace 唯一调用点。prepare/校验/结算失败或丢弃 pending 均不记最终指标，类型所有权禁止同一 pending 重复 finish。指标度量服务端已接纳的业务结果，不声称远端已收到网络字节；transport 错误另行观测。组件 EXACT census 与 `classify_for_witness` 只提供纯判定，不能绕过 provenance/计数/Context 门发最终指标；G80-6 指标 witness 必须经过同一最终入口，不能伪造全集或索引读数将组件测试冒充全链验收。此处不改变 A1/A2、降级方向或字段的单一权威。
+`classify` 保留上述六参签名及 A1 优先分支（其后紧接 lag 分支，ADR-0057 D-E），但只做纯判定，不提前记账。Envelope 在同一出口完成 A2、§23.1④ 计数口径、§23.1③ provenance 与 mandatory overflow 校验后，才把最终 `class/reason/exact/known_lower_bound` 一起交付；不得先记 `exact`，再向调用方返回 `cannot_establish`。若本次确实产生 §25.5 `ContextOutcome::Overflow`，最终 reason 为 `mandatory_context_overflow`，同时保留真实 projection/账本诊断；不得改写账本或把非 overflow 结果改成该 reason。`known_lower_bound` 仅取真实 census 已知下界，未知为 `null`，不得用正文条数回填。`envelope_outcome_block` 是唯一 prepare：完成上述判定，并通过接纳回调组装、序列化及校验实际输出，返回字段私有、不可 Clone 的 `PendingEnvelope<T>`，此时不记指标。Gateway 还须完成配额与审计结算，全部成功后才消费 `pending.finish(self)` 返回已准备的输出；`finish` 是 `completeness::record_final_classification` 的全 workspace 唯一调用点。prepare/校验/结算失败或丢弃 pending 均不记最终指标，类型所有权禁止同一 pending 重复 finish。指标度量服务端已接纳的业务结果，不声称远端已收到网络字节；transport 错误另行观测。组件 EXACT census 与 `classify_for_witness` 只提供纯判定，不能绕过 provenance/计数/Context 门发最终指标；G80-6 指标 witness 必须经过同一最终入口，不能伪造全集或索引读数将组件测试冒充全链验收。此处不改变 A1/A2、降级方向或字段的单一权威。
 
 ---
 
@@ -5819,6 +5826,8 @@ persisted = count(redeemed_event_id IS NOT NULL)   <- 事务 B 累加
 completeness_ratio = visible / (expected - deleted)
 ```
 
+**ADR-0057 D-A 修订（卡 31）**：分母改为点单位的 `points_expected`（U），即 `completeness_ratio = visible / points_expected`（U = 0 时取 1.0）；`expected - deleted` 是票据单位，扇出（1 Evidence → N 记忆）读数 > 1.0、生命周期票读数 < 1.0，与分子不同单位。
+
 五个数的取数面必须互相独立：
 
 | 字段 | 取数面 |
@@ -5826,7 +5835,7 @@ completeness_ratio = visible / (expected - deleted)
 | `expected` | `projection.stream_checkpoints.issued_highwater`（= `max(stream_seq)`）—— **口径以 §15.4 冻结算式为准，与 §22.5 `ledger::close` 是同一次取数**，本表不另立第二个定义；这里的 `expected` 是 `projection.expected`，不是 ① 的 `evidence.expected` |
 | `done` / `deleted` / `skipped` | `projection.stream_log`（`deleted` = `TOMBSTONED`，`skipped` = `SKIPPED_BY_POLICY` ∪ `RETIRED_FAILED`，两者都已计入 `done`） |
 | `open_gaps` | `projection.processing_gaps` 视图（§48） |
-| `visible` | Qdrant 索引按 tenant + scope + `projection_version = serving_version(family)` 的 count，**再扣除 tombstone overlay**（§37）：`visible = count(F) − count(F ∧ seq ∈ TOMBSTONED)`，`F` = 前述 filter —— 即检索路径在同一 filter 下实际能返回的条数（§17.1 / §16.2） |
+| `visible` | Qdrant 索引按 tenant + scope + `projection_version = serving_version(family)` 的 count，**再扣除 tombstone overlay**（§37）：`visible = count(F) − count(F ∧ seq ∈ TOMBSTONED)`，`F` = 前述 filter —— 即检索路径在同一 filter 下实际能返回的条数（§17.1 / §16.2）。ADR-0057 D-C：scope 是该 workspace 流，且带调用方的 §6.1 可见性（`family_probe`），与 PG 侧点读数同一谓词 |
 
 **`projection.expected` 与 ① 的 `evidence.expected` 是两个量，不是同一个量的两处写法**，分居 envelope 的 `pipeline.projection` 与 `pipeline.evidence` 两块，**禁止互相回填**：后者是批次在写入开始之前声明的票数（§23.1①），前者是这条流已经发放出去的稠密序号上界（票兑成 Evidence、`remember` 事务 B 发出 `stream_seq` 之后才有）。①「分母外生」这条只管 `evidence` 层；`projection` 层分母的外生性由 §15.1 的稠密序号 + §15.2「默认状态是未证明完成」保证 —— 序号一发就跑不掉，与被测对象声不声明「我写完了」无关。把 `projection.expected` 也改取票据表会把整条流永久钉死：G23-1a 那条注入（声明 100 只写 97）之后票数 100 而 stream_log 只有 97 行，A1 恒不闭合 ⇒ 每一个未兑完的批次都永久 `cannot_establish`，一个比值都出不来。
 
@@ -5862,6 +5871,8 @@ A2 可见闭合（有向；差额的方向决定处置）
    visible + deleted + skipped == done ⇒ 闭合（删除全程也在此支：tombstone 一提交，deleted 加一与
         visible 减一同时发生，§37 DeletionPlan 第 1 步 + §23.1② overlay）
 ```
+
+**ADR-0057 D-A 修订（卡 31）**：上式只在「每票恰好一个点、没有生命周期票」时成立，故 A2 改为两侧都按记忆点计（A1 仍是票据单位）：PG 侧由 0189 `projection.stream_point_ledger` 在账本同一快照读出 `points_settled` L、`points_in_flight` F、`points_unsettled` Q（最新票 FAILED / LOST / RETIRED_FAILED 的记忆，点数 0 或 1）、`points_expected` U，判据为 `visible < L` ⇒ 丢失（处置不变）、`L ≤ visible ≤ L + Q` ⇒ 闭合、`≤ L + Q + F` ⇒ 在途、再超出 ⇒ `cannot_establish`；四个读数上线值。
 
 **`current` 的冻结定义（全文只此一处，envelope 的 `projection.current` 与 §22 的降级判定都读它）**：
 
@@ -5940,7 +5951,8 @@ Event payload、完全未消费索引或 RetrievalCard，可以对这四项如�
 在「lane 跑完了但带回来的不全」这一侧的同一个洞。§25.5 的 `mandatory_context_overflow` 表达
 不了它——溢出是「装不下」，这条是「装下了但没装满」。§23.3 的 `reason` 闭集因此为 11 个
 （`mandatory_not_satisfied` 是第 11 个），线值与 §41.2 计数器 label 同源于
-`CompletenessClass::wire_labels`。
+`CompletenessClass::wire_labels`。此后 ADR-0053 加 `no_serving_projection`、ADR-0057 D-E 加
+`projection_lag`，闭集现为 13 个。
 这不另造 classifier、Envelope 或统计资格，也不改 §23.1② 的 A1/A2 算法。
 
 **这两个读数的来源（ADR-0041 落地口径，不放宽上面任何一条）**：`stream_ledger` 口径的
@@ -6064,7 +6076,7 @@ Exact，以及 schema/结算/审计失败的零指标对照；此入口不代表
 }
 ```
 
-本例读数的来源：A1 成立（`95 + 1 + 2 == 98`）；A2 违反（`88 + 3 + 2 = 93 != 95`，差的 2 条就是「票已结清、状态已 `DONE`、却不在索引里」）⇒ 照算 `completeness_ratio = 88 / (98 - 3) = 0.926`、`current = false`（`open_gaps = 1 != 0`，且 A2 不闭合 —— 两个分量同时不成立，定义见 §23.1②）、`degradations` 含 `PROJECTION_INVISIBLE_LOSS`。`skipped = 2` 是按策略永不进索引的两条（§7.2 / §18），它**计入 A2 左边、不进分母**：不计入左边，任何有禁外发策略的租户都会永久 A2 红；从分母里减掉，则策略排除会静默消失（§22.1 `excluded_secret` 同款纪律）。同一组数在旧口径下读 `(95 - 3) / (98 - 3) = 0.968`，两者必须分叉，否则本示例不能当夹具用。pipeline 三段的逐级衔接同样要对得上（示例即夹具，任一处对不上就不是示例、是反例）：`evidence 100 → 98`（2 张票未销）、`knowledge.eligible 98 == evidence.persisted`、`95 + 2 + 1 == 98`、`projection.expected 98 == evidence.persisted 98` —— **不是 `knowledge.processed`**：`projection.expected` 是 `issued_highwater`（§23.1② 取数面表），`remember` 事务 B 对每条持久化 Evidence 无条件发一个 `stream_seq`（§15.1 / §60），知识层的 `waiting_key` / `failed` 不会让已经发出去的序号消失。这 98 行 `stream_log` 的三分即 A1：`done 95` = 90 `DONE` + 3 `TOMBSTONED` + 2 `SKIPPED_BY_POLICY`、`open_gaps 1` = 那条 `knowledge.failed`（`FAILED` ∈ GAP）、`pending 2` = 那两条 `knowledge.waiting_key` 还没结清（stream state=`WAITING_KEY`，不会被墙钟巡检误报 LOST）；90 条 `DONE` 在索引里只剩 88，少的 2 条就是 A2 报出来的丢失。A2 的差额落在 `<` 侧（`93 < 95`）⇒ 判丢失而非在途 —— 在途只可能让左边**大于** `done`（§23.1② A2 的 `>` 支）。
+本例读数的来源：A1 成立（`95 + 1 + 2 == 98`）；A2 违反（`88 + 3 + 2 = 93 != 95`，差的 2 条就是「票已结清、状态已 `DONE`、却不在索引里」）⇒ 照算 `completeness_ratio = 88 / (98 - 3) = 0.926`、`current = false`（`open_gaps = 1 != 0`，且 A2 不闭合 —— 两个分量同时不成立，定义见 §23.1②）、`degradations` 含 `PROJECTION_INVISIBLE_LOSS`。`skipped = 2` 是按策略永不进索引的两条（§7.2 / §18），它**计入 A2 左边、不进分母**：不计入左边，任何有禁外发策略的租户都会永久 A2 红；从分母里减掉，则策略排除会静默消失（§22.1 `excluded_secret` 同款纪律）。同一组数在旧口径下读 `(95 - 3) / (98 - 3) = 0.968`，两者必须分叉，否则本示例不能当夹具用。pipeline 三段的逐级衔接同样要对得上（示例即夹具，任一处对不上就不是示例、是反例）：`evidence 100 → 98`（2 张票未销）、`knowledge.eligible 98 == evidence.persisted`、`95 + 2 + 1 == 98`、`projection.expected 98 == evidence.persisted 98` —— **不是 `knowledge.processed`**：`projection.expected` 是 `issued_highwater`（§23.1② 取数面表），`remember` 事务 B 对每条持久化 Evidence 无条件发一个 `stream_seq`（§15.1 / §60），知识层的 `waiting_key` / `failed` 不会让已经发出去的序号消失。这 98 行 `stream_log` 的三分即 A1：`done 95` = 90 `DONE` + 3 `TOMBSTONED` + 2 `SKIPPED_BY_POLICY`、`open_gaps 1` = 那条 `knowledge.failed`（`FAILED` ∈ GAP）、`pending 2` = 那两条 `knowledge.waiting_key` 还没结清（stream state=`WAITING_KEY`，不会被墙钟巡检误报 LOST）；90 条 `DONE` 在索引里只剩 88，少的 2 条就是 A2 报出来的丢失。A2 的差额落在 `<` 侧（`93 < 95`）⇒ 判丢失而非在途 —— 在途只可能让左边**大于** `done`（§23.1② A2 的 `>` 支）。**ADR-0057 D-A 修订（卡 31）**：本例按修订前的票据单位书写；修订后 `projection` 块另带 `points_expected` / `points_settled` / `points_in_flight` / `points_unsettled`，A2 拿 `visible` 比 L（本例每票一个记忆、无生命周期票，L = 90 条 `DONE` ⇒ `88 < 90` 仍判丢失），比值分母为 `points_expected`；结论（丢失、`current = false`、`PROJECTION_INVISIBLE_LOSS`）不变。
 
 检索侧同理：`candidate_count 25` / `reranked_count 12` / `returned 5`。`RERANK_PROVIDER_TIMEOUT` 的含义是 25 个候选里只有 12 个真过了重排、其余走 fallback 序；**两个 count 相等的示例看不出降级发生过**，正是 §23.2 那条判据例要排除的形态（本示例先前写 `25 / 25` 却同时挂着这条降级，自己违反了自己立的标准，已改）。三个数的自洽关系即 §23.4 的夹具断言：`returned (5) == profile.top_k`、`reranked_count (12) <= candidate_count (25) == profile.cand_k == min(top_k * 5, 200)`、`truncated = true` 因为 `candidate_count > returned`；且 `reranked_count == candidate_count` 时 `degradations` 不得含任何 rerank 类降级（重排全数完成 = 结果未被降级；重试后全数成功只记指标，不进 `degradations`），反之含该降级时 `reranked_count` 必须严格小于 `candidate_count`。
 
@@ -12034,6 +12046,9 @@ I3  status != Active 的行不参与裁决。**它照常计入 §23 的 `visible
     分子口径由 §23.1② 单独冻结（Qdrant 计数减 tombstone overlay，与 authority status 无关），
     本节不得在那之外另加一维；真要让非 Active 行退出检索面，必须先在 §23.1② 的 `visible`
     filter 里显式加上 status 维度、并给 A2 补一个 `superseded` 项（同 `skipped` 的处理）。
+    ADR-0057 D-A 修订（卡 31）：A2 改按记忆点计后，Superseded 行的点由其 retire 票删除、同时退出
+    L，两侧同步减一，上面「计入 `visible` 与 `done`」的推理只适用于修订前的票据单位判据；
+    I3 对裁决的规定不变。
 I4  status == Superseded  <=>  superseded_by.is_some()；
     Active / Revoked / Expired 三个状态 superseded_by 必须为 None。
 I5  confidence 越界（含 NaN / Inf）构造失败；禁止 clamp 回 [0,1]。

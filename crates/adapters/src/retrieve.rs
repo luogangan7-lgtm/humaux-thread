@@ -6,12 +6,13 @@
 //!   private.memory_records, projection.stream_checkpoints, projection.stream_log]]; env=[CARGO_MANIFEST_DIR];
 //!   modules=[adapters::context_repo, adapters::postgres, adapters::private_projection_registry, adapters::qdrant,
 //!   adapters::read_materialize, adapters::serving_repo, adapters::stream_repo, domain::affect, domain::error,
-//!   domain::identity, domain::ids, domain::subject, infra-cell::permit, infra-cell::transport, projection::serving,
+//!   domain::identity, domain::ids, domain::subject, infra-cell::permit, infra-cell::transport, projection::dense, projection::serving,
 //!   projection::stream, retrieval::completeness, retrieval::envelope]
-//! Called-by: [adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::read_materialize, adapters::remember, adapters::stream_repo, gateway::recall, tests, xtask::switch_visible]
+//! Called-by: [adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::provisioning, adapters::read_materialize, adapters::remember, adapters::stream_repo, gateway::recall, tests, xtask::switch_visible]
 //! Invariants: [read-your-writes on role_gateway: an expired token, cross-tenant/workspace scope or a changed serving
-//!   projection is a typed RetrieveError, never a stale answer passed off as caught up]
-//! Spec: Baseline §6.2.3
+//!   projection is a typed RetrieveError, never a stale answer passed off as caught up; the read-route visible count
+//!   is caller-scoped (family_probe), the visibility-free stream count serves ops callers only (ADR-0057 D-C)]
+//! Spec: Baseline §6.2.3; ADR-0057
 //!
 //! **Why this lives in `humaux-adapters`, not `humaux-application`**: every function below
 //! that touches PostgreSQL needs `&RuntimeDbPool`, and [`crate::postgres::RuntimeDbPool`]'s
@@ -45,6 +46,7 @@ use humaux_domain::identity::AuthorizationScope;
 use humaux_domain::ids::{TenantId, WorkspaceId};
 use humaux_domain::subject::SubjectId;
 use humaux_infra_cell::{CellAccessPermit, IntraCellHttpTransport};
+use humaux_projection::dense::build_stream_count_filter;
 use humaux_projection::serving::StreamFamily;
 use humaux_projection::stream::StreamKey;
 use humaux_retrieval::completeness::LedgerClosure;
@@ -771,7 +773,7 @@ pub struct RecallEnvelope {
     /// §16.2：本次响应**唯一合法的检索面版本**，取自该 family 的 `serving` 行
     /// （[`crate::serving_repo::serving_version`]），**不是** token 里带的那个。
     ///
-    /// 构造 §23.1② 的 visible filter（`qdrant::VisibleCountFilter::new`）时只许读这里：
+    /// 构造 §23.1② 的 visible filter（`qdrant::VisibleCountFilter::family_probe`）时只许读这里：
     /// token 是客户端提交的，拿它当路由依据等于让调用方指定读哪个版本，正是 §16.2 要禁的。
     /// token 里的 version 仍然有用，但角色是**被核对项**（它命中的行是不是 serving），
     /// 不是路由依据。
@@ -933,7 +935,7 @@ pub async fn materialize_private_read_serving_about(
     )
     .await?;
     let key = family.with_version(projection_version);
-    let ledger = close_ledger_in_txn(&mut txn, &key).await?;
+    let ledger = close_ledger_in_txn(&mut txn, &key, authorization).await?;
     let pipeline = stream_pipeline_counts_in_txn(&mut txn, &key)
         .await
         .map_err(RetrieveError::FinalMaterialization)?;
@@ -1220,47 +1222,77 @@ pub async fn visible_index_count(
             .await
             .ok()?
     };
-    // Rules 2 and 3's actual arithmetic — shared verbatim with the §16.2 serve switch, see
-    // [`visible_count_of_version`].
-    visible_count_of_version(&index, authorization, serving_version, &tombstoned).await
+    // Rules 2 and 3's actual arithmetic. The worker stamps a point's `workspace_id` with its
+    // family's `scope_id`, so the stream's own points are exactly `workspace_id = key.scope_id`.
+    visible_count_of_version(
+        &index,
+        authorization,
+        WorkspaceId(key.scope_id),
+        serving_version,
+        &tombstoned,
+    )
+    .await
 }
 
-/// §23.1②'s `visible` for **one declared `projection_version`** — the shared body of
-/// [`visible_index_count`] (the three read routes) and of the §16.2 serve switch's two
-/// `visible_*` inputs (`xtask::switch_visible`, which feeds
-/// `adapters::serving_repo::switch_projection_version` / `projection::serving::evaluate_switch`).
-/// One producer, so the switch cannot drift onto a second, hand-written filter: rule 2 of
-/// [`visible_index_count`]'s doc (`VisibleCountFilter` is only constructible through
+/// §23.1②'s `visible` of **one workspace stream at one `projection_version`**, under the
+/// caller's visibility — the shared body of [`visible_index_count`] (the three read routes).
+/// Rule 2 of [`visible_index_count`]'s doc (`VisibleCountFilter::family_probe` routes through
 /// `projection::dense::build_dense_filter`, which unconditionally ANDs the tenant clause and the
 /// §6.1.2 visibility disjunction) and rule 3 (the §37 tombstone overlay rides the same `count`
-/// request) both live here and are therefore identical on both sides.
+/// request) both live here.
 ///
-/// **Why this takes a bare `projection_version` rather than [`visible_index_count`]'s
-/// `serving_version` + `key` pair.** That function's `serving_version != key.projection_version
-/// ⇒ None` guard exists because its answer is compared against a `LedgerClosure` closed at
-/// `key.projection_version` (A2: `visible + deleted + skipped == done`) — two different faces
-/// there is a manufactured `PROJECTION_INVISIBLE_LOSS`. The switch compares a count against
-/// *another count*, never against a ledger, and §16.3 requires the two sides to differ in
-/// exactly the `projection_version` filter — so the serve path must count the **candidate**
-/// version for `visible_shadow` and the **serving** version for `visible_serving`, and applying
-/// the read route's same-version guard there would return `None` for every real (candidate ≠
-/// serving) promotion, i.e. `VisibleUnavailable` forever. The guard stays where it belongs, on
-/// the ledger-comparing caller.
+/// ADR-0057 D-C: narrowed to `workspace_id`, because the ledger A2 compares against covers ONE
+/// workspace stream while `build_dense_filter`'s TENANT_SHARED arm is tenant-wide — the card-30
+/// two-workspace fixture read visible=29 against a 6-ticket stream. The PostgreSQL side
+/// (`projection.stream_point_ledger`) applies the same caller visibility, so A2 is caller-scoped
+/// on both sides.
 ///
 /// `None` — never a fabricated number — when the version string is empty or the Qdrant count
 /// fails.
 pub async fn visible_count_of_version(
     index: &IndexFace<'_>,
     authorization: &AuthorizationScope,
+    workspace: WorkspaceId,
     projection_version: &str,
     tombstoned_seqs: &[i64],
 ) -> Option<u64> {
-    let filter = VisibleCountFilter::new(authorization, projection_version)?;
+    let filter = VisibleCountFilter::family_probe(authorization, workspace, projection_version)?;
+    count_of(index, &filter, tombstoned_seqs).await
+}
+
+/// §16.2/§16.3 ops count (ADR-0057 D-C): every point of one stream whatever its visibility
+/// class — the serve switch's two `visible_*` inputs (`xtask::switch_visible`, which may count a
+/// candidate version different from the serving one, so it takes a bare version), the soak, and
+/// the ADR-0053 empty-activation probe. Never a request path (gate
+/// `stream_count_off_request_path`): §17.1's visibility arm is absent by design, which is why it
+/// returns a number and nothing else. Same tombstone overlay and same `None` rule as
+/// [`visible_count_of_version`].
+pub async fn stream_count_of_version(
+    index: &IndexFace<'_>,
+    tenant: TenantId,
+    workspace: WorkspaceId,
+    projection_version: &str,
+    tombstoned_seqs: &[i64],
+) -> Option<u64> {
+    let filter = VisibleCountFilter::from_stream(build_stream_count_filter(
+        tenant,
+        workspace,
+        projection_version,
+    )?);
+    count_of(index, &filter, tombstoned_seqs).await
+}
+
+/// The one count call both audiences share.
+async fn count_of(
+    index: &IndexFace<'_>,
+    filter: &VisibleCountFilter,
+    tombstoned_seqs: &[i64],
+) -> Option<u64> {
     count_visible_excluding_seqs(
         index.transport,
         index.permit,
         index.collection,
-        &filter,
+        filter,
         tombstoned_seqs,
     )
     .await

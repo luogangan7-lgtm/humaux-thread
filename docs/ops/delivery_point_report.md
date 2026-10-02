@@ -42,7 +42,7 @@ than borrowing a soak's number.
 | `memory.enumerate` | `exact` | a frozen denominator exists (card 19 `exact_census`) | `native_mcp_memory_enumeration_counts_in_the_page_snapshot` |
 | `memory.get` | `cannot_establish` / `count_unknown` | DirectGet has no enumerable universe; a universe-of-one census is a future decision (ADR-0041 D-D) | `native_mcp_memory_get_authorization_and_lifecycle_matrix` |
 | `recall.search` | `semantic_bounded`, `reason: null` | §22.4 scopes `reason`/`known_lower_bound` to `cannot_establish` only | ADR-0044 (card 22 narrowed Tool 2 to the semantic lane) |
-| `context.assemble` | `cannot_establish` / `lane_failed`, and since card 22c also `mandatory_not_satisfied` | the §25 selector set is wired but the PINNED lane has no deliverable class — see §6.3 | ADR-0047 |
+| `context.assemble` | `cannot_establish` / `lane_failed`, and since card 22c also `mandatory_not_satisfied` | the §25 selector set is wired; a pin at the `ProjectConstraint` floor is delivered through Mandatory, a below-floor pin is not (ruling C, §6.3) | ADR-0047, ADR-0057 D-G |
 
 ### 1.3 Share (workspace / tenant scope)
 
@@ -532,16 +532,19 @@ Evidence for the fixes: `gates_card24_rehearsal4.log` and `card24_rehearsal4_evi
 Each limit states the exact refusal and the condition that unlocks it. None of these is a
 "probably fine".
 
-### 6.1 USER_PRIVATE points make the §16.2 promotion switch refuse (ADR-0040 D-J)
+### 6.1 USER_PRIVATE points no longer block the §16.2 promotion switch — closed by card 31 (ADR-0057 D-C)
 
-The ops `AuthorizationScope` cannot express "all USER_PRIVATE points of a tenant". Rather than
-counting two sides that agree only by absence, the §16.2 switch **refuses with
-`VisibleUnavailable`** whenever a tenant has any live projected USER_PRIVATE point.
+Until card 31 the switch refused with `VisibleUnavailable` whenever a tenant had any live
+USER_PRIVATE point, because the ops `AuthorizationScope` could not express "every USER_PRIVATE
+point of a tenant" (ADR-0040 D-J). The ops count now goes through §17.1's count-only exception,
+`projection::dense::StreamCountFilter` (tenant + workspace + `projection_version`, every visibility
+class): it returns a number, never ids or bodies, and cannot be converted into a search filter
+(compile-fail test). The request path keeps the caller-scoped `family_probe`.
 
-- False on the rehearsal corpus (everything is WORKSPACE_SHARED), so it has never fired here.
-- **A real deployment with private memories cannot promote a projection version until a
-  system-scope arm exists in `projection::dense`** (§17.1 / §6.1.2 — a change no card owns).
-- Unlock: that system-scope arm.
+- Witness: `switch_user_private::a_tenant_with_user_private_memories_can_switch` (no
+  `VisibleUnavailable`) and `…::a_shadow_missing_a_user_private_point_is_refused`
+  (`VisibleMismatch` — the count is not equal by absence).
+- Still open: non-first promotions refuse on criterion ③ (§6.2), unchanged.
 
 ### 6.2 Non-first projection promotions refuse on §16.3 criterion ③ (card 20)
 
@@ -556,15 +559,23 @@ Related, and operator-visible: **RETIRED_FAILED tickets are permanently invisibl
 (§15.2.1 — they were never indexed). This is a consequence of retirement, not loss of anything
 that was ever served.
 
-### 6.3 The PINNED lane has no deliverable class (discovered by card 22c, pre-existing)
+### 6.3 PINNED delivers through Mandatory; a below-floor pin is not delivered (ruling C, ADR-0057 D-G)
 
-`fetch_pinned_in_txn` borrows the `ProjectConstraint` floor from `explicit_mandatory_bindings_v1`
-while `project_active_constraints_v1` claims every active `ProjectConstraint` row, so
-`PinnedLane::excluding_mandatory` is **always empty for legally storable memories**. Two
-fixtures had to manufacture a stored `ExplicitTaskContext` to escape it.
+**User-visible limit.** `memory.pin` stores the binding for any readable memory, but
+`context.assemble` delivers a pinned memory only when its authority is at or above
+`ProjectConstraint`. Such a memory is already claimed by Mandatory
+(`project_active_constraints_v1`), so it arrives in `handoff.mandatory` and the content, and the
+PINNED lane counts it in `counts.pinned_excluded`. A pin **below** that floor (for example a
+distilled `PrivateKnowledge` memory) is counted in `pinned_excluded` and **not returned**. This is
+Baseline §25.4.B(6) as written, not a defect: deterministic delivery of a below-floor memory belongs
+to the v2 task-authorization path (audit, content version, revocation), because a lower floor would
+let one induced `memory.pin` inject low-origin content into every Context (§25.4.B, §10.1). The main
+line confirmed this ruling for card 31 (E1); the card's acceptance line "memory.pin then
+context.assemble delivers the pinned memory" holds at the floor and is struck below it.
 
-This needs a ruling on the PINNED floor before any code change. Until then the affected
-assertions are listed here rather than counted as green.
+- Witness: rehearsal lines `pinned_constraint_delivered_by_context_assemble` and
+  `pinned_below_floor_named_excluded` (§6.17).
+- Unlock for below-floor delivery: the v2 task-authorization path (no card owns it yet).
 
 ### 6.4 `memory.get` completeness is `cannot_establish` by construction (ADR-0041 D-D)
 
@@ -835,6 +846,45 @@ not, and it withdraws the "ready for production" reading of §5.**
   coarse-timestamp FS) — the control is a root-owned 0555 binary on a read-only path;
   `egress_chars_total` has no production emit (G80-6), so "one seal per recall" is pinned
   structurally, not by the metric.
+
+### 6.17 Closed by card 31 (ADR-0057)
+
+| Change | Before | After (ADR-0057) | Witness |
+|---|---|---|---|
+| A2 unit (P1-5) | tickets (`done`) against points (`visible`): `recall_after_restore` read `done=6 visible=4` (`PROJECTION_INVISIBLE_LOSS`, `current=false`) in all 5 rehearsal-5 runs; kill-9 read `done=8 visible=4`; 1 Evidence → 3 memories read cannot_establish | points on both sides: `visible` vs `points_settled` L (0189 definer, same snapshot), with `points_in_flight` F and `points_unsettled` Q as slack; the four readings are on the wire; ratio = `visible / points_expected` | `a2_point_identity` 19/19 (numbers in ADR-0057 §Per-transition); rehearsal `a2_after_*` |
+| `visible` scope | tenant-wide against a one-workspace ledger (card-30 fixture `visible=29` vs `done=6`) | the workspace stream under the caller's visibility (`family_probe`), PG side the same predicate | `two_workspaces_count_only_their_own_stream` (6 / 23) |
+| `correct` / undo | M1's point stayed; undo left M2's point | correct issues two tickets (E2 projects M2, E1 retires M1); undo tickets M2 before deactivating it; lifecycle tickets go to the memory's home stream | `correct_retires_the_corrected_versions_point`, `identity_holds_after_correct_then_restore`, rehearsal `correct_retired_m1_point` |
+| ProjectionLag (P1-8) | no input; a stalled runner read `current=true`, `degradations=[]` | `classify()` sixth input; age of the oldest pending ticket > `HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS` ⇒ `cannot_establish / projection_lag` + `PROJECTION_LAG` | `projection_lag` 3/3; rehearsal `stall_yields_projection_lag_within_threshold`, `resume_clears_projection_lag` |
+| Upsert/delete fence (card-30 review P2) | a reclaimed worker could overwrite or delete a point after a later ticket settled | `update_filter` / delete filter on `source_stream_seq` (`lte` the writer's ticket) | `stale_worker_upsert_is_refused_by_seq_fence`, `stale_worker_delete_is_refused_by_seq_fence` |
+| §6.1 switch | refused any tenant with USER_PRIVATE points | ops count-only `StreamCountFilter` | §6.1 |
+| §6.3 PINNED | "never delivers" (read as a defect) | ruling C (spec as written) | §6.3 |
+
+- **Operator-visible:** new required key `HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS` (no default; a gateway
+  without it does not boot); reads can now answer `cannot_establish / projection_lag` with
+  `PROJECTION_LAG` (runbook §7.2); deploy requirement Qdrant server ≥ 1.19.0 (runbook §4).
+- **Filed, not closed:** an unarchive ticket that ends `FAILED` leaves `archived=true` on the point
+  until a later ticket (card 35's reissue, ADR-0057 D-H); a stale upsert after a retire delete
+  re-inserts the point (reads as overshoot, never a false close; card 37); the registry write is not
+  seq-fenced (card 37).
+- **Rehearsal (no soak, 2026-10-02, debug profile):** `REHEARSAL VERDICT: 92 passed, 1 failed` on an
+  isolated database (`HUMAUX_REHEARSE_DB=humaux_thread_c31`, all migrations applied fresh). Card-31
+  lines, every one green: `a2_after_{supersede,restore,archive,unarchive,correct,correct_undo,kill9_drained}`
+  (each `visible == L`, F = Q = 0, `current=true`; e.g. restore `visible=4 L=4 U=4 done=6`, kill-9
+  drained `visible=4 L=4 done=17` — rehearsal 5 read `done=6 visible=4` loss on the same step),
+  `correct_retired_m1_point` (registry live 0, Qdrant points 0), both `pinned_*` lines (counts
+  expected 2 / returned 0 / excluded 2), `stall_yields_projection_lag_within_threshold` (threshold 20 s,
+  observed 21 s, ticket `ISSUED`, no lease while stopped), `resume_clears_projection_lag` (0 s).
+  The one red, `no_seq_scan_on_outbox_jobs_memory_evidence` (`4|1`, a seq scan on `ops.outbox` in the
+  claim plan), is the fresh database's size (227 outbox rows), not a regression; the catalog check
+  of the seven P1-15 indexes passed in the same run.
+- **Open for the main line (environment, not card 31):** the shared dev database cannot run the
+  rehearsal today. 195 `DERIVED_DISTILL` jobs of 119 leftover test tenants (created 2026-10-01
+  11:52–16:26 UTC, no route binding) are claimable. The dispatch claims
+  `ORDER BY priority DESC, next_retry_at, created_at` 8 at a time (`crates/adapters/src/jobs.rs:214`),
+  and a not-ready job is released with at most 300 s backoff and never parked DEAD
+  (`bins/private-worker/src/distill.rs:336-349`). Ready tenants starve: the run on
+  `humaux_thread_dev` distilled 0 memories. The same head-of-line blocking applies in production
+  to any tenant without a route binding.
 
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 

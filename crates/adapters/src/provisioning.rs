@@ -6,7 +6,7 @@
 //!   control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant,
 //!   control.onboard_workspace, control.revoke_api_key, control.set_workspace_membership,
 //!   projection.activate_empty_family, projection.ensure_tenant_placement], Qdrant(*)]; env=[];
-//!   modules=[adapters::membership_repo, adapters::postgres, adapters::qdrant, application::auth, domain::audit,
+//!   modules=[adapters::membership_repo, adapters::postgres, adapters::qdrant, adapters::retrieve, application::auth, domain::audit,
 //!   domain::identity, domain::ids, domain::ticket_family, infra-cell::permit, infra-cell::resource,
 //!   infra-cell::transport, projection::serving]
 //! Called-by: [maintenance::main, tests, xtask::e2e_seed]
@@ -15,7 +15,7 @@
 //!   transaction and the activation commits only if evaluate_switch accepts the DB-returned facts and the collection
 //!   generation is unchanged; a refusal writes nothing but its DENIED audit row; Qdrant or PostgreSQL down -> a typed
 //!   ProvisioningError (exit 1), never a partial activation; no receipt carries a wire key or the pepper]
-//! Spec: Baseline §4.2; §6.2.2; §16.2; §16.3; §17.3; §77; ADR-0017; ADR-0053
+//! Spec: Baseline §4.2; §6.2.2; §16.2; §16.3; §17.3; §77; ADR-0017; ADR-0053; ADR-0057
 //!
 //! Every onboarding write runs as `role_maintenance` ([`MaintenanceDbPool`]) through the eight
 //! owner SECURITY DEFINER doors of migration 0186 — this module holds no table INSERT of its own.
@@ -42,10 +42,7 @@ use std::time::{Duration, Instant};
 
 use humaux_application::auth::canonicalize_email;
 use humaux_domain::audit::SYSTEM_TENANT_ID;
-use humaux_domain::identity::{
-    AuthorizationScope, BoundedSet, MembershipConflict, MembershipMutation, MembershipRole,
-    PrincipalId,
-};
+use humaux_domain::identity::{MembershipConflict, MembershipMutation, MembershipRole};
 use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
 use humaux_domain::ticket_family::TicketFamily;
 use humaux_infra_cell::{
@@ -67,9 +64,9 @@ use uuid::Uuid;
 use crate::membership_repo::{self, AdminAction, MembershipRepoError, MembershipRequest};
 use crate::postgres::MaintenanceDbPool;
 use crate::qdrant::{
-    Distance, ShardingMethod, VisibleCountFilter, count_visible, create_collection_body,
-    subject_index_body, tenant_index_body,
+    Distance, ShardingMethod, create_collection_body, subject_index_body, tenant_index_body,
 };
+use crate::retrieve::{IndexFace, stream_count_of_version};
 
 type Txn<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
@@ -1370,21 +1367,6 @@ pub async fn ensure_collection(
     })
 }
 
-/// The user-less, single-workspace scope the empty probe counts under. The USER_PRIVATE blind
-/// spot is empty by construction: the workspace id is a fresh uuidv7 minted by
-/// `control.onboard_workspace`, and no ticket can have been issued for it while PROVISIONING
-/// (the 0185 write gate), so no point anywhere can carry it; PostgreSQL's side is re-checked by
-/// the definer regardless.
-fn probe_scope(tenant_id: Uuid, workspace_id: Uuid) -> Result<AuthorizationScope> {
-    Ok(AuthorizationScope::new(
-        TenantId(tenant_id),
-        PrincipalId(Uuid::nil()),
-        None,
-        BoundedSet::new([WorkspaceId(workspace_id)])
-            .map_err(|_| ProvisioningError::InvalidInput("workspace".to_owned()))?,
-    ))
-}
-
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -1527,16 +1509,27 @@ async fn activate_family(
         Err(other) => return Err(other),
     };
     let probe_id = Uuid::now_v7();
-    let filter = VisibleCountFilter::family_probe(
-        &probe_scope(tenant_id, workspace_id)?,
+    if family.projection_version().is_empty() {
+        return Err(ProvisioningError::InvalidInput(
+            "projection_version".to_owned(),
+        ));
+    }
+    let permit = face.permit()?;
+    // ADR-0057 D-C: the ops stream count — every point of the family whatever its visibility
+    // class (the previous user-less probe scope could not see USER_PRIVATE points).
+    let probe_visible = stream_count_of_version(
+        &IndexFace {
+            transport: &face.transport,
+            permit: &permit,
+            collection: &collection,
+        },
+        TenantId(tenant_id),
         WorkspaceId(workspace_id),
         family.projection_version(),
+        &[],
     )
-    .ok_or_else(|| ProvisioningError::InvalidInput("projection_version".to_owned()))?;
-    let permit = face.permit()?;
-    let probe_visible = count_visible(&face.transport, &permit, &collection, &filter, &[])
-        .await
-        .map_err(|e| ProvisioningError::Qdrant(format!("probe count: {e}")))?;
+    .await
+    .ok_or_else(|| ProvisioningError::Qdrant("probe count unavailable".to_owned()))?;
     let probed_at = OffsetDateTime::now_utc();
     receipt.probe_latency_ms = Some(millis(probe_started.elapsed()));
     receipt.generation = Some(g1.0.clone());

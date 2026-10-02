@@ -141,6 +141,19 @@ Two rules that are not obvious from the variable names:
   changes, so a rewrite that preserves all five fields (root, a shared `mmap` write, or a
   coarse-timestamp filesystem) is no longer caught per scan. File ownership is the control; the
   stat check detects tampering, it does not prevent it.
+- **`HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS` is required, no default** (card 31 / ADR-0057 D-F). A
+  gateway without it, or with `0`, fails boot naming the key. It is the age (seconds, DB clock) of
+  the oldest `ISSUED` / `PROCESSING` / `RETRY_WAIT` projection ticket of the stream a read touches
+  beyond which recall / context / memory reads answer `cannot_establish` with reason
+  `projection_lag` and the degradation `PROJECTION_LAG`. `WAITING_KEY` does not count; a ticket in
+  retry backoff does. Set it above the normal put → `DONE` time of the deployment (distill is
+  usually the long hop, §8) and below the sweep SLA card 35 introduces, or stuck tickets turn
+  `LOST` before they ever read as lag. The rehearsal uses 20.
+- **Qdrant server ≥ 1.19.0** (ADR-0057 D-I). The projection runner fences every point upsert with
+  Qdrant's `update_filter` and every delete with a `source_stream_seq` filter, so a reclaimed
+  runner's late write cannot undo a later ticket's. 1.19.0 is the version this behaviour was
+  measured on; an older server may ignore `update_filter` and silently drop the fence. Card 39
+  pins the image.
 - **Private retrieval egress runs gitleaks only** (ADR-0056 D-A). E-mail addresses, phone numbers,
   dates and long numbers in private memories and recall queries are sent to the retrieval provider
   (the disclosed ExternalProcessor, recorded in `ops.data_disclosures`). The e-mail/phone rules
@@ -252,6 +265,27 @@ returns the memory. This is the chain the acceptance suites exercise; a deployme
 - A `MEMORY_LIFECYCLE` ticket for a superseded / revoked / expired memory settles `DONE` by
   retiring its registry binding and deleting its point (ADR-0049). `registry_failed` on such a
   ticket means the retrieval worker binary predates ADR-0049.
+
+### 7.2 What `PROJECTION_LAG` means and what to do (ADR-0057 D-E)
+
+A read answers `completeness.class = cannot_establish`, `reason = projection_lag`, with
+`PROJECTION_LAG` in `degradations`, when the stream it read has a pending projection ticket older
+than `HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS`. The items are still served; the envelope says the
+index is behind the ledger, so a recent write may be missing. `projection.current` does not
+change (its formula is frozen), so watch the class, not `current`. With `PROJECTION_INVISIBLE_LOSS`
+at the same time both codes are reported, loss first.
+
+1. Is the runner alive and claiming? `humaux-retrieval-worker --serve`'s pass line
+   (`projection pass claimed= done= … pending= lost_lease=`) every poll interval. No line ⇒ the
+   process is stopped or hung: restart it through its supervisor (never by port or pattern, §9).
+2. Is the oldest pending ticket waiting on distill? An `EVIDENCE_ACCEPTED` ticket stays `ISSUED`
+   until its distill job closes; a growing private-worker backlog (§8) reads as lag. Fix the
+   distill hop, not the runner.
+3. Is one ticket retrying? `attempts` / `next_attempt_at` / `error_class` on the oldest `ISSUED`
+   row of the stream. A poison ticket makes its whole family lag until it settles `FAILED`; that is
+   intended (its write is not reflected). `FAILED` then shows as `open_gaps`, which `role_maintenance`
+   retires (ADR-0042).
+4. It clears by itself once the oldest pending ticket settles; no restart of the gateway is needed.
 
 ## 8. Load sizing — read before the first real traffic
 

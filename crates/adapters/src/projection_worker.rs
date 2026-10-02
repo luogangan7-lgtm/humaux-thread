@@ -15,8 +15,10 @@
 //!   upsert, verify search-visible, then settle; a transient failure returns the ticket to ISSUED with backoff
 //!   (bounded by max attempts, then FAILED transient_exhausted), except that a dependency-outage failure while the
 //!   dependency is already known down spends no attempt; a permanent one settles FAILED at once; every settle/retry/release is fenced on (lease_owner, attempts); a DONE is never written
-//!   before search-visible confirmation]
-//! Spec: Baseline §4.2; §15.1; §17.4; §18.2; §15.7; §6.1.2; ADR-0052
+//!   before search-visible confirmation; every point upsert and delete is fenced on the ticket's source_stream_seq, so a
+//!   reclaimed worker's late write cannot overwrite or remove a point a later ticket wrote; the fence has no
+//!   tombstone, so a stale upsert that lands after a retire delete re-inserts the point (ADR-0057 D-I, known limit 9)]
+//! Spec: Baseline §4.2; §15.1; §17.4; §18.2; §15.7; §6.1.2; ADR-0052; ADR-0057
 //!
 //! §4.2 (line 818): there is no separate `projection-worker` process — this is
 //! `humaux-retrieval-worker`'s own consumer loop, owned by `role_retrieval_worker`.
@@ -37,7 +39,7 @@
 //! carries N memories, and card 9 reported that only the first one used to be projected) (c)
 //! `embed_cards` (one batched call for the whole Evidence) (d) reject a short batch or a
 //! dimension mismatch (e) build a `QdrantPointPayload` per memory (f)
-//! [`crate::qdrant::upsert`] (g) [`crate::private_projection_registry::register_private_memory_point`]
+//! [`crate::qdrant::upsert_fenced`] (g) [`crate::private_projection_registry::register_private_memory_point`]
 //! (h) [`crate::qdrant::verify_visible_via_transport`] (i) only then mark the row `DONE` (j)
 //! [`crate::stream_repo::advance_prefix`] once for the whole batch.
 //!
@@ -594,9 +596,15 @@ fn extract_str(value: &serde_json::Value, key: &str) -> Option<String> {
 /// `content` is arbitrary `jsonb` (§8.5) — `title`/`key_claim`/`evidence_excerpt` are read as
 /// optional string fields on it, falling back to a truncated stringified `content` for `title`
 /// only (never for `key_claim`/`evidence_excerpt` — a missing one of those is a genuine §18.4
-/// "缺字段", not something to paper over here).
+/// "缺字段", not something to paper over here). A bare JSON string is not a record with missing
+/// fields: it is the whole statement, so it is the claim and the title.
 fn card_input(memory: &ResolvedMemory, workspace_id: WorkspaceId) -> CardInput {
+    // ADR-0057 D-B: `memory.correct` stores the user's corrected text verbatim as a JSON string
+    // (gateway `memory_correct`); read as an object it had no claim, so every correction settled
+    // FAILED `card_unbuildable` and the corrected memory never reached the index.
+    let statement = memory.content.as_str();
     let title = extract_str(&memory.content, "title")
+        .or_else(|| statement.map(|text| text.chars().take(80).collect()))
         .unwrap_or_else(|| memory.content.to_string().chars().take(80).collect());
     let entities = memory
         .content
@@ -623,7 +631,8 @@ fn card_input(memory: &ResolvedMemory, workspace_id: WorkspaceId) -> CardInput {
                 .unwrap_or(memory.created_at),
         ),
         title,
-        key_claim: extract_str(&memory.content, "key_claim"),
+        key_claim: extract_str(&memory.content, "key_claim")
+            .or_else(|| statement.map(str::to_owned)),
         entities,
         evidence_excerpt: extract_str(&memory.content, "evidence_excerpt"),
     }
@@ -771,7 +780,7 @@ async fn process_row(
     let mut any_done = false;
     let mut skipped: Option<(RowTerminal, &'static str)> = None;
     for memory in prepared.dead {
-        match retire_row(ctx, workspace_id, &memory).await {
+        match retire_row(ctx, stream_seq, workspace_id, &memory).await {
             (RowTerminal::Done, _) => any_done = true,
             other => return other,
         }
@@ -981,11 +990,16 @@ async fn finish_row(
     );
     let point_id = PointId::Uuid(registration.point_id.as_uuid());
 
-    if let Err(error) = qdrant::upsert(
+    // ADR-0057 D-I: fenced on this ticket's seq — a stalled worker whose lease was reclaimed
+    // cannot overwrite a point a later ticket of the same memory already wrote.
+    // ponytail: no tombstone behind the seq fence — a stale upsert after a retire delete finds no
+    // point and re-inserts it (reads as A2 overshoot, never a false close; ADR-0057 known limits
+    // 9-10). Card 37's generation fence on the registry row is the upgrade path.
+    if let Err(error) = qdrant::upsert_fenced(
         ctx.transport,
         ctx.permit,
         &ctx.placement.collection_name,
-        &[(point_id, &indexable, vector)],
+        (point_id, &indexable, vector),
         ha_profile_for(QdrantOperation::NormalImmutableUpsert),
     )
     .await
@@ -1030,6 +1044,7 @@ async fn finish_row(
                     ctx.permit,
                     &ctx.placement.collection_name,
                     &[point_id],
+                    stream_seq,
                     ha_profile_for(QdrantOperation::CorrectionDeleteSupersede),
                 )
                 .await
@@ -1066,6 +1081,7 @@ async fn finish_row(
 /// plus settlement, not a visibility change.
 async fn retire_row(
     ctx: &RowCtx<'_>,
+    stream_seq: i64,
     workspace_id: WorkspaceId,
     memory: &ResolvedMemory,
 ) -> (RowTerminal, &'static str) {
@@ -1095,6 +1111,8 @@ async fn retire_row(
         ctx.permit,
         &ctx.placement.collection_name,
         &ids,
+        // ADR-0057 D-I: the delete mirror of the upsert fence (a later ticket's revive survives).
+        stream_seq,
         ha_profile_for(QdrantOperation::CorrectionDeleteSupersede),
     )
     .await

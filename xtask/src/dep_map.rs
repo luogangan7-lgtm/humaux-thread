@@ -5784,7 +5784,7 @@ mod tests {
             .filter(|f| f.path == "xtask/src/dep_map.rs" || f.path == "xtask/src/gate_truth.rs")
             .collect();
         assert!(bad.is_empty(), "{bad:?}");
-        assert_eq!(an.fixtures.len(), 24, "trybuild fixtures excluded by path");
+        assert_eq!(an.fixtures.len(), 25, "trybuild fixtures excluded by path");
     }
 
     // ---- DB ------------------------------------------------------------------------------

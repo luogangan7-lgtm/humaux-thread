@@ -66,16 +66,14 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use humaux_domain::ids::TenantId;
+use humaux_domain::ids::{TenantId, WorkspaceId};
 use humaux_projection::serving::{
     ActivationEvidence, ContinuationVerdict, StreamFamily, SwitchCriteria, evaluate_switch,
 };
 use postgres::{Client, NoTls};
 use uuid::Uuid;
 
-use crate::switch_visible::{
-    Candidate, VisibleFace, ops_scope, read_candidate_facts, visible_pair,
-};
+use crate::switch_visible::{Candidate, VisibleFace, read_candidate_facts, visible_pair};
 
 // ---------------------------------------------------------------------------------------------
 // Configuration (§78.1: required flags only, no defaults)
@@ -1211,9 +1209,9 @@ pub struct PromoteCandidate {
     pub open_gaps: i64,
     /// §23.1②'s live Qdrant count for the **candidate** version, tagged with that version
     /// (`crate::switch_visible`, which delegates to card 18's shared producer
-    /// `adapters::retrieve::visible_count_of_version`). `None` only when the count genuinely
-    /// could not be taken — no placement row, Qdrant unreachable, or the user-private blind
-    /// spot — never as a stand-in for "this harness has no counter".
+    /// `adapters::retrieve::stream_count_of_version`, ADR-0057 D-C). `None` only when the count
+    /// genuinely could not be taken — no placement row or Qdrant unreachable — never as a
+    /// stand-in for "this harness has no counter".
     pub visible_shadow: Option<(String, u64)>,
     /// The same count for the family's current `serving` version, or `None` for a first
     /// activation (there is no serving face to compare against yet).
@@ -1242,14 +1240,14 @@ pub struct PromoteGrading {
 /// this harness has never seen still appears the moment the evaluator returns it.
 ///
 /// The two `visible_*` counts arrive on [`PromoteCandidate`], taken live from Qdrant by
-/// [`promote_rejections`] through `crate::switch_visible` — card 18's shared producer
-/// (`adapters::retrieve::visible_count_of_version`), the same one the three read routes use, so
-/// there is no second hand-written filter for this call (§17.1,
-/// `crates/projection/tests/no_handwritten_filter_scan.rs`). Until that wiring existed this
+/// [`promote_rejections`] through `crate::switch_visible` — the ops producer
+/// (`adapters::retrieve::stream_count_of_version`, ADR-0057 D-C: every point of the stream,
+/// same tombstone overlay as the read routes), so there is no second hand-written filter for
+/// this call (`crates/projection/tests/no_handwritten_filter_scan.rs`). Until that wiring existed this
 /// function passed a literal `None` on both sides and every candidate in every soak witness was
 /// refused `VisibleUnavailable` — a statement about the harness, not the deployment. A `None`
-/// here is now a real refusal (no placement row, Qdrant unreachable, or the user-private blind
-/// spot `switch_visible::ops_scope` documents), and §23.1's rule still holds: an uncountable
+/// here is now a real refusal (no placement row or Qdrant unreachable), and §23.1's rule still
+/// holds: an uncountable
 /// index is `visible: null`, never a backfill from another number.
 ///
 /// `continuation` is [`ContinuationVerdict::CannotEstablish`] for a similar reason: §69's
@@ -1338,21 +1336,18 @@ fn promote_rejections(
         let serving: Option<String> = r.get(5);
         let (visible_shadow, visible_serving) =
             match read_candidate_facts(db, &family, &candidate_version, serving.as_deref())? {
-                Some(facts) => {
-                    let scope = ops_scope(tenant, family.scope_id)?;
-                    rt.block_on(visible_pair(
-                        face,
-                        &Candidate {
-                            scope: &scope,
-                            collection: &facts.collection,
-                            candidate_version: &candidate_version,
-                            candidate_tombstoned: &facts.candidate_tombstoned,
-                            serving_version: serving.as_deref(),
-                            serving_tombstoned: &facts.serving_tombstoned,
-                            user_private_points: facts.user_private_points,
-                        },
-                    ))
-                }
+                Some(facts) => rt.block_on(visible_pair(
+                    face,
+                    &Candidate {
+                        tenant: TenantId(tenant),
+                        workspace: WorkspaceId(family.scope_id),
+                        collection: &facts.collection,
+                        candidate_version: &candidate_version,
+                        candidate_tombstoned: &facts.candidate_tombstoned,
+                        serving_version: serving.as_deref(),
+                        serving_tombstoned: &facts.serving_tombstoned,
+                    },
+                )),
                 // No §17.3 placement row for this tenant: nothing to count against, so both
                 // sides stay the honest `None` (`VisibleUnavailable`).
                 None => (None, None),

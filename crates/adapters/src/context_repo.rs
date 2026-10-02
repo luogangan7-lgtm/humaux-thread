@@ -1768,7 +1768,7 @@ pub async fn materialize_memory_enumeration(
     let grounding = page_grounding_in_txn(&mut txn, &authorization, &page.items).await?;
     let subjects =
         memory_subjects_in_txn(&mut txn, authorization.tenant_id().0, &page.items).await?;
-    let ledger = close_ledger_in_txn(&mut txn, validated_key)
+    let ledger = close_ledger_in_txn(&mut txn, validated_key, &authorization)
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
     // §23.3④: read in the same transaction as the ledger whose `expected` they are compared
@@ -1998,7 +1998,7 @@ pub async fn materialize_memory_get(
     .ok_or(ErrorCode::Internal)?;
     let subjects =
         memory_subjects_in_txn(&mut txn, authorization.tenant_id().0, &[memory_id.0]).await?;
-    let ledger = close_ledger_in_txn(&mut txn, validated_key)
+    let ledger = close_ledger_in_txn(&mut txn, validated_key, authorization)
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
     txn.commit()
@@ -2056,7 +2056,7 @@ pub async fn assemble_materialized(
     {
         return Err(ErrorCode::DependencyUnavailable);
     }
-    let ledger = close_ledger_in_txn(&mut txn, validated_key)
+    let ledger = close_ledger_in_txn(&mut txn, validated_key, authorization)
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
     let pipeline = stream_pipeline_counts_in_txn(&mut txn, validated_key).await?;

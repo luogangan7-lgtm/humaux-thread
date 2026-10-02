@@ -487,6 +487,7 @@ fn context_bootstrap(handle: &Handle) -> ContextBootstrap {
         )
         .expect("registered default profile"),
         &policy,
+        std::time::Duration::from_secs(60),
     )
     .expect("actual executable identity")
 }

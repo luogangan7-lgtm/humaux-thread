@@ -4,19 +4,20 @@
 //!   humaux-projection, humaux-retrieval-provider, humaux-testkit, postgres, serde_json, sha2, sqlx, time, tokio];
 //!   services=[PostgreSQL(any) r=[ops.commit_seq_seq, private.ingest_tickets] w=[control.memberships,
 //!   control.private_reasoning_domains, control.tenants, control.users, control.workspace_memberships,
-//!   control.workspaces, ops.outbox, private.events, private.evidence_objects, private.memory_affects,
+//!   control.workspaces, ops.jobs, ops.outbox, private.events, private.evidence_objects, private.memory_affects,
 //!   private.memory_evidence, private.memory_records, private.memory_subjects, private.subjects, projection.private_memory_points,
 //!   projection.stream_checkpoints, projection.stream_log] x=[private.memory_subject_visibility_ok],
 //!   PostgreSQL(role_batch_issuer), PostgreSQL(role_gateway), PostgreSQL(role_retrieval_worker), Qdrant(*),
 //!   subprocess(gitleaks)]; env=[HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_PG_DSN,
-//!   HUMAUX_TEST_QDRANT_URL]; modules=[adapters::postgres, adapters::projection_worker, adapters::qdrant,
-//!   adapters::remember, domain::egress, domain::error, domain::evidence, domain::identity, domain::ids,
+//!   HUMAUX_TEST_QDRANT_URL]; modules=[adapters::memory_governance_repo, adapters::postgres,
+//!   adapters::projection_worker, adapters::qdrant, adapters::remember, adapters::tests::support::governance_ops,
+//!   domain::confirm, domain::egress, domain::error, domain::evidence, domain::identity, domain::ids,
 //!   domain::subject, humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource,
 //!   infra-cell::transport, projection::serving, retrieval-provider::adapters, retrieval-provider::contract]
 //! Called-by: [cargo-test]
 //! Invariants: [uses a throwaway tenant and Qdrant collection cleaned up on Drop; a ticket is marked done only after
 //!   search-visible confirmation; no DSN, unreachable PG/Qdrant or no local gitleaks is a visible SKIP]
-//! Spec: Baseline §17.4; §15.7; §79.2; ADR-0052; ADR-0055; ADR-0056
+//! Spec: Baseline §17.4; §15.7; §79.2; ADR-0052; ADR-0055; ADR-0056; ADR-0057
 //!
 //! Same convention as `outbox_batch_remember.rs`/`stream_repo.rs`: throwaway
 //! `control.tenants` row + throwaway Qdrant collection, cleaned up on `Drop`.
@@ -36,7 +37,8 @@ use humaux_adapters::projection_worker::{CardEmbedder, ProjectionWorkerDeps, run
 use humaux_adapters::qdrant::{
     DenseCandidate, DenseQuery, DenseQueryVersions, Distance, PlacementClass, PointId,
     PromotionState, QdrantOperation, RetrievalFamily, ShardingMethod, TenantPlacementRow,
-    create_collection_body, ha_profile_for, query_dense, subject_index_body, tenant_index_body,
+    create_collection_body, delete_points, ha_profile_for, query_dense, subject_index_body,
+    tenant_index_body,
 };
 use humaux_adapters::remember::{self, RememberCommand};
 use humaux_domain::egress::ProcessorId;
@@ -61,6 +63,13 @@ use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
 use sha2::{Digest, Sha256};
 use sqlx::types::Uuid;
+
+use humaux_adapters::memory_governance_repo::{ArchiveResult, RestoreResult};
+use humaux_domain::confirm::DestructiveOp;
+
+#[path = "support/governance_ops.rs"]
+mod governance_ops;
+use governance_ops::Governor;
 
 /// Card 21 fix pass: this suite's fixed §7.4 worker identity. `advance_prefix` writes it into
 /// `projection.stream_checkpoints.projection_processor_id` (migration 0171); the attribution
@@ -140,8 +149,16 @@ struct Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM projection.private_memory_points WHERE tenant_id = '{0}'; \
+        Governor::cleanup(&mut self.admin, self.tenant_id);
+        // Jobs go first, in one batch with the rows that produced them: the `ops.outbox` trigger
+        // enqueues a DERIVED_DISTILL job per seeded Evidence, and a claimable job of a tenant with
+        // no route binding is released NotReady forever, never DEAD (private-worker distill.rs) —
+        // left behind, it is claimed ahead of every later tenant on the shared dev DB (card 31
+        // rehearsal: 258 leaked jobs, memory_records=0). A failure is printed, not swallowed; gate
+        // `no_leaked_distill_jobs` is the check.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.private_memory_points WHERE tenant_id = '{0}'; \
              DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
              DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
              DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}'; \
@@ -151,8 +168,19 @@ impl Drop for Handle {
              DELETE FROM private.events USING private.evidence_objects eo \
                WHERE events.event_id = eo.evidence_id AND eo.tenant_id = '{0}'; \
              DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
-             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
-             DELETE FROM control.workspaces WHERE tenant_id = '{0}'; \
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}';",
+            self.tenant_id
+        )) {
+            eprintln!(
+                "projection_worker cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        // Best effort and kept apart: `control.audit_events` is append-only and references the
+        // tenant, so a fixture that ran a governance op cannot delete its tenant row. In the same
+        // batch as the deletes above, this refusal rolled the whole cleanup back.
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.workspaces WHERE tenant_id = '{0}'; \
              DELETE FROM control.tenants WHERE tenant_id = '{0}';",
             self.tenant_id
         ));
@@ -2426,60 +2454,29 @@ fn reissued_lifecycle_ticket_reprojects_the_same_point_with_current_subject_ids(
 /// (`current_source_matches`), and ADR-0018 §4's "re-upsert with status=superseded" predates
 /// it — which wedged the §15.4 prefix behind the ticket and broke every token-carrying recall
 /// on the stream. A dead memory's ticket now retires its binding, removes its point, and
-/// settles `DONE`. Fault control: make `resolve_and_embed` route the superseded memory through
-/// `finish_row` again and this reads `(0, 1)` with `error_class = registry_failed`.
+/// settles `DONE`. ADR-0057 D-J: the supersede runs through the real
+/// `memory_governance_repo::supersede_atomically`. Faults: remove that op's
+/// `issue_lifecycle_ticket` call (no ticket ⇒ the point stays), or route the superseded memory
+/// through `finish_row` again (`(0, 1)`, `registry_failed`).
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one causal chain — project, supersede, retire, restore, revive — reads best in one place; ADR-0049"
-)]
-fn a_superseded_memory_ticket_retires_its_point_and_settles_done() {
+fn supersede_through_the_real_op_retires_its_point_and_settles_done() {
     run_db_fixture::<Fixture, _>(
-        "a_superseded_memory_ticket_retires_its_point_and_settles_done",
+        "supersede_through_the_real_op_retires_its_point_and_settles_done",
         |mut handle| {
-            let scope_id = Uuid::new_v4();
-            let (_, memory_a) = seed_memory_with_visibility(
-                &mut handle,
-                scope_id,
-                "the rule before it was replaced",
-                "TENANT_SHARED",
-                None,
-                None,
-            );
-            let (_, memory_b) = seed_memory_with_visibility(
-                &mut handle,
-                scope_id,
-                "the rule that replaced it",
-                "TENANT_SHARED",
-                None,
-                None,
-            );
-            let provider = Arc::new(TestDoubleProvider::new(
-                embedding_model(),
-                unused_rerank_model(),
-            ));
-            let deps = handle.rt.block_on(deps_for(&handle, scope_id, provider));
-            let outcome = handle
-                .rt
-                .block_on(run_once(&deps, 10))
-                .expect("first run_once succeeds");
-            assert_eq!((outcome.done, outcome.failed), (2, 0), "{outcome:?}");
+            let (scope_id, deps, memories, gov) = governed_memories(&mut handle, 2);
+            let (memory_a, memory_b) = (memories[0], memories[1]);
             let point_a = point_id_for_memory(&mut handle, memory_a);
             let point_b = point_id_for_memory(&mut handle, memory_b);
-
-            // §36 supersede, as `memory_governance_repo` writes it (G59-4: status and
-            // superseded_by flip together; `updated_at` is NOT touched — the registry identity
-            // survives, which is what makes the restore below a revive, not a new point).
-            handle
-                .admin
-                .execute(
-                    "UPDATE private.memory_records \
-                        SET status = 'superseded', superseded_by = $2, superseded_at = now() \
-                      WHERE memory_id = $1",
-                    &[&memory_a, &memory_b],
-                )
-                .expect("supersede memory_a");
-            let ticket = reissue_lifecycle_ticket(&mut handle, scope_id, memory_a);
+            let ticket = governance_ops::supersede(
+                &handle.rt,
+                &handle.gateway,
+                &gov.scope(scope_id),
+                &governance_ops::stream(handle.tenant_id, scope_id),
+                memory_a,
+                memory_b,
+            )
+            .expect("supersede through the real op")
+            .stream_seq;
             let outcome = handle
                 .rt
                 .block_on(run_once(&deps, 10))
@@ -2504,21 +2501,11 @@ fn a_superseded_memory_ticket_retires_its_point_and_settles_done() {
                 ticket,
                 "the §15.4 prefix advances past the lifecycle ticket"
             );
-            let live: bool = handle
-                .admin
-                .query_one(
-                    "SELECT projection_live FROM projection.private_memory_points WHERE point_id = $1",
-                    &[&point_a],
-                )
-                .expect("binding row survives, retired")
-                .get(0);
-            assert!(!live, "the superseded memory's binding is retired");
-            let permit = authorize_cell_access(
-                &handle.registry,
-                IntraCellResource::QDRANT_REST,
-                Duration::from_secs(30),
-            )
-            .expect("admin Qdrant permit");
+            assert!(
+                !point_live(&mut handle, point_a),
+                "the superseded memory's binding is retired"
+            );
+            let permit = admin_permit(&handle);
             let scrolled = scroll_payloads(&handle, &permit, &[point_a, point_b]);
             let ids = scrolled["result"]["points"]
                 .as_array()
@@ -2539,50 +2526,71 @@ fn a_superseded_memory_ticket_retires_its_point_and_settles_done() {
                 "DONE",
                 "ADR-0049 D-C: the ticket's carrier outbox row is settled with the ticket"
             );
+        },
+    );
+}
 
-            // ADR-0020 restore, as `restore_atomically` writes it: status back, same
-            // `updated_at`. The re-issued ticket must bring the SAME point back (identity
-            // unchanged → the retired binding is revived, ADR-0049) — the rehearsal's
-            // `restored_memory_is_servable_again = 0` shape is this leg failing.
+/// ADR-0020 restore through the real `restore_atomically` (ADR-0057 D-J): status back, same
+/// `updated_at`, so the ticket brings the SAME point back (identity unchanged → the retired
+/// binding is revived, ADR-0049) — the rehearsal's `restored_memory_is_servable_again = 0` shape
+/// is this test failing. Fault: remove restore's `issue_lifecycle_ticket` call (no ticket ⇒ the
+/// point stays retired).
+#[test]
+fn restore_through_the_real_op_revives_the_same_point() {
+    run_db_fixture::<Fixture, _>(
+        "restore_through_the_real_op_revives_the_same_point",
+        |mut handle| {
+            let (scope_id, deps, memories, gov) = governed_memories(&mut handle, 2);
+            let (memory_a, memory_b) = (memories[0], memories[1]);
+            let point_a = point_id_for_memory(&mut handle, memory_a);
+            let (auth, key) = (
+                gov.scope(scope_id),
+                governance_ops::stream(handle.tenant_id, scope_id),
+            );
+            governance_ops::supersede(&handle.rt, &handle.gateway, &auth, &key, memory_a, memory_b)
+                .expect("supersede");
             handle
-                .admin
-                .execute(
-                    "UPDATE private.memory_records \
-                        SET status = 'active', superseded_by = NULL, superseded_at = NULL \
-                      WHERE memory_id = $1",
-                    &[&memory_a],
-                )
-                .expect("restore memory_a");
-            let restore_ticket = reissue_lifecycle_ticket(&mut handle, scope_id, memory_a);
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("retire pass");
+            assert!(!point_live(&mut handle, point_a));
+            let restored =
+                governance_ops::restore(&handle.rt, &handle.gateway, &auth, &key, memory_a)
+                    .expect("restore through the real op");
+            let restore_ticket = match restored {
+                RestoreResult::Restored(done) => done.stream_seq,
+                RestoreResult::Refused(reason) => panic!("restore refused: {reason:?}"),
+            };
             let outcome = handle
                 .rt
                 .block_on(run_once(&deps, 10))
                 .expect("third run_once succeeds");
             assert_eq!((outcome.done, outcome.failed), (1, 0), "{outcome:?}");
-            assert_eq!(stream_log_state(&mut handle, &key, restore_ticket), "DONE");
+            let stream_key = (
+                handle.tenant_id,
+                "workspace",
+                scope_id,
+                "private_memory",
+                "PRIVATE_MEMORY",
+                "v1",
+            );
+            assert_eq!(
+                stream_log_state(&mut handle, &stream_key, restore_ticket),
+                "DONE"
+            );
             assert_eq!(outbox_status(&mut handle, restore_ticket), "DONE");
             assert_eq!(
                 point_id_for_memory(&mut handle, memory_a),
                 point_a,
                 "same identity, same deterministic point id"
             );
-            let live: bool = handle
-                .admin
-                .query_one(
-                    "SELECT projection_live FROM projection.private_memory_points WHERE point_id = $1",
-                    &[&point_a],
-                )
-                .expect("binding row")
-                .get(0);
             assert!(
-                live,
+                point_live(&mut handle, point_a),
                 "the restored memory's binding is live again (revived)"
             );
-            let scrolled = scroll_payloads(&handle, &permit, &[point_a, point_b]);
             assert_eq!(
-                scrolled["result"]["points"].as_array().map_or(0, Vec::len),
-                2,
-                "the restored memory's point is back in the index: {scrolled}"
+                lifecycle_flags(&handle, point_a),
+                (Some(false), "active".to_owned())
             );
         },
     );
@@ -2602,17 +2610,13 @@ fn outbox_status(handle: &mut Handle, stream_seq: i64) -> String {
         .get(0)
 }
 
-// ---- ADR-0055 D-B: the `archived` payload flag follows the PG row on every ticket ----
+// ---- ADR-0055 D-B / ADR-0057 D-J: the `archived` payload flag follows the PG row on every
+// ticket, each transition driven through the real `memory_governance_repo` op ----
 
 /// The (`archived`, `status`) payload pair of one point, read back through a raw payload scroll.
 /// `None` for `archived` = the point carries no flag (never the case after card 30).
 fn lifecycle_flags(handle: &Handle, point: Uuid) -> (Option<bool>, String) {
-    let permit = authorize_cell_access(
-        &handle.registry,
-        IntraCellResource::QDRANT_REST,
-        Duration::from_secs(30),
-    )
-    .expect("admin Qdrant permit");
+    let permit = admin_permit(handle);
     let scrolled = scroll_payloads(handle, &permit, &[point]);
     let payload = &scrolled["result"]["points"][0]["payload"];
     assert!(
@@ -2625,37 +2629,49 @@ fn lifecycle_flags(handle: &Handle, point: Uuid) -> (Option<bool>, String) {
     )
 }
 
-/// One lifecycle step the way `memory_governance_repo` performs it: the PG write, then the
-/// existing MEMORY_LIFECYCLE ticket bound to the memory's PRIMARY Evidence, then one worker pass.
-fn lifecycle_step(
-    handle: &mut Handle,
-    deps: &ProjectionWorkerDeps,
-    scope_id: Uuid,
-    memory_id: Uuid,
-    sql: &str,
-) {
-    handle
-        .admin
-        .execute(sql, &[&memory_id])
-        .expect("lifecycle PG write");
-    reissue_lifecycle_ticket(handle, scope_id, memory_id);
-    let outcome = handle.rt.block_on(run_once(deps, 10)).expect("run_once");
-    assert_eq!(outcome.failed, 0, "{outcome:?}");
+fn admin_permit(handle: &Handle) -> CellAccessPermit {
+    authorize_cell_access(
+        &handle.registry,
+        IntraCellResource::QDRANT_REST,
+        Duration::from_secs(30),
+    )
+    .expect("admin Qdrant permit")
 }
 
-const ARCHIVE: &str = "UPDATE private.memory_records SET archived_at = now() WHERE memory_id = $1";
-const UNARCHIVE: &str = "UPDATE private.memory_records SET archived_at = NULL WHERE memory_id = $1";
+fn point_live(handle: &mut Handle, point: Uuid) -> bool {
+    handle
+        .admin
+        .query_one(
+            "SELECT projection_live FROM projection.private_memory_points WHERE point_id = $1",
+            &[&point],
+        )
+        .expect("binding row")
+        .get(0)
+}
 
-/// Seeds `n` TENANT_SHARED memories in a fresh scope, projects them once, and returns the scope,
-/// the worker deps and the memory ids.
-fn projected_memories(handle: &mut Handle, n: usize) -> (Uuid, ProjectionWorkerDeps, Vec<Uuid>) {
-    let scope_id = Uuid::new_v4();
+fn point_present(handle: &Handle, point: Uuid) -> bool {
+    let permit = admin_permit(handle);
+    scroll_payloads(handle, &permit, &[point])["result"]["points"]
+        .as_array()
+        .is_some_and(|points| !points.is_empty())
+}
+
+/// Seeds `n` TENANT_SHARED memories in a fresh real workspace whose governor (ADR-0057 D-J) can
+/// run the confirm-gated ops, projects them once, and returns the workspace, the worker deps,
+/// the memory ids and the governor.
+fn governed_memories(
+    handle: &mut Handle,
+    n: usize,
+) -> (Uuid, ProjectionWorkerDeps, Vec<Uuid>, Governor) {
+    let gov = Governor::seed(&mut handle.admin, handle.tenant_id);
+    let scope_id = seed_workspace(handle);
+    gov.join(&mut handle.admin, scope_id);
     let memories: Vec<Uuid> = (0..n)
         .map(|i| {
             seed_memory_with_visibility(
                 handle,
                 scope_id,
-                &format!("card 30 lifecycle fixture memory {i}"),
+                &format!("governed lifecycle fixture memory {i}"),
                 "TENANT_SHARED",
                 None,
                 None,
@@ -2677,21 +2693,52 @@ fn projected_memories(handle: &mut Handle, n: usize) -> (Uuid, ProjectionWorkerD
         (u64::try_from(n).expect("n"), 0),
         "{outcome:?}"
     );
-    (scope_id, deps, memories)
+    (scope_id, deps, memories, gov)
 }
 
+/// One confirm-gated archive / unarchive through the real op, then one worker pass.
+fn archive_step(
+    handle: &mut Handle,
+    deps: &ProjectionWorkerDeps,
+    gov: &Governor,
+    scope_id: Uuid,
+    memory_id: Uuid,
+    op: DestructiveOp,
+) {
+    let result = governance_ops::archive(
+        &handle.rt,
+        &handle.gateway,
+        &gov.scope(scope_id),
+        &governance_ops::stream(handle.tenant_id, scope_id),
+        memory_id,
+        op,
+    )
+    .expect("archive / unarchive through the real op");
+    assert!(matches!(result, ArchiveResult::Done(_)), "{result:?}");
+    let outcome = handle.rt.block_on(run_once(deps, 10)).expect("run_once");
+    assert_eq!((outcome.done, outcome.failed), (1, 0), "{outcome:?}");
+}
+
+/// Fault: remove archive's `issue_lifecycle_ticket` call (no ticket ⇒ `archived` stays false).
 #[test]
-fn archive_ticket_reupserts_the_same_point_with_archived_true() {
+fn archive_through_the_real_op_reupserts_the_same_point_with_archived_true() {
     run_db_fixture::<Fixture, _>(
-        "archive_ticket_reupserts_the_same_point_with_archived_true",
+        "archive_through_the_real_op_reupserts_the_same_point_with_archived_true",
         |mut handle| {
-            let (scope_id, deps, memories) = projected_memories(&mut handle, 1);
+            let (scope_id, deps, memories, gov) = governed_memories(&mut handle, 1);
             let point = point_id_for_memory(&mut handle, memories[0]);
             assert_eq!(
                 lifecycle_flags(&handle, point),
                 (Some(false), "active".to_owned())
             );
-            lifecycle_step(&mut handle, &deps, scope_id, memories[0], ARCHIVE);
+            archive_step(
+                &mut handle,
+                &deps,
+                &gov,
+                scope_id,
+                memories[0],
+                DestructiveOp::MemoryArchive,
+            );
             assert_eq!(
                 point_id_for_memory(&mut handle, memories[0]),
                 point,
@@ -2705,16 +2752,31 @@ fn archive_ticket_reupserts_the_same_point_with_archived_true() {
     );
 }
 
+/// Fault: remove the (shared) archive/unarchive `issue_lifecycle_ticket` call.
 #[test]
-fn unarchive_ticket_reupserts_the_same_point_with_archived_false() {
+fn unarchive_through_the_real_op_reupserts_the_same_point_with_archived_false() {
     run_db_fixture::<Fixture, _>(
-        "unarchive_ticket_reupserts_the_same_point_with_archived_false",
+        "unarchive_through_the_real_op_reupserts_the_same_point_with_archived_false",
         |mut handle| {
-            let (scope_id, deps, memories) = projected_memories(&mut handle, 1);
+            let (scope_id, deps, memories, gov) = governed_memories(&mut handle, 1);
             let point = point_id_for_memory(&mut handle, memories[0]);
-            lifecycle_step(&mut handle, &deps, scope_id, memories[0], ARCHIVE);
+            archive_step(
+                &mut handle,
+                &deps,
+                &gov,
+                scope_id,
+                memories[0],
+                DestructiveOp::MemoryArchive,
+            );
             assert_eq!(lifecycle_flags(&handle, point).0, Some(true));
-            lifecycle_step(&mut handle, &deps, scope_id, memories[0], UNARCHIVE);
+            archive_step(
+                &mut handle,
+                &deps,
+                &gov,
+                scope_id,
+                memories[0],
+                DestructiveOp::MemoryUnarchive,
+            );
             assert_eq!(
                 point_id_for_memory(&mut handle, memories[0]),
                 point,
@@ -2736,46 +2798,35 @@ fn restore_of_an_archived_memory_revives_the_point_with_archived_true() {
     run_db_fixture::<Fixture, _>(
         "restore_of_an_archived_memory_revives_the_point_with_archived_true",
         |mut handle| {
-            let (scope_id, deps, memories) = projected_memories(&mut handle, 2);
+            let (scope_id, deps, memories, gov) = governed_memories(&mut handle, 2);
             let (a, b) = (memories[0], memories[1]);
             let point = point_id_for_memory(&mut handle, a);
-            lifecycle_step(&mut handle, &deps, scope_id, a, ARCHIVE);
-            handle
-                .admin
-                .execute(
-                    "UPDATE private.memory_records \
-                        SET status = 'superseded', superseded_by = $2, superseded_at = now() \
-                      WHERE memory_id = $1",
-                    &[&a, &b],
-                )
+            archive_step(
+                &mut handle,
+                &deps,
+                &gov,
+                scope_id,
+                a,
+                DestructiveOp::MemoryArchive,
+            );
+            let (auth, key) = (
+                gov.scope(scope_id),
+                governance_ops::stream(handle.tenant_id, scope_id),
+            );
+            governance_ops::supersede(&handle.rt, &handle.gateway, &auth, &key, a, b)
                 .expect("supersede a");
-            reissue_lifecycle_ticket(&mut handle, scope_id, a);
             handle
                 .rt
                 .block_on(run_once(&deps, 10))
                 .expect("retire pass");
-            let permit = authorize_cell_access(
-                &handle.registry,
-                IntraCellResource::QDRANT_REST,
-                Duration::from_secs(30),
-            )
-            .expect("admin Qdrant permit");
-            assert_eq!(
-                scroll_payloads(&handle, &permit, &[point])["result"]["points"]
-                    .as_array()
-                    .map_or(0, Vec::len),
-                0,
-                "superseded ⇒ retired point"
-            );
-            lifecycle_step(
-                &mut handle,
-                &deps,
-                scope_id,
-                a,
-                "UPDATE private.memory_records \
-                    SET status = 'active', superseded_by = NULL, superseded_at = NULL \
-                  WHERE memory_id = $1",
-            );
+            assert!(!point_present(&handle, point), "superseded ⇒ retired point");
+            governance_ops::restore(&handle.rt, &handle.gateway, &auth, &key, a)
+                .expect("restore a");
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("revive pass");
+            assert_eq!(outcome.failed, 0, "{outcome:?}");
             assert_eq!(
                 point_id_for_memory(&mut handle, a),
                 point,
@@ -2789,36 +2840,45 @@ fn restore_of_an_archived_memory_revives_the_point_with_archived_true() {
     );
 }
 
-/// An unrelated re-projection (affect annotate re-issues MEMORY_LIFECYCLE) must carry the
-/// archive flag from PG, never reset it to the default.
+/// An unrelated re-projection (affect annotate re-issues MEMORY_LIFECYCLE — not a governance
+/// transition, so its ticket stays the test-side reissue) must carry the archive flag from PG,
+/// never reset it to the default.
 #[test]
 fn annotate_ticket_on_an_archived_memory_keeps_archived_true() {
     run_db_fixture::<Fixture, _>(
         "annotate_ticket_on_an_archived_memory_keeps_archived_true",
         |mut handle| {
-            let (scope_id, deps, memories) = projected_memories(&mut handle, 1);
+            let (scope_id, deps, memories, gov) = governed_memories(&mut handle, 1);
             let point = point_id_for_memory(&mut handle, memories[0]);
-            lifecycle_step(&mut handle, &deps, scope_id, memories[0], ARCHIVE);
-            lifecycle_step(
+            archive_step(
                 &mut handle,
                 &deps,
+                &gov,
                 scope_id,
                 memories[0],
-                "INSERT INTO private.memory_affects \
-                   (tenant_id, memory_id, affect_kind, label, valence_bp, arousal_bp, intensity_bp, \
-                    confidence_bp, evidence_id, observed_at) \
-                 SELECT m.tenant_id, m.memory_id, 'EMOTION', 'JOY', 5000, 2000, 6000, 10000, \
-                        me.evidence_id, now() \
-                 FROM private.memory_records m \
-                 JOIN private.memory_evidence me ON me.memory_id = m.memory_id \
-                 WHERE m.memory_id = $1 LIMIT 1",
+                DestructiveOp::MemoryArchive,
             );
-            let permit = authorize_cell_access(
-                &handle.registry,
-                IntraCellResource::QDRANT_REST,
-                Duration::from_secs(30),
-            )
-            .expect("admin Qdrant permit");
+            handle
+                .admin
+                .execute(
+                    "INSERT INTO private.memory_affects \
+                       (tenant_id, memory_id, affect_kind, label, valence_bp, arousal_bp, intensity_bp, \
+                        confidence_bp, evidence_id, observed_at) \
+                     SELECT m.tenant_id, m.memory_id, 'EMOTION', 'JOY', 5000, 2000, 6000, 10000, \
+                            me.evidence_id, now() \
+                     FROM private.memory_records m \
+                     JOIN private.memory_evidence me ON me.memory_id = m.memory_id \
+                     WHERE m.memory_id = $1 LIMIT 1",
+                    &[&memories[0]],
+                )
+                .expect("annotate");
+            reissue_lifecycle_ticket(&mut handle, scope_id, memories[0]);
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("annotate pass");
+            assert_eq!(outcome.failed, 0, "{outcome:?}");
+            let permit = admin_permit(&handle);
             let scrolled = scroll_payloads(&handle, &permit, &[point]);
             assert_eq!(
                 scrolled["result"]["points"][0]["payload"]["affect_kinds"],
@@ -2833,41 +2893,194 @@ fn annotate_ticket_on_an_archived_memory_keeps_archived_true() {
     );
 }
 
-/// `memory.correct`: M1 (archived, projected) is superseded by a freshly inserted M2 whose own
-/// ticket projects it. M2's point is live — `archived=false`, `status="active"` — whatever M1's
-/// flags were (the flag is per memory row, never inherited).
+/// `memory.correct` through the real op: M2's own ticket projects it live — `archived=false`,
+/// `status="active"` whatever M1's flags were (the flag is per memory row, never inherited) — and
+/// the second ticket on E1 retires M1's point (ADR-0057 D-B). Fault: remove correct's E1
+/// `issue_lifecycle_ticket` call (M1's point stays).
 #[test]
-fn correct_ticket_projects_the_successor_with_archived_false_and_status_active() {
+fn correct_through_the_real_op_projects_the_successor_and_retires_the_original() {
     run_db_fixture::<Fixture, _>(
-        "correct_ticket_projects_the_successor_with_archived_false_and_status_active",
+        "correct_through_the_real_op_projects_the_successor_and_retires_the_original",
         |mut handle| {
-            let (scope_id, deps, memories) = projected_memories(&mut handle, 1);
+            let (scope_id, deps, memories, gov) = governed_memories(&mut handle, 1);
             let m1 = memories[0];
-            lifecycle_step(&mut handle, &deps, scope_id, m1, ARCHIVE);
-            let (_, m2) = seed_memory_with_visibility(
+            let m1_point = point_id_for_memory(&mut handle, m1);
+            archive_step(
                 &mut handle,
+                &deps,
+                &gov,
                 scope_id,
-                "card 30 corrected successor",
-                "TENANT_SHARED",
-                None,
-                None,
+                m1,
+                DestructiveOp::MemoryArchive,
             );
-            handle
-                .admin
-                .execute(
-                    "UPDATE private.memory_records \
-                        SET status = 'superseded', superseded_by = $2, superseded_at = now() \
-                      WHERE memory_id = $1",
-                    &[&m1, &m2],
-                )
-                .expect("m2 corrects m1");
-            let outcome = handle.rt.block_on(run_once(&deps, 10)).expect("m2 pass");
-            assert_eq!(outcome.failed, 0, "{outcome:?}");
-            let point = point_id_for_memory(&mut handle, m2);
+            let done = governance_ops::correct(
+                &handle.rt,
+                &handle.gateway,
+                &gov.scope(scope_id),
+                &governance_ops::stream(handle.tenant_id, scope_id),
+                m1,
+                "corrected body",
+            )
+            .expect("correct through the real op");
+            let outcome = handle
+                .rt
+                .block_on(run_once(&deps, 10))
+                .expect("correct pass");
+            assert_eq!((outcome.done, outcome.failed), (2, 0), "{outcome:?}");
+            let point = point_id_for_memory(&mut handle, done.new_memory_id.0);
             assert_eq!(
                 lifecycle_flags(&handle, point),
                 (Some(false), "active".to_owned())
             );
+            assert!(!point_present(&handle, m1_point), "M1's point is retired");
+            assert!(!point_live(&mut handle, m1_point));
+        },
+    );
+}
+
+// ---- ADR-0057 D-I: the worker's Qdrant writes are fenced on `source_stream_seq` ----
+
+/// The stored `source_stream_seq` of one point, read back through a raw payload scroll.
+fn stored_seq(handle: &Handle, point: Uuid) -> Option<i64> {
+    let permit = admin_permit(handle);
+    scroll_payloads(handle, &permit, &[point])["result"]["points"][0]["payload"]
+        ["source_stream_seq"]
+        .as_i64()
+}
+
+/// The highest ticket seq on the fixture's workspace stream (the one an op just issued).
+fn last_seq(handle: &mut Handle, scope_id: Uuid) -> i64 {
+    handle
+        .admin
+        .query_one(
+            "SELECT max(stream_seq) FROM projection.stream_log \
+             WHERE tenant_id = $1 AND scope_kind = 'workspace' AND scope_id = $2",
+            &[&handle.tenant_id, &scope_id],
+        )
+        .expect("stream has tickets")
+        .get(0)
+}
+
+/// Holds (`park`) or releases one ISSUED ticket through its backoff column — the
+/// `run_once` read skips a ticket whose `next_attempt_at` is in the future, exactly as it skips a
+/// ticket another worker is backing off. Lets a lower seq be processed after a higher one.
+fn set_backoff(handle: &mut Handle, scope_id: Uuid, stream_seq: i64, park: bool) {
+    let at = if park {
+        "now() + interval '1 hour'"
+    } else {
+        "now() - interval '1 second'"
+    };
+    // dep: PostgreSQL(any) — fixture backoff write on one ISSUED ticket
+    let n = handle
+        .admin
+        .execute(
+            &format!(
+                "UPDATE projection.stream_log SET next_attempt_at = {at} \
+                 WHERE tenant_id = $1 AND scope_kind = 'workspace' AND scope_id = $2 \
+                   AND stream_seq = $3 AND state = 'ISSUED'"
+            ),
+            &[&handle.tenant_id, &scope_id, &stream_seq],
+        )
+        .expect("backoff write");
+    assert_eq!(n, 1, "ticket {stream_seq} is ISSUED");
+}
+
+/// ADR-0057 D-I (debt 4): a ticket processed after a later ticket of the same memory — what a
+/// stalled worker whose lease was reclaimed does when it resumes — must not overwrite the later
+/// write. Archive (seq s1) is held back, unarchive (s2 > s1) projects first, then s1 runs through
+/// the real worker. Qdrant answers `completed` either way, so the point is read back: its seq
+/// stays s2. Fault: `finish_row` calls the unfenced `qdrant::upsert` (the stored seq becomes s1).
+#[test]
+fn stale_worker_upsert_is_refused_by_seq_fence() {
+    run_db_fixture::<Fixture, _>(
+        "stale_worker_upsert_is_refused_by_seq_fence",
+        |mut handle| {
+            let (scope_id, deps, memories, gov) = governed_memories(&mut handle, 1);
+            let point = point_id_for_memory(&mut handle, memories[0]);
+            let stream = governance_ops::stream(handle.tenant_id, scope_id);
+            let archived = governance_ops::archive(
+                &handle.rt,
+                &handle.gateway,
+                &gov.scope(scope_id),
+                &stream,
+                memories[0],
+                DestructiveOp::MemoryArchive,
+            )
+            .expect("archive through the real op");
+            assert!(matches!(archived, ArchiveResult::Done(_)), "{archived:?}");
+            let s1 = last_seq(&mut handle, scope_id);
+            set_backoff(&mut handle, scope_id, s1, true);
+            let unarchived = governance_ops::archive(
+                &handle.rt,
+                &handle.gateway,
+                &gov.scope(scope_id),
+                &stream,
+                memories[0],
+                DestructiveOp::MemoryUnarchive,
+            )
+            .expect("unarchive through the real op");
+            assert!(
+                matches!(unarchived, ArchiveResult::Done(_)),
+                "{unarchived:?}"
+            );
+            let s2 = last_seq(&mut handle, scope_id);
+            assert!(s2 > s1, "s1={s1} s2={s2}");
+
+            let later = handle.rt.block_on(run_once(&deps, 10)).expect("later pass");
+            assert_eq!((later.done, later.failed), (1, 0), "{later:?}");
+            assert_eq!(
+                stored_seq(&handle, point),
+                Some(s2),
+                "the later ticket wrote"
+            );
+
+            set_backoff(&mut handle, scope_id, s1, false);
+            let stale = handle.rt.block_on(run_once(&deps, 10)).expect("stale pass");
+            assert_eq!((stale.done, stale.failed), (1, 0), "{stale:?}");
+            eprintln!(
+                "stale_worker_upsert: s1={s1} s2={s2} stored={:?}",
+                stored_seq(&handle, point)
+            );
+            assert_eq!(
+                stored_seq(&handle, point),
+                Some(s2),
+                "the stale ticket's write was refused (silently: it still settled DONE)"
+            );
+            assert_eq!(lifecycle_flags(&handle, point).0, Some(false));
+        },
+    );
+}
+
+/// ADR-0057 D-I: the delete mirror. A delete carrying a seq below the stored one (a stalled
+/// worker's retire after a later revive) leaves the point; the stored seq itself deletes it.
+/// Fault: drop the fence from `delete_points` (the first delete removes the point).
+#[test]
+fn stale_worker_delete_is_refused_by_seq_fence() {
+    run_db_fixture::<Fixture, _>(
+        "stale_worker_delete_is_refused_by_seq_fence",
+        |mut handle| {
+            let (_scope_id, _deps, memories, _gov) = governed_memories(&mut handle, 1);
+            let point = point_id_for_memory(&mut handle, memories[0]);
+            let seq = stored_seq(&handle, point).expect("projected point carries its seq");
+            let permit = admin_permit(&handle);
+            let delete = |fence_seq: i64| {
+                // dep: Qdrant(*) — the adapter's fenced delete against the fixture collection
+                handle
+                    .rt
+                    .block_on(delete_points(
+                        handle.transport.as_ref(),
+                        &permit,
+                        &handle.collection,
+                        &[PointId::Uuid(point)],
+                        fence_seq,
+                        ha_profile_for(QdrantOperation::CorrectionDeleteSupersede),
+                    ))
+                    .expect("delete answers completed");
+            };
+            delete(seq - 1);
+            assert!(point_present(&handle, point), "a lower seq deletes nothing");
+            delete(seq);
+            assert!(!point_present(&handle, point), "the stored seq deletes it");
         },
     );
 }

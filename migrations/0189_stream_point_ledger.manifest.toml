@@ -1,0 +1,40 @@
+# §46.1 migration manifest. ADR-0057 D-L (card 31): projection.stream_point_ledger, the owner
+# SECURITY DEFINER point reading of §23.1② A2 (points_expected / settled / in_flight / unsettled of
+# one stream under the caller's §6.1 visibility). Owner role_migration_owner, STABLE (it runs in the
+# caller's repeatable-read snapshot), search_path pinned to pg_catalog, PUBLIC has no EXECUTE,
+# role_gateway and role_retrieval_worker are the only non-owner roles with EXECUTE. No table grant,
+# no DML. §46 forward-fix (EXPAND_CONTRACT, first free after 0188).
+
+migration_id = "0189_stream_point_ledger"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('projection.stream_point_ledger(uuid,text,uuid,text,text,text,text,uuid[])') is null
+ and to_regprocedure('private.visibility_allowed(text,boolean,boolean,boolean)') is not null
+ and to_regclass('control.workspace_memberships') is not null
+ and to_regclass('projection.stream_log') is not null
+ and to_regclass('ops.outbox') is not null
+ as precheck_ok
+"""
+
+postcheck = """
+select coalesce(bool_and(
+   pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef and p.provolatile = 's'
+   and 'search_path=pg_catalog' = any(coalesce(p.proconfig,'{}'))
+   and has_function_privilege('role_gateway', p.oid, 'EXECUTE')
+   and has_function_privilege('role_retrieval_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_maintenance', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_private_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_consolidation_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_public_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_batch_issuer', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_admin', p.oid, 'EXECUTE')
+   and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                    where x.grantee = 0 and x.privilege_type = 'EXECUTE')), false)
+ and count(*) = 1 as postcheck_ok
+from pg_proc p
+where p.oid = to_regprocedure('projection.stream_point_ledger(uuid,text,uuid,text,text,text,text,uuid[])')
+"""
+
+rollback_or_forward_fix = "Roll back the gateway / retrieval-worker binaries first (stream_repo::close_ledger_in_txn calls the function in every ledger read), then DROP FUNCTION projection.stream_point_ledger(uuid, text, uuid, text, text, text, text, uuid[])."
+backup_restore_requirement = "none: function only."

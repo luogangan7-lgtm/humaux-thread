@@ -262,7 +262,7 @@ pub async fn family_read_state(
     .try_get("initialized")?;
     let serving = serving_version_in_txn(&mut txn, authorization, &family).await?;
     let unserved = if initialized && serving.is_none() {
-        let ledger = stream_repo::close_ledger_in_txn(&mut txn, key).await?;
+        let ledger = stream_repo::close_ledger_in_txn(&mut txn, key, authorization).await?;
         let pipeline = context_repo::stream_pipeline_counts_in_txn(&mut txn, key)
             .await
             .map_err(ServingRepoError::Pipeline)?;

@@ -708,7 +708,8 @@ fn accepted_output(
     let items = render_items(materialized.bodies.items);
     let returned = u32::try_from(items.len()).map_err(|_| ErrorCode::Internal)?;
     let candidate_count = u32::try_from(candidate_count).map_err(|_| ErrorCode::Internal)?;
-    let projection = build_projection_block(&materialized.ledger, visible);
+    let projection =
+        build_projection_block(&materialized.ledger, visible, bootstrap.projection_lag);
     // §23.3④ (ADR-0041 D-H): the request's own six-column `StreamKey` ledger, counted in the
     // same RR snapshot that closed the ledger and hydrated the bodies. `classify()` maps this
     // route's `PlannerDecision::Class(_)` to `SemanticBounded`, so — unlike `memory.enumerate`
@@ -757,6 +758,7 @@ fn accepted_output(
             visible,
             context: None,
             mandatory_missing: 0,
+            lag_threshold: bootstrap.projection_lag,
         },
         |outcome| {
             let value = serde_json::to_value(Envelope {

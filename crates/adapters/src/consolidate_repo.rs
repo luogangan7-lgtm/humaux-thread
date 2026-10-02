@@ -1,10 +1,10 @@
 //! `adapters::consolidate_repo` — §11.6/§11.7 Private Memory Consolidation SQL, through [`ConsolidationDbPool`] only.
-//! Depends-on: crates=[humaux-application, humaux-domain, humaux-projection, humaux-testkit, postgres, serde_json, sha2, sqlx]; services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, private.context_bindings, private.events, private.evidence_objects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollups] x=[control.current_reasoning_route_binding]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::jobs, adapters::postgres, adapters::remember, adapters::subject_repo, application::consolidate, domain::authority, domain::consolidate, domain::ids, domain::ticket_family, projection::stream]
+//! Depends-on: crates=[humaux-application, humaux-domain, humaux-projection, humaux-testkit, postgres, serde_json, sha2, sqlx]; services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, private.context_bindings, private.events, private.evidence_objects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollups] x=[control.current_reasoning_route_binding]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::jobs, adapters::memory_governance_repo, adapters::postgres, adapters::remember, adapters::subject_repo, application::consolidate, domain::authority, domain::consolidate, domain::error, domain::ids, domain::ticket_family, projection::stream]
 //! Called-by: [adapters::consolidation_reasoner, adapters::distill_reasoner, adapters::distill_repo, humaux-consolidation-worker, tests]
 //! Invariants: [input selection and materialization happen in ONE REPEATABLE READ READ WRITE transaction (§11.7), so
 //!   no concurrent insert can leak into a run; a lost lease is LostRace and an unknown source UnknownSource, never a
-//!   partial publish]
-//! Spec: Baseline §3; §78.3; §11.7
+//!   partial publish; the rollup ticket lands on the source memory's home stream (ADR-0057 D-M)]
+//! Spec: Baseline §3; §78.3; §11.7; ADR-0057
 //!
 //! The invariants themselves (`ConsolidationRunState`,
 //! `AutoMutableMemoryId`/`classify`, the rollup-authority ceiling) are pure Rust in
@@ -43,6 +43,7 @@ use humaux_application::consolidate::{
 };
 use humaux_domain::authority::{AuthorityClass, EvidenceId, MemoryId};
 use humaux_domain::consolidate::{AutoMutableMemoryId, ClassifiedMemoryId, classify};
+use humaux_domain::error::ErrorCode;
 use humaux_domain::ids::TenantId;
 use humaux_domain::ticket_family::TicketFamily;
 use humaux_projection::stream::StreamKey;
@@ -110,6 +111,10 @@ pub enum ConsolidateRepoError {
     /// (ADR-0036) failed at the database level. A LOST fence is not this error — that is
     /// [`PublishOutcome::LostLease`], a normal outcome.
     Jobs(crate::jobs::JobsError),
+    /// The rollup ticket's home stream (ADR-0057 D-M) could not be resolved: the lookup failed,
+    /// or the source memory's home differs from the run's scope and is not provisioned
+    /// (`DependencyUnavailable`). Nothing is published; the run stays retryable.
+    HomeStream(ErrorCode),
 }
 
 impl From<sqlx::Error> for ConsolidateRepoError {
@@ -149,6 +154,10 @@ impl std::fmt::Display for ConsolidateRepoError {
                 )
             }
             Self::Jobs(e) => write!(f, "consolidate_repo job lease settle failed: {e}"),
+            Self::HomeStream(code) => write!(
+                f,
+                "consolidate_repo: the rollup ticket's home stream is unavailable: {code:?}"
+            ),
         }
     }
 }
@@ -815,7 +824,7 @@ pub async fn publish_rollup(
     // of the three hand-aligned copies the retrieval worker had to be configured to match; a
     // mismatch produced a ticket nobody polls, silently and forever.
     let family = TicketFamily::PrivateMemory;
-    let key = StreamKey::new(
+    let run_key = StreamKey::new(
         TenantId(tenant_id),
         scope.0,
         scope.1,
@@ -823,6 +832,13 @@ pub async fn publish_rollup(
         family.projection_kind(),
         family.projection_version(),
     );
+    // ADR-0057 D-M (W3): the ticket re-projects an existing memory, so it goes to the stream that
+    // created that memory's point, not the run's scope — a run-scoped ticket would write a
+    // duplicate point into another family that no later home-stream retire ever reaches.
+    let key =
+        crate::memory_governance_repo::home_stream(&mut txn, &run_key, evidence_id_for_ticket)
+            .await
+            .map_err(ConsolidateRepoError::HomeStream)?;
     let ticket_commit_seq = remember::next_commit_seq(&mut txn).await?;
     let ticket_stream_seq =
         remember::issue_stream_log_row(&mut txn, &key, ticket_commit_seq).await?;

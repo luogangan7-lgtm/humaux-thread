@@ -1,5 +1,5 @@
 //! `xtask::rls_check` — G80-26 (§48.2) runtime DB role invariant CI enumeration gate.
-//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.assert_write_scope, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant, control.onboard_workspace, control.resolve_user_reasoning_admission, control.revoke_api_key, ops.claim_derived_work, ops.contribution_reservation_authority_validate, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal]]; env=[CARGO_MANIFEST_DIR, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
+//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.assert_write_scope, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant, control.onboard_workspace, control.resolve_user_reasoning_admission, control.revoke_api_key, ops.claim_derived_work, ops.contribution_reservation_authority_validate, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal]]; env=[CARGO_MANIFEST_DIR, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
 //! Called-by: [xtask::dep_map, xtask::main]
 //! Invariants: [any catalog cell that disagrees with §48.2 / §62 grants is fail, named by role and table]
 //! Spec: Baseline §48.2; §62
@@ -3961,6 +3961,48 @@ pub fn check_onboarding_boundary(client: &mut impl GenericClient) -> GateResult 
     }
 }
 
+/// ADR-0057 D-L (migration 0189, card 31): the §23.1② A2 point reading.
+const STREAM_POINT_LEDGER_FN: &str =
+    "projection.stream_point_ledger(uuid,text,uuid,text,text,text,text,uuid[])";
+/// The two roles that close a ledger: request handlers / serving_repo (`role_gateway`) and
+/// `stream_repo::fetch_ledger_closure` (`role_retrieval_worker`).
+const STREAM_POINT_LEDGER_EXECUTORS: &[&str] = &["role_gateway", "role_retrieval_worker"];
+
+/// ADR-0057 D-L: `projection.stream_point_ledger` reads memory rows as the owner (it must skip
+/// the 0155 subject term the Qdrant count cannot mirror), so its EXECUTE list is its whole
+/// authorization boundary: owner-owned, SECURITY DEFINER, `search_path=pg_catalog`, EXECUTE held
+/// by exactly [`STREAM_POINT_LEDGER_EXECUTORS`], PUBLIC revoked. Missing ⇒ `not_applicable` with
+/// the object named (§57.1).
+pub fn check_stream_point_ledger_boundary(client: &mut impl GenericClient) -> GateResult {
+    let check = "ADR-0057 A2 point-ledger definer";
+    let exists: bool = match client.query_one(
+        "SELECT to_regprocedure($1) IS NOT NULL",
+        &[&STREAM_POINT_LEDGER_FN],
+    ) {
+        Ok(row) => row.get(0),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    if !exists {
+        return not_applicable(check, format!("missing {STREAM_POINT_LEDGER_FN}"));
+    }
+    let mut problems = Vec::new();
+    check_owner_definer_function(
+        client,
+        &mut problems,
+        STREAM_POINT_LEDGER_FN,
+        STREAM_POINT_LEDGER_EXECUTORS,
+    );
+    if problems.is_empty() {
+        pass(
+            check,
+            "projection.stream_point_ledger: owner SECURITY DEFINER, search_path pinned, EXECUTE \
+             exactly {role_gateway, role_retrieval_worker}, PUBLIC revoked",
+        )
+    } else {
+        fail(check, problems.join("; "))
+    }
+}
+
 pub fn run(_args: &[String]) -> i32 {
     let mut results = Vec::new();
 
@@ -3992,6 +4034,7 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_ticket_retirement_boundary(&mut client));
             results.push(check_projection_claim_boundary(&mut client));
             results.push(check_onboarding_boundary(&mut client));
+            results.push(check_stream_point_ledger_boundary(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -4012,6 +4055,7 @@ pub fn run(_args: &[String]) -> i32 {
                 "§15.2/§15.4 FAILED ticket retirement boundary",
                 "ADR-0052 projection ticket cross-tenant claim",
                 "ADR-0053 onboarding doors and PROVISIONING write gate",
+                "ADR-0057 A2 point-ledger definer",
             ] {
                 results.push(fail_for(name, &conn_err));
             }

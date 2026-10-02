@@ -2,8 +2,8 @@
 //!   workspace (§53).
 //! Depends-on: crates=[humaux-domain, smallvec, tracing]; services=[]; env=[]; modules=[domain::error]
 //! Called-by: [retrieval::envelope, tests]
-//! Invariants: []
-//! Spec: Baseline §53.3
+//! Invariants: [abstain() is the only writer of a non-empty degradations; Outcome::also joins codes through it]
+//! Spec: Baseline §53.3; ADR-0057
 //!
 //! Every fail-open
 //! / degrade / abstain path goes through `abstain()`; a caller that returns
@@ -154,6 +154,15 @@ impl<T> Outcome<T> {
             value,
             degradations: SmallVec::new(),
         }
+    }
+
+    /// Appends one more degradation to an existing outcome, so two independent fail-open
+    /// verdicts on the same value (ADR-0057 D-E: projection loss and projection lag) are both
+    /// reported, in call order, instead of one dropping the other.
+    pub fn also(mut self, code: DegradeCode) -> Self {
+        // §53.1: every code still passes abstain(); this only joins two exits' codes.
+        self.degradations.extend(abstain(code, ()).degradations);
+        self
     }
 }
 
@@ -374,5 +383,33 @@ mod tests {
         );
         assert_eq!(degrade_total_count(DegradeCode::EgressDenied), before_a + 1);
         assert_eq!(degrade_total_count(DegradeCode::StatePinMissing), before_b);
+    }
+
+    /// ADR-0057 D-E: `also` keeps the first code, appends the second in order, and the second
+    /// is counted through `abstain()` like any other degradation.
+    #[test]
+    fn also_counts_every_code_through_abstain() {
+        let before_a = degrade_total_count(DegradeCode::ProjectionInvisibleLoss);
+        let before_b = degrade_total_count(DegradeCode::ProjectionLag);
+        let outcome =
+            abstain(DegradeCode::ProjectionInvisibleLoss, 7u8).also(DegradeCode::ProjectionLag);
+        assert_eq!(outcome.value, 7);
+        assert_eq!(
+            outcome.degradations.as_slice(),
+            &[
+                DegradeCode::ProjectionInvisibleLoss,
+                DegradeCode::ProjectionLag
+            ]
+        );
+        assert_eq!(
+            degrade_total_count(DegradeCode::ProjectionInvisibleLoss),
+            before_a + 1
+        );
+        assert_eq!(
+            degrade_total_count(DegradeCode::ProjectionLag),
+            before_b + 1
+        );
+        let clean = Outcome::clean(()).also(DegradeCode::ProjectionLag);
+        assert_eq!(clean.degradations.as_slice(), &[DegradeCode::ProjectionLag]);
     }
 }

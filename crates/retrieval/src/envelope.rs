@@ -2,8 +2,10 @@
 //! Depends-on: crates=[humaux-domain, humaux-telemetry, serde, serde_json]; services=[];
 //!   env=[]; modules=[domain::context, domain::error, domain::grounding, retrieval::compiler, retrieval::completeness, retrieval::planner, retrieval::request, telemetry::degrade]
 //! Called-by: [adapters::context_repo, adapters::retrieve, gateway::context, gateway::memory, gateway::recall, retrieval::completeness, retrieval::signals, tests]
-//! Invariants: []
-//! Spec: §23; §23.1
+//! Invariants: [A2 compares the Qdrant point count with the ledger's ProjectionReads points, never with ticket
+//!   counts (ADR-0057 D-A); build_projection_block is the only place completeness_ratio / current are computed
+//!   and the only producer of PROJECTION_INVISIBLE_LOSS / PROJECTION_LAG, composed loss-then-lag (ADR-0057 D-E)]
+//! Spec: §23; §23.1; ADR-0057
 //!
 //! Assembles the five blocks
 //! (`pipeline` / `completeness` / `provenance` / `freshness` / `grounding`) and, most
@@ -17,6 +19,7 @@
 //! calling [`build_projection_block`]; this module has no IO to order.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -109,34 +112,34 @@ pub struct KnowledgeBlock {
 
 /// §23.1② A2 (可见闭合) outcome — directional and three-way, never a bare bool: the `<` and
 /// `>` sides get opposite treatment (real loss vs. harmless in-flight write), and the `>` side
-/// itself splits again at `pending` (in-flight vs. untrustworthy).
+/// itself splits again at `points_in_flight` (in-flight vs. untrustworthy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum A2Closure {
-    /// `visible + deleted + skipped == done`.
+    /// `points_settled <= visible <= points_settled + points_unsettled`.
     Closed,
-    /// `< done` — index has fewer than the ledger says settled: a real loss.
+    /// `visible < points_settled` — the index lacks a point the ledger says must be visible: a
+    /// real loss.
     InvisibleLoss,
-    /// `> done` but the excess is `<= pending` — a normal in-flight write (§17.4: point
-    /// becomes search-visible before its `stream_log` row settles), not a loss.
+    /// Above the closed band but within `points_in_flight` — a normal in-flight write (§17.4:
+    /// point becomes search-visible before its `stream_log` row settles), not a loss.
     InFlight,
-    /// `> done` and the excess exceeds `pending` — the index holds points the ledger never
-    /// issued a ticket for; neither side is trustworthy (§23.1②: "同 A1 判 cannot_establish").
+    /// Beyond `points_settled + points_unsettled + points_in_flight` — the index holds points
+    /// no ticket accounts for; neither side is trustworthy (§23.1②: "同 A1 判 cannot_establish").
     Inconsistent,
 }
 
-fn judge_a2(visible: u64, deleted: u64, skipped: u64, done: u64, pending: u64) -> A2Closure {
-    let lhs = visible + deleted + skipped;
-    match lhs.cmp(&done) {
-        std::cmp::Ordering::Equal => A2Closure::Closed,
-        std::cmp::Ordering::Less => A2Closure::InvisibleLoss,
-        std::cmp::Ordering::Greater => {
-            let over = lhs - done;
-            if over <= pending {
-                A2Closure::InFlight
-            } else {
-                A2Closure::Inconsistent
-            }
-        }
+// §23.1② (ADR-0057 D-A): both sides count memory points; tickets stay A1's unit. Unsettled
+// memories (latest ticket FAILED/LOST/RETIRED_FAILED) hold 0 or 1 point, so they widen the
+// closed band instead of reading as in-flight (known limit 12: the slack can absorb one loss each).
+fn judge_a2(visible: u64, settled: u64, in_flight: u64, unsettled: u64) -> A2Closure {
+    if visible < settled {
+        A2Closure::InvisibleLoss
+    } else if visible - settled <= unsettled {
+        A2Closure::Closed
+    } else if visible - settled - unsettled <= in_flight {
+        A2Closure::InFlight
+    } else {
+        A2Closure::Inconsistent
     }
 }
 
@@ -152,11 +155,21 @@ pub struct ProjectionBlock {
     pub visible: Option<u64>,
     pub open_gaps: u64,
     pub pending: u64,
+    /// ADR-0057 D-A: the A2 point readings `visible` is judged against (see
+    /// [`crate::completeness::ledger::ProjectionReads`]); the six ticket fields above stay A1's.
+    /// The universe that should eventually be visible — the ratio's denominator.
+    pub points_expected: u64,
+    /// Must be visible now — A2's lower bound.
+    pub points_settled: u64,
+    /// Memories with a pending ticket — the in-flight slack above the closed band.
+    pub points_in_flight: u64,
+    /// Memories whose latest ticket failed or was retired — the closed band's width.
+    pub points_unsettled: u64,
     /// `null` whenever it cannot be established: A1 broken, `visible` unavailable, or A2's
-    /// `>` side exceeds `pending` — all three are the *same* "don't know the true count"
-    /// failure (§23.1②: "把 A2 的 `<` 侧也判成 cannot_establish 等于把真实的丢失藏进测不出来
-    /// 里"，其反面同样成立：只有 `>` 超出 `pending` 才与 A1 同判). Only one ratio is ever
-    /// output — there is no second "ledger-only" ratio (§23.1②).
+    /// `>` side exceeds the in-flight slack — all three are the *same* "don't know the true
+    /// count" failure (§23.1②: "把 A2 的 `<` 侧也判成 cannot_establish 等于把真实的丢失藏进测不出来
+    /// 里"，其反面同样成立). Otherwise `visible / points_expected` (ADR-0057 D-A: one unit on both
+    /// sides). Only one ratio is ever output — there is no second "ledger-only" ratio (§23.1②).
     pub completeness_ratio: Option<f64>,
     /// §23.1② frozen definition, this crate's only computation of it:
     /// `current = (open_gaps == 0) && A2 闭合`. `pending` never enters this — see this
@@ -165,31 +178,48 @@ pub struct ProjectionBlock {
 }
 
 /// §23.1②'s full A1/A2 assembly: the one place `completeness_ratio` / `current` /
-/// `PROJECTION_INVISIBLE_LOSS` are computed from a [`LedgerClosure`] and an
+/// `PROJECTION_INVISIBLE_LOSS` / `PROJECTION_LAG` are computed from a [`LedgerClosure`] and an
 /// independently-read Qdrant `visible` count (`None` when the index count could not be
-/// taken). Returns the block plus whatever `abstain()` degradations fired — only ever
-/// [`DegradeCode::ProjectionInvisibleLoss`], and only via `abstain()` (§53.1 single exit
-/// point; this function never builds `Outcome { degradations: ... }` by hand).
+/// taken). Returns the block plus whatever `abstain()` degradations fired — at most
+/// `[ProjectionInvisibleLoss, ProjectionLag]`, in that order, and only via `abstain()` (§53.1
+/// single exit point; this function never builds `Outcome { degradations: ... }` by hand).
+///
+/// §52.2 (ADR-0057 D-E): a result read while [`LedgerClosure::lagging`] holds is a lagged
+/// result, so it degrades `PROJECTION_LAG` on every path — `current` is untouched (its formula
+/// is frozen); the class side is `classify()`'s lag arm.
 pub fn build_projection_block(
     ledger: &LedgerClosure,
     visible: Option<u64>,
+    lag_threshold: Duration,
 ) -> Outcome<ProjectionBlock> {
-    let counts = ledger.counts();
-    let expected = counts.expected();
-    let done = counts.done();
-    let deleted = counts.deleted();
-    let skipped = counts.skipped();
-    let open_gaps = counts.open_gaps();
-    let pending = counts.pending();
+    let out = projection_block_a2(ledger, visible);
+    // ADR-0057 D-E: compose, never early-return — loss and lag can both hold (a stalled runner
+    // plus a lost point) and each must reach the wire.
+    if ledger.lagging(lag_threshold) {
+        out.also(DegradeCode::ProjectionLag)
+    } else {
+        out
+    }
+}
 
+/// [`build_projection_block`]'s A1/A2 half (no lag judgement): also the block of the
+/// no-serving-projection envelope, whose class is already `cannot_establish` and whose index
+/// face does not exist to lag behind.
+fn projection_block_a2(ledger: &LedgerClosure, visible: Option<u64>) -> Outcome<ProjectionBlock> {
+    let counts = ledger.counts();
+    let points = ledger.points();
     let no_ratio = |visible: Option<u64>| ProjectionBlock {
-        expected,
-        done,
-        deleted,
-        skipped,
+        expected: counts.expected(),
+        done: counts.done(),
+        deleted: counts.deleted(),
+        skipped: counts.skipped(),
         visible,
-        open_gaps,
-        pending,
+        open_gaps: counts.open_gaps(),
+        pending: counts.pending(),
+        points_expected: points.points_expected,
+        points_settled: points.points_settled,
+        points_in_flight: points.points_in_flight,
+        points_unsettled: points.points_unsettled,
         completeness_ratio: None,
         current: false,
     };
@@ -204,37 +234,33 @@ pub fn build_projection_block(
         return Outcome::clean(no_ratio(None));
     };
 
-    let a2 = judge_a2(v, deleted, skipped, done, pending);
+    let a2 = judge_a2(
+        v,
+        points.points_settled,
+        points.points_in_flight,
+        points.points_unsettled,
+    );
 
-    // §23.1②: `>` side exceeding `pending` is untrustworthy on both sides — same treatment
-    // as A1 broken, no ratio.
+    // §23.1②: `>` side beyond the in-flight slack is untrustworthy on both sides — same
+    // treatment as A1 broken, no ratio.
     if a2 == A2Closure::Inconsistent {
         return Outcome::clean(no_ratio(Some(v)));
     }
 
-    let denom = expected.saturating_sub(deleted);
-    // §23.1②'s ratio is only ever `null` for the three named cannot-establish cases (A1
-    // broken / `visible` unavailable / A2 overshoot beyond `pending`) — a vacuous stream
-    // (`expected == deleted`, e.g. every issued record was tombstoned) is none of those three:
-    // A1 and A2 both hold trivially. Pinned here as `1.0` — "0 of a 0-record universe" is
-    // complete by definition — rather than `null`, so this branch cannot silently drift back
-    // to the undefined `ratio: null, current: true` shape.
+    // A vacuous universe (`points_expected == 0`, e.g. every memory was tombstoned) is none of
+    // the three named cannot-establish cases: A1 and A2 both hold trivially. Pinned as `1.0` —
+    // "0 of a 0-point universe" is complete by definition — rather than `null`, so this branch
+    // cannot silently drift back to the undefined `ratio: null, current: true` shape.
+    let denom = points.points_expected;
     let ratio = Some(if denom == 0 {
         1.0
     } else {
         v as f64 / denom as f64
     });
-    let current = open_gaps == 0 && a2 == A2Closure::Closed;
     let block = ProjectionBlock {
-        expected,
-        done,
-        deleted,
-        skipped,
-        visible: Some(v),
-        open_gaps,
-        pending,
         completeness_ratio: ratio,
-        current,
+        current: counts.open_gaps() == 0 && a2 == A2Closure::Closed,
+        ..no_ratio(Some(v))
     };
 
     if a2 == A2Closure::InvisibleLoss {
@@ -265,6 +291,7 @@ pub(crate) fn assemble_completeness_class(
     ledger: &LedgerClosure,
     visible: Option<u64>,
     pipeline: &PipelineBlock,
+    lag_threshold: Duration,
 ) -> (CompletenessClassWire, Option<CannotEstablishReasonWire>) {
     let class = final_completeness_class(
         planner_output,
@@ -275,6 +302,7 @@ pub(crate) fn assemble_completeness_class(
         visible,
         None,
         0,
+        lag_threshold,
     );
 
     (class.into(), CannotEstablishReasonWire::from_class(class))
@@ -290,6 +318,7 @@ fn final_completeness_class(
     visible: Option<u64>,
     context: Option<&ContextOutcome>,
     mandatory_missing: u64,
+    lag_threshold: Duration,
 ) -> CompletenessClass {
     let classified = classify(
         planner_output,
@@ -297,6 +326,7 @@ fn final_completeness_class(
         census_result,
         ledger,
         mandatory_missing,
+        lag_threshold,
     );
     // §25.5's final outcome makes a real Mandatory Context overflow the canonical reason even
     // when §22's pure classifier has already found a different failure. The `PipelineBlock` is
@@ -441,6 +471,8 @@ pub enum CannotEstablishReasonWire {
     MandatoryNotSatisfied,
     /// ADR-0053 D-E：账本已初始化但该 family 尚无 serving version。
     NoServingProjection,
+    /// §22.4 / ADR-0057 D-E: the stream's oldest pending ticket is older than the threshold.
+    ProjectionLag,
 }
 
 impl CannotEstablishReasonWire {
@@ -468,6 +500,7 @@ impl CannotEstablishReasonWire {
             "pipeline_count_mismatch" => Some(Self::PipelineCountMismatch),
             "mandatory_not_satisfied" => Some(Self::MandatoryNotSatisfied),
             "no_serving_projection" => Some(Self::NoServingProjection),
+            "projection_lag" => Some(Self::ProjectionLag),
             // 到不了：`wire_labels` 是闭集。真到了说明有人加了 reason 变体却没加这里，
             // 那时 `None` 会让新 reason 在 JSON 上静默消失——所以 panic 而不是 None。
             other => unreachable!("未登记的 reason 线值: {other}"),
@@ -565,6 +598,9 @@ pub struct CompletenessInputs<'a> {
     /// (card 22c review debt): the shortfall must move `completeness.class`, not only sit in
     /// the handoff counts.
     pub mandatory_missing: u64,
+    /// §22.4 / §78.1 (ADR-0057 D-E/D-F): the projection-lag threshold from the gateway's
+    /// `PROJECTION_LAG_SECONDS` key, judged only by [`LedgerClosure::lagging`].
+    pub lag_threshold: Duration,
 }
 
 /// A fully validated outcome whose final metric is still pending downstream acceptance.
@@ -648,6 +684,7 @@ fn outcome_block_under<T>(
         inputs.visible,
         inputs.context,
         inputs.mandatory_missing,
+        inputs.lag_threshold,
     );
     let outcome = exact_outcome_from_class(class, inputs.census)?;
     let value = accept(outcome)?;
@@ -675,8 +712,16 @@ pub(crate) fn component_exact_outcome(
     lane_status: LaneStatus,
     census: &crate::completeness::CensusResult,
     ledger: &crate::completeness::LedgerClosure,
+    lag_threshold: Duration,
 ) -> Result<ExactOutcome, humaux_domain::error::ErrorCode> {
-    let class = crate::completeness::classify(planner_output, lane_status, census, ledger, 0);
+    let class = crate::completeness::classify(
+        planner_output,
+        lane_status,
+        census,
+        ledger,
+        0,
+        lag_threshold,
+    );
     exact_outcome_from_class(class, census)
 }
 
@@ -1139,7 +1184,7 @@ pub fn no_serving_projection_envelope<I, T>(
     let class = CompletenessClass::CannotEstablish {
         reason: CannotEstablishReason::NoServingProjection,
     };
-    let projection = build_projection_block(ledger, None);
+    let projection = projection_block_a2(ledger, None);
     let envelope = Envelope {
         items: Vec::new(),
         pipeline: PipelineBlock {
@@ -1347,7 +1392,7 @@ mod tests {
                 failed: Some(0),
                 count_scope: CountScope::StreamLedger,
             },
-            projection: build_projection_block(&ledger, Some(1)).value,
+            projection: build_projection_block(&ledger, Some(1), LAG).value,
         };
         assert!(take_final_record_trace().is_empty());
         let final_out = envelope_outcome_block(
@@ -1361,6 +1406,7 @@ mod tests {
                 visible: Some(1),
                 context: Some(&outcome),
                 mandatory_missing: 0,
+                lag_threshold: LAG,
             },
             Ok,
         )
@@ -1385,7 +1431,7 @@ mod tests {
         use crate::completeness::{ExactEnumeration, take_final_record_trace};
 
         let request = provenance_request("all rejected", 5, true);
-        let ledger = ledger::close(LedgerReads {
+        let ledger = close_mirrored(LedgerReads {
             expected: 2,
             done: 1,
             deleted: 0,
@@ -1406,7 +1452,7 @@ mod tests {
                 failed: Some(0),
                 count_scope: CountScope::StreamLedger,
             },
-            projection: build_projection_block(&ledger, Some(1)).value,
+            projection: build_projection_block(&ledger, Some(1), LAG).value,
         };
         assert!(
             pipeline.projection.completeness_ratio.is_none(),
@@ -1426,6 +1472,7 @@ mod tests {
                 visible: Some(1),
                 context: Some(&overflow),
                 mandatory_missing: 0,
+                lag_threshold: LAG,
             },
             Ok,
         )
@@ -1471,7 +1518,7 @@ mod tests {
         use crate::completeness::{ExactEnumeration, take_final_record_trace};
 
         let request = provenance_request("all rejected", 5, true);
-        let ledger = ledger::close(LedgerReads {
+        let ledger = close_mirrored(LedgerReads {
             expected: 2,
             done: 1,
             deleted: 0,
@@ -1488,7 +1535,7 @@ mod tests {
                 failed: Some(0),
                 count_scope: CountScope::StreamLedger,
             },
-            projection: build_projection_block(&ledger, Some(1)).value,
+            projection: build_projection_block(&ledger, Some(1), LAG).value,
         };
         let census = CensusResult::enumerated(ExactEnumeration::new("p", 3, 2, 0).unwrap());
         assert!(take_final_record_trace().is_empty());
@@ -1503,6 +1550,7 @@ mod tests {
                 visible: Some(1),
                 context: None,
                 mandatory_missing: 0,
+                lag_threshold: LAG,
             },
             Ok,
         )
@@ -1656,13 +1704,35 @@ mod tests {
 
     use super::*;
     use crate::completeness::ledger::{self, LedgerReads};
+
+    /// No fixture in this module has a pending age, so the threshold never fires here.
+    const LAG: Duration = Duration::from_secs(30);
     use humaux_domain::grounding::{
         EdgeOutcome, GroundingEdge, GroundingInputs, GroundingMode, GroundingVersionToken,
         derive_grounding_state,
     };
 
+    /// The pre-ADR-0057 fixtures state A2 in tickets. On a stream where every ticket projects
+    /// exactly one memory (no fan-out, no lifecycle ticket, no failure) the point readings equal
+    /// the ticket terms: settled = done - deleted - skipped, expected = expected - deleted,
+    /// in-flight = pending, unsettled = 0. The point-unit tests below state their readings
+    /// directly instead.
+    fn mirrored(reads: &LedgerReads) -> ledger::ProjectionReads {
+        ledger::ProjectionReads {
+            points_expected: reads.expected.saturating_sub(reads.deleted),
+            points_settled: reads.done.saturating_sub(reads.deleted + reads.skipped),
+            points_in_flight: reads.pending,
+            points_unsettled: 0,
+            oldest_pending_age_secs: None,
+        }
+    }
+
+    fn close_mirrored(reads: LedgerReads) -> LedgerClosure {
+        ledger::close(reads, mirrored(&reads))
+    }
+
     fn closed(reads: LedgerReads) -> LedgerClosure {
-        let c = ledger::close(reads);
+        let c = close_mirrored(reads);
         assert!(c.is_closed(), "fixture must have A1 closed");
         c
     }
@@ -1680,7 +1750,7 @@ mod tests {
             open_gaps: 0,
             pending: 0,
         });
-        let out = build_projection_block(&ledger, Some(90));
+        let out = build_projection_block(&ledger, Some(90), LAG);
         assert!(out.degradations.is_empty());
         let b = out.value;
         assert_eq!(b.completeness_ratio, Some(1.0));
@@ -1700,7 +1770,7 @@ mod tests {
             open_gaps: 8,
             pending: 2,
         });
-        let out = build_projection_block(&ledger, Some(90));
+        let out = build_projection_block(&ledger, Some(90), LAG);
         assert!(out.degradations.is_empty(), "no loss here, just open gaps");
         let b = out.value;
         assert_eq!(b.completeness_ratio, Some(0.9));
@@ -1720,7 +1790,7 @@ mod tests {
             open_gaps: 0,
             pending: 0,
         });
-        let out = build_projection_block(&ledger, Some(90));
+        let out = build_projection_block(&ledger, Some(90), LAG);
         let b = &out.value;
         assert_eq!(b.completeness_ratio, Some(0.9));
         assert!(!b.current);
@@ -1749,7 +1819,7 @@ mod tests {
             open_gaps: 1,
             pending: 2,
         });
-        let out = build_projection_block(&ledger, Some(88));
+        let out = build_projection_block(&ledger, Some(88), LAG);
         let b = &out.value;
         assert_eq!(b.expected, 98);
         assert_eq!(b.done, 95);
@@ -1849,7 +1919,7 @@ mod tests {
     /// §22.4/G23-3: A1 broken ⇒ `cannot_establish`, no ratio output at all.
     #[test]
     fn a1_broken_yields_no_ratio_and_not_current() {
-        let ledger = ledger::close(LedgerReads {
+        let ledger = close_mirrored(LedgerReads {
             expected: 100,
             done: 90,
             deleted: 0,
@@ -1858,7 +1928,7 @@ mod tests {
             pending: 0, // 90 != 100
         });
         assert!(!ledger.is_closed());
-        let out = build_projection_block(&ledger, Some(90));
+        let out = build_projection_block(&ledger, Some(90), LAG);
         assert_eq!(out.value.completeness_ratio, None);
         assert!(!out.value.current);
         assert!(
@@ -1879,7 +1949,7 @@ mod tests {
             open_gaps: 0,
             pending: 0,
         });
-        let out = build_projection_block(&ledger, None);
+        let out = build_projection_block(&ledger, None, LAG);
         assert_eq!(out.value.visible, None);
         assert_eq!(out.value.completeness_ratio, None);
         assert!(!out.value.current);
@@ -1898,7 +1968,7 @@ mod tests {
             pending: 5,
         });
         // visible=98 ⇒ lhs=98, done=90, over=8 > pending(5).
-        let out = build_projection_block(&ledger, Some(98));
+        let out = build_projection_block(&ledger, Some(98), LAG);
         assert_eq!(out.value.completeness_ratio, None);
         assert!(!out.value.current);
         assert!(out.degradations.is_empty());
@@ -1919,7 +1989,7 @@ mod tests {
             open_gaps: 0,
             pending: 0,
         });
-        let out = build_projection_block(&ledger, None);
+        let out = build_projection_block(&ledger, None, LAG);
         assert_eq!(out.value.completeness_ratio, None, "fixture precondition");
         let (class, reason) = assemble_completeness_class(
             &PlannerDecision::Class(crate::planner::QueryClass::Semantic),
@@ -1938,6 +2008,7 @@ mod tests {
                 },
                 projection: out.value,
             },
+            LAG,
         );
         assert_eq!(class, CompletenessClassWire::CannotEstablish);
         assert_eq!(
@@ -1957,7 +2028,7 @@ mod tests {
             open_gaps: 5,
             pending: 5,
         });
-        let out = build_projection_block(&ledger, Some(98)); // over=8 > pending(5)
+        let out = build_projection_block(&ledger, Some(98), LAG); // over=8 > pending(5)
         assert_eq!(out.value.completeness_ratio, None, "fixture precondition");
         let (class, reason) = assemble_completeness_class(
             &PlannerDecision::Class(crate::planner::QueryClass::Semantic),
@@ -1976,6 +2047,7 @@ mod tests {
                 },
                 projection: out.value,
             },
+            LAG,
         );
         assert_eq!(class, CompletenessClassWire::CannotEstablish);
         assert_eq!(
@@ -1995,7 +2067,7 @@ mod tests {
             open_gaps: 0,
             pending: 0,
         });
-        let out = build_projection_block(&ledger, Some(90));
+        let out = build_projection_block(&ledger, Some(90), LAG);
         assert!(
             out.value.completeness_ratio.is_some(),
             "fixture precondition"
@@ -2017,6 +2089,7 @@ mod tests {
                 },
                 projection: out.value,
             },
+            LAG,
         );
         assert_eq!(class, CompletenessClassWire::SemanticBounded);
         assert_eq!(reason, None);
@@ -2042,7 +2115,7 @@ mod tests {
                 failed: Some(0),
                 count_scope: CountScope::StreamLedger,
             },
-            projection: build_projection_block(&ledger, Some(100)).value,
+            projection: build_projection_block(&ledger, Some(100), LAG).value,
         };
         let census = CensusResult::enumerated(ExactEnumeration::new("p", 100, 100, 0).unwrap());
         (ledger, pipeline, census)
@@ -2158,6 +2231,7 @@ mod tests {
                 &census,
                 &ledger,
                 0,
+                LAG,
             ),
             CompletenessClass::Exact,
             "the count gate, not a census failure, downgrades this fixture"
@@ -2183,6 +2257,7 @@ mod tests {
                 &ledger,
                 Some(100),
                 &pipeline,
+                LAG,
             );
             assert_eq!(class, CompletenessClassWire::CannotEstablish);
             assert_eq!(reason, Some(expected_reason));
@@ -2210,7 +2285,7 @@ mod tests {
                 failed: Some(0),
                 count_scope: CountScope::StreamLedger,
             },
-            projection: build_projection_block(&ledger, Some(1)).value,
+            projection: build_projection_block(&ledger, Some(1), LAG).value,
         };
         let census = CensusResult::enumerated(
             crate::completeness::ExactEnumeration::new("p", 1, 1, 0).unwrap(),
@@ -2226,6 +2301,7 @@ mod tests {
                 visible: Some(1),
                 context: None,
                 mandatory_missing: 0,
+                lag_threshold: LAG,
             },
             accept,
         )
@@ -2282,7 +2358,7 @@ mod tests {
                 failed: Some(0),
                 count_scope: CountScope::StreamLedger,
             },
-            projection: build_projection_block(&ledger, Some(1)).value,
+            projection: build_projection_block(&ledger, Some(1), LAG).value,
         };
         assert!(take_final_record_trace().is_empty());
         let out = envelope_outcome_block(
@@ -2296,6 +2372,7 @@ mod tests {
                 visible: Some(1),
                 context: None,
                 mandatory_missing: 0,
+                lag_threshold: LAG,
             },
             Ok,
         )
@@ -2325,6 +2402,7 @@ mod tests {
                 visible: Some(1),
                 context: None,
                 mandatory_missing: 0,
+                lag_threshold: LAG,
             },
             Ok,
         )
@@ -2354,6 +2432,7 @@ mod tests {
                     visible: Some(1),
                     context: None,
                     mandatory_missing: 0,
+                    lag_threshold: LAG,
                 },
                 Ok::<_, humaux_domain::error::ErrorCode>,
             ),
@@ -2383,7 +2462,7 @@ mod tests {
                 failed: Some(0),
                 count_scope: CountScope::StreamLedger,
             },
-            projection: build_projection_block(&ledger, Some(1)).value,
+            projection: build_projection_block(&ledger, Some(1), LAG).value,
         };
         assert!(take_final_record_trace().is_empty());
         assert!(matches!(
@@ -2398,6 +2477,7 @@ mod tests {
                     visible: Some(1),
                     context: None,
                     mandatory_missing: 0,
+                    lag_threshold: LAG,
                 },
                 Ok::<_, humaux_domain::error::ErrorCode>,
             ),
@@ -2419,7 +2499,7 @@ mod tests {
             pending: 5,
         });
         // visible=93 ⇒ lhs=93, done=90, over=3 <= pending(5).
-        let out = build_projection_block(&ledger, Some(93));
+        let out = build_projection_block(&ledger, Some(93), LAG);
         assert_eq!(out.value.completeness_ratio, Some(0.93));
         assert!(!out.value.current);
         assert!(out.degradations.is_empty());
@@ -2440,7 +2520,7 @@ mod tests {
             pending: 0,
         });
         // visible=0 (policy-skipped content never enters the index) ⇒ lhs = 0+0+100 = 100 = done.
-        let out = build_projection_block(&ledger, Some(0));
+        let out = build_projection_block(&ledger, Some(0), LAG);
         assert!(
             out.value.current,
             "skipped must not leave A2 permanently red"
@@ -2462,7 +2542,7 @@ mod tests {
             pending: 0,
         });
         // visible=0: every point was tombstoned, none left visible; lhs = 0+10+0 = 10 = done.
-        let out = build_projection_block(&ledger, Some(0));
+        let out = build_projection_block(&ledger, Some(0), LAG);
         assert_eq!(out.value.completeness_ratio, Some(1.0));
         assert!(out.value.current);
         assert!(out.degradations.is_empty());
@@ -2714,7 +2794,7 @@ mod tests {
     // through `Envelope<T>` serialization (`null`, not `0.0` or omitted).
     #[test]
     fn envelope_serializes_null_ratio_as_json_null_not_omitted() {
-        let ledger = ledger::close(LedgerReads {
+        let ledger = close_mirrored(LedgerReads {
             expected: 10,
             done: 5,
             deleted: 0,
@@ -2722,7 +2802,7 @@ mod tests {
             open_gaps: 1,
             pending: 1, // 5+1+1=7 != 10 -> Broken
         });
-        let out = build_projection_block(&ledger, Some(5));
+        let out = build_projection_block(&ledger, Some(5), LAG);
         let envelope = Envelope::<()> {
             items: vec![],
             // 本条不测 §25.5 的两条 lane —— `NotRun` 是「本次没跑」的显式表达，
@@ -2867,7 +2947,7 @@ mod tests {
                     failed: Some(0),
                     count_scope: CountScope::StreamLedger,
                 },
-                projection: build_projection_block(&ledger, Some(1)).value,
+                projection: build_projection_block(&ledger, Some(1), LAG).value,
             },
             completeness: completeness_block(5, 5, vec![]),
             provenance: full_provenance(),
@@ -2888,7 +2968,7 @@ mod tests {
     /// census's own enumeration (no independent assembly path exists).
     #[test]
     fn component_exact_outcome_carries_the_full_22_1_block_without_recording() {
-        use crate::completeness::{CensusResult, ExactEnumeration, ledger};
+        use crate::completeness::{CensusResult, ExactEnumeration};
         use crate::planner::PlannerDecision;
 
         let census = CensusResult::enumerated(
@@ -2902,7 +2982,7 @@ mod tests {
             },
             LaneStatus::Ok,
             &census,
-            &ledger::close(ledger::LedgerReads {
+            &close_mirrored(LedgerReads {
                 expected: 10,
                 done: 10,
                 deleted: 0,
@@ -2910,6 +2990,7 @@ mod tests {
                 open_gaps: 0,
                 pending: 0,
             }),
+            LAG,
         )
         .unwrap();
         assert_eq!(out.class, CompletenessClassWire::Exact);
@@ -2930,7 +3011,7 @@ mod tests {
     /// 5xx，**不是降级**". The one Err path; nothing here downgrades to a weaker class.
     #[test]
     fn g22_0_fault_a_verbal_exact_claim_is_a_hard_error_not_a_downgrade() {
-        use crate::completeness::{CensusResult, ledger};
+        use crate::completeness::CensusResult;
         use crate::planner::PlannerDecision;
 
         let err = component_exact_outcome(
@@ -2939,7 +3020,7 @@ mod tests {
             },
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
-            &ledger::close(ledger::LedgerReads {
+            &close_mirrored(LedgerReads {
                 expected: 1,
                 done: 1,
                 deleted: 0,
@@ -2947,6 +3028,7 @@ mod tests {
                 open_gaps: 0,
                 pending: 0,
             }),
+            LAG,
         )
         .unwrap_err();
         assert_eq!(err, humaux_domain::error::ErrorCode::Internal);
@@ -2957,7 +3039,7 @@ mod tests {
     /// itself must not ride along on a `cannot_establish` answer.
     #[test]
     fn cannot_establish_keeps_the_census_count_as_lower_bound_only() {
-        use crate::completeness::{CensusResult, ExactEnumeration, ledger};
+        use crate::completeness::{CensusResult, ExactEnumeration};
         use crate::planner::PlannerDecision;
 
         let census = CensusResult::enumerated(
@@ -2969,7 +3051,7 @@ mod tests {
             },
             LaneStatus::Ok,
             &census,
-            &ledger::close(ledger::LedgerReads {
+            &close_mirrored(LedgerReads {
                 expected: 10,
                 done: 5,
                 deleted: 0,
@@ -2977,6 +3059,7 @@ mod tests {
                 open_gaps: 0,
                 pending: 0,
             }),
+            LAG,
         )
         .unwrap();
         assert_eq!(out.class, CompletenessClassWire::CannotEstablish);
@@ -2989,14 +3072,14 @@ mod tests {
     /// partial-count claim for `semantic_bounded`).
     #[test]
     fn non_exact_class_never_emits_the_enumeration_block() {
-        use crate::completeness::{CensusResult, ledger};
+        use crate::completeness::CensusResult;
         use crate::planner::{PlannerDecision, QueryClass};
 
         let out = component_exact_outcome(
             &PlannerDecision::Class(QueryClass::Semantic),
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
-            &ledger::close(ledger::LedgerReads {
+            &close_mirrored(LedgerReads {
                 expected: 1,
                 done: 1,
                 deleted: 0,
@@ -3004,6 +3087,7 @@ mod tests {
                 open_gaps: 0,
                 pending: 0,
             }),
+            LAG,
         )
         .unwrap();
         assert_eq!(out.class, CompletenessClassWire::SemanticBounded);
@@ -3071,7 +3155,7 @@ mod tests {
                 failed: Some(0),
                 count_scope: CountScope::StreamLedger,
             },
-            projection: build_projection_block(&ledger, Some(1)).value,
+            projection: build_projection_block(&ledger, Some(1), LAG).value,
         };
         let provenance = full_provenance();
         let census = CensusResult::ok_without_enumeration();
@@ -3084,6 +3168,7 @@ mod tests {
             visible: Some(1),
             context: None,
             mandatory_missing: 0,
+            lag_threshold: LAG,
         };
         // The request's own decision (DirectGet ⇒ Exact without a census) is §22.0's 5xx.
         assert!(matches!(
@@ -3095,5 +3180,218 @@ mod tests {
             .finish();
         assert_eq!(out.class, CompletenessClassWire::SemanticBounded);
         assert!(out.exact.is_none());
+    }
+}
+
+/// ADR-0057 D-A: A2 judged in memory points. Each test names the single fault that turns it red.
+#[cfg(test)]
+mod a2_point_tests {
+    use super::*;
+    use crate::completeness::ledger::{self, LedgerReads, ProjectionReads};
+
+    const LAG: Duration = Duration::from_secs(30);
+
+    fn ledger_of(
+        reads: LedgerReads,
+        points_expected: u64,
+        points_settled: u64,
+        points_in_flight: u64,
+        points_unsettled: u64,
+    ) -> LedgerClosure {
+        let closure = ledger::close(
+            reads,
+            ProjectionReads {
+                points_expected,
+                points_settled,
+                points_in_flight,
+                points_unsettled,
+                oldest_pending_age_secs: None,
+            },
+        );
+        assert!(closure.is_closed(), "fixture must have A1 closed");
+        closure
+    }
+
+    /// A1-closed stream with one pending ticket of `age_secs` and the given point readings.
+    fn pending_for(age_secs: u64, settled: u64, in_flight: u64) -> LedgerClosure {
+        ledger::close(
+            LedgerReads {
+                expected: 5,
+                done: 4,
+                pending: 1,
+                ..LedgerReads::default()
+            },
+            ProjectionReads {
+                points_expected: settled + in_flight,
+                points_settled: settled,
+                points_in_flight: in_flight,
+                points_unsettled: 0,
+                oldest_pending_age_secs: Some(age_secs),
+            },
+        )
+    }
+
+    /// ADR-0057 D-E (test 10): a lagging stream degrades `PROJECTION_LAG` through `abstain()`
+    /// and leaves `current` to its frozen formula. Fault: remove the `.also(ProjectionLag)`.
+    #[test]
+    fn build_projection_block_degrades_projection_lag_via_abstain() {
+        let before = humaux_telemetry::degrade::degrade_total_count(DegradeCode::ProjectionLag);
+        let out = build_projection_block(&pending_for(31, 4, 1), Some(4), LAG);
+        assert_eq!(out.degradations.as_slice(), &[DegradeCode::ProjectionLag]);
+        assert!(
+            humaux_telemetry::degrade::degrade_total_count(DegradeCode::ProjectionLag) > before,
+            "PROJECTION_LAG must be counted through abstain()"
+        );
+        assert!(
+            out.value.current,
+            "lag does not move the frozen `current` formula"
+        );
+        // At the threshold: no degradation (strict `>`).
+        let at = build_projection_block(&pending_for(30, 4, 1), Some(4), LAG);
+        assert!(at.degradations.is_empty(), "{:?}", at.degradations);
+    }
+
+    /// ADR-0057 D-E (test 10b): loss and lag hold together ⇒ both codes, loss first, and the
+    /// class is `cannot_establish/projection_lag`. Faults: return early after the loss abstain
+    /// (lag dropped) / test lag first and return (loss dropped).
+    #[test]
+    fn build_projection_block_carries_loss_and_lag_together() {
+        let ledger = pending_for(3_600, 4, 1);
+        let out = build_projection_block(&ledger, Some(3), LAG);
+        assert_eq!(
+            out.degradations.as_slice(),
+            &[
+                DegradeCode::ProjectionInvisibleLoss,
+                DegradeCode::ProjectionLag
+            ]
+        );
+        assert!(!out.value.current);
+        let class = classify(
+            &PlannerDecision::Class(QueryClass::Semantic),
+            LaneStatus::Ok,
+            &CensusResult::ok_without_enumeration(),
+            &ledger,
+            0,
+            LAG,
+        );
+        assert_eq!(class.wire_labels(), ("cannot_establish", "projection_lag"));
+        assert_eq!(
+            CannotEstablishReasonWire::from_class(class),
+            Some(CannotEstablishReasonWire::ProjectionLag)
+        );
+    }
+
+    fn settled_tickets(n: u64) -> LedgerReads {
+        LedgerReads {
+            expected: n,
+            done: n,
+            ..LedgerReads::default()
+        }
+    }
+
+    /// rehearsal5 `recall_after_restore`: 6 settled tickets (2 EVIDENCE_ACCEPTED fan-outs + 4
+    /// lifecycle tickets) project 4 live points. Fault: judge `visible + deleted + skipped`
+    /// against `done` again (4 < 6 ⇒ loss).
+    #[test]
+    fn a2_closes_in_points_after_lifecycle_tickets() {
+        let out = build_projection_block(&ledger_of(settled_tickets(6), 4, 4, 0, 0), Some(4), LAG);
+        assert!(out.degradations.is_empty(), "{:?}", out.degradations);
+        assert!(out.value.current);
+        assert_eq!(out.value.completeness_ratio, Some(1.0));
+        assert_eq!(
+            (out.value.done, out.value.points_settled, out.value.visible),
+            (6, 4, Some(4))
+        );
+    }
+
+    /// One Evidence → three memories: one ticket, three points. Fault: the ticket-unit judge
+    /// (3 > 1 + pending 0 ⇒ Inconsistent, ratio null).
+    #[test]
+    fn a2_fan_out_one_evidence_three_memories_is_closed() {
+        let out = build_projection_block(&ledger_of(settled_tickets(1), 3, 3, 0, 0), Some(3), LAG);
+        assert!(out.degradations.is_empty());
+        assert!(out.value.current);
+        assert_eq!(out.value.completeness_ratio, Some(1.0));
+    }
+
+    /// `visible < points_settled` is a real loss: ratio still computed, `current=false`,
+    /// `PROJECTION_INVISIBLE_LOSS`. Fault: route `<` to cannot_establish (ratio null).
+    #[test]
+    fn a2_visible_below_points_settled_is_loss_with_ratio() {
+        let out = build_projection_block(&ledger_of(settled_tickets(2), 4, 4, 0, 0), Some(3), LAG);
+        assert_eq!(out.value.completeness_ratio, Some(0.75));
+        assert!(!out.value.current);
+        assert_eq!(
+            out.degradations.as_slice(),
+            &[DegradeCode::ProjectionInvisibleLoss]
+        );
+    }
+
+    /// One pending ticket whose evidence fans out to two memories: both points may already be
+    /// written. Fault: use ticket `pending` (1) as the slack ⇒ L+2 reads Inconsistent.
+    #[test]
+    fn a2_overshoot_within_points_in_flight_is_in_flight() {
+        let reads = LedgerReads {
+            expected: 3,
+            done: 2,
+            pending: 1,
+            ..LedgerReads::default()
+        };
+        let out = build_projection_block(&ledger_of(reads, 4, 2, 2, 0), Some(4), LAG);
+        assert!(out.degradations.is_empty());
+        assert!(
+            out.value.completeness_ratio.is_some(),
+            "in-flight keeps a ratio"
+        );
+        assert!(!out.value.current, "in-flight is not closed");
+    }
+
+    /// Beyond `points_settled + points_unsettled + points_in_flight` ⇒ untrustworthy, no ratio.
+    /// Fault: drop the upper bound (treat every `>` as in-flight).
+    #[test]
+    fn a2_overshoot_beyond_points_in_flight_is_cannot_establish() {
+        let reads = LedgerReads {
+            expected: 3,
+            done: 2,
+            pending: 1,
+            ..LedgerReads::default()
+        };
+        let out = build_projection_block(&ledger_of(reads, 4, 2, 2, 0), Some(5), LAG);
+        assert_eq!(out.value.completeness_ratio, None);
+        assert!(!out.value.current);
+        assert!(out.degradations.is_empty());
+    }
+
+    /// Unsettled memories (latest ticket failed/retired) hold 0 or 1 point: up to Q above L is
+    /// Closed, not in-flight; one more is Inconsistent. Fault: drop Q from the judge (L+2 reads
+    /// Inconsistent).
+    #[test]
+    fn a2_points_unsettled_is_closed_slack_not_in_flight() {
+        let closed =
+            build_projection_block(&ledger_of(settled_tickets(5), 5, 3, 0, 2), Some(5), LAG);
+        assert!(closed.value.current, "L+Q is inside the closed band");
+        assert!(closed.degradations.is_empty());
+        let over = build_projection_block(&ledger_of(settled_tickets(5), 5, 3, 0, 2), Some(6), LAG);
+        assert_eq!(
+            over.value.completeness_ratio, None,
+            "L+Q+1 with F=0 is beyond the slack"
+        );
+        assert!(!over.value.current);
+    }
+
+    /// `completeness_ratio = visible / points_expected`. Fault: denominator `expected -
+    /// deleted` (10 - 2 = 8 ⇒ 0.75, not 0.5).
+    #[test]
+    fn completeness_ratio_is_visible_over_points_expected() {
+        let reads = LedgerReads {
+            expected: 10,
+            done: 8,
+            deleted: 2,
+            open_gaps: 2,
+            ..LedgerReads::default()
+        };
+        let out = build_projection_block(&ledger_of(reads, 12, 6, 0, 0), Some(6), LAG);
+        assert_eq!(out.value.completeness_ratio, Some(0.5));
+        assert!(!out.value.current, "open_gaps > 0");
     }
 }

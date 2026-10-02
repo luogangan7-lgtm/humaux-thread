@@ -3,7 +3,7 @@
 //!   services=[PostgreSQL(any), PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_PG_DSN];
 //!   modules=[adapters::postgres, adapters::serving_repo, adapters::stream_repo, domain::ids, projection::serving,
 //!   xtask::switch_visible]
-//! Called-by: [xtask::main]
+//! Called-by: [tests, xtask::main]
 //! Invariants: [runs under HUMAUX_MAINTENANCE_PG_DSN, the only role with UPDATE(serving, shadow) on the checkpoint row (§6.2.2)]
 //! Spec: Baseline §16.2; §16.3; §6.2.2
 //!
@@ -26,14 +26,14 @@
 
 use humaux_adapters::postgres::MaintenanceDbPool;
 use humaux_adapters::serving_repo::{SwitchOutcome, switch_projection_version};
-use humaux_domain::ids::TenantId;
+use humaux_domain::ids::{TenantId, WorkspaceId};
 use humaux_projection::serving::ContinuationVerdict;
 use humaux_projection::serving::StreamFamily;
 use postgres::{Client, NoTls};
 use uuid::Uuid;
 
 use crate::switch_visible::{
-    Candidate, SERVING_ROW_VERSION_SQL, VisibleFace, VisiblePair, ops_scope, qdrant_endpoint,
+    Candidate, SERVING_ROW_VERSION_SQL, VisibleFace, VisiblePair, qdrant_endpoint,
     read_candidate_facts, visible_pair,
 };
 
@@ -277,17 +277,16 @@ fn visible_inputs(
         return Ok(((None, None), serving));
     };
     let face = VisibleFace::connect(&flags.qdrant_host, flags.qdrant_port)?;
-    let scope = ops_scope(family.tenant_id.0, flags.workspace)?;
     let pair = rt.block_on(visible_pair(
         &face,
         &Candidate {
-            scope: &scope,
+            tenant: family.tenant_id,
+            workspace: WorkspaceId(flags.workspace),
             collection: &facts.collection,
             candidate_version: &flags.version,
             candidate_tombstoned: &facts.candidate_tombstoned,
             serving_version: serving.as_deref(),
             serving_tombstoned: &facts.serving_tombstoned,
-            user_private_points: facts.user_private_points,
         },
     ));
     Ok((pair, serving))

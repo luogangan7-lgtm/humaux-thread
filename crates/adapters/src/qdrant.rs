@@ -6,8 +6,10 @@
 //! Called-by: [adapters::placement_repo, adapters::projection_worker, adapters::provisioning, adapters::public_projection, adapters::retrieve, adapters::stream_repo, gateway::recall, retrieval-worker::main, tests, xtask::switch_visible]
 //! Invariants: [every wire call takes &dyn IntraCellHttpTransport carrying a CellAccessPermit; Qdrant down ->
 //!   QdrantTransportError to the caller, no fallback search; tombstoned points are filtered by the overlay, never
-//!   counted as visible]
-//! Spec: Baseline §17; §17.5; §17.4; §23.1; §23.4; ADR-0003; §83.4; §7.0; ADR-0055
+//!   counted as visible; the count takes a VisibleCountFilter (one stream) only, search/scroll take a
+//!   DenseQueryFilter only — a StreamCountFilter reaches the count, never search (ADR-0057 D-C); the projection
+//!   worker's point writes and deletes are fenced on source_stream_seq (ADR-0057 D-I)]
+//! Spec: Baseline §17; §17.5; §17.4; §23.1; §23.4; ADR-0003; §83.4; §7.0; ADR-0055; ADR-0057
 //!
 //! Implements every part of §17: collection/index request-body shaping, payload encoding, the
 //! [`Condition`](humaux_projection::dense::Condition) → Qdrant filter JSON translation, the
@@ -49,7 +51,7 @@ use humaux_projection::card::EgressDisposition;
 use humaux_projection::dense::{
     AFFECT_AROUSAL_FIELD, AFFECT_DOMINANCE_FIELD, AFFECT_INTENSITY_FIELD, AFFECT_KINDS_FIELD,
     AFFECT_LABELS_FIELD, AFFECT_VALENCE_FIELD, ARCHIVED_FIELD, Condition, DenseQueryFilter,
-    FieldMatch, SUBJECT_IDS_FIELD, build_dense_filter,
+    FieldMatch, SUBJECT_IDS_FIELD, StreamCountFilter, build_dense_filter,
 };
 use serde_json::{Value, json};
 use sqlx::types::time::OffsetDateTime;
@@ -581,38 +583,27 @@ fn condition_to_wire(condition: &Condition) -> Value {
 }
 
 // ============================================================================
-// §16.3/§23.1② — visible count filter (tenant+visibility+projection_version)
+// §16.3/§23.1② — visible count filter (one stream: tenant + workspace + projection_version)
 // ============================================================================
 
-/// §16.3/§23.1②'s `visible` count filter — the only shape [`count_body`] accepts. §16.3's own
-/// warning: counting by tenant+scope alone (no `projection_version` tag) makes criterion ①
-/// compare a number to itself (恒真闸, `projection::serving`'s own G80-28 doc names this exact
-/// failure mode). The sole constructor, [`Self::new`], routes through
-/// `projection::dense::build_dense_filter` with `projection_version` as a mandatory `narrow_by`
-/// term — §17.1's tenant/visibility injection stays intact, this only narrows further — and
-/// refuses an empty version string, so a blank string cannot silently stand in for "no version
-/// filter".
+/// §16.3/§23.1②'s `visible` count filter — the only shape [`count_body`] and the count calls
+/// accept. Always narrowed to ONE stream (`workspace_id` + `projection_version`): §16.3's own
+/// warning is that counting by tenant+scope alone (no `projection_version` tag) makes criterion
+/// ① compare a number to itself (恒真闸), and a tenant-wide count compared with one workspace's
+/// ledger reads every other workspace's points as overshoot (card-30 debt, ADR-0057 D-C).
+///
+/// Two constructors, one per audience (ADR-0057 D-C):
+/// * [`Self::family_probe`] — the request path: §17.1's tenant clause + the caller's visibility
+///   disjunction through `projection::dense::build_dense_filter`, narrowed by the stream;
+/// * [`Self::from_stream`] — the ops switch / soak / provisioning probe only: a
+///   `projection::dense::StreamCountFilter`, every point of the stream whatever its visibility
+///   class (a number, never ids or bodies).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VisibleCountFilter(DenseQueryFilter);
+pub struct VisibleCountFilter(Condition);
 
 impl VisibleCountFilter {
-    pub fn new(scope: &AuthorizationScope, projection_version: &str) -> Option<Self> {
-        if projection_version.is_empty() {
-            return None;
-        }
-        Some(Self(build_dense_filter(
-            scope,
-            &[FieldMatch {
-                field: "projection_version",
-                value: projection_version.to_string(),
-            }],
-        )))
-    }
-
-    /// ADR-0053 D-D: the empty-activation probe of ONE workspace family — [`Self::new`] plus a
-    /// `workspace_id` term, because `build_dense_filter`'s TENANT_SHARED arm is tenant-wide and
-    /// would count another workspace's tenant-shared points (refusing every second workspace of
-    /// an active tenant).
+    /// The request-path count of one workspace stream under the caller's visibility (ADR-0053
+    /// D-D's empty probe shape, ADR-0057 D-C's read-route count). `None` on an empty version.
     pub fn family_probe(
         scope: &AuthorizationScope,
         workspace_id: WorkspaceId,
@@ -621,26 +612,35 @@ impl VisibleCountFilter {
         if projection_version.is_empty() {
             return None;
         }
-        Some(Self(build_dense_filter(
-            scope,
-            &[
-                FieldMatch {
-                    field: "workspace_id",
-                    value: workspace_id.0.to_string(),
-                },
-                FieldMatch {
-                    field: "projection_version",
-                    value: projection_version.to_string(),
-                },
-            ],
-        )))
+        Some(Self(
+            build_dense_filter(
+                scope,
+                &[
+                    FieldMatch {
+                        field: "workspace_id",
+                        value: workspace_id.0.to_string(),
+                    },
+                    FieldMatch {
+                        field: "projection_version",
+                        value: projection_version.to_string(),
+                    },
+                ],
+            )
+            .as_condition()
+            .clone(),
+        ))
+    }
+
+    /// ADR-0057 D-C: the ops count of one stream — see [`humaux_projection::dense::StreamCountFilter`].
+    pub fn from_stream(filter: StreamCountFilter) -> Self {
+        Self(filter.as_condition().clone())
     }
 }
 
 /// `POST /collections/{name}/points/count` request body. `exact: true` always — §23.1② needs a
 /// real count, not Qdrant's approximate fast-count path.
 pub fn count_body(filter: &VisibleCountFilter) -> Value {
-    json!({ "filter": condition_to_filter(&filter.0), "exact": true })
+    json!({ "filter": condition_tree_to_filter(&filter.0), "exact": true })
 }
 
 /// §17/§37: `visible` is the raw Qdrant count minus the tombstone overlay — the missing half
@@ -725,7 +725,7 @@ pub async fn count_visible(
         transport,
         permit,
         collection,
-        overlay_filter(condition_to_filter(&filter.0), tombstoned),
+        overlay_filter(condition_tree_to_filter(&filter.0), tombstoned),
     )
     .await
 }
@@ -751,7 +751,7 @@ pub async fn count_visible_excluding_seqs(
         transport,
         permit,
         collection,
-        tombstoned_seq_overlay_filter(condition_to_filter(&filter.0), tombstoned_seqs),
+        tombstoned_seq_overlay_filter(condition_tree_to_filter(&filter.0), tombstoned_seqs),
     )
     .await
 }
@@ -1449,13 +1449,61 @@ pub async fn query_dense(
 /// embedding production is a separate concern from body-shaping): a real Qdrant collection with
 /// a configured vector size rejects a point that omits it, so the live wire call needs one.
 /// `ha_profile`'s `ordering` (§17.5) is appended as Qdrant's documented URI control; the body
-/// contains only point data.
+/// contains only point data. Unfenced: the projection worker writes through [`upsert_fenced`].
 pub async fn upsert(
     transport: &dyn IntraCellHttpTransport,
     permit: &CellAccessPermit,
     collection: &str,
     points: &[(PointId, &IndexablePayload, Vec<f32>)],
     ha_profile: HaConsistencyProfile,
+) -> Result<(), QdrantTransportError> {
+    put_points(transport, permit, collection, points, ha_profile, None).await
+}
+
+/// ADR-0057 D-I: the projection worker's point write — one point, fenced on its own payload's
+/// `source_stream_seq` through Qdrant's `update_filter` (measured on server 1.19.0, the minimum
+/// this repo deploys). A stored point whose seq is higher than this payload's — a later ticket of
+/// the same home stream already wrote it — is left untouched; an absent point is inserted. Qdrant
+/// still answers `completed` on a refusal, so the refusal is silent by design: the newer state is
+/// the right one and the caller has nothing to do.
+pub async fn upsert_fenced(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+    point: (PointId, &IndexablePayload, Vec<f32>),
+    ha_profile: HaConsistencyProfile,
+) -> Result<(), QdrantTransportError> {
+    let fence = seq_fence(point.1.payload.source_stream_seq);
+    put_points(
+        transport,
+        permit,
+        collection,
+        &[point],
+        ha_profile,
+        Some(fence),
+    )
+    .await
+}
+
+/// ADR-0057 D-I: a point qualifies for a worker write when it carries no `source_stream_seq` or
+/// one `<=` the writer's ticket. Per-stream seqs are allocated under the checkpoint row lock
+/// (`remember::issue_stream_log_row`) and every ticket of a memory goes to its home stream
+/// (ADR-0057 D-M), so a higher stored seq is always a later ticket of the same memory. `lte`, not
+/// `lt`: a retry of the same ticket re-applies idempotently.
+fn seq_fence(seq: i64) -> Value {
+    json!({ "should": [
+        { "is_empty": { "key": SOURCE_STREAM_SEQ_FIELD } },
+        { "key": SOURCE_STREAM_SEQ_FIELD, "range": { "lte": seq } },
+    ] })
+}
+
+async fn put_points(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+    points: &[(PointId, &IndexablePayload, Vec<f32>)],
+    ha_profile: HaConsistencyProfile,
+    update_filter: Option<Value>,
 ) -> Result<(), QdrantTransportError> {
     validate_collection(collection)?;
     let points_json: Vec<Value> = points
@@ -1468,7 +1516,10 @@ pub async fn upsert(
             body
         })
         .collect();
-    let body = json!({ "points": points_json });
+    let mut body = json!({ "points": points_json });
+    if let Some(filter) = update_filter {
+        body["update_filter"] = filter;
+    }
     call(
         transport,
         permit,
@@ -1487,15 +1538,20 @@ pub async fn upsert(
 /// that stopped being live. Same `wait=true` + `ordering` controls as [`upsert`]; the caller
 /// passes the §17.5 correction/delete/supersede profile (strong ordering, so a concurrent
 /// weak-ordered upsert of the same id cannot land after the delete).
+/// ADR-0057 D-I: the mirror of [`upsert_fenced`] — only ids whose stored `source_stream_seq` is
+/// absent or `<= fence_seq` (the deleting ticket's seq) are deleted, so a stalled worker cannot
+/// delete a point a later ticket revived. Silent like the upsert fence.
 pub async fn delete_points(
     transport: &dyn IntraCellHttpTransport,
     permit: &CellAccessPermit,
     collection: &str,
     points: &[PointId],
+    fence_seq: i64,
     ha_profile: HaConsistencyProfile,
 ) -> Result<(), QdrantTransportError> {
     validate_collection(collection)?;
-    let body = json!({ "points": points.iter().map(|id| id.to_json()).collect::<Vec<_>>() });
+    let ids = points.iter().map(|id| id.to_json()).collect::<Vec<_>>();
+    let body = json!({ "filter": { "must": [{ "has_id": ids }, seq_fence(fence_seq)] } });
     call(
         transport,
         permit,

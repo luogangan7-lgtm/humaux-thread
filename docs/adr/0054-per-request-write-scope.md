@@ -11,6 +11,14 @@
   D-B (PROVISIONING write gate, 55000 → CONFLICT), ADR-0053 D-E (initialised ledger key).
 - Closes: `docs/ops/system_audit_20260926.md` C5 ("governance ops only work for the bootstrap
   (tenant, workspace)"); delivery_point_report §6 gains §6.14 "Closed by card 29".
+- Amended by ADR-0057 D-M (card 31, 2026-10-02): the request's (tenant, workspace) still
+  authorizes every write, but a `MEMORY_LIFECYCLE` ticket no longer lands on the request stream. It
+  goes to the target memory's **home stream** — the workspace stream of its PRIMARY Evidence's first
+  ticket, the family that holds its point — through `memory_governance_repo::home_stream`; `correct`
+  homes E2 and M2 with M1. A home other than the request stream must already be provisioned, else
+  `DEPENDENCY_UNAVAILABLE`. Consistency tokens name the stream the ticket landed on. D-A's sentence
+  "the ticket lands on the derived stream" is superseded for lifecycle tickets; it still holds for
+  `remember.put` and for confirm-token binding.
 
 ## Context (read on `403cb43`)
 

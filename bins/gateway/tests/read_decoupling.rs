@@ -189,6 +189,7 @@ fn gateway(handle: &Handle) -> Gateway {
         )
         .expect("registered profile"),
         &policy,
+        std::time::Duration::from_secs(60),
     )
     .expect("actual executable identity");
     let runtime = handle

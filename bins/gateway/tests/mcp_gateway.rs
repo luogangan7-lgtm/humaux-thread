@@ -21,7 +21,8 @@
 //!   HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
 //!   HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST, HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS,
 //!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES, HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS,
-//!   HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN,
+//!   HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_GATEWAY_REMEMBER_DATA_CLASS,
+//!   HUMAUX_GATEWAY_REMEMBER_DOMAIN,
 //!   HUMAUX_GATEWAY_REMEMBER_EVENT_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND,
 //!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION, HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID,
 //!   HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND,
@@ -159,6 +160,7 @@ fn final_completeness_count() -> u64 {
         "pipeline_count_mismatch",
         "mandatory_not_satisfied",
         "no_serving_projection",
+        "projection_lag",
     ];
     [
         "exact",
@@ -279,6 +281,7 @@ fn application_with_budget(
         )
         .expect("registered profile"),
         &policy,
+        std::time::Duration::from_secs(60),
     )
     .expect("actual executable identity");
     GatewayMcpApplication::new(
@@ -677,9 +680,35 @@ fn seed_semantic_projection_ledger(handle: &mut Handle, n: i64) {
     }
 }
 
-/// One settled `DONE` seq plus the highwater that admits it. Used on its own to force §23.1②'s
-/// A2 `<` side: a row with no Qdrant point behind it is exactly an invisible loss.
+/// ADR-0057 D-A: one settled EVIDENCE_ACCEPTED ticket per record, seqs `1..=n`, each reaching
+/// its record's memory through `ops.outbox` → PRIMARY `memory_evidence` — the path the A2 point
+/// reading (`projection.stream_point_ledger`) counts. Rows seeded by
+/// [`seed_semantic_projection_ledger`] reach no memory and so add no point. Because these rows
+/// do carry an outbox row, the serving `projection_highwater` is raised to `n`: they stand for
+/// already-projected points, so §15.5's RYW overlay (which starts above that watermark) must not
+/// carry them.
+fn seed_semantic_projection_ledger_of(handle: &mut Handle, records: &[&ScopedContextRecord]) {
+    for (i, record) in records.iter().enumerate() {
+        seed_ledger_row(handle, i as i64 + 1, Some(record.evidence_id));
+    }
+    let n = records.len() as i64;
+    handle
+        .admin
+        .execute(
+            "UPDATE projection.stream_checkpoints SET projection_highwater=$3 \
+             WHERE tenant_id=$1 AND scope_kind='workspace' AND scope_id=$2 \
+               AND domain='knowledge' AND projection_kind='ingest' AND projection_version='v1'",
+            &[&handle.tenant_id, &handle.workspace_id, &n],
+        )
+        .expect("owner marks the linked rows as projected");
+}
+
+/// One settled `DONE` seq plus the highwater that admits it, reaching no memory.
 fn seed_semantic_projection_ledger_row(handle: &mut Handle, seq: i64) {
+    seed_ledger_row(handle, seq, None);
+}
+
+fn seed_ledger_row(handle: &mut Handle, seq: i64, evidence: Option<Uuid>) {
     let commit_seq: i64 = handle
         .admin
         .query_one("SELECT nextval('ops.commit_seq_seq')", &[])
@@ -695,6 +724,16 @@ fn seed_semantic_projection_ledger_row(handle: &mut Handle, seq: i64) {
             &[&handle.tenant_id, &handle.workspace_id, &seq, &commit_seq],
         )
         .expect("owner seeds the semantic fixture's settled ledger row");
+    if let Some(evidence_id) = evidence {
+        handle
+            .admin
+            .execute(
+                "INSERT INTO ops.outbox (tenant_id, commit_seq, stream_seq, event_type, evidence_id, status) \
+                 VALUES ($1, $2, $3, 'EVIDENCE_ACCEPTED', $4, 'DONE')",
+                &[&handle.tenant_id, &commit_seq, &seq, &evidence_id],
+            )
+            .expect("owner links the ledger row to its Evidence");
+    }
     set_semantic_issued_highwater(handle, seq);
 }
 
@@ -1897,8 +1936,9 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
             let second_updated = seed_semantic_registry_row(&mut handle, &second, second_point);
             let third_updated = seed_semantic_registry_row(&mut handle, &third, third_point);
             seed_semantic_checkpoint(&mut handle);
-            // Card 18: three points, three settled ledger rows — §23.1②'s A2 has both sides.
-            seed_semantic_projection_ledger(&mut handle, 3);
+            // Card 18: three points, three settled ledger rows — §23.1②'s A2 has both sides
+            // (ADR-0057 D-A: each row reaches its memory, so the point reading is 3 as well).
+            seed_semantic_projection_ledger_of(&mut handle, &[&first, &second, &third]);
 
             let cell = CellId(Uuid::now_v7());
             let registry =
@@ -2114,11 +2154,24 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 assert_eq!(no_token["pipeline"]["knowledge"]["failed"], 0, "{no_token}");
                 assert_eq!(no_token["pipeline"]["projection"]["expected"], 3, "{no_token}");
 
-                // A2 InvisibleLoss, forced: one more settled ledger row with no point behind it.
-                // The ratio must MOVE and stay a number — "cannot_establish" would hide the loss
-                // and a null ratio would be the pre-card-18 answer wearing a new reason.
+                // A2 InvisibleLoss, forced: one more settled ledger row whose memory has no point
+                // behind it (ADR-0057 D-A: the loss is counted in points, so the row must reach a
+                // memory). The ghost memory is archived and unbound so the later legs' enumerate
+                // and context counts stay at the fixture's three. The ratio must MOVE and stay a
+                // number — "cannot_establish" would hide the loss and a null ratio would be the
+                // pre-card-18 answer wearing a new reason.
                 tokio::task::block_in_place(|| {
-                    seed_semantic_projection_ledger_row(&mut handle, 4);
+                    let ghost = handle.seed_workspace_visible_context_record();
+                    handle
+                        .admin
+                        .batch_execute(&format!(
+                            "UPDATE private.memory_records SET archived_at = clock_timestamp() \
+                              WHERE memory_id = '{0}'; \
+                             DELETE FROM private.context_bindings WHERE context_binding_id = '{1}';",
+                            ghost.memory_id, ghost.binding_id
+                        ))
+                        .expect("owner archives and unbinds the ghost memory");
+                    seed_ledger_row(&mut handle, 4, Some(ghost.evidence_id));
                 });
                 let (status, lossy) = recall_call(
                     address,
@@ -2621,8 +2674,10 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                 .await;
                 assert_eq!(status, 200, "in-flight pipeline: {inflight}");
                 let inflight = enumerate_result(&inflight)["content"].clone();
+                // ADR-0057 D-A: the ratio is counted in points and this ticket reaches no
+                // memory, so it stays where it was (1.0) rather than the ticket-unit 3/4.
                 assert_eq!(
-                    inflight["pipeline"]["projection"]["completeness_ratio"], 0.75,
+                    inflight["pipeline"]["projection"]["completeness_ratio"], 1.0,
                     "A1/A2 still hold — this fault is in the knowledge layer, not §23.1②: \
                      {inflight}"
                 );
@@ -2684,8 +2739,9 @@ fn native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance() {
                         faulted
                     };
                     assert_eq!(
-                        faulted["pipeline"]["projection"]["completeness_ratio"], 0.75,
-                        "A1/A2 still hold — the fault is in the knowledge layer: {faulted}"
+                        faulted["pipeline"]["projection"]["completeness_ratio"], 1.0,
+                        "A1/A2 still hold (point ratio, ADR-0057 D-A) — the fault is in the \
+                         knowledge layer: {faulted}"
                     );
                     assert_eq!(faulted["pipeline"]["evidence"]["persisted"], 4, "{faulted}");
                     assert_eq!(faulted["pipeline"]["knowledge"]["eligible"], 4, "{faulted}");
@@ -3827,7 +3883,7 @@ fn recall_everyday_queries_are_answered_by_dense_with_lane_substituted() {
                 &mut handle,
                 vec![(semantic_vector("operation receipt scoped context"), false)],
             );
-            seed_semantic_projection_ledger(&mut handle, 1);
+            seed_semantic_projection_ledger_of(&mut handle, &[&points[0].record]);
             // A fixed UUID keeps the leg reproducible; since ADR-0056 a random one (a 7+ digit run)
             // is no longer refused, see
             // `recall_answers_identifier_bearing_queries_and_refuses_a_credential_query`.
@@ -5519,6 +5575,7 @@ impl GatewayProcessConfig {
                 "300".into(),
             ),
             ("HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS".into(), "86400".into()),
+            ("HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS".into(), "60".into()),
             (
                 "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS".into(),
                 "21600".into(),

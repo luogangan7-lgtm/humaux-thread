@@ -2,17 +2,17 @@
 //!   onto `private.memory_affects` ([`annotate`]) and the ONE set-based read ([`AFFECTS_FOR_MEMORIES_SQL`] /
 //!   [`affects_for_memories_in_txn`]) every reader shares — the PG hydrate re-check (`read_materialize`), the
 //!   projection worker's payload build, and `memory.get` / `memory.enumerate` / the recall rerank.
-//! Depends-on: crates=[humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time]; services=[PostgreSQL(any) r=[private.memory_evidence, private.memory_records] w=[private.evidence_affects, private.memory_affects]]; env=[]; modules=[adapters::confirm_token_repo, adapters::postgres, adapters::remember, adapters::subject_repo, application::affect, domain::affect, domain::authority, domain::error, domain::identity, domain::subject, projection::stream]
+//! Depends-on: crates=[humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time]; services=[PostgreSQL(any) r=[private.memory_evidence, private.memory_records] w=[private.evidence_affects, private.memory_affects]]; env=[]; modules=[adapters::confirm_token_repo, adapters::memory_governance_repo, adapters::postgres, adapters::remember, adapters::subject_repo, application::affect, domain::affect, domain::authority, domain::error, domain::identity, domain::subject, projection::stream]
 //! Called-by: [adapters::memory_governance_repo, adapters::projection_worker, adapters::read_materialize, adapters::remember, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, tests]
 //! Invariants: [affect rows are INSERT-only through insert_in_txn and never decayed on write; everything runs under
 //!   the caller's role + RLS, so another tenant's memory is NOT_FOUND like an unknown id; a PG error propagates as
-//!   ErrorCode, no fallback]
-//! Spec: Baseline §60
+//!   ErrorCode, no fallback; the annotate re-projection ticket lands on the memory's home stream (ADR-0057 D-M)]
+//! Spec: Baseline §60; ADR-0057
 //!
 //! Rows are immutable (0156 owner trigger; no UPDATE/DELETE grant): a write is INSERT-only through
 //! the ONE row issuer [`insert_in_txn`] (`memory.annotate_affect` on its own transaction,
 //! `memory.correct` inside `correct_atomically`, `remember.put` inside `remember_in_txn` onto the
-//! 0157 `evidence_affects` carrier) and, for a live memory, ends with one `MEMORY_LIFECYCLE` ticket on the memory's stream (the §60 issuers `remember`
+//! 0157 `evidence_affects` carrier) and, for a live memory, ends with one `MEMORY_LIFECYCLE` ticket on the memory's home stream (ADR-0057 D-M; the §60 issuers `remember`
 //! owns, verbatim — the same ticket `memory.supersede`/`restore`/`archive` issue) so the worker
 //! re-projects the SAME deterministic point with the fresh affect payload. Decay is never
 //! written: [`observed`] derives `effective_intensity(now)` from the raw row at read time.
@@ -344,7 +344,9 @@ pub async fn insert_in_txn(
 
 /// `memory.annotate_affect` (ADR-0030 D-C) — appends `inputs` to the visible, active head memory
 /// `memory_id` in one transaction and issues one `MEMORY_LIFECYCLE` re-projection ticket bound
-/// to the memory's PRIMARY Evidence (also the rows' provenance `evidence_id`). Refusals, in
+/// to the memory's PRIMARY Evidence (also the rows' provenance `evidence_id`), on the memory's
+/// home stream (`memory_governance_repo::home_stream`; `stream` is the request's, the fallback
+/// for a never-projected memory and the source of tenant / domain / kind / version). Refusals, in
 /// order and with nothing written: unknown / another tenant's / archived-but-invisible memory
 /// ⇒ `NOT_FOUND`; a superseded or non-active version ⇒ `CONFLICT` (annotate the head); unknown
 /// `target_subject` id/key ⇒ `INVALID_INPUT`. `mood_half_life` is the frozen policy stamped onto
@@ -403,10 +405,13 @@ pub async fn annotate(
 
     // Re-projection: the payload's affect fields are written only when the worker (re)projects
     // the row — same mechanism as 0155's back-fill and every governance write.
+    // ADR-0057 D-M (W3): on the memory's home stream, not the request's — a W2-routed ticket
+    // would write a duplicate point into W2's family that no later W1 retire ever reaches.
+    let stream = crate::memory_governance_repo::home_stream(&mut txn, stream, evidence_id).await?;
     let commit_seq = remember::next_commit_seq(&mut txn)
         .await
         .map_err(remember_error)?;
-    let stream_seq = remember::issue_stream_log_row(&mut txn, stream, commit_seq)
+    let stream_seq = remember::issue_stream_log_row(&mut txn, &stream, commit_seq)
         .await
         .map_err(remember_error)?;
     remember::insert_outbox(

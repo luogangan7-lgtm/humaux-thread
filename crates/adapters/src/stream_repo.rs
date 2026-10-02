@@ -4,16 +4,18 @@
 //! Depends-on: crates=[humaux-domain, humaux-projection, humaux-retrieval, humaux-testkit, sqlx, tokio];
 //!   services=[PostgreSQL(any)
 //!   r=[ops.jobs, projection.processing_gaps] w=[projection.stream_checkpoints, projection.stream_log]
-//!   x=[projection.retire_failed_ticket], PostgreSQL(role_maintenance), PostgreSQL(role_retrieval_worker)
-//!   x=[projection.claim_issued_tickets, projection.unplaced_issued_tickets]]; env=[HUMAUX_TEST_PG_DSN];
-//!   modules=[adapters::placement_repo, adapters::postgres, adapters::qdrant, adapters::retrieve, domain::egress,
+//!   x=[projection.retire_failed_ticket, projection.stream_point_ledger], PostgreSQL(role_maintenance),
+//!   PostgreSQL(role_retrieval_worker) x=[projection.claim_issued_tickets, projection.unplaced_issued_tickets]];
+//!   env=[HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::placement_repo, adapters::postgres, adapters::qdrant, adapters::retrieve, domain::dataclass, domain::egress, domain::identity,
 //!   projection::stream, retrieval::completeness]
 //! Called-by: [adapters::context_repo, adapters::projection_worker, adapters::retrieve, adapters::serving_repo, retrieval-worker::main, tests, xtask::projection_serve]
 //! Invariants: [every function opens its own transaction and sets humaux.tenant_id before touching FORCE-RLS stream
 //!   tables (otherwise it would silently see zero rows) — except the two ADR-0052 definer calls, which are the only
 //!   cross-tenant reads/claims of stream_log; every settle/retry/release write is fenced on (lease_owner, attempts), so
-//!   a worker whose lease was reclaimed writes 0 rows; consistency arithmetic lives in humaux_projection::stream]
-//! Spec: Baseline §6.2.0; §11; §15.2; ADR-0052
+//!   a worker whose lease was reclaimed writes 0 rows; consistency arithmetic lives in humaux_projection::stream;
+//!   A2's point reading and the projection-lag age are read in the ledger's snapshot (ADR-0057 D-L/D-D)]
+//! Spec: Baseline §6.2.0; §11; §15.2; §23.1②; ADR-0052; ADR-0057
 //!
 //! The consistency arithmetic itself lives in
 //! `humaux_projection::stream` (no IO, unit-tested there); this module only fetches the
@@ -34,11 +36,13 @@
 use sqlx::Row;
 use sqlx::types::Uuid;
 
+use humaux_domain::dataclass::DataClass;
 use humaux_domain::egress::ProcessorId;
+use humaux_domain::identity::AuthorizationScope;
 use humaux_projection::stream::{Inconsistent, StreamKey, StreamLedgerSnapshot};
 use humaux_retrieval::completeness::{
     LedgerClosure,
-    ledger::{self, LedgerReads},
+    ledger::{self, LedgerReads, ProjectionReads},
 };
 
 use crate::postgres::{MaintenanceDbPool, RetrievalWorkerDbPool};
@@ -235,6 +239,7 @@ async fn fetch_snapshot_in_txn(
 pub(crate) async fn close_ledger_in_txn(
     txn: &mut Txn<'_>,
     key: &StreamKey,
+    authorization: &AuthorizationScope,
 ) -> Result<LedgerClosure, sqlx::Error> {
     let snapshot = fetch_snapshot_in_txn(txn, key).await?;
     // §23.1② A2 is `visible + deleted + skipped == done`, so EVERY state inside `done` must
@@ -247,11 +252,18 @@ pub(crate) async fn close_ledger_in_txn(
     // recall on a stream that ever had one retirement abstain with `ProjectionInvisibleLoss`
     // forever, which is the read-side failure 0167's own header analysed only for the §15.4
     // prefix. §23.1② amended with this citation.
+    // ADR-0057 D-D: WAITING_KEY excluded (its own DOD-014 signal); backoff included. DB clock:
+    // `now()` is this snapshot's transaction start, so the age and the counts share one instant.
+    // ponytail: one poison ticket retrying past the threshold makes its whole family lag until it
+    // goes FAILED (ADR-0057 known limit 5); tune PROJECTION_LAG_SECONDS, per-ticket exclusion if it bites.
     let row = bind_key(
         sqlx::query(&format!(
             "SELECT count(*) FILTER (WHERE state = 'TOMBSTONED') AS deleted, \
                     count(*) FILTER (WHERE state IN ('SKIPPED_BY_POLICY','RETIRED_FAILED')) \
-                      AS skipped \
+                      AS skipped, \
+                    floor(EXTRACT(EPOCH FROM now() - min(issued_at) \
+                      FILTER (WHERE state IN ('ISSUED','PROCESSING','RETRY_WAIT'))))::bigint \
+                      AS oldest_pending_age_secs \
              FROM projection.stream_log WHERE {KEY_WHERE}"
         )),
         key,
@@ -260,14 +272,50 @@ pub(crate) async fn close_ledger_in_txn(
     .await?;
     let deleted = row.try_get::<i64, _>("deleted")? as u64;
     let skipped = row.try_get::<i64, _>("skipped")? as u64;
-    Ok(ledger::close(LedgerReads {
-        expected: snapshot.expected,
-        done: snapshot.done,
-        deleted,
-        skipped,
-        open_gaps: snapshot.open_gaps,
-        pending: snapshot.pending,
-    }))
+    let oldest_pending_age_secs = row
+        .try_get::<Option<i64>, _>("oldest_pending_age_secs")?
+        // NULL (nothing pending) must stay `None` — SQL `GREATEST` would turn it into 0. A ticket
+        // committed after this snapshot began reads a negative age, clamped to 0 here.
+        .map(|age| age.max(0) as u64);
+    // §23.1② (ADR-0057 D-L): the point reading through the definer, in this same snapshot. It
+    // applies the caller's §6.1 visibility (user from the GUC the caller installed, workspace arm
+    // narrowed to `allowed_workspace_ids`) — the predicate the Qdrant count applies — but not the
+    // 0155 subject term the caller's own RLS view would add and Qdrant cannot mirror.
+    let workspace_ids: Vec<Uuid> = authorization
+        .allowed_workspace_ids()
+        .iter()
+        .map(|w| w.0)
+        .collect();
+    let points = bind_key(
+        sqlx::query(
+            "SELECT points_expected, points_settled, points_in_flight, points_unsettled \
+               FROM projection.stream_point_ledger($1, $2, $3, $4, $5, $6, $7, $8)",
+        ),
+        key,
+    )
+    .bind(DataClass::SecretMaterial.as_str())
+    .bind(workspace_ids)
+    .fetch_one(&mut **txn)
+    .await?;
+    let count =
+        |column: &str| -> Result<u64, sqlx::Error> { Ok(points.try_get::<i64, _>(column)? as u64) };
+    Ok(ledger::close(
+        LedgerReads {
+            expected: snapshot.expected,
+            done: snapshot.done,
+            deleted,
+            skipped,
+            open_gaps: snapshot.open_gaps,
+            pending: snapshot.pending,
+        },
+        ProjectionReads {
+            points_expected: count("points_expected")?,
+            points_settled: count("points_settled")?,
+            points_in_flight: count("points_in_flight")?,
+            points_unsettled: count("points_unsettled")?,
+            oldest_pending_age_secs,
+        },
+    ))
 }
 
 /// Public, read-only entry point for [`fetch_snapshot_in_txn`]: opens its own tenant-scoped
@@ -293,14 +341,27 @@ pub async fn fetch_ledger_snapshot(
 /// for an out-of-band reader (ops, and the closure tests that must exercise the REAL counting
 /// query rather than a fixture's copy of it — a copy is how the `RETIRED_FAILED` A2 hole got
 /// past every existing envelope test).
+///
+/// `authorization` is the reader whose visibility the A2 point reading applies (ADR-0057 D-L):
+/// its user is installed as `humaux.user_id` for this transaction only.
 pub async fn fetch_ledger_closure(
     pool: &RetrievalWorkerDbPool,
     key: &StreamKey,
+    authorization: &AuthorizationScope,
 ) -> Result<LedgerClosure, StreamRepoError> {
     // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `fetch_ledger_closure`
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, key.tenant_id.0).await?;
-    let closure = close_ledger_in_txn(&mut txn, key).await?;
+    sqlx::query("SELECT set_config('humaux.user_id', $1, true)")
+        .bind(
+            authorization
+                .user_id()
+                .map(|u| u.0.to_string())
+                .unwrap_or_default(),
+        )
+        .execute(&mut *txn)
+        .await?;
+    let closure = close_ledger_in_txn(&mut txn, key, authorization).await?;
     txn.commit().await?;
     Ok(closure)
 }

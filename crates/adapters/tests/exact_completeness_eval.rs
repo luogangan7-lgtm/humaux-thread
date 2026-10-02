@@ -489,14 +489,18 @@ fn real_registry_entry(f: &mut Fixture) -> PredicateEntry {
 }
 
 fn closed_ledger() -> LedgerClosure {
-    ledger::close(ledger::LedgerReads {
-        expected: 1,
-        done: 1,
-        deleted: 0,
-        skipped: 0,
-        open_gaps: 0,
-        pending: 0,
-    })
+    // classify() reads A1 only; the A2 point reading is irrelevant here (ADR-0057 D-A).
+    ledger::close(
+        ledger::LedgerReads {
+            expected: 1,
+            done: 1,
+            deleted: 0,
+            skipped: 0,
+            open_gaps: 0,
+            pending: 0,
+        },
+        ledger::ProjectionReads::default(),
+    )
 }
 
 /// The quantifier query matching migration 0077's seeded surface pattern.
@@ -534,8 +538,14 @@ fn component_exact_outcome(
     decision: &PlannerDecision,
     census: &CensusResult,
 ) -> Result<ComponentExactOutcome, String> {
-    let (class_label, reason_label) =
-        classify_for_witness(decision, LaneStatus::Ok, census, &closed_ledger(), 0);
+    let (class_label, reason_label) = classify_for_witness(
+        decision,
+        LaneStatus::Ok,
+        census,
+        &closed_ledger(),
+        0,
+        std::time::Duration::from_secs(60),
+    );
     let exact = match (class_label, census.enumeration()) {
         ("exact", Some(enumeration)) => Some(component_exact_report(enumeration)),
         ("exact", None) => {

@@ -257,14 +257,27 @@ fn read_ledger(admin: &mut Client, k: &StreamKey) -> LedgerClosure {
         )
         .expect("processing_gaps count")
         .get(0);
-    ledger::close(LedgerReads {
+    let reads = LedgerReads {
         expected: expected as u64,
         done: row.get::<_, i64>(0) as u64,
         deleted: row.get::<_, i64>(1) as u64,
         skipped: row.get::<_, i64>(2) as u64,
         open_gaps: open_gaps as u64,
         pending: row.get::<_, i64>(3) as u64,
-    })
+    };
+    // ADR-0057 D-A: A2 compares points with points. This fixture writes one synthetic point per
+    // ticket and no memory rows, so its point reading is the ticket terms one-for-one (the
+    // definer itself is exercised against real memories in `a2_point_identity.rs`).
+    ledger::close(
+        reads,
+        ledger::ProjectionReads {
+            points_expected: reads.expected - reads.deleted,
+            points_settled: reads.done - reads.deleted - reads.skipped,
+            points_in_flight: reads.pending,
+            points_unsettled: 0,
+            oldest_pending_age_secs: None,
+        },
+    )
 }
 
 fn cleanup(admin: &mut Client, tenant_id: Uuid) {
@@ -489,7 +502,7 @@ fn visible_index_count_is_the_live_denominator_input() {
         Some(TOTAL as u64),
         "a healthy serving projection must report a real count, not None"
     );
-    let out = build_projection_block(&closure, healthy);
+    let out = build_projection_block(&closure, healthy, std::time::Duration::from_secs(60));
     assert_eq!(out.value.visible, Some(TOTAL as u64));
     assert_eq!(
         out.value.completeness_ratio,
@@ -518,14 +531,14 @@ fn visible_index_count_is_the_live_denominator_input() {
         "§4.4 坑5: 0 would claim the index is empty, which is a different (false) statement"
     );
     assert!(
-        build_projection_block(&closure, no_serving)
+        build_projection_block(&closure, no_serving, std::time::Duration::from_secs(60))
             .value
             .completeness_ratio
             .is_none(),
         "and it must reach the envelope as cannot_establish, not as a 0.0 ratio"
     );
     assert!(
-        VisibleCountFilter::new(&scope, "").is_none(),
+        VisibleCountFilter::family_probe(&scope, workspace_id, "").is_none(),
         "an empty version string must not stand in for \"no version filter\" either"
     );
 
@@ -602,7 +615,11 @@ fn visible_index_count_is_the_live_denominator_input() {
         (TOTAL - TOMBSTONED) as u64,
         "the overlay must exclude the 10 tombstoned points that are still physically indexed"
     );
-    let out = build_projection_block(&after_tombstone, Some(overlaid));
+    let out = build_projection_block(
+        &after_tombstone,
+        Some(overlaid),
+        std::time::Duration::from_secs(60),
+    );
     assert_eq!(out.value.completeness_ratio, Some(1.0));
     assert!(out.value.current);
     assert!(
@@ -614,7 +631,8 @@ fn visible_index_count_is_the_live_denominator_input() {
     // This is the card's named fault ("return a raw Qdrant count without subtracting the
     // tombstone overlay"): the only difference from leg 2 is `count` instead of
     // `count_visible_excluding_seqs`, and it must break leg 2's ratio assertion.
-    let filter = VisibleCountFilter::new(&scope, VERSION).expect("non-empty version");
+    let filter =
+        VisibleCountFilter::family_probe(&scope, workspace_id, VERSION).expect("non-empty version");
     let raw = rt
         .block_on(count(&transport, &permit, &collection, &filter))
         .expect("raw count");
@@ -622,7 +640,11 @@ fn visible_index_count_is_the_live_denominator_input() {
         raw, TOTAL as u64,
         "without the overlay the tombstoned points are still counted"
     );
-    let faulted = build_projection_block(&after_tombstone, Some(raw));
+    let faulted = build_projection_block(
+        &after_tombstone,
+        Some(raw),
+        std::time::Duration::from_secs(60),
+    );
     assert_ne!(
         faulted.value.completeness_ratio,
         Some(1.0),
@@ -661,7 +683,11 @@ fn visible_index_count_is_the_live_denominator_input() {
         ))
         .expect("count must still succeed");
     assert_eq!(lossy, (TOTAL - TOMBSTONED - RAW_DELETED) as u64);
-    let out = build_projection_block(&after_tombstone, Some(lossy));
+    let out = build_projection_block(
+        &after_tombstone,
+        Some(lossy),
+        std::time::Duration::from_secs(60),
+    );
     let ratio = out
         .value
         .completeness_ratio

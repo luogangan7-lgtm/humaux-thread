@@ -4,7 +4,8 @@
 //!   `run_once_bound` through the real `humaux_consolidation_worker::inference_client::UdsInferenceClient` against
 //!   the real MiniMax provider (ADR-0015).
 //! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-private-worker,
-//!   humaux-testkit, postgres, serde_json, tokio, uuid]; services=[PostgreSQL(role_consolidation_worker),
+//!   humaux-testkit, postgres, serde_json, tokio, uuid]; services=[PostgreSQL(owner) r=[ops.commit_seq_seq]
+//!   w=[ops.outbox, projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_consolidation_worker),
 //!   PostgreSQL(role_private_worker) r=[ops.data_disclosure_sources, ops.data_disclosures, ops.model_call_ledger,
 //!   ops.outbox, ops.private_inference_rpc_calls, private.memory_consolidation_runs, private.memory_rollup_subjects,
 //!   private.memory_rollups, projection.stream_log] w=[control.credentials, control.memberships,
@@ -1281,6 +1282,92 @@ fn t6_tenant_scoped_run_never_consumes_workspace_shared_inputs() {
         "T6 ASSERTION LOG: rollup={rollup_id} visibility={visibility_class} workspace={visibility_workspace_id:?} \
          inputs={} (only tenant memory {tenant_memory}) ticket_scope={ticket_scope:?}",
         inputs.len()
+    );
+}
+
+/// (T8) ADR-0057 D-M (W3): the rollup's re-projection ticket goes to the stream that created the
+/// source memory's point, not to the run's scope. The TENANT_SHARED source was projected on the
+/// fixture workspace W (its EVIDENCE_ACCEPTED ticket); a tenant-scoped run must still ticket W.
+/// Fault: `publish_rollup` issues on the run's key ⇒ the ticket lands on `('tenant', tenant_id)`,
+/// a second family that writes a duplicate point no W retire ever reaches.
+#[test]
+fn t8_rollup_ticket_goes_to_the_source_memorys_home_stream() {
+    let Some(mut f) = setup_db("t8_rollup_ticket_goes_to_the_source_memorys_home_stream") else {
+        return;
+    };
+    let (_memory, evidence) = seed_tenant_memory(&mut f, "t8 tenant memory homed in W");
+    let home = f.workspace_id;
+    // The source's first ticket: EVIDENCE_ACCEPTED on W's provisioned `v1` stream.
+    // dep: PostgreSQL(owner) — seeds the home stream the source memory was projected on
+    f.admin
+        .batch_execute(&format!(
+            "INSERT INTO projection.stream_checkpoints \
+               (tenant_id, scope_kind, scope_id, domain, projection_kind, projection_version, \
+                issued_highwater) \
+             VALUES ('{t}', 'workspace', '{home}', 'private_memory', 'PRIVATE_MEMORY', 'v1', 1); \
+             INSERT INTO projection.stream_log \
+               (tenant_id, scope_kind, scope_id, domain, projection_kind, projection_version, \
+                stream_seq, commit_seq) \
+             VALUES ('{t}', 'workspace', '{home}', 'private_memory', 'PRIVATE_MEMORY', 'v1', 1, \
+                     nextval('ops.commit_seq_seq')); \
+             INSERT INTO ops.outbox (tenant_id, commit_seq, stream_seq, event_type, evidence_id) \
+             SELECT '{t}', commit_seq, 1, 'EVIDENCE_ACCEPTED', '{evidence}' \
+               FROM projection.stream_log WHERE tenant_id = '{t}' AND scope_id = '{home}';",
+            t = f.tenant_id,
+        ))
+        .expect("seed the home stream ticket");
+
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let consolidation_pool = rt
+        // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
+        .block_on(ConsolidationDbPool::connect(&dsn_as_role(
+            &f.dsn,
+            "role_consolidation_worker",
+        )))
+        .expect("consolidation pool");
+    let outcome = rt.block_on(run_once_bound(
+        &consolidation_pool,
+        |_run_id| FakePort,
+        f.tenant_id,
+        f.reasoning_domain_id,
+        ReasoningRouteBindingId(UNADMITTED_BINDING_ID),
+        ReasoningRouteBindingVersion(1),
+        None,
+        10_000,
+        |inputs, _result| {
+            let sources = inputs
+                .iter()
+                .map(|input| (input.memory_id, input.evidence_id))
+                .collect();
+            Ok((
+                serde_json::json!({"content": "t8 tenant rollup"}),
+                AuthorityClass::PrivateKnowledge,
+                sources,
+            ))
+        },
+        None,
+    ));
+    assert!(
+        matches!(outcome, Ok(PublishOutcome::Published { .. })),
+        "T8 expected a published rollup, got: {outcome:?}"
+    );
+    let tickets: Vec<(String, Uuid, i64)> = f
+        .admin
+        .query(
+            "SELECT l.scope_kind, l.scope_id, l.stream_seq FROM projection.stream_log l \
+               JOIN ops.outbox o ON o.tenant_id = l.tenant_id AND o.commit_seq = l.commit_seq \
+              WHERE l.tenant_id = $1 AND o.event_type = $2",
+            &[&f.tenant_id, &ROLLUP_TICKET_EVENT_TYPE],
+        )
+        .expect("rollup tickets")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    println!("T8 ASSERTION LOG: home={home} rollup tickets={tickets:?}");
+    assert_eq!(
+        tickets,
+        vec![("workspace".to_owned(), home, 2)],
+        "the rollup ticket is the home stream's next seq, never a tenant-scope family"
     );
 }
 

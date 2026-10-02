@@ -198,6 +198,7 @@ pub(crate) async fn get<T>(
         false,
         archived,
         visible,
+        bootstrap.projection_lag,
         // DirectGet has no enumerable universe (§23.3④) — see `accept_memory_envelope`.
         None,
         accept,
@@ -312,6 +313,7 @@ pub(crate) async fn enumerate<T>(
         pagination.next_cursor.is_some(),
         false,
         visible,
+        bootstrap.projection_lag,
         enumeration,
         |content| {
             accept(EnumerationResult {
@@ -327,8 +329,9 @@ pub(crate) const ENUMERATION_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// §36 `memory.supersede`, second (confirmed) call. The write stream is derived per request
 /// (`write_scope`, ADR-0054 D-A: principal tenant + the guard-routed workspace, provisioned
-/// pairs only) so the lifecycle ticket lands on the stream whose ledger that pair's reads
-/// consult.
+/// pairs only) and authorizes the write; the lifecycle ticket itself lands on the target's home
+/// stream — the workspace stream that projected its point (ADR-0057 D-M) — which is the request
+/// stream unless the target was projected from another workspace.
 pub(crate) async fn supersede(
     pool: Arc<RuntimeDbPool>,
     write: ConfirmedWrite,
@@ -588,8 +591,9 @@ impl From<AnnotateDone> for AnnotateResult {
 
 /// §8.5.1 / ADR-0030 D-C `memory.annotate_affect`: appends immutable affect rows to the visible
 /// active head `memory_id` (provenance = its PRIMARY Evidence) and issues the re-projection
-/// ticket on the request's own (tenant, workspace) stream (`write_scope`, ADR-0054);
-/// the tenant is the credential's. Not confirm-gated: nothing is deleted, superseded or hidden.
+/// ticket on the memory's home stream (ADR-0057 D-M; `write_scope`'s (tenant, workspace) stream
+/// authorizes and is the fallback for a never-projected memory, ADR-0054), so `stream_seq` is a
+/// seq of that home stream; the tenant is the credential's. Not confirm-gated: nothing is deleted, superseded or hidden.
 /// Also the sole path `memory.correct {affects}` re-supplies the new version's affects through.
 pub(crate) async fn annotate_affect(
     pool: Arc<RuntimeDbPool>,
@@ -821,6 +825,7 @@ fn accept_memory_envelope<T>(
     truncated: bool,
     archived: bool,
     visible: Option<u64>,
+    lag_threshold: Duration,
     // `Some` only for `memory.enumerate` (ADR-0041): the §22.1 census this page's manifest was
     // minted under plus the §23.3④ `stream_ledger` pipeline counts read in that same snapshot.
     enumeration: Option<EnumerationCensus>,
@@ -846,7 +851,7 @@ fn accept_memory_envelope<T>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let returned = u32::try_from(items.len()).map_err(|_| ErrorCode::Internal)?;
-    let projection = build_projection_block(&materialized.ledger, visible);
+    let projection = build_projection_block(&materialized.ledger, visible, lag_threshold);
     let (census, pipeline) = match enumeration {
         // §22.1/§23.3④ (ADR-0041, card 19): `memory.enumerate` counted its own authorized
         // universe and read the stream ledger's evidence/knowledge counts in that same
@@ -898,6 +903,7 @@ fn accept_memory_envelope<T>(
             visible,
             context: None,
             mandatory_missing: 0,
+            lag_threshold,
         },
         |final_outcome| {
             accept(Envelope {

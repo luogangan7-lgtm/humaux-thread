@@ -40,6 +40,7 @@ use humaux_infra_cell::{
     ResourceEntry, authorize_cell_access,
 };
 use humaux_projection::card::EgressDisposition;
+use humaux_projection::dense::build_stream_count_filter;
 use sqlx::types::time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -463,20 +464,40 @@ fn read_your_write_strict_path_uses_quorum_or_stronger_read_consistency() {
 #[test]
 fn visible_count_filter_refuses_an_empty_projection_version() {
     let s = scope(TenantId::new(), &[]);
-    assert!(VisibleCountFilter::new(&s, "").is_none());
+    assert!(VisibleCountFilter::family_probe(&s, WorkspaceId::new(), "").is_none());
 }
 
 #[test]
 fn count_body_is_exact_and_carries_the_projection_version_clause() {
     let s = scope(TenantId::new(), &[]);
-    let filter = VisibleCountFilter::new(&s, "card-v2").expect("non-empty version");
+    let workspace = WorkspaceId::new();
+    let filter =
+        VisibleCountFilter::family_probe(&s, workspace, "card-v2").expect("non-empty version");
     let body = count_body(&filter);
     assert_eq!(body["exact"], true);
     let must = body["filter"]["must"].as_array().expect("must array");
-    // tenant clause + visibility disjunction + projection_version narrow_by term.
-    assert_eq!(must.len(), 3);
-    assert_eq!(must[2]["key"], "projection_version");
-    assert_eq!(must[2]["match"]["value"], "card-v2");
+    // tenant clause + visibility disjunction + workspace + projection_version narrow_by terms
+    // (ADR-0057 D-C: one stream, never tenant-wide).
+    assert_eq!(must.len(), 4);
+    assert_eq!(must[2]["key"], "workspace_id");
+    assert_eq!(must[2]["match"]["value"], workspace.0.to_string());
+    assert_eq!(must[3]["key"], "projection_version");
+    assert_eq!(must[3]["match"]["value"], "card-v2");
+}
+
+/// ADR-0057 D-C: the ops stream count carries tenant + workspace + version and no visibility
+/// disjunction (every visibility class of the stream counts).
+#[test]
+fn stream_count_body_has_no_visibility_disjunction() {
+    let (tenant, workspace) = (TenantId::new(), WorkspaceId::new());
+    let filter = VisibleCountFilter::from_stream(
+        build_stream_count_filter(tenant, workspace, "card-v2").expect("non-empty version"),
+    );
+    let body = count_body(&filter);
+    let must = body["filter"]["must"].as_array().expect("must array");
+    let keys: Vec<&str> = must.iter().filter_map(|c| c["key"].as_str()).collect();
+    assert_eq!(keys, ["tenant_id", "workspace_id", "projection_version"]);
+    assert!(must.iter().all(|c| c.get("should").is_none()), "{body}");
 }
 
 #[test]

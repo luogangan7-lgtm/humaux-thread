@@ -113,6 +113,7 @@ fn application(handle: &Handle, runtime: RuntimeDbPool) -> GatewayMcpApplication
         )
         .unwrap(),
         &policy,
+        std::time::Duration::from_secs(60),
     )
     .unwrap();
     GatewayMcpApplication::new(

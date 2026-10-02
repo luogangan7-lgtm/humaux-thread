@@ -12,7 +12,8 @@
 //!   HUMAUX_GATEWAY_EMBEDDING_VERSION, HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
 //!   HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST, HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS,
 //!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES,
-//!   HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS, HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_QDRANT_CIDR,
+//!   HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS, HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS,
+//!   HUMAUX_GATEWAY_QDRANT_CIDR,
 //!   HUMAUX_GATEWAY_QDRANT_HOST, HUMAUX_GATEWAY_QDRANT_PORT, HUMAUX_GATEWAY_QDRANT_TLS,
 //!   HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN, HUMAUX_GATEWAY_REMEMBER_EVENT_KIND,
 //!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION,
@@ -470,7 +471,11 @@ fn parse_context_bootstrap(
         .collect::<Result<BTreeMap<_, _>, BootstrapError>>()?;
     let profile = resolve_registered_retrieval_profile(&raw)
         .map_err(|_| BootstrapError::new("HUMAUX_GATEWAY_RETRIEVAL_*", "invalid profile"))?;
-    ContextBootstrap::new(budget, profile, write_policy)
+    let projection_lag = seconds(
+        required(effective, "HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS")?,
+        "HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS",
+    )?;
+    ContextBootstrap::new(budget, profile, write_policy, projection_lag)
         .map_err(|_| BootstrapError::new("gateway binary", "provenance unavailable"))
 }
 
@@ -642,6 +647,8 @@ fn registry() -> Vec<ConfigEntry> {
         ("CONFIRM_TOKEN_TTL_SECONDS", "u64", false),
         ("UNDO_WINDOW_SECONDS", "u64", false),
         ("MOOD_HALF_LIFE_SECONDS", "u64", false),
+        // §78.1: no default — boot-fatal when absent (ADR-0057 D-F, §22.4 projection lag).
+        ("PROJECTION_LAG_SECONDS", "u64", false),
         ("REMEMBER_SCOPE_KIND", "enum:workspace", false),
         ("REMEMBER_DOMAIN", "string", false),
         ("REMEMBER_PROJECTION_KIND", "string", false),
@@ -944,6 +951,7 @@ mod tests {
                 "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS" => "300".into(),
                 "HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS" => "86400".into(),
                 "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS" => "21600".into(),
+                "HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS" => "60".into(),
                 "HUMAUX_GATEWAY_REMEMBER_TENANT_ID" => tenant.to_string(),
                 "HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID" => workspace.to_string(),
                 "HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND" => "workspace".into(),
@@ -995,6 +1003,34 @@ mod tests {
         let mut values = raw();
         values.insert("HUMAUX_GATEWAY_BIND_ADDR".into(), "0.0.0.0:8080".into());
         assert!(GatewayBootstrap::from_raw(values).is_err());
+    }
+
+    /// ADR-0057 D-F (test 35): `PROJECTION_LAG_SECONDS` has no default — boot without it fails
+    /// naming the key, and zero is refused. Fault: give the registry entry a default.
+    #[test]
+    fn bootstrap_without_projection_lag_seconds_fails_naming_the_key() {
+        let key = "HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS";
+        assert!(
+            registry()
+                .iter()
+                .any(|entry| entry.name == key && entry.default.is_none()),
+            "{key} must be declared without a default"
+        );
+        let mut values = raw();
+        values.remove(key);
+        let error = GatewayBootstrap::from_raw(values)
+            .err()
+            .expect("boot must fail without the lag key");
+        assert!(error.to_string().contains(key), "{error}");
+
+        let mut values = raw();
+        values.insert(key.into(), "0".into());
+        let error = GatewayBootstrap::from_raw(values)
+            .err()
+            .expect("a zero lag threshold must be refused");
+        assert!(error.to_string().contains(key), "{error}");
+
+        assert!(GatewayBootstrap::from_raw(raw()).is_ok());
     }
 
     /// ADR-0054 D-D: the former default write pair is optional — the process boots without

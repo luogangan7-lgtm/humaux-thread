@@ -258,9 +258,10 @@ async fn upsert_then_search_visible_round_trips_over_real_qdrant() {
         // six below means a missing filter cannot hide behind the result limit.
         let tenant_id = TenantId::new();
         let user_id = UserId::new();
+        let workspace_id = WorkspaceId::new();
         let payload = QdrantPointPayload {
             tenant_id,
-            workspace_id: WorkspaceId::new(),
+            workspace_id,
             visibility_class: VisibilityClass::UserPrivate,
             visibility_user_id: Some(user_id),
             visibility_workspace_id: None,
@@ -350,7 +351,8 @@ async fn upsert_then_search_visible_round_trips_over_real_qdrant() {
             Some(user_id),
             BoundedSet::new(Vec::<WorkspaceId>::new()).expect("empty workspace set is valid"),
         );
-        let filter = VisibleCountFilter::new(&scope, "v1").expect("non-empty projection_version");
+        let filter = VisibleCountFilter::family_probe(&scope, workspace_id, "v1")
+            .expect("non-empty projection_version");
         let raw_count = count(&transport, &permit, &body_collection, &filter)
             .await
             .expect("count over the real transport must succeed");

@@ -2006,6 +2006,7 @@ mod tests {
             )
             .unwrap(),
             &policy,
+            std::time::Duration::from_secs(60),
         )
         .unwrap();
         GatewayMcpApplication::new(

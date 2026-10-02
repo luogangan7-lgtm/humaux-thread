@@ -1,9 +1,10 @@
 //! `adapters::tests::stream_repo` — T3.3+T3.4 integration test — `stream_repo` (§15) against a real Postgres.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, humaux-retrieval, humaux-testkit, postgres,
-//!   sqlx, tokio]; services=[PostgreSQL(owner) r=[projection.processing_gaps] w=[control.tenants, ops.jobs,
+//!   sqlx, tokio]; services=[PostgreSQL(owner) r=[projection.processing_gaps] w=[control.private_reasoning_domains, control.tenants,
+//!   ops.jobs, ops.outbox, private.events, private.evidence_objects, private.memory_evidence, private.memory_records,
 //!   projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_maintenance),
 //!   PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres, adapters::retrieve,
-//!   adapters::stream_repo, domain::egress, domain::ids, humaux-testkit, projection::stream, retrieval::completeness,
+//!   adapters::stream_repo, domain::egress, domain::identity, domain::ids, humaux-testkit, projection::stream, retrieval::completeness,
 //!   retrieval::envelope]
 //! Called-by: [cargo-test]
 //! Invariants: [advance_prefix/sweep_lost run per tenant under FORCE RLS on real projection tables scoped to a
@@ -23,7 +24,8 @@ use std::time::{Duration, SystemTime};
 use humaux_adapters::postgres::{MaintenanceDbPool, RetrievalWorkerDbPool};
 use humaux_adapters::stream_repo::{self, AdvanceError};
 use humaux_domain::egress::ProcessorId;
-use humaux_domain::ids::TenantId;
+use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
+use humaux_domain::ids::{TenantId, WorkspaceId};
 use humaux_projection::stream::StreamKey;
 use humaux_retrieval::completeness::LedgerClosure;
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
@@ -64,6 +66,14 @@ impl Drop for Handle {
         // schema/table of its own, only rows it created under its own throwaway tenant).
         let _ = self.admin.batch_execute(&format!(
             "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
+             DELETE FROM private.memory_evidence USING private.memory_records m \
+               WHERE memory_evidence.memory_id = m.memory_id AND m.tenant_id = '{0}'; \
+             DELETE FROM private.memory_records WHERE tenant_id = '{0}'; \
+             DELETE FROM private.events USING private.evidence_objects eo \
+               WHERE events.event_id = eo.evidence_id AND eo.tenant_id = '{0}'; \
+             DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
              DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
              DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}'; \
              DELETE FROM control.tenants WHERE tenant_id = '{0}';",
@@ -564,6 +574,78 @@ fn sweep_lost_sweeps_orphan_but_spares_owned_and_fresh_issued() {
 
 /// Seeds the §15.7 worked example in miniature — seq 1 `DONE`, seq 2 `FAILED` with a named
 /// `error_class`, seq 3 `DONE` — plus the checkpoint that claims all three were issued.
+/// One live TENANT_SHARED memory reached by the ticket at `seq` (seed rows use `commit_seq =
+/// stream_seq`): the Evidence, its outbox carrier and the memory with its PRIMARY link — what
+/// `projection.stream_point_ledger` (ADR-0057 D-L) joins through.
+fn attach_memory(handle: &mut Handle, seq: i64) {
+    let tenant = handle.tenant_id;
+    let domain: Uuid = handle
+        .admin
+        .query_one(
+            "INSERT INTO control.private_reasoning_domains (tenant_id, name) \
+             VALUES ($1, $2) RETURNING reasoning_domain_id",
+            &[&tenant, &format!("stream_repo point ledger {seq}")],
+        )
+        .expect("seed reasoning domain")
+        .get(0);
+    let evidence: Uuid = handle
+        .admin
+        .query_one(
+            "INSERT INTO private.evidence_objects (tenant_id, evidence_kind, payload_sha256, \
+               data_class, origin_class, visibility_class, reasoning_domain_id) \
+             VALUES ($1, 'EVENT', sha256(convert_to($2, 'UTF8')), 'INTERNAL', 'DirectUserInput', \
+               'TENANT_SHARED', $3) RETURNING evidence_id",
+            &[&tenant, &format!("{{\"seq\":{seq}}}"), &domain],
+        )
+        .expect("seed evidence")
+        .get(0);
+    handle
+        .admin
+        .execute(
+            "INSERT INTO private.events (event_id, event_kind, payload) VALUES ($1, 'USER_MESSAGE', '{}')",
+            &[&evidence],
+        )
+        .expect("seed event subtype");
+    handle
+        .admin
+        .execute(
+            "INSERT INTO ops.outbox (tenant_id, commit_seq, stream_seq, event_type, evidence_id) \
+             VALUES ($1, $2, $2, 'EVIDENCE_ACCEPTED', $3)",
+            &[&tenant, &seq, &evidence],
+        )
+        .expect("seed outbox carrier");
+    // §8.6: the memory and its evidence link commit together (deferred orphan check).
+    let mut txn = handle.admin.transaction().expect("owner txn");
+    let memory: Uuid = txn
+        .query_one(
+            "INSERT INTO private.memory_records (tenant_id, memory_type, content, visibility_class, \
+               authority_class, confidence, status, asserted_at) \
+             VALUES ($1, 'NOTE', '{\"title\":\"t\"}', 'TENANT_SHARED', 'PrivateKnowledge', 0.9, \
+               'active', now()) RETURNING memory_id",
+            &[&tenant],
+        )
+        .expect("seed memory")
+        .get(0);
+    txn.execute(
+        "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, ordinal) \
+         VALUES ($1, $2, 'PRIMARY', 0)",
+        &[&memory, &evidence],
+    )
+    .expect("link memory to its evidence");
+    txn.commit().expect("commit memory + link");
+}
+
+/// The reader of a ledger closure: the definer applies its §6.1 visibility (ADR-0057 D-L).
+/// TENANT_SHARED fixtures need no user.
+fn reader(handle: &Handle) -> AuthorizationScope {
+    AuthorizationScope::new(
+        TenantId(handle.tenant_id),
+        PrincipalId::new(),
+        None,
+        BoundedSet::new(Vec::<WorkspaceId>::new()).expect("empty workspace set is valid"),
+    )
+}
+
 fn seed_one_failed_between_two_done(handle: &mut Handle, k: &StreamKey, failure_class: &str) {
     let now = SystemTime::now();
     seed_log_row(&mut handle.admin, k, 1, "DONE", now);
@@ -707,13 +789,20 @@ fn a_retired_ticket_keeps_the_a2_closure_shut() {
                 ))
                 .expect("retire");
 
+            for seq in 1..=3 {
+                attach_memory(&mut handle, seq);
+            }
             let closure = handle
                 .rt
-                .block_on(stream_repo::fetch_ledger_closure(&handle.retrieval, &k))
+                .block_on(stream_repo::fetch_ledger_closure(
+                    &handle.retrieval,
+                    &k,
+                    &reader(&handle),
+                ))
                 .expect("the real envelope-side counting query, not a fixture copy");
             let counts = match &closure {
-                LedgerClosure::Closed(counts) => counts,
-                LedgerClosure::Broken(_) => panic!("A1 must still close after a retirement"),
+                LedgerClosure::Closed(counts, _) => counts,
+                LedgerClosure::Broken(..) => panic!("A1 must still close after a retirement"),
             };
             assert_eq!(counts.done(), 3);
             assert_eq!(counts.deleted(), 0, "a retirement is not a §37 deletion");
@@ -723,8 +812,27 @@ fn a_retired_ticket_keeps_the_a2_closure_shut() {
                 "the retired row is the `skipped` term's second member (§23.1②/0167)"
             );
 
+            // ADR-0057 D-A: the point reading from the definer — the retired ticket's memory is
+            // unsettled (0 or 1 point), the two DONE tickets' memories are settled. Fault:
+            // `close_ledger_in_txn` stops calling the definer ⇒ all zeros ⇒ visible 2 reads as
+            // overshoot (ratio null).
+            let points = closure.points();
+            assert_eq!(
+                (
+                    points.points_expected,
+                    points.points_settled,
+                    points.points_in_flight,
+                    points.points_unsettled
+                ),
+                (3, 2, 0, 1)
+            );
+
             // `visible` = the two DONE rows: the retired record was never indexed (0167 header).
-            let block = humaux_retrieval::envelope::build_projection_block(&closure, Some(2));
+            let block = humaux_retrieval::envelope::build_projection_block(
+                &closure,
+                Some(2),
+                std::time::Duration::from_secs(60),
+            );
             assert!(
                 block.degradations.is_empty(),
                 "a retirement must not read as ProjectionInvisibleLoss: {:?}",

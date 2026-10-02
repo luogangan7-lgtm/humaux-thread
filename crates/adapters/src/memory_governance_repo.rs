@@ -1,11 +1,13 @@
 //! `adapters::memory_governance_repo` — §36 `memory.supersede`, the first confirm-gated governance write (ADR-0018,
 //!   D-C).
-//! Depends-on: crates=[hex, humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time, uuid]; services=[PostgreSQL(any) r=[ops.memory_lifecycle_events, private.evidence_objects, private.memory_evidence] w=[private.memory_records] x=[ops.append_memory_lifecycle]]; env=[]; modules=[adapters::affect_repo, adapters::confirm_token_repo, adapters::context_repo, adapters::distill_repo, adapters::postgres, adapters::quota_repo, adapters::remember, adapters::request_guard_repo, adapters::retrieve, adapters::subject_repo, application::archive, application::correct, application::supersede, domain::affect, domain::audit, domain::authority, domain::confirm, domain::error, domain::evidence, domain::identity, domain::ids, domain::lifecycle, domain::memory, domain::subject, projection::stream]
-//! Called-by: [gateway::mcp_application, gateway::memory]
+//! Depends-on: crates=[hex, humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time, uuid]; services=[PostgreSQL(any) r=[ops.memory_lifecycle_events, ops.outbox, private.evidence_objects, private.memory_evidence, projection.stream_checkpoints, projection.stream_log] w=[private.memory_records] x=[ops.append_memory_lifecycle]]; env=[]; modules=[adapters::affect_repo, adapters::confirm_token_repo, adapters::context_repo, adapters::distill_repo, adapters::postgres, adapters::quota_repo, adapters::remember, adapters::request_guard_repo, adapters::retrieve, adapters::subject_repo, application::archive, application::correct, application::supersede, domain::affect, domain::audit, domain::authority, domain::confirm, domain::error, domain::evidence, domain::identity, domain::ids, domain::lifecycle, domain::memory, domain::subject, projection::stream]
+//! Called-by: [adapters::affect_repo, adapters::consolidate_repo, gateway::mcp_application, gateway::memory, tests]
 //! Invariants: [one role_gateway transaction: BMO reserve -> confirm token consume -> visibility -> successor rule ->
 //!   conditional UPDATE -> lifecycle ticket; the UPDATE's WHERE is the only status judge (0 rows = Conflict); any
-//!   failure rolls back everything]
-//! Spec: Baseline §7; §15; ADR-0018; ADR-0020
+//!   failure rolls back everything; every status change carries a lifecycle ticket on the target's home stream
+//!   (ADR-0057 D-M, W3); correct issues two lifecycle tickets (E2 projects M2, E1 retires M1) and undoing a
+//!   correction tickets M2 (ADR-0057 D-B)]
+//! Spec: Baseline §7; §15; ADR-0018; ADR-0020; ADR-0057
 //!
 //! One `role_gateway` transaction, in this order, every step rolling the whole thing back:
 //! reserve BMO -> consume the confirm token ([`crate::confirm_token_repo::consume_in_txn`],
@@ -280,16 +282,13 @@ async fn successor_status(
     status(&wire)
 }
 
-/// §7/§15 projection consequence: one `MEMORY_LIFECYCLE` ticket (stream_log ISSUED row +
-/// outbox row bound to the target's PRIMARY Evidence) on the memory's stream family, via
-/// the same §60 writers `remember` uses. Returns `(stream_seq, commit_seq)`.
-async fn issue_lifecycle_ticket(
+/// The Evidence a lifecycle ticket on `target` is bound to: its PRIMARY Evidence (the first by
+/// ordinal when it has none) — the same Evidence the worker resolves the memory through.
+async fn ticket_evidence(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    auth: &AuthorizationScope,
-    stream: &StreamKey,
     target: MemoryId,
-) -> Result<(i64, i64), ErrorCode> {
-    let evidence_id: Uuid = sqlx::query_scalar(
+) -> Result<Uuid, ErrorCode> {
+    sqlx::query_scalar(
         "SELECT evidence_id FROM private.memory_evidence WHERE memory_id = $1 \
          ORDER BY (role = 'PRIMARY') DESC, ordinal ASC LIMIT 1",
     )
@@ -297,11 +296,86 @@ async fn issue_lifecycle_ticket(
     .fetch_optional(&mut **txn)
     .await
     .map_err(db_error)?
-    .ok_or(ErrorCode::NotFound)?;
+    .ok_or(ErrorCode::NotFound)
+}
+
+/// The stream whose family holds the points of `evidence_id`'s memories: the workspace stream of
+/// the Evidence's FIRST ticket (its EVIDENCE_ACCEPTED, or a correction's own lifecycle ticket),
+/// keeping the request's tenant / domain / kind / process-configured version — a promotion must
+/// not route to a retired version. No ticket yet (never projected) ⇒ the request stream. A home
+/// that differs from the request stream must already be provisioned (a `stream_checkpoints` row),
+/// else `DependencyUnavailable`: a governance write never initialises an unprovisioned pair
+/// (ADR-0054 D-A). Every ticket bound to an existing memory's Evidence goes through here: the
+/// governance ops below, `affect_repo::annotate` and `consolidate_repo::publish_rollup`.
+// ADR-0057 D-M (W3): the ticket goes to the stream that created the target's point — point id,
+// payload workspace and retirement are family-scoped; the request workspace only authorizes.
+pub(crate) async fn home_stream(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request_stream: &StreamKey,
+    evidence_id: Uuid,
+) -> Result<StreamKey, ErrorCode> {
+    let home: Option<(String, Uuid)> = sqlx::query_as(
+        "SELECT sl.scope_kind, sl.scope_id FROM ops.outbox o \
+           JOIN projection.stream_log sl \
+             ON sl.tenant_id = o.tenant_id AND sl.commit_seq = o.commit_seq \
+          WHERE o.tenant_id = $1 AND o.evidence_id = $2 \
+            AND sl.domain = $3 AND sl.projection_kind = $4 \
+          ORDER BY o.commit_seq LIMIT 1",
+    )
+    .bind(request_stream.tenant_id.0)
+    .bind(evidence_id)
+    .bind(&request_stream.domain)
+    .bind(&request_stream.projection_kind)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(db_error)?;
+    let Some((scope_kind, scope_id)) = home else {
+        return Ok(request_stream.clone());
+    };
+    if scope_kind == request_stream.scope_kind && scope_id == request_stream.scope_id {
+        return Ok(request_stream.clone());
+    }
+    let key = StreamKey {
+        scope_kind,
+        scope_id,
+        ..request_stream.clone()
+    };
+    let provisioned: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM projection.stream_checkpoints \
+          WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3 AND domain = $4 \
+            AND projection_kind = $5 AND projection_version = $6)",
+    )
+    .bind(key.tenant_id.0)
+    .bind(&key.scope_kind)
+    .bind(key.scope_id)
+    .bind(&key.domain)
+    .bind(&key.projection_kind)
+    .bind(&key.projection_version)
+    .fetch_one(&mut **txn)
+    .await
+    .map_err(db_error)?;
+    if !provisioned {
+        return Err(ErrorCode::DependencyUnavailable);
+    }
+    Ok(key)
+}
+
+/// §7/§15 projection consequence: one `MEMORY_LIFECYCLE` ticket (stream_log ISSUED row +
+/// outbox row bound to the target's PRIMARY Evidence) on the target's home stream
+/// ([`home_stream`]), via the same §60 writers `remember` uses. Returns `(stream_seq,
+/// commit_seq, stream)` — the stream the ticket landed on, which a consistency token must name.
+async fn issue_lifecycle_ticket(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    auth: &AuthorizationScope,
+    stream: &StreamKey,
+    target: MemoryId,
+) -> Result<(i64, i64, StreamKey), ErrorCode> {
+    let evidence_id = ticket_evidence(txn, target).await?;
+    let stream = home_stream(txn, stream, evidence_id).await?;
     let commit_seq = remember::next_commit_seq(txn)
         .await
         .map_err(remember_error)?;
-    let stream_seq = remember::issue_stream_log_row(txn, stream, commit_seq)
+    let stream_seq = remember::issue_stream_log_row(txn, &stream, commit_seq)
         .await
         .map_err(remember_error)?;
     remember::insert_outbox(
@@ -314,7 +388,7 @@ async fn issue_lifecycle_ticket(
     )
     .await
     .map_err(remember_error)?;
-    Ok((stream_seq, commit_seq))
+    Ok((stream_seq, commit_seq, stream))
 }
 
 /// D-C, atomically. See the module doc for the step order.
@@ -360,7 +434,7 @@ pub async fn supersede_atomically(
 
     // The MEMORY_LIFECYCLE ticket and the append run before the arbiter UPDATE; a 0-row
     // UPDATE (already superseded / lost the concurrent race) rolls both back with the txn.
-    let (stream_seq, commit_seq) =
+    let (stream_seq, commit_seq, _) =
         issue_lifecycle_ticket(&mut txn, auth, &request.stream, request.target).await?;
     let event_id = append_lifecycle_event(
         &mut txn,
@@ -652,8 +726,11 @@ pub async fn restore_atomically(
         };
         let restored_at: OffsetDateTime =
             row.try_get("created_at").map_err(|_| ErrorCode::Internal)?;
+        // The original ticket landed on the target's home stream (ADR-0057 D-M).
+        let evidence_id = ticket_evidence(&mut txn, request.target).await?;
+        let ticket_stream = home_stream(&mut txn, &request.stream, evidence_id).await?;
         let consistency_token = build_consistency_token(
-            &request.stream,
+            &ticket_stream,
             stream_seq,
             commit_seq,
             request.consistency_token_ttl,
@@ -706,7 +783,7 @@ pub async fn restore_atomically(
 
     // New ticket (new stream seq) + RESTORE event before the arbiter UPDATE; a 0-row UPDATE
     // rolls both back.
-    let (stream_seq, commit_seq) =
+    let (stream_seq, commit_seq, ticket_stream) =
         issue_lifecycle_ticket(&mut txn, auth, &request.stream, request.target).await?;
     let event_id = append_lifecycle_event(
         &mut txn,
@@ -759,6 +836,9 @@ pub async fn restore_atomically(
         && head.head_reason == Some(LifecycleReason::UserCorrection)
     {
         let successor = head.successor_id.ok_or(ErrorCode::Internal)?;
+        // ADR-0057 D-B (W3): M2's deactivation is a status change — its E2 ticket retires M2's
+        // point (the E1 ticket above resolves E1's memories only and never sees M2).
+        issue_lifecycle_ticket(&mut txn, auth, &request.stream, MemoryId(successor)).await?;
         let deactivated: Option<Uuid> = sqlx::query_scalar(
             "UPDATE private.memory_records \
                 SET status = 'superseded', superseded_by = $2, superseded_at = clock_timestamp() \
@@ -801,7 +881,7 @@ pub async fn restore_atomically(
         return Err(ErrorCode::Conflict);
     }
     let consistency_token = build_consistency_token(
-        &request.stream,
+        &ticket_stream,
         stream_seq,
         commit_seq,
         request.consistency_token_ttl,
@@ -1039,7 +1119,7 @@ pub async fn archive_or_unarchive_atomically(
 
     // New ticket (new stream seq) + lifecycle event before the arbiter UPDATE; a 0-row UPDATE
     // (a concurrent racer flipped the flag first) rolls both back.
-    let (stream_seq, commit_seq) =
+    let (stream_seq, commit_seq, _) =
         issue_lifecycle_ticket(&mut txn, auth, &request.stream, request.target).await?;
     let (lifecycle_op, reason, undoes) = match op {
         DestructiveOp::MemoryArchive => (
@@ -1396,8 +1476,10 @@ pub async fn correct_atomically(
         };
         let superseded_at: OffsetDateTime =
             row.try_get("created_at").map_err(|_| ErrorCode::Internal)?;
+        // E2's ticket landed on M1's home stream (ADR-0057 D-M); E2's first ticket names it.
+        let ticket_stream = home_stream(&mut txn, &request.stream, evidence_id).await?;
         let consistency_token = build_consistency_token(
-            &request.stream,
+            &ticket_stream,
             stream_seq,
             commit_seq,
             request.consistency_token_ttl,
@@ -1468,6 +1550,10 @@ pub async fn correct_atomically(
     confirm_token_repo::consume_in_txn(&mut txn, auth, &request.claim).await?;
 
     let source = correction_source(&mut txn, auth, request.target).await?;
+    // ADR-0057 D-M: E2's ticket, M2's scope and the token all live on M1's home stream, so M2 is
+    // homed with M1 and the E1 retire ticket below lands in the family that holds M1's point.
+    let m1_evidence = ticket_evidence(&mut txn, request.target).await?;
+    let home = home_stream(&mut txn, &request.stream, m1_evidence).await?;
 
     // E2: a new DirectUserInput Evidence, visibility + reasoning-domain copied from M1, through
     // remember's own evidence/event issuers (never a second hand-written INSERT).
@@ -1481,11 +1567,11 @@ pub async fn correct_atomically(
     let cmd = RememberCommand {
         tenant_id: auth.tenant_id().0,
         authorization_user_id: auth.user_id().map(|u| u.0),
-        scope_kind: request.stream.scope_kind.clone(),
-        scope_id: request.stream.scope_id,
-        domain: request.stream.domain.clone(),
-        projection_kind: request.stream.projection_kind.clone(),
-        projection_version: request.stream.projection_version.clone(),
+        scope_kind: home.scope_kind.clone(),
+        scope_id: home.scope_id,
+        domain: home.domain.clone(),
+        projection_kind: home.projection_kind.clone(),
+        projection_version: home.projection_version.clone(),
         consistency_token_expires_at: expires_at,
         batch_id: None,
         payload_sha256: request.payload_sha256,
@@ -1518,7 +1604,7 @@ pub async fn correct_atomically(
     let commit_seq = remember::next_commit_seq(&mut txn)
         .await
         .map_err(remember_error)?;
-    let stream_seq = remember::issue_stream_log_row(&mut txn, &request.stream, commit_seq)
+    let stream_seq = remember::issue_stream_log_row(&mut txn, &home, commit_seq)
         .await
         .map_err(remember_error)?;
     remember::insert_outbox(
@@ -1538,8 +1624,7 @@ pub async fn correct_atomically(
     let scope = Scope {
         tenant_id: auth.tenant_id(),
         user_id: auth.user_id(),
-        workspace_id: (request.stream.scope_kind == "workspace")
-            .then_some(WorkspaceId(request.stream.scope_id)),
+        workspace_id: (home.scope_kind == "workspace").then_some(WorkspaceId(home.scope_id)),
         repository_id: None,
         task_id: None,
         run_id: None,
@@ -1598,6 +1683,10 @@ pub async fn correct_atomically(
     )
     .await?;
 
+    // ADR-0049 / ADR-0057 D-B: the E1 ticket retires M1's point (M1 goes dead below; the E2
+    // ticket above resolves E2's memories only). A 0-row UPDATE rolls it back with E2/M2.
+    issue_lifecycle_ticket(&mut txn, auth, &home, request.target).await?;
+
     // Sole arbiter (mirrors supersede): PostgreSQL re-evaluates status='active' under the row
     // lock. 0 rows (already superseded / lost the race) = Conflict, rolling E2/M2 back.
     let superseded_at: Option<OffsetDateTime> = sqlx::query_scalar(
@@ -1635,7 +1724,8 @@ pub async fn correct_atomically(
 
     // §8.5.1 (ADR-0030 D-E): M2's re-supplied affects, provenance E2, through the sole affect
     // issuer in THIS transaction — the MEMORY_LIFECYCLE ticket above already re-projects M2 with
-    // them; there is no second transaction and no second ticket.
+    // them; there is no second transaction and no second ticket for the affects (correct's
+    // second ticket, on E1, retires M1's point — ADR-0057 D-B).
     let affect_ids = affect_repo::insert_in_txn(
         &mut txn,
         auth.tenant_id().0,
@@ -1673,12 +1763,8 @@ pub async fn correct_atomically(
     if finalized_at >= reservation.expires_at() {
         return Err(ErrorCode::Conflict);
     }
-    let consistency_token = build_consistency_token(
-        &request.stream,
-        stream_seq,
-        commit_seq,
-        request.consistency_token_ttl,
-    )?;
+    let consistency_token =
+        build_consistency_token(&home, stream_seq, commit_seq, request.consistency_token_ttl)?;
     txn.commit()
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;

@@ -764,7 +764,7 @@ mod tests {
             "pipeline": {
                 "evidence": {"expected": None::<u64>, "expected_source":"none", "persisted":None::<u64>, "count_scope":"authorized_view"},
                 "knowledge": {"eligible":0, "processed":0, "waiting_key":0, "failed":0, "count_scope":"authorized_view"},
-                "projection": {"expected":0, "done":0, "deleted":0, "skipped":0, "visible":0, "open_gaps":0, "pending":0, "completeness_ratio":1.0, "current":true}
+                "projection": {"expected":0, "done":0, "deleted":0, "skipped":0, "visible":0, "open_gaps":0, "pending":0, "points_expected":0, "points_settled":0, "points_in_flight":0, "points_unsettled":0, "completeness_ratio":1.0, "current":true}
             },
             "completeness": {"class":"cannot_establish", "reason":"count_unknown", "exact":None::<Value>, "known_lower_bound":None::<u64>, "lanes":{}, "candidate_count":0, "reranked_count":0, "returned":0, "truncated":false, "degradations":[]},
             "provenance": {

@@ -147,6 +147,10 @@
                 "visible",
                 "open_gaps",
                 "pending",
+                "points_expected",
+                "points_settled",
+                "points_in_flight",
+                "points_unsettled",
                 "completeness_ratio",
                 "current"
               ],
@@ -158,6 +162,10 @@
                 "visible": {"type":["integer","null"],"minimum":0},
                 "open_gaps": {"type":"integer","minimum":0},
                 "pending": {"type":"integer","minimum":0},
+                "points_expected": {"type":"integer","minimum":0},
+                "points_settled": {"type":"integer","minimum":0},
+                "points_in_flight": {"type":"integer","minimum":0},
+                "points_unsettled": {"type":"integer","minimum":0},
                 "completeness_ratio": {"type":["number","null"],"minimum":0},
                 "current": {"type":"boolean"}
               },
@@ -196,7 +204,8 @@
                 "count_scope_mismatch",
                 "pipeline_count_mismatch",
                 "mandatory_not_satisfied",
-                "no_serving_projection"
+                "no_serving_projection",
+                "projection_lag"
               ]
             },
             "exact": {

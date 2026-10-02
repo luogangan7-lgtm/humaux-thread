@@ -3,8 +3,9 @@
 //!   or bypassable via `From`/`Deref`/raw field access (`fail_*`).
 //! Depends-on: crates=[trybuild]; services=[]; env=[]; modules=[]
 //! Called-by: [cargo-test]
-//! Invariants: [compile-time only: no runtime services; failure = a wrapper became cross-substitutable or bypassable]
-//! Spec: Baseline §6.2.3
+//! Invariants: [compile-time only: no runtime services; failure = a wrapper became cross-substitutable or bypassable,
+//!   or the count-only StreamCountFilter became convertible into a search filter (ADR-0057 D-C)]
+//! Spec: Baseline §6.2.3; §17.1; ADR-0057
 //!
 //! `tests/ui/pass_*.rs` covers five wrappers currently used by compile-time ports;
 //! role-match runtime coverage covers all seven roles.
@@ -30,4 +31,6 @@ fn pool_typestate_fixtures() {
     t.compile_fail("tests/ui/fail_deref_inner.rs");
     t.compile_fail("tests/ui/fail_raw_pool_field.rs");
     t.compile_fail("tests/ui/fail_contribution_cross_roles.rs");
+    // ADR-0057 D-C: the ops stream count filter cannot become a dense search filter.
+    t.compile_fail("tests/ui/fail_stream_count_filter_in_dense_search.rs");
 }

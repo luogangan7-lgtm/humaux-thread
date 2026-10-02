@@ -118,7 +118,7 @@ fn final_labels(
     reads: ledger::LedgerReads,
 ) -> (&'static str, &'static str) {
     let request = request(kind);
-    let ledger = ledger::close(reads);
+    let ledger = close(reads);
     let counts = ledger.counts();
     let visible = counts
         .done()
@@ -133,7 +133,7 @@ fn final_labels(
             failed: Some(0),
             count_scope: CountScope::StreamLedger,
         },
-        projection: build_projection_block(&ledger, Some(visible)).value,
+        projection: build_projection_block(&ledger, Some(visible), std::time::Duration::from_secs(60)).value,
     };
     let outcome = envelope_outcome_block(
         &request,
@@ -146,6 +146,7 @@ fn final_labels(
             visible: Some(visible),
             context: None,
             mandatory_missing: 0,
+            lag_threshold: std::time::Duration::from_secs(60),
         },
         |outcome| Ok(outcome),
     )
@@ -171,8 +172,24 @@ fn final_labels(
         Some(CannotEstablishReasonWire::PipelineCountMismatch) => "pipeline_count_mismatch",
         Some(CannotEstablishReasonWire::MandatoryNotSatisfied) => "mandatory_not_satisfied",
         Some(CannotEstablishReasonWire::NoServingProjection) => "no_serving_projection",
+        Some(CannotEstablishReasonWire::ProjectionLag) => "projection_lag",
     };
     (class, reason)
+}
+
+/// ADR-0057 D-A: these fixtures project one memory per ticket, so the A2 point reading mirrors
+/// the ticket terms (settled = done - deleted - skipped, expected = expected - deleted).
+fn close(reads: ledger::LedgerReads) -> humaux_retrieval::completeness::LedgerClosure {
+    ledger::close(
+        reads,
+        ledger::ProjectionReads {
+            points_expected: reads.expected - reads.deleted,
+            points_settled: reads.done - reads.deleted - reads.skipped,
+            points_in_flight: reads.pending,
+            points_unsettled: 0,
+            oldest_pending_age_secs: None,
+        },
+    )
 }
 
 fn closed_ledger() -> ledger::LedgerReads {
@@ -285,9 +302,9 @@ fn component_witness_labels_do_not_increment_final_metric() {
             request.planner_decision(),
             LaneStatus::Ok,
             &census,
-            &ledger::close(closed_ledger()),
+            &close(closed_ledger()),
             0
-        ),
+        , std::time::Duration::from_secs(60)),
         ("exact", "none")
     );
     assert_eq!(
@@ -308,9 +325,9 @@ fn predicate_not_enumerable_is_component_visible_but_not_metric_emittable() {
             request.planner_decision(),
             LaneStatus::Ok,
             &CensusResult::ok_without_enumeration(),
-            &ledger::close(closed_ledger()),
+            &close(closed_ledger()),
             0
-        ),
+        , std::time::Duration::from_secs(60)),
         ("cannot_establish", "predicate_not_enumerable")
     );
     assert_eq!(

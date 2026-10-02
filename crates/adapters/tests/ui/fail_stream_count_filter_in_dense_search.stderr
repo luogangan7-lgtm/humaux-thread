@@ -1,0 +1,7 @@
+error[E0277]: the trait bound `DenseQueryFilter: From<StreamCountFilter>` is not satisfied
+  --> tests/ui/fail_stream_count_filter_in_dense_search.rs:10:47
+   |
+10 |     let search: DenseQueryFilter = count_only.into();
+   |                                               ^^^^ the trait `From<StreamCountFilter>` is not implemented for `DenseQueryFilter`
+   |
+   = note: required for `StreamCountFilter` to implement `Into<DenseQueryFilter>`

@@ -97,6 +97,24 @@ except Exception: v=None
 for k in sys.argv[1].split('.'):
     v = v.get(k) if isinstance(v,dict) else None
 print('' if v is None else (json.dumps(v) if isinstance(v,(dict,list)) else v))" "$1" 2>/dev/null; }
+# Card 31 (ADR-0057 D-A): after a drain, A2 must close in memory points on lane A's workspace —
+# recall's pipeline.projection reads current=true, visible == points_settled (L), nothing in flight
+# (F) or unsettled (Q), and no PROJECTION_INVISIBLE_LOSS. Each check logs every number it graded.
+# $2 (optional) grades a recall response already on disk instead of sending a new one.
+typeset -gA A2
+a2_check() { # $1=label [$2=recall json]
+  local f=${2:-$EV/a2_$1.json}
+  [ -n "${2:-}" ] || mcp recall "{\"query\":\"which language do we prefer for backend services?\",\"workspace_id\":\"$WS\",\"mode\":\"semantic\"}" > $f 2>&1
+  local line=$(head -1 $f | python3 -c "
+import sys,json
+try:
+    sc=json.load(sys.stdin)['result']['structuredContent']; p=sc['pipeline']['projection']; dg=sc['completeness'].get('degradations',[])
+    ok=p['current'] is True and p['visible']==p['points_settled'] and p['points_in_flight']==0 and p['points_unsettled']==0 and 'PROJECTION_INVISIBLE_LOSS' not in dg
+    print('%d visible=%s L=%s F=%s Q=%s U=%s done=%s current=%s degradations=%s' % (ok, p['visible'], p['points_settled'], p['points_in_flight'], p['points_unsettled'], p['points_expected'], p['done'], p['current'], ','.join(dg) or '-'))
+except Exception as e: print('0 unparsed(%s)' % type(e).__name__)")
+  A2[$1]=${line%% *}; A2[${1}_n]=${line#* }
+  echo "a2 $1: ${A2[${1}_n]} closed=${A2[$1]}" | tee -a $EV/rehearsal.log
+}
 
 # ---------- 0. build ----------
 step build
@@ -216,12 +234,15 @@ start_rp() {
 own_pid rp $!
 }
 start_rp; RP_PID=$(cat $S/rp.pid)
+# Card 31 (ADR-0057 D-F): the §78 ProjectionLag threshold has no default — boot-fatal when absent.
+# One value, read by start_gw AND by step stall_lag's window, so the assertion grades the deployment.
+LAG_SECS=20
 start_gw() {
 ( export HUMAUX_GATEWAY_PG_DSN="postgres://role_gateway:devlocal_role_gateway@$PG/$DB" HUMAUX_GATEWAY_BIND_ADDR=127.0.0.1:8080 \
     HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX=$PEPPER_HEX HUMAUX_GATEWAY_ALLOWED_HOSTS=127.0.0.1:8080 HUMAUX_GATEWAY_ALLOWED_ORIGINS=http://127.0.0.1:8080 \
     HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES=1048576 HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS= HUMAUX_GATEWAY_MAX_FORWARDED_HOPS=1 HUMAUX_GATEWAY_GLOBAL_DENYLIST= HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST= \
     HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS=30 HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS=20 HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS=5 HUMAUX_GATEWAY_REPLAY_TTL_SECONDS=60 \
-    HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS=300 HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS=86400 HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS=21600 \
+    HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS=300 HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS=86400 HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS=21600 HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS=$LAG_SECS \
     HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND=workspace \
     HUMAUX_GATEWAY_REMEMBER_DOMAIN=$DOMAIN HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND=$PKIND HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION=$PVER \
     HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID=$RDOM HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS=60 HUMAUX_GATEWAY_REMEMBER_DATA_CLASS=INTERNAL \
@@ -529,6 +550,7 @@ if [ -n "$LC_TARGET" ] && [ -n "$LC_REPL" ]; then
   gated_as "$BEARER" memory "{\"action\":\"supersede\",\"memory_id\":\"$LC_TARGET\",\"replacement_memory_id\":\"$LC_REPL\"}" > $EV/supersede.json 2>&1
   LC_SUPERSEDE_EVENTS=$(PGQ "select count(*) from ops.memory_lifecycle_events where tenant_id='$TENANT' and op='SUPERSEDE' and memory_id='$LC_TARGET'")
   drain_all
+  a2_check supersede
   LC_RECALL_WHILE_SUPERSEDED=$(mcp memory "{\"action\":\"get\",\"memory_id\":\"$LC_TARGET\",\"workspace_id\":\"$WS\"}" | head -1 | sc superseded_at)
   gated_as "$BEARER" memory "{\"action\":\"restore\",\"memory_id\":\"$LC_TARGET\"}" > $EV/restore.json 2>&1
   LC_RESTORE_EVENTS=$(PGQ "select count(*) from ops.memory_lifecycle_events r join ops.memory_lifecycle_events s on s.event_id=r.undoes_event_id where r.tenant_id='$TENANT' and r.op='RESTORE' and s.op='SUPERSEDE' and s.memory_id='$LC_TARGET'")
@@ -541,6 +563,7 @@ import sys,json
 try: d=json.load(sys.stdin)['result'].get('structuredContent',{})
 except Exception: d={}
 print(json.dumps(d, ensure_ascii=False).count(sys.argv[1]))" "$LC_TARGET")
+  a2_check restore $EV/recall_after_restore.json
   echo "lifecycle: supersede_events=$LC_SUPERSEDE_EVENTS restore_undoes=$LC_RESTORE_EVENTS superseded_at_while_gone='$LC_RECALL_WHILE_SUPERSEDED' recall_hits_after_restore=$LC_RECALL_AFTER_RESTORE" | tee -a $EV/rehearsal.log
 else
   LC_SUPERSEDE_EVENTS=-1; LC_RESTORE_EVENTS=-1; LC_RECALL_AFTER_RESTORE=-1
@@ -570,6 +593,8 @@ try: d=json.load(sys.stdin)['result'].get('structuredContent',{})
 except Exception: d={}
 s=json.dumps(d)
 print('true' if ('\"archived\": true' in s or d.get('archived_at')) else 'false')")
+  drain_all
+  a2_check archive
   gated_as "$BEARER" memory "{\"action\":\"unarchive\",\"memory_id\":\"$AR_TARGET\"}" > $EV/unarchive.json 2>&1
   # Card 30 (ADR-0055 D-B): the Qdrant prefilter drops `archived == true` points, so an unarchived
   # memory serves again once its MEMORY_LIFECYCLE ticket has re-projected the point with
@@ -587,9 +612,34 @@ print(json.dumps(d, ensure_ascii=False).count(sys.argv[1]))" "$AR_TARGET")
   done
   AR_UNARCHIVE_LAG_S=$(( $(date +%s) - AR_T0 ))
   drain_all
+  a2_check unarchive
   echo "archive: recall_hits_while_archived=$AR_RECALL_WHILE_ARCHIVED get_reports_archived=$AR_GET_ARCHIVED recall_hits_after_unarchive=$AR_RECALL_AFTER_UNARCHIVE unarchive_to_served_s=$AR_UNARCHIVE_LAG_S (bounded 60)" | tee -a $EV/rehearsal.log
 else
   echo "archive: no target (lifecycle step had no pair)" | tee -a $EV/rehearsal.log
+fi
+
+# ---------- 6a1c2. card 31: correct retires M1's point; undoing it keeps A2 closed (ADR-0057 D-B) ----------
+# correct issues two lifecycle tickets (E2 projects M2, E1 retires M1); restore of the corrected
+# memory issues M2's retire ticket before deactivating it. Both must leave the identity closed, and
+# M1's point must be gone from the index — registry AND Qdrant, by point id.
+step correct
+CR_M1=${LC_TARGET:-}; CR_M2=""
+if [ -n "$CR_M1" ]; then
+  gated_as "$BEARER" memory "{\"action\":\"correct\",\"memory_id\":\"$CR_M1\",\"text\":\"card 31 correction: backend services are written in Rust, reviewed weekly.\"}" > $EV/correct.json 2>&1
+  CR_M2=$(head -1 $EV/correct.json | sc memory_id)
+  drain_all
+  a2_check correct
+  CR_ROWS=$(PGQ "select count(*) from projection.private_memory_points where memory_id='$CR_M1'")
+  CR_LIVE=$(PGQ "select count(*) from projection.private_memory_points where memory_id='$CR_M1' and projection_live")
+  CR_IDS=$(PGQ "select coalesce(string_agg('\"'||point_id||'\"', ','),'') from projection.private_memory_points where memory_id='$CR_M1'")
+  CR_QD=$(curl -s -X POST "http://127.0.0.1:6333/collections/$COLLECTION/points/count" -H 'Content-Type: application/json' --data "{\"exact\":true,\"filter\":{\"must\":[{\"has_id\":[$CR_IDS]}]}}" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['count'])" 2>/dev/null)
+  gated_as "$BEARER" memory "{\"action\":\"restore\",\"memory_id\":\"$CR_M1\"}" > $EV/correct_undo.json 2>&1
+  drain_all
+  a2_check correct_undo
+  CR_M2_LIVE=$(PGQ "select count(*) from projection.private_memory_points where memory_id='${CR_M2:-00000000-0000-0000-0000-000000000000}' and projection_live")
+  echo "correct: m1=$CR_M1 m2=${CR_M2:-<none>} m1_registry_rows=$CR_ROWS m1_live=$CR_LIVE m1_qdrant_points=${CR_QD:-?} m2_live_after_undo=$CR_M2_LIVE" | tee -a $EV/rehearsal.log
+else
+  echo "correct: no target (lifecycle step had no pair)" | tee -a $EV/rehearsal.log
 fi
 
 # ---------- 6a1d. completeness class on a closed ledger (acceptance item 4) ----------
@@ -671,6 +721,32 @@ GOV[replay]=$(mcp_as "$BEARER_A2" memory "{\"action\":\"pin\",\"memory_id\":\"$G
 echo "governance: tenants_exercised=${GOV[tenants]} cross_workspace_replay=${GOV[replay]:-<none>}" | tee -a $EV/rehearsal.log
 drain_all
 
+# ---------- 6a1d3. card 31: the PINNED lane under §25.4.B(6) (ADR-0057 D-G, ruling C) ----------
+# The PINNED floor is ProjectConstraint and project_active_constraints_v1 claims every such row, so
+# a pin at the floor is delivered through Mandatory and counted in pinned_excluded; a below-floor
+# pin (leg A's distilled target) is counted there and not returned (v2 authorization path). Fixture:
+# one ProjectConstraint memory, the governance leg's shape (superuser insert, ADR-0044).
+step pinned_lane
+PN_AT=$(PGQ "with e as (insert into private.evidence_objects (tenant_id,evidence_kind,payload_sha256,data_class,origin_class,visibility_class,visibility_workspace_id,reasoning_domain_id) values ('$TENANT','EVENT',sha256(gen_random_uuid()::text::bytea),'INTERNAL','TenantAdmin','WORKSPACE_SHARED','$WS','$RDOM') returning evidence_id), m as (insert into private.memory_records (tenant_id,memory_type,content,visibility_class,visibility_workspace_id,authority_class,confidence,status,asserted_at) values ('$TENANT','NOTE','{\"rehearsal\":\"card31 pinned at the floor\"}','WORKSPACE_SHARED','$WS','ProjectConstraint',0.9,'active',clock_timestamp()) returning memory_id), l as (insert into private.memory_evidence (memory_id,evidence_id,role,grounding_mode) select m.memory_id, e.evidence_id, 'PRIMARY', 'SNAPSHOT' from m, e returning memory_id) select memory_id from l")
+PN_BELOW=${GOV[A_target]:-none}
+PN_BELOW_AUTH=$(PGQ "select authority_class from private.memory_records where memory_id='${PN_BELOW/none/00000000-0000-0000-0000-000000000000}'")
+gated_as "$BEARER" memory "{\"action\":\"pin\",\"memory_id\":\"$PN_AT\"}" > $EV/pin_at_floor.json 2>&1
+mcp context "{\"workspace_id\":\"$WS\"}" > $EV/context_pinned.json 2>&1
+PN=$(head -1 $EV/context_pinned.json | python3 -c "
+import sys,json
+try:
+    sc=json.load(sys.stdin)['result']['structuredContent']; h=sc['handoff']; c=h['counts']
+    ids=lambda xs:{x['memory_id'] for x in xs}
+    items={i['memory_id'] for i in sc['content']['items']}
+    m,pn=ids(h['mandatory']),ids(h['pinned'])
+    f=lambda x:'%d|%d|%d' % (x in m, x in items, x in pn)
+    print(f(sys.argv[1]), f(sys.argv[2]), '%d|%d|%d' % (c['pinned_expected'], c['pinned_returned'], c['pinned_excluded']))
+except Exception as e: print('unparsed unparsed unparsed(%s)' % type(e).__name__)" "$PN_AT" "$PN_BELOW")
+PN_AT_V=${PN%% *}; PN_REST=${PN#* }; PN_BELOW_V=${PN_REST%% *}; PN_COUNTS=${PN_REST#* }
+# Both pins must exist as live PINNED bindings, or "not returned" would be true for the wrong reason.
+PN_BINDINGS=$(PGQ "select count(*) from private.context_bindings where tenant_id='$TENANT' and mode='PINNED' and revoked_at is null and memory_id in ('${PN_AT:-00000000-0000-0000-0000-000000000000}','${PN_BELOW/none/00000000-0000-0000-0000-000000000000}')")
+echo "pinned lane: pinned_bindings=$PN_BINDINGS at_floor=$PN_AT (mandatory|items|pinned)=$PN_AT_V below_floor=$PN_BELOW authority=$PN_BELOW_AUTH (mandatory|items|pinned)=$PN_BELOW_V counts(expected|returned|excluded)=$PN_COUNTS" | tee -a $EV/rehearsal.log
+
 # ---------- 6a1e. kill -9 every resident worker and recover (acceptance item 6) ----------
 # SIGTERM drains, which is the case that is safe by construction; kill -9 is the case the leases
 # exist to survive. Each worker is signalled ONLY through its own pidfile via own_signal, which
@@ -701,6 +777,48 @@ K9_STRANDED=$((K9_STRANDED + $(PGQ "select count(*) from projection.stream_log w
 # grouping is the slot, not the memory.)
 K9_DUP_POINTS=$(PGQ "select count(*) from (select memory_id from projection.private_memory_points where tenant_id in ('$TENANT','$TENANT_B') and projection_live and retired_at is null group by memory_id, scope_id, projection_version, embedding_version having count(*) > 1) t")
 echo "kill9 rotation: recovery_failures=$K9_RECOVERY_BAD recall_isError=$K9_RECALL_ERROR stranded_leases=$K9_STRANDED duplicate_live_points=$K9_DUP_POINTS" | tee -a $EV/rehearsal.log
+# recall_after_kill9 ran before the drain and may legitimately read in-flight; this one may not.
+a2_check kill9_drained
+
+# ---------- 6a1f. card 31: a stalled projection runner surfaces as PROJECTION_LAG (ADR-0057 D-E) ----------
+# SIGSTOP/SIGCONT go ONLY to the runner PID this script spawned, through own_signal (which checks
+# the binary name); never a container, never a foreign PID. The write is distilled concurrently so
+# its ticket is claimable and only the stopped runner holds it; the ticket state is read before the
+# resume to prove that. Lag is the age of the oldest pending ticket, strictly beyond LAG_SECS.
+step stall_lag
+# An interrupted run must not leave the runner stopped: a SIGSTOPped process ignores the teardown's TERM.
+trap "own_signal $S/rp.pid humaux-retrieval-worker CONT 0" EXIT
+own_signal $S/rp.pid humaux-retrieval-worker STOP 0
+ST_T0=$(date +%s)
+mcp remember "{\"operation\":\"put\",\"content\":\"card 31 stall probe: the projection runner is paused while this write waits.\",\"idempotency_key\":\"stall-probe-$RANDOM\",\"workspace_id\":\"$WS\"}" > $EV/stall_put.json 2>&1
+ST_EV=$(head -1 $EV/stall_put.json | sc evidence_id)
+distill_once > /dev/null 2>&1 &
+ST_DPID=$!
+lag_probe() { mcp recall "{\"query\":\"which language do we prefer for backend services?\",\"workspace_id\":\"$WS\",\"mode\":\"semantic\"}" | head -1 | python3 -c "
+import sys,json
+try:
+    sc=json.load(sys.stdin)['result']['structuredContent']; c=sc['completeness']
+    print('%d %s %s %s' % ('PROJECTION_LAG' in c.get('degradations',[]), sc['pipeline']['projection']['current'], c.get('class'), c.get('reason')))
+except Exception as e: print('x unparsed %s -' % type(e).__name__)"; }
+ST_SECS=-1; ST_SEEN=""
+while [ $(( $(date +%s) - ST_T0 )) -le $((LAG_SECS + 30)) ]; do
+  ST_SEEN=$(lag_probe)
+  [ "${ST_SEEN%% *}" = 1 ] && { ST_SECS=$(( $(date +%s) - ST_T0 )); break; }
+  sleep 2
+done
+wait $ST_DPID 2>/dev/null
+ST_STATE=$(PGQ "select s.state||'/lease='||coalesce(s.lease_owner,'none') from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id and s.commit_seq=o.commit_seq where o.evidence_id='${ST_EV:-00000000-0000-0000-0000-000000000000}' and o.event_type='EVIDENCE_ACCEPTED'")
+echo "stall: runner stopped, lag seen after ${ST_SECS}s (threshold ${LAG_SECS}s) probe='$ST_SEEN' ticket_while_stopped=$ST_STATE" | tee -a $EV/rehearsal.log
+own_signal $S/rp.pid humaux-retrieval-worker CONT 0
+trap - EXIT
+ST_C0=$(date +%s); ST_CLEAR_SECS=-1; ST_AFTER=""
+while [ $(( $(date +%s) - ST_C0 )) -le 60 ]; do
+  ST_AFTER=$(lag_probe)
+  [ "${ST_AFTER%% *}" = 0 ] && [ "$(print -r -- "$ST_AFTER" | cut -d' ' -f2)" = True ] && { ST_CLEAR_SECS=$(( $(date +%s) - ST_C0 )); break; }
+  sleep 2
+done
+echo "stall: runner resumed, lag cleared after ${ST_CLEAR_SECS}s (bounded 60) probe='$ST_AFTER'" | tee -a $EV/rehearsal.log
+drain_all
 
 # ---------- 6a2. card 17 RYW probe: the soak replay's shape, with and without `limit` ----------
 # §55.1 reserves candidate depth to the registered profile. Card 16's post-drain replay sent
@@ -853,6 +971,16 @@ assert_eq "every_worker_recovered_after_kill9" "$K9_RECOVERY_BAD" 0
 assert_eq "recall_serves_again_after_kill9" "$K9_RECALL_ERROR" 0
 assert_eq "no_stranded_lease_after_kill9" "$K9_STRANDED" 0
 assert_eq "exactly_once_no_duplicate_live_points_after_kill9" "$K9_DUP_POINTS" 0
+# Card 31 (ADR-0057): A2 closes in points after every lifecycle transition, numbers in the label.
+for l in supersede restore archive unarchive correct correct_undo kill9_drained; do
+  assert_eq "a2_after_${l}(${A2[${l}_n]:-not run})" "${A2[$l]:-}" 1
+done
+assert_eq "correct_retired_m1_point(n=${CR_ROWS:-0} registry rows: live|qdrant points)" "${CR_LIVE:-x}|${CR_QD:-x}|$([ "${CR_ROWS:-0}" -gt 0 ] && echo projected || echo never_projected)" "0|0|projected"
+assert_eq "pinned_constraint_delivered_by_context_assemble(mandatory|items|pinned_lane, counts=$PN_COUNTS)" "$PN_AT_V|bindings=$PN_BINDINGS" "1|1|0|bindings=2"
+assert_eq "pinned_below_floor_named_excluded(authority=$PN_BELOW_AUTH mandatory|items|pinned_lane, counts=$PN_COUNTS)" "$PN_BELOW_V|$(print -r -- "$PN_COUNTS" | awk -F'|' '{print ($1==$3 && $2==0)?"all_excluded":"not_all_excluded"}')|$([ -n "$PN_BELOW_AUTH" ] && [ "$PN_BELOW_AUTH" != ProjectConstraint ] && echo below_floor || echo not_below_floor)" "0|0|0|all_excluded|below_floor"
+assert_eq "stall_yields_projection_lag_within_threshold(threshold=${LAG_SECS}s observed=${ST_SECS}s ticket_while_stopped=$ST_STATE)" "$([ "$ST_SECS" -ge "$LAG_SECS" ] && [ "$ST_SECS" -le $((LAG_SECS + 10)) ] && echo 1 || echo 0)" 1
+assert_eq "stall_ticket_held_by_the_stopped_runner(n=1)" "${ST_STATE%%/*}" "ISSUED"
+assert_eq "resume_clears_projection_lag(cleared_after=${ST_CLEAR_SECS}s bounded 60)" "$([ "$ST_CLEAR_SECS" -ge 0 ] && echo 1 || echo 0)" 1
 # (7) card 29 / ADR-0054: governance ops on BOTH seeded tenants through one gateway that was started
 #     without a default write pair; each leg's tickets on its own stream only; a token minted in one
 #     workspace is refused in another. The boot witness greps this script's own gateway block; the

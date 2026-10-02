@@ -17,7 +17,7 @@ toml = "1"
 humaux-contracts = { path = "../crates/contracts" }
 # why: reuse the real Postgres/Qdrant repo adapters instead of re-typing SQL/wire calls; used-by: [xtask::confirm_sweep, xtask::e2e_seed, xtask::mechanism_registry, xtask::member, xtask::projection_serve, xtask::switch_visible]
 humaux-adapters = { path = "../crates/adapters" }
-# why: async runtime for the ops subcommands that call async adapters; used-by: [tests, xtask::confirm_sweep, xtask::e2e_seed, xtask::mechanism_registry, xtask::member, xtask::projection_serve, xtask::soak, xtask::switch_visible]
+# why: async runtime for the ops subcommands that call async adapters; used-by: [tests, xtask::confirm_sweep, xtask::e2e_seed, xtask::mechanism_registry, xtask::member, xtask::projection_serve, xtask::soak]
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # Parsing `cargo metadata` output for dependency-rule checks (§78.3) and gate reports.
 # why: parse cargo metadata / gate report JSON; used-by: [tests, xtask::architecture_check, xtask::e2e_onboard, xtask::soak]

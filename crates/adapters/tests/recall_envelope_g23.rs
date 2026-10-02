@@ -67,6 +67,7 @@ use humaux_infra_cell::{
 use humaux_projection::card::EgressDisposition;
 use humaux_projection::sparse::{CorpusDocument, build_sparse_lane};
 use humaux_projection::stream::StreamKey;
+use humaux_retrieval::completeness::LedgerClosure;
 use humaux_retrieval::completeness::ledger::{self, LedgerReads};
 use humaux_retrieval::envelope::build_projection_block;
 use humaux_telemetry::degrade::DegradeCode;
@@ -212,6 +213,22 @@ fn seed_100_done(admin: &mut Client, k: &StreamKey) {
     seed_checkpoint(admin, k, 100);
 }
 
+/// ADR-0057 D-A: these fixtures write one synthetic point per ticket and no memory rows, so the
+/// A2 point reading is the ticket terms one-for-one (the definer itself is exercised against
+/// real memories in `a2_point_identity.rs`).
+fn close_mirrored(reads: LedgerReads) -> LedgerClosure {
+    ledger::close(
+        reads,
+        ledger::ProjectionReads {
+            points_expected: reads.expected - reads.deleted,
+            points_settled: reads.done - reads.deleted - reads.skipped,
+            points_in_flight: reads.pending,
+            points_unsettled: 0,
+            oldest_pending_age_secs: None,
+        },
+    )
+}
+
 /// The three independent PG reads §22.5's `ledger::close` needs, done here as plain SQL (this
 /// file's own IO, not `adapters`-internal — see module doc) so the *judgment* under test is
 /// exactly `humaux_retrieval::completeness::ledger::close`, unmodified.
@@ -310,10 +327,15 @@ fn registry(cell: CellId, caller: CallerId) -> IntraCellResourceRegistry {
     IntraCellResourceRegistry::new(entries, cell, caller)
 }
 
-fn payload(tenant_id: TenantId, user_id: UserId, seq: i64) -> QdrantPointPayload {
+fn payload(
+    tenant_id: TenantId,
+    workspace_id: WorkspaceId,
+    user_id: UserId,
+    seq: i64,
+) -> QdrantPointPayload {
     QdrantPointPayload {
         tenant_id,
-        workspace_id: WorkspaceId::new(),
+        workspace_id,
         visibility_class: VisibilityClass::UserPrivate,
         visibility_user_id: Some(user_id),
         visibility_workspace_id: None,
@@ -338,6 +360,7 @@ fn payload(tenant_id: TenantId, user_id: UserId, seq: i64) -> QdrantPointPayload
 #[allow(clippy::too_many_arguments)]
 async fn setup_collection(
     tenant_id: TenantId,
+    workspace_id: WorkspaceId,
     user_id: UserId,
     total: i64,
     upsert_count: i64,
@@ -397,7 +420,7 @@ async fn setup_collection(
     let ha = ha_profile_for(QdrantOperation::NormalImmutableUpsert);
     for (i, id) in ids.iter().enumerate().take(upsert_count as usize) {
         let seq = i as i64 + 1;
-        let p = payload(tenant_id, user_id, seq);
+        let p = payload(tenant_id, workspace_id, user_id, seq);
         let indexable: IndexablePayload = p.into_indexable().expect("Private is indexable");
         upsert(
             &transport,
@@ -420,7 +443,8 @@ async fn setup_collection(
     // Wait for the upserted subset to become search-visible before returning.
     let expect_visible = upsert_count.min(total) as u64;
     for _ in 0..40 {
-        let filter = VisibleCountFilter::new(&scope, "g23_2").expect("non-empty version");
+        let filter = VisibleCountFilter::family_probe(&scope, workspace_id, "g23_2")
+            .expect("non-empty version");
         if let Ok(n) = count(&transport, &permit, &collection, &filter).await
             && n >= expect_visible
         {
@@ -483,11 +507,17 @@ fn g23_2_injection_1_bypass_tombstone_direct_delete() {
     let k = key(tenant_id);
     seed_100_done(&mut admin, &k);
 
-    let (collection, ids, transport, permit, scope) =
-        rt.block_on(setup_collection(k.tenant_id, UserId::new(), 100, 100));
+    let (collection, ids, transport, permit, scope) = rt.block_on(setup_collection(
+        k.tenant_id,
+        WorkspaceId(k.scope_id),
+        UserId::new(),
+        100,
+        100,
+    ));
 
     // §23.4 precondition check: all 100 confirmed search-visible before the injection runs.
-    let filter = VisibleCountFilter::new(&scope, "g23_2").unwrap();
+    let filter =
+        VisibleCountFilter::family_probe(&scope, WorkspaceId(k.scope_id), "g23_2").unwrap();
     let before = rt
         .block_on(count(&transport, &permit, &collection, &filter))
         .expect("count before");
@@ -528,10 +558,10 @@ fn g23_2_injection_1_bypass_tombstone_direct_delete() {
         reads.deleted, 0,
         "ledger deleted must stay 0 — retention::tombstone was bypassed"
     );
-    let closure = ledger::close(reads);
+    let closure = close_mirrored(reads);
     assert!(closure.is_closed());
 
-    let out = build_projection_block(&closure, Some(after));
+    let out = build_projection_block(&closure, Some(after), std::time::Duration::from_secs(60));
     assert_eq!(
         out.value.completeness_ratio,
         Some(0.90),
@@ -575,10 +605,16 @@ fn g23_2_injection_2_adapter_acks_without_verify_loses_seven() {
     // `verify_visible`/§17.4's confirmation contract, not a partial write to PostgreSQL.
     seed_100_done(&mut admin, &k);
 
-    let (collection, _ids, transport, permit, scope) =
-        rt.block_on(setup_collection(k.tenant_id, UserId::new(), 100, 93));
+    let (collection, _ids, transport, permit, scope) = rt.block_on(setup_collection(
+        k.tenant_id,
+        WorkspaceId(k.scope_id),
+        UserId::new(),
+        100,
+        93,
+    ));
 
-    let filter = VisibleCountFilter::new(&scope, "g23_2").unwrap();
+    let filter =
+        VisibleCountFilter::family_probe(&scope, WorkspaceId(k.scope_id), "g23_2").unwrap();
     let visible = rt
         .block_on(count(&transport, &permit, &collection, &filter))
         .expect("count");
@@ -591,8 +627,8 @@ fn g23_2_injection_2_adapter_acks_without_verify_loses_seven() {
     assert_eq!(reads.done, 100);
     assert_eq!(reads.deleted, 0);
 
-    let closure = ledger::close(reads);
-    let out = build_projection_block(&closure, Some(visible));
+    let closure = close_mirrored(reads);
+    let out = build_projection_block(&closure, Some(visible), std::time::Duration::from_secs(60));
     assert_eq!(
         out.value.completeness_ratio,
         Some(0.93),
@@ -641,17 +677,23 @@ fn g23_2_legal_deletion_contrast_stays_closed_across_four_lanes() {
     seed_100_done(&mut admin, &k);
 
     let user_id = UserId::new();
-    let (collection, ids, transport, permit, scope) =
-        rt.block_on(setup_collection(k.tenant_id, user_id, 100, 100));
-    let filter = VisibleCountFilter::new(&scope, "g23_2").unwrap();
+    let (collection, ids, transport, permit, scope) = rt.block_on(setup_collection(
+        k.tenant_id,
+        WorkspaceId(k.scope_id),
+        user_id,
+        100,
+        100,
+    ));
+    let filter =
+        VisibleCountFilter::family_probe(&scope, WorkspaceId(k.scope_id), "g23_2").unwrap();
 
     // Boundary A: before any deletion — ratio 1.0, current true.
     let raw_a = rt
         .block_on(count(&transport, &permit, &collection, &filter))
         .unwrap();
     let reads_a = read_ledger(&mut admin, &k);
-    let closure_a = ledger::close(reads_a);
-    let out_a = build_projection_block(&closure_a, Some(raw_a));
+    let closure_a = close_mirrored(reads_a);
+    let out_a = build_projection_block(&closure_a, Some(raw_a), std::time::Duration::from_secs(60));
     assert_eq!(out_a.value.completeness_ratio, Some(1.0));
     assert!(out_a.value.current);
     assert!(out_a.degradations.is_empty());
@@ -706,8 +748,12 @@ fn g23_2_legal_deletion_contrast_stays_closed_across_four_lanes() {
         ))
         .expect("count_visible pre-purge");
     assert_eq!(visible_b, 90);
-    let closure_b = ledger::close(reads_b);
-    let out_b = build_projection_block(&closure_b, Some(visible_b));
+    let closure_b = close_mirrored(reads_b);
+    let out_b = build_projection_block(
+        &closure_b,
+        Some(visible_b),
+        std::time::Duration::from_secs(60),
+    );
     assert_eq!(
         out_b.value.completeness_ratio,
         Some(1.0),
@@ -886,8 +932,12 @@ fn g23_2_legal_deletion_contrast_stays_closed_across_four_lanes() {
         "count_visible's answer must not move across purge"
     );
     let reads_c = read_ledger(&mut admin, &k);
-    let closure_c = ledger::close(reads_c);
-    let out_c = build_projection_block(&closure_c, Some(visible_c));
+    let closure_c = close_mirrored(reads_c);
+    let out_c = build_projection_block(
+        &closure_c,
+        Some(visible_c),
+        std::time::Duration::from_secs(60),
+    );
     assert_eq!(out_c.value.completeness_ratio, Some(1.0));
     assert!(out_c.value.current);
     assert!(out_c.degradations.is_empty());

@@ -1,10 +1,12 @@
 //! `projection::dense` — dense lane 查询构造：自动注入 `tenant + §6.1 AuthorizationScope visibility filter`（§17.1）。
 //! Depends-on: crates=[humaux-domain]; services=[]; env=[]; modules=[domain::affect, domain::identity,
 //!   domain::ids, domain::subject]
-//! Called-by: [adapters::qdrant, projection::sparse, tests]
+//! Called-by: [adapters::qdrant, adapters::retrieve, projection::sparse, tests]
 //! Invariants: [DenseQueryFilter can only be built by build_dense_filter from a mandatory &AuthorizationScope, so
-//!   every private dense query carries the tenant + visibility filter (§17.1); servable() and in_workspace() only narrow (ADR-0055)]
-//! Spec: Baseline §17.1; §6.1.1; §3; §78.3; ADR-0055
+//!   every private dense query carries the tenant + visibility filter (§17.1); servable() and in_workspace() only narrow (ADR-0055);
+//!   StreamCountFilter (count-only, no visibility arm) is built only by build_stream_count_filter and is accepted
+//!   only by the Qdrant count; no conversion into DenseQueryFilter (ADR-0057 D-C)]
+//! Spec: Baseline §17.1; §6.1.1; §3; §78.3; §16.3; §23.1②; ADR-0055; ADR-0057
 //!
 //! §17.1 冻结："所有 private query adapter 必须自动注入 tenant + AuthorizationScope
 //! visibility filter；业务层不得手写可选 filter。" 本模块的落实方式是类型级的，不是靠约定：
@@ -24,7 +26,7 @@
 
 use humaux_domain::affect::{AffectFilter, BasisPointRange, BasisPoints};
 use humaux_domain::identity::AuthorizationScope;
-use humaux_domain::ids::WorkspaceId;
+use humaux_domain::ids::{TenantId, WorkspaceId};
 use humaux_domain::subject::SubjectId;
 
 /// §6.1.3 / ADR-0029: the Qdrant payload field carrying a point's linked subject ids
@@ -258,6 +260,51 @@ pub fn build_dense_filter(
         value: m.value.clone(),
     }));
     DenseQueryFilter(Condition::And(clauses))
+}
+
+/// §16.3 / §23.1② (ADR-0057 D-C): the ops count of ONE stream — every point of
+/// `(tenant, workspace, projection_version)` whatever its visibility class. Count-only: the
+/// field is private, the sole constructor is [`build_stream_count_filter`], and nothing converts
+/// it into a [`DenseQueryFilter`], so search / scroll cannot take it (compile-fail
+/// `crates/adapters/tests/ui/fail_stream_count_filter_in_dense_search.rs`). Its callers are the
+/// §16.2 serve switch, the soak and the ADR-0053 provisioning probe — never a request path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCountFilter(Condition);
+
+impl StreamCountFilter {
+    /// The condition tree, for `adapters::qdrant`'s count body only.
+    pub fn as_condition(&self) -> &Condition {
+        &self.0
+    }
+}
+
+/// Builds the [`StreamCountFilter`] of one stream: `tenant_id == T ∧ workspace_id == W ∧
+/// projection_version == V`, with no visibility disjunction. `None` on an empty version — a blank
+/// string must not stand in for "every version".
+// §17.1 (ADR-0057 D-C): count-only exception — returns a number, never ids or bodies; the type
+// cannot reach search.
+pub fn build_stream_count_filter(
+    tenant: TenantId,
+    workspace: WorkspaceId,
+    projection_version: &str,
+) -> Option<StreamCountFilter> {
+    if projection_version.is_empty() {
+        return None;
+    }
+    Some(StreamCountFilter(Condition::And(vec![
+        Condition::Eq {
+            field: "tenant_id",
+            value: tenant.0.to_string(),
+        },
+        Condition::Eq {
+            field: WORKSPACE_ID_FIELD,
+            value: workspace.0.to_string(),
+        },
+        Condition::Eq {
+            field: "projection_version",
+            value: projection_version.to_string(),
+        },
+    ])))
 }
 
 /// §6.1.2 三段独立 AND 谓词里的第一段："tenant filter"。`identity::can_read` 本身从不检查
@@ -683,5 +730,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- ADR-0057 D-C: the ops stream count ----
+
+    fn point(
+        tenant: TenantId,
+        workspace: WorkspaceId,
+        version: &str,
+        class: &str,
+        user: Option<UserId>,
+    ) -> std::collections::HashMap<&'static str, String> {
+        let mut m = std::collections::HashMap::new();
+        m.insert("tenant_id", tenant.0.to_string());
+        m.insert(WORKSPACE_ID_FIELD, workspace.0.to_string());
+        m.insert("projection_version", version.to_string());
+        m.insert("visibility_class", class.to_string());
+        if let Some(u) = user {
+            m.insert("visibility_user_id", u.0.to_string());
+        }
+        if class == "WORKSPACE_SHARED" {
+            m.insert("visibility_workspace_id", workspace.0.to_string());
+        }
+        m
+    }
+
+    /// Fault: AND `visibility_disjunction` into the builder (the two users' private points and
+    /// the workspace-shared one drop out).
+    #[test]
+    fn stream_count_filter_counts_every_visibility_class_of_the_stream() {
+        let (t, w) = (TenantId::new(), WorkspaceId::new());
+        let f = build_stream_count_filter(t, w, "v1").expect("non-empty version");
+        let points = [
+            point(t, w, "v1", "USER_PRIVATE", Some(UserId::new())),
+            point(t, w, "v1", "USER_PRIVATE", Some(UserId::new())),
+            point(t, w, "v1", "WORKSPACE_SHARED", None),
+            point(t, w, "v1", "TENANT_SHARED", None),
+        ];
+        assert_eq!(
+            points.iter().filter(|p| eval(f.as_condition(), p)).count(),
+            4
+        );
+    }
+
+    /// Fault: drop the workspace term (another workspace's point of the same tenant counts).
+    #[test]
+    fn stream_count_filter_drops_other_workspace_and_other_version() {
+        let (t, w) = (TenantId::new(), WorkspaceId::new());
+        let f = build_stream_count_filter(t, w, "v1").expect("non-empty version");
+        assert!(eval(
+            f.as_condition(),
+            &point(t, w, "v1", "TENANT_SHARED", None)
+        ));
+        assert!(!eval(
+            f.as_condition(),
+            &point(t, WorkspaceId::new(), "v1", "TENANT_SHARED", None)
+        ));
+        assert!(!eval(
+            f.as_condition(),
+            &point(t, w, "v2", "TENANT_SHARED", None)
+        ));
+        assert!(!eval(
+            f.as_condition(),
+            &point(TenantId::new(), w, "v1", "TENANT_SHARED", None)
+        ));
+    }
+
+    /// Fault: remove the empty-string check (a blank version would count nothing, or every
+    /// version once the term is dropped).
+    #[test]
+    fn stream_count_filter_refuses_an_empty_version() {
+        assert!(build_stream_count_filter(TenantId::new(), WorkspaceId::new(), "").is_none());
     }
 }

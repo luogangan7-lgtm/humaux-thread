@@ -3,16 +3,19 @@
 //! Depends-on: crates=[humaux-domain, serde]; services=[];
 //!   env=[]; modules=[domain::context, domain::ledger, retrieval::envelope, retrieval::planner]
 //! Called-by: [adapters::context_repo, adapters::exact_census, adapters::retrieve, adapters::serving_repo, adapters::stream_repo, gateway::context, gateway::memory, gateway::recall, retrieval::envelope, retrieval::signals, tests]
-//! Invariants: []
-//! Spec: §22.4; §22.5; §59; §41.2; §25.3; §78.2
+//! Invariants: [ledger::close is the sole LedgerClosure constructor; A1 counts tickets, A2's PostgreSQL side
+//!   (ProjectionReads) counts memory points (ADR-0057 D-A); classify has six inputs and LedgerClosure::lagging
+//!   is the only projection-lag comparison (ADR-0057 D-D/D-E)]
+//! Spec: §22.4; §22.5; §59; §41.2; §25.3; §78.2; ADR-0057
 //!
 //! `classify()` is the sole constructor of [`CompletenessClass`]; final outcome emission is
 //! the sole increment point of `retrieval_completeness_total{class,reason}` (§22.5, §41.2).
 //! Its
 //! parameters are `planner_output` / `lane_status` / `census_result` / `ledger` /
-//! `mandatory_missing` — §22.5's frozen four plus the §25.3 Mandatory shortfall added by card
-//! 22c's review (an unmet obligation moves `completeness`, see
-//! [`CannotEstablishReason::MandatoryNotSatisfied`]); this module reuses [`crate::planner::PlannerDecision`] for
+//! `mandatory_missing` / `lag_threshold` — §22.5's four plus the §25.3 Mandatory shortfall added by
+//! card 22c's review (an unmet obligation moves `completeness`, see
+//! [`CannotEstablishReason::MandatoryNotSatisfied`]) and the §22.4 projection-lag threshold
+//! (ADR-0057 D-E, which closes ADR-0047's parameter-count debt); this module reuses [`crate::planner::PlannerDecision`] for
 //! `planner_output` and [`crate::envelope::LaneStatus`] for `lane_status` rather than
 //! inventing second representations of either — only `CensusResult` is minted here, because
 //! no Authority-census type exists anywhere in the workspace yet (see its own doc for scope).
@@ -50,6 +53,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Ledger's six fields (§22.5): produced by `ledger::close(repo, stream_key)` taking three
 /// independent reads (`stream_log_agg` / `count_open_gaps` / `contiguous_done_prefix`) and
@@ -103,11 +107,10 @@ impl CompletenessClass {
 }
 
 /// §22.4 `CANNOT_ESTABLISH` reason, a closed set (§78.2: no stringly-typed domain) covering
-/// exactly what `classify()`'s signature can observe: A1 broken, Planner's own non-enumerable
-/// verdict, census failure, lane failure, and (card 22c) an unmet Mandatory obligation.
-/// `projection lag` (also named in §22.4's trigger list) has no input path into this signature
-/// and so is not a variant here — out of scope for this constructor, not silently folded into
-/// one of the others.
+/// exactly what `classify()`'s signature can observe: A1 broken, projection lag beyond the
+/// threshold (ADR-0057 D-E), Planner's own non-enumerable verdict, census failure, lane failure,
+/// and (card 22c) an unmet Mandatory obligation — plus the projection-side reasons only the
+/// envelope can observe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CannotEstablishReason {
     /// A1 broken (§22.4/§23.1②): `done + open_gaps + pending != expected`.
@@ -129,8 +132,9 @@ pub(crate) enum CannotEstablishReason {
     // caller reaches `assemble_completeness_class`.
     #[allow(dead_code)]
     IndexCountUnavailable,
-    /// §23.1②: A2's `>` side exceeded `pending` — index holds points the ledger never issued a
-    /// ticket for, untrustworthy on both sides. Same "projection-side, not visible to
+    /// §23.1② (ADR-0057 D-A): A2's `>` side exceeded `points_in_flight + points_unsettled` —
+    /// index holds points no ticket accounts for, untrustworthy on both sides. The label keeps
+    /// its pre-ADR-0057 spelling for wire stability. Same "projection-side, not visible to
     /// `classify()`'s signature" reasoning, and the same test-only-caller ceiling, as
     /// [`Self::IndexCountUnavailable`].
     #[allow(dead_code)]
@@ -165,6 +169,10 @@ pub(crate) enum CannotEstablishReason {
     /// [`crate::envelope::no_serving_projection_envelope`] (recall/context, the optional
     /// lanes); never mapped to get → NOT_FOUND or enumerate → a complete empty set.
     NoServingProjection,
+    /// §22.4 "projection lag 超过门槛" (ADR-0057 D-E): the oldest pending ticket of the stream is
+    /// older than the configured threshold — writes exist that the index does not reflect yet,
+    /// so the true count is not known. Same projection-side family as [`Self::LedgerNotClosed`].
+    ProjectionLag,
 }
 
 /// §25.5 的唯一映射：Mandatory Context 溢出 ⇒ `cannot_establish`。
@@ -200,6 +208,7 @@ impl CannotEstablishReason {
             Self::PipelineCountMismatch => "pipeline_count_mismatch",
             Self::MandatoryNotSatisfied => "mandatory_not_satisfied",
             Self::NoServingProjection => "no_serving_projection",
+            Self::ProjectionLag => "projection_lag",
         }
     }
 }
@@ -394,24 +403,46 @@ pub enum FreshnessClass {
 /// carry `LedgerCounts` by value, but `LedgerCounts`'s *fields* stay unreachable from outside
 /// this module (private + no external constructor), so exposing this enum does not reopen the
 /// sole-construction-point guarantee `ledger::close` exists to hold.
+///
+/// Each variant also carries the A2 point reading ([`ledger::ProjectionReads`], ADR-0057 D-A),
+/// read in the same snapshot as the six ticket counts; A1 never looks at it.
 #[derive(Debug, Clone)]
 pub enum LedgerClosure {
-    Closed(LedgerCounts),
-    Broken(LedgerCounts),
+    /// A1 held.
+    Closed(LedgerCounts, ledger::ProjectionReads),
+    /// A1 broken.
+    Broken(LedgerCounts, ledger::ProjectionReads),
 }
 
 impl LedgerClosure {
     /// A1 (§23.1②): `true` iff `done + open_gaps + pending == expected` held.
     pub fn is_closed(&self) -> bool {
-        matches!(self, Self::Closed(_))
+        matches!(self, Self::Closed(..))
     }
 
     /// The six counts either way — a `Broken` closure is still required to report its known
     /// lower bound (§22.4), never to withhold the numbers it did manage to read.
     pub fn counts(&self) -> &LedgerCounts {
         match self {
-            Self::Closed(c) | Self::Broken(c) => c,
+            Self::Closed(c, _) | Self::Broken(c, _) => c,
         }
+    }
+
+    /// §23.1② A2's PostgreSQL side in the point unit (ADR-0057 D-A) — tickets stay A1's unit.
+    pub fn points(&self) -> &ledger::ProjectionReads {
+        match self {
+            Self::Closed(_, p) | Self::Broken(_, p) => p,
+        }
+    }
+
+    /// §22.4 / §52.2 projection lag (ADR-0057 D-D): the oldest pending ticket of this stream is
+    /// strictly older than `threshold`. Nothing pending ⇒ never lagging.
+    pub fn lagging(&self, threshold: Duration) -> bool {
+        // ADR-0057 D-D: the only lag comparison in the workspace; strict `>` so an age equal to
+        // the threshold is still within it.
+        self.points()
+            .oldest_pending_age_secs
+            .is_some_and(|age| Duration::from_secs(age) > threshold)
     }
 }
 
@@ -485,13 +516,38 @@ pub mod ledger {
         pub pending: u64,
     }
 
+    /// §23.1② A2's PostgreSQL side, counted in memory points (ADR-0057 D-A/D-L): the four
+    /// readings `projection.stream_point_ledger` returns over the memories the stream's tickets
+    /// reach, under the caller's §6.1 visibility (the same predicate the Qdrant `visible` count
+    /// applies). Plain and freely constructible, like [`LedgerReads`]: only the judged
+    /// [`LedgerClosure`] is guarded.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct ProjectionReads {
+        /// Live, indexable, not tombstoned — the universe that should eventually be visible;
+        /// the `completeness_ratio` denominator.
+        pub points_expected: u64,
+        /// The above with no pending ticket and the latest ticket `DONE` — must be visible now
+        /// (A2's lower bound).
+        pub points_settled: u64,
+        /// Not tombstoned with a pending ticket — may hold 0 or 1 point right now.
+        pub points_in_flight: u64,
+        /// Not tombstoned, nothing pending, latest ticket `FAILED`/`LOST`/`RETIRED_FAILED` —
+        /// may hold 0 or 1 point until a later ticket acts on the memory (W5).
+        pub points_unsettled: u64,
+        /// ADR-0057 D-D: age in whole seconds (DB clock) of the stream's oldest
+        /// `ISSUED`/`PROCESSING`/`RETRY_WAIT` ticket, read in the same snapshot; `None` when
+        /// nothing is pending. Judged only by [`LedgerClosure::lagging`].
+        pub oldest_pending_age_secs: Option<u64>,
+    }
+
     /// §22.5 `ledger::close`: judges §23.1② A1 (`done + open_gaps + pending == expected`) and
     /// returns `Broken` — never panics, never silently clamps — when it does not hold. Does
     /// **not** judge A2 (§22.4/§23.1②: "A2 只能在 envelope 层求值", `ledger::close` 不判 A2") —
     /// this function has no `visible` input at all, by construction, so A2 cannot be judged
     /// here even by accident. `retrieval_completeness_total{class,reason}`'s single increment
-    /// point (§22.5) lives in final Envelope outcome assembly, not here.
-    pub fn close(reads: LedgerReads) -> LedgerClosure {
+    /// point (§22.5) lives in final Envelope outcome assembly, not here. `projection` (the A2
+    /// point reading, ADR-0057 D-A) rides along unjudged for the envelope's A2.
+    pub fn close(reads: LedgerReads, projection: ProjectionReads) -> LedgerClosure {
         let counts = LedgerCounts {
             expected: reads.expected,
             done: reads.done,
@@ -508,9 +564,9 @@ pub mod ledger {
             reads.open_gaps,
             reads.pending,
         ) {
-            LedgerClosure::Closed(counts)
+            LedgerClosure::Closed(counts, projection)
         } else {
-            LedgerClosure::Broken(counts)
+            LedgerClosure::Broken(counts, projection)
         }
     }
 
@@ -520,14 +576,17 @@ pub mod ledger {
 
         #[test]
         fn close_reports_closed_when_a1_identity_holds() {
-            let closure = close(LedgerReads {
-                expected: 100,
-                done: 100,
-                deleted: 10,
-                skipped: 0,
-                open_gaps: 0,
-                pending: 0,
-            });
+            let closure = close(
+                LedgerReads {
+                    expected: 100,
+                    done: 100,
+                    deleted: 10,
+                    skipped: 0,
+                    open_gaps: 0,
+                    pending: 0,
+                },
+                ProjectionReads::default(),
+            );
             assert!(closure.is_closed());
             assert_eq!(closure.counts().expected(), 100);
             assert_eq!(closure.counts().deleted(), 10);
@@ -537,14 +596,17 @@ pub mod ledger {
         /// counts it read (the "known lower bound" `CANNOT_ESTABLISH` must report).
         #[test]
         fn close_reports_broken_when_a1_identity_breaks() {
-            let closure = close(LedgerReads {
-                expected: 100,
-                done: 90,
-                deleted: 0,
-                skipped: 0,
-                open_gaps: 0,
-                pending: 0, // 90+0+0 = 90 != 100
-            });
+            let closure = close(
+                LedgerReads {
+                    expected: 100,
+                    done: 90,
+                    deleted: 0,
+                    skipped: 0,
+                    open_gaps: 0,
+                    pending: 0, // 90+0+0 = 90 != 100
+                },
+                ProjectionReads::default(),
+            );
             assert!(!closure.is_closed());
             assert_eq!(closure.counts().done(), 90);
         }
@@ -553,14 +615,17 @@ pub mod ledger {
         /// union (95), not decomposed by this function.
         #[test]
         fn close_matches_23_3_worked_example() {
-            let closure = close(LedgerReads {
-                expected: 98,
-                done: 95,
-                deleted: 3,
-                skipped: 2,
-                open_gaps: 1,
-                pending: 2,
-            });
+            let closure = close(
+                LedgerReads {
+                    expected: 98,
+                    done: 95,
+                    deleted: 3,
+                    skipped: 2,
+                    open_gaps: 1,
+                    pending: 2,
+                },
+                ProjectionReads::default(),
+            );
             assert!(closure.is_closed());
             let c = closure.counts();
             assert_eq!(
@@ -589,7 +654,7 @@ impl CompletenessTotal {
         "semantic_bounded",
         "cannot_establish",
     ];
-    const REASONS: [&'static str; 13] = [
+    const REASONS: [&'static str; 14] = [
         "none",
         "ledger_not_closed",
         "predicate_not_enumerable",
@@ -603,6 +668,7 @@ impl CompletenessTotal {
         "pipeline_count_mismatch",
         "mandatory_not_satisfied",
         "no_serving_projection",
+        "projection_lag",
     ];
     const CELLS: usize = Self::CLASSES.len() * Self::REASONS.len();
 
@@ -679,7 +745,8 @@ pub(crate) fn take_final_record_trace() -> Vec<(&'static str, &'static str)> {
 ///
 /// Match order is the frozen degrade-direction table (§22.5): ledger closure is checked
 /// *before* `planner_output` is read at all — a broken ledger blocks every class, EXACT
-/// included (§22.4). Census failure and lane failure are checked next (§22.4's other two
+/// included (§22.4). Projection lag beyond `lag_threshold` comes right after it (ADR-0057 D-E:
+/// both say "the true count is not known" on the projection side). Census failure and lane failure are checked next (§22.4's other two
 /// `CANNOT_ESTABLISH` triggers this signature can observe), then `planner_output` decides
 /// between `Exact` (a `DirectGet`/`Enumerate` decision — both are fully-defined, enumerable
 /// sets) and the fallback `SemanticBounded` for everything else (adjudication 4 in this
@@ -692,6 +759,7 @@ pub(crate) fn classify(
     census_result: &CensusResult,
     ledger: &LedgerClosure,
     mandatory_missing: u64,
+    lag_threshold: Duration,
 ) -> CompletenessClass {
     use crate::envelope::LaneStatus;
     use crate::planner::PlannerDecision;
@@ -699,6 +767,11 @@ pub(crate) fn classify(
     if !ledger.is_closed() {
         CompletenessClass::CannotEstablish {
             reason: CannotEstablishReason::LedgerNotClosed,
+        }
+    } else if ledger.lagging(lag_threshold) {
+        // §22.4 (ADR-0057 D-E): projection lag beyond the threshold — after A1, before census.
+        CompletenessClass::CannotEstablish {
+            reason: CannotEstablishReason::ProjectionLag,
         }
     } else if !census_result.is_ok() {
         CompletenessClass::CannotEstablish {
@@ -741,6 +814,7 @@ pub fn classify_for_witness(
     census_result: &CensusResult,
     ledger: &LedgerClosure,
     mandatory_missing: u64,
+    lag_threshold: Duration,
 ) -> (&'static str, &'static str) {
     let class = classify(
         planner_output,
@@ -748,6 +822,7 @@ pub fn classify_for_witness(
         census_result,
         ledger,
         mandatory_missing,
+        lag_threshold,
     );
     class.wire_labels()
 }
@@ -783,7 +858,7 @@ mod tests {
             );
             seen.insert(idx);
         }
-        // 十二个 CannotEstablish reason 逐个走一遍。少一个变体这里就少一个 idx，
+        // 十三个 CannotEstablish reason 逐个走一遍。少一个变体这里就少一个 idx，
         // 而 REASONS 与数组长度对不上时 `idx()` 会直接 panic。
         for reason in [
             CannotEstablishReason::LedgerNotClosed,
@@ -798,6 +873,7 @@ mod tests {
             CannotEstablishReason::PipelineCountMismatch,
             CannotEstablishReason::MandatoryNotSatisfied,
             CannotEstablishReason::NoServingProjection,
+            CannotEstablishReason::ProjectionLag,
         ] {
             let (c, r) = CompletenessClass::CannotEstablish { reason }.wire_labels();
             let idx = CompletenessTotal::idx(c, r);
@@ -810,8 +886,8 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            15,
-            "十五个 (class, reason) 组合应当落在十五个不同的格子里"
+            16,
+            "十六个 (class, reason) 组合应当落在十六个不同的格子里"
         );
     }
 
@@ -853,25 +929,139 @@ mod tests {
     }
 
     fn closed_ledger() -> LedgerClosure {
-        ledger::close(ledger::LedgerReads {
-            expected: 10,
-            done: 10,
-            deleted: 0,
-            skipped: 0,
-            open_gaps: 0,
-            pending: 0,
-        })
+        ledger::close(
+            ledger::LedgerReads {
+                expected: 10,
+                done: 10,
+                deleted: 0,
+                skipped: 0,
+                open_gaps: 0,
+                pending: 0,
+            },
+            ledger::ProjectionReads::default(),
+        )
+    }
+
+    /// Every test that is not about lag runs with a threshold no fixture's age reaches.
+    const LAG: Duration = Duration::from_secs(30);
+
+    fn lagging_ledger(age_secs: u64, a1_holds: bool) -> LedgerClosure {
+        ledger::close(
+            ledger::LedgerReads {
+                expected: 10,
+                done: if a1_holds { 9 } else { 5 },
+                deleted: 0,
+                skipped: 0,
+                open_gaps: 0,
+                pending: 1,
+            },
+            ledger::ProjectionReads {
+                oldest_pending_age_secs: Some(age_secs),
+                ..ledger::ProjectionReads::default()
+            },
+        )
+    }
+
+    /// ADR-0057 D-E (test 7): the oldest pending ticket older than the threshold makes the class
+    /// `cannot_establish/projection_lag`, whatever the planner would have said. Fault: delete
+    /// the lag arm in `classify()` (the `Enumerate` case falls back to `Exact`).
+    #[test]
+    fn classify_lag_beyond_threshold_is_cannot_establish_projection_lag() {
+        for decision in [
+            PlannerDecision::Enumerate {
+                predicate_id: "rejected_decisions_v1".to_string(),
+            },
+            PlannerDecision::Class(QueryClass::Semantic),
+        ] {
+            let class = classify(
+                &decision,
+                LaneStatus::Ok,
+                &CensusResult::ok_without_enumeration(),
+                &lagging_ledger(31, true),
+                0,
+                LAG,
+            );
+            assert_eq!(
+                class,
+                CompletenessClass::CannotEstablish {
+                    reason: CannotEstablishReason::ProjectionLag
+                },
+                "{decision:?} over a lagging projection"
+            );
+            assert_eq!(class.wire_labels(), ("cannot_establish", "projection_lag"));
+        }
+        // Lag outranks census and lane: they describe this query, lag the whole stream.
+        assert_eq!(
+            classify(
+                &PlannerDecision::Class(QueryClass::Semantic),
+                LaneStatus::Failed,
+                &CensusResult::failed(),
+                &lagging_ledger(31, true),
+                1,
+                LAG,
+            ),
+            CompletenessClass::CannotEstablish {
+                reason: CannotEstablishReason::ProjectionLag
+            }
+        );
+    }
+
+    /// ADR-0057 D-E (test 8): A1 broken outranks lag. Fault: move the lag arm before A1.
+    #[test]
+    fn classify_ledger_not_closed_outranks_lag() {
+        let class = classify(
+            &PlannerDecision::Class(QueryClass::Semantic),
+            LaneStatus::Ok,
+            &CensusResult::ok_without_enumeration(),
+            &lagging_ledger(3_600, false),
+            0,
+            LAG,
+        );
+        assert_eq!(
+            class,
+            CompletenessClass::CannotEstablish {
+                reason: CannotEstablishReason::LedgerNotClosed
+            }
+        );
+    }
+
+    /// ADR-0057 D-D (test 9): an age equal to the threshold, or nothing pending, is not lag.
+    /// Fault: `>=` instead of `>` in `LedgerClosure::lagging`.
+    #[test]
+    fn classify_lag_at_or_below_threshold_is_unchanged() {
+        for ledger in [
+            lagging_ledger(30, true),
+            lagging_ledger(0, true),
+            closed_ledger(),
+        ] {
+            assert!(!ledger.lagging(LAG));
+            assert_eq!(
+                classify(
+                    &PlannerDecision::Class(QueryClass::Semantic),
+                    LaneStatus::Ok,
+                    &CensusResult::ok_without_enumeration(),
+                    &ledger,
+                    0,
+                    LAG,
+                ),
+                CompletenessClass::SemanticBounded
+            );
+        }
+        assert!(lagging_ledger(31, true).lagging(LAG));
     }
 
     fn broken_ledger() -> LedgerClosure {
-        ledger::close(ledger::LedgerReads {
-            expected: 10,
-            done: 5,
-            deleted: 0,
-            skipped: 0,
-            open_gaps: 0,
-            pending: 0, // 5 != 10
-        })
+        ledger::close(
+            ledger::LedgerReads {
+                expected: 10,
+                done: 5,
+                deleted: 0,
+                skipped: 0,
+                open_gaps: 0,
+                pending: 0, // 5 != 10
+            },
+            ledger::ProjectionReads::default(),
+        )
     }
 
     /// §22.5's frozen first branch: a broken ledger wins even when everything else (census,
@@ -886,6 +1076,7 @@ mod tests {
             &CensusResult::ok_without_enumeration(),
             &broken_ledger(),
             0,
+            LAG,
         );
         assert_eq!(
             class,
@@ -903,6 +1094,7 @@ mod tests {
             &CensusResult::failed(),
             &closed_ledger(),
             0,
+            LAG,
         );
         assert_eq!(
             class,
@@ -920,6 +1112,7 @@ mod tests {
             &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
             0,
+            LAG,
         );
         assert_eq!(
             class,
@@ -950,6 +1143,7 @@ mod tests {
                 &CensusResult::ok_without_enumeration(),
                 &closed_ledger(),
                 1,
+                LAG,
             );
             assert_eq!(
                 class,
@@ -971,6 +1165,7 @@ mod tests {
                 &CensusResult::ok_without_enumeration(),
                 &closed_ledger(),
                 1,
+                LAG,
             ),
             CompletenessClass::CannotEstablish {
                 reason: CannotEstablishReason::LaneFailed
@@ -988,6 +1183,7 @@ mod tests {
             &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
             0,
+            LAG,
         );
         assert_eq!(
             class,
@@ -1007,6 +1203,7 @@ mod tests {
             &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
             0,
+            LAG,
         );
         assert_eq!(class, CompletenessClass::Exact);
     }
@@ -1021,6 +1218,7 @@ mod tests {
             &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
             0,
+            LAG,
         );
         assert_eq!(class, CompletenessClass::Exact);
     }
@@ -1035,6 +1233,7 @@ mod tests {
             &CensusResult::ok_without_enumeration(),
             &closed_ledger(),
             0,
+            LAG,
         );
         assert_eq!(class, CompletenessClass::SemanticBounded);
     }
@@ -1055,6 +1254,7 @@ mod tests {
             &census,
             &closed_ledger(),
             0,
+            LAG,
         );
         assert_eq!((class_label, reason_label), ("exact", "none"));
         assert!(take_final_record_trace().is_empty());

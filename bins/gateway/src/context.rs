@@ -9,6 +9,7 @@ use std::{
     collections::BTreeMap,
     io::Read,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 use humaux_adapters::{
@@ -62,20 +63,30 @@ pub struct ContextBootstrap {
     /// `GatewayMcpApplication::with_semantic_recall`, the one place that holds both this
     /// bootstrap and the runtime; nothing here can construct one.
     index: Option<Arc<SemanticRecallRuntime>>,
+    /// §22.4 / §78.1 projection-lag threshold (ADR-0057 D-F,
+    /// `HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS`) every read route hands to the envelope.
+    pub(crate) projection_lag: Duration,
 }
 
 impl ContextBootstrap {
+    /// Builds the read routes' trusted state. A zero `projection_lag` is refused
+    /// (`InvalidInput`): every pending ticket would read as lag.
     pub fn new(
         budget: ContextBudget,
         profile: RegisteredRetrievalProfile,
         write_policy: &RememberPolicy,
+        projection_lag: Duration,
     ) -> Result<Self, ErrorCode> {
+        if projection_lag.is_zero() {
+            return Err(ErrorCode::InvalidInput);
+        }
         Ok(Self {
             budget,
             profile,
             family: write_policy.family().clone(),
             binary_build: executable_fingerprint()?,
             index: None,
+            projection_lag,
         })
     }
 
@@ -276,6 +287,7 @@ pub async fn assemble<T>(
         &request,
         &bootstrap.binary_build,
         visible,
+        bootstrap.projection_lag,
         accept,
     )
 }
@@ -306,6 +318,7 @@ fn into_result<T>(
     request: &RetrievalRequest,
     binary_build: &str,
     visible: Option<u64>,
+    lag_threshold: Duration,
     accept: impl FnOnce(ContextResult) -> Result<T, ErrorCode>,
 ) -> Result<PendingEnvelope<T>, ErrorCode> {
     let MaterializedContext {
@@ -330,7 +343,7 @@ fn into_result<T>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let returned = u32::try_from(items.len()).map_err(|_| ErrorCode::Internal)?;
-    let projection = build_projection_block(&ledger, visible);
+    let projection = build_projection_block(&ledger, visible, lag_threshold);
     // §23.3④ (ADR-0041 D-H): read from `projection.stream_log` for this request's full
     // six-column `StreamKey`, in the same RR snapshot as the manifest, the bodies and the
     // ledger — never the number of Context items or of returned stream rows, which §23.3④
@@ -381,6 +394,7 @@ fn into_result<T>(
             // `cannot_establish/mandatory_not_satisfied` — instead of being reported only as
             // a number inside the handoff counts while the class still claims a sound answer.
             mandatory_missing: handoff.counts.mandatory_missing,
+            lag_threshold,
         },
         |final_outcome| {
             let content = Envelope {
