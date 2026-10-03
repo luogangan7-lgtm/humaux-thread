@@ -11,7 +11,7 @@ case $REHEARSE_PROFILE in debug|release) ;; *) echo "REHEARSE_PROFILE must be de
 BIN_DIR="${CARGO_TARGET_DIR:-target}/$REHEARSE_PROFILE"
 R=/Volumes/data/humaux-thread; cd $R
 PG=127.0.0.1:54329; DB=${HUMAUX_REHEARSE_DB:-humaux_thread_dev}; MYUID=$(id -u)
-export HUMAUX_TEST_PG_DSN="postgres://postgres:devlocal@$PG/$DB" HUMAUX_MAINTENANCE_PG_DSN="postgres://role_maintenance:devlocal_role_maintenance@$PG/$DB"
+export HUMAUX_TEST_PG_DSN="postgres://postgres:${HUMAUX_DEV_PG_SUPERUSER_PASSWORD:?}@$PG/$DB" HUMAUX_MAINTENANCE_PG_DSN="postgres://role_maintenance:${HUMAUX_ROLE_PASSWORD_MAINTENANCE:?}@$PG/$DB"
 GITLEAKS_BIN=/private/tmp/gitleaks-8.30.1/gitleaks; GITLEAKS_SHA=ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f; GITLEAKS_VER=8.30.1
 # 统一的流族（card 21）：三个字面量删了。DOMAIN/PKIND/PVER 现在由 e2e-seed 从
 # `domain::ticket_family::TicketFamily` 打印出来（见 step seed 之后的赋值），retrieval worker
@@ -22,6 +22,8 @@ GITLEAKS_BIN=/private/tmp/gitleaks-8.30.1/gitleaks; GITLEAKS_SHA=ba52fb1bfabbcde
 EMB_MODEL=text-embedding-v4; EMB_DIM=1024; EMB_REV=2026-08; EMB_VER=text-embedding-v4@2026-08; EMB_REGION=cn-beijing; EMB_MAX_TOK=8192
 COLLECTION=humaux_private_memory_v1_e2e
 CELL_ID=$(uuidgen | tr 'A-Z' 'a-z'); PEPPER_HEX=$(openssl rand -hex 32)
+# ADR-0059 D-G: one per-run token MAC key, shared by every gateway (re)start of this run; never printed.
+TOKEN_HMAC_HEX=$(openssl rand -hex 32)
 # MiniMax lane（值须与种子一致；provider_id/model 由 seed flags 决定）
 MM_URL=https://api.minimaxi.com/v1/chat/completions; MM_PROVIDER=minimax; MM_MODEL=MiniMax-M3; MM_REV=2026-08; MM_REGION=cn-shanghai; MM_TIER=standard
 # ADR-0058 R10: the rehearsal profile's distill channel, chosen by the live A/B probe
@@ -131,7 +133,7 @@ echo "build profile: $REHEARSE_PROFILE ($BIN_DIR)" | tee -a $EV/rehearsal.log
 step seed
 SEED_OUT=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 --workspaces 2 \
   --processor-id $EGRESS_PROC --region $MM_REGION --service-tier $MM_TIER --endpoint-ref $MM_URL \
-  --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV \
+  --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV --credential-env MINIMAX_API_KEY \
   --collection $COLLECTION --dimension $EMB_DIM --embedding-provider dashscope --embedding-region $EMB_REGION 2>$EV/seed.stderr)
 BEARER=$(print -r -- "$SEED_OUT" | sed -n 's/^Authorization: Bearer //p' | head -1)
 val() { print -r -- "$SEED_OUT" | grep -iE "^[[:space:]]*$1[[:space:]]*[:=]" | head -1 | sed -E 's/^[^:=]*[:=][[:space:]]*//' | tr -d ' '; }
@@ -157,7 +159,7 @@ echo "seed ok tenant=$TENANT ws=$WS domain=$RDOM" | tee -a $EV/rehearsal.log
 step seed_b
 SEED_OUT_B=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 --workspaces 2 \
   --processor-id $EGRESS_PROC --region $MM_REGION --service-tier $MM_TIER --endpoint-ref $MM_URL \
-  --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV \
+  --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV --credential-env MINIMAX_API_KEY \
   --collection $COLLECTION --dimension $EMB_DIM --embedding-provider dashscope --embedding-region $EMB_REGION 2>$EV/seed_b.stderr)
 valb() { print -r -- "$SEED_OUT_B" | grep -iE "^[[:space:]]*$1[[:space:]]*[:=]" | head -1 | sed -E 's/^[^:=]*[:=][[:space:]]*//' | tr -d ' '; }
 export BEARER_A="$BEARER"
@@ -177,7 +179,7 @@ step seed_c
 # with its own admitted lane and key (`bearer_d2:`, a secret) — one tenant, two domains.
 SEED_OUT_C=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 --workspaces 2 --second-domain \
   --processor-id $EGRESS_PROC --region $MM_REGION --service-tier $MM_TIER --endpoint-ref $MM_URL \
-  --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV \
+  --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV --credential-env MINIMAX_API_KEY \
   --collection $COLLECTION --dimension $EMB_DIM --embedding-provider dashscope --embedding-region $EMB_REGION 2>$EV/seed_c.stderr)
 print -r -- "$SEED_OUT_C" | grep -vE 'Bearer|bearer_|export' | tee -a $EV/seed_ids.txt >/dev/null
 seedval() { print -r -- "$1" | grep -iE "^[[:space:]]*$2[[:space:]]*[:=]" | head -1 | sed -E 's/^[^:=]*[:=][[:space:]]*//' | tr -d ' '; }
@@ -190,6 +192,14 @@ for v in TENANT_C WS_C BEARER_C WS_A2 WS_B2 WS_C2 BEARER_A2 BEARER_B2 BEARER_C2 
   [ -z "${(P)v}" ] && { echo "seed_c: $v not parsed from e2e-seed --workspaces 2" | tee -a $EV/rehearsal.log; exit 2; }
 done
 SEEDED="'$TENANT','$TENANT_B','$TENANT_C'"
+# ADR-0059 D-I: the private worker serves a credential reference only if its map names it. Each
+# seed prints the map of the lanes it created (refs and the key variable NAME, never a key); the
+# deployment's map is their union. A seed without one is a red seed, never an unmapped tenant.
+credmap() { print -r -- "$1" | sed -n 's/^export HUMAUX_PRIVATE_WORKER_CREDENTIALS=//p' | head -1; }
+CM_A=$(credmap "$SEED_OUT"); CM_B=$(credmap "$SEED_OUT_B"); CM_C=$(credmap "$SEED_OUT_C")
+[ -z "$CM_A" -o -z "$CM_B" -o -z "$CM_C" ] && { echo "seed: HUMAUX_PRIVATE_WORKER_CREDENTIALS not emitted by every seed" | tee -a $EV/rehearsal.log; exit 2; }
+export HUMAUX_PRIVATE_WORKER_CREDENTIALS="$CM_A,$CM_B,$CM_C"
+echo "credential map: $(print -r -- "$HUMAUX_PRIVATE_WORKER_CREDENTIALS" | tr ',' '\n' | wc -l | tr -d ' ') refs -> MINIMAX_API_KEY" | tee -a $EV/rehearsal.log
 echo "tenants: C=$TENANT_C/$WS_C  second workspaces: A2=$WS_A2 B2=$WS_B2 C2=$WS_C2" | tee -a $EV/rehearsal.log
 
 # ---------- 2. processes ----------
@@ -199,9 +209,9 @@ rm -f $SOCK/*.sock
 # step kill9_rotation. A chaos step that restarts a differently-configured process grades a
 # deployment nobody ran (the same argument $DS_ENV/$CW_ENV already make for the soak).
 start_pw() {
-( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB" \
+( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB" \
     HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
-    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
     HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS"
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
   exec "$BIN_DIR"/humaux-private-worker --serve-rpc >> $EV/private-worker.log 2>&1 ) &
@@ -209,7 +219,7 @@ own_pid pw $!
 }
 start_pw; PW_PID=$(cat $S/pw.pid)
 start_rw() {
-( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:devlocal_role_retrieval_worker@$PG/$DB" \
+( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:${HUMAUX_ROLE_PASSWORD_RETRIEVAL_WORKER:?}@$PG/$DB" \
     HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH=$SOCK/retrieval.sock HUMAUX_RETRIEVAL_WORKER_GATEWAY_UID=$MYUID \
     HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER=dashscope HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL=$EMB_MODEL HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION=$EMB_REV \
     HUMAUX_RETRIEVAL_WORKER_DIMENSION=$EMB_DIM HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
@@ -230,7 +240,7 @@ RP_PASS_ENV="HUMAUX_RETRIEVAL_WORKER_BATCH=16 HUMAUX_RETRIEVAL_WORKER_PER_TENANT
 HUMAUX_RETRIEVAL_WORKER_POLL_INTERVAL_SECS=1 HUMAUX_RETRIEVAL_WORKER_MAX_ATTEMPTS=6 \
 HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS=30 HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS=300"
 start_rp() {
-( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:devlocal_role_retrieval_worker@$PG/$DB" \
+( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:${HUMAUX_ROLE_PASSWORD_RETRIEVAL_WORKER:?}@$PG/$DB" \
     HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER=dashscope HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL=$EMB_MODEL HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION=$EMB_REV \
     HUMAUX_RETRIEVAL_WORKER_DIMENSION=$EMB_DIM HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
     HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=${1:-6333} HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
@@ -246,8 +256,8 @@ start_rp; RP_PID=$(cat $S/rp.pid)
 # One value, read by start_gw AND by step stall_lag's window, so the assertion grades the deployment.
 LAG_SECS=20
 start_gw() {
-( export HUMAUX_GATEWAY_PG_DSN="postgres://role_gateway:devlocal_role_gateway@$PG/$DB" HUMAUX_GATEWAY_BIND_ADDR=127.0.0.1:8080 \
-    HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX=$PEPPER_HEX HUMAUX_GATEWAY_ALLOWED_HOSTS=127.0.0.1:8080 HUMAUX_GATEWAY_ALLOWED_ORIGINS=http://127.0.0.1:8080 \
+( export HUMAUX_GATEWAY_PG_DSN="postgres://role_gateway:${HUMAUX_ROLE_PASSWORD_GATEWAY:?}@$PG/$DB" HUMAUX_GATEWAY_BIND_ADDR=127.0.0.1:8080 \
+    HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX=$PEPPER_HEX HUMAUX_GATEWAY_TOKEN_HMAC_KEY=$TOKEN_HMAC_HEX HUMAUX_GATEWAY_ALLOWED_HOSTS=127.0.0.1:8080 HUMAUX_GATEWAY_ALLOWED_ORIGINS=http://127.0.0.1:8080 \
     HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES=1048576 HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS= HUMAUX_GATEWAY_MAX_FORWARDED_HOPS=1 HUMAUX_GATEWAY_GLOBAL_DENYLIST= HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST= \
     HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS=30 HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS=20 HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS=5 HUMAUX_GATEWAY_REPLAY_TTL_SECONDS=60 \
     HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS=300 HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS=86400 HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS=21600 HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS=$LAG_SECS \
@@ -275,14 +285,14 @@ ls -la $SOCK | tee -a $EV/rehearsal.log
 step readyz
 # Each probe uses exactly the keys ADR-0037 says that probe needs — nothing more, and no tenant
 # id for the two derived workers (ADR-0036 / card 14 env contract).
-rw_readyz() { ( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:devlocal_role_retrieval_worker@$PG/$DB" \
+rw_readyz() { ( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:${HUMAUX_ROLE_PASSWORD_RETRIEVAL_WORKER:?}@$PG/$DB" \
     HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=6333 \
     HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
     HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID HUMAUX_RETRIEVAL_WORKER_CALLER=retrieval-worker
   exec "$BIN_DIR"/humaux-retrieval-worker --readyz ) }
-pw_readyz() { ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB"
+pw_readyz() { ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB"
   exec "$BIN_DIR"/humaux-private-worker --readyz ) }
-cw_readyz() { ( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:devlocal_role_consolidation_worker@$PG/$DB" \
+cw_readyz() { ( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:${HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER:?}@$PG/$DB" \
     HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock
   exec "$BIN_DIR"/humaux-consolidation-worker --readyz ) }
 gw_readyz() { curl -fsS -o /dev/null http://127.0.0.1:8080/readyz; }
@@ -346,8 +356,8 @@ distill_once() {
   done
 }
 distill_pass() {
-( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB" \
-    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB" \
+    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
     HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-distill.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
     HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120
@@ -363,8 +373,8 @@ PGQ "select 'memory: '||authority_class||' '||visibility_class||' '||left(conten
 # every job it claimed. The witness is SQL, not the exit code: after the process is gone, no
 # ops.jobs row may still be PROCESSING with a live lease.
 step sigterm_mid_load
-( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB" \
-    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB" \
+    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
     HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-drain.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
     HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120 \
@@ -386,7 +396,7 @@ tail -n 2 $EV/distill-serve.log | tee -a $EV/rehearsal.log
 
 # ---------- 4. consolidation (second hop, real MiniMax) ----------
 step consolidation
-( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:devlocal_role_consolidation_worker@$PG/$DB" \
+( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:${HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER:?}@$PG/$DB" \
     HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS=120 HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS=10 \
     HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS=50 HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS=120 HUMAUX_CONSOLIDATION_WORKER_BATCH=8 HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5
   exec "$BIN_DIR"/humaux-consolidation-worker --run-once ) > $EV/consolidation.log 2>&1 &
@@ -435,7 +445,7 @@ serve_switch_tenant $TENANT_B $WS_B
 # `derived_jobs_not_done` counted it. A drain is not a drain until the second hop ran too.
 # `--run-once` is one bounded pass then exit (ADR-0036), so this waits for exit, no kill.
 consolidate_once() {
-( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:devlocal_role_consolidation_worker@$PG/$DB" \
+( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:${HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER:?}@$PG/$DB" \
     HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS=120 HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS=10 \
     HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS=50 HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS=120 HUMAUX_CONSOLIDATION_WORKER_BATCH=8 HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5
   exec "$BIN_DIR"/humaux-consolidation-worker --run-once ) >> $EV/consolidation.log 2>&1
@@ -1045,8 +1055,8 @@ assert_eq "no_tenant_env_for_the_projection_runner" \
   "$(sed -n '/^start_rp() {/,/^}/p' $0 | grep -cE 'HUMAUX_RETRIEVAL_WORKER_(TENANT_ID|SCOPE_ID|SCOPE_KIND|QDRANT_COLLECTION)=')" 0
 # The resident distiller for this step (the gate's deployment runs distill resident; the earlier
 # steps drive it one pass at a time). Stopped at the end of the step; the soak starts its own.
-( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB" \
-    HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB" \
+    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
     HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-pst.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
     HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120 \
@@ -1058,7 +1068,7 @@ own_pid ds $!
 # DERIVED_CONSOLIDATE job (0164), and a step that left ~100 of them behind would sit, FIFO, in
 # front of the next rehearsal's own jobs (run 2026-09-29 #2: derived_jobs_not_done red for exactly
 # that reason). The step drains what it created before it ends.
-( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:devlocal_role_consolidation_worker@$PG/$DB" \
+( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:${HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER:?}@$PG/$DB" \
     HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS=120 HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS=10 \
     HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS=50 HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS=120 HUMAUX_CONSOLIDATION_WORKER_BATCH=8 HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5 \
     HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS=1
@@ -1073,7 +1083,12 @@ except Exception: print('')")
 }
 ev_list() { awk -F'\t' '{printf "%s'"'"'%s'"'"'", (NR>1?",":""), $1}' $1; }
 # settled/total tickets of the Evidence in $1
-tickets_settled() { PGQ "select count(*) filter (where s.state in ('DONE','SKIPPED_BY_POLICY'))||'/'||count(*) from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id and s.commit_seq=o.commit_seq where o.event_type='EVIDENCE_ACCEPTED' and o.evidence_id in ($(ev_list $1))"; }
+# A ticket is settled once the runner has nothing left to do with it: DONE, SKIPPED_BY_POLICY, or FAILED
+# `distill_failed` — the §15.2 settlement of a DEAD distill (ADR-0058 R11: fail-closed after one re-ask,
+# bounded by `distill_dead` below, retired by the operator). Counting that FAILED row as unsettled made
+# `projection_lag_within_120s` and `crash_tickets_all_done` grade the model's reply a second time: card-33
+# chain re-run 2026-10-03 11:09 went red on exactly one FAILED_OUTPUT_SCHEMA death in 60 puts.
+tickets_settled() { PGQ "select count(*) filter (where s.state in ('DONE','SKIPPED_BY_POLICY') or (s.state='FAILED' and s.error_class='distill_failed'))||'/'||count(*) from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id and s.commit_seq=o.commit_seq where o.event_type='EVIDENCE_ACCEPTED' and o.evidence_id in ($(ev_list $1))"; }
 wait_settled() { # $1=tsv $2=deadline secs; echoes seconds waited, 0 status when every ticket settled OK
   local i=0 st= want=$(wc -l < $1 | tr -d ' ')
   while [ $i -lt $2 ]; do
@@ -1347,7 +1362,7 @@ PERM_SEQ=$(PGQ "select s.stream_seq from ops.outbox o join projection.stream_log
 PERM_OTHERS=$(PGQ "select count(*) from projection.stream_log s join projection.tenant_placements p on p.tenant_id=s.tenant_id and p.projection_family='private_memory_v1' where s.state='ISSUED' and s.scope_kind='workspace' and s.domain='$DOMAIN' and s.projection_kind='$PKIND' and s.projection_version='$PVER' and (s.lease_expires_at is null or s.lease_expires_at < now()) and (s.next_attempt_at is null or s.next_attempt_at <= now()) and not exists (select 1 from ops.outbox o where o.tenant_id=s.tenant_id and o.commit_seq=s.commit_seq and o.event_type='EVIDENCE_ACCEPTED' and o.status in ('PENDING','PROCESSING')) and not (s.tenant_id='$TENANT_C' and s.scope_id='$WS_C2' and s.stream_seq=${PERM_SEQ:-0})")
 PTS_BEFORE=$(curl -s -X POST "http://127.0.0.1:6333/collections/$COLLECTION/points/count" -H 'Content-Type: application/json' --data "{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"tenant_id\",\"match\":{\"value\":\"$TENANT_C\"}},{\"key\":\"workspace_id\",\"match\":{\"value\":\"$WS_C2\"}}]}}" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['count'])")
 if [ "$PERM_OTHERS" = "0" ]; then
-  ( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:devlocal_role_retrieval_worker@$PG/$DB" \
+  ( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:${HUMAUX_ROLE_PASSWORD_RETRIEVAL_WORKER:?}@$PG/$DB" \
       HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER=dashscope HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL=$EMB_MODEL HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION=$EMB_REV \
       HUMAUX_RETRIEVAL_WORKER_DIMENSION=512 HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
       HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=6333 HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
@@ -1645,7 +1660,7 @@ echo "soak tenants: A=$TENANT/$WS  B=$TENANT_B/$WS_B" | tee -a $EV/rehearsal.log
 # Self-contained hook scripts: the chaos/probe commands are run by `sh -c` out of xtask, so they
 # cannot see this shell's functions. No API key is written into any of them — the retrieval
 # worker's restart sources $R/.env.local exactly as step 2 does.
-RW_ENV="export HUMAUX_RETRIEVAL_WORKER_PG_DSN='postgres://role_retrieval_worker:devlocal_role_retrieval_worker@$PG/$DB' \
+RW_ENV="export HUMAUX_RETRIEVAL_WORKER_PG_DSN=\"postgres://role_retrieval_worker:\${HUMAUX_ROLE_PASSWORD_RETRIEVAL_WORKER:?}@$PG/$DB\" \
 HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=6333 \
 HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
 HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID \
@@ -1660,15 +1675,15 @@ HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GI
 # One definition per worker, used by BOTH the resident spawn below and its chaos restart, so a
 # restarted process is the same process — a chaos hook that starts a differently-configured
 # worker grades a deployment nobody ran.
-DS_ENV="export PRIVATE_WORKER_PG_DSN='postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB' \
-HUMAUX_PRIVATE_WORKER_KEY_ENV=MINIMAX_API_KEY HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+DS_ENV="export PRIVATE_WORKER_PG_DSN=\"postgres://role_private_worker:\${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB\" \
+HUMAUX_PRIVATE_WORKER_CREDENTIALS='$HUMAUX_PRIVATE_WORKER_CREDENTIALS' HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
 HUMAUX_PRIVATE_WORKER_DNS_PINS='$MM_PINS' HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-soak.sock \
 HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
 HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 \
 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 \
 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120 \
 HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=3"
-CW_ENV="export CONSOLIDATION_WORKER_PG_DSN='postgres://role_consolidation_worker:devlocal_role_consolidation_worker@$PG/$DB' \
+CW_ENV="export CONSOLIDATION_WORKER_PG_DSN=\"postgres://role_consolidation_worker:\${HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER:?}@$PG/$DB\" \
 HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS=120 \
 HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS=10 HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS=50 \
 HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS=120 HUMAUX_CONSOLIDATION_WORKER_BATCH=8 \
@@ -1683,7 +1698,7 @@ EOF
 cat > $S/soak_probe_pw.sh <<EOF
 #!/bin/sh
 cd $R || exit 1
-PRIVATE_WORKER_PG_DSN='postgres://role_private_worker:devlocal_role_private_worker@$PG/$DB'
+PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:\${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB"
 export PRIVATE_WORKER_PG_DSN
 exec "$BIN_DIR"/humaux-private-worker --readyz
 EOF
