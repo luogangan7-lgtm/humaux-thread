@@ -1,0 +1,91 @@
+# §46.1 migration manifest. Card 33b slice 1 / ADR-0060: JSON_OBJECT in the §11.2 capability closed set;
+# control.reasoning_profiles.request_extras with its adapter-owned-key CHECK; the tenant-scoped
+# control.reasoning_profile_capabilities definer; the ledger snapshot CHECK gains the private arm and
+# the BEFORE INSERT validator requires a current exact admission for private rows (no role exemption);
+# private.processing_runs names its Profile@version; one reserve transaction for ledger row + disclosure
+# (widened disclosure validator + deferred constraint trigger); fair-share tenant order in
+# ops.claim_derived_work_v2; control.reasoning_credential_accounts and control.observe_reasoning_route_health
+# (role_private_worker only). §46 forward-fix (EXPAND_CONTRACT, first free after 0205).
+
+migration_id = "0206_reasoning_route_runtime"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('control.reasoning_profile_capabilities(uuid,bigint)') is null
+ and to_regprocedure('control.reasoning_credential_accounts(uuid[])') is null
+ and to_regprocedure('control.observe_reasoning_route_health(uuid,boolean,bigint)') is null
+ and to_regprocedure('control.resolve_user_reasoning_admission(uuid,bigint,uuid,text)') is not null
+ and to_regprocedure('ops.claim_derived_work_v2(text,double precision,double precision)') is not null
+ and (select count(*) from pg_constraint
+       where conname in ('user_reasoning_profiles_capabilities_known',
+                         'processor_models_capabilities_check',
+                         'reasoning_profiles_capabilities_check')
+         and pg_get_constraintdef(oid) like '%''REASONING_SPLIT''%'
+         and pg_get_constraintdef(oid) not like '%JSON_OBJECT%') = 3
+ and not exists (select 1 from information_schema.columns
+                  where table_schema = 'private' and table_name = 'processing_runs'
+                    and column_name in ('profile_id', 'profile_version'))
+ as precheck_ok
+"""
+
+postcheck = """
+with non_owner(r) as (values ('role_gateway'), ('role_private_worker'), ('role_consolidation_worker'),
+  ('role_public_worker'), ('role_retrieval_worker'), ('role_batch_issuer'), ('role_maintenance'),
+  ('role_admin')),
+worker_definers(sig) as (values ('control.reasoning_profile_capabilities(uuid,bigint)'),
+  ('control.reasoning_credential_accounts(uuid[])'),
+  ('control.observe_reasoning_route_health(uuid,boolean,bigint)'))
+select
+  (select count(*) from pg_constraint
+    where conname in ('user_reasoning_profiles_capabilities_known',
+                      'processor_models_capabilities_check',
+                      'reasoning_profiles_capabilities_check')
+      and convalidated and pg_get_constraintdef(oid) like '%''JSON_OBJECT''%') = 3
+  and (select convalidated and pg_get_constraintdef(oid) like '%max_completion_tokens%'
+         from pg_constraint where conname = 'reasoning_profiles_request_extras_check')
+  and (select attnotnull from pg_attribute
+        where attrelid = 'control.reasoning_profiles'::regclass and attname = 'request_extras')
+  -- the three worker definers: owner, SECURITY DEFINER, pinned search_path, EXECUTE exactly
+  -- {role_private_worker}, no PUBLIC EXECUTE
+  and (select bool_and(
+          pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+          and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+          and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                           where x.grantee = 0 and x.privilege_type = 'EXECUTE')
+          and (select bool_and(has_function_privilege(n.r, p.oid, 'EXECUTE') = (n.r = 'role_private_worker'))
+                 from non_owner n))
+         from worker_definers w join pg_proc p on p.oid = to_regprocedure(w.sig)) is true
+  and (select count(*) from worker_definers w where to_regprocedure(w.sig) is not null) = 3
+  -- ledger CHECK carries the private arm and keeps the no-cost-estimate rule
+  and (select convalidated
+              and pg_get_constraintdef(oid) like '%PRIVATE_DISTILL_TEXT%'
+              and pg_get_constraintdef(oid) like '%estimated_cost IS NULL%'
+         from pg_constraint where conname = 'model_call_ledger_reasoning_snapshot_shape')
+  and position('PRIVATE_DISTILL_TEXT' in pg_get_functiondef('ops.reasoning_model_call_validate()'::regprocedure)) > 0
+  and position('PRIVATE_CONSOLIDATE' in pg_get_functiondef('ops.data_disclosure_reasoning_model_call_validate()'::regprocedure)) > 0
+  and exists (select 1 from pg_trigger
+               where tgrelid = 'ops.model_call_ledger'::regclass
+                 and tgname = 'model_call_ledger_private_disclosure_present'
+                 and tgdeferrable and tginitdeferred)
+  and (select pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+              and (select bool_and(not has_function_privilege(n.r, p.oid, 'EXECUTE')) from non_owner n)
+         from pg_proc p where p.oid = 'ops.model_call_ledger_private_disclosure_present()'::regprocedure)
+  -- processing_runs profile pair + FK
+  and (select count(*) from information_schema.columns
+        where table_schema = 'private' and table_name = 'processing_runs'
+          and column_name in ('profile_id', 'profile_version') and is_nullable = 'YES') = 2
+  and exists (select 1 from pg_constraint where conname = 'processing_runs_profile_pair' and convalidated)
+  and exists (select 1 from pg_constraint where conname = 'processing_runs_profile_fk' and contype = 'f')
+  -- fair-share claim: new ORDER BY, ACL unchanged (EXECUTE exactly {role_private_worker})
+  and (select pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+              and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+              and position('ops.provider_slots sl JOIN ops.jobs hj' in pg_get_functiondef(p.oid)) > 0
+              and (select bool_and(has_function_privilege(n.r, p.oid, 'EXECUTE') = (n.r = 'role_private_worker'))
+                     from non_owner n)
+         from pg_proc p
+        where p.oid = 'ops.claim_derived_work_v2(text,double precision,double precision)'::regprocedure)
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward-fix only. Undoing it means: drop the three control definers, the deferred constraint trigger and its function, and the processing_runs profile columns; re-create the 0195 capability CHECKs (fails while a row declares JSON_OBJECT), drop request_extras, restore the 0130 ledger CHECK text (fails once a private row carries a route), the 0168 validator body, the 0130 disclosure validator body and the 0193 claim body. Private rows reserved after 0206 cannot satisfy the 0130 CHECK, so a revert is a data migration, not a DDL swap."
+backup_restore_requirement = "none: no row data is changed; constraint validation scans only. A pg_dump of control.reasoning_profiles, ops.model_call_ledger and private.processing_runs before deploy is enough to inspect any refusal."

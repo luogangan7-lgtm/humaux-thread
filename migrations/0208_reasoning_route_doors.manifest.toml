@@ -1,0 +1,48 @@
+# §46.1 migration manifest. Card 33b slice 4 / ADR-0060 D-H: the operator reasoning-route doors —
+# control.register_reasoning_profile, control.bind_reasoning_domain (R2 projection with successor
+# Binding@version), control.attest_reasoning_route_health (OPERATOR_ATTEST, explicit validity),
+# control.set_reasoning_profile_enabled and the read-only control.reasoning_route_status (ruling E3 (c)).
+# Owner role_migration_owner, SECURITY DEFINER, search_path pinned to pg_catalog, PUBLIC has no EXECUTE,
+# role_maintenance is the only non-owner role with EXECUTE. No table grant, no DML.
+# §46 forward-fix (EXPAND_CONTRACT, first free after 0207).
+
+migration_id = "0208_reasoning_route_doors"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('control.register_reasoning_profile(uuid,uuid,text,text,text,text[],jsonb,bytea,text,text,text,uuid,uuid,uuid)') is null
+ and to_regprocedure('control.bind_reasoning_domain(uuid,uuid,text,uuid,bigint)') is null
+ and to_regprocedure('control.attest_reasoning_route_health(uuid,uuid,bigint,bigint)') is null
+ and to_regprocedure('control.set_reasoning_profile_enabled(uuid,uuid,bigint,boolean)') is null
+ and to_regprocedure('control.reasoning_route_status(uuid)') is null
+ and to_regprocedure('control.reasoning_route_health_state(uuid,bigint)') is not null
+ and exists (select 1 from pg_attribute
+              where attrelid = 'control.reasoning_profiles'::regclass and attname = 'request_extras')
+ as precheck_ok
+"""
+
+postcheck = """
+with non_owner(r) as (values ('role_gateway'), ('role_private_worker'), ('role_consolidation_worker'),
+  ('role_public_worker'), ('role_retrieval_worker'), ('role_batch_issuer'), ('role_maintenance'),
+  ('role_admin')),
+doors(sig) as (values
+  ('control.register_reasoning_profile(uuid,uuid,text,text,text,text[],jsonb,bytea,text,text,text,uuid,uuid,uuid)'),
+  ('control.bind_reasoning_domain(uuid,uuid,text,uuid,bigint)'),
+  ('control.attest_reasoning_route_health(uuid,uuid,bigint,bigint)'),
+  ('control.set_reasoning_profile_enabled(uuid,uuid,bigint,boolean)'),
+  ('control.reasoning_route_status(uuid)'))
+select
+  (select count(*) from doors d where to_regprocedure(d.sig) is not null) = 5
+  and (select bool_and(
+          pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+          and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+          and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                           where x.grantee = 0 and x.privilege_type = 'EXECUTE')
+          and (select bool_and(has_function_privilege(n.r, p.oid, 'EXECUTE') = (n.r = 'role_maintenance'))
+                 from non_owner n))
+         from doors d join pg_proc p on p.oid = to_regprocedure(d.sig)) is true
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward-fix only: DROP FUNCTION each of the five control.* doors above. Routes already written stay valid (they are ordinary 0128 rows); after the drop a new route is written only by owner SQL again, and humaux-maintenance reasoning ... exits 1."
+backup_restore_requirement = "none: five functions, no row data changed."

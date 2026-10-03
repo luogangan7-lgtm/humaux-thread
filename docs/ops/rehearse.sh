@@ -24,19 +24,41 @@ COLLECTION=humaux_private_memory_v1_e2e
 CELL_ID=$(uuidgen | tr 'A-Z' 'a-z'); PEPPER_HEX=$(openssl rand -hex 32)
 # ADR-0059 D-G: one per-run token MAC key, shared by every gateway (re)start of this run; never printed.
 TOKEN_HMAC_HEX=$(openssl rand -hex 32)
-# MiniMax lane（值须与种子一致；provider_id/model 由 seed flags 决定）
-MM_URL=https://api.minimaxi.com/v1/chat/completions; MM_PROVIDER=minimax; MM_MODEL=MiniMax-M3; MM_REV=2026-08; MM_REGION=cn-shanghai; MM_TIER=standard
+# MiniMax lane (tenants A and B): the values `humaux-maintenance reasoning register` declares (ADR-0060 D-H).
+MM_URL=https://api.minimaxi.com/v1/chat/completions; MM_PROVIDER=minimax; MM_MODEL=MiniMax-M3; MM_REV=caps-REASONING_SPLIT.STRUCTURED_OUTPUT.TEXT.TOOL_CALLS; MM_REGION=cn-shanghai; MM_TIER=standard
 # ADR-0058 R10: the rehearsal profile's distill channel, chosen by the live A/B probe
 # `distill_channel_ab_live` (rule: TOOL_CALLS only if the tool channel's DEAD count and first-reply
 # malformed rate are not higher than the content channel's). 2026-10-03, n=100 each: tool dead=0
 # malformed=1, content dead=1 malformed=6 -> TOOL_CALLS. One definition for every worker below.
-PW_CAPABILITIES=STRUCTURED_OUTPUT,TOOL_CALLS,REASONING_SPLIT
+# ADR-0060 D-A / D-B / E5: the registered profile declares this set (reasoning register --capabilities)
+# and the worker builds each call's provider from its admitted route — no worker env names a provider,
+# model, endpoint or capability (D-C). The catalog row for a tool-capable profile is a new revision
+# label (MM_REV above; the 2026-08 row is frozen at TEXT,STRUCTURED_OUTPUT; never on the wire).
+PW_CAPABILITIES=TEXT,STRUCTURED_OUTPUT,TOOL_CALLS,REASONING_SPLIT
+# ADR-0060 ruling E3: traffic renews a route's health once less than half of this is left (the
+# operator attestation below covers the whole run; renewal keeps a busy route admissible beyond it).
+PW_HEALTH_RENEW_SECS=1800
 EGRESS_PROC=$(uuidgen | tr 'A-Z' 'a-z')
 step() { echo "### STEP $1 $(date +%T)" | tee -a $EV/rehearsal.log; }
 doh_ips() { curl -s "https://dns.alidns.com/resolve?name=$1&type=A" | python3 -c "import sys,json; d=json.load(sys.stdin); print('|'.join(a['data'] for a in d.get('Answer',[]) if a.get('type')==1))"; }
 MM_HOST=$(print -r -- "$MM_URL" | sed -E 's#https://([^/]+)/.*#\1#')
 MM_PINS="$MM_HOST=$(doh_ips $MM_HOST)"
 echo "dns pins: $MM_PINS" | tee -a $EV/rehearsal.log
+# ADR-0060 (card 33b, research amendment 5): tenant C reasons on a second provider taken from the
+# environment — the repo names no vendor. The nine names below (and the key variable the map will name)
+# are required before anything is seeded; a missing one is exit 2, never a single-provider rehearsal.
+# HUMAUX_LIVE_P2_DNS_PINS is optional (absent = no pin). HUMAUX_LIVE_P2_HOSTS is `|`-separated, the
+# separator HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS uses inside one recipient (live_provider.rs agrees).
+for v in HUMAUX_LIVE_P2_BASE_URL HUMAUX_LIVE_P2_HOSTS HUMAUX_LIVE_P2_MODEL HUMAUX_LIVE_P2_CAPABILITIES \
+         HUMAUX_LIVE_P2_REQUEST_EXTRAS HUMAUX_LIVE_P2_KEY_ENV HUMAUX_LIVE_P2_PROVIDER_ID \
+         HUMAUX_LIVE_P2_REGION HUMAUX_LIVE_P2_EGRESS_PROCESSOR_ID; do
+  [ -n "${(P)v:-}" ] || { echo "second provider: $v is not set (ADR-0060 research amendment 5)" | tee -a $EV/rehearsal.log; exit 2; }
+done
+case "$HUMAUX_LIVE_P2_HOSTS" in *,*) echo "second provider: HUMAUX_LIVE_P2_HOSTS is |-separated, not comma-separated" | tee -a $EV/rehearsal.log; exit 2;; esac
+[ -n "${(P)HUMAUX_LIVE_P2_KEY_ENV:-}" ] || { echo "second provider: the variable named by HUMAUX_LIVE_P2_KEY_ENV is not set" | tee -a $EV/rehearsal.log; exit 2; }
+# Ruling E5: the second provider's catalog label is its sorted capability set (never on the wire).
+P2_REV=caps-$(print -r -- "$HUMAUX_LIVE_P2_CAPABILITIES" | tr ',' '\n' | sort | paste -sd. -); P2_TIER=standard
+PW_DNS_PINS="$MM_PINS${HUMAUX_LIVE_P2_DNS_PINS:+,$HUMAUX_LIVE_P2_DNS_PINS}"
 
 # ---------- process ownership (HARD RULE — after the 2026-09-09 incident) ----------
 # Every process this script starts records its PID in $S/<name>.pid, and NOTHING here ever
@@ -126,14 +148,15 @@ except Exception as e: print('0 unparsed(%s)' % type(e).__name__)")
 # ---------- 0. build ----------
 step build
 BUILD_FLAGS=(); [ "$REHEARSE_PROFILE" = release ] && BUILD_FLAGS=(--release)
-cargo build $BUILD_FLAGS -p humaux-gateway -p humaux-retrieval-worker -p humaux-consolidation-worker -p humaux-private-worker -p xtask 2>&1 | tail -2 | tee -a $EV/rehearsal.log
+cargo build $BUILD_FLAGS -p humaux-gateway -p humaux-retrieval-worker -p humaux-consolidation-worker -p humaux-private-worker -p humaux-maintenance -p xtask 2>&1 | tail -2 | tee -a $EV/rehearsal.log
 echo "build profile: $REHEARSE_PROFILE ($BIN_DIR)" | tee -a $EV/rehearsal.log
 
 # ---------- 1. seed (stdout kept in a variable only) ----------
+# ADR-0060 D-H (card 33b): `--no-lane` — the seed writes tenants, users, domains and keys only; every
+# reasoning route comes from the operator doors in step onboard_routes below.
 step seed
 SEED_OUT=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 --workspaces 2 \
-  --processor-id $EGRESS_PROC --region $MM_REGION --service-tier $MM_TIER --endpoint-ref $MM_URL \
-  --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV --credential-env MINIMAX_API_KEY \
+  --no-lane --processor-id $EGRESS_PROC \
   --collection $COLLECTION --dimension $EMB_DIM --embedding-provider dashscope --embedding-region $EMB_REGION 2>$EV/seed.stderr)
 BEARER=$(print -r -- "$SEED_OUT" | sed -n 's/^Authorization: Bearer //p' | head -1)
 val() { print -r -- "$SEED_OUT" | grep -iE "^[[:space:]]*$1[[:space:]]*[:=]" | head -1 | sed -E 's/^[^:=]*[:=][[:space:]]*//' | tr -d ' '; }
@@ -158,8 +181,7 @@ echo "seed ok tenant=$TENANT ws=$WS domain=$RDOM" | tee -a $EV/rehearsal.log
 # tenants get $EGRESS_PROC or tenant B's distill defers every row forever, silently (card 16 P0).
 step seed_b
 SEED_OUT_B=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 --workspaces 2 \
-  --processor-id $EGRESS_PROC --region $MM_REGION --service-tier $MM_TIER --endpoint-ref $MM_URL \
-  --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV --credential-env MINIMAX_API_KEY \
+  --no-lane --processor-id $EGRESS_PROC \
   --collection $COLLECTION --dimension $EMB_DIM --embedding-provider dashscope --embedding-region $EMB_REGION 2>$EV/seed_b.stderr)
 valb() { print -r -- "$SEED_OUT_B" | grep -iE "^[[:space:]]*$1[[:space:]]*[:=]" | head -1 | sed -E 's/^[^:=]*[:=][[:space:]]*//' | tr -d ' '; }
 export BEARER_A="$BEARER"
@@ -178,29 +200,83 @@ step seed_c
 # Card 32 (ADR-0058 M8 twin): tenant C also gets a second user who owns a second reasoning domain
 # with its own admitted lane and key (`bearer_d2:`, a secret) — one tenant, two domains.
 SEED_OUT_C=$(cargo run -q -p xtask -- e2e-seed --pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 1000 --workspaces 2 --second-domain \
-  --processor-id $EGRESS_PROC --region $MM_REGION --service-tier $MM_TIER --endpoint-ref $MM_URL \
-  --provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV --credential-env MINIMAX_API_KEY \
+  --no-lane --processor-id $EGRESS_PROC \
   --collection $COLLECTION --dimension $EMB_DIM --embedding-provider dashscope --embedding-region $EMB_REGION 2>$EV/seed_c.stderr)
 print -r -- "$SEED_OUT_C" | grep -vE 'Bearer|bearer_|export' | tee -a $EV/seed_ids.txt >/dev/null
 seedval() { print -r -- "$1" | grep -iE "^[[:space:]]*$2[[:space:]]*[:=]" | head -1 | sed -E 's/^[^:=]*[:=][[:space:]]*//' | tr -d ' '; }
 TENANT_C=$(seedval "$SEED_OUT_C" tenant_id); WS_C=$(seedval "$SEED_OUT_C" workspace_id)
+USERID_C=$(seedval "$SEED_OUT_C" user_id); RDOM_C=$(seedval "$SEED_OUT_C" reasoning_domain_id); USERID_C2=$(seedval "$SEED_OUT_C" second_user_id)
 export BEARER_C=$(print -r -- "$SEED_OUT_C" | sed -n 's/^Authorization: Bearer //p' | head -1)
 WS_A2=$(seedval "$SEED_OUT" workspace_id_2); WS_B2=$(seedval "$SEED_OUT_B" workspace_id_2); WS_C2=$(seedval "$SEED_OUT_C" workspace_id_2)
 export BEARER_A2=$(seedval "$SEED_OUT" bearer_2) BEARER_B2=$(seedval "$SEED_OUT_B" bearer_2) BEARER_C2=$(seedval "$SEED_OUT_C" bearer_2)
 export BEARER_C_D2=$(seedval "$SEED_OUT_C" bearer_d2); RDOM_C2=$(seedval "$SEED_OUT_C" second_reasoning_domain_id)
-for v in TENANT_C WS_C BEARER_C WS_A2 WS_B2 WS_C2 BEARER_A2 BEARER_B2 BEARER_C2 BEARER_C_D2 RDOM_C2; do
+for v in TENANT_C WS_C BEARER_C WS_A2 WS_B2 WS_C2 BEARER_A2 BEARER_B2 BEARER_C2 BEARER_C_D2 RDOM_C2 USERID USERID_B USERID_C USERID_C2 RDOM RDOM_B RDOM_C; do
   [ -z "${(P)v}" ] && { echo "seed_c: $v not parsed from e2e-seed --workspaces 2" | tee -a $EV/rehearsal.log; exit 2; }
 done
 SEEDED="'$TENANT','$TENANT_B','$TENANT_C'"
-# ADR-0059 D-I: the private worker serves a credential reference only if its map names it. Each
-# seed prints the map of the lanes it created (refs and the key variable NAME, never a key); the
-# deployment's map is their union. A seed without one is a red seed, never an unmapped tenant.
-credmap() { print -r -- "$1" | sed -n 's/^export HUMAUX_PRIVATE_WORKER_CREDENTIALS=//p' | head -1; }
-CM_A=$(credmap "$SEED_OUT"); CM_B=$(credmap "$SEED_OUT_B"); CM_C=$(credmap "$SEED_OUT_C")
-[ -z "$CM_A" -o -z "$CM_B" -o -z "$CM_C" ] && { echo "seed: HUMAUX_PRIVATE_WORKER_CREDENTIALS not emitted by every seed" | tee -a $EV/rehearsal.log; exit 2; }
-export HUMAUX_PRIVATE_WORKER_CREDENTIALS="$CM_A,$CM_B,$CM_C"
-echo "credential map: $(print -r -- "$HUMAUX_PRIVATE_WORKER_CREDENTIALS" | tr ',' '\n' | wc -l | tr -d ' ') refs -> MINIMAX_API_KEY" | tee -a $EV/rehearsal.log
 echo "tenants: C=$TENANT_C/$WS_C  second workspaces: A2=$WS_A2 B2=$WS_B2 C2=$WS_C2" | tee -a $EV/rehearsal.log
+
+# ---------- 1d. reasoning routes through the operator doors (ADR-0060 D-H, card 33b) ----------
+# Every domain is routed the way an operator does it: `humaux-maintenance reasoning register`
+# (Profile@version + a credential reference) → `bind` (both derived purposes, the R2 projection) →
+# `attest-health` (OPERATOR_ATTEST, valid for the whole run, ruling E3 (a)). Tenants A and B reason
+# on the first provider and declare ONE vendor account (same --account-ref), so their references may
+# share MINIMAX_API_KEY (ADR-0060 D-J); tenant C — both domains; its checks are model-independent —
+# reasons on the second provider. The worker's credential map, recipient (uuid=hosts) and region lists
+# are composed from the receipts; the workers start only after this step (L15). Receipts hold ids
+# and variable NAMES only.
+step onboard_routes
+MAINT=("$BIN_DIR"/humaux-maintenance)
+RADMIN=(--actor rehearsal --reason "card 33b rehearsal onboarding" --ticket C33B-REHEARSAL --step-up-auth rehearsal-local)
+ATTEST_SECS=$(( ${SOAK_SECS:-0} + ${SOAK_DRAIN:-150} + 5400 ))
+MM_ROUTE=(--provider-id $MM_PROVIDER --provider-model-id $MM_MODEL --model-revision $MM_REV
+  --capabilities $PW_CAPABILITIES --account-ref rehearsal-minimax --request-extras '{"reasoning_split":true}'
+  --endpoint-ref $MM_URL --region $MM_REGION --service-tier $MM_TIER --egress-processor-id $EGRESS_PROC)
+P2_ROUTE=(--provider-id $HUMAUX_LIVE_P2_PROVIDER_ID --provider-model-id $HUMAUX_LIVE_P2_MODEL --model-revision $P2_REV
+  --capabilities $HUMAUX_LIVE_P2_CAPABILITIES --account-ref rehearsal-p2 --request-extras "$HUMAUX_LIVE_P2_REQUEST_EXTRAS"
+  --endpoint-ref $HUMAUX_LIVE_P2_BASE_URL --region $HUMAUX_LIVE_P2_REGION --service-tier $P2_TIER
+  --egress-processor-id $HUMAUX_LIVE_P2_EGRESS_PROCESSOR_ID)
+rcpt() { python3 -c "import sys,json
+try: print(json.loads(sys.stdin.read().strip().splitlines()[-1]).get(sys.argv[1],''))
+except Exception: print('')" "$1"; }
+CRED_MAP=""; ROUTE_PROFILES=()
+onboard_route() { # $1=route array name $2=key variable NAME $3=tenant $4=owner user $5=reasoning domain
+  local out prof ver ref purpose
+  out=$("${MAINT[@]}" reasoning register --tenant $3 --owner-user $4 "${(@P)1}" "${RADMIN[@]}" 2>>$EV/onboard.stderr)
+  print -r -- "$out" >> $EV/onboard.log
+  prof=$(print -r -- "$out" | rcpt profile_id); ver=$(print -r -- "$out" | rcpt profile_version); ref=$(print -r -- "$out" | rcpt credential_ref)
+  [ -n "$prof" -a -n "$ver" -a -n "$ref" ] || { echo "onboard_routes: register refused for tenant $3 ($(print -r -- "$out" | tail -1))" | tee -a $EV/rehearsal.log; exit 2; }
+  for purpose in PRIVATE_DISTILL_TEXT PRIVATE_CONSOLIDATE; do
+    "${MAINT[@]}" reasoning bind --tenant $3 --domain $5 --purpose $purpose --profile $prof --profile-version $ver "${RADMIN[@]}" >> $EV/onboard.log 2>>$EV/onboard.stderr \
+      || { echo "onboard_routes: bind $purpose refused for tenant $3 domain $5" | tee -a $EV/rehearsal.log; exit 2; }
+  done
+  "${MAINT[@]}" reasoning attest-health --tenant $3 --profile $prof --profile-version $ver --valid-for-secs $ATTEST_SECS "${RADMIN[@]}" >> $EV/onboard.log 2>>$EV/onboard.stderr \
+    || { echo "onboard_routes: attest-health refused for tenant $3" | tee -a $EV/rehearsal.log; exit 2; }
+  ROUTE_PROFILES+=("$3 $prof $ver")
+  CRED_MAP="${CRED_MAP:+$CRED_MAP,}$ref=$2"
+  echo "onboard_routes: tenant=$3 domain=$5 profile=$prof@$ver credential_ref=$ref -> $2 (valid ${ATTEST_SECS}s)" | tee -a $EV/rehearsal.log
+}
+onboard_route MM_ROUTE MINIMAX_API_KEY $TENANT $USERID $RDOM
+onboard_route MM_ROUTE MINIMAX_API_KEY $TENANT_B $USERID_B $RDOM_B
+onboard_route P2_ROUTE $HUMAUX_LIVE_P2_KEY_ENV $TENANT_C $USERID_C $RDOM_C
+onboard_route P2_ROUTE $HUMAUX_LIVE_P2_KEY_ENV $TENANT_C $USERID_C2 $RDOM_C2
+# ADR-0059 D-I / ADR-0060 D-C, D-J, D-L: the worker serves a reference only if its map names it, dials
+# a recipient only at the hosts listed for it, and only in a listed region (deny-only, never selects).
+export HUMAUX_PRIVATE_WORKER_CREDENTIALS="$CRED_MAP"
+# parse_recipients / parse_regions refuse a repeated entry, so a shared recipient or region is listed once.
+if [ "$HUMAUX_LIVE_P2_EGRESS_PROCESSOR_ID" = "$EGRESS_PROC" ]; then
+  export HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS="$EGRESS_PROC=$MM_HOST|$HUMAUX_LIVE_P2_HOSTS"
+else
+  export HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS="$EGRESS_PROC=$MM_HOST,$HUMAUX_LIVE_P2_EGRESS_PROCESSOR_ID=$HUMAUX_LIVE_P2_HOSTS"
+fi
+if [ "$HUMAUX_LIVE_P2_REGION" = "$MM_REGION" ]; then
+  export HUMAUX_PRIVATE_WORKER_REGIONS="$MM_REGION"
+else
+  export HUMAUX_PRIVATE_WORKER_REGIONS="$MM_REGION,$HUMAUX_LIVE_P2_REGION"
+fi
+echo "credential map: ${#ROUTE_PROFILES} refs; recipients: ${#${(s:,:)HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS}}; regions: $HUMAUX_PRIVATE_WORKER_REGIONS" | tee -a $EV/rehearsal.log
+"${MAINT[@]}" reasoning status --tenant $TENANT_C > $EV/route_status_c.json 2>>$EV/onboard.stderr
+echo "route status C: $(python3 -c "import sys,json; print(' '.join(r['purpose']+'='+r['health'] for r in json.load(sys.stdin)['routes']))" < $EV/route_status_c.json 2>/dev/null)" | tee -a $EV/rehearsal.log
 
 # ---------- 2. processes ----------
 step processes
@@ -211,8 +287,8 @@ rm -f $SOCK/*.sock
 start_pw() {
 ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB" \
     HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
-    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
-    HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS"
+    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS=$PW_HEALTH_RENEW_SECS HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+    HUMAUX_PRIVATE_WORKER_DNS_PINS="$PW_DNS_PINS"
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
   exec "$BIN_DIR"/humaux-private-worker --serve-rpc >> $EV/private-worker.log 2>&1 ) &
 own_pid pw $!
@@ -357,8 +433,8 @@ distill_once() {
 }
 distill_pass() {
 ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB" \
-    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
-    HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-distill.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
+    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS=$PW_HEALTH_RENEW_SECS HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+    HUMAUX_PRIVATE_WORKER_DNS_PINS="$PW_DNS_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-distill.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
     HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
@@ -374,8 +450,8 @@ PGQ "select 'memory: '||authority_class||' '||visibility_class||' '||left(conten
 # ops.jobs row may still be PROCESSING with a live lease.
 step sigterm_mid_load
 ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB" \
-    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
-    HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-drain.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
+    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS=$PW_HEALTH_RENEW_SECS HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+    HUMAUX_PRIVATE_WORKER_DNS_PINS="$PW_DNS_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-drain.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
     HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120 \
     HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=3
@@ -1056,8 +1132,8 @@ assert_eq "no_tenant_env_for_the_projection_runner" \
 # The resident distiller for this step (the gate's deployment runs distill resident; the earlier
 # steps drive it one pass at a time). Stopped at the end of the step; the soak starts its own.
 ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB" \
-    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
-    HUMAUX_PRIVATE_WORKER_DNS_PINS="$MM_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-pst.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
+    HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS=$PW_HEALTH_RENEW_SECS HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+    HUMAUX_PRIVATE_WORKER_DNS_PINS="$PW_DNS_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-pst.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
     HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120 \
     HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=1
@@ -1639,6 +1715,16 @@ echo "pst derived backlog of the seeded tenants after ${i}s: $PST_BACKLOG" | tee
 assert_eq "pst_leaves_no_derived_backlog(n=$(PGQ "select count(*) from ops.jobs where tenant_id in ($SEEDED) and left(job_type,8)='DERIVED_'") jobs)" "$PST_BACKLOG" 0
 own_signal $S/ds.pid humaux-private-worker TERM 90 | tee -a $EV/rehearsal.log
 own_signal $S/cw.pid humaux-consolidation-worker TERM 90 | tee -a $EV/rehearsal.log
+# ADR-0060 (card 33b, T32): one deployed worker served two providers, each tenant on its own route.
+# Counted from the SUCCEEDED private-reasoning ledger rows the worker wrote for the seeded tenants.
+PRIV_PURPOSES="'PRIVATE_DISTILL_TEXT','PRIVATE_CONSOLIDATE'"
+C33B_PROV=$(PGQ "select count(distinct provider||'/'||model) from ops.model_call_ledger where tenant_id in ($SEEDED) and purpose in ($PRIV_PURPOSES) and status='SUCCEEDED'")
+C33B_C_OFF=$(PGQ "select count(*) from ops.model_call_ledger where tenant_id='$TENANT_C' and purpose in ($PRIV_PURPOSES) and status='SUCCEEDED' and provider<>'$HUMAUX_LIVE_P2_PROVIDER_ID'")
+C33B_AB_OFF=$(PGQ "select count(*) from ops.model_call_ledger where tenant_id in ('$TENANT','$TENANT_B') and purpose in ($PRIV_PURPOSES) and status='SUCCEEDED' and provider<>'$MM_PROVIDER'")
+C33B_N=$(PGQ "select count(*) from ops.model_call_ledger where tenant_id in ($SEEDED) and purpose in ($PRIV_PURPOSES) and status='SUCCEEDED'")
+assert_eq "c33b_providers_distinct(n=$C33B_N succeeded rows)" "$C33B_PROV" 2
+assert_eq "c33b_tenant_c_only_on_its_route" "$C33B_C_OFF" 0
+assert_eq "c33b_tenants_a_b_only_on_their_route" "$C33B_AB_OFF" 0
 echo "ASSERTIONS (incl. projection_serve_multi_tenant) $A_OK passed, $A_BAD failed" | tee -a $EV/rehearsal.log
 
 # ---------- 6c. soak (card 16 / ADR-0038) — only when SOAK_SECS is set ----------
@@ -1649,10 +1735,10 @@ echo "ASSERTIONS (incl. projection_serve_multi_tenant) $A_OK passed, $A_BAD fail
 # more: the runner that serves the whole rehearsal serves the soak.
 if [ "${SOAK_SECS:-0}" -gt 0 ]; then
 step soak
-# --processor-id is the DEPLOYMENT's egress processor (§7.3), not a per-tenant value: the private
-# worker holds one HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID and provider_matches_admission
-# compares the two. Minting a fresh uuid here gave tenant B a route no running worker could admit,
-# so its distill deferred every row forever, silently (card 16 P0). Both tenants: $EGRESS_PROC.
+# --processor-id is the recipient the deployment's HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS lists
+# (ADR-0060 D-C / D-L, exported by the first seed with its host). Minting a fresh uuid here gave
+# tenant B a route no running worker could admit, so its distill deferred every row forever,
+# silently (card 16 P0). Both tenants: $EGRESS_PROC.
 # Tenant B is provisioned in step seed_b on the main path now — the soak reuses that pair
 # instead of minting a third tenant nothing else in this run ever asserts on.
 echo "soak tenants: A=$TENANT/$WS  B=$TENANT_B/$WS_B" | tee -a $EV/rehearsal.log
@@ -1676,8 +1762,8 @@ HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GI
 # restarted process is the same process — a chaos hook that starts a differently-configured
 # worker grades a deployment nobody ran.
 DS_ENV="export PRIVATE_WORKER_PG_DSN=\"postgres://role_private_worker:\${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB\" \
-HUMAUX_PRIVATE_WORKER_CREDENTIALS='$HUMAUX_PRIVATE_WORKER_CREDENTIALS' HUMAUX_PRIVATE_WORKER_CAPABILITIES=$PW_CAPABILITIES HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
-HUMAUX_PRIVATE_WORKER_DNS_PINS='$MM_PINS' HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-soak.sock \
+HUMAUX_PRIVATE_WORKER_CREDENTIALS='$HUMAUX_PRIVATE_WORKER_CREDENTIALS' HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS=$PW_HEALTH_RENEW_SECS HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
+HUMAUX_PRIVATE_WORKER_DNS_PINS='$PW_DNS_PINS' HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-soak.sock \
 HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
 HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 \
 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 \
@@ -1788,19 +1874,16 @@ chmod +x $S/soak_probe_rw.sh $S/soak_probe_pw.sh \
 # macOS XProtect assesses each freshly linked binary on FIRST exec (~98 s, strictly serial).
 # Warm every binary the soak launches or probes BEFORE the timed window; never widen a
 # production timeout to absorb this (docs/ops/soak.md §5).
-# Card 30: e2e-seed's TEST health observations are valid for 30 minutes from the seed. A soak
-# sized for n >= 300 recalls (docs/ops/soak.md "Sizing a latency measurement") outlives them, and
-# every distill after that defers with "reasoning route not admitted" — the settlement verdicts
-# would then grade the seed's clock, not the soak. Re-observe the seeded tenants' latest verdicts
-# once, before the timed window, for the soak's own span (the same rows a health prober writes;
-# append-only, nothing rewritten). A default-length soak finishes inside the original window.
+# Card 30 / ADR-0060 ruling E3 (a): a soak sized for n >= 300 recalls (docs/ops/soak.md "Sizing a
+# latency measurement") can outlive the onboarding attestation; every distill after that would park
+# ROUTE_HEALTH_STALE and the settlement verdicts would grade the attestation's clock, not the soak.
+# The operator re-attests each onboarded Profile@version once, before the timed window, for the
+# soak's own span — through the same door, never an owner INSERT (append-only, nothing rewritten).
 HEALTH_SECS=$(( SOAK_SECS + ${SOAK_DRAIN:-150} + 900 ))
-PGQ "insert into ops.reasoning_provider_health_observations(tenant_id,processor_id,processor_model_id,provider_model_id,model_revision,provider_endpoint_id,endpoint_ref,region,service_tier,source_kind,reason_code,verdict,observed_at,valid_until)
-select distinct on (tenant_id,processor_id,processor_model_id,provider_endpoint_id) tenant_id,processor_id,processor_model_id,provider_model_id,model_revision,provider_endpoint_id,endpoint_ref,region,service_tier,source_kind,reason_code,verdict,clock_timestamp()-interval '1 second',clock_timestamp()+make_interval(secs=>$HEALTH_SECS)
-from ops.reasoning_provider_health_observations where tenant_id in ($SEEDED) order by tenant_id,processor_id,processor_model_id,provider_endpoint_id,observed_at desc" | tee -a $EV/rehearsal.log
-PGQ "insert into ops.reasoning_account_health_observations(tenant_id,provider_account_id,credential_ref,billing_account_id,billing_instrument_id,source_kind,reason_code,account_verdict,credential_verdict,billing_account_verdict,billing_instrument_verdict,observed_at,valid_until)
-select distinct on (tenant_id,provider_account_id) tenant_id,provider_account_id,credential_ref,billing_account_id,billing_instrument_id,source_kind,reason_code,account_verdict,credential_verdict,billing_account_verdict,billing_instrument_verdict,clock_timestamp()-interval '1 second',clock_timestamp()+make_interval(secs=>$HEALTH_SECS)
-from ops.reasoning_account_health_observations where tenant_id in ($SEEDED) order by tenant_id,provider_account_id,observed_at desc" | tee -a $EV/rehearsal.log
+for rp in "${ROUTE_PROFILES[@]}"; do set -- ${=rp}
+  "${MAINT[@]}" reasoning attest-health --tenant $1 --profile $2 --profile-version $3 --valid-for-secs $HEALTH_SECS "${RADMIN[@]}" >> $EV/onboard.log 2>>$EV/onboard.stderr \
+    || echo "soak: attest-health refused for tenant $1 profile $2@$3" | tee -a $EV/rehearsal.log
+done
 echo "soak health re-observation: valid for ${HEALTH_SECS}s" | tee -a $EV/rehearsal.log
 
 step soak_warmup

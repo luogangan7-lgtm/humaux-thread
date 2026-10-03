@@ -1,11 +1,13 @@
 //! `private-worker::main` — `humaux-private-worker` process entry (§4.2 minimal process set; §4.4 admin probe
 //!   contract; §11/§11.1 T4.4+T4.5; §11.8 ADR-0015 inference RPC).
-//! Depends-on: crates=[humaux-adapters, humaux-domain, tokio, uuid]; services=[PostgreSQL(role_private_worker)]; env=[HUMAUX_PRIVATE_WORKER_CAPABILITIES, HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT, HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS, HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS, HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_KEY_ENV, HUMAUX_PRIVATE_WORKER_MODEL_ID, HUMAUX_PRIVATE_WORKER_MODEL_REVISION, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_PROVIDER_ID, HUMAUX_PRIVATE_WORKER_REGION, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, PRIVATE_WORKER_PG_DSN]; modules=[adapters::byok, adapters::byok::ssrf, adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::disclosure, adapters::jobs, adapters::postgres, domain::authority, domain::egress, private-worker::distill, private-worker::inference_rpc]
+//! Depends-on: crates=[humaux-adapters, humaux-domain, tokio, uuid]; services=[PostgreSQL(role_private_worker)]; env=[HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT, HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS, HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS, HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS, HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_REGIONS, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, PRIVATE_WORKER_PG_DSN, refused:HUMAUX_PRIVATE_WORKER_{CAPABILITIES, CHAT_URL, EGRESS_PROCESSOR_ID, KEY_ENV, MODEL_ID, MODEL_REVISION, PROVIDER_ID, REGION}]; modules=[adapters::byok::ssrf, adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::disclosure, adapters::jobs, adapters::postgres, adapters::reasoning_route_admission, domain::authority, private-worker::distill, private-worker::inference_rpc, private-worker::route_providers]
 //! Called-by: [process(humaux-private-worker)]
 //! Invariants: [the only process holding both role_private_worker DB write and BYOK decrypt capability (§11.1); a
-//!   missing/invalid env value or unreachable DSN exits non-zero before serving; a credential reference resolves to
-//!   its own mapped key or to none, never to another reference's key (ADR-0059 D-I)]
-//! Spec: Baseline §11.1; §11.8; §78.1; ADR-0037; ADR-0036; ADR-0016; ADR-0058; ADR-0059
+//!   missing/invalid env value or unreachable DSN exits non-zero before serving; no provider, model, endpoint,
+//!   capability, recipient or region is process configuration — each call's comes from its admitted route
+//!   (ADR-0060 D-B/D-C), and a removed process-level key that is set refuses boot (E7); one `RouteProviders`]
+//! Spec: Baseline §11.1; §11.8; §78.1; ADR-0037; ADR-0036; ADR-0016; ADR-0058; ADR-0059; ADR-0060 D-B; ADR-0060 D-C;
+//!   ADR-0060 D-J; ADR-0060 E3
 //!
 //! §11.1: "仅 humaux-private-worker 在最贴近 adapter 处解密" — this is the one process in the
 //! workspace permitted to hold both DB write capability (`PrivateWorkerDbPool`,
@@ -22,40 +24,37 @@
 //!   `HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH` dials — the same `bind_socket` + `serve`
 //!   pair `bins/consolidation-worker/tests/consolidation_hop_e2e.rs` proves in-process, so
 //!   the tests cover the accept loop production runs. Provider identity/endpoint/capabilities
-//!   are configuration (§78.1: no literal model, endpoint, or dimension in code).
+//!   come from each call's admitted route (ADR-0060 D-B), never from this process's
+//!   environment (§78.1: no literal model, endpoint, or dimension in code).
 //! * `--readyz`: card 15 / ADR-0037 probe-based readiness — see [`readyz`]. Tenant-free
 //!   (ADR-0036) and provider-free: it deliberately makes NO inference call, because a readiness
 //!   probe that burns a paid provider round trip is a probe nobody dares to poll.
 //! * `--distill-once` / `--distill-serve` (ADR-0016, cross-tenant since ADR-0036, seats since
 //!   ADR-0058): IN_FLIGHT seats drain the backlog once
 //!   ([`humaux_private_worker::distill::dispatch_pass`]) / stay resident
-//!   ([`humaux_private_worker::distill::dispatch_serve`]) — same provider/config bootstrap as
+//!   ([`humaux_private_worker::distill::dispatch_serve`]) — same route/config bootstrap as
 //!   `--serve-rpc` ([`bootstrap`]). There is no tenant id or reasoning domain in the environment:
 //!   both come from each `DERIVED_DISTILL` job claimed through the owner SECURITY DEFINER
 //!   `ops.claim_derived_work_v2` (migration 0190), and everything after the claim runs under that
 //!   job's own tenant context.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use humaux_adapters::byok::{
-    CredentialDecryptor, CredentialRef, EgressHttpTransport, OpenAiCompatibleProvider,
-    PlaintextApiKey, ReasoningCapability, ReasoningProviderDescriptor, ReasoningProviderError,
-    ssrf,
-};
+use humaux_adapters::byok::ssrf;
 use humaux_adapters::consolidation_reasoner::consolidation_prompt_contract;
 use humaux_adapters::contribution_reasoner::ContributionReasonerConfig;
 use humaux_adapters::disclosure::DeletionCapability;
 use humaux_adapters::jobs;
 use humaux_adapters::postgres::PrivateWorkerDbPool;
+use humaux_adapters::reasoning_route_admission::{ProviderFor, ReasoningAdmissionLocator};
 use humaux_domain::authority::AuthorityClass;
-use humaux_domain::egress::ProcessorId;
 use humaux_private_worker::distill::{self, DistillDispatchConfig};
 use humaux_private_worker::inference_rpc::{RpcState, bind_socket, clone_config, serve};
+use humaux_private_worker::route_providers::{self, RouteProviders};
 use uuid::Uuid;
 
 fn required(name: &str) -> Result<String, String> {
@@ -66,19 +65,6 @@ fn parse<T: std::str::FromStr>(name: &str) -> Result<T, String> {
     required(name)?
         .parse()
         .map_err(|_| format!("invalid configuration: {name}"))
-}
-
-/// A required comma list from the §11.2 capability closed set ([`ReasoningCapability::parse`]);
-/// empty, unknown or repeated values are a configuration error.
-fn capabilities(name: &str) -> Result<Vec<ReasoningCapability>, String> {
-    let mut out = Vec::new();
-    for raw in required(name)?.split(',') {
-        match ReasoningCapability::parse(raw.trim()) {
-            Some(c) if !out.contains(&c) => out.push(c),
-            _ => return Err(format!("invalid configuration: {name}")),
-        }
-    }
-    Ok(out)
 }
 
 fn usage() -> &'static str {
@@ -144,8 +130,9 @@ async fn probe_connection() {
 /// readiness).
 ///
 /// Deliberately not probed here, each for a reason readiness cannot argue away:
-/// * the provider endpoint — a readiness poll must not spend a BYOK inference call, and §11.4's
-///   SSRF choke point already refuses a bad endpoint at `bootstrap()`, i.e. at start, not here;
+/// * the provider endpoints — a readiness poll must not spend a BYOK inference call, and §11.4's
+///   SSRF choke point refuses a bad endpoint when its route's instance is first built
+///   (ADR-0060 D-B), with the route's NOT_READY class, not here;
 /// * this process's own RPC socket — it is the SERVER of that socket (`--serve-rpc` binds it),
 ///   so "can I connect to it" is a statement about the previous process generation, not this
 ///   one. The consolidation worker's `--readyz` is what asserts that peer is up, from the side
@@ -198,195 +185,85 @@ impl Shutdown {
     }
 }
 
-/// The required credential map (ADR-0059 D-I): `<credential_ref uuid>=<ENV_NAME>[,…]`. It holds
-/// variable NAMES only; each key stays in its own environment variable.
-const CREDENTIALS: &str = "HUMAUX_PRIVATE_WORKER_CREDENTIALS";
-/// The single-key variable of card 32, removed by ADR-0059 D-I. Refused when set, so stale
-/// configuration is never silently ignored.
-const LEGACY_KEY_ENV: &str = "HUMAUX_PRIVATE_WORKER_KEY_ENV";
+/// Process-level keys removed by ADR-0059 D-I (the single key variable) and ADR-0060 D-C (the five
+/// provider keys and the two singular deny-list keys): the provider, model, endpoint, capabilities,
+/// recipient and region of a call come from its admitted route. Refused when set, so stale
+/// configuration is never silently ignored (the card-16 P0 shape).
+const REMOVED_KEYS: [(&str, &str); 8] = [
+    (
+        "HUMAUX_PRIVATE_WORKER_KEY_ENV",
+        "ADR-0059 D-I; use HUMAUX_PRIVATE_WORKER_CREDENTIALS",
+    ),
+    ("HUMAUX_PRIVATE_WORKER_PROVIDER_ID", "ADR-0060 D-C"),
+    ("HUMAUX_PRIVATE_WORKER_MODEL_ID", "ADR-0060 D-C"),
+    ("HUMAUX_PRIVATE_WORKER_MODEL_REVISION", "ADR-0060 D-C"),
+    ("HUMAUX_PRIVATE_WORKER_CHAT_URL", "ADR-0060 D-C"),
+    ("HUMAUX_PRIVATE_WORKER_CAPABILITIES", "ADR-0060 D-C"),
+    (
+        "HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID",
+        "ADR-0060 D-C; use HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS",
+    ),
+    (
+        "HUMAUX_PRIVATE_WORKER_REGION",
+        "ADR-0060 D-C; use HUMAUX_PRIVATE_WORKER_REGIONS",
+    ),
+];
 
-/// The BYOK keys this process holds, one per `credential_ref` (§11.1, ADR-0059 D-I). Built once at
-/// startup by [`credential_map`]; a key leaves it only as a [`PlaintextApiKey`] (whose `Debug`/
-/// `Display` print a fingerprint) inside `OpenAiCompatibleProvider::build_openai_request`, the
-/// §11.1 "closest to the adapter" point. No `Debug`: nothing can format the map.
-// ponytail: env-held keys until card 54 (OpenBao) replaces this impl; provider/model/endpoint
-// stay process-level until card 33b resolves them per binding. Written out as the desugared
-// `async_trait` signature because `async-trait` is a dev-only dependency of this binary.
-struct EnvCredentialMap(BTreeMap<Uuid, String>);
-
-impl EnvCredentialMap {
-    /// The references this process can serve: the dispatcher's pre-reserve check (ADR-0059 D-I)
-    /// comes from the same parse as the keys, so the two cannot drift.
-    fn refs(&self) -> BTreeSet<Uuid> {
-        self.0.keys().copied().collect()
+/// Refuses the first [`REMOVED_KEYS`] entry `lookup` finds set, naming it (T22).
+fn refuse_removed_keys(lookup: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    match REMOVED_KEYS.iter().find(|(name, _)| lookup(name).is_some()) {
+        Some((name, why)) => Err(format!(
+            "invalid configuration: {name} was removed by {why}"
+        )),
+        None => Ok(()),
     }
 }
 
-impl CredentialDecryptor for EnvCredentialMap {
-    fn resolve<'life0, 'async_trait>(
-        &'life0 self,
-        credential_ref: CredentialRef,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<PlaintextApiKey, ReasoningProviderError>>
-                + Send
-                + 'async_trait,
-        >,
-    >
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        // ADR-0059 D-I: exactly the key of this reference, never a fallback to another one. The
-        // miss is defence in depth: distill parks before reserving (CREDENTIAL_NOT_MAPPED); the
-        // RPC paths meet it after their reservation (ADR-0059 L7).
-        let key = self
-            .0
-            .get(&credential_ref.credential_id())
-            .map(|key| PlaintextApiKey::new(key.clone()))
-            .ok_or(ReasoningProviderError::WaitingKey { fingerprint: None });
-        Box::pin(std::future::ready(key))
-    }
-}
-
-/// Parses [`CREDENTIALS`] through `lookup` (production: the process environment). Refuses, naming
-/// the variable and never a value: an unset map (required, no default); [`LEGACY_KEY_ENV`] set; an
-/// entry without exactly one `=`; a non-UUID or nil reference; a name outside `[A-Z0-9_]+`; a
-/// duplicate reference; a named variable that is empty (named) or unset (named by its entry and
-/// credential_ref only, never echoed: ADR-0059 D-I). An explicitly empty map is
-/// accepted (main-line amendment 2026-10-02 22:30): every route then parks `CREDENTIAL_NOT_MAPPED`,
-/// so a node with no credentials yet does not crash-loop under supervision. Two references may
-/// share one variable.
-fn credential_map(lookup: impl Fn(&str) -> Option<String>) -> Result<EnvCredentialMap, String> {
-    if lookup(LEGACY_KEY_ENV).is_some() {
-        return Err(format!(
-            "invalid configuration: {LEGACY_KEY_ENV} was removed by ADR-0059 D-I; use {CREDENTIALS}"
-        ));
-    }
-    let spec = lookup(CREDENTIALS)
-        .ok_or_else(|| format!("missing required configuration: {CREDENTIALS}"))?;
-    let mut keys = BTreeMap::new();
-    if spec.is_empty() {
-        return Ok(EnvCredentialMap(keys));
-    }
-    for (n, entry) in spec.split(',').enumerate() {
-        let invalid = |what: &str| {
-            format!(
-                "invalid configuration: {CREDENTIALS} entry {} {what}",
-                n + 1
-            )
-        };
-        let (reference, name) = entry
-            .split_once('=')
-            .filter(|(_, name)| !name.contains('='))
-            .ok_or_else(|| invalid("is not <credential_ref>=<ENV_NAME>"))?;
-        let reference = reference
-            .trim()
-            .parse::<Uuid>()
-            .ok()
-            .filter(|r| !r.is_nil())
-            .ok_or_else(|| invalid("has no non-nil UUID reference"))?;
-        let name = name.trim();
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-        {
-            return Err(invalid("names a variable outside [A-Z0-9_]+"));
-        }
-        // ADR-0059 D-I: the right-hand side is echoed only when that variable exists (then it is
-        // a variable name); an unset one may be a pasted secret that happens to match
-        // [A-Z0-9_]+, so the refusal names the entry, its credential_ref and the pattern only.
-        let key = match lookup(name) {
-            Some(key) if !key.is_empty() => key,
-            Some(_) => {
-                return Err(format!(
-                    "missing required configuration: {name} is empty (named by {CREDENTIALS} \
-                     entry {} for credential_ref {reference})",
-                    n + 1
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "missing required configuration: <unset variable> named by {CREDENTIALS} \
-                     entry {} for credential_ref {reference} (a [A-Z0-9_]+ name that is not set; \
-                     not echoed)",
-                    n + 1
-                ));
-            }
-        };
-        if keys.insert(reference, key).is_some() {
-            return Err(invalid("repeats a credential reference"));
-        }
-    }
-    Ok(EnvCredentialMap(keys))
-}
-
-/// The provider + deployment config + `role_private_worker` pool every inference-bearing mode
-/// of this binary shares (`--serve-rpc`, `--distill-once`, `--distill-serve`) — one bootstrap,
-/// so the Distill hop and the RPC listener can never drift on which provider/endpoint/keys they
-/// hold (§4.2 one process; ADR-0059 D-I one key per credential reference).
+/// The route→provider seam + deployment config + `role_private_worker` pool every
+/// inference-bearing mode of this binary shares (`--serve-rpc`, `--distill-once`,
+/// `--distill-serve`) — one bootstrap, so the Distill hop and the RPC listener can never drift on
+/// which keys, recipients and regions they hold (§4.2 one process; ADR-0060 D-B).
 struct Bootstrap {
     pool: PrivateWorkerDbPool,
     config: ContributionReasonerConfig,
-    provider: OpenAiCompatibleProvider<EgressHttpTransport, EnvCredentialMap>,
-    /// The references the provider's credential map holds (ADR-0059 D-I pre-reserve check).
-    credential_refs: BTreeSet<Uuid>,
+    /// ADR-0060 D-B: admitted route → its Profile@version's instance ([`RouteProviders`]).
+    providers: Box<ProviderFor>,
     /// The provider transport timeout; the distill dispatcher sizes `ops.begin_call`'s window
     /// from it (ADR-0058 D-K).
     http_timeout: Duration,
+    /// Ruling E3: the validity of a worker-observed health renewal, and twice the remaining
+    /// validity below which a SUCCEEDED call renews it.
+    health_renew_seconds: i64,
 }
 
 async fn bootstrap() -> Result<Bootstrap, String> {
+    let lookup = |name: &str| env::var(name).ok();
+    refuse_removed_keys(lookup)?;
     let dsn = required("PRIVATE_WORKER_PG_DSN")?;
-    let chat_url = required("HUMAUX_PRIVATE_WORKER_CHAT_URL")?;
-    let descriptor = ReasoningProviderDescriptor {
-        provider_id: required("HUMAUX_PRIVATE_WORKER_PROVIDER_ID")?,
-        model_id: required("HUMAUX_PRIVATE_WORKER_MODEL_ID")?,
-        model_revision: env::var("HUMAUX_PRIVATE_WORKER_MODEL_REVISION")
-            .ok()
-            .filter(|v| !v.is_empty()),
-        // ADR-0058 D-M (main-line ruling 2026-10-02 10:35): what the bound endpoint can do is
-        // deployment configuration, never a literal or a provider name — the distill output
-        // channel and any provider-specific request field follow these declared capabilities.
-        capabilities: capabilities("HUMAUX_PRIVATE_WORKER_CAPABILITIES")?,
-        custom_endpoint: Some(chat_url.clone()),
-    };
     let http_timeout =
         Duration::from_secs(parse::<u64>("HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS")?);
-    // ADR-0059 D-I: the map names a key variable per credential reference (required: a default
-    // would name a provider in code, §78.1); the keys are read once, here, and only ever leave
-    // this scope inside `EnvCredentialMap`.
-    let credentials = credential_map(|name| env::var(name).ok())?;
-    let credential_refs = credentials.refs();
+    // Ruling E3 (b): required, no default (§78.1) — it trades attestation lifetime against one
+    // extra definer call per renewal window.
+    let health_renew_seconds = Some(parse::<i64>("HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS")?)
+        .filter(|secs| *secs > 0)
+        .ok_or("invalid configuration: HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS")?;
+    // ADR-0059 D-I / ADR-0060 D-J: the keys are read once, here, and only ever leave this scope
+    // inside `EnvCredentialMap`. ADR-0060 D-C: the recipient ↔ host and region lists refuse a
+    // route, never select one; explicitly empty lists are legal (every route parks).
+    let credentials = route_providers::parse_credential_map(lookup)?;
+    let recipients = route_providers::parse_recipients(lookup)?;
+    let regions = route_providers::parse_regions(lookup)?;
     // §11.4 static DNS pins (optional): `host=ip[|ip],...` — for hosts whose system DNS answer
     // is not trustworthy on this node. Unpinned hosts fall through to the system resolver
     // inside `PinnedDnsResolver`, so an empty/absent spec is exactly the old default. The
-    // forbidden-range check still runs on the pins.
+    // forbidden-range check still runs on the pins. ADR-0039 判据0: this one resolver is handed
+    // to every instance, which derives both its §11.4 check and its dial from it.
     let resolver: Arc<dyn ssrf::DnsResolver> = Arc::new(
         ssrf::PinnedDnsResolver::parse(
             &env::var("HUMAUX_PRIVATE_WORKER_DNS_PINS").unwrap_or_default(),
         )
         .map_err(|e| format!("invalid configuration: HUMAUX_PRIVATE_WORKER_DNS_PINS ({e:?})"))?,
     );
-    // ADR-0039 判据0: the resolver is handed over **once** — `with_egress_transport` derives
-    // both the §11.4 check and the client's dial-time resolver from this one value. Building
-    // the transport separately is what let the operator's pins reach only the check while the
-    // dial kept using system DNS (card 17 review, P0).
-    let provider = OpenAiCompatibleProvider::with_egress_transport(
-        descriptor,
-        chat_url,
-        http_timeout,
-        credentials,
-        ssrf::CustomEndpointPolicy::default(),
-        Arc::clone(&resolver),
-    )
-    .map_err(|e| {
-        format!(
-            "invalid configuration: HUMAUX_PRIVATE_WORKER_CHAT_URL rejected by the §11.4 SSRF \
-             choke point, or the egress transport could not be built ({e:?})"
-        )
-    })?;
 
     // The Consolidate path takes prompt/schema/budget from the shared contract itself
     // (`ConsolidationReasoner`, ADR-0015 D2); these three fields only have to satisfy
@@ -394,13 +271,9 @@ async fn bootstrap() -> Result<Bootstrap, String> {
     // ADR-0058 D-O: any ceiling satisfies `validate`; the highest storable one is the widest menu.
     let contract = consolidation_prompt_contract(AuthorityClass::ProjectConstraint);
     let config = ContributionReasonerConfig {
-        allowed_egress_processor_id: ProcessorId(parse::<Uuid>(
-            "HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID",
-        )?),
-        region: required("HUMAUX_PRIVATE_WORKER_REGION")?,
         permit_ttl: Duration::from_secs(parse::<u64>("HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS")?),
         // ponytail: no deployment has told us the endpoint's deletion semantics yet; make it
-        // env-driven when a provider that does promise deletion is onboarded.
+        // per-recipient when a provider that does promise deletion is onboarded (ADR-0060 L7).
         deletion_capability: DeletionCapability::Unknown,
         system_prompt: contract.system_prompt,
         json_schema: contract.json_schema,
@@ -414,12 +287,29 @@ async fn bootstrap() -> Result<Bootstrap, String> {
     let pool = PrivateWorkerDbPool::connect(&dsn)
         .await
         .map_err(|e| format!("private worker database role connection failed: {e}"))?;
+    // ADR-0060 D-J: one secret serves one vendor account, or the worker does not start.
+    for line in route_providers::verify_credential_accounts(&pool, &credentials).await? {
+        eprintln!("humaux-private-worker: {line}");
+    }
+    eprintln!(
+        "humaux-private-worker: routes credentials={} recipients={} regions={}",
+        credentials.refs().len(),
+        recipients.len(),
+        regions.len()
+    );
+    let routes = Arc::new(RouteProviders::new(
+        credentials,
+        recipients,
+        regions,
+        resolver,
+        http_timeout,
+    ));
     Ok(Bootstrap {
         pool,
         config,
-        provider,
-        credential_refs,
+        providers: Box::new(move |route: &ReasoningAdmissionLocator| routes.provider_for(route)),
         http_timeout,
+        health_renew_seconds,
     })
 }
 
@@ -430,14 +320,16 @@ async fn serve_rpc() -> Result<(), String> {
     let Bootstrap {
         pool,
         config,
-        provider,
+        providers,
+        health_renew_seconds,
         ..
     } = bootstrap().await?;
     let state = Arc::new(RpcState {
         expected_consolidation_uid: consolidation_uid,
         calls: pool,
         config,
-        provider: Box::new(provider),
+        providers,
+        health_renew_seconds,
     });
 
     let listener = bind_socket(std::path::Path::new(&socket_path)).map_err(|error| {
@@ -464,8 +356,9 @@ async fn serve_rpc() -> Result<(), String> {
 /// backlog exits zero promptly) / `--distill-serve` (the same seats, resident: a seat sleeps
 /// `HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS` only after its own claim came back empty).
 /// ADR-0058: jobs are claimed one at a time through `ops.claim_derived_work_v2` (four provider
-/// slots, least-recently-served tenant first); the route binding is still resolved by
-/// `(tenant, reasoning_domain, purpose = PRIVATE_DISTILL_TEXT)` per job.
+/// slots, fewest-held-slots tenant first, ADR-0060 D-F); the route binding is resolved by
+/// `(tenant, reasoning_domain, purpose = PRIVATE_DISTILL_TEXT)` per job and its admitted
+/// Profile@version picks the instance (ADR-0060 D-B).
 async fn distill_mode(resident: bool) -> Result<(), String> {
     let poll_interval = if resident {
         Some(Duration::from_secs(parse::<u64>(
@@ -477,9 +370,9 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
     let Bootstrap {
         pool,
         config,
-        provider,
-        credential_refs,
+        providers,
         http_timeout,
+        health_renew_seconds,
     } = bootstrap().await?;
     let dispatch = DistillDispatchConfig {
         // Per-process owner: the job lease and the outbox row a job takes are both fenced on it,
@@ -498,7 +391,7 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
                 as f64,
             max_calls: parse::<i32>("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS")?,
         },
-        credential_refs,
+        health_renew_seconds,
     };
     dispatch.validate().map_err(|code| {
         format!(
@@ -509,7 +402,7 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
     })?;
     let mut shutdown = Shutdown::install()?;
     let Some(poll) = poll_interval else {
-        let report = distill::dispatch_pass(&pool, &provider, clone_config(&config), &dispatch)
+        let report = distill::dispatch_pass(&pool, &*providers, clone_config(&config), &dispatch)
             .await
             .map_err(|error| format!("distill dispatch failed: {error}"))?;
         println!("{}", report.summary_line());
@@ -523,7 +416,7 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
     let stop = AtomicBool::new(false);
     let serve = distill::dispatch_serve(
         &pool,
-        &provider,
+        &*providers,
         clone_config(&config),
         &dispatch,
         poll,
@@ -547,178 +440,33 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// `(variable name, value)` pairs one lookup serves.
-    type Vars = Vec<(&'static str, String)>;
-
-    /// A lookup over generated throwaway values (never a literal key).
-    fn lookup(vars: Vars) -> impl Fn(&str) -> Option<String> {
-        move |name| {
-            vars.iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, v)| v.clone())
-        }
-    }
-
-    fn resolve(map: &EnvCredentialMap, r: Uuid) -> Result<PlaintextApiKey, ReasoningProviderError> {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime")
-            .block_on(map.resolve(CredentialRef::new(r)))
-    }
-
-    /// T23 (card-33 amendment gate) — fault: return the first key for every reference.
+    /// T22 (ADR-0060 D-C, E7) — fault: drop one name from [`REMOVED_KEYS`] ⇒ that key boots.
     #[test]
-    fn credential_map_resolves_each_ref_to_its_own_key() {
-        let (r1, r2, r3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let (k1, k2) = (
-            Uuid::new_v4().simple().to_string(),
-            Uuid::new_v4().simple().to_string(),
-        );
-        let map = credential_map(lookup(vec![
-            (CREDENTIALS, format!("{r1}=HX33_KEY_ONE,{r2}=HX33_KEY_TWO")),
-            ("HX33_KEY_ONE", k1.clone()),
-            ("HX33_KEY_TWO", k2.clone()),
-        ]))
-        .expect("valid map");
-        assert_eq!(map.refs(), BTreeSet::from([r1, r2]));
-        // `assert!(a == b)`: a failure never prints a key.
-        assert!(
-            resolve(&map, r1).expect("r1 mapped").expose() == k1,
-            "r1 must get k1"
-        );
-        assert!(
-            resolve(&map, r2).expect("r2 mapped").expose() == k2,
-            "r2 must get k2"
-        );
-        assert!(matches!(
-            resolve(&map, r3),
-            Err(ReasoningProviderError::WaitingKey { fingerprint: None })
-        ));
-    }
-
-    /// ADR-0059 D-I (card 33 review P2): an unset right-hand side is reported by entry and
-    /// credential_ref only. Fault: echo the right-hand side whatever it is.
-    #[test]
-    fn credential_map_unset_rhs_is_never_echoed() {
-        let r = Uuid::new_v4();
-        // ADR-0059 D-I: an unset right-hand side is never echoed (it may be a pasted secret that
-        // matches [A-Z0-9_]+); the refusal names the credential_ref instead. A set-but-empty one
-        // is a variable that exists, so its name is echoed.
-        let pasted = Uuid::new_v4().simple().to_string().to_ascii_uppercase();
-        let Err(unset) = credential_map(lookup(vec![(CREDENTIALS, format!("{r}={pasted}"))]))
-        else {
-            panic!("an unset right-hand side is refused");
-        };
-        assert!(!unset.contains(&pasted), "unset rhs echoed: {unset}");
-        assert!(unset.contains("<unset variable>"), "{unset}");
-        assert!(
-            unset.contains(&r.to_string()),
-            "names the credential_ref: {unset}"
-        );
-        let Err(empty_named) = credential_map(lookup(vec![
-            (CREDENTIALS, format!("{r}=HX33_KEY")),
-            ("HX33_KEY", String::new()),
-        ])) else {
-            panic!("an empty variable is refused");
-        };
-        assert!(
-            empty_named.contains("HX33_KEY is empty") && empty_named.contains(&r.to_string()),
-            "{empty_named}"
-        );
-    }
-
-    /// T24 — every boot refusal names a variable and never echoes a value. Fault: drop the
-    /// empty-value check (an empty key variable then boots).
-    #[test]
-    fn credential_map_boot_refusals() {
-        let r = Uuid::new_v4();
-        let key = Uuid::new_v4().simple().to_string();
-        let ok_key = || ("HX33_KEY", key.clone());
-        let cases: Vec<(&str, Vars, &str)> = vec![
-            ("unset map", vec![ok_key()], CREDENTIALS),
-            (
-                "legacy KEY_ENV set",
-                vec![
-                    (CREDENTIALS, format!("{r}=HX33_KEY")),
-                    ok_key(),
-                    (LEGACY_KEY_ENV, "HX33_KEY".into()),
-                ],
-                LEGACY_KEY_ENV,
-            ),
-            (
-                "no =",
-                vec![(CREDENTIALS, format!("{r}")), ok_key()],
-                CREDENTIALS,
-            ),
-            (
-                "two =",
-                vec![(CREDENTIALS, format!("{r}=HX33_KEY=X")), ok_key()],
-                CREDENTIALS,
-            ),
-            (
-                "bad uuid",
-                vec![(CREDENTIALS, "not-a-uuid=HX33_KEY".into()), ok_key()],
-                CREDENTIALS,
-            ),
-            (
-                "nil uuid",
-                vec![(CREDENTIALS, format!("{}=HX33_KEY", Uuid::nil())), ok_key()],
-                CREDENTIALS,
-            ),
-            (
-                "bad name",
-                vec![(CREDENTIALS, format!("{r}=hx33-key")), ok_key()],
-                CREDENTIALS,
-            ),
-            (
-                "empty name",
-                vec![(CREDENTIALS, format!("{r}=")), ok_key()],
-                CREDENTIALS,
-            ),
-            (
-                "duplicate ref",
-                vec![
-                    (CREDENTIALS, format!("{r}=HX33_KEY,{r}=HX33_KEY")),
-                    ok_key(),
-                ],
-                CREDENTIALS,
-            ),
-            (
-                "unset key variable",
-                vec![(CREDENTIALS, format!("{r}=HX33_KEY"))],
-                "<unset variable>",
-            ),
-            (
-                "empty key variable",
-                vec![
-                    (CREDENTIALS, format!("{r}=HX33_KEY")),
-                    ("HX33_KEY", String::new()),
-                ],
-                "HX33_KEY",
-            ),
-        ];
-        for (what, vars, named) in cases {
-            let Err(error) = credential_map(lookup(vars)) else {
-                panic!("{what}: must be refused");
-            };
-            assert!(error.contains(named), "{what}: names {named}: {error}");
+    fn removed_provider_env_is_refused_at_boot() {
+        assert_eq!(refuse_removed_keys(|_| None), Ok(()));
+        for (name, _) in REMOVED_KEYS {
+            let error =
+                refuse_removed_keys(|n| (n == name).then(|| "x".to_owned())).expect_err(name);
             assert!(
-                !error.contains(&key),
-                "{what}: the error must not carry a key value"
+                error.contains(name) && error.contains("removed by"),
+                "{name}: {error}"
             );
         }
-        // Main-line amendment: an explicitly empty map boots with no references.
-        let empty = credential_map(lookup(vec![(CREDENTIALS, String::new())])).expect("empty map");
-        assert!(empty.refs().is_empty());
-        // Two references may share one variable.
-        let shared = credential_map(lookup(vec![
-            (
-                CREDENTIALS,
-                format!("{r}=HX33_KEY,{}=HX33_KEY", Uuid::new_v4()),
-            ),
-            ok_key(),
-        ]))
-        .expect("shared variable");
-        assert_eq!(shared.refs().len(), 2);
+        let names: Vec<&str> = REMOVED_KEYS.iter().map(|(n, _)| *n).collect();
+        for suffix in [
+            "PROVIDER_ID",
+            "MODEL_ID",
+            "MODEL_REVISION",
+            "CHAT_URL",
+            "CAPABILITIES",
+            "EGRESS_PROCESSOR_ID",
+            "REGION",
+            "KEY_ENV",
+        ] {
+            assert!(
+                names.contains(&format!("HUMAUX_PRIVATE_WORKER_{suffix}").as_str()),
+                "{suffix} is refused"
+            );
+        }
     }
 }

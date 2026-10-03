@@ -1,7 +1,7 @@
 //! `domain::egress` — §7.3's `EgressPermit` unique-egress topology and §83.4's `OutboundPurpose` registry closure
 //!   (T4.1).
 //! Depends-on: crates=[async-trait, sha2, uuid]; services=[]; env=[]; modules=[domain::boundary, domain::dataclass, domain::error, domain::ids]
-//! Called-by: [adapters::byok, adapters::contribution_reasoner, adapters::disclosure, adapters::projection_worker, adapters::provider_budget, adapters::reasoning_route_admission, adapters::retrieval_query_source, adapters::stream_repo, infra-egress::http, private-worker::inference_rpc, private-worker::main, retrieval-provider::adapters, retrieval-provider::admission, retrieval-provider::contract, retrieval-provider::failover, retrieval-worker::main, tests]
+//! Called-by: [adapters::byok, adapters::contribution_reasoner, adapters::disclosure, adapters::model_call_ledger, adapters::projection_worker, adapters::provider_budget, adapters::reasoning_route_admission, adapters::retrieval_query_source, adapters::stream_repo, infra-egress::http, retrieval-provider::adapters, retrieval-provider::admission, retrieval-provider::contract, retrieval-provider::failover, retrieval-worker::main, tests]
 //! Invariants: []
 //! Spec: Baseline §7; §7.0; §7.2; ADR-0003
 //!

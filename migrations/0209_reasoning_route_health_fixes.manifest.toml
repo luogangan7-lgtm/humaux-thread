@@ -1,0 +1,40 @@
+# §46.1 migration manifest. Card 33b review pass 2 / ADR-0060 ruling E3: two applied bodies corrected
+# forward — control.observe_reasoning_route_health (0206) records a rejected credential even after a
+# newer renewal, and accepts a contribution 401 on its RESERVED row; control.reasoning_route_health_state
+# (0207) reads the route with the 0130 resolver's administrative conditions, so a disabled or retired
+# route is "not admitted", never ROUTE_HEALTH_STALE. Same signatures, owner, SECURITY DEFINER, search_path
+# and role_private_worker-only EXECUTE. §46 forward-fix (EXPAND_CONTRACT, first free after 0208).
+
+migration_id = "0209_reasoning_route_health_fixes"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('control.observe_reasoning_route_health(uuid,boolean,bigint)') is not null
+ and to_regprocedure('control.reasoning_route_health_state(uuid,bigint)') is not null
+ and to_regprocedure('control.set_reasoning_profile_enabled(uuid,uuid,bigint,boolean)') is not null
+ as precheck_ok
+"""
+
+postcheck = """
+with non_owner(r) as (values ('role_gateway'), ('role_private_worker'), ('role_consolidation_worker'),
+  ('role_public_worker'), ('role_retrieval_worker'), ('role_batch_issuer'), ('role_maintenance'),
+  ('role_admin')),
+fixed(sig, marker) as (values
+  ('control.observe_reasoning_route_health(uuid,boolean,bigint)', 'o.credential_verdict = ''INVALID'''),
+  ('control.reasoning_route_health_state(uuid,bigint)', 'AND profile.enabled'))
+select
+  (select count(*) from fixed f where to_regprocedure(f.sig) is not null) = 2
+  and (select bool_and(
+          strpos(p.prosrc, f.marker) > 0
+          and pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+          and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+          and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                           where x.grantee = 0 and x.privilege_type = 'EXECUTE')
+          and (select bool_and(has_function_privilege(n.r, p.oid, 'EXECUTE') = (n.r = 'role_private_worker'))
+                 from non_owner n))
+         from fixed f join pg_proc p on p.oid = to_regprocedure(f.sig)) is true
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward-fix only: re-run the 0206 body of control.observe_reasoning_route_health and the 0207 body of control.reasoning_route_health_state (CREATE OR REPLACE, same signatures). That restores the one-admission-late rejection and the STALE class for a disabled route; nothing else depends on the new bodies."
+backup_restore_requirement = "none: two function bodies replaced, no row data changed."

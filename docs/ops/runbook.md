@@ -133,6 +133,110 @@ families (serving, highwaters), activation receipts, placement, key prefixes and
 A collection created before card 24 lacks the `subject_ids` index; `collection ensure` PUTs both
 indexes idempotently, so running it once fixes such a collection.
 
+### 3.1 Reasoning routes — which LLM a domain uses (ADR-0060 D-H)
+
+A freshly onboarded tenant's reasoning domain has **no route**: its distill and consolidation jobs park
+`NO_DISTILL_BINDING` until an operator binds it. Every step is a `humaux-maintenance reasoning …`
+subcommand (same exit codes, §77 flags and one-JSON-receipt rule as onboarding; a refusal names its
+`reason` and writes only its DENIED audit row). Never raw SQL, never `e2e-seed`. `<A>` below means
+`--actor <who> --reason <why> --ticket <ref> --step-up-auth <evidence>`.
+
+**Register** one Profile@version (provider, model, endpoint, capabilities, vendor request fields, vendor
+account, credential reference):
+
+```sh
+humaux-maintenance reasoning register --tenant <id> --owner-user <domain owner user id> \
+  --provider-id <processor id> --provider-model-id <model> [--model-revision <catalog label>] \
+  --capabilities TEXT,STRUCTURED_OUTPUT[,TOOL_CALLS|JSON_OBJECT…] --request-extras '<json object>' \
+  --account-ref <vendor account reference text> --endpoint-ref https://<host>/<path> \
+  --region <region> --service-tier <tier> --egress-processor-id <recipient uuid of this vendor/region> \
+  [--credential-ref <existing ref bound to this account>] [--successor-of <profile id>] <A>
+```
+
+- `--request-extras` is required (`'{}'` for none): vendor fields such as a thinking switch are profile
+  data; an adapter-owned key (`model`, `messages`, `tools`, `response_format`, `max_tokens`, …) is refused
+  `request_extras_invalid`.
+- The catalog row is append-only: declaring more capabilities than an existing (provider, model,
+  revision) row is refused `capabilities_exceed_catalog` — use a new `--model-revision` label
+  (convention `caps-<sorted capabilities joined by .>`; never sent on the wire).
+- `--account-ref` is hashed (sha256) before it leaves the CLI. Profiles whose references will share one
+  key variable **must** name the same account reference, or the worker refuses to boot (ADR-0060 D-J).
+- The receipt prints `credential_map_entry: "<credential_ref>=<ENV_NAME>"`: add it to
+  `HUMAUX_PRIVATE_WORKER_CREDENTIALS` with the variable that holds the key (§10.4). The key never passes
+  through the CLI.
+- A re-run with the same values answers `existing`.
+
+**Bind** a domain to it (both derived purposes are bound separately):
+
+```sh
+humaux-maintenance reasoning bind --tenant <id> --domain <reasoning domain id> \
+  --purpose PRIVATE_DISTILL_TEXT|PRIVATE_CONSOLIDATE --profile <profile id> --profile-version <n> <A>
+```
+
+One PINNED policy, exactly one candidate, one current binding. Refused: `purpose_not_bindable`
+(contribution keeps its own bootstrap), `owner_mismatch` (the profile's owner must own the domain),
+`profile_disabled`, `profile_lacks_structured_output`.
+
+**Attest health** — a bound route is admitted only with valid provider and account observations:
+
+```sh
+humaux-maintenance reasoning attest-health --tenant <id> --profile <id> --profile-version <n> \
+  --valid-for-secs <n> <A>
+```
+
+`--valid-for-secs` has no default. Traffic renews a route on its own (`HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS`,
+§10.4), so the value only has to cover the time until the first successful call and any quiet period you
+accept; the rehearsal uses the run length plus 90 minutes. A route idle for longer parks
+`ROUTE_HEALTH_STALE` (no spend) until re-attested.
+
+**Status** — `humaux-maintenance reasoning status --tenant <id>` lists every ACTIVE domain × purpose with
+its binding, profile, provider/model, recipient, credential reference, the latest verdicts, `valid_until`
+and `health`: `UNBOUND`, `MISSING`, `STALE`, `DENIED` or `ADMISSIBLE`.
+
+**Switch model** (no restart, history kept): `register --successor-of <profile id>` with the new model /
+revision / endpoint / capabilities, then `bind` the new Profile@version (the current binding is closed and
+a successor Binding@version takes over), then `attest-health`. Old rows stay; every earlier ledger row
+and processing run still names the route it ran under. If the new profile has a new credential
+reference, add its map entry and restart the worker **before** `bind` (L15).
+
+**Disable** one route at once: `reasoning profile-state --tenant <id> --profile <id> --profile-version <n>
+--enabled false <A>`; the next admission refuses it (`reasoning route not admitted`), nothing is sent.
+`--enabled true` re-enables it.
+
+**Add a provider** (any OpenAI-compatible chat endpoint): mint one recipient uuid for that vendor/region
+(reused by every tenant's endpoint for it), add `<uuid>=<host>[|<host>]` to
+`HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS` and its region to `HUMAUX_PRIVATE_WORKER_REGIONS` (and a DNS pin
+if this node's resolver is not trusted for the host, §10.5), export its key under a variable name,
+`register` with `--egress-processor-id <uuid>`, add the map entry, restart the worker, `bind`,
+`attest-health`. Two profiles on one vendor account share that account's rate limit at the provider
+(research amendment 6).
+
+What to do when a job line or the status says:
+- `NO_DISTILL_BINDING` / `UNBOUND` — the domain has no route: `register` (if needed) and `bind`.
+- `CREDENTIAL_NOT_MAPPED` — the route's credential reference is not in the worker's map: add the
+  register receipt's `credential_map_entry` with the right variable and restart the worker.
+- `ROUTE_HEALTH_STALE` / `STALE` / `MISSING` — no valid observation: check the provider, then
+  `attest-health`. `ROUTE_HEALTH_DENIED` / `DENIED` after a 401: rotate the key (§10.4), then
+  `attest-health`.
+- `EGRESS_PROCESSOR_NOT_ALLOWED` / `EGRESS_HOST_NOT_ALLOWED` / `REGION_NOT_ALLOWED` — the deployment's
+  lists do not cover the route: fix the lists (never the route) and restart.
+- `ENDPOINT_REJECTED` — the route's endpoint failed the §11.4 check before any request: it is not a
+  bare `https` host, or the host resolves into a forbidden range. On a node whose resolver answers the
+  host with a fake IP (198.18.0.0/15 and similar), add a pin for it to `HUMAUX_PRIVATE_WORKER_DNS_PINS`
+  (§10.5) and restart; a wrong endpoint is fixed with a successor profile (**Switch model**), never by
+  weakening the check. Nothing was sent.
+- `TRANSPORT` when the job parks — the worker could not build the egress client for the route (TLS /
+  client setup on this node); nothing was sent. Fix the node and restart. A `TRANSPORT` failure of a
+  call that was sent is an outage (next bullet).
+- `ROUTE_PROVIDER_MISMATCH` — the instance the worker holds is not the one the admitted route names (a
+  seam or cache defect, never a configuration choice). Restart the worker (instances are rebuilt from
+  the routes), keep the job line, and file a defect; do not edit the route to match.
+- `PROFILE_LACKS_STRUCTURED_OUTPUT` — the bound Profile@version does not declare `STRUCTURED_OUTPUT`:
+  `register --successor-of` with the capability (it must be in the catalog row), then `bind` and
+  `attest-health`.
+- A provider outage is **not** parked: jobs retry with backoff and go DEAD at `max_attempts` (ADR-0060
+  D-G). Once it is back: `jobs requeue-dead --tenant <id> --error-class <class>`.
+
 ## 4. Environment
 
 Per-process env is listed in `docs/ops/supervision.md` and the deployment's own secrets manager.
@@ -297,9 +401,12 @@ Every job also prints one line:
 `humaux-private-worker: distill job=<uuid> tenant=<uuid> evidence=<uuid> gen=<n> outcome=<DONE|RETRY|NOT_READY|PARKED|DEAD|LEASE_LOST|ERROR|UNKNOWN> attempt=<n>/<max> error_class=<class|-> next_retry_s=<n|-> channel_fallback=<0|1>`
 (`channel_fallback=1`: the written reply arrived in `content` on the tool channel, ADR-0058 R9)
 
-- `outcome=NOT_READY error_class=<reason>` — nothing was sent (no admitted binding, the
-  deployment's provider does not match the admitted route, or `DOMAIN_MISMATCH`); no attempt is
-  spent. Past `HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS` the job is `PARKED`
+- `outcome=NOT_READY error_class=<reason>` — nothing was sent (no admitted binding,
+  `CREDENTIAL_NOT_MAPPED`, `EGRESS_PROCESSOR_NOT_ALLOWED` / `EGRESS_HOST_NOT_ALLOWED` /
+  `REGION_NOT_ALLOWED` — the route's recipient, host or region is not in this deployment's lists —,
+  `ROUTE_HEALTH_STALE` — the route's latest health observation ran out —, `ROUTE_HEALTH_DENIED` — it
+  is valid but not HEALTHY/VALID, e.g. a key the provider rejected —, or `DOMAIN_MISMATCH`); no
+  attempt is spent. Past `HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS` the job is `PARKED`
   (`ops.jobs.status = 'WAITING_KEY'`, re-checked once per park interval): fix the tenant's
   binding; the job resumes by itself.
 - `outcome=NOT_READY error_class=PROVIDER_BUDGET` — the tenant spent its §72.3 distill budget
@@ -573,9 +680,35 @@ variable name, point the map entry at it, restart the private worker (`--distill
 `--serve-rpc`), then revoke the old key at the provider and unset the old variable. A reference
 missing from the map parks its distill jobs `WAITING_KEY` with class `CREDENTIAL_NOT_MAPPED` — no
 ledger row, no provider call, no attempt spent — and they are re-checked every
-`HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS`. (Consolidation/contribution RPC calls still meet
-a missing reference after their reservation, ADR-0059 L7.) The removed
-`HUMAUX_PRIVATE_WORKER_KEY_ENV` is refused at boot when set.
+`HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS`. Consolidation and contribution calls are refused
+the same way before any reservation (ADR-0060 D-B). An explicitly empty map is legal: the worker boots
+and every route parks `CREDENTIAL_NOT_MAPPED`. References that share one key (by variable name or by
+value) must all be bound to one vendor account, or the worker refuses to start naming them
+(ADR-0060 D-J); boot prints one `credential ref=<uuid> env=<NAME> account_hash=<8 hex|unregistered>`
+line per entry.
+
+The provider, model, endpoint and capabilities of every call come from its admitted route
+(ADR-0060 D-B); the worker env names none of them. It names only the deny-only lists
+`HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS = <egress_processor_id>=<host>[|<host>…][,…]` (each
+recipient with the hosts its endpoints may dial; a subdomain of a listed host is allowed) and
+`HUMAUX_PRIVATE_WORKER_REGIONS = <region>[,…]`. Both are required; an explicitly empty value allows
+nothing (every route parks with its class). The removed keys `HUMAUX_PRIVATE_WORKER_KEY_ENV`,
+`_PROVIDER_ID`, `_MODEL_ID`, `_MODEL_REVISION`, `_CHAT_URL`, `_CAPABILITIES`, `_EGRESS_PROCESSOR_ID`
+and `_REGION` are refused at boot when set. Onboarding order for a new route: start with the lists
+as they are, register the profile, add its `<credential_ref>=<ENV_NAME>` entry and its recipient,
+restart the worker, bind, attest health.
+
+`HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS` (required, no default; ruling E3): after a SUCCEEDED call
+the worker appends a `WORKER_OBSERVED` HEALTHY provider and account observation valid for this many
+seconds, but only when the admitted observation has less than half of it left, so a route with
+traffic never expires and a busy route costs one definer write per half window. After a provider
+401 it appends one account observation with the credential verdict INVALID, so the next admission
+of that route is refused `ROUTE_HEALTH_DENIED` at once. Trade-off: a larger value keeps a quiet
+route admissible longer after its last success but also keeps a provider that degraded without a
+401 admissible longer. A route with no traffic for longer than its attestation parks
+`ROUTE_HEALTH_STALE` until it is re-attested (ADR-0060 L3; a prober is a later card). The rehearsal
+and `e2e-onboard` use 1800. Two profiles that share one vendor account share that account's rate
+limit at the provider (research amendment 6); nothing in the worker separates them.
 
 ### 10.5 DNS pins (OPS-10)
 

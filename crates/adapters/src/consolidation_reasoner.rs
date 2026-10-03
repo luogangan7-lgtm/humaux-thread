@@ -8,7 +8,7 @@
 //! Invariants: [reads only under role_private_worker's SELECT grants and writes only §7.4 disclosure-ledger rows; the
 //!   run is located by the registered call id, never a caller-supplied memory id; admission or provider failure
 //!   returns an error with no private.* write]
-//! Spec: Baseline §11.6; §7.4; ADR-0015; §7.3; ADR-0042; ADR-0058
+//! Spec: Baseline §11.6; §7.4; ADR-0015; §7.3; ADR-0042; ADR-0058; ADR-0060 D-E; ADR-0060 D-M; ADR-0060 D-N
 //!
 //! §11.6 MUST NOTs held by construction: this adapter reads runs / inputs / memory_records /
 //! evidence classes under `role_private_worker`'s SELECT-only grants (migration 0145) and
@@ -17,15 +17,16 @@
 //! DB capability: the run is located by the id `role_consolidation_worker` registered in
 //! `ops.private_inference_rpc_calls` (ADR-0015).
 //!
-//! Provider pipeline: the same admission resolver, provider/admission match, §7.3 egress
+//! Provider pipeline: the same admission resolver, the registered binding's route → provider
+//! instance (`ProviderFor`, ADR-0060 D-E: the RPC wire never names a route), provider/admission
+//! match, §7.3 egress
 //! authorization, [`crate::byok::PrivateInferenceContext`] construction and timed provider call
 //! `ContributionReasoner` uses (`crate::contribution_reasoner`'s `pub(crate)` helpers) — one
-//! provider call path, not a second one. Since card 20 (ADR-0042) the `ops.model_call_ledger`
-//! leg is shared too — `model_call_ledger::reserve_private_call`/`finalize_private_call` with
-//! purpose `PRIVATE_CONSOLIDATE`, the same registration point every other hop uses. ADR-0015
-//! §"ledger leg" recorded the absence as a consequence of 0130's purpose CHECK; `migrations/0166`
-//! widened it. The §7.4 disclosure row still exists alongside — it records what left the
-//! boundary, the ledger row records what it cost.
+//! provider call path, not a second one. The `ops.model_call_ledger` leg is shared too —
+//! `model_call_ledger::reserve_private_call_with_disclosure`/`finalize_private_call` with purpose
+//! `PRIVATE_CONSOLIDATE`: the ledger row carries the admitted route (ADR-0060 D-I) and is reserved
+//! in ONE transaction with the §7.4 disclosure row that names it (ADR-0060 D-N). The disclosure
+//! records what left the boundary, the ledger row what it cost and on whose account.
 
 use async_trait::async_trait;
 use humaux_application::consolidate::{
@@ -45,10 +46,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    byok::{
-        OutputChannel, ReasoningCapability, StructuredReasoningRequest, UserReasoningProvider,
-        json_has_nul,
-    },
+    byok::{OutputChannel, ReasoningProviderError, StructuredReasoningRequest, json_has_nul},
     consolidate_repo::{self, MaterializedInput},
     contribution_reasoner::{
         ContributionReasonerConfig, admitted_inference_context, authorize_structured_egress,
@@ -58,7 +56,9 @@ use crate::{
     distill_reasoner::admissible_classes,
     model_call_ledger,
     postgres::PrivateWorkerDbPool,
-    reasoning_route_admission::resolve_user_reasoning_admission,
+    reasoning_route_admission::{
+        ProviderFor, resolve_user_reasoning_admission, route_health_refusal,
+    },
 };
 
 // ============================================================================
@@ -305,19 +305,24 @@ pub struct ConsolidationCallBinding {
 /// Private worker implementation of [`PrivateReasoningPort`] for one Consolidate call.
 pub struct ConsolidationReasoner<'a> {
     pool: &'a PrivateWorkerDbPool,
-    provider: &'a dyn UserReasoningProvider,
+    providers: &'a ProviderFor,
     config: ContributionReasonerConfig,
     binding: ConsolidationCallBinding,
+    /// ADR-0060 D-M: the admitted route's fields, once [`PrivateReasoningPort::infer`] admitted one.
+    route: std::sync::OnceLock<String>,
+    /// ADR-0060 ruling E3: the ledger id of the finalized call and whether the provider rejected
+    /// its credential, once a call SUCCEEDED or failed with the WAITING_KEY class.
+    observed: std::sync::OnceLock<(Uuid, bool)>,
 }
 
 impl<'a> ConsolidationReasoner<'a> {
-    /// Binds a provider + the deployment egress config to one registered call. Only
-    /// `allowed_egress_processor_id` / `region` / `permit_ttl` / `deletion_capability` of the
-    /// config are used: prompt, schema and output budget come from
-    /// [`consolidation_prompt_contract`], never from deployment config.
+    /// Binds the route→provider seam + the deployment egress config to one registered call. Only
+    /// `permit_ttl` / `deletion_capability` of the config are used: prompt, schema and output
+    /// budget come from [`consolidation_prompt_contract`], never from deployment config; the
+    /// provider comes from the registered binding's admitted route (ADR-0060 D-E).
     pub fn new(
         pool: &'a PrivateWorkerDbPool,
-        provider: &'a dyn UserReasoningProvider,
+        providers: &'a ProviderFor,
         config: ContributionReasonerConfig,
         binding: ConsolidationCallBinding,
     ) -> Result<Self, ErrorCode> {
@@ -327,10 +332,27 @@ impl<'a> ConsolidationReasoner<'a> {
         }
         Ok(Self {
             pool,
-            provider,
+            providers,
             config,
             binding,
+            route: std::sync::OnceLock::new(),
+            observed: std::sync::OnceLock::new(),
         })
+    }
+
+    /// ADR-0060 D-M: `provider=… model=… profile=…@… binding=…@…` of the route this call was
+    /// admitted on, or `None` when it never got that far.
+    #[must_use]
+    pub fn route_fields(&self) -> Option<&str> {
+        self.route.get().map(String::as_str)
+    }
+
+    /// ADR-0060 ruling E3: `(ledger model_call_id, credential_rejected)` of the call this reasoner
+    /// finalized SUCCEEDED (`false`) or failed with a provider-rejected credential (`true`); the
+    /// worker turns it into a health observation. `None` for any other end.
+    #[must_use]
+    pub fn observed_call(&self) -> Option<(Uuid, bool)> {
+        self.observed.get().copied()
     }
 }
 
@@ -537,10 +559,6 @@ impl PrivateReasoningPort for ConsolidationReasoner<'_> {
         if sealed.purpose != PrivateReasoningPurpose::Consolidate {
             return Err(fail("consolidation reasoner serves Consolidate only"));
         }
-        let descriptor = self.provider.descriptor();
-        descriptor
-            .require_capability(ReasoningCapability::StructuredOutput)
-            .map_err(|_| fail("provider lacks structured output"))?;
         let tenant_id = self.binding.tenant_id;
         let reasoning_domain_id = sealed.reasoning_domain_id.0;
 
@@ -562,14 +580,25 @@ impl PrivateReasoningPort for ConsolidationReasoner<'_> {
             sealed.purpose,
         )
         .await
-        .map_err(|_| fail("reasoning admission resolver unavailable"))?
-        .ok_or_else(|| fail("reasoning route not admitted"))?;
+        .map_err(|_| fail("reasoning admission resolver unavailable"))?;
+        let Some(admission) = admission else {
+            // Ruling E3 (c): a route parked for its health is named as such.
+            let refusal = route_health_refusal(&mut txn, sealed.binding_id, sealed.binding_version)
+                .await
+                .map_err(|_| fail("reasoning admission resolver unavailable"))?;
+            return Err(fail(refusal.unwrap_or("reasoning route not admitted")));
+        };
         if admission.tenant_id != tenant_id
             || admission.purpose != PrivateReasoningPurpose::Consolidate
-            || !provider_matches_admission(self.provider, &admission, &self.config)
         {
-            return Err(fail("configured provider does not match admitted route"));
+            return Err(fail("admitted route does not match the registered call"));
         }
+        let _ = self.route.set(admission.route_fields());
+        // ADR-0060 D-B/D-C/D-E: the instance of the registered binding's admitted route, asked
+        // only after admission and proven equal to it.
+        let provider = (self.providers)(&admission).map_err(fail)?;
+        provider_matches_admission(provider.as_ref(), &admission).map_err(fail)?;
+        let descriptor = provider.descriptor();
         let inputs = load_inputs(&mut txn, tenant_id, self.binding.consolidation_run_id).await?;
         // §11.8 integrity gate (ADR-0015): the sealed manifest hash must equal the hash over the
         // run's rows as this worker reads them now. No provider call on any difference.
@@ -617,32 +646,20 @@ impl PrivateReasoningPort for ConsolidationReasoner<'_> {
             .iter()
             .map(|input| DisclosureSource::Memory(input.memory_id))
             .collect();
-        // §19.1 then §7.4, in that order (`ContributionReasoner`'s own resolver→ledger→disclosure
-        // sequence): the cost row is reserved before any byte leaves.
-        let reserved = model_call_ledger::reserve_private_call(
+        // §19.1 + §7.4 in ONE transaction (ADR-0060 D-N, §11.2.5): the ledger row carries the
+        // admitted route and the disclosure names that row. The disclosure id stays this attempt's
+        // durable receipt (ADR-0015) and what `model_call_id` below carries — the consolidation
+        // hop's persisted `response_model_call_id` is a disclosure reference, not a ledger one.
+        let (reserved, disclosure_id) = model_call_ledger::reserve_private_call_with_disclosure(
             self.pool,
-            &model_call_ledger::private_reserve_call(
-                ModelCallPurpose::PrivateConsolidate,
-                &admission,
-            ),
-        )
-        .await
-        .map_err(|_| fail("model call reservation failed"))?;
-        // §7.4: the disclosure row is reserved before the bytes leave and finalized after,
-        // success or failure alike. Its id stays this attempt's durable receipt (ADR-0015) and
-        // stays what `model_call_id` below carries — the consolidation hop's persisted
-        // `response_model_call_id` is a disclosure reference, not a ledger reference, and card
-        // 20 adds the ledger row ALONGSIDE it rather than re-pointing that column.
-        let disclosure_id = disclosure::reserve_private(
-            self.pool,
+            ModelCallPurpose::PrivateConsolidate,
+            &admission,
             &permit,
-            &admission.region,
             &wire_payload,
-            None,
             &sources,
         )
         .await
-        .map_err(|_| fail("disclosure reservation failed"))?;
+        .map_err(|_| fail("model call reservation failed"))?;
         let context = admitted_inference_context(
             tenant_id,
             user_id,
@@ -653,7 +670,7 @@ impl PrivateReasoningPort for ConsolidationReasoner<'_> {
         )
         .map_err(|_| fail("private context rejected"))?;
         let (response, disclosure_outcome, model_outcome, finalize) =
-            complete_structured_timed(self.provider, &context, request).await;
+            complete_structured_timed(provider.as_ref(), &context, request).await;
         let finalized = disclosure::finalize_private(
             self.pool,
             tenant_id,
@@ -680,13 +697,22 @@ impl PrivateReasoningPort for ConsolidationReasoner<'_> {
         {
             return Err(fail("model call finalization lost"));
         }
+        match &response {
+            Ok(_) => {
+                let _ = self.observed.set((reserved.model_call_id, false));
+            }
+            Err(error) if error.class() == ReasoningProviderError::WAITING_KEY_CLASS => {
+                let _ = self.observed.set((reserved.model_call_id, true));
+            }
+            Err(_) => {}
+        }
         let output_bytes = response
             .map_err(|error| {
                 eprintln!(
                     "{}",
                     provider_failure_line(
                         ModelCallPurpose::PrivateConsolidate,
-                        tenant_id,
+                        &admission,
                         reserved.model_call_id,
                         &finalize,
                         &error,

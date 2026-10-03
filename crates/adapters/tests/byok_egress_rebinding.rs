@@ -243,6 +243,7 @@ async fn the_production_constructor_hands_one_resolver_to_both_legs() {
         model_revision: None,
         capabilities: vec![ReasoningCapability::StructuredOutput],
         custom_endpoint: Some(format!("https://rebind.test:{port}/v1/chat/completions")),
+        request_extras: Default::default(),
     };
 
     // resolver 只传一次。构造成功 = 检查腿用它解析到公网地址并放行。

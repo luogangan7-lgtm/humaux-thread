@@ -22,6 +22,9 @@ cargo run -p xtask -- e2e-seed \
   --provider-id <provider text id, e.g. minimax> \
   --provider-model-id <provider model id> \
   --model-revision <model revision, or an explicit placeholder text> \
+  --capabilities <the profile's §11.2 capabilities, e.g. TEXT,STRUCTURED_OUTPUT; a set wider than an existing catalog row needs a new --model-revision label (ADR-0060 E5)> \
+  --account-ref <the vendor account every lane names; sha256 of it is the account hash (ADR-0060 D-J)> \
+  --request-extras <the profile's vendor request fields as a JSON object, {} for none (ADR-0060 research amendment 1)> \
   --credential-env <NAME of the variable holding the provider key, e.g. MINIMAX_API_KEY> \
   --collection <qdrant collection name> \
   --dimension <embedding vector size, e.g. 1024> \
@@ -31,6 +34,12 @@ cargo run -p xtask -- e2e-seed \
 
 `--qdrant-host`/`--qdrant-port` default to `127.0.0.1:6333` and may name no other host
 (same local-only rule as the two Postgres DSNs).
+
+`--no-lane` (card 33b, ADR-0060 D-H) seeds the tenant, users, reasoning domains and keys only: the lane
+flags (`--region` … `--request-extras`) and `--credential-env` are not read, no route row and no
+private-worker export line is written, and `--processor-id` still names the retrieval worker's egress
+identity. The routes then come from `humaux-maintenance reasoning register | bind | attest-health`
+(runbook §3.1), which is how `docs/ops/rehearse.sh` onboards its three tenants.
 
 Prints, once, to stdout:
 - the six base ids (`tenant_id`, `user_id`, `workspace_id`, `reasoning_domain_id`,
@@ -44,7 +53,10 @@ Prints, once, to stdout:
 - four paste-ready `export` blocks (`HUMAUX_CONSOLIDATION_WORKER_*`,
   `HUMAUX_PRIVATE_WORKER_*`, `HUMAUX_RETRIEVAL_WORKER_*`,
   `HUMAUX_PRIVATE_WORKER_DISTILL_*`) plus `HUMAUX_GATEWAY_EMBEDDING_DIMENSION`, so every
-  rehearsal hop can pick up the exact same seeded values (`provider_matches_admission`);
+  rehearsal hop can pick up the exact same seeded values. The private-worker block carries only
+  the deny-only `HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS=<processor-id>=<endpoint host>` and
+  `HUMAUX_PRIVATE_WORKER_REGIONS=<region>` lines: provider, model, endpoint and capabilities come
+  from each admitted route (ADR-0060 D-B / D-C);
 - `export HUMAUX_PRIVATE_WORKER_CREDENTIALS=<credential_id>=<--credential-env>` — one entry per
   lane this run created (two with `--second-domain`). ADR-0059 D-I: the private worker serves a
   route only if its credential reference is in this map. A deployment that seeds several
@@ -106,16 +118,19 @@ private worker's distill mode also requires these deployment values — none has
 - `HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS` [5] — counted provider requests before DEAD;
 - `HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS` [60] / `_BUDGET_MAX_CALLS` [120] — the §72.3
   per-tenant sliding window of admitted requests;
-- `HUMAUX_PRIVATE_WORKER_CAPABILITIES` [`STRUCTURED_OUTPUT,TOOL_CALLS,REASONING_SPLIT`] — what the
-  configured provider supports; declaring `TOOL_CALLS` selects the distill tool channel. The rehearsal
-  profile keeps it by measurement (ADR-0058 R10: live A/B `distill_channel_ab_live`, n=100 per channel,
-  tool dead=0 / malformed=1 vs content dead=1 / malformed=6); another provider is measured the same way;
+- `HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS` / `_REGIONS` [the seed's lines] — the deny-only recipient
+  (with the hosts it may dial) and region lists (ADR-0060 D-C); `HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS`
+  [1800] — worker-observed health renewal (ruling E3). The process-level provider keys of card 32
+  (`HUMAUX_PRIVATE_WORKER_CAPABILITIES`, `_PROVIDER_ID`, `_MODEL_ID`, `_MODEL_REVISION`, `_CHAT_URL`)
+  and the singular `_EGRESS_PROCESSOR_ID` / `_REGION` are refused at boot when set. What a profile declares (`--capabilities`) selects
+  its distill channel; the rehearsal profile keeps `TOOL_CALLS` by measurement (ADR-0058 R10);
 - `HUMAUX_PRIVATE_WORKER_CREDENTIALS` [the seed's line(s)] — `<credential_ref>=<ENV_NAME>[,…]`:
   per credential reference, the NAME of the variable that holds its provider key (a key is never a
   `HUMAUX_*` value). Required, no default; an explicitly empty value boots and parks every route
   `WAITING_KEY` / `CREDENTIAL_NOT_MAPPED`; a duplicate reference or an unset/empty named variable
-  refuses to boot (ADR-0059 D-I). `HUMAUX_PRIVATE_WORKER_KEY_ENV` (card 32's single key variable)
-  was removed by ADR-0059 D-I and is refused at boot when set;
+  refuses to boot (ADR-0059 D-I); references sharing one key must name one vendor account (same
+  `--account-ref`), or the worker refuses to boot (ADR-0060 D-J). `HUMAUX_PRIVATE_WORKER_KEY_ENV`
+  (card 32's single key variable) was removed by ADR-0059 D-I and is refused at boot when set;
 - `HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS` — `--distill-serve` only.
 
 ```sh

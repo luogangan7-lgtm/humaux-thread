@@ -1,7 +1,11 @@
 //! `adapters::tests::contribution_execution_repo_0131` — Provider-free PostgreSQL 18 coverage for migration 0131's
 //!   eight typed repository commands.
 //! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-testkit, serde_json, sha2, uuid]; services=[PostgreSQL(any) r=[ops.contribution_execution_job_links, ops.data_disclosures, ops.model_call_ledger, private.contribution_execution_sources, private.contribution_executions, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates] w=[ops.jobs]];
-//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::byok, adapters::contribution_entry_repo, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::disclosure, adapters::tests::support::contribution_fixture, application::consolidate, application::contribute, application::contribution_execution, domain::egress, domain::evidence, domain::identity, humaux-testkit]
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::byok, adapters::contribution_entry_repo,
+//!   adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::disclosure,
+//!   adapters::reasoning_route_admission, adapters::tests::support::contribution_fixture, application::consolidate,
+//!   application::contribute, application::contribution_execution, domain::evidence, domain::identity,
+//!   humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [admin SQL only seeds, simulates leases/faults and observes; every coupled mutation goes through
 //!   ContributionExecutionRepo; without a DB it SKIPs unless HUMAUX_REQUIRE_DB, then panics]
@@ -10,6 +14,7 @@
 //! Admin SQL is limited to fixture setup, lease/fault simulation, and durable observations.
 //! Every coupled contribution mutation goes through `ContributionExecutionRepo`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -34,6 +39,7 @@ use humaux_adapters::{
         coverage_prompt_contract,
     },
     disclosure::DeletionCapability,
+    reasoning_route_admission::ReasoningAdmissionLocator,
 };
 use humaux_application::{
     consolidate::{ContentSha256, ProviderTraceRef, ReasoningIntentSha256},
@@ -46,7 +52,6 @@ use humaux_application::{
     },
 };
 use humaux_domain::{
-    egress::ProcessorId,
     evidence::payload_sha256,
     identity::{AuthorizationScope, PrincipalId},
 };
@@ -121,6 +126,7 @@ impl NoCallProvider {
                     ReasoningCapability::StructuredOutput,
                 ],
                 custom_endpoint: None,
+                request_extras: Default::default(),
             },
         }
     }
@@ -170,13 +176,14 @@ fn prepared_plan(
         )
         .expect("load execution for prepare")
         .expect("execution exists");
-    let provider = NoCallProvider::new();
+    let provider: Arc<dyn UserReasoningProvider> = Arc::new(NoCallProvider::new());
+    // ADR-0060 D-B: every admitted route is served by the one stub.
+    let providers =
+        move |_: &ReasoningAdmissionLocator| Ok::<_, &'static str>(Arc::clone(&provider));
     let reasoner = ContributionReasoner::new_for_execution(
         &fixture.private,
-        &provider,
+        &providers,
         ContributionReasonerConfig {
-            allowed_egress_processor_id: ProcessorId(fixture.egress_processor),
-            region: "test-region".into(),
             permit_ttl: Duration::from_secs(30),
             deletion_capability: DeletionCapability::Unknown,
             system_prompt: "Remove personal identifiers and return JSON.".into(),

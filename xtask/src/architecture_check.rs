@@ -1437,6 +1437,67 @@ fn adr0059_role_hygiene_sole_call_sites(root: &Path) -> Verdict {
     }
 }
 
+/// ADR-0060 D-B / D-A (T31): the private worker's provider instances have one production source.
+/// Over `bins/*/src` (tests stripped): `RouteProviders::new(` is called exactly once, in the
+/// private worker's `main.rs`; exactly one `ReasoningProviderDescriptor {` literal exists, in
+/// `route_providers.rs` (a second one is a process-level descriptor again). Over
+/// `crates/adapters/src`: exactly one `reasoning_profile_capabilities(` call, the admission
+/// wrapper's.
+fn route_provider_sole_site_problems(root: &Path, files: &[(PathBuf, String)]) -> Vec<String> {
+    let in_dir = |prefix: &str| -> Vec<(String, &String)> {
+        files
+            .iter()
+            .map(|(p, s)| (display(root, p), s))
+            .filter(|(d, _)| d.starts_with(prefix) && d.contains("/src/") && !d.contains("/tests/"))
+            .collect()
+    };
+    let bins = in_dir("bins/");
+    let adapters = in_dir("crates/adapters/");
+    let mut problems = Vec::new();
+    let mut expect =
+        |sources: &[(String, &String)], count: &dyn Fn(&str) -> usize, what: &str, home: &str| {
+            let sites: Vec<(String, usize)> = sources
+                .iter()
+                .map(|(d, s)| (d.clone(), count(s)))
+                .filter(|(_, n)| *n > 0)
+                .collect();
+            let total: usize = sites.iter().map(|(_, n)| n).sum();
+            if total != 1 || !sites.iter().all(|(d, _)| d.ends_with(home)) {
+                problems.push(format!(
+                    "ADR-0060 D-B: expected exactly 1 {what} in {home}, found {total}: {sites:?}"
+                ));
+            }
+        };
+    expect(
+        &bins,
+        &|s| count_call_sites(s, "RouteProviders::new"),
+        "`RouteProviders::new(` call",
+        "bins/private-worker/src/main.rs",
+    );
+    expect(
+        &bins,
+        &|s| count_construction_calls(s, "ReasoningProviderDescriptor {"),
+        "`ReasoningProviderDescriptor {` literal",
+        "bins/private-worker/src/route_providers.rs",
+    );
+    expect(
+        &adapters,
+        &|s| count_call_sites(s, "reasoning_profile_capabilities"),
+        "`reasoning_profile_capabilities(` call",
+        "crates/adapters/src/reasoning_route_admission.rs",
+    );
+    problems
+}
+
+fn adr0060_route_provider_sole_sites(root: &Path) -> Verdict {
+    let problems = route_provider_sole_site_problems(root, &walk_workspace_rs(root));
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
 /// §1.3/§48.0 G80-11 (source_hash leg): `humaux_projection::fingerprint::source_hash` is the
 /// sole construction point of `SourceHash` (§16.1/§16.1.1, T5.1) — same single-crate
 /// convergence family as `EvidencePayloadSha256` (G80-22, above) and the §1.12 canonical tool
@@ -5850,6 +5911,10 @@ pub fn run(_args: &[String]) -> i32 {
             "ADR-0059 D-G (token key install and the token field parser: one production call site each)",
             adr0059_token_sole_call_sites(&root),
         ),
+        (
+            "ADR-0060 D-B T31 (one RouteProviders::new, one ReasoningProviderDescriptor literal under bins, one capabilities read)",
+            adr0060_route_provider_sole_sites(&root),
+        ),
     ];
     checks.extend(provider_plane_architecture_gate_checks(&root));
 
@@ -7139,6 +7204,40 @@ mod tests {
         assert!(problems[0].contains("`install_token_keys(` call site, found 2"));
         assert!(matches!(
             adr0059_token_sole_call_sites(&workspace_root()),
+            Verdict::Pass
+        ));
+    }
+
+    /// T31 (ADR-0060 D-B) — fault: a process descriptor literal in main.rs ⇒ 2 literals ⇒ red;
+    /// the real workspace is green.
+    #[test]
+    fn route_provider_sources_are_single() {
+        let root = Path::new("/r");
+        let files = vec![
+            (
+                root.join("bins/private-worker/src/main.rs"),
+                "fn b() { let r = RouteProviders::new(a, b, c, d, e); }".to_owned(),
+            ),
+            (
+                root.join("bins/private-worker/src/route_providers.rs"),
+                "fn p() { let d = ReasoningProviderDescriptor { x }; }".to_owned(),
+            ),
+            (
+                root.join("crates/adapters/src/reasoning_route_admission.rs"),
+                "fn w() { q(\"SELECT reasoning_profile_capabilities($1,$2)\"); }".to_owned(),
+            ),
+        ];
+        assert!(route_provider_sole_site_problems(root, &files).is_empty());
+        let mut two = files.clone();
+        two.push((
+            root.join("bins/private-worker/src/main.rs"),
+            "fn m() { let d = ReasoningProviderDescriptor { y }; }".to_owned(),
+        ));
+        let problems = route_provider_sole_site_problems(root, &two);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("found 2"), "{problems:?}");
+        assert!(matches!(
+            adr0060_route_provider_sole_sites(&workspace_root()),
             Verdict::Pass
         ));
     }

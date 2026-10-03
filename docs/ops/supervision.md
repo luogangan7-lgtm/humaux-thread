@@ -82,6 +82,8 @@ missing object) · `1` infrastructure (connect refused, timeout, TLS).
 |---|---|---|
 | boot exits naming `HUMAUX_PRIVATE_WORKER_CREDENTIALS` | the map is unset, malformed, repeats a reference, or names an unset/empty variable | fix the map; do not restart in a loop. An explicitly empty value boots (every route parks) |
 | boot exits naming `HUMAUX_PRIVATE_WORKER_KEY_ENV ... removed` | stale card-32 configuration | delete the variable; put the key in the map |
+| boot exits naming `HUMAUX_PRIVATE_WORKER_{PROVIDER_ID,MODEL_ID,MODEL_REVISION,CHAT_URL,CAPABILITIES,EGRESS_PROCESSOR_ID,REGION} ... removed by ADR-0060 D-C` | stale card-33 configuration: provider, model, endpoint, capabilities, recipient and region now come from each call's admitted route | delete the variable; register / bind the route (runbook §3); a recipient goes in `HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS`, a region in `HUMAUX_PRIVATE_WORKER_REGIONS` |
+| boot exits naming `HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS`, `_REGIONS` or `_HEALTH_RENEW_SECS` | required since ADR-0060 (no default); malformed, repeated or blank entry | set it; an explicitly empty recipient or region list boots (every route parks with its class) |
 | distill jobs `WAITING_KEY`, `last_error_class = CREDENTIAL_NOT_MAPPED` | the route's credential reference is not in this worker's map; no provider call, no ledger row, no attempt was spent | add `<credential_ref>=<ENV_NAME>` to the map and restart (runbook §10.4); the jobs are re-checked every `HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS` |
 
 **Never treat a `missing object` as a zero reading.** If a dashboard shows `0` where a probe

@@ -21,13 +21,13 @@ order, every process gated on its own probe), then point `soak` at it. It needs:
   it twice and keep both tenant ids in the report. Every invocation must repeat the SAME
   deployment-shaped lane flags — `--processor-id`, `--region`, `--endpoint-ref`, `--provider-id`,
   `--provider-model-id`, `--model-revision` — and the same `--pepper-hex`. `--processor-id` is the
-  egress processor of the deployment (§7.3), not a per-tenant value: one private worker holds one
-  `HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID`, and a tenant seeded under a different one is
-  admitted by nothing, so its Distill hop hands every Evidence back forever. Card 16's first soak
-  ran that way for 8 minutes and the second tenant produced zero memories; the worker now names
-  the class on every deferral (`… not ready: configured provider does not match admitted route`),
-  and `cargo test -p xtask e2e_seed` pins the property that two seeded tenants share one egress
-  processor.
+  egress recipient of the deployment (§7.3), not a per-tenant value: the private worker holds a
+  recipient LIST (`HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS`, `<uuid>=<host>[|<host>…][,…]`,
+  ADR-0060 D-C / D-L), and a tenant seeded under a recipient that is not in the list parks every
+  Distill job `WAITING_KEY` with `last_error_class = EGRESS_PROCESSOR_NOT_ALLOWED` — no provider
+  call, no ledger row (runbook §3). Card 16's first soak ran a mismatched tenant for 8 minutes and
+  it produced zero memories; the class now names the cause, and `cargo test -p xtask e2e_seed`
+  pins the property that two seeded tenants share one egress processor.
 
 ## 2. Invocation
 

@@ -3,7 +3,7 @@
 //!   provider capability and the only INSERT on `memory_records`/`memory_evidence` (no RPC needed, contrast
 //!   ADR-0015's Consolidate hop). Dispatch is ADR-0058's: one `DERIVED_DISTILL` job = one Evidence, claimed through
 //!   the four provider slots, worked by at most IN_FLIGHT seats of one task.
-//! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-domain, humaux-projection, serde_json, sha2, tokio, uuid]; services=[]; env=[HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS]; modules=[adapters::affect_repo, adapters::byok, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::distill_repo, adapters::jobs, adapters::postgres, application::consolidate, domain::authority, domain::dataclass, domain::error, domain::evidence, domain::ids, domain::memory, domain::policy, projection::fingerprint]
+//! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-domain, humaux-projection, serde_json, sha2, tokio, uuid]; services=[PostgreSQL(role_private_worker)]; env=[HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS]; modules=[adapters::affect_repo, adapters::byok, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::distill_repo, adapters::jobs, adapters::postgres, adapters::reasoning_route_admission, application::consolidate, domain::authority, domain::dataclass, domain::error, domain::evidence, domain::ids, domain::memory, domain::policy, humaux-private-worker, projection::fingerprint]
 //! Called-by: [private-worker::main, tests]
 //! Invariants: [a candidate over the §10.1 origin-bound ceiling is rejected, never downgraded; one job = one Evidence
 //!   and a job only takes its own Evidence's outbox row; at most IN_FLIGHT seats per process and four bound slots
@@ -13,8 +13,11 @@
 //!   one generation-fenced transaction; only a fence refusal is a lost lease, an escaped error is ERROR (ADR-0058
 //!   R3); an invalid inferred affect drops the reply's affects, never its memories (R1); a drain names why it stopped,
 //!   no_slot or no_work (R5); a route whose credential reference is not in the worker's key map is NOT_READY
-//!   CREDENTIAL_NOT_MAPPED before any ledger row or provider call (ADR-0059 D-I)]
-//! Spec: Baseline §16.1.1; §10.1; ADR-0016; §15.7; §67.2; §11; ADR-0058; ADR-0059
+//!   CREDENTIAL_NOT_MAPPED before any ledger row or provider call (refused by its route instance, ADR-0060 D-B);
+//!   a route parked for its health is NOT_READY ROUTE_HEALTH_STALE / ROUTE_HEALTH_DENIED; a SUCCEEDED call renews
+//!   its route's health near expiry and a provider 401 records the credential INVALID (ruling E3)]
+//! Spec: Baseline §16.1.1; §10.1; ADR-0016; §15.7; §67.2; §11; §11.2.5; ADR-0058; ADR-0059; ADR-0060 D-B; ADR-0060 D-M;
+//!   ADR-0060 E3
 //!
 //! One job (ADR-0058 D-C): take the job's own outbox row, (a) check the Evidence still names the
 //! job's reasoning domain, resolve the admitted Distill route, load the Evidence, record the
@@ -40,7 +43,6 @@
 //! as a no-op when the answer was "nothing memorable", `projection_worker` D6).
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,7 +51,7 @@ use std::time::Duration;
 
 use humaux_adapters::{
     affect_repo,
-    byok::{ReasoningProviderError, UserReasoningProvider},
+    byok::ReasoningProviderError,
     contribution_reasoner::ContributionReasonerConfig,
     distill_reasoner::{
         AFFECT_INVALID_CLASS, DISPATCH_REFUSED, DISTILL_PARSER_VERSION, DISTILL_PROCESSOR_KIND,
@@ -63,6 +65,7 @@ use humaux_adapters::{
     },
     jobs::{self, CallAdmission, DistillClaim, DistillFinish, DistillLease},
     postgres::PrivateWorkerDbPool,
+    reasoning_route_admission::ProviderFor,
 };
 use humaux_application::consolidate::PrivateReasoningError;
 use humaux_domain::{
@@ -103,10 +106,10 @@ pub struct DistillDispatchConfig {
     pub max_attempts: i32,
     /// §72.3 tenant distill budget every request passes before it may leave (ADR-0058 D-T).
     pub budget: jobs::DistillCallBudget,
-    /// The credential references this process's key map holds (`HUMAUX_PRIVATE_WORKER_CREDENTIALS`,
-    /// ADR-0059 D-I). An admitted route whose reference is not here is NOT_READY
-    /// [`CREDENTIAL_NOT_MAPPED`] before anything is reserved. Empty = every route parks.
-    pub credential_refs: BTreeSet<Uuid>,
+    /// Ruling E3 (`HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS`): the validity of the health a
+    /// SUCCEEDED call renews (only once less than half of it is left) and of the INVALID verdict
+    /// a provider-rejected credential records.
+    pub health_renew_seconds: i64,
 }
 
 /// ADR-0058 R2: the `ops.provider_slots` rows `migrations/0190_distill_dispatch_v2.sql` seeds
@@ -128,6 +131,7 @@ impl DistillDispatchConfig {
             || self.hard_deadline_seconds < 2.0 * self.min_remaining_seconds()
             || !positive(self.budget.window_seconds)
             || self.budget.max_calls < 1
+            || self.health_renew_seconds < 1
         {
             return Err(ErrorCode::InvalidInput);
         }
@@ -373,8 +377,6 @@ fn payload_identity(payload: &Value) -> Option<(Uuid, Uuid)> {
 /// The static NOT_READY class for a tenant whose `(domain, PRIVATE_DISTILL_TEXT)` binding has not
 /// been admitted yet — the "onboarded before its route" case.
 const NO_DISTILL_BINDING: &str = "no admitted PRIVATE_DISTILL_TEXT route binding";
-/// ADR-0059 D-I: the admitted route's credential reference is not in this process's key map.
-pub const CREDENTIAL_NOT_MAPPED: &str = "CREDENTIAL_NOT_MAPPED";
 /// ADR-0058 D-D: the Evidence names another reasoning domain than its job.
 const DOMAIN_MISMATCH: &str = "DOMAIN_MISMATCH";
 /// A job payload without the 0164 identity: no Evidence can ever be named for it.
@@ -471,14 +473,15 @@ enum Mode<'a> {
 
 /// `--distill-once` (and every test): IN_FLIGHT seats work the cross-tenant backlog until each
 /// seat's claim comes back empty. Returns the summed report; a seat's claim error is returned
-/// after every other seat has finished its own job.
+/// after every other seat has finished its own job. `providers` maps each job's admitted route
+/// to its provider instance (ADR-0060 D-B).
 pub async fn dispatch_pass(
     pool: &PrivateWorkerDbPool,
-    provider: &dyn UserReasoningProvider,
+    providers: &ProviderFor,
     config: ContributionReasonerConfig,
     dispatch: &DistillDispatchConfig,
 ) -> Result<DistillDispatchReport, DistillError> {
-    run_seats(pool, provider, config, dispatch, Mode::Drain).await
+    run_seats(pool, providers, config, dispatch, Mode::Drain).await
 }
 
 /// `--distill-serve`: the same seats, resident. A seat sleeps `poll` only after its own claim
@@ -486,7 +489,7 @@ pub async fn dispatch_pass(
 /// the job it holds.
 pub async fn dispatch_serve(
     pool: &PrivateWorkerDbPool,
-    provider: &dyn UserReasoningProvider,
+    providers: &ProviderFor,
     config: ContributionReasonerConfig,
     dispatch: &DistillDispatchConfig,
     poll: Duration,
@@ -494,7 +497,7 @@ pub async fn dispatch_serve(
 ) -> Result<DistillDispatchReport, DistillError> {
     run_seats(
         pool,
-        provider,
+        providers,
         config,
         dispatch,
         Mode::Serve { poll, shutdown },
@@ -504,7 +507,7 @@ pub async fn dispatch_serve(
 
 async fn run_seats(
     pool: &PrivateWorkerDbPool,
-    provider: &dyn UserReasoningProvider,
+    providers: &ProviderFor,
     config: ContributionReasonerConfig,
     dispatch: &DistillDispatchConfig,
     mode: Mode<'_>,
@@ -515,7 +518,7 @@ async fn run_seats(
     // IN_FLIGHT in adapters::postgres.
     let dispatcher = Dispatcher {
         pool,
-        reasoner: DistillReasoner::new(pool, provider, config).map_err(DistillError::Config)?,
+        reasoner: DistillReasoner::new(pool, providers, config).map_err(DistillError::Config)?,
         dispatch,
     };
     let seats: Vec<SeatFuture<'_>> = (0..dispatch.in_flight)
@@ -658,6 +661,8 @@ async fn run_claimed(
     }
     let lost = Cell::new(false);
     let mut attempt = claim.attempt;
+    // ADR-0060 D-M: the admitted route's fields once the read leg admitted one.
+    let mut route = String::from("route=-");
     let heartbeat = async {
         let period = Duration::from_secs_f64(dispatch.lease_seconds / 3.0);
         loop {
@@ -684,6 +689,7 @@ async fn run_claimed(
         &lease,
         local_deadline,
         &mut attempt,
+        &mut route,
         report,
     );
     let settled = tokio::select! {
@@ -720,7 +726,7 @@ async fn run_claimed(
         report.heartbeat_lost += 1;
     }
     eprintln!(
-        "humaux-private-worker: distill job={} tenant={} evidence={} gen={} outcome={} attempt={}/{} error_class={} next_retry_s={} channel_fallback={}",
+        "humaux-private-worker: distill job={} tenant={} {route} evidence={} gen={} outcome={} attempt={}/{} error_class={} next_retry_s={} channel_fallback={}",
         claim.job_id,
         claim.tenant_id,
         payload_identity(&claim.payload).map_or_else(|| "-".to_owned(), |(_, e)| e.to_string()),
@@ -881,11 +887,11 @@ enum ReadLeg {
     NotReady(&'static str),
 }
 
-/// (a) of the module doc: domain check, binding, admission, credential check, Evidence load,
-/// processing run (committed before the call).
+/// (a) of the module doc: domain check, binding, admission (whose route instance refuses an
+/// unmapped credential, ADR-0060 D-B), Evidence load, processing run (committed before the call).
 #[allow(
     clippy::too_many_lines,
-    reason = "one read transaction whose NOT_READY gates (domain, binding, admission, credential map) must all precede the reservation; ADR-0058 D-H, ADR-0059 D-I"
+    reason = "one read transaction whose NOT_READY gates (domain, binding, admission and its route instance) must all precede the reservation; ADR-0058 D-H, ADR-0060 D-B"
 )]
 async fn read_leg(
     dispatcher: &Dispatcher<'_>,
@@ -933,16 +939,6 @@ async fn read_leg(
             ));
         }
     };
-    // ADR-0058 D-H / ADR-0059 D-I: pre-reserve — a reference the key map does not hold is NOT_READY
-    // here, before any ledger row, `ops.begin_call` or provider call exists.
-    if !dispatcher
-        .dispatch
-        .credential_refs
-        .contains(&admission.locator.credential_ref)
-    {
-        txn.rollback().await?;
-        return Ok(ReadLeg::NotReady(CREDENTIAL_NOT_MAPPED));
-    }
     let Some(evidence) = distill_repo::load_evidence(
         &mut txn,
         tenant_id,
@@ -962,7 +958,7 @@ async fn read_leg(
     // `prepare` sends, for the channel the provider declares.
     let ceiling = evidence.origin_class.authority_ceiling(MemoryType::Fact);
     let affects = affect_menu(&mut txn, tenant_id, &evidence).await?;
-    let contract = distill_prompt_contract(ceiling, affects, dispatcher.reasoner.output_channel());
+    let contract = distill_prompt_contract(ceiling, affects, admission.output_channel());
     let evidence_hashes = [evidence_axis(&evidence)?];
     let prompt_hash = hex::encode(contract.sha256.0);
     let prompt_version = contract.version.to_string();
@@ -996,6 +992,8 @@ async fn read_leg(
             evidence_payload_sha256: vec![evidence.payload_sha256.clone()],
             source_hash: fingerprint.as_bytes(),
             context_snapshot_seq,
+            profile_id: admission.locator.profile_id,
+            profile_version: admission.locator.profile_version,
         },
     )
     .await?;
@@ -1038,13 +1036,15 @@ struct EmptyAnswer {
 }
 
 /// One claimed job end to end; every exit settles (or, for an unknown call, deliberately does
-/// not). `attempt` tracks the job's counted calls for the job line.
+/// not). `attempt` tracks the job's counted calls and `route` its admitted route (ADR-0060 D-M)
+/// for the job line.
 async fn work_job(
     dispatcher: &Dispatcher<'_>,
     claim: &DistillClaim,
     lease: &DistillLease<'_>,
     local_deadline: Instant,
     attempt: &mut i32,
+    route: &mut String,
     report: &mut DistillDispatchReport,
 ) -> Result<Settled, DistillError> {
     let dispatch = dispatcher.dispatch;
@@ -1115,6 +1115,7 @@ async fn work_job(
         reasoning_domain_id,
         local_deadline,
         attempt,
+        route,
         &mut calls,
         report,
     )
@@ -1142,6 +1143,7 @@ async fn call_loop(
     reasoning_domain_id: Uuid,
     local_deadline: Instant,
     attempt: &mut i32,
+    route: &mut String,
     calls: &mut u32,
     report: &mut DistillDispatchReport,
 ) -> Result<Settled, DistillError> {
@@ -1187,6 +1189,7 @@ async fn call_loop(
             }
             Err(error) => return Err(error),
         };
+        *route = ready.admission.locator.route_fields();
         let evidence = &ready.evidence;
         let ceiling = evidence.origin_class.authority_ceiling(MemoryType::Fact);
         let envelope = DistillEnvelopeInput {
@@ -1263,10 +1266,38 @@ async fn call_loop(
         *calls += 1;
         *attempt = admitted_attempt;
         report.attempts += 1;
+        let model_call_id = prepared.model_call_id;
         let outcome = dispatcher
             .reasoner
             .call(prepared, tokio::time::sleep_until(http_cutoff))
             .await;
+        // Ruling E3 (b): traffic keeps a route's health alive; a rejected key denies the next
+        // admission at once.
+        match &outcome {
+            Ok(DistillCallOutcome::Answered(_)) => {
+                crate::observe_route_health(
+                    dispatcher.pool,
+                    claim.tenant_id,
+                    model_call_id,
+                    false,
+                    dispatcher.dispatch.health_renew_seconds,
+                )
+                .await;
+            }
+            Ok(DistillCallOutcome::Failed(class))
+                if *class == ReasoningProviderError::WAITING_KEY_CLASS =>
+            {
+                crate::observe_route_health(
+                    dispatcher.pool,
+                    claim.tenant_id,
+                    model_call_id,
+                    true,
+                    dispatcher.dispatch.health_renew_seconds,
+                )
+                .await;
+            }
+            _ => {}
+        }
         let answered = match outcome {
             Ok(DistillCallOutcome::Unknown) => {
                 return Ok(Settled::new(JobOutcome::Unknown, Some(EXECUTION_UNCERTAIN)));
@@ -1625,7 +1656,7 @@ mod tests {
                 window_seconds: 60.0,
                 max_calls: 120,
             },
-            credential_refs: BTreeSet::new(),
+            health_renew_seconds: 1800,
         }
     }
 
@@ -1675,6 +1706,10 @@ mod tests {
                     window_seconds: 60.0,
                     max_calls: 0,
                 },
+                ..ok.clone()
+            },
+            DistillDispatchConfig {
+                health_renew_seconds: 0,
                 ..ok.clone()
             },
         ] {

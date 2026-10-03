@@ -1,6 +1,10 @@
 //! `private-worker::tests::contribution_execution_runner` — Real-PostgreSQL R4-C worker coverage with an in-process
 //!   recording provider.
-//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-testkit, postgres, serde_json, sha2, uuid]; services=[PostgreSQL(owner) r=[ops.contribution_execution_job_links, private.contribution_executions, staging.contribution_candidates] w=[ops.jobs]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::byok, adapters::contribution_entry_repo, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::contribution_scan, adapters::disclosure, adapters::jobs, adapters::tests::support::contribution_fixture, application::contribute, application::contribution_execution, domain::egress, domain::error, humaux-private-worker, humaux-testkit]
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-testkit, postgres, serde_json, sha2, uuid]; services=[PostgreSQL(owner) r=[ops.contribution_execution_job_links, ops.reasoning_account_health_observations, private.contribution_executions, staging.contribution_candidates] w=[ops.jobs]]; env=[HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::byok, adapters::contribution_entry_repo, adapters::contribution_execution_repo,
+//!   adapters::contribution_reasoner, adapters::contribution_scan, adapters::disclosure, adapters::jobs,
+//!   adapters::reasoning_route_admission, adapters::tests::support::contribution_fixture, application::contribute,
+//!   application::contribution_execution, domain::error, humaux-private-worker, humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [no external model or production credential; admin SQL only seeds, injects faults and observes,
 //!   mutations go through the typed runner; without a DB the test SKIPs unless HUMAUX_REQUIRE_DB, then panics]
@@ -19,7 +23,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -43,12 +47,13 @@ use humaux_adapters::{
     contribution_scan::{ContributionScanner, ContributionScannerConfig},
     disclosure::DeletionCapability,
     jobs,
+    reasoning_route_admission::ReasoningAdmissionLocator,
 };
 use humaux_application::{
     contribute::prepare_assessed_input,
     contribution_execution::{ContributionExecutionEnqueueInput, ContributionExecutionState},
 };
-use humaux_domain::{egress::ProcessorId, error::ErrorCode};
+use humaux_domain::error::ErrorCode;
 use humaux_private_worker::{
     ContributionExecutionRunner, ContributionExecutionRunnerConfig,
     ContributionExecutionRunnerError, ContributionRunOnceReport,
@@ -58,6 +63,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+/// Twice the fixture's one-hour attestation, so every answered call is "near expiry" and renews
+/// (ruling E3 (b): renewal when less than half of this is left).
+const HEALTH_RENEW_SECS: i64 = 7200;
 static SCANNER_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 /// Env probe only; the skip goes through `humaux_testkit::skip_or_fail`, which turns a
@@ -72,6 +80,7 @@ enum ProviderStep {
     SleepThenJson(Duration, String),
     Permanent,
     MayHaveReachedTimeout,
+    KeyRejected,
 }
 
 struct RecordingProvider {
@@ -93,6 +102,7 @@ impl RecordingProvider {
                     ReasoningCapability::StructuredOutput,
                 ],
                 custom_endpoint: None,
+                request_extras: Default::default(),
             },
             endpoint_ref: "https://reasoning.invalid/v1/chat/completions".into(),
             steps: Mutex::new(steps.into_iter().collect()),
@@ -163,6 +173,9 @@ impl UserReasoningProvider for RecordingProvider {
             ProviderStep::MayHaveReachedTimeout => {
                 Err(ReasoningProviderError::RetryWait { retry_after: None })
             }
+            ProviderStep::KeyRejected => {
+                Err(ReasoningProviderError::WaitingKey { fingerprint: None })
+            }
         }
     }
 
@@ -212,10 +225,19 @@ fn test_scanner() -> (TestScannerExecutable, ContributionScanner) {
     (TestScannerExecutable(path), scanner)
 }
 
-fn reasoner_config(fixture: &ContributionFixture) -> ContributionReasonerConfig {
+/// ADR-0060 D-B: every admitted route is served by `provider`.
+fn serve_all(
+    provider: &Arc<RecordingProvider>,
+) -> impl Fn(&ReasoningAdmissionLocator) -> Result<Arc<dyn UserReasoningProvider>, &'static str>
++ Send
++ Sync
++ use<> {
+    let provider = Arc::clone(provider);
+    move |_| Ok(Arc::clone(&provider) as Arc<dyn UserReasoningProvider>)
+}
+
+fn reasoner_config() -> ContributionReasonerConfig {
     ContributionReasonerConfig {
-        allowed_egress_processor_id: ProcessorId(fixture.egress_processor),
-        region: "test-region".into(),
         permit_ttl: Duration::from_secs(30),
         deletion_capability: DeletionCapability::Unknown,
         system_prompt: "validated static contribution prompt".into(),
@@ -250,16 +272,14 @@ fn enqueue(
 
 fn run(
     fixture: &ContributionFixture,
-    provider: &RecordingProvider,
+    provider: &Arc<RecordingProvider>,
     scanner: &ContributionScanner,
     lease_seconds: f64,
 ) -> Result<ContributionRunOnceReport, ContributionExecutionRunnerError> {
-    let reasoner = ContributionReasoner::new_for_execution(
-        &fixture.private,
-        provider,
-        reasoner_config(fixture),
-    )
-    .expect("execution reasoner");
+    let providers = serve_all(provider);
+    let reasoner =
+        ContributionReasoner::new_for_execution(&fixture.private, &providers, reasoner_config())
+            .expect("execution reasoner");
     let runner = ContributionExecutionRunner::new(
         &fixture.private,
         &reasoner,
@@ -267,6 +287,7 @@ fn run(
         ContributionExecutionRunnerConfig {
             lease_owner: format!("r4-c-runner-{}", Uuid::new_v4()),
             lease_seconds,
+            health_renew_seconds: HEALTH_RENEW_SECS,
         },
     )
     .expect("bounded runner");
@@ -287,7 +308,7 @@ fn requeue_for_reconciliation(fixture: &mut ContributionFixture, job_id: Uuid) {
 
 fn reserve_a_without_dispatch(
     fixture: &ContributionFixture,
-    provider: &RecordingProvider,
+    provider: &Arc<RecordingProvider>,
     execution_id: humaux_application::contribution_execution::ContributionExecutionId,
     owner: &str,
 ) {
@@ -311,12 +332,10 @@ fn reserve_a_without_dispatch(
         .block_on(repo.load(fixture.auth.tenant_id().0, execution_id))
         .expect("load execution before A reserve")
         .expect("execution exists before A reserve");
-    let reasoner = ContributionReasoner::new_for_execution(
-        &fixture.private,
-        provider,
-        reasoner_config(fixture),
-    )
-    .expect("execution reasoner");
+    let providers = serve_all(provider);
+    let reasoner =
+        ContributionReasoner::new_for_execution(&fixture.private, &providers, reasoner_config())
+            .expect("execution reasoner");
     let prepared = fixture
         .rt
         .block_on(reasoner.prepare_a(&execution))
@@ -419,10 +438,10 @@ fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
     {
         let fixture = ContributionFixture::new();
         let enqueued = enqueue(&fixture, "happy");
-        let provider = RecordingProvider::new([
+        let provider = Arc::new(RecordingProvider::new([
             ProviderStep::Json(r#"{"probe":"general knowledge"}"#.into()),
             ProviderStep::Json(r#"{"novelty":"PASS","quality":"PASS","generality":"PASS","grounding":"PASS","candidate":"generalized candidate"}"#.into()),
-        ]);
+        ]));
         let (_scanner_file, scanner) = test_scanner();
         assert_eq!(
             run(&fixture, &provider, &scanner, 60.0).expect("happy runner"),
@@ -445,7 +464,7 @@ fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
     {
         let mut fixture = ContributionFixture::new();
         let enqueued = enqueue(&fixture, "a-reserve-crash");
-        let provider = RecordingProvider::new([]);
+        let provider = Arc::new(RecordingProvider::new([]));
         reserve_a_without_dispatch(
             &fixture,
             &provider,
@@ -505,10 +524,10 @@ fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
     {
         let mut fixture = ContributionFixture::new();
         let enqueued = enqueue(&fixture, "b-timeout");
-        let provider = RecordingProvider::new([
+        let provider = Arc::new(RecordingProvider::new([
             ProviderStep::Json(r#"{"probe":"general knowledge"}"#.into()),
             ProviderStep::MayHaveReachedTimeout,
-        ]);
+        ]));
         let (_scanner_file, scanner) = test_scanner();
         assert_eq!(
             run(&fixture, &provider, &scanner, 60.0).expect("B timeout reconciliation"),
@@ -564,10 +583,10 @@ fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
     {
         let fixture = ContributionFixture::new();
         let enqueued = enqueue(&fixture, "b-gate-fail");
-        let provider = RecordingProvider::new([
+        let provider = Arc::new(RecordingProvider::new([
             ProviderStep::Json(r#"{"probe":"general knowledge"}"#.into()),
             ProviderStep::Json(r#"{"novelty":"PASS","quality":"FAIL","generality":"PASS","grounding":"PASS","candidate":"unused generalized candidate"}"#.into()),
-        ]);
+        ]));
         let (_scanner_file, scanner) = test_scanner();
         assert_eq!(
             run(&fixture, &provider, &scanner, 60.0).expect("B gate fail"),
@@ -599,10 +618,10 @@ fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
     {
         let fixture = ContributionFixture::new();
         let enqueued = enqueue(&fixture, "b-scan-reject");
-        let provider = RecordingProvider::new([
+        let provider = Arc::new(RecordingProvider::new([
             ProviderStep::Json(r#"{"probe":"general knowledge"}"#.into()),
             ProviderStep::Json(r#"{"novelty":"PASS","quality":"PASS","generality":"PASS","grounding":"PASS","candidate":"contact person@example.test"}"#.into()),
-        ]);
+        ]));
         let (_scanner_file, scanner) = test_scanner();
         assert_eq!(
             run(&fixture, &provider, &scanner, 60.0).expect("scanner rejection"),
@@ -632,7 +651,7 @@ fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
     {
         let fixture = ContributionFixture::new();
         let enqueued = enqueue(&fixture, "permanent");
-        let provider = RecordingProvider::new([ProviderStep::Permanent]);
+        let provider = Arc::new(RecordingProvider::new([ProviderStep::Permanent]));
         let (_scanner_file, scanner) = test_scanner();
         assert_eq!(
             run(&fixture, &provider, &scanner, 60.0).expect("terminal provider failure"),
@@ -667,10 +686,10 @@ fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
     {
         let fixture = ContributionFixture::new();
         let enqueued = enqueue(&fixture, "late-a");
-        let provider = RecordingProvider::new([ProviderStep::SleepThenJson(
+        let provider = Arc::new(RecordingProvider::new([ProviderStep::SleepThenJson(
             Duration::from_millis(2_500),
             r#"{"probe":"general knowledge"}"#.into(),
-        )]);
+        )]));
         let (_scanner_file, scanner) = test_scanner();
         assert_eq!(
             run(&fixture, &provider, &scanner, 2.0).expect("exact late A completion"),
@@ -701,9 +720,9 @@ fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
     {
         let mut fixture = ContributionFixture::new();
         let enqueued = enqueue(&fixture, "a-response-before-commit");
-        let provider = RecordingProvider::new([ProviderStep::Json(
+        let provider = Arc::new(RecordingProvider::new([ProviderStep::Json(
             r#"{"probe":"general knowledge"}"#.into(),
-        )]);
+        )]));
         let (scanner_file, scanner) = test_scanner();
         fs::remove_file(&scanner_file.0).expect("inject scanner disappearance");
         assert_eq!(
@@ -748,13 +767,13 @@ fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
         let mut fixture = ContributionFixture::new();
         let enqueued = enqueue(&fixture, "b-scanner-unknown");
         let (scanner_file, scanner) = test_scanner();
-        let provider = RecordingProvider::new([
+        let provider = Arc::new(RecordingProvider::new([
             ProviderStep::Json(r#"{"probe":"general knowledge"}"#.into()),
             ProviderStep::RemoveThenJson(
                 scanner_file.0.clone(),
                 r#"{"novelty":"PASS","quality":"PASS","generality":"PASS","grounding":"PASS","candidate":"generalized candidate"}"#.into(),
             ),
-        ]);
+        ]));
         assert_eq!(
             run(&fixture, &provider, &scanner, 60.0).expect("B scanner unknown"),
             ContributionRunOnceReport::ReconciliationRequired {
@@ -806,7 +825,7 @@ fn runner_closes_dispatch_replay_scan_terminal_and_late_completion_paths() {
                 &[&enqueued.job_id],
             )
             .expect("inject unknown payload field");
-        let provider = RecordingProvider::new([]);
+        let provider = Arc::new(RecordingProvider::new([]));
         let (_scanner_file, scanner) = test_scanner();
         assert!(matches!(
             run(&fixture, &provider, &scanner, 60.0),
@@ -851,8 +870,89 @@ fn runner_config_fails_closed_without_database_or_provider() {
         ContributionExecutionRunnerConfig {
             lease_owner: String::new(),
             lease_seconds: 30.0,
+            health_renew_seconds: HEALTH_RENEW_SECS,
         }
         .validate(),
         Err(ErrorCode::InvalidInput)
     );
+    assert_eq!(
+        ContributionExecutionRunnerConfig {
+            lease_owner: "r4-c-runner".into(),
+            lease_seconds: 30.0,
+            health_renew_seconds: 0,
+        }
+        .validate(),
+        Err(ErrorCode::InvalidInput),
+        "ruling E3 (b): the renewal validity has no default"
+    );
+}
+
+/// `(WORKER_OBSERVED HEALTHY/VALID, WORKER_OBSERVED INVALID)` account rows of `tenant`.
+fn worker_observed_accounts(fixture: &mut ContributionFixture, tenant: Uuid) -> (i64, i64) {
+    let row = fixture
+        .admin
+        .query_one(
+            "SELECT count(*) FILTER (WHERE credential_verdict = 'VALID'), \
+                    count(*) FILTER (WHERE credential_verdict = 'INVALID') \
+               FROM ops.reasoning_account_health_observations \
+              WHERE tenant_id = $1 AND source_kind = 'WORKER_OBSERVED'",
+            &[&tenant],
+        )
+        .expect("worker-observed account rows");
+    (row.get(0), row.get(1))
+}
+
+/// ADR-0060 ruling E3 (b) for contribution (finding 7): an answered A and B call renew their
+/// route's health, and a provider-refused key appends one INVALID account row (the call stays
+/// RESERVED for reconciliation). Fault: the runner observes nothing → (0, 0) rows.
+#[test]
+fn contribution_calls_renew_health_and_record_a_rejected_key() {
+    if !require_db() {
+        humaux_testkit::skip_or_fail(
+            "contribution_calls_renew_health_and_record_a_rejected_key",
+            "HUMAUX_TEST_PG_DSN",
+            humaux_testkit::ExternalDep::Postgres,
+        );
+        return;
+    }
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    {
+        let mut fixture = ContributionFixture::new();
+        let tenant = fixture.auth.tenant_id().0;
+        enqueue(&fixture, "health-renewal");
+        let provider = Arc::new(RecordingProvider::new([
+            ProviderStep::Json(r#"{"probe":"general knowledge"}"#.into()),
+            ProviderStep::Json(r#"{"novelty":"PASS","quality":"PASS","generality":"PASS","grounding":"PASS","candidate":"generalized candidate"}"#.into()),
+        ]));
+        let (_scanner_file, scanner) = test_scanner();
+        run(&fixture, &provider, &scanner, 60.0).expect("answered runner");
+        assert_eq!(provider.calls(), 2);
+        let (renewed, invalid) = worker_observed_accounts(&mut fixture, tenant);
+        assert!(
+            renewed >= 1,
+            "an answered contribution call renews its route"
+        );
+        assert_eq!(invalid, 0);
+    }
+    {
+        let mut fixture = ContributionFixture::new();
+        let tenant = fixture.auth.tenant_id().0;
+        let enqueued = enqueue(&fixture, "key-rejected");
+        let provider = Arc::new(RecordingProvider::new([ProviderStep::KeyRejected]));
+        let (_scanner_file, scanner) = test_scanner();
+        assert_eq!(
+            run(&fixture, &provider, &scanner, 60.0).expect("rejected-key runner"),
+            ContributionRunOnceReport::ReconciliationRequired {
+                execution_id: enqueued.execution_id,
+                state: ContributionExecutionState::AReserved,
+            }
+        );
+        assert_eq!(
+            worker_observed_accounts(&mut fixture, tenant),
+            (0, 1),
+            "a refused key appends one INVALID account row"
+        );
+    }
 }

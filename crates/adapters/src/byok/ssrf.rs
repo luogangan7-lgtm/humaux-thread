@@ -1,6 +1,6 @@
 //! `adapters::byok::ssrf` — §11.4 Custom / OpenAI-compatible Endpoint Security.
 //! Depends-on: crates=[]; services=[]; env=[]; modules=[]
-//! Called-by: [adapters::byok, private-worker::main, tests]
+//! Called-by: [adapters::byok, private-worker::main, private-worker::route_providers, tests, xtask::e2e_onboard, xtask::e2e_seed]
 //! Invariants: [every custom endpoint URL and every redirect hop passes validate_custom_endpoint; a forbidden or
 //!   unresolvable address is an SsrfError before any connection is made (§11.4)]
 //! Spec: Baseline §11.4; §83.4
@@ -290,6 +290,13 @@ fn parse_https_authority(url: &str) -> Result<ParsedAuthority, SsrfError> {
             port: 443,
         }),
     }
+}
+
+/// The lowercase host of an `https://` endpoint, parsed by the same narrow parser the §11.4 check
+/// uses and WITHOUT any DNS lookup — the deny-only recipient ↔ host binding (ADR-0060 D-B step 2,
+/// D-L) runs before a resolver or a client is touched. Port, path and IPv6 brackets are dropped.
+pub fn https_host(url: &str) -> Result<String, SsrfError> {
+    parse_https_authority(url).map(|authority| authority.host.to_ascii_lowercase())
 }
 
 // =============================================================================

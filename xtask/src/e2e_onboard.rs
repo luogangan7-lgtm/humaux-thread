@@ -1,6 +1,6 @@
 //! `xtask::e2e_onboard` — the card-28 acceptance harness: production onboarding on a fresh database, live reads,
 //!   live writes, idempotency and the five faults (ADR-0053 D-H).
-//! Depends-on: crates=[humaux-domain, postgres, serde_json, uuid]; services=[HTTP(gateway), PostgreSQL(owner)
+//! Depends-on: crates=[humaux-adapters, humaux-domain, postgres, serde_json, uuid]; services=[HTTP(gateway), PostgreSQL(owner)
 //!   r=[control.api_keys, control.audit_events, control.entitlement_snapshots, control.memberships,
 //!   control.private_reasoning_domains, control.quota_windows, control.retrieval_provider_admission_limits,
 //!   control.tenants, control.user_emails, control.users, control.workspace_memberships, control.workspaces,
@@ -34,16 +34,14 @@
 //!   HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX, HUMAUX_MAINTENANCE_EMBEDDING_DIMENSION, HUMAUX_MAINTENANCE_PG_DSN,
 //!   HUMAUX_MAINTENANCE_PRIVATE_MEMORY_COLLECTION, HUMAUX_MAINTENANCE_QDRANT_CIDR, HUMAUX_MAINTENANCE_QDRANT_HOST,
 //!   HUMAUX_MAINTENANCE_QDRANT_PORT, HUMAUX_MINIMAX_DNS_PINS, HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS,
-//!   HUMAUX_PRIVATE_WORKER_CAPABILITIES, HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID,
-//!   HUMAUX_PRIVATE_WORKER_CREDENTIALS,
+//!   HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS,
-//!   HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID,
-//!   HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_MODEL_ID,
-//!   HUMAUX_PRIVATE_WORKER_MODEL_REVISION, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_PROVIDER_ID,
-//!   HUMAUX_PRIVATE_WORKER_REGION, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS,
+//!   HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS,
+//!   HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS,
+//!   HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_REGIONS, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS,
 //!   HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS, HUMAUX_RETRIEVAL_WORKER_BATCH, HUMAUX_RETRIEVAL_WORKER_CALLER,
 //!   HUMAUX_RETRIEVAL_WORKER_CELL_ID, HUMAUX_RETRIEVAL_WORKER_DIMENSION,
 //!   HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID, HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL,
@@ -57,7 +55,7 @@
 //!   HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST, HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT, HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS,
 //!   HUMAUX_RETRIEVAL_WORKER_REGION, HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH, HUMAUX_TEST_GITLEAKS_BIN,
 //!   HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN, HUMAUX_TEST_QDRANT_PORT, PATH];
-//!   modules=[domain::ticket_family, xtask::e2e_seed, xtask::migrate, xtask::soak]
+//!   modules=[adapters::byok, adapters::byok::ssrf, domain::ticket_family, xtask::e2e_seed, xtask::migrate, xtask::soak]
 //! Called-by: [xtask::main]
 //! Invariants: [owns only its database humaux_thread_c28_onboard_<pid>, collection humaux_c28_onboard_<pid> and the
 //!   four children it spawned (stopped via their Child handles, never by port or name), all torn down by Drop regardless
@@ -85,6 +83,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use humaux_adapters::byok::ReasoningCapability;
 use postgres::{Client, NoTls};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -114,7 +113,17 @@ const EMB_MAX_TOK: &str = "8192";
 const MM_URL: &str = "https://api.minimaxi.com/v1/chat/completions";
 const MM_PROVIDER: &str = "minimax";
 const MM_MODEL: &str = "MiniMax-M3";
-const MM_REV: &str = "2026-08";
+/// ADR-0060 E5: the catalog row of a tool-capable profile is a new revision label (the 2026-08 row is
+/// frozen at {TEXT, STRUCTURED_OUTPUT}); the label is never sent on the wire.
+const MM_REV: &str = "caps-REASONING_SPLIT.STRUCTURED_OUTPUT.TEXT.TOOL_CALLS";
+/// ADR-0058 R10 / ADR-0060 D-A: what the rehearsal profile declares and the seeded catalog row holds;
+/// the worker builds its instance from that route (ADR-0060 D-B).
+const PW_CAPABILITIES: [ReasoningCapability; 4] = [
+    ReasoningCapability::Text,
+    ReasoningCapability::StructuredOutput,
+    ReasoningCapability::ToolCalls,
+    ReasoningCapability::ReasoningSplit,
+];
 const MM_REGION: &str = "cn-shanghai";
 const ADMIN: [&str; 8] = [
     "--actor",
@@ -806,6 +815,16 @@ pub fn run(_args: &[String]) -> i32 {
             provider_id: MM_PROVIDER.to_owned(),
             provider_model_id: MM_MODEL.to_owned(),
             model_revision: MM_REV.to_owned(),
+            capabilities: PW_CAPABILITIES.to_vec(),
+            // ADR-0060 D-J: the one vendor account behind MINIMAX_API_KEY in this run.
+            account_ref: "e2e-onboard-minimax".to_owned(),
+            // ADR-0060 research amendment 1: the rehearsal MiniMax profile's request field
+            // (rehearse.sh `reasoning register --request-extras`); the adapter no longer writes it
+            // for REASONING_SPLIT, so a profile without it is a different request.
+            request_extras: serde_json::Map::from_iter([(
+                "reasoning_split".to_owned(),
+                serde_json::Value::Bool(true),
+            )]),
         },
     );
     report.step(
@@ -819,6 +838,11 @@ pub fn run(_args: &[String]) -> i32 {
         |_| String::new(),
         |l| format!("{}=MINIMAX_API_KEY", l.credential_id),
     );
+    // ADR-0060 D-C / D-L: the worker's deny-only lists name this lane's recipient with the host its
+    // endpoint dials, and its region; provider, model, endpoint and capabilities come from the route.
+    let recipients = humaux_adapters::byok::ssrf::https_host(MM_URL)
+        .map(|host| format!("{egress}={host}"))
+        .unwrap_or_default();
     let distill: Vec<(&str, &str)> = vec![
         ("PRIVATE_WORKER_PG_DSN", env.private_worker.as_str()),
         ("HUMAUX_PRIVATE_WORKER_CREDENTIALS", credentials.as_str()),
@@ -842,18 +866,13 @@ pub fn run(_args: &[String]) -> i32 {
         // ADR-0058 D-T: the rehearsal's §72.3 tenant distill budget.
         ("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS", "60"),
         ("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS", "120"),
-        // ADR-0058 D-M: what the rehearsal binding's endpoint declares (no default in the worker).
-        // ADR-0058 R10: TOOL_CALLS kept by measurement (`distill_channel_ab_live`, 2026-10-03).
         (
-            "HUMAUX_PRIVATE_WORKER_CAPABILITIES",
-            "STRUCTURED_OUTPUT,TOOL_CALLS,REASONING_SPLIT",
+            "HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS",
+            recipients.as_str(),
         ),
-        ("HUMAUX_PRIVATE_WORKER_PROVIDER_ID", MM_PROVIDER),
-        ("HUMAUX_PRIVATE_WORKER_MODEL_ID", MM_MODEL),
-        ("HUMAUX_PRIVATE_WORKER_MODEL_REVISION", MM_REV),
-        ("HUMAUX_PRIVATE_WORKER_CHAT_URL", MM_URL),
-        ("HUMAUX_PRIVATE_WORKER_REGION", MM_REGION),
-        ("HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID", egress.as_str()),
+        ("HUMAUX_PRIVATE_WORKER_REGIONS", MM_REGION),
+        // Ruling E3: traffic renews the seed's 30-minute attestation once less than 15 min is left.
+        ("HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS", "1800"),
     ];
     run.spawn(
         "private-worker-distill",

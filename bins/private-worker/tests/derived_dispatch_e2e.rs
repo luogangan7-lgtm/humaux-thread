@@ -10,25 +10,28 @@
 //!   ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, private.events,
 //!   private.evidence_objects, private.memory_evidence], PostgreSQL(role_maintenance), PostgreSQL(role_private_worker) x=[ops.claim_derived_work_v2],
 //!   subprocess(humaux-private-worker), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-private-worker,
-//!   HUMAUX_CARD15_TEST_SECRET, HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS, HUMAUX_PRIVATE_WORKER_CAPABILITIES,
-//!   HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS,
+//!   HUMAUX_CARD15_TEST_SECRET, HUMAUX_LIVE_P2_KEY_ENV, HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS,
+//!   HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS,
-//!   HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS,
-//!   HUMAUX_PRIVATE_WORKER_KEY_ENV, HUMAUX_PRIVATE_WORKER_MODEL_ID, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS,
-//!   HUMAUX_PRIVATE_WORKER_PROVIDER_ID, HUMAUX_PRIVATE_WORKER_REGION, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH,
-//!   HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY, PRIVATE_WORKER_PG_DSN]; modules=[adapters::byok, adapters::contribution_reasoner,
-//!   adapters::disclosure, adapters::distill_reasoner, adapters::jobs, adapters::membership_repo, adapters::postgres, adapters::provisioning, domain::egress,
-//!   domain::evidence, humaux-testkit,
-//!   private-worker::distill, private-worker::tests::support::dispatch_fence,
-//!   private-worker::tests::support::double_spend, private-worker::tests::support::live_minimax]
+//!   HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS,
+//!   HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS,
+//!   HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_REGIONS, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH,
+//!   HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY, PRIVATE_WORKER_PG_DSN,
+//!   refused:HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID]; modules=[adapters::byok,
+//!   adapters::contribution_reasoner, adapters::disclosure, adapters::distill_reasoner, adapters::jobs,
+//!   adapters::membership_repo, adapters::postgres, adapters::provisioning, adapters::reasoning_route_admission,
+//!   domain::evidence, humaux-testkit, private-worker::distill, private-worker::tests::support::dispatch_fence,
+//!   private-worker::tests::support::double_spend, private-worker::tests::support::live_minimax,
+//!   private-worker::tests::support::live_provider, private-worker::inference_rpc, private-worker::route_providers,
+//!   adapters::byok::ssrf]
 //! Called-by: [cargo-test]
 //! Invariants: [only this file's tenants are ever claimed (foreign scheduler rows are fenced FOR UPDATE); every
 //!   scenario's faults are named in its doc (ADR-0058 records the red→green runs); a fixture deletes its jobs, slots
 //!   and data rows in one printed batch and its tenant rows in a separate best-effort batch]
-//! Spec: Baseline §16.1.1; §10.1; §67.2; §11; §79.2; ADR-0058; ADR-0059
+//! Spec: Baseline §16.1.1; §10.1; §67.2; §11; §11.2.5; §79.2; ADR-0058; ADR-0059; ADR-0060
 //!
 //! The Distill hop's own behaviour (route admission, §16.1.1 fingerprint, §10.1 ceiling, the
 //! fenced write transaction) is `tests/distill_hop_e2e.rs`' subject. This file covers the layer
@@ -37,7 +40,7 @@
 //! fence under two dispatchers, and the binary's resident loop.
 
 use humaux_adapters::byok::{
-    PrivateInferenceContext, ReasoningCapability, ReasoningProviderDescriptor,
+    OutputChannel, PrivateInferenceContext, ReasoningCapability, ReasoningProviderDescriptor,
     ReasoningProviderError, StructuredReasoningRequest, StructuredReasoningResponse, TokenUsage,
     UserReasoningProvider, VisionReasoningRequest, VisionReasoningResponse,
 };
@@ -50,13 +53,17 @@ use humaux_adapters::provisioning::{
     self, ProvisioningError, RequeueReceipt, RequeueSkipReason, RequeueTarget, RequeuedJob,
     SkippedJob,
 };
-use humaux_domain::egress::ProcessorId;
+use humaux_adapters::reasoning_route_admission::{
+    ProviderFor, ROUTE_HEALTH_DENIED, ROUTE_HEALTH_STALE, ReasoningAdmissionLocator,
+};
 use humaux_private_worker::distill::{self, DistillDispatchConfig, DistillDispatchReport};
+use humaux_private_worker::route_providers::{
+    self, CREDENTIAL_NOT_MAPPED, EGRESS_RECIPIENTS, REGIONS, RouteProviders,
+};
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
-use std::collections::BTreeSet;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -66,29 +73,40 @@ mod dispatch_fence;
 mod double_spend;
 #[path = "support/live_minimax.rs"]
 mod live_minimax;
+#[path = "support/live_provider.rs"]
+mod live_provider;
 
 /// Every test drives the ONE global slot set and the cross-tenant claim, so tests never overlap.
 static SERIAL_GUARD: Mutex<()> = Mutex::new(());
 
-/// ADR-0059 D-I: the worker's credential map as this file configures it — every credential
-/// reference [`seed_reasoning_profile`] created (tests are serialized by [`SERIAL_GUARD`]). T25
-/// takes one reference back out of a config.
-static MAPPED_CREDENTIALS: Mutex<BTreeSet<Uuid>> = Mutex::new(BTreeSet::new());
-
-fn mapped_credentials() -> BTreeSet<Uuid> {
-    MAPPED_CREDENTIALS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-/// `HUMAUX_PRIVATE_WORKER_CREDENTIALS` for a spawned worker: every mapped reference names `var`.
-fn credentials_spec(var: &str) -> String {
-    mapped_credentials()
-        .iter()
-        .map(|r| format!("{r}={var}"))
+/// `HUMAUX_PRIVATE_WORKER_CREDENTIALS` for a spawned worker: every credential reference of
+/// `tenants`' rehearsal-vendor profiles names `var`. They all declare [`ACCOUNT_REF`]'s vendor
+/// account, so the worker's one-secret-one-account boot check accepts them (ADR-0060 D-J).
+fn credentials_spec(admin: &mut Client, tenants: &[Uuid], var: &str) -> String {
+    admin
+        .query(
+            "SELECT p.credential_ref FROM control.reasoning_profiles p \
+               JOIN control.provider_accounts a ON a.provider_account_id = p.provider_account_id \
+             WHERE p.tenant_id = ANY($1) AND a.processor_id = $2 ORDER BY 1",
+            &[&tenants, &PROVIDER_ID],
+        )
+        .expect("mapped credential references")
+        .into_iter()
+        .map(|row| format!("{}={var}", row.get::<_, Uuid>(0)))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// ADR-0060 D-J: the one vendor account behind every profile this file seeds for a vendor
+/// (`external_account_ref_hash = sha256(ACCOUNT_REF)` per processor).
+const ACCOUNT_REF: &str = "derived-dispatch-e2e-vendor-account";
+/// The host the subprocess workers' recipient may dial: the literal endpoint and the rehearsal
+/// host (ADR-0060 D-L).
+fn subprocess_recipients() -> String {
+    format!(
+        "{EGRESS_PROCESSOR_ID}=192.88.99.1|{}",
+        live_minimax::MINIMAX_HOST
+    )
 }
 
 const REGION: &str = "cn-shanghai";
@@ -98,7 +116,7 @@ const EGRESS_PROCESSOR_ID: Uuid = Uuid::from_u128(0x2001);
 /// never be served by THIS worker (card 16's P0).
 const FOREIGN_EGRESS_PROCESSOR_ID: Uuid = Uuid::from_u128(0x2002);
 /// The static class `PrivateReasoningError::class` carries for that failure.
-const FOREIGN_EGRESS_REASON: &str = "configured provider does not match admitted route";
+const FOREIGN_EGRESS_REASON: &str = "EGRESS_PROCESSOR_NOT_ALLOWED";
 /// The NOT_READY class of a tenant with no admitted binding.
 const NO_BINDING_REASON: &str = "no admitted PRIVATE_DISTILL_TEXT route binding";
 /// Route-graph fixture values, mirrored from `tests/distill_hop_e2e.rs` so the two files share
@@ -166,14 +184,15 @@ impl UserReasoningProvider for NeverCalledProvider {
     }
 }
 
-fn never_called() -> NeverCalledProvider {
-    NeverCalledProvider(ReasoningProviderDescriptor {
+fn never_called() -> Arc<NeverCalledProvider> {
+    Arc::new(NeverCalledProvider(ReasoningProviderDescriptor {
         provider_id: "derived-dispatch-e2e".to_string(),
         model_id: "never-called".to_string(),
         model_revision: None,
         capabilities: vec![ReasoningCapability::StructuredOutput],
         custom_endpoint: Some("https://example.invalid/v1/chat/completions".to_string()),
-    })
+        request_extras: Default::default(),
+    }))
 }
 
 /// What a scripted call answers.
@@ -191,6 +210,9 @@ type Script = dyn Fn(&str) -> (Duration, Reply) + Send + Sync;
 struct StubProvider {
     descriptor: ReasoningProviderDescriptor,
     calls: AtomicU32,
+    /// Calls sent on the tool channel (ADR-0058 D-M; ADR-0060 D-D: only a profile declaring
+    /// TOOL_CALLS gets it).
+    tool_calls: AtomicU32,
     finished: AtomicU32,
     live: AtomicU32,
     max_live: AtomicU32,
@@ -198,19 +220,29 @@ struct StubProvider {
 }
 
 impl StubProvider {
-    fn new(script: impl Fn(&str) -> (Duration, Reply) + Send + Sync + 'static) -> Self {
-        Self {
-            descriptor: live_minimax::descriptor(),
+    fn new(script: impl Fn(&str) -> (Duration, Reply) + Send + Sync + 'static) -> Arc<Self> {
+        Self::declaring(live_minimax::descriptor(), script)
+    }
+
+    /// A stub built as the route of `descriptor` would build it (ADR-0060 D-B): its endpoint is
+    /// the descriptor's.
+    fn declaring(
+        descriptor: ReasoningProviderDescriptor,
+        script: impl Fn(&str) -> (Duration, Reply) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor,
             calls: AtomicU32::new(0),
+            tool_calls: AtomicU32::new(0),
             finished: AtomicU32::new(0),
             live: AtomicU32::new(0),
             max_live: AtomicU32::new(0),
             script: Box::new(script),
-        }
+        })
     }
 
     /// Answers every call with one admissible memory after `delay`.
-    fn one_memory(delay: Duration) -> Self {
+    fn one_memory(delay: Duration) -> Arc<Self> {
         Self::new(move |_| (delay, Reply::Json(ONE_MEMORY_REPLY.to_string())))
     }
 
@@ -234,11 +266,14 @@ impl UserReasoningProvider for StubProvider {
     }
 
     fn endpoint_ref(&self) -> &str {
-        ENDPOINT_REF
+        self.descriptor
+            .custom_endpoint
+            .as_deref()
+            .unwrap_or(ENDPOINT_REF)
     }
 
     fn model_revision(&self) -> Option<&str> {
-        None
+        self.descriptor.model_revision.as_deref()
     }
 
     async fn complete_structured(
@@ -247,6 +282,9 @@ impl UserReasoningProvider for StubProvider {
         request: StructuredReasoningRequest,
     ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if matches!(request.output, OutputChannel::Tool(_)) {
+            self.tool_calls.fetch_add(1, Ordering::SeqCst);
+        }
         let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_live.fetch_max(live, Ordering::SeqCst);
         let _live = LiveGuard(&self.live);
@@ -275,10 +313,27 @@ impl UserReasoningProvider for StubProvider {
     }
 }
 
+/// ADR-0060 D-B: every admitted route goes to `provider`, unless its recipient is not this
+/// deployment's — the deny-only check the private worker's route mapping holds (§11.2.5: it can
+/// refuse a route, never select one). D-C still compares the stub with the route.
+fn routes<P: UserReasoningProvider + 'static>(
+    provider: &Arc<P>,
+) -> impl Fn(&ReasoningAdmissionLocator) -> Result<Arc<dyn UserReasoningProvider>, &'static str>
++ Send
++ Sync
++ use<P> {
+    let provider = Arc::clone(provider);
+    move |route| {
+        if route.egress_processor_id.0 == EGRESS_PROCESSOR_ID {
+            Ok(Arc::clone(&provider) as Arc<dyn UserReasoningProvider>)
+        } else {
+            Err(FOREIGN_EGRESS_REASON)
+        }
+    }
+}
+
 fn reasoner_config() -> ContributionReasonerConfig {
     ContributionReasonerConfig {
-        allowed_egress_processor_id: ProcessorId(EGRESS_PROCESSOR_ID),
-        region: REGION.to_string(),
         permit_ttl: Duration::from_secs(30),
         deletion_capability: DeletionCapability::Unknown,
         system_prompt: "s".to_string(),
@@ -298,9 +353,14 @@ fn dispatch_config(owner: &str, lease_seconds: f64) -> DistillDispatchConfig {
         not_ready_park_seconds: 600.0,
         max_attempts: 5,
         budget: TEST_BUDGET,
-        credential_refs: mapped_credentials(),
+        health_renew_seconds: HEALTH_RENEW_SECS,
     }
 }
+
+/// Ruling E3: the renewal window every in-process dispatcher of this file uses. The seed's
+/// 30-minute observations have more than half of it left, so traffic renews nothing unless a
+/// test shortens them.
+const HEALTH_RENEW_SECS: i64 = 1800;
 
 struct SeededTenant {
     tenant_id: Uuid,
@@ -465,15 +525,55 @@ impl Handle {
         label: &str,
         binding_egress: Option<Uuid>,
     ) -> Result<usize, postgres::Error> {
+        self.add_tenant_declaring(label, binding_egress, &live_minimax::REHEARSAL_CAPABILITIES)
+    }
+
+    /// [`Self::add_tenant`] whose Profile declares exactly `capabilities` (ADR-0060 D-C: the
+    /// provider serving it must declare the same set).
+    fn add_tenant_declaring(
+        &mut self,
+        label: &str,
+        binding_egress: Option<Uuid>,
+        capabilities: &[ReasoningCapability],
+    ) -> Result<usize, postgres::Error> {
         let tenant = seed_tenant(
             &mut self.admin,
             label,
             self.user_id,
             binding_egress,
             ENDPOINT_REF,
+            capabilities,
         )?;
         self.tenants.push(tenant);
         Ok(self.tenants.len() - 1)
+    }
+
+    /// One more tenant whose domain is bound to a Profile of `lane` (ADR-0060 D-B: the route picks
+    /// the provider). Returns its index and the Profile's route ids.
+    fn add_tenant_on(&mut self, label: &str, lane: &Lane) -> (usize, SeededRoute) {
+        let tenant = seed_tenant(
+            &mut self.admin,
+            label,
+            self.user_id,
+            None,
+            ENDPOINT_REF,
+            &[],
+        )
+        .expect("tenant");
+        let (policy, route) = seed_route_binding_on(
+            &mut self.admin,
+            tenant.tenant_id,
+            self.user_id,
+            tenant.reasoning_domain_id,
+            label,
+            lane,
+        )
+        .expect("route");
+        self.tenants.push(SeededTenant {
+            route_policy_id: Some(policy),
+            ..tenant
+        });
+        (self.tenants.len() - 1, route)
     }
 
     /// A second reasoning domain of tenant `idx`, bound to the tenant's own route policy.
@@ -502,15 +602,24 @@ impl Handle {
         domain
     }
 
-    fn pass(
+    fn pass<P: UserReasoningProvider + 'static>(
         &self,
-        provider: &dyn UserReasoningProvider,
+        provider: &Arc<P>,
+        config: &DistillDispatchConfig,
+    ) -> DistillDispatchReport {
+        self.pass_routes(&routes(provider), config)
+    }
+
+    /// One `--distill-once` pass over any route→provider mapping (ADR-0060 D-B).
+    fn pass_routes(
+        &self,
+        providers: &ProviderFor,
         config: &DistillDispatchConfig,
     ) -> DistillDispatchReport {
         self.rt
             .block_on(distill::dispatch_pass(
                 &self.private,
-                provider,
+                providers,
                 reasoner_config(),
                 config,
             ))
@@ -605,6 +714,7 @@ fn seed_tenant(
     user_id: Uuid,
     binding_egress: Option<Uuid>,
     endpoint_ref: &str,
+    capabilities: &[ReasoningCapability],
 ) -> Result<SeededTenant, postgres::Error> {
     let tenant_id: Uuid = admin
         .query_one(
@@ -629,16 +739,17 @@ fn seed_tenant(
         )?
         .get(0);
     let route_policy_id = match binding_egress {
-        Some(egress) => Some(seed_route_binding(
-            admin,
-            tenant_id,
-            user_id,
-            reasoning_domain_id,
-            label,
-            egress,
-            endpoint_ref,
-            MODEL_ID,
-        )?),
+        Some(egress) => Some(
+            seed_route_binding_on(
+                admin,
+                tenant_id,
+                user_id,
+                reasoning_domain_id,
+                label,
+                &Lane::rehearsal(egress, endpoint_ref, MODEL_ID, capabilities),
+            )?
+            .0,
+        ),
         None => None,
     };
     Ok(SeededTenant {
@@ -646,6 +757,65 @@ fn seed_tenant(
         reasoning_domain_id,
         route_policy_id,
     })
+}
+
+/// One provider a Profile can name — ADR-0060 D-B: the admitted route, not the worker, picks the
+/// provider, model, endpoint, recipient, capabilities and request extras of a call.
+#[derive(Clone)]
+struct Lane {
+    provider_id: String,
+    model_id: String,
+    endpoint_ref: String,
+    egress_processor_id: Uuid,
+    region: String,
+    capabilities: Vec<ReasoningCapability>,
+    request_extras: serde_json::Value,
+}
+
+impl Lane {
+    /// The rehearsal vendor at `endpoint_ref` / `model_id`, declaring `capabilities`, no extras.
+    fn rehearsal(
+        egress_processor_id: Uuid,
+        endpoint_ref: &str,
+        model_id: &str,
+        capabilities: &[ReasoningCapability],
+    ) -> Self {
+        Self {
+            provider_id: PROVIDER_ID.to_owned(),
+            model_id: model_id.to_owned(),
+            endpoint_ref: endpoint_ref.to_owned(),
+            egress_processor_id,
+            region: REGION.to_owned(),
+            capabilities: capabilities.to_vec(),
+            request_extras: serde_json::json!({}),
+        }
+    }
+
+    /// A live provider's lane (ADR-0060 D-B / D-L): its recipient is `egress_processor_id` unless
+    /// the provider fixes its own.
+    fn live(profile: &live_provider::LiveProfile, egress_processor_id: Uuid) -> Self {
+        Self {
+            provider_id: profile.provider_id.clone(),
+            model_id: profile.model_id.clone(),
+            endpoint_ref: profile.chat_url.clone(),
+            egress_processor_id: profile.egress_processor_id.unwrap_or(egress_processor_id),
+            region: profile.region.clone(),
+            capabilities: profile.capabilities.clone(),
+            request_extras: serde_json::Value::Object(profile.request_extras.clone()),
+        }
+    }
+
+    /// The descriptor an instance built from this lane's route carries (ADR-0060 D-C compares it).
+    fn descriptor(&self) -> ReasoningProviderDescriptor {
+        ReasoningProviderDescriptor {
+            provider_id: self.provider_id.clone(),
+            model_id: self.model_id.clone(),
+            model_revision: Some(live_minimax::caps_revision_label(&self.capabilities)),
+            capabilities: self.capabilities.clone(),
+            custom_endpoint: Some(self.endpoint_ref.clone()),
+            request_extras: self.request_extras.as_object().cloned().unwrap_or_default(),
+        }
+    }
 }
 
 /// The admitted `PRIVATE_DISTILL_TEXT` binding the dispatcher resolves per claimed job, mirrored
@@ -662,16 +832,43 @@ fn seed_route_binding(
     egress_processor_id: Uuid,
     endpoint_ref: &str,
     model_id: &str,
+    capabilities: &[ReasoningCapability],
 ) -> Result<Uuid, postgres::Error> {
-    let route = seed_reasoning_profile(
-        admin,
-        tenant_id,
-        user_id,
-        label,
-        egress_processor_id,
-        endpoint_ref,
-        model_id,
+    let lane = Lane::rehearsal(egress_processor_id, endpoint_ref, model_id, capabilities);
+    seed_route_binding_on(admin, tenant_id, user_id, reasoning_domain_id, label, &lane)
+        .map(|(policy, _)| policy)
+}
+
+/// [`seed_route_binding`] over any [`Lane`]: Profile + PINNED policy + one candidate + binding v1
+/// + fresh health. Returns the policy and the Profile's route ids.
+fn seed_route_binding_on(
+    admin: &mut Client,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    reasoning_domain_id: Uuid,
+    label: &str,
+    lane: &Lane,
+) -> Result<(Uuid, SeededRoute), postgres::Error> {
+    let route = seed_reasoning_profile(admin, tenant_id, user_id, label, lane)?;
+    let policy = seed_pinned_policy(admin, tenant_id, user_id, route.profile_id)?;
+    admin.execute(
+        "INSERT INTO control.reasoning_route_bindings \
+           (tenant_id, reasoning_domain_id, purpose, route_policy_id, route_policy_version) \
+         VALUES ($1, $2, $3, $4, 1)",
+        &[&tenant_id, &reasoning_domain_id, &PURPOSE_DB, &policy],
     )?;
+    Ok((policy, route))
+}
+
+/// A SERVING PINNED policy whose one candidate is `profile_id@1`. A PINNED policy needs exactly one
+/// priority-0 candidate before it may leave DRAFT, and DRAFT -> SHADOW -> SERVING is the only order
+/// the owner check accepts.
+fn seed_pinned_policy(
+    admin: &mut Client,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    profile_id: Uuid,
+) -> Result<Uuid, postgres::Error> {
     let policy: Uuid = admin
         .query_one(
             "INSERT INTO control.reasoning_route_policies \
@@ -680,14 +877,12 @@ fn seed_route_binding(
             &[&tenant_id, &user_id, &PURPOSE_DB],
         )?
         .get(0);
-    // A PINNED policy needs exactly one priority-0 candidate before it may leave DRAFT, and
-    // DRAFT -> SHADOW -> SERVING is the only order the owner check accepts.
     admin.execute(
         "INSERT INTO control.reasoning_route_candidates \
            (tenant_id, route_policy_id, route_policy_version, profile_id, profile_version, \
             priority) \
          VALUES ($1, $2, 1, $3, 1, 0)",
-        &[&tenant_id, &policy, &route.profile_id],
+        &[&tenant_id, &policy, &profile_id],
     )?;
     for state in ["SHADOW", "SERVING"] {
         admin.execute(
@@ -696,28 +891,80 @@ fn seed_route_binding(
             &[&policy, &state],
         )?;
     }
-    admin.execute(
+    Ok(policy)
+}
+
+/// ADR-0060 D-H shape, as the test owner: closes the domain's current binding and inserts its
+/// successor version over a new PINNED policy naming the tenant's OWN `profile_id@1` (the 0128
+/// candidate FK makes a cross-tenant profile impossible). Returns `(binding_id, new version)`.
+fn switch_binding(
+    admin: &mut Client,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    reasoning_domain_id: Uuid,
+    profile_id: Uuid,
+) -> (Uuid, i64) {
+    let policy = seed_pinned_policy(admin, tenant_id, user_id, profile_id).expect("new policy");
+    let mut txn = admin.transaction().expect("switch txn");
+    let (binding_id, version): (Uuid, i64) = {
+        let row = txn
+            .query_one(
+                "UPDATE control.reasoning_route_bindings SET effective_to = clock_timestamp() \
+                 WHERE tenant_id = $1 AND reasoning_domain_id = $2 AND purpose = $3 \
+                   AND effective_to IS NULL \
+                 RETURNING binding_id, binding_version",
+                &[&tenant_id, &reasoning_domain_id, &PURPOSE_DB],
+            )
+            .expect("close the current binding");
+        (row.get(0), row.get(1))
+    };
+    txn.execute(
         "INSERT INTO control.reasoning_route_bindings \
-           (tenant_id, reasoning_domain_id, purpose, route_policy_id, route_policy_version) \
-         VALUES ($1, $2, $3, $4, 1)",
-        &[&tenant_id, &reasoning_domain_id, &PURPOSE_DB, &policy],
-    )?;
+           (binding_id, binding_version, tenant_id, reasoning_domain_id, purpose, route_policy_id, \
+            route_policy_version, effective_from) \
+         VALUES ($1, $2, $3, $4, $5, $6, 1, clock_timestamp())",
+        &[
+            &binding_id,
+            &(version + 1),
+            &tenant_id,
+            &reasoning_domain_id,
+            &PURPOSE_DB,
+            &policy,
+        ],
+    )
+    .expect("successor binding");
+    txn.commit().expect("commit the switch");
+    (binding_id, version + 1)
+}
+
+/// The two health observations of a Profile's exact identity, observed now, valid `valid_for`.
+fn seed_health(
+    admin: &mut Client,
+    tenant_id: Uuid,
+    lane: &Lane,
+    route: &SeededRoute,
+    valid_for: Duration,
+) -> Result<(), postgres::Error> {
+    let secs = valid_for.as_secs_f64();
     admin.execute(
         "INSERT INTO ops.reasoning_provider_health_observations \
            (tenant_id, processor_id, processor_model_id, provider_model_id, model_revision, \
             provider_endpoint_id, endpoint_ref, region, service_tier, source_kind, reason_code, \
             verdict, observed_at, valid_until) \
-         VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, 'TEST', NULL, 'HEALTHY', \
-                 clock_timestamp() - interval '1 second', clock_timestamp() + interval '30 minutes')",
+         VALUES ($1, $2, $3, $4, $9, $5, $6, $7, $8, 'TEST', NULL, 'HEALTHY', \
+                 clock_timestamp() - interval '1 second', \
+                 clock_timestamp() + make_interval(secs => $10))",
         &[
             &tenant_id,
-            &PROVIDER_ID,
+            &lane.provider_id,
             &route.processor_model_id,
-            &model_id,
+            &lane.model_id,
             &route.endpoint_id,
-            &endpoint_ref,
-            &REGION,
+            &lane.endpoint_ref,
+            &lane.region,
             &SERVICE_TIER,
+            &route.model_revision,
+            &secs,
         ],
     )?;
     admin.execute(
@@ -727,30 +974,88 @@ fn seed_route_binding(
             credential_verdict, billing_account_verdict, billing_instrument_verdict, \
             observed_at, valid_until) \
          VALUES ($1, $2, $3, NULL, NULL, 'TEST', NULL, 'HEALTHY', 'VALID', NULL, NULL, \
-                 clock_timestamp() - interval '1 second', clock_timestamp() + interval '30 minutes')",
-        &[&tenant_id, &route.provider_account_id, &route.credential_ref],
+                 clock_timestamp() - interval '1 second', \
+                 clock_timestamp() + make_interval(secs => $4))",
+        &[
+            &tenant_id,
+            &route.provider_account_id,
+            &route.credential_ref,
+            &secs,
+        ],
     )?;
-    Ok(policy)
+    Ok(())
 }
 
 /// The route-graph tail `control.reasoning_route_candidates` needs, plus the ids the two health
 /// observations key on.
+#[derive(Clone)]
 struct SeededRoute {
     profile_id: Uuid,
     processor_model_id: Uuid,
+    model_revision: String,
     provider_account_id: Uuid,
     endpoint_id: Uuid,
     credential_ref: Uuid,
 }
 
+/// The tenant's [`ACCOUNT_REF`] account of `lane`'s vendor and its endpoint for `lane`, created on
+/// first use and reused after.
+fn vendor_account_and_endpoint(
+    admin: &mut Client,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    lane: &Lane,
+) -> Result<(Uuid, Uuid), postgres::Error> {
+    // ADR-0060 D-J: one vendor = one account row per tenant (0128 UNIQUE), reused with its endpoint
+    // by a second profile (M6 poison lane) as `register_reasoning_profile` (0208) does; an endpoint
+    // whose region / tier / recipient differ selects no row, so `query_one` fails.
+    let account: Uuid = admin
+        .query_one(
+            "WITH new AS (INSERT INTO control.provider_accounts \
+               (tenant_id, owner_user_id, processor_id, external_account_ref_hash) \
+             VALUES ($1, $2, $3, sha256(convert_to($4::text, 'UTF8'))) \
+             ON CONFLICT (tenant_id, owner_user_id, processor_id, external_account_ref_hash) \
+             DO NOTHING RETURNING provider_account_id) \
+             SELECT provider_account_id FROM new UNION ALL \
+             SELECT provider_account_id FROM control.provider_accounts \
+             WHERE tenant_id = $1 AND owner_user_id = $2 AND processor_id = $3 \
+               AND external_account_ref_hash = sha256(convert_to($4::text, 'UTF8'))",
+            &[&tenant_id, &user_id, &lane.provider_id, &ACCOUNT_REF],
+        )?
+        .get(0);
+    let endpoint: Uuid = admin
+        .query_one(
+            "WITH new AS (INSERT INTO control.provider_endpoints \
+               (tenant_id, provider_account_id, region, service_tier, endpoint_ref, \
+                egress_processor_id) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (tenant_id, provider_account_id, endpoint_ref) DO NOTHING \
+             RETURNING endpoint_id) \
+             SELECT endpoint_id FROM new UNION ALL \
+             SELECT endpoint_id FROM control.provider_endpoints \
+             WHERE tenant_id = $1 AND provider_account_id = $2 AND region = $3 \
+               AND service_tier = $4 AND endpoint_ref = $5 AND egress_processor_id = $6",
+            &[
+                &tenant_id,
+                &account,
+                &lane.region,
+                &SERVICE_TIER,
+                &lane.endpoint_ref,
+                &lane.egress_processor_id,
+            ],
+        )?
+        .get(0);
+    Ok((account, endpoint))
+}
+
+/// One Profile@1 of `lane` with its account (vendor account [`ACCOUNT_REF`]), credential, endpoint
+/// and catalog row, plus fresh 30-minute health.
 fn seed_reasoning_profile(
     admin: &mut Client,
     tenant_id: Uuid,
     user_id: Uuid,
     label: &str,
-    egress_processor_id: Uuid,
-    endpoint_ref: &str,
-    model_id: &str,
+    lane: &Lane,
 ) -> Result<SeededRoute, postgres::Error> {
     let credential: Uuid = admin
         .query_one(
@@ -759,66 +1064,48 @@ fn seed_reasoning_profile(
             &[&tenant_id, &format!("openbao://derived-dispatch/{label}")],
         )?
         .get(0);
-    MAPPED_CREDENTIALS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(credential);
     // `control.processor_models` is global and append-only (0128 trigger): one catalog row per
     // (processor, model, revision) across every run of every test in this workspace.
+    // ADR-0060 D-C / E5: the catalog row, the Profile and the stub declare one capability set; the
+    // revision label keeps a wider set off the frozen NULL-revision row.
+    let caps: Vec<&str> = lane.capabilities.iter().map(|c| c.as_str()).collect();
+    let model_revision = live_minimax::caps_revision_label(&lane.capabilities);
     admin.execute(
         "INSERT INTO control.processor_models \
            (processor_id, provider_model_id, model_revision, capabilities, status, \
             catalog_observed_at) \
-         VALUES ($1, $2, NULL, ARRAY['TEXT','STRUCTURED_OUTPUT'], 'ACTIVE', clock_timestamp()) \
+         VALUES ($1, $2, $3, $4, 'ACTIVE', clock_timestamp()) \
          ON CONFLICT DO NOTHING",
-        &[&PROVIDER_ID, &model_id],
+        &[&lane.provider_id, &lane.model_id, &model_revision, &caps],
     )?;
     let processor_model_id: Uuid = admin
         .query_one(
             "SELECT processor_model_id FROM control.processor_models \
-             WHERE processor_id = $1 AND provider_model_id = $2 AND model_revision IS NULL \
+             WHERE processor_id = $1 AND provider_model_id = $2 AND model_revision = $3 \
                AND status = 'ACTIVE'",
-            &[&PROVIDER_ID, &model_id],
+            &[&lane.provider_id, &lane.model_id, &model_revision],
         )?
         .get(0);
-    let account: Uuid = admin
-        .query_one(
-            "INSERT INTO control.provider_accounts \
-               (tenant_id, owner_user_id, processor_id, external_account_ref_hash) \
-             VALUES ($1, $2, $3, sha256(convert_to(gen_random_uuid()::text, 'UTF8'))) \
-             RETURNING provider_account_id",
-            &[&tenant_id, &user_id, &PROVIDER_ID],
-        )?
-        .get(0);
+    let (account, endpoint) = vendor_account_and_endpoint(admin, tenant_id, user_id, lane)?;
     admin.execute(
         "INSERT INTO control.reasoning_credential_bindings \
            (credential_ref, tenant_id, owner_user_id, provider_account_id, processor_id) \
          VALUES ($1, $2, $3, $4, $5)",
-        &[&credential, &tenant_id, &user_id, &account, &PROVIDER_ID],
+        &[
+            &credential,
+            &tenant_id,
+            &user_id,
+            &account,
+            &lane.provider_id,
+        ],
     )?;
-    let endpoint: Uuid = admin
-        .query_one(
-            "INSERT INTO control.provider_endpoints \
-               (tenant_id, provider_account_id, region, service_tier, endpoint_ref, \
-                egress_processor_id) \
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING endpoint_id",
-            &[
-                &tenant_id,
-                &account,
-                &REGION,
-                &SERVICE_TIER,
-                &endpoint_ref,
-                &egress_processor_id,
-            ],
-        )?
-        .get(0);
     let profile: Uuid = admin
         .query_one(
             "INSERT INTO control.reasoning_profiles \
                (tenant_id, owner_user_id, provider_account_id, endpoint_id, processor_model_id, \
                 credential_ref, billing_account_id, default_billing_instrument_id, capabilities, \
-                processing_region) \
-             VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL, ARRAY['TEXT'], $7) RETURNING profile_id",
+                processing_region, request_extras) \
+             VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL, $8, $7, $9) RETURNING profile_id",
             &[
                 &tenant_id,
                 &user_id,
@@ -826,17 +1113,22 @@ fn seed_reasoning_profile(
                 &endpoint,
                 &processor_model_id,
                 &credential,
-                &REGION,
+                &lane.region,
+                &caps,
+                &lane.request_extras,
             ],
         )?
         .get(0);
-    Ok(SeededRoute {
+    let route = SeededRoute {
         profile_id: profile,
         processor_model_id,
+        model_revision,
         provider_account_id: account,
         endpoint_id: endpoint,
         credential_ref: credential,
-    })
+    };
+    seed_health(admin, tenant_id, lane, &route, Duration::from_secs(1800))?;
+    Ok(route)
 }
 
 /// What `remember` writes for one accepted Evidence (§14): the Evidence row plus the
@@ -1333,63 +1625,103 @@ fn not_ready_never_spends_an_attempt_and_parks_after_the_age() {
     );
 }
 
-/// T25 (card-33 acceptance, ADR-0059 D-I) — tenant A's route is fully admitted, but its
-/// credential reference is not in the worker's key map: the job is NOT_READY
-/// `CREDENTIAL_NOT_MAPPED`, then parks `WAITING_KEY` past the age, with no attempt, no
-/// `ops.model_call_ledger` / `ops.distill_calls` row and no provider call. Fault: remove the
-/// `read_leg` pre-check ⇒ the request is reserved and sent (the stub answers) ⇒ red.
+/// The production [`RouteProviders`] of an in-process dispatcher (ADR-0060 D-B): `mapped` refs
+/// name one generated throwaway key, the rehearsal recipient may dial the rehearsal host, one
+/// region. A route outside them parks with its class before any build, ledger row or call.
+fn production_routes(mapped: &[Uuid]) -> Arc<RouteProviders> {
+    let spec = mapped
+        .iter()
+        .map(|r| format!("{r}=HX33B_TEST_KEY"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let key = Uuid::new_v4().simple().to_string();
+    let lookup = |name: &str| match name {
+        route_providers::CREDENTIALS => Some(spec.clone()),
+        "HX33B_TEST_KEY" => Some(key.clone()),
+        EGRESS_RECIPIENTS => Some(format!(
+            "{EGRESS_PROCESSOR_ID}={}",
+            live_minimax::MINIMAX_HOST
+        )),
+        REGIONS => Some(REGION.to_owned()),
+        _ => None,
+    };
+    Arc::new(RouteProviders::new(
+        route_providers::parse_credential_map(lookup).expect("credential map"),
+        route_providers::parse_recipients(lookup).expect("recipients"),
+        route_providers::parse_regions(lookup).expect("regions"),
+        live_minimax::live_dns_resolver(),
+        Duration::from_secs_f64(HTTP_SECS),
+    ))
+}
+
+/// The ledger rows of one tenant.
+fn ledger_rows(handle: &mut Handle, tenant_id: Uuid) -> i64 {
+    handle
+        .admin
+        .query_one(
+            "SELECT count(*) FROM ops.model_call_ledger WHERE tenant_id = $1",
+            &[&tenant_id],
+        )
+        .expect("ledger count")
+        .get(0)
+}
+
+/// T17 (card 33 T25, ADR-0060 D-B step 1) — tenant A's route names a credential reference the
+/// worker's map does not hold: `WAITING_KEY` / `CREDENTIAL_NOT_MAPPED` after the park age, attempt
+/// 0, no ledger row, no `distill_calls` row, no provider instance built. Fault: remove the map
+/// check from `RouteProviders::provider_for` ⇒ the instance is built and the key lookup fails
+/// after the reservation ⇒ a ledger row exists.
 #[test]
 fn foreign_credential_ref_parks_waiting_key_without_ledger_row() {
     run(
         "foreign_credential_ref_parks_waiting_key_without_ledger_row",
         |mut handle| {
             let tenant_id = handle.tenants[0].tenant_id;
-            let credential_ref: Uuid = handle
+            let others: Vec<Uuid> = handle.tenant_ids()[1..].to_vec();
+            let mapped: Vec<Uuid> = handle
                 .admin
-                .query_one(
-                    "SELECT credential_ref FROM control.reasoning_profiles WHERE tenant_id = $1",
-                    &[&tenant_id],
+                .query(
+                    "SELECT credential_ref FROM control.reasoning_profiles WHERE tenant_id = ANY($1)",
+                    &[&others],
                 )
-                .expect("tenant A's route credential")
-                .get(0);
+                .expect("other tenants' credentials")
+                .into_iter()
+                .map(|r| r.get(0))
+                .collect();
+            let routes = production_routes(&mapped);
+            let providers = {
+                let routes = Arc::clone(&routes);
+                move |l: &ReasoningAdmissionLocator| routes.provider_for(l)
+            };
             let evidence = accept_evidence(&mut handle, 0);
             let job = handle.job_of(evidence);
             let mut config = dispatch_config("c33-t25", 60.0);
-            assert!(
-                config.credential_refs.remove(&credential_ref),
-                "A was mapped"
-            );
             config.not_ready_park_seconds = 1.0;
-            let provider = StubProvider::one_memory(Duration::ZERO);
-            let first = handle.pass(&provider, &config);
+            let first = handle.pass_routes(&providers, &config);
             assert_eq!((first.not_ready, first.attempts), (1, 0), "{first:?}");
             let (status, attempt, class, ..) = handle.job(job);
             assert_eq!(
                 (status.as_str(), attempt, class.as_deref()),
-                ("PENDING", 0, Some(distill::CREDENTIAL_NOT_MAPPED))
+                ("PENDING", 0, Some(CREDENTIAL_NOT_MAPPED))
             );
             std::thread::sleep(Duration::from_millis(1200));
             handle.ready_now(job);
-            let second = handle.pass(&provider, &config);
+            let second = handle.pass_routes(&providers, &config);
             assert_eq!(second.parked, 1, "{second:?}");
             let (status, attempt, class, ..) = handle.job(job);
             assert_eq!(
                 (status.as_str(), attempt, class.as_deref()),
-                ("WAITING_KEY", 0, Some(distill::CREDENTIAL_NOT_MAPPED)),
+                ("WAITING_KEY", 0, Some(CREDENTIAL_NOT_MAPPED)),
                 "parked with the named class, never DEAD, no attempt"
             );
-            let ledger: i64 = handle
-                .admin
-                .query_one(
-                    "SELECT count(*) FROM ops.model_call_ledger WHERE tenant_id = $1",
-                    &[&tenant_id],
-                )
-                .expect("ledger count")
-                .get(0);
             assert_eq!(
-                (ledger, handle.calls_of(job), provider.calls()),
+                (
+                    ledger_rows(&mut handle, tenant_id),
+                    handle.calls_of(job),
+                    routes.built()
+                ),
                 (0, 0, 0),
-                "no ledger row, no distill call, no provider call"
+                "no ledger row, no distill call, no provider instance"
             );
             assert_eq!(handle.outbox_status(evidence), "PENDING", "not stranded");
             handle.assert_i_slot();
@@ -1397,10 +1729,60 @@ fn foreign_credential_ref_parks_waiting_key_without_ledger_row() {
     );
 }
 
+/// T35 (ADR-0060 D-J, review finding 9) — a node with an explicitly empty credential map boots:
+/// the RPC state builds over it, and a bound domain's job parks `WAITING_KEY` /
+/// `CREDENTIAL_NOT_MAPPED` with no ledger row. Fault: refuse an empty map at parse (the card-33
+/// rule) ⇒ the map does not build.
+#[test]
+fn zero_profile_boot_parks_with_a_class() {
+    run("zero_profile_boot_parks_with_a_class", |mut handle| {
+        let routes = production_routes(&[]);
+        let state = humaux_private_worker::inference_rpc::RpcState {
+            expected_consolidation_uid: 0,
+            calls: handle
+                .rt
+                // dep: PostgreSQL(role_private_worker) — the RPC state's own pool
+                .block_on(PrivateWorkerDbPool::connect(&dsn_as_role(
+                    &handle.dsn,
+                    "role_private_worker",
+                )))
+                .expect("pool"),
+            config: reasoner_config(),
+            providers: {
+                let routes = Arc::clone(&routes);
+                Box::new(move |l: &ReasoningAdmissionLocator| routes.provider_for(l))
+            },
+            health_renew_seconds: HEALTH_RENEW_SECS,
+        };
+        let evidence = accept_evidence(&mut handle, 0);
+        let job = handle.job_of(evidence);
+        let mut config = dispatch_config("c33b-t35", 60.0);
+        config.not_ready_park_seconds = 1.0;
+        let first = handle.pass_routes(state.providers.as_ref(), &config);
+        assert_eq!((first.not_ready, first.attempts), (1, 0), "{first:?}");
+        std::thread::sleep(Duration::from_millis(1200));
+        handle.ready_now(job);
+        let second = handle.pass_routes(state.providers.as_ref(), &config);
+        assert_eq!(second.parked, 1, "{second:?}");
+        let (status, _, class, ..) = handle.job(job);
+        assert_eq!(
+            (status.as_str(), class.as_deref()),
+            ("WAITING_KEY", Some(CREDENTIAL_NOT_MAPPED))
+        );
+        let tenant_id = handle.tenants[0].tenant_id;
+        assert_eq!(
+            (ledger_rows(&mut handle, tenant_id), routes.built()),
+            (0, 0)
+        );
+    });
+}
+
 /// E7 (§11) — a provider that always answers 401: every round parks the job `WAITING_KEY` with
 /// attempt 0 and the outbox row open, even with `max_attempts = 1`; the physical calls stay in
-/// the ledger and in `ops.distill_calls`. Fault: drop the WAITING_KEY revert in
-/// `ops.finish_derived_work_v2` ⇒ round 2 sees attempt 1 = max ⇒ DEAD.
+/// the ledger and in `ops.distill_calls`. Since ruling E3 each 401 also records the credential
+/// INVALID, so the operator re-attests the account before each further round (the "key rotated,
+/// still rejected" case). Fault: drop the WAITING_KEY revert in `ops.finish_derived_work_v2` ⇒
+/// round 2 sees attempt 1 = max ⇒ DEAD.
 #[test]
 fn a_401_parks_waiting_key_and_never_dies() {
     run("a_401_parks_waiting_key_and_never_dies", |mut handle| {
@@ -1410,7 +1792,11 @@ fn a_401_parks_waiting_key_and_never_dies() {
         let mut config = dispatch_config("c32-e7", 60.0);
         config.max_attempts = 1;
         config.not_ready_park_seconds = 1.0;
+        let tenant_id = handle.tenants[0].tenant_id;
         for round in 1..=3 {
+            if round > 1 {
+                reattest_account(&mut handle.admin, tenant_id);
+            }
             let report = handle.pass(&provider, &config);
             assert_eq!(report.parked, 1, "round {round}: {report:?}");
             let (status, attempt, class, ..) = handle.job(job);
@@ -1434,6 +1820,25 @@ fn a_401_parks_waiting_key_and_never_dies() {
         assert_eq!(failed, 3, "every 401 call is ledgered");
         handle.assert_i_slot();
     });
+}
+
+/// An operator attestation of every profile account of `tenant_id` (HEALTHY / VALID, 30 minutes),
+/// newer than any worker-observed verdict.
+fn reattest_account(admin: &mut Client, tenant_id: Uuid) {
+    admin
+        .execute(
+            "INSERT INTO ops.reasoning_account_health_observations \
+               (tenant_id, provider_account_id, credential_ref, billing_account_id, \
+                billing_instrument_id, source_kind, reason_code, account_verdict, \
+                credential_verdict, billing_account_verdict, billing_instrument_verdict, \
+                observed_at, valid_until) \
+             SELECT tenant_id, provider_account_id, credential_ref, billing_account_id, \
+                    default_billing_instrument_id, 'TEST', NULL, 'HEALTHY', 'VALID', NULL, NULL, \
+                    clock_timestamp(), clock_timestamp() + interval '30 minutes' \
+             FROM control.reasoning_profiles WHERE tenant_id = $1",
+            &[&tenant_id],
+        )
+        .expect("re-attest the account");
 }
 
 /// E8 — two in-process dispatchers (different owners, separate pools) over one backlog: every
@@ -1463,15 +1868,21 @@ fn two_dispatchers_over_one_backlog_call_each_evidence_once() {
                 dispatch_config("c32-e8-one", 30.0),
                 dispatch_config("c32-e8-two", 30.0),
             );
+            let providers = routes(&provider);
             let (one, two) = handle.rt.block_on(async {
                 tokio::join!(
                     distill::dispatch_pass(
                         &handle.private,
-                        &provider,
+                        &providers,
                         reasoner_config(),
                         &config_one,
                     ),
-                    distill::dispatch_pass(&second_pool, &provider, reasoner_config(), &config_two)
+                    distill::dispatch_pass(
+                        &second_pool,
+                        &providers,
+                        reasoner_config(),
+                        &config_two
+                    )
                 )
             });
             let (one, two) = (one.expect("dispatcher one"), two.expect("dispatcher two"));
@@ -1563,7 +1974,7 @@ fn a_db_error_after_a_counted_call_settles_one_fenced_retry() {
                 .rt
                 .block_on(distill::dispatch_pass(
                     &short_lock_pool,
-                    &provider,
+                    &routes(&provider),
                     reasoner_config(),
                     &config,
                 ))
@@ -1644,7 +2055,7 @@ fn an_escaped_job_error_is_counted_as_an_error_not_a_lost_lease() {
                 .rt
                 .block_on(distill::dispatch_pass(
                     &short_lock_pool,
-                    &provider,
+                    &routes(&provider),
                     reasoner_config(),
                     &dispatch_config("c32-e14", 30.0),
                 ))
@@ -1669,21 +2080,19 @@ fn an_escaped_job_error_is_counted_as_an_error_not_a_lost_lease() {
     );
 }
 
-/// ADR-0058 D-M (main-line ruling 2026-10-02 10:35, test 3) + §78.1: the endpoint's capabilities
-/// and the credential map (ADR-0059 D-I, which replaced card 32's single key variable; the test
-/// keeps its card-32 name, a gate greps it) are deployment configuration with no code default —
-/// the worker refuses to start without either, naming the key, and refuses the removed
-/// `HUMAUX_PRIVATE_WORKER_KEY_ENV`. Fault: a literal default for `HUMAUX_PRIVATE_WORKER_CAPABILITIES`
-/// or `_CREDENTIALS` → the process gets past bootstrap and fails elsewhere (or not at all).
+/// ADR-0060 D-C / D-J / E3 / E7 — the binary refuses to start without each required route list
+/// or the health renewal window, and refuses a removed process-level key that is still set (stale
+/// configuration is never silently ignored). The keys are named by the boot error; the unreachable
+/// DSN proves the refusal comes before any connection.
 #[test]
-fn the_worker_refuses_to_boot_without_capabilities_or_key_env() {
+fn the_worker_refuses_to_boot_without_its_route_lists() {
     for missing in [
-        "HUMAUX_PRIVATE_WORKER_CAPABILITIES",
-        "HUMAUX_PRIVATE_WORKER_CREDENTIALS",
+        route_providers::CREDENTIALS,
+        EGRESS_RECIPIENTS,
+        REGIONS,
+        "HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS",
     ] {
-        // An unreachable DSN: a bootstrap that got past the configuration would fail on it with
-        // a different message.
-        let out = distill_serve_command("postgres://nobody@127.0.0.1:1/none")
+        let out = distill_serve_command("postgres://nobody@127.0.0.1:1/none", "")
             .env_remove(missing)
             .arg("--distill-once")
             .output()
@@ -1695,29 +2104,19 @@ fn the_worker_refuses_to_boot_without_capabilities_or_key_env() {
             "{missing}: {stderr}"
         );
     }
-    let out = distill_serve_command("postgres://nobody@127.0.0.1:1/none")
-        .env("HUMAUX_PRIVATE_WORKER_KEY_ENV", "HUMAUX_CARD15_TEST_SECRET")
-        .arg("--distill-once")
-        .output()
-        .expect("spawn humaux-private-worker");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains(
-            "invalid configuration: HUMAUX_PRIVATE_WORKER_KEY_ENV was removed by ADR-0059 D-I"
-        ),
-        "the removed single-key variable is refused, never silently ignored"
-    );
-    let out = distill_serve_command("postgres://nobody@127.0.0.1:1/none")
+    let out = distill_serve_command("postgres://nobody@127.0.0.1:1/none", "")
         .env(
-            "HUMAUX_PRIVATE_WORKER_CAPABILITIES",
-            "STRUCTURED_OUTPUT,JSON_MODE",
+            "HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID",
+            EGRESS_PROCESSOR_ID.to_string(),
         )
         .arg("--distill-once")
         .output()
         .expect("spawn humaux-private-worker");
     assert!(
-        String::from_utf8_lossy(&out.stderr)
-            .contains("invalid configuration: HUMAUX_PRIVATE_WORKER_CAPABILITIES"),
-        "a value outside the §11.2 closed set is refused"
+        String::from_utf8_lossy(&out.stderr).contains(
+            "invalid configuration: HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID was removed by ADR-0060 D-C"
+        ),
+        "a removed singular recipient key is refused, never silently ignored"
     );
 }
 
@@ -1792,7 +2191,7 @@ fn a_success_at_the_end_of_the_http_window_is_kept_not_resent() {
                 not_ready_park_seconds: 600.0,
                 max_attempts: 5,
                 budget: TEST_BUDGET,
-                credential_refs: mapped_credentials(),
+                health_renew_seconds: HEALTH_RENEW_SECS,
             };
             let replied = std::sync::Arc::new(AtomicBool::new(false));
             let called = std::sync::Arc::new(AtomicBool::new(false));
@@ -1871,7 +2270,7 @@ fn a_success_at_the_end_of_the_http_window_is_kept_not_resent() {
                 let pass = async {
                     let r = distill::dispatch_pass(
                         &handle.private,
-                        &provider,
+                        &routes(&provider),
                         reasoner_config(),
                         &config,
                     )
@@ -2610,6 +3009,936 @@ fn requeue_dead_by_class_reports_the_dead_jobs_it_skipped() {
 }
 
 // ---------------------------------------------------------------------------
+// ADR-0060 (card 33b): the route picks the provider; worker-observed health (ruling E3)
+// ---------------------------------------------------------------------------
+
+/// A second vendor for the stub tests: another processor, model, endpoint and capability set.
+fn p2_lane() -> Lane {
+    Lane {
+        provider_id: "derived-dispatch-p2".to_owned(),
+        model_id: "p2-model".to_owned(),
+        endpoint_ref: "https://p2.derived-dispatch.example/v1/chat/completions".to_owned(),
+        egress_processor_id: EGRESS_PROCESSOR_ID,
+        region: REGION.to_owned(),
+        capabilities: vec![
+            ReasoningCapability::Text,
+            ReasoningCapability::StructuredOutput,
+        ],
+        request_extras: serde_json::json!({}),
+    }
+}
+
+/// The rehearsal lane every fixture tenant is seeded with.
+fn rehearsal_lane() -> Lane {
+    Lane::rehearsal(
+        EGRESS_PROCESSOR_ID,
+        ENDPOINT_REF,
+        MODEL_ID,
+        &live_minimax::REHEARSAL_CAPABILITIES,
+    )
+}
+
+/// ADR-0060 D-B in the stub form: each admitted route goes to the stub of its processor; every
+/// tenant asked for is recorded (T20: an unbound domain never reaches the seam).
+fn by_provider(
+    stubs: Vec<(String, Arc<StubProvider>)>,
+    asked: Arc<Mutex<Vec<Uuid>>>,
+) -> impl Fn(&ReasoningAdmissionLocator) -> Result<Arc<dyn UserReasoningProvider>, &'static str>
++ Send
++ Sync {
+    move |route| {
+        asked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(route.tenant_id);
+        stubs
+            .iter()
+            .find(|(processor, _)| *processor == route.processor_id)
+            .map(|(_, stub)| Arc::clone(stub) as Arc<dyn UserReasoningProvider>)
+            .ok_or("NO_STUB_FOR_PROVIDER")
+    }
+}
+
+/// `(tenant, provider, model, binding_id, binding_version, profile_id, provider_account_id,
+/// credential_ref, provider_endpoint_id, status)` of every ledger row of `tenants`, oldest first.
+type LedgerRow = (
+    Uuid,
+    String,
+    String,
+    Uuid,
+    i64,
+    Uuid,
+    Uuid,
+    Uuid,
+    Uuid,
+    String,
+);
+
+fn ledger_of(admin: &mut Client, tenants: &[Uuid]) -> Vec<LedgerRow> {
+    admin
+        .query(
+            "SELECT tenant_id, provider, model, binding_id, binding_version, profile_id, \
+                    provider_account_id, credential_ref, provider_endpoint_id, status \
+             FROM ops.model_call_ledger WHERE tenant_id = ANY($1) ORDER BY called_at, model_call_id",
+            &[&tenants],
+        )
+        .expect("ledger rows")
+        .into_iter()
+        .map(|r| {
+            (
+                r.get(0),
+                r.get(1),
+                r.get(2),
+                r.get(3),
+                r.get(4),
+                r.get(5),
+                r.get(6),
+                r.get(7),
+                r.get(8),
+                r.get(9),
+            )
+        })
+        .collect()
+}
+
+/// T18 (ADR-0060 D-B, card fault 1 in the seam form) — two tenants on two providers in ONE
+/// dispatch pass: each stub is called once, the tool channel only for the profile declaring
+/// TOOL_CALLS, two ledger rows with distinct (provider, model), each equal to its tenant's route.
+/// Fault: `DistillReasoner` keeps the first instance it got ⇒ B is refused
+/// ROUTE_PROVIDER_MISMATCH and the ledger shows one provider.
+#[test]
+fn two_profiles_two_providers_one_dispatch() {
+    run("two_profiles_two_providers_one_dispatch", |mut handle| {
+        let (a_lane, b_lane) = (rehearsal_lane(), p2_lane());
+        let (a, a_route) = handle.add_tenant_on("t18 tenant A (provider 1)", &a_lane);
+        let (b, b_route) = handle.add_tenant_on("t18 tenant B (provider 2)", &b_lane);
+        let reply = |_: &str| (Duration::ZERO, Reply::Json(ONE_MEMORY_REPLY.to_owned()));
+        let (stub1, stub2) = (
+            StubProvider::declaring(a_lane.descriptor(), reply),
+            StubProvider::declaring(b_lane.descriptor(), reply),
+        );
+        let providers = by_provider(
+            vec![
+                (a_lane.provider_id.clone(), Arc::clone(&stub1)),
+                (b_lane.provider_id.clone(), Arc::clone(&stub2)),
+            ],
+            Arc::default(),
+        );
+        let (ea, eb) = (
+            accept_evidence(&mut handle, a),
+            accept_evidence(&mut handle, b),
+        );
+        let report = handle.pass_routes(&providers, &dispatch_config("c33b-t18", 60.0));
+        assert_eq!(report.completed, 2, "{report:?}");
+        assert_eq!(
+            (stub1.calls(), stub1.tool_calls.load(Ordering::SeqCst)),
+            (1, 1),
+            "A only, on the tool channel"
+        );
+        assert_eq!(
+            (stub2.calls(), stub2.tool_calls.load(Ordering::SeqCst)),
+            (1, 0),
+            "B only, on the content channel"
+        );
+        for evidence in [ea, eb] {
+            let job = handle.job_of(evidence);
+            assert_eq!(handle.job(job).0, "DONE");
+        }
+        let tenants = [handle.tenants[a].tenant_id, handle.tenants[b].tenant_id];
+        let rows = ledger_of(&mut handle.admin, &tenants);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for (tenant, lane, route) in [
+            (tenants[0], &a_lane, &a_route),
+            (tenants[1], &b_lane, &b_route),
+        ] {
+            let row = rows
+                .iter()
+                .find(|r| r.0 == tenant)
+                .expect("a row per tenant");
+            assert_eq!(
+                (
+                    row.1.as_str(),
+                    row.2.as_str(),
+                    row.5,
+                    row.6,
+                    row.7,
+                    row.8,
+                    row.9.as_str()
+                ),
+                (
+                    lane.provider_id.as_str(),
+                    lane.model_id.as_str(),
+                    route.profile_id,
+                    route.provider_account_id,
+                    route.credential_ref,
+                    route.endpoint_id,
+                    "SUCCEEDED"
+                )
+            );
+        }
+        assert_ne!((&rows[0].1, &rows[0].2), (&rows[1].1, &rows[1].2));
+    });
+}
+
+/// T19 (ADR-0060 D-H shape, review findings 1/7) — tenant B's binding is switched from its
+/// provider-2 Profile to B's OWN provider-1 Profile `PB1` between two jobs on one dispatcher, no
+/// restart: job 1 → stub 2 with binding v1, job 2 → stub 1 with binding v2, `PB1@1`, B's provider-1
+/// account and credential. No column of row 2 names a tenant-A route id; row 1 is unchanged.
+/// Fault: the worker remembers the domain's first binding version ⇒ job 2 admits the closed v1 ⇒
+/// NOT_READY.
+#[test]
+fn binding_switch_takes_effect_on_next_job_without_restart() {
+    run(
+        "binding_switch_takes_effect_on_next_job_without_restart",
+        |mut handle| {
+            let (a_lane, b_lane) = (rehearsal_lane(), p2_lane());
+            let (a, a_route) = handle.add_tenant_on("t19 tenant A", &a_lane);
+            let (b, b_route) = handle.add_tenant_on("t19 tenant B", &b_lane);
+            let (tenant_b, domain_b, user) = (
+                handle.tenants[b].tenant_id,
+                handle.tenants[b].reasoning_domain_id,
+                handle.user_id,
+            );
+            let pb1 = seed_reasoning_profile(&mut handle.admin, tenant_b, user, "t19 PB1", &a_lane)
+                .expect("B's own provider-1 profile");
+            let reply = |_: &str| (Duration::ZERO, Reply::Json(ONE_MEMORY_REPLY.to_owned()));
+            let (stub1, stub2) = (
+                StubProvider::declaring(a_lane.descriptor(), reply),
+                StubProvider::declaring(b_lane.descriptor(), reply),
+            );
+            let providers = by_provider(
+                vec![
+                    (a_lane.provider_id.clone(), Arc::clone(&stub1)),
+                    (b_lane.provider_id.clone(), Arc::clone(&stub2)),
+                ],
+                Arc::default(),
+            );
+            let config = dispatch_config("c33b-t19", 60.0);
+            accept_evidence(&mut handle, b);
+            let first = handle.pass_routes(&providers, &config);
+            assert_eq!((first.completed, stub2.calls(), stub1.calls()), (1, 1, 0));
+            let row1 = ledger_of(&mut handle.admin, &[tenant_b]);
+            assert_eq!(row1.len(), 1);
+            assert_eq!(
+                (row1[0].4, row1[0].5, row1[0].7),
+                (1, b_route.profile_id, b_route.credential_ref)
+            );
+            let (binding_id, version) =
+                switch_binding(&mut handle.admin, tenant_b, user, domain_b, pb1.profile_id);
+            assert_eq!((binding_id, version), (row1[0].3, 2), "a successor version");
+            accept_evidence(&mut handle, b);
+            let second = handle.pass_routes(&providers, &config);
+            assert_eq!(
+                (second.completed, stub1.calls(), stub2.calls()),
+                (1, 1, 1),
+                "{second:?}"
+            );
+            let rows = ledger_of(&mut handle.admin, &[tenant_b]);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0], row1[0], "row 1 unchanged");
+            let row2 = &rows[1];
+            assert_eq!(
+                (
+                    row2.0,
+                    row2.1.as_str(),
+                    row2.2.as_str(),
+                    row2.3,
+                    row2.4,
+                    row2.5,
+                    row2.6,
+                    row2.7,
+                    row2.9.as_str()
+                ),
+                (
+                    tenant_b,
+                    a_lane.provider_id.as_str(),
+                    a_lane.model_id.as_str(),
+                    binding_id,
+                    2,
+                    pb1.profile_id,
+                    pb1.provider_account_id,
+                    pb1.credential_ref,
+                    "SUCCEEDED"
+                )
+            );
+            let a_ids = [
+                handle.tenants[a].tenant_id,
+                a_route.profile_id,
+                a_route.provider_account_id,
+                a_route.credential_ref,
+                a_route.endpoint_id,
+            ];
+            for id in [row2.0, row2.3, row2.5, row2.6, row2.7, row2.8] {
+                assert!(!a_ids.contains(&id), "row 2 names a tenant-A route id {id}");
+            }
+        },
+    );
+}
+
+/// T20 (ADR-0060 D-G) — a domain with no binding parks `WAITING_KEY` / no-binding after the park
+/// age, never reaches the provider seam and writes no ledger row, while tenant A is served. Fault:
+/// settle the no-binding class as DEAD ⇒ C is DEAD with its outbox FAILED.
+#[test]
+fn unbound_domain_parks_waiting_key_others_unaffected() {
+    run(
+        "unbound_domain_parks_waiting_key_others_unaffected",
+        |mut handle| {
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let stub = StubProvider::one_memory(Duration::ZERO);
+            let providers = by_provider(
+                vec![(PROVIDER_ID.to_owned(), Arc::clone(&stub))],
+                Arc::clone(&asked),
+            );
+            let (ea, ec) = (
+                accept_evidence(&mut handle, 0),
+                accept_evidence(&mut handle, 2),
+            );
+            let (job_a, job_c) = (handle.job_of(ea), handle.job_of(ec));
+            let mut config = dispatch_config("c33b-t20", 60.0);
+            config.not_ready_park_seconds = 1.0;
+            let first = handle.pass_routes(&providers, &config);
+            assert_eq!((first.completed, first.not_ready), (1, 1), "{first:?}");
+            assert_eq!(handle.job(job_a).0, "DONE");
+            std::thread::sleep(Duration::from_millis(1200));
+            handle.ready_now(job_c);
+            let second = handle.pass_routes(&providers, &config);
+            assert_eq!(second.parked, 1, "{second:?}");
+            let (status, attempt, class, ..) = handle.job(job_c);
+            assert_eq!(
+                (status.as_str(), attempt, class.as_deref()),
+                ("WAITING_KEY", 0, Some(NO_BINDING_REASON))
+            );
+            assert_eq!(handle.outbox_status(ec), "PENDING");
+            let tenant_c = handle.tenants[2].tenant_id;
+            assert_eq!(ledger_rows(&mut handle, tenant_c), 0);
+            assert!(
+                !asked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&tenant_c),
+                "the seam is never asked for an unbound domain"
+            );
+        },
+    );
+}
+
+/// T21 (ADR-0060 D-G, security argument (c)) — after job 1 the Profile is disabled: job 2 is
+/// NOT_READY "reasoning route not admitted", no new call, no new ledger row. Fault: the reasoner
+/// caches the admitted locator per Binding@version and skips the resolver ⇒ job 2 is served.
+#[test]
+fn disabled_profile_stops_being_used() {
+    run("disabled_profile_stops_being_used", |mut handle| {
+        let stub = StubProvider::one_memory(Duration::ZERO);
+        let config = dispatch_config("c33b-t21", 60.0);
+        accept_evidence(&mut handle, 0);
+        let first = handle.pass(&stub, &config);
+        assert_eq!((first.completed, stub.calls()), (1, 1), "{first:?}");
+        let tenant_id = handle.tenants[0].tenant_id;
+        handle.sql(
+            "UPDATE control.reasoning_profiles SET enabled = false WHERE tenant_id = $1",
+            tenant_id,
+        );
+        let evidence = accept_evidence(&mut handle, 0);
+        let second = handle.pass(&stub, &config);
+        assert_eq!((second.not_ready, stub.calls()), (1, 1), "{second:?}");
+        let job = handle.job_of(evidence);
+        assert_eq!(
+            handle.job(job).2.as_deref(),
+            Some("reasoning route not admitted")
+        );
+        assert_eq!(ledger_rows(&mut handle, tenant_id), 1, "no new ledger row");
+    });
+}
+
+/// T34 (ADR-0060 D-F, review finding 6) — tenant B's provider hangs past the HTTP timeout and
+/// answers RETRY, A's answers at once; four seats over A's 500 and B's 50 READY jobs. Sampled every
+/// 100 ms for 3 × the timeout: B never holds more than 2 of the 4 slots and A completes at least
+/// 20 jobs; B's jobs wait RETRY (not WAITING_KEY, the D-G correction). Fault: the claim orders by
+/// least-recently-served only (the 0199 body) ⇒ B takes all four slots.
+#[test]
+#[allow(clippy::too_many_lines)] // one sampled scenario: seed, serve with a sampler, assert
+fn slow_provider_tenant_cannot_take_all_slots() {
+    run(
+        "slow_provider_tenant_cannot_take_all_slots",
+        |mut handle| {
+            const TIMEOUT_SECS: f64 = 2.0;
+            let (a_lane, b_lane) = (rehearsal_lane(), p2_lane());
+            let (a, _) = handle.add_tenant_on("t34 tenant A (fast)", &a_lane);
+            let (b, _) = handle.add_tenant_on("t34 tenant B (hanging)", &b_lane);
+            let fast = StubProvider::declaring(a_lane.descriptor(), |_| {
+                (Duration::ZERO, Reply::Json(ONE_MEMORY_REPLY.to_owned()))
+            });
+            let slow = StubProvider::declaring(b_lane.descriptor(), |_| {
+                (
+                    Duration::from_secs_f64(TIMEOUT_SECS + 0.2),
+                    Reply::RetryWait,
+                )
+            });
+            let providers = by_provider(
+                vec![
+                    (a_lane.provider_id.clone(), Arc::clone(&fast)),
+                    (b_lane.provider_id.clone(), Arc::clone(&slow)),
+                ],
+                Arc::default(),
+            );
+            for _ in 0..500 {
+                accept_evidence(&mut handle, a);
+            }
+            for _ in 0..50 {
+                accept_evidence(&mut handle, b);
+            }
+            let (tenant_a, tenant_b) = (handle.tenants[a].tenant_id, handle.tenants[b].tenant_id);
+            let config = DistillDispatchConfig {
+                http_timeout_seconds: TIMEOUT_SECS,
+                hard_deadline_seconds: 2.0 * (TIMEOUT_SECS + 2.0),
+                ..dispatch_config("c33b-t34", 2.0)
+            };
+            let stop = AtomicBool::new(false);
+            let dsn = handle.dsn.clone();
+            let (max_b, samples) = std::thread::scope(|scope| {
+                let stop = &stop;
+                let sampler = scope.spawn(move || {
+                    // dep: PostgreSQL(owner) — sampler connection
+                    let mut admin = Client::connect(&dsn, NoTls).expect("sampler");
+                    let started = std::time::Instant::now();
+                    let (mut max_b, mut samples) = (0_i64, 0_u32);
+                    while started.elapsed() < Duration::from_secs_f64(3.0 * TIMEOUT_SECS) {
+                        let held: i64 = admin
+                            .query_one(
+                                "SELECT count(*) FROM ops.provider_slots s \
+                               JOIN ops.jobs j ON j.job_id = s.job_id WHERE j.tenant_id = $1",
+                                &[&tenant_b],
+                            )
+                            .expect("slots held by B")
+                            .get(0);
+                        max_b = max_b.max(held);
+                        samples += 1;
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    stop.store(true, Ordering::SeqCst);
+                    (max_b, samples)
+                });
+                handle
+                    .rt
+                    .block_on(distill::dispatch_serve(
+                        &handle.private,
+                        &providers,
+                        reasoner_config(),
+                        &config,
+                        Duration::from_millis(100),
+                        stop,
+                    ))
+                    .expect("dispatcher");
+                sampler.join().expect("sampler")
+            });
+            let done_a: i64 = handle
+                .admin
+                .query_one(
+                    "SELECT count(*) FROM ops.jobs WHERE tenant_id = $1 AND status = 'DONE'",
+                    &[&tenant_a],
+                )
+                .expect("A done")
+                .get(0);
+            let (retry_b, parked_b): (i64, i64) = {
+                let r = handle
+                    .admin
+                    .query_one(
+                        "SELECT count(*) FILTER (WHERE last_error_class = 'RETRY_WAIT'), \
+                            count(*) FILTER (WHERE status = 'WAITING_KEY') \
+                     FROM ops.jobs WHERE tenant_id = $1",
+                        &[&tenant_b],
+                    )
+                    .expect("B jobs");
+                (r.get(0), r.get(1))
+            };
+            eprintln!(
+                "c33b-t34 samples={samples} max_slots_b={max_b} done_a={done_a} retry_b={retry_b} slow_calls={}",
+                slow.calls()
+            );
+            assert!(samples >= 20, "{samples} samples");
+            assert!(max_b <= 2, "B held {max_b} of 4 slots");
+            assert!(done_a >= 20, "A completed {done_a}");
+            assert!(
+                retry_b >= 1 && parked_b == 0,
+                "retry={retry_b} parked={parked_b}"
+            );
+            retire_open_jobs(&mut handle.admin, &[tenant_a, tenant_b]);
+        },
+    );
+}
+
+/// Worker-observed health rows (ruling E3) of one tenant: `(provider rows, account rows, account
+/// rows with credential verdict INVALID)`.
+fn worker_observed(admin: &mut Client, tenant_id: Uuid) -> (i64, i64, i64) {
+    let r = admin
+        .query_one(
+            "SELECT (SELECT count(*) FROM ops.reasoning_provider_health_observations \
+                      WHERE tenant_id = $1 AND source_kind = 'WORKER_OBSERVED'), \
+                    (SELECT count(*) FROM ops.reasoning_account_health_observations \
+                      WHERE tenant_id = $1 AND source_kind = 'WORKER_OBSERVED'), \
+                    (SELECT count(*) FROM ops.reasoning_account_health_observations \
+                      WHERE tenant_id = $1 AND source_kind = 'WORKER_OBSERVED' \
+                        AND credential_verdict = 'INVALID')",
+            &[&tenant_id],
+        )
+        .expect("worker-observed health");
+    (r.get(0), r.get(1), r.get(2))
+}
+
+/// E3 (ruling E3 (b), test 1) — the route's latest attestation expires in 4 s: a SUCCEEDED call
+/// renews it (one HEALTHY provider row and one HEALTHY account row, valid for
+/// HEALTH_RENEW_SECS), so a job after the old `valid_until` is admitted and served. Fault: no
+/// renewal after a success ⇒ job 2 is NOT_READY ROUTE_HEALTH_STALE.
+#[test]
+fn a_success_near_expiry_renews_route_health() {
+    run("a_success_near_expiry_renews_route_health", |mut handle| {
+        let lane = rehearsal_lane();
+        let (x, route) = handle.add_tenant_on("e3 renew", &lane);
+        let tenant_id = handle.tenants[x].tenant_id;
+        seed_health(
+            &mut handle.admin,
+            tenant_id,
+            &lane,
+            &route,
+            Duration::from_secs(4),
+        )
+        .expect("short attestation");
+        let stub = StubProvider::one_memory(Duration::ZERO);
+        let config = dispatch_config("c33b-e3-renew", 60.0);
+        accept_evidence(&mut handle, x);
+        let first = handle.pass(&stub, &config);
+        assert_eq!(first.completed, 1, "{first:?}");
+        std::thread::sleep(Duration::from_millis(4500));
+        let evidence = accept_evidence(&mut handle, x);
+        let second = handle.pass(&stub, &config);
+        let job = handle.job_of(evidence);
+        assert_eq!(
+            (second.completed, handle.job(job).2),
+            (1, None),
+            "admitted on the renewed health: {second:?}"
+        );
+        assert_eq!(worker_observed(&mut handle.admin, tenant_id), (1, 1, 0));
+    });
+}
+
+/// E3 (ruling E3 (b), test 2) — a provider 401 appends one account row with the credential
+/// verdict INVALID, so the next admission is refused ROUTE_HEALTH_DENIED although the attestation
+/// is still valid, with no further call. Fault: no negative row on a 401 ⇒ job 2 is admitted and
+/// the provider is called again.
+#[test]
+fn a_401_records_invalid_credential_and_denies_the_next_admission() {
+    run(
+        "a_401_records_invalid_credential_and_denies_the_next_admission",
+        |mut handle| {
+            let (y, _) = handle.add_tenant_on("e3 401", &rehearsal_lane());
+            let tenant_id = handle.tenants[y].tenant_id;
+            let stub = StubProvider::new(|_| (Duration::ZERO, Reply::WaitingKey));
+            let config = dispatch_config("c33b-e3-401", 60.0);
+            accept_evidence(&mut handle, y);
+            let first = handle.pass(&stub, &config);
+            assert_eq!((first.parked, stub.calls()), (1, 1), "{first:?}");
+            let evidence = accept_evidence(&mut handle, y);
+            let second = handle.pass(&stub, &config);
+            let job = handle.job_of(evidence);
+            assert_eq!(
+                (second.not_ready, stub.calls(), handle.job(job).2.as_deref()),
+                (1, 1, Some(ROUTE_HEALTH_DENIED)),
+                "{second:?}"
+            );
+            assert_eq!(worker_observed(&mut handle.admin, tenant_id), (0, 1, 1));
+        },
+    );
+}
+
+/// E3 (ruling E3 (b), test 3) — renewal is rate-limited: with the seed's 30-minute attestation
+/// and HEALTH_RENEW_SECS = 1800, more than half the window is left, so two SUCCEEDED calls append
+/// nothing. Fault: drop the remaining-validity clause from
+/// `control.observe_reasoning_route_health` (0206) ⇒ every success appends two rows.
+#[test]
+fn renewal_is_rate_limited() {
+    run("renewal_is_rate_limited", |mut handle| {
+        let (z, _) = handle.add_tenant_on("e3 rate limit", &rehearsal_lane());
+        let tenant_id = handle.tenants[z].tenant_id;
+        let stub = StubProvider::one_memory(Duration::ZERO);
+        let config = dispatch_config("c33b-e3-rate", 60.0);
+        for _ in 0..2 {
+            accept_evidence(&mut handle, z);
+            assert_eq!(handle.pass(&stub, &config).completed, 1);
+        }
+        assert_eq!(stub.calls(), 2);
+        assert_eq!(worker_observed(&mut handle.admin, tenant_id), (0, 0, 0));
+    });
+}
+
+/// Ruling E3 (c) — a route whose latest attestation ran out is NOT_READY with its own class
+/// ROUTE_HEALTH_STALE (not the generic refusal, not the no-binding class), and nothing is called.
+/// Fault: fold the health refusal into the generic "reasoning route not admitted".
+#[test]
+fn stale_health_parks_with_its_own_class() {
+    run("stale_health_parks_with_its_own_class", |mut handle| {
+        let lane = rehearsal_lane();
+        let (w, route) = handle.add_tenant_on("e3 stale", &lane);
+        let tenant_id = handle.tenants[w].tenant_id;
+        seed_health(
+            &mut handle.admin,
+            tenant_id,
+            &lane,
+            &route,
+            Duration::from_secs(1),
+        )
+        .expect("short attestation");
+        std::thread::sleep(Duration::from_millis(1500));
+        let stub = StubProvider::one_memory(Duration::ZERO);
+        let evidence = accept_evidence(&mut handle, w);
+        let report = handle.pass(&stub, &dispatch_config("c33b-e3-stale", 60.0));
+        let job = handle.job_of(evidence);
+        assert_eq!(
+            (report.not_ready, stub.calls(), handle.job(job).2.as_deref()),
+            (1, 0, Some(ROUTE_HEALTH_STALE))
+        );
+    });
+}
+
+/// The production instance of a live route, recording which output channel each call used (T24
+/// asserts the tool channel is used only for a profile declaring TOOL_CALLS).
+struct ChannelLog {
+    inner: Arc<dyn UserReasoningProvider>,
+    tenant_id: Uuid,
+    log: Arc<Mutex<Vec<(Uuid, &'static str)>>>,
+}
+
+#[async_trait::async_trait]
+impl UserReasoningProvider for ChannelLog {
+    fn descriptor(&self) -> &ReasoningProviderDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn endpoint_ref(&self) -> &str {
+        self.inner.endpoint_ref()
+    }
+
+    fn model_revision(&self) -> Option<&str> {
+        self.inner.model_revision()
+    }
+
+    async fn complete_structured(
+        &self,
+        context: &PrivateInferenceContext,
+        request: StructuredReasoningRequest,
+    ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((self.tenant_id, channel_name(&request.output)));
+        self.inner.complete_structured(context, request).await
+    }
+
+    async fn analyze_vision(
+        &self,
+        _context: &PrivateInferenceContext,
+        _request: VisionReasoningRequest,
+    ) -> Result<VisionReasoningResponse, ReasoningProviderError> {
+        unreachable!("distill never calls vision")
+    }
+}
+
+fn channel_name(output: &OutputChannel) -> &'static str {
+    match output {
+        OutputChannel::Content => "content",
+        OutputChannel::JsonObject => "json_object",
+        OutputChannel::Tool(_) => "tool",
+    }
+}
+
+/// T24 (ADR-0060 D-B, card fault 1 in the production form; the card's acceptance gate) — ONE
+/// production [`RouteProviders`] (credential map composed from the two key variable NAMES, one
+/// resolver from both pin specs, both recipients and regions, the D-J boot check passed) serves
+/// tenant A on the first live provider and tenant B on the second (`HUMAUX_LIVE_P2_*`): each
+/// distils one real Evidence, both rows SUCCEEDED with distinct (provider, model), each call on the
+/// channel its own profile's capabilities select. Then B's binding is switched to B's OWN
+/// first-provider Profile `PB1` and a second B Evidence runs on the SAME instance, no restart: one
+/// new cache entry, a row naming binding v2, `PB1@1`, B's first-provider account and credential.
+/// Prints one `c33b-live` line per ledger row and a summary (never a key, never an endpoint).
+/// Fault: `provider_for` returns the first-built instance for every route ⇒ B is refused
+/// ROUTE_PROVIDER_MISMATCH and never DONE; the ledger shows one provider.
+#[test]
+#[ignore = "lane(a:shared_db) live two-provider gate (card 33b T24): run with --include-ignored, HUMAUX_REQUIRE_MINIMAX=1 and HUMAUX_REQUIRE_SECOND_PROVIDER=1"]
+#[allow(clippy::too_many_lines)]
+fn distill_two_provider_live() {
+    let Some(mm_key) = live_minimax::load_minimax_key() else {
+        humaux_testkit::skip_or_fail(
+            "distill_two_provider_live",
+            "missing object: MINIMAX_API_KEY (env and /Volumes/data/viral-skill-eval/.env both empty)",
+            humaux_testkit::ExternalDep::MiniMax,
+        );
+        return;
+    };
+    let Some(p2) = live_provider::LiveProfile::second_provider() else {
+        return;
+    };
+    let p2_key = p2.key().unwrap_or_else(|| {
+        panic!(
+            "missing object: {} (the variable HUMAUX_LIVE_P2_KEY_ENV names is unset or empty)",
+            p2.key_env
+        )
+    });
+    run("distill_two_provider_live", |mut handle| {
+        // SAFETY: set while SERIAL_GUARD is held (see `distill_fairness_live`).
+        unsafe {
+            std::env::set_var("HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS", "604800");
+        }
+        let mm = live_minimax::minimax_profile(REGION);
+        let a_lane = Lane::live(&mm, EGRESS_PROCESSOR_ID);
+        let b_lane = Lane::live(&p2, Uuid::new_v4());
+        let (a, a_route) = handle.add_tenant_on("c33b live tenant A (provider 1)", &a_lane);
+        let (b, b_route) = handle.add_tenant_on("c33b live tenant B (provider 2)", &b_lane);
+        let (tenant_a, tenant_b, domain_b, user) = (
+            handle.tenants[a].tenant_id,
+            handle.tenants[b].tenant_id,
+            handle.tenants[b].reasoning_domain_id,
+            handle.user_id,
+        );
+        let pb1 = seed_reasoning_profile(
+            &mut handle.admin,
+            tenant_b,
+            user,
+            "c33b live tenant B PB1",
+            &a_lane,
+        )
+        .expect("B's own first-provider profile");
+
+        // The deployment: three map entries (two refs share the first key, one vendor account),
+        // both recipients with their hosts, both regions, one resolver from both pin specs.
+        let spec = format!(
+            "{}=MINIMAX_API_KEY,{}={},{}=MINIMAX_API_KEY",
+            a_route.credential_ref, b_route.credential_ref, p2.key_env, pb1.credential_ref
+        );
+        let recipients = format!(
+            "{}={},{}={}",
+            a_lane.egress_processor_id,
+            mm.hosts.join("|"),
+            b_lane.egress_processor_id,
+            p2.hosts.join("|")
+        );
+        let regions: Vec<&str> = if mm.region == p2.region {
+            vec![mm.region.as_str()]
+        } else {
+            vec![mm.region.as_str(), p2.region.as_str()]
+        };
+        let regions = regions.join(",");
+        let lookup = |name: &str| match name {
+            route_providers::CREDENTIALS => Some(spec.clone()),
+            "MINIMAX_API_KEY" => Some(mm_key.clone()),
+            EGRESS_RECIPIENTS => Some(recipients.clone()),
+            REGIONS => Some(regions.clone()),
+            other if other == p2.key_env => Some(p2_key.clone()),
+            _ => None,
+        };
+        let credentials = route_providers::parse_credential_map(lookup).expect("credential map");
+        for line in handle
+            .rt
+            .block_on(route_providers::verify_credential_accounts(
+                &handle.private,
+                &credentials,
+            ))
+            .expect("ADR-0060 D-J boot check")
+        {
+            println!("c33b-live boot {line}");
+        }
+        let pins = [mm.dns_pins.as_str(), p2.dns_pins.as_str()]
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        let routes = Arc::new(RouteProviders::new(
+            credentials,
+            route_providers::parse_recipients(lookup).expect("recipients"),
+            route_providers::parse_regions(lookup).expect("regions"),
+            Arc::new(
+                humaux_adapters::byok::ssrf::PinnedDnsResolver::parse(&pins)
+                    .expect("both pin specs parse"),
+            ),
+            Duration::from_secs(LIVE_HTTP_SECS),
+        ));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let providers = {
+            let (routes, log) = (Arc::clone(&routes), Arc::clone(&log));
+            move |l: &ReasoningAdmissionLocator| {
+                routes.provider_for(l).map(|inner| {
+                    Arc::new(ChannelLog {
+                        inner,
+                        tenant_id: l.tenant_id,
+                        log: Arc::clone(&log),
+                    }) as Arc<dyn UserReasoningProvider>
+                })
+            }
+        };
+        let config = live_config("c33b-live", 30.0, 4);
+        // ADR-0058 D-F: a live transient settles RETRY; the job is made due and claimed again
+        // within its own attempt budget (as distill_hop_e2e D1 does).
+        let drain = |handle: &mut Handle, evidence: &[Uuid]| {
+            for pass in 1..=3 {
+                let report = handle.pass_routes(&providers, &config);
+                println!("c33b-live pass={pass} {}", report.summary_line());
+                let jobs: Vec<Uuid> = evidence.iter().map(|e| handle.job_of(*e)).collect();
+                let mut open = false;
+                for job in jobs {
+                    let (status, ..) = handle.job(job);
+                    if status != "DONE" {
+                        open = true;
+                        handle.ready_now(job);
+                    }
+                }
+                if !open {
+                    return true;
+                }
+            }
+            false
+        };
+        let first = [
+            accept_evidence_marked(&mut handle, a, &live_note("c33b-a", 0)),
+            accept_evidence_marked(&mut handle, b, &live_note("c33b-b", 0)),
+        ];
+        let first_done = drain(&mut handle, &first);
+        let built_before = routes.built();
+        let (binding_b, version) =
+            switch_binding(&mut handle.admin, tenant_b, user, domain_b, pb1.profile_id);
+        let second = [accept_evidence_marked(
+            &mut handle,
+            b,
+            &live_note("c33b-b", 1),
+        )];
+        let second_done = drain(&mut handle, &second);
+        let built_after = routes.built();
+        if built_after == built_before + 1 {
+            println!(
+                "c33b-live route built tenant=B profile={}@1 provider={} model={} endpoint_id={} capabilities={}",
+                pb1.profile_id,
+                a_lane.provider_id,
+                a_lane.model_id,
+                pb1.endpoint_id,
+                a_lane
+                    .capabilities
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        let rows = handle
+            .admin
+            .query(
+                "SELECT tenant_id, binding_id, binding_version, profile_id, profile_version, \
+                        provider_account_id, credential_ref, provider, model, provider_endpoint_id, \
+                        status, coalesce(input_tokens::text, '-'), coalesce(output_tokens::text, '-'), \
+                        coalesce(latency_ms::text, '-') \
+                 FROM ops.model_call_ledger WHERE tenant_id = ANY($1) \
+                 ORDER BY called_at, model_call_id",
+                &[&vec![tenant_a, tenant_b]],
+            )
+            .expect("ledger rows");
+        let channels = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut seen: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
+        let mut succeeded = std::collections::BTreeSet::new();
+        for row in &rows {
+            let tenant: Uuid = row.get(0);
+            let nth = seen.entry(tenant).or_default();
+            let channel = channels
+                .iter()
+                .filter(|(t, _)| *t == tenant)
+                .nth(*nth)
+                .map_or("-", |(_, c)| *c);
+            *nth += 1;
+            let (profile, account, credential): (Uuid, Uuid, Uuid) =
+                (row.get(3), row.get(5), row.get(6));
+            let status: String = row.get(10);
+            println!(
+                "c33b-live tenant={} binding={}@{} profile={}@{} account={} credential_ref={} provider={} model={} endpoint_id={} channel={channel} status={status} input_tokens={} output_tokens={} latency_ms={}",
+                if tenant == tenant_a { "A" } else { "B" },
+                row.get::<_, Uuid>(1),
+                row.get::<_, i64>(2),
+                profile,
+                row.get::<_, i64>(4),
+                account,
+                credential,
+                row.get::<_, String>(7),
+                row.get::<_, String>(8),
+                row.get::<_, Uuid>(9),
+                row.get::<_, String>(11),
+                row.get::<_, String>(12),
+                row.get::<_, String>(13),
+            );
+            // Security argument (a): every row's route belongs to its own tenant.
+            let own = if tenant == tenant_a {
+                vec![(
+                    a_route.profile_id,
+                    a_route.provider_account_id,
+                    a_route.credential_ref,
+                )]
+            } else {
+                vec![
+                    (
+                        b_route.profile_id,
+                        b_route.provider_account_id,
+                        b_route.credential_ref,
+                    ),
+                    (pb1.profile_id, pb1.provider_account_id, pb1.credential_ref),
+                ]
+            };
+            assert!(
+                own.contains(&(profile, account, credential)),
+                "a row names a route that is not its tenant's own"
+            );
+            if status == "SUCCEEDED" {
+                succeeded.insert((row.get::<_, String>(7), row.get::<_, String>(8)));
+            }
+        }
+        let expected_channel = |lane: &Lane| {
+            channel_name(&humaux_adapters::distill_reasoner::distill_output_channel(
+                &lane.descriptor(),
+            ))
+        };
+        for (tenant, lane) in [(tenant_a, &a_lane), (tenant_b, &b_lane)] {
+            let first_channel = channels.iter().find(|(t, _)| *t == tenant).map(|(_, c)| *c);
+            assert_eq!(
+                first_channel,
+                Some(expected_channel(lane)),
+                "the channel follows the tenant's own profile"
+            );
+        }
+        let last_b = rows
+            .iter()
+            .rev()
+            .find(|r| r.get::<_, Uuid>(0) == tenant_b)
+            .expect("a row of B");
+        let swap_effective = second_done
+            && built_after == built_before + 1
+            && last_b.get::<_, Uuid>(1) == binding_b
+            && last_b.get::<_, i64>(2) == version
+            && last_b.get::<_, Uuid>(3) == pb1.profile_id
+            && last_b.get::<_, Uuid>(6) == pb1.credential_ref
+            && last_b.get::<_, String>(10) == "SUCCEEDED";
+        let (memories_a, memories_b) = (memory_count(&mut handle, a), memory_count(&mut handle, b));
+        println!(
+            "c33b-live providers_distinct={} swap_effective={swap_effective} rows={} memories_a={memories_a} memories_b={memories_b}",
+            succeeded.len(),
+            rows.len()
+        );
+        retire_open_jobs(&mut handle.admin, &[tenant_a, tenant_b]);
+        assert!(first_done, "both first jobs DONE");
+        assert_eq!(
+            succeeded.len(),
+            2,
+            "two distinct (provider, model): {succeeded:?}"
+        );
+        assert!(
+            swap_effective,
+            "the switch took effect on the next job, no restart"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
 // The BINARY: graceful shutdown (card 15 / ADR-0037) and two resident workers (E10)
 // ---------------------------------------------------------------------------
 
@@ -2625,32 +3954,27 @@ fn warm_binary() {
 /// round trip; F25: no loopback stub is reachable from the subprocess).
 const LITERAL_CHAT_URL: &str = "https://192.88.99.1/v1/chat/completions";
 
-/// The `--distill-serve` environment: `bootstrap()` builds the real BYOK provider before the loop
-/// starts, so every one of its keys has to be present.
-fn distill_serve_command(dsn: &str) -> std::process::Command {
+/// The `--distill-serve` environment: every required key of `bootstrap()`. ADR-0060 D-C: no
+/// provider, model, endpoint or capability — each route names its own; the recipient list lets
+/// the literal endpoint and the rehearsal host be dialled. `credentials` is the
+/// `HUMAUX_PRIVATE_WORKER_CREDENTIALS` value ([`credentials_spec`]); its references name a
+/// generated throwaway key the literal endpoint never receives.
+fn distill_serve_command(dsn: &str, credentials: &str) -> std::process::Command {
     // dep: subprocess(humaux-private-worker) — spawns the private-worker binary under test
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_humaux-private-worker"));
     cmd.env("PRIVATE_WORKER_PG_DSN", dsn)
-        .env("HUMAUX_PRIVATE_WORKER_CHAT_URL", LITERAL_CHAT_URL)
-        .env("HUMAUX_PRIVATE_WORKER_PROVIDER_ID", PROVIDER_ID)
-        .env("HUMAUX_PRIVATE_WORKER_MODEL_ID", MODEL_ID)
         .env("HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS", "5")
-        // ADR-0059 D-I: a generated throwaway key under every reference this file seeded; the
-        // literal chat URL is never reached with it.
-        .env_remove("HUMAUX_PRIVATE_WORKER_KEY_ENV")
-        .env(
-            "HUMAUX_PRIVATE_WORKER_CREDENTIALS",
-            credentials_spec("HUMAUX_CARD15_TEST_SECRET"),
-        )
+        .env(route_providers::CREDENTIALS, credentials)
         .env(
             "HUMAUX_CARD15_TEST_SECRET",
             Uuid::new_v4().simple().to_string(),
         )
+        .env(EGRESS_RECIPIENTS, subprocess_recipients())
+        .env(REGIONS, REGION)
         .env(
-            "HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID",
-            EGRESS_PROCESSOR_ID.to_string(),
+            "HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS",
+            HEALTH_RENEW_SECS.to_string(),
         )
-        .env("HUMAUX_PRIVATE_WORKER_REGION", REGION)
         .env("HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS", "30")
         .env("HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS", "120")
         .env("HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT", "4")
@@ -2659,13 +3983,7 @@ fn distill_serve_command(dsn: &str) -> std::process::Command {
         .env("HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS", "5")
         .env("HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS", "1")
         .env("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS", "60")
-        .env("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS", "10000")
-        .env(
-            "HUMAUX_PRIVATE_WORKER_CAPABILITIES",
-            live_minimax::REHEARSAL_CAPABILITIES
-                .map(ReasoningCapability::as_str)
-                .join(","),
-        );
+        .env("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS", "10000");
     cmd
 }
 
@@ -2728,7 +4046,10 @@ fn distill_serve_drains_on(sig: &str, test_name: &'static str) {
         }
         let tenant_id = handle.tenants[2].tenant_id;
         let dsn = dsn_as_role(&handle.dsn, "role_private_worker");
-        let mut child = distill_serve_command(&dsn)
+        let tenants = handle.tenant_ids();
+        let credentials =
+            credentials_spec(&mut handle.admin, &tenants, "HUMAUX_CARD15_TEST_SECRET");
+        let mut child = distill_serve_command(&dsn, &credentials)
             .arg("--distill-serve")
             .spawn()
             .expect("spawn humaux-private-worker --distill-serve");
@@ -2794,13 +4115,16 @@ fn distill_serve_drains_on(sig: &str, test_name: &'static str) {
 fn sigterm_to_the_inference_rpc_listener_exits_zero() {
     run(
         "sigterm_to_the_inference_rpc_listener_exits_zero",
-        |handle| {
+        |mut handle| {
             warm_binary();
+            let tenants = handle.tenant_ids();
+            let credentials =
+                credentials_spec(&mut handle.admin, &tenants, "HUMAUX_CARD15_TEST_SECRET");
             // Short `/tmp` path: macOS's temp dir plus a uuid overruns `sockaddr_un.sun_path`.
             let socket_path = format!("/tmp/hp15-rpc-{}.sock", Uuid::now_v7().simple());
             let _ = std::fs::remove_file(&socket_path);
             let dsn = dsn_as_role(&handle.dsn, "role_private_worker");
-            let mut child = distill_serve_command(&dsn)
+            let mut child = distill_serve_command(&dsn, &credentials)
                 .arg("--serve-rpc")
                 .env("HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH", &socket_path)
                 .env(
@@ -2864,6 +4188,7 @@ fn two_resident_workers_never_overlap_calls_for_one_evidence() {
                     handle.user_id,
                     Some(EGRESS_PROCESSOR_ID),
                     LITERAL_CHAT_URL,
+                    &live_minimax::REHEARSAL_CAPABILITIES,
                 )
                 .expect("e10 tenant");
                 handle.tenants.push(tenant);
@@ -2873,8 +4198,11 @@ fn two_resident_workers_never_overlap_calls_for_one_evidence() {
                 }
             }
             let dsn = dsn_as_role(&handle.dsn, "role_private_worker");
+            let tenants = handle.tenant_ids();
+            let credentials =
+                credentials_spec(&mut handle.admin, &tenants, "HUMAUX_CARD15_TEST_SECRET");
             let spawn = || {
-                distill_serve_command(&dsn)
+                distill_serve_command(&dsn, &credentials)
                     .env("HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS", "3")
                     .env("HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS", "1")
                     .env(
@@ -3033,7 +4361,7 @@ fn live_config(owner: &str, lease_seconds: f64, in_flight: u32) -> DistillDispat
         not_ready_park_seconds: 600.0,
         max_attempts: 5,
         budget: TEST_BUDGET,
-        credential_refs: mapped_credentials(),
+        health_renew_seconds: HEALTH_RENEW_SECS,
     }
 }
 
@@ -3143,9 +4471,9 @@ struct Served {
 /// a sampler records the bound-slot maximum and I-SLOT on every 100 ms tick (M4 a). One
 /// dispatcher only: a process serves one provider (card 33b), so two dispatchers with different
 /// providers over one queue race for each other's jobs (M6, `distill_poison_live`).
-fn serve_until(
+fn serve_until<P: UserReasoningProvider + 'static>(
     handle: &Handle,
-    provider: &dyn UserReasoningProvider,
+    provider: &Arc<P>,
     config: &DistillDispatchConfig,
     limit: Duration,
     done: impl Fn(&mut Client) -> bool + Send,
@@ -3176,7 +4504,7 @@ fn serve_until(
         });
         let report = handle.rt.block_on(distill::dispatch_serve(
             &handle.private,
-            provider,
+            &routes(provider),
             reasoner_config(),
             config,
             poll,
@@ -3195,15 +4523,11 @@ fn serve_until(
 }
 
 /// A resident `--distill-serve` subprocess on the live MiniMax lane (the same keys the rehearsal
-/// sets; the key reaches the child's environment only).
-fn live_serve_command(dsn: &str, key: &str) -> std::process::Command {
-    let mut cmd = distill_serve_command(dsn);
-    cmd.env("HUMAUX_PRIVATE_WORKER_CHAT_URL", ENDPOINT_REF)
-        .env("HUMAUX_PRIVATE_WORKER_DNS_PINS", live_minimax::dns_pins())
-        .env(
-            "HUMAUX_PRIVATE_WORKER_CREDENTIALS",
-            credentials_spec("MINIMAX_API_KEY"),
-        )
+/// sets; the key reaches the child's environment only). `credentials` maps the live tenants'
+/// references to `MINIMAX_API_KEY` ([`credentials_spec`]).
+fn live_serve_command(dsn: &str, key: &str, credentials: &str) -> std::process::Command {
+    let mut cmd = distill_serve_command(dsn, credentials);
+    cmd.env("HUMAUX_PRIVATE_WORKER_DNS_PINS", live_minimax::dns_pins())
         .env("MINIMAX_API_KEY", key)
         .env("HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS", "604800")
         .env(
@@ -3284,6 +4608,7 @@ fn distill_poison_live() {
             EGRESS_PROCESSOR_ID,
             ENDPOINT_REF,
             POISON_MODEL_ID,
+            &live_minimax::REHEARSAL_CAPABILITIES,
         )
         .expect("poison lane");
         let good_rows: Vec<Uuid> = (0..2)
@@ -3311,7 +4636,11 @@ fn distill_poison_live() {
             + f64::from(poison_config.max_attempts)
                 * (poison_config.http_timeout_seconds + poison_config.lease_seconds)
             + poison_config.lease_seconds;
-        let poison_provider = live_minimax::live_provider(key.clone(), POISON_MODEL_ID, http);
+        let poison_provider = Arc::new(live_minimax::live_provider(
+            key.clone(),
+            POISON_MODEL_ID,
+            http,
+        ));
         let phase_a = serve_until(
             &handle,
             &poison_provider,
@@ -3338,7 +4667,7 @@ fn distill_poison_live() {
         }
         let phase_b_bound = PER_GEN_CALL_BUDGET as f64 * good_config.http_timeout_seconds
             + good_config.lease_seconds;
-        let live = live_minimax::live_provider(key.clone(), MODEL_ID, http);
+        let live = Arc::new(live_minimax::live_provider(key.clone(), MODEL_ID, http));
         let phase_b = serve_until(
             &handle,
             &live,
@@ -3447,7 +4776,7 @@ fn distill_fairness_live() {
         }
         warm_binary();
         let http = Duration::from_secs(LIVE_HTTP_SECS);
-        let live = live_minimax::live_provider(key.clone(), MODEL_ID, http);
+        let live = Arc::new(live_minimax::live_provider(key.clone(), MODEL_ID, http));
         let new_tenant = |handle: &mut Handle, label: &str| {
             handle
                 .add_tenant(
@@ -3554,9 +4883,11 @@ fn distill_fairness_live() {
         }
         let m3_tenants: Vec<Uuid> = m3.iter().map(|i| handle.tenants[*i].tenant_id).collect();
         let worker_dsn = dsn_as_role(&handle.dsn, "role_private_worker");
+        let live_tenants = handle.tenant_ids();
+        let live_map = credentials_spec(&mut handle.admin, &live_tenants, "MINIMAX_API_KEY");
         let mut workers: Vec<std::process::Child> = (0..2)
             .map(|_| {
-                live_serve_command(&worker_dsn, &key)
+                live_serve_command(&worker_dsn, &key, &live_map)
                     .arg("--distill-serve")
                     .spawn()
                     .expect("spawn a live resident worker")
@@ -3647,7 +4978,9 @@ fn distill_fairness_live() {
                 .env("HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS", "50")
                 .arg("--distill-serve");
         };
-        let mut cmd = live_serve_command(&worker_dsn, &key);
+        let live_tenants = handle.tenant_ids();
+        let live_map = credentials_spec(&mut handle.admin, &live_tenants, "MINIMAX_API_KEY");
+        let mut cmd = live_serve_command(&worker_dsn, &key, &live_map);
         m5_env(&mut cmd);
         let mut victim = cmd.spawn().expect("spawn the kill -9 victim");
         let started = std::time::Instant::now();
@@ -3672,7 +5005,7 @@ fn distill_fairness_live() {
         signal(victim.id(), "KILL");
         let _ = victim.wait();
         let killed_at = std::time::Instant::now();
-        let mut cmd = live_serve_command(&worker_dsn, &key);
+        let mut cmd = live_serve_command(&worker_dsn, &key, &live_map);
         m5_env(&mut cmd);
         let mut survivor = cmd.spawn().expect("spawn the surviving worker");
         let (mut uncertain_with_slot, mut t6) = (false, None::<(Duration, f64, i32)>);
@@ -3998,19 +5331,26 @@ fn distill_channel_ab_live() {
         let mut finished = Vec::new();
         for (channel, capabilities) in [
             ("tool", &live_minimax::REHEARSAL_CAPABILITIES[..]),
-            ("content", &[ReasoningCapability::StructuredOutput][..]),
+            (
+                "content",
+                &[
+                    ReasoningCapability::Text,
+                    ReasoningCapability::StructuredOutput,
+                ][..],
+            ),
         ] {
             let idx = handle
-                .add_tenant(
+                .add_tenant_declaring(
                     &format!("private derived_dispatch_e2e live ab {channel}"),
                     Some(EGRESS_PROCESSOR_ID),
+                    capabilities,
                 )
                 .expect("live tenant");
             for text in &notes {
                 accept_evidence_marked(&mut handle, idx, text);
             }
             let tenants = vec![handle.tenants[idx].tenant_id];
-            let provider = RecordingProvider {
+            let provider = Arc::new(RecordingProvider {
                 inner: live_minimax::live_provider_declaring(
                     key.clone(),
                     MODEL_ID,
@@ -4019,7 +5359,7 @@ fn distill_channel_ab_live() {
                 ),
                 notes: notes.clone(),
                 calls: Mutex::new(Vec::new()),
-            };
+            });
             let served = serve_until(
                 &handle,
                 &provider,
@@ -4037,7 +5377,7 @@ fn distill_channel_ab_live() {
                 )
                 .expect("dead jobs")
                 .get(0);
-            let calls = provider.calls.into_inner().expect("calls");
+            let calls = std::mem::take(&mut *provider.calls.lock().expect("calls"));
             let mut first: Vec<Option<&RecordedCall>> = vec![None; AB_N];
             for call in &calls {
                 if let Some(n) = call.note

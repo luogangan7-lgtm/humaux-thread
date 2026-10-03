@@ -1,5 +1,5 @@
 //! `xtask::rls_check` — G80-26 (§48.2) runtime DB role invariant CI enumeration gate.
-//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.credential_pepper_state, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.distill_calls, ops.distill_tenant_scheduler, ops.email_delivery_events, ops.email_domains, ops.email_outbox, ops.email_provider_health, ops.email_suppressions, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.provider_arbiters, ops.provider_slots, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.schema_migrations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.api_key_rehash, control.assert_write_scope, control.credential_pepper_epoch, control.credential_pepper_epoch_advance, control.credential_pepper_epoch_close, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant, control.onboard_workspace, control.resolve_user_reasoning_admission, control.revoke_api_key, ops.admit_distill_budget, ops.begin_call, ops.claim_derived_work, ops.claim_derived_work_v2, ops.distill_slots_all_bound, ops.contribution_reservation_authority_validate, ops.distill_scheduler_admit, ops.finish_derived_work_v2, ops.renew_lease, ops.requeue_dead_distill, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal], PostgreSQL(role_gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_GATEWAY_PG_DSN, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
+//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.credential_pepper_state, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.distill_calls, ops.distill_tenant_scheduler, ops.email_delivery_events, ops.email_domains, ops.email_outbox, ops.email_provider_health, ops.email_suppressions, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.provider_arbiters, ops.provider_slots, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.schema_migrations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.api_key_rehash, control.assert_write_scope, control.attest_reasoning_route_health, control.bind_reasoning_domain, control.credential_pepper_epoch, control.credential_pepper_epoch_advance, control.credential_pepper_epoch_close, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.observe_reasoning_route_health, control.onboard_tenant, control.onboard_workspace, control.reasoning_credential_accounts, control.reasoning_profile_capabilities, control.reasoning_profile_request_extras, control.reasoning_route_health_state, control.reasoning_route_status, control.register_reasoning_profile, control.resolve_user_reasoning_admission, control.revoke_api_key, control.set_reasoning_profile_enabled, ops.admit_distill_budget, ops.begin_call, ops.claim_derived_work, ops.claim_derived_work_v2, ops.contribution_reservation_authority_validate, ops.distill_scheduler_admit, ops.distill_slots_all_bound, ops.finish_derived_work_v2, ops.renew_lease, ops.requeue_dead_distill, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal], PostgreSQL(role_gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_GATEWAY_PG_DSN, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
 //! Called-by: [xtask::dep_map, xtask::main]
 //! Invariants: [any catalog cell that disagrees with §48.2 / §62 grants is fail, named by role and table]
 //! Spec: Baseline §48.2; §62
@@ -2928,6 +2928,33 @@ const R3_PRIVATE_WORKER_FUNCTIONS: &[(&str, &[&str])] = &[
         &["role_private_worker", "role_consolidation_worker"],
     ),
     ("control.assert_write_scope(uuid,uuid)", &["role_gateway"]),
+    // ADR-0060 (0206, card 33b): the admitted profile's capabilities (D-A), the vendor identity
+    // behind credential references for the boot check (D-J), and the worker-observed health writer
+    // (ruling E3) — all private-worker-only.
+    (
+        "control.reasoning_profile_capabilities(uuid,bigint)",
+        &["role_private_worker"],
+    ),
+    (
+        "control.reasoning_credential_accounts(uuid[])",
+        &["role_private_worker"],
+    ),
+    (
+        "control.observe_reasoning_route_health(uuid,boolean,bigint)",
+        &["role_private_worker"],
+    ),
+    // ADR-0060 (0207, card 33b slice 3): the admitted profile's request extras (research
+    // amendment 1) and the stale/denied health verdict of a refused route (ruling E3 (c)).
+    // 0209 replaces the bodies of observe_reasoning_route_health and reasoning_route_health_state
+    // (same signatures); their EXECUTE sets stay exactly as listed here.
+    (
+        "control.reasoning_profile_request_extras(uuid,bigint)",
+        &["role_private_worker"],
+    ),
+    (
+        "control.reasoning_route_health_state(uuid,bigint)",
+        &["role_private_worker"],
+    ),
 ];
 
 fn check_r3_health_resolver_contract(
@@ -3910,6 +3937,47 @@ const ONBOARDING_FUNCTIONS: [&str; 8] = [
 const ONBOARDING_EXECUTORS: &[&str] = &["role_maintenance"];
 const WRITE_GATE_FN: &str = "projection.stream_checkpoints_workspace_write_gate()";
 
+/// ADR-0060 D-H (migration 0208, card 33b): the operator reasoning-route doors and their read-only
+/// status view, executable by `role_maintenance` only (the §4.2 operator-write role) — never by a
+/// worker, so no runtime role can mint, bind or attest its own route.
+const ROUTE_DOOR_FUNCTIONS: [&str; 5] = [
+    "control.register_reasoning_profile(uuid,uuid,text,text,text,text[],jsonb,bytea,text,text,text,uuid,uuid,uuid)",
+    "control.bind_reasoning_domain(uuid,uuid,text,uuid,bigint)",
+    "control.attest_reasoning_route_health(uuid,uuid,bigint,bigint)",
+    "control.set_reasoning_profile_enabled(uuid,uuid,bigint,boolean)",
+    "control.reasoning_route_status(uuid)",
+];
+
+/// ADR-0060 D-H (0208): each route door is owner-owned, SECURITY DEFINER,
+/// `search_path=pg_catalog`, EXECUTE held by exactly `role_maintenance`, PUBLIC revoked (same
+/// helper as [`ONBOARDING_FUNCTIONS`]). Missing ⇒ `not_applicable` naming the function (§57.1).
+pub fn check_reasoning_route_doors(client: &mut impl GenericClient) -> GateResult {
+    let check = "ADR-0060 reasoning route doors";
+    let missing: Vec<String> = match client.query(
+        "SELECT f FROM unnest($1::text[]) AS f WHERE to_regprocedure(f) IS NULL",
+        &[&ROUTE_DOOR_FUNCTIONS.to_vec()],
+    ) {
+        Ok(rows) => rows.iter().map(|r| r.get(0)).collect(),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    if !missing.is_empty() {
+        return not_applicable(check, format!("missing {}", missing.join(", ")));
+    }
+    let mut problems = Vec::new();
+    for function in ROUTE_DOOR_FUNCTIONS {
+        check_owner_definer_function(client, &mut problems, function, ONBOARDING_EXECUTORS);
+    }
+    if problems.is_empty() {
+        pass(
+            check,
+            "5 route doors (register / bind / attest-health / profile-state / status): owner \
+             SECURITY DEFINER, search_path pinned, EXECUTE exactly {role_maintenance}, PUBLIC revoked",
+        )
+    } else {
+        fail(check, problems.join("; "))
+    }
+}
+
 /// ADR-0053 (migrations 0185/0186, card 28): production onboarding's boundary.
 ///
 /// * the eight doors are owner-owned, SECURITY DEFINER, `search_path=pg_catalog`, EXECUTE held
@@ -4312,6 +4380,7 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_stream_point_ledger_boundary(&mut client));
             results.push(check_distill_dispatch_v2_boundary(&mut client));
             results.push(check_api_key_rehash_boundary(&mut client));
+            results.push(check_reasoning_route_doors(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -4334,6 +4403,7 @@ pub fn run(_args: &[String]) -> i32 {
                 "ADR-0053 onboarding doors and PROVISIONING write gate",
                 "ADR-0057 A2 point-ledger definer",
                 "ADR-0058 distill dispatch v2 boundary",
+                "ADR-0060 reasoning route doors",
             ] {
                 results.push(fail_for(name, &conn_err));
             }
@@ -5534,6 +5604,92 @@ mod tests {
         .into_iter()
         .map(|result| result.status)
         .collect()
+    }
+
+    /// ADR-0060 (0206) T30: each private-worker definer's EXECUTE set is exact. Faults (rolled
+    /// back): grant the capabilities definer to role_gateway, or the observed-health writer to
+    /// role_maintenance → the R3 boundary goes red naming the function and the role.
+    #[test]
+    fn reasoning_route_runtime_definers_are_private_worker_only() {
+        txn_or_skip!(client, txn);
+        let clean = check_r3_health_observation_boundary(&mut txn);
+        assert_eq!(clean.status, GateStatus::Pass, "{}", clean.detail);
+        for (signature, role) in [
+            (
+                "control.reasoning_profile_capabilities(uuid,bigint)",
+                "role_gateway",
+            ),
+            (
+                "control.observe_reasoning_route_health(uuid,boolean,bigint)",
+                "role_maintenance",
+            ),
+            (
+                "control.reasoning_credential_accounts(uuid[])",
+                "role_admin",
+            ),
+            (
+                "control.reasoning_profile_request_extras(uuid,bigint)",
+                "role_consolidation_worker",
+            ),
+            (
+                "control.reasoning_route_health_state(uuid,bigint)",
+                "role_gateway",
+            ),
+        ] {
+            txn.batch_execute(&format!(
+                "SAVEPOINT r3_definer_fault; GRANT EXECUTE ON FUNCTION {signature} TO {role}"
+            ))
+            .expect("fault grant");
+            let red = check_r3_health_observation_boundary(&mut txn);
+            assert_eq!(red.status, GateStatus::Fail, "{signature}: {}", red.detail);
+            assert!(
+                red.detail.contains(signature) && red.detail.contains(role),
+                "{}",
+                red.detail
+            );
+            txn.batch_execute("ROLLBACK TO SAVEPOINT r3_definer_fault")
+                .expect("restore");
+        }
+    }
+
+    /// ADR-0060 (0208) T30: the five route doors are role_maintenance-only. Faults (rolled back):
+    /// grant `bind_reasoning_domain` to role_private_worker, or revoke `register_reasoning_profile`
+    /// from role_maintenance → red naming the function and the role.
+    #[test]
+    fn reasoning_route_doors_are_maintenance_only() {
+        txn_or_skip!(client, txn);
+        let clean = check_reasoning_route_doors(&mut txn);
+        assert_eq!(clean.status, GateStatus::Pass, "{}", clean.detail);
+        for (fault, signature, role) in [
+            (
+                "GRANT EXECUTE ON FUNCTION {f} TO {r}",
+                ROUTE_DOOR_FUNCTIONS[1],
+                "role_private_worker",
+            ),
+            (
+                "REVOKE EXECUTE ON FUNCTION {f} FROM {r}",
+                ROUTE_DOOR_FUNCTIONS[0],
+                "role_maintenance",
+            ),
+            (
+                "GRANT EXECUTE ON FUNCTION {f} TO {r}",
+                ROUTE_DOOR_FUNCTIONS[4],
+                "role_gateway",
+            ),
+        ] {
+            let sql = fault.replace("{f}", signature).replace("{r}", role);
+            txn.batch_execute(&format!("SAVEPOINT route_door_fault; {sql}"))
+                .expect("fault");
+            let red = check_reasoning_route_doors(&mut txn);
+            assert_eq!(red.status, GateStatus::Fail, "{sql}: {}", red.detail);
+            assert!(
+                red.detail.contains(signature) && red.detail.contains(role),
+                "{}",
+                red.detail
+            );
+            txn.batch_execute("ROLLBACK TO SAVEPOINT route_door_fault")
+                .expect("restore");
+        }
     }
 
     /// R4 migration-origin coverage must not turn into a prefix deny-list or alter the

@@ -1,7 +1,7 @@
 //! `application::consolidate` — Phase 4 T4.6+T4.7: Consolidation worker orchestration (§11.6-11.9, G11-1/G80-29).
 //! Depends-on: crates=[async-trait, hex, humaux-domain, sha2, tokio, uuid]; services=[]; env=[];
 //!   modules=[domain::authority]
-//! Called-by: [adapters::consolidate_repo, adapters::consolidation_reasoner, adapters::contribution_entry_repo, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::distill_repo, adapters::model_call_ledger, adapters::private_inference_rpc, adapters::reasoning_route_admission, application::contribute, application::contribution_execution, consolidation-worker::inference_client, humaux-consolidation-worker, humaux-private-worker, private-worker::distill, private-worker::inference_rpc, tests]
+//! Called-by: [adapters::consolidate_repo, adapters::consolidation_reasoner, adapters::contribution_entry_repo, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::distill_repo, adapters::model_call_ledger, adapters::private_inference_rpc, adapters::reasoning_route_admission, adapters::reasoning_route_onboarding, application::contribute, application::contribution_execution, consolidation-worker::inference_client, humaux-consolidation-worker, humaux-private-worker, private-worker::distill, private-worker::inference_rpc, tests]
 //! Invariants: []
 //! Spec: §11.6; §3; §78.3; §11.2.1
 //!

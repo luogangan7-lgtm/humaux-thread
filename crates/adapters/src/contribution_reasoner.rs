@@ -4,13 +4,15 @@
 //! Called-by: [adapters::consolidation_reasoner, adapters::distill_reasoner, humaux-private-worker, private-worker::distill, private-worker::inference_rpc, private-worker::main, tests]
 //! Invariants: [private-worker only: source identifiers are reloaded and validated under the authenticated scope
 //!   before any outbound body is built; callers cannot inject private text; an existing reservation or failed
-//!   admission returns an error without a provider call]
-//! Spec: ADR-0058
+//!   admission returns an error without a provider call; the provider instance comes only from the admitted route
+//!   and must equal it (ADR-0060 D-B/D-C); no config field names a recipient, region or provider]
+//! Spec: ADR-0058; ADR-0060 D-B; ADR-0060 D-C; ADR-0060 D-E; ADR-0060 D-M
 //!
 //! This private-worker-only adapter owns the original source identifiers. It reloads and
 //! validates them under the authenticated scope before it ever builds an outbound body; callers
 //! cannot supply arbitrary private text to [`ContributionReasoner::infer`].
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -34,7 +36,7 @@ use humaux_application::{
 };
 use humaux_domain::{
     dataclass::{DataClass, join_data_class},
-    egress::{AuthorizedEgressPayload, EgressPermit, PrivateDataPurpose, ProcessorId, authorize},
+    egress::{AuthorizedEgressPayload, EgressPermit, PrivateDataPurpose, authorize},
     error::ErrorCode,
     evidence::payload_sha256,
     ids::{TenantId, UserId},
@@ -62,18 +64,18 @@ use crate::{
         self, FinalizeCall, ModelCallOutcome, ReasoningCallLookup, ReasoningReserveCall,
     },
     postgres::PrivateWorkerDbPool,
-    reasoning_route_admission::{ReasoningAdmissionLocator, resolve_user_reasoning_admission},
+    reasoning_route_admission::{
+        ProviderFor, ReasoningAdmissionLocator, resolve_user_reasoning_admission,
+    },
 };
 
 /// Deployment-owned inputs for one contribution de-identification call.
 ///
-/// No provider model, credentials, source bytes, or fallback key appears here: the trusted
-/// profile loader below supplies the former three, and the caller injects the provider itself.
+/// No provider, model, recipient, region, credential, source bytes or fallback key appears here:
+/// the admitted route names all of them, and the caller's [`ProviderFor`] maps that route to its
+/// provider instance (ADR-0060 D-B/D-C). The deployment's deny-only recipient and region lists
+/// live with that mapping, not here, so no config can select a recipient (§11.2.5).
 pub struct ContributionReasonerConfig {
-    /// Deployment deny-only allowlist. It can reject the admitted recipient but never select or
-    /// replace the resolver's `egress_processor_id`.
-    pub allowed_egress_processor_id: ProcessorId,
-    pub region: String,
     pub permit_ttl: Duration,
     pub deletion_capability: DeletionCapability,
     pub system_prompt: String,
@@ -84,8 +86,7 @@ pub struct ContributionReasonerConfig {
 impl ContributionReasonerConfig {
     /// Rejects an incomplete deployment configuration before any private DB read or egress.
     pub fn validate(&self) -> Result<(), ErrorCode> {
-        if self.region.trim().is_empty()
-            || self.permit_ttl.is_zero()
+        if self.permit_ttl.is_zero()
             || self.system_prompt.trim().is_empty()
             || self.json_schema.trim().is_empty()
             || self.max_output_tokens == 0
@@ -294,6 +295,9 @@ struct ReservedReasoningCall {
     tenant_id: Uuid,
     model_call_id: Uuid,
     disclosure_id: Uuid,
+    /// The admitted route and the instance [`provider_matches_admission`] proved equal to it.
+    admission: ReasoningAdmissionLocator,
+    provider: Arc<dyn UserReasoningProvider>,
     binding_id: humaux_application::consolidate::ReasoningRouteBindingId,
     binding_version: humaux_application::consolidate::ReasoningRouteBindingVersion,
     context: PrivateInferenceContext,
@@ -304,40 +308,51 @@ struct ReservedReasoningCall {
 pub struct ContributionReasoner<'a> {
     pool: &'a PrivateWorkerDbPool,
     legacy_request: Option<PrepareContribution>,
-    provider: &'a dyn UserReasoningProvider,
+    providers: &'a ProviderFor,
     config: ContributionReasonerConfig,
 }
 
 impl<'a> ContributionReasoner<'a> {
-    /// Binds a provider to an authenticated, identifier-only contribution request.
+    /// Binds the route→provider seam to an authenticated, identifier-only contribution request.
     pub fn new(
         pool: &'a PrivateWorkerDbPool,
         request: PrepareContribution,
-        provider: &'a dyn UserReasoningProvider,
+        providers: &'a ProviderFor,
         config: ContributionReasonerConfig,
     ) -> Result<Self, ErrorCode> {
         config.validate()?;
         Ok(Self {
             pool,
             legacy_request: Some(request),
-            provider,
+            providers,
             config,
         })
     }
 
-    /// Binds the R4 execution seam without caller-shaped contribution input.
+    /// Binds the R4 execution seam without caller-shaped contribution input. ADR-0060 D-E: each
+    /// stage obtains its instance from its own admitted route.
     pub fn new_for_execution(
         pool: &'a PrivateWorkerDbPool,
-        provider: &'a dyn UserReasoningProvider,
+        providers: &'a ProviderFor,
         config: ContributionReasonerConfig,
     ) -> Result<Self, ErrorCode> {
         config.validate()?;
         Ok(Self {
             pool,
             legacy_request: None,
-            provider,
+            providers,
             config,
         })
+    }
+
+    /// ADR-0060 D-B/D-C: the instance for an admitted route, proven equal to it.
+    fn provider_for(
+        &self,
+        admission: &ReasoningAdmissionLocator,
+    ) -> Result<Arc<dyn UserReasoningProvider>, &'static str> {
+        let provider = (self.providers)(admission)?;
+        provider_matches_admission(provider.as_ref(), admission)?;
+        Ok(provider)
     }
 
     fn legacy_request(&self) -> Result<&PrepareContribution, PrivateReasoningError> {
@@ -431,10 +446,6 @@ impl<'a> ContributionReasoner<'a> {
             return Err(ErrorCode::Conflict);
         }
 
-        let descriptor = self.provider.descriptor();
-        descriptor
-            .require_capability(ReasoningCapability::StructuredOutput)
-            .map_err(|_| ErrorCode::InvalidInput)?;
         let mut txn = self
             .pool
             .pool()
@@ -454,7 +465,11 @@ impl<'a> ContributionReasoner<'a> {
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?
         .ok_or(ErrorCode::Forbidden)?;
-        validate_admission(execution, &admission, self.provider, &self.config)?;
+        validate_admission(execution, &admission)?;
+        // ADR-0060 D-B/D-C: the instance comes from the admitted route only, after admission.
+        let provider = self
+            .provider_for(&admission)
+            .map_err(|_| ErrorCode::Conflict)?;
         let materialized = materialize_execution_sources(&mut txn, execution).await?;
         let data_class = join_data_class(materialized.classes);
         let user_prompt = structured_user_envelope(materialized.fragments, public_context)
@@ -469,7 +484,7 @@ impl<'a> ContributionReasoner<'a> {
         let (wire_payload, egress_permit) = authorize_structured_egress(
             execution.tenant_id,
             &admission,
-            descriptor,
+            provider.descriptor(),
             &request,
             data_class,
             self.config.permit_ttl,
@@ -503,6 +518,10 @@ impl<'a> ContributionReasoner<'a> {
             .contribution_attempt
             .ok_or(ErrorCode::Conflict)?;
         let reservation = dispatch_permit.reservation();
+        // ADR-0060 D-E: the same Profile@version yields the same instance it was prepared with.
+        let provider = self
+            .provider_for(&prepared.admission)
+            .map_err(|_| ErrorCode::Conflict)?;
         if binding.execution_id() != prepared.execution_id
             || binding.stage() != prepared.stage
             || binding.request_id() != attempt.logical_call_id
@@ -513,13 +532,12 @@ impl<'a> ContributionReasoner<'a> {
             || reservation.model_revision() != prepared.admission.model_revision.as_deref()
             || reservation.egress_processor_id() != Some(prepared.admission.egress_processor_id.0)
             || reservation.credential_ref() != Some(prepared.admission.credential_ref)
-            || !provider_matches_admission(self.provider, &prepared.admission, &self.config)
             || prepared.egress_permit.tenant_id() != TenantId(prepared.tenant_id)
             || prepared.egress_permit.processor() != prepared.admission.egress_processor_id
             || prepared.egress_permit.purpose() != PrivateDataPurpose::UserReasoning
             || prepared.egress_permit.data_class() != prepared.data_class
             || prepared.egress_permit.payload_sha256() != prepared.wire_payload.sha256()
-            || structured_request_body(self.provider.descriptor(), &prepared.request)
+            || structured_request_body(provider.descriptor(), &prepared.request)
                 != prepared.wire_payload.bytes()
         {
             return Err(ErrorCode::Conflict);
@@ -533,8 +551,7 @@ impl<'a> ContributionReasoner<'a> {
             binding.model_call_id().to_string(),
         )
         .map_err(|_| ErrorCode::Conflict)?;
-        let response = self
-            .provider
+        let response = provider
             .complete_structured(&context, prepared.request)
             .await;
         match response {
@@ -619,17 +636,10 @@ impl<'a> ContributionReasoner<'a> {
             return Err(fail("sealed contribution manifest is stale"));
         }
 
-        let descriptor = self.provider.descriptor();
-        if admission.tenant_id != request.authorization.tenant_id().0
-            || admission.egress_processor_id != self.config.allowed_egress_processor_id
-            || admission.processor_id != descriptor.provider_id
-            || admission.provider_model_id != descriptor.model_id
-            || self.provider.model_revision() != admission.model_revision.as_deref()
-            || admission.region != self.config.region
-            || self.provider.endpoint_ref() != admission.endpoint_ref
-        {
-            return Err(fail("configured provider does not match admitted route"));
+        if admission.tenant_id != request.authorization.tenant_id().0 {
+            return Err(fail("admitted route belongs to another tenant"));
         }
+        let provider = self.provider_for(&admission).map_err(fail)?;
 
         let user_id = self
             .legacy_request()?
@@ -654,7 +664,7 @@ impl<'a> ContributionReasoner<'a> {
         let (wire_payload, permit) = authorize_structured_egress(
             request.authorization.tenant_id().0,
             &admission,
-            descriptor,
+            provider.descriptor(),
             &provider_request,
             join_data_class(materialized.classes),
             self.config.permit_ttl,
@@ -703,6 +713,8 @@ impl<'a> ContributionReasoner<'a> {
             tenant_id: request.authorization.tenant_id().0,
             model_call_id: reserved.model_call_id,
             disclosure_id,
+            admission,
+            provider,
             binding_id: sealed.binding_id,
             binding_version: sealed.binding_version,
             context,
@@ -769,7 +781,7 @@ impl<'a> ContributionReasoner<'a> {
             )
             .await?;
         let (response, disclosure_outcome, model_outcome, finalize) = complete_structured_timed(
-            self.provider,
+            reserved.provider.as_ref(),
             &reserved.context,
             reserved.provider_request.clone(),
         )
@@ -782,7 +794,7 @@ impl<'a> ContributionReasoner<'a> {
                     "{}",
                     provider_failure_line(
                         ModelCallPurpose::ContributionDeidentify,
-                        reserved.tenant_id,
+                        &reserved.admission,
                         reserved.model_call_id,
                         &finalize,
                         &error,
@@ -920,10 +932,11 @@ pub(crate) async fn complete_structured_timed(
 /// class, the latency and the `model_call_id` to join on — so a timeout (`RETRY_WAIT` with
 /// latency ≈ the transport timeout), a 429/5xx (`RETRY_WAIT`, short) and a refusal
 /// (`PROVIDER_PERMANENT`) are told apart without a SQL session. Never the provider message: it
-/// may carry provider or user text.
+/// may carry provider or user text. ADR-0060 D-M: it names the route of the call (provider,
+/// model, Profile@version, Binding@version), so with several providers the line says which one.
 pub(crate) fn provider_failure_line(
     purpose: ModelCallPurpose,
-    tenant_id: Uuid,
+    route: &ReasoningAdmissionLocator,
     model_call_id: Uuid,
     finalize: &FinalizeCall,
     error: &ReasoningProviderError,
@@ -932,8 +945,10 @@ pub(crate) fn provider_failure_line(
         .latency_ms
         .map_or_else(|| "-".to_owned(), |ms| ms.to_string());
     format!(
-        "humaux-reasoning: provider call failed purpose={} tenant={tenant_id} model_call_id={model_call_id} error_class={} latency_ms={latency_ms}",
+        "humaux-reasoning: provider call failed purpose={} tenant={} {} model_call_id={model_call_id} error_class={} latency_ms={latency_ms}",
         purpose.as_db_str(),
+        route.tenant_id,
+        route.route_fields(),
         error.class()
     )
 }
@@ -1060,36 +1075,54 @@ async fn validate_execution_user_domain(
 fn validate_admission(
     execution: &ContributionExecutionRead,
     admission: &ReasoningAdmissionLocator,
-    provider: &dyn UserReasoningProvider,
-    config: &ContributionReasonerConfig,
 ) -> Result<(), ErrorCode> {
     if admission.tenant_id != execution.tenant_id
         || admission.binding_id.0 != execution.binding_id
         || admission.binding_version.0 != execution.binding_version
         || admission.reasoning_domain_id.0 != execution.reasoning_domain_id
         || admission.purpose != PrivateReasoningPurpose::ContributionDeidentify
-        || !provider_matches_admission(provider, admission, config)
     {
         return Err(ErrorCode::Conflict);
     }
     Ok(())
 }
 
+/// ADR-0060 D-C: the class of an instance that is not the one its admitted route names — a seam
+/// or cache bug, never a deployment choice.
+pub const ROUTE_PROVIDER_MISMATCH: &str = "ROUTE_PROVIDER_MISMATCH";
+/// ADR-0060 D-C: the admitted Profile@version does not declare `STRUCTURED_OUTPUT`.
+pub const PROFILE_LACKS_STRUCTURED_OUTPUT: &str = "PROFILE_LACKS_STRUCTURED_OUTPUT";
+
+/// ADR-0060 D-C: the instance that will send equals the admitted route on every axis it serves
+/// (provider, model, revision, endpoint, capability SET, request extras), and the route's own Profile@version
+/// declares structured output. The deployment's deny-only recipient / region lists are not here:
+/// they belong to the one production source of instances (D-B), which can refuse a route but
+/// never select one (§11.2.5).
 pub(crate) fn provider_matches_admission(
     provider: &dyn UserReasoningProvider,
     admission: &ReasoningAdmissionLocator,
-    config: &ContributionReasonerConfig,
-) -> bool {
+) -> Result<(), &'static str> {
     let descriptor = provider.descriptor();
-    admission.egress_processor_id == config.allowed_egress_processor_id
-        && admission.processor_id == descriptor.provider_id
-        && admission.provider_model_id == descriptor.model_id
-        && provider.model_revision() == admission.model_revision.as_deref()
-        && admission.region == config.region
-        && provider.endpoint_ref() == admission.endpoint_ref
-        && descriptor
-            .capabilities
-            .contains(&ReasoningCapability::StructuredOutput)
+    let declared: std::collections::BTreeSet<&str> =
+        descriptor.capabilities.iter().map(|c| c.as_str()).collect();
+    let admitted: std::collections::BTreeSet<&str> =
+        admission.capabilities.iter().map(|c| c.as_str()).collect();
+    if admission.processor_id != descriptor.provider_id
+        || admission.provider_model_id != descriptor.model_id
+        || provider.model_revision() != admission.model_revision.as_deref()
+        || provider.endpoint_ref() != admission.endpoint_ref
+        || declared != admitted
+        || descriptor.request_extras != admission.request_extras
+    {
+        return Err(ROUTE_PROVIDER_MISMATCH);
+    }
+    if !admission
+        .capabilities
+        .contains(&ReasoningCapability::StructuredOutput)
+    {
+        return Err(PROFILE_LACKS_STRUCTURED_OUTPUT);
+    }
+    Ok(())
 }
 
 fn execution_manifest_digest(sources: &[ContributionExecutionSource]) -> [u8; 32] {
@@ -1685,15 +1718,163 @@ pub(crate) fn fail(label: &'static str) -> PrivateReasoningError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::byok::{
+        ReasoningProviderDescriptor, StructuredReasoningResponse, VisionReasoningRequest,
+        VisionReasoningResponse,
+    };
+    use humaux_application::consolidate::{
+        ReasoningRouteBindingId as BindingId, ReasoningRouteBindingVersion as BindingVersion,
+    };
+    use humaux_domain::egress::ProcessorId;
 
-    /// ADR-0058 D-N — fault: drop `latency_ms=` (or the class / id) from the line.
+    /// One admitted route, every id distinct.
+    fn route() -> ReasoningAdmissionLocator {
+        ReasoningAdmissionLocator {
+            tenant_id: Uuid::from_u128(1),
+            binding_id: BindingId(Uuid::from_u128(3)),
+            binding_version: BindingVersion(2),
+            reasoning_domain_id: PrivateReasoningDomainId(Uuid::from_u128(4)),
+            purpose: PrivateReasoningPurpose::Distill,
+            route_policy_id: Uuid::from_u128(5),
+            route_policy_version: 1,
+            profile_id: Uuid::from_u128(6),
+            profile_version: 7,
+            provider_account_id: Uuid::from_u128(8),
+            processor_id: "vendor-a".to_owned(),
+            processor_model_id: Uuid::from_u128(9),
+            provider_model_id: "model-a".to_owned(),
+            model_revision: Some("rev-a".to_owned()),
+            provider_endpoint_id: Uuid::from_u128(10),
+            egress_processor_id: ProcessorId(Uuid::from_u128(11)),
+            endpoint_ref: "https://a.example/v1/chat/completions".to_owned(),
+            region: "region-a".to_owned(),
+            service_tier: "tier".to_owned(),
+            credential_ref: Uuid::from_u128(12),
+            billing_account_id: None,
+            billing_instrument_id: None,
+            provider_health_observation_id: 13,
+            account_health_observation_id: 14,
+            admitted_at: sqlx::types::time::OffsetDateTime::UNIX_EPOCH,
+            capabilities: vec![
+                ReasoningCapability::Text,
+                ReasoningCapability::StructuredOutput,
+                ReasoningCapability::ToolCalls,
+            ],
+            request_extras: serde_json::json!({"vendor_field": true})
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// A provider that only describes itself.
+    struct Described {
+        descriptor: ReasoningProviderDescriptor,
+        endpoint_ref: String,
+    }
+
+    #[async_trait]
+    impl UserReasoningProvider for Described {
+        fn descriptor(&self) -> &ReasoningProviderDescriptor {
+            &self.descriptor
+        }
+        fn endpoint_ref(&self) -> &str {
+            &self.endpoint_ref
+        }
+        fn model_revision(&self) -> Option<&str> {
+            self.descriptor.model_revision.as_deref()
+        }
+        async fn complete_structured(
+            &self,
+            _ctx: &crate::byok::PrivateInferenceContext,
+            _request: StructuredReasoningRequest,
+        ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
+            unreachable!("never called")
+        }
+        async fn analyze_vision(
+            &self,
+            _ctx: &crate::byok::PrivateInferenceContext,
+            _request: VisionReasoningRequest,
+        ) -> Result<VisionReasoningResponse, ReasoningProviderError> {
+            unreachable!("never called")
+        }
+    }
+
+    /// The instance built from `route` (capabilities in another order: a set, not a list).
+    fn built_from(route: &ReasoningAdmissionLocator) -> Described {
+        let mut capabilities = route.capabilities.clone();
+        capabilities.reverse();
+        Described {
+            descriptor: ReasoningProviderDescriptor {
+                provider_id: route.processor_id.clone(),
+                model_id: route.provider_model_id.clone(),
+                model_revision: route.model_revision.clone(),
+                capabilities,
+                custom_endpoint: Some(route.endpoint_ref.clone()),
+                request_extras: route.request_extras.clone(),
+            },
+            endpoint_ref: route.endpoint_ref.clone(),
+        }
+    }
+
+    /// T9 (ADR-0060 D-C) — fault: drop the capability-set comparison (the caps case is then Ok).
+    /// Each axis of the instance that differs from the admitted route is ROUTE_PROVIDER_MISMATCH; a
+    /// route whose Profile lacks STRUCTURED_OUTPUT is PROFILE_LACKS_STRUCTURED_OUTPUT.
     #[test]
-    fn provider_failure_line_names_class_latency_and_model_call_id() {
-        let tenant = Uuid::from_u128(1);
+    fn provider_matches_admission_compares_instance_to_route() {
+        let route = route();
+        assert_eq!(
+            provider_matches_admission(&built_from(&route), &route),
+            Ok(())
+        );
+        type Mutation = fn(&mut Described);
+        let cases: [(&str, Mutation); 7] = [
+            ("provider", |p| p.descriptor.provider_id = "vendor-b".into()),
+            ("model", |p| p.descriptor.model_id = "model-b".into()),
+            ("revision", |p| p.descriptor.model_revision = None),
+            ("endpoint", |p| {
+                p.endpoint_ref = "https://b.example/v1/chat/completions".into();
+            }),
+            ("caps narrower", |p| {
+                p.descriptor
+                    .capabilities
+                    .retain(|c| *c != ReasoningCapability::ToolCalls);
+            }),
+            ("caps wider", |p| {
+                p.descriptor
+                    .capabilities
+                    .push(ReasoningCapability::JsonObject);
+            }),
+            // Research amendment 1: the profile's vendor fields are part of the route.
+            ("request extras", |p| p.descriptor.request_extras.clear()),
+        ];
+        for (axis, mutate) in cases {
+            let mut instance = built_from(&route);
+            mutate(&mut instance);
+            assert_eq!(
+                provider_matches_admission(&instance, &route),
+                Err(ROUTE_PROVIDER_MISMATCH),
+                "{axis}"
+            );
+        }
+        let mut plain = route.clone();
+        plain.capabilities = vec![ReasoningCapability::Text];
+        assert_eq!(
+            provider_matches_admission(&built_from(&plain), &plain),
+            Err(PROFILE_LACKS_STRUCTURED_OUTPUT)
+        );
+    }
+
+    /// ADR-0058 D-N + T10 (ADR-0060 D-M) — fault: drop `profile=` (or the class / latency / id)
+    /// from the line.
+    #[test]
+    fn provider_failure_line_names_route_class_latency_and_model_call_id() {
+        let route = route();
+        let tenant = route.tenant_id;
         let call = Uuid::from_u128(2);
         let line = provider_failure_line(
             ModelCallPurpose::PrivateDistillText,
-            tenant,
+            &route,
             call,
             &FinalizeCall {
                 latency_ms: Some(120_004),
@@ -1704,7 +1885,8 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "humaux-reasoning: provider call failed purpose=PRIVATE_DISTILL_TEXT tenant={tenant} model_call_id={call} error_class=RETRY_WAIT latency_ms=120004"
+                "humaux-reasoning: provider call failed purpose=PRIVATE_DISTILL_TEXT tenant={tenant} provider=vendor-a model=model-a profile={}@7 binding={}@2 model_call_id={call} error_class=RETRY_WAIT latency_ms=120004",
+                route.profile_id, route.binding_id.0
             )
         );
         let secret = ReasoningProviderError::ProviderPermanent {
@@ -1712,7 +1894,7 @@ mod tests {
         };
         let line = provider_failure_line(
             ModelCallPurpose::PrivateConsolidate,
-            tenant,
+            &route,
             call,
             &FinalizeCall::default(),
             &secret,
@@ -1722,6 +1904,7 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("user text"), "never the provider message");
+        assert!(!line.contains(&route.endpoint_ref), "never the endpoint");
     }
 
     #[test]

@@ -261,6 +261,7 @@ fn descriptor() -> ReasoningProviderDescriptor {
         model_revision: None,
         capabilities: vec![ReasoningCapability::StructuredOutput],
         custom_endpoint: Some(MINIMAX_CHAT_URL.to_string()),
+        request_extras: Default::default(),
     }
 }
 

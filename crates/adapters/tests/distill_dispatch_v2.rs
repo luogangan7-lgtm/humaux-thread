@@ -1,5 +1,6 @@
-//! `adapters::tests::distill_dispatch_v2` — ADR-0058 T1–T23: the four distill dispatch definers (0190), the v1 claim's
-//!   distill refusal and the cutover block (0193), the tenant budget (0196) and the capability CHECKs (0195) against
+//! `adapters::tests::distill_dispatch_v2` — ADR-0058 T1–T23 + ADR-0060 T33: the four distill dispatch definers (0190), the
+//!   v1 claim's distill refusal and the cutover block (0193), the tenant budget (0196), the fair-share tenant order (0206)
+//!   and the capability CHECKs (0206) against
 //!   the real PostgreSQL, driven through `adapters::jobs` as role_private_worker.
 //! Depends-on: crates=[humaux-adapters, humaux-testkit, postgres, sqlx, tokio];
 //!   services=[PostgreSQL(owner) r=[control.processor_models, control.reasoning_profiles,
@@ -16,7 +17,7 @@
 //!   whole test, so the cross-tenant claim only ever serves this file's tenants; a fixture deletes its jobs (and
 //!   unbinds their slots) in one printed batch and its tenants in a separate best-effort batch; a missing DB is a
 //!   fixture error under HUMAUX_REQUIRE_DB=1, never a silent pass]
-//! Spec: Baseline §31; §61; §67.2; §11; §79.2; ADR-0058
+//! Spec: Baseline §31; §61; §67.2; §11; §79.2; ADR-0058; ADR-0060 D-F
 //!
 //! Each test names, in its doc, the fault that turns it red (ADR-0058 records the red→green runs).
 
@@ -1695,10 +1696,84 @@ fn a_claim_skips_a_slot_row_another_transaction_holds() {
     );
 }
 
+/// T33 — ADR-0060 D-F (supersedes ADR-0058 D-B's pure least-recently-served order): the tenant
+/// with READY work holding the FEWEST slots is claimed first, least recently served breaks ties,
+/// and a free slot never idles while any tenant has READY work.
+/// Fault: `ORDER BY t.last_served_turn, t.tenant_id` only (the 0193 body) → the sixth claim goes to
+/// B, which then holds 3 of the 4 slots.
+#[test]
+fn claim_prefers_tenant_holding_fewest_slots() {
+    run("claim_prefers_tenant_holding_fewest_slots", |mut h| {
+        let (a, b) = (h.tenant(), h.tenant());
+        for i in 0..10 {
+            h.seed(a, 100.0 - f64::from(i));
+            h.seed(b, 90.0 - f64::from(i));
+        }
+        for (t, turn) in [(a, -2i64), (b, -1)] {
+            h.admin
+                .execute(
+                    "UPDATE ops.distill_tenant_scheduler SET last_served_turn = $2 WHERE tenant_id = $1",
+                    &[&t, &turn],
+                )
+                .unwrap();
+        }
+        let held = |h: &mut Handle, tenant: Uuid| -> i64 {
+            h.admin
+                .query_one(
+                    "SELECT count(*) FROM ops.provider_slots s JOIN ops.jobs j ON j.job_id = s.job_id \
+                     WHERE j.tenant_id = $1",
+                    &[&tenant],
+                )
+                .expect("held slots")
+                .get(0)
+        };
+        let first: Vec<DistillClaim> = (0..4)
+            .map(|_| h.claim("c33b-t33").expect("four free slots"))
+            .collect();
+        assert_eq!(
+            first.iter().map(|c| c.tenant_id).collect::<Vec<_>>(),
+            vec![a, b, a, b],
+            "equal holdings: least recently served first"
+        );
+        for c in first.iter().filter(|c| c.tenant_id == a) {
+            assert!(h.finish(&DistillLease::of(c, "c33b-t33"), DistillFinish::Done, None));
+        }
+        let fifth = h.claim("c33b-t33").expect("two free slots");
+        let sixth = h.claim("c33b-t33").expect("one free slot");
+        assert_eq!(
+            (fifth.tenant_id, sixth.tenant_id),
+            (a, a),
+            "A holds fewer slots than B both times"
+        );
+        assert_eq!(
+            (held(&mut h, a), held(&mut h, b)),
+            (2, 2),
+            "fair share of 4"
+        );
+        // Work-conserving: with only A READY, A takes the slot B frees.
+        h.admin
+            .execute(
+                "DELETE FROM ops.jobs WHERE tenant_id = $1 AND status = 'PENDING'",
+                &[&b],
+            )
+            .expect("B has no READY work left");
+        let b_claim = first.iter().find(|c| c.tenant_id == b).expect("a B claim");
+        assert!(h.finish(
+            &DistillLease::of(b_claim, "c33b-t33"),
+            DistillFinish::Done,
+            None
+        ));
+        let seventh = h.claim("c33b-t33").expect("the freed slot");
+        assert_eq!(seventh.tenant_id, a);
+        assert_eq!(held(&mut h, a), 3, "no slot idles while A has READY work");
+        h.assert_i_slot();
+    });
+}
+
 /// T23 — §78.2 / ADR-0058 D-M (main-line ruling 2026-10-02 10:35, test 4): the three LIVE
-/// capability CHECKs (0048, 0128 x2, widened by 0195) hold exactly `ReasoningCapability::ALL`.
-/// Fault: skip 0195 (run against a database where it is not applied) → the CHECKs lack TOOL_CALLS
-/// and REASONING_SPLIT.
+/// capability CHECKs (0048, 0128 x2, widened by 0195 and 0206) hold exactly
+/// `ReasoningCapability::ALL`. Fault: skip 0206 (run against a database where it is not applied) →
+/// the CHECKs lack JSON_OBJECT (ADR-0060 research amendment 2).
 #[test]
 fn reasoning_capability_checks_match_the_rust_closed_set() {
     run(

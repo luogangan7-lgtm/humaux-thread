@@ -1,8 +1,9 @@
 //! `humaux-private-worker` — Bounded Phase 9 private contribution worker orchestration.
-//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, serde_json, sha2, uuid]; services=[]; env=[]; modules=[adapters::contribution_execution_ingress, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::contribution_scan, adapters::jobs, adapters::postgres, application::consolidate, application::contribute, application::contribution_execution, domain::error, domain::evidence]
-//! Called-by: [crate(humaux-consolidation-worker), tests]
-//! Invariants: []
-//! Spec: ADR-0012; ADR-0016
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, serde_json, sha2, uuid]; services=[PostgreSQL(role_private_worker)]; env=[]; modules=[adapters::byok, adapters::contribution_execution_ingress, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::contribution_scan, adapters::jobs, adapters::postgres, adapters::reasoning_route_admission, application::consolidate, application::contribute, application::contribution_execution, domain::error, domain::evidence]
+//! Called-by: [crate(humaux-consolidation-worker), private-worker::distill, private-worker::inference_rpc, tests]
+//! Invariants: [a routed call's health observation (ruling E3 (b)) is best effort: it is logged with a static class
+//!   and never fails or re-settles a job]
+//! Spec: ADR-0012; ADR-0016; ADR-0060 E3
 //!
 //! `pub mod inference_rpc` exists on this lib target (not only inside `src/main.rs`) for the
 //! same reason `bins/retrieval-worker/src/lib.rs` exports its own ADR-0012 `rpc` module:
@@ -10,6 +11,8 @@
 //! in-process against a temp UDS path rather than reimplementing (and drifting from) it.
 //! `pub mod distill` (ADR-0016) is the Evidence → MemoryRecord hop the binary's
 //! `--distill-once`/`--distill-serve` modes drive and `tests/distill_hop_e2e.rs` proves.
+//! `pub mod route_providers` (ADR-0060 D-B) is the one production source of provider instances,
+//! one per admitted Profile@version, shared by both modes.
 //!
 //! This library deliberately exposes one `run_once` operation rather than a resident loop. The
 //! binary's provider/config bootstrap remains deployment-owned; this module owns only the frozen
@@ -17,8 +20,10 @@
 
 pub mod distill;
 pub mod inference_rpc;
+pub mod route_providers;
 
 use humaux_adapters::{
+    byok::ReasoningProviderError,
     contribution_execution_ingress::{
         ContributionExecutionIngress, ContributionExecutionIngressError,
     },
@@ -34,6 +39,7 @@ use humaux_adapters::{
     contribution_scan::{ContributionScanOutcome, ContributionScanner},
     jobs::{self, ClaimedJob, JobStatus, JobsError},
     postgres::PrivateWorkerDbPool,
+    reasoning_route_admission,
 };
 use humaux_application::{
     consolidate::ContentSha256,
@@ -91,6 +97,9 @@ impl<'a> StartManualContributionCommand<'a> {
 pub struct ContributionExecutionRunnerConfig {
     pub lease_owner: String,
     pub lease_seconds: f64,
+    /// Ruling E3 (b): validity of a worker-observed health renewal
+    /// (`HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS`, the same value distill and consolidation use).
+    pub health_renew_seconds: i64,
 }
 
 impl ContributionExecutionRunnerConfig {
@@ -98,6 +107,7 @@ impl ContributionExecutionRunnerConfig {
         if self.lease_owner.trim().is_empty()
             || !self.lease_seconds.is_finite()
             || self.lease_seconds <= 0.0
+            || self.health_renew_seconds <= 0
         {
             return Err(ErrorCode::InvalidInput);
         }
@@ -322,15 +332,26 @@ impl<'a, 'provider> ContributionExecutionRunner<'a, 'provider> {
                     CoverageCompletionValue::FailedTerminal(failure),
                 )
                 .map_err(|_| ErrorCode::Conflict)?;
-                return self.complete_a(repo, &execution, lease, &completion).await;
+                return self
+                    .complete_a(repo, &execution, lease, &completion, None)
+                    .await;
             }
-            ContributionDispatchOutcome::NonTerminal { .. } => {
+            ContributionDispatchOutcome::NonTerminal { binding, error } => {
+                self.observe_rejected_key(&execution, binding.model_call_id(), &error)
+                    .await;
                 return self.reconcile(repo, &execution, lease).await;
             }
         };
         let completion = CoverageCompletion::try_new(reserved, completion_binding, value)
             .map_err(|_| ErrorCode::Conflict)?;
-        self.complete_a(repo, &execution, lease, &completion).await
+        self.complete_a(
+            repo,
+            &execution,
+            lease,
+            &completion,
+            Some(completion_binding.model_call_id()),
+        )
+        .await
     }
 
     async fn coverage_value(
@@ -379,9 +400,11 @@ impl<'a, 'provider> ContributionExecutionRunner<'a, 'provider> {
         execution: &ContributionExecutionRead,
         lease: &ContributionJobLease,
         completion: &CoverageCompletion,
+        answered_call: Option<Uuid>,
     ) -> Result<ContributionRunOnceReport, ContributionExecutionRunnerError> {
         let (state, late) =
             complete_a_live_or_late(repo, execution.tenant_id, completion, lease).await?;
+        self.observe_answered(execution, answered_call).await;
         if late {
             return Ok(ContributionRunOnceReport::LateCompleted {
                 execution_id: execution.execution_id,
@@ -452,15 +475,26 @@ impl<'a, 'provider> ContributionExecutionRunner<'a, 'provider> {
                     AssessmentCompletionValue::FailedTerminal(failure),
                 )
                 .map_err(|_| ErrorCode::Conflict)?;
-                return self.complete_b(repo, &execution, lease, &completion).await;
+                return self
+                    .complete_b(repo, &execution, lease, &completion, None)
+                    .await;
             }
-            ContributionDispatchOutcome::NonTerminal { .. } => {
+            ContributionDispatchOutcome::NonTerminal { binding, error } => {
+                self.observe_rejected_key(&execution, binding.model_call_id(), &error)
+                    .await;
                 return self.reconcile(repo, &execution, lease).await;
             }
         };
         let completion = AssessmentCompletion::try_new(reserved, completion_binding, value)
             .map_err(|_| ErrorCode::Conflict)?;
-        self.complete_b(repo, &execution, lease, &completion).await
+        self.complete_b(
+            repo,
+            &execution,
+            lease,
+            &completion,
+            Some(completion_binding.model_call_id()),
+        )
+        .await
     }
 
     async fn assessment_value(
@@ -520,9 +554,11 @@ impl<'a, 'provider> ContributionExecutionRunner<'a, 'provider> {
         execution: &ContributionExecutionRead,
         lease: &ContributionJobLease,
         completion: &AssessmentCompletion,
+        answered_call: Option<Uuid>,
     ) -> Result<ContributionRunOnceReport, ContributionExecutionRunnerError> {
         let (state, late) =
             complete_b_live_or_late(repo, execution.tenant_id, completion, lease).await?;
+        self.observe_answered(execution, answered_call).await;
         if late {
             return Ok(ContributionRunOnceReport::LateCompleted {
                 execution_id: execution.execution_id,
@@ -549,6 +585,45 @@ impl<'a, 'provider> ContributionExecutionRunner<'a, 'provider> {
             _ => Err(ContributionExecutionRunnerError::Invariant(
                 "B completion returned an impossible state",
             )),
+        }
+    }
+
+    /// Ruling E3 (b): a call the provider answered (its row now SUCCEEDED) keeps its route's health
+    /// alive, as distill and consolidation do.
+    async fn observe_answered(
+        &self,
+        execution: &ContributionExecutionRead,
+        answered_call: Option<Uuid>,
+    ) {
+        if let Some(model_call_id) = answered_call {
+            observe_route_health(
+                self.pool,
+                execution.tenant_id,
+                model_call_id,
+                false,
+                self.config.health_renew_seconds,
+            )
+            .await;
+        }
+    }
+
+    /// Ruling E3 (b): a key the provider refused (WAITING_KEY) denies the route's next admission
+    /// at once; the row stays RESERVED for reconciliation (0131, observed there per 0209).
+    async fn observe_rejected_key(
+        &self,
+        execution: &ContributionExecutionRead,
+        model_call_id: Uuid,
+        error: &ReasoningProviderError,
+    ) {
+        if error.class() == ReasoningProviderError::WAITING_KEY_CLASS {
+            observe_route_health(
+                self.pool,
+                execution.tenant_id,
+                model_call_id,
+                true,
+                self.config.health_renew_seconds,
+            )
+            .await;
         }
     }
 
@@ -683,6 +758,41 @@ fn parse_execution_id(
     ContributionExecutionId::try_from_uuid(id).map_err(Into::into)
 }
 
+/// Ruling E3 (b): records the route health one routed call observed through the owner definer —
+/// after a SUCCEEDED call a renewal (rate-limited by the definer), after a provider-refused key
+/// (`credential_rejected`) one INVALID account row. Best effort: a failure is logged with a static
+/// class and changes no settle — the next admission then sees the older observation (§11.2.5:
+/// stale health parks, it never admits). The one call shape for distill, the consolidation RPC and the
+/// contribution runner.
+pub async fn observe_route_health(
+    pool: &PrivateWorkerDbPool,
+    tenant_id: Uuid,
+    model_call_id: Uuid,
+    credential_rejected: bool,
+    valid_for_seconds: i64,
+) {
+    // dep: PostgreSQL(role_private_worker) — control.observe_reasoning_route_health (0206/0209, E3)
+    match reasoning_route_admission::observe_route_health(
+        pool,
+        tenant_id,
+        model_call_id,
+        credential_rejected,
+        valid_for_seconds,
+    )
+    .await
+    {
+        Ok((None, None)) => {}
+        Ok((provider, account)) => eprintln!(
+            "humaux-private-worker: route health observed tenant={tenant_id} model_call_id={model_call_id} credential_rejected={credential_rejected} provider_observation={} account_observation={}",
+            provider.map_or_else(|| "-".to_owned(), |id| id.to_string()),
+            account.map_or_else(|| "-".to_owned(), |id| id.to_string()),
+        ),
+        Err(_) => eprintln!(
+            "humaux-private-worker: route health observe failed tenant={tenant_id} model_call_id={model_call_id} class=WORKER_DB_ERROR"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +803,7 @@ mod tests {
             ContributionExecutionRunnerConfig {
                 lease_owner: "worker-a".into(),
                 lease_seconds: 30.0,
+                health_renew_seconds: 1800,
             }
             .validate()
             .is_ok()
@@ -701,6 +812,7 @@ mod tests {
             ContributionExecutionRunnerConfig {
                 lease_owner: " ".into(),
                 lease_seconds: 30.0,
+                health_renew_seconds: 1800,
             }
             .validate()
             .is_err()

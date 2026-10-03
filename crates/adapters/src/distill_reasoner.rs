@@ -6,26 +6,27 @@
 //!   finalize) with purpose Distill and the same model_call_ledger leg; no second provider path; any step failing
 //!   returns an error before memories are written; the HTTP cutoff cuts only the provider future, an answer that
 //!   arrived is always finalized (ADR-0058 D-J)]
-//! Spec: ADR-0042; §19.1; §7.4; ADR-0015; §10.1; ADR-0048; ADR-0058
+//! Spec: ADR-0042; §19.1; §7.4; ADR-0015; §10.1; ADR-0048; ADR-0058; ADR-0060 D-B; ADR-0060 D-C; ADR-0060 D-D;
+//!   ADR-0060 D-M; ADR-0060 D-N
 //!
 //! Contract half of the hop
 //! (`crate::distill_repo` is the SQL half; `bins/private-worker/src/distill.rs` drives both).
 //!
 //! Provider pipeline: exactly the `pub(crate)` steps `ContributionReasoner`/
-//! `ConsolidationReasoner` already share — admission resolver → `provider_matches_admission`
-//! → `authorize_structured_egress` → `disclosure::reserve_private` → `admitted_inference_context`
-//! → `complete_structured_timed` → `disclosure::finalize_private` — with purpose `Distill`.
-//! No second provider call path. Since card 20 (ADR-0042) the §19.1 ledger leg runs alongside
-//! the §7.4 disclosure leg through the SAME `model_call_ledger` registration point the
-//! retrieval and contribution hops use (`reserve_private_call`/`finalize_private_call`,
-//! purpose `PRIVATE_DISTILL_TEXT`): ADR-0015 D5's "ledger CHECKs are contribution-only" was
-//! the 0130 CHECK, which `migrations/0166` widened. A disclosure row says what left the
-//! boundary; only the ledger row says what it cost.
+//! `ConsolidationReasoner` already share — admission resolver → the admitted route's provider
+//! instance (`ProviderFor`, ADR-0060 D-B; never a process-level provider) → `provider_matches_admission`
+//! → `authorize_structured_egress` → `model_call_ledger::reserve_private_call_with_disclosure`
+//! → `admitted_inference_context` → `complete_structured_timed` → `disclosure::finalize_private`
+//! — with purpose `Distill`. No second provider call path. The §19.1 ledger row (carrying the
+//! admitted route, ADR-0060 D-I) and the §7.4 disclosure row are reserved in ONE transaction
+//! (ADR-0060 D-N, purpose `PRIVATE_DISTILL_TEXT`). A disclosure row says what left the
+//! boundary; only the ledger row says what it cost and on whose account.
 //!
 //! The contract is versioned + hashed ([`distill_prompt_contract`], v3 — RENDERED per §10.1
-//! origin ceiling (ADR-0048), per affect menu (ADR-0058 D-P) and per output channel (ADR-0058 D-M:
-//! one `emit_distillation` tool call when the provider descriptor declares `TOOL_CALLS`, else the
-//! v1 JSON content reply — chosen by [`distill_output_channel`], never by provider name)): its
+//! origin ceiling (ADR-0048), per affect menu (ADR-0058 D-P) and per output channel (ADR-0058 D-M,
+//! ADR-0060 D-D: one `emit_distillation` tool call when the admitted Profile declares `TOOL_CALLS`,
+//! else `response_format: json_object` for `JSON_OBJECT`, else the v1 JSON content reply — chosen
+//! by [`distill_output_channel`], never by provider name)): its
 //! sha256 is what
 //! `private.processing_runs.prompt_hash` stores and what `humaux_projection::fingerprint::
 //! source_hash` folds in, so a prompt/schema/budget edit moves every Distill run's
@@ -48,6 +49,7 @@ use humaux_domain::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::types::time::OffsetDateTime;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
@@ -65,7 +67,10 @@ use crate::{
     disclosure::{self, DisclosureOutcome, DisclosureSource},
     model_call_ledger::{self, FinalizeCall, ModelCallOutcome},
     postgres::PrivateWorkerDbPool,
-    reasoning_route_admission::{ReasoningAdmissionLocator, resolve_user_reasoning_admission},
+    reasoning_route_admission::{
+        ProviderFor, ReasoningAdmissionLocator, resolve_user_reasoning_admission,
+        route_health_refusal,
+    },
 };
 
 // ============================================================================
@@ -85,19 +90,21 @@ pub const DISTILL_PARSER_VERSION: &str = "3";
 /// ADR-0058 D-M: the one side-effect-free tool whose arguments are the Distill answer.
 pub const EMIT_DISTILLATION: &str = "emit_distillation";
 
-/// ADR-0058 D-M (main-line ruling 2026-10-02 10:35): the channel the Distill answer travels on is
-/// chosen from the provider descriptor's declared capabilities — the tool channel only for
-/// [`ReasoningCapability::ToolCalls`], otherwise the v1 content body every OpenAI-compatible chat
-/// endpoint accepts. The ADR-0048 parser validates both.
-// ponytail: two channels; add a `response_format: json_schema` channel behind a JSON_SCHEMA
+/// ADR-0058 D-M (main-line ruling 2026-10-02 10:35) and ADR-0060 research amendment 2: the
+/// channel the Distill answer travels on is chosen from the admitted Profile's declared
+/// capabilities, never from a provider name — the tool channel for
+/// [`ReasoningCapability::ToolCalls`], else `response_format: json_object` for
+/// [`ReasoningCapability::JsonObject`], else the v1 content body every OpenAI-compatible chat
+/// endpoint accepts. The ADR-0048 parser validates all three.
+// ponytail: three channels; add a `response_format: json_schema` channel behind a JSON_SCHEMA
 // capability when a bound provider needs it.
 #[must_use]
 pub fn distill_output_channel(descriptor: &ReasoningProviderDescriptor) -> OutputChannel {
-    if descriptor
-        .capabilities
-        .contains(&ReasoningCapability::ToolCalls)
-    {
+    let declares = |capability| descriptor.capabilities.contains(&capability);
+    if declares(ReasoningCapability::ToolCalls) {
         OutputChannel::Tool(EMIT_DISTILLATION)
+    } else if declares(ReasoningCapability::JsonObject) {
+        OutputChannel::JsonObject
     } else {
         OutputChannel::Content
     }
@@ -230,7 +237,7 @@ fn render_system_prompt(
                 " (7) answer ONLY through that one {name} call — its arguments are the JSON above, with no prose, no markdown fences and no extra keys."
             ),
         ),
-        OutputChannel::Content => (
+        OutputChannel::Content | OutputChannel::JsonObject => (
             "by replying with exactly".to_owned(),
             " (7) output JSON only — no prose, no markdown fences, no extra keys.".to_owned(),
         ),
@@ -343,7 +350,12 @@ pub fn distill_prompt_contract(
     hasher.update((ceiling_wire.len() as u64).to_be_bytes());
     hasher.update(ceiling_wire.as_bytes());
     hasher.update([u8::from(offer_affects)]);
-    hasher.update([u8::from(matches!(output, OutputChannel::Tool(_)))]);
+    // Content 0 and Tool 1 keep the hashes they had before JSON_OBJECT existed (ADR-0060).
+    hasher.update([match output {
+        OutputChannel::Content => 0_u8,
+        OutputChannel::Tool(_) => 1,
+        OutputChannel::JsonObject => 2,
+    }]);
     hasher.update((system_prompt.len() as u64).to_be_bytes());
     hasher.update(system_prompt.as_bytes());
     hasher.update((json_schema.len() as u64).to_be_bytes());
@@ -622,10 +634,22 @@ pub fn distill_user_envelope(
 /// The admitted route for one Distill pass — resolved once per claimed Evidence (the binding
 /// may rotate between rows). `user_id` is the reasoning domain's ACTIVE owner: the identity
 /// the §11.1 context carries for a headless call, same gate `ConsolidationReasoner` applies.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DistillAdmission {
     pub locator: ReasoningAdmissionLocator,
     pub owner_user_id: Uuid,
+    /// ADR-0060 D-B/D-C: the instance for this route, proven equal to it at admission.
+    pub provider: Arc<dyn UserReasoningProvider>,
+}
+
+impl DistillAdmission {
+    /// ADR-0060 D-D: the channel the admitted Profile answers on ([`distill_output_channel`]);
+    /// the worker fingerprints the processing run with the same contract [`DistillReasoner::prepare`]
+    /// sends.
+    #[must_use]
+    pub fn output_channel(&self) -> OutputChannel {
+        distill_output_channel(self.provider.descriptor())
+    }
 }
 
 /// Successful provider round trip: the raw reply bytes plus the §7.4 disclosure row id that is
@@ -676,40 +700,34 @@ pub fn distill_request(
     })
 }
 
-/// Private worker Distill reasoner: one provider + the deployment egress config.
+/// Private worker Distill reasoner: the route→provider seam + the deployment egress config.
 pub struct DistillReasoner<'a> {
     pool: &'a PrivateWorkerDbPool,
-    provider: &'a dyn UserReasoningProvider,
+    providers: &'a ProviderFor,
     config: ContributionReasonerConfig,
 }
 
 impl<'a> DistillReasoner<'a> {
-    /// Only `allowed_egress_processor_id` / `region` / `permit_ttl` / `deletion_capability` of
-    /// the config are used: prompt, schema and output budget come from
-    /// [`distill_prompt_contract`], never from deployment config.
+    /// Only `permit_ttl` / `deletion_capability` of the config are used: prompt, schema and output
+    /// budget come from [`distill_prompt_contract`], never from deployment config; the provider
+    /// comes from each job's admitted route through `providers` (ADR-0060 D-B).
     pub fn new(
         pool: &'a PrivateWorkerDbPool,
-        provider: &'a dyn UserReasoningProvider,
+        providers: &'a ProviderFor,
         config: ContributionReasonerConfig,
     ) -> Result<Self, ErrorCode> {
         config.validate()?;
         Ok(Self {
             pool,
-            provider,
+            providers,
             config,
         })
     }
 
-    /// The channel this reasoner's provider answers on ([`distill_output_channel`]); the worker
-    /// fingerprints the processing run with the same contract [`Self::prepare`] sends.
-    #[must_use]
-    pub fn output_channel(&self) -> OutputChannel {
-        distill_output_channel(self.provider.descriptor())
-    }
-
     /// Resolves the admitted Distill route inside the caller's tenant-pinned transaction:
-    /// ACTIVE domain owner → `resolve_user_reasoning_admission(purpose = Distill)` →
-    /// `provider_matches_admission`. Nothing leaves the worker here.
+    /// ACTIVE domain owner → `resolve_user_reasoning_admission(purpose = Distill)` → the route's
+    /// instance (`providers`, ADR-0060 D-B, asked only after admission, D-G) →
+    /// `provider_matches_admission` (D-C). Nothing leaves the worker here.
     pub async fn admit(
         &self,
         txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -718,10 +736,6 @@ impl<'a> DistillReasoner<'a> {
         binding_id: ReasoningRouteBindingId,
         binding_version: ReasoningRouteBindingVersion,
     ) -> Result<DistillAdmission, PrivateReasoningError> {
-        self.provider
-            .descriptor()
-            .require_capability(ReasoningCapability::StructuredOutput)
-            .map_err(|_| fail("provider lacks structured output"))?;
         let owner_user_id = domain_owner(txn, tenant_id, reasoning_domain_id).await?;
         let locator = resolve_user_reasoning_admission(
             txn,
@@ -731,17 +745,24 @@ impl<'a> DistillReasoner<'a> {
             PrivateReasoningPurpose::Distill,
         )
         .await
-        .map_err(|_| fail("reasoning admission resolver unavailable"))?
-        .ok_or_else(|| fail("reasoning route not admitted"))?;
-        if locator.tenant_id != tenant_id
-            || locator.purpose != PrivateReasoningPurpose::Distill
-            || !provider_matches_admission(self.provider, &locator, &self.config)
-        {
-            return Err(fail("configured provider does not match admitted route"));
+        .map_err(|_| fail("reasoning admission resolver unavailable"))?;
+        let Some(locator) = locator else {
+            // Ruling E3 (c): a route parked for its health is named as such (ROUTE_HEALTH_STALE /
+            // ROUTE_HEALTH_DENIED), never folded into the generic refusal.
+            let refusal = route_health_refusal(txn, binding_id, binding_version)
+                .await
+                .map_err(|_| fail("reasoning admission resolver unavailable"))?;
+            return Err(fail(refusal.unwrap_or("reasoning route not admitted")));
+        };
+        if locator.tenant_id != tenant_id || locator.purpose != PrivateReasoningPurpose::Distill {
+            return Err(fail("admitted route does not match the job"));
         }
+        let provider = (self.providers)(&locator).map_err(fail)?;
+        provider_matches_admission(provider.as_ref(), &locator).map_err(fail)?;
         Ok(DistillAdmission {
             locator,
             owner_user_id,
+            provider,
         })
     }
 
@@ -760,42 +781,32 @@ impl<'a> DistillReasoner<'a> {
         envelope: &DistillEnvelopeInput<'_>,
     ) -> Result<PreparedDistillCall, PrivateReasoningError> {
         let tenant_id = admission.locator.tenant_id;
-        let request = distill_request(self.provider.descriptor(), envelope)?;
+        let request = distill_request(admission.provider.descriptor(), envelope)?;
         let (wire_payload, permit) = authorize_structured_egress(
             tenant_id,
             &admission.locator,
-            self.provider.descriptor(),
+            admission.provider.descriptor(),
             &request,
             data_class,
             self.config.permit_ttl,
         )
         .map_err(|_| fail("egress authorization rejected"))?;
-        // §19.1 before §7.4, the same order `ContributionReasoner::resolve_and_reserve_reasoning_call`
-        // fixes: the cost row is reserved before any byte leaves, so a worker that dies between
-        // the two legs leaves an unfinalized ledger row (visible, auditable) rather than an
-        // egress with no cost trace at all.
+        // §19.1 + §7.4 in ONE transaction (ADR-0060 D-N, §11.2.5): the ledger row carries the
+        // admitted route and its disclosure names that row; the database refuses either alone, so
+        // nothing can leave without both.
         // ponytail: reservation and `ops.begin_call` are two transactions (ADR-0058 L13); a crash
-        // between them leaves a RESERVED row with no ops.distill_calls row. Upgrade: reserve inside
+        // between them leaves a RESERVED pair with no ops.distill_calls row. Upgrade: reserve inside
         // begin_call once model_call_ledger can take a caller transaction.
-        let reserved = model_call_ledger::reserve_private_call(
+        let (reserved, disclosure_id) = model_call_ledger::reserve_private_call_with_disclosure(
             self.pool,
-            &model_call_ledger::private_reserve_call(
-                ModelCallPurpose::PrivateDistillText,
-                &admission.locator,
-            ),
-        )
-        .await
-        .map_err(|_| fail("model call reservation failed"))?;
-        let disclosure_id = disclosure::reserve_private(
-            self.pool,
+            ModelCallPurpose::PrivateDistillText,
+            &admission.locator,
             &permit,
-            &admission.locator.region,
             &wire_payload,
-            None,
             &[DisclosureSource::Evidence(evidence_id)],
         )
         .await
-        .map_err(|_| fail("disclosure reservation failed"))?;
+        .map_err(|_| fail("model call reservation failed"))?;
         let context = admitted_inference_context(
             tenant_id,
             user_id,
@@ -811,6 +822,8 @@ impl<'a> DistillReasoner<'a> {
             tenant_id,
             context,
             request,
+            route: admission.locator.clone(),
+            provider: Arc::clone(&admission.provider),
         })
     }
 
@@ -829,8 +842,14 @@ impl<'a> DistillReasoner<'a> {
             tenant_id,
             context,
             request,
+            route,
+            provider,
         } = prepared;
-        let mut http = std::pin::pin!(complete_structured_timed(self.provider, &context, request));
+        let mut http = std::pin::pin!(complete_structured_timed(
+            provider.as_ref(),
+            &context,
+            request
+        ));
         let mut http_cutoff = std::pin::pin!(http_cutoff);
         let answered = std::future::poll_fn(|cx| {
             if let std::task::Poll::Ready(answer) = http.as_mut().poll(cx) {
@@ -880,7 +899,7 @@ impl<'a> DistillReasoner<'a> {
                     "{}",
                     provider_failure_line(
                         ModelCallPurpose::PrivateDistillText,
-                        tenant_id,
+                        &route,
                         model_call_id,
                         &finalize,
                         &error,
@@ -938,6 +957,9 @@ pub struct PreparedDistillCall {
     tenant_id: Uuid,
     context: PrivateInferenceContext,
     request: StructuredReasoningRequest,
+    /// The admitted route (ADR-0060 D-M: named in the failure line) and its instance (D-B).
+    route: ReasoningAdmissionLocator,
+    provider: Arc<dyn UserReasoningProvider>,
 }
 
 /// How one admitted request ended ([`DistillReasoner::call`]).
@@ -965,6 +987,7 @@ mod tests {
             model_revision: None,
             capabilities,
             custom_endpoint: None,
+            request_extras: Default::default(),
         }
     }
 
@@ -1019,6 +1042,54 @@ mod tests {
             )
             .sha256,
             "the channel moves the prompt hash"
+        );
+    }
+
+    /// ADR-0060 research amendment 2 — fault: fall through to the content channel for a
+    /// JSON_OBJECT profile (or prefer it over TOOL_CALLS). Order: TOOL_CALLS > JSON_OBJECT >
+    /// content, and the JSON_OBJECT contract hashes apart from the content one.
+    #[test]
+    fn json_object_is_the_channel_between_tool_calls_and_content() {
+        use crate::byok::structured_request_body;
+        let payload = serde_json::json!({"text": "I decided to ship on Friday."});
+        let envelope = DistillEnvelopeInput {
+            origin_class: "AuthenticatedAgent",
+            max_class: AuthorityClass::PrivateKnowledge,
+            occurred_at: None,
+            payload: &payload,
+            offer_affects: false,
+        };
+        let json = descriptor_with(vec![
+            ReasoningCapability::StructuredOutput,
+            ReasoningCapability::JsonObject,
+        ]);
+        let request = distill_request(&json, &envelope).expect("request");
+        assert_eq!(request.output, OutputChannel::JsonObject);
+        let body: Value =
+            serde_json::from_slice(&structured_request_body(&json, &request)).expect("json");
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert!(body.get("tools").is_none());
+        assert!(request.system_prompt.contains("output JSON only"));
+        let both = descriptor_with(vec![
+            ReasoningCapability::StructuredOutput,
+            ReasoningCapability::JsonObject,
+            ReasoningCapability::ToolCalls,
+        ]);
+        assert_eq!(distill_output_channel(&both), TOOL);
+        let content = distill_prompt_contract(
+            AuthorityClass::PrivateKnowledge,
+            false,
+            OutputChannel::Content,
+        );
+        let json_object = distill_prompt_contract(
+            AuthorityClass::PrivateKnowledge,
+            false,
+            OutputChannel::JsonObject,
+        );
+        assert_eq!(content.system_prompt, json_object.system_prompt);
+        assert_ne!(
+            content.sha256, json_object.sha256,
+            "the channel moves the hash"
         );
     }
     use humaux_domain::evidence::payload_sha256;

@@ -10,7 +10,7 @@
 //!   modules=[adapters::membership_repo, adapters::postgres, adapters::qdrant, adapters::retrieve, application::auth, domain::audit,
 //!   domain::identity, domain::ids, domain::ticket_family, infra-cell::permit, infra-cell::resource,
 //!   infra-cell::transport, projection::serving]
-//! Called-by: [adapters::role_hygiene, maintenance::main, tests, xtask::e2e_seed]
+//! Called-by: [adapters::reasoning_route_onboarding, adapters::role_hygiene, maintenance::main, tests, xtask::e2e_seed]
 //! Invariants: [every write goes through a 0186 / 0197 owner definer as role_maintenance, no table INSERT here; one transaction
 //!   per tenant (onboard_tenant installs the tenant GUC for the caller's transaction); the Qdrant probe runs outside any
 //!   transaction and the activation commits only if evaluate_switch accepts the DB-returned facts and the collection
@@ -73,7 +73,7 @@ type Txn<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
 /// §77 `AuditEvent` spellings for this path, defined once next to their only writer (§78.2).
 const AUDIT_ACTOR_TYPE: &str = "ADMIN";
-const AUDIT_RESULT_SUCCESS: &str = "SUCCESS";
+pub(crate) const AUDIT_RESULT_SUCCESS: &str = "SUCCESS";
 const AUDIT_RESULT_DENIED: &str = "DENIED";
 const AUDIT_RISK_TAG: &str = "onboarding";
 const AUDIT_ABSENT: &str = "";
@@ -316,7 +316,7 @@ fn family_triples() -> Vec<String> {
         .collect()
 }
 
-fn require_admin(admin: &AdminAction<'_>) -> Result<()> {
+pub(crate) fn require_admin(admin: &AdminAction<'_>) -> Result<()> {
     let complete = [
         admin.actor,
         admin.reason,
@@ -337,7 +337,7 @@ fn require_admin(admin: &AdminAction<'_>) -> Result<()> {
     }
 }
 
-async fn set_tenant(txn: &mut Txn<'_>, tenant_id: Uuid) -> Result<()> {
+pub(crate) async fn set_tenant(txn: &mut Txn<'_>, tenant_id: Uuid) -> Result<()> {
     sqlx::query("SELECT set_config('humaux.tenant_id', $1, true)")
         .bind(tenant_id.to_string())
         .execute(&mut **txn)
@@ -373,7 +373,7 @@ async fn audit(
 /// One §77 row through `control.audit_event_insert` (the only audit writer, 0161) — same shape
 /// as `membership_repo`'s rows; `(action, risk_tag)`. The tenant GUC must already be installed.
 #[allow(clippy::too_many_arguments)] // one audit row = these facts, in one place
-async fn audit_tagged(
+pub(crate) async fn audit_tagged(
     txn: &mut Txn<'_>,
     tenant_id: Uuid,
     (action, risk_tag): (&str, &str),
@@ -416,7 +416,7 @@ async fn audit_tagged(
 
 /// A refusal decided after its transaction rolled back still gets its `DENIED` row (§77 "全部
 /// 审计"), in a transaction of its own.
-async fn audit_denied(
+pub(crate) async fn audit_denied(
     pool: &MaintenanceDbPool,
     tenant_id: Uuid,
     (action, risk_tag): (&str, &str),

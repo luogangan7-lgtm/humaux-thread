@@ -8,7 +8,7 @@
 //!   only ever takes the outbox row of its own Evidence; every read runs under role_private_worker grants + RLS with the acting
 //!   user installed first; memory.confirm / memory.reject lock a candidate only inside the narrowed write scope
 //!   (its visibility against the scope's one workspace and user, ADR-0054)]
-//! Spec: Baseline §15.5; §14; ADR-0016; §6.1.1; ADR-0054; ADR-0058
+//! Spec: Baseline §15.5; §14; ADR-0016; §6.1.1; ADR-0054; ADR-0058; ADR-0060 D-K
 //!
 //! §15.5: one Evidence → 0/1/N `private.memory_records`; §14: the `ops.outbox` row remember wrote
 //! is the work item (PENDING → PROCESSING → DONE | FAILED, or back to PENDING when the attempt was
@@ -421,6 +421,11 @@ pub struct ProcessingRunStart<'a> {
     pub evidence_payload_sha256: Vec<Vec<u8>>,
     pub source_hash: &'a [u8],
     pub context_snapshot_seq: i64,
+    /// §11.2 / ADR-0060 D-K: the admitted Profile@version this run was shaped by (FK to
+    /// `control.reasoning_profiles`), so history names the route that produced it.
+    pub profile_id: Uuid,
+    /// See [`Self::profile_id`].
+    pub profile_version: i64,
 }
 
 /// One new `private.processing_runs` row (`started_at` = now, `completed_at` NULL).
@@ -433,8 +438,9 @@ pub async fn start_processing_run(
         "INSERT INTO private.processing_runs \
            (tenant_id, evidence_id, processor_kind, processor_version, model_provider, model_id, \
             model_revision, prompt_version, prompt_hash, parser_version, embedding_version, \
-            card_builder_version, evidence_payload_sha256, source_hash, context_snapshot_seq) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, $11, $12, $13) \
+            card_builder_version, evidence_payload_sha256, source_hash, context_snapshot_seq, \
+            profile_id, profile_version) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, $11, $12, $13, $14, $15) \
          RETURNING processing_run_id",
     )
     .bind(tenant_id)
@@ -450,6 +456,8 @@ pub async fn start_processing_run(
     .bind(&start.evidence_payload_sha256)
     .bind(start.source_hash)
     .bind(start.context_snapshot_seq)
+    .bind(start.profile_id)
+    .bind(start.profile_version)
     .fetch_one(&mut **txn)
     .await
 }

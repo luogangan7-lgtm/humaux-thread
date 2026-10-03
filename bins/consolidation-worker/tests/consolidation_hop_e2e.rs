@@ -19,8 +19,8 @@
 //!   UDS(serve)]; env=[HUMAUX_MINIMAX_DNS_PINS, HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY]; modules=[adapters::byok,
 //!   adapters::byok::ssrf, adapters::consolidate_repo, adapters::consolidation_reasoner,
 //!   adapters::contribution_reasoner, adapters::disclosure, adapters::postgres, adapters::private_inference_rpc,
-//!   application::consolidate, consolidation-worker::inference_client, domain::authority, domain::egress,
-//!   humaux-consolidation-worker, humaux-testkit, private-worker::inference_rpc]
+//!   adapters::reasoning_route_admission, application::consolidate, consolidation-worker::inference_client,
+//!   domain::authority, humaux-consolidation-worker, humaux-testkit, private-worker::inference_rpc]
 //! Called-by: [cargo-test]
 //! Invariants: [no key -> visible SKIP for the live-MiniMax tests only; no DB -> SKIP for all;
 //!   HUMAUX_REQUIRE_MINIMAX/HUMAUX_REQUIRE_DB turn either skip into a panic via skip_or_fail (ADR-0005)]
@@ -40,11 +40,14 @@
 //! `control.resolve_user_reasoning_admission` resolver — no admission shortcut.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use humaux_adapters::byok::{
     CredentialDecryptor, CredentialRef, OpenAiCompatibleProvider, PlaintextApiKey,
-    ReasoningCapability, ReasoningProviderDescriptor, ReasoningProviderError, ssrf,
+    PrivateInferenceContext, ReasoningCapability, ReasoningProviderDescriptor,
+    ReasoningProviderError, StructuredReasoningRequest, StructuredReasoningResponse, TokenUsage,
+    UserReasoningProvider, VisionReasoningRequest, VisionReasoningResponse, ssrf,
 };
 use humaux_adapters::consolidate_repo::{PublishOutcome, ROLLUP_TICKET_EVENT_TYPE};
 use humaux_adapters::consolidation_reasoner::MANIFEST_MISMATCH;
@@ -54,6 +57,7 @@ use humaux_adapters::postgres::{ConsolidationDbPool, PrivateWorkerDbPool};
 use humaux_adapters::private_inference_rpc::{
     ClaimOutcome, ConsolidationRegistrations, PrivateWorkerInferenceCalls, RegisterCall,
 };
+use humaux_adapters::reasoning_route_admission::{ProviderFor, ReasoningAdmissionLocator};
 use humaux_application::consolidate::{
     PrivateReasoningError, PrivateReasoningPort, PrivateReasoningPurpose, PrivateReasoningResult,
     ReasoningRouteBindingId, ReasoningRouteBindingVersion, SealedPrivateReasoningRequest,
@@ -61,7 +65,6 @@ use humaux_application::consolidate::{
 use humaux_consolidation_worker::inference_client::UdsInferenceClient;
 use humaux_consolidation_worker::{RunOnceError, build_rollup, run_once, run_once_bound};
 use humaux_domain::authority::AuthorityClass;
-use humaux_domain::egress::ProcessorId;
 use humaux_testkit::{ExternalDep, skip_or_fail};
 use postgres::{Client, NoTls};
 use tokio::net::{UnixListener, UnixStream};
@@ -70,10 +73,8 @@ use uuid::Uuid;
 const NAME: &str = "consolidation_hop_e2e";
 const MINIMAX_CHAT_URL: &str = "https://api.minimaxi.com/v1/chat/completions";
 const MINIMAX_MODEL: &str = "MiniMax-M3";
-/// One fixed egress processor id shared by the seeded `control.provider_endpoints` row and
-/// the private worker's deny-only allowlist (`ContributionReasonerConfig
-/// .allowed_egress_processor_id`) — the admission resolver and `provider_matches_admission`
-/// both compare it exactly.
+/// One fixed egress processor id on every seeded `control.provider_endpoints` row (the
+/// recipient the admitted route names, ADR-0060 D-L).
 const EGRESS_PROCESSOR_ID: Uuid = Uuid::from_u128(0x2001);
 const REGION: &str = "cn-shanghai";
 const SERVICE_TIER: &str = "standard";
@@ -145,15 +146,34 @@ fn descriptor() -> ReasoningProviderDescriptor {
         provider_id: "minimax".to_string(),
         model_id: MINIMAX_MODEL.to_string(),
         model_revision: None,
-        capabilities: vec![ReasoningCapability::StructuredOutput],
+        // ADR-0060 D-C: the seeded Profile's capability set exactly.
+        capabilities: vec![
+            ReasoningCapability::Text,
+            ReasoningCapability::StructuredOutput,
+        ],
         custom_endpoint: Some(MINIMAX_CHAT_URL.to_string()),
+        request_extras: Default::default(),
     }
+}
+
+/// ADR-0060 D-B: every admitted route goes to the one live provider over `key`.
+fn live_providers(key: String) -> Box<ProviderFor> {
+    let provider: Arc<dyn UserReasoningProvider> = Arc::new(
+        OpenAiCompatibleProvider::with_egress_transport(
+            descriptor(),
+            MINIMAX_CHAT_URL.to_string(),
+            Duration::from_secs(120),
+            EnvKeyDecryptor { key_material: key },
+            ssrf::CustomEndpointPolicy::default(),
+            live_dns_resolver(),
+        )
+        .expect("SSRF choke point must accept the endpoint (see live_dns_resolver / HUMAUX_MINIMAX_DNS_PINS)"),
+    );
+    Box::new(move |_: &ReasoningAdmissionLocator| Ok(Arc::clone(&provider)))
 }
 
 fn contribution_config() -> ContributionReasonerConfig {
     ContributionReasonerConfig {
-        allowed_egress_processor_id: ProcessorId(EGRESS_PROCESSOR_ID),
-        region: REGION.to_string(),
         permit_ttl: Duration::from_secs(30),
         deletion_capability: DeletionCapability::Unknown,
         // Contribution-path prompt config only; the Consolidate path takes prompt/schema/budget
@@ -188,22 +208,14 @@ async fn spawn_private_worker(
     socket_path: &std::path::Path,
     expected_consolidation_uid: u32,
     calls: PrivateWorkerDbPool,
-    key: String,
+    providers: Box<ProviderFor>,
 ) {
-    let provider = OpenAiCompatibleProvider::with_egress_transport(
-        descriptor(),
-        MINIMAX_CHAT_URL.to_string(),
-        Duration::from_secs(120),
-        EnvKeyDecryptor { key_material: key },
-        ssrf::CustomEndpointPolicy::default(),
-        live_dns_resolver(),
-    )
-    .expect("SSRF choke point must accept the endpoint (see live_dns_resolver / HUMAUX_MINIMAX_DNS_PINS)");
     let state = Arc::new(humaux_private_worker::inference_rpc::RpcState {
         expected_consolidation_uid,
         calls,
         config: contribution_config(),
-        provider: Box::new(provider),
+        providers,
+        health_renew_seconds: 1800,
     });
     // Same `bind_socket` + `serve` pair the binary's `--serve-rpc` mode runs — nothing here
     // reimplements the accept loop, so this harness proves the production listener.
@@ -225,6 +237,8 @@ struct Fixture {
     workspace_id: Uuid,
     binding_id: Uuid,
     binding_version: i64,
+    /// The Profile@1 the binding's one candidate names.
+    profile_id: Uuid,
 }
 
 impl Drop for Fixture {
@@ -409,7 +423,7 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
         .get(0);
     let profile: Uuid = admin
         .query_one(
-            "INSERT INTO control.reasoning_profiles(tenant_id,owner_user_id,provider_account_id,endpoint_id,processor_model_id,credential_ref,billing_account_id,default_billing_instrument_id,capabilities,processing_region) VALUES($1,$2,$3,$4,$5,$6,NULL,NULL,ARRAY['TEXT'],$7) RETURNING profile_id",
+            "INSERT INTO control.reasoning_profiles(tenant_id,owner_user_id,provider_account_id,endpoint_id,processor_model_id,credential_ref,billing_account_id,default_billing_instrument_id,capabilities,processing_region) VALUES($1,$2,$3,$4,$5,$6,NULL,NULL,ARRAY['TEXT','STRUCTURED_OUTPUT'],$7) RETURNING profile_id",
             &[&tenant_id, &user_id, &account, &endpoint, &processor_model_id, &credential, &REGION],
         )
         .expect("reasoning profile")
@@ -470,6 +484,7 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
         workspace_id,
         binding_id,
         binding_version: 1,
+        profile_id: profile,
     })
 }
 
@@ -574,6 +589,156 @@ fn call_ttl() -> Duration {
     Duration::from_secs(180)
 }
 
+/// Key-free provider whose descriptor is the seeded route's ([`descriptor`]): answers every
+/// request with one rollup citing both inputs, and counts its calls.
+struct RollupStub {
+    descriptor: ReasoningProviderDescriptor,
+    calls: AtomicUsize,
+}
+
+impl RollupStub {
+    fn new() -> Self {
+        Self {
+            descriptor: descriptor(),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl UserReasoningProvider for RollupStub {
+    fn descriptor(&self) -> &ReasoningProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn endpoint_ref(&self) -> &str {
+        MINIMAX_CHAT_URL
+    }
+
+    fn model_revision(&self) -> Option<&str> {
+        None
+    }
+
+    async fn complete_structured(
+        &self,
+        _ctx: &PrivateInferenceContext,
+        _request: StructuredReasoningRequest,
+    ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(StructuredReasoningResponse {
+            json: r#"{"content":"The user prefers Rust and health endpoints.","class":"UserPreference","sources":[1,2]}"#.to_owned(),
+            usage: TokenUsage::default(),
+            channel_fallback: false,
+        })
+    }
+
+    async fn analyze_vision(
+        &self,
+        _ctx: &PrivateInferenceContext,
+        _request: VisionReasoningRequest,
+    ) -> Result<VisionReasoningResponse, ReasoningProviderError> {
+        Err(ReasoningProviderError::UnsupportedCapability(
+            ReasoningCapability::Vision,
+        ))
+    }
+}
+
+/// T11 (ADR-0060 D-E) — fault: the RPC state memoises the first instance `providers` returned,
+/// so stub one serves both runs (calls 2 and 0). Two tenants, each bound to its own Profile, one
+/// private worker mapping each admitted Profile to its own stub: each run is served by its own
+/// stub exactly once, and each ledger row names the Profile of its run.
+#[test]
+fn t11_consolidation_uses_the_provider_of_its_admitted_route() {
+    let name = "t11_consolidation_uses_the_provider_of_its_admitted_route";
+    let Some(mut one) = setup_db(name) else {
+        return;
+    };
+    let Some(mut two) = setup_db(name) else {
+        return;
+    };
+    for f in [&mut one, &mut two] {
+        seed_workspace_memory(f, "The user prefers Rust for backend services.");
+        seed_workspace_memory(f, "New services expose a health endpoint first.");
+    }
+    let (stub_one, stub_two) = (Arc::new(RollupStub::new()), Arc::new(RollupStub::new()));
+    let (profile_one, profile_two) = (one.profile_id, two.profile_id);
+    let providers: Box<ProviderFor> = {
+        let (stub_one, stub_two) = (Arc::clone(&stub_one), Arc::clone(&stub_two));
+        Box::new(move |route: &ReasoningAdmissionLocator| {
+            if route.profile_id == profile_one {
+                Ok(Arc::clone(&stub_one) as Arc<dyn UserReasoningProvider>)
+            } else if route.profile_id == profile_two {
+                Ok(Arc::clone(&stub_two) as Arc<dyn UserReasoningProvider>)
+            } else {
+                Err("UNKNOWN_PROFILE")
+            }
+        })
+    };
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let outcomes = rt.block_on(async {
+        let uid = own_uid().await;
+        let socket_path = temp_socket_path("t11");
+        let private_pool =
+            // dep: PostgreSQL(role_private_worker) — role-scoped pool call
+            PrivateWorkerDbPool::connect(&dsn_as_role(&one.dsn, "role_private_worker"))
+                .await
+                .expect("private worker pool");
+        spawn_private_worker(&socket_path, uid, private_pool, providers).await;
+        let consolidation_pool =
+            // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
+            ConsolidationDbPool::connect(&dsn_as_role(&one.dsn, "role_consolidation_worker"))
+                .await
+                .expect("consolidation pool");
+        let mut outcomes = Vec::new();
+        for f in [&one, &two] {
+            outcomes.push(
+                run_once_bound(
+                    &consolidation_pool,
+                    |run_id| {
+                        UdsInferenceClient::new(
+                            &consolidation_pool,
+                            socket_path.to_string_lossy(),
+                            f.tenant_id,
+                            call_ttl(),
+                            call_ttl(),
+                            run_id,
+                        )
+                    },
+                    f.tenant_id,
+                    f.reasoning_domain_id,
+                    ReasoningRouteBindingId(f.binding_id),
+                    ReasoningRouteBindingVersion(f.binding_version),
+                    Some(f.workspace_id),
+                    10_000,
+                    build_rollup,
+                    None,
+                )
+                .await,
+            );
+        }
+        outcomes
+    });
+    for outcome in &outcomes {
+        assert!(
+            matches!(outcome, Ok(PublishOutcome::Published { .. })),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(stub_one.calls.load(Ordering::SeqCst), 1, "stub one");
+    assert_eq!(stub_two.calls.load(Ordering::SeqCst), 1, "stub two");
+    for f in [&mut one, &mut two] {
+        let rows = f
+            .admin
+            .query(
+                "SELECT profile_id FROM ops.model_call_ledger WHERE tenant_id = $1",
+                &[&f.tenant_id],
+            )
+            .expect("ledger rows");
+        let profiles: Vec<Option<Uuid>> = rows.iter().map(|row| row.get(0)).collect();
+        assert_eq!(profiles, vec![Some(f.profile_id)], "tenant {}", f.tenant_id);
+    }
+}
+
 /// (T1) Full positive path: real MiniMax provider through the real UDS RPC hop, real R3
 /// admission, WORKSPACE_SHARED inputs, workspace-scoped rollup + ticket.
 #[test]
@@ -608,7 +773,7 @@ fn t1_full_inference_hop_publishes_ticket() {
             PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker"))
                 .await
                 .expect("private worker pool");
-        spawn_private_worker(&socket_path, uid, private_pool, key).await;
+        spawn_private_worker(&socket_path, uid, private_pool, live_providers(key)).await;
 
         let consolidation_pool =
             // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
@@ -897,7 +1062,7 @@ fn t2_wrong_peer_uid_rejected_before_body() {
             &socket_path,
             uid.wrapping_add(1),
             private_pool,
-            String::new(),
+            live_providers(String::new()),
         )
         .await;
 
@@ -1125,7 +1290,7 @@ fn t5_manifest_mismatch_fails_closed_without_provider_call() {
             PrivateWorkerDbPool::connect(&dsn_as_role(&f.dsn, "role_private_worker"))
                 .await
                 .expect("private worker pool");
-        spawn_private_worker(&socket_path, uid, private_pool, key).await;
+        spawn_private_worker(&socket_path, uid, private_pool, live_providers(key)).await;
         let consolidation_pool =
             // dep: PostgreSQL(role_consolidation_worker) — role-scoped pool call
             ConsolidationDbPool::connect(&dsn_as_role(&f.dsn, "role_consolidation_worker"))

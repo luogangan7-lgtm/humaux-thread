@@ -3,12 +3,13 @@
 //!   pre-call cost estimate before the external provider call is made, `status='RESERVED'`; [`finalize_call`] fills
 //!   in the token/latency/actual-cost/ error columns and flips `status` to `SUCCEEDED`/`FAILED` after the call
 //!   returns.
-//! Depends-on: crates=[humaux-application, humaux-domain, sqlx]; services=[PostgreSQL(any) r=[control.provider_pricing_versions, ops.data_disclosures] w=[ops.model_call_ledger, ops.tenant_cost_events]]; env=[]; modules=[adapters::postgres, adapters::reasoning_route_admission, application::consolidate, domain::ledger]
+//! Depends-on: crates=[humaux-application, humaux-domain, sqlx]; services=[PostgreSQL(any) r=[control.provider_pricing_versions, ops.data_disclosures] w=[ops.model_call_ledger, ops.tenant_cost_events]]; env=[]; modules=[adapters::disclosure, adapters::postgres, adapters::reasoning_route_admission, application::consolidate, domain::egress, domain::ledger]
 //! Called-by: [adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::provider_budget, retrieval-provider::adapters, tests]
 //! Invariants: [every real provider call is bracketed by reserve_call/finalize_call (a skipped reserve leaves no row,
 //!   which the 0094 guard cannot see); costs are persisted as given, never computed here; a reservation conflict is a
-//!   typed error, not a second attempt identity]
-//! Spec: Baseline §19; §78.1; §20; §11.6; §11.7; §6.2.1; §6.2.2
+//!   typed error, not a second attempt identity; a private reasoning row carries its admitted route and is reserved
+//!   in ONE transaction with its disclosure (ADR-0060 D-I / D-N, enforced by the 0206 triggers)]
+//! Spec: Baseline §19; §78.1; §20; §11.2.4; §11.2.5; §11.5; §11.6; §11.7; §6.2.1; §6.2.2; ADR-0060 D-I, D-N
 //!
 //! Every
 //! caller that makes a real `EmbeddingProvider`/`RerankProvider` call (§19 Retrieval Provider
@@ -26,9 +27,9 @@
 //! number its caller already computed.
 //!
 //! Runtime roles: [`RetrievalWorkerDbPool`] for the §19/§20 retrieval hops and
-//! [`PrivateWorkerDbPool`] for the §11.6/§11.7 private reasoning hops ([`reserve_private_call`]/
-//! [`finalize_private_call`], card 20) — both reach the same `reserve_in_txn`/`finalize_in_txn`
-//! statements. (§6.2.1 `ops.* = R + W` domain default — this table
+//! [`PrivateWorkerDbPool`] for the §11.6/§11.7 private reasoning hops
+//! ([`reserve_private_call_with_disclosure`]/[`finalize_private_call`], card 20, ADR-0060 D-N) —
+//! both reach the same `reserve_in_txn`/`finalize_in_txn` statements. (§6.2.1 `ops.* = R + W` domain default — this table
 //! is not one of §6.2.2's named tables, same reasoning `disclosure.rs` documents for
 //! `ops.data_disclosures`). `control.provider_pricing_versions` is `control.* = R`-only for
 //! every runtime role (§6.2.1) — [`load_pricing_versions`] only ever `SELECT`s it.
@@ -36,12 +37,14 @@
 use humaux_application::consolidate::{
     ContributionReasoningCallKind, LogicalReasoningCallId, ReasoningIntentSha256,
 };
+use humaux_domain::egress::{AuthorizedEgressPayload, EgressPermit};
 use humaux_domain::ledger::ModelCallPurpose;
 use sqlx::Row;
 use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
 use crate::{
+    disclosure::{self, DisclosureError, DisclosureSource},
     postgres::{PrivateWorkerDbPool, RetrievalWorkerDbPool},
     reasoning_route_admission::ReasoningAdmissionLocator,
 };
@@ -55,11 +58,20 @@ const REASONING_REQUEST_ADVISORY_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(
 pub enum ModelCallLedgerError {
     Db(sqlx::Error),
     ReasoningReservationConflict,
+    /// ADR-0060 D-N: the disclosure half of a one-transaction private reservation failed; the
+    /// ledger row rolled back with it.
+    Disclosure(DisclosureError),
 }
 
 impl From<sqlx::Error> for ModelCallLedgerError {
     fn from(e: sqlx::Error) -> Self {
         Self::Db(e)
+    }
+}
+
+impl From<DisclosureError> for ModelCallLedgerError {
+    fn from(e: DisclosureError) -> Self {
+        Self::Disclosure(e)
     }
 }
 
@@ -70,6 +82,7 @@ impl std::fmt::Display for ModelCallLedgerError {
             Self::ReasoningReservationConflict => {
                 f.write_str("reasoning model-call reservation conflicts with durable state")
             }
+            Self::Disclosure(error) => write!(f, "private reservation disclosure failed: {error}"),
         }
     }
 }
@@ -337,9 +350,13 @@ async fn set_tenant_local(
     Ok(())
 }
 
+/// The one ledger INSERT. `route` is the admitted route of a private reasoning call (ADR-0060
+/// D-I: its 14 route columns, payer and billing ids), `None` for the retrieval plane, whose rows
+/// carry no reasoning column (0206 CHECK arm B).
 async fn reserve_in_txn(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     input: &ReserveCall,
+    route: Option<&ReasoningAdmissionLocator>,
 ) -> Result<ReservedCall, ModelCallLedgerError> {
     set_tenant_local(txn, input.tenant_id).await?;
     let request_id = input.request_id.unwrap_or_else(Uuid::now_v7);
@@ -347,8 +364,13 @@ async fn reserve_in_txn(
     let inserted = sqlx::query(
         "INSERT INTO ops.model_call_ledger \
            (request_id, tenant_id, workspace_id, purpose, provider, model, model_revision, \
-            estimated_cost) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+            estimated_cost, reasoning_domain_id, binding_id, binding_version, route_policy_id, \
+            route_policy_version, profile_id, profile_version, provider_account_id, \
+            provider_endpoint_id, egress_processor_id, credential_ref, billing_account_id, \
+            billing_instrument_id, provider_health_observation_id, account_health_observation_id, \
+            billing_responsibility, admitted_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
+                 $19, $20, $21, $22, $23, $24, $25) \
          ON CONFLICT (tenant_id, request_id) DO NOTHING \
          RETURNING model_call_id, request_id, called_at",
     )
@@ -360,6 +382,24 @@ async fn reserve_in_txn(
     .bind(&input.model)
     .bind(&input.model_revision)
     .bind(input.estimated_cost)
+    .bind(route.map(|r| r.reasoning_domain_id.0))
+    .bind(route.map(|r| r.binding_id.0))
+    .bind(route.map(|r| r.binding_version.0))
+    .bind(route.map(|r| r.route_policy_id))
+    .bind(route.map(|r| r.route_policy_version))
+    .bind(route.map(|r| r.profile_id))
+    .bind(route.map(|r| r.profile_version))
+    .bind(route.map(|r| r.provider_account_id))
+    .bind(route.map(|r| r.provider_endpoint_id))
+    .bind(route.map(|r| r.egress_processor_id.0))
+    .bind(route.map(|r| r.credential_ref))
+    .bind(route.and_then(|r| r.billing_account_id))
+    .bind(route.and_then(|r| r.billing_instrument_id))
+    .bind(route.map(|r| r.provider_health_observation_id))
+    .bind(route.map(|r| r.account_health_observation_id))
+    // §11.5 / ADR-0060 ruling E2: the account of the admitted credential pays.
+    .bind(route.map(|_| "USER"))
+    .bind(route.map(|r| r.admitted_at))
     .fetch_optional(&mut **txn)
     .await?;
 
@@ -399,26 +439,20 @@ pub async fn reserve_call(
 ) -> Result<ReservedCall, ModelCallLedgerError> {
     // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await?;
-    let reserved = reserve_in_txn(&mut txn, input).await?;
+    let reserved = reserve_in_txn(&mut txn, input, None).await?;
     txn.commit().await?;
     Ok(reserved)
 }
 
-/// One private-reasoning [`ReserveCall`] built from the admitted route — the single place the
-/// §11.6 distill and §11.7 consolidation hops turn a resolved route into a ledger reservation,
-/// so the two cannot drift on which columns a private row carries.
+/// The identity columns of one private-reasoning reservation, from the admitted route — the
+/// single place the §11.6 distill and §11.7 consolidation hops turn a resolved route into a ledger
+/// row, so the two cannot drift on which columns a private row carries.
 ///
-/// `workspace_id` is `None` (these hops are tenant-scoped background work, not a per-request
-/// write stream) and `estimated_cost` is `None` by construction: §19/§78.1 put cost arithmetic
-/// in `humaux_retrieval_provider::cost` against a `control.provider_pricing_versions` row, and
-/// the private reasoning models carry no pricing row — a fabricated 0 would be worse than the
-/// honest NULL (§23.3④ "禁止填 `0` … 充数"). Token usage still lands at finalize.
-///
-/// Every 0130 route column stays NULL: those belong to the USER-paid CONTRIBUTION_DEIDENTIFY
-/// arm of `model_call_ledger_reasoning_snapshot_shape`, and distill/consolidation are
-/// platform-paid. See `migrations/0166_model_call_ledger_private_purposes.sql`.
-#[must_use]
-pub fn private_reserve_call(
+/// `workspace_id` is `None` (tenant-scoped background work) and `estimated_cost` is `None`: §11.5
+/// BYOK rows carry no platform cost estimate (0206 CHECK arm C), and the private models carry no
+/// pricing row — a fabricated 0 would be worse than the honest NULL (§23.3④). Token usage still
+/// lands at finalize.
+fn private_reserve_call(
     purpose: ModelCallPurpose,
     locator: &ReasoningAdmissionLocator,
 ) -> ReserveCall {
@@ -434,25 +468,42 @@ pub fn private_reserve_call(
     }
 }
 
-/// §19.1 reserve() for the **private reasoning plane** (§11.6 distill, §11.7 consolidation) —
-/// the exact same `reserve_in_txn` INSERT [`reserve_call`] runs, reached with the pool role
-/// those hops actually hold. Two entry points, one registration point: the `PgPool` accessors
-/// on `postgres::*DbPool` are `pub(crate)` (G6-DB1 keeps the role a *type*, not a convention),
-/// so a per-role wrapper is the only way to share one write path across roles — exactly the
-/// split `disclosure::reserve_private`/`reserve_retrieval` already uses for `ops.data_disclosures`.
-///
-/// Before card 20 these hops had no ledger leg at all (`distill_reasoner.rs`/
-/// `consolidation_reasoner.rs` module docs both recorded the absence), so the two most
-/// expensive paths in the system produced a §7.4 disclosure receipt and no cost row anywhere.
-pub async fn reserve_private_call(
+/// §19.1 + §7.4 reserve() for the **private reasoning plane** (§11.6 distill, §11.7
+/// consolidation): the ledger row (carrying `locator`, the admitted route, ADR-0060 D-I) and its
+/// `USER_REASONING` disclosure (`model_call_id` = that row) in ONE transaction (ADR-0060 D-N,
+/// §11.2.5). The database checks the rest at INSERT and COMMIT: the row equals a current exact
+/// admission (`ops.reasoning_model_call_validate`), the disclosure's processor is the row's egress
+/// id (`ops.data_disclosure_reasoning_model_call_validate`), and the row never commits without
+/// that disclosure (`model_call_ledger_private_disclosure_present`). Any refusal rolls both back,
+/// so no `ops.begin_call` and no provider call can follow. Returns the reservation and the
+/// disclosure id.
+pub async fn reserve_private_call_with_disclosure(
     pool: &PrivateWorkerDbPool,
-    input: &ReserveCall,
-) -> Result<ReservedCall, ModelCallLedgerError> {
-    // dep: PostgreSQL(any) — opens a PostgreSQL transaction
+    purpose: ModelCallPurpose,
+    locator: &ReasoningAdmissionLocator,
+    permit: &EgressPermit,
+    payload: &AuthorizedEgressPayload,
+    sources: &[DisclosureSource],
+) -> Result<(ReservedCall, Uuid), ModelCallLedgerError> {
+    // dep: PostgreSQL(any) — one transaction: ledger INSERT, disclosure INSERT, deferred check at COMMIT
     let mut txn = pool.pool().begin().await?;
-    let reserved = reserve_in_txn(&mut txn, input).await?;
+    let reserved = reserve_in_txn(
+        &mut txn,
+        &private_reserve_call(purpose, locator),
+        Some(locator),
+    )
+    .await?;
+    let disclosure_id = disclosure::reserve_reasoning_in_txn(
+        &mut txn,
+        reserved.model_call_id,
+        permit,
+        &locator.region,
+        payload,
+        sources,
+    )
+    .await?;
     txn.commit().await?;
-    Ok(reserved)
+    Ok((reserved, disclosure_id))
 }
 
 /// [`finalize_call`]'s input — the outcome columns only known after the external call
@@ -565,7 +616,7 @@ pub async fn finalize_call(
 }
 
 /// §19.1 finalize() for the private reasoning plane — [`finalize_call`]'s statement, reached
-/// with `role_private_worker`. See [`reserve_private_call`] for why the pair exists.
+/// with `role_private_worker`; the reserve half is [`reserve_private_call_with_disclosure`].
 ///
 /// A failed provider call finalizes here too (`ModelCallOutcome::Failed` + `error_class`):
 /// card 20's acceptance is explicit that a failure must leave a ledger row *recording the

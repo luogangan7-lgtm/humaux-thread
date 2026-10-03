@@ -4,8 +4,9 @@
 //!   control.private_reasoning_domains, control.user_reasoning_profiles, ops.data_disclosures, ops.model_call_ledger,
 //!   ops.reasoning_provider_health_observations] x=[control.resolve_user_reasoning_admission]];
 //!   env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::byok, adapters::contribution_entry_repo,
-//!   adapters::contribution_reasoner, adapters::disclosure, adapters::tests::support::contribution_fixture,
-//!   application::consolidate, application::contribute, domain::egress, domain::error]
+//!   adapters::contribution_reasoner, adapters::disclosure, adapters::reasoning_route_admission,
+//!   adapters::tests::support::contribution_fixture, application::consolidate, application::contribute,
+//!   domain::error]
 //! Called-by: [cargo-test]
 //! Invariants: [uses a recording provider (no user key, no network) over the real private pool and disclosure ledger;
 //!   a failed admission or wrong binding leaves no ledger/disclosure side effect; PG cases are #[ignore] lane tests]
@@ -17,7 +18,10 @@
 #[path = "support/contribution_fixture.rs"]
 mod contribution_fixture;
 
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use contribution_fixture::ContributionFixture as Fixture;
@@ -31,6 +35,7 @@ use humaux_adapters::{
     contribution_entry_repo::ContributionEntryRepo,
     contribution_reasoner::{ContributionReasoner, ContributionReasonerConfig},
     disclosure::DeletionCapability,
+    reasoning_route_admission::ReasoningAdmissionLocator,
 };
 use humaux_application::{
     consolidate::{
@@ -39,16 +44,34 @@ use humaux_application::{
     },
     contribute::ContributionCandidatePort,
 };
-use humaux_domain::{egress::ProcessorId, error::ErrorCode};
+use humaux_domain::error::ErrorCode;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-fn config(allowed_egress_processor_id: Uuid) -> ContributionReasonerConfig {
+/// ADR-0060 D-B: every admitted route goes to `provider` unless its recipient is not `allowed` —
+/// the deny-only recipient check the private worker's route mapping holds (it can refuse a route,
+/// never select one, §11.2.5).
+fn serving(
+    provider: &Arc<RecordingProvider>,
+    allowed: Uuid,
+) -> impl Fn(&ReasoningAdmissionLocator) -> Result<Arc<dyn UserReasoningProvider>, &'static str>
++ Send
++ Sync
++ use<> {
+    let provider = Arc::clone(provider);
+    move |route| {
+        if route.egress_processor_id.0 == allowed {
+            Ok(Arc::clone(&provider) as Arc<dyn UserReasoningProvider>)
+        } else {
+            Err("EGRESS_PROCESSOR_NOT_ALLOWED")
+        }
+    }
+}
+
+fn config() -> ContributionReasonerConfig {
     ContributionReasonerConfig {
-        allowed_egress_processor_id: ProcessorId(allowed_egress_processor_id),
-        region: "test-region".into(),
         permit_ttl: Duration::from_secs(30),
         deletion_capability: DeletionCapability::Unknown,
         system_prompt: "Remove personal identifiers and return JSON.".into(),
@@ -151,6 +174,7 @@ impl RecordingProvider {
                     ReasoningCapability::StructuredOutput,
                 ],
                 custom_endpoint: None,
+                request_extras: Default::default(),
             },
             endpoint_ref: "https://reasoning.invalid/v1/chat/completions".into(),
             calls: Mutex::new(Vec::new()),
@@ -258,10 +282,7 @@ impl UserReasoningProvider for RecordingProvider {
 
 #[test]
 fn incomplete_configuration_fails_before_private_read_or_egress() {
-    let mut missing = config(Uuid::new_v4());
-    missing.region.clear();
-    assert_eq!(missing.validate(), Err(ErrorCode::InvalidInput));
-    let mut zero_timeout = config(Uuid::new_v4());
+    let mut zero_timeout = config();
     zero_timeout.permit_ttl = Duration::ZERO;
     assert_eq!(zero_timeout.validate(), Err(ErrorCode::InvalidInput));
 }
@@ -277,14 +298,10 @@ fn legacy_infer_without_canonical_coverage_is_rejected_without_side_effects() {
         .block_on(ContributionEntryRepo::new(&fixture.private).load_preparation(&request))
         .expect("fresh preparation");
     let before = reasoning_side_effect_counts(&mut fixture);
-    let provider = RecordingProvider::new("offline-fixture", "offline-fixture");
-    let reasoner = ContributionReasoner::new(
-        &fixture.private,
-        request,
-        &provider,
-        config(fixture.egress_processor),
-    )
-    .expect("reasoner");
+    let provider = Arc::new(RecordingProvider::new("offline-fixture", "offline-fixture"));
+    let provider_routes = serving(&provider, fixture.egress_processor);
+    let reasoner = ContributionReasoner::new(&fixture.private, request, &provider_routes, config())
+        .expect("reasoner");
     assert!(
         fixture
             .rt
@@ -318,14 +335,10 @@ fn nil_logical_call_is_rejected_without_side_effects() {
         None,
     );
     let before = reasoning_side_effect_counts(&mut fixture);
-    let provider = RecordingProvider::new("offline-fixture", "offline-fixture");
-    let reasoner = ContributionReasoner::new(
-        &fixture.private,
-        request,
-        &provider,
-        config(fixture.egress_processor),
-    )
-    .expect("reasoner");
+    let provider = Arc::new(RecordingProvider::new("offline-fixture", "offline-fixture"));
+    let provider_routes = serving(&provider, fixture.egress_processor);
+    let reasoner = ContributionReasoner::new(&fixture.private, request, &provider_routes, config())
+        .expect("reasoner");
     assert!(
         fixture
             .rt
@@ -387,19 +400,23 @@ fn endpoint_revision_descriptor_or_allowlist_mismatch_has_zero_side_effects() {
     let mut fixture = Fixture::new();
     let before = reasoning_side_effect_counts(&mut fixture);
 
-    let mut endpoint_provider = RecordingProvider::new("offline-fixture", "offline-fixture");
-    endpoint_provider.endpoint_ref.push('/');
+    let endpoint_provider = Arc::new({
+        let mut provider = RecordingProvider::new("offline-fixture", "offline-fixture");
+        provider.endpoint_ref.push('/');
+        provider
+    });
     let request = fresh_request(&fixture);
     let snapshot = fixture
         .rt
         .block_on(ContributionEntryRepo::new(&fixture.private).load_preparation(&request))
         .expect("fresh preparation");
     let sealed = coverage_probe_call(snapshot.reasoning, &request);
+    let endpoint_provider_routes = serving(&endpoint_provider, fixture.egress_processor);
     let reasoner = ContributionReasoner::new(
         &fixture.private,
         request,
-        &endpoint_provider,
-        config(fixture.egress_processor),
+        &endpoint_provider_routes,
+        config(),
     )
     .expect("endpoint mismatch reasoner");
     assert!(
@@ -418,19 +435,23 @@ fn endpoint_revision_descriptor_or_allowlist_mismatch_has_zero_side_effects() {
     );
     assert_eq!(reasoning_side_effect_counts(&mut fixture), before);
 
-    let mut revision_provider = RecordingProvider::new("offline-fixture", "offline-fixture");
-    revision_provider.descriptor.model_revision = Some("unexpected-revision".into());
+    let revision_provider = Arc::new({
+        let mut provider = RecordingProvider::new("offline-fixture", "offline-fixture");
+        provider.descriptor.model_revision = Some("unexpected-revision".into());
+        provider
+    });
     let request = fresh_request(&fixture);
     let snapshot = fixture
         .rt
         .block_on(ContributionEntryRepo::new(&fixture.private).load_preparation(&request))
         .expect("fresh preparation");
     let sealed = coverage_probe_call(snapshot.reasoning, &request);
+    let revision_provider_routes = serving(&revision_provider, fixture.egress_processor);
     let reasoner = ContributionReasoner::new(
         &fixture.private,
         request,
-        &revision_provider,
-        config(fixture.egress_processor),
+        &revision_provider_routes,
+        config(),
     )
     .expect("revision mismatch reasoner");
     assert!(
@@ -449,16 +470,16 @@ fn endpoint_revision_descriptor_or_allowlist_mismatch_has_zero_side_effects() {
     );
     assert_eq!(reasoning_side_effect_counts(&mut fixture), before);
 
-    let provider = RecordingProvider::new("offline-fixture", "offline-fixture");
+    let provider = Arc::new(RecordingProvider::new("offline-fixture", "offline-fixture"));
     let request = fresh_request(&fixture);
     let snapshot = fixture
         .rt
         .block_on(ContributionEntryRepo::new(&fixture.private).load_preparation(&request))
         .expect("fresh preparation");
     let sealed = coverage_probe_call(snapshot.reasoning, &request);
-    let reasoner =
-        ContributionReasoner::new(&fixture.private, request, &provider, config(Uuid::new_v4()))
-            .expect("allowlist mismatch reasoner");
+    let provider_routes = serving(&provider, Uuid::new_v4());
+    let reasoner = ContributionReasoner::new(&fixture.private, request, &provider_routes, config())
+        .expect("allowlist mismatch reasoner");
     assert!(
         fixture
             .rt
@@ -505,12 +526,13 @@ fn matching_reserved_retry_returns_original_model_call_without_dispatch_or_readm
     let model_call_id = reserve_without_dispatch(&mut fixture, sealed);
     let before = reasoning_side_effect_counts(&mut fixture);
     record_unavailable_health(&mut fixture);
-    let provider = RecordingProvider::new("offline-fixture", "offline-fixture");
+    let provider = Arc::new(RecordingProvider::new("offline-fixture", "offline-fixture"));
+    let provider_routes = serving(&provider, fixture.egress_processor);
     let reasoner = ContributionReasoner::new(
         &fixture.private,
         request.clone(),
-        &provider,
-        config(fixture.egress_processor),
+        &provider_routes,
+        config(),
     )
     .expect("reasoner");
     let retry = fixture
@@ -532,13 +554,9 @@ fn matching_reserved_retry_returns_original_model_call_without_dispatch_or_readm
     new_request.coverage_probe_call_id = LogicalReasoningCallId(Uuid::new_v4());
     new_request.assessment_call_id = LogicalReasoningCallId(Uuid::new_v4());
     let new_sealed = coverage_probe_call(snapshot.reasoning, &new_request);
-    let next = ContributionReasoner::new(
-        &fixture.private,
-        new_request,
-        &provider,
-        config(fixture.egress_processor),
-    )
-    .expect("new logical call");
+    let provider_routes = serving(&provider, fixture.egress_processor);
+    let next = ContributionReasoner::new(&fixture.private, new_request, &provider_routes, config())
+        .expect("new logical call");
     assert!(
         fixture
             .rt
@@ -571,14 +589,10 @@ fn changed_intent_or_terminal_logical_call_conflicts_without_repeat_dispatch() {
     let mut changed_base = snapshot.reasoning;
     changed_base.input_manifest_hash.0[0] ^= 1;
     let changed = coverage_probe_call(changed_base, &request);
-    let provider = RecordingProvider::new("offline-fixture", "offline-fixture");
-    let reasoner = ContributionReasoner::new(
-        &fixture.private,
-        request,
-        &provider,
-        config(fixture.egress_processor),
-    )
-    .expect("reasoner");
+    let provider = Arc::new(RecordingProvider::new("offline-fixture", "offline-fixture"));
+    let provider_routes = serving(&provider, fixture.egress_processor);
+    let reasoner = ContributionReasoner::new(&fixture.private, request, &provider_routes, config())
+        .expect("reasoner");
     let conflict = fixture
         .rt
         .block_on(reasoner.call_coverage_probe(changed))
@@ -595,11 +609,12 @@ fn changed_intent_or_terminal_logical_call_conflicts_without_repeat_dispatch() {
 
     let terminal_request = fresh_request(&fixture);
     let terminal_sealed = coverage_probe_call(snapshot.reasoning, &terminal_request);
+    let provider_routes = serving(&provider, fixture.egress_processor);
     let terminal_reasoner = ContributionReasoner::new(
         &fixture.private,
         terminal_request,
-        &provider,
-        config(fixture.egress_processor),
+        &provider_routes,
+        config(),
     )
     .expect("terminal reasoner");
     fixture
@@ -640,21 +655,17 @@ fn concurrent_same_logical_call_serializes_to_one_reservation_and_dispatch() {
         .block_on(ContributionEntryRepo::new(&fixture.private).load_preparation(&request))
         .expect("fresh preparation");
     let sealed = coverage_probe_call(snapshot.reasoning, &request);
-    let provider = RecordingProvider::new("offline-fixture", "offline-fixture");
+    let provider = Arc::new(RecordingProvider::new("offline-fixture", "offline-fixture"));
+    let provider_routes = serving(&provider, fixture.egress_processor);
     let first = ContributionReasoner::new(
         &fixture.private,
         request.clone(),
-        &provider,
-        config(fixture.egress_processor),
+        &provider_routes,
+        config(),
     )
     .expect("first reasoner");
-    let second = ContributionReasoner::new(
-        &fixture.private,
-        request,
-        &provider,
-        config(fixture.egress_processor),
-    )
-    .expect("second reasoner");
+    let second = ContributionReasoner::new(&fixture.private, request, &provider_routes, config())
+        .expect("second reasoner");
     let (left, right) = fixture.rt.block_on(async {
         tokio::join!(
             first.call_coverage_probe(sealed),
@@ -687,14 +698,10 @@ fn records_exact_wire_hash_and_finalizes_the_reserved_disclosure() {
         PrivateReasoningPurpose::ContributionDeidentify
     );
     let sealed = coverage_probe_call(snapshot.reasoning, &request);
-    let provider = RecordingProvider::new("offline-fixture", "offline-fixture");
-    let reasoner = ContributionReasoner::new(
-        &fixture.private,
-        request,
-        &provider,
-        config(fixture.egress_processor),
-    )
-    .expect("complete bridge config");
+    let provider = Arc::new(RecordingProvider::new("offline-fixture", "offline-fixture"));
+    let provider_routes = serving(&provider, fixture.egress_processor);
+    let reasoner = ContributionReasoner::new(&fixture.private, request, &provider_routes, config())
+        .expect("complete bridge config");
     let result = fixture
         .rt
         .block_on(reasoner.call_coverage_probe(sealed))
@@ -749,14 +756,10 @@ fn legacy_profile_change_cannot_replace_exact_binding_admission() {
         .block_on(ContributionEntryRepo::new(&fixture.private).load_preparation(&request))
         .unwrap();
     let sealed = coverage_probe_call(snapshot.reasoning, &request);
-    let provider = RecordingProvider::new("offline-fixture", "offline-fixture");
-    let reasoner = ContributionReasoner::new(
-        &fixture.private,
-        request,
-        &provider,
-        config(fixture.egress_processor),
-    )
-    .unwrap();
+    let provider = Arc::new(RecordingProvider::new("offline-fixture", "offline-fixture"));
+    let provider_routes = serving(&provider, fixture.egress_processor);
+    let reasoner =
+        ContributionReasoner::new(&fixture.private, request, &provider_routes, config()).unwrap();
     fixture
         .rt
         .block_on(reasoner.call_coverage_probe(sealed))
@@ -782,14 +785,13 @@ fn provider_failure_finalizes_the_already_reserved_disclosure_as_failed() {
         .block_on(ContributionEntryRepo::new(&fixture.private).load_preparation(&request))
         .unwrap();
     let sealed = coverage_probe_call(snapshot.reasoning, &request);
-    let provider = RecordingProvider::failing("offline-fixture", "offline-fixture");
-    let reasoner = ContributionReasoner::new(
-        &fixture.private,
-        request,
-        &provider,
-        config(fixture.egress_processor),
-    )
-    .unwrap();
+    let provider = Arc::new(RecordingProvider::failing(
+        "offline-fixture",
+        "offline-fixture",
+    ));
+    let provider_routes = serving(&provider, fixture.egress_processor);
+    let reasoner =
+        ContributionReasoner::new(&fixture.private, request, &provider_routes, config()).unwrap();
     assert!(
         fixture
             .rt
@@ -815,14 +817,13 @@ fn finalize_failure_never_retries_provider_and_leaves_reserved_call_for_reconcil
         .block_on(ContributionEntryRepo::new(&fixture.private).load_preparation(&request))
         .expect("fresh preparation");
     let sealed = coverage_probe_call(snapshot.reasoning, &request);
-    let provider = RecordingProvider::with_finalize_fault("offline-fixture", "offline-fixture");
-    let reasoner = ContributionReasoner::new(
-        &fixture.private,
-        request,
-        &provider,
-        config(fixture.egress_processor),
-    )
-    .expect("reasoner");
+    let provider = Arc::new(RecordingProvider::with_finalize_fault(
+        "offline-fixture",
+        "offline-fixture",
+    ));
+    let provider_routes = serving(&provider, fixture.egress_processor);
+    let reasoner = ContributionReasoner::new(&fixture.private, request, &provider_routes, config())
+        .expect("reasoner");
     assert!(
         fixture
             .rt

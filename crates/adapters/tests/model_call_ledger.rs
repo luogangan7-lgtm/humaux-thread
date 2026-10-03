@@ -1,15 +1,17 @@
 //! `adapters::tests::model_call_ledger` — T7.4 integration test — `model_call_ledger` (§19.1) against a real
 //!   Postgres, on `migrations/0094_model_call_ledger_fields.sql` / `0095_provider_pricing_versions.sql` /
 //!   `0096_tenant_cost_events.sql`.
-//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-retrieval-provider, humaux-testkit, postgres, sqlx,
-//!   tokio, uuid]; services=[PostgreSQL(any) w=[control.provider_pricing_versions, control.tenants,
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, humaux-retrieval-provider, humaux-testkit,
+//!   postgres, sqlx, tokio, uuid]; services=[PostgreSQL(any) w=[control.provider_pricing_versions, control.tenants,
 //!   ops.model_call_ledger, ops.tenant_cost_events], PostgreSQL(role_private_worker),
-//!   PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::model_call_ledger,
-//!   adapters::postgres, domain::ledger, humaux-testkit, retrieval-provider::cost, retrieval-provider::pricing]
+//!   PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::disclosure,
+//!   adapters::model_call_ledger, adapters::postgres, adapters::tests::support::private_route, application::consolidate,
+//!   domain::dataclass, domain::egress, domain::ids, domain::ledger, humaux-testkit, retrieval-provider::cost,
+//!   retrieval-provider::pricing]
 //! Called-by: [cargo-test]
 //! Invariants: [each test scopes rows to its own throwaway tenant; reserve/finalize pairs and cost events are
 //!   asserted on real rows; no DSN, unreachable DB or migrations missing is a visible SKIP]
-//! Spec: Baseline §19.1; §79.2
+//! Spec: Baseline §19.1; §79.2; ADR-0060 D-I, D-N
 //!
 //! Same convention as `disclosure_ledger.rs`: shared tables,
 //! each test scopes rows to its own throwaway `control.tenants` row.
@@ -17,10 +19,18 @@
 //! Three-state skip (§79.2): no DSN, unreachable DB, or the migrations not yet applied all
 //! print a visible SKIP and return.
 
+#[path = "support/private_route.rs"]
+mod private_route;
+
+use humaux_adapters::disclosure::DisclosureSource;
 use humaux_adapters::model_call_ledger::{
     self, FinalizeCall, ModelCallLedgerError, ModelCallOutcome, ReserveCall,
 };
 use humaux_adapters::postgres::{PrivateWorkerDbPool, RetrievalWorkerDbPool};
+use humaux_application::consolidate::PrivateReasoningPurpose;
+use humaux_domain::dataclass::DataClass;
+use humaux_domain::egress::{self, AuthorizedEgressPayload, PrivateDataPurpose};
+use humaux_domain::ids::TenantId;
 use humaux_domain::ledger::ModelCallPurpose;
 use humaux_retrieval_provider::cost::{UsageSnapshot, compute_cost};
 use humaux_retrieval_provider::pricing::{self, PricingVersion};
@@ -848,9 +858,66 @@ fn purpose_outside_the_closed_set_is_rejected_by_the_database() {
     );
 }
 
+/// One admitted private route of a fresh tenant for `purpose`, reserved through the one private
+/// entry point (ADR-0060 D-N): returns `(tenant, model_call_id, locator profile id)`.
+fn reserve_routed(
+    handle: &mut Handle,
+    private_worker: &PrivateWorkerDbPool,
+    purpose: ModelCallPurpose,
+) -> (Uuid, Uuid, Uuid) {
+    let (db_purpose, admission_purpose) = match purpose {
+        ModelCallPurpose::PrivateDistillText => {
+            ("PRIVATE_DISTILL_TEXT", PrivateReasoningPurpose::Distill)
+        }
+        ModelCallPurpose::PrivateDistillVision => {
+            ("PRIVATE_DISTILL_VISION", PrivateReasoningPurpose::Vision)
+        }
+        ModelCallPurpose::PrivateConsolidate => {
+            ("PRIVATE_CONSOLIDATE", PrivateReasoningPurpose::Consolidate)
+        }
+        other => panic!("{other:?} is not a private reasoning purpose"),
+    };
+    let owner = private_route::seed_owner(&mut handle.admin, "model_call_ledger.rs");
+    let caps = ["TEXT", "STRUCTURED_OUTPUT"];
+    let profile = private_route::seed_profile(&mut handle.admin, owner, &caps, &caps, 3600.0);
+    let binding = private_route::bind(&mut handle.admin, owner, db_purpose, &profile);
+    let locator = private_route::admit(
+        &handle.rt,
+        private_worker,
+        owner,
+        binding,
+        admission_purpose,
+    )
+    .expect("admitted route");
+    let evidence = private_route::seed_evidence(&mut handle.admin, owner);
+    let payload = AuthorizedEgressPayload::new(b"model_call_ledger private probe".to_vec());
+    let permit = egress::authorize(
+        TenantId(owner.tenant),
+        locator.egress_processor_id,
+        PrivateDataPurpose::UserReasoning,
+        DataClass::Private,
+        &payload,
+        std::time::Duration::from_secs(300),
+    )
+    .expect("permit");
+    let (reserved, _) = handle
+        .rt
+        .block_on(model_call_ledger::reserve_private_call_with_disclosure(
+            private_worker,
+            purpose,
+            &locator,
+            &permit,
+            &payload,
+            &[DisclosureSource::Evidence(evidence)],
+        ))
+        .expect("an admitted private route reserves (0206)");
+    assert!(!reserved.already_reserved);
+    (owner.tenant, reserved.model_call_id, locator.profile_id)
+}
+
 /// §11.6/§11.7: the private hops' reserve->finalize round trip on the role that actually runs
-/// them (`role_private_worker`), through the same registration point the retrieval hops use.
-/// One row per call, purpose/model/tenant persisted, token usage landed at finalize.
+/// them (`role_private_worker`). One row per call, purpose/model/tenant persisted, token usage
+/// landed at finalize, and the row names its admitted route as USER-paid (ADR-0060 D-I).
 #[test]
 fn private_purposes_reserve_and_finalize_on_the_private_worker_pool() {
     run_db_fixture::<LedgerFixture, _>(
@@ -865,39 +932,22 @@ fn private_purposes_reserve_and_finalize_on_the_private_worker_pool() {
                     "role_private_worker",
                 )))
                 .expect("role_private_worker pool");
-            let tenant_id = handle.tenant_id;
-            let before = ledger_row_count(&mut handle, tenant_id);
 
-            for (purpose, model) in [
-                (ModelCallPurpose::PrivateDistillText, "MiniMax-Text-01"),
-                (ModelCallPurpose::PrivateDistillVision, "MiniMax-VL-01"),
-                (ModelCallPurpose::PrivateConsolidate, "MiniMax-Text-01"),
+            for purpose in [
+                ModelCallPurpose::PrivateDistillText,
+                ModelCallPurpose::PrivateDistillVision,
+                ModelCallPurpose::PrivateConsolidate,
             ] {
-                let reserved = handle
-                    .rt
-                    .block_on(model_call_ledger::reserve_private_call(
-                        &private_worker,
-                        &ReserveCall {
-                            request_id: None,
-                            tenant_id: handle.tenant_id,
-                            workspace_id: None,
-                            purpose: Some(purpose),
-                            provider: "minimax".to_string(),
-                            model: Some(model.to_string()),
-                            model_revision: None,
-                            estimated_cost: None,
-                        },
-                    ))
-                    .expect("private purposes are admitted by the 0166 CHECK");
-                assert!(!reserved.already_reserved);
-                assert_eq!(status_of(&mut handle, reserved.model_call_id), "RESERVED");
+                let (tenant_id, model_call_id, profile_id) =
+                    reserve_routed(&mut handle, &private_worker, purpose);
+                assert_eq!(status_of(&mut handle, model_call_id), "RESERVED");
 
                 let changed = handle
                     .rt
                     .block_on(model_call_ledger::finalize_private_call(
                         &private_worker,
-                        handle.tenant_id,
-                        reserved.model_call_id,
+                        tenant_id,
+                        model_call_id,
                         ModelCallOutcome::Succeeded,
                         &FinalizeCall {
                             input_tokens: Some(1234),
@@ -913,35 +963,29 @@ fn private_purposes_reserve_and_finalize_on_the_private_worker_pool() {
                 let row = handle
                     .admin
                     .query_one(
-                        "SELECT purpose, model, tenant_id, status, input_tokens, \
-                                billable_tokens, output_tokens, latency_ms, \
-                                reasoning_domain_id IS NULL AND binding_id IS NULL \
-                                AND billing_responsibility IS NULL AS route_columns_null \
+                        "SELECT purpose, status, input_tokens, billable_tokens, output_tokens, \
+                                latency_ms, profile_id, billing_responsibility \
                          FROM ops.model_call_ledger WHERE model_call_id = $1",
-                        &[&reserved.model_call_id],
+                        &[&model_call_id],
                     )
                     .expect("row must exist");
                 assert_eq!(row.get::<_, String>("purpose"), purpose.as_db_str());
-                assert_eq!(row.get::<_, String>("model"), model);
-                assert_eq!(row.get::<_, Uuid>("tenant_id"), handle.tenant_id);
                 assert_eq!(row.get::<_, String>("status"), "SUCCEEDED");
                 assert_eq!(row.get::<_, i64>("input_tokens"), 1234);
                 // §19.1 both priced dimensions (0168): a generative call bills the prompt at
-                // `input_token_price` and the completion at `output_token_price`. Persisting
-                // only the first is what left these rows unpriceable.
+                // `input_token_price` and the completion at `output_token_price`.
                 assert_eq!(row.get::<_, i64>("billable_tokens"), 1234);
                 assert_eq!(row.get::<_, i64>("output_tokens"), 5678);
                 assert_eq!(row.get::<_, i32>("latency_ms"), 42);
-                // 0130's USER-paid arm stays untouched: a platform-paid private row carries no
-                // route/billing snapshot (migrations/0166 header).
-                assert!(row.get::<_, bool>("route_columns_null"));
+                // ADR-0060 D-I / ruling E2: the row carries its admitted route, USER-paid.
+                assert_eq!(row.get::<_, Uuid>("profile_id"), profile_id);
+                assert_eq!(row.get::<_, String>("billing_responsibility"), "USER");
+                assert_eq!(
+                    ledger_row_count(&mut handle, tenant_id),
+                    1,
+                    "exactly one ledger row per private call — no second receipt mechanism"
+                );
             }
-
-            assert_eq!(
-                ledger_row_count(&mut handle, tenant_id) - before,
-                3,
-                "exactly one ledger row per private call — no second receipt mechanism"
-            );
         },
     );
 }
@@ -963,30 +1007,18 @@ fn a_failed_private_call_is_ledgered_as_failed_not_absent() {
                     "role_private_worker",
                 )))
                 .expect("role_private_worker pool");
-
-            let reserved = handle
-                .rt
-                .block_on(model_call_ledger::reserve_private_call(
-                    &private_worker,
-                    &ReserveCall {
-                        request_id: None,
-                        tenant_id: handle.tenant_id,
-                        workspace_id: None,
-                        purpose: Some(ModelCallPurpose::PrivateConsolidate),
-                        provider: "minimax".to_string(),
-                        model: Some("MiniMax-Text-01".to_string()),
-                        model_revision: None,
-                        estimated_cost: None,
-                    },
-                ))
-                .expect("reserve succeeds");
+            let (tenant_id, model_call_id, _) = reserve_routed(
+                &mut handle,
+                &private_worker,
+                ModelCallPurpose::PrivateConsolidate,
+            );
 
             let changed = handle
                 .rt
                 .block_on(model_call_ledger::finalize_private_call(
                     &private_worker,
-                    handle.tenant_id,
-                    reserved.model_call_id,
+                    tenant_id,
+                    model_call_id,
                     ModelCallOutcome::Failed,
                     &FinalizeCall {
                         latency_ms: Some(7),
@@ -1002,7 +1034,7 @@ fn a_failed_private_call_is_ledgered_as_failed_not_absent() {
                 .query_one(
                     "SELECT status, error_class, input_tokens IS NULL AS no_tokens \
                      FROM ops.model_call_ledger WHERE model_call_id = $1",
-                    &[&reserved.model_call_id],
+                    &[&model_call_id],
                 )
                 .expect("a failed call still leaves its row");
             assert_eq!(row.get::<_, String>("status"), "FAILED");

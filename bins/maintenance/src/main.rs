@@ -1,18 +1,19 @@
 //! `maintenance::main` — `humaux-maintenance`, the operator-write CLI (§4.2): onboarding, API keys, placement,
-//!   activation, re-drive of DEAD distill jobs, role-password rotation, the deploy-check and opening/closing
-//!   the API-key pepper rehash window.
+//!   activation, re-drive of DEAD distill jobs, role-password rotation, the deploy-check, opening/closing
+//!   the API-key pepper rehash window and the reasoning-route doors (register / bind / attest-health /
+//!   profile-state / status, ADR-0060 D-H).
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, rand, serde, serde_json, time, tokio, uuid];
 //!   services=[PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX,
 //!   HUMAUX_MAINTENANCE_EMBEDDING_DIMENSION, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MAINTENANCE_PRIVATE_MEMORY_COLLECTION,
 //!   HUMAUX_MAINTENANCE_QDRANT_CIDR, HUMAUX_MAINTENANCE_QDRANT_HOST, HUMAUX_MAINTENANCE_QDRANT_PORT];
-//!   modules=[adapters::membership_repo, adapters::postgres, adapters::provisioning, adapters::quota_repo,
-//!   adapters::role_hygiene,
+//!   modules=[adapters::byok, adapters::membership_repo, adapters::postgres, adapters::provisioning,
+//!   adapters::quota_repo, adapters::reasoning_route_onboarding, adapters::role_hygiene,
 //!   domain::identity, domain::ids, domain::ticket_family, maintenance::roles, protocol::edge]
 //! Called-by: [process(humaux-maintenance)]
 //! Invariants: [one-shot, one JSON receipt on stdout per run; exit 0 created/existing, 3 refused, 2 usage, 1
 //!   infrastructure (PostgreSQL/Qdrant down); the wire key and generated role passwords are printed once on stdout
 //!   before the receipt, never on stderr or in a receipt; no flag or env var has a literal default]
-//! Spec: Baseline §4.2; §6.2.2; §73.5; §77; §78.1; ADR-0053; ADR-0058; ADR-0059
+//! Spec: Baseline §4.2; §6.2.2; §11.2.3; §73.5; §77; §78.1; ADR-0053; ADR-0058; ADR-0059; ADR-0060
 //!
 //! Subcommand mode (card 28; the resident `--serve` job is card 35). Every subcommand is
 //! one-shot, idempotent (a re-run writes nothing and answers `existing`; `apikey pepper-epoch advance`
@@ -27,6 +28,9 @@
 //! as the single line `Authorization: Bearer <prefix>.<secret>` on stdout before the JSON, only
 //! when it was created — never on stderr, never inside a receipt, never on a re-run (a lost key
 //! is revoked and reissued under a new `--key-name`). Receipts carry the log fingerprint only.
+//! `reasoning register` (ADR-0060 D-H) takes `--account-ref` as text and sends only its sha256; it
+//! never takes a key — the receipt names the `<credential_ref>=<ENV_NAME>` line the operator adds to
+//! the private worker's `HUMAUX_PRIVATE_WORKER_CREDENTIALS` (D-J).
 //! `roles rotate` (ADR-0059 D-E) prints each generated role password the same way, once, as
 //! `HUMAUX_ROLE_PASSWORD_<SUFFIX>=<value>`; `deploy-check` (D-F) is read-only and prints names only.
 //!
@@ -39,6 +43,7 @@ mod roles;
 
 use std::process::ExitCode;
 
+use humaux_adapters::byok::ReasoningCapability;
 use humaux_adapters::membership_repo::AdminAction;
 use humaux_adapters::postgres::MaintenanceDbPool;
 use humaux_adapters::provisioning::{
@@ -46,6 +51,7 @@ use humaux_adapters::provisioning::{
     WorkspaceActivation,
 };
 use humaux_adapters::quota_repo;
+use humaux_adapters::reasoning_route_onboarding::{self as routes, RegisterProfile};
 use humaux_adapters::role_hygiene;
 use humaux_domain::identity::MembershipRole;
 use humaux_domain::ids::TenantId;
@@ -60,6 +66,7 @@ use uuid::Uuid;
 const USAGE: &str = "usage: humaux-maintenance <deploy-init | onboard tenant|workspace|user | \
 apikey issue|revoke | apikey pepper-epoch advance|close | placement ensure | collection ensure | activate | status | \
 jobs requeue-dead --tenant ID (--job ID | --error-class CLASS) | \
+reasoning register|bind|attest-health|profile-state|status --tenant ID | \
 roles rotate --roles-sql PATH [--role ROLE]... [--create-missing] | deploy-check --roles-sql PATH> [flags]";
 
 /// A failure before or outside the provisioning library.
@@ -574,6 +581,125 @@ async fn status(args: &Args) -> Result<Output> {
     Ok(Output::ok(provisioning::status(&pool, tenant_id).await?))
 }
 
+/// `--profile ID --profile-version N`: one Profile@version (ADR-0060 D-H).
+fn profile_flags(args: &Args) -> Result<(Uuid, i64)> {
+    Ok((
+        uuid_flag(args, "--profile")?,
+        args.parsed("--profile-version")?,
+    ))
+}
+
+/// `reasoning register` (ADR-0060 D-H 1): one Profile@version with its catalog row, vendor account,
+/// endpoint and credential reference. Every provider-shaped value is a flag (§78.1: no default);
+/// `--request-extras` is required too (pass `{}` for none), so no vendor field is ever implied.
+async fn reasoning_register(args: &Args) -> Result<Output> {
+    let admin = Admin::from(args)?;
+    let capabilities = args
+        .required("--capabilities")?
+        .split(',')
+        .map(|c| {
+            ReasoningCapability::parse(c.trim()).ok_or_else(|| {
+                Failure::Usage(format!(
+                    "--capabilities: {c:?} is outside the §11.2 closed set"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let request_extras: Value = serde_json::from_str(&args.required("--request-extras")?)
+        .map_err(|e| Failure::Usage(format!("--request-extras: not JSON ({e})")))?;
+    let optional_uuid = |flag: &str| args.get(flag).map(|_| uuid_flag(args, flag)).transpose();
+    let (processor_id, provider_model_id, account_ref) = (
+        args.required("--provider-id")?,
+        args.required("--provider-model-id")?,
+        args.required("--account-ref")?,
+    );
+    let (endpoint_ref, region, service_tier) = (
+        args.required("--endpoint-ref")?,
+        args.required("--region")?,
+        args.required("--service-tier")?,
+    );
+    let model_revision = args.get("--model-revision");
+    let request = RegisterProfile {
+        tenant_id: uuid_flag(args, "--tenant")?,
+        owner_user_id: uuid_flag(args, "--owner-user")?,
+        processor_id: &processor_id,
+        provider_model_id: &provider_model_id,
+        model_revision: model_revision.as_deref(),
+        capabilities: &capabilities,
+        request_extras: &request_extras,
+        account_ref: &account_ref,
+        endpoint_ref: &endpoint_ref,
+        region: &region,
+        service_tier: &service_tier,
+        egress_processor_id: uuid_flag(args, "--egress-processor-id")?,
+        credential_ref: optional_uuid("--credential-ref")?,
+        successor_of: optional_uuid("--successor-of")?,
+    };
+    let pool = pool().await?;
+    let receipt = routes::register_profile(&pool, &request, &admin.action()).await?;
+    Ok(Output::ok(to_json(&receipt)?))
+}
+
+/// `reasoning bind` (ADR-0060 D-H 2): the R2 projection of one (domain, purpose) onto one
+/// Profile@version; a rebind writes the successor Binding@version.
+async fn reasoning_bind(args: &Args) -> Result<Output> {
+    let admin = Admin::from(args)?;
+    let purpose_text = args.required("--purpose")?;
+    let purpose = routes::parse_purpose(&purpose_text).ok_or_else(|| {
+        Failure::Usage(format!(
+            "--purpose: {purpose_text:?} is not a §11.2.3 purpose"
+        ))
+    })?;
+    let pool = pool().await?;
+    let receipt = routes::bind_domain(
+        &pool,
+        uuid_flag(args, "--tenant")?,
+        uuid_flag(args, "--domain")?,
+        purpose,
+        profile_flags(args)?,
+        &admin.action(),
+    )
+    .await?;
+    Ok(Output::ok(to_json(&receipt)?))
+}
+
+/// `reasoning attest-health` (ADR-0060 D-H 3, ruling E3 (a)): `--valid-for-secs` has no default.
+async fn reasoning_attest_health(args: &Args) -> Result<Output> {
+    let admin = Admin::from(args)?;
+    let pool = pool().await?;
+    let receipt = routes::attest_health(
+        &pool,
+        uuid_flag(args, "--tenant")?,
+        profile_flags(args)?,
+        args.parsed("--valid-for-secs")?,
+        &admin.action(),
+    )
+    .await?;
+    Ok(Output::ok(to_json(&receipt)?))
+}
+
+/// `reasoning profile-state --enabled true|false` (ADR-0060 D-H 4).
+async fn reasoning_profile_state(args: &Args) -> Result<Output> {
+    let admin = Admin::from(args)?;
+    let pool = pool().await?;
+    let receipt = routes::set_profile_enabled(
+        &pool,
+        uuid_flag(args, "--tenant")?,
+        profile_flags(args)?,
+        args.parsed("--enabled")?,
+        &admin.action(),
+    )
+    .await?;
+    Ok(Output::ok(to_json(&receipt)?))
+}
+
+/// `reasoning status --tenant` (ruling E3 (c)): read-only.
+async fn reasoning_status(args: &Args) -> Result<Output> {
+    let tenant_id = uuid_flag(args, "--tenant")?;
+    let pool = pool().await?;
+    Ok(Output::ok(routes::route_status(&pool, tenant_id).await?))
+}
+
 async fn run(args: Args) -> Result<Output> {
     let words: Vec<&str> = args.0.iter().take(2).map(String::as_str).collect();
     match words.as_slice() {
@@ -588,6 +714,11 @@ async fn run(args: Args) -> Result<Output> {
         ["activate", ..] => activate(&args).await,
         ["status", ..] => status(&args).await,
         ["jobs", "requeue-dead"] => jobs_requeue_dead(&args).await,
+        ["reasoning", "register"] => reasoning_register(&args).await,
+        ["reasoning", "bind"] => reasoning_bind(&args).await,
+        ["reasoning", "attest-health"] => reasoning_attest_health(&args).await,
+        ["reasoning", "profile-state"] => reasoning_profile_state(&args).await,
+        ["reasoning", "status"] => reasoning_status(&args).await,
         ["apikey", "pepper-epoch"] => match args.0.get(2).map(String::as_str) {
             Some("advance") => apikey_pepper_epoch(&args, true).await,
             Some("close") => apikey_pepper_epoch(&args, false).await,

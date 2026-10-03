@@ -38,6 +38,8 @@ Read on `5ff4aff` (file:line at that commit):
   numbers claims), `ops.provider_slots` (exactly four rows, created by the migration — §67.2),
   `ops.distill_tenant_scheduler` (`last_served_turn` per tenant, admitted by an owner trigger on enqueue),
   one job per claim: arbiter → sweep → free slot `SKIP LOCKED` → least-recently-served tenant with READY work
+  (forward pointer: the four slots are shared across every provider, profile and tenant; since 0206 the tenant
+  order is fewest held slots, then least recently served — ADR-0060 D-F)
   (`FOR UPDATE OF t SKIP LOCKED`) → that tenant's oldest READY job (`SKIP LOCKED`, eligibility restated) →
   job `PROCESSING/CLAIMED`, slot bound to `(job, generation, hard_deadline)` with a `job_id IS NULL` recheck,
   turn advanced. No attempt at claim. Rejected (card list): global FIFO, row_number-only pick, process-only
@@ -97,7 +99,9 @@ Read on `5ff4aff` (file:line at that commit):
 - **D-F settles (slice 2)**: anything before the first admitted request is NOT_READY; a provider 401
   (`ReasoningProviderError::WAITING_KEY_CLASS`) parks WAITING_KEY and reverts its attempt; any other failed call is
   RETRY with `jobs::retry_backoff_seconds(lease, attempt)` or, at `max_attempts`, DEAD with the class and the outbox
-  FAILED in the same transaction; a refused malformed re-ask is DEAD `FAILED_OUTPUT_SCHEMA`, a refused empty retry
+  FAILED in the same transaction (forward pointer: so a provider outage settles RETRY → DEAD, not WAITING_KEY,
+  and is recovered with `jobs requeue-dead` once the provider is back — ADR-0060 D-G); a refused malformed re-ask
+  is DEAD `FAILED_OUTPUT_SCHEMA`, a refused empty retry
   accepts the empty answer; a claim with `attempt` or `abandoned_claims ≥ max_attempts` is DEAD at once
   (`ATTEMPTS_EXHAUSTED` / `PRE_DISPATCH_ABANDONED`). Every settle runs `finish_derived_work_v2` as the first
   statement of the transaction that also flips the outbox row (and, for DONE, writes the memories). A T6 re-claim

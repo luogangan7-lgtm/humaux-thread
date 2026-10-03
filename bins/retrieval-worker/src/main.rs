@@ -530,9 +530,9 @@ fn build_scanner() -> Result<LocalSecretScanner, Outcome> {
     })
 }
 
-/// This process's §7 egress identity, read from configuration exactly the way the private
-/// worker reads its own (`HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID`) — deployment identity,
-/// never tenant data.
+/// This process's §7 egress identity, read from configuration — deployment identity, never tenant
+/// data. (The private worker instead holds a recipient list, `HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS`,
+/// and takes each call's recipient from its admitted route, ADR-0060 D-C / D-L.)
 ///
 /// Card 21: before this, the value was `ProcessorId(Uuid::nil())`, so **every**
 /// `ops.data_disclosures` row this worker wrote carried `processor_id` all-zeros. §7.4's

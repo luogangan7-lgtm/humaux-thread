@@ -18,13 +18,15 @@
 //!   ops.claim_derived_work_v2], PostgreSQL(role_private_worker), PostgreSQL(owner), PostgreSQL(role_maintenance),
 //!   PostgreSQL(role_retrieval_worker), MiniMax, subprocess(gitleaks)]; env=[HUMAUX_MINIMAX_DNS_PINS,
 //!   HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY];
-//!   modules=[adapters::affect_repo, adapters::byok, adapters::byok::ssrf, adapters::contribution_reasoner, adapters::disclosure,
-//!   adapters::distill_reasoner, adapters::membership_repo, adapters::postgres, adapters::projection_worker,
-//!   adapters::provisioning, adapters::qdrant,
-//!   adapters::distill_repo, adapters::jobs, application::affect, domain::affect, domain::authority, domain::egress,
-//!   domain::error, domain::evidence, domain::identity, domain::ids, domain::ticket_family, humaux-local-secret-scan, humaux-testkit, infra-cell::permit,
-//!   infra-cell::resource, infra-cell::transport, private-worker::distill,
-//!   private-worker::tests::support::dispatch_fence, private-worker::tests::support::live_minimax, projection::fingerprint, projection::serving]
+//!   modules=[adapters::affect_repo, adapters::byok, adapters::byok::ssrf, adapters::contribution_reasoner,
+//!   adapters::disclosure, adapters::distill_reasoner, adapters::distill_repo, adapters::jobs,
+//!   adapters::membership_repo, adapters::postgres, adapters::projection_worker, adapters::provisioning,
+//!   adapters::qdrant, adapters::reasoning_route_admission, application::affect, domain::affect, domain::authority,
+//!   domain::egress, domain::error, domain::evidence, domain::identity, domain::ids, domain::ticket_family,
+//!   humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
+//!   private-worker::distill, private-worker::tests::support::dispatch_fence,
+//!   private-worker::tests::support::live_minimax, private-worker::tests::support::live_provider,
+//!   projection::fingerprint, projection::serving]
 //! Called-by: [cargo-test]
 //! Invariants: [no MINIMAX_API_KEY -> SKIP for the live test only; no DB (or not migrated to 0190) -> SKIP for all;
 //!   HUMAUX_REQUIRE_MINIMAX/HUMAUX_REQUIRE_DB make either a panic via skip_or_fail; tests run one at a time and
@@ -72,6 +74,7 @@ use humaux_adapters::provisioning::{self, RequeueTarget};
 use humaux_adapters::qdrant::{
     PlacementClass, PromotionState, RetrievalFamily, TenantPlacementRow,
 };
+use humaux_adapters::reasoning_route_admission::ReasoningAdmissionLocator;
 use humaux_application::affect::{ObservedAffect, memories_matching};
 use humaux_domain::affect::{AffectFilter, EmotionLabel};
 use humaux_domain::egress::ProcessorId;
@@ -97,6 +100,10 @@ use uuid::Uuid;
 mod dispatch_fence;
 #[path = "support/live_minimax.rs"]
 mod live_minimax;
+// The first provider's `LiveProfile` lives here; this file dials it through `live_minimax` only.
+#[allow(dead_code)]
+#[path = "support/live_provider.rs"]
+mod live_provider;
 
 use live_minimax::{
     EnvKeyDecryptor, MINIMAX_CHAT_URL, MINIMAX_MODEL, descriptor, live_provider, load_minimax_key,
@@ -105,9 +112,6 @@ use live_minimax::{
 /// The claim is cross-tenant: tests of this file never overlap (one fixture at a time).
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// ADR-0059 D-I: the worker's credential map as this file configures it — every credential
-/// reference `setup_db` created (tests are serialized by [`SERIAL`]).
-static MAPPED_CREDENTIALS: Mutex<BTreeSet<Uuid>> = Mutex::new(BTreeSet::new());
 const NAME: &str = "distill_hop_e2e";
 const EGRESS_PROCESSOR_ID: Uuid = Uuid::from_u128(0x2016);
 const REGION: &str = "cn-shanghai";
@@ -134,10 +138,26 @@ fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
         .unwrap_or_else(|missing| panic!("missing object: {missing} (ADR-0059 D-D)"))
 }
 
+/// ADR-0060 D-B: every admitted route goes to `provider`, unless its recipient is not this
+/// deployment's (the deny-only check the private worker's route mapping holds, §11.2.5).
+fn routes<P: UserReasoningProvider + 'static>(
+    provider: &Arc<P>,
+) -> impl Fn(&ReasoningAdmissionLocator) -> Result<Arc<dyn UserReasoningProvider>, &'static str>
++ Send
++ Sync
++ use<P> {
+    let provider = Arc::clone(provider);
+    move |route| {
+        if route.egress_processor_id.0 == EGRESS_PROCESSOR_ID {
+            Ok(Arc::clone(&provider) as Arc<dyn UserReasoningProvider>)
+        } else {
+            Err("EGRESS_PROCESSOR_NOT_ALLOWED")
+        }
+    }
+}
+
 fn contribution_config() -> ContributionReasonerConfig {
     ContributionReasonerConfig {
-        allowed_egress_processor_id: ProcessorId(EGRESS_PROCESSOR_ID),
-        region: REGION.to_string(),
         permit_ttl: Duration::from_secs(30),
         deletion_capability: DeletionCapability::Unknown,
         // Contribution-path prompt config only; Distill takes prompt/schema/budget from
@@ -163,13 +183,13 @@ struct FakeProvider {
 }
 
 impl FakeProvider {
-    fn new(replies: Vec<&str>) -> Self {
-        Self {
+    fn new(replies: Vec<&str>) -> Arc<Self> {
+        Arc::new(Self {
             descriptor: descriptor(),
             replies: Mutex::new(replies.into_iter().rev().map(str::to_owned).collect()),
             calls: Mutex::new(0),
             schemas: Mutex::new(Vec::new()),
-        }
+        })
     }
 
     fn calls(&self) -> u32 {
@@ -192,7 +212,7 @@ impl UserReasoningProvider for FakeProvider {
     }
 
     fn model_revision(&self) -> Option<&str> {
-        None
+        self.descriptor.model_revision.as_deref()
     }
 
     async fn complete_structured(
@@ -404,23 +424,22 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
         )
         .expect("credential locator")
         .get(0);
-    MAPPED_CREDENTIALS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(credential);
     let d = descriptor();
+    // ADR-0060 D-C / E5: catalog row, Profile and provider declare one capability set; the
+    // descriptor's revision is that set's label, so it never meets the frozen NULL-revision row.
+    let caps: Vec<&str> = d.capabilities.iter().map(|c| c.as_str()).collect();
     admin
         .execute(
             "INSERT INTO control.processor_models(processor_id,provider_model_id,model_revision,capabilities,status,catalog_observed_at) \
-             VALUES($1,$2,NULL,ARRAY['TEXT','STRUCTURED_OUTPUT'],'ACTIVE',clock_timestamp()) ON CONFLICT DO NOTHING",
-            &[&d.provider_id, &d.model_id],
+             VALUES($1,$2,$3,$4,'ACTIVE',clock_timestamp()) ON CONFLICT DO NOTHING",
+            &[&d.provider_id, &d.model_id, &d.model_revision, &caps],
         )
         .expect("processor model");
     let processor_model_id: Uuid = admin
         .query_one(
             "SELECT processor_model_id FROM control.processor_models \
-             WHERE processor_id=$1 AND provider_model_id=$2 AND model_revision IS NULL AND status='ACTIVE'",
-            &[&d.provider_id, &d.model_id],
+             WHERE processor_id=$1 AND provider_model_id=$2 AND model_revision IS NOT DISTINCT FROM $3 AND status='ACTIVE'",
+            &[&d.provider_id, &d.model_id, &d.model_revision],
         )
         .expect("processor model id")
         .get(0);
@@ -447,8 +466,8 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
         .get(0);
     let profile: Uuid = admin
         .query_one(
-            "INSERT INTO control.reasoning_profiles(tenant_id,owner_user_id,provider_account_id,endpoint_id,processor_model_id,credential_ref,billing_account_id,default_billing_instrument_id,capabilities,processing_region) VALUES($1,$2,$3,$4,$5,$6,NULL,NULL,ARRAY['TEXT'],$7) RETURNING profile_id",
-            &[&tenant_id, &user_id, &account, &endpoint, &processor_model_id, &credential, &REGION],
+            "INSERT INTO control.reasoning_profiles(tenant_id,owner_user_id,provider_account_id,endpoint_id,processor_model_id,credential_ref,billing_account_id,default_billing_instrument_id,capabilities,processing_region) VALUES($1,$2,$3,$4,$5,$6,NULL,NULL,$8,$7) RETURNING profile_id",
+            &[&tenant_id, &user_id, &account, &endpoint, &processor_model_id, &credential, &REGION, &caps],
         )
         .expect("reasoning profile")
         .get(0);
@@ -486,8 +505,8 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
     admin
         .execute(
             "INSERT INTO ops.reasoning_provider_health_observations(tenant_id,processor_id,processor_model_id,provider_model_id,model_revision,provider_endpoint_id,endpoint_ref,region,service_tier,source_kind,reason_code,verdict,observed_at,valid_until) \
-             VALUES($1,$2,$3,$4,NULL,$5,$6,$7,$8,'TEST',NULL,'HEALTHY',clock_timestamp()-interval '1 second',clock_timestamp()+interval '30 minutes')",
-            &[&tenant_id, &d.provider_id, &processor_model_id, &d.model_id, &endpoint, &MINIMAX_CHAT_URL, &REGION, &SERVICE_TIER],
+             VALUES($1,$2,$3,$4,$9,$5,$6,$7,$8,'TEST',NULL,'HEALTHY',clock_timestamp()-interval '1 second',clock_timestamp()+interval '30 minutes')",
+            &[&tenant_id, &d.provider_id, &processor_model_id, &d.model_id, &endpoint, &MINIMAX_CHAT_URL, &REGION, &SERVICE_TIER, &d.model_revision],
         )
         .expect("provider health observation");
     admin
@@ -620,10 +639,7 @@ fn dispatch_config(lease_owner: &str, lease_seconds: f64) -> DistillDispatchConf
         not_ready_park_seconds: 600.0,
         max_attempts: 5,
         budget: TEST_BUDGET,
-        credential_refs: MAPPED_CREDENTIALS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone(),
+        health_renew_seconds: 1800,
     }
 }
 
@@ -636,16 +652,16 @@ fn private_pool(rt: &tokio::runtime::Runtime, f: &Fixture) -> PrivateWorkerDbPoo
 }
 
 /// One `--distill-once` drain over the fixture tenant (foreign tenants are fenced).
-fn run_pass(
+fn run_pass<P: UserReasoningProvider + 'static>(
     rt: &tokio::runtime::Runtime,
     f: &Fixture,
-    provider: &dyn UserReasoningProvider,
+    provider: &Arc<P>,
     lease_owner: &str,
 ) -> DistillDispatchReport {
     let pool = private_pool(rt, f);
     rt.block_on(dispatch_pass(
         &pool,
-        provider,
+        &routes(provider),
         contribution_config(),
         &dispatch_config(lease_owner, 30.0),
     ))
@@ -714,7 +730,7 @@ struct Observed {
     disclosure_outcomes: Vec<String>,
     rpc_calls: i64,
     /// Card 20's primary acceptance gate: the §19.1 cost row that must exist ALONGSIDE the §7.4
-    /// disclosure row, not instead of it. Deleting `distill_reasoner`'s `reserve_private_call` /
+    /// disclosure row, not instead of it. Deleting `distill_reasoner`'s `reserve_private_call_with_disclosure` /
     /// `finalize_private_call` makes this go red, which is what "the ledger covers this hop"
     /// has to mean.
     ledger: LedgerRow,
@@ -1059,7 +1075,11 @@ fn d1_live_distill_writes_memories_and_projection_resolves_ticket() {
     // fake-provider `dispatch_config` (5 s) would cut a live call — or a live malformed re-ask —
     // at `hard_deadline − lease` = 40 s and leave the job UNKNOWN instead of DONE.
     const LIVE_HTTP_SECS: u64 = 120;
-    let provider = live_provider(key, MINIMAX_MODEL, Duration::from_secs(LIVE_HTTP_SECS));
+    let provider = Arc::new(live_provider(
+        key,
+        MINIMAX_MODEL,
+        Duration::from_secs(LIVE_HTTP_SECS),
+    ));
     let live_config = DistillDispatchConfig {
         http_timeout_seconds: LIVE_HTTP_SECS as f64,
         hard_deadline_seconds: 2.0 * (LIVE_HTTP_SECS as f64 + 30.0),
@@ -1075,7 +1095,7 @@ fn d1_live_distill_writes_memories_and_projection_resolves_ticket() {
         let r = rt
             .block_on(dispatch_pass(
                 &private_pool(&rt, &f),
-                &provider,
+                &routes(&provider),
                 contribution_config(),
                 &live_config,
             ))
@@ -1162,7 +1182,7 @@ fn d1_live_distill_writes_memories_and_projection_resolves_ticket() {
     );
     // Card 20 acceptance, the positive half: ONE §19.1 ledger row per provider call, with
     // the right purpose/model/status and real token usage — BOTH it and the §7.4 disclosure row
-    // above, never either alone. Deleting `distill_reasoner::infer`'s `reserve_private_call` or
+    // above, never either alone. Deleting `distill_reasoner`'s `reserve_private_call_with_disclosure` or
     // `finalize_private_call` turns this red.
     let l = &o.ledger;
     assert_eq!(
@@ -1773,7 +1793,7 @@ impl UserReasoningProvider for GatedProvider {
     }
 
     fn model_revision(&self) -> Option<&str> {
-        None
+        self.descriptor.model_revision.as_deref()
     }
 
     async fn complete_structured(
@@ -1845,19 +1865,20 @@ fn d5b_a_late_worker_loses_its_lease_writes_nothing_and_its_cost_is_ledgered() {
         private_pool(&rt, &f),
         private_pool(&rt, &f),
     );
-    let provider = GatedProvider {
+    let provider = Arc::new(GatedProvider {
         descriptor: descriptor(),
         calls: AtomicU32::new(0),
         gate_one: AtomicBool::new(false),
         gate_two: AtomicBool::new(false),
-    };
+    });
+    let providers = routes(&provider);
     // Lease 6 s: a heartbeat every 2 s, so W1's next renew lands after generation 2 exists.
     let config = dispatch_config("d5b-worker", 6.0);
     let w1_done = AtomicBool::new(false);
     let dsn = f.dsn.clone();
     let (w1, w2) = rt.block_on(async {
         let w1 = async {
-            let r = dispatch_pass(&pool_one, &provider, contribution_config(), &config).await;
+            let r = dispatch_pass(&pool_one, &providers, contribution_config(), &config).await;
             w1_done.store(true, Ordering::SeqCst);
             r
         };
@@ -1883,7 +1904,7 @@ fn d5b_a_late_worker_loses_its_lease_writes_nothing_and_its_cost_is_ledgered() {
                 "UPDATE ops.jobs SET next_retry_at = clock_timestamp() - interval '1 second' WHERE job_id = $1",
                 job,
             );
-            let w2 = dispatch_pass(&pool_two, &provider, contribution_config(), &config);
+            let w2 = dispatch_pass(&pool_two, &providers, contribution_config(), &config);
             let release = async {
                 while provider.calls.load(Ordering::SeqCst) < 2 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2194,7 +2215,7 @@ type Sent = Arc<Mutex<Vec<serde_json::Value>>>;
 fn scripted_provider(
     bodies: Vec<&'static str>,
 ) -> (
-    OpenAiCompatibleProvider<ScriptedTransport, EnvKeyDecryptor>,
+    Arc<OpenAiCompatibleProvider<ScriptedTransport, EnvKeyDecryptor>>,
     Sent,
 ) {
     let sent = Sent::default();
@@ -2215,7 +2236,7 @@ fn scripted_provider(
         &resolver,
     )
     .expect("the endpoint passes the SSRF choke point");
-    (provider, sent)
+    (Arc::new(provider), sent)
 }
 
 const TOOL_OVER_CEILING: &str = r#"{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"emit_distillation","arguments":"{\"memories\":[{\"content\":\"Health endpoint before traffic.\",\"memory_type\":\"Decision\",\"class\":\"ProjectConstraint\",\"confidence\":0.9}]}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":5},"base_resp":{"status_code":0,"status_msg":""}}"#;
@@ -2256,7 +2277,9 @@ fn d8_tool_call_reply_goes_through_the_fail_closed_parser() {
     let sent = sent.lock().expect("sent").clone();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0]["tools"][0]["function"]["name"], "emit_distillation");
-    assert_eq!(sent[0]["reasoning_split"], true);
+    // ADR-0060 research amendment 1: a vendor field comes only from the Profile's request_extras
+    // (none here); REASONING_SPLIT selects nothing.
+    assert!(sent[0].get("reasoning_split").is_none());
     assert!(sent[0].get("tool_choice").is_none(), "W1: never sent");
 
     let (two, _, _) = seed_evidence(&mut f, "two tool calls evidence");

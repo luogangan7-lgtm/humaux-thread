@@ -1,0 +1,39 @@
+# §46.1 migration manifest. Card 33b slice 3 / ADR-0060: two narrow worker reads 0206 did not provide —
+# control.reasoning_profile_request_extras (research amendment 1: the admitted Profile@version's vendor
+# request fields reach the route-built provider instance) and control.reasoning_route_health_state
+# (ruling E3 (c): a route parked for stale or denied health is named with its own class). Both
+# role_private_worker only, tenant GUC fenced. §46 forward-fix (EXPAND_CONTRACT, first free after 0206).
+
+migration_id = "0207_reasoning_route_worker_reads"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('control.reasoning_profile_request_extras(uuid,bigint)') is null
+ and to_regprocedure('control.reasoning_route_health_state(uuid,bigint)') is null
+ and to_regprocedure('control.reasoning_profile_capabilities(uuid,bigint)') is not null
+ and exists (select 1 from pg_attribute
+              where attrelid = 'control.reasoning_profiles'::regclass and attname = 'request_extras')
+ as precheck_ok
+"""
+
+postcheck = """
+with non_owner(r) as (values ('role_gateway'), ('role_private_worker'), ('role_consolidation_worker'),
+  ('role_public_worker'), ('role_retrieval_worker'), ('role_batch_issuer'), ('role_maintenance'),
+  ('role_admin')),
+worker_reads(sig) as (values ('control.reasoning_profile_request_extras(uuid,bigint)'),
+  ('control.reasoning_route_health_state(uuid,bigint)'))
+select
+  (select count(*) from worker_reads w where to_regprocedure(w.sig) is not null) = 2
+  and (select bool_and(
+          pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+          and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+          and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                           where x.grantee = 0 and x.privilege_type = 'EXECUTE')
+          and (select bool_and(has_function_privilege(n.r, p.oid, 'EXECUTE') = (n.r = 'role_private_worker'))
+                 from non_owner n))
+         from worker_reads w join pg_proc p on p.oid = to_regprocedure(w.sig)) is true
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward-fix only: DROP FUNCTION control.reasoning_profile_request_extras(uuid,bigint) and control.reasoning_route_health_state(uuid,bigint). A worker built after this migration then fails every admission (InvalidLocator / Database), so the drop needs the worker rolled back first."
+backup_restore_requirement = "none: two functions, no row data changed."

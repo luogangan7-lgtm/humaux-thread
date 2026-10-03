@@ -1,13 +1,14 @@
 //! `private-worker::tests::support::live_minimax` — the live MiniMax rehearsal binding the private-worker tests dial:
 //!   key lookup, DNS pins, descriptor and the real `OpenAiCompatibleProvider` over the egress transport.
-//! Depends-on: crates=[async-trait, humaux-adapters]; services=[MiniMax]; env=[HUMAUX_MINIMAX_DNS_PINS,
-//!   MINIMAX_API_KEY]; modules=[adapters::byok, adapters::byok::ssrf]
+//! Depends-on: crates=[async-trait, humaux-adapters, serde_json]; services=[MiniMax]; env=[HUMAUX_MINIMAX_DNS_PINS,
+//!   MINIMAX_API_KEY]; modules=[adapters::byok, adapters::byok::ssrf, private-worker::tests::support::live_provider]
 //! Called-by: [private-worker::tests::derived_dispatch_e2e, private-worker::tests::distill_hop_e2e]
 //! Invariants: [the key never reaches a println, a panic message or a child's argv (only a child's environment); the
 //!   DNS pins are the one dial-time resolver, as in production (ADR-0039 D0)]
 //! Spec: ADR-0005; ADR-0039; ADR-0058
 //!
-//! Moved here (ADR-0058 D-Q) so `distill_hop_e2e`'s D1 and `derived_dispatch_e2e`'s
+//! The first live provider's instance of `support::live_provider::LiveProfile` (ADR-0060 D-B) is
+//! [`minimax_profile`]. Moved here (ADR-0058 D-Q) so `distill_hop_e2e`'s D1 and `derived_dispatch_e2e`'s
 //! `distill_fairness_live` dial MiniMax through one definition instead of two copies.
 
 use std::sync::Arc;
@@ -20,20 +21,56 @@ use humaux_adapters::byok::{
     ssrf,
 };
 
+use crate::live_provider::LiveProfile;
+
 /// The rehearsal endpoint every live test (and the route rows they seed) names.
 pub const MINIMAX_CHAT_URL: &str = "https://api.minimaxi.com/v1/chat/completions";
+/// The host the rehearsal recipient may dial (ADR-0060 D-L).
+#[allow(dead_code)] // derived_dispatch_e2e only; distill_hop_e2e routes through stub closures
+pub const MINIMAX_HOST: &str = "api.minimaxi.com";
 /// The rehearsal model; route admission compares it with the seeded `processor_models` row.
 pub const MINIMAX_MODEL: &str = "MiniMax-M3";
 /// The provider id the seeded route rows and the descriptor share.
 pub const MINIMAX_PROVIDER: &str = "minimax";
-/// What the rehearsal binding declares (`HUMAUX_PRIVATE_WORKER_CAPABILITIES` of every subprocess
-/// that dials it, and the in-process descriptor). ADR-0058 R10: the tool channel is kept because
-/// the live A/B probe (`derived_dispatch_e2e::distill_channel_ab_live`) measured it no worse.
-pub const REHEARSAL_CAPABILITIES: [ReasoningCapability; 3] = [
+/// What the rehearsal Profile declares (the seeded catalog row, the Profile and every in-process
+/// descriptor built from its route — ADR-0060 D-C compares the sets). ADR-0058 R10: the tool channel is kept because the live A/B probe
+/// (`derived_dispatch_e2e::distill_channel_ab_live`) measured it no worse.
+pub const REHEARSAL_CAPABILITIES: [ReasoningCapability; 4] = [
+    ReasoningCapability::Text,
     ReasoningCapability::StructuredOutput,
     ReasoningCapability::ToolCalls,
     ReasoningCapability::ReasoningSplit,
 ];
+
+/// ADR-0060 E5: the catalog `model_revision` label of a capability set — `caps-` and the sorted
+/// wire names joined by `.` — so a wider set never collides with a frozen catalog row (the
+/// catalog is append-only). Never sent on the wire.
+pub fn caps_revision_label(capabilities: &[ReasoningCapability]) -> String {
+    let mut names: Vec<&str> = capabilities.iter().map(|c| c.as_str()).collect();
+    names.sort_unstable();
+    format!("caps-{}", names.join("."))
+}
+
+/// The first live provider as a [`LiveProfile`] (ADR-0060 D-B): the rehearsal binding with its
+/// `{"reasoning_split": true}` request extra (research amendment 1: a vendor field is profile data).
+#[allow(dead_code)] // derived_dispatch_e2e only (the two-provider live gate)
+pub fn minimax_profile(region: &str) -> LiveProfile {
+    LiveProfile {
+        provider_id: MINIMAX_PROVIDER.to_owned(),
+        chat_url: MINIMAX_CHAT_URL.to_owned(),
+        hosts: vec![MINIMAX_HOST.to_owned()],
+        model_id: MINIMAX_MODEL.to_owned(),
+        capabilities: REHEARSAL_CAPABILITIES.to_vec(),
+        request_extras: serde_json::json!({"reasoning_split": true})
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        key_env: "MINIMAX_API_KEY".to_owned(),
+        region: region.to_owned(),
+        egress_processor_id: None,
+        dns_pins: dns_pins(),
+    }
+}
 
 /// Same env + `/Volumes/data/viral-skill-eval/.env` fallback `minimax_live_smoke.rs` uses.
 /// Zero println/panic-message exposure of the value.
@@ -108,9 +145,10 @@ pub fn descriptor_declaring(
     ReasoningProviderDescriptor {
         provider_id: MINIMAX_PROVIDER.to_string(),
         model_id: model_id.to_string(),
-        model_revision: None,
+        model_revision: Some(caps_revision_label(capabilities)),
         capabilities: capabilities.to_vec(),
         custom_endpoint: Some(MINIMAX_CHAT_URL.to_string()),
+        request_extras: Default::default(),
     }
 }
 

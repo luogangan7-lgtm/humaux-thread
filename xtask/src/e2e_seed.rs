@@ -1,5 +1,5 @@
 //! `xtask::e2e_seed` — persistent tenant/credential/quota seed for deployment-point rehearsals.
-//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, postgres, rand, time, tokio, uuid];
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, postgres, rand, serde_json, time, tokio, uuid];
 //!   services=[PostgreSQL(any) w=[control.api_keys, control.audit_events, control.credentials,
 //!   control.entitlement_snapshots, control.memberships, control.private_reasoning_domains, control.processor_models,
 //!   control.provider_accounts, control.provider_endpoints, control.quota_windows,
@@ -14,7 +14,7 @@
 //!   projection.private_memory_points, projection.stream_checkpoints, projection.stream_log,
 //!   projection.tenant_placements] x=[control.onboard_tenant, control.resolve_user_reasoning_admission],
 //!   PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
-//!   modules=[adapters::membership_repo, adapters::postgres, adapters::provisioning, adapters::quota_repo,
+//!   modules=[adapters::byok, adapters::byok::ssrf, adapters::membership_repo, adapters::postgres, adapters::provisioning, adapters::quota_repo,
 //!   domain::identity, domain::ids, domain::ticket_family, protocol::edge]
 //! Called-by: [xtask::e2e_onboard, xtask::main]
 //! Invariants: [a thin wrapper over adapters::provisioning (the same onboarding doors humaux-maintenance uses, no INSERT
@@ -67,11 +67,33 @@
 //! line mapping every lane it created (the base lane and, with `--second-domain`, the second one)
 //! to that name. Only names and references are printed, never a key.
 //!
+//! Card 33b (ADR-0060 D-A, E5): `--capabilities <CSV>` (required, §11.2 closed set) is what the
+//! seeded Profile declares and what a catalog row this seed creates declares. An existing catalog
+//! row narrower than that set is refused naming `--model-revision` (catalog rows are append-only, so
+//! a wider set takes a new revision label).
+//!
+//! Card 33b (ADR-0060 D-J): `--account-ref <text>` (required) is the vendor account every lane of
+//! this seed declares (`external_account_ref_hash = sha256(text)`): lanes whose references the
+//! deployment maps to one key variable must name one vendor account or the private worker refuses
+//! to boot. The seed no longer prints provider / model / endpoint / capability lines for the worker
+//! (ADR-0060 D-C: those come from each route); it prints the deny-only
+//! `HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS` (`<processor-id>=<endpoint host>`) and
+//! `HUMAUX_PRIVATE_WORKER_REGIONS` lines its lanes need.
+//!
+//! Card 33b (ADR-0060 research amendment 1): `--request-extras <JSON object>` (required, `{}` for
+//! none) is the Profile's vendor request fields; the adapter writes no vendor field itself.
+//!
+//! Card 33b (ADR-0060 D-H): `--no-lane` seeds the tenant, users, reasoning domains and keys only —
+//! no catalog row, account, credential, endpoint, profile, policy, binding or health row, and no
+//! private-worker export line. The routes then come from `humaux-maintenance reasoning register |
+//! bind | attest-health`, the production doors (docs/ops/rehearse.sh does this).
+//!
 //! Refuses to run against anything but a local disposable database (binding rule): DSN
 //! host must be `127.0.0.1` and the database name must start with `humaux_thread_`.
 
 use std::fmt::Write as _;
 
+use humaux_adapters::byok::ReasoningCapability;
 use humaux_adapters::membership_repo::AdminAction;
 use humaux_adapters::postgres::MaintenanceDbPool;
 use humaux_adapters::provisioning::{self, NewApiKey, QdrantFace, TenantReceipt, TenantRequest};
@@ -167,6 +189,31 @@ pub(crate) struct LaneFlags {
     pub(crate) provider_id: String,
     pub(crate) provider_model_id: String,
     pub(crate) model_revision: String,
+    /// §11.2: what the seeded Profile declares, and the catalog row's capabilities when this seed
+    /// creates it (ADR-0060 E5: a wider set needs a new `--model-revision` label, the catalog is
+    /// append-only).
+    pub(crate) capabilities: Vec<ReasoningCapability>,
+    /// ADR-0060 D-J: the vendor account every lane of this seed declares (its sha256 is the
+    /// account's `external_account_ref_hash`).
+    pub(crate) account_ref: String,
+    /// ADR-0060 research amendment 1: the Profile's vendor request fields (`{}` for none); the
+    /// adapter writes no vendor field itself, and the 0206 CHECK refuses an adapter-owned key.
+    pub(crate) request_extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `--capabilities TEXT,STRUCTURED_OUTPUT,...` over the §11.2 closed set (no default, §78.1).
+fn parse_capabilities(raw: &str) -> Result<Vec<ReasoningCapability>, String> {
+    let caps = raw
+        .split(',')
+        .map(|c| {
+            ReasoningCapability::parse(c.trim())
+                .ok_or_else(|| format!("--capabilities: {c:?} is outside the §11.2 closed set"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if caps.is_empty() {
+        return Err("--capabilities must name at least one capability".to_owned());
+    }
+    Ok(caps)
 }
 
 fn parse_lane_flags(args: &[String]) -> Result<LaneFlags, String> {
@@ -184,7 +231,22 @@ fn parse_lane_flags(args: &[String]) -> Result<LaneFlags, String> {
         provider_id: get("--provider-id")?,
         provider_model_id: get("--provider-model-id")?,
         model_revision: get("--model-revision")?,
+        capabilities: parse_capabilities(&get("--capabilities")?)?,
+        account_ref: Some(get("--account-ref")?)
+            .filter(|r| !r.trim().is_empty())
+            .ok_or("--account-ref must not be empty")?,
+        request_extras: parse_request_extras(&get("--request-extras")?)?,
     })
+}
+
+/// `--request-extras <JSON object>` — required like `humaux-maintenance reasoning register`'s
+/// (pass `{}` for none), so no vendor field is ever implied by its absence.
+fn parse_request_extras(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match serde_json::from_str(raw) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        Ok(_) => Err("--request-extras must be a JSON object".to_owned()),
+        Err(e) => Err(format!("--request-extras: not JSON ({e})")),
+    }
 }
 
 /// The lane's own ids, printed alongside the base six + used to build the two paste-ready
@@ -275,27 +337,40 @@ pub(crate) fn seed_lane(
         .map_err(|e| format!("insert credential: {}", db_detail(&e)))?
         .get(0);
 
+    let capabilities: Vec<&str> = flags.capabilities.iter().map(|c| c.as_str()).collect();
     txn.execute(
         "INSERT INTO control.processor_models(processor_id,provider_model_id,model_revision,capabilities,status,catalog_observed_at) \
-         VALUES($1,$2,$3,ARRAY['TEXT','STRUCTURED_OUTPUT'],'ACTIVE',clock_timestamp()) ON CONFLICT DO NOTHING",
-        &[&flags.provider_id, &flags.provider_model_id, &flags.model_revision],
+         VALUES($1,$2,$3,$4,'ACTIVE',clock_timestamp()) ON CONFLICT DO NOTHING",
+        &[&flags.provider_id, &flags.provider_model_id, &flags.model_revision, &capabilities],
     )
     .map_err(|e| format!("insert processor model: {}", db_detail(&e)))?;
-    let processor_model_id: Uuid = txn
+    let (processor_model_id, covers): (Uuid, bool) = txn
         .query_one(
-            "SELECT processor_model_id FROM control.processor_models \
+            "SELECT processor_model_id, $4::text[] <@ capabilities FROM control.processor_models \
              WHERE processor_id=$1 AND provider_model_id=$2 AND model_revision=$3 AND status='ACTIVE'",
-            &[&flags.provider_id, &flags.provider_model_id, &flags.model_revision],
+            &[&flags.provider_id, &flags.provider_model_id, &flags.model_revision, &capabilities],
         )
-        .map_err(|e| format!("select processor model: {}", db_detail(&e)))?
-        .get(0);
+        .map(|row| (row.get(0), row.get(1)))
+        .map_err(|e| format!("select processor model: {}", db_detail(&e)))?;
+    // ADR-0060 E5: catalog rows are append-only; an existing row narrower than --capabilities would
+    // make the profile INSERT fail with a generic 0128 trigger error, so name the way out instead.
+    if !covers {
+        return Err(format!(
+            "the catalog row ({}, {}, {}) declares fewer capabilities than --capabilities {}; \
+             pass a new --model-revision label (e.g. caps-<sorted capabilities joined by .>)",
+            flags.provider_id,
+            flags.provider_model_id,
+            flags.model_revision,
+            capabilities.join(",")
+        ));
+    }
 
-    let account_hash: Vec<u8> = Uuid::new_v4().as_bytes().repeat(2);
+    // ADR-0060 D-J: one --account-ref = one vendor account across every lane that names it.
     let provider_account_id: Uuid = txn
         .query_one(
             "INSERT INTO control.provider_accounts(tenant_id,owner_user_id,processor_id,external_account_ref_hash) \
-             VALUES($1,$2,$3,$4) RETURNING provider_account_id",
-            &[&tenant_id, &user_id, &flags.provider_id, &account_hash],
+             VALUES($1,$2,$3,sha256(convert_to($4::text,'UTF8'))) RETURNING provider_account_id",
+            &[&tenant_id, &user_id, &flags.provider_id, &flags.account_ref],
         )
         .map_err(|e| format!("insert provider account: {}", db_detail(&e)))?
         .get(0);
@@ -315,9 +390,9 @@ pub(crate) fn seed_lane(
         .get(0);
     let profile_id: Uuid = txn
         .query_one(
-            "INSERT INTO control.reasoning_profiles(tenant_id,owner_user_id,provider_account_id,endpoint_id,processor_model_id,credential_ref,billing_account_id,default_billing_instrument_id,capabilities,processing_region) \
-             VALUES($1,$2,$3,$4,$5,$6,NULL,NULL,ARRAY['TEXT'],$7) RETURNING profile_id",
-            &[&tenant_id, &user_id, &provider_account_id, &endpoint_id, &processor_model_id, &credential_id, &flags.region],
+            "INSERT INTO control.reasoning_profiles(tenant_id,owner_user_id,provider_account_id,endpoint_id,processor_model_id,credential_ref,billing_account_id,default_billing_instrument_id,capabilities,processing_region,request_extras) \
+             VALUES($1,$2,$3,$4,$5,$6,NULL,NULL,$7,$8,$9::text::jsonb) RETURNING profile_id",
+            &[&tenant_id, &user_id, &provider_account_id, &endpoint_id, &processor_model_id, &credential_id, &capabilities, &flags.region, &serde_json::Value::Object(flags.request_extras.clone()).to_string()],
         )
         .map_err(|e| format!("insert reasoning profile: {}", db_detail(&e)))?
         .get(0);
@@ -373,8 +448,8 @@ pub(crate) struct SecondDomain {
     user_id: Uuid,
     reasoning_domain_id: Uuid,
     wire: String,
-    /// The second lane's credential reference (ADR-0059 D-I map entry).
-    credential_id: Uuid,
+    /// The second lane's credential reference (ADR-0059 D-I map entry); `None` under `--no-lane`.
+    credential_id: Option<Uuid>,
 }
 
 /// ADR-0058 M8, rehearsal twin (card 32 `--second-domain`): one tenant whose Evidence lands in
@@ -388,7 +463,7 @@ pub(crate) fn seed_second_domain(
     maintenance: &MaintenanceDbPool,
     client: &mut Client,
     tenant: &TenantReceipt,
-    flags: &LaneFlags,
+    flags: Option<&LaneFlags>,
     scopes: &[String],
     pepper: &[u8],
 ) -> Result<SecondDomain, String> {
@@ -410,13 +485,17 @@ pub(crate) fn seed_second_domain(
         )
         .map_err(|e| format!("insert second reasoning domain: {}", db_detail(&e)))?
         .get(0);
-    let lane = seed_lane(
-        client,
-        tenant.tenant_id,
-        user.user_id,
-        reasoning_domain_id,
-        flags,
-    )?;
+    let lane = flags
+        .map(|flags| {
+            seed_lane(
+                client,
+                tenant.tenant_id,
+                user.user_id,
+                reasoning_domain_id,
+                flags,
+            )
+        })
+        .transpose()?;
     let (key, wire) = seed_key(pepper);
     rt.block_on(provisioning::issue_api_key(
         maintenance,
@@ -432,7 +511,7 @@ pub(crate) fn seed_second_domain(
         user_id: user.user_id,
         reasoning_domain_id,
         wire,
-        credential_id: lane.credential_id,
+        credential_id: lane.map(|l| l.credential_id),
     })
 }
 
@@ -807,9 +886,11 @@ fn teardown(client: &mut Client, tenant_id: Uuid) -> Result<(), String> {
 
 /// `cargo xtask e2e-seed --pepper-hex <hex> --scopes <a,b> [--limit 1000] \
 ///   --processor-id <uuid> --region <s> --service-tier <s> --endpoint-ref <url> \
-///   --provider-id <s> --provider-model-id <s> --model-revision <s> \
-///   --collection <name> --dimension <u32> [--qdrant-host 127.0.0.1] [--qdrant-port 6333] \
-///   --credential-env <ENV_NAME> [--workspaces <n>] [--second-domain]`
+///   --provider-id <s> --provider-model-id <s> --model-revision <s> --capabilities <CSV> \
+///   --account-ref <text> --request-extras <JSON object> --collection <name> --dimension <u32> [--qdrant-host 127.0.0.1] [--qdrant-port 6333] \
+///   --credential-env <ENV_NAME> [--workspaces <n>] [--second-domain]`,
+/// or the same with `--no-lane` (ADR-0060 D-H: only `--pepper-hex --scopes --processor-id` and the
+/// Qdrant/collection flags; the lane flags and `--credential-env` are not read),
 /// or `cargo xtask e2e-seed --teardown <tenant_id> [--drop-collection <name>] \
 ///   [--qdrant-host 127.0.0.1] [--qdrant-port 6333]`.
 #[allow(clippy::too_many_lines)]
@@ -908,10 +989,29 @@ pub fn run(args: &[String]) -> i32 {
         },
         None => DEFAULT_LIMIT,
     };
-    let lane_flags = match parse_lane_flags(args) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("e2e-seed: fail ({e})");
+    // ADR-0060 D-H: `--no-lane` seeds tenant, users, domains and keys only; the reasoning routes are
+    // then written by `humaux-maintenance reasoning register|bind|attest-health` (the rehearsal's way).
+    let no_lane = args.iter().any(|a| a == "--no-lane");
+    let lane_flags = if no_lane {
+        None
+    } else {
+        match parse_lane_flags(args) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("e2e-seed: fail ({e})");
+                return 1;
+            }
+        }
+    };
+    // Card 21: the retrieval worker's §7 egress identity is printed in both modes.
+    let retrieval_processor_id = match arg(args, "--processor-id").map(|v| v.parse::<Uuid>()) {
+        Some(Ok(id)) => id,
+        Some(Err(e)) => {
+            eprintln!("e2e-seed: fail (--processor-id must be a uuid: {e})");
+            return 1;
+        }
+        None => {
+            eprintln!("e2e-seed: fail (missing required flag --processor-id — §78.1: no default)");
             return 1;
         }
     };
@@ -922,13 +1022,21 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let Some(credential_env) = arg(args, "--credential-env") else {
-        eprintln!("e2e-seed: fail (missing required flag --credential-env — §78.1: no default)");
-        return 1;
-    };
-    if let Err(e) = credential_map_value(&credential_env, &[]) {
-        eprintln!("e2e-seed: fail ({e})");
-        return 1;
+    let credential_env = arg(args, "--credential-env");
+    match (&lane_flags, &credential_env) {
+        (Some(_), None) => {
+            eprintln!(
+                "e2e-seed: fail (missing required flag --credential-env — §78.1: no default)"
+            );
+            return 1;
+        }
+        (_, Some(env_name)) => {
+            if let Err(e) = credential_map_value(env_name, &[]) {
+                eprintln!("e2e-seed: fail ({e})");
+                return 1;
+            }
+        }
+        (None, None) => {}
     }
 
     // Card 27: `--workspaces <n>` (absent = 1, so every existing caller is unchanged).
@@ -990,13 +1098,19 @@ pub fn run(args: &[String]) -> i32 {
     };
     let base = &seeded.tenant;
 
-    let lane = match seed_lane(
-        &mut client,
-        base.tenant_id,
-        base.owner_user_id,
-        base.reasoning_domain_id,
-        &lane_flags,
-    ) {
+    let lane = match lane_flags
+        .as_ref()
+        .map(|flags| {
+            seed_lane(
+                &mut client,
+                base.tenant_id,
+                base.owner_user_id,
+                base.reasoning_domain_id,
+                flags,
+            )
+        })
+        .transpose()
+    {
         Ok(l) => l,
         Err(e) => {
             eprintln!("e2e-seed: fail (lane seed: {e})");
@@ -1011,7 +1125,7 @@ pub fn run(args: &[String]) -> i32 {
             &maintenance,
             &mut client,
             base,
-            &lane_flags,
+            lane_flags.as_ref(),
             &scopes,
             &pepper,
         ) {
@@ -1041,15 +1155,17 @@ pub fn run(args: &[String]) -> i32 {
         println!("second_reasoning_domain_id: {}", d.reasoning_domain_id);
         println!("bearer_d2: {}", d.wire);
     }
-    println!("binding_id: {}", lane.binding_id);
-    println!("binding_version: {}", lane.binding_version);
-    println!("distill_binding_id: {}", lane.distill_binding_id);
-    println!("credential_id: {}", lane.credential_id);
-    println!("provider_account_id: {}", lane.provider_account_id);
-    println!("processor_model_id: {}", lane.processor_model_id);
-    println!("endpoint_id: {}", lane.endpoint_id);
-    println!("profile_id: {}", lane.profile_id);
-    println!("policy_id: {}", lane.policy_id);
+    if let Some(lane) = &lane {
+        println!("binding_id: {}", lane.binding_id);
+        println!("binding_version: {}", lane.binding_version);
+        println!("distill_binding_id: {}", lane.distill_binding_id);
+        println!("credential_id: {}", lane.credential_id);
+        println!("provider_account_id: {}", lane.provider_account_id);
+        println!("processor_model_id: {}", lane.processor_model_id);
+        println!("endpoint_id: {}", lane.endpoint_id);
+        println!("profile_id: {}", lane.profile_id);
+        println!("policy_id: {}", lane.policy_id);
+    }
     println!("collection_name: {}", qdrant_flags.collection);
     println!("embedding_provider: {}", qdrant_flags.embedding_provider);
     println!("embedding_region: {}", qdrant_flags.embedding_region);
@@ -1063,34 +1179,31 @@ pub fn run(args: &[String]) -> i32 {
     println!("export HUMAUX_CONSOLIDATION_WORKER_BATCH=8");
     println!("export HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5");
     println!();
-    println!(
-        "export HUMAUX_PRIVATE_WORKER_PROVIDER_ID={}",
-        lane_flags.provider_id
-    );
-    println!(
-        "export HUMAUX_PRIVATE_WORKER_MODEL_ID={}",
-        lane_flags.provider_model_id
-    );
-    println!(
-        "export HUMAUX_PRIVATE_WORKER_MODEL_REVISION={}",
-        lane_flags.model_revision
-    );
-    println!(
-        "export HUMAUX_PRIVATE_WORKER_CHAT_URL={}",
-        lane_flags.endpoint_ref
-    );
-    println!("export HUMAUX_PRIVATE_WORKER_REGION={}", lane_flags.region);
-    println!(
-        "export HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID={}",
-        lane_flags.egress_processor_id
-    );
-    let mut lane_refs = vec![lane.credential_id];
-    lane_refs.extend(second_domain.as_ref().map(|d| d.credential_id));
-    match credential_map_value(&credential_env, &lane_refs) {
-        Ok(map) => println!("export HUMAUX_PRIVATE_WORKER_CREDENTIALS={map}"),
-        Err(e) => {
-            eprintln!("e2e-seed: fail ({e})");
-            return 1;
+    // ADR-0060 D-C / D-L: the deny-only lists the worker needs to serve these lanes; provider,
+    // model, endpoint and capabilities come from each admitted route, never from the worker env.
+    // Under `--no-lane` the deployment composes these from its `reasoning register` receipts.
+    if let (Some(lane_flags), Some(lane), Some(credential_env)) =
+        (&lane_flags, &lane, &credential_env)
+    {
+        match humaux_adapters::byok::ssrf::https_host(&lane_flags.endpoint_ref) {
+            Ok(host) => println!(
+                "export HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS={}={host}",
+                lane_flags.egress_processor_id
+            ),
+            Err(e) => {
+                eprintln!("e2e-seed: fail (--endpoint-ref host: {e})");
+                return 1;
+            }
+        }
+        println!("export HUMAUX_PRIVATE_WORKER_REGIONS={}", lane_flags.region);
+        let mut lane_refs = vec![lane.credential_id];
+        lane_refs.extend(second_domain.as_ref().and_then(|d| d.credential_id));
+        match credential_map_value(credential_env, &lane_refs) {
+            Ok(map) => println!("export HUMAUX_PRIVATE_WORKER_CREDENTIALS={map}"),
+            Err(e) => {
+                eprintln!("e2e-seed: fail ({e})");
+                return 1;
+            }
         }
     }
     println!();
@@ -1110,10 +1223,7 @@ pub fn run(args: &[String]) -> i32 {
     // embedding provider with `ProcessorId(Uuid::nil())`, so every `ops.data_disclosures` row
     // it wrote named processor all-zeros. Emitted from the SAME `--processor-id` the private
     // worker's identity comes from, so the deployment has one value to set, not two.
-    println!(
-        "export HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID={}",
-        lane_flags.egress_processor_id
-    );
+    println!("export HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID={retrieval_processor_id}");
     println!(
         "export HUMAUX_GATEWAY_EMBEDDING_DIMENSION={}",
         qdrant_flags.dimension
@@ -1166,6 +1276,7 @@ mod tests {
         DSN_ENV, LaneFlags, MAINTENANCE_DSN_ENV, QdrantFlags, credential_map_value,
         guard_local_test_db, seed_lane, teardown,
     };
+    use humaux_adapters::byok::ReasoningCapability;
     use humaux_adapters::postgres::MaintenanceDbPool;
     use postgres::{Client, NoTls};
     use uuid::Uuid;
@@ -1186,6 +1297,35 @@ mod tests {
 
     /// Card 28 fault (e): the guard stays — a hostname (even `localhost`) is refused, only the
     /// literal `127.0.0.1` and a `humaux_thread_*` database pass.
+    /// §11.2 closed set, no default (§78.1): an unknown or empty capability list is refused.
+    #[test]
+    fn capabilities_flag_parses_the_closed_set_only() {
+        assert_eq!(
+            super::parse_capabilities("TEXT, STRUCTURED_OUTPUT,JSON_OBJECT").unwrap(),
+            vec![
+                ReasoningCapability::Text,
+                ReasoningCapability::StructuredOutput,
+                ReasoningCapability::JsonObject
+            ]
+        );
+        assert!(super::parse_capabilities("TEXT,VISIONS").is_err());
+        assert!(super::parse_capabilities("").is_err());
+    }
+
+    /// ADR-0060 research amendment 1: `--request-extras` is a JSON object (`{}` for none); an
+    /// array, a scalar or non-JSON is refused before any row is written.
+    #[test]
+    fn request_extras_flag_takes_a_json_object_only() {
+        assert_eq!(
+            super::parse_request_extras(r#"{"reasoning_split":true}"#).unwrap()["reasoning_split"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(super::parse_request_extras("{}").unwrap().is_empty());
+        for bad in ["[]", "true", "", "{"] {
+            assert!(super::parse_request_extras(bad).is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn guard_refuses_hostname_dsn() {
         assert!(
@@ -1203,10 +1343,10 @@ mod tests {
     /// Card 16 regression, seed side. Two `e2e-seed` invocations must produce two tenants that
     /// ONE private-worker process can serve: each with its OWN admitted `PRIVATE_DISTILL_TEXT`
     /// route and its OWN credential (no shared/global row standing in for a per-tenant one), and
-    /// both under the SAME `egress_processor_id` — that field is the deployment's egress identity
-    /// (`HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID`), and `provider_matches_admission` compares
-    /// the two, so a second tenant seeded under a different `--processor-id` is admitted by
-    /// nothing and its Distill hop defers forever.
+    /// both under the SAME `egress_processor_id` — that field is the recipient the deployment's
+    /// `HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS` must list (ADR-0060 D-C), so a second tenant
+    /// seeded under a different `--processor-id` is refused by a worker configured from the
+    /// first seed's export line and its Distill hop parks.
     ///
     /// Card 28: the tenants come from the onboarding library over `HUMAUX_MAINTENANCE_PG_DSN`
     /// (the seed's own path), the lane from the owner DSN as before.
@@ -1260,9 +1400,16 @@ mod tests {
             region: "cn-shanghai".to_string(),
             service_tier: "standard".to_string(),
             endpoint_ref: format!("https://xtask-e2e-seed-{run}.invalid/v1/chat/completions"),
-            provider_id: format!("xtask-e2e-seed-{run}"),
+            provider_id: format!("e2e-seed-{run}"),
             provider_model_id: "self-test-model".to_string(),
             model_revision: "self-test".to_string(),
+            capabilities: vec![
+                ReasoningCapability::Text,
+                ReasoningCapability::StructuredOutput,
+            ],
+            account_ref: format!("e2e-seed-account-{run}"),
+            request_extras: super::parse_request_extras(r#"{"xtask_seed_probe":true}"#)
+                .expect("extras"),
         };
         // This test never touches Qdrant: it onboards through the PostgreSQL-only library steps
         // (`onboard_pg_only`); the Qdrant half of `provision` runs in `cargo xtask e2e-onboard`.
@@ -1271,7 +1418,7 @@ mod tests {
             dimension: 8,
             host: "127.0.0.1".to_string(),
             port: 1,
-            embedding_provider: format!("xtask-e2e-seed-{run}"),
+            embedding_provider: format!("e2e-seed-{run}"),
             embedding_region: "cn-shanghai".to_string(),
         };
         let scopes = vec!["memory:write".to_string()];
@@ -1316,12 +1463,68 @@ mod tests {
                         "tenant {tenant_id} has {rows} admitted PRIVATE_DISTILL_TEXT routes, want 1"
                     ));
                 }
+                // ADR-0060 research amendment 1: the Profile carries --request-extras verbatim.
+                // Fault: drop the column from the INSERT ⇒ the profile stores `{}` and the
+                // deployed worker sends no vendor field (e2e-onboard's MiniMax lane).
+                let extras = client
+                    .query_one(
+                        "SELECT count(*), count(*) FILTER (WHERE request_extras <> \
+                           '{\"xtask_seed_probe\":true}'::jsonb) \
+                         FROM control.reasoning_profiles WHERE tenant_id = $1",
+                        &[tenant_id],
+                    )
+                    .map_err(|e| format!("read profile extras: {e}"))?;
+                let (profiles, wrong): (i64, i64) = (extras.get(0), extras.get(1));
+                if profiles == 0 || wrong != 0 {
+                    return Err(format!(
+                        "tenant {tenant_id}: {wrong} of {profiles} profile(s) lack --request-extras"
+                    ));
+                }
+            }
+            // ADR-0060 E5: the catalog row this run created declares {TEXT, STRUCTURED_OUTPUT}; a
+            // wider --capabilities on the same identity is refused naming --model-revision.
+            // Fault: drop the `covers` refusal → the 0128 profile trigger's generic error instead.
+            let wider = LaneFlags {
+                capabilities: vec![
+                    ReasoningCapability::Text,
+                    ReasoningCapability::StructuredOutput,
+                    ReasoningCapability::ToolCalls,
+                ],
+                ..flags(egress)
+            };
+            let (tenant_id, user_id, domain_id) = seeded[0];
+            match seed_lane(&mut client, tenant_id, user_id, domain_id, &wider) {
+                Err(error) if error.contains("--model-revision") => {}
+                Err(error) => return Err(format!("wider caps refused without the flag: {error}")),
+                Ok(_) => return Err("a narrower catalog row accepted a wider profile".to_string()),
             }
             if lanes[0].distill_binding_id == lanes[1].distill_binding_id {
                 return Err("the two tenants share one distill binding".to_string());
             }
             if lanes[0].credential_id == lanes[1].credential_id {
                 return Err("the two tenants share one credential".to_string());
+            }
+            // ADR-0060 D-J: one --account-ref names one vendor account in every lane, so lanes the
+            // deployment maps to one key variable pass the worker's boot check. Fault: hash a
+            // random value per lane (the pre-33b seed) ⇒ two hashes.
+            let hashes: Vec<Vec<u8>> = client
+                .query(
+                    "SELECT DISTINCT external_account_ref_hash FROM control.provider_accounts \
+                     WHERE provider_account_id = ANY($1)",
+                    &[&vec![
+                        lanes[0].provider_account_id,
+                        lanes[1].provider_account_id,
+                    ]],
+                )
+                .map_err(|e| format!("read account hashes: {e}"))?
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            if hashes.len() != 1 {
+                return Err(format!(
+                    "one --account-ref must declare one vendor account, got {} hashes",
+                    hashes.len()
+                ));
             }
             let egresses: Vec<Uuid> = client
                 .query(
@@ -1336,9 +1539,8 @@ mod tests {
             if egresses != vec![egress] {
                 return Err(format!(
                     "the two tenants must share ONE deployment egress processor ({egress}), got \
-                     {egresses:?} — a private worker holds a single \
-                     HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID, so the odd one out is admitted by \
-                     nothing and its distill defers forever (card 16)"
+                     {egresses:?} — the seed exports one recipient, so the odd one out is refused \
+                     by the worker's deny-only list and its distill parks (card 16)"
                 ));
             }
             Ok(())

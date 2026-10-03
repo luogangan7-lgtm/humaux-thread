@@ -644,8 +644,11 @@ over-ceiling rollup (never clamps). Gate: `consolidation_reasoner::consolidation
 
 ### 6.9 Provider and host dependence
 
-- The delivery path depends on **real DashScope** (embeddings) and **real MiniMax** (distill,
-  consolidation). Both are single points of failure for the hops they serve.
+- The delivery path depends on **real DashScope** (embeddings) and on the provider each reasoning
+  domain is bound to (distill, consolidation). Since card 33b (ADR-0060) that is per Binding@version:
+  the rehearsal runs tenants A and B on MiniMax and tenant C on a second OpenAI-compatible provider in
+  one worker. A bound provider is still a single point of failure for its domains (PINNED, no
+  fallback: R4); its outage settles RETRY → DEAD, recovered with `jobs requeue-dead` (ADR-0060 D-G).
 - **This node requires DNS pins.** The dev box's resolver fake-IPs `api.minimaxi.com` into
   `198.18.0.0/15`, which §11.4 forbids; the checked resolver correctly refuses it. That refusal
   is the card-17 negative control, not a defect. Every live run must source
@@ -930,6 +933,33 @@ OpenBao is still card 54.
   `DERIVED_DISTILL`, so it does not catch this leak (filed for the main line).
 - **Main-line step outside the slices (E4):** rotating the shared dev cluster (red `deploy-check` →
   `roles rotate` → superuser password → green `deploy-check`).
+
+### 6.19 Closed by card 33b (ADR-0060)
+
+| Change | Before | After (ADR-0060) | Witness |
+|---|---|---|---|
+| Which LLM a job uses | one process-level descriptor (`HUMAUX_PRIVATE_WORKER_PROVIDER_ID` / `_MODEL_ID` / `_CHAT_URL` / `_CAPABILITIES`) for every tenant | per job from the admitted Binding@version → Profile@version: provider, model, endpoint, capabilities, request extras, credential reference; one cached instance per Profile@version; the five keys are refused at boot | `private_worker_lib` (T13–T16, T22, T23, T35, T36, T38), `c33b_route_dispatch_named` (T18–T21, T34), `two_provider_live` (T24) |
+| Ledger truth | private rows carried provider/model only; ledger row and disclosure in two transactions | 14 route columns, USER payer, DB-checked equality with a current exact admission; ledger row + disclosure in one transaction (deferred trigger) | `adapters_route_runtime` (T1–T7, T37, T39) |
+| Request shape | vendor field written by code (`reasoning_split`) | profile `request_extras` (adapter-owned keys refused by CHECK and door); TOOL_CALLS > JSON_OBJECT > content; `<think>` tolerated; `usage` optional | `c33b_request_shape_named` |
+| Fairness across providers | least-recently-served only; one hanging provider could hold all 4 slots | fewest held slots first (0206) | T33, T34 |
+| Health | 30-minute TEST rows written by the seed | operator `attest-health` (explicit validity), traffic renewal, INVALID on 401, `ROUTE_HEALTH_STALE` / `_DENIED` classes | E3 tests, `reasoning status` |
+| Onboarding a route | owner SQL in `e2e-seed` only | `humaux-maintenance reasoning register / bind / attest-health / profile-state / status` over five role_maintenance-only doors (0208) | `c33b_route_doors_named` (T25–T29), `c33b_t30_route_doors_named` |
+
+- **Rehearsal (no soak, 2026-10-03, debug profile, `humaux_thread_dev`, label `impl`):** `REHEARSAL VERDICT:
+  103 passed, 0 failed`. Every tenant was onboarded only through `humaux-maintenance reasoning …`
+  (`e2e-seed --no-lane`); the deployed worker served two providers on a 4-reference map. Private-reasoning
+  ledger rows the worker wrote, SUCCEEDED: tenant A MiniMax-M3 83, tenant B MiniMax-M3 39, tenant C
+  (two domains) qwen-plus 32 + 3; `providers_distinct=2`, `process_provider_env_sites=0`, tenant C only on
+  its route, A/B only on theirs. The rehearsal's consolidation jobs (197) all ended DONE without a provider
+  call, so the two-provider proof of the consolidation hop is the stub test T11, not the rehearsal.
+- **Declared deviation from §67.2 until card 54:** keys stay environment-held (one variable per credential
+  reference); a reference registered after boot needs a map entry and a worker restart (L15).
+- **Operator-visible:** required `HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS`, `_REGIONS`,
+  `_HEALTH_RENEW_SECS`; removed and refused `_PROVIDER_ID`, `_MODEL_ID`, `_MODEL_REVISION`, `_CHAT_URL`,
+  `_CAPABILITIES`, `_EGRESS_PROCESSOR_ID`, `_REGION`. Procedures: runbook §3.1 (register / bind / switch
+  model / attest / disable / add a provider) and §10.4.
+- **Filed, not closed:** R4 fallback across models; a prober for routes without traffic (card 38); per-provider
+  budget domains and rate limits (L1, L2); OpenBao (card 54).
 
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 

@@ -1,6 +1,6 @@
 //! `adapters::disclosure` — `ops.data_disclosures` two-phase ledger writer (§7.4, T4.2).
 //! Depends-on: crates=[humaux-domain, sqlx]; services=[PostgreSQL(any) w=[ops.data_disclosure_sources, ops.data_disclosures] x=[ops.attach_retrieval_query_source]]; env=[]; modules=[adapters::postgres, domain::boundary, domain::egress]
-//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::retrieval_query_source, private-worker::inference_rpc, private-worker::main, retrieval-provider::adapters, retrieval-worker::main, tests]
+//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::model_call_ledger, adapters::retrieval_query_source, private-worker::inference_rpc, private-worker::main, retrieval-provider::adapters, retrieval-worker::main, tests]
 //! Invariants: [sole writer of ops.data_disclosures and its sources: reserve inserts the ledger row plus >=1 source
 //!   in one transaction before any external call, finalize records the outcome; empty sources or a payload mismatch
 //!   is a DisclosureError, no sampling]

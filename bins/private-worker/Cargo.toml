@@ -20,7 +20,7 @@ workspace = true
 humaux-adapters = { path = "../../crates/adapters" }
 # why: humaux-application dependency; used-by: [humaux-private-worker, private-worker::distill, private-worker::inference_rpc, private-worker::tests::contribution_execution_runner, private-worker::tests::start_manual_contribution_command_0131, tests]
 humaux-application = { path = "../../crates/application" }
-# why: humaux-domain dependency; used-by: [humaux-private-worker, private-worker::distill, private-worker::inference_rpc, private-worker::main, private-worker::tests::contribution_execution_runner, private-worker::tests::derived_dispatch_e2e, private-worker::tests::distill_hop_e2e, tests]
+# why: humaux-domain dependency; used-by: [humaux-private-worker, private-worker::distill, private-worker::main, private-worker::tests::contribution_execution_runner, private-worker::tests::derived_dispatch_e2e, private-worker::tests::distill_hop_e2e, tests]
 humaux-domain = { path = "../../crates/domain" }
 # why: humaux-infra-cell dependency; used-by: [private-worker::tests::distill_hop_e2e, tests]
 humaux-infra-cell = { path = "../../crates/infra-cell" }
@@ -62,3 +62,6 @@ humaux-testkit = { path = "../../crates/testkit" }
 humaux-local-secret-scan = { path = "../../crates/local-secret-scan" }
 # why: sha2 dependency; used-by: [humaux-private-worker, private-worker::distill, private-worker::tests::contribution_execution_runner, private-worker::tests::distill_hop_e2e, tests]
 sha2 = "0.11"
+# The `ReasoningAdmissionLocator.admitted_at` type (sqlx's `time` re-export) for the route_providers unit tests.
+# why: time dependency; used-by: [private-worker::route_providers]
+time = "0.3"

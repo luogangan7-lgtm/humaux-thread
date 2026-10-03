@@ -2,11 +2,12 @@
 //!   `UserReasoningProfile`/`PrivateReasoningDomain` DB-facing types, the §11.3 Provider Error state machine, and the
 //!   §11.4 custom-endpoint SSRF guard chain.
 //! Depends-on: crates=[async-trait, humaux-domain, humaux-infra-egress, serde_json, tokio, uuid]; services=[]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::byok::ssrf, domain::egress, domain::error, domain::evidence, domain::ids, infra-egress::raw, infra-egress::resolver]
-//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::distill_reasoner, gateway::mcp_application, private-worker::distill, private-worker::inference_rpc, private-worker::main, tests]
+//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::reasoning_route_admission, adapters::reasoning_route_onboarding, gateway::mcp_application, humaux-private-worker, maintenance::main, private-worker::distill, private-worker::route_providers, tests, xtask::e2e_onboard, xtask::e2e_seed]
 //! Invariants: [the plaintext BYOK key never becomes a struct field and never prints (only CredentialFingerprint
 //!   does); permit tenant/purpose/payload mismatches are refused before any provider call; provider failures surface
-//!   as typed ReasoningProviderError]
-//! Spec: Baseline §11.1; §48.0; §83.4; §11.3; §4.2; ADR-0058
+//!   as typed ReasoningProviderError; no vendor-specific request field is written by code — a Profile's
+//!   request_extras are the only source (ADR-0060 research amendment 1)]
+//! Spec: Baseline §11.1; §48.0; §83.4; §11.3; §4.2; ADR-0058; ADR-0060
 //!
 //! ## Plaintext key discipline (§11.1, this Phase's security red line)
 //!
@@ -70,7 +71,7 @@ pub mod ssrf;
 
 /// §11.2 "能力至少" closed set. `==` the capability CHECKs of `control.user_reasoning_profiles`,
 /// `control.processor_models` and `control.reasoning_profiles` (last widened by
-/// `migrations/0195_reasoning_capabilities_tool_calls.sql`) — [`ReasoningCapability::as_str`] /
+/// `migrations/0206_reasoning_route_runtime.sql`) — [`ReasoningCapability::as_str`] /
 /// [`ReasoningCapability::parse`] are the §78.2 contract-test surface for those columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReasoningCapability {
@@ -81,19 +82,24 @@ pub enum ReasoningCapability {
     /// ADR-0058 D-M: the endpoint answers through one declared `tools` function (`tool_calls`).
     ToolCalls,
     /// ADR-0058 D-M: the endpoint accepts `"reasoning_split": true` and keeps its reasoning out of
-    /// the answer.
+    /// the answer. Superseded by the Profile's `request_extras` (ADR-0060 research amendment 1):
+    /// it selects no request field any more and stays in the closed set for the rows that already
+    /// declare it.
     ReasoningSplit,
+    /// ADR-0060 research amendment 2: the endpoint answers `response_format: {"type":"json_object"}`.
+    JsonObject,
 }
 
 impl ReasoningCapability {
-    /// Every variant, in the order of the 0195 CHECK arrays.
-    pub const ALL: [ReasoningCapability; 6] = [
+    /// Every variant, in the order of the 0206 CHECK arrays.
+    pub const ALL: [ReasoningCapability; 7] = [
         ReasoningCapability::Text,
         ReasoningCapability::Vision,
         ReasoningCapability::StructuredOutput,
         ReasoningCapability::TokenUsage,
         ReasoningCapability::ToolCalls,
         ReasoningCapability::ReasoningSplit,
+        ReasoningCapability::JsonObject,
     ];
 
     /// The wire / DB value.
@@ -105,6 +111,7 @@ impl ReasoningCapability {
             ReasoningCapability::TokenUsage => "TOKEN_USAGE",
             ReasoningCapability::ToolCalls => "TOOL_CALLS",
             ReasoningCapability::ReasoningSplit => "REASONING_SPLIT",
+            ReasoningCapability::JsonObject => "JSON_OBJECT",
         }
     }
 
@@ -113,6 +120,24 @@ impl ReasoningCapability {
         Self::ALL.into_iter().find(|c| c.as_str() == s)
     }
 }
+
+/// ADR-0060 research amendment 1: the request-body keys the adapter owns. A Profile's
+/// `request_extras` may never carry one (`reasoning_profiles_request_extras_check`, 0206, holds
+/// exactly this list, pinned by `request_extras_check_holds_the_adapter_owned_keys`), so a vendor
+/// field can extend a request but never rewrite its model, messages, output channel or size.
+pub const ADAPTER_OWNED_REQUEST_KEYS: [&str; 11] = [
+    "model",
+    "messages",
+    "tools",
+    "tool_choice",
+    "functions",
+    "function_call",
+    "response_format",
+    "stream",
+    "stream_options",
+    "max_tokens",
+    "max_completion_tokens",
+];
 
 impl fmt::Display for ReasoningCapability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -137,6 +162,10 @@ pub struct ReasoningProviderDescriptor {
     /// refuses to construct on failure, so an unvalidated endpoint cannot become a live
     /// provider regardless of what this field claims.
     pub custom_endpoint: Option<String>,
+    /// ADR-0060 research amendment 1: the Profile@version's `request_extras`, merged into every
+    /// structured request body after the adapter's own fields ([`structured_request_body`]). This
+    /// is the only way a vendor-specific request field reaches the wire; no code writes one.
+    pub request_extras: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ReasoningProviderDescriptor {
@@ -465,11 +494,15 @@ pub struct StructuredReasoningRequest {
     pub output: OutputChannel,
 }
 
-/// The channel a structured answer travels on (ADR-0058 D-M).
+/// The channel a structured answer travels on (ADR-0058 D-M; ADR-0060 research amendment 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputChannel {
     /// `choices[0].message.content`, `<think>` blocks stripped — the v1 wire body, byte-identical.
     Content,
+    /// ADR-0060 research amendment 2: `response_format: {"type":"json_object"}` and the answer in
+    /// `choices[0].message.content` (`<think>` blocks stripped, as on [`Self::Content`]). Only for a
+    /// descriptor that declares [`ReasoningCapability::JsonObject`].
+    JsonObject,
     /// Exactly one call of this side-effect-free function whose `parameters` are
     /// [`StructuredReasoningRequest::json_schema`]; its `arguments` string is the answer. Only for a
     /// descriptor that declares [`ReasoningCapability::ToolCalls`] (ADR-0058 D-M: the channel is
@@ -485,7 +518,7 @@ pub struct StructuredReasoningResponse {
     pub json: String,
     pub usage: TokenUsage,
     /// ADR-0058 R9: on [`OutputChannel::Tool`] the reply carried no tool call and `json` is its
-    /// `content` object instead. Always `false` on [`OutputChannel::Content`].
+    /// `content` object instead. Always `false` on the content channels.
     pub channel_fallback: bool,
 }
 
@@ -792,10 +825,12 @@ struct ChatEnvelope {
 /// 3. 取 `choices[0].message.content`；缺 ⇒ `ProviderPermanent`。
 ///    **显式忽略 `message.reasoning_content`**：M3 实测 reasoning 可能落在这个独立字段，
 ///    它绝不许漏进结构化输出。
-/// 4. 解析 usage 四字段（缺哪个哪个 `None`，不编造）。
+/// 4. 解析 usage 四字段（缺哪个哪个 `None`，不编造；整个 `usage` 缺席也是 `None`——ADR-0060
+///    research amendment 4: `usage` is optional, §19.1 "unknown stays NULL"）。
 ///
 /// ADR-0058 D-M: on [`OutputChannel::Tool`] step 3 reads the one tool call instead
-/// ([`tool_arguments`]); a tool-call reply carries no `content` key at all (measured live, W1).
+/// ([`tool_arguments`]); a tool-call reply carries either no `content` key or `content: ""`
+/// (both measured live, ADR-0058 W1 / ADR-0060 second-endpoint measurement), and neither is read.
 /// ADR-0058 R9: a reply with no tool call may carry the answer object in `content`.
 fn parse_chat_envelope(
     body: &[u8],
@@ -821,7 +856,7 @@ fn parse_chat_envelope(
 
     let choice = v.get("choices").and_then(|c| c.get(0));
     let (content, channel_fallback) = match channel {
-        OutputChannel::Content => (
+        OutputChannel::Content | OutputChannel::JsonObject => (
             choice
                 .and_then(|c| c.get("message"))
                 .and_then(|m| m.get("content"))
@@ -1228,34 +1263,41 @@ impl<D: CredentialDecryptor> OpenAiCompatibleProvider<EgressHttpTransport, D> {
 ///
 /// ADR-0058 D-M: [`OutputChannel::Content`] is the v1 body byte for byte; [`OutputChannel::Tool`]
 /// appends one function whose `parameters` are `json_schema` verbatim (it must be a JSON object —
-/// the rendered contracts are). `"reasoning_split":true` is a provider-specific field: it is sent
-/// only on the tool channel and only when the descriptor declares
-/// [`ReasoningCapability::ReasoningSplit`] — an endpoint that validates its body rejects an
-/// unknown field.
+/// the rendered contracts are); [`OutputChannel::JsonObject`] appends
+/// `"response_format":{"type":"json_object"}` (ADR-0060 research amendment 2).
+///
+/// ADR-0060 research amendment 1: the descriptor's `request_extras` follow, in key order (the
+/// map is ordered, so the bytes a permit covers are reproducible). An extra named like an
+/// adapter-owned field ([`ADAPTER_OWNED_REQUEST_KEYS`]) is never written: the 0206 CHECK refuses
+/// such a profile, and skipping it here keeps a hand-built descriptor from rewriting the model,
+/// messages, channel or size the ledger and the permit describe. Nothing vendor-specific is ever
+/// written by this function itself.
 pub fn structured_request_body(
     descriptor: &ReasoningProviderDescriptor,
     request: &StructuredReasoningRequest,
 ) -> Vec<u8> {
-    let head = format!(
+    let mut body = format!(
         "{{\"model\":{:?},\"messages\":[{{\"role\":\"system\",\"content\":{:?}}},{{\"role\":\"user\",\"content\":{:?}}}],\"max_tokens\":{}",
         descriptor.model_id, request.system_prompt, request.user_prompt, request.max_output_tokens
     );
     match request.output {
-        OutputChannel::Content => format!("{head}}}"),
-        OutputChannel::Tool(name) => format!(
-            "{head},\"tools\":[{{\"type\":\"function\",\"function\":{{\"name\":{name:?},\"parameters\":{}}}}}]{}}}",
-            request.json_schema,
-            if descriptor
-                .capabilities
-                .contains(&ReasoningCapability::ReasoningSplit)
-            {
-                ",\"reasoning_split\":true"
-            } else {
-                ""
-            }
-        ),
+        OutputChannel::Content => {}
+        OutputChannel::JsonObject => body.push_str(",\"response_format\":{\"type\":\"json_object\"}"),
+        OutputChannel::Tool(name) => body.push_str(&format!(
+            ",\"tools\":[{{\"type\":\"function\",\"function\":{{\"name\":{name:?},\"parameters\":{}}}}}]",
+            request.json_schema
+        )),
     }
-    .into_bytes()
+    for (key, value) in &descriptor.request_extras {
+        if !ADAPTER_OWNED_REQUEST_KEYS.contains(&key.as_str()) {
+            body.push(',');
+            body.push_str(&serde_json::Value::String(key.clone()).to_string());
+            body.push(':');
+            body.push_str(&value.to_string());
+        }
+    }
+    body.push('}');
+    body.into_bytes()
 }
 
 /// Pure, deterministic wire body for [`UserReasoningProvider::analyze_vision`] — see
@@ -1297,9 +1339,14 @@ impl<T: OpenAiCompatTransport, D: CredentialDecryptor> UserReasoningProvider
     ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
         self.descriptor
             .require_capability(ReasoningCapability::StructuredOutput)?;
-        if let OutputChannel::Tool(_) = request.output {
-            self.descriptor
-                .require_capability(ReasoningCapability::ToolCalls)?;
+        match request.output {
+            OutputChannel::Content => {}
+            OutputChannel::JsonObject => self
+                .descriptor
+                .require_capability(ReasoningCapability::JsonObject)?,
+            OutputChannel::Tool(_) => self
+                .descriptor
+                .require_capability(ReasoningCapability::ToolCalls)?,
         }
         let body = structured_request_body(&self.descriptor, &request);
         let bytes = self.send_once(ctx, body).await?;
@@ -1307,10 +1354,13 @@ impl<T: OpenAiCompatTransport, D: CredentialDecryptor> UserReasoningProvider
         let envelope = parse_chat_envelope(&bytes, request.output)?;
         let json = match request.output {
             // 剥 <think> 块（含未闭合形态：reasoning 吃光 max_tokens 的实测静默失败）。
-            OutputChannel::Content => strip_think_blocks(&envelope.content),
-            // ADR-0058 D-M: the reasoning never reaches the arguments string (it travels in
-            // `reasoning_content` under REASONING_SPLIT, and a tool call's arguments carry no
-            // `<think>` block); an R9 `content` answer was stripped by `tool_arguments`.
+            // ADR-0060 research amendment 3: the same strip on the JSON-object channel.
+            OutputChannel::Content | OutputChannel::JsonObject => {
+                strip_think_blocks(&envelope.content)
+            }
+            // ADR-0058 D-M: the reasoning never reaches the arguments string (a side field such as
+            // `reasoning_content` is never read, and a tool call's arguments carry no `<think>`
+            // block); an R9 `content` answer was stripped by `tool_arguments`.
             OutputChannel::Tool(_) => envelope.content,
         };
         // §11.3 "invalid structured output -> schema validation failure"：剥后必须还是
@@ -1681,8 +1731,10 @@ mod tests {
                 ReasoningCapability::Vision,
                 ReasoningCapability::ToolCalls,
                 ReasoningCapability::ReasoningSplit,
+                ReasoningCapability::JsonObject,
             ],
             custom_endpoint: None,
+            request_extras: Default::default(),
         }
     }
 
@@ -1942,6 +1994,104 @@ mod tests {
         });
     }
 
+    /// One canned reply on `output` (permit minted over that request's exact body).
+    async fn call_canned_on(
+        output: OutputChannel,
+        body: &'static [u8],
+    ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
+        let resolver = resolver_for(example_public_ip());
+        let provider = OpenAiCompatibleProvider::new(
+            descriptor(),
+            "https://api.example.com/v1/chat/completions".to_string(),
+            CannedTransport(body),
+            StaticDecryptor,
+            ssrf::CustomEndpointPolicy::default(),
+            &resolver,
+        )
+        .expect("valid endpoint");
+        let request = StructuredReasoningRequest {
+            json_schema: r#"{"type":"object"}"#.to_string(),
+            output,
+            ..structured_request()
+        };
+        let tenant = TenantId::new();
+        let wire = structured_request_body(&descriptor(), &request);
+        let c = ctx_with_permit(
+            tenant,
+            permit_for_payload(tenant, &wire, Duration::from_secs(60)),
+        );
+        provider.complete_structured(&c, request).await
+    }
+
+    /// ADR-0060 research amendment 3 — fault: strip `<think>` on the content channel only (or read
+    /// `reasoning_content`). Reasoning text arriving as a `<think>` block in `content` or in a
+    /// `reasoning_content` side field never reaches the answer, on every channel.
+    #[test]
+    fn reasoning_text_in_content_or_a_side_field_never_reaches_the_answer() {
+        rt().block_on(async {
+            for output in [OutputChannel::Content, OutputChannel::JsonObject] {
+                for body in [
+                    &br#"{"choices":[{"message":{"content":"<think>secret plan</think>{\"a\":1}"}}]}"#[..],
+                    br#"{"choices":[{"message":{"content":"{\"a\":1}","reasoning_content":"secret plan"}}]}"#,
+                ] {
+                    let answer = call_canned_on(output, body).await.expect("answer");
+                    assert_eq!(answer.json, r#"{"a":1}"#, "{output:?}");
+                }
+            }
+            for body in [
+                &br#"{"choices":[{"message":{"content":"<think>secret plan</think>","tool_calls":[{"type":"function","function":{"name":"emit_distillation","arguments":"{\"a\":1}"}}]}}]}"#[..],
+                br#"{"choices":[{"message":{"reasoning_content":"secret plan","tool_calls":[{"type":"function","function":{"name":"emit_distillation","arguments":"{\"a\":1}"}}]}}]}"#,
+            ] {
+                let answer = call_canned_on(OutputChannel::Tool(TOOL), body)
+                    .await
+                    .expect("answer");
+                assert_eq!(answer.json, r#"{"a":1}"#);
+            }
+        });
+    }
+
+    /// ADR-0060 second-endpoint measurement — fault: read `content` before the tool call. A
+    /// tool-call reply carries either no `content` key or `content: ""`; both answer from the call.
+    #[test]
+    fn a_tool_reply_with_no_or_empty_content_answers_from_the_call() {
+        rt().block_on(async {
+            for body in [
+                &br#"{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"emit_distillation","arguments":"{\"memories\":[]}"}}]}}]}"#[..],
+                br#"{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"emit_distillation","arguments":"{\"memories\":[]}"}}]}}]}"#,
+            ] {
+                let answer = call_canned_on(OutputChannel::Tool(TOOL), body)
+                    .await
+                    .expect("the tool call is the answer");
+                assert_eq!(answer.json, r#"{"memories":[]}"#);
+                assert!(!answer.channel_fallback);
+            }
+        });
+    }
+
+    /// ADR-0060 research amendment 4 — fault: treat a missing `usage` as a malformed envelope. A
+    /// reply without `usage` answers with every token count `None` (§19.1: unknown stays NULL).
+    #[test]
+    fn a_reply_without_usage_answers_with_unknown_token_counts() {
+        rt().block_on(async {
+            for output in [
+                OutputChannel::Content,
+                OutputChannel::JsonObject,
+                OutputChannel::Tool(TOOL),
+            ] {
+                let body: &'static [u8] = if output == OutputChannel::Tool(TOOL) {
+                    br#"{"choices":[{"message":{"tool_calls":[{"type":"function","function":{"name":"emit_distillation","arguments":"{}"}}]}}]}"#
+                } else {
+                    br#"{"choices":[{"message":{"content":"{}"}}]}"#
+                };
+                let answer = call_canned_on(output, body).await.expect("answer");
+                assert_eq!(answer.usage.input_tokens, None, "{output:?}");
+                assert_eq!(answer.usage.output_tokens, None, "{output:?}");
+                assert_eq!(answer.usage.reasoning_tokens, None, "{output:?}");
+                assert_eq!(answer.usage.cached_input_tokens, None, "{output:?}");
+            }
+        });
+    }
+
     #[test]
     fn failed_output_schema_after_budget_exhausted() {
         // 语义修正（parse_chat_envelope 落地时同步）：body 整体不是 JSON = **端点坏了**
@@ -2127,24 +2277,24 @@ mod tests {
 
     /// §78.2 "DB enum 与 Rust enum 走 contract test 对账": runs against the real migration
     /// file text (same `include_str!` pattern as `jobs.rs::contract_tests`), not a hardcoded
-    /// copy of the CHECK list. 0195 is the migration that last defines all three capability
-    /// CHECKs; the live constraints are compared too (`byok_egress_rebinding.rs`, real PG).
-    const MIGRATION_0195_SQL: &str = include_str!(concat!(
+    /// copy of the CHECK list. 0206 is the migration that last defines all three capability
+    /// CHECKs; the live constraints are compared too (`distill_dispatch_v2.rs` T23, real PG).
+    const MIGRATION_0206_SQL: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../migrations/0195_reasoning_capabilities_tool_calls.sql"
+        "/../../migrations/0206_reasoning_route_runtime.sql"
     ));
 
-    fn migration_0195_capability_checks() -> Vec<Vec<String>> {
-        let needle = "capabilities <@ ARRAY[";
-        MIGRATION_0195_SQL
+    /// Every quoted list that follows `needle` in the 0206 text.
+    fn migration_0206_lists(needle: &str) -> Vec<Vec<String>> {
+        MIGRATION_0206_SQL
             .match_indices(needle)
             .map(|(at, _)| {
                 let start = at + needle.len();
-                let end = MIGRATION_0195_SQL[start..]
+                let end = MIGRATION_0206_SQL[start..]
                     .find(']')
-                    .expect("unterminated capabilities ARRAY[...] literal")
+                    .expect("unterminated ARRAY[...] literal")
                     + start;
-                MIGRATION_0195_SQL[start..end]
+                MIGRATION_0206_SQL[start..end]
                     .split(',')
                     .map(|s| s.trim().trim_matches('\'').to_string())
                     .collect()
@@ -2152,9 +2302,21 @@ mod tests {
             .collect()
     }
 
+    /// ADR-0060 research amendment 1 (§78.2 twin): the CHECK's key list is the Rust const, both
+    /// directions. Fault: drop `max_completion_tokens` from the 0206 list → red.
+    #[test]
+    fn request_extras_check_holds_the_adapter_owned_keys() {
+        let lists = migration_0206_lists("request_extras ?| ARRAY[");
+        assert_eq!(lists.len(), 1, "one request_extras CHECK in 0206");
+        assert_eq!(
+            lists[0],
+            ADAPTER_OWNED_REQUEST_KEYS.map(str::to_owned).to_vec()
+        );
+    }
+
     #[test]
     fn capability_wire_form_matches_migration_check_constraint() {
-        let checks = migration_0195_capability_checks();
+        let checks = migration_0206_lists("capabilities <@ ARRAY[");
         assert_eq!(checks.len(), 3, "0048 + two 0128 tables");
         let wire: Vec<String> = ReasoningCapability::ALL
             .iter()
@@ -2383,9 +2545,9 @@ mod tests {
         provider.complete_structured(&c, tool_request()).await
     }
 
-    /// Fault: omit `reasoning_split` (or the tool) from the Tool body.
+    /// Fault: omit the tool from the Tool body.
     #[test]
-    fn tool_channel_body_carries_one_tool_and_reasoning_split() {
+    fn tool_channel_body_carries_one_tool() {
         let body: serde_json::Value =
             serde_json::from_slice(&structured_request_body(&descriptor(), &tool_request()))
                 .expect("the tool body is JSON");
@@ -2397,23 +2559,113 @@ mod tests {
             tools[0]["function"]["parameters"],
             serde_json::json!({"type":"object"})
         );
-        assert_eq!(body["reasoning_split"], true);
+        // ADR-0060 research amendment 1: REASONING_SPLIT selects no field any more.
+        assert!(body.get("reasoning_split").is_none());
         // W1 (ADR-0058): a named tool_choice is accepted but not honoured, so it is never sent.
         assert!(body.get("tool_choice").is_none());
         assert_eq!(body["max_tokens"], 64);
     }
 
-    /// ADR-0058 D-M (ruling 2026-10-02 10:35, test 2) — fault: send `reasoning_split`
-    /// unconditionally on the tool channel.
+    /// ADR-0060 research amendment 1 — fault: the adapter writes `reasoning_split` (for
+    /// REASONING_SPLIT, or on the tool channel). A profile's extras reach every channel's body
+    /// verbatim, and nothing vendor-specific is written besides them; an extra named like an
+    /// adapter-owned field never reaches the wire.
     #[test]
-    fn tool_channel_without_reasoning_split_capability_sends_no_reasoning_split() {
-        let body: serde_json::Value = serde_json::from_slice(&structured_request_body(
-            &descriptor_without(ReasoningCapability::ReasoningSplit),
-            &tool_request(),
-        ))
-        .expect("the tool body is JSON");
-        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
-        assert!(body.get("reasoning_split").is_none());
+    fn request_extras_are_merged_and_nothing_vendor_specific_is_written() {
+        let mut extras = descriptor_without(ReasoningCapability::ReasoningSplit);
+        extras.capabilities.push(ReasoningCapability::JsonObject);
+        extras.request_extras = serde_json::json!({
+            "enable_thinking": false,
+            "model": "smuggled",
+            "max_tokens": 1
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        let json_object = StructuredReasoningRequest {
+            output: OutputChannel::JsonObject,
+            ..structured_request()
+        };
+        for request in [structured_request(), tool_request(), json_object] {
+            let body: serde_json::Value =
+                serde_json::from_slice(&structured_request_body(&extras, &request))
+                    .expect("the body is JSON");
+            assert_eq!(body["enable_thinking"], false, "{:?}", request.output);
+            assert_eq!(body["model"], "test-model", "adapter-owned key kept");
+            assert_eq!(body["max_tokens"], 64, "adapter-owned key kept");
+            assert!(
+                body.get("reasoning_split").is_none(),
+                "{:?}",
+                request.output
+            );
+        }
+        // A REASONING_SPLIT profile with no extras sends no vendor field on any channel.
+        for request in [structured_request(), tool_request()] {
+            let body: serde_json::Value =
+                serde_json::from_slice(&structured_request_body(&descriptor(), &request))
+                    .expect("the body is JSON");
+            assert!(
+                body.get("reasoning_split").is_none(),
+                "{:?}",
+                request.output
+            );
+        }
+    }
+
+    /// ADR-0060 research amendment 2 — fault: the JSON_OBJECT channel falls through to the plain
+    /// content body (no `response_format`), or sends `tools`.
+    #[test]
+    fn json_object_channel_request_shape() {
+        let request = StructuredReasoningRequest {
+            output: OutputChannel::JsonObject,
+            ..structured_request()
+        };
+        let body: serde_json::Value =
+            serde_json::from_slice(&structured_request_body(&descriptor(), &request))
+                .expect("the body is JSON");
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({"type": "json_object"})
+        );
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert_eq!(body["max_tokens"], 64);
+    }
+
+    /// ADR-0060 research amendment 2 — fault: drop the JSON_OBJECT gate in `complete_structured`.
+    #[test]
+    fn a_json_object_request_without_the_capability_fails_before_the_network() {
+        rt().block_on(async {
+            let resolver = resolver_for(example_public_ip());
+            let provider = OpenAiCompatibleProvider::new(
+                descriptor_without(ReasoningCapability::JsonObject),
+                "https://api.example.com/v1/chat/completions".to_string(),
+                CannedTransport(b"{}"),
+                StaticDecryptor,
+                ssrf::CustomEndpointPolicy::default(),
+                &resolver,
+            )
+            .expect("valid endpoint");
+            let request = StructuredReasoningRequest {
+                output: OutputChannel::JsonObject,
+                ..structured_request()
+            };
+            let tenant = TenantId::new();
+            let body = structured_request_body(
+                &descriptor_without(ReasoningCapability::JsonObject),
+                &request,
+            );
+            let c = ctx_with_permit(
+                tenant,
+                permit_for_payload(tenant, &body, Duration::from_secs(60)),
+            );
+            assert!(matches!(
+                provider.complete_structured(&c, request).await,
+                Err(ReasoningProviderError::UnsupportedCapability(
+                    ReasoningCapability::JsonObject
+                ))
+            ));
+        });
     }
 
     /// ADR-0058 D-M — fault: drop the TOOL_CALLS gate in `complete_structured`. A tool request to a
