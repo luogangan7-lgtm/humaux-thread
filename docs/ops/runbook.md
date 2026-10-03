@@ -45,12 +45,39 @@ Since card 25 (ADR-0050 D-D/D-F), migrate also enforces the following:
 
 ## 2. Roles and grants
 
-`cargo xtask rls-check` must exit 0. It walks the §6.2.2 matrix row for row; a new table or a
-new grant that is not in both the matrix and `xtask/src/rls_check.rs::MATRIX` reds it.
+ADR-0059. The eight password roles — the seven LOGIN roles of `migrations/0011_roles_and_grants.sql`
+(gateway, private_worker, consolidation_worker, public_worker, retrieval_worker, batch_issuer,
+maintenance) and `role_admin` — get their passwords **only** from
+`humaux-maintenance roles rotate`. The passwords written in 0011 are development placeholders,
+published in the repository, and must never survive a deploy. `role_migration_owner` is NOLOGIN
+with no password (D-A, migration 0201): nothing logs in as it; `migrate`'s own principal acts on
+its behalf (superuser, or CREATEROLE with ADMIN OPTION on the eight roles plus membership in
+`role_migration_owner`). Before any traffic, **both** must exit 0:
 
-`role_admin` is created **without a password** (`migrations/0110_mechanism_runtime_evidence.sql:70`
-— deployments set it from their secrets manager, which is outside migrations). Provision it
-before the mechanism-observation surface is used.
+- `cargo xtask rls-check` — walks the §6.2.2 matrix row for row; a new table or grant that is not
+  in both the matrix and `xtask/src/rls_check.rs::MATRIX` reds it; the role set must be the
+  §6.2.0 rows with the owner NOLOGIN.
+- `humaux-maintenance deploy-check --roles-sql migrations/0011_roles_and_grants.sql` — read-only,
+  prints names only, exit 0 all pass / 3 any check fails or is `not_applicable` / 1 infrastructure.
+  Its five checks and what each red means are in `docs/ops/supervision.md` §2. It must run from a
+  host whose pg_hba path applies password authentication (`scram-sha-256`) to every probed role:
+  SQLSTATE 28000 means *unverified* and is red, by design.
+
+**First deploy on a fresh cluster** (D-A; `migrate` refuses step 2 with
+`missing object: role <name>` when step 1 was skipped):
+
+1. `humaux-maintenance roles rotate --create-missing --roles-sql migrations/0011_roles_and_grants.sql
+   --actor … --reason … --ticket … --step-up-auth …` with `HUMAUX_MIGRATOR_PG_DSN` set. Creates the seven 0011 LOGIN roles with a client-side SCRAM
+   verifier and the owner NOLOGIN. Generated values print once, as `HUMAUX_ROLE_PASSWORD_<SUFFIX>=…`
+   lines before the JSON receipt; pipe `grep '^HUMAUX_ROLE_PASSWORD_'` straight into the secrets
+   store.
+2. `cargo xtask migrate` (§1).
+3. `humaux-maintenance roles rotate --roles-sql migrations/0011_roles_and_grants.sql --role role_admin …` (0110 creates `role_admin` without a
+   password).
+4. `humaux-maintenance deploy-check --roles-sql migrations/0011_roles_and_grants.sql` → exit 0.
+
+An interrupted migrate after step 1 leaves no placeholder login, because none was ever created. A
+brand-new **development** container may instead pass `migrate --dev-placeholder-roles` once.
 
 ## 3. Tenant provisioning
 
@@ -437,3 +464,121 @@ what it looks like when it is violated.
   only. See `docs/ops/delivery_point_report.md` §5.2 for the time this rule was learned.
 - **Never stop or restart shared infrastructure containers to simulate an outage.** Point at a
   closed loopback port or an absent socket instead.
+
+## 10. Rotate — role passwords, API-key pepper, token key, provider keys, DNS pins
+
+ADR-0059. Every value below lives in the secrets store and reaches a process as an environment
+variable; none is ever on argv, in a tracked file or in a log. Rotation never needs a migration.
+
+### 10.1 PostgreSQL role passwords
+
+Preconditions: `HUMAUX_MIGRATOR_PG_DSN` set; new values in the store as
+`HUMAUX_ROLE_PASSWORD_<SUFFIX>` (at least 32 characters of `[A-Za-z0-9._~-]`, not built on the
+0011 placeholder prefix), or let `rotate` generate them. `rotate` refuses, naming the variable, any
+value that equals or contains a repository placeholder; an environment that still exports the
+current placeholders as `HUMAUX_ROLE_PASSWORD_*` (the dev env before its first rotation) must
+**unset every one of them** (or replace it with a new value) before step 2, or `rotate` stops at the
+first such variable with exit 2.
+
+1. `deploy-check` — record the current state.
+2. `humaux-maintenance roles rotate --roles-sql migrations/0011_roles_and_grants.sql --actor … --reason …
+   --ticket … --step-up-auth … [--role role_x]`.
+   One transaction; only SCRAM verifiers reach the server; generated values print once after
+   COMMIT (pipe `grep '^HUMAUX_ROLE_PASSWORD_'` into the 0600 secrets file). Crash or unknown
+   outcome: re-run with the variables set — idempotent (same passwords, fresh salts). The rotating
+   principal is never a target, so a rotation cannot lock the operator out.
+3. Update each service's DSN from the store and restart **one service at a time**. Open sessions
+   survive; only new connections need the new value (one password per role: each service has a
+   reconnect gap, ADR-0059 L2).
+4. `deploy-check` → exit 0.
+5. The migrator/superuser itself: `psql \password <user>` from a session of that user (libpq sends
+   a client-side verifier), update `HUMAUX_MIGRATOR_PG_DSN` in the store, then `deploy-check`.
+
+Development: the values live in `$HOME/.config/humaux/dev_role_passwords.env` (0600), including
+`HUMAUX_DEV_PG_SUPERUSER_PASSWORD`; the chain's env script sources it.
+
+### 10.2 API-key pepper — rolling phases, never one restart (gateway replicas ≥ 2, §67.5)
+
+Generate a new 32-byte hex value N; O is the current one.
+
+1. **Verify both.** Every gateway replica: `HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX=O`,
+   `HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX=N`; rolling restart until **all** replicas run it.
+   Maintenance stays on O. Nothing observable changes; every replica can now verify N.
+2. **Switch current.** Maintenance `HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX=N`, restart; then every
+   replica `…_PEPPER_HEX=N`, `…_PEPPER_PREVIOUS_HEX=O`, rolling restart. A replica still in phase 1
+   that sees an N-hashed key matches it as previous and asks to rehash; the closed rehash window
+   refuses that (non-fatal), so keys never ping-pong.
+3. **Open rehash.** Only after all replicas are in phase 2:
+   `humaux-maintenance apikey pepper-epoch advance --actor … --reason … --ticket … --step-up-auth …`
+   (next epoch, rehash window open). A key used from now on is rehashed to N once (migrations
+   0202–0204, one `api_key.pepper_rehash` audit row in its tenant). Run it once: while the window is
+   open a second `advance` is refused, exit 3, `"reason": "rehash_window_open"`, epoch unchanged
+   (migration 0205) — a retry after an unknown outcome is safe and tells you the window is open.
+4. **Close.** After the window you chose (at least the longest expected key idle time):
+   `humaux-maintenance apikey pepper-epoch close --actor … --reason … --ticket … --step-up-auth …`
+   (from then on no verifier can be rewritten, whatever a key's epoch — migration 0204), then unset
+   `…_PEPPER_PREVIOUS_HEX` with a rolling restart. A key not used in the window is refused from then
+   on: re-issue it (`apikey issue` + `apikey revoke`). There is no count of keys still behind the
+   epoch yet (ADR-0059 L6).
+
+Side effects: outstanding enumerate cursors and email verification codes die when a replica's
+current pepper changes (phase 2); both are short-lived. Between `advance` and `close` (and only
+then), the role_gateway database credential can rewrite each not-yet-rehashed key's verifier once,
+audited (L12), so keep the window no longer than it must be.
+
+Rollback. Before phase 3, undo the phases in reverse: maintenance back to O, then every replica
+`…_PEPPER_HEX=O`, `…_PEPPER_PREVIOUS_HEX=N`, rolling restart; unset `…_PREVIOUS_HEX` only once no key
+was issued under N (re-issue any that were). After `advance`, keys already rehashed verify only under
+N: `close` first, then make O current and N previous (rolling restart) — every key still verifies —
+and never unset N while a key is hashed under it; moving those keys back is a full rotation N → O
+(phases 3–4 again). Never roll back by unsetting `…_PREVIOUS_HEX` mid-rotation: every key on the
+other pepper is refused at once.
+
+Card-33 rollout: a pre-card-33 gateway reads no `…_PEPPER_PREVIOUS_HEX` and never calls the rehash
+door, so do not start phase 1 until every replica runs the card-33 build (whose own rollout order is
+in §10.3).
+
+### 10.3 Consistency-token key — same shape
+
+1. Every replica `HUMAUX_GATEWAY_TOKEN_HMAC_KEY=O`, `HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS=N`
+   (hex, ≥ 32 bytes, N ≠ O); rolling restart until all run it — all verify N's key id, all still
+   sign with O.
+2. Every replica `…_TOKEN_HMAC_KEY=N`, `…_PREVIOUS=O`; rolling restart. Any replica verifies
+   anything any other replica signed.
+3. After one token TTL (`HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS`), unset `…_PREVIOUS` with a
+   rolling restart.
+
+The token MAC proves only that a gateway issued those fields unchanged; it is not authorization
+(rejected memory 710a2548). First deploy of card 33 only: outstanding unsigned tokens are refused
+(`token_malformed`) for at most one TTL (L4).
+
+Rollback. Before step 3, swap back: every replica `…_TOKEN_HMAC_KEY=O`, `…_PREVIOUS=N`, rolling
+restart — all still verify both kids. After step 3 (O gone), going back to O is the same three steps
+with O as the new key; unsetting N earlier refuses every outstanding token N signed (`token_malformed`)
+until it expires.
+
+Card-33 rollout (mixed versions): a pre-card-33 gateway issues unsigned tokens, which a card-33
+gateway refuses, and refuses the card-33 wire form (kid and MAC appended). A replica-by-replica roll
+behind one load balancer therefore refuses tokens in both directions for as long as both versions
+serve. Avoid it: start the full set of card-33 replicas (all with the same
+`HUMAUX_GATEWAY_TOKEN_HMAC_KEY`, `…_PREVIOUS` unset), switch all traffic to them at once, then stop
+the old set. Only tokens issued by the old set before the switch are refused, for at most one TTL
+(L4). Rolling back across that boundary is the same switch in reverse, with the same one-TTL cost.
+
+### 10.4 Provider keys (private worker)
+
+`HUMAUX_PRIVATE_WORKER_CREDENTIALS = <credential_ref>=<ENV_NAME>[,…]` names, per credential
+reference, the variable holding its key (ADR-0059 D-I). To rotate: put the new key under a **new**
+variable name, point the map entry at it, restart the private worker (`--distill-serve` and
+`--serve-rpc`), then revoke the old key at the provider and unset the old variable. A reference
+missing from the map parks its distill jobs `WAITING_KEY` with class `CREDENTIAL_NOT_MAPPED` — no
+ledger row, no provider call, no attempt spent — and they are re-checked every
+`HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS`. (Consolidation/contribution RPC calls still meet
+a missing reference after their reservation, ADR-0059 L7.) The removed
+`HUMAUX_PRIVATE_WORKER_KEY_ENV` is refused at boot when set.
+
+### 10.5 DNS pins (OPS-10)
+
+Refresh `HUMAUX_PRIVATE_WORKER_DNS_PINS` (and `HUMAUX_MINIMAX_DNS_PINS` in the chain) from an
+authoritative resolver, check each IP is outside the §11.4 forbidden ranges (the worker re-checks at
+boot and refuses a forbidden pin), restart, and confirm with one live call.

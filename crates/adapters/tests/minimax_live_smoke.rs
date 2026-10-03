@@ -128,32 +128,10 @@ fn live_dns_resolver() -> Arc<dyn ssrf::DnsResolver> {
     )
 }
 
-#[test]
-fn dsn_as_role_accepts_both_postgres_uri_schemes() {
-    let postgres = dsn_as_role(
-        "postgres://postgres@127.0.0.1:54329/test",
-        "role_private_worker",
-    );
-    let postgresql = dsn_as_role(
-        "postgresql://postgres@127.0.0.1:54329/test",
-        "role_private_worker",
-    );
-
-    assert_eq!(postgres, postgresql);
-    assert!(postgres.starts_with("postgres://role_private_worker:"));
-}
-
 fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
-    let Some(rest) = admin_dsn
-        .strip_prefix("postgres://")
-        .or_else(|| admin_dsn.strip_prefix("postgresql://"))
-    else {
-        return admin_dsn.to_string();
-    };
-    let Some(at) = rest.find('@') else {
-        return admin_dsn.to_string();
-    };
-    format!("postgres://{role}:devlocal_{role}@{}", &rest[at + 1..])
+    // ADR-0059 D-D: a real login as `role`, its password from HUMAUX_ROLE_PASSWORD_<SUFFIX>.
+    humaux_testkit::role_login_dsn(admin_dsn, role, |name| std::env::var(name).ok())
+        .unwrap_or_else(|missing| panic!("missing object: {missing} (ADR-0059 D-D)"))
 }
 
 struct Fixture {

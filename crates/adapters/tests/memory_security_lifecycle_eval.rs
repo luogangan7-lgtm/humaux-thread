@@ -1,7 +1,7 @@
 //! `adapters::tests::memory_security_lifecycle_eval` — memory_security_lifecycle eval harness (§45.2 Private Memory
 //!   Poisoning，ADR-0007 分段声明)。
 //! Depends-on: crates=[humaux-domain, humaux-testkit, postgres, serde_json, sha2, uuid]; services=[PostgreSQL(any)
-//!   w=[control.private_reasoning_domains, control.tenants, private.events, private.evidence_objects,
+//!   w=[control.private_reasoning_domains, control.tenants, ops.jobs, private.events, private.evidence_objects,
 //!   private.memory_evidence, private.memory_records]]; env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN];
 //!   modules=[domain::authority, domain::evidence, domain::ids, domain::memory, domain::policy, humaux-testkit]
 //! Called-by: [cargo-test]
@@ -291,16 +291,29 @@ struct Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM private.memory_evidence WHERE memory_id IN \
+        // Card-31 pattern (card 33 leak fix): each seeded PRIMARY memory_evidence link
+        // enqueues a DERIVED_* job (0164 trigger). Jobs go first, in one batch with the data rows, and
+        // a failure is printed; the tenant row goes in a separate best-effort batch, so a refused tenant
+        // delete (append-only audit rows, a missed child table) can no longer roll the job delete back.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM private.memory_evidence WHERE memory_id IN \
                (SELECT memory_id FROM private.memory_records WHERE tenant_id = '{0}'); \
              DELETE FROM private.memory_records WHERE tenant_id = '{0}'; \
              DELETE FROM private.events WHERE event_id IN \
                (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id = '{0}'); \
              DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
-             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{0}';",
-            self.tenant_id
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}';",
+            self.tenant_id,
+        )) {
+            eprintln!(
+                "memory_security_lifecycle_eval cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{0}';",
+            self.tenant_id,
         ));
     }
 }

@@ -104,7 +104,9 @@ fn remember_error(error: RememberError) -> ErrorCode {
             ErrorCode::Conflict
         }
         RememberError::Subject(code) | RememberError::Affect(code) => code,
-        RememberError::ReasoningDomainUnresolved => ErrorCode::DependencyUnavailable,
+        RememberError::ReasoningDomainUnresolved | RememberError::TokenKeysUnset => {
+            ErrorCode::DependencyUnavailable
+        }
     }
 }
 

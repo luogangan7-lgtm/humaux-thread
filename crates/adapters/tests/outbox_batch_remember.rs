@@ -2,9 +2,10 @@
 //!   `remember::remember` (§34/§34.1/§60/ §60.1) against a real Postgres.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, sqlx, tokio];
 //!   services=[PostgreSQL(any) r=[ops.commit_seq_seq] w=[control.private_reasoning_domains, control.tenants,
-//!   ops.outbox, private.events, private.evidence_objects, private.ingest_tickets, projection.stream_checkpoints,
-//!   projection.stream_log], PostgreSQL(role_batch_issuer), PostgreSQL(role_gateway)]; env=[HUMAUX_TEST_PG_DSN];
-//!   modules=[adapters::batch, adapters::postgres, adapters::remember, domain::evidence, domain::subject,
+//!   ops.jobs, ops.outbox, private.events, private.evidence_objects, private.ingest_tickets,
+//!   projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_batch_issuer), PostgreSQL(role_gateway)];
+//!   env=[HUMAUX_TEST_PG_DSN];
+//!   modules=[adapters::batch, adapters::postgres, adapters::remember, adapters::tests::support::token_keys, domain::evidence, domain::subject,
 //!   humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [the two §60.1 fault injections stay two separate tests; rows are scoped to a throwaway tenant; no
@@ -26,6 +27,8 @@
 //! "should G23-1c move", which can only be answered correctly by keeping the two actions, and
 //! their two tests, apart).
 
+#[path = "support/token_keys.rs"]
+mod token_keys;
 use std::sync::Mutex;
 
 use humaux_adapters::batch::{self, BeginBatchCommand};
@@ -72,18 +75,31 @@ impl Drop for Handle {
         // Best-effort cleanup, FK-dependency order (child tables first). A leftover row from a
         // panicking test is swept by the next run's fresh throwaway tenant anyway — this file
         // never reuses a tenant_id across tests.
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
+        // Card-31 pattern (card 33 leak fix): each remember's EVIDENCE_ACCEPTED outbox row
+        // enqueues a DERIVED_* job (0164 trigger). Jobs go first, in one batch with the data rows, and
+        // a failure is printed; the tenant row goes in a separate best-effort batch, so a refused tenant
+        // delete (append-only audit rows, a missed child table) can no longer roll the job delete back.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
              DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
              DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}'; \
              DELETE FROM private.ingest_tickets WHERE tenant_id = '{0}'; \
              DELETE FROM private.events USING private.evidence_objects eo \
                WHERE events.event_id = eo.evidence_id AND eo.tenant_id = '{0}'; \
              DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
-             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{0}'; \
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}';",
+            self.tenant_id,
+        )) {
+            eprintln!(
+                "outbox_batch_remember cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{0}'; \
              REVOKE INSERT ON private.ingest_tickets FROM role_gateway;",
-            self.tenant_id
+            self.tenant_id,
         ));
     }
 }
@@ -94,6 +110,7 @@ impl DbIntegrationFixture for Fixture {
     type Handle = Handle;
 
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
+        token_keys::install();
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
         // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test

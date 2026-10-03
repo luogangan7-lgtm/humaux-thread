@@ -1,0 +1,45 @@
+# §46.1 migration manifest. Card 33 / ADR-0059 D-H: the pepper rehash window becomes explicit state.
+# control.credential_pepper_state.rehash_open (default false) is opened by
+# control.credential_pepper_epoch_advance() and closed by the new role_maintenance-only
+# control.credential_pepper_epoch_close(); control.api_key_rehash changes nothing while it is closed.
+# §46 forward-fix (EXPAND_CONTRACT, first free after 0203).
+
+migration_id = "0204_api_key_rehash_window"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.credential_pepper_state') is not null
+ and to_regprocedure('control.credential_pepper_epoch_close()') is null
+ and not exists (select 1 from information_schema.columns
+                  where table_schema = 'control' and table_name = 'credential_pepper_state'
+                    and column_name = 'rehash_open')
+ as precheck_ok
+"""
+
+postcheck = """
+with non_owner(r) as (values ('role_gateway'), ('role_private_worker'), ('role_consolidation_worker'),
+  ('role_public_worker'), ('role_retrieval_worker'), ('role_batch_issuer'), ('role_maintenance'),
+  ('role_admin')),
+fns(sig, executor) as (values
+  ('control.credential_pepper_epoch_advance()', 'role_maintenance'),
+  ('control.credential_pepper_epoch_close()', 'role_maintenance'),
+  ('control.api_key_rehash(uuid,bytea,bytea)', 'role_gateway'))
+select
+  (select count(*) = 1 and bool_and(not rehash_open) from control.credential_pepper_state)
+  and exists (select 1 from information_schema.columns
+               where table_schema = 'control' and table_name = 'credential_pepper_state'
+                 and column_name = 'rehash_open' and is_nullable = 'NO')
+  and (select bool_and(pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+                       and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+                       and position('rehash_open' in p.prosrc) > 0
+                       and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                                        where x.grantee = 0 and x.privilege_type = 'EXECUTE'))
+         and count(*) = 3
+       from fns join pg_proc p on p.oid = to_regprocedure(fns.sig))
+  and (select bool_and(has_function_privilege(n.r, fns.sig, 'EXECUTE') = (n.r = fns.executor))
+       from fns cross join non_owner n)
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward-fix only: re-create the 0203 rehash body and the 0202 advance body and drop control.credential_pepper_epoch_close(). The window is then never closed again: every key behind the epoch stays rewritable by role_gateway with no rotation open (the defect this migration removes)."
+backup_restore_requirement = "none: one column with a default is added and three function bodies are replaced; no api_keys row is changed."

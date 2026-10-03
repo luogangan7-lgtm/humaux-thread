@@ -83,7 +83,9 @@ fn remember_error(error: RememberError) -> ErrorCode {
         RememberError::Subject(code) | RememberError::Affect(code) => code,
         // §11.2.1 / ADR-0032 D-A: the caller tenant has no reasoning domain to process this
         // Evidence under — not provisioned for writes, nothing written, retryable once it is.
-        RememberError::ReasoningDomainUnresolved => ErrorCode::DependencyUnavailable,
+        RememberError::ReasoningDomainUnresolved | RememberError::TokenKeysUnset => {
+            ErrorCode::DependencyUnavailable
+        }
         RememberError::Db(error) => db_error(error),
     }
 }
@@ -464,7 +466,9 @@ async fn replay(
         commit_seq: field(prior, "commit_seq")?,
         issued_at,
         expires_at,
-    });
+    })
+    // ADR-0059 D-G: an uninstalled key set is a missing dependency, never an unsigned token.
+    .map_err(|_| ErrorCode::DependencyUnavailable)?;
     Ok(RememberAccepted {
         evidence_id,
         processing_handle: evidence_id.to_string(),

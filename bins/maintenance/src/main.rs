@@ -1,19 +1,22 @@
 //! `maintenance::main` — `humaux-maintenance`, the operator-write CLI (§4.2): onboarding, API keys, placement,
-//!   activation, re-drive of DEAD distill jobs.
+//!   activation, re-drive of DEAD distill jobs, role-password rotation, the deploy-check and opening/closing
+//!   the API-key pepper rehash window.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, rand, serde, serde_json, time, tokio, uuid];
 //!   services=[PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX,
 //!   HUMAUX_MAINTENANCE_EMBEDDING_DIMENSION, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MAINTENANCE_PRIVATE_MEMORY_COLLECTION,
 //!   HUMAUX_MAINTENANCE_QDRANT_CIDR, HUMAUX_MAINTENANCE_QDRANT_HOST, HUMAUX_MAINTENANCE_QDRANT_PORT];
 //!   modules=[adapters::membership_repo, adapters::postgres, adapters::provisioning, adapters::quota_repo,
-//!   domain::identity, domain::ids, domain::ticket_family, protocol::edge]
+//!   adapters::role_hygiene,
+//!   domain::identity, domain::ids, domain::ticket_family, maintenance::roles, protocol::edge]
 //! Called-by: [process(humaux-maintenance)]
 //! Invariants: [one-shot, one JSON receipt on stdout per run; exit 0 created/existing, 3 refused, 2 usage, 1
-//!   infrastructure (PostgreSQL/Qdrant down); the wire key is printed once on stdout only when created, never on
-//!   stderr or in a receipt; no flag or env var has a literal default]
-//! Spec: Baseline §4.2; §6.2.2; §73.5; §77; §78.1; ADR-0053; ADR-0058
+//!   infrastructure (PostgreSQL/Qdrant down); the wire key and generated role passwords are printed once on stdout
+//!   before the receipt, never on stderr or in a receipt; no flag or env var has a literal default]
+//! Spec: Baseline §4.2; §6.2.2; §73.5; §77; §78.1; ADR-0053; ADR-0058; ADR-0059
 //!
 //! Subcommand mode (card 28; the resident `--serve` job is card 35). Every subcommand is
-//! one-shot, idempotent (a re-run writes nothing and answers `existing`), and prints exactly ONE
+//! one-shot, idempotent (a re-run writes nothing and answers `existing`; `apikey pepper-epoch advance`
+//! is instead refused `rehash_window_open` while its window is open, ADR-0059 D-H), and prints exactly ONE
 //! JSON receipt on stdout. Exit codes (ADR-0053 D-F): 0 created/existing, 3 refused (a named
 //! reason, nothing written), 2 usage, 1 infrastructure. `jobs requeue-dead` (ADR-0058 R4) answers
 //! `requeued` (`nothing_requeued` when class mode skipped every match; class mode lists each skipped
@@ -24,11 +27,15 @@
 //! as the single line `Authorization: Bearer <prefix>.<secret>` on stdout before the JSON, only
 //! when it was created — never on stderr, never inside a receipt, never on a re-run (a lost key
 //! is revoked and reissued under a new `--key-name`). Receipts carry the log fingerprint only.
+//! `roles rotate` (ADR-0059 D-E) prints each generated role password the same way, once, as
+//! `HUMAUX_ROLE_PASSWORD_<SUFFIX>=<value>`; `deploy-check` (D-F) is read-only and prints names only.
 //!
 //! Every writing subcommand requires the §77 Sensitive-Admin-Action fields `--actor --reason
 //! --ticket --step-up-auth` (`--trace-id` optional; minted and printed in the receipt otherwise).
 //! No flag has a literal default (§78.1) except the two names `--workspace` / `--reasoning-domain`
 //! (`default`, the name the seed always used).
+
+mod roles;
 
 use std::process::ExitCode;
 
@@ -39,6 +46,7 @@ use humaux_adapters::provisioning::{
     WorkspaceActivation,
 };
 use humaux_adapters::quota_repo;
+use humaux_adapters::role_hygiene;
 use humaux_domain::identity::MembershipRole;
 use humaux_domain::ids::TenantId;
 use humaux_domain::ticket_family::TicketFamily;
@@ -50,8 +58,9 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 const USAGE: &str = "usage: humaux-maintenance <deploy-init | onboard tenant|workspace|user | \
-apikey issue|revoke | placement ensure | collection ensure | activate | status | \
-jobs requeue-dead --tenant ID (--job ID | --error-class CLASS)> [flags]";
+apikey issue|revoke | apikey pepper-epoch advance|close | placement ensure | collection ensure | activate | status | \
+jobs requeue-dead --tenant ID (--job ID | --error-class CLASS) | \
+roles rotate --roles-sql PATH [--role ROLE]... [--create-missing] | deploy-check --roles-sql PATH> [flags]";
 
 /// A failure before or outside the provisioning library.
 enum Failure {
@@ -175,6 +184,13 @@ fn mint(pepper: &[u8], tenant_id: Uuid, key_name: &str) -> (NewApiKey, String) {
     )
 }
 
+/// The one stdout line that carries a newly minted key, when there is one.
+fn bearer_line(wire: Option<String>) -> Vec<String> {
+    wire.map(|w| format!("Authorization: Bearer {w}"))
+        .into_iter()
+        .collect()
+}
+
 fn scopes(args: &Args) -> Result<Vec<String>> {
     let scopes: Vec<String> = args
         .required("--scopes")?
@@ -224,11 +240,12 @@ fn to_json<T: serde::Serialize>(value: &T) -> Result<Value> {
     serde_json::to_value(value).map_err(|e| Failure::Infra(format!("receipt: {e}")))
 }
 
-/// A receipt plus whether it reports a refusal (exit 3) and the one-time wire line.
+/// A receipt plus whether it reports a refusal (exit 3) and the secret lines printed once before it
+/// (a minted `Authorization: Bearer` key, or generated `HUMAUX_ROLE_PASSWORD_<SUFFIX>=` values).
 struct Output {
     receipt: Value,
     refused: bool,
-    wire: Option<String>,
+    once: Vec<String>,
 }
 
 impl Output {
@@ -236,15 +253,25 @@ impl Output {
         Self {
             receipt,
             refused: false,
-            wire: None,
+            once: Vec::new(),
         }
+    }
+
+    /// Everything printed on stdout: the once-lines, then the one JSON receipt.
+    fn render(&self) -> String {
+        self.once
+            .iter()
+            .map(String::as_str)
+            .chain([self.receipt.to_string().as_str()])
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn activation(receipt: Value, activation: &WorkspaceActivation) -> Self {
         Self {
             receipt,
             refused: activation.refusal().is_some(),
-            wire: None,
+            once: Vec::new(),
         }
     }
 }
@@ -331,7 +358,7 @@ async fn onboard_tenant(args: &Args) -> Result<Output> {
     receipt["wall_clock_ms"] = json!(started.elapsed().as_millis());
     let mut output = Output::activation(receipt, &activation);
     // Printed only when this run created the key (the tenant was created).
-    output.wire = tenant.api_key.as_ref().filter(|k| k.created).and(wire);
+    output.once = bearer_line(tenant.api_key.as_ref().filter(|k| k.created).and(wire));
     Ok(output)
 }
 
@@ -406,7 +433,7 @@ async fn apikey_issue(args: &Args) -> Result<Output> {
     } else {
         "existing"
     });
-    output.wire = receipt.created.then_some(wire);
+    output.once = bearer_line(receipt.created.then_some(wire));
     Ok(output)
 }
 
@@ -519,6 +546,28 @@ async fn jobs_requeue_dead(args: &Args) -> Result<Output> {
     Ok(Output::ok(to_json(&receipt)?))
 }
 
+/// `apikey pepper-epoch advance|close` (ADR-0059 D-H, runbook Rotate pepper phases 3 and 4):
+/// `advance` opens the rehash-on-use window once every gateway replica runs with the new current
+/// pepper; `close` shuts it, after which no key's verifier can be rewritten. `advance` is not
+/// re-runnable inside one window: while it is open a second `advance` is refused
+/// `rehash_window_open` (exit 3, epoch unchanged; migration 0205); `close` re-runs as a no-op.
+async fn apikey_pepper_epoch(args: &Args, open: bool) -> Result<Output> {
+    let admin = Admin::from(args)?;
+    let pool = pool().await?;
+    let epoch = role_hygiene::set_pepper_window(&pool, open).await?;
+    // ponytail: receipt-only audit (control.audit_events needs a tenant; the epoch is cluster-wide),
+    // a tenant-less ops audit stream is the upgrade path (ADR-0059 L3).
+    Ok(Output::ok(json!({
+        "command": if open { "apikey pepper-epoch advance" } else { "apikey pepper-epoch close" },
+        "epoch": epoch,
+        "rehash_open": open,
+        "actor": admin.actor,
+        "reason": admin.reason,
+        "ticket": admin.ticket,
+        "trace_id": admin.trace_id,
+    })))
+}
+
 async fn status(args: &Args) -> Result<Output> {
     let tenant_id = uuid_flag(args, "--tenant")?;
     let pool = pool().await?;
@@ -539,6 +588,13 @@ async fn run(args: Args) -> Result<Output> {
         ["activate", ..] => activate(&args).await,
         ["status", ..] => status(&args).await,
         ["jobs", "requeue-dead"] => jobs_requeue_dead(&args).await,
+        ["apikey", "pepper-epoch"] => match args.0.get(2).map(String::as_str) {
+            Some("advance") => apikey_pepper_epoch(&args, true).await,
+            Some("close") => apikey_pepper_epoch(&args, false).await,
+            _ => Err(Failure::Usage(USAGE.to_owned())),
+        },
+        ["roles", "rotate"] => roles::rotate(&args).await,
+        ["deploy-check", ..] => roles::deploy_check(&args).await,
         _ => Err(Failure::Usage(USAGE.to_owned())),
     }
 }
@@ -557,10 +613,7 @@ fn main() -> ExitCode {
     };
     match runtime.block_on(run(args)) {
         Ok(output) => {
-            if let Some(wire) = output.wire {
-                println!("Authorization: Bearer {wire}");
-            }
-            println!("{}", output.receipt);
+            println!("{}", output.render());
             ExitCode::from(if output.refused { 3 } else { 0 })
         }
         Err(Failure::Usage(message)) => {

@@ -1,5 +1,6 @@
 //! `adapters::tests::project_continuity_0136` — Real-PostgreSQL acceptance for migration 0136's project continuity registration and facet publication.
-//! Depends-on: crates=[postgres, serde_json, uuid]; services=[PostgreSQL(any) r=[control.contribution_policies,
+//! Depends-on: crates=[humaux-testkit, postgres, serde_json, uuid]; services=[PostgreSQL(any)
+//!   r=[control.contribution_policies,
 //!   private.continuity_] w=[control.memberships, control.private_reasoning_domains, control.tenants, control.users,
 //!   control.workspace_memberships, control.workspaces, private.continuity_facet_memory_links,
 //!   private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects,
@@ -7,7 +8,7 @@
 //!   x=[private.compute_contribution_source_backing_closure_v1, private.enqueue_contribution_execution,
 //!   private.publish_continuity_facet, private.register_continuity_project], PostgreSQL(role_gateway),
 //!   PostgreSQL(role_migration_owner)]; env=[HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN];
-//!   modules=[adapters::tests::support::contribution_fixture]
+//!   modules=[adapters::tests::support::contribution_fixture, humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [registration is eager and idempotent; null/unknown facets, ACL violations and a terminated pre-commit
 //!   backend leave no residue; one winner per expected version; a missing DB fails when HUMAUX_REQUIRE_DB=1]
@@ -55,19 +56,12 @@ fn required_dsn() -> Option<String> {
     }
 }
 
-fn role_dsn(base: &str, role: &str, password: &str, app: &str) -> String {
-    // Swap the credential pair of whatever admin DSN the caller supplied — the host/port/db
-    // suffix is what we need, the admin password is not fixed by contract (local dev, CI and
-    // the compose file each use a different one, so a hardcoded `postgres:postgres@` prefix
-    // makes this fixture non-portable and panics everywhere but one machine).
-    // Same shape as `dsn_as_role` in tests/mandatory_context_lane.rs.
-    let suffix = base
-        .strip_prefix("postgres://")
-        .or_else(|| base.strip_prefix("postgresql://"))
-        .and_then(|rest| rest.split_once('@').map(|(_creds, host)| host))
-        .expect("HUMAUX_TEST_PG_DSN must be postgres://<user>:<password>@<host>/<db>");
-    let separator = if suffix.contains('?') { '&' } else { '?' };
-    format!("postgres://{role}:{password}@{suffix}{separator}application_name={app}")
+fn role_dsn(base: &str, role: &str, app: &str) -> String {
+    // ADR-0059 D-D: a real login as `role`, its password from HUMAUX_ROLE_PASSWORD_<SUFFIX>.
+    let dsn = humaux_testkit::role_login_dsn(base, role, |name| std::env::var(name).ok())
+        .unwrap_or_else(|missing| panic!("missing object: {missing} (ADR-0059 D-D)"));
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    format!("{dsn}{separator}application_name={app}")
 }
 
 struct Fixture {
@@ -91,12 +85,7 @@ struct Fixture {
 impl Fixture {
     #[allow(clippy::too_many_lines)]
     fn new(admin_dsn: String) -> Self {
-        let gateway_dsn = role_dsn(
-            &admin_dsn,
-            "role_gateway",
-            "devlocal_role_gateway",
-            "continuity_gateway",
-        );
+        let gateway_dsn = role_dsn(&admin_dsn, "role_gateway", "continuity_gateway");
         let tenant = Uuid::now_v7();
         let user = Uuid::now_v7();
         let principal = Uuid::now_v7();
@@ -804,12 +793,7 @@ fn headless_visibility_hash_successor_and_acl_are_closed() {
         .unwrap()
         .get(0);
     assert_eq!(residue, 0);
-    let private_dsn = role_dsn(
-        &dsn,
-        "role_private_worker",
-        "devlocal_role_private_worker",
-        "continuity_private_denied",
-    );
+    let private_dsn = role_dsn(&dsn, "role_private_worker", "continuity_private_denied");
     // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut private = Client::connect(&private_dsn, NoTls).unwrap();
     private.batch_execute("BEGIN").unwrap();
@@ -1492,12 +1476,7 @@ fn role_private_worker_enqueue_preserves_0133_legacy_workspace_shared_route() {
         "SELECT policy_id FROM control.contribution_policies WHERE tenant_id=$1 AND effective_to IS NULL",
         &[&tenant],
     ).unwrap().get(0);
-    let private_dsn = role_dsn(
-        &dsn,
-        "role_private_worker",
-        "devlocal_role_private_worker",
-        "continuity_legacy_enqueue",
-    );
+    let private_dsn = role_dsn(&dsn, "role_private_worker", "continuity_legacy_enqueue");
     // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
     let mut private = Client::connect(&private_dsn, NoTls).unwrap();
     let snapshot =

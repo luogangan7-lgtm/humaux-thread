@@ -1,12 +1,13 @@
 //! `adapters::tests::project_continuity_read_0137` — Real-PostgreSQL acceptance for migration 0137's project continuity read path through read_project_continuity.
-//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, postgres, serde_json, tokio, uuid];
+//! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, humaux-testkit, postgres, serde_json,
+//!   tokio, uuid];
 //!   services=[PostgreSQL(any) r=[private.continuity_facet_versions] w=[control.memberships,
 //!   control.private_reasoning_domains, control.tenants, control.users, control.workspaces,
 //!   private.continuity_facet_slots, private.evidence_objects, private.memory_evidence, private.memory_records]
 //!   x=[private.publish_continuity_facet, private.register_continuity_project], PostgreSQL(role_gateway)];
 //!   env=[HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[adapters::continuity_read, adapters::postgres,
 //!   adapters::tests::support::continuity_0137_cleanup, application::continuity, domain::context, domain::continuity,
-//!   domain::error, domain::identity, domain::ids]
+//!   domain::error, domain::identity, domain::ids, humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [an authorized read is current, a revoked source makes it non-leaking stale, and a rolled-back owner
 //!   pointer or orphan version never reads as current or missing; a missing DB fails when HUMAUX_REQUIRE_DB=1]
@@ -64,19 +65,12 @@ fn required_dsn() -> Option<String> {
     }
 }
 
-fn role_dsn(base: &str, role: &str, password: &str, app: &str) -> String {
-    // Swap the credential pair of whatever admin DSN the caller supplied — the host/port/db
-    // suffix is what we need, the admin password is not fixed by contract (local dev, CI and
-    // the compose file each use a different one, so a hardcoded `postgres:postgres@` prefix
-    // makes this fixture non-portable and panics everywhere but one machine).
-    // Same shape as `dsn_as_role` in tests/mandatory_context_lane.rs.
-    let suffix = base
-        .strip_prefix("postgres://")
-        .or_else(|| base.strip_prefix("postgresql://"))
-        .and_then(|rest| rest.split_once('@').map(|(_creds, host)| host))
-        .expect("HUMAUX_TEST_PG_DSN must be postgres://<user>:<password>@<host>/<db>");
-    let separator = if suffix.contains('?') { '&' } else { '?' };
-    format!("postgres://{role}:{password}@{suffix}{separator}application_name={app}")
+fn role_dsn(base: &str, role: &str, app: &str) -> String {
+    // ADR-0059 D-D: a real login as `role`, its password from HUMAUX_ROLE_PASSWORD_<SUFFIX>.
+    let dsn = humaux_testkit::role_login_dsn(base, role, |name| std::env::var(name).ok())
+        .unwrap_or_else(|missing| panic!("missing object: {missing} (ADR-0059 D-D)"));
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    format!("{dsn}{separator}application_name={app}")
 }
 
 fn set_context(
@@ -119,12 +113,7 @@ impl Fixture {
     #[allow(clippy::too_many_lines)]
     fn new(admin_dsn: String) -> Self {
         let cleanup = Arc::new(CleanupOwner::new(admin_dsn.clone()));
-        let gateway_dsn = role_dsn(
-            &admin_dsn,
-            "role_gateway",
-            "devlocal_role_gateway",
-            "continuity_w2",
-        );
+        let gateway_dsn = role_dsn(&admin_dsn, "role_gateway", "continuity_w2");
         let tenant = Uuid::now_v7();
         let user = Uuid::now_v7();
         let principal = Uuid::now_v7();

@@ -1360,6 +1360,83 @@ fn g80_22_payload_sha256_unique(root: &Path) -> Verdict {
     }
 }
 
+/// ADR-0059: the functions that build role DDL carrying a verifier, and the one parser that reads
+/// migration 0011's placeholder literals, each have exactly one production call site.
+const ADR0059_SOLE_CALLS: [&str; 3] = [
+    "alter_role_password_sql",
+    "create_role_sql",
+    "parse_roles_sql",
+];
+
+/// ADR-0059 D-E/D-F pure comparator: each name in [`ADR0059_SOLE_CALLS`] is called `== 1` times
+/// across `files` (`#[cfg(test)]` modules already stripped by the walker); 0 is red as well.
+fn sole_call_site_problems(root: &Path, files: &[(PathBuf, String)]) -> Vec<String> {
+    names_with_one_call_site(root, files, &ADR0059_SOLE_CALLS)
+}
+
+/// Each of `names` is called `== 1` times across `files`; 0 is red as well.
+fn names_with_one_call_site(
+    root: &Path,
+    files: &[(PathBuf, String)],
+    names: &[&str],
+) -> Vec<String> {
+    names
+        .iter()
+        .filter_map(|name| {
+            let sites: Vec<String> = files
+                .iter()
+                .filter_map(|(path, source)| {
+                    let n = count_call_sites(source, name);
+                    (n > 0).then(|| format!("{}: {n}", display(root, path)))
+                })
+                .collect();
+            let total: usize = files.iter().map(|(_, s)| count_call_sites(s, name)).sum();
+            (total != 1).then(|| {
+                format!("expected exactly 1 `{name}(` call site, found {total}: {sites:?}")
+            })
+        })
+        .collect()
+}
+
+/// ADR-0059 D-G: the token key set is installed by exactly one production call (gateway
+/// bootstrap), and the 11-field token parser is reached only through MAC verification.
+const ADR0059_TOKEN_SOLE_CALLS: [&str; 2] = ["install_token_keys", "parse_token_fields"];
+
+/// [`ADR0059_TOKEN_SOLE_CALLS`] over production sources: integration-test trees (a `tests`
+/// path component) install their own per-process keys and are not production call sites.
+fn token_sole_call_problems(root: &Path, files: &[(PathBuf, String)]) -> Vec<String> {
+    let production: Vec<(PathBuf, String)> = files
+        .iter()
+        .filter(|(path, _)| {
+            !path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .components()
+                .any(|c| c.as_os_str() == "tests")
+        })
+        .cloned()
+        .collect();
+    names_with_one_call_site(root, &production, &ADR0059_TOKEN_SOLE_CALLS)
+}
+
+fn adr0059_token_sole_call_sites(root: &Path) -> Verdict {
+    let problems = token_sole_call_problems(root, &walk_workspace_rs(root));
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
+fn adr0059_role_hygiene_sole_call_sites(root: &Path) -> Verdict {
+    let problems = sole_call_site_problems(root, &walk_workspace_rs(root));
+    if problems.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(problems)
+    }
+}
+
 /// §1.3/§48.0 G80-11 (source_hash leg): `humaux_projection::fingerprint::source_hash` is the
 /// sole construction point of `SourceHash` (§16.1/§16.1.1, T5.1) — same single-crate
 /// convergence family as `EvidencePayloadSha256` (G80-22, above) and the §1.12 canonical tool
@@ -2831,7 +2908,8 @@ pub fn g6_db_pool_topology(root: &Path) -> Verdict {
 
     let mut problems = Vec::new();
 
-    // Eight wrappers, each declared exactly once, all in the encapsulation point.
+    // Nine wrappers (eight role pools + ADR-0059 D-E MigratorDbPool), each declared exactly once,
+    // all in the encapsulation point.
     for wrapper in [
         "RuntimeDbPool",
         "BatchIssuerDbPool",
@@ -2841,6 +2919,7 @@ pub fn g6_db_pool_topology(root: &Path) -> Verdict {
         "MaintenanceDbPool",
         "PublicWorkerDbPool",
         "AdminDbPool",
+        "MigratorDbPool",
     ] {
         let decl = format!("pub struct {wrapper}");
         let n = pool_src.matches(&decl).count();
@@ -5763,6 +5842,14 @@ pub fn run(_args: &[String]) -> i32 {
              recall.rs DEPENDENCY_UNAVAILABLE guard)",
             recall_v1_supported_lanes(&root),
         ),
+        (
+            "ADR-0059 D-E/D-F (role DDL and 0011 placeholder parsing: one call site each)",
+            adr0059_role_hygiene_sole_call_sites(&root),
+        ),
+        (
+            "ADR-0059 D-G (token key install and the token field parser: one production call site each)",
+            adr0059_token_sole_call_sites(&root),
+        ),
     ];
     checks.extend(provider_plane_architecture_gate_checks(&root));
 
@@ -6996,6 +7083,66 @@ mod tests {
     /// a call site. Exactly one of the six lines below is.
     ///
     /// This is the case the old raw-substring count got wrong: it scored 4 here.
+    /// T18 (ADR-0059): one call site each is green; a second call site of any of the three names,
+    /// or none at all, is red naming it. Then the live workspace is green.
+    #[test]
+    fn adr0059_role_ddl_and_parser_have_one_call_site_each() {
+        let root = Path::new("/w");
+        let one = "pub fn alter_role_password_sql(r: &str) {}\n\
+                   fn a() { alter_role_password_sql(r); create_role_sql(r); parse_roles_sql(t); }\n";
+        let files = vec![(root.join("a.rs"), one.to_owned())];
+        assert!(sole_call_site_problems(root, &files).is_empty());
+        let mut two = files.clone();
+        two.push((
+            root.join("b.rs"),
+            "fn b() { create_role_sql(x); }".to_owned(),
+        ));
+        let problems = sole_call_site_problems(root, &two);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("`create_role_sql(` call site, found 2"));
+        let none = vec![(root.join("c.rs"), "fn c() {}".to_owned())];
+        assert_eq!(sole_call_site_problems(root, &none).len(), 3);
+        assert!(matches!(
+            adr0059_role_hygiene_sole_call_sites(&workspace_root()),
+            Verdict::Pass
+        ));
+    }
+
+    /// T18 (ADR-0059 D-G): one production call of `install_token_keys(` and of
+    /// `parse_token_fields(` is green; a test-tree call does not count; a second production call
+    /// site is red naming it. Then the live workspace is green.
+    #[test]
+    fn adr0059_token_install_and_parser_have_one_production_call_site_each() {
+        let root = Path::new("/w");
+        let files = vec![
+            (
+                root.join("bins/gateway/src/bootstrap.rs"),
+                "fn b() { install_token_keys(k); }".to_owned(),
+            ),
+            (
+                root.join("crates/adapters/src/retrieve.rs"),
+                "fn parse_token_fields(p: &str) {}\nfn v() { parse_token_fields(p); }".to_owned(),
+            ),
+            (
+                root.join("crates/adapters/tests/support/token_keys.rs"),
+                "fn i() { install_token_keys(k); }".to_owned(),
+            ),
+        ];
+        assert!(token_sole_call_problems(root, &files).is_empty());
+        let mut two = files.clone();
+        two.push((
+            root.join("bins/private-worker/src/main.rs"),
+            "fn m() { install_token_keys(k); }".to_owned(),
+        ));
+        let problems = token_sole_call_problems(root, &two);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("`install_token_keys(` call site, found 2"));
+        assert!(matches!(
+            adr0059_token_sole_call_sites(&workspace_root()),
+            Verdict::Pass
+        ));
+    }
+
     #[test]
     fn g80_4_needle_counts_calls_not_definitions_or_lookalikes() {
         let src = "\
@@ -7916,7 +8063,8 @@ async fn serving_version_in_txn() {}
              pub struct RetrievalWorkerDbPool(());\n\
              pub struct MaintenanceDbPool(());\n\
              pub struct PublicWorkerDbPool(());\n\
-             pub struct AdminDbPool(());\n",
+             pub struct AdminDbPool(());\n\
+             pub struct MigratorDbPool(());\n",
         )
         .unwrap();
         match g6_db_pool_topology(&tmp) {
@@ -7943,7 +8091,8 @@ async fn serving_version_in_txn() {}
              pub struct RetrievalWorkerDbPool { inner: sqlx::PgPool }\n\
              pub struct MaintenanceDbPool { inner: sqlx::PgPool }\n\
              pub struct PublicWorkerDbPool { inner: sqlx::PgPool }\n\
-             pub struct AdminDbPool { inner: sqlx::PgPool }\n",
+             pub struct AdminDbPool { inner: sqlx::PgPool }\n\
+             pub struct MigratorDbPool { inner: sqlx::PgPool }\n",
         )
         .unwrap();
         fs::write(

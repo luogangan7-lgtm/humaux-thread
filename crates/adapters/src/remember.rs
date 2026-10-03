@@ -68,6 +68,9 @@ pub enum RememberError {
     /// and the on-behalf-of user owns no ACTIVE domain here. The tenant is not provisioned for
     /// writes (`DEPENDENCY_UNAVAILABLE`); raised BEFORE the first write, nothing is committed.
     ReasoningDomainUnresolved,
+    /// ADR-0059 D-G: no consistency-token key set is installed in this process; the transaction
+    /// is rolled back, nothing is committed (`DEPENDENCY_UNAVAILABLE`).
+    TokenKeysUnset,
 }
 
 impl From<sqlx::Error> for RememberError {
@@ -84,6 +87,7 @@ impl std::fmt::Display for RememberError {
                 write!(f, "consistency_token expiry must be after issuance time")
             }
             Self::BatchExhausted => write!(f, "BATCH_EXHAUSTED (§34.1)"),
+            Self::TokenKeysUnset => write!(f, "consistency_token key set is not installed"),
             Self::Subject(code) => write!(f, "subject declaration rejected: {code}"),
             Self::Affect(code) => write!(f, "affect declaration rejected: {code}"),
             Self::ReasoningDomainUnresolved => {
@@ -618,7 +622,8 @@ pub async fn remember_in_txn(
         commit_seq,
         issued_at,
         expires_at: cmd.consistency_token_expires_at,
-    });
+    })
+    .map_err(|_| RememberError::TokenKeysUnset)?;
 
     Ok(RememberPending {
         accepted: RememberAccepted {

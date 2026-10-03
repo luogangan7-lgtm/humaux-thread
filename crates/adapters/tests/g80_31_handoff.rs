@@ -2,9 +2,10 @@
 //!   的选取是机械规则、撤销立即生效、pinned 的「钉 3 带 2」可观测。
 //! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, humaux-projection, humaux-retrieval,
 //!   humaux-testkit, postgres, serde_json, sqlx, tokio, uuid]; services=[PostgreSQL(any)
-//!   w=[control.private_reasoning_domains, control.tenants, ops.selection_snapshot_items, ops.selection_snapshots,
-//!   private.context_bindings, private.events, private.evidence_objects, private.memory_evidence,
-//!   private.memory_records, projection.stream_checkpoints, projection.stream_log], PostgreSQL(owner),
+//!   w=[control.private_reasoning_domains, control.tenants, ops.jobs, ops.selection_snapshot_items,
+//!   ops.selection_snapshots, private.context_bindings, private.events, private.evidence_objects,
+//!   private.memory_evidence, private.memory_records, projection.stream_checkpoints, projection.stream_log],
+//!   PostgreSQL(owner),
 //!   PostgreSQL(role_gateway)]; env=[HUMAUX_GATEWAY_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[adapters::context_repo,
 //!   adapters::postgres, adapters::read_materialize, application::continuity, domain::authority, domain::context,
 //!   domain::error, domain::identity, domain::ids, humaux-testkit, projection::serving, projection::stream,
@@ -157,6 +158,19 @@ static QUIET: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // Card-31 pattern (card 33 leak fix): each seeded PRIMARY memory_evidence link enqueued a
+        // DERIVED_CONSOLIDATE job (0164 trigger). They are deleted in their own autocommit
+        // statement first, so a failure in the transaction below (which ends in the tenant delete)
+        // cannot roll the job delete back.
+        if let Err(error) = self.admin.execute(
+            "DELETE FROM ops.jobs WHERE tenant_id = $1",
+            &[&self.tenant_id],
+        ) {
+            eprintln!(
+                "g80 handoff fixture job cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
         let cleanup = (|| -> Result<(), postgres::Error> {
             let mut txn = self.admin.transaction()?;
             if let Some(name) = self.direct_get_barrier.take() {

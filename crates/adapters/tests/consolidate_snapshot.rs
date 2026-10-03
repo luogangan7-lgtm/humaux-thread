@@ -1,9 +1,10 @@
 //! `adapters::tests::consolidate_snapshot` — T4.6/T4.7 integration test — `consolidate_repo` (§11.7) against a real
 //!   Postgres.
 //! Depends-on: crates=[humaux-adapters, humaux-testkit, postgres, serde_json, sha2, sqlx, tokio];
-//!   services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, control.users, private.events,
-//!   private.evidence_objects, private.memory_consolidation_inputs, private.memory_consolidation_runs,
-//!   private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollups],
+//!   services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, control.users, ops.jobs,
+//!   ops.outbox, private.events, private.evidence_objects, private.memory_consolidation_inputs,
+//!   private.memory_consolidation_runs, private.memory_evidence, private.memory_records,
+//!   private.memory_rollup_sources, private.memory_rollups, projection.stream_checkpoints, projection.stream_log],
 //!   PostgreSQL(role_consolidation_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::consolidate_repo,
 //!   adapters::postgres, humaux-testkit]
 //! Called-by: [cargo-test]
@@ -116,23 +117,39 @@ struct Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // Best-effort cleanup (repo CLAUDE.md hard rule ④: this file never touches a
-        // schema/table of its own, only rows it created under its own throwaway tenant).
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM private.memory_rollup_sources WHERE rollup_id IN \
+        // Repo CLAUDE.md hard rule ④: this file never touches a schema/table of its own, only rows
+        // it created under its own throwaway tenant. Card-31 pattern (card 33 leak fix): each seeded
+        // PRIMARY memory_evidence link enqueued a DERIVED_CONSOLIDATE job (0164 trigger). Jobs go
+        // first, in one batch with the rows that produced them (and the rollup ticket's outbox and
+        // stream rows), and a failure is printed; the tenant row goes in a separate best-effort
+        // batch, so a refused tenant delete can no longer roll the job delete back.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM private.memory_rollup_sources WHERE rollup_id IN \
                (SELECT rollup_id FROM private.memory_rollups WHERE tenant_id = '{0}'); \
              DELETE FROM private.memory_rollups WHERE tenant_id = '{0}'; \
              DELETE FROM private.memory_consolidation_inputs WHERE run_id IN \
                (SELECT run_id FROM private.memory_consolidation_runs WHERE tenant_id = '{0}'); \
              DELETE FROM private.memory_consolidation_runs WHERE tenant_id = '{0}'; \
+             DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}'; \
              DELETE FROM private.memory_evidence WHERE memory_id IN \
                (SELECT memory_id FROM private.memory_records WHERE tenant_id = '{0}'); \
              DELETE FROM private.memory_records WHERE tenant_id = '{0}'; \
              DELETE FROM private.events WHERE event_id IN \
                (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id = '{0}'); \
              DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
-             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{0}';",
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}';",
+            self.tenant_id
+        )) {
+            eprintln!(
+                "consolidate_snapshot cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{0}';",
             self.tenant_id
         ));
     }

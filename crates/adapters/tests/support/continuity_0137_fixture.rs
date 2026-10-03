@@ -1,5 +1,6 @@
 //! `adapters::tests::support::continuity_0137_fixture` — Shared seed, role-DSN and run-bound diagnostic fixture for the 0137 continuity tests.
-//! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-domain, postgres, serde_json, sha2, tokio,
+//! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-domain, humaux-testkit, postgres, serde_json,
+//!   sha2, tokio,
 //!   uuid]; services=[PostgreSQL(owner) r=[ops.commit_seq_seq] w=[control.memberships,
 //!   control.private_reasoning_domains, control.tenants, control.users, control.workspace_memberships,
 //!   control.workspaces, ops.outbox, private.evidence_objects, private.memory_evidence, private.memory_records,
@@ -7,7 +8,7 @@
 //!   PostgreSQL(role_gateway)]; env=[HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN, HUMAUX_W2_V4_DIAGNOSTIC,
 //!   HUMAUX_W2_V4_DIAGNOSTIC_DIR, HUMAUX_W2_V4_DIAGNOSTIC_RUN_UUID]; modules=[adapters::continuity_read,
 //!   adapters::postgres, adapters::tests::support::continuity_0137_cleanup, application::continuity, domain::context,
-//!   domain::continuity, domain::error, domain::identity, domain::ids]
+//!   domain::continuity, domain::error, domain::identity, domain::ids, humaux-testkit]
 //! Called-by: [adapters::tests::project_continuity_read_0137_acceptance]
 //! Invariants: [seeds control, source and continuity rows as owner and reads back as role_gateway; every seeded id is
 //!   registered for cleanup; diagnostic output is bound to one run UUID; a missing DB fails when HUMAUX_REQUIRE_DB=1]
@@ -489,18 +490,12 @@ pub fn required_dsn() -> Option<String> {
     }
 }
 
-pub fn role_dsn(base: &str, role: &str, password: &str, app: &str) -> String {
-    // Swap the credential pair of whatever admin DSN the caller supplied; the admin password
-    // is not fixed by contract (local dev, CI and compose each use a different one), so a
-    // hardcoded `postgres:postgres@` prefix makes this fixture panic everywhere but one
-    // machine. Same shape as `dsn_as_role` in tests/mandatory_context_lane.rs.
-    let suffix = base
-        .strip_prefix("postgres://")
-        .or_else(|| base.strip_prefix("postgresql://"))
-        .and_then(|rest| rest.split_once('@').map(|(_creds, host)| host))
-        .expect("HUMAUX_TEST_PG_DSN must be postgres://<user>:<password>@<host>/<db>");
-    let separator = if suffix.contains('?') { '&' } else { '?' };
-    format!("postgres://{role}:{password}@{suffix}{separator}application_name={app}")
+pub fn role_dsn(base: &str, role: &str, app: &str) -> String {
+    // ADR-0059 D-D: a real login as `role`, its password from HUMAUX_ROLE_PASSWORD_<SUFFIX>.
+    let dsn = humaux_testkit::role_login_dsn(base, role, |name| std::env::var(name).ok())
+        .unwrap_or_else(|missing| panic!("missing object: {missing} (ADR-0059 D-D)"));
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    format!("{dsn}{separator}application_name={app}")
 }
 
 pub fn set_context(
@@ -677,12 +672,7 @@ impl Fixture {
         let application_name = diagnostic
             .map(|diagnostic| diagnostic.application_name("gw").unwrap())
             .unwrap_or(fallback_application_name);
-        let gateway_dsn = role_dsn(
-            admin_dsn,
-            "role_gateway",
-            "devlocal_role_gateway",
-            &application_name,
-        );
+        let gateway_dsn = role_dsn(admin_dsn, "role_gateway", &application_name);
         let gateway_dsn = if diagnostic.is_some() {
             bind_application_name(&gateway_dsn, &application_name)
         } else {
@@ -916,26 +906,21 @@ impl Fixture {
     }
 
     pub fn gateway(&self, app: &str) -> Client {
-        self.gateway_as("role_gateway", "devlocal_role_gateway", app)
+        self.gateway_as("role_gateway", app)
     }
 
-    pub fn gateway_as(&self, role: &str, password: &str, app: &str) -> Client {
-        self.try_gateway_as(role, password, app)
-            .expect("gateway connect")
+    pub fn gateway_as(&self, role: &str, app: &str) -> Client {
+        self.try_gateway_as(role, app).expect("gateway connect")
     }
 
-    pub fn try_gateway_as(
-        &self,
-        role: &str,
-        password: &str,
-        app: &str,
-    ) -> Result<Client, postgres::Error> {
+    /// A real login as `role` (ADR-0059 D-D: password from `HUMAUX_ROLE_PASSWORD_<SUFFIX>`).
+    pub fn try_gateway_as(&self, role: &str, app: &str) -> Result<Client, postgres::Error> {
         let application_name = self
             .diagnostic
             .as_ref()
             .map(|diagnostic| diagnostic.application_name("gw").unwrap())
             .unwrap_or_else(|| app.to_owned());
-        let dsn = role_dsn(&self.admin_dsn, role, password, &application_name);
+        let dsn = role_dsn(&self.admin_dsn, role, &application_name);
         let dsn = if self.diagnostic.is_some() {
             bind_application_name(&dsn, &application_name)
         } else {

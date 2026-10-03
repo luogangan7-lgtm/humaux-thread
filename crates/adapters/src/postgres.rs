@@ -3,12 +3,14 @@
 //!   r=[private.events, private.ingest_tickets, private.memory_consolidation_inputs, private.memory_evidence,
 //!   private.memory_records, projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_batch_issuer),
 //!   PostgreSQL(role_consolidation_worker), PostgreSQL(role_gateway), PostgreSQL(role_maintenance),
-//!   PostgreSQL(role_private_worker), PostgreSQL(role_public_worker), PostgreSQL(role_retrieval_worker)];
+//!   PostgreSQL(role_private_worker), PostgreSQL(role_public_worker), PostgreSQL(role_retrieval_worker),
+//!   PostgreSQL(owner)];
 //!   env=[HUMAUX_TEST_PG_DSN]; modules=[domain::error]
-//! Called-by: [adapters::affect_repo, adapters::batch, adapters::confirm_token_repo, adapters::consolidate_repo, adapters::consolidation_reasoner, adapters::context_repo, adapters::continuity_read, adapters::continuity_repo, adapters::contribution_entry_repo, adapters::contribution_execution_ingress, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::contribution_repo, adapters::credential_repo, adapters::disclosure, adapters::distill_reasoner, adapters::distill_repo, adapters::email::outbox, adapters::exact_census, adapters::forget_repo, adapters::jobs, adapters::mechanism_observation, adapters::membership_repo, adapters::memory_governance_repo, adapters::model_call_ledger, adapters::operation_receipt, adapters::placement_repo, adapters::private_inference_rpc, adapters::private_projection_registry, adapters::projection_worker, adapters::provider_budget, adapters::provisioning, adapters::public_provenance, adapters::public_repo, adapters::quota_repo, adapters::read_materialize, adapters::remember, adapters::request_guard_repo, adapters::retrieval_embedding_rpc, adapters::retrieval_query_source, adapters::retrieve, adapters::scheduler, adapters::selection_repo, adapters::serving_repo, adapters::stream_repo, adapters::subject_repo, admin::mechanism, consolidation-worker::inference_client, consolidation-worker::main, gateway::auth, gateway::bootstrap, gateway::context, gateway::continuity, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::retrieval_embedding_client, humaux-consolidation-worker, humaux-private-worker, maintenance::main, private-worker::distill, private-worker::inference_rpc, private-worker::main, public-worker::main, retrieval-provider::adapters, retrieval-worker::main, retrieval-worker::rpc, tests, xtask::confirm_sweep, xtask::e2e_seed, xtask::mechanism_registry, xtask::member, xtask::projection_serve]
+//! Called-by: [adapters::affect_repo, adapters::batch, adapters::confirm_token_repo, adapters::consolidate_repo, adapters::consolidation_reasoner, adapters::context_repo, adapters::continuity_read, adapters::continuity_repo, adapters::contribution_entry_repo, adapters::contribution_execution_ingress, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::contribution_repo, adapters::credential_repo, adapters::disclosure, adapters::distill_reasoner, adapters::distill_repo, adapters::email::outbox, adapters::exact_census, adapters::forget_repo, adapters::jobs, adapters::mechanism_observation, adapters::membership_repo, adapters::memory_governance_repo, adapters::model_call_ledger, adapters::operation_receipt, adapters::placement_repo, adapters::private_inference_rpc, adapters::private_projection_registry, adapters::projection_worker, adapters::provider_budget, adapters::provisioning, adapters::public_provenance, adapters::public_repo, adapters::quota_repo, adapters::read_materialize, adapters::remember, adapters::request_guard_repo, adapters::retrieval_embedding_rpc, adapters::retrieval_query_source, adapters::retrieve, adapters::role_hygiene, adapters::scheduler, adapters::selection_repo, adapters::serving_repo, adapters::stream_repo, adapters::subject_repo, admin::mechanism, consolidation-worker::inference_client, consolidation-worker::main, gateway::auth, gateway::bootstrap, gateway::context, gateway::continuity, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::retrieval_embedding_client, humaux-consolidation-worker, humaux-private-worker, maintenance::main, maintenance::roles, private-worker::distill, private-worker::inference_rpc, private-worker::main, public-worker::main, retrieval-provider::adapters, retrieval-worker::main, retrieval-worker::rpc, tests, xtask::confirm_sweep, xtask::e2e_seed, xtask::mechanism_registry, xtask::member, xtask::projection_serve]
 //! Invariants: [the only file that names sqlx::PgPool: eight typed pools, one per role (§6.2.3), each connect checks
-//!   current_user and fails with PoolInitError::RoleMismatch on a wrong role; no raw-pool accessor leaves the crate]
-//! Spec: Baseline §58; §6.2.3; §15.4; §15.2; §6.2.2
+//!   current_user and fails with PoolInitError::RoleMismatch on a wrong role; no raw-pool accessor leaves the crate;
+//!   the ninth, MigratorDbPool, refuses every §6.2.0 role and any principal without CREATEROLE (ADR-0059 D-E)]
+//! Spec: Baseline §58; §6.2.3; §15.4; §15.2; §6.2.2; ADR-0059
 //!
 //! Spec canonical path is `crates/adapters/postgres/src/pools.rs`; this repo's crate layout
 //! (§58) flattens adapters into `crates/adapters/src/<name>.rs` modules, so **this file IS
@@ -94,15 +96,20 @@ impl std::error::Error for PoolInitError {
     }
 }
 
-/// Connects `dsn` and asserts `SELECT current_user` equals `expected_role` literally before
-/// handing back a pool (§6.2.3 assertion E). This is the *only* place in the crate that
-/// constructs a bare [`PgPool`] — every wrapper's `connect` calls through here.
-async fn connect_checked(dsn: &str, expected_role: &'static str) -> Result<PgPool, PoolInitError> {
+/// The *only* place in the crate that constructs a bare [`PgPool`]; every wrapper's `connect`
+/// calls through here and then checks the connected identity before handing the pool out.
+async fn open(dsn: &str) -> Result<PgPool, PoolInitError> {
     // dep: PostgreSQL(any) — connects to PostgreSQL
-    let pool = PgPoolOptions::new()
+    PgPoolOptions::new()
         .connect(dsn)
         .await
-        .map_err(PoolInitError::Connect)?;
+        .map_err(PoolInitError::Connect)
+}
+
+/// Connects `dsn` and asserts `SELECT current_user` equals `expected_role` literally before
+/// handing back a pool (§6.2.3 assertion E).
+async fn connect_checked(dsn: &str, expected_role: &'static str) -> Result<PgPool, PoolInitError> {
+    let pool = open(dsn).await?;
     let row = sqlx::query("SELECT current_user")
         // dep: PostgreSQL(any) — executes a query against the pool
         .fetch_one(&pool)
@@ -261,6 +268,57 @@ impl PublicWorkerDbPool {
 
     /// Public contribution worker queries stay inside this crate so the checked role wrapper
     /// cannot be replaced by a pool belonging to another role.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.0
+    }
+}
+
+/// `role_migration_owner`: NOLOGIN, never a pool identity (ADR-0059 D-A); named here so the
+/// migrator check can refuse every member of the frozen role set (§6.2.0).
+pub const ROLE_MIGRATION_OWNER: &str = "role_migration_owner";
+
+/// The principal that runs `migrate` (ADR-0059 D-E): the only pool that may `ALTER ROLE`. Opened
+/// for `humaux-maintenance roles rotate` from `HUMAUX_MIGRATOR_PG_DSN`, one connection, never a
+/// standing pool of any service.
+pub struct MigratorDbPool(PgPool);
+
+impl MigratorDbPool {
+    /// §6.2.3-style connect check (ADR-0059 D-E): `current_user` is none of the nine §6.2.0 roles
+    /// and is a superuser or holds CREATEROLE. Anything else is [`PoolInitError::RoleMismatch`].
+    pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
+        const EXPECTED: &str = "a superuser or CREATEROLE principal outside the §6.2.0 role set";
+        let pool = open(dsn).await?;
+        let row = sqlx::query(
+            "SELECT current_user::text, rolsuper OR rolcreaterole FROM pg_roles \
+             WHERE rolname = current_user",
+        )
+        // dep: PostgreSQL(owner) — the connect check of the role-rotation principal
+        .fetch_one(&pool)
+        .await
+        .map_err(PoolInitError::Connect)?;
+        let actual: String = row.try_get(0).map_err(PoolInitError::Connect)?;
+        let may_alter_roles: bool = row.try_get(1).map_err(PoolInitError::Connect)?;
+        let frozen = [
+            ROLE_GATEWAY,
+            ROLE_BATCH_ISSUER,
+            ROLE_CONSOLIDATION_WORKER,
+            ROLE_PRIVATE_WORKER,
+            ROLE_RETRIEVAL_WORKER,
+            ROLE_MAINTENANCE,
+            ROLE_PUBLIC_WORKER,
+            ROLE_ADMIN,
+            ROLE_MIGRATION_OWNER,
+        ];
+        if frozen.contains(&actual.as_str()) || !may_alter_roles {
+            return Err(PoolInitError::RoleMismatch {
+                expected: EXPECTED,
+                actual,
+            });
+        }
+        Ok(Self(pool))
+    }
+
+    /// `adapters::role_hygiene`'s accessor — see [`RuntimeDbPool::pool`]'s doc for why `pub(crate)`.
     pub(crate) fn pool(&self) -> &PgPool {
         &self.0
     }

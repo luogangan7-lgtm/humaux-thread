@@ -35,12 +35,10 @@
 //!   own claimed `tenant_id` against the caller's actual request scope and rejects the
 //!   mismatch on its own.
 //!
-//! `adapters::retrieve::issue_consistency_token`'s doc comment explicitly ponytails away a
-//! signature ("§15.5 states outright this is 只提供 read-your-writes 约束,不是认证
-//! token...upgrade path: HMAC-sign the field list with a server-held key") because that
-//! token's real boundary is RLS, not itself. §20.4 draws the opposite line for EXACT/Export/
-//! audit pagination ("不能使用 best-effort") — this module is that upgrade, applied to the
-//! one call site that actually needs it, not retrofitted onto the read-your-writes token.
+//! §20.4 requires EXACT/Export/audit pagination cursors to be unforgeable ("不能使用
+//! best-effort"), so this cursor carries its own MAC. The §15.5 read-your-writes token is
+//! MAC'd separately in `adapters::retrieve` (ADR-0059 D-G) under its own key; neither MAC is
+//! authorization — the tenant comparison in [`Cursor::validate`] and RLS are.
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -240,9 +238,7 @@ impl Cursor {
         Ok(())
     }
 
-    /// Opaque wire encoding — same field-list-then-hex technique as
-    /// `adapters::retrieve::issue_consistency_token`, with the MAC that module's doc comment
-    /// names as the upgrade path appended as a final field.
+    /// Opaque wire encoding: hex of the field list with the MAC appended as a final field.
     pub fn encode(&self) -> String {
         let fields = [
             self.snapshot_id.to_string(),

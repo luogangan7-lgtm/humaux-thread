@@ -62,6 +62,28 @@ never report a healthy-but-empty reading — §4.4 坑5, "没有" ≠ "没扫到
 | `--readyz` names `the private worker's inference RPC socket` | the private worker is not running, or is running as a different OS user / with a different socket path | start the private worker first (§4 start order); check the socket path and its owner |
 | `humaux-admin q <name>` exits non-zero with `missing object` | the probe could not reach its object **at all** | that is data, not a bug: the named object is what has to exist before the probe can answer. See §5 |
 
+### `humaux-maintenance deploy-check` (ADR-0059 D-F; run before traffic and after every rotation)
+
+Read-only; one JSON `{checks:[{name, status, detail}]}`, where `detail` holds role or variable
+**names** only. Exit `0` every check passes · `3` a check fails or is `not_applicable` (it names the
+missing object) · `1` infrastructure (connect refused, timeout, TLS).
+
+| check | red means | action |
+|---|---|---|
+| `placeholder_login` | a named role accepted a repository placeholder (`Accepted`), or answered SQLSTATE 28000 (`unverified`: pg_hba rejected the path, or a NOLOGIN role still holds a verifier) | `roles rotate` that role (runbook §10.1); for 28000, add a password-auth pg_hba line for that role from this host |
+| `probe_valid` | a random password was not refused with 28P01 — that path does not check passwords (trust/peer) or is unverified, so `placeholder_login` would be vacuous | fix pg_hba for the named role; never mark the check optional |
+| `owner_nologin` | `role_migration_owner` can log in | `ALTER ROLE role_migration_owner NOLOGIN PASSWORD NULL` via the migrator principal; find who changed it |
+| `schema_migrations_write` | a non-owner role holds INSERT/UPDATE/DELETE/TRUNCATE on `ops.schema_migrations` | revoke it; a forged ledger row would make `migrate` skip a migration (SEC-2) |
+| `env_dsn_placeholders` | a `*_PG_DSN` / `DATABASE_URL` in this environment still carries a placeholder password (the variable is named) | rotate (§10.1) and update the named variable from the secrets store |
+
+### Private worker: credential map (ADR-0059 D-I)
+
+| symptom | means | action |
+|---|---|---|
+| boot exits naming `HUMAUX_PRIVATE_WORKER_CREDENTIALS` | the map is unset, malformed, repeats a reference, or names an unset/empty variable | fix the map; do not restart in a loop. An explicitly empty value boots (every route parks) |
+| boot exits naming `HUMAUX_PRIVATE_WORKER_KEY_ENV ... removed` | stale card-32 configuration | delete the variable; put the key in the map |
+| distill jobs `WAITING_KEY`, `last_error_class = CREDENTIAL_NOT_MAPPED` | the route's credential reference is not in this worker's map; no provider call, no ledger row, no attempt was spent | add `<credential_ref>=<ENV_NAME>` to the map and restart (runbook §10.4); the jobs are re-checked every `HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS` |
+
 **Never treat a `missing object` as a zero reading.** If a dashboard shows `0` where a probe
 actually failed, the dashboard is broken, not the system: the probes emit no envelope at all on
 that path, precisely so a `0` can never be manufactured downstream.

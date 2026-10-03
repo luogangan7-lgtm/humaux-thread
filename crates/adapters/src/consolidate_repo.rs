@@ -1,5 +1,5 @@
 //! `adapters::consolidate_repo` — §11.6/§11.7 Private Memory Consolidation SQL, through [`ConsolidationDbPool`] only.
-//! Depends-on: crates=[humaux-application, humaux-domain, humaux-projection, humaux-testkit, postgres, serde_json, sha2, sqlx]; services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, private.context_bindings, private.events, private.evidence_objects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollups] x=[control.current_reasoning_route_binding]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::jobs, adapters::memory_governance_repo, adapters::postgres, adapters::remember, adapters::subject_repo, application::consolidate, domain::authority, domain::consolidate, domain::error, domain::ids, domain::ticket_family, projection::stream]
+//! Depends-on: crates=[humaux-application, humaux-domain, humaux-projection, humaux-testkit, postgres, serde_json, sha2, sqlx]; services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, ops.jobs, private.context_bindings, private.events, private.evidence_objects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollups] x=[control.current_reasoning_route_binding]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::jobs, adapters::memory_governance_repo, adapters::postgres, adapters::remember, adapters::subject_repo, application::consolidate, domain::authority, domain::consolidate, domain::error, domain::ids, domain::ticket_family, projection::stream]
 //! Called-by: [adapters::consolidation_reasoner, adapters::distill_reasoner, adapters::distill_repo, humaux-consolidation-worker, tests]
 //! Invariants: [input selection and materialization happen in ONE REPEATABLE READ READ WRITE transaction (§11.7), so
 //!   no concurrent insert can leak into a run; a lost lease is LostRace and an unknown source UnknownSource, never a
@@ -1062,15 +1062,23 @@ mod binding_predicate_tests {
             );
         }
 
-        // 清理：binding 不是 append-only，可以删。
-        let _ = admin.execute(
-            "DELETE FROM private.context_bindings WHERE memory_id = $1",
-            &[&memory_id],
-        );
-        let _ = admin.execute(
-            "DELETE FROM private.memory_records WHERE memory_id = $1",
-            &[&memory_id],
-        );
+        // Card-31 pattern (card 33 leak fix): the seeded PRIMARY link enqueued a DERIVED_CONSOLIDATE
+        // job (0164 trigger). Jobs go first, in one batch with the rows that produced them, and a
+        // failure is printed; the tenant row goes in a separate best-effort batch. Before, the
+        // memory delete failed on its evidence link and the tenant delete on its reasoning domain,
+        // both swallowed, and the job stayed PENDING on the shared dev DB.
+        if let Err(error) = admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{tenant_id}'; \
+             DELETE FROM private.context_bindings WHERE memory_id = '{memory_id}'; \
+             DELETE FROM private.memory_evidence WHERE memory_id = '{memory_id}'; \
+             DELETE FROM private.memory_records WHERE memory_id = '{memory_id}'; \
+             DELETE FROM private.events WHERE event_id IN \
+               (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id = '{tenant_id}'); \
+             DELETE FROM private.evidence_objects WHERE tenant_id = '{tenant_id}'; \
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{tenant_id}';"
+        )) {
+            eprintln!("binding_predicate_tests cleanup failed for tenant {tenant_id}: {error}");
+        }
         let _ = admin.execute(
             "DELETE FROM control.tenants WHERE tenant_id = $1",
             &[&tenant_id],

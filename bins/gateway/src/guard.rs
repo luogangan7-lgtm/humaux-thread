@@ -55,6 +55,8 @@ use crate::auth::{
 /// network restriction; they never replace credential authentication or scoped grants.
 pub struct GuardSettings {
     pub credential_pepper: Vec<u8>,
+    /// ADR-0059 D-H: the previous pepper while a rotation window is open, `None` otherwise.
+    pub credential_pepper_previous: Option<Vec<u8>>,
     pub trusted_proxies: TrustedProxyConfig,
     pub global_denylist: Vec<Cidr>,
     pub global_emergency_allowlist: Vec<Cidr>,
@@ -279,6 +281,7 @@ impl GatewayGuard {
                     &self.pool,
                     header,
                     &self.settings.credential_pepper,
+                    self.settings.credential_pepper_previous.as_deref(),
                     network.client_ip,
                     SystemTime::now(),
                 )

@@ -575,6 +575,15 @@ pub async fn search(
             );
             ErrorCode::InvalidInput
         }
+        // ADR-0059 D-G: bootstrap installs the token keys before the listener starts, so this is
+        // a server fault, never a caller one.
+        humaux_adapters::retrieve::RetrieveError::TokenKeysUnset => {
+            eprintln!(
+                "humaux-gateway: recall request_id={request_id} materialize_failed \
+                 class=token_keys_unset"
+            );
+            ErrorCode::DependencyUnavailable
+        }
         error => {
             // Operator signal, same discipline as the qdrant_query_failed line above: the
             // RetrieveError class only — `Db` carries driver text and is reduced to its name.

@@ -58,6 +58,7 @@ pub mod request_guard_repo;
 pub mod retrieval_embedding_rpc;
 pub mod retrieval_query_source;
 pub mod retrieve;
+pub mod role_hygiene;
 pub mod s3;
 pub mod scheduler;
 pub mod selection_repo;

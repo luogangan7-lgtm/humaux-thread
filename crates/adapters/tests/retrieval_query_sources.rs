@@ -3,7 +3,7 @@
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-local-secret-scan, humaux-retrieval, humaux-testkit,
 //!   postgres, sqlx, tokio]; services=[PostgreSQL(owner) r=[ops.commit_seq_seq] w=[control.memberships,
 //!   control.private_reasoning_domains, control.tenants, control.users, control.workspaces,
-//!   ops.data_disclosure_sources, ops.data_disclosures, ops.outbox, private.events, private.evidence_objects,
+//!   ops.data_disclosure_sources, ops.data_disclosures, ops.jobs, ops.outbox, private.events, private.evidence_objects,
 //!   private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollups,
 //!   private.retrieval_query_sources, staging.contribution_release_sources, staging.contribution_releases]
 //!   x=[ops.attach_retrieval_query_source], PostgreSQL(role_maintenance), PostgreSQL(role_migration_owner),
@@ -66,6 +66,25 @@ struct Handle {
     release_id: Uuid,
     auth: AuthorizationScope,
     retrieval_dsn: String,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // Card-31 pattern (card 33 leak fix): the seeded PRIMARY memory_evidence link enqueued a
+        // DERIVED_CONSOLIDATE job (0164 trigger) for a tenant with no route binding; left behind it
+        // is claimed ahead of every later tenant on the shared dev DB. This fixture keeps its other
+        // rows (the append-only disclosure ledger references them, so the tenant row cannot go);
+        // the job is the one row that must not outlive the test. A failure is printed.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}';",
+            self.tenant_id
+        )) {
+            eprintln!(
+                "retrieval_query_sources cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+    }
 }
 
 struct Fixture;

@@ -1,10 +1,10 @@
 //! `adapters::credential_repo` — Gateway-only read adapter for §73.5.1 service credential bindings.
-//! Depends-on: crates=[humaux-domain, sqlx]; services=[PostgreSQL(any) r=[control.workspace_memberships] x=[control.api_key_lookup, control.api_key_touch_last_used]]; env=[]; modules=[adapters::postgres, domain::error, domain::identity]
+//! Depends-on: crates=[humaux-domain, sqlx]; services=[PostgreSQL(any) r=[control.workspace_memberships] x=[control.api_key_lookup, control.api_key_rehash, control.api_key_touch_last_used]]; env=[]; modules=[adapters::postgres, domain::error, domain::identity]
 //! Called-by: [gateway::auth, tests]
 //! Invariants: [returns database facts only (HMAC and authorization stay in the auth layer); the workspace-ceiling
 //!   read runs only after a user-bound key validates, so a bad key does no membership work; a PG error is
-//!   DependencyUnavailable]
-//! Spec: Baseline §6.1.1; ADR-0035
+//!   DependencyUnavailable; a verifier is rewritten only through the epoch-gated, window-bounded api_key_rehash door (ADR-0059 D-H, migration 0204)]
+//! Spec: Baseline §6.1.1, §73.5; ADR-0035; ADR-0059
 //!
 //! This module returns database facts only; HMAC and authorization decisions remain in
 //! the protocol/authentication layer.
@@ -261,4 +261,27 @@ pub async fn mark_used(pool: &RuntimeDbPool, api_key_id: Uuid) -> Result<(), Err
         .await
         .map_err(db_error)?;
     Ok(())
+}
+
+/// §73.5 / ADR-0059 D-H: rewrites a key's verifier from `old_hash` (previous pepper) to `new_hash`
+/// (current pepper) through the epoch-gated, audited `control.api_key_rehash` door.
+///
+/// `Some(true)` = rewritten; `Some(false)` = nothing rewritten (compare-and-set lost, key revoked,
+/// or no epoch open). `None` is decoded rather than assumed away even though the function never
+/// returns NULL, so the caller treats every non-`true` outcome alike: never fatal to a request
+/// that already validated.
+pub async fn rehash(
+    pool: &RuntimeDbPool,
+    api_key_id: Uuid,
+    old_hash: &[u8],
+    new_hash: &[u8],
+) -> Result<Option<bool>, ErrorCode> {
+    sqlx::query_scalar("SELECT control.api_key_rehash($1, $2, $3)")
+        .bind(api_key_id)
+        .bind(old_hash)
+        .bind(new_hash)
+        // dep: PostgreSQL(any) — control.api_key_rehash owner definer (migration 0202)
+        .fetch_one(pool.pool())
+        .await
+        .map_err(db_error)
 }

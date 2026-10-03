@@ -72,6 +72,7 @@ fn guard(runtime: RuntimeDbPool) -> Arc<GatewayGuard> {
             runtime,
             GuardSettings {
                 credential_pepper: SYNTHETIC_CREDENTIAL_PEPPER.to_vec(),
+                credential_pepper_previous: None,
                 trusted_proxies: TrustedProxyConfig {
                     trusted_proxy_cidrs: vec![Cidr::from_str("127.0.0.1/32").unwrap()],
                     max_forwarded_hops: 1,

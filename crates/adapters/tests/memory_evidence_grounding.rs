@@ -2,7 +2,7 @@
 //!   `migrations/0100_memory_evidence_grounding.sql` — §8.8's two per-edge columns on `private.memory_evidence`,
 //!   against a real Postgres.
 //! Depends-on: crates=[humaux-domain, humaux-testkit, postgres, uuid]; services=[PostgreSQL(owner)
-//!   w=[control.private_reasoning_domains, control.tenants, private.events, private.evidence_objects,
+//!   w=[control.private_reasoning_domains, control.tenants, ops.jobs, private.events, private.evidence_objects,
 //!   private.memory_evidence, private.memory_records]]; env=[HUMAUX_TEST_PG_DSN]; modules=[domain::grounding,
 //!   humaux-testkit]
 //! Called-by: [cargo-test]
@@ -80,14 +80,27 @@ impl Drop for Handle {
         // Best-effort cleanup (repo CLAUDE.md hard rule ④), same shape as
         // `processing_runs_fingerprint_rerun.rs`'s `Handle::drop`. `memory_evidence` rows go
         // with their Memory (`ON DELETE CASCADE`, 0004③).
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM private.memory_records WHERE tenant_id = '{0}'; \
+        // Card-31 pattern (card 33 leak fix): the seeded PRIMARY memory_evidence link
+        // enqueues a DERIVED_* job (0164 trigger). Jobs go first, in one batch with the data rows, and
+        // a failure is printed; the tenant row goes in a separate best-effort batch, so a refused tenant
+        // delete (append-only audit rows, a missed child table) can no longer roll the job delete back.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM private.memory_records WHERE tenant_id = '{0}'; \
              DELETE FROM private.events WHERE event_id IN \
                (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id = '{0}'); \
              DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
-             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{0}';",
-            self.tenant_id
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}';",
+            self.tenant_id,
+        )) {
+            eprintln!(
+                "memory_evidence_grounding cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{0}';",
+            self.tenant_id,
         ));
     }
 }

@@ -11,7 +11,8 @@
 //!   private.evidence_objects, private.memory_evidence], PostgreSQL(role_maintenance), PostgreSQL(role_private_worker) x=[ops.claim_derived_work_v2],
 //!   subprocess(humaux-private-worker), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-private-worker,
 //!   HUMAUX_CARD15_TEST_SECRET, HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS, HUMAUX_PRIVATE_WORKER_CAPABILITIES,
-//!   HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS,
+//!   HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS,
+//!   HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS,
@@ -27,7 +28,7 @@
 //! Invariants: [only this file's tenants are ever claimed (foreign scheduler rows are fenced FOR UPDATE); every
 //!   scenario's faults are named in its doc (ADR-0058 records the red→green runs); a fixture deletes its jobs, slots
 //!   and data rows in one printed batch and its tenant rows in a separate best-effort batch]
-//! Spec: Baseline §16.1.1; §10.1; §67.2; §11; §79.2; ADR-0058
+//! Spec: Baseline §16.1.1; §10.1; §67.2; §11; §79.2; ADR-0058; ADR-0059
 //!
 //! The Distill hop's own behaviour (route admission, §16.1.1 fingerprint, §10.1 ceiling, the
 //! fenced write transaction) is `tests/distill_hop_e2e.rs`' subject. This file covers the layer
@@ -53,6 +54,7 @@ use humaux_domain::egress::ProcessorId;
 use humaux_private_worker::distill::{self, DistillDispatchConfig, DistillDispatchReport};
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -67,6 +69,27 @@ mod live_minimax;
 
 /// Every test drives the ONE global slot set and the cross-tenant claim, so tests never overlap.
 static SERIAL_GUARD: Mutex<()> = Mutex::new(());
+
+/// ADR-0059 D-I: the worker's credential map as this file configures it — every credential
+/// reference [`seed_reasoning_profile`] created (tests are serialized by [`SERIAL_GUARD`]). T25
+/// takes one reference back out of a config.
+static MAPPED_CREDENTIALS: Mutex<BTreeSet<Uuid>> = Mutex::new(BTreeSet::new());
+
+fn mapped_credentials() -> BTreeSet<Uuid> {
+    MAPPED_CREDENTIALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// `HUMAUX_PRIVATE_WORKER_CREDENTIALS` for a spawned worker: every mapped reference names `var`.
+fn credentials_spec(var: &str) -> String {
+    mapped_credentials()
+        .iter()
+        .map(|r| format!("{r}={var}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 const REGION: &str = "cn-shanghai";
 const SERVICE_TIER: &str = "standard";
@@ -96,16 +119,9 @@ const TEST_BUDGET: jobs::DistillCallBudget = jobs::DistillCallBudget {
 const ONE_MEMORY_REPLY: &str = r#"{"memories":[{"content":"Health endpoint before traffic.","memory_type":"Decision","class":"PrivateKnowledge","confidence":0.9}]}"#;
 
 fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
-    let Some(rest) = admin_dsn
-        .strip_prefix("postgres://")
-        .or_else(|| admin_dsn.strip_prefix("postgresql://"))
-    else {
-        return admin_dsn.to_string();
-    };
-    let Some(at) = rest.find('@') else {
-        return admin_dsn.to_string();
-    };
-    format!("postgres://{role}:devlocal_{role}@{}", &rest[at + 1..])
+    // ADR-0059 D-D: a real login as `role`, its password from HUMAUX_ROLE_PASSWORD_<SUFFIX>.
+    humaux_testkit::role_login_dsn(admin_dsn, role, |name| std::env::var(name).ok())
+        .unwrap_or_else(|missing| panic!("missing object: {missing} (ADR-0059 D-D)"))
 }
 
 fn db_detail(error: &postgres::Error) -> String {
@@ -282,6 +298,7 @@ fn dispatch_config(owner: &str, lease_seconds: f64) -> DistillDispatchConfig {
         not_ready_park_seconds: 600.0,
         max_attempts: 5,
         budget: TEST_BUDGET,
+        credential_refs: mapped_credentials(),
     }
 }
 
@@ -742,6 +759,10 @@ fn seed_reasoning_profile(
             &[&tenant_id, &format!("openbao://derived-dispatch/{label}")],
         )?
         .get(0);
+    MAPPED_CREDENTIALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(credential);
     // `control.processor_models` is global and append-only (0128 trigger): one catalog row per
     // (processor, model, revision) across every run of every test in this workspace.
     admin.execute(
@@ -1312,6 +1333,70 @@ fn not_ready_never_spends_an_attempt_and_parks_after_the_age() {
     );
 }
 
+/// T25 (card-33 acceptance, ADR-0059 D-I) — tenant A's route is fully admitted, but its
+/// credential reference is not in the worker's key map: the job is NOT_READY
+/// `CREDENTIAL_NOT_MAPPED`, then parks `WAITING_KEY` past the age, with no attempt, no
+/// `ops.model_call_ledger` / `ops.distill_calls` row and no provider call. Fault: remove the
+/// `read_leg` pre-check ⇒ the request is reserved and sent (the stub answers) ⇒ red.
+#[test]
+fn foreign_credential_ref_parks_waiting_key_without_ledger_row() {
+    run(
+        "foreign_credential_ref_parks_waiting_key_without_ledger_row",
+        |mut handle| {
+            let tenant_id = handle.tenants[0].tenant_id;
+            let credential_ref: Uuid = handle
+                .admin
+                .query_one(
+                    "SELECT credential_ref FROM control.reasoning_profiles WHERE tenant_id = $1",
+                    &[&tenant_id],
+                )
+                .expect("tenant A's route credential")
+                .get(0);
+            let evidence = accept_evidence(&mut handle, 0);
+            let job = handle.job_of(evidence);
+            let mut config = dispatch_config("c33-t25", 60.0);
+            assert!(
+                config.credential_refs.remove(&credential_ref),
+                "A was mapped"
+            );
+            config.not_ready_park_seconds = 1.0;
+            let provider = StubProvider::one_memory(Duration::ZERO);
+            let first = handle.pass(&provider, &config);
+            assert_eq!((first.not_ready, first.attempts), (1, 0), "{first:?}");
+            let (status, attempt, class, ..) = handle.job(job);
+            assert_eq!(
+                (status.as_str(), attempt, class.as_deref()),
+                ("PENDING", 0, Some(distill::CREDENTIAL_NOT_MAPPED))
+            );
+            std::thread::sleep(Duration::from_millis(1200));
+            handle.ready_now(job);
+            let second = handle.pass(&provider, &config);
+            assert_eq!(second.parked, 1, "{second:?}");
+            let (status, attempt, class, ..) = handle.job(job);
+            assert_eq!(
+                (status.as_str(), attempt, class.as_deref()),
+                ("WAITING_KEY", 0, Some(distill::CREDENTIAL_NOT_MAPPED)),
+                "parked with the named class, never DEAD, no attempt"
+            );
+            let ledger: i64 = handle
+                .admin
+                .query_one(
+                    "SELECT count(*) FROM ops.model_call_ledger WHERE tenant_id = $1",
+                    &[&tenant_id],
+                )
+                .expect("ledger count")
+                .get(0);
+            assert_eq!(
+                (ledger, handle.calls_of(job), provider.calls()),
+                (0, 0, 0),
+                "no ledger row, no distill call, no provider call"
+            );
+            assert_eq!(handle.outbox_status(evidence), "PENDING", "not stranded");
+            handle.assert_i_slot();
+        },
+    );
+}
+
 /// E7 (§11) — a provider that always answers 401: every round parks the job `WAITING_KEY` with
 /// attempt 0 and the outbox row open, even with `max_attempts = 1`; the physical calls stay in
 /// the ledger and in `ops.distill_calls`. Fault: drop the WAITING_KEY revert in
@@ -1585,15 +1670,16 @@ fn an_escaped_job_error_is_counted_as_an_error_not_a_lost_lease() {
 }
 
 /// ADR-0058 D-M (main-line ruling 2026-10-02 10:35, test 3) + §78.1: the endpoint's capabilities
-/// and the name of the key variable are deployment configuration with no code default — the worker
-/// refuses to start without either, naming the key. Fault: a literal default for
-/// `HUMAUX_PRIVATE_WORKER_CAPABILITIES` (or the old `MINIMAX_API_KEY` default of `_KEY_ENV`) → the
-/// process gets past bootstrap and fails elsewhere (or not at all).
+/// and the credential map (ADR-0059 D-I, which replaced card 32's single key variable; the test
+/// keeps its card-32 name, a gate greps it) are deployment configuration with no code default —
+/// the worker refuses to start without either, naming the key, and refuses the removed
+/// `HUMAUX_PRIVATE_WORKER_KEY_ENV`. Fault: a literal default for `HUMAUX_PRIVATE_WORKER_CAPABILITIES`
+/// or `_CREDENTIALS` → the process gets past bootstrap and fails elsewhere (or not at all).
 #[test]
 fn the_worker_refuses_to_boot_without_capabilities_or_key_env() {
     for missing in [
         "HUMAUX_PRIVATE_WORKER_CAPABILITIES",
-        "HUMAUX_PRIVATE_WORKER_KEY_ENV",
+        "HUMAUX_PRIVATE_WORKER_CREDENTIALS",
     ] {
         // An unreachable DSN: a bootstrap that got past the configuration would fail on it with
         // a different message.
@@ -1609,6 +1695,17 @@ fn the_worker_refuses_to_boot_without_capabilities_or_key_env() {
             "{missing}: {stderr}"
         );
     }
+    let out = distill_serve_command("postgres://nobody@127.0.0.1:1/none")
+        .env("HUMAUX_PRIVATE_WORKER_KEY_ENV", "HUMAUX_CARD15_TEST_SECRET")
+        .arg("--distill-once")
+        .output()
+        .expect("spawn humaux-private-worker");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(
+            "invalid configuration: HUMAUX_PRIVATE_WORKER_KEY_ENV was removed by ADR-0059 D-I"
+        ),
+        "the removed single-key variable is refused, never silently ignored"
+    );
     let out = distill_serve_command("postgres://nobody@127.0.0.1:1/none")
         .env(
             "HUMAUX_PRIVATE_WORKER_CAPABILITIES",
@@ -1695,6 +1792,7 @@ fn a_success_at_the_end_of_the_http_window_is_kept_not_resent() {
                 not_ready_park_seconds: 600.0,
                 max_attempts: 5,
                 budget: TEST_BUDGET,
+                credential_refs: mapped_credentials(),
             };
             let replied = std::sync::Arc::new(AtomicBool::new(false));
             let called = std::sync::Arc::new(AtomicBool::new(false));
@@ -2537,8 +2635,17 @@ fn distill_serve_command(dsn: &str) -> std::process::Command {
         .env("HUMAUX_PRIVATE_WORKER_PROVIDER_ID", PROVIDER_ID)
         .env("HUMAUX_PRIVATE_WORKER_MODEL_ID", MODEL_ID)
         .env("HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS", "5")
-        .env("HUMAUX_PRIVATE_WORKER_KEY_ENV", "HUMAUX_CARD15_TEST_SECRET")
-        .env("HUMAUX_CARD15_TEST_SECRET", "unused-by-this-path")
+        // ADR-0059 D-I: a generated throwaway key under every reference this file seeded; the
+        // literal chat URL is never reached with it.
+        .env_remove("HUMAUX_PRIVATE_WORKER_KEY_ENV")
+        .env(
+            "HUMAUX_PRIVATE_WORKER_CREDENTIALS",
+            credentials_spec("HUMAUX_CARD15_TEST_SECRET"),
+        )
+        .env(
+            "HUMAUX_CARD15_TEST_SECRET",
+            Uuid::new_v4().simple().to_string(),
+        )
         .env(
             "HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID",
             EGRESS_PROCESSOR_ID.to_string(),
@@ -2926,6 +3033,7 @@ fn live_config(owner: &str, lease_seconds: f64, in_flight: u32) -> DistillDispat
         not_ready_park_seconds: 600.0,
         max_attempts: 5,
         budget: TEST_BUDGET,
+        credential_refs: mapped_credentials(),
     }
 }
 
@@ -3092,7 +3200,10 @@ fn live_serve_command(dsn: &str, key: &str) -> std::process::Command {
     let mut cmd = distill_serve_command(dsn);
     cmd.env("HUMAUX_PRIVATE_WORKER_CHAT_URL", ENDPOINT_REF)
         .env("HUMAUX_PRIVATE_WORKER_DNS_PINS", live_minimax::dns_pins())
-        .env("HUMAUX_PRIVATE_WORKER_KEY_ENV", "MINIMAX_API_KEY")
+        .env(
+            "HUMAUX_PRIVATE_WORKER_CREDENTIALS",
+            credentials_spec("MINIMAX_API_KEY"),
+        )
         .env("MINIMAX_API_KEY", key)
         .env("HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS", "604800")
         .env(

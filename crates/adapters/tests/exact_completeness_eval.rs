@@ -3,8 +3,9 @@
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, humaux-retrieval, humaux-testkit, postgres,
 //!   serde_json, sha2, tokio, uuid]; services=[PostgreSQL(any) r=[control.retrieval_predicates, ops.commit_seq_seq, public.pool]
 //!   w=[control.memberships, control.private_reasoning_domains, control.tenants, control.users,
-//!   control.workspace_memberships, control.workspaces, ops.outbox, private.events, private.evidence_objects,
-//!   private.memory_evidence, private.memory_records, projection.stream_log], PostgreSQL(role_gateway),
+//!   control.workspace_memberships, control.workspaces, ops.jobs, ops.outbox, private.events,
+//!   private.evidence_objects, private.memory_evidence, private.memory_records, projection.stream_log],
+//!   PostgreSQL(role_gateway),
 //!   PostgreSQL(role_maintenance)]; env=[CARGO_MANIFEST_DIR, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
 //!   modules=[adapters::exact_census, adapters::forget_repo, adapters::postgres, domain::error, domain::identity,
 //!   domain::ids, humaux-testkit, projection::stream, retrieval::completeness, retrieval::envelope,
@@ -62,17 +63,9 @@ use uuid::Uuid;
 const NAME: &str = "exact_completeness_eval";
 
 fn dsn_as_role(dsn: &str, role: &str) -> String {
-    // 与 tests/mandatory_context_lane.rs / tests/serving_repo.rs 同形。
-    let Some(rest) = dsn
-        .strip_prefix("postgres://")
-        .or_else(|| dsn.strip_prefix("postgresql://"))
-    else {
-        return dsn.to_string();
-    };
-    let Some(at) = rest.find('@') else {
-        return dsn.to_string();
-    };
-    format!("postgres://{role}:devlocal_{role}@{}", &rest[at + 1..])
+    // ADR-0059 D-D: a real login as `role`, its password from HUMAUX_ROLE_PASSWORD_<SUFFIX>.
+    humaux_testkit::role_login_dsn(dsn, role, |name| std::env::var(name).ok())
+        .unwrap_or_else(|missing| panic!("missing object: {missing} (ADR-0059 D-D)"))
 }
 
 fn verified_maintenance_dsn() -> Option<String> {
@@ -185,8 +178,13 @@ struct Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
+        // Card-31 pattern (card 33 leak fix): each seeded EVIDENCE_ACCEPTED row or PRIMARY link
+        // enqueues a DERIVED_* job (0164 trigger). Jobs go first, in one batch with the data rows, and
+        // a failure is printed; the tenant row goes in a separate best-effort batch, so a refused tenant
+        // delete (append-only audit rows, a missed child table) can no longer roll the job delete back.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
              DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
              DELETE FROM private.memory_evidence WHERE memory_id IN \
                (SELECT memory_id FROM private.memory_records WHERE tenant_id = '{0}'); \
@@ -196,10 +194,18 @@ impl Drop for Fixture {
              DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
              DELETE FROM control.workspaces WHERE tenant_id = '{0}'; \
              DELETE FROM control.memberships WHERE tenant_id = '{0}'; \
-             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{0}'; \
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}';",
+            self.tenant_id,
+        )) {
+            eprintln!(
+                "exact_completeness_eval cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{0}'; \
              DELETE FROM control.users WHERE user_id IN ('{1}', '{2}');",
-            self.tenant_id, self.user_id, self.other_user_id
+            self.tenant_id, self.user_id, self.other_user_id,
         ));
     }
 }

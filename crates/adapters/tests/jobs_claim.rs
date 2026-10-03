@@ -60,10 +60,21 @@ impl Drop for Handle {
     fn drop(&mut self) {
         // Best-effort cleanup (repo CLAUDE.md hard rule ④: this file never touches a
         // schema/table of its own, only rows it created under its own throwaway tenant).
+        // Card-31 pattern (card 33 leak fix): this file seeds claimable jobs directly. They go in
+        // their own batch whose failure is printed; the tenant row goes in a separate best-effort
+        // batch, so a refused tenant delete can no longer roll the job delete back.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}';",
+            self.tenant_id,
+        )) {
+            eprintln!(
+                "jobs_claim cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
         let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{0}';",
-            self.tenant_id
+            "DELETE FROM control.tenants WHERE tenant_id = '{0}';",
+            self.tenant_id,
         ));
     }
 }

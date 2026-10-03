@@ -1,0 +1,36 @@
+# §46.1 migration manifest. Card 33 / ADR-0059 D-H: control.api_key_rehash sets the rewritten key's
+# tenant GUC around its audit insert (control.audit_events is FORCE RLS on humaux.tenant_id), so a
+# successful rehash commits with its api_key.pepper_rehash row instead of failing 42501. Body only;
+# owner, SECURITY DEFINER, pinned search_path and EXECUTE = {role_gateway} are unchanged.
+# §46 forward-fix (EXPAND_CONTRACT, first free after 0202).
+
+migration_id = "0203_api_key_rehash_audit_tenant"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('control.api_key_rehash(uuid,bytea,bytea)') is not null
+ and (select l.lanname = 'sql' from pg_proc p join pg_language l on l.oid = p.prolang
+       where p.oid = to_regprocedure('control.api_key_rehash(uuid,bytea,bytea)'))
+ as precheck_ok
+"""
+
+postcheck = """
+with non_owner(r) as (values ('role_gateway'), ('role_private_worker'), ('role_consolidation_worker'),
+  ('role_public_worker'), ('role_retrieval_worker'), ('role_batch_issuer'), ('role_maintenance'),
+  ('role_admin'))
+select
+  (select l.lanname = 'plpgsql' and pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+          and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+          and position('humaux.tenant_id' in p.prosrc) > 0
+          and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                           where x.grantee = 0 and x.privilege_type = 'EXECUTE')
+     from pg_proc p join pg_language l on l.oid = p.prolang
+    where p.oid = to_regprocedure('control.api_key_rehash(uuid,bytea,bytea)'))
+  and (select bool_and(has_function_privilege(n.r, 'control.api_key_rehash(uuid,bytea,bytea)', 'EXECUTE')
+                       = (n.r = 'role_gateway'))
+         from non_owner n)
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward-fix only: re-create the 0202 body. A successful rehash then fails 42501 again (non-fatal to the request, logged pepper_rehash_failed), so keys behind the epoch are never rehashed."
+backup_restore_requirement = "none: one function body is replaced; no row data is changed."

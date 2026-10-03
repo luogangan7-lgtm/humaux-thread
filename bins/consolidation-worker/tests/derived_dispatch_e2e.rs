@@ -76,16 +76,9 @@ const EGRESS_PROCESSOR_ID: Uuid = Uuid::from_u128(0x2001);
 /// (§6.2.3 assertion E checks `current_user`), so the DSN's credentials are swapped, never a
 /// `SET ROLE` on the admin connection.
 fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
-    let Some(rest) = admin_dsn
-        .strip_prefix("postgres://")
-        .or_else(|| admin_dsn.strip_prefix("postgresql://"))
-    else {
-        return admin_dsn.to_string();
-    };
-    let Some(at) = rest.find('@') else {
-        return admin_dsn.to_string();
-    };
-    format!("postgres://{role}:devlocal_{role}@{}", &rest[at + 1..])
+    // ADR-0059 D-D: a real login as `role`, its password from HUMAUX_ROLE_PASSWORD_<SUFFIX>.
+    humaux_testkit::role_login_dsn(admin_dsn, role, |name| std::env::var(name).ok())
+        .unwrap_or_else(|missing| panic!("missing object: {missing} (ADR-0059 D-D)"))
 }
 
 /// Returns the §11.8 rollup contract shape (`content` / `class` / `sources`), with `sources` as
@@ -187,12 +180,21 @@ impl Drop for Handle {
                     "DELETE FROM {schema}.{table} WHERE tenant_id = '{tenant}'; "
                 ));
             }
-            sql.push_str(&format!(
-                "DELETE FROM control.tenants WHERE tenant_id = '{tenant}'; \
-                 SET session_replication_role = DEFAULT;"
-            ));
+            sql.push_str("SET session_replication_role = DEFAULT;");
+            // Card-31 pattern (card 33): jobs and data rows in one batch whose failure is printed;
+            // the tenant row in a separate best-effort batch that cannot roll the job delete back.
             if let Err(error) = self.admin.batch_execute(&sql) {
-                eprintln!("derived_dispatch_e2e teardown ({tenant}): {error}");
+                eprintln!("derived_dispatch_e2e teardown ({tenant}) jobs/data: {error}");
+            }
+            if let Err(error) = self.admin.batch_execute(&format!(
+                "SET session_replication_role = replica; \
+                 DELETE FROM control.tenants WHERE tenant_id = '{tenant}'; \
+                 SET session_replication_role = DEFAULT;"
+            )) {
+                eprintln!("derived_dispatch_e2e teardown ({tenant}) tenant, best effort: {error}");
+                let _ = self
+                    .admin
+                    .batch_execute("SET session_replication_role = DEFAULT");
             }
         }
         let _ = self.admin.execute(
@@ -1267,9 +1269,7 @@ fn readyz_binary_names_postgresql_when_the_database_is_down() {
         drop(listener);
         port
     };
-    let dsn = format!(
-        "postgres://role_consolidation_worker:devlocal_role_consolidation_worker@127.0.0.1:{dead}/humaux_thread_dev"
-    );
+    let dsn = format!("postgres://role_consolidation_worker@127.0.0.1:{dead}/humaux_thread_dev");
     let output = serve_command(&dsn, "/nonexistent/humaux-card15-readyz.sock")
         .arg("--readyz")
         .output()

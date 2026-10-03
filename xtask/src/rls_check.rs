@@ -1,5 +1,5 @@
 //! `xtask::rls_check` — G80-26 (§48.2) runtime DB role invariant CI enumeration gate.
-//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.distill_calls, ops.distill_tenant_scheduler, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.provider_arbiters, ops.provider_slots, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.assert_write_scope, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant, control.onboard_workspace, control.resolve_user_reasoning_admission, control.revoke_api_key, ops.admit_distill_budget, ops.begin_call, ops.claim_derived_work, ops.claim_derived_work_v2, ops.distill_slots_all_bound, ops.contribution_reservation_authority_validate, ops.distill_scheduler_admit, ops.finish_derived_work_v2, ops.renew_lease, ops.requeue_dead_distill, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal]]; env=[CARGO_MANIFEST_DIR, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
+//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.credential_pepper_state, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.distill_calls, ops.distill_tenant_scheduler, ops.email_delivery_events, ops.email_domains, ops.email_outbox, ops.email_provider_health, ops.email_suppressions, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.provider_arbiters, ops.provider_slots, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.schema_migrations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.api_key_rehash, control.assert_write_scope, control.credential_pepper_epoch, control.credential_pepper_epoch_advance, control.credential_pepper_epoch_close, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant, control.onboard_workspace, control.resolve_user_reasoning_admission, control.revoke_api_key, ops.admit_distill_budget, ops.begin_call, ops.claim_derived_work, ops.claim_derived_work_v2, ops.distill_slots_all_bound, ops.contribution_reservation_authority_validate, ops.distill_scheduler_admit, ops.finish_derived_work_v2, ops.renew_lease, ops.requeue_dead_distill, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal], PostgreSQL(role_gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_GATEWAY_PG_DSN, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
 //! Called-by: [xtask::dep_map, xtask::main]
 //! Invariants: [any catalog cell that disagrees with §48.2 / §62 grants is fail, named by role and table]
 //! Spec: Baseline §48.2; §62
@@ -1007,6 +1007,24 @@ const MATRIX: &[Cell] = &[
         ["SELECT"]
     ),
     cell!("public.eligible_objects", "role_maintenance", ["SELECT"]),
+    // 0201 (SEC-2 / ADR-0059 D-C): exactly the verbs adapters::email::outbox issues.
+    cell!("ops.email_outbox", "role_gateway", ["INSERT"]),
+    cell!(
+        "ops.email_outbox",
+        "role_private_worker",
+        ["SELECT", "UPDATE"]
+    ),
+    cell!("ops.email_suppressions", "role_gateway", ["SELECT"]),
+    cell!(
+        "ops.email_suppressions",
+        "role_private_worker",
+        ["SELECT", "INSERT", "UPDATE"]
+    ),
+    cell!(
+        "ops.email_delivery_events",
+        "role_private_worker",
+        ["INSERT"]
+    ),
 ];
 
 // 0120 is an additive observation-window seam, not a rewrite of the frozen §6.2.2 header.
@@ -1431,6 +1449,13 @@ const NAMED_NO_NON_OWNER_GRANTS: &[&str] = &[
     "ops.provider_slots",
     "ops.distill_tenant_scheduler",
     "ops.distill_calls",
+    // 0201 (SEC-2 / ADR-0059 D-C): a runtime role that can write the migration ledger can make
+    // migrate skip a hardening migration; the two email tables have no code writer.
+    "ops.schema_migrations",
+    "ops.email_domains",
+    "ops.email_provider_health",
+    // 0202 (ADR-0059 D-H): the pepper epoch moves only through the role_maintenance definer.
+    "control.credential_pepper_state",
 ];
 
 /// The §6.2.2 column set — "T" in the §48.2 "表集合派生" check's `S \ T == ∅`. Single
@@ -2050,13 +2075,18 @@ fn fetch_roles(client: &mut impl GenericClient) -> Result<Vec<RoleRow>, postgres
 }
 
 /// §6.2.0: `pg_roles` restricted to `rolcanlogin AND NOT rolsuper` must equal the frozen
-/// declared-name set exactly (extra/missing/renamed all red), and per §48.2's opening block
-/// every role must independently be `NOT SUPERUSER` / `NOT BYPASSRLS`.
+/// declared-name set minus [`OWNER_ROLE`] exactly (extra/missing/renamed all red), the owner must
+/// exist NOLOGIN (ADR-0059 D-A), and per §48.2's opening block every role must independently be
+/// `NOT SUPERUSER` / `NOT BYPASSRLS`.
 pub fn check_role_set_equality(client: &mut impl GenericClient) -> GateResult {
-    let roles = match fetch_roles(client) {
-        Ok(r) => r,
-        Err(e) => return fail("角色全集相等", format!("query pg_roles failed: {e}")),
-    };
+    match fetch_roles(client) {
+        Ok(roles) => role_set_result(&roles),
+        Err(e) => fail("角色全集相等", format!("query pg_roles failed: {e}")),
+    }
+}
+
+/// The pure half of [`check_role_set_equality`], over already-fetched `pg_roles` rows.
+fn role_set_result(roles: &[RoleRow]) -> GateResult {
     let by_name: std::collections::BTreeMap<&str, &RoleRow> =
         roles.iter().map(|r| (r.rolname.as_str(), r)).collect();
 
@@ -2073,7 +2103,13 @@ pub fn check_role_set_equality(client: &mut impl GenericClient) -> GateResult {
                 if r.rolbypassrls {
                     problems.push(format!("{name} has BYPASSRLS"));
                 }
-                if !r.rolcanlogin {
+                // §6.2.0 / ADR-0059 D-A: the owner never connects; every migration acts for it.
+                if *name == OWNER_ROLE && r.rolcanlogin {
+                    problems.push(format!(
+                        "{name} has rolcanlogin=true (ADR-0059 D-A requires NOLOGIN)"
+                    ));
+                }
+                if *name != OWNER_ROLE && !r.rolcanlogin {
                     problems.push(format!("{name} has rolcanlogin=false (§6.2.0 requires it)"));
                 }
             }
@@ -2085,17 +2121,20 @@ pub fn check_role_set_equality(client: &mut impl GenericClient) -> GateResult {
         .filter(|r| r.rolcanlogin && !r.rolsuper)
         .map(|r| r.rolname.as_str())
         .collect();
-    let extra: Vec<&&str> = actual.iter().filter(|n| !expected.contains(*n)).collect();
+    let extra: Vec<&&str> = actual
+        .iter()
+        .filter(|n| !expected.contains(*n) || **n == OWNER_ROLE)
+        .collect();
     if !extra.is_empty() {
         problems.push(format!(
-            "extra login role(s) beyond the frozen role set: {extra:?}"
+            "extra login role(s) beyond the frozen role set minus {OWNER_ROLE}: {extra:?}"
         ));
     }
 
     if problems.is_empty() {
         pass(
             "角色全集相等",
-            "pg_roles login∧¬superuser set == §6.2.0 frozen role set, all NOT SUPERUSER/NOBYPASSRLS",
+            "pg_roles login∧¬superuser set == §6.2.0 frozen role set minus role_migration_owner (NOLOGIN), all NOT SUPERUSER/NOBYPASSRLS",
         )
     } else {
         fail("角色全集相等", problems.join("; "))
@@ -4147,6 +4186,98 @@ pub fn check_distill_dispatch_v2_boundary(client: &mut impl GenericClient) -> Ga
     }
 }
 
+/// ADR-0059 D-H (migrations 0202 + 0203 + 0204, card 33): the API-key pepper-epoch doors.
+const API_KEY_REHASH_FN: &str = "control.api_key_rehash(uuid,bytea,bytea)";
+const PEPPER_EPOCH_ADVANCE_FN: &str = "control.credential_pepper_epoch_advance()";
+const PEPPER_EPOCH_CLOSE_FN: &str = "control.credential_pepper_epoch_close()";
+const PEPPER_EPOCH_FN: &str = "control.credential_pepper_epoch()";
+
+/// ADR-0059 D-H (0205): the advance body refuses with 55000 `rehash_window_open` while the window is
+/// open, so a second `apikey pepper-epoch advance` cannot move the epoch inside one window.
+fn advance_refuses_open_window(prosrc: &str) -> bool {
+    prosrc.contains("NOT rehash_open")
+        && prosrc.contains("'rehash_window_open'")
+        && prosrc.contains("'55000'")
+}
+
+/// ADR-0059 D-H: role_gateway's only verifier write is the epoch-gated `api_key_rehash`; only
+/// role_maintenance moves the epoch and opens or closes the rehash window (0204); the epoch getter (the `api_keys.pepper_epoch` default) is
+/// executable by no non-owner role because every `api_keys` writer is an owner definer. All three
+/// are owner-owned SECURITY DEFINER with `search_path=pg_catalog` and PUBLIC revoked, and
+/// `control.credential_pepper_state` holds exactly one row (its table cells are `—` for every
+/// non-owner role via [`NAMED_NO_NON_OWNER_GRANTS`]). Missing objects ⇒ `not_applicable` naming
+/// them (§57.1).
+pub fn check_api_key_rehash_boundary(client: &mut impl GenericClient) -> GateResult {
+    let check = "ADR-0059 API-key rehash boundary";
+    let functions = [
+        API_KEY_REHASH_FN,
+        PEPPER_EPOCH_ADVANCE_FN,
+        PEPPER_EPOCH_CLOSE_FN,
+        PEPPER_EPOCH_FN,
+    ];
+    let present: bool = match client.query_one(
+        "SELECT bool_and(to_regprocedure(f) IS NOT NULL) \
+                AND to_regclass('control.credential_pepper_state') IS NOT NULL \
+         FROM unnest($1::text[]) AS f",
+        &[&functions.to_vec()],
+    ) {
+        Ok(row) => row.get::<_, Option<bool>>(0).unwrap_or(false),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    if !present {
+        return not_applicable(
+            check,
+            format!(
+                "missing one of {}, control.credential_pepper_state",
+                functions.join(", ")
+            ),
+        );
+    }
+    let mut problems = Vec::new();
+    for (function, executors) in [
+        (API_KEY_REHASH_FN, &["role_gateway"][..]),
+        (PEPPER_EPOCH_ADVANCE_FN, &["role_maintenance"][..]),
+        (PEPPER_EPOCH_CLOSE_FN, &["role_maintenance"][..]),
+        (PEPPER_EPOCH_FN, &[][..]),
+    ] {
+        check_owner_definer_function(client, &mut problems, function, executors);
+    }
+    match client.query_one(
+        "SELECT prosrc FROM pg_proc WHERE oid = to_regprocedure($1)",
+        &[&PEPPER_EPOCH_ADVANCE_FN],
+    ) {
+        Ok(row) if advance_refuses_open_window(&row.get::<_, String>(0)) => {}
+        Ok(_) => problems.push(format!(
+            "{PEPPER_EPOCH_ADVANCE_FN} does not refuse while the rehash window is open \
+             (0205: 55000 rehash_window_open)"
+        )),
+        Err(error) => problems.push(format!("advance body probe failed: {error}")),
+    }
+    match client.query_one("SELECT count(*) FROM control.credential_pepper_state", &[]) {
+        Ok(row) => {
+            let rows: i64 = row.get(0);
+            if rows != 1 {
+                problems.push(format!(
+                    "control.credential_pepper_state must hold exactly 1 row, found {rows}"
+                ));
+            }
+        }
+        Err(error) => problems.push(format!("pepper state probe failed: {error}")),
+    }
+    if problems.is_empty() {
+        pass(
+            check,
+            "api_key_rehash EXECUTE exactly {role_gateway}; credential_pepper_epoch_advance and \
+             credential_pepper_epoch_close EXECUTE exactly {role_maintenance}; \
+             credential_pepper_epoch EXECUTE by no non-owner \
+             role; all owner SECURITY DEFINER, search_path pinned, PUBLIC revoked; advance refuses \
+             an open window (55000); one pepper-state row",
+        )
+    } else {
+        fail(check, problems.join("; "))
+    }
+}
+
 pub fn run(_args: &[String]) -> i32 {
     let mut results = Vec::new();
 
@@ -4180,6 +4311,7 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_onboarding_boundary(&mut client));
             results.push(check_stream_point_ledger_boundary(&mut client));
             results.push(check_distill_dispatch_v2_boundary(&mut client));
+            results.push(check_api_key_rehash_boundary(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -4853,22 +4985,28 @@ mod tests {
     /// directly inspect W1 storage, and PostgreSQL itself rejects a write after READ ONLY.
     #[test]
     fn w2_gateway_runtime_role_direct_storage_denial_and_read_only_write_are_real() {
-        let Ok(admin_dsn) = std::env::var(DSN_ENV) else {
+        // ADR-0059 D-D: the real runtime login comes from the env DSN, never a repository literal.
+        let Ok(gateway_dsn) = std::env::var("HUMAUX_GATEWAY_PG_DSN") else {
             assert!(
                 !skip_is_a_failure(),
-                "HUMAUX_REQUIRE_DB is set, so a skip here is a failure — missing object: {DSN_ENV}"
+                "HUMAUX_REQUIRE_DB is set, so a skip here is a failure — missing object: HUMAUX_GATEWAY_PG_DSN"
             );
-            eprintln!("rls-check test: not_applicable — {DSN_ENV} unset, skipping");
+            eprintln!("rls-check test: not_applicable — HUMAUX_GATEWAY_PG_DSN unset, skipping");
             return;
         };
-        let Some((_, authority)) = admin_dsn.split_once('@') else {
-            panic!("{DSN_ENV} must be a PostgreSQL URL with an authority");
-        };
-        let gateway_dsn = format!("postgres://role_gateway:devlocal_role_gateway@{authority}");
-        // dep: PostgreSQL(any) — gateway_dsn, gateway role positive control
+        // dep: PostgreSQL(role_gateway) — gateway_dsn, gateway role positive control
         let mut gateway = Client::connect(&gateway_dsn, NoTls).unwrap_or_else(|error| {
             panic!("role_gateway must be reachable for W2 runtime boundary proof: {error}")
         });
+        // A superuser DSN in HUMAUX_GATEWAY_PG_DSN would make the denials below vacuous.
+        let who = gateway
+            .query_one("SELECT current_user::text, session_user::text", &[])
+            .expect("current_user/session_user");
+        assert_eq!(
+            (who.get::<_, String>(0), who.get::<_, String>(1)),
+            ("role_gateway".to_string(), "role_gateway".to_string()),
+            "HUMAUX_GATEWAY_PG_DSN must log in as role_gateway itself"
+        );
         let direct_read = gateway
             .query_one("SELECT count(*) FROM private.continuity_projects", &[])
             .expect_err("role_gateway must not directly read W1 continuity storage");
@@ -5110,6 +5248,163 @@ mod tests {
             "{}",
             after.detail
         );
+    }
+
+    /// T1 (ADR-0059 D-B): after 0201 the gate passes with the owner NOLOGIN and the other eight
+    /// LOGIN. Roles are cluster-global, so the fault is injected into the fetched rows, never into
+    /// the catalog: the owner regaining LOGIN, or a runtime role losing it, is red naming the role.
+    #[test]
+    fn role_set_requires_owner_nologin_and_login_for_the_other_eight() {
+        txn_or_skip!(client, txn);
+        let roles = fetch_roles(&mut txn).expect("pg_roles");
+        let clean = role_set_result(&roles);
+        assert_eq!(clean.status, GateStatus::Pass, "{}", clean.detail);
+
+        let with = |name: &str, login: bool| -> Vec<RoleRow> {
+            roles
+                .iter()
+                .map(|r| RoleRow {
+                    rolname: r.rolname.clone(),
+                    rolsuper: r.rolsuper,
+                    rolcanlogin: if r.rolname == name {
+                        login
+                    } else {
+                        r.rolcanlogin
+                    },
+                    rolbypassrls: r.rolbypassrls,
+                })
+                .collect()
+        };
+        let owner_login = role_set_result(&with(OWNER_ROLE, true));
+        assert_eq!(
+            owner_login.status,
+            GateStatus::Fail,
+            "{}",
+            owner_login.detail
+        );
+        assert!(
+            owner_login
+                .detail
+                .contains("role_migration_owner has rolcanlogin=true"),
+            "{}",
+            owner_login.detail
+        );
+        let gateway_nologin = role_set_result(&with("role_gateway", false));
+        assert_eq!(gateway_nologin.status, GateStatus::Fail);
+        assert!(
+            gateway_nologin.detail.contains("role_gateway"),
+            "{}",
+            gateway_nologin.detail
+        );
+    }
+
+    /// ADR-0059 D-H (0205): the boundary's advance-body probe is red on the 0204 body (re-opens an
+    /// open window) and green on 0205's; read from the migration files, never a catalog write.
+    #[test]
+    fn advance_body_probe_tells_0204_from_0205() {
+        let body = |file: &str| {
+            let sql = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../migrations")
+                    .join(file),
+            )
+            .expect("migration body");
+            let start = sql
+                .find("FUNCTION control.credential_pepper_epoch_advance()")
+                .expect("advance definition");
+            let rest = &sql[start..];
+            let open = rest.find("$$").expect("body start") + 2;
+            let close = rest[open..].find("$$").expect("body end");
+            rest[open..open + close].to_owned()
+        };
+        assert!(!advance_refuses_open_window(&body(
+            "0204_api_key_rehash_window.sql"
+        )));
+        assert!(advance_refuses_open_window(&body(
+            "0205_pepper_epoch_advance_refuses_open_window.sql"
+        )));
+    }
+
+    /// T22 (ADR-0059 D-H): the four pepper-epoch doors keep their exact EXECUTE sets. The faults
+    /// (GRANT EXECUTE on api_key_rehash TO role_maintenance; on credential_pepper_epoch_advance() TO
+    /// role_gateway) are shown red against a scratch database, never the shared one.
+    #[test]
+    fn api_key_rehash_doors_have_exact_executors() {
+        txn_or_skip!(client, txn);
+        let result = check_api_key_rehash_boundary(&mut txn);
+        assert_eq!(result.status, GateStatus::Pass, "{}", result.detail);
+        assert!(named_tables().contains("control.credential_pepper_state"));
+    }
+
+    /// T2 (SEC-2 / ADR-0059 D-C): the live grants on ops.schema_migrations and the five email
+    /// tables equal §6.2.2; an extra runtime write on either is red naming table and role. The
+    /// faults are injected into the fetched grant rows (no catalog write on the shared database).
+    #[test]
+    fn sec2_schema_migrations_and_email_grants_are_exact() {
+        txn_or_skip!(client, txn);
+        let whole = check_grant_equality(&mut txn);
+        assert_eq!(whole.status, GateStatus::Pass, "{}", whole.detail);
+
+        let mut table_grants = fetch_table_grants(&mut txn).expect("role_table_grants");
+        let col_grants = fetch_column_grants(&mut txn).expect("column_privileges");
+        let owners: BTreeMap<(String, String), String> = txn
+            .query(
+                "SELECT n.nspname, c.relname, r.rolname FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 JOIN pg_roles r ON r.oid = c.relowner \
+                 WHERE n.nspname = 'ops' AND c.relkind = 'r'",
+                &[],
+            )
+            .expect("owners")
+            .iter()
+            .map(|r| ((r.get(0), r.get(1)), r.get(2)))
+            .collect();
+        let non_owner: Vec<&str> = NON_OWNER_ROLES.to_vec();
+        let sec2 = [
+            "ops.schema_migrations",
+            "ops.email_outbox",
+            "ops.email_delivery_events",
+            "ops.email_suppressions",
+            "ops.email_domains",
+            "ops.email_provider_health",
+        ];
+        for table in sec2 {
+            assert!(named_tables().contains(table), "{table} is §6.2.2-named");
+            let clean = grant_equality_mismatches_for_table(
+                table,
+                &table_grants,
+                &col_grants,
+                &owners,
+                &non_owner,
+            );
+            assert!(clean.is_empty(), "{table}: {clean:?}");
+        }
+
+        for (table, verb) in [
+            ("ops.schema_migrations", "INSERT"),
+            ("ops.email_outbox", "UPDATE"),
+        ] {
+            let (schema, name) = table.split_once('.').expect("qualified");
+            table_grants.push(GrantRow {
+                grantee: "role_gateway".to_owned(),
+                table_schema: schema.to_owned(),
+                table_name: name.to_owned(),
+                privilege_type: verb.to_owned(),
+            });
+            let red = grant_equality_mismatches_for_table(
+                table,
+                &table_grants,
+                &col_grants,
+                &owners,
+                &non_owner,
+            );
+            assert!(
+                red.iter()
+                    .any(|m| m.contains(table) && m.contains("role_gateway")),
+                "{table} {verb}: {red:?}"
+            );
+            table_grants.pop();
+        }
     }
 
     /// Every 0131-created relation stays in the one existing named ACL/RLS authority.

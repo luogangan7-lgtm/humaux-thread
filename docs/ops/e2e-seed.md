@@ -6,8 +6,10 @@ tool, not a test fixture: rows outlive the process, teardown is explicit.
 ## Seed
 
 ```sh
-export HUMAUX_TEST_PG_DSN='postgres://postgres:devlocal@127.0.0.1:54329/humaux_thread_dev'
-export HUMAUX_MAINTENANCE_PG_DSN='postgres://role_maintenance:devlocal_role_maintenance@127.0.0.1:54329/humaux_thread_dev'
+# ADR-0059 D-J: the values live only in $HOME/.config/humaux/dev_role_passwords.env (0600), never here.
+set -a; . "$HOME/.config/humaux/dev_role_passwords.env"; set +a
+export HUMAUX_TEST_PG_DSN="postgres://postgres:${HUMAUX_DEV_PG_SUPERUSER_PASSWORD:?}@127.0.0.1:54329/humaux_thread_dev"
+export HUMAUX_MAINTENANCE_PG_DSN="postgres://role_maintenance:${HUMAUX_ROLE_PASSWORD_MAINTENANCE:?}@127.0.0.1:54329/humaux_thread_dev"
 
 cargo run -p xtask -- e2e-seed \
   --pepper-hex <hex> \
@@ -20,6 +22,7 @@ cargo run -p xtask -- e2e-seed \
   --provider-id <provider text id, e.g. minimax> \
   --provider-model-id <provider model id> \
   --model-revision <model revision, or an explicit placeholder text> \
+  --credential-env <NAME of the variable holding the provider key, e.g. MINIMAX_API_KEY> \
   --collection <qdrant collection name> \
   --dimension <embedding vector size, e.g. 1024> \
   --qdrant-host 127.0.0.1 \
@@ -41,7 +44,11 @@ Prints, once, to stdout:
 - four paste-ready `export` blocks (`HUMAUX_CONSOLIDATION_WORKER_*`,
   `HUMAUX_PRIVATE_WORKER_*`, `HUMAUX_RETRIEVAL_WORKER_*`,
   `HUMAUX_PRIVATE_WORKER_DISTILL_*`) plus `HUMAUX_GATEWAY_EMBEDDING_DIMENSION`, so every
-  rehearsal hop can pick up the exact same seeded values (`provider_matches_admission`).
+  rehearsal hop can pick up the exact same seeded values (`provider_matches_admission`);
+- `export HUMAUX_PRIVATE_WORKER_CREDENTIALS=<credential_id>=<--credential-env>` — one entry per
+  lane this run created (two with `--second-domain`). ADR-0059 D-I: the private worker serves a
+  route only if its credential reference is in this map. A deployment that seeds several
+  tenants joins the lines with `,` (`docs/ops/rehearse.sh` does this for its three seeds).
 
 Nothing is written to a file, logged, or stored — the bearer's secret half only ever
 appears in this one stdout line.
@@ -103,8 +110,12 @@ private worker's distill mode also requires these deployment values — none has
   configured provider supports; declaring `TOOL_CALLS` selects the distill tool channel. The rehearsal
   profile keeps it by measurement (ADR-0058 R10: live A/B `distill_channel_ab_live`, n=100 per channel,
   tool dead=0 / malformed=1 vs content dead=1 / malformed=6); another provider is measured the same way;
-- `HUMAUX_PRIVATE_WORKER_KEY_ENV` — the NAME of the variable that holds the provider key (the key
-  itself is never a `HUMAUX_*` value);
+- `HUMAUX_PRIVATE_WORKER_CREDENTIALS` [the seed's line(s)] — `<credential_ref>=<ENV_NAME>[,…]`:
+  per credential reference, the NAME of the variable that holds its provider key (a key is never a
+  `HUMAUX_*` value). Required, no default; an explicitly empty value boots and parks every route
+  `WAITING_KEY` / `CREDENTIAL_NOT_MAPPED`; a duplicate reference or an unset/empty named variable
+  refuses to boot (ADR-0059 D-I). `HUMAUX_PRIVATE_WORKER_KEY_ENV` (card 32's single key variable)
+  was removed by ADR-0059 D-I and is refused at boot when set;
 - `HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS` — `--distill-serve` only.
 
 ```sh

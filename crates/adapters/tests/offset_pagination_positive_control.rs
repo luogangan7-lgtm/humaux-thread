@@ -1,5 +1,7 @@
 //! `adapters::tests::offset_pagination_positive_control` — §20.4 禁掉的「活集合上的跨事务 OFFSET 分页」——**可执行的坏变体**（DOD-012 的具名注错）。
-//! Depends-on: crates=[humaux-testkit, postgres, serde_json, uuid]; services=[PostgreSQL(any) w=[control.private_reasoning_domains, control.tenants, private.events, private.evidence_objects, private.memory_evidence, private.memory_records]];
+//! Depends-on: crates=[humaux-testkit, postgres, serde_json, uuid]; services=[PostgreSQL(any)
+//!   w=[control.private_reasoning_domains, control.tenants, ops.jobs, private.events, private.evidence_objects,
+//!   private.memory_evidence, private.memory_records]];
 //!   env=[HUMAUX_TEST_PG_DSN]; modules=[humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [pins the forbidden cross-transaction OFFSET/LIMIT variant as an executable positive control that must
@@ -36,16 +38,29 @@ struct Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM private.memory_evidence WHERE memory_id IN \
+        // Card-31 pattern (card 33 leak fix): each seeded PRIMARY memory_evidence link
+        // enqueues a DERIVED_* job (0164 trigger). Jobs go first, in one batch with the data rows, and
+        // a failure is printed; the tenant row goes in a separate best-effort batch, so a refused tenant
+        // delete (append-only audit rows, a missed child table) can no longer roll the job delete back.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM private.memory_evidence WHERE memory_id IN \
                (SELECT memory_id FROM private.memory_records WHERE tenant_id = '{0}'); \
              DELETE FROM private.memory_records WHERE tenant_id = '{0}'; \
              DELETE FROM private.events WHERE event_id IN \
                (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id = '{0}'); \
              DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
-             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{0}';",
-            self.tenant_id
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}';",
+            self.tenant_id,
+        )) {
+            eprintln!(
+                "offset_pagination_positive_control cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{0}';",
+            self.tenant_id,
         ));
     }
 }

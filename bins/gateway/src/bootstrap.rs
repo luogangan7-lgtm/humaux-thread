@@ -8,7 +8,8 @@
 //!   uuid]; services=[PostgreSQL(role_gateway)]; env=[HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS,
 //!   HUMAUX_GATEWAY_BIND_ADDR, HUMAUX_GATEWAY_CALLER_ID, HUMAUX_GATEWAY_CELL_ID,
 //!   HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS,
-//!   HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX, HUMAUX_GATEWAY_EMBEDDING_DIMENSION,
+//!   HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX,
+//!   HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX, HUMAUX_GATEWAY_EMBEDDING_DIMENSION,
 //!   HUMAUX_GATEWAY_EMBEDDING_VERSION, HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
 //!   HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST, HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS,
 //!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES,
@@ -23,8 +24,10 @@
 //!   HUMAUX_GATEWAY_REPLAY_TTL_SECONDS, HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS,
 //!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_PRODUCTION_ENABLED, HUMAUX_GATEWAY_RETRIEVAL_PROFILE_QUERY_TRANSFORM,
 //!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K, HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS,
-//!   HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS,
+//!   HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH, HUMAUX_GATEWAY_TOKEN_HMAC_KEY, HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS,
+//!   HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS,
 //!   HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS, HUMAUX_GATEWAY_UNKNOWN]; modules=[adapters::postgres, adapters::quota_repo,
+//!   adapters::retrieve,
 //!   application::retrieval_embedding_port, contracts::config_registry, contracts::retrieval_config,
 //!   domain::context, domain::dataclass, domain::identity, gateway::context, gateway::guard,
 //!   gateway::mcp_application, gateway::recall, gateway::remember, gateway::retrieval_embedding_client,
@@ -47,7 +50,11 @@ use std::{
     time::Duration,
 };
 
-use humaux_adapters::{postgres::RuntimeDbPool, quota_repo::RatePolicy};
+use humaux_adapters::{
+    postgres::RuntimeDbPool,
+    quota_repo::RatePolicy,
+    retrieve::{TokenKeys, install_token_keys},
+};
 use humaux_application::retrieval_embedding_port::RetrievalEmbeddingPort;
 use humaux_contracts::config_registry::{
     ConfigEntry, effective_config_fingerprint, resolve_effective_config,
@@ -130,6 +137,8 @@ pub struct GatewayBootstrap {
     /// §8.5.1 / ADR-0030 D-B frozen mood half-life policy (§78.1, no literal),
     /// `HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS`.
     mood_half_life: Duration,
+    /// §15.5 / ADR-0059 D-G consistency-token MAC keys, installed process-wide in [`Self::build`].
+    token_keys: TokenKeys,
 }
 
 /// Parsed `HUMAUX_GATEWAY_RETRIEVAL_RPC_*` / `HUMAUX_GATEWAY_EMBEDDING_*` /
@@ -199,6 +208,13 @@ impl GatewayBootstrap {
     /// Guard/application/adapter chain. No caller can inject an alternate pool
     /// or a per-request write policy.
     pub async fn build(self) -> Result<GatewayRuntime, BootstrapError> {
+        // ADR-0059 D-G: the one production install, before the pool, the guard and the listener.
+        install_token_keys(self.token_keys).map_err(|_| {
+            BootstrapError::new(
+                "HUMAUX_GATEWAY_TOKEN_HMAC_KEY",
+                "a different key set is already installed",
+            )
+        })?;
         // dep: PostgreSQL(role_gateway) — opens the role_gateway pool the rest of bootstrap wires into the app state
         let pool = RuntimeDbPool::connect(&self.pg_dsn)
             .await
@@ -286,6 +302,7 @@ impl GatewayBootstrap {
             required(&effective, "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS")?,
             "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS",
         )?;
+        let token_keys = parse_token_keys(&effective)?;
 
         Ok(Self {
             bind_addr: parse_bind_addr(required(&effective, "HUMAUX_GATEWAY_BIND_ADDR")?)?,
@@ -301,8 +318,44 @@ impl GatewayBootstrap {
             confirm_token_ttl,
             undo_window,
             mood_half_life,
+            token_keys,
         })
     }
+}
+
+/// ADR-0059 D-G: `HUMAUX_GATEWAY_TOKEN_HMAC_KEY` (required, no default) and the optional rotation
+/// twin `…_PREVIOUS` (empty = window closed). Errors name the key, never a value.
+fn parse_token_keys(effective: &BTreeMap<String, String>) -> Result<TokenKeys, BootstrapError> {
+    const CURRENT: &str = "HUMAUX_GATEWAY_TOKEN_HMAC_KEY";
+    const PREVIOUS: &str = "HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS";
+    let current = hex::decode(required(effective, CURRENT)?)
+        .map_err(|_| BootstrapError::new(CURRENT, "invalid hex"))?;
+    let previous = optional_hex(effective, PREVIOUS)?;
+    // TokenKeys::new names the failing key ("current …" / "previous …") without its value.
+    TokenKeys::new(current, previous).map_err(|why| {
+        BootstrapError::new(
+            if why.starts_with("current") {
+                CURRENT
+            } else {
+                PREVIOUS
+            },
+            why,
+        )
+    })
+}
+
+/// An optional secret hex key registered with default `""`: empty = absent; otherwise valid hex.
+fn optional_hex(
+    effective: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<Option<Vec<u8>>, BootstrapError> {
+    let value = present(effective, key)?;
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    hex::decode(value)
+        .map(Some)
+        .map_err(|_| BootstrapError::new(key, "invalid hex"))
 }
 
 fn parse_http(effective: &BTreeMap<String, String>) -> Result<McpHttpConfig, BootstrapError> {
@@ -332,8 +385,17 @@ fn parse_guard(effective: &BTreeMap<String, String>) -> Result<GuardSettings, Bo
             "must not be empty",
         ));
     }
+    // ADR-0059 D-H: the rotation window is open exactly while this key is set (runbook Rotate).
+    let pepper_previous = optional_hex(effective, "HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX")?;
+    if pepper_previous.as_ref() == Some(&pepper) {
+        return Err(BootstrapError::new(
+            "HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX",
+            "must differ from the current pepper",
+        ));
+    }
     let guard = GuardSettings {
         credential_pepper: pepper,
+        credential_pepper_previous: pepper_previous,
         trusted_proxies: TrustedProxyConfig {
             trusted_proxy_cidrs: cidrs(
                 present(effective, "HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS")?,
@@ -636,6 +698,8 @@ fn registry() -> Vec<ConfigEntry> {
         ("MAX_REQUEST_BODY_BYTES", "usize", false),
         ("PG_DSN", "dsn", true),
         ("CREDENTIAL_PEPPER_HEX", "hex", true),
+        // ADR-0059 D-G: no default — boot-fatal when absent.
+        ("TOKEN_HMAC_KEY", "hex", true),
         ("TRUSTED_PROXY_CIDRS", "csv-cidr", false),
         ("MAX_FORWARDED_HOPS", "usize", false),
         ("GLOBAL_DENYLIST", "csv-cidr", false),
@@ -677,6 +741,12 @@ fn registry() -> Vec<ConfigEntry> {
     // are optional (default "") and ignored; a present value must still parse as a UUID. Kept
     // registered only because `xtask e2e-onboard` still passes them; the follow-up that drops
     // them there deletes these two entries (their presence then becomes a boot error).
+    // ADR-0059 D-G / D-H rotation twins: empty (the default) = rotation window closed.
+    entries.extend(
+        ["TOKEN_HMAC_KEY_PREVIOUS", "CREDENTIAL_PEPPER_PREVIOUS_HEX"]
+            .into_iter()
+            .map(|suffix| entry_with_default(&format!("{PREFIX}{suffix}"), "hex", true, "")),
+    );
     entries.extend(
         ["REMEMBER_TENANT_ID", "REMEMBER_WORKSPACE_ID"]
             .into_iter()
@@ -940,6 +1010,7 @@ mod tests {
                 "HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES" => "65536".into(),
                 "HUMAUX_GATEWAY_PG_DSN" => "postgres://redacted".into(),
                 "HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX" => "00112233".into(),
+                "HUMAUX_GATEWAY_TOKEN_HMAC_KEY" => generated_key_hex(),
                 "HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS"
                 | "HUMAUX_GATEWAY_GLOBAL_DENYLIST"
                 | "HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST" => String::new(),
@@ -988,6 +1059,86 @@ mod tests {
             raw.insert(entry.name, value);
         }
         raw
+    }
+
+    /// A per-call generated 32-byte key, hex-encoded (never a literal key).
+    fn generated_key_hex() -> String {
+        format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple())
+    }
+
+    fn rejected_key(values: BTreeMap<String, String>) -> String {
+        match GatewayBootstrap::from_raw(values) {
+            Ok(_) => panic!("configuration must be rejected"),
+            Err(error) => error.key,
+        }
+    }
+
+    #[test]
+    fn bootstrap_without_token_hmac_key_fails_naming_the_key() {
+        let mut values = raw();
+        values.remove("HUMAUX_GATEWAY_TOKEN_HMAC_KEY");
+        assert_eq!(rejected_key(values), "HUMAUX_GATEWAY_TOKEN_HMAC_KEY");
+        let mut values = raw();
+        values.insert("HUMAUX_GATEWAY_TOKEN_HMAC_KEY".into(), String::new());
+        assert_eq!(rejected_key(values), "HUMAUX_GATEWAY_TOKEN_HMAC_KEY");
+    }
+
+    #[test]
+    fn bootstrap_rejects_short_or_equal_previous_token_key() {
+        let mut values = raw();
+        values.insert("HUMAUX_GATEWAY_TOKEN_HMAC_KEY".into(), "00".repeat(31));
+        assert_eq!(rejected_key(values), "HUMAUX_GATEWAY_TOKEN_HMAC_KEY");
+        let mut values = raw();
+        values.insert(
+            "HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS".into(),
+            "00".repeat(31),
+        );
+        assert_eq!(
+            rejected_key(values),
+            "HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS"
+        );
+        let mut values = raw();
+        let current = values["HUMAUX_GATEWAY_TOKEN_HMAC_KEY"].clone();
+        values.insert("HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS".into(), current);
+        assert_eq!(
+            rejected_key(values),
+            "HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS"
+        );
+        let mut values = raw();
+        values.insert(
+            "HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS".into(),
+            generated_key_hex(),
+        );
+        assert!(GatewayBootstrap::from_raw(values).is_ok());
+    }
+
+    #[test]
+    fn bootstrap_rejects_previous_pepper_equal_to_current() {
+        let mut values = raw();
+        let current = values["HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX"].clone();
+        values.insert(
+            "HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX".into(),
+            current,
+        );
+        assert_eq!(
+            rejected_key(values),
+            "HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX"
+        );
+        let mut values = raw();
+        values.insert(
+            "HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX".into(),
+            "not hex".into(),
+        );
+        assert_eq!(
+            rejected_key(values),
+            "HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX"
+        );
+        let mut values = raw();
+        values.insert(
+            "HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX".into(),
+            generated_key_hex(),
+        );
+        assert!(GatewayBootstrap::from_raw(values).is_ok());
     }
 
     #[test]

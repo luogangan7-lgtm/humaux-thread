@@ -3,8 +3,8 @@
 //!   humaux-protocol]; services=[]; env=[]; modules=[adapters::credential_repo, adapters::postgres, domain::error,
 //!   domain::identity, domain::ids, protocol::edge]
 //! Called-by: [gateway::guard, tests]
-//! Invariants: [a PAT's allowed_workspace_ids is always an intersection of the live ACTIVE membership set with the credential's bound workspace; a stale binding whose membership was revoked yields Forbidden, never a silent tenant-wide downgrade]
-//! Spec: Baseline §73.5.1; §6.1.1; §33; ADR-0035
+//! Invariants: [a PAT's allowed_workspace_ids is always an intersection of the live ACTIVE membership set with the credential's bound workspace; a stale binding whose membership was revoked yields Forbidden, never a silent tenant-wide downgrade; a key verified only by the previous pepper is rehashed after validation and the rehash is never fatal to the request (ADR-0059 D-H)]
+//! Spec: Baseline §73.5.1; §6.1.1; §33; ADR-0035; ADR-0059
 //!
 //! Credentials and live grants come from the
 //! database; tool arguments never supply a principal, user, or workspace grant.
@@ -29,7 +29,9 @@ use humaux_adapters::postgres::RuntimeDbPool;
 use humaux_domain::error::ErrorCode;
 use humaux_domain::identity::{AuthorizationScope, BoundedSet, PrincipalId};
 use humaux_domain::ids::{TenantId, UserId, WorkspaceId};
-use humaux_protocol::edge::{ApiKeyRecord, ApiKeyStatus, validate_api_key};
+use humaux_protocol::edge::{
+    ApiKeyRecord, ApiKeyStatus, PepperMatch, compute_api_key_hash, validate_api_key,
+};
 
 /// The closed service-credential scope vocabulary from §33.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -157,6 +159,7 @@ pub async fn authenticate_service_credential(
     pool: &RuntimeDbPool,
     authorization_header: &str,
     pepper: &[u8],
+    pepper_previous: Option<&[u8]>,
     request_ip: IpAddr,
     now: SystemTime,
 ) -> Result<AuthenticatedServiceCredential, ErrorCode> {
@@ -178,7 +181,7 @@ pub async fn authenticate_service_credential(
         expires_at: record.expires_at().map(SystemTime::from),
         revoked_at: record.revoked_at().map(SystemTime::from),
     };
-    validate_api_key(&key, raw_key, pepper, request_ip, now)
+    let pepper_match = validate_api_key(&key, raw_key, pepper, pepper_previous, request_ip, now)
         .map_err(|_| ErrorCode::Unauthorized)?;
     // §6.1.1 / ADR-0035 D-D: derive the live workspace ceiling ONLY after a valid key, and only
     // for a user-bound credential (a machine credential's ceiling is its bound singleton / empty,
@@ -192,9 +195,37 @@ pub async fn authenticate_service_credential(
         None => record.workspace_id().map(WorkspaceId).into_iter().collect(),
     };
     let authenticated = authenticated_binding(&record, live)?;
+    if pepper_match == PepperMatch::Previous {
+        rehash_to_current(pool, &record, pepper, raw_key).await;
+    }
     // Reuse the gateway-only definer; rejected credentials never get a usage write.
     credential_repo::mark_used(pool, record.api_key_id()).await?;
     Ok(authenticated)
+}
+
+/// §73.5 / ADR-0059 D-H: moves a previous-pepper verifier to the current pepper. Runs only after
+/// the request fully validated and is never fatal to it: a lost compare-and-set, a closed epoch or
+/// a DB error is logged by class only (never a key, hash or prefix) and the request proceeds.
+async fn rehash_to_current(
+    pool: &RuntimeDbPool,
+    record: &CredentialRecord,
+    pepper: &[u8],
+    raw_key: &str,
+) {
+    let new_hash = compute_api_key_hash(pepper, raw_key);
+    let class = match credential_repo::rehash(
+        pool,
+        record.api_key_id(),
+        record.key_hash(),
+        &new_hash,
+    )
+    .await
+    {
+        Ok(Some(true)) => return,
+        Ok(Some(false) | None) => "pepper_rehash_skipped",
+        Err(_) => "pepper_rehash_failed",
+    };
+    eprintln!("humaux-gateway: auth credential {class}");
 }
 
 fn authenticated_binding(

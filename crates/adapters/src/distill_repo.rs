@@ -670,7 +670,8 @@ fn remember_err(error: remember::RememberError) -> ErrorCode {
         remember::RememberError::ConsistencyTokenExpiryNotFuture
         | remember::RememberError::BatchExhausted => ErrorCode::Conflict,
         remember::RememberError::Subject(code) | remember::RememberError::Affect(code) => code,
-        remember::RememberError::ReasoningDomainUnresolved => ErrorCode::DependencyUnavailable,
+        remember::RememberError::ReasoningDomainUnresolved
+        | remember::RememberError::TokenKeysUnset => ErrorCode::DependencyUnavailable,
     }
 }
 
@@ -1258,7 +1259,7 @@ fn build_candidate_consistency_token(
     let issued_at = OffsetDateTime::now_utc();
     let ttl = time::Duration::try_from(ttl).map_err(|_| ErrorCode::InvalidInput)?;
     let expires_at = issued_at.checked_add(ttl).ok_or(ErrorCode::InvalidInput)?;
-    Ok(retrieve::issue_consistency_token(&TokenClaims {
+    retrieve::issue_consistency_token(&TokenClaims {
         tenant_id: stream.tenant_id.0,
         workspace_id: (stream.scope_kind == "workspace").then_some(stream.scope_id),
         scope_kind: stream.scope_kind.clone(),
@@ -1270,7 +1271,9 @@ fn build_candidate_consistency_token(
         commit_seq,
         issued_at,
         expires_at,
-    }))
+    })
+    // ADR-0059 D-G: an uninstalled key set is a missing dependency, never an unsigned token.
+    .map_err(|_| ErrorCode::DependencyUnavailable)
 }
 
 /// ADR-0026 D-D `memory.reject`, atomically: consume token -> reserve BMO -> flip PENDING to

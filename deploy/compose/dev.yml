@@ -1,16 +1,22 @@
 # Developer 档（§67.1，非生产）。Thread 专用开发 PG——绝不复用任何旧系统/其他项目实例。
 # 启动：docker compose -f deploy/compose/dev.yml up -d
-# 等价单容器：docker run -d --name humaux-thread-pg -e POSTGRES_PASSWORD=devlocal \
-#   -e POSTGRES_DB=humaux_thread_dev -p 127.0.0.1:54329:5432 postgres:18
+# 等价单容器 (ADR-0059 D-J: the superuser password never goes on argv — `-e NAME` passes the name only and
+#   docker reads the value from its own environment; a `-e NAME=value` would show in `ps`):
+#   ( . "$HOME/.config/humaux/dev_role_passwords.env" && POSTGRES_PASSWORD="$HUMAUX_DEV_PG_SUPERUSER_PASSWORD" \
+#     docker run -d --name humaux-thread-pg -e POSTGRES_PASSWORD \
+#     -e POSTGRES_DB=humaux_thread_dev -p 127.0.0.1:54329:5432 postgres:18 )
+#   Compose below interpolates the value into the container config through the API, not argv.
 # 测试 DSN 约定（testkit DB fixture 读取）：
-#   HUMAUX_TEST_PG_DSN=postgres://postgres:devlocal@127.0.0.1:54329/humaux_thread_dev
-# 密码仅本机回环开发实例；生产凭证走 OpenBao（§7），永不入库。
+#   HUMAUX_TEST_PG_DSN=postgres://postgres:${HUMAUX_DEV_PG_SUPERUSER_PASSWORD}@127.0.0.1:54329/humaux_thread_dev
+# 密码仅本机回环开发实例；生产凭证走 OpenBao（§7），永不入库。ADR-0059 D-J: values live only in
+#   $HOME/.config/humaux/dev_role_passwords.env (0600). A brand-new container has no 0011 roles yet:
+#   run `cargo xtask migrate --dev-placeholder-roles` once (dev clusters only), then `roles rotate`.
 services:
   postgres:
     image: postgres:18 # spec 基线 18.6（§5）
     container_name: humaux-thread-pg
     environment:
-      POSTGRES_PASSWORD: devlocal
+      POSTGRES_PASSWORD: ${HUMAUX_DEV_PG_SUPERUSER_PASSWORD:?set HUMAUX_DEV_PG_SUPERUSER_PASSWORD (dev_role_passwords.env)}
       POSTGRES_DB: humaux_thread_dev
     ports:
       - "127.0.0.1:54329:5432"

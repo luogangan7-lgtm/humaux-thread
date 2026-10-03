@@ -2,7 +2,13 @@
 //!   before this review, `grep` over the whole workspace for `run_once` found no caller and no test, and the crate's
 //!   own "positive sentinel" only asserted a fact about its own `FakePort` fixture 15 lines above it (a change to any
 //!   production file could never turn it red).
-//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-testkit, postgres, serde_json, tokio, uuid]; services=[PostgreSQL(role_consolidation_worker) w=[control.private_reasoning_domains, control.tenants, private.events, private.evidence_objects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollups]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::consolidate_repo, adapters::postgres, application::consolidate, domain::authority, humaux-consolidation-worker, humaux-testkit]
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-testkit, postgres,
+//!   serde_json, tokio, uuid]; services=[PostgreSQL(role_consolidation_worker) w=[control.private_reasoning_domains,
+//!   control.tenants, ops.jobs, ops.outbox, private.events, private.evidence_objects,
+//!   private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence,
+//!   private.memory_records, private.memory_rollup_sources, private.memory_rollups, projection.stream_checkpoints,
+//!   projection.stream_log]]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::consolidate_repo, adapters::postgres,
+//!   application::consolidate, domain::authority, humaux-consolidation-worker, humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [run_once against a real ConsolidationDbPool: empty input makes no provider call (§11.5.1) and the
 //!   publish path leaves exactly the §11.7-§11.9 rows; no DSN / unreachable / unmigrated DB is a visible SKIP]
@@ -68,24 +74,39 @@ struct Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // Best-effort cleanup, same shape as `consolidate_snapshot.rs::Handle::drop` — this
-        // file never touches a schema/table of its own, only rows it created under its own
-        // throwaway tenant.
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM private.memory_rollup_sources WHERE rollup_id IN \
+        // This file never touches a schema/table of its own, only rows it created under its own
+        // throwaway tenant. Card-31 pattern (card 33 leak fix): the seeded PRIMARY memory_evidence
+        // link enqueued a DERIVED_CONSOLIDATE job (0164 trigger). Jobs go first, in one batch with
+        // the rows that produced them (including the rollup ticket's outbox/stream rows, whose
+        // evidence FK rolled the old single batch back), and a failure is printed; the tenant row
+        // goes in a separate best-effort batch.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM private.memory_rollup_sources WHERE rollup_id IN \
                (SELECT rollup_id FROM private.memory_rollups WHERE tenant_id = '{0}'); \
              DELETE FROM private.memory_rollups WHERE tenant_id = '{0}'; \
              DELETE FROM private.memory_consolidation_inputs WHERE run_id IN \
                (SELECT run_id FROM private.memory_consolidation_runs WHERE tenant_id = '{0}'); \
              DELETE FROM private.memory_consolidation_runs WHERE tenant_id = '{0}'; \
+             DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}'; \
              DELETE FROM private.memory_evidence WHERE memory_id IN \
                (SELECT memory_id FROM private.memory_records WHERE tenant_id = '{0}'); \
              DELETE FROM private.memory_records WHERE tenant_id = '{0}'; \
              DELETE FROM private.events WHERE event_id IN \
                (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id = '{0}'); \
              DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
-             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{0}';",
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}';",
+            self.tenant_id
+        )) {
+            eprintln!(
+                "run_once_e2e cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{0}';",
             self.tenant_id
         ));
     }

@@ -108,6 +108,14 @@ hex = "0.4"
 # feature) stays alongside for test fixtures; `v7` is what production code here calls.
 # why: id minting/binding; used-by: [adapters::confirm_token_repo, adapters::byok]
 uuid = { version = "1.25.0", features = ["v7", "serde"] }
+# ADR-0059 D-E: client-side SCRAM-SHA-256 role verifiers (PBKDF2 on HMAC-SHA256, base64 fields) and
+# their random salts; all three versions already resolved in the lockfile (protocol, maintenance).
+# why: SCRAM verifier computation for role rotation and the consistency-token MAC (ADR-0059 D-G); used-by: [adapters::retrieve, adapters::role_hygiene]
+hmac = "0.13"
+# why: SCRAM verifier field encoding; used-by: [adapters::role_hygiene]
+base64 = "0.22"
+# why: SCRAM salt and the deploy-check random probe password; used-by: [adapters::role_hygiene]
+rand = "0.9"
 
 [dev-dependencies]
 # §80.1: self-referencing dev-dependency, the standard Cargo idiom for a feature that must be

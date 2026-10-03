@@ -1,8 +1,8 @@
 //! `adapters::tests::mandatory_context_lane` — §25.4/§25.5 Mandatory Context Lane 的 DB 判据（DOD-020，phase=7 欠账）。
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, sqlx, tokio, uuid];
 //!   services=[PostgreSQL(any) w=[control.memberships, control.private_reasoning_domains, control.tenants,
-//!   control.users, control.workspace_memberships, control.workspaces, private.context_bindings, private.events,
-//!   private.evidence_objects, private.memory_evidence, private.memory_records], PostgreSQL(owner),
+//!   control.users, control.workspace_memberships, control.workspaces, ops.jobs, private.context_bindings,
+//!   private.events, private.evidence_objects, private.memory_evidence, private.memory_records], PostgreSQL(owner),
 //!   PostgreSQL(role_gateway)]; env=[HUMAUX_GATEWAY_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[adapters::context_repo,
 //!   adapters::postgres, domain::context, domain::error, domain::identity, domain::ids, humaux-testkit]
 //! Called-by: [cargo-test]
@@ -153,8 +153,13 @@ const FIXTURE_LOCK_WAIT: &str = "120s";
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM private.context_bindings WHERE tenant_id = '{0}'; \
+        // Card-31 pattern (card 33 leak fix): each seeded PRIMARY memory_evidence link
+        // enqueues a DERIVED_* job (0164 trigger). Jobs go first, in one batch with the data rows, and
+        // a failure is printed; the tenant row goes in a separate best-effort batch, so a refused tenant
+        // delete (append-only audit rows, a missed child table) can no longer roll the job delete back.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM private.context_bindings WHERE tenant_id = '{0}'; \
              DELETE FROM private.memory_evidence WHERE memory_id IN \
                (SELECT memory_id FROM private.memory_records WHERE tenant_id = '{0}'); \
              DELETE FROM private.memory_records WHERE tenant_id = '{0}'; \
@@ -163,9 +168,17 @@ impl Drop for Fixture {
              DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
              DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
              DELETE FROM control.memberships WHERE tenant_id = '{0}'; \
-             DELETE FROM control.workspaces WHERE tenant_id = '{0}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{0}';",
-            self.tenant_id
+             DELETE FROM control.workspaces WHERE tenant_id = '{0}';",
+            self.tenant_id,
+        )) {
+            eprintln!(
+                "mandatory_context_lane cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{0}';",
+            self.tenant_id,
         ));
         for user_id in &self.user_ids {
             let _ = self

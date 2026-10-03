@@ -411,20 +411,36 @@ pub enum ApiKeyRejection {
     CidrNotAllowed,
 }
 
+/// Which pepper verified the presented key (ADR-0059 D-H). A result, not an error: `Previous`
+/// tells the caller to rehash the stored verifier under the current pepper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PepperMatch {
+    Current,
+    Previous,
+}
+
 /// §73.5 validation: keyed-hash compare, then lifecycle status, then `expires_at`/`revoked_at`
 /// timestamps (belt-and-suspenders with `status` — a row can be `Active` in the DB with a
 /// stale `expires_at` between the row's actual expiry and the next sweep), then CIDR binding.
 /// `now` is caller-supplied (§78.1: no clock read baked into a pure function).
+///
+/// ADR-0059 D-H: `previous` is the rotation window's old pepper (`None` = window closed); it is
+/// tried only after `current` fails.
 pub fn validate_api_key(
     record: &ApiKeyRecord,
     presented_key: &str,
-    pepper: &[u8],
+    current: &[u8],
+    previous: Option<&[u8]>,
     request_ip: IpAddr,
     now: SystemTime,
-) -> Result<(), ApiKeyRejection> {
-    if !verify_api_key_hash(pepper, presented_key, &record.key_hash) {
+) -> Result<PepperMatch, ApiKeyRejection> {
+    let matched = if verify_api_key_hash(current, presented_key, &record.key_hash) {
+        PepperMatch::Current
+    } else if previous.is_some_and(|p| verify_api_key_hash(p, presented_key, &record.key_hash)) {
+        PepperMatch::Previous
+    } else {
         return Err(ApiKeyRejection::HashMismatch);
-    }
+    };
     match record.status {
         ApiKeyStatus::Revoked => return Err(ApiKeyRejection::Revoked),
         ApiKeyStatus::Expired => return Err(ApiKeyRejection::Expired),
@@ -443,7 +459,7 @@ pub fn validate_api_key(
             return Err(ApiKeyRejection::CidrNotAllowed);
         }
     }
-    Ok(())
+    Ok(matched)
 }
 
 /// §73.5 "日志只记录 fingerprint/prefix，不记录 secret". A short, deterministic,
@@ -824,8 +840,15 @@ mod tests {
         let record = active_record(hash);
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         assert_eq!(
-            validate_api_key(&record, "raw-key-value", pepper, ip, SystemTime::now()),
-            Ok(())
+            validate_api_key(
+                &record,
+                "raw-key-value",
+                pepper,
+                None,
+                ip,
+                SystemTime::now()
+            ),
+            Ok(PepperMatch::Current)
         );
     }
 
@@ -836,7 +859,7 @@ mod tests {
         let record = active_record(hash);
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         assert_eq!(
-            validate_api_key(&record, "wrong-key", pepper, ip, SystemTime::now()),
+            validate_api_key(&record, "wrong-key", pepper, None, ip, SystemTime::now()),
             Err(ApiKeyRejection::HashMismatch)
         );
     }
@@ -850,7 +873,14 @@ mod tests {
         record.status = ApiKeyStatus::Revoked;
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         assert_eq!(
-            validate_api_key(&record, "raw-key-value", pepper, ip, SystemTime::now()),
+            validate_api_key(
+                &record,
+                "raw-key-value",
+                pepper,
+                None,
+                ip,
+                SystemTime::now()
+            ),
             Err(ApiKeyRejection::Revoked)
         );
     }
@@ -863,7 +893,14 @@ mod tests {
         record.expires_at = Some(SystemTime::UNIX_EPOCH);
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         assert_eq!(
-            validate_api_key(&record, "raw-key-value", pepper, ip, SystemTime::now()),
+            validate_api_key(
+                &record,
+                "raw-key-value",
+                pepper,
+                None,
+                ip,
+                SystemTime::now()
+            ),
             Err(ApiKeyRejection::Expired)
         );
     }
@@ -876,7 +913,14 @@ mod tests {
         record.allowed_cidrs = vec![cidr("10.0.0.0/8")];
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         assert_eq!(
-            validate_api_key(&record, "raw-key-value", pepper, ip, SystemTime::now()),
+            validate_api_key(
+                &record,
+                "raw-key-value",
+                pepper,
+                None,
+                ip,
+                SystemTime::now()
+            ),
             Err(ApiKeyRejection::CidrNotAllowed)
         );
         let bound_ip: IpAddr = "10.1.1.1".parse().unwrap();
@@ -885,10 +929,79 @@ mod tests {
                 &record,
                 "raw-key-value",
                 pepper,
+                None,
                 bound_ip,
                 SystemTime::now()
             ),
-            Ok(())
+            Ok(PepperMatch::Current)
+        );
+    }
+
+    /// ADR-0059 D-H (card 33 acceptance): a key hashed under the previous pepper verifies while
+    /// the window is open and reports `Previous`, so the gateway rehashes it.
+    #[test]
+    fn pepper_window_verifies_previous_and_reports_it() {
+        let (old, new) = (
+            b"pepper-before-rotation".as_slice(),
+            b"pepper-after-rotation".as_slice(),
+        );
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let old_hashed = active_record(compute_api_key_hash(old, "raw-key-value"));
+        assert_eq!(
+            validate_api_key(
+                &old_hashed,
+                "raw-key-value",
+                new,
+                Some(old),
+                ip,
+                SystemTime::now()
+            ),
+            Ok(PepperMatch::Previous)
+        );
+        let new_hashed = active_record(compute_api_key_hash(new, "raw-key-value"));
+        assert_eq!(
+            validate_api_key(
+                &new_hashed,
+                "raw-key-value",
+                new,
+                Some(old),
+                ip,
+                SystemTime::now()
+            ),
+            Ok(PepperMatch::Current)
+        );
+        assert_eq!(
+            validate_api_key(
+                &old_hashed,
+                "wrong-key",
+                new,
+                Some(old),
+                ip,
+                SystemTime::now()
+            ),
+            Err(ApiKeyRejection::HashMismatch)
+        );
+    }
+
+    /// ADR-0059 D-H: once the window closes (`previous = None`) the old-pepper key is refused.
+    #[test]
+    fn pepper_outside_window_refuses_old_key() {
+        let (old, new) = (
+            b"pepper-before-rotation".as_slice(),
+            b"pepper-after-rotation".as_slice(),
+        );
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let old_hashed = active_record(compute_api_key_hash(old, "raw-key-value"));
+        assert_eq!(
+            validate_api_key(
+                &old_hashed,
+                "raw-key-value",
+                new,
+                None,
+                ip,
+                SystemTime::now()
+            ),
+            Err(ApiKeyRejection::HashMismatch)
         );
     }
 

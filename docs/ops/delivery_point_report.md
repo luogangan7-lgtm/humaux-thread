@@ -673,6 +673,9 @@ provenance claims `cand_k` (25); the query planner answers `INVALID_INPUT` to ev
 The ranked list, evidence and fix sketches are in the audit report. **This report's "MET"
 verdicts stand for what the rehearsal exercised; the audit is the record of what it did
 not, and it withdraws the "ready for production" reading of §5.**
+Card 33 (ADR-0059, §6.18) closes the role-password, SEC-2 and ARCH-9 items of that list and
+replaces "one env-held key serves every tenant" with a per-reference key map; BYOK through
+OpenBao is still card 54.
 
 ### 6.11 Folded debts closed by card 26 (ADR-0051 D-L)
 
@@ -893,6 +896,41 @@ not, and it withdraws the "ready for production" reading of §5.**
   `humaux_thread_dev` distilled 0 memories. The same head-of-line blocking applies in production
   to any tenant without a route binding.
 
+### 6.18 Closed by card 33 (ADR-0059)
+
+| Change | Before | After (ADR-0059) | Witness |
+|---|---|---|---|
+| Role passwords (P1-3) | 8 roles `LOGIN PASSWORD '<literal>'` from 0011; nothing proved a deploy replaced them | `humaux-maintenance roles rotate` (one transaction, client-side SCRAM verifiers, values printed once) and `deploy-check` (placeholders parsed from 0011 at run time; only 28P01 counts as refused) | `maintenance_roles_hygiene`, `adapters_role_hygiene` |
+| Migration owner | LOGIN with a published password | NOLOGIN, no password (0201); `migrate` refuses a fresh cluster without pre-provisioned roles | `xtask_rls_tests` (role set), `xtask_migrate_tests` (guard) |
+| SEC-2 | runtime roles could write `ops.schema_migrations` and the `ops.email_*` tables | owner-only ledger; email verbs narrowed to `adapters::email::outbox`'s writers | `rls`, `adapters_email_outbox` |
+| ARCH-9 | consistency token was unsigned hex; `expires_at` editable | HMAC-SHA256 with key id, dual-key window; MAC checked before any field is parsed; not authorization (710a2548) | `adapters_retrieve_ryw` (T29), `adapters_token_keys_unset` |
+| Pepper rotation | rotating the pepper invalidated every key | dual verify + epoch-gated, window-bounded, audited rehash on use (0202–0204) | `gateway_service_credentials`, `api_key_rehash_boundary` |
+| Provider keys (P1-2 interim) | one env key (`HUMAUX_PRIVATE_WORKER_KEY_ENV`) served every tenant's credential reference | `HUMAUX_PRIVATE_WORKER_CREDENTIALS` maps each reference to its own key variable; an unmapped reference parks `WAITING_KEY` / `CREDENTIAL_NOT_MAPPED` before any ledger row or provider call | `private_worker_tests` (T23, T24, T25) |
+| Real-login placeholders | 21 tracked files carried the dev placeholder prefix | none (`files_with_placeholder=0`); dev values only in a 0600 file outside the repo | `placeholder_files`, `tw_env_no_placeholder` |
+
+- **Declared deviation from §67.2 until card 54:** provider keys are still environment-held (one
+  variable per credential reference), not OpenBao-decrypted. Until card 33b, the provider, model and
+  endpoint of every job still come from the process-level descriptor
+  (`HUMAUX_PRIVATE_WORKER_PROVIDER_ID` / `_MODEL_ID` / `_CHAT_URL`); only the key is chosen per
+  credential reference. Consolidation and contribution RPC calls meet an unmapped reference only
+  after their reservation (ADR-0059 L7).
+- **Operator-visible:** new required keys `HUMAUX_PRIVATE_WORKER_CREDENTIALS`,
+  `HUMAUX_GATEWAY_TOKEN_HMAC_KEY`, `HUMAUX_MIGRATOR_PG_DSN` (rotate) — no defaults;
+  `HUMAUX_PRIVATE_WORKER_KEY_ENV` is removed and refused at boot. Rotation procedures: runbook §10;
+  deploy-check reds: supervision §2.
+- **Filed, not closed:** the email grant matrix is interim (card 55); rotation and the pepper-epoch
+  advance are audited by receipt only (L3); there is no count of keys still behind the pepper epoch (L6).
+- **Rehearsal (no soak, 2026-10-03, release profile, `humaux_thread_dev`):** `REHEARSAL VERDICT: 99
+  passed, 1 failed`; the private worker ran on a 4-reference map (`credential map: 4 refs`, three seeds
+  plus tenant C's second domain), and every distill and consolidation job of the rehearsal tenant
+  ended DONE. The one red, `derived_jobs_not_done` (`2`), is environmental: 81 `DERIVED_CONSOLIDATE`
+  jobs leaked as PENDING by `cargo test -p humaux-adapters --tests` throwaway tenants (73 from
+  `selection_snapshot.rs`) are claimed ahead of the rehearsal's own (`claimed=8 … not_ready=8` per
+  pass); the tenant's two jobs reached DONE after the assertion. `c31_leak_check` counts only
+  `DERIVED_DISTILL`, so it does not catch this leak (filed for the main line).
+- **Main-line step outside the slices (E4):** rotating the shared dev cluster (red `deploy-check` →
+  `roles rotate` → superuser password → green `deploy-check`).
+
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 
 The user approved the whole list on 2026-09-26 ("需要清理删除的进行清理删除，其他的你看着办"). Every
@@ -980,10 +1018,13 @@ MiniMax key were never in the library and are unaffected.
 
 ### 7.7 Still the user's — `role_admin`'s development password
 
-Unchanged: migration 0110 creates `role_admin` with LOGIN and no password ("provisioned
-externally"); the main line set a development password out of band so the mechanism group
-could run (`HUMAUX_ADMIN_PG_DSN`). A production deployment needs a real source for it
-(`docs/ops/runbook.md` §2). Not changed by this pass.
+Migration 0110 creates `role_admin` with LOGIN and no password ("provisioned externally"); the
+main line set a development password out of band so the mechanism group could run
+(`HUMAUX_ADMIN_PG_DSN`). Card 33 (ADR-0059) gives it a real source: `humaux-maintenance roles
+rotate --role role_admin` (runbook §2 step 3, §10.1); `deploy-check` probes it with the derived
+placeholder convention. The development value now lives only in
+`$HOME/.config/humaux/dev_role_passwords.env` (0600) as `HUMAUX_ROLE_PASSWORD_ADMIN`; rotating it on
+the shared dev cluster is the main line's E4 step.
 
 ### 7.8 Migration manifests brought onto the rehearsal gate's closed class set
 

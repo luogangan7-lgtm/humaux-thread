@@ -1,9 +1,10 @@
 //! `maintenance::tests::onboarding` — real-PostgreSQL / real-Qdrant tests of the `humaux-maintenance` binary
 //!   (ADR-0053).
 //! Depends-on: crates=[humaux-protocol, humaux-testkit, postgres, serde_json, uuid]; services=[PostgreSQL(owner)
-//!   r=[control.api_keys, control.audit_events, control.entitlement_snapshots, control.memberships,
+//!   r=[control.api_keys, control.audit_events, control.credential_pepper_state, control.entitlement_snapshots, control.memberships,
 //!   control.private_reasoning_domains, control.quota_windows, control.retrieval_provider_admission_limits,
 //!   control.tenants, control.user_emails, control.users, control.workspace_memberships, ops.commit_seq_seq,
+//!   ops.schema_migrations,
 //!   projection.family_activations, projection.tenant_placements] w=[control.workspaces, ops.jobs, ops.outbox,
 //!   private.evidence_objects, projection.stream_checkpoints, projection.stream_log]
 //!   x=[control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.onboard_tenant,
@@ -121,6 +122,12 @@ impl Drop for Fixture {
 /// Applies every migration file in order (bodies only; the executed manifest checks are the
 /// `xtask migrate` gate's job, run separately on its own throwaway database).
 fn migrate(client: &mut Client) {
+    // Role DDL is cluster-global: 0201's ALTER ROLE from parallel fixtures onto the one pg_authid row
+    // fails "tuple concurrently updated", so this process applies one database at a time.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("migrations dir")
@@ -128,6 +135,15 @@ fn migrate(client: &mut Client) {
         .filter(|p| p.extension().is_some_and(|x| x == "sql"))
         .collect();
     files.sort();
+    // `xtask migrate` bootstraps its ledger before the first migration; 0201 (ADR-0059 D-C) revokes
+    // runtime writes on it, so a bodies-only apply needs the same table first.
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS ops; CREATE TABLE IF NOT EXISTS ops.schema_migrations \
+             (migration_id text PRIMARY KEY, checksum text NOT NULL, \
+              applied_at timestamptz NOT NULL DEFAULT now())",
+        )
+        .expect("migration ledger bootstrap");
     for file in files {
         let sql = std::fs::read_to_string(&file).expect("migration body");
         client
@@ -1022,6 +1038,57 @@ fn apikey_revoke_is_idempotent() {
         f.count("SELECT count(*) FROM control.api_keys WHERE status = 'REVOKED' AND revoked_at IS NOT NULL"),
         1
     );
+}
+
+/// ADR-0059 D-H (migration 0205): `apikey pepper-epoch advance` opens one window per epoch; a second
+/// `advance` while it is open is refused `rehash_window_open` (exit 3) and leaves epoch and window
+/// unchanged; `close` re-runs as a no-op; after `close` the next `advance` moves on. Runs on this
+/// test's own database, so the shared dev epoch never moves.
+#[test]
+fn apikey_pepper_epoch_advance_refuses_while_the_window_is_open() {
+    let Some(mut f) = fixture("apikey_pepper_epoch_advance_refuses_while_the_window_is_open")
+    else {
+        return;
+    };
+    let pepper = |f: &mut Fixture| -> (i32, bool) {
+        // dep: PostgreSQL(owner) — read the singleton pepper state of this test's database
+        let row = f
+            .db()
+            .query_one(
+                "SELECT epoch, rehash_open FROM control.credential_pepper_state",
+                &[],
+            )
+            .expect("pepper state");
+        (row.get(0), row.get(1))
+    };
+    let (start, open) = pepper(&mut f);
+    assert!(!open, "a fresh database starts with the window closed");
+    let advance = |f: &Fixture| f.run_admin(&["apikey", "pepper-epoch", "advance"]);
+    let close = |f: &Fixture| f.run_admin(&["apikey", "pepper-epoch", "close"]);
+
+    let first = advance(&f);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    assert_eq!(receipt(&first)["epoch"], start + 1);
+    assert_eq!(pepper(&mut f), (start + 1, true));
+
+    let again = advance(&f);
+    assert_eq!(again.status.code(), Some(3), "{}", stdout(&again));
+    assert_eq!(receipt(&again)["outcome"], "refused");
+    assert_eq!(receipt(&again)["reason"], "rehash_window_open");
+    assert_eq!(
+        pepper(&mut f),
+        (start + 1, true),
+        "epoch and window unchanged"
+    );
+
+    for _ in 0..2 {
+        let closed = close(&f);
+        assert_eq!(closed.status.code(), Some(0), "{}", stderr(&closed));
+        assert_eq!(pepper(&mut f), (start + 1, false));
+    }
+    let next = advance(&f);
+    assert_eq!(next.status.code(), Some(0), "{}", stderr(&next));
+    assert_eq!(pepper(&mut f), (start + 2, true));
 }
 
 #[test]

@@ -10,7 +10,7 @@
 //!   PostgreSQL(role_batch_issuer), PostgreSQL(role_gateway), PostgreSQL(role_retrieval_worker), Qdrant(*),
 //!   subprocess(gitleaks)]; env=[HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_PG_DSN,
 //!   HUMAUX_TEST_QDRANT_URL]; modules=[adapters::memory_governance_repo, adapters::postgres,
-//!   adapters::projection_worker, adapters::qdrant, adapters::remember, adapters::tests::support::governance_ops,
+//!   adapters::projection_worker, adapters::qdrant, adapters::remember, adapters::tests::support::governance_ops, adapters::tests::support::token_keys,
 //!   domain::confirm, domain::egress, domain::error, domain::evidence, domain::identity, domain::ids,
 //!   domain::subject, humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource,
 //!   infra-cell::transport, projection::serving, retrieval-provider::adapters, retrieval-provider::contract]
@@ -291,6 +291,7 @@ impl DbIntegrationFixture for Fixture {
     type Handle = Handle;
 
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
+        governance_ops::token_keys::install();
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
         // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test

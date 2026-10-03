@@ -11,7 +11,7 @@
 //!   subprocess(gitleaks)];
 //!   env=[HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN];
 //!   modules=[adapters::postgres, adapters::projection_worker, adapters::qdrant, adapters::remember,
-//!   adapters::stream_repo, domain::egress, domain::error, domain::evidence, domain::ids, domain::subject,
+//!   adapters::stream_repo, adapters::tests::support::token_keys, domain::egress, domain::error, domain::evidence, domain::ids, domain::subject,
 //!   humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
 //!   retrieval-provider::adapters, retrieval-provider::contract]
 //! Called-by: [cargo-test]
@@ -28,6 +28,8 @@
 //! wants a ticket claimable closes that outbox row (`close_distill`), exactly what a finished
 //! distill does.
 
+#[path = "support/token_keys.rs"]
+mod token_keys;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -85,6 +87,7 @@ struct Env {
 impl Env {
     /// `None` = visible SKIP (or a failure under `HUMAUX_REQUIRE_DB=1`).
     fn new(test: &str) -> Option<Self> {
+        token_keys::install();
         let Ok(admin_dsn) = std::env::var("HUMAUX_TEST_PG_DSN") else {
             skip_or_fail(
                 test,
@@ -314,7 +317,11 @@ impl Env {
 impl Drop for Env {
     fn drop(&mut self) {
         for tenant in &self.tenants {
-            let _ = self.admin.batch_execute(&format!(
+            // Card-31 pattern (card 33 leak fix): each remember's EVIDENCE_ACCEPTED row or PRIMARY link
+            // enqueues a DERIVED_* job (0164 trigger). Jobs go first, in one batch with the data rows, and
+            // a failure is printed; the tenant row goes in a separate best-effort batch, so a refused tenant
+            // delete (append-only audit rows, a missed child table) can no longer roll the job delete back.
+            if let Err(error) = self.admin.batch_execute(&format!(
                 "DELETE FROM projection.private_memory_points WHERE tenant_id = '{0}'; \
                  DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
                  DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
@@ -327,9 +334,17 @@ impl Drop for Env {
                  DELETE FROM private.events USING private.evidence_objects eo \
                    WHERE events.event_id = eo.evidence_id AND eo.tenant_id = '{0}'; \
                  DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
-                 DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
-                 DELETE FROM control.tenants WHERE tenant_id = '{0}';",
-                tenant
+                 DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}';",
+                tenant,
+            )) {
+                eprintln!(
+                    "projection_claim cleanup failed for tenant {}: {error}",
+                    tenant
+                );
+            }
+            let _ = self.admin.batch_execute(&format!(
+                "DELETE FROM control.tenants WHERE tenant_id = '{0}';",
+                tenant,
             ));
         }
     }

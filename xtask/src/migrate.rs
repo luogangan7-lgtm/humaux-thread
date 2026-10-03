@@ -3,8 +3,10 @@
 //! Called-by: [xtask::e2e_onboard, xtask::main, xtask::serial_lane]
 //! Invariants: [each PENDING migration runs in one explicit transaction (ADR-0050 D-D) unless its manifest says
 //!   transaction = "none" (only that value, only for a CONCURRENTLY body; ADR-0052 D-G); DSN missing ⇒ not_applicable
-//!   naming the missing object, never a silent skip; a second run is idempotent]
-//! Spec: Baseline §46; ADR-0050; ADR-0052
+//!   naming the missing object, never a silent skip; a second run is idempotent; 0011 pending with one of its
+//!   roles missing is refused unless --dev-placeholder-roles (ADR-0059 D-A), so no deployment ever creates a
+//!   role with a repository placeholder password]
+//! Spec: Baseline §46; ADR-0050; ADR-0052; ADR-0059
 //!
 //! xtask `migrate` — applies `migrations/*.sql` in filename order against a live PostgreSQL
 //! instance (§46 migration safety). DSN comes from `--dsn <url>` or `HUMAUX_TEST_PG_DSN`;
@@ -233,15 +235,103 @@ fn run_check(
     }
 }
 
+/// The migration whose `CREATE ROLE ... IF NOT EXISTS` blocks carry the repository's dev-only
+/// placeholder passwords (ADR-0059 D-A).
+const ROLES_MIGRATION: &str = "0011_roles_and_grants";
+
+/// ADR-0059 D-A: the only way to let [`ROLES_MIGRATION`] create a missing role with its
+/// repository placeholder password. Meant for a brand-new dev container, never a deployment.
+const DEV_PLACEHOLDER_ROLES_FLAG: &str = "--dev-placeholder-roles";
+
+/// The role names `sql` creates, in order (`CREATE ROLE <name> ...`). Names only: nothing after the
+/// name is read, so no password literal ever leaves the file through this function.
+fn created_role_names(sql: &str) -> Vec<String> {
+    sql.split("CREATE ROLE ")
+        .skip(1)
+        .filter_map(|rest| {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// ADR-0059 D-A, fresh-cluster guard: when [`ROLES_MIGRATION`] is about to run and one of the roles
+/// it creates does not exist yet, applying it would create that role LOGIN with a password
+/// published in the repository. Refused unless the operator passed [`DEV_PLACEHOLDER_ROLES_FLAG`];
+/// production pre-provisions the roles with `humaux-maintenance roles rotate --create-missing`.
+fn placeholder_role_guard(
+    roles_migration_pending: bool,
+    missing_roles: &[String],
+    dev_placeholder_roles: bool,
+) -> Result<(), String> {
+    match missing_roles.first() {
+        Some(role) if roles_migration_pending && !dev_placeholder_roles => Err(format!(
+            "missing object: role {role} — pre-provision with 'humaux-maintenance roles rotate \
+             --create-missing --roles-sql migrations/0011_roles_and_grants.sql' (runbook §2) or pass {DEV_PLACEHOLDER_ROLES_FLAG} (dev clusters \
+             only); 0 applied"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Feeds [`placeholder_role_guard`] from the target cluster: whether [`ROLES_MIGRATION`] is in this
+/// run and not yet recorded, and which of its roles are absent from `pg_roles`.
+fn check_placeholder_roles(
+    client: &mut Client,
+    migrations: &[PendingMigration],
+    dev_placeholder_roles: bool,
+) -> Result<(), String> {
+    let Some(roles) = migrations
+        .iter()
+        .find(|m| m.migration_id == ROLES_MIGRATION)
+    else {
+        return Ok(());
+    };
+    let query = |e: postgres::Error| format!("placeholder-role guard: {}", db_error_text(&e));
+    // dep: PostgreSQL(any) — ledger and pg_roles reads for the fresh-cluster guard
+    // The ledger is bootstrapped later, under the same lock: no table yet = nothing applied.
+    let ledger: bool = client
+        .query_one(
+            "SELECT to_regclass('ops.schema_migrations') IS NOT NULL",
+            &[],
+        )
+        .map_err(query)?
+        .get(0);
+    let pending = !ledger
+        || client
+            .query_opt(
+                "SELECT 1 FROM ops.schema_migrations WHERE migration_id = $1",
+                &[&ROLES_MIGRATION],
+            )
+            .map_err(query)?
+            .is_none();
+    let missing: Vec<String> = client
+        .query(
+            "SELECT n FROM unnest($1::text[]) WITH ORDINALITY AS u(n, i) \
+             WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = n) ORDER BY i",
+            &[&created_role_names(&roles.sql)],
+        )
+        .map_err(query)?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    placeholder_role_guard(pending, &missing, dev_placeholder_roles)
+}
+
 /// Applies every not-yet-recorded migration in order under [`MIGRATE_ADVISORY_LOCK`]; stops
 /// at the first failure (a later migration may depend on an earlier one's objects, so
 /// partial-then-continue would mask the real error behind a cascade of unrelated ones).
 /// `lock_timeout` is a PostgreSQL interval literal ([`LOCK_TIMEOUT`] in production; tests
-/// pass `1s`). Returns `(applied, skipped)` counts.
+/// pass `1s`). `dev_placeholder_roles` is [`DEV_PLACEHOLDER_ROLES_FLAG`] (ADR-0059 D-A guard, checked
+/// under the lock before anything is applied). Returns `(applied, skipped)` counts.
 fn apply_all(
     client: &mut Client,
     migrations: &[PendingMigration],
     lock_timeout: &str,
+    dev_placeholder_roles: bool,
 ) -> Result<(usize, usize), String> {
     client
         .batch_execute(&format!("SET lock_timeout = '{lock_timeout}'"))
@@ -258,7 +348,8 @@ fn apply_all(
                 format!("cannot take HXMIGRAT advisory lock: {}", db_error_text(&e))
             }
         })?;
-    let result = apply_locked(client, migrations);
+    let result = check_placeholder_roles(client, migrations, dev_placeholder_roles)
+        .and_then(|()| apply_locked(client, migrations));
     // Explicit release; a dropped connection releases it too. An unlock error cannot change
     // what was applied, so it never masks `result`.
     let _ = client.execute("SELECT pg_advisory_unlock($1)", &[&MIGRATE_ADVISORY_LOCK]);
@@ -457,7 +548,12 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
-    match apply_all(&mut client, &migrations, LOCK_TIMEOUT) {
+    match apply_all(
+        &mut client,
+        &migrations,
+        LOCK_TIMEOUT,
+        args.iter().any(|a| a == DEV_PLACEHOLDER_ROLES_FLAG),
+    ) {
         Ok((applied, skipped)) => {
             eprintln!(
                 "migrate: pass ({applied} applied, {skipped} already-applied, {} total)",
@@ -630,6 +726,80 @@ mod tests {
         }
     }
 
+    /// T27 (ADR-0059 D-A): a fresh cluster never gets a placeholder-password role unless the dev flag
+    /// says so; an applied 0011 or a cluster that already has every role passes.
+    #[test]
+    fn placeholder_role_guard_refuses_fresh_cluster_without_dev_flag() {
+        let missing = vec!["role_gateway".to_owned()];
+        let err = placeholder_role_guard(true, &missing, false).expect_err("fresh cluster");
+        assert!(err.contains("missing object: role role_gateway"), "{err}");
+        assert!(err.contains("roles rotate --create-missing"), "{err}");
+        assert!(placeholder_role_guard(true, &missing, true).is_ok());
+        assert!(placeholder_role_guard(false, &missing, false).is_ok());
+        assert!(placeholder_role_guard(true, &[], false).is_ok());
+    }
+
+    /// The guard reads the role names from the real 0011 body: all eight, names only.
+    #[test]
+    fn created_role_names_reads_the_eight_0011_roles() {
+        let sql = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations/0011_roles_and_grants.sql"),
+        )
+        .expect("0011 body");
+        let names = created_role_names(&sql);
+        assert_eq!(names.len(), 8, "{names:?}");
+        assert!(names.iter().all(|n| n.starts_with("role_")), "{names:?}");
+        assert!(
+            names.contains(&"role_migration_owner".to_owned()),
+            "{names:?}"
+        );
+    }
+
+    /// The DB half of T27: on the real cluster 0011's roles all exist, so a pending 0011 passes
+    /// without the flag (existing clusters and lane databases are unaffected).
+    #[test]
+    fn placeholder_role_guard_passes_on_a_cluster_that_has_the_roles() {
+        let Some((_db, dsn)) = throwaway("guard", "placeholder_role_guard") else {
+            return;
+        };
+        // dep: PostgreSQL(any) — the throwaway database of this test
+        let mut client = Client::connect(&dsn, NoTls).expect("throwaway connect");
+        let migrations =
+            collect_migrations(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations"))
+                .expect("collect");
+        check_placeholder_roles(&mut client, &migrations, false)
+            .expect("every 0011 role exists cluster-wide");
+    }
+
+    /// T27 wiring (ADR-0059 D-A, fault 12(a)): `apply_all` itself consults the guard — a pending
+    /// 0011 that would create a role absent from `pg_roles` is refused before anything runs and the
+    /// role is not created. The pure-function test above stays green when the guard call inside
+    /// `check_placeholder_roles` (or its call in `apply_all`) is dropped; this one goes red.
+    #[test]
+    fn migrate_refuses_a_pending_roles_migration_whose_role_is_missing() {
+        let Some((_db, dsn)) = throwaway("guard_wiring", "guard_wiring") else {
+            return;
+        };
+        let role = format!("role_c33_absent_{}", std::process::id());
+        // dep: PostgreSQL(any) — the throwaway database of this test
+        let mut client = Client::connect(&dsn, NoTls).expect("throwaway connect");
+        let roles = migration(ROLES_MIGRATION, &format!("CREATE ROLE {role} NOLOGIN;"));
+        let result = apply_all(&mut client, &[roles], "1s", false);
+        let created = scalar_bool(
+            &mut client,
+            &format!("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}')"),
+        );
+        if created {
+            let _ = client.batch_execute(&format!("DROP ROLE {role}"));
+        }
+        let err = result.expect_err("a fresh-cluster 0011 is refused without the dev flag");
+        assert!(
+            err.contains(&format!("missing object: role {role}")),
+            "{err}"
+        );
+        assert!(!created, "the guard must refuse before 0011 creates {role}");
+    }
+
     #[test]
     fn collect_migrations_sorts_by_filename() {
         let dir =
@@ -730,7 +900,7 @@ mod tests {
         ];
 
         let (applied, skipped) =
-            apply_all(&mut client, &migrations, LOCK_TIMEOUT).expect("clean apply");
+            apply_all(&mut client, &migrations, LOCK_TIMEOUT, false).expect("clean apply");
         assert_eq!((applied, skipped), (2, 0), "first run applies both");
         let migration_table_owner: String = client
             .query_one(
@@ -746,7 +916,7 @@ mod tests {
         );
 
         let (applied, skipped) =
-            apply_all(&mut client, &migrations, LOCK_TIMEOUT).expect("idempotent re-apply");
+            apply_all(&mut client, &migrations, LOCK_TIMEOUT, false).expect("idempotent re-apply");
         assert_eq!(
             (applied, skipped),
             (0, 2),
@@ -766,7 +936,7 @@ mod tests {
             &id_bad,
             &format!("CREATE TABLE {schema}.u (id int); INSERT INTO {schema}.u VALUES (1/0);"),
         )];
-        let err = apply_all(&mut client, &bad, LOCK_TIMEOUT)
+        let err = apply_all(&mut client, &bad, LOCK_TIMEOUT, false)
             .expect_err("a runtime-failing statement must fail, not silently pass");
         assert!(
             err.contains(&id_bad),
@@ -828,7 +998,7 @@ mod tests {
         // dep: PostgreSQL(any) — disposable database — split apply up to 0137.
         let mut client = Client::connect(&test_dsn, NoTls).expect("connect disposable database");
         let (applied, skipped) =
-            apply_all(&mut client, before, LOCK_TIMEOUT).expect("apply through 0136");
+            apply_all(&mut client, before, LOCK_TIMEOUT, false).expect("apply through 0136");
         assert_eq!(
             (applied, skipped),
             (before.len(), 0),
@@ -847,7 +1017,7 @@ mod tests {
             manifest: exact.manifest.clone(),
             transaction: None,
         };
-        let error = apply_all(&mut client, &[failed], LOCK_TIMEOUT)
+        let error = apply_all(&mut client, &[failed], LOCK_TIMEOUT, false)
             .expect_err("exact 0137 candidate must fail");
         assert!(
             error.contains(&failed_id),
@@ -872,8 +1042,13 @@ mod tests {
             "failed candidate must not enter ledger"
         );
 
-        let (applied, skipped) = apply_all(&mut client, std::slice::from_ref(exact), LOCK_TIMEOUT)
-            .expect("apply untouched exact 0137");
+        let (applied, skipped) = apply_all(
+            &mut client,
+            std::slice::from_ref(exact),
+            LOCK_TIMEOUT,
+            false,
+        )
+        .expect("apply untouched exact 0137");
         assert_eq!((applied, skipped), (1, 0), "untouched 0137 applies once");
         assert_exact_manifest_boolean(&mut client, "postcheck", true);
         // Migrations authored after 0137 must be applied before the replay assertion below.
@@ -881,15 +1056,15 @@ mod tests {
         // later migration would show up as a fresh apply during the replay and turn the
         // zero-apply assertion red for a reason that has nothing to do with 0137's residue.
         let after = &migrations[split + 1..];
-        let (applied, skipped) = apply_all(&mut client, after, LOCK_TIMEOUT)
+        let (applied, skipped) = apply_all(&mut client, after, LOCK_TIMEOUT, false)
             .expect("apply migrations authored after 0137");
         assert_eq!(
             (applied, skipped),
             (after.len(), 0),
             "post-0137 migrations apply exactly once"
         );
-        let (applied, skipped) =
-            apply_all(&mut client, &migrations, LOCK_TIMEOUT).expect("replay exact migration set");
+        let (applied, skipped) = apply_all(&mut client, &migrations, LOCK_TIMEOUT, false)
+            .expect("replay exact migration set");
         assert_eq!(
             (applied, skipped),
             (0, migrations.len()),
@@ -926,7 +1101,7 @@ mod tests {
         // dep: PostgreSQL(any) — throwaway c25 database — apply 0001→head executing every manifest check.
         let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
         let started = Instant::now();
-        let (applied, skipped) = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+        let (applied, skipped) = apply_all(&mut client, &migrations, LOCK_TIMEOUT, false)
             .unwrap_or_else(|e| panic!("0001→head with every manifest check: {e}"));
         eprintln!(
             "migrate test: 0001→head applied {applied} migrations, {} checks, in {:.1}s",
@@ -982,7 +1157,7 @@ mod tests {
                 Some((pre, post)),
             );
             let migrations = collect_migrations(&dir).expect("scratch dir");
-            let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+            let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT, false)
                 .expect_err("a failing check must refuse the migration");
             assert!(
                 err.contains(&stem) && err.contains(field) && err.contains(reason),
@@ -1012,7 +1187,8 @@ mod tests {
         let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
         let mut m = migration("0001_c25_nonbool", "CREATE TABLE c25_nonbool (id int)");
         m.manifest = Some(manifest(&m.migration_id, "select 1", "select true"));
-        let err = apply_all(&mut client, &[m], LOCK_TIMEOUT).expect_err("int is not a verdict");
+        let err =
+            apply_all(&mut client, &[m], LOCK_TIMEOUT, false).expect_err("int is not a verdict");
         assert!(
             err.contains("precheck") && err.contains("expected bool"),
             "{err}"
@@ -1039,7 +1215,7 @@ mod tests {
         };
         // dep: PostgreSQL(any) — throwaway c25 database — apply_all under the advisory lock.
         let mut client = Client::connect(&dsn, NoTls).expect("connect throwaway");
-        let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+        let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT, false)
             .expect_err("a pending migration without a manifest is refused");
         assert!(err.contains("no manifest"), "{err}");
         assert!(scalar_bool(
@@ -1093,7 +1269,7 @@ mod tests {
             Some(("select true", "select true")),
         );
         let migrations = collect_migrations(&dir).expect("scratch dir");
-        let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+        let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT, false)
             .expect_err("CIC inside a transaction block must be refused by the server");
         assert!(
             err.contains("0002_c27_cic") && err.contains("25001"),
@@ -1108,8 +1284,8 @@ mod tests {
         write_migration_tx(&dir, "0002_c27_cic", cic, "\"none\"");
         let migrations = collect_migrations(&dir).expect("scratch dir");
         assert_eq!(migrations[1].transaction.as_deref(), Some("none"));
-        let (applied, skipped) =
-            apply_all(&mut client, &migrations, LOCK_TIMEOUT).expect("transaction=none applies");
+        let (applied, skipped) = apply_all(&mut client, &migrations, LOCK_TIMEOUT, false)
+            .expect("transaction=none applies");
         assert_eq!((applied, skipped), (1, 1));
         assert!(scalar_bool(
             &mut client,
@@ -1118,7 +1294,7 @@ mod tests {
              AND (SELECT count(*) = 1 FROM ops.schema_migrations WHERE migration_id = '0002_c27_cic')"
         ));
         assert_eq!(
-            apply_all(&mut client, &migrations, LOCK_TIMEOUT).expect("replay"),
+            apply_all(&mut client, &migrations, LOCK_TIMEOUT, false).expect("replay"),
             (0, 2),
             "a second run applies nothing"
         );
@@ -1143,7 +1319,7 @@ mod tests {
             "\"none\"",
         );
         let migrations = collect_migrations(&dir).expect("scratch dir");
-        let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+        let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT, false)
             .expect_err("a non-CONCURRENTLY transaction=none body is refused");
         assert!(
             err.contains("0001_c27_plain") && err.contains("requires a CONCURRENTLY body"),
@@ -1179,7 +1355,7 @@ mod tests {
                 value,
             );
             let migrations = collect_migrations(&dir).expect("scratch dir");
-            let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT)
+            let err = apply_all(&mut client, &migrations, LOCK_TIMEOUT, false)
                 .expect_err("an unknown transaction value is refused");
             assert!(
                 err.contains(&stem) && err.contains("the only accepted value"),
@@ -1213,7 +1389,7 @@ mod tests {
         a.execute("SELECT pg_advisory_lock($1)", &[&MIGRATE_ADVISORY_LOCK])
             .expect("A takes HXMIGRAT");
         let ms = [migration("0001_c25_lock", "CREATE TABLE c25_lock (id int)")];
-        let err = apply_all(&mut b, &ms, "1s").expect_err("B must not interleave with A");
+        let err = apply_all(&mut b, &ms, "1s", false).expect_err("B must not interleave with A");
         assert!(err.contains("55P03") && err.contains("0 applied"), "{err}");
         assert!(
             scalar_bool(&mut b, "SELECT to_regclass('c25_lock') IS NULL"),
@@ -1222,7 +1398,7 @@ mod tests {
         a.execute("SELECT pg_advisory_unlock($1)", &[&MIGRATE_ADVISORY_LOCK])
             .expect("A releases");
         assert_eq!(
-            apply_all(&mut b, &ms, "1s").expect("B applies after A"),
+            apply_all(&mut b, &ms, "1s", false).expect("B applies after A"),
             (1, 0)
         );
 
@@ -1239,7 +1415,7 @@ mod tests {
                 std::thread::spawn(move || {
                     // dep: PostgreSQL(any) — throwaway c25 database — one of the concurrent migrate racers.
                     let mut c = Client::connect(&dsn, NoTls).expect("racer connects");
-                    apply_all(&mut c, &slow, LOCK_TIMEOUT)
+                    apply_all(&mut c, &slow, LOCK_TIMEOUT, false)
                 })
             })
             .collect();

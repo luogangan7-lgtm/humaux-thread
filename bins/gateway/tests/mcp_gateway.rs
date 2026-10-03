@@ -28,7 +28,8 @@
 //!   HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND,
 //!   HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS,
 //!   HUMAUX_GATEWAY_REPLAY_TTL_SECONDS, HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS,
-//!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS, HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS,
+//!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K, HUMAUX_GATEWAY_TOKEN_HMAC_KEY, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS,
+//!   HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS,
 //!   HUMAUX_GATEWAY_UNKNOWN, HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
 //!   HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN, HUMAUX_TEST_QDRANT_PORT];
 //!   modules=[adapters::confirm_token_repo, adapters::consolidate_repo, adapters::context_repo,
@@ -187,6 +188,7 @@ fn guard(runtime: RuntimeDbPool) -> Arc<GatewayGuard> {
             runtime,
             GuardSettings {
                 credential_pepper: SYNTHETIC_CREDENTIAL_PEPPER.to_vec(),
+                credential_pepper_previous: None,
                 trusted_proxies: TrustedProxyConfig {
                     trusted_proxy_cidrs: vec![],
                     max_forwarded_hops: 1,
@@ -5529,6 +5531,16 @@ fn native_mcp_gateway_commit_ack_loss_is_unknown_and_replays_the_committed_recei
 }
 
 const GATEWAY_ENV_PREFIX: &str = "HUMAUX_GATEWAY_";
+
+/// 32 bytes from the OS CSPRNG, hex-encoded, for the spawned gateway's token MAC key.
+fn generated_token_hmac_key_hex() -> String {
+    use std::io::Read as _;
+    let mut key = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut urandom| urandom.read_exact(&mut key))
+        .expect("read 32 bytes from /dev/urandom");
+    hex::encode(key)
+}
 const GATEWAY_PROCESS_START_TIMEOUT: Duration = Duration::from_secs(5);
 /// Must exceed `bins/gateway/src/main.rs`'s `DRAIN_ANNOUNCE_WINDOW` (5s): a graceful stop now
 /// deliberately keeps accepting for that window so `/readyz` can answer 503 to a supervisor that
@@ -5558,6 +5570,11 @@ impl GatewayProcessConfig {
             (
                 "HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX".into(),
                 hex::encode(SYNTHETIC_CREDENTIAL_PEPPER),
+            ),
+            // ADR-0059 D-G: a per-run generated token MAC key, never a literal and never printed.
+            (
+                "HUMAUX_GATEWAY_TOKEN_HMAC_KEY".into(),
+                generated_token_hmac_key_hex(),
             ),
             ("HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS".into(), String::new()),
             ("HUMAUX_GATEWAY_MAX_FORWARDED_HOPS".into(), "1".into()),

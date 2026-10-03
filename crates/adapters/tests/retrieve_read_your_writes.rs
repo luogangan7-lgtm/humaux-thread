@@ -1,13 +1,13 @@
 //! `adapters::tests::retrieve_read_your_writes` — T3.8 (§15.5) integration test — `retrieve::recall_with_overlay`
 //!   against a real Postgres.
-//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, humaux-testkit, postgres, serde_json, sqlx,
+//! Depends-on: crates=[hex, humaux-adapters, humaux-domain, humaux-projection, humaux-testkit, postgres, serde_json, sqlx,
 //!   tokio]; services=[PostgreSQL(owner) r=[ops.commit_seq_seq] w=[control.memberships,
-//!   control.private_reasoning_domains, control.tenants, control.users, control.workspaces, ops.outbox,
+//!   control.private_reasoning_domains, control.tenants, control.users, control.workspaces, ops.jobs, ops.outbox,
 //!   private.artifacts, private.events, private.evidence_objects, private.memory_evidence, private.memory_records,
 //!   projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_gateway), PostgreSQL(role_maintenance),
 //!   PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
 //!   modules=[adapters::forget_repo, adapters::postgres, adapters::read_materialize, adapters::remember,
-//!   adapters::retrieve, adapters::stream_repo, domain::error, domain::evidence, domain::identity, domain::ids,
+//!   adapters::retrieve, adapters::stream_repo, adapters::tests::support::token_keys, domain::error, domain::evidence, domain::identity, domain::ids,
 //!   domain::subject, humaux-testkit, projection::serving, projection::stream]
 //! Called-by: [cargo-test]
 //! Invariants: [seeded rows match exactly what remember() writes; expired, malformed or unissued tokens and
@@ -26,6 +26,8 @@
 //! through `0046_stream_log_evidence_id_via_outbox.sql` not yet applied all print a visible
 //! SKIP and return, never a false pass.
 
+#[path = "support/token_keys.rs"]
+mod token_keys;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -133,8 +135,12 @@ impl Handle {
     fn cleanup(&mut self) -> Result<(), postgres::Error> {
         // A rejected worker transition may leave the owner's explicit transaction aborted.
         // Roll it back before deleting only this fixture's recorded identities and rows.
+        // Card-31 pattern (card 33 leak fix): each remember's EVIDENCE_ACCEPTED row and each PRIMARY
+        // link enqueued a DERIVED_* job (0164 triggers). Jobs go first in the data batch, so a later
+        // failure before the tenant delete (whose cascade was the only job delete) cannot leave them.
         self.admin.batch_execute(&format!(
             "ROLLBACK; \
+             DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
              DELETE FROM private.artifacts WHERE artifact_id IN \
                (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id = '{0}'); \
              DELETE FROM private.memory_evidence WHERE evidence_id IN \
@@ -178,6 +184,7 @@ impl DbIntegrationFixture for RetrieveFixture {
     type Handle = Handle;
 
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
+        token_keys::install();
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
         // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
@@ -1004,7 +1011,7 @@ fn recall_overlay_decision_keeps_token_and_projection_reads_in_one_rr_snapshot()
                 .expect("activate seeded serving version at highwater zero");
             let claims = issued_token_claims(&mut handle, 1);
             let commit_seq = claims.commit_seq;
-            let token = retrieve::issue_consistency_token(&claims);
+            let token = retrieve::issue_consistency_token(&claims).expect("token keys installed");
             let actor_token = token.clone();
             let application_name = format!("recall-rr-{}", Uuid::new_v4().simple());
             let actor_dsn = dsn_with_application_name_and_statement_timeout(
@@ -1092,7 +1099,7 @@ fn remember_then_recall_sees_evidence_with_processing_state_not_memory() {
         |mut handle| {
             let evidence_id = seed_evidence_and_stream_row(&mut handle, 1, "PROCESSING");
             let claims = issued_token_claims(&mut handle, 1);
-            let token = retrieve::issue_consistency_token(&claims);
+            let token = retrieve::issue_consistency_token(&claims).expect("token keys installed");
 
             let envelope = handle
                 .rt
@@ -1130,7 +1137,7 @@ fn settled_evidence_without_memory_link_reports_none_not_fabricated_id() {
         |mut handle| {
             let evidence_id = seed_evidence_and_stream_row(&mut handle, 1, "DONE");
             let claims = issued_token_claims(&mut handle, 1);
-            let token = retrieve::issue_consistency_token(&claims);
+            let token = retrieve::issue_consistency_token(&claims).expect("token keys installed");
 
             let envelope = handle
                 .rt
@@ -1215,7 +1222,8 @@ fn token_used_across_workspace_is_rejected() {
         let mut claims = retrieve::decode_consistency_token(&accepted.consistency_token)
             .expect("real token decodes");
         claims.workspace_id = Some(Uuid::new_v4());
-        let malformed_scope_token = retrieve::issue_consistency_token(&claims);
+        let malformed_scope_token =
+            retrieve::issue_consistency_token(&claims).expect("token keys installed");
         let result = handle.rt.block_on(retrieve::recall_with_overlay(
             &handle.gateway,
             &malformed_scope_token,
@@ -1255,7 +1263,7 @@ fn expired_token_is_rejected() {
     run_db_fixture::<RetrieveFixture, _>("expired_token_is_rejected", |handle| {
         let mut claims = token_claims(&handle, 1);
         claims.expires_at = OffsetDateTime::now_utc() - std::time::Duration::from_secs(1);
-        let token = retrieve::issue_consistency_token(&claims);
+        let token = retrieve::issue_consistency_token(&claims).expect("token keys installed");
         let result = handle.rt.block_on(retrieve::recall_with_overlay(
             &handle.gateway,
             &token,
@@ -1264,6 +1272,60 @@ fn expired_token_is_rejected() {
         ));
         assert!(matches!(result, Err(RetrieveError::TokenExpired)));
     });
+}
+
+/// §15.5 / ADR-0059 D-G (T29, card 33 acceptance on the production path): a real issued token with
+/// its expires_at edited, kid and MAC kept, is refused by `recall_with_overlay` as malformed; the
+/// untampered token is served.
+#[test]
+fn tampered_expires_at_refused_through_recall_with_overlay() {
+    run_db_fixture::<RetrieveFixture, _>(
+        "tampered_expires_at_refused_through_recall_with_overlay",
+        |handle| {
+            let accepted = handle
+                .rt
+                .block_on(remember::remember(
+                    &handle.gateway,
+                    remember_command(
+                        &handle,
+                        "tampered expiry",
+                        OffsetDateTime::now_utc() + std::time::Duration::from_secs(300),
+                    ),
+                ))
+                .expect("real remember must accept the Evidence");
+            let signed = String::from_utf8(hex::decode(&accepted.consistency_token).unwrap())
+                .expect("token is utf8");
+            let mut fields: Vec<String> = signed.split('\u{1}').map(str::to_string).collect();
+            assert_eq!(fields.len(), 13, "v1 token = 11 fields + kid + mac");
+            let extended: i64 = fields[10].parse::<i64>().unwrap() + 86_400;
+            fields[10] = extended.to_string();
+            let tampered = hex::encode(fields.join("\u{1}"));
+
+            let refused = handle.rt.block_on(retrieve::recall_with_overlay(
+                &handle.gateway,
+                &tampered,
+                &handle.auth,
+                &handle.family,
+            ));
+            assert!(
+                matches!(
+                    refused,
+                    Err(RetrieveError::TokenMalformed("token signature"))
+                ),
+                "tampered expires_at must fail the MAC, got {refused:?}"
+            );
+            let served = handle.rt.block_on(retrieve::recall_with_overlay(
+                &handle.gateway,
+                &accepted.consistency_token,
+                &handle.auth,
+                &handle.family,
+            ));
+            assert!(
+                served.is_ok(),
+                "untampered token must be served, got {served:?}"
+            );
+        },
+    );
 }
 
 /// Seeds N `private.memory_records` rows and links every one of them to `evidence_id` via
@@ -1315,7 +1377,7 @@ fn evidence_with_two_memories_reports_one_candidate_with_both_ids() {
             let evidence_id = seed_evidence_and_stream_row(&mut handle, 1, "DONE");
             let memory_ids = link_memories_to_evidence(&mut handle, evidence_id, 2);
             let claims = issued_token_claims(&mut handle, 1);
-            let token = retrieve::issue_consistency_token(&claims);
+            let token = retrieve::issue_consistency_token(&claims).expect("token keys installed");
 
             let envelope = handle
                 .rt
@@ -1379,7 +1441,8 @@ fn same_tenant_other_user_cannot_read_private_overlay_evidence() {
                     &[&evidence_id, &handle.user_id],
                 )
                 .expect("make seed private to the authenticated user");
-            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1));
+            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1))
+                .expect("token keys installed");
             let owner = handle
                 .rt
                 .block_on(retrieve::recall_with_overlay(
@@ -1457,7 +1520,7 @@ fn unauthorized_workspace_token_is_rejected_by_scope_narrowing() {
             );
             let result = handle.rt.block_on(retrieve::recall_with_overlay(
                 &handle.gateway,
-                &retrieve::issue_consistency_token(&claims),
+                &retrieve::issue_consistency_token(&claims).expect("token keys installed"),
                 &handle.auth,
                 &family,
             ));
@@ -1472,7 +1535,8 @@ fn token_cannot_forge_a_different_trusted_stream_family() {
         "token_cannot_forge_a_different_trusted_stream_family",
         |mut handle| {
             let evidence_id = seed_evidence_and_stream_row(&mut handle, 1, "ISSUED");
-            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1));
+            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1))
+                .expect("token keys installed");
             let forged_family = StreamFamily::new(
                 TenantId(handle.tenant_id),
                 SCOPE_KIND,
@@ -1533,7 +1597,7 @@ fn forged_sequence_or_unregistered_version_is_rejected() {
             sequence_claims.stream_seq = 2;
             let sequence_result = handle.rt.block_on(retrieve::recall_with_overlay(
                 &handle.gateway,
-                &retrieve::issue_consistency_token(&sequence_claims),
+                &retrieve::issue_consistency_token(&sequence_claims).expect("token keys installed"),
                 &handle.auth,
                 &handle.family,
             ));
@@ -1554,7 +1618,7 @@ fn forged_sequence_or_unregistered_version_is_rejected() {
             version_claims.projection_version = "unregistered-v2".to_string();
             let version_result = handle.rt.block_on(retrieve::recall_with_overlay(
                 &handle.gateway,
-                &retrieve::issue_consistency_token(&version_claims),
+                &retrieve::issue_consistency_token(&version_claims).expect("token keys installed"),
                 &handle.auth,
                 &handle.family,
             ));
@@ -1620,7 +1684,7 @@ fn registered_nonserving_old_version_uses_full_pg_overlay() {
                 .rt
                 .block_on(retrieve::recall_with_overlay(
                     &handle.gateway,
-                    &retrieve::issue_consistency_token(&claims),
+                    &retrieve::issue_consistency_token(&claims).expect("token keys installed"),
                     &handle.auth,
                     &handle.family,
                 ))
@@ -1642,7 +1706,8 @@ fn revoked_memory_and_tombstoned_evidence_are_finally_filtered() {
         |mut handle| {
             let evidence_id = seed_evidence_and_stream_row(&mut handle, 1, "DONE");
             let memory_id = link_memories_to_evidence(&mut handle, evidence_id, 1)[0];
-            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1));
+            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1))
+                .expect("token keys installed");
             let before_revoke = handle
                 .rt
                 .block_on(retrieve::recall_with_overlay(
@@ -1728,7 +1793,8 @@ fn final_materialize_returns_real_memory_and_processing_event_bodies() {
         |mut handle| {
             let evidence_id = seed_evidence_and_stream_row(&mut handle, 1, "PROCESSING");
             let memory_id = link_memories_to_evidence(&mut handle, evidence_id, 1)[0];
-            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1));
+            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1))
+                .expect("token keys installed");
             let envelope = handle
                 .rt
                 .block_on(retrieve::recall_with_overlay(
@@ -1785,7 +1851,8 @@ fn final_materialize_rechecks_private_evidence_for_the_current_user() {
                     &[&evidence_id, &handle.user_id],
                 )
                 .expect("make Evidence private");
-            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1));
+            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1))
+                .expect("token keys installed");
             let owner = handle
                 .rt
                 .block_on(retrieve::recall_with_overlay(
@@ -1838,7 +1905,8 @@ fn final_materialize_drops_memory_with_a_hidden_linked_source() {
         |mut handle| {
             let visible_evidence = seed_evidence_and_stream_row(&mut handle, 1, "PROCESSING");
             let memory_id = link_memories_to_evidence(&mut handle, visible_evidence, 1)[0];
-            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1));
+            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1))
+                .expect("token keys installed");
             let envelope = handle
                 .rt
                 .block_on(retrieve::recall_with_overlay(
@@ -1908,7 +1976,8 @@ fn final_materialize_binds_overlay_to_the_validated_projection_version() {
         "final_materialize_binds_overlay_to_the_validated_projection_version",
         |mut handle| {
             let evidence_id = seed_evidence_and_stream_row(&mut handle, 1, "PROCESSING");
-            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1));
+            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1))
+                .expect("token keys installed");
             let envelope = handle
                 .rt
                 .block_on(retrieve::recall_with_overlay(
@@ -1953,7 +2022,8 @@ fn final_materialize_excludes_secret_memory_source_and_marks_artifact_unavailabl
         |mut handle| {
             let evidence_id = seed_evidence_and_stream_row(&mut handle, 1, "PROCESSING");
             let memory_id = link_memories_to_evidence(&mut handle, evidence_id, 1)[0];
-            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1));
+            let token = retrieve::issue_consistency_token(&issued_token_claims(&mut handle, 1))
+                .expect("token keys installed");
             let envelope = handle
                 .rt
                 .block_on(retrieve::recall_with_overlay(
@@ -2082,7 +2152,7 @@ fn retired_seq_leaves_the_overlay_and_enters_the_contiguous_prefix() {
                 .expect("activate the seeded version at the pinned prefix");
 
             let claims = issued_token_claims(&mut handle, 3);
-            let token = retrieve::issue_consistency_token(&claims);
+            let token = retrieve::issue_consistency_token(&claims).expect("token keys installed");
             let before = handle
                 .rt
                 .block_on(retrieve::recall_with_overlay(
@@ -2215,7 +2285,7 @@ fn an_evidence_with_a_lifecycle_row_surfaces_once_as_its_newest_row() {
             let evidence_id = seed_evidence_and_stream_row(&mut handle, 1, "DONE");
             append_lifecycle_row(&mut handle, evidence_id, 2, "ISSUED");
             let claims = issued_token_claims(&mut handle, 2);
-            let token = retrieve::issue_consistency_token(&claims);
+            let token = retrieve::issue_consistency_token(&claims).expect("token keys installed");
 
             let envelope = handle
                 .rt

@@ -482,9 +482,8 @@ fn live_role_acl_and_read_only_attempt_are_exact() {
     ];
     let mut admin = fixture.admin();
     for role in roles {
-        let password = format!("devlocal_{role}");
         let mut client = fixture
-            .try_gateway_as(role, &password, "continuity_w2_live_acl")
+            .try_gateway_as(role, "continuity_w2_live_acl")
             .unwrap_or_else(|error| panic!("{role} must be a live LOGIN role: {error}"));
         let actual: String = client.query_one("SELECT current_user", &[]).unwrap().get(0);
         assert_eq!(actual, role);

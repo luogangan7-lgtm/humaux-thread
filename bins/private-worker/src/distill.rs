@@ -12,8 +12,9 @@
 //!   refused retry settles as its exhausted budget; memories, run completion, job settle and outbox flip commit in
 //!   one generation-fenced transaction; only a fence refusal is a lost lease, an escaped error is ERROR (ADR-0058
 //!   R3); an invalid inferred affect drops the reply's affects, never its memories (R1); a drain names why it stopped,
-//!   no_slot or no_work (R5)]
-//! Spec: Baseline §16.1.1; §10.1; ADR-0016; §15.7; §67.2; §11; ADR-0058
+//!   no_slot or no_work (R5); a route whose credential reference is not in the worker's key map is NOT_READY
+//!   CREDENTIAL_NOT_MAPPED before any ledger row or provider call (ADR-0059 D-I)]
+//! Spec: Baseline §16.1.1; §10.1; ADR-0016; §15.7; §67.2; §11; ADR-0058; ADR-0059
 //!
 //! One job (ADR-0058 D-C): take the job's own outbox row, (a) check the Evidence still names the
 //! job's reasoning domain, resolve the admitted Distill route, load the Evidence, record the
@@ -39,6 +40,7 @@
 //! as a no-op when the answer was "nothing memorable", `projection_worker` D6).
 
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,6 +103,10 @@ pub struct DistillDispatchConfig {
     pub max_attempts: i32,
     /// §72.3 tenant distill budget every request passes before it may leave (ADR-0058 D-T).
     pub budget: jobs::DistillCallBudget,
+    /// The credential references this process's key map holds (`HUMAUX_PRIVATE_WORKER_CREDENTIALS`,
+    /// ADR-0059 D-I). An admitted route whose reference is not here is NOT_READY
+    /// [`CREDENTIAL_NOT_MAPPED`] before anything is reserved. Empty = every route parks.
+    pub credential_refs: BTreeSet<Uuid>,
 }
 
 /// ADR-0058 R2: the `ops.provider_slots` rows `migrations/0190_distill_dispatch_v2.sql` seeds
@@ -367,6 +373,8 @@ fn payload_identity(payload: &Value) -> Option<(Uuid, Uuid)> {
 /// The static NOT_READY class for a tenant whose `(domain, PRIVATE_DISTILL_TEXT)` binding has not
 /// been admitted yet — the "onboarded before its route" case.
 const NO_DISTILL_BINDING: &str = "no admitted PRIVATE_DISTILL_TEXT route binding";
+/// ADR-0059 D-I: the admitted route's credential reference is not in this process's key map.
+pub const CREDENTIAL_NOT_MAPPED: &str = "CREDENTIAL_NOT_MAPPED";
 /// ADR-0058 D-D: the Evidence names another reasoning domain than its job.
 const DOMAIN_MISMATCH: &str = "DOMAIN_MISMATCH";
 /// A job payload without the 0164 identity: no Evidence can ever be named for it.
@@ -873,8 +881,12 @@ enum ReadLeg {
     NotReady(&'static str),
 }
 
-/// (a) of the module doc: domain check, binding, admission, Evidence load, processing run
-/// (committed before the call).
+/// (a) of the module doc: domain check, binding, admission, credential check, Evidence load,
+/// processing run (committed before the call).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one read transaction whose NOT_READY gates (domain, binding, admission, credential map) must all precede the reservation; ADR-0058 D-H, ADR-0059 D-I"
+)]
 async fn read_leg(
     dispatcher: &Dispatcher<'_>,
     tenant_id: Uuid,
@@ -921,6 +933,16 @@ async fn read_leg(
             ));
         }
     };
+    // ADR-0058 D-H / ADR-0059 D-I: pre-reserve — a reference the key map does not hold is NOT_READY
+    // here, before any ledger row, `ops.begin_call` or provider call exists.
+    if !dispatcher
+        .dispatch
+        .credential_refs
+        .contains(&admission.locator.credential_ref)
+    {
+        txn.rollback().await?;
+        return Ok(ReadLeg::NotReady(CREDENTIAL_NOT_MAPPED));
+    }
     let Some(evidence) = distill_repo::load_evidence(
         &mut txn,
         tenant_id,
@@ -1603,6 +1625,7 @@ mod tests {
                 window_seconds: 60.0,
                 max_calls: 120,
             },
+            credential_refs: BTreeSet::new(),
         }
     }
 

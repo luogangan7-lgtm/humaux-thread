@@ -409,7 +409,7 @@ and the provider accepts exactly one call (zero, two, another name, non-string a
   join the §11.2 closed set (`ReasoningCapability`, 0195, Baseline §11.2, contract tests byok unit + T23). The
   worker's descriptor capabilities are the required key `HUMAUX_PRIVATE_WORKER_CAPABILITIES` (comma list, no
   default) and `HUMAUX_PRIVATE_WORKER_KEY_ENV` is required (its `MINIMAX_API_KEY` default was a provider name in
-  code, §78.1); profile-driven resolution per binding replaces both in card 33b. The rehearsal profile declares
+  code, §78.1; `_KEY_ENV` is superseded by ADR-0059 D-I, the credential map `HUMAUX_PRIVATE_WORKER_CREDENTIALS`); profile-driven resolution per binding replaces both in card 33b. The rehearsal profile declares
   `STRUCTURED_OUTPUT,TOOL_CALLS,REASONING_SPLIT` because MiniMax documents `tools` and `reasoning_split` but not
   `response_format: json_schema` (R-32 a, research batch 5) — that is the reason for the rehearsal's values, never
   a branch in code; no non-test comment in `byok.rs` or the reasoners names a vendor. The channel is folded into

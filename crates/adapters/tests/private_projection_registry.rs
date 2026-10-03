@@ -2,12 +2,12 @@
 //!   registry.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, humaux-projection, humaux-testkit,
 //!   postgres, serde_json, sqlx, tokio]; services=[PostgreSQL(any) r=[ops.commit_seq_seq] w=[control.memberships,
-//!   control.private_reasoning_domains, control.reasoning_domain_grants, control.tenants, control.users, ops.outbox,
-//!   private.events, private.evidence_objects, private.memory_evidence, private.memory_records,
+//!   control.private_reasoning_domains, control.reasoning_domain_grants, control.tenants, control.users, ops.jobs,
+//!   ops.outbox, private.events, private.evidence_objects, private.memory_evidence, private.memory_records,
 //!   projection.private_memory_points, projection.stream_checkpoints, projection.stream_log],
 //!   PostgreSQL(role_gateway), PostgreSQL(role_retrieval_worker), Qdrant(*)]; env=[HUMAUX_TEST_PG_DSN,
 //!   HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::postgres, adapters::private_projection_registry, adapters::qdrant,
-//!   adapters::read_materialize, adapters::retrieve, domain::authority, domain::dataclass, domain::identity,
+//!   adapters::read_materialize, adapters::retrieve, adapters::tests::support::token_keys, domain::authority, domain::dataclass, domain::identity,
 //!   domain::ids, domain::memory, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
 //!   projection::card, projection::serving]
 //! Called-by: [cargo-test]
@@ -18,6 +18,8 @@
 //! Run explicitly against the isolated migrated fixture:
 //! `cargo test -p humaux-adapters --test private_projection_registry -- --ignored`.
 
+#[path = "support/token_keys.rs"]
+mod token_keys;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -133,7 +135,8 @@ impl Drop for Handle {
         for (tenant_id, user_id) in &self.extra_tenants {
             self.admin
                 .batch_execute(&format!(
-                    "DELETE FROM projection.private_memory_points WHERE tenant_id = '{tenant_id}'; \
+                    "DELETE FROM ops.jobs WHERE tenant_id = '{tenant_id}'; \
+                     DELETE FROM projection.private_memory_points WHERE tenant_id = '{tenant_id}'; \
                      DELETE FROM projection.stream_log WHERE tenant_id = '{tenant_id}'; \
                      DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{tenant_id}'; \
                      DELETE FROM ops.outbox WHERE tenant_id = '{tenant_id}'; \
@@ -143,15 +146,22 @@ impl Drop for Handle {
                      DELETE FROM private.evidence_objects WHERE tenant_id = '{tenant_id}'; \
                      DELETE FROM control.reasoning_domain_grants WHERE reasoning_domain_id IN (SELECT reasoning_domain_id FROM control.private_reasoning_domains WHERE tenant_id = '{tenant_id}'); \
                      DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{tenant_id}'; \
-                     DELETE FROM control.memberships WHERE tenant_id = '{tenant_id}'; \
-                     DELETE FROM control.users WHERE user_id = '{user_id}'; \
-                     DELETE FROM control.tenants WHERE tenant_id = '{tenant_id}';"
+                     DELETE FROM control.memberships WHERE tenant_id = '{tenant_id}';"
                 ))
                 .expect("extra registry fixture cleanup");
+            let _ = self.admin.batch_execute(&format!(
+                "DELETE FROM control.users WHERE user_id = '{user_id}'; \
+                 DELETE FROM control.tenants WHERE tenant_id = '{tenant_id}';"
+            ));
         }
+        // Card-31 pattern (card 33 leak fix): the seeded EVIDENCE_ACCEPTED row and PRIMARY link
+        // enqueued DERIVED_* jobs (0164 triggers). Jobs go first, in one batch with the data rows
+        // (a failure is red); user and tenant rows go in a separate best-effort batch, so a refused
+        // tenant delete can no longer roll the job delete back.
         self.admin
             .batch_execute(&format!(
-                "DELETE FROM projection.private_memory_points WHERE tenant_id = '{0}'; \
+                "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+                 DELETE FROM projection.private_memory_points WHERE tenant_id = '{0}'; \
                  DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
                  DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}'; \
                  DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
@@ -161,12 +171,15 @@ impl Drop for Handle {
                  DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
                  DELETE FROM control.reasoning_domain_grants WHERE reasoning_domain_id IN (SELECT reasoning_domain_id FROM control.private_reasoning_domains WHERE tenant_id = '{0}'); \
                  DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
-                 DELETE FROM control.memberships WHERE tenant_id = '{0}'; \
-                 DELETE FROM control.users WHERE user_id = '{1}'; \
-                 DELETE FROM control.tenants WHERE tenant_id = '{0}';",
-                self.tenant_id, self.user_id
+                 DELETE FROM control.memberships WHERE tenant_id = '{0}';",
+                self.tenant_id
             ))
             .expect("registry fixture cleanup");
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.users WHERE user_id = '{1}'; \
+             DELETE FROM control.tenants WHERE tenant_id = '{0}';",
+            self.tenant_id, self.user_id
+        ));
     }
 }
 
@@ -230,6 +243,7 @@ impl DbIntegrationFixture for RegistryFixture {
     type Handle = Handle;
 
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
+        token_keys::install();
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
         // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
@@ -396,7 +410,8 @@ fn seed_ryw_overlay(handle: &mut Handle, stream_seq: i64) -> (Uuid, String) {
         commit_seq,
         issued_at: now,
         expires_at: now + Duration::from_secs(300),
-    });
+    })
+    .expect("token keys installed");
     (evidence_id, token)
 }
 

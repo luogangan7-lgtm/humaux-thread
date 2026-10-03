@@ -1,6 +1,6 @@
 //! `adapters::tests::selection_snapshot` — T6.3 integration test — `selection_repo` (§20.4) against a real Postgres.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, sqlx, tokio];
-//!   services=[PostgreSQL(owner) w=[control.private_reasoning_domains, control.tenants, ops.selection_snapshot_items,
+//!   services=[PostgreSQL(owner) w=[control.private_reasoning_domains, control.tenants, ops.jobs, ops.selection_snapshot_items,
 //!   ops.selection_snapshots, private.events, private.evidence_objects, private.memory_evidence,
 //!   private.memory_records], PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_TEST_PG_DSN];
 //!   modules=[adapters::postgres, adapters::selection_repo, domain::selection, humaux-testkit]
@@ -112,10 +112,15 @@ struct Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // Best-effort cleanup (CLAUDE.md hard rule ④: this file never touches a schema/table
-        // of its own, only rows it created under its own throwaway tenants).
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM ops.selection_snapshot_items WHERE tenant_id IN ('{0}','{1}'); \
+        // CLAUDE.md hard rule ④: this file never touches a schema/table of its own, only rows it
+        // created under its own throwaway tenants. Card-31 pattern (card 33 leak fix): every PRIMARY
+        // memory_evidence row enqueued a DERIVED_CONSOLIDATE job (0164 trigger), so jobs go first in
+        // one batch with the rows that produced them and a failure is printed; the tenant row goes
+        // in a separate best-effort batch. Before, one batch ending in the tenant delete was rolled
+        // back whole by the still-referencing private_reasoning_domains row (73 PENDING jobs/run).
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id IN ('{0}','{1}'); \
+             DELETE FROM ops.selection_snapshot_items WHERE tenant_id IN ('{0}','{1}'); \
              DELETE FROM ops.selection_snapshots WHERE tenant_id IN ('{0}','{1}'); \
              DELETE FROM private.memory_evidence WHERE memory_id IN \
                (SELECT memory_id FROM private.memory_records WHERE tenant_id IN ('{0}','{1}')); \
@@ -123,7 +128,16 @@ impl Drop for Handle {
              DELETE FROM private.events WHERE event_id IN \
                (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id IN ('{0}','{1}')); \
              DELETE FROM private.evidence_objects WHERE tenant_id IN ('{0}','{1}'); \
-             DELETE FROM control.tenants WHERE tenant_id IN ('{0}','{1}');",
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id IN ('{0}','{1}');",
+            self.tenant_id, self.other_tenant_id
+        )) {
+            eprintln!(
+                "selection_snapshot cleanup failed for tenants {} {}: {error}",
+                self.tenant_id, self.other_tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id IN ('{0}','{1}');",
             self.tenant_id, self.other_tenant_id
         ));
     }

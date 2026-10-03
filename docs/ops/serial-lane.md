@@ -206,7 +206,9 @@ manager outside migrations (the same rule 0011 states for every role). On a dev 
 operator step, after which `live_env.sh` can export `HUMAUX_ADMIN_PG_DSN`:
 
 ```sh
-docker exec humaux-thread-pg psql -U postgres -c "ALTER ROLE role_admin PASSWORD 'devlocal_role_admin'"
+# ADR-0059 D-E: a client-side SCRAM verifier, value printed once (or read from HUMAUX_ROLE_PASSWORD_ADMIN);
+# store it in $HOME/.config/humaux/dev_role_passwords.env, which live_env.sh sources.
+humaux-maintenance roles rotate --roles-sql migrations/0011_roles_and_grants.sql --role role_admin --actor <you> --reason <why> --ticket <id> --step-up-auth <proof>
 ```
 
 Without it the lane reports that group as `NOT RUN (missing object: HUMAUX_ADMIN_PG_DSN

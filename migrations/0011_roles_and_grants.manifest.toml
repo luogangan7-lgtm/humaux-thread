@@ -9,12 +9,14 @@ class = "EXPAND_CONTRACT"
 # `control`'s schema ownership has already been reassigned to role_migration_owner.
 precheck = "select not exists (select 1 from pg_namespace n join pg_roles r on r.oid = n.nspowner where n.nspname = 'control' and r.rolname = 'role_migration_owner') as precheck_ok"
 
+# ADR-0059 D-A (card 33, manifest-only edit; the .sql is byte-identical): 0201 turns the cluster-global
+# role_migration_owner NOLOGIN, so a fresh database migrated on the same cluster must accept it here.
 postcheck = """
 select
   (select count(*) from pg_roles where rolname in (
      'role_gateway','role_private_worker','role_consolidation_worker','role_public_worker',
      'role_retrieval_worker','role_batch_issuer','role_maintenance','role_migration_owner'
-   ) and rolcanlogin and not rolsuper) = 8
+   ) and (rolcanlogin or rolname = 'role_migration_owner') and not rolsuper) = 8
   and (select count(*) from information_schema.role_table_grants
        where table_schema='private' and table_name='ingest_tickets'
          and privilege_type='INSERT' and grantee <> 'role_migration_owner') = 1

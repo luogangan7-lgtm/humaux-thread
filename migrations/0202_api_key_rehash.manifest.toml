@@ -1,0 +1,43 @@
+# §46.1 migration manifest. Card 33 / ADR-0059 D-H: API-key pepper epoch (singleton owner-only
+# table + getter + role_maintenance-only advance), control.api_keys.pepper_epoch, and the epoch-gated,
+# audited rehash-on-use door control.api_key_rehash (role_gateway only). §46 forward-fix
+# (EXPAND_CONTRACT, first free after 0201).
+
+migration_id = "0202_api_key_rehash"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('control.credential_pepper_state') is null
+ and to_regprocedure('control.api_key_rehash(uuid,bytea,bytea)') is null
+ and to_regprocedure('control.audit_event_insert(uuid,timestamp with time zone,uuid,text,text,text,text,text,text,text,text,inet,text,text[],text,text,jsonb)') is not null
+ as precheck_ok
+"""
+
+postcheck = """
+with non_owner(r) as (values ('role_gateway'), ('role_private_worker'), ('role_consolidation_worker'),
+  ('role_public_worker'), ('role_retrieval_worker'), ('role_batch_issuer'), ('role_maintenance'),
+  ('role_admin')),
+fns(sig, executor) as (values
+  ('control.credential_pepper_epoch()', null),
+  ('control.credential_pepper_epoch_advance()', 'role_maintenance'),
+  ('control.api_key_rehash(uuid,bytea,bytea)', 'role_gateway'))
+select
+  (select count(*) = 1 and bool_and(epoch = 0) from control.credential_pepper_state)
+  and exists (select 1 from information_schema.columns
+               where table_schema = 'control' and table_name = 'api_keys'
+                 and column_name = 'pepper_epoch' and is_nullable = 'NO')
+  and (select bool_and(pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+                       and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+                       and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                                        where x.grantee = 0 and x.privilege_type = 'EXECUTE'))
+         and count(*) = 3
+       from fns join pg_proc p on p.oid = to_regprocedure(fns.sig))
+  and (select bool_and(has_function_privilege(n.r, fns.sig, 'EXECUTE') = coalesce(n.r = fns.executor, false))
+       from fns cross join non_owner n)
+  and (select bool_and(not has_table_privilege(n.r, 'control.credential_pepper_state', v))
+       from non_owner n cross join (values ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE')) t(v))
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "DROP FUNCTION control.api_key_rehash(uuid,bytea,bytea); ALTER TABLE control.api_keys DROP COLUMN pepper_epoch; DROP FUNCTION control.credential_pepper_epoch_advance(); DROP FUNCTION control.credential_pepper_epoch(); DROP TABLE control.credential_pepper_state. The gateway then cannot rehash on use (rehash is non-fatal, logged pepper_rehash_failed) and a pepper rotation needs every key re-issued."
+backup_restore_requirement = "none: existing api_keys rows only gain pepper_epoch = 0; no key_hash is changed by the migration."

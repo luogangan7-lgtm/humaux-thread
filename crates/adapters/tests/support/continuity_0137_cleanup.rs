@@ -1,5 +1,5 @@
 //! `adapters::tests::support::continuity_0137_cleanup` — Cleanup owner for the 0137 continuity fixtures: deletes every registered seeded row in dependency order.
-//! Depends-on: crates=[postgres, serde_json, uuid]; services=[PostgreSQL(any) r=[private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects] w=[control.memberships, control.private_reasoning_domains, control.tenants, control.users, control.workspaces, ops.outbox, private.evidence_objects, private.memory_evidence, private.memory_records, projection.stream_log]]; env=[]; modules=[]
+//! Depends-on: crates=[postgres, serde_json, uuid]; services=[PostgreSQL(any) r=[private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects] w=[control.memberships, control.private_reasoning_domains, control.tenants, control.users, control.workspaces, ops.jobs, ops.outbox, private.evidence_objects, private.memory_evidence, private.memory_records, projection.stream_log]]; env=[]; modules=[]
 //! Called-by: [adapters::tests::project_continuity_read_0137, adapters::tests::support::continuity_0137_fixture]
 //! Invariants: [deletes only rows whose ids the fixture registered, in dependency order, so a failed test never
 //!   erases another tenant's continuity data]
@@ -273,6 +273,15 @@ fn delete_event_rows(
     transaction: &mut postgres::Transaction<'_>,
     ledger: &Ledger,
 ) -> Result<(), String> {
+    // Card 33 leak fix: each seeded EVIDENCE_ACCEPTED row enqueued a DERIVED_DISTILL job (0164
+    // trigger). This cleanup runs with session_replication_role = replica, which also skips the
+    // ON DELETE CASCADE from control.tenants, so the jobs are deleted explicitly, in this one
+    // all-or-nothing transaction whose failure is returned (10 orphaned PENDING jobs per run before).
+    execute_delete(
+        transaction,
+        "DELETE FROM ops.jobs WHERE tenant_id=ANY($1)",
+        &[&ledger.tenants],
+    )?;
     execute_delete(
         transaction,
         "DELETE FROM ops.outbox WHERE tenant_id=ANY($1) AND evidence_id=ANY($2)",

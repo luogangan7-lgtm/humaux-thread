@@ -1,7 +1,7 @@
 //! `adapters::tests::contribution_repo` — §12/§13 real-Postgres integration coverage for contribution repository IO.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-testkit, postgres, serde_json, sqlx, tokio];
 //!   services=[PostgreSQL(any) r=[ops.card_c_outbox_fault_, ops.commit_seq_seq] w=[control.private_reasoning_domains,
-//!   control.tenants, ops.outbox, ops.public_release_revocations, private.events, private.evidence_objects,
+//!   control.tenants, ops.jobs, ops.outbox, ops.public_release_revocations, private.events, private.evidence_objects,
 //!   private.memory_evidence, private.memory_records, public.claims, public.provenance_edges, public.source_closure,
 //!   public.sources, public.syntheses, public.synthesis_inputs, staging.contribution_release_sources,
 //!   staging.contribution_releases], PostgreSQL(role_private_worker), PostgreSQL(role_public_worker)];
@@ -78,8 +78,13 @@ impl Drop for Handle {
         let sources = ids(&self.source_ids);
         let claims = ids(&self.claim_ids);
         let syntheses = ids(&self.synthesis_ids);
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM public.source_closure WHERE root_source_id IN ('{sources}') OR claim_id IN ('{claims}') OR synthesis_id IN ('{syntheses}'); \
+        // Card-31 pattern (card 33 leak fix): the seeded PRIMARY memory_evidence link enqueues a
+        // DERIVED_CONSOLIDATE job (0164 trigger). Jobs go first, in one batch with the data rows,
+        // and a failure is printed; the tenant row goes in a separate best-effort batch, so a
+        // refused tenant delete can no longer roll the job delete back.
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{}'; \
+             DELETE FROM public.source_closure WHERE root_source_id IN ('{sources}') OR claim_id IN ('{claims}') OR synthesis_id IN ('{syntheses}'); \
              DELETE FROM public.provenance_edges WHERE source_id IN ('{sources}') OR claim_id IN ('{claims}'); \
              DELETE FROM public.synthesis_inputs WHERE synthesis_id IN ('{syntheses}') OR claim_id IN ('{claims}') OR input_synthesis_id IN ('{syntheses}'); \
              DELETE FROM public.syntheses WHERE synthesis_id IN ('{syntheses}'); \
@@ -93,11 +98,18 @@ impl Drop for Handle {
              DELETE FROM private.memory_evidence WHERE memory_id = '{}'; \
              DELETE FROM private.memory_records WHERE memory_id = '{}'; \
              DELETE FROM private.evidence_objects WHERE evidence_id = '{}'; \
-             DELETE FROM control.private_reasoning_domains WHERE reasoning_domain_id = '{}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{}';",
-            self.tenant_id, self.tenant_id, self.tenant_id, self.tenant_id, self.evidence_id, self.memory_id,
-            self.memory_id, self.evidence_id, self.reasoning_domain_id,
-            self.tenant_id,
+             DELETE FROM control.private_reasoning_domains WHERE reasoning_domain_id = '{}';",
+            self.tenant_id, self.tenant_id, self.tenant_id, self.tenant_id, self.tenant_id, self.evidence_id,
+            self.memory_id, self.memory_id, self.evidence_id, self.reasoning_domain_id,
+        )) {
+            eprintln!(
+                "contribution_repo cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{}';",
+            self.tenant_id
         ));
     }
 }

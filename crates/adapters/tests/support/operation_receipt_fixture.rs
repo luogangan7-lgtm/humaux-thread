@@ -4,14 +4,14 @@
 //!   services=[PostgreSQL(owner) w=[control.api_keys, control.audit_events, control.entitlement_snapshots,
 //!   control.memberships, control.operation_receipts, control.private_reasoning_domains, control.quota_windows,
 //!   control.rate_buckets, control.tenants, control.usage_reservations, control.users, control.workspace_memberships,
-//!   control.workspaces, coord.tasks, ops.outbox, ops.selection_snapshot_items, ops.selection_snapshots,
+//!   control.workspaces, coord.tasks, ops.jobs, ops.outbox, ops.selection_snapshot_items, ops.selection_snapshots,
 //!   private.context_bindings, private.continuity_facet_evidence_links, private.continuity_facet_memory_links,
 //!   private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.events,
 //!   private.evidence_objects, private.memory_evidence, private.memory_records, projection.private_memory_points,
 //!   projection.stream_checkpoints, projection.stream_log, projection.tenant_placements]
 //!   x=[control.check_operation_receipt], PostgreSQL(role_gateway), PostgreSQL(role_maintenance)];
 //!   env=[HUMAUX_GATEWAY_PG_DSN, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres,
-//!   adapters::quota_repo, domain::identity, domain::ids, humaux-testkit]
+//!   adapters::quota_repo, adapters::tests::support::token_keys, domain::identity, domain::ids, humaux-testkit]
 //! Called-by: [adapters::tests::auth_scope_rls, adapters::tests::membership_lifecycle, adapters::tests::operation_receipts, gateway::mcp_application, gateway::tests::continuity_get, gateway::tests::mcp_gateway, gateway::tests::read_decoupling, gateway::tests::semantic_recall_wiring]
 //! Invariants: [test-only, included by #[path]; runtime writes are real role_gateway logins and the owner connection
 //!   only seeds/cleans the fixture tenant; an isolation setup failure is a fixture error]
@@ -20,6 +20,8 @@
 //! This module is test-only and included by relative path; it is not an adapters export or a
 //! replacement for `humaux_testkit`. Runtime writes remain actual `role_gateway` logins.
 
+#[path = "token_keys.rs"]
+mod token_keys;
 use std::str::FromStr;
 
 use humaux_adapters::{
@@ -177,6 +179,7 @@ impl DbIntegrationFixture for Fixture {
 
     #[allow(clippy::too_many_lines)] // one linear owner-role seed of the whole fixture tenant tree
     fn isolate() -> Result<Handle, DbFixtureSkipReason> {
+        token_keys::install();
         let serial = if SERIAL_HELD.with(std::cell::Cell::get) {
             None
         } else {
@@ -311,6 +314,19 @@ impl Drop for Handle {
         user_ids.push(self.user_id);
         let mut workspace_ids = self.extra_workspace_ids.clone();
         workspace_ids.push(self.workspace_id);
+        // Card-31 pattern (card 33 leak fix): remember's EVIDENCE_ACCEPTED rows and every PRIMARY
+        // link a governance op materializes enqueue DERIVED_* jobs (0164 triggers). They are deleted
+        // in their own autocommit statement first, so a failure anywhere in the all-or-nothing
+        // teardown below (which ends in the tenant delete) cannot roll the job delete back.
+        if let Err(error) = self.admin.execute(
+            "DELETE FROM ops.jobs WHERE tenant_id=$1",
+            &[&self.tenant_id],
+        ) {
+            eprintln!(
+                "operation receipt fixture job cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
         // Strict guard82-only owner teardown. The trigger change is transactional: any cleanup
         // error rolls it back rather than leaving audit_events mutable.
         let cleanup = (|| -> Result<(), postgres::Error> {

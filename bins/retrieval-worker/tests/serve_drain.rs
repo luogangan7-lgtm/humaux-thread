@@ -44,7 +44,7 @@ fn dead_port() -> u16 {
 fn spawn_serve(gitleaks: [String; 3], stderr: std::fs::File) -> std::process::Child {
     let [bin, version, sha] = gitleaks;
     let pg = format!(
-        "postgres://role_retrieval_worker:devlocal_role_retrieval_worker@127.0.0.1:{}/humaux_thread_dev",
+        "postgres://role_retrieval_worker@127.0.0.1:{}/humaux_thread_dev",
         dead_port()
     );
     // dep: subprocess(humaux-retrieval-worker) — the resident projection runner under test

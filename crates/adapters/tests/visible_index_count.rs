@@ -137,16 +137,9 @@ fn skip_unless_both_reachable() -> Option<(String, Client)> {
 }
 
 fn dsn_as_role(dsn: &str, role: &str) -> String {
-    let Some(rest) = dsn
-        .strip_prefix("postgres://")
-        .or_else(|| dsn.strip_prefix("postgresql://"))
-    else {
-        return dsn.to_string();
-    };
-    let Some(at) = rest.find('@') else {
-        return dsn.to_string();
-    };
-    format!("postgres://{role}:devlocal_{role}@{}", &rest[at + 1..])
+    // ADR-0059 D-D: a real login as `role`, its password from HUMAUX_ROLE_PASSWORD_<SUFFIX>.
+    humaux_testkit::role_login_dsn(dsn, role, |name| std::env::var(name).ok())
+        .unwrap_or_else(|missing| panic!("missing object: {missing} (ADR-0059 D-D)"))
 }
 
 fn key(tenant_id: Uuid, scope_id: Uuid) -> StreamKey {

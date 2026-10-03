@@ -1,10 +1,14 @@
 //! `humaux-testkit` — 测试基建：DB fixture、注错（fault injection）夹具、正哨兵样本。
 //! Depends-on: crates=[]; services=[]; env=[HUMAUX_REQUIRE_DASHSCOPE, HUMAUX_REQUIRE_DB, HUMAUX_REQUIRE_MINIMAX,
-//!   HUMAUX_REQUIRE_QDRANT]; modules=[]
+//!   HUMAUX_REQUIRE_QDRANT, HUMAUX_ROLE_PASSWORD_ADMIN, HUMAUX_ROLE_PASSWORD_BATCH_ISSUER,
+//!   HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER, HUMAUX_ROLE_PASSWORD_GATEWAY, HUMAUX_ROLE_PASSWORD_MAINTENANCE,
+//!   HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER, HUMAUX_ROLE_PASSWORD_PUBLIC_WORKER, HUMAUX_ROLE_PASSWORD_RETRIEVAL_WORKER];
+//!   modules=[]
 //! Called-by: [crate(humaux-adapters), crate(humaux-consolidation-worker), crate(humaux-gateway), crate(humaux-maintenance), crate(humaux-private-worker), crate(humaux-retrieval-provider), crate(xtask), tests]
 //! Invariants: [skip_or_fail prints a visible SKIP naming the missing object, or panics when the matching
-//!   HUMAUX_REQUIRE_* is set (a skip is not a pass, §79.2); the crate depends on no domain/adapters type]
-//! Spec: Baseline §53.3; §80.2; §53.4; §52.4; §78.3
+//!   HUMAUX_REQUIRE_* is set (a skip is not a pass, §79.2); the crate depends on no domain/adapters type;
+//!   role_login_dsn never substitutes a repository literal for a missing role password (ADR-0059 D-D)]
+//! Spec: Baseline §53.3; §80.2; §53.4; §52.4; §78.3; ADR-0059
 //!
 //! 目录契约：`sentinels/`（§53.3 规则3 正哨兵）· `tests/metrics/`（§80.2 Metric Witness）
 //! · `tests/fault/`（§53.4 每个 DegradeCode reason 一条注错）· `tests/pair/`（§52.4 G52-5 成对测试）。
@@ -263,6 +267,39 @@ pub fn assert_fault_observed(obs: &FaultObservation<'_>) {
     );
 }
 
+/// ADR-0059 D-D: the DSN a real-login test opens as `role` — the admin DSN's
+/// `host:port/db?query`, with `role` and its password from `HUMAUX_ROLE_PASSWORD_<SUFFIX>`
+/// (SUFFIX = `role` without `role_`, upper-cased: the names `humaux-maintenance roles rotate`
+/// reads, so one sourced secrets file feeds rotate and the tests alike).
+///
+/// `lookup` is the caller's environment read, `|name| std::env::var(name).ok()`: this crate's
+/// `src/` may read only test-control variables (xtask architecture-check, §78 env lint).
+///
+/// # Errors
+/// The name of the missing object: the unset or empty password variable, or the admin DSN shape
+/// when `admin_dsn` is not `postgres[ql]://<userinfo>@<host>/<db>`. Callers hand it to
+/// [`skip_or_fail`] or panic with it; nothing falls back to a repository literal.
+pub fn role_login_dsn(
+    admin_dsn: &str,
+    role: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let host = admin_dsn
+        .strip_prefix("postgres://")
+        .or_else(|| admin_dsn.strip_prefix("postgresql://"))
+        .and_then(|rest| rest.split_once('@'))
+        .map(|(_userinfo, host)| host)
+        .ok_or_else(|| "admin DSN postgres://<userinfo>@<host>/<db>".to_string())?;
+    let var = format!(
+        "HUMAUX_ROLE_PASSWORD_{}",
+        role.strip_prefix("role_")
+            .unwrap_or(role)
+            .to_ascii_uppercase()
+    );
+    let password = lookup(&var).filter(|v| !v.is_empty()).ok_or(var)?;
+    Ok(format!("postgres://{role}:{password}@{host}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +391,47 @@ mod tests {
             degrade_total_after: 1,
             completeness_degradations: &degradations,
         });
+    }
+
+    /// A throwaway value generated per run; no password literal lives in the repository.
+    fn throwaway() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        format!("t{nanos:x}")
+    }
+
+    #[test]
+    fn role_login_dsn_keeps_host_db_query_and_takes_the_role_password_variable() {
+        let value = throwaway();
+        let lookup =
+            |name: &str| (name == "HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER").then(|| value.clone());
+        for scheme in ["postgres", "postgresql"] {
+            let admin = format!("{scheme}://admin:x@127.0.0.1:54329/db?sslmode=disable");
+            assert_eq!(
+                role_login_dsn(&admin, "role_private_worker", lookup),
+                Ok(format!(
+                    "postgres://role_private_worker:{value}@127.0.0.1:54329/db?sslmode=disable"
+                ))
+            );
+        }
+    }
+
+    /// 注错: drop the empty-value filter, or fall back to any default ⇒ red.
+    #[test]
+    fn role_login_dsn_names_the_missing_variable_and_never_falls_back() {
+        let admin = "postgres://admin:x@127.0.0.1:54329/db";
+        assert_eq!(
+            role_login_dsn(admin, "role_gateway", |_| None),
+            Err("HUMAUX_ROLE_PASSWORD_GATEWAY".to_string())
+        );
+        assert_eq!(
+            role_login_dsn(admin, "role_gateway", |_| Some(String::new())),
+            Err("HUMAUX_ROLE_PASSWORD_GATEWAY".to_string())
+        );
+        let malformed = role_login_dsn("127.0.0.1:54329/db", "role_gateway", |_| Some(throwaway()));
+        assert!(malformed.is_err_and(|e| e.starts_with("admin DSN")));
     }
 
     #[test]

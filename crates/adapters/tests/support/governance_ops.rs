@@ -3,7 +3,7 @@
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-projection, postgres, serde_json, sqlx, tokio]; services=[PostgreSQL(owner)
 //!   w=[control.api_keys, control.confirm_tokens, control.memberships, control.quota_windows, control.tenants,
 //!   control.usage_reservations, control.users, control.workspace_memberships], PostgreSQL(role_gateway)]; env=[]; modules=[adapters::confirm_token_repo,
-//!   adapters::memory_governance_repo, adapters::postgres, adapters::quota_repo, domain::audit, domain::authority,
+//!   adapters::memory_governance_repo, adapters::postgres, adapters::quota_repo, adapters::tests::support::token_keys, domain::audit, domain::authority,
 //!   domain::confirm, domain::error, domain::evidence, domain::identity, domain::ids, domain::subject,
 //!   projection::stream]
 //! Called-by: [adapters::tests::a2_point_identity, adapters::tests::projection_lag,
@@ -17,6 +17,8 @@
 //! route does (ADR-0054 D-A). Each op mints a confirm token through `mint_with_audit` and then
 //! runs the confirmed op, so the ticket a test observes is the one production issues.
 
+#[path = "token_keys.rs"]
+pub mod token_keys;
 use std::time::{Duration, SystemTime};
 
 use humaux_adapters::confirm_token_repo::{self, ConfirmationClaim};
@@ -48,6 +50,7 @@ impl Governor {
     /// Activates `tenant_id` and seeds an ACTIVE user with an ACTIVE tenant membership, an
     /// unbound user API key and a BMO quota window. Workspaces are joined with [`Self::join`].
     pub fn seed(admin: &mut Client, tenant_id: Uuid) -> Self {
+        token_keys::install();
         admin
             .execute(
                 "UPDATE control.tenants SET state = 'ACTIVE' WHERE tenant_id = $1",

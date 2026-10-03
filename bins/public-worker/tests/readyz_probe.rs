@@ -3,9 +3,9 @@
 //! Depends-on: crates=[]; services=[subprocess(humaux-public-worker)]; env=[CARGO_BIN_EXE_humaux-public-worker,
 //!   HUMAUX_PUBLIC_WORKER_CALLER, HUMAUX_PUBLIC_WORKER_CELL_ID, HUMAUX_PUBLIC_WORKER_PG_DSN,
 //!   HUMAUX_PUBLIC_WORKER_QDRANT_CIDR, HUMAUX_PUBLIC_WORKER_QDRANT_HOST, HUMAUX_PUBLIC_WORKER_QDRANT_PORT,
-//!   HUMAUX_PUBLIC_WORKER_QDRANT_TLS, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN, HUMAUX_TEST_QDRANT_PORT]; modules=[]
+//!   HUMAUX_PUBLIC_WORKER_QDRANT_TLS, HUMAUX_REQUIRE_DB, HUMAUX_TEST_QDRANT_PORT]; modules=[]
 //! Called-by: [cargo-test]
-//! Invariants: [the probe test spawns its own humaux-public-worker subprocess against HUMAUX_TEST_PG_DSN/HUMAUX_TEST_QDRANT_PORT and fails, not skips, when HUMAUX_REQUIRE_DB is set and the DB is unreachable]
+//! Invariants: [the probe test spawns its own humaux-public-worker subprocess against HUMAUX_PUBLIC_WORKER_PG_DSN/HUMAUX_TEST_QDRANT_PORT and fails, not skips, when HUMAUX_REQUIRE_DB is set and the DB is unreachable]
 //! Spec: Baseline §79.2; ADR-0037
 //!
 //! The review this file answers found the readiness contract's down-path asserted for exactly
@@ -16,7 +16,7 @@
 //! (Postgres and Qdrant are shared state for every other suite on this machine).
 //!
 //! Three-state (§79.2): the Postgres-down case needs no database at all and always runs; the
-//! Qdrant cases need the live fixture DB (`HUMAUX_TEST_PG_DSN`) and, for the up-case, live
+//! Qdrant cases need the live fixture DB (`HUMAUX_PUBLIC_WORKER_PG_DSN`, a real role login) and, for the up-case, live
 //! Qdrant (`HUMAUX_TEST_QDRANT_PORT`) — absent either, they print a visible SKIP naming what was
 //! missing, and `HUMAUX_REQUIRE_DB=1` turns that SKIP into a failure.
 
@@ -49,16 +49,9 @@ fn skip(test: &str, missing: &str) {
     eprintln!("SKIP {test}: {missing}");
 }
 
+/// ADR-0059 D-D: the worker's own runtime DSN, a real login as role_public_worker (no repository literal).
 fn role_dsn() -> Option<String> {
-    let admin = std::env::var("HUMAUX_TEST_PG_DSN").ok()?;
-    let rest = admin
-        .strip_prefix("postgres://")
-        .or_else(|| admin.strip_prefix("postgresql://"))?;
-    let at = rest.find('@')?;
-    Some(format!(
-        "postgres://role_public_worker:devlocal_role_public_worker@{}",
-        &rest[at + 1..]
-    ))
+    std::env::var("HUMAUX_PUBLIC_WORKER_PG_DSN").ok()
 }
 
 /// `--readyz` with the whole environment it needs; the caller varies exactly one dependency.
@@ -93,7 +86,7 @@ fn stderr_of(output: &Output) -> String {
 fn readyz_names_postgresql_when_the_database_is_down() {
     warm_binary();
     let dsn = format!(
-        "postgres://role_public_worker:devlocal_role_public_worker@127.0.0.1:{}/humaux_thread_dev",
+        "postgres://role_public_worker@127.0.0.1:{}/humaux_thread_dev",
         dead_port()
     );
     let output = readyz(&dsn, "127.0.0.1", dead_port());
@@ -119,7 +112,7 @@ fn readyz_names_the_qdrant_cell_resource_when_qdrant_is_down() {
     let Some(dsn) = role_dsn() else {
         return skip(
             "readyz_names_the_qdrant_cell_resource_when_qdrant_is_down",
-            "HUMAUX_TEST_PG_DSN is not set (the DB must be UP for Qdrant to be the failure)",
+            "HUMAUX_PUBLIC_WORKER_PG_DSN is not set (the DB must be UP for Qdrant to be the failure)",
         );
     };
     warm_binary();
@@ -146,7 +139,7 @@ fn readyz_names_the_qdrant_cell_resource_when_qdrant_is_down() {
 fn readyz_exits_zero_when_postgresql_and_qdrant_both_answer() {
     let test = "readyz_exits_zero_when_postgresql_and_qdrant_both_answer";
     let Some(dsn) = role_dsn() else {
-        return skip(test, "HUMAUX_TEST_PG_DSN is not set");
+        return skip(test, "HUMAUX_PUBLIC_WORKER_PG_DSN is not set");
     };
     let Some(port) = std::env::var("HUMAUX_TEST_QDRANT_PORT")
         .ok()

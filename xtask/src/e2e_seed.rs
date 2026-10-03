@@ -20,7 +20,7 @@
 //! Invariants: [a thin wrapper over adapters::provisioning (the same onboarding doors humaux-maintenance uses, no INSERT
 //!   of its own for tenant/workspace/key/tier/placement/collection); refuses any DSN host but 127.0.0.1 and any database
 //!   not named humaux_thread_*; --teardown removes seeded rows explicitly]
-//! Spec: Baseline §73.5; ADR-0053
+//! Spec: Baseline §73.5; ADR-0053; ADR-0059
 //!
 //! xtask `e2e-seed` — persistent tenant/credential/quota seed for deployment-point
 //! rehearsals (an ops tool, not a test fixture: rows outlive the process, teardown is
@@ -61,6 +61,11 @@
 //! domain that user owns, that user's own seed lane and key (`bearer_d2:`), so remember.put lands
 //! one tenant's Evidence in two domains. The domain row is the one seed-only INSERT besides the
 //! lane (no provisioning door creates a second domain today).
+//!
+//! Card 33 (ADR-0059 D-I): `--credential-env <ENV_NAME>` (required) names the variable that holds
+//! the rehearsal's provider key; the seed prints one `export HUMAUX_PRIVATE_WORKER_CREDENTIALS=`
+//! line mapping every lane it created (the base lane and, with `--second-domain`, the second one)
+//! to that name. Only names and references are printed, never a key.
 //!
 //! Refuses to run against anything but a local disposable database (binding rule): DSN
 //! host must be `127.0.0.1` and the database name must start with `humaux_thread_`.
@@ -190,7 +195,9 @@ pub(crate) struct LaneSeed {
     /// ADR-0016 D7: the `PRIVATE_DISTILL_TEXT` binding over the same profile — resolved by
     /// purpose at runtime, printed only for teardown bookkeeping.
     distill_binding_id: Uuid,
-    credential_id: Uuid,
+    /// The lane's credential reference — the key the private worker's credential map is keyed
+    /// on (ADR-0059 D-I).
+    pub(crate) credential_id: Uuid,
     provider_account_id: Uuid,
     processor_model_id: Uuid,
     endpoint_id: Uuid,
@@ -366,6 +373,8 @@ pub(crate) struct SecondDomain {
     user_id: Uuid,
     reasoning_domain_id: Uuid,
     wire: String,
+    /// The second lane's credential reference (ADR-0059 D-I map entry).
+    credential_id: Uuid,
 }
 
 /// ADR-0058 M8, rehearsal twin (card 32 `--second-domain`): one tenant whose Evidence lands in
@@ -401,7 +410,7 @@ pub(crate) fn seed_second_domain(
         )
         .map_err(|e| format!("insert second reasoning domain: {}", db_detail(&e)))?
         .get(0);
-    seed_lane(
+    let lane = seed_lane(
         client,
         tenant.tenant_id,
         user.user_id,
@@ -423,7 +432,26 @@ pub(crate) fn seed_second_domain(
         user_id: user.user_id,
         reasoning_domain_id,
         wire,
+        credential_id: lane.credential_id,
     })
+}
+
+/// ADR-0059 D-I: the private worker's `HUMAUX_PRIVATE_WORKER_CREDENTIALS` value for the seeded
+/// lanes — every reference maps to `env_name`, the variable that holds the rehearsal's provider
+/// key (a NAME, never a value; required, no default: a default would name a provider, §78.1).
+fn credential_map_value(env_name: &str, refs: &[Uuid]) -> Result<String, String> {
+    if env_name.is_empty()
+        || !env_name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err("--credential-env must name a variable matching [A-Z0-9_]+".to_owned());
+    }
+    Ok(refs
+        .iter()
+        .map(|r| format!("{r}={env_name}"))
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
 /// Flags for the 追加2 semantic-recall placement lane (§78.1: dimension/collection/host/port
@@ -781,7 +809,7 @@ fn teardown(client: &mut Client, tenant_id: Uuid) -> Result<(), String> {
 ///   --processor-id <uuid> --region <s> --service-tier <s> --endpoint-ref <url> \
 ///   --provider-id <s> --provider-model-id <s> --model-revision <s> \
 ///   --collection <name> --dimension <u32> [--qdrant-host 127.0.0.1] [--qdrant-port 6333] \
-///   [--workspaces <n>] [--second-domain]`
+///   --credential-env <ENV_NAME> [--workspaces <n>] [--second-domain]`
 /// or `cargo xtask e2e-seed --teardown <tenant_id> [--drop-collection <name>] \
 ///   [--qdrant-host 127.0.0.1] [--qdrant-port 6333]`.
 #[allow(clippy::too_many_lines)]
@@ -894,6 +922,14 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let Some(credential_env) = arg(args, "--credential-env") else {
+        eprintln!("e2e-seed: fail (missing required flag --credential-env — §78.1: no default)");
+        return 1;
+    };
+    if let Err(e) = credential_map_value(&credential_env, &[]) {
+        eprintln!("e2e-seed: fail ({e})");
+        return 1;
+    }
 
     // Card 27: `--workspaces <n>` (absent = 1, so every existing caller is unchanged).
     let workspaces = match arg(args, "--workspaces").map(|v| v.parse::<usize>()) {
@@ -1048,6 +1084,15 @@ pub fn run(args: &[String]) -> i32 {
         "export HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID={}",
         lane_flags.egress_processor_id
     );
+    let mut lane_refs = vec![lane.credential_id];
+    lane_refs.extend(second_domain.as_ref().map(|d| d.credential_id));
+    match credential_map_value(&credential_env, &lane_refs) {
+        Ok(map) => println!("export HUMAUX_PRIVATE_WORKER_CREDENTIALS={map}"),
+        Err(e) => {
+            eprintln!("e2e-seed: fail ({e})");
+            return 1;
+        }
+    }
     println!();
     println!(
         "export HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER={}",
@@ -1118,12 +1163,26 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DSN_ENV, LaneFlags, MAINTENANCE_DSN_ENV, QdrantFlags, guard_local_test_db, seed_lane,
-        teardown,
+        DSN_ENV, LaneFlags, MAINTENANCE_DSN_ENV, QdrantFlags, credential_map_value,
+        guard_local_test_db, seed_lane, teardown,
     };
     use humaux_adapters::postgres::MaintenanceDbPool;
     use postgres::{Client, NoTls};
     use uuid::Uuid;
+
+    /// ADR-0059 D-I: one `ref=NAME` entry per seeded lane; a lower-case, empty or punctuated name
+    /// is refused. Fault: drop the name check ⇒ a map the worker refuses at boot is emitted.
+    #[test]
+    fn credential_map_value_names_each_lane_and_refuses_a_bad_name() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(
+            credential_map_value("HX33_KEY", &[a, b]).as_deref(),
+            Ok(format!("{a}=HX33_KEY,{b}=HX33_KEY").as_str())
+        );
+        for bad in ["", "hx33_key", "HX33-KEY", "HX33=KEY"] {
+            assert!(credential_map_value(bad, &[a]).is_err(), "{bad:?}");
+        }
+    }
 
     /// Card 28 fault (e): the guard stays — a hostname (even `localhost`) is refused, only the
     /// literal `127.0.0.1` and a `humaux_thread_*` database pass.

@@ -64,7 +64,11 @@ impl Drop for Handle {
     fn drop(&mut self) {
         // Best-effort cleanup (repo CLAUDE.md hard rule ④: this file never touches a
         // schema/table of its own, only rows it created under its own throwaway tenant).
-        let _ = self.admin.batch_execute(&format!(
+        // Card-31 pattern (card 33 leak fix): the seeded EVIDENCE_ACCEPTED row or PRIMARY link
+        // enqueues a DERIVED_* job (0164 trigger). Jobs go first, in one batch with the data rows, and
+        // a failure is printed; the tenant row goes in a separate best-effort batch, so a refused tenant
+        // delete (append-only audit rows, a missed child table) can no longer roll the job delete back.
+        if let Err(error) = self.admin.batch_execute(&format!(
             "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
              DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
              DELETE FROM private.memory_evidence USING private.memory_records m \
@@ -75,9 +79,17 @@ impl Drop for Handle {
              DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
              DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}'; \
              DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
-             DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{0}';",
-            self.tenant_id
+             DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}';",
+            self.tenant_id,
+        )) {
+            eprintln!(
+                "stream_repo cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{0}';",
+            self.tenant_id,
         ));
     }
 }

@@ -1,13 +1,18 @@
 //! `gateway::tests::service_credentials` — §73.5.1 real PostgreSQL acceptance.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, humaux-testkit, postgres, sqlx, tokio];
-//!   services=[PostgreSQL(role_gateway), PostgreSQL(role_migration_owner) w=[control.api_keys, control.memberships,
-//!   control.tenants, control.users, control.workspace_memberships, control.workspaces] x=[control.api_key_lookup,
-//!   control.api_key_touch_last_used], PostgreSQL(role_public_worker)]; env=[HUMAUX_GATEWAY_PG_DSN,
+//!   services=[PostgreSQL(role_gateway), PostgreSQL(role_maintenance) x=[control.credential_pepper_epoch_advance,
+//!   control.credential_pepper_epoch_close],
+//!   PostgreSQL(role_migration_owner) w=[control.api_keys, control.memberships,
+//!   control.tenants, control.users, control.workspace_memberships, control.workspaces] r=[control.audit_events, control.credential_pepper_state]
+//!   x=[control.api_key_lookup, control.api_key_rehash, control.api_key_touch_last_used,
+//!   control.credential_pepper_epoch], PostgreSQL(role_public_worker)]; env=[HUMAUX_GATEWAY_PG_DSN,
 //!   HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres, domain::error, domain::ids, gateway::auth, humaux-testkit,
 //!   protocol::edge]
 //! Called-by: [cargo-test]
-//! Invariants: [each test provisions its own PostgreSQL role/credential rows and tears them down; no test relies on another test's credential state]
-//! Spec: Baseline §73.5.1; §6.1.1; ADR-0035
+//! Invariants: [each test provisions its own PostgreSQL role/credential rows and tears them down; no test relies on another test's credential state;
+//!   the pepper rehash window is closed before and after every test (a cross-process advisory lock serialises the tests that use it; T32 runs in a
+//!   rolled-back transaction, T21 opens and closes it)]
+//! Spec: Baseline §73.5.1; §6.1.1; ADR-0035; ADR-0059
 //!
 //! Only a dedicated loopback fixture is writable.
 
@@ -186,13 +191,23 @@ impl DbIntegrationFixture for CredentialFixture {
 
 impl Handle {
     fn key(&mut self, user: Option<Uuid>, workspace: Option<Uuid>, version: Option<i16>) -> Key {
+        self.key_under(TEST_PEPPER, user, workspace, version)
+    }
+
+    fn key_under(
+        &mut self,
+        pepper: &[u8],
+        user: Option<Uuid>,
+        workspace: Option<Uuid>,
+        version: Option<i16>,
+    ) -> Key {
         let id = Uuid::now_v7();
         let prefix = format!("fixture_{}", id.simple());
         let wire = format!(
             "{prefix}.synthetic_test_material_{}",
             Uuid::now_v7().simple()
         );
-        let hash = compute_api_key_hash(TEST_PEPPER, &wire);
+        let hash = compute_api_key_hash(pepper, &wire);
         let tenant_epoch = version.map(|_| 0_i64);
         let user_epoch = user.map(|_| 0_i64);
         db_ok(self.admin.execute(
@@ -216,13 +231,59 @@ impl Handle {
     }
 
     fn authenticate(&self, key: &Key) -> Result<AuthenticatedServiceCredential, ErrorCode> {
+        self.authenticate_with(key, TEST_PEPPER, None)
+    }
+
+    fn authenticate_with(
+        &self,
+        key: &Key,
+        pepper: &[u8],
+        previous: Option<&[u8]>,
+    ) -> Result<AuthenticatedServiceCredential, ErrorCode> {
         self.rt.block_on(authenticate_service_credential(
             &self.runtime,
             &format!("Bearer {}", key.wire),
-            TEST_PEPPER,
+            pepper,
+            previous,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             SystemTime::now(),
         ))
+    }
+
+    /// Compared with `assert!(a == b)` only, so a failure never prints verifier bytes.
+    fn stored_hash(&mut self, key: &Key) -> Vec<u8> {
+        db_ok(self.admin.query_one(
+            "SELECT key_hash FROM control.api_keys WHERE api_key_id = $1",
+            &[&key.id],
+        ))
+        .get(0)
+    }
+
+    fn rehash_audit_rows(&mut self, key: &Key) -> i64 {
+        db_ok(self.admin.query_one(
+            "SELECT count(*) FROM control.audit_events \
+             WHERE tenant_id = $1 AND action = 'api_key.pepper_rehash' AND resource_id = $2",
+            &[&self.tenant, &key.id.to_string()],
+        ))
+        .get(0)
+    }
+
+    fn at_current_epoch(&mut self, key: &Key) -> bool {
+        db_ok(self.admin.query_one(
+            "SELECT pepper_epoch = control.credential_pepper_epoch() \
+             FROM control.api_keys WHERE api_key_id = $1",
+            &[&key.id],
+        ))
+        .get(0)
+    }
+
+    /// `control.api_key_rehash` called directly as the real role_gateway login.
+    fn gateway_rehash(&mut self, key: &Key, old: &[u8], new: &[u8]) -> Option<bool> {
+        db_ok(self.gateway.query_one(
+            "SELECT control.api_key_rehash($1, $2, $3)",
+            &[&key.id, &old, &new],
+        ))
+        .get(0)
     }
 
     fn used(&mut self, key: &Key) -> bool {
@@ -605,5 +666,217 @@ fn bootstrap_ignores_forged_gucs_and_touch_changes_only_one_row_timestamp() {
             other_before == other_after,
             "touch modified another credential"
         );
+    });
+}
+
+/// ADR-0059 D-H: the rehash window is one cluster-database singleton. These tests take a
+/// session-level advisory lock on a connection of their own, so they serialise across test
+/// processes and lanes on the same database, not only within this binary; the lock dies with the
+/// connection, also when a test panics or the process is killed.
+struct PepperWindow {
+    client: Client,
+    opened: bool,
+}
+
+impl PepperWindow {
+    /// Takes the lock and asserts the window is closed: an open window on a shared database is a
+    /// security condition (every key behind the epoch is rewritable), never a test precondition.
+    fn lock() -> Self {
+        let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("fixture already resolved the DSN");
+        // dep: PostgreSQL(role_migration_owner) — advisory lock + window probe on the fixture DB
+        let mut client = db_ok(Client::connect(&dsn, NoTls));
+        db_ok(client.execute(
+            "SELECT pg_advisory_lock(hashtext('humaux.test.credential_pepper_window'))",
+            &[],
+        ));
+        let open: bool = db_ok(client.query_one(
+            "SELECT rehash_open FROM control.credential_pepper_state",
+            &[],
+        ))
+        .get(0);
+        assert!(
+            !open,
+            "the pepper rehash window is open on the test database; close it with \
+             `humaux-maintenance apikey pepper-epoch close` before running these tests"
+        );
+        Self {
+            client,
+            opened: false,
+        }
+    }
+
+    /// Opens the window the way `apikey pepper-epoch advance` does (the role_maintenance door);
+    /// `Drop` closes it again through `apikey pepper-epoch close`'s door.
+    fn open(&mut self) {
+        // dep: PostgreSQL(role_maintenance) — SET ROLE on the lock connection
+        db_ok(self.client.batch_execute(
+            "SET ROLE role_maintenance; SELECT control.credential_pepper_epoch_advance(); RESET ROLE",
+        ));
+        self.opened = true;
+    }
+}
+
+impl Drop for PepperWindow {
+    fn drop(&mut self) {
+        if self.opened {
+            // dep: PostgreSQL(role_maintenance) — SET ROLE on the lock connection
+            let closed = self.client.batch_execute(
+                "SET ROLE role_maintenance; SELECT control.credential_pepper_epoch_close(); RESET ROLE",
+            );
+            if closed.is_err() {
+                eprintln!("service_credentials: closing the pepper rehash window FAILED");
+            }
+        }
+    }
+}
+
+/// A per-run generated pepper for the rotation tests (never a literal).
+fn generated_pepper() -> Vec<u8> {
+    format!("synthetic-rotation-pepper-{}", Uuid::now_v7().simple()).into_bytes()
+}
+
+/// ADR-0059 D-H T21 (card 33 acceptance): with the previous pepper in the window an old key still
+/// authenticates, is rehashed to the current pepper and epoch with one audit row in its tenant,
+/// and then authenticates with the window closed.
+#[test]
+fn previous_pepper_match_rehashes_to_current() {
+    run_db_fixture::<CredentialFixture, _>("previous pepper rehash", |mut f| {
+        let mut window = PepperWindow::lock();
+        let current = generated_pepper();
+        let key = f.key(None, Some(f.workspace), Some(1));
+        window.open();
+        assert!(
+            f.authenticate_with(&key, &current, Some(TEST_PEPPER))
+                .is_ok(),
+            "an old-pepper key must authenticate inside the window"
+        );
+        drop(window);
+        assert!(
+            f.stored_hash(&key) == compute_api_key_hash(&current, &key.wire),
+            "verifier must be rewritten under the current pepper"
+        );
+        assert!(f.at_current_epoch(&key));
+        assert_eq!(f.rehash_audit_rows(&key), 1);
+        assert!(
+            f.authenticate_with(&key, &current, None).is_ok(),
+            "a rehashed key must authenticate with the window closed"
+        );
+        assert!(f.used(&key));
+    });
+}
+
+/// ADR-0059 D-H T31: a rehash that rewrites nothing (here the closed window, the same false
+/// branch a parallel loser of the compare-and-set takes) never fails a request that already
+/// validated; the door answers false, never NULL.
+#[test]
+fn rehash_miss_does_not_fail_a_valid_request() {
+    run_db_fixture::<CredentialFixture, _>("rehash miss is not fatal", |mut f| {
+        let _window = PepperWindow::lock();
+        let current = generated_pepper();
+        let key = f.key(None, Some(f.workspace), Some(1));
+        let old_hash = f.stored_hash(&key);
+        assert!(
+            f.authenticate_with(&key, &current, Some(TEST_PEPPER))
+                .is_ok(),
+            "a closed window must not fail the request"
+        );
+        assert!(f.used(&key), "mark_used must still run");
+        assert!(
+            f.stored_hash(&key) == old_hash,
+            "window closed: hash unchanged"
+        );
+        let stale = compute_api_key_hash(&generated_pepper(), &key.wire);
+        assert_eq!(f.gateway_rehash(&key, &stale, &stale), Some(false));
+    });
+}
+
+/// `control.api_key_rehash` as role_gateway inside `txn` (SET LOCAL ROLE; the EXECUTE check is
+/// on current_user), with the old verifier read through role_gateway's own lookup door.
+fn rehash_in_txn(txn: &mut postgres::Transaction<'_>, key: &Key, new: &[u8]) -> (Vec<u8>, bool) {
+    let prefix = key.wire.split_once('.').unwrap().0;
+    // dep: PostgreSQL(role_gateway) — SET LOCAL ROLE inside the rolled-back transaction
+    db_ok(txn.batch_execute("SET LOCAL ROLE role_gateway"));
+    let old: Vec<u8> = db_ok(txn.query_one(
+        "SELECT key_hash FROM control.api_key_lookup($1)",
+        &[&prefix],
+    ))
+    .get(0);
+    let rewritten: Option<bool> = db_ok(txn.query_one(
+        "SELECT control.api_key_rehash($1, $2, $3)",
+        &[&key.id, &old, &new],
+    ))
+    .get(0);
+    db_ok(txn.batch_execute("RESET ROLE"));
+    (old, rewritten.expect("api_key_rehash never returns NULL"))
+}
+
+fn pepper_door_in_txn(txn: &mut postgres::Transaction<'_>, door: &str) {
+    // dep: PostgreSQL(role_maintenance) — SET LOCAL ROLE inside the rolled-back transaction
+    db_ok(txn.batch_execute(&format!(
+        "SET LOCAL ROLE role_maintenance; SELECT control.{door}(); RESET ROLE"
+    )));
+}
+
+fn hash_and_audits_in_txn(
+    txn: &mut postgres::Transaction<'_>,
+    tenant: Uuid,
+    key: &Key,
+) -> (Vec<u8>, i64) {
+    let row = db_ok(txn.query_one(
+        "SELECT (SELECT key_hash FROM control.api_keys WHERE api_key_id = $2), \
+                (SELECT count(*) FROM control.audit_events WHERE tenant_id = $1 \
+                   AND action = 'api_key.pepper_rehash' AND resource_id = $3)",
+        &[&tenant, &key.id, &key.id.to_string()],
+    ));
+    (row.get(0), row.get(1))
+}
+
+/// ADR-0059 D-H T32: `control.api_key_rehash` as role_gateway is a no-op while the window is
+/// closed, rewrites a key behind the epoch once with one audit row while it is open, and is a
+/// no-op again for every key once it is closed (review P1: the window must close). The whole
+/// sequence runs in one transaction that is rolled back, so the shared epoch and window never move.
+#[test]
+fn api_key_rehash_is_epoch_gated_once_and_audited() {
+    run_db_fixture::<CredentialFixture, _>("rehash epoch gate", |mut f| {
+        let _window = PepperWindow::lock();
+        let tenant = f.tenant;
+        let key = f.key(None, Some(f.workspace), Some(1));
+        let behind = f.key(None, Some(f.workspace), Some(1));
+        let new = compute_api_key_hash(&generated_pepper(), &key.wire);
+        let mut txn = db_ok(f.admin.transaction());
+
+        let (old, rewritten) = rehash_in_txn(&mut txn, &key, &new);
+        assert!(!rewritten, "window closed: nothing rewritten");
+        let (hash, audits) = hash_and_audits_in_txn(&mut txn, tenant, &key);
+        assert!(hash == old, "window closed: hash unchanged");
+        assert_eq!(audits, 0);
+
+        pepper_door_in_txn(&mut txn, "credential_pepper_epoch_advance");
+        assert!(
+            rehash_in_txn(&mut txn, &key, &new).1,
+            "window open: rewritten"
+        );
+        let (hash, audits) = hash_and_audits_in_txn(&mut txn, tenant, &key);
+        assert!(hash == new, "rewritten once");
+        assert_eq!(audits, 1);
+        assert!(
+            !rehash_in_txn(&mut txn, &key, &old).1,
+            "at most once per epoch"
+        );
+        let (hash, audits) = hash_and_audits_in_txn(&mut txn, tenant, &key);
+        assert!(hash == new, "rewritten once");
+        assert_eq!(audits, 1);
+
+        pepper_door_in_txn(&mut txn, "credential_pepper_epoch_close");
+        let behind_new = compute_api_key_hash(&generated_pepper(), &behind.wire);
+        let (behind_old, rewritten) = rehash_in_txn(&mut txn, &behind, &behind_new);
+        assert!(
+            !rewritten,
+            "window closed: a key still behind the epoch is not rewritable"
+        );
+        let (hash, audits) = hash_and_audits_in_txn(&mut txn, tenant, &behind);
+        assert!(hash == behind_old, "window closed: hash unchanged");
+        assert_eq!(audits, 0);
+        db_ok(txn.rollback());
     });
 }

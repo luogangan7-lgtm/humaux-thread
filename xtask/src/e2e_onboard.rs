@@ -30,17 +30,18 @@
 //!   HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS, HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID,
 //!   HUMAUX_GATEWAY_REPLAY_TTL_SECONDS, HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS,
 //!   HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS, HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH,
-//!   HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS, HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS,
+//!   HUMAUX_GATEWAY_TOKEN_HMAC_KEY, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS, HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS,
 //!   HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX, HUMAUX_MAINTENANCE_EMBEDDING_DIMENSION, HUMAUX_MAINTENANCE_PG_DSN,
 //!   HUMAUX_MAINTENANCE_PRIVATE_MEMORY_COLLECTION, HUMAUX_MAINTENANCE_QDRANT_CIDR, HUMAUX_MAINTENANCE_QDRANT_HOST,
 //!   HUMAUX_MAINTENANCE_QDRANT_PORT, HUMAUX_MINIMAX_DNS_PINS, HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS,
 //!   HUMAUX_PRIVATE_WORKER_CAPABILITIES, HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID,
+//!   HUMAUX_PRIVATE_WORKER_CREDENTIALS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS,
 //!   HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID,
-//!   HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_KEY_ENV, HUMAUX_PRIVATE_WORKER_MODEL_ID,
+//!   HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_MODEL_ID,
 //!   HUMAUX_PRIVATE_WORKER_MODEL_REVISION, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_PROVIDER_ID,
 //!   HUMAUX_PRIVATE_WORKER_REGION, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS,
 //!   HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS, HUMAUX_RETRIEVAL_WORKER_BATCH, HUMAUX_RETRIEVAL_WORKER_CALLER,
@@ -62,15 +63,16 @@
 //!   four children it spawned (stopped via their Child handles, never by port or name), all torn down by Drop regardless
 //!   of outcome; each step prints PASS|FAIL and the exit is 0 only if every step passed; PostgreSQL/Qdrant/provider down
 //!   -> the step that needed it FAILs with the stuck stage named; no key, pepper or DSN is printed]
-//! Spec: Baseline §4.2; §16.2; §23.1; §52.3; ADR-0052; ADR-0053
+//! Spec: Baseline §4.2; §16.2; §23.1; §52.3; ADR-0052; ADR-0053; ADR-0059
 //!
 //! `cargo xtask e2e-onboard` — every step prints `e2e-onboard: <step> PASS|FAIL <detail>` and the
 //! command exits 0 only if every step passed. It owns everything it touches and nothing else:
 //! the database `humaux_thread_c28_onboard_<pid>` (created from migrations 0001→head in-process,
 //! dropped at the end), the Qdrant collection `humaux_c28_onboard_<pid>` on the shared container
 //! (deleted at the end), and the four child processes it spawned (stopped through their own
-//! `Child` handles — never by port or name). Role DSNs are rewritten to host `localhost`, a
-//! hostname, so the maintenance binary is exercised without the seed's 127.0.0.1 guard.
+//! `Child` handles — never by port or name). Role DSNs (each its own env variable, including
+//! `PRIVATE_WORKER_PG_DSN`; ADR-0059 D-D) are rewritten to host `localhost`, a hostname, so the
+//! maintenance binary is exercised without the seed's 127.0.0.1 guard.
 //!
 //! Secrets: the pepper is minted per run; `DASHSCOPE_API_KEY` / `MINIMAX_API_KEY` come from the
 //! environment or, failing that, from the same two files `docs/ops/rehearse.sh` sources (only the
@@ -94,6 +96,8 @@ const OWNER_DSN: &str = "HUMAUX_TEST_PG_DSN";
 const MAINTENANCE_DSN: &str = "HUMAUX_MAINTENANCE_PG_DSN";
 const GATEWAY_DSN: &str = "HUMAUX_GATEWAY_PG_DSN";
 const RETRIEVAL_DSN: &str = "HUMAUX_RETRIEVAL_WORKER_PG_DSN";
+// ADR-0059 D-D: the private worker logs in with its own env DSN (the name its binary reads).
+const PRIVATE_WORKER_DSN: &str = "PRIVATE_WORKER_PG_DSN";
 /// The rehearsal's own key files (`docs/ops/rehearse.sh`), read only when the environment does
 /// not already carry the key.
 const DASHSCOPE_KEY_FILE: &str = "/Volumes/data/humaux-thread/.env.local";
@@ -163,12 +167,6 @@ fn rewrite_dsn(dsn: &str, db: &str) -> Option<String> {
     let (hostport, _path) = hostpath.split_once('/')?;
     let port = hostport.rsplit_once(':').map_or("5432", |(_, p)| p);
     Some(format!("{scheme}://{userinfo}@localhost:{port}/{db}"))
-}
-
-/// The private worker's DSN: the gateway's with the role swapped (the dev roles share one
-/// `devlocal_<role>` password convention; live_env.sh carries no private-worker DSN).
-fn private_worker_dsn(gateway: &str) -> String {
-    gateway.replace("role_gateway", "role_private_worker")
 }
 
 /// One key out of a dotenv file (`KEY=v` or `export KEY=v`, optional quotes); never logged.
@@ -276,6 +274,8 @@ struct Env {
     retrieval: String,
     private_worker: String,
     pepper: String,
+    /// ADR-0059 D-G: the gateway's per-run consistency-token MAC key (hex, 32 bytes), never printed.
+    token_hmac_key: String,
     dashscope: String,
     minimax: String,
     gitleaks: [String; 3],
@@ -287,14 +287,14 @@ impl Env {
         let var = |name: &str| std::env::var(name).map_err(|_| format!("missing env {name}"));
         let rewrite =
             |name: &str| var(name).and_then(|d| rewrite_dsn(&d, db).ok_or(format!("bad {name}")));
-        let gateway = rewrite(GATEWAY_DSN)?;
         Ok(Self {
             owner: rewrite(OWNER_DSN)?,
             maintenance: rewrite(MAINTENANCE_DSN)?,
-            private_worker: private_worker_dsn(&gateway),
-            gateway,
+            private_worker: rewrite(PRIVATE_WORKER_DSN)?,
+            gateway: rewrite(GATEWAY_DSN)?,
             retrieval: rewrite(RETRIEVAL_DSN)?,
             pepper: hex_of(Uuid::new_v4().as_bytes()) + &hex_of(Uuid::new_v4().as_bytes()),
+            token_hmac_key: hex_of(Uuid::new_v4().as_bytes()) + &hex_of(Uuid::new_v4().as_bytes()),
             dashscope: key_from("DASHSCOPE_API_KEY", DASHSCOPE_KEY_FILE)
                 .ok_or("DASHSCOPE_API_KEY unavailable")?,
             minimax: key_from("MINIMAX_API_KEY", MINIMAX_KEY_FILE)
@@ -789,9 +789,39 @@ pub fn run(_args: &[String]) -> i32 {
         &["--serve"],
         &runner,
     );
+    // BYOK lane (seed), before the private worker starts: ADR-0059 D-I keys the worker's credential
+    // map on the lane's credential reference, which exists only once the lane is seeded. An
+    // unseeded lane leaves the map explicitly empty (the worker boots; every route parks
+    // CREDENTIAL_NOT_MAPPED), and `byok_lane` is already red.
+    let lane = seed_lane(
+        &mut owner,
+        tenant,
+        user,
+        domain,
+        &LaneFlags {
+            egress_processor_id: egress.parse().unwrap_or_else(|_| Uuid::nil()),
+            region: MM_REGION.to_owned(),
+            service_tier: "standard".to_owned(),
+            endpoint_ref: MM_URL.to_owned(),
+            provider_id: MM_PROVIDER.to_owned(),
+            provider_model_id: MM_MODEL.to_owned(),
+            model_revision: MM_REV.to_owned(),
+        },
+    );
+    report.step(
+        "byok_lane",
+        lane.is_ok(),
+        lane.as_ref().map_or_else(Clone::clone, |_| {
+            "e2e_seed::seed_lane for t1 (card 52 moves it into onboarding)".to_owned()
+        }),
+    );
+    let credentials = lane.as_ref().map_or_else(
+        |_| String::new(),
+        |l| format!("{}=MINIMAX_API_KEY", l.credential_id),
+    );
     let distill: Vec<(&str, &str)> = vec![
         ("PRIVATE_WORKER_PG_DSN", env.private_worker.as_str()),
-        ("HUMAUX_PRIVATE_WORKER_KEY_ENV", "MINIMAX_API_KEY"),
+        ("HUMAUX_PRIVATE_WORKER_CREDENTIALS", credentials.as_str()),
         ("MINIMAX_API_KEY", env.minimax.as_str()),
         ("HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS", "120"),
         ("HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS", "60"),
@@ -838,6 +868,7 @@ pub fn run(_args: &[String]) -> i32 {
         ("HUMAUX_GATEWAY_PG_DSN", env.gateway.as_str()),
         ("HUMAUX_GATEWAY_BIND_ADDR", bind.as_str()),
         ("HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX", env.pepper.as_str()),
+        ("HUMAUX_GATEWAY_TOKEN_HMAC_KEY", env.token_hmac_key.as_str()),
         ("HUMAUX_GATEWAY_ALLOWED_HOSTS", bind.as_str()),
         ("HUMAUX_GATEWAY_ALLOWED_ORIGINS", origin.as_str()),
         ("HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES", "1048576"),
@@ -994,29 +1025,7 @@ pub fn run(_args: &[String]) -> i32 {
         format!("DEPENDENCY_UNAVAILABLE count={dependency_unavailable}"),
     );
 
-    // ---- 5. BYOK lane (seed), 5 remember.put, recall returns all 5 with no operator action ----
-    let lane = seed_lane(
-        &mut owner,
-        tenant,
-        user,
-        domain,
-        &LaneFlags {
-            egress_processor_id: egress.parse().unwrap_or_else(|_| Uuid::nil()),
-            region: MM_REGION.to_owned(),
-            service_tier: "standard".to_owned(),
-            endpoint_ref: MM_URL.to_owned(),
-            provider_id: MM_PROVIDER.to_owned(),
-            provider_model_id: MM_MODEL.to_owned(),
-            model_revision: MM_REV.to_owned(),
-        },
-    );
-    report.step(
-        "byok_lane",
-        lane.is_ok(),
-        lane.as_ref().map_or_else(Clone::clone, |_| {
-            "e2e_seed::seed_lane for t1 (card 52 moves it into onboarding)".to_owned()
-        }),
-    );
+    // ---- 5. 5 remember.put, recall returns all 5 with no operator action ----
     let mut put_ok = 0;
     for sentinel in SENTINELS {
         let response = mcp(

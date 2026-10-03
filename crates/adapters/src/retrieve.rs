@@ -1,18 +1,19 @@
 //! `adapters::retrieve` — §15.5 Read-your-writes (`consistency_token` issue/decode/scope-check) and the PostgreSQL
 //!   delta overlay `recall`/`context` fall back to when serving Qdrant has not yet caught up to a token's write
 //!   (T3.8).
-//! Depends-on: crates=[humaux-domain, humaux-infra-cell, humaux-projection, humaux-retrieval, sqlx];
+//! Depends-on: crates=[hex, hmac, humaux-domain, humaux-infra-cell, humaux-projection, humaux-retrieval, sha2, sqlx];
 //!   services=[PostgreSQL(role_gateway) r=[ops.outbox, private.evidence_objects, private.memory_evidence,
 //!   private.memory_records, projection.stream_checkpoints, projection.stream_log]]; env=[CARGO_MANIFEST_DIR];
 //!   modules=[adapters::context_repo, adapters::postgres, adapters::private_projection_registry, adapters::qdrant,
 //!   adapters::read_materialize, adapters::serving_repo, adapters::stream_repo, domain::affect, domain::error,
 //!   domain::identity, domain::ids, domain::subject, infra-cell::permit, infra-cell::transport, projection::dense, projection::serving,
 //!   projection::stream, retrieval::completeness, retrieval::envelope]
-//! Called-by: [adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::provisioning, adapters::read_materialize, adapters::remember, adapters::stream_repo, gateway::recall, tests, xtask::switch_visible]
+//! Called-by: [adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::provisioning, adapters::read_materialize, adapters::remember, adapters::stream_repo, gateway::bootstrap, gateway::recall, tests, xtask::switch_visible]
 //! Invariants: [read-your-writes on role_gateway: an expired token, cross-tenant/workspace scope or a changed serving
 //!   projection is a typed RetrieveError, never a stale answer passed off as caught up; the read-route visible count
-//!   is caller-scoped (family_probe), the visibility-free stream count serves ops callers only (ADR-0057 D-C)]
-//! Spec: Baseline §6.2.3; ADR-0057
+//!   is caller-scoped (family_probe), the visibility-free stream count serves ops callers only (ADR-0057 D-C);
+//!   the consistency token is MAC-verified before any field is parsed and carries no authorization (ADR-0059 D-G)]
+//! Spec: Baseline §6.2.3, §15.5; ADR-0057; ADR-0059
 //!
 //! **Why this lives in `humaux-adapters`, not `humaux-application`**: every function below
 //! that touches PostgreSQL needs `&RuntimeDbPool`, and [`crate::postgres::RuntimeDbPool`]'s
@@ -26,9 +27,8 @@
 //! `crates/application/Cargo.toml` dependency edit against a shared file with no compile-time
 //! way to use the added dependency anyway (see the doc comment cited above).
 //!
-//! Token format is self-contained here (hex-encoded field list, no signature — see
-//! [`decode_consistency_token`]'s doc for the ponytail note on that ceiling) rather than
-//! reusing `humaux_projection::stream::StreamKey`'s `Serialize`/`Deserialize` (it derives
+//! Token format is self-contained here (hex-encoded field list + key id + HMAC-SHA256, ADR-0059
+//! D-G) rather than reusing `humaux_projection::stream::StreamKey`'s `Serialize`/`Deserialize` (it derives
 //! neither, and this module does not own that file to add them). [`issue_consistency_token`]
 //! is the only encoder: `crate::remember::remember` builds [`TokenClaims`] from its in-transaction
 //! Evidence/stream write and returns the result only after commit, so every returned token is
@@ -71,6 +71,9 @@ pub enum RetrieveError {
     Db(sqlx::Error),
     /// Malformed token: not valid hex, wrong field count, or an unparsable field.
     TokenMalformed(&'static str),
+    /// ADR-0059 D-G: no token key set is installed in this process, so no token can be issued or
+    /// verified (there is no default key).
+    TokenKeysUnset,
     /// §15.1 nine-state closed set: a `state` value came back that matches none of them —
     /// only reachable if `stream_log_state_check` has drifted from [`ProcessingState`] (§78.2).
     UnknownProcessingState(String),
@@ -124,6 +127,7 @@ impl std::fmt::Display for RetrieveError {
         match self {
             Self::Db(e) => write!(f, "retrieve overlay DB error: {e}"),
             Self::TokenMalformed(why) => write!(f, "consistency_token malformed: {why}"),
+            Self::TokenKeysUnset => write!(f, "consistency_token key set is not installed"),
             Self::UnknownProcessingState(s) => {
                 write!(
                     f,
@@ -299,20 +303,115 @@ impl TokenClaims {
 
 const FIELD_SEP: char = '\u{1}';
 
+/// §15.5 / ADR-0059 D-G: MAC domain label; the kid label below keeps the two derivations apart.
+const MAC_LABEL: &[u8] = b"humaux.consistency_token.v1";
+const KID_LABEL: &[u8] = b"humaux.consistency_token.kid.v1";
+/// ADR-0059 D-G: a token key is ≥ 32 bytes, the HMAC-SHA256 block-security floor.
+const MIN_TOKEN_KEY_BYTES: usize = 32;
+
+type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+/// ADR-0059 D-G: the gateway's token MAC key set — `current` signs and verifies, `previous`
+/// (rotation window only) verifies. `Debug` prints key ids only, never key bytes.
+pub struct TokenKeys {
+    current: Vec<u8>,
+    previous: Option<Vec<u8>>,
+}
+
+impl TokenKeys {
+    /// Validates the set: each key ≥ 32 bytes and `previous != current`. The error names the
+    /// failed rule, never a key byte.
+    pub fn new(current: Vec<u8>, previous: Option<Vec<u8>>) -> Result<Self, &'static str> {
+        if current.len() < MIN_TOKEN_KEY_BYTES {
+            return Err("current token key shorter than 32 bytes");
+        }
+        if let Some(prev) = &previous {
+            if prev.len() < MIN_TOKEN_KEY_BYTES {
+                return Err("previous token key shorter than 32 bytes");
+            }
+            if *prev == current {
+                return Err("previous token key equals the current key");
+            }
+        }
+        Ok(Self { current, previous })
+    }
+
+    fn by_kid(&self, kid: &str) -> Option<&[u8]> {
+        std::iter::once(self.current.as_slice())
+            .chain(self.previous.as_deref())
+            .find(|key| key_id(key) == kid)
+    }
+}
+
+impl std::fmt::Debug for TokenKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenKeys")
+            .field("current_kid", &key_id(&self.current))
+            .field("previous_kid", &self.previous.as_deref().map(key_id))
+            .finish()
+    }
+}
+
+/// ADR-0059 D-G: first 8 hex chars of `SHA-256(KID_LABEL ‖ 0x00 ‖ key)`.
+fn key_id(key: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::new()
+        .chain_update(KID_LABEL)
+        .chain_update([0u8])
+        .chain_update(key)
+        .finalize();
+    hex::encode(&digest[..4])
+}
+
+fn token_mac(key: &[u8], plain11: &str, kid: &str) -> HmacSha256 {
+    use hmac::Mac as _;
+    let mut mac =
+        <HmacSha256 as hmac::KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(MAC_LABEL);
+    mac.update(&[0u8]);
+    mac.update(plain11.as_bytes());
+    mac.update(FIELD_SEP.to_string().as_bytes());
+    mac.update(kid.as_bytes());
+    mac
+}
+
+// ponytail: one key set per process (OnceLock); key change = restart; pass TokenKeys by value if
+// a second issuing process ever appears.
+static TOKEN_KEYS: std::sync::OnceLock<TokenKeys> = std::sync::OnceLock::new();
+
+/// ADR-0059 D-G: installs the process-wide key set. Re-installing an identical set is `Ok`; a
+/// different set is `Err` (a key change needs a restart). Production calls this exactly once,
+/// in gateway bootstrap (architecture-check pins the call site count).
+pub fn install_token_keys(keys: TokenKeys) -> Result<(), &'static str> {
+    // §80.2 G80-6: `SCREAMING.set(` is this repo's metric-emit convention, so the cell is filled
+    // through `get_or_init` and never reads as a gauge.
+    let mut offered = Some(keys);
+    let installed = TOKEN_KEYS.get_or_init(|| offered.take().expect("runs at most once"));
+    match offered {
+        None => Ok(()),
+        Some(keys) if installed.current == keys.current && installed.previous == keys.previous => {
+            Ok(())
+        }
+        Some(_) => Err("a different token key set is already installed"),
+    }
+}
+
+fn installed_token_keys() -> Result<&'static TokenKeys, RetrieveError> {
+    TOKEN_KEYS.get().ok_or(RetrieveError::TokenKeysUnset)
+}
+
 /// Sole constructor for an opaque `consistency_token` string (§15.5 "consistency_token 是服务
-/// 器生成的不透明值...Agent 不需要理解...也不能自行构造 token"). `remember()`'s transaction B
-/// (T3.1/T3.2, not yet landed) is expected to call this exact function once it exists —
-/// documented here so that task converges on it instead of re-deriving the wire format.
-///
-/// ponytail: field-list + hex, no signature. §15.5 states outright this is "只提供
-/// read-your-writes 约束，不是认证 token" — the real security boundary is PostgreSQL RLS on
-/// `humaux.tenant_id` from the *authenticated session*, not from anything this token claims;
-/// [`validate_scope`] below rejects a mismatch before any query runs, so a hand-forged token
-/// cannot widen what RLS already lets the caller see, only make `recall`/`context` return a
-/// `CrossTenant`/`CrossWorkspace` error for its own request. Upgrade path if that stops being
-/// true (e.g. this token starts gating something RLS does not independently enforce): HMAC-
-/// sign the field list with a server-held key, verify in [`decode_consistency_token`].
-pub fn issue_consistency_token(claims: &TokenClaims) -> String {
+/// 器生成的不透明值...Agent 不需要理解...也不能自行构造 token"), signed with the installed key
+/// set; `Err(TokenKeysUnset)` when no set is installed (no default key, ADR-0059 D-G).
+pub fn issue_consistency_token(claims: &TokenClaims) -> Result<String, RetrieveError> {
+    Ok(sign_with(installed_token_keys()?, claims))
+}
+
+/// §15.5 / ADR-0059 D-G wire v1: `hex(plain11 ‖ U+0001 ‖ kid ‖ U+0001 ‖ mac)`. The MAC proves only
+/// that a gateway holding this key issued these 11 fields unchanged; it is not authorization
+/// (rejected memory 710a2548): [`validate_scope`] and RLS remain the boundary.
+fn sign_with(keys: &TokenKeys, claims: &TokenClaims) -> String {
+    use hmac::Mac as _;
     let fields = [
         claims.tenant_id.to_string(),
         claims
@@ -329,29 +428,52 @@ pub fn issue_consistency_token(claims: &TokenClaims) -> String {
         claims.issued_at.unix_timestamp().to_string(),
         claims.expires_at.unix_timestamp().to_string(),
     ];
-    let plain = fields.join("\u{1}");
-    plain
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    let plain11 = fields.join("\u{1}");
+    let kid = key_id(&keys.current);
+    let mac = hex::encode(
+        token_mac(&keys.current, &plain11, &kid)
+            .finalize()
+            .into_bytes(),
+    );
+    hex::encode(format!("{plain11}{FIELD_SEP}{kid}{FIELD_SEP}{mac}"))
 }
 
-/// Inverse of [`issue_consistency_token`]. Every failure mode returns
-/// [`RetrieveError::TokenMalformed`] — never panics on attacker/client-controlled input.
+/// Inverse of [`issue_consistency_token`] against the installed key set. Every failure mode
+/// returns [`RetrieveError::TokenMalformed`] (or `TokenKeysUnset`) — never panics on
+/// attacker/client-controlled input.
 pub fn decode_consistency_token(token: &str) -> Result<TokenClaims, RetrieveError> {
+    verify_with(installed_token_keys()?, token)
+}
+
+/// §15.5 / ADR-0059 D-G: kid lookup, then constant-time MAC verification, and only then the
+/// 11-field parse — the field parser never sees unauthenticated bytes.
+fn verify_with(keys: &TokenKeys, token: &str) -> Result<TokenClaims, RetrieveError> {
+    use hmac::Mac as _;
     if !token.len().is_multiple_of(2) || token.is_empty() {
         return Err(RetrieveError::TokenMalformed("odd length or empty"));
     }
-    let mut bytes = Vec::with_capacity(token.len() / 2);
-    let chars: Vec<char> = token.chars().collect();
-    for pair in chars.chunks(2) {
-        let hex: String = pair.iter().collect();
-        let b =
-            u8::from_str_radix(&hex, 16).map_err(|_| RetrieveError::TokenMalformed("not hex"))?;
-        bytes.push(b);
-    }
-    let plain = String::from_utf8(bytes).map_err(|_| RetrieveError::TokenMalformed("not utf8"))?;
+    let bytes = hex::decode(token).map_err(|_| RetrieveError::TokenMalformed("not hex"))?;
+    let signed = String::from_utf8(bytes).map_err(|_| RetrieveError::TokenMalformed("not utf8"))?;
+    let mut tail = signed.rsplitn(3, FIELD_SEP);
+    let (Some(mac_hex), Some(kid), Some(plain11)) = (tail.next(), tail.next(), tail.next()) else {
+        return Err(RetrieveError::TokenMalformed("wrong field count"));
+    };
+    let key = keys
+        .by_kid(kid)
+        .ok_or(RetrieveError::TokenMalformed("token key unknown"))?;
+    let tag = hex::decode(mac_hex)
+        .ok()
+        .filter(|t| t.len() == 32)
+        .ok_or(RetrieveError::TokenMalformed("token signature"))?;
+    token_mac(key, plain11, kid)
+        .verify_slice(&tag)
+        .map_err(|_| RetrieveError::TokenMalformed("token signature"))?;
+    parse_token_fields(plain11)
+}
+
+/// The 11-field parser; private, called only from [`verify_with`] (architecture-check pins one
+/// call site, ADR-0059 D-G).
+fn parse_token_fields(plain: &str) -> Result<TokenClaims, RetrieveError> {
     let parts: Vec<&str> = plain.split(FIELD_SEP).collect();
     let [
         tenant_id,
@@ -1453,12 +1575,13 @@ mod contract_tests {
             issued_at: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
             expires_at: OffsetDateTime::from_unix_timestamp(1_700_003_600).unwrap(),
         };
-        let token = issue_consistency_token(&claims);
+        let keys = test_keys(None);
+        let token = sign_with(&keys, &claims);
         assert!(
             token.chars().all(|c| c.is_ascii_hexdigit()),
             "token must be pure hex"
         );
-        let decoded = decode_consistency_token(&token).expect("round trip must decode");
+        let decoded = verify_with(&keys, &token).expect("round trip must decode");
         assert_eq!(decoded, claims);
     }
 
@@ -1477,26 +1600,134 @@ mod contract_tests {
             issued_at: OffsetDateTime::from_unix_timestamp(0).unwrap(),
             expires_at: OffsetDateTime::from_unix_timestamp(3600).unwrap(),
         };
-        let token = issue_consistency_token(&claims);
-        let decoded = decode_consistency_token(&token).expect("round trip must decode");
+        let keys = test_keys(None);
+        let token = sign_with(&keys, &claims);
+        let decoded = verify_with(&keys, &token).expect("round trip must decode");
         assert_eq!(decoded.workspace_id, None);
         assert_eq!(decoded, claims);
     }
 
     #[test]
     fn decode_rejects_garbage() {
+        let keys = test_keys(None);
+        for garbage in ["not hex at all!!", "", "abc"] {
+            assert!(matches!(
+                verify_with(&keys, garbage),
+                Err(RetrieveError::TokenMalformed(_))
+            ));
+        }
+    }
+
+    /// A fresh random key per call; tests never use a literal key.
+    fn random_key() -> Vec<u8> {
+        (0..2).flat_map(|_| *Uuid::new_v4().as_bytes()).collect()
+    }
+
+    fn test_keys(previous: Option<Vec<u8>>) -> TokenKeys {
+        TokenKeys::new(random_key(), previous).expect("valid test key set")
+    }
+
+    fn sample_claims() -> TokenClaims {
+        TokenClaims {
+            tenant_id: Uuid::new_v4(),
+            workspace_id: Some(Uuid::new_v4()),
+            scope_kind: "workspace".to_string(),
+            scope_id: Uuid::new_v4(),
+            domain: "knowledge".to_string(),
+            projection_kind: "ingest".to_string(),
+            projection_version: "v1".to_string(),
+            stream_seq: 7,
+            commit_seq: 9,
+            issued_at: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+            expires_at: OffsetDateTime::from_unix_timestamp(1_700_000_060).unwrap(),
+        }
+    }
+
+    /// Re-encodes a signed token with its 11th field (expires_at) replaced, kid and MAC kept.
+    fn tamper_expires_at(token: &str, new_expires_at: i64) -> String {
+        let signed = String::from_utf8(hex::decode(token).unwrap()).unwrap();
+        let mut parts: Vec<String> = signed.split(FIELD_SEP).map(str::to_string).collect();
+        assert_eq!(parts.len(), 13, "v1 token = 11 fields + kid + mac");
+        parts[10] = new_expires_at.to_string();
+        hex::encode(parts.join(&FIELD_SEP.to_string()))
+    }
+
+    #[test]
+    fn token_with_tampered_expires_at_is_refused() {
+        // §15.5 / ADR-0059 D-G, card 33 acceptance: an edited expires_at fails the MAC.
+        let keys = test_keys(None);
+        let claims = sample_claims();
+        let token = sign_with(&keys, &claims);
+        let tampered = tamper_expires_at(&token, claims.expires_at.unix_timestamp() + 86_400);
         assert!(matches!(
-            decode_consistency_token("not hex at all!!"),
-            Err(RetrieveError::TokenMalformed(_))
+            verify_with(&keys, &tampered),
+            Err(RetrieveError::TokenMalformed("token signature"))
         ));
+        assert_eq!(verify_with(&keys, &token).unwrap(), claims);
+    }
+
+    /// ADR-0059 D-G wire v1, computed independently of `token_mac`/`key_id`: the MAC covers the
+    /// label, all 11 fields and the kid, and the kid is the labelled key digest. A MAC that drops
+    /// the kid (or any field) changes the token and turns this red.
+    #[test]
+    fn token_mac_covers_label_fields_and_kid() {
+        use hmac::Mac as _;
+        use sha2::Digest as _;
+        let keys = test_keys(None);
+        let token = sign_with(&keys, &sample_claims());
+        let signed = String::from_utf8(hex::decode(&token).unwrap()).unwrap();
+        let (rest, mac_hex) = signed.rsplit_once(FIELD_SEP).unwrap();
+        let (plain11, kid) = rest.rsplit_once(FIELD_SEP).unwrap();
+        assert_eq!(plain11.split(FIELD_SEP).count(), 11);
+        let digest = sha2::Sha256::new()
+            .chain_update(b"humaux.consistency_token.kid.v1")
+            .chain_update([0u8])
+            .chain_update(&keys.current)
+            .finalize();
+        assert_eq!(kid, hex::encode(&digest[..4]));
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(&keys.current).unwrap();
+        mac.update(b"humaux.consistency_token.v1\0");
+        mac.update(format!("{plain11}\u{1}{kid}").as_bytes());
+        assert_eq!(mac_hex, hex::encode(mac.finalize().into_bytes()));
+    }
+
+    #[test]
+    fn token_from_previous_key_verifies_and_unknown_kid_is_refused() {
+        let old = test_keys(None);
+        let claims = sample_claims();
+        let token = sign_with(&old, &claims);
+        let rotated = TokenKeys::new(random_key(), Some(old.current.clone())).unwrap();
+        assert_eq!(verify_with(&rotated, &token).unwrap(), claims);
+        let closed = TokenKeys::new(rotated.current.clone(), None).unwrap();
         assert!(matches!(
-            decode_consistency_token(""),
-            Err(RetrieveError::TokenMalformed(_))
+            verify_with(&closed, &token),
+            Err(RetrieveError::TokenMalformed("token key unknown"))
         ));
+        let signed = String::from_utf8(hex::decode(&token).unwrap()).unwrap();
+        let mut parts: Vec<&str> = signed.split(FIELD_SEP).collect();
+        parts[11] = "00000000";
+        let forged_kid = hex::encode(parts.join(&FIELD_SEP.to_string()));
         assert!(matches!(
-            decode_consistency_token("abc"),
-            Err(RetrieveError::TokenMalformed(_))
+            verify_with(&rotated, &forged_kid),
+            Err(RetrieveError::TokenMalformed("token key unknown"))
         ));
+    }
+
+    #[test]
+    fn token_keys_debug_prints_kids_only() {
+        let keys = test_keys(Some(random_key()));
+        let shown = format!("{keys:?}");
+        assert!(!shown.contains(&hex::encode(&keys.current)));
+        assert!(!shown.contains(&hex::encode(keys.previous.as_ref().unwrap())));
+        assert!(shown.contains(&key_id(&keys.current)));
+    }
+
+    #[test]
+    fn token_keys_refuse_short_or_equal_previous() {
+        assert!(TokenKeys::new(vec![7; 31], None).is_err());
+        let k = random_key();
+        assert!(TokenKeys::new(k.clone(), Some(k.clone())).is_err());
+        assert!(TokenKeys::new(k, Some(vec![7; 31])).is_err());
     }
 
     fn auth(tenant_id: Uuid, workspaces: impl IntoIterator<Item = Uuid>) -> AuthorizationScope {

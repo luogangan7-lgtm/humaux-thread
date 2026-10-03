@@ -1,10 +1,11 @@
 //! `private-worker::main` — `humaux-private-worker` process entry (§4.2 minimal process set; §4.4 admin probe
 //!   contract; §11/§11.1 T4.4+T4.5; §11.8 ADR-0015 inference RPC).
-//! Depends-on: crates=[humaux-adapters, humaux-domain, tokio, uuid]; services=[PostgreSQL(role_private_worker)]; env=[HUMAUX_PRIVATE_WORKER_CAPABILITIES, HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT, HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS, HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS, HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_KEY_ENV, HUMAUX_PRIVATE_WORKER_MODEL_ID, HUMAUX_PRIVATE_WORKER_MODEL_REVISION, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_PROVIDER_ID, HUMAUX_PRIVATE_WORKER_REGION, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, PRIVATE_WORKER_PG_DSN]; modules=[adapters::byok, adapters::byok::ssrf, adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::disclosure, adapters::jobs, adapters::postgres, domain::authority, domain::egress, private-worker::distill, private-worker::inference_rpc]
+//! Depends-on: crates=[humaux-adapters, humaux-domain, tokio, uuid]; services=[PostgreSQL(role_private_worker)]; env=[HUMAUX_PRIVATE_WORKER_CAPABILITIES, HUMAUX_PRIVATE_WORKER_CHAT_URL, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT, HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS, HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS, HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_KEY_ENV, HUMAUX_PRIVATE_WORKER_MODEL_ID, HUMAUX_PRIVATE_WORKER_MODEL_REVISION, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_PROVIDER_ID, HUMAUX_PRIVATE_WORKER_REGION, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, PRIVATE_WORKER_PG_DSN]; modules=[adapters::byok, adapters::byok::ssrf, adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::disclosure, adapters::jobs, adapters::postgres, domain::authority, domain::egress, private-worker::distill, private-worker::inference_rpc]
 //! Called-by: [process(humaux-private-worker)]
 //! Invariants: [the only process holding both role_private_worker DB write and BYOK decrypt capability (§11.1); a
-//!   missing/invalid env value or unreachable DSN exits non-zero before serving]
-//! Spec: Baseline §11.1; §11.8; §78.1; ADR-0037; ADR-0036; ADR-0016; ADR-0058
+//!   missing/invalid env value or unreachable DSN exits non-zero before serving; a credential reference resolves to
+//!   its own mapped key or to none, never to another reference's key (ADR-0059 D-I)]
+//! Spec: Baseline §11.1; §11.8; §78.1; ADR-0037; ADR-0036; ADR-0016; ADR-0058; ADR-0059
 //!
 //! §11.1: "仅 humaux-private-worker 在最贴近 adapter 处解密" — this is the one process in the
 //! workspace permitted to hold both DB write capability (`PrivateWorkerDbPool`,
@@ -34,6 +35,7 @@
 //!   `ops.claim_derived_work_v2` (migration 0190), and everything after the claim runs under that
 //!   job's own tenant context.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -196,20 +198,34 @@ impl Shutdown {
     }
 }
 
-/// The one BYOK credential this process holds (§4.2 one process, one credential). Read from
-/// `HUMAUX_PRIVATE_WORKER_PROVIDER_API_KEY` once at startup, handed out only as a
-/// [`PlaintextApiKey`] (whose `Debug`/`Display` print a fingerprint, never the value) and read
-/// only inside `OpenAiCompatibleProvider::build_openai_request` — the §11.1 "closest to the
-/// adapter" point. Nothing in this file logs or formats it.
-// ponytail: env-held key until `adapters::openbao` stops being a placeholder; the OpenBao
-// decryptor replaces this impl and nothing else here changes. Written out as the desugared
-// `async_trait` signature because `async-trait` is a dev-only dependency of this binary.
-struct EnvCredential(String);
+/// The required credential map (ADR-0059 D-I): `<credential_ref uuid>=<ENV_NAME>[,…]`. It holds
+/// variable NAMES only; each key stays in its own environment variable.
+const CREDENTIALS: &str = "HUMAUX_PRIVATE_WORKER_CREDENTIALS";
+/// The single-key variable of card 32, removed by ADR-0059 D-I. Refused when set, so stale
+/// configuration is never silently ignored.
+const LEGACY_KEY_ENV: &str = "HUMAUX_PRIVATE_WORKER_KEY_ENV";
 
-impl CredentialDecryptor for EnvCredential {
+/// The BYOK keys this process holds, one per `credential_ref` (§11.1, ADR-0059 D-I). Built once at
+/// startup by [`credential_map`]; a key leaves it only as a [`PlaintextApiKey`] (whose `Debug`/
+/// `Display` print a fingerprint) inside `OpenAiCompatibleProvider::build_openai_request`, the
+/// §11.1 "closest to the adapter" point. No `Debug`: nothing can format the map.
+// ponytail: env-held keys until card 54 (OpenBao) replaces this impl; provider/model/endpoint
+// stay process-level until card 33b resolves them per binding. Written out as the desugared
+// `async_trait` signature because `async-trait` is a dev-only dependency of this binary.
+struct EnvCredentialMap(BTreeMap<Uuid, String>);
+
+impl EnvCredentialMap {
+    /// The references this process can serve: the dispatcher's pre-reserve check (ADR-0059 D-I)
+    /// comes from the same parse as the keys, so the two cannot drift.
+    fn refs(&self) -> BTreeSet<Uuid> {
+        self.0.keys().copied().collect()
+    }
+}
+
+impl CredentialDecryptor for EnvCredentialMap {
     fn resolve<'life0, 'async_trait>(
         &'life0 self,
-        _credential_ref: CredentialRef,
+        credential_ref: CredentialRef,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<PlaintextApiKey, ReasoningProviderError>>
@@ -221,18 +237,101 @@ impl CredentialDecryptor for EnvCredential {
         'life0: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(std::future::ready(Ok(PlaintextApiKey::new(self.0.clone()))))
+        // ADR-0059 D-I: exactly the key of this reference, never a fallback to another one. The
+        // miss is defence in depth: distill parks before reserving (CREDENTIAL_NOT_MAPPED); the
+        // RPC paths meet it after their reservation (ADR-0059 L7).
+        let key = self
+            .0
+            .get(&credential_ref.credential_id())
+            .map(|key| PlaintextApiKey::new(key.clone()))
+            .ok_or(ReasoningProviderError::WaitingKey { fingerprint: None });
+        Box::pin(std::future::ready(key))
     }
+}
+
+/// Parses [`CREDENTIALS`] through `lookup` (production: the process environment). Refuses, naming
+/// the variable and never a value: an unset map (required, no default); [`LEGACY_KEY_ENV`] set; an
+/// entry without exactly one `=`; a non-UUID or nil reference; a name outside `[A-Z0-9_]+`; a
+/// duplicate reference; a named variable that is empty (named) or unset (named by its entry and
+/// credential_ref only, never echoed: ADR-0059 D-I). An explicitly empty map is
+/// accepted (main-line amendment 2026-10-02 22:30): every route then parks `CREDENTIAL_NOT_MAPPED`,
+/// so a node with no credentials yet does not crash-loop under supervision. Two references may
+/// share one variable.
+fn credential_map(lookup: impl Fn(&str) -> Option<String>) -> Result<EnvCredentialMap, String> {
+    if lookup(LEGACY_KEY_ENV).is_some() {
+        return Err(format!(
+            "invalid configuration: {LEGACY_KEY_ENV} was removed by ADR-0059 D-I; use {CREDENTIALS}"
+        ));
+    }
+    let spec = lookup(CREDENTIALS)
+        .ok_or_else(|| format!("missing required configuration: {CREDENTIALS}"))?;
+    let mut keys = BTreeMap::new();
+    if spec.is_empty() {
+        return Ok(EnvCredentialMap(keys));
+    }
+    for (n, entry) in spec.split(',').enumerate() {
+        let invalid = |what: &str| {
+            format!(
+                "invalid configuration: {CREDENTIALS} entry {} {what}",
+                n + 1
+            )
+        };
+        let (reference, name) = entry
+            .split_once('=')
+            .filter(|(_, name)| !name.contains('='))
+            .ok_or_else(|| invalid("is not <credential_ref>=<ENV_NAME>"))?;
+        let reference = reference
+            .trim()
+            .parse::<Uuid>()
+            .ok()
+            .filter(|r| !r.is_nil())
+            .ok_or_else(|| invalid("has no non-nil UUID reference"))?;
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(invalid("names a variable outside [A-Z0-9_]+"));
+        }
+        // ADR-0059 D-I: the right-hand side is echoed only when that variable exists (then it is
+        // a variable name); an unset one may be a pasted secret that happens to match
+        // [A-Z0-9_]+, so the refusal names the entry, its credential_ref and the pattern only.
+        let key = match lookup(name) {
+            Some(key) if !key.is_empty() => key,
+            Some(_) => {
+                return Err(format!(
+                    "missing required configuration: {name} is empty (named by {CREDENTIALS} \
+                     entry {} for credential_ref {reference})",
+                    n + 1
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "missing required configuration: <unset variable> named by {CREDENTIALS} \
+                     entry {} for credential_ref {reference} (a [A-Z0-9_]+ name that is not set; \
+                     not echoed)",
+                    n + 1
+                ));
+            }
+        };
+        if keys.insert(reference, key).is_some() {
+            return Err(invalid("repeats a credential reference"));
+        }
+    }
+    Ok(EnvCredentialMap(keys))
 }
 
 /// The provider + deployment config + `role_private_worker` pool every inference-bearing mode
 /// of this binary shares (`--serve-rpc`, `--distill-once`, `--distill-serve`) — one bootstrap,
-/// so the Distill hop and the RPC listener can never drift on which provider/endpoint/key they
-/// hold (§4.2 one process, one credential).
+/// so the Distill hop and the RPC listener can never drift on which provider/endpoint/keys they
+/// hold (§4.2 one process; ADR-0059 D-I one key per credential reference).
 struct Bootstrap {
     pool: PrivateWorkerDbPool,
     config: ContributionReasonerConfig,
-    provider: OpenAiCompatibleProvider<EgressHttpTransport, EnvCredential>,
+    provider: OpenAiCompatibleProvider<EgressHttpTransport, EnvCredentialMap>,
+    /// The references the provider's credential map holds (ADR-0059 D-I pre-reserve check).
+    credential_refs: BTreeSet<Uuid>,
     /// The provider transport timeout; the distill dispatcher sizes `ops.begin_call`'s window
     /// from it (ADR-0058 D-K).
     http_timeout: Duration,
@@ -255,13 +354,11 @@ async fn bootstrap() -> Result<Bootstrap, String> {
     };
     let http_timeout =
         Duration::from_secs(parse::<u64>("HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS")?);
-    // The NAME of the variable holding the key is configuration (required: a default would name a
-    // provider in code, §78.1); the key itself is read once, here, and only ever leaves this scope
-    // inside `EnvCredential`.
-    let key_env = required("HUMAUX_PRIVATE_WORKER_KEY_ENV")?;
-    let key = env::var(&key_env).map_err(|_| {
-        format!("missing required configuration: {key_env} (HUMAUX_PRIVATE_WORKER_KEY_ENV)")
-    })?;
+    // ADR-0059 D-I: the map names a key variable per credential reference (required: a default
+    // would name a provider in code, §78.1); the keys are read once, here, and only ever leave
+    // this scope inside `EnvCredentialMap`.
+    let credentials = credential_map(|name| env::var(name).ok())?;
+    let credential_refs = credentials.refs();
     // §11.4 static DNS pins (optional): `host=ip[|ip],...` — for hosts whose system DNS answer
     // is not trustworthy on this node. Unpinned hosts fall through to the system resolver
     // inside `PinnedDnsResolver`, so an empty/absent spec is exactly the old default. The
@@ -280,7 +377,7 @@ async fn bootstrap() -> Result<Bootstrap, String> {
         descriptor,
         chat_url,
         http_timeout,
-        EnvCredential(key),
+        credentials,
         ssrf::CustomEndpointPolicy::default(),
         Arc::clone(&resolver),
     )
@@ -321,6 +418,7 @@ async fn bootstrap() -> Result<Bootstrap, String> {
         pool,
         config,
         provider,
+        credential_refs,
         http_timeout,
     })
 }
@@ -380,6 +478,7 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
         pool,
         config,
         provider,
+        credential_refs,
         http_timeout,
     } = bootstrap().await?;
     let dispatch = DistillDispatchConfig {
@@ -399,6 +498,7 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
                 as f64,
             max_calls: parse::<i32>("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS")?,
         },
+        credential_refs,
     };
     dispatch.validate().map_err(|code| {
         format!(
@@ -441,4 +541,184 @@ async fn distill_mode(resident: bool) -> Result<(), String> {
     .map_err(|error| format!("distill dispatch failed: {error}"))?;
     println!("{}", report.summary_line());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `(variable name, value)` pairs one lookup serves.
+    type Vars = Vec<(&'static str, String)>;
+
+    /// A lookup over generated throwaway values (never a literal key).
+    fn lookup(vars: Vars) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    fn resolve(map: &EnvCredentialMap, r: Uuid) -> Result<PlaintextApiKey, ReasoningProviderError> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(map.resolve(CredentialRef::new(r)))
+    }
+
+    /// T23 (card-33 amendment gate) — fault: return the first key for every reference.
+    #[test]
+    fn credential_map_resolves_each_ref_to_its_own_key() {
+        let (r1, r2, r3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (k1, k2) = (
+            Uuid::new_v4().simple().to_string(),
+            Uuid::new_v4().simple().to_string(),
+        );
+        let map = credential_map(lookup(vec![
+            (CREDENTIALS, format!("{r1}=HX33_KEY_ONE,{r2}=HX33_KEY_TWO")),
+            ("HX33_KEY_ONE", k1.clone()),
+            ("HX33_KEY_TWO", k2.clone()),
+        ]))
+        .expect("valid map");
+        assert_eq!(map.refs(), BTreeSet::from([r1, r2]));
+        // `assert!(a == b)`: a failure never prints a key.
+        assert!(
+            resolve(&map, r1).expect("r1 mapped").expose() == k1,
+            "r1 must get k1"
+        );
+        assert!(
+            resolve(&map, r2).expect("r2 mapped").expose() == k2,
+            "r2 must get k2"
+        );
+        assert!(matches!(
+            resolve(&map, r3),
+            Err(ReasoningProviderError::WaitingKey { fingerprint: None })
+        ));
+    }
+
+    /// ADR-0059 D-I (card 33 review P2): an unset right-hand side is reported by entry and
+    /// credential_ref only. Fault: echo the right-hand side whatever it is.
+    #[test]
+    fn credential_map_unset_rhs_is_never_echoed() {
+        let r = Uuid::new_v4();
+        // ADR-0059 D-I: an unset right-hand side is never echoed (it may be a pasted secret that
+        // matches [A-Z0-9_]+); the refusal names the credential_ref instead. A set-but-empty one
+        // is a variable that exists, so its name is echoed.
+        let pasted = Uuid::new_v4().simple().to_string().to_ascii_uppercase();
+        let Err(unset) = credential_map(lookup(vec![(CREDENTIALS, format!("{r}={pasted}"))]))
+        else {
+            panic!("an unset right-hand side is refused");
+        };
+        assert!(!unset.contains(&pasted), "unset rhs echoed: {unset}");
+        assert!(unset.contains("<unset variable>"), "{unset}");
+        assert!(
+            unset.contains(&r.to_string()),
+            "names the credential_ref: {unset}"
+        );
+        let Err(empty_named) = credential_map(lookup(vec![
+            (CREDENTIALS, format!("{r}=HX33_KEY")),
+            ("HX33_KEY", String::new()),
+        ])) else {
+            panic!("an empty variable is refused");
+        };
+        assert!(
+            empty_named.contains("HX33_KEY is empty") && empty_named.contains(&r.to_string()),
+            "{empty_named}"
+        );
+    }
+
+    /// T24 — every boot refusal names a variable and never echoes a value. Fault: drop the
+    /// empty-value check (an empty key variable then boots).
+    #[test]
+    fn credential_map_boot_refusals() {
+        let r = Uuid::new_v4();
+        let key = Uuid::new_v4().simple().to_string();
+        let ok_key = || ("HX33_KEY", key.clone());
+        let cases: Vec<(&str, Vars, &str)> = vec![
+            ("unset map", vec![ok_key()], CREDENTIALS),
+            (
+                "legacy KEY_ENV set",
+                vec![
+                    (CREDENTIALS, format!("{r}=HX33_KEY")),
+                    ok_key(),
+                    (LEGACY_KEY_ENV, "HX33_KEY".into()),
+                ],
+                LEGACY_KEY_ENV,
+            ),
+            (
+                "no =",
+                vec![(CREDENTIALS, format!("{r}")), ok_key()],
+                CREDENTIALS,
+            ),
+            (
+                "two =",
+                vec![(CREDENTIALS, format!("{r}=HX33_KEY=X")), ok_key()],
+                CREDENTIALS,
+            ),
+            (
+                "bad uuid",
+                vec![(CREDENTIALS, "not-a-uuid=HX33_KEY".into()), ok_key()],
+                CREDENTIALS,
+            ),
+            (
+                "nil uuid",
+                vec![(CREDENTIALS, format!("{}=HX33_KEY", Uuid::nil())), ok_key()],
+                CREDENTIALS,
+            ),
+            (
+                "bad name",
+                vec![(CREDENTIALS, format!("{r}=hx33-key")), ok_key()],
+                CREDENTIALS,
+            ),
+            (
+                "empty name",
+                vec![(CREDENTIALS, format!("{r}=")), ok_key()],
+                CREDENTIALS,
+            ),
+            (
+                "duplicate ref",
+                vec![
+                    (CREDENTIALS, format!("{r}=HX33_KEY,{r}=HX33_KEY")),
+                    ok_key(),
+                ],
+                CREDENTIALS,
+            ),
+            (
+                "unset key variable",
+                vec![(CREDENTIALS, format!("{r}=HX33_KEY"))],
+                "<unset variable>",
+            ),
+            (
+                "empty key variable",
+                vec![
+                    (CREDENTIALS, format!("{r}=HX33_KEY")),
+                    ("HX33_KEY", String::new()),
+                ],
+                "HX33_KEY",
+            ),
+        ];
+        for (what, vars, named) in cases {
+            let Err(error) = credential_map(lookup(vars)) else {
+                panic!("{what}: must be refused");
+            };
+            assert!(error.contains(named), "{what}: names {named}: {error}");
+            assert!(
+                !error.contains(&key),
+                "{what}: the error must not carry a key value"
+            );
+        }
+        // Main-line amendment: an explicitly empty map boots with no references.
+        let empty = credential_map(lookup(vec![(CREDENTIALS, String::new())])).expect("empty map");
+        assert!(empty.refs().is_empty());
+        // Two references may share one variable.
+        let shared = credential_map(lookup(vec![
+            (
+                CREDENTIALS,
+                format!("{r}=HX33_KEY,{}=HX33_KEY", Uuid::new_v4()),
+            ),
+            ok_key(),
+        ]))
+        .expect("shared variable");
+        assert_eq!(shared.refs().len(), 2);
+    }
 }

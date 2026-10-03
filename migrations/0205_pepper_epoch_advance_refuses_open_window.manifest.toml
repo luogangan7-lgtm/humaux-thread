@@ -1,0 +1,39 @@
+# §46.1 migration manifest. Card 33 / ADR-0059 D-H: control.credential_pepper_epoch_advance() refuses
+# (SQLSTATE 55000, reason rehash_window_open) while control.credential_pepper_state.rehash_open is
+# true, so a second `apikey pepper-epoch advance` can no longer re-open the window on a newer epoch.
+# Body only; owner, SECURITY DEFINER, pinned search_path and EXECUTE = {role_maintenance} unchanged.
+# §46 forward-fix (EXPAND_CONTRACT, first free after 0204).
+
+migration_id = "0205_pepper_epoch_advance_refuses_open_window"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('control.credential_pepper_epoch_advance()') is not null
+ and (select l.lanname = 'sql' from pg_proc p join pg_language l on l.oid = p.prolang
+       where p.oid = to_regprocedure('control.credential_pepper_epoch_advance()'))
+ as precheck_ok
+"""
+
+postcheck = """
+with non_owner(r) as (values ('role_gateway'), ('role_private_worker'), ('role_consolidation_worker'),
+  ('role_public_worker'), ('role_retrieval_worker'), ('role_batch_issuer'), ('role_maintenance'),
+  ('role_admin'))
+select
+  (select l.lanname = 'plpgsql' and pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+          and p.prorettype = 'integer'::regtype
+          and 'search_path=pg_catalog' = any(coalesce(p.proconfig, '{}'))
+          and position('NOT rehash_open' in p.prosrc) > 0
+          and position('rehash_window_open' in p.prosrc) > 0
+          and position('55000' in p.prosrc) > 0
+          and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                           where x.grantee = 0 and x.privilege_type = 'EXECUTE')
+     from pg_proc p join pg_language l on l.oid = p.prolang
+    where p.oid = to_regprocedure('control.credential_pepper_epoch_advance()'))
+  and (select bool_and(has_function_privilege(n.r, 'control.credential_pepper_epoch_advance()', 'EXECUTE')
+                       = (n.r = 'role_maintenance'))
+         from non_owner n)
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward-fix only: re-create the 0204 body. A second advance then moves the epoch again while the window is open, and every key already rehashed in that window becomes rewritable by role_gateway a second time."
+backup_restore_requirement = "none: one function body is replaced; no row data is changed."

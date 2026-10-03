@@ -80,16 +80,9 @@ const SERVICE_TIER: &str = "standard";
 const PURPOSE_DB: &str = "PRIVATE_CONSOLIDATE";
 
 fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
-    let Some(rest) = admin_dsn
-        .strip_prefix("postgres://")
-        .or_else(|| admin_dsn.strip_prefix("postgresql://"))
-    else {
-        return admin_dsn.to_string();
-    };
-    let Some(at) = rest.find('@') else {
-        return admin_dsn.to_string();
-    };
-    format!("postgres://{role}:devlocal_{role}@{}", &rest[at + 1..])
+    // ADR-0059 D-D: a real login as `role`, its password from HUMAUX_ROLE_PASSWORD_<SUFFIX>.
+    humaux_testkit::role_login_dsn(admin_dsn, role, |name| std::env::var(name).ok())
+        .unwrap_or_else(|missing| panic!("missing object: {missing} (ADR-0059 D-D)"))
 }
 
 /// Same env + `/Volumes/data/viral-skill-eval/.env` fallback `minimax_live_smoke.rs` uses.
@@ -268,14 +261,24 @@ impl Drop for Fixture {
                 "DELETE FROM {schema}.{table} WHERE tenant_id = '{tenant}'; "
             ));
         }
-        sql.push_str(&format!(
-            "DELETE FROM control.tenants WHERE tenant_id = '{tenant}'; \
+        sql.push_str("SET session_replication_role = DEFAULT;");
+        // Card-31 pattern (card 33): jobs (ops.jobs is one of the tenant_id tables above) and data
+        // rows in one batch whose failure is printed; the tenant and user rows in a separate
+        // best-effort batch that cannot roll the job delete back.
+        if let Err(error) = self.admin.batch_execute(&sql) {
+            eprintln!("{NAME}: fixture cleanup (jobs/data) for tenant {tenant} failed: {error}");
+        }
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "SET session_replication_role = replica; \
+             DELETE FROM control.tenants WHERE tenant_id = '{tenant}'; \
              DELETE FROM control.users WHERE user_id = '{}'; \
              SET session_replication_role = DEFAULT;",
             self.user_id
-        ));
-        if let Err(error) = self.admin.batch_execute(&sql) {
-            eprintln!("{NAME}: fixture cleanup for tenant {tenant} failed: {error}");
+        )) {
+            eprintln!("{NAME}: fixture cleanup (tenant, best effort) for {tenant} failed: {error}");
+            let _ = self
+                .admin
+                .batch_execute("SET session_replication_role = DEFAULT");
         }
     }
 }
