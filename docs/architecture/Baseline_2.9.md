@@ -2,7 +2,7 @@
 
 > 版本：Architecture Baseline 2.9 Product-Named Development Handoff（2.3 用户调整版 + 2026-08-25 外部实现/规范复核）  
 > 日期：2026-08-25  
-> 主语言：Rust 1.98 / Edition 2024  
+> 主语言：Rust 1.99 / Edition 2024  
 > 目标：从 0→1 开发 Humaux Thread，不延续旧系统的模块边界；保留必要数据兼容与行为契约。
 > 状态：**Architecture Frozen / GO for Phase 0 implementation / NOT GA**。Claude 可以按 §57 Phase 0→17 顺序开始编码；不得以“架构已冻结”替代各 owning Phase 的 DoD / BenchmarkManifest / G80 Gate。Phase 0/1 的 Contract、Schema、Role、Architecture Gate 优先于业务功能。
 
@@ -13141,7 +13141,7 @@ NOT DEVELOPMENT-READY / NOT GA
 截至 2026-08-24，建议冻结：
 
 ```text
-Core language       Rust 1.98 / Edition 2024
+Core language       Rust 1.99 / Edition 2024
 HTTP/runtime        Axum + Tower + Tokio
 Authority DB        PostgreSQL 18.6
 Vector/sparse       Qdrant 1.19
@@ -16874,7 +16874,7 @@ G80-3 自本节起从 `NOT_ADMITTED` 转为 `ADMITTED`（Layer 0/1A/1B 均含）
 1. Model Context Protocol — 2026-07-28 Specification  
    https://blog.modelcontextprotocol.io/posts/2026-07-28/
 
-2. Rust 1.98.0 release / Cargo workspaces  
+2. Rust 1.99.0 release / Cargo workspaces  
    https://blog.rust-lang.org/releases/latest/  
    https://doc.rust-lang.org/cargo/reference/workspaces.html
 

@@ -366,6 +366,26 @@ binary at 0.00 s and a 40-test binary at 0.04 s are still offenders (unit test
 `gate_truth_per_test_floor_keeps_a_fast_genuine_small_binary_green`). The skip ledger remains the
 upgrade path for a real single-test binary under 3 ms.
 
+## Amendment (owner decision, 2026-10-03) — D-G pin moves to 1.99.0
+
+The owner asked for the toolchain to move to Rust 1.99 (released 2026-09-28, `rustc 1.99.0 (b940084d7)`).
+Compatibility was measured first, on the card-32 tree, in a separate target directory with the 1.99.0
+toolchain installed as D-G prescribes (`rustup toolchain install 1.99.0 --profile minimal -c clippy -c rustfmt`):
+`cargo fmt --all --check` no diff; `cargo metadata --locked` unchanged lock (v4); `cargo check --workspace
+--all-targets` 0; `cargo build --release --workspace` 0; `cargo test --workspace --lib` 1026 passed (one gateway
+test needs the DSN env and passed with it, 23/23); `cargo clippy --workspace --all-targets -- -D warnings`
+red on exactly three sites, all fixed in card 32 (`AtomicUsize::fetch_update` deprecated in 1.99 — renamed
+`try_update`, which 1.98.1 also compiles — at `crates/application/src/scheduler.rs:78,:88`; 1.99's
+`clippy::single_element_loop` at `xtask/src/architecture_check.rs:5058`), then 0 warnings on both toolchains.
+The 1.99.0 release notes list no behaviour change affecting this workspace (new stable APIs only; the
+`Box::leak` round-trip advice does not apply).
+
+Changes: `rust-toolchain.toml` channel `1.99.0`; `Cargo.toml [workspace.package] rust-version = "1.99"`;
+Baseline §70 and its header line say `Rust 1.99 / Edition 2024`. D-G's rules stay: exact patch pinned, explicit
+install, no re-baseline. Evidence that the pinned toolchain builds and passes the whole chain is the card-33
+main-line chain (`gates_card33_mainline.log`, the first chain run on 1.99.0, including the release build and the
+rehearsal). The first build on 1.99.0 invalidates every fingerprint in `CARGO_TARGET_DIR`, as the 1.98.1 move did.
+
 ## Consequences and limits
 
 - gate-truth sees **whole-binary** skips only. A binary where some tests skip and others do real
