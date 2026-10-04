@@ -1,8 +1,8 @@
 //! `xtask::rls_check` — G80-26 (§48.2) runtime DB role invariant CI enumeration gate.
-//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.credential_pepper_state, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.deletion_plan_steps, ops.distill_calls, ops.distill_tenant_scheduler, ops.email_delivery_events, ops.email_domains, ops.email_outbox, ops.email_provider_health, ops.email_suppressions, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.provider_arbiters, ops.provider_slots, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.schema_migrations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.api_key_rehash, control.assert_write_scope, control.attest_reasoning_route_health, control.bind_reasoning_domain, control.credential_pepper_epoch, control.credential_pepper_epoch_advance, control.credential_pepper_epoch_close, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.observe_reasoning_route_health, control.onboard_tenant, control.onboard_workspace, control.reasoning_credential_accounts, control.reasoning_profile_capabilities, control.reasoning_profile_request_extras, control.reasoning_route_health_state, control.reasoning_route_status, control.register_reasoning_profile, control.resolve_user_reasoning_admission, control.revoke_api_key, control.set_reasoning_profile_enabled, ops.admit_distill_budget, ops.begin_call, ops.claim_derived_work, ops.claim_derived_work_v2, ops.contribution_reservation_authority_validate, ops.distill_scheduler_admit, ops.distill_slots_all_bound, ops.finish_derived_work_v2, ops.renew_lease, ops.requeue_dead_distill, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal], PostgreSQL(role_gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_GATEWAY_PG_DSN, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
+//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.credential_pepper_state, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.data_disclosures, ops.deletion_plan_steps, ops.distill_calls, ops.distill_tenant_scheduler, ops.email_delivery_events, ops.email_domains, ops.email_outbox, ops.email_provider_health, ops.email_suppressions, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.provider_arbiters, ops.provider_slots, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.schema_migrations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.processing_gaps, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.api_key_rehash, control.assert_write_scope, control.attest_reasoning_route_health, control.bind_reasoning_domain, control.credential_pepper_epoch, control.credential_pepper_epoch_advance, control.credential_pepper_epoch_close, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.observe_reasoning_route_health, control.onboard_tenant, control.onboard_workspace, control.reasoning_credential_accounts, control.reasoning_profile_capabilities, control.reasoning_profile_request_extras, control.reasoning_route_health_state, control.reasoning_route_status, control.register_reasoning_profile, control.resolve_user_reasoning_admission, control.revoke_api_key, control.set_reasoning_profile_enabled, ops.admin_probe_snapshot, ops.admit_distill_budget, ops.begin_call, ops.claim_derived_work, ops.claim_derived_work_v2, ops.contribution_reservation_authority_validate, ops.distill_scheduler_admit, ops.distill_slots_all_bound, ops.finish_derived_work_v2, ops.health_snapshot, ops.renew_lease, ops.requeue_dead_distill, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal], PostgreSQL(role_gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_GATEWAY_PG_DSN, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
 //! Called-by: [xtask::dep_map, xtask::main]
 //! Invariants: [any catalog cell that disagrees with §48.2 / §62 grants is fail, named by role and table]
-//! Spec: Baseline §48.2; §62
+//! Spec: Baseline §48.2; §62; §6.2.0; §6.2.2; ADR-0061 D-D
 //!
 //! xtask `rls-check` — G80-26 (§48.2 Runtime DB Role Invariant CI enumeration gate),
 //! folding in §62's tenant RLS policy template. §48.2's own text: "上面四项只覆盖 RLS
@@ -1025,6 +1025,16 @@ const MATRIX: &[Cell] = &[
         "role_private_worker",
         ["INSERT"]
     ),
+    // 0210 (ADR-0061 D-D): the NOLOGIN owner of the two aggregate definers; its other two relations
+    // (ops.data_disclosures, projection.processing_gaps) are outside the §6.2.2 header and are pinned,
+    // with the whole grant set, by check_health_reader_boundary.
+    cell!(
+        "projection.stream_checkpoints",
+        HEALTH_READER_ROLE,
+        ["SELECT"]
+    ),
+    cell!("ops.outbox", HEALTH_READER_ROLE, ["SELECT"]),
+    cell!("ops.jobs", HEALTH_READER_ROLE, ["SELECT"]),
 ];
 
 // 0120 is an additive observation-window seam, not a rewrite of the frozen §6.2.2 header.
@@ -2334,7 +2344,15 @@ pub fn check_grant_equality(client: &mut impl GenericClient) -> GateResult {
 
     let non_owner_roles: Vec<&str> = RUNTIME_ROLES
         .iter()
-        .chain(["role_batch_issuer", "role_maintenance", "role_admin"].iter())
+        .chain(
+            [
+                "role_batch_issuer",
+                "role_maintenance",
+                "role_admin",
+                HEALTH_READER_ROLE,
+            ]
+            .iter(),
+        )
         .copied()
         .collect();
     let mismatches: Vec<String> = t
@@ -3704,6 +3722,26 @@ fn check_owner_definer_function(
     function: &str,
     executors: &[&str],
 ) {
+    check_definer_function(
+        client,
+        problems,
+        function,
+        OWNER_ROLE,
+        "search_path=pg_catalog",
+        executors,
+    );
+}
+
+/// [`check_owner_definer_function`] with the owner and the pinned `search_path` entry named by the caller
+/// (ADR-0061 D-D: the 0210 aggregate definers are owned by [`HEALTH_READER_ROLE`]).
+fn check_definer_function(
+    client: &mut impl GenericClient,
+    problems: &mut Vec<String>,
+    function: &str,
+    expected_owner: &str,
+    search_path: &str,
+    executors: &[&str],
+) {
     match client.query_one(
         "SELECT pg_get_userbyid(p.proowner), p.prosecdef, coalesce(p.proconfig, ARRAY[]::text[]) \
          FROM pg_proc p WHERE p.oid = to_regprocedure($1)",
@@ -3713,14 +3751,10 @@ fn check_owner_definer_function(
             let owner: String = row.get(0);
             let definer: bool = row.get(1);
             let config: Vec<String> = row.get(2);
-            if owner != OWNER_ROLE
-                || !definer
-                || !config.iter().any(|v| v == "search_path=pg_catalog")
-            {
+            if owner != expected_owner || !definer || !config.iter().any(|v| v == search_path) {
                 problems.push(format!(
-                    "{function}: expected owner={OWNER_ROLE}, SECURITY DEFINER, \
-                     search_path=pg_catalog; actual owner={owner}, definer={definer}, \
-                     config={config:?}"
+                    "{function}: expected owner={expected_owner}, SECURITY DEFINER, \
+                     {search_path}; actual owner={owner}, definer={definer}, config={config:?}"
                 ));
             }
         }
@@ -3763,6 +3797,223 @@ fn check_owner_definer_function(
     }
 }
 
+/// ADR-0061 D-D (migration 0210): the NOLOGIN owner of the two read-only aggregate definers. Not a §6.2.0
+/// login role, so [`check_role_set_equality`] (LOGIN roles only) never sees it; this check pins it instead.
+pub const HEALTH_READER_ROLE: &str = "role_health_reader";
+/// `pg_get_expr` of every `_health_reader_read` policy qual, verbatim (0210).
+const HEALTH_READER_QUAL: &str = "(CURRENT_USER = 'role_health_reader'::name)";
+/// The two definers the reader owns, each with its one executor (ADR-0061 D-D, D-J / E11).
+const HEALTH_READER_FUNCTIONS: [(&str, &str); 2] = [
+    ("ops.health_snapshot(timestamptz)", "role_maintenance"),
+    ("ops.admin_probe_snapshot()", "role_admin"),
+];
+/// Every relation the reader may SELECT, and nothing else (§6.2.2 row `role_health_reader`).
+const HEALTH_READER_RELATIONS: [&str; 5] = [
+    "ops.data_disclosures",
+    "ops.jobs",
+    "ops.outbox",
+    "projection.processing_gaps",
+    "projection.stream_checkpoints",
+];
+/// (table, policy): the five `TO PUBLIC USING (current_user = 'role_health_reader')` reads. stream_log is read only
+/// through the non-invoker `projection.processing_gaps` view, so it has a policy and no grant.
+const HEALTH_READER_POLICIES: [(&str, &str); 5] = [
+    ("ops.jobs", "jobs_health_reader_read"),
+    (
+        "ops.data_disclosures",
+        "data_disclosures_health_reader_read",
+    ),
+    ("ops.outbox", "outbox_health_reader_read"),
+    (
+        "projection.stream_checkpoints",
+        "stream_checkpoints_health_reader_read",
+    ),
+    ("projection.stream_log", "stream_log_health_reader_read"),
+];
+/// The one owner-wide read that predates 0210 on those tables (0127 dispatch read), allowed by name.
+const PREEXISTING_OWNER_WIDE_READS: [&str; 1] = ["outbox_phase9_owner_dispatch_read"];
+
+/// ADR-0061 D-D / §6.2.0 / §6.2.2 (migration 0210): `role_health_reader` exists NOLOGIN NOINHERIT NOBYPASSRLS,
+/// not superuser, without a password; has no members and is a member of nothing; owns exactly the two aggregate
+/// definers (each: SECURITY DEFINER, pinned `search_path`, EXECUTE exactly its one executor, PUBLIC revoked) and no
+/// relation; holds exactly SELECT on its five relations and CREATE on no schema; the five `_health_reader_read`
+/// policies are SELECT-only, `TO PUBLIC`, qual verbatim; and no other permissive policy on those tables reads
+/// `USING (true)` for `role_migration_owner` (an owner-wide read would be ORed into every existing owner definer
+/// and strip its tenant filter).
+///
+/// Missing role or function ⇒ `not_applicable` naming it (§57.1).
+pub fn check_health_reader_boundary(client: &mut impl GenericClient) -> GateResult {
+    let check = "ADR-0061 health reader boundary";
+    let missing: Vec<String> = match client.query_one(
+        "SELECT (SELECT count(*) FROM pg_roles WHERE rolname = $1) = 1, \
+                to_regprocedure($2) IS NOT NULL, to_regprocedure($3) IS NOT NULL",
+        &[
+            &HEALTH_READER_ROLE,
+            &HEALTH_READER_FUNCTIONS[0].0,
+            &HEALTH_READER_FUNCTIONS[1].0,
+        ],
+    ) {
+        Ok(row) => [
+            (row.get::<_, bool>(0), format!("role {HEALTH_READER_ROLE}")),
+            (row.get(1), HEALTH_READER_FUNCTIONS[0].0.to_string()),
+            (row.get(2), HEALTH_READER_FUNCTIONS[1].0.to_string()),
+        ]
+        .into_iter()
+        .filter_map(|(present, name)| (!present).then_some(name))
+        .collect(),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    if !missing.is_empty() {
+        return not_applicable(
+            check,
+            format!("missing object(s) {missing:?} (migration 0210)"),
+        );
+    }
+
+    let mut problems = Vec::new();
+    check_health_reader_role(client, &mut problems);
+    for (function, executor) in HEALTH_READER_FUNCTIONS {
+        check_definer_function(
+            client,
+            &mut problems,
+            function,
+            HEALTH_READER_ROLE,
+            "search_path=pg_catalog, ops, projection",
+            &[executor],
+        );
+    }
+
+    check_health_reader_policies(client, &mut problems);
+
+    if problems.is_empty() {
+        pass(
+            check,
+            "role_health_reader: NOLOGIN NOINHERIT NOBYPASSRLS, no password, no members; owns exactly \
+             ops.health_snapshot(timestamptz) (EXECUTE role_maintenance) and ops.admin_probe_snapshot() \
+             (EXECUTE role_admin), \
+             PUBLIC revoked, no relation; SELECT on exactly its five relations; five reader policies verbatim; \
+             no owner-wide read on them beyond 0127's",
+        )
+    } else {
+        fail(check, problems.join("; "))
+    }
+}
+
+/// The catalog half of [`check_health_reader_boundary`]: role flags, membership, ownership, grants, schema CREATE.
+fn check_health_reader_role(client: &mut impl GenericClient, problems: &mut Vec<String>) {
+    let mut probe = |problems: &mut Vec<String>, what: &str, sql: &str| match client
+        .query_one(sql, &[&HEALTH_READER_ROLE])
+    {
+        Ok(row) => {
+            let bad: Option<String> = row.get(0);
+            if let Some(bad) = bad {
+                problems.push(format!("{what}: {bad}"));
+            }
+        }
+        Err(error) => problems.push(format!("{what} probe failed: {error}")),
+    };
+    probe(
+        problems,
+        "role flags (want NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS, no password)",
+        "SELECT CASE WHEN rolcanlogin OR rolinherit OR rolsuper OR rolcreatedb OR rolcreaterole \
+                          OR rolreplication OR rolbypassrls OR rolpassword IS NOT NULL \
+                     THEN format('login=%s inherit=%s super=%s createdb=%s createrole=%s replication=%s \
+                                  bypassrls=%s password=%s', rolcanlogin, rolinherit, rolsuper, rolcreatedb, \
+                                  rolcreaterole, rolreplication, rolbypassrls, rolpassword IS NOT NULL) END \
+         FROM pg_authid WHERE rolname = $1",
+    );
+    probe(
+        problems,
+        "membership (want none in either direction; a member could act as the reader)",
+        "SELECT string_agg(pg_get_userbyid(m.member) || ' -> ' || pg_get_userbyid(m.roleid), ', ') \
+         FROM pg_auth_members m JOIN pg_roles r ON r.rolname = $1 \
+         WHERE m.roleid = r.oid OR m.member = r.oid",
+    );
+    probe(
+        problems,
+        "owned functions (want exactly the two 0210 definers)",
+        "SELECT CASE WHEN count(*) <> 2 \
+                       OR count(*) FILTER (WHERE p.oid IN (to_regprocedure('ops.health_snapshot(timestamptz)'), \
+                                                            to_regprocedure('ops.admin_probe_snapshot()'))) <> 2 \
+                     THEN string_agg(p.oid::regprocedure::text, ', ') END \
+         FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE r.rolname = $1",
+    );
+    probe(
+        problems,
+        "owned relations (want none)",
+        "SELECT string_agg(c.oid::regclass::text, ', ') \
+         FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner WHERE r.rolname = $1",
+    );
+    probe(
+        problems,
+        "table grants (want exactly SELECT on its five relations)",
+        &format!(
+            "SELECT CASE WHEN coalesce(array_agg(g.x ORDER BY g.x COLLATE \"C\"), '{{}}') \
+                                IS DISTINCT FROM ARRAY[{}]::text[] \
+                         THEN coalesce(array_agg(g.x ORDER BY g.x COLLATE \"C\"), '{{}}')::text END \
+             FROM (SELECT DISTINCT table_schema || '.' || table_name || ':' || privilege_type AS x \
+                     FROM information_schema.role_table_grants WHERE grantee = $1) g",
+            HEALTH_READER_RELATIONS
+                .iter()
+                .map(|r| format!("'{r}:SELECT'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
+    probe(
+        problems,
+        "schema CREATE (want none)",
+        "SELECT string_agg(n.nspname, ', ') FROM pg_namespace n \
+         WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' \
+           AND has_schema_privilege($1, n.oid, 'CREATE')",
+    );
+}
+
+/// The policy half of [`check_health_reader_boundary`]: the five verbatim reader policies, and no owner-wide read.
+fn check_health_reader_policies(client: &mut impl GenericClient, problems: &mut Vec<String>) {
+    for (table, policy) in HEALTH_READER_POLICIES {
+        match client.query_opt(
+            "SELECT p.polcmd::text, p.polpermissive, p.polroles = ARRAY[0::oid], \
+                    pg_get_expr(p.polqual, p.polrelid), p.polwithcheck IS NULL \
+             FROM pg_policy p WHERE p.polrelid = $1::text::regclass AND p.polname = $2",
+            &[&table, &policy],
+        ) {
+            Ok(Some(row)) => {
+                let (cmd, permissive, public, qual, no_check): (String, bool, bool, String, bool) =
+                    (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+                if cmd != "r" || !permissive || !public || qual != HEALTH_READER_QUAL || !no_check {
+                    problems.push(format!(
+                        "{policy} on {table}: want PERMISSIVE FOR SELECT TO PUBLIC USING \
+                         {HEALTH_READER_QUAL}; actual cmd={cmd} permissive={permissive} \
+                         to_public={public} qual={qual} no_with_check={no_check}"
+                    ));
+                }
+            }
+            Ok(None) => problems.push(format!("missing policy {policy} on {table}")),
+            Err(error) => problems.push(format!("{policy} probe failed: {error}")),
+        }
+        match client.query_opt(
+            "SELECT string_agg(p.polname, ', ') FROM pg_policy p \
+             WHERE p.polrelid = $1::text::regclass AND p.polpermissive AND p.polcmd IN ('r', '*') \
+               AND p.polroles @> ARRAY[(SELECT oid FROM pg_roles WHERE rolname = $2)] \
+               AND pg_get_expr(p.polqual, p.polrelid) = 'true' \
+               AND p.polname <> ALL($3)",
+            &[&table, &OWNER_ROLE, &PREEXISTING_OWNER_WIDE_READS.to_vec()],
+        ) {
+            Ok(Some(row)) => {
+                if let Some(names) = row.get::<_, Option<String>>(0) {
+                    problems.push(format!(
+                        "{table}: owner-wide read policy {names} (USING (true) TO {OWNER_ROLE}) widens every \
+                         existing owner definer that reads it"
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => problems.push(format!("{table} owner-widening probe failed: {error}")),
+        }
+    }
+}
+
 /// `jobs_tenant_isolation` must keep BOTH arms on BOTH legs, stay the ONLY permissive policy on
 /// `ops.jobs`, and `ops.jobs` must stay ENABLE + FORCE RLS.
 fn check_derived_jobs_policy(client: &mut impl GenericClient, problems: &mut Vec<String>) {
@@ -3773,7 +4024,9 @@ fn check_derived_jobs_policy(client: &mut impl GenericClient, problems: &mut Vec
 /// `current_user = 'role_migration_owner' OR` arm: BOTH arms on BOTH legs (dropping the owner arm
 /// silently breaks the definer's cross-tenant read; dropping the tenant arm opens every tenant to
 /// every runtime role), exactly ONE permissive policy (a second one ORs in and widens access), and
-/// ENABLE + FORCE.
+/// ENABLE + FORCE. ADR-0061 D-D: the 0210 `_health_reader_read` SELECT policy is not counted when its qual is
+/// verbatim [`HEALTH_READER_QUAL`] (false for every role but the NOLOGIN reader; pinned by
+/// [`check_health_reader_boundary`]); a lookalike with any other qual still counts.
 fn check_owner_arm_policy(
     client: &mut impl GenericClient,
     problems: &mut Vec<String>,
@@ -3784,12 +4037,14 @@ fn check_owner_arm_policy(
         "SELECT pg_get_expr(polqual, polrelid), \
                 coalesce(pg_get_expr(polwithcheck, polrelid), ''), \
                 (SELECT count(*) FROM pg_policy q \
-                 WHERE q.polrelid = $1::text::regclass AND q.polpermissive), \
+                 WHERE q.polrelid = $1::text::regclass AND q.polpermissive \
+                   AND NOT (q.polcmd = 'r' AND q.polname LIKE '%\\_health\\_reader\\_read' \
+                            AND pg_get_expr(q.polqual, q.polrelid) = $3)), \
                 (SELECT c.relrowsecurity AND c.relforcerowsecurity \
                  FROM pg_class c WHERE c.oid = $1::text::regclass) \
          FROM pg_policy \
          WHERE polrelid = $1::text::regclass AND polname = $2",
-        &[&table, &policy],
+        &[&table, &policy, &HEALTH_READER_QUAL],
     ) {
         Ok(Some(row)) => {
             let using: String = row.get(0);
@@ -4381,6 +4636,7 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_distill_dispatch_v2_boundary(&mut client));
             results.push(check_api_key_rehash_boundary(&mut client));
             results.push(check_reasoning_route_doors(&mut client));
+            results.push(check_health_reader_boundary(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -4404,6 +4660,7 @@ pub fn run(_args: &[String]) -> i32 {
                 "ADR-0057 A2 point-ledger definer",
                 "ADR-0058 distill dispatch v2 boundary",
                 "ADR-0060 reasoning route doors",
+                "ADR-0061 health reader boundary",
             ] {
                 results.push(fail_for(name, &conn_err));
             }
@@ -5789,5 +6046,86 @@ mod tests {
             "{}",
             after.detail
         );
+    }
+
+    /// ADR-0061 D-D / T-D8 / T-D9 / T-D10: each fault on the 0210 boundary reds the real gate, naming the cell,
+    /// inside one never-committed transaction (role membership and LOGIN are cluster-global, so they are never
+    /// committed on the shared cluster).
+    #[test]
+    fn health_reader_faults_drive_actual_gate_red_then_restore() {
+        txn_or_skip!(client, txn);
+        let clean = check_health_reader_boundary(&mut txn);
+        assert_eq!(clean.status, GateStatus::Pass, "{}", clean.detail);
+        for (label, fault, named) in [
+            (
+                "T-D10 reader granted to a login role",
+                "GRANT role_health_reader TO role_maintenance",
+                "role_maintenance -> role_health_reader",
+            ),
+            (
+                "T-D10 reader can log in",
+                "ALTER ROLE role_health_reader LOGIN",
+                "login=t ",
+            ),
+            (
+                "T-D8 gateway may run the health definer",
+                "GRANT EXECUTE ON FUNCTION ops.health_snapshot(timestamptz) TO role_gateway",
+                "ops.health_snapshot(timestamptz)/role_gateway",
+            ),
+            (
+                "T-D9 owner-wide read (the previous revision)",
+                "CREATE POLICY c34_owner_wide ON ops.data_disclosures FOR SELECT \
+                 TO role_migration_owner USING (true)",
+                "c34_owner_wide",
+            ),
+            (
+                "reader policy dropped",
+                "DROP POLICY stream_log_health_reader_read ON projection.stream_log",
+                "missing policy stream_log_health_reader_read",
+            ),
+            (
+                "reader policy widened to a qual other than current_user",
+                "ALTER POLICY outbox_health_reader_read ON ops.outbox USING (true)",
+                "outbox_health_reader_read on ops.outbox",
+            ),
+            (
+                "reader over-granted",
+                "GRANT SELECT ON projection.stream_log TO role_health_reader",
+                "projection.stream_log:SELECT",
+            ),
+            (
+                "reader owns a third function",
+                "ALTER FUNCTION control.credential_pepper_epoch() OWNER TO role_health_reader",
+                "owned functions",
+            ),
+        ] {
+            txn.batch_execute("SAVEPOINT reader_fault")
+                .expect("fault savepoint");
+            txn.batch_execute(fault).expect(label);
+            let red = check_health_reader_boundary(&mut txn);
+            assert_eq!(red.status, GateStatus::Fail, "{label}: {}", red.detail);
+            assert!(red.detail.contains(named), "{label}: {}", red.detail);
+            txn.batch_execute("ROLLBACK TO SAVEPOINT reader_fault; RELEASE SAVEPOINT reader_fault")
+                .expect("restore exact catalog");
+        }
+        let restored = check_health_reader_boundary(&mut txn);
+        assert_eq!(restored.status, GateStatus::Pass, "{}", restored.detail);
+    }
+
+    /// The owner-arm "exactly one permissive policy" guard exempts only the verbatim reader policy: a second
+    /// permissive policy that merely borrows the reader's name suffix still reds it.
+    #[test]
+    fn owner_arm_count_exempts_only_the_verbatim_reader_policy() {
+        txn_or_skip!(client, txn);
+        let clean = check_derived_work_dispatch_boundary(&mut txn);
+        assert_eq!(clean.status, GateStatus::Pass, "{}", clean.detail);
+        txn.batch_execute(
+            "CREATE POLICY jobs_extra_health_reader_read ON ops.jobs AS PERMISSIVE FOR SELECT TO PUBLIC \
+             USING (current_user = 'role_health_reader' OR true)",
+        )
+        .expect("lookalike policy");
+        let red = check_derived_work_dispatch_boundary(&mut txn);
+        assert_eq!(red.status, GateStatus::Fail, "{}", red.detail);
+        assert!(red.detail.contains("found 2"), "{}", red.detail);
     }
 }

@@ -28,8 +28,10 @@
 //!   a `kill -9` mid-pass leaves the row leased, and only lease expiry may free it, so a live
 //!   lease surviving `drain > LEASE_SECS` means a worker is wedged, not crashed;
 //! * §6.1 isolation: no tenant's MCP response ever contains another tenant's sentinel or id;
-//! * ADR-0037 probes (`GET /readyz`, `<worker> --readyz`) stay green throughout — polled as the
-//!   real probes through `--probe-cmd`, never re-implemented here;
+//! * ADR-0037 probes (the gateway's `GET /livez`, `<worker> --readyz`) stay green throughout — polled
+//!   as the real probes through `--probe-cmd`, never re-implemented here. The gateway is graded on
+//!   `/livez` since ADR-0061 D-F (E15): its `/readyz` is dependency-truthful, so the chaos kill of the
+//!   retrieval worker correctly turns it 503 for that window;
 //! * every process the launcher started is actually alive (ADR-0050 D-I, audit TH-4): each
 //!   observation runs ONE `ps -axo pid=,rss=,comm=` and looks up every `--watch-pidfile`'s current
 //!   pid. Absent inside `[chaos_start, chaos_start + --chaos-grace-secs]` is an *expected* absence

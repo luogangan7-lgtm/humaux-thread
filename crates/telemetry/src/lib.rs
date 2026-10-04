@@ -1,6 +1,7 @@
 //! `humaux-telemetry` — Humaux Thread workspace crate（布局见 §58）。
 //! Depends-on: crates=[]; services=[]; env=[]; modules=[]
-//! Called-by: [crate(humaux-adapters), crate(humaux-retrieval), crate(humaux-testkit)]
+//! Called-by: [crate(humaux-adapters), crate(humaux-admin), crate(humaux-consolidation-worker), crate(humaux-gateway), crate(humaux-maintenance),
+//!   crate(humaux-private-worker), crate(humaux-retrieval), crate(humaux-retrieval-worker), crate(humaux-testkit)]
 //! Invariants: []
 //! Spec: Baseline §3; §58; §78.3
 //!
@@ -9,4 +10,5 @@
 
 pub mod degrade;
 pub mod direction;
+pub mod health;
 pub mod metrics;

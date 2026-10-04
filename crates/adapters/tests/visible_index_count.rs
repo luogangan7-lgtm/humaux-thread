@@ -273,19 +273,40 @@ fn read_ledger(admin: &mut Client, k: &StreamKey) -> LedgerClosure {
     )
 }
 
-fn cleanup(admin: &mut Client, tenant_id: Uuid) {
-    let _ = admin.execute(
-        "DELETE FROM projection.stream_log WHERE tenant_id=$1",
-        &[&tenant_id],
-    );
-    let _ = admin.execute(
-        "DELETE FROM projection.stream_checkpoints WHERE tenant_id=$1",
-        &[&tenant_id],
-    );
-    let _ = admin.execute(
-        "DELETE FROM control.tenants WHERE tenant_id=$1",
-        &[&tenant_id],
-    );
+/// Card-31 pattern (card 34 ruling B2): from `Drop`, so a failing leg still runs it. The tenant's stream rows go in
+/// ONE batch whose failure is printed — a leaked fixture-only `(domain, projection_kind)` checkpoint makes
+/// `ops.health_snapshot` / `ops.admin_probe_snapshot` fail closed on the shared dev DB (ADR-0061 D-D, §78.2) — and the
+/// tenant row in a separate best-effort batch. Owns its own connection so the test keeps `&mut admin`.
+struct TenantCleanup {
+    admin: Client,
+    tenant_id: Uuid,
+}
+
+impl TenantCleanup {
+    fn new(dsn: &str, tenant_id: Uuid) -> Self {
+        // dep: PostgreSQL(owner) — fixture cleanup connection
+        let admin = Client::connect(dsn, NoTls).expect("cleanup connection");
+        Self { admin, tenant_id }
+    }
+}
+
+impl Drop for TenantCleanup {
+    fn drop(&mut self) {
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}';",
+            self.tenant_id
+        )) {
+            eprintln!(
+                "visible_index_count cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{}';",
+            self.tenant_id
+        ));
+    }
 }
 
 fn registry(cell: CellId, caller: CallerId) -> IntraCellResourceRegistry {
@@ -362,6 +383,7 @@ fn visible_index_count_is_the_live_denominator_input() {
         )
         .expect("insert tenant")
         .get(0);
+    let _cleanup = TenantCleanup::new(&dsn, tenant_id);
     let workspace_id = WorkspaceId::new();
     let user_id = UserId::new();
     let k = key(tenant_id, workspace_id.0);
@@ -732,5 +754,4 @@ fn visible_index_count_is_the_live_denominator_input() {
             )
             .await;
     });
-    cleanup(&mut admin, tenant_id);
 }

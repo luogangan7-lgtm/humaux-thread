@@ -1,0 +1,115 @@
+{
+ "process": "humaux-gateway",
+ "mode": "serve",
+ "crate_version": "0.1.0",
+ "git_sha": "6b6981b",
+ "started_at": 1790000000,
+ "uptime_seconds": 12,
+ "degrade": {
+  "RerankModelMismatch": {
+   "count": 0,
+   "last_fired_at": null
+  },
+  "RerankProviderTimeout": {
+   "count": 0,
+   "last_fired_at": null
+  },
+  "EmbedProviderTimeout": {
+   "count": 0,
+   "last_fired_at": null
+  },
+  "EgressDenied": {
+   "count": 0,
+   "last_fired_at": null
+  },
+  "StatePinMissing": {
+   "count": 0,
+   "last_fired_at": null
+  },
+  "StatePinAmbiguous": {
+   "count": 0,
+   "last_fired_at": null
+  },
+  "CompletenessUnknown": {
+   "count": 0,
+   "last_fired_at": null
+  },
+  "ProjectionLag": {
+   "count": 0,
+   "last_fired_at": null
+  },
+  "GraphExpandCapped": {
+   "count": 0,
+   "last_fired_at": null
+  },
+  "ProjectionInvisibleLoss": {
+   "count": 0,
+   "last_fired_at": null
+  },
+  "LaneSubstituted": {
+   "count": 0,
+   "last_fired_at": null
+  }
+ },
+ "accepting": true,
+ "readiness": {
+  "verdict": "ready",
+  "taken_at": 1790000010,
+  "age_seconds": 1,
+  "pg": {
+   "state": "pass",
+   "checked_at": 1790000010,
+   "age_seconds": 1,
+   "missing_object": null
+  },
+  "retrieval_rpc": {
+   "state": "not_applicable",
+   "checked_at": 1790000010,
+   "age_seconds": 1,
+   "missing_object": "HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH (semantic recall disabled)"
+  },
+  "qdrant": {
+   "state": "not_applicable",
+   "checked_at": 1790000010,
+   "age_seconds": 1,
+   "missing_object": "HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH (semantic recall disabled)"
+  }
+ },
+ "effective_config": [
+  {
+   "name": "HUMAUX_GATEWAY_BIND_ADDR",
+   "source": "env",
+   "value": "127.0.0.1:18080"
+  },
+  {
+   "name": "HUMAUX_GATEWAY_PG_DSN",
+   "source": "env",
+   "secret": true
+  },
+  {
+   "name": "HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX",
+   "source": "env",
+   "secret": true
+  },
+  {
+   "name": "HUMAUX_GATEWAY_METRICS_ADDR",
+   "source": "env",
+   "value": "127.0.0.1:19101"
+  },
+  {
+   "name": "HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS",
+   "source": "env",
+   "value": "2"
+  },
+  {
+   "name": "HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS",
+   "source": "default",
+   "secret": true
+  },
+  {
+   "name": "HUMAUX_GATEWAY_REMEMBER_TENANT_ID",
+   "source": "default",
+   "value": ""
+  }
+ ]
+}

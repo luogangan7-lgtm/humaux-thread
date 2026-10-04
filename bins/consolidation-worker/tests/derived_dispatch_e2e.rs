@@ -13,7 +13,7 @@
 //!   HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS, HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS,
 //!   HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS, HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS,
 //!   HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS, HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH,
-//!   HUMAUX_TEST_PG_DSN]; modules=[adapters::consolidate_repo, adapters::jobs, adapters::postgres,
+//!   HUMAUX_CONSOLIDATION_WORKER_SERVE_METRICS_ADDR, HUMAUX_TEST_PG_DSN]; modules=[adapters::consolidate_repo, adapters::jobs, adapters::postgres,
 //!   application::consolidate, humaux-consolidation-worker, humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [one tenant-less pass completes both tenants' work, claims each job exactly once under RLS, and a
@@ -1183,7 +1183,15 @@ fn serve_command(dsn: &str, socket_path: &str) -> std::process::Command {
         .env("HUMAUX_CONSOLIDATION_WORKER_BATCH", "16")
         .env("HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS", "1000")
         .env("HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS", "5")
-        .env("HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS", "1");
+        .env("HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS", "1")
+        // ADR-0061 D-B: `--serve`'s own ops listener, a free loopback port bound and released here.
+        .env(
+            "HUMAUX_CONSOLIDATION_WORKER_SERVE_METRICS_ADDR",
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .expect("reserve a loopback port")
+                .to_string(),
+        );
     cmd
 }
 

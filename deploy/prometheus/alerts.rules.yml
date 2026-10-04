@@ -1,0 +1,50 @@
+# §42 alert rows loaded by card 34 (ADR-0061 D-E). Each expression is copied literally from the
+# §42 table; metric names and label keys are §41.2 rows (freezes ① and ④, checked by
+# `cargo xtask metrics-registry --check` D8). The other §42 rows wait for a producer and a red
+# record (freeze ②, §80.1); they are listed in ADR-0061 limits.
+# Every alert here has a firing and a silent case in tests/alerts.test.yml, and one balanced token
+# mutation in mutations.sh that the tests must catch.
+groups:
+  - name: humaux-alerts
+    rules:
+      # §42 "core metric absent": the runtime twin of §80.2 — a family dropped from a live exporter.
+      - alert: CoreMetricAbsent
+        expr: absent(humaux_retrieval_requests_total) or absent(degrade_total) or absent(humaux_mcp_requests_total)
+        labels:
+          severity: critical
+
+      # §42 "projection lag exceeds SLO". No `by (stream)`: the family is unlabeled (§42 freeze ④).
+      - alert: ProjectionLagExceedsSLO
+        expr: max(projection_lag_events) > 100
+        for: 10m
+        labels:
+          severity: critical
+
+      # §42 "queue dead letter increase".
+      - alert: QueueDeadLetterIncrease
+        expr: delta(jobs_dead[15m]) > 0
+        labels:
+          severity: warning
+
+      # §42 "backup failure": 26 h without a verified off-site pull. The producer is card 37; until
+      # then the family is on metrics-registry's NOT_YET_PRODUCED allowlist and this rule is silent.
+      - alert: BackupFailure
+        expr: time() - backup_last_success_timestamp_seconds > 93600
+        labels:
+          severity: critical
+
+      # §42 "health gauges absent" (ADR-0061 D-D, ruling E8): INV-3, the lag row and the DEAD row have
+      # no absent branch, so a dead or failing `humaux-maintenance health serve` (its /metrics answers
+      # 503 and the series go stale) would silence all three. Only §41.2 names, no label key.
+      - alert: HealthGaugesAbsent
+        expr: absent(data_disclosures_reserved_unfinalized) or absent(jobs_dead) or absent(projection_lag_events)
+        for: 2m
+        labels:
+          severity: critical
+
+      # §42.1 heartbeat: always firing, routed alone to the external dead-man receiver
+      # (alertmanager.yml). Its payload carries external_labels.git_sha (prometheus.yml).
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none

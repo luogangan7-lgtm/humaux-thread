@@ -295,19 +295,40 @@ fn read_ledger(admin: &mut Client, k: &StreamKey) -> LedgerReads {
     }
 }
 
-fn cleanup(admin: &mut Client, k: &StreamKey) {
-    let _ = admin.execute(
-        "DELETE FROM projection.stream_log WHERE tenant_id=$1",
-        &[&k.tenant_id.0],
-    );
-    let _ = admin.execute(
-        "DELETE FROM projection.stream_checkpoints WHERE tenant_id=$1",
-        &[&k.tenant_id.0],
-    );
-    let _ = admin.execute(
-        "DELETE FROM control.tenants WHERE tenant_id=$1",
-        &[&k.tenant_id.0],
-    );
+/// Card-31 pattern (card 34 ruling B2): from `Drop`, so a failing leg still runs it. The tenant's stream rows go in
+/// ONE batch whose failure is printed — a leaked fixture-only `(domain, projection_kind)` checkpoint makes
+/// `ops.health_snapshot` / `ops.admin_probe_snapshot` fail closed on the shared dev DB (ADR-0061 D-D, §78.2) — and the
+/// tenant row in a separate best-effort batch. Owns its own connection so the test keeps `&mut admin`.
+struct TenantCleanup {
+    admin: Client,
+    tenant_id: Uuid,
+}
+
+impl TenantCleanup {
+    fn new(dsn: &str, tenant_id: Uuid) -> Self {
+        // dep: PostgreSQL(owner) — fixture cleanup connection
+        let admin = Client::connect(dsn, NoTls).expect("cleanup connection");
+        Self { admin, tenant_id }
+    }
+}
+
+impl Drop for TenantCleanup {
+    fn drop(&mut self) {
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}';",
+            self.tenant_id
+        )) {
+            eprintln!(
+                "recall_envelope_g23 cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{}';",
+            self.tenant_id
+        ));
+    }
 }
 
 fn registry(cell: CellId, caller: CallerId) -> IntraCellResourceRegistry {
@@ -491,7 +512,7 @@ fn old_ratio(done: u64, deleted: u64, expected: u64) -> f64 {
 // thread. `stream_repo.rs`'s DB fixture uses the identical shape for the identical reason.
 #[test]
 fn g23_2_injection_1_bypass_tombstone_direct_delete() {
-    let Some((_, mut admin)) =
+    let Some((dsn, mut admin)) =
         skip_unless_both_reachable("g23_2_injection_1_bypass_tombstone_direct_delete")
     else {
         return;
@@ -504,6 +525,7 @@ fn g23_2_injection_1_bypass_tombstone_direct_delete() {
         )
         .expect("insert tenant")
         .get(0);
+    let _cleanup = TenantCleanup::new(&dsn, tenant_id);
     let k = key(tenant_id);
     seed_100_done(&mut admin, &k);
 
@@ -577,7 +599,6 @@ fn g23_2_injection_1_bypass_tombstone_direct_delete() {
     assert_eq!(old_ratio(reads.done, reads.deleted, reads.expected), 1.0);
 
     rt.block_on(teardown_collection(&transport, &permit, &collection));
-    cleanup(&mut admin, &k);
 }
 
 // ============================================================================
@@ -586,7 +607,7 @@ fn g23_2_injection_1_bypass_tombstone_direct_delete() {
 
 #[test]
 fn g23_2_injection_2_adapter_acks_without_verify_loses_seven() {
-    let Some((_, mut admin)) =
+    let Some((dsn, mut admin)) =
         skip_unless_both_reachable("g23_2_injection_2_adapter_acks_without_verify_loses_seven")
     else {
         return;
@@ -599,6 +620,7 @@ fn g23_2_injection_2_adapter_acks_without_verify_loses_seven() {
         )
         .expect("insert tenant")
         .get(0);
+    let _cleanup = TenantCleanup::new(&dsn, tenant_id);
     let k = key(tenant_id);
     // §17.4's fault shape: the ledger settles all 100 as DONE (the adapter acked every write)
     // even though only 93 ever became search-visible — an adapter that skipped
@@ -647,7 +669,6 @@ fn g23_2_injection_2_adapter_acks_without_verify_loses_seven() {
     );
 
     rt.block_on(teardown_collection(&transport, &permit, &collection));
-    cleanup(&mut admin, &k);
 }
 
 // ============================================================================
@@ -673,6 +694,7 @@ fn g23_2_legal_deletion_contrast_stays_closed_across_four_lanes() {
         )
         .expect("insert tenant")
         .get(0);
+    let _cleanup = TenantCleanup::new(&dsn, tenant_id);
     let k = key(tenant_id);
     seed_100_done(&mut admin, &k);
 
@@ -943,7 +965,6 @@ fn g23_2_legal_deletion_contrast_stays_closed_across_four_lanes() {
     assert!(out_c.degradations.is_empty());
 
     rt.block_on(teardown_collection(&transport, &permit, &collection));
-    cleanup(&mut admin, &k);
 }
 
 fn dsn_as_role(admin_dsn: &str, role: &str) -> String {

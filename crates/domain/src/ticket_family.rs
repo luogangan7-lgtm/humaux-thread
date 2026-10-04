@@ -1,6 +1,7 @@
 //! `domain::ticket_family` — the §15.1 stream-ticket family triple, in one place.
 //! Depends-on: crates=[]; services=[]; env=[]; modules=[]
-//! Called-by: [adapters::consolidate_repo, adapters::provisioning, adapters::qdrant, maintenance::main, tests, xtask::e2e_onboard, xtask::e2e_seed]
+//! Called-by: [adapters::consolidate_repo, adapters::health, adapters::provisioning, adapters::qdrant, maintenance::main, telemetry::health, tests, xtask::e2e_onboard,
+//!   xtask::e2e_seed]
 //! Invariants: []
 //! Spec: Baseline §3; §15.1; §16.2
 //!

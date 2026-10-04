@@ -1,0 +1,31 @@
+# OTel Collector (core) config for the §67.2 bundle (ADR-0061 D-G): present as §67.2's required
+# local service and §40's future OTLP ingress. Every listener is loopback.
+# ponytail: collector terminates OTLP at `debug` and forwards nothing (no process speaks OTLP, no SDK
+# by main-line note); add the Prometheus ingest path (authenticated, loopback-only) together with the
+# first SDK producer.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+      http:
+        endpoint: 127.0.0.1:4318
+
+exporters:
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [debug]
+  telemetry:
+    # Scraped by Prometheus as job `otelcol` (prometheus.yml).
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 8888

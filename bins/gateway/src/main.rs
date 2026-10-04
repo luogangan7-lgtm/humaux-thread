@@ -1,8 +1,9 @@
 //! `gateway::main` — `humaux-gateway` 进程入口（最小必要进程集见 §4.2；admin 探针契约见 §4.4）。
-//! Depends-on: crates=[axum, tokio]; services=[]; env=[]; modules=[gateway::bootstrap]
+//! Depends-on: crates=[axum, humaux-telemetry, tokio]; services=[HTTP(loopback)]; env=[]; modules=[gateway::bootstrap,
+//!   gateway::guard, gateway::status, telemetry::metrics]
 //! Called-by: [process(humaux-gateway)]
-//! Invariants: [/readyz flips to 503 and the accept loop keeps draining for DRAIN_ANNOUNCE_WINDOW before closing, so a k8s readinessProbe never sees ECONNREFUSED confused with a crash]
-//! Spec: Baseline §4.2; §4.4; ADR-0037
+//! Invariants: [/readyz flips to 503 and the accept loop keeps draining for DRAIN_ANNOUNCE_WINDOW before closing, so a k8s readinessProbe never sees ECONNREFUSED confused with a crash; the ops listener stays up through the drain window and closes after it; `--metrics-families` reads no configuration]
+//! Spec: Baseline §4.2; §4.4; ADR-0037; ADR-0061 D-B; ADR-0061 D-F
 //!
 //! ## Supervision surface (card 15, ADR-0037)
 //!
@@ -12,7 +13,7 @@
 //! | route | 200 means | 503 means |
 //! |---|---|---|
 //! | `/livez` | this process is running and its accept loop is alive | — (a dead process refuses the connection) |
-//! | `/readyz` | bootstrap completed **and** this process is still accepting new work | SIGTERM/Ctrl-C was received; the process is draining and must be taken out of rotation |
+//! | `/readyz` | bootstrap completed, this process is still accepting new work, and the last readiness snapshot (PG, the retrieval RPC round trip, Qdrant; refreshed every `HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS`) is all pass/not_applicable and ≤ 2 intervals old | body `{"status": "not_ready" \| "stale" \| "draining"}` — never a dependency name; the loopback `/status` names it (ADR-0061 D-F) |
 //!
 //! The 503 is only a real answer if a supervisor can still *reach* it. A k8s
 //! `readinessProbe.httpGet` opens a FRESH TCP connection on every poll, so flipping readiness to
@@ -21,12 +22,15 @@
 //! exists to make. [`DRAIN_ANNOUNCE_WINDOW`] is the gap between the two events, and it is the
 //! reason the 503 branch is reachable at all.
 //!
-//! `/readyz` returning 200 is a real statement, not a placeholder: reaching this point means
-//! [`GatewayBootstrap::build`] already connected the `role_gateway` pool and verified
-//! `current_user` (§6.2.3 assertion E), resolved the effective config, and bound the listener.
-//! A process that failed any of those never serves this route at all — the connection is
-//! refused, which is the honest "not ready" (§4.4 坑5 in HTTP form: *unreachable* and
-//! *reachable-but-unhealthy* must not be the same answer).
+//! `/readyz` returning 200 is a real statement: [`GatewayBootstrap::build`] connected the
+//! `role_gateway` pool and verified `current_user` (§6.2.3 assertion E), and the cached snapshot
+//! (`gateway::status`) says every hard dependency answered a real round trip within the last two
+//! refresh intervals (ADR-0061 D-F, OPS-8: before card 34 it was 200 forever after boot). A
+//! process that failed boot never serves this route at all — the connection is refused, which is
+//! the honest "not ready" (§4.4 坑5 in HTTP form: *unreachable* and *reachable-but-unhealthy* must
+//! not be the same answer). `/metrics` and `/status` are NOT on this listener: they live on the
+//! loopback ops listener `HUMAUX_GATEWAY_METRICS_ADDR` (ADR-0061 D-B, E5), because this one sits
+//! behind the reverse proxy.
 //!
 //! **Why these two are outside `native_request_boundary`**: they carry no tenant data, no
 //! config fingerprint, and no state mutation — a constant token and a status code — so the
@@ -35,18 +39,15 @@
 //! could be configured to accept. Anything that would report *what* this process is (version,
 //! fingerprint, tenant counts) belongs behind the boundary or in `humaux-admin q`, not here.
 
-use std::{
-    error::Error,
-    net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{Router, http::StatusCode, routing::get};
-use humaux_gateway::bootstrap::GatewayBootstrap;
+use humaux_gateway::{
+    bootstrap::GatewayBootstrap,
+    guard::GuardMetrics,
+    status::{METRICS_ADDR_KEY, Readiness, Verdict, render_metrics},
+};
+use humaux_telemetry::metrics::{Routes, serve_loopback};
 
 /// How long the process keeps accepting connections AFTER readiness has gone false, so a
 /// supervisor that dials a new connection per poll actually observes `503 draining` instead of
@@ -58,33 +59,65 @@ use humaux_gateway::bootstrap::GatewayBootstrap;
 // fingerprint input. Promote it there if a deployment's readiness period ever exceeds 5s.
 const DRAIN_ANNOUNCE_WINDOW: Duration = Duration::from_secs(5);
 
-/// `/livez` + `/readyz`. `accepting` is flipped to `false` by the shutdown future the moment a
-/// termination signal arrives, so a request in flight during the graceful drain window still
-/// gets served while the next readiness poll already reports 503.
-fn supervision_routes(accepting: Arc<AtomicBool>) -> Router {
+/// `/livez` + `/readyz`. The readiness verdict is read from the cached snapshot (never a
+/// dependency call per request), and the body is a status word only (ADR-0061 D-F).
+fn supervision_routes(readiness: Arc<Readiness>) -> Router {
     Router::new()
         .route("/livez", get(async || (StatusCode::OK, "live\n")))
         .route(
             "/readyz",
             get(async move || {
-                if accepting.load(Ordering::SeqCst) {
-                    (StatusCode::OK, "ready\n")
+                let verdict = readiness.verdict();
+                let code = if verdict == Verdict::Ready {
+                    StatusCode::OK
                 } else {
-                    (StatusCode::SERVICE_UNAVAILABLE, "draining\n")
-                }
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
+                (
+                    code,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    format!("{{\"status\":\"{}\"}}\n", verdict.as_str()),
+                )
             }),
         )
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let runtime = GatewayBootstrap::load_from_env()?.build().await?;
+    // ADR-0061 D-C: the zero-state exposition, before any configuration is read (D-H reads it).
+    if std::env::args().nth(1).as_deref() == Some("--metrics-families") {
+        print!("{}", render_metrics(&GuardMetrics::default()));
+        return Ok(());
+    }
+    let started = std::time::SystemTime::now();
+    let mut runtime = GatewayBootstrap::load_from_env()?.build().await?;
+    let refresh = runtime.readiness_refresh();
+    let probe = runtime
+        .take_readiness_probe()
+        .ok_or("readiness probe already taken")?;
+    // ADR-0061 D-F: the first snapshot exists before anything accepts, so there is no "unknown".
+    let readiness = Arc::new(Readiness::new(probe.check(refresh).await, refresh));
+    readiness.spawn_refresh(probe);
+
+    let (guard, for_status, config) = (
+        runtime.guard(),
+        Arc::clone(&readiness),
+        runtime.effective_config().clone(),
+    );
+    // dep: HTTP(loopback) — the ops listener serving /metrics and /status (ADR-0061 D-B)
+    let ops = serve_loopback(
+        METRICS_ADDR_KEY,
+        runtime.metrics_addr(),
+        Routes {
+            metrics: Box::new(move || Ok(render_metrics(guard.metrics()))),
+            status: Box::new(move || Ok(for_status.status_json(started, &config))),
+        },
+    )?;
     let listener = tokio::net::TcpListener::bind(runtime.bind_addr()).await?;
-    let accepting = Arc::new(AtomicBool::new(true));
     let app = runtime
         .adapter()
         .router()
-        .merge(supervision_routes(accepting.clone()));
+        .merge(supervision_routes(readiness.clone()));
 
     // Both handlers are installed before `axum::serve` exists: `tokio::signal::ctrl_c()` only
     // registers SIGINT on the shutdown future's first poll (inside `serve`), so a Ctrl-C landing
@@ -106,18 +139,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // wait the two events are simultaneous and a supervisor that opens a new connection per
         // poll (the k8s `readinessProbe.httpGet` this route is written for) could only ever get
         // ECONNREFUSED — never the 503 that says "draining, do not restart me".
-        accepting.store(false, Ordering::SeqCst);
+        readiness.stop_accepting();
         eprintln!(
             "humaux-gateway: signal received, /readyz now 503, accepting for {}s more",
             DRAIN_ANNOUNCE_WINDOW.as_secs()
         );
         tokio::time::sleep(DRAIN_ANNOUNCE_WINDOW).await;
+        // ADR-0061 D-B: metrics stay scrapable through the drain, so the drain itself is visible.
+        drop(ops);
         eprintln!("humaux-gateway: drain window elapsed, closing the accept loop");
     };
 
     eprintln!(
-        "humaux-gateway listening on {} config_fingerprint={}",
+        "humaux-gateway listening on {} ops={} config_fingerprint={}",
         listener.local_addr()?,
+        runtime.metrics_addr(),
         runtime.config_fingerprint()
     );
     axum::serve(

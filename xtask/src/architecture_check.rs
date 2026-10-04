@@ -1498,6 +1498,71 @@ fn adr0060_route_provider_sole_sites(root: &Path) -> Verdict {
     }
 }
 
+/// The file whose `&'static str` label signature carries the ADR-0061 D-A bound; the scan
+/// domain is dead without it.
+const METRICS_ENCODER_FILE: &str = "crates/telemetry/src/metrics.rs";
+
+/// The ways a runtime `String` becomes `&'static str`: the three std `leak` paths and the method
+/// form `.leak(` (ADR-0061 review-fix 3, F11).
+const LEAK_TOKENS: [&str; 4] = ["Box::leak", "String::leak", "Vec::leak", ".leak("];
+
+/// `file:line: token` of every non-comment leak in one source.
+fn box_leak_hits(display_path: &str, source: &str) -> Vec<String> {
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim_start().starts_with("//"))
+        .flat_map(|(i, l)| {
+            LEAK_TOKENS
+                .iter()
+                .filter(move |t| l.contains(**t))
+                .map(move |t| format!("{display_path}:{}: {t}", i + 1))
+        })
+        .collect()
+}
+
+/// The crates whose code renders or records a §41.2 label (ADR-0061 D-A, D-C) plus every binary.
+fn in_leak_scan_domain(display_path: &str) -> bool {
+    [
+        "crates/telemetry/src/",
+        "crates/retrieval/src/",
+        "crates/retrieval-provider/src/",
+    ]
+    .iter()
+    .any(|p| display_path.starts_with(p))
+        || (display_path.starts_with("bins/") && display_path.contains("/src/"))
+}
+
+/// ADR-0061 D-A: metric label values are `&'static str` from closed enums, so a tenant id,
+/// user id or free text can reach a label only by leaking it. No production leak may exist in
+/// the label-recording crates (telemetry, retrieval, retrieval-provider) or any `bins/*/src`
+/// (test modules stripped).
+fn adr0061_no_box_leak_labels(root: &Path) -> Verdict {
+    let files: Vec<(String, String)> = walk_workspace_rs(root)
+        .into_iter()
+        .map(|(p, s)| (display(root, &p), s))
+        .filter(|(d, _)| in_leak_scan_domain(d))
+        .collect();
+    adr0061_box_leak_verdict(&files)
+}
+
+fn adr0061_box_leak_verdict(files: &[(String, String)]) -> Verdict {
+    if !files.iter().any(|(d, _)| d == METRICS_ENCODER_FILE) {
+        return Verdict::Fail(vec![format!(
+            "positive sentinel dead: {METRICS_ENCODER_FILE} is not in the scan domain"
+        )]);
+    }
+    let hits: Vec<String> = files
+        .iter()
+        .flat_map(|(d, s)| box_leak_hits(d, s))
+        .collect();
+    if hits.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(hits)
+    }
+}
+
 /// §1.3/§48.0 G80-11 (source_hash leg): `humaux_projection::fingerprint::source_hash` is the
 /// sole construction point of `SourceHash` (§16.1/§16.1.1, T5.1) — same single-crate
 /// convergence family as `EvidencePayloadSha256` (G80-22, above) and the §1.12 canonical tool
@@ -5915,6 +5980,10 @@ pub fn run(_args: &[String]) -> i32 {
             "ADR-0060 D-B T31 (one RouteProviders::new, one ReasoningProviderDescriptor literal under bins, one capabilities read)",
             adr0060_route_provider_sole_sites(&root),
         ),
+        (
+            "ADR-0061 D-A (no Box::leak in crates/telemetry or bins: metric labels stay closed &'static str)",
+            adr0061_no_box_leak_labels(&root),
+        ),
     ];
     checks.extend(provider_plane_architecture_gate_checks(&root));
 
@@ -5943,6 +6012,54 @@ mod tests {
             fs::read_to_string(root.join("crates/domain/src/continuity.rs")).unwrap(),
             fs::read_to_string(root.join("crates/adapters/src/continuity_repo.rs")).unwrap(),
         )
+    }
+
+    #[test]
+    fn adr0061_box_leak_sentinel_is_green_on_the_tree_and_red_on_a_leak() {
+        assert_eq!(adr0061_no_box_leak_labels(&real_root()), Verdict::Pass);
+        let encoder = (
+            METRICS_ENCODER_FILE.to_string(),
+            "//! Box::leak is refused\n".to_string(),
+        );
+        let leak = (
+            "bins/gateway/src/x.rs".to_string(),
+            "fn f(t: String) -> &'static str {\n    Box::leak(t.into_boxed_str())\n}\n".to_string(),
+        );
+        assert_eq!(
+            adr0061_box_leak_verdict(std::slice::from_ref(&encoder)),
+            Verdict::Pass
+        );
+        assert_eq!(
+            adr0061_box_leak_verdict(&[encoder, leak.clone()]),
+            Verdict::Fail(vec!["bins/gateway/src/x.rs:2: Box::leak".to_string()])
+        );
+        assert!(
+            matches!(adr0061_box_leak_verdict(&[leak]), Verdict::Fail(p) if p[0].contains("positive sentinel dead"))
+        );
+    }
+
+    /// ADR-0061 review-fix 3 (F11): the scan covers the label-recording crates, not only telemetry and the bins,
+    /// and every std leak path. Fault: the narrower `crates/telemetry/src` + `bins/*/src` domain ⇒ red.
+    #[test]
+    fn adr0061_leak_sentinel_scans_retrieval_crates_and_every_leak_path() {
+        for path in [
+            "crates/retrieval/src/completeness.rs",
+            "crates/retrieval-provider/src/metrics.rs",
+            "crates/telemetry/src/health.rs",
+            "bins/gateway/src/guard.rs",
+        ] {
+            assert!(in_leak_scan_domain(path), "{path} is outside the leak scan");
+        }
+        assert!(!in_leak_scan_domain("crates/adapters/src/health.rs"));
+        let src = "fn f(s: String, v: Vec<u8>) {\n    let _ = String::leak(s);\n    let _ = Vec::leak(v);\n    let _ = t.leak();\n}\n";
+        assert_eq!(
+            box_leak_hits("crates/retrieval/src/x.rs", src),
+            [
+                "crates/retrieval/src/x.rs:2: String::leak",
+                "crates/retrieval/src/x.rs:3: Vec::leak",
+                "crates/retrieval/src/x.rs:4: .leak(",
+            ]
+        );
     }
 
     #[test]

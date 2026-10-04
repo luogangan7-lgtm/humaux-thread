@@ -1,9 +1,10 @@
 //! `retrieval::request` — Retrieval request construction (§55.1): one typed path shared by every future lane.
 //! Depends-on: crates=[humaux-contracts, humaux-domain, serde]; services=[];
 //!   env=[]; modules=[contracts::config_registry, contracts::retrieval_config, domain::authority, domain::selection, retrieval::planner, retrieval::predicate_registry]
-//! Called-by: [application::retrieve, gateway::context, gateway::memory, gateway::recall, humaux-local-secret-scan, retrieval-worker::rpc, retrieval::envelope, tests]
-//! Invariants: []
-//! Spec: §55.1
+//! Called-by: [application::retrieve, gateway::context, gateway::memory, gateway::recall, humaux-local-secret-scan, retrieval-worker::rpc, retrieval::completeness, retrieval::envelope, tests]
+//! Invariants: [build_request records which RetrievalIntent constructor ran as a closed IntentKind; nothing else
+//!   sets it]
+//! Spec: §55.1; §41.2; ADR-0061 D-C
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -41,6 +42,36 @@ impl ProfileFingerprint {
 #[derive(Debug, Clone)]
 pub struct RetrievalIntent {
     input: RetrievalInput,
+}
+
+/// §41.2 `humaux_retrieval_requests_total.intent`: which [`RetrievalIntent`] constructor built the
+/// request. A closed set, one value per `RetrievalInput` variant (ADR-0061 D-C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntentKind {
+    Text,
+    Context,
+    DirectGet,
+    MemoryEnumerate,
+}
+
+impl IntentKind {
+    /// Every value, in render order; the label's cardinality bound (ADR-0061 D-A).
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Text,
+        Self::Context,
+        Self::DirectGet,
+        Self::MemoryEnumerate,
+    ];
+
+    /// The `intent` label value.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Context => "context",
+            Self::DirectGet => "direct_get",
+            Self::MemoryEnumerate => "memory_enumerate",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +158,7 @@ impl TrustedRetrievalQuery<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrievalRequest {
+    intent: IntentKind,
     query: Option<String>,
     planner_decision: PlannerDecision,
     query_transform: QueryTransform,
@@ -137,6 +169,10 @@ pub struct RetrievalRequest {
 }
 
 impl RetrievalRequest {
+    pub(crate) fn intent(&self) -> IntentKind {
+        self.intent
+    }
+
     #[must_use]
     pub fn query(&self) -> Option<&str> {
         self.query.as_deref()
@@ -214,7 +250,7 @@ pub fn build_request(
         .top_k()
         .saturating_mul(RETRIEVAL_CANDIDATE_MULTIPLIER)
         .min(CANDIDATE_CAP);
-    let (query, planner_decision) = match intent.input {
+    let (intent, query, planner_decision) = match intent.input {
         RetrievalInput::Text {
             query,
             predicate_registry,
@@ -227,19 +263,22 @@ pub fn build_request(
                 &indexed_columns,
                 &enumerable_scopes,
             );
-            (Some(query), planner_decision)
+            (IntentKind::Text, Some(query), planner_decision)
         }
         RetrievalInput::Context => (
+            IntentKind::Context,
             None,
             PlannerDecision::Class(planner::QueryClass::Continuity),
         ),
         RetrievalInput::DirectGet { memory_id } => (
+            IntentKind::DirectGet,
             None,
             PlannerDecision::DirectGet(crate::planner::DirectGetLocator::MemoryId(
                 memory_id.0.to_string(),
             )),
         ),
         RetrievalInput::MemoryEnumerate => (
+            IntentKind::MemoryEnumerate,
             None,
             PlannerDecision::Enumerate {
                 predicate_id: humaux_domain::selection::AUTHORIZED_MEMORY_ENUMERATION_V1.to_owned(),
@@ -247,6 +286,7 @@ pub fn build_request(
         ),
     };
     Ok(RetrievalRequest {
+        intent,
         query,
         planner_decision,
         query_transform: profile.query_transform(),

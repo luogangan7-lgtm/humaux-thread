@@ -166,6 +166,7 @@ async fn spawn_worker(expected_gateway_uid: u32) -> String {
     let state = Arc::new(humaux_retrieval_worker::rpc::RpcState {
         expected_gateway_uid,
         calls,
+        pg_dsn: required("HUMAUX_RETRIEVAL_WORKER_PG_DSN"),
         scanner: scanner(),
         embedder: Arc::new(TestDoubleProvider::new(embedding_model(), rerank_model())),
         dimension: DIMENSION,

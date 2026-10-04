@@ -1,17 +1,20 @@
 //! `telemetry::degrade` — `DegradeCode`, `Outcome<T>`, and `abstain()`: the single fail-open topology for the whole
 //!   workspace (§53).
-//! Depends-on: crates=[humaux-domain, smallvec, tracing]; services=[]; env=[]; modules=[domain::error]
-//! Called-by: [retrieval::envelope, tests]
-//! Invariants: [abstain() is the only writer of a non-empty degradations; Outcome::also joins codes through it]
-//! Spec: Baseline §53.3; ADR-0057
+//! Depends-on: crates=[humaux-domain, smallvec, tracing]; services=[]; env=[]; modules=[domain::error, telemetry::metrics]
+//! Called-by: [admin::ops_status, gateway::status, maintenance::health_serve, retrieval::envelope, telemetry::metrics, tests]
+//! Invariants: [abstain() is the only writer of a non-empty degradations; Outcome::also joins codes through it;
+//!   abstain() holds the one `degrade_total` increment and the last-fired store]
+//! Spec: Baseline §53.3; §41.2; ADR-0057; ADR-0061 D-A
 //!
 //! Every fail-open
 //! / degrade / abstain path goes through `abstain()`; a caller that returns
 //! a fallback value any other way is what §53.3 rule 1 exists to catch.
 
+use crate::metrics::{Counters, families, write_single_label};
 use humaux_domain::error::ErrorCode;
 use smallvec::{SmallVec, smallvec};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Generates `DegradeCode`, `DegradeCode::ALL`, and `DegradeCode::as_str`
 /// from one variant list (§52.4 G52-3, §53.3 规则2). Before this macro,
@@ -182,66 +185,45 @@ impl<T> Outcome<T> {
 /// halves are actually assembled.
 pub type Response<T> = Result<Outcome<T>, ErrorCode>;
 
-/// Process-local placeholder for `degrade_total{code}` (§53.1). Full
-/// Prometheus `IntCounterVec` registration lands with the `telemetry::metrics`
-/// task; until then this keeps the count observable (§53.4's per-code
-/// injection assertions need *a* counter to read) while keeping `abstain()`
-/// the one place any counter is touched.
-///
-// ponytail: no Prometheus `degrade_total{code}` family is emitted at all —
-// §53.5 INV-1/INV-2 have no real data source yet. Upgrade path: replace this
-// with `prometheus::IntCounterVec` in the `telemetry::metrics` task (§41.2
-// `degrade_total{code}`); `label_cardinality`-shaped operands for §53.3 规则2
-// must read that counter's live label set, not this process-local stand-in.
-struct DegradeTotal([AtomicU64; DegradeCode::ALL.len()]);
+// §41.2 `degrade_total{code}`: one slot per `DegradeCode::ALL` position, rendered by [`render`].
+static DEGRADE_TOTAL: Counters<{ DegradeCode::ALL.len() }> = Counters::new();
 
-impl DegradeTotal {
-    // ponytail: 11 literal AtomicU64::new(0) instead of a `[X; N]` repeat
-    // expression — AtomicU64 isn't Copy, and naming a `const ZERO` for the
-    // repeat trips clippy::declare_interior_mutable_const (a const with
-    // interior mutability silently re-evaluates per use site, which is
-    // exactly wrong for a shared atomic). Update the count by hand if
-    // DegradeCode ever grows past 11.
-    const fn new() -> Self {
-        DegradeTotal([
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-        ])
-    }
+// ADR-0061 D-A: unix seconds of the last abstain() per code (0 = never since start). Written with
+// `store`, not as a gauge: it feeds `/status` and §4.4 `degrade.counters`, not a §41.2 family.
+static DEGRADE_LAST_FIRED_UNIX: [AtomicU64; DegradeCode::ALL.len()] =
+    [const { AtomicU64::new(0) }; DegradeCode::ALL.len()];
 
-    fn inc(&self, code: DegradeCode) {
-        let idx = DegradeCode::ALL
-            .iter()
-            .position(|c| *c == code)
-            .expect("DegradeCode::ALL is exhaustive");
-        self.0[idx].fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// count for one code — exposed for tests / future metrics wiring.
-    fn count(&self, code: DegradeCode) -> u64 {
-        let idx = DegradeCode::ALL
-            .iter()
-            .position(|c| *c == code)
-            .expect("DegradeCode::ALL is exhaustive");
-        self.0[idx].load(Ordering::Relaxed)
-    }
+fn slot(code: DegradeCode) -> usize {
+    DegradeCode::ALL
+        .iter()
+        .position(|c| *c == code)
+        .expect("DegradeCode::ALL is exhaustive")
 }
-
-static DEGRADE_TOTAL: DegradeTotal = DegradeTotal::new();
 
 /// current count for `code` — read-only accessor for注错测试 assertions
 /// ("① `degrade_total{code}` 恰 +1", §53.4), without exposing the counter itself.
 pub fn degrade_total_count(code: DegradeCode) -> u64 {
-    DEGRADE_TOTAL.count(code)
+    DEGRADE_TOTAL.get(slot(code))
+}
+
+/// Unix seconds of the last `abstain(code)` in this process, `None` if it never fired since
+/// start (ADR-0061 D-A; §4.4 `degrade.counters` "计数与最后触发时间").
+pub fn degrade_last_fired_unix(code: DegradeCode) -> Option<u64> {
+    match DEGRADE_LAST_FIRED_UNIX[slot(code)].load(Ordering::Relaxed) {
+        0 => None,
+        t => Some(t),
+    }
+}
+
+/// Renders `degrade_total{code}` seeded over all 11 codes (ADR-0061 D-A), so INV-1's
+/// `absent_over_time` branch can only mean "process down", never "never incremented".
+pub fn render(out: &mut String) {
+    write_single_label(
+        out,
+        &families::DEGRADE_TOTAL,
+        &DegradeCode::ALL.map(DegradeCode::as_str),
+        |i| DEGRADE_TOTAL.get(i) as f64,
+    );
 }
 
 /// §53.1 single exit point for every fail-open / degrade / abstain path in
@@ -253,7 +235,11 @@ pub fn degrade_total_count(code: DegradeCode) -> u64 {
 /// `Outcome`'s doc comment for why this module cannot enforce that itself.
 pub fn abstain<T>(code: DegradeCode, fallback: T) -> Outcome<T> {
     tracing::warn!(target: "degrade", code = code.as_str(), "abstain");
-    DEGRADE_TOTAL.inc(code);
+    DEGRADE_TOTAL.inc(slot(code), 1);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    DEGRADE_LAST_FIRED_UNIX[slot(code)].store(now, Ordering::Relaxed);
     Outcome {
         value: fallback,
         degradations: smallvec![code],
@@ -383,6 +369,42 @@ mod tests {
         );
         assert_eq!(degrade_total_count(DegradeCode::EgressDenied), before_a + 1);
         assert_eq!(degrade_total_count(DegradeCode::StatePinMissing), before_b);
+    }
+
+    /// T-D1: abstain() records the last-fired time for its own code only.
+    #[test]
+    fn abstain_sets_last_fired_for_its_own_code_only() {
+        // No lib test abstains RerankModelMismatch (slot 0), so it stays unfired.
+        let t0 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        abstain(DegradeCode::GraphExpandCapped, ());
+        let fired = degrade_last_fired_unix(DegradeCode::GraphExpandCapped);
+        assert!(fired.is_some_and(|t| t >= t0), "{fired:?} < {t0}");
+        assert_eq!(
+            degrade_last_fired_unix(DegradeCode::RerankModelMismatch),
+            None
+        );
+    }
+
+    /// T-A2 / T-A4: `degrade_total` renders HELP + TYPE and exactly one series per code (11,
+    /// §41.2 frozen set), seeded before any abstain.
+    #[test]
+    fn render_seeds_all_eleven_codes() {
+        let mut out = String::new();
+        render(&mut out);
+        assert!(out.starts_with("# HELP degrade_total "), "{out}");
+        assert!(out.contains("\n# TYPE degrade_total counter\n"));
+        let series: Vec<&str> = out.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(series.len(), 11, "{out}");
+        for code in DegradeCode::ALL {
+            let prefix = format!("degrade_total{{code=\"{}\"}} ", code.as_str());
+            assert!(
+                series.iter().any(|l| l.starts_with(&prefix)),
+                "missing {prefix}"
+            );
+        }
     }
 
     /// ADR-0057 D-E: `also` keeps the first code, appends the second in order, and the second

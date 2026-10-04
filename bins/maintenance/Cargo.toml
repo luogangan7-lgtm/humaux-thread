@@ -15,8 +15,10 @@ humaux-adapters = { path = "../../crates/adapters" }
 humaux-domain = { path = "../../crates/domain" }
 # why: the §73.5 API-key keyed hash and its log fingerprint (edge); used-by: [maintenance::main]
 humaux-protocol = { path = "../../crates/protocol" }
-# why: async runtime for the sqlx pool and the Qdrant transport; used-by: [maintenance::main]
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# why: the §41.2 health families (publish/render), the loopback ops listener and the degrade accessors of /status (ADR-0061 D-B, D-D); used-by: [maintenance::health_serve]
+humaux-telemetry = { path = "../../crates/telemetry" }
+# why: async runtime for the sqlx pool and the Qdrant transport; signal/time/macros for the resident `health serve` loop (ADR-0061 D-D); used-by: [maintenance::main, maintenance::health_serve]
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "time", "macros"] }
 # why: the one JSON receipt printed per subcommand; used-by: [maintenance::main]
 serde_json = "1"
 # why: the Serialize bound of the receipt-to-JSON helper; used-by: [maintenance::main]

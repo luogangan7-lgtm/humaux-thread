@@ -29,6 +29,9 @@ humaux-infra-cell = { path = "../../crates/infra-cell" }
 # source_hash` must come from it, never a second hasher.
 # why: humaux-projection dependency; used-by: [private-worker::distill, private-worker::tests::distill_hop_e2e, tests]
 humaux-projection = { path = "../../crates/projection" }
+# ADR-0061 D-B: the loopback ops listener (no metrics crate, D-A).
+# why: /metrics + /status exposition; used-by: [private-worker::main]
+humaux-telemetry = { path = "../../crates/telemetry" }
 # §11.8 `inference_rpc.rs`: `axum::serve` over a `tokio::net::UnixListener` (axum 0.8 native
 # `Listener` impl) — same pin `bins/retrieval-worker`'s own ADR-0012 RPC transport already uses.
 # why: axum dependency; used-by: [private-worker::inference_rpc]

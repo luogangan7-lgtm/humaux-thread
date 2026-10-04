@@ -393,8 +393,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid 0.9.6",
+ "der_derive",
+ "flagset",
  "pem-rfc7468",
  "zeroize",
+]
+
+[[package]]
+name = "der_derive"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -543,6 +556,12 @@ name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
+
+[[package]]
+name = "flagset"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
 
 [[package]]
 name = "fluent-uri"
@@ -923,12 +942,17 @@ version = "0.1.0"
 dependencies = [
  "humaux-adapters",
  "humaux-contracts",
+ "humaux-domain",
  "humaux-infra-cell",
+ "humaux-telemetry",
+ "humaux-testkit",
+ "postgres",
  "serde_json",
  "sha2 0.11.0",
  "time",
  "tokio",
  "uuid",
+ "x509-cert",
 ]
 
 [[package]]
@@ -961,6 +985,7 @@ dependencies = [
  "humaux-application",
  "humaux-domain",
  "humaux-private-worker",
+ "humaux-telemetry",
  "humaux-testkit",
  "postgres",
  "serde",
@@ -1011,6 +1036,7 @@ dependencies = [
  "humaux-retrieval",
  "humaux-retrieval-provider",
  "humaux-retrieval-worker",
+ "humaux-telemetry",
  "humaux-testkit",
  "postgres",
  "serde",
@@ -1076,6 +1102,7 @@ dependencies = [
  "humaux-adapters",
  "humaux-domain",
  "humaux-protocol",
+ "humaux-telemetry",
  "humaux-testkit",
  "postgres",
  "rand 0.9.5",
@@ -1099,6 +1126,7 @@ dependencies = [
  "humaux-infra-cell",
  "humaux-local-secret-scan",
  "humaux-projection",
+ "humaux-telemetry",
  "humaux-testkit",
  "postgres",
  "serde",
@@ -1193,6 +1221,9 @@ dependencies = [
  "humaux-local-secret-scan",
  "humaux-retrieval",
  "humaux-retrieval-provider",
+ "humaux-telemetry",
+ "humaux-testkit",
+ "postgres",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3828,6 +3859,17 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "x509-cert"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
+dependencies = [
+ "const-oid 0.9.6",
+ "der",
+ "spki",
+]
 
 [[package]]
 name = "xtask"

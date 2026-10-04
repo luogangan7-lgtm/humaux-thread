@@ -23,6 +23,9 @@ humaux-adapters = { path = "../../crates/adapters" }
 humaux-application = { path = "../../crates/application" }
 # why: humaux-domain dependency; used-by: [consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::run_once_e2e, humaux-consolidation-worker, tests]
 humaux-domain = { path = "../../crates/domain" }
+# ADR-0061 D-B: the loopback ops listener (no metrics crate, D-A).
+# why: /metrics + /status exposition; used-by: [consolidation-worker::main]
+humaux-telemetry = { path = "../../crates/telemetry" }
 # why: tokio dependency; used-by: [consolidation-worker::inference_client, consolidation-worker::main, consolidation-worker::tests::consolidation_hop_e2e, consolidation-worker::tests::derived_dispatch_e2e, consolidation-worker::tests::run_once_e2e, tests]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 # `sqlx::types::Uuid` (what `consolidate_repo`'s functions take) is the literal `uuid::Uuid`

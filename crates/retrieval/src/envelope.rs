@@ -4,8 +4,10 @@
 //! Called-by: [adapters::context_repo, adapters::retrieve, gateway::context, gateway::memory, gateway::recall, retrieval::completeness, retrieval::signals, tests]
 //! Invariants: [A2 compares the Qdrant point count with the ledger's ProjectionReads points, never with ticket
 //!   counts (ADR-0057 D-A); build_projection_block is the only place completeness_ratio / current are computed
-//!   and the only producer of PROJECTION_INVISIBLE_LOSS / PROJECTION_LAG, composed loss-then-lag (ADR-0057 D-E)]
-//! Spec: §23; §23.1; ADR-0057
+//!   and the only producer of PROJECTION_INVISIBLE_LOSS / PROJECTION_LAG, composed loss-then-lag (ADR-0057 D-E);
+//!   PendingEnvelope::finish is the only path to both final retrieval metrics, a dropped pending records neither
+//!   (ADR-0061 D-C)]
+//! Spec: §23; §23.1; §41.2; ADR-0057; ADR-0061 D-C
 //!
 //! Assembles the five blocks
 //! (`pipeline` / `completeness` / `provenance` / `freshness` / `grounding`) and, most
@@ -30,7 +32,7 @@ use humaux_domain::context::MandatoryOverflow;
 
 use crate::compiler::ContextOutcome;
 use crate::planner::{PlannerDecision, QueryClass};
-use crate::request::{ProfileFingerprint, RetrievalRequest};
+use crate::request::{IntentKind, ProfileFingerprint, RetrievalRequest};
 use humaux_domain::grounding::{GroundingState, GroundingStateKind};
 use humaux_telemetry::degrade::{DegradeCode, Outcome, abstain};
 
@@ -612,12 +614,15 @@ pub struct CompletenessInputs<'a> {
 pub struct PendingEnvelope<T> {
     value: T,
     class: CompletenessClass,
+    intent: IntentKind,
 }
 
 impl<T> PendingEnvelope<T> {
     /// Commits the one observable final classification after the caller has accepted its output.
+    /// It also counts the returned envelope in `humaux_retrieval_requests_total` (§41.2 "envelope
+    /// returns", the §53.5 INV-1 denominator; ADR-0061 D-C).
     pub fn finish(self) -> T {
-        crate::completeness::record_final_classification(self.class);
+        crate::completeness::record_final_classification(self.class, self.intent);
         self.value
     }
 }
@@ -688,7 +693,11 @@ fn outcome_block_under<T>(
     );
     let outcome = exact_outcome_from_class(class, inputs.census)?;
     let value = accept(outcome)?;
-    Ok(PendingEnvelope { value, class })
+    Ok(PendingEnvelope {
+        value,
+        class,
+        intent: request.intent(),
+    })
 }
 
 /// Pure component-level producer of the (`class`, `exact` block) pair, retained only for this
@@ -1228,7 +1237,11 @@ pub fn no_serving_projection_envelope<I, T>(
         pinned: PinnedReport::NotRun,
     };
     let value = accept(envelope)?;
-    Ok(PendingEnvelope { value, class })
+    Ok(PendingEnvelope {
+        value,
+        class,
+        intent: request.intent(),
+    })
 }
 
 // ============================================================================
@@ -2267,7 +2280,15 @@ mod tests {
     fn valid_final_exact_outcome<T>(
         accept: impl FnOnce(ExactOutcome) -> Result<T, humaux_domain::error::ErrorCode>,
     ) -> Result<PendingEnvelope<T>, humaux_domain::error::ErrorCode> {
-        let request = provenance_request("all rejected", 5, true);
+        valid_final_outcome_for(&provenance_request("all rejected", 5, true), accept)
+    }
+
+    /// Every final gate passes for `request` (closed ledger, enumerated census, valid
+    /// provenance), whatever its intent.
+    fn valid_final_outcome_for<T>(
+        request: &RetrievalRequest,
+        accept: impl FnOnce(ExactOutcome) -> Result<T, humaux_domain::error::ErrorCode>,
+    ) -> Result<PendingEnvelope<T>, humaux_domain::error::ErrorCode> {
         let ledger = closed(LedgerReads {
             expected: 1,
             done: 1,
@@ -2291,7 +2312,7 @@ mod tests {
             crate::completeness::ExactEnumeration::new("p", 1, 1, 0).unwrap(),
         );
         envelope_outcome_block(
-            &request,
+            request,
             CompletenessInputs {
                 lane_status: &LaneStatus::Ok,
                 census: &census,
@@ -2334,6 +2355,63 @@ mod tests {
         assert!(take_final_record_trace().is_empty());
         drop(pending);
         assert!(take_final_record_trace().is_empty());
+        // T-C2 (ADR-0061 D-C): neither final family moves before `finish()` or on a drop.
+        assert!(crate::completeness::take_requests_trace().is_empty());
+    }
+
+    /// T-C1 (ADR-0061 D-C): `finish()` counts `humaux_retrieval_requests_total` exactly once, under
+    /// the intent of the `RetrievalIntent` constructor that built the request, and only then.
+    #[test]
+    fn finish_counts_the_returned_envelope_once_under_its_own_intent() {
+        use crate::completeness::take_requests_trace;
+        use crate::request::{
+            RetrievalIntent, build_request, resolve_registered_retrieval_profile,
+        };
+        use humaux_domain::authority::MemoryId;
+
+        let raw = BTreeMap::from([("retrieval.profile.top_k".to_string(), "5".to_string())]);
+        let profile = resolve_registered_retrieval_profile(&raw).expect("registered profile");
+        let text = RetrievalIntent::new(
+            "ordinary text".to_string(),
+            vec![],
+            Default::default(),
+            Default::default(),
+        )
+        .expect("text intent");
+        let cases = [
+            (text, "text", "semantic_bounded"),
+            (
+                RetrievalIntent::trusted_context(),
+                "context",
+                "semantic_bounded",
+            ),
+            (
+                RetrievalIntent::trusted_memory_get(MemoryId::new()),
+                "direct_get",
+                "exact",
+            ),
+            (
+                RetrievalIntent::trusted_memory_enumerate(),
+                "memory_enumerate",
+                "exact",
+            ),
+        ];
+        assert!(take_requests_trace().is_empty());
+        for (intent, want_intent, want_class) in cases {
+            let request = build_request(intent, &profile).expect("request");
+            let pending = valid_final_outcome_for(&request, Ok).expect("every final gate passes");
+            assert!(
+                take_requests_trace().is_empty(),
+                "{want_intent}: counted before finish"
+            );
+            let out = pending.finish();
+            assert_eq!(
+                take_requests_trace(),
+                vec![(want_intent, want_class)],
+                "{want_intent}: {:?}",
+                out.class
+            );
+        }
     }
 
     #[test]

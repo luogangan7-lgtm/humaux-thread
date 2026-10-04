@@ -1145,6 +1145,7 @@ Visibility（§6.1.1）回答"谁能看见这条记忆"；Subject 轴回答一�
 ```text
 runtime role     = role_gateway · role_private_worker · role_consolidation_worker · role_public_worker · role_retrieval_worker
 非 runtime role  = role_batch_issuer · role_maintenance · role_admin · role_migration_owner
+NOLOGIN 读者     = role_health_reader（ADR-0061 D-D；不是登录角色，不进任何连接池）
 ```
 
 判据是两条同时成立，不是「听起来像不像运行时」：**持有常驻连接池**（请求路径或常驻 worker），且**不拥有任何表**（§48.2）。凡「runtime role 无 X 权限」的断言，指对上面五个角色**逐个**成立 —— 五个里有一个成立不了，该断言就是假的。
@@ -1154,6 +1155,8 @@ runtime role     = role_gateway · role_private_worker · role_consolidation_wor
 `role_batch_issuer` 刻意排除在外，它就是持有 `INSERT ON private.ingest_tickets` 的那一个角色。若把它算进 runtime role，§23.4 G23-1c 会把它自己判红，§60.1 整条机制作废；若它与 runtime 共用连接池，同样作废 —— 请求路径拿到的连接会自带发票权。**独立连接池是这条机制的一部分，不是部署细节。**
 
 **本节两张表是角色全集，不是示例清单**：`pg_roles` 中 `rolcanlogin = true` 且非 superuser 的角色集合，必须与表的行集合去掉 `role_migration_owner` 后逐一相等；`role_migration_owner` 必须存在且为 NOLOGIN、无口令——它从不登录，迁移由 `migrate` 的执行主体以 `ALTER … OWNER TO` / `SET ROLE` 代它行事（ADR-0059 D-A）。多一个少一个都是 CI 红（§48.2 枚举），不是「文档忘了更新」。
+
+`role_health_reader` 是第十个角色（迁移 0210，卡 34）：NOLOGIN · NOINHERIT · NOBYPASSRLS · 非 superuser · 无口令 · **无成员**——没有任何会话能成为它；它不拥有任何表，只拥有**恰好两个**只读聚合 SECURITY DEFINER（health snapshot 与 admin probe snapshot），授权见 §6.2.2 该行与其下的说明。上一段的「登录角色全集」相等只数 LOGIN 角色，故不因它改变；`rls-check` 的 `ADR-0061 health reader boundary` 单独钉死这里的每一条（成员为空、拥有函数数 == 2、不拥有任何关系）。
 
 ### 6.2.1 域级默认授权
 
@@ -1200,6 +1203,7 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
 | `role_batch_issuer` | **INSERT, SELECT** | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 | `role_maintenance` | SELECT, UPDATE（仅 `ISSUED → EXPIRED` 巡检，§15.6） | SELECT | SELECT, UPDATE（仅 `ISSUED → LOST` 巡检 §15.2 与 `retention::tombstone` 的 `* → TOMBSTONED` §37.2） | SELECT, UPDATE(serving, shadow) | SELECT | SELECT, UPDATE(status, lease_owner, lease_expires_at) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT | SELECT, INSERT | SELECT | SELECT | SELECT | SELECT, UPDATE(revoked_at, revocation_reason) | — | — | SELECT | SELECT | SELECT | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | —  | — | — | — | — | — | — | SELECT | — | SELECT | — | — | SELECT | SELECT | SELECT, UPDATE(state) | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT | SELECT, INSERT, UPDATE(state, role, updated_at) | SELECT | — | SELECT | — | — | — | — | — | — | — | — | — | — | — |
 | `role_admin` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | SELECT | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | —  | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `role_health_reader` | — | — | — | SELECT | SELECT | SELECT | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 | `role_migration_owner` | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner  | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner | owner |
 
 落点逐一对齐：
@@ -1274,6 +1278,7 @@ role_maintenance  无 DELETE / TRUNCATE；修复只能靠 UPDATE，且只在 §6
 
 - **0134 anonymous claim trust split**：`control.anonymous_claim_trust_authorities` 与 `public.anonymous_claim_trust_receipts` 的逐角色列授权见本矩阵新增两列；authority 对全部 non-owner roles 为 `—`，receipt 仅 gateway/public/retrieval/maintenance `SELECT`，owner 保持 `owner`。0134 只通过窄 SECURITY DEFINER 入口维护 authority，并向公共面投影 identity-free receipt safe fields；不得以 `rls-check` carve-out 替代本表授权真源。
 
+- **Health / admin probe 聚合读者（0210，ADR-0061 D-D / D-J，卡 34）**：`role_health_reader`（§6.2.0 的 NOLOGIN 读者）在本矩阵只有 `projection.stream_checkpoints` / `ops.outbox` / `ops.jobs` 三格 `SELECT`；矩阵外另持 `ops.data_disclosures` 与视图 `projection.processing_gaps` 的 `SELECT`，此外无任何授权，任何 schema 上无 CREATE（`rls-check` 逐条比对全集）。这五张表各一条 `<table>_health_reader_read`：`FOR SELECT TO PUBLIC USING (current_user = 'role_health_reader')`——对其他任何角色恒假，所以不放宽任何登录角色，也不放宽任何既有 owner definer。**不加** owner-wide `USING (true)` 读策略：那会被 OR 进 0115 / 0132 等读这些表的 owner definer，剥掉它们的 FORCE RLS 租户过滤（`rls-check` 除 0127 的 `outbox_phase9_owner_dispatch_read` 外一律判红）。`projection.stream_log` 只有策略没有授权：它只经非 invoker 视图 `processing_gaps` 被读（视图按 owner 鉴权，策略里的 `current_user` 仍是读者）。读者拥有恰好两个只读聚合 SECURITY DEFINER：`ops.health_snapshot(timestamptz)`（EXECUTE 仅 `role_maintenance`；`humaux-maintenance health serve` 采样 §41.2 的 SQL 派生指标）与 `ops.admin_probe_snapshot()`（EXECUTE 仅 `role_admin`；§4.4 探针）。两者 `search_path = pg_catalog, ops, projection`、PUBLIC 无 EXECUTE、只返回跨租户聚合、不返回任何 tenant id。**`role_admin` 的 EXECUTE 禁令只针对写入型 SECURITY DEFINER**（下一条）：`ops.admin_probe_snapshot()` 是只读聚合 definer，`role_admin` 对它的 EXECUTE 不违反该条（ADR-0061 E11）。
 - **§1.14.1 观测证据**：`ops.mechanism_observations` 与 `ops.mechanism_e2e_runs` 仅 `role_maintenance` 有 INSERT；`role_admin` 仅 SELECT，所有其他域默认无权，不继承写入角色、无写入 SECURITY DEFINER 函数 EXECUTE。运行角色只读，不能用自报 ACTIVE 或伪造 run 开启机制。凭证从环境/secret manager 供应，迁移不带口令。
 
 - **§60.1 / §23.4 G23-1c 自发票**：`INSERT ON private.ingest_tickets` 整列只有 `role_batch_issuer` 一行有，五个 runtime role 全为空 —— G23-1c 静态查的就是这一列与这五行的交叉。反向同时封死：`role_batch_issuer` 整行除这一格外全是 `—`，发票方垫不了分子。`role_migration_owner` 的 `owner` 格不参与这条判定，理由见 §48.2「发票权唯一」（表 owner 隐式持有全部权限，不排除掉它这条闸恒红）。
@@ -9691,13 +9696,13 @@ Trace / logs with protected access
 | `retrieval_provider_cost_total{provider,purpose,currency}` | §19 同一处 · 1 | counter·货币最小单位 | §42 cost anomaly |
 | `evidence_highwater` / `knowledge_highwater` | §15.1 稠密序号推进处 · 各 1 | gauge·seq | §42 projection lag；§54 |
 | `projection_highwater{stream}` | §15.4 `advance_prefix()` 落 highwater 处 · 1 | gauge·seq | 同上 |
-| `processing_gap_count{stream}` | §15.4 `count_open_gaps()`（读 `processing_gaps` 视图）· 1 | gauge·条 | §42；§23.4 G23-3 |
+| `processing_gap_count{stream}` | §15.4 只读 `processing_gaps` 视图：`ops.health_snapshot()` 按 (domain, projection_kind) 计数，由 `humaux-maintenance health serve` 周期采样，`telemetry::health::publish` 内唯一 `.set()` · 1；`stream` = `TicketFamily::domain()`，未知对 = 采样失败（ADR-0061 D-D / 裁定 E3） | gauge·条 | §42 open gap 不收敛（规则未装载，ADR-0061 limits）；§23.4 G23-3 |
 | `knowledge_waiting_key` / `knowledge_failed` | §11 私域蒸馏 stage 收尾采样 · 各 1 | gauge·条 | §42 waiting_key 长期不归零 |
-| `projection_lag_events` | §16 Projection Engine 周期采样 · 1 | gauge·条 | §42 projection lag exceeds SLO |
+| `projection_lag_events` | §16 `ops.health_snapshot()` 取全部 stream 的 Σ(`issued_highwater` − `projection_highwater`)，由 `humaux-maintenance health serve` 周期采样，`telemetry::health::publish` 内唯一 `.set()` · 1（ADR-0061 D-D / 裁定 E3） | gauge·条 | §42 projection lag exceeds SLO；§42 health gauges absent |
 | `projection_failures_total` | §16 投影失败分支 · 1 | counter·次 | §42 |
 | `pg_only_objects` / `qdrant_only_objects` | §17 双写对账扫描收尾 · 各 1 | gauge·条 | §65 Repair Jobs |
-| `jobs_pending` / `jobs_processing` / `jobs_waiting_key` / `jobs_dead` | §31 队列周期采样，同一次采样四个 `.set()` · 各 1 | gauge·条 | §42 dead letter increase |
-| `oldest_pending_age_seconds` | §31 同一次采样取 `now() - min(enqueued_at)` · 1 | gauge·秒 | §39 NO_OUTPUT；§42 |
+| `jobs_pending` / `jobs_processing` / `jobs_waiting_key` / `jobs_dead` | §31 队列：同一次 `ops.health_snapshot()` 采样（`humaux-maintenance health serve`），`telemetry::health::publish` 内四个 `.set()` · 各 1（ADR-0061 D-D / 裁定 E3） | gauge·条 | §42 dead letter increase；§42 health gauges absent（`jobs_dead`） |
+| `oldest_pending_age_seconds` | §31 同一次 `ops.health_snapshot()` 采样取 `now() - min(enqueued_at)`（`ops.jobs` 的入队时刻列名是 `created_at`）· 1（ADR-0061 D-D） | gauge·秒 | §39 NO_OUTPUT；§42 队列停摆（规则未装载，ADR-0061 limits） |
 | `admission_rejected_total{class}` | §67 admission control 返 503 处 · 1 | counter·次 | §67 单机档；§54 |
 | `private_distill_runs_total` / `private_distill_outputs_total` | §11 每次 run / 每条产出 · 各 1 | counter·次 / counter·条 | §39 Stage Liveness；§42 no-output stage |
 | `public_releases_total` / `public_syntheses_total` / `public_conflicts_total` / `public_provenance_orphans_total` | §12 公共管线各阶段 · 各 1 | counter·条 | §42 public provenance orphan |
@@ -9709,8 +9714,8 @@ Trace / logs with protected access
 | `mcp_grants_revoked_total{reason}` | §73 撤销动作处 · 1 | counter·次 | §77 |
 | `mcp_quota_reservations_total{result}` | §72.1 预留处 · 1 | counter·次 | §35；§71 Entitlement |
 | `mcp_bmo_consumed_total{plan_class}` | §72.1 销账处 · 1 | counter·次 | §35；§71 |
-| `data_disclosures_finalized_total{outcome}` | §7.4 `ops.data_disclosures` 写 `finalized_at` 后由 exporter +1 · 1 | counter·次 | **§53.5 INV-2 分母** |
-| `data_disclosures_reserved_unfinalized{age_bucket}` | §7.4 exporter 周期扫 `reserved_at` 非空且 `finalized_at` 空 · 1 | gauge·条 | **§53.5 INV-3** |
+| `data_disclosures_finalized_total{outcome}` | §7.4 `ops.data_disclosures`：`ops.health_snapshot(watermark)` 返回 `finalized_at` 落在 (watermark, as_of] 的行数，`telemetry::health::publish` 内唯一 `.inc()` 累加 · 1（ADR-0061 D-D；进程重启 = 计数器重置，历史不重计） | counter·次 | **§53.5 INV-2 分母** |
+| `data_disclosures_reserved_unfinalized{age_bucket}` | §7.4 `ops.health_snapshot()` 周期扫 `reserved_at` 非空且 `finalized_at` 空、按年龄分桶，`telemetry::health::publish` 内唯一 `.set()` · 1（ADR-0061 D-D） | gauge·条 | **§53.5 INV-3**；§42 health gauges absent |
 | `quota_usage_total{feature,result}` | §35 `usage_counter` 落库同一事务提交后 · 1 | counter·次 | §72 MonthlyQuota |
 | `rate_limit_rejected_total{scope}` | §72 RATE LIMIT 判定点 · 1 | counter·次 | §72「三者独立计数器」 |
 | `budget_denied_total{budget}` | §72 COST BUDGET 判定点 · 1 | counter·次 | §72「三者独立计数器」 |
@@ -9795,6 +9800,7 @@ Prometheus + Alertmanager。
 | open gap 不收敛 | `max by (stream) (processing_gap_count) > 0 for 15m` | WARN | 让一条 `ISSUED` 超 SLA 不销票（§15.2）⇒ 巡检登记 LOST ⇒ gauge 由 0 变 1 |
 | waiting_key 长期不归零 | `min_over_time(knowledge_waiting_key[6h]) > 0` | WARN | 摘掉一个租户的 KMS key 后写 20 条 evidence ⇒ 蒸馏全进 WAITING_KEY ⇒ gauge 恒 = 20，窗口内最小值 > 0 ⇒ firing。**口径冻结**：用「窗口内最小值 > 0」表达「年龄过高」，禁止另造 `knowledge_waiting_key_age_seconds`（R3 同物二名） |
 | queue dead letter increase | `delta(jobs_dead[15m]) > 0` | WARN | 让一个 job 连续失败到超重试上限 ⇒ `jobs_dead` 由 0 变 1 |
+| health gauges absent | `absent(data_disclosures_reserved_unfinalized) or absent(jobs_dead) or absent(projection_lag_events) for 2m` | CRITICAL | 在测试自建自删的一次性库上 REVOKE `ops.health_snapshot` 的 EXECUTE（绝不碰共享 dev 库）⇒ `humaux-maintenance health serve` 的 `/metrics` 答 503 ⇒ 三个 gauge 在下一次抓取被标 stale ⇒ `absent()` 返回 1 ⇒ 2m 后 firing（ADR-0061 D-D / 裁定 E8；`deploy/prometheus/tests/alerts.test.yml` 的 fire/silent 用例 + `mutations.sh` 的 `health` 行）。INV-3、projection lag、dead letter 三行都没有 absent 分支，INV-3 又被冻结 ③ 锁死不能加 —— 采样器一死这三条同时静默，只有这一行看得见。只用 §41.2 名字（冻结 ①），不写 label key（冻结 ④） |
 | 队列停摆 | `oldest_pending_age_seconds > 900` | WARN | 停 worker 后 enqueue 一条 ⇒ gauge 单调涨过 900 |
 | no-output stage | `increase(private_distill_runs_total[1h]) > 0 and increase(private_distill_outputs_total[1h]) == 0` | CRITICAL | 把蒸馏 parser 换成恒返回空数组的 stub ⇒ runs 涨、outputs 不涨 ⇒ firing。形状同 §53.5 INV-1：有分子没分母就是停摆 |
 | public provenance orphan | `increase(public_provenance_orphans_total[1h]) > 0` | CRITICAL | 删掉一条 release 的 provenance edge 后跑对账 ⇒ 计数 +1 |
@@ -11024,6 +11030,8 @@ INV-3  造一条 reserved_at 非空、finalized_at 空且超 60s 的记录
        data_disclosures_reserved_unfinalized{age_bucket="gt_60s"} 0 → 1 ⇒ firing
 INV-4  让单个 code 24h 占比从 ~10% 压到 > 40% ⇒ firing
 ```
+
+INV-1 的 `sum()` 跨**所有**导出 `degrade_total` 的进程求和（ADR-0061 裁定 E9）：今天只有 gateway 导出它（`abstain()` 只在 retrieval envelope 里可达，而那只在 gateway 进程里），分子分母同在一个进程；任何非 gateway 进程里新增一个可达的 `abstain()`，必须先在本节为它登记一行自己的不变量，才准上线 —— 否则它的降级会被 gateway 的请求分母「稀释」掉。
 
 INV-1 是坑 3 的通用判据：**任何"只有分子没有分母"的组合都是停摆，不是健康。** INV-4 管的是另一头 —— 长期占 40% 以上的降级不是降级，是新常态，必须重新定义正常路径而不是继续 warn。
 

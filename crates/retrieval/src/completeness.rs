@@ -1,12 +1,13 @@
 //! `retrieval::completeness` — `LedgerCounts` / `CompletenessClass` / `FreshnessClass` / the `ledger::close` and
 //!   `classify()` sole constructors (§22.4 / §22.5 / §59).
-//! Depends-on: crates=[humaux-domain, serde]; services=[];
-//!   env=[]; modules=[domain::context, domain::ledger, retrieval::envelope, retrieval::planner]
-//! Called-by: [adapters::context_repo, adapters::exact_census, adapters::retrieve, adapters::serving_repo, adapters::stream_repo, gateway::context, gateway::memory, gateway::recall, retrieval::envelope, retrieval::signals, tests]
+//! Depends-on: crates=[humaux-domain, humaux-telemetry, serde]; services=[];
+//!   env=[]; modules=[domain::context, domain::ledger, retrieval::envelope, retrieval::planner, retrieval::request, telemetry::metrics]
+//! Called-by: [adapters::context_repo, adapters::exact_census, adapters::retrieve, adapters::serving_repo, adapters::stream_repo, gateway::context, gateway::memory, gateway::recall, gateway::status, retrieval::envelope, retrieval::signals, tests]
 //! Invariants: [ledger::close is the sole LedgerClosure constructor; A1 counts tickets, A2's PostgreSQL side
 //!   (ProjectionReads) counts memory points (ADR-0057 D-A); classify has six inputs and LedgerClosure::lagging
-//!   is the only projection-lag comparison (ADR-0057 D-D/D-E)]
-//! Spec: §22.4; §22.5; §59; §41.2; §25.3; §78.2; ADR-0057
+//!   is the only projection-lag comparison (ADR-0057 D-D/D-E); record_final_classification holds the one increment of
+//!   retrieval_completeness_total and of humaux_retrieval_requests_total; render_metrics seeds both over closed sets]
+//! Spec: §22.4; §22.5; §59; §41.2; §25.3; §78.2; ADR-0057; ADR-0061 D-A; ADR-0061 D-C
 //!
 //! `classify()` is the sole constructor of [`CompletenessClass`]; final outcome emission is
 //! the sole increment point of `retrieval_completeness_total{class,reason}` (§22.5, §41.2).
@@ -54,6 +55,10 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+use humaux_telemetry::metrics::{families, write_family};
+
+use crate::request::IntentKind;
 
 /// Ledger's six fields (§22.5): produced by `ledger::close(repo, stream_key)` taking three
 /// independent reads (`stream_log_agg` / `count_open_gaps` / `contiguous_done_prefix`) and
@@ -637,14 +642,12 @@ pub mod ledger {
 }
 
 // ============================================================================
-// §41.2 `retrieval_completeness_total{class,reason}` — process-local placeholder counter.
+// §41.2 `retrieval_completeness_total{class,reason}` and `humaux_retrieval_requests_total
+// {intent,completeness_class}` — process-local counters, exported by [`render_metrics`].
 // ============================================================================
 
-/// Same pattern as `telemetry::degrade::DegradeTotal` (`crates/telemetry/src/degrade.rs`):
-/// keeps the count observable for §80.1 G80-6's witness before the real Prometheus
-/// `IntCounterVec` registration lands with the `telemetry::metrics` task.
-// ponytail: process-local `AtomicU64` grid, no real Prometheus `IntCounterVec` yet — same
-// ceiling and upgrade path as `DEGRADE_TOTAL`; replace both together when that task lands.
+/// Process-local `AtomicU64` grid, one cell per (class, reason) label pair; rendered through
+/// `telemetry::metrics` (ADR-0061 D-A: no metrics crate, the family table lives there).
 struct CompletenessTotal([AtomicU64; CompletenessTotal::CELLS]);
 
 impl CompletenessTotal {
@@ -716,24 +719,119 @@ pub fn retrieval_completeness_total_count(class: &str, reason: &str) -> u64 {
     RETRIEVAL_COMPLETENESS_TOTAL.count(class, reason)
 }
 
+/// §41.2 `humaux_retrieval_requests_total{intent,completeness_class}`: one cell per
+/// (`IntentKind`, wire class) pair, 4 × 4 (ADR-0061 D-C).
+struct RequestsTotal([AtomicU64; RequestsTotal::CELLS]);
+
+impl RequestsTotal {
+    const CELLS: usize = IntentKind::ALL.len() * CompletenessTotal::CLASSES.len();
+
+    const fn new() -> Self {
+        Self([const { AtomicU64::new(0) }; Self::CELLS])
+    }
+
+    fn idx(intent: IntentKind, class_label: &str) -> usize {
+        let i = IntentKind::ALL
+            .iter()
+            .position(|k| *k == intent)
+            .expect("IntentKind::ALL is exhaustive");
+        let c = CompletenessTotal::CLASSES
+            .iter()
+            .position(|&s| s == class_label)
+            .expect("class_label must be one of CompletenessClass::wire_labels' outputs");
+        i * CompletenessTotal::CLASSES.len() + c
+    }
+
+    // The test trace lives inside the increment, so an increment moved ahead of `finish()` shows
+    // up in the trace too (ADR-0061 D-C: a dropped PendingEnvelope records neither family).
+    fn inc(&self, intent: IntentKind, class_label: &'static str) {
+        self.0[Self::idx(intent, class_label)].fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        REQUESTS_TRACE.with(|trace| trace.borrow_mut().push((intent.as_str(), class_label)));
+    }
+
+    fn count(&self, intent: IntentKind, class_label: &str) -> u64 {
+        self.0[Self::idx(intent, class_label)].load(Ordering::Relaxed)
+    }
+}
+
+static HUMAUX_RETRIEVAL_REQUESTS_TOTAL: RequestsTotal = RequestsTotal::new();
+
 /// Sole final-outcome metric emission. Call only after the envelope outcome's invariants have
 /// been checked; provisional classifier answers must never be observed as result statistics.
-pub(crate) fn record_final_classification(class: CompletenessClass) {
+/// The same point counts the returned envelope by intent (§41.2 "envelope 返回时 · 1", the §53.5
+/// INV-1 denominator), so both families move together or not at all (ADR-0061 D-C).
+pub(crate) fn record_final_classification(class: CompletenessClass, intent: IntentKind) {
     let (class_label, reason_label) = class.wire_labels();
+    // labels: class,reason
     RETRIEVAL_COMPLETENESS_TOTAL.inc(class_label, reason_label);
+    // labels: intent,completeness_class
+    HUMAUX_RETRIEVAL_REQUESTS_TOTAL.inc(intent, class_label);
     #[cfg(test)]
     FINAL_RECORD_TRACE.with(|trace| trace.borrow_mut().push((class_label, reason_label)));
+}
+
+/// Renders `humaux_retrieval_requests_total` (4 intents × 4 classes) and
+/// `retrieval_completeness_total` (the 16 (class, reason) pairs `wire_labels` can produce), every
+/// series seeded at 0 so the first scrape already carries INV-1's denominator (ADR-0061 D-A).
+pub fn render_metrics(out: &mut String) {
+    let classes = CompletenessTotal::CLASSES;
+    let requests: Vec<([&'static str; 2], f64)> = IntentKind::ALL
+        .iter()
+        .flat_map(|&intent| {
+            classes.iter().map(move |&class| {
+                (
+                    [intent.as_str(), class],
+                    HUMAUX_RETRIEVAL_REQUESTS_TOTAL.count(intent, class) as f64,
+                )
+            })
+        })
+        .collect();
+    let samples: Vec<(&[&'static str], f64)> =
+        requests.iter().map(|(l, v)| (l.as_slice(), *v)).collect();
+    write_family(out, &families::HUMAUX_RETRIEVAL_REQUESTS_TOTAL, &samples);
+
+    // `reason` is "none" exactly when the class is not cannot_establish (`wire_labels`), so the
+    // other 40 grid cells can never be incremented and are not rendered.
+    let completeness: Vec<([&'static str; 2], f64)> = classes
+        .iter()
+        .flat_map(|&class| {
+            CompletenessTotal::REASONS
+                .iter()
+                .filter(move |&&reason| (class == "cannot_establish") != (reason == "none"))
+                .map(move |&reason| {
+                    (
+                        [class, reason],
+                        RETRIEVAL_COMPLETENESS_TOTAL.count(class, reason) as f64,
+                    )
+                })
+        })
+        .collect();
+    let samples: Vec<(&[&'static str], f64)> = completeness
+        .iter()
+        .map(|(l, v)| (l.as_slice(), *v))
+        .collect();
+    write_family(out, &families::RETRIEVAL_COMPLETENESS_TOTAL, &samples);
 }
 
 #[cfg(test)]
 thread_local! {
     static FINAL_RECORD_TRACE: std::cell::RefCell<Vec<(&'static str, &'static str)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static REQUESTS_TRACE: std::cell::RefCell<Vec<(&'static str, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
 pub(crate) fn take_final_record_trace() -> Vec<(&'static str, &'static str)> {
     FINAL_RECORD_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+}
+
+/// `(intent, completeness_class)` of every `humaux_retrieval_requests_total` increment on this
+/// thread since the last call.
+#[cfg(test)]
+pub(crate) fn take_requests_trace() -> Vec<(&'static str, &'static str)> {
+    REQUESTS_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
 }
 
 // ============================================================================
@@ -1327,5 +1425,69 @@ mod tests {
         );
         assert!(!CensusResult::failed().is_ok());
         assert!(CensusResult::failed().enumeration().is_none());
+    }
+
+    /// T-C3 (ADR-0061 D-A/D-C): the render parses as text exposition, each family has HELP and
+    /// TYPE, its label keys are exactly the §41.2 row's, and every closed combination is seeded:
+    /// 4 intents × 4 classes and the 16 reachable (class, reason) pairs.
+    #[test]
+    fn render_metrics_parses_with_the_registry_label_keys_and_seeds_every_cell() {
+        let mut out = String::new();
+        render_metrics(&mut out);
+        // §41.2 rows, verbatim.
+        let rows: [(&str, [&str; 2], usize); 2] = [
+            (
+                "humaux_retrieval_requests_total",
+                ["intent", "completeness_class"],
+                16,
+            ),
+            ("retrieval_completeness_total", ["class", "reason"], 16),
+        ];
+        for (family, keys, cells) in rows {
+            assert!(
+                out.contains(&format!("# HELP {family} ")),
+                "{family} HELP\n{out}"
+            );
+            assert!(
+                out.contains(&format!("# TYPE {family} counter\n")),
+                "{family} TYPE\n{out}"
+            );
+            let mut series = std::collections::BTreeSet::new();
+            for line in out
+                .lines()
+                .filter(|l| l.starts_with(&format!("{family}{{")))
+            {
+                let (labels, value) = line
+                    .strip_prefix(&format!("{family}{{"))
+                    .and_then(|rest| rest.split_once("} "))
+                    .unwrap_or_else(|| panic!("unparseable sample: {line}"));
+                value
+                    .parse::<f64>()
+                    .unwrap_or_else(|e| panic!("{line}: {e}"));
+                let pairs: Vec<(&str, &str)> = labels
+                    .split(',')
+                    .map(|kv| {
+                        let (k, v) = kv.split_once('=').expect("k=v");
+                        (k, v.trim_matches('"'))
+                    })
+                    .collect();
+                let got_keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+                assert_eq!(got_keys, keys, "{line}");
+                series.insert(pairs.iter().map(|(_, v)| v.to_string()).collect::<Vec<_>>());
+            }
+            assert_eq!(series.len(), cells, "{family}\n{out}");
+        }
+        for intent in IntentKind::ALL {
+            for class in CompletenessTotal::CLASSES {
+                assert!(out.contains(&format!(
+                    "humaux_retrieval_requests_total{{intent=\"{}\",completeness_class=\"{class}\"}} ",
+                    intent.as_str()
+                )));
+            }
+        }
+        assert!(out.contains(
+            "retrieval_completeness_total{class=\"cannot_establish\",reason=\"projection_lag\"} "
+        ));
+        assert!(!out.contains("class=\"exact\",reason=\"projection_lag\""));
     }
 }

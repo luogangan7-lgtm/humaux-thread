@@ -1,0 +1,31 @@
+# Alertmanager config for the §67.2 bundle (ADR-0061 D-E).
+# Deployer contract: the two `__HUMAUX_ALERTMANAGER_*_URL_FILE__` placeholders are replaced by the
+# values of the §78 deploy keys of the same name (HUMAUX_ALERTMANAGER_LOG_SINK_URL_FILE,
+# HUMAUX_ALERTMANAGER_WATCHDOG_URL_FILE): paths of files OUTSIDE the repo holding the webhook URL
+# (a healthchecks URL may carry a ping token). No URL is ever written here (`url_file`, since 0.27, W8).
+route:
+  receiver: humaux-log-sink
+  group_by: [alertname]
+  # Explicit: the default group_interval (5m) also gates resolved notifications; 1m bounds the
+  # rehearsal alert_drill and is harmless on a single node (D-E).
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+  routes:
+    # §42.1: the heartbeat has its own receiver and is never merged with another alert; it is
+    # re-sent every 5 min so the external dead-man sees a missing ping.
+    - matchers: ['alertname="Watchdog"']
+      receiver: watchdog-healthchecks
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 5m
+
+receivers:
+  - name: humaux-log-sink
+    webhook_configs:
+      - url_file: __HUMAUX_ALERTMANAGER_LOG_SINK_URL_FILE__
+        send_resolved: true
+  - name: watchdog-healthchecks
+    webhook_configs:
+      - url_file: __HUMAUX_ALERTMANAGER_WATCHDOG_URL_FILE__
+        send_resolved: false

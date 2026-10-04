@@ -1,11 +1,15 @@
 //! `admin::cell_resources` — §4.4 live probe: cross-checks §83.4's `intra-cell-resource-registry` DECLARATION against
-//!   what each [`IntraCellResource`]'s registered hostname ACTUALLY, LIVE, resolves to and answers on.
-//! Depends-on: crates=[humaux-infra-cell, serde_json, tokio, uuid]; services=[Qdrant(*)]; env=[HUMAUX_CELL_CALLER_ID,
-//!   HUMAUX_CELL_ID, HUMAUX_QDRANT_CIDR, HUMAUX_QDRANT_HOST, HUMAUX_QDRANT_PORT, HUMAUX_QDRANT_TLS];
-//!   modules=[admin::probe, infra-cell::permit, infra-cell::resource, infra-cell::transport]
+//!   what each [`IntraCellResource`]'s registered hostname ACTUALLY, LIVE, resolves to and answers on, and whether
+//!   each same-Cell Unix-socket resource's listener accepts a connection.
+//! Depends-on: crates=[humaux-infra-cell, humaux-telemetry, serde_json, tokio, uuid]; services=[Qdrant(*), UDS(private-worker), UDS(retrieval-worker)];
+//!   env=[HUMAUX_ADMIN_PRIVATE_INFERENCE_RPC_SOCKET_PATH, HUMAUX_ADMIN_RETRIEVAL_RPC_SOCKET_PATH,
+//!   HUMAUX_CELL_CALLER_ID, HUMAUX_CELL_ID, HUMAUX_QDRANT_CIDR, HUMAUX_QDRANT_HOST, HUMAUX_QDRANT_PORT,
+//!   HUMAUX_QDRANT_TLS]; modules=[admin::probe, infra-cell::permit, infra-cell::resource, infra-cell::transport,
+//!   telemetry::metrics]
 //! Called-by: [admin::probe]
-//! Invariants: [every Qdrant call here goes through the same CellAccessPermit as production code, so the probe cannot mask a permit regression]
-//! Spec: Baseline §57.1; §78.1; §83.4; ADR-0003
+//! Invariants: [every Qdrant call here goes through the same CellAccessPermit as production code, so the probe cannot
+//!   mask a permit regression; scanned_n is the set actually probed, all of IntraCellResource::ALL]
+//! Spec: Baseline §4.4; §57.1; §78.1; §83.4; ADR-0003; ADR-0061 D-J (B1)
 //!
 //! Humaux's own "不要拿声明校验声明" principle (旧系统坑5，全局适用): "the registry says this
 //! resource lives in this Cell" is a deploy-time claim; "the resource's hostname currently
@@ -59,6 +63,13 @@
 //! | `HUMAUX_QDRANT_CIDR` | comma-separated CIDR list its resolved addresses must fall in |
 //! | `HUMAUX_QDRANT_TLS` | `"true"` / `"false"` |
 //!
+//! The two Unix-socket resources (ADR-0061 D-J, ruling B1) are probed at connect level: `RETRIEVAL_EMBEDDING_RPC` at
+//! `HUMAUX_ADMIN_RETRIEVAL_RPC_SOCKET_PATH`, `PRIVATE_INFERENCE_RPC` at `HUMAUX_ADMIN_PRIVATE_INFERENCE_RPC_SOCKET_PATH`
+//! (the same paths the gateway and the private worker are given). §4.4 "reachable" for a UDS is the listener
+//! accepting the connection.
+//! // ponytail: connect-level only; the peer-uid check runs after accept and is not exercised here — add a
+//! // `/readyz` round trip per socket if a listener that accepts but refuses every peer must read unhealthy.
+//!
 //! Any missing/unparseable var is this probe's own "missing object" (same convention
 //! `probe.rs`'s catalog-membership check already uses for an unwired backend) — non-zero exit,
 //! no JSON envelope, never a `value = 0` standing in for "could not even build the registry".
@@ -73,9 +84,24 @@ use humaux_infra_cell::{
     IntraCellResourceRegistry, ResourceEntry, SystemDnsResolve, authorize_cell_access,
     is_metadata_or_link_local, is_private_or_reserved_address,
 };
+use humaux_telemetry::metrics::IO_TIMEOUT;
 
-const PROBE_VERSION: &str = "cell.resources@1";
+// ADR-0061 D-J (B1): `@2` — `scanned_n` went from 1 (Qdrant only) to all three resources.
+const PROBE_VERSION: &str = "cell.resources@2";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// ADR-0061 D-J (B1): each Unix-socket resource and the §78 admin key naming its socket path.
+const UDS_KEYS: [(IntraCellResource, &str); 2] = [
+    (
+        IntraCellResource::RETRIEVAL_EMBEDDING_RPC,
+        "HUMAUX_ADMIN_RETRIEVAL_RPC_SOCKET_PATH",
+    ),
+    // dep: UDS(private-worker) — dialed by `uds_reachable` at this key's path
+    (
+        IntraCellResource::PRIVATE_INFERENCE_RPC,
+        "HUMAUX_ADMIN_PRIVATE_INFERENCE_RPC_SOCKET_PATH",
+    ),
+];
 
 /// One missing/unparseable required env var — this probe's own "missing object" (module doc).
 struct MissingEnv(&'static str);
@@ -326,6 +352,14 @@ async fn probe_qdrant(
     })
 }
 
+/// Connect-level reachability of one Unix-socket resource (module doc): the listener accepted within [`IO_TIMEOUT`].
+async fn uds_reachable(path: &str) -> bool {
+    // dep: UDS(retrieval-worker) — connect only, dropped before any request; the same site dials the private worker
+    // socket (UDS(private-worker)), one path per `UDS_KEYS` entry
+    let connect = tokio::net::UnixStream::connect(path);
+    matches!(tokio::time::timeout(IO_TIMEOUT, connect).await, Ok(Ok(_)))
+}
+
 /// `sha256:`-prefixed digest of the scanned scope (§4.4: "两次结果只有 scope_hash 相同才可
 ///比") — `cell_id` + the sorted resource-name set this run actually scanned. The digest itself
 /// is [`crate::probe::scope_hash`], shared with every other probe so two probes can never
@@ -349,6 +383,16 @@ pub fn run() -> i32 {
             return 2;
         }
     };
+    let mut uds = Vec::with_capacity(UDS_KEYS.len());
+    for (resource, key) in UDS_KEYS {
+        match required_env(key) {
+            Ok(path) => uds.push((resource, path)),
+            Err(MissingEnv(name)) => {
+                eprintln!("q cell.resources: fail — missing object: {name}");
+                return 2;
+            }
+        }
+    }
     let Some(entry) = registry.resolve(IntraCellResource::QDRANT_REST).cloned() else {
         eprintln!("q cell.resources: fail — missing object: QDRANT_REST not in registry");
         return 2;
@@ -367,13 +411,26 @@ pub fn run() -> i32 {
         }
     };
 
+    // (name, healthy, per-resource row) for every resource this run probed.
+    let mut rows = vec![(report.resource, report.healthy(), report.to_json())];
+    for (resource, path) in &uds {
+        let reachable = rt.block_on(uds_reachable(path));
+        rows.push((
+            resource.name(),
+            reachable,
+            serde_json::json!({
+                "resource": resource.name(),
+                "socket_path": path,
+                "reachable": reachable,
+            }),
+        ));
+    }
+
     // §4.4 坑5 minor fix: `scanned_n` must come from the same set this run actually probed
     // (the same slice `scope_hash` hashes), not from `IntraCellResource::ALL`'s declared
-    // count — those two only happen to agree today because `registry_from_env` can only ever
-    // build `QDRANT_REST` and `ALL` has exactly one variant. Fail closed (this probe's own
-    // "missing object", not a `value = 0` reading) the day a second `IntraCellResource`
-    // variant exists but this Phase-0 probe has not been extended to cover it.
-    let probed_resources: Vec<&str> = vec![report.resource];
+    // count. Fail closed (this probe's own "missing object", not a `value = 0` reading) the day
+    // a further `IntraCellResource` variant exists but this probe has not been extended to cover it.
+    let probed_resources: Vec<&str> = rows.iter().map(|(name, _, _)| *name).collect();
     if probed_resources.len() != IntraCellResource::ALL.len() {
         let unwired: Vec<&str> = IntraCellResource::ALL
             .iter()
@@ -390,14 +447,20 @@ pub fn run() -> i32 {
     // `value` = count of resources this run found healthy (`ResourceReport::healthy`), out of
     // `scanned_n` — not a count of *unhealthy* resources. Spec §4.4's table row freezes only
     // `scanned_n`'s meaning; this doc is `value`'s one authoritative source for this probe.
-    let value = i64::from(report.healthy());
+    let unhealthy: Vec<&str> = rows
+        .iter()
+        .filter(|(_, healthy, _)| !healthy)
+        .map(|(name, _, _)| *name)
+        .collect();
+    let value = probed_resources.len() - unhealthy.len();
     let envelope = serde_json::json!({
         "value": value,
         "scanned_n": probed_resources.len(),
         "scope_hash": scope_hash(cell_id, &probed_resources),
         "checked_at": crate::probe::now_rfc3339(),
         "probe_version": PROBE_VERSION,
-        "resources": [report.to_json()],
+        "detail": { "unhealthy": unhealthy },
+        "resources": rows.into_iter().map(|(_, _, row)| row).collect::<Vec<_>>(),
     });
     println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
     0

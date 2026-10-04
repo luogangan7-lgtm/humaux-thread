@@ -679,6 +679,9 @@ not, and it withdraws the "ready for production" reading of §5.**
 Card 33 (ADR-0059, §6.18) closes the role-password, SEC-2 and ARCH-9 items of that list and
 replaces "one env-held key serves every tenant" with a per-reference key map; BYOK through
 OpenBao is still card 54.
+Card 34 (ADR-0061, §6.20) closes "no process exports metrics": every resident mode serves `/metrics` and
+`/status` on a loopback ops listener, the §53.5 / §42 rules are loaded and tested, and the rehearsal drives a real
+INV-1 through the alert route.
 
 ### 6.11 Folded debts closed by card 26 (ADR-0051 D-L)
 
@@ -960,6 +963,40 @@ OpenBao is still card 54.
   model / attest / disable / add a provider) and §10.4.
 - **Filed, not closed:** R4 fallback across models; a prober for routes without traffic (card 38); per-provider
   budget domains and rate limits (L1, L2); OpenBao (card 54).
+
+### 6.20 Closed by card 34 (ADR-0061)
+
+| Change | Before | After (ADR-0061) | Witness |
+|---|---|---|---|
+| Metrics export | no process exported a §41.2 family; `telemetry::metrics` was a placeholder; INV-1/2/4 could never fire | every resident mode serves `/metrics` + `/status` on its own loopback ops key (7 keys); gateway 9 families, retrieval worker 4, maintenance `health serve` 9 SQL-derived; private / consolidation workers 0 (E10, card 34b) | `telemetry_lib`, `gateway_ops`, `retrieval_worker_ops`, `private_worker_ops`, `consolidation_worker_ops`, `maintenance_tests`, `metrics_registry` |
+| SQL health gauges | none | one sampler (`humaux-maintenance health serve`) over `ops.health_snapshot()`, owned by the NOLOGIN `role_health_reader`; a failed or stale sample answers 503, never old values | `adapters_health`, `maintenance_tests`, `rls` |
+| Rules | `invariants.rules.yml` loaded nowhere | INV-1..4 + CoreMetricAbsent, ProjectionLag, DeadLetter, Backup, HealthGaugesAbsent (new §42 row, E8), Watchdog; every alert has a firing and a silent promtool case, 14 mutations each caught | `promtool_*` gates |
+| `/readyz` | 200 forever after boot (OPS-8) | dependency-truthful (PG, retrieval RPC round trip, Qdrant), status word only; `/status` names the dependency (E15) | `gateway_ops` T-G2 / T-G3 |
+| §4.4 probes | 1 of 11 answered | 8 Readings + 3 named refusals by design (E2) | `admin_tests`, `admin_lib` |
+| `metrics_registry` gate | **E6:** cards 31–33b ran `cargo xtask metrics-registry --check`, but the tool ignored every flag except `--strict`, so those gate records proved only the default D1–D6 mode; under §80.1 the `--check` gate did not exist as named until card 34 | strict parser (unknown flag = exit 2), D7 (real `--metrics-families` output) and D8 (rule references) | `metrics_registry`, `metrics_registry_rejects_unknown_flag` |
+
+- **Rehearsal `impl2` (no soak, 2026-10-04 03:22–03:33, debug profile, `humaux_thread_dev`, clean re-run):**
+  `REHEARSAL VERDICT: 116 passed, 2 failed`; the 2 are the open `admin_probes` items below. Watchdog receipt
+  `git_sha` = deployed sha after 11 s; `metrics-registry EX: pass — 7 scrape(s)`; `up n=7`; `alert_drill` green in 95 s
+  (INV-1 firing 1 s after the degrade was visible, firing receipt 10 s, resolved receipt 49 s); 3 named refusals;
+  `degrade.counters` = Σ scraped `degrade_total` = 215.
+- **Rehearsal `impl` (first run, same day 03:08–03:18):** `REHEARSAL VERDICT: 98
+  passed, 20 failed`. New steps: Watchdog receipt `git_sha=6b6981b30bac…` = `humaux-admin q deploy.binary` after 6 s;
+  `metrics-registry EX: pass — 7 scrape(s)`; `up n=7` (exactly the seven `(job, mode)` pairs); `alert_drill` green in
+  94 s (INV-1 firing in the drill Prometheus 1 s after the degrade was visible, firing receipt after 10 s, inactive
+  after the denominator returned, resolved receipt after 49 s). 18 of the 20 failures (`pinned_lane`,
+  `governance_both_tenants`) were a harness fault of this run: rehearse.sh was edited while the run executed it, so
+  zsh read the shifted file and `sigterm_mid_load` never started its distiller (`OPS_P: parameter not set`); one
+  memory fewer left governance without a target. The other 2 are open, below.
+- **Open (main-line decisions):** (1) `cell.resources` refuses `not wired into this probe: RETRIEVAL_EMBEDDING_RPC,
+  PRIVATE_INFERENCE_RPC` — the probe covers only `QDRANT_REST` while `IntraCellResource::ALL` has had three variants
+  since ADR-0015; the design counted it as an unchanged Reading. (2) `stream.watermark`, `outbox.backlog` and
+  `jobs.stuck` refuse on `humaux_thread_dev` because `ops.admin_probe_snapshot()` returns checkpoint rows of the
+  fixture families `(code, retrieval_card)` and `(knowledge, ingest)` (test residue of 17 fixture tenants) and the
+  adapter fails the whole read closed on a pair with no `TicketFamily`.
+- **Open limits kept:** the other 19 §42 rows wait for producers; `egress_chars_total` still has no production emit
+  (§6.16); backup alert silent until card 37; the collector forwards nothing until an SDK producer; the external
+  Watchdog dead-man is a manual §69 step (runbook §7).
 
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 

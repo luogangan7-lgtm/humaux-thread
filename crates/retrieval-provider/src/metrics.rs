@@ -1,15 +1,14 @@
 //! `retrieval-provider::metrics` — §19 **Provider Plane Observability** / §41.2 registry: the four
 //!   `retrieval_provider_*` families.
-//! Depends-on: crates=[]; services=[]; env=[]; modules=[retrieval-provider::admission]
-//! Called-by: [retrieval-provider::adapters, tests]
-//! Invariants: []
-//! Spec: §19; §41.2
-// ponytail: process-local `Mutex<HashMap<..>>` counters, not a real `prometheus::*Vec`
-// registration — this workspace has no Prometheus client dependency anywhere yet (see
-// `telemetry::degrade`'s `DEGRADE_TOTAL`, the one precedent, whose own doc names the same
-// deferral). Upgrade path: swap each `CounterFamily`/`HistogramFamily` body for a real
-// `prometheus::IntCounterVec`/`HistogramVec` when that dependency lands workspace-wide; the
-// four `pub fn record_*`/`pub fn *_count` signatures below do not need to change.
+//! Depends-on: crates=[]; services=[]; env=[]; modules=[retrieval-provider::admission, retrieval-provider::health]
+//! Called-by: [retrieval-provider::adapters, retrieval-worker::main, tests]
+//! Invariants: [record_provider_call is the one emit of all four families; every snapshot_* is seeded over the
+//!   closed label sets, so a renderer never needs a second list of label values]
+//! Spec: §19; §41.2; ADR-0061 D-A; ADR-0061 D-C
+//!
+//! Process-local `Mutex<HashMap<..>>` counters; no metrics crate is linked (ADR-0061 D-A). A
+//! process exports them by rendering the four `snapshot_*` functions through
+//! `telemetry::metrics`.
 //!
 //! §19 Observability: "禁止 tenant_id / query / memory_id 作为 Prometheus label" — enforced
 //! here by construction, not by a runtime denylist: [`record_provider_call`]'s parameter list
@@ -19,7 +18,7 @@
 //! even attempt to pass one through. Tenant-level cost instead goes to `ModelCallLedger` /
 //! `ops.tenant_cost_events` (§19 Observability, a different task's deliverable).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use crate::admission::RetrievalPurpose;
@@ -39,6 +38,9 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// Every value; the `provider` label's closed set (ADR-0061 D-A seeding).
+    pub const ALL: [Self; 2] = [Self::DashScope, Self::Custom];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DashScope => "dashscope",
@@ -60,6 +62,14 @@ pub enum Region {
 }
 
 impl Region {
+    /// Every value; the `region` label's closed set (ADR-0061 D-A seeding).
+    pub const ALL: [Self; 4] = [
+        Self::CnHangzhou,
+        Self::CnShanghai,
+        Self::CnBeijing,
+        Self::ApSoutheast1,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CnHangzhou => "cn-hangzhou",
@@ -79,6 +89,9 @@ pub enum Currency {
 }
 
 impl Currency {
+    /// Every value; the `currency` label's closed set (ADR-0061 D-A seeding).
+    pub const ALL: [Self; 2] = [Self::Usd, Self::Cny];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Usd => "usd",
@@ -100,6 +113,21 @@ pub fn purpose_label(purpose: RetrievalPurpose) -> &'static str {
         RetrievalPurpose::Rerank => "rerank",
     }
 }
+
+/// Every `purpose` label value. `purpose_label`'s exhaustive match is the compile-time guard: a
+/// third `RetrievalPurpose` fails to build there before this list can fall behind.
+const PURPOSES: [RetrievalPurpose; 2] = [RetrievalPurpose::Embedding, RetrievalPurpose::Rerank];
+
+/// §41.2 frozen `retrieval_provider_requests_total.result` set, in the registry's order
+/// (`ProviderCallOutcome::metric_result_label` ∪ `CIRCUIT_OPEN_RESULT_LABEL`).
+const RESULTS: [&str; 6] = [
+    "ok",
+    "http_401",
+    "http_429",
+    "http_5xx",
+    "timeout",
+    crate::health::CIRCUIT_OPEN_RESULT_LABEL,
+];
 
 /// Process-local counter family: `label tuple -> running total`. See module doc's ponytail
 /// note for the real-Prometheus upgrade path.
@@ -130,6 +158,13 @@ impl CounterFamily {
             .get(key)
             .copied()
             .unwrap_or(0)
+    }
+    /// Every `seed` tuple (0 when never recorded) plus every recorded tuple, sorted.
+    fn snapshot(&self, seed: Vec<Vec<&'static str>>) -> Vec<(Vec<&'static str>, u64)> {
+        let mut all: BTreeMap<Vec<&'static str>, u64> = seed.into_iter().map(|k| (k, 0)).collect();
+        let map = self.map().lock().expect("counter mutex poisoned");
+        all.extend(map.iter().map(|(k, v)| (k.clone(), *v)));
+        all.into_iter().collect()
     }
 }
 
@@ -174,6 +209,14 @@ impl HistogramFamily {
             .get(key)
             .map(|(_, sum)| *sum)
             .unwrap_or(0.0)
+    }
+    /// Every `seed` tuple (`(0, 0.0)` when never observed) plus every observed tuple, sorted.
+    fn snapshot(&self, seed: Vec<Vec<&'static str>>) -> Vec<(Vec<&'static str>, u64, f64)> {
+        let mut all: BTreeMap<Vec<&'static str>, (u64, f64)> =
+            seed.into_iter().map(|k| (k, (0, 0.0))).collect();
+        let map = self.map().lock().expect("histogram mutex poisoned");
+        all.extend(map.iter().map(|(k, v)| (k.clone(), *v)));
+        all.into_iter().map(|(k, (n, sum))| (k, n, sum)).collect()
     }
 }
 
@@ -288,6 +331,45 @@ pub fn retrieval_provider_cost_total_count(
     ])
 }
 
+fn provider_purpose() -> impl Iterator<Item = (&'static str, &'static str)> {
+    Provider::ALL
+        .into_iter()
+        .flat_map(|p| PURPOSES.map(|u| (p.as_str(), purpose_label(u))))
+}
+
+fn provider_purpose_region() -> impl Iterator<Item = [&'static str; 3]> {
+    provider_purpose().flat_map(|(p, u)| Region::ALL.map(|r| [p, u, r.as_str()]))
+}
+
+/// `retrieval_provider_requests_total` samples `([provider, purpose, region, result], count)`:
+/// every closed combination (2 × 2 × 4 × 6) plus anything recorded (ADR-0061 D-A seeding).
+pub fn snapshot_requests_total() -> Vec<(Vec<&'static str>, u64)> {
+    let seed = provider_purpose_region()
+        .flat_map(|[p, u, r]| RESULTS.map(|res| vec![p, u, r, res]))
+        .collect();
+    RETRIEVAL_PROVIDER_REQUESTS_TOTAL.snapshot(seed)
+}
+
+/// `retrieval_provider_latency_seconds` samples `([provider, purpose, region], count, sum)`.
+pub fn snapshot_latency_seconds() -> Vec<(Vec<&'static str>, u64, f64)> {
+    let seed = provider_purpose_region().map(Vec::from).collect();
+    RETRIEVAL_PROVIDER_LATENCY_SECONDS.snapshot(seed)
+}
+
+/// `retrieval_provider_tokens_total` samples `([provider, purpose], tokens)`.
+pub fn snapshot_tokens_total() -> Vec<(Vec<&'static str>, u64)> {
+    let seed = provider_purpose().map(|(p, u)| vec![p, u]).collect();
+    RETRIEVAL_PROVIDER_TOKENS_TOTAL.snapshot(seed)
+}
+
+/// `retrieval_provider_cost_total` samples `([provider, purpose, currency], minor units)`.
+pub fn snapshot_cost_total() -> Vec<(Vec<&'static str>, u64)> {
+    let seed = provider_purpose()
+        .flat_map(|(p, u)| Currency::ALL.map(|c| vec![p, u, c.as_str()]))
+        .collect();
+    RETRIEVAL_PROVIDER_COST_TOTAL.snapshot(seed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +470,78 @@ mod tests {
     fn purpose_label_matches_frozen_values() {
         assert_eq!(purpose_label(RetrievalPurpose::Embedding), "embedding");
         assert_eq!(purpose_label(RetrievalPurpose::Rerank), "rerank");
+    }
+
+    /// T-C4 (ADR-0061 D-C): each snapshot holds every recorded tuple with its recorded amount,
+    /// plus the zero-seeded rest of the closed label product.
+    #[test]
+    fn snapshots_return_every_recorded_tuple_seeded_over_the_closed_sets() {
+        let (provider, purpose, region) = (
+            Provider::Custom,
+            RetrievalPurpose::Embedding,
+            Region::CnBeijing,
+        );
+        let result = ProviderCallOutcome::Http429.metric_result_label();
+        record_provider_call(provider, purpose, region, result, 7, 3, Currency::Cny, 0.5);
+        let (p, u, r) = (provider.as_str(), purpose_label(purpose), region.as_str());
+
+        let requests = snapshot_requests_total();
+        assert_eq!(requests.len(), 2 * 2 * 4 * 6);
+        let got = requests.iter().find(|(k, _)| *k == [p, u, r, result]);
+        assert!(got.is_some_and(|(_, n)| *n >= 1), "{requests:?}");
+        for res in RESULTS {
+            assert!(
+                requests.iter().any(|(k, _)| k[3] == res),
+                "{res} not seeded"
+            );
+        }
+
+        let latency = snapshot_latency_seconds();
+        assert_eq!(latency.len(), 2 * 2 * 4);
+        let got = latency.iter().find(|(k, _, _)| *k == [p, u, r]);
+        assert!(
+            got.is_some_and(|(_, n, sum)| *n >= 1 && *sum >= 0.5),
+            "{latency:?}"
+        );
+
+        let tokens = snapshot_tokens_total();
+        assert_eq!(tokens.len(), 2 * 2);
+        assert!(
+            tokens.iter().any(|(k, n)| *k == [p, u] && *n >= 7),
+            "{tokens:?}"
+        );
+
+        let cost = snapshot_cost_total();
+        assert_eq!(cost.len(), 2 * 2 * 2);
+        assert!(
+            cost.iter().any(|(k, n)| *k == [p, u, "cny"] && *n >= 3),
+            "{cost:?}"
+        );
+    }
+
+    /// The frozen `result` set the snapshot seeds is exactly what the emit path can produce.
+    #[test]
+    fn seeded_results_equal_the_reachable_result_labels() {
+        use crate::health::ProviderCallOutcome::*;
+        let mut reachable: Vec<&str> = [
+            Success,
+            Http401,
+            Http403,
+            Http429,
+            Http5xx,
+            Timeout,
+            ConnectionReset,
+            MalformedResponse,
+            FewerDocumentsThanRequested,
+            DuplicateDocumentResult,
+        ]
+        .map(ProviderCallOutcome::metric_result_label)
+        .to_vec();
+        reachable.push(CIRCUIT_OPEN_RESULT_LABEL);
+        reachable.sort_unstable();
+        reachable.dedup();
+        let mut seeded = RESULTS.to_vec();
+        seeded.sort_unstable();
+        assert_eq!(seeded, reachable);
     }
 }

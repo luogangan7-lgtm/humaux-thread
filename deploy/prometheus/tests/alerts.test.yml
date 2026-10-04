@@ -1,0 +1,211 @@
+# promtool unit tests for the §42 rows in alerts.rules.yml (ADR-0061 D-E). Each alert has a firing
+# and a silent case (Watchdog: two firing checks, it has no silent state), and each `absent(...)`
+# branch of a multi-branch alert has its own firing case with only that family missing, so deleting
+# any one branch is red (ADR-0061 review-fix 3, F6); mutations.sh proves each case catches its mutation. Measured promtool 3.15.0 semantics (research addendum W6): an absent
+# family is an omitted input series; `exp_alerts: []` asserts "not firing", so a pending alert
+# (inside its `for:`) also reads as [].
+rule_files:
+  - ../alerts.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # core silent: the three core families are exported.
+  - interval: 1m
+    input_series:
+      - series: 'humaux_retrieval_requests_total{intent="text",completeness_class="complete"}'
+        values: '0x10'
+      - series: 'degrade_total{code="ProjectionLag"}'
+        values: '0x10'
+      - series: 'humaux_mcp_requests_total{tool="recall",result="ok",plan_class="unclassified"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CoreMetricAbsent
+        exp_alerts: []
+
+  # core fire, branch 2: degrade_total dropped from the exporter while the other two stay.
+  - interval: 1m
+    input_series:
+      - series: 'humaux_retrieval_requests_total{intent="text",completeness_class="complete"}'
+        values: '0x10'
+      - series: 'humaux_mcp_requests_total{tool="recall",result="ok",plan_class="unclassified"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CoreMetricAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # core fire, branch 1: humaux_retrieval_requests_total dropped while the other two stay.
+  - interval: 1m
+    input_series:
+      - series: 'degrade_total{code="ProjectionLag"}'
+        values: '0x10'
+      - series: 'humaux_mcp_requests_total{tool="recall",result="ok",plan_class="unclassified"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CoreMetricAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # core fire, branch 3: humaux_mcp_requests_total dropped while the other two stay.
+  - interval: 1m
+    input_series:
+      - series: 'humaux_retrieval_requests_total{intent="text",completeness_class="complete"}'
+        values: '0x10'
+      - series: 'degrade_total{code="ProjectionLag"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CoreMetricAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # lag fire: constant 200 is pending at 9m and firing at 11m (`for` 10m).
+  - interval: 1m
+    input_series:
+      - series: 'projection_lag_events'
+        values: '200x20'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: ProjectionLagExceedsSLO
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: ProjectionLagExceedsSLO
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # lag silent: constant 50 never crosses 100.
+  - interval: 1m
+    input_series:
+      - series: 'projection_lag_events'
+        values: '50x20'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: ProjectionLagExceedsSLO
+        exp_alerts: []
+
+  # dead fire: one job goes DEAD at 3m.
+  - interval: 1m
+    input_series:
+      - series: 'jobs_dead'
+        values: '0 0 0 1x27'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: QueueDeadLetterIncrease
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # dead silent: a constant DEAD count is not an increase.
+  - interval: 1m
+    input_series:
+      - series: 'jobs_dead'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: QueueDeadLetterIncrease
+        exp_alerts: []
+
+  # backup fire: the timestamp never advances past 0; at 26h1m time() - 0 exceeds 26 h.
+  - interval: 1m
+    input_series:
+      - series: 'backup_last_success_timestamp_seconds{target="offsite"}'
+        values: '0x1600'
+    alert_rule_test:
+      - eval_time: 26h1m
+        alertname: BackupFailure
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              target: offsite
+
+  # backup silent: the timestamp tracks time() (test clock starts at 0).
+  - interval: 1m
+    input_series:
+      - series: 'backup_last_success_timestamp_seconds{target="offsite"}'
+        values: '0+60x1600'
+    alert_rule_test:
+      - eval_time: 26h1m
+        alertname: BackupFailure
+        exp_alerts: []
+
+  # health silent: the sampler's three gauges are present.
+  - interval: 1m
+    input_series:
+      - series: 'data_disclosures_reserved_unfinalized{age_bucket="gt_60s"}'
+        values: '0x10'
+      - series: 'jobs_dead'
+        values: '0x10'
+      - series: 'projection_lag_events'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HealthGaugesAbsent
+        exp_alerts: []
+
+  # health fire, branch 1: reserved_unfinalized is gone (a 503 scrape marks it stale); pending at 1m,
+  # firing at 3m.
+  - interval: 1m
+    input_series:
+      - series: 'jobs_dead'
+        values: '0x10'
+      - series: 'projection_lag_events'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: HealthGaugesAbsent
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: HealthGaugesAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # health fire, branch 2: jobs_dead is gone while the other two stay.
+  - interval: 1m
+    input_series:
+      - series: 'data_disclosures_reserved_unfinalized{age_bucket="gt_60s"}'
+        values: '0x10'
+      - series: 'projection_lag_events'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HealthGaugesAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # health fire, branch 3: projection_lag_events is gone while the other two stay.
+  - interval: 1m
+    input_series:
+      - series: 'data_disclosures_reserved_unfinalized{age_bucket="gt_60s"}'
+        values: '0x10'
+      - series: 'jobs_dead'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HealthGaugesAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # watchdog: firing from the first evaluation, with no input at all.
+  - interval: 1m
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels:
+              severity: none
+      - eval_time: 1m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels:
+              severity: none

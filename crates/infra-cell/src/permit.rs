@@ -1,6 +1,6 @@
 //! `infra-cell::permit` — ADR-0003 / §83.4 Layer 1B's sole authorization token.
 //! Depends-on: crates=[uuid]; services=[]; env=[]; modules=[infra-cell::resource]
-//! Called-by: [adapters::projection_worker, adapters::provisioning, adapters::public_projection, adapters::qdrant, adapters::retrieve, admin::cell_resources, gateway::bootstrap, gateway::recall, gateway::retrieval_embedding_client, infra-cell::resource, infra-cell::transport, public-worker::main, retrieval-worker::main, tests, xtask::switch_visible]
+//! Called-by: [adapters::projection_worker, adapters::provisioning, adapters::public_projection, adapters::qdrant, adapters::retrieve, admin::cell_resources, gateway::bootstrap, gateway::recall, gateway::retrieval_embedding_client, gateway::status, infra-cell::resource, infra-cell::transport, public-worker::main, retrieval-worker::main, tests, xtask::switch_visible]
 //! Invariants: [CellAccessPermit has no payload/data-class field and no conversion to EgressPermit, so minting one
 //!   cannot reserve a disclosure row; an unknown caller or wrong Cell is a PermitError]
 //! Spec: Baseline §7.4; §53.5; §83.4

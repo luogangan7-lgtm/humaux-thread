@@ -1,37 +1,38 @@
 //! `xtask::e2e_onboard` — the card-28 acceptance harness: production onboarding on a fresh database, live reads,
 //!   live writes, idempotency and the five faults (ADR-0053 D-H).
-//! Depends-on: crates=[humaux-adapters, humaux-domain, postgres, serde_json, uuid]; services=[HTTP(gateway), PostgreSQL(owner)
-//!   r=[control.api_keys, control.audit_events, control.entitlement_snapshots, control.memberships,
-//!   control.private_reasoning_domains, control.quota_windows, control.retrieval_provider_admission_limits,
-//!   control.tenants, control.user_emails, control.users, control.workspace_memberships, control.workspaces,
-//!   ops.commit_seq_seq, ops.outbox, private.evidence_objects, projection.family_activations,
-//!   projection.private_memory_points, projection.stream_checkpoints] w=[projection.stream_log,
-//!   projection.tenant_placements] x=[control.ensure_user, control.issue_quota_window, control.onboard_tenant],
-//!   Qdrant(*), subprocess(cargo), subprocess(humaux-gateway), subprocess(humaux-maintenance), subprocess(id),
-//!   subprocess(xtask), PostgreSQL(role_maintenance)]; env=[CARGO_TARGET_DIR, HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS,
-//!   HUMAUX_GATEWAY_BIND_ADDR, HUMAUX_GATEWAY_CALLER_ID, HUMAUX_GATEWAY_CELL_ID,
-//!   HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS,
-//!   HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX, HUMAUX_GATEWAY_EMBEDDING_DIMENSION,
-//!   HUMAUX_GATEWAY_EMBEDDING_VERSION, HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
+//! Depends-on: crates=[humaux-adapters, humaux-domain, postgres, serde_json, uuid]; services=[HTTP(gateway),
+//!   PostgreSQL(owner) r=[control.api_keys, control.audit_events, control.entitlement_snapshots,
+//!   control.memberships, control.private_reasoning_domains, control.quota_windows,
+//!   control.retrieval_provider_admission_limits, control.tenants, control.user_emails, control.users,
+//!   control.workspace_memberships, control.workspaces, ops.commit_seq_seq, ops.outbox, private.evidence_objects,
+//!   projection.family_activations, projection.private_memory_points, projection.stream_checkpoints]
+//!   w=[projection.stream_log, projection.tenant_placements] x=[control.ensure_user, control.issue_quota_window,
+//!   control.onboard_tenant], Qdrant(*), subprocess(cargo), subprocess(humaux-gateway),
+//!   subprocess(humaux-maintenance), subprocess(id), subprocess(xtask), PostgreSQL(role_maintenance)];
+//!   env=[CARGO_TARGET_DIR, HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS, HUMAUX_GATEWAY_BIND_ADDR,
+//!   HUMAUX_GATEWAY_CALLER_ID, HUMAUX_GATEWAY_CELL_ID, HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS, HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS,
+//!   HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX, HUMAUX_GATEWAY_EMBEDDING_DIMENSION, HUMAUX_GATEWAY_EMBEDDING_VERSION,
+//!   HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
 //!   HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST, HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS,
-//!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES,
+//!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES, HUMAUX_GATEWAY_METRICS_ADDR,
 //!   HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS, HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS,
-//!   HUMAUX_GATEWAY_QDRANT_CIDR,
-//!   HUMAUX_GATEWAY_QDRANT_HOST, HUMAUX_GATEWAY_QDRANT_PORT, HUMAUX_GATEWAY_QDRANT_TLS,
+//!   HUMAUX_GATEWAY_QDRANT_CIDR, HUMAUX_GATEWAY_QDRANT_HOST, HUMAUX_GATEWAY_QDRANT_PORT, HUMAUX_GATEWAY_QDRANT_TLS,
 //!   HUMAUX_GATEWAY_RATE_CREDENTIAL_CAPACITY, HUMAUX_GATEWAY_RATE_CREDENTIAL_REFILL_PER_SECOND,
 //!   HUMAUX_GATEWAY_RATE_OPERATION_CAPACITY, HUMAUX_GATEWAY_RATE_OPERATION_REFILL_PER_SECOND,
 //!   HUMAUX_GATEWAY_RATE_PREAUTH_IP_CAPACITY, HUMAUX_GATEWAY_RATE_PREAUTH_IP_REFILL_PER_SECOND,
 //!   HUMAUX_GATEWAY_RATE_TENANT_CAPACITY, HUMAUX_GATEWAY_RATE_TENANT_REFILL_PER_SECOND,
 //!   HUMAUX_GATEWAY_RATE_USER_CAPACITY, HUMAUX_GATEWAY_RATE_USER_REFILL_PER_SECOND,
-//!   HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN, HUMAUX_GATEWAY_REMEMBER_EVENT_KIND,
-//!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION,
-//!   HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID, HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND,
-//!   HUMAUX_GATEWAY_REMEMBER_TENANT_ID, HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS,
-//!   HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS, HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID,
-//!   HUMAUX_GATEWAY_REPLAY_TTL_SECONDS, HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS,
-//!   HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS, HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH,
-//!   HUMAUX_GATEWAY_TOKEN_HMAC_KEY, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS, HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS,
-//!   HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX, HUMAUX_MAINTENANCE_EMBEDDING_DIMENSION, HUMAUX_MAINTENANCE_PG_DSN,
+//!   HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS, HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN,
+//!   HUMAUX_GATEWAY_REMEMBER_EVENT_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND,
+//!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION, HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID,
+//!   HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND, HUMAUX_GATEWAY_REMEMBER_TENANT_ID,
+//!   HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS,
+//!   HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID, HUMAUX_GATEWAY_REPLAY_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS, HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH, HUMAUX_GATEWAY_TOKEN_HMAC_KEY, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS,
+//!   HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS, HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX,
+//!   HUMAUX_MAINTENANCE_EMBEDDING_DIMENSION, HUMAUX_MAINTENANCE_PG_DSN,
 //!   HUMAUX_MAINTENANCE_PRIVATE_MEMORY_COLLECTION, HUMAUX_MAINTENANCE_QDRANT_CIDR, HUMAUX_MAINTENANCE_QDRANT_HOST,
 //!   HUMAUX_MAINTENANCE_QDRANT_PORT, HUMAUX_MINIMAX_DNS_PINS, HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS,
 //!   HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS,
@@ -39,23 +40,25 @@
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS,
-//!   HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS,
+//!   HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR, HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS,
 //!   HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS,
-//!   HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_REGIONS, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS,
-//!   HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS, HUMAUX_RETRIEVAL_WORKER_BATCH, HUMAUX_RETRIEVAL_WORKER_CALLER,
-//!   HUMAUX_RETRIEVAL_WORKER_CELL_ID, HUMAUX_RETRIEVAL_WORKER_DIMENSION,
-//!   HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID, HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL,
-//!   HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER, HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION,
-//!   HUMAUX_RETRIEVAL_WORKER_GATEWAY_UID, HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN,
-//!   HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256, HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION,
-//!   HUMAUX_RETRIEVAL_WORKER_LEASE_SECS, HUMAUX_RETRIEVAL_WORKER_MAX_ATTEMPTS,
-//!   HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS, HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION,
-//!   HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP, HUMAUX_RETRIEVAL_WORKER_PG_DSN,
+//!   HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_REGIONS, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH,
+//!   HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS, HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS,
+//!   HUMAUX_RETRIEVAL_WORKER_BATCH, HUMAUX_RETRIEVAL_WORKER_CALLER, HUMAUX_RETRIEVAL_WORKER_CELL_ID,
+//!   HUMAUX_RETRIEVAL_WORKER_DIMENSION, HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID,
+//!   HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL, HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER,
+//!   HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION, HUMAUX_RETRIEVAL_WORKER_GATEWAY_UID,
+//!   HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN, HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256,
+//!   HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION, HUMAUX_RETRIEVAL_WORKER_LEASE_SECS,
+//!   HUMAUX_RETRIEVAL_WORKER_MAX_ATTEMPTS, HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS,
+//!   HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION, HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP, HUMAUX_RETRIEVAL_WORKER_PG_DSN,
 //!   HUMAUX_RETRIEVAL_WORKER_POLL_INTERVAL_SECS, HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR,
 //!   HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST, HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT, HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS,
-//!   HUMAUX_RETRIEVAL_WORKER_REGION, HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH, HUMAUX_TEST_GITLEAKS_BIN,
+//!   HUMAUX_RETRIEVAL_WORKER_REGION, HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH,
+//!   HUMAUX_RETRIEVAL_WORKER_SERVE_METRICS_ADDR, HUMAUX_RETRIEVAL_WORKER_SERVE_RPC_METRICS_ADDR, HUMAUX_TEST_GITLEAKS_BIN,
 //!   HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN, HUMAUX_TEST_QDRANT_PORT, PATH];
-//!   modules=[adapters::byok, adapters::byok::ssrf, domain::ticket_family, xtask::e2e_seed, xtask::migrate, xtask::soak]
+//!   modules=[adapters::byok, adapters::byok::ssrf, domain::ticket_family, xtask::e2e_seed, xtask::migrate,
+//!   xtask::soak]
 //! Called-by: [xtask::main]
 //! Invariants: [owns only its database humaux_thread_c28_onboard_<pid>, collection humaux_c28_onboard_<pid> and the
 //!   four children it spawned (stopped via their Child handles, never by port or name), all torn down by Drop regardless
@@ -195,12 +198,16 @@ fn key_from(name: &str, file: &str) -> Option<String> {
         })
 }
 
-fn free_port() -> Option<u16> {
-    TcpListener::bind("127.0.0.1:0")
-        .ok()?
-        .local_addr()
-        .ok()
-        .map(|a| a.port())
+/// `N` distinct free loopback ports: every listener is held until all are bound, so no two are equal.
+fn free_ports<const N: usize>() -> Option<[u16; N]> {
+    let held = (0..N)
+        .map(|_| TcpListener::bind("127.0.0.1:0").ok())
+        .collect::<Option<Vec<_>>>()?;
+    let ports = held
+        .iter()
+        .map(|l| l.local_addr().ok().map(|a| a.port()))
+        .collect::<Option<Vec<_>>>()?;
+    ports.try_into().ok()
 }
 
 fn target_dir() -> PathBuf {
@@ -727,7 +734,17 @@ pub fn run(_args: &[String]) -> i32 {
     };
 
     // ---- 4. the four resident children ---------------------------------------------------------
-    let Some(gw_port) = free_port() else {
+    // ADR-0061 D-B: the gateway's listener plus one loopback ops port per resident mode.
+    let Some(
+        [
+            gw_port,
+            gw_ops_port,
+            rpc_ops_port,
+            runner_ops_port,
+            distill_ops_port,
+        ],
+    ) = free_ports()
+    else {
         report.step("processes", false, "no free loopback port");
         return 1;
     };
@@ -768,8 +785,17 @@ pub fn run(_args: &[String]) -> i32 {
         ),
         ("DASHSCOPE_API_KEY", env.dashscope.as_str()),
     ];
+    let (rpc_ops, runner_ops, distill_ops) = (
+        format!("127.0.0.1:{rpc_ops_port}"),
+        format!("127.0.0.1:{runner_ops_port}"),
+        format!("127.0.0.1:{distill_ops_port}"),
+    );
     let mut rpc = retrieval_common.clone();
     rpc.extend([
+        (
+            "HUMAUX_RETRIEVAL_WORKER_SERVE_RPC_METRICS_ADDR",
+            rpc_ops.as_str(),
+        ),
         (
             "HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH",
             retrieval_sock.as_str(),
@@ -784,6 +810,10 @@ pub fn run(_args: &[String]) -> i32 {
     );
     let mut runner = retrieval_common.clone();
     runner.extend([
+        (
+            "HUMAUX_RETRIEVAL_WORKER_SERVE_METRICS_ADDR",
+            runner_ops.as_str(),
+        ),
         ("HUMAUX_RETRIEVAL_WORKER_BATCH", "16"),
         ("HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP", "8"),
         ("HUMAUX_RETRIEVAL_WORKER_LEASE_SECS", "60"),
@@ -871,6 +901,10 @@ pub fn run(_args: &[String]) -> i32 {
             recipients.as_str(),
         ),
         ("HUMAUX_PRIVATE_WORKER_REGIONS", MM_REGION),
+        (
+            "HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR",
+            distill_ops.as_str(),
+        ),
         // Ruling E3: traffic renews the seed's 30-minute attestation once less than 15 min is left.
         ("HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS", "1800"),
     ];
@@ -882,6 +916,8 @@ pub fn run(_args: &[String]) -> i32 {
     );
     let bind = format!("127.0.0.1:{gw_port}");
     let origin = format!("http://{bind}");
+    // ADR-0061 D-B: the gateway's loopback ops listener, its own free port.
+    let gw_ops = format!("127.0.0.1:{gw_ops_port}");
     let family = humaux_domain::ticket_family::TicketFamily::PrivateMemory;
     let gateway: Vec<(&str, &str)> = vec![
         ("HUMAUX_GATEWAY_PG_DSN", env.gateway.as_str()),
@@ -951,6 +987,8 @@ pub fn run(_args: &[String]) -> i32 {
         ("HUMAUX_GATEWAY_RATE_TENANT_REFILL_PER_SECOND", "100"),
         ("HUMAUX_GATEWAY_RATE_OPERATION_CAPACITY", "100"),
         ("HUMAUX_GATEWAY_RATE_OPERATION_REFILL_PER_SECOND", "100"),
+        ("HUMAUX_GATEWAY_METRICS_ADDR", gw_ops.as_str()),
+        ("HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS", "2"),
     ];
     run.spawn("gateway", "humaux-gateway", &[], &gateway);
     let ready = wait_until(Duration::from_secs(90), || {

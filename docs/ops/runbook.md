@@ -79,6 +79,15 @@ its behalf (superuser, or CREATEROLE with ADMIN OPTION on the eight roles plus m
 An interrupted migrate after step 1 leaves no placeholder login, because none was ever created. A
 brand-new **development** container may instead pass `migrate --dev-placeholder-roles` once.
 
+**Migration 0210 and a non-superuser migrator** (ADR-0061 review-fix 3, F2). 0210 makes the NOLOGIN
+`role_health_reader` the owner of `ops.health_snapshot(timestamptz)` and `ops.admin_probe_snapshot()` with
+`ALTER FUNCTION … OWNER TO`. A superuser executor needs nothing more (the dev cluster's migrator is the superuser).
+Any other executor needs, for the duration of 0210 only: membership in `role_health_reader` with the SET option
+(`GRANT role_health_reader TO <migrator> WITH INHERIT FALSE, SET TRUE`) and `GRANT CREATE ON SCHEMA ops TO
+role_health_reader`. Revoke both right after 0210 (`REVOKE role_health_reader FROM <migrator>`, `REVOKE CREATE ON
+SCHEMA ops FROM role_health_reader`), then run `cargo xtask rls-check`: it is red while the reader has a member or
+the extra grant.
+
 ## 3. Tenant provisioning
 
 Card 28 / ADR-0053: onboarding is `humaux-maintenance` (the §4.2 operator-write process),
@@ -376,6 +385,42 @@ probes emit no envelope at all on that path so a `0` cannot be manufactured down
 Then one real round trip: `remember.put` → distill pass → projection resolve → `recall.search`
 returns the memory. This is the chain the acceptance suites exercise; a deployment that answers
 `/readyz` but cannot complete it is not up.
+
+`/readyz` is dependency-truthful since card 34 (ADR-0061 D-F): 503 `not_ready` means PostgreSQL,
+the retrieval RPC round trip or Qdrant is down — do **not** restart the gateway for it; the
+loopback `/status` names the dependency (supervision.md §2).
+
+**Metrics and alerts (card 34, ADR-0061).** Every resident mode serves `/metrics` and `/status`
+on its own loopback ops key (supervision.md §1 lists the seven keys). Prometheus, Alertmanager and
+the collector are units of their own (supervision.md §8).
+
+```sh
+curl -fsS 127.0.0.1:<ops port>/metrics | head          # one per resident mode: 200, `# HELP` / `# TYPE` lines
+curl -fsS 127.0.0.1:<ops port>/status                  # JSON naming `process`, `mode`, `git_sha`, the 11 degrade codes
+sh deploy/prometheus/pinned-tool.sh promtool check rules deploy/prometheus/invariants.rules.yml deploy/prometheus/alerts.rules.yml
+sh deploy/prometheus/test-rules.sh                     # every loaded alert fires and stays silent on synthetic series
+curl -fsS 127.0.0.1:9090/api/v1/targets                # every humaux-* target and otelcol: health "up"
+curl -fsS -G 127.0.0.1:9090/api/v1/query --data-urlencode 'query=up{job=~"humaux-.*"}'   # exactly the seven (job, mode) pairs, all 1
+curl -fsS 127.0.0.1:9090/api/v1/alerts                 # Watchdog firing (always); nothing else firing on a quiet system
+humaux-admin q deploy.binary                           # detail.git_sha = the sha rendered into prometheus.yml
+```
+
+- The Watchdog receipt (the sink log or the external healthchecks service) carries
+  `labels.git_sha` equal to `humaux-admin q deploy.binary`'s `detail.git_sha`. A receipt that
+  says `__HUMAUX_GIT_SHA__` means the deployer skipped the render: fix it before trusting any
+  alert (§42.1, §67.4).
+- `HealthGaugesAbsent` firing means `humaux-maintenance health serve` is down or its sample fails
+  (its `/metrics` answers 503 naming why); INV-3, projection lag and dead-letter are blind until it
+  is back (supervision.md §2).
+- `BackupFailure` is silent until card 37 produces `backup_last_success_timestamp_seconds`;
+  `metrics-registry --check` names it not_applicable with its producer card.
+
+**Manual §69 step — the external dead-man (§42.1), once per deployment and after every change to
+the Watchdog route.** It is not a gate, because the endpoint is outside this repo: stop
+Alertmanager for 5 minutes and confirm that the external healthchecks endpoint reports the missing
+ping (its own alert or e-mail); start Alertmanager again and confirm the next ping clears it.
+Record the date, the endpoint and its alert in the deployment log. A Watchdog that nobody would
+miss is not a dead-man.
 
 ### 7.1 Reading the private-worker dispatch line
 

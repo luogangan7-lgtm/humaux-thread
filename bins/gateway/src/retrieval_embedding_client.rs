@@ -4,7 +4,7 @@
 //!   serde_json, sha2, tokio, uuid]; services=[UDS(retrieval-worker)]; env=[]; modules=[adapters::postgres,
 //!   adapters::retrieval_embedding_rpc, application::retrieval_embedding_port, domain::error, infra-cell::permit,
 //!   infra-cell::resource]
-//! Called-by: [gateway::bootstrap, tests]
+//! Called-by: [gateway::bootstrap, gateway::status, tests]
 //! Invariants: [the RPC still flows through the one closed IntraCellResource::RETRIEVAL_EMBEDDING_RPC registry/permit even though the dial bypasses IntraCellHttpTransport (a UDS path plus kernel peer-credential auth)]
 //! Spec: Baseline §2; §83.4; ADR-0012
 //!
@@ -37,6 +37,9 @@ use humaux_infra_cell::{
 };
 
 const SCHEMA_VERSION: u16 = 1;
+const QUERY_EMBEDDING_PATH: &str = "/internal/v1/retrieval/query-embedding";
+/// ADR-0061 D-F: the worker's readiness route, behind the same peer-uid layer.
+const READYZ_PATH: &str = "/internal/v1/retrieval/readyz";
 
 /// Worker response cap — the envelope is a small JSON object plus one dense vector (a few KB at
 /// realistic dimensions); anything past this is either a misbehaving/hostile peer or a protocol
@@ -239,13 +242,20 @@ impl GatewayRetrievalEmbeddingClient {
         &self,
         wire: &QueryEmbeddingRpcRequest,
     ) -> Result<QueryEmbeddingRpcEnvelope, String> {
+        let body = serde_json::to_vec(wire).map_err(|_| "INVALID_RESPONSE".to_owned())?;
+        let raw = self.exchange("POST", QUERY_EMBEDDING_PATH, &body).await?;
+        parse_http_response(&raw)
+    }
+
+    /// One `Connection: close` request over a fresh connection to the worker's socket; returns the
+    /// raw response, capped at [`MAX_RESPONSE_BYTES`].
+    async fn exchange(&self, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, String> {
         // dep: UDS(retrieval-worker) — dials humaux-retrieval-worker's ADR-0012 embedding RPC socket
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(|_| "TRANSPORT".to_owned())?;
-        let body = serde_json::to_vec(wire).map_err(|_| "INVALID_RESPONSE".to_owned())?;
         let head = format!(
-            "POST /internal/v1/retrieval/query-embedding HTTP/1.1\r\n\
+            "{method} {path} HTTP/1.1\r\n\
              Host: localhost\r\n\
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
@@ -257,7 +267,7 @@ impl GatewayRetrievalEmbeddingClient {
             .await
             .map_err(|_| "TRANSPORT".to_owned())?;
         stream
-            .write_all(&body)
+            .write_all(body)
             .await
             .map_err(|_| "TRANSPORT".to_owned())?;
         let mut raw = Vec::new();
@@ -275,14 +285,37 @@ impl GatewayRetrievalEmbeddingClient {
             }
             raw.extend_from_slice(&chunk[..n]);
         }
-        parse_http_response(&raw)
+        Ok(raw)
+    }
+
+    /// ADR-0061 D-F `retrieval_rpc` readiness: one `GET /internal/v1/retrieval/readyz` round trip
+    /// over the same socket, permit and worker-side peer-uid layer a recall uses — the worker
+    /// answers it with a fresh `role_retrieval_worker` connection, so a bare `connect()` that
+    /// succeeds while the worker cannot reach PostgreSQL is not a pass. `Err` carries the transport
+    /// reason or the worker's non-200 status and body; never a provider call (ADR-0061 D-F).
+    ///
+    /// # Errors
+    /// The permit refusal, a transport failure, the deadline, or a non-200 answer.
+    pub async fn ping(&self, deadline: Duration) -> Result<(), String> {
+        let _permit = self
+            .permit()
+            .map_err(|_| "IntraCellResource::RETRIEVAL_EMBEDDING_RPC permit refused".to_owned())?;
+        let raw = tokio::time::timeout(deadline, self.exchange("GET", READYZ_PATH, &[]))
+            .await
+            .unwrap_or_else(|_| Err("TRANSPORT_TIMEOUT".to_owned()))?;
+        match split_http_response(&raw)? {
+            (200, _) => Ok(()),
+            (status, body) => Err(format!(
+                "TRANSPORT_HTTP_{status}: {}",
+                String::from_utf8_lossy(body).trim()
+            )),
+        }
     }
 }
 
-/// Parses one fixed-shape `HTTP/1.1 <status> ...\r\n...\r\n\r\n<json body>` response — the
-/// exact shape [`GatewayRetrievalEmbeddingClient::dial`] sends `Connection: close` to obtain.
-/// Not a general HTTP parser: no chunked transfer-encoding, no header folding, no redirects.
-fn parse_http_response(raw: &[u8]) -> Result<QueryEmbeddingRpcEnvelope, String> {
+/// Splits one fixed-shape `HTTP/1.1 <status> ...\r\n...\r\n\r\n<body>` response into its status
+/// code and body.
+fn split_http_response(raw: &[u8]) -> Result<(u16, &[u8]), String> {
     let header_end = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -294,9 +327,16 @@ fn parse_http_response(raw: &[u8]) -> Result<QueryEmbeddingRpcEnvelope, String> 
         .nth(1)
         .and_then(|code| code.parse().ok())
         .ok_or_else(|| "TRANSPORT".to_owned())?;
+    Ok((status, &raw[header_end + 4..]))
+}
+
+/// Parses one fixed-shape `HTTP/1.1 <status> ...\r\n...\r\n\r\n<json body>` response — the
+/// exact shape [`GatewayRetrievalEmbeddingClient::dial`] sends `Connection: close` to obtain.
+/// Not a general HTTP parser: no chunked transfer-encoding, no header folding, no redirects.
+fn parse_http_response(raw: &[u8]) -> Result<QueryEmbeddingRpcEnvelope, String> {
+    let (status, body) = split_http_response(raw)?;
     if status != 200 {
         return Err(format!("TRANSPORT_HTTP_{status}"));
     }
-    let body = &raw[header_end + 4..];
     serde_json::from_slice(body).map_err(|_| "INVALID_RESPONSE".to_owned())
 }

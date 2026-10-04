@@ -1,0 +1,163 @@
+# promtool unit tests for §53.5 INV-1..4 (ADR-0061 D-E). Each alert has a firing and a silent case;
+# mutations.sh proves each case catches its mutation. Measured promtool 3.15.0 semantics (research
+# addendum W6): an absent family is an omitted input series; `exp_alerts: []` asserts "not firing".
+rule_files:
+  - ../invariants.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # inv1: the numerator rises while the denominator is present and flat → INV-1.
+  - interval: 1m
+    input_series:
+      - series: 'degrade_total{code="ProjectionLag"}'
+        values: '0+1x10'
+      - series: 'humaux_retrieval_requests_total{intent="text",completeness_class="complete"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: INV-1
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "INV-1 (§53.5): degrade_total 有分子但 retrieval 分母为零/缺席，链路只走弃权分支"
+
+  # inv1s: the same degrade with a rising denominator → silent.
+  - interval: 1m
+    input_series:
+      - series: 'degrade_total{code="ProjectionLag"}'
+        values: '0+1x10'
+      - series: 'humaux_retrieval_requests_total{intent="text",completeness_class="complete"}'
+        values: '0+5x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: INV-1
+        exp_alerts: []
+
+  # inv1p (INV-1'): the denominator family has no sample at all → the absent_over_time branch fires.
+  - interval: 1m
+    input_series:
+      - series: 'degrade_total{code="ProjectionLag"}'
+        values: '0+1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: INV-1
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "INV-1 (§53.5): degrade_total 有分子但 retrieval 分母为零/缺席，链路只走弃权分支"
+
+  # inv2: EgressDenied rises while finalized disclosures are present and flat → INV-2.
+  - interval: 1m
+    input_series:
+      - series: 'degrade_total{code="EgressDenied"}'
+        values: '0+1x10'
+      - series: 'data_disclosures_finalized_total{outcome="SUCCESS"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: INV-2
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "INV-2 (§53.5): Egress 降级有分子但 data_disclosures_finalized_total 分母为零/缺席"
+
+  # inv2m: a non-Egress code rises, finalized flat → silent (the code=~"Egress.*" matcher).
+  - interval: 1m
+    input_series:
+      - series: 'degrade_total{code="LaneSubstituted"}'
+        values: '0+1x10'
+      - series: 'data_disclosures_finalized_total{outcome="SUCCESS"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: INV-2
+        exp_alerts: []
+
+  # inv2p (INV-2'): EgressDenied rises and the finalized family has no sample → fires.
+  - interval: 1m
+    input_series:
+      - series: 'degrade_total{code="EgressDenied"}'
+        values: '0+1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: INV-2
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "INV-2 (§53.5): Egress 降级有分子但 data_disclosures_finalized_total 分母为零/缺席"
+
+  # inv3: one reservation older than 60 s → INV-3.
+  - interval: 1m
+    input_series:
+      - series: 'data_disclosures_reserved_unfinalized{age_bucket="gt_60s"}'
+        values: '1x10'
+      - series: 'data_disclosures_reserved_unfinalized{age_bucket="le_60s"}'
+        values: '0x10'
+      - series: 'data_disclosures_reserved_unfinalized{age_bucket="le_10s"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: INV-3
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              age_bucket: gt_60s
+            exp_annotations:
+              summary: "INV-3 (§53.5/§7.4): 存在 reserved 超 60s 未 finalize 的记录"
+
+  # inv3 silent: only young reservations.
+  - interval: 1m
+    input_series:
+      - series: 'data_disclosures_reserved_unfinalized{age_bucket="gt_60s"}'
+        values: '0x10'
+      - series: 'data_disclosures_reserved_unfinalized{age_bucket="le_60s"}'
+        values: '0x10'
+      - series: 'data_disclosures_reserved_unfinalized{age_bucket="le_10s"}'
+        values: '3x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: INV-3
+        exp_alerts: []
+
+  # inv4: two codes at 45 % / 55 % of all degrades over 24 h → INV-4 for both.
+  - interval: 1m
+    input_series:
+      - series: 'degrade_total{code="LaneSubstituted"}'
+        values: '0+45x1600'
+      - series: 'degrade_total{code="ProjectionLag"}'
+        values: '0+55x1600'
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: INV-4
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              code: LaneSubstituted
+            exp_annotations:
+              summary: "INV-4 (§53.5): 单个 degrade code 24h 占比超 40%"
+          - exp_labels:
+              severity: warning
+              code: ProjectionLag
+            exp_annotations:
+              summary: "INV-4 (§53.5): 单个 degrade code 24h 占比超 40%"
+
+  # inv4 silent: four codes at 25 % each.
+  - interval: 1m
+    input_series:
+      - series: 'degrade_total{code="LaneSubstituted"}'
+        values: '0+25x1600'
+      - series: 'degrade_total{code="ProjectionLag"}'
+        values: '0+25x1600'
+      - series: 'degrade_total{code="EgressDenied"}'
+        values: '0+25x1600'
+      - series: 'degrade_total{code="ProjectionInvisibleLoss"}'
+        values: '0+25x1600'
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: INV-4
+        exp_alerts: []

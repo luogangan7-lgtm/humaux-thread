@@ -1,16 +1,20 @@
 //! `consolidation-worker::main` — `humaux-consolidation-worker` process entry (§4.2 minimal process set; §4.4 admin
 //!   probe contract; §11.7/§11.8 T4.6+T4.7).
-//! Depends-on: crates=[humaux-adapters, tokio, uuid]; services=[PostgreSQL(role_consolidation_worker),
-//!   UDS(private-worker)]; env=[CONSOLIDATION_WORKER_PG_DSN, HUMAUX_CONSOLIDATION_WORKER_BATCH,
+//! Depends-on: crates=[humaux-adapters, humaux-telemetry, tokio, uuid]; services=[HTTP(loopback),
+//!   PostgreSQL(role_consolidation_worker), UDS(private-worker)]; env=[CARGO_PKG_VERSION, CONSOLIDATION_WORKER_PG_DSN,
+//!   HUMAUX_BUILD_GIT_SHA, HUMAUX_CONSOLIDATION_WORKER_BATCH,
 //!   HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS, HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS,
 //!   HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS, HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS,
 //!   HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS, HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS,
-//!   HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH]; modules=[adapters::postgres,
-//!   consolidation-worker::inference_client, humaux-consolidation-worker]
+//!   HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH, HUMAUX_CONSOLIDATION_WORKER_SERVE_METRICS_ADDR];
+//!   modules=[adapters::postgres, consolidation-worker::inference_client, humaux-consolidation-worker,
+//!   telemetry::metrics]
 //! Called-by: [process(humaux-consolidation-worker)]
 //! Invariants: [missing/invalid env or an unreachable role_consolidation_worker DSN exits non-zero before any claim;
-//!   `--readyz` fails unless both PG and the private worker's inference socket answer one live round trip]
-//! Spec: ADR-0036; ADR-0037; §11.6
+//!   `--readyz` fails unless both PG and the private worker's inference socket answer one live round trip;
+//!   `--serve` reads its own HUMAUX_CONSOLIDATION_WORKER_SERVE_METRICS_ADDR (required, loopback) and the one-shot
+//!   modes open no listener; --metrics-families reads no configuration]
+//! Spec: ADR-0036; ADR-0037; §11.6; ADR-0061 D-B; ADR-0061 E10
 //!
 //! The actual orchestration ([`run_once`] and friends) lives
 //! in `src/lib.rs` — see that module's doc comment for why: a binary-only crate has no target
@@ -45,6 +49,9 @@
 //! pairs (`humaux_adapters::consolidation_reasoner::parse_rollup_output`, shared with the
 //! private worker). §11.6's guard holds by construction — the closure still has no DB
 //! capability and can only pick sources from ids the run itself recorded.
+//!
+//! Card 34 / ADR-0061 D-B: `--serve` opens a loopback ops listener (`/metrics`, `/status`). No §41.2 family is
+//! counted in this process yet, so `/metrics` is empty and Prometheus' `up` is the resident liveness signal (E10).
 
 use std::env;
 use std::process::ExitCode;
@@ -54,6 +61,7 @@ use humaux_adapters::postgres::ConsolidationDbPool;
 use humaux_consolidation_worker::{
     DispatchConfig, dispatch_pass, inference_client::UdsInferenceClient,
 };
+use humaux_telemetry::metrics::{OpsListener, parse_ops_addr, process_routes, serve_loopback};
 use uuid::Uuid;
 
 fn required(name: &str) -> Result<String, String> {
@@ -67,7 +75,30 @@ fn parse<T: std::str::FromStr>(name: &str) -> Result<T, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: humaux-consolidation-worker (--probe-connection | --readyz | --run-once | --serve)"
+    "usage: humaux-consolidation-worker (--probe-connection | --readyz | --run-once | --serve | --metrics-families)"
+}
+
+/// §78.1 / ADR-0061 D-B: `--serve`'s own ops listener address (loopback only, no default).
+const SERVE_METRICS_ADDR: &str = "HUMAUX_CONSOLIDATION_WORKER_SERVE_METRICS_ADDR";
+
+/// The §41.2 families this process counts: none yet (ADR-0061 E10). `/metrics` and `--metrics-families` both
+/// call this.
+fn render_metrics(_out: &mut String) {}
+
+/// Binds `--serve`'s loopback ops listener (ADR-0061 D-B). The handle must live as long as the mode: dropping it
+/// closes the port.
+fn ops_listener() -> Result<OpsListener, String> {
+    let addr = parse_ops_addr(&required(SERVE_METRICS_ADDR)?)
+        .map_err(|reason| format!("invalid configuration: {SERVE_METRICS_ADDR}: {reason}"))?;
+    let routes = process_routes(
+        "humaux-consolidation-worker",
+        "serve",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("HUMAUX_BUILD_GIT_SHA"),
+        render_metrics,
+    );
+    // dep: HTTP(loopback) — --serve's /metrics + /status listener
+    serve_loopback(SERVE_METRICS_ADDR, addr, routes).map_err(|e| e.to_string())
 }
 
 #[tokio::main]
@@ -80,6 +111,13 @@ async fn main() -> ExitCode {
         }
         Some("--probe-connection") => {
             probe_connection().await;
+            ExitCode::SUCCESS
+        }
+        // ADR-0061 D-C: before any configuration is read.
+        Some("--metrics-families") => {
+            let mut out = String::new();
+            render_metrics(&mut out);
+            print!("{out}");
             ExitCode::SUCCESS
         }
         Some("--readyz") => match readyz().await {
@@ -126,6 +164,12 @@ async fn probe_connection() {
 /// instead of spinning) / `--serve` (the same pass on
 /// `HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS` until the process is killed).
 async fn dispatch_mode(resident: bool) -> Result<(), String> {
+    // ADR-0061 D-B: only the resident mode is scraped; `--run-once` opens no listener.
+    let _ops = if resident {
+        Some(ops_listener()?)
+    } else {
+        None
+    };
     let dsn = required("CONSOLIDATION_WORKER_PG_DSN")?;
     let socket_path = required("HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH")?;
     let call_ttl = Duration::from_secs(parse::<u64>("HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS")?);

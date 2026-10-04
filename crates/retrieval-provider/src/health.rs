@@ -1,6 +1,6 @@
 //! `retrieval-provider::health` — §19 **Provider Health / Circuit Breaker**.
 //! Depends-on: crates=[]; services=[]; env=[]; modules=[retrieval-provider::admission, retrieval-provider::contract]
-//! Called-by: [tests]
+//! Called-by: [retrieval-provider::metrics, tests]
 //! Invariants: []
 //! Spec: §19
 //!

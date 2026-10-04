@@ -4,7 +4,7 @@
 //!   HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER, HUMAUX_ROLE_PASSWORD_GATEWAY, HUMAUX_ROLE_PASSWORD_MAINTENANCE,
 //!   HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER, HUMAUX_ROLE_PASSWORD_PUBLIC_WORKER, HUMAUX_ROLE_PASSWORD_RETRIEVAL_WORKER];
 //!   modules=[]
-//! Called-by: [crate(humaux-adapters), crate(humaux-consolidation-worker), crate(humaux-gateway), crate(humaux-maintenance), crate(humaux-private-worker), crate(humaux-retrieval-provider), crate(xtask), tests]
+//! Called-by: [crate(humaux-adapters), crate(humaux-admin), crate(humaux-consolidation-worker), crate(humaux-gateway), crate(humaux-maintenance), crate(humaux-private-worker), crate(humaux-retrieval-provider), crate(humaux-retrieval-worker), crate(xtask), tests]
 //! Invariants: [skip_or_fail prints a visible SKIP naming the missing object, or panics when the matching
 //!   HUMAUX_REQUIRE_* is set (a skip is not a pass, §79.2); the crate depends on no domain/adapters type;
 //!   role_login_dsn never substitutes a repository literal for a missing role password (ADR-0059 D-D)]

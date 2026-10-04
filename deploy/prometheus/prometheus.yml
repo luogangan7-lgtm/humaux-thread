@@ -1,0 +1,34 @@
+# Prometheus config for the §67.2 bundle (ADR-0061 D-G). Prometheus scrapes the app ops listeners
+# directly and owns the rules, the TSDB and alerting; nothing is remote-written into it (no write
+# receiver flag anywhere, check-compose.sh).
+# Deployer contract (rehearse.sh now, card-39 packaging later):
+#   - `__HUMAUX_GIT_SHA__` is replaced by the `value` of `humaux-admin q deploy.binary`, so every
+#     alert — the §42.1 Watchdog included — carries the deployed git sha (§67.4);
+#   - targets/*.json is written from the seven `*_METRICS_ADDR` values, one entry per resident mode
+#     with labels {job: humaux-<process>, mode: <mode>}, so ports live only in the env (D-B);
+#   - retention is the flag `--storage.tsdb.retention.time=30d` (§67.2), with
+#     `--web.listen-address=127.0.0.1:<port>`; both are in deploy/compose/observability.yml.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    git_sha: "__HUMAUX_GIT_SHA__"
+
+rule_files:
+  - invariants.rules.yml
+  - alerts.rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["127.0.0.1:9093"]
+
+scrape_configs:
+  # The app processes; the target file's `job` label overrides this job_name.
+  - job_name: humaux
+    file_sd_configs:
+      - files: ["targets/*.json"]
+  # The collector's own telemetry: a dead collector shows as up{job="otelcol"} == 0.
+  - job_name: otelcol
+    static_configs:
+      - targets: ["127.0.0.1:8888"]

@@ -1,32 +1,36 @@
-//! `admin::probe` — `humaux-admin q <name>` —— §4.4 即时探针目录。
-//! Depends-on: crates=[serde_json, sha2, time]; services=[PostgreSQL(role_admin) r=[ops.jobs, ops.outbox,
-//!   private.artifacts, projection.stream_checkpoints, public.claims, public.consensus_ready,
-//!   public.corroborated]]; env=[CARGO_PKG_NAME, CARGO_PKG_VERSION,
-//!   HUMAUX_BUILD_GIT_SHA, HUMAUX_BUILD_TIME]; modules=[admin::cell_resources]
-//! Called-by: [admin::cell_resources, admin::main]
-//! Invariants: [the probe is read-only against every table it names; it never writes ops.jobs/ops.outbox/private.artifacts itself]
-//! Spec: Baseline §4.4; §1.14; ADR-0037
+//! `admin::probe` — `humaux-admin q <name>`: the §4.4 instant probe catalog (8 Readings, 3 typed refusals).
+//! Depends-on: crates=[humaux-adapters, humaux-domain, serde_json, sha2, time, tokio]; services=[PostgreSQL(role_admin)
+//!   x=[ops.admin_probe_snapshot]]; env=[CARGO_PKG_NAME, CARGO_PKG_VERSION, HUMAUX_ADMIN_PG_DSN,
+//!   HUMAUX_BUILD_GIT_SHA, HUMAUX_BUILD_TIME]; modules=[adapters::health, adapters::postgres, admin::cell_resources,
+//!   admin::ops_status, admin::tls_expiry]
+//! Called-by: [admin::cell_resources, admin::main, admin::ops_status, admin::tls_expiry]
+//! Invariants: [the probe is read-only: every DB probe is one call of the read-only aggregate definer
+//!   ops.admin_probe_snapshot(); a Reading always has scanned_n > 0, an empty denominator is a MissingObject; a DB
+//!   probe's scope_hash covers the deployed definition of that function, read with the sample]
+//! Spec: Baseline §4.4; §1.14; ADR-0037; ADR-0061 D-J
+//! dep-map: allow table-undeclared — the table names here are probe names, refusal text and scan-scope labels; the
+//!   one SQL read is ops.admin_probe_snapshot() through adapters::health
 //!
-//! 统一输出契约（§4.4）：`{value, scanned_n, scope_hash, checked_at, probe_version}`。
+//! Unified output contract (§4.4): `{value, scanned_n, scope_hash, checked_at, probe_version}`.
 //!
-//! **本模块的唯一纪律（§4.4 坑5）**：一条探针要么**够到了它的对象**并给出读数，要么
-//! **够不到**——后者必须以非零退出码失败并**点名缺的对象**，禁止压成 `value = 0`（假事实：
-//! 「没有」）或 `scanned_n = 0`（会被 §1.14 G4 读成「机制过期」）。这条纪律由本模块的
-//! [`ProbeOutcome`] 二值枚举在类型上承载：`MissingObject` 分支**没有** `value` 字段，
-//! 所以「够不到却报了个 0」在这里写不出来；而 `Reading` 分支的 `scanned_n > 0` 由
-//! `no_probe_reports_a_reading_it_did_not_scan` 逐条守住（注错见该测试的文档注释）。
+//! **The one discipline of this module (§4.4 坑5).** A probe either **reaches its object** and gives a reading,
+//! or it **cannot** — and then it exits non-zero **naming the missing object**. It never collapses that into
+//! `value = 0` (a false "there is none") or `scanned_n = 0` (which §1.14 G4 reads as "mechanism stale"). The
+//! two-valued [`ProbeOutcome`] carries this in the type: `MissingObject` has no `value`, and every new Reading
+//! goes through [`reading`], which turns an empty denominator into a `MissingObject` naming it.
 //!
-//! 目录里 11 条探针今天的接线状态分成三档，`WIRED_PROBES` 是其中「已接线」那档的闭集：
+//! The 11 probes after ADR-0061 D-J:
 //!
-//! * `cell.resources` —— live probe，见 [`crate::cell_resources`]。
-//! * `deploy.binary` —— 编译期事实（git sha / build time / crate 版本），见 [`deploy_binary`]。
-//!   §4.4 坑4「三臂全跑旧镜像而验活全绿」正是这条探针存在的理由，所以 sha 没被烧进二进制时
-//!   它**拒绝作答**（`MissingObject`），而不是印一个 `"unknown"` 让验活继续全绿。
-//! * 其余 9 条 —— 各自点名自己缺的那个对象（见 [`missing_object`]）。它们缺的不是「代码没写」
-//!   这种笼统理由，而是本进程当下**确实没有**的那个具体东西：读能力、列、或存储。ADR-0037
-//!   记了每一条的解锁条件；本卡的 allowed-files 不含 `migrations/`、`crates/adapters/` 与
-//!   `bins/admin/Cargo.toml`，而这 9 条无一例外要动其中之一。
+//! * Readings: `stream.watermark`, `outbox.backlog`, `jobs.stuck` (one `ops.admin_probe_snapshot()` call as
+//!   `role_admin`, cross-tenant aggregates, no tenant id); `degrade.counters`, `flags.effective` (the loopback
+//!   `/status` of each `HUMAUX_ADMIN_OPS_ADDRS` entry, [`crate::ops_status`]); `tls.expiry`
+//!   ([`crate::tls_expiry`]); `deploy.binary` (compile-time facts, [`deploy_binary`]); `cell.resources`
+//!   ([`crate::cell_resources`]).
+//! * Typed refusals (§4.4 line 883 freeze, ADR-0061 E2): `public.corroborated`, `public.consensus_ready` and
+//!   `parse.poison` name the column or state that does not exist in the schema ([`missing_object`]).
 
+use humaux_adapters::health::{self, AdminProbeSample};
+use humaux_adapters::postgres::AdminDbPool;
 use serde_json::json;
 
 /// §4.4 冻结的探针名闭集（新增走 PR）。`mechanism.registry --render` 不在此列
@@ -55,15 +59,40 @@ pub(crate) const KNOWN_PROBES: [&str; 11] = [
     "cell.resources",
 ];
 
-/// 本进程今天真正接得上其对象的探针（`KNOWN_PROBES` 的子集）。其余每一条都必须走
-/// [`ProbeOutcome::MissingObject`]——由 `every_unwired_probe_names_its_missing_object`
-/// 逐条守住。**这就是本卡验收要求的 placeholder-detection 测试**：把任意一条未接线探针
-/// 改成返回读数（哪怕 `value = 0`）而不把它加进本闭集，那个测试立刻红。
+/// The probes that reach their object (a subset of `KNOWN_PROBES`). Every other one must answer
+/// [`ProbeOutcome::MissingObject`], which `every_unwired_probe_names_its_missing_object` checks name by name:
+/// turn one of the three refusals into a Reading (even `value = 0`) without listing it here ⇒ that test is red.
 ///
-/// 只在测试构建里存在：它是那道闸的台账，生产路径一个字节都不读它——接线状态在
-/// [`outcome`] 的 match 臂上，不在这张表上，两处若漂移，红的是测试而不是生产行为。
+/// Test-only ledger: the wiring itself is the match in [`outcome`]; drift between the two reds a test, never
+/// production behaviour.
 #[cfg(test)]
-const WIRED_PROBES: [&str; 2] = ["deploy.binary", "cell.resources"];
+const WIRED_PROBES: [&str; 8] = [
+    "stream.watermark",
+    "outbox.backlog",
+    "jobs.stuck",
+    "degrade.counters",
+    "flags.effective",
+    "deploy.binary",
+    "tls.expiry",
+    "cell.resources",
+];
+
+/// `stream.watermark` scan predicate description (ADR-0061 D-J). The scope hashed is this plus the deployed definition
+/// of `ops.admin_probe_snapshot()` ([`db_scope`]). Editing it without bumping `@n` and `PINNED` is red.
+const STREAM_SCOPE: &str =
+    "ops.admin_probe_snapshot()#stream_lagging|projection_highwater < issued_highwater|tenants=*";
+/// `outbox.backlog` scan predicate: undelivered = PENDING or PROCESSING over every `ops.outbox` row (E2c).
+const OUTBOX_SCOPE: &str =
+    "ops.admin_probe_snapshot()#outbox_undelivered|status IN ('PENDING','PROCESSING')|tenants=*";
+/// `jobs.stuck` scan predicate: an expired lease on a PROCESSING job over every `ops.jobs` row (E2c).
+const JOBS_SCOPE: &str = "ops.admin_probe_snapshot()#jobs_stuck|status = 'PROCESSING' AND lease_expires_at < now()|tenants=*";
+
+/// §4.4 scope of a DB probe: its predicate description plus the statement it ran, as `pg_get_functiondef` read it
+/// with the sample — a forward migration that changes a predicate changes the hash even when nobody edits the
+/// description (ADR-0061 review-fix 3, F3).
+fn db_scope(description: &str, sample: &AdminProbeSample) -> String {
+    format!("{description}|{}", sample.definition)
+}
 
 /// 一次探针的结果。**二值，没有第三种**：够到了对象（[`Self::Reading`]），或够不到并点名
 /// （[`Self::MissingObject`]）。§4.4 坑5 的类型化落点——`MissingObject` 分支不带 `value`，
@@ -156,49 +185,128 @@ fn deploy_binary_from(git_sha: Option<&str>, build_time: Option<&str>) -> ProbeO
     }
 }
 
-/// 未接线探针缺的那个**具体对象**。不是「代码没写」，是本进程当下确实没有的东西。
-/// 解锁条件逐条记在 ADR-0037。
+/// A Reading, or — when the denominator is empty — the `MissingObject` §4.4 requires: 0/0 means "not scanned",
+/// never "none" (ADR-0061 D-J). Every Reading built in this crate after ADR-0061 goes through here.
+pub(crate) fn reading(
+    value: i64,
+    scanned_n: usize,
+    scope: String,
+    version: &'static str,
+    detail: serde_json::Value,
+    denominator: &str,
+) -> ProbeOutcome {
+    match i64::try_from(scanned_n) {
+        Ok(scanned_n) if scanned_n > 0 => ProbeOutcome::Reading {
+            value,
+            scanned_n,
+            scope,
+            version,
+            detail,
+        },
+        _ => ProbeOutcome::MissingObject(format!("{denominator} has no rows — nothing scanned")),
+    }
+}
+
+/// The three probes whose object does not exist in the schema (§4.4 line 883 freeze; ADR-0061 E2).
 fn missing_object(name: &str) -> String {
-    // 这三个是本仓当下的三堵墙，9 条探针每条至少撞其中一堵。写在一处，免得 9 份手抄副本。
-    const NO_READ_CAPABILITY: &str = "this process has no read capability for it: `role_admin` holds only the §6.2.2 \
-         observation SELECT grants, and G80-40 confines `sqlx::PgPool` to \
-         crates/adapters/src/postgres.rs, so `humaux-admin` has no query surface for it either \
-         (ADR-0037)";
     match name {
-        "public.corroborated" => format!(
-            "public.claims.corroboration — {NO_READ_CAPABILITY}; and §7.6 freezes that column as \
-             GA-建, so it does not exist in the schema yet either (§4.4: 列尚未建时探针必须以非零 \
-             退出码失败并打印缺的列名)"
-        ),
-        "public.consensus_ready" => format!(
-            "public.claims.contributor_set — {NO_READ_CAPABILITY}; and §7.6 freezes that column \
-             as GA-建, so it does not exist in the schema yet either"
-        ),
-        "stream.watermark" => format!("projection.stream_checkpoints — {NO_READ_CAPABILITY}"),
-        "outbox.backlog" => format!("ops.outbox — {NO_READ_CAPABILITY}"),
-        "jobs.stuck" => format!("ops.jobs — {NO_READ_CAPABILITY}"),
-        "parse.poison" => format!("private.artifacts — {NO_READ_CAPABILITY}"),
-        "degrade.counters" => "the §53 DegradeCode counter store — `degrade_total{code}` is an \
-             in-process counter with no process-external store, so no second process can read \
-             another's counts at all (ADR-0037)"
+        "public.corroborated" => "public.claims.corroboration — §7.6 freezes that column as GA-建 and it does \
+             not exist in the schema yet (§4.4: while the column is absent the probe must exit non-zero naming it)"
             .to_owned(),
-        "flags.effective" => "the effective-flag registry — it is built per process inside \
-             `humaux_gateway::bootstrap` (`resolve_effective_config`) and is not published \
-             anywhere `humaux-admin` can read; §4.4 坑4 wants the EFFECTIVE value, which by \
-             construction only the process that resolved it holds (ADR-0037)"
+        "public.consensus_ready" => "public.claims.contributor_set — §7.6 freezes that column as GA-建 and it \
+             does not exist in the schema yet (§4.4)"
             .to_owned(),
-        "tls.expiry" => "the TLS certificate store — no certificate path is configured for this \
-             process, and `humaux-admin` links no X.509 parser (ADR-0037)"
+        "parse.poison" => "private.artifacts POISON state / limit_hit column — no parse-poison state or \
+             limit_hit column exists anywhere in the schema (ADR-0061 E2)"
             .to_owned(),
         other => format!("{other} is in the catalog but has no outcome arm"),
     }
 }
 
-/// 一条探针的结果——**纯函数除 `cell.resources` 外**（那条要 DNS/网络，见 [`run`]）。
-/// 单元测试直接调它，不经进程。
+/// One `ops.admin_probe_snapshot()` read as `role_admin` (`HUMAUX_ADMIN_PG_DSN`).
+fn admin_sample() -> Result<AdminProbeSample, String> {
+    let dsn = std::env::var("HUMAUX_ADMIN_PG_DSN").map_err(|_| {
+        "HUMAUX_ADMIN_PG_DSN (a role_admin login; required for this probe)".to_owned()
+    })?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("a tokio runtime: {e}"))?;
+    runtime.block_on(async {
+        // dep: PostgreSQL(role_admin) — opens the read-only role_admin pool
+        let pool = AdminDbPool::connect(&dsn)
+            .await
+            .map_err(|e| format!("PostgreSQL as role_admin (HUMAUX_ADMIN_PG_DSN): {e}"))?;
+        // dep: PostgreSQL(role_admin) — ops.admin_probe_snapshot(), the 0210 aggregate definer, via adapters::health
+        health::read_admin_probe_snapshot(&pool)
+            .await
+            .map_err(|e| format!("ops.admin_probe_snapshot() as role_admin: {e}"))
+    })
+}
+
+/// The three DB probes over one aggregate row; pure so each arm is testable without a database.
+fn from_admin_sample(name: &str, s: &AdminProbeSample) -> ProbeOutcome {
+    let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let size = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
+    match name {
+        "stream.watermark" => {
+            let families: Vec<_> = s
+                .streams
+                .iter()
+                .map(|f| {
+                    json!({
+                        "family": f.family.domain(),
+                        "streams": f.streams,
+                        "lagging": f.lagging,
+                        "lag_total": f.lag_total,
+                        "lag_max": f.lag_max,
+                    })
+                })
+                .collect();
+            reading(
+                n(s.streams.iter().map(|f| f.lagging).sum()),
+                size(s.streams.iter().map(|f| f.streams).sum()),
+                db_scope(STREAM_SCOPE, s),
+                "stream.watermark@1",
+                json!({
+                    "lag_total": s.streams.iter().map(|f| f.lag_total).sum::<u64>(),
+                    "lag_max": s.streams.iter().map(|f| f.lag_max).max(),
+                    "families": families,
+                }),
+                "projection.stream_checkpoints",
+            )
+        }
+        "outbox.backlog" => reading(
+            n(s.outbox_undelivered),
+            size(s.outbox_total),
+            db_scope(OUTBOX_SCOPE, s),
+            "outbox.backlog@1",
+            json!({ "oldest_undelivered_age_seconds": s.outbox_oldest_undelivered_age_seconds }),
+            "ops.outbox",
+        ),
+        "jobs.stuck" => reading(
+            n(s.jobs_stuck),
+            size(s.jobs_total),
+            db_scope(JOBS_SCOPE, s),
+            "jobs.stuck@1",
+            json!({ "in_lease": s.jobs_in_lease }),
+            "ops.jobs",
+        ),
+        other => ProbeOutcome::MissingObject(missing_object(other)),
+    }
+}
+
+/// One probe's result. `cell.resources` renders its own envelope and is dispatched in [`run`].
 pub(crate) fn outcome(name: &str) -> ProbeOutcome {
     match name {
         "deploy.binary" => deploy_binary(),
+        "stream.watermark" | "outbox.backlog" | "jobs.stuck" => match admin_sample() {
+            Ok(sample) => from_admin_sample(name, &sample),
+            Err(missing) => ProbeOutcome::MissingObject(missing),
+        },
+        "degrade.counters" => crate::ops_status::degrade_counters(),
+        "flags.effective" => crate::ops_status::flags_effective(),
+        "tls.expiry" => crate::tls_expiry::run(),
         other => ProbeOutcome::MissingObject(missing_object(other)),
     }
 }
@@ -234,8 +342,15 @@ fn render(name: &str, outcome: ProbeOutcome) -> i32 {
     }
 }
 
-/// 跑一次探针；返回进程退出码。
-pub fn run(name: &str, _args: &[String]) -> i32 {
+/// Runs one probe; returns the process exit code (0 Reading, 1 MissingObject, 2 usage).
+pub fn run(name: &str, args: &[String]) -> i32 {
+    // ADR-0061 D-J: the `--arg k=v` slot takes no key in this catalog version, so any argument is a usage error.
+    if let Some(arg) = args.first() {
+        eprintln!(
+            "q {name}: usage — unknown argument {arg:?}: no probe in this catalog takes an argument"
+        );
+        return 2;
+    }
     if !KNOWN_PROBES.contains(&name) {
         eprintln!(
             "q {name}: fail — missing object: not in §4.4 probe catalog (known: {})",
@@ -255,28 +370,198 @@ pub fn run(name: &str, _args: &[String]) -> i32 {
 mod tests {
     use super::*;
 
-    /// §4.4 坑5 的守卫，也是本卡验收点名的 fault-injection 测试。
-    ///
-    /// 注错：把 [`missing_object`] 覆盖的任意一条改成
-    /// `ProbeOutcome::Reading { value: 0, scanned_n: 0, .. }`（「够不到 ⇒ 报 0」这个正是坑5
-    /// 的形状）⇒ 本测试红，因为 `scanned_n == 0` 在本模块里没有合法读数含义。
+    /// §4.4 坑5: an empty denominator is never a Reading. Fault: let [`reading`] build a Reading at
+    /// `scanned_n == 0` ⇒ red.
     #[test]
     fn no_probe_reports_a_reading_it_did_not_scan() {
-        for name in KNOWN_PROBES {
-            if name == "cell.resources" {
-                continue; // live 探针，见 `run`
-            }
-            if let ProbeOutcome::Reading {
-                scanned_n, scope, ..
-            } = outcome(name)
-            {
-                assert!(
-                    scanned_n > 0,
-                    "{name}: scanned_n == 0 是「没扫到」，不是读数（§4.4 坑5）"
-                );
-                assert!(!scope.is_empty(), "{name}: 读数必须带可比的扫描域（§4.4）");
-            }
+        let ProbeOutcome::MissingObject(m) =
+            reading(0, 0, "s".into(), "x@1", json!({}), "ops.jobs")
+        else {
+            panic!("0/0 is \"not scanned\", never a reading (§4.4 坑5)");
+        };
+        assert_eq!(m, "ops.jobs has no rows — nothing scanned");
+        assert!(matches!(
+            reading(0, 3, "s".into(), "x@1", json!({}), "ops.jobs"),
+            ProbeOutcome::Reading { scanned_n: 3, .. }
+        ));
+    }
+
+    fn sample() -> AdminProbeSample {
+        use humaux_adapters::health::StreamFamilyLag;
+        use humaux_domain::ticket_family::TicketFamily;
+        AdminProbeSample {
+            as_of: time::OffsetDateTime::UNIX_EPOCH,
+            streams: vec![StreamFamilyLag {
+                family: TicketFamily::PrivateMemory,
+                streams: 2,
+                lagging: 1,
+                lag_total: 6,
+                lag_max: 6,
+            }],
+            outbox_total: 4,
+            outbox_undelivered: 2,
+            outbox_oldest_undelivered_age_seconds: Some(9.0),
+            jobs_total: 3,
+            jobs_stuck: 1,
+            jobs_in_lease: 1,
+            definition: "CREATE OR REPLACE FUNCTION ops.admin_probe_snapshot() … j.lease_expires_at < now() …"
+                .to_owned(),
         }
+    }
+
+    /// The three DB arms map the aggregate row onto (value, `scanned_n`) as ADR-0061 D-J's table says. Fault: use
+    /// `outbox_total` as the jobs denominator ⇒ red.
+    #[test]
+    fn db_probes_map_value_and_denominator() {
+        for (name, want) in [
+            ("stream.watermark", (1, 2)),
+            ("outbox.backlog", (2, 4)),
+            ("jobs.stuck", (1, 3)),
+        ] {
+            let ProbeOutcome::Reading {
+                value, scanned_n, ..
+            } = from_admin_sample(name, &sample())
+            else {
+                panic!("{name}: a non-empty sample is a reading");
+            };
+            assert_eq!((value, scanned_n), want, "{name}");
+        }
+        let empty = AdminProbeSample {
+            streams: vec![],
+            jobs_total: 0,
+            ..sample()
+        };
+        for (name, object) in [
+            ("stream.watermark", "projection.stream_checkpoints"),
+            ("jobs.stuck", "ops.jobs"),
+        ] {
+            let ProbeOutcome::MissingObject(m) = from_admin_sample(name, &empty) else {
+                panic!("{name}: an empty table is not scanned");
+            };
+            assert!(m.starts_with(object), "{m}");
+        }
+    }
+
+    /// ADR-0061 review-fix 3 (F3): the three DB probes hash the deployed statement, not only their description: a
+    /// redefinition of `ops.admin_probe_snapshot()` changes each `scope_hash`, an identical one keeps it. Fault: hash
+    /// the description only ⇒ red.
+    #[test]
+    fn db_scope_hashes_follow_the_deployed_definition() {
+        let changed = AdminProbeSample {
+            definition: sample()
+                .definition
+                .replace("j.lease_expires_at < now()", "j.lease_expires_at <= now()"),
+            ..sample()
+        };
+        for name in ["stream.watermark", "outbox.backlog", "jobs.stuck"] {
+            let hash = |s: &AdminProbeSample| match from_admin_sample(name, s) {
+                ProbeOutcome::Reading { scope, .. } => scope_hash(&scope),
+                ProbeOutcome::MissingObject(m) => panic!("{name}: {m}"),
+            };
+            assert_eq!(hash(&sample()), hash(&sample()), "{name}");
+            assert_ne!(
+                hash(&sample()),
+                hash(&changed),
+                "{name}: a redefined statement kept its scope_hash"
+            );
+        }
+    }
+
+    /// T-J11: `probe_version` and the scope hash of every pinned predicate description. Fault: edit a predicate
+    /// constant without bumping `@n` and this pin ⇒ red.
+    #[test]
+    fn pinned_probe_versions_and_scope_hashes() {
+        const PINNED: [(&str, &str, &str); 6] = [
+            (
+                "stream.watermark",
+                "stream.watermark@1",
+                "b902b0bf0bc5d0411ff3fb34e58e63855bb67cab2304431abadcf5789f62ab8d",
+            ),
+            (
+                "outbox.backlog",
+                "outbox.backlog@1",
+                "a560d25100719588cbd05ef5159e4017d3e1fcb201c0e5a2be6d01e3ec5a0e7c",
+            ),
+            (
+                "jobs.stuck",
+                "jobs.stuck@1",
+                "51616b4ecc70c4541230d8d52ef4eee6b59b019ca059c8fd69181c8738bf3d86",
+            ),
+            (
+                "degrade.counters",
+                "degrade.counters@1",
+                "d750fb19123972c15abb4b177fee802a4e6fdff7ad2a438c724bcd9f784cc1c7",
+            ),
+            (
+                "flags.effective",
+                "flags.effective@1",
+                "5c8009750e249f7cc1288adbe02cb8e7b84cb5d1b9df3591cfaa7161032b6d3a",
+            ),
+            (
+                "tls.expiry",
+                "tls.expiry@1",
+                "17e475dd788d75001e99e964f8eabf84ad18aca1b800838e5d3558215f61f0bc",
+            ),
+        ];
+        let live = [
+            (
+                STREAM_SCOPE,
+                version_of(from_admin_sample("stream.watermark", &sample())),
+            ),
+            (
+                OUTBOX_SCOPE,
+                version_of(from_admin_sample("outbox.backlog", &sample())),
+            ),
+            (
+                JOBS_SCOPE,
+                version_of(from_admin_sample("jobs.stuck", &sample())),
+            ),
+            (crate::ops_status::DEGRADE_SCOPE, "degrade.counters@1"),
+            (crate::ops_status::FLAGS_SCOPE, "flags.effective@1"),
+            (crate::tls_expiry::SCOPE, "tls.expiry@1"),
+        ];
+        for ((name, version, hash), (scope, live_version)) in PINNED.into_iter().zip(live) {
+            assert_eq!(live_version, version, "{name}");
+            assert_eq!(
+                scope_hash(scope),
+                format!("sha256:{hash}"),
+                "{name}: predicate changed without a version bump"
+            );
+        }
+    }
+
+    fn version_of(o: ProbeOutcome) -> &'static str {
+        match o {
+            ProbeOutcome::Reading { version, .. } => version,
+            ProbeOutcome::MissingObject(m) => panic!("{m}"),
+        }
+    }
+
+    /// T-J12: the `q` set is exactly the 11 §4.4 names, each either wired or one of the three typed refusals.
+    #[test]
+    fn the_catalog_is_eleven_names_eight_wired_three_refused() {
+        let mut names = KNOWN_PROBES.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 11);
+        let refused: Vec<_> = KNOWN_PROBES
+            .into_iter()
+            .filter(|n| !WIRED_PROBES.contains(n))
+            .collect();
+        assert_eq!(
+            refused,
+            [
+                "public.corroborated",
+                "public.consensus_ready",
+                "parse.poison"
+            ]
+        );
+    }
+
+    /// The `--arg` slot takes no key yet: any argument is a usage error (exit 2), not a silently ignored flag.
+    #[test]
+    fn an_argument_is_a_usage_error() {
+        assert_eq!(run("deploy.binary", &["--arg".into(), "k=v".into()]), 2);
     }
 
     /// placeholder-detection：未接线的探针**必须**点名它缺的对象，不许悄悄变成一个读数。

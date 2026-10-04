@@ -16,17 +16,24 @@ workspace = true
 # check (`xtask architecture-check`) freezes that crate's dependent-manifest set to exactly
 # `{crates/infra-egress/Cargo.toml, crates/infra-cell/Cargo.toml}`; this crate reaches
 # `reqwest`'s types only transitively, through `humaux-infra-cell`'s own re-export.
-# why: same-Cell transport and CellAccessPermit for Qdrant/UDS calls; used-by: [admin::cell_resources]
+# why: same-Cell transport and CellAccessPermit for Qdrant/UDS calls, and its response cap; used-by: [admin::cell_resources, admin::ops_status]
 humaux-infra-cell = { path = "../../crates/infra-cell" }
 # why: typed PG pools, repositories and wire adapters this package drives; used-by: [admin::mechanism]
 humaux-adapters = { path = "../../crates/adapters" }
 # why: config/feature/mechanism registries and contract types; used-by: [admin::mechanism, admin::render]
 humaux-contracts = { path = "../../crates/contracts" }
+# §4.4 `degrade.counters`: the closed `DegradeCode::ALL` set a process `/status` must carry in full (ADR-0061 D-J).
+# why: DegradeCode closed set; used-by: [admin::ops_status]
+humaux-telemetry = { path = "../../crates/telemetry" }
+# §4.4 `tls.expiry`: X.509 notAfter from PEM files; `der`/`spki`/`pem-rfc7468` are already in the tree (ADR-0061 D-J).
+# why: X.509 certificate parsing (notAfter); used-by: [admin::tls_expiry]
+x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
 # `HttpIntraCellTransport::execute` is async; `main` stays sync (this binary has exactly one
 # probe that needs a runtime so far) — `cell_resources::run` opens a small dedicated runtime
 # rather than making every subcommand async.
+# `net` + `time`: the connect-level UDS reachability of the two socket resources (ADR-0061 D-J, B1).
 # why: async runtime; used-by: [admin::cell_resources, admin::mechanism]
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "time"] }
 # §4.4 envelope `{value, scanned_n, scope_hash, checked_at, probe_version}` plus this probe's
 # per-resource breakdown — same JSON shape every adapter in this workspace already emits with.
 # why: JSON payloads and envelopes; used-by: [admin::cell_resources, admin::probe]
@@ -40,3 +47,11 @@ time = { version = "0.3", features = ["formatting"] }
 # `HUMAUX_CELL_ID` env var parsing.
 # why: UUID ids (v7) and parsing; used-by: [admin::cell_resources, tests]
 uuid = "1.25.0"
+
+[dev-dependencies]
+# why: TicketFamily in the probe-row fixtures; used-by: [admin::probe, tests]
+humaux-domain = { path = "../../crates/domain" }
+# why: the §79.2 three-state skip contract and role login DSNs (skip_or_fail, role_login_dsn); used-by: [tests]
+humaux-testkit = { path = "../../crates/testkit" }
+# why: owner-DSN fixtures seeding the throwaway database; used-by: [tests]
+postgres = { version = "0.19", features = ["with-uuid-1"] }

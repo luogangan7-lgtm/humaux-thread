@@ -23,9 +23,62 @@ write derives (tenant, workspace) per request, and the two `REMEMBER_TENANT_ID` 
 | `humaux-private-worker` | process alive | `--readyz` exit 0 | `--serve-rpc` / `--distill-serve` yes |
 | `humaux-consolidation-worker` | process alive | `--readyz` exit 0 | `--serve` yes |
 | `humaux-public-worker` | process alive | `--readyz` exit 0 | no — one bounded pass per invocation |
-| `humaux-maintenance` | — | — | no — CLI mode only (card 28); the resident `--serve` job is card 35 |
+| `humaux-maintenance` | `health serve`: process alive | `health serve`: `GET /metrics` on its ops address → 200 / 503 | `health serve` yes (card 34, ADR-0061 D-D); every other subcommand no (card 28); the resident `--serve` job is card 35 |
 
-`humaux-maintenance` (§4.2, the operator-write process) is not supervised: every subcommand
+`humaux-maintenance health serve` (ADR-0061 D-D) **is** a supervised unit: the one process that samples
+the §41.2 SQL-derived health gauges (`jobs_*`, `oldest_pending_age_seconds`, `projection_lag_events`,
+`processing_gap_count`, `data_disclosures_*`) through `ops.health_snapshot()` as `role_maintenance`,
+every `HUMAUX_MAINTENANCE_HEALTH_SAMPLE_SECONDS`, and serves the last sample on the loopback
+`HUMAUX_MAINTENANCE_HEALTH_SERVE_METRICS_ADDR` (`/metrics`, `/status`). Both keys are required, with no
+default. The first sample is taken before the port binds, so a boot that cannot sample exits non-zero
+naming the failure. A scrape never runs SQL. A failed sample, or one older than 2 × the interval, makes
+`/metrics` answer 503 with the reason and the age — never the last good values. Run exactly one
+instance: two would export every gauge twice.
+
+### Ops listeners: `/metrics` and `/status` (card 34, ADR-0061 D-B)
+
+Every resident mode opens one **loopback** ops listener on its own required key — one key per
+mode, never per binary, because two modes of one binary run at the same time from one environment.
+It serves `GET /metrics` (Prometheus text format 0.0.4, every label value pre-seeded at 0 so the
+first scrape already has a sample per family) and `GET /status` (JSON: `process`, `mode`,
+`crate_version`, `git_sha`, `started_at`, `uptime_seconds`, the 11 `degrade` codes with their count
+and `last_fired_at`; the gateway adds `accepting`, `readiness` and `effective_config`, where a
+secret entry carries `secret: true` and never a value). A non-loopback or missing address is
+boot-fatal naming the key; there is no default port and no fallback to `:0`. One-shot modes
+(`--readyz`, `--run-once`, `--distill-once`, every other maintenance subcommand) open nothing.
+
+| process / mode | ops key | families on `/metrics` |
+|---|---|---|
+| gateway | `HUMAUX_GATEWAY_METRICS_ADDR` | 9: `degrade_total`, `humaux_retrieval_requests_total`, `retrieval_completeness_total`, the six guard families |
+| retrieval-worker `--serve-rpc` | `HUMAUX_RETRIEVAL_WORKER_SERVE_RPC_METRICS_ADDR` | 4 `retrieval_provider_*` |
+| retrieval-worker `--serve` | `HUMAUX_RETRIEVAL_WORKER_SERVE_METRICS_ADDR` | 4 `retrieval_provider_*` |
+| private-worker `--serve-rpc` | `HUMAUX_PRIVATE_WORKER_SERVE_RPC_METRICS_ADDR` | none yet (card 34b) — `up` is its liveness |
+| private-worker `--distill-serve` | `HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR` | none yet (card 34b) |
+| consolidation-worker `--serve` | `HUMAUX_CONSOLIDATION_WORKER_SERVE_METRICS_ADDR` | none yet (card 34b) |
+| maintenance `health serve` | `HUMAUX_MAINTENANCE_HEALTH_SERVE_METRICS_ADDR` | 9 SQL-derived gauges / counters |
+
+`/metrics` and `/status` are **never** on the gateway's `BIND_ADDR` (the MCP surface behind the
+reverse proxy): anything mounted there is reachable through the proxy. `BIND_ADDR` keeps `/livez`
+and `/readyz`, whose body is a status word only. Each binary prints its zero-state exposition with
+`--metrics-families` before reading any configuration; `cargo xtask metrics-registry --check` uses
+exactly that to prove every exported family is a §41.2 row.
+
+### The gateway's `/readyz` is dependency-truthful (ADR-0061 D-F, ruling E15)
+
+A background task refreshes a readiness snapshot every `HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS`
+(required, > 0); the first snapshot is taken before the listener accepts. Each check is bounded by
+that interval: `pg` (`SELECT 1` as `role_gateway`), `retrieval_rpc` (a real
+`GET /internal/v1/retrieval/readyz` round trip over the recall socket; the worker answers from one
+fresh `role_retrieval_worker` connection and never calls the embedding provider) and `qdrant`
+(the gateway's own Qdrant cell resource). With semantic recall disabled the last two are
+`not_applicable`. `/readyz` answers 200 `{"status":"ready"}` only while the gateway accepts, every
+dependency is `pass` or `not_applicable` and the snapshot is at most 2 × the interval old;
+otherwise 503 with `{"status":"not_ready"}`, `{"status":"stale"}` or `{"status":"draining"}`. The
+body never names a dependency, a path or an error — those are in the loopback `/status`
+(`readiness`: per dependency `state`, `checked_at`, `age_seconds`, `missing_object`). Probe
+`/readyz` no faster than the refresh interval buys you nothing: a probe reads the cached snapshot.
+
+Every other `humaux-maintenance` subcommand (§4.2, the operator-write process) is not supervised: every subcommand
 (`deploy-init`, `onboard tenant|workspace|user`, `apikey issue|revoke`, `placement ensure`,
 `collection ensure`, `activate`, `status`) is one-shot, idempotent and prints one JSON receipt;
 exit `0` created/existing, `3` refused with a named reason, `2` usage, `1` infrastructure (the
@@ -56,10 +109,15 @@ never report a healthy-but-empty reading — §4.4 坑5, "没有" ≠ "没扫到
 |---|---|---|
 | `/livez` connection refused | the gateway process is gone or never bound | restart; check bootstrap stderr for the missing configuration key. A default write pair is **not** one of them since card 29 (ADR-0054): `HUMAUX_GATEWAY_REMEMBER_TENANT_ID` / `_WORKSPACE_ID` are optional and ignored (a present value must still be a UUID — a malformed one is the only way they fail boot) |
 | `/readyz` → 503 `draining` | SIGTERM was received; the process is finishing in-flight requests | take it out of rotation; do **not** restart it, it will exit on its own |
+| `/readyz` → 503 `not_ready` | a dependency is down: PostgreSQL as `role_gateway`, the retrieval worker's RPC round trip, or Qdrant | **do not restart the gateway** — it is healthy and will turn ready by itself on the next refresh after the dependency returns. On a single node (§67.2) **do not route on it either**: nothing else can take the traffic, and recall already degrades to `LaneSubstituted` while remember / memory.get keep working. Read `curl -fsS 127.0.0.1:<HUMAUX_GATEWAY_METRICS_ADDR port>/status` — `readiness.<dep>.missing_object` names what is down — and fix that. Liveness (`/livez`) is the restart signal, never `/readyz` |
+| `/readyz` → 503 `stale` | the readiness refresh task has not produced a snapshot for more than 2 × `HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS` | a stuck refresh is a gateway fault: capture `/status`, then restart the gateway |
+| an ops `/metrics` connection refused | the process is down or never bound its ops key (boot stderr names the key) | Prometheus shows `up{job,mode} == 0` for it; restart per §3 |
 | `/readyz` connection refused, `/livez` too | the drain window already elapsed, or the process died | treat as gone; restart per §3 |
 | `--readyz` names `PostgreSQL as role_*` | the DB is down, the DSN is wrong, or the role does not exist / does not match `current_user` | do not restart the worker in a loop — it will fail identically. Fix PostgreSQL or the DSN first |
 | `--readyz` names `the Qdrant cell resource` | Qdrant is down, or its address no longer resolves inside the registered Cell CIDR (§83.4) | check Qdrant, then `humaux-admin q cell.resources` for the declaration-vs-reality breakdown |
 | `--readyz` names `the private worker's inference RPC socket` | the private worker is not running, or is running as a different OS user / with a different socket path | start the private worker first (§4 start order); check the socket path and its owner |
+| `health serve` `/metrics` → 503 `health sample failed: …` | the last `ops.health_snapshot()` call failed: PostgreSQL is down, the DSN is wrong, or `role_maintenance` lost EXECUTE on the function (the body names it) | do not restart in a loop: the process keeps sampling and returns to 200 by itself on the next good sample. Fix PostgreSQL or the grant. Meanwhile Prometheus marks the gauges stale, and `HealthGaugesAbsent` fires after 2 min |
+| `health serve` `/metrics` → 503 `health sample stale` | no good sample for more than 2 × the interval (each sample is bounded by the interval) | as above; if it persists while PostgreSQL is healthy, restart the unit |
 | `humaux-admin q <name>` exits non-zero with `missing object` | the probe could not reach its object **at all** | that is data, not a bug: the named object is what has to exist before the probe can answer. See §5 |
 
 ### `humaux-maintenance deploy-check` (ADR-0059 D-F; run before traffic and after every rotation)
@@ -100,6 +158,7 @@ that path, precisely so a `0` can never be manufactured downstream.
 | `humaux-private-worker --serve-rpc` | always restart | ≥ one inference call |
 | `humaux-private-worker --distill-serve` | always restart | **≥ one distill job** = `HTTP_TIMEOUT_SECS` + one `DISTILL_LEASE_SECS` (ADR-0058) |
 | `humaux-consolidation-worker --serve` | always restart | **≥ one dispatch pass** |
+| `humaux-maintenance health serve` | always restart | ≥ one sample = `HUMAUX_MAINTENANCE_HEALTH_SAMPLE_SECONDS` (each sample is bounded by it); SIGTERM / Ctrl-C exit 0 after the sample in hand |
 | `humaux-public-worker --run-once` | on-failure only; it is a scheduled one-shot, exit 0 is success | ≥ one outbox pass |
 
 The bolded rows are the ones that matter. The resident derived-layer workers and the projection
@@ -177,7 +236,8 @@ Qdrant ──────┘
              ├─> humaux-private-worker --serve-rpc ─────> humaux-consolidation-worker --serve
              │        (binds the inference UDS)             (dials it)
              ├─> humaux-private-worker --distill-serve
-             └─> humaux-public-worker --run-once   (scheduled; needs Qdrant + PostgreSQL only)
+             ├─> humaux-public-worker --run-once   (scheduled; needs Qdrant + PostgreSQL only)
+             └─> humaux-maintenance health serve   (PostgreSQL only; migration 0210 applied)
 ```
 
 Rules:
@@ -231,11 +291,23 @@ Deployment check, per host: `ps -o user,comm` over the four must print four dist
 or exits non-zero having **named the object it could not reach**. There is no third answer, and
 `value = 0` is never how a probe reports "I could not look".
 
-| probe | today |
-|---|---|
-| `cell.resources` | live: DNS + a real intra-Cell HTTP call, cross-checked against the §83.4 registry declaration |
-| `deploy.binary` | live: the git sha / build time burned in at compile time, plus the crate version |
-| the other 9 | each names the specific object it lacks (a column that is GA-建 and not yet migrated, a read grant this process does not hold, a counter store that does not exist outside the emitting process). ADR-0037 §"What is not wired" lists the unlock condition for each |
+Since card 34 (ADR-0061 D-J, ruling E2): **8 Readings and 3 refusals that name their object.**
+
+| probe | today | needs |
+|---|---|---|
+| `stream.watermark` | streams whose projection highwater is behind the issued one, of all streams | `HUMAUX_ADMIN_PG_DSN` (`role_admin`; one call of the aggregate definer `ops.admin_probe_snapshot()`) |
+| `outbox.backlog` | undelivered rows, of the whole outbox (detail: oldest undelivered age) | the same |
+| `jobs.stuck` | `PROCESSING` jobs with an expired lease, of all jobs (detail: in-lease count) | the same |
+| `degrade.counters` | Σ `degrade_total` over every listed process (detail: per code and process, `last_fired_at`) | `HUMAUX_ADMIN_OPS_ADDRS` = `name=127.0.0.1:port,…`; one unreachable process refuses the probe, never a partial sum |
+| `flags.effective` | gateway `effective_config` entries whose source is `env`, of all entries | the same, with exactly one gateway entry |
+| `deploy.binary` | the git sha / build time burned in at compile time, plus the crate version | — |
+| `tls.expiry` | certificate files inside the 21-day WARN window, of the files listed | `HUMAUX_ADMIN_TLS_CERT_PATHS` |
+| `cell.resources` | healthy resources of all three `IntraCellResource`s: `QDRANT_REST` by DNS + a real intra-Cell HTTP call cross-checked against the §83.4 registry declaration; `RETRIEVAL_EMBEDDING_RPC` / `PRIVATE_INFERENCE_RPC` by a connect to their Unix socket (2 s; the listener accepting is "reachable" — the peer-uid check after accept is not probed). `detail.unhealthy` names the rest | `HUMAUX_CELL_*`, `HUMAUX_QDRANT_*`, `HUMAUX_ADMIN_RETRIEVAL_RPC_SOCKET_PATH`, `HUMAUX_ADMIN_PRIVATE_INFERENCE_RPC_SOCKET_PATH` (the paths given to the gateway / the private worker; a missing key refuses, naming it) |
+| `public.corroborated` / `public.consensus_ready` | exit non-zero naming `public.claims.corroboration` / `public.claims.contributor_set` (§4.4 freeze: those columns do not exist) | — |
+| `parse.poison` | exit non-zero naming the `limit_hit` column (no POISON state exists anywhere) | — |
+
+An empty denominator table is a refusal naming the table (`… has no rows — nothing scanned`), never
+`0/0`.
 
 `deploy.binary` answers only when the build burned in the git sha (build-time variables of
 `admin::build`, see env_vars.md). `bins/admin/build.rs` fills it from `git rev-parse HEAD` when the build
@@ -273,3 +345,20 @@ gateway (`periodSeconds` below the 5 s drain window, so the draining state is ac
 `exec: ["…-worker", "--readyz"]` as `readinessProbe` for the workers.
 `terminationGracePeriodSeconds` must exceed one pass for the two resident derived workers, and
 the drain window plus the longest request for the gateway.
+
+## 8. Observability units (§67.2, ADR-0061 D-G)
+
+Three more supervised units on the same host, every listener on loopback by an **explicit** flag:
+
+| unit | listen | notes |
+|---|---|---|
+| Prometheus | `--web.listen-address=127.0.0.1:9090`, `--storage.tsdb.retention.time=30d` | scrapes the seven ops listeners above (`targets/*.json`, written by the deployer from the seven `*_METRICS_ADDR` values, labels `{job: humaux-<process>, mode: <mode>}`) and the collector; loads `invariants.rules.yml` + `alerts.rules.yml`; **no** remote-write / OTLP receiver, admin or lifecycle flag (`deploy/prometheus/check-compose.sh` refuses them); reload = SIGHUP |
+| Alertmanager | `--web.listen-address=127.0.0.1:9093 --cluster.listen-address=` (empty: no gossip listener) | default route → the log sink, `Watchdog` → its own receiver every 5 min; both URLs come from `url_file`s outside the repo |
+| OTel Collector (core) | OTLP `127.0.0.1:4317/4318`, own telemetry `127.0.0.1:8888` | terminates OTLP at `debug`; carries no application traffic until an SDK producer exists; `up{job="otelcol"}` is its liveness |
+
+Restart policy: always restart, each. Start them after PostgreSQL and before traffic; they depend on
+nothing in the app. Prometheus's `prometheus.yml` carries `external_labels.git_sha:
+"__HUMAUX_GIT_SHA__"`: the deployer **must** replace it with the `git_sha` of
+`humaux-admin q deploy.binary`, so the Watchdog ping names the running revision (§42.1, §67.4).
+Verification is runbook §7. The rehearsal (`docs/ops/rehearse.sh` steps `observability`,
+`metrics_scrape`, `alert_drill`) runs the same configs from the pinned host binaries.

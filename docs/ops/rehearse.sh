@@ -1,5 +1,10 @@
 #!/bin/zsh
 # 部署点演练驱动（本机四进程；真 DashScope + 真 MiniMax）。密钥只 source 进对应子 shell；任何输出不含 bearer/key。
+# Verifies one deployment on this host, step by step: seed and onboarding, the resident processes and
+# their probes, the observability bundle (Prometheus / Alertmanager / collector from the pinned
+# binaries, ADR-0061 D-K), traffic with named assertions, metrics_scrape / admin_probes / alert_drill,
+# and the soak when SOAK_SECS is set. Every process is started and signalled only through its pidfile.
+# Exit: 0 = REHEARSAL VERDICT with 0 failed; 1 = an assertion failed; 2 = usage or missing configuration.
 set -u
 S=${HUMAUX_REHEARSE_WORK:-${TMPDIR:-/tmp}/humaux-rehearsal}   # work dir: pidfiles, helpers, evidence (override with HUMAUX_REHEARSE_WORK)
 EV=$S/e2e_evidence; SOCK=/tmp/hq-e2e; mkdir -p $EV $SOCK
@@ -96,9 +101,10 @@ PGQ() { docker exec humaux-thread-pg psql -U postgres -d $DB -Atc "$1"; }
 mcp() { # $1=tool $2=arguments-json ; prints http_code + body (body may contain memory ids only)
   local id=$RANDOM
   local body="{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2,\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"rehearsal\",\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}"
-  curl -s -w '\nHTTP %{http_code}\n' -X POST "http://127.0.0.1:8080/mcp" \
+  local gw=${GW_URL:-http://127.0.0.1:8080}   # ADR-0061 D-K: a scratch gateway sets GW_URL
+  curl -s -w '\nHTTP %{http_code}\n' -X POST "$gw/mcp" \
     -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tools/call' -H "Mcp-Name: $1" \
-    -H 'Origin: http://127.0.0.1:8080' -H "Authorization: Bearer $BEARER" --data "$body"
+    -H "Origin: $gw" -H "Authorization: Bearer $BEARER" --data "$body"
 }
 
 # Same request, a different principal's bearer. zsh `local` is dynamically scoped, so the
@@ -148,7 +154,9 @@ except Exception as e: print('0 unparsed(%s)' % type(e).__name__)")
 # ---------- 0. build ----------
 step build
 BUILD_FLAGS=(); [ "$REHEARSE_PROFILE" = release ] && BUILD_FLAGS=(--release)
-cargo build $BUILD_FLAGS -p humaux-gateway -p humaux-retrieval-worker -p humaux-consolidation-worker -p humaux-private-worker -p humaux-maintenance -p xtask 2>&1 | tail -2 | tee -a $EV/rehearsal.log
+# humaux-admin: step observability renders the Watchdog's git_sha from `q deploy.binary`, and step
+# admin_probes runs the §4.4 catalog (ADR-0061 D-J / D-K).
+cargo build $BUILD_FLAGS -p humaux-gateway -p humaux-retrieval-worker -p humaux-consolidation-worker -p humaux-private-worker -p humaux-maintenance -p humaux-admin -p xtask 2>&1 | tail -2 | tee -a $EV/rehearsal.log
 echo "build profile: $REHEARSE_PROFILE ($BIN_DIR)" | tee -a $EV/rehearsal.log
 
 # ---------- 1. seed (stdout kept in a variable only) ----------
@@ -281,6 +289,21 @@ echo "route status C: $(python3 -c "import sys,json; print(' '.join(r['purpose']
 # ---------- 2. processes ----------
 step processes
 rm -f $SOCK/*.sock
+# ADR-0061 D-B: one loopback ops port per resident mode (job:mode -> port), never per binary — two
+# modes of one binary run at once from one env. Every launch line sets its own mode's key from here,
+# and the Prometheus targets are written from it; the alert drill's scratch gateway is not in it.
+# Defined before the first launch: every worker launch line and chaos heredoc below reads it.
+typeset -A OPS_PORTS
+OPS_PORTS=(humaux-gateway:serve 19101 humaux-retrieval-worker:serve-rpc 19102 humaux-retrieval-worker:serve 19103
+  humaux-private-worker:serve-rpc 19104 humaux-private-worker:distill-serve 19105 humaux-consolidation-worker:serve 19106
+  humaux-maintenance:health-serve 19107)
+# The per-mode keys, one line each, reused by every launch of that mode (first spawn, kill -9 recovery,
+# the soak's resident spawn and its chaos restart).
+OPS_RW_RPC="HUMAUX_RETRIEVAL_WORKER_SERVE_RPC_METRICS_ADDR=127.0.0.1:${OPS_PORTS[humaux-retrieval-worker:serve-rpc]}"
+OPS_RW_SERVE="HUMAUX_RETRIEVAL_WORKER_SERVE_METRICS_ADDR=127.0.0.1:${OPS_PORTS[humaux-retrieval-worker:serve]}"
+OPS_PW_RPC="HUMAUX_PRIVATE_WORKER_SERVE_RPC_METRICS_ADDR=127.0.0.1:${OPS_PORTS[humaux-private-worker:serve-rpc]}"
+OPS_PW_DISTILL="HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR=127.0.0.1:${OPS_PORTS[humaux-private-worker:distill-serve]}"
+OPS_CW_SERVE="HUMAUX_CONSOLIDATION_WORKER_SERVE_METRICS_ADDR=127.0.0.1:${OPS_PORTS[humaux-consolidation-worker:serve]}"
 # ONE definition per resident process, used by the first spawn AND by the kill -9 recovery in
 # step kill9_rotation. A chaos step that restarts a differently-configured process grades a
 # deployment nobody ran (the same argument $DS_ENV/$CW_ENV already make for the soak).
@@ -288,7 +311,7 @@ start_pw() {
 ( export PRIVATE_WORKER_PG_DSN="postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER:?}@$PG/$DB" \
     HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CREDENTIALS="$HUMAUX_PRIVATE_WORKER_CREDENTIALS" HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS=$PW_HEALTH_RENEW_SECS HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS=120 HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS=60 \
-    HUMAUX_PRIVATE_WORKER_DNS_PINS="$PW_DNS_PINS"
+    HUMAUX_PRIVATE_WORKER_DNS_PINS="$PW_DNS_PINS" $OPS_PW_RPC
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
   exec "$BIN_DIR"/humaux-private-worker --serve-rpc >> $EV/private-worker.log 2>&1 ) &
 own_pid pw $!
@@ -301,7 +324,8 @@ start_rw() {
     HUMAUX_RETRIEVAL_WORKER_DIMENSION=$EMB_DIM HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
     HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=6333 HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
     HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID HUMAUX_RETRIEVAL_WORKER_CALLER=retrieval-worker \
-    HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER
+    HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER \
+    $OPS_RW_RPC
   set -a; source $R/.env.local; set +a
   exec "$BIN_DIR"/humaux-retrieval-worker --serve-rpc >> $EV/retrieval-worker.log 2>&1 ) &
 own_pid rw $!
@@ -321,7 +345,8 @@ start_rp() {
     HUMAUX_RETRIEVAL_WORKER_DIMENSION=$EMB_DIM HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
     HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=${1:-6333} HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
     HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID HUMAUX_RETRIEVAL_WORKER_CALLER=retrieval-worker \
-    HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER
+    HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER \
+    $OPS_RW_SERVE
   eval "export $RP_PASS_ENV"
   set -a; source $R/.env.local; set +a
   exec "$BIN_DIR"/humaux-retrieval-worker --serve >> $EV/projection-runner.log 2>&1 ) &
@@ -331,9 +356,13 @@ start_rp; RP_PID=$(cat $S/rp.pid)
 # Card 31 (ADR-0057 D-F): the §78 ProjectionLag threshold has no default — boot-fatal when absent.
 # One value, read by start_gw AND by step stall_lag's window, so the assertion grades the deployment.
 LAG_SECS=20
+# Arguments (all optional; the main gateway passes none): $1 = bind host:port, $2 = ops port,
+# $3 = pidfile name, $4 = log. Only step alert_drill passes them, for its scratch gateway G'
+# (ADR-0061 D-K): the same configuration on its own listener, origin and ops port.
 start_gw() {
-( export HUMAUX_GATEWAY_PG_DSN="postgres://role_gateway:${HUMAUX_ROLE_PASSWORD_GATEWAY:?}@$PG/$DB" HUMAUX_GATEWAY_BIND_ADDR=127.0.0.1:8080 \
-    HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX=$PEPPER_HEX HUMAUX_GATEWAY_TOKEN_HMAC_KEY=$TOKEN_HMAC_HEX HUMAUX_GATEWAY_ALLOWED_HOSTS=127.0.0.1:8080 HUMAUX_GATEWAY_ALLOWED_ORIGINS=http://127.0.0.1:8080 \
+local gw_bind=${1:-127.0.0.1:8080} gw_ops=${2:-${OPS_PORTS[humaux-gateway:serve]}} gw_name=${3:-gw} gw_log=${4:-$EV/gateway.log}
+( export HUMAUX_GATEWAY_PG_DSN="postgres://role_gateway:${HUMAUX_ROLE_PASSWORD_GATEWAY:?}@$PG/$DB" HUMAUX_GATEWAY_BIND_ADDR=$gw_bind \
+    HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX=$PEPPER_HEX HUMAUX_GATEWAY_TOKEN_HMAC_KEY=$TOKEN_HMAC_HEX HUMAUX_GATEWAY_ALLOWED_HOSTS=$gw_bind HUMAUX_GATEWAY_ALLOWED_ORIGINS=http://$gw_bind \
     HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES=1048576 HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS= HUMAUX_GATEWAY_MAX_FORWARDED_HOPS=1 HUMAUX_GATEWAY_GLOBAL_DENYLIST= HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST= \
     HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS=30 HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS=20 HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS=5 HUMAUX_GATEWAY_REPLAY_TTL_SECONDS=60 \
     HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS=300 HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS=86400 HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS=21600 HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS=$LAG_SECS \
@@ -346,13 +375,24 @@ start_gw() {
     HUMAUX_GATEWAY_EMBEDDING_DIMENSION=$EMB_DIM HUMAUX_GATEWAY_EMBEDDING_VERSION=$EMB_VER \
     HUMAUX_GATEWAY_QDRANT_HOST=127.0.0.1 HUMAUX_GATEWAY_QDRANT_PORT=6333 HUMAUX_GATEWAY_QDRANT_CIDR=127.0.0.1/32 HUMAUX_GATEWAY_QDRANT_TLS=false \
     HUMAUX_GATEWAY_CELL_ID=$CELL_ID HUMAUX_GATEWAY_CALLER_ID=gateway \
+    HUMAUX_GATEWAY_METRICS_ADDR=127.0.0.1:$gw_ops HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS=2 \
     HUMAUX_GATEWAY_RATE_PREAUTH_IP_CAPACITY=100 HUMAUX_GATEWAY_RATE_PREAUTH_IP_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_CREDENTIAL_CAPACITY=100 HUMAUX_GATEWAY_RATE_CREDENTIAL_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_USER_CAPACITY=100 HUMAUX_GATEWAY_RATE_USER_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_TENANT_CAPACITY=100 HUMAUX_GATEWAY_RATE_TENANT_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_OPERATION_CAPACITY=100 HUMAUX_GATEWAY_RATE_OPERATION_REFILL_PER_SECOND=100
-  exec "$BIN_DIR"/humaux-gateway >> $EV/gateway.log 2>&1 ) &
-own_pid gw $!
+  exec "$BIN_DIR"/humaux-gateway >> $gw_log 2>&1 ) &
+own_pid $gw_name $!
 }
 start_gw; GW_PID=$(cat $S/gw.pid)
+# ADR-0061 D-D / E7: the one resident sampler of the §41.2 SQL-derived health gauges
+# (`ops.health_snapshot()` as role_maintenance), on its own mode's ops key. No other process
+# exports those gauges, so exactly one instance runs.
+start_mh() {
+( export HUMAUX_MAINTENANCE_PG_DSN="postgres://role_maintenance:${HUMAUX_ROLE_PASSWORD_MAINTENANCE:?}@$PG/$DB" \
+    HUMAUX_MAINTENANCE_HEALTH_SERVE_METRICS_ADDR=127.0.0.1:${OPS_PORTS[humaux-maintenance:health-serve]} HUMAUX_MAINTENANCE_HEALTH_SAMPLE_SECONDS=5
+  exec "$BIN_DIR"/humaux-maintenance health serve >> $EV/maintenance-health.log 2>&1 ) &
+own_pid mh $!
+}
+start_mh; MH_PID=$(cat $S/mh.pid)
 for i in $(seq 1 30); do code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/mcp -H 'Origin: http://127.0.0.1:8080' --data '{}' 2>/dev/null); [ "$code" != "000" ] && break; sleep 1; done
-echo "gateway http=$code pw=$PW_PID rw=$RW_PID rp=$RP_PID gw=$GW_PID" | tee -a $EV/rehearsal.log
+echo "gateway http=$code pw=$PW_PID rw=$RW_PID rp=$RP_PID gw=$GW_PID mh=$MH_PID" | tee -a $EV/rehearsal.log
 ls -la $SOCK | tee -a $EV/rehearsal.log
 
 # ---------- 2b. readiness gate (card 15 / ADR-0037; docs/ops/supervision.md §1) ----------
@@ -390,6 +430,108 @@ rp_readyz() { kill -0 "$(cat $S/rp.pid)" 2>/dev/null || { echo "projection runne
 wait_ready projection-runner rp_readyz
 wait_ready consolidation-worker cw_readyz   # dials the private worker's UDS from the side that uses it
 wait_ready gateway gw_readyz
+# ADR-0061 D-D: health serve answers 200 only while its latest sample succeeded and is fresh.
+mh_readyz() { curl -fsS -o /dev/null http://127.0.0.1:${OPS_PORTS[humaux-maintenance:health-serve]}/metrics; }
+wait_ready maintenance-health-serve mh_readyz
+
+# ---------- 2c. observability: Prometheus, Alertmanager, collector (ADR-0061 D-G / D-K) ----------
+# The pinned host binaries (deploy/prometheus/pinned-tool.sh: sha256 + version, never PATH; exit 2
+# = a pin variable unset) run the repo's own configs, rendered only where the deployer contract in
+# prometheus.yml / alertmanager.yml says: the targets file (exactly the seven OPS_PORTS entries),
+# the rule paths, the Alertmanager address, the git sha, the webhook URL files. Every listener is
+# loopback and owned through its pidfile; the readiness waits below are part of the gate above.
+step observability
+PT=(sh $R/deploy/prometheus/pinned-tool.sh)
+PROM_PORT=19190; AM_PORT=19193; SINK_PORT=19194; OBS=$S/prom
+obs_stop() { # every observability process this script started, each through its own pidfile
+  local p
+  for p in "promd prometheus" "gwd humaux-gateway" "prom prometheus" "am alertmanager" "otel otelcol" "sink $(cat $S/sink.comm 2>/dev/null)"; do
+    set -- ${=p}; [ -f $S/$1.pid ] && own_signal $S/$1.pid "$2" TERM 30
+  done
+  return 0
+}
+# A previous run's pidfiles are dropped, never acted on: a PID recorded then may name someone else's
+# process now (the sink's `Python` comm is not distinctive). A leftover listener makes the start
+# below fail on its port, loudly. Every exit path of THIS run stops its own processes (trap).
+rm -f $S/promd.pid $S/gwd.pid $S/prom.pid $S/am.pid $S/otel.pid $S/sink.pid $S/sink.comm
+trap obs_stop EXIT
+rm -rf $OBS; mkdir -p $OBS/targets $OBS/data $OBS/am-data
+DEPLOY_SHA=$("$BIN_DIR"/humaux-admin q deploy.binary 2>>$EV/rehearsal.log | python3 -c "import sys,json; print(json.load(sys.stdin)['detail']['git_sha'])" 2>/dev/null)
+echo "observability: deployed git_sha (humaux-admin q deploy.binary) = ${DEPLOY_SHA:-NONE}" | tee -a $EV/rehearsal.log
+python3 - $OBS/targets/humaux.json ${(kv)OPS_PORTS} <<'PYEOF'
+import json, sys
+kv = sys.argv[2:]
+t = [{"targets": ["127.0.0.1:%s" % kv[i + 1]], "labels": dict(zip(("job", "mode"), kv[i].split(":", 1)))}
+     for i in range(0, len(kv), 2)]
+json.dump(sorted(t, key=lambda e: (e["labels"]["job"], e["labels"]["mode"])), open(sys.argv[1], "w"), indent=1)
+PYEOF
+sed -e "s#__HUMAUX_GIT_SHA__#${DEPLOY_SHA:-__HUMAUX_GIT_SHA__}#" -e "s#\"127.0.0.1:9093\"#\"127.0.0.1:$AM_PORT\"#" \
+    -e "s#\"targets/\\*.json\"#\"$OBS/targets/*.json\"#" -e "s#^  - \\([a-z]*\\.rules\\.yml\\)\$#  - $R/deploy/prometheus/\\1#" \
+    $R/deploy/prometheus/prometheus.yml > $OBS/prometheus.yml
+print -r -- "http://127.0.0.1:$SINK_PORT/log" > $OBS/log_sink.url
+print -r -- "http://127.0.0.1:$SINK_PORT/watchdog" > $OBS/watchdog.url
+sed -e "s#__HUMAUX_ALERTMANAGER_LOG_SINK_URL_FILE__#$OBS/log_sink.url#" -e "s#__HUMAUX_ALERTMANAGER_WATCHDOG_URL_FILE__#$OBS/watchdog.url#" \
+    $R/deploy/prometheus/alertmanager.yml > $OBS/alertmanager.yml
+OBS_CFG=$( { $PT promtool check config $OBS/prometheus.yml && $PT amtool check-config $OBS/alertmanager.yml; } >> $EV/observability.log 2>&1; echo $?)
+echo "observability: targets=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))))" $OBS/targets/humaux.json) rendered configs check=$OBS_CFG placeholders_left=$(cat $OBS/prometheus.yml $OBS/alertmanager.yml | grep -v '^ *#' | grep -c '__HUMAUX')" | tee -a $EV/rehearsal.log
+# The webhook receiver: every POST body becomes one compact JSON line {"path", "body"} in the evidence.
+cat > $S/alert_sink.py <<'PYEOF'
+#!/usr/bin/env python3
+# alert_sink.py <port> <jsonl>: the rehearsal's Alertmanager webhook receiver (ADR-0061 D-K), loopback only.
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port, out = int(sys.argv[1]), sys.argv[2]
+class Sink(BaseHTTPRequestHandler):
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            body = raw.decode("utf-8", "replace")
+        with open(out, "a") as f:
+            f.write(json.dumps({"path": self.path, "body": body}, separators=(",", ":")) + "\n")
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+HTTPServer(("127.0.0.1", port), Sink).serve_forever()
+PYEOF
+: > $EV/alert_receipts.jsonl
+( exec python3 $S/alert_sink.py $SINK_PORT $EV/alert_receipts.jsonl >> $EV/alert_sink.log 2>&1 ) &
+own_pid sink $!; sleep 1; ps -o comm= -p "$(cat $S/sink.pid)" | sed 's#.*/##' > $S/sink.comm   # own_signal's expected name, read at spawn
+( exec "${PT[@]}" alertmanager --config.file=$OBS/alertmanager.yml --storage.path=$OBS/am-data \
+    --web.listen-address=127.0.0.1:$AM_PORT --cluster.listen-address= >> $EV/alertmanager.log 2>&1 ) &
+own_pid am $!
+( exec "${PT[@]}" prometheus --config.file=$OBS/prometheus.yml --storage.tsdb.path=$OBS/data \
+    --storage.tsdb.retention.time=30d --web.listen-address=127.0.0.1:$PROM_PORT >> $EV/prometheus.log 2>&1 ) &
+own_pid prom $!
+( exec "${PT[@]}" otelcol --config=$R/deploy/prometheus/otel-collector.yml >> $EV/otelcol.log 2>&1 ) &
+own_pid otel $!
+am_ready() { curl -fsS http://127.0.0.1:$AM_PORT/-/ready; }
+prom_ready() { curl -fsS http://127.0.0.1:$PROM_PORT/-/ready; }
+otel_ready() { curl -fsS -o /dev/null http://127.0.0.1:8888/metrics; }
+# §42.1: the Watchdog reaches its own receiver carrying the deployed git sha (external_labels).
+WD_OK=0
+watchdog_receipt() {
+  python3 - $EV/alert_receipts.jsonl "${DEPLOY_SHA:-}" <<'PYEOF'
+import json, sys
+want = sys.argv[2]
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    body = r["body"] if isinstance(r["body"], dict) else {}
+    for a in body.get("alerts", []):
+        if a.get("labels", {}).get("alertname") == "Watchdog" and r["path"] == "/watchdog":
+            sha = a["labels"].get("git_sha")
+            print("watchdog receipt git_sha=%s status=%s" % (sha, a.get("status")))
+            sys.exit(0 if want and sha == want and "__HUMAUX" not in sha else 1)
+print("no Watchdog receipt yet")
+sys.exit(1)
+PYEOF
+}
+wait_ready alertmanager am_ready
+wait_ready prometheus prom_ready
+wait_ready otel-collector otel_ready
+wait_ready watchdog-receipt watchdog_receipt && WD_OK=1
 READY_BAD_BEFORE_TRAFFIC=$READY_BAD   # frozen here; step kill9_rotation reuses wait_ready
 echo "readiness: $READY_OK ready, $READY_BAD not ready" | tee -a $EV/rehearsal.log
 [ $READY_BAD -gt 0 ] && echo "readiness gate failed — traffic below is measuring a race" | tee -a $EV/rehearsal.log
@@ -454,7 +596,7 @@ step sigterm_mid_load
     HUMAUX_PRIVATE_WORKER_DNS_PINS="$PW_DNS_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-drain.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
     HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120 \
-    HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=3
+    HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=3 $OPS_PW_DISTILL
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
   exec "$BIN_DIR"/humaux-private-worker --distill-serve > $EV/distill-serve.log 2>&1 ) &
 DS_PID=$!
@@ -897,7 +1039,8 @@ a2_check kill9_drained
 # resume to prove that. Lag is the age of the oldest pending ticket, strictly beyond LAG_SECS.
 step stall_lag
 # An interrupted run must not leave the runner stopped: a SIGSTOPped process ignores the teardown's TERM.
-trap "own_signal $S/rp.pid humaux-retrieval-worker CONT 0" EXIT
+# (obs_stop: the observability trap set in step observability stays armed through this one.)
+trap "own_signal $S/rp.pid humaux-retrieval-worker CONT 0; obs_stop" EXIT
 own_signal $S/rp.pid humaux-retrieval-worker STOP 0
 ST_T0=$(date +%s)
 mcp remember "{\"operation\":\"put\",\"content\":\"card 31 stall probe: the projection runner is paused while this write waits.\",\"idempotency_key\":\"stall-probe-$RANDOM\",\"workspace_id\":\"$WS\"}" > $EV/stall_put.json 2>&1
@@ -920,7 +1063,7 @@ wait $ST_DPID 2>/dev/null
 ST_STATE=$(PGQ "select s.state||'/lease='||coalesce(s.lease_owner,'none') from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id and s.commit_seq=o.commit_seq where o.evidence_id='${ST_EV:-00000000-0000-0000-0000-000000000000}' and o.event_type='EVIDENCE_ACCEPTED'")
 echo "stall: runner stopped, lag seen after ${ST_SECS}s (threshold ${LAG_SECS}s) probe='$ST_SEEN' ticket_while_stopped=$ST_STATE" | tee -a $EV/rehearsal.log
 own_signal $S/rp.pid humaux-retrieval-worker CONT 0
-trap - EXIT
+trap obs_stop EXIT
 ST_C0=$(date +%s); ST_CLEAR_SECS=-1; ST_AFTER=""
 while [ $(( $(date +%s) - ST_C0 )) -le 60 ]; do
   ST_AFTER=$(lag_probe)
@@ -1136,7 +1279,7 @@ assert_eq "no_tenant_env_for_the_projection_runner" \
     HUMAUX_PRIVATE_WORKER_DNS_PINS="$PW_DNS_PINS" HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH=$SOCK/inference-pst.sock HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID \
     HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS=86400 \
     HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120 \
-    HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=1
+    HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=1 $OPS_PW_DISTILL
   set -a; source /Volumes/data/viral-skill-eval/.env; set +a
   exec "$BIN_DIR"/humaux-private-worker --distill-serve >> $EV/pst-distill.log 2>&1 ) &
 own_pid ds $!
@@ -1147,7 +1290,7 @@ own_pid ds $!
 ( export CONSOLIDATION_WORKER_PG_DSN="postgres://role_consolidation_worker:${HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER:?}@$PG/$DB" \
     HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS=120 HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS=10 \
     HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS=50 HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS=120 HUMAUX_CONSOLIDATION_WORKER_BATCH=8 HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5 \
-    HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS=1
+    HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS=1 $OPS_CW_SERVE
   exec "$BIN_DIR"/humaux-consolidation-worker --serve >> $EV/pst-consolidation.log 2>&1 ) &
 own_pid cw $!
 pst_put() { # $1=bearer var $2=workspace $3=content $4=tsv — one remember.put, recorded with its put time
@@ -1192,7 +1335,7 @@ done
 
 # ---- 2. timed load: 10 remember.put per family = 60 ----
 if [ "${FAULT:-}" = "revoke_claim" ]; then
-  trap "docker exec humaux-thread-pg psql -U postgres -d $DB -qc \"GRANT EXECUTE ON FUNCTION $CLAIM_FN TO role_retrieval_worker\"" EXIT
+  trap "docker exec humaux-thread-pg psql -U postgres -d $DB -qc \"GRANT EXECUTE ON FUNCTION $CLAIM_FN TO role_retrieval_worker\"; obs_stop" EXIT
   PGQ "REVOKE EXECUTE ON FUNCTION $CLAIM_FN FROM role_retrieval_worker" >/dev/null
   echo "pst FAULT=revoke_claim: EXECUTE on the claim revoked from role_retrieval_worker (trap re-grants)" | tee -a $EV/rehearsal.log
 fi
@@ -1218,9 +1361,10 @@ def pg(sql):
 def recall(bearer, ws, query):
     body = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"query":query,"workspace_id":ws,"mode":"semantic"},
             "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"rehearsal","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}
-    req = urllib.request.Request("http://127.0.0.1:8080/mcp", data=json.dumps(body).encode(), method="POST", headers={
+    gw = os.environ.get("GW_URL", "http://127.0.0.1:8080")  # ADR-0061 D-K: a scratch gateway sets GW_URL
+    req = urllib.request.Request(gw + "/mcp", data=json.dumps(body).encode(), method="POST", headers={
         "Content-Type":"application/json","Accept":"application/json, text/event-stream","MCP-Protocol-Version":"2026-07-28",
-        "Mcp-Method":"tools/call","Mcp-Name":"recall","Origin":"http://127.0.0.1:8080","Authorization":"Bearer "+os.environ[bearer]})
+        "Mcp-Method":"tools/call","Mcp-Name":"recall","Origin":gw,"Authorization":"Bearer "+os.environ[bearer]})
     try:
         d = json.load(urllib.request.urlopen(req, timeout=30))
         return {i.get("memory_id") for i in d["result"].get("structuredContent",{}).get("items",[])}
@@ -1299,6 +1443,7 @@ if [ "${FAULT:-}" = "revoke_claim" ]; then
   echo "pst FAULT=revoke_claim: stopping here (steps 3-6 and the soak need a working claim)" | tee -a $EV/rehearsal.log
   own_signal $S/gw.pid humaux-gateway TERM 30; own_signal $S/rw.pid humaux-retrieval-worker TERM 30
   own_signal $S/rp.pid humaux-retrieval-worker TERM 90; own_signal $S/pw.pid humaux-private-worker TERM 30
+  own_signal $S/mh.pid humaux-maintenance TERM 30; obs_stop
   echo "REHEARSAL VERDICT: $A_OK passed, $A_BAD failed" | tee -a $EV/rehearsal.log
   [ "${A_BAD:-1}" -eq 0 ] || exit 1
   exit 0
@@ -1645,9 +1790,10 @@ def pg(sql):
 def recall(bearer, ws, query):
     body = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"query":query,"workspace_id":ws},
             "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"rehearsal","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}
-    req = urllib.request.Request("http://127.0.0.1:8080/mcp", data=json.dumps(body).encode(), method="POST", headers={
+    gw = os.environ.get("GW_URL", "http://127.0.0.1:8080")  # ADR-0061 D-K: a scratch gateway sets GW_URL
+    req = urllib.request.Request(gw + "/mcp", data=json.dumps(body).encode(), method="POST", headers={
         "Content-Type":"application/json","Accept":"application/json, text/event-stream","MCP-Protocol-Version":"2026-07-28",
-        "Mcp-Method":"tools/call","Mcp-Name":"recall","Origin":"http://127.0.0.1:8080","Authorization":"Bearer "+os.environ[bearer]})
+        "Mcp-Method":"tools/call","Mcp-Name":"recall","Origin":gw,"Authorization":"Bearer "+os.environ[bearer]})
     try:
         d = json.load(urllib.request.urlopen(req, timeout=30))
     except urllib.error.HTTPError as e:
@@ -1713,6 +1859,97 @@ i=0; while [ $i -lt 600 ]; do
 done
 echo "pst derived backlog of the seeded tenants after ${i}s: $PST_BACKLOG" | tee -a $EV/rehearsal.log
 assert_eq "pst_leaves_no_derived_backlog(n=$(PGQ "select count(*) from ops.jobs where tenant_id in ($SEEDED) and left(job_type,8)='DERIVED_'") jobs)" "$PST_BACKLOG" 0
+# ---------- 6b2. metrics_scrape (ADR-0061 D-H / D-K) ----------
+# Here, after the traffic and while all seven resident modes run (the resident distiller and the
+# consolidation worker live only inside this step and the soak): every ops endpoint is scraped and
+# graded against its own binary's `--metrics-families` and §41.2, and the production prometheus.yml's
+# scrape path is proven by `up` being EXACTLY the seven OPS_PORTS pairs at 1 — never "every result".
+step metrics_scrape
+mkdir -p $EV/metrics; MS_ARGS=(); MS_BAD=0; ST_BAD=0
+for k in ${(ko)OPS_PORTS}; do
+  MS_F=$EV/metrics/${k/:/-}.prom
+  curl -fsS -o $MS_F http://127.0.0.1:${OPS_PORTS[$k]}/metrics \
+    || { echo "metrics_scrape: $k /metrics did not answer 200 on ${OPS_PORTS[$k]}" | tee -a $EV/rehearsal.log; MS_BAD=$((MS_BAD+1)); }
+  MS_ARGS+=(--exposition "${${k%%:*}#humaux-}=$MS_F")
+  curl -fsS http://127.0.0.1:${OPS_PORTS[$k]}/status 2>/dev/null > $EV/metrics/${k/:/-}.status.json
+  python3 -c "import sys,json; sys.exit(0 if json.load(open(sys.argv[1])).get('process') else 1)" $EV/metrics/${k/:/-}.status.json 2>/dev/null \
+    || { echo "metrics_scrape: $k /status is not JSON naming its process" | tee -a $EV/rehearsal.log; ST_BAD=$((ST_BAD+1)); }
+done
+cargo run -q -p xtask -- metrics-registry "${MS_ARGS[@]}" > $EV/metrics/metrics_registry_exposition.log 2>&1; MR_RC=$?
+tail -3 $EV/metrics/metrics_registry_exposition.log | tee -a $EV/rehearsal.log
+python3 - "http://127.0.0.1:$PROM_PORT" 30 ${(k)OPS_PORTS} > $EV/metrics/up.txt <<'PYEOF'
+# Poll up{job=~"humaux-.*"} every 1 s for at most 2 x scrape_interval until the (job, mode) pairs at 1
+# EQUAL the expected set; an empty or short result at the bound is a failure naming the missing pairs.
+import json, sys, time, urllib.parse, urllib.request
+base, bound, want = sys.argv[1], float(sys.argv[2]), {tuple(k.split(":", 1)) for k in sys.argv[3:]}
+url = base + "/api/v1/query?" + urllib.parse.urlencode({"query": 'up{job=~"humaux-.*"}'})
+t0, got, zero = time.time(), set(), set()
+while True:
+    try:
+        res = json.load(urllib.request.urlopen(url, timeout=5))["data"]["result"]
+    except Exception:
+        res = []
+    pairs = [((s["metric"].get("job"), s["metric"].get("mode")), s["value"][1]) for s in res]
+    got = {p for p, v in pairs if v == "1"}
+    zero = {p for p, v in pairs if v != "1"}
+    if got == want or time.time() - t0 >= bound:
+        break
+    time.sleep(1)
+print("up n=%d after %.0fs: %s" % (len(got), time.time() - t0, " ".join("%s/%s" % p for p in sorted(got, key=str))))
+if got != want:
+    print("up mismatch: missing %s; at 0 %s; extra %s" % (sorted(want - got, key=str), sorted(zero, key=str), sorted(got - want, key=str)))
+sys.exit(0 if got == want else 1)
+PYEOF
+UP_RC=$?
+tee -a $EV/rehearsal.log < $EV/metrics/up.txt
+DG_SUM=$(cat $EV/metrics/*.prom | awk '/^degrade_total\{/ {s += $NF} END {printf "%d", s}')
+echo "metrics_scrape: degrade_total summed over the seven scrapes = $DG_SUM" | tee -a $EV/rehearsal.log
+assert_eq "metrics_scrape_every_ops_endpoint_answers(n=${#OPS_PORTS})" "$MS_BAD" 0
+assert_eq "metrics_scrape_status_is_json_naming_its_process(n=${#OPS_PORTS})" "$ST_BAD" 0
+assert_eq "metrics_scrape_matches_metrics_families_and_41_2(n=${#OPS_PORTS} scrapes)" "$MR_RC" 0
+assert_eq "prometheus_up_is_exactly_the_seven_ops_pairs" "$UP_RC" 0
+assert_eq "watchdog_receipt_carries_the_deployed_git_sha(sha=${DEPLOY_SHA:-none})" "$WD_OK" 1
+
+# ---------- 6b3. admin_probes: the §4.4 catalog over role_admin (ADR-0061 D-J) ----------
+# 8 Readings with the five-key envelope and 3 refusals that name their missing object (ruling E2).
+# cell.resources probes the same two sockets the gateway (retrieval.sock) and the private worker (inference.sock) are
+# given, so its value is 3 of 3 here (ruling B1).
+step admin_probes
+mkdir -p $EV/admin_probes
+openssl req -x509 -newkey rsa:2048 -nodes -keyout $S/tls_probe.key -out $S/tls_probe.pem -days 30 -subj /CN=humaux-rehearsal >/dev/null 2>&1
+AP_ADDRS=; for k in ${(ko)OPS_PORTS}; do AP_ADDRS+="${AP_ADDRS:+,}${k/:/-}=127.0.0.1:${OPS_PORTS[$k]}"; done
+admin_q() { ( export HUMAUX_ADMIN_PG_DSN="postgres://role_admin:${HUMAUX_ROLE_PASSWORD_ADMIN:?}@$PG/$DB" \
+    HUMAUX_ADMIN_OPS_ADDRS=$AP_ADDRS HUMAUX_ADMIN_TLS_CERT_PATHS=$S/tls_probe.pem \
+    HUMAUX_CELL_ID=$CELL_ID HUMAUX_CELL_CALLER_ID=admin HUMAUX_QDRANT_HOST=127.0.0.1 HUMAUX_QDRANT_PORT=6333 \
+    HUMAUX_QDRANT_CIDR=127.0.0.1/32 HUMAUX_QDRANT_TLS=false \
+    HUMAUX_ADMIN_RETRIEVAL_RPC_SOCKET_PATH=$SOCK/retrieval.sock HUMAUX_ADMIN_PRIVATE_INFERENCE_RPC_SOCKET_PATH=$SOCK/inference.sock
+  exec "$BIN_DIR"/humaux-admin q $1 ) > $EV/admin_probes/$1.json 2> $EV/admin_probes/$1.err; }
+apv() { python3 -c "import sys,json
+try: d=json.load(open(sys.argv[1]))
+except Exception: print(''); raise SystemExit
+print(d.get(sys.argv[2], ''))" $EV/admin_probes/$1.json $2; }
+AP_READ=0
+for p in stream.watermark outbox.backlog jobs.stuck degrade.counters flags.effective deploy.binary tls.expiry cell.resources; do
+  admin_q $p; AP_RC=$?
+  AP_ENV=$(python3 -c "import sys,json
+try: d=json.load(open(sys.argv[1]))
+except Exception: print(0); raise SystemExit
+print(int({'value','scanned_n','scope_hash','checked_at','probe_version'} <= set(d) and isinstance(d['scanned_n'],int) and d['scanned_n'] > 0))" $EV/admin_probes/$p.json)
+  echo "admin_probes: $p rc=$AP_RC envelope=$AP_ENV value=$(apv $p value) scanned_n=$(apv $p scanned_n) version=$(apv $p probe_version)$([ $AP_RC -ne 0 ] && echo " err=$(head -c 300 $EV/admin_probes/$p.err | tr '\n' ' ')")" | tee -a $EV/rehearsal.log
+  [ $AP_RC -eq 0 ] && [ "$AP_ENV" = 1 ] && AP_READ=$((AP_READ+1))
+done
+AP_REFUSED=0
+for p in public.corroborated:public.claims.corroboration public.consensus_ready:public.claims.contributor_set parse.poison:limit_hit; do
+  admin_q ${p%%:*}; AP_RC=$?
+  AP_NAMED=$(cat $EV/admin_probes/${p%%:*}.json $EV/admin_probes/${p%%:*}.err | grep -cF -- "${p#*:}")
+  echo "admin_probes: ${p%%:*} rc=$AP_RC names ${p#*:}: $AP_NAMED" | tee -a $EV/rehearsal.log
+  [ $AP_RC -ne 0 ] && [ "$AP_NAMED" -gt 0 ] && AP_REFUSED=$((AP_REFUSED+1))
+done
+assert_eq "admin_probes_eight_readings_with_the_five_key_envelope" "$AP_READ" 8
+assert_eq "admin_probes_three_refusals_name_their_missing_object" "$AP_REFUSED" 3
+assert_eq "admin_jobs_stuck_is_a_count(value=$(apv jobs.stuck value))" "$(apv jobs.stuck value | grep -cE '^[0-9]+$')" 1
+assert_eq "admin_degrade_counters_equals_the_scraped_degrade_total_sum" "$(apv degrade.counters value)" "$DG_SUM"
+
 own_signal $S/ds.pid humaux-private-worker TERM 90 | tee -a $EV/rehearsal.log
 own_signal $S/cw.pid humaux-consolidation-worker TERM 90 | tee -a $EV/rehearsal.log
 # ADR-0060 (card 33b, T32): one deployed worker served two providers, each tenant on its own route.
@@ -1756,7 +1993,8 @@ HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL=$EMB_MODEL HUMAUX_RETRIEVAL_WORKER_MODEL
 HUMAUX_RETRIEVAL_WORKER_DIMENSION=$EMB_DIM HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER \
 HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
 HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN \
-HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER"
+HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER \
+$OPS_RW_RPC $OPS_RW_SERVE"
 
 # One definition per worker, used by BOTH the resident spawn below and its chaos restart, so a
 # restarted process is the same process — a chaos hook that starts a differently-configured
@@ -1768,12 +2006,12 @@ HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID=$MYUID HUMAUX_PRIVATE_WORKER_CANDIDATE_T
 HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS=30 HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT=4 \
 HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS=300 HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS=600 \
 HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS=5 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS=120 \
-HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=3"
+HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS=3 $OPS_PW_DISTILL"
 CW_ENV="export CONSOLIDATION_WORKER_PG_DSN=\"postgres://role_consolidation_worker:\${HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER:?}@$PG/$DB\" \
 HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH=$SOCK/inference.sock HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS=120 \
 HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS=10 HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS=50 \
 HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS=120 HUMAUX_CONSOLIDATION_WORKER_BATCH=8 \
-HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5 HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS=3"
+HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS=5 HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS=3 $OPS_CW_SERVE"
 
 cat > $S/soak_probe_rw.sh <<EOF
 #!/bin/sh
@@ -1933,13 +2171,16 @@ SOAK_CW_PID=$!; own_pid cw $SOAK_CW_PID
 # The runner's chaos hook runs FIRST: a SOAK_SECS=120 run with a 90 s chaos period fires exactly one
 # hook, and the card-27 gate is the runner's kill -9 (the retrieval worker's restart window fails a
 # handful of recalls, which op_failure_rate counts at 1%; longer soaks rotate through all four).
+# ADR-0061 D-F / E15: the gateway is graded on /livez. Its /readyz is now dependency-truthful, so
+# the chaos kill of the retrieval worker it depends on correctly makes it 503 for that window; the
+# old /readyz was only the accepting flag, which /livez carries at the same strength.
 cargo run -q -p xtask -- soak \
   --gateway-url http://127.0.0.1:8080/mcp \
   --tenant "$TENANT:$WS:BEARER_A" --tenant "$TENANT_B:$WS_B:BEARER_B" --tenant "$TENANT_C:$WS_C:BEARER_C" \
   --sessions-per-tenant ${SOAK_SESSIONS:-2} \
   --duration-secs $SOAK_SECS --drain-secs ${SOAK_DRAIN:-150} --think-ms ${SOAK_THINK_MS:-500} \
   --probe-every-secs 15 \
-  --probe-cmd "curl -fsS -o /dev/null http://127.0.0.1:8080/readyz" \
+  --probe-cmd "curl -fsS -o /dev/null http://127.0.0.1:8080/livez" \
   --probe-cmd "$S/soak_probe_rw.sh" \
   --probe-cmd "$S/soak_probe_pw.sh" \
   --watch-pidfile gw=$S/gw.pid --watch-pidfile rw=$S/rw.pid --watch-pidfile pw=$S/pw.pid \
@@ -2024,6 +2265,125 @@ DD_MAX=$(( ${DD_N:-0} / 100 )) 2>/dev/null || DD_MAX=0
 case "$DD_N$DD_K" in ''|*[!0-9]*) DD_OK=0 ;; *) [ -n "$DD_N" ] && [ -n "$DD_K" ] && [ "$DD_K" -le "$DD_MAX" ] && DD_OK=1 || DD_OK=0 ;; esac
 assert_eq "distill_dead(n=$DD_N, dead=$DD_K, at_most=$DD_MAX = 1% of n, classes=${DD_CLASSES:--})" "$DD_OK" 1
 
+# ---------- 6d. alert_drill: a synthetic INV-1 reaches the alert route (ADR-0061 D-K) ----------
+# A real scratch gateway G' and a real LaneSubstituted degrade; NO database grant or row is changed.
+# The INV-1' shape (denominator absent) is made at the drill Prometheus P''s ingestion: P' drops
+# humaux_retrieval_requests_total from G' with a metric_relabel rule, exactly as if it were never
+# exported. P' loads the two production rule files unchanged and sends to the same Alertmanager;
+# its alerts carry `prometheus: drill` so they never merge with the main Prometheus's. G'/P' ports
+# are local to this step: they are not in OPS_PORTS, so the main `up` set never sees them.
+step alert_drill
+AD_T0=$(date +%s)
+GWD_PORT=18081; GWD_OPS=19111; PROMD_PORT=19191; PD=$S/prom-drill; PDB=http://127.0.0.1:$PROMD_PORT
+rm -rf $PD; mkdir -p $PD/data
+start_gw 127.0.0.1:$GWD_PORT $GWD_OPS gwd $EV/gateway-drill.log
+gwd_readyz() { curl -fsS -o /dev/null http://127.0.0.1:$GWD_PORT/readyz; }
+render_drill() { # $1 = 1 with the relabel drop, 0 without
+  cat > $PD/prometheus.yml <<YEOF
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    git_sha: "${DEPLOY_SHA:-__HUMAUX_GIT_SHA__}"
+    prometheus: drill
+rule_files:
+  - $R/deploy/prometheus/invariants.rules.yml
+  - $R/deploy/prometheus/alerts.rules.yml
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["127.0.0.1:$AM_PORT"]
+scrape_configs:
+  - job_name: humaux-gateway-drill
+    static_configs:
+      - targets: ["127.0.0.1:$GWD_OPS"]
+YEOF
+  [ "$1" = 1 ] && cat >> $PD/prometheus.yml <<'YEOF'
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: humaux_retrieval_requests_total
+        action: drop
+YEOF
+  $PT promtool check config $PD/prometheus.yml >> $EV/observability.log 2>&1
+}
+pq() { # $1 = PromQL against P'; prints the first sample's value, empty when the result is empty
+  curl -fsS -G "$PDB/api/v1/query" --data-urlencode "query=$1" 2>/dev/null | python3 -c "import sys,json
+try: r=json.load(sys.stdin)['data']['result']; print(r[0]['value'][1] if r else '')
+except Exception: print('')"; }
+inv1_state() { curl -fsS $PDB/api/v1/alerts 2>/dev/null | python3 -c "import sys,json
+try: a=json.load(sys.stdin)['data']['alerts']
+except Exception: a=[]
+s=[x['state'] for x in a if x['labels'].get('alertname')=='INV-1']
+print(s[0] if s else 'inactive')"; }
+receipt() { # $1 = alertname $2 = status; 0 once the sink holds that alert from P' in that status
+  python3 - $EV/alert_receipts.jsonl $1 $2 <<'PYEOF'
+import json, sys
+path, name, status = sys.argv[1:4]
+for line in open(path):
+    body = json.loads(line)["body"]
+    for a in (body.get("alerts", []) if isinstance(body, dict) else []):
+        l = a.get("labels", {})
+        if l.get("alertname") == name and l.get("prometheus") == "drill" and a.get("status") == status:
+            sys.exit(0)
+sys.exit(1)
+PYEOF
+}
+poll() { # $1 = bound secs, rest = a command; prints the seconds waited; status 0 once the command succeeds
+  local bound=$1 i=0; shift
+  while [ $i -le $bound ]; do "$@" >/dev/null 2>&1 && { echo $i; return 0; }; sleep 1; i=$((i+1)); done
+  echo $i; return 1
+}
+deg_at() { [ "$(pq 'sum(degrade_total{job="humaux-gateway-drill",code="LaneSubstituted"})')" = "$1" ]; }
+deg_ge1() { [ "$(pq 'sum(degrade_total{job="humaux-gateway-drill",code="LaneSubstituted"})' | cut -d. -f1)" -ge 1 ] 2>/dev/null; }
+req_seen() { [ -n "$(pq 'sum(humaux_retrieval_requests_total{job="humaux-gateway-drill"})')" ]; }
+req_above() { [ "$(pq 'sum(humaux_retrieval_requests_total{job="humaux-gateway-drill"})' | cut -d. -f1)" -gt "$1" ] 2>/dev/null; }
+inv1_is() { [ "$(inv1_state)" = "$1" ]; }
+AD_PRE_OK=0; AD_DROP_OK=0; AD_LS=0; AD_FIRE_OK=0; AD_RCPT_OK=0; AD_CLEAR_OK=0; AD_RES_OK=0
+if wait_ready drill-gateway gwd_readyz; then
+  render_drill 1
+  ( exec "${PT[@]}" prometheus --config.file=$PD/prometheus.yml --storage.tsdb.path=$PD/data \
+      --web.listen-address=127.0.0.1:$PROMD_PORT >> $EV/prometheus-drill.log 2>&1 ) &
+  own_pid promd $!
+  promd_ready() { curl -fsS $PDB/-/ready; }
+  wait_ready drill-prometheus promd_ready
+  # 3. one sample of G''s degrade at 0 first, so rate() sees the increment.
+  W=$(poll 15 deg_at 0) && AD_PRE_OK=1
+  [ -z "$(pq 'count(humaux_retrieval_requests_total)')" ] && AD_DROP_OK=1
+  echo "alert_drill: pre-sample degrade_total{code=LaneSubstituted}=0 in P' after ${W}s ok=$AD_PRE_OK; denominator absent in P' ok=$AD_DROP_OK" | tee -a $EV/rehearsal.log
+  # 4. an abstaining recall: the lane_substitution step's queries, in order, until one degrades.
+  for q in "目前项目进度" "客户张三最近的情绪怎么样" "和支付相关的决定" 'the "frozen contract" decision' "$LS_UUID"; do
+    AD_ARGS=$(python3 -c "import sys,json; print(json.dumps({'query':sys.argv[1],'workspace_id':sys.argv[2]}, ensure_ascii=False))" "$q" "$WS")
+    AD_OUT=$(GW_URL=http://127.0.0.1:$GWD_PORT mcp recall "$AD_ARGS")
+    print -r -- "$AD_OUT" | head -1 | grep -q 'LANE_SUBSTITUTED' && { AD_LS=1; break; }
+  done
+  [ $AD_LS = 1 ] || echo "alert_drill: no recall to G' carried LANE_SUBSTITUTED (step lane_substitution's queries)" | tee -a $EV/rehearsal.log
+  # 5. INV-1 fires in P' within scrape 5 s + eval 5 s + 2 s of the increment being visible there.
+  W1=$(poll 10 deg_ge1); W2=$(poll 12 inv1_is firing) && AD_FIRE_OK=1
+  echo "alert_drill: degrade visible in P' after ${W1}s; INV-1 $(inv1_state) in P' ${W2}s later" | tee -a $EV/rehearsal.log
+  # 6. the route delivers it: group_wait 10 s + 10 s.
+  W3=$(poll 20 receipt INV-1 firing) && AD_RCPT_OK=1
+  echo "alert_drill: INV-1 firing receipt in alert_receipts.jsonl after ${W3}s ok=$AD_RCPT_OK" | tee -a $EV/rehearsal.log
+  # 7. clear: the denominator comes back (config reload on SIGHUP, no lifecycle API), one recall
+  #    moves it, INV-1 goes inactive within 2 evals and a resolved notification arrives.
+  render_drill 0; own_signal $S/promd.pid prometheus HUP 0 >/dev/null
+  W4=$(poll 20 req_seen); REQ0=$(pq 'sum(humaux_retrieval_requests_total{job="humaux-gateway-drill"})' | cut -d. -f1)
+  GW_URL=http://127.0.0.1:$GWD_PORT mcp recall "{\"query\":\"which language do we prefer for backend services?\",\"workspace_id\":\"$WS\",\"mode\":\"semantic\"}" > $EV/alert_drill_clear_recall.json 2>&1
+  W5=$(poll 10 req_above ${REQ0:-0}); W6=$(poll 12 inv1_is inactive) && AD_CLEAR_OK=1
+  echo "alert_drill: denominator back in P' after ${W4}s (sum=${REQ0:-none}), moved after ${W5}s; INV-1 $(inv1_state) ${W6}s later" | tee -a $EV/rehearsal.log
+  W7=$(poll 75 receipt INV-1 resolved) && AD_RES_OK=1
+  echo "alert_drill: INV-1 resolved receipt after ${W7}s ok=$AD_RES_OK" | tee -a $EV/rehearsal.log
+fi
+# 8. G' and P' through their own pidfiles (obs_stop does the same on any other exit path).
+[ -f $S/promd.pid ] && own_signal $S/promd.pid prometheus TERM 30 >/dev/null
+own_signal $S/gwd.pid humaux-gateway TERM 30 >/dev/null
+echo "alert_drill: elapsed $(( $(date +%s) - AD_T0 ))s" | tee -a $EV/rehearsal.log
+assert_eq "alert_drill_presample_at_zero_and_denominator_dropped" "$AD_PRE_OK$AD_DROP_OK" 11
+assert_eq "alert_drill_abstaining_recall_on_the_scratch_gateway" "$AD_LS" 1
+assert_eq "alert_drill_inv1_fires_in_the_drill_prometheus" "$AD_FIRE_OK" 1
+assert_eq "alert_drill_inv1_firing_reaches_the_alert_route" "$AD_RCPT_OK" 1
+assert_eq "alert_drill_inv1_inactive_after_the_denominator_returns" "$AD_CLEAR_OK" 1
+assert_eq "alert_drill_inv1_resolved_reaches_the_alert_route" "$AD_RES_OK" 1
+
 # ---------- 7. stop ----------
 step stop
 # Through the pidfiles, not the variables: the soak's chaos hook restarts the retrieval worker,
@@ -2032,6 +2392,8 @@ own_signal $S/gw.pid humaux-gateway TERM 30
 own_signal $S/rw.pid humaux-retrieval-worker TERM 30
 own_signal $S/rp.pid humaux-retrieval-worker TERM 90
 own_signal $S/pw.pid humaux-private-worker TERM 30
+own_signal $S/mh.pid humaux-maintenance TERM 30
+obs_stop; trap - EXIT
 sleep 1
 echo "done; tenant kept for inspection: $TENANT (teardown: cargo run -q -p xtask -- e2e-seed --teardown $TENANT)" | tee -a $EV/rehearsal.log
 # Card 21 fix pass: the assertion table IS the verdict. Without this the script exited 0 whatever

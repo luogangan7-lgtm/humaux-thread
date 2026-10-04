@@ -316,14 +316,19 @@ impl Drop for Handle {
         workspace_ids.push(self.workspace_id);
         // Card-31 pattern (card 33 leak fix): remember's EVIDENCE_ACCEPTED rows and every PRIMARY
         // link a governance op materializes enqueue DERIVED_* jobs (0164 triggers). They are deleted
-        // in their own autocommit statement first, so a failure anywhere in the all-or-nothing
-        // teardown below (which ends in the tenant delete) cannot roll the job delete back.
-        if let Err(error) = self.admin.execute(
-            "DELETE FROM ops.jobs WHERE tenant_id=$1",
-            &[&self.tenant_id],
-        ) {
+        // in their own batch first, so a failure anywhere in the all-or-nothing teardown below
+        // (which ends in the tenant delete) cannot roll the job delete back. Card 34 ruling B2: the
+        // fixture-only `(knowledge, ingest)` stream rows join that batch — a leaked checkpoint of an
+        // unregistered family fails `ops.health_snapshot` / `ops.admin_probe_snapshot` closed
+        // (ADR-0061 D-D, §78.2).
+        if let Err(error) = self.admin.batch_execute(&format!(
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}';",
+            self.tenant_id
+        )) {
             eprintln!(
-                "operation receipt fixture job cleanup failed for tenant {}: {error}",
+                "operation receipt fixture job/stream cleanup failed for tenant {}: {error}",
                 self.tenant_id
             );
         }
@@ -394,8 +399,6 @@ impl Drop for Handle {
                 "DELETE FROM ops.outbox WHERE tenant_id=$1",
                 "DELETE FROM projection.private_memory_points WHERE tenant_id=$1",
                 "DELETE FROM projection.tenant_placements WHERE tenant_id=$1",
-                "DELETE FROM projection.stream_log WHERE tenant_id=$1",
-                "DELETE FROM projection.stream_checkpoints WHERE tenant_id=$1",
                 "DELETE FROM private.context_bindings WHERE tenant_id=$1",
                 "DELETE FROM ops.selection_snapshot_items WHERE tenant_id=$1",
                 "DELETE FROM ops.selection_snapshots WHERE tenant_id=$1",

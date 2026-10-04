@@ -32,6 +32,7 @@ pub mod distill_repo;
 pub mod email;
 pub mod exact_census;
 pub mod forget_repo;
+pub mod health;
 pub mod jobs;
 pub mod mechanism_observation;
 pub mod membership_repo;

@@ -164,6 +164,7 @@ async fn spawn_worker_with(
     let state = Arc::new(RpcState {
         expected_gateway_uid,
         calls,
+        pg_dsn: required("HUMAUX_RETRIEVAL_WORKER_PG_DSN"),
         scanner,
         embedder,
         dimension: 4,

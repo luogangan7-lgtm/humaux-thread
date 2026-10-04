@@ -147,7 +147,7 @@ silently stops being a check. The four therefore MUST run as four distinct OS us
 
 ## What is NOT wired, and the unlock condition for each
 
-Nine of the eleven §4.4 probes still report `MissingObject`. That is the spec-conformant answer,
+When card 15 closed, nine of the eleven §4.4 probes reported `MissingObject` (ADR-0061 D-J has since unlocked six; see the table). That is the spec-conformant answer,
 not a placeholder: each names the specific object this process lacks. What none of them can do
 is *read the database*, and that is a structural boundary, not an omission:
 
@@ -166,15 +166,15 @@ is *read the database*, and that is a structural boundary, not an omission:
 
 | probe | unlock condition |
 |---|---|
-| `public.corroborated` / `public.consensus_ready` | the §7.6 GA columns `public.claims.corroboration` / `.contributor_set` must exist, **and** a read path must exist for this process |
-| `stream.watermark`, `outbox.backlog`, `jobs.stuck`, `parse.poison` | a `role_admin` SELECT grant (migration + §6.2.2 row + `xtask rls_check` MATRIX row in the same change), **and** a read path, **and** the tenant argument above |
-| `degrade.counters` | a process-external store for `degrade_total{code}`; today it is an in-process counter, so no second process can read another's counts at all |
-| `flags.effective` | the effective-flag resolution is built per process inside `humaux_gateway::bootstrap` and published nowhere; §4.4 坑4 wants the *effective* value, which by construction only the resolving process holds |
-| `tls.expiry` | a configured certificate store and an X.509 parser; `humaux-admin` links neither |
+| `public.corroborated` / `public.consensus_ready` | the §7.6 GA columns `public.claims.corroboration` / `.contributor_set` must exist, **and** a read path must exist for this process. **Still refused** after ADR-0061: the columns do not exist, so the probe exits non-zero naming them (§4.4 line 883). |
+| `stream.watermark`, `outbox.backlog`, `jobs.stuck` | **Unlocked by ADR-0061 D-J** as an aggregate definer instead of table grants plus a tenant argument: `ops.admin_probe_snapshot()` (migration 0210, owner the NOLOGIN `role_health_reader`, EXECUTE `role_admin` only) returns cross-tenant counts and no tenant id; read through `adapters::health::read_admin_probe_snapshot`. |
+| `parse.poison` | **Still refused** after ADR-0061: no POISON state or `limit_hit` column exists anywhere; the probe names `limit_hit`. |
+| `degrade.counters` | **Unlocked by ADR-0061 D-J**: each process serves its counters on its loopback `/status` (ADR-0061 D-B); the probe sums every `HUMAUX_ADMIN_OPS_ADDRS` entry and refuses, naming it, when one is unreachable. |
+| `flags.effective` | **Unlocked by ADR-0061 D-J**: the gateway publishes its resolved `effective_config` (source per entry, no secret value) on its loopback `/status`. |
+| `tls.expiry` | **Unlocked by ADR-0061 D-J**: certificate paths in `HUMAUX_ADMIN_TLS_CERT_PATHS`, parsed with `x509-cert`. |
 
-All five unlock conditions touch `migrations/`, `crates/adapters/`, or `bins/admin/Cargo.toml` —
-none of which are in card 15's allowed-file set. They are recorded here so the next card that
-opens one of those files knows what it unblocks.
+The table above was written for card 15, whose allowed files excluded `migrations/`, `crates/adapters/` and
+`bins/admin/Cargo.toml`; card 34 (ADR-0061) opened them. After it the catalog is 8 Readings and 3 typed refusals.
 
 ## Acceptance evidence
 

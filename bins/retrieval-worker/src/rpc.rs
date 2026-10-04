@@ -2,7 +2,7 @@
 //!   serves.
 //! Depends-on: crates=[axum, humaux-adapters, humaux-domain, humaux-local-secret-scan, humaux-retrieval,
 //!   humaux-retrieval-provider, serde, sha2, tokio, tracing,
-//!   uuid]; services=[]; env=[]; modules=[adapters::postgres, adapters::retrieval_embedding_rpc, domain::error,
+//!   uuid]; services=[PostgreSQL(role_retrieval_worker)]; env=[]; modules=[adapters::postgres, adapters::retrieval_embedding_rpc, domain::error,
 //!   domain::identity, domain::ids, humaux-local-secret-scan, retrieval-provider::contract, retrieval::request]
 //! Called-by: [retrieval-worker::main, tests]
 //! Invariants: [a malformed or unauthenticated RPC frame is rejected before it reaches the embedding provider call]
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -100,6 +100,10 @@ impl
 pub struct RpcState {
     pub expected_gateway_uid: u32,
     pub calls: RetrievalWorkerDbPool,
+    /// ADR-0061 D-F: the readiness route opens one fresh `role_retrieval_worker` connection with
+    /// this DSN per check (the worker's `--readyz` contract), so a rotated password shows here as it
+    /// would at the next pool growth. A secret: `RpcState` has no `Debug` and never serializes it.
+    pub pg_dsn: String,
     pub scanner: Arc<LocalSecretScanner>,
     pub embedder: Arc<dyn EmbeddingProvider>,
     pub dimension: u32,
@@ -127,11 +131,27 @@ pub fn router(state: Arc<RpcState>) -> Router {
             "/internal/v1/retrieval/query-embedding",
             post(query_embedding_handler),
         )
+        .route("/internal/v1/retrieval/readyz", get(readyz_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_gateway_uid,
         ))
         .with_state(state)
+}
+
+/// ADR-0061 D-F: the gateway's `retrieval_rpc` readiness round trip. One fresh connection as
+/// `role_retrieval_worker` (current_user checked, §6.2.3 assertion E), then closed; never the
+/// embedding provider (a paid call per refresh). 503 names the missing object, never the DSN.
+async fn readyz_handler(State(state): State<Arc<RpcState>>) -> Response {
+    // dep: PostgreSQL(role_retrieval_worker) — readiness: one fresh connect per check, then dropped
+    match RetrievalWorkerDbPool::connect(&state.pg_dsn).await {
+        Ok(_) => (StatusCode::OK, "ready\n").into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("missing object: PostgreSQL as role_retrieval_worker ({e})\n"),
+        )
+            .into_response(),
+    }
 }
 
 enum WorkerRpcError {

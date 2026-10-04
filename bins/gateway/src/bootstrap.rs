@@ -4,35 +4,34 @@
 //!   stream cache) — the same family the 14 governance / subject / affect writes attach to since ADR-0054, so
 //!   the process holds no default write pair at all.
 //! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-contracts, humaux-domain, humaux-infra-cell,
-//!   humaux-protocol, tokio,
-//!   uuid]; services=[PostgreSQL(role_gateway)]; env=[HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS,
-//!   HUMAUX_GATEWAY_BIND_ADDR, HUMAUX_GATEWAY_CALLER_ID, HUMAUX_GATEWAY_CELL_ID,
-//!   HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS,
-//!   HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX,
-//!   HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX, HUMAUX_GATEWAY_EMBEDDING_DIMENSION,
-//!   HUMAUX_GATEWAY_EMBEDDING_VERSION, HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
-//!   HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST, HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS,
-//!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES,
-//!   HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS, HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS,
-//!   HUMAUX_GATEWAY_QDRANT_CIDR,
+//!   humaux-protocol, humaux-telemetry, serde_json, tokio, uuid]; services=[PostgreSQL(role_gateway)];
+//!   env=[HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS, HUMAUX_GATEWAY_BIND_ADDR,
+//!   HUMAUX_GATEWAY_CALLER_ID, HUMAUX_GATEWAY_CELL_ID, HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS, HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS,
+//!   HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX,
+//!   HUMAUX_GATEWAY_EMBEDDING_DIMENSION, HUMAUX_GATEWAY_EMBEDDING_VERSION, HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS,
+//!   HUMAUX_GATEWAY_GLOBAL_DENYLIST, HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST,
+//!   HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS, HUMAUX_GATEWAY_MAX_FORWARDED_HOPS,
+//!   HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES, HUMAUX_GATEWAY_METRICS_ADDR, HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS,
+//!   HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_GATEWAY_QDRANT_CIDR,
 //!   HUMAUX_GATEWAY_QDRANT_HOST, HUMAUX_GATEWAY_QDRANT_PORT, HUMAUX_GATEWAY_QDRANT_TLS,
-//!   HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN, HUMAUX_GATEWAY_REMEMBER_EVENT_KIND,
-//!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION,
-//!   HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID, HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND,
-//!   HUMAUX_GATEWAY_REMEMBER_TENANT_ID, HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS,
-//!   HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS, HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID,
-//!   HUMAUX_GATEWAY_REPLAY_TTL_SECONDS, HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS,
-//!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_PRODUCTION_ENABLED, HUMAUX_GATEWAY_RETRIEVAL_PROFILE_QUERY_TRANSFORM,
-//!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K, HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS,
-//!   HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH, HUMAUX_GATEWAY_TOKEN_HMAC_KEY, HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS,
-//!   HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS,
+//!   HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS, HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN,
+//!   HUMAUX_GATEWAY_REMEMBER_EVENT_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND,
+//!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION, HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID,
+//!   HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND, HUMAUX_GATEWAY_REMEMBER_TENANT_ID,
+//!   HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS,
+//!   HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID, HUMAUX_GATEWAY_REPLAY_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS, HUMAUX_GATEWAY_RETRIEVAL_PROFILE_PRODUCTION_ENABLED,
+//!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_QUERY_TRANSFORM, HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K,
+//!   HUMAUX_GATEWAY_RETRIEVAL_RPC_PERMIT_TTL_SECONDS, HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH,
+//!   HUMAUX_GATEWAY_TOKEN_HMAC_KEY, HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS,
 //!   HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS, HUMAUX_GATEWAY_UNKNOWN]; modules=[adapters::postgres, adapters::quota_repo,
-//!   adapters::retrieve,
-//!   application::retrieval_embedding_port, contracts::config_registry, contracts::retrieval_config,
-//!   domain::context, domain::dataclass, domain::identity, gateway::context, gateway::guard,
-//!   gateway::mcp_application, gateway::recall, gateway::remember, gateway::retrieval_embedding_client,
-//!   infra-cell::permit, infra-cell::resource, infra-cell::transport, protocol::edge, protocol::mcp, protocol::mcp_catalog]
-//! Called-by: [gateway::main]
+//!   adapters::retrieve, application::retrieval_embedding_port, contracts::config_registry,
+//!   contracts::retrieval_config, domain::context, domain::dataclass, domain::identity, gateway::context,
+//!   gateway::guard, gateway::mcp_application, gateway::recall, gateway::remember,
+//!   gateway::retrieval_embedding_client, gateway::status, infra-cell::permit, infra-cell::resource,
+//!   infra-cell::transport, protocol::edge, protocol::mcp, protocol::mcp_catalog, telemetry::metrics]
+//! Called-by: [gateway::main, tests]
 //! Invariants: [one process serves every (tenant, workspace) pair with no per-process stream cache or registry table; GuardSettings::tenant_network stays empty until a separate authorization approves a tenant-specific network policy]
 //! Spec: Baseline §34.0.1; §78.1; ADR-0031; ADR-0032; ADR-0054
 //!
@@ -74,6 +73,8 @@ use humaux_protocol::{
 };
 use uuid::Uuid;
 
+use serde_json::{Map, Value};
+
 use crate::{
     context::ContextBootstrap,
     guard::{GatewayGuard, GuardRatePolicies, GuardSettings},
@@ -81,6 +82,7 @@ use crate::{
     recall::{SemanticRecallRuntime, SemanticRecallVersions},
     remember::{self, ProcessFamily, RememberEventKind, RememberPolicy},
     retrieval_embedding_client::GatewayRetrievalEmbeddingClient,
+    status::{METRICS_ADDR_KEY, READINESS_REFRESH_KEY, ReadinessProbe, SemanticDeps},
 };
 
 const PREFIX: &str = "HUMAUX_GATEWAY_";
@@ -139,6 +141,12 @@ pub struct GatewayBootstrap {
     mood_half_life: Duration,
     /// §15.5 / ADR-0059 D-G consistency-token MAC keys, installed process-wide in [`Self::build`].
     token_keys: TokenKeys,
+    /// ADR-0061 D-B `HUMAUX_GATEWAY_METRICS_ADDR`: the loopback ops listener (`/metrics`, `/status`).
+    metrics_addr: SocketAddr,
+    /// ADR-0061 D-F `HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS`.
+    readiness_refresh: Duration,
+    /// ADR-0061 D-B: one `{name, source, value | secret}` row per `registry()` entry, for `/status`.
+    effective_config: Value,
 }
 
 /// Parsed `HUMAUX_GATEWAY_RETRIEVAL_RPC_*` / `HUMAUX_GATEWAY_EMBEDDING_*` /
@@ -164,6 +172,11 @@ pub struct GatewayRuntime {
     bind_addr: SocketAddr,
     adapter: McpAdapter,
     config_fingerprint: String,
+    guard: Arc<GatewayGuard>,
+    readiness: Option<ReadinessProbe>,
+    metrics_addr: SocketAddr,
+    readiness_refresh: Duration,
+    effective_config: Value,
 }
 
 impl GatewayRuntime {
@@ -181,6 +194,35 @@ impl GatewayRuntime {
     #[must_use]
     pub fn config_fingerprint(&self) -> &str {
         &self.config_fingerprint
+    }
+
+    /// The guard whose counters `/metrics` renders.
+    #[must_use]
+    pub fn guard(&self) -> Arc<GatewayGuard> {
+        Arc::clone(&self.guard)
+    }
+
+    /// The readiness checks, handed once to the refresh task (`None` after the first call).
+    pub fn take_readiness_probe(&mut self) -> Option<ReadinessProbe> {
+        self.readiness.take()
+    }
+
+    /// ADR-0061 D-B: the loopback ops listener address.
+    #[must_use]
+    pub const fn metrics_addr(&self) -> SocketAddr {
+        self.metrics_addr
+    }
+
+    /// ADR-0061 D-F: the readiness refresh interval (also each check's deadline).
+    #[must_use]
+    pub const fn readiness_refresh(&self) -> Duration {
+        self.readiness_refresh
+    }
+
+    /// The `/status` `effective_config` rows; no secret value is in them.
+    #[must_use]
+    pub fn effective_config(&self) -> &Value {
+        &self.effective_config
     }
 }
 
@@ -257,14 +299,16 @@ impl GatewayBootstrap {
                 "must be positive seconds",
             )
         })?;
+        let mut semantic = None;
         match self.semantic_recall {
             Some(config) => {
-                let runtime = build_semantic_recall_runtime(
+                let (runtime, deps) = build_semantic_recall_runtime(
                     guard.runtime_pool(),
                     config,
                     self.handler_timeout,
                 )?;
                 application = application.with_semantic_recall(runtime);
+                semantic = Some(deps);
             }
             None => {
                 // §57.1: not_applicable prints the missing object's name, not a silent skip.
@@ -279,6 +323,14 @@ impl GatewayBootstrap {
             bind_addr: self.bind_addr,
             adapter: McpAdapter::new(application, advertised, self.http),
             config_fingerprint: self.config_fingerprint,
+            readiness: Some(ReadinessProbe {
+                pool: guard.runtime_pool(),
+                semantic,
+            }),
+            guard,
+            metrics_addr: self.metrics_addr,
+            readiness_refresh: self.readiness_refresh,
+            effective_config: self.effective_config,
         })
     }
 
@@ -303,6 +355,11 @@ impl GatewayBootstrap {
             "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS",
         )?;
         let token_keys = parse_token_keys(&effective)?;
+        let metrics_addr = parse_metrics_addr(required(&effective, METRICS_ADDR_KEY)?)?;
+        let readiness_refresh = seconds(
+            required(&effective, READINESS_REFRESH_KEY)?,
+            READINESS_REFRESH_KEY,
+        )?;
 
         Ok(Self {
             bind_addr: parse_bind_addr(required(&effective, "HUMAUX_GATEWAY_BIND_ADDR")?)?,
@@ -319,8 +376,52 @@ impl GatewayBootstrap {
             undo_window,
             mood_half_life,
             token_keys,
+            metrics_addr,
+            readiness_refresh,
+            effective_config: effective_config_rows(&registry, &raw, &effective),
         })
     }
+}
+
+/// ADR-0061 D-B: the ops listener binds loopback only, on a fixed port Prometheus can target.
+fn parse_metrics_addr(value: &str) -> Result<SocketAddr, BootstrapError> {
+    humaux_telemetry::metrics::parse_ops_addr(value)
+        .map_err(|reason| BootstrapError::new(METRICS_ADDR_KEY, reason))
+}
+
+/// ADR-0061 D-B: the `/status` `effective_config` rows — `source` is `env` when the variable was
+/// set and `default` otherwise. The one place a value is exposed, and it reads the entry's own
+/// `secret` flag for every entry whichever constructor (`entry` / `entry_with_default`) made it:
+/// a secret row carries `secret: true` and no `value` key at all.
+fn effective_config_rows(
+    registry: &[ConfigEntry],
+    raw: &BTreeMap<String, String>,
+    effective: &BTreeMap<String, String>,
+) -> Value {
+    registry
+        .iter()
+        .map(|entry| {
+            let source = if raw.contains_key(&entry.name) {
+                "env"
+            } else {
+                "default"
+            };
+            let mut row = Map::new();
+            row.insert("name".into(), Value::from(entry.name.as_str()));
+            row.insert("source".into(), Value::from(source));
+            if entry.secret {
+                row.insert("secret".into(), Value::Bool(true));
+            } else {
+                row.insert(
+                    "value".into(),
+                    effective
+                        .get(&entry.name)
+                        .map_or(Value::Null, |v| Value::from(v.as_str())),
+                );
+            }
+            Value::Object(row)
+        })
+        .collect()
 }
 
 /// ADR-0059 D-G: `HUMAUX_GATEWAY_TOKEN_HMAC_KEY` (required, no default) and the optional rotation
@@ -618,7 +719,7 @@ fn build_semantic_recall_runtime(
     pool: Arc<RuntimeDbPool>,
     config: SemanticRecallConfig,
     handler_timeout: Duration,
-) -> Result<SemanticRecallRuntime, BootstrapError> {
+) -> Result<(SemanticRecallRuntime, SemanticDeps), BootstrapError> {
     let mut entries = BTreeMap::new();
     entries.insert(
         IntraCellResource::QDRANT_REST,
@@ -662,13 +763,20 @@ fn build_semantic_recall_runtime(
             )
         })?,
     );
-    let embedding_port: Arc<dyn RetrievalEmbeddingPort> =
-        Arc::new(GatewayRetrievalEmbeddingClient::new(
-            pool,
-            config.socket_path,
-            registry.clone(),
-            config.permit_ttl,
-        ));
+    let client = Arc::new(GatewayRetrievalEmbeddingClient::new(
+        pool,
+        config.socket_path.clone(),
+        registry.clone(),
+        config.permit_ttl,
+    ));
+    // ADR-0061 D-F: readiness checks the same client, socket, transport and registry recall uses.
+    let deps = SemanticDeps {
+        rpc: Arc::clone(&client),
+        socket_path: config.socket_path,
+        qdrant: qdrant_transport.clone(),
+        registry: registry.clone(),
+    };
+    let embedding_port: Arc<dyn RetrievalEmbeddingPort> = client;
     // ADR-0056 D-C: no scanner here — the retrieval worker's `seal_query` is the one query seal.
     SemanticRecallRuntime::new(
         embedding_port,
@@ -680,6 +788,7 @@ fn build_semantic_recall_runtime(
         },
         handler_timeout,
     )
+    .map(|runtime| (runtime, deps))
     .map_err(|_| BootstrapError::new("gateway semantic recall", "invalid runtime configuration"))
 }
 
@@ -690,7 +799,11 @@ fn retrieval_env_key(canonical_key: &str) -> String {
     )
 }
 
-fn registry() -> Vec<ConfigEntry> {
+/// Every `HUMAUX_GATEWAY_*` key this process reads (§78.1): the boot validator, the config
+/// fingerprint and the `/status` `effective_config` all derive from this one list. Public so the
+/// ops-listener test derives its secret canaries from it rather than from a hand list.
+#[must_use]
+pub fn registry() -> Vec<ConfigEntry> {
     let mut entries = [
         ("BIND_ADDR", "socket_addr", false),
         ("ALLOWED_HOSTS", "csv", false),
@@ -732,6 +845,9 @@ fn registry() -> Vec<ConfigEntry> {
         ("REMEMBER_EVENT_KIND", "enum", false),
         ("CONTEXT_TOTAL_TOKENS", "u32", false),
         ("CONTEXT_MANDATORY_TOKENS", "u32", false),
+        // ADR-0061 D-B / D-F: no default — boot-fatal when absent.
+        ("METRICS_ADDR", "socket_addr", false),
+        ("READINESS_REFRESH_SECONDS", "u64", false),
     ]
     .into_iter()
     .map(|(suffix, type_name, secret)| entry(&format!("{PREFIX}{suffix}"), type_name, secret))
@@ -1036,6 +1152,8 @@ mod tests {
                 "HUMAUX_GATEWAY_REMEMBER_EVENT_KIND" => "USER_MESSAGE".into(),
                 "HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS" => "2048".into(),
                 "HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS" => "1024".into(),
+                "HUMAUX_GATEWAY_METRICS_ADDR" => "127.0.0.1:9101".into(),
+                "HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS" => "2".into(),
                 // Semantic recall stays disabled in this fixture (empty socket path) — every
                 // other key in this group may legitimately be blank when it is.
                 "HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH"
@@ -1257,6 +1375,65 @@ mod tests {
         values.insert("HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K".into(), "7".into());
         let changed = GatewayBootstrap::from_raw(values).expect("registered profile override");
         assert_ne!(first.config_fingerprint, changed.config_fingerprint);
+    }
+
+    /// ADR-0061 D-B / D-F: both new keys are required with no code default; a non-loopback or
+    /// port-0 ops address and a zero refresh are refused naming the key (T-G6 at the parser).
+    #[test]
+    fn ops_keys_are_required_and_the_ops_address_is_loopback_only() {
+        for key in [METRICS_ADDR_KEY, READINESS_REFRESH_KEY] {
+            assert!(
+                registry()
+                    .iter()
+                    .any(|entry| entry.name == key && entry.default.is_none()),
+                "{key} must be declared without a default"
+            );
+            let mut values = raw();
+            values.remove(key);
+            assert_eq!(rejected_key(values), key);
+        }
+        for bad in ["0.0.0.0:9101", "10.0.0.1:9101", "127.0.0.1:0", "nonsense"] {
+            let mut values = raw();
+            values.insert(METRICS_ADDR_KEY.into(), bad.into());
+            assert_eq!(rejected_key(values), METRICS_ADDR_KEY, "{bad}");
+        }
+        let mut values = raw();
+        values.insert(READINESS_REFRESH_KEY.into(), "0".into());
+        assert_eq!(rejected_key(values), READINESS_REFRESH_KEY);
+    }
+
+    /// ADR-0061 D-B: every registry entry has one `/status` row; a secret row has no `value` key,
+    /// whichever constructor declared it. Fault: emit `value` for `entry_with_default` rows ⇒ red.
+    #[test]
+    fn effective_config_rows_never_carry_a_secret_value() {
+        let mut values = raw();
+        values.insert(
+            "HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS".into(),
+            generated_key_hex(),
+        );
+        values.remove("HUMAUX_GATEWAY_REMEMBER_TENANT_ID");
+        let boot = GatewayBootstrap::from_raw(values.clone()).expect("valid config");
+        let rows = boot.effective_config.as_array().expect("rows");
+        assert_eq!(rows.len(), registry().len());
+        for entry in registry() {
+            let row = rows
+                .iter()
+                .find(|r| r["name"] == entry.name.as_str())
+                .unwrap_or_else(|| panic!("{} has no row", entry.name));
+            if entry.secret {
+                assert_eq!(row["secret"], true, "{row}");
+                assert!(row.get("value").is_none(), "{row}");
+                if let Some(secret) = values.get(&entry.name).filter(|v| !v.is_empty()) {
+                    assert!(!boot.effective_config.to_string().contains(secret.as_str()));
+                }
+            } else {
+                assert!(row.get("value").is_some(), "{row}");
+            }
+        }
+        let source =
+            |name: &str| rows.iter().find(|r| r["name"] == name).expect("row")["source"].clone();
+        assert_eq!(source("HUMAUX_GATEWAY_BIND_ADDR"), "env");
+        assert_eq!(source("HUMAUX_GATEWAY_REMEMBER_TENANT_ID"), "default");
     }
 
     fn semantic_recall_enabled_values() -> BTreeMap<String, String> {

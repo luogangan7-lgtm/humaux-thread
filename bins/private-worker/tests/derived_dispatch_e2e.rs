@@ -9,17 +9,17 @@
 //!   control.reasoning_route_policies, control.tenants, control.users, ops.jobs, ops.outbox, ops.provider_slots,
 //!   ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, private.events,
 //!   private.evidence_objects, private.memory_evidence], PostgreSQL(role_maintenance), PostgreSQL(role_private_worker) x=[ops.claim_derived_work_v2],
-//!   subprocess(humaux-private-worker), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-private-worker,
+//!   HTTP(loopback), subprocess(humaux-private-worker), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-private-worker,
 //!   HUMAUX_CARD15_TEST_SECRET, HUMAUX_LIVE_P2_KEY_ENV, HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS,
 //!   HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS,
 //!   HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS,
-//!   HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS,
+//!   HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR, HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS,
 //!   HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS,
 //!   HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_REGIONS, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH,
-//!   HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY, PRIVATE_WORKER_PG_DSN,
+//!   HUMAUX_PRIVATE_WORKER_SERVE_RPC_METRICS_ADDR, HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY, PRIVATE_WORKER_PG_DSN,
 //!   refused:HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID]; modules=[adapters::byok,
 //!   adapters::contribution_reasoner, adapters::disclosure, adapters::distill_reasoner, adapters::jobs,
 //!   adapters::membership_repo, adapters::postgres, adapters::provisioning, adapters::reasoning_route_admission,
@@ -3983,8 +3983,38 @@ fn distill_serve_command(dsn: &str, credentials: &str) -> std::process::Command 
         .env("HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS", "5")
         .env("HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS", "1")
         .env("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS", "60")
-        .env("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS", "10000");
+        .env("HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS", "10000")
+        // ADR-0061 D-B: each resident mode's own ops listener, a fresh free loopback port per spawn (two
+        // resident workers run at once in E10).
+        .env(
+            "HUMAUX_PRIVATE_WORKER_SERVE_RPC_METRICS_ADDR",
+            free_ops_addr(),
+        )
+        .env(
+            "HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR",
+            free_ops_addr(),
+        );
     cmd
+}
+
+/// The status line of one `GET /metrics`, `None` when the port refuses.
+fn ops_metrics_status(addr: std::net::SocketAddr) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+    // dep: HTTP(loopback) — the child's ops listener
+    let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    write!(s, "GET /metrics HTTP/1.1\r\nHost: {addr}\r\n\r\n").ok()?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).ok()?;
+    raw.lines().next().map(str::to_owned)
+}
+
+/// A loopback address that was bound and released, for one spawn's ops listener.
+fn free_ops_addr() -> String {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("reserve a loopback port")
+        .to_string()
 }
 
 fn wait_exit(
@@ -4111,6 +4141,7 @@ fn distill_serve_drains_on(sig: &str, test_name: &'static str) {
 
 /// ADR-0037 D3, the RPC-listener half: `--serve-rpc` holds no lease, its drain is "stop
 /// accepting and return zero". 注错: drop the `shutdown.recv()` arm from `serve_rpc`'s `select!`.
+/// ADR-0061 D-B: its ops listener answers while it serves and is closed after the exit.
 #[test]
 fn sigterm_to_the_inference_rpc_listener_exits_zero() {
     run(
@@ -4124,8 +4155,10 @@ fn sigterm_to_the_inference_rpc_listener_exits_zero() {
             let socket_path = format!("/tmp/hp15-rpc-{}.sock", Uuid::now_v7().simple());
             let _ = std::fs::remove_file(&socket_path);
             let dsn = dsn_as_role(&handle.dsn, "role_private_worker");
+            let ops = free_ops_addr();
             let mut child = distill_serve_command(&dsn, &credentials)
                 .arg("--serve-rpc")
+                .env("HUMAUX_PRIVATE_WORKER_SERVE_RPC_METRICS_ADDR", &ops)
                 .env("HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH", &socket_path)
                 .env(
                     "HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID",
@@ -4142,12 +4175,21 @@ fn sigterm_to_the_inference_rpc_listener_exits_zero() {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
+            let ops: std::net::SocketAddr = ops.parse().expect("ops address");
+            assert!(
+                ops_metrics_status(ops).is_some_and(|line| line.contains(" 200 ")),
+                "--serve-rpc's ops listener does not answer /metrics on {ops}"
+            );
             signal(child.id(), "TERM");
             let status = wait_exit(&mut child, Duration::from_secs(60), "the RPC listener");
             let _ = std::fs::remove_file(&socket_path);
             assert!(
                 status.success(),
                 "a drained RPC listener must exit zero, got {status:?}"
+            );
+            assert!(
+                ops_metrics_status(ops).is_none(),
+                "the ops port {ops} still accepts after exit"
             );
         },
     );

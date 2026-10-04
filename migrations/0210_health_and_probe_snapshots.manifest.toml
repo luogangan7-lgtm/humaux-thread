@@ -1,0 +1,60 @@
+# §46.1 migration manifest. Card 34 / ADR-0061 D-D, D-J: role_health_reader (NOLOGIN, no members) owns the two
+# read-only aggregate definers ops.health_snapshot(timestamptz) (EXECUTE role_maintenance) and
+# ops.admin_probe_snapshot() (EXECUTE role_admin); five `_health_reader_read` policies admit only that role.
+# REVERSIBLE, first free after 0209.
+
+migration_id = "0210_health_and_probe_snapshots"
+class = "REVERSIBLE"
+
+# Roles are cluster-global (0201 note): another database of this cluster may already hold the reader, so the
+# precheck accepts a pre-existing role only in its frozen shape and keys "not applied" on the database-local
+# functions and policies.
+precheck = """
+select to_regprocedure('ops.health_snapshot(timestamptz)') is null
+ and to_regprocedure('ops.admin_probe_snapshot()') is null
+ and not exists (select 1 from pg_policy where polname like '%\\_health\\_reader\\_read')
+ and coalesce((select not r.rolcanlogin and not r.rolsuper and not r.rolbypassrls and r.rolpassword is null
+                 and not exists (select 1 from pg_auth_members m where m.roleid = r.oid or m.member = r.oid)
+                 from pg_authid r where r.rolname = 'role_health_reader'), true)
+ as precheck_ok
+"""
+
+postcheck = """
+with login_role(r) as (values ('role_gateway'), ('role_private_worker'), ('role_consolidation_worker'),
+  ('role_public_worker'), ('role_retrieval_worker'), ('role_batch_issuer'), ('role_maintenance'),
+  ('role_admin')),
+fn(sig, executor) as (values ('ops.health_snapshot(timestamptz)', 'role_maintenance'),
+  ('ops.admin_probe_snapshot()', 'role_admin')),
+pol(tbl, name) as (values ('ops.jobs', 'jobs_health_reader_read'),
+  ('ops.data_disclosures', 'data_disclosures_health_reader_read'), ('ops.outbox', 'outbox_health_reader_read'),
+  ('projection.stream_checkpoints', 'stream_checkpoints_health_reader_read'),
+  ('projection.stream_log', 'stream_log_health_reader_read')),
+readable(rel) as (values ('ops.jobs'), ('ops.data_disclosures'), ('ops.outbox'),
+  ('projection.stream_checkpoints'), ('projection.processing_gaps'))
+select
+  (select not r.rolcanlogin and not r.rolinherit and not r.rolsuper and not r.rolcreatedb and not r.rolcreaterole
+          and not r.rolreplication and not r.rolbypassrls and r.rolpassword is null
+     from pg_authid r where r.rolname = 'role_health_reader') is true
+  and not exists (select 1 from pg_auth_members m
+                   where m.roleid = (select oid from pg_roles where rolname = 'role_health_reader') or m.member = (select oid from pg_roles where rolname = 'role_health_reader'))
+  and (select count(*) from fn where to_regprocedure(fn.sig) is not null) = 2
+  and (select bool_and(pg_get_userbyid(p.proowner) = 'role_health_reader' and p.prosecdef and p.provolatile = 's'
+                       and 'search_path=pg_catalog, ops, projection' = any(coalesce(p.proconfig, '{}'))
+                       and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                                        where x.grantee = 0 and x.privilege_type = 'EXECUTE')
+                       and (select bool_and(has_function_privilege(l.r, p.oid, 'EXECUTE') = (l.r = fn.executor))
+                              from login_role l))
+         from fn join pg_proc p on p.oid = to_regprocedure(fn.sig)) is true
+  and (select count(*) from pg_proc p where p.proowner = (select oid from pg_roles where rolname = 'role_health_reader')) = 2
+  and not exists (select 1 from pg_class c where c.relowner = (select oid from pg_roles where rolname = 'role_health_reader'))
+  and (select count(*) from pol join pg_policy p
+         on p.polrelid = to_regclass(pol.tbl) and p.polname = pol.name
+        where p.polpermissive and p.polcmd = 'r' and p.polroles = array[0::oid]
+          and pg_get_expr(p.polqual, p.polrelid) = '(CURRENT_USER = ''role_health_reader''::name)'
+          and p.polwithcheck is null) = 5
+  and (select bool_and(has_table_privilege('role_health_reader', readable.rel, 'SELECT')) from readable)
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP FUNCTION ops.health_snapshot(timestamptz); DROP FUNCTION ops.admin_probe_snapshot(); DROP POLICY jobs_health_reader_read ON ops.jobs; DROP POLICY data_disclosures_health_reader_read ON ops.data_disclosures; DROP POLICY outbox_health_reader_read ON ops.outbox; DROP POLICY stream_checkpoints_health_reader_read ON projection.stream_checkpoints; DROP POLICY stream_log_health_reader_read ON projection.stream_log; REVOKE SELECT ON ops.jobs, ops.data_disclosures, ops.outbox, projection.stream_checkpoints, projection.processing_gaps FROM role_health_reader; REVOKE USAGE ON SCHEMA ops, projection FROM role_health_reader; then, once no other database of the cluster still holds its grants, DROP ROLE role_health_reader. humaux-maintenance health serve and the admin aggregate probes then fail naming the missing function."
+backup_restore_requirement = "none: one NOLOGIN role, grants, five SELECT policies and two read-only functions; no row data is changed."

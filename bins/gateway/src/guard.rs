@@ -1,11 +1,11 @@
 //! `gateway::guard` — §83: one business admission path for every canonical MCP operation.
-//! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-domain, humaux-protocol, serde_json, sha2,
-//!   time, tokio, uuid]; services=[]; env=[]; modules=[adapters::confirm_token_repo, adapters::operation_receipt,
-//!   adapters::postgres, adapters::quota_repo, adapters::remember, adapters::request_guard_repo,
-//!   application::supersede, domain::affect, domain::audit, domain::confirm, domain::error, domain::identity,
-//!   domain::ids, domain::selection, domain::subject, gateway::auth, protocol::edge, protocol::mcp,
-//!   protocol::mcp_catalog]
-//! Called-by: [gateway::bootstrap, gateway::mcp_application, gateway::memory, tests]
+//! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-domain, humaux-protocol, humaux-telemetry,
+//!   serde_json, sha2, time, tokio, uuid]; services=[]; env=[]; modules=[adapters::confirm_token_repo,
+//!   adapters::operation_receipt, adapters::postgres, adapters::quota_repo, adapters::remember,
+//!   adapters::request_guard_repo, application::supersede, domain::affect, domain::audit, domain::confirm,
+//!   domain::error, domain::identity, domain::ids, domain::selection, domain::subject, gateway::auth,
+//!   protocol::edge, protocol::mcp, protocol::mcp_catalog, telemetry::metrics]
+//! Called-by: [gateway::bootstrap, gateway::main, gateway::mcp_application, gateway::memory, gateway::status, tests]
 //! Invariants: [transport owns HTTP validation only; this layer is the sole place that authenticates, authorizes and admits a request, so an operation that bypasses it is a bug, not a variant path]
 //! Spec: Baseline §83; §52.1; ADR-0018; ADR-0028; ADR-0030; ADR-0054
 //!
@@ -40,9 +40,10 @@ use humaux_protocol::{
         Cidr, ClientNetworkIdentity, IpPolicyDecision, IpPolicyInput, TrustedProxyConfig,
         build_client_network_identity, evaluate_ip_policy,
     },
-    mcp::{McpHttpContext, McpOperation},
+    mcp::{McpHttpContext, McpOperation, ToolName},
     mcp_catalog::{MeterKind, OperationDescriptor},
 };
+use humaux_telemetry::metrics::{Family, families, write_family};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -102,32 +103,108 @@ impl AuthorizedRequest {
 }
 
 /// Operational counters only. They are never an authority for rate limits or billing.
-/// All family/label strings originate from this module or closed protocol/error enums.
+/// Every label value is a `&'static str` from this module or a closed protocol/error enum, in the
+/// order of its family's §41.2 label list (ADR-0061 D-A).
 #[derive(Default)]
 pub struct GuardMetrics {
-    counters: Mutex<BTreeMap<String, u64>>,
+    counters: Mutex<BTreeMap<(&'static str, Vec<&'static str>), u64>>,
 }
 
+/// The six guard families, in render order (ADR-0061 D-C).
+const GUARD_FAMILIES: [&Family; 6] = [
+    &families::HUMAUX_MCP_REQUESTS_TOTAL,
+    &families::MCP_AUTH_ATTEMPTS_TOTAL,
+    &families::MCP_AUTHZ_DENIED_TOTAL,
+    &families::MCP_QUOTA_RESERVATIONS_TOTAL,
+    &families::MCP_BMO_CONSUMED_TOTAL,
+    &families::RATE_LIMIT_REJECTED_TOTAL,
+];
+
+/// Every `ToolName` (protocol keeps its own list private); the exhaustive match in
+/// `tools_list_every_variant_once` makes a new variant a compile error until it is added here (§78.2).
+const TOOLS: [ToolName; 8] = [
+    ToolName::Remember,
+    ToolName::Recall,
+    ToolName::Memory,
+    ToolName::Context,
+    ToolName::Continuity,
+    ToolName::Artifact,
+    ToolName::Code,
+    ToolName::Coordinate,
+];
+
+/// The closed value set of each label of `f`, in label order (ADR-0061 D-A seeding rule). The
+/// values are exactly what this module's `increment` calls pass.
+fn label_values(f: &Family) -> Vec<Vec<&'static str>> {
+    let error_codes = || ErrorCode::ALL.iter().map(|c| c.as_str());
+    match f.name {
+        "humaux_mcp_requests_total" => vec![
+            TOOLS.iter().map(|t| t.as_str()).collect(),
+            std::iter::once("ok").chain(error_codes()).collect(),
+            vec![PLAN_CLASS],
+        ],
+        // §41.2 frozen `result` set; `flow` has one authenticate path (`authenticate`).
+        "mcp_auth_attempts_total" => vec![
+            vec!["ok", "bad_credential", "expired", "locked"],
+            vec![AUTH_FLOW],
+        ],
+        "mcp_authz_denied_total" => vec![error_codes().collect()],
+        "mcp_quota_reservations_total" => vec![vec!["ok", "denied"]],
+        "mcp_bmo_consumed_total" => vec![vec![PLAN_CLASS]],
+        "rate_limit_rejected_total" => {
+            vec![vec!["ip", "credential", "user", "tenant", "operation"]]
+        }
+        other => unreachable!("{other} is not a guard family"),
+    }
+}
+
+/// Every combination of the per-label value sets.
+fn combinations(sets: &[Vec<&'static str>]) -> Vec<Vec<&'static str>> {
+    sets.iter().fold(vec![Vec::new()], |acc, set| {
+        acc.iter()
+            .flat_map(|prefix| {
+                set.iter().map(move |v| {
+                    let mut next = prefix.clone();
+                    next.push(*v);
+                    next
+                })
+            })
+            .collect()
+    })
+}
+
+// §41.2: plan classes are not modelled yet; every call is `unclassified` (guard.rs record sites).
+const PLAN_CLASS: &str = "unclassified";
+const AUTH_FLOW: &str = "service_credential";
+
 impl GuardMetrics {
-    fn increment(&self, family: &str, labels: &[(&str, &str)]) {
-        let labels = labels
-            .iter()
-            .map(|(key, value)| format!("{key}=\"{value}\""))
-            .collect::<Vec<_>>()
-            .join(",");
-        let key = format!("{family}{{{labels}}}");
+    fn increment(&self, family: &Family, values: &[&'static str]) {
+        debug_assert_eq!(values.len(), family.labels.len(), "{}", family.name);
         let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
-        let count = counters.entry(key).or_default();
+        let count = counters.entry((family.name, values.to_vec())).or_default();
         *count = count.saturating_add(1);
     }
 
-    pub fn exposition(&self) -> String {
-        self.counters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(key, count)| format!("{key} {count}\n"))
-            .collect()
+    /// The six guard families seeded over their closed label sets, plus any recorded combination
+    /// outside them, through `write_family` (ADR-0061 D-A, D-C).
+    pub fn render(&self, out: &mut String) {
+        let counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        for family in GUARD_FAMILIES {
+            let mut series: BTreeMap<Vec<&'static str>, u64> = combinations(&label_values(family))
+                .into_iter()
+                .map(|values| (values, 0))
+                .collect();
+            for ((name, values), count) in counters.iter() {
+                if *name == family.name {
+                    series.insert(values.clone(), *count);
+                }
+            }
+            let samples: Vec<(&[&'static str], f64)> = series
+                .iter()
+                .map(|(values, count)| (values.as_slice(), *count as f64))
+                .collect();
+            write_family(out, family, &samples);
+        }
     }
 }
 
@@ -265,7 +342,7 @@ impl GatewayGuard {
         let result = quota_repo::consume_rate(&self.pool, subject, operation, bucket, policy).await;
         if result == Err(ErrorCode::RateLimited) {
             self.metrics
-                .increment("rate_limit_rejected_total", &[("scope", scope)]);
+                .increment(&families::RATE_LIMIT_REJECTED_TOTAL, &[scope]);
         }
         result
     }
@@ -290,17 +367,14 @@ impl GatewayGuard {
             None => Err(ErrorCode::Unauthorized),
         };
         self.metrics.increment(
-            "mcp_auth_attempts_total",
+            &families::MCP_AUTH_ATTEMPTS_TOTAL,
             &[
-                (
-                    "result",
-                    if result.is_ok() {
-                        "ok"
-                    } else {
-                        "bad_credential"
-                    },
-                ),
-                ("flow", "service_credential"),
+                if result.is_ok() {
+                    "ok"
+                } else {
+                    "bad_credential"
+                },
+                AUTH_FLOW,
             ],
         );
         match &result {
@@ -704,9 +778,9 @@ impl GatewayGuard {
             match &result {
                 Ok(outcome) if !outcome.replayed => {
                     self.metrics
-                        .increment("mcp_quota_reservations_total", &[("result", "ok")]);
+                        .increment(&families::MCP_QUOTA_RESERVATIONS_TOTAL, &["ok"]);
                     self.metrics
-                        .increment("mcp_bmo_consumed_total", &[("plan_class", "unclassified")]);
+                        .increment(&families::MCP_BMO_CONSUMED_TOTAL, &[PLAN_CLASS]);
                 }
                 // A replay is a newly authenticated request, but never another business write/BMO.
                 Ok(_) => {
@@ -819,9 +893,9 @@ impl GatewayGuard {
             match &result {
                 Ok(_) => {
                     self.metrics
-                        .increment("mcp_quota_reservations_total", &[("result", "ok")]);
+                        .increment(&families::MCP_QUOTA_RESERVATIONS_TOTAL, &["ok"]);
                     self.metrics
-                        .increment("mcp_bmo_consumed_total", &[("plan_class", "unclassified")]);
+                        .increment(&families::MCP_BMO_CONSUMED_TOTAL, &[PLAN_CLASS]);
                 }
                 Err(ErrorCode::DependencyUnavailable) => {
                     self.observe_unknown(context, operation, &admitted).await;
@@ -934,14 +1008,11 @@ impl GatewayGuard {
 
     fn record_request<T>(&self, operation: &OperationDescriptor, result: &Result<T, ErrorCode>) {
         self.metrics.increment(
-            "humaux_mcp_requests_total",
+            &families::HUMAUX_MCP_REQUESTS_TOTAL,
             &[
-                ("tool", operation.tool().as_str()),
-                (
-                    "result",
-                    result.as_ref().err().map(|e| e.as_str()).unwrap_or("ok"),
-                ),
-                ("plan_class", "unclassified"),
+                operation.tool().as_str(),
+                result.as_ref().err().map(|e| e.as_str()).unwrap_or("ok"),
+                PLAN_CLASS,
             ],
         );
     }
@@ -979,7 +1050,7 @@ impl GatewayGuard {
             Ok(auth) => auth,
             Err(code) => {
                 self.metrics
-                    .increment("mcp_authz_denied_total", &[("reason", code.as_str())]);
+                    .increment(&families::MCP_AUTHZ_DENIED_TOTAL, &[code.as_str()]);
                 self.audit(
                     context,
                     &network,
@@ -1152,8 +1223,8 @@ impl GatewayGuard {
         .map_err(|_| ErrorCode::DependencyUnavailable)?
         .map(Some);
         self.metrics.increment(
-            "mcp_quota_reservations_total",
-            &[("result", if result.is_ok() { "ok" } else { "denied" })],
+            &families::MCP_QUOTA_RESERVATIONS_TOTAL,
+            &[if result.is_ok() { "ok" } else { "denied" }],
         );
         result
     }
@@ -1183,7 +1254,7 @@ impl GatewayGuard {
         .await?;
         if settled && completion.reservation.is_some() && completion.consume {
             self.metrics
-                .increment("mcp_bmo_consumed_total", &[("plan_class", "unclassified")]);
+                .increment(&families::MCP_BMO_CONSUMED_TOTAL, &[PLAN_CLASS]);
         }
         Ok(settled)
     }
@@ -1370,5 +1441,93 @@ mod tests {
         ] {
             assert!(!ChargePolicy::CompletedBusinessCalls.consumes(&Err::<(), _>(code)));
         }
+    }
+
+    /// Exhaustive over `ToolName`: a new variant does not compile until it is placed in `TOOLS`.
+    #[test]
+    fn tools_list_every_variant_once() {
+        let slot = |tool: ToolName| match tool {
+            ToolName::Remember => 0,
+            ToolName::Recall => 1,
+            ToolName::Memory => 2,
+            ToolName::Context => 3,
+            ToolName::Continuity => 4,
+            ToolName::Artifact => 5,
+            ToolName::Code => 6,
+            ToolName::Coordinate => 7,
+        };
+        for (i, tool) in TOOLS.iter().enumerate() {
+            assert_eq!(slot(*tool), i, "{tool:?}");
+        }
+    }
+
+    fn series(out: &str, family: &str) -> Vec<String> {
+        out.lines()
+            .filter(|l| {
+                l.starts_with(&format!("{family}{{")) || l.starts_with(&format!("{family} "))
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// ADR-0061 D-A seeding: every guard family has HELP/TYPE and its full closed product at zero
+    /// state, with exactly the §41.2 label keys. Fault: seed one family from an empty set ⇒ red.
+    #[test]
+    fn render_seeds_every_guard_family_over_its_closed_sets() {
+        let mut out = String::new();
+        GuardMetrics::default().render(&mut out);
+        let expected = [
+            ("humaux_mcp_requests_total", 8 * (ErrorCode::ALL.len() + 1)),
+            ("mcp_auth_attempts_total", 4),
+            ("mcp_authz_denied_total", ErrorCode::ALL.len()),
+            ("mcp_quota_reservations_total", 2),
+            ("mcp_bmo_consumed_total", 1),
+            ("rate_limit_rejected_total", 5),
+        ];
+        for (family, n) in expected {
+            assert!(
+                out.contains(&format!("# TYPE {family} counter\n")),
+                "{family}"
+            );
+            let lines = series(&out, family);
+            assert_eq!(lines.len(), n, "{family}: {lines:?}");
+            let f = GUARD_FAMILIES
+                .iter()
+                .find(|f| f.name == family)
+                .expect("guard family");
+            for line in &lines {
+                let keys: Vec<&str> = line[family.len() + 1..line.find('}').expect("labels")]
+                    .split(',')
+                    .map(|kv| kv.split('=').next().expect("key"))
+                    .collect();
+                assert_eq!(keys, f.labels, "{line}");
+                assert!(line.ends_with(" 0"), "{line}");
+            }
+        }
+    }
+
+    /// An increment lands on its seeded series, and a value outside the seed set still renders.
+    #[test]
+    fn increments_render_on_their_series() {
+        let metrics = GuardMetrics::default();
+        metrics.increment(&families::MCP_AUTHZ_DENIED_TOTAL, &["FORBIDDEN"]);
+        metrics.increment(&families::MCP_AUTHZ_DENIED_TOTAL, &["FORBIDDEN"]);
+        metrics.increment(&families::MCP_AUTH_ATTEMPTS_TOTAL, &["ok", AUTH_FLOW]);
+        metrics.increment(&families::RATE_LIMIT_REJECTED_TOTAL, &["unseeded"]);
+        let mut out = String::new();
+        metrics.render(&mut out);
+        assert!(
+            out.contains("mcp_authz_denied_total{reason=\"FORBIDDEN\"} 2\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mcp_auth_attempts_total{result=\"ok\",flow=\"service_credential\"} 1\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("rate_limit_rejected_total{scope=\"unseeded\"} 1\n"),
+            "{out}"
+        );
+        assert_eq!(series(&out, "rate_limit_rejected_total").len(), 6);
     }
 }

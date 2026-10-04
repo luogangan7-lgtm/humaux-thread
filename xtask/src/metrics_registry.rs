@@ -1,8 +1,14 @@
-//! `xtask::metrics_registry` — G80-6 metrics-registry-check: Registry/Code/Witness three-way falsification.
+//! `xtask::metrics_registry` — G80-6 metrics-registry-check: Registry/Code/Witness three-way falsification, plus the exported (D7) and rule (D8) legs.
 //! Depends-on: crates=[]; services=[subprocess(cargo)]; env=[CARGO_MANIFEST_DIR]; modules=[]
 //! Called-by: [xtask::main]
-//! Invariants: [each Witness file is really compiled and run in a throwaway probe package; missing/failing/timed-out witnesses count as 0 passed, never substituted by comment]
-//! Spec: Baseline §80.2; §41.2
+//! Invariants: [each Witness file is really compiled and run in a throwaway probe package; missing/failing/timed-out witnesses count as 0 passed, never substituted by comment; an unknown argument exits 2 naming it; "exported" is read from each process's real `--metrics-families` output, never from a hand list; a rule-referenced family that no process exports fails unless NOT_YET_PRODUCED names its producer card]
+//! Spec: Baseline §80.2; §41.2; §42; ADR-0061 D-H
+//!
+//! Modes (ADR-0061 D-H; the strict parser replaces the old `any(--strict)` scan that let
+//! `--check` run the default mode silently, E6): no mode flag = D1–D6; `--check` = D1–D8;
+//! `--exposition <process>=<file>` (repeatable) = the D7 parser over live scrapes (EX);
+//! `--strict` also counts not_applicable. D7 runs `cargo run -p humaux-<process> -- --metrics-families`
+//! for the five processes in [`PROCESSES`]; D8 scans `deploy/prometheus/*.rules.yml`.
 //!
 //! xtask `metrics-registry` — G80-6 `metrics-registry-check`：Registry(R) / Code(C) /
 //! Witness(W) 三方证伪（§80.2 全文）。R 解析 §41.2 注册表；C 静态扫 `crates/**/src/**/*.rs`
@@ -30,6 +36,68 @@ const SPEC_PATH: &str = "docs/architecture/Baseline_2.9.md";
 const CRATES_DIR: &str = "crates";
 const REGISTRY_HEADING: &str = "## 41.2 注册表（全集）";
 const WITNESS_SUBDIR: &str = "testkit/tests/metrics";
+const RULES_DIR: &str = "deploy/prometheus";
+const RULES_SUFFIX: &str = ".rules.yml";
+const USAGE: &str =
+    "usage: cargo xtask metrics-registry [--check] [--strict] [--exposition <process>=<file>]...";
+
+/// The processes that serve `/metrics` (ADR-0061 D-B). The cargo package and bin of each is
+/// `humaux-<process>`; the key is also the `--exposition` process name.
+const PROCESSES: [&str; 5] = [
+    "gateway",
+    "retrieval-worker",
+    "private-worker",
+    "consolidation-worker",
+    "maintenance",
+];
+
+/// ADR-0061 D-H D8(c): rule-referenced families no process exports yet, each with the card
+/// that adds its producer. An entry whose family IS exported fails as a stale entry, so the
+/// producer card has to delete its row (E10: card 34b owns the two distill counters).
+const NOT_YET_PRODUCED: &[(&str, &str)] = &[
+    ("backup_last_success_timestamp_seconds", "card 37"),
+    ("private_distill_runs_total", "card 34b"),
+    ("private_distill_outputs_total", "card 34b"),
+];
+
+/// §42 ①: third-party exporter families a rule may name although §41.2 does not register them.
+const THIRD_PARTY_PREFIXES: &[&str] = &["node_filesystem_"];
+
+/// PromQL words that are neither a family nor followed by `(` as a function call is.
+const PROMQL_KEYWORDS: &[&str] = &[
+    "by",
+    "without",
+    "ignoring",
+    "on",
+    "group_left",
+    "group_right",
+    "and",
+    "or",
+    "unless",
+    "offset",
+    "bool",
+    "atan2",
+    "inf",
+    "nan",
+];
+
+/// Aggregation operators: `sum by (code) (…)` puts a clause between the name and its `(`.
+const PROMQL_AGGREGATIONS: &[&str] = &[
+    "sum",
+    "min",
+    "max",
+    "avg",
+    "group",
+    "stddev",
+    "stdvar",
+    "count",
+    "count_values",
+    "bottomk",
+    "topk",
+    "quantile",
+    "limitk",
+    "limit_ratio",
+];
 
 /// 一行 §41.2 注册表拆出的单个 family（同一单元格 `/` 分隔的多个 family 各产生一条，
 /// §80.2「parser 拆成多个 family，各自产生一条派生路径」）。
@@ -862,6 +930,642 @@ pub fn check_all(spec: &str, crates_root: &Path) -> Option<Vec<DCheck>> {
     ])
 }
 
+// ---------------------------------------------------------------------------
+// D7: exported families, read from each process's real `--metrics-families`
+// ---------------------------------------------------------------------------
+
+/// One `# TYPE`d family in a text exposition: its declared kind and the label-key set of
+/// every sample (histogram samples are folded onto the base name with `le` dropped).
+#[derive(Debug, Default)]
+struct ExpFamily {
+    kind: String,
+    samples: Vec<BTreeSet<String>>,
+}
+
+/// A parsed text exposition (format 0.0.4). `problems` holds lines the parser could not
+/// attribute to a `# TYPE`d family; they are D7/EX failures, never skipped.
+#[derive(Debug, Default)]
+struct Exposition {
+    families: BTreeMap<String, ExpFamily>,
+    problems: Vec<String>,
+}
+
+/// Label keys of one sample's `{k="v",…}` block; values are skipped with `\`-escapes honoured.
+/// `rest` is the sample line after its name; no `{` means no labels.
+fn sample_label_keys(rest: &str) -> Result<BTreeSet<String>, String> {
+    let Some(body) = rest.strip_prefix('{') else {
+        return Ok(BTreeSet::new());
+    };
+    let mut keys = BTreeSet::new();
+    let mut it = body.chars().peekable();
+    loop {
+        while matches!(it.peek(), Some(' ' | ',')) {
+            it.next();
+        }
+        match it.peek() {
+            Some('}') => return Ok(keys),
+            None => return Err("unterminated label set".into()),
+            _ => {}
+        }
+        let mut key = String::new();
+        while let Some(&c) = it.peek() {
+            if c == '=' {
+                break;
+            }
+            key.push(c);
+            it.next();
+        }
+        if it.next() != Some('=') || it.next() != Some('"') {
+            return Err(format!("label `{key}` lacks =\"value\""));
+        }
+        let mut escaped = false;
+        loop {
+            match it.next() {
+                None => return Err(format!("label `{key}` value unterminated")),
+                Some('\\') if !escaped => escaped = true,
+                Some('"') if !escaped => break,
+                Some(_) => escaped = false,
+            }
+        }
+        keys.insert(key.trim().to_string());
+    }
+}
+
+fn parse_exposition(text: &str) -> Exposition {
+    let mut e = Exposition::default();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(rest) = line.strip_prefix("# TYPE ") {
+            let mut parts = rest.split_whitespace();
+            if let (Some(name), Some(kind)) = (parts.next(), parts.next()) {
+                e.families.entry(name.to_string()).or_default().kind = kind.to_string();
+            }
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let name_end = line
+            .find(|c: char| c == '{' || c.is_whitespace())
+            .unwrap_or(line.len());
+        let name = &line[..name_end];
+        let mut keys = match sample_label_keys(&line[name_end..]) {
+            Ok(k) => k,
+            Err(err) => {
+                e.problems.push(format!("sample `{name}`: {err}"));
+                continue;
+            }
+        };
+        let family = if e.families.contains_key(name) {
+            name.to_string()
+        } else {
+            // A histogram family has no sample under its own name, only these three suffixes.
+            let base = ["_bucket", "_sum", "_count"].iter().find_map(|s| {
+                name.strip_suffix(s)
+                    .filter(|b| e.families.get(*b).is_some_and(|f| f.kind == "histogram"))
+                    .map(|b| (b.to_string(), *s))
+            });
+            match base {
+                Some((b, suffix)) => {
+                    if suffix == "_bucket" {
+                        keys.remove("le");
+                    }
+                    b
+                }
+                None => {
+                    e.problems
+                        .push(format!("sample `{name}` has no preceding `# TYPE` line"));
+                    continue;
+                }
+            }
+        };
+        if let Some(f) = e.families.get_mut(&family) {
+            f.samples.push(keys);
+        }
+    }
+    e
+}
+
+/// The R / R6 / kind leg shared by D7 and EX: every family is registered, its kind is the
+/// §41.2 kind, and every sample carries exactly the §41.2 label keys.
+fn registry_problems(
+    process: &str,
+    exp: &Exposition,
+    registry: &BTreeMap<&str, &RegistryEntry>,
+) -> Vec<String> {
+    let mut out: Vec<String> = exp
+        .problems
+        .iter()
+        .map(|p| format!("{process}: {p}"))
+        .collect();
+    for (name, fam) in &exp.families {
+        let Some(r) = registry.get(name.as_str()) else {
+            out.push(format!(
+                "{process}: `{name}` exported, not registered in §41.2"
+            ));
+            continue;
+        };
+        if fam.kind != r.metric_kind {
+            out.push(format!(
+                "{process}: `{name}` is a {} but §41.2 registers a {}",
+                fam.kind, r.metric_kind
+            ));
+        }
+        if let Some(keys) = fam.samples.iter().find(|k| **k != r.labels) {
+            out.push(format!(
+                "{process}: `{name}` sample label keys {keys:?} != §41.2 {:?} (R6)",
+                r.labels
+            ));
+        }
+    }
+    out
+}
+
+fn registry_index(registry: &[RegistryEntry]) -> BTreeMap<&str, &RegistryEntry> {
+    registry.iter().map(|r| (r.family.as_str(), r)).collect()
+}
+
+/// D7: the union of what the five processes export is registered, kind- and label-exact.
+/// `outputs` is `(process, its --metrics-families stdout or the run error)`. A process that
+/// cannot be built or run is a fail naming it: it is in-tree, so there is no not_applicable.
+/// Returns the check and the exported family union (D8(c) input): a family counts as exported
+/// only when its render carries at least one sample line, since a `# TYPE` line alone gives a
+/// rule nothing to read (ADR-0061 review-fix 3, F10).
+fn check_d7(
+    registry: &[RegistryEntry],
+    outputs: &[(String, Result<String, String>)],
+) -> (DCheck, BTreeSet<String>) {
+    let index = registry_index(registry);
+    let mut problems = Vec::new();
+    let mut exported = BTreeSet::new();
+    let mut per_process = Vec::new();
+    for (process, out) in outputs {
+        match out {
+            Ok(text) => {
+                let exp = parse_exposition(text);
+                problems.extend(registry_problems(process, &exp, &index));
+                let sampled: Vec<String> = exp
+                    .families
+                    .into_iter()
+                    .filter(|(_, f)| !f.samples.is_empty())
+                    .map(|(name, _)| name)
+                    .collect();
+                per_process.push(format!("{process}={}", sampled.len()));
+                exported.extend(sampled);
+            }
+            Err(err) => problems.push(format!("humaux-{process} --metrics-families: {err}")),
+        }
+    }
+    let check = if problems.is_empty() {
+        DCheck {
+            id: "D7",
+            status: GateStatus::Pass,
+            detail: format!(
+                "{} exported families registered, kind- and label-exact ({})",
+                exported.len(),
+                per_process.join(" ")
+            ),
+            na_families: BTreeSet::new(),
+        }
+    } else {
+        DCheck {
+            id: "D7",
+            status: GateStatus::Fail,
+            detail: problems.join("; "),
+            na_families: BTreeSet::new(),
+        }
+    };
+    (check, exported)
+}
+
+/// Runs `cargo run -q -p humaux-<process> --bin humaux-<process> -- --metrics-families`
+/// (ADR-0061 D-C): cargo rebuilds from the current tree, so neither a stale binary nor a
+/// hand list can disagree with what `/metrics` serves.
+fn metrics_families_output(process: &str) -> Result<String, String> {
+    let pkg = format!("humaux-{process}");
+    // dep: subprocess(cargo) — builds and runs the process's own zero-state render
+    let out = std::process::Command::new("cargo")
+        .args([
+            "run",
+            "-q",
+            "-p",
+            &pkg,
+            "--bin",
+            &pkg,
+            "--",
+            "--metrics-families",
+        ])
+        .output()
+        .map_err(|e| format!("cannot spawn cargo: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
+        return Err(format!(
+            "exited {} ({})",
+            out.status,
+            tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("stdout is not UTF-8: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// D8: families and label keys referenced by the loaded rule files
+// ---------------------------------------------------------------------------
+
+/// Every `expr:` value in a rule file: inline (quotes stripped) or a `|`/`>` block, plus any
+/// continuation line indented deeper than the `expr:` key.
+// ponytail: a line scanner, not a YAML parser; flow mappings (`{expr: …}`) are not read.
+// Upgrade to a YAML crate if a rule file ever uses them.
+fn rule_exprs(yaml: &str) -> Vec<String> {
+    let lines: Vec<&str> = yaml.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("expr:") else {
+            continue;
+        };
+        let indent = line.len() - trimmed.len();
+        let mut text = rest.trim().to_string();
+        if text.starts_with('|') || text.starts_with('>') {
+            text.clear();
+        }
+        for cont in &lines[i + 1..] {
+            if cont.trim().is_empty() {
+                continue;
+            }
+            if cont.len() - cont.trim_start().len() <= indent {
+                break;
+            }
+            text.push(' ');
+            text.push_str(cont.trim());
+        }
+        let t = text.trim();
+        let t = ['\'', '"']
+            .iter()
+            .find_map(|q| t.strip_prefix(*q).and_then(|s| s.strip_suffix(*q)))
+            .unwrap_or(t);
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// Index one past the quote that closes the string opening at `i`.
+fn skip_quoted(b: &[u8], i: usize) -> usize {
+    let q = b[i];
+    let mut j = i + 1;
+    while j < b.len() {
+        if b[j] == b'\\' && q != b'`' {
+            j += 2;
+            continue;
+        }
+        if b[j] == q {
+            return j + 1;
+        }
+        j += 1;
+    }
+    b.len()
+}
+
+/// Matcher keys of the `{…}` block opening at `i`, and the index one past its `}`.
+fn matcher_keys(b: &[u8], i: usize) -> (BTreeSet<String>, usize) {
+    let mut keys = BTreeSet::new();
+    let mut j = i + 1;
+    while j < b.len() && b[j] != b'}' {
+        let c = b[j];
+        if c == b'"' || c == b'\'' || c == b'`' {
+            j = skip_quoted(b, j);
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            let start = j;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            keys.insert(String::from_utf8_lossy(&b[start..j]).into_owned());
+        } else {
+            j += 1;
+        }
+    }
+    (keys, (j + 1).min(b.len()))
+}
+
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// The metric identifiers of one PromQL expression, each with the keys of its own `{…}`
+/// matcher, plus the keys of every `by/without/on/ignoring/group_left/group_right (…)` list.
+/// Functions and aggregations (a name followed by `(` or a grouping clause), keywords,
+/// strings, `[…]` ranges and numbers are skipped.
+fn expr_refs(expr: &str) -> (Vec<(String, BTreeSet<String>)>, BTreeSet<String>) {
+    let b = expr.as_bytes();
+    let mut idents = Vec::new();
+    let mut grouping = BTreeSet::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'"' || c == b'\'' || c == b'`' {
+            i = skip_quoted(b, i);
+        } else if c == b'[' {
+            i = b[i..]
+                .iter()
+                .position(|&x| x == b']')
+                .map_or(b.len(), |p| i + p + 1);
+        } else if c == b'{' {
+            // a bare selector (`{__name__=…}`): its keys belong to no identifier here
+            i = matcher_keys(b, i).1;
+        } else if c.is_ascii_digit() || c == b'.' {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.' || b[i] == b'_') {
+                i += 1;
+            }
+        } else if c.is_ascii_alphabetic() || c == b'_' || c == b':' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b':') {
+                i += 1;
+            }
+            let word = &expr[start..i];
+            let lower = word.to_ascii_lowercase();
+            let next = skip_ws(b, i);
+            if PROMQL_KEYWORDS.contains(&lower.as_str()) {
+                let lists = matches!(
+                    word,
+                    "by" | "without" | "on" | "ignoring" | "group_left" | "group_right"
+                );
+                if lists && b.get(next) == Some(&b'(') {
+                    let close = b[next..]
+                        .iter()
+                        .position(|&x| x == b')')
+                        .map_or(b.len(), |p| next + p);
+                    grouping.extend(
+                        expr[next + 1..close]
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
+                    );
+                    i = (close + 1).min(b.len());
+                }
+            } else if PROMQL_AGGREGATIONS.contains(&word) || b.get(next) == Some(&b'(') {
+                // function or aggregation call
+            } else if b.get(next) == Some(&b'{') {
+                let (keys, end) = matcher_keys(b, next);
+                idents.push((word.to_string(), keys));
+                i = end;
+            } else {
+                idents.push((word.to_string(), BTreeSet::new()));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    (idents, grouping)
+}
+
+/// The §41.2 family an identifier names, and its label keys: a registered name, or a
+/// histogram's `_bucket` (adds `le`), `_sum` or `_count` series.
+fn resolve_family<'a>(
+    ident: &str,
+    index: &BTreeMap<&str, &'a RegistryEntry>,
+) -> Option<(&'a RegistryEntry, bool)> {
+    if let Some(r) = index.get(ident) {
+        return Some((r, false));
+    }
+    ["_bucket", "_sum", "_count"].iter().find_map(|s| {
+        let base = ident.strip_suffix(s)?;
+        let r = index.get(base).filter(|r| r.metric_kind == "histogram")?;
+        Some((*r, *s == "_bucket"))
+    })
+}
+
+/// D8 over `rules` = `(file name, content)` of every `*.rules.yml`:
+/// (a) every identifier is a §41.2 family or a §42 ① third-party family;
+/// (b) every matcher key is a label of its family, and every grouping key a label of some
+///     family in the same expression (§42 ④);
+/// (c) every referenced family is exported (D7), unless [`NOT_YET_PRODUCED`] names its
+///     producer card (not_applicable); a listed family that is exported fails as stale;
+/// (d) no rule file or no `expr:` is a fail (sentinel).
+fn check_d8(
+    registry: &[RegistryEntry],
+    rules: &[(String, String)],
+    exported: &BTreeSet<String>,
+) -> DCheck {
+    let index = registry_index(registry);
+    let mut problems = Vec::new();
+    let mut referenced: BTreeMap<String, String> = BTreeMap::new();
+    let mut exprs = 0usize;
+    for (file, content) in rules {
+        for expr in rule_exprs(content) {
+            exprs += 1;
+            let (idents, grouping) = expr_refs(&expr);
+            let mut expr_labels = BTreeSet::new();
+            for (ident, keys) in &idents {
+                if THIRD_PARTY_PREFIXES.iter().any(|p| ident.starts_with(p)) {
+                    continue;
+                }
+                let Some((r, bucket)) = resolve_family(ident, &index) else {
+                    problems.push(format!("{file}: `{ident}` is not a §41.2 family (§41.4②)"));
+                    continue;
+                };
+                let mut allowed = r.labels.clone();
+                if bucket {
+                    allowed.insert("le".to_string());
+                }
+                for k in keys.difference(&allowed) {
+                    problems.push(format!(
+                        "{file}: `{ident}{{{k}…}}` — `{k}` is not a §41.2 label of `{}` (§42 ④)",
+                        r.family
+                    ));
+                }
+                expr_labels.extend(allowed);
+                referenced
+                    .entry(r.family.clone())
+                    .or_insert_with(|| file.clone());
+            }
+            for k in grouping.difference(&expr_labels) {
+                problems.push(format!(
+                    "{file}: grouping key `{k}` is not a §41.2 label of any family in `{expr}` (§42 ④)"
+                ));
+            }
+        }
+    }
+    if rules.is_empty() || exprs == 0 {
+        problems.push(format!(
+            "no `expr:` in any {RULES_DIR}/*{RULES_SUFFIX} (sentinel: the rules leg reads nothing)"
+        ));
+    }
+    let mut na = BTreeSet::new();
+    let mut producers = Vec::new();
+    for (family, file) in &referenced {
+        if exported.contains(family) {
+            continue;
+        }
+        match NOT_YET_PRODUCED.iter().find(|(f, _)| f == family) {
+            Some((_, card)) => {
+                na.insert(family.clone());
+                producers.push(format!("{family} (producer: {card})"));
+            }
+            None => problems.push(format!(
+                "{file}: `{family}` is referenced by a rule but no process exports it"
+            )),
+        }
+    }
+    for (family, card) in NOT_YET_PRODUCED {
+        if exported.contains(*family) {
+            problems.push(format!(
+                "stale allowlist entry: `{family}` ({card}) is exported now; delete it from NOT_YET_PRODUCED"
+            ));
+        }
+    }
+    let status = if !problems.is_empty() {
+        GateStatus::Fail
+    } else if !na.is_empty() {
+        GateStatus::NotApplicable
+    } else {
+        GateStatus::Pass
+    };
+    let mut detail = format!(
+        "{} rule file(s), {exprs} expr(s), {} referenced families",
+        rules.len(),
+        referenced.len()
+    );
+    if !problems.is_empty() {
+        detail.push_str(&format!("; {}", problems.join("; ")));
+    }
+    if !producers.is_empty() {
+        detail.push_str(&format!(
+            "; rule-referenced, not yet exported: {}",
+            producers.join(", ")
+        ));
+    }
+    DCheck {
+        id: "D8",
+        status,
+        detail,
+        na_families: na,
+    }
+}
+
+/// `(file name, content)` of every `*.rules.yml` directly under `dir`, sorted by name.
+fn read_rule_files(dir: &Path) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(RULES_SUFFIX) {
+                return None;
+            }
+            fs::read_to_string(e.path()).ok().map(|c| (name, c))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+// ---------------------------------------------------------------------------
+// EX: live scrapes (`--exposition`) against the same parser
+// ---------------------------------------------------------------------------
+
+/// EX: each scraped file `(process, path, content or read error)` carries exactly its
+/// process's `--metrics-families` family set, every family has ≥1 sample, and the D7
+/// R / R6 / kind leg holds.
+fn check_expositions(
+    registry: &[RegistryEntry],
+    files: &[(String, String, Result<String, String>)],
+    families_of: &BTreeMap<String, Result<String, String>>,
+) -> DCheck {
+    let index = registry_index(registry);
+    let mut problems = Vec::new();
+    for (process, path, content) in files {
+        let text = match content {
+            Ok(t) => t,
+            Err(e) => {
+                problems.push(format!("{path}: {e}"));
+                continue;
+            }
+        };
+        let exp = parse_exposition(text);
+        problems.extend(registry_problems(path, &exp, &index));
+        for (name, fam) in &exp.families {
+            if fam.samples.is_empty() {
+                problems.push(format!("{path}: `{name}` has zero samples"));
+            }
+        }
+        match families_of.get(process) {
+            Some(Ok(expected)) => {
+                let want: BTreeSet<String> =
+                    parse_exposition(expected).families.into_keys().collect();
+                let got: BTreeSet<String> = exp.families.keys().cloned().collect();
+                let missing: Vec<&String> = want.difference(&got).collect();
+                let extra: Vec<&String> = got.difference(&want).collect();
+                if !missing.is_empty() || !extra.is_empty() {
+                    problems.push(format!(
+                        "{path}: family set != humaux-{process} --metrics-families (missing {missing:?}, extra {extra:?})"
+                    ));
+                }
+            }
+            Some(Err(e)) => problems.push(format!("humaux-{process} --metrics-families: {e}")),
+            None => problems.push(format!("humaux-{process} --metrics-families: not run")),
+        }
+    }
+    let status = if problems.is_empty() {
+        GateStatus::Pass
+    } else {
+        GateStatus::Fail
+    };
+    let detail = if problems.is_empty() {
+        format!(
+            "{} scrape(s) match their process's --metrics-families, every family sampled, R/R6 hold",
+            files.len()
+        )
+    } else {
+        problems.join("; ")
+    };
+    DCheck {
+        id: "EX",
+        status,
+        detail,
+        na_families: BTreeSet::new(),
+    }
+}
+
+/// Parsed command line (ADR-0061 D-H strict parser).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Opts {
+    check: bool,
+    strict: bool,
+    expositions: Vec<(String, PathBuf)>,
+}
+
+/// Any argument outside `--check`, `--strict`, `--exposition <process>=<file>` is an error
+/// naming it (E6: the old parser ignored it and ran the default mode).
+fn parse_args(args: &[String]) -> Result<Opts, String> {
+    let mut o = Opts::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--check" => o.check = true,
+            "--strict" => o.strict = true,
+            "--exposition" => {
+                let v = it.next().ok_or("`--exposition` needs <process>=<file>")?;
+                let (p, f) = v
+                    .split_once('=')
+                    .ok_or_else(|| format!("`--exposition {v}`: expected <process>=<file>"))?;
+                if !PROCESSES.contains(&p) {
+                    return Err(format!(
+                        "`--exposition {v}`: unknown process `{p}` (known: {PROCESSES:?})"
+                    ));
+                }
+                o.expositions.push((p.to_string(), PathBuf::from(f)));
+            }
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    Ok(o)
+}
+
 /// 打印每条 D-check 自己算出的三态（§57.1：pass/fail/not_applicable，`not_applicable`
 /// 打印缺失对象名，就地打印，不是脱节的汇总行）。`--strict` 决定 `NotApplicable` 是否也
 /// 计入退出码：默认模式下不计入（G80-6 未到 Phase 14 生效期的过渡豁免），`--strict` 下
@@ -891,8 +1595,16 @@ fn report(checks: &[DCheck], strict: bool) -> i32 {
     i32::from(failed)
 }
 
+/// Entry point: exit 2 on a usage error, otherwise 1 iff a check fails (or, with `--strict`,
+/// is not_applicable).
 pub fn run(args: &[String]) -> i32 {
-    let strict = args.iter().any(|a| a == "--strict");
+    let opts = match parse_args(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("metrics-registry: {e}\n{USAGE}");
+            return 2;
+        }
+    };
     let spec = match fs::read_to_string(SPEC_PATH) {
         Ok(s) => s,
         Err(e) => {
@@ -900,16 +1612,58 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match check_all(&spec, Path::new(CRATES_DIR)) {
-        Some(checks) => report(&checks, strict),
-        None => {
-            eprintln!(
-                "metrics-registry: fail — §41.2 registry unreadable or empty at {SPEC_PATH} \
-                 (§80.2 D6 正哨兵语义: |R|>0 必须成立，这是 fail 不是 not_applicable)"
-            );
-            1
-        }
+    let registry = parse_registry(&spec);
+    let mut checks = Vec::new();
+    let d1_to_d6 = opts.check || opts.expositions.is_empty();
+    let rows = if d1_to_d6 {
+        check_all(&spec, Path::new(CRATES_DIR))
+    } else {
+        (!registry.is_empty()).then(Vec::new)
+    };
+    let Some(rows) = rows else {
+        eprintln!(
+            "metrics-registry: fail — §41.2 registry unreadable or empty at {SPEC_PATH} \
+             (§80.2 D6 正哨兵语义: |R|>0 必须成立，这是 fail 不是 not_applicable)"
+        );
+        return 1;
+    };
+    checks.extend(rows);
+
+    let needed: BTreeSet<&str> = if opts.check {
+        PROCESSES.into_iter().collect()
+    } else {
+        opts.expositions.iter().map(|(p, _)| p.as_str()).collect()
+    };
+    let families_of: BTreeMap<String, Result<String, String>> = needed
+        .into_iter()
+        .map(|p| (p.to_string(), metrics_families_output(p)))
+        .collect();
+    if opts.check {
+        let outputs: Vec<(String, Result<String, String>)> = families_of
+            .iter()
+            .map(|(p, o)| (p.clone(), o.clone()))
+            .collect();
+        let (d7, exported) = check_d7(&registry, &outputs);
+        checks.push(d7);
+        checks.push(check_d8(
+            &registry,
+            &read_rule_files(Path::new(RULES_DIR)),
+            &exported,
+        ));
     }
+    if !opts.expositions.is_empty() {
+        let files: Vec<(String, String, Result<String, String>)> = opts
+            .expositions
+            .iter()
+            .map(|(p, path)| {
+                let shown = path.display().to_string();
+                let content = fs::read_to_string(path).map_err(|e| format!("cannot read: {e}"));
+                (p.clone(), shown, content)
+            })
+            .collect();
+        checks.push(check_expositions(&registry, &files, &families_of));
+    }
+    report(&checks, opts.strict)
 }
 
 #[cfg(test)]
@@ -1272,6 +2026,405 @@ pub fn gateway_respond() {
         assert_eq!(status(&green, "D2"), GateStatus::Pass);
         assert_eq!(status(&green, "D6"), GateStatus::Pass);
         fs::remove_dir_all(spec_path.parent().unwrap()).ok();
+    }
+
+    // -- D7 / D8 / EX / flags (ADR-0061 D-H) ---------------------------------
+
+    fn real_registry() -> Vec<RegistryEntry> {
+        parse_registry(&fs::read_to_string(spec_path()).expect("spec must be readable"))
+    }
+
+    /// The frozen INV-1..4 file only (§42 freeze ③: byte-identical), so later rule files do
+    /// not move these assertions.
+    fn real_rules() -> Vec<(String, String)> {
+        read_rule_files(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(RULES_DIR),
+        )
+        .into_iter()
+        .filter(|(name, _)| name == "invariants.rules.yml")
+        .collect()
+    }
+
+    fn gateway_exposition_without(drop: &str) -> String {
+        let mut out = String::new();
+        for (family, kind, labels) in [
+            ("degrade_total", "counter", r#"code="ProjectionLag""#),
+            (
+                "humaux_retrieval_requests_total",
+                "counter",
+                r#"intent="text",completeness_class="complete""#,
+            ),
+            (
+                "humaux_mcp_requests_total",
+                "counter",
+                r#"tool="recall",result="ok",plan_class="unclassified""#,
+            ),
+            (
+                "data_disclosures_finalized_total",
+                "counter",
+                r#"outcome="SUCCESS""#,
+            ),
+            (
+                "data_disclosures_reserved_unfinalized",
+                "gauge",
+                r#"age_bucket="gt_60s""#,
+            ),
+        ] {
+            if family == drop {
+                continue;
+            }
+            out.push_str(&format!(
+                "# HELP {family} h\n# TYPE {family} {kind}\n{family}{{{labels}}} 0\n"
+            ));
+        }
+        out
+    }
+
+    fn d7_of(text: &str) -> DCheck {
+        check_d7(
+            &real_registry(),
+            &[("gateway".into(), Ok(text.to_string()))],
+        )
+        .0
+    }
+
+    #[test]
+    fn exposition_parser_folds_histograms_and_honours_escapes() {
+        let e = parse_exposition(
+            "# HELP retrieval_provider_latency_seconds h\n\
+             # TYPE retrieval_provider_latency_seconds histogram\n\
+             retrieval_provider_latency_seconds_bucket{provider=\"p\",purpose=\"embedding\",region=\"r\",le=\"+Inf\"} 0\n\
+             retrieval_provider_latency_seconds_sum{provider=\"p\",purpose=\"embedding\",region=\"r\"} 0\n\
+             retrieval_provider_latency_seconds_count{provider=\"p\",purpose=\"embedding\",region=\"r\"} 0\n\
+             # TYPE degrade_total counter\n\
+             degrade_total{code=\"a\\\"b,c=\\\\\"} 1\n",
+        );
+        assert!(e.problems.is_empty(), "{:?}", e.problems);
+        let h = &e.families["retrieval_provider_latency_seconds"];
+        assert_eq!(h.samples.len(), 3);
+        let want: BTreeSet<String> = ["provider", "purpose", "region"].map(String::from).into();
+        assert!(h.samples.iter().all(|k| *k == want), "{:?}", h.samples);
+        assert_eq!(
+            e.families["degrade_total"].samples,
+            vec![BTreeSet::from(["code".to_string()])]
+        );
+        let d7 = check_d7(
+            &real_registry(),
+            &[(
+                "retrieval-worker".into(),
+                Ok("# TYPE x_total counter\nx_total 1\nstray 1\n".into()),
+            )],
+        )
+        .0;
+        assert!(
+            d7.detail.contains("`stray` has no preceding `# TYPE` line"),
+            "{}",
+            d7.detail
+        );
+    }
+
+    /// T-H1: an exported family that §41.2 does not register is a D7 fail naming it.
+    #[test]
+    fn t_h1_d7_unregistered_family_fails_naming_it() {
+        let green = d7_of(&gateway_exposition_without(""));
+        assert_eq!(green.status, GateStatus::Pass, "{}", green.detail);
+        let red = d7_of(&gateway_exposition_without("").replace("degrade_total", "degrade_totals"));
+        assert_eq!(red.status, GateStatus::Fail);
+        assert!(
+            red.detail
+                .contains("`degrade_totals` exported, not registered"),
+            "{}",
+            red.detail
+        );
+        let failed = check_d7(
+            &real_registry(),
+            &[("maintenance".into(), Err("exited 101".into()))],
+        )
+        .0;
+        assert_eq!(failed.status, GateStatus::Fail);
+        assert!(
+            failed
+                .detail
+                .contains("humaux-maintenance --metrics-families: exited 101")
+        );
+    }
+
+    /// ADR-0061 review-fix 3 (F10): a family whose render is HELP/TYPE only is not exported, so D8(c) cannot read a
+    /// rule family as present when no series exists. Fault: count every `# TYPE` line ⇒ red.
+    #[test]
+    fn d7_a_help_type_only_family_is_not_exported() {
+        let (_, exported) = check_d7(
+            &real_registry(),
+            &[(
+                "maintenance".into(),
+                Ok("# HELP jobs_dead h\n# TYPE jobs_dead gauge\n# HELP jobs_pending h\n# TYPE jobs_pending gauge\njobs_pending 0\n".into()),
+            )],
+        );
+        assert_eq!(exported, BTreeSet::from(["jobs_pending".to_string()]));
+    }
+
+    /// T-H2: an exported kind that differs from §41.2 fails.
+    #[test]
+    fn t_h2_d7_wrong_kind_fails() {
+        let red = d7_of(
+            &gateway_exposition_without("")
+                .replace("# TYPE degrade_total counter", "# TYPE degrade_total gauge"),
+        );
+        assert_eq!(red.status, GateStatus::Fail);
+        assert!(
+            red.detail
+                .contains("`degrade_total` is a gauge but §41.2 registers a counter")
+        );
+    }
+
+    /// T-H3: a sample label key outside §41.2 fails (R6).
+    #[test]
+    fn t_h3_d7_extra_label_key_fails() {
+        let red = d7_of(&gateway_exposition_without("").replace(
+            r#"degrade_total{code="ProjectionLag"}"#,
+            r#"degrade_total{code="ProjectionLag",tenant="t1"}"#,
+        ));
+        assert_eq!(red.status, GateStatus::Fail);
+        assert!(
+            red.detail.contains("`degrade_total` sample label keys"),
+            "{}",
+            red.detail
+        );
+        assert!(red.detail.contains("(R6)"));
+    }
+
+    fn all_exported() -> BTreeSet<String> {
+        parse_exposition(&gateway_exposition_without(""))
+            .families
+            .into_keys()
+            .collect()
+    }
+
+    fn rule(expr: &str) -> Vec<(String, String)> {
+        vec![(
+            "t.rules.yml".to_string(),
+            format!(
+                "groups:\n  - name: g\n    rules:\n      - alert: A\n        expr: {expr}\n        labels:\n          severity: critical\n"
+            ),
+        )]
+    }
+
+    #[test]
+    fn d8_passes_on_the_real_rule_files_when_their_families_are_exported() {
+        let rules = real_rules();
+        assert!(
+            !rules.is_empty(),
+            "deploy/prometheus/*.rules.yml must exist"
+        );
+        let d8 = check_d8(&real_registry(), &rules, &all_exported());
+        assert_eq!(d8.status, GateStatus::Pass, "{}", d8.detail);
+        // INV-1/2/4 are `|` blocks, INV-3 is inline: all four are read.
+        assert!(
+            d8.detail.contains("4 expr(s), 4 referenced families"),
+            "{}",
+            d8.detail
+        );
+    }
+
+    #[test]
+    fn expr_refs_reads_matchers_grouping_and_skips_functions() {
+        let (idents, grouping) = expr_refs(
+            "sum by (code) (rate(degrade_total{code=~\"Egress.*\"}[24h] offset 5m)) / ignoring(code) group_left sum(rate(degrade_total[24h])) > 0.4 and absent(vector(1))",
+        );
+        assert_eq!(
+            idents,
+            vec![
+                (
+                    "degrade_total".to_string(),
+                    BTreeSet::from(["code".to_string()])
+                ),
+                ("degrade_total".to_string(), BTreeSet::new()),
+            ]
+        );
+        assert_eq!(grouping, BTreeSet::from(["code".to_string()]));
+    }
+
+    /// T-H4: a rule naming a family outside §41.2 (`queries_total`, §41.4②) fails.
+    #[test]
+    fn t_h4_d8_rule_naming_unregistered_family_fails() {
+        let d8 = check_d8(
+            &real_registry(),
+            &rule("sum(rate(queries_total[5m])) == 0"),
+            &all_exported(),
+        );
+        assert_eq!(d8.status, GateStatus::Fail);
+        assert!(
+            d8.detail.contains("`queries_total` is not a §41.2 family"),
+            "{}",
+            d8.detail
+        );
+    }
+
+    /// T-H5: `by (stream)` on the unlabeled `projection_lag_events` fails (§42 ④).
+    #[test]
+    fn t_h5_d8_by_stream_on_projection_lag_fails() {
+        let mut exported = all_exported();
+        exported.insert("projection_lag_events".into());
+        let red = check_d8(
+            &real_registry(),
+            &rule("max by (stream) (projection_lag_events) > 100"),
+            &exported,
+        );
+        assert_eq!(red.status, GateStatus::Fail);
+        assert!(
+            red.detail.contains("grouping key `stream`"),
+            "{}",
+            red.detail
+        );
+        let green = check_d8(
+            &real_registry(),
+            &rule("max(projection_lag_events) > 100"),
+            &exported,
+        );
+        assert_eq!(green.status, GateStatus::Pass, "{}", green.detail);
+    }
+
+    /// T-H6: an allowlisted unexported family is not_applicable naming its producer card
+    /// (exit 0, 1 with `--strict`); a non-allowlisted unexported one fails; an allowlisted one
+    /// that is exported fails as stale.
+    #[test]
+    fn t_h6_d8_allowlist_is_the_only_not_applicable_path() {
+        let registry = real_registry();
+        let backup = rule("time() - backup_last_success_timestamp_seconds > 93600");
+        let na = check_d8(&registry, &backup, &all_exported());
+        assert_eq!(na.status, GateStatus::NotApplicable, "{}", na.detail);
+        assert!(
+            na.na_families
+                .contains("backup_last_success_timestamp_seconds")
+        );
+        assert!(na.detail.contains("(producer: card 37)"), "{}", na.detail);
+        assert_eq!(report(std::slice::from_ref(&na), false), 0);
+        assert_eq!(report(std::slice::from_ref(&na), true), 1);
+
+        let unlisted = check_d8(
+            &registry,
+            &rule("delta(jobs_dead[15m]) > 0"),
+            &all_exported(),
+        );
+        assert_eq!(unlisted.status, GateStatus::Fail, "{}", unlisted.detail);
+        assert!(
+            unlisted
+                .detail
+                .contains("`jobs_dead` is referenced by a rule but no process exports it")
+        );
+        assert_eq!(report(std::slice::from_ref(&unlisted), false), 1);
+
+        let mut exported = all_exported();
+        exported.insert("private_distill_runs_total".into());
+        let stale = check_d8(&registry, &real_rules(), &exported);
+        assert_eq!(stale.status, GateStatus::Fail);
+        assert!(
+            stale
+                .detail
+                .contains("stale allowlist entry: `private_distill_runs_total` (card 34b)")
+        );
+    }
+
+    /// T-H10: CoreMetricAbsent names `humaux_mcp_requests_total`; a gateway exposition
+    /// without it is a D8(c) fail naming it (the review's P0: never a silent not_applicable).
+    #[test]
+    fn t_h10_core_metric_absent_family_unexported_fails() {
+        let text = gateway_exposition_without("humaux_mcp_requests_total");
+        let (d7, exported) = check_d7(&real_registry(), &[("gateway".into(), Ok(text))]);
+        assert_eq!(d7.status, GateStatus::Pass, "{}", d7.detail);
+        let d8 = check_d8(
+            &real_registry(),
+            &rule(
+                "absent(humaux_retrieval_requests_total) or absent(degrade_total) or absent(humaux_mcp_requests_total)",
+            ),
+            &exported,
+        );
+        assert_eq!(d8.status, GateStatus::Fail);
+        assert!(
+            d8.detail.contains(
+                "`humaux_mcp_requests_total` is referenced by a rule but no process exports it"
+            ),
+            "{}",
+            d8.detail
+        );
+    }
+
+    /// T-H7: no rule file, or rule files without `expr:`, is a fail (sentinel).
+    #[test]
+    fn t_h7_d8_empty_rules_dir_fails() {
+        let empty = std::env::temp_dir().join(format!("mr_empty_rules_{}", std::process::id()));
+        fs::create_dir_all(&empty).unwrap();
+        let none = check_d8(&real_registry(), &read_rule_files(&empty), &all_exported());
+        fs::remove_dir_all(&empty).ok();
+        assert_eq!(none.status, GateStatus::Fail);
+        assert!(none.detail.contains("no `expr:`"), "{}", none.detail);
+        let no_expr = check_d8(
+            &real_registry(),
+            &[("x.rules.yml".into(), "groups: []\n".into())],
+            &all_exported(),
+        );
+        assert_eq!(no_expr.status, GateStatus::Fail);
+    }
+
+    /// T-H8: an unknown flag exits 2 naming it, before any file is read.
+    #[test]
+    fn t_h8_unknown_flag_exits_2() {
+        assert_eq!(run(&["--chek".to_string()]), 2);
+        assert_eq!(
+            parse_args(&["--chek".to_string()]),
+            Err("unknown argument `--chek`".to_string())
+        );
+        assert!(
+            parse_args(&["--exposition".into(), "gw=x.prom".into()])
+                .unwrap_err()
+                .contains("unknown process `gw`")
+        );
+        assert!(parse_args(&["--exposition".into()]).is_err());
+        assert_eq!(
+            parse_args(&[
+                "--check".into(),
+                "--strict".into(),
+                "--exposition".into(),
+                "maintenance=m.prom".into()
+            ]),
+            Ok(Opts {
+                check: true,
+                strict: true,
+                expositions: vec![("maintenance".into(), PathBuf::from("m.prom"))],
+            })
+        );
+    }
+
+    /// T-H9: a scraped family with zero samples, or a family set that differs from the
+    /// process's `--metrics-families`, fails EX.
+    #[test]
+    fn t_h9_exposition_zero_sample_family_fails() {
+        let registry = real_registry();
+        let full = gateway_exposition_without("");
+        let families_of = BTreeMap::from([("gateway".to_string(), Ok::<_, String>(full.clone()))]);
+        let file = |text: String| vec![("gateway".to_string(), "gw.prom".to_string(), Ok(text))];
+        let green = check_expositions(&registry, &file(full.clone()), &families_of);
+        assert_eq!(green.status, GateStatus::Pass, "{}", green.detail);
+
+        let zero = full.replace("degrade_total{code=\"ProjectionLag\"} 0\n", "");
+        let red = check_expositions(&registry, &file(zero), &families_of);
+        assert_eq!(red.status, GateStatus::Fail);
+        assert!(
+            red.detail.contains("`degrade_total` has zero samples"),
+            "{}",
+            red.detail
+        );
+
+        let short = gateway_exposition_without("jobs_dead");
+        let short = short.replace("# HELP degrade_total h\n# TYPE degrade_total counter\ndegrade_total{code=\"ProjectionLag\"} 0\n", "");
+        let red = check_expositions(&registry, &file(short), &families_of);
+        assert!(
+            red.detail.contains("missing [\"degrade_total\"]"),
+            "{}",
+            red.detail
+        );
     }
 
     // -- unit-level parser tests --------------------------------------------

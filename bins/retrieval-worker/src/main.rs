@@ -1,7 +1,8 @@
 //! `retrieval-worker::main` — `humaux-retrieval-worker` 进程入口（最小必要进程集见 §4.2；admin 探针契约见 §4.4）。
 //! Depends-on: crates=[async-trait, axum, humaux-adapters, humaux-domain, humaux-infra-cell,
-//!   humaux-local-secret-scan, humaux-retrieval-provider, tokio, uuid];
-//!   services=[PostgreSQL(role_retrieval_worker), Qdrant(*), UDS(serve)]; env=[HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS,
+//!   humaux-local-secret-scan, humaux-retrieval-provider, humaux-telemetry, tokio, uuid];
+//!   services=[HTTP(loopback), PostgreSQL(role_retrieval_worker), Qdrant(*), UDS(serve)]; env=[CARGO_PKG_VERSION,
+//!   HUMAUX_BUILD_GIT_SHA, HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS,
 //!   HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS, HUMAUX_RETRIEVAL_WORKER_BATCH, HUMAUX_RETRIEVAL_WORKER_CALLER,
 //!   HUMAUX_RETRIEVAL_WORKER_CELL_ID, HUMAUX_RETRIEVAL_WORKER_DIMENSION, HUMAUX_RETRIEVAL_WORKER_EGRESS_PROCESSOR_ID,
 //!   HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL, HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER,
@@ -12,17 +13,21 @@
 //!   HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION, HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP, HUMAUX_RETRIEVAL_WORKER_PG_DSN,
 //!   HUMAUX_RETRIEVAL_WORKER_POLL_INTERVAL_SECS, HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR,
 //!   HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST, HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT, HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS,
-//!   HUMAUX_RETRIEVAL_WORKER_REGION, HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH]; modules=[adapters::disclosure,
+//!   HUMAUX_RETRIEVAL_WORKER_REGION, HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH,
+//!   HUMAUX_RETRIEVAL_WORKER_SERVE_METRICS_ADDR, HUMAUX_RETRIEVAL_WORKER_SERVE_RPC_METRICS_ADDR];
+//!   modules=[adapters::disclosure,
 //!   adapters::postgres, adapters::projection_worker, adapters::qdrant, adapters::stream_repo, domain::egress,
 //!   domain::error, domain::ids, humaux-local-secret-scan, infra-cell::permit, infra-cell::resource,
-//!   infra-cell::transport, retrieval-provider::adapters, retrieval-provider::contract, retrieval-worker::rpc]
+//!   infra-cell::transport, retrieval-provider::adapters, retrieval-provider::contract, retrieval-provider::metrics,
+//!   retrieval-worker::rpc, telemetry::metrics]
 //! Called-by: [process(humaux-retrieval-worker)]
 //! Invariants: [the UDS server binds only the configured socket path; a peer without kernel peer-credential auth is
 //!   refused before any request is read; --serve / --run-once read no tenant, workspace or collection from the
 //!   environment (ADR-0052: the claim supplies ticket and placement); a missing/zero pass key exits non-zero before
 //!   any claim; --serve observes SIGTERM/SIGINT only between passes and a DB outage is a logged failed pass, not an
-//!   exit]
-//! Spec: Baseline §4.2; §4.4; §17.3; ADR-0012; ADR-0037; ADR-0052
+//!   exit; each resident mode reads only its own *_METRICS_ADDR key (required, loopback) and --readyz / --run-once
+//!   open no listener; --metrics-families reads no configuration]
+//! Spec: Baseline §4.2; §4.4; §17.3; §41.2; ADR-0012; ADR-0037; ADR-0052; ADR-0061 D-B; ADR-0061 D-C
 //!
 //! §4.2 (line 818): the owning process of `humaux_adapters::projection_worker::run_once` —
 //! there is no separate `projection-worker` process. Env wiring mirrors
@@ -40,6 +45,11 @@
 //! so every claimed ticket is settled, retried or released before exit). `--run-once` is one such
 //! pass (nothing claimable = exit 0). Neither reads a tenant, workspace or collection from the
 //! environment: the claim hands each ticket its placement.
+//!
+//! Card 34 / ADR-0061 D-B: each resident mode serves `/metrics` and `/status` on its own loopback ops listener,
+//! `HUMAUX_RETRIEVAL_WORKER_SERVE_RPC_METRICS_ADDR` / `HUMAUX_RETRIEVAL_WORKER_SERVE_METRICS_ADDR` — one key per
+//! mode, because both modes run at once from one environment. `/metrics` carries the four
+//! `retrieval_provider_*` families (D-C); `--metrics-families` prints the same render at zero state.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -68,6 +78,11 @@ use humaux_infra_cell::{
 use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig, SealedRetrievalCard};
 use humaux_retrieval_provider::adapters::embedding_provider_for;
 use humaux_retrieval_provider::contract::{EmbeddingModelDescriptor, EmbeddingProvider, ModelId};
+use humaux_retrieval_provider::metrics as provider_metrics;
+use humaux_telemetry::metrics::{
+    OpsListener, families, parse_ops_addr, process_routes, serve_loopback, write_family,
+    write_histogram,
+};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -82,7 +97,61 @@ fn parse<T: std::str::FromStr>(name: &str) -> Result<T, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: humaux-retrieval-worker (--readyz | --run-once | --serve | --serve-rpc)"
+    "usage: humaux-retrieval-worker (--readyz | --run-once | --serve | --serve-rpc | --metrics-families)"
+}
+
+/// §78.1 / ADR-0061 D-B: `--serve-rpc`'s own ops listener address (loopback only, no default).
+const SERVE_RPC_METRICS_ADDR: &str = "HUMAUX_RETRIEVAL_WORKER_SERVE_RPC_METRICS_ADDR";
+/// §78.1 / ADR-0061 D-B: `--serve`'s own ops listener address (loopback only, no default).
+const SERVE_METRICS_ADDR: &str = "HUMAUX_RETRIEVAL_WORKER_SERVE_METRICS_ADDR";
+
+/// The four §41.2 `retrieval_provider_*` families this process counts (ADR-0061 D-C), each seeded over its
+/// closed label product by the `snapshot_*` functions. `/metrics` and `--metrics-families` both call this.
+fn render_metrics(out: &mut String) {
+    let counter = |out: &mut String, family, rows: Vec<(Vec<&'static str>, u64)>| {
+        let samples: Vec<_> = rows
+            .iter()
+            .map(|(labels, n)| (labels.as_slice(), *n as f64))
+            .collect();
+        write_family(out, family, &samples);
+    };
+    counter(
+        out,
+        &families::RETRIEVAL_PROVIDER_REQUESTS_TOTAL,
+        provider_metrics::snapshot_requests_total(),
+    );
+    let latency = provider_metrics::snapshot_latency_seconds();
+    let samples: Vec<_> = latency
+        .iter()
+        .map(|(labels, n, sum)| (labels.as_slice(), *n, *sum))
+        .collect();
+    write_histogram(out, &families::RETRIEVAL_PROVIDER_LATENCY_SECONDS, &samples);
+    counter(
+        out,
+        &families::RETRIEVAL_PROVIDER_TOKENS_TOTAL,
+        provider_metrics::snapshot_tokens_total(),
+    );
+    counter(
+        out,
+        &families::RETRIEVAL_PROVIDER_COST_TOTAL,
+        provider_metrics::snapshot_cost_total(),
+    );
+}
+
+/// Binds `key`'s loopback ops listener for resident `mode` (ADR-0061 D-B). The handle must live as long as the
+/// mode: dropping it closes the port.
+fn ops_listener(key: &'static str, mode: &'static str) -> Result<OpsListener, String> {
+    let addr = parse_ops_addr(&required(key)?)
+        .map_err(|reason| format!("invalid configuration: {key}: {reason}"))?;
+    let routes = process_routes(
+        "humaux-retrieval-worker",
+        mode,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("HUMAUX_BUILD_GIT_SHA"),
+        render_metrics,
+    );
+    // dep: HTTP(loopback) — this mode's /metrics + /status listener
+    serve_loopback(key, addr, routes).map_err(|e| e.to_string())
 }
 
 /// Lifetime of each Qdrant permit (pre-existing value; ADR-0052 D-F mints one per ticket, so a
@@ -224,6 +293,13 @@ async fn run() -> Result<(), Outcome> {
         return Err(Outcome::Failed(usage().to_owned()));
     }
     match args[0].as_str() {
+        // ADR-0061 D-C: before any configuration is read.
+        "--metrics-families" => {
+            let mut out = String::new();
+            render_metrics(&mut out);
+            print!("{out}");
+            Ok(())
+        }
         "--readyz" => readyz().await,
         "--run-once" => projection_mode(false).await,
         "--serve" => projection_mode(true).await,
@@ -282,6 +358,12 @@ async fn readyz() -> Result<(), Outcome> {
 /// `--run-once` (`resident == false`: one pass, then exit — nothing claimable exits 0) and
 /// `--serve` (the same pass every poll interval until SIGTERM/SIGINT). ADR-0052 D-F.
 async fn projection_mode(resident: bool) -> Result<(), Outcome> {
+    // ADR-0061 D-B: only the resident mode is scraped; a one-shot `--run-once` opens no listener.
+    let _ops = if resident {
+        Some(ops_listener(SERVE_METRICS_ADDR, "serve")?)
+    } else {
+        None
+    };
     // Gate: the embedding-model descriptor is config-driven (§78.1 bans a hardcoded model/
     // dim/endpoint), and the catalog that would otherwise supply it does not exist yet
     // (`crates/retrieval-provider/src/contract.rs`'s own T7.1 scope note).
@@ -606,10 +688,14 @@ mod rpc_mode {
 
     use humaux_adapters::postgres::RetrievalWorkerDbPool;
 
-    use super::{Outcome, build_embedding_provider, build_scanner, parse, required};
+    use super::{
+        Outcome, SERVE_RPC_METRICS_ADDR, build_embedding_provider, build_scanner, ops_listener,
+        parse, required,
+    };
     use humaux_retrieval_worker::rpc::{RpcState, router};
 
     pub async fn run() -> Result<(), Outcome> {
+        let _ops = ops_listener(SERVE_RPC_METRICS_ADDR, "serve-rpc")?;
         for var in [
             "HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL",
             "HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION",
@@ -640,6 +726,7 @@ mod rpc_mode {
         let state = Arc::new(RpcState {
             expected_gateway_uid: gateway_uid,
             calls,
+            pg_dsn: dsn,
             scanner,
             embedder,
             dimension,

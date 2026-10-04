@@ -15,7 +15,7 @@ workspace = true
 serde = { version = "1", features = ["derive"] }
 # §53.1: `abstain()`/`DegradeCode`/`Outcome` — the single fail-open exit point (§23.1②'s
 # `ProjectionInvisibleLoss`, §23's `degradations`); already a workspace-wide dependency.
-# why: the sole fail-open exit point (abstain/DegradeCode); used-by: [retrieval::envelope]
+# why: the sole fail-open exit point (abstain/DegradeCode) and the text-format family encoder (ADR-0061 D-A); used-by: [retrieval::completeness, retrieval::envelope]
 humaux-telemetry = { path = "../telemetry" }
 # §21.5's freshness policy is keyed by `MemoryType` (§8.5) — no SQLx/HTTP import, just this
 # pure enum, so this stays within §3/§78.3's "Domain 永不 import HTTP/SQLx" rule (the

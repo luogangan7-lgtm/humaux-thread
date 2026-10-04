@@ -1,21 +1,24 @@
 //! `maintenance::main` — `humaux-maintenance`, the operator-write CLI (§4.2): onboarding, API keys, placement,
 //!   activation, re-drive of DEAD distill jobs, role-password rotation, the deploy-check, opening/closing
 //!   the API-key pepper rehash window and the reasoning-route doors (register / bind / attest-health /
-//!   profile-state / status, ADR-0060 D-H).
+//!   profile-state / status, ADR-0060 D-H), and the one resident mode `health serve` (ADR-0061 D-D).
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, rand, serde, serde_json, time, tokio, uuid];
 //!   services=[PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX,
 //!   HUMAUX_MAINTENANCE_EMBEDDING_DIMENSION, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MAINTENANCE_PRIVATE_MEMORY_COLLECTION,
 //!   HUMAUX_MAINTENANCE_QDRANT_CIDR, HUMAUX_MAINTENANCE_QDRANT_HOST, HUMAUX_MAINTENANCE_QDRANT_PORT];
 //!   modules=[adapters::byok, adapters::membership_repo, adapters::postgres, adapters::provisioning,
 //!   adapters::quota_repo, adapters::reasoning_route_onboarding, adapters::role_hygiene,
-//!   domain::identity, domain::ids, domain::ticket_family, maintenance::roles, protocol::edge]
+//!   domain::identity, domain::ids, domain::ticket_family, maintenance::health_serve, maintenance::roles,
+//!   protocol::edge]
 //! Called-by: [process(humaux-maintenance)]
-//! Invariants: [one-shot, one JSON receipt on stdout per run; exit 0 created/existing, 3 refused, 2 usage, 1
+//! Invariants: [every subcommand but `health serve` is one-shot; one JSON receipt on stdout per run; exit 0 created/existing, 3 refused, 2 usage, 1
 //!   infrastructure (PostgreSQL/Qdrant down); the wire key and generated role passwords are printed once on stdout
 //!   before the receipt, never on stderr or in a receipt; no flag or env var has a literal default]
-//! Spec: Baseline §4.2; §6.2.2; §11.2.3; §73.5; §77; §78.1; ADR-0053; ADR-0058; ADR-0059; ADR-0060
+//! Spec: Baseline §4.2; §6.2.2; §11.2.3; §41.2; §73.5; §77; §78.1; ADR-0053; ADR-0058; ADR-0059; ADR-0060; ADR-0061
 //!
-//! Subcommand mode (card 28; the resident `--serve` job is card 35). Every subcommand is
+//! Subcommand mode (card 28; the resident `--serve` job is card 35). `health serve` (ADR-0061 D-D) is the
+//! one resident subcommand: it samples the §41.2 health gauges until SIGTERM and prints its receipt on exit;
+//! `--metrics-families` prints its zero-state exposition before any config is read. Every other subcommand is
 //! one-shot, idempotent (a re-run writes nothing and answers `existing`; `apikey pepper-epoch advance`
 //! is instead refused `rehash_window_open` while its window is open, ADR-0059 D-H), and prints exactly ONE
 //! JSON receipt on stdout. Exit codes (ADR-0053 D-F): 0 created/existing, 3 refused (a named
@@ -39,6 +42,7 @@
 //! No flag has a literal default (§78.1) except the two names `--workspace` / `--reasoning-domain`
 //! (`default`, the name the seed always used).
 
+mod health_serve;
 mod roles;
 
 use std::process::ExitCode;
@@ -67,7 +71,8 @@ const USAGE: &str = "usage: humaux-maintenance <deploy-init | onboard tenant|wor
 apikey issue|revoke | apikey pepper-epoch advance|close | placement ensure | collection ensure | activate | status | \
 jobs requeue-dead --tenant ID (--job ID | --error-class CLASS) | \
 reasoning register|bind|attest-health|profile-state|status --tenant ID | \
-roles rotate --roles-sql PATH [--role ROLE]... [--create-missing] | deploy-check --roles-sql PATH> [flags]";
+roles rotate --roles-sql PATH [--role ROLE]... [--create-missing] | deploy-check --roles-sql PATH | \
+health serve | --metrics-families> [flags]";
 
 /// A failure before or outside the provisioning library.
 enum Failure {
@@ -726,12 +731,18 @@ async fn run(args: Args) -> Result<Output> {
         },
         ["roles", "rotate"] => roles::rotate(&args).await,
         ["deploy-check", ..] => roles::deploy_check(&args).await,
+        ["health", "serve"] => health_serve::serve().await,
         _ => Err(Failure::Usage(USAGE.to_owned())),
     }
 }
 
 fn main() -> ExitCode {
     let args = Args(std::env::args().skip(1).collect());
+    // ADR-0061 D-C: the exposition this process serves, at zero state, before any config is read.
+    if args.0.first().is_some_and(|a| a == "--metrics-families") {
+        print!("{}", health_serve::metrics_families());
+        return ExitCode::SUCCESS;
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

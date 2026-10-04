@@ -1,0 +1,53 @@
+# Observability bundle services (§67.2: OTel Collector + Prometheus required, local, 30 d), ADR-0061
+# D-G. Consumed by card 39's Linux packaging; the dev Mac does not run it (Docker Desktop cannot reach
+# host listeners bound to 127.0.0.1, research addendum W5) — the rehearsal runs the SAME pinned
+# versions as host binaries, and deploy/prometheus/check-compose.sh validates this file statically.
+# Rules enforced by check-compose.sh: every image is `name:tag@sha256:` with the tag equal to the pin
+# (HUMAUX_TEST_*_VERSION); every listener is an explicit 127.0.0.1 flag (`network_mode: host`, so
+# the loopback app targets are reachable); Alertmanager's gossip listener is disabled
+# (`--cluster.listen-address=` empty); no remote-write / OTLP receiver, admin or lifecycle API.
+# Deployer inputs (both required, no default):
+#   HUMAUX_OBSERVABILITY_RENDERED_DIR — the rendered configs: prometheus/ (prometheus.yml with the
+#     git sha, both rule files, targets/*.json), alertmanager/alertmanager.yml (url_file placeholders
+#     rendered to /run/humaux-alert-urls/<file>), otelcol/otel-collector.yml;
+#   HUMAUX_ALERTMANAGER_URL_DIR — the host directory holding the webhook URL files (outside the repo).
+services:
+  prometheus:
+    image: prom/prometheus:v3.15.0@sha256:6b41f7a45cfbd1d259a78701ee5e14fc2ad9383c9aa5d0427345a18539bc3c91
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      - ${HUMAUX_OBSERVABILITY_RENDERED_DIR:?set HUMAUX_OBSERVABILITY_RENDERED_DIR}/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1@sha256:47a1dc7e74f1e755e29f74d392262f8d1da41f2ada5653911199bf07219e41d9
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=127.0.0.1:9093
+      - --cluster.listen-address=
+    volumes:
+      - ${HUMAUX_OBSERVABILITY_RENDERED_DIR:?set HUMAUX_OBSERVABILITY_RENDERED_DIR}/alertmanager:/etc/alertmanager:ro
+      - ${HUMAUX_ALERTMANAGER_URL_DIR:?set HUMAUX_ALERTMANAGER_URL_DIR}:/run/humaux-alert-urls:ro
+      - alertmanager-data:/alertmanager
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.162.0@sha256:ef772ad07ca455ad83fabbf3da792f0f298a3d41a08e9099367364c0d1349801
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - --config=/etc/otelcol/otel-collector.yml
+    volumes:
+      - ${HUMAUX_OBSERVABILITY_RENDERED_DIR:?set HUMAUX_OBSERVABILITY_RENDERED_DIR}/otelcol:/etc/otelcol:ro
+
+volumes:
+  prometheus-data:
+  alertmanager-data:

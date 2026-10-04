@@ -47,14 +47,26 @@ struct Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // Best-effort cleanup (repo CLAUDE.md hard rule ④: this file never touches a
-        // schema/table of its own, only rows it created under its own throwaway tenant).
-        let _ = self.admin.batch_execute(&format!(
+        // Repo CLAUDE.md hard rule ④: this file never touches a schema/table of its own, only rows
+        // it created under its own throwaway tenant. Card-31 pattern (card 34 ruling B2): the data rows
+        // — incl. the fixture-only `(code, retrieval_card)` stream rows, which fail
+        // `ops.admin_probe_snapshot` closed when leaked (ADR-0061 D-D) — go in ONE batch whose failure
+        // is printed; the tenant row in a separate best-effort batch, so a refused tenant delete can no
+        // longer roll the data delete back.
+        if let Err(error) = self.admin.batch_execute(&format!(
             "DELETE FROM ops.deletion_plan_steps WHERE tenant_id = '{0}'; \
              DELETE FROM control.deletion_requests WHERE tenant_id = '{0}'; \
              DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
-             DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}'; \
-             DELETE FROM control.tenants WHERE tenant_id = '{0}';",
+             DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}';",
+            self.tenant_id
+        )) {
+            eprintln!(
+                "forget_repo cleanup failed for tenant {}: {error}",
+                self.tenant_id
+            );
+        }
+        let _ = self.admin.batch_execute(&format!(
+            "DELETE FROM control.tenants WHERE tenant_id = '{}';",
             self.tenant_id
         ));
     }

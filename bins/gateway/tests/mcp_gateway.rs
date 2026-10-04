@@ -7,42 +7,41 @@
 //!   private.evidence_affects, private.evidence_subjects, private.subject_keys, private.task_binding_grants,
 //!   public.humaux_test_restore_fault_, public.humaux_test_supersede_fault_] w=[control.api_keys,
 //!   control.confirm_tokens, control.memberships, control.operation_receipts, control.private_reasoning_domains,
-//!   control.tenants, control.workspace_memberships, control.workspaces, coord.tasks, ops.memory_lifecycle_events, ops.outbox,
-//!   ops.selection_snapshots, private.context_bindings, private.distill_candidates, private.evidence_objects,
-//!   private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs,
-//!   private.memory_evidence, private.memory_records, private.memory_subjects, private.subjects,
-//!   projection.private_memory_points, projection.stream_checkpoints, projection.stream_log,
+//!   control.tenants, control.workspace_memberships, control.workspaces, coord.tasks, ops.memory_lifecycle_events,
+//!   ops.outbox, ops.selection_snapshots, private.context_bindings, private.distill_candidates,
+//!   private.evidence_objects, private.memory_affects, private.memory_consolidation_inputs,
+//!   private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_subjects,
+//!   private.subjects, projection.private_memory_points, projection.stream_checkpoints, projection.stream_log,
 //!   projection.tenant_placements] x=[control.bump_user_security_epoch, control.onboard_workspace,
-//!   control.set_workspace_membership], PostgreSQL(role_retrieval_worker), Qdrant(*), UDS(retrieval-worker), UDS(serve),
-//!   subprocess(humaux-gateway), subprocess(kill), HTTP(gateway)]; env=[CARGO_BIN_EXE_humaux-gateway,
+//!   control.set_workspace_membership], PostgreSQL(role_retrieval_worker), Qdrant(*), UDS(retrieval-worker),
+//!   UDS(serve), subprocess(humaux-gateway), subprocess(kill), HTTP(gateway)]; env=[CARGO_BIN_EXE_humaux-gateway,
 //!   HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS, HUMAUX_GATEWAY_BIND_ADDR,
 //!   HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS,
 //!   HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX,
 //!   HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
 //!   HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST, HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS,
-//!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES, HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS,
-//!   HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_GATEWAY_REMEMBER_DATA_CLASS,
-//!   HUMAUX_GATEWAY_REMEMBER_DOMAIN,
+//!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES, HUMAUX_GATEWAY_METRICS_ADDR,
+//!   HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS, HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS,
+//!   HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS, HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN,
 //!   HUMAUX_GATEWAY_REMEMBER_EVENT_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND,
 //!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION, HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID,
-//!   HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND,
-//!   HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS,
-//!   HUMAUX_GATEWAY_REPLAY_TTL_SECONDS, HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS,
-//!   HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K, HUMAUX_GATEWAY_TOKEN_HMAC_KEY, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS,
-//!   HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS,
-//!   HUMAUX_GATEWAY_UNKNOWN, HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
+//!   HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND, HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_REMEMBER_VISIBILITY_CLASS, HUMAUX_GATEWAY_REPLAY_TTL_SECONDS,
+//!   HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS, HUMAUX_GATEWAY_RETRIEVAL_PROFILE_TOP_K, HUMAUX_GATEWAY_TOKEN_HMAC_KEY,
+//!   HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS, HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS, HUMAUX_GATEWAY_UNKNOWN,
+//!   HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
 //!   HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN, HUMAUX_TEST_QDRANT_PORT];
 //!   modules=[adapters::confirm_token_repo, adapters::consolidate_repo, adapters::context_repo,
 //!   adapters::forget_repo, adapters::membership_repo, adapters::operation_receipt, adapters::postgres,
-//!   adapters::qdrant, adapters::quota_repo, adapters::remember, adapters::subject_repo, adapters::tests::support::operation_receipt_fixture,
-//!   application::retrieval_embedding_port, contracts::retrieval_config, domain::affect, domain::audit,
-//!   domain::authority, domain::confirm, domain::context, domain::dataclass, domain::error, domain::evidence,
-//!   domain::identity, domain::ids, domain::memory, domain::selection, domain::subject, gateway::context,
-//!   gateway::guard, gateway::mcp_application, gateway::recall, gateway::remember,
-//!   gateway::retrieval_embedding_client, humaux-local-secret-scan, humaux-testkit, infra-cell::permit,
-//!   infra-cell::resource, infra-cell::transport, projection::card, projection::stream, protocol::edge,
-//!   protocol::mcp, protocol::mcp_catalog, retrieval-provider::adapters, retrieval-provider::contract,
-//!   retrieval-worker::rpc, retrieval::completeness, retrieval::request]
+//!   adapters::qdrant, adapters::quota_repo, adapters::remember, adapters::subject_repo,
+//!   adapters::tests::support::operation_receipt_fixture, application::retrieval_embedding_port,
+//!   contracts::retrieval_config, domain::affect, domain::audit, domain::authority, domain::confirm,
+//!   domain::context, domain::dataclass, domain::error, domain::evidence, domain::identity, domain::ids,
+//!   domain::memory, domain::selection, domain::subject, gateway::context, gateway::guard, gateway::mcp_application,
+//!   gateway::recall, gateway::remember, gateway::retrieval_embedding_client, humaux-local-secret-scan,
+//!   humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::card,
+//!   projection::stream, protocol::edge, protocol::mcp, protocol::mcp_catalog, retrieval-provider::adapters,
+//!   retrieval-provider::contract, retrieval-worker::rpc, retrieval::completeness, retrieval::request]
 //! Called-by: [cargo-test]
 //! Invariants: [each test wires its own PostgreSQL/Qdrant/UDS fixtures and gateway subprocess; no test depends on state left by another test]
 //! Spec: Baseline §33.10; §34.0.1; ADR-0030; ADR-0031; ADR-0054; ADR-0056
@@ -423,15 +422,15 @@ async fn semantic_own_uid() -> u32 {
 async fn spawn_semantic_worker(expected_gateway_uid: u32) -> String {
     let socket_path = semantic_rpc_socket_path("worker");
     // dep: PostgreSQL(role_retrieval_worker) — test fixture pool for the mcp_gateway end-to-end suite
-    let calls = humaux_adapters::postgres::RetrievalWorkerDbPool::connect(
-        &std::env::var("HUMAUX_RETRIEVAL_WORKER_PG_DSN")
-            .expect("semantic Gateway fixture requires HUMAUX_RETRIEVAL_WORKER_PG_DSN"),
-    )
-    .await
-    .expect("retrieval worker db pool");
+    let pg_dsn = std::env::var("HUMAUX_RETRIEVAL_WORKER_PG_DSN")
+        .expect("semantic Gateway fixture requires HUMAUX_RETRIEVAL_WORKER_PG_DSN");
+    let calls = humaux_adapters::postgres::RetrievalWorkerDbPool::connect(&pg_dsn)
+        .await
+        .expect("retrieval worker db pool");
     let state = Arc::new(humaux_retrieval_worker::rpc::RpcState {
         expected_gateway_uid,
         calls,
+        pg_dsn,
         scanner: semantic_scanner(),
         embedder: semantic_provider(),
         dimension: 4,
@@ -5636,6 +5635,15 @@ impl GatewayProcessConfig {
             (
                 "HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS".into(),
                 "1024".into(),
+            ),
+            // ADR-0061 D-B / D-F: required, no default; the ops port is free at run time.
+            (
+                "HUMAUX_GATEWAY_METRICS_ADDR".into(),
+                unused_loopback_address().to_string(),
+            ),
+            (
+                "HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS".into(),
+                "1".into(),
             ),
         ]);
         for name in ["PREAUTH_IP", "CREDENTIAL", "USER", "TENANT", "OPERATION"] {

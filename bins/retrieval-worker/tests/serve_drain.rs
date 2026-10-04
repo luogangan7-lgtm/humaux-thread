@@ -11,7 +11,7 @@
 //!   HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP, HUMAUX_RETRIEVAL_WORKER_PG_DSN,
 //!   HUMAUX_RETRIEVAL_WORKER_POLL_INTERVAL_SECS, HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR,
 //!   HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST, HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT, HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS,
-//!   HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION]; modules=[]
+//!   HUMAUX_RETRIEVAL_WORKER_SERVE_METRICS_ADDR, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION]; modules=[]
 //! Called-by: [cargo-test]
 //! Invariants: [touches no shared state: PostgreSQL and Qdrant are closed loopback ports this test bound and released;
 //!   it signals only the child it spawned; without the pinned gitleaks triple it prints a visible SKIP, and
@@ -88,6 +88,11 @@ fn spawn_serve(gitleaks: [String; 3], stderr: std::fs::File) -> std::process::Ch
         .env("HUMAUX_RETRIEVAL_WORKER_MAX_ATTEMPTS", "3")
         .env("HUMAUX_RETRIEVAL_WORKER_BACKOFF_BASE_SECS", "1")
         .env("HUMAUX_RETRIEVAL_WORKER_BACKOFF_MAX_SECS", "2")
+        // ADR-0061 D-B: the resident mode's own ops listener, a free loopback port.
+        .env(
+            "HUMAUX_RETRIEVAL_WORKER_SERVE_METRICS_ADDR",
+            format!("127.0.0.1:{}", dead_port()),
+        )
         .stdout(Stdio::null())
         .stderr(stderr)
         .spawn()

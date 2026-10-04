@@ -1,0 +1,18 @@
+# §46.1 migration manifest. Card 34 / ADR-0061 D-D: one CONCURRENTLY index for ops.health_snapshot(), run outside a
+# transaction (`transaction = "none"`, honoured by xtask migrate; the 0177 shape). Index-only, safely droppable.
+
+migration_id = "0213_idx_data_disclosures_finalized_at"
+class = "REVERSIBLE"
+transaction = "none"
+
+precheck = """
+select to_regclass('ops.data_disclosures_finalized_at_idx') is null as precheck_ok
+"""
+
+postcheck = """
+select coalesce((select indisvalid and indisready and pg_get_expr(indpred, indrelid) like '%finalized_at IS NOT NULL%'
+                   from pg_index where indexrelid = to_regclass('ops.data_disclosures_finalized_at_idx')), false) as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP INDEX CONCURRENTLY IF EXISTS ops.data_disclosures_finalized_at_idx; (also the fix for an INVALID leftover of a failed build, which the precheck refuses by name)"
+backup_restore_requirement = "none: index-only DDL built CONCURRENTLY, no row data touched, safely droppable"

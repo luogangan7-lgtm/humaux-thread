@@ -40,8 +40,9 @@ cargo run -q -p xtask -- soak \
   --sessions-per-tenant 4 \
   --duration-secs 900 --drain-secs 240 --think-ms 250 \
   --probe-every-secs 15 \
-  --probe-cmd 'curl -fsS -o /dev/null http://127.0.0.1:8080/readyz' \
+  --probe-cmd 'curl -fsS -o /dev/null http://127.0.0.1:8080/livez' \
   --probe-cmd './target/debug/humaux-retrieval-worker --readyz' \
+  --probe-cmd "curl -fsS 127.0.0.1:19101/metrics | grep -q '^degrade_total{'" \
   --watch-pidfile gateway=$S/gw.pid \
   --watch-pidfile retrieval-worker=$S/rw.pid \
   --watch-pidfile distill-worker=$S/ds.pid \
@@ -56,6 +57,15 @@ cargo run -q -p xtask -- soak \
   --max-op-failure-rate 0.05 \
   --report ./soak-report.json
 ```
+
+Card 34 / ADR-0061 D-F (ruling E15): the gateway is graded on **`/livez`**, not `/readyz`. Since
+card 34 `/readyz` is dependency-truthful, and the chaos hook kill -9's the retrieval worker the
+gateway depends on, so a correct `/readyz` is 503 `not_ready` for that window — counting it would
+grade the chaos, not the gateway. The old `/readyz` was only the accepting flag, which `/livez`
+carries at the same strength. Probes that need a number read the loopback `/metrics` of the
+process instead of shelling out (the third `--probe-cmd` above: the gateway's ops listener answers
+and exports `degrade_total`; port = `HUMAUX_GATEWAY_METRICS_ADDR`). The xtask soak harness itself is
+unchanged.
 
 Card 27 / ADR-0052: the rotation includes the resident projection runner
 (`humaux-retrieval-worker --serve`). It replaced the per-tenant `--run-once` loop the rehearsal
@@ -308,7 +318,7 @@ What matters beyond that is not which worker you pick but that the run still fin
   (`DERIVED_DISTILL` lease) and the `--serve` consolidation worker (`DERIVED_CONSOLIDATION`
   lease); check `config.chaos_cmds` in the report before believing a run exercised restarts.
 - Two processes are deliberately **out** of the rotation, and the reason belongs in the report,
-  not in silence: the **gateway**, whose `GET /readyz` is the only probe bound to a live process
+  not in silence: the **gateway**, whose `GET /livez` is the only probe bound to a live process
   (the worker probes are one-shot binaries checking PG/Qdrant), so killing it makes
   `probes_green` grade the harness's own outage window; and the private worker's
   **`--serve-rpc`** listener, which holds no `ops.jobs` lease and is the UDS server the
