@@ -1,7 +1,7 @@
 //! `private-worker::tests::ops_listener` — card 34 / ADR-0061 D-B, E10 against the BINARY: `--serve-rpc` and
 //!   `--distill-serve` each open their own loopback ops listener from their own key (before any database work), it
-//!   serves zero families and a `/status` naming the mode, `--distill-once` opens none, and `--metrics-families`
-//!   reads no configuration.
+//!   serves the three private-plane families (card 34b) and a `/status` naming the mode, `--distill-once` opens
+//!   none, and `--metrics-families` reads no configuration.
 //! Depends-on: crates=[]; services=[HTTP(loopback), subprocess(humaux-private-worker)];
 //!   env=[CARGO_BIN_EXE_humaux-private-worker, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID,
 //!   HUMAUX_PRIVATE_WORKER_CREDENTIALS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS,
@@ -13,7 +13,7 @@
 //! Invariants: [touches no shared state: PostgreSQL is a loopback port this test bound and never answers, so every
 //!   mode is observed while it is still booting; every listener is a free loopback port taken at run time; the test
 //!   kills only children it spawned]
-//! Spec: Baseline §78.1; ADR-0061 D-B; ADR-0061 E10
+//! Spec: Baseline §78.1; §41.2; ADR-0061 D-B; ADR-0061 D-C; ADR-0061 E10
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -108,12 +108,36 @@ fn addr_of(env: &[(&str, String)], key: &str) -> SocketAddr {
         .expect("ops address in env")
 }
 
-/// T-W4 (private half, E10): `--metrics-families` with an empty environment prints zero families and exits 0.
+/// The three §41.2 families this process exports (card 34b), each unlabeled.
+const FAMILIES: [&str; 3] = [
+    "private_distill_runs_total",
+    "private_distill_outputs_total",
+    "private_reasoning_usage_total",
+];
+
+/// Every family is typed `counter` and carries exactly one bare sample at `value` (ADR-0061 D-A seeding).
+fn assert_families_at(body: &str, value: &str, what: &str) {
+    for family in FAMILIES {
+        assert!(
+            body.contains(&format!("# TYPE {family} counter\n{family} {value}\n")),
+            "{what}: {family} {value} missing in\n{body}"
+        );
+    }
+    let samples = body.lines().filter(|l| !l.starts_with('#')).count();
+    assert_eq!(samples, FAMILIES.len(), "{what}: {body}");
+}
+
+/// T-W4 (private half, card 34b): `--metrics-families` with an empty environment prints the three private-plane
+/// families at 0 and exits 0. Fault: render nothing (the card-34 empty `render_metrics`) ⇒ red.
 #[test]
-fn metrics_families_prints_zero_families_without_env() {
+fn metrics_families_prints_the_three_private_families_without_env() {
     let out = run(&["--metrics-families"], &[]);
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{}", text(&out));
+    assert_families_at(
+        &String::from_utf8_lossy(&out.stdout),
+        "0",
+        "--metrics-families",
+    );
 }
 
 /// T-W1: each resident mode refuses to boot without ITS OWN key and names it; with only the `--serve-rpc` key set,
@@ -149,8 +173,8 @@ fn each_resident_mode_needs_its_own_metrics_key() {
     }
 }
 
-/// T-W2 / T-W3 (private, E10): while each mode is held in its database connect, `--serve-rpc` and
-/// `--distill-serve` answer `/metrics` 200 with zero families and `/status` naming the mode; `--distill-once` with
+/// T-W2 / T-W3 (private, card 34b): while each mode is held in its database connect, `--serve-rpc` and
+/// `--distill-serve` answer `/metrics` 200 with the three private-plane families at 0 and `/status` naming the mode; `--distill-once` with
 /// both keys set opens no listener. Fault: bind in `--distill-once` ⇒ red; drop the listener handle early ⇒ red.
 #[test]
 fn resident_modes_open_their_listener_before_the_database_and_one_shots_none() {
@@ -180,7 +204,7 @@ fn resident_modes_open_their_listener_before_the_database_and_one_shots_none() {
         let status = get(addr, "/status");
         let _ = child.kill();
         let _ = child.wait();
-        assert!(!body.contains("# TYPE"), "{mode}: {body}");
+        assert_families_at(&body, "0", mode);
         let (code, status) = status.expect("/status answers");
         assert_eq!(code, 200, "{status}");
         assert!(

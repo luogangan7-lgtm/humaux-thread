@@ -998,6 +998,18 @@ INV-1 through the alert route.
   (§6.16); backup alert silent until card 37; the collector forwards nothing until an SDK producer; the external
   Watchdog dead-man is a manual §69 step (runbook §7).
 
+### 6.21 Closed by card 34b (ADR-0061 addendum)
+
+| Change | Before | After | Witness |
+|---|---|---|---|
+| Private-worker metrics | `/metrics` empty in both resident modes (E10); the two distill families allowlisted in `NOT_YET_PRODUCED` | `private_distill_runs_total` / `private_distill_outputs_total` (counted after the distill write commits, `commit_distill_write`; a rolled-back write counts nothing), `private_reasoning_usage_total` (`finalize_private_call` after its commit, input + output tokens) — one emit each, one production caller each (D5), rendered by `--serve-rpc`, `--distill-serve` and `--metrics-families`; `NOT_YET_PRODUCED` = backup only | three G80-6 witnesses, `distill_hop_e2e` d5 / d5c, `private_worker_ops`, `metrics_registry` |
+| §42 no-output stage | not loaded | `DistillNoOutput` (verbatim §42, CRITICAL, no `for:`): fires when runs rise and outputs stay flat, silent when outputs rise or nothing moves; mutations 20/20 | `promtool_*` gates |
+| Rehearsal | private-worker scrape graded for exposition only | `metrics_scrape` asserts the three counters of the resident distiller > 0 after it distilled real Evidence | `rehearse_c34b` |
+
+- **Open:** `public_reasoning_usage_total` dormant (no PLATFORM_PUBLIC reasoning producer); the consolidation worker
+  exports none and provider slot / dispatch families have no §41.2 row; the §42 parser-stub injection is proven on
+  synthetic series (promtool), not in the rehearsal.
+
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 
 The user approved the whole list on 2026-09-26 ("需要清理删除的进行清理删除，其他的你看着办"). Every

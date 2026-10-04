@@ -3403,16 +3403,25 @@ fn slow_provider_tenant_cannot_take_all_slots() {
                     let started = std::time::Instant::now();
                     let (mut max_b, mut samples) = (0_i64, 0_u32);
                     while started.elapsed() < Duration::from_secs_f64(3.0 * TIMEOUT_SECS) {
-                        let held: i64 = admin
+                        // ADR-0060 D-F is a contention invariant: B's share is bounded only while A
+                        // still has claimable work. Once A's 500 jobs are drained (a warm host does
+                        // it inside this window: card 34b chain, done_a=500 max_b=4) B is the only
+                        // tenant with READY jobs and may hold every slot — so both counters fold a
+                        // sample in only while A has PENDING or PROCESSING jobs.
+                        let row = admin
                             .query_one(
-                                "SELECT count(*) FROM ops.provider_slots s \
-                               JOIN ops.jobs j ON j.job_id = s.job_id WHERE j.tenant_id = $1",
-                                &[&tenant_b],
+                                "SELECT (SELECT count(*) FROM ops.provider_slots s \
+                                   JOIN ops.jobs j ON j.job_id = s.job_id WHERE j.tenant_id = $1), \
+                                        (SELECT count(*) FROM ops.jobs \
+                                   WHERE tenant_id = $2 AND status IN ('PENDING', 'PROCESSING'))",
+                                &[&tenant_b, &tenant_a],
                             )
-                            .expect("slots held by B")
-                            .get(0);
-                        max_b = max_b.max(held);
-                        samples += 1;
+                            .expect("slots held by B / A's open jobs");
+                        let (held, a_open): (i64, i64) = (row.get(0), row.get(1));
+                        if a_open > 0 {
+                            max_b = max_b.max(held);
+                            samples += 1;
+                        }
                         std::thread::sleep(Duration::from_millis(100));
                     }
                     stop.store(true, Ordering::SeqCst);

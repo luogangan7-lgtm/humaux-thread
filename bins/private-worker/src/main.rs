@@ -1,6 +1,6 @@
 //! `private-worker::main` — `humaux-private-worker` process entry (§4.2 minimal process set; §4.4 admin probe
 //!   contract; §11/§11.1 T4.4+T4.5; §11.8 ADR-0015 inference RPC).
-//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-telemetry, tokio, uuid]; services=[HTTP(loopback), PostgreSQL(role_private_worker)]; env=[CARGO_PKG_VERSION, HUMAUX_BUILD_GIT_SHA, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT, HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS, HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR, HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS, HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_REGIONS, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, HUMAUX_PRIVATE_WORKER_SERVE_RPC_METRICS_ADDR, PRIVATE_WORKER_PG_DSN, refused:HUMAUX_PRIVATE_WORKER_{CAPABILITIES, CHAT_URL, EGRESS_PROCESSOR_ID, KEY_ENV, MODEL_ID, MODEL_REVISION, PROVIDER_ID, REGION}]; modules=[adapters::byok::ssrf, adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::disclosure, adapters::jobs, adapters::postgres, adapters::reasoning_route_admission, domain::authority, private-worker::distill, private-worker::inference_rpc, private-worker::route_providers, telemetry::metrics]
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-telemetry, tokio, uuid]; services=[HTTP(loopback), PostgreSQL(role_private_worker)]; env=[CARGO_PKG_VERSION, HUMAUX_BUILD_GIT_SHA, HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_MAX_CALLS, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_HARD_DEADLINE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_IN_FLIGHT, HUMAUX_PRIVATE_WORKER_DISTILL_LEASE_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS, HUMAUX_PRIVATE_WORKER_DISTILL_NOT_READY_PARK_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_POLL_INTERVAL_SECS, HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR, HUMAUX_PRIVATE_WORKER_DNS_PINS, HUMAUX_PRIVATE_WORKER_EGRESS_RECIPIENTS, HUMAUX_PRIVATE_WORKER_HEALTH_RENEW_SECS, HUMAUX_PRIVATE_WORKER_HTTP_TIMEOUT_SECS, HUMAUX_PRIVATE_WORKER_PERMIT_TTL_SECS, HUMAUX_PRIVATE_WORKER_REGIONS, HUMAUX_PRIVATE_WORKER_RPC_SOCKET_PATH, HUMAUX_PRIVATE_WORKER_SERVE_RPC_METRICS_ADDR, PRIVATE_WORKER_PG_DSN, refused:HUMAUX_PRIVATE_WORKER_{CAPABILITIES, CHAT_URL, EGRESS_PROCESSOR_ID, KEY_ENV, MODEL_ID, MODEL_REVISION, PROVIDER_ID, REGION}]; modules=[adapters::byok::ssrf, adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::disclosure, adapters::distill_repo, adapters::jobs, adapters::model_call_ledger, adapters::postgres, adapters::reasoning_route_admission, domain::authority, private-worker::distill, private-worker::inference_rpc, private-worker::route_providers, telemetry::metrics]
 //! Called-by: [process(humaux-private-worker)]
 //! Invariants: [the only process holding both role_private_worker DB write and BYOK decrypt capability (§11.1); a
 //!   missing/invalid env value or unreachable DSN exits non-zero before serving; no provider, model, endpoint,
@@ -9,7 +9,7 @@
 //!   each resident mode reads only its own *_METRICS_ADDR key (required, loopback) and the one-shot modes open no
 //!   listener; --metrics-families reads no configuration]
 //! Spec: Baseline §11.1; §11.8; §78.1; ADR-0037; ADR-0036; ADR-0016; ADR-0058; ADR-0059; ADR-0060 D-B; ADR-0060 D-C;
-//!   ADR-0060 D-J; ADR-0060 E3; ADR-0061 D-B; ADR-0061 D-C; ADR-0061 E10
+//!   ADR-0060 D-J; ADR-0060 E3; ADR-0061 D-B; ADR-0061 D-C; ADR-0061 E10; §41.2; §42
 //!
 //! §11.1: "仅 humaux-private-worker 在最贴近 adapter 处解密" — this is the one process in the
 //! workspace permitted to hold both DB write capability (`PrivateWorkerDbPool`,
@@ -41,9 +41,9 @@
 //!   job's own tenant context.
 //!
 //! Card 34 / ADR-0061 D-B: `--serve-rpc` and `--distill-serve` each open their own loopback ops listener
-//! (`HUMAUX_PRIVATE_WORKER_SERVE_RPC_METRICS_ADDR` / `HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR`). No
-//! §41.2 family is counted in this process yet, so `/metrics` is empty and Prometheus' `up` is the resident
-//! liveness signal (E10; producer: card 34b).
+//! (`HUMAUX_PRIVATE_WORKER_SERVE_RPC_METRICS_ADDR` / `HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR`).
+//! Metrics families emitted (card 34b, ADR-0061 D-C): `private_distill_runs_total`, `private_distill_outputs_total`
+//! (§42 no-output stage) and `private_reasoning_usage_total` (§35 quota), all unlabeled and seeded at 0.
 
 use std::env;
 use std::process::ExitCode;
@@ -55,14 +55,18 @@ use humaux_adapters::byok::ssrf;
 use humaux_adapters::consolidation_reasoner::consolidation_prompt_contract;
 use humaux_adapters::contribution_reasoner::ContributionReasonerConfig;
 use humaux_adapters::disclosure::DeletionCapability;
+use humaux_adapters::distill_repo;
 use humaux_adapters::jobs;
+use humaux_adapters::model_call_ledger;
 use humaux_adapters::postgres::PrivateWorkerDbPool;
 use humaux_adapters::reasoning_route_admission::{ProviderFor, ReasoningAdmissionLocator};
 use humaux_domain::authority::AuthorityClass;
 use humaux_private_worker::distill::{self, DistillDispatchConfig};
 use humaux_private_worker::inference_rpc::{RpcState, bind_socket, clone_config, serve};
 use humaux_private_worker::route_providers::{self, RouteProviders};
-use humaux_telemetry::metrics::{OpsListener, parse_ops_addr, process_routes, serve_loopback};
+use humaux_telemetry::metrics::{
+    OpsListener, families, parse_ops_addr, process_routes, serve_loopback, write_family,
+};
 use uuid::Uuid;
 
 fn required(name: &str) -> Result<String, String> {
@@ -84,9 +88,26 @@ const SERVE_RPC_METRICS_ADDR: &str = "HUMAUX_PRIVATE_WORKER_SERVE_RPC_METRICS_AD
 /// §78.1 / ADR-0061 D-B: `--distill-serve`'s own ops listener address (loopback only, no default).
 const DISTILL_SERVE_METRICS_ADDR: &str = "HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR";
 
-/// The §41.2 families this process counts: none yet (ADR-0061 E10; `private_distill_*` arrive with card 34b).
-/// `/metrics` and `--metrics-families` both call this.
-fn render_metrics(_out: &mut String) {}
+/// The §41.2 families this process counts (ADR-0061 D-C, card 34b): the two distill counters and the private
+/// reasoning usage, each read from its adapters emit. `/metrics` and `--metrics-families` both call this.
+fn render_metrics(out: &mut String) {
+    for (family, value) in [
+        (
+            &families::PRIVATE_DISTILL_RUNS_TOTAL,
+            distill_repo::private_distill_runs_total(),
+        ),
+        (
+            &families::PRIVATE_DISTILL_OUTPUTS_TOTAL,
+            distill_repo::private_distill_outputs_total(),
+        ),
+        (
+            &families::PRIVATE_REASONING_USAGE_TOTAL,
+            model_call_ledger::private_reasoning_usage_total(),
+        ),
+    ] {
+        write_family(out, family, &[(&[], value as f64)]);
+    }
+}
 
 /// Binds `key`'s loopback ops listener for resident `mode` (ADR-0061 D-B). The handle must live as long as the
 /// mode: dropping it closes the port.

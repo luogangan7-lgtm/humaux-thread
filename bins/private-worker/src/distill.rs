@@ -1389,7 +1389,7 @@ async fn call_loop(
             ready.evidence.rls_user_id,
         )
         .await?;
-        distill_repo::finish_processing_run(
+        let finished_runs = distill_repo::finish_processing_run(
             &mut abandoned_txn,
             ready.processing_run_id,
             &abandoned_digest,
@@ -1397,7 +1397,8 @@ async fn call_loop(
             Some(&inferred.disclosure_id.to_string()),
         )
         .await?;
-        abandoned_txn.commit().await?;
+        // ADR-0061 card 34b: §41.2 run counted only once this commit lands.
+        distill_repo::commit_distill_write(abandoned_txn, finished_runs, 0).await?;
         empty_retries += 1;
         report.empty_retries += 1;
         eprintln!(
@@ -1613,7 +1614,7 @@ async fn write_txn(
         }
     }
     let output_digest: [u8; 32] = Sha256::digest(&inferred.output_bytes).into();
-    distill_repo::finish_processing_run(
+    let finished_runs = distill_repo::finish_processing_run(
         &mut txn,
         processing_run_id,
         &output_digest,
@@ -1632,11 +1633,11 @@ async fn write_txn(
         txn.rollback().await?;
         return Ok(None);
     }
-    txn.commit().await?;
-    Ok(Some((
-        u32::try_from(inserted).unwrap_or_default(),
-        rejected,
-    )))
+    let inserted = u32::try_from(inserted).unwrap_or_default();
+    // ADR-0061 card 34b: §41.2 run and outputs counted only once this commit lands (a rollback above counts
+    // nothing, so the job's retry counts once).
+    distill_repo::commit_distill_write(txn, finished_runs, u64::from(inserted)).await?;
+    Ok(Some((inserted, rejected)))
 }
 
 #[cfg(test)]

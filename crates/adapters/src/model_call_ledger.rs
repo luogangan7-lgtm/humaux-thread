@@ -3,13 +3,15 @@
 //!   pre-call cost estimate before the external provider call is made, `status='RESERVED'`; [`finalize_call`] fills
 //!   in the token/latency/actual-cost/ error columns and flips `status` to `SUCCEEDED`/`FAILED` after the call
 //!   returns.
-//! Depends-on: crates=[humaux-application, humaux-domain, sqlx]; services=[PostgreSQL(any) r=[control.provider_pricing_versions, ops.data_disclosures] w=[ops.model_call_ledger, ops.tenant_cost_events]]; env=[]; modules=[adapters::disclosure, adapters::postgres, adapters::reasoning_route_admission, application::consolidate, domain::egress, domain::ledger]
-//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::provider_budget, retrieval-provider::adapters, tests]
+//! Depends-on: crates=[humaux-application, humaux-domain, sqlx]; services=[PostgreSQL(any) r=[control.provider_pricing_versions, ops.data_disclosures] w=[ops.model_call_ledger, ops.tenant_cost_events]]; env=[]; modules=[adapters::disclosure, adapters::postgres, adapters::reasoning_route_admission, application::consolidate, domain::egress, domain::ledger, humaux-adapters]
+//! Called-by: [adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::provider_budget, private-worker::main, retrieval-provider::adapters, tests]
 //! Invariants: [every real provider call is bracketed by reserve_call/finalize_call (a skipped reserve leaves no row,
 //!   which the 0094 guard cannot see); costs are persisted as given, never computed here; a reservation conflict is a
 //!   typed error, not a second attempt identity; a private reasoning row carries its admitted route and is reserved
-//!   in ONE transaction with its disclosure (ADR-0060 D-I / D-N, enforced by the 0206 triggers)]
-//! Spec: Baseline §19; §78.1; §20; §11.2.4; §11.2.5; §11.5; §11.6; §11.7; §6.2.1; §6.2.2; ADR-0060 D-I, D-N
+//!   in ONE transaction with its disclosure (ADR-0060 D-I / D-N, enforced by the 0206 triggers); metrics family
+//!   emitted: private_reasoning_usage_total, counted after the finalize commits (ADR-0061 card 34b)]
+//! Spec: Baseline §19; §78.1; §20; §11.2.4; §11.2.5; §11.5; §11.6; §11.7; §6.2.1; §6.2.2; ADR-0060 D-I, D-N; §41.2;
+//!   ADR-0061 D-C
 //!
 //! Every
 //! caller that makes a real `EmbeddingProvider`/`RerankProvider` call (§19 Retrieval Provider
@@ -44,6 +46,7 @@ use sqlx::types::Uuid;
 use sqlx::types::time::OffsetDateTime;
 
 use crate::{
+    Counter,
     disclosure::{self, DisclosureError, DisclosureSource},
     postgres::{PrivateWorkerDbPool, RetrievalWorkerDbPool},
     reasoning_route_admission::ReasoningAdmissionLocator,
@@ -633,7 +636,29 @@ pub async fn finalize_private_call(
     let mut txn = pool.pool().begin().await?;
     let changed = finalize_in_txn(&mut txn, tenant_id, model_call_id, outcome, finalize).await?;
     txn.commit().await?;
+    if changed {
+        count_private_reasoning_usage(finalize);
+    }
     Ok(changed)
+}
+
+// §41.2 row `private_reasoning_usage_total` (§11 推理调用返回读 usage · 1; consumer §35 quota). Rendered by
+// `humaux-private-worker` (ADR-0061 D-C).
+static PRIVATE_REASONING_USAGE_TOTAL: Counter = Counter::new();
+
+/// §41.2 `private_reasoning_usage_total`: adds the tokens the provider reported for one finalized private call,
+/// input + output as §35 quota counts them; an unreported or negative count adds 0 and never fails the call.
+/// Public so the G80-6 witness can drive the emit without a database; the one production caller is
+/// [`finalize_private_call`] (`cargo xtask metrics-registry` D5 asserts exactly one, ADR-0061 card 34b).
+pub fn count_private_reasoning_usage(finalize: &FinalizeCall) {
+    let reported = |tokens: Option<i64>| tokens.and_then(|t| u64::try_from(t).ok()).unwrap_or(0);
+    let tokens = reported(finalize.input_tokens).saturating_add(reported(finalize.output_tokens));
+    PRIVATE_REASONING_USAGE_TOTAL.inc(tokens);
+}
+
+/// This process's `private_reasoning_usage_total` (ADR-0061 D-C: the private worker renders it).
+pub fn private_reasoning_usage_total() -> u64 {
+    PRIVATE_REASONING_USAGE_TOTAL.get()
 }
 
 /// One `control.provider_pricing_versions` row — plain data, deliberately shaped to match

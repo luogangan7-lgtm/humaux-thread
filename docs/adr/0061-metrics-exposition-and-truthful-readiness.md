@@ -5,7 +5,9 @@
   migrations 0210-0213 and the aggregate reads; S4 `humaux-maintenance health serve`; S5 the gateway ops listener,
   truthful `/readyz`, `/status`, guard render and the worker's readiness route; S6 worker ops listeners; S7
   `metrics-registry --check` D7/D8; S8 loaded rules, promtool tests, the mutation record and bundle configs; S9 the
-  §4.4 probes; S10 the rehearsal steps, docs, rulings, tests and limits recorded below.
+  §4.4 probes; S10 the rehearsal steps, docs, rulings, tests and limits recorded below. Addendum card 34b
+  (2026-10-04, on HEAD `5c5f8fa`): the private worker's three families and the §42 no-output stage — see "Addendum
+  card 34b".
 - Spec: Baseline §41.2, §42, §53.5, §67.2, §4.4, §80.2; design `card_34_design.md` with its main-line rulings
   (2026-10-04: E1–E15) and the research addendum (W1–W8).
 
@@ -331,12 +333,62 @@ per scrape; upgrade = a DEAD retention/archival path (card 36 retention) or a ma
 | E7 | `health serve` is a supervised resident unit | D-D, supervision.md |
 | E8 | §42 `health gauges absent` row, injection on a throwaway database only | D-E |
 | E9 | INV-1's `sum()` spans every process exporting `degrade_total`; a non-gateway `abstain()` needs its own row first | Baseline §53.5 |
-| E10 | private and consolidation workers export zero families; `private_distill_runs_total` / `_outputs_total` are on `NOT_YET_PRODUCED` with producer card 34b | D-C, D-H |
+| E10 | private and consolidation workers export zero families; `private_distill_runs_total` / `_outputs_total` are on `NOT_YET_PRODUCED` with producer card 34b — **closed by card 34b** (addendum below); the consolidation worker still exports none | D-C, D-H |
 | E11 | `role_admin` may EXECUTE the read-only aggregate definer | Baseline §6.2.2 |
 | E12 | pin suffix `_SHA256` | D-I |
 | E13 | the drill drops the denominator at ingestion; no shared-DB grant | D-K |
 | E14 | `role_health_reader` row in §6.2.0 / §6.2.2; `rls-check` asserts ownership == 2; the dev migrator is the superuser, a non-superuser migrator's prerequisites are in "Review-fix pass 3" (F2) | D-D |
 | E15 | PG, the retrieval RPC round trip and Qdrant are hard for `/readyz`; the soak grades `/livez` | D-F |
+
+## Addendum card 34b (2026-10-04): the private worker's families and the §42 no-output stage
+
+### D-M  Three unlabeled counters, each emitted where §41.2 reads it, rendered by the private worker
+
+| family (§41.2) | emit (the one `.inc(`, §41.2 R4) | the one production caller | why there |
+|---|---|---|---|
+| `private_distill_runs_total` | `adapters::distill_repo::count_committed_distill` | `commit_distill_write`, after `txn.commit()`, with the runs `finish_processing_run` flipped | §42 no-output stage is about runs that *finish* without output; a run counts whatever its `output_count`, a failed attempt never finishes (ADR-0016 D4), an already finished run adds 0 |
+| `private_distill_outputs_total` | the same `count_committed_distill` | the same post-commit call, with the `insert_memory` calls of that write | one per memory record the distill write made durable |
+| `private_reasoning_usage_total` | `adapters::model_call_ledger::count_private_reasoning_usage` | `finalize_private_call`, after the commit and only when the row was finalized | §35 quota counts input + output tokens as the provider reported them; unreported or negative usage adds 0 and never fails the call; a no-op re-finalize adds nothing |
+
+**Counted after commit (review fix, 2026-10-04).** The first cut counted runs in `finish_processing_run` and outputs
+in `insert_memory`, i.e. inside the settle transaction. `write_txn` still has fallible steps after those statements
+(the inferred-affect insert, the candidate TTL read, the outbox settle that returns `false` when the outbox lease
+moved, the commit itself) and rolls back on each, so a rolled-back attempt counted, and its retry counted again —
+outputs could rise while nothing was persisted and `DistillNoOutput` stayed silent. Both distill commits (the
+written attempt and the ADR-0048 abandoned empty attempt) now go through `distill_repo::commit_distill_write`,
+which commits and only then counts; `finish_processing_run` returns the runs it finished instead of counting.
+memory.confirm / memory.correct reach `insert_memory` too but never this commit, so they are no longer counted as
+distill outputs anywhere.
+
+- The counters are `humaux_adapters::Counter` statics, not telemetry `Counters`: `humaux-adapters` has no
+  production dependency on `humaux-telemetry`, and card 34b adds no dependency. The private worker renders the three
+  values through `telemetry::metrics::write_family` (the one encoder, D-A) from adapters accessors, the shape
+  `retrieval-provider::metrics` already has. No label (the §41.2 rows carry none).
+- The recorder functions are public only so the G80-6 witnesses can drive the emit without a database. Their call
+  sites are pinned twice: statically, `metrics-registry` D5 counts each `EMIT_HELPERS` helper's production callers
+  and requires the declared §41.2 count (1) — a deleted call is `=1/0`, a second caller `=1/2`; and on the real
+  path against PostgreSQL, `distill_hop_e2e` d5 requires exactly (runs, outputs) = (1, 1) for one committed write
+  and d5c requires (0, 0) for a write whose outbox settle is refused after its insert, plus exactly the provider's
+  input + output tokens once for its finalized call. The rehearsal's `> 0` remains the deployed-binary check.
+- D-C: both resident modes (`--serve-rpc`, `--distill-serve`) and `--metrics-families` render the three, seeded at 0.
+  The consolidation worker's reasoner also reaches `finalize_private_call` — in a process that does not export the
+  family, so nothing is double-counted on a scrape.
+- `NOT_YET_PRODUCED` keeps only `backup_last_success_timestamp_seconds` (card 37); D8's stale check would fail on
+  either distill entry now that D7 counts them exported. **E10 closed** for the private worker.
+- `public_reasoning_usage_total` stays dormant: no PLATFORM_PUBLIC reasoning call exists (no producing card in plan
+  v2) and no loaded rule names it, so it is neither emitted nor allowlisted.
+
+### D-N  `DistillNoOutput` loaded verbatim from §42, proven on synthetic series
+
+- `alerts.rules.yml` gains `DistillNoOutput`: `increase(private_distill_runs_total[1h]) > 0 and
+  increase(private_distill_outputs_total[1h]) == 0`, CRITICAL, no `for:` (the §42 row gives none).
+- promtool cases: fires when runs rise and outputs stay flat; silent when outputs rise too; silent when neither moves.
+  `mutations.sh` rows `distill_and` (drop the `and` branch) and `distill_flat` (`== 0` → `> 0`): 20/20 red.
+- The §42 injection ("a parser stub that always returns an empty array ⇒ runs rise, outputs do not") is proven by
+  the firing promtool case, not by the rehearsal: a stub parser in the deployed binary is a code change, not an
+  operator action. The rehearsal's `metrics_scrape` instead asserts the three counters of the `--distill-serve`
+  scrape are > 0 after this step's distiller distilled real Evidence — the live proof that the three call sites are
+  wired.
 
 ## Pins (D-I, research addendum W1–W3; values live only in TW `live_env.sh`)
 
@@ -367,6 +419,13 @@ pin variable before the chain starts.
   exporter.
 - A static per-process family list or scraping a running stack in CI for D7; extending the C scan to `bins/`.
 - A drill that REVOKEs on the shared dev database (E13).
+- Card 34b: a production `humaux-adapters` → `humaux-telemetry` dependency so the emits could call telemetry
+  `Counters` (a new dependency edge; the crate-local counter rendered by the process is the retrieval-provider shape
+  already); a database-backed witness driving `commit_distill_write` (the probe package links no async runtime —
+  the PostgreSQL leg lives in `distill_hop_e2e` d5 / d5c and D5 pins the callers); counting in
+  `finish_processing_run` / `insert_memory` inside the transaction (the review P0: a rollback still counted); the §42
+  parser-stub injection inside the rehearsal (a code
+  change to the deployed binary, not an operator action).
 
 ## Tests (each shown red under its named fault while it was written; slice notes carry the failing lines)
 
@@ -392,10 +451,16 @@ pin variable before the chain starts.
 | gateway `status::tests::an_old_all_pass_snapshot_is_stale` (T-G4) | drop the age check |
 | retrieval-worker `rpc_readyz` (T-W5), `ops_listener` (T-W1..T-W4) | answer readiness without connecting; one shared metrics key for two modes; render only recorded tuples |
 | private / consolidation worker `ops_listener` | default the metrics address |
+| card 34b: testkit witnesses `private_distill_runs_total`, `private_distill_outputs_total`, `private_reasoning_usage_total` (G80-6 probe) | delete the family's `.inc(` line (TW `c34b_red.log`, gate `c34b_red_recorded`, 12 faults) |
+| card 34b review fix: private-worker `distill_hop_e2e` d5c | count inside the write transaction before the outbox settle (the reviewed shape) ⇒ (1, 1); delete the `count_private_reasoning_usage` call ⇒ usage 0 |
+| card 34b review fix: `distill_hop_e2e` d5 (real path) and `metrics-registry` D5 (`d5_counts_emit_helper_callers_exactly`) | delete the `count_committed_distill` call ⇒ (0, 0); call it twice ⇒ D5 `private_distill_*<-count_committed_distill()=1/2` |
+| card 34b review fix: gate `c34b_rehearse_asserts_private_counters` | rehearse.sh `assert_gt … "${PW_V:-absent}" 0` floor → `-1` (a counter at 0 would pass) |
+| card 34b: private-worker `ops_listener` `metrics_families_prints_the_three_private_families_without_env` and the resident-mode leg | the card-34 empty `render_metrics` |
+| card 34b: `metrics-registry --check` D8 | the private worker renders nothing ⇒ `DistillNoOutput`'s families referenced but not exported |
 | xtask `metrics_registry` T-H1..T-H10 | **rename one exported family**; wrong kind; extra label; `queries_total`; `by (stream)`; restore the NA path for an unexported rule family; stop exporting `humaux_mcp_requests_total`; empty rules dir; an unknown flag; a zero-sample family |
 | xtask `architecture_check` `adr0061_box_leak_sentinel…` | a `Box::leak` label |
 | review-fix 3 (14 faults, TW `c34_fix3_red.log`, gate `c34_fix3_red_recorded`) | see "Review-fix pass 3" below |
-| promtool `test-rules.sh` + `mutations.sh` (18 rows) + `selftest.sh` (T-E1..T-E7) | **delete one rule test** (coverage grep); each row's token mutation; pin unset / no-op / syntax-breaking mutation / wrong `rule_files` path / bad compose |
+| promtool `test-rules.sh` + `mutations.sh` (20 rows since card 34b) + `selftest.sh` (T-E1..T-E7) | **delete one rule test** (coverage grep); each row's token mutation; pin unset / no-op / syntax-breaking mutation / wrong `rule_files` path / bad compose |
 | admin `probes` (T-J2..T-J12) | drop `lease_expires_at < now()`; count FAILED as undelivered; a public probe returning a Reading; sum the reachable processes only; compare against `notBefore`; an empty table read as 0/0; edit a predicate without a bump |
 | admin `probes::cell_resources_reads_all_three_resources_and_names_the_unreachable_socket` (B1) | ignore the UDS connect result (value 3 instead of 2) |
 | TW `c31_leak_check.sh` count 2 (B2) | one `(code, retrieval_card)` checkpoint written on the dev DB; a fixture leg panicking with its cleanup guard removed |
@@ -408,8 +473,13 @@ pin variable before the chain starts.
 - Histograms render a `+Inf` bucket only (no quantiles for `retrieval_provider_latency_seconds`); upgrade = a §78
   bucket-boundary key and real buckets.
 - Guard families live in a bin: the C scan and D2 witnesses do not see them; their export is enforced by D7 / D8(c).
-- **E10:** private-worker and consolidation-worker export zero families; the distill counters and the §42 no-output
-  CRITICAL wait for card 34b (`NOT_YET_PRODUCED`).
+- **E10 (closed for the private worker by card 34b):** the consolidation worker still exports zero families (none is
+  registered in §41.2); provider slot / dispatch families are not registered either — a §41.2 row first.
+- The distill counters count after `txn.commit()` returns: a commit acknowledged by PostgreSQL but lost on the wire
+  returns an error and counts nothing although the rows persisted (an under-count of that one write, never an
+  over-count).
+- `EMIT_HELPERS` is a hand-kept table in `metrics_registry.rs`; a new helper-emitted family must add its row (a
+  family whose `.inc(` sits in an unlisted helper is checked at the helper only).
 - The other 19 §42 rows are not loaded (each needs a producer and a red record); `processing_gap_count` and
   `oldest_pending_age_seconds` are exported, their rules are cheap follow-ups. No §42 row alerts on `up == 0` for a
   worker or the collector.

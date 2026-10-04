@@ -53,11 +53,20 @@ const PROCESSES: [&str; 5] = [
 
 /// ADR-0061 D-H D8(c): rule-referenced families no process exports yet, each with the card
 /// that adds its producer. An entry whose family IS exported fails as a stale entry, so the
-/// producer card has to delete its row (E10: card 34b owns the two distill counters).
-const NOT_YET_PRODUCED: &[(&str, &str)] = &[
-    ("backup_last_success_timestamp_seconds", "card 37"),
-    ("private_distill_runs_total", "card 34b"),
-    ("private_distill_outputs_total", "card 34b"),
+/// producer card has to delete its row (E10 closed: card 34b's private worker exports the two
+/// distill counters).
+const NOT_YET_PRODUCED: &[(&str, &str)] = &[("backup_last_success_timestamp_seconds", "card 37")];
+
+/// §41.2 R4 (ADR-0061 addendum, D-M): families whose one `.inc(` sits in a `pub` helper so a DB-free
+/// witness can drive it. The helper's production call sites are the real emit sites, so D5 also
+/// requires exactly one per helper — deleting or duplicating the call is red here.
+const EMIT_HELPERS: &[(&str, &str)] = &[
+    ("private_distill_runs_total", "count_committed_distill"),
+    ("private_distill_outputs_total", "count_committed_distill"),
+    (
+        "private_reasoning_usage_total",
+        "count_private_reasoning_usage",
+    ),
 ];
 
 /// §42 ①: third-party exporter families a rule may name although §41.2 does not register them.
@@ -387,6 +396,40 @@ fn parse_labels_comment(text: &str) -> Option<BTreeSet<String>> {
             .map(String::from)
             .collect(),
     )
+}
+
+/// Production call sites of `helper` in one line: `helper(` at an identifier boundary, not its own
+/// `fn helper(` definition, not in a whole-line comment.
+fn count_helper_calls_in_line(line: &str, helper: &str) -> usize {
+    if line.trim_start().starts_with("//") {
+        return 0;
+    }
+    let pat = format!("{helper}(");
+    line.match_indices(&pat)
+        .filter(|(at, _)| {
+            let before = &line[..*at];
+            !before.ends_with("fn ") && before.as_bytes().last().is_none_or(|b| !is_ident_byte(*b))
+        })
+        .count()
+}
+
+/// [`EMIT_HELPERS`]' production call sites under `crates_root` (cfg(test) blocks stripped), per helper.
+fn scan_helper_calls(crates_root: &Path) -> BTreeMap<&'static str, usize> {
+    let mut files = Vec::new();
+    collect_rs_files(crates_root, &mut files);
+    let mut out: BTreeMap<&'static str, usize> =
+        EMIT_HELPERS.iter().map(|(_, h)| (*h, 0)).collect();
+    for path in files {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in strip_cfg_test_blocks(&raw).lines() {
+            for (helper, n) in out.iter_mut() {
+                *n += count_helper_calls_in_line(line, helper);
+            }
+        }
+    }
+    out
 }
 
 /// 扫 `crates_root` 下所有生产代码文件，返回 (family -> 调用点计数, family -> 观测到的 label 集合并集)。
@@ -812,22 +855,38 @@ fn check_d4(
     }
 }
 
-/// D5: `∀f: actual_emit_callsite_count(C,f) == declared_emit_count(R,f)`。
+/// D5: `∀f: actual_emit_callsite_count(C,f) == declared_emit_count(R,f)`; for a registered family
+/// in [`EMIT_HELPERS`] its helper's production callers must also equal the declared count.
 fn check_d5(
     registry: &[RegistryEntry],
     code_counts: &BTreeMap<String, usize>,
     witness_exists: &BTreeSet<String>,
+    helper_calls: &BTreeMap<&'static str, usize>,
 ) -> DCheck {
-    let bad: Vec<(String, u32, usize)> = registry
+    // (family, site kind, declared, actual): `.inc(` sites, then each EMIT_HELPERS helper's callers.
+    let bad: Vec<(&str, String, u32, usize)> = registry
         .iter()
-        .filter_map(|r| {
-            let actual = code_counts.get(&r.family).copied().unwrap_or(0);
-            (actual as u32 != r.declared_emit_count)
-                .then(|| (r.family.clone(), r.declared_emit_count, actual))
+        .flat_map(|r| {
+            let sites = code_counts.get(&r.family).copied().unwrap_or(0);
+            std::iter::once((String::new(), sites))
+                .chain(
+                    EMIT_HELPERS
+                        .iter()
+                        .filter(|(f, _)| *f == r.family)
+                        .map(|(_, h)| {
+                            (
+                                format!("<-{h}()"),
+                                helper_calls.get(h).copied().unwrap_or(0),
+                            )
+                        }),
+                )
+                .filter(|(_, actual)| *actual as u32 != r.declared_emit_count)
+                .map(|(kind, actual)| (r.family.as_str(), kind, r.declared_emit_count, actual))
+                .collect::<Vec<_>>()
         })
         .collect();
     let (status, na_families) = status_for(
-        bad.iter().map(|(f, _, _)| f.as_str()),
+        bad.iter().map(|(f, _, _, _)| *f),
         code_counts,
         witness_exists,
     );
@@ -837,7 +896,7 @@ fn check_d5(
         format!(
             "处数不等(family,declared,actual): {:?}",
             bad.iter()
-                .map(|(f, d, a)| format!("{f}={d}/{a}"))
+                .map(|(f, k, d, a)| format!("{f}{k}={d}/{a}"))
                 .collect::<Vec<_>>()
         )
     };
@@ -925,7 +984,12 @@ pub fn check_all(spec: &str, crates_root: &Path) -> Option<Vec<DCheck>> {
         check_d2(&registry, &code_counts, &witness_exists, &witness_info),
         check_d3(&registry, &code_counts, &witness_exists),
         check_d4(&registry, &code_labels, &witness_info),
-        check_d5(&registry, &code_counts, &witness_exists),
+        check_d5(
+            &registry,
+            &code_counts,
+            &witness_exists,
+            &scan_helper_calls(crates_root),
+        ),
         check_d6(&registry, &code_counts, &witness_exists, &witness_info),
     ])
 }
@@ -2317,14 +2381,73 @@ pub fn gateway_respond() {
         assert_eq!(report(std::slice::from_ref(&unlisted), false), 1);
 
         let mut exported = all_exported();
-        exported.insert("private_distill_runs_total".into());
+        exported.insert("backup_last_success_timestamp_seconds".into());
         let stale = check_d8(&registry, &real_rules(), &exported);
         assert_eq!(stale.status, GateStatus::Fail);
         assert!(
-            stale
-                .detail
-                .contains("stale allowlist entry: `private_distill_runs_total` (card 34b)")
+            stale.detail.contains(
+                "stale allowlist entry: `backup_last_success_timestamp_seconds` (card 37)"
+            ),
+            "{}",
+            stale.detail
         );
+    }
+
+    /// Card 34b (§41.2 R4): a helper-emitted family's real emit sites are its helper's
+    /// production callers — none (the call deleted) or two (a second caller) is a D5 fail, and
+    /// the definition, a comment and a longer identifier never count.
+    #[test]
+    fn d5_counts_emit_helper_callers_exactly() {
+        let h = "count_committed_distill";
+        assert_eq!(
+            count_helper_calls_in_line("pub fn count_committed_distill(runs: u64) {", h),
+            0
+        );
+        assert_eq!(
+            count_helper_calls_in_line("    // count_committed_distill(1, 0);", h),
+            0
+        );
+        assert_eq!(
+            count_helper_calls_in_line("    recount_committed_distill(1, 0);", h),
+            0
+        );
+        assert_eq!(
+            count_helper_calls_in_line("    count_committed_distill(runs, outputs);", h),
+            1
+        );
+        assert_eq!(
+            count_helper_calls_in_line("    x::count_committed_distill(a, b);", h),
+            1
+        );
+
+        let registry = vec![RegistryEntry {
+            family: "private_distill_runs_total".into(),
+            labels: BTreeSet::new(),
+            declared_emit_count: 1,
+            metric_kind: "counter".into(),
+        }];
+        let code_counts = BTreeMap::from([("private_distill_runs_total".to_string(), 1)]);
+        let witnesses = BTreeSet::from(["private_distill_runs_total".to_string()]);
+        let d5 = |callers: usize| {
+            check_d5(
+                &registry,
+                &code_counts,
+                &witnesses,
+                &BTreeMap::from([(h, callers)]),
+            )
+        };
+        assert_eq!(d5(1).status, GateStatus::Pass, "{}", d5(1).detail);
+        for callers in [0, 2] {
+            let red = d5(callers);
+            assert_eq!(red.status, GateStatus::Fail, "{}", red.detail);
+            assert!(
+                red.detail.contains(&format!(
+                    "private_distill_runs_total<-count_committed_distill()=1/{callers}"
+                )),
+                "{}",
+                red.detail
+            );
+        }
     }
 
     /// T-H10: CoreMetricAbsent names `humaux_mcp_requests_total`; a gateway exposition

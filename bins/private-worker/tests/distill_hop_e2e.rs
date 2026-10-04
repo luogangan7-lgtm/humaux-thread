@@ -20,7 +20,7 @@
 //!   HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY];
 //!   modules=[adapters::affect_repo, adapters::byok, adapters::byok::ssrf, adapters::contribution_reasoner,
 //!   adapters::disclosure, adapters::distill_reasoner, adapters::distill_repo, adapters::jobs,
-//!   adapters::membership_repo, adapters::postgres, adapters::projection_worker, adapters::provisioning,
+//!   adapters::membership_repo, adapters::model_call_ledger, adapters::postgres, adapters::projection_worker, adapters::provisioning,
 //!   adapters::qdrant, adapters::reasoning_route_admission, application::affect, domain::affect, domain::authority,
 //!   domain::egress, domain::error, domain::evidence, domain::identity, domain::ids, domain::ticket_family,
 //!   humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
@@ -67,6 +67,7 @@ use humaux_adapters::distill_reasoner::{DISTILL_PARSER_VERSION, distill_prompt_c
 use humaux_adapters::distill_repo;
 use humaux_adapters::jobs::{self, DistillLease};
 use humaux_adapters::membership_repo::AdminAction;
+use humaux_adapters::model_call_ledger;
 use humaux_adapters::postgres::RuntimeDbPool;
 use humaux_adapters::postgres::{MaintenanceDbPool, PrivateWorkerDbPool, RetrievalWorkerDbPool};
 use humaux_adapters::projection_worker::{CardEmbedder, ProjectionWorkerDeps, RunOnceOutcome};
@@ -1705,9 +1706,17 @@ fn d5_two_passes_and_expired_lease_never_duplicate_memories() {
     let reply = r#"{"memories":[{"content":"Health endpoint before traffic.","memory_type":"Decision","class":"PrivateKnowledge","confidence":0.9}]}"#;
     let (evidence_a, _, _) = seed_evidence(&mut f, EVIDENCE_TEXT);
     let rt = tokio::runtime::Runtime::new().expect("rt");
+    let counted = distill_counters();
     let first = run_pass(&rt, &f, &FakeProvider::new(vec![reply]), "d5-worker");
     assert_eq!(first.completed, 1, "{first:?}");
     assert_eq!(observe(&mut f, evidence_a).memories, 1);
+    // §41.2 R4 on the real path (card 34b): one committed write = exactly one run and one output; a deleted
+    // or duplicated emit call is red here.
+    assert_eq!(
+        counters_since(counted),
+        (1, 1),
+        "(runs, outputs) of one committed distill write"
+    );
     assert_fingerprint_recomputes(&mut f, evidence_a);
     let second = run_pass(&rt, &f, &FakeProvider::new(vec![]), "d5-worker");
     assert_eq!(
@@ -1838,6 +1847,126 @@ fn admin_exec(dsn: &str, sql: &'static str, id: Uuid) {
     })
     .join()
     .expect("admin thread");
+}
+
+/// This process's (`private_distill_runs_total`, `private_distill_outputs_total`,
+/// `private_reasoning_usage_total`). Exact deltas hold because `SERIAL` runs this file's tests one at a time.
+fn distill_counters() -> (u64, u64, u64) {
+    (
+        distill_repo::private_distill_runs_total(),
+        distill_repo::private_distill_outputs_total(),
+        model_call_ledger::private_reasoning_usage_total(),
+    )
+}
+
+/// (runs, outputs) counted since `before`.
+fn counters_since(before: (u64, u64, u64)) -> (u64, u64) {
+    let now = distill_counters();
+    (now.0 - before.0, now.1 - before.1)
+}
+
+/// Moves the Evidence's outbox lease to another owner while the job's own lease stays live.
+const STEAL_OUTBOX_LEASE: &str = "UPDATE ops.outbox SET lease_owner = 'd5c-thief' \
+     WHERE evidence_id = $1 AND event_type = 'EVIDENCE_ACCEPTED'";
+
+/// Input / output tokens [`StealingProvider`] reports.
+const D5C_USAGE: (u64, u64) = (1200, 34);
+
+/// A provider that, inside its one call, takes the outbox row's lease away from the worker, then
+/// answers one admissible memory with [`D5C_USAGE`].
+struct StealingProvider {
+    descriptor: ReasoningProviderDescriptor,
+    dsn: String,
+    evidence_id: Uuid,
+}
+
+#[async_trait]
+impl UserReasoningProvider for StealingProvider {
+    fn descriptor(&self) -> &ReasoningProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn endpoint_ref(&self) -> &str {
+        MINIMAX_CHAT_URL
+    }
+
+    fn model_revision(&self) -> Option<&str> {
+        self.descriptor.model_revision.as_deref()
+    }
+
+    async fn complete_structured(
+        &self,
+        _context: &PrivateInferenceContext,
+        _request: StructuredReasoningRequest,
+    ) -> Result<StructuredReasoningResponse, ReasoningProviderError> {
+        admin_exec(&self.dsn, STEAL_OUTBOX_LEASE, self.evidence_id);
+        Ok(StructuredReasoningResponse {
+            json: r#"{"memories":[{"content":"Health endpoint before traffic.","memory_type":"Decision","class":"PrivateKnowledge","confidence":0.9}]}"#.to_string(),
+            usage: TokenUsage {
+                input_tokens: Some(D5C_USAGE.0),
+                output_tokens: Some(D5C_USAGE.1),
+                ..TokenUsage::default()
+            },
+            channel_fallback: false,
+        })
+    }
+
+    async fn analyze_vision(
+        &self,
+        _context: &PrivateInferenceContext,
+        _request: VisionReasoningRequest,
+    ) -> Result<VisionReasoningResponse, ReasoningProviderError> {
+        unreachable!("distill never calls vision")
+    }
+}
+
+/// D5c (card 34b, ADR-0061; §41.2 / §42) — the distill counters count only what commits. The
+/// provider takes the outbox lease away mid-call, so the write's outbox settle is refused AFTER its
+/// memory insert and run finish, and the transaction rolls back: runs and outputs stay flat. The
+/// finalized call's reported tokens were spent, so `private_reasoning_usage_total` adds them once.
+/// Faults: count inside the write transaction (the card-34b review P0) ⇒ (runs, outputs) = (1, 1);
+/// drop or duplicate the usage emit in `finalize_private_call` ⇒ a usage delta of 0 or twice the tokens.
+#[test]
+fn d5c_a_rolled_back_write_counts_nothing_and_a_finalized_call_counts_its_tokens_once() {
+    let Some(mut f) = setup_db(
+        "d5c_a_rolled_back_write_counts_nothing_and_a_finalized_call_counts_its_tokens_once",
+    ) else {
+        return;
+    };
+    let (evidence_id, _, _) = seed_evidence(&mut f, EVIDENCE_TEXT);
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let provider = Arc::new(StealingProvider {
+        descriptor: descriptor(),
+        dsn: f.dsn.clone(),
+        evidence_id,
+    });
+    let counted = distill_counters();
+    let report = run_pass(&rt, &f, &provider, "d5c-worker");
+    let usage = model_call_ledger::private_reasoning_usage_total() - counted.2;
+    println!("D5C ASSERTION LOG: report={report:?} usage={usage}");
+    assert_eq!(
+        report.memories, 0,
+        "the refused settle rolled the write back: {report:?}"
+    );
+    let o = observe(&mut f, evidence_id);
+    assert_eq!(o.memories, 0, "no memory row survives the rollback");
+    assert!(!o.run_completed, "the run's finish rolled back with it");
+    assert_eq!(
+        counters_since(counted),
+        (0, 0),
+        "(runs, outputs) of a rolled-back distill write"
+    );
+    assert_eq!(
+        (o.ledger.input_tokens, o.ledger.output_tokens),
+        (Some(D5C_USAGE.0 as i64), Some(D5C_USAGE.1 as i64)),
+        "the call is finalized with the provider's usage: {:?}",
+        o.ledger
+    );
+    assert_eq!(
+        usage,
+        D5C_USAGE.0 + D5C_USAGE.1,
+        "input + output tokens, counted once"
+    );
 }
 
 /// D5b (card TH-3, ADR-0058 D-E/D-J) — a late worker. W1 is blocked inside its provider call;

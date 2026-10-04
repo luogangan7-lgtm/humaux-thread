@@ -245,6 +245,31 @@ pub mod families {
         Kind::Gauge,
         &["age_bucket"],
     );
+    // §41.2: §11 每次 run — private worker (card 34b; emit `adapters::distill_repo::finish_processing_run`).
+    /// `private_distill_runs_total`.
+    pub const PRIVATE_DISTILL_RUNS_TOTAL: Family = f(
+        "private_distill_runs_total",
+        "Distill processing runs finished, whatever their output count.",
+        Kind::Counter,
+        &[],
+    );
+    // §41.2: §11 每条产出 — private worker (card 34b; emit `adapters::distill_repo::insert_memory`).
+    /// `private_distill_outputs_total`.
+    pub const PRIVATE_DISTILL_OUTPUTS_TOTAL: Family = f(
+        "private_distill_outputs_total",
+        "Memory records the distill hop wrote, one per record.",
+        Kind::Counter,
+        &[],
+    );
+    // §41.2: §11 推理调用返回读 usage — private worker (card 34b; emit
+    // `adapters::model_call_ledger::finalize_private_call`).
+    /// `private_reasoning_usage_total`.
+    pub const PRIVATE_REASONING_USAGE_TOTAL: Family = f(
+        "private_reasoning_usage_total",
+        "Tokens private reasoning providers reported (input + output) on finalized calls.",
+        Kind::Counter,
+        &[],
+    );
 }
 
 /// Process-local counters, one slot per closed label value (index = the enum's `ALL` position).

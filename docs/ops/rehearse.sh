@@ -1554,13 +1554,24 @@ OUT_Q="from ops.outbox o join projection.stream_log s on s.tenant_id=o.tenant_id
 # backoff): ISSUED, attempts 1, lease cleared, backing off, class qdrant_upsert_failed.
 typeset -A OUT_SEEN; OUT_T0=; i=0
 while [ $i -lt 600 ] && [ ${#OUT_SEEN} -lt $N_OUT ]; do
+  # stop early once every ticket that still has a distill has been seen (a dead one never will be)
+  OUT_DEAD_NOW=$(PGQ "select count(*) from ops.jobs j where j.job_type='DERIVED_DISTILL' and j.status='DEAD' and j.payload->>'evidence_id' in ($(ev_list $PST/outage.tsv))")
+  [ $(( ${#OUT_SEEN} + ${OUT_DEAD_NOW:-0} )) -ge $N_OUT ] && break
   for seq in $(PGQ "select s.tenant_id||':'||s.stream_seq $OUT_Q and s.state='ISSUED' and s.attempts=1 and s.next_attempt_at > now() and s.lease_owner is null and s.error_class='qdrant_upsert_failed'"); do
     OUT_SEEN[$seq]=1; [ -z "$OUT_T0" ] && OUT_T0=$EPOCHREALTIME
   done
   sleep 1; i=$((i+1))
 done
 [ -z "$OUT_T0" ] && OUT_T0=$EPOCHREALTIME
-assert_eq "outage_tickets_retry_with_attempts_1(n=$N_OUT)" "${#OUT_SEEN}" "$N_OUT"
+# ADR-0058 R11: an Evidence whose distill died (DEAD FAILED_OUTPUT_SCHEMA after the one re-ask; MiniMax
+# NUL-character replies, card-34b chain 2026-10-04) never reaches ISSUED/attempts=1 and is graded by
+# `distill_dead` below, not here. The population of this witness is the outage tickets that still have a
+# distill; it must keep at least two members or the step is red naming the dead count.
+OUT_DEAD=$(PGQ "select count(*) from ops.jobs j where j.job_type='DERIVED_DISTILL' and j.status='DEAD' and j.payload->>'evidence_id' in ($(ev_list $PST/outage.tsv))")
+N_OUT_LIVE=$(( N_OUT - ${OUT_DEAD:-0} ))
+echo "pst outage: tickets=$N_OUT distill_dead=${OUT_DEAD:-0} graded=$N_OUT_LIVE seen_attempts_1=${#OUT_SEEN}" | tee -a $EV/rehearsal.log
+assert_eq "outage_population_keeps_two_live_tickets(n=$N_OUT dead=${OUT_DEAD:-0})" "$([ "$N_OUT_LIVE" -ge 2 ] && echo 1 || echo 0)" 1
+assert_eq "outage_tickets_retry_with_attempts_1(n=$N_OUT_LIVE of $N_OUT)" "${#OUT_SEEN}" "$N_OUT_LIVE"
 # ADR-0058 R11: the two outage witnesses count tickets FAILED by the projection path (every class
 # except `distill_failed`); a distill that died is graded under its own name by `distill_dead` below.
 assert_eq "no_ticket_failed_during_outage(n=$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED)") tickets)" "$(PGQ "select count(*) from projection.stream_log where tenant_id in ($SEEDED) and state='FAILED' and error_class is distinct from 'distill_failed'")" 0
@@ -1904,6 +1915,14 @@ UP_RC=$?
 tee -a $EV/rehearsal.log < $EV/metrics/up.txt
 DG_SUM=$(cat $EV/metrics/*.prom | awk '/^degrade_total\{/ {s += $NF} END {printf "%d", s}')
 echo "metrics_scrape: degrade_total summed over the seven scrapes = $DG_SUM" | tee -a $EV/rehearsal.log
+# card 34b (§41.2, §42 no-output stage): this step's resident distiller distilled real Evidence, so its three
+# private-plane counters are above 0. The §42 injection (a parser stub ⇒ runs up, outputs flat) is proven by the
+# promtool test of DistillNoOutput, not here: a stub parser in the deployed binary is a code change (ADR-0061).
+for PW_F in private_distill_runs_total private_distill_outputs_total private_reasoning_usage_total; do
+  PW_V=$(awk -v f=$PW_F '$1 == f {printf "%d", $2}' $EV/metrics/humaux-private-worker-distill-serve.prom 2>/dev/null)
+  echo "metrics_scrape: humaux-private-worker distill-serve $PW_F = ${PW_V:-absent}" | tee -a $EV/rehearsal.log
+  assert_gt "metrics_scrape_private_worker_${PW_F}_after_distill" "${PW_V:-absent}" 0
+done
 assert_eq "metrics_scrape_every_ops_endpoint_answers(n=${#OPS_PORTS})" "$MS_BAD" 0
 assert_eq "metrics_scrape_status_is_json_naming_its_process(n=${#OPS_PORTS})" "$ST_BAD" 0
 assert_eq "metrics_scrape_matches_metrics_families_and_41_2(n=${#OPS_PORTS} scrapes)" "$MR_RC" 0

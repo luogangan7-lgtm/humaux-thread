@@ -1,14 +1,16 @@
 //! `adapters::distill_repo` — SQL half of the Distill hop (ADR-0016), through [`PrivateWorkerDbPool`] only: take the
 //!   one `EVIDENCE_ACCEPTED` outbox row of a claimed `DERIVED_DISTILL` job (ADR-0058), load that Evidence, record the
 //!   §16.1.1 processing run, insert the authorized memories, settle the job and its outbox row together.
-//! Depends-on: crates=[hex, humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time]; services=[PostgreSQL(any) r=[control.memberships, ops.jobs, private.events, private.evidence_affects, private.evidence_objects] w=[ops.outbox, private.distill_candidates, private.memory_evidence, private.memory_records, private.processing_runs] x=[control.current_reasoning_route_binding]]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::confirm_token_repo, adapters::consolidate_repo, adapters::jobs, adapters::postgres, adapters::quota_repo, adapters::remember, adapters::request_guard_repo, adapters::retrieve, adapters::subject_repo, application::confirm, application::consolidate, domain::audit, domain::authority, domain::confirm, domain::error, domain::evidence, domain::identity, domain::ids, domain::memory, domain::subject, projection::stream]
-//! Called-by: [adapters::context_repo, adapters::memory_governance_repo, gateway::mcp_application, gateway::memory, private-worker::distill, tests]
+//! Depends-on: crates=[hex, humaux-application, humaux-domain, humaux-projection, serde_json, sqlx, time]; services=[PostgreSQL(any) r=[control.memberships, ops.jobs, private.events, private.evidence_affects, private.evidence_objects] w=[ops.outbox, private.distill_candidates, private.memory_evidence, private.memory_records, private.processing_runs] x=[control.current_reasoning_route_binding]]; env=[CARGO_MANIFEST_DIR]; modules=[adapters::confirm_token_repo, adapters::consolidate_repo, adapters::jobs, adapters::postgres, adapters::quota_repo, adapters::remember, adapters::request_guard_repo, adapters::retrieve, adapters::subject_repo, application::confirm, application::consolidate, domain::audit, domain::authority, domain::confirm, domain::error, domain::evidence, domain::identity, domain::ids, domain::memory, domain::subject, humaux-adapters, projection::stream]
+//! Called-by: [adapters::context_repo, adapters::memory_governance_repo, gateway::mcp_application, gateway::memory, private-worker::distill, private-worker::main, tests]
 //! Invariants: [memories, run completion, the job settle and the outbox flip commit in ONE transaction whose first
 //!   statement is the job's generation-fenced finish (ADR-0058 D-E), so a superseded worker's inserts roll back; a job
 //!   only ever takes the outbox row of its own Evidence; every read runs under role_private_worker grants + RLS with the acting
 //!   user installed first; memory.confirm / memory.reject lock a candidate only inside the narrowed write scope
-//!   (its visibility against the scope's one workspace and user, ADR-0054)]
-//! Spec: Baseline §15.5; §14; ADR-0016; §6.1.1; ADR-0054; ADR-0058; ADR-0060 D-K
+//!   (its visibility against the scope's one workspace and user, ADR-0054); metrics families emitted:
+//!   private_distill_runs_total and private_distill_outputs_total, counted only after the distill write commits
+//!   ([`commit_distill_write`], ADR-0061 card 34b)]
+//! Spec: Baseline §15.5; §14; ADR-0016; §6.1.1; ADR-0054; ADR-0058; ADR-0060 D-K; §41.2; §42; ADR-0061 D-C
 //!
 //! §15.5: one Evidence → 0/1/N `private.memory_records`; §14: the `ops.outbox` row remember wrote
 //! is the work item (PENDING → PROCESSING → DONE | FAILED, or back to PENDING when the attempt was
@@ -43,6 +45,7 @@ use sqlx::types::time::OffsetDateTime;
 
 use crate::postgres::{PrivateWorkerDbPool, RuntimeDbPool};
 use crate::{
+    Counter,
     confirm_token_repo::{self, ConfirmationClaim},
     quota_repo::{self, ReservationStatus, ReserveResult},
     remember::{self, RememberCommand},
@@ -464,15 +467,17 @@ pub async fn start_processing_run(
 
 /// Completes a run: `output_digest` + `output_count` + `completed_at` together (0064's
 /// `processing_runs_completed_has_output` CHECK). A failed attempt never calls this — its row
-/// keeps `completed_at IS NULL` as the failure marker (ADR-0016 D4).
+/// keeps `completed_at IS NULL` as the failure marker (ADR-0016 D4). Returns the runs this call
+/// finished (0 when the run was already complete), which the caller hands to
+/// [`commit_distill_write`].
 pub async fn finish_processing_run(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     processing_run_id: Uuid,
     output_digest: &[u8],
     output_count: i32,
     provider_request_id: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<u64, sqlx::Error> {
+    let finished = sqlx::query(
         "UPDATE private.processing_runs \
          SET output_digest = $2, output_count = $3, provider_request_id = $4, completed_at = now() \
          WHERE processing_run_id = $1 AND completed_at IS NULL",
@@ -483,7 +488,46 @@ pub async fn finish_processing_run(
     .bind(provider_request_id)
     .execute(&mut **txn)
     .await?;
+    Ok(finished.rows_affected())
+}
+
+/// Commits a distill write transaction, then counts what it made durable: `finished_runs` runs
+/// ([`finish_processing_run`]'s return) and `outputs` memory records ([`insert_memory`] calls).
+/// ADR-0061 card 34b: counted only after the commit — a rolled-back write (lost generation or
+/// outbox lease, a failed statement) counts nothing, and its retry counts once.
+pub async fn commit_distill_write(
+    txn: sqlx::Transaction<'_, sqlx::Postgres>,
+    finished_runs: u64,
+    outputs: u64,
+) -> Result<(), sqlx::Error> {
+    // dep: PostgreSQL(any) — commits the distill write transaction
+    txn.commit().await?;
+    count_committed_distill(finished_runs, outputs);
     Ok(())
+}
+
+// §41.2 row `private_distill_runs_total` / `private_distill_outputs_total` (§11 每次 run / 每条产出 · 各 1); consumers
+// §39 stage liveness and the §42 no-output stage. Rendered by `humaux-private-worker` (ADR-0061 D-C).
+static PRIVATE_DISTILL_RUNS_TOTAL: Counter = Counter::new();
+static PRIVATE_DISTILL_OUTPUTS_TOTAL: Counter = Counter::new();
+
+/// §41.2 `private_distill_runs_total` / `private_distill_outputs_total`: adds `runs` finished runs (a run counts
+/// whatever its output count — the §42 no-output stage is about runs without outputs) and `outputs` memory records.
+/// Public so the G80-6 witnesses can drive the emit without a database; the one production caller is
+/// [`commit_distill_write`] (`cargo xtask metrics-registry` D5 asserts exactly one, ADR-0061 card 34b).
+pub fn count_committed_distill(runs: u64, outputs: u64) {
+    PRIVATE_DISTILL_RUNS_TOTAL.inc(runs);
+    PRIVATE_DISTILL_OUTPUTS_TOTAL.inc(outputs);
+}
+
+/// This process's `private_distill_runs_total` (ADR-0061 D-C: the private worker renders it).
+pub fn private_distill_runs_total() -> u64 {
+    PRIVATE_DISTILL_RUNS_TOTAL.get()
+}
+
+/// This process's `private_distill_outputs_total` (ADR-0061 D-C: the private worker renders it).
+pub fn private_distill_outputs_total() -> u64 {
+    PRIVATE_DISTILL_OUTPUTS_TOTAL.get()
 }
 
 /// One authorized memory to insert — `class` is the `AuthorizedAuthority` §10.1 returned, never

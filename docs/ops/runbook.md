@@ -414,6 +414,15 @@ humaux-admin q deploy.binary                           # detail.git_sha = the sh
   is back (supervision.md §2).
 - `BackupFailure` is silent until card 37 produces `backup_last_success_timestamp_seconds`;
   `metrics-registry --check` names it not_applicable with its producer card.
+- `DistillNoOutput` (CRITICAL, §42 no-output stage, card 34b) means the private worker finished distill runs
+  in the last hour and wrote no memory record: the stage is alive but produces nothing. Read the
+  `--distill-serve` scrape (`private_distill_runs_total` rising, `private_distill_outputs_total` flat), then, in
+  this order: the distill parser (the dispatch line's `memories=` / `rejected=` counts, §7.1 — replies the
+  fail-closed parser turns into an empty array are exactly this alert); the provider replies (the route's
+  `humaux-maintenance reasoning status`, the `error_class` of recent `ops.model_call_ledger` rows); then
+  `humaux-admin q jobs.stuck`. Do not restart the worker for it — a restart resets the counters and silences
+  the alert without fixing the stage. `private_reasoning_usage_total` on the same scrape is the provider-reported
+  token count (input + output) the §35 quota reads.
 
 **Manual §69 step — the external dead-man (§42.1), once per deployment and after every change to
 the Watchdog route.** It is not a gate, because the endpoint is outside this repo: stop

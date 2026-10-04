@@ -656,6 +656,10 @@ mod tests {
                 return None;
             }
         };
+        // Taken BEFORE the CREATE so the whole migrate run of this database holds it.
+        let cluster_ddl = CLUSTER_DDL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let name = format!("humaux_thread_c25_{purpose}_{}", std::process::id());
         admin
             .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
@@ -668,6 +672,7 @@ mod tests {
             DisposableDatabase {
                 admin_dsn: base,
                 name,
+                _cluster_ddl: cluster_ddl,
             },
             dsn,
         ))
@@ -712,9 +717,18 @@ mod tests {
         assert_eq!(rows[0].get::<_, bool>(0), expected, "exact 0137 {field}");
     }
 
+    /// Throwaway databases are isolated from each other, the cluster's roles are not: 0201's
+    /// `ALTER ROLE role_migration_owner …` (and every GRANT/REVOKE on a role) writes one shared
+    /// `pg_authid` tuple, so two tests migrating their throwaway databases on parallel threads
+    /// race into `XX000 tuple concurrently updated` (card 34b chain, 2026-10-04). One guard for
+    /// the lifetime of every throwaway database serializes them; the lock is poison-tolerant so a
+    /// panicking test does not take the others down with it.
+    static CLUSTER_DDL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct DisposableDatabase {
         admin_dsn: String,
         name: String,
+        _cluster_ddl: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Drop for DisposableDatabase {

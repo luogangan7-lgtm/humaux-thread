@@ -196,6 +196,47 @@ tests:
           - exp_labels:
               severity: critical
 
+  # distill fire (§42 injection: a parser stub that always returns an empty array): runs rise one per
+  # minute, outputs stay flat, so over the 1h window runs increased and outputs did not.
+  - interval: 1m
+    input_series:
+      - series: 'private_distill_runs_total{job="humaux-private-worker",mode="distill-serve"}'
+        values: '0+1x70'
+      - series: 'private_distill_outputs_total{job="humaux-private-worker",mode="distill-serve"}'
+        values: '0x70'
+    alert_rule_test:
+      - eval_time: 61m
+        alertname: DistillNoOutput
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: humaux-private-worker
+              mode: distill-serve
+
+  # distill silent: runs and outputs both rise.
+  - interval: 1m
+    input_series:
+      - series: 'private_distill_runs_total{job="humaux-private-worker",mode="distill-serve"}'
+        values: '0+1x70'
+      - series: 'private_distill_outputs_total{job="humaux-private-worker",mode="distill-serve"}'
+        values: '0+2x70'
+    alert_rule_test:
+      - eval_time: 61m
+        alertname: DistillNoOutput
+        exp_alerts: []
+
+  # distill silent: neither moves (an idle stage is not a stalled one).
+  - interval: 1m
+    input_series:
+      - series: 'private_distill_runs_total{job="humaux-private-worker",mode="distill-serve"}'
+        values: '0x70'
+      - series: 'private_distill_outputs_total{job="humaux-private-worker",mode="distill-serve"}'
+        values: '0x70'
+    alert_rule_test:
+      - eval_time: 61m
+        alertname: DistillNoOutput
+        exp_alerts: []
+
   # watchdog: firing from the first evaluation, with no input at all.
   - interval: 1m
     alert_rule_test:
