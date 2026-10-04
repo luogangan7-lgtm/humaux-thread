@@ -803,26 +803,29 @@ fn run_group(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let verdicts = libtest_verdicts(
+        &text,
+        &tests.iter().map(|e| e.test.as_str()).collect::<Vec<_>>(),
+    );
+    let mut dump = !output.status.success();
     for entry in tests {
-        let needle = format!("test {} ... ", entry.test);
-        let verdict = text
-            .lines()
-            .find_map(|l| l.trim().strip_prefix(&needle).map(str::trim));
-        match verdict {
-            Some("ok") => {
+        match verdicts.get(entry.test.as_str()) {
+            Some(LibtestVerdict::Ok) => {
                 tally.passed += 1;
                 println!("  PASS  {package} {label}::{}", entry.test);
             }
-            Some(other) => {
+            Some(LibtestVerdict::Failed(detail)) => {
+                dump = true;
                 tally
                     .failed
-                    .push(format!("{package} {label}::{} ({other})", entry.test));
-                println!("  FAIL  {package} {label}::{} ({other})", entry.test);
+                    .push(format!("{package} {label}::{} ({detail})", entry.test));
+                println!("  FAIL  {package} {label}::{} ({detail})", entry.test);
             }
-            None => {
+            Some(LibtestVerdict::NoVerdict) | None => {
+                dump = true;
                 tally.not_run.push(format!(
                     "{package} {label}::{} (no libtest verdict — the target did not build or \
-                     the binary aborted; see the tail below)",
+                     the binary aborted; see the output below)",
                     entry.test
                 ));
                 println!("  ????  {package} {label}::{} (no verdict)", entry.test);
@@ -833,12 +836,82 @@ fn run_group(
     // did), and twelve trailing lines are then libtest's summary and nothing about why any of
     // them failed — every panic message scrolled past. A log that names failures it cannot
     // explain sends the next reader back to re-run the group by hand, which is the cost this
-    // lane exists to remove.
-    if !output.status.success() {
+    // lane exists to remove. Dumped on any non-PASS verdict too (card 34: a FAIL that the exit
+    // status did not confirm left no evidence at all).
+    if dump {
         for line in text.lines() {
             eprintln!("    | {line}");
         }
     }
+}
+
+/// What libtest said about one test of a group.
+#[derive(Debug, PartialEq, Eq)]
+enum LibtestVerdict {
+    Ok,
+    /// The first lines of the test's `---- <name> stdout ----` section (its panic message), or
+    /// `FAILED` when libtest printed no section.
+    Failed(String),
+    /// No `test <name> ... ` line at all: the binary did not reach the test.
+    NoVerdict,
+}
+
+/// libtest verdicts for `tests`, read from the libtest contract rather than from the token
+/// after `test <name> ... `.
+///
+/// Card 34 lane runs 1–2: `distill_fairness_live` spawns resident worker subprocesses that
+/// inherit stdout, so their log lines land on the libtest line between `test <name> ... ` and
+/// `ok` — the old parser took the first such line as the verdict and reported a FAIL for a test
+/// that passed, while `cargo test` exited 0 and nothing was dumped. The contract libtest keeps
+/// regardless of interleaving: a failed test is listed by name under the trailing `failures:`
+/// heading (indented), and a test that ran has a `test <name> ... ` line. So: listed → Failed;
+/// ran and not listed → Ok; no line → NoVerdict.
+fn libtest_verdicts<'a>(text: &str, tests: &[&'a str]) -> BTreeMap<&'a str, LibtestVerdict> {
+    let lines: Vec<&str> = text.lines().collect();
+    // Names under the LAST `failures:` heading (libtest prints the heading twice: once before
+    // the per-test stdout sections, once before the bare name list; the list is the last one).
+    let mut failed: BTreeSet<&str> = BTreeSet::new();
+    if let Some(start) = lines.iter().rposition(|l| l.trim_end() == "failures:") {
+        for l in &lines[start + 1..] {
+            if l.starts_with("test result:") {
+                break;
+            }
+            let name = l.trim();
+            if !name.is_empty() && !name.contains(' ') {
+                failed.insert(name);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    for &test in tests {
+        let needle = format!("test {test} ... ");
+        let ran = lines.iter().any(|l| l.trim_start().starts_with(&needle));
+        let verdict = if failed.contains(test) {
+            let header = format!("---- {test} stdout ----");
+            let detail = lines
+                .iter()
+                .position(|l| l.trim() == header)
+                .map(|i| {
+                    lines[i + 1..]
+                        .iter()
+                        .take_while(|l| !l.starts_with("---- ") && l.trim_end() != "failures:")
+                        .filter(|l| !l.trim().is_empty())
+                        .take(12)
+                        .map(|l| l.trim())
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                })
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| "FAILED".to_owned());
+            LibtestVerdict::Failed(detail)
+        } else if ran {
+            LibtestVerdict::Ok
+        } else {
+            LibtestVerdict::NoVerdict
+        };
+        out.insert(test, verdict);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1111,5 +1184,49 @@ mod tests {
                 .any(|d| d.file.ends_with("feature_registry_contract.rs")),
             "a doc comment was read as an `#[ignore]` attribute"
         );
+    }
+
+    /// Card 34 lane bug: a resident worker subprocess writes on the libtest line between
+    /// `test <name> ... ` and `ok`. The verdict comes from the libtest contract, not from the
+    /// token after the ellipsis. Fault: take the token after `... ` as the verdict → this test
+    /// reports Failed("humaux-private-worker: …").
+    #[test]
+    fn interleaved_child_output_on_the_libtest_line_is_still_a_pass() {
+        let text = "running 2 tests\n\
+test distill_poison_live ... ok\n\
+test distill_fairness_live ... humaux-private-worker: distill dispatch claimed=24 completed=24 \
+failed=0 stopped=-\nok\n\n\
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 46 filtered out; finished in 1061.27s\n";
+        let v = libtest_verdicts(
+            text,
+            &["distill_poison_live", "distill_fairness_live", "absent_one"],
+        );
+        assert_eq!(v["distill_poison_live"], LibtestVerdict::Ok);
+        assert_eq!(v["distill_fairness_live"], LibtestVerdict::Ok);
+        assert_eq!(v["absent_one"], LibtestVerdict::NoVerdict);
+    }
+
+    /// A real failure is read from the trailing `failures:` name list, with the panic line from
+    /// the test's stdout section as detail. Fault: drop the `failures:` scan → Ok.
+    #[test]
+    fn a_listed_failure_is_failed_with_its_panic_line() {
+        let text = "running 2 tests\n\
+test a_pass ... ok\n\
+test a_fail ... FAILED\n\n\
+failures:\n\n\
+---- a_fail stdout ----\n\n\
+thread 'a_fail' panicked at bins/x/tests/y.rs:10:5:\n\
+assertion `left == right` failed\n  left: 1\n right: 2\n\n\n\
+failures:\n    a_fail\n\n\
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        let v = libtest_verdicts(text, &["a_pass", "a_fail"]);
+        assert_eq!(v["a_pass"], LibtestVerdict::Ok);
+        match &v["a_fail"] {
+            LibtestVerdict::Failed(d) => {
+                assert!(d.contains("panicked at bins/x/tests/y.rs:10:5"), "{d}");
+                assert!(d.contains("left: 1"), "{d}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }
