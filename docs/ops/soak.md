@@ -78,6 +78,19 @@ period) fires exactly that hook; the card-27 gate ran it with `SOAK_SESSIONS=1 S
 SOAK_DRAIN=300` (card 24's shape) — with the default load, one resident distiller cannot drain three
 tenants' writes inside a 150 s drain and `backlog_drained` grades distill throughput, not the soak.
 
+Card 35 / ADR-0062 D-T: the rotation also includes the resident maintenance daemon
+(`humaux-maintenance --serve`, hook `soak_chaos_md.sh`, pidfile `md.pid`, watched as `md`). It runs only
+against the rehearsal's **throwaway** database `humaux_thread_c35_rh_<pid>` (created, migrated with `cargo xtask
+migrate --dsn`, seeded with eight tenants of purgeable work and one orphan ticket each, dropped on exit; ruling
+E8: never the shared dev database), with retentions 0, so its kill -9 lands while the purge doors are working.
+Its hook is listed **second**, right after the runner's, so the gate's `SOAK_SECS=1800 SOAK_CHAOS_SECS=400`
+(four hooks fire) reaches it, and the seed is sized from `SOAK_SECS` so the purging outlasts that round. After
+the soak, step `maintenance_drain` grades it, not the soak harness: per purge door `seeded − remaining =
+Σ ops.maintenance_receipts.affected` (`maintenance_soak_receipts_balance`; a multi-statement or receipt-less
+purge cut by kill -9 breaks the equality), every orphan LOST with exactly one reissue, and the restarted daemon
+finished a cycle and answers 200. `cargo test -p xtask rotation_includes_the_maintenance_daemon` reds when the
+hook leaves the rotation.
+
 Each chaos script kills **one PID the launcher recorded at spawn**, and never a pattern or a
 port — see §6. `pgrep -f "…"` in a chaos command is the shape this runbook used to publish and
 must not: it matches any process on the host whose argv happens to contain that string.
@@ -105,8 +118,8 @@ needs `recalls = 3 x SOAK_SESSIONS x SOAK_SECS / (think_secs + round_trip_secs)`
 under the same ceiling `3 x SOAK_SESSIONS / (think_secs + round_trip_secs) < 0.229`. With
 `SOAK_SESSIONS=1 SOAK_THINK_MS=14000` the round trip (remember + recall + enumerate + get, ~1 s
 in release, ~2.5 s in debug) gives ~0.2 loops/s: `SOAK_SECS=1800` ⇒ ≥ 330 recalls at ~0.2
-Evidence/s, `SOAK_DRAIN=300`, and `SOAK_CHAOS_SECS=400` so each of the four chaos hooks fires
-about once (every retrieval-worker kill fails the recalls in its restart window, and the default
+Evidence/s, `SOAK_DRAIN=300`, and `SOAK_CHAOS_SECS=400` so four of the five chaos hooks fire
+about once (the runner's, the maintenance daemon's, the retrieval worker's and the distiller's; card 35) (every retrieval-worker kill fails the recalls in its restart window, and the default
 90 s period over a 30-minute run would spend the 1 % `op_failure_rate` budget on chaos alone). Measure latency on `REHEARSE_PROFILE=release` (the rehearsal
 builds and runs every binary from `$CARGO_TARGET_DIR/release`); a debug build inflates exactly
 the CPU-bound stages (`scan`) the stage table exists to attribute, so a debug number is a

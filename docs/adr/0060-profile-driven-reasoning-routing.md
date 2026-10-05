@@ -401,3 +401,10 @@ never another payer); (d) per-attempt reservation; (e) a health writer beyond op
 renewal (probe or worker-reported negative observations) so health-based selection has data; (f) per-provider
 budget domains (L1, L2); (g) its own research pass and owner gate (automatic fallback across models is a separate
 card).
+
+## Addendum (2026-10-05, card 35 final verification) — T34's sampler counted the wrong population; the claim is already serialized
+
+- **Observation.** T34 `slow_provider_tenant_cannot_take_all_slots` went red once in card 35's final verification (`c33b-t34 samples=58 max_slots_b=4 done_a=500`). An external 100 ms observer on a second run showed: while tenant A had READY `DERIVED_DISTILL` work, B held at most 2 of 4 slots in every sample; after A's 500 distill jobs were DONE, B took all 4 — correct, work-conserving D-F behaviour — and the sampler kept folding those samples in.
+- **Root cause (test side).** The sampler's "A still has work" guard counted `ops.jobs` rows with `status IN ('PENDING','PROCESSING')` across **all job types**. The 0164 trigger `derived_consolidate_work_enqueue` queues one `DERIVED_CONSOLIDATE` job per accepted Evidence that nothing in T34 claims, so the guard never dropped to 0. Fixed in the test: the guard now requires `job_type = 'DERIVED_DISTILL'`. The assertion `max_slots_b <= 2` is unchanged.
+- **Hypothesis disproved.** The main line first suspected a claim race (two overlapping `ops.claim_derived_work_v2` calls, the second skipping the fewest-held tenant's `FOR UPDATE … SKIP LOCKED` row and falling through to the over-share tenant). A two-session experiment on a throwaway database refuted it: the single `ops.provider_arbiters` row taken `FOR UPDATE` by 0190 (ADR-0058 D-B) already serializes every claim — session 2 waited on `transactionid` until session 1 committed, then received the fewest-held tenant's job (final slots B, B, A, A). No migration or claim change was made; D-F holds as written.
+- **Lesson.** A fairness witness must define the contended window by the exact READY predicate of the work it measures, never by an untyped job count.

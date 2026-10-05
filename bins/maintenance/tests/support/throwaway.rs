@@ -1,0 +1,221 @@
+//! `maintenance::tests::support::throwaway` — the resident-mode test kit: a throwaway database migrated from the
+//!   files, the spawned process guard, free loopback ports and a one-shot HTTP GET (moved from
+//!   `health_serve.rs`, card 35 S1).
+//! Depends-on: crates=[humaux-testkit, postgres]; services=[PostgreSQL(owner) r=[ops.schema_migrations], HTTP(loopback),
+//!   subprocess(humaux-maintenance), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-maintenance, CARGO_MANIFEST_DIR,
+//!   HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[humaux-testkit]
+//! Called-by: [maintenance::tests::health_serve, maintenance::tests::serve]
+//! Invariants: [every database is humaux_thread_<prefix>_<pid>_<n>, created by the fixture and dropped WITH (FORCE)
+//!   by its Drop even on panic, so the shared dev database never sees a fixture row; the spawned process is
+//!   killed by its own Drop; missing env -> §79.2 skip_or_fail]
+//! Spec: Baseline §78.1; §79.2; ADR-0061 D-D; ADR-0062 D-A
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::{Child, Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use humaux_testkit::{ExternalDep, skip_or_fail};
+use postgres::{Client, NoTls};
+
+pub const BIN: &str = env!("CARGO_BIN_EXE_humaux-maintenance");
+pub const OWNER_DSN: &str = "HUMAUX_TEST_PG_DSN";
+pub const MAINTENANCE_DSN: &str = "HUMAUX_MAINTENANCE_PG_DSN";
+
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// `postgres://user:pass@host:port/<db>?query` with the database replaced.
+pub fn with_db(dsn: &str, db: &str) -> String {
+    let (head, tail) = dsn.split_at(dsn.rfind('/').expect("dsn has a database path") + 1);
+    let query = tail.find('?').map_or("", |i| &tail[i..]);
+    format!("{head}{db}{query}")
+}
+
+/// A loopback port free at the moment of the call (the xtask e2e_onboard::free_port pattern).
+pub fn free_addr() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("a free loopback port")
+}
+
+/// One HTTP/1.0 GET; `None` when nothing listens.
+pub fn get(addr: SocketAddr, path: &str) -> Option<(u16, String)> {
+    // dep: HTTP(loopback) — the process's ops listener
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    write!(stream, "GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n").ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    let code = raw.split_whitespace().nth(1)?.parse().ok()?;
+    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_owned())?;
+    Some((code, body))
+}
+
+/// Polls `GET path` until `done` holds or `within` elapses; returns the last answer.
+pub fn poll(
+    addr: SocketAddr,
+    path: &str,
+    within: Duration,
+    done: impl Fn(&(u16, String)) -> bool,
+) -> Option<(u16, String)> {
+    let deadline = Instant::now() + within;
+    loop {
+        let answer = get(addr, path);
+        if answer.as_ref().is_some_and(&done) || Instant::now() >= deadline {
+            return answer;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The spawned process, killed if the test did not stop it itself.
+pub struct Serve(pub Child);
+
+impl Drop for Serve {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Serve {
+    /// SIGTERM, then the exit status within `within` and everything it printed on stdout.
+    pub fn terminate(&mut self, within: Duration) -> (std::process::ExitStatus, Duration, String) {
+        let pid = self.0.id().to_string();
+        let sent = Instant::now();
+        // dep: subprocess(kill) — SIGTERM to the process this test spawned
+        let ok = Command::new("kill").args(["-TERM", &pid]).status();
+        assert!(ok.is_ok_and(|s| s.success()), "kill -TERM {pid}");
+        let status = loop {
+            if let Some(status) = self.0.try_wait().expect("try_wait") {
+                break status;
+            }
+            assert!(
+                sent.elapsed() < within,
+                "no exit within {within:?} of SIGTERM"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let took = sent.elapsed();
+        let mut out = String::new();
+        if let Some(mut stdout) = self.0.stdout.take() {
+            stdout.read_to_string(&mut out).expect("read stdout");
+        }
+        (status, took, out)
+    }
+}
+
+pub struct Db {
+    pub owner_dsn: String,
+    pub maintenance_dsn: String,
+    pub name: String,
+    client: Option<Client>,
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        drop(self.client.take());
+        // dep: PostgreSQL(owner) — drop this test's throwaway database
+        match Client::connect(&with_db(&self.owner_dsn, "postgres"), NoTls) {
+            Ok(mut admin) => {
+                let drop_db = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name);
+                if let Err(e) = admin.batch_execute(&drop_db) {
+                    eprintln!("throwaway cleanup: {drop_db} failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("throwaway cleanup: connect failed: {e}"),
+        }
+    }
+}
+
+/// Applies every migration file in order (bodies only; the manifests are the `xtask migrate` gate's job).
+fn migrate(client: &mut Client) {
+    // Role DDL is cluster-global (0201 ALTER ROLE, 0210 CREATE ROLE): one database at a time per process.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("migrations dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        .collect();
+    files.sort();
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS ops; CREATE TABLE IF NOT EXISTS ops.schema_migrations \
+             (migration_id text PRIMARY KEY, checksum text NOT NULL, \
+              applied_at timestamptz NOT NULL DEFAULT now())",
+        )
+        .expect("migration ledger bootstrap");
+    for file in files {
+        let sql = std::fs::read_to_string(&file).expect("migration body");
+        client
+            .batch_execute(&sql)
+            .unwrap_or_else(|e| panic!("apply {}: {e:?}", file.display()));
+    }
+}
+
+/// A fresh migrated database `humaux_thread_<prefix>_<pid>_<n>`, or `None` after a §79.2 skip.
+pub fn db(test: &str, prefix: &str) -> Option<Db> {
+    let (Ok(owner_dsn), Ok(maintenance_dsn)) =
+        (std::env::var(OWNER_DSN), std::env::var(MAINTENANCE_DSN))
+    else {
+        skip_or_fail(
+            test,
+            "missing object: HUMAUX_TEST_PG_DSN / HUMAUX_MAINTENANCE_PG_DSN",
+            ExternalDep::Postgres,
+        );
+        return None;
+    };
+    let name = format!(
+        "humaux_thread_{prefix}_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    );
+    // dep: PostgreSQL(owner) — create this test's throwaway database
+    let mut admin =
+        Client::connect(&with_db(&owner_dsn, "postgres"), NoTls).expect("owner connect");
+    admin
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .expect("create throwaway db");
+    drop(admin);
+    let mut db = Db {
+        maintenance_dsn: with_db(&maintenance_dsn, &name),
+        owner_dsn: owner_dsn.clone(),
+        name: name.clone(),
+        client: None,
+    };
+    // dep: PostgreSQL(owner) — fixture connection to the throwaway database
+    let mut client = Client::connect(&with_db(&owner_dsn, &name), NoTls).expect("connect test db");
+    migrate(&mut client);
+    db.client = Some(client);
+    Some(db)
+}
+
+impl Db {
+    /// The owner connection to this database.
+    pub fn client(&mut self) -> &mut Client {
+        self.client.as_mut().expect("client")
+    }
+
+    pub fn sql(&mut self, statements: &str) {
+        self.client()
+            .batch_execute(statements)
+            .unwrap_or_else(|e| panic!("{statements}: {e:?}"));
+    }
+}
+
+/// One run with exactly `env`.
+pub fn run(args: &[&str], env: &[(&str, String)]) -> Output {
+    // dep: subprocess(humaux-maintenance) — one run with exactly `env`
+    Command::new(BIN)
+        .args(args)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .output()
+        .expect("run humaux-maintenance")
+}

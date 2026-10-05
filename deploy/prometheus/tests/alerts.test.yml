@@ -250,3 +250,67 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: none
+
+  # maintenance fire (§42 injection: a revoked door on a throwaway database), as the daemon really exports it:
+  # clean scrapes with failed = 0 until 10m; the revoke makes every cycle fail, `/metrics` answers 503 and the
+  # 11m scrape marks the series stale; no sample until the re-grant; the first clean scrape at 31m reads the
+  # failed calls counted meanwhile. During the outage this row is silent and MaintenanceCountersAbsent fires;
+  # after the re-grant this row fires with the task's labels and the absent row clears.
+  - interval: 1m
+    input_series:
+      - series: 'maintenance_task_runs_total{job="humaux-maintenance",mode="serve",task="quota_reservations",outcome="failed"}'
+        values: '0x10 stale _x19 7x30'
+      - series: 'maintenance_task_runs_total{job="humaux-maintenance",mode="serve",task="lost",outcome="ok"}'
+        values: '0+1x10 stale _x19 40+1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: MaintenanceTaskFailing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: MaintenanceCountersAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 35m
+        alertname: MaintenanceTaskFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: humaux-maintenance
+              mode: serve
+              task: quota_reservations
+              outcome: failed
+      - eval_time: 35m
+        alertname: MaintenanceCountersAbsent
+        exp_alerts: []
+
+  # maintenance absent: the daemon was never scraped (dead before its first answer, or not in the targets file);
+  # pending at 1m, firing at 3m.
+  - interval: 1m
+    input_series:
+      - series: 'jobs_dead'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: MaintenanceCountersAbsent
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: MaintenanceCountersAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # maintenance silent: every call succeeds (ok rises), failed stays 0 — dropping the outcome matcher fires here.
+  - interval: 1m
+    input_series:
+      - series: 'maintenance_task_runs_total{job="humaux-maintenance",mode="serve",task="quota_reservations",outcome="failed"}'
+        values: '0x70'
+      - series: 'maintenance_task_runs_total{job="humaux-maintenance",mode="serve",task="lost",outcome="ok"}'
+        values: '0+1x70'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: MaintenanceTaskFailing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: MaintenanceCountersAbsent
+        exp_alerts: []

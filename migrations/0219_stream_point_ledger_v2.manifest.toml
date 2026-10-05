@@ -1,0 +1,42 @@
+# §46.1 migration manifest. Card 35 S4 / ADR-0062 D-M: v2 of projection.stream_point_ledger (0189 is never edited).
+# CREATE OR REPLACE with the identical signature: `indexable` now also fences points_in_flight and points_unsettled.
+# Owner role_migration_owner, SECURITY DEFINER, STABLE, search_path pinned, EXECUTE role_gateway and
+# role_retrieval_worker only, PUBLIC has none. No table grant, no DML.
+
+migration_id = "0219_stream_point_ledger_v2"
+class = "EXPAND_CONTRACT"
+
+# Refuses a v1 that is missing (0189 not applied) and a body that already carries the v2 F fence.
+precheck = """
+select coalesce((select p.prosrc !~ 'r\\.tomb AND r\\.in_flight AND r\\.indexable\\)'
+                   from pg_proc p
+                  where p.oid = to_regprocedure('projection.stream_point_ledger(uuid,text,uuid,text,text,text,text,uuid[])')),
+                false) as precheck_ok
+"""
+
+# Fails on a body without the F and Q fences, a changed owner / security / volatility / search_path, or any
+# EXECUTE beyond role_gateway and role_retrieval_worker (PUBLIC included).
+postcheck = """
+select coalesce(bool_and(
+   p.prosrc ~ 'r\\.tomb AND r\\.in_flight AND r\\.indexable\\)'
+   and p.prosrc ~ 'NOT r\\.in_flight AND r\\.indexable\\s+AND r\\.latest IN'
+   and pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef and p.provolatile = 's'
+   and 'search_path=pg_catalog' = any(coalesce(p.proconfig,'{}'))
+   and has_function_privilege('role_gateway', p.oid, 'EXECUTE')
+   and has_function_privilege('role_retrieval_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_maintenance', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_private_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_consolidation_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_public_worker', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_batch_issuer', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_admin', p.oid, 'EXECUTE')
+   and not has_function_privilege('role_health_reader', p.oid, 'EXECUTE')
+   and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                    where x.grantee = 0 and x.privilege_type = 'EXECUTE')), false)
+ and count(*) = 1 as postcheck_ok
+from pg_proc p
+where p.oid = to_regprocedure('projection.stream_point_ledger(uuid,text,uuid,text,text,text,text,uuid[])')
+"""
+
+rollback_or_forward_fix = "forward-fix only: CREATE OR REPLACE the function with the 0189 body (F and Q then count non-indexable memories again; no caller changes). Never DROP: stream_repo::close_ledger_in_txn calls it on every ledger read."
+backup_restore_requirement = "none: function body only, no row data touched."

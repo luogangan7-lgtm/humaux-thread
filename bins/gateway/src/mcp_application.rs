@@ -131,6 +131,10 @@ pub struct GatewayMcpApplication {
     /// (`HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS`, §78.1). `None` keeps `memory.annotate_affect`
     /// failing closed through `reject_unsupported` (a MOOD row needs the policy to stamp).
     mood_half_life: Option<MoodHalfLife>,
+    /// `memory.enumerate`'s manifest lifetime and size cap (`HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS`,
+    /// `HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP`; §78.1, ADR-0062 D-K). `None` keeps `memory.enumerate` failing closed
+    /// through `reject_unsupported`.
+    enumeration: Option<(Duration, usize)>,
     #[cfg(test)]
     trusted_continuity_scope: Option<humaux_domain::identity::AuthorizationScope>,
 }
@@ -155,6 +159,7 @@ impl GatewayMcpApplication {
             confirm_token_ttl: None,
             undo_window: None,
             mood_half_life: None,
+            enumeration: None,
             #[cfg(test)]
             trusted_continuity_scope: None,
         }
@@ -186,6 +191,21 @@ impl GatewayMcpApplication {
             return Err(ErrorCode::InvalidInput);
         }
         self.undo_window = Some(window);
+        Ok(self)
+    }
+
+    /// Enables `memory.enumerate` with the bootstrap-owned manifest lifetime and cap
+    /// (`HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS` / `HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP`, §78.1, ADR-0062 D-K).
+    /// A zero TTL or cap is refused.
+    pub fn with_enumeration(
+        mut self,
+        ttl: Duration,
+        manifest_cap: usize,
+    ) -> Result<Self, ErrorCode> {
+        if ttl.is_zero() || manifest_cap == 0 {
+            return Err(ErrorCode::InvalidInput);
+        }
+        self.enumeration = Some((ttl, manifest_cap));
         Ok(self)
     }
 
@@ -524,6 +544,9 @@ impl GatewayMcpApplication {
                 .memory_enumerate_subjects(context, operation, raw_arguments, value)
                 .await;
         }
+        let Some((ttl, manifest_cap)) = self.enumeration else {
+            return self.reject_unsupported(context, operation, None).await;
+        };
         let page_size = u16::try_from(
             value
                 .get("limit")
@@ -560,7 +583,8 @@ impl GatewayMcpApplication {
                         MemoryEnumerationParams {
                             cursor: cursor.as_deref(),
                             page_size,
-                            ttl: memory::ENUMERATION_TTL,
+                            ttl,
+                            manifest_cap,
                             mac_key: &mac_key,
                             subject_id,
                         },
@@ -2578,7 +2602,10 @@ mod tests {
                 let forwarded = fixture_forwarded(handle.tenant_id);
                 let barrier = barrier_config();
                 if let Some(forwarded) = forwarded {
-                    handle.seed_legacy_system_preauth_bucket(forwarded.to_string());
+                    // Baseline §73.2 / ADR-0062 E5: the pre-auth bucket of an IPv6 client is its /64.
+                    handle.seed_legacy_system_preauth_bucket(
+                        humaux_adapters::quota_repo::preauth_ip_subject(forwarded.into()),
+                    );
                 }
                 let runtime_handle = handle.rt.handle().clone();
                 let first_only = runtime_handle.block_on(async {
@@ -2613,7 +2640,9 @@ mod tests {
                          WHERE tenant_id='00000000-0000-0000-0000-000000000000' \
                            AND subject_kind='ip' AND subject_id=$1 \
                            AND operation='mcp' AND bucket_key='preauth'",
-                            &[&forwarded.to_string()],
+                            &[&humaux_adapters::quota_repo::preauth_ip_subject(
+                                forwarded.into(),
+                            )],
                         )
                         .unwrap();
                     assert_eq!(row.get::<_, i64>(0), 10_000);

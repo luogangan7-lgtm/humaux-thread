@@ -94,7 +94,7 @@ measured with the pinned 3.15.0 (W6): an assertion failure and a rule-load error
 ## Deployer rendering contract (rehearse.sh now, card-39 packaging later)
 
 - `prometheus.yml`: replace `__HUMAUX_GIT_SHA__` with the `value` of `humaux-admin q deploy.binary`
-  (the Watchdog payload must carry it, §42.1 / §67.4); write `targets/*.json` from the seven
+  (the Watchdog payload must carry it, §42.1 / §67.4); write `targets/*.json` from the eight
   `*_METRICS_ADDR` values with labels `{job: humaux-<process>, mode: <mode>}`; start Prometheus with
   `--web.listen-address=127.0.0.1:<port> --storage.tsdb.retention.time=30d`.
 - `alertmanager.yml`: replace `__HUMAUX_ALERTMANAGER_LOG_SINK_URL_FILE__` and

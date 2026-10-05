@@ -1,5 +1,5 @@
 //! `xtask::rls_check` — G80-26 (§48.2) runtime DB role invariant CI enumeration gate.
-//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.credential_pepper_state, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.data_disclosures, ops.deletion_plan_steps, ops.distill_calls, ops.distill_tenant_scheduler, ops.email_delivery_events, ops.email_domains, ops.email_outbox, ops.email_provider_health, ops.email_suppressions, ops.jobs, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.provider_arbiters, ops.provider_slots, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.schema_migrations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.processing_gaps, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[private.ingest_tickets] x=[control.api_key_rehash, control.assert_write_scope, control.attest_reasoning_route_health, control.bind_reasoning_domain, control.credential_pepper_epoch, control.credential_pepper_epoch_advance, control.credential_pepper_epoch_close, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.observe_reasoning_route_health, control.onboard_tenant, control.onboard_workspace, control.reasoning_credential_accounts, control.reasoning_profile_capabilities, control.reasoning_profile_request_extras, control.reasoning_route_health_state, control.reasoning_route_status, control.register_reasoning_profile, control.resolve_user_reasoning_admission, control.revoke_api_key, control.set_reasoning_profile_enabled, ops.admin_probe_snapshot, ops.admit_distill_budget, ops.begin_call, ops.claim_derived_work, ops.claim_derived_work_v2, ops.contribution_reservation_authority_validate, ops.distill_scheduler_admit, ops.distill_slots_all_bound, ops.finish_derived_work_v2, ops.health_snapshot, ops.renew_lease, ops.requeue_dead_distill, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal], PostgreSQL(role_gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_GATEWAY_PG_DSN, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
+//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.credential_pepper_state, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.data_disclosures, ops.deletion_plan_steps, ops.distill_calls, ops.distill_tenant_scheduler, ops.email_delivery_events, ops.email_domains, ops.email_outbox, ops.email_provider_health, ops.email_suppressions, ops.jobs, ops.maintenance_receipts, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.provider_arbiters, ops.provider_slots, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.schema_migrations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.processing_gaps, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.ticket_reissues, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[ops.jobs, ops.outbox, private.ingest_tickets] x=[control.api_key_rehash, control.assert_write_scope, control.attest_reasoning_route_health, control.bind_reasoning_domain, control.credential_pepper_epoch, control.credential_pepper_epoch_advance, control.credential_pepper_epoch_close, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.maintenance_tenant_page, control.observe_reasoning_route_health, control.onboard_tenant, control.onboard_workspace, control.purge_idle_rate_buckets, control.reasoning_credential_accounts, control.reasoning_profile_capabilities, control.reasoning_profile_request_extras, control.reasoning_route_health_state, control.reasoning_route_status, control.register_reasoning_profile, control.resolve_user_reasoning_admission, control.revoke_api_key, control.set_reasoning_profile_enabled, control.sweep_confirm_tokens, ops.admin_probe_snapshot, ops.admit_distill_budget, ops.auto_redrive_schema_failed, ops.begin_call, ops.c35_fault_definer_trigger, ops.c35_fault_invoker_delete, ops.c35_fault_outbox_door, ops.claim_derived_work, ops.claim_derived_work_v2, ops.contribution_reservation_authority_validate, ops.distill_scheduler_admit, ops.distill_slots_all_bound, ops.finish_derived_work_v2, ops.health_snapshot, ops.purge_expired_selection_snapshots, ops.purge_terminal_jobs, ops.renew_lease, ops.requeue_dead_distill, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.reissue_unsettled_tickets, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal, staging.require_phase9_exact_assessed_storage_binding], PostgreSQL(role_gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_GATEWAY_PG_DSN, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
 //! Called-by: [xtask::dep_map, xtask::main]
 //! Invariants: [any catalog cell that disagrees with §48.2 / §62 grants is fail, named by role and table]
 //! Spec: Baseline §48.2; §62; §6.2.0; §6.2.2; ADR-0061 D-D
@@ -1035,6 +1035,12 @@ const MATRIX: &[Cell] = &[
     ),
     cell!("ops.outbox", HEALTH_READER_ROLE, ["SELECT"]),
     cell!("ops.jobs", HEALTH_READER_ROLE, ["SELECT"]),
+    // 0214 (ADR-0062 D-F): purge receipts are written only by the owner doors, in the same statement as the
+    // delete; the daemon's role reads them, nobody else touches them.
+    cell!("ops.maintenance_receipts", "role_maintenance", ["SELECT"]),
+    // 0220 (ADR-0062 D-N): the once-per-retirement markers are written only by the reissue door, in the same
+    // transaction as the ticket; the daemon's role reads them, nobody else touches them.
+    cell!("projection.ticket_reissues", "role_maintenance", ["SELECT"]),
 ];
 
 // 0120 is an additive observation-window seam, not a rewrite of the frozen §6.2.2 header.
@@ -4177,6 +4183,152 @@ pub fn check_projection_claim_boundary(client: &mut impl GenericClient) -> GateR
     }
 }
 
+/// ADR-0062 D-D / D-N / D-P (migrations 0214, 0220, 0221; card 35): the owner definers only the maintenance daemon
+/// may run. The page is its one cross-tenant read (tenant ids only); every sweep, purge, reissue and re-drive stays
+/// per tenant under the caller's GUC.
+const MAINTENANCE_DOOR_FUNCTIONS: [&str; 3] = [
+    "control.maintenance_tenant_page(uuid,integer)",
+    "projection.reissue_unsettled_tickets(uuid,interval,integer)",
+    "ops.auto_redrive_schema_failed(uuid,interval,integer)",
+];
+
+/// ADR-0062 D-D/D-R: each maintenance door is owner-owned, SECURITY DEFINER, `search_path=pg_catalog`, EXECUTE
+/// held by exactly `role_maintenance`, PUBLIC revoked. Missing ⇒ `not_applicable` naming the function (§57.1).
+pub fn check_maintenance_doors(client: &mut impl GenericClient) -> GateResult {
+    let check = "ADR-0062 maintenance doors";
+    let missing: Vec<String> = match client.query(
+        "SELECT f FROM unnest($1::text[]) AS f WHERE to_regprocedure(f) IS NULL",
+        &[&MAINTENANCE_DOOR_FUNCTIONS.to_vec()],
+    ) {
+        Ok(rows) => rows.iter().map(|r| r.get(0)).collect(),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    if !missing.is_empty() {
+        return not_applicable(check, format!("missing {}", missing.join(", ")));
+    }
+    let mut problems = Vec::new();
+    for function in MAINTENANCE_DOOR_FUNCTIONS {
+        check_owner_definer_function(client, &mut problems, function, ONBOARDING_EXECUTORS);
+    }
+    if problems.is_empty() {
+        pass(
+            check,
+            format!(
+                "{}: owner SECURITY DEFINER, search_path pinned, EXECUTE exactly {{role_maintenance}}, PUBLIC revoked",
+                MAINTENANCE_DOOR_FUNCTIONS.join(", ")
+            ),
+        )
+    } else {
+        fail(check, problems.join("; "))
+    }
+}
+
+/// ADR-0062 D-E / D-R (Baseline §6.2.1 as amended by ruling E1): the closed set of SECURITY DEFINER functions whose
+/// body contains `DELETE` and that `role_maintenance` can reach — by EXECUTE, or, for a trigger function, by firing it
+/// (PostgreSQL checks no EXECUTE when a trigger fires) — each with its justification.
+const MAINTENANCE_DELETE_DOORS: [(&str, &str); 6] = [
+    (
+        "control.sweep_confirm_tokens(interval,integer)",
+        "D-G: expired confirm tokens past their audit retention (0218)",
+    ),
+    (
+        "ops.purge_expired_selection_snapshots(integer)",
+        "D-H: DB-expired enumerate snapshots and their items (0218)",
+    ),
+    (
+        "control.purge_idle_rate_buckets(interval,integer)",
+        "D-I: idle rate buckets that would be full now (0218)",
+    ),
+    (
+        "ops.purge_terminal_jobs(interval,interval,interval,integer)",
+        "D-J: terminal jobs past retention, budget-window / linked / R4 jobs kept (0218)",
+    ),
+    (
+        "control.ensure_user(text,text)",
+        "ADR-0053: deletes only the user row it inserted in the same call when a concurrent onboarding \
+         won the email (a self-rollback, not a purge path); keeps its shipped 0186 ACL",
+    ),
+    (
+        "staging.require_phase9_exact_assessed_storage_binding()",
+        "0126 phase-9 exact-binding guard trigger: `DELETE` appears only as `TG_OP <> 'DELETE'` tests; it reads and \
+         raises, it deletes nothing",
+    ),
+];
+
+/// The catalog side of [`check_maintenance_delete_doors`]. Invoker-rights functions (trigger or not) are filtered out
+/// before the comparison: they run with the caller's table privileges, which [`check_forbidden_verbs`] pins. Every
+/// SECURITY DEFINER trigger function is in scope whatever its ACL: an UPDATE role_maintenance may make can fire it,
+/// and firing checks no EXECUTE (review P1, card 35 fix pass).
+/// ponytail: a `DELETE` built by dynamic SQL (`EXECUTE format(...)`) evades the regex (ADR-0062 L15); every door is
+/// LANGUAGE sql; also flag maintenance-reachable definers whose body runs `EXECUTE` if one ever ships.
+const MAINTENANCE_DELETE_DOORS_SQL: &str = "SELECT p.oid::regprocedure::text FROM pg_proc p \
+     WHERE p.prosecdef \
+       AND (p.prorettype = 'trigger'::regtype \
+            OR has_function_privilege('role_maintenance', p.oid, 'EXECUTE')) \
+       AND p.prosrc ~* '\\mDELETE\\M' \
+     ORDER BY 1";
+
+/// ADR-0062 D-R: the maintenance DELETE doors are exactly [`MAINTENANCE_DELETE_DOORS`]; each of the four purge
+/// doors is owner-owned, SECURITY DEFINER, `search_path=pg_catalog`, EXECUTE exactly `{role_maintenance}`, PUBLIC
+/// revoked. A missing door is `not_applicable` naming it (§57.1).
+pub fn check_maintenance_delete_doors(client: &mut impl GenericClient) -> GateResult {
+    let check = "ADR-0062 maintenance DELETE doors";
+    let expected: Vec<String> = MAINTENANCE_DELETE_DOORS
+        .iter()
+        .map(|(sig, _)| (*sig).to_owned())
+        .collect();
+    // Rendered by the catalog itself, so both sides of the comparison share one spelling.
+    let rendered = match client.query(
+        "SELECT f, to_regprocedure(f)::text FROM unnest($1::text[]) AS f ORDER BY 1",
+        &[&expected],
+    ) {
+        Ok(rows) => rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+            .collect::<Vec<_>>(),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    let missing: Vec<&str> = rendered
+        .iter()
+        .filter(|(_, r)| r.is_none())
+        .map(|(f, _)| f.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return not_applicable(check, format!("missing {}", missing.join(", ")));
+    }
+    let want: BTreeSet<String> = rendered.into_iter().filter_map(|(_, r)| r).collect();
+    let found: BTreeSet<String> = match client.query(MAINTENANCE_DELETE_DOORS_SQL, &[]) {
+        Ok(rows) => rows.iter().map(|r| r.get(0)).collect(),
+        Err(error) => return fail(check, format!("pg_proc scan failed: {error}")),
+    };
+    let mut problems = Vec::new();
+    for extra in found.difference(&want) {
+        problems.push(format!(
+            "{extra}: a SECURITY DEFINER DELETE function role_maintenance can reach (EXECUTE, or a trigger its \
+             writes fire) outside the ADR-0062 closed set"
+        ));
+    }
+    for gone in want.difference(&found) {
+        problems.push(format!(
+            "{gone}: in the ADR-0062 closed set but not a maintenance-reachable DELETE definer"
+        ));
+    }
+    for (door, _) in &MAINTENANCE_DELETE_DOORS[..4] {
+        check_owner_definer_function(client, &mut problems, door, ONBOARDING_EXECUTORS);
+    }
+    if problems.is_empty() {
+        pass(
+            check,
+            format!(
+                "maintenance DELETE doors exactly {{{}}}",
+                want.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        )
+    } else {
+        fail(check, problems.join("; "))
+    }
+}
+
 /// ADR-0053 (migrations 0185/0186, card 28): the eight onboarding doors, all executable by
 /// `role_maintenance` only.
 const ONBOARDING_FUNCTIONS: [&str; 8] = [
@@ -4637,6 +4789,8 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_api_key_rehash_boundary(&mut client));
             results.push(check_reasoning_route_doors(&mut client));
             results.push(check_health_reader_boundary(&mut client));
+            results.push(check_maintenance_doors(&mut client));
+            results.push(check_maintenance_delete_doors(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -4661,6 +4815,8 @@ pub fn run(_args: &[String]) -> i32 {
                 "ADR-0058 distill dispatch v2 boundary",
                 "ADR-0060 reasoning route doors",
                 "ADR-0061 health reader boundary",
+                "ADR-0062 maintenance doors",
+                "ADR-0062 maintenance DELETE doors",
             ] {
                 results.push(fail_for(name, &conn_err));
             }
@@ -6109,6 +6265,162 @@ mod tests {
                 .expect("restore exact catalog");
         }
         let restored = check_health_reader_boundary(&mut txn);
+        assert_eq!(restored.status, GateStatus::Pass, "{}", restored.detail);
+    }
+
+    /// T-D2 (ADR-0062 D-D, D-N, D-P): the tenant page, the reissue and the re-drive door are the daemon's alone.
+    /// Granting one to another runtime role (or the page to PUBLIC) inside a never-committed transaction reds the real
+    /// gate, naming the cell; the rollback restores green.
+    #[test]
+    fn the_tenant_page_is_maintenance_only() {
+        txn_or_skip!(client, txn);
+        let clean = check_maintenance_doors(&mut txn);
+        assert_eq!(clean.status, GateStatus::Pass, "{}", clean.detail);
+        for (fault, named) in [
+            (
+                "GRANT EXECUTE ON FUNCTION control.maintenance_tenant_page(uuid,integer) TO role_gateway",
+                "control.maintenance_tenant_page(uuid,integer)/role_gateway",
+            ),
+            (
+                "GRANT EXECUTE ON FUNCTION control.maintenance_tenant_page(uuid,integer) TO PUBLIC",
+                "control.maintenance_tenant_page(uuid,integer)/PUBLIC",
+            ),
+            (
+                "ALTER FUNCTION control.maintenance_tenant_page(uuid,integer) SECURITY INVOKER",
+                "definer=false",
+            ),
+            // ADR-0062 D-N: the reissue door writes tickets as the owner; it is the daemon's alone too.
+            (
+                "GRANT EXECUTE ON FUNCTION projection.reissue_unsettled_tickets(uuid,interval,integer) TO role_gateway",
+                "projection.reissue_unsettled_tickets(uuid,interval,integer)/role_gateway",
+            ),
+            // ADR-0062 D-P: the re-drive door re-arms DEAD jobs as the owner; the private worker must not hold it.
+            (
+                "GRANT EXECUTE ON FUNCTION ops.auto_redrive_schema_failed(uuid,interval,integer) TO role_private_worker",
+                "ops.auto_redrive_schema_failed(uuid,interval,integer)/role_private_worker",
+            ),
+        ] {
+            txn.batch_execute("SAVEPOINT door_fault")
+                .expect("fault savepoint");
+            txn.batch_execute(fault).expect(fault);
+            let red = check_maintenance_doors(&mut txn);
+            println!("{fault} => {:?}: {}", red.status, red.detail);
+            assert_eq!(red.status, GateStatus::Fail, "{fault}: {}", red.detail);
+            assert!(red.detail.contains(named), "{fault}: {}", red.detail);
+            txn.batch_execute("ROLLBACK TO SAVEPOINT door_fault; RELEASE SAVEPOINT door_fault")
+                .expect("restore exact catalog");
+        }
+        let restored = check_maintenance_doors(&mut txn);
+        assert_eq!(restored.status, GateStatus::Pass, "{}", restored.detail);
+    }
+
+    /// T-R1 (ADR-0062 D-R, ruling E11): inside a never-committed transaction, (1) a table DELETE grant to
+    /// role_maintenance reds the §6.2.1 verb gate; (2) a fifth purge door (the struck outbox door) granted to
+    /// role_maintenance reds the closed set, naming it; (3) an invoker function with a DELETE granted to
+    /// role_maintenance stays green (drop the `prosecdef` clause and this step reds); (4) a SECURITY DEFINER trigger
+    /// function whose body deletes, with no EXECUTE grant at all, reds the closed set, naming it (restore the old
+    /// "non-trigger, EXECUTE-granted" filter and this step goes green ⇒ red). Each fault rolls back to a green gate.
+    #[test]
+    fn maintenance_delete_door_faults_drive_gate_red_then_restore() {
+        txn_or_skip!(client, txn);
+        let clean = check_maintenance_delete_doors(&mut txn);
+        println!("clean => {:?}: {}", clean.status, clean.detail);
+        assert_eq!(clean.status, GateStatus::Pass, "{}", clean.detail);
+        assert!(
+            clean
+                .detail
+                .starts_with("maintenance DELETE doors exactly {"),
+            "{}",
+            clean.detail
+        );
+        assert_eq!(
+            check_forbidden_verbs(&mut txn).status,
+            GateStatus::Pass,
+            "the verb gate is green before the fault"
+        );
+
+        let fault = |txn: &mut postgres::Transaction<'_>, sql: &str| {
+            txn.batch_execute(&format!("SAVEPOINT delete_door_fault; {sql}"))
+                .expect(sql);
+        };
+        let restore = |txn: &mut postgres::Transaction<'_>| {
+            txn.batch_execute(
+                "ROLLBACK TO SAVEPOINT delete_door_fault; RELEASE SAVEPOINT delete_door_fault",
+            )
+            .expect("restore exact catalog");
+        };
+
+        fault(&mut txn, "GRANT DELETE ON ops.jobs TO role_maintenance");
+        let verbs = check_forbidden_verbs(&mut txn);
+        println!("table DELETE grant => {:?}: {}", verbs.status, verbs.detail);
+        assert_eq!(verbs.status, GateStatus::Fail, "{}", verbs.detail);
+        assert!(
+            verbs
+                .detail
+                .contains("ops.jobs: role_maintenance holds DELETE"),
+            "{}",
+            verbs.detail
+        );
+        restore(&mut txn);
+
+        fault(
+            &mut txn,
+            "CREATE FUNCTION ops.c35_fault_outbox_door(p_limit integer) RETURNS bigint \
+             LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS \
+             $$ WITH gone AS (DELETE FROM ops.outbox WHERE status = 'DONE' RETURNING 1) \
+                SELECT count(*) FROM gone $$; \
+             REVOKE ALL ON FUNCTION ops.c35_fault_outbox_door(integer) FROM PUBLIC; \
+             GRANT EXECUTE ON FUNCTION ops.c35_fault_outbox_door(integer) TO role_maintenance",
+        );
+        let extra = check_maintenance_delete_doors(&mut txn);
+        println!("fifth door => {:?}: {}", extra.status, extra.detail);
+        assert_eq!(extra.status, GateStatus::Fail, "{}", extra.detail);
+        assert!(
+            extra.detail.contains("ops.c35_fault_outbox_door(integer)"),
+            "{}",
+            extra.detail
+        );
+        restore(&mut txn);
+
+        // Out of scope by construction: an invoker function runs with the caller's table privileges (no DELETE for
+        // role_maintenance), so it stays green.
+        fault(
+            &mut txn,
+            "CREATE FUNCTION ops.c35_fault_invoker_delete() RETURNS bigint LANGUAGE sql AS \
+             $$ WITH gone AS (DELETE FROM ops.jobs WHERE false RETURNING 1) SELECT count(*) FROM gone $$; \
+             GRANT EXECUTE ON FUNCTION ops.c35_fault_invoker_delete() TO role_maintenance",
+        );
+        let invoker = check_maintenance_delete_doors(&mut txn);
+        println!(
+            "invoker function => {:?}: {}",
+            invoker.status, invoker.detail
+        );
+        assert_eq!(invoker.status, GateStatus::Pass, "{}", invoker.detail);
+        restore(&mut txn);
+
+        // In scope: a SECURITY DEFINER trigger function runs as its owner whenever a write role_maintenance may make
+        // fires it, and firing checks no EXECUTE, so it reds without any grant (and with one).
+        fault(
+            &mut txn,
+            "CREATE FUNCTION ops.c35_fault_definer_trigger() RETURNS trigger LANGUAGE plpgsql \
+             SECURITY DEFINER SET search_path = pg_catalog AS \
+             $$ BEGIN DELETE FROM ops.jobs WHERE job_id = NEW.job_id; RETURN NEW; END $$; \
+             REVOKE ALL ON FUNCTION ops.c35_fault_definer_trigger() FROM PUBLIC",
+        );
+        let trigger = check_maintenance_delete_doors(&mut txn);
+        println!(
+            "definer trigger => {:?}: {}",
+            trigger.status, trigger.detail
+        );
+        assert_eq!(trigger.status, GateStatus::Fail, "{}", trigger.detail);
+        assert!(
+            trigger.detail.contains("ops.c35_fault_definer_trigger()"),
+            "{}",
+            trigger.detail
+        );
+        restore(&mut txn);
+
+        let restored = check_maintenance_delete_doors(&mut txn);
         assert_eq!(restored.status, GateStatus::Pass, "{}", restored.detail);
     }
 

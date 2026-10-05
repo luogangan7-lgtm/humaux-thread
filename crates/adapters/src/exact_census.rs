@@ -3,7 +3,7 @@
 //! Called-by: [adapters::context_repo, tests]
 //! Invariants: [total, returned items and the probe snapshot come from ONE REPEATABLE READ transaction (§22.1); total
 //!   is its own count(*), never the recall length; a census failure is trigger 4 (Internal), never a guessed total]
-//! Spec: Baseline §22.4; §22.1; §23.4; §23.1; §60
+//! Spec: Baseline §22.4; §22.1; §23.4; §23.1; §60; ADR-0062 D-K
 //!
 //! Split of responsibilities (frozen by the pure crates' own docs):
 //! - `retrieval::predicate_registry` validates rows but "does not import sqlx or issue any
@@ -173,7 +173,7 @@ const AUTHORIZED_CANDIDATE: &str = "memory_records.memory_id = ANY($8)";
 
 /// §6.1.3 (ADR-0028 D-D) subject axis, EXACT-channel face: the bound uuid being NULL means
 /// "not subject-scoped". `{n}` is the placeholder number, filled by [`subject_scoped`] — the
-/// candidate statement binds 8 placeholders and the three readout statements bind 9, so the
+/// candidate statement binds it as `$8` and the three readout statements as `$9`, so the
 /// one fragment cannot hardcode a single `$k` (a mismatch there would silently compare the
 /// subject id against an id array).
 ///
@@ -187,6 +187,15 @@ const SUBJECT_SCOPED: &str = "(${n}::uuid IS NULL OR EXISTS ( \
 
 fn subject_scoped(placeholder: u8) -> String {
     SUBJECT_SCOPED.replace("{n}", &placeholder.to_string())
+}
+
+/// ADR-0062 D-K segment axis, EXACT-channel face: a later manifest segment of `memory.enumerate` counts only
+/// `memory_id < bound` (NULL = the first segment, the whole universe). Same placeholder rule as [`SUBJECT_SCOPED`]:
+/// the candidate statement binds it as `$9`, the three readout statements as `$10`.
+const BEFORE_BOUNDED: &str = "(${n}::uuid IS NULL OR memory_records.memory_id < ${n})";
+
+fn before_bounded(placeholder: u8) -> String {
+    BEFORE_BOUNDED.replace("{n}", &placeholder.to_string())
 }
 
 /// §18/§22.1 `SECRET_MATERIAL` linkage: a memory whose evidence chain carries secret material
@@ -208,6 +217,7 @@ async fn census_count(txn: &mut Txn<'_>, sql: &str, args: &CensusArgs<'_>) -> sq
         .bind(&args.stream.projection_version)
         .bind(args.authorized_ids)
         .bind(args.subject_id)
+        .bind(args.before_id)
         .fetch_one(&mut **txn)
         .await?
         .try_get(0)
@@ -219,6 +229,7 @@ struct CensusArgs<'a> {
     stream: &'a StreamKey,
     authorized_ids: &'a [Uuid],
     subject_id: Option<Uuid>,
+    before_id: Option<Uuid>,
 }
 
 struct CandidateQuery<'a> {
@@ -228,6 +239,7 @@ struct CandidateQuery<'a> {
     scope: &'a str,
     predicate: &'a str,
     subject_id: Option<Uuid>,
+    before_id: Option<Uuid>,
 }
 
 async fn authorized_candidate_ids(
@@ -235,11 +247,12 @@ async fn authorized_candidate_ids(
     query: &CandidateQuery<'_>,
 ) -> Result<Vec<Uuid>, ErrorCode> {
     let candidates_sql = format!(
-        "SELECT memory_id FROM {} AND ({}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} AND {} \
+        "SELECT memory_id FROM {} AND ({}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} AND {} AND {} \
          ORDER BY memory_id",
         query.scope,
         query.predicate,
         subject_scoped(8),
+        before_bounded(9),
     );
     let candidates: Vec<Uuid> = match sqlx::query(&candidates_sql)
         .bind(query.authorization.tenant_id().0)
@@ -250,6 +263,7 @@ async fn authorized_candidate_ids(
         .bind(&query.stream.projection_kind)
         .bind(&query.stream.projection_version)
         .bind(query.subject_id)
+        .bind(query.before_id)
         .fetch_all(&mut **txn)
         .await
     {
@@ -274,7 +288,7 @@ async fn census_readout(
     predicate: &str,
     args: &CensusArgs<'_>,
 ) -> Result<(i64, Vec<Uuid>, i64), ErrorCode> {
-    let subject = subject_scoped(9);
+    let subject = format!("{} AND {}", subject_scoped(9), before_bounded(10));
     let total_sql = format!(
         "SELECT count(*) FROM {scope} AND ({predicate}) AND {ACTIVE_FINAL} AND {NOT_TOMBSTONED} \
          AND {AUTHORIZED_CANDIDATE} AND {subject}"
@@ -297,6 +311,7 @@ async fn census_readout(
         .bind(&args.stream.projection_version)
         .bind(args.authorized_ids)
         .bind(args.subject_id)
+        .bind(args.before_id)
         .fetch_all(&mut **txn)
         .await
         .map_err(|_| ErrorCode::Internal)?
@@ -336,6 +351,8 @@ pub struct CensusInputs<'a> {
     pub stream: &'a StreamKey,
     /// §6.1.3 (ADR-0028 D-D): restrict the universe to memories linked to this subject.
     pub subject_id: Option<Uuid>,
+    /// ADR-0062 D-K: restrict the universe to `memory_id < before_id` (a later manifest segment); `None` = whole.
+    pub before_id: Option<Uuid>,
 }
 
 /// §22.1 census inside a transaction the caller owns (isolation level and the RLS GUCs are
@@ -393,6 +410,7 @@ async fn census_readout_in_savepoint(
         scope: inputs.enumerable_scope,
         predicate: inputs.sql_predicate,
         subject_id: inputs.subject_id,
+        before_id: inputs.before_id,
     };
     let authorized_ids = authorized_candidate_ids(sp, &candidate_query)
         .await
@@ -403,6 +421,7 @@ async fn census_readout_in_savepoint(
         stream: inputs.stream,
         authorized_ids: &authorized_ids,
         subject_id: inputs.subject_id,
+        before_id: inputs.before_id,
     };
     let (total, ids, excluded_secret) =
         census_readout(sp, inputs.enumerable_scope, inputs.sql_predicate, &args)
@@ -470,6 +489,7 @@ pub async fn exact_enumerate(
             workspace: requested_workspace,
             stream,
             subject_id: None,
+            before_id: None,
         },
     )
     .await;

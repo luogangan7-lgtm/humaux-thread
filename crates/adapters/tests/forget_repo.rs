@@ -475,10 +475,12 @@ fn tombstoned_unpurged_over_sla_goes_red_then_green_on_purge_step() {
 /// §37.2 architecture assertion (own-file verification — the workspace-wide
 /// architecture-check(§37.2) grep gate itself is not wired into `xtask` by this ticket, see
 /// the T4.8 report): `projection.stream_log` is exactly the columns §15.1's DDL names — the
-/// original 12 plus the two §15.2.1 audit columns 0167 added (`retired_at`, `retired_by`; facts
-/// about a transition, not counters derivable from `state`, which is what §37.2's freeze
-/// guards against) — no `deleted_count` and no `status` (`state` is the only status-like
-/// column). The set is asserted verbatim so a 15th column is red by name, not by count alone.
+/// original 12, the two §15.2.1 audit columns 0167 added (`retired_at`, `retired_by`), the four
+/// 0176 lease/attempt columns (ADR-0052) and 0223's `lost_at` (the LOST transition clock,
+/// ADR-0062 D-N). All seven are facts about a transition, not counters derivable from `state`,
+/// which is what §37.2's freeze guards against — no `deleted_count` and no `status` (`state` is
+/// the only status-like column). The set is asserted verbatim so a 20th column is red by name,
+/// not by count alone.
 #[test]
 fn stream_log_has_exactly_the_frozen_columns() {
     run_db_fixture::<ForgetFixture, _>(
@@ -516,12 +518,14 @@ fn stream_log_has_exactly_the_frozen_columns() {
                 "lease_expires_at",
                 "attempts",
                 "next_attempt_at",
+                "lost_at",
             ];
             want.sort();
             assert_eq!(
                 got, want,
                 "§37.2/§15.1: the frozen column set (12 + the two 0167 audit columns + the four \
-                 0176 lease/attempt columns, ADR-0052), got {cols:?}"
+                 0176 lease/attempt columns, ADR-0052 + the one 0223 column `lost_at`, \
+                 ADR-0062 D-N), got {cols:?}"
             );
             assert!(
                 !cols.iter().any(|c| c == "deleted_count"),

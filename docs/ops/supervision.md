@@ -1,4 +1,4 @@
-# Supervision runbook — the five processes
+# Supervision runbook — the resident units
 
 > Scope: §4.2's minimal process set, §4.4's probe contract, ADR-0037. This file is the
 > operational half of card 15; the architectural decisions and their limits are in
@@ -14,7 +14,7 @@ list cannot show: since card 29 (ADR-0054) the gateway needs **no default write 
 write derives (tenant, workspace) per request, and the two `REMEMBER_TENANT_ID` /
 `REMEMBER_WORKSPACE_ID` keys are accepted-and-ignored (e2e tooling only).
 
-## 1. The five processes and how each answers "are you up"
+## 1. The processes and resident units, and how each answers "are you up"
 
 | process | liveness | readiness | resident? |
 |---|---|---|---|
@@ -23,7 +23,23 @@ write derives (tenant, workspace) per request, and the two `REMEMBER_TENANT_ID` 
 | `humaux-private-worker` | process alive | `--readyz` exit 0 | `--serve-rpc` / `--distill-serve` yes |
 | `humaux-consolidation-worker` | process alive | `--readyz` exit 0 | `--serve` yes |
 | `humaux-public-worker` | process alive | `--readyz` exit 0 | no — one bounded pass per invocation |
-| `humaux-maintenance` | `health serve`: process alive | `health serve`: `GET /metrics` on its ops address → 200 / 503 | `health serve` yes (card 34, ADR-0061 D-D); every other subcommand no (card 28); the resident `--serve` job is card 35 |
+| `humaux-maintenance` | `health serve`: process alive | `health serve`: `GET /metrics` on its ops address → 200 / 503 | `health serve` yes (card 34, ADR-0061 D-D); every other subcommand no (card 28) |
+| `humaux-maintenance --serve` | process alive | `GET /metrics` on `HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR` → 200 / 503 | yes — the sixth resident unit (card 35, ADR-0062 D-A): the scheduled maintenance daemon |
+
+`humaux-maintenance --serve` (ADR-0062) is the scheduled maintenance daemon and the eighth ops pair
+(`humaux-maintenance:serve`, ADR-0061 D-B): every
+`HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS` it runs each due task of the closed D-C list (LOST sweep, quota and
+provider-budget reapers, the four purge doors, the Q-drain reissue and the schema-failed re-drive) over one page
+of tenants, one transaction and one door call per tenant, as `role_maintenance`. Every key is required with no
+default (runbook "Scheduled maintenance" has the table). Only the first connect is boot-fatal; a failed call is
+logged, counted (`maintenance_task_runs_total{outcome="failed"}`) and answered 503 while the loop goes on, so do
+not restart it on a 503. `/metrics` answers 200 with the two D-S counters only while the last finished cycle had no
+failed call and a cycle finished within 3 × CYCLE; `/status` carries `cycles`, `in_cycle` and `last_cycle` per
+task. SIGTERM / Ctrl-C is checked between door calls, so a stop never waits out a cycle. **Run exactly one
+instance**: a second one only doubles the calls (`FOR UPDATE SKIP LOCKED` keeps the results correct), and both must
+read one env file, because the daemon reads the gateway's `HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS` and the distill
+worker's `HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS` under their own names (ADR-0062 L4). It never samples
+health and `health serve` never purges (ADR-0062 D-A).
 
 `humaux-maintenance health serve` (ADR-0061 D-D) **is** a supervised unit: the one process that samples
 the §41.2 SQL-derived health gauges (`jobs_*`, `oldest_pending_age_seconds`, `projection_lag_events`,
@@ -56,6 +72,7 @@ boot-fatal naming the key; there is no default port and no fallback to `:0`. One
 | private-worker `--distill-serve` | `HUMAUX_PRIVATE_WORKER_DISTILL_SERVE_METRICS_ADDR` | none yet (card 34b) |
 | consolidation-worker `--serve` | `HUMAUX_CONSOLIDATION_WORKER_SERVE_METRICS_ADDR` | none yet (card 34b) |
 | maintenance `health serve` | `HUMAUX_MAINTENANCE_HEALTH_SERVE_METRICS_ADDR` | 9 SQL-derived gauges / counters |
+| maintenance `--serve` | `HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR` | 2: `maintenance_task_runs_total{task,outcome}`, `maintenance_task_rows_total{task}` (ADR-0062 D-S; zero state: `--serve --metrics-families`) |
 
 `/metrics` and `/status` are **never** on the gateway's `BIND_ADDR` (the MCP surface behind the
 reverse proxy): anything mounted there is reachable through the proxy. `BIND_ADDR` keeps `/livez`
@@ -118,6 +135,9 @@ never report a healthy-but-empty reading — §4.4 坑5, "没有" ≠ "没扫到
 | `--readyz` names `the private worker's inference RPC socket` | the private worker is not running, or is running as a different OS user / with a different socket path | start the private worker first (§4 start order); check the socket path and its owner |
 | `health serve` `/metrics` → 503 `health sample failed: …` | the last `ops.health_snapshot()` call failed: PostgreSQL is down, the DSN is wrong, or `role_maintenance` lost EXECUTE on the function (the body names it) | do not restart in a loop: the process keeps sampling and returns to 200 by itself on the next good sample. Fix PostgreSQL or the grant. Meanwhile Prometheus marks the gauges stale, and `HealthGaugesAbsent` fires after 2 min |
 | `health serve` `/metrics` → 503 `health sample stale` | no good sample for more than 2 × the interval (each sample is bounded by the interval) | as above; if it persists while PostgreSQL is healthy, restart the unit |
+| `--serve` `/metrics` → 503 `maintenance cycle failed: <task>: N failed call(s), first: …` | a door call of that task failed in the last finished cycle: PostgreSQL is down, or `role_maintenance` lost EXECUTE on the door (the error names it) | do not restart in a loop: the next clean cycle answers 200 by itself. Fix PostgreSQL or the grant. Meanwhile Prometheus marks the counters stale and `MaintenanceCountersAbsent` (WARNING) fires after 2 min; `MaintenanceTaskFailing` fires once the first clean scrape after the fix reads the failed calls |
+| `--serve` `/metrics` → 503 `maintenance cycle pending: no good maintenance cycle since start` | the daemon is up but its first cycle has not finished clean yet (ADR-0062 D-A: booted is not ready) | wait one cycle; if a failure follows, the row above applies |
+| `--serve` `/metrics` → 503 `maintenance cycle stale` | no cycle finished within 3 × `HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS` (every call is bounded by CYCLE on both sides) | as above; if it persists while PostgreSQL is healthy, restart the unit |
 | `humaux-admin q <name>` exits non-zero with `missing object` | the probe could not reach its object **at all** | that is data, not a bug: the named object is what has to exist before the probe can answer. See §5 |
 
 ### `humaux-maintenance deploy-check` (ADR-0059 D-F; run before traffic and after every rotation)
@@ -159,6 +179,7 @@ that path, precisely so a `0` can never be manufactured downstream.
 | `humaux-private-worker --distill-serve` | always restart | **≥ one distill job** = `HTTP_TIMEOUT_SECS` + one `DISTILL_LEASE_SECS` (ADR-0058) |
 | `humaux-consolidation-worker --serve` | always restart | **≥ one dispatch pass** |
 | `humaux-maintenance health serve` | always restart | ≥ one sample = `HUMAUX_MAINTENANCE_HEALTH_SAMPLE_SECONDS` (each sample is bounded by it); SIGTERM / Ctrl-C exit 0 after the sample in hand |
+| `humaux-maintenance --serve` | always restart | ≥ one door call = `HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS` (each call is bounded by it); SIGTERM / Ctrl-C exit 0 after the call in hand with a `stopped` receipt. A SIGKILL is safe: every call is one statement in one transaction, so a purge and its receipt commit together or not at all (ADR-0062 D-E) |
 | `humaux-public-worker --run-once` | on-failure only; it is a scheduled one-shot, exit 0 is success | ≥ one outbox pass |
 
 The bolded rows are the ones that matter. The resident derived-layer workers and the projection
@@ -237,7 +258,9 @@ Qdrant ──────┘
              │        (binds the inference UDS)             (dials it)
              ├─> humaux-private-worker --distill-serve
              ├─> humaux-public-worker --run-once   (scheduled; needs Qdrant + PostgreSQL only)
-             └─> humaux-maintenance health serve   (PostgreSQL only; migration 0210 applied)
+             ├─> humaux-maintenance health serve   (PostgreSQL only; migration 0210 applied)
+             └─> humaux-maintenance --serve        (PostgreSQL only; migrations 0214-0222 applied; after
+                                                     health serve, before traffic)
 ```
 
 Rules:
@@ -352,7 +375,7 @@ Three more supervised units on the same host, every listener on loopback by an *
 
 | unit | listen | notes |
 |---|---|---|
-| Prometheus | `--web.listen-address=127.0.0.1:9090`, `--storage.tsdb.retention.time=30d` | scrapes the seven ops listeners above (`targets/*.json`, written by the deployer from the seven `*_METRICS_ADDR` values, labels `{job: humaux-<process>, mode: <mode>}`) and the collector; loads `invariants.rules.yml` + `alerts.rules.yml`; **no** remote-write / OTLP receiver, admin or lifecycle flag (`deploy/prometheus/check-compose.sh` refuses them); reload = SIGHUP |
+| Prometheus | `--web.listen-address=127.0.0.1:9090`, `--storage.tsdb.retention.time=30d` | scrapes the eight ops listeners above (`targets/*.json`, written by the deployer from the eight `*_METRICS_ADDR` values, labels `{job: humaux-<process>, mode: <mode>}`) and the collector; loads `invariants.rules.yml` + `alerts.rules.yml`; **no** remote-write / OTLP receiver, admin or lifecycle flag (`deploy/prometheus/check-compose.sh` refuses them); reload = SIGHUP |
 | Alertmanager | `--web.listen-address=127.0.0.1:9093 --cluster.listen-address=` (empty: no gossip listener) | default route → the log sink, `Watchdog` → its own receiver every 5 min; both URLs come from `url_file`s outside the repo |
 | OTel Collector (core) | OTLP `127.0.0.1:4317/4318`, own telemetry `127.0.0.1:8888` | terminates OTLP at `debug`; carries no application traffic until an SDK producer exists; `up{job="otelcol"}` is its liveness |
 

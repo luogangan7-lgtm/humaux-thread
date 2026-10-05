@@ -6,8 +6,9 @@
 //!   modules=[adapters::postgres, adapters::selection_repo, domain::selection, humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [G20-1/G80-32: pages of a Mode B snapshot are duplicate-free, miss nothing from the base set and never
-//!   contain rows inserted during or after page 1; a tampered cursor is SelectionRepoError::Cursor]
-//! Spec: Baseline §8.1; §8.6; §20
+//!   contain rows inserted during or after page 1; a tampered cursor is SelectionRepoError::Cursor; the manifest is
+//!   one INSERT statement in memory_id DESC ordinal order]
+//! Spec: Baseline §8.1; §8.6; §20; ADR-0062 D-K
 //!
 //! **G20-1 / G80-32 "Stable Selection Snapshot Integrity"** (§20.4's own anchor for both gate
 //! numbers, `§20#G20-1`): seed 30 eligible memories, page through a §20.4 Mode B snapshot at
@@ -544,4 +545,57 @@ fn cursor_rejects_forged_ordinal() {
             "expected InvalidMac rejection, got {result:?}"
         );
     });
+}
+
+/// ADR-0062 D-K (T-K1): page 1 writes the whole manifest in ONE statement — every item row carries the same
+/// command id (`cmin`) — and the ordinals are 0..N-1 in `memory_id DESC` order. Fault: reverse the ordinality, or
+/// restore the per-id INSERT loop (one `cmin` per row; the grep gate `c35_one_manifest_insert` also catches it).
+#[test]
+fn the_manifest_is_one_insert_in_ordinal_order() {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<SelectionFixture, _>(
+        "the_manifest_is_one_insert_in_ordinal_order",
+        |mut handle| {
+            let mut seeded =
+                seed_active_memories(&mut handle.admin, handle.tenant_id, handle.evidence_id, 6);
+            seeded.sort_unstable_by(|a, b| b.cmp(a));
+            let page1 = handle
+                .rt
+                .block_on(selection_repo::begin_enumeration_snapshot(
+                    &handle.retrieval,
+                    handle.tenant_id,
+                    300.0,
+                    6,
+                    MAC_KEY,
+                ))
+                .expect("begin_enumeration_snapshot must not error");
+            assert_eq!(
+                page1.items, seeded,
+                "page 1 is the manifest in DESC id order"
+            );
+            let rows = handle
+                .admin
+                .query(
+                    "SELECT item_id, ordinal, cmin::text FROM ops.selection_snapshot_items \
+                 WHERE selection_snapshot_id = $1 ORDER BY ordinal",
+                    &[&page1.snapshot_id],
+                )
+                .expect("read manifest rows");
+            let ordinals: Vec<i64> = rows.iter().map(|row| row.get(1)).collect();
+            let items: Vec<Uuid> = rows.iter().map(|row| row.get(0)).collect();
+            let commands: std::collections::BTreeSet<String> =
+                rows.iter().map(|row| row.get(2)).collect();
+            assert_eq!(
+                ordinals,
+                (0..6).collect::<Vec<i64>>(),
+                "ordinals are 0..N-1"
+            );
+            assert_eq!(items, seeded, "ordinal order is memory_id DESC");
+            assert_eq!(
+                commands.len(),
+                1,
+                "one INSERT statement wrote every row: {commands:?}"
+            );
+        },
+    );
 }

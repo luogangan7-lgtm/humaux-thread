@@ -381,3 +381,14 @@ was added *to* the existing one, precisely so it cannot drift from the number it
 baseline): `native_gateway_semantic_recall_real_qdrant_pg_and_ryw_acceptance` 80.81 s wall
 (n=1, real Qdrant + PG + read-your-writes); `consolidation_hop_e2e` 7 tests in 3.89 s;
 `distill_hop_e2e` 8 tests in 3.31 s.
+
+## Addendum (card 35, 2026-10-04; ADR-0062 D-G / D-Q)
+
+The confirm-token sweep now has a schedule. Card 35 supersedes "this system has no maintenance daemon": the resident
+`humaux-maintenance --serve` (ADR-0062 D-A) calls the bounded door `control.sweep_confirm_tokens(interval, integer)`
+(migration 0218, which dropped the 1-arg version: one door) per tenant with `ORDER BY expires_at LIMIT … FOR UPDATE
+SKIP LOCKED` and one `ops.maintenance_receipts` row per call that removed rows. Its predicate is this ADR's,
+verbatim. `cargo xtask sweep-confirm-tokens` and `xtask/src/confirm_sweep.rs` are retired; the manual override is
+`humaux-maintenance sweep once` with the §77 fields, which needs no test DSN (OPS-6). "Derived values are derived"
+is also why card 35 rejected mark-only purge columns (ADR-0062 D-E, ruling E2): an `expired_at` mark is derivable
+from `expires_at` and nothing would ever delete the marked rows.

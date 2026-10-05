@@ -1,11 +1,11 @@
 //! `adapters::confirm_token_repo` — `control.confirm_tokens` (migration 0148, ADR-0018).
 //! Depends-on: crates=[humaux-domain, sqlx, uuid]; services=[PostgreSQL(any) w=[control.confirm_tokens] x=[control.sweep_confirm_tokens, control.assert_write_scope]]; env=[]; modules=[adapters::postgres, adapters::request_guard_repo, domain::audit, domain::confirm, domain::error, domain::identity, domain::ids]
-//! Called-by: [adapters::affect_repo, adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::subject_repo, gateway::guard, tests, xtask::confirm_sweep]
+//! Called-by: [adapters::affect_repo, adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::subject_repo, gateway::guard, maintenance::serve, tests]
 //! Invariants: [tokens store only sha256(nonce) and are consumed by one UPDATE inside the caller's transaction;
 //!   replayed, expired or mis-bound tokens — including one minted for another workspace — are one indistinguishable
 //!   Conflict, never a silent success; every write transaction rechecks its principal and its one workspace
 //!   through control.assert_write_scope before it writes]
-//! Spec: Baseline §33.10; ADR-0018; ADR-0054
+//! Spec: Baseline §33.10; ADR-0018; ADR-0054; ADR-0062 D-G
 //!
 //! Two writes, both `role_gateway`, both FORCE-RLS tenant-scoped:
 //! - [`mint_with_audit`]: first call of a §33.10 two-step destructive action. One
@@ -214,44 +214,42 @@ pub async fn mint_with_audit(
     Ok(MintedConfirmation { expires_at })
 }
 
-/// §33.10 rule 9 / card 21 (card 1 review P2): the retention sweep — the ONLY caller-side door
-/// to `control.sweep_confirm_tokens(interval)` (migration 0169, forward-fixed by 0170).
+/// §33.10 rule 9 / ADR-0062 D-G: the retention sweep — the ONLY caller-side door to
+/// `control.sweep_confirm_tokens(interval, integer)` (migration 0218, replacing the unbounded 0169 door).
 ///
 /// Why a function call and not a `DELETE` here: `role_maintenance` holds no DELETE on the table
-/// (§6.2.1 bans that verb for every non-owner role, globally — 0169 granted it, `xtask
-/// rls-check` went red, 0170 revoked it). The predicate lives once, inside the owner SECURITY
-/// DEFINER function, rather than in every operator's shell history:
+/// (§6.2.1 bans that verb for every non-owner role; 0170 revoked the grant 0169 had made). The
+/// predicate lives once, inside the owner SECURITY DEFINER function:
 ///
 /// > deletable ⇔ `expires_at < now()` AND (`consumed_at IS NULL` OR `consumed_at < now() -
 /// > retention`)
 ///
 /// i.e. a row that can no longer gate anything AND is no longer wanted as audit. A
 /// recently-consumed token is deliberately KEPT: the §9 audit answer "which confirm token
-/// authorized this destructive call" has to outlive the call. `retention` is the deployment's
-/// policy, never a literal in here or in the function (§78.1).
+/// authorized this destructive call" has to outlive the call. `retention` and `limit` are the
+/// deployment's policy, never literals in here or in the function (§78.1).
 ///
-/// Per-tenant by construction: `control.confirm_tokens` FORCEs RLS and its policy is
-/// `tenant_id = current_setting('humaux.tenant_id')`, which the definer owner is subject to as
-/// well — a call with no tenant context matches nothing and deletes nothing. A deployment
-/// patrolling every tenant loops `control.tenants` and calls this once per tenant, exactly like
-/// [`crate::stream_repo::sweep_lost`]. Returns the number of rows deleted for that tenant.
+/// One transaction, one statement: the door asserts the tenant GUC set here, deletes at most `limit` of that
+/// tenant's rows (oldest expiry first) and writes one `ops.maintenance_receipts` row when it removed any. Returns
+/// the number of rows deleted for that tenant.
 pub async fn sweep_expired(
     pool: &MaintenanceDbPool,
     tenant_id: Uuid,
     retention: Duration,
+    limit: i32,
 ) -> Result<i64, ErrorCode> {
     // dep: PostgreSQL(any) — opens a PostgreSQL transaction
     let mut txn = pool.pool().begin().await.map_err(db_error)?;
-    // Same technique and rationale as `stream_repo::set_tenant_local` (a `Uuid`'s `Display`
-    // only ever emits canonical lowercase hex, so this formatted string carries nothing
-    // injectable) — `SET LOCAL` takes no bind parameters.
-    sqlx::query(&format!("SET LOCAL humaux.tenant_id = '{tenant_id}'"))
+    sqlx::query("SELECT set_config('humaux.tenant_id', $1, true)")
+        .bind(tenant_id.to_string())
         .execute(&mut *txn)
         .await
         .map_err(db_error)?;
+    // dep: PostgreSQL(any) — control.sweep_confirm_tokens (0218 owner purge door, EXECUTE role_maintenance only)
     let deleted: i64 =
-        sqlx::query_scalar("SELECT control.sweep_confirm_tokens(make_interval(secs => $1))")
+        sqlx::query_scalar("SELECT control.sweep_confirm_tokens(make_interval(secs => $1), $2)")
             .bind(retention.as_secs_f64())
+            .bind(limit)
             .fetch_one(&mut *txn)
             .await
             .map_err(db_error)?;

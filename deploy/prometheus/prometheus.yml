@@ -4,7 +4,7 @@
 # Deployer contract (rehearse.sh now, card-39 packaging later):
 #   - `__HUMAUX_GIT_SHA__` is replaced by the `value` of `humaux-admin q deploy.binary`, so every
 #     alert — the §42.1 Watchdog included — carries the deployed git sha (§67.4);
-#   - targets/*.json is written from the seven `*_METRICS_ADDR` values, one entry per resident mode
+#   - targets/*.json is written from the eight `*_METRICS_ADDR` values, one entry per resident mode
 #     with labels {job: humaux-<process>, mode: <mode>}, so ports live only in the env (D-B);
 #   - retention is the flag `--storage.tsdb.retention.time=30d` (§67.2), with
 #     `--web.listen-address=127.0.0.1:<port>`; both are in deploy/compose/observability.yml.

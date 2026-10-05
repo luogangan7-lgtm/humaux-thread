@@ -3,7 +3,9 @@
 # Verifies one deployment on this host, step by step: seed and onboarding, the resident processes and
 # their probes, the observability bundle (Prometheus / Alertmanager / collector from the pinned
 # binaries, ADR-0061 D-K), traffic with named assertions, metrics_scrape / admin_probes / alert_drill,
-# and the soak when SOAK_SECS is set. Every process is started and signalled only through its pidfile.
+# and the soak when SOAK_SECS is set. The resident maintenance daemon (`humaux-maintenance --serve`, card 35) runs
+# only against this run's own throwaway database humaux_thread_c35_rh_<pid> (ruling E8), never against $DB.
+# Every process is started and signalled only through its pidfile.
 # Exit: 0 = REHEARSAL VERDICT with 0 failed; 1 = an assertion failed; 2 = usage or missing configuration.
 set -u
 S=${HUMAUX_REHEARSE_WORK:-${TMPDIR:-/tmp}/humaux-rehearsal}   # work dir: pidfiles, helpers, evidence (override with HUMAUX_REHEARSE_WORK)
@@ -296,7 +298,7 @@ rm -f $SOCK/*.sock
 typeset -A OPS_PORTS
 OPS_PORTS=(humaux-gateway:serve 19101 humaux-retrieval-worker:serve-rpc 19102 humaux-retrieval-worker:serve 19103
   humaux-private-worker:serve-rpc 19104 humaux-private-worker:distill-serve 19105 humaux-consolidation-worker:serve 19106
-  humaux-maintenance:health-serve 19107)
+  humaux-maintenance:health-serve 19107 humaux-maintenance:serve 19108)
 # The per-mode keys, one line each, reused by every launch of that mode (first spawn, kill -9 recovery,
 # the soak's resident spawn and its chaos restart).
 OPS_RW_RPC="HUMAUX_RETRIEVAL_WORKER_SERVE_RPC_METRICS_ADDR=127.0.0.1:${OPS_PORTS[humaux-retrieval-worker:serve-rpc]}"
@@ -365,7 +367,7 @@ local gw_bind=${1:-127.0.0.1:8080} gw_ops=${2:-${OPS_PORTS[humaux-gateway:serve]
     HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX=$PEPPER_HEX HUMAUX_GATEWAY_TOKEN_HMAC_KEY=$TOKEN_HMAC_HEX HUMAUX_GATEWAY_ALLOWED_HOSTS=$gw_bind HUMAUX_GATEWAY_ALLOWED_ORIGINS=http://$gw_bind \
     HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES=1048576 HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS= HUMAUX_GATEWAY_MAX_FORWARDED_HOPS=1 HUMAUX_GATEWAY_GLOBAL_DENYLIST= HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST= \
     HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS=30 HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS=20 HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS=5 HUMAUX_GATEWAY_REPLAY_TTL_SECONDS=60 \
-    HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS=300 HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS=86400 HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS=21600 HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS=$LAG_SECS \
+    HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS=300 HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS=86400 HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS=21600 HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS=$LAG_SECS HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS=900 HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP=1000 \
     HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND=workspace \
     HUMAUX_GATEWAY_REMEMBER_DOMAIN=$DOMAIN HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND=$PKIND HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION=$PVER \
     HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID=$RDOM HUMAUX_GATEWAY_REMEMBER_TOKEN_TTL_SECONDS=60 HUMAUX_GATEWAY_REMEMBER_DATA_CLASS=INTERNAL \
@@ -391,6 +393,135 @@ start_mh() {
 own_pid mh $!
 }
 start_mh; MH_PID=$(cat $S/mh.pid)
+# ADR-0062 D-T / ruling E8 (card 35): the resident maintenance daemon `humaux-maintenance --serve` (the eighth ops
+# pair) works ONLY on this run's own throwaway database, never on $DB: on the shared dev database LOST, REISSUE and
+# REDRIVE would act on real tenants, and the confirm door's unconsumed branch ignores any retention. The database
+# is created through the owner psql path, migrated with `xtask migrate --dsn`, seeded with eight tenants of
+# purgeable work plus one orphan ticket each, and dropped WITH (FORCE) on every exit path (md_teardown; obs_stop
+# calls it once the observability trap replaces this one).
+MD_DB=humaux_thread_c35_rh_$$
+MDQ() { docker exec humaux-thread-pg psql -U postgres -d $MD_DB -Atc "$1"; }
+md_teardown() {
+  [ -f $S/md.pid ] && own_signal $S/md.pid humaux-maintenance TERM 30
+  rm -f $S/md.pid
+  docker exec humaux-thread-pg psql -U postgres -d postgres -qc "DROP DATABASE IF EXISTS $MD_DB WITH (FORCE)" >/dev/null 2>&1
+  return 0
+}
+rm -f $S/md.pid
+trap md_teardown EXIT
+# Rows per tenant per purge table: enough that purging outlasts the soak's second chaos round (the daemon's hook
+# runs second), so its kill -9 lands mid-purge; 6 without a soak. LIMIT 2 x 3 tenants per run every 3 s.
+MD_K=$(( ${SOAK_SECS:-0} > 0 ? ${SOAK_SECS:-0} / 8 : 6 ))
+# ONE definition, used by the first spawn, the kill -9 restart below and the soak's chaos hook. Retentions 0 so
+# every seeded row is purgeable at once; LOST_AFTER = LAG_SECS + 1 (the boot relation, ADR-0057 D-F); the budget
+# window is the distill worker's own value ($DS_ENV); the password stays a reference until the subshell runs.
+MD_ENV="export HUMAUX_MAINTENANCE_PG_DSN=\"postgres://role_maintenance:\${HUMAUX_ROLE_PASSWORD_MAINTENANCE:?}@$PG/$MD_DB\" \
+HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR=127.0.0.1:${OPS_PORTS[humaux-maintenance:serve]} \
+HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS=1 HUMAUX_MAINTENANCE_SERVE_TENANTS_PER_RUN=3 \
+HUMAUX_MAINTENANCE_SERVE_LOST_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_LOST_LIMIT=2 \
+HUMAUX_MAINTENANCE_SERVE_QUOTA_RESERVATIONS_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_QUOTA_RESERVATIONS_LIMIT=2 \
+HUMAUX_MAINTENANCE_SERVE_PROVIDER_BUDGETS_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_PROVIDER_BUDGETS_LIMIT=2 \
+HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_LIMIT=2 \
+HUMAUX_MAINTENANCE_SERVE_SNAPSHOTS_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_SNAPSHOTS_LIMIT=2 \
+HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_LIMIT=2 \
+HUMAUX_MAINTENANCE_SERVE_JOBS_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_JOBS_LIMIT=2 \
+HUMAUX_MAINTENANCE_SERVE_REISSUE_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_REISSUE_LIMIT=2 \
+HUMAUX_MAINTENANCE_SERVE_REDRIVE_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_REDRIVE_LIMIT=2 \
+HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS=$((LAG_SECS + 1)) HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS=$LAG_SECS \
+HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS=0 HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_IDLE_SECONDS=0 \
+HUMAUX_MAINTENANCE_SERVE_JOBS_DONE_RETENTION_SECONDS=0 HUMAUX_MAINTENANCE_SERVE_JOBS_DEAD_RETENTION_SECONDS=0 \
+HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS=60 \
+HUMAUX_MAINTENANCE_SERVE_REISSUE_COOLDOWN_SECONDS=2 HUMAUX_MAINTENANCE_SERVE_REDRIVE_COOLDOWN_SECONDS=2"
+# (MD_COOLDOWN in step maintenance_drain is REISSUE_COOLDOWN_SECONDS above.)
+# ADR-0062 E8: the database the daemon writes, read through the daemon's own DSN — $MD_ENV evaluated in a subshell
+# of this shell exactly as start_md does, so a DSN left out of $MD_ENV reads the inherited one (line 21, $DB).
+md_daemon_db() {
+  ( eval "$MD_ENV"
+    python3 -c "
+import os, psycopg2
+c = psycopg2.connect(os.environ['HUMAUX_MAINTENANCE_PG_DSN']); cur = c.cursor(); cur.execute('select current_database()'); print(cur.fetchone()[0])" ) 2>/dev/null
+}
+# Refuses to spawn the daemon unless that database is this run's throwaway one: the check runs before any write.
+start_md() {
+  MD_SPAWN_DB=$(md_daemon_db)
+  if [ "$MD_SPAWN_DB" != "$MD_DB" ] || [ "$MD_SPAWN_DB" = "$DB" ]; then
+    echo "REFUSED humaux-maintenance --serve: its DSN reads database '$MD_SPAWN_DB', not the throwaway $MD_DB" | tee -a $EV/rehearsal.log
+    MD_SPAWN_REFUSED=1
+    return 1
+  fi
+( eval "$MD_ENV"
+  exec "$BIN_DIR"/humaux-maintenance --serve >> $EV/maintenance-serve.log 2>&1 ) &
+own_pid md $!
+}
+MD_SPAWN_REFUSED=0
+MD_SETUP_OK=0
+if docker exec humaux-thread-pg psql -U postgres -d postgres -qc "CREATE DATABASE $MD_DB" >> $EV/rehearsal.log 2>&1 \
+   && "$BIN_DIR"/xtask migrate --dsn "postgres://postgres:${HUMAUX_DEV_PG_SUPERUSER_PASSWORD:?}@$PG/$MD_DB" > $EV/maintenance-migrate.log 2>&1 \
+   && docker exec -i humaux-thread-pg psql -U postgres -d $MD_DB -v ON_ERROR_STOP=1 -v k=$MD_K -1 -q >> $EV/maintenance-seed.log 2>&1 <<'MDSQL'
+SELECT set_config('c35.k', :'k', false);
+-- Eight tenants, each: k expired confirm tokens, k expired snapshots (3 items each), k idle full rate buckets,
+-- k old DONE/DEAD jobs (no calls, no links, not distill), and one orphan ISSUED ticket whose Evidence carries an
+-- indexable memory (the reissue door's input; ADR-0062 D-L / D-N). Owner SQL, one transaction.
+DO $do$
+DECLARE
+  k int := current_setting('c35.k')::int;
+  t uuid; u uuid; w uuid; s uuid; d uuid; e uuid; m uuid; sc uuid;
+BEGIN
+  FOR i IN 1..8 LOOP
+    INSERT INTO control.tenants (name) VALUES ('c35 rehearsal maintenance ' || i) RETURNING tenant_id INTO t;
+    INSERT INTO control.users (user_id) VALUES (gen_random_uuid()) RETURNING user_id INTO u;
+    INSERT INTO control.workspaces (tenant_id, name) VALUES (t, 'c35 rh') RETURNING workspace_id INTO w;
+    INSERT INTO control.confirm_tokens (tenant_id, user_id, operation, target_id, nonce_sha256, issued_at,
+        expires_at, workspace_id)
+      SELECT t, u, 'c35.rh', gen_random_uuid(), sha256(convert_to(gen_random_uuid()::text, 'UTF8')),
+        now() - interval '1 day', now() - interval '1 minute', w FROM generate_series(1, k);
+    FOR j IN 1..k LOOP
+      INSERT INTO ops.selection_snapshots (tenant_id, query_fingerprint, expires_at)
+        VALUES (t, 'c35-rh', now() - interval '1 minute') RETURNING selection_snapshot_id INTO s;
+      INSERT INTO ops.selection_snapshot_items (selection_snapshot_id, tenant_id, item_id, ordinal)
+        SELECT s, t, gen_random_uuid(), g - 1 FROM generate_series(1, 3) g;
+    END LOOP;
+    INSERT INTO control.rate_buckets (tenant_id, subject_kind, subject_id, operation, bucket_key, capacity, tokens,
+        refill_per_second, updated_at)
+      SELECT t, 'tenant', 'c35-rh-' || g, 'mcp.read', 'default', 5, 5, 1, now() - interval '2 hours'
+      FROM generate_series(1, k) g;
+    INSERT INTO ops.jobs (tenant_id, job_type, status, idempotency_key, created_at)
+      SELECT t, 'c35.rehearsal', CASE WHEN g % 2 = 0 THEN 'DONE' ELSE 'DEAD' END, gen_random_uuid()::text,
+        now() - interval '2 hours' FROM generate_series(1, k) g;
+    sc := gen_random_uuid();
+    INSERT INTO projection.stream_checkpoints (tenant_id, scope_kind, scope_id, domain, projection_kind,
+        projection_version, issued_highwater) VALUES (t, 'workspace', sc, 'code', 'retrieval_card', 'v1', 1);
+    INSERT INTO projection.stream_log (tenant_id, scope_kind, scope_id, domain, projection_kind, projection_version,
+        stream_seq, commit_seq, state, issued_at)
+      VALUES (t, 'workspace', sc, 'code', 'retrieval_card', 'v1', 1, i, 'ISSUED', now() - interval '1 hour');
+    INSERT INTO control.private_reasoning_domains (tenant_id, name) VALUES (t, 'c35 rh')
+      RETURNING reasoning_domain_id INTO d;
+    INSERT INTO private.evidence_objects (tenant_id, evidence_kind, payload_sha256, data_class, origin_class,
+        visibility_class, reasoning_domain_id)
+      VALUES (t, 'EVENT', sha256(convert_to('c35-rh-' || i, 'UTF8')), 'INTERNAL', 'DirectUserInput',
+        'TENANT_SHARED', d) RETURNING evidence_id INTO e;
+    INSERT INTO private.events (event_id, event_kind, payload) VALUES (e, 'USER_MESSAGE', '{}');
+    -- DONE: the Evidence was distilled; only then is an ISSUED ticket an orphan (a PENDING / PROCESSING carrier is
+    -- held back by the claim on purpose and sweep_lost leaves it, ADR-0062 D-L).
+    INSERT INTO ops.outbox (tenant_id, commit_seq, stream_seq, event_type, evidence_id, status)
+      VALUES (t, i, 1, 'EVIDENCE_ACCEPTED', e, 'DONE');
+    INSERT INTO private.memory_records (tenant_id, memory_type, content, visibility_class, authority_class,
+        confidence, status, asserted_at)
+      VALUES (t, 'NOTE', '{"title":"c35 rehearsal"}', 'TENANT_SHARED', 'PrivateKnowledge', 0.9, 'active', now())
+      RETURNING memory_id INTO m;
+    INSERT INTO private.memory_evidence (memory_id, evidence_id, role, ordinal) VALUES (m, e, 'PRIMARY', 0);
+  END LOOP;
+  -- The orphans took commit_seq 1..8 by hand; the reissue door draws from the sequence.
+  PERFORM setval('ops.commit_seq_seq', 100);
+END $do$;
+MDSQL
+then
+  MD_SETUP_OK=1
+fi
+# Seeded counts per purge door, read once before the daemon starts (the receipts-balance baseline).
+MD_SEEDED=$(MDQ "select (select count(*) from control.confirm_tokens where operation='c35.rh')||' '||(select count(*) from ops.selection_snapshots where query_fingerprint='c35-rh')||' '||(select count(*) from control.rate_buckets where subject_id like 'c35-rh-%')||' '||(select count(*) from ops.jobs where job_type='c35.rehearsal')")
+echo "maintenance daemon db: $MD_DB setup_ok=$MD_SETUP_OK k=$MD_K seeded(confirm snapshots buckets jobs)=$MD_SEEDED orphans=$(MDQ "select count(*) from projection.stream_log where state='ISSUED'") migrate: $(tail -1 $EV/maintenance-migrate.log)" | tee -a $EV/rehearsal.log
+print -r -- $MD_DB > $S/md.db   # for the TW twin's safety net: the one database name this run may drop
 for i in $(seq 1 30); do code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/mcp -H 'Origin: http://127.0.0.1:8080' --data '{}' 2>/dev/null); [ "$code" != "000" ] && break; sleep 1; done
 echo "gateway http=$code pw=$PW_PID rw=$RW_PID rp=$RP_PID gw=$GW_PID mh=$MH_PID" | tee -a $EV/rehearsal.log
 ls -la $SOCK | tee -a $EV/rehearsal.log
@@ -433,11 +564,29 @@ wait_ready gateway gw_readyz
 # ADR-0061 D-D: health serve answers 200 only while its latest sample succeeded and is fresh.
 mh_readyz() { curl -fsS -o /dev/null http://127.0.0.1:${OPS_PORTS[humaux-maintenance:health-serve]}/metrics; }
 wait_ready maintenance-health-serve mh_readyz
+# ADR-0062 D-A: the daemon answers 200 only after a finished cycle with no failed call.
+md_readyz() { curl -fsS -o /dev/null http://127.0.0.1:${OPS_PORTS[humaux-maintenance:serve]}/metrics; }
+# Started here, not with the others: the kill -9 below must land while the doors still have seeded rows.
+start_md; MD_PID=$(cat $S/md.pid)
+wait_ready maintenance-serve md_readyz
+# ADR-0062 D-E / D-T: kill -9 while the doors are purging (the first receipt is in, rows are left), then the
+# same daemon again. Every purge is one statement with its receipt, so nothing can half-apply; the receipts
+# balance in step maintenance_drain grades it.
+MD_LEFT_SQL="select (select count(*) from control.confirm_tokens where operation='c35.rh')+(select count(*) from ops.selection_snapshots where query_fingerprint='c35-rh')+(select count(*) from control.rate_buckets where subject_id like 'c35-rh-%')+(select count(*) from ops.jobs where job_type='c35.rehearsal')"
+MD_K9_T0=$(date +%s); MD_K9_RECEIPTS=0
+while [ $(( $(date +%s) - MD_K9_T0 )) -le 60 ]; do
+  MD_K9_RECEIPTS=$(MDQ "select count(*) from ops.maintenance_receipts"); [ "${MD_K9_RECEIPTS:-0}" -gt 0 ] 2>/dev/null && break; sleep 0.2
+done
+own_signal $S/md.pid humaux-maintenance 9 15 | tee -a $EV/rehearsal.log
+MD_K9_LEFT=$(MDQ "$MD_LEFT_SQL")
+start_md
+wait_ready maintenance-serve-after-kill9 md_readyz
+echo "maintenance daemon: kill -9 after ${MD_K9_RECEIPTS:-0} receipt(s) with ${MD_K9_LEFT:-?} seeded row(s) left; restarted pid $(cat $S/md.pid)" | tee -a $EV/rehearsal.log
 
 # ---------- 2c. observability: Prometheus, Alertmanager, collector (ADR-0061 D-G / D-K) ----------
 # The pinned host binaries (deploy/prometheus/pinned-tool.sh: sha256 + version, never PATH; exit 2
 # = a pin variable unset) run the repo's own configs, rendered only where the deployer contract in
-# prometheus.yml / alertmanager.yml says: the targets file (exactly the seven OPS_PORTS entries),
+# prometheus.yml / alertmanager.yml says: the targets file (exactly the eight OPS_PORTS entries),
 # the rule paths, the Alertmanager address, the git sha, the webhook URL files. Every listener is
 # loopback and owned through its pidfile; the readiness waits below are part of the gate above.
 step observability
@@ -448,6 +597,7 @@ obs_stop() { # every observability process this script started, each through its
   for p in "promd prometheus" "gwd humaux-gateway" "prom prometheus" "am alertmanager" "otel otelcol" "sink $(cat $S/sink.comm 2>/dev/null)"; do
     set -- ${=p}; [ -f $S/$1.pid ] && own_signal $S/$1.pid "$2" TERM 30
   done
+  md_teardown   # card 35: the daemon and its throwaway database go on every exit path too
   return 0
 }
 # A previous run's pidfiles are dropped, never acted on: a PID recorded then may name someone else's
@@ -1871,17 +2021,19 @@ done
 echo "pst derived backlog of the seeded tenants after ${i}s: $PST_BACKLOG" | tee -a $EV/rehearsal.log
 assert_eq "pst_leaves_no_derived_backlog(n=$(PGQ "select count(*) from ops.jobs where tenant_id in ($SEEDED) and left(job_type,8)='DERIVED_'") jobs)" "$PST_BACKLOG" 0
 # ---------- 6b2. metrics_scrape (ADR-0061 D-H / D-K) ----------
-# Here, after the traffic and while all seven resident modes run (the resident distiller and the
+# Here, after the traffic and while all eight resident modes run (the resident distiller and the
 # consolidation worker live only inside this step and the soak): every ops endpoint is scraped and
 # graded against its own binary's `--metrics-families` and §41.2, and the production prometheus.yml's
-# scrape path is proven by `up` being EXACTLY the seven OPS_PORTS pairs at 1 — never "every result".
+# scrape path is proven by `up` being EXACTLY the eight OPS_PORTS pairs at 1 — never "every result".
 step metrics_scrape
 mkdir -p $EV/metrics; MS_ARGS=(); MS_BAD=0; ST_BAD=0
 for k in ${(ko)OPS_PORTS}; do
   MS_F=$EV/metrics/${k/:/-}.prom
   curl -fsS -o $MS_F http://127.0.0.1:${OPS_PORTS[$k]}/metrics \
     || { echo "metrics_scrape: $k /metrics did not answer 200 on ${OPS_PORTS[$k]}" | tee -a $EV/rehearsal.log; MS_BAD=$((MS_BAD+1)); }
-  MS_ARGS+=(--exposition "${${k%%:*}#humaux-}=$MS_F")
+  # ADR-0062 D-S: `humaux-maintenance --serve` is graded against `--serve --metrics-families` (its own families).
+  MS_P=${${k%%:*}#humaux-}; [ "$k" = humaux-maintenance:serve ] && MS_P=maintenance-serve
+  MS_ARGS+=(--exposition "$MS_P=$MS_F")
   curl -fsS http://127.0.0.1:${OPS_PORTS[$k]}/status 2>/dev/null > $EV/metrics/${k/:/-}.status.json
   python3 -c "import sys,json; sys.exit(0 if json.load(open(sys.argv[1])).get('process') else 1)" $EV/metrics/${k/:/-}.status.json 2>/dev/null \
     || { echo "metrics_scrape: $k /status is not JSON naming its process" | tee -a $EV/rehearsal.log; ST_BAD=$((ST_BAD+1)); }
@@ -1914,7 +2066,7 @@ PYEOF
 UP_RC=$?
 tee -a $EV/rehearsal.log < $EV/metrics/up.txt
 DG_SUM=$(cat $EV/metrics/*.prom | awk '/^degrade_total\{/ {s += $NF} END {printf "%d", s}')
-echo "metrics_scrape: degrade_total summed over the seven scrapes = $DG_SUM" | tee -a $EV/rehearsal.log
+echo "metrics_scrape: degrade_total summed over the eight scrapes = $DG_SUM" | tee -a $EV/rehearsal.log
 # card 34b (§41.2, §42 no-output stage): this step's resident distiller distilled real Evidence, so its three
 # private-plane counters are above 0. The §42 injection (a parser stub ⇒ runs up, outputs flat) is proven by the
 # promtool test of DistillNoOutput, not here: a stub parser in the deployed binary is a code change (ADR-0061).
@@ -1926,7 +2078,7 @@ done
 assert_eq "metrics_scrape_every_ops_endpoint_answers(n=${#OPS_PORTS})" "$MS_BAD" 0
 assert_eq "metrics_scrape_status_is_json_naming_its_process(n=${#OPS_PORTS})" "$ST_BAD" 0
 assert_eq "metrics_scrape_matches_metrics_families_and_41_2(n=${#OPS_PORTS} scrapes)" "$MR_RC" 0
-assert_eq "prometheus_up_is_exactly_the_seven_ops_pairs" "$UP_RC" 0
+assert_eq "prometheus_up_is_exactly_the_eight_ops_pairs" "$UP_RC" 0
 assert_eq "watchdog_receipt_carries_the_deployed_git_sha(sha=${DEPLOY_SHA:-none})" "$WD_OK" 1
 
 # ---------- 6b3. admin_probes: the §4.4 catalog over role_admin (ADR-0061 D-J) ----------
@@ -2125,8 +2277,23 @@ echo \$! > $S/rp.pid
 sleep 3
 exit 0
 EOF
+# …and the resident maintenance daemon (ADR-0062 D-T): kill -9 while its doors purge the throwaway database; the
+# receipts balance in step maintenance_drain proves no purge half-applied. Same $MD_ENV as start_md.
+cat > $S/soak_chaos_md.sh <<EOF
+#!/bin/sh
+cd $R || exit 1
+. $S/own_signal.sh
+own_signal $S/md.pid humaux-maintenance 9 || exit 1
+(
+$MD_ENV
+exec "$BIN_DIR"/humaux-maintenance --serve >> $EV/maintenance-serve.log 2>&1
+) &
+echo \$! > $S/md.pid
+sleep 3
+exit 0
+EOF
 chmod +x $S/soak_probe_rw.sh $S/soak_probe_pw.sh \
-         $S/soak_chaos_rw.sh $S/soak_chaos_ds.sh $S/soak_chaos_cw.sh $S/soak_chaos_rp.sh
+         $S/soak_chaos_rw.sh $S/soak_chaos_ds.sh $S/soak_chaos_cw.sh $S/soak_chaos_rp.sh $S/soak_chaos_md.sh
 
 # macOS XProtect assesses each freshly linked binary on FIRST exec (~98 s, strictly serial).
 # Warm every binary the soak launches or probes BEFORE the timed window; never widen a
@@ -2203,9 +2370,9 @@ cargo run -q -p xtask -- soak \
   --probe-cmd "$S/soak_probe_rw.sh" \
   --probe-cmd "$S/soak_probe_pw.sh" \
   --watch-pidfile gw=$S/gw.pid --watch-pidfile rw=$S/rw.pid --watch-pidfile pw=$S/pw.pid \
-  --watch-pidfile ds=$S/ds.pid --watch-pidfile cw=$S/cw.pid --watch-pidfile rp=$S/rp.pid \
+  --watch-pidfile ds=$S/ds.pid --watch-pidfile cw=$S/cw.pid --watch-pidfile rp=$S/rp.pid --watch-pidfile md=$S/md.pid \
   --chaos-every-secs ${SOAK_CHAOS_SECS:-90} --chaos-grace-secs ${SOAK_CHAOS_GRACE:-60} \
-  --chaos-cmd "$S/soak_chaos_rp.sh" --chaos-cmd "$S/soak_chaos_rw.sh" --chaos-cmd "$S/soak_chaos_ds.sh" --chaos-cmd "$S/soak_chaos_cw.sh" \
+  --chaos-cmd "$S/soak_chaos_rp.sh" --chaos-cmd "$S/soak_chaos_md.sh" --chaos-cmd "$S/soak_chaos_rw.sh" --chaos-cmd "$S/soak_chaos_ds.sh" --chaos-cmd "$S/soak_chaos_cw.sh" \
   --lease-secs 120 --max-rss-mib ${SOAK_MAX_RSS_MIB:-2048} --max-db-connections ${SOAK_MAX_CONNS:-120} \
   --max-op-failure-rate ${SOAK_MAX_OP_FAIL:-0.01} \
   --report $EV/soak-report.json 2>&1 | tee -a $EV/rehearsal.log
@@ -2263,6 +2430,51 @@ fi
 # A rehearsal that skipped the soak must SAY so in its own verdict; silence is how "no soak ran
 # in this pass" ended up only in the report's §8.2 instead of in the evidence file.
 [ "${SOAK_RAN:-0}" = "1" ] || echo "NOTE: SOAK_SECS unset — acceptance item (5) NOT witnessed by this run" | tee -a $EV/rehearsal.log
+
+# ---------- 6c2. maintenance_drain: the resident daemon's work on its throwaway database (ADR-0062 D-T, E8) ----------
+# After every kill -9 (the explicit one in step readyz, and the soak's rotation when it ran): the seeded work is
+# gone and, per purge door, seeded − remaining = Σ ops.maintenance_receipts.affected (snapshots counted in
+# snapshots) — a multi-statement or receipt-less purge interrupted by kill -9 breaks the equality; every seeded
+# orphan is LOST with exactly one reissue; the restarted daemon finished a cycle and answers 200.
+step maintenance_drain
+MD_D0=$(date +%s); MD_LEFT=-1
+while [ $(( $(date +%s) - MD_D0 )) -le $(( MD_K * 8 / 2 + 120 )) ]; do
+  MD_LEFT=$(MDQ "$MD_LEFT_SQL"); [ "$MD_LEFT" = 0 ] && break; sleep 3
+done
+MD_REMAINING=$(MDQ "select (select count(*) from control.confirm_tokens where operation='c35.rh')||' '||(select count(*) from ops.selection_snapshots where query_fingerprint='c35-rh')||' '||(select count(*) from control.rate_buckets where subject_id like 'c35-rh-%')||' '||(select count(*) from ops.jobs where job_type='c35.rehearsal')")
+MD_RECEIPTS=$(MDQ "select coalesce(sum(affected) filter (where task='confirm_tokens'),0)||' '||coalesce(sum(affected) filter (where task='selection_snapshots'),0)||' '||coalesce(sum(affected) filter (where task='rate_buckets'),0)||' '||coalesce(sum(affected) filter (where task='terminal_jobs'),0) from ops.maintenance_receipts")
+MD_BAL_BAD=0; MD_BAL_LINE=""; MD_TASKS=(confirm_tokens selection_snapshots rate_buckets terminal_jobs)
+MD_SA=(${=MD_SEEDED}); MD_RA=(${=MD_REMAINING}); MD_AA=(${=MD_RECEIPTS})
+for MD_I in 1 2 3 4; do
+  MD_T=${MD_TASKS[$MD_I]}; MD_S=${MD_SA[$MD_I]:-}; MD_R=${MD_RA[$MD_I]:-}; MD_A=${MD_AA[$MD_I]:-}
+  MD_OK=0; [ -n "$MD_S" ] && [ -n "$MD_R" ] && [ -n "$MD_A" ] && [ $(( MD_S - MD_R )) -eq "$MD_A" ] 2>/dev/null && [ "$MD_S" -gt 0 ] && MD_OK=1
+  [ $MD_OK = 1 ] || MD_BAL_BAD=$((MD_BAL_BAD + 1))
+  echo "maintenance receipts balance $MD_T: seeded=$MD_S remaining=$MD_R receipts_affected=$MD_A ok=$MD_OK" | tee -a $EV/rehearsal.log
+  MD_BAL_LINE+="${MD_BAL_LINE:+,}$MD_T=$MD_S-$MD_R/$MD_A"
+done
+MD_ORPHANS=$(MDQ "select count(*) from projection.stream_log s where s.stream_seq = 1 and s.commit_seq between 1 and 8 and s.state = 'LOST' and (select count(*) from projection.ticket_reissues r where r.tenant_id = s.tenant_id and r.source_commit_seq = s.commit_seq) = 1")
+MD_STATUS=$(curl -fsS http://127.0.0.1:${OPS_PORTS[humaux-maintenance:serve]}/status 2>/dev/null | python3 -c "
+import sys,json
+try: d=json.load(sys.stdin); print('%d %s %s' % (d.get('cycles',0), d['readiness']['state'], ','.join('%s:%s/%s' % (t['task'], t['affected'], t['failed']) for t in d.get('last_cycle') or [])))
+except Exception as e: print('0 unparsed(%s) -' % type(e).__name__)")
+MD_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${OPS_PORTS[humaux-maintenance:serve]}/metrics)
+MD_CURRENT=$(md_daemon_db)
+# ADR-0062 D-N (0223): a LOST ticket's reissue waits the cool-down from its sweep (lost_at), and one memory is
+# reissued at most once per cool-down window. With no runner here every reissued ticket goes LOST again, so the
+# chain repeats for the whole soak; each link must keep both spacings.
+MD_COOLDOWN=2
+MD_REISSUE_EARLY=$(MDQ "select count(*) from projection.ticket_reissues r join projection.stream_log s on s.tenant_id = r.tenant_id and s.commit_seq = r.source_commit_seq where r.source_state = 'LOST' and (s.lost_at is null or r.reissued_at < s.lost_at + interval '$MD_COOLDOWN seconds')")
+MD_REISSUE_DENSE=$(MDQ "select count(*) from (select r.reissued_at - lag(r.reissued_at) over (partition by r.tenant_id, o.evidence_id order by r.reissued_at) as gap from projection.ticket_reissues r join ops.outbox o on o.tenant_id = r.tenant_id and o.commit_seq = r.reissued_commit_seq) g where g.gap < interval '$MD_COOLDOWN seconds'")
+MD_REISSUES=$(MDQ "select count(*) from projection.ticket_reissues")
+echo "maintenance_drain: left=$MD_LEFT after $(( $(date +%s) - MD_D0 ))s; orphans LOST+reissued once=$MD_ORPHANS/8; status(cycles state last_cycle)=$MD_STATUS /metrics=$MD_CODE daemon_db=$MD_CURRENT" | tee -a $EV/rehearsal.log
+assert_eq "maintenance_daemon_db_is_throwaway(db=$MD_CURRENT, shared=$DB, spawn_refused=$MD_SPAWN_REFUSED)" "$([ "$MD_CURRENT" = "$MD_DB" ] && [ "$MD_CURRENT" != "$DB" ] && [ "$MD_SPAWN_REFUSED" = 0 ] && echo 1 || echo 0)" 1
+assert_eq "maintenance_reissue_waits_cooldown_after_lost(reissues=$MD_REISSUES, dense=${MD_REISSUE_DENSE:-?})" "${MD_REISSUE_EARLY:-x}:${MD_REISSUE_DENSE:-x}" "0:0"
+assert_eq "maintenance_daemon_setup_migrated_and_seeded(k=$MD_K)" "$MD_SETUP_OK" 1
+assert_gt "maintenance_kill9_landed_mid_purge(receipts_before=${MD_K9_RECEIPTS:-0})" "${MD_K9_LEFT:-0}" 0
+assert_eq "maintenance_soak_receipts_balance($MD_BAL_LINE)" "$MD_BAL_BAD" 0
+assert_eq "maintenance_seeded_work_drained" "$MD_LEFT" 0
+assert_eq "maintenance_every_orphan_lost_and_reissued_once" "$MD_ORPHANS" 8
+assert_eq "maintenance_daemon_cycled_and_ready_after_restart($MD_STATUS)" "$([ "${MD_STATUS%% *}" -ge 1 ] 2>/dev/null && [ "$MD_CODE" = 200 ] && echo 1 || echo 0)" 1
 
 # ADR-0058 R11: every DEAD distill of the run, graded under its own name. Classes are the job's
 # `last_error_class` plus, for a refused reply, the parser/tool-shape reason the worker printed

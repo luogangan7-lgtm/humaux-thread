@@ -3,19 +3,20 @@
 //!   `ISSUED -> LOST` patrol (through [`MaintenanceDbPool`]).
 //! Depends-on: crates=[humaux-domain, humaux-projection, humaux-retrieval, humaux-testkit, sqlx, tokio];
 //!   services=[PostgreSQL(any)
-//!   r=[ops.jobs, projection.processing_gaps] w=[projection.stream_checkpoints, projection.stream_log]
+//!   r=[ops.jobs, ops.outbox, projection.processing_gaps] w=[projection.stream_checkpoints, projection.stream_log]
 //!   x=[projection.retire_failed_ticket, projection.stream_point_ledger], PostgreSQL(role_maintenance),
 //!   PostgreSQL(role_retrieval_worker) x=[projection.claim_issued_tickets, projection.unplaced_issued_tickets]];
 //!   env=[HUMAUX_TEST_PG_DSN];
 //!   modules=[adapters::placement_repo, adapters::postgres, adapters::qdrant, adapters::retrieve, domain::dataclass, domain::egress, domain::identity,
 //!   projection::stream, retrieval::completeness]
-//! Called-by: [adapters::context_repo, adapters::projection_worker, adapters::retrieve, adapters::serving_repo, retrieval-worker::main, tests, xtask::projection_serve]
+//! Called-by: [adapters::context_repo, adapters::projection_worker, adapters::retrieve, adapters::serving_repo, maintenance::serve, retrieval-worker::main, tests, xtask::projection_serve]
 //! Invariants: [every function opens its own transaction and sets humaux.tenant_id before touching FORCE-RLS stream
 //!   tables (otherwise it would silently see zero rows) — except the two ADR-0052 definer calls, which are the only
 //!   cross-tenant reads/claims of stream_log; every settle/retry/release write is fenced on (lease_owner, attempts), so
 //!   a worker whose lease was reclaimed writes 0 rows; consistency arithmetic lives in humaux_projection::stream;
-//!   A2's point reading and the projection-lag age are read in the ledger's snapshot (ADR-0057 D-L/D-D)]
-//! Spec: Baseline §6.2.0; §11; §15.2; §23.1②; ADR-0052; ADR-0057
+//!   A2's point reading and the projection-lag age are read in the ledger's snapshot (ADR-0057 D-L/D-D);
+//!   sweep_lost never takes a leased or backing-off ticket and moves at most its LIMIT per call (ADR-0062 D-L)]
+//! Spec: Baseline §6.2.0; §11; §15.2; §23.1②; ADR-0052; ADR-0057; ADR-0062
 //!
 //! The consistency arithmetic itself lives in
 //! `humaux_projection::stream` (no IO, unit-tested there); this module only fetches the
@@ -477,44 +478,78 @@ pub async fn retire_failed(
 /// [`StreamKey::stream_key_text`](humaux_projection::stream::StreamKey::stream_key_text) —
 /// this `UPDATE` builds the identical `:`-joined text in SQL so it matches whatever a job
 /// writer bound via that Rust function) older than `sla` becomes an explicit gap.
-/// `WAITING_KEY` / `RETRY_WAIT` rows are structurally excluded — the `WHERE s.state =
-/// 'ISSUED'` guard means this statement can never touch them regardless of how long they have
-/// sat (§15.2: "永远不能仅因为墙钟时间而转 LOST"). Runs under [`MaintenanceDbPool`] — the only
-/// role `stream_log_guard_state_transition` (0011) permits to make this transition.
+/// `WAITING_KEY` / `RETRY_WAIT` rows are structurally excluded — the `state = 'ISSUED'` guard
+/// means this statement can never touch them regardless of how long they have sat (§15.2:
+/// "永远不能仅因为墙钟时间而转 LOST"). Runs under [`MaintenanceDbPool`] — the only role
+/// `stream_log_guard_state_transition` (0011) permits to make this transition, which it checks
+/// on `current_user`, so this stays a direct UPDATE and never moves behind a definer.
+///
+/// ADR-0062 D-L (ADR-0052 tickets are claimed on `stream_log` itself): a ticket under a live
+/// runner lease, backing off ([`RETRY_PREDICATE`], the `RETRY_WAIT` equivalent), or held back by
+/// the claim while its Evidence's `EVIDENCE_ACCEPTED` outbox row is still `PENDING`/`PROCESSING`
+/// is never an orphan; at most `limit` tickets move per call, oldest `issued_at` first, and a row
+/// another transaction holds is skipped, never waited on. A swept ticket records `lost_at`.
 ///
 /// Scoped to one `tenant_id` (see this module's doc for why: RLS has no cross-tenant carve-out
-/// for `role_maintenance`) — a periodic patrol job loops `control.tenants` under a connection
-/// that *can* enumerate tenants (out of this function's scope) and calls this once per tenant.
-/// Returns the number of rows swept for that tenant.
+/// for `role_maintenance`); `humaux-maintenance --serve` walks the tenants and calls this once per
+/// tenant. Returns the number of rows swept for that tenant.
 pub async fn sweep_lost(
     pool: &MaintenanceDbPool,
     tenant_id: Uuid,
     sla: std::time::Duration,
+    limit: i64,
 ) -> Result<u64, StreamRepoError> {
     // dep: PostgreSQL(role_maintenance) — transaction entry for `sweep_lost`
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
 
-    let result = sqlx::query(
+    // RETRY_PREDICATE's columns are unqualified on purpose: they resolve to `v`, the only
+    // stream_log in that scope. `IS NOT TRUE`, not `NOT`: a NULL `next_attempt_at` must not
+    // make the whole predicate NULL and hide an orphan.
+    // ADR-0062 D-L: the outbox NOT EXISTS is 0176's claim hold-back verbatim. A ticket whose Evidence is still being
+    // distilled is held back by the claim on purpose and is in flight (§15.2); the legacy ops.jobs test cannot see
+    // that, because the 0164 trigger writes DERIVED_DISTILL jobs without stream_key/stream_seq.
+    // ADR-0062 D-N: `lost_at` is the LOST transition's clock; the reissue door counts its cool-down from it (0223).
+    let result = sqlx::query(&format!(
         "UPDATE projection.stream_log s \
-            SET state = 'LOST', error_class = 'ORPHANED_PIPELINE_ITEM' \
-          WHERE s.tenant_id = $1 \
-            AND s.state = 'ISSUED' \
-            AND s.issued_at < now() - (interval '1 second' * $2::bigint) \
-            AND NOT EXISTS ( \
-                SELECT 1 FROM ops.jobs j \
-                 WHERE j.tenant_id = $1 \
-                   AND j.stream_key = ( \
-                         s.tenant_id::text || ':' || s.scope_kind || ':' || s.scope_id::text \
-                         || ':' || s.domain || ':' || s.projection_kind || ':' \
-                         || s.projection_version \
-                       ) \
-                   AND j.stream_seq = s.stream_seq \
-                   AND j.status IN ('PENDING','PROCESSING','WAITING_KEY','RETRY_WAIT') \
-            )",
-    )
+            SET state = 'LOST', error_class = 'ORPHANED_PIPELINE_ITEM', lost_at = now() \
+          WHERE s.state = 'ISSUED' \
+            AND (s.tenant_id, s.scope_kind, s.scope_id, s.domain, s.projection_kind, \
+                 s.projection_version, s.stream_seq) IN ( \
+              SELECT v.tenant_id, v.scope_kind, v.scope_id, v.domain, v.projection_kind, \
+                     v.projection_version, v.stream_seq \
+                FROM projection.stream_log v \
+               WHERE v.tenant_id = $1 \
+                 AND v.state = 'ISSUED' \
+                 AND v.issued_at < now() - (interval '1 second' * $2::bigint) \
+                 AND (v.lease_expires_at IS NULL OR v.lease_expires_at < now()) \
+                 AND ({RETRY_PREDICATE}) IS NOT TRUE \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM ops.jobs j \
+                      WHERE j.tenant_id = $1 \
+                        AND j.stream_key = ( \
+                              v.tenant_id::text || ':' || v.scope_kind || ':' || v.scope_id::text \
+                              || ':' || v.domain || ':' || v.projection_kind || ':' \
+                              || v.projection_version \
+                            ) \
+                        AND j.stream_seq = v.stream_seq \
+                        AND j.status IN ('PENDING','PROCESSING','WAITING_KEY','RETRY_WAIT') \
+                 ) \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM ops.outbox o \
+                      WHERE o.tenant_id = v.tenant_id \
+                        AND o.commit_seq = v.commit_seq \
+                        AND o.event_type = 'EVIDENCE_ACCEPTED' \
+                        AND o.status IN ('PENDING','PROCESSING') \
+                 ) \
+               ORDER BY v.issued_at \
+               LIMIT $3 \
+               FOR UPDATE SKIP LOCKED \
+            )"
+    ))
     .bind(tenant_id)
     .bind(sla.as_secs() as i64)
+    .bind(limit)
     .execute(&mut *txn)
     .await?;
     txn.commit().await?;

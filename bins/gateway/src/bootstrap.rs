@@ -9,7 +9,8 @@
 //!   HUMAUX_GATEWAY_CALLER_ID, HUMAUX_GATEWAY_CELL_ID, HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS,
 //!   HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS, HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS,
 //!   HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX,
-//!   HUMAUX_GATEWAY_EMBEDDING_DIMENSION, HUMAUX_GATEWAY_EMBEDDING_VERSION, HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS,
+//!   HUMAUX_GATEWAY_EMBEDDING_DIMENSION, HUMAUX_GATEWAY_EMBEDDING_VERSION, HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP,
+//!   HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS, HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS,
 //!   HUMAUX_GATEWAY_GLOBAL_DENYLIST, HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST,
 //!   HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS, HUMAUX_GATEWAY_MAX_FORWARDED_HOPS,
 //!   HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES, HUMAUX_GATEWAY_METRICS_ADDR, HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS,
@@ -86,6 +87,8 @@ use crate::{
 };
 
 const PREFIX: &str = "HUMAUX_GATEWAY_";
+const ENUMERATION_TTL_KEY: &str = "HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS";
+const ENUMERATION_MANIFEST_CAP_KEY: &str = "HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP";
 
 /// A fail-closed bootstrap error. It intentionally contains configuration keys,
 /// never a DSN, pepper, or another secret value.
@@ -145,6 +148,10 @@ pub struct GatewayBootstrap {
     metrics_addr: SocketAddr,
     /// ADR-0061 D-F `HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS`.
     readiness_refresh: Duration,
+    /// ADR-0062 D-K `HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS`: one memory.enumerate manifest segment's lifetime.
+    enumeration_ttl: Duration,
+    /// ADR-0062 D-K `HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP`: the most ids one manifest segment stores.
+    enumeration_manifest_cap: usize,
     /// ADR-0061 D-B: one `{name, source, value | secret}` row per `registry()` entry, for `/status`.
     effective_config: Value,
 }
@@ -298,7 +305,9 @@ impl GatewayBootstrap {
                 "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS",
                 "must be positive seconds",
             )
-        })?;
+        })?
+        .with_enumeration(self.enumeration_ttl, self.enumeration_manifest_cap)
+        .map_err(|_| BootstrapError::new(ENUMERATION_TTL_KEY, "must be positive seconds"))?;
         let mut semantic = None;
         match self.semantic_recall {
             Some(config) => {
@@ -360,6 +369,14 @@ impl GatewayBootstrap {
             required(&effective, READINESS_REFRESH_KEY)?,
             READINESS_REFRESH_KEY,
         )?;
+        let enumeration_ttl = seconds(
+            required(&effective, ENUMERATION_TTL_KEY)?,
+            ENUMERATION_TTL_KEY,
+        )?;
+        let enumeration_manifest_cap = parse_usize(
+            required(&effective, ENUMERATION_MANIFEST_CAP_KEY)?,
+            ENUMERATION_MANIFEST_CAP_KEY,
+        )?;
 
         Ok(Self {
             bind_addr: parse_bind_addr(required(&effective, "HUMAUX_GATEWAY_BIND_ADDR")?)?,
@@ -378,6 +395,8 @@ impl GatewayBootstrap {
             token_keys,
             metrics_addr,
             readiness_refresh,
+            enumeration_ttl,
+            enumeration_manifest_cap,
             effective_config: effective_config_rows(&registry, &raw, &effective),
         })
     }
@@ -826,6 +845,9 @@ pub fn registry() -> Vec<ConfigEntry> {
         ("MOOD_HALF_LIFE_SECONDS", "u64", false),
         // §78.1: no default — boot-fatal when absent (ADR-0057 D-F, §22.4 projection lag).
         ("PROJECTION_LAG_SECONDS", "u64", false),
+        // ADR-0062 D-K / §78.1: no default — boot-fatal when absent (memory.enumerate manifest lifetime and cap).
+        ("ENUMERATION_TTL_SECONDS", "u64", false),
+        ("ENUMERATION_MANIFEST_CAP", "usize", false),
         ("REMEMBER_SCOPE_KIND", "enum:workspace", false),
         ("REMEMBER_DOMAIN", "string", false),
         ("REMEMBER_PROJECTION_KIND", "string", false),
@@ -1139,6 +1161,8 @@ mod tests {
                 "HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS" => "86400".into(),
                 "HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS" => "21600".into(),
                 "HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS" => "60".into(),
+                "HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS" => "900".into(),
+                "HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP" => "1000".into(),
                 "HUMAUX_GATEWAY_REMEMBER_TENANT_ID" => tenant.to_string(),
                 "HUMAUX_GATEWAY_REMEMBER_WORKSPACE_ID" => workspace.to_string(),
                 "HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND" => "workspace".into(),
@@ -1299,6 +1323,34 @@ mod tests {
             .expect("a zero lag threshold must be refused");
         assert!(error.to_string().contains(key), "{error}");
 
+        assert!(GatewayBootstrap::from_raw(raw()).is_ok());
+    }
+
+    /// ADR-0062 D-K (T-K4): the enumeration TTL and manifest cap have no default — boot without either fails
+    /// naming that key, and zero is refused. Fault: give either registry entry a default.
+    #[test]
+    fn bootstrap_without_enumeration_cap_or_ttl_fails_naming_the_key() {
+        for key in [ENUMERATION_TTL_KEY, ENUMERATION_MANIFEST_CAP_KEY] {
+            assert!(
+                registry()
+                    .iter()
+                    .any(|entry| entry.name == key && entry.default.is_none()),
+                "{key} must be declared without a default"
+            );
+            let mut values = raw();
+            values.remove(key);
+            let error = GatewayBootstrap::from_raw(values)
+                .err()
+                .unwrap_or_else(|| panic!("boot must fail without {key}"));
+            assert!(error.to_string().contains(key), "{error}");
+
+            let mut values = raw();
+            values.insert(key.into(), "0".into());
+            let error = GatewayBootstrap::from_raw(values)
+                .err()
+                .unwrap_or_else(|| panic!("a zero {key} must be refused"));
+            assert!(error.to_string().contains(key), "{error}");
+        }
         assert!(GatewayBootstrap::from_raw(raw()).is_ok());
     }
 

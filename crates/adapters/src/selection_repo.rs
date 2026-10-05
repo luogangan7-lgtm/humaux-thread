@@ -4,8 +4,12 @@
 //!   domain::selection]
 //! Called-by: [adapters::context_repo, tests]
 //! Invariants: [page 1 materializes the whole enumeration in one REPEATABLE READ transaction; later pages read only
-//!   the immutable manifest behind a MAC-signed cursor; a mismatched query or unknown snapshot is a typed error]
-//! Spec: Baseline §20.4
+//!   the immutable manifest behind a MAC-signed cursor; a mismatched query or unknown snapshot is a typed error;
+//!   every page read, gateway and worker path alike, is the one MANIFEST_PAGE_SQL statement, which sees a snapshot
+//!   with its whole manifest or no snapshot, and a snapshot the DB clock has expired is refused (and never continued
+//!   into a new segment) even when the host-clock cursor check passed; a manifest is one INSERT statement;
+//!   a gateway manifest stores at most its cap and records continues_before when it truncates]
+//! Spec: Baseline §20.4; §22.1; ADR-0062 D-H; ADR-0062 D-K
 //!
 //! The worker API uses [`RetrievalWorkerDbPool`]; crate-private manifest
 //! helpers also let `context_repo` authorize and materialize Gateway pages in one RR.
@@ -51,7 +55,7 @@ pub enum SelectionRepoError {
     Cursor(CursorError),
     /// The cursor's `snapshot_id` names no row this tenant can see — either it never existed
     /// under this tenant (RLS makes a cross-tenant id indistinguishable from a nonexistent
-    /// one, which is the point) or `role_maintenance`'s future sweep job has since removed it.
+    /// one, which is the point) or the maintenance purge door (ADR-0062 D-H) has since removed it.
     SnapshotNotFound,
     /// The `ops.selection_snapshots` row's own `query_fingerprint` no longer matches the
     /// cursor's — defense in depth alongside the MAC (see this crate's `0083` migration
@@ -109,6 +113,27 @@ async fn set_tenant_local(
     Ok(())
 }
 
+/// ADR-0062 D-K: the whole manifest is one statement; `ids` order becomes `ordinal` 0..N-1, so the caller's
+/// `memory_id DESC` order is the page order. Replaces a per-id INSERT loop (N round trips inside the minting
+/// REPEATABLE READ transaction, P1-14).
+async fn insert_manifest_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: Uuid,
+    tenant_id: Uuid,
+    ids: &[Uuid],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO ops.selection_snapshot_items (selection_snapshot_id, tenant_id, item_id, ordinal) \
+         SELECT $1, $2, u.id, u.ord - 1 FROM unnest($3::uuid[]) WITH ORDINALITY AS u(id, ord)",
+    )
+    .bind(snapshot_id)
+    .bind(tenant_id)
+    .bind(ids)
+    .execute(&mut **txn)
+    .await?;
+    Ok(())
+}
+
 /// Bundles the three fields both `begin_enumeration_snapshot` and `fetch_enumeration_page`
 /// already know about a snapshot before reading its manifest — keeps
 /// `fetch_page_from_manifest` under clippy's `too_many_arguments` threshold without inventing
@@ -124,12 +149,12 @@ fn build_page(
     tenant_id: Uuid,
     query_fingerprint: &str,
     expires_at_unix: i64,
-    rows: Vec<sqlx::postgres::PgRow>,
+    rows: &[(Uuid, i64)],
     requested_page_size: i64,
     mac_key: &[u8],
 ) -> SnapshotPage {
-    let items: Vec<Uuid> = rows.iter().map(|r| r.get::<Uuid, _>(0)).collect();
-    let last_ordinal: Option<i64> = rows.last().map(|r| r.get::<i64, _>(1));
+    let items: Vec<Uuid> = rows.iter().map(|(item, _)| *item).collect();
+    let last_ordinal: Option<i64> = rows.last().map(|(_, ordinal)| *ordinal);
     // A full page might still be the last one (universe size an exact multiple of
     // page_size) — that costs one extra empty-page round trip in the rare exact-multiple
     // case, never a missed or duplicated row, so it is not worth a second COUNT query to
@@ -206,20 +231,8 @@ pub async fn begin_enumeration_snapshot(
     .fetch_all(&mut *txn)
     .await?;
 
-    for (ordinal, row) in rows.iter().enumerate() {
-        let item_id: Uuid = row.get(0);
-        sqlx::query(
-            "INSERT INTO ops.selection_snapshot_items \
-               (selection_snapshot_id, tenant_id, item_id, ordinal) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(snapshot_id)
-        .bind(tenant_id)
-        .bind(item_id)
-        .bind(ordinal as i64)
-        .execute(&mut *txn)
-        .await?;
-    }
+    let ids: Vec<Uuid> = rows.iter().map(|row| row.get(0)).collect();
+    insert_manifest_in_txn(&mut txn, snapshot_id, tenant_id, &ids).await?;
     txn.commit().await?;
 
     let meta = SnapshotMeta {
@@ -263,12 +276,64 @@ pub async fn fetch_enumeration_page(
     .await
 }
 
-/// Shared read path for both page 1 (called right after materialization, `after_ordinal =
-/// -1`) and page 2+ (called with the previous page's `last_ordinal`). Confirms the snapshot
-/// row is still visible under this tenant (RLS-scoped — a cross-tenant or nonexistent
-/// `snapshot_id` both read back zero rows, hence one shared `SnapshotNotFound`) and that its
-/// `query_fingerprint` still matches before reading the manifest — defense in depth alongside
-/// the MAC, per this module's `QueryMismatch` doc.
+/// ADR-0062 D-H: the one page statement, read by every page of both enumeration paths (the gateway's
+/// `memory.enumerate` and the worker API). The snapshot row, its DB-clock liveness and the page of items come from
+/// one MVCC snapshot, and the purge door deletes a snapshot with its items in one statement, so a read sees the
+/// whole manifest or no snapshot row: never a found snapshot with an empty page. `live` uses the purge's own clock
+/// (`expires_at < now()` there). Public so the race test runs the production text.
+pub const MANIFEST_PAGE_SQL: &str = "SELECT s.query_fingerprint, s.expires_at > now() AS live, s.continues_before, \
+     i.item_id, i.ordinal \
+     FROM ops.selection_snapshots s \
+     LEFT JOIN LATERAL (SELECT item_id, ordinal FROM ops.selection_snapshot_items \
+                         WHERE selection_snapshot_id = s.selection_snapshot_id AND ordinal > $2 \
+                         ORDER BY ordinal LIMIT $3) i ON true \
+     WHERE s.selection_snapshot_id = $1 \
+     ORDER BY i.ordinal";
+
+/// One page of a manifest as [`MANIFEST_PAGE_SQL`] read it, before either caller maps it to its own error type.
+struct ManifestRead {
+    query_fingerprint: String,
+    live: bool,
+    continues_before: Option<Uuid>,
+    items: Vec<(Uuid, i64)>,
+}
+
+/// The one caller of [`MANIFEST_PAGE_SQL`]: `None` when no snapshot row is visible (RLS makes a cross-tenant id read
+/// like a nonexistent or purged one).
+async fn read_manifest_page(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: Uuid,
+    after_ordinal: i64,
+    page_size: i64,
+) -> Result<Option<ManifestRead>, sqlx::Error> {
+    let rows = sqlx::query(MANIFEST_PAGE_SQL)
+        .bind(snapshot_id)
+        .bind(after_ordinal)
+        .bind(page_size)
+        .fetch_all(&mut **txn)
+        .await?;
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    // LEFT JOIN: a snapshot with no item past `after_ordinal` is one row with a NULL item.
+    let mut items = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let Some(item) = row.try_get::<Option<Uuid>, _>("item_id")? {
+            items.push((item, row.try_get::<i64, _>("ordinal")?));
+        }
+    }
+    Ok(Some(ManifestRead {
+        query_fingerprint: first.try_get("query_fingerprint")?,
+        live: first.try_get("live")?,
+        continues_before: first.try_get("continues_before")?,
+        items,
+    }))
+}
+
+/// The worker API's page read (page 1 right after materialization with `after_ordinal = -1`, page 2+ with the
+/// previous page's `last_ordinal`) through [`read_manifest_page`]: no row is `SnapshotNotFound`; a snapshot the DB
+/// clock has expired is `Cursor(Expired)` even when the host-clock cursor check passed; a fingerprint that no longer
+/// matches is `QueryMismatch` — defense in depth alongside the MAC, per this module's `QueryMismatch` doc.
 async fn fetch_page_from_manifest(
     pool: &RetrievalWorkerDbPool,
     tenant_id: Uuid,
@@ -280,43 +345,33 @@ async fn fetch_page_from_manifest(
     // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `fetch_page_from_manifest`
     let mut txn = pool.pool().begin().await?;
     set_tenant_local(&mut txn, tenant_id).await?;
-
-    let snapshot_fp: Option<String> = sqlx::query_scalar(
-        "SELECT query_fingerprint FROM ops.selection_snapshots WHERE selection_snapshot_id = $1",
-    )
-    .bind(meta.snapshot_id)
-    .fetch_optional(&mut *txn)
-    .await?;
-    let Some(snapshot_fp) = snapshot_fp else {
-        return Err(SelectionRepoError::SnapshotNotFound);
-    };
-    if snapshot_fp != meta.query_fingerprint {
-        return Err(SelectionRepoError::QueryMismatch);
-    }
-
-    let rows = sqlx::query(
-        "SELECT item_id, ordinal FROM ops.selection_snapshot_items \
-         WHERE selection_snapshot_id = $1 AND ordinal > $2 \
-         ORDER BY ordinal LIMIT $3",
-    )
-    .bind(meta.snapshot_id)
-    .bind(after_ordinal)
-    .bind(page_size)
-    .fetch_all(&mut *txn)
-    .await?;
+    let read = read_manifest_page(&mut txn, meta.snapshot_id, after_ordinal, page_size).await?;
     txn.commit().await?;
 
+    let Some(read) = read else {
+        return Err(SelectionRepoError::SnapshotNotFound);
+    };
+    if !read.live {
+        return Err(SelectionRepoError::Cursor(CursorError::Expired));
+    }
+    if read.query_fingerprint != meta.query_fingerprint {
+        return Err(SelectionRepoError::QueryMismatch);
+    }
     Ok(build_page(
         meta.snapshot_id,
         tenant_id,
         meta.query_fingerprint,
         meta.expires_at.unix_timestamp(),
-        rows,
+        &read.items,
         page_size,
         mac_key,
     ))
 }
 
+/// The gateway's page read (`memory.enumerate`, every page) through [`read_manifest_page`] in the caller's
+/// REPEATABLE READ transaction. A snapshot that is gone, DB-clock expired (ADR-0062 D-H: the authority, the same
+/// clock as the purge), or minted under another fingerprint is `NotFound`, the gateway's answer for an expired or
+/// foreign cursor.
 async fn authorized_page_in_txn(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,
@@ -325,100 +380,86 @@ async fn authorized_page_in_txn(
     page_size: i64,
     mac_key: &[u8],
 ) -> Result<SnapshotPage, humaux_domain::error::ErrorCode> {
-    let snapshot_fp: Option<String> = sqlx::query_scalar(
-        "SELECT query_fingerprint FROM ops.selection_snapshots WHERE selection_snapshot_id=$1 AND tenant_id=$2",
-    )
-    .bind(meta.snapshot_id)
-    .bind(tenant_id)
-    .fetch_optional(&mut **txn)
-    .await
-    .map_err(|_| humaux_domain::error::ErrorCode::DependencyUnavailable)?;
-    if snapshot_fp.as_deref() != Some(meta.query_fingerprint) {
-        return Err(humaux_domain::error::ErrorCode::NotFound);
-    }
-    let rows = sqlx::query(
-        "SELECT item_id,ordinal FROM ops.selection_snapshot_items WHERE selection_snapshot_id=$1 AND tenant_id=$2 AND ordinal>$3 ORDER BY ordinal LIMIT $4",
-    )
-    .bind(meta.snapshot_id)
-    .bind(tenant_id)
-    .bind(after_ordinal)
-    .bind(page_size)
-    .fetch_all(&mut **txn)
-    .await
-    .map_err(|_| humaux_domain::error::ErrorCode::DependencyUnavailable)?;
-    let items = rows
-        .iter()
-        .map(|row| {
-            row.try_get("item_id")
-                .map_err(|_| humaux_domain::error::ErrorCode::Internal)
-        })
-        .collect::<Result<Vec<Uuid>, _>>()?;
-    let next_cursor = if items.len() == page_size as usize {
-        rows.last()
-            .map(|row| {
-                row.try_get("ordinal")
-                    .map_err(|_| humaux_domain::error::ErrorCode::Internal)
-            })
-            .transpose()?
-            .map(|ordinal| {
-                Cursor::sign(
-                    meta.snapshot_id,
-                    tenant_id,
-                    meta.query_fingerprint.to_owned(),
-                    ordinal,
-                    meta.expires_at.unix_timestamp(),
-                    mac_key,
-                )
-            })
-    } else {
-        None
-    };
+    let read = read_manifest_page(txn, meta.snapshot_id, after_ordinal, page_size)
+        .await
+        .map_err(|_| humaux_domain::error::ErrorCode::DependencyUnavailable)?
+        .filter(|read| read.live && read.query_fingerprint == meta.query_fingerprint)
+        .ok_or(humaux_domain::error::ErrorCode::NotFound)?;
+    let last_ordinal = read
+        .items
+        .last()
+        .map_or(after_ordinal, |(_, ordinal)| *ordinal);
+    // ADR-0062 D-K: a short page on a capped manifest still answers a cursor (at the manifest's end), which
+    // [`continuation_bound_in_txn`] turns into the next segment; an uncapped manifest ends at its short page.
+    let next_cursor = (read.items.len() == page_size as usize || read.continues_before.is_some())
+        .then(|| {
+            Cursor::sign(
+                meta.snapshot_id,
+                tenant_id,
+                meta.query_fingerprint.to_owned(),
+                last_ordinal,
+                meta.expires_at.unix_timestamp(),
+                mac_key,
+            )
+        });
     Ok(SnapshotPage {
         snapshot_id: meta.snapshot_id,
-        items,
+        items: read.items.into_iter().map(|(item, _)| item).collect(),
         next_cursor,
     })
 }
 
-/// Creates an immutable authorization-filtered manifest in the caller's RR READ WRITE transaction.
+/// What one authorized manifest is minted under: its query identity, lifetime and size cap.
+pub(crate) struct ManifestSpec<'a> {
+    /// `context_repo`'s enumeration fingerprint (caller identity + filter), checked on every later page.
+    pub fingerprint: &'a str,
+    /// `HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS` (§78.1, ADR-0062 D-K).
+    pub ttl: std::time::Duration,
+    /// `HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP` (> 0): the most item rows one manifest stores.
+    pub cap: usize,
+}
+
+/// Creates an immutable authorization-filtered manifest in the caller's RR READ WRITE transaction. `item_ids` is
+/// the whole authorized universe in `memory_id DESC` order; the manifest stores at most `spec.cap` of them and, when
+/// it truncates, records the last stored id as `continues_before` (ADR-0062 D-K), the next segment's keyset bound.
 pub(crate) async fn begin_authorized_snapshot_in_txn(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,
-    fingerprint: &str,
-    ttl: std::time::Duration,
+    spec: &ManifestSpec<'_>,
     page_size: i64,
     mac_key: &[u8],
     item_ids: &[Uuid],
 ) -> Result<SnapshotPage, humaux_domain::error::ErrorCode> {
-    let row = sqlx::query("INSERT INTO ops.selection_snapshots(tenant_id,query_fingerprint,expires_at) VALUES($1,$2,now()+make_interval(secs=>$3)) RETURNING selection_snapshot_id,expires_at")
-        .bind(tenant_id).bind(fingerprint).bind(ttl.as_secs_f64()).fetch_one(&mut **txn).await
+    let stored = &item_ids[..item_ids.len().min(spec.cap)];
+    let continues_before = (stored.len() < item_ids.len())
+        .then(|| stored.last().copied())
+        .flatten();
+    let row = sqlx::query("INSERT INTO ops.selection_snapshots(tenant_id,query_fingerprint,expires_at,continues_before) VALUES($1,$2,now()+make_interval(secs=>$3),$4) RETURNING selection_snapshot_id,expires_at")
+        .bind(tenant_id).bind(spec.fingerprint).bind(spec.ttl.as_secs_f64()).bind(continues_before).fetch_one(&mut **txn).await
         .map_err(|_| humaux_domain::error::ErrorCode::DependencyUnavailable)?;
     let meta = SnapshotMeta {
         snapshot_id: row
             .try_get("selection_snapshot_id")
             .map_err(|_| humaux_domain::error::ErrorCode::Internal)?,
-        query_fingerprint: fingerprint,
+        query_fingerprint: spec.fingerprint,
         expires_at: row
             .try_get("expires_at")
             .map_err(|_| humaux_domain::error::ErrorCode::Internal)?,
     };
-    for (ordinal, id) in item_ids.iter().enumerate() {
-        sqlx::query("INSERT INTO ops.selection_snapshot_items(selection_snapshot_id,tenant_id,item_id,ordinal) VALUES($1,$2,$3,$4)")
-            .bind(meta.snapshot_id).bind(tenant_id).bind(id).bind(ordinal as i64).execute(&mut **txn).await
-            .map_err(|_| humaux_domain::error::ErrorCode::DependencyUnavailable)?;
-    }
+    insert_manifest_in_txn(txn, meta.snapshot_id, tenant_id, stored)
+        .await
+        .map_err(|_| humaux_domain::error::ErrorCode::DependencyUnavailable)?;
     authorized_page_in_txn(txn, tenant_id, &meta, -1, page_size, mac_key).await
 }
 
-/// Validates a trusted cursor and returns its frozen manifest page in the caller's RR transaction.
-pub(crate) async fn fetch_authorized_snapshot_page_in_txn(
-    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    tenant_id: Uuid,
+/// The §20.4 cursor checks of the gateway path, in order: MAC/tenant/expiry on the host clock (an expired cursor is
+/// `NotFound`, anything forged is `InvalidInput`), then the caller's own enumeration fingerprint.
+fn validate_trusted_cursor(
     cursor: &Cursor,
+    tenant_id: Uuid,
     fingerprint: &str,
-    page_size: i64,
     mac_key: &[u8],
-) -> Result<SnapshotPage, humaux_domain::error::ErrorCode> {
+) -> Result<OffsetDateTime, humaux_domain::error::ErrorCode> {
     cursor
         .validate(
             tenant_id,
@@ -432,8 +473,47 @@ pub(crate) async fn fetch_authorized_snapshot_page_in_txn(
     if cursor.query_fingerprint != fingerprint {
         return Err(humaux_domain::error::ErrorCode::NotFound);
     }
-    let expires_at = OffsetDateTime::from_unix_timestamp(cursor.expires_at_unix)
-        .map_err(|_| humaux_domain::error::ErrorCode::InvalidInput)?;
+    OffsetDateTime::from_unix_timestamp(cursor.expires_at_unix)
+        .map_err(|_| humaux_domain::error::ErrorCode::InvalidInput)
+}
+
+/// ADR-0062 D-K: `Some(bound)` when `cursor` stands at the end of a live capped manifest, i.e. the next page is the
+/// first page of a new segment `memory_id < bound`; `None` when it is an ordinary page of the frozen manifest, or
+/// the snapshot is gone or DB-clock expired (ADR-0062 D-H), which the page read then refuses. One statement, run
+/// before the caller picks its transaction mode (a new segment mints, so it needs READ WRITE).
+pub(crate) async fn continuation_bound_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    cursor: &Cursor,
+    fingerprint: &str,
+    mac_key: &[u8],
+) -> Result<Option<Uuid>, humaux_domain::error::ErrorCode> {
+    validate_trusted_cursor(cursor, tenant_id, fingerprint, mac_key)?;
+    let bound: Option<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT s.continues_before FROM ops.selection_snapshots s \
+          WHERE s.selection_snapshot_id = $1 AND s.tenant_id = $2 AND s.expires_at > now() \
+            AND NOT EXISTS (SELECT 1 FROM ops.selection_snapshot_items i \
+                             WHERE i.selection_snapshot_id = s.selection_snapshot_id AND i.ordinal > $3)",
+    )
+    .bind(cursor.snapshot_id)
+    .bind(tenant_id)
+    .bind(cursor.last_ordinal)
+    .fetch_optional(&mut **txn)
+    .await
+    .map_err(|_| humaux_domain::error::ErrorCode::DependencyUnavailable)?;
+    Ok(bound.flatten())
+}
+
+/// Validates a trusted cursor and returns its frozen manifest page in the caller's RR transaction.
+pub(crate) async fn fetch_authorized_snapshot_page_in_txn(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    cursor: &Cursor,
+    fingerprint: &str,
+    page_size: i64,
+    mac_key: &[u8],
+) -> Result<SnapshotPage, humaux_domain::error::ErrorCode> {
+    let expires_at = validate_trusted_cursor(cursor, tenant_id, fingerprint, mac_key)?;
     authorized_page_in_txn(
         txn,
         tenant_id,

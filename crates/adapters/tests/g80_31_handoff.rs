@@ -464,6 +464,20 @@ async fn one_enumerated(
     cursor: Option<&str>,
     page_size: u16,
 ) -> Result<humaux_adapters::context_repo::MaterializedMemoryPage, ErrorCode> {
+    capped_enumerated(dsn, authorization, scope, family, cursor, page_size, 1000).await
+}
+
+/// [`one_enumerated`] with an explicit `HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP` (ADR-0062 D-K).
+#[allow(clippy::too_many_arguments)] // the six enumerate inputs plus the cap under test
+async fn capped_enumerated(
+    dsn: &str,
+    authorization: &AuthorizationScope,
+    scope: &Scope,
+    family: &StreamFamily,
+    cursor: Option<&str>,
+    page_size: u16,
+    manifest_cap: usize,
+) -> Result<humaux_adapters::context_repo::MaterializedMemoryPage, ErrorCode> {
     // dep: PostgreSQL(role_gateway) — RuntimeDbPool under test, the runtime role's real pool.
     // dep: PostgreSQL(role_gateway) — opens the role-scoped connection for `one_enumerated`
     let pool = RuntimeDbPool::connect(dsn).await.expect("pool");
@@ -478,6 +492,7 @@ async fn one_enumerated(
             cursor,
             page_size,
             ttl: Duration::from_secs(30),
+            manifest_cap,
             mac_key: ENUMERATION_MAC_KEY,
             subject_id: None,
         },
@@ -1175,6 +1190,7 @@ fn enumeration_keeps_body_grounding_and_ledger_on_one_snapshot() {
                         cursor: None,
                         page_size: 1,
                         ttl: Duration::from_secs(30),
+                        manifest_cap: 1000,
                         mac_key: ENUMERATION_MAC_KEY,
                         subject_id: None,
                     },
@@ -1308,4 +1324,205 @@ fn enumeration_rejects_cursor_subject_scope_and_parameter_mismatch() {
         1,
     ));
     assert!(matches!(workspace_result, Err(ErrorCode::Forbidden)));
+}
+
+/// A workspace-scoped enumeration (so every page carries a §22.1 census): one authorization reused across pages, a
+/// grant on a fresh workspace and that workspace's stream family.
+fn workspace_enumeration(tenant: Uuid) -> (AuthorizationScope, Scope, StreamFamily) {
+    let workspace = WorkspaceId(Uuid::new_v4());
+    let authorization = AuthorizationScope::new(
+        TenantId(tenant),
+        PrincipalId::new(),
+        None,
+        BoundedSet::new([workspace]).expect("workspace grant"),
+    );
+    let scope = Scope {
+        workspace_id: Some(workspace),
+        ..scope_for(tenant)
+    };
+    let family = StreamFamily::new(
+        TenantId(tenant),
+        "workspace",
+        workspace.0,
+        "private_reasoning",
+        "context",
+    );
+    (authorization, scope, family)
+}
+
+fn page_ids(page: &humaux_adapters::context_repo::MaterializedMemoryPage) -> Vec<Uuid> {
+    page.memory
+        .bodies
+        .items
+        .iter()
+        .map(|item| match item {
+            MaterializedItem::Memory { memory_id, .. } => *memory_id,
+            other => panic!("enumerate returns memories only, got {other:?}"),
+        })
+        .collect()
+}
+
+/// ADR-0062 D-K (T-K2): cap 3, 7 memories, page size 2 — segments of 3 + 3 + 1. Every page's census is exact for
+/// its own segment (7, then the remainder 4, then 1) and the pages' union is exactly the 7, in DESC order, once.
+/// Fault: answer `next_cursor = None` at the end of a capped manifest; the walk stops after 3.
+#[test]
+fn a_manifest_larger_than_the_cap_continues_in_a_new_segment_with_its_own_exact_census() {
+    let Some(mut fixture) = setup() else { return };
+    let mut seeded = seed_many(&mut fixture, "ProjectConstraint", 7);
+    seeded.sort_unstable_by(|a, b| b.cmp(a));
+    let (authorization, scope, family) = workspace_enumeration(fixture.tenant_id);
+    let runtime = tokio::runtime::Runtime::new().expect("segment runtime");
+    let (mut cursor, mut seen, mut walk) = (None::<String>, Vec::new(), Vec::new());
+    loop {
+        let page = runtime
+            .block_on(capped_enumerated(
+                &fixture.dsn,
+                &authorization,
+                &scope,
+                &family,
+                cursor.as_deref(),
+                2,
+                3,
+            ))
+            .expect("enumerate page");
+        let census = page
+            .census
+            .as_ref()
+            .expect("workspace page carries a census");
+        let exact = census
+            .census
+            .enumeration()
+            .expect("every segment page has an exact census");
+        let ids = page_ids(&page);
+        assert_eq!(exact.returned(), ids.len() as u64);
+        walk.push((page.snapshot_id, exact.total(), ids.len()));
+        seen.extend(ids);
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+        assert!(walk.len() < 10, "the walk must end: {walk:?}");
+    }
+    let shape: Vec<(u64, usize)> = walk.iter().map(|(_, total, n)| (*total, *n)).collect();
+    assert_eq!(shape, [(7, 2), (7, 1), (4, 2), (4, 1), (1, 1)], "{walk:?}");
+    let segments: std::collections::BTreeSet<Uuid> = walk.iter().map(|(id, _, _)| *id).collect();
+    assert_eq!(segments.len(), 3, "three segment snapshots: {walk:?}");
+    assert_eq!(seen, seeded, "the pages' union is the 7, DESC, once");
+}
+
+/// Owner write: the DB clock has expired `snapshot` (its signed cursor stays valid on the host clock for the 30 s TTL).
+fn expire_in_db(fixture: &mut Fixture, snapshot: Uuid) {
+    let n = fixture
+        .admin
+        .execute(
+            "UPDATE ops.selection_snapshots SET expires_at = now() - interval '1 second' \
+             WHERE selection_snapshot_id = $1",
+            &[&snapshot],
+        )
+        .expect("expire in the DB only");
+    assert_eq!(n, 1, "snapshot {snapshot} exists");
+}
+
+/// T-H2 (ADR-0062 D-H) through the production entry point `materialize_memory_enumeration`: a snapshot the DB clock
+/// has expired is refused `NotFound` although its signed cursor is still valid on the host clock — never items,
+/// never an empty page, and never continued into a fresh segment when the cursor stands at the end of a capped
+/// manifest. Faults: drop `expires_at > now()` from `MANIFEST_PAGE_SQL` ⇒ the frozen page comes back ⇒ red; drop it
+/// from `continuation_bound_in_txn` ⇒ the capped cursor mints a new segment ⇒ red.
+#[test]
+fn a_db_expired_snapshot_is_refused_even_when_the_cursor_is_host_valid() {
+    let Some(mut fixture) = setup() else { return };
+    seed_many(&mut fixture, "ProjectConstraint", 3);
+    let (authorization, scope, family) = workspace_enumeration(fixture.tenant_id);
+    let runtime = tokio::runtime::Runtime::new().expect("expiry runtime");
+    let dsn = fixture.dsn.clone();
+    let page = |cursor: Option<&str>, cap: usize| {
+        runtime.block_on(capped_enumerated(
+            &dsn,
+            &authorization,
+            &scope,
+            &family,
+            cursor,
+            1,
+            cap,
+        ))
+    };
+
+    // An ordinary later page of a frozen manifest (cap 10 > 3 memories).
+    let first = page(None, 10).expect("first page");
+    let cursor = first.next_cursor.clone().expect("a second page");
+    assert_eq!(
+        page(Some(&cursor), 10).map(|p| p.memory.bodies.items.len()),
+        Ok(1),
+        "the cursor reads while the snapshot is live"
+    );
+    // A cursor at the end of a capped manifest (cap 1): live, it would open the next segment.
+    let capped = page(None, 1).expect("capped first page");
+    let at_cap = capped
+        .next_cursor
+        .clone()
+        .expect("a capped manifest answers a cursor");
+
+    for snapshot in [first.snapshot_id, capped.snapshot_id] {
+        expire_in_db(&mut fixture, snapshot);
+    }
+    let later = page(Some(&cursor), 10).map(|p| p.snapshot_id);
+    println!("DB-expired, host-valid cursor => {later:?}");
+    assert_eq!(
+        later,
+        Err(ErrorCode::NotFound),
+        "a frozen page of an expired snapshot"
+    );
+    let continued = page(Some(&at_cap), 1).map(|p| p.snapshot_id);
+    println!("DB-expired cursor at the cap => {continued:?}");
+    assert_eq!(
+        continued,
+        Err(ErrorCode::NotFound),
+        "no new segment from an expired snapshot"
+    );
+}
+
+/// ADR-0062 D-K (T-K3): a manifest stores at most the cap and records the last stored id as its keyset bound.
+/// Fault: store every id (no truncation).
+#[test]
+fn snapshot_rows_never_exceed_the_cap() {
+    let Some(mut fixture) = setup() else { return };
+    let mut seeded = seed_many(&mut fixture, "ProjectConstraint", 7);
+    seeded.sort_unstable_by(|a, b| b.cmp(a));
+    let (authorization, scope, family) = workspace_enumeration(fixture.tenant_id);
+    let runtime = tokio::runtime::Runtime::new().expect("cap runtime");
+    let page = runtime
+        .block_on(capped_enumerated(
+            &fixture.dsn,
+            &authorization,
+            &scope,
+            &family,
+            None,
+            2,
+            3,
+        ))
+        .expect("first page");
+    let row = fixture
+        .admin
+        .query_one(
+            "SELECT (SELECT count(*) FROM ops.selection_snapshot_items i \
+                      WHERE i.selection_snapshot_id = s.selection_snapshot_id), s.continues_before \
+               FROM ops.selection_snapshots s WHERE s.selection_snapshot_id = $1",
+            &[&page.snapshot_id],
+        )
+        .expect("manifest size");
+    let (rows, bound): (i64, Option<Uuid>) = (row.get(0), row.get(1));
+    assert_eq!(rows, 3, "the manifest stores the cap, not the 7");
+    assert_eq!(
+        bound,
+        Some(seeded[2]),
+        "continues_before is the last stored id"
+    );
+    assert_eq!(
+        page.census
+            .as_ref()
+            .and_then(|census| census.census.enumeration())
+            .map(|exact| exact.total()),
+        Some(7),
+        "page 1's census still counts the whole universe"
+    );
 }

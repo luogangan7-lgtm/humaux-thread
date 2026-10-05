@@ -9,8 +9,8 @@
 #   (c) the pinned `promtool test rules` exits 1 AND prints `alertname: <expected>, time:` (W6).
 # Before any row: the promtool pin is checked, and the unmutated tree must pass test-rules.sh in the
 # same copy layout ("baseline red in copy" otherwise), so a path or layout error is never read as red.
-# Rows: `id|rule-file|from|to|expected-alertname`; rows-file overrides the built-in 20 (selftest.sh);
-# every `absent(...)` branch of CoreMetricAbsent and HealthGaugesAbsent has its own row.
+# Rows: `id|rule-file|from|to|expected-alertname`; rows-file overrides the built-in 23 (selftest.sh);
+# every `absent(...)` branch of CoreMetricAbsent, HealthGaugesAbsent and MaintenanceCountersAbsent has its own row.
 #
 # Exit codes: 0 = every row printed `mutation=<id> red`; 1 = a row did not apply, broke syntax or
 #             was NOT-DETECTED, or the baseline failed; 2 = not_applicable (promtool pin unset);
@@ -60,6 +60,9 @@ health_lag|alerts.rules.yml|absent(projection_lag_events)|absent(vector(1))|Heal
 watchdog|alerts.rules.yml|vector(1)|absent(vector(1))|Watchdog
 distill_and|alerts.rules.yml|> 0 and increase(private_distill_outputs_total[1h]) == 0|> 0|DistillNoOutput
 distill_flat|alerts.rules.yml|private_distill_outputs_total[1h]) == 0|private_distill_outputs_total[1h]) > 0|DistillNoOutput
+maint_label|alerts.rules.yml|maintenance_task_runs_total{outcome="failed"}|maintenance_task_runs_total|MaintenanceTaskFailing
+maint_cmp|alerts.rules.yml|{outcome="failed"}[1h]) > 0|{outcome="failed"}[1h]) < 0|MaintenanceTaskFailing
+maint_absent|alerts.rules.yml|absent(maintenance_task_runs_total)|absent(vector(1))|MaintenanceCountersAbsent
 ROWS
 fi
 # ponytail: `dead` uses `> 2`, not `> 1`: measured, delta() extrapolates a 0→1 step over [15m] at 1m

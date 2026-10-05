@@ -4,12 +4,13 @@
 //!   ops.jobs, ops.outbox, private.events, private.evidence_objects, private.memory_evidence, private.memory_records,
 //!   projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_maintenance),
 //!   PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres, adapters::retrieve,
-//!   adapters::stream_repo, domain::egress, domain::identity, domain::ids, humaux-testkit, projection::stream, retrieval::completeness,
-//!   retrieval::envelope]
+//!   adapters::stream_repo, adapters::tests::support::throwaway_db, domain::egress, domain::identity, domain::ids,
+//!   humaux-testkit, projection::stream, retrieval::completeness, retrieval::envelope]
 //! Called-by: [cargo-test]
 //! Invariants: [advance_prefix/sweep_lost run per tenant under FORCE RLS on real projection tables scoped to a
-//!   throwaway tenant; no DSN, unreachable DB or projection.stream_log missing is a visible SKIP]
-//! Spec: Baseline §79.2
+//!   throwaway tenant; every sweep_lost test (an ISSUED -> LOST write) runs in its own throwaway database, never on
+//!   the shared dev database (ADR-0062 E8); no DSN, unreachable DB or projection.stream_log missing is a visible SKIP]
+//! Spec: Baseline §15.2; §79.2; ADR-0052; ADR-0062 D-L
 //!
 //! Same convention
 //! as `jobs_claim.rs`/`email_outbox.rs`: the tables are shared (`0007_projection.sql`,
@@ -31,6 +32,11 @@ use humaux_retrieval::completeness::LedgerClosure;
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
 use sqlx::types::Uuid;
+
+#[path = "support/throwaway_db.rs"]
+#[allow(dead_code)]
+mod throwaway_db;
+use throwaway_db::ThrowawayDb;
 
 // `sweep_lost` is scoped to one `tenant_id` (RLS has no cross-tenant carve-out for
 // `role_maintenance` — see `stream_repo`'s module doc), and every test below seeds its own
@@ -58,6 +64,8 @@ struct Handle {
     maintenance: MaintenanceDbPool,
     admin: Client,
     tenant_id: Uuid,
+    /// Set for [`ThrowawayStreamFixture`]: dropped last, it drops the whole database.
+    _db: Option<ThrowawayDb>,
 }
 
 impl Drop for Handle {
@@ -102,60 +110,78 @@ impl DbIntegrationFixture for StreamFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
-        // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
-        let mut admin = Client::connect(&dsn, NoTls)
-            .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
+        isolate_on(&dsn, None)
+    }
+}
 
-        for table in [
-            "projection.stream_log",
-            "projection.stream_checkpoints",
-            "projection.processing_gaps",
-            "ops.jobs",
-        ] {
-            let exists: bool = admin
-                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
-                .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
-                .get(0);
-            if !exists {
-                return Err(DbFixtureSkipReason::IsolationSetupFailed(format!(
-                    "{table} does not exist — run `cargo xtask migrate` first"
-                )));
-            }
-        }
+/// ADR-0062 E8: every test that moves a ticket ISSUED -> LOST runs in its own throwaway database
+/// (`humaux_thread_c35_stream_<pid>_<n>`), never on the shared dev database.
+struct ThrowawayStreamFixture;
 
-        let tenant_id: Uuid = admin
-            .query_one(
-                "INSERT INTO control.tenants (name) VALUES ($1) RETURNING tenant_id",
-                &[&"stream_repo.rs throwaway tenant"],
-            )
+impl DbIntegrationFixture for ThrowawayStreamFixture {
+    type Handle = Handle;
+
+    fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
+        let db = throwaway_db::create("c35_stream")?;
+        isolate_on(&db.dsn(), Some(db))
+    }
+}
+
+fn isolate_on(dsn: &str, db: Option<ThrowawayDb>) -> Result<Handle, DbFixtureSkipReason> {
+    // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
+    let mut admin = Client::connect(dsn, NoTls)
+        .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
+
+    for table in [
+        "projection.stream_log",
+        "projection.stream_checkpoints",
+        "projection.processing_gaps",
+        "ops.jobs",
+    ] {
+        let exists: bool = admin
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
             .get(0);
-
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
-        let retrieval = rt
-            // dep: PostgreSQL(role_retrieval_worker) — test opens a direct PG connection for setup/verification
-            .block_on(RetrievalWorkerDbPool::connect(&dsn_as_role(
-                &dsn,
-                "role_retrieval_worker",
-            )))
-            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
-        let maintenance = rt
-            // dep: PostgreSQL(role_maintenance) — test opens a direct PG connection for setup/verification
-            .block_on(MaintenanceDbPool::connect(&dsn_as_role(
-                &dsn,
-                "role_maintenance",
-            )))
-            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
-
-        Ok(Handle {
-            rt,
-            retrieval,
-            maintenance,
-            admin,
-            tenant_id,
-        })
+        if !exists {
+            return Err(DbFixtureSkipReason::IsolationSetupFailed(format!(
+                "{table} does not exist — run `cargo xtask migrate` first"
+            )));
+        }
     }
+
+    let tenant_id: Uuid = admin
+        .query_one(
+            "INSERT INTO control.tenants (name) VALUES ($1) RETURNING tenant_id",
+            &[&"stream_repo.rs throwaway tenant"],
+        )
+        .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
+        .get(0);
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+    let retrieval = rt
+        // dep: PostgreSQL(role_retrieval_worker) — test opens a direct PG connection for setup/verification
+        .block_on(RetrievalWorkerDbPool::connect(&dsn_as_role(
+            dsn,
+            "role_retrieval_worker",
+        )))
+        .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+    let maintenance = rt
+        // dep: PostgreSQL(role_maintenance) — test opens a direct PG connection for setup/verification
+        .block_on(MaintenanceDbPool::connect(&dsn_as_role(
+            dsn,
+            "role_maintenance",
+        )))
+        .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?;
+
+    Ok(Handle {
+        rt,
+        retrieval,
+        maintenance,
+        admin,
+        tenant_id,
+        _db: db,
+    })
 }
 
 fn key(handle: &Handle) -> StreamKey {
@@ -490,7 +516,7 @@ fn advance_prefix_inconsistent_when_max_seq_disagrees_with_expected() {
 /// `sweep_lost` leaves it untouched.
 #[test]
 fn sweep_lost_never_touches_waiting_key_regardless_of_age() {
-    run_db_fixture::<StreamFixture, _>(
+    run_db_fixture::<ThrowawayStreamFixture, _>(
         "sweep_lost_never_touches_waiting_key_regardless_of_age",
         |mut handle| {
             let k = key(&handle);
@@ -505,6 +531,7 @@ fn sweep_lost_never_touches_waiting_key_regardless_of_age() {
                     &handle.maintenance,
                     tenant_id,
                     Duration::from_secs(900),
+                    100,
                 ))
                 .expect("sweep must run");
 
@@ -524,7 +551,7 @@ fn sweep_lost_never_touches_waiting_key_regardless_of_age() {
 /// in-SQL text concatenation matches that Rust encoding exactly.
 #[test]
 fn sweep_lost_sweeps_orphan_but_spares_owned_and_fresh_issued() {
-    run_db_fixture::<StreamFixture, _>(
+    run_db_fixture::<ThrowawayStreamFixture, _>(
         "sweep_lost_sweeps_orphan_but_spares_owned_and_fresh_issued",
         |mut handle| {
             let k = key(&handle);
@@ -551,6 +578,7 @@ fn sweep_lost_sweeps_orphan_but_spares_owned_and_fresh_issued() {
                     &handle.maintenance,
                     tenant_id,
                     Duration::from_secs(900),
+                    100,
                 ))
                 .expect("sweep must run");
 
@@ -576,6 +604,249 @@ fn sweep_lost_sweeps_orphan_but_spares_owned_and_fresh_issued() {
                 .expect("row must exist")
                 .get(0);
             assert_eq!(error_class.as_deref(), Some("ORPHANED_PIPELINE_ITEM"));
+        },
+    );
+}
+
+/// Owner write of the ADR-0052 claim columns on one ticket (no state change, so the 0011/0167
+/// transition guard returns early).
+fn set_claim(
+    admin: &mut Client,
+    key: &StreamKey,
+    seq: i64,
+    lease: Option<(&str, Duration, bool)>,
+    attempts: i32,
+    next_attempt_in: Option<Duration>,
+) {
+    let (owner, expires) = match lease {
+        Some((owner, d, future)) => (
+            Some(owner),
+            Some(if future {
+                SystemTime::now() + d
+            } else {
+                SystemTime::now() - d
+            }),
+        ),
+        None => (None, None),
+    };
+    let next = next_attempt_in.map(|d| SystemTime::now() + d);
+    let n = admin
+        .execute(
+            "UPDATE projection.stream_log \
+                SET lease_owner = $8, lease_expires_at = $9, attempts = $10, next_attempt_at = $11 \
+              WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND domain=$4 \
+                AND projection_kind=$5 AND projection_version=$6 AND stream_seq=$7",
+            &[
+                &key.tenant_id.0,
+                &key.scope_kind,
+                &key.scope_id,
+                &key.domain,
+                &key.projection_kind,
+                &key.projection_version,
+                &seq,
+                &owner,
+                &expires,
+                &attempts,
+                &next,
+            ],
+        )
+        .expect("set the claim columns");
+    assert_eq!(n, 1, "seq {seq} exists");
+}
+
+/// T-L1 (ADR-0062 D-L, ADR-0052): four ISSUED tickets far past the SLA and none with a job — a
+/// plain orphan and one whose runner lease already expired go LOST; one under a live runner lease
+/// and one backing off ([`stream_repo::RETRY_PREDICATE`]) stay ISSUED, because the runner's next
+/// settle would otherwise hit the transition guard and §15.2 forbids wall-clock LOST for a retry.
+/// Fault: drop the lease predicate ⇒ seq 2 goes LOST ⇒ red; drop the retry predicate ⇒ seq 3 ⇒ red.
+#[test]
+fn sweep_lost_skips_a_leased_or_backing_off_ticket() {
+    run_db_fixture::<ThrowawayStreamFixture, _>(
+        "sweep_lost_skips_a_leased_or_backing_off_ticket",
+        |mut handle| {
+            let k = key(&handle);
+            let old = SystemTime::now() - Duration::from_secs(2 * 3600);
+            for seq in 1..=4 {
+                seed_log_row(&mut handle.admin, &k, seq, "ISSUED", old);
+            }
+            seed_checkpoint(&mut handle.admin, &k, 4);
+            let hour = Duration::from_secs(3600);
+            set_claim(
+                &mut handle.admin,
+                &k,
+                2,
+                Some(("runner-a", hour, true)),
+                1,
+                None,
+            );
+            set_claim(&mut handle.admin, &k, 3, None, 1, Some(hour));
+            set_claim(
+                &mut handle.admin,
+                &k,
+                4,
+                Some(("runner-dead", Duration::from_secs(60), false)),
+                1,
+                None,
+            );
+
+            let tenant_id = handle.tenant_id;
+            let swept = handle
+                .rt
+                .block_on(stream_repo::sweep_lost(
+                    &handle.maintenance,
+                    tenant_id,
+                    Duration::from_secs(900),
+                    100,
+                ))
+                .expect("sweep must run");
+
+            let states: Vec<String> = (1..=4)
+                .map(|seq| log_state(&mut handle.admin, &k, seq))
+                .collect();
+            assert_eq!(
+                states,
+                ["LOST", "ISSUED", "ISSUED", "LOST"],
+                "orphan / live lease / backing off / expired lease"
+            );
+            assert_eq!(swept, 2);
+        },
+    );
+}
+
+/// T-L2 (ADR-0062 D-L): five orphans, LIMIT 2 ⇒ exactly the two oldest `issued_at` go LOST and
+/// the call reports 2; the next call takes the next two. Fault: drop the LIMIT ⇒ 5 ⇒ red.
+#[test]
+fn sweep_lost_sweeps_at_most_limit_oldest_first() {
+    run_db_fixture::<ThrowawayStreamFixture, _>(
+        "sweep_lost_sweeps_at_most_limit_oldest_first",
+        |mut handle| {
+            let k = key(&handle);
+            // seq 5 is the oldest, seq 1 the youngest — order by issued_at, not by seq.
+            for seq in 1..=5 {
+                let age = Duration::from_secs(3600 * (1 + seq as u64));
+                seed_log_row(
+                    &mut handle.admin,
+                    &k,
+                    seq,
+                    "ISSUED",
+                    SystemTime::now() - age,
+                );
+            }
+            seed_checkpoint(&mut handle.admin, &k, 5);
+            let tenant_id = handle.tenant_id;
+            let sweep = |handle: &Handle| {
+                handle
+                    .rt
+                    .block_on(stream_repo::sweep_lost(
+                        &handle.maintenance,
+                        tenant_id,
+                        Duration::from_secs(900),
+                        2,
+                    ))
+                    .expect("sweep must run")
+            };
+            assert_eq!(sweep(&handle), 2, "at most LIMIT per call");
+            let states: Vec<String> = (1..=5)
+                .map(|seq| log_state(&mut handle.admin, &k, seq))
+                .collect();
+            assert_eq!(states, ["ISSUED", "ISSUED", "ISSUED", "LOST", "LOST"]);
+            assert_eq!(sweep(&handle), 2);
+            assert_eq!(log_state(&mut handle.admin, &k, 1), "ISSUED");
+            assert_eq!(sweep(&handle), 1);
+        },
+    );
+}
+
+/// `projection.stream_log.lost_at` of one ticket (0223).
+fn lost_at(admin: &mut Client, key: &StreamKey, seq: i64) -> Option<SystemTime> {
+    admin
+        .query_one(
+            "SELECT lost_at FROM projection.stream_log \
+             WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND domain=$4 \
+               AND projection_kind=$5 AND projection_version=$6 AND stream_seq=$7",
+            &[
+                &key.tenant_id.0,
+                &key.scope_kind,
+                &key.scope_id,
+                &key.domain,
+                &key.projection_kind,
+                &key.projection_version,
+                &seq,
+            ],
+        )
+        .expect("row must exist")
+        .get(0)
+}
+
+/// T-L5 (ADR-0062 D-L, §15.2): four orphan-aged ISSUED tickets, each carried by an Evidence whose
+/// `EVIDENCE_ACCEPTED` row enqueued a real DERIVED_DISTILL job (0164 trigger: no `stream_key`, so the legacy
+/// ops.jobs test never matches it). While that outbox row is PENDING or PROCESSING the claim holds the ticket back
+/// on purpose (0176), so it is in flight and stays ISSUED; DONE and FAILED carriers leave true orphans, which go
+/// LOST and record `lost_at`. Fault: drop the outbox NOT EXISTS from `sweep_lost` ⇒ seq 1 and 2 go LOST ⇒ red.
+#[test]
+fn sweep_lost_spares_a_ticket_whose_evidence_is_still_distilling() {
+    run_db_fixture::<ThrowawayStreamFixture, _>(
+        "sweep_lost_spares_a_ticket_whose_evidence_is_still_distilling",
+        |mut handle| {
+            let k = key(&handle);
+            let old = SystemTime::now() - Duration::from_secs(2 * 3600);
+            for seq in 1..=4 {
+                seed_log_row(&mut handle.admin, &k, seq, "ISSUED", old);
+                attach_memory(&mut handle, seq);
+            }
+            seed_checkpoint(&mut handle.admin, &k, 4);
+            let tenant_id = handle.tenant_id;
+            for (seq, status) in [(2_i64, "PROCESSING"), (3, "DONE"), (4, "FAILED")] {
+                let n = handle
+                    .admin
+                    .execute(
+                        "UPDATE ops.outbox SET status = $3 WHERE tenant_id = $1 AND commit_seq = $2",
+                        &[&tenant_id, &seq, &status],
+                    )
+                    .expect("set the carrier status");
+                assert_eq!(n, 1, "carrier of seq {seq}");
+            }
+            let distill_jobs: i64 = handle
+                .admin
+                .query_one(
+                    "SELECT count(*) FROM ops.jobs WHERE tenant_id = $1 \
+                       AND job_type = 'DERIVED_DISTILL' AND stream_key IS NULL",
+                    &[&tenant_id],
+                )
+                .expect("count distill jobs")
+                .get(0);
+            assert_eq!(
+                distill_jobs, 4,
+                "the 0164 trigger's jobs carry no stream locator"
+            );
+
+            let swept = handle
+                .rt
+                .block_on(stream_repo::sweep_lost(
+                    &handle.maintenance,
+                    tenant_id,
+                    Duration::from_secs(900),
+                    100,
+                ))
+                .expect("sweep must run");
+
+            let states: Vec<String> = (1..=4)
+                .map(|seq| log_state(&mut handle.admin, &k, seq))
+                .collect();
+            assert_eq!(
+                states,
+                ["ISSUED", "ISSUED", "LOST", "LOST"],
+                "carrier PENDING / PROCESSING / DONE / FAILED"
+            );
+            assert_eq!(swept, 2);
+            let stamped: Vec<bool> = (1..=4)
+                .map(|seq| lost_at(&mut handle.admin, &k, seq).is_some())
+                .collect();
+            assert_eq!(
+                stamped,
+                [false, false, true, true],
+                "lost_at only on the swept"
+            );
         },
     );
 }

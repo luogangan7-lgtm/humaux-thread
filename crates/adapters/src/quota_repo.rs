@@ -3,10 +3,12 @@
 //!   control.rate_buckets, control.usage_reservations] x=[control.issue_quota_window,
 //!   control.reap_quota_reservations], PostgreSQL(role_gateway), PostgreSQL(role_maintenance)]; env=[];
 //!   modules=[adapters::postgres, domain::audit, domain::error, domain::identity, domain::ids]
-//! Called-by: [adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::request_guard_repo, gateway::bootstrap, gateway::guard, maintenance::main, tests, xtask::e2e_seed]
+//! Called-by: [adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo,
+//!   adapters::operation_receipt, adapters::request_guard_repo, gateway::bootstrap, gateway::guard,
+//!   maintenance::main, maintenance::serve, tests, xtask::e2e_seed]
 //! Invariants: [the gateway only consumes existing quota windows; only role_maintenance can issue or reap them;
 //!   exhaustion is QuotaExhausted/RateLimited and a PG error DependencyUnavailable, never an allow]
-//! Spec: none
+//! Spec: Baseline §72.2.1; §73.2; ADR-0062 E5
 //!
 //! The gateway consumes existing windows; only maintenance can invoke their issuer.
 
@@ -457,6 +459,21 @@ pub enum RateSubject<'a> {
     Tenant(&'a AuthorizationScope),
 }
 
+/// The pre-auth `ip` bucket's `subject_id`: the full address for IPv4, the `/64` network for IPv6.
+// §73.2 (ADR-0062 E5, SEC-6): canonicalise first, so `::ffff:a.b.c.d` keys as the IPv4 address it is; one
+// IPv6 end site owns a whole /64, so a /128 key would hand it 2^64 independent buckets. Authenticated keys
+// (credential/user/tenant) are untouched.
+#[must_use]
+pub fn preauth_ip_subject(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let net = std::net::Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX));
+            format!("{net}/64")
+        }
+    }
+}
+
 /// Each bucket is a short independent transaction. A later entitlement/quota failure
 /// cannot refund an already admitted abuse-limit attempt. PG failures fail closed.
 pub async fn consume_rate(
@@ -470,7 +487,7 @@ pub async fn consume_rate(
         return Err(ErrorCode::InvalidInput);
     }
     let (tenant, user, kind, id) = match subject {
-        RateSubject::PreauthIp(ip) => (SYSTEM_TENANT_ID, None, "ip", ip.to_string()),
+        RateSubject::PreauthIp(ip) => (SYSTEM_TENANT_ID, None, "ip", preauth_ip_subject(ip)),
         RateSubject::Credential {
             auth,
             credential_id,

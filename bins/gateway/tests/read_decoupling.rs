@@ -233,6 +233,8 @@ fn gateway(handle: &Handle) -> Gateway {
     .expect("positive undo window")
     .with_mood_half_life(Duration::from_secs(21_600))
     .expect("positive mood half-life")
+    .with_enumeration(Duration::from_secs(900), 1000)
+    .expect("positive enumeration policy")
     .with_semantic_recall(semantic);
     Gateway {
         port,

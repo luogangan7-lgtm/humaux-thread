@@ -178,6 +178,17 @@ the tokens differ, and the test fails on its precondition. It does not fail on a
   QUIET is binary-local". Do not widen the lock or retry the test.
 - Status on card 26: it did not flake. The card-25 main-line chain passed with 11 tests in 3.22 s.
 
+## `enumerate_first_page_scales_with_a_capped_manifest` (card 35, ADR-0062 D-K M-1)
+
+`crates/adapters/tests/enumerate_scale.rs` carries `lane(b)`: it is timing-sensitive (n = 30 timed first and later
+pages after 3 warm-ups, p95 bars per ruling E12) and seeds 50 000 memories, so it runs serially after the warm-up,
+never beside the chain. It needs no lane resource: it creates, migrates and drops its own throwaway database
+`humaux_thread_c35_enum_<pid>_<n>` (the shared database never sees the seed). Its bars are the E12 regression bars
+read against the checked-in baseline `crates/adapters/tests/data/enumerate_scale_baseline.txt`; the 300 ms
+first-page target is not met on this host and moves to card 35b. The card-35 chain also runs it by name (gate
+`c35_enumerate_scale_live`). The S7 reason text lacked the `lane(` prefix and the audit was red on it ("1 ignored
+test(s) with no disposition"); card 35 S8 gave it `lane(b)`.
+
 ## Process discipline
 
 The lane never kills a process it did not spawn and never frees a port by force (a `lsof -ti

@@ -2,9 +2,9 @@
 //!   health gauges: a periodic `ops.health_snapshot` sampler plus the loopback `/metrics` + `/status` listener
 //!   (ADR-0061 D-D process side, D-B).
 //! Depends-on: crates=[humaux-adapters, humaux-telemetry, serde_json, time, tokio];
-//!   services=[PostgreSQL(role_maintenance) x=[ops.health_snapshot]]; env=[CARGO_PKG_VERSION, HUMAUX_BUILD_GIT_SHA,
+//!   services=[PostgreSQL(role_maintenance) x=[ops.health_snapshot]]; env=[
 //!   HUMAUX_MAINTENANCE_HEALTH_SAMPLE_SECONDS, HUMAUX_MAINTENANCE_HEALTH_SERVE_METRICS_ADDR, HUMAUX_MAINTENANCE_PG_DSN]; modules=[adapters::disclosure, adapters::health, adapters::postgres,
-//!   telemetry::degrade, telemetry::health, telemetry::metrics, maintenance::main]
+//!   telemetry::health, telemetry::metrics, maintenance::main, maintenance::resident]
 //! Called-by: [maintenance::main]
 //! Invariants: [a scrape never runs SQL, it renders the last publish; a failed or stale (> 2 × interval) sample
 //!   answers 503 with the error and the age, never the last good values; the first sample is taken before the
@@ -13,21 +13,21 @@
 //!
 //! Exactly one process samples (ADR-0061 D-D): one series per gauge, one EXECUTE grant. The finalized-disclosure
 //! watermark lives here: it starts at process start and advances to each successful sample's `as_of`; a failed
-//! sample leaves it where it was, so the next good sample counts the rows the failed one missed.
+//! sample leaves it where it was, so the next good sample counts the rows the failed one missed. It never purges:
+//! the maintenance tasks are `--serve`'s (ADR-0062 D-A).
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use humaux_adapters::disclosure::DisclosureOutcome as DbOutcome;
 use humaux_adapters::health::{HealthSample, read_health_snapshot};
 use humaux_adapters::postgres::MaintenanceDbPool;
-use humaux_telemetry::degrade::{DegradeCode, degrade_last_fired_unix, degrade_total_count};
 use humaux_telemetry::health::{self, AgeBucket, DisclosureOutcome, HealthSnapshot};
-use humaux_telemetry::metrics::{Routes, parse_ops_addr, serve_loopback};
-use serde_json::{Map, json};
+use humaux_telemetry::metrics::Routes;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
-use tokio::signal::unix::{SignalKind, signal};
 
+use crate::resident::{self, Last, Latch, with_statement_timeout};
 use crate::{Failure, Output, Result, env, env_parsed};
 
 /// §78.1 / ADR-0061 D-B: this resident mode's own ops listener address (loopback only, no default).
@@ -43,62 +43,28 @@ pub(crate) fn metrics_families() -> String {
     out
 }
 
-/// What every scrape reads: when the last good sample landed and whether the latest one failed.
-struct Last {
-    ok_at: Instant,
-    error: Option<String>,
-}
-
 fn verdict(last: &Mutex<Last>, interval: Duration) -> std::result::Result<String, String> {
-    let last = last.lock().unwrap_or_else(PoisonError::into_inner);
-    let age = last.ok_at.elapsed().as_secs();
-    // ADR-0061 D-D: a stale gauge looks healthy, so a failed or old sample is a 503, never the last values.
-    if let Some(error) = &last.error {
-        return Err(format!(
-            "health sample failed: {error} (last good sample {age} s ago)\n"
-        ));
-    }
-    if last.ok_at.elapsed() > 2 * interval {
-        return Err(format!(
-            "health sample stale: last good sample {age} s ago (> 2 x {SAMPLE_SECONDS})\n"
-        ));
-    }
-    Ok(metrics_families())
+    let bound = format!("2 x {SAMPLE_SECONDS}");
+    resident::verdict(
+        last,
+        "health sample",
+        2 * interval,
+        &bound,
+        metrics_families,
+    )
 }
 
 fn status(started: SystemTime, last: &Mutex<Last>, interval: Duration) -> String {
-    let unix = |t: SystemTime| t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let degrade: Map<_, _> = DegradeCode::ALL
-        .iter()
-        .map(|&code| {
-            let entry = json!({
-                "count": degrade_total_count(code),
-                "last_fired_at": degrade_last_fired_unix(code),
-            });
-            (code.as_str().to_owned(), entry)
-        })
-        .collect();
+    let mut doc = resident::status_document("health serve", started);
     let sample = verdict(last, interval).err();
-    json!({
-        "process": "humaux-maintenance",
-        "mode": "health serve",
-        "crate_version": env!("CARGO_PKG_VERSION"),
-        "git_sha": option_env!("HUMAUX_BUILD_GIT_SHA"),
-        "started_at": unix(started),
-        "uptime_seconds": started.elapsed().map_or(0, |d| d.as_secs()),
-        "degrade": degrade,
-        "health_sample": sample.map_or_else(|| json!({"state": "pass"}), |e| json!({"state": "fail", "error": e.trim_end()})),
-    })
-    .to_string()
-}
-
-/// ADR-0061 D-D: the server cancels a sample at the interval (`options[...]` is sqlx's startup-parameter form).
-fn with_statement_timeout(dsn: &str, interval: Duration) -> String {
-    let sep = if dsn.contains('?') { '&' } else { '?' };
-    format!(
-        "{dsn}{sep}options[statement_timeout]={}",
-        interval.as_millis()
-    )
+    doc.insert(
+        "health_sample".into(),
+        sample.map_or_else(
+            || json!({"state": "pass"}),
+            |e| json!({"state": "fail", "error": e.trim_end()}),
+        ),
+    );
+    Value::Object(doc).to_string()
 }
 
 /// The adapters row onto the telemetry snapshot; the outcome match is exhaustive, so a new DB outcome is a
@@ -149,21 +115,13 @@ async fn sample(
 
 /// `health serve`: samples every interval until SIGTERM / SIGINT, serving the last sample on the ops listener.
 pub(crate) async fn serve() -> Result<Output> {
-    let addr = parse_ops_addr(&env(METRICS_ADDR)?)
-        .map_err(|reason| Failure::Usage(format!("{METRICS_ADDR}: {reason}")))?;
+    let addr = resident::ops_addr(METRICS_ADDR)?;
     let seconds: u64 = env_parsed(SAMPLE_SECONDS)?;
     if seconds == 0 {
         return Err(Failure::Usage(format!("{SAMPLE_SECONDS} must be > 0")));
     }
     let interval = Duration::from_secs(seconds);
-    // Both handlers before any work (supervision.md §3: Ctrl-C is handled exactly like SIGTERM).
-    let handler = |kind| {
-        signal(kind).map_err(|e| Failure::Infra(format!("cannot install a signal handler: {e}")))
-    };
-    let (mut terminate, mut interrupt) = (
-        handler(SignalKind::terminate())?,
-        handler(SignalKind::interrupt())?,
-    );
+    let mut latch = Latch::install()?;
     let started = SystemTime::now();
     // dep: PostgreSQL(role_maintenance) — the sampler's pool; every statement bounded by the interval
     let pool = MaintenanceDbPool::connect(&with_statement_timeout(&env(PG_DSN)?, interval))
@@ -172,19 +130,13 @@ pub(crate) async fn serve() -> Result<Output> {
     let mut watermark = sample(&pool, OffsetDateTime::now_utc(), interval)
         .await
         .map_err(|e| Failure::Infra(format!("first health sample: {e}")))?;
-    let last = Arc::new(Mutex::new(Last {
-        ok_at: Instant::now(),
-        error: None,
-    }));
+    let last = Arc::new(Last::ok());
     let (for_metrics, for_status) = (Arc::clone(&last), Arc::clone(&last));
     let routes = Routes {
         metrics: Box::new(move || verdict(&for_metrics, interval)),
         status: Box::new(move || Ok(status(started, &for_status, interval))),
     };
-    let listener = serve_loopback(METRICS_ADDR, addr, routes).map_err(|e| match e.kind() {
-        std::io::ErrorKind::InvalidInput => Failure::Usage(e.to_string()),
-        _ => Failure::Infra(e.to_string()),
-    })?;
+    let listener = resident::listen(METRICS_ADDR, addr, routes)?;
     eprintln!(
         "humaux-maintenance: health serve on {} every {seconds} s",
         listener.local_addr()
@@ -195,8 +147,7 @@ pub(crate) async fn serve() -> Result<Output> {
     let mut samples: u64 = 1;
     loop {
         tokio::select! {
-            _ = terminate.recv() => break,
-            _ = interrupt.recv() => break,
+            _ = latch.wait() => break,
             _ = ticker.tick() => {}
         }
         let outcome = sample(&pool, watermark, interval).await;
@@ -206,7 +157,7 @@ pub(crate) async fn serve() -> Result<Output> {
             Ok(as_of) => {
                 watermark = as_of;
                 *guard = Last {
-                    ok_at: Instant::now(),
+                    ok_at: Some(Instant::now()),
                     error: None,
                 };
             }

@@ -287,8 +287,9 @@ Two rules that are not obvious from the variable names:
   beyond which recall / context / memory reads answer `cannot_establish` with reason
   `projection_lag` and the degradation `PROJECTION_LAG`. `WAITING_KEY` does not count; a ticket in
   retry backoff does. Set it above the normal put → `DONE` time of the deployment (distill is
-  usually the long hop, §8) and below the sweep SLA card 35 introduces, or stuck tickets turn
-  `LOST` before they ever read as lag. The rehearsal uses 20.
+  usually the long hop, §8) and below `HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS` (the LOST sweep of
+  "Scheduled maintenance" below; the daemon refuses to boot unless LOST_AFTER is greater), or stuck tickets
+  would turn `LOST` before they ever read as lag. The rehearsal uses 20.
 - **Qdrant server ≥ 1.19.0** (ADR-0057 D-I). The projection runner fences every point upsert with
   Qdrant's `update_filter` and every delete with a `source_stream_seq` filter, so a reclaimed
   runner's late write cannot undo a later ticket's. 1.19.0 is the version this behaviour was
@@ -314,7 +315,11 @@ Two rules that are not obvious from the variable names:
    placement is never claimed (the runner logs `placement_missing tenants=<n> tickets=<m>`).
    Readiness: the process is alive AND `--readyz` exits 0 (`docs/ops/supervision.md` §4 rule 3).
 4. `humaux-consolidation-worker --serve`
-5. `humaux-gateway`
+5. `humaux-maintenance health serve` (ADR-0061 D-D), then `humaux-maintenance --serve` (card 35, ADR-0062 D-A) —
+   after migrations 0214-0222 and `health serve`, before traffic. PostgreSQL is its only dependency; it is ready
+   when `GET /metrics` on `HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR` answers 200 (one clean cycle). What it runs:
+   "Scheduled maintenance" below.
+6. `humaux-gateway`
 
 Before card 27 nothing in this runbook drove projection at all: tickets stayed `ISSUED` and recall
 never saw a new memory (audit P1-1). One line per pass shows the runner working:
@@ -329,6 +334,62 @@ The order is not a preference: the consolidation worker's `--readyz` probes the 
 UDS peer, and the gateway's semantic recall needs the retrieval worker's socket. Starting a
 consumer before its socket exists produces a readiness failure that names the missing socket
 (`docs/ops/supervision.md` §2) — correct behaviour, but an avoidable page.
+
+## 5.1 Scheduled maintenance (`humaux-maintenance --serve`, card 35, ADR-0062)
+
+One resident unit, one instance, one env file shared with the gateway and the private worker (it reads
+`HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS` and `HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS` under their own
+names; two env files could disagree — ADR-0062 L4). Every `HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS` it runs each
+**due** task (its `<T>_EVERY_SECONDS` has passed, ≥ CYCLE) over one page of `HUMAUX_MAINTENANCE_SERVE_TENANTS_PER_RUN`
+tenants (`control.maintenance_tenant_page`, ids only), one transaction and **one statement** per tenant with LIMIT
+`<T>_LIMIT`. Every key below is required with no default (prefix `HUMAUX_MAINTENANCE_SERVE_`, full list and readers
+in `docs/architecture/env_vars.md`); every age is sent as an interval and compared with the **DB clock** inside the
+door. A full rotation takes `ceil(tenants / TENANTS_PER_RUN) × EVERY` (ADR-0062 L1).
+
+| task (`task` label) | door (one statement per tenant) | cadence / limit keys | age key | never touches | evidence |
+|---|---|---|---|---|---|
+| `lost` | `stream_repo::sweep_lost`: ISSUED → LOST, oldest first | `LOST_EVERY_SECONDS`, `LOST_LIMIT` | `LOST_AFTER_SECONDS` (> `HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS`) | a ticket under a live runner lease, a ticket in retry backoff, a ticket with an in-flight job, a ticket whose Evidence is still being distilled (`EVIDENCE_ACCEPTED` row PENDING / PROCESSING) | the row itself: `state = LOST`, `error_class = ORPHANED_PIPELINE_ITEM`, `lost_at` (the reissue cool-down counts from it) |
+| `quota_reservations` | `control.reap_quota_reservations` (0113) | `QUOTA_RESERVATIONS_*` | — (reservation TTL) | live reservations | the reaped reservations' state |
+| `provider_budgets` | `ops.reap_expired_retrieval_provider_budget` (0117) | `PROVIDER_BUDGETS_*` | — (reservation TTL) | live reservations | the reaped reservations' state |
+| `confirm_tokens` | `control.sweep_confirm_tokens(interval, integer)` (0218) | `CONFIRM_TOKENS_*` | `CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS` | an unexpired token; a consumed token younger than the retention (§9 audit) | `ops.maintenance_receipts` task `confirm_tokens` |
+| `snapshots` | `ops.purge_expired_selection_snapshots(integer)` (0218): snapshot + items in one statement | `SNAPSHOTS_*` | — (DB `expires_at`) | an unexpired snapshot; a page read already running (one-statement read, ADR-0062 D-H) | receipts task `selection_snapshots` (counted in snapshots) |
+| `rate_buckets` | `control.purge_idle_rate_buckets(interval, integer)` (0218) | `RATE_BUCKETS_*` | `RATE_BUCKETS_IDLE_SECONDS` | a bucket that would not be full now; a bucket a consumer holds (same advisory key) | receipts task `rate_buckets` |
+| `jobs` | `ops.purge_terminal_jobs(interval, interval, interval, integer)` (0218) | `JOBS_*` | `JOBS_DONE_RETENTION_SECONDS`, `JOBS_DEAD_RETENTION_SECONDS`, budget window = `HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS` | a job with a provider call inside the budget window; a contribution-linked job; a DEAD distill job `jobs requeue-dead` could still re-arm (its Evidence row is not DONE); every outbox row (no outbox door, ruling E11) | receipts task `terminal_jobs` |
+| `reissue` | `projection.reissue_unsettled_tickets(uuid, interval, integer)` (0220; cool-down clock incl. `lost_at`, 0223) | `REISSUE_*` | `REISSUE_COOLDOWN_SECONDS` (> 0) | a tombstoned or non-indexable memory; a memory with a ticket in flight; a deterministic failure already reissued once | `projection.ticket_reissues` (one row per fresh ticket) |
+| `redrive` | `ops.auto_redrive_schema_failed(uuid, interval, integer)` (0221) + one §77 row | `REDRIVE_*` | `REDRIVE_COOLDOWN_SECONDS` (> 0) | any class but `FAILED_OUTPUT_SCHEMA`; a job already re-driven once (`auto_redrives = 1`) | `control.audit_events` action `DISTILL_AUTO_REDRIVE` |
+
+- **What an operator reads**, as `role_maintenance` with the tenant GUC: `SELECT task, sum(affected), max(ran_at)
+  FROM ops.maintenance_receipts WHERE tenant_id = $1 AND ran_at > now() - interval '1 day' GROUP BY task`.
+  Fleet-wide: `maintenance_task_rows_total{task}` and `maintenance_task_runs_total{task,outcome}` on the daemon's
+  `/metrics`; `MaintenanceCountersAbsent` (WARNING) fires while the daemon answers 503 or is not scraped, and
+  `MaintenanceTaskFailing` (WARNING) records any failed call of the last hour once a clean scrape reads it. A call that deletes
+  nothing writes no receipt.
+- **Pause one task**: raise its `<T>_EVERY_SECONDS` and restart the unit (there is no per-task off switch: a
+  disabled purge is unbounded growth).
+- **The jobs door frees `idempotency_key`** (ADR-0062 L5): safe while every producer's key derives from a row
+  created once (outbox row, PRIMARY evidence, `(schedule_id, planned_at)`, `(outbox row, consumer)`). A new
+  producer that re-presents an old key must keep its jobs out of the door first.
+- **Manual one-shot**: `humaux-maintenance sweep once --actor … --reason … --ticket … --step-up-auth …` reads the
+  same keys except `METRICS_ADDR` and the `*_EVERY_SECONDS`, runs every task for one page, prints one receipt with
+  per-task counts and exits 1 if any call failed (ADR-0062 D-Q).
+
+### 5.2 Running the daemon against a database that already holds residue (ruling E8)
+
+The first `--serve` (or `sweep once`) against a long-lived database deletes shared rows across every tenant and
+makes irreversible ISSUED → LOST transitions, permanent reissue tickets and live re-drive model calls. That is a
+production-class destructive step: the shared dev database (`humaux_thread_dev`) is **never** pointed at by a
+test, a gate or the rehearsal (they use throwaway databases). When an operator decides to run it:
+
+1. **Backup first**, as the owner, of exactly what it can change:
+   `pg_dump -Fc -t control.confirm_tokens -t ops.selection_snapshots -t ops.selection_snapshot_items
+   -t control.rate_buckets -t ops.jobs -t ops.distill_calls -t projection.stream_log -t projection.stream_checkpoints
+   -t ops.outbox -t control.audit_events -t projection.ticket_reissues -t ops.maintenance_receipts <db> > pre_maintenance.dump`,
+   and keep the file until the run is reviewed.
+2. **State the impact** before running: the counts each door would take now (e.g. expired snapshots, DEAD/DONE jobs
+   past the retentions, ISSUED tickets older than `LOST_AFTER` with no live lease, Q memories, schema-failed deaths).
+3. **Run once with explicit retentions**: `humaux-maintenance sweep once` with the §77 fields (actor, reason,
+   ticket, step-up) and the keys chosen for this run; read its receipt, then the receipts table.
+4. Only then start the resident unit.
 
 ## 6. First activation — performed by onboarding (ADR-0053)
 

@@ -5,11 +5,14 @@
 //!   control.rate_buckets, control.tenants, control.usage_reservations, control.users]
 //!   x=[control.issue_quota_window], PostgreSQL(role_gateway), PostgreSQL(role_maintenance)];
 //!   env=[HUMAUX_GATEWAY_PG_DSN, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[adapters::postgres,
-//!   adapters::quota_repo, domain::error, domain::identity, domain::ids, humaux-testkit]
+//!   adapters::quota_repo, adapters::tests::support::throwaway_db, domain::error, domain::identity, domain::ids,
+//!   humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [needs the dedicated RequestGuard fixture after migration 0113 (gateway + maintenance DSNs); exhausted
-//!   windows are QuotaExhausted/RateLimited, never an allow; the fixture tests are #[ignore] lane tests]
-//! Spec: Baseline §72.2.1; §79.2
+//!   windows are QuotaExhausted/RateLimited, never an allow; the fixture tests are #[ignore] lane tests; the SEC-6
+//!   pre-auth IP tests are not ignored and own a throwaway database each, because pre-auth buckets live under the
+//!   system tenant, which no fixture Drop on the shared database may clean]
+//! Spec: Baseline §72.2.1; §73.2; §79.2; ADR-0062 E5
 //!
 //! These tests intentionally require the dedicated RequestGuard fixture after migration 0113.
 
@@ -32,6 +35,10 @@ use postgres::{Client, NoTls};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::types::Uuid;
 use tokio::sync::Barrier;
+
+#[path = "support/throwaway_db.rs"]
+#[allow(dead_code)]
+mod throwaway_db;
 
 const FIXTURE_DB: &str = "humaux_thread_request_guard_20260828";
 const TENANT_ID: Uuid = Uuid::from_u128(0x0bad_cafe_0000_4000_8000_0000_0000_0101);
@@ -779,5 +786,106 @@ fn a_contended_rate_bucket_waits_for_its_holder_instead_of_answering_rate_limite
             held_for >= Duration::from_millis(400),
             "the consumer waited for the holder rather than refusing: {held_for:?}"
         );
+    });
+}
+
+/// Fields drop in order: the pool and the owner connection close before `_db` drops the database.
+struct PreauthHandle {
+    rt: tokio::runtime::Runtime,
+    runtime: RuntimeDbPool,
+    admin: Client,
+    _db: throwaway_db::ThrowawayDb,
+}
+
+struct PreauthFixture;
+
+impl DbIntegrationFixture for PreauthFixture {
+    type Handle = PreauthHandle;
+
+    fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
+        let setup = |e: String| DbFixtureSkipReason::IsolationSetupFailed(e);
+        let db = throwaway_db::create("c35_sec6")?;
+        let dsn = db.dsn();
+        // dep: PostgreSQL(any) — owner connection reading the bucket keys of this test's throwaway database
+        let admin = Client::connect(&dsn, NoTls)
+            .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
+        let rt = tokio::runtime::Runtime::new().map_err(|e| setup(e.to_string()))?;
+        let sep = if dsn.contains('?') { '&' } else { '?' };
+        // dep: PostgreSQL(role_gateway) — the pre-auth rate consumer
+        let runtime = rt
+            .block_on(RuntimeDbPool::connect(&format!(
+                "{dsn}{sep}options=-c%20role%3Drole_gateway"
+            )))
+            .map_err(|e| setup(e.to_string()))?;
+        Ok(PreauthHandle {
+            rt,
+            runtime,
+            admin,
+            _db: db,
+        })
+    }
+}
+
+impl PreauthHandle {
+    /// One pre-auth call from `ip` against a capacity-1 bucket.
+    fn consume(&self, ip: &str) -> Result<(), ErrorCode> {
+        self.rt.block_on(quota_repo::consume_rate(
+            &self.runtime,
+            RateSubject::PreauthIp(ip.parse().expect("ip literal")),
+            "mcp.read",
+            "default",
+            RatePolicy::new(1, 1).expect("policy"),
+        ))
+    }
+
+    fn ip_buckets(&mut self) -> Vec<String> {
+        self.admin
+            .query(
+                "SELECT subject_id FROM control.rate_buckets WHERE subject_kind = 'ip' ORDER BY subject_id",
+                &[],
+            )
+            .expect("ip buckets")
+            .iter()
+            .map(|r| r.get(0))
+            .collect()
+    }
+}
+
+/// T-S1 (SEC-6, §73.2): two addresses of one IPv6 /64 are one client and drain one pre-auth bucket. Fault: key by
+/// `ip.to_string()` ⇒ the second address gets its own full bucket ⇒ red.
+#[test]
+fn two_ipv6_addresses_in_one_64_share_a_preauth_bucket() {
+    run_db_fixture::<PreauthFixture, _>(
+        "two_ipv6_addresses_in_one_64_share_a_preauth_bucket",
+        |mut h| {
+            assert_eq!(h.consume("2001:db8:1:2::1"), Ok(()));
+            assert_eq!(
+                h.consume("2001:db8:1:2:ffff:ffff:ffff:ffff"),
+                Err(ErrorCode::RateLimited)
+            );
+            assert_eq!(h.ip_buckets(), ["2001:db8:1:2::/64"]);
+        },
+    );
+}
+
+/// T-S2 (SEC-6): neighbouring /64s inside one /48 are different clients. Fault: mask /48 ⇒ they share ⇒ red.
+#[test]
+fn ipv6_addresses_in_different_64s_do_not_share() {
+    run_db_fixture::<PreauthFixture, _>("ipv6_addresses_in_different_64s_do_not_share", |mut h| {
+        assert_eq!(h.consume("2001:db8:1:2::1"), Ok(()));
+        assert_eq!(h.consume("2001:db8:1:3::1"), Ok(()));
+        assert_eq!(h.ip_buckets(), ["2001:db8:1:2::/64", "2001:db8:1:3::/64"]);
+    });
+}
+
+/// T-S3 (SEC-6, §73.2 canonicalisation): IPv4 keys by its full address, and an IPv4-mapped IPv6 address is that
+/// IPv4 client. Fault: mask v4 to /24 ⇒ `.10` shares `.9`'s bucket ⇒ red.
+#[test]
+fn ipv4_keeps_its_full_address_key() {
+    run_db_fixture::<PreauthFixture, _>("ipv4_keeps_its_full_address_key", |mut h| {
+        assert_eq!(h.consume("203.0.113.9"), Ok(()));
+        assert_eq!(h.consume("203.0.113.10"), Ok(()));
+        assert_eq!(h.consume("::ffff:203.0.113.9"), Err(ErrorCode::RateLimited));
+        assert_eq!(h.ip_buckets(), ["203.0.113.10", "203.0.113.9"]);
     });
 }

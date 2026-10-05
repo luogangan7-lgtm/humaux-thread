@@ -2181,10 +2181,70 @@ mod tests {
     /// variable becomes `PATH` (always set) so no test touches the environment.
     #[test]
     fn rehearse_script_soak_invocation_parses() {
-        let script = std::fs::read_to_string(
+        let cfg = rehearse_soak_config();
+        let names: Vec<&str> = cfg.watch_pidfiles.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["gw", "rw", "pw", "ds", "cw", "rp", "md"]);
+        assert!(cfg.chaos_grace.is_some() && cfg.max_op_failure_rate > 0.0);
+        // card 27 / ADR-0052: the projection runner is in the kill rotation, and the soak grades
+        // all three tenants the rehearsal seeds.
+        assert!(
+            cfg.chaos_cmds
+                .iter()
+                .any(|c| c.ends_with("soak_chaos_rp.sh"))
+        );
+        assert_eq!(cfg.tenants.len(), 3);
+    }
+
+    /// ADR-0062 D-T (card 35): the resident maintenance daemon is in the kill rotation — its chaos hook is passed to
+    /// the soak, its pidfile is watched, and the hook kill -9s exactly that pidfile's `humaux-maintenance` and
+    /// restarts `--serve` from the one `$MD_ENV` definition. Fault: drop it from the rotation list ⇒ red.
+    #[test]
+    fn rotation_includes_the_maintenance_daemon() {
+        let cfg = rehearse_soak_config();
+        assert!(
+            cfg.chaos_cmds
+                .iter()
+                .any(|c| c.ends_with("/soak_chaos_md.sh")),
+            "chaos rotation: {:?}",
+            cfg.chaos_cmds
+        );
+        assert!(
+            cfg.watch_pidfiles
+                .iter()
+                .any(|(n, p)| n == "md" && p.ends_with("md.pid")),
+            "watched: {:?}",
+            cfg.watch_pidfiles
+        );
+        let script = rehearse_script();
+        let hook = script
+            .split("cat > $S/soak_chaos_md.sh <<EOF")
+            .nth(1)
+            .and_then(|rest| rest.split("\nEOF\n").next())
+            .expect("the soak_chaos_md.sh heredoc");
+        assert!(
+            hook.contains("own_signal $S/md.pid humaux-maintenance 9"),
+            "kill -9 by pidfile only: {hook}"
+        );
+        assert!(
+            hook.contains("$MD_ENV") && hook.contains("humaux-maintenance --serve"),
+            "restarts the same daemon: {hook}"
+        );
+        assert!(
+            hook.contains("echo \\$! > $S/md.pid"),
+            "pidfile kept current: {hook}"
+        );
+    }
+
+    fn rehearse_script() -> String {
+        std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/ops/rehearse.sh"),
         )
-        .expect("docs/ops/rehearse.sh");
+        .expect("docs/ops/rehearse.sh")
+    }
+
+    /// The rehearsal's soak invocation through the real parser (see the test above).
+    fn rehearse_soak_config() -> Config {
+        let script = rehearse_script();
         let start = script
             .find("cargo run -q -p xtask -- soak")
             .expect("soak invocation");
@@ -2233,18 +2293,7 @@ mod tests {
             .skip_while(|w| w != "soak")
             .skip(1)
             .collect();
-        let cfg = parse_config(&args).unwrap_or_else(|e| panic!("{e}\nargs: {args:?}"));
-        let names: Vec<&str> = cfg.watch_pidfiles.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["gw", "rw", "pw", "ds", "cw", "rp"]);
-        assert!(cfg.chaos_grace.is_some() && cfg.max_op_failure_rate > 0.0);
-        // card 27 / ADR-0052: the projection runner is in the kill rotation, and the soak grades
-        // all three tenants the rehearsal seeds.
-        assert!(
-            cfg.chaos_cmds
-                .iter()
-                .any(|c| c.ends_with("soak_chaos_rp.sh"))
-        );
-        assert_eq!(cfg.tenants.len(), 3);
+        parse_config(&args).unwrap_or_else(|e| panic!("{e}\nargs: {args:?}"))
     }
 
     /// `applied` and `projected` move together in the healthy fixture; the tests that care

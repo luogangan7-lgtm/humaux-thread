@@ -1,7 +1,7 @@
 //! `telemetry::degrade` — `DegradeCode`, `Outcome<T>`, and `abstain()`: the single fail-open topology for the whole
 //!   workspace (§53).
 //! Depends-on: crates=[humaux-domain, smallvec, tracing]; services=[]; env=[]; modules=[domain::error, telemetry::metrics]
-//! Called-by: [admin::ops_status, gateway::status, maintenance::health_serve, retrieval::envelope, telemetry::metrics, tests]
+//! Called-by: [admin::ops_status, gateway::status, maintenance::resident, retrieval::envelope, telemetry::metrics, tests]
 //! Invariants: [abstain() is the only writer of a non-empty degradations; Outcome::also joins codes through it;
 //!   abstain() holds the one `degrade_total` increment and the last-fired store]
 //! Spec: Baseline §53.3; §41.2; ADR-0057; ADR-0061 D-A

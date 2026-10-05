@@ -1,0 +1,36 @@
+# §46.1 migration manifest. Card 35 S7 / ADR-0062 D-K (P1-14): one nullable column
+# ops.selection_snapshots.continues_before uuid, the keyset bound of a capped memory.enumerate manifest. No new table,
+# role, GRANT or policy (table-level grants extend to the column); no DML.
+
+migration_id = "0222_selection_snapshot_segments"
+class = "EXPAND_CONTRACT"
+
+# Refuses a database without the 0165 census columns (the segment census is stored there) or with the column present.
+precheck = """
+select to_regclass('ops.selection_snapshots') is not null
+ and exists (select 1 from information_schema.columns
+              where table_schema = 'ops' and table_name = 'selection_snapshots' and column_name = 'census_total')
+ and not exists (select 1 from information_schema.columns
+                  where table_schema = 'ops' and table_name = 'selection_snapshots'
+                    and column_name = 'continues_before')
+ as precheck_ok
+"""
+
+# Fails on a missing, non-uuid or NOT NULL column (every pre-0222 row must stay legal), an RLS posture changed by
+# the ALTER, a gateway that cannot write or read the column, or a role that gained DELETE or a maintenance write.
+postcheck = """
+select
+ (select c.data_type = 'uuid' and c.is_nullable = 'YES' and c.column_default is null
+    from information_schema.columns c
+   where c.table_schema = 'ops' and c.table_name = 'selection_snapshots' and c.column_name = 'continues_before')
+ and (select relrowsecurity and relforcerowsecurity from pg_class where oid = 'ops.selection_snapshots'::regclass)
+ and has_column_privilege('role_gateway', 'ops.selection_snapshots', 'continues_before', 'INSERT')
+ and has_column_privilege('role_gateway', 'ops.selection_snapshots', 'continues_before', 'SELECT')
+ and not has_table_privilege('role_gateway', 'ops.selection_snapshots', 'DELETE')
+ and not has_table_privilege('role_maintenance', 'ops.selection_snapshots', 'DELETE')
+ and not has_column_privilege('role_maintenance', 'ops.selection_snapshots', 'continues_before', 'UPDATE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix after deployment. Reverting is ALTER TABLE ops.selection_snapshots DROP COLUMN continues_before, after the gateway that writes it is rolled back; a reverted gateway mints uncapped manifests again (P1-14 returns) and widens no tenant's data access."
+backup_restore_requirement = "none: one ADD COLUMN with a NULL default (no table rewrite); no row data is read, written or deleted."

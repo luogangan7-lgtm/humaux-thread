@@ -18,6 +18,7 @@
 //!   HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS, HUMAUX_GATEWAY_BIND_ADDR,
 //!   HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS,
 //!   HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX,
+//!   HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP, HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS,
 //!   HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
 //!   HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST, HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS,
 //!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES, HUMAUX_GATEWAY_METRICS_ADDR,
@@ -298,6 +299,8 @@ fn application_with_budget(
     .expect("positive fixture undo window")
     .with_mood_half_life(MOOD_HALF_LIFE)
     .expect("positive fixture mood half-life")
+    .with_enumeration(Duration::from_secs(900), 1000)
+    .expect("positive fixture enumeration policy")
 }
 
 /// §8.5.1 / ADR-0030 D-B fixture policy (`HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS` in the binary
@@ -5546,6 +5549,12 @@ const GATEWAY_PROCESS_START_TIMEOUT: Duration = Duration::from_secs(5);
 /// dials a fresh connection per poll.
 const GATEWAY_PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// ADR-0062 D-K: the spawned gateway's required `memory.enumerate` manifest lifetime and cap.
+const ENUMERATION_KEYS: [(&str, &str); 2] = [
+    ("HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS", "900"),
+    ("HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP", "1000"),
+];
+
 #[derive(Clone)]
 struct GatewayProcessConfig {
     values: BTreeMap<String, String>,
@@ -5646,6 +5655,7 @@ impl GatewayProcessConfig {
                 "1".into(),
             ),
         ]);
+        values.extend(ENUMERATION_KEYS.map(|(key, value)| (key.into(), value.into())));
         for name in ["PREAUTH_IP", "CREDENTIAL", "USER", "TENANT", "OPERATION"] {
             values.insert(format!("HUMAUX_GATEWAY_RATE_{name}_CAPACITY"), "100".into());
             values.insert(

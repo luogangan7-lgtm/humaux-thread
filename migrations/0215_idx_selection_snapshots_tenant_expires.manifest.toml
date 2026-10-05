@@ -1,0 +1,20 @@
+# §46.1 migration manifest. Card 35 S2 / ADR-0062: one CONCURRENTLY index serving a 0218 purge door's per-tenant
+# victim scan, run outside a transaction (`transaction = "none"`, honoured by xtask migrate; the 0213 shape).
+# Index-only, safely droppable.
+
+migration_id = "0215_idx_selection_snapshots_tenant_expires"
+class = "REVERSIBLE"
+transaction = "none"
+
+precheck = """
+select to_regclass('ops.selection_snapshots_tenant_expires_idx') is null as precheck_ok
+"""
+
+postcheck = """
+select coalesce((select indisvalid and indisready and indrelid = 'ops.selection_snapshots'::regclass
+                        and pg_get_indexdef(indexrelid) like '%(tenant_id, expires_at)%' and indpred is null
+                   from pg_index where indexrelid = to_regclass('ops.selection_snapshots_tenant_expires_idx')), false) as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP INDEX CONCURRENTLY IF EXISTS ops.selection_snapshots_tenant_expires_idx; (also the fix for an INVALID leftover of a failed build, which the precheck refuses by name)"
+backup_restore_requirement = "none: index-only DDL built CONCURRENTLY, no row data touched, safely droppable"

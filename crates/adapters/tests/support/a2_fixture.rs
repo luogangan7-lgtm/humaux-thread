@@ -98,6 +98,11 @@ pub struct Handle {
     pub reasoning_domain_id: Uuid,
     pub scanner: Arc<LocalSecretScanner>,
     pub gov: Governor,
+    /// The owner DSN every pool of this handle derives from.
+    pub dsn: String,
+    retrieval_dsn: String,
+    /// The throwaway database this handle lives in (dropped last, after every pool), if any.
+    _db: Option<Box<dyn std::any::Any>>,
 }
 
 impl Drop for Handle {
@@ -170,11 +175,36 @@ impl DbIntegrationFixture for Fixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
-        let env = |name: &str| {
-            std::env::var(name).map_err(|_| {
-                DbFixtureSkipReason::IsolationSetupFailed(format!("missing object: {name}"))
-            })
-        };
+        let retrieval = env("HUMAUX_RETRIEVAL_WORKER_PG_DSN")?;
+        let maintenance = env("HUMAUX_MAINTENANCE_PG_DSN")?;
+        Handle::open(dsn, retrieval, maintenance, None)
+    }
+}
+
+fn env(name: &str) -> Result<String, DbFixtureSkipReason> {
+    std::env::var(name)
+        .map_err(|_| DbFixtureSkipReason::IsolationSetupFailed(format!("missing object: {name}")))
+}
+
+impl Handle {
+    /// The fixture in its own throwaway database `db` (owner DSN `dsn`): every runtime pool connects to it as its
+    /// role, so ticket writes the shared dev database must never see (reissues, ADR-0062 E8) stay there. `db` is
+    /// dropped after every pool.
+    pub fn in_throwaway(
+        dsn: String,
+        db: Box<dyn std::any::Any>,
+    ) -> Result<Self, DbFixtureSkipReason> {
+        let retrieval = dsn_as_role(&dsn, "role_retrieval_worker");
+        let maintenance = dsn_as_role(&dsn, "role_maintenance");
+        Self::open(dsn, retrieval, maintenance, Some(db))
+    }
+
+    fn open(
+        dsn: String,
+        retrieval_dsn: String,
+        maintenance_dsn: String,
+        db: Option<Box<dyn std::any::Any>>,
+    ) -> Result<Self, DbFixtureSkipReason> {
         // dep: PostgreSQL(any) — the owner connection that seeds and cleans the fixture tenant
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
@@ -210,15 +240,11 @@ impl DbIntegrationFixture for Fixture {
             .map_err(setup("role_gateway pool"))?;
         // dep: PostgreSQL(role_retrieval_worker) — the worker and the ledger closure
         let retrieval = rt
-            .block_on(RetrievalWorkerDbPool::connect(&env(
-                "HUMAUX_RETRIEVAL_WORKER_PG_DSN",
-            )?))
+            .block_on(RetrievalWorkerDbPool::connect(&retrieval_dsn))
             .map_err(setup("role_retrieval_worker pool"))?;
-        // dep: PostgreSQL(role_maintenance) — the audited FAILED retirement
+        // dep: PostgreSQL(role_maintenance) — the audited FAILED retirement and the reissue door
         let maintenance = rt
-            .block_on(MaintenanceDbPool::connect(&env(
-                "HUMAUX_MAINTENANCE_PG_DSN",
-            )?))
+            .block_on(MaintenanceDbPool::connect(&maintenance_dsn))
             .map_err(setup("role_maintenance pool"))?;
         let (registry, transport, collection) = rt.block_on(setup_qdrant_collection())?;
         Ok(Handle {
@@ -234,6 +260,9 @@ impl DbIntegrationFixture for Fixture {
             reasoning_domain_id,
             scanner: Arc::new(scanner),
             gov,
+            dsn,
+            retrieval_dsn,
+            _db: db,
         })
     }
 }
@@ -511,11 +540,10 @@ impl Handle {
         transport: Arc<dyn IntraCellHttpTransport>,
         version: &str,
     ) -> ProjectionWorkerDeps {
-        let dsn = std::env::var("HUMAUX_RETRIEVAL_WORKER_PG_DSN").expect("checked in isolate()");
         // dep: PostgreSQL(role_retrieval_worker) — the worker's own pool for one drain
         let pool = self
             .rt
-            .block_on(RetrievalWorkerDbPool::connect(&dsn))
+            .block_on(RetrievalWorkerDbPool::connect(&self.retrieval_dsn))
             .expect("role_retrieval_worker connects");
         ProjectionWorkerDeps {
             pool,
@@ -706,9 +734,8 @@ impl Handle {
 
     pub fn admin_query_ids(&self, memory: Uuid) -> Vec<Uuid> {
         // A fresh owner connection: `points_of` borrows `self` immutably.
-        let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("dsn");
         // dep: PostgreSQL(any) — read the registry rows of one memory
-        let mut admin = Client::connect(&dsn, NoTls).expect("owner connects");
+        let mut admin = Client::connect(&self.dsn, NoTls).expect("owner connects");
         admin
             .query(
                 "SELECT point_id FROM projection.private_memory_points WHERE memory_id = $1",

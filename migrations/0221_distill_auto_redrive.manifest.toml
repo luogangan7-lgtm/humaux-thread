@@ -1,0 +1,54 @@
+# §46.1 migration manifest. Card 35 S6 / ADR-0062 D-P (card 32 debt, ADR-0058 L23): the automatic re-drive of a
+# schema-failed distill death. One column ops.jobs.auto_redrives (no grant: only the door writes it) and the owner
+# SECURITY DEFINER door ops.auto_redrive_schema_failed(uuid, interval, integer), EXECUTE role_maintenance only. No
+# DML, no existing function changed; no role gains a table write.
+
+migration_id = "0221_distill_auto_redrive"
+class = "EXPAND_CONTRACT"
+
+# Refuses a database without 0200's re-drive door (the only re-arm path this door calls) or with either object
+# already present.
+precheck = """
+select to_regprocedure('ops.auto_redrive_schema_failed(uuid,interval,integer)') is null
+   and to_regprocedure('ops.requeue_dead_distill(uuid,uuid,text)') is not null
+   and not exists (select 1 from information_schema.columns
+                    where table_schema = 'ops' and table_name = 'jobs' and column_name = 'auto_redrives')
+ as precheck_ok
+"""
+
+# Fails on the column without its NOT NULL default 0, a runtime role able to write it, a changed owner / security /
+# volatility / search_path of the door, a body without its exact class, once, cool-down, tenant or re-drive-path
+# fences, a body naming a row-removing verb, or any EXECUTE beyond role_maintenance (PUBLIC included).
+postcheck = """
+select
+ (select c.data_type = 'smallint' and c.is_nullable = 'NO' and c.column_default = '0'
+    from information_schema.columns c
+   where c.table_schema = 'ops' and c.table_name = 'jobs' and c.column_name = 'auto_redrives')
+ and not exists (
+       select 1 from unnest(array['role_maintenance', 'role_consolidation_worker', 'role_batch_issuer',
+                                  'role_admin', 'role_health_reader']) r(role)
+        where has_column_privilege(r.role, 'ops.jobs', 'auto_redrives', 'UPDATE'))
+ and (select p.prosecdef and pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.provolatile = 'v'
+        and 'search_path=pg_catalog' = any(coalesce(p.proconfig, array[]::text[]))
+        and p.prosrc ~ 'j\\.last_error_class = ''FAILED_OUTPUT_SCHEMA'''
+        and p.prosrc ~ 'j\\.auto_redrives = 0'
+        and p.prosrc ~ '< now\\(\\) - p_cooldown'
+        and p.prosrc ~ 'ops\\.requeue_dead_distill\\(p_tenant, v\\.job_id, NULL\\)'
+        and p.prosrc ~ 'current_setting\\(''humaux\\.tenant_id'''
+        and p.prosrc !~* '\\mDELETE\\M'
+      from pg_proc p where p.oid = to_regprocedure('ops.auto_redrive_schema_failed(uuid,interval,integer)'))
+ and has_function_privilege('role_maintenance', 'ops.auto_redrive_schema_failed(uuid,interval,integer)', 'EXECUTE')
+ and not exists (
+       select 1 from unnest(array['role_gateway', 'role_private_worker', 'role_consolidation_worker',
+                                  'role_public_worker', 'role_retrieval_worker', 'role_batch_issuer',
+                                  'role_admin', 'role_health_reader']) r(role)
+        where has_function_privilege(r.role, 'ops.auto_redrive_schema_failed(uuid,interval,integer)', 'EXECUTE'))
+ and not exists (
+       select 1 from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+        where p.oid = to_regprocedure('ops.auto_redrive_schema_failed(uuid,interval,integer)')
+          and x.grantee = 0 and x.privilege_type = 'EXECUTE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback before any call: DROP FUNCTION ops.auto_redrive_schema_failed(uuid,interval,integer); ALTER TABLE ops.jobs DROP COLUMN auto_redrives. Once the door has run, forward fix only: the jobs it re-armed are ordinary PENDING distill jobs; to stop it, REVOKE EXECUTE (the daemon's redrive task then fails and answers 503) and keep the column as the record."
+backup_restore_requirement = "none for the DDL: a defaulted column (metadata only) and a new function, no row touched. Running the door re-arms jobs and spends provider calls; on a shared database it is part of the operator-run sweep of the runbook (ruling E8)."

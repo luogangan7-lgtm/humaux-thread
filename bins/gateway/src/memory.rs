@@ -324,9 +324,6 @@ pub(crate) async fn enumerate<T>(
     )
 }
 
-/// Bootstrap policy for this cursor protocol; callers cannot extend it in MCP arguments.
-pub(crate) const ENUMERATION_TTL: Duration = Duration::from_secs(15 * 60);
-
 /// §36 `memory.supersede`, second (confirmed) call. The write stream is derived per request
 /// (`write_scope`, ADR-0054 D-A: principal tenant + the guard-routed workspace, provisioned
 /// pairs only) and authorizes the write; the lifecycle ticket itself lands on the target's home

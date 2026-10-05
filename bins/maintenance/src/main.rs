@@ -1,7 +1,8 @@
 //! `maintenance::main` — `humaux-maintenance`, the operator-write CLI (§4.2): onboarding, API keys, placement,
 //!   activation, re-drive of DEAD distill jobs, role-password rotation, the deploy-check, opening/closing
 //!   the API-key pepper rehash window and the reasoning-route doors (register / bind / attest-health /
-//!   profile-state / status, ADR-0060 D-H), and the one resident mode `health serve` (ADR-0061 D-D).
+//!   profile-state / status, ADR-0060 D-H), `sweep once` (one page of every maintenance task, ADR-0062 D-Q), and
+//!   the two resident modes `health serve` (ADR-0061 D-D) and `--serve`, the maintenance daemon (ADR-0062).
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, rand, serde, serde_json, time, tokio, uuid];
 //!   services=[PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX,
 //!   HUMAUX_MAINTENANCE_EMBEDDING_DIMENSION, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MAINTENANCE_PRIVATE_MEMORY_COLLECTION,
@@ -9,20 +10,23 @@
 //!   modules=[adapters::byok, adapters::membership_repo, adapters::postgres, adapters::provisioning,
 //!   adapters::quota_repo, adapters::reasoning_route_onboarding, adapters::role_hygiene,
 //!   domain::identity, domain::ids, domain::ticket_family, maintenance::health_serve, maintenance::roles,
-//!   protocol::edge]
+//!   maintenance::serve, protocol::edge]
 //! Called-by: [process(humaux-maintenance)]
-//! Invariants: [every subcommand but `health serve` is one-shot; one JSON receipt on stdout per run; exit 0 created/existing, 3 refused, 2 usage, 1
+//! Invariants: [every subcommand but `health serve` and `--serve` is one-shot; one JSON receipt on stdout per run; exit 0 created/existing, 3 refused, 2 usage, 1
 //!   infrastructure (PostgreSQL/Qdrant down); the wire key and generated role passwords are printed once on stdout
 //!   before the receipt, never on stderr or in a receipt; no flag or env var has a literal default]
-//! Spec: Baseline §4.2; §6.2.2; §11.2.3; §41.2; §73.5; §77; §78.1; ADR-0053; ADR-0058; ADR-0059; ADR-0060; ADR-0061
+//! Spec: Baseline §4.2; §6.2.2; §11.2.3; §41.2; §73.5; §77; §78.1; ADR-0053; ADR-0058; ADR-0059; ADR-0060; ADR-0061;
+//!   ADR-0062
 //!
-//! Subcommand mode (card 28; the resident `--serve` job is card 35). `health serve` (ADR-0061 D-D) is the
-//! one resident subcommand: it samples the §41.2 health gauges until SIGTERM and prints its receipt on exit;
-//! `--metrics-families` prints its zero-state exposition before any config is read. Every other subcommand is
+//! Subcommand mode (card 28). Two modes are resident: `health serve` (ADR-0061 D-D) samples the §41.2 health
+//! gauges, and `--serve` (ADR-0062) runs the scheduled maintenance tasks; each runs until SIGTERM, answers
+//! readiness on its own ops listener and prints its receipt on exit;
+//! `--metrics-families` (`health serve`'s families) and `--serve --metrics-families` (the daemon's, ADR-0062 D-S)
+//! print their zero-state exposition before any config is read. Every other subcommand is
 //! one-shot, idempotent (a re-run writes nothing and answers `existing`; `apikey pepper-epoch advance`
 //! is instead refused `rehash_window_open` while its window is open, ADR-0059 D-H), and prints exactly ONE
 //! JSON receipt on stdout. Exit codes (ADR-0053 D-F): 0 created/existing, 3 refused (a named
-//! reason, nothing written), 2 usage, 1 infrastructure. `jobs requeue-dead` (ADR-0058 R4) answers
+//! reason, nothing written), 2 usage, 1 infrastructure (`sweep once` still prints its receipt then). `jobs requeue-dead` (ADR-0058 R4) answers
 //! `requeued` (`nothing_requeued` when class mode skipped every match; class mode lists each skipped
 //! DEAD job with `evidence_gone` / `outbox_settled`, exit 0); its re-run is refused `job_not_dead` /
 //! `no_dead_job` (exit 3), never a second re-arm.
@@ -43,7 +47,9 @@
 //! (`default`, the name the seed always used).
 
 mod health_serve;
+mod resident;
 mod roles;
+mod serve;
 
 use std::process::ExitCode;
 
@@ -72,7 +78,7 @@ apikey issue|revoke | apikey pepper-epoch advance|close | placement ensure | col
 jobs requeue-dead --tenant ID (--job ID | --error-class CLASS) | \
 reasoning register|bind|attest-health|profile-state|status --tenant ID | \
 roles rotate --roles-sql PATH [--role ROLE]... [--create-missing] | deploy-check --roles-sql PATH | \
-health serve | --metrics-families> [flags]";
+health serve | --serve | --serve --metrics-families | sweep once | --metrics-families> [flags]";
 
 /// A failure before or outside the provisioning library.
 enum Failure {
@@ -257,6 +263,8 @@ fn to_json<T: serde::Serialize>(value: &T) -> Result<Value> {
 struct Output {
     receipt: Value,
     refused: bool,
+    /// An infrastructure failure reported in the receipt itself (`sweep once`, ADR-0062 D-Q): exit 1.
+    failed: bool,
     once: Vec<String>,
 }
 
@@ -265,6 +273,7 @@ impl Output {
         Self {
             receipt,
             refused: false,
+            failed: false,
             once: Vec::new(),
         }
     }
@@ -283,6 +292,7 @@ impl Output {
         Self {
             receipt,
             refused: activation.refusal().is_some(),
+            failed: false,
             once: Vec::new(),
         }
     }
@@ -732,6 +742,8 @@ async fn run(args: Args) -> Result<Output> {
         ["roles", "rotate"] => roles::rotate(&args).await,
         ["deploy-check", ..] => roles::deploy_check(&args).await,
         ["health", "serve"] => health_serve::serve().await,
+        ["--serve"] => serve::serve().await,
+        ["sweep", "once"] => serve::sweep_once(&args).await,
         _ => Err(Failure::Usage(USAGE.to_owned())),
     }
 }
@@ -741,6 +753,11 @@ fn main() -> ExitCode {
     // ADR-0061 D-C: the exposition this process serves, at zero state, before any config is read.
     if args.0.first().is_some_and(|a| a == "--metrics-families") {
         print!("{}", health_serve::metrics_families());
+        return ExitCode::SUCCESS;
+    }
+    // ADR-0062 D-S: `--serve` is a second resident mode with its own families; its zero state, also before config.
+    if args.0 == ["--serve", "--metrics-families"] {
+        print!("{}", serve::render_metrics());
         return ExitCode::SUCCESS;
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -756,7 +773,11 @@ fn main() -> ExitCode {
     match runtime.block_on(run(args)) {
         Ok(output) => {
             println!("{}", output.render());
-            ExitCode::from(if output.refused { 3 } else { 0 })
+            ExitCode::from(match (output.refused, output.failed) {
+                (true, _) => 3,
+                (false, true) => 1,
+                (false, false) => 0,
+            })
         }
         Err(Failure::Usage(message)) => {
             eprintln!("humaux-maintenance: {message}");

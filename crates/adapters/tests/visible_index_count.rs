@@ -2,15 +2,17 @@
 //!   the live Qdrant `visible` number the three read routes hand to `envelope::build_projection_block`.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-infra-cell, humaux-projection, humaux-retrieval,
 //!   humaux-telemetry, humaux-testkit, postgres, serde_json, sqlx, tokio, uuid]; services=[PostgreSQL(owner)
-//!   r=[projection.processing_gaps] w=[control.tenants, projection.stream_checkpoints, projection.stream_log],
-//!   PostgreSQL(role_gateway), PostgreSQL(role_maintenance), Qdrant(*)]; env=[HUMAUX_TEST_PG_DSN,
+//!   r=[projection.processing_gaps] w=[control.private_reasoning_domains, control.tenants, ops.jobs, ops.outbox,
+//!   private.evidence_objects, private.memory_evidence, private.memory_records, projection.stream_checkpoints,
+//!   projection.stream_log], PostgreSQL(role_gateway) x=[projection.stream_point_ledger],
+//!   PostgreSQL(role_maintenance), Qdrant(*)]; env=[HUMAUX_TEST_PG_DSN,
 //!   HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::forget_repo, adapters::postgres, adapters::qdrant,
 //!   adapters::retrieve, domain::authority, domain::dataclass, domain::identity, domain::ids, domain::memory,
 //!   humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport, projection::card,
 //!   projection::stream, retrieval::completeness, retrieval::envelope, telemetry::degrade]
 //! Called-by: [cargo-test]
 //! Invariants: [PostgreSQL unreachable or role denied -> the call fails and surfaces the error to the caller; no silent fallback; Qdrant unreachable -> QdrantTransportError to the caller, no fallback search]
-//! Spec: Baseline §4.4; §15.2; §16.2; ADR-0031
+//! Spec: Baseline §4.4; §15.2; §16.2; §23.1②; ADR-0031; ADR-0057 D-A/D-L; ADR-0062 D-M
 //!
 //! Against a **real** Postgres ledger and a **real** Qdrant index (both required; three-state
 //! skip, §79.2/§57.1, prints which object is missing rather than passing silently). The
@@ -153,6 +155,33 @@ fn key(tenant_id: Uuid, scope_id: Uuid) -> StreamKey {
     )
 }
 
+/// The point a ticket reaches, the 0189/0219 join `stream_log -> ops.outbox(commit_seq) -> memory_evidence`: one
+/// Evidence, its outbox row and one TENANT_SHARED memory whose PRIMARY it is (column lists as `a2_fixture.rs`).
+/// `MEMORY_LIFECYCLE`, not `EVIDENCE_ACCEPTED`, so no DERIVED_DISTILL job is enqueued for a fixture Evidence.
+fn seed_ticketed_memory(admin: &mut Client, k: &StreamKey, domain: Uuid, seq: i64) {
+    // §8.6: the memory and its PRIMARY link commit together (deferred orphan check), so one statement.
+    admin
+        .execute(
+            "WITH e AS ( \
+               INSERT INTO private.evidence_objects (tenant_id, evidence_kind, payload_sha256, data_class, \
+                 origin_class, visibility_class, reasoning_domain_id) \
+               VALUES ($1, 'EVENT', sha256(convert_to($3::bigint::text, 'UTF8')), 'INTERNAL', 'DirectUserInput', \
+                 'TENANT_SHARED', $2) RETURNING evidence_id), \
+             o AS ( \
+               INSERT INTO ops.outbox (tenant_id, commit_seq, stream_seq, event_type, evidence_id, status) \
+               SELECT $1, $3, $3, 'MEMORY_LIFECYCLE', evidence_id, 'DONE' FROM e), \
+             m AS ( \
+               INSERT INTO private.memory_records (tenant_id, memory_type, content, visibility_class, \
+                 authority_class, confidence, status, asserted_at) \
+               VALUES ($1, 'NOTE', jsonb_build_object('title', 'c18 point ' || $3::bigint), 'TENANT_SHARED', \
+                 'PrivateKnowledge', 0.9, 'active', now()) RETURNING memory_id) \
+             INSERT INTO private.memory_evidence (memory_id, evidence_id, role, ordinal) \
+             SELECT m.memory_id, e.evidence_id, 'PRIMARY', 0 FROM m, e",
+            &[&k.tenant_id.0, &domain, &seq],
+        )
+        .expect("seed the ticket's evidence, outbox row and memory");
+}
+
 fn seed_log_row(admin: &mut Client, k: &StreamKey, seq: i64, state: &str) {
     let now = SystemTime::now();
     let settled_at: Option<SystemTime> = matches!(state, "DONE").then_some(now);
@@ -178,9 +207,18 @@ fn seed_log_row(admin: &mut Client, k: &StreamKey, seq: i64, state: &str) {
         .expect("seed stream_log row");
 }
 
-/// The §23.1② precondition every leg starts from: `TOTAL` rows, all `DONE`, serving.
+/// The §23.1② precondition every leg starts from: `TOTAL` rows, all `DONE`, serving, each reaching one memory.
 fn seed_serving_stream(admin: &mut Client, k: &StreamKey) {
+    let domain: Uuid = admin
+        .query_one(
+            "INSERT INTO control.private_reasoning_domains (tenant_id, name) \
+             VALUES ($1, 'c18 throwaway') RETURNING reasoning_domain_id",
+            &[&k.tenant_id.0],
+        )
+        .expect("seed reasoning domain")
+        .get(0);
     for seq in 1..=TOTAL {
+        seed_ticketed_memory(admin, k, domain, seq);
         seed_log_row(admin, k, seq, "DONE");
     }
     admin
@@ -202,9 +240,10 @@ fn seed_serving_stream(admin: &mut Client, k: &StreamKey) {
         .expect("seed serving stream_checkpoints row");
 }
 
-/// The six ledger numbers, read as plain SQL so the judgment under test stays exactly
-/// `humaux_retrieval::completeness::ledger::close`.
-fn read_ledger(admin: &mut Client, k: &StreamKey) -> LedgerClosure {
+/// The six ticket numbers, read as plain SQL, and the four point numbers, read through the production
+/// `projection.stream_point_ledger` definer as role_gateway (ADR-0057 D-L; v2 ADR-0062 D-M), so the judgment under
+/// test stays exactly `humaux_retrieval::completeness::ledger::close`.
+fn read_ledger(admin: &mut Client, k: &StreamKey, user: UserId) -> LedgerClosure {
     let expected: i64 = admin
         .query_one(
             "SELECT issued_highwater FROM projection.stream_checkpoints \
@@ -258,16 +297,38 @@ fn read_ledger(admin: &mut Client, k: &StreamKey) -> LedgerClosure {
         open_gaps: open_gaps as u64,
         pending: row.get::<_, i64>(3) as u64,
     };
-    // ADR-0057 D-A: A2 compares points with points. This fixture writes one synthetic point per
-    // ticket and no memory rows, so its point reading is the ticket terms one-for-one (the
-    // definer itself is exercised against real memories in `a2_point_identity.rs`).
+    // ADR-0057 D-A: A2 compares points with points, read by the definer the read routes call.
+    let mut txn = admin.transaction().expect("owner txn for the definer read");
+    // dep: PostgreSQL(role_gateway) — role switch for the definer call (the a2_point_identity pattern)
+    txn.batch_execute(&format!(
+        "SET LOCAL ROLE role_gateway; SET LOCAL humaux.tenant_id = '{}'; SET LOCAL humaux.user_id = '{}';",
+        k.tenant_id.0, user.0
+    ))
+    .expect("act as role_gateway");
+    let points = txn
+        .query_one(
+            "SELECT points_expected, points_settled, points_in_flight, points_unsettled \
+             FROM projection.stream_point_ledger($1, $2, $3, $4, $5, $6, 'SECRET_MATERIAL', $7)",
+            &[
+                &k.tenant_id.0,
+                &k.scope_kind,
+                &k.scope_id,
+                &k.domain,
+                &k.projection_kind,
+                &k.projection_version,
+                &vec![k.scope_id],
+            ],
+        )
+        .expect("point ledger");
+    txn.rollback().expect("read only");
+    let point = |i: usize| points.get::<_, i64>(i) as u64;
     ledger::close(
         reads,
         ledger::ProjectionReads {
-            points_expected: reads.expected - reads.deleted,
-            points_settled: reads.done - reads.deleted - reads.skipped,
-            points_in_flight: reads.pending,
-            points_unsettled: 0,
+            points_expected: point(0),
+            points_settled: point(1),
+            points_in_flight: point(2),
+            points_unsettled: point(3),
             oldest_pending_age_secs: None,
         },
     )
@@ -293,8 +354,15 @@ impl TenantCleanup {
 impl Drop for TenantCleanup {
     fn drop(&mut self) {
         if let Err(error) = self.admin.batch_execute(&format!(
-            "DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
-             DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}';",
+            "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
+             DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}'; \
+             DELETE FROM private.memory_evidence USING private.memory_records m \
+               WHERE memory_evidence.memory_id = m.memory_id AND m.tenant_id = '{0}'; \
+             DELETE FROM private.memory_records WHERE tenant_id = '{0}'; \
+             DELETE FROM private.evidence_objects WHERE tenant_id = '{0}'; \
+             DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{0}';",
             self.tenant_id
         )) {
             eprintln!(
@@ -482,7 +550,7 @@ fn visible_index_count_is_the_live_denominator_input() {
     }
 
     // ---- Leg 1: healthy. ------------------------------------------------------------------
-    let closure = read_ledger(&mut admin, &k);
+    let closure = read_ledger(&mut admin, &k, user_id);
     assert!(closure.is_closed(), "A1 must hold on the seeded fixture");
     let healthy = rt.block_on(async {
         // Qdrant indexing is asynchronous: retry until the whole seeded set is countable, so a
@@ -608,7 +676,7 @@ fn visible_index_count_is_the_live_denominator_input() {
         maintenance
     });
     drop(maintenance);
-    let after_tombstone = read_ledger(&mut admin, &k);
+    let after_tombstone = read_ledger(&mut admin, &k, user_id);
     assert_eq!(after_tombstone.counts().deleted(), TOMBSTONED as u64);
     assert_eq!(
         after_tombstone.counts().done(),

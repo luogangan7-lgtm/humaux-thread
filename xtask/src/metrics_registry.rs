@@ -8,7 +8,7 @@
 //! `--check` run the default mode silently, E6): no mode flag = D1–D6; `--check` = D1–D8;
 //! `--exposition <process>=<file>` (repeatable) = the D7 parser over live scrapes (EX);
 //! `--strict` also counts not_applicable. D7 runs `cargo run -p humaux-<process> -- --metrics-families`
-//! for the five processes in [`PROCESSES`]; D8 scans `deploy/prometheus/*.rules.yml`.
+//! for the six process keys in [`PROCESSES`] (`maintenance-serve` adds `--serve`, ADR-0062 D-S); D8 scans `deploy/prometheus/*.rules.yml`.
 //!
 //! xtask `metrics-registry` — G80-6 `metrics-registry-check`：Registry(R) / Code(C) /
 //! Witness(W) 三方证伪（§80.2 全文）。R 解析 §41.2 注册表；C 静态扫 `crates/**/src/**/*.rs`
@@ -42,13 +42,16 @@ const USAGE: &str =
     "usage: cargo xtask metrics-registry [--check] [--strict] [--exposition <process>=<file>]...";
 
 /// The processes that serve `/metrics` (ADR-0061 D-B). The cargo package and bin of each is
-/// `humaux-<process>`; the key is also the `--exposition` process name.
-const PROCESSES: [&str; 5] = [
+/// `humaux-<process>`; the key is also the `--exposition` process name. `maintenance-serve` is
+/// `humaux-maintenance --serve` (ADR-0062 D-S): a second resident mode of that binary whose families
+/// differ from `health serve`'s, read with `--serve --metrics-families`.
+const PROCESSES: [&str; 6] = [
     "gateway",
     "retrieval-worker",
     "private-worker",
     "consolidation-worker",
     "maintenance",
+    "maintenance-serve",
 ];
 
 /// ADR-0061 D-H D8(c): rule-referenced families no process exports yet, each with the card
@@ -1148,7 +1151,7 @@ fn registry_index(registry: &[RegistryEntry]) -> BTreeMap<&str, &RegistryEntry> 
     registry.iter().map(|r| (r.family.as_str(), r)).collect()
 }
 
-/// D7: the union of what the five processes export is registered, kind- and label-exact.
+/// D7: the union of what the six process keys export is registered, kind- and label-exact.
 /// `outputs` is `(process, its --metrics-families stdout or the run error)`. A process that
 /// cannot be built or run is a fail naming it: it is in-tree, so there is no not_applicable.
 /// Returns the check and the exported family union (D8(c) input): a family counts as exported
@@ -1201,23 +1204,21 @@ fn check_d7(
     (check, exported)
 }
 
-/// Runs `cargo run -q -p humaux-<process> --bin humaux-<process> -- --metrics-families`
+/// Runs `cargo run -q -p humaux-<process> --bin humaux-<process> -- [--serve] --metrics-families`
 /// (ADR-0061 D-C): cargo rebuilds from the current tree, so neither a stale binary nor a
 /// hand list can disagree with what `/metrics` serves.
 fn metrics_families_output(process: &str) -> Result<String, String> {
-    let pkg = format!("humaux-{process}");
+    // ADR-0062 D-S: the one process key that names a mode, not a binary.
+    let (bin, mode): (&str, &[&str]) = match process {
+        "maintenance-serve" => ("maintenance", &["--serve"]),
+        other => (other, &[]),
+    };
+    let pkg = format!("humaux-{bin}");
     // dep: subprocess(cargo) — builds and runs the process's own zero-state render
     let out = std::process::Command::new("cargo")
-        .args([
-            "run",
-            "-q",
-            "-p",
-            &pkg,
-            "--bin",
-            &pkg,
-            "--",
-            "--metrics-families",
-        ])
+        .args(["run", "-q", "-p", &pkg, "--bin", &pkg, "--"])
+        .args(mode)
+        .arg("--metrics-families")
         .output()
         .map_err(|e| format!("cannot spawn cargo: {e}"))?;
     if !out.status.success() {

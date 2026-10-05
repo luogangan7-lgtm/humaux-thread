@@ -335,6 +335,27 @@ was found.
     evidence (`projection_worker.rs:494-506`); a mismatch reads as loss, never as a false close.
     Main line: verify the worker side (possible §18.2 egress path) and file it.
 
+**Addendum (card 35 S4, 2026-10-04; ADR-0062 D-M/D-O).** Migration 0219 is v2 of the D-L definer (0189 unedited,
+same signature): `indexable` now also fences `points_in_flight` and `points_unsettled`, so a SECRET_MATERIAL-primary
+memory reached by a FAILED / LOST / RETIRED_FAILED ticket (the limit-15 shape) no longer widens Q by a slack no
+reissue can drain (narrows limit 3). Card-size and gitleaks refusals are still counted in Q (ADR-0062 L7).
+`visible_index_count.rs` reads the point terms through the definer instead of a test-side copy (card-31 review P2).
+Test `a2_point_identity.rs::a_non_indexable_memory_with_a_failed_ticket_widens_no_slack`.
+
+**Addendum (card 35 S1/S5/S8, 2026-10-04; ADR-0062 D-L / D-N, rulings E13 and E8).** D-H is closed:
+`projection.reissue_unsettled_tickets` (0220) puts one fresh lifecycle ticket on the latest ticket's own stream (the
+home stream for every post-D-M ticket) for each memory in Q, permanent classes at most once per retirement, after a
+cool-down that applies to every class; the resident daemon runs it per tenant page (task `reissue`), and
+`projection.ticket_reissues` records each one. `stream_repo::sweep_lost` now has a caller and is fixed at the root
+(no live runner lease, no backoff, LIMIT). **How LOST reads in recall (ruling E13):** an orphan ISSUED ticket first
+reads as `PROJECTION_LAG`; after the sweep the lag clears (D-D counts only ISSUED / PROCESSING / RETRY_WAIT), the
+memory moves into `points_unsettled` (+1) and `completeness_ratio < 1` while its point is missing; `judge_a2` reads
+the band closed (limit 12), so no degrade code is emitted until the reissue settles and Q and the ratio return to 0
+and 1. Tests `projection_lag.rs::a_swept_orphan_trades_lag_for_unsettled_slack_and_a_ratio_below_one` and
+`an_orphan_reads_as_lag_then_lost_then_in_flight_after_reissue`; the rehearsal grades "every seeded orphan LOST with
+exactly one reissue" on its throwaway database only — the shared dev database's stale ISSUED tickets are never swept
+by a gate (ruling E8).
+
 ## Rejected
 
 - Card option (i), `done` = distinct EVIDENCE_ACCEPTED seqs: breaks A1 (shares `done`), cannot see

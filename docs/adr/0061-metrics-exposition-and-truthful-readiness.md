@@ -506,3 +506,20 @@ pin variable before the chain starts.
   not_applicable / red, never silently green.
 - The drill Prometheus loads `alerts.rules.yml` too, so `CoreMetricAbsent` (and, past 2 min, `HealthGaugesAbsent`)
   also fire in P′ during the drill; they carry `prometheus: drill` in the receipts and are not graded.
+
+## Addendum (card 35, 2026-10-04; ADR-0062 D-A / D-S, ruling E3)
+
+D-B's ops-port map gains an **eighth** `(job, mode)` pair: `humaux-maintenance:serve`, key
+`HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR` (rehearsal port 19108). It is a second resident mode of the maintenance binary
+with its own families, so D-C's zero-state render is `humaux-maintenance --serve --metrics-families`, and
+`cargo xtask metrics-registry` reads it as the process key `maintenance-serve` (D7 and the rehearsal's EX leg).
+Families (§41.2 rows added by ruling E3): `maintenance_task_runs_total{task,outcome}` and
+`maintenance_task_rows_total{task}`, `task` = the closed D-C list, `outcome` ∈ {ok, failed}, seeded at 0, one emit
+each in `adapters::maintenance_repo::count_task_call` (witnesses `crates/testkit/tests/metrics/maintenance_*.rs`).
+§42 `MaintenanceTaskFailing` (`increase(maintenance_task_runs_total{outcome="failed"}[1h]) > 0`, WARNING) is loaded
+with firing / silent promtool cases and two mutations (matcher dropped, `> 0` → `< 0`); the card-35 fix pass adds
+`MaintenanceCountersAbsent` (`absent(maintenance_task_runs_total)` for 2m, WARNING), the live signal while the
+daemon answers 503, with its own cases and mutation: 23/23 (ADR-0062 D-S).
+`prometheus.yml`'s deployer contract, rehearse.sh's `OPS_PORTS` and the `up` assertion now say eight
+(`prometheus_up_is_exactly_the_eight_ops_pairs`). `NOT_YET_PRODUCED` is unchanged (backup only). Readiness of the
+daemon follows D-D's rule: a failed or stale cycle answers 503, never the last counters.

@@ -22,22 +22,25 @@
 //!   HUMAUX_PRIVATE_WORKER_SERVE_RPC_METRICS_ADDR, HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY, PRIVATE_WORKER_PG_DSN,
 //!   refused:HUMAUX_PRIVATE_WORKER_EGRESS_PROCESSOR_ID]; modules=[adapters::byok,
 //!   adapters::contribution_reasoner, adapters::disclosure, adapters::distill_reasoner, adapters::jobs,
-//!   adapters::membership_repo, adapters::postgres, adapters::provisioning, adapters::reasoning_route_admission,
-//!   domain::evidence, humaux-testkit, private-worker::distill, private-worker::tests::support::dispatch_fence,
+//!   adapters::maintenance_repo, adapters::membership_repo, adapters::postgres, adapters::provisioning,
+//!   adapters::reasoning_route_admission, adapters::tests::support::throwaway_db, domain::evidence, humaux-testkit,
+//!   private-worker::distill, private-worker::tests::support::dispatch_fence,
 //!   private-worker::tests::support::double_spend, private-worker::tests::support::live_minimax,
 //!   private-worker::tests::support::live_provider, private-worker::inference_rpc, private-worker::route_providers,
 //!   adapters::byok::ssrf]
 //! Called-by: [cargo-test]
 //! Invariants: [only this file's tenants are ever claimed (foreign scheduler rows are fenced FOR UPDATE); every
 //!   scenario's faults are named in its doc (ADR-0058 records the red→green runs); a fixture deletes its jobs, slots
-//!   and data rows in one printed batch and its tenant rows in a separate best-effort batch]
-//! Spec: Baseline §16.1.1; §10.1; §67.2; §11; §11.2.5; §79.2; ADR-0058; ADR-0059; ADR-0060
+//!   and data rows in one printed batch and its tenant rows in a separate best-effort batch; the automatic re-drive
+//!   tests run on their own throwaway database (ADR-0062 E8), never on the shared dev database]
+//! Spec: Baseline §16.1.1; §10.1; §67.2; §11; §11.2.5; §79.2; ADR-0058; ADR-0059; ADR-0060; ADR-0062 D-P
 //!
 //! The Distill hop's own behaviour (route admission, §16.1.1 fingerprint, §10.1 ceiling, the
 //! fenced write transaction) is `tests/distill_hop_e2e.rs`' subject. This file covers the layer
 //! above it: one job = one Evidence (P1-4), the four provider slots and the tenant rotation
 //! (P1-16, debts 1 and 2), counted attempts and honest DEAD, WAITING_KEY parking, the generation
-//! fence under two dispatchers, and the binary's resident loop.
+//! fence under two dispatchers, the binary's resident loop, and the maintenance daemon's one
+//! automatic re-drive of a schema-failed death (ADR-0062 D-P).
 
 use humaux_adapters::byok::{
     OutputChannel, PrivateInferenceContext, ReasoningCapability, ReasoningProviderDescriptor,
@@ -47,6 +50,7 @@ use humaux_adapters::byok::{
 use humaux_adapters::contribution_reasoner::ContributionReasonerConfig;
 use humaux_adapters::disclosure::DeletionCapability;
 use humaux_adapters::jobs::{self, DistillLease};
+use humaux_adapters::maintenance_repo;
 use humaux_adapters::membership_repo::AdminAction;
 use humaux_adapters::postgres::{MaintenanceDbPool, PrivateWorkerDbPool};
 use humaux_adapters::provisioning::{
@@ -75,6 +79,8 @@ mod double_spend;
 mod live_minimax;
 #[path = "support/live_provider.rs"]
 mod live_provider;
+#[path = "../../../crates/adapters/tests/support/throwaway_db.rs"]
+mod throwaway_db;
 
 /// Every test drives the ONE global slot set and the cross-tenant claim, so tests never overlap.
 static SERIAL_GUARD: Mutex<()> = Mutex::new(());
@@ -378,6 +384,8 @@ struct Handle {
     dsn: String,
     tenants: Vec<SeededTenant>,
     user_id: Uuid,
+    /// ADR-0062 E8: the throwaway database a re-drive test runs on, dropped after every connection above.
+    _throwaway: Option<throwaway_db::ThrowawayDb>,
 }
 
 impl Drop for Handle {
@@ -445,6 +453,30 @@ impl DbIntegrationFixture for DispatchFixture {
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
         let dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
+        Handle::open(dsn, None)
+    }
+}
+
+/// ADR-0062 E8: the re-drive tests' fixture. The same four tenants on a throwaway database created and migrated for
+/// the test, so no automatic re-drive ever touches the shared dev database.
+struct RedriveFixture;
+
+impl DbIntegrationFixture for RedriveFixture {
+    type Handle = Handle;
+
+    fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
+        let db = throwaway_db::create("c35_redrive")?;
+        Handle::open(db.dsn(), Some(db))
+    }
+}
+
+impl Handle {
+    /// Seeds the four tenants on `dsn` (the owner DSN); `throwaway` is the database `dsn` points at, if the test
+    /// owns one.
+    fn open(
+        dsn: String,
+        throwaway: Option<throwaway_db::ThrowawayDb>,
+    ) -> Result<Self, DbFixtureSkipReason> {
         // dep: PostgreSQL(owner) — admin connection for seeding, inspection and cleanup
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
@@ -491,6 +523,7 @@ impl DbIntegrationFixture for DispatchFixture {
             dsn,
             tenants: Vec::new(),
             user_id,
+            _throwaway: throwaway,
         };
         // A and B are provisioned with an admitted PRIVATE_DISTILL_TEXT route; C deliberately is
         // not ("onboarded before its route was admitted"); D has a COMPLETE, admitted route bound
@@ -3009,6 +3042,283 @@ fn requeue_dead_by_class_reports_the_dead_jobs_it_skipped() {
 }
 
 // ---------------------------------------------------------------------------
+// ADR-0062 D-P (card 35 S6): the daemon's automatic re-drive of a schema-failed death, on a throwaway database
+// ---------------------------------------------------------------------------
+
+/// The cool-down the re-drive tests pass to the door; each test sleeps past it before the call that must re-drive.
+const REDRIVE_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// The §77 fields `humaux-maintenance --serve` writes under its own identity (`sweep once` passes the operator's).
+fn daemon() -> AdminAction<'static> {
+    AdminAction {
+        actor: "system:humaux-maintenance --serve",
+        reason: "ADR-0062 D-P",
+        ticket: "ADR-0062 D-P",
+        trace_id: "c35-redrive-trace",
+        step_up_auth_context: "none: scheduled task (ADR-0062 D-P)",
+    }
+}
+
+fn run_redrive(name: &str, body: impl FnOnce(Handle)) {
+    let _guard = SERIAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    run_db_fixture::<RedriveFixture, _>(name, body);
+}
+
+/// A provider whose first `refusals` replies are malformed JSON (a schema refusal) and every later one admissible.
+fn refusing(refusals: u32) -> Arc<StubProvider> {
+    let sent = AtomicU32::new(0);
+    StubProvider::new(move |_| {
+        let reply = if sent.fetch_add(1, Ordering::SeqCst) < refusals {
+            "not json".to_string()
+        } else {
+            ONE_MEMORY_REPLY.to_string()
+        };
+        (Duration::ZERO, Reply::Json(reply))
+    })
+}
+
+impl Handle {
+    /// One daemon call of the `redrive` task for `tenant`: the library call behind it, as role_maintenance (0221
+    /// grants EXECUTE to role_maintenance only).
+    fn auto_redrive(&self, tenant_id: Uuid, cooldown: Duration) -> i64 {
+        let pool = self
+            .rt
+            // dep: PostgreSQL(role_maintenance) — the daemon's pool on this test's throwaway database
+            .block_on(MaintenanceDbPool::connect(&dsn_as_role(
+                &self.dsn,
+                "role_maintenance",
+            )))
+            .expect("maintenance pool");
+        self.rt
+            .block_on(maintenance_repo::auto_redrive_schema_failed(
+                &pool,
+                tenant_id,
+                cooldown,
+                10,
+                &daemon(),
+            ))
+            .expect("auto re-drive")
+    }
+
+    /// (status, attempt, last_error_class, auto_redrives) of one job.
+    fn redrive_state(&mut self, job_id: Uuid) -> (String, i32, Option<String>, i16) {
+        let r = self
+            .admin
+            .query_one(
+                "SELECT status, attempt, last_error_class, auto_redrives FROM ops.jobs WHERE job_id = $1",
+                &[&job_id],
+            )
+            .expect("job row");
+        (r.get(0), r.get(1), r.get(2), r.get(3))
+    }
+
+    /// The tenant's §77 rows of the daemon's re-drive.
+    fn auto_redrive_audits(&mut self, tenant_id: Uuid) -> i64 {
+        self.admin
+            .query_one(
+                "SELECT count(*) FROM control.audit_events \
+                 WHERE tenant_id = $1 AND action = 'DISTILL_AUTO_REDRIVE'",
+                &[&tenant_id],
+            )
+            .expect("audit rows")
+            .get(0)
+    }
+
+    /// Distills tenant 0's pending work with `provider` and asserts every claimed job died of its schema after
+    /// its one re-ask (attempt 2).
+    fn die_of_schema(&mut self, provider: &Arc<StubProvider>, jobs: &[Uuid]) {
+        let report = self.pass(provider, &dispatch_config("c35-redrive", 30.0));
+        assert_eq!(
+            usize::try_from(report.dead).ok(),
+            Some(jobs.len()),
+            "{report:?}"
+        );
+        for &job in jobs {
+            assert_eq!(
+                self.redrive_state(job),
+                (
+                    "DEAD".to_string(),
+                    2,
+                    Some("FAILED_OUTPUT_SCHEMA".to_string()),
+                    0
+                )
+            );
+        }
+    }
+}
+
+/// T-P1 (ADR-0062 D-P; card 32 debt): calls 1-2 are refused, so the job dies DEAD `FAILED_OUTPUT_SCHEMA` at attempt
+/// 2; after the cool-down one daemon call re-arms it, call 3 answers, and the Evidence is distilled with no operator,
+/// under one `DISTILL_AUTO_REDRIVE` §77 row. Fault: the definer skips the `requeue_dead_distill` call ⇒ the job stays
+/// DEAD ⇒ red.
+#[test]
+fn a_schema_failed_death_is_redriven_once_after_cooldown_and_distilled() {
+    run_redrive(
+        "a_schema_failed_death_is_redriven_once_after_cooldown_and_distilled",
+        |mut handle| {
+            let tenant = handle.tenants[0].tenant_id;
+            let evidence = accept_evidence(&mut handle, 0);
+            let job = handle.job_of(evidence);
+            let provider = refusing(2);
+            handle.die_of_schema(&provider, &[job]);
+            std::thread::sleep(REDRIVE_COOLDOWN + Duration::from_millis(300));
+
+            assert_eq!(handle.auto_redrive(tenant, REDRIVE_COOLDOWN), 1);
+            assert_eq!(
+                handle.redrive_state(job),
+                (
+                    "PENDING".to_string(),
+                    0,
+                    Some("FAILED_OUTPUT_SCHEMA".to_string()),
+                    1
+                ),
+                "re-armed once, class kept"
+            );
+            let second = handle.pass(&provider, &dispatch_config("c35-redrive", 30.0));
+            assert_eq!(second.completed, 1, "{second:?}");
+            assert_eq!(handle.job(job).0, "DONE");
+            assert_eq!(handle.outbox_status(evidence), "DONE");
+            assert_eq!(
+                memory_count(&mut handle, 0),
+                1,
+                "distilled without an operator"
+            );
+            assert_eq!(provider.calls(), 3);
+            assert_eq!(handle.auto_redrive_audits(tenant), 1);
+            handle.assert_i_slot();
+        },
+    );
+}
+
+/// T-P2 (ADR-0062 D-P): a provider that always refuses costs 2 + 2 calls: one re-drive, then DEAD for good; two
+/// more daemon calls past the cool-down take nothing and write no §77 row. Fault: drop `auto_redrives = 0` from the
+/// definer ⇒ the second call re-drives again ⇒ 6 calls ⇒ red.
+#[test]
+fn an_always_refusing_provider_is_redriven_once_and_never_loops() {
+    run_redrive(
+        "an_always_refusing_provider_is_redriven_once_and_never_loops",
+        |mut handle| {
+            let tenant = handle.tenants[0].tenant_id;
+            let evidence = accept_evidence(&mut handle, 0);
+            let job = handle.job_of(evidence);
+            let provider = refusing(u32::MAX);
+            handle.die_of_schema(&provider, &[job]);
+            std::thread::sleep(REDRIVE_COOLDOWN + Duration::from_millis(300));
+            assert_eq!(handle.auto_redrive(tenant, REDRIVE_COOLDOWN), 1);
+            let second = handle.pass(&provider, &dispatch_config("c35-redrive", 30.0));
+            assert_eq!(second.dead, 1, "{second:?}");
+
+            std::thread::sleep(REDRIVE_COOLDOWN + Duration::from_millis(300));
+            let later = [
+                handle.auto_redrive(tenant, REDRIVE_COOLDOWN),
+                handle.auto_redrive(tenant, REDRIVE_COOLDOWN),
+            ];
+            let third = handle.pass(&provider, &dispatch_config("c35-redrive", 30.0));
+            println!(
+                "T-P2 later={later:?} third={third:?} calls={}",
+                provider.calls()
+            );
+            assert_eq!(later, [0, 0], "never re-driven twice");
+            assert_eq!(third.claimed, 0, "{third:?}");
+            assert_eq!(provider.calls(), 4, "2 + 2 counted calls, then nothing");
+            assert_eq!(
+                handle.redrive_state(job),
+                (
+                    "DEAD".to_string(),
+                    2,
+                    Some("FAILED_OUTPUT_SCHEMA".to_string()),
+                    1
+                )
+            );
+            assert_eq!(handle.outbox_status(evidence), "FAILED");
+            assert_eq!(handle.auto_redrive_audits(tenant), 1);
+            handle.assert_i_slot();
+        },
+    );
+}
+
+/// T-P3 (ADR-0062 D-P): the class predicate is exact. Three real schema deaths; two are re-classed by the owner as
+/// `ATTEMPTS_EXHAUSTED` and `PROVIDER_PERMANENT`; past the cool-down only the third is re-driven. Fault: the class
+/// predicate widened to `IS NOT NULL` ⇒ 3 re-armed ⇒ red.
+#[test]
+fn attempts_exhausted_and_provider_permanent_deaths_are_never_auto_redriven() {
+    run_redrive(
+        "attempts_exhausted_and_provider_permanent_deaths_are_never_auto_redriven",
+        |mut handle| {
+            let tenant = handle.tenants[0].tenant_id;
+            let evidence: Vec<Uuid> = (0..3).map(|_| accept_evidence(&mut handle, 0)).collect();
+            let jobs: Vec<Uuid> = evidence.iter().map(|&e| handle.job_of(e)).collect();
+            handle.die_of_schema(&refusing(u32::MAX), &jobs);
+            for (job, class) in jobs
+                .iter()
+                .zip(["ATTEMPTS_EXHAUSTED", "PROVIDER_PERMANENT"])
+            {
+                handle
+                    .admin
+                    .execute(
+                        "UPDATE ops.jobs SET last_error_class = $2 WHERE job_id = $1",
+                        &[job, &class],
+                    )
+                    .expect("re-class a death");
+            }
+            std::thread::sleep(REDRIVE_COOLDOWN + Duration::from_millis(300));
+
+            assert_eq!(handle.auto_redrive(tenant, REDRIVE_COOLDOWN), 1);
+            assert_eq!(
+                handle.redrive_state(jobs[0]),
+                (
+                    "DEAD".to_string(),
+                    2,
+                    Some("ATTEMPTS_EXHAUSTED".to_string()),
+                    0
+                )
+            );
+            assert_eq!(
+                handle.redrive_state(jobs[1]),
+                (
+                    "DEAD".to_string(),
+                    2,
+                    Some("PROVIDER_PERMANENT".to_string()),
+                    0
+                )
+            );
+            assert_eq!(
+                handle.redrive_state(jobs[2]),
+                (
+                    "PENDING".to_string(),
+                    0,
+                    Some("FAILED_OUTPUT_SCHEMA".to_string()),
+                    1
+                )
+            );
+        },
+    );
+}
+
+/// T-P4 (ADR-0062 D-P): a death whose last counted call lies inside the cool-down is left DEAD, unmarked, with no
+/// §77 row. Fault: drop the cool-down predicate ⇒ re-driven at once ⇒ red.
+#[test]
+fn a_death_inside_the_cooldown_is_left_dead() {
+    run_redrive("a_death_inside_the_cooldown_is_left_dead", |mut handle| {
+        let tenant = handle.tenants[0].tenant_id;
+        let evidence = accept_evidence(&mut handle, 0);
+        let job = handle.job_of(evidence);
+        handle.die_of_schema(&refusing(u32::MAX), &[job]);
+        assert_eq!(handle.auto_redrive(tenant, Duration::from_secs(3600)), 0);
+        assert_eq!(
+            handle.redrive_state(job),
+            (
+                "DEAD".to_string(),
+                2,
+                Some("FAILED_OUTPUT_SCHEMA".to_string()),
+                0
+            )
+        );
+        assert_eq!(handle.auto_redrive_audits(tenant), 0);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // ADR-0060 (card 33b): the route picks the provider; worker-observed health (ruling E3)
 // ---------------------------------------------------------------------------
 
@@ -3404,16 +3714,22 @@ fn slow_provider_tenant_cannot_take_all_slots() {
                     let (mut max_b, mut samples) = (0_i64, 0_u32);
                     while started.elapsed() < Duration::from_secs_f64(3.0 * TIMEOUT_SECS) {
                         // ADR-0060 D-F is a contention invariant: B's share is bounded only while A
-                        // still has claimable work. Once A's 500 jobs are drained (a warm host does
-                        // it inside this window: card 34b chain, done_a=500 max_b=4) B is the only
-                        // tenant with READY jobs and may hold every slot — so both counters fold a
-                        // sample in only while A has PENDING or PROCESSING jobs.
+                        // still has claimable DISTILL work. Once A's 500 distill jobs are drained (a
+                        // warm host does it inside this window: card 34b chain, done_a=500 max_b=4)
+                        // B is the only tenant with READY jobs and may hold every slot — so both
+                        // counters fold a sample in only while A has a PENDING or PROCESSING
+                        // DERIVED_DISTILL job. The job_type predicate matters: 0164's trigger
+                        // enqueues one DERIVED_CONSOLIDATE job per accepted Evidence that nothing in
+                        // this test claims, so an untyped count never drops to 0 and the drained
+                        // window would be folded in (card 35 final verification: max_slots_b=4 with
+                        // done_a=500 while 500 consolidate jobs sat PENDING).
                         let row = admin
                             .query_one(
                                 "SELECT (SELECT count(*) FROM ops.provider_slots s \
                                    JOIN ops.jobs j ON j.job_id = s.job_id WHERE j.tenant_id = $1), \
                                         (SELECT count(*) FROM ops.jobs \
-                                   WHERE tenant_id = $2 AND status IN ('PENDING', 'PROCESSING'))",
+                                   WHERE tenant_id = $2 AND job_type = 'DERIVED_DISTILL' \
+                                     AND status IN ('PENDING', 'PROCESSING'))",
                                 &[&tenant_b, &tenant_a],
                             )
                             .expect("slots held by B / A's open jobs");

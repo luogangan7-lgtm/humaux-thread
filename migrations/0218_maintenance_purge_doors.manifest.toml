@@ -1,0 +1,59 @@
+# §46.1 migration manifest. Card 35 S2 / ADR-0062 D-E..D-J (Baseline §6.2.1 amended by ruling E1): the closed set of
+# four owner SECURITY DEFINER purge doors, EXECUTE role_maintenance only; the 1-argument 0169 confirm door is replaced
+# by its bounded, receipted 2-argument successor. No table grant changes: no non-owner role gains DELETE anywhere.
+
+migration_id = "0218_maintenance_purge_doors"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regprocedure('control.sweep_confirm_tokens(interval)') is not null
+   and to_regprocedure('control.sweep_confirm_tokens(interval,integer)') is null
+   and to_regprocedure('ops.purge_expired_selection_snapshots(integer)') is null
+   and to_regprocedure('control.purge_idle_rate_buckets(interval,integer)') is null
+   and to_regprocedure('ops.purge_terminal_jobs(interval,interval,interval,integer)') is null
+   and to_regclass('ops.maintenance_receipts') is not null
+ as precheck_ok
+"""
+
+postcheck = """
+with door(sig) as (values ('control.sweep_confirm_tokens(interval,integer)'),
+                          ('ops.purge_expired_selection_snapshots(integer)'),
+                          ('control.purge_idle_rate_buckets(interval,integer)'),
+                          ('ops.purge_terminal_jobs(interval,interval,interval,integer)'))
+select
+ -- one confirm door: the 1-argument 0169 door is gone
+ (select count(*) = 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'control' and p.proname = 'sweep_confirm_tokens')
+ -- each door: owner, definer, strict, LANGUAGE sql, pinned search_path, no text argument
+ and (select count(*) = 4 from door d join pg_proc p on p.oid = to_regprocedure(d.sig)
+       where pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef and p.proisstrict
+         and p.prolang = (select oid from pg_language where lanname = 'sql')
+         and 'search_path=pg_catalog' = any(coalesce(p.proconfig, array[]::text[]))
+         and not ('text'::regtype = any(p.proargtypes::oid[]::regtype[])))
+ -- EXECUTE exactly role_maintenance: PUBLIC and every other role denied
+ and not exists (select 1 from door d where not has_function_privilege('role_maintenance', d.sig, 'EXECUTE'))
+ and not exists (
+       select 1 from door d, unnest(array['role_gateway', 'role_private_worker', 'role_consolidation_worker',
+                                          'role_public_worker', 'role_retrieval_worker', 'role_batch_issuer',
+                                          'role_admin', 'role_health_reader']) r(role)
+        where has_function_privilege(r.role, d.sig, 'EXECUTE'))
+ and not exists (
+       select 1 from door d, pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+        where p.oid = to_regprocedure(d.sig) and x.grantee = 0 and x.privilege_type = 'EXECUTE')
+ -- the verb stays behind the doors: role_maintenance holds no DELETE or TRUNCATE on any purge table
+ and not exists (
+       select 1 from unnest(array['control.confirm_tokens', 'ops.selection_snapshots', 'ops.selection_snapshot_items',
+                                  'control.rate_buckets', 'ops.jobs', 'ops.distill_calls',
+                                  'ops.maintenance_receipts']) t(tbl)
+        where has_table_privilege('role_maintenance', t.tbl, 'DELETE')
+           or has_table_privilege('role_maintenance', t.tbl, 'TRUNCATE'))
+ -- every purge table and the receipt table keep FORCE RLS
+ and (select bool_and(c.relrowsecurity and c.relforcerowsecurity) from pg_class c
+       where c.oid in ('control.confirm_tokens'::regclass, 'ops.selection_snapshots'::regclass,
+                       'ops.selection_snapshot_items'::regclass, 'control.rate_buckets'::regclass,
+                       'ops.jobs'::regclass, 'ops.maintenance_receipts'::regclass))
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "forward fix only once a door has run (deleted rows are gone; their receipts in ops.maintenance_receipts record tenant, task, cutoff and count). To retire the doors: REVOKE EXECUTE and DROP FUNCTION for each of the four signatures; re-creating the 0169 1-argument door is not needed (the 2-argument door holds its predicate)."
+backup_restore_requirement = "none for the DDL itself: functions only, no row touched by the migration. Running a door is the destructive step; the runbook's scheduled-maintenance section names the pg_dump -t backup for an operator-run sweep on a shared database (ruling E8)."

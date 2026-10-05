@@ -1,23 +1,30 @@
 //! `adapters::tests::a2_point_identity` — ADR-0057 D-A/D-B/D-L/D-M: §23.1② A2 in the point unit, against a real
-//!   PostgreSQL ledger, the real `projection.stream_point_ledger` definer, the real projection worker and a real Qdrant.
+//!   PostgreSQL ledger, the real `projection.stream_point_ledger` definer, the real projection worker and a real Qdrant;
+//!   and the Q drain (ADR-0062 D-N): the reissue door on throwaway databases.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-telemetry, humaux-testkit, postgres, serde_json, sqlx];
-//!   services=[PostgreSQL(owner) w=[control.users, control.workspaces] x=[private.memory_subject_visibility_ok],
-//!   PostgreSQL(role_gateway) r=[private.memory_records] x=[projection.stream_point_ledger], Qdrant(*)]; env=[];
-//!   modules=[adapters::affect_repo, adapters::retrieve, adapters::tests::support::a2_fixture,
-//!   adapters::tests::support::governance_ops, domain::affect, domain::authority, domain::confirm, domain::ids,
+//!   services=[PostgreSQL(owner) r=[ops.commit_seq_seq, projection.ticket_reissues] w=[control.users,
+//!   control.workspaces, ops.outbox, private.evidence_objects, private.memory_evidence,
+//!   projection.stream_checkpoints, projection.stream_log] x=[private.memory_subject_visibility_ok],
+//!   PostgreSQL(role_gateway) r=[private.memory_records] x=[projection.stream_point_ledger],
+//!   PostgreSQL(role_maintenance), PostgreSQL(role_retrieval_worker) w=[projection.stream_log], Qdrant(*)]; env=[];
+//!   modules=[adapters::affect_repo, adapters::maintenance_repo, adapters::retrieve, adapters::stream_repo,
+//!   adapters::tests::support::a2_fixture, adapters::tests::support::governance_ops,
+//!   adapters::tests::support::throwaway_db, domain::affect, domain::authority, domain::confirm, domain::ids,
 //!   humaux-testkit, telemetry::degrade]
 //! Called-by: [cargo-test]
 //! Invariants: [both sides of A2 are the production producers: stream_repo::fetch_ledger_closure (the 0189 definer)
 //!   and retrieve::visible_count_of_version (the caller-scoped Qdrant count); governance ops run through the real
 //!   memory_governance_repo ops; throwaway tenant + collection cleaned up on Drop; a missing PG / Qdrant / gitleaks is
-//!   a fixture error, never a silent pass]
-//! Spec: Baseline §23.1②; §22.4; §79.2; ADR-0049; ADR-0057
+//!   a fixture error, never a silent pass; every reissue runs in its own throwaway database, never on the shared dev
+//!   database (ADR-0062 E8)]
+//! Spec: Baseline §23.1②; §22.4; §79.2; ADR-0049; ADR-0057; ADR-0057 D-H; ADR-0062 D-M; ADR-0062 D-N
 //!
 //! Every test prints `a2 <label>: visible L F Q U done` so a red run names the reading that moved.
 
 use std::time::Duration;
 
 use humaux_adapters::affect_repo;
+use humaux_adapters::maintenance_repo;
 use humaux_adapters::retrieve::{IndexFace, stream_count_of_version};
 use humaux_domain::affect::MoodHalfLife;
 use humaux_domain::authority::MemoryId;
@@ -31,6 +38,8 @@ use sqlx::types::Uuid;
 mod a2_fixture;
 #[path = "support/governance_ops.rs"]
 mod governance_ops;
+#[path = "support/throwaway_db.rs"]
+mod throwaway_db;
 use a2_fixture::{Fixture, Handle, TENANT_SHARED};
 use governance_ops::stream;
 
@@ -654,4 +663,512 @@ fn retired_restore_failed_after_done_is_closed() {
             (Some(1), 1, 1)
         );
     });
+}
+
+// ---- card 35 S4: ledger v2 (ADR-0062 D-M/D-O) ----
+
+/// T-M1 — a memory whose PRIMARY evidence is SECRET_MATERIAL can never hold a point, so the v2 definer counts it
+/// neither in flight (F) nor as slack (Q); an ordinary memory failed by the same ticket still widens Q by one.
+/// Fault: drop `AND r.indexable` from 0219's Q filter ⇒ Q = 2 (from its F filter ⇒ F = 2 before the run).
+#[test]
+fn a_non_indexable_memory_with_a_failed_ticket_widens_no_slack() {
+    run_db_fixture::<Fixture, _>(
+        "a_non_indexable_memory_with_a_failed_ticket_widens_no_slack",
+        |mut h| {
+            let ws = h.workspace();
+            // Ticket 1: the secret Evidence, PRIMARY of `secret`; the worker skips it by policy.
+            let secret_source = h.evidence(ws, "a2 secret primary source");
+            let secret = h.memory(secret_source, "secret primary", TENANT_SHARED);
+            h.admin
+                .execute(
+                    "UPDATE private.evidence_objects SET data_class = 'SECRET_MATERIAL' \
+                     WHERE evidence_id = $1",
+                    &[&secret_source],
+                )
+                .expect("mark the PRIMARY source secret");
+            // Ticket 2: an ordinary Evidence, PRIMARY of `ordinary` and SUPPORTING of `secret`. It reaches both and
+            // the worker reads the ticket evidence's class (ADR-0057 limit 15), so a refused upsert fails it for both.
+            let ordinary_source = h.evidence(ws, "a2 ordinary source");
+            h.memory(ordinary_source, "ordinary", TENANT_SHARED);
+            h.admin
+                .execute(
+                    "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, ordinal) \
+                     VALUES ($1, $2, 'SUPPORTING', 1)",
+                    &[&secret, &ordinary_source],
+                )
+                .expect("the ordinary ticket also reaches the secret memory");
+            let reader = h.scope(ws);
+            let pending = h.reading("non_indexable_pending", ws, &reader).value;
+            assert_eq!(
+                (pending.points_expected, pending.points_in_flight),
+                (1, 1),
+                "U and F count only the ordinary memory while both tickets are ISSUED"
+            );
+            assert_eq!(
+                h.run_refused(ws, 0, false),
+                1,
+                "the ordinary ticket fails on the refused upsert; the secret one settles SKIPPED_BY_POLICY"
+            );
+            let failed = h.reading("non_indexable_failed", ws, &reader).value;
+            assert_eq!(
+                (
+                    failed.points_expected,
+                    failed.points_in_flight,
+                    failed.points_unsettled
+                ),
+                (1, 0, 1),
+                "Q is the ordinary memory only: the secret one's latest ticket is FAILED too but it holds no point"
+            );
+        },
+    );
+}
+
+// ---- card 35 S5: the Q drain (ADR-0062 D-N; ADR-0057 D-H) ----
+// Every test below owns a throwaway database (ruling E8: no reissue ever lands on the shared dev database) and calls
+// the production door through `maintenance_repo::reissue_unsettled_tickets` as role_maintenance.
+
+/// The a2 fixture in its own throwaway database `humaux_thread_c35_reissue_<pid>_<n>`.
+struct Drain;
+
+impl humaux_testkit::DbIntegrationFixture for Drain {
+    type Handle = Handle;
+
+    fn isolate() -> Result<Handle, humaux_testkit::DbFixtureSkipReason> {
+        let db = throwaway_db::create("c35_reissue")?;
+        Handle::in_throwaway(db.dsn(), Box::new(db))
+    }
+}
+
+/// A cool-down every test ages its tickets past (see [`age`]).
+const COOLDOWN: Duration = Duration::from_secs(3_600);
+
+/// One call of the production door for the fixture tenant; returns the tickets issued.
+fn reissue(h: &Handle) -> i64 {
+    h.rt.block_on(maintenance_repo::reissue_unsettled_tickets(
+        &h.maintenance,
+        h.tenant_id,
+        COOLDOWN,
+        100,
+    ))
+    .expect("reissue door as role_maintenance")
+}
+
+/// Settles the ISSUED tickets of `ws`'s stream (only those carrying `evidence`, when given) FAILED `class` through
+/// role_retrieval_worker's one legal edge, as the worker does; returns how many.
+fn fail(h: &mut Handle, ws: Uuid, evidence: Option<Uuid>, class: &str) -> u64 {
+    let tenant = h.tenant_id;
+    let mut txn = h.admin.transaction().expect("owner txn");
+    let seqs: Vec<i64> = txn
+        .query(
+            "SELECT sl.commit_seq FROM projection.stream_log sl \
+               JOIN ops.outbox o ON o.tenant_id = sl.tenant_id AND o.commit_seq = sl.commit_seq \
+              WHERE sl.tenant_id = $1 AND sl.scope_id = $2 AND sl.state = 'ISSUED' \
+                AND ($3::uuid IS NULL OR o.evidence_id = $3)",
+            &[&tenant, &ws, &evidence],
+        )
+        .expect("issued tickets")
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    // dep: PostgreSQL(role_retrieval_worker) — the ISSUED -> FAILED settle edge (0167 guard)
+    txn.batch_execute(&format!(
+        "SET LOCAL ROLE role_retrieval_worker; SET LOCAL humaux.tenant_id = '{tenant}';"
+    ))
+    .expect("act as role_retrieval_worker");
+    let failed = txn
+        .execute(
+            "UPDATE projection.stream_log SET state = 'FAILED', error_class = $1 \
+              WHERE tenant_id = $2 AND scope_id = $3 AND commit_seq = ANY($4)",
+            &[&class, &tenant, &ws, &seqs],
+        )
+        .expect("settle FAILED");
+    txn.commit().expect("commit the settle");
+    failed
+}
+
+/// Pushes every timestamp of `ws`'s tickets two hours back (owner write, no state change, so the 0167 guard is not
+/// involved): past [`COOLDOWN`].
+fn age(h: &mut Handle, ws: Uuid) {
+    h.admin
+        .execute(
+            "UPDATE projection.stream_log SET issued_at = issued_at - interval '2 hours', \
+               settled_at = settled_at - interval '2 hours', retired_at = retired_at - interval '2 hours', \
+               lost_at = lost_at - interval '2 hours' \
+             WHERE tenant_id = $1 AND scope_id = $2",
+            &[&h.tenant_id, &ws],
+        )
+        .expect("age the stream's tickets");
+}
+
+/// Owner write of one settled lifecycle ticket bound to `evidence` on `ws`'s stream (0198's issue sequence), for a
+/// ticket history no production path writes on demand (a TOMBSTONED ticket, a ticket on a second stream).
+fn owner_ticket(h: &mut Handle, ws: Uuid, evidence: Uuid, state: &str, class: Option<&str>) -> i64 {
+    let key = stream(h.tenant_id, ws);
+    h.admin
+        .query_one(
+            "WITH k AS (UPDATE projection.stream_checkpoints SET issued_highwater = issued_highwater + 1 \
+                         WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3 AND domain = $4 \
+                           AND projection_kind = $5 AND projection_version = $6 RETURNING issued_highwater), \
+                  t AS (INSERT INTO projection.stream_log (tenant_id, scope_kind, scope_id, domain, projection_kind, \
+                          projection_version, stream_seq, commit_seq, state, error_class, settled_at) \
+                        SELECT $1, $2, $3, $4, $5, $6, k.issued_highwater, nextval('ops.commit_seq_seq'), $7, $8, \
+                               now() FROM k RETURNING commit_seq, stream_seq) \
+             INSERT INTO ops.outbox (tenant_id, commit_seq, stream_seq, event_type, evidence_id, status) \
+             SELECT $1, t.commit_seq, t.stream_seq, 'MEMORY_LIFECYCLE', $9, 'DONE' FROM t RETURNING commit_seq",
+            &[
+                &h.tenant_id,
+                &key.scope_kind,
+                &key.scope_id,
+                &key.domain,
+                &key.projection_kind,
+                &key.projection_version,
+                &state,
+                &class,
+                &evidence,
+            ],
+        )
+        .expect("owner ticket on a provisioned stream")
+        .get(0)
+}
+
+/// The tickets the door issued, as (stream scope_id, carrier evidence), oldest first.
+fn reissued(h: &mut Handle) -> Vec<(Uuid, Uuid)> {
+    h.admin
+        .query(
+            "SELECT sl.scope_id, o.evidence_id FROM projection.ticket_reissues r \
+               JOIN projection.stream_log sl ON sl.tenant_id = r.tenant_id AND sl.commit_seq = r.reissued_commit_seq \
+               JOIN ops.outbox o ON o.tenant_id = r.tenant_id AND o.commit_seq = r.reissued_commit_seq \
+              WHERE r.tenant_id = $1 ORDER BY r.reissued_commit_seq",
+            &[&h.tenant_id],
+        )
+        .expect("reissue markers")
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
+}
+
+/// T-N1 (ADR-0057 D-H acceptance, ADR-0062 D-N): the three retired fixtures of test 36 — a partial fan-out, a
+/// refused supersede delete, a refused restore upsert — each leave Q > 0; one door call issues one ticket per
+/// fixture on its own stream and one projection run per stream drains every Q to 0 with the identity closed.
+/// Fault: the door issues every ticket on one stream (not `t`'s) ⇒ two streams keep their Q ⇒ red.
+#[test]
+fn one_sweep_drains_the_three_retired_fixtures_to_zero_unsettled() {
+    run_db_fixture::<Drain, _>(
+        "one_sweep_drains_the_three_retired_fixtures_to_zero_unsettled",
+        |mut h| {
+            let fan = h.workspace();
+            h.fan_out(fan, "a2 partial fan-out", 3);
+            assert_eq!(h.run_refused(fan, 1, false), 1, "the fan-out ticket fails");
+            h.retire(fan, "qdrant_upsert_rejected");
+
+            let (sup, m1, m2) = two_memories(&mut h);
+            let sup_reader = h.scope(sup);
+            governance_ops::supersede(
+                &h.rt,
+                &h.gateway,
+                &sup_reader,
+                &stream(h.tenant_id, sup),
+                m1,
+                m2,
+            )
+            .expect("supersede");
+            assert_eq!(
+                h.run_refused(sup, usize::MAX, true),
+                1,
+                "the retire ticket fails"
+            );
+            h.retire(sup, "qdrant_delete_rejected");
+
+            let (res, r1, r2) = two_memories(&mut h);
+            let res_reader = h.scope(res);
+            let key = stream(h.tenant_id, res);
+            governance_ops::supersede(&h.rt, &h.gateway, &res_reader, &key, r1, r2)
+                .expect("supersede");
+            h.drain(res);
+            governance_ops::restore(&h.rt, &h.gateway, &res_reader, &key, r1).expect("restore");
+            assert_eq!(h.run_refused(res, 0, false), 1, "the restore ticket fails");
+            h.retire(res, "qdrant_upsert_rejected");
+
+            for ws in [fan, sup, res] {
+                assert!(
+                    h.reading("retired", ws, &h.scope(ws))
+                        .value
+                        .points_unsettled
+                        > 0
+                );
+                age(&mut h, ws);
+            }
+            assert_eq!(reissue(&h), 3, "one ticket per retired fixture");
+            let streams: Vec<Uuid> = reissued(&mut h).into_iter().map(|(s, _)| s).collect();
+            assert_eq!(streams.len(), 3);
+            for ws in [fan, sup, res] {
+                assert!(
+                    streams.contains(&ws),
+                    "a ticket on {ws}'s own stream: {streams:?}"
+                );
+            }
+            for (ws, label, visible) in [
+                (fan, "fan_out", 3),
+                (sup, "supersede", 1),
+                (res, "restore", 2),
+            ] {
+                h.drain(ws);
+                let b = h.assert_closed(&format!("drained_{label}"), ws, &h.scope(ws));
+                assert_eq!(
+                    (b.points_unsettled, b.visible, b.points_settled),
+                    (0, Some(visible), visible),
+                    "{label}: Q drained, every point settled"
+                );
+            }
+        },
+    );
+}
+
+/// T-N2 (ADR-0062 D-N): a deterministic failure (`card_unbuildable`) is reissued once; when the reissued ticket
+/// fails the same way the next call leaves it; an operator retirement makes it eligible once more. Fault: drop the
+/// "`t` is not itself a reissue" predicate ⇒ the second call issues again ⇒ red.
+#[test]
+fn a_deterministic_failure_is_reissued_once_then_left() {
+    run_db_fixture::<Drain, _>(
+        "a_deterministic_failure_is_reissued_once_then_left",
+        |mut h| {
+            let ws = h.workspace();
+            h.fan_out(ws, "a2 unbuildable", 1);
+            assert_eq!(fail(&mut h, ws, None, "card_unbuildable"), 1);
+            age(&mut h, ws);
+            assert_eq!(
+                reissue(&h),
+                1,
+                "the first deterministic failure is retried once"
+            );
+            assert_eq!(
+                fail(&mut h, ws, None, "card_unbuildable"),
+                1,
+                "the reissue fails the same way"
+            );
+            age(&mut h, ws);
+            assert_eq!(
+                reissue(&h),
+                0,
+                "a failed reissue waits for an operator retirement"
+            );
+            let retired =
+                h.rt.block_on(humaux_adapters::stream_repo::retire_failed(
+                    &h.maintenance,
+                    &stream(h.tenant_id, ws),
+                    "card_unbuildable",
+                ))
+                .expect("audited retirement of the class");
+            assert_eq!(
+                retired.len(),
+                2,
+                "the operator retires both failed tickets of the class"
+            );
+            age(&mut h, ws);
+            assert_eq!(reissue(&h), 1, "once per retirement");
+            assert_eq!(reissued(&mut h).len(), 2);
+        },
+    );
+}
+
+/// T-N3 (ADR-0062 D-N): a transient FAILED, a deterministic FAILED and a RETIRED_FAILED ticket settled inside the
+/// cool-down are all left; aged past it, each is reissued. Fault: no cool-down for RETIRED_FAILED ⇒ the first call
+/// issues 1 ⇒ red.
+#[test]
+fn every_class_waits_out_the_cooldown() {
+    run_db_fixture::<Drain, _>("every_class_waits_out_the_cooldown", |mut h| {
+        let ws = h.workspace();
+        h.fan_out(ws, "a2 transient", 1);
+        let e_transient = evidence_of_ticket(&mut h, ws, 0);
+        h.fan_out(ws, "a2 deterministic", 1);
+        let e_deterministic = evidence_of_ticket(&mut h, ws, 1);
+        h.fan_out(ws, "a2 retired", 1);
+        let e_retired = evidence_of_ticket(&mut h, ws, 2);
+        assert_eq!(
+            fail(&mut h, ws, Some(e_transient), "qdrant_upsert_rejected"),
+            1
+        );
+        assert_eq!(
+            fail(&mut h, ws, Some(e_deterministic), "card_unbuildable"),
+            1
+        );
+        assert_eq!(fail(&mut h, ws, Some(e_retired), "registry_failed"), 1);
+        h.retire(ws, "registry_failed");
+        assert_eq!(reissue(&h), 0, "every class waits out the cool-down");
+        age(&mut h, ws);
+        assert_eq!(reissue(&h), 3, "past the cool-down every class is reissued");
+    });
+}
+
+/// The ISSUED tickets of `ws`'s stream, as the daemon's LOST task finds them: carriers settled (the Evidence is no
+/// longer being distilled, so the claim does not hold the ticket back) and past `LOST_AFTER`; returns how many went
+/// LOST through the production `sweep_lost` as role_maintenance.
+fn sweep_lost(h: &mut Handle, ws: Uuid) -> u64 {
+    h.admin
+        .execute(
+            "UPDATE ops.outbox o SET status = 'DONE' FROM projection.stream_log sl \
+              WHERE sl.tenant_id = $1 AND sl.scope_id = $2 AND sl.state = 'ISSUED' \
+                AND o.tenant_id = sl.tenant_id AND o.commit_seq = sl.commit_seq",
+            &[&h.tenant_id, &ws],
+        )
+        .expect("settle the carriers");
+    h.rt.block_on(humaux_adapters::stream_repo::sweep_lost(
+        &h.maintenance,
+        h.tenant_id,
+        Duration::from_secs(900),
+        100,
+    ))
+    .expect("sweep_lost as role_maintenance")
+}
+
+/// T-N7 (ADR-0062 D-N, 0223): a LOST ticket's cool-down counts from its sweep (`lost_at`), not from its old
+/// `issued_at`. An orphan two hours old is swept LOST and is not reissued inside the cool-down; past it, it is
+/// reissued once; the reissued ticket, orphaned again and swept LOST, again waits the full cool-down. So reissues of
+/// one memory are at least LOST_AFTER + cool-down apart, never one per cycle. Fault: 0220's clock (no `lost_at` in
+/// `last_activity`) ⇒ the first call right after the sweep issues 1 ⇒ red.
+#[test]
+fn a_lost_ticket_waits_out_the_cooldown_from_its_sweep() {
+    run_db_fixture::<Drain, _>(
+        "a_lost_ticket_waits_out_the_cooldown_from_its_sweep",
+        |mut h| {
+            let ws = h.workspace();
+            h.fan_out(ws, "a2 orphan", 1);
+            age(&mut h, ws);
+            assert_eq!(sweep_lost(&mut h, ws), 1, "the orphan goes LOST");
+            assert_eq!(reissue(&h), 0, "swept just now: inside the cool-down");
+            age(&mut h, ws);
+            assert_eq!(reissue(&h), 1, "past the cool-down: reissued once");
+            age(&mut h, ws);
+            assert_eq!(
+                sweep_lost(&mut h, ws),
+                1,
+                "the reissued ticket is orphaned too"
+            );
+            assert_eq!(
+                reissue(&h),
+                0,
+                "a second LOST waits the full cool-down again"
+            );
+            age(&mut h, ws);
+            assert_eq!(reissue(&h), 1);
+            assert_eq!(
+                reissued(&mut h).len(),
+                2,
+                "one reissue per cool-down window"
+            );
+        },
+    );
+}
+
+/// The evidence carried by the `n`-th (0-based, commit order) ticket of `ws`'s stream.
+fn evidence_of_ticket(h: &mut Handle, ws: Uuid, n: i64) -> Uuid {
+    h.admin
+        .query_one(
+            "SELECT o.evidence_id FROM projection.stream_log sl \
+               JOIN ops.outbox o ON o.tenant_id = sl.tenant_id AND o.commit_seq = sl.commit_seq \
+              WHERE sl.tenant_id = $1 AND sl.scope_id = $2 ORDER BY sl.commit_seq OFFSET $3 LIMIT 1",
+            &[&h.tenant_id, &ws, &n],
+        )
+        .expect("ticket evidence")
+        .get(0)
+}
+
+/// T-N4 (ADR-0062 D-N): three memories of one Evidence whose ticket failed give one ticket, bound to that
+/// Evidence. Fault: dedup by memory instead of (stream, PRIMARY evidence) ⇒ 3 ⇒ red.
+#[test]
+fn one_ticket_per_stream_and_evidence() {
+    run_db_fixture::<Drain, _>("one_ticket_per_stream_and_evidence", |mut h| {
+        let ws = h.workspace();
+        h.fan_out(ws, "a2 one evidence", 3);
+        let evidence = evidence_of_ticket(&mut h, ws, 0);
+        assert_eq!(fail(&mut h, ws, None, "qdrant_upsert_rejected"), 1);
+        age(&mut h, ws);
+        assert_eq!(
+            reissue(&h),
+            1,
+            "one ticket covers every memory of the Evidence"
+        );
+        assert_eq!(reissued(&mut h), vec![(ws, evidence)]);
+    });
+}
+
+/// T-N5 (ADR-0062 D-N, ADR-0057 D-M): the reissue goes on the failed ticket's own stream, which is the Evidence's
+/// home stream (the stream of its first ticket, `memory_governance_repo::home_stream`) — even when a later ticket of
+/// another kind carries the same Evidence on a second stream. Fault: issue on the stream of the Evidence's last
+/// ticket ⇒ the ticket lands on the second stream ⇒ red.
+#[test]
+fn the_reissue_stream_is_the_home_stream() {
+    run_db_fixture::<Drain, _>("the_reissue_stream_is_the_home_stream", |mut h| {
+        let home = h.workspace();
+        h.fan_out(home, "a2 home", 1);
+        let evidence = evidence_of_ticket(&mut h, home, 0);
+        let other = h.workspace();
+        h.evidence(other, "a2 provisions the second stream");
+        assert_eq!(fail(&mut h, home, Some(evidence), "transient_exhausted"), 1);
+        // A later, settled ticket of another kind carrying the same Evidence on the second stream.
+        owner_ticket(&mut h, other, evidence, "DONE", None);
+        age(&mut h, home);
+        age(&mut h, other);
+        let first_stream: Uuid = h
+            .admin
+            .query_one(
+                "SELECT sl.scope_id FROM ops.outbox o JOIN projection.stream_log sl \
+                   ON sl.tenant_id = o.tenant_id AND sl.commit_seq = o.commit_seq \
+                  WHERE o.tenant_id = $1 AND o.evidence_id = $2 ORDER BY o.commit_seq LIMIT 1",
+                &[&h.tenant_id, &evidence],
+            )
+            .expect("home stream, as memory_governance_repo::home_stream reads it")
+            .get(0);
+        assert_eq!(first_stream, home);
+        assert_eq!(reissue(&h), 1);
+        assert_eq!(
+            reissued(&mut h),
+            vec![(home, evidence)],
+            "the ticket is on the home stream"
+        );
+    });
+}
+
+/// T-N6 (ADR-0062 D-N/D-O): a memory with a TOMBSTONED ticket and a secret-PRIMARY (non-indexable) memory are never
+/// reissued, even when their latest ticket is FAILED; the ordinary memory beside them is. Fault: drop the
+/// `indexable` term (or the tombstone exclusion) ⇒ 2 tickets ⇒ red.
+#[test]
+fn a_tombstoned_or_non_indexable_memory_is_never_reissued() {
+    run_db_fixture::<Drain, _>(
+        "a_tombstoned_or_non_indexable_memory_is_never_reissued",
+        |mut h| {
+            let ws = h.workspace();
+            let secret_source = h.evidence(ws, "a2 secret primary source");
+            let secret = h.memory(secret_source, "secret primary", TENANT_SHARED);
+            h.admin
+            .execute(
+                "UPDATE private.evidence_objects SET data_class = 'SECRET_MATERIAL' WHERE evidence_id = $1",
+                &[&secret_source],
+            )
+            .expect("mark the PRIMARY source secret");
+            let ordinary_source = h.evidence(ws, "a2 ordinary source");
+            h.memory(ordinary_source, "ordinary", TENANT_SHARED);
+            h.admin
+                .execute(
+                    "INSERT INTO private.memory_evidence (memory_id, evidence_id, role, ordinal) \
+                 VALUES ($1, $2, 'SUPPORTING', 1)",
+                    &[&secret, &ordinary_source],
+                )
+                .expect("the ordinary ticket also reaches the secret memory");
+            let tomb_source = h.evidence(ws, "a2 tombstoned source");
+            h.memory(tomb_source, "tombstoned", TENANT_SHARED);
+            assert_eq!(fail(&mut h, ws, None, "qdrant_upsert_rejected"), 3);
+            owner_ticket(&mut h, ws, tomb_source, "TOMBSTONED", None);
+            owner_ticket(
+                &mut h,
+                ws,
+                tomb_source,
+                "FAILED",
+                Some("transient_exhausted"),
+            );
+            age(&mut h, ws);
+            assert_eq!(reissue(&h), 1, "only the ordinary memory is drained");
+            assert_eq!(reissued(&mut h), vec![(ws, ordinary_source)]);
+        },
+    );
 }

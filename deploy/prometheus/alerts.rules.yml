@@ -1,4 +1,4 @@
-# §42 alert rows loaded by cards 34 and 34b (ADR-0061 D-E). Each expression is copied literally from the
+# §42 alert rows loaded by cards 34, 34b and 35 (ADR-0061 D-E, ADR-0062 D-S). Each expression is copied literally from the
 # §42 table; metric names and label keys are §41.2 rows (freezes ① and ④, checked by
 # `cargo xtask metrics-registry --check` D8). The other §42 rows wait for a producer and a red
 # record (freeze ②, §80.1); they are listed in ADR-0061 limits.
@@ -56,3 +56,22 @@ groups:
         expr: vector(1)
         labels:
           severity: none
+
+      # §42 "maintenance task failing" (card 35, ADR-0062 D-S, ruling E3): a scheduled maintenance door call
+      # failed in the last hour. Exported only by `humaux-maintenance --serve` (ADR-0061 D-C); `outcome` is the
+      # §41.2 closed set ok | failed. While a failure lasts `/metrics` answers 503 (ADR-0062 D-A), so no sample is
+      # scraped: this row is the record read on the first clean scrape after recovery, and the live signal is
+      # MaintenanceCountersAbsent below.
+      - alert: MaintenanceTaskFailing
+        expr: increase(maintenance_task_runs_total{outcome="failed"}[1h]) > 0
+        labels:
+          severity: warning
+
+      # §42 "maintenance counters absent" (card 35 fix pass, ADR-0062 D-S): the daemon is dead, never scraped, or
+      # answering 503 (a failed door call, an unreachable database, no cycle finished yet) — a failed scrape marks
+      # its series stale. The HealthGaugesAbsent shape for the eighth ops pair; only a §41.2 name, no label key.
+      - alert: MaintenanceCountersAbsent
+        expr: absent(maintenance_task_runs_total)
+        for: 2m
+        labels:
+          severity: warning

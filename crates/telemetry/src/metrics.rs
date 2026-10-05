@@ -1,8 +1,10 @@
 //! `telemetry::metrics` — the §41.2 family table this workspace exports, a hand-written Prometheus text-format
 //!   0.0.4 encoder, and the std-only loopback listener that serves `/metrics` and `/status` (ADR-0061 D-A, D-B).
 //! Depends-on: crates=[]; services=[HTTP(loopback)]; env=[]; modules=[telemetry::degrade]
-//! Called-by: [admin::cell_resources, admin::ops_status, consolidation-worker::main, gateway::bootstrap, gateway::guard, gateway::main, maintenance::health_serve,
-//!   private-worker::main, retrieval-worker::main, retrieval::completeness, telemetry::degrade, telemetry::health, tests]
+//! Called-by: [admin::cell_resources, admin::ops_status, consolidation-worker::main, gateway::bootstrap,
+//!   gateway::guard, gateway::main, maintenance::health_serve, maintenance::resident, maintenance::serve,
+//!   private-worker::main, retrieval-worker::main, retrieval::completeness, telemetry::degrade, telemetry::health,
+//!   tests]
 //! Invariants: [every exported family is a `families::*` const and nowhere else; label values are `&'static str`
 //!   from a closed enum; the listener refuses a non-loopback address and names the config key]
 //! Spec: Baseline §41.2; §53.5; ADR-0061 D-A; ADR-0061 D-B
@@ -269,6 +271,23 @@ pub mod families {
         "Tokens private reasoning providers reported (input + output) on finalized calls.",
         Kind::Counter,
         &[],
+    );
+    // §41.2: §4.2 every door call of the resident daemon — `humaux-maintenance --serve` (card 35; emit
+    // `adapters::maintenance_repo::count_task_call`, ADR-0062 D-S).
+    /// `maintenance_task_runs_total{task,outcome}`.
+    pub const MAINTENANCE_TASK_RUNS_TOTAL: Family = f(
+        "maintenance_task_runs_total",
+        "Scheduled maintenance door calls (one per tenant), by D-C task and outcome.",
+        Kind::Counter,
+        &["task", "outcome"],
+    );
+    // §41.2: §4.2 the same door call's affected rows — `humaux-maintenance --serve` (card 35, ADR-0062 D-S).
+    /// `maintenance_task_rows_total{task}`.
+    pub const MAINTENANCE_TASK_ROWS_TOTAL: Family = f(
+        "maintenance_task_rows_total",
+        "Rows the scheduled maintenance doors affected (deleted, swept, reaped, reissued, re-driven), by D-C task.",
+        Kind::Counter,
+        &["task"],
     );
 }
 

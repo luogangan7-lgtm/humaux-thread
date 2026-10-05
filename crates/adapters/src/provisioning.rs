@@ -10,7 +10,8 @@
 //!   modules=[adapters::membership_repo, adapters::postgres, adapters::qdrant, adapters::retrieve, application::auth, domain::audit,
 //!   domain::identity, domain::ids, domain::ticket_family, infra-cell::permit, infra-cell::resource,
 //!   infra-cell::transport, projection::serving]
-//! Called-by: [adapters::reasoning_route_onboarding, adapters::role_hygiene, maintenance::main, tests, xtask::e2e_seed]
+//! Called-by: [adapters::maintenance_repo, adapters::reasoning_route_onboarding, adapters::role_hygiene, maintenance::main, tests,
+//!   xtask::e2e_seed]
 //! Invariants: [every write goes through a 0186 / 0197 owner definer as role_maintenance, no table INSERT here; one transaction
 //!   per tenant (onboard_tenant installs the tenant GUC for the caller's transaction); the Qdrant probe runs outside any
 //!   transaction and the activation commits only if evaluate_switch accepts the DB-returned facts and the collection
@@ -993,10 +994,12 @@ pub async fn onboard_user(
 // Operator re-drive of DEAD distill jobs (ADR-0058 R4, migration 0197)
 // ============================================================================
 
-/// §77 risk tag of the distill re-drive rows (not an onboarding step).
-const REDRIVE_RISK_TAG: &str = "distill_redrive";
+/// §77 risk tag of the distill re-drive rows (not an onboarding step); also the daemon's automatic re-drive rows
+/// (ADR-0062 D-P, `maintenance_repo::auto_redrive_schema_failed`).
+pub(crate) const REDRIVE_RISK_TAG: &str = "distill_redrive";
 const REDRIVE_ACTION: &str = "DISTILL_REQUEUE_DEAD";
-const REDRIVE_RESOURCE: &str = "distill_job";
+/// The §77 resource type of a re-drive row (operator or daemon).
+pub(crate) const REDRIVE_RESOURCE: &str = "distill_job";
 
 /// Which DEAD `DERIVED_DISTILL` jobs of one tenant `jobs requeue-dead` re-arms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

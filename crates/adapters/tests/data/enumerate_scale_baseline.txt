@@ -1,0 +1,1 @@
+ENUM n=50000 runs=30 first_p50_ms=19886.5 first_p95_ms=21562.1 later_p95_ms=37.4 floor_p95_ms=655.0 ratio=32.92 manifest_rows=50000

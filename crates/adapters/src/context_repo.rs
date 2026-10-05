@@ -3,8 +3,9 @@
 //! Called-by: [adapters::continuity_read, adapters::exact_census, adapters::memory_governance_repo, adapters::read_materialize, adapters::retrieve, adapters::serving_repo, gateway::context, gateway::mcp_application, gateway::memory, tests]
 //! Invariants: [pure reads on role_gateway; each selector enumerates twice without LIMIT so expected is never derived
 //!   from returned rows; both passes go through the same can_read re-check; a PG error is
-//!   DependencyUnavailable/Internal, never an empty context]
-//! Spec: Baseline §25.4; §16.2; §6.2.3
+//!   DependencyUnavailable/Internal, never an empty context; memory.enumerate writes at most MANIFEST_CAP manifest
+//!   rows per segment and a cursor at a capped manifest's end mints the next keyset segment with its own census]
+//! Spec: Baseline §25.4; §16.2; §6.2.3; §22.1; ADR-0062 D-K
 //!
 //! 判定与类型在 [`humaux_domain::context`]（零 IO），本模块只负责发查询。分工的理由不是
 //! 洁癖：§25.4 那条「不许用 embedding similarity 解释」之所以是拓扑保证，靠的是
@@ -58,7 +59,8 @@ use crate::read_materialize::{
 };
 use crate::request_guard_repo::{self, AuditTenant};
 use crate::selection_repo::{
-    begin_authorized_snapshot_in_txn, fetch_authorized_snapshot_page_in_txn,
+    ManifestSpec, SnapshotPage, begin_authorized_snapshot_in_txn, continuation_bound_in_txn,
+    fetch_authorized_snapshot_page_in_txn,
 };
 use crate::stream_repo::close_ledger_in_txn;
 
@@ -1188,7 +1190,11 @@ pub struct MaterializedMemory {
 pub struct MemoryEnumerationParams<'a> {
     pub cursor: Option<&'a str>,
     pub page_size: u16,
+    /// `HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS` (§78.1): one manifest segment's lifetime.
     pub ttl: std::time::Duration,
+    /// `HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP` (> 0, ADR-0062 D-K): the most ids one manifest segment stores;
+    /// a larger universe continues in keyset segments, each with its own exact census.
+    pub manifest_cap: usize,
     pub mac_key: &'a [u8],
     /// §6.1.3 (ADR-0028 D-D): restrict the EXACT enumeration predicate to memories linked to
     /// this subject (`private.memory_subjects`, under RLS). Part of the manifest's query
@@ -1357,6 +1363,7 @@ async fn memory_subjects_in_txn(
 
 fn validate_enumeration_params(params: &MemoryEnumerationParams<'_>) -> Result<(), ErrorCode> {
     if !(1..=100).contains(&params.page_size)
+        || params.manifest_cap == 0
         || !(1..=86_400).contains(&params.ttl.as_secs())
         || params.ttl.subsec_nanos() != 0
         || params.mac_key.is_empty()
@@ -1593,12 +1600,20 @@ async fn census_mint_barrier_in_txn(txn: &mut Txn<'_>) -> Result<(), ErrorCode> 
 /// [`ENUMERATION_PREDICATE`]), so their id sets must be identical. Disagreement means the two
 /// faces drifted apart — §22.4 trigger 4, reported as a failed census instead of publishing a
 /// `coverage` for a set the page never held.
+/// The two runtime axes of the enumeration predicate: the §6.1.3 subject filter and the ADR-0062 D-K segment bound
+/// (`memory_id < before_id`; `None` = the first segment). Both are bound, never interpolated.
+#[derive(Clone, Copy)]
+struct EnumerationFilter {
+    subject_id: Option<Uuid>,
+    before_id: Option<Uuid>,
+}
+
 async fn mint_census_in_txn(
     txn: &mut Txn<'_>,
     authorization: &AuthorizationScope,
     workspace: WorkspaceId,
     stream: &StreamKey,
-    subject_id: Option<Uuid>,
+    filter: EnumerationFilter,
     universe: &[Uuid],
 ) -> Result<Option<FrozenCensus>, ErrorCode> {
     let outcome = census_in_txn(
@@ -1610,7 +1625,8 @@ async fn mint_census_in_txn(
             authorization,
             workspace,
             stream,
-            subject_id,
+            subject_id: filter.subject_id,
+            before_id: filter.before_id,
         },
     )
     .await?;
@@ -1629,6 +1645,106 @@ async fn mint_census_in_txn(
     }))
 }
 
+/// [`continuation_bound_in_txn`] in its own short transaction under the caller's RLS GUCs.
+async fn continuation_bound(
+    pool: &RuntimeDbPool,
+    authorization: &AuthorizationScope,
+    cursor: &Cursor,
+    fingerprint: &str,
+    mac_key: &[u8],
+) -> Result<Option<Uuid>, ErrorCode> {
+    let mut txn = pool
+        .pool()
+        // dep: PostgreSQL(any) — opens a PostgreSQL transaction
+        .begin()
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    set_authorization_local(&mut txn, authorization).await?;
+    let bound = continuation_bound_in_txn(
+        &mut txn,
+        authorization.tenant_id().0,
+        cursor,
+        fingerprint,
+        mac_key,
+    )
+    .await?;
+    txn.commit()
+        .await
+        .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    Ok(bound)
+}
+
+/// Page 1 of one manifest segment (§20.4 Mode B; ADR-0062 D-K): the candidate ids of the enumeration predicate
+/// (narrowed to `memory_id < before_id` for a later segment), their final authorization, the §22.1 census of that
+/// same predicate in the same REPEATABLE READ snapshot, then a manifest of at most `manifest_cap` of them. The census
+/// reads every id of the segment (its set-equality cross-check needs them) but the manifest writes at most the cap.
+async fn mint_segment_in_txn(
+    txn: &mut Txn<'_>,
+    authorization: &AuthorizationScope,
+    scope: &Scope,
+    validated_key: &StreamKey,
+    params: &MemoryEnumerationParams<'_>,
+    fingerprint: &str,
+    filter: EnumerationFilter,
+) -> Result<(SnapshotPage, Option<FrozenCensus>), ErrorCode> {
+    // §6.1.3 D-D: the subject filter is part of the EXACT manifest predicate (RLS-visible
+    // memory_subjects rows), never a post-filter over an unfiltered page. The scope +
+    // predicate are the SAME two fragments the census counts (see `ENUMERATION_SCOPE`);
+    // `$3` is the subject filter and `$4` the segment bound, matching `exact_census`'s own fragments.
+    let rows = sqlx::query(&format!(
+        "SELECT memory_id FROM {ENUMERATION_SCOPE} AND ({ENUMERATION_PREDICATE}) \
+           AND {ACTIVE_FINAL} \
+           AND ($3::uuid IS NULL OR EXISTS (SELECT 1 FROM private.memory_subjects ms \
+                WHERE ms.tenant_id = memory_records.tenant_id \
+                  AND ms.memory_id = memory_records.memory_id AND ms.subject_id = $3)) \
+           AND ($4::uuid IS NULL OR memory_records.memory_id < $4) \
+         ORDER BY memory_id DESC"
+    ))
+    .bind(authorization.tenant_id().0)
+    .bind(scope.workspace_id.map(|workspace| workspace.0))
+    .bind(filter.subject_id)
+    .bind(filter.before_id)
+    .fetch_all(&mut **txn)
+    .await
+    .map_err(|_| ErrorCode::DependencyUnavailable)?;
+    let candidates = rows
+        .into_iter()
+        .map(|row| row.try_get("memory_id").map_err(|_| ErrorCode::Internal))
+        .collect::<Result<Vec<Uuid>, ErrorCode>>()?;
+    let ids = final_memory_ids_in_txn(txn, authorization, &candidates, false).await?;
+    // Disarmed in production; a test parks the mint here to commit a row into the window
+    // between this id list and the census below (ADR-0041 D-G).
+    census_mint_barrier_in_txn(txn).await?;
+    // Same transaction, therefore the same REPEATABLE READ snapshot as `ids` and as every
+    // read below it (§22.1's "与返回项取同一事务快照").
+    let census = match scope.workspace_id {
+        Some(workspace) => {
+            mint_census_in_txn(txn, authorization, workspace, validated_key, filter, &ids).await?
+        }
+        // No workspace means no `$2` for the enumerable scope — there is no universe to
+        // count, so nothing is claimed (never a total of 0).
+        None => None,
+    };
+    let page = begin_authorized_snapshot_in_txn(
+        txn,
+        authorization.tenant_id().0,
+        &ManifestSpec {
+            fingerprint,
+            ttl: params.ttl,
+            cap: params.manifest_cap,
+        },
+        params.page_size as i64,
+        params.mac_key,
+        &ids,
+    )
+    .await?;
+    if let Some(census) = census.as_ref() {
+        store_frozen_census_in_txn(txn, authorization.tenant_id().0, page.snapshot_id, census)
+            .await?;
+    }
+    Ok((page, census))
+}
+
 /// Materializes an authorization-bound immutable Memory page.
 #[allow(clippy::too_many_lines)] // ADR-0028 D-D: the exact enumeration predicate now carries the subject_id filter inside the same manifest SQL + fingerprint; splitting it would separate the predicate from the completeness classification it must stay honest with.
 pub async fn materialize_memory_enumeration(
@@ -1643,14 +1759,27 @@ pub async fn materialize_memory_enumeration(
     let (authorization, scope) = canonical_scope(authorization, scope)?;
     materialized_identity(&scope, expected_family, validated_key)?;
     let fingerprint = enumeration_fingerprint(&authorization, &scope, params.subject_id);
+    // ADR-0062 D-K: a cursor standing at the end of a capped manifest opens the next segment. The segment bound is
+    // read (one statement) before the transaction mode is chosen, because a new segment mints and needs READ WRITE.
+    let cursor = params
+        .cursor
+        .map(|encoded| Cursor::decode(encoded).map_err(|_| ErrorCode::InvalidInput))
+        .transpose()?;
+    let mint = match &cursor {
+        None => Some(None),
+        Some(cursor) => {
+            continuation_bound(pool, &authorization, cursor, &fingerprint, params.mac_key)
+                .await?
+                .map(Some)
+        }
+    };
     let mut txn = pool
         .pool()
         // dep: PostgreSQL(any) — opens a PostgreSQL transaction
         .begin()
         .await
         .map_err(|_| ErrorCode::DependencyUnavailable)?;
-    let read_write = params.cursor.is_none();
-    sqlx::query(if read_write {
+    sqlx::query(if mint.is_some() {
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ WRITE"
     } else {
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
@@ -1659,87 +1788,42 @@ pub async fn materialize_memory_enumeration(
     .await
     .map_err(|_| ErrorCode::DependencyUnavailable)?;
     set_authorization_local(&mut txn, &authorization).await?;
-    let (page, frozen_census) = if let Some(encoded) = params.cursor {
-        let cursor = Cursor::decode(encoded).map_err(|_| ErrorCode::InvalidInput)?;
-        let page = fetch_authorized_snapshot_page_in_txn(
-            &mut txn,
-            authorization.tenant_id().0,
-            &cursor,
-            &fingerprint,
-            params.page_size as i64,
-            params.mac_key,
-        )
-        .await?;
-        // §22.1: a later page's denominator is the one frozen WITH the manifest (migration
-        // 0165). Re-counting here would pair a younger snapshot's total with frozen items.
-        let census =
-            frozen_census_in_txn(&mut txn, authorization.tenant_id().0, page.snapshot_id).await?;
-        (page, census)
-    } else {
-        // §6.1.3 D-D: the subject filter is part of the EXACT manifest predicate (RLS-visible
-        // memory_subjects rows), never a post-filter over an unfiltered page. The scope +
-        // predicate are the SAME two fragments the census counts (see `ENUMERATION_SCOPE`);
-        // `$3` is the subject filter, matching `exact_census`'s own fragment.
-        let rows = sqlx::query(&format!(
-            "SELECT memory_id FROM {ENUMERATION_SCOPE} AND ({ENUMERATION_PREDICATE}) \
-               AND {ACTIVE_FINAL} \
-               AND ($3::uuid IS NULL OR EXISTS (SELECT 1 FROM private.memory_subjects ms \
-                    WHERE ms.tenant_id = memory_records.tenant_id \
-                      AND ms.memory_id = memory_records.memory_id AND ms.subject_id = $3)) \
-             ORDER BY memory_id DESC"
-        ))
-        .bind(authorization.tenant_id().0)
-        .bind(scope.workspace_id.map(|workspace| workspace.0))
-        .bind(params.subject_id)
-        .fetch_all(&mut *txn)
-        .await
-        .map_err(|_| ErrorCode::DependencyUnavailable)?;
-        let candidates = rows
-            .into_iter()
-            .map(|row| row.try_get("memory_id").map_err(|_| ErrorCode::Internal))
-            .collect::<Result<Vec<Uuid>, ErrorCode>>()?;
-        let ids = final_memory_ids_in_txn(&mut txn, &authorization, &candidates, false).await?;
-        // Disarmed in production; a test parks the mint here to commit a row into the window
-        // between this id list and the census below (ADR-0041 D-G).
-        census_mint_barrier_in_txn(&mut txn).await?;
-        // Same transaction, therefore the same REPEATABLE READ snapshot as `ids` and as every
-        // read below it (§22.1's "与返回项取同一事务快照").
-        let census = match scope.workspace_id {
-            Some(workspace) => {
-                mint_census_in_txn(
-                    &mut txn,
-                    &authorization,
-                    workspace,
-                    validated_key,
-                    params.subject_id,
-                    &ids,
-                )
-                .await?
-            }
-            // No workspace means no `$2` for the enumerable scope — there is no universe to
-            // count, so nothing is claimed (never a total of 0).
-            None => None,
-        };
-        let page = begin_authorized_snapshot_in_txn(
-            &mut txn,
-            authorization.tenant_id().0,
-            &fingerprint,
-            params.ttl,
-            params.page_size as i64,
-            params.mac_key,
-            &ids,
-        )
-        .await?;
-        if let Some(census) = census.as_ref() {
-            store_frozen_census_in_txn(
+    let (page, frozen_census) = match (mint, &cursor) {
+        (None, Some(cursor)) => {
+            let page = fetch_authorized_snapshot_page_in_txn(
                 &mut txn,
                 authorization.tenant_id().0,
-                page.snapshot_id,
-                census,
+                cursor,
+                &fingerprint,
+                params.page_size as i64,
+                params.mac_key,
             )
             .await?;
+            // §22.1: a later page's denominator is the one frozen WITH the manifest (migration
+            // 0165). Re-counting here would pair a younger snapshot's total with frozen items.
+            let census =
+                frozen_census_in_txn(&mut txn, authorization.tenant_id().0, page.snapshot_id)
+                    .await?;
+            (page, census)
         }
-        (page, census)
+        (Some(before_id), _) => {
+            let filter = EnumerationFilter {
+                subject_id: params.subject_id,
+                before_id,
+            };
+            mint_segment_in_txn(
+                &mut txn,
+                &authorization,
+                &scope,
+                validated_key,
+                &params,
+                &fingerprint,
+                filter,
+            )
+            .await?
+        }
+        // `mint` is `None` only for a cursor call.
+        (None, None) => return Err(ErrorCode::Internal),
     };
     let expected: HashSet<_> = page.items.iter().copied().collect();
     if expected.len() != page.items.len() {

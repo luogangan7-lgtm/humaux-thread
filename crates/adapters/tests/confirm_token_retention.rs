@@ -2,13 +2,14 @@
 //!   `control.sweep_confirm_tokens` against a real Postgres, through the one caller-side door
 //!   (`confirm_token_repo::sweep_expired`) and the maintenance role that owns it.
 //! Depends-on: crates=[humaux-adapters, humaux-testkit, postgres, sha2, sqlx, tokio]; services=[PostgreSQL(any)
-//!   w=[control.confirm_tokens, control.tenants, control.users, control.workspaces] x=[control.sweep_confirm_tokens],
+//!   w=[control.confirm_tokens, control.tenants, control.users, control.workspaces],
 //!   PostgreSQL(role_maintenance)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::confirm_token_repo,
-//!   adapters::postgres, humaux-testkit]
+//!   adapters::postgres, adapters::tests::support::throwaway_db, humaux-testkit]
 //! Called-by: [cargo-test]
 //! Invariants: [four rows cover the sweep predicate's truth table and a fifth in another tenant proves RLS scoping;
-//!   no DSN, unreachable DB or 0169 missing is a visible SKIP]
-//! Spec: Baseline §79.2
+//!   every test owns its throwaway database humaux_thread_c35_confirm_<pid>_<n> (a sweep deletes rows, so never on
+//!   the shared dev database, ruling E8); no DSN or unreachable DB is a visible SKIP]
+//! Spec: Baseline §79.2; ADR-0062 D-G
 //!
 //! What this pins that the migration manifests cannot: 0169/0170's manifests assert the sweep
 //! *exists* with the right owner, `search_path` and EXECUTE set. They never assert what it
@@ -17,8 +18,7 @@
 //! caller's tenant cover the predicate's whole truth table, and a fifth in a second tenant
 //! covers the RLS scoping that keeps a sweep from becoming a cross-tenant erase.
 //!
-//! Three-state skip (§79.2): no DSN, unreachable DB, or 0169 not applied all print a visible
-//! SKIP and return.
+//! Three-state skip (§79.2): no DSN or an unreachable DB prints a visible SKIP and returns.
 
 use std::time::{Duration, SystemTime};
 
@@ -29,36 +29,32 @@ use postgres::{Client, NoTls};
 use sha2::{Digest, Sha256};
 use sqlx::types::Uuid;
 
+#[path = "support/throwaway_db.rs"]
+#[allow(dead_code)]
+mod throwaway_db;
+use throwaway_db::ThrowawayDb;
+
 /// The audit-retention window this file sweeps with: a token consumed inside it survives, one
 /// consumed before it does not.
 const RETENTION: Duration = Duration::from_secs(3600);
+/// Larger than any row count seeded here: the bound itself is pinned by `maintenance_doors.rs` (T-G1).
+const LIMIT: i32 = 100;
 
 fn dsn_as_role(admin_dsn: &str, role: &str) -> String {
     let sep = if admin_dsn.contains('?') { '&' } else { '?' };
     format!("{admin_dsn}{sep}options=-c%20role%3D{role}")
 }
 
+/// Fields drop in order: the pool and the owner connection close before `_db` drops the database.
 struct Handle {
     rt: tokio::runtime::Runtime,
     maintenance: MaintenanceDbPool,
     admin: Client,
+    dsn: String,
     tenant_id: Uuid,
     other_tenant_id: Uuid,
     user_id: Uuid,
-}
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        // ON DELETE CASCADE from control.tenants/users takes the token rows with it; the
-        // DELETEs are spelled anyway so a failure to cascade is not silently tolerated.
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM control.confirm_tokens WHERE tenant_id IN ('{0}','{1}'); \
-             DELETE FROM control.workspaces WHERE tenant_id IN ('{0}','{1}'); \
-             DELETE FROM control.users WHERE user_id = '{2}'; \
-             DELETE FROM control.tenants WHERE tenant_id IN ('{0}','{1}');",
-            self.tenant_id, self.other_tenant_id, self.user_id
-        ));
-    }
+    _db: ThrowawayDb,
 }
 
 struct ConfirmTokenFixture;
@@ -67,26 +63,11 @@ impl DbIntegrationFixture for ConfirmTokenFixture {
     type Handle = Handle;
 
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
-        let dsn =
-            std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
-        // dep: PostgreSQL(any) — opens the role-scoped connection for `isolate`
+        let db = throwaway_db::create("c35_confirm")?;
+        let dsn = db.dsn();
+        // dep: PostgreSQL(any) — opens the owner connection to this test's throwaway database
         let mut admin = Client::connect(&dsn, NoTls)
             .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
-
-        let swept: bool = admin
-            .query_one(
-                "SELECT to_regprocedure('control.sweep_confirm_tokens(interval)') IS NOT NULL",
-                &[],
-            )
-            .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
-            .get(0);
-        if !swept {
-            return Err(DbFixtureSkipReason::IsolationSetupFailed(
-                "control.sweep_confirm_tokens(interval) does not exist — run \
-                 `cargo xtask migrate` (migrations/0169_confirm_token_retention.sql) first"
-                    .to_string(),
-            ));
-        }
 
         let tenant_id: Uuid = admin
             .query_one(
@@ -124,9 +105,11 @@ impl DbIntegrationFixture for ConfirmTokenFixture {
             rt,
             maintenance,
             admin,
+            dsn,
             tenant_id,
             other_tenant_id,
             user_id,
+            _db: db,
         })
     }
 }
@@ -197,7 +180,7 @@ fn surviving(handle: &mut Handle, tenant_id: Uuid) -> Vec<String> {
 /// (it can still gate a call), and another tenant's expired row STAYS (FORCE RLS scopes the
 /// definer's own DELETE — a sweep is never a cross-tenant erase).
 ///
-/// Fault injection: drop `expires_at < now()` from 0169's predicate and `still.unexpired` goes
+/// Fault injection: drop `expires_at < now()` from the door's predicate (0218, 0169's verbatim) and `still.unexpired` goes
 /// with it; drop the `consumed_at IS NULL OR ...` clause and the recently-consumed audit row is
 /// erased; call the sweep without a tenant context and the count is 0 instead of 2.
 #[test]
@@ -230,6 +213,7 @@ fn the_sweep_deletes_only_expired_tokens_no_longer_wanted_as_audit() {
                     &handle.maintenance,
                     tenant_id,
                     RETENTION,
+                    LIMIT,
                 ))
                 .expect("sweep runs under role_maintenance");
             assert_eq!(
@@ -257,6 +241,7 @@ fn the_sweep_deletes_only_expired_tokens_no_longer_wanted_as_audit() {
                     &handle.maintenance,
                     tenant_id,
                     RETENTION,
+                    LIMIT,
                 ))
                 .expect("second sweep");
             assert_eq!(again, 0, "the sweep must converge, not re-delete");
@@ -269,6 +254,7 @@ fn the_sweep_deletes_only_expired_tokens_no_longer_wanted_as_audit() {
                     &handle.maintenance,
                     tenant_id,
                     Duration::ZERO,
+                    LIMIT,
                 ))
                 .expect("zero-retention sweep");
             assert_eq!(zero, 1, "the consumed-recently row is retention-gated");
@@ -293,10 +279,10 @@ fn the_maintenance_role_cannot_delete_a_confirm_token_directly() {
             let tenant_id = handle.tenant_id;
             seed_token(&mut handle, tenant_id, "gone.by_hand", -60, None);
 
-            let dsn = std::env::var("HUMAUX_TEST_PG_DSN").expect("checked by the fixture");
             // dep: PostgreSQL(any) — opens the role-scoped connection for `the_maintenance_role_cannot_delete_a_confirm_token_directly`
-            let mut maintenance = Client::connect(&dsn_as_role(&dsn, "role_maintenance"), NoTls)
-                .expect("role_maintenance connects");
+            let mut maintenance =
+                Client::connect(&dsn_as_role(&handle.dsn, "role_maintenance"), NoTls)
+                    .expect("role_maintenance connects");
             maintenance
                 .batch_execute(&format!("SET humaux.tenant_id = '{tenant_id}'"))
                 .expect("tenant context");

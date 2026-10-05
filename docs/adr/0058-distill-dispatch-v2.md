@@ -685,6 +685,16 @@ the maintenance daemon re-drives a `FAILED_OUTPUT_SCHEMA` death once after a coo
 re-ask of a profile that declares both channels may use the other channel (the A/B probe shows the two channels
 fail on different classes).
 
+**Addendum (card 35 S6, 2026-10-04; ADR-0062 D-P / D-J).** L23 is closed for the same channel: the daemon's task
+`redrive` calls `ops.auto_redrive_schema_failed(uuid, interval, integer)` (0221), which re-arms a DEAD
+`FAILED_OUTPUT_SCHEMA` distill job once ever (`ops.jobs.auto_redrives`), after a cool-down measured from its last
+counted provider call, through this ADR's R4 body (`ops.requeue_dead_distill`, unchanged), with one §77
+`DISTILL_AUTO_REDRIVE` row; `PROVIDER_PERMANENT`, `ATTEMPTS_EXHAUSTED`, `PRE_DISPATCH_ABANDONED` and
+`EXECUTION_UNCERTAIN` are never selected, and an always-refusing provider costs exactly 2 + 2 calls. The re-ask keeps
+the route's channel (ADR-0060 D-D; the other-channel option stays an upgrade, ADR-0062 L8). The terminal-jobs purge
+door keeps every R4 handle: a DEAD distill job is purgeable iff `requeue_dead_distill` would refuse it (its
+`EVIDENCE_ACCEPTED` row is DONE or gone), so neither the operator's door nor the daemon can lose a job to retention.
+
 ## Known limits
 
 - L1 Consolidation stays on v1 (global FIFO, attempt at claim, no slot): private-reasoning in-flight across both

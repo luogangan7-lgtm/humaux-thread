@@ -1,0 +1,53 @@
+# §46.1 migration manifest. Card 35 fix pass / ADR-0062 D-N: projection.stream_log.lost_at (nullable, CHECK: only on
+# LOST / TOMBSTONED rows) and projection.reissue_unsettled_tickets re-created with lost_at in its cool-down clock. No
+# new table, role, GRANT or policy; no DML.
+
+migration_id = "0223_ticket_lost_at"
+class = "EXPAND_CONTRACT"
+
+# Refuses a database without the 0220 door or with the column already present.
+precheck = """
+select to_regprocedure('projection.reissue_unsettled_tickets(uuid,interval,integer)') is not null
+ and not exists (select 1 from information_schema.columns
+                  where table_schema = 'projection' and table_name = 'stream_log' and column_name = 'lost_at')
+ as precheck_ok
+"""
+
+# Fails on a missing / NOT NULL / defaulted column or its CHECK, a door whose cool-down clock omits lost_at or lost its
+# 0220 fences, a changed owner / security / search_path, any EXECUTE beyond role_maintenance (PUBLIC included), the
+# maintenance role losing its LOST write, or any runtime role holding DELETE on stream_log.
+postcheck = """
+select
+ (select c.data_type = 'timestamp with time zone' and c.is_nullable = 'YES' and c.column_default is null
+    from information_schema.columns c
+   where c.table_schema = 'projection' and c.table_name = 'stream_log' and c.column_name = 'lost_at')
+ and exists (select 1 from pg_constraint
+              where conrelid = 'projection.stream_log'::regclass and conname = 'stream_log_lost_at_state'
+                and contype = 'c' and convalidated)
+ and has_column_privilege('role_maintenance', 'projection.stream_log', 'lost_at', 'UPDATE')
+ and (select p.prosecdef and pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.provolatile = 'v'
+        and 'search_path=pg_catalog' = any(coalesce(p.proconfig, array[]::text[]))
+        and p.prosrc ~ 'GREATEST\\(sl\\.issued_at, sl\\.settled_at, sl\\.lost_at,'
+        and p.prosrc ~ 'last_activity < now\\(\\) - p_cooldown'
+        and p.prosrc ~ 'r\\.reissued_commit_seq = pm\\.commit_seq'
+        and p.prosrc ~ 'current_setting\\(''humaux\\.tenant_id'''
+        and p.prosrc ~ 'data_class = ''SECRET_MATERIAL'''
+        and p.prosrc !~* '\\mDELETE\\M'
+      from pg_proc p where p.oid = to_regprocedure('projection.reissue_unsettled_tickets(uuid,interval,integer)'))
+ and has_function_privilege('role_maintenance', 'projection.reissue_unsettled_tickets(uuid,interval,integer)', 'EXECUTE')
+ and not exists (
+       select 1 from unnest(array['role_gateway', 'role_private_worker', 'role_consolidation_worker',
+                                  'role_public_worker', 'role_retrieval_worker', 'role_batch_issuer',
+                                  'role_admin', 'role_health_reader']) r(role)
+        where has_function_privilege(r.role, 'projection.reissue_unsettled_tickets(uuid,interval,integer)', 'EXECUTE')
+           or has_table_privilege(r.role, 'projection.stream_log', 'DELETE'))
+ and not has_table_privilege('role_maintenance', 'projection.stream_log', 'DELETE')
+ and not exists (
+       select 1 from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+        where p.oid = to_regprocedure('projection.reissue_unsettled_tickets(uuid,interval,integer)')
+          and x.grantee = 0 and x.privilege_type = 'EXECUTE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only once a LOST ticket carries lost_at. Before that: CREATE OR REPLACE the door with 0220's body, then ALTER TABLE projection.stream_log DROP COLUMN lost_at (after the maintenance build that writes it is rolled back); the reverted door re-opens the no-cool-down reissue loop for LOST tickets."
+backup_restore_requirement = "none: one ADD COLUMN with a NULL default and a CHECK every existing row satisfies (validated by a scan, no rewrite), and a function body replaced; no row data is read, written or deleted."

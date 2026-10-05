@@ -398,6 +398,11 @@ asking.
 
 **Rule reinforced:** DELETE-class smoke runs happen on a throwaway database only.
 
+*Card 35 (2026-10-04, ADR-0062 D-G):* the xtask subcommand named above is retired. Its door is now the bounded,
+receipted `control.sweep_confirm_tokens(interval, integer)` (migration 0218). Its callers are `humaux-maintenance
+--serve` and the manual `humaux-maintenance sweep once` (§77 fields required). Neither needs a test DSN (OPS-6).
+Their tests and the rehearsal run against throwaway databases only (ruling E8).
+
 ---
 
 ### 5.3 2026-09-18 — the chain's env file went missing and `source` failed silently
@@ -682,6 +687,8 @@ OpenBao is still card 54.
 Card 34 (ADR-0061, §6.20) closes "no process exports metrics": every resident mode serves `/metrics` and
 `/status` on a loopback ops listener, the §53.5 / §42 rules are loaded and tested, and the rehearsal drives a real
 INV-1 through the alert route.
+Card 35 (ADR-0062, §6.22) closes "no retention or maintenance process" for expiring operational state (P1-11 daemon
+part, P1-14, OPS-6, SEC-6); partition retention of the §48.1 history tables stays card 36.
 
 ### 6.11 Folded debts closed by card 26 (ADR-0051 D-L)
 
@@ -1009,6 +1016,34 @@ INV-1 through the alert route.
 - **Open:** `public_reasoning_usage_total` dormant (no PLATFORM_PUBLIC reasoning producer); the consolidation worker
   exports none and provider slot / dispatch families have no §41.2 row; the §42 parser-stub injection is proven on
   synthetic series (promtool), not in the rehearsal.
+
+### 6.22 Closed by card 35 (ADR-0062)
+
+| Audit row | Before | After | Gate / witness |
+|---|---|---|---|
+| **P1-11** (daemon part): no retention or maintenance process | `stream_repo::sweep_lost` had no caller (and would have taken leased / backing-off tickets), confirm tokens swept only by a hand-run xtask, snapshots / rate buckets / terminal jobs never deleted | `humaux-maintenance --serve`, the sixth resident unit and eighth ops pair: every due task of the closed D-C list per tenant page, one transaction and one statement per tenant; the four owner purge doors (confirm tokens, snapshots + items, idle full rate buckets, terminal jobs) with LIMIT and one `ops.maintenance_receipts` row each — the closed DELETE-door set rls-check pins `== 6` with `ensure_user` and the read-only 0126 phase-9 guard trigger (SECURITY DEFINER trigger functions are in scope: firing checks no EXECUTE); `sweep_lost` fixed at the root (no live lease, no backoff, no ticket whose Evidence is still being distilled, LIMIT, `lost_at` recorded); Q drained by `reissue_unsettled_tickets`, the cool-down of a LOST ticket counted from its sweep (0223); schema-failed distill deaths re-driven once (`auto_redrive_schema_failed`); no outbox door (ruling E11). Partition retention stays card 36 | `c35_serve_*`, `c35_doors`, `c35_delete_doors_closed`, `c35_no_outbox_door`, `c35_reissue_*`, `c35_redrive_*`, `c35_soak_rotation_named`, `c35_sweep_lost_outbox_named`, `c35_reissue_lost_cooldown_named`, `c35_serve_first_cycle_named`; rehearsal `maintenance_daemon_db_is_throwaway` (read through the daemon's own DSN, before the first spawn and after the drain), `maintenance_soak_receipts_balance`, `maintenance_reissue_waits_cooldown_after_lost`, `prometheus_up_is_exactly_the_eight_ops_pairs` |
+| **P1-14**: memory.enumerate first page unbounded | full id `fetch_all` + one INSERT per id into the snapshot manifest; snapshots never deleted | one `INSERT … unnest WITH ORDINALITY`, a manifest cap (`HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP`) with keyset segments and an exact census per segment (§22.1 as amended, E4), TTL from a required key, expired snapshots purged; every page read (gateway and worker path) is the one `MANIFEST_PAGE_SQL` statement with a DB-clock expiry check, and a DB-expired snapshot never continues into a new segment | `c35_one_manifest_insert`, `c35_enumerate_cap_named`, `c35_enumerate_keys_named`, `c35_one_page_statement`, `c35_enumerate_scale_live` (E12 regression bars; the 300 ms bar is §6.23 / card 35b) |
+| **OPS-6**: an ops path needed `HUMAUX_TEST_PG_DSN` | `cargo xtask sweep-confirm-tokens` (test DSN, no schedule) | retired; the confirm door runs scheduled under `--serve` and on demand under `humaux-maintenance sweep once` (§77 fields required) | `c35_confirm_xtask_retired`, `c35_one_confirm_door`, `c35_sweep_once_named` |
+| **SEC-6**: pre-auth rate limit keyed by the full IPv6 address, buckets never cleaned | one bucket per /128 | IPv4 full address, IPv6 /64 prefix after canonicalisation (§73.2, E5); idle full buckets leave through the rate-bucket door | `c35_sec6_named`, `c35_bucket_full_only_named` |
+| **Folded debts** (card 31 / 32) | Q counted memories that can never hold a point; `visible_index_count` read a hand copy of the ledger terms; Q never drained; schema-failed deaths waited for an operator | ledger v2 (0219: `indexable` in F and Q); the test reads through the definer; reissue drains Q (permanent classes once per retirement); one automatic re-drive per Evidence after a cool-down, same channel | `c35_ledger_v2_*`, `c35_visible_index_definer`, `c35_reissue_*`, `c35_redrive_*` |
+| §42 maintenance failing / absent | — | `MaintenanceTaskFailing` (`increase(maintenance_task_runs_total{outcome="failed"}[1h]) > 0`, WARNING) is the after-the-fact record read on the first clean scrape after a failure (while it lasts `/metrics` answers 503, ADR-0062 D-A); `MaintenanceCountersAbsent` (`absent(maintenance_task_runs_total)` for 2m, WARNING) is the live signal; promtool cases feed the real flat → stale → gap → recovered shape; mutations 23/23 | `c35_promtool_maintenance`, `promtool_mutations`, `c35_serve_families` |
+
+- **Not done here, by ruling E8:** the daemon was never run against the shared `humaux_thread_dev`; its residue
+  (expired snapshots, DEAD jobs, stale ISSUED tickets) stays until an operator runs runbook §5.2 (backup, impact,
+  `sweep once`). Every test and the rehearsal use throwaway databases.
+- **Open (ADR-0062 known limits):** tenant-page rotation latency (L1); daemon cursors are in memory (L13);
+  receipts table waits for card 36's partitions (L11, §48.1 as amended by E6); outbox growth bounded by Evidence and
+  public events, not purged (L3); embedding / inference RPC call rows not purged (L6); size- or gitleaks-refused
+  memories reissued once then left in Q (L7); the closed-set arm reads `prosrc` and dynamic SQL would evade it (L15).
+- **T34 sampler guard (ADR-0060 addendum 2026-10-05).** `slow_provider_tenant_cannot_take_all_slots` folded in samples after tenant A's distill work was drained because its guard counted every PENDING/PROCESSING job of A, including the 500 `DERIVED_CONSOLIDATE` jobs the 0164 trigger enqueues and nothing claims; the guard now requires `job_type = 'DERIVED_DISTILL'`. A two-session experiment showed the claim itself is serialized by the 0190 arbiter row (no over-share pick possible), so the fairness invariant D-F needed no change.
+
+
+### 6.23 Open limits of card 35 (ADR-0062 §Known limits (ruling E12))
+
+| Limit | Root cause | Owner |
+|---|---|---|
+| memory.enumerate first page on a 50k workspace ≈ 9.4 s p95 (RLS per-row visibility function) — card 35b | RLS policy `memory_records_subject_visibility` calls `private.memory_subject_visibility_ok` per row (≈ 550 ms per 50k-row read, about a dozen reads per first page); the 300 ms bar is not relaxed, gate `c35_enumerate_scale_live` asserts ruling E12's regression bars | card 35b |
+| Three copies of the create-and-migrate throwaway-database test helper (debt, card 35 fix pass) | `bins/maintenance/tests/support/throwaway.rs` (`migrate` panics), `crates/adapters/tests/support/throwaway_db.rs` (`migrate` returns `Err` → §79.2 `skip_or_fail`, also `#[path]`-included by `bins/private-worker/tests/derived_dispatch_e2e.rs`) and `crates/adapters/tests/health_snapshot.rs` (its own copy) each hold their own `ONE_AT_A_TIME` mutex, which serialises cluster-global role DDL (0201 `ALTER ROLE`, 0210 `CREATE ROLE`) only inside one test binary — card 34b hit `XX000 tuple concurrently updated` on 0201 for this reason. Consolidating them is not a contained change: one `pub` test-support module in `crates/testkit` gives testkit its first runtime dependency (`postgres`) and rewires 12 test files' module declarations and dep-map headers. Upgrade: that module, the strictest semantics (`Err` → `skip_or_fail` where a caller needs a skip, panic elsewhere), and a cluster-wide lock (a `pg_advisory_lock` held on the `postgres` database connection while migrating) instead of a per-process mutex | next card touching test support |
 
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 

@@ -485,3 +485,12 @@ The card's "all tickets DONE within 120 s" is read on the main line as two condi
 The put->DONE p95 of 143.9 s (run 2: 133.9 s; max 146.1 s) is bounded by live distill throughput with one
 resident distiller and is owned by card 32 (distill throughput), not by this ADR. The literal figure stays
 visible as the `GATE-LITERAL` line.
+
+## Addendum (2026-10-05, card 35 final verification) — the frozen-column pin gains 0223's `lost_at`
+Migration 0223 (ADR-0062 D-N) adds `projection.stream_log.lost_at timestamptz` (CHECK `lost_at IS NULL OR state IN
+('LOST','TOMBSTONED')`), written by `sweep_lost` on the ISSUED -> LOST edge; the reissue cool-down counts from it. It
+is a fact about a transition, the same class as 0167's `retired_at`/`retired_by` and this ADR's four D-B lease/attempt
+columns, not a counter derivable from `state`, which is what Baseline §37.2's freeze guards against. The pin
+`crates/adapters/tests/forget_repo.rs::stream_log_has_exactly_the_frozen_columns` (G80-25) therefore lists 12 + two
+0167 + four 0176 + one 0223 columns verbatim, so a 20th column is still red by name; Baseline §15.1's DDL now carries
+the 0176 and 0223 columns and their CHECKs, and §15.2's LOST sweep writes `lost_at = now()`.

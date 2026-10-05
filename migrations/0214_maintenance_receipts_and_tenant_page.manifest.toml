@@ -1,0 +1,52 @@
+# §46.1 migration manifest. Card 35 S1 / ADR-0062 D-D, D-F: the purge-receipt table (FORCE RLS, tenant policy,
+# role_maintenance SELECT only) and the one cross-tenant read of the resident maintenance daemon, the owner
+# SECURITY DEFINER tenant-id page (EXECUTE role_maintenance only). No DML, no existing object changed.
+
+migration_id = "0214_maintenance_receipts_and_tenant_page"
+class = "EXPAND_CONTRACT"
+
+precheck = """
+select to_regclass('ops.maintenance_receipts') is null
+   and to_regprocedure('control.maintenance_tenant_page(uuid,integer)') is null
+   and exists (select 1 from pg_policies where schemaname = 'control' and tablename = 'tenants'
+                 and policyname = 'tenants_bootstrap_owner_select')
+ as precheck_ok
+"""
+
+postcheck = """
+select
+ -- the receipt table: owner, RLS + FORCE, one ALL tenant policy, SELECT for role_maintenance only, no DELETE anywhere
+ (select pg_get_userbyid(c.relowner) = 'role_migration_owner' and c.relrowsecurity and c.relforcerowsecurity
+    from pg_class c where c.oid = 'ops.maintenance_receipts'::regclass)
+ and (select count(*) = 1 from pg_policies where schemaname = 'ops' and tablename = 'maintenance_receipts'
+        and cmd = 'ALL' and qual like '%humaux.tenant_id%' and with_check like '%humaux.tenant_id%')
+ and has_table_privilege('role_maintenance', 'ops.maintenance_receipts', 'SELECT')
+ and not has_table_privilege('role_maintenance', 'ops.maintenance_receipts', 'INSERT')
+ and not has_table_privilege('role_maintenance', 'ops.maintenance_receipts', 'UPDATE')
+ and not has_table_privilege('role_maintenance', 'ops.maintenance_receipts', 'DELETE')
+ and not exists (select 1 from information_schema.role_table_grants
+                  where table_schema = 'ops' and table_name = 'maintenance_receipts'
+                    and grantee not in ('role_migration_owner', 'role_maintenance'))
+ and not exists (select 1 from information_schema.role_table_grants
+                  where table_schema = 'ops' and table_name = 'maintenance_receipts'
+                    and grantee = 'role_maintenance' and privilege_type <> 'SELECT')
+ -- the tenant page: owner, definer, pinned search_path
+ and (select p.prosecdef and pg_get_userbyid(p.proowner) = 'role_migration_owner'
+        and 'search_path=pg_catalog' = any(coalesce(p.proconfig, array[]::text[]))
+      from pg_proc p where p.oid = to_regprocedure('control.maintenance_tenant_page(uuid,integer)'))
+ -- EXECUTE exactly role_maintenance: PUBLIC and every other runtime role denied
+ and has_function_privilege('role_maintenance', 'control.maintenance_tenant_page(uuid,integer)', 'EXECUTE')
+ and not exists (
+       select 1 from unnest(array['role_gateway', 'role_private_worker', 'role_consolidation_worker',
+                                  'role_public_worker', 'role_retrieval_worker', 'role_batch_issuer',
+                                  'role_admin']) r(role)
+        where has_function_privilege(r.role, 'control.maintenance_tenant_page(uuid,integer)', 'EXECUTE'))
+ and not exists (
+       select 1 from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+        where p.oid = to_regprocedure('control.maintenance_tenant_page(uuid,integer)')
+          and x.grantee = 0 and x.privilege_type = 'EXECUTE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback: DROP FUNCTION control.maintenance_tenant_page(uuid,integer); DROP TABLE ops.maintenance_receipts; (no other object depends on either in this migration)"
+backup_restore_requirement = "none: new objects only, no existing row touched"

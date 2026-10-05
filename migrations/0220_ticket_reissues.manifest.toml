@@ -1,0 +1,58 @@
+# §46.1 migration manifest. Card 35 S5 / ADR-0062 D-N (card 31 debt 1, ADR-0057 D-H): the Q drain. The marker table
+# projection.ticket_reissues (FORCE RLS, tenant policy, role_maintenance SELECT only) and the owner SECURITY DEFINER
+# door projection.reissue_unsettled_tickets(uuid, interval, integer), EXECUTE role_maintenance only. No DML, no
+# existing object changed; no role gains a table write.
+
+migration_id = "0220_ticket_reissues"
+class = "EXPAND_CONTRACT"
+
+# Refuses a database without ledger v2 (the door's candidate set is 0219's Q) or with either object already present.
+precheck = """
+select to_regclass('projection.ticket_reissues') is null
+   and to_regprocedure('projection.reissue_unsettled_tickets(uuid,interval,integer)') is null
+   and coalesce((select p.prosrc ~ 'NOT r\\.in_flight AND r\\.indexable'
+                   from pg_proc p
+                  where p.oid = to_regprocedure('projection.stream_point_ledger(uuid,text,uuid,text,text,text,text,uuid[])')),
+                false)
+ as precheck_ok
+"""
+
+# Fails on a changed owner / security / volatility / search_path of the door, a body without its cool-down, marker,
+# tenant or indexable fences, any EXECUTE beyond role_maintenance (PUBLIC included), any table privilege beyond
+# role_maintenance SELECT on the marker table, or the marker table without FORCE RLS and its one tenant policy.
+postcheck = """
+select
+ (select pg_get_userbyid(c.relowner) = 'role_migration_owner' and c.relrowsecurity and c.relforcerowsecurity
+    from pg_class c where c.oid = 'projection.ticket_reissues'::regclass)
+ and (select count(*) = 1 from pg_policies where schemaname = 'projection' and tablename = 'ticket_reissues'
+        and cmd = 'ALL' and qual like '%humaux.tenant_id%' and with_check like '%humaux.tenant_id%')
+ and has_table_privilege('role_maintenance', 'projection.ticket_reissues', 'SELECT')
+ and not exists (select 1 from information_schema.role_table_grants
+                  where table_schema = 'projection' and table_name = 'ticket_reissues'
+                    and grantee not in ('role_migration_owner', 'role_maintenance'))
+ and not exists (select 1 from information_schema.role_table_grants
+                  where table_schema = 'projection' and table_name = 'ticket_reissues'
+                    and grantee = 'role_maintenance' and privilege_type <> 'SELECT')
+ and (select p.prosecdef and pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.provolatile = 'v'
+        and 'search_path=pg_catalog' = any(coalesce(p.proconfig, array[]::text[]))
+        and p.prosrc ~ 'last_activity < now\\(\\) - p_cooldown'
+        and p.prosrc ~ 'r\\.reissued_commit_seq = pm\\.commit_seq'
+        and p.prosrc ~ 'current_setting\\(''humaux\\.tenant_id'''
+        and p.prosrc ~ 'data_class = ''SECRET_MATERIAL'''
+        and p.prosrc !~* '\\mDELETE\\M'
+      from pg_proc p where p.oid = to_regprocedure('projection.reissue_unsettled_tickets(uuid,interval,integer)'))
+ and has_function_privilege('role_maintenance', 'projection.reissue_unsettled_tickets(uuid,interval,integer)', 'EXECUTE')
+ and not exists (
+       select 1 from unnest(array['role_gateway', 'role_private_worker', 'role_consolidation_worker',
+                                  'role_public_worker', 'role_retrieval_worker', 'role_batch_issuer',
+                                  'role_admin', 'role_health_reader']) r(role)
+        where has_function_privilege(r.role, 'projection.reissue_unsettled_tickets(uuid,interval,integer)', 'EXECUTE'))
+ and not exists (
+       select 1 from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+        where p.oid = to_regprocedure('projection.reissue_unsettled_tickets(uuid,interval,integer)')
+          and x.grantee = 0 and x.privilege_type = 'EXECUTE')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback before any call: DROP FUNCTION projection.reissue_unsettled_tickets(uuid,interval,integer); DROP TABLE projection.ticket_reissues. Once the door has run, forward fix only: the tickets it issued are ordinary lifecycle tickets (stream_log + outbox) the worker settles; to stop it, REVOKE EXECUTE (the daemon's reissue task then fails and answers 503) and keep the table as the record."
+backup_restore_requirement = "none for the DDL: new objects only, no row touched. Running the door writes tickets; on a shared database it is part of the operator-run sweep of the runbook (ruling E8)."

@@ -5,7 +5,7 @@
 //!   ops.reserve_retrieval_provider_budget, ops.settle_retrieval_provider_budget], PostgreSQL(role_maintenance),
 //!   PostgreSQL(role_retrieval_worker)]; env=[]; modules=[adapters::model_call_ledger, adapters::postgres,
 //!   domain::egress, domain::error, domain::ids]
-//! Called-by: [retrieval-provider::adapters, tests]
+//! Called-by: [maintenance::serve, retrieval-provider::adapters, tests]
 //! Invariants: [budget reservations are made only through the ops.*_retrieval_provider_budget functions after a
 //!   matching ModelCallLedger reservation; exhaustion is CostBudgetExceeded; no second provider-attempt identity is
 //!   created]
