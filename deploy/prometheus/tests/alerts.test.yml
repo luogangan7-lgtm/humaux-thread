@@ -314,3 +314,114 @@ tests:
       - eval_time: 30m
         alertname: MaintenanceCountersAbsent
         exp_alerts: []
+
+  # partition horizon short (card 36, ADR-0063 D-F; §42 injection: the monthly create-partitions run skipped once):
+  # the ledger's horizon is 1, the others 2 and 3 — only the ledger fires, labelled by `table` alone (the `min by`
+  # drops job and mode). The same horizon 1 keeps Exhausted silent.
+  - interval: 1m
+    input_series:
+      - series: 'partition_horizon_months{job="humaux-maintenance",mode="serve",table="model_call_ledger"}'
+        values: '1x90'
+      - series: 'partition_horizon_months{job="humaux-maintenance",mode="serve",table="events"}'
+        values: '2x90'
+      - series: 'partition_horizon_months{job="humaux-maintenance",mode="serve",table="stage_runs"}'
+        values: '3x90'
+    alert_rule_test:
+      - eval_time: 59m
+        alertname: PartitionHorizonShort
+        exp_alerts: []
+      - eval_time: 61m
+        alertname: PartitionHorizonShort
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              table: model_call_ledger
+      - eval_time: 61m
+        alertname: PartitionHorizonExhausted
+        exp_alerts: []
+
+  # partition horizon silent: every table has 2 or 3 months ahead (the month after a create-partitions run); the
+  # family is present, so Absent is silent too.
+  - interval: 1m
+    input_series:
+      - series: 'partition_horizon_months{job="humaux-maintenance",mode="serve",table="model_call_ledger"}'
+        values: '2x150'
+      - series: 'partition_horizon_months{job="humaux-maintenance",mode="serve",table="audit_events"}'
+        values: '3x150'
+    alert_rule_test:
+      - eval_time: 140m
+        alertname: PartitionHorizonShort
+        exp_alerts: []
+      - eval_time: 140m
+        alertname: PartitionHorizonExhausted
+        exp_alerts: []
+      - eval_time: 140m
+        alertname: PartitionHorizonAbsent
+        exp_alerts: []
+
+  # partition horizon exhausted (§42 injection: three monthly runs skipped): events' last leaf is the current
+  # month (0) and stage_runs has no leaf at all (-1); both fire after 10m, audit_events (1) does not.
+  - interval: 1m
+    input_series:
+      - series: 'partition_horizon_months{job="humaux-maintenance",mode="serve",table="events"}'
+        values: '0x30'
+      - series: 'partition_horizon_months{job="humaux-maintenance",mode="serve",table="stage_runs"}'
+        values: '-1x30'
+      - series: 'partition_horizon_months{job="humaux-maintenance",mode="serve",table="audit_events"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: PartitionHorizonExhausted
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: PartitionHorizonExhausted
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              table: events
+          - exp_labels:
+              severity: critical
+              table: stage_runs
+
+  # partition horizon absent (§42 injection: REVOKE SELECT ON control.partition_registry FROM role_maintenance on a
+  # throwaway database, T-K3): PARTITIONS fails every run, so the family is never rendered while the daemon's
+  # counters are; pending until 2h, firing after.
+  - interval: 1m
+    input_series:
+      - series: 'maintenance_task_runs_total{job="humaux-maintenance",mode="serve",task="partitions",outcome="failed"}'
+        values: '0+1x150'
+    alert_rule_test:
+      - eval_time: 119m
+        alertname: PartitionHorizonAbsent
+        exp_alerts: []
+      - eval_time: 121m
+        alertname: PartitionHorizonAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # a failed PARTITIONS run as the daemon really exports it (ADR-0063 D-K, ADR-0062 D-A): clean scrapes until 10m;
+  # the revoke makes the run fail, `/metrics` answers 503 and every series goes stale (the horizon family is also
+  # reset); after the re-grant at 31m the family is back and the first clean scrape reads the failed run, so
+  # MaintenanceTaskFailing fires with task="partitions" while the 20-minute gap is far below Absent's 2h.
+  - interval: 1m
+    input_series:
+      - series: 'maintenance_task_runs_total{job="humaux-maintenance",mode="serve",task="partitions",outcome="failed"}'
+        values: '0x10 stale _x19 1x30'
+      - series: 'maintenance_task_runs_total{job="humaux-maintenance",mode="serve",task="partitions",outcome="ok"}'
+        values: '0+1x10 stale _x19 11+1x30'
+      - series: 'partition_horizon_months{job="humaux-maintenance",mode="serve",table="model_call_ledger"}'
+        values: '3x10 stale _x19 3x30'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: MaintenanceTaskFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: humaux-maintenance
+              mode: serve
+              task: partitions
+              outcome: failed
+      - eval_time: 35m
+        alertname: PartitionHorizonAbsent
+        exp_alerts: []

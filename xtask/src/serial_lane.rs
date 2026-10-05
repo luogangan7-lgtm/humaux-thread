@@ -1,5 +1,6 @@
 //! `xtask::serial_lane` — card 23 serial isolated lane runner for #[ignore]d DB/Qdrant tests.
-//! Depends-on: crates=[postgres]; services=[PostgreSQL(any), Qdrant(*), subprocess(cargo), subprocess(humaux-*)];
+//! Depends-on: crates=[humaux-testkit, postgres]; services=[PostgreSQL(any) r=[ops.schema_migrations]
+//!   w=[ops.schema_migrations], Qdrant(*), subprocess(cargo), subprocess(humaux-*)];
 //!   env=[CARGO, CARGO_MANIFEST_DIR, CARGO_TARGET_DIR, HUMAUX_0132_GATE_MODE, HUMAUX_ADMIN_PG_DSN,
 //!   HUMAUX_GATEWAY_PG_DSN, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MECHANISM_ADMIN_BIN, HUMAUX_MECHANISM_FIXTURE,
 //!   HUMAUX_PUBLIC_PROVENANCE_FAULT_DB, HUMAUX_REQUIRE_DB, HUMAUX_RETRIEVAL_WORKER_PG_DSN,
@@ -8,7 +9,8 @@
 //! Called-by: [xtask::main]
 //! Invariants: [every #[ignore] carries lane(a|b|c) in its reason and an ignored test without one reds the gate;
 //!   lane(a) resources are provisioned before the run; a missing dependency is a failure under HUMAUX_REQUIRE_DB,
-//!   never a SKIP]
+//!   never a SKIP; every database the lane created is dropped when its group ends (also on a red test or a panic),
+//!   never humaux_thread_{dev,c31,ci,stable_observations}]
 //! Spec: Baseline §79.2; ADR-0047
 //!
 //! `cargo xtask serial-lane` — card 23's serial isolated lane for the `#[ignore]`d tests.
@@ -55,8 +57,8 @@ use std::time::{Duration, Instant};
 /// is a red, not a silently skipped test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Resource {
-    /// The repo-wide isolated test database named by `HUMAUX_TEST_PG_DSN` (§79.2), migrated to
-    /// head. `cargo xtask migrate` is the provisioner.
+    /// The repo-wide isolated test database named by `HUMAUX_TEST_PG_DSN` (§79.2), which must
+    /// already be at head: the lane checks it and never migrates it (ADR-0063 D-M).
     SharedDb,
     /// A per-run `humaux_thread_request_guard_<stamp>` database, with every role DSN pointed at
     /// it — the "dedicated request-guard fixture" these tests' ignore reasons promise. It is a
@@ -356,20 +358,7 @@ fn ensure_database_through(
     // dep: PostgreSQL(any) — postgres_dsn, serial lane target database
     let mut client = postgres::Client::connect(&postgres_dsn, postgres::NoTls)
         .map_err(|e| format!("cannot connect to provision {database}: {e}"))?;
-    let exists = client
-        .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&database])
-        .map_err(|e| format!("cannot read pg_database: {e}"))?
-        .is_some();
-    if !exists {
-        let quoted = database.replace('"', "\"\"");
-        client
-            .batch_execute(&format!("CREATE DATABASE \"{quoted}\""))
-            .map_err(|e| format!("cannot create {database}: {e}"))?;
-        eprintln!("serial-lane: provisioned database {database}");
-        if let Ok(mut created) = PROVISIONED_THIS_RUN.lock() {
-            created.push(database.to_string());
-        }
-    }
+    create_if_absent(&mut client, database)?;
     let target = dsn_with_database(admin_dsn, database)
         .ok_or_else(|| "cannot rewrite the admin DSN onto the target database".to_string())?;
     let mut args = vec!["--dsn".to_string(), target];
@@ -385,55 +374,138 @@ fn ensure_database_through(
     }
 }
 
-/// Every database THIS process created (never one it found), in creation order — the only
-/// set `--drop-provisioned` may touch. Post-delivery housekeeping (2026-09-26): each lane run
-/// left ~11 `humaux_thread_{request_guard,qdrant,disposable,pre0132,prov_fault}_<stamp>`
-/// databases on the shared container (96 by the time the user was asked to drop them), because
-/// dropping was a decision this gate did not own. It still does not own it — the flag is the
-/// decision, made per run by whoever launches the lane, and the fixed-name fixture
-/// (`humaux_thread_stable_observations`) is exempt because the next run expects it.
+/// `CREATE DATABASE` unless `database` exists; one this process created is recorded for [`drop_provisioned`].
+fn create_if_absent(client: &mut postgres::Client, database: &str) -> Result<(), String> {
+    let exists = client
+        .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&database])
+        .map_err(|e| format!("cannot read pg_database: {e}"))?
+        .is_some();
+    if !exists {
+        let quoted = database.replace('"', "\"\"");
+        client
+            .batch_execute(&format!("CREATE DATABASE \"{quoted}\""))
+            .map_err(|e| format!("cannot create {database}: {e}"))?;
+        eprintln!("serial-lane: provisioned database {database}");
+        if let Ok(mut created) = PROVISIONED_THIS_RUN.lock() {
+            created.push(database.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Every database THIS process created (never one it found), in creation order, not yet dropped — the only set
+/// [`drop_provisioned`] may touch. Each lane run used to leave ~10 `humaux_thread_{request_guard,qdrant,disposable,
+/// pre0132,prov_fault}_<stamp>` databases (~200 MB) on the shared container unless `--drop-provisioned` was passed
+/// (47 found on 2026-10-05); dropping is now the lane's own job (owner disk constraint, 2026-10-05).
 static PROVISIONED_THIS_RUN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// `--drop-provisioned`: drop what this run created. Runs after the tally so a failure here
-/// cannot hide a test verdict; each drop is reported by name, and a drop that fails is a
-/// visible line, not an exit code (the tests already have theirs).
-fn drop_provisioned() {
-    let Ok(admin) = std::env::var("HUMAUX_TEST_PG_DSN") else {
-        eprintln!("serial-lane: --drop-provisioned: HUMAUX_TEST_PG_DSN unset, nothing dropped");
-        return;
-    };
-    let Some(postgres_dsn) = dsn_with_database(&admin, "postgres") else {
-        eprintln!("serial-lane: --drop-provisioned: cannot rewrite the admin DSN, nothing dropped");
-        return;
-    };
+/// How many databases this run dropped so far (the end-of-lane line).
+static DROPPED_THIS_RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Never dropped, even when this process created them: the shared dev and CI databases and the fixed-name fixture
+/// (`humaux_thread_stable_observations`) the next lane run expects.
+const NEVER_DROPPED: [&str; 4] = [
+    "humaux_thread_dev",
+    "humaux_thread_c31",
+    "humaux_thread_ci",
+    "humaux_thread_stable_observations",
+];
+
+/// Drops (`WITH (FORCE)`) every database recorded in [`PROVISIONED_THIS_RUN`] and forgets it; called when the lane
+/// group that provisioned them ends and once more when the lane ends (also by [`DropOnExit`] on a panic). Each drop
+/// is reported by name; a failed drop is a visible line, not an exit code (the tests already have theirs). Returns
+/// the number dropped.
+fn drop_provisioned() -> usize {
     let created: Vec<String> = PROVISIONED_THIS_RUN
         .lock()
-        .map(|c| c.clone())
+        .map(|mut c| std::mem::take(&mut *c))
         .unwrap_or_default();
+    let created: Vec<String> = created
+        .into_iter()
+        .filter(|d| !NEVER_DROPPED.contains(&d.as_str()))
+        .collect();
     if created.is_empty() {
-        println!("serial-lane: --drop-provisioned: this run created no database");
-        return;
+        return 0;
     }
+    let Some(postgres_dsn) = std::env::var("HUMAUX_TEST_PG_DSN")
+        .ok()
+        .and_then(|admin| dsn_with_database(&admin, "postgres"))
+    else {
+        eprintln!("serial-lane: cannot drop {created:?}: HUMAUX_TEST_PG_DSN unset or not a URL");
+        return 0;
+    };
     // dep: PostgreSQL(any) — postgres_dsn, serial lane target database
     let mut client = match postgres::Client::connect(&postgres_dsn, postgres::NoTls) {
         Ok(client) => client,
         Err(e) => {
-            eprintln!("serial-lane: --drop-provisioned: cannot connect: {e}; nothing dropped");
-            return;
+            eprintln!("serial-lane: cannot connect to drop {created:?}: {e}");
+            return 0;
         }
     };
+    let mut dropped = 0;
     for database in created {
-        if database == "humaux_thread_stable_observations" {
-            continue;
-        }
         let quoted = database.replace('"', "\"\"");
         // FORCE: a test that leaked a pooled connection must not keep its throwaway alive.
         match client.batch_execute(&format!(
             "DROP DATABASE IF EXISTS \"{quoted}\" WITH (FORCE)"
         )) {
-            Ok(()) => println!("serial-lane: dropped provisioned database {database}"),
+            Ok(()) => {
+                println!("serial-lane: dropped provisioned database {database}");
+                dropped += 1;
+            }
             Err(e) => eprintln!("serial-lane: could not drop {database}: {e}"),
         }
+    }
+    DROPPED_THIS_RUN.fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+    dropped
+}
+
+/// Drops what is still recorded and prints the run's one count line when the lane returns or unwinds. Ctrl-C
+/// (SIGINT) kills the process without unwinding: the lane installs no signal handler.
+// ponytail: no SIGINT handler (a killed lane leaves its last group's databases), add one if interrupted lanes recur.
+struct DropOnExit;
+
+impl Drop for DropOnExit {
+    fn drop(&mut self) {
+        drop_provisioned();
+        println!(
+            "serial-lane: dropped {} provisioned database(s) this run",
+            DROPPED_THIS_RUN.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+}
+
+/// ADR-0063 D-M (card 36 review, 2026-10-05): the shared database moves only through the main line's dev-conversion
+/// protocol (`c36_dev_convert.sh`: copy rehearsal EQUAL, backup, writers stopped, `MAINLINE_GO=1`). The lane used to
+/// run `migrate` against `HUMAUX_TEST_PG_DSN` here, which applied any pending file (a forward fix such as 0232) to dev
+/// outside that protocol. Now a shared database that lacks a migration file is an error naming the files (its
+/// groups are NOT RUN), and nothing is applied.
+fn shared_db_at_head(admin_dsn: &str) -> Result<(), String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations");
+    let files: BTreeSet<String> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .collect();
+    // dep: PostgreSQL(any) — HUMAUX_TEST_PG_DSN, read-only ledger read of the shared database
+    let mut client = postgres::Client::connect(admin_dsn, postgres::NoTls)
+        .map_err(|e| format!("cannot connect to the shared database: {e}"))?;
+    let applied: BTreeSet<String> = client
+        .query("SELECT migration_id FROM ops.schema_migrations", &[])
+        .map_err(|e| format!("cannot read ops.schema_migrations: {e}"))?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let pending: Vec<&String> = files.difference(&applied).collect();
+    if pending.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the shared database lacks {pending:?}; the lane never migrates it (ADR-0063 D-M: the main \
+             line applies them through the dev-conversion protocol)"
+        ))
     }
 }
 
@@ -505,16 +577,9 @@ fn provision(resource: Resource) -> Result<EnvOverrides, String> {
     let admin = std::env::var("HUMAUX_TEST_PG_DSN")
         .map_err(|_| "missing object: HUMAUX_TEST_PG_DSN".to_string())?;
     match resource {
-        // The shared isolated database is whatever HUMAUX_TEST_PG_DSN names; `migrate` is the
-        // only provisioning it needs.
-        Resource::SharedDb => {
-            let code = crate::migrate::run(&[]);
-            if code == 0 {
-                Ok(Vec::new())
-            } else {
-                Err(format!("migrate exited {code} against HUMAUX_TEST_PG_DSN"))
-            }
-        }
+        // The shared isolated database is whatever HUMAUX_TEST_PG_DSN names (the shared dev
+        // database): checked at head, never migrated here.
+        Resource::SharedDb => shared_db_at_head(&admin).map(|()| Vec::new()),
         // The ignore reasons in `request_guard.rs` / `quota_and_rate.rs` / `service_credentials.rs`
         // promise a *dedicated* fixture. Before card 23's lane run 1 this arm was a synonym for
         // `SharedDb`, so the promise was words: the fixtures seed fixed TENANT_ID/USER_ID
@@ -565,10 +630,7 @@ fn provision(resource: Resource) -> Result<EnvOverrides, String> {
             Ok(env)
         }
         Resource::Post0132 => {
-            let code = crate::migrate::run(&[]);
-            if code != 0 {
-                return Err(format!("migrate exited {code} against HUMAUX_TEST_PG_DSN"));
-            }
+            shared_db_at_head(&admin)?;
             Ok(vec![(
                 "HUMAUX_0132_GATE_MODE".to_string(),
                 "post0132".to_string(),
@@ -927,7 +989,7 @@ fn libtest_verdicts<'a>(text: &str, tests: &[&'a str]) -> BTreeMap<&'a str, Libt
 pub fn run(args: &[String]) -> i32 {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let audit_only = args.iter().any(|a| a == "--audit-only");
-    let drop_provisioned_after = args.iter().any(|a| a == "--drop-provisioned");
+    // `--drop-provisioned` is still accepted (older gate lines pass it); dropping is now unconditional.
     let (entries, defects) = inventory(&root);
 
     println!(
@@ -1016,6 +1078,7 @@ pub fn run(args: &[String]) -> i32 {
         warm.as_secs_f64()
     );
 
+    let _drop_on_exit = DropOnExit;
     let start = Instant::now();
     let mut tally = Tally::default();
     for (resource, group) in &runnable {
@@ -1062,7 +1125,12 @@ pub fn run(args: &[String]) -> i32 {
                 }
             };
             run_group(package, target.as_deref(), &env, tests, &mut tally);
+            if per_target {
+                drop_provisioned();
+            }
         }
+        // The group's databases are done with once its last target ran (the next group provisions its own).
+        drop_provisioned();
     }
     let elapsed = start.elapsed();
 
@@ -1082,15 +1150,116 @@ pub fn run(args: &[String]) -> i32 {
     for line in &tally.not_run {
         eprintln!("  NOT RUN  {line}");
     }
-    if drop_provisioned_after {
-        drop_provisioned();
-    }
     i32::from(!tally.failed.is_empty() || !tally.not_run.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0063 D-M: a shared database whose ledger lacks the migration files is refused naming them, and nothing is
+    /// applied to it (the throwaway keeps its one ledger table); with every file recorded it passes. Fault: run
+    /// `crate::migrate::run` before the check (what the old SharedDb / Post0132 arms did) ⇒ 0001.. are applied to the
+    /// throwaway ⇒ red.
+    #[test]
+    fn a_shared_db_missing_a_migration_is_refused_and_never_migrated() {
+        let Some((_db, dsn)) = crate::migrate::tests::throwaway(
+            "a_shared_db_missing_a_migration_is_refused_and_never_migrated",
+            "lane_head",
+        ) else {
+            return;
+        };
+        // dep: PostgreSQL(any) — superuser on the throwaway: the real ledger shape, no migration body
+        let mut c = postgres::Client::connect(&dsn, postgres::NoTls).expect("throwaway connect");
+        c.batch_execute(
+            "CREATE SCHEMA ops; CREATE TABLE ops.schema_migrations (migration_id text PRIMARY KEY, \
+             checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())",
+        )
+        .expect("bare ledger");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations");
+        let mut stems: Vec<String> = std::fs::read_dir(&dir)
+            .expect("migrations dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+            .map(|p| p.file_stem().expect("stem").to_string_lossy().into_owned())
+            .collect();
+        stems.sort();
+        let refused = shared_db_at_head(&dsn).expect_err("pending files are refused");
+        assert!(
+            refused.contains(&stems[0])
+                && refused.contains(&stems[stems.len() - 1])
+                && refused.contains("never migrates"),
+            "{refused}"
+        );
+        let tables: i64 = c
+            .query_one(
+                "SELECT count(*) FROM pg_class WHERE relkind IN ('r', 'p') AND relpersistence = 'p' \
+                   AND relnamespace NOT IN ('pg_catalog'::regnamespace, 'information_schema'::regnamespace)",
+                &[],
+            )
+            .expect("tables")
+            .get(0);
+        assert_eq!(
+            tables, 1,
+            "nothing was applied: only the ledger table exists"
+        );
+        for stem in &stems {
+            c.execute(
+                "INSERT INTO ops.schema_migrations (migration_id, checksum) VALUES ($1, 'x')",
+                &[stem],
+            )
+            .expect("record");
+        }
+        shared_db_at_head(&dsn).expect("at head");
+    }
+
+    /// Owner disk constraint (2026-10-05): a database the lane created is gone once [`drop_provisioned`] ran for its
+    /// group, and a protected name recorded by mistake is never dropped. Fault: return before the DROP loop (the old
+    /// opt-in behaviour) ⇒ the probe database survives ⇒ red.
+    #[test]
+    fn a_provisioned_database_is_gone_after_its_group_and_dev_never_is() {
+        let test = "a_provisioned_database_is_gone_after_its_group_and_dev_never_is";
+        let Ok(admin) = std::env::var("HUMAUX_TEST_PG_DSN") else {
+            humaux_testkit::skip_or_fail(
+                test,
+                "missing object: HUMAUX_TEST_PG_DSN",
+                humaux_testkit::ExternalDep::Postgres,
+            );
+            return;
+        };
+        let postgres_dsn = dsn_with_database(&admin, "postgres").expect("URL DSN");
+        // dep: PostgreSQL(any) — superuser on the `postgres` database: CREATE / pg_database reads
+        let mut client =
+            postgres::Client::connect(&postgres_dsn, postgres::NoTls).expect("admin connect");
+        let probe = format!("humaux_thread_lane_drop_probe_{}", std::process::id());
+        let exists = |client: &mut postgres::Client, db: &str| -> bool {
+            client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)",
+                    &[&db],
+                )
+                .expect("pg_database")
+                .get(0)
+        };
+        create_if_absent(&mut client, &probe).expect("provision the probe");
+        assert!(exists(&mut client, &probe), "provisioned");
+        let dev_present = exists(&mut client, "humaux_thread_dev");
+        PROVISIONED_THIS_RUN
+            .lock()
+            .expect("list")
+            .push("humaux_thread_dev".to_owned());
+        assert_eq!(drop_provisioned(), 1, "the probe only");
+        assert!(!exists(&mut client, &probe), "dropped when its group ended");
+        assert_eq!(
+            exists(&mut client, "humaux_thread_dev"),
+            dev_present,
+            "dev never dropped"
+        );
+        assert!(
+            PROVISIONED_THIS_RUN.lock().expect("list").is_empty(),
+            "forgotten once dropped"
+        );
+    }
 
     fn repo_root() -> PathBuf {
         // `xtask`'s manifest dir is `<root>/xtask`.

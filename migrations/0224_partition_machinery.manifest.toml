@@ -1,0 +1,85 @@
+# §46.1 migration manifest. Card 36 S1 / ADR-0063 D-C, D-E, D-G, D-I, D-J: control.retention_policies v2 (the 0-row
+# v1 of 0003 dropped under this precheck), control.partition_registry, and the nine owner functions of the §48.1
+# partition machinery. No table is converted; no row is written.
+# ADR-0063 D-D 7b: every check names new objects through to_regclass / to_regprocedure text lookups and text
+# arguments, so migration-rehearsal can EXPLAIN it against any schema, before or after this migration.
+
+migration_id = "0224_partition_machinery"
+class = "FORWARD_ONLY"
+
+# Refuses a database where v1 holds rows, is referenced, or is not the 0003 shape, or where any object of this
+# migration already exists, or where one of the six §48.1 tables is missing.
+precheck = """
+select to_regclass('control.partition_registry') is null
+ and exists (select 1 from information_schema.columns
+              where table_schema = 'control' and table_name = 'retention_policies' and column_name = 'retention_days')
+ and (select count(*) = 0 from control.retention_policies)
+ and not exists (select 1 from pg_constraint
+                  where contype = 'f' and confrelid = to_regclass('control.retention_policies'))
+ and to_regclass('ops.stage_runs') is not null and to_regclass('private.messages') is not null
+ and to_regclass('ops.maintenance_receipts') is not null and to_regclass('private.events') is not null
+ and to_regclass('control.audit_events') is not null and to_regclass('ops.model_call_ledger') is not null
+ and to_regprocedure('control.partition_drop_check(uuid,uuid)') is null
+ and to_regprocedure('control.partition_create_month(text,timestamptz)') is null
+ as precheck_ok
+"""
+
+# Fails on: a missing table or one not owned by role_migration_owner; a v2 table_key set that admits EVENTS or
+# AUDIT_EVENTS; any runtime privilege beyond role_maintenance's SELECT (both tables) and column UPDATE of the two
+# proposal columns; a missing function; a definer that is not one, or an invoker that is; drop_check / drop without
+# row_security=off; any function without search_path=pg_catalog, not owned by role_migration_owner, or EXECUTE-able
+# by PUBLIC or a runtime role; any policy row (the migration seeds none, D-C).
+postcheck = """
+select
+ (select count(*) = 2 from pg_class c
+   where c.oid in (to_regclass('control.retention_policies'), to_regclass('control.partition_registry'))
+     and c.relkind = 'r' and pg_get_userbyid(c.relowner) = 'role_migration_owner')
+ and exists (select 1 from information_schema.columns
+              where table_schema = 'control' and table_name = 'retention_policies' and column_name = 'retention_months')
+ and not exists (select 1 from information_schema.columns
+                  where table_schema = 'control' and table_name = 'retention_policies' and column_name = 'retention_days')
+ and (select pg_get_constraintdef(co.oid) ~ 'MODEL_CALL_LEDGER' and pg_get_constraintdef(co.oid) !~ 'EVENTS'
+        from pg_constraint co
+       where co.conrelid = to_regclass('control.retention_policies') and co.conname = 'retention_policies_table_key')
+ and has_table_privilege('role_maintenance', 'control.retention_policies', 'SELECT')
+ and has_table_privilege('role_maintenance', 'control.partition_registry', 'SELECT')
+ and has_column_privilege('role_maintenance', 'control.partition_registry', 'proposed_at', 'UPDATE')
+ and has_column_privilege('role_maintenance', 'control.partition_registry', 'proposed_policy_revision', 'UPDATE')
+ and not has_column_privilege('role_maintenance', 'control.partition_registry', 'state', 'UPDATE')
+ and not has_column_privilege('role_maintenance', 'control.partition_registry', 'upper_bound', 'UPDATE')
+ and not exists (
+       select 1 from pg_class c, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+        where c.oid in (to_regclass('control.retention_policies'), to_regclass('control.partition_registry'))
+          and x.grantee <> c.relowner
+          and not (x.grantee = to_regrole('role_maintenance') and x.privilege_type = 'SELECT'))
+ and not exists (
+       select 1 from pg_attribute a, aclexplode(a.attacl) x
+        where a.attrelid in (to_regclass('control.retention_policies'), to_regclass('control.partition_registry'))
+          and not (a.attrelid = to_regclass('control.partition_registry')
+                   and a.attname in ('proposed_at', 'proposed_policy_revision')
+                   and x.grantee = to_regrole('role_maintenance') and x.privilege_type = 'UPDATE'))
+ and (select count(*) = 9 from pg_proc p
+       where p.oid in (to_regprocedure('control.partition_parent(text)'),
+                       to_regprocedure('control.partition_catalog_fingerprint(text)'),
+                       to_regprocedure('control.partition_adopt_leaf(text,regclass)'),
+                       to_regprocedure('control.partition_create_month(text,timestamptz)'),
+                       to_regprocedure('control.partition_drop_statements(uuid)'),
+                       to_regprocedure('control.partition_drop_check(uuid,uuid)'),
+                       to_regprocedure('control.partition_drop(uuid,uuid,bigint,text,text)'),
+                       to_regprocedure('control.retention_policy_approve(text,integer,timestamptz,text)'),
+                       to_regprocedure('control.reject_partition_key_update()'))
+         and pg_get_userbyid(p.proowner) = 'role_migration_owner'
+         and 'search_path=pg_catalog' = any(coalesce(p.proconfig, array[]::text[]))
+         and p.prosecdef = (p.proname in ('partition_adopt_leaf', 'partition_create_month',
+                                          'partition_drop_statements', 'retention_policy_approve',
+                                          'reject_partition_key_update'))
+         and (p.proname not in ('partition_drop_check', 'partition_drop')
+              or 'row_security=off' = any(coalesce(p.proconfig, array[]::text[])))
+         and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                          where x.grantee <> p.proowner and x.privilege_type = 'EXECUTE'))
+ and (select count(*) = 0 from control.retention_policies)
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only (FORWARD_ONLY, §46.1): 0225..0230 depend on these functions. Before any conversion has run: DROP the nine functions, DROP TABLE control.partition_registry, control.retention_policies; then re-create the 0003 v1 retention_policies shape (0 rows) with its control-domain grants."
+backup_restore_requirement = "pg_dump before apply (ADR-0063 D-M): the only existing object touched is the 0-row control.retention_policies v1, dropped under the precheck; no row data is read, written or deleted."

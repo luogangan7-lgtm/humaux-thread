@@ -145,6 +145,7 @@ mod tests {
         let mut txn = admin.transaction().expect("txn");
         // The report reads two tables only: FK targets and the ledger's insert validation are not
         // what is under test, and every row goes with the rollback.
+        // replica-mode: fault setup, rolled back (no tenant row is planted; every row goes with `txn.rollback()`)
         txn.batch_execute("SET LOCAL session_replication_role = replica")
             .expect("replica role");
         let tenant = Uuid::now_v7();

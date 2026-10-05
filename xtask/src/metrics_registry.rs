@@ -1,7 +1,7 @@
 //! `xtask::metrics_registry` — G80-6 metrics-registry-check: Registry/Code/Witness three-way falsification, plus the exported (D7) and rule (D8) legs.
 //! Depends-on: crates=[]; services=[subprocess(cargo)]; env=[CARGO_MANIFEST_DIR]; modules=[]
 //! Called-by: [xtask::main]
-//! Invariants: [each Witness file is really compiled and run in a throwaway probe package; missing/failing/timed-out witnesses count as 0 passed, never substituted by comment; an unknown argument exits 2 naming it; "exported" is read from each process's real `--metrics-families` output, never from a hand list; a rule-referenced family that no process exports fails unless NOT_YET_PRODUCED names its producer card]
+//! Invariants: [each Witness file is really compiled and run in a throwaway probe package; missing/failing/timed-out witnesses count as 0 passed, never substituted by comment; an unknown argument exits 2 naming it; "exported" is read from each process's real `--metrics-families` output, never from a hand list; a rule-referenced family that no process exports fails unless NOT_YET_PRODUCED names its producer card; a header-only family counts as exported only when ABSENT_UNTIL_FIRST_RUN names it (ADR-0063 D-K)]
 //! Spec: Baseline §80.2; §41.2; §42; ADR-0061 D-H
 //!
 //! Modes (ADR-0061 D-H; the strict parser replaces the old `any(--strict)` scan that let
@@ -59,6 +59,14 @@ const PROCESSES: [&str; 6] = [
 /// producer card has to delete its row (E10 closed: card 34b's private worker exports the two
 /// distill counters).
 const NOT_YET_PRODUCED: &[(&str, &str)] = &[("backup_last_success_timestamp_seconds", "card 37")];
+
+/// D7 / D8(c): families a process declares (`# TYPE`) whose zero-state render deliberately has no sample, because
+/// absence is their failure signal and a §42 `absent()` rule reads it. Only these count as exported from the header
+/// alone; any other header-only family stays unexported (ADR-0061 review-fix 3, F10).
+const ABSENT_UNTIL_FIRST_RUN: &[(&str, &str)] = &[(
+    "partition_horizon_months",
+    "ADR-0063 D-K: rendered only while the last PARTITIONS run succeeded; PartitionHorizonAbsent",
+)];
 
 /// §41.2 R4 (ADR-0061 addendum, D-M): families whose one `.inc(` sits in a `pub` helper so a DB-free
 /// witness can drive it. The helper's production call sites are the real emit sites, so D5 also
@@ -1156,7 +1164,8 @@ fn registry_index(registry: &[RegistryEntry]) -> BTreeMap<&str, &RegistryEntry> 
 /// cannot be built or run is a fail naming it: it is in-tree, so there is no not_applicable.
 /// Returns the check and the exported family union (D8(c) input): a family counts as exported
 /// only when its render carries at least one sample line, since a `# TYPE` line alone gives a
-/// rule nothing to read (ADR-0061 review-fix 3, F10).
+/// rule nothing to read (ADR-0061 review-fix 3, F10) — except a family of
+/// [`ABSENT_UNTIL_FIRST_RUN`], whose declared absence is what its `absent()` rule reads.
 fn check_d7(
     registry: &[RegistryEntry],
     outputs: &[(String, Result<String, String>)],
@@ -1173,7 +1182,10 @@ fn check_d7(
                 let sampled: Vec<String> = exp
                     .families
                     .into_iter()
-                    .filter(|(_, f)| !f.samples.is_empty())
+                    .filter(|(name, f)| {
+                        !f.samples.is_empty()
+                            || ABSENT_UNTIL_FIRST_RUN.iter().any(|(n, _)| n == name)
+                    })
                     .map(|(name, _)| name)
                     .collect();
                 per_process.push(format!("{process}={}", sampled.len()));
@@ -2188,6 +2200,18 @@ pub fn gateway_respond() {
             "{}",
             d7.detail
         );
+    }
+
+    /// ADR-0063 D-K: a header-only family counts as exported only when [`ABSENT_UNTIL_FIRST_RUN`] names it.
+    #[test]
+    fn header_only_family_is_exported_only_when_absence_is_its_signal() {
+        let text = "# TYPE partition_horizon_months gauge\n# TYPE jobs_dead gauge\n";
+        let (_, exported) = check_d7(&real_registry(), &[("maintenance".into(), Ok(text.into()))]);
+        assert!(
+            exported.contains("partition_horizon_months"),
+            "{exported:?}"
+        );
+        assert!(!exported.contains("jobs_dead"), "{exported:?}");
     }
 
     /// T-H1: an exported family that §41.2 does not register is a D7 fail naming it.

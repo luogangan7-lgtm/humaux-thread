@@ -689,6 +689,9 @@ Card 34 (ADR-0061, §6.20) closes "no process exports metrics": every resident m
 INV-1 through the alert route.
 Card 35 (ADR-0062, §6.22) closes "no retention or maintenance process" for expiring operational state (P1-11 daemon
 part, P1-14, OPS-6, SEC-6); partition retention of the §48.1 history tables stays card 36.
+Card 36 (ADR-0063, §6.24) closes the retention part of P1-11: the six existing §48.1 tables are monthly RANGE
+partitions with a pre-created horizon and three horizon alerts, and retention drops whole months only through the
+superuser executor's database chokepoint, with holds, an export and a receipt.
 
 ### 6.11 Folded debts closed by card 26 (ADR-0051 D-L)
 
@@ -1044,6 +1047,43 @@ part, P1-14, OPS-6, SEC-6); partition retention of the §48.1 history tables sta
 |---|---|---|
 | memory.enumerate first page on a 50k workspace ≈ 9.4 s p95 (RLS per-row visibility function) — card 35b | RLS policy `memory_records_subject_visibility` calls `private.memory_subject_visibility_ok` per row (≈ 550 ms per 50k-row read, about a dozen reads per first page); the 300 ms bar is not relaxed, gate `c35_enumerate_scale_live` asserts ruling E12's regression bars | card 35b |
 | Three copies of the create-and-migrate throwaway-database test helper (debt, card 35 fix pass) | `bins/maintenance/tests/support/throwaway.rs` (`migrate` panics), `crates/adapters/tests/support/throwaway_db.rs` (`migrate` returns `Err` → §79.2 `skip_or_fail`, also `#[path]`-included by `bins/private-worker/tests/derived_dispatch_e2e.rs`) and `crates/adapters/tests/health_snapshot.rs` (its own copy) each hold their own `ONE_AT_A_TIME` mutex, which serialises cluster-global role DDL (0201 `ALTER ROLE`, 0210 `CREATE ROLE`) only inside one test binary — card 34b hit `XX000 tuple concurrently updated` on 0201 for this reason. Consolidating them is not a contained change: one `pub` test-support module in `crates/testkit` gives testkit its first runtime dependency (`postgres`) and rewires 12 test files' module declarations and dep-map headers. Upgrade: that module, the strictest semantics (`Err` → `skip_or_fail` where a caller needs a skip, panic elsewhere), and a cluster-wide lock (a `pg_advisory_lock` held on the `postgres` database connection while migrating) instead of a per-process mutex | next card touching test support |
+
+### 6.24 Closed by card 36 (ADR-0063)
+
+| Audit row | Before | After | Gate / witness |
+|---|---|---|---|
+| **P1-11** (retention part): §48.1 append-heavy tables grow without bound, `control.retention_policies` has no reader | six plain heaps (`stage_runs`, `messages`, `maintenance_receipts`, `events`, `audit_events`, `model_call_ledger`); `retention_policies` v1 per tenant, 0 rows, nothing reads it; no physical-delete path but a hand-written DROP | migrations 0224–0230: each table is a RANGE parent under its own name (heap → one leaf, current month + 3 pre-created, no DEFAULT partition, leaves sealed: FORCE RLS with the parent's policies verbatim, zero runtime grants, the TRUNCATE guard); every global UNIQUE and all 8 inbound FKs moved to three identity tables (`ops.model_call_identity`, `control.audit_event_identity`, `private.event_identity`), so no FK points at a log row; `retention_policies` v2 (per table, all tenants, monthly; no EVENTS / AUDIT_EVENTS by CHECK) + `control.partition_registry`; the daemon's PARTITIONS task proposes candidates and exports `partition_horizon_months{table}`; `humaux-maintenance retention approve \| create-partitions \| execute` with the superuser migrator DSN from the operator shell only — `control.partition_drop` re-derives policy, cutoff, newest leaf, staleness, proposal, the four holds and the row count in the database, exports the leaf, DETACHes and DROPs it RESTRICT and records the receipt with a §77 row in one transaction; both resident modes refuse to boot with that DSN in their environment | `c36_partitions`, `c36_retention`, `c36_serve`, `c36_pg_facts`, `c36_*_named` (T-B/C/D/F/G/H/I/J/K), `c36_rls_leaf_faults_named`, `c36_rls_leaves_sealed`, `c36_manifest_checks_executed`, `c36_never_cascade`, `c36_no_fk_into_log_rows`, `c36_no_default_partition`; rehearsal `partitioned_parents_written_by_rehearsal` |
+| §42 partition horizon | the card's own text: "an insert failure is the alarm" — false here, 23514 maps to 409/400 in eleven repositories | `PartitionHorizonShort` (≤ 1 for 1h, WARNING), `PartitionHorizonExhausted` (≤ 0 for 10m, CRITICAL), `PartitionHorizonAbsent` (absent for 2h, CRITICAL; a failed PARTITIONS run removes the family); runbook §5.3 is the operator's answer to each; promtool firing / silent cases and four mutations (27/27) | `c36_promtool_horizon`, `promtool_mutations`, `c36_horizon_family`, `c36_horizon_failure_named`; witness `crates/testkit/tests/metrics/partition_horizon_months.rs` |
+| Dev FK integrity (card 36 finding, ADR-0063 "Dev integrity finding") | test teardowns hard-deleted tenants under `session_replication_role = replica` with hand-written DELETE lists: dev holds 62,314 FK-violating rows over 31 validated FKs plus 1,767 `private.event_identity` rows without their event (`ORPHANS 64081`, 2026-10-05) | one catalog-driven purge `humaux_testkit::fixture_purge` (fixture tenants only: `humaux_thread_*` database, name `e2e-…`; tenant_id rows + FK closure + identity rows, children first) called by `e2e-seed --teardown`, `switch_visible.rs` and `derived_dispatch_e2e.rs`, and since the follow-up by every remaining dev teardown (`continuity_0137_cleanup.rs`, private-worker `derived_dispatch_e2e.rs` / `distill_hop_e2e.rs`) and at the end of every dev fault-setup test (0131, `distill_dispatch_v2`, 0137 acceptance, route health admission, route runtime; `double_spend` plants only in a rolled-back transaction); the 7 throwaway-only files declare it (ADR-0063 "The 16 remaining replica-mode files", per-file scan 0 → 0); one edge generator `crates/testkit/sql/integrity_edges.sql` behind the test and `c36_dev_orphan_repair.sh scan / repair`; dev itself is repaired by the main line | `e2e_seed::tests::teardown_leaves_no_fk_orphan_and_no_identity_garbage` (red on a skipped table and on skipped identity tables); chain gate `dev_no_fk_orphans` (`ORPHANS 0`, red until the repair); static gate `replica_mode_is_declared` (every `session_replication_role` file uses `fixture_purge` or carries a `// replica-mode:` declaration; red witness recorded) |
+
+- **Not done here, by ruling E5:** the shared `humaux_thread_dev` is converted by the main line (D-M:
+  `c36_devcopy.sh` → `MAINLINE_GO=1 c36_dev_convert.sh`), after its FK orphans from test teardown are repaired; no
+  retention ever executes on dev in this card. Wall clock and insert latency on a dev copy are in ADR-0063
+  "Measurements".
+- **Open (ADR-0063 known limits):** monthly `create-partitions` is a manual operator step backed by the alerts
+  (L9); retention and leaf creation need a superuser per command (L14, card 54); a horizon outage looks like 409/400
+  until card 36b (L15); identity rows are kept forever (L1); EVENTS retention waits for card 37's rebuild baseline,
+  AUDIT_EVENTS for a separate approval line; the export stands in for card 37's PITR proof (L8, L16).
+
+- **Review fixes (2026-10-05 evening, ADR-0063 "Protocol hardening", L8, L17–L19).** The export is mode 0600 with
+  its directory fsynced before the DROP commits; `--months-ahead` is 2..=24; the daemon's horizon value is witnessed
+  per missed month (T-K4, red under `GREATEST(…, 1)`) and the STAGE_RUNS running-stage hold (T-G6); the fixture purge
+  runs any number of times per transaction and names a table dropped under it; the serial lane drops every database
+  it created when the group ends and never migrates the shared database; the migrate tests' throwaway helper drops
+  dead-pid leftovers. Gate list: the inherited `migrate` line is a `# main line:` comment (and `gates_card.sh` skips
+  `#` lines); `c36_no_fk_into_log_rows` quoting fixed (`chr(102)`); `maintenance_tests` skips the D-N latency
+  measurement (lane(c), never in the chain); `dev_no_fk_orphans` fails on a failed scan. `docs/ops/rehearse.sh` changes by
+  one line in this card (`HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS=3` for the resident daemon, D-K's
+  required cadence key); `c36_rehearse.sh`'s header and ADR-0063 D-M say so. On-dev wall clock of the main line's
+  D-M run: 0229 1330.7 ms, 0230 1029.1 ms (ADR-0063 "D-M on dev").
+- **Fixture tenants still on dev (recorded 2026-10-05, not purged here — dev rows are the main line's):**
+  `model_call_ledger.rs` now purges every tenant it creates (its own, renamed `e2e-fixture …`, and the
+  `seed_owner` route tenants; a run leaves the count unchanged: 2,026 before and after); left from earlier runs are
+  2,004 non-fixture `model_call_ledger.rs throwaway tenant` rows (the purge's name predicate refuses them) and 22
+  `e2e-fixture model_call_ledger.rs …` route tenants, both purgeable by the main line. The eight
+  `e2e-contribution-fixture-…` tenants of the 0132/0133 tests stay: their `lane(a:post_0132)` / `lane(a:shared_db)`
+  tests keep fixtures for post-failure forensics (`contribution_fixture.rs` header); not changed in this pass —
+  debt row: purge at the end of a passing test with `ContributionFixture::purge` (plan row 36c).
 
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 

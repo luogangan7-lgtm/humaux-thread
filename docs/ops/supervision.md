@@ -25,6 +25,7 @@ write derives (tenant, workspace) per request, and the two `REMEMBER_TENANT_ID` 
 | `humaux-public-worker` | process alive | `--readyz` exit 0 | no — one bounded pass per invocation |
 | `humaux-maintenance` | `health serve`: process alive | `health serve`: `GET /metrics` on its ops address → 200 / 503 | `health serve` yes (card 34, ADR-0061 D-D); every other subcommand no (card 28) |
 | `humaux-maintenance --serve` | process alive | `GET /metrics` on `HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR` → 200 / 503 | yes — the sixth resident unit (card 35, ADR-0062 D-A): the scheduled maintenance daemon |
+| `humaux-maintenance retention …` | — | — | **never** — one-shot operator commands with the superuser migrator DSN (card 36, ADR-0063 D-H); never supervised |
 
 `humaux-maintenance --serve` (ADR-0062) is the scheduled maintenance daemon and the eighth ops pair
 (`humaux-maintenance:serve`, ADR-0061 D-B): every
@@ -102,6 +103,17 @@ exit `0` created/existing, `3` refused with a named reason, `2` usage, `1` infra
 database or Qdrant it names is down — retry once it is up; a re-run never duplicates a row).
 It runs as its own OS user with `role_maintenance`'s DSN and the credential pepper, which no
 resident process except the gateway holds. Operating it: `docs/ops/runbook.md` §3 and §6.
+
+**The `retention …` arms are never supervised and never resident** (card 36, ADR-0063 D-H):
+`humaux-maintenance retention approve | create-partitions | execute` each open the **superuser** migrator principal
+`HUMAUX_MIGRATOR_PG_DSN` for one transaction and exit. They run from the operator's shell only, with that key
+exported for the one command (runbook §5.3 monthly `create-partitions`, §5.4 retention execute); no scheduler, cron
+entry or unit stores it. The supervised environment must **not** define `HUMAUX_MIGRATOR_PG_DSN`: both resident
+modes (`humaux-maintenance --serve` and `humaux-maintenance health serve`) check for the key by name as their first
+statement and exit 2 with `boot refused: HUMAUX_MIGRATOR_PG_DSN is set in a resident mode's environment (ADR-0063 D-H)`
+when it is present at all, even empty — before reading any other key or binding a port. Because both modes and the
+operator commands of one binary share one env file (above), keep the migrator DSN out of that file; a boot loop
+with this line means it is there.
 
 The four workers have no HTTP surface, so their readiness is an **exec probe**: run the binary
 with `--readyz`, exit 0 = ready. It performs one live round trip per dependency and exits; it

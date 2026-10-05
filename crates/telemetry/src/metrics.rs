@@ -289,6 +289,15 @@ pub mod families {
         Kind::Counter,
         &["task"],
     );
+    // §41.2: the PARTITIONS run of `humaux-maintenance --serve` (card 36; emit
+    // `adapters::maintenance_repo::set_partition_horizon_months`, ADR-0063 D-K; a failed run renders no sample).
+    /// `partition_horizon_months{table}`.
+    pub const PARTITION_HORIZON_MONTHS: Family = f(
+        "partition_horizon_months",
+        "Whole months of pre-created partitions after the current UTC month, per §48.1 table_key (-1: no leaf).",
+        Kind::Gauge,
+        &["table"],
+    );
 }
 
 /// Process-local counters, one slot per closed label value (index = the enum's `ALL` position).

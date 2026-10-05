@@ -1,27 +1,32 @@
 //! `maintenance::tests::serve` — the resident `humaux-maintenance --serve` daemon and its one-shot twin `sweep once`
 //!   against real throwaway PostgreSQL databases (ADR-0062 D-A..D-D, D-L, D-Q; card 35 S1/S2): required keys, the
 //!   lag relation, one counted cycle, 503 and recovery across a closed PG port, SIGTERM between calls, the tenant
-//!   page rotation, and the §77-gated one-page sweep with its per-task counts.
+//!   page rotation, the §77-gated one-page sweep with its per-task counts, the boot refusal of both resident
+//!   modes when the migrator DSN is in their environment (ADR-0063 D-H, T-H3), and the PARTITIONS proposer with its
+//!   `partition_horizon_months` family (ADR-0063 D-K, T-K1..T-K3).
 //! Depends-on: crates=[serde_json]; services=[PostgreSQL(any), PostgreSQL(owner)
-//!   r=[ops.maintenance_receipts] w=[control.confirm_tokens, control.rate_buckets, control.tenants, control.users,
-//!   control.workspaces, ops.jobs, ops.selection_snapshots, projection.stream_log]
+//!   r=[control.partition_registry, control.retention_policies, ops.maintenance_receipts, ops.stage_runs]
+//!   w=[control.confirm_tokens, control.rate_buckets, control.tenants, control.users, control.workspaces, ops.jobs,
+//!   ops.selection_snapshots, projection.stream_log]
 //!   x=[control.maintenance_tenant_page, control.reap_quota_reservations], PostgreSQL(role_maintenance),
 //!   HTTP(loopback), subprocess(humaux-maintenance)];
-//!   env=[HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS,
+//!   env=[CARGO_TARGET_TMPDIR, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_MAINTENANCE_HEALTH_SAMPLE_SECONDS,
+//!   HUMAUX_MAINTENANCE_HEALTH_SERVE_METRICS_ADDR, HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS, HUMAUX_MAINTENANCE_SERVE_JOBS_DEAD_RETENTION_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_JOBS_DONE_RETENTION_SECONDS, HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_LOST_EVERY_SECONDS, HUMAUX_MAINTENANCE_SERVE_LOST_LIMIT,
-//!   HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR, HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_IDLE_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR, HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_IDLE_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_REDRIVE_COOLDOWN_SECONDS, HUMAUX_MAINTENANCE_SERVE_REISSUE_COOLDOWN_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_TENANTS_PER_RUN,
-//!   HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS];
+//!   HUMAUX_MIGRATOR_PG_DSN, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS];
 //!   modules=[maintenance::tests::support::throwaway]
 //! Called-by: [cargo-test]
 //! Invariants: [every DB test owns its throwaway database humaux_thread_c35_serve_<pid>_<n>, dropped by the
 //!   fixture's Drop even on panic, so no LOST transition ever touches the shared dev database; every spawned
 //!   daemon is killed by its own Drop; the key tests point at a closed port and never reach a database]
 //! Spec: Baseline §15.2; §77; §78.1; §79.2; ADR-0037; ADR-0057 D-F; ADR-0062 D-A; ADR-0062 D-B; ADR-0062 D-D;
-//!   ADR-0062 D-Q
+//!   ADR-0062 D-Q; ADR-0063 D-H; ADR-0063 D-K
 
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
@@ -42,6 +47,8 @@ const LOST_AFTER_SECONDS: &str = "HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS";
 const LAG_SECONDS: &str = "HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS";
 /// A DSN nothing listens on: a config check that passes when it should not reaches the connect and names the DSN.
 const CLOSED_DSN: &str = "postgres://role_maintenance:unused@127.0.0.1:1/none";
+/// ADR-0063 D-K: the PARTITIONS cadence (seconds, >= CYCLE_SECONDS).
+const PARTITIONS_EVERY: &str = "HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS";
 /// The task keys the daemon requires, by D-C task name.
 const TASKS: [&str; 9] = [
     "LOST",
@@ -101,6 +108,8 @@ fn keys(addr: SocketAddr, dsn: &str, cycle: u64, tenants_per_run: u32) -> Vec<(S
             "50".to_owned(),
         ));
     }
+    // ADR-0063 D-K: the cluster-level PARTITIONS task has a cadence and no LIMIT.
+    keys.push((PARTITIONS_EVERY.to_owned(), cycle.to_string()));
     keys.push((LOST_AFTER_SECONDS.to_owned(), "120".to_owned()));
     keys.push((LAG_SECONDS.to_owned(), "60".to_owned()));
     // ADR-0062 D-G..D-J ages: one hour each, so only rows seeded older than that are purgeable.
@@ -712,4 +721,337 @@ fn sweep_once_requires_admin_fields_and_prints_per_task_counts() {
         .expect("receipts")
         .get(0);
     assert_eq!(receipts, 4, "one receipt per purge door that removed a row");
+}
+
+/// Starts one resident mode with `env` (every key it needs plus the migrator key) and returns its exit status and
+/// stderr; panics when it is still running after 5 s, i.e. when it booted.
+fn refused_boot(args: &[&str], env: &[(String, String)]) -> (Option<i32>, String) {
+    // dep: subprocess(humaux-maintenance) — a resident mode that must refuse to boot
+    let child = Command::new(BIN)
+        .args(args)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn a resident mode");
+    let mut serve = Serve(child);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = serve.0.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{args:?} booted with HUMAUX_MIGRATOR_PG_DSN in its environment"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(serve.0.stderr.as_mut().expect("piped stderr"), &mut stderr)
+        .expect("read stderr");
+    (status.code(), stderr)
+}
+
+/// T-H3 (ADR-0063 D-H): both resident modes refuse to boot, exit 2, when their environment defines the superuser
+/// migrator DSN at all (even empty); stderr names the key and never its value, and nothing listens. Fault: delete
+/// the `resident::refuse_owner_credentials()` call from either mode ⇒ that mode boots against the throwaway ⇒ red.
+#[test]
+fn resident_modes_refuse_to_boot_with_the_migrator_dsn_in_env() {
+    const TEST: &str = "resident_modes_refuse_to_boot_with_the_migrator_dsn_in_env";
+    const MIGRATOR: &str = "HUMAUX_MIGRATOR_PG_DSN";
+    const DUMMY: &str = "postgres://refused@127.0.0.1:1/none";
+    let Some(db) = throwaway::db(TEST, "c36_boot") else {
+        return;
+    };
+    let serve_addr = free_addr();
+    let health_addr = free_addr();
+    let health_keys = |value: &str| {
+        vec![
+            (MAINTENANCE_DSN.to_owned(), db.maintenance_dsn.clone()),
+            (
+                "HUMAUX_MAINTENANCE_HEALTH_SERVE_METRICS_ADDR".to_owned(),
+                health_addr.to_string(),
+            ),
+            (
+                "HUMAUX_MAINTENANCE_HEALTH_SAMPLE_SECONDS".to_owned(),
+                "1".to_owned(),
+            ),
+            (MIGRATOR.to_owned(), value.to_owned()),
+        ]
+    };
+    let serve_keys = |value: &str| {
+        let mut env = keys(serve_addr, &db.maintenance_dsn, 1, 100);
+        env.push((MIGRATOR.to_owned(), value.to_owned()));
+        env
+    };
+    let cases = [
+        (vec!["--serve"], serve_keys(DUMMY), serve_addr),
+        (vec!["--serve"], serve_keys(""), serve_addr),
+        (vec!["health", "serve"], health_keys(DUMMY), health_addr),
+        (vec!["health", "serve"], health_keys(""), health_addr),
+    ];
+    for (args, env, addr) in cases {
+        let (code, stderr) = refused_boot(&args, &env);
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains(
+                "boot refused: HUMAUX_MIGRATOR_PG_DSN is set in a resident mode's environment (ADR-0063 D-H)"
+            ),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("refused@"),
+            "{args:?} printed the value: {stderr}"
+        );
+        assert!(get(addr, "/metrics").is_none(), "{args:?} bound {addr}");
+    }
+}
+
+/// The daemon's proposal state of every STAGE_RUNS registry row that has one: `(leaf, revision, proposed_at >=
+/// effective_at of that revision)`, by leaf.
+fn proposals(db: &mut Db) -> Vec<(String, i32, bool)> {
+    db.client()
+        .query(
+            "SELECT r.leaf_name, r.proposed_policy_revision, r.proposed_at >= p.effective_at \
+               FROM control.partition_registry r JOIN control.retention_policies p \
+                 ON p.table_key = r.table_key AND p.policy_revision = r.proposed_policy_revision \
+              WHERE r.table_key = 'STAGE_RUNS' AND r.proposed_at IS NOT NULL ORDER BY 1",
+            &[],
+        )
+        .expect("proposals")
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect()
+}
+
+/// `true` when the exposition carries any `partition_horizon_months` sample.
+fn has_horizon_sample(body: &str) -> bool {
+    body.lines()
+        .any(|l| l.starts_with("partition_horizon_months{"))
+}
+
+/// Asserts every closed table_key renders `months`.
+fn assert_horizon(body: &str, months: i64) {
+    for table in [
+        "model_call_ledger",
+        "stage_runs",
+        "messages",
+        "maintenance_receipts",
+        "events",
+        "audit_events",
+    ] {
+        assert_eq!(
+            sample(
+                body,
+                &format!("partition_horizon_months{{table=\"{table}\"}}")
+            ),
+            months,
+            "{table}: {body}"
+        );
+    }
+}
+
+/// T-K1 (ADR-0063 D-K): with revision 1 (1 month) superseded by revision 2 (2 months), the daemon proposes only the
+/// leaf expired under revision 2, under revision 2; the newer expired month, the current month and the future months
+/// are never proposed; every closed key renders its horizon (current month + 3 ⇒ 3) and the run counts once as ok.
+/// Fault: propose under the first revision ⇒ the newer month is proposed (revision 1) ⇒ red.
+#[test]
+fn the_daemon_proposes_only_expired_months_of_the_latest_policy() {
+    let Some(mut db) = throwaway::db(
+        "the_daemon_proposes_only_expired_months_of_the_latest_policy",
+        "c36_serve",
+    ) else {
+        return;
+    };
+    let c = db.client();
+    let (_, oldest) = throwaway::past_leaf(c, "STAGE_RUNS", "ops.stage_runs", -3);
+    throwaway::past_leaf(c, "STAGE_RUNS", "ops.stage_runs", -2);
+    throwaway::effective_policy(c, "STAGE_RUNS", Some(1));
+    throwaway::effective_policy(c, "STAGE_RUNS", Some(2));
+    let addr = free_addr();
+    let _serve = spawn(&keys(addr, &db.maintenance_dsn, 1, 1000));
+    after_cycles(addr, 2, Duration::from_secs(15));
+    assert_eq!(proposals(&mut db), vec![(oldest, 2, true)]);
+    let ready = poll(addr, "/metrics", Duration::from_secs(5), |(c, _)| *c == 200);
+    let (code, body) = ready.expect("/metrics");
+    assert_eq!(code, 200, "{body}");
+    assert_horizon(&body, 3);
+    assert!(
+        sample(
+            &body,
+            r#"maintenance_task_runs_total{task="partitions",outcome="ok"}"#
+        ) >= 1,
+        "{body}"
+    );
+}
+
+/// T-K2 (ADR-0063 D-K, review finding 7): a policy approved with a future `effective_at` is not proposed by ticks
+/// before it takes effect (an early forged proposal under the same revision stays as forged); after `effective_at`
+/// the next tick proposes the expired month and re-proposes the forged one, both with `proposed_at >= effective_at`,
+/// and `retention execute` drops each. Fault: drop the `effective_at <= clock_timestamp()` term from the proposer ⇒
+/// an early tick proposes ⇒ red.
+#[test]
+fn a_future_effective_policy_is_proposed_after_it_takes_effect_and_executes() {
+    let Some(mut db) = throwaway::db(
+        "a_future_effective_policy_is_proposed_after_it_takes_effect_and_executes",
+        "c36_serve",
+    ) else {
+        return;
+    };
+    let c = db.client();
+    let (forged, forged_leaf) = throwaway::past_leaf(c, "STAGE_RUNS", "ops.stage_runs", -3);
+    let (fresh, fresh_leaf) = throwaway::past_leaf(c, "STAGE_RUNS", "ops.stage_runs", -2);
+    let effective: String = c
+        .query_one(
+            "SELECT to_char((clock_timestamp() + interval '8 seconds') AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+            &[],
+        )
+        .expect("effective_at")
+        .get(0);
+    let owner = throwaway::with_db(&db.owner_dsn, &db.name);
+    let retention = |args: &[&str]| {
+        let mut all = vec!["retention"];
+        all.extend(args);
+        all.extend(ADMIN);
+        run(&all, &[("HUMAUX_MIGRATOR_PG_DSN", owner.clone())])
+    };
+    let approved = retention(&[
+        "approve",
+        "--table",
+        "STAGE_RUNS",
+        "--months",
+        "1",
+        "--effective-at",
+        &effective,
+        "--lock-timeout-ms",
+        "5000",
+    ]);
+    let stdout = String::from_utf8_lossy(&approved.stdout);
+    assert_eq!(
+        approved.status.code(),
+        Some(0),
+        "{stdout} {}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+    let receipt: Value = serde_json::from_str(stdout.trim()).expect("approve receipt");
+    let policy = receipt["policy_id"].as_str().expect("policy_id").to_owned();
+    throwaway::forge_proposal(db.client(), &forged, 1, "clock_timestamp()");
+    let addr = free_addr();
+    let _serve = spawn(&keys(addr, &db.maintenance_dsn, 1, 1000));
+    after_cycles(addr, 2, Duration::from_secs(6));
+    let before: bool = db
+        .client()
+        .query_one(
+            "SELECT clock_timestamp() < effective_at FROM control.retention_policies WHERE policy_id = $1::text::uuid",
+            &[&policy],
+        )
+        .expect("clock")
+        .get(0);
+    assert!(
+        before,
+        "two ticks must finish before effective_at for this test to mean anything"
+    );
+    assert_eq!(
+        proposals(&mut db),
+        vec![(forged_leaf.clone(), 1, false)],
+        "no tick before effective_at proposes; the early forge stays as it was"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let expected = vec![(forged_leaf, 1, true), (fresh_leaf, 1, true)];
+    while proposals(&mut db) != expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "not (re-)proposed after effective_at: {:?}",
+            proposals(&mut db)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("c36_t_k2");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("export dir");
+    let dir = dir.display().to_string();
+    for registry in [&forged, &fresh] {
+        let out = retention(&[
+            "execute",
+            "--policy",
+            &policy,
+            "--registry-id",
+            registry,
+            "--export-dir",
+            &dir,
+            "--lock-timeout-ms",
+            "5000",
+        ]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{stdout} {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains(r#""outcome":"dropped""#), "{stdout}");
+    }
+}
+
+/// T-K3 (ADR-0063 D-K, D-F, review finding 8): with PARTITIONS every 4 cycles, a run that fails (SELECT on the
+/// registry revoked) counts `{task="partitions",outcome="failed"}` and removes every `partition_horizon_months`
+/// sample, so the next clean cycle's 200 renders the family header with no sample (`PartitionHorizonAbsent`), never
+/// the last value; after the re-grant the family is back with the right values. Fault: skip
+/// `reset_partition_horizon_months()` ⇒ the stale samples render under 200 ⇒ red.
+#[test]
+fn a_failed_partitions_run_removes_the_horizon_family_and_counts_failed() {
+    let Some(mut db) = throwaway::db(
+        "a_failed_partitions_run_removes_the_horizon_family_and_counts_failed",
+        "c36_serve",
+    ) else {
+        return;
+    };
+    let addr = free_addr();
+    let env: Vec<(String, String)> = keys(addr, &db.maintenance_dsn, 1, 1000)
+        .into_iter()
+        .map(|(k, v)| {
+            if k == PARTITIONS_EVERY {
+                (k, "4".to_owned())
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+    let _serve = spawn(&env);
+    let first = poll(addr, "/metrics", Duration::from_secs(15), |(c, b)| {
+        *c == 200 && has_horizon_sample(b)
+    });
+    let (code, body) = first.expect("/metrics after the first run");
+    assert_eq!(code, 200, "{body}");
+    assert_horizon(&body, 3);
+
+    db.sql("REVOKE SELECT ON control.partition_registry FROM role_maintenance");
+    let failed_series = r#"maintenance_task_runs_total{task="partitions",outcome="failed"}"#;
+    let failed = poll(addr, "/metrics", Duration::from_secs(20), |(c, b)| {
+        *c == 200
+            && b.lines()
+                .find_map(|l| l.strip_prefix(failed_series)?.trim().parse::<f64>().ok())
+                .is_some_and(|n| n >= 1.0)
+    });
+    let (code, body) = failed.expect("/metrics after a failed run");
+    assert_eq!(code, 200, "a clean cycle after the failed run: {body}");
+    assert!(sample(&body, failed_series) >= 1, "{body}");
+    assert!(
+        body.contains("# TYPE partition_horizon_months gauge"),
+        "the header stays: {body}"
+    );
+    assert!(
+        !has_horizon_sample(&body),
+        "a failed run leaves no horizon sample: {body}"
+    );
+
+    db.sql("GRANT SELECT ON control.partition_registry TO role_maintenance");
+    let back = poll(addr, "/metrics", Duration::from_secs(20), |(c, b)| {
+        *c == 200 && has_horizon_sample(b)
+    });
+    let (code, body) = back.expect("/metrics after the re-grant");
+    assert_eq!(code, 200, "{body}");
+    assert_horizon(&body, 3);
 }

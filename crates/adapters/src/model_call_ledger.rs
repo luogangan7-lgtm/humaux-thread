@@ -7,11 +7,13 @@
 //! Called-by: [adapters::consolidation_reasoner, adapters::contribution_reasoner, adapters::distill_reasoner, adapters::provider_budget, private-worker::main, retrieval-provider::adapters, tests]
 //! Invariants: [every real provider call is bracketed by reserve_call/finalize_call (a skipped reserve leaves no row,
 //!   which the 0094 guard cannot see); costs are persisted as given, never computed here; a reservation conflict is a
-//!   typed error, not a second attempt identity; a private reasoning row carries its admitted route and is reserved
+//!   typed error, not a second attempt identity; one (tenant_id, request_id) is reserved once: both writers take the
+//!   `model-call-request:` advisory lock, look the key up and insert only when absent (ADR-0063 D-B, ruling E3-b: the
+//!   identity claim raises 23505 on any duplicate); a private reasoning row carries its admitted route and is reserved
 //!   in ONE transaction with its disclosure (ADR-0060 D-I / D-N, enforced by the 0206 triggers); metrics family
 //!   emitted: private_reasoning_usage_total, counted after the finalize commits (ADR-0061 card 34b)]
 //! Spec: Baseline §19; §78.1; §20; §11.2.4; §11.2.5; §11.5; §11.6; §11.7; §6.2.1; §6.2.2; ADR-0060 D-I, D-N; §41.2;
-//!   ADR-0061 D-C
+//!   ADR-0061 D-C; ADR-0063 D-B
 //!
 //! Every
 //! caller that makes a real `EmbeddingProvider`/`RerankProvider` call (§19 Retrieval Provider
@@ -52,6 +54,8 @@ use crate::{
     reasoning_route_admission::ReasoningAdmissionLocator,
 };
 
+// ADR-0063 D-B, ruling E3-b: both writers serialize one (tenant_id, request_id) on this lock before their lookup;
+// the identity claim raises 23505 on a duplicate, so the lock + lookup is the writers' whole dedupe.
 const REASONING_REQUEST_ADVISORY_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended('model-call-request:' || $1::uuid::text || ':' || $2::uuid::text,0))";
 
 /// DB-layer failure from any function in this module. Adapter-local, not one of the
@@ -123,8 +127,9 @@ pub struct ReserveCall {
     /// Caller's idempotency key for the logical call — `None` mints a fresh one
     /// (`Uuid::now_v7()`), matching `domain::ids`'s own minting convention
     /// (`crate::byok`'s doc). A retry that supplies the *same* value as a prior attempt hits
-    /// `model_call_ledger_request_id_unique` and [`reserve_call`] returns the original
-    /// reservation instead of a second row.
+    /// the lookup [`reserve_call`] makes under the `model-call-request:` advisory lock and returns
+    /// the original reservation instead of a second row (ADR-0063 D-B, ruling E3-b; a raw duplicate
+    /// INSERT is refused 23505 by `model_call_identity_request_id_unique`).
     pub request_id: Option<Uuid>,
     pub tenant_id: Uuid,
     pub workspace_id: Option<Uuid>,
@@ -145,7 +150,7 @@ pub struct ReservedCall {
     pub request_id: Uuid,
     pub called_at: OffsetDateTime,
     /// `true` when this reservation already existed (a retry with the same `request_id`
-    /// hit `model_call_ledger_request_id_unique`) — the caller should not repeat the external
+    /// was found by the writer's locked lookup) — the caller should not repeat the external
     /// call, only re-check `status`/re-attempt `finalize_call` if the prior attempt never got
     /// that far.
     pub already_reserved: bool,
@@ -279,14 +284,41 @@ pub(crate) async fn lookup_reasoning_call_in_txn(
 /// Reserves one admitted contribution attempt in the caller's private-worker transaction.
 /// A retry may reuse the same request id only while the durable row is still RESERVED and every
 /// immutable snapshot field is byte-for-field equivalent.
+///
+/// ADR-0063 ruling E3-b: the lookup under the `model-call-request:` lock is this writer's own dedupe. Its only caller
+/// (`contribution_reasoner`) already ran [`lookup_reasoning_call_in_txn`] under the same lock in the same
+/// transaction, so today no duplicate reaches it (a racing writer between the two deadlocks on the reasoner's
+/// contribution-inputs lock instead, measured 2026-10-05); it stays so a caller without that lookup still never
+/// meets the identity claim's 23505.
 pub(crate) async fn reserve_reasoning_call_in_txn(
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     input: &ReasoningReserveCall,
 ) -> Result<ReservedCall, ModelCallLedgerError> {
     let locator = &input.locator;
     set_tenant_local(txn, locator.tenant_id).await?;
-    let inserted = sqlx::query(
-        "INSERT INTO ops.model_call_ledger (request_id,tenant_id,workspace_id,purpose,provider,model,model_revision,estimated_cost,call_kind,intent_sha256,reasoning_domain_id,binding_id,binding_version,route_policy_id,route_policy_version,profile_id,profile_version,provider_account_id,provider_endpoint_id,egress_processor_id,credential_ref,billing_account_id,billing_instrument_id,provider_health_observation_id,account_health_observation_id,billing_responsibility,admitted_at) VALUES ($1,$2,NULL,$3,$4,$5,$6,NULL,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,'USER',$24) ON CONFLICT (tenant_id,request_id) DO NOTHING RETURNING model_call_id,request_id,called_at",
+    lock_request(txn, locator.tenant_id, input.logical_call_id.0).await?;
+    let existing = sqlx::query(
+        "SELECT * FROM ops.model_call_ledger WHERE tenant_id=$1 AND request_id=$2 FOR UPDATE",
+    )
+    .bind(locator.tenant_id)
+    .bind(input.logical_call_id.0)
+    .fetch_optional(&mut **txn)
+    .await?;
+    if let Some(row) = existing {
+        if row.try_get::<String, _>("status")? != "RESERVED"
+            || !reasoning_snapshot_matches(&row, input)?
+        {
+            return Err(ModelCallLedgerError::ReasoningReservationConflict);
+        }
+        return Ok(ReservedCall {
+            model_call_id: row.try_get("model_call_id")?,
+            request_id: row.try_get("request_id")?,
+            called_at: row.try_get("called_at")?,
+            already_reserved: true,
+        });
+    }
+    let row = sqlx::query(
+        "INSERT INTO ops.model_call_ledger (request_id,tenant_id,workspace_id,purpose,provider,model,model_revision,estimated_cost,call_kind,intent_sha256,reasoning_domain_id,binding_id,binding_version,route_policy_id,route_policy_version,profile_id,profile_version,provider_account_id,provider_endpoint_id,egress_processor_id,credential_ref,billing_account_id,billing_instrument_id,provider_health_observation_id,account_health_observation_id,billing_responsibility,admitted_at) VALUES ($1,$2,NULL,$3,$4,$5,$6,NULL,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,'USER',$24) RETURNING model_call_id,request_id,called_at",
     )
     .bind(input.logical_call_id.0)
     .bind(locator.tenant_id)
@@ -312,35 +344,29 @@ pub(crate) async fn reserve_reasoning_call_in_txn(
     .bind(locator.provider_health_observation_id)
     .bind(locator.account_health_observation_id)
     .bind(locator.admitted_at)
-    .fetch_optional(&mut **txn)
-    .await?;
-    if let Some(row) = inserted {
-        return Ok(ReservedCall {
-            model_call_id: row.try_get("model_call_id")?,
-            request_id: row.try_get("request_id")?,
-            called_at: row.try_get("called_at")?,
-            already_reserved: false,
-        });
-    }
-
-    let row = sqlx::query(
-        "SELECT * FROM ops.model_call_ledger WHERE tenant_id=$1 AND request_id=$2 FOR UPDATE",
-    )
-    .bind(locator.tenant_id)
-    .bind(input.logical_call_id.0)
     .fetch_one(&mut **txn)
     .await?;
-    if row.try_get::<String, _>("status")? != "RESERVED"
-        || !reasoning_snapshot_matches(&row, input)?
-    {
-        return Err(ModelCallLedgerError::ReasoningReservationConflict);
-    }
     Ok(ReservedCall {
         model_call_id: row.try_get("model_call_id")?,
         request_id: row.try_get("request_id")?,
         called_at: row.try_get("called_at")?,
-        already_reserved: true,
+        already_reserved: false,
     })
+}
+
+/// Takes the transaction-scoped `model-call-request:` advisory lock for one (tenant, request) key.
+async fn lock_request(
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    request_id: Uuid,
+) -> Result<(), ModelCallLedgerError> {
+    // dep: PostgreSQL(any) — pg_advisory_xact_lock, held to COMMIT so a concurrent writer's lookup sees this row
+    sqlx::query(REASONING_REQUEST_ADVISORY_LOCK_SQL)
+        .bind(tenant_id)
+        .bind(request_id)
+        .execute(&mut **txn)
+        .await?;
+    Ok(())
 }
 
 async fn set_tenant_local(
@@ -364,7 +390,27 @@ async fn reserve_in_txn(
     set_tenant_local(txn, input.tenant_id).await?;
     let request_id = input.request_id.unwrap_or_else(Uuid::now_v7);
 
-    let inserted = sqlx::query(
+    // ADR-0063 D-B, ruling E3-b: the lock serializes one key, so a retry (or a concurrent writer, after the first
+    // commits) finds the prior reservation here (§19.1 idempotent retry) and returns it instead of a second row.
+    lock_request(txn, input.tenant_id, request_id).await?;
+    let existing = sqlx::query(
+        "SELECT model_call_id, request_id, called_at FROM ops.model_call_ledger \
+         WHERE tenant_id = $1 AND request_id = $2",
+    )
+    .bind(input.tenant_id)
+    .bind(request_id)
+    .fetch_optional(&mut **txn)
+    .await?;
+    if let Some(row) = existing {
+        return Ok(ReservedCall {
+            model_call_id: row.get("model_call_id"),
+            request_id: row.get("request_id"),
+            called_at: row.get("called_at"),
+            already_reserved: true,
+        });
+    }
+
+    let row = sqlx::query(
         "INSERT INTO ops.model_call_ledger \
            (request_id, tenant_id, workspace_id, purpose, provider, model, model_revision, \
             estimated_cost, reasoning_domain_id, binding_id, binding_version, route_policy_id, \
@@ -374,7 +420,6 @@ async fn reserve_in_txn(
             billing_responsibility, admitted_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
                  $19, $20, $21, $22, $23, $24, $25) \
-         ON CONFLICT (tenant_id, request_id) DO NOTHING \
          RETURNING model_call_id, request_id, called_at",
     )
     .bind(request_id)
@@ -403,33 +448,13 @@ async fn reserve_in_txn(
     // §11.5 / ADR-0060 ruling E2: the account of the admitted credential pays.
     .bind(route.map(|_| "USER"))
     .bind(route.map(|r| r.admitted_at))
-    .fetch_optional(&mut **txn)
-    .await?;
-
-    if let Some(row) = inserted {
-        return Ok(ReservedCall {
-            model_call_id: row.get("model_call_id"),
-            request_id: row.get("request_id"),
-            called_at: row.get("called_at"),
-            already_reserved: false,
-        });
-    }
-
-    // ON CONFLICT DO NOTHING: a prior reservation with this (tenant_id, request_id) already
-    // exists (§19.1 idempotent retry) — return it instead of a second row.
-    let row = sqlx::query(
-        "SELECT model_call_id, request_id, called_at FROM ops.model_call_ledger \
-         WHERE tenant_id = $1 AND request_id = $2",
-    )
-    .bind(input.tenant_id)
-    .bind(request_id)
     .fetch_one(&mut **txn)
     .await?;
     Ok(ReservedCall {
         model_call_id: row.get("model_call_id"),
         request_id: row.get("request_id"),
         called_at: row.get("called_at"),
-        already_reserved: true,
+        already_reserved: false,
     })
 }
 

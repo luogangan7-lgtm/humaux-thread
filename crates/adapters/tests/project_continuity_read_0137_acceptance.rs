@@ -22,7 +22,8 @@ use std::{
 };
 
 use continuity_0137_fixture::{
-    CleanupOwner, Fixture, assert_diagnostic_pure_cases, preflight_test, required_dsn, set_context,
+    CleanupOwner, Fixture, POLICY_DDL_LOCK_KEY, assert_diagnostic_pure_cases, preflight_test,
+    required_dsn, set_context,
 };
 use humaux_domain::error::ErrorCode;
 use postgres::{Client, Error, NoTls, types::ToSql};
@@ -31,7 +32,6 @@ use uuid::Uuid;
 
 const READ_FUNCTION: &str =
     "private.read_continuity_project_storage_v1(uuid,uuid,uuid,uuid,uuid,uuid[])";
-const POLICY_DDL_LOCK_KEY: i64 = 13_720_260_831;
 
 fn sql_suffix(fixture: &Fixture) -> String {
     fixture.project.simple().to_string()
@@ -769,6 +769,7 @@ fn raw_parallel_array_mispairing_never_yields_current_or_complete() {
     let second_hash: Vec<u8> = rows[1].get(1);
     assert_ne!(first_hash, second_hash);
 
+    // replica-mode: fault setup, fixture purged at the end (the CleanupOwner's last drop runs the fixture purge)
     admin
         .batch_execute("SET session_replication_role=replica")
         .unwrap();

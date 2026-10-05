@@ -6,14 +6,14 @@
 //!   humaux-projection, humaux-testkit, postgres, serde_json, sha2, tokio, uuid]; services=[PostgreSQL(role_gateway)
 //!   r=[control.current_reasoning_route_binding, ops.claim_derived_work_v2, ops.commit_seq_seq, ops.data_disclosure_sources,
 //!   ops.data_disclosures, ops.model_call_ledger, ops.private_inference_rpc_calls, private.distill_candidates,
-//!   private.memory_affects, private.memory_records, private.memory_subject_mentions, private.memory_subjects, private.processing_runs]
+//!   private.memory_affects, private.memory_evidence, private.memory_records, private.memory_subject_mentions, private.memory_subjects, private.processing_runs]
 //!   w=[control.credentials, control.memberships, control.private_reasoning_domains, control.processor_models,
 //!   control.provider_accounts, control.provider_endpoints, control.reasoning_credential_bindings,
 //!   control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates,
 //!   control.reasoning_route_policies, control.tenants, control.users, control.workspace_memberships,
 //!   control.workspaces, ops.outbox, ops.reasoning_account_health_observations,
 //!   ops.reasoning_provider_health_observations, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects,
-//!   private.memory_evidence, private.subject_keys, private.subjects, projection.stream_checkpoints,
+//!   private.subject_keys, private.subjects, projection.stream_checkpoints,
 //!   projection.stream_log, ops.jobs, ops.provider_slots] x=[control.current_reasoning_route_binding,
 //!   ops.claim_derived_work_v2], PostgreSQL(role_private_worker), PostgreSQL(owner), PostgreSQL(role_maintenance),
 //!   PostgreSQL(role_retrieval_worker), MiniMax, subprocess(gitleaks)]; env=[HUMAUX_MINIMAX_DNS_PINS,
@@ -26,7 +26,7 @@
 //!   humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
 //!   private-worker::distill, private-worker::tests::support::dispatch_fence,
 //!   private-worker::tests::support::live_minimax, private-worker::tests::support::live_provider,
-//!   projection::fingerprint, projection::serving]
+//!   projection::fingerprint, projection::serving, testkit::fixture_purge]
 //! Called-by: [cargo-test]
 //! Invariants: [no MINIMAX_API_KEY -> SKIP for the live test only; no DB (or not migrated to 0190) -> SKIP for all;
 //!   HUMAUX_REQUIRE_MINIMAX/HUMAUX_REQUIRE_DB make either a panic via skip_or_fail; tests run one at a time and
@@ -92,6 +92,7 @@ use humaux_local_secret_scan::{LocalSecretScanner, LocalSecretScannerConfig, Sea
 use humaux_private_worker::distill::{DistillDispatchConfig, DistillDispatchReport, dispatch_pass};
 use humaux_projection::fingerprint::{ProcessingInputFingerprintInputs, source_hash};
 use humaux_projection::serving::StreamFamily;
+use humaux_testkit::fixture_purge::purge_tenant_fixture_sql;
 use humaux_testkit::{ExternalDep, skip_or_fail};
 use postgres::{Client, NoTls};
 use sha2::{Digest, Sha256};
@@ -265,49 +266,30 @@ struct Fixture {
 }
 
 impl Drop for Fixture {
-    /// Throwaway-tenant cleanup — the generic sweep `consolidation_hop_e2e.rs` uses, plus the child
-    /// tables that key through a parent. Card-31 lesson: jobs (with the slots they hold) and data
-    /// rows in ONE printed batch; the tenant and user rows in a separate best-effort batch.
+    /// Throwaway-tenant cleanup through the one fixture purge (`humaux_testkit::fixture_purge`, ADR-0063 "Dev
+    /// integrity finding"; the replica-mode DELETE list it replaces skipped RI and the identity release triggers and
+    /// left orphans on dev). The slots the tenant's jobs hold are released first: `ops.provider_slots` rows are global
+    /// and carry no FK, so the purge never reaches them. A failure is printed (the fixture tenant stays, nothing is
+    /// half-deleted); the user is not a tenant row and goes last with constraints enforced, best effort.
     fn drop(&mut self) {
         let _ = self.fence.batch_execute("ROLLBACK");
         let tenant = self.tenant_id;
-        let Ok(rows) = self.admin.query(
-            "SELECT table_schema, table_name FROM information_schema.columns \
-             WHERE column_name = 'tenant_id' AND table_schema IN ('control','private','ops','projection','staging') \
-               AND table_name <> 'tenants' \
-             ORDER BY table_schema, table_name",
-            &[],
-        ) else {
-            eprintln!("{NAME}: fixture cleanup for tenant {tenant}: table list failed");
-            return;
-        };
-        let mut sql = format!(
-            "SET session_replication_role = replica; \
-             UPDATE ops.provider_slots SET job_id = NULL, claim_generation = NULL, bound_until = NULL \
-               WHERE job_id IN (SELECT job_id FROM ops.jobs WHERE tenant_id = '{tenant}'); \
-             DELETE FROM private.memory_evidence WHERE memory_id IN \
-               (SELECT memory_id FROM private.memory_records WHERE tenant_id = '{tenant}'); \
-             DELETE FROM private.events WHERE event_id IN \
-               (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id = '{tenant}'); "
+        if let Err(error) = self.admin.execute(
+            "UPDATE ops.provider_slots SET job_id = NULL, claim_generation = NULL, bound_until = NULL \
+             WHERE job_id IN (SELECT job_id FROM ops.jobs WHERE tenant_id = $1)",
+            &[&tenant],
+        ) {
+            eprintln!("{NAME}: slot release for tenant {tenant} failed: {error}");
+        }
+        let purged = purge_tenant_fixture_sql(&tenant.to_string())
+            .and_then(|sql| self.admin.batch_execute(&sql).map_err(|e| e.to_string()));
+        if let Err(error) = purged {
+            eprintln!("{NAME}: fixture cleanup for tenant {tenant} failed: {error}");
+        }
+        let _ = self.admin.execute(
+            "DELETE FROM control.users WHERE user_id = $1",
+            &[&self.user_id],
         );
-        for row in rows {
-            let schema: String = row.get(0);
-            let table: String = row.get(1);
-            sql.push_str(&format!(
-                "DELETE FROM {schema}.{table} WHERE tenant_id = '{tenant}'; "
-            ));
-        }
-        sql.push_str("SET session_replication_role = DEFAULT;");
-        if let Err(error) = self.admin.batch_execute(&sql) {
-            eprintln!("{NAME}: fixture cleanup (jobs/data) for tenant {tenant} failed: {error}");
-        }
-        if let Err(error) = self.admin.batch_execute(&format!(
-            "DELETE FROM control.tenants WHERE tenant_id = '{tenant}'; \
-             DELETE FROM control.users WHERE user_id = '{}';",
-            self.user_id
-        )) {
-            eprintln!("{NAME}: fixture cleanup (tenant, best effort) for {tenant} failed: {error}");
-        }
     }
 }
 
@@ -372,7 +354,7 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
     let tenant_id: Uuid = admin
         .query_one(
             "INSERT INTO control.tenants (name, state) VALUES ($1, 'ACTIVE') RETURNING tenant_id",
-            &[&format!("{NAME} throwaway tenant {suffix}")],
+            &[&format!("e2e-fixture {NAME} throwaway tenant {suffix}")],
         )
         .expect("tenant")
         .get(0);

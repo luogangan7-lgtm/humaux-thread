@@ -297,6 +297,7 @@ fn contribution_deidentify_shadow_bootstrap_is_exact_replayable_and_fail_closed(
             )
             .expect("fingerprint before mutation")
             .get(0);
+        // replica-mode: throwaway database only (humaux_thread_disposable_<stamp>, migrated to head by `cargo xtask serial-lane` for lane a:disposable, dropped by its --drop-provisioned)
         tx.batch_execute("SET LOCAL session_replication_role = replica")
             .expect("disable immutable-parent trigger for fingerprint fault");
         tx.execute(update, &[&instrument])
@@ -335,6 +336,7 @@ fn contribution_deidentify_shadow_bootstrap_is_exact_replayable_and_fail_closed(
 
     tx.batch_execute("SAVEPOINT missing_binding")
         .expect("savepoint");
+    // replica-mode: throwaway database only (humaux_thread_disposable_<stamp>, migrated to head by `cargo xtask serial-lane` for lane a:disposable, dropped by its --drop-provisioned)
     tx.batch_execute(
         "SET LOCAL session_replication_role = replica; \
          DELETE FROM control.reasoning_route_bindings; \
@@ -348,6 +350,7 @@ fn contribution_deidentify_shadow_bootstrap_is_exact_replayable_and_fail_closed(
 
     tx.batch_execute("SAVEPOINT missing_policy")
         .expect("savepoint");
+    // replica-mode: throwaway database only (humaux_thread_disposable_<stamp>, migrated to head by `cargo xtask serial-lane` for lane a:disposable, dropped by its --drop-provisioned)
     tx.batch_execute(
         "SET LOCAL session_replication_role = replica; \
          DELETE FROM control.reasoning_route_policies; \
@@ -361,6 +364,7 @@ fn contribution_deidentify_shadow_bootstrap_is_exact_replayable_and_fail_closed(
 
     tx.batch_execute("SAVEPOINT missing_candidate")
         .expect("savepoint");
+    // replica-mode: throwaway database only (humaux_thread_disposable_<stamp>, migrated to head by `cargo xtask serial-lane` for lane a:disposable, dropped by its --drop-provisioned)
     tx.batch_execute(
         "SET LOCAL session_replication_role = replica; \
          DELETE FROM control.reasoning_route_candidates; \
@@ -374,6 +378,7 @@ fn contribution_deidentify_shadow_bootstrap_is_exact_replayable_and_fail_closed(
 
     tx.batch_execute("SAVEPOINT profile_receipt_fingerprint_drift")
         .expect("savepoint");
+    // replica-mode: throwaway database only (humaux_thread_disposable_<stamp>, migrated to head by `cargo xtask serial-lane` for lane a:disposable, dropped by its --drop-provisioned)
     tx.batch_execute("SET LOCAL session_replication_role = replica")
         .expect("disable receipt trigger for profile receipt corruption injection");
     tx.execute(
@@ -390,6 +395,7 @@ fn contribution_deidentify_shadow_bootstrap_is_exact_replayable_and_fail_closed(
 
     tx.batch_execute("SAVEPOINT fingerprint_drift")
         .expect("savepoint");
+    // replica-mode: throwaway database only (humaux_thread_disposable_<stamp>, migrated to head by `cargo xtask serial-lane` for lane a:disposable, dropped by its --drop-provisioned)
     tx.batch_execute("SET LOCAL session_replication_role = replica")
         .expect("disable receipt trigger for corruption injection");
     tx.execute(
@@ -406,6 +412,7 @@ fn contribution_deidentify_shadow_bootstrap_is_exact_replayable_and_fail_closed(
 
     tx.batch_execute("SAVEPOINT null_receipt_fingerprint_drift")
         .expect("savepoint");
+    // replica-mode: throwaway database only (humaux_thread_disposable_<stamp>, migrated to head by `cargo xtask serial-lane` for lane a:disposable, dropped by its --drop-provisioned)
     tx.batch_execute("SET LOCAL session_replication_role = replica")
         .expect("disable receipt trigger for null receipt corruption injection");
     tx.execute(

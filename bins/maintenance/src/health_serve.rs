@@ -8,8 +8,9 @@
 //! Called-by: [maintenance::main]
 //! Invariants: [a scrape never runs SQL, it renders the last publish; a failed or stale (> 2 × interval) sample
 //!   answers 503 with the error and the age, never the last good values; the first sample is taken before the
-//!   listener binds; both keys are required with no code default; SIGTERM / SIGINT close the port and exit 0]
-//! Spec: Baseline §41.2; §53.5; §42; §78.1; ADR-0061 D-B; ADR-0061 D-D
+//!   listener binds; both keys are required with no code default; HUMAUX_MIGRATOR_PG_DSN in the environment refuses
+//!   boot before anything else (ADR-0063 D-H); SIGTERM / SIGINT close the port and exit 0]
+//! Spec: Baseline §41.2; §53.5; §42; §78.1; ADR-0061 D-B; ADR-0061 D-D; ADR-0063 D-H
 //!
 //! Exactly one process samples (ADR-0061 D-D): one series per gauge, one EXECUTE grant. The finalized-disclosure
 //! watermark lives here: it starts at process start and advances to each successful sample's `as_of`; a failed
@@ -115,6 +116,7 @@ async fn sample(
 
 /// `health serve`: samples every interval until SIGTERM / SIGINT, serving the last sample on the ops listener.
 pub(crate) async fn serve() -> Result<Output> {
+    resident::refuse_owner_credentials()?;
     let addr = resident::ops_addr(METRICS_ADDR)?;
     let seconds: u64 = env_parsed(SAMPLE_SECONDS)?;
     if seconds == 0 {

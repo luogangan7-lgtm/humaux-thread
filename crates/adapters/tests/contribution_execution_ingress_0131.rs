@@ -71,6 +71,7 @@ fn counts(admin: &mut Client, tenant_id: Uuid, key: &str) -> (i64, i64, i64, i64
 /// still fails closed if storage is corrupted without changing the referenced policy key.
 fn force_same_version_policy_update(admin: &mut Client, tenant_id: Uuid, statement: &str) {
     let mut txn = admin.transaction().expect("policy fault transaction");
+    // replica-mode: fault setup, fixture purged at the end (the test ends with each fixture's `purge()`)
     txn.batch_execute("SET LOCAL session_replication_role='replica'")
         .expect("suppress policy version trigger for bounded fault injection");
     txn.execute(statement, &[&tenant_id])
@@ -362,4 +363,8 @@ fn production_core_is_atomic_v2_complete_and_v1_compatible() {
         counts(&mut legacy.admin, legacy_tenant_id, &legacy_key),
         (1, 1, 1, 1)
     );
+    // The fault rows above are fixture rows of these three tenants: nothing this test planted survives it.
+    race.purge();
+    fixture.purge();
+    legacy.purge();
 }

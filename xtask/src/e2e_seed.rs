@@ -1,25 +1,26 @@
 //! `xtask::e2e_seed` — persistent tenant/credential/quota seed for deployment-point rehearsals.
-//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, postgres, rand, serde_json, time, tokio, uuid];
-//!   services=[PostgreSQL(any) w=[control.api_keys, control.audit_events, control.credentials,
-//!   control.entitlement_snapshots, control.memberships, control.private_reasoning_domains, control.processor_models,
-//!   control.provider_accounts, control.provider_endpoints, control.quota_windows,
-//!   control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings,
-//!   control.reasoning_route_candidates, control.reasoning_route_policies,
-//!   control.retrieval_provider_admission_limits, control.tenants, control.user_emails, control.users,
-//!   control.workspace_memberships, control.workspaces, ops.data_disclosure_sources, ops.data_disclosures, ops.jobs,
-//!   ops.model_call_ledger, ops.outbox, ops.reasoning_account_health_observations,
-//!   ops.reasoning_provider_health_observations, ops.retrieval_provider_budget_allocations,
-//!   ops.retrieval_provider_budget_reservations, private.events, private.evidence_objects, private.memory_evidence,
-//!   private.memory_records, private.processing_runs, private.retrieval_query_sources, projection.family_activations,
-//!   projection.private_memory_points, projection.stream_checkpoints, projection.stream_log,
-//!   projection.tenant_placements] x=[control.onboard_tenant, control.resolve_user_reasoning_admission],
-//!   PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
+//! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, humaux-testkit, postgres, rand, serde_json, time,
+//!   tokio, uuid];
+//!   services=[PostgreSQL(any) r=[control.audit_event_identity, control.audit_events, control.memberships,
+//!   control.quota_windows, control.workspace_memberships, control.workspaces, ops.jobs, ops.model_call_identity,
+//!   ops.schema_migrations, private.event_identity, public.c36_vanishing]
+//!   w=[control.credentials, control.operation_receipts, control.private_reasoning_domains, control.processor_models,
+//!   control.provider_accounts, control.provider_endpoints, control.reasoning_credential_bindings,
+//!   control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates,
+//!   control.reasoning_route_policies, control.retrieval_provider_admission_limits, control.tenants,
+//!   control.usage_reservations, control.user_emails, control.users, ops.model_call_ledger,
+//!   ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations,
+//!   ops.selection_snapshot_items, ops.selection_snapshots, private.conversations, private.events,
+//!   private.evidence_objects, private.memory_evidence, private.memory_records, private.messages]
+//!   x=[control.onboard_tenant, control.resolve_user_reasoning_admission], PostgreSQL(role_maintenance)];
+//!   env=[CARGO_MANIFEST_DIR, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN];
 //!   modules=[adapters::byok, adapters::byok::ssrf, adapters::membership_repo, adapters::postgres, adapters::provisioning, adapters::quota_repo,
-//!   domain::identity, domain::ids, domain::ticket_family, protocol::edge]
+//!   domain::identity, domain::ids, domain::ticket_family, protocol::edge, testkit::fixture_purge]
 //! Called-by: [xtask::e2e_onboard, xtask::main]
 //! Invariants: [a thin wrapper over adapters::provisioning (the same onboarding doors humaux-maintenance uses, no INSERT
 //!   of its own for tenant/workspace/key/tier/placement/collection); refuses any DSN host but 127.0.0.1 and any database
-//!   not named humaux_thread_*; --teardown removes seeded rows explicitly]
+//!   not named humaux_thread_*; --teardown is the one fixture purge (testkit::fixture_purge, ADR-0063 "Dev integrity
+//!   finding") plus the seeded users with constraints enforced, so it leaves no FK orphan]
 //! Spec: Baseline §73.5; ADR-0053; ADR-0059
 //!
 //! xtask `e2e-seed` — persistent tenant/credential/quota seed for deployment-point
@@ -102,6 +103,7 @@ use humaux_domain::identity::MembershipRole;
 use humaux_domain::ids::TenantId;
 use humaux_domain::ticket_family::TicketFamily;
 use humaux_protocol::edge::{api_key_log_fingerprint, compute_api_key_hash};
+use humaux_testkit::fixture_purge::purge_tenant_fixture_sql;
 use postgres::{Client, NoTls};
 use rand::Rng;
 use uuid::Uuid;
@@ -752,21 +754,18 @@ async fn provision(
     })
 }
 
-/// Deletes one tenant's rows in dependency-reverse order — base fixture tables (mirrors
-/// `operation_receipt_fixture.rs` Drop) then the lane (reverse of `seed_lane`, per the
-/// 2026-09-03 addition's explicit order).
+/// `--teardown`: the seeded tenant and every row that depends on it go through the one fixture purge
+/// (`humaux_testkit::fixture_purge`, ADR-0063 "Dev integrity finding" — it replaced a hand-written replica-mode
+/// DELETE list that left FK orphans on dev whenever a table was added). The users the seed onboarded are not tenant
+/// rows: they are deleted afterwards in the same transaction with constraints enforced (the purge restores the
+/// replication role), so a user still referenced elsewhere refuses instead of leaving an orphan. The global
+/// `control.processor_models` catalog row of a lane stays (append-only, `processor_models_identity_immutable`).
 fn teardown(client: &mut Client, tenant_id: Uuid) -> Result<(), String> {
+    let purge = purge_tenant_fixture_sql(&tenant_id.to_string())?;
     let mut txn = client
         .transaction()
         .map_err(|e| format!("begin teardown txn: {}", db_detail(&e)))?;
-    // `ops.reasoning_*_health_observations` are append-only by trigger (§11.2.4-11.2.5 R3).
-    // Superuser test DSN can skip triggers for this row-forward teardown, same shape
-    // `consolidation_hop_e2e.rs::Fixture::drop` uses for the same tables.
-    txn.batch_execute("SET session_replication_role = replica")
-        .map_err(|e| format!("set session_replication_role: {}", db_detail(&e)))?;
-
-    // Captured before memberships are deleted below — the only way back to "which
-    // users did this seed create" once the membership row is gone.
+    // Captured before the purge — the only way back to "which users did this seed create".
     let user_ids: Vec<Uuid> = txn
         .query(
             "SELECT user_id FROM control.memberships WHERE tenant_id=$1",
@@ -776,110 +775,15 @@ fn teardown(client: &mut Client, tenant_id: Uuid) -> Result<(), String> {
         .into_iter()
         .map(|r| r.get(0))
         .collect();
-
-    // Captured before reasoning_profiles is deleted below — needed to tell whether this
-    // tenant's processor_models row(s) go orphaned once its own lane is torn down (card's
-    // "仅本次种的" clause: seed_lane's `ON CONFLICT DO NOTHING` means the row may be shared
-    // with another tenant's seed run, so it is deleted only when no profile references it
-    // any more, never unconditionally).
-    let processor_model_ids: Vec<Uuid> = txn
-        .query(
-            "SELECT DISTINCT processor_model_id FROM control.reasoning_profiles WHERE tenant_id=$1",
-            &[&tenant_id],
-        )
-        .map_err(|e| format!("select seeded processor_model ids: {}", db_detail(&e)))?
-        .into_iter()
-        .map(|r| r.get(0))
-        .collect();
-
-    // Lane, reverse dependency order. Every statement here takes exactly `$1 = tenant_id`.
+    txn.batch_execute(&purge)
+        .map_err(|e| format!("fixture purge: {}", db_detail(&e)))?;
     for sql in [
-        "DELETE FROM ops.reasoning_account_health_observations WHERE tenant_id=$1",
-        "DELETE FROM ops.reasoning_provider_health_observations WHERE tenant_id=$1",
-        "DELETE FROM control.reasoning_route_bindings WHERE tenant_id=$1",
-        "DELETE FROM control.reasoning_route_candidates WHERE tenant_id=$1",
-        "DELETE FROM control.reasoning_route_policies WHERE tenant_id=$1",
-        "DELETE FROM control.reasoning_profiles WHERE tenant_id=$1",
-        "DELETE FROM control.provider_endpoints WHERE tenant_id=$1",
-        "DELETE FROM control.reasoning_credential_bindings WHERE tenant_id=$1",
-        "DELETE FROM control.provider_accounts WHERE tenant_id=$1",
-        "DELETE FROM control.credentials WHERE tenant_id=$1",
-    ] {
-        txn.execute(sql, &[&tenant_id])
-            .map_err(|e| format!("teardown ({sql}): {}", db_detail(&e)))?;
-    }
-    // control.processor_models has no tenant_id (global catalog, `ON CONFLICT DO NOTHING`
-    // insert) — deleted here only for the rows this tenant's lane referenced AND that no
-    // other tenant's reasoning_profiles row references any more (i.e. this run's own catalog
-    // row going orphaned, never a shared one still in use elsewhere).
-    txn.execute(
-        "DELETE FROM control.processor_models pm WHERE pm.processor_model_id = ANY($1) \
-         AND NOT EXISTS (SELECT 1 FROM control.reasoning_profiles rp WHERE rp.processor_model_id = pm.processor_model_id)",
-        &[&processor_model_ids],
-    )
-    .map_err(|e| format!("teardown (processor_models): {}", db_detail(&e)))?;
-
-    // Base fixture tables, reverse dependency order (mirrors operation_receipt_fixture.rs Drop).
-    for sql in [
-        "DELETE FROM projection.private_memory_points WHERE tenant_id=$1",
-        "DELETE FROM projection.tenant_placements WHERE tenant_id=$1",
-        "DELETE FROM projection.stream_log WHERE tenant_id=$1",
-        // Card 28 (ADR-0053): the VerifiedEmpty receipts reference the checkpoint rows.
-        "DELETE FROM projection.family_activations WHERE tenant_id=$1",
-        "DELETE FROM projection.stream_checkpoints WHERE tenant_id=$1",
-        // Distill-hop outputs (ADR-0016) the rehearsal wrote for this tenant after seeding:
-        // disclosure receipts, memories + their PRIMARY links, processing runs, then the
-        // outbox rows and the Evidence they announced.
-        "DELETE FROM ops.data_disclosure_sources WHERE tenant_id=$1",
-        "DELETE FROM ops.data_disclosures WHERE tenant_id=$1",
-        "DELETE FROM ops.retrieval_provider_budget_allocations WHERE tenant_id=$1",
-        "DELETE FROM ops.retrieval_provider_budget_reservations WHERE tenant_id=$1",
-        "DELETE FROM ops.model_call_ledger WHERE tenant_id=$1",
-        "DELETE FROM private.retrieval_query_sources WHERE tenant_id=$1",
-        "DELETE FROM control.retrieval_provider_admission_limits WHERE tenant_id=$1",
-        "DELETE FROM private.memory_evidence WHERE memory_id IN \
-           (SELECT memory_id FROM private.memory_records WHERE tenant_id=$1)",
-        "DELETE FROM private.memory_records WHERE tenant_id=$1",
-        "DELETE FROM private.processing_runs WHERE tenant_id=$1",
-        // Card 27: the 0164 enqueue triggers give every seeded tenant ops.jobs rows, and the
-        // replica-mode delete below skips the ON DELETE CASCADE, so they were left orphaned.
-        "DELETE FROM ops.jobs WHERE tenant_id=$1",
-        "DELETE FROM ops.outbox WHERE tenant_id=$1",
-        "DELETE FROM private.events WHERE event_id IN \
-           (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id=$1)",
-        "DELETE FROM private.evidence_objects WHERE tenant_id=$1",
-        "DELETE FROM control.api_keys WHERE tenant_id=$1",
-        "DELETE FROM control.entitlement_snapshots WHERE tenant_id=$1",
-        "DELETE FROM control.quota_windows WHERE tenant_id=$1",
-        // Card 28: replica mode skips the ON DELETE CASCADE from memberships/workspaces, and
-        // onboarding now writes §77 audit rows for the tenant.
-        "DELETE FROM control.workspace_memberships WHERE tenant_id=$1",
-        "DELETE FROM control.audit_events WHERE tenant_id=$1",
-        "DELETE FROM control.memberships WHERE tenant_id=$1",
-        "DELETE FROM control.workspaces WHERE tenant_id=$1",
-        "DELETE FROM control.private_reasoning_domains WHERE tenant_id=$1",
-    ] {
-        txn.execute(sql, &[&tenant_id])
-            .map_err(|e| format!("teardown ({sql}): {}", db_detail(&e)))?;
-    }
-    txn.execute(
         "DELETE FROM control.user_emails WHERE user_id = ANY($1)",
-        &[&user_ids],
-    )
-    .map_err(|e| format!("teardown user emails: {}", db_detail(&e)))?;
-    txn.execute(
         "DELETE FROM control.users WHERE user_id = ANY($1)",
-        &[&user_ids],
-    )
-    .map_err(|e| format!("teardown users: {}", db_detail(&e)))?;
-    txn.execute(
-        "DELETE FROM control.tenants WHERE tenant_id=$1",
-        &[&tenant_id],
-    )
-    .map_err(|e| format!("teardown tenant: {}", db_detail(&e)))?;
-    txn.batch_execute("SET session_replication_role = DEFAULT")
-        .map_err(|e| format!("reset session_replication_role: {}", db_detail(&e)))?;
-
+    ] {
+        txn.execute(sql, &[&user_ids])
+            .map_err(|e| format!("teardown ({sql}): {}", db_detail(&e)))?;
+    }
     txn.commit()
         .map_err(|e| format!("commit teardown txn: {}", db_detail(&e)))
 }
@@ -1278,7 +1182,9 @@ mod tests {
     };
     use humaux_adapters::byok::ReasoningCapability;
     use humaux_adapters::postgres::MaintenanceDbPool;
+    use humaux_testkit::fixture_purge::{INTEGRITY_EDGES_SQL, purge_tenant_fixture_sql};
     use postgres::{Client, NoTls};
+    use std::collections::BTreeMap;
     use uuid::Uuid;
 
     /// ADR-0059 D-I: one `ref=NAME` entry per seeded lane; a lower-case, empty or punctuated name
@@ -1607,5 +1513,416 @@ mod tests {
             tenant.owner_user_id,
             tenant.reasoning_domain_id,
         ))
+    }
+
+    /// The catalog-driven integrity scan (`INTEGRITY_EDGES_SQL`, the generator `c36_dev_orphan_repair.sh scan` runs
+    /// on dev): one `child|parent|constraint|n` or `identity|table|parent|n` line per violated edge; empty when the
+    /// database is FK-consistent and holds no identity garbage.
+    fn integrity_violations(client: &mut Client) -> Vec<String> {
+        let statements: Vec<String> = client
+            .query(
+                &format!("SELECT scan_sql FROM ({INTEGRITY_EDGES_SQL}) g"),
+                &[],
+            )
+            .expect("integrity edge generator")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        statements
+            .iter()
+            .flat_map(|sql| {
+                client
+                    .query(sql.as_str(), &[])
+                    .expect("integrity scan statement")
+            })
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    /// `table -> rows` with `tenant_id = tenant`, over every table that has the column (none named here).
+    fn tenant_rows(client: &mut Client, tenant: Uuid) -> BTreeMap<String, i64> {
+        let statements: Vec<(String, String)> = client
+            .query(
+                "SELECT c.oid::regclass::text, format('SELECT count(*) FROM %s WHERE tenant_id = $1', c.oid::regclass) \
+                 FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'tenant_id' \
+                   AND NOT a.attisdropped \
+                 WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition",
+                &[],
+            )
+            .expect("tenant_id tables")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        statements
+            .into_iter()
+            .filter_map(|(table, sql)| {
+                let n: i64 = client
+                    .query_one(sql.as_str(), &[&tenant])
+                    .expect("count")
+                    .get(0);
+                (n > 0).then_some((table, n))
+            })
+            .collect()
+    }
+
+    /// The runtime rows a rehearsal leaves after the seed (evidence + event and its identity row, memory + link,
+    /// ledger row + identity, consumed reservation + operation receipt, selection snapshot + item, conversation +
+    /// message). The receipt is written in replica mode (its 0128-style integrity trigger wants a whole committed
+    /// request) and references only rows written here or by onboarding, so the fixture is FK-consistent.
+    fn runtime_residue_sql(tenant: Uuid) -> String {
+        format!(
+            "WITH t AS (SELECT '{tenant}'::uuid AS tenant_id), \
+             w AS (SELECT workspace_id FROM control.workspaces WHERE tenant_id = (SELECT tenant_id FROM t) LIMIT 1), \
+             d AS (SELECT reasoning_domain_id FROM control.private_reasoning_domains \
+                    WHERE tenant_id = (SELECT tenant_id FROM t) LIMIT 1), \
+             q AS (SELECT entitlement_key, window_start FROM control.quota_windows \
+                    WHERE tenant_id = (SELECT tenant_id FROM t) LIMIT 1), \
+             u AS (SELECT user_id FROM control.memberships WHERE tenant_id = (SELECT tenant_id FROM t) LIMIT 1), \
+             e AS (INSERT INTO private.evidence_objects (tenant_id, evidence_kind, payload_sha256, data_class, \
+                     origin_class, visibility_class, reasoning_domain_id) \
+                   SELECT (SELECT tenant_id FROM t), 'EVENT', sha256('purge'::bytea), 'PRIVATE', 'DirectUserInput', \
+                     'TENANT_SHARED', reasoning_domain_id FROM d RETURNING evidence_id), \
+             ev AS (INSERT INTO private.events (event_id, event_kind, payload) \
+                    SELECT evidence_id, 'USER_MESSAGE', '{{}}'::jsonb FROM e RETURNING event_id), \
+             m AS (INSERT INTO private.memory_records (tenant_id, memory_type, content, visibility_class, \
+                     authority_class, confidence, status, asserted_at) \
+                   SELECT tenant_id, 'NOTE', '{{}}'::jsonb, 'TENANT_SHARED', 'PrivateKnowledge', 0.9, 'active', now() \
+                   FROM t RETURNING memory_id), \
+             me AS (INSERT INTO private.memory_evidence (memory_id, evidence_id, role, ordinal) \
+                    SELECT m.memory_id, e.evidence_id, 'PRIMARY', 0 FROM m, e RETURNING 1), \
+             l AS (INSERT INTO ops.model_call_ledger (tenant_id, provider, workspace_id) \
+                   SELECT (SELECT tenant_id FROM t), 'purge-probe', workspace_id FROM w RETURNING 1), \
+             r AS (INSERT INTO control.usage_reservations (request_id, tenant_id, principal_id, entitlement_key, \
+                     window_start, operation, request_fingerprint, units, expires_at, status, finished_at) \
+                   SELECT gen_random_uuid(), (SELECT tenant_id FROM t), u.user_id, q.entitlement_key, q.window_start, \
+                     'memory.remember', encode(sha256('purge'::bytea), 'hex'), 1, now() + interval '1 hour', \
+                     'CONSUMED', now() FROM q, u RETURNING 1), \
+             s AS (INSERT INTO ops.selection_snapshots (tenant_id, query_fingerprint, expires_at) \
+                   SELECT tenant_id, 'purge', now() + interval '1 hour' FROM t RETURNING selection_snapshot_id), \
+             si AS (INSERT INTO ops.selection_snapshot_items (selection_snapshot_id, item_id, tenant_id, ordinal) \
+                    SELECT s.selection_snapshot_id, gen_random_uuid(), (SELECT tenant_id FROM t), 0 FROM s RETURNING 1), \
+             c AS (INSERT INTO private.conversations (tenant_id) SELECT tenant_id FROM t RETURNING conversation_id), \
+             msg AS (INSERT INTO private.messages (tenant_id, conversation_id, event_id) \
+                     SELECT (SELECT tenant_id FROM t), c.conversation_id, ev.event_id FROM c, ev RETURNING 1) \
+             SELECT (SELECT count(*) FROM me) + (SELECT count(*) FROM l) + (SELECT count(*) FROM r) \
+                  + (SELECT count(*) FROM si) + (SELECT count(*) FROM msg); \
+             BEGIN; SET LOCAL session_replication_role = replica; \
+             INSERT INTO control.operation_receipts (tenant_id, principal_id, operation, idempotency_key, \
+               request_fingerprint, request_id, reservation_id, scope_kind, scope_id, domain, projection_kind, \
+               projection_version, stream_seq, commit_seq, audit_event_id, replay_expires_at, evidence_id) \
+             SELECT r.tenant_id, r.principal_id, r.operation, 'purge-probe', r.request_fingerprint, r.request_id, \
+               r.reservation_id, 'tenant', r.tenant_id, 'private_memory', 'PRIVATE_MEMORY', 'v1', 1, 1, \
+               (SELECT a.audit_event_id FROM control.audit_events a WHERE a.tenant_id = r.tenant_id LIMIT 1), \
+               now() + interval '1 day', \
+               (SELECT eo.evidence_id FROM private.evidence_objects eo WHERE eo.tenant_id = r.tenant_id LIMIT 1) \
+             FROM control.usage_reservations r WHERE r.tenant_id = '{tenant}'; \
+             COMMIT;"
+        )
+    }
+
+    /// `private.event_identity` rows of `tenant`'s evidence (the identity table has no `tenant_id`).
+    fn event_identity_rows(client: &mut Client, tenant: Uuid) -> i64 {
+        client
+            .query_one(
+                "SELECT count(*) FROM private.event_identity i \
+                 JOIN private.evidence_objects e ON e.evidence_id = i.event_id WHERE e.tenant_id = $1",
+                &[&tenant],
+            )
+            .expect("event identity rows")
+            .get(0)
+    }
+
+    /// Every migration body in file order on the throwaway `owner` is connected to, as
+    /// `rls_check::tests::migrated_bodies` does (`migrate::run` reads a cwd-relative directory; the manifests are
+    /// `migrate`'s own test).
+    fn apply_every_migration(owner: &mut Client) {
+        owner
+            .batch_execute(
+                "CREATE SCHEMA IF NOT EXISTS ops; CREATE TABLE IF NOT EXISTS ops.schema_migrations \
+                 (migration_id text PRIMARY KEY, checksum text NOT NULL, \
+                  applied_at timestamptz NOT NULL DEFAULT now())",
+            )
+            .expect("ledger bootstrap");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations");
+        let mut bodies: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("migrations dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+            .collect();
+        bodies.sort();
+        for body in bodies {
+            owner
+                .batch_execute(&std::fs::read_to_string(&body).expect("migration body"))
+                .unwrap_or_else(|e| panic!("apply {}: {e:?}", body.display()));
+        }
+    }
+
+    /// A fixture tenant (`e2e-fixture …`, the purge's predicate) on the throwaway.
+    fn fixture_tenant(owner: &mut Client, label: &str) -> Uuid {
+        owner
+            .query_one(
+                "INSERT INTO control.tenants (name) VALUES ($1) RETURNING tenant_id",
+                &[&format!("e2e-fixture purge {label}")],
+            )
+            .expect("fixture tenant")
+            .get(0)
+    }
+
+    fn tenant_exists(owner: &mut Client, tenant: Uuid) -> bool {
+        owner
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM control.tenants WHERE tenant_id = $1)",
+                &[&tenant],
+            )
+            .expect("tenant read")
+            .get(0)
+    }
+
+    /// `humaux_testkit::fixture_purge` sharp edges (2026-10-05 teardown sweep), on a throwaway migrated to head:
+    /// (a) two purges in ONE transaction both commit (the purge drops its own scratch tables); (b) a `tenant_id` table
+    /// dropped by another session while the purge waits on it is refused by name (`relation public.c36_vanishing
+    /// (oid …) vanished while the purge ran`), nothing is purged, and the same purge succeeds afterwards.
+    /// Faults: delete the purge's `DROP TABLE pg_temp.fixture_purge_edges, …` ⇒ (a) raises 42P07 ⇒ red; delete the
+    /// purge's `EXCEPTION WHEN syntax_error …` handler ⇒ (b) raises a bare `relation … does not exist` ⇒ red.
+    #[test]
+    fn purges_share_a_transaction_and_a_vanished_table_is_named() {
+        let Some((_db, dsn)) = crate::migrate::tests::throwaway(
+            "purges_share_a_transaction_and_a_vanished_table_is_named",
+            "purge_edges",
+        ) else {
+            return;
+        };
+        // dep: PostgreSQL(any) — superuser on the throwaway database (migrate, fixture tenants, purges)
+        let mut owner = Client::connect(&dsn, NoTls).expect("owner connect");
+        apply_every_migration(&mut owner);
+
+        let (a, b) = (
+            fixture_tenant(&mut owner, "a"),
+            fixture_tenant(&mut owner, "b"),
+        );
+        let sql = |t: Uuid| purge_tenant_fixture_sql(&t.to_string()).expect("canonical");
+        owner
+            .batch_execute(&format!("BEGIN; {}; {}; COMMIT;", sql(a), sql(b)))
+            .map_err(|e| super::db_detail(&e))
+            .expect("two purges in one transaction");
+        assert!(!tenant_exists(&mut owner, a) && !tenant_exists(&mut owner, b));
+
+        let c = fixture_tenant(&mut owner, "c");
+        owner
+            .batch_execute("CREATE TABLE public.c36_vanishing (tenant_id uuid)")
+            .expect("scratch tenant_id table");
+        // dep: PostgreSQL(any) — a second superuser session that holds, then drops, the scratch table
+        let mut dropper = Client::connect(&dsn, NoTls).expect("dropper connect");
+        dropper
+            .batch_execute("BEGIN; LOCK TABLE public.c36_vanishing IN ACCESS EXCLUSIVE MODE")
+            .expect("hold the scratch table");
+        let purge_dsn = dsn.clone();
+        let purge_c = sql(c);
+        let purging = std::thread::spawn(move || {
+            // dep: PostgreSQL(any) — the purging session
+            let mut purger = Client::connect(&purge_dsn, NoTls).expect("purger connect");
+            purger
+                .batch_execute(&purge_c)
+                .map_err(|e| super::db_detail(&e))
+        });
+        let waited = (0..300).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            owner
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'public.c36_vanishing'::regclass \
+                       AND NOT granted)",
+                    &[],
+                )
+                .expect("lock read")
+                .get::<_, bool>(0)
+        });
+        assert!(waited, "the purge never queued behind the scratch table");
+        dropper
+            .batch_execute("DROP TABLE public.c36_vanishing; COMMIT")
+            .expect("drop while the purge waits");
+        let refused = purging.join().expect("purge thread");
+        match &refused {
+            Err(e)
+                if e.contains("public.c36_vanishing")
+                    && e.contains("vanished while the purge ran") => {}
+            other => panic!("a vanished table must be refused by name: {other:?}"),
+        }
+        assert!(
+            tenant_exists(&mut owner, c),
+            "a refused purge purges nothing"
+        );
+        owner
+            .batch_execute(&sql(c))
+            .map_err(|e| super::db_detail(&e))
+            .expect("the same purge once nothing is dropped under it");
+        assert!(!tenant_exists(&mut owner, c));
+    }
+
+    /// ADR-0063 "Dev integrity finding". On a throwaway migrated to head, a tenant seeded through the real e2e-seed
+    /// path (`provision` with two workspaces, `seed_lane`, `seed_second_domain`) plus [`runtime_residue_sql`] is torn
+    /// down by [`teardown`], next to a decoy fixture tenant and a non-fixture tenant. Afterwards: no row with the
+    /// tenant's id in any `tenant_id` table, the whole-database integrity scan empty (no FK orphan, no identity
+    /// garbage), the decoy's rows untouched, and the purge refuses the non-fixture tenant.
+    /// Faults (ADR-0063): skip `ops.jobs` in the purge's delete loop ⇒ `ops.jobs|control.tenants|
+    /// jobs_tenant_id_fkey|n`; skip the identity tables ⇒ `private.event_identity|private.evidence_objects|…` plus
+    /// `identity|…` lines.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear fixture script (seed -> assert -> teardown -> assert); splitting it hides which seed each assertion reads"
+    )]
+    fn teardown_leaves_no_fk_orphan_and_no_identity_garbage() {
+        let Some((_db, dsn)) = crate::migrate::tests::throwaway(
+            "teardown_leaves_no_fk_orphan_and_no_identity_garbage",
+            "purge",
+        ) else {
+            return;
+        };
+        // dep: PostgreSQL(any) — superuser on the throwaway database (migrate, seed residue, teardown, scan)
+        let mut owner = Client::connect(&dsn, NoTls).expect("owner connect");
+        apply_every_migration(&mut owner);
+        let maintenance_dsn =
+            humaux_testkit::role_login_dsn(&dsn, "role_maintenance", |n| std::env::var(n).ok())
+                .unwrap_or_else(|missing| panic!("missing object: {missing} (ADR-0059 D-D)"));
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        // dep: PostgreSQL(role_maintenance) — the seed's onboarding pool on the throwaway
+        let maintenance = rt
+            .block_on(MaintenanceDbPool::connect(&maintenance_dsn))
+            .expect("maintenance pool");
+        let run = Uuid::new_v4();
+        let qdrant = QdrantFlags {
+            collection: format!("xtask_purge_{}", run.simple()),
+            dimension: 8,
+            host: "127.0.0.1".to_string(),
+            port: 6333,
+            embedding_provider: format!("e2e-seed-{run}"),
+            embedding_region: "cn-shanghai".to_string(),
+        };
+        let scopes = vec!["memory:write".to_string()];
+        let pepper = [7u8; 32];
+        let flags = LaneFlags {
+            egress_processor_id: Uuid::new_v4(),
+            region: "cn-shanghai".to_string(),
+            service_tier: "standard".to_string(),
+            endpoint_ref: format!("https://xtask-purge-{run}.invalid/v1/chat/completions"),
+            provider_id: format!("e2e-seed-{run}"),
+            provider_model_id: "purge-model".to_string(),
+            model_revision: "purge".to_string(),
+            capabilities: vec![ReasoningCapability::Text],
+            account_ref: format!("e2e-seed-account-{run}"),
+            request_extras: super::parse_request_extras("{}").expect("extras"),
+        };
+
+        let seeded = rt
+            .block_on(super::provision(
+                &maintenance,
+                &qdrant,
+                &scopes,
+                1000,
+                &pepper,
+                2,
+            ))
+            .expect("provision (the e2e-seed onboarding path)");
+        let verdict = (|| -> Result<(), String> {
+            let tenant = seeded.tenant.tenant_id;
+            seed_lane(
+                &mut owner,
+                tenant,
+                seeded.tenant.owner_user_id,
+                seeded.tenant.reasoning_domain_id,
+                &flags,
+            )?;
+            super::seed_second_domain(
+                &rt,
+                &maintenance,
+                &mut owner,
+                &seeded.tenant,
+                Some(&flags),
+                &scopes,
+                &pepper,
+            )?;
+            owner
+                .batch_execute(&runtime_residue_sql(tenant))
+                .map_err(|e| format!("tenant residue: {e:?}"))?;
+            let decoy = rt
+                .block_on(onboard_pg_only(&maintenance, &qdrant, &scopes))?
+                .0;
+            owner
+                .batch_execute(&runtime_residue_sql(decoy))
+                .map_err(|e| format!("decoy residue: {e:?}"))?;
+            let foreign: Uuid = owner
+                .query_one(
+                    "INSERT INTO control.tenants (name) VALUES ('acme purge probe') RETURNING tenant_id",
+                    &[],
+                )
+                .map_err(|e| format!("foreign tenant: {e}"))?
+                .get(0);
+            if !integrity_violations(&mut owner).is_empty() {
+                return Err("the seeded throwaway is not FK-consistent before teardown".to_string());
+            }
+
+            let before = tenant_rows(&mut owner, tenant);
+            for table in [
+                "control.audit_events",
+                "control.audit_event_identity",
+                "ops.jobs",
+                "control.usage_reservations",
+                "ops.selection_snapshots",
+                "ops.selection_snapshot_items",
+                "control.workspace_memberships",
+                "control.operation_receipts",
+                "ops.model_call_ledger",
+                "ops.model_call_identity",
+                "control.reasoning_profiles",
+                "private.messages",
+            ] {
+                if !before.contains_key(table) {
+                    return Err(format!("seed left no {table} row to tear down: {before:?}"));
+                }
+            }
+            if event_identity_rows(&mut owner, tenant) == 0 {
+                return Err("seed left no private.event_identity row".to_string());
+            }
+            let decoy_before = (
+                tenant_rows(&mut owner, decoy),
+                event_identity_rows(&mut owner, decoy),
+            );
+            eprintln!(
+                "teardown purge: {} tenant tables seeded: {before:?}",
+                before.len()
+            );
+
+            teardown(&mut owner, tenant)?;
+
+            let violations = integrity_violations(&mut owner);
+            let left = tenant_rows(&mut owner, tenant);
+            if !violations.is_empty() || !left.is_empty() {
+                return Err(format!(
+                    "after teardown: integrity scan {violations:?}, tenant rows left {left:?}"
+                ));
+            }
+            let decoy_after = (
+                tenant_rows(&mut owner, decoy),
+                event_identity_rows(&mut owner, decoy),
+            );
+            if decoy_after != decoy_before {
+                return Err(format!(
+                    "decoy touched: {decoy_before:?} -> {decoy_after:?}"
+                ));
+            }
+            let refusal = purge_tenant_fixture_sql(&foreign.to_string())
+                .and_then(|sql| owner.batch_execute(&sql).map_err(|e| super::db_detail(&e)));
+            match refusal {
+                Err(error) if error.contains("not a fixture tenant") => {}
+                other => return Err(format!("non-fixture tenant not refused: {other:?}")),
+            }
+            if tenant_rows(&mut owner, foreign).get("control.tenants") != Some(&1) {
+                return Err("the refused purge removed the non-fixture tenant".to_string());
+            }
+            teardown(&mut owner, decoy)
+        })();
+        let dropped = super::drop_qdrant_collection(&rt, "127.0.0.1", 6333, &qdrant.collection);
+        verdict.expect("fixture teardown leaves a consistent database");
+        dropped.expect("drop the run's Qdrant collection");
     }
 }

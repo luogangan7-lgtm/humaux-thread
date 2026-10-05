@@ -140,7 +140,7 @@ impl Fixture {
         let mut admin = Client::connect(&admin_dsn, NoTls).expect("admin connect");
         admin
             .execute(
-                "INSERT INTO control.tenants(tenant_id,name,state) VALUES($1,'w2','ACTIVE')",
+                "INSERT INTO control.tenants(tenant_id,name,state) VALUES($1,'e2e-fixture w2','ACTIVE')",
                 &[&tenant],
             )
             .unwrap();

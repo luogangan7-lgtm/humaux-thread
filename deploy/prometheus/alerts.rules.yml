@@ -1,4 +1,4 @@
-# §42 alert rows loaded by cards 34, 34b and 35 (ADR-0061 D-E, ADR-0062 D-S). Each expression is copied literally from the
+# §42 alert rows loaded by cards 34, 34b, 35 and 36 (ADR-0061 D-E, ADR-0062 D-S, ADR-0063 D-F). Each expression is copied literally from the
 # §42 table; metric names and label keys are §41.2 rows (freezes ① and ④, checked by
 # `cargo xtask metrics-registry --check` D8). The other §42 rows wait for a producer and a red
 # record (freeze ②, §80.1); they are listed in ADR-0061 limits.
@@ -75,3 +75,33 @@ groups:
         for: 2m
         labels:
           severity: warning
+
+      # §42 "partition horizon short" (card 36, ADR-0063 D-F): the §48.1 tables have no DEFAULT partition, so the
+      # first insert past the last pre-created month fails with 23514 for every tenant at once — and most
+      # repositories map 23514 to 409/400 (ADR-0063 L15), so the outage itself is invisible to 5xx monitoring. These
+      # three rows are the alarm. `partition_horizon_months{table}` is exported by `humaux-maintenance --serve`'s
+      # PARTITIONS task: 3 right after the monthly `retention create-partitions --months-ahead 3`, 2 during the
+      # following month, <= 1 after one missed run (two months before the outage); -1 for a table with no leaf.
+      - alert: PartitionHorizonShort
+        expr: min by (table) (partition_horizon_months) <= 1
+        for: 1h
+        labels:
+          severity: warning
+
+      # §42 "partition horizon exhausted" (ADR-0063 D-F): the current month's leaf is the last one (or the table has
+      # none), so inserts fail from 00:00 UTC on the next 1st. `for: 600s` is §42's 10m, spelled so the `lag` row
+      # of mutations.sh keeps the only 10-minute `for:` token of this file.
+      - alert: PartitionHorizonExhausted
+        expr: min by (table) (partition_horizon_months) <= 0
+        for: 600s
+        labels:
+          severity: critical
+
+      # §42 "partition horizon absent" (ADR-0063 D-F / D-K): PARTITIONS never succeeded since boot or its last run
+      # failed — a failed run removes every series of the family instead of keeping the last value — or the daemon
+      # is not scraped. The HealthGaugesAbsent shape; only a §41.2 name, no label key.
+      - alert: PartitionHorizonAbsent
+        expr: absent(partition_horizon_months)
+        for: 2h
+        labels:
+          severity: critical

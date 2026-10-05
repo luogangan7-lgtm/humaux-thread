@@ -8,7 +8,7 @@
 //!   control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates,
 //!   control.reasoning_route_policies, control.tenants, control.users, ops.jobs, ops.outbox, ops.provider_slots,
 //!   ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, private.events,
-//!   private.evidence_objects, private.memory_evidence], PostgreSQL(role_maintenance), PostgreSQL(role_private_worker) x=[ops.claim_derived_work_v2],
+//!   private.evidence_objects], PostgreSQL(role_maintenance), PostgreSQL(role_private_worker) x=[ops.claim_derived_work_v2],
 //!   HTTP(loopback), subprocess(humaux-private-worker), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-private-worker,
 //!   HUMAUX_CARD15_TEST_SECRET, HUMAUX_LIVE_P2_KEY_ENV, HUMAUX_PRIVATE_WORKER_CANDIDATE_TTL_SECONDS,
 //!   HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID, HUMAUX_PRIVATE_WORKER_CREDENTIALS,
@@ -27,7 +27,7 @@
 //!   private-worker::distill, private-worker::tests::support::dispatch_fence,
 //!   private-worker::tests::support::double_spend, private-worker::tests::support::live_minimax,
 //!   private-worker::tests::support::live_provider, private-worker::inference_rpc, private-worker::route_providers,
-//!   adapters::byok::ssrf]
+//!   adapters::byok::ssrf, testkit::fixture_purge, testkit::reaped]
 //! Called-by: [cargo-test]
 //! Invariants: [only this file's tenants are ever claimed (foreign scheduler rows are fenced FOR UPDATE); every
 //!   scenario's faults are named in its doc (ADR-0058 records the red→green runs); a fixture deletes its jobs, slots
@@ -64,6 +64,8 @@ use humaux_private_worker::distill::{self, DistillDispatchConfig, DistillDispatc
 use humaux_private_worker::route_providers::{
     self, CREDENTIAL_NOT_MAPPED, EGRESS_RECIPIENTS, REGIONS, RouteProviders,
 };
+use humaux_testkit::fixture_purge::purge_tenant_fixture_sql;
+use humaux_testkit::reaped::{Reaped, SpawnReaped};
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -389,59 +391,32 @@ struct Handle {
 }
 
 impl Drop for Handle {
-    /// Card-31 lesson: the jobs (with the slots they hold) and every data row of this file's
-    /// tenants go in ONE batch whose failure is printed; the tenant rows (referenced by
-    /// append-only audit rows) and the shared user go in a separate best-effort batch.
+    /// Throwaway-tenant cleanup through the one fixture purge (`humaux_testkit::fixture_purge`, ADR-0063 "Dev
+    /// integrity finding"; the replica-mode DELETE list it replaces skipped RI and the identity release triggers and
+    /// left orphans on dev). The slots this file's jobs hold are released first: `ops.provider_slots` rows are global
+    /// and carry no FK, so the purge never reaches them. A failure is printed (that fixture tenant stays, nothing is
+    /// half-deleted); the shared user is not a tenant row and goes last with constraints enforced, best effort.
     fn drop(&mut self) {
         let _ = self.fence.batch_execute("ROLLBACK");
-        let ids = self
-            .tenants
-            .iter()
-            .map(|t| format!("'{}'", t.tenant_id))
-            .collect::<Vec<_>>()
-            .join(",");
-        if ids.is_empty() {
-            return;
-        }
-        let tables: Vec<(String, String)> = match self.admin.query(
-            "SELECT table_schema, table_name FROM information_schema.columns \
-             WHERE column_name = 'tenant_id' \
-               AND table_schema IN ('control','private','ops','projection','staging') \
-               AND table_name <> 'tenants' \
-             ORDER BY table_schema, table_name",
-            &[],
+        let ids: Vec<Uuid> = self.tenants.iter().map(|t| t.tenant_id).collect();
+        if let Err(e) = self.admin.execute(
+            "UPDATE ops.provider_slots SET job_id = NULL, claim_generation = NULL, bound_until = NULL \
+             WHERE job_id IN (SELECT job_id FROM ops.jobs WHERE tenant_id = ANY($1))",
+            &[&ids],
         ) {
-            Ok(rows) => rows.into_iter().map(|r| (r.get(0), r.get(1))).collect(),
-            Err(e) => {
-                eprintln!("derived_dispatch_e2e cleanup: table list failed: {e}");
-                return;
+            eprintln!("derived_dispatch_e2e cleanup: slot release failed: {}", db_detail(&e));
+        }
+        for tenant in &ids {
+            let purged = purge_tenant_fixture_sql(&tenant.to_string())
+                .and_then(|sql| self.admin.batch_execute(&sql).map_err(|e| db_detail(&e)));
+            if let Err(error) = purged {
+                eprintln!("derived_dispatch_e2e cleanup ({tenant}): {error}");
             }
-        };
-        let mut sql = format!(
-            "SET session_replication_role = replica; \
-             UPDATE ops.provider_slots SET job_id = NULL, claim_generation = NULL, bound_until = NULL \
-               WHERE job_id IN (SELECT job_id FROM ops.jobs WHERE tenant_id IN ({ids})); \
-             DELETE FROM private.memory_evidence WHERE memory_id IN \
-               (SELECT memory_id FROM private.memory_records WHERE tenant_id IN ({ids})); \
-             DELETE FROM private.events WHERE event_id IN \
-               (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id IN ({ids})); "
+        }
+        let _ = self.admin.execute(
+            "DELETE FROM control.users WHERE user_id = $1",
+            &[&self.user_id],
         );
-        for (schema, table) in &tables {
-            sql.push_str(&format!(
-                "DELETE FROM {schema}.{table} WHERE tenant_id IN ({ids}); "
-            ));
-        }
-        sql.push_str("SET session_replication_role = DEFAULT;");
-        if let Err(e) = self.admin.batch_execute(&sql) {
-            eprintln!("derived_dispatch_e2e cleanup: jobs/data batch failed: {e}");
-        }
-        if let Err(e) = self.admin.batch_execute(&format!(
-            "DELETE FROM control.tenants WHERE tenant_id IN ({ids}); \
-             DELETE FROM control.users WHERE user_id = '{}';",
-            self.user_id
-        )) {
-            eprintln!("derived_dispatch_e2e cleanup: tenant batch failed (best effort): {e}");
-        }
     }
 }
 
@@ -752,7 +727,7 @@ fn seed_tenant(
     let tenant_id: Uuid = admin
         .query_one(
             "INSERT INTO control.tenants (name, state) VALUES ($1, 'ACTIVE') RETURNING tenant_id",
-            &[&label],
+            &[&format!("e2e-fixture {label}")],
         )?
         .get(0);
     // `control.reasoning_route_policies_check_owner` refuses a policy whose owner has no ACTIVE
@@ -4352,7 +4327,6 @@ fn wait_exit(
         match child.try_wait().expect("poll the worker") {
             Some(status) => return status,
             None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
                 panic!("{what} did not exit within {within:?}");
             }
             None => std::thread::sleep(Duration::from_millis(100)),
@@ -4406,8 +4380,7 @@ fn distill_serve_drains_on(sig: &str, test_name: &'static str) {
             credentials_spec(&mut handle.admin, &tenants, "HUMAUX_CARD15_TEST_SECRET");
         let mut child = distill_serve_command(&dsn, &credentials)
             .arg("--distill-serve")
-            .spawn()
-            .expect("spawn humaux-private-worker --distill-serve");
+            .spawn_reaped("spawn humaux-private-worker --distill-serve");
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
         loop {
             let touched: i64 = handle
@@ -4423,8 +4396,6 @@ fn distill_serve_drains_on(sig: &str, test_name: &'static str) {
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
                 panic!("the distill loop never claimed a job — this test would assert nothing");
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -4489,13 +4460,10 @@ fn sigterm_to_the_inference_rpc_listener_exits_zero() {
                     "HUMAUX_PRIVATE_WORKER_CONSOLIDATION_UID",
                     own_uid().to_string(),
                 )
-                .spawn()
-                .expect("spawn humaux-private-worker --serve-rpc");
+                .spawn_reaped("spawn humaux-private-worker --serve-rpc");
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
             while !std::path::Path::new(&socket_path).exists() {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
                     panic!("the RPC listener never bound {socket_path}");
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -4578,8 +4546,7 @@ fn two_resident_workers_never_overlap_calls_for_one_evidence() {
                     )
                     .env("HUMAUX_PRIVATE_WORKER_DISTILL_MAX_ATTEMPTS", "3")
                     .arg("--distill-serve")
-                    .spawn()
-                    .expect("spawn a resident worker")
+                    .spawn_reaped("spawn a resident worker")
             };
             let mut one = spawn();
             let tenants = handle.tenant_ids();
@@ -5252,12 +5219,11 @@ fn distill_fairness_live() {
         let worker_dsn = dsn_as_role(&handle.dsn, "role_private_worker");
         let live_tenants = handle.tenant_ids();
         let live_map = credentials_spec(&mut handle.admin, &live_tenants, "MINIMAX_API_KEY");
-        let mut workers: Vec<std::process::Child> = (0..2)
+        let mut workers: Vec<Reaped> = (0..2)
             .map(|_| {
                 live_serve_command(&worker_dsn, &key, &live_map)
                     .arg("--distill-serve")
-                    .spawn()
-                    .expect("spawn a live resident worker")
+                    .spawn_reaped("spawn a live resident worker")
             })
             .collect();
         let started = std::time::Instant::now();
@@ -5349,7 +5315,7 @@ fn distill_fairness_live() {
         let live_map = credentials_spec(&mut handle.admin, &live_tenants, "MINIMAX_API_KEY");
         let mut cmd = live_serve_command(&worker_dsn, &key, &live_map);
         m5_env(&mut cmd);
-        let mut victim = cmd.spawn().expect("spawn the kill -9 victim");
+        let mut victim = cmd.spawn_reaped("spawn the kill -9 victim");
         let started = std::time::Instant::now();
         let (uncertain_call, gen_one): (Uuid, i32) = loop {
             let row = handle
@@ -5374,7 +5340,7 @@ fn distill_fairness_live() {
         let killed_at = std::time::Instant::now();
         let mut cmd = live_serve_command(&worker_dsn, &key, &live_map);
         m5_env(&mut cmd);
-        let mut survivor = cmd.spawn().expect("spawn the surviving worker");
+        let mut survivor = cmd.spawn_reaped("spawn the surviving worker");
         let (mut uncertain_with_slot, mut t6) = (false, None::<(Duration, f64, i32)>);
         let m5_done = loop {
             let row = handle

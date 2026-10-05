@@ -1,6 +1,6 @@
 //! `xtask::migrate` — applies migrations/*.sql in filename order against a live PostgreSQL instance (§46).
-//! Depends-on: crates=[humaux-testkit, postgres, toml]; services=[PostgreSQL(any) w=[ops.schema_migrations] x=[private.read_continuity_project_storage_v1]]; env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN]; modules=[xtask::migration_rehearsal]
-//! Called-by: [xtask::e2e_onboard, xtask::main, xtask::serial_lane]
+//! Depends-on: crates=[humaux-testkit, postgres, toml]; services=[PostgreSQL(any) w=[ops.schema_migrations] x=[private.read_continuity_project_storage_v1], subprocess(ps), subprocess(true)]; env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN]; modules=[xtask::migration_rehearsal]
+//! Called-by: [tests, xtask::e2e_onboard, xtask::main, xtask::serial_lane]
 //! Invariants: [each PENDING migration runs in one explicit transaction (ADR-0050 D-D) unless its manifest says
 //!   transaction = "none" (only that value, only for a CONCURRENTLY body; ADR-0052 D-G); DSN missing ⇒ not_applicable
 //!   naming the missing object, never a silent skip; a second run is idempotent; 0011 pending with one of its
@@ -569,7 +569,7 @@ pub fn run(args: &[String]) -> i32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::migration_rehearsal::MigrationClass;
     use humaux_testkit::{ExternalDep, skip_or_fail};
@@ -642,7 +642,7 @@ mod tests {
 
     /// Creates `humaux_thread_c25_<purpose>_<pid>` (dropped `WITH (FORCE)` by the guard) and
     /// returns the guard plus a DSN onto it. `None` = skipped through `skip_or_fail`.
-    fn throwaway(test: &str, purpose: &str) -> Option<(DisposableDatabase, String)> {
+    pub(crate) fn throwaway(test: &str, purpose: &str) -> Option<(DisposableDatabase, String)> {
         let base = base_dsn(test)?;
         // dep: PostgreSQL(any) — superuser from HUMAUX_TEST_PG_DSN — CREATE/DROP DATABASE.
         let mut admin = match Client::connect(&base, NoTls) {
@@ -664,6 +664,7 @@ mod tests {
         admin
             .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
             .expect("drop a leftover throwaway of this pid");
+        drop_dead_leftovers(&mut admin, purpose);
         admin
             .batch_execute(&format!("CREATE DATABASE {name}"))
             .expect("create throwaway database");
@@ -676,6 +677,98 @@ mod tests {
             },
             dsn,
         ))
+    }
+
+    /// A killed test never runs its guard's DROP, so its `humaux_thread_c25_<purpose>_<pid>` stays for good (owner
+    /// disk constraint, 2026-10-05: `humaux_thread_c25_purge_36283`). On creation, every same-purpose leftover whose
+    /// pid is no longer a live process is dropped; a live pid is another running test's database and stays.
+    fn drop_dead_leftovers(admin: &mut Client, purpose: &str) {
+        let prefix = format!("humaux_thread_c25_{purpose}_");
+        let rows = admin
+            .query(
+                "SELECT datname::text FROM pg_database WHERE starts_with(datname, $1)",
+                &[&prefix],
+            )
+            .expect("list leftover throwaways");
+        for row in rows {
+            let leftover: String = row.get(0);
+            // `<purpose>_<other>_<pid>` of a longer purpose is not ours: the suffix must be the pid alone.
+            let Ok(pid) = leftover[prefix.len()..].parse::<u32>() else {
+                continue;
+            };
+            if pid != std::process::id() && !pid_alive(pid) {
+                admin
+                    .batch_execute(&format!("DROP DATABASE IF EXISTS {leftover} WITH (FORCE)"))
+                    .expect("drop a dead test's leftover throwaway");
+                eprintln!("throwaway: dropped {leftover} (pid {pid} is gone)");
+            }
+        }
+    }
+
+    /// `ps -p <pid>`; a `ps` that cannot run counts as alive (keeping a database is the safe error).
+    fn pid_alive(pid: u32) -> bool {
+        // dep: subprocess(ps) — is the pid in a leftover throwaway's name still a process?
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_or(true, |s| s.success())
+    }
+
+    /// A same-purpose leftover of a dead pid is dropped when the next throwaway of that purpose is created; one of a
+    /// live pid (1) and one of a longer purpose stay. Fault: delete the `drop_dead_leftovers` call ⇒ the dead pid's
+    /// database survives ⇒ red.
+    #[test]
+    fn a_dead_pids_leftover_throwaway_is_dropped_on_the_next_create() {
+        let test = "a_dead_pids_leftover_throwaway_is_dropped_on_the_next_create";
+        let Some(base) = base_dsn(test) else {
+            return;
+        };
+        // dep: PostgreSQL(any) — superuser from HUMAUX_TEST_PG_DSN — CREATE/DROP DATABASE.
+        let mut admin = Client::connect(&base, NoTls).expect("admin connect");
+        // dep: subprocess(true) — a pid that is certainly dead once reaped
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let dead = child.id();
+        child.wait().expect("reap true");
+        let leftovers = [
+            format!("humaux_thread_c25_leftover_{dead}"),
+            "humaux_thread_c25_leftover_1".to_owned(),
+            format!("humaux_thread_c25_leftover_x_{dead}"),
+        ];
+        for db in &leftovers {
+            // Two statements: a multi-statement batch is one implicit transaction, and neither may run inside one.
+            admin
+                .batch_execute(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
+                .expect("clear a stale probe");
+            admin
+                .batch_execute(&format!("CREATE DATABASE {db}"))
+                .expect("plant a leftover");
+        }
+        let created = throwaway(test, "leftover");
+        let mut present = |db: &str| -> bool {
+            admin
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)",
+                    &[&db],
+                )
+                .expect("pg_database")
+                .get(0)
+        };
+        let seen: Vec<bool> = leftovers.iter().map(|db| present(db)).collect();
+        drop(created);
+        for db in &leftovers {
+            admin
+                .batch_execute(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
+                .expect("remove the planted leftovers");
+        }
+        assert_eq!(
+            seen,
+            [false, true, true],
+            "dead pid dropped; live pid and other purpose kept"
+        );
     }
 
     fn scalar_bool(client: &mut Client, sql: &str) -> bool {
@@ -725,7 +818,7 @@ mod tests {
     /// panicking test does not take the others down with it.
     static CLUSTER_DDL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct DisposableDatabase {
+    pub(crate) struct DisposableDatabase {
         admin_dsn: String,
         name: String,
         _cluster_ddl: std::sync::MutexGuard<'static, ()>,

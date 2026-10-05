@@ -1,6 +1,6 @@
 //! `adapters::tests::reasoning_route_health_admission` — Focused PostgreSQL 18 gates for Phase 9 R3 exact
 //!   Binding-only admission.
-//! Depends-on: crates=[postgres, uuid]; services=[PostgreSQL(owner) w=[control.contribution_policies,
+//! Depends-on: crates=[humaux-testkit, postgres, uuid]; services=[PostgreSQL(owner) w=[control.contribution_policies,
 //!   control.credentials, control.memberships, control.private_reasoning_domains, control.processor_models,
 //!   control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments,
 //!   control.provider_endpoints, control.reasoning_credential_bindings, control.reasoning_profiles,
@@ -8,12 +8,14 @@
 //!   control.tenants, control.users, ops.data_disclosures, ops.model_call_ledger,
 //!   ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations,
 //!   staging.contribution_candidates] x=[control.resolve_user_reasoning_admission], PostgreSQL(role_private_worker)];
-//!   env=[HUMAUX_TEST_PG_DSN]; modules=[]
+//!   env=[HUMAUX_TEST_PG_DSN]; modules=[testkit::fixture_purge]
 //! Called-by: [cargo-test]
 //! Invariants: [route health and admission are decided only by the SECURITY DEFINER resolver as role_private_worker;
-//!   unhealthy or unbound routes admit nothing; the tests are #[ignore] lane tests]
-//! Spec: none
+//!   unhealthy or unbound routes admit nothing; the tests are #[ignore] lane tests; every replica-mode fault lives in a
+//!   rolled-back case transaction and every seeded lane's tenant is purged when its test ends, panic included]
+//! Spec: ADR-0063 ("Dev integrity finding")
 
+use humaux_testkit::fixture_purge::purge_tenant_fixture_sql;
 use postgres::{Client, GenericClient, NoTls};
 use uuid::Uuid;
 
@@ -44,6 +46,40 @@ fn dsn() -> String {
     std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PostgreSQL 18 DSN")
 }
 
+/// The lanes a test seeded, purged when the test ends (panic included) through the one fixture purge (ADR-0063 "Dev
+/// integrity finding"); a lane's user is not a tenant row and goes afterwards with constraints enforced, best effort.
+/// Declared before the test's connections, so it drops after them and no open transaction holds a lane row.
+#[derive(Default)]
+struct Purge(Vec<(Uuid, Uuid)>);
+
+impl Purge {
+    fn lane(&mut self, lane: Lane) -> Lane {
+        self.0.push((lane.tenant, lane.user));
+        lane
+    }
+}
+
+impl Drop for Purge {
+    fn drop(&mut self) {
+        // dep: PostgreSQL(owner) — purges this test's fixture tenants
+        let mut db = match Client::connect(&dsn(), NoTls) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("reasoning_route_health_admission cleanup: connect failed: {e}");
+                return;
+            }
+        };
+        for (tenant, user) in &self.0 {
+            let purged = purge_tenant_fixture_sql(&tenant.to_string())
+                .and_then(|sql| db.batch_execute(&sql).map_err(|e| e.to_string()));
+            if let Err(e) = purged {
+                eprintln!("reasoning_route_health_admission cleanup ({tenant}): {e}");
+            }
+            let _ = db.execute("DELETE FROM control.users WHERE user_id = $1", &[user]);
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "fixture seeds the complete route health dependency graph in one transaction"
@@ -59,7 +95,7 @@ fn seed_lane(
     let tenant: Uuid = db
         .query_one(
             "INSERT INTO control.tenants(name) VALUES($1) RETURNING tenant_id",
-            &[&format!("r3-{label}-{suffix}")],
+            &[&format!("e2e-fixture r3-{label}-{suffix}")],
         )
         .expect("tenant")
         .get(0);
@@ -335,9 +371,10 @@ fn end_case(db: &mut Client, name: &str) {
     reason = "matrix acceptance test enumerates the complete admission decision surface"
 )]
 fn reasoning_route_health_admission_matrix() {
+    let mut purge = Purge::default();
     // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut db = Client::connect(&dsn(), NoTls).expect("PostgreSQL 18");
-    let lane = seed_lane(&mut db, "matrix", true, true, true);
+    let lane = purge.lane(seed_lane(&mut db, "matrix", true, true, true));
     set_tenant(&mut db, lane.tenant);
 
     assert_eq!(resolve_count(&mut db, &lane), 0, "missing health denies");
@@ -547,6 +584,8 @@ fn reasoning_route_health_admission_matrix() {
     }
 
     begin_case(&mut db, "credential_missing");
+    // replica-mode: fault setup, fixture purged at the end (the case transaction is rolled back; the lane
+    // tenants go through the purge when `purge` drops)
     db.batch_execute("SET LOCAL session_replication_role=replica")
         .expect("fault injection mode");
     db.execute(
@@ -587,6 +626,8 @@ fn reasoning_route_health_admission_matrix() {
     end_case(&mut db, "old_binding");
 
     begin_case(&mut db, "zero_candidate");
+    // replica-mode: fault setup, fixture purged at the end (the case transaction is rolled back; the lane
+    // tenants go through the purge when `purge` drops)
     db.batch_execute("SET LOCAL session_replication_role=replica")
         .expect("fault injection mode");
     db.execute(
@@ -604,6 +645,8 @@ fn reasoning_route_health_admission_matrix() {
         "INSERT INTO control.reasoning_profiles(tenant_id,owner_user_id,provider_account_id,endpoint_id,processor_model_id,credential_ref,billing_account_id,default_billing_instrument_id,capabilities,processing_region) VALUES($1,$2,$3,$4,$5,$6,$7,$8,ARRAY['TEXT'],$9) RETURNING profile_id",
         &[&lane.tenant, &lane.user, &lane.account, &lane.endpoint, &lane.model, &lane.credential, &lane.billing_account, &lane.billing_instrument, &lane.region],
     ).expect("second profile fixture").get(0);
+    // replica-mode: fault setup, fixture purged at the end (the case transaction is rolled back; the lane
+    // tenants go through the purge when `purge` drops)
     db.batch_execute("SET LOCAL session_replication_role=replica")
         .expect("fault injection mode");
     db.execute(
@@ -620,12 +663,13 @@ fn reasoning_route_health_admission_matrix() {
     );
     end_case(&mut db, "two_candidates");
 
-    let shadow = seed_lane(&mut db, "shadow", false, false, true);
+    let shadow = purge.lane(seed_lane(&mut db, "shadow", false, false, true));
     insert_fresh_pair(&mut db, &shadow);
     set_tenant(&mut db, shadow.tenant);
     assert_eq!(resolve_count(&mut db, &shadow), 0, "SHADOW never admits");
 
-    let legacy_null_egress = seed_lane(&mut db, "legacy-null-egress", false, true, false);
+    let legacy_null_egress =
+        purge.lane(seed_lane(&mut db, "legacy-null-egress", false, true, false));
     insert_fresh_pair(&mut db, &legacy_null_egress);
     set_tenant(&mut db, legacy_null_egress.tenant);
     assert_eq!(
@@ -652,10 +696,11 @@ fn reasoning_route_health_admission_matrix() {
     reason = "ACL acceptance test covers append-only and nullable shape cases together"
 )]
 fn reasoning_route_health_acl_append_only_and_null_shape() {
+    let mut purge = Purge::default();
     let dsn = dsn();
     // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut owner = Client::connect(&dsn, NoTls).expect("PostgreSQL 18");
-    let lane = seed_lane(&mut owner, "acl", false, true, true);
+    let lane = purge.lane(seed_lane(&mut owner, "acl", false, true, true));
     set_tenant(&mut owner, lane.tenant);
     insert_fresh_pair(&mut owner, &lane);
     assert_eq!(
@@ -810,9 +855,10 @@ fn reasoning_route_health_acl_append_only_and_null_shape() {
     reason = "ledger acceptance test verifies disclosure, candidate and atomicity invariants together"
 )]
 fn reasoning_attempt_ledger_disclosure_candidate_and_atomicity() {
+    let mut purge = Purge::default();
     // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut db = Client::connect(&dsn(), NoTls).expect("PostgreSQL 18");
-    let lane = seed_lane(&mut db, "ledger", true, true, true);
+    let lane = purge.lane(seed_lane(&mut db, "ledger", true, true, true));
     let egress = lane.egress_processor.expect("provisioned recipient");
     set_tenant(&mut db, lane.tenant);
     insert_fresh_pair(&mut db, &lane);
@@ -1124,10 +1170,11 @@ fn reasoning_attempt_ledger_disclosure_candidate_and_atomicity() {
 #[test]
 #[ignore = "lane(a:shared_db) requires isolated PostgreSQL 18 migrated through 0130"]
 fn reasoning_route_health_statement_snapshot_advances_on_next_call() {
+    let mut purge = Purge::default();
     let dsn = dsn();
     // dep: PostgreSQL(owner) — test opens a direct PG connection for setup/verification
     let mut first = Client::connect(&dsn, NoTls).expect("first connection");
-    let lane = seed_lane(&mut first, "snapshot", false, true, true);
+    let lane = purge.lane(seed_lane(&mut first, "snapshot", false, true, true));
     set_tenant(&mut first, lane.tenant);
     insert_fresh_pair(&mut first, &lane);
     first

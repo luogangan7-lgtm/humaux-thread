@@ -71,7 +71,10 @@ pub fn seed_owner(admin: &mut Client, label: &str) -> Owner {
     let tenant: Uuid = admin
         .query_one(
             "INSERT INTO control.tenants(name,state) VALUES($1,'ACTIVE') RETURNING tenant_id",
-            &[&format!("{label} throwaway tenant {}", Uuid::new_v4())],
+            &[&format!(
+                "e2e-fixture {label} throwaway tenant {}",
+                Uuid::new_v4()
+            )],
         )
         .expect("tenant")
         .get(0);

@@ -739,6 +739,7 @@ fn a_job_linked_by_a_contribution_execution_is_kept() {
             // Seeding only: a real link needs a whole contribution execution; replica mode skips the link's FK
             // and validate triggers for this one insert, while the jobs -> links FK the purge meets stays live.
             let mut txn = h.admin.transaction().expect("txn");
+            // replica-mode: throwaway database only (humaux_thread_c35_doors_<pid>_<n>, created by throwaway_db::create, dropped WITH (FORCE) by ThrowawayDb::drop)
             txn.batch_execute("SET LOCAL session_replication_role = replica")
                 .expect("replica");
             txn.execute(

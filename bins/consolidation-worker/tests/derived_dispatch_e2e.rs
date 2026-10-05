@@ -1,20 +1,20 @@
 //! `consolidation-worker::tests::derived_dispatch_e2e` — ADR-0036 (card 14) acceptance: cross-tenant pending-work
 //!   discovery for the consolidation worker.
 //! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-testkit, postgres, tokio, uuid];
-//!   services=[PostgreSQL(role_consolidation_worker) r=[ops.claim_derived_work, private.memory_consolidation_runs,
-//!   private.memory_rollups] w=[control.credentials, control.memberships, control.private_reasoning_domains,
+//!   services=[PostgreSQL(role_consolidation_worker) r=[ops.claim_derived_work, private.memory_rollups] w=[control.credentials, control.memberships, control.private_reasoning_domains,
 //!   control.processor_models, control.provider_accounts, control.provider_endpoints,
 //!   control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings,
 //!   control.reasoning_route_candidates, control.reasoning_route_policies, control.tenants, control.users, ops.jobs,
-//!   private.events, private.evidence_objects, private.memory_consolidation_inputs, private.memory_evidence,
-//!   private.memory_records, private.memory_rollup_sources] x=[ops.claim_derived_work], UDS(serve),
+//!   private.events, private.evidence_objects, private.memory_evidence,
+//!   private.memory_records] x=[ops.claim_derived_work], UDS(serve),
 //!   subprocess(humaux-consolidation-worker), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-consolidation-worker,
 //!   CONSOLIDATION_WORKER_PG_DSN, HUMAUX_CONSOLIDATION_WORKER_BATCH, HUMAUX_CONSOLIDATION_WORKER_CALL_TTL_SECS,
 //!   HUMAUX_CONSOLIDATION_WORKER_DIAL_TIMEOUT_SECS, HUMAUX_CONSOLIDATION_WORKER_LEASE_SECS,
 //!   HUMAUX_CONSOLIDATION_WORKER_MAX_ATTEMPTS, HUMAUX_CONSOLIDATION_WORKER_MAX_INPUTS,
 //!   HUMAUX_CONSOLIDATION_WORKER_POLL_INTERVAL_SECS, HUMAUX_CONSOLIDATION_WORKER_RPC_SOCKET_PATH,
 //!   HUMAUX_CONSOLIDATION_WORKER_SERVE_METRICS_ADDR, HUMAUX_TEST_PG_DSN]; modules=[adapters::consolidate_repo, adapters::jobs, adapters::postgres,
-//!   application::consolidate, humaux-consolidation-worker, humaux-testkit]
+//!   application::consolidate, humaux-consolidation-worker, humaux-testkit,
+//!   testkit::fixture_purge, testkit::reaped]
 //! Called-by: [cargo-test]
 //! Invariants: [one tenant-less pass completes both tenants' work, claims each job exactly once under RLS, and a
 //!   killed worker's expired lease is re-claimed with the result written once; an isolation-setup failure is a
@@ -52,6 +52,8 @@ use humaux_application::consolidate::{
     SealedPrivateReasoningRequest,
 };
 use humaux_consolidation_worker::{DispatchConfig, build_rollup, dispatch_pass, run_once_bound};
+use humaux_testkit::fixture_purge::purge_tenant_fixture_sql;
+use humaux_testkit::reaped::SpawnReaped;
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
 use std::sync::Mutex;
@@ -141,60 +143,18 @@ struct Handle {
 }
 
 impl Drop for Handle {
-    /// Throwaway-tenant cleanup, verbatim in shape from `tests/consolidation_hop_e2e.rs`:
-    /// `session_replication_role = replica` (superuser test DSN) skips the 0128 append-only
-    /// triggers on the seeded route graph — those rows are deliberately undeletable in
-    /// production — so one pass over every `tenant_id`-carrying table plus the child tables that
-    /// key through a parent is enough. `ops.jobs` is one of those `tenant_id` tables, so the
-    /// jobs 0164's triggers emitted go with the tenant.
+    /// Throwaway-tenant cleanup through the one fixture purge (`humaux_testkit::fixture_purge`, ADR-0063 "Dev
+    /// integrity finding"): every `tenant_id` row, everything that references one through any FK, the identity
+    /// rows, then the tenant — the route graph's 0128 append-only rows and the jobs 0164's triggers emitted
+    /// included. A failure is printed (the fixture tenant stays, nothing is half-deleted). The shared user is not a
+    /// tenant row: deleted last with constraints enforced, best effort.
     fn drop(&mut self) {
-        let Ok(rows) = self.admin.query(
-            "SELECT table_schema, table_name FROM information_schema.columns \
-             WHERE column_name = 'tenant_id' \
-               AND table_schema IN ('control','private','ops','projection','staging') \
-               AND table_name <> 'tenants' \
-             ORDER BY table_schema, table_name",
-            &[],
-        ) else {
-            return;
-        };
-        let tables: Vec<(String, String)> = rows
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
         for tenant in &self.tenants {
             let tenant = tenant.tenant_id;
-            let mut sql = String::from("SET session_replication_role = replica; ");
-            sql.push_str(&format!(
-                "DELETE FROM private.memory_rollup_sources WHERE rollup_id IN \
-                   (SELECT rollup_id FROM private.memory_rollups WHERE tenant_id = '{tenant}'); \
-                 DELETE FROM private.memory_consolidation_inputs WHERE run_id IN \
-                   (SELECT run_id FROM private.memory_consolidation_runs WHERE tenant_id = '{tenant}'); \
-                 DELETE FROM private.memory_evidence WHERE memory_id IN \
-                   (SELECT memory_id FROM private.memory_records WHERE tenant_id = '{tenant}'); \
-                 DELETE FROM private.events WHERE event_id IN \
-                   (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id = '{tenant}'); "
-            ));
-            for (schema, table) in &tables {
-                sql.push_str(&format!(
-                    "DELETE FROM {schema}.{table} WHERE tenant_id = '{tenant}'; "
-                ));
-            }
-            sql.push_str("SET session_replication_role = DEFAULT;");
-            // Card-31 pattern (card 33): jobs and data rows in one batch whose failure is printed;
-            // the tenant row in a separate best-effort batch that cannot roll the job delete back.
-            if let Err(error) = self.admin.batch_execute(&sql) {
-                eprintln!("derived_dispatch_e2e teardown ({tenant}) jobs/data: {error}");
-            }
-            if let Err(error) = self.admin.batch_execute(&format!(
-                "SET session_replication_role = replica; \
-                 DELETE FROM control.tenants WHERE tenant_id = '{tenant}'; \
-                 SET session_replication_role = DEFAULT;"
-            )) {
-                eprintln!("derived_dispatch_e2e teardown ({tenant}) tenant, best effort: {error}");
-                let _ = self
-                    .admin
-                    .batch_execute("SET session_replication_role = DEFAULT");
+            let purged = purge_tenant_fixture_sql(&tenant.to_string())
+                .and_then(|sql| self.admin.batch_execute(&sql).map_err(|e| db_detail(&e)));
+            if let Err(error) = purged {
+                eprintln!("derived_dispatch_e2e teardown ({tenant}): {error}");
             }
         }
         let _ = self.admin.execute(
@@ -256,9 +216,12 @@ impl DbIntegrationFixture for DispatchFixture {
         // a backoff and never parked DEAD.
         let mut tenants = Vec::new();
         for (label, with_binding) in [
-            ("derived_dispatch_e2e tenant A", true),
-            ("derived_dispatch_e2e tenant B", true),
-            ("derived_dispatch_e2e tenant C (no admitted route)", false),
+            ("e2e-fixture derived_dispatch_e2e tenant A", true),
+            ("e2e-fixture derived_dispatch_e2e tenant B", true),
+            (
+                "e2e-fixture derived_dispatch_e2e tenant C (no admitted route)",
+                false,
+            ),
         ] {
             tenants.push(
                 seed_tenant(&mut admin, label, user_id, with_binding)
@@ -1359,8 +1322,7 @@ fn drain_mid_pass_leaves_no_live_lease(signal: &str, test_name: &'static str) {
         let dsn = dsn_as_role(&handle.dsn, "role_consolidation_worker");
         let mut child = serve_command(&dsn, &socket_path.to_string_lossy())
             .arg("--serve")
-            .spawn()
-            .expect("spawn humaux-consolidation-worker --serve");
+            .spawn_reaped("spawn humaux-consolidation-worker --serve");
 
         // Wait for the claim to actually have happened (bounded, monotonic).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -1402,7 +1364,6 @@ fn drain_mid_pass_leaves_no_live_lease(signal: &str, test_name: &'static str) {
             match child.try_wait().expect("poll the worker") {
                 Some(status) => break status,
                 None if std::time::Instant::now() >= exit_deadline => {
-                    let _ = child.kill();
                     panic!("the worker did not exit within 90s of SIG{signal}");
                 }
                 None => std::thread::sleep(std::time::Duration::from_millis(100)),

@@ -3,7 +3,7 @@
 //!   verification only — no IO, no ObjectStore; the adapter-layer export port lives in `adapters::audit_sink`,
 //!   §3/§78.3 keeps this crate free of it).
 //! Depends-on: crates=[sha2, uuid]; services=[]; env=[]; modules=[domain::error, domain::ids]
-//! Called-by: [adapters::audit_sink, adapters::confirm_token_repo, adapters::context_repo, adapters::distill_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::provisioning, adapters::quota_repo, adapters::request_guard_repo, application::auth, gateway::guard, tests]
+//! Called-by: [adapters::audit_sink, adapters::confirm_token_repo, adapters::context_repo, adapters::distill_repo, adapters::maintenance_repo, adapters::memory_governance_repo, adapters::operation_receipt, adapters::provisioning, adapters::quota_repo, adapters::request_guard_repo, application::auth, gateway::guard, tests]
 //! Invariants: []
 //! Spec: Baseline §77
 //!

@@ -1244,6 +1244,7 @@ fn cutover_nonterminal_precheck_is_atomic() {
         }
 
         let ids = (0..9).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        // replica-mode: throwaway database only (humaux_0133_cutover_<uuid>, created and dropped WITH (FORCE) by this test)
         db.batch_execute("SET session_replication_role=replica")
             .expect("fixture trigger bypass");
         db.execute(

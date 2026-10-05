@@ -7,10 +7,12 @@
 //!   PostgreSQL(role_retrieval_worker)]; env=[HUMAUX_TEST_PG_DSN]; modules=[adapters::disclosure,
 //!   adapters::model_call_ledger, adapters::postgres, adapters::tests::support::private_route, application::consolidate,
 //!   domain::dataclass, domain::egress, domain::ids, domain::ledger, humaux-testkit, retrieval-provider::cost,
-//!   retrieval-provider::pricing]
+//!   retrieval-provider::pricing, testkit::fixture_purge]
 //! Called-by: [cargo-test]
 //! Invariants: [each test scopes rows to its own throwaway tenant; reserve/finalize pairs and cost events are
-//!   asserted on real rows; no DSN, unreachable DB or migrations missing is a visible SKIP]
+//!   asserted on real rows; every tenant a test creates (its own and the seed_owner route tenants) is removed at
+//!   teardown by the fixture purge (testkit::fixture_purge), the route owners' users stay; no DSN, unreachable DB or
+//!   migrations missing is a visible SKIP]
 //! Spec: Baseline §19.1; §79.2; ADR-0060 D-I, D-N
 //!
 //! Same convention as `disclosure_ledger.rs`: shared tables,
@@ -34,6 +36,7 @@ use humaux_domain::ids::TenantId;
 use humaux_domain::ledger::ModelCallPurpose;
 use humaux_retrieval_provider::cost::{UsageSnapshot, compute_cost};
 use humaux_retrieval_provider::pricing::{self, PricingVersion};
+use humaux_testkit::fixture_purge::purge_tenant_fixture_sql;
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::error::SqlState;
 use postgres::{Client, NoTls};
@@ -61,16 +64,17 @@ struct Handle {
     retrieval_worker: RetrievalWorkerDbPool,
     admin: Client,
     tenant_id: Uuid,
+    /// The `private_route::seed_owner` tenants this test created (purged by `Drop`).
+    owners: Vec<Uuid>,
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
         // Best-effort cleanup (repo CLAUDE.md hard rule ④). ops.model_call_ledger is
-        // append-only (migrations/0094's guard trigger rejects DELETE unconditionally, even
-        // as `postgres` superuser — BYPASSRLS bypasses row security, not triggers), and
-        // control.tenants is FK-referenced by those rows, so neither is deleted here — same
-        // permanent-across-runs shape `disclosure_ledger.rs`'s own Drop impl documents.
-        // ops.tenant_cost_events carries no such guard, so it is cleaned up.
+        // append-only (migrations/0094's guard trigger rejects a plain DELETE, even as
+        // `postgres` superuser — BYPASSRLS bypasses row security, not triggers), and
+        // control.tenants is FK-referenced by those rows, so both go through the fixture purge
+        // at the end of this Drop. ops.tenant_cost_events carries no such guard.
         let _ = self.admin.execute(
             "DELETE FROM ops.tenant_cost_events WHERE tenant_id = $1",
             &[&self.tenant_id],
@@ -116,6 +120,16 @@ impl Drop for Handle {
                 &[&(superseded_at as f64)],
             );
         }
+        // Every tenant this test created, its append-only ledger rows included, goes through the one fixture purge
+        // (`humaux_testkit::fixture_purge`, ADR-0063 "Dev integrity finding"); one statement per tenant. A failure is
+        // printed (that tenant stays, nothing is half-deleted). The owner users are not tenant rows and stay.
+        for tenant in std::iter::once(self.tenant_id).chain(self.owners.iter().copied()) {
+            let purged = purge_tenant_fixture_sql(&tenant.to_string())
+                .and_then(|sql| self.admin.batch_execute(&sql).map_err(|e| e.to_string()));
+            if let Err(e) = purged {
+                eprintln!("model_call_ledger cleanup ({tenant}): {e}");
+            }
+        }
     }
 }
 
@@ -154,7 +168,8 @@ impl DbIntegrationFixture for LedgerFixture {
         let tenant_id: Uuid = admin
             .query_one(
                 "INSERT INTO control.tenants (name) VALUES ($1) RETURNING tenant_id",
-                &[&"model_call_ledger.rs throwaway tenant"],
+                // The fixture purge's name predicate (`e2e-`), so `Drop` can remove it.
+                &[&"e2e-fixture model_call_ledger.rs throwaway tenant"],
             )
             .map_err(|e| DbFixtureSkipReason::IsolationSetupFailed(e.to_string()))?
             .get(0);
@@ -172,6 +187,7 @@ impl DbIntegrationFixture for LedgerFixture {
             retrieval_worker,
             admin,
             tenant_id,
+            owners: Vec::new(),
         })
     }
 }
@@ -337,6 +353,54 @@ fn reserve_with_the_same_request_id_is_idempotent() {
                 rows, 1,
                 "a retried reserve() must never produce a second row"
             );
+        },
+    );
+}
+
+/// ADR-0063 D-B, ruling E3-b: two writers racing one (tenant_id, request_id) leave exactly one
+/// ledger row and both return it — the second waits on the `model-call-request:` advisory lock,
+/// then finds the first's committed row in its lookup. Fault: drop the writer's lookup ⇒ the
+/// second INSERT hits the identity claim's 23505, which escapes to the caller ⇒ red.
+#[test]
+fn two_concurrent_writers_for_one_key_leave_one_ledger_row() {
+    run_db_fixture::<LedgerFixture, _>(
+        "two_concurrent_writers_for_one_key_leave_one_ledger_row",
+        |mut handle| {
+            let request_id = Uuid::now_v7();
+            let input = ReserveCall {
+                request_id: Some(request_id),
+                tenant_id: handle.tenant_id,
+                workspace_id: None,
+                purpose: Some(ModelCallPurpose::Rerank),
+                provider: "dashscope".to_string(),
+                model: Some("qwen3-rerank".to_string()),
+                model_revision: None,
+                estimated_cost: Some(0.01),
+            };
+            let (a, b) = handle.rt.block_on(async {
+                tokio::join!(
+                    model_call_ledger::reserve_call(&handle.retrieval_worker, &input),
+                    model_call_ledger::reserve_call(&handle.retrieval_worker, &input),
+                )
+            });
+            let (a, b) = (a.expect("first writer"), b.expect("second writer"));
+            assert_eq!(
+                (
+                    a.model_call_id == b.model_call_id,
+                    a.already_reserved ^ b.already_reserved
+                ),
+                (true, true),
+                "both writers return the one reservation; exactly one of them inserted it"
+            );
+            let rows: i64 = handle
+                .admin
+                .query_one(
+                    "SELECT count(*) FROM ops.model_call_ledger WHERE tenant_id = $1 AND request_id = $2",
+                    &[&handle.tenant_id, &request_id],
+                )
+                .expect("count query")
+                .get(0);
+            assert_eq!(rows, 1, "one key, one ledger row");
         },
     );
 }
@@ -878,6 +942,7 @@ fn reserve_routed(
         other => panic!("{other:?} is not a private reasoning purpose"),
     };
     let owner = private_route::seed_owner(&mut handle.admin, "model_call_ledger.rs");
+    handle.owners.push(owner.tenant);
     let caps = ["TEXT", "STRUCTURED_OUTPUT"];
     let profile = private_route::seed_profile(&mut handle.admin, owner, &caps, &caps, 3600.0);
     let binding = private_route::bind(&mut handle.admin, owner, db_purpose, &profile);

@@ -1,0 +1,92 @@
+# §46.1 migration manifest. Card 36, logical-restore finding (2026-10-05) / ADR-0063 "Registry by name": the leaf
+# registry is keyed by name + bounds verified against the catalog; leaf_oid is retired (nullable, cleared, held NULL
+# by a CHECK) and partition_adopt_leaf / partition_drop_check no longer read or write it.
+# Catalog-only checks through to_regclass / to_regprocedure text lookups, so migration-rehearsal can EXPLAIN them
+# against HEAD.
+
+migration_id = "0231_partition_registry_by_name"
+class = "FORWARD_ONLY"
+
+# Refuses unless leaf_oid is still the NOT NULL column of 0224 without the retirement CHECK, both functions exist,
+# and every ATTACHED registry row already resolves by name to an ordinary-table partition of its table_key's parent
+# whose bound equals the row's [lower_bound, upper_bound) (the body names any row that does not).
+precheck = """
+select coalesce((select a.attnotnull from pg_attribute a
+                  where a.attrelid = to_regclass('control.partition_registry') and a.attname = 'leaf_oid'
+                    and not a.attisdropped), false)
+ and not exists (select 1 from pg_constraint co
+                  where co.conrelid = to_regclass('control.partition_registry')
+                    and co.conname = 'partition_registry_leaf_oid_retired')
+ and to_regprocedure('control.partition_adopt_leaf(text,regclass)') is not null
+ and to_regprocedure('control.partition_drop_check(uuid,uuid)') is not null
+ and not exists (
+       select 1 from control.partition_registry g
+        where g.state = 'ATTACHED'
+          and not exists (
+                select 1
+                  from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                  join pg_inherits i on i.inhrelid = c.oid
+                 where c.oid = to_regclass(g.leaf_name) and c.relkind = 'r'
+                   and format('%I.%I', n.nspname, c.relname) = g.leaf_name
+                   and i.inhparent = (select p.parent from control.partition_parent(g.table_key) p)
+                   and pg_get_expr(c.relpartbound, c.oid)
+                       = format('FOR VALUES FROM (%s) TO (%s)', coalesce(quote_literal(g.lower_bound), 'MINVALUE'),
+                                quote_literal(g.upper_bound))))
+ as precheck_ok
+"""
+
+# Fails on: leaf_oid still NOT NULL, or without its validated `CHECK ((leaf_oid IS NULL))`; UNIQUE (leaf_name) gone;
+# any function body outside pg_catalog / information_schema that still names leaf_oid; either replaced function with
+# another owner, SECURITY attribute, SET list or any EXECUTE grantee, or without the registry_catalog_mismatch
+# refusal; an ATTACHED registry row that does not match its leaf by name and bounds; a leaf of a partitioned table
+# without an ATTACHED registry row of its name.
+postcheck = """
+select
+ coalesce((select not a.attnotnull from pg_attribute a
+            where a.attrelid = to_regclass('control.partition_registry') and a.attname = 'leaf_oid'
+              and not a.attisdropped), false)
+ and exists (select 1 from pg_constraint co
+              where co.conrelid = to_regclass('control.partition_registry') and co.contype = 'c'
+                and co.conname = 'partition_registry_leaf_oid_retired' and co.convalidated
+                and pg_get_constraintdef(co.oid) = 'CHECK ((leaf_oid IS NULL))')
+ and exists (select 1 from pg_constraint co
+              where co.conrelid = to_regclass('control.partition_registry') and co.contype = 'u'
+                and co.conkey = array[(select a.attnum from pg_attribute a
+                                        where a.attrelid = to_regclass('control.partition_registry')
+                                          and a.attname = 'leaf_name')])
+ and not exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+                  where n.nspname not in ('pg_catalog', 'information_schema') and p.prosrc ~ 'leaf_oid')
+ and (select count(*) = 2 from pg_proc p
+       where p.oid in (to_regprocedure('control.partition_adopt_leaf(text,regclass)'),
+                       to_regprocedure('control.partition_drop_check(uuid,uuid)'))
+         and pg_get_userbyid(p.proowner) = 'role_migration_owner'
+         and p.prosecdef = (p.proname = 'partition_adopt_leaf')
+         and coalesce(p.proconfig, array[]::text[])
+             = case when p.proname = 'partition_drop_check' then array['search_path=pg_catalog', 'row_security=off']
+                    else array['search_path=pg_catalog'] end
+         and p.prosrc ~ 'retention refused: registry_catalog_mismatch'
+         and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                          where x.grantee <> p.proowner and x.privilege_type = 'EXECUTE'))
+ and not exists (
+       select 1 from control.partition_registry g
+        where g.state = 'ATTACHED'
+          and not exists (
+                select 1
+                  from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                  join pg_inherits i on i.inhrelid = c.oid
+                 where c.oid = to_regclass(g.leaf_name) and c.relkind = 'r'
+                   and format('%I.%I', n.nspname, c.relname) = g.leaf_name
+                   and i.inhparent = (select p.parent from control.partition_parent(g.table_key) p)
+                   and pg_get_expr(c.relpartbound, c.oid)
+                       = format('FOR VALUES FROM (%s) TO (%s)', coalesce(quote_literal(g.lower_bound), 'MINVALUE'),
+                                quote_literal(g.upper_bound))))
+ and not exists (
+       select 1 from pg_partitioned_table pt join pg_inherits i on i.inhparent = pt.partrelid
+         join pg_class c on c.oid = i.inhrelid join pg_namespace n on n.oid = c.relnamespace
+        where not exists (select 1 from control.partition_registry g
+                           where g.state = 'ATTACHED' and g.leaf_name = format('%I.%I', n.nspname, c.relname)))
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only (FORWARD_ONLY, §46.1; no fake down migration). Before COMMIT any failure rolls the single transaction back and leaves the registry and both functions as 0224 made them. After COMMIT: a forward migration; re-introducing a stored OID would re-break the ADR-0063 D-M rollback (a logical restore renumbers relations), so the registry stays keyed by name + bounds."
+backup_restore_requirement = "pg_dump before apply (ADR-0063 D-M): the only row data written is control.partition_registry.leaf_oid set to NULL (one row per leaf); a dump taken before or after this migration restores into a database that passes rls-check's partition arm without any rebind step."

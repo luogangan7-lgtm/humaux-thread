@@ -1,0 +1,60 @@
+# §46.1 migration manifest. Card 36 S2 / ADR-0063 D-D: ops.stage_runs converted to a RANGE (started_at) parent with
+# one leaf adopted from the heap and the current UTC month plus 3 pre-created.
+# ADR-0063 D-D 7b: catalog-only checks through to_regclass text lookups, so migration-rehearsal can EXPLAIN them
+# against HEAD; the row-count and fingerprint comparisons are the body's own last DO block (7a).
+
+migration_id = "0225_partition_stage_runs"
+class = "FORWARD_ONLY"
+
+# Refuses unless ops.stage_runs is still a plain heap that no view, BEGIN ATOMIC body or FK depends on, and the 0224
+# creator exists.
+precheck = """
+select coalesce((select c.relkind = 'r' from pg_class c where c.oid = to_regclass('ops.stage_runs')), false)
+ and to_regprocedure('control.partition_create_month(text,timestamptz)') is not null
+ and not exists (select 1 from pg_depend d
+                  where d.refobjid = to_regclass('ops.stage_runs')
+                    and d.classid in ('pg_rewrite'::regclass, 'pg_proc'::regclass))
+ and not exists (select 1 from pg_constraint co
+                  where co.contype = 'f' and co.confrelid = to_regclass('ops.stage_runs'))
+ as precheck_ok
+"""
+
+# Fails on: not a RANGE parent; a DEFAULT partition; a leaf not owned by role_migration_owner, without RLS + FORCE,
+# with a policy set other than the parent's, or with any ACL entry for another role (table or column); registry
+# ATTACHED rows not equal to pg_inherits; a horizon short of the current UTC month + 4; an FK into the parent.
+postcheck = """
+select
+ coalesce((select c.relkind = 'p' from pg_class c where c.oid = to_regclass('ops.stage_runs')), false)
+ and (select count(*) >= 4 from pg_inherits i where i.inhparent = to_regclass('ops.stage_runs'))
+ and not exists (
+       select 1 from pg_inherits i join pg_class l on l.oid = i.inhrelid
+        where i.inhparent = to_regclass('ops.stage_runs')
+          and (pg_get_expr(l.relpartbound, l.oid) = 'DEFAULT'
+               or not l.relrowsecurity or not l.relforcerowsecurity
+               or pg_get_userbyid(l.relowner) <> 'role_migration_owner'
+               or exists (select 1 from aclexplode(coalesce(l.relacl, acldefault('r', l.relowner))) x
+                           where x.grantee <> l.relowner)
+               or exists (select 1 from pg_attribute a, aclexplode(a.attacl) x where a.attrelid = l.oid)
+               or (select array_agg(format('%s %s %s %s %s %s', p.polname, p.polcmd, p.polpermissive, p.polroles,
+                                           pg_get_expr(p.polqual, p.polrelid), pg_get_expr(p.polwithcheck, p.polrelid))
+                                    order by p.polname)
+                     from pg_policy p where p.polrelid = l.oid)
+                  is distinct from
+                  (select array_agg(format('%s %s %s %s %s %s', p.polname, p.polcmd, p.polpermissive, p.polroles,
+                                           pg_get_expr(p.polqual, p.polrelid), pg_get_expr(p.polwithcheck, p.polrelid))
+                                    order by p.polname)
+                     from pg_policy p where p.polrelid = to_regclass('ops.stage_runs'))))
+ and (select array_agg(i.inhrelid order by i.inhrelid) from pg_inherits i
+       where i.inhparent = to_regclass('ops.stage_runs'))
+     = (select array_agg(r.leaf_oid order by r.leaf_oid) from control.partition_registry r
+         where r.table_key = 'STAGE_RUNS' and r.state = 'ATTACHED')
+ and (select max(r.upper_bound) from control.partition_registry r
+       where r.table_key = 'STAGE_RUNS' and r.state = 'ATTACHED')
+     >= date_add(date_trunc('month', now(), 'UTC'), interval '4 months', 'UTC')
+ and not exists (select 1 from pg_constraint co
+                  where co.contype = 'f' and co.confrelid = to_regclass('ops.stage_runs'))
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only (FORWARD_ONLY, §46.1; no fake down migration). Before COMMIT any failure rolls the single transaction back and leaves the heap untouched. After COMMIT: restore the pre-apply pg_dump into a fresh database and swap names (ADR-0063 D-M runbook), or a forward migration."
+backup_restore_requirement = "pg_dump before apply (ADR-0063 D-M): the heap's own relfilenode becomes the leaf; no row is copied, rewritten or deleted, and the body's last DO block refuses any count or catalog-fingerprint drift."

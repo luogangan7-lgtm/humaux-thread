@@ -571,3 +571,35 @@ fixture) unless the row says otherwise; nothing purges, LOSTs, reissues or re-dr
   Consolidating them gives `crates/testkit` its first runtime dependency and rewires twelve test files, beyond a
   contained change; upgrade: one testkit module with the strictest semantics and a cluster-wide advisory lock.
 - **E8 operator step**: the shared dev database's residue waits for runbook §5.2 (backup, impact, `sweep once`).
+
+## Addendum 2026-10-05 (card 36, ADR-0063): the receipts table is partitioned; the daemon gains PARTITIONS
+
+- **L11 / E6 closed.** Migration 0227 (ADR-0063 D-D) turned `ops.maintenance_receipts` into a RANGE (`ran_at`)
+  parent under its own name: PK `(receipt_id, ran_at)`, the heap became one leaf, the current UTC month plus three
+  future months are pre-created, no DEFAULT partition, every leaf sealed (FORCE RLS with the parent's tenant policy
+  verbatim, zero runtime grants). The four purge doors of D-E..D-J are unchanged: each still writes its one receipt
+  row in the same statement, through the parent, which routes it to the current month's leaf; no door names a leaf.
+  Nothing references the table, so it has no identity table (ADR-0063 L10). Its retention is an ordinary
+  `MAINTENANCE_RECEIPTS` policy (whole months for all tenants, no hold; runbook §5.4).
+- **What a missed horizon does here.** Once the last pre-created month is past, a purge door's receipt insert fails
+  with 23514, so the door's single statement deletes nothing and the daemon answers 503 (D-A) — fail closed, never
+  a delete without a receipt. The alarm is ADR-0063's `PartitionHorizonShort / Exhausted / Absent`, one to two
+  months earlier.
+- **D-C gains one cluster-level task, `partitions`** (ADR-0063 D-K): `HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS`
+  (required, no default), no tenant page and no LIMIT key. It runs once per due run, counts
+  `maintenance_task_runs_total{task="partitions"}` once per run (not per tenant), and only writes the two proposal
+  columns of `control.partition_registry`. The closed DELETE-door set rls-check pins (D-R) is unchanged; the daemon holds no DDL
+  and no owner path.
+- **Boot refusal.** `--serve` (and `health serve`) exit 2 when `HUMAUX_MIGRATOR_PG_DSN` is in their environment
+  (ADR-0063 D-H): the shared env file of this ADR's L4 must not carry the superuser migrator DSN.
+
+## Addendum 2026-10-05 — ruling E12-b: the enumerate regression bar is ratio-only
+
+Card 36's verification showed that the absolute bar `first_p95_ms < 0.6 × B.first_p95_ms` depends on host load, not on
+the code: the same tree measured 9.4–9.6 s (card 35 chain), 16.6 s (a verifier overlapping its own reruns; the bare floor
+scan doubled to 1.2 s) and 12.9 s on an idle but slower day (floor 748 ms, a 25 ms margin against the bar), while the
+ratio `first_p95 / floor_p95` of each run stayed at 13.8–17.3. `enumerate_first_page_scales_with_a_capped_manifest` now
+asserts three bars: (a) `ratio_after ≤ 0.6 × ratio_B` (= 19.75 against baseline B's 32.92; it replaces the absolute bar
+and subsumes the former `ratio × 1.5 ≤ ratio_B`), (c) `later_p95_ms < 300`, (d) `manifest_rows == cap`. The uncapped
+per-id loop still reds (a) at a ratio of about 33. Absolute first-page times and `target_300ms=not_met` stay on the `ENUM`
+line; the 300 ms target itself remains card 35b's acceptance.

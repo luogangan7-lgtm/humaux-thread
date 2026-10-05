@@ -1,7 +1,8 @@
 //! `maintenance::serve` — `humaux-maintenance --serve`, the resident maintenance daemon (ADR-0062): every cycle
 //!   runs each due task over one tenant page, one transaction and one door call per tenant, and serves its
 //!   readiness on its own loopback ops listener (the eighth `(job, mode)` pair, ADR-0061 D-B); and `sweep once`,
-//!   the same tasks for one page with cadence ignored (D-Q).
+//!   the same tasks for one page with cadence ignored (D-Q). The cluster-level PARTITIONS task (ADR-0063 D-K) runs once
+//!   per due run without a tenant page: it proposes candidate leaves and publishes `partition_horizon_months`.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-telemetry, serde_json, tokio, uuid];
 //!   services=[PostgreSQL(role_maintenance)]; env=[CARGO_PKG_VERSION, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS,
 //!   HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS,
@@ -10,7 +11,8 @@
 //!   HUMAUX_MAINTENANCE_SERVE_JOBS_DONE_RETENTION_SECONDS, HUMAUX_MAINTENANCE_SERVE_JOBS_EVERY_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_JOBS_LIMIT, HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_LOST_EVERY_SECONDS, HUMAUX_MAINTENANCE_SERVE_LOST_LIMIT,
-//!   HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR, HUMAUX_MAINTENANCE_SERVE_PROVIDER_BUDGETS_EVERY_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR, HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_PROVIDER_BUDGETS_EVERY_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_PROVIDER_BUDGETS_LIMIT, HUMAUX_MAINTENANCE_SERVE_QUOTA_RESERVATIONS_EVERY_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_QUOTA_RESERVATIONS_LIMIT, HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_EVERY_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_IDLE_SECONDS, HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_LIMIT,
@@ -23,7 +25,8 @@
 //!   adapters::provider_budget, adapters::quota_repo, adapters::stream_repo, domain::ids, telemetry::metrics,
 //!   maintenance::main, maintenance::resident]
 //! Called-by: [maintenance::main]
-//! Invariants: [every key is required with no code default and checked before any connection; LOST_AFTER must
+//! Invariants: [HUMAUX_MIGRATOR_PG_DSN in the environment refuses boot before anything else (ADR-0063 D-H); every
+//!   key is required with no code default and checked before any connection; LOST_AFTER must
 //!   exceed the gateway's projection-lag key; only the first connect is boot-fatal, every later failure is logged,
 //!   kept for /status and answered 503 while the loop goes on; every call is bounded by CYCLE_SECONDS on the server
 //!   and the client; the signal latch is checked between calls, so SIGTERM never waits out a cycle; it never
@@ -33,7 +36,8 @@
 //!   the daemon's system identity (`--serve`) or the operator's fields (`sweep once`); `sweep once` requires the §77
 //!   fields like every writing subcommand]
 //! Spec: Baseline §4.2; §6.2.1; §15.2; §41.2; §77; §78.1; ADR-0037; ADR-0043; ADR-0057 D-F; ADR-0057 D-H;
-//!   ADR-0061 D-B; ADR-0062 D-A..D-D; ADR-0062 D-E..D-J; ADR-0062 D-L; ADR-0062 D-N; ADR-0062 D-P; ADR-0062 D-Q
+//!   ADR-0061 D-B; ADR-0062 D-A..D-D; ADR-0062 D-E..D-J; ADR-0062 D-L; ADR-0062 D-N; ADR-0062 D-P; ADR-0062 D-Q;
+//!   ADR-0063 D-H
 //!
 //! Metrics: `maintenance_task_runs_total{task,outcome}` and `maintenance_task_rows_total{task}` (ADR-0062 D-S),
 //!   counted once per tenant door call through `adapters::maintenance_repo::count_task_call`, served by `/metrics`
@@ -44,7 +48,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use humaux_adapters::maintenance_repo::{
-    self, JobRetention, MaintenanceTask as Task, TaskOutcome, count_task_call,
+    self, JobRetention, MaintenanceTask as Task, PartitionTable, TaskOutcome, count_task_call,
 };
 use humaux_adapters::membership_repo::AdminAction;
 use humaux_adapters::postgres::MaintenanceDbPool;
@@ -102,12 +106,14 @@ const fn every_key(task: Task) -> &'static str {
         Task::Jobs => "HUMAUX_MAINTENANCE_SERVE_JOBS_EVERY_SECONDS",
         Task::Reissue => "HUMAUX_MAINTENANCE_SERVE_REISSUE_EVERY_SECONDS",
         Task::Redrive => "HUMAUX_MAINTENANCE_SERVE_REDRIVE_EVERY_SECONDS",
+        Task::Partitions => "HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS",
     }
 }
 
-/// ADR-0062 D-C: the LIMIT of a task's per-tenant statement (> 0).
-const fn limit_key(task: Task) -> &'static str {
-    match task {
+/// ADR-0062 D-C: the LIMIT of a task's per-tenant statement (> 0); `None` for the cluster-level PARTITIONS task
+/// (ADR-0063 D-K: one statement over a few hundred registry rows, no tenant page).
+const fn limit_key(task: Task) -> Option<&'static str> {
+    Some(match task {
         Task::Lost => "HUMAUX_MAINTENANCE_SERVE_LOST_LIMIT",
         Task::QuotaReservations => "HUMAUX_MAINTENANCE_SERVE_QUOTA_RESERVATIONS_LIMIT",
         Task::ProviderBudgets => "HUMAUX_MAINTENANCE_SERVE_PROVIDER_BUDGETS_LIMIT",
@@ -117,7 +123,8 @@ const fn limit_key(task: Task) -> &'static str {
         Task::Jobs => "HUMAUX_MAINTENANCE_SERVE_JOBS_LIMIT",
         Task::Reissue => "HUMAUX_MAINTENANCE_SERVE_REISSUE_LIMIT",
         Task::Redrive => "HUMAUX_MAINTENANCE_SERVE_REDRIVE_LIMIT",
-    }
+        Task::Partitions => return None,
+    })
 }
 
 /// Which resident shape reads the keys: `sweep once` ignores cadence, so it reads no `*_EVERY_SECONDS`.
@@ -173,7 +180,10 @@ impl Config {
                     every_key(task)
                 )));
             }
-            *slot = (every, positive(limit_key(task))?);
+            *slot = (
+                every,
+                limit_key(task).map(positive).transpose()?.unwrap_or(0),
+            );
         }
         let lost_after: u64 = positive(LOST_AFTER_SECONDS)?;
         let lag: u64 = env_parsed(PROJECTION_LAG_SECONDS)?;
@@ -304,6 +314,32 @@ async fn call(
         .await
         .map(i64::unsigned_abs)
         .map_err(|e| e.to_string()),
+        // Cluster-level: [`partitions`] runs it once per run, never per tenant.
+        Task::Partitions => Err("PARTITIONS has no tenant call".to_owned()),
+    }
+}
+
+/// ADR-0063 D-K: one PARTITIONS run, counted once (not per tenant). Success publishes the horizon of every closed
+/// table_key; a failure first removes the whole family (D-F: `PartitionHorizonAbsent` fires, never a stale value).
+async fn partitions(pool: &MaintenanceDbPool, cfg: &Config, run: &mut Run) {
+    // dep: PostgreSQL(role_maintenance) — control.partition_registry proposal UPDATE + horizon read (adapters::maintenance_repo)
+    let done =
+        match tokio::time::timeout(cfg.cycle, maintenance_repo::propose_partitions(pool)).await {
+            Ok(Ok(done)) => Ok(done),
+            Ok(Err(e)) => Err(format!("partitions: {e}")),
+            Err(_) => Err(format!("partitions: no answer within {CYCLE_SECONDS}")),
+        };
+    match done {
+        Ok(done) => {
+            maintenance_repo::set_partition_horizon_months(done.horizon_months);
+            count_task_call(Task::Partitions, Some(done.proposed));
+            run.affected += done.proposed;
+        }
+        Err(e) => {
+            maintenance_repo::reset_partition_horizon_months();
+            count_task_call(Task::Partitions, None);
+            run.fail(e);
+        }
     }
 }
 
@@ -331,6 +367,11 @@ async fn cycle(
         }
         run.ran = true;
         cursor.last_run = Some(Instant::now());
+        if task == Task::Partitions {
+            partitions(pool, cfg, &mut run).await;
+            runs.push((task, run));
+            continue;
+        }
         // ponytail: per-task tenant page rotation, latency = ceil(tenants / TENANTS_PER_RUN) x EVERY; a "tenants
         // with work" definer per task if rotation latency matters (ADR-0062 L1).
         let page = tokio::time::timeout(
@@ -427,6 +468,19 @@ pub(crate) fn render_metrics() -> String {
         &names,
         |i| maintenance_repo::maintenance_task_rows_total(Task::ALL[i]) as f64,
     );
+    // ADR-0063 D-K: every closed key while the last PARTITIONS run succeeded, no sample otherwise (the header stays,
+    // so `--metrics-families` names the family at zero state).
+    let tables = PartitionTable::ALL.map(PartitionTable::label);
+    let horizon: Vec<(&[&'static str], f64)> = maintenance_repo::partition_horizon_months()
+        .map(|months| {
+            tables
+                .iter()
+                .zip(months)
+                .map(|(t, m)| (std::slice::from_ref(t), m as f64))
+                .collect()
+        })
+        .unwrap_or_default();
+    write_family(&mut out, &families::PARTITION_HORIZON_MONTHS, &horizon);
     out
 }
 
@@ -467,6 +521,7 @@ fn status(shared: &Shared, cycle: Duration, started: SystemTime) -> String {
 
 /// `--serve`: runs cycles until SIGTERM / SIGINT, serving readiness and the last cycle on the ops listener.
 pub(crate) async fn serve() -> Result<Output> {
+    resident::refuse_owner_credentials()?;
     let started = SystemTime::now();
     let addr = resident::ops_addr(METRICS_ADDR)?;
     let cfg = Config::read(Mode::Serve)?;

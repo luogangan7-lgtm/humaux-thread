@@ -97,10 +97,10 @@ serde = { version = "1", features = ["derive"] }
 # `domain::evidence::payload_sha256` (§48.0①/§78 "唯一构造点"); reusing it here for an
 # unrelated fingerprint would blur what it identifies. Same version pin as
 # `humaux-domain`/`humaux-application`'s existing `sha2` uses.
-# why: content fingerprint hashing; used-by: [adapters::consolidate_repo, adapters::context_repo]
+# why: content fingerprint hashing; used-by: [adapters::consolidate_repo, adapters::context_repo, adapters::maintenance_repo]
 sha2 = "0.11"
 # §12.1.1: printable scanner artifact and payload digests; already resolved in the lockfile.
-# why: printable digest/scanner-artifact encoding; used-by: [adapters::contribution_entry_repo]
+# why: printable digest/scanner-artifact encoding; used-by: [adapters::contribution_entry_repo, adapters::maintenance_repo]
 hex = "0.4"
 # T4.4/T4.5 `byok.rs` (§11.1/§11.2.1): `CredentialRef`/`ReasoningDomainId` mint new ids
 # directly via `Uuid::now_v7()`, same minting convention `domain::ids`'s `uuid_newtype!` macro

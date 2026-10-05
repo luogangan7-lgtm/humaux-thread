@@ -1,8 +1,8 @@
 //! `xtask::rls_check` — G80-26 (§48.2) runtime DB role invariant CI enumeration gate.
-//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.confirm_tokens, control.contribution_confirmations, control.credential_pepper_state, control.memberships, control.operation_receipts, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.claim_derived_work, ops.contribution_execution_job_links, ops.data_disclosures, ops.deletion_plan_steps, ops.distill_calls, ops.distill_tenant_scheduler, ops.email_delivery_events, ops.email_domains, ops.email_outbox, ops.email_provider_health, ops.email_suppressions, ops.jobs, ops.maintenance_receipts, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.provider_arbiters, ops.provider_slots, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.schema_migrations, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.processing_gaps, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.ticket_reissues, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[ops.jobs, ops.outbox, private.ingest_tickets] x=[control.api_key_rehash, control.assert_write_scope, control.attest_reasoning_route_health, control.bind_reasoning_domain, control.credential_pepper_epoch, control.credential_pepper_epoch_advance, control.credential_pepper_epoch_close, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.maintenance_tenant_page, control.observe_reasoning_route_health, control.onboard_tenant, control.onboard_workspace, control.purge_idle_rate_buckets, control.reasoning_credential_accounts, control.reasoning_profile_capabilities, control.reasoning_profile_request_extras, control.reasoning_route_health_state, control.reasoning_route_status, control.register_reasoning_profile, control.resolve_user_reasoning_admission, control.revoke_api_key, control.set_reasoning_profile_enabled, control.sweep_confirm_tokens, ops.admin_probe_snapshot, ops.admit_distill_budget, ops.auto_redrive_schema_failed, ops.begin_call, ops.c35_fault_definer_trigger, ops.c35_fault_invoker_delete, ops.c35_fault_outbox_door, ops.claim_derived_work, ops.claim_derived_work_v2, ops.contribution_reservation_authority_validate, ops.distill_scheduler_admit, ops.distill_slots_all_bound, ops.finish_derived_work_v2, ops.health_snapshot, ops.purge_expired_selection_snapshots, ops.purge_terminal_jobs, ops.renew_lease, ops.requeue_dead_distill, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.reissue_unsettled_tickets, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal, staging.require_phase9_exact_assessed_storage_binding], PostgreSQL(role_gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_GATEWAY_PG_DSN, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
+//! Depends-on: crates=[postgres]; services=[PostgreSQL(any) r=[control.anonymous_claim_trust_authorities, control.anonymous_source_lineage, control.audit_event_identity, control.confirm_tokens, control.contribution_confirmations, control.credential_pepper_state, control.memberships, control.operation_receipts, control.partition_registry, control.processor_models, control.provider_accounts, control.provider_billing_accounts, control.provider_billing_instruments, control.provider_endpoints, control.public_moderator_grants, control.quota_windows, control.rate_buckets, control.reasoning_credential_bindings, control.reasoning_profiles, control.reasoning_route_bindings, control.reasoning_route_candidates, control.reasoning_route_domain_receipts, control.reasoning_route_policies, control.reasoning_route_profile_receipts, control.retention_policies, control.usage_reservations, control.workspace_memberships, control.workspaces, ops.anonymous_public_revocations, ops.c36_scratch, ops.claim_derived_work, ops.contribution_execution_job_links, ops.data_disclosures, ops.deletion_plan_steps, ops.distill_calls, ops.distill_tenant_scheduler, ops.email_delivery_events, ops.email_domains, ops.email_outbox, ops.email_provider_health, ops.email_suppressions, ops.jobs, ops.maintenance_receipts, ops.mechanism_e2e_runs, ops.mechanism_observations, ops.memory_lifecycle_events, ops.model_call_identity, ops.model_call_ledger, ops.outbox, ops.private_inference_rpc_calls, ops.provider_arbiters, ops.provider_slots, ops.public_anonymous_dispatches, ops.public_release_revocations, ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations, ops.retrieval_embedding_rpc_calls, ops.retrieval_provider_budget_allocations, ops.retrieval_provider_budget_reservations, ops.schema_migrations, ops.stage_runs, ops.stage_runs_default, ops.stage_runs_p209901, ops.xtask_fx_domain_owner, ops.xtask_fx_domain_table, private.any_fourth_relation, private.comment_only, private.continuity_facet_evidence_links, private.continuity_facet_memory_links, private.continuity_facet_slots, private.continuity_facet_versions, private.continuity_projects, private.contribution_execution_future_probe, private.contribution_execution_sources, private.contribution_executions, private.distill_candidates, private.event_identity, private.events, private.evidence_affects, private.evidence_objects, private.evidence_subjects, private.lower, private.memory_affects, private.memory_consolidation_inputs, private.memory_consolidation_runs, private.memory_evidence, private.memory_records, private.memory_rollup_sources, private.memory_rollup_subjects, private.memory_rollups, private.memory_subject_mentions, private.memory_subject_visibility_ok, private.memory_subjects, private.read_continuity_project_storage_v1, private.retrieval_query_sources, private.some_new_table, private.some_untracked_table, private.subject_keys, private.subject_roles, private.subjects, private.task_binding_grants, projection.claim_issued_tickets, projection.family_activations, projection.processing_gaps, projection.retire_failed_ticket, projection.stream_checkpoints, projection.stream_log, projection.stream_point_ledger, projection.tenant_placements, projection.ticket_reissues, projection.unplaced_issued_tickets, public.anonymous_claim_trust_receipts, public.anonymous_source_authority_events, public.anonymous_source_lifecycle_events, public.claim_independence_attestations, public.claim_trust_evaluation_sources, public.claim_trust_evaluations, public.current_anonymous_source_objects, public.eligible_objects, public.poisoning_signals, staging.contribution_candidate_phase9_assessments, staging.contribution_candidate_sources, staging.contribution_candidates, staging.contribution_release_sources, staging.contribution_releases, staging.sanitized_public_candidates] w=[control.partition_registry, ops.jobs, ops.outbox, private.ingest_tickets] x=[control.api_key_rehash, control.assert_write_scope, control.attest_reasoning_route_health, control.audit_event_identity_claim, control.audit_event_identity_release, control.bind_reasoning_domain, control.credential_pepper_epoch, control.credential_pepper_epoch_advance, control.credential_pepper_epoch_close, control.current_reasoning_route_binding, control.ensure_admission_tier, control.ensure_user, control.issue_api_key, control.maintenance_tenant_page, control.observe_reasoning_route_health, control.onboard_tenant, control.onboard_workspace, control.partition_adopt_leaf, control.partition_catalog_fingerprint, control.partition_create_month, control.partition_drop, control.partition_drop_check, control.partition_drop_statements, control.partition_parent, control.purge_idle_rate_buckets, control.reasoning_credential_accounts, control.reasoning_profile_capabilities, control.reasoning_profile_request_extras, control.reasoning_route_health_state, control.reasoning_route_status, control.register_reasoning_profile, control.reject_partition_key_update, control.resolve_user_reasoning_admission, control.retention_policy_approve, control.revoke_api_key, control.set_reasoning_profile_enabled, control.sweep_confirm_tokens, ops.admin_probe_snapshot, ops.admit_distill_budget, ops.auto_redrive_schema_failed, ops.begin_call, ops.c35_fault_definer_trigger, ops.c35_fault_invoker_delete, ops.c35_fault_outbox_door, ops.claim_derived_work, ops.claim_derived_work_v2, ops.contribution_reservation_authority_validate, ops.distill_scheduler_admit, ops.distill_slots_all_bound, ops.finish_derived_work_v2, ops.health_snapshot, ops.model_call_identity_claim, ops.purge_expired_selection_snapshots, ops.purge_terminal_jobs, ops.renew_lease, ops.requeue_dead_distill, private.assert_contribution_prepared_route_shape, private.assert_current_contribution_reservation_authority, private.commit_contribution_candidate, private.complete_contribution_a_exact, private.complete_contribution_b_exact, private.compute_contribution_source_backing_closure_v1, private.contribution_execution_closure_seal_immutable, private.contribution_unregistered_fixture, private.enqueue_contribution_execution, private.event_identity_claim, private.event_identity_release, private.mark_contribution_reconciliation_required, private.memory_subject_visibility_ok, private.publish_continuity_facet, private.read_continuity_project_storage_v1, private.register_continuity_project, private.require_contribution_execution_lease, private.require_contribution_source_manifest, private.reserve_contribution_a, private.reserve_contribution_b, private.reserve_contribution_execution_call, private.settle_contribution_job_if_live, private.settle_contribution_terminal_job, private.visibility_allowed, projection.activate_empty_family, projection.claim_issued_tickets, projection.ensure_tenant_placement, projection.reissue_unsettled_tickets, projection.retire_failed_ticket, projection.stream_checkpoints_workspace_write_gate, projection.stream_log_guard_state_transition, projection.stream_point_ledger, projection.unplaced_issued_tickets, public.guard_evaluated_source_identity, public.public_receipt_matches, public.require_trust_root_seal, staging.require_phase9_exact_assessed_storage_binding], PostgreSQL(role_gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_GATEWAY_PG_DSN, HUMAUX_REQUIRE_DB, HUMAUX_TEST_PG_DSN]; modules=[]
 //! Called-by: [xtask::dep_map, xtask::main]
 //! Invariants: [any catalog cell that disagrees with §48.2 / §62 grants is fail, named by role and table]
-//! Spec: Baseline §48.2; §62; §6.2.0; §6.2.2; ADR-0061 D-D
+//! Spec: Baseline §48.2; §62; §6.2.0; §6.2.2; ADR-0061 D-D; ADR-0063 D-L
 //!
 //! xtask `rls-check` — G80-26 (§48.2 Runtime DB Role Invariant CI enumeration gate),
 //! folding in §62's tenant RLS policy template. §48.2's own text: "上面四项只覆盖 RLS
@@ -1041,6 +1041,15 @@ const MATRIX: &[Cell] = &[
     // 0220 (ADR-0062 D-N): the once-per-retirement markers are written only by the reissue door, in the same
     // transaction as the ticket; the daemon's role reads them, nobody else touches them.
     cell!("projection.ticket_reissues", "role_maintenance", ["SELECT"]),
+    // 0224 (ADR-0063 D-C): the daemon reads the policies and the leaf registry and writes only its two proposal
+    // columns; drops, receipts and approvals are owner functions no runtime role can execute.
+    cell!("control.retention_policies", "role_maintenance", ["SELECT"]),
+    cell!(
+        "control.partition_registry",
+        "role_maintenance",
+        ["SELECT"],
+        [("UPDATE", ["proposed_at", "proposed_policy_revision"])]
+    ),
 ];
 
 // 0120 is an additive observation-window seam, not a rewrite of the frozen §6.2.2 header.
@@ -1472,6 +1481,14 @@ const NAMED_NO_NON_OWNER_GRANTS: &[&str] = &[
     "ops.email_provider_health",
     // 0202 (ADR-0059 D-H): the pepper epoch moves only through the role_maintenance definer.
     "control.credential_pepper_state",
+    // 0228 (ADR-0063 D-B): the event identity rows are written only by the owner claim / release triggers.
+    "private.event_identity",
+    // 0229 (ADR-0063 D-B): the audit identity rows are written only by the claim / release triggers of
+    // control.audit_events, whose only writer is the owner definer control.audit_event_insert.
+    "control.audit_event_identity",
+    // 0230 (ADR-0063 D-B): the ledger identity rows are written only by the owner claim trigger of
+    // ops.model_call_ledger; the five referencers reach them only through their FKs.
+    "ops.model_call_identity",
 ];
 
 /// The §6.2.2 column set — "T" in the §48.2 "表集合派生" check's `S \ T == ∅`. Single
@@ -2412,8 +2429,11 @@ pub fn check_grant_equality(client: &mut impl GenericClient) -> GateResult {
 pub fn check_domain_default_grants(client: &mut impl GenericClient) -> GateResult {
     let t = named_tables();
     let all_tables: Vec<(String, String, String)> = match client.query(
-        "SELECT schemaname, tablename, tableowner FROM pg_tables \
-         WHERE schemaname = ANY($1)",
+        // ADR-0063 D-L: leaves carry no grant by design; check_partition_leaves owns them.
+        "SELECT t.schemaname, t.tablename, t.tableowner FROM pg_tables t \
+         JOIN pg_namespace n ON n.nspname = t.schemaname \
+         JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.tablename \
+         WHERE t.schemaname = ANY($1) AND NOT c.relispartition",
         &[&SCHEMAS.to_vec()],
     ) {
         Ok(rows) => rows
@@ -2543,8 +2563,12 @@ pub fn check_forbidden_verbs(client: &mut impl GenericClient) -> GateResult {
         }
     }
 
+    // ADR-0063 D-L: leaf ownership is check_partition_leaves's (owner role_migration_owner, exactly).
     let owned: Vec<(String, String, String)> = match client.query(
-        "SELECT schemaname, tablename, tableowner FROM pg_tables",
+        "SELECT t.schemaname, t.tablename, t.tableowner FROM pg_tables t \
+         JOIN pg_namespace n ON n.nspname = t.schemaname \
+         JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.tablename \
+         WHERE NOT c.relispartition",
         &[],
     ) {
         Ok(rows) => rows
@@ -4329,6 +4353,221 @@ pub fn check_maintenance_delete_doors(client: &mut impl GenericClient) -> GateRe
     }
 }
 
+/// ADR-0063 D-L (migration 0224, card 36): the partition machinery's functions. None is executable by any role but
+/// its owner (PUBLIC included): only superusers (migrate, the retention executor) and the owner call them.
+const PARTITION_FUNCTIONS: [&str; 14] = [
+    "control.partition_parent(text)",
+    "control.partition_catalog_fingerprint(text)",
+    "control.partition_create_month(text,timestamptz)",
+    "control.partition_adopt_leaf(text,regclass)",
+    "control.partition_drop_statements(uuid)",
+    "control.partition_drop_check(uuid,uuid)",
+    "control.partition_drop(uuid,uuid,bigint,text,text)",
+    "control.retention_policy_approve(text,integer,timestamptz,text)",
+    "control.reject_partition_key_update()",
+    // 0228 (ADR-0063 D-B): the private.events identity claim / release triggers.
+    "private.event_identity_claim()",
+    "private.event_identity_release()",
+    // 0229 (ADR-0063 D-B): the control.audit_events identity claim / release triggers.
+    "control.audit_event_identity_claim()",
+    "control.audit_event_identity_release()",
+    // 0230 (ADR-0063 D-B): the ops.model_call_ledger identity claim (dedupe) trigger.
+    "ops.model_call_identity_claim()",
+];
+
+/// ADR-0063 D-G / F11: the two hold-reading functions stay invoker with `row_security=off`; as definers they would
+/// read the holds as the FORCE-RLS-blind owner and see "nothing unsettled".
+const PARTITION_INVOKER_FUNCTIONS: [&str; 2] = [
+    "control.partition_drop_check(uuid,uuid)",
+    "control.partition_drop(uuid,uuid,bigint,text,text)",
+];
+
+/// Every leaf of every partitioned table in [`SCHEMAS`]: (parent, leaf, problem) rows, one per violated D-L rule.
+/// Policy expressions of both sides are deparsed against the parent: a policy naming its own table (private.events,
+/// 0228) otherwise deparses under each leaf's own name.
+// ponytail: deparsing a leaf's policy against its parent assumes equal column numbers (true for every leaf until a
+// parent drops a column); compare through an attname map if a §48.1 parent ever drops one.
+const PARTITION_LEAF_PROBLEMS_SQL: &str = r"
+WITH leaves AS (
+  SELECT p.oid AS parent_oid, format('%I.%I', pn.nspname, p.relname) AS parent,
+         l.oid AS leaf_oid, format('%I.%I', ln.nspname, l.relname) AS leaf, l.relowner, l.relacl,
+         l.relrowsecurity, l.relforcerowsecurity
+    FROM pg_partitioned_table pt
+    JOIN pg_class p ON p.oid = pt.partrelid JOIN pg_namespace pn ON pn.oid = p.relnamespace
+    JOIN pg_inherits i ON i.inhparent = p.oid
+    JOIN pg_class l ON l.oid = i.inhrelid JOIN pg_namespace ln ON ln.oid = l.relnamespace
+   WHERE pn.nspname = ANY($1)
+), pol AS (
+  SELECT polrelid, polname, polcmd, polpermissive,
+         (SELECT array_agg(r ORDER BY r) FROM unnest(polroles) r) AS roles, polqual, polwithcheck
+    FROM pg_policy
+)
+SELECT leaf, 'not owned by role_migration_owner (owner ' || pg_get_userbyid(relowner) || ')'
+  FROM leaves WHERE pg_get_userbyid(relowner) <> 'role_migration_owner'
+UNION ALL
+SELECT leaf, 'RLS not enabled and forced' FROM leaves WHERE NOT (relrowsecurity AND relforcerowsecurity)
+UNION ALL
+SELECT leaf, 'policy set differs from its parent ' || parent FROM leaves l
+ WHERE EXISTS (SELECT polname, polcmd, polpermissive, roles, pg_get_expr(polqual, l.parent_oid), pg_get_expr(polwithcheck, l.parent_oid)
+                 FROM pol WHERE polrelid = l.parent_oid
+               EXCEPT SELECT polname, polcmd, polpermissive, roles, pg_get_expr(polqual, l.parent_oid), pg_get_expr(polwithcheck, l.parent_oid)
+                 FROM pol WHERE polrelid = l.leaf_oid)
+    OR EXISTS (SELECT polname, polcmd, polpermissive, roles, pg_get_expr(polqual, l.parent_oid), pg_get_expr(polwithcheck, l.parent_oid)
+                 FROM pol WHERE polrelid = l.leaf_oid
+               EXCEPT SELECT polname, polcmd, polpermissive, roles, pg_get_expr(polqual, l.parent_oid), pg_get_expr(polwithcheck, l.parent_oid)
+                 FROM pol WHERE polrelid = l.parent_oid)
+UNION ALL
+SELECT leaf, 'grants ' || x.privilege_type || ' to ' ||
+             CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee)::text END
+  FROM leaves, aclexplode(relacl) x WHERE x.grantee <> relowner
+UNION ALL
+SELECT leaf, 'grants column ' || a.attname || ' ' || x.privilege_type || ' to ' ||
+             CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee)::text END
+  FROM leaves l JOIN pg_attribute a ON a.attrelid = l.leaf_oid CROSS JOIN LATERAL aclexplode(a.attacl) x
+ WHERE x.grantee <> l.relowner
+UNION ALL
+SELECT leaf, 'misses its parent''s statement trigger ' || t.tgname FROM leaves l
+  JOIN pg_trigger t ON t.tgrelid = l.parent_oid AND NOT t.tgisinternal AND (t.tgtype & 1) = 0
+ WHERE NOT EXISTS (SELECT 1 FROM pg_trigger s WHERE s.tgrelid = l.leaf_oid AND s.tgname = t.tgname
+                     AND s.tgfoid = t.tgfoid AND s.tgtype = t.tgtype)
+";
+
+/// Registry ATTACHED rows versus `pg_inherits` by (name, parent, bounds), both directions; never a relation OID, which
+/// a logical restore renumbers (ADR-0063 "Registry by name", 0231). One text, shared with the maintenance witness
+/// `registry_survives_a_logical_dump_and_restore`.
+const PARTITION_REGISTRY_DRIFT_SQL: &str =
+    include_str!("../../crates/testkit/sql/partition_registry_drift.sql");
+
+/// [`check_partition_leaves`]'s function half: owner, executors, and the invoker rule of the two hold readers.
+fn partition_function_problems(client: &mut impl GenericClient, problems: &mut Vec<String>) {
+    match client.query(
+        "SELECT p.oid::regprocedure::text, pg_get_userbyid(p.proowner), p.prosecdef,
+                'row_security=off' = ANY(coalesce(p.proconfig, ARRAY[]::text[])),
+                ARRAY(SELECT CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee)::text END
+                        FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                       WHERE x.privilege_type = 'EXECUTE' AND x.grantee <> p.proowner ORDER BY 1),
+                to_regprocedure(f) = ANY(ARRAY(SELECT to_regprocedure(i) FROM unnest($2::text[]) i))
+           FROM unnest($1::text[]) AS f JOIN pg_proc p ON p.oid = to_regprocedure(f)",
+        &[
+            &PARTITION_FUNCTIONS.to_vec(),
+            &PARTITION_INVOKER_FUNCTIONS.to_vec(),
+        ],
+    ) {
+        Ok(rows) => {
+            for r in &rows {
+                let (sig, owner, definer, rls_off, executors, invoker): (
+                    String,
+                    String,
+                    bool,
+                    bool,
+                    Vec<String>,
+                    bool,
+                ) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5));
+                if owner != OWNER_ROLE {
+                    problems.push(format!("{sig}: owner {owner}, expected {OWNER_ROLE}"));
+                }
+                if !executors.is_empty() {
+                    problems.push(format!(
+                        "{sig}: EXECUTE held by {executors:?}; only its owner may execute it"
+                    ));
+                }
+                if invoker && (definer || !rls_off) {
+                    problems.push(format!(
+                        "{sig}: must be SECURITY INVOKER with row_security=off (definer={definer}, \
+                         row_security_off={rls_off}) — a definer reads holds as the RLS-blind owner"
+                    ));
+                }
+            }
+        }
+        Err(error) => problems.push(format!("function scan failed: {error}")),
+    }
+}
+
+/// ADR-0063 D-L (migration 0224, card 36): the partition-leaf arm. Runtime roles reach §48.1 rows only through the
+/// parents, so every leaf must be sealed exactly like its parent and registered:
+///
+/// * no DEFAULT partition anywhere (D-F: it would hide a horizon miss and forbids a row-free month creation);
+/// * every leaf owned by `role_migration_owner`, RLS enabled and FORCEd, with its parent's policy set verbatim
+///   (name, command, permissive, roles, USING, WITH CHECK) and its parent's statement-level triggers (F9: not
+///   cloned by PostgreSQL);
+/// * no ACL entry on a leaf (table or column) for any role but its owner, PUBLIC included;
+/// * `control.partition_registry` ATTACHED rows equal `pg_inherits` by (name, parent, bounds), never by OID (0231);
+/// * no foreign key references a partitioned table (D-B: FKs point at the identity tables);
+/// * the machinery's functions have no executor but their owner, and the two hold readers stay SECURITY INVOKER
+///   with `row_security=off`.
+///
+/// The domain-default and forbidden-verb scans skip leaves (`relispartition`): this arm owns them. A database
+/// before 0224 ⇒ `not_applicable` naming the missing object (§57.1).
+pub fn check_partition_leaves(client: &mut impl GenericClient) -> GateResult {
+    let check = "ADR-0063 partition leaves";
+    let missing: Vec<String> = match client.query(
+        "SELECT f FROM unnest($1::text[]) AS f WHERE to_regprocedure(f) IS NULL
+         UNION ALL SELECT 'control.partition_registry' WHERE to_regclass('control.partition_registry') IS NULL",
+        &[&PARTITION_FUNCTIONS.to_vec()],
+    ) {
+        Ok(rows) => rows.iter().map(|r| r.get(0)).collect(),
+        Err(error) => return fail(check, format!("catalog probe failed: {error}")),
+    };
+    if !missing.is_empty() {
+        return not_applicable(check, format!("missing object: {}", missing.join(", ")));
+    }
+    let schemas = SCHEMAS.to_vec();
+    let mut problems = Vec::new();
+    let queries: [(&str, &str); 4] = [
+        (
+            "SELECT p.oid::regclass::text, 'has a DEFAULT partition ' || pt.partdefid::regclass::text
+               FROM pg_partitioned_table pt JOIN pg_class p ON p.oid = pt.partrelid
+               JOIN pg_namespace n ON n.oid = p.relnamespace
+              WHERE n.nspname = ANY($1) AND pt.partdefid <> 0",
+            "DEFAULT partition",
+        ),
+        (PARTITION_LEAF_PROBLEMS_SQL, "leaf"),
+        (PARTITION_REGISTRY_DRIFT_SQL, "registry"),
+        (
+            "SELECT c.conrelid::regclass::text, 'foreign key ' || c.conname || ' references partitioned '
+                    || c.confrelid::regclass::text
+               FROM pg_constraint c JOIN pg_partitioned_table pt ON pt.partrelid = c.confrelid
+               JOIN pg_class p ON p.oid = c.confrelid JOIN pg_namespace n ON n.oid = p.relnamespace
+              WHERE c.contype = 'f' AND n.nspname = ANY($1)",
+            "foreign key",
+        ),
+    ];
+    for (sql, what) in queries {
+        match client.query(sql, &[&schemas]) {
+            Ok(rows) => problems.extend(
+                rows.iter()
+                    .map(|r| format!("{}: {}", r.get::<_, String>(0), r.get::<_, String>(1))),
+            ),
+            Err(error) => problems.push(format!("{what} scan failed: {error}")),
+        }
+    }
+    partition_function_problems(client, &mut problems);
+    let counts = client.query_one(
+        "SELECT count(DISTINCT pt.partrelid), count(i.inhrelid)
+           FROM pg_partitioned_table pt JOIN pg_class p ON p.oid = pt.partrelid
+           JOIN pg_namespace n ON n.oid = p.relnamespace LEFT JOIN pg_inherits i ON i.inhparent = pt.partrelid
+          WHERE n.nspname = ANY($1)",
+        &[&schemas],
+    );
+    let (parents, leaves): (i64, i64) = match counts {
+        Ok(row) => (row.get(0), row.get(1)),
+        Err(error) => return fail(check, format!("count failed: {error}")),
+    };
+    if problems.is_empty() {
+        pass(
+            check,
+            format!(
+                "partition leaves: {leaves} leaves under {parents} parents sealed; {} partition functions \
+                 owner-only, {} hold readers invoker with row_security=off",
+                PARTITION_FUNCTIONS.len(),
+                PARTITION_INVOKER_FUNCTIONS.len()
+            ),
+        )
+    } else {
+        fail(check, problems.join("; "))
+    }
+}
+
 /// ADR-0053 (migrations 0185/0186, card 28): the eight onboarding doors, all executable by
 /// `role_maintenance` only.
 const ONBOARDING_FUNCTIONS: [&str; 8] = [
@@ -4791,6 +5030,7 @@ pub fn run(_args: &[String]) -> i32 {
             results.push(check_health_reader_boundary(&mut client));
             results.push(check_maintenance_doors(&mut client));
             results.push(check_maintenance_delete_doors(&mut client));
+            results.push(check_partition_leaves(&mut client));
         }
         Err(conn_err) => {
             for name in [
@@ -4817,6 +5057,7 @@ pub fn run(_args: &[String]) -> i32 {
                 "ADR-0061 health reader boundary",
                 "ADR-0062 maintenance doors",
                 "ADR-0062 maintenance DELETE doors",
+                "ADR-0063 partition leaves",
             ] {
                 results.push(fail_for(name, &conn_err));
             }
@@ -6439,5 +6680,160 @@ mod tests {
         let red = check_derived_work_dispatch_boundary(&mut txn);
         assert_eq!(red.status, GateStatus::Fail, "{}", red.detail);
         assert!(red.detail.contains("found 2"), "{}", red.detail);
+    }
+
+    /// Applies every migration body in file order to `dsn` (the manifests are `migrate`'s own test).
+    fn migrated_bodies(dsn: &str) -> Client {
+        // dep: PostgreSQL(any) — superuser onto this test's throwaway database (migrated here, dropped by the guard)
+        let mut client = Client::connect(dsn, NoTls).expect("connect throwaway");
+        client
+            .batch_execute(
+                "CREATE SCHEMA IF NOT EXISTS ops; CREATE TABLE IF NOT EXISTS ops.schema_migrations \
+                 (migration_id text PRIMARY KEY, checksum text NOT NULL, \
+                  applied_at timestamptz NOT NULL DEFAULT now())",
+            )
+            .expect("ledger bootstrap");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations");
+        let mut files: Vec<std::path::PathBuf> = fs::read_dir(&dir)
+            .expect("migrations dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+            .collect();
+        files.sort();
+        for file in files {
+            client
+                .batch_execute(&fs::read_to_string(&file).expect("migration body"))
+                .unwrap_or_else(|e| panic!("apply {}: {e:?}", file.display()));
+        }
+        client
+    }
+
+    /// `ops.stage_runs` (converted by 0225) gains a statement-level guard on the parent, and every leaf is re-sealed
+    /// through the real adopter, which copies that guard (P5: PostgreSQL does not clone statement triggers).
+    fn stage_runs_guarded(client: &mut Client) {
+        client
+            .batch_execute(
+                "CREATE TRIGGER stage_runs_c36_guard BEFORE TRUNCATE ON ops.stage_runs
+                   FOR EACH STATEMENT EXECUTE FUNCTION control.reject_partition_key_update();
+                 SELECT control.partition_adopt_leaf('STAGE_RUNS', i.inhrelid::regclass)
+                   FROM pg_inherits i WHERE i.inhparent = 'ops.stage_runs'::regclass",
+            )
+            .expect("statement guard on ops.stage_runs re-sealed onto its leaves by the adopter");
+    }
+
+    /// T-L1 (ADR-0063 D-L): on a throwaway migrated to head (0225..0227 convert three parents through the real
+    /// creator; a statement-level guard is added to `ops.stage_runs` here), the partition arm is green and counts
+    /// exactly the catalog's leaves; each D-L fault, applied in a rolled-back transaction, drives the actual gate red
+    /// naming the fault, and the rollback restores green.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table of D-L faults, each injected, judged and rolled back in place"
+    )]
+    fn partition_leaf_faults_drive_gate_red_then_restore() {
+        const TEST: &str = "partition_leaf_faults_drive_gate_red_then_restore";
+        let Some((_db, dsn)) = crate::migrate::tests::throwaway(TEST, "c36_rls_leaves") else {
+            return;
+        };
+        let mut client = migrated_bodies(&dsn);
+        stage_runs_guarded(&mut client);
+        let green = check_partition_leaves(&mut client);
+        assert_eq!(green.status, GateStatus::Pass, "{}", green.detail);
+        let (leaves, parents): (i64, i64) = client
+            .query_one(
+                "SELECT (SELECT count(*) FROM pg_inherits i JOIN pg_partitioned_table p ON p.partrelid = i.inhparent),
+                        (SELECT count(*) FROM pg_partitioned_table)",
+                &[],
+            )
+            .map(|r| (r.get(0), r.get(1)))
+            .expect("catalog leaf count");
+        assert!(
+            parents >= 3,
+            "0225..0227 convert three parents, found {parents}"
+        );
+        assert!(
+            green.detail.contains(&format!(
+                "partition leaves: {leaves} leaves under {parents} parents sealed"
+            )),
+            "{}",
+            green.detail
+        );
+        let leaf: String = client
+            .query_one(
+                "SELECT leaf_name FROM control.partition_registry WHERE table_key = 'STAGE_RUNS' \
+                 ORDER BY upper_bound LIMIT 1",
+                &[],
+            )
+            .expect("first leaf")
+            .get(0);
+        let faults = [
+            (format!("GRANT SELECT ON {leaf} TO role_gateway"), "grants SELECT to role_gateway"),
+            (format!("ALTER TABLE {leaf} NO FORCE ROW LEVEL SECURITY"), "RLS not enabled and forced"),
+            (
+                format!("DROP POLICY stage_runs_tenant_isolation ON {leaf}"),
+                "policy set differs from its parent",
+            ),
+            (
+                "CREATE TABLE ops.stage_runs_default PARTITION OF ops.stage_runs DEFAULT".to_owned(),
+                "has a DEFAULT partition",
+            ),
+            (
+                "CREATE TABLE ops.stage_runs_p209901 PARTITION OF ops.stage_runs \
+                 FOR VALUES FROM ('2099-01-01+00') TO ('2099-02-01+00')"
+                    .to_owned(),
+                "leaf with no matching ATTACHED registry row",
+            ),
+            (
+                "CREATE TABLE ops.c36_scratch (stage_run_id uuid, started_at timestamptz, \
+                 FOREIGN KEY (stage_run_id, started_at) REFERENCES ops.stage_runs (stage_run_id, started_at))"
+                    .to_owned(),
+                "references partitioned ops.stage_runs",
+            ),
+            (
+                "ALTER FUNCTION control.partition_drop_check(uuid,uuid) SECURITY DEFINER".to_owned(),
+                "must be SECURITY INVOKER with row_security=off",
+            ),
+            (
+                format!("DROP TRIGGER stage_runs_c36_guard ON {leaf}"),
+                "misses its parent's statement trigger stage_runs_c36_guard",
+            ),
+            (format!("ALTER TABLE {leaf} OWNER TO postgres"), "not owned by role_migration_owner"),
+            (
+                "GRANT EXECUTE ON FUNCTION control.partition_create_month(text,timestamptz) TO role_maintenance"
+                    .to_owned(),
+                "EXECUTE held by [\"role_maintenance\"]",
+            ),
+            (
+                format!(
+                    "UPDATE control.partition_registry SET upper_bound = upper_bound + interval '1 day' \
+                     WHERE leaf_name = '{leaf}'"
+                ),
+                "ATTACHED registry row with no matching leaf",
+            ),
+            // 0231: the bounds are half of a leaf's identity; a lower bound that drifts from the catalog's is red.
+            (
+                format!(
+                    "UPDATE control.partition_registry SET lower_bound = coalesce(lower_bound, upper_bound) - interval '1 month' \
+                     WHERE leaf_name = '{leaf}'"
+                ),
+                "leaf with no matching ATTACHED registry row",
+            ),
+        ];
+        for (sql, expected) in &faults {
+            let mut txn = client.transaction().expect("fault transaction");
+            txn.batch_execute(sql)
+                .unwrap_or_else(|e| panic!("inject {sql}: {e}"));
+            let red = check_partition_leaves(&mut txn);
+            assert_eq!(red.status, GateStatus::Fail, "{sql}: {}", red.detail);
+            assert!(red.detail.contains(expected), "{sql}: {}", red.detail);
+            txn.rollback().expect("restore");
+            let restored = check_partition_leaves(&mut client);
+            assert_eq!(
+                restored.status,
+                GateStatus::Pass,
+                "after {sql}: {}",
+                restored.detail
+            );
+        }
     }
 }

@@ -7,7 +7,7 @@
 //!   humaux-testkit, postgres, serde_json, tokio, uuid]; services=[PostgreSQL(owner) r=[ops.commit_seq_seq]
 //!   w=[ops.outbox, projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_consolidation_worker),
 //!   PostgreSQL(role_private_worker) r=[ops.data_disclosure_sources, ops.data_disclosures, ops.model_call_ledger,
-//!   ops.outbox, ops.private_inference_rpc_calls, private.memory_consolidation_runs, private.memory_rollup_subjects,
+//!   ops.outbox, ops.private_inference_rpc_calls, private.memory_rollup_sources, private.memory_rollup_subjects,
 //!   private.memory_rollups, projection.stream_log] w=[control.credentials, control.memberships,
 //!   control.private_reasoning_domains, control.processor_models, control.provider_accounts,
 //!   control.provider_endpoints, control.reasoning_credential_bindings, control.reasoning_profiles,
@@ -15,12 +15,12 @@
 //!   control.tenants, control.users, control.workspaces, ops.reasoning_account_health_observations,
 //!   ops.reasoning_provider_health_observations, private.events, private.evidence_objects,
 //!   private.memory_consolidation_inputs, private.memory_evidence, private.memory_records,
-//!   private.memory_rollup_sources, private.subjects] x=[private.link_memory_subjects], MiniMax, UDS(private-worker),
+//!   private.subjects] x=[private.link_memory_subjects], MiniMax, UDS(private-worker),
 //!   UDS(serve)]; env=[HUMAUX_MINIMAX_DNS_PINS, HUMAUX_TEST_PG_DSN, MINIMAX_API_KEY]; modules=[adapters::byok,
 //!   adapters::byok::ssrf, adapters::consolidate_repo, adapters::consolidation_reasoner,
 //!   adapters::contribution_reasoner, adapters::disclosure, adapters::postgres, adapters::private_inference_rpc,
 //!   adapters::reasoning_route_admission, application::consolidate, consolidation-worker::inference_client,
-//!   domain::authority, humaux-consolidation-worker, humaux-testkit, private-worker::inference_rpc]
+//!   domain::authority, humaux-consolidation-worker, humaux-testkit, private-worker::inference_rpc, testkit::fixture_purge]
 //! Called-by: [cargo-test]
 //! Invariants: [no key -> visible SKIP for the live-MiniMax tests only; no DB -> SKIP for all;
 //!   HUMAUX_REQUIRE_MINIMAX/HUMAUX_REQUIRE_DB turn either skip into a panic via skip_or_fail (ADR-0005)]
@@ -65,6 +65,7 @@ use humaux_application::consolidate::{
 use humaux_consolidation_worker::inference_client::UdsInferenceClient;
 use humaux_consolidation_worker::{RunOnceError, build_rollup, run_once, run_once_bound};
 use humaux_domain::authority::AuthorityClass;
+use humaux_testkit::fixture_purge::purge_tenant_fixture_sql;
 use humaux_testkit::{ExternalDep, skip_or_fail};
 use postgres::{Client, NoTls};
 use tokio::net::{UnixListener, UnixStream};
@@ -242,58 +243,21 @@ struct Fixture {
 }
 
 impl Drop for Fixture {
-    /// Throwaway-tenant cleanup. `session_replication_role = replica` (superuser test DSN)
-    /// skips the 0128 append-only triggers on the seeded route graph and the FK/RI triggers,
-    /// so one pass over every `tenant_id`-carrying table plus the four child tables that key
-    /// through a parent is enough; nothing here is a production path.
+    /// Throwaway-tenant cleanup through the one fixture purge (`humaux_testkit::fixture_purge`, ADR-0063 "Dev
+    /// integrity finding"; the replica-mode DELETE list it replaces left `private.event_identity` orphans on dev).
+    /// A failure is printed (the fixture tenant stays, nothing is half-deleted); the user is not a tenant row and
+    /// goes afterwards with constraints enforced, best effort.
     fn drop(&mut self) {
         let tenant = self.tenant_id;
-        let Ok(rows) = self.admin.query(
-            "SELECT table_schema, table_name FROM information_schema.columns \
-             WHERE column_name = 'tenant_id' AND table_schema IN ('control','private','ops','projection','staging') \
-               AND table_name <> 'tenants' \
-             ORDER BY table_schema, table_name",
-            &[],
-        ) else {
-            return;
-        };
-        let mut sql = String::from("SET session_replication_role = replica; ");
-        sql.push_str(&format!(
-            "DELETE FROM private.memory_rollup_sources WHERE rollup_id IN \
-               (SELECT rollup_id FROM private.memory_rollups WHERE tenant_id = '{tenant}'); \
-             DELETE FROM private.memory_consolidation_inputs WHERE run_id IN \
-               (SELECT run_id FROM private.memory_consolidation_runs WHERE tenant_id = '{tenant}'); \
-             DELETE FROM private.memory_evidence WHERE memory_id IN \
-               (SELECT memory_id FROM private.memory_records WHERE tenant_id = '{tenant}'); \
-             DELETE FROM private.events WHERE event_id IN \
-               (SELECT evidence_id FROM private.evidence_objects WHERE tenant_id = '{tenant}'); "
-        ));
-        for row in rows {
-            let schema: String = row.get(0);
-            let table: String = row.get(1);
-            sql.push_str(&format!(
-                "DELETE FROM {schema}.{table} WHERE tenant_id = '{tenant}'; "
-            ));
+        let purged = purge_tenant_fixture_sql(&tenant.to_string())
+            .and_then(|sql| self.admin.batch_execute(&sql).map_err(|e| e.to_string()));
+        if let Err(error) = purged {
+            eprintln!("{NAME}: fixture cleanup for tenant {tenant} failed: {error}");
         }
-        sql.push_str("SET session_replication_role = DEFAULT;");
-        // Card-31 pattern (card 33): jobs (ops.jobs is one of the tenant_id tables above) and data
-        // rows in one batch whose failure is printed; the tenant and user rows in a separate
-        // best-effort batch that cannot roll the job delete back.
-        if let Err(error) = self.admin.batch_execute(&sql) {
-            eprintln!("{NAME}: fixture cleanup (jobs/data) for tenant {tenant} failed: {error}");
-        }
-        if let Err(error) = self.admin.batch_execute(&format!(
-            "SET session_replication_role = replica; \
-             DELETE FROM control.tenants WHERE tenant_id = '{tenant}'; \
-             DELETE FROM control.users WHERE user_id = '{}'; \
-             SET session_replication_role = DEFAULT;",
-            self.user_id
-        )) {
-            eprintln!("{NAME}: fixture cleanup (tenant, best effort) for {tenant} failed: {error}");
-            let _ = self
-                .admin
-                .batch_execute("SET session_replication_role = DEFAULT");
-        }
+        let _ = self.admin.execute(
+            "DELETE FROM control.users WHERE user_id = $1",
+            &[&self.user_id],
+        );
     }
 }
 
@@ -340,7 +304,7 @@ fn setup_db(test_name: &str) -> Option<Fixture> {
     let tenant_id: Uuid = admin
         .query_one(
             "INSERT INTO control.tenants (name, state) VALUES ($1, 'ACTIVE') RETURNING tenant_id",
-            &[&format!("{NAME} throwaway tenant {suffix}")],
+            &[&format!("e2e-fixture {NAME} throwaway tenant {suffix}")],
         )
         .expect("tenant")
         .get(0);

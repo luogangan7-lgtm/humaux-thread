@@ -8,6 +8,9 @@
 # Every process is started and signalled only through its pidfile.
 # Exit: 0 = REHEARSAL VERDICT with 0 failed; 1 = an assertion failed; 2 = usage or missing configuration.
 set -u
+# zsh runs no EXIT trap when an untrapped TERM kills it: a run stopped from outside (gate ceiling, operator) would skip
+# the pidfile teardown and the FAULT=revoke_claim re-GRANT on $DB. Trapped, it exits through whichever EXIT trap is armed.
+trap 'exit 143' TERM INT   # not HUP: a nohup'd run inherits it ignored and must keep ignoring it
 S=${HUMAUX_REHEARSE_WORK:-${TMPDIR:-/tmp}/humaux-rehearsal}   # work dir: pidfiles, helpers, evidence (override with HUMAUX_REHEARSE_WORK)
 EV=$S/e2e_evidence; SOCK=/tmp/hq-e2e; mkdir -p $EV $SOCK
 # Card 30 (ADR-0055 D-E): one build profile for every binary this script builds, spawns, probes
@@ -427,6 +430,7 @@ HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_R
 HUMAUX_MAINTENANCE_SERVE_JOBS_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_JOBS_LIMIT=2 \
 HUMAUX_MAINTENANCE_SERVE_REISSUE_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_REISSUE_LIMIT=2 \
 HUMAUX_MAINTENANCE_SERVE_REDRIVE_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_REDRIVE_LIMIT=2 \
+HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS=3 \
 HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS=$((LAG_SECS + 1)) HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS=$LAG_SECS \
 HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS=0 HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_IDLE_SECONDS=0 \
 HUMAUX_MAINTENANCE_SERVE_JOBS_DONE_RETENTION_SECONDS=0 HUMAUX_MAINTENANCE_SERVE_JOBS_DEAD_RETENTION_SECONDS=0 \

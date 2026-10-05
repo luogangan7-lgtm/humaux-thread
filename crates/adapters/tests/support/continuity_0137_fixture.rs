@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 #[path = "continuity_0137_cleanup.rs"]
 mod continuity_0137_cleanup;
-pub use continuity_0137_cleanup::CleanupOwner;
+pub use continuity_0137_cleanup::{CleanupOwner, POLICY_DDL_LOCK_KEY};
 
 const NIL: Uuid = Uuid::nil();
 const DIAGNOSTIC_ENV: &str = "HUMAUX_W2_V4_DIAGNOSTIC";
@@ -566,7 +566,7 @@ fn register_seed_ids(cleanup: &CleanupOwner, ids: &SeedIds, project: Uuid) {
 fn seed_control(admin: &mut Client, ids: &SeedIds) {
     admin
         .execute(
-            "INSERT INTO control.tenants(tenant_id,name,state) VALUES($1,'w2 acceptance','ACTIVE')",
+            "INSERT INTO control.tenants(tenant_id,name,state) VALUES($1,'e2e-fixture w2 acceptance','ACTIVE')",
             &[&ids.tenant],
         )
         .unwrap();
@@ -788,7 +788,7 @@ impl Fixture {
         let mut admin = Client::connect(&admin_dsn, NoTls).expect("partial-seed admin connect");
         admin
             .execute(
-                "INSERT INTO control.tenants(tenant_id,name,state) VALUES($1,'w2 partial','ACTIVE')",
+                "INSERT INTO control.tenants(tenant_id,name,state) VALUES($1,'e2e-fixture w2 partial','ACTIVE')",
                 &[&tenant],
             )
             .expect("partial-seed tenant");
@@ -1226,7 +1226,7 @@ impl Fixture {
         self.cleanup.register_tenant(tenant);
         self.admin()
             .execute(
-                "INSERT INTO control.tenants(tenant_id,name,state) VALUES($1,'w2 decoy','ACTIVE')",
+                "INSERT INTO control.tenants(tenant_id,name,state) VALUES($1,'e2e-fixture w2 decoy','ACTIVE')",
                 &[&tenant],
             )
             .unwrap();

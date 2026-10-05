@@ -5,18 +5,18 @@
 //! Depends-on: crates=[humaux-adapters, humaux-application, humaux-domain, humaux-testkit, postgres, tokio, uuid];
 //!   services=[PostgreSQL(owner) r=[control.reasoning_profiles, ops.data_disclosures, ops.model_call_ledger,
 //!   ops.reasoning_account_health_observations, ops.reasoning_provider_health_observations]
-//!   w=[control.reasoning_profiles, control.tenants, ops.jobs, ops.model_call_ledger, private.processing_runs],
+//!   w=[control.reasoning_profiles, ops.model_call_ledger, private.processing_runs],
 //!   PostgreSQL(role_private_worker) w=[ops.data_disclosures, ops.model_call_ledger]
 //!   x=[control.observe_reasoning_route_health, control.reasoning_credential_accounts,
 //!   control.reasoning_profile_capabilities, control.reasoning_route_health_state], PostgreSQL(role_gateway)]; env=[HUMAUX_TEST_PG_DSN];
 //!   modules=[adapters::byok, adapters::disclosure, adapters::model_call_ledger, adapters::postgres,
 //!   adapters::reasoning_route_admission, adapters::tests::support::private_route, application::consolidate,
-//!   domain::dataclass, domain::egress, domain::ids, domain::ledger, humaux-testkit]
+//!   domain::dataclass, domain::egress, domain::ids, domain::ledger, humaux-testkit, testkit::fixture_purge]
 //! Called-by: [cargo-test]
-//! Invariants: [every test seeds its own tenants and catalog rows; ledger, disclosure, profile and health rows are
-//!   append-only and stay (forensics), the fixture deletes its tenants' jobs and processing runs in one printed batch
-//!   and tries the tenant rows in a separate best-effort batch; a missing DB is a fixture error under
-//!   HUMAUX_REQUIRE_DB=1]
+//! Invariants: [every test seeds its own tenants and catalog rows; the fixture purges each of its tenants through the
+//!   fixture purge (append-only ledger, disclosure, profile and health rows included; printed on failure), the
+//!   catalog rows and owner users stay; T5's replica-mode insert is refused inside a dropped transaction; a missing DB
+//!   is a fixture error under HUMAUX_REQUIRE_DB=1]
 //! Spec: Baseline §11.2; §11.2.4; §11.2.5; §11.5; §19.1; ADR-0060 D-A, D-I, D-J, D-K, D-N, ruling E3
 //!
 //! Each test names, in its doc, the fault that turns it red.
@@ -36,6 +36,7 @@ use humaux_domain::dataclass::DataClass;
 use humaux_domain::egress::{self, AuthorizedEgressPayload, PrivateDataPurpose};
 use humaux_domain::ids::TenantId;
 use humaux_domain::ledger::ModelCallPurpose;
+use humaux_testkit::fixture_purge::purge_tenant_fixture_sql;
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::error::SqlState;
 use postgres::{Client, NoTls};
@@ -54,27 +55,18 @@ struct Handle {
 }
 
 impl Drop for Handle {
+    /// Each tenant goes through the one fixture purge (`humaux_testkit::fixture_purge`, ADR-0063 "Dev integrity
+    /// finding"): its jobs, processing runs and the append-only profile, ledger, disclosure and health rows that kept
+    /// the old best-effort `DELETE FROM control.tenants` from ever succeeding. A failure is printed (that tenant
+    /// stays, nothing is half-deleted). The catalog rows and owner users are not tenant rows and stay.
     fn drop(&mut self) {
-        let ids = self
-            .tenants
-            .iter()
-            .map(|t| format!("'{t}'"))
-            .collect::<Vec<_>>()
-            .join(",");
-        if ids.is_empty() {
-            return;
+        for tenant in &self.tenants {
+            let purged = purge_tenant_fixture_sql(&tenant.to_string())
+                .and_then(|sql| self.admin.batch_execute(&sql).map_err(|e| e.to_string()));
+            if let Err(e) = purged {
+                eprintln!("reasoning_route_runtime cleanup ({tenant}): {e}");
+            }
         }
-        // Card-31 lesson: jobs and data rows in ONE printed batch; the tenant rows separately and
-        // best-effort (profiles, ledger and disclosure rows are append-only and keep them alive).
-        if let Err(e) = self.admin.batch_execute(&format!(
-            "DELETE FROM ops.jobs WHERE tenant_id IN ({ids}); \
-             DELETE FROM private.processing_runs WHERE tenant_id IN ({ids});"
-        )) {
-            eprintln!("reasoning_route_runtime cleanup: jobs/data batch failed: {e}");
-        }
-        let _ = self.admin.batch_execute(&format!(
-            "DELETE FROM control.tenants WHERE tenant_id IN ({ids});"
-        ));
     }
 }
 
@@ -455,6 +447,8 @@ fn private_route_columns_all_or_none() {
         let (owner, _, binding) = h.routed(3600.0);
         {
             let mut txn = h.admin.transaction().expect("txn");
+            // replica-mode: fault setup, fixture purged at the end (here the insert is refused and the transaction is
+            // dropped uncommitted; the fixture tenants go through the purge in Handle::drop)
             txn.batch_execute("SET LOCAL session_replication_role = replica")
                 .expect("triggers off: the CHECK alone");
             let partial = txn

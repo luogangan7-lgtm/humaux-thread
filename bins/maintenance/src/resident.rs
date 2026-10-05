@@ -1,13 +1,16 @@
-//! `maintenance::resident` — what the two resident modes (`health serve`, `--serve`) share: the SIGTERM / SIGINT
-//!   latch, the per-statement timeout on the pool DSN, the last-outcome record behind the 200/503 readiness verdict,
+//! `maintenance::resident` — what the two resident modes (`health serve`, `--serve`) share: the boot refusal of an
+//!   owner credential (ADR-0063 D-H), the SIGTERM / SIGINT latch, the per-statement timeout on the pool DSN, the last-outcome record behind the 200/503 readiness verdict,
 //!   the `/status` identity document and the loopback ops listener wiring (ADR-0061 D-B, D-D; ADR-0062 D-A).
-//! Depends-on: crates=[humaux-telemetry, serde_json, tokio]; services=[HTTP(loopback)]; env=[CARGO_PKG_VERSION, HUMAUX_BUILD_GIT_SHA];
+//! Depends-on: crates=[humaux-telemetry, serde_json, tokio]; services=[HTTP(loopback)]; env=[CARGO_PKG_VERSION, HUMAUX_BUILD_GIT_SHA,
+//!   HUMAUX_MIGRATOR_PG_DSN];
 //!   modules=[telemetry::degrade, telemetry::metrics, maintenance::main]
 //! Called-by: [maintenance::health_serve, maintenance::serve]
-//! Invariants: [both signal handlers are installed before any work; a failed or stale last outcome answers 503 with
+//! Invariants: [a resident mode whose environment defines HUMAUX_MIGRATOR_PG_DSN at all (even empty) exits 2 before
+//!   it installs a handler, reads a DSN or binds a port, and never reads or prints the value; both signal handlers
+//!   are installed before any work; a failed or stale last outcome answers 503 with
 //!   the reason and the age, never the last good values; the ops listener binds a loopback address only; every
 //!   resident mode's `/status` carries the full ADR-0061 D-B identity document, the 11 degrade codes included]
-//! Spec: Baseline §41.2; §78.1; ADR-0037; ADR-0061 D-B; ADR-0061 D-D; ADR-0062 D-A
+//! Spec: Baseline §41.2; §78.1; ADR-0037; ADR-0061 D-B; ADR-0061 D-D; ADR-0062 D-A; ADR-0063 D-H
 
 use std::net::SocketAddr;
 use std::sync::{Mutex, PoisonError};
@@ -20,6 +23,22 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 
 use crate::{Failure, Result, env};
+
+/// ADR-0063 D-H: the superuser migrator DSN, used only by the one-shot `retention …` / `roles …` arms from the
+/// operator shell.
+const MIGRATOR_DSN: &str = "HUMAUX_MIGRATOR_PG_DSN";
+
+/// ADR-0063 D-H: the first statement of every resident mode. supervision.md runs both resident modes from one
+/// environment, so "no owner credential in a resident process" is a boot condition, not a review rule: the key's
+/// presence alone refuses (exit 2), and its value is never read.
+pub(crate) fn refuse_owner_credentials() -> Result<()> {
+    if std::env::var_os(MIGRATOR_DSN).is_some() {
+        return Err(Failure::Usage(format!(
+            "boot refused: {MIGRATOR_DSN} is set in a resident mode's environment (ADR-0063 D-H)"
+        )));
+    }
+    Ok(())
+}
 
 /// SIGTERM or SIGINT seen (supervision.md §3: Ctrl-C is handled exactly like SIGTERM).
 pub(crate) struct Latch(JoinHandle<()>);

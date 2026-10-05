@@ -1,14 +1,17 @@
 //! `maintenance::tests::support::throwaway` — the resident-mode test kit: a throwaway database migrated from the
 //!   files, the spawned process guard, free loopback ports and a one-shot HTTP GET (moved from
-//!   `health_serve.rs`, card 35 S1).
-//! Depends-on: crates=[humaux-testkit, postgres]; services=[PostgreSQL(owner) r=[ops.schema_migrations], HTTP(loopback),
-//!   subprocess(humaux-maintenance), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-maintenance, CARGO_MANIFEST_DIR,
+//!   `health_serve.rs`, card 35 S1), plus the §48.1 fixtures every retention test shares: an owner-made sealed leaf,
+//!   an effective policy and a proposal forged through role_maintenance's column grant (ADR-0063 D-C, D-E, D-J).
+//! Depends-on: crates=[humaux-testkit, postgres]; services=[PostgreSQL(owner) r=[ops.schema_migrations]
+//!   w=[control.retention_policies] x=[control.partition_adopt_leaf], PostgreSQL(role_maintenance)
+//!   w=[control.partition_registry], HTTP(loopback), subprocess(humaux-maintenance), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-maintenance, CARGO_MANIFEST_DIR,
 //!   HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[humaux-testkit]
-//! Called-by: [maintenance::tests::health_serve, maintenance::tests::serve]
+//! Called-by: [maintenance::tests::health_serve, maintenance::tests::partition_pg_facts,
+//!   maintenance::tests::partitions, maintenance::tests::retention, maintenance::tests::serve]
 //! Invariants: [every database is humaux_thread_<prefix>_<pid>_<n>, created by the fixture and dropped WITH (FORCE)
 //!   by its Drop even on panic, so the shared dev database never sees a fixture row; the spawned process is
 //!   killed by its own Drop; missing env -> §79.2 skip_or_fail]
-//! Spec: Baseline §78.1; §79.2; ADR-0061 D-D; ADR-0062 D-A
+//! Spec: Baseline §78.1; §79.2; ADR-0061 D-D; ADR-0062 D-A; ADR-0063 D-E; ADR-0063 D-J
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -130,8 +133,9 @@ impl Drop for Db {
     }
 }
 
-/// Applies every migration file in order (bodies only; the manifests are the `xtask migrate` gate's job).
-fn migrate(client: &mut Client) {
+/// Applies every migration file in order (bodies only; the manifests are the `xtask migrate` gate's job), or only
+/// those whose 4-digit stem is at or before `through`.
+fn migrate(client: &mut Client, through: Option<&str>) {
     // Role DDL is cluster-global (0201 ALTER ROLE, 0210 CREATE ROLE): one database at a time per process.
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _serial = ONE_AT_A_TIME
@@ -142,6 +146,12 @@ fn migrate(client: &mut Client) {
         .expect("migrations dir")
         .map(|e| e.expect("entry").path())
         .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        .filter(|p| {
+            through.is_none_or(|t| {
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                stem.get(..t.len()).is_some_and(|n| n <= t)
+            })
+        })
         .collect();
     files.sort();
     client
@@ -161,6 +171,20 @@ fn migrate(client: &mut Client) {
 
 /// A fresh migrated database `humaux_thread_<prefix>_<pid>_<n>`, or `None` after a §79.2 skip.
 pub fn db(test: &str, prefix: &str) -> Option<Db> {
+    db_through(test, prefix, None)
+}
+
+/// Like [`db`], migrated only through the migration whose 4-digit stem is `through` (`Some("0000")`: no
+/// migration, only the ledger bootstrap: a bare database for scratch-table facts).
+pub fn db_through(test: &str, prefix: &str, through: Option<&str>) -> Option<Db> {
+    let mut db = empty(test, prefix)?;
+    migrate(db.client(), through);
+    Some(db)
+}
+
+/// A fresh database `humaux_thread_<prefix>_<pid>_<n>` with nothing in it (not even the migration ledger): the target
+/// of a `pg_restore`. `None` after a §79.2 skip.
+pub fn empty(test: &str, prefix: &str) -> Option<Db> {
     let (Ok(owner_dsn), Ok(maintenance_dsn)) =
         (std::env::var(OWNER_DSN), std::env::var(MAINTENANCE_DSN))
     else {
@@ -190,9 +214,7 @@ pub fn db(test: &str, prefix: &str) -> Option<Db> {
         client: None,
     };
     // dep: PostgreSQL(owner) — fixture connection to the throwaway database
-    let mut client = Client::connect(&with_db(&owner_dsn, &name), NoTls).expect("connect test db");
-    migrate(&mut client);
-    db.client = Some(client);
+    db.client = Some(Client::connect(&with_db(&owner_dsn, &name), NoTls).expect("connect test db"));
     Some(db)
 }
 
@@ -218,4 +240,77 @@ pub fn run(args: &[&str], env: &[(&str, String)]) -> Output {
         .envs(env.iter().map(|(k, v)| (k, v)))
         .output()
         .expect("run humaux-maintenance")
+}
+
+/// UTC month start `months` after the current one, as SQL (ADR-0063 D-D step 5 arithmetic).
+pub fn month_sql(months: i32) -> String {
+    format!("date_add(date_trunc('month', now(), 'UTC'), make_interval(months => {months}), 'UTC')")
+}
+
+/// ADR-0063 D-E fixture: a leaf of `parent` for the UTC month `months` from now (negative = past), owned by
+/// role_migration_owner like a creator-made one (the definer re-owns only what it owns), sealed and registered by `control.partition_adopt_leaf` exactly like a creator-made one; `(registry_id, leaf)`.
+pub fn past_leaf(c: &mut Client, table_key: &str, parent: &str, months: i32) -> (String, String) {
+    let m = month_sql(months);
+    let row = c
+        .query_one(
+            &format!(
+                "SELECT $1::text || '_p' || to_char({m} AT TIME ZONE 'UTC', 'YYYYMM'), \
+                        to_char({m} AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || '+00', \
+                        to_char(date_add({m}, interval '1 month', 'UTC') AT TIME ZONE 'UTC', \
+                                'YYYY-MM-DD HH24:MI:SS') || '+00'"
+            ),
+            &[&parent],
+        )
+        .expect("leaf name and bounds");
+    let (leaf, lo, hi): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+    c.batch_execute(&format!(
+        "CREATE TABLE {leaf} PARTITION OF {parent} FOR VALUES FROM ('{lo}') TO ('{hi}'); \
+         ALTER TABLE {leaf} OWNER TO role_migration_owner"
+    ))
+    .unwrap_or_else(|e| panic!("create {leaf}: {e:?}"));
+    let registry_id: String = c
+        .query_one(
+            "SELECT control.partition_adopt_leaf($1, $2::text::regclass)::text",
+            &[&table_key, &leaf],
+        )
+        .unwrap_or_else(|e| panic!("adopt {leaf}: {e:?}"))
+        .get(0);
+    (registry_id, leaf)
+}
+
+/// ADR-0063 D-C fixture: the next revision of `table_key`'s policy, approved and effective an hour ago (a direct owner
+/// INSERT, so it is effective at once); `(policy_id, policy_revision)`.
+pub fn effective_policy(c: &mut Client, table_key: &str, months: Option<i32>) -> (String, i32) {
+    let row = c
+        .query_one(
+            "INSERT INTO control.retention_policies \
+               (table_key, retention_months, policy_revision, approved_by, approved_at, effective_at) \
+             SELECT $1, $2, coalesce(max(policy_revision), 0) + 1, 'c36 fixture', now() - interval '1 hour', \
+                    now() - interval '1 hour' \
+               FROM control.retention_policies WHERE table_key = $1 \
+             RETURNING policy_id::text, policy_revision",
+            &[&table_key, &months],
+        )
+        .expect("policy fixture");
+    (row.get(0), row.get(1))
+}
+
+/// ADR-0063 D-J step 4: writes the proposal columns of one registry row as role_maintenance through its column
+/// grant (the forge every test of the corroboration uses); `proposed_at` is `proposed_at_sql`.
+pub fn forge_proposal(c: &mut Client, registry_id: &str, revision: i32, proposed_at_sql: &str) {
+    let mut tx = c.transaction().expect("begin");
+    // dep: PostgreSQL(role_maintenance) — role switch: the daemon's column UPDATE cells
+    tx.batch_execute("SET LOCAL ROLE role_maintenance")
+        .expect("set role");
+    let n = tx
+        .execute(
+            &format!(
+                "UPDATE control.partition_registry SET proposed_policy_revision = $2, proposed_at = {proposed_at_sql} \
+                 WHERE registry_id = $1::text::uuid"
+            ),
+            &[&registry_id, &revision],
+        )
+        .expect("forge proposal");
+    assert_eq!(n, 1, "one registry row");
+    tx.commit().expect("commit");
 }

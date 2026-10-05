@@ -281,6 +281,7 @@ mod tests {
         Distance, ShardingMethod, create_collection_body, tenant_index_body,
     };
     use humaux_infra_cell::{IntraCellHttpTransport, IntraCellMethod, IntraCellRequest};
+    use humaux_testkit::fixture_purge::purge_tenant_fixture_sql;
     use humaux_testkit::{ExternalDep, skip_or_fail};
     use postgres::NoTls;
 
@@ -306,7 +307,7 @@ mod tests {
              -> Uuid { db.query_one(sql, params).expect(sql).get(0) };
             let tenant = one(
                 &mut db,
-                "INSERT INTO control.tenants (name) VALUES ('switch_visible.rs throwaway') \
+                "INSERT INTO control.tenants (name) VALUES ('e2e-fixture switch_visible.rs') \
                  RETURNING tenant_id",
                 &[],
             );
@@ -491,28 +492,21 @@ mod tests {
                     },
                 ));
             }
+            // ADR-0063 "Dev integrity finding": the one fixture purge, then the two users (not tenant rows)
+            // with constraints enforced; a failure is printed.
             let t = self.tenant;
-            // Rows first in one batch (failure printed); the tenant row separately, best effort.
-            if let Err(e) = self.db.batch_execute(&format!(
-                "DELETE FROM projection.private_memory_points WHERE tenant_id = '{t}'; \
-                 DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{t}'; \
-                 DELETE FROM projection.tenant_placements WHERE tenant_id = '{t}'; \
-                 DELETE FROM private.memory_evidence USING private.memory_records m \
-                   WHERE memory_evidence.memory_id = m.memory_id AND m.tenant_id = '{t}'; \
-                 DELETE FROM private.memory_records WHERE tenant_id = '{t}'; \
-                 DELETE FROM private.events USING private.evidence_objects eo \
-                   WHERE events.event_id = eo.evidence_id AND eo.tenant_id = '{t}'; \
-                 DELETE FROM private.evidence_objects WHERE tenant_id = '{t}'; \
-                 DELETE FROM control.private_reasoning_domains WHERE tenant_id = '{t}'; \
-                 DELETE FROM control.workspaces WHERE tenant_id = '{t}'; \
-                 DELETE FROM control.users WHERE user_id IN ('{}', '{}');",
-                self.users[0], self.users[1]
-            )) {
+            let purge = purge_tenant_fixture_sql(&t.to_string());
+            if let Err(e) = purge.map_err(|e| e.to_string()).and_then(|sql| {
+                self.db.batch_execute(&sql).map_err(|e| e.to_string())?;
+                self.db
+                    .execute(
+                        "DELETE FROM control.users WHERE user_id = ANY($1)",
+                        &[&self.users.to_vec()],
+                    )
+                    .map_err(|e| e.to_string())
+            }) {
                 eprintln!("switch_visible fixture cleanup failed for tenant {t}: {e}");
             }
-            let _ = self.db.batch_execute(&format!(
-                "DELETE FROM control.tenants WHERE tenant_id = '{t}';"
-            ));
         }
     }
 

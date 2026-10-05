@@ -36,6 +36,7 @@ xtask. A table would be a second list of the same tests, and nothing keeps two l
 | `lane(a:<resource>)` | needs a dedicated resource | provisions it, then runs the test |
 | `lane(b)` | timing-sensitive | runs it serially after the warm-up |
 | `lane(c)` | retired: pins a path that no longer exists | **not run**; the free text is the recorded reason |
+| `lane(c)` (measurement) | a main-line-only measurement whose target no lane resource provisions | **not run** (counted `retired`); the reason names the script that runs it |
 
 Resources are a closed set (`xtask/src/serial_lane.rs::Resource`): `shared_db`,
 `request_guard`, `qdrant`, `disposable`, `pre_0132`, `post_0132`, `mechanism_fixture`,
@@ -52,12 +53,12 @@ fixture" its ignore reasons named did not exist anywhere.
 
 | Resource | Provisioned | Environment the group runs under |
 |---|---|---|
-| `shared_db` | `cargo xtask migrate` against `HUMAUX_TEST_PG_DSN` | unchanged |
+| `shared_db` | checks `HUMAUX_TEST_PG_DSN`'s ledger holds every migration file; never migrates it (ADR-0063 D-M) — pending files are a NOT RUN naming them | unchanged |
 | `request_guard` | per-run `humaux_thread_request_guard_<unix>`, migrated | every role DSN repointed |
 | `qdrant` | TCP probe of `HUMAUX_TEST_QDRANT_PORT` + per-run `humaux_thread_qdrant_<unix>`, migrated | every role DSN repointed |
 | `disposable` | per-**target** `humaux_thread_disposable_<unix>`, migrated | every role DSN repointed |
 | `pre_0132` | per-run `humaux_thread_pre0132_<unix>`, migrated `--through 0131` | + `HUMAUX_0132_GATE_MODE=pre0132` |
-| `post_0132` | `cargo xtask migrate` against `HUMAUX_TEST_PG_DSN` | + `HUMAUX_0132_GATE_MODE=post0132` |
+| `post_0132` | the same head check as `shared_db`, never a migrate | + `HUMAUX_0132_GATE_MODE=post0132` |
 | `mechanism_fixture` | `humaux_thread_stable_observations`, migrated; **requires `HUMAUX_ADMIN_PG_DSN`** | + `HUMAUX_MECHANISM_FIXTURE`, role DSNs repointed |
 | `mechanism_admin_bin` | the `mechanism_fixture` half + `target/debug/humaux-admin` (built if absent) | + `HUMAUX_MECHANISM_ADMIN_BIN` |
 | `provenance_mutation` | per-run `humaux_thread_prov_fault_<unix>`, migrated | + `HUMAUX_PUBLIC_PROVENANCE_FAULT_DB=1`, role DSNs repointed |
@@ -189,6 +190,16 @@ first-page target is not met on this host and moves to card 35b. The card-35 cha
 `c35_enumerate_scale_live`). The S7 reason text lacked the `lane(` prefix and the audit was red on it ("1 ignored
 test(s) with no disposition"); card 35 S8 gave it `lane(b)`.
 
+## `partition_insert_latency` (card 36, ADR-0063 D-N)
+
+`bins/maintenance/tests/partitions.rs` carries `lane(c)`: it retires no path, it is a measurement the lane cannot
+run. It targets an existing database named by `HUMAUX_C36_LATENCY_DB`, which must be a `humaux_thread_c36_*` copy
+restored from a dev dump; no lane resource provisions one, and under the lane's `HUMAUX_REQUIRE_DB=1` its
+missing-object skip would be a failure, not a skip. The main line runs it through `c36_devcopy.sh` (D-M step 3, D-N:
+`--ignored --exact` on the two restored copies, then drops them). The S7 reason lacked the `lane(` prefix and the
+audit was red on it (`every_ignored_test_has_a_disposition`); fixed 2026-10-05 with this `lane(c)` reason, so the
+lane's `retired` tally counts it.
+
 ## Process discipline
 
 The lane never kills a process it did not spawn and never frees a port by force (a `lsof -ti
@@ -257,3 +268,12 @@ created (never one it found, never the fixed-name `humaux_thread_stable_observat
 reported line per drop, `WITH (FORCE)` so a leaked pooled connection cannot keep a throwaway
 alive. The gate chain's `serial_lane` extra passes the flag (`card24_extra_gates.env`); an
 operator who wants to inspect a run's databases afterwards omits it.
+
+## Dropping what the lane created (card 36 review, 2026-10-05)
+
+Every database the lane creates is recorded and dropped `WITH (FORCE)` when the group that provisioned it ends
+(per target for `disposable`), again when the lane returns or unwinds, and the lane prints
+`serial-lane: dropped <n> provisioned database(s) this run`. `--drop-provisioned` is still accepted and changes
+nothing. Never dropped: `humaux_thread_dev`, `humaux_thread_c31`, `humaux_thread_ci`,
+`humaux_thread_stable_observations`. A lane killed by Ctrl-C (no signal handler) leaves its current group's
+databases (ADR-0063 L19).

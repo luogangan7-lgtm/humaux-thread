@@ -10,13 +10,13 @@
 //!   private.evidence_objects] x=[ops.admit_distill_budget, ops.begin_call, ops.claim_derived_work,
 //!   ops.claim_derived_work_v2, ops.finish_derived_work_v2],
 //!   PostgreSQL(role_private_worker), PostgreSQL(role_consolidation_worker), PostgreSQL(role_gateway)];
-//!   env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN]; modules=[adapters::byok, adapters::jobs, adapters::postgres, humaux-testkit]
+//!   env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN]; modules=[adapters::byok, adapters::jobs, adapters::postgres, humaux-testkit, testkit::fixture_purge]
 //! Called-by: [cargo-test]
 //! Invariants: [every scenario ends with I-SLOT (each PROCESSING distill job with a dispatch_state holds exactly one
 //!   slot bound to its own generation); scheduler rows of tenants this file did not create are row-locked for the
-//!   whole test, so the cross-tenant claim only ever serves this file's tenants; a fixture deletes its jobs (and
-//!   unbinds their slots) in one printed batch and its tenants in a separate best-effort batch; a missing DB is a
-//!   fixture error under HUMAUX_REQUIRE_DB=1, never a silent pass]
+//!   whole test, so the cross-tenant claim only ever serves this file's tenants; a fixture unbinds its jobs' slots and
+//!   then purges each of its tenants through the fixture purge (printed on failure); T19's replica-mode shapes live in
+//!   one rolled-back transaction; a missing DB is a fixture error under HUMAUX_REQUIRE_DB=1, never a silent pass]
 //! Spec: Baseline §31; §61; §67.2; §11; §79.2; ADR-0058; ADR-0060 D-F
 //!
 //! Each test names, in its doc, the fault that turns it red (ADR-0058 records the red→green runs).
@@ -29,6 +29,7 @@ use humaux_adapters::jobs::{
     DistillLease, JobsError,
 };
 use humaux_adapters::postgres::PrivateWorkerDbPool;
+use humaux_testkit::fixture_purge::purge_tenant_fixture_sql;
 use humaux_testkit::{DbFixtureSkipReason, DbIntegrationFixture, run_db_fixture};
 use postgres::{Client, NoTls};
 use sqlx::types::Uuid;
@@ -63,30 +64,26 @@ struct Handle {
 }
 
 impl Drop for Handle {
+    /// The slots this file's jobs hold are released first (`ops.provider_slots` rows are global and carry no FK, so
+    /// the purge never reaches them); then each tenant goes through the one fixture purge
+    /// (`humaux_testkit::fixture_purge`, ADR-0063 "Dev integrity finding"): its jobs, data rows and the append-only
+    /// profile, ledger and disclosure rows that kept the old best-effort `DELETE FROM control.tenants` from ever
+    /// succeeding. A failure is printed (that tenant stays, nothing is half-deleted).
     fn drop(&mut self) {
         let _ = self.fence.batch_execute("ROLLBACK");
-        let ids = self
-            .tenants
-            .iter()
-            .map(|t| format!("'{t}'"))
-            .collect::<Vec<_>>()
-            .join(",");
-        if ids.is_empty() {
-            return;
-        }
-        // Card-31 lesson: jobs (and the slots they hold) go in ONE batch whose failure is printed;
-        // the tenant row (referenced by append-only audit rows) goes in a separate best-effort batch.
-        if let Err(e) = self.admin.batch_execute(&format!(
+        if let Err(e) = self.admin.execute(
             "UPDATE ops.provider_slots SET job_id = NULL, claim_generation = NULL, bound_until = NULL \
-               WHERE job_id IN (SELECT job_id FROM ops.jobs WHERE tenant_id IN ({ids})); \
-             DELETE FROM ops.jobs WHERE tenant_id IN ({ids});"
-        )) {
-            eprintln!("distill_dispatch_v2 cleanup: jobs/slots batch failed: {e}");
+               WHERE job_id IN (SELECT job_id FROM ops.jobs WHERE tenant_id = ANY($1))",
+            &[&self.tenants],
+        ) {
+            eprintln!("distill_dispatch_v2 cleanup: slot release failed: {e}");
         }
-        if let Err(e) = self.admin.batch_execute(&format!(
-            "DELETE FROM control.tenants WHERE tenant_id IN ({ids});"
-        )) {
-            eprintln!("distill_dispatch_v2 cleanup: tenant batch failed (best effort): {e}");
+        for tenant in &self.tenants {
+            let purged = purge_tenant_fixture_sql(&tenant.to_string())
+                .and_then(|sql| self.admin.batch_execute(&sql).map_err(|e| e.to_string()));
+            if let Err(e) = purged {
+                eprintln!("distill_dispatch_v2 cleanup ({tenant}): {e}");
+            }
         }
     }
 }
@@ -169,7 +166,7 @@ impl Handle {
         let id: Uuid = self
             .admin
             .query_one(
-                "INSERT INTO control.tenants (name) VALUES ('distill_dispatch_v2.rs throwaway tenant') \
+                "INSERT INTO control.tenants (name) VALUES ('e2e-fixture distill_dispatch_v2.rs throwaway tenant') \
                  RETURNING tenant_id",
                 &[],
             )
@@ -1287,6 +1284,8 @@ fn the_cutover_block_rearms_stranded_evidence_with_a_full_budget() {
             let (unbound, bound): (Uuid, Uuid) = (seeded.get(0), seeded.get(1));
             let (domain_a, domain_b, ev_dead, ev_jobless): (Uuid, Uuid, Uuid, Uuid) =
                 (seeded.get(2), seeded.get(3), seeded.get(4), seeded.get(5));
+            // replica-mode: fault setup, fixture purged at the end (here every shape it plants, the two t19 tenants
+            // included, goes with `tx.rollback()`; the fixture tenants go through the purge in Handle::drop)
             tx.batch_execute("SET LOCAL session_replication_role = replica")
                 .expect("replica");
             tx.execute(

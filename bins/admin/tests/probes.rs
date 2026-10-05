@@ -271,6 +271,7 @@ impl Db {
     /// superuser, throwaway database); the row-class CHECK still applies.
     fn outbox(&mut self, tenant: Uuid, seq: i64, status: &str) {
         let mut txn = self.sql().transaction().expect("outbox txn");
+        // replica-mode: throwaway database only (humaux_thread_c34_ap_<pid>_<n>, created by fixture(), dropped WITH (FORCE) by Db::drop)
         txn.batch_execute("SET LOCAL session_replication_role = replica")
             .expect("replica role");
         txn.execute(

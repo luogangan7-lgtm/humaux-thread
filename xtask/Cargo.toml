@@ -50,10 +50,10 @@ humaux-infra-cell = { path = "../crates/infra-cell" }
 # Card 28: the seed's entitlement period (now .. now + 1 h) for provisioning::onboard_tenant.
 # why: entitlement period timestamps for the onboarding library; used-by: [xtask::e2e_seed]
 time = "0.3"
-
-[dev-dependencies]
 # ADR-0050 D-D: the throwaway-DB migrate tests skip through `skip_or_fail(ExternalDep::Postgres)`
-# so `HUMAUX_REQUIRE_DB=1` turns a missing database into a red instead of a silent pass.
-# testkit has zero normal dependencies, so this adds no cycle.
-# why: skip_or_fail(ExternalDep::Postgres) so a missing DB is red, not a silent skip; used-by: [tests, xtask::dep_map, xtask::migrate, xtask::migration_rehearsal]
+# so `HUMAUX_REQUIRE_DB=1` turns a missing database into a red instead of a silent pass; ADR-0063
+# "Dev integrity finding": `e2e-seed --teardown` runs the one fixture purge (a normal dependency now).
+# testkit has zero normal dependencies, so this adds no cycle and nothing reaches a runtime binary.
+# why: skip_or_fail(ExternalDep::Postgres) and the shared fixture purge; used-by: [tests, xtask::dep_map, xtask::e2e_seed, xtask::migrate, xtask::migration_rehearsal]
 humaux-testkit = { path = "../crates/testkit" }
+

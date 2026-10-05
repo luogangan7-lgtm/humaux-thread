@@ -314,6 +314,7 @@ fn seed_unresolved_legacy_execution(db: &mut Client, seed: &LegacySeed) -> Uuid 
         )
         .expect("seed valid v1 execution");
     assert!(row.get::<_, bool>(5), "legacy execution must be created");
+    // replica-mode: throwaway database only (humaux_thread_pre0132_<stamp>, migrated through 0131 by `cargo xtask serial-lane` for lane a:pre_0132, dropped by its --drop-provisioned)
     db.batch_execute("BEGIN; SET LOCAL session_replication_role='replica'")
         .expect("begin bounded execution fault");
     db.execute(
@@ -406,6 +407,7 @@ fn pre_0132_unresolved_triples_hard_stop() {
 
     fixture
         .admin
+        // replica-mode: throwaway database only (humaux_thread_pre0132_<stamp>, migrated through 0131 by `cargo xtask serial-lane` for lane a:pre_0132, dropped by its --drop-provisioned)
         .batch_execute("BEGIN; SET LOCAL session_replication_role='replica'")
         .expect("begin bounded candidate repair");
     fixture

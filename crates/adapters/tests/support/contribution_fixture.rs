@@ -1,6 +1,7 @@
 //! `adapters::tests::support::contribution_fixture` — Shared isolated PostgreSQL/Gitleaks fixture for authenticated
 //!   contribution entry tests.
-//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, postgres, sha2, tokio, uuid];
+//! Depends-on: crates=[async-trait, humaux-adapters, humaux-application, humaux-domain, humaux-testkit, postgres, sha2,
+//!   tokio, uuid];
 //!   services=[PostgreSQL(owner) r=[ops.outbox, staging.contribution_candidates, staging.contribution_releases]
 //!   w=[control.contribution_policies, control.credentials, control.memberships, control.private_reasoning_domains,
 //!   control.processor_models, control.provider_accounts, control.provider_endpoints,
@@ -12,7 +13,7 @@
 //!   PostgreSQL(role_private_worker)]; env=[HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
 //!   HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN]; modules=[adapters::contribution_entry_repo,
 //!   adapters::contribution_scan, adapters::postgres, application::consolidate, application::contribute,
-//!   domain::authority, domain::identity, domain::ids, domain::public]
+//!   domain::authority, domain::identity, domain::ids, domain::public, testkit::fixture_purge]
 //! Called-by: [adapters::tests::contribution_authorization, adapters::tests::contribution_execution_0131, adapters::tests::contribution_execution_disclosure_sources_0131, adapters::tests::contribution_execution_ingress_0131, adapters::tests::contribution_execution_repo_0131, adapters::tests::contribution_pipeline, adapters::tests::contribution_policy_lifecycle_0132, adapters::tests::contribution_reasoner, adapters::tests::contribution_self_principal_authority_0133, adapters::tests::mechanism_observation, adapters::tests::phase9_exact_assessed_storage_binding, adapters::tests::phase9_independence_attestation, adapters::tests::project_continuity_0136, adapters::tests::public_provenance, adapters::tests::public_provenance_revocation_eval, adapters::tests::public_runtime, adapters::tests::public_runtime_qdrant, adapters::tests::public_trust, adapters::tests::support::public_anonymous_seam, private-worker::tests::contribution_execution_runner, private-worker::tests::start_manual_contribution_command_0131]
 //! Invariants: [seeds the contribution graph as owner and exercises it through the role_gateway/role_private_worker
 //!   pools; fixtures stay in the disposable isolated database for post-failure forensics]
@@ -71,7 +72,7 @@ impl ContributionFixture {
         let tenant: Uuid = admin
             .query_one(
                 "INSERT INTO control.tenants(name,state) VALUES($1,'ACTIVE') RETURNING tenant_id",
-                &[&format!("contribution-fixture-{}", Uuid::new_v4())],
+                &[&format!("e2e-contribution-fixture-{}", Uuid::new_v4())],
             )
             .expect("tenant")
             .get(0);
@@ -260,6 +261,23 @@ impl ContributionFixture {
             egress_processor,
             coverage_probe_call_id,
             assessment_call_id,
+        }
+    }
+
+    /// Purges this fixture's tenant through the one fixture purge (ADR-0063 "Dev integrity finding") and then its user,
+    /// which is not a tenant row, with constraints enforced. For a test that mutated a fixture row under replica mode;
+    /// the other callers keep their fixtures for post-failure forensics.
+    pub fn purge(mut self) {
+        let tenant = self.auth.tenant_id().0;
+        let sql = humaux_testkit::fixture_purge::purge_tenant_fixture_sql(&tenant.to_string())
+            .expect("canonical tenant id");
+        self.admin
+            .batch_execute(&sql)
+            .unwrap_or_else(|e| panic!("fixture purge of tenant {tenant}: {e}"));
+        if let Some(UserId(user)) = self.auth.user_id() {
+            self.admin
+                .execute("DELETE FROM control.users WHERE user_id=$1", &[&user])
+                .unwrap_or_else(|e| panic!("fixture user {user}: {e}"));
         }
     }
 

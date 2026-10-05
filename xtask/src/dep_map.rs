@@ -3657,18 +3657,21 @@ fn read_catalog(root: &Path, findings: &mut Vec<Finding>) -> Result<Option<Catal
         "SELECT n.nspname || '.' || c.relname, c.relkind::text, pg_get_userbyid(c.relowner), \
          c.relrowsecurity, c.relforcerowsecurity \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = ANY($1) AND c.relkind IN ('r','p','v','m','S','f')",
+         WHERE n.nspname = ANY($1) AND c.relkind IN ('r','p','v','m','S','f') AND NOT c.relispartition",
         &schemas,
     )? {
+        // ADR-0063 D-L: leaves come and go with every monthly create-partitions run, so the parent row names where
+        // they are listed instead of each leaf drifting this file.
         let kind = match r.get::<_, String>(1).as_str() {
             "r" => "table",
-            "p" => "partitioned table",
+            "p" => "partitioned (monthly leaves: control.partition_registry)",
             "v" => "view",
             "m" => "materialized view",
             "S" => "sequence",
             _ => "foreign table",
         };
-        let rls = matches!(kind, "table" | "partitioned table").then(|| (r.get(3), r.get(4)));
+        let rls =
+            (kind == "table" || kind.starts_with("partitioned")).then(|| (r.get(3), r.get(4)));
         objects.insert(
             r.get(0),
             DbObject {

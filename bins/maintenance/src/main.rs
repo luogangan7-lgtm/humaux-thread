@@ -1,22 +1,23 @@
 //! `maintenance::main` — `humaux-maintenance`, the operator-write CLI (§4.2): onboarding, API keys, placement,
 //!   activation, re-drive of DEAD distill jobs, role-password rotation, the deploy-check, opening/closing
 //!   the API-key pepper rehash window and the reasoning-route doors (register / bind / attest-health /
-//!   profile-state / status, ADR-0060 D-H), `sweep once` (one page of every maintenance task, ADR-0062 D-Q), and
-//!   the two resident modes `health serve` (ADR-0061 D-D) and `--serve`, the maintenance daemon (ADR-0062).
+//!   profile-state / status, ADR-0060 D-H), `sweep once` (one page of every maintenance task, ADR-0062 D-Q), the
+//!   one-shot §48.1 retention executor `retention approve | create-partitions | execute` (ADR-0063 D-I), and the
+//!   two resident modes `health serve` (ADR-0061 D-D) and `--serve`, the maintenance daemon (ADR-0062).
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-protocol, rand, serde, serde_json, time, tokio, uuid];
 //!   services=[PostgreSQL(role_maintenance)]; env=[HUMAUX_MAINTENANCE_CREDENTIAL_PEPPER_HEX,
 //!   HUMAUX_MAINTENANCE_EMBEDDING_DIMENSION, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MAINTENANCE_PRIVATE_MEMORY_COLLECTION,
 //!   HUMAUX_MAINTENANCE_QDRANT_CIDR, HUMAUX_MAINTENANCE_QDRANT_HOST, HUMAUX_MAINTENANCE_QDRANT_PORT];
 //!   modules=[adapters::byok, adapters::membership_repo, adapters::postgres, adapters::provisioning,
 //!   adapters::quota_repo, adapters::reasoning_route_onboarding, adapters::role_hygiene,
-//!   domain::identity, domain::ids, domain::ticket_family, maintenance::health_serve, maintenance::roles,
-//!   maintenance::serve, protocol::edge]
+//!   domain::identity, domain::ids, domain::ticket_family, maintenance::health_serve, maintenance::retention,
+//!   maintenance::roles, maintenance::serve, protocol::edge]
 //! Called-by: [process(humaux-maintenance)]
 //! Invariants: [every subcommand but `health serve` and `--serve` is one-shot; one JSON receipt on stdout per run; exit 0 created/existing, 3 refused, 2 usage, 1
 //!   infrastructure (PostgreSQL/Qdrant down); the wire key and generated role passwords are printed once on stdout
 //!   before the receipt, never on stderr or in a receipt; no flag or env var has a literal default]
-//! Spec: Baseline §4.2; §6.2.2; §11.2.3; §41.2; §73.5; §77; §78.1; ADR-0053; ADR-0058; ADR-0059; ADR-0060; ADR-0061;
-//!   ADR-0062
+//! Spec: Baseline §4.2; §6.2.2; §11.2.3; §41.2; §48.1; §73.5; §77; §78.1; ADR-0053; ADR-0058; ADR-0059; ADR-0060;
+//!   ADR-0061; ADR-0062; ADR-0063
 //!
 //! Subcommand mode (card 28). Two modes are resident: `health serve` (ADR-0061 D-D) samples the §41.2 health
 //! gauges, and `--serve` (ADR-0062) runs the scheduled maintenance tasks; each runs until SIGTERM, answers
@@ -48,6 +49,7 @@
 
 mod health_serve;
 mod resident;
+mod retention;
 mod roles;
 mod serve;
 
@@ -78,6 +80,7 @@ apikey issue|revoke | apikey pepper-epoch advance|close | placement ensure | col
 jobs requeue-dead --tenant ID (--job ID | --error-class CLASS) | \
 reasoning register|bind|attest-health|profile-state|status --tenant ID | \
 roles rotate --roles-sql PATH [--role ROLE]... [--create-missing] | deploy-check --roles-sql PATH | \
+retention approve|create-partitions|execute | \
 health serve | --serve | --serve --metrics-families | sweep once | --metrics-families> [flags]";
 
 /// A failure before or outside the provisioning library.
@@ -741,6 +744,9 @@ async fn run(args: Args) -> Result<Output> {
         },
         ["roles", "rotate"] => roles::rotate(&args).await,
         ["deploy-check", ..] => roles::deploy_check(&args).await,
+        ["retention", "approve"] => retention::approve(&args).await,
+        ["retention", "create-partitions"] => retention::create_partitions(&args).await,
+        ["retention", "execute"] => retention::execute(&args).await,
         ["health", "serve"] => health_serve::serve().await,
         ["--serve"] => serve::serve().await,
         ["sweep", "once"] => serve::sweep_once(&args).await,

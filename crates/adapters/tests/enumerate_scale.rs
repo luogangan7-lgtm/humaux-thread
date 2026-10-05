@@ -8,16 +8,19 @@
 //!   adapters::tests::support::throwaway_db, domain::identity, domain::ids, humaux-testkit, projection::serving]
 //! Called-by: [cargo-test]
 //! Invariants: [the 50k seed and every manifest it mints live in humaux_thread_c35_enum_<pid>_<n>, dropped WITH
-//!   (FORCE) even on panic, never in the shared dev database (ruling E8); bars (a) and (b) read the checked-in
+//!   (FORCE) even on panic, never in the shared dev database (ruling E8); bar (a) reads the checked-in
 //!   baseline B (Step 1, measured before any S7 edit), never a value from the same run; a missing baseline fails
 //!   naming the file, never skips]
 //! Spec: Baseline §20.4; §22.1; ADR-0062 D-K, Known limits (ruling E12)
 //!
-//! Regression bars (main-line ruling E12, 2026-10-04 21:50), each printing its operands; n = 30 timed runs after 3
-//! warm-ups, ms, dev host, debug test build, throwaway DB: (a) `first_p95_ms < 0.6 × B.first_p95_ms`;
-//! (b) `ratio_after × 1.5 ≤ ratio_B`; (c) `later_p95_ms < 300`; (d) `manifest_rows == cap`. The card's 300 ms
-//! first-page bar is neither relaxed nor met: it moved verbatim to card 35b and is printed as `target_300ms=` on the
-//! `ENUM` line only.
+//! Regression bars (main-line rulings E12, 2026-10-04 21:50, and E12-b, 2026-10-05 20:05), each printing its
+//! operands; n = 30 timed runs after 3 warm-ups, ms, dev host, debug test build, throwaway DB:
+//! (a) `ratio_after ≤ 0.6 × ratio_B` where ratio = first_p95 / floor_p95 of the SAME run; (c) `later_p95_ms < 300`;
+//! (d) `manifest_rows == cap`. E12-b: no bar compares an absolute first-page time with the baseline — host load moves
+//! first_p95 and the bare floor scan together (card 36 verification: 16.6 s under load, 12.9 s idle on a slower day,
+//! 9.4 s the day before, ratio 13.8–17.3 throughout), so only the ratio is load-independent; it also subsumes the
+//! former weaker bar `ratio × 1.5 ≤ ratio_B`. The card's 300 ms first-page bar is neither relaxed nor met: it moved
+//! verbatim to card 35b and is printed as `target_300ms=` on the `ENUM` line only.
 
 use std::time::{Duration, Instant};
 
@@ -193,29 +196,17 @@ fn floor_ms_once(admin: &mut Client, tenant: Uuid, workspace: Uuid) -> f64 {
     ms(start)
 }
 
-/// Ruling E12 bars (a)–(d), each printing its operands; called after the `ENUM` line so a red run still prints the
-/// numbers it was judged on. `first_p95_b` / `ratio_b` come from baseline B.
-fn judge(
-    first_p95: f64,
-    ratio: f64,
-    later_p95: f64,
-    manifest_rows: i64,
-    first_p95_b: f64,
-    ratio_b: f64,
-) {
+/// Rulings E12 / E12-b bars (a), (c), (d), each printing its operands; called after the `ENUM` line so a red run
+/// still prints the numbers it was judged on. `ratio_b` comes from baseline B.
+fn judge(ratio: f64, later_p95: f64, manifest_rows: i64, ratio_b: f64) {
     assert_eq!(
         manifest_rows as usize, CAP,
         "(d) manifest_rows={manifest_rows} must be == cap={CAP}"
     );
     assert!(
-        first_p95 < 0.6 * first_p95_b,
-        "(a) first_p95_ms={first_p95:.1} must be < 0.6 x B.first_p95_ms={first_p95_b:.1} (= {:.1}; from {BASELINE})",
-        0.6 * first_p95_b
-    );
-    assert!(
-        ratio * 1.5 <= ratio_b,
-        "(b) ratio_after={ratio:.2} x 1.5 = {:.2} must be <= ratio_B={ratio_b:.2} (from {BASELINE})",
-        ratio * 1.5
+        ratio <= 0.6 * ratio_b,
+        "(a) ratio_after={ratio:.2} must be <= 0.6 x ratio_B={ratio_b:.2} (= {:.2}; from {BASELINE})",
+        0.6 * ratio_b
     );
     assert!(
         later_p95 < LATER_P95_BAR_MS,
@@ -227,7 +218,6 @@ fn judge(
 #[ignore = "lane(b) timing-sensitive: seeds 50k memories on its own throwaway database (ADR-0062 D-K M-1)"]
 fn enumerate_first_page_scales_with_a_capped_manifest() {
     let ratio_b = baseline_field("ratio");
-    let first_p95_b = baseline_field("first_p95_ms");
     let db = match throwaway_db::create("c35_enum") {
         Ok(db) => db,
         Err(reason) => {
@@ -311,14 +301,7 @@ fn enumerate_first_page_scales_with_a_capped_manifest() {
          later_p95_ms={later_p95:.1} floor_p95_ms={floor_p95:.1} ratio={ratio:.2} manifest_rows={manifest_rows} \
          target_300ms={target}"
     );
-    judge(
-        first_p95,
-        ratio,
-        later_p95,
-        manifest_rows,
-        first_p95_b,
-        ratio_b,
-    );
+    judge(ratio, later_p95, manifest_rows, ratio_b);
     drop(pool);
     drop(rt);
     drop(admin);

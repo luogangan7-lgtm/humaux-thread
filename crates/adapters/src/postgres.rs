@@ -6,11 +6,12 @@
 //!   PostgreSQL(role_private_worker), PostgreSQL(role_public_worker), PostgreSQL(role_retrieval_worker),
 //!   PostgreSQL(owner)];
 //!   env=[HUMAUX_TEST_PG_DSN]; modules=[domain::error]
-//! Called-by: [adapters::affect_repo, adapters::batch, adapters::confirm_token_repo, adapters::consolidate_repo, adapters::consolidation_reasoner, adapters::context_repo, adapters::continuity_read, adapters::continuity_repo, adapters::contribution_entry_repo, adapters::contribution_execution_ingress, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::contribution_repo, adapters::credential_repo, adapters::disclosure, adapters::distill_reasoner, adapters::distill_repo, adapters::email::outbox, adapters::exact_census, adapters::forget_repo, adapters::health, adapters::jobs, adapters::maintenance_repo, adapters::mechanism_observation, adapters::membership_repo, adapters::memory_governance_repo, adapters::model_call_ledger, adapters::operation_receipt, adapters::placement_repo, adapters::private_inference_rpc, adapters::private_projection_registry, adapters::projection_worker, adapters::provider_budget, adapters::provisioning, adapters::public_provenance, adapters::public_repo, adapters::quota_repo, adapters::read_materialize, adapters::reasoning_route_admission, adapters::reasoning_route_onboarding, adapters::remember, adapters::request_guard_repo, adapters::retrieval_embedding_rpc, adapters::retrieval_query_source, adapters::retrieve, adapters::role_hygiene, adapters::scheduler, adapters::selection_repo, adapters::serving_repo, adapters::stream_repo, adapters::subject_repo, admin::mechanism, admin::probe, consolidation-worker::inference_client, consolidation-worker::main, gateway::auth, gateway::bootstrap, gateway::context, gateway::continuity, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::retrieval_embedding_client, gateway::status, humaux-consolidation-worker, humaux-private-worker, maintenance::health_serve, maintenance::main, maintenance::serve, maintenance::roles, private-worker::distill, private-worker::inference_rpc, private-worker::main, private-worker::route_providers, public-worker::main, retrieval-provider::adapters, retrieval-worker::main, retrieval-worker::rpc, tests, xtask::e2e_seed, xtask::mechanism_registry, xtask::member, xtask::projection_serve]
+//! Called-by: [adapters::affect_repo, adapters::batch, adapters::confirm_token_repo, adapters::consolidate_repo, adapters::consolidation_reasoner, adapters::context_repo, adapters::continuity_read, adapters::continuity_repo, adapters::contribution_entry_repo, adapters::contribution_execution_ingress, adapters::contribution_execution_repo, adapters::contribution_reasoner, adapters::contribution_repo, adapters::credential_repo, adapters::disclosure, adapters::distill_reasoner, adapters::distill_repo, adapters::email::outbox, adapters::exact_census, adapters::forget_repo, adapters::health, adapters::jobs, adapters::maintenance_repo, adapters::mechanism_observation, adapters::membership_repo, adapters::memory_governance_repo, adapters::model_call_ledger, adapters::operation_receipt, adapters::placement_repo, adapters::private_inference_rpc, adapters::private_projection_registry, adapters::projection_worker, adapters::provider_budget, adapters::provisioning, adapters::public_provenance, adapters::public_repo, adapters::quota_repo, adapters::read_materialize, adapters::reasoning_route_admission, adapters::reasoning_route_onboarding, adapters::remember, adapters::request_guard_repo, adapters::retrieval_embedding_rpc, adapters::retrieval_query_source, adapters::retrieve, adapters::role_hygiene, adapters::scheduler, adapters::selection_repo, adapters::serving_repo, adapters::stream_repo, adapters::subject_repo, admin::mechanism, admin::probe, consolidation-worker::inference_client, consolidation-worker::main, gateway::auth, gateway::bootstrap, gateway::context, gateway::continuity, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::retrieval_embedding_client, gateway::status, humaux-consolidation-worker, humaux-private-worker, maintenance::health_serve, maintenance::main, maintenance::retention, maintenance::serve, maintenance::roles, private-worker::distill, private-worker::inference_rpc, private-worker::main, private-worker::route_providers, public-worker::main, retrieval-provider::adapters, retrieval-worker::main, retrieval-worker::rpc, tests, xtask::e2e_seed, xtask::mechanism_registry, xtask::member, xtask::projection_serve]
 //! Invariants: [the only file that names sqlx::PgPool: eight typed pools, one per role (§6.2.3), each connect checks
 //!   current_user and fails with PoolInitError::RoleMismatch on a wrong role; no raw-pool accessor leaves the crate;
-//!   the ninth, MigratorDbPool, refuses every §6.2.0 role and any principal without CREATEROLE (ADR-0059 D-E)]
-//! Spec: Baseline §58; §6.2.3; §15.4; §15.2; §6.2.2; ADR-0059
+//!   the ninth, MigratorDbPool, refuses every §6.2.0 role and any principal without CREATEROLE (ADR-0059 D-E);
+//!   RetentionExecutor wraps it and also refuses a non-SUPERUSER session_user (ADR-0063 D-H)]
+//! Spec: Baseline §58; §6.2.3; §15.4; §15.2; §6.2.2; ADR-0059; ADR-0063 D-H
 //!
 //! Spec canonical path is `crates/adapters/postgres/src/pools.rs`; this repo's crate layout
 //! (§58) flattens adapters into `crates/adapters/src/<name>.rs` modules, so **this file IS
@@ -331,6 +332,40 @@ impl MigratorDbPool {
     /// `adapters::role_hygiene`'s accessor — see [`RuntimeDbPool::pool`]'s doc for why `pub(crate)`.
     pub(crate) fn pool(&self) -> &PgPool {
         &self.0
+    }
+}
+
+/// The `humaux-maintenance retention …` principal (ADR-0063 D-H): the [`MigratorDbPool`] principal, and it must be a
+/// SUPERUSER. LOCK SHARE, COPY and count of a leaf need table privileges no non-owner role may hold on a leaf (rls-check
+/// partition arm), and the cross-tenant hold reads need to bypass FORCE RLS; a CREATEROLE-only migrator can do neither.
+pub struct RetentionExecutor(MigratorDbPool);
+
+impl RetentionExecutor {
+    /// [`MigratorDbPool::connect`]'s check, then `rolsuper` of `session_user`; anything else is
+    /// [`PoolInitError::RoleMismatch`] naming SUPERUSER, before any other statement.
+    pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
+        // dep: PostgreSQL(owner) — the checked migrator connect this executor narrows to SUPERUSER
+        let migrator = MigratorDbPool::connect(dsn).await?;
+        let row = sqlx::query(
+            "SELECT session_user::text, rolsuper FROM pg_roles WHERE rolname = session_user",
+        )
+        // dep: PostgreSQL(owner) — the connect check of the retention executor principal
+        .fetch_one(migrator.pool())
+        .await
+        .map_err(PoolInitError::Connect)?;
+        let actual: String = row.try_get(0).map_err(PoolInitError::Connect)?;
+        if !row.try_get::<bool, _>(1).map_err(PoolInitError::Connect)? {
+            return Err(PoolInitError::RoleMismatch {
+                expected: "a SUPERUSER principal (ADR-0063 D-H)",
+                actual,
+            });
+        }
+        Ok(Self(migrator))
+    }
+
+    /// `adapters::maintenance_repo`'s executor accessor — see [`RuntimeDbPool::pool`]'s doc for why `pub(crate)`.
+    pub(crate) fn pool(&self) -> &PgPool {
+        self.0.pool()
     }
 }
 

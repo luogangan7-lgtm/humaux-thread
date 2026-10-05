@@ -43,6 +43,35 @@ Since card 25 (ADR-0050 D-D/D-F), migrate also enforces the following:
   than stalling traffic behind an `ACCESS EXCLUSIVE` request. Stop the workers, migrate, then
   start them in §5 order.
 
+### 1.1 The §48.1 partition conversions (0224–0230, card 36, ADR-0063 D-D / D-M)
+
+Migrations 0224–0230 turn `ops.stage_runs`, `private.messages`, `ops.maintenance_receipts`, `private.events`,
+`control.audit_events` and `ops.model_call_ledger` into monthly RANGE parents under their own names (the heap
+becomes one leaf, the current month plus three future months are pre-created, no DEFAULT partition). All seven are
+`FORWARD_ONLY` with `backup_restore_requirement = "pg_dump before apply"`: there is no down migration. Each holds
+ACCESS EXCLUSIVE on its table and SHARE ROW EXCLUSIVE on every FK neighbour for its whole transaction, so **every
+writer is stopped first** (milliseconds on an empty production database; measured on a dev copy in ADR-0063).
+A conversion refuses `c36 precheck: <fk>: <n> orphan rows - repair data first` when rows violate an FK it re-creates.
+
+On a database that already holds data (the shared dev database), the order is fixed and run by the main line only:
+
+1. stop every writer; `SELECT count(*) FROM pg_stat_activity WHERE datname = '<db>' AND usename <> 'postgres'` = 0;
+2. `c36_devcopy.sh` (task-work directory): a fresh `pg_dump -Fc` into `db_backups_<YYYYMMDD>_c36/`, checked with
+   `pg_restore -l` and sha256, restored into two throwaways, one migrated; counts compared, `rls-check`, latency;
+   it must end `C36 DEVCOPY COUNTS EQUAL` with every migration under 30 s;
+3. `MAINLINE_GO=1 c36_dev_convert.sh`: refuses unless step 2 is EQUAL, the dump's sha256 still matches and dev
+   has not changed since the dump; migrates, compares counts and ends `C36 DEV COUNTS EQUAL`;
+4. restart the services in §5 order.
+
+**Rollback** (no down migration): restore the step-2 dump into a fresh database
+(`createdb <db>_restore && pg_restore -d <db>_restore <dump>`), stop every service, swap the names
+(`ALTER DATABASE <db> RENAME TO <db>_c36_failed; ALTER DATABASE <db>_restore RENAME TO <db>`), start the services.
+The restored database passes `cargo xtask rls-check` (partition arm included) and runs retention **without any
+rebind step**: since 0231 a leaf is identified by its name and bounds, verified against the catalog, never by a
+stored OID (a logical restore renumbers every relation; ADR-0063 "Registry by name", proven by
+`partitions.rs::registry_survives_a_logical_dump_and_restore`). A dump taken before 0231 restores the same way: 0231
+re-checks every registry row by name and bounds when the restored copy is migrated, and clears the old OIDs.
+
 ## 2. Roles and grants
 
 ADR-0059. The eight password roles — the seven LOGIN roles of `migrations/0011_roles_and_grants.sql`
@@ -357,6 +386,8 @@ door. A full rotation takes `ceil(tenants / TENANTS_PER_RUN) × EVERY` (ADR-0062
 | `jobs` | `ops.purge_terminal_jobs(interval, interval, interval, integer)` (0218) | `JOBS_*` | `JOBS_DONE_RETENTION_SECONDS`, `JOBS_DEAD_RETENTION_SECONDS`, budget window = `HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS` | a job with a provider call inside the budget window; a contribution-linked job; a DEAD distill job `jobs requeue-dead` could still re-arm (its Evidence row is not DONE); every outbox row (no outbox door, ruling E11) | receipts task `terminal_jobs` |
 | `reissue` | `projection.reissue_unsettled_tickets(uuid, interval, integer)` (0220; cool-down clock incl. `lost_at`, 0223) | `REISSUE_*` | `REISSUE_COOLDOWN_SECONDS` (> 0) | a tombstoned or non-indexable memory; a memory with a ticket in flight; a deterministic failure already reissued once | `projection.ticket_reissues` (one row per fresh ticket) |
 | `redrive` | `ops.auto_redrive_schema_failed(uuid, interval, integer)` (0221) + one §77 row | `REDRIVE_*` | `REDRIVE_COOLDOWN_SECONDS` (> 0) | any class but `FAILED_OUTPUT_SCHEMA`; a job already re-driven once (`auto_redrives = 1`) | `control.audit_events` action `DISTILL_AUTO_REDRIVE` |
+| `partitions` (cluster-level, once per run, ADR-0063 D-K) | one `UPDATE control.partition_registry` of the two proposal columns (expired leaves of each table's latest effective policy, never the newest leaf) + one horizon read | `PARTITIONS_EVERY_SECONDS` (no LIMIT, no tenant page) | the policy's `retention_months` (`control.retention_policies`) | every DDL, every DROP, every hold (holds are re-derived by the executor only) | `proposed_at` / `proposed_policy_revision` on the registry row; `partition_horizon_months{table}` |
+| `create-partitions` — **MANUAL monthly operator step**, not the daemon | `humaux-maintenance retention create-partitions --months-ahead 3` (§5.3), from the operator shell with the superuser `HUMAUX_MIGRATOR_PG_DSN` exported for that one command | monthly, first week of the month | — | existing leaves (idempotent: an existing month returns `exists`) | new `control.partition_registry` rows; `partition_horizon_months` back to 3; one §77 row `PARTITIONS_CREATED` |
 
 - **What an operator reads**, as `role_maintenance` with the tenant GUC: `SELECT task, sum(affected), max(ran_at)
   FROM ops.maintenance_receipts WHERE tenant_id = $1 AND ran_at > now() - interval '1 day' GROUP BY task`.
@@ -390,6 +421,80 @@ test, a gate or the rehearsal (they use throwaway databases). When an operator d
 3. **Run once with explicit retentions**: `humaux-maintenance sweep once` with the §77 fields (actor, reason,
    ticket, step-up) and the keys chosen for this run; read its receipt, then the receipts table.
 4. Only then start the resident unit.
+
+### 5.3 Partitions: the monthly create-partitions step and the horizon alerts (ADR-0063 D-F)
+
+The §48.1 tables have **no DEFAULT partition**. The first insert whose key is at or past the last pre-created month
+fails with SQLSTATE 23514 (`no partition of relation … found for row`) for **every tenant at the same instant**
+(00:00 UTC on the 1st): audited admin operations abort, every model call is refused before dispatch, `remember`
+fails, the maintenance doors answer 503. No data is lost (every failure is a refused write), but most repositories
+map 23514 to **409 / 400**, not 5xx (card 36b fixes the mapping), so the outage does not page through 5xx
+monitoring. The alarm is the three horizon alerts, one to two months earlier.
+
+**Monthly step** (first week of each month; nothing stores the DSN — no cron, no supervised env file):
+
+```sh
+export HUMAUX_MIGRATOR_PG_DSN=…   # the superuser migrator principal, this shell only
+humaux-maintenance retention create-partitions --months-ahead 3 --lock-timeout-ms 5000 \
+  --actor <you> --reason "monthly partitions" --ticket <ticket> --step-up-auth <ref>
+unset HUMAUX_MIGRATOR_PG_DSN
+```
+
+It prints one JSON receipt (`outcome` `created` or `existing`), writes one §77 `PARTITIONS_CREATED` row when it
+created a leaf, and the next `--serve` PARTITIONS run shows `partition_horizon_months{table} = 3` for every table.
+New leaves serve the next insert at once; nothing restarts. Exit 1 = busy (another `retention` command holds
+`HXRETAIN`) or a lock wait past `--lock-timeout-ms`: re-run.
+
+**When an alert fires** (`partition_horizon_months{table}`: 3 after the step, 2 the month after, ≤ 1 after one
+missed step, -1 = a table with no leaf):
+
+| alert | meaning | do |
+|---|---|---|
+| `PartitionHorizonShort` (WARNING, ≤ 1 for 1h) | one monthly step was missed; the outage is two months away | run the monthly step now |
+| `PartitionHorizonExhausted` (CRITICAL, ≤ 0 for 10m) | the current month's leaf is the last one (or the table has none): inserts fail from the next 1st | run the monthly step now; check its receipt lists the table; confirm the gauge reads 3 on the next PARTITIONS run |
+| `PartitionHorizonAbsent` (CRITICAL, absent for 2h) | the daemon's PARTITIONS run has not succeeded (a failed run removes the family, it never keeps the last value) or the daemon is not scraped | read `maintenance_task_runs_total{task="partitions",outcome="failed"}` and the daemon's log (`partitions: …`): usually a revoked grant on `control.partition_registry` / `control.retention_policies` or an unreachable database; fix it, the next run renders the family again. Until then nobody sees the horizon: run the monthly step by hand |
+
+**Never attach a DEFAULT partition** as a stop-gap: it hides the miss, makes every later month creation scan and
+move rows, and forbids `DETACH … CONCURRENTLY`.
+
+### 5.4 Retention execute (ADR-0063 D-C, D-G, D-I, D-J)
+
+Retention drops one whole month of one table for **all tenants at once** (per-tenant deletion stays §37
+tombstones). `EVENTS` and `AUDIT_EVENTS` cannot have a policy (a CHECK; card 37 / a separate approval line). Every
+command below runs from the operator shell with the superuser `HUMAUX_MIGRATOR_PG_DSN` exported for that command
+only, never from the supervised environment (both resident modes refuse to boot when it is set), and takes the §77
+fields `--actor --reason --ticket --step-up-auth` plus `--lock-timeout-ms`. Exit 0 = done / no-op, 1 = infra or busy
+(re-run), 2 = configuration, 3 = refused (`{"outcome":"refused","reason":"<code>"}`).
+
+1. **Precondition — backup.** `pg_dump -Fc -t <parent> <db> > pre_retention_<table>_<date>.dump` (the leaf rows are
+   in it), checked with `pg_restore -l`, kept under §44 protection until the drop is reviewed. Card 37's PITR proof
+   replaces this; until then it is required.
+2. **Approve** a policy (a row IS the approval; the newest revision of a table is the current one; `forever`
+   withdraws): `retention approve --table MODEL_CALL_LEDGER --months 12 --effective-at <rfc3339>`.
+3. **Wait for the proposal**: the daemon's next PARTITIONS run (after `effective_at`) marks each expired leaf
+   (`proposed_policy_revision`, `proposed_at`). The proposal corroborates; it authorises nothing.
+4. **List**: `retention execute --policy <id> --export-dir <dir> --dry-run` — every due leaf with `registry_id`,
+   bounds, row count and the verdict of `control.partition_drop_check` (`ok` or the refusal, e.g.
+   `hold:unsettled_ledger_calls`, `hold:open_budget_reservations`, `hold:open_contribution_executions`,
+   `hold:running_stage`, `not_due`, `newest_leaf`, `not_proposed`, `registry_catalog_mismatch <leaf>` — the registry
+   row's name or bounds no longer describe the catalog's leaf; investigate, never edit the row to make it pass).
+   Nothing is written.
+5. **Review one leaf**: `retention execute --policy <id> --registry-id <id> --export-dir <dir> --dry-run` prints the
+   exact `DETACH PARTITION` / `DROP TABLE … RESTRICT` statements the database will execute.
+6. **Run it**: the same command without `--dry-run`. In one transaction the database re-derives every predicate,
+   the leaf is exported (`COPY` to `<dir>/<leaf>__<registry_id>.copy`, mode 0600, fsync, rename, directory fsync,
+   row count checked, sha256; the file holds every tenant's rows of the month, so `<dir>` is owner-only, e.g.
+   `install -d -m 0700 <dir>`), detached,
+   dropped RESTRICT (never CASCADE), and the registry row becomes the receipt (`rows_dropped`, `export_path`,
+   `export_sha256`, `dropped_by`) with one §77 `PARTITION_DROPPED` row. One leaf per run; a backlog is one reviewed
+   run per leaf.
+7. **After exit 1** (lost acknowledgement, lock timeout): re-run the same command. A dropped leaf answers
+   `already_dropped` with its stored receipt; the next month is never taken.
+8. **Restore from the export** (to read it, or to hand it over): `CREATE TABLE <scratch> (LIKE <parent>)` in a
+   scratch database, `COPY <scratch> FROM '<file>'`, then compare `count(*)` with `rows_dropped` and the file's
+   sha256 with `export_sha256`. The parent cannot take the rows back through this door: a dropped month has no
+   leaf, `control.partition_create_month` only extends the newest bound (it refuses a gap), and re-attaching a past
+   month is owner DDL that needs its own reviewed decision.
 
 ## 6. First activation — performed by onboarding (ADR-0053)
 
