@@ -1,0 +1,2 @@
+30 0 * * * $HOME/humaux/deploy/pgbackrest/humaux-dr.sh backup run
+0 3 * * 3 $HOME/humaux/deploy/pgbackrest/humaux-dr.sh restore drill --evidence $HOME/humaux/dr-evidence/drill-$(date -u +\%Y\%m\%d).json

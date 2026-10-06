@@ -431,6 +431,7 @@ HUMAUX_MAINTENANCE_SERVE_JOBS_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_JOBS_LIMI
 HUMAUX_MAINTENANCE_SERVE_REISSUE_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_REISSUE_LIMIT=2 \
 HUMAUX_MAINTENANCE_SERVE_REDRIVE_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_SERVE_REDRIVE_LIMIT=2 \
 HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS=3 \
+HUMAUX_MAINTENANCE_SERVE_DR_EVIDENCE_EVERY_SECONDS=3 HUMAUX_MAINTENANCE_DR_REPO_FS_PATH=$EV HUMAUX_MAINTENANCE_DR_PGDATA_FS_PATH=$EV \
 HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS=$((LAG_SECS + 1)) HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS=$LAG_SECS \
 HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS=0 HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_IDLE_SECONDS=0 \
 HUMAUX_MAINTENANCE_SERVE_JOBS_DONE_RETENTION_SECONDS=0 HUMAUX_MAINTENANCE_SERVE_JOBS_DEAD_RETENTION_SECONDS=0 \
@@ -1747,16 +1748,27 @@ PERM_SEQ=$(PGQ "select s.stream_seq from ops.outbox o join projection.stream_log
 # 512-d fault would land on someone else's ticket. Checked, never assumed.
 PERM_OTHERS=$(PGQ "select count(*) from projection.stream_log s join projection.tenant_placements p on p.tenant_id=s.tenant_id and p.projection_family='private_memory_v1' where s.state='ISSUED' and s.scope_kind='workspace' and s.domain='$DOMAIN' and s.projection_kind='$PKIND' and s.projection_version='$PVER' and (s.lease_expires_at is null or s.lease_expires_at < now()) and (s.next_attempt_at is null or s.next_attempt_at <= now()) and not exists (select 1 from ops.outbox o where o.tenant_id=s.tenant_id and o.commit_seq=s.commit_seq and o.event_type='EVIDENCE_ACCEPTED' and o.status in ('PENDING','PROCESSING')) and not (s.tenant_id='$TENANT_C' and s.scope_id='$WS_C2' and s.stream_seq=${PERM_SEQ:-0})")
 PTS_BEFORE=$(curl -s -X POST "http://127.0.0.1:6333/collections/$COLLECTION/points/count" -H 'Content-Type: application/json' --data "{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"tenant_id\",\"match\":{\"value\":\"$TENANT_C\"}},{\"key\":\"workspace_id\",\"match\":{\"value\":\"$WS_C2\"}}]}}" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['count'])")
-if [ "$PERM_OTHERS" = "0" ]; then
+# ADR-0064 D-C: a worker binds its embedding label to the fingerprint of its model inputs before the first pass; the
+# same label with another dimension is refused at boot (exit 2) and claims nothing. The card-27 permanent fault (a
+# 512-d vector into the 1024-d collection) therefore runs under its own label, after the refusal itself is witnessed.
+# Both workers share this environment except DIMENSION and EMBEDDING_VERSION. The refusal logs to its own file: the
+# c37_rehearse.sh post-chain assertion wants no fingerprint_mismatch in the worker logs, and this one is intended.
+perm_run_once() {  # <dimension> <embedding label> <log>  (--run-once; returns the worker's exit code)
   ( export HUMAUX_RETRIEVAL_WORKER_PG_DSN="postgres://role_retrieval_worker:${HUMAUX_ROLE_PASSWORD_RETRIEVAL_WORKER:?}@$PG/$DB" \
       HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER=dashscope HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL=$EMB_MODEL HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION=$EMB_REV \
-      HUMAUX_RETRIEVAL_WORKER_DIMENSION=512 HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$EMB_VER HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
+      HUMAUX_RETRIEVAL_WORKER_DIMENSION=$1 HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION=$2 HUMAUX_RETRIEVAL_WORKER_REGION=$EMB_REGION HUMAUX_RETRIEVAL_WORKER_MAX_INPUT_TOKENS=$EMB_MAX_TOK \
       HUMAUX_RETRIEVAL_WORKER_QDRANT_HOST=127.0.0.1 HUMAUX_RETRIEVAL_WORKER_QDRANT_PORT=6333 HUMAUX_RETRIEVAL_WORKER_QDRANT_CIDR=127.0.0.1/32 HUMAUX_RETRIEVAL_WORKER_QDRANT_TLS=false \
       HUMAUX_RETRIEVAL_WORKER_CELL_ID=$CELL_ID HUMAUX_RETRIEVAL_WORKER_CALLER=retrieval-worker \
       HUMAUX_RETRIEVAL_WORKER_GITLEAKS_BIN=$GITLEAKS_BIN HUMAUX_RETRIEVAL_WORKER_GITLEAKS_SHA256=$GITLEAKS_SHA HUMAUX_RETRIEVAL_WORKER_GITLEAKS_VERSION=$GITLEAKS_VER
     eval "export $RP_PASS_ENV"; export HUMAUX_RETRIEVAL_WORKER_BATCH=1 HUMAUX_RETRIEVAL_WORKER_PER_TENANT_CAP=1
     set -a; source $R/.env.local; set +a
-    exec "$BIN_DIR"/humaux-retrieval-worker --run-once ) 2>&1 | tee -a $EV/projection-runner.log | tail -2 | tee -a $EV/rehearsal.log
+    exec "$BIN_DIR"/humaux-retrieval-worker --run-once ) >> $3 2>&1
+}
+if [ "$PERM_OTHERS" = "0" ]; then
+  perm_run_once 512 "$EMB_VER" $EV/dc-refusal.log; DC_RC=$?; tail -1 $EV/dc-refusal.log | tee -a $EV/rehearsal.log
+  DC_ROW=$(PGQ "select state from projection.stream_log where tenant_id='$TENANT_C' and scope_id='$WS_C2' and stream_seq=${PERM_SEQ:-0}")
+  assert_eq "same_label_other_dimension_refused_at_boot(n=1: exit|ticket)" "$DC_RC|$DC_ROW" "2|ISSUED"
+  perm_run_once 512 "$EMB_VER-rehearsal-512d" $EV/projection-runner.log; tail -2 $EV/projection-runner.log | tee -a $EV/rehearsal.log
 else
   echo "pst permanent fault NOT injected: $PERM_OTHERS other claimable ticket(s) exist and would take the fault" | tee -a $EV/rehearsal.log
 fi

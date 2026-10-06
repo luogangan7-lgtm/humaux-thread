@@ -19,6 +19,12 @@ route:
       group_wait: 0s
       group_interval: 1m
       repeat_interval: 5m
+    # ADR-0064 10.11 F: the standing BackupNotOffsite notice (card 37 keeps every backup copy on this host) is sent
+    # once a week and never resolves, so it neither floods nor trains the owner to ignore the channel that carries
+    # the disk and backup alerts.
+    - matchers: ['alertname="BackupNotOffsite"']
+      receiver: humaux-log-sink-weekly
+      repeat_interval: 168h
 
 receivers:
   - name: humaux-log-sink
@@ -28,4 +34,8 @@ receivers:
   - name: watchdog-healthchecks
     webhook_configs:
       - url_file: __HUMAUX_ALERTMANAGER_WATCHDOG_URL_FILE__
+        send_resolved: false
+  - name: humaux-log-sink-weekly
+    webhook_configs:
+      - url_file: __HUMAUX_ALERTMANAGER_LOG_SINK_URL_FILE__
         send_resolved: false

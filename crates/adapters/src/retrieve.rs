@@ -3,7 +3,8 @@
 //!   (T3.8).
 //! Depends-on: crates=[hex, hmac, humaux-domain, humaux-infra-cell, humaux-projection, humaux-retrieval, sha2, sqlx];
 //!   services=[PostgreSQL(role_gateway) r=[ops.outbox, private.evidence_objects, private.memory_evidence,
-//!   private.memory_records, projection.stream_checkpoints, projection.stream_log]]; env=[CARGO_MANIFEST_DIR];
+//!   private.memory_records, projection.rebuild_tickets, projection.stream_checkpoints, projection.stream_log]];
+//!   env=[CARGO_MANIFEST_DIR];
 //!   modules=[adapters::context_repo, adapters::postgres, adapters::private_projection_registry, adapters::qdrant,
 //!   adapters::read_materialize, adapters::serving_repo, adapters::stream_repo, domain::affect, domain::error,
 //!   domain::identity, domain::ids, domain::subject, infra-cell::permit, infra-cell::transport, projection::dense, projection::serving,
@@ -12,8 +13,9 @@
 //! Invariants: [read-your-writes on role_gateway: an expired token, cross-tenant/workspace scope or a changed serving
 //!   projection is a typed RetrieveError, never a stale answer passed off as caught up; the read-route visible count
 //!   is caller-scoped (family_probe), the visibility-free stream count serves ops callers only (ADR-0057 D-C);
-//!   the consistency token is MAC-verified before any field is parsed and carries no authorization (ADR-0059 D-G)]
-//! Spec: Baseline §6.2.3, §15.5; ADR-0057; ADR-0059
+//!   the consistency token is MAC-verified before any field is parsed and carries no authorization (ADR-0059 D-G);
+//!   the RYW overlay never shows a rebuild generation's stream_log row (ADR-0064 D-A, E13)]
+//! Spec: Baseline §6.2.3, §15.5; ADR-0057; ADR-0059; ADR-0064
 //!
 //! **Why this lives in `humaux-adapters`, not `humaux-application`**: every function below
 //! that touches PostgreSQL needs `&RuntimeDbPool`, and [`crate::postgres::RuntimeDbPool`]'s
@@ -829,6 +831,14 @@ pub(crate) async fn pg_delta_overlay_in_txn(
          WHERE sl.tenant_id = $1 AND sl.scope_kind = $2 AND sl.scope_id = $3
            AND sl.domain = $4 AND sl.projection_kind = $5 AND sl.projection_version = $6
            AND sl.stream_seq > $7 AND sl.stream_seq <= $8 AND sl.state <> 'TOMBSTONED'
+           -- ADR-0064 D-A / E13: a rebuild generation's rows enter no envelope (§16.2).
+           AND NOT EXISTS (
+                 SELECT 1 FROM projection.rebuild_tickets rt
+                  WHERE rt.tenant_id = sl.tenant_id AND rt.scope_kind = sl.scope_kind
+                    AND rt.scope_id = sl.scope_id AND rt.domain = sl.domain
+                    AND rt.projection_kind = sl.projection_kind
+                    AND rt.projection_version = sl.projection_version
+                    AND rt.stream_seq = sl.stream_seq)
            AND (evidence.visibility_class = 'TENANT_SHARED'
              OR (evidence.visibility_class = 'USER_PRIVATE' AND evidence.visibility_user_id = $9)
              OR (evidence.visibility_class = 'WORKSPACE_SHARED'

@@ -3,20 +3,24 @@
 //!   `ISSUED -> LOST` patrol (through [`MaintenanceDbPool`]).
 //! Depends-on: crates=[humaux-domain, humaux-projection, humaux-retrieval, humaux-testkit, sqlx, tokio];
 //!   services=[PostgreSQL(any)
-//!   r=[ops.jobs, ops.outbox, projection.processing_gaps] w=[projection.stream_checkpoints, projection.stream_log]
+//!   r=[ops.jobs, ops.outbox, projection.processing_gaps, projection.rebuild_tickets, projection.tenant_placements]
+//!   w=[projection.stream_checkpoints, projection.stream_log]
 //!   x=[projection.retire_failed_ticket, projection.stream_point_ledger], PostgreSQL(role_maintenance),
 //!   PostgreSQL(role_retrieval_worker) x=[projection.claim_issued_tickets, projection.unplaced_issued_tickets]];
 //!   env=[HUMAUX_TEST_PG_DSN];
 //!   modules=[adapters::placement_repo, adapters::postgres, adapters::qdrant, adapters::retrieve, domain::dataclass, domain::egress, domain::identity,
 //!   projection::stream, retrieval::completeness]
-//! Called-by: [adapters::context_repo, adapters::projection_worker, adapters::retrieve, adapters::serving_repo, maintenance::serve, retrieval-worker::main, tests, xtask::projection_serve]
+//! Called-by: [adapters::context_repo, adapters::projection_worker, adapters::retrieve, adapters::serving_repo,
+//!   maintenance::drill, maintenance::serve, retrieval-worker::main, tests, xtask::projection_serve]
 //! Invariants: [every function opens its own transaction and sets humaux.tenant_id before touching FORCE-RLS stream
 //!   tables (otherwise it would silently see zero rows) — except the two ADR-0052 definer calls, which are the only
 //!   cross-tenant reads/claims of stream_log; every settle/retry/release write is fenced on (lease_owner, attempts), so
 //!   a worker whose lease was reclaimed writes 0 rows; consistency arithmetic lives in humaux_projection::stream;
 //!   A2's point reading and the projection-lag age are read in the ledger's snapshot (ADR-0057 D-L/D-D);
-//!   sweep_lost never takes a leased or backing-off ticket and moves at most its LIMIT per call (ADR-0062 D-L)]
-//! Spec: Baseline §6.2.0; §11; §15.2; §23.1②; ADR-0052; ADR-0057; ADR-0062
+//!   sweep_lost never takes a leased or backing-off ticket and moves at most its LIMIT per call (ADR-0062 D-L);
+//!   claim_run_tickets leases only the generation tickets of one rebuild run, never a generation-1 ticket
+//!   (ADR-0064 D-N(g))]
+//! Spec: Baseline §6.2.0; §11; §15.2; §23.1②; ADR-0052; ADR-0057; ADR-0062; ADR-0064
 //!
 //! The consistency arithmetic itself lives in
 //! `humaux_projection::stream` (no IO, unit-tested there); this module only fetches the
@@ -676,6 +680,87 @@ pub async fn claim_issued(
     // dep: PostgreSQL(role_retrieval_worker) — the cross-tenant ticket claim definer (0176)
     .fetch_all(pool.pool())
     .await?;
+    Ok(parse_claim_rows(&rows))
+}
+
+/// The one rebuild run a scoped claim may take tickets of (ADR-0064 D-N(g)): its tenant (the RLS GUC the claim
+/// runs under; `rebuild_tickets` is FORCE RLS) and its `run_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnlyRun {
+    pub tenant_id: Uuid,
+    pub run_id: Uuid,
+}
+
+/// ADR-0064 D-N(g): [`claim_issued`] narrowed to the generation tickets of ONE rebuild run, so a pass over a
+/// restored cluster never claims a restored generation-1 ticket. Same lease, attempt increment, per-family
+/// exclusivity, distill-closed predicate and placement join as the 0176 definer, as role_retrieval_worker under the run's tenant GUC
+/// with its table-level UPDATE and its `rebuild_tickets` SELECT (no definer, no new grant). The resident worker
+/// never calls this; it claims through [`claim_issued`].
+pub async fn claim_run_tickets(
+    pool: &RetrievalWorkerDbPool,
+    family: &ClaimFamily,
+    run: OnlyRun,
+    lease_owner: &str,
+    lease_seconds: f64,
+    limit: i64,
+) -> Result<ClaimBatch, StreamRepoError> {
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `claim_run_tickets`
+    let mut txn = pool.pool().begin().await?;
+    set_tenant_local(&mut txn, run.tenant_id).await?;
+    let rows = sqlx::query(
+        "WITH picked AS ( \
+           SELECT s.tenant_id, s.scope_kind, s.scope_id, s.domain, s.projection_kind, \
+                  s.projection_version, s.stream_seq \
+             FROM projection.stream_log s \
+             JOIN projection.rebuild_tickets rt \
+               ON rt.tenant_id = s.tenant_id AND rt.scope_kind = s.scope_kind AND rt.scope_id = s.scope_id \
+              AND rt.domain = s.domain AND rt.projection_kind = s.projection_kind \
+              AND rt.projection_version = s.projection_version AND rt.stream_seq = s.stream_seq \
+              AND rt.run_id = $1 \
+            WHERE s.tenant_id = $2 AND s.state = 'ISSUED' AND s.scope_kind = 'workspace' \
+              AND s.domain = $3 AND s.projection_kind = $4 AND s.projection_version = $5 \
+              AND (s.lease_expires_at IS NULL OR s.lease_expires_at < clock_timestamp()) \
+              AND (s.next_attempt_at IS NULL OR s.next_attempt_at <= clock_timestamp()) \
+              AND NOT EXISTS ( \
+                    SELECT 1 FROM projection.stream_log f \
+                     WHERE f.tenant_id = s.tenant_id AND f.scope_kind = s.scope_kind \
+                       AND f.scope_id = s.scope_id AND f.domain = s.domain \
+                       AND f.projection_kind = s.projection_kind \
+                       AND f.projection_version = s.projection_version \
+                       AND f.state = 'ISSUED' AND f.lease_expires_at >= clock_timestamp()) \
+              AND NOT EXISTS ( \
+                    SELECT 1 FROM ops.outbox o \
+                     WHERE o.tenant_id = s.tenant_id AND o.commit_seq = s.commit_seq \
+                       AND o.event_type = 'EVIDENCE_ACCEPTED' AND o.status IN ('PENDING', 'PROCESSING')) \
+            ORDER BY s.scope_id, s.stream_seq \
+            LIMIT $6 \
+            FOR UPDATE OF s SKIP LOCKED) \
+         UPDATE projection.stream_log s \
+            SET lease_owner = $7, \
+                lease_expires_at = clock_timestamp() + make_interval(secs => $8), \
+                attempts = s.attempts + 1 \
+           FROM picked k, projection.tenant_placements p \
+          WHERE s.tenant_id = k.tenant_id AND s.scope_kind = k.scope_kind AND s.scope_id = k.scope_id \
+            AND s.domain = k.domain AND s.projection_kind = k.projection_kind \
+            AND s.projection_version = k.projection_version AND s.stream_seq = k.stream_seq \
+            AND p.tenant_id = s.tenant_id AND p.projection_family = $9 AND s.state = 'ISSUED' \
+         RETURNING s.tenant_id, s.scope_kind, s.scope_id, s.domain, s.projection_kind, \
+                   s.projection_version, s.stream_seq, s.commit_seq, s.attempts, \
+                   p.projection_family, p.collection_name, p.shard_key, p.placement_class, \
+                   p.point_count, p.bytes_estimate, p.promotion_state",
+    )
+    .bind(run.run_id)
+    .bind(run.tenant_id)
+    .bind(&family.domain)
+    .bind(&family.projection_kind)
+    .bind(&family.projection_version)
+    .bind(limit)
+    .bind(lease_owner)
+    .bind(lease_seconds)
+    .bind(family.placement.as_db_str())
+    .fetch_all(&mut *txn)
+    .await?;
+    txn.commit().await?;
     Ok(parse_claim_rows(&rows))
 }
 

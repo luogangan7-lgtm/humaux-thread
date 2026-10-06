@@ -672,7 +672,10 @@ async fn provision(
             reasoning_domain_name: "default",
             plan_limit: limit,
             period_start: now - time::Duration::seconds(1),
-            period_end: now + time::Duration::hours(1),
+            // The window must outlast the longest rehearsal that reuses this seed: the card-37 chain's rerun ran 67
+            // minutes and every billable call after the 60th answered ENTITLEMENT_REQUIRED (ADR-0064 "Chain run 1");
+            // the card-53 go-live soak is eight hours. A day; the plan limit, not the clock, is the quota under test.
+            period_end: now + time::Duration::hours(24),
             provider_id: &qdrant.embedding_provider,
             region: &qdrant.embedding_region,
             tenant_tpm: SEED_TIER_LIMIT,

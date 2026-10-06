@@ -1,12 +1,13 @@
 //! `projection::dense` — dense lane 查询构造：自动注入 `tenant + §6.1 AuthorizationScope visibility filter`（§17.1）。
 //! Depends-on: crates=[humaux-domain]; services=[]; env=[]; modules=[domain::affect, domain::identity,
 //!   domain::ids, domain::subject]
-//! Called-by: [adapters::qdrant, adapters::retrieve, projection::sparse, tests]
+//! Called-by: [adapters::qdrant, adapters::rebuild, adapters::retrieve, projection::sparse, tests]
 //! Invariants: [DenseQueryFilter can only be built by build_dense_filter from a mandatory &AuthorizationScope, so
 //!   every private dense query carries the tenant + visibility filter (§17.1); servable() and in_workspace() only narrow (ADR-0055);
-//!   StreamCountFilter (count-only, no visibility arm) is built only by build_stream_count_filter and is accepted
-//!   only by the Qdrant count; no conversion into DenseQueryFilter (ADR-0057 D-C)]
-//! Spec: Baseline §17.1; §6.1.1; §3; §78.3; §16.3; §23.1②; ADR-0055; ADR-0057
+//!   StreamCountFilter (ops-only, no visibility arm) is built only by build_stream_count_filter and is accepted
+//!   only by the Qdrant count and the rebuild verifier's scroll; no conversion into DenseQueryFilter (ADR-0057 D-C,
+//!   ADR-0064 D-F)]
+//! Spec: Baseline §17.1; §6.1.1; §3; §78.3; §16.3; §23.1②; ADR-0055; ADR-0057; ADR-0064
 //!
 //! §17.1 冻结："所有 private query adapter 必须自动注入 tenant + AuthorizationScope
 //! visibility filter；业务层不得手写可选 filter。" 本模块的落实方式是类型级的，不是靠约定：
@@ -265,9 +266,10 @@ pub fn build_dense_filter(
 /// §16.3 / §23.1② (ADR-0057 D-C): the ops count of ONE stream — every point of
 /// `(tenant, workspace, projection_version)` whatever its visibility class. Count-only: the
 /// field is private, the sole constructor is [`build_stream_count_filter`], and nothing converts
-/// it into a [`DenseQueryFilter`], so search / scroll cannot take it (compile-fail
+/// it into a [`DenseQueryFilter`], so search cannot take it (compile-fail
 /// `crates/adapters/tests/ui/fail_stream_count_filter_in_dense_search.rs`). Its callers are the
-/// §16.2 serve switch, the soak and the ADR-0053 provisioning probe — never a request path.
+/// §16.2 serve switch, the soak, the ADR-0053 provisioning probe and the ADR-0064 rebuild verifier's
+/// scroll — never a request path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamCountFilter(Condition);
 

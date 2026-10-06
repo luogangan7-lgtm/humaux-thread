@@ -2,12 +2,16 @@
 //!   runs each due task over one tenant page, one transaction and one door call per tenant, and serves its
 //!   readiness on its own loopback ops listener (the eighth `(job, mode)` pair, ADR-0061 D-B); and `sweep once`,
 //!   the same tasks for one page with cadence ignored (D-Q). The cluster-level PARTITIONS task (ADR-0063 D-K) runs once
-//!   per due run without a tenant page: it proposes candidate leaves and publishes `partition_horizon_months`.
+//!   per due run without a tenant page: it proposes candidate leaves and publishes `partition_horizon_months`. The
+//!   cluster-level DR_EVIDENCE task (ADR-0064 D-K / 10.11 D) runs the same way: one statement over the backup and
+//!   drill receipts with the WAL latch, two `df -Pk` children, and one `telemetry::dr::publish`.
 //! Depends-on: crates=[humaux-adapters, humaux-domain, humaux-telemetry, serde_json, tokio, uuid];
-//!   services=[PostgreSQL(role_maintenance)]; env=[CARGO_PKG_VERSION, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS,
+//!   services=[PostgreSQL(role_maintenance), subprocess(df)]; env=[CARGO_PKG_VERSION,
+//!   HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_MAINTENANCE_DR_PGDATA_FS_PATH, HUMAUX_MAINTENANCE_DR_REPO_FS_PATH,
 //!   HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_EVERY_SECONDS, HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_LIMIT,
-//!   HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS, HUMAUX_MAINTENANCE_SERVE_JOBS_DEAD_RETENTION_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS, HUMAUX_MAINTENANCE_SERVE_DR_EVIDENCE_EVERY_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_JOBS_DEAD_RETENTION_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_JOBS_DONE_RETENTION_SECONDS, HUMAUX_MAINTENANCE_SERVE_JOBS_EVERY_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_JOBS_LIMIT, HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_LOST_EVERY_SECONDS, HUMAUX_MAINTENANCE_SERVE_LOST_LIMIT,
@@ -22,8 +26,8 @@
 //!   HUMAUX_MAINTENANCE_SERVE_SNAPSHOTS_LIMIT,
 //!   HUMAUX_MAINTENANCE_SERVE_TENANTS_PER_RUN, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS];
 //!   modules=[adapters::confirm_token_repo, adapters::maintenance_repo, adapters::membership_repo, adapters::postgres,
-//!   adapters::provider_budget, adapters::quota_repo, adapters::stream_repo, domain::ids, telemetry::metrics,
-//!   maintenance::main, maintenance::resident]
+//!   adapters::provider_budget, adapters::quota_repo, adapters::stream_repo, domain::ids, telemetry::dr,
+//!   telemetry::metrics, maintenance::main, maintenance::resident]
 //! Called-by: [maintenance::main]
 //! Invariants: [HUMAUX_MIGRATOR_PG_DSN in the environment refuses boot before anything else (ADR-0063 D-H); every
 //!   key is required with no code default and checked before any connection; LOST_AFTER must
@@ -34,26 +38,29 @@
 //!   receipt, never a DELETE of its own; a reissue is one owner door call per tenant (ticket, carrier and marker in
 //!   one transaction); a re-drive is one owner door call per tenant with its §77 row in the same transaction, under
 //!   the daemon's system identity (`--serve`) or the operator's fields (`sweep once`); `sweep once` requires the §77
-//!   fields like every writing subcommand]
+//!   fields like every writing subcommand; DR_EVIDENCE reads no budget key (the receipts carry the limits) and a
+//!   failed run publishes nothing, so the DR gauges keep their last values, never reset]
 //! Spec: Baseline §4.2; §6.2.1; §15.2; §41.2; §77; §78.1; ADR-0037; ADR-0043; ADR-0057 D-F; ADR-0057 D-H;
 //!   ADR-0061 D-B; ADR-0062 D-A..D-D; ADR-0062 D-E..D-J; ADR-0062 D-L; ADR-0062 D-N; ADR-0062 D-P; ADR-0062 D-Q;
-//!   ADR-0063 D-H
+//!   ADR-0063 D-H; ADR-0064 D-K; ADR-0064 10.11 D
 //!
 //! Metrics: `maintenance_task_runs_total{task,outcome}` and `maintenance_task_rows_total{task}` (ADR-0062 D-S),
 //!   counted once per tenant door call through `adapters::maintenance_repo::count_task_call`, served by `/metrics`
 //!   only while ready and printed at zero by `--serve --metrics-families`; `/status` carries the last finished cycle
-//!   per task.
+//!   per task. The six DR families (`telemetry::dr`, ADR-0064 D-K) render 0 until the first DR_EVIDENCE run.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use humaux_adapters::maintenance_repo::{
-    self, JobRetention, MaintenanceTask as Task, PartitionTable, TaskOutcome, count_task_call,
+    self, DrEvidence, JobRetention, MaintenanceTask as Task, MeasuredBudget, PartitionTable,
+    TaskOutcome, count_task_call,
 };
 use humaux_adapters::membership_repo::AdminAction;
 use humaux_adapters::postgres::MaintenanceDbPool;
 use humaux_adapters::{confirm_token_repo, provider_budget, quota_repo, stream_repo};
 use humaux_domain::ids::TenantId;
+use humaux_telemetry::dr::{self, DrReading, Limit, Volume};
 use humaux_telemetry::metrics::{Routes, families, write_family, write_single_label};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -71,6 +78,11 @@ const LOST_AFTER_SECONDS: &str = "HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS";
 /// ADR-0057 D-F peer key, read under the gateway's own name: one value, two readers.
 const PROJECTION_LAG_SECONDS: &str = "HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS";
 const PG_DSN: &str = "HUMAUX_MAINTENANCE_PG_DSN";
+/// ADR-0064 10.11 J: the mount point of the repository's own filesystem (live `df` for the free-floor headroom and
+/// `backup_disk_free_bytes{volume="repo"}`). Not a secret; set in the daemon's supervised environment.
+const DR_REPO_FS_PATH: &str = "HUMAUX_MAINTENANCE_DR_REPO_FS_PATH";
+/// ADR-0064 10.11 J: a path on the filesystem holding PGDATA (`backup_disk_free_bytes{volume="pgdata"}`).
+const DR_PGDATA_FS_PATH: &str = "HUMAUX_MAINTENANCE_DR_PGDATA_FS_PATH";
 /// ADR-0062 D-G: seconds a consumed, expired confirm token is kept as audit (>= 0).
 const CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS: &str =
     "HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS";
@@ -107,11 +119,13 @@ const fn every_key(task: Task) -> &'static str {
         Task::Reissue => "HUMAUX_MAINTENANCE_SERVE_REISSUE_EVERY_SECONDS",
         Task::Redrive => "HUMAUX_MAINTENANCE_SERVE_REDRIVE_EVERY_SECONDS",
         Task::Partitions => "HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS",
+        Task::DrEvidence => "HUMAUX_MAINTENANCE_SERVE_DR_EVIDENCE_EVERY_SECONDS",
     }
 }
 
 /// ADR-0062 D-C: the LIMIT of a task's per-tenant statement (> 0); `None` for the cluster-level PARTITIONS task
-/// (ADR-0063 D-K: one statement over a few hundred registry rows, no tenant page).
+/// (ADR-0063 D-K: one statement over a few hundred registry rows, no tenant page) and DR_EVIDENCE (ADR-0064 D-K: one
+/// statement over the receipts, which hold a few rows a day).
 const fn limit_key(task: Task) -> Option<&'static str> {
     Some(match task {
         Task::Lost => "HUMAUX_MAINTENANCE_SERVE_LOST_LIMIT",
@@ -123,7 +137,7 @@ const fn limit_key(task: Task) -> Option<&'static str> {
         Task::Jobs => "HUMAUX_MAINTENANCE_SERVE_JOBS_LIMIT",
         Task::Reissue => "HUMAUX_MAINTENANCE_SERVE_REISSUE_LIMIT",
         Task::Redrive => "HUMAUX_MAINTENANCE_SERVE_REDRIVE_LIMIT",
-        Task::Partitions => return None,
+        Task::Partitions | Task::DrEvidence => return None,
     })
 }
 
@@ -149,6 +163,8 @@ struct Config {
     redrive_cooldown: Duration,
     /// Per [`Task::ALL`] index: (every, limit); every is zero under [`Mode::Once`].
     tasks: [(Duration, i32); Task::ALL.len()],
+    /// ADR-0064 10.11 D: the `df -Pk` path per [`Volume::ALL`] slot.
+    dr_paths: [String; Volume::ALL.len()],
 }
 
 fn positive<T: std::str::FromStr + PartialOrd + Default>(key: &str) -> Result<T> {
@@ -207,6 +223,7 @@ impl Config {
             reissue_cooldown: Duration::from_secs(positive(REISSUE_COOLDOWN_SECONDS)?),
             redrive_cooldown: Duration::from_secs(positive(REDRIVE_COOLDOWN_SECONDS)?),
             tasks,
+            dr_paths: [env(DR_REPO_FS_PATH)?, env(DR_PGDATA_FS_PATH)?],
         })
     }
 }
@@ -314,8 +331,8 @@ async fn call(
         .await
         .map(i64::unsigned_abs)
         .map_err(|e| e.to_string()),
-        // Cluster-level: [`partitions`] runs it once per run, never per tenant.
-        Task::Partitions => Err("PARTITIONS has no tenant call".to_owned()),
+        // Cluster-level: [`partitions`] / [`dr_evidence`] run once per run, never per tenant.
+        Task::Partitions | Task::DrEvidence => Err(format!("{} has no tenant call", task.label())),
     }
 }
 
@@ -338,6 +355,83 @@ async fn partitions(pool: &MaintenanceDbPool, cfg: &Config, run: &mut Run) {
         Err(e) => {
             maintenance_repo::reset_partition_horizon_months();
             count_task_call(Task::Partitions, None);
+            run.fail(e);
+        }
+    }
+}
+
+/// Free bytes of the filesystem holding `path`: `df -Pk`'s Available column × 1024, bounded by CYCLE_SECONDS.
+async fn df_free_bytes(path: &str, cycle: Duration) -> std::result::Result<i64, String> {
+    // dep: subprocess(df) — POSIX `df -Pk <path>` (ADR-0064 10.11 D: live free bytes, not a recorded value)
+    let child = tokio::process::Command::new("df")
+        .args(["-Pk", path])
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(cycle, child).await {
+        Ok(Ok(out)) if out.status.success() => out,
+        Ok(Ok(out)) => return Err(format!("df -Pk {path}: exit {:?}", out.status.code())),
+        Ok(Err(e)) => return Err(format!("df -Pk {path}: {e}")),
+        Err(_) => return Err(format!("df -Pk {path}: no answer within {CYCLE_SECONDS}")),
+    };
+    // ponytail: column 4 of the second line; a filesystem name with blanks breaks it (the error names the path).
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().nth(3)?.parse::<i64>().ok())
+        .map(|kib| kib * 1024)
+        .ok_or_else(|| format!("df -Pk {path}: no Available column"))
+}
+
+/// ADR-0064 10.11 D: the gauges of one reading. Headroom comes from the limits the newest measuring receipt
+/// recorded (`repo_max` = max − repo − estimate; `free_floor` = live repo free − min free − estimate); before the
+/// first such receipt both are 0 (BackupFailure already fires).
+fn dr_reading(e: &DrEvidence, free: [i64; Volume::ALL.len()]) -> DrReading {
+    let budget_headroom_bytes = match e.budget {
+        Some(MeasuredBudget {
+            repo_bytes,
+            repo_max_bytes: Some(max),
+            min_free_bytes: Some(min_free),
+            estimate_bytes: Some(estimate),
+        }) => [max - repo_bytes - estimate, free[0] - min_free - estimate],
+        _ => [0; Limit::ALL.len()],
+    };
+    DrReading {
+        backup_last_success: e.backup_last_success.unwrap_or(0.0),
+        restore_drill_last_success: e.restore_drill_last_success.unwrap_or(0.0),
+        repo_bytes: e.budget.map_or(0, |b| b.repo_bytes),
+        disk_free_bytes: free,
+        budget_headroom_bytes,
+        wal_archive_failing: e.wal_archive_failing,
+    }
+}
+
+/// ADR-0064 D-K / 10.11 D: one DR_EVIDENCE run, counted once. Success publishes all six families; a failure
+/// publishes nothing (the last values stay: an absent series would silence BackupFailure) and counts `failed`.
+async fn dr_evidence(pool: &MaintenanceDbPool, cfg: &Config, run: &mut Run) {
+    let done = async {
+        // dep: PostgreSQL(role_maintenance) — the DR_EVIDENCE statement (adapters::maintenance_repo::dr_evidence);
+        // production binds no archiver override
+        let evidence =
+            match tokio::time::timeout(cfg.cycle, maintenance_repo::dr_evidence(pool, None, None))
+                .await
+            {
+                Ok(Ok(e)) => e,
+                Ok(Err(e)) => return Err(format!("dr_evidence: {e}")),
+                Err(_) => return Err(format!("dr_evidence: no answer within {CYCLE_SECONDS}")),
+            };
+        let mut free = [0; Volume::ALL.len()];
+        for (slot, path) in free.iter_mut().zip(&cfg.dr_paths) {
+            *slot = df_free_bytes(path, cfg.cycle).await?;
+        }
+        Ok(dr_reading(&evidence, free))
+    };
+    match done.await {
+        Ok(reading) => {
+            dr::publish(&reading);
+            count_task_call(Task::DrEvidence, Some(0));
+        }
+        Err(e) => {
+            count_task_call(Task::DrEvidence, None);
             run.fail(e);
         }
     }
@@ -369,6 +463,11 @@ async fn cycle(
         cursor.last_run = Some(Instant::now());
         if task == Task::Partitions {
             partitions(pool, cfg, &mut run).await;
+            runs.push((task, run));
+            continue;
+        }
+        if task == Task::DrEvidence {
+            dr_evidence(pool, cfg, &mut run).await;
             runs.push((task, run));
             continue;
         }
@@ -481,6 +580,8 @@ pub(crate) fn render_metrics() -> String {
         })
         .unwrap_or_default();
     write_family(&mut out, &families::PARTITION_HORIZON_MONTHS, &horizon);
+    // ADR-0064 D-K: the six DR families from the last successful DR_EVIDENCE run (0 before the first).
+    dr::render(&mut out);
     out
 }
 

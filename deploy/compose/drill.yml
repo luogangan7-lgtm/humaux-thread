@@ -1,0 +1,61 @@
+# deploy/compose/drill.yml — the isolated restore-drill project `humaux-drill-<id>` (ADR-0064 D-L step 3 as amended
+# by section 10.4 S5 and ruling E17: local_only, no repository key exists to map).
+#   up:  humaux-maintenance restore drill runs `docker compose -p humaux-drill-<id> -f <this file> ...` (card 37 S5).
+# Every value is required with no default (§78.1). Every container, volume and network carries the label
+# humaux.drill=<id>, so the drill's destroy (and `restore drill --destroy-stale`) removes exactly its own resources.
+# The drill mounts exactly one thing it did not create: the repository filesystem HUMAUX_PG_REPO_DIR, READ-ONLY and
+# never created on the host (D-M; spike SP-5 measured restore and archive-get from a read-only bind). The cipher
+# pass passes by NAME only. Both services are capped, so an OOM inside the drill kills a drill container, not the
+# production cluster. Pinned by gates c37_repo_is_bind_mount and c37_compose_valid.
+services:
+  pg:
+    image: ${HUMAUX_PG_IMAGE:?the pinned image built from deploy/images/postgres}
+    mem_limit: ${HUMAUX_DRILL_PG_MEM_LIMIT:?}
+    cpus: ${HUMAUX_DRILL_CPUS:?}
+    labels:
+      humaux.drill: ${HUMAUX_DRILL_ID:?}
+    ports:
+      - "127.0.0.1::5432"
+    environment:
+      - PGBACKREST_REPO1_CIPHER_PASS
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - type: bind
+        source: ../pgbackrest/pgbackrest.conf
+        target: /etc/pgbackrest/pgbackrest.conf
+        read_only: true
+      - type: bind
+        source: ${HUMAUX_PG_REPO_DIR:?the mount point of the repository filesystem}
+        target: /var/lib/pgbackrest
+        read_only: true
+        bind:
+          create_host_path: false
+    command:
+      - postgres
+      - -c
+      - listen_addresses=${HUMAUX_DRILL_PG_LISTEN_ADDRESSES?set it; empty = socket only}
+  qdrant:
+    image: qdrant/qdrant:v1.19.0@sha256:139bbec1a1e6c0f04c978c96b5359568e72e60ae6abc9db0ab4b7643a8cd957f
+    mem_limit: ${HUMAUX_DRILL_QDRANT_MEM_LIMIT:?}
+    cpus: ${HUMAUX_DRILL_CPUS:?}
+    labels:
+      humaux.drill: ${HUMAUX_DRILL_ID:?}
+    ports:
+      - "127.0.0.1::6333"
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - qdrant:/qdrant/storage
+
+volumes:
+  pgdata:
+    labels:
+      humaux.drill: ${HUMAUX_DRILL_ID:?}
+  qdrant:
+    labels:
+      humaux.drill: ${HUMAUX_DRILL_ID:?}
+
+networks:
+  default:
+    labels:
+      humaux.drill: ${HUMAUX_DRILL_ID:?}

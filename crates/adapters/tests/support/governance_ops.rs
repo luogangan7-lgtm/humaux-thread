@@ -7,7 +7,8 @@
 //!   domain::confirm, domain::error, domain::evidence, domain::identity, domain::ids, domain::subject,
 //!   projection::stream]
 //! Called-by: [adapters::tests::a2_point_identity, adapters::tests::projection_lag,
-//!   adapters::tests::projection_worker, adapters::tests::support::a2_fixture, adapters::tests::switch_user_private]
+//!   adapters::tests::projection_worker, adapters::tests::rebuild, adapters::tests::support::a2_fixture,
+//!   adapters::tests::switch_user_private, maintenance::tests::drill, maintenance::tests::measure]
 //! Invariants: [test-only, included by #[path]; the owner connection only seeds the principal the ops run as;
 //!   every governance write is a real role_gateway call: mint (first leg) then the op (second leg)]
 //! Spec: Baseline §36; §79.2; ADR-0018; ADR-0054; ADR-0057

@@ -1,13 +1,18 @@
-//! `adapters::private_projection_registry` — PostgreSQL-only identity binding for private Qdrant candidates.
+//! `adapters::private_projection_registry` — PostgreSQL-only identity binding for private Qdrant candidates, the
+//!   stored vector each binding was projected from, and the embedding label's fingerprint binding.
 //! Depends-on: crates=[humaux-domain, humaux-projection, sha2, sqlx]; services=[PostgreSQL(any)
-//!   r=[private.memory_records] w=[projection.private_memory_points], PostgreSQL(role_gateway),
-//!   PostgreSQL(role_retrieval_worker)]; env=[]; modules=[adapters::postgres, domain::authority, domain::identity,
-//!   domain::ids, projection::serving]
-//! Called-by: [adapters::projection_worker, adapters::retrieve, tests]
+//!   r=[private.memory_records] w=[projection.embedding_fingerprints, projection.memory_vectors,
+//!   projection.private_memory_points], PostgreSQL(role_gateway), PostgreSQL(role_retrieval_worker)]; env=[];
+//!   modules=[adapters::postgres, domain::authority, domain::identity, domain::ids, projection::card,
+//!   projection::embedding_fingerprint, projection::serving]
+//! Called-by: [adapters::projection_worker, adapters::retrieve, retrieval-worker::main, tests]
 //! Invariants: [sole private point-id resolver: binds a Qdrant point id to a Memory in PostgreSQL and re-checks the
 //!   source fence; no Qdrant IO here; cross-tenant/workspace, collisions and lost races are typed errors, never a
-//!   guessed binding]
-//! Spec: none
+//!   guessed binding; a registration that carries a vector writes it in the SAME transaction as the registry row
+//!   (ADR-0064 D-B), so a fingerprinted registry row always has its vector row (0232 FK); every retirement purges
+//!   the vector bytes the last live binding held, by UPDATE (ADR-0064 D-D); one embedding label is bound to one
+//!   fingerprint and a different one is refused, never overwritten (ADR-0064 D-C)]
+//! Spec: Baseline §16.1; §17; §44; ADR-0049; ADR-0064 D-B; ADR-0064 D-C; ADR-0064 D-D
 //!
 //! Qdrant returns an opaque point id plus a score.  This module is the sole private-plane
 //! point-id resolver: it binds that id to a Memory through PostgreSQL and then rechecks the
@@ -19,6 +24,10 @@ use std::collections::{HashMap, HashSet};
 use humaux_domain::authority::MemoryId;
 use humaux_domain::identity::AuthorizationScope;
 use humaux_domain::ids::WorkspaceId;
+use humaux_projection::card::CARD_TEMPLATE_HASH;
+use humaux_projection::embedding_fingerprint::{
+    DISTANCE, DTYPE, EmbeddingFingerprint, EmbeddingFingerprintInputs, NORMALIZATION,
+};
 use humaux_projection::serving::StreamFamily;
 use sha2::{Digest, Sha256};
 use sqlx::types::Uuid;
@@ -105,6 +114,31 @@ impl PrivateMemoryPointRegistration {
     }
 }
 
+/// ADR-0064 D-B: the provider vector a registration was projected from, keyed by the vector space and the exact
+/// embedded bytes. Written in the registry transaction; never constructed from a Qdrant read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredVector {
+    /// The worker label's fingerprint (`projection.embedding_fingerprints`, ADR-0064 D-C).
+    pub fingerprint_sha256: [u8; 32],
+    /// sha256 of the sealed card text that was (or would be) embedded.
+    pub input_sha256: [u8; 32],
+    /// The provider's raw vector; finite and non-empty, else the registration is `InvalidInput`.
+    pub vector: Vec<f32>,
+}
+
+/// ADR-0064 D-C: the provider task type of every vector the projection worker stores — cards are documents (query
+/// vectors are embedded by `--serve-rpc` and never stored).
+pub const PROJECTION_TASK_TYPE: &str = "document";
+
+/// ADR-0064 D-D: the one purge statement both retire paths run in their liveness transaction — the bytes of a
+/// memory's vectors that no live binding references any more become NULL (the key row stays, ~150 B).
+const PURGE_UNREFERENCED_VECTORS: &str = "UPDATE projection.memory_vectors v \
+        SET vector = NULL, purged_at = clock_timestamp() \
+      WHERE v.tenant_id = $1 AND v.memory_id = $2 AND v.vector IS NOT NULL \
+        AND NOT EXISTS (SELECT 1 FROM projection.private_memory_points p \
+                         WHERE p.projection_live AND p.tenant_id = v.tenant_id AND p.memory_id = v.memory_id \
+                           AND p.fingerprint_sha256 = v.fingerprint_sha256 AND p.input_sha256 = v.input_sha256)";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationOutcome {
     Inserted,
@@ -133,6 +167,9 @@ pub enum PrivateProjectionRegistryError {
     PointIdCollision,
     IdentityAlreadyBound,
     RegistryRaceLost,
+    /// ADR-0064 D-C: the embedding label and the computed fingerprint are not bound to each other (the label holds
+    /// another fingerprint, or the fingerprint is bound under another label).
+    FingerprintMismatch,
 }
 
 impl From<sqlx::Error> for PrivateProjectionRegistryError {
@@ -166,6 +203,10 @@ impl std::fmt::Display for PrivateProjectionRegistryError {
             Self::RegistryRaceLost => write!(
                 f,
                 "private projection registry insert lost without a readable binding"
+            ),
+            Self::FingerprintMismatch => write!(
+                f,
+                "embedding label is bound to another model fingerprint (ADR-0064 D-C)"
             ),
         }
     }
@@ -333,25 +374,66 @@ async fn identity_binding_in_txn(
     .await?)
 }
 
-/// Registers one exact PG source binding before any Qdrant I/O.  A replay with every identity
-/// field unchanged is a no-op; a reused point id or duplicate identity with a different point
-/// is an error and must not be repaired by silently minting another id.
+/// Registers one exact PG source binding without a stored vector (a legacy row, ADR-0064 D-G). The projection
+/// worker calls [`register_private_memory_point_with_vector`]; this form stays for callers that bind no vector.
 pub async fn register_private_memory_point(
     pool: &RetrievalWorkerDbPool,
     authorization: &AuthorizationScope,
     registration: &PrivateMemoryPointRegistration,
 ) -> Result<RegistrationOutcome, PrivateProjectionRegistryError> {
+    register_private_memory_point_with_vector(pool, authorization, registration, None).await
+}
+
+/// Registers one exact PG source binding before any Qdrant I/O.  A replay with every identity
+/// field unchanged is a no-op; a reused point id or duplicate identity with a different point
+/// is an error and must not be repaired by silently minting another id.
+///
+/// ADR-0064 D-B: with `vector`, the vector row is upserted first and the registry row carries its key, in ONE
+/// transaction, so DONE ⇒ live registry row ⇒ stored vector. An existing binding without a key (a legacy row) is
+/// given this one (backfill-on-touch); a purged vector row is re-stored (a revival).
+pub async fn register_private_memory_point_with_vector(
+    pool: &RetrievalWorkerDbPool,
+    authorization: &AuthorizationScope,
+    registration: &PrivateMemoryPointRegistration,
+    vector: Option<&StoredVector>,
+) -> Result<RegistrationOutcome, PrivateProjectionRegistryError> {
     validate_input(authorization, registration)?;
-    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `register_private_memory_point`
+    // ADR-0064 D-B: PostgreSQL has no cheap all-finite CHECK on real[]; a NaN/inf vector is refused here.
+    if vector.is_some_and(|v| v.vector.is_empty() || !v.vector.iter().all(|x| x.is_finite())) {
+        return Err(PrivateProjectionRegistryError::InvalidInput);
+    }
+    // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `register_private_memory_point_with_vector`
     let mut txn = pool.pool().begin().await?;
     set_authorization_local(&mut txn, authorization).await?;
     current_source_matches(&mut txn, registration).await?;
+    if let Some(stored) = vector {
+        let dimension = i32::try_from(stored.vector.len())
+            .map_err(|_| PrivateProjectionRegistryError::InvalidInput)?;
+        sqlx::query(
+            "INSERT INTO projection.memory_vectors \
+                 (tenant_id, memory_id, fingerprint_sha256, input_sha256, dimension, vector) \
+             VALUES ($1,$2,$3,$4,$5,$6) \
+             ON CONFLICT (tenant_id, memory_id, fingerprint_sha256, input_sha256) \
+             DO UPDATE SET vector = EXCLUDED.vector, purged_at = NULL WHERE memory_vectors.vector IS NULL",
+        )
+        .bind(registration.family.tenant_id.0)
+        .bind(registration.memory_id.0)
+        .bind(&stored.fingerprint_sha256[..])
+        .bind(&stored.input_sha256[..])
+        .bind(dimension)
+        .bind(&stored.vector)
+        .execute(&mut *txn)
+        .await?;
+    }
+    let fingerprint = vector.map(|v| &v.fingerprint_sha256[..]);
+    let input = vector.map(|v| &v.input_sha256[..]);
 
     let inserted = sqlx::query(
         "INSERT INTO projection.private_memory_points \
              (point_id, tenant_id, scope_kind, scope_id, domain, projection_kind, \
-              projection_version, embedding_version, memory_id, source_updated_at, body_sha256) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+              projection_version, embedding_version, memory_id, source_updated_at, body_sha256, \
+              fingerprint_sha256, input_sha256) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
          ON CONFLICT DO NOTHING RETURNING point_id",
     )
     .bind(registration.point_id.0)
@@ -365,6 +447,8 @@ pub async fn register_private_memory_point(
     .bind(registration.memory_id.0)
     .bind(registration.source_updated_at)
     .bind(&registration.body_sha256)
+    .bind(fingerprint)
+    .bind(input)
     .fetch_optional(&mut *txn)
     .await?;
     if inserted.is_some() {
@@ -387,6 +471,19 @@ pub async fn register_private_memory_point(
             .bind(registration.point_id.0)
             .execute(&mut *txn)
             .await?;
+            // ADR-0064 D-B backfill-on-touch: a binding registered before card 37 takes this vector's key.
+            if let (Some(fingerprint), Some(input)) = (fingerprint, input) {
+                sqlx::query(
+                    "UPDATE projection.private_memory_points \
+                        SET fingerprint_sha256 = $2, input_sha256 = $3 \
+                      WHERE point_id = $1 AND fingerprint_sha256 IS NULL",
+                )
+                .bind(registration.point_id.0)
+                .bind(fingerprint)
+                .bind(input)
+                .execute(&mut *txn)
+                .await?;
+            }
             txn.commit().await?;
             return Ok(if revived.rows_affected() == 1 {
                 RegistrationOutcome::Revived
@@ -420,13 +517,14 @@ pub async fn retire_private_memory_point(
     // dep: PostgreSQL(role_retrieval_worker) — transaction entry for `retire_private_memory_point`
     let mut txn = pool.pool().begin().await?;
     set_authorization_local(&mut txn, authorization).await?;
-    let result = sqlx::query(
+    let retired: Option<Uuid> = sqlx::query_scalar(
         "UPDATE projection.private_memory_points \
             SET projection_live = false, retired_at = now() \
           WHERE point_id = $1 AND tenant_id = $2 AND scope_kind = $3 AND scope_id = $4 \
             AND domain = $5 AND projection_kind = $6 AND projection_version = $7 \
             AND embedding_version = $8 \
-            AND projection_live",
+            AND projection_live \
+          RETURNING memory_id",
     )
     .bind(point_id.0)
     .bind(family.tenant_id.0)
@@ -436,10 +534,17 @@ pub async fn retire_private_memory_point(
     .bind(&family.projection_kind)
     .bind(projection_version)
     .bind(embedding_version)
-    .execute(&mut *txn)
+    .fetch_optional(&mut *txn)
     .await?;
+    if let Some(memory_id) = retired {
+        sqlx::query(PURGE_UNREFERENCED_VECTORS)
+            .bind(family.tenant_id.0)
+            .bind(memory_id)
+            .execute(&mut *txn)
+            .await?;
+    }
     txn.commit().await?;
-    Ok(result.rows_affected() == 1)
+    Ok(retired.is_some())
 }
 
 /// ADR-0049: the projection consequence of a memory that stopped being live (superseded,
@@ -492,8 +597,83 @@ pub async fn retire_points_for_memory(
     .bind(memory_id.0)
     .execute(&mut *txn)
     .await?;
+    sqlx::query(PURGE_UNREFERENCED_VECTORS)
+        .bind(family.tenant_id.0)
+        .bind(memory_id.0)
+        .execute(&mut *txn)
+        .await?;
     txn.commit().await?;
     Ok(point_ids.into_iter().map(ProjectionPointId::new).collect())
+}
+
+/// ADR-0064 D-C: the fingerprint inputs of the projection worker's embedding configuration. The task type, the card
+/// template hash and the ticket family's projection version are fixed by the build, never by configuration.
+pub fn worker_fingerprint_inputs<'a>(
+    provider: &'a str,
+    model_id: &'a str,
+    model_revision: &'a str,
+    dimension: u32,
+    projection_version: &'a str,
+) -> EmbeddingFingerprintInputs<'a> {
+    EmbeddingFingerprintInputs {
+        provider,
+        model_id,
+        model_revision,
+        dimension,
+        task_type: PROJECTION_TASK_TYPE,
+        preprocessing_version: CARD_TEMPLATE_HASH,
+        projection_contract_version: projection_version,
+    }
+}
+
+/// ADR-0064 D-C: binds `embedding_version` to the fingerprint of `inputs` (`INSERT .. ON CONFLICT DO NOTHING`) and
+/// reads the label's row back. A label already bound to another fingerprint (or this fingerprint already bound under
+/// another label) is [`PrivateProjectionRegistryError::FingerprintMismatch`]; the row is never overwritten. The
+/// retrieval worker calls this before its first pass and refuses to run on a mismatch.
+pub async fn bind_embedding_fingerprint(
+    pool: &RetrievalWorkerDbPool,
+    embedding_version: &str,
+    inputs: &EmbeddingFingerprintInputs<'_>,
+) -> Result<EmbeddingFingerprint, PrivateProjectionRegistryError> {
+    let fingerprint = EmbeddingFingerprint::compute(inputs)
+        .map_err(|_| PrivateProjectionRegistryError::InvalidInput)?;
+    let dimension = i32::try_from(inputs.dimension)
+        .map_err(|_| PrivateProjectionRegistryError::InvalidInput)?;
+    if !valid_text(embedding_version, 128) {
+        return Err(PrivateProjectionRegistryError::InvalidInput);
+    }
+    // dep: PostgreSQL(role_retrieval_worker) — the embedding label's one-time fingerprint binding
+    sqlx::query(
+        "INSERT INTO projection.embedding_fingerprints (fingerprint_sha256, embedding_version, provider, model_id, \
+           model_revision, dimension, task_type, preprocessing_version, projection_contract_version, dtype, \
+           normalization, distance) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING",
+    )
+    .bind(&fingerprint.0[..])
+    .bind(embedding_version)
+    .bind(inputs.provider)
+    .bind(inputs.model_id)
+    .bind(inputs.model_revision)
+    .bind(dimension)
+    .bind(inputs.task_type)
+    .bind(inputs.preprocessing_version)
+    .bind(inputs.projection_contract_version)
+    .bind(DTYPE)
+    .bind(NORMALIZATION)
+    .bind(DISTANCE)
+    .execute(pool.pool())
+    .await?;
+    let bound: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT fingerprint_sha256 FROM projection.embedding_fingerprints WHERE embedding_version = $1",
+    )
+    .bind(embedding_version)
+    // dep: PostgreSQL(role_retrieval_worker) — reads the label's binding back (the compare is by fingerprint)
+    .fetch_optional(pool.pool())
+    .await?;
+    if bound.as_deref() != Some(&fingerprint.0[..]) {
+        return Err(PrivateProjectionRegistryError::FingerprintMismatch);
+    }
+    Ok(fingerprint)
 }
 
 /// Resolves only current, live candidate bindings.  Unknown, wrong-family/version, retired,

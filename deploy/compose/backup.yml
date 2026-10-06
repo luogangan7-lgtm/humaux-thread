@@ -1,0 +1,48 @@
+# deploy/compose/backup.yml — the production PostgreSQL service with its pgBackRest repository (ADR-0064 D-H as
+# amended by sections 10.1 KEEP and 10.11 A; ruling E17: local_only, one service, no runner, no mirror).
+#   up:     humaux-dr.sh compose ... (the env file is sourced by the wrapper, never by cron's environment)
+#   arms:   humaux-maintenance backup check|run|verify|status run every pgBackRest command here with
+#           `docker compose -f <this file> -p <project> exec -T --user postgres pg pgbackrest --stanza=humaux ...`.
+# Every value is required with no default (§78.1). Runbook values: HUMAUX_PG_ARCHIVE_TIMEOUT_SECONDS=3600 (D-V),
+# HUMAUX_PG_LISTEN_ADDRESSES='*' ('' = socket only, used by `restore pitr`, D-U).
+# The repository is a HOST BIND of HUMAUX_PG_REPO_DIR, the mount point of a filesystem used only by the
+# repository (a 12 GiB loop-mounted ext4 image outside /var/lib/docker, runbook go-live step 1; 10.11 A): a full
+# repository stops archiving, never PostgreSQL, and `docker compose down -v` / `docker volume rm|prune` cannot
+# remove it (a bind is neither a declared nor an anonymous volume). Pinned by gates c37_repo_is_bind_mount and
+# c37_compose_valid. Secrets pass by NAME only (no value in this file): POSTGRES_PASSWORD (first initdb) and
+# PGBACKREST_REPO1_CIPHER_PASS (archive-push encrypts WAL, so `pg` holds it; ADR-0064 9.6 custody).
+services:
+  pg:
+    image: ${HUMAUX_PG_IMAGE:?the pinned image built from deploy/images/postgres}
+    container_name: ${HUMAUX_PG_CONTAINER:?}
+    ports:
+      - "127.0.0.1:${HUMAUX_PG_PORT:?}:5432"
+    environment:
+      - POSTGRES_PASSWORD
+      - PGBACKREST_REPO1_CIPHER_PASS
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - type: bind
+        source: ../pgbackrest/pgbackrest.conf
+        target: /etc/pgbackrest/pgbackrest.conf
+        read_only: true
+      - type: bind
+        source: ${HUMAUX_PG_REPO_DIR:?the mount point of the repository filesystem}
+        target: /var/lib/pgbackrest
+        bind:
+          create_host_path: false
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_timeout=${HUMAUX_PG_ARCHIVE_TIMEOUT_SECONDS:?}s
+      - -c
+      - archive_command=pgbackrest --stanza=humaux archive-push %p
+      - -c
+      - listen_addresses=${HUMAUX_PG_LISTEN_ADDRESSES?set it; empty = socket only}
+
+volumes:
+  pgdata:

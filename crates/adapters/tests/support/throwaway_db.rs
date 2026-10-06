@@ -5,7 +5,8 @@
 //!   env=[CARGO_MANIFEST_DIR, HUMAUX_TEST_PG_DSN]; modules=[humaux-testkit]
 //! Called-by: [adapters::tests::a2_point_identity, adapters::tests::confirm_token_retention,
 //!   adapters::tests::enumerate_scale, adapters::tests::maintenance_doors, adapters::tests::projection_lag,
-//!   adapters::tests::quota_and_rate, adapters::tests::stream_repo, private-worker::tests::derived_dispatch_e2e]
+//!   adapters::tests::quota_and_rate, adapters::tests::rebuild, adapters::tests::stream_repo,
+//!   private-worker::tests::derived_dispatch_e2e]
 //! Invariants: [the database is humaux_thread_<prefix>_<pid>_<n>, created here and dropped WITH (FORCE) by Drop
 //!   even on panic; migrations are applied one database at a time per process (role DDL is cluster-global)]
 //! Spec: Baseline §79.2; ADR-0062 E8

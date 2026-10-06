@@ -387,6 +387,8 @@ door. A full rotation takes `ceil(tenants / TENANTS_PER_RUN) × EVERY` (ADR-0062
 | `reissue` | `projection.reissue_unsettled_tickets(uuid, interval, integer)` (0220; cool-down clock incl. `lost_at`, 0223) | `REISSUE_*` | `REISSUE_COOLDOWN_SECONDS` (> 0) | a tombstoned or non-indexable memory; a memory with a ticket in flight; a deterministic failure already reissued once | `projection.ticket_reissues` (one row per fresh ticket) |
 | `redrive` | `ops.auto_redrive_schema_failed(uuid, interval, integer)` (0221) + one §77 row | `REDRIVE_*` | `REDRIVE_COOLDOWN_SECONDS` (> 0) | any class but `FAILED_OUTPUT_SCHEMA`; a job already re-driven once (`auto_redrives = 1`) | `control.audit_events` action `DISTILL_AUTO_REDRIVE` |
 | `partitions` (cluster-level, once per run, ADR-0063 D-K) | one `UPDATE control.partition_registry` of the two proposal columns (expired leaves of each table's latest effective policy, never the newest leaf) + one horizon read | `PARTITIONS_EVERY_SECONDS` (no LIMIT, no tenant page) | the policy's `retention_months` (`control.retention_policies`) | every DDL, every DROP, every hold (holds are re-derived by the executor only) | `proposed_at` / `proposed_policy_revision` on the registry row; `partition_horizon_months{table}` |
+| `dr_evidence` (cluster-level, once per run, card 37, ADR-0064 D-K) | one statement over `ops.backup_receipts`, `ops.restore_drills` and `pg_stat_archiver` (inserting one `ops.wal_archive_failures` row per archive-failure incident), then two `df -Pk` children on `HUMAUX_MAINTENANCE_DR_REPO_FS_PATH` / `HUMAUX_MAINTENANCE_DR_PGDATA_FS_PATH` | `DR_EVIDENCE_EVERY_SECONDS` (no LIMIT, no tenant page) | — | every backup and every repository file (it reads receipts, never pgBackRest; no budget key) | the six DR families (`backup_last_success_timestamp_seconds{target="local"}`, `restore_drill_last_success_timestamp_seconds{target="local"}`, `backup_repo_bytes`, `backup_disk_free_bytes{volume}`, `backup_budget_headroom_bytes{limit}`, `wal_archive_failing`), §11 |
+| `backup run` / `restore drill` — **HOST CRONTAB**, not the daemon (card 37, ADR-0064 D-I) | `humaux-dr.sh backup run` (nightly 00:30 UTC) and `humaux-dr.sh restore drill --evidence …` (Wednesdays 03:00 UTC) from `deploy/pgbackrest/humaux-backup.crontab`; `backup verify` / `backup status` on demand | the crontab | — | the production data volume (the drill restores into its own `humaux-drill-<id>` project and destroys it) | `ops.backup_receipts`, `ops.restore_drills`, the drill evidence file; §11 |
 | `create-partitions` — **MANUAL monthly operator step**, not the daemon | `humaux-maintenance retention create-partitions --months-ahead 3` (§5.3), from the operator shell with the superuser `HUMAUX_MIGRATOR_PG_DSN` exported for that one command | monthly, first week of the month | — | existing leaves (idempotent: an existing month returns `exists`) | new `control.partition_registry` rows; `partition_horizon_months` back to 3; one §77 row `PARTITIONS_CREATED` |
 
 - **What an operator reads**, as `role_maintenance` with the tenant GUC: `SELECT task, sum(affected), max(ran_at)
@@ -935,3 +937,198 @@ limit at the provider (research amendment 6); nothing in the worker separates th
 Refresh `HUMAUX_PRIVATE_WORKER_DNS_PINS` (and `HUMAUX_MINIMAX_DNS_PINS` in the chain) from an
 authoritative resolver, check each IP is outside the §11.4 forbidden ranges (the worker re-checks at
 boot and refuses a forbidden pin), restart, and confirm with one live call.
+
+## 11. Disaster recovery (card 37, ADR-0064)
+
+What card 37 ships is the go-live class **`local_only`**: one encrypted pgBackRest repository on its own fixed-size
+filesystem on this server, a nightly checked full backup, continuous WAL archiving, a weekly restore drill and a
+real restore (`restore pitr`). Qdrant is never backed up: it is rebuilt from PostgreSQL (`projection rebuild`), which
+holds every point's vector. Every arm runs through `deploy/pgbackrest/humaux-dr.sh`, which refuses unless
+`$HOME/.config/humaux/dr.env` is mode 0600 and yours.
+
+**NOT OFFSITE.** All backups are on the same server and disk as the database. **host loss = total loss.** The
+system says so on every backup arm, in `backup status`, in every drill and restore evidence file, and with the
+`BackupNotOffsite` warning, which repeats once a week (it is never silenced) until card 37d's NAS copy works.
+中文：**目前所有备份与数据库在同一台服务器、同一块盘；服务器或磁盘丢失 = 全部丢失。** 在卡 37d 的 NAS 副本生效之前，
+`BackupNotOffsite` 每周提醒一次（不会被静音）。
+
+### 11.1 Before go-live (once, in this order)
+
+1. **Give the backups their own fixed-size filesystem** (uid:gid of `postgres` in the pinned image is **999:999**,
+   ADR-0064 SP-13), outside Docker's data root:
+   ```sh
+   sudo fallocate -l 12G /srv/humaux/pgbackrest.img && sudo mkfs.ext4 -q -m 0 /srv/humaux/pgbackrest.img && sudo install -d /srv/humaux/pgbackrest
+   # /etc/fstab:
+   # /srv/humaux/pgbackrest.img /srv/humaux/pgbackrest ext4 loop,nodev,nosuid,noexec 0 2
+   sudo mount /srv/humaux/pgbackrest && sudo chown 999:999 /srv/humaux/pgbackrest && sudo chmod 0750 /srv/humaux/pgbackrest
+   ```
+   and set `HUMAUX_PG_REPO_DIR=/srv/humaux/pgbackrest`. This takes 12 GiB of the disk at once and never more; when
+   it is full, backups stop, the database does not. Deleting Docker volumes or `docker compose down -v` can never
+   delete it (it is a host bind with `create_host_path: false`, never a Docker volume).
+2. **Write `$HOME/.config/humaux/dr.env`** (mode 0600, owned by the user whose crontab runs the arms; names only
+   here, values are yours). `humaux-dr.sh` refuses (exit 3) to run any arm, `compose` included, until this file
+   exists with that mode and owner, so this step comes before anything below:
+   `PATH` (cron's `PATH` is `/usr/bin:/bin`; it must reach `humaux-maintenance` and `docker`, e.g.
+   `/usr/local/bin:/usr/bin:/bin` — `humaux-dr.sh` refuses, exit 3, naming the binary it cannot find),
+   `HUMAUX_MAINTENANCE_PG_DSN` (role_maintenance on the production database), `PGBACKREST_REPO1_CIPHER_PASS`,
+   `HUMAUX_MAINTENANCE_BACKUP_COMPOSE_FILE`, `HUMAUX_MAINTENANCE_BACKUP_PROJECT`,
+   `HUMAUX_MAINTENANCE_BACKUP_REPO_MAX_BYTES` = **8 GiB** (8589934592), `HUMAUX_MAINTENANCE_BACKUP_MIN_FREE_BYTES` =
+   **2 GiB** (2147483648, the free space that must remain on the backup filesystem after the new set: the WAL
+   margin), `HUMAUX_MAINTENANCE_DRILL_COMPOSE_FILE`, `HUMAUX_MAINTENANCE_DRILL_MIN_FREE_MEMORY_BYTES`,
+   `HUMAUX_MAINTENANCE_DRILL_RESTORE_TIMEOUT_SECONDS`, `HUMAUX_MAINTENANCE_RESTORE_MIN_FREE_DISK_BYTES` = **7.5 GiB**
+   (8053063680), `HUMAUX_PG_REPO_DIR`, `HUMAUX_PG_IMAGE`, `HUMAUX_DRILL_PG_MEM_LIMIT`, `HUMAUX_DRILL_QDRANT_MEM_LIMIT`,
+   `HUMAUX_DRILL_CPUS`, the retrieval worker's `HUMAUX_RETRIEVAL_WORKER_GITLEAKS_{BIN,VERSION,SHA256}` (the drill's
+   scanner pin, read under the worker's names), and the compose keys `HUMAUX_PG_CONTAINER`, `HUMAUX_PG_PORT`,
+   `HUMAUX_PG_ARCHIVE_TIMEOUT_SECONDS` (= 3600) and `HUMAUX_PG_LISTEN_ADDRESSES`. Every key is required with no
+   default; a missing key is exit 2. The full list with readers is `docs/architecture/env_vars.md`.
+3. **Start the production database through the wrapper, then create the stanza and check it:**
+   ```sh
+   humaux-dr.sh compose up -d pg
+   humaux-dr.sh compose exec -T --user postgres pg pgbackrest --stanza=humaux stanza-create
+   humaux-dr.sh backup check
+   ```
+   Always start or recreate `pg` with `humaux-dr.sh compose …`, never with a plain `docker compose up`: `backup.yml`
+   passes `PGBACKREST_REPO1_CIPHER_PASS` by name only, so a container started without `dr.env` cannot encrypt, every
+   WAL archive push fails and `WalArchiveFailing` latches. `backup check` must print `repo_cipher=aes-256-cbc` and
+   `weak_subkeys=0` and exit 0. It also refuses (`repo_shares_pgdata_fs`) a backup directory on the database's own
+   filesystem — that is what an unmounted image looks like. The encryption keys inside the backup store are made
+   once, now; the future NAS copy will be this same store.
+4. **Write the backup password down** (`PGBACKREST_REPO1_CIPHER_PASS`) on paper or in your password manager, away
+   from this server. Without it no backup can ever be read (ADR-0064 L14). When the NAS is added, card 37d asks you to
+   prove this copy with one command before anything is called "offsite".
+5. **Import the production data and run the E12 re-embed** (`projection rebuild --all --allow-reembed <legacy count>`,
+   provider cost = legacy points × the embedding price, under the retrieval worker's budget) **before** the first
+   `backup run`, so their burst of changes leaves the backup store with the first rotation.
+6. **Create the drill evidence directory and install `deploy/pgbackrest/humaux-backup.crontab`.** The crontab
+   assumes the checkout at `$HOME/humaux` and writes the weekly drill evidence into `$HOME/humaux/dr-evidence`:
+   ```sh
+   install -d -m 0700 "$HOME/humaux/dr-evidence"
+   crontab -l 2>/dev/null | cat - "$HOME/humaux/deploy/pgbackrest/humaux-backup.crontab" | crontab -
+   ```
+   It holds exactly two lines (UTC): `30 0 * * *` `humaux-dr.sh backup run` (nightly full) and `0 3 * * 3`
+   `humaux-dr.sh restore drill --evidence <dir>/drill-<date>.json` (weekly drill). A drill whose evidence directory
+   is missing refuses before it starts (exit 2, no receipt), so it can never record a success whose evidence is
+   lost. No gate proves the crontab is installed: `BackupFailure` (26 h) and `RestoreDrillFailure` (8 d) are the
+   proof that it runs (L6).
+7. **In the daemon's supervised environment** (`humaux-maintenance --serve`, §5.1) set
+   `HUMAUX_MAINTENANCE_DR_REPO_FS_PATH=/srv/humaux/pgbackrest`, `HUMAUX_MAINTENANCE_DR_PGDATA_FS_PATH=/` and
+   `HUMAUX_MAINTENANCE_SERVE_DR_EVIDENCE_EVERY_SECONDS`; as root confirm that `df -P /var/lib/docker` and `df -P /`
+   print the same device and that `df -P /srv/humaux/pgbackrest` prints a `/dev/loop…` device. These are not
+   secrets; the budget keys are **not** daemon keys (each receipt records the limits the arm used).
+
+### 11.2 What is protected today (`local_only`)
+
+- Every night at 00:30 UTC: a full backup of PostgreSQL, a read-back check of every file (`pgbackrest verify --set`
+  plus the manifest identity), and only then removal of backups older than the newest two (`repo1-retention-full=2`,
+  expire only after VERIFIED). A failed check removes nothing.
+- Between backups, changes are copied into the backup store at least once an hour (`archive_timeout` = 3600 s).
+- Every Wednesday a drill restores the latest backup into a throw-away copy, checks it, rebuilds search from it with
+  no provider call, deletes the copy and checks that the backup directory was not touched (`repo_intact`).
+- You can undo a mistake from up to 24–48 hours ago, **as long as `backup status` shows `pitr_window_unbroken_since`
+  that far back**. If archiving broke, it says from when the window is whole again.
+
+### 11.3 What is NOT protected today
+
+- **All backups are on the same server and disk as the database. If the server or its disk is lost, everything is
+  lost** (host loss = total loss, L37). The backup filesystem is separate from the root filesystem (it survives Docker
+  cleanup and a full root filesystem), not from disk or host loss (L25).
+- 中文：**目前所有备份与数据库在同一台服务器、同一块盘；服务器或磁盘丢失 = 全部丢失。** 在卡 37d 的 NAS 副本生效之前，
+  `BackupNotOffsite` 每周提醒一次。
+- A compromised server (root or docker access) can wipe or corrupt the backup store and forge receipts (L21).
+- `dev` is not backed up (ruling E7): `BackupFailure` and `RestoreDrillFailure` fire on the dev observability stack,
+  truthfully.
+
+### 11.4 Disk: what uses it, its cap, what happens at the cap, how to check
+
+| what | cap | at the cap | check |
+|---|---|---|---|
+| backup store (2 fulls + WAL since the older one) | its own 12 GiB filesystem; `REPO_MAX_BYTES` (8 GiB) and `MIN_FREE_BYTES` (2 GiB left on that filesystem) checked **before** each backup | the next backup is refused before writing, existing backups stay, `BackupBudgetLow` warns; if WAL then fills the filesystem, archiving stops and `WalArchiveFailing` (critical) fires — the database keeps running. Remedy in 11.5 | `humaux-dr.sh backup status`; `backup_repo_bytes`, `backup_budget_headroom_bytes`, `backup_disk_free_bytes{volume="repo"}` |
+| free space on the main disk | `DiskFreeLow` (critical) below 7.5 GiB, whatever the cause; drills and restores refuse to go below 7.5 GiB | you are paged before PostgreSQL stops | `backup_disk_free_bytes{volume="pgdata"}` |
+| unarchived WAL (`pg_wal`) when archiving breaks | 2 GiB (`archive-push-queue-max`) | after about 5 days at light load the oldest unarchived changes are dropped from the backup (the database keeps running); this also happens when the backup filesystem is full. `WalArchiveFailing` (critical) fires within 15 minutes and **stays on until a new nightly backup has been checked** | `wal_archive_failing`; fix the cause, then `humaux-dr.sh backup run` |
+| weekly drill copy | refuses below its memory floor or when the copy would leave less than 7.5 GiB free, naming the bytes (`drill_free_bytes:<need>/<have> (restore= vectors= repo_copy= floor=)`) | drill skipped; `RestoreDrillFailure` after 8 days | the drill evidence file |
+| Docker images and build cache | not capped by this card | on the old host they took 46 GB; pruning is your decision. **Never needed for backups:** the backup directory is not a Docker volume | `docker system df` |
+
+Measured on the card-36 dev dump (ADR-0064 "S7 measurements"): one compressed, encrypted full = 149 MB for a
+770 MB cluster; peak with retention 2 and a generous WAL bound ≈ 0.74 GB, far inside 8 GiB.
+
+### 11.5 After a refused backup
+
+`backup run` exit 3 means it refused before writing anything (`budget_repo_max:<bytes>`,
+`budget_free_floor:<bytes>` or `repo_shares_pgdata_fs`) and wrote a FAILED receipt; the existing backups stay. If
+`backup status` shows the backup filesystem still has room, raise `REPO_MAX_BYTES` in `dr.env` and run
+`humaux-dr.sh backup run`. If it does not, grow the filesystem (stop `pg`, `umount`, `truncate -s +4G` the image,
+`e2fsck -f`, `resize2fs`, mount, start `pg`) or free the main disk (`docker image prune` / build-cache prune, your
+decision). **Never delete a verified backup to make room.** A set whose check FAILED stays until you remove it
+(`pgbackrest expire --set=<label>`, your deletion decision, L29); it counts toward retention and budget meanwhile.
+
+### 11.6 When something must be restored on this server ("PG lost")
+
+Keep the damaged data. Default target: **end of archive**; `--target-time <rfc3339>` only to undo a logical mistake
+inside the window `backup status` shows.
+
+1. `docker compose -f <backup.yml> -p <old project> down` — **never with `-v`**: the container goes, the damaged data
+   volume stays.
+2. `humaux-dr.sh restore pitr --compose-file <backup.yml> --project <new project> --target end --evidence <file>` (or
+   `--target-time <ts>`), with the same `HUMAUX_PG_CONTAINER` and `HUMAUX_PG_PORT` as before. It refuses (exit 3)
+   while the old project still runs (`production_pg_running:<container>` — only one cluster may ever archive into the
+   stanza), when the new project's data volume is not empty, when the disk would drop below 7.5 GiB
+   (`restore_free_bytes:<need>/<have>`), and when the backup does not verify (`repo_set_unverifiable:<label>`). It
+   restores, boots socket-only, sets **NOLOGIN** on role_gateway and the private, consolidation and public workers,
+   records the restored in-flight state in the evidence, then boots with TCP. The restored cluster archives on its new
+   timeline: it is the new production.
+3. Set `HUMAUX_MAINTENANCE_BACKUP_PROJECT=<new project>` in `dr.env`.
+4. Run `humaux-dr.sh backup run` at once, so a verified full exists on the new timeline.
+5. `humaux-maintenance projection rebuild --all …` (Qdrant from the restored PostgreSQL), reconcile the restored job
+   state (RESERVED ledger rows, in-flight jobs; L8), re-run card 36's `retention execute` (drops are re-derived from
+   the approved policy), then `ALTER ROLE … LOGIN` the locked roles. Deletions committed after the target are lost
+   with every other write of that window: re-submit them from the requester's side (D-T).
+
+Never start the old project again; to read its data, ask first. A restore needs free disk of about one database.
+
+### 11.7 Qdrant lost
+
+`humaux-maintenance projection rebuild --all --batch <n> --wait-seconds <n>` before traffic (plus
+`--allow-reembed <legacy count>` while pre-card-37 points without a stored vector remain, D-G). The rebuild issues a
+new generation of tickets on the same streams, the resident retrieval worker re-projects them from
+`projection.memory_vectors` (no provider call), and `projection verify` proves the collection equals PostgreSQL
+(count, id set, payload Merkle, per-point vectors). A changed embedding fingerprint is refused `re_embed_required`
+(card 37b re-embeds).
+
+### 11.8 Measured RPO and RTO (measured, not promised)
+
+Numbers from ADR-0064 "S7 measurements" (dev-sized data, this Mac, n = 3 medians):
+
+| quantity | value | from |
+|---|---|---|
+| full backup | 3.9 s | M1 `full_backup_s` (770 MB cluster) |
+| verify of one set | 0.75 s | M1 `verify_full_s` |
+| restore to promotion (`restore pitr`) | 8.5 s | M1 `pitr_restore_s` |
+| rebuild of 17,435 points (issue + project + verify) | 147 s (0.15 + 126 + 21) | M2 |
+| **RTO (dev size)** = restore + drill checks + rebuild + verify | ≈ 156 s (2.6 min) | M1 + drill `checks_s` 0.43 s + M2 |
+| **RPO with the WAL archive intact** | ≤ 1 h at light load (`archive_timeout` 3600 s; busier writes fill segments sooner) | D-V |
+| **RPO if the WAL archive is lost** | the age of the last verified full (≤ 24 h) | D-V |
+
+Production scales roughly linearly in database bytes and points; re-measure at the first production drill (L13).
+§67.2's RTO/RPO bound is 24 h.
+
+### 11.9 Other routine
+
+- **After a killed drill:** `humaux-maintenance restore drill --destroy-stale` (removes only resources labelled
+  `humaux.drill`; the next drill refuses `stale_drill` until then).
+- **Reading a drill evidence file:** `succeeded`, `repo_intact`, `repo_class` (always `local_only`), the notice, and
+  each check (`witness_a_present`, `witness_b_absent`, `migrations_drift`, `rls_unforced`, `isolation_violations`,
+  `payload_digest_mismatches`, `provider_calls`, `rebuild.equivalent`, `residue`) are plain fields; the timings are
+  `restore_s`, `checks_s`, `rebuild_s`, `destroy_s`, `rto_seconds`.
+- **Cipher pass custody:** readers are the postgres OS user in `pg` (hence every PostgreSQL superuser), docker users
+  on the host and the owner of `dr.env` — all of whom already read the live database. Losing it loses every backup.
+- **Deletion bound** (§37 DeletionGraph "Backups"): data deleted from the database leaves the backups **3 days**
+  after the last set holding it expires ((2 + 1) × 1 d, D-T).
+
+### 11.10 When the NAS arrives
+
+Tell us four things: the NAS brand and model and its operating-system version; whether it can run a scheduled shell
+script with `ssh`, `rsync`, `sha256sum`, `awk` and `find`, or can run Docker; whether your home internet has a fixed
+IP address (so the server's firewall can admit only your home); and how much space the share has (it needs room for
+about two full backups plus a day of changes, plus the snapshots you choose to keep). Also confirm that the backup
+password from go-live step 3 is written down away from the server. Card 37d then wires the NAS copy — about one and a
+half days of work — and until it is done nothing on the server will call any copy "offsite".

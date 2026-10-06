@@ -1,0 +1,84 @@
+# §46.1 migration manifest. Card 37 S1 / ADR-0064 D-A, D-E: projection.rebuild_runs and projection.rebuild_tickets
+# (FORCE RLS), the two stream_log triggers and the three owner definers of an in-place rebuild generation.
+# Catalog-only checks through to_regclass / to_regprocedure text lookups, so migration-rehearsal can EXPLAIN them
+# before and after apply.
+
+migration_id = "0233_rebuild_generations"
+class = "EXPAND_CONTRACT"
+
+# Refuses a database without 0232's fingerprint table or with any of this migration's objects already present.
+precheck = """
+select to_regclass('projection.embedding_fingerprints') is not null
+   and to_regclass('projection.rebuild_runs') is null
+   and to_regclass('projection.rebuild_tickets') is null
+   and to_regprocedure('projection.rebuild_open(uuid,text,uuid,text,text,text,bytea)') is null
+   and to_regprocedure('projection.issue_rebuild_tickets(uuid,integer,boolean)') is null
+   and to_regprocedure('projection.rebuild_close(uuid,bigint,text,bigint,bytea,jsonb)') is null
+   and to_regprocedure('projection.stream_log_generation_never_lost()') is null
+   and to_regprocedure('projection.stream_log_tombstone_follows_to_generation()') is null
+ as precheck_ok
+"""
+
+# Fails on: another owner or no ENABLE + FORCE RLS / tenant policy on either table; any table grant beyond the
+# enumerated cells; the generation UNIQUE without `generation`; a definer that is not owner SECURITY DEFINER with
+# search_path=pg_catalog, has an executor other than role_maintenance (PUBLIC included) or a DELETE in its body; a
+# trigger function with any EXECUTE grantee, the wrong security mode (never_lost DEFINER, tombstone_follows INVOKER
+# because the 0167 guard refuses `* -> TOMBSTONED` to the owner), or either trigger missing its WHEN clause.
+postcheck = """
+select
+ (select count(*) = 2 from pg_class c
+   where c.oid in (to_regclass('projection.rebuild_runs'), to_regclass('projection.rebuild_tickets'))
+     and pg_get_userbyid(c.relowner) = 'role_migration_owner' and c.relrowsecurity and c.relforcerowsecurity)
+ and (select count(*) = 2 from pg_policy p
+       where p.polrelid in (to_regclass('projection.rebuild_runs'), to_regclass('projection.rebuild_tickets'))
+         and pg_get_expr(p.polqual, p.polrelid) like '%humaux.tenant_id%'
+         and pg_get_expr(p.polwithcheck, p.polrelid) like '%humaux.tenant_id%')
+ and (select coalesce(string_agg(pg_get_userbyid(x.grantee) || ':' || x.privilege_type, ','
+                                 order by pg_get_userbyid(x.grantee) || ':' || x.privilege_type collate "C"), '')
+        from pg_class c, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+       where c.oid = to_regclass('projection.rebuild_runs') and x.grantee <> c.relowner)
+     = 'role_maintenance:SELECT'
+ and (select coalesce(string_agg(pg_get_userbyid(x.grantee) || ':' || x.privilege_type, ','
+                                 order by pg_get_userbyid(x.grantee) || ':' || x.privilege_type collate "C"), '')
+        from pg_class c, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+       where c.oid = to_regclass('projection.rebuild_tickets') and x.grantee <> c.relowner)
+     = 'role_gateway:SELECT,role_maintenance:SELECT,role_retrieval_worker:SELECT'
+ and exists (select 1 from pg_constraint co
+              where co.conrelid = to_regclass('projection.rebuild_tickets') and co.contype = 'u'
+                and co.conname = 'rebuild_tickets_generation_unique'
+                and pg_get_constraintdef(co.oid) like '%generation, commit_seq)')
+ and (select count(*) = 3 from pg_proc p
+       where p.oid in (to_regprocedure('projection.rebuild_open(uuid,text,uuid,text,text,text,bytea)'),
+                       to_regprocedure('projection.issue_rebuild_tickets(uuid,integer,boolean)'),
+                       to_regprocedure('projection.rebuild_close(uuid,bigint,text,bigint,bytea,jsonb)'))
+         and pg_get_userbyid(p.proowner) = 'role_migration_owner' and p.prosecdef
+         and coalesce(p.proconfig, array[]::text[]) = array['search_path=pg_catalog']
+         and p.prosrc ~ 'current_setting\\(''humaux\\.tenant_id'''
+         and p.prosrc !~* '\\mDELETE\\M'
+         and (select coalesce(string_agg(pg_get_userbyid(x.grantee), ',' order by pg_get_userbyid(x.grantee) collate "C"), '')
+                from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+               where x.grantee <> p.proowner and x.privilege_type = 'EXECUTE') = 'role_maintenance')
+ and (select count(*) = 2 from pg_proc p
+       where p.oid in (to_regprocedure('projection.stream_log_generation_never_lost()'),
+                       to_regprocedure('projection.stream_log_tombstone_follows_to_generation()'))
+         and pg_get_userbyid(p.proowner) = 'role_migration_owner'
+         and p.prosecdef = (p.proname = 'stream_log_generation_never_lost')
+         and coalesce(p.proconfig, array[]::text[]) = array['search_path=pg_catalog']
+         and p.prosrc !~* '\\mDELETE\\M'
+         and not exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                          where x.grantee <> p.proowner and x.privilege_type = 'EXECUTE'))
+ and exists (select 1 from pg_trigger t
+              where t.tgrelid = to_regclass('projection.stream_log') and not t.tgisinternal
+                and t.tgname = 'stream_log_generation_never_lost'
+                and t.tgfoid = to_regprocedure('projection.stream_log_generation_never_lost()')
+                and pg_get_triggerdef(t.oid) like '%BEFORE UPDATE OF state%WHEN ((new.state = ''LOST''::text))%')
+ and exists (select 1 from pg_trigger t
+              where t.tgrelid = to_regclass('projection.stream_log') and not t.tgisinternal
+                and t.tgname = 'stream_log_tombstone_follows_to_generation'
+                and t.tgfoid = to_regprocedure('projection.stream_log_tombstone_follows_to_generation()')
+                and pg_get_triggerdef(t.oid) like '%AFTER UPDATE OF state%WHEN (((new.state = ''TOMBSTONED''::text) AND (old.state <> ''TOMBSTONED''::text)))%')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback before the first rebuild run: DROP TRIGGER stream_log_tombstone_follows_to_generation ON projection.stream_log; DROP TRIGGER stream_log_generation_never_lost ON projection.stream_log; DROP FUNCTION the five functions; DROP TABLE projection.rebuild_tickets; DROP TABLE projection.rebuild_runs. After a run: forward fix only; the generation tickets are ordinary stream_log rows the worker settles, and the side table is what keeps them out of the RYW overlay (E13) and away from the LOST sweep."
+backup_restore_requirement = "none: new tables, functions and triggers only; no existing row is touched (the triggers fire only on future UPDATEs of stream_log.state)."

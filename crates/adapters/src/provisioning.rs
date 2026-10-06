@@ -10,8 +10,8 @@
 //!   modules=[adapters::membership_repo, adapters::postgres, adapters::qdrant, adapters::retrieve, application::auth, domain::audit,
 //!   domain::identity, domain::ids, domain::ticket_family, infra-cell::permit, infra-cell::resource,
 //!   infra-cell::transport, projection::serving]
-//! Called-by: [adapters::maintenance_repo, adapters::reasoning_route_onboarding, adapters::role_hygiene, maintenance::main, tests,
-//!   xtask::e2e_seed]
+//! Called-by: [adapters::maintenance_repo, adapters::reasoning_route_onboarding, adapters::rebuild,
+//!   adapters::role_hygiene, maintenance::drill, maintenance::main, maintenance::rebuild_cli, tests, xtask::e2e_seed]
 //! Invariants: [every write goes through a 0186 / 0197 owner definer as role_maintenance, no table INSERT here; one transaction
 //!   per tenant (onboard_tenant installs the tenant GUC for the caller's transaction); the Qdrant probe runs outside any
 //!   transaction and the activation commits only if evaluate_switch accepts the DB-returned facts and the collection
@@ -1356,6 +1356,12 @@ impl QdrantFace {
             QDRANT_PERMIT_TTL,
         )
         .map_err(|e| ProvisioningError::Qdrant(format!("permit: {e:?}")))
+    }
+
+    /// This face's transport and a fresh permit, for the rebuild verifier's scroll / count / delete
+    /// (ADR-0064 D-F), so the operator CLI holds one Qdrant face, not two.
+    pub fn wire(&self) -> Result<(&HttpIntraCellTransport, CellAccessPermit)> {
+        Ok((&self.transport, self.permit()?))
     }
 
     /// One raw REST call: `(status, body)` — the caller decides what a status means.

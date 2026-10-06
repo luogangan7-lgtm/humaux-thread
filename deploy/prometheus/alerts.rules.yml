@@ -1,4 +1,4 @@
-# §42 alert rows loaded by cards 34, 34b, 35 and 36 (ADR-0061 D-E, ADR-0062 D-S, ADR-0063 D-F). Each expression is copied literally from the
+# §42 alert rows loaded by cards 34, 34b, 35, 36 and 37 (ADR-0061 D-E, ADR-0062 D-S, ADR-0063 D-F, ADR-0064 D-K). Each expression is copied literally from the
 # §42 table; metric names and label keys are §41.2 rows (freezes ① and ④, checked by
 # `cargo xtask metrics-registry --check` D8). The other §42 rows wait for a producer and a red
 # record (freeze ②, §80.1); they are listed in ADR-0061 limits.
@@ -26,10 +26,11 @@ groups:
         labels:
           severity: warning
 
-      # §42 "backup failure": 26 h without a verified off-site pull. The producer is card 37; until
-      # then the family is on metrics-registry's NOT_YET_PRODUCED allowlist and this rule is silent.
+      # §42 "backup failure": 26 h without a new VERIFIED local backup set. Produced by the DR_EVIDENCE task of
+      # `humaux-maintenance --serve` (ADR-0064 D-K): the stop time of the newest set whose latest receipt the table
+      # derived as VERIFIED; `target` has the one value `local` (ruling E17).
       - alert: BackupFailure
-        expr: time() - backup_last_success_timestamp_seconds > 93600
+        expr: time() - backup_last_success_timestamp_seconds{target="local"} > 93600
         labels:
           severity: critical
 
@@ -103,5 +104,48 @@ groups:
       - alert: PartitionHorizonAbsent
         expr: absent(partition_horizon_months)
         for: 2h
+        labels:
+          severity: critical
+
+      # §42 "backup not offsite" (ADR-0064 E17 / 10.11 F): a standing notice built from no series, so a restart or
+      # a scrape gap can neither resolve nor re-fire it. Card 37 keeps every copy on the database host; the
+      # notice stays until card 37d adds the NAS pull mirror. Routed weekly (alertmanager.yml).
+      - alert: BackupNotOffsite
+        expr: label_replace(vector(0), "repo_class", "local_only", "", "")
+        labels:
+          severity: warning
+        annotations:
+          summary: "card 37 keeps every backup copy on this host; host loss = total loss; card 37d adds the NAS pull mirror (ADR-0064 E17)"
+
+      # §42 "restore drill failure" (ADR-0064 D-K): eight days without a drill the table derived as succeeded
+      # (the drill runs weekly from the host crontab).
+      - alert: RestoreDrillFailure
+        expr: time() - restore_drill_last_success_timestamp_seconds > 691200
+        labels:
+          severity: critical
+
+      # §42 "WAL archive failing" (ADR-0064 10.11 D): latched in ops.wal_archive_failures by DR_EVIDENCE until a
+      # VERIFIED full starts later, so a recovered archiver or a stats reset does not clear it. PostgreSQL keeps
+      # running (archive-push-queue-max caps pg_wal); the PITR window is broken until the next verified full.
+      - alert: WalArchiveFailing
+        expr: wal_archive_failing > 0
+        for: 15m
+        labels:
+          severity: critical
+
+      # §42 "backup budget low" (ADR-0064 D-V / 10.11 D): the next backup's estimate no longer fits under one of
+      # the two budget limits the last backup run recorded, so that run is refused before writing.
+      - alert: BackupBudgetLow
+        expr: backup_budget_headroom_bytes < 0
+        for: 1h
+        labels:
+          severity: warning
+
+      # §42 "disk free low" (ADR-0064 10.11 F): 7.5 GiB = the runbook value of
+      # HUMAUX_MAINTENANCE_RESTORE_MIN_FREE_DISK_BYTES: page while a restore of today's database and several 2 GiB
+      # WAL queues still fit, whatever the cause.
+      - alert: DiskFreeLow
+        expr: backup_disk_free_bytes{volume="pgdata"} < 8053063680
+        for: 15m
         labels:
           severity: critical

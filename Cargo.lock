@@ -1099,15 +1099,22 @@ dependencies = [
 name = "humaux-maintenance"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "humaux-adapters",
  "humaux-domain",
+ "humaux-infra-cell",
+ "humaux-local-secret-scan",
+ "humaux-projection",
  "humaux-protocol",
+ "humaux-retrieval",
+ "humaux-retrieval-provider",
  "humaux-telemetry",
  "humaux-testkit",
  "postgres",
  "rand 0.9.5",
  "serde",
  "serde_json",
+ "sqlx",
  "time",
  "tokio",
  "uuid",

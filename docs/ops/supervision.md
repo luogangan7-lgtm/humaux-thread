@@ -26,6 +26,7 @@ write derives (tenant, workspace) per request, and the two `REMEMBER_TENANT_ID` 
 | `humaux-maintenance` | `health serve`: process alive | `health serve`: `GET /metrics` on its ops address → 200 / 503 | `health serve` yes (card 34, ADR-0061 D-D); every other subcommand no (card 28) |
 | `humaux-maintenance --serve` | process alive | `GET /metrics` on `HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR` → 200 / 503 | yes — the sixth resident unit (card 35, ADR-0062 D-A): the scheduled maintenance daemon |
 | `humaux-maintenance retention …` | — | — | **never** — one-shot operator commands with the superuser migrator DSN (card 36, ADR-0063 D-H); never supervised |
+| `humaux-maintenance backup …`, `restore drill`, `restore pitr`, `projection rebuild \| verify` | — | — | **never** — one-shot (card 37, ADR-0064 D-I): `backup run` and `restore drill` from the host crontab through `deploy/pgbackrest/humaux-dr.sh` (0600 `dr.env`), the rest by the operator; they need the docker CLI (root-equivalent), so neither the docker socket nor `dr.env` ever enters the supervised environment |
 
 `humaux-maintenance --serve` (ADR-0062) is the scheduled maintenance daemon and the eighth ops pair
 (`humaux-maintenance:serve`, ADR-0061 D-B): every
@@ -41,6 +42,14 @@ instance**: a second one only doubles the calls (`FOR UPDATE SKIP LOCKED` keeps 
 read one env file, because the daemon reads the gateway's `HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS` and the distill
 worker's `HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS` under their own names (ADR-0062 L4). It never samples
 health and `health serve` never purges (ADR-0062 D-A).
+
+Since card 37 (ADR-0064 D-K) the daemon also runs the cluster-level `dr_evidence` task, so its supervised
+environment carries three more required keys (no default; not secrets): `HUMAUX_MAINTENANCE_SERVE_DR_EVIDENCE_EVERY_SECONDS`,
+`HUMAUX_MAINTENANCE_DR_REPO_FS_PATH` (the backup filesystem's mount point, e.g. `/srv/humaux/pgbackrest`) and
+`HUMAUX_MAINTENANCE_DR_PGDATA_FS_PATH` (the filesystem holding Docker's data root, `/` on a single-disk host); it
+runs `df -Pk` on the two paths and reads the backup and drill receipts. It needs no budget key, no docker access and
+no cipher pass: the backup, `restore drill` and `restore pitr` arms are one-shot (row above, runbook §11) and the
+daemon only reports what their receipts recorded.
 
 `humaux-maintenance health serve` (ADR-0061 D-D) **is** a supervised unit: the one process that samples
 the §41.2 SQL-derived health gauges (`jobs_*`, `oldest_pending_age_seconds`, `projection_lag_events`,

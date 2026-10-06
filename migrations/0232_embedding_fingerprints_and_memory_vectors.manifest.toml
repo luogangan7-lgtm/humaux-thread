@@ -1,0 +1,67 @@
+# §46.1 migration manifest. Card 37 S1 / ADR-0064 D-B, D-C, D-D: projection.embedding_fingerprints,
+# projection.memory_vectors (FORCE RLS) and the registry's two vector-identity columns with a MATCH SIMPLE FK.
+# Catalog-only checks through to_regclass text lookups, so migration-rehearsal can EXPLAIN them before and after apply.
+
+migration_id = "0232_embedding_fingerprints_and_memory_vectors"
+class = "EXPAND_CONTRACT"
+
+# Refuses a database that already has either table or either registry column, or has no registry to extend.
+precheck = """
+select to_regclass('projection.embedding_fingerprints') is null
+   and to_regclass('projection.memory_vectors') is null
+   and to_regclass('projection.private_memory_points') is not null
+   and not exists (select 1 from pg_attribute a
+                    where a.attrelid = to_regclass('projection.private_memory_points')
+                      and a.attname in ('fingerprint_sha256', 'input_sha256') and not a.attisdropped)
+ as precheck_ok
+"""
+
+# Fails on: another owner; memory_vectors without ENABLE + FORCE RLS or without exactly one tenant-GUC policy; any
+# table grant beyond the enumerated cells (role_gateway holding anything on memory_vectors included: the 0011 default
+# coming back); any column grant on memory_vectors other than role_retrieval_worker UPDATE (vector, purged_at); the
+# label UNIQUE, the registry pair CHECK or the registry -> memory_vectors FK missing.
+postcheck = """
+select
+ (select count(*) = 2 from pg_class c
+   where c.oid in (to_regclass('projection.embedding_fingerprints'), to_regclass('projection.memory_vectors'))
+     and pg_get_userbyid(c.relowner) = 'role_migration_owner')
+ and coalesce((select c.relrowsecurity and c.relforcerowsecurity from pg_class c
+                where c.oid = to_regclass('projection.memory_vectors')), false)
+ and (select count(*) = 1 from pg_policy p
+       where p.polrelid = to_regclass('projection.memory_vectors')
+         and pg_get_expr(p.polqual, p.polrelid) like '%humaux.tenant_id%'
+         and pg_get_expr(p.polwithcheck, p.polrelid) like '%humaux.tenant_id%')
+ and (select coalesce(string_agg(pg_get_userbyid(x.grantee) || ':' || x.privilege_type, ','
+                                 order by pg_get_userbyid(x.grantee) || ':' || x.privilege_type collate "C"), '')
+        from pg_class c, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+       where c.oid = to_regclass('projection.embedding_fingerprints') and x.grantee <> c.relowner)
+     = 'role_maintenance:SELECT,role_retrieval_worker:INSERT,role_retrieval_worker:SELECT'
+ and (select coalesce(string_agg(pg_get_userbyid(x.grantee) || ':' || x.privilege_type, ','
+                                 order by pg_get_userbyid(x.grantee) || ':' || x.privilege_type collate "C"), '')
+        from pg_class c, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+       where c.oid = to_regclass('projection.memory_vectors') and x.grantee <> c.relowner)
+     = 'role_maintenance:SELECT,role_retrieval_worker:INSERT,role_retrieval_worker:SELECT'
+ and (select coalesce(string_agg(a.attname || ':' || pg_get_userbyid(x.grantee) || ':' || x.privilege_type, ','
+                                 order by a.attname || ':' || pg_get_userbyid(x.grantee) || ':' || x.privilege_type
+                                          collate "C"), '')
+        from pg_attribute a, aclexplode(a.attacl) x
+       where a.attrelid = to_regclass('projection.memory_vectors') and not a.attisdropped)
+     = 'purged_at:role_retrieval_worker:UPDATE,vector:role_retrieval_worker:UPDATE'
+ and exists (select 1 from pg_constraint co
+              where co.conrelid = to_regclass('projection.embedding_fingerprints') and co.contype = 'u'
+                and pg_get_constraintdef(co.oid) = 'UNIQUE (embedding_version)')
+ and exists (select 1 from pg_constraint co
+              where co.conrelid = to_regclass('projection.private_memory_points') and co.contype = 'c'
+                and co.conname = 'private_memory_points_vector_identity_pair' and co.convalidated)
+ and exists (select 1 from pg_constraint co
+              where co.conrelid = to_regclass('projection.private_memory_points') and co.contype = 'f'
+                and co.conname = 'private_memory_points_vector_fk' and co.convalidated
+                and co.confrelid = to_regclass('projection.memory_vectors') and co.confmatchtype = 's')
+ and exists (select 1 from pg_constraint co
+              where co.conrelid = to_regclass('projection.memory_vectors') and co.contype = 'c'
+                and co.conname = 'memory_vectors_purge_consistent')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "rollback before the retrieval worker writes a vector: ALTER TABLE projection.private_memory_points DROP CONSTRAINT private_memory_points_vector_fk, DROP CONSTRAINT private_memory_points_vector_identity_pair, DROP COLUMN input_sha256, DROP COLUMN fingerprint_sha256; DROP TABLE projection.memory_vectors; DROP TABLE projection.embedding_fingerprints. After vectors are stored: forward fix only; the stored vectors are what makes a provider-free rebuild possible (ADR-0064 D-B), so they are never dropped by a rollback."
+backup_restore_requirement = "none: new tables and nullable columns; no existing row is rewritten (the registry gains two NULL columns and a CHECK / MATCH SIMPLE FK every existing row passes)."

@@ -692,6 +692,8 @@ part, P1-14, OPS-6, SEC-6); partition retention of the §48.1 history tables sta
 Card 36 (ADR-0063, §6.24) closes the retention part of P1-11: the six existing §48.1 tables are monthly RANGE
 partitions with a pre-created horizon and three horizon alerts, and retention drops whole months only through the
 superuser executor's database chokepoint, with holds, an export and a receipt.
+Card 37 (ADR-0064, §6.25) closes P1-10 for the go-live class `local_only`: verified nightly backups, PITR, a
+weekly restore drill and a provider-free Qdrant rebuild; offsite is NOT YET (host loss = total loss, card 37d).
 
 ### 6.11 Folded debts closed by card 26 (ADR-0051 D-L)
 
@@ -1084,6 +1086,25 @@ superuser executor's database chokepoint, with holds, an export and a receipt.
   `e2e-contribution-fixture-…` tenants of the 0132/0133 tests stay: their `lane(a:post_0132)` / `lane(a:shared_db)`
   tests keep fixtures for post-failure forensics (`contribution_fixture.rs` header); not changed in this pass —
   debt row: purge at the end of a passing test with `ContributionFixture::purge` (plan row 36c).
+
+### 6.25 Closed by card 37 (ADR-0064) — go-live class `local_only` (ruling E17)
+
+| Audit row | Before | After | Gate / witness |
+|---|---|---|---|
+| **P1-10**: no backup and no PITR; Qdrant cannot be rebuilt from PostgreSQL | nothing backed up; losing the Qdrant volume made every memory unrecallable; `ops.restore_drills` had 0 rows | **backup + PITR + drill + rebuild: DONE.** pgBackRest 2.59.3 in the pinned PG 18.6 image; one encrypted (aes-256-cbc) posix repository on its own fixed 12 GiB filesystem bound from the host (never a Docker volume); a nightly full, verified (`verify --set` + manifest identity) before the two newest are kept; a refuse-before-write disk budget; `archive-push-queue-max=2GiB` and a latched `WalArchiveFailing`; a weekly restore drill into an isolated, label-scoped project with witness-defined T, catalog / RLS / isolation checks, a no-provider rebuild verified equivalent and `repo_intact`; `restore pitr` with a NOLOGIN quarantine; Qdrant rebuilt from `projection.memory_vectors` as an in-place generation and verified (count, id set, payload Merkle, per-point vectors). **offsite: NOT YET — local_only, host loss = total loss; card 37d adds the NAS pull mirror when the owner has the NAS** (`BackupNotOffsite` repeats weekly until then) | `c37_backup_suite`, `c37_drill_suite`, `c37_rebuild_suite`, `c37_drill_e2e_live`, `c37_drill_evidence`, `c37_drill_corrupt_wal_live`, `c37_drill_catalog_faults_live`, `c37_restore_pitr_live`, `c37_budget_refused_named`, `c37_repo_fs_full_named`, `c37_repo_own_fs_named`, `c37_retention_named`, `c37_wal_latch_named`, `c37_no_offsite_claim`, `c37_local_only_said`; rehearsal `vectors_stored_for_rehearsal_points` |
+| **RQ-6**: `embedding_version` not bound to a model | gateway and worker each read their own env label; a same-dimension model change mixes two vector spaces silently | **worker half closed**: `projection.embedding_fingerprints` binds one label to one fingerprint (provider, model, revision, dimension, task type, preprocessing and contract versions, dtype, distance); the retrieval worker refuses to boot on a mismatch and every point carries its fingerprint and input sha256; a rebuild refuses `re_embed_required` on another fingerprint. **Gateway half open → card 37b** (the gateway's refusal and the re-embed generation, ruling E3) | `c37_fingerprint_unit`, `c37_fingerprint_bound_named`, `c37_reembed_refused_named` |
+| §44 Backup / DR | Baseline text only | daily full, retention 2, `local_only` with the standing NOT OFFSITE notice, the 3-day deletion bound; Qdrant snapshot fast path deferred with a measured trigger (rebuild > 6 h for the largest tenant, D-S) | Baseline §44; ADR-0064 "S7 measurements" |
+| §42 backup alerts | `BackupFailure` matched no series (the family was not exported) | `BackupFailure` on `{target="local"}`, `BackupNotOffsite` (standing, weekly route, `send_resolved: false`), `RestoreDrillFailure`, `WalArchiveFailing`, `BackupBudgetLow`, `DiskFreeLow`; 11 promtool cases; mutations 32/32; six witnesses | `c37_rules_loaded`, `c37_not_offsite_route`, `c37_dr_families`, `promtool_mutations`, `c37_witness_*` |
+
+- **P0-2 stays OPEN** (Baseline §1.9 item 2, "只在异地拉回且 sha256 校验成功后"): card 37 maps it to nothing; it is
+  assigned to card 37d, whose offsite VERIFIED receipt is the first thing that can satisfy it.
+- **Not done here:** dev is migrated to 0232–0234 by the main line after a dated `pg_dump -Fc` (ruling E7) and is not
+  backed up (its `BackupFailure` / `RestoreDrillFailure` fire truthfully); the E12 `--allow-reembed` runs on dev and
+  production by the main line after commit; the EVENTS coverage hold and the PITR-coverage replacement of card 36's
+  COPY export are card 37c; the deploy-artifact offsite list is card 39 (E11).
+- **Open (ADR-0064 known limits):** host loss = total loss until 37d (L37, L25); a compromised server can wipe the
+  repository and forge receipts (L21); the PITR window is 24–48 h and only while `pitr_window_unbroken_since` says so
+  (L15, L31); RTO/RPO are measured on dev-sized data (L13); losing the cipher pass loses every backup (L14).
 
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 

@@ -57,8 +57,9 @@ const PROCESSES: [&str; 6] = [
 /// ADR-0061 D-H D8(c): rule-referenced families no process exports yet, each with the card
 /// that adds its producer. An entry whose family IS exported fails as a stale entry, so the
 /// producer card has to delete its row (E10 closed: card 34b's private worker exports the two
-/// distill counters).
-const NOT_YET_PRODUCED: &[(&str, &str)] = &[("backup_last_success_timestamp_seconds", "card 37")];
+/// distill counters; card 37's `humaux-maintenance --serve` exports
+/// `backup_last_success_timestamp_seconds`, ADR-0064 D-K). Empty: every rule-referenced family is exported.
+const NOT_YET_PRODUCED: &[(&str, &str)] = &[];
 
 /// D7 / D8(c): families a process declares (`# TYPE`) whose zero-state render deliberately has no sample, because
 /// absence is their failure signal and a §42 `absent()` rule reads it. Only these count as exported from the header
@@ -1427,6 +1428,17 @@ fn check_d8(
     rules: &[(String, String)],
     exported: &BTreeSet<String>,
 ) -> DCheck {
+    check_d8_with(registry, rules, exported, NOT_YET_PRODUCED)
+}
+
+/// [`check_d8`] against an explicit allowlist (the unit tests pin the not_applicable and stale paths with a fixture
+/// entry now that [`NOT_YET_PRODUCED`] is empty).
+fn check_d8_with(
+    registry: &[RegistryEntry],
+    rules: &[(String, String)],
+    exported: &BTreeSet<String>,
+    not_yet_produced: &[(&str, &str)],
+) -> DCheck {
     let index = registry_index(registry);
     let mut problems = Vec::new();
     let mut referenced: BTreeMap<String, String> = BTreeMap::new();
@@ -1477,7 +1489,7 @@ fn check_d8(
         if exported.contains(family) {
             continue;
         }
-        match NOT_YET_PRODUCED.iter().find(|(f, _)| f == family) {
+        match not_yet_produced.iter().find(|(f, _)| f == family) {
             Some((_, card)) => {
                 na.insert(family.clone());
                 producers.push(format!("{family} (producer: {card})"));
@@ -1487,7 +1499,7 @@ fn check_d8(
             )),
         }
     }
-    for (family, card) in NOT_YET_PRODUCED {
+    for (family, card) in not_yet_produced {
         if exported.contains(*family) {
             problems.push(format!(
                 "stale allowlist entry: `{family}` ({card}) is exported now; delete it from NOT_YET_PRODUCED"
@@ -2377,25 +2389,37 @@ pub fn gateway_respond() {
 
     /// T-H6: an allowlisted unexported family is not_applicable naming its producer card
     /// (exit 0, 1 with `--strict`); a non-allowlisted unexported one fails; an allowlisted one
-    /// that is exported fails as stale.
+    /// that is exported fails as stale. The real allowlist is empty since card 37 (ADR-0064 D-K), so
+    /// the paths are pinned with a fixture entry, and the empty real list is asserted.
     #[test]
     fn t_h6_d8_allowlist_is_the_only_not_applicable_path() {
+        const FIXTURE: &[(&str, &str)] =
+            &[("backup_last_success_timestamp_seconds", "fixture card")];
+        assert!(
+            NOT_YET_PRODUCED.is_empty(),
+            "card 37 exports the last allowlisted family: {NOT_YET_PRODUCED:?}"
+        );
         let registry = real_registry();
         let backup = rule("time() - backup_last_success_timestamp_seconds > 93600");
-        let na = check_d8(&registry, &backup, &all_exported());
+        let na = check_d8_with(&registry, &backup, &all_exported(), FIXTURE);
         assert_eq!(na.status, GateStatus::NotApplicable, "{}", na.detail);
         assert!(
             na.na_families
                 .contains("backup_last_success_timestamp_seconds")
         );
-        assert!(na.detail.contains("(producer: card 37)"), "{}", na.detail);
+        assert!(
+            na.detail.contains("(producer: fixture card)"),
+            "{}",
+            na.detail
+        );
         assert_eq!(report(std::slice::from_ref(&na), false), 0);
         assert_eq!(report(std::slice::from_ref(&na), true), 1);
 
-        let unlisted = check_d8(
+        let unlisted = check_d8_with(
             &registry,
             &rule("delta(jobs_dead[15m]) > 0"),
             &all_exported(),
+            FIXTURE,
         );
         assert_eq!(unlisted.status, GateStatus::Fail, "{}", unlisted.detail);
         assert!(
@@ -2407,11 +2431,11 @@ pub fn gateway_respond() {
 
         let mut exported = all_exported();
         exported.insert("backup_last_success_timestamp_seconds".into());
-        let stale = check_d8(&registry, &real_rules(), &exported);
+        let stale = check_d8_with(&registry, &real_rules(), &exported, FIXTURE);
         assert_eq!(stale.status, GateStatus::Fail);
         assert!(
             stale.detail.contains(
-                "stale allowlist entry: `backup_last_success_timestamp_seconds` (card 37)"
+                "stale allowlist entry: `backup_last_success_timestamp_seconds` (fixture card)"
             ),
             "{}",
             stale.detail

@@ -16,7 +16,8 @@
 //!   HUMAUX_RETRIEVAL_WORKER_REGION, HUMAUX_RETRIEVAL_WORKER_RPC_SOCKET_PATH,
 //!   HUMAUX_RETRIEVAL_WORKER_SERVE_METRICS_ADDR, HUMAUX_RETRIEVAL_WORKER_SERVE_RPC_METRICS_ADDR];
 //!   modules=[adapters::disclosure,
-//!   adapters::postgres, adapters::projection_worker, adapters::qdrant, adapters::stream_repo, domain::egress,
+//!   adapters::postgres, adapters::private_projection_registry, adapters::projection_worker, adapters::qdrant,
+//!   adapters::stream_repo, domain::egress,
 //!   domain::error, domain::ids, humaux-local-secret-scan, infra-cell::permit, infra-cell::resource,
 //!   infra-cell::transport, retrieval-provider::adapters, retrieval-provider::contract, retrieval-provider::metrics,
 //!   retrieval-worker::rpc, telemetry::metrics]
@@ -26,8 +27,10 @@
 //!   environment (ADR-0052: the claim supplies ticket and placement); a missing/zero pass key exits non-zero before
 //!   any claim; --serve observes SIGTERM/SIGINT only between passes and a DB outage is a logged failed pass, not an
 //!   exit; each resident mode reads only its own *_METRICS_ADDR key (required, loopback) and --readyz / --run-once
-//!   open no listener; --metrics-families reads no configuration]
-//! Spec: Baseline §4.2; §4.4; §17.3; §41.2; ADR-0012; ADR-0037; ADR-0052; ADR-0061 D-B; ADR-0061 D-C
+//!   open no listener; --metrics-families reads no configuration; --serve / --run-once bind
+//!   HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION to the configured model's fingerprint before the first pass and exit 2
+//!   when the label is bound to another one (ADR-0064 D-C)]
+//! Spec: Baseline §4.2; §4.4; §17.3; §41.2; ADR-0012; ADR-0037; ADR-0052; ADR-0061 D-B; ADR-0061 D-C; ADR-0064 D-C
 //!
 //! §4.2 (line 818): the owning process of `humaux_adapters::projection_worker::run_once` —
 //! there is no separate `projection-worker` process. Env wiring mirrors
@@ -62,6 +65,9 @@ use std::{
 use async_trait::async_trait;
 use humaux_adapters::disclosure::DisclosureSource;
 use humaux_adapters::postgres::RetrievalWorkerDbPool;
+use humaux_adapters::private_projection_registry::{
+    PrivateProjectionRegistryError, bind_embedding_fingerprint, worker_fingerprint_inputs,
+};
 use humaux_adapters::projection_worker::{
     CardEmbedder, PassConfig, PassOutcome, SharedProjectionDeps, run_claimed_pass,
 };
@@ -237,6 +243,10 @@ impl ServeConfig {
 /// name different families (card 21).
 const PROJECTION_FAMILY: RetrievalFamily = RetrievalFamily::PrivateMemoryV1;
 
+/// ADR-0064 D-C: the one line a fingerprint refusal prints (exit 2, never retried).
+const BOOT_REFUSED: &str = "boot refused: fingerprint_mismatch: HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION is bound \
+                            to another model fingerprint (ADR-0064 D-C)";
+
 /// Local wrapper making a real [`EmbeddingProvider`] satisfy [`CardEmbedder`] — see that
 /// trait's doc in `crates/adapters/src/projection_worker.rs` for why the orphan rule forces
 /// this indirection here rather than a blanket impl on the provider type in
@@ -390,6 +400,7 @@ async fn projection_mode(resident: bool) -> Result<(), Outcome> {
         ));
     }
     let embedding_version = required("HUMAUX_RETRIEVAL_WORKER_EMBEDDING_VERSION")?;
+    let projection_version = claim.projection_version.clone();
     let dsn = required("HUMAUX_RETRIEVAL_WORKER_PG_DSN")?;
     let processor_id = egress_processor_id()?;
     let (registry, transport) = build_cell_access()?;
@@ -417,7 +428,14 @@ async fn projection_mode(resident: bool) -> Result<(), Outcome> {
             )
             .await
             {
-                Ok(deps) => shared = Some(deps),
+                // ADR-0064 D-C: no pass runs until the label is bound to this model's fingerprint.
+                Ok(deps) => match bind_label(&deps, &projection_version).await? {
+                    None => shared = Some(deps),
+                    Some(error) if resident => {
+                        eprintln!("humaux-retrieval-worker: projection pass failed: {error}")
+                    }
+                    Some(error) => return Err(Outcome::Failed(error)),
+                },
                 Err(error) if resident => {
                     eprintln!("humaux-retrieval-worker: projection pass failed: {error}")
                 }
@@ -469,6 +487,34 @@ fn pass_line(o: &PassOutcome) -> String {
         o.placement_invalid,
         o.claim_ms
     )
+}
+
+/// ADR-0064 D-C: binds `deps`' label to the fingerprint of the configured model, read under the
+/// names `build_embedder` read them (so they exist once `deps` does). `Err` = refused — a label bound
+/// to another model can never become right by retrying, so every mode exits 2; `Ok(Some(_))` = a
+/// database failure, retried next poll in `--serve`.
+async fn bind_label(
+    deps: &SharedProjectionDeps,
+    projection_version: &str,
+) -> Result<Option<String>, Outcome> {
+    let provider = required("HUMAUX_RETRIEVAL_WORKER_EMBEDDING_PROVIDER")?;
+    let model_id = required("HUMAUX_RETRIEVAL_WORKER_EMBEDDING_MODEL")?;
+    let model_revision = required("HUMAUX_RETRIEVAL_WORKER_MODEL_REVISION")?;
+    let inputs = worker_fingerprint_inputs(
+        &provider,
+        &model_id,
+        &model_revision,
+        deps.dimension,
+        projection_version,
+    );
+    match bind_embedding_fingerprint(&deps.pool, &deps.embedding_version, &inputs).await {
+        Ok(_) => Ok(None),
+        Err(
+            PrivateProjectionRegistryError::FingerprintMismatch
+            | PrivateProjectionRegistryError::InvalidInput,
+        ) => Err(Outcome::Failed(BOOT_REFUSED.to_owned())),
+        Err(error) => Ok(Some(format!("fingerprint binding: {error}"))),
+    }
 }
 
 /// The database-bound half of [`SharedProjectionDeps`]: the worker pool and the embedder (whose

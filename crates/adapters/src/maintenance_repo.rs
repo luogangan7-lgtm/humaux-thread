@@ -8,16 +8,28 @@
 //!   [`count_task_call`]), which `humaux-maintenance --serve` renders (ADR-0061 D-C). For §48.1 (ADR-0063) it owns
 //!   the closed table_key enum, the daemon's PARTITIONS proposer with the `partition_horizon_months{table}` gauge
 //!   (D-K), and the one-shot superuser executor's calls of the owner functions with the COPY export (D-I, D-J); no
-//!   drop predicate lives here.
+//!   drop predicate lives here. For card 37 (ADR-0064 D-J, D-V, 10.11 C/E) it owns the backup arms' append-only
+//!   receipts (`ops.backup_receipts`), the label identity (`ops.backup_sets`) and `backup status`'s read-only facts;
+//!   for the restore drill and `restore pitr` (ADR-0064 D-L..D-O, S5) the witnesses, the newest VERIFIED set, the
+//!   both-sides check reads (catalog, migrations, per-tenant facts, isolation probes) and the drill receipt; for the
+//!   daemon's DR_EVIDENCE task (ADR-0064 D-K / 10.11 D, S6) the one statement over the receipts, the newest
+//!   succeeded drill and the WAL latch, and the D-V estimate ratio both the backup arm and the daemon use.
 //! Depends-on: crates=[hex, humaux-domain, serde, serde_json, sha2, sqlx, time]; services=[PostgreSQL(role_maintenance)
-//!   r=[control.partition_registry, control.retention_policies] w=[control.partition_registry] x=[
+//!   r=[control.partition_registry, control.retention_policies, ops.backup_receipts, ops.backup_sets,
+//!   ops.jobs, ops.model_call_ledger, ops.restore_witnesses, ops.wal_archive_failures,
+//!   private.evidence_objects, private.memory_records, projection.embedding_fingerprints,
+//!   projection.private_memory_points, projection.rebuild_tickets, projection.stream_log]
+//!   w=[control.partition_registry, ops.backup_receipts, ops.backup_sets, ops.restore_drills, ops.restore_witnesses,
+//!   ops.wal_archive_failures] x=[
 //!   control.maintenance_tenant_page, control.purge_idle_rate_buckets, ops.auto_redrive_schema_failed,
 //!   ops.purge_expired_selection_snapshots, ops.purge_terminal_jobs, projection.reissue_unsettled_tickets],
 //!   PostgreSQL(owner) r=[control.partition_registry, control.retention_policies] x=[control.partition_create_month,
 //!   control.partition_drop, control.partition_drop_check, control.partition_drop_statements,
-//!   control.retention_policy_approve]]; env=[];
+//!   control.retention_policy_approve], PostgreSQL(role_gateway) r=[private.evidence_objects, private.memory_records,
+//!   projection.private_memory_points], PostgreSQL(role_retrieval_worker) r=[projection.memory_vectors]]; env=[];
 //!   modules=[adapters::membership_repo, adapters::postgres, adapters::provisioning, domain::audit, humaux-adapters]
-//! Called-by: [maintenance::retention, maintenance::serve, tests]
+//! Called-by: [adapters::rebuild, maintenance::backup, maintenance::drill, maintenance::retention, maintenance::serve,
+//!   tests]
 //! Invariants: [the page returns tenant ids only, strictly after the cursor in tenant_id order, at most `limit`;
 //!   the definer refuses limit <= 0 (22023), so no call can read every tenant at once; every door call is one
 //!   transaction holding the tenant GUC and exactly one statement, so the delete and its receipt (or a reissued
@@ -25,10 +37,14 @@
 //!   age is sent as an interval and compared with the DB clock inside the door; the proposer writes only the two
 //!   proposal columns and a failed run resets the horizon family; every executor transaction takes lock_timeout
 //!   and the HXRETAIN key first, never sets row_security, and commits its effect with its §77 row or not at all;
-//!   the executor never selects a leaf, never CASCADEs and never detaches CONCURRENTLY]
+//!   the executor never selects a leaf, never CASCADEs and never detaches CONCURRENTLY; the backup receipts are only
+//!   ever INSERTed (no UPDATE / DELETE path) and a VERIFIED claim the table refuses surfaces as the database error;
+//!   DR_EVIDENCE writes at most one latch row per run and only when no row since the newest VERIFIED start exists]
 //! Spec: Baseline §4.2; §6.2.1; §6.2.2; §15.2; §48.1; ADR-0057 D-H; ADR-0062 D-D; ADR-0062 D-E; ADR-0062 D-H;
-//!   ADR-0062 D-I; ADR-0062 D-J; ADR-0062 D-N; ADR-0062 D-P; ADR-0062 D-S; ADR-0063 D-F..D-K; §41.2; §77
+//!   ADR-0062 D-I; ADR-0062 D-J; ADR-0062 D-N; ADR-0062 D-P; ADR-0062 D-S; ADR-0063 D-F..D-K; ADR-0064 D-J;
+//!   ADR-0064 D-K; ADR-0064 D-V; §41.2; §44; §77
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -42,7 +58,7 @@ use sqlx::types::Uuid;
 use time::OffsetDateTime;
 
 use crate::membership_repo::AdminAction;
-use crate::postgres::{MaintenanceDbPool, RetentionExecutor};
+use crate::postgres::{MaintenanceDbPool, RetentionExecutor, RetrievalWorkerDbPool, RuntimeDbPool};
 use crate::provisioning::{
     self, AUDIT_RESULT_SUCCESS, ProvisioningError, REDRIVE_RESOURCE, REDRIVE_RISK_TAG,
 };
@@ -244,11 +260,13 @@ pub enum MaintenanceTask {
     Redrive,
     /// [`propose_partitions`] (ADR-0063 D-K): cluster-level, no tenant page and no LIMIT key; one run = one count.
     Partitions,
+    /// [`dr_evidence`] (ADR-0064 D-K / 10.11 D): cluster-level like PARTITIONS; one run = one count.
+    DrEvidence,
 }
 
 impl MaintenanceTask {
     /// Every task, in D-C cycle order (the counters' slot order).
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Lost,
         Self::QuotaReservations,
         Self::ProviderBudgets,
@@ -259,6 +277,7 @@ impl MaintenanceTask {
         Self::Reissue,
         Self::Redrive,
         Self::Partitions,
+        Self::DrEvidence,
     ];
 
     /// The `/status`, receipt and §41.2 `task` label value (lowercase D-C name; the frozen value set of §41.2).
@@ -274,6 +293,7 @@ impl MaintenanceTask {
             Self::Reissue => "reissue",
             Self::Redrive => "redrive",
             Self::Partitions => "partitions",
+            Self::DrEvidence => "dr_evidence",
         }
     }
 
@@ -325,9 +345,9 @@ static MAINTENANCE_TASK_RUNS_TOTAL: TaskCounters<{ TASKS * 2 }> = TaskCounters::
 static MAINTENANCE_TASK_ROWS_TOTAL: TaskCounters<TASKS> = TaskCounters::new();
 
 /// ADR-0062 D-S: counts one finished door call of `task` (one tenant; one run for the cluster-level
-/// [`MaintenanceTask::Partitions`], ADR-0063 D-K): `affected` is `Some(rows)` when it committed, `None` when it
+/// [`MaintenanceTask::Partitions`] and [`MaintenanceTask::DrEvidence`]): `affected` is `Some(rows)` when it committed, `None` when it
 /// failed. Public so the G80-6 witnesses drive the emit without a database; the one production caller is
-/// `maintenance::serve`'s cycle, once per tenant call (once per run for PARTITIONS).
+/// `maintenance::serve`'s cycle, once per tenant call (once per run for PARTITIONS and DR_EVIDENCE).
 pub fn count_task_call(task: MaintenanceTask, affected: Option<u64>) {
     let outcome = if affected.is_some() {
         TaskOutcome::Ok
@@ -1107,4 +1127,666 @@ async fn list_due(txn: &mut Txn<'_>, policy_id: Uuid) -> Result<Vec<DueLeaf>, Pr
         });
     }
     Ok(due)
+}
+
+// ---- ADR-0064 D-J / D-V / 10.11 A, C, E (card 37 S4): the backup arms' receipts, local_only ----
+// Owner of every statement below: `humaux-maintenance backup check|run|verify|status` (maintenance::backup), as
+// role_maintenance (0234: INSERT, SELECT on ops.backup_sets / ops.backup_receipts / ops.wal_archive_failures; no
+// UPDATE, no DELETE: the receipts are append-only). Cluster-level tables: no tenant GUC, no RLS.
+
+/// One `ops.backup_receipts` row as a backup arm writes it. The arm CLAIMS `VERIFIED` by leaving `failure` empty;
+/// the table refuses the claim unless verify exited 0 and the verified manifest is the label's first-verified one
+/// (`backup_receipts_verified_derived`, FK to `ops.backup_sets`) and the row is shaped (`backup_receipts_shape`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackupReceipt {
+    /// pgBackRest's set label; `None` for a refusal before any write (10.11 A).
+    pub backup_label: Option<String>,
+    /// The set's start / stop as pgBackRest's `info` reports them.
+    pub backup_started_at: Option<OffsetDateTime>,
+    /// See `backup_started_at`.
+    pub backup_stopped_at: Option<OffsetDateTime>,
+    /// sha256 of the set's `backup.manifest` pulled back now with `repo-get`.
+    pub manifest_sha256: Option<Vec<u8>>,
+    /// `pgbackrest verify --set` exit code; `None` when verify did not run.
+    pub verify_exit: Option<i32>,
+    /// The manifest sha256 this verification proved: set only when every verify step passed.
+    pub verified_manifest_sha256: Option<Vec<u8>>,
+    /// The named failure; `None` claims VERIFIED.
+    pub failure: Option<String>,
+    /// Live `du -sk` of the repository (backup arms only; D-K reads the newest non-NULL one).
+    pub repo_bytes: Option<i64>,
+    /// Live `df -Pk` free bytes of the repository filesystem.
+    pub repo_free_bytes: Option<i64>,
+    /// The set's repository size from `info` (`backup[].info.repository.size`, spike SP-11).
+    pub set_repo_bytes: Option<i64>,
+    /// `HUMAUX_MAINTENANCE_BACKUP_REPO_MAX_BYTES` as the arm used it (10.11 C: the daemon reads no budget key).
+    pub repo_max_bytes: Option<i64>,
+    /// `HUMAUX_MAINTENANCE_BACKUP_MIN_FREE_BYTES` as the arm used it.
+    pub min_free_bytes: Option<i64>,
+    /// The D-V estimate the budget precheck used.
+    pub estimate_bytes: Option<i64>,
+}
+
+/// Appends one receipt (`backup_type` is always `full` in card 37, D-V); returns its id. A VERIFIED claim the table
+/// refuses comes back as the database error (23514 / 23503), never as a quietly FAILED row.
+pub async fn insert_backup_receipt(
+    pool: &MaintenanceDbPool,
+    receipt: &BackupReceipt,
+) -> Result<Uuid, sqlx::Error> {
+    let outcome = if receipt.failure.is_none() {
+        "VERIFIED"
+    } else {
+        "FAILED"
+    };
+    // dep: PostgreSQL(role_maintenance) — ops.backup_receipts INSERT (0234)
+    sqlx::query_scalar(
+        "INSERT INTO ops.backup_receipts (backup_label, backup_type, backup_started_at, backup_stopped_at, \
+           manifest_sha256, verify_exit, verified_manifest_sha256, outcome, failure, repo_bytes, repo_free_bytes, \
+           set_repo_bytes, repo_max_bytes, min_free_bytes, estimate_bytes) \
+         VALUES ($1, 'full', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING receipt_id",
+    )
+    .bind(&receipt.backup_label)
+    .bind(receipt.backup_started_at)
+    .bind(receipt.backup_stopped_at)
+    .bind(&receipt.manifest_sha256)
+    .bind(receipt.verify_exit)
+    .bind(&receipt.verified_manifest_sha256)
+    .bind(outcome)
+    .bind(&receipt.failure)
+    .bind(receipt.repo_bytes)
+    .bind(receipt.repo_free_bytes)
+    .bind(receipt.set_repo_bytes)
+    .bind(receipt.repo_max_bytes)
+    .bind(receipt.min_free_bytes)
+    .bind(receipt.estimate_bytes)
+    .fetch_one(pool.pool())
+    .await
+}
+
+/// ADR-0064 D-J step 2: the manifest sha256 of `label`'s FIRST verification, if it was ever verified.
+pub async fn first_verified_manifest(
+    pool: &MaintenanceDbPool,
+    label: &str,
+) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — ops.backup_sets SELECT (0234)
+    sqlx::query_scalar("SELECT manifest_sha256 FROM ops.backup_sets WHERE backup_label = $1")
+        .bind(label)
+        .fetch_optional(pool.pool())
+        .await
+}
+
+/// ADR-0064 D-J step 2: records `manifest_sha256` as `label`'s identity after its first clean verification; a later
+/// call for the same label writes nothing (the first verification stays the identity).
+pub async fn bind_backup_set(
+    pool: &MaintenanceDbPool,
+    label: &str,
+    manifest_sha256: &[u8],
+) -> Result<(), sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — ops.backup_sets INSERT (0234)
+    sqlx::query(
+        "INSERT INTO ops.backup_sets (backup_label, manifest_sha256) VALUES ($1, $2) \
+         ON CONFLICT (backup_label) DO NOTHING",
+    )
+    .bind(label)
+    .bind(manifest_sha256)
+    .execute(pool.pool())
+    .await
+    .map(|_| ())
+}
+
+/// ADR-0064 D-V: the newest VERIFIED set's repository bytes, the basis of the next backup's estimate (`None` before
+/// the first verified backup).
+pub async fn newest_verified_set_repo_bytes(
+    pool: &MaintenanceDbPool,
+) -> Result<Option<i64>, sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — ops.backup_receipts SELECT (0234)
+    sqlx::query_scalar(
+        "SELECT set_repo_bytes FROM ops.backup_receipts \
+         WHERE outcome = 'VERIFIED' AND set_repo_bytes IS NOT NULL ORDER BY recorded_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool.pool())
+    .await
+}
+
+/// The latest verification verdict of one backup set (the newest receipt under its label).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetVerdict {
+    /// pgBackRest's set label.
+    pub label: String,
+    /// The newest receipt of the label is VERIFIED.
+    pub verified: bool,
+    /// The set's start as the receipt recorded it.
+    pub started_at: Option<OffsetDateTime>,
+    /// The set's stop as the receipt recorded it.
+    pub stopped_at: Option<OffsetDateTime>,
+}
+
+/// What `backup status` reads from the database, in one READ ONLY snapshot (status writes nothing, T-J4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupStatusFacts {
+    /// Every labelled set's latest verdict (D-K's `latest` CTE: `DISTINCT ON (backup_label)`, newest first).
+    pub sets: Vec<SetVerdict>,
+    /// The oldest `ops.wal_archive_failures` row newer than the newest VERIFIED start (10.11 D's `v`): the latch.
+    pub latched_since: Option<OffsetDateTime>,
+    /// The newest `ops.wal_archive_failures` row (the PITR window starts after it, 10.11 E).
+    pub newest_failure: Option<OffsetDateTime>,
+    /// `pg_stat_archiver.last_failed_time` when it is newer than `last_archived_time`: failing right now.
+    pub failing_now_since: Option<OffsetDateTime>,
+}
+
+/// ADR-0064 10.11 D / E: the facts `backup status` prints, read-only.
+pub async fn backup_status_facts(
+    pool: &MaintenanceDbPool,
+) -> Result<BackupStatusFacts, sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — one READ ONLY snapshot of the receipts, the latch and pg_stat_archiver
+    let mut txn = pool.pool().begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *txn)
+        .await?;
+    let rows = sqlx::query(
+        "SELECT backup_label, outcome = 'VERIFIED', backup_started_at, backup_stopped_at FROM ( \
+           SELECT DISTINCT ON (backup_label) backup_label, outcome, backup_started_at, backup_stopped_at \
+           FROM ops.backup_receipts WHERE backup_label IS NOT NULL \
+           ORDER BY backup_label, recorded_at DESC) latest ORDER BY backup_started_at",
+    )
+    .fetch_all(&mut *txn)
+    .await?;
+    let sets = rows
+        .iter()
+        .map(|r| {
+            Ok(SetVerdict {
+                label: r.try_get(0)?,
+                verified: r.try_get(1)?,
+                started_at: r.try_get(2)?,
+                stopped_at: r.try_get(3)?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    let row = sqlx::query(
+        "WITH v AS (SELECT coalesce(max(backup_started_at), '-infinity'::timestamptz) AS v \
+                    FROM ops.backup_receipts WHERE outcome = 'VERIFIED') \
+         SELECT (SELECT min(observed_at) FROM ops.wal_archive_failures, v WHERE observed_at > v.v), \
+                (SELECT max(observed_at) FROM ops.wal_archive_failures), \
+                (SELECT a.last_failed_time FROM pg_stat_archiver a \
+                  WHERE a.last_failed_time > coalesce(a.last_archived_time, '-infinity'::timestamptz))",
+    )
+    .fetch_one(&mut *txn)
+    .await?;
+    let facts = BackupStatusFacts {
+        sets,
+        latched_since: row.try_get(0)?,
+        newest_failure: row.try_get(1)?,
+        failing_now_since: row.try_get(2)?,
+    };
+    txn.commit().await?;
+    Ok(facts)
+}
+
+// ---- ADR-0064 D-K / 10.11 D (card 37 S6): the daemon's DR_EVIDENCE statement ----
+// Owner: `humaux-maintenance --serve`'s cluster-level DR_EVIDENCE task (maintenance::serve), as role_maintenance
+// (0234: SELECT on ops.backup_receipts, INSERT + SELECT on ops.wal_archive_failures; ops.restore_drills SELECT by the
+// 0011 ops default; pg_stat_archiver is readable by PUBLIC, spike SP-12). One statement, no tenant GUC, no LIMIT: it
+// reads the latest receipt per label, the newest succeeded drill and the newest measuring receipt, and writes at
+// most one latch row.
+
+/// ADR-0064 D-V: the next set's estimate is the newest VERIFIED set's repository bytes × 1.25, kept as the exact
+/// ratio 5/4. One definition for the backup arm's precheck and the daemon's headroom.
+pub const ESTIMATE_RATIO: (i64, i64) = (5, 4);
+
+/// [`ESTIMATE_RATIO`] applied to one set's repository bytes.
+pub const fn estimate_from_set_bytes(set_repo_bytes: i64) -> i64 {
+    set_repo_bytes * ESTIMATE_RATIO.0 / ESTIMATE_RATIO.1
+}
+
+/// The newest receipt that measured the repository (a budget refusal qualifies, 10.11 D / F4), with the limits the
+/// arm used then; the daemon reads no budget key (10.11 C / F10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeasuredBudget {
+    /// `du -sk` of the repository at that run.
+    pub repo_bytes: i64,
+    /// `HUMAUX_MAINTENANCE_BACKUP_REPO_MAX_BYTES` as that run used it.
+    pub repo_max_bytes: Option<i64>,
+    /// `HUMAUX_MAINTENANCE_BACKUP_MIN_FREE_BYTES` as that run used it.
+    pub min_free_bytes: Option<i64>,
+    /// The next set's estimate: newest VERIFIED `set_repo_bytes` × 1.25, else that receipt's `estimate_bytes`.
+    pub estimate_bytes: Option<i64>,
+}
+
+/// One DR_EVIDENCE reading from the database (ADR-0064 10.11 D). Timestamps are unix seconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrEvidence {
+    /// `max(backup_stopped_at)` over the labels whose latest receipt is VERIFIED; `None` before the first.
+    pub backup_last_success: Option<f64>,
+    /// `finished_at` of the newest drill the table derived as succeeded.
+    pub restore_drill_last_success: Option<f64>,
+    /// `None` before the first measuring receipt.
+    pub budget: Option<MeasuredBudget>,
+    /// The latch (a row observed after the newest VERIFIED start) or archiving failing now.
+    pub wal_archive_failing: bool,
+}
+
+/// ADR-0064 10.11 D: the DR_EVIDENCE statement. `last_failed` / `last_archived` override `pg_stat_archiver`'s two
+/// columns and exist only for T-K3' (a dev cluster with archiving off cannot fail an archive); production binds
+/// `None, None`. A latch row is written when a failure is newer than the newest VERIFIED start `v` and no row since
+/// `v` exists ("any failure since the newest VERIFIED start", so a queue-max drop that PostgreSQL counts as archived
+/// stays latched); it resolves only when a VERIFIED full starts after it.
+pub async fn dr_evidence(
+    pool: &MaintenanceDbPool,
+    last_failed: Option<OffsetDateTime>,
+    last_archived: Option<OffsetDateTime>,
+) -> Result<DrEvidence, sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — ops.backup_receipts + ops.restore_drills + pg_stat_archiver SELECT,
+    // ops.wal_archive_failures SELECT/INSERT (0234), one statement
+    let row = sqlx::query(
+        "WITH latest AS ( \
+           SELECT DISTINCT ON (backup_label) outcome, backup_stopped_at FROM ops.backup_receipts \
+           WHERE backup_label IS NOT NULL ORDER BY backup_label, recorded_at DESC), \
+         v AS (SELECT coalesce(max(backup_started_at), '-infinity'::timestamptz) AS v \
+               FROM ops.backup_receipts WHERE outcome = 'VERIFIED'), \
+         a AS (SELECT coalesce($1::timestamptz, last_failed_time) AS last_failed_time, \
+                      coalesce($2::timestamptz, last_archived_time) AS last_archived_time FROM pg_stat_archiver), \
+         ins AS (INSERT INTO ops.wal_archive_failures (observed_at) \
+                 SELECT clock_timestamp() FROM a, v \
+                 WHERE a.last_failed_time > v.v \
+                   AND NOT EXISTS (SELECT 1 FROM ops.wal_archive_failures f WHERE f.observed_at > v.v) \
+                 RETURNING observed_at), \
+         measured AS (SELECT repo_bytes, repo_max_bytes, min_free_bytes, estimate_bytes FROM ops.backup_receipts \
+                      WHERE repo_bytes IS NOT NULL ORDER BY recorded_at DESC LIMIT 1) \
+         SELECT (SELECT extract(epoch FROM max(backup_stopped_at))::float8 FROM latest WHERE outcome = 'VERIFIED'), \
+                (SELECT extract(epoch FROM max(finished_at))::float8 FROM ops.restore_drills WHERE succeeded), \
+                m.repo_bytes, m.repo_max_bytes, m.min_free_bytes, m.estimate_bytes, \
+                (SELECT set_repo_bytes FROM ops.backup_receipts \
+                  WHERE outcome = 'VERIFIED' AND set_repo_bytes IS NOT NULL ORDER BY recorded_at DESC LIMIT 1), \
+                EXISTS (SELECT 1 FROM ins) \
+                OR EXISTS (SELECT 1 FROM ops.wal_archive_failures, v WHERE observed_at > v.v) \
+                OR coalesce((SELECT a.last_failed_time > coalesce(a.last_archived_time, '-infinity'::timestamptz) \
+                             FROM a), false) \
+         FROM (SELECT 1) one LEFT JOIN measured m ON true",
+    )
+    .bind(last_failed)
+    .bind(last_archived)
+    .fetch_one(pool.pool())
+    .await?;
+    let repo_bytes: Option<i64> = row.try_get(2)?;
+    let verified_set: Option<i64> = row.try_get(6)?;
+    let budget = match repo_bytes {
+        Some(repo_bytes) => Some(MeasuredBudget {
+            repo_bytes,
+            repo_max_bytes: row.try_get(3)?,
+            min_free_bytes: row.try_get(4)?,
+            estimate_bytes: verified_set
+                .map(estimate_from_set_bytes)
+                .or(row.try_get(5)?),
+        }),
+        None => None,
+    };
+    Ok(DrEvidence {
+        backup_last_success: row.try_get(0)?,
+        restore_drill_last_success: row.try_get(1)?,
+        budget,
+        wal_archive_failing: row.try_get(7)?,
+    })
+}
+
+// ---- ADR-0064 D-L..D-O, D-U (card 37 S5): the restore drill's and `restore pitr`'s SQL ----
+// Owner of every statement below: `humaux-maintenance restore drill | restore pitr` (maintenance::drill). Source side
+// (HUMAUX_MAINTENANCE_PG_DSN, role_maintenance): the newest VERIFIED set, the witnesses A/B (0234 INSERT, SELECT),
+// the source's migration rows at T, the Evidence digests, the receipt (0234 INSERT on ops.restore_drills). Drill
+// side (the restored cluster through `docker compose port`, neutralised passwords): the same reads plus the
+// isolation probes as role_gateway / role_retrieval_worker. Every tenant-scoped read sets the tenant GUC in its own
+// transaction (RLS on every table with a tenant_id); every read is READ ONLY except the witness and receipt INSERTs.
+
+/// The set a drill or `restore pitr` restores: the newest set whose LATEST receipt is VERIFIED (D-K's rule).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSet {
+    /// pgBackRest's set label.
+    pub label: String,
+    /// The label's identity (`ops.backup_sets.manifest_sha256`, the first verification's manifest).
+    pub manifest_sha256: Vec<u8>,
+    /// The set's stop as its receipt recorded it.
+    pub stopped_at: Option<OffsetDateTime>,
+}
+
+/// ADR-0064 D-L step 1: the newest set whose latest receipt is VERIFIED, with its identity; `None` when no set
+/// qualifies (the drill then refuses `no_verified_backup`, it never falls back to an unverified set).
+pub async fn newest_verified_set(
+    pool: &MaintenanceDbPool,
+) -> Result<Option<VerifiedSet>, sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — ops.backup_receipts + ops.backup_sets SELECT (0234)
+    let row = sqlx::query(
+        "SELECT l.backup_label, s.manifest_sha256, l.backup_stopped_at FROM ( \
+           SELECT DISTINCT ON (backup_label) backup_label, outcome, backup_stopped_at \
+             FROM ops.backup_receipts WHERE backup_label IS NOT NULL \
+            ORDER BY backup_label, recorded_at DESC) l \
+           JOIN ops.backup_sets s ON s.backup_label = l.backup_label \
+          WHERE l.outcome = 'VERIFIED' ORDER BY l.backup_stopped_at DESC NULLS LAST LIMIT 1",
+    )
+    .fetch_optional(pool.pool())
+    .await?;
+    row.map(|r| {
+        Ok(VerifiedSet {
+            label: r.try_get(0)?,
+            manifest_sha256: r.try_get(1)?,
+            stopped_at: r.try_get(2)?,
+        })
+    })
+    .transpose()
+}
+
+/// ADR-0064 D-L step 2: one committed witness row (`kind` 'A' or 'B'); its `written_at` and the WAL file the
+/// insert position is in after the commit (`pg_walfile_name(pg_current_wal_insert_lsn())`).
+pub async fn write_witness(
+    pool: &MaintenanceDbPool,
+    drill_id: Uuid,
+    kind: &str,
+) -> Result<(OffsetDateTime, String), sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — ops.restore_witnesses INSERT (0234)
+    let written: OffsetDateTime = sqlx::query_scalar(
+        "INSERT INTO ops.restore_witnesses (drill_id, kind) VALUES ($1, $2) RETURNING written_at",
+    )
+    .bind(drill_id)
+    .bind(kind)
+    .fetch_one(pool.pool())
+    .await?;
+    // dep: PostgreSQL(role_maintenance) — WAL position after the commit (PUBLIC functions)
+    let walfile: String = sqlx::query_scalar("SELECT pg_walfile_name(pg_current_wal_insert_lsn())")
+        .fetch_one(pool.pool())
+        .await?;
+    Ok((written, walfile))
+}
+
+/// ADR-0064 D-L step 2: `clock_timestamp()` read in its own transaction, between the two witness commits (T).
+pub async fn clock(pool: &MaintenanceDbPool) -> Result<OffsetDateTime, sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — the database clock
+    sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool.pool())
+        .await
+}
+
+/// ADR-0064 D-N (b): the witness kinds of `drill_id` this pool sees (`{A}` = the restore at T; `B` = the source).
+pub async fn witness_kinds(
+    pool: &MaintenanceDbPool,
+    drill_id: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — ops.restore_witnesses SELECT (0234)
+    sqlx::query_scalar("SELECT kind FROM ops.restore_witnesses WHERE drill_id = $1 ORDER BY kind")
+        .bind(drill_id)
+        .fetch_all(pool.pool())
+        .await
+}
+
+/// The cluster facts a drill reads through role_maintenance (D-N (c), (e), (j)). D-N (d) is not here:
+/// `ops.schema_migrations` is owner-only (0201 D-C), so the drill reads it as the image superuser over each
+/// container's socket.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterFacts {
+    /// `server_version_num`.
+    pub server_version_num: i32,
+    /// D-N (e): tenant tables (`relkind` r/p with a `tenant_id` column) lacking `relrowsecurity AND
+    /// relforcerowsecurity` or lacking a policy.
+    pub rls_unforced: i64,
+    /// D-N (j): `archived_count + failed_count` of `pg_stat_archiver` (0 when `--archive-mode=off` held).
+    pub archiver_attempts: i64,
+}
+
+/// ADR-0064 D-N (c), (e), (j) in one READ ONLY snapshot.
+pub async fn cluster_facts(pool: &MaintenanceDbPool) -> Result<ClusterFacts, sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — catalog and pg_stat_archiver (READ ONLY)
+    let mut txn = pool.pool().begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *txn)
+        .await?;
+    let row = sqlx::query(
+        "SELECT current_setting('server_version_num')::int, \
+                (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE c.relkind IN ('r', 'p') AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                    AND NOT c.relispartition \
+                    AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid \
+                                 AND a.attname = 'tenant_id' AND NOT a.attisdropped) \
+                    AND (NOT (c.relrowsecurity AND c.relforcerowsecurity) \
+                         OR NOT EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid))), \
+                (SELECT archived_count + failed_count FROM pg_stat_archiver)",
+    )
+    .fetch_one(&mut *txn)
+    .await?;
+    txn.commit().await?;
+    Ok(ClusterFacts {
+        server_version_num: row.try_get(0)?,
+        rls_unforced: row.try_get(1)?,
+        archiver_attempts: row.try_get(2)?,
+    })
+}
+
+/// What one tenant holds, read as role_maintenance under the tenant GUC (D-N (f) ranking, (h), restored state).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TenantFacts {
+    /// `private.memory_records` rows visible under the GUC (the (f) ranking).
+    pub memories: i64,
+    /// D-N (h): sha256 over the sorted `evidence_id:payload_sha256` pairs, `created_at <= at` when `at` was given.
+    pub evidence_digest: Vec<u8>,
+    /// Restored in-flight state the drill leaves untouched (R-37 quarantine): ISSUED tickets that are not
+    /// generation tickets, non-terminal `ops.jobs`, RESERVED `ops.model_call_ledger` rows.
+    pub issued_g1: i64,
+    /// See `issued_g1`.
+    pub open_jobs: i64,
+    /// See `issued_g1`.
+    pub reserved_calls: i64,
+    /// Distinct `embedding_version` of live registry rows.
+    pub labels: BTreeSet<String>,
+    /// D-L step 0 / 10.11 H: live registry rows × (4 × dimension + 2,048) bytes.
+    pub vector_bytes: i64,
+}
+
+/// ADR-0064 D-N (f), (h) and the restored-state counts for one tenant, in one READ ONLY transaction.
+pub async fn tenant_facts(
+    pool: &MaintenanceDbPool,
+    tenant: Uuid,
+    at: Option<OffsetDateTime>,
+) -> Result<TenantFacts, sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — per-tenant READ ONLY reads under the tenant GUC (0012 RLS)
+    let mut txn = pool.pool().begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *txn)
+        .await?;
+    sqlx::query("SELECT set_config('humaux.tenant_id', $1::text, true)")
+        .bind(tenant)
+        .execute(&mut *txn)
+        .await?;
+    let row = sqlx::query(
+        "SELECT (SELECT count(*) FROM private.memory_records WHERE tenant_id = $1), \
+                (SELECT sha256(convert_to(coalesce(string_agg(evidence_id::text || ':' || encode(payload_sha256, 'hex'), \
+                         ',' ORDER BY evidence_id), ''), 'UTF8')) \
+                   FROM private.evidence_objects \
+                  WHERE tenant_id = $1 AND ($2::timestamptz IS NULL OR created_at <= $2)), \
+                (SELECT count(*) FROM projection.stream_log sl WHERE sl.tenant_id = $1 AND sl.state = 'ISSUED' \
+                    AND NOT EXISTS (SELECT 1 FROM projection.rebuild_tickets rt \
+                                     WHERE rt.tenant_id = sl.tenant_id AND rt.scope_kind = sl.scope_kind \
+                                       AND rt.scope_id = sl.scope_id AND rt.domain = sl.domain \
+                                       AND rt.projection_kind = sl.projection_kind \
+                                       AND rt.projection_version = sl.projection_version \
+                                       AND rt.stream_seq = sl.stream_seq)), \
+                (SELECT count(*) FROM ops.jobs WHERE tenant_id = $1 AND status NOT IN ('DONE', 'FAILED', 'DEAD')), \
+                (SELECT count(*) FROM ops.model_call_ledger WHERE tenant_id = $1 AND status = 'RESERVED'), \
+                ARRAY(SELECT DISTINCT embedding_version FROM projection.private_memory_points \
+                       WHERE tenant_id = $1 AND projection_live), \
+                (SELECT coalesce(sum(4 * coalesce(ef.dimension, 0) + 2048), 0)::bigint \
+                   FROM projection.private_memory_points p \
+                   LEFT JOIN projection.embedding_fingerprints ef ON ef.fingerprint_sha256 = p.fingerprint_sha256 \
+                  WHERE p.tenant_id = $1 AND p.projection_live)",
+    )
+    .bind(tenant)
+    .bind(at)
+    .fetch_one(&mut *txn)
+    .await?;
+    txn.commit().await?;
+    Ok(TenantFacts {
+        memories: row.try_get(0)?,
+        evidence_digest: row.try_get(1)?,
+        issued_g1: row.try_get(2)?,
+        open_jobs: row.try_get(3)?,
+        reserved_calls: row.try_get(4)?,
+        labels: row.try_get::<Vec<String>, _>(5)?.into_iter().collect(),
+        vector_bytes: row.try_get(6)?,
+    })
+}
+
+/// ADR-0064 D-N (f), as role_gateway under `tenant`'s GUC: `(other-tenant rows visible in memory_records,
+/// evidence_objects and private_memory_points, own memory_records)`.
+pub async fn gateway_isolation(
+    pool: &RuntimeDbPool,
+    tenant: Uuid,
+) -> Result<(i64, i64), sqlx::Error> {
+    // dep: PostgreSQL(role_gateway) — READ ONLY isolation probe under the tenant GUC (0012 RLS)
+    let mut txn = pool.pool().begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *txn)
+        .await?;
+    sqlx::query("SELECT set_config('humaux.tenant_id', $1::text, true)")
+        .bind(tenant)
+        .execute(&mut *txn)
+        .await?;
+    let row = sqlx::query(
+        "SELECT (SELECT count(*) FROM private.memory_records WHERE tenant_id <> $1) \
+              + (SELECT count(*) FROM private.evidence_objects WHERE tenant_id <> $1) \
+              + (SELECT count(*) FROM projection.private_memory_points WHERE tenant_id <> $1), \
+                (SELECT count(*) FROM private.memory_records WHERE tenant_id = $1)",
+    )
+    .bind(tenant)
+    .fetch_one(&mut *txn)
+    .await?;
+    txn.commit().await?;
+    Ok((row.try_get(0)?, row.try_get(1)?))
+}
+
+/// ADR-0064 D-N (f), as role_retrieval_worker (the only tenant-scoped reader of vectors) under `tenant`'s GUC:
+/// other-tenant rows visible in `projection.memory_vectors`.
+pub async fn vector_isolation(
+    pool: &RetrievalWorkerDbPool,
+    tenant: Uuid,
+) -> Result<i64, sqlx::Error> {
+    // dep: PostgreSQL(role_retrieval_worker) — READ ONLY isolation probe under the tenant GUC (0232 RLS)
+    let mut txn = pool.pool().begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *txn)
+        .await?;
+    sqlx::query("SELECT set_config('humaux.tenant_id', $1::text, true)")
+        .bind(tenant)
+        .execute(&mut *txn)
+        .await?;
+    let n: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM projection.memory_vectors WHERE tenant_id <> $1")
+            .bind(tenant)
+            .fetch_one(&mut *txn)
+            .await?;
+    txn.commit().await?;
+    Ok(n)
+}
+
+/// One `ops.restore_drills` row (D-O as 0234 shaped it). `succeeded` is NOT a field: the receipt claims it only by
+/// leaving `failure` empty, and `restore_drills_succeeded_derived` refuses a claim any check contradicts.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DrillReceipt {
+    /// The drill id (`restore_drill_id`).
+    pub drill_id: Uuid,
+    /// The restored set.
+    pub backup_label: Option<String>,
+    /// Its identity as the drill read it.
+    pub backup_manifest_sha256: Option<Vec<u8>>,
+    /// T (between the witnesses).
+    pub target_time: Option<OffsetDateTime>,
+    /// Drill start / end.
+    pub started_at: Option<OffsetDateTime>,
+    /// See `started_at`.
+    pub finished_at: Option<OffsetDateTime>,
+    /// D-N (a).
+    pub manifest_matches: Option<bool>,
+    /// D-N (b).
+    pub witness_a_present: Option<bool>,
+    /// D-N (b).
+    pub witness_b_absent: Option<bool>,
+    /// D-N (c).
+    pub server_version_matches: Option<bool>,
+    /// D-N (d).
+    pub migrations_drift: Option<i32>,
+    /// D-N (e).
+    pub rls_unforced: Option<i32>,
+    /// D-N (f).
+    pub isolation_violations: Option<i32>,
+    /// D-N (f).
+    pub isolation_pairs: Option<i32>,
+    /// D-N (h).
+    pub payload_digest_mismatches: Option<i32>,
+    /// D-M: refused embedder attempts.
+    pub provider_calls: Option<i64>,
+    /// D-N (j).
+    pub drill_archiver_attempts: Option<i64>,
+    /// D-N (g).
+    pub rebuild_equivalent: Option<bool>,
+    /// D-N (g).
+    pub rebuild_points: Option<i64>,
+    /// D-G.
+    pub legacy_points_without_vector: Option<i64>,
+    /// D-N (g): memories distilled but unprojected at T.
+    pub unprojected_at_target: Option<i64>,
+    /// R-37 quarantine counts.
+    pub restored_in_flight: Option<serde_json::Value>,
+    /// D-O: labelled resources left after destroy.
+    pub residue: Option<i32>,
+    /// D-Q RTO.
+    pub rto_seconds: Option<f64>,
+    /// Every phase, timed.
+    pub phase_seconds: Option<serde_json::Value>,
+    /// The first named failure; `None` claims success.
+    pub failure: Option<String>,
+    /// 10.11 H.
+    pub repo_intact: Option<bool>,
+}
+
+/// ADR-0064 D-O step 9: the receipt, written AFTER destroy (residue known). A success claim the table refuses comes
+/// back as the database error (23514), never as a quietly failed row.
+pub async fn insert_drill_receipt(
+    pool: &MaintenanceDbPool,
+    r: &DrillReceipt,
+) -> Result<bool, sqlx::Error> {
+    // dep: PostgreSQL(role_maintenance) — ops.restore_drills INSERT (0234)
+    sqlx::query_scalar(
+        "INSERT INTO ops.restore_drills (restore_drill_id, succeeded, backup_label, backup_manifest_sha256, \
+           target_time, started_at, finished_at, manifest_matches, witness_a_present, witness_b_absent, \
+           server_version_matches, migrations_drift, rls_unforced, isolation_violations, isolation_pairs, \
+           payload_digest_mismatches, provider_calls, drill_archiver_attempts, rebuild_equivalent, rebuild_points, \
+           legacy_points_without_vector, unprojected_at_target, restored_in_flight, residue, rto_seconds, \
+           phase_seconds, failure, repo_intact) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
+           $23, $24, $25::float8::numeric, $26, $27, $28) RETURNING succeeded",
+    )
+    .bind(r.drill_id)
+    .bind(r.failure.is_none())
+    .bind(&r.backup_label)
+    .bind(&r.backup_manifest_sha256)
+    .bind(r.target_time)
+    .bind(r.started_at)
+    .bind(r.finished_at)
+    .bind(r.manifest_matches)
+    .bind(r.witness_a_present)
+    .bind(r.witness_b_absent)
+    .bind(r.server_version_matches)
+    .bind(r.migrations_drift)
+    .bind(r.rls_unforced)
+    .bind(r.isolation_violations)
+    .bind(r.isolation_pairs)
+    .bind(r.payload_digest_mismatches)
+    .bind(r.provider_calls)
+    .bind(r.drill_archiver_attempts)
+    .bind(r.rebuild_equivalent)
+    .bind(r.rebuild_points)
+    .bind(r.legacy_points_without_vector)
+    .bind(r.unprojected_at_target)
+    .bind(&r.restored_in_flight)
+    .bind(r.residue)
+    .bind(r.rto_seconds)
+    .bind(&r.phase_seconds)
+    .bind(&r.failure)
+    .bind(r.repo_intact)
+    .fetch_one(pool.pool())
+    .await
 }

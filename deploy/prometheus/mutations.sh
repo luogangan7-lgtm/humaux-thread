@@ -9,7 +9,7 @@
 #   (c) the pinned `promtool test rules` exits 1 AND prints `alertname: <expected>, time:` (W6).
 # Before any row: the promtool pin is checked, and the unmutated tree must pass test-rules.sh in the
 # same copy layout ("baseline red in copy" otherwise), so a path or layout error is never read as red.
-# Rows: `id|rule-file|from|to|expected-alertname`; rows-file overrides the built-in 27 (selftest.sh);
+# Rows: `id|rule-file|from|to|expected-alertname`; rows-file overrides the built-in 32 (selftest.sh);
 # every `absent(...)` branch of CoreMetricAbsent, HealthGaugesAbsent, MaintenanceCountersAbsent and PartitionHorizonAbsent
 # has its own row.
 #
@@ -68,6 +68,11 @@ horizon_le1|alerts.rules.yml|(partition_horizon_months) <= 1|(partition_horizon_
 horizon_min|alerts.rules.yml|min by (table) (partition_horizon_months) <= 1|partition_horizon_months <= 1|PartitionHorizonShort
 horizon_le0|alerts.rules.yml|(partition_horizon_months) <= 0|(partition_horizon_months) < 0|PartitionHorizonExhausted
 horizon_absent|alerts.rules.yml|absent(partition_horizon_months)|absent(vector(1))|PartitionHorizonAbsent
+not_offsite|alerts.rules.yml|label_replace(vector(0),|label_replace(vector(0) < 0,|BackupNotOffsite
+drill|alerts.rules.yml|691200|1382400|RestoreDrillFailure
+wal_failing|alerts.rules.yml|wal_archive_failing > 0|wal_archive_failing > 1|WalArchiveFailing
+budget_low|alerts.rules.yml|backup_budget_headroom_bytes < 0|backup_budget_headroom_bytes > 0|BackupBudgetLow
+disk_free_low|alerts.rules.yml|8053063680|0|DiskFreeLow
 ROWS
 fi
 # ponytail: `dead` uses `> 2`, not `> 1`: measured, delta() extrapolates a 0→1 step over [15m] at 1m

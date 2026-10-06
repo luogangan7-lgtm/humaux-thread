@@ -3,8 +3,8 @@
 //! Depends-on: crates=[]; services=[HTTP(loopback)]; env=[]; modules=[telemetry::degrade]
 //! Called-by: [admin::cell_resources, admin::ops_status, consolidation-worker::main, gateway::bootstrap,
 //!   gateway::guard, gateway::main, maintenance::health_serve, maintenance::resident, maintenance::serve,
-//!   private-worker::main, retrieval-worker::main, retrieval::completeness, telemetry::degrade, telemetry::health,
-//!   tests]
+//!   private-worker::main, retrieval-worker::main, retrieval::completeness, telemetry::degrade, telemetry::dr,
+//!   telemetry::health, tests]
 //! Invariants: [every exported family is a `families::*` const and nowhere else; label values are `&'static str`
 //!   from a closed enum; the listener refuses a non-loopback address and names the config key]
 //! Spec: Baseline §41.2; §53.5; ADR-0061 D-A; ADR-0061 D-B
@@ -297,6 +297,55 @@ pub mod families {
         "Whole months of pre-created partitions after the current UTC month, per §48.1 table_key (-1: no leaf).",
         Kind::Gauge,
         &["table"],
+    );
+    // §41.2: §44 the DR_EVIDENCE run of `humaux-maintenance --serve` (card 37; emit `telemetry::dr::publish`,
+    // ADR-0064 D-K / 10.11 D). `target` is the one value `telemetry::dr::TARGET_LOCAL` (ruling E17).
+    /// `backup_last_success_timestamp_seconds{target}`.
+    pub const BACKUP_LAST_SUCCESS_TIMESTAMP_SECONDS: Family = f(
+        "backup_last_success_timestamp_seconds",
+        "Stop time of the newest backup set whose latest verification is VERIFIED (0: never).",
+        Kind::Gauge,
+        &["target"],
+    );
+    // §41.2: §44 the same DR_EVIDENCE run (ADR-0064 D-K).
+    /// `restore_drill_last_success_timestamp_seconds{target}`.
+    pub const RESTORE_DRILL_LAST_SUCCESS_TIMESTAMP_SECONDS: Family = f(
+        "restore_drill_last_success_timestamp_seconds",
+        "Finish time of the newest restore drill the table derived as succeeded (0: never).",
+        Kind::Gauge,
+        &["target"],
+    );
+    // §41.2: §44 the same DR_EVIDENCE run (ADR-0064 E15.6 / 10.11 D).
+    /// `backup_repo_bytes`.
+    pub const BACKUP_REPO_BYTES: Family = f(
+        "backup_repo_bytes",
+        "Repository bytes as the newest backup arm run measured them (refusals included; 0: no run).",
+        Kind::Gauge,
+        &[],
+    );
+    // §41.2: §44 the same DR_EVIDENCE run, live `df -Pk` (ADR-0064 E15.6 / 10.11 D).
+    /// `backup_disk_free_bytes{volume}`.
+    pub const BACKUP_DISK_FREE_BYTES: Family = f(
+        "backup_disk_free_bytes",
+        "Free bytes of the repository filesystem and of the PGDATA filesystem, by volume.",
+        Kind::Gauge,
+        &["volume"],
+    );
+    // §41.2: §44 the same DR_EVIDENCE run (ADR-0064 D-V / 10.11 D).
+    /// `backup_budget_headroom_bytes{limit}`.
+    pub const BACKUP_BUDGET_HEADROOM_BYTES: Family = f(
+        "backup_budget_headroom_bytes",
+        "Bytes left under each backup budget limit after the next set's estimate (< 0: the next backup is refused).",
+        Kind::Gauge,
+        &["limit"],
+    );
+    // §41.2: §44 the same DR_EVIDENCE run, latched in ops.wal_archive_failures (ADR-0064 10.11 D).
+    /// `wal_archive_failing`.
+    pub const WAL_ARCHIVE_FAILING: Family = f(
+        "wal_archive_failing",
+        "1 while a WAL archive failure is latched (until a later VERIFIED full) or archiving fails now, else 0.",
+        Kind::Gauge,
+        &[],
     );
 }
 

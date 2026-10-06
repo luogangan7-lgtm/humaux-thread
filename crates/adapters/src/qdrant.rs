@@ -3,13 +3,16 @@
 //!   services=[Qdrant(*)]; env=[]; modules=[domain::affect, domain::authority, domain::dataclass, domain::identity,
 //!   domain::ids, domain::memory, domain::subject, domain::ticket_family, infra-cell::permit, infra-cell::transport,
 //!   projection::card, projection::dense]
-//! Called-by: [adapters::placement_repo, adapters::projection_worker, adapters::provisioning, adapters::public_projection, adapters::retrieve, adapters::stream_repo, gateway::recall, retrieval-worker::main, tests, xtask::switch_visible]
+//! Called-by: [adapters::placement_repo, adapters::projection_worker, adapters::provisioning,
+//!   adapters::public_projection, adapters::rebuild, adapters::retrieve, adapters::stream_repo, gateway::recall,
+//!   maintenance::drill, retrieval-worker::main, tests, xtask::switch_visible]
 //! Invariants: [every wire call takes &dyn IntraCellHttpTransport carrying a CellAccessPermit; Qdrant down ->
 //!   QdrantTransportError to the caller, no fallback search; tombstoned points are filtered by the overlay, never
 //!   counted as visible; the count takes a VisibleCountFilter (one stream) only, search/scroll take a
-//!   DenseQueryFilter only — a StreamCountFilter reaches the count, never search (ADR-0057 D-C); the projection
+//!   DenseQueryFilter only — a StreamCountFilter reaches the count and the rebuild verifier's scroll
+//!   (scroll_stream_points, ADR-0064 D-F), never search (ADR-0057 D-C); the projection
 //!   worker's point writes and deletes are fenced on source_stream_seq (ADR-0057 D-I)]
-//! Spec: Baseline §17; §17.5; §17.4; §23.1; §23.4; ADR-0003; §83.4; §7.0; ADR-0055; ADR-0057
+//! Spec: Baseline §17; §17.5; §17.4; §23.1; §23.4; ADR-0003; §83.4; §7.0; ADR-0055; ADR-0057; ADR-0064
 //!
 //! Implements every part of §17: collection/index request-body shaping, payload encoding, the
 //! [`Condition`](humaux_projection::dense::Condition) → Qdrant filter JSON translation, the
@@ -1628,6 +1631,118 @@ pub async fn count(
         .and_then(|c| c.as_u64())
         .ok_or_else(|| {
             QdrantTransportError::UnexpectedResponseShape("missing result.count".to_string())
+        })
+}
+
+/// One point of a [`scroll_stream_points`] page: its id, its stored payload object and, when asked for,
+/// its stored vector (Qdrant's copy, normalised on upload for Cosine).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrolledPoint {
+    pub id: PointId,
+    pub payload: serde_json::Map<String, Value>,
+    pub vector: Option<Vec<f32>>,
+}
+
+/// One page of [`scroll_stream_points`]; `next` is Qdrant's `next_page_offset` (`None` = last page).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrollPage {
+    pub points: Vec<ScrolledPoint>,
+    pub next: Option<PointId>,
+}
+
+/// ADR-0064 D-F E3/E4/E5: one page of every point of ONE stream (`POST /points/scroll` with the
+/// [`StreamCountFilter`], payload always, vector on request), for the rebuild verifier only.
+// ADR-0057 D-C as amended by ADR-0064 D-F: a StreamCountFilter reaches the count and this ops-only
+// verifier scroll, never search; the filter is still the typed one (no hand-built tree).
+pub async fn scroll_stream_points(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+    filter: &StreamCountFilter,
+    offset: Option<PointId>,
+    page: u32,
+    with_vector: bool,
+) -> Result<ScrollPage, QdrantTransportError> {
+    validate_collection(collection)?;
+    let mut body = json!({
+        "filter": condition_tree_to_filter(filter.as_condition()),
+        "limit": page.max(1),
+        "with_payload": true,
+        "with_vector": with_vector,
+    });
+    if let Some(offset) = offset {
+        body["offset"] = offset.to_json();
+    }
+    let result = call(
+        transport,
+        permit,
+        IntraCellMethod::Post,
+        format!("/collections/{collection}/points/scroll"),
+        Some(body),
+    )
+    .await?;
+    let shape = |what: &str| QdrantTransportError::UnexpectedResponseShape(what.to_owned());
+    let raw = result
+        .get("result")
+        .and_then(|r| r.get("points"))
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| shape("missing result.points"))?;
+    let mut points = Vec::with_capacity(raw.len());
+    for point in raw {
+        let id = point
+            .get("id")
+            .and_then(point_id_from_json)
+            .ok_or_else(|| shape("point without id"))?;
+        let payload = point
+            .get("payload")
+            .and_then(|p| p.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let vector = match point.get("vector") {
+            Some(Value::Array(values)) => Some(
+                values
+                    .iter()
+                    .map(|v| v.as_f64().map(|f| f as f32))
+                    .collect::<Option<Vec<f32>>>()
+                    .ok_or_else(|| shape("non-numeric vector"))?,
+            ),
+            _ => None,
+        };
+        points.push(ScrolledPoint {
+            id,
+            payload,
+            vector,
+        });
+    }
+    let next = result
+        .get("result")
+        .and_then(|r| r.get("next_page_offset"))
+        .and_then(point_id_from_json);
+    Ok(ScrollPage { points, next })
+}
+
+/// ADR-0064 D-F E1: `result.status` of `GET /collections/{c}` (`green` = optimised and serving).
+pub async fn collection_status(
+    transport: &dyn IntraCellHttpTransport,
+    permit: &CellAccessPermit,
+    collection: &str,
+) -> Result<String, QdrantTransportError> {
+    validate_collection(collection)?;
+    let result = call(
+        transport,
+        permit,
+        IntraCellMethod::Get,
+        format!("/collections/{collection}"),
+        None,
+    )
+    .await?;
+    result
+        .get("result")
+        .and_then(|r| r.get("status"))
+        .and_then(|s| s.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            QdrantTransportError::UnexpectedResponseShape("missing result.status".to_string())
         })
 }
 

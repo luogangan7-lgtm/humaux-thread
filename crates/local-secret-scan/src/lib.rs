@@ -3,7 +3,8 @@
 //! Depends-on: crates=[humaux-domain, humaux-projection, humaux-retrieval, serde_json, sha2, uuid];
 //!   services=[subprocess(gitleaks)]; env=[]; modules=[domain::dataclass, domain::error, domain::evidence,
 //!   projection::card, retrieval::request]
-//! Called-by: [crate(humaux-adapters), crate(humaux-gateway), crate(humaux-private-worker), crate(humaux-retrieval-provider), crate(humaux-retrieval-worker), tests]
+//! Called-by: [crate(humaux-adapters), crate(humaux-gateway), crate(humaux-maintenance),
+//!   crate(humaux-private-worker), crate(humaux-retrieval-provider), crate(humaux-retrieval-worker), tests]
 //! Invariants: [gitleaks subprocess failure or non-zero exit surfaces as an error to the caller, no silent pass; no fallback scanner;
 //!   the retrieval seal path (seal_query/seal_card) applies no contribution-privacy rule, only size/DataClass checks and the
 //!   pinned gitleaks scan; the pinned binary is hashed at construction and re-hashed whenever its stat tuple changes]

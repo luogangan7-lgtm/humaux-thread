@@ -2,17 +2,22 @@
 //!   against real throwaway PostgreSQL databases (ADR-0062 D-A..D-D, D-L, D-Q; card 35 S1/S2): required keys, the
 //!   lag relation, one counted cycle, 503 and recovery across a closed PG port, SIGTERM between calls, the tenant
 //!   page rotation, the §77-gated one-page sweep with its per-task counts, the boot refusal of both resident
-//!   modes when the migrator DSN is in their environment (ADR-0063 D-H, T-H3), and the PARTITIONS proposer with its
-//!   `partition_horizon_months` family (ADR-0063 D-K, T-K1..T-K3).
-//! Depends-on: crates=[serde_json]; services=[PostgreSQL(any), PostgreSQL(owner)
-//!   r=[control.partition_registry, control.retention_policies, ops.maintenance_receipts, ops.stage_runs]
-//!   w=[control.confirm_tokens, control.rate_buckets, control.tenants, control.users, control.workspaces, ops.jobs,
-//!   ops.selection_snapshots, projection.stream_log]
+//!   modes when the migrator DSN is in their environment (ADR-0063 D-H, T-H3), the PARTITIONS proposer with its
+//!   `partition_horizon_months` family (ADR-0063 D-K, T-K1..T-K3), and the DR_EVIDENCE task with the six DR
+//!   families (ADR-0064 D-K / 10.11 D; card 37 T-K1..T-K4, T-K3' through the archiver parameter seam).
+//! Depends-on: crates=[humaux-adapters, serde_json, time, tokio]; services=[PostgreSQL(any), PostgreSQL(owner)
+//!   r=[control.partition_registry, control.retention_policies, ops.maintenance_receipts, ops.stage_runs,
+//!   ops.wal_archive_failures]
+//!   w=[control.confirm_tokens, control.rate_buckets, control.tenants, control.users, control.workspaces,
+//!   ops.backup_receipts, ops.backup_sets, ops.jobs, ops.restore_drills, ops.selection_snapshots,
+//!   projection.stream_log]
 //!   x=[control.maintenance_tenant_page, control.reap_quota_reservations], PostgreSQL(role_maintenance),
 //!   HTTP(loopback), subprocess(humaux-maintenance)];
-//!   env=[CARGO_TARGET_TMPDIR, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_MAINTENANCE_HEALTH_SAMPLE_SECONDS,
+//!   env=[CARGO_TARGET_TMPDIR, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_MAINTENANCE_DR_PGDATA_FS_PATH,
+//!   HUMAUX_MAINTENANCE_DR_REPO_FS_PATH, HUMAUX_MAINTENANCE_HEALTH_SAMPLE_SECONDS,
 //!   HUMAUX_MAINTENANCE_HEALTH_SERVE_METRICS_ADDR, HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS,
-//!   HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS, HUMAUX_MAINTENANCE_SERVE_JOBS_DEAD_RETENTION_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS, HUMAUX_MAINTENANCE_SERVE_DR_EVIDENCE_EVERY_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_JOBS_DEAD_RETENTION_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_JOBS_DONE_RETENTION_SECONDS, HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_LOST_EVERY_SECONDS, HUMAUX_MAINTENANCE_SERVE_LOST_LIMIT,
 //!   HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR, HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS,
@@ -20,13 +25,13 @@
 //!   HUMAUX_MAINTENANCE_SERVE_REDRIVE_COOLDOWN_SECONDS, HUMAUX_MAINTENANCE_SERVE_REISSUE_COOLDOWN_SECONDS,
 //!   HUMAUX_MAINTENANCE_SERVE_TENANTS_PER_RUN,
 //!   HUMAUX_MIGRATOR_PG_DSN, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS];
-//!   modules=[maintenance::tests::support::throwaway]
+//!   modules=[adapters::maintenance_repo, adapters::postgres, maintenance::tests::support::throwaway]
 //! Called-by: [cargo-test]
 //! Invariants: [every DB test owns its throwaway database humaux_thread_c35_serve_<pid>_<n>, dropped by the
 //!   fixture's Drop even on panic, so no LOST transition ever touches the shared dev database; every spawned
 //!   daemon is killed by its own Drop; the key tests point at a closed port and never reach a database]
 //! Spec: Baseline §15.2; §77; §78.1; §79.2; ADR-0037; ADR-0057 D-F; ADR-0062 D-A; ADR-0062 D-B; ADR-0062 D-D;
-//!   ADR-0062 D-Q; ADR-0063 D-H; ADR-0063 D-K
+//!   ADR-0062 D-Q; ADR-0063 D-H; ADR-0063 D-K; ADR-0064 D-K; ADR-0064 10.11 D
 
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
@@ -49,18 +54,8 @@ const LAG_SECONDS: &str = "HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS";
 const CLOSED_DSN: &str = "postgres://role_maintenance:unused@127.0.0.1:1/none";
 /// ADR-0063 D-K: the PARTITIONS cadence (seconds, >= CYCLE_SECONDS).
 const PARTITIONS_EVERY: &str = "HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS";
-/// The task keys the daemon requires, by D-C task name.
-const TASKS: [&str; 9] = [
-    "LOST",
-    "QUOTA_RESERVATIONS",
-    "PROVIDER_BUDGETS",
-    "CONFIRM_TOKENS",
-    "SNAPSHOTS",
-    "RATE_BUCKETS",
-    "JOBS",
-    "REISSUE",
-    "REDRIVE",
-];
+/// ADR-0064 D-K: the DR_EVIDENCE cadence (seconds, >= CYCLE_SECONDS).
+const DR_EVIDENCE_EVERY: &str = "HUMAUX_MAINTENANCE_SERVE_DR_EVIDENCE_EVERY_SECONDS";
 /// Their `/status` and receipt labels, in the same order.
 const LABELS: [&str; 9] = [
     "lost",
@@ -87,45 +82,13 @@ const ADMIN: [&str; 8] = [
 
 /// Every key `--serve` requires, with values valid for `cycle` seconds (EVERY = CYCLE, LOST_AFTER > LAG).
 fn keys(addr: SocketAddr, dsn: &str, cycle: u64, tenants_per_run: u32) -> Vec<(String, String)> {
-    let mut keys = vec![
-        (
-            "HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR".to_owned(),
-            addr.to_string(),
-        ),
-        (CYCLE_SECONDS.to_owned(), cycle.to_string()),
-        (
-            "HUMAUX_MAINTENANCE_SERVE_TENANTS_PER_RUN".to_owned(),
-            tenants_per_run.to_string(),
-        ),
-    ];
-    for task in TASKS {
-        keys.push((
-            format!("HUMAUX_MAINTENANCE_SERVE_{task}_EVERY_SECONDS"),
-            cycle.to_string(),
-        ));
-        keys.push((
-            format!("HUMAUX_MAINTENANCE_SERVE_{task}_LIMIT"),
-            "50".to_owned(),
-        ));
-    }
-    // ADR-0063 D-K: the cluster-level PARTITIONS task has a cadence and no LIMIT.
-    keys.push((PARTITIONS_EVERY.to_owned(), cycle.to_string()));
-    keys.push((LOST_AFTER_SECONDS.to_owned(), "120".to_owned()));
-    keys.push((LAG_SECONDS.to_owned(), "60".to_owned()));
-    // ADR-0062 D-G..D-J ages: one hour each, so only rows seeded older than that are purgeable.
-    for age in [
-        "HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS",
-        "HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_IDLE_SECONDS",
-        "HUMAUX_MAINTENANCE_SERVE_JOBS_DONE_RETENTION_SECONDS",
-        "HUMAUX_MAINTENANCE_SERVE_JOBS_DEAD_RETENTION_SECONDS",
-        "HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS",
-        "HUMAUX_MAINTENANCE_SERVE_REISSUE_COOLDOWN_SECONDS",
-        "HUMAUX_MAINTENANCE_SERVE_REDRIVE_COOLDOWN_SECONDS",
-    ] {
-        keys.push((age.to_owned(), "3600".to_owned()));
-    }
-    keys.push((MAINTENANCE_DSN.to_owned(), dsn.to_owned()));
-    keys
+    throwaway::serve_keys(
+        addr,
+        dsn,
+        cycle,
+        tenants_per_run,
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+    )
 }
 
 /// The keys `sweep once` reads: every `--serve` key but the listener and the cadences (ADR-0062 D-Q).
@@ -1054,4 +1017,366 @@ fn a_failed_partitions_run_removes_the_horizon_family_and_counts_failed() {
     let (code, body) = back.expect("/metrics after the re-grant");
     assert_eq!(code, 200, "{body}");
     assert_horizon(&body, 3);
+}
+
+// ---- card 37 S6: the DR_EVIDENCE task (ADR-0064 D-K as corrected by 10.11 D) ----
+
+/// 2026-09-01T00:00:00Z: the receipts below are fixed in time so each gauge value is an exact number.
+const DAY0: i64 = 1_788_220_800;
+const HOUR: i64 = 3_600;
+
+fn c37_db(test: &str) -> Option<Db> {
+    throwaway::db(test, "c37_serve")
+}
+
+fn value(body: &str, series: &str) -> Option<f64> {
+    throwaway::sample_value(body, series)
+}
+
+/// One VERIFIED receipt for `label` as `backup run` writes it: the label identity in `ops.backup_sets` first, then
+/// a receipt whose verified manifest is that identity. `measured` = (repo, repo_max, min_free, estimate) bytes.
+fn seed_verified(
+    db: &mut Db,
+    label: &str,
+    (started, stopped): (f64, f64),
+    set_repo_bytes: i64,
+    measured: Option<[i64; 4]>,
+) {
+    let m = measured.map_or([None; 4], |m| m.map(Some));
+    db.client()
+        .execute(
+            "INSERT INTO ops.backup_sets (backup_label, manifest_sha256) \
+             VALUES ($1, sha256(convert_to($1, 'UTF8'))) ON CONFLICT DO NOTHING",
+            &[&label],
+        )
+        .expect("backup set identity");
+    db.client()
+        .execute(
+            "INSERT INTO ops.backup_receipts (backup_label, backup_type, backup_started_at, backup_stopped_at, \
+               manifest_sha256, verify_exit, verified_manifest_sha256, outcome, set_repo_bytes, repo_bytes, \
+               repo_max_bytes, min_free_bytes, estimate_bytes) \
+             VALUES ($1, 'full', to_timestamp($2), to_timestamp($3), sha256(convert_to($1, 'UTF8')), 0, \
+               sha256(convert_to($1, 'UTF8')), 'VERIFIED', $4, $5, $6, $7, $8)",
+            &[&label, &started, &stopped, &set_repo_bytes, &m[0], &m[1], &m[2], &m[3]],
+        )
+        .expect("VERIFIED receipt");
+}
+
+/// One FAILED receipt (a failed run or re-verification of `label`, or with `None` a budget refusal).
+fn seed_failed(
+    db: &mut Db,
+    label: Option<&str>,
+    stopped: Option<f64>,
+    failure: &str,
+    measured: Option<[i64; 4]>,
+) {
+    let m = measured.map_or([None; 4], |m| m.map(Some));
+    db.client()
+        .execute(
+            "INSERT INTO ops.backup_receipts (backup_label, backup_type, backup_stopped_at, outcome, failure, \
+               repo_bytes, repo_max_bytes, min_free_bytes, estimate_bytes) \
+             VALUES ($1, 'full', to_timestamp($2), 'FAILED', $3, $4, $5, $6, $7)",
+            &[&label, &stopped, &failure, &m[0], &m[1], &m[2], &m[3]],
+        )
+        .expect("FAILED receipt");
+}
+
+/// One drill receipt; `succeeded` is derived by `restore_drills_succeeded_derived`, so a passing row carries every
+/// check and a failing one a failure.
+fn seed_drill(db: &mut Db, succeeded: bool, finished: f64) {
+    let sql = if succeeded {
+        "INSERT INTO ops.restore_drills (succeeded, finished_at, manifest_matches, witness_a_present, \
+           witness_b_absent, server_version_matches, rebuild_equivalent, repo_intact, migrations_drift, rls_unforced, \
+           isolation_violations, isolation_pairs, payload_digest_mismatches, provider_calls, drill_archiver_attempts, \
+           legacy_points_without_vector, residue, rebuild_points) \
+         VALUES (true, to_timestamp($1), true, true, true, true, true, true, 0, 0, 0, 2, 0, 0, 0, 0, 0, 1)"
+    } else {
+        "INSERT INTO ops.restore_drills (succeeded, finished_at, failure) \
+         VALUES (false, to_timestamp($1), 'restore_failed')"
+    };
+    db.client()
+        .execute(sql, &[&finished])
+        .expect("drill receipt");
+}
+
+/// `--serve` keys with the DR_EVIDENCE cadence set to `every` seconds (cycle 1 s).
+fn dr_keys(addr: SocketAddr, db: &Db, every: u64) -> Vec<(String, String)> {
+    keys(addr, &db.maintenance_dsn, 1, 1000)
+        .into_iter()
+        .map(|(k, v)| {
+            if k == DR_EVIDENCE_EVERY {
+                (k, every.to_string())
+            } else {
+                (k, v)
+            }
+        })
+        .collect()
+}
+
+const BACKUP_LOCAL: &str = r#"backup_last_success_timestamp_seconds{target="local"}"#;
+const DRILL_LOCAL: &str = r#"restore_drill_last_success_timestamp_seconds{target="local"}"#;
+const DR_FAILED: &str = r#"maintenance_task_runs_total{task="dr_evidence",outcome="failed"}"#;
+
+/// T-K1 (ADR-0064 D-K): the backup gauge is the stop time of the newest set whose LATEST receipt is VERIFIED — not a
+/// set verified earlier and FAILED since (its stop is later), not the newest set (FAILED only) — and the drill gauge
+/// is the newest drill the table derived as succeeded, not a later failed one; no other `target` is rendered. Fault:
+/// `max` over every VERIFIED row, ignoring a later FAILED → the withdrawn set's stop → red.
+#[test]
+fn dr_evidence_sets_both_gauges_from_the_latest_verified_receipts_only() {
+    let Some(mut db) =
+        c37_db("dr_evidence_sets_both_gauges_from_the_latest_verified_receipts_only")
+    else {
+        return;
+    };
+    let good = (DAY0 as f64, (DAY0 + HOUR) as f64);
+    seed_verified(&mut db, "20260901-000000F", good, 100, None);
+    let withdrawn = ((DAY0 + 24 * HOUR) as f64, (DAY0 + 25 * HOUR) as f64);
+    seed_verified(&mut db, "20260902-000000F", withdrawn, 100, None);
+    seed_failed(
+        &mut db,
+        Some("20260902-000000F"),
+        Some(withdrawn.1),
+        "verify_exit:1",
+        None,
+    );
+    seed_failed(
+        &mut db,
+        Some("20260903-000000F"),
+        Some((DAY0 + 49 * HOUR) as f64),
+        "backup_exit:1",
+        None,
+    );
+    seed_drill(&mut db, true, (DAY0 + 3 * 24 * HOUR) as f64);
+    seed_drill(&mut db, false, (DAY0 + 4 * 24 * HOUR) as f64);
+
+    let addr = free_addr();
+    let _serve = spawn(&dr_keys(addr, &db, 1));
+    let ready = poll(addr, "/metrics", Duration::from_secs(15), |(c, b)| {
+        *c == 200 && value(b, BACKUP_LOCAL).is_some_and(|v| v > 0.0)
+    });
+    let (code, body) = ready.expect("/metrics after the first DR_EVIDENCE run");
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(value(&body, BACKUP_LOCAL), Some(good.1), "{body}");
+    assert_eq!(
+        value(&body, DRILL_LOCAL),
+        Some((DAY0 + 3 * 24 * HOUR) as f64),
+        "{body}"
+    );
+    assert_eq!(
+        body.matches("target=").count(),
+        body.matches(r#"target="local""#).count(),
+        "only target=\"local\" is rendered: {body}"
+    );
+    assert!(
+        sample(
+            &body,
+            r#"maintenance_task_runs_total{task="dr_evidence",outcome="ok"}"#
+        ) >= 1,
+        "one counted run: {body}"
+    );
+}
+
+/// T-K2 (ADR-0064 D-K): a failed DR_EVIDENCE run (SELECT on the receipts revoked on the throwaway database) counts
+/// `outcome="failed"` and keeps every DR series at its last value — never reset, never 0. Fault: `reset()` (publish
+/// a zero reading) on failure → the backup gauge reads 0 → red.
+#[test]
+fn a_failed_dr_evidence_run_keeps_the_last_values_and_counts_failed() {
+    let Some(mut db) = c37_db("a_failed_dr_evidence_run_keeps_the_last_values_and_counts_failed")
+    else {
+        return;
+    };
+    let set = (DAY0 as f64, (DAY0 + HOUR) as f64);
+    seed_verified(
+        &mut db,
+        "20260901-000000F",
+        set,
+        100,
+        Some([1_000, 5_000, 100, 300]),
+    );
+    let addr = free_addr();
+    let _serve = spawn(&dr_keys(addr, &db, 4));
+    let first = poll(addr, "/metrics", Duration::from_secs(15), |(c, b)| {
+        *c == 200 && value(b, BACKUP_LOCAL) == Some(set.1)
+    });
+    let (code, body) = first.expect("/metrics after the first run");
+    assert_eq!(
+        (code, value(&body, BACKUP_LOCAL)),
+        (200, Some(set.1)),
+        "{body}"
+    );
+    let repo_max = value(&body, r#"backup_budget_headroom_bytes{limit="repo_max"}"#);
+
+    db.sql("REVOKE SELECT ON ops.backup_receipts FROM role_maintenance");
+    let failed = poll(addr, "/metrics", Duration::from_secs(20), |(c, b)| {
+        *c == 200 && value(b, DR_FAILED).is_some_and(|n| n >= 1.0)
+    });
+    let (code, body) = failed.expect("/metrics after a failed run");
+    assert_eq!(code, 200, "a clean cycle after the failed run: {body}");
+    assert_eq!(value(&body, BACKUP_LOCAL), Some(set.1), "kept: {body}");
+    assert_eq!(
+        value(&body, r#"backup_repo_bytes"#),
+        Some(1_000.0),
+        "kept: {body}"
+    );
+    assert_eq!(
+        value(&body, r#"backup_budget_headroom_bytes{limit="repo_max"}"#),
+        repo_max,
+        "kept: {body}"
+    );
+}
+
+/// The DB clock now, as a timestamp the seam can bind (the Docker VM's clock, not the host's).
+fn db_now(db: &mut Db) -> f64 {
+    db.client()
+        .query_one("SELECT extract(epoch FROM clock_timestamp())::float8", &[])
+        .expect("clock")
+        .get(0)
+}
+
+fn at(epoch: f64) -> time::OffsetDateTime {
+    time::OffsetDateTime::from_unix_timestamp_nanos((epoch * 1e9) as i128).expect("timestamp")
+}
+
+fn latch_rows(db: &mut Db) -> i64 {
+    db.client()
+        .query_one("SELECT count(*) FROM ops.wal_archive_failures", &[])
+        .expect("latch rows")
+        .get(0)
+}
+
+/// T-K3' (ADR-0064 10.11 D / I, dev-cluster leg; the live leg is T-J13): through the archiver parameter seam —
+/// no ALTER SYSTEM, no stats reset — (a) no receipts, a failure seen in two runs → exactly one latch row, failing;
+/// (b) a later archived segment → still failing; (c) no archiver failure at all (archive-off cluster = a reset) →
+/// still failing; (d) a VERIFIED full started after the observation → cleared; (e) a failure after that start
+/// followed by an archived segment (a queue-max drop PostgreSQL counts as archived) → latched again. Faults: the
+/// `last_failed_time > last_archived_time` comparison alone → (b) red; no `-infinity` coalesce → (a) red.
+#[test]
+fn wal_archive_failing_latches_until_a_later_verified_full() {
+    let Some(mut db) = c37_db("wal_archive_failing_latches_until_a_later_verified_full") else {
+        return;
+    };
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    // dep: PostgreSQL(role_maintenance) — the daemon's own statement, called through its parameter seam
+    let pool = rt
+        .block_on(humaux_adapters::postgres::MaintenanceDbPool::connect(
+            &db.maintenance_dsn,
+        ))
+        .expect("maintenance pool");
+    let pass = |failed: Option<f64>, archived: Option<f64>| {
+        rt.block_on(humaux_adapters::maintenance_repo::dr_evidence(
+            &pool,
+            failed.map(at),
+            archived.map(at),
+        ))
+        .expect("dr_evidence")
+        .wal_archive_failing
+    };
+    let t1 = db_now(&mut db) - 600.0;
+    assert!(pass(Some(t1), None), "(a) first run");
+    assert!(pass(Some(t1), None), "(a) second run");
+    assert_eq!(latch_rows(&mut db), 1, "(a) one row per incident");
+    assert!(
+        pass(Some(t1), Some(t1 + 60.0)),
+        "(b) a later archived segment does not clear it"
+    );
+    assert!(
+        pass(None, None),
+        "(c) the archiver forgot the failure; the latch did not"
+    );
+    let started = db_now(&mut db) + 1.0;
+    seed_verified(
+        &mut db,
+        "20261006-000000F",
+        (started, started + 1.0),
+        100,
+        None,
+    );
+    assert!(
+        !pass(None, None),
+        "(d) a VERIFIED full started after the observation clears it"
+    );
+    assert_eq!(latch_rows(&mut db), 1, "(d) nothing new latched");
+    let t2 = started + 60.0;
+    assert!(
+        pass(Some(t2), Some(t2 + 1.0)),
+        "(e) a dropped segment after that start latches again"
+    );
+    assert_eq!(latch_rows(&mut db), 2, "(e) one more row");
+}
+
+/// T-K4 (ADR-0064 D-V / 10.11 D): no receipt → both headrooms 0; after a VERIFIED run, `repo_max` = the recorded
+/// max − repo bytes − estimate (newest VERIFIED set bytes × 1.25, not the recorded estimate) and `free_floor` = live
+/// repo free − min free − estimate; when the newest measuring receipt is a budget refusal (label NULL) its numbers
+/// count and `repo_max` goes negative. Faults: estimate omitted → red; headroom from the newest VERIFIED receipt only
+/// → the refusal is ignored, `repo_max` stays positive → red.
+#[test]
+fn budget_headroom_is_max_minus_repo_minus_estimate() {
+    let Some(mut db) = c37_db("budget_headroom_is_max_minus_repo_minus_estimate") else {
+        return;
+    };
+    let repo_max = r#"backup_budget_headroom_bytes{limit="repo_max"}"#;
+    let free_floor = r#"backup_budget_headroom_bytes{limit="free_floor"}"#;
+    let repo_free = r#"backup_disk_free_bytes{volume="repo"}"#;
+    let addr = free_addr();
+    let _serve = spawn(&dr_keys(addr, &db, 1));
+    let first = poll(addr, "/metrics", Duration::from_secs(15), |(c, _)| {
+        *c == 200
+    });
+    let (code, body) = first.expect("/metrics after the first run");
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        (value(&body, repo_max), value(&body, free_floor)),
+        (Some(0.0), Some(0.0)),
+        "{body}"
+    );
+    assert!(
+        value(&body, repo_free).is_some_and(|v| v > 0.0),
+        "live df: {body}"
+    );
+
+    let set = (DAY0 as f64, (DAY0 + HOUR) as f64);
+    seed_verified(
+        &mut db,
+        "20260901-000000F",
+        set,
+        400,
+        Some([1_000, 5_000, 100, 300]),
+    );
+    let verified = poll(addr, "/metrics", Duration::from_secs(15), |(c, b)| {
+        *c == 200 && value(b, "backup_repo_bytes") == Some(1_000.0)
+    });
+    let (_, body) = verified.expect("/metrics after the VERIFIED receipt");
+    let estimate = 400 * 5 / 4;
+    assert_eq!(
+        value(&body, repo_max),
+        Some(f64::from(5_000 - 1_000 - estimate)),
+        "{body}"
+    );
+    let free = value(&body, repo_free).expect("repo free");
+    assert_eq!(
+        value(&body, free_floor),
+        Some(free - 100.0 - f64::from(estimate)),
+        "{body}"
+    );
+
+    seed_failed(
+        &mut db,
+        None,
+        None,
+        "budget_repo_max:6500",
+        Some([6_000, 5_000, 100, 700]),
+    );
+    let refused = poll(addr, "/metrics", Duration::from_secs(15), |(c, b)| {
+        *c == 200 && value(b, "backup_repo_bytes") == Some(6_000.0)
+    });
+    let (_, body) = refused.expect("/metrics after the refusal");
+    assert_eq!(
+        value(&body, repo_max),
+        Some(f64::from(5_000 - 6_000 - estimate)),
+        "{body}"
+    );
+    assert!(
+        value(&body, repo_max).is_some_and(|v| v < 0.0),
+        "BackupBudgetLow: {body}"
+    );
 }

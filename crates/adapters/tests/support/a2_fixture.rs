@@ -4,8 +4,9 @@
 //!   humaux-projection, humaux-retrieval, humaux-retrieval-provider, humaux-telemetry, humaux-testkit, postgres,
 //!   serde_json, sqlx, time, tokio]; services=[PostgreSQL(owner) w=[control.private_reasoning_domains,
 //!   control.tenants, control.workspaces, ops.jobs, ops.outbox, private.events, private.evidence_objects,
-//!   private.memory_evidence, private.memory_records, projection.private_memory_points,
-//!   projection.stream_checkpoints, projection.stream_log], PostgreSQL(role_gateway), PostgreSQL(role_maintenance),
+//!   private.memory_evidence, private.memory_records, projection.memory_vectors, projection.private_memory_points,
+//!   projection.rebuild_runs, projection.rebuild_tickets, projection.stream_checkpoints, projection.stream_log],
+//!   PostgreSQL(role_gateway), PostgreSQL(role_maintenance),
 //!   PostgreSQL(role_retrieval_worker), Qdrant(*)]; env=[HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_RETRIEVAL_WORKER_PG_DSN,
 //!   HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256, HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_PG_DSN,
 //!   HUMAUX_TEST_QDRANT_URL]; modules=[adapters::postgres, adapters::projection_worker, adapters::qdrant,
@@ -14,7 +15,8 @@
 //!   humaux-local-secret-scan, humaux-testkit, infra-cell::permit, infra-cell::resource, infra-cell::transport,
 //!   projection::serving, retrieval-provider::adapters, retrieval-provider::contract, retrieval::completeness,
 //!   retrieval::envelope, telemetry::degrade]
-//! Called-by: [adapters::tests::a2_point_identity, adapters::tests::projection_lag, adapters::tests::switch_user_private]
+//! Called-by: [adapters::tests::a2_point_identity, adapters::tests::projection_lag, adapters::tests::rebuild,
+//!   adapters::tests::switch_user_private, maintenance::tests::drill, maintenance::tests::measure]
 //! Invariants: [test-only, included by #[path]; both sides of A2 are the production producers
 //!   (stream_repo::fetch_ledger_closure through the 0189 definer, retrieve::visible_count_of_version); throwaway
 //!   tenant + collection cleaned up on Drop; a missing PG / Qdrant / gitleaks is a fixture error, never a silent pass]
@@ -117,6 +119,9 @@ impl Drop for Handle {
         if let Err(error) = self.admin.batch_execute(&format!(
             "DELETE FROM ops.jobs WHERE tenant_id = '{0}'; \
              DELETE FROM projection.private_memory_points WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.memory_vectors WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.rebuild_tickets WHERE tenant_id = '{0}'; \
+             DELETE FROM projection.rebuild_runs WHERE tenant_id = '{0}'; \
              DELETE FROM ops.outbox WHERE tenant_id = '{0}'; \
              DELETE FROM projection.stream_log WHERE tenant_id = '{0}'; \
              DELETE FROM projection.stream_checkpoints WHERE tenant_id = '{0}'; \
@@ -177,7 +182,7 @@ impl DbIntegrationFixture for Fixture {
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
         let retrieval = env("HUMAUX_RETRIEVAL_WORKER_PG_DSN")?;
         let maintenance = env("HUMAUX_MAINTENANCE_PG_DSN")?;
-        Handle::open(dsn, retrieval, maintenance, None)
+        Handle::open(dsn, retrieval, maintenance, None, qdrant_port())
     }
 }
 
@@ -194,9 +199,19 @@ impl Handle {
         dsn: String,
         db: Box<dyn std::any::Any>,
     ) -> Result<Self, DbFixtureSkipReason> {
+        Self::in_throwaway_at(dsn, db, qdrant_port())
+    }
+
+    /// [`Self::in_throwaway`] whose collection lives in the Qdrant on loopback `qdrant_port` (a test-owned
+    /// scratch container, ADR-0064 S3) instead of `HUMAUX_TEST_QDRANT_URL`'s.
+    pub fn in_throwaway_at(
+        dsn: String,
+        db: Box<dyn std::any::Any>,
+        qdrant_port: u16,
+    ) -> Result<Self, DbFixtureSkipReason> {
         let retrieval = dsn_as_role(&dsn, "role_retrieval_worker");
         let maintenance = dsn_as_role(&dsn, "role_maintenance");
-        Self::open(dsn, retrieval, maintenance, Some(db))
+        Self::open(dsn, retrieval, maintenance, Some(db), qdrant_port)
     }
 
     fn open(
@@ -204,6 +219,7 @@ impl Handle {
         retrieval_dsn: String,
         maintenance_dsn: String,
         db: Option<Box<dyn std::any::Any>>,
+        qdrant_port: u16,
     ) -> Result<Self, DbFixtureSkipReason> {
         // dep: PostgreSQL(any) — the owner connection that seeds and cleans the fixture tenant
         let mut admin = Client::connect(&dsn, NoTls)
@@ -246,7 +262,8 @@ impl Handle {
         let maintenance = rt
             .block_on(MaintenanceDbPool::connect(&maintenance_dsn))
             .map_err(setup("role_maintenance pool"))?;
-        let (registry, transport, collection) = rt.block_on(setup_qdrant_collection())?;
+        let (registry, transport, collection) =
+            rt.block_on(setup_qdrant_collection(qdrant_port))?;
         Ok(Handle {
             rt,
             admin,
@@ -267,7 +284,9 @@ impl Handle {
     }
 }
 
-async fn setup_qdrant_collection() -> Result<
+async fn setup_qdrant_collection(
+    port: u16,
+) -> Result<
     (
         IntraCellResourceRegistry,
         Arc<HttpIntraCellTransport>,
@@ -282,7 +301,7 @@ async fn setup_qdrant_collection() -> Result<
         IntraCellResource::QDRANT_REST,
         ResourceEntry::new(
             "127.0.0.1",
-            qdrant_port(),
+            port,
             cell_id,
             vec!["127.0.0.1/32".parse().expect("loopback CIDR")],
             BTreeSet::from([caller.clone()]),

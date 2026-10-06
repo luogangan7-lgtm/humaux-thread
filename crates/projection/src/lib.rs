@@ -1,6 +1,7 @@
 //! `humaux-projection` — Humaux Thread workspace crate（布局见 §58）。
 //! Depends-on: crates=[]; services=[]; env=[]; modules=[]
-//! Called-by: [crate(humaux-adapters), crate(humaux-gateway), crate(humaux-local-secret-scan), crate(humaux-private-worker), crate(humaux-retrieval-provider), crate(xtask)]
+//! Called-by: [crate(humaux-adapters), crate(humaux-gateway), crate(humaux-local-secret-scan),
+//!   crate(humaux-maintenance), crate(humaux-private-worker), crate(humaux-retrieval-provider), crate(xtask)]
 //! Invariants: [crate root: projection logic stays pure (no HTTP/SQLx/Qdrant/provider SDK, §3/§78.3); IO lives in
 //!   humaux-adapters]
 //! Spec: Baseline §3; §78.3
@@ -11,6 +12,7 @@
 pub mod card;
 pub mod code;
 pub mod dense;
+pub mod embedding_fingerprint;
 pub mod fingerprint;
 pub mod graph;
 pub mod serving;

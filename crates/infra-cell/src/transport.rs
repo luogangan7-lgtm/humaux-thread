@@ -1,7 +1,7 @@
 //! `infra-cell::transport` — ADR-0003 / §83.4 Layer 1B: the same-Cell HTTP capability wrapper.
 //! Depends-on: crates=[async-trait, humaux-infra-network, serde_json, tokio, url, uuid]; services=[Qdrant(*)];
 //!   env=[]; modules=[humaux-infra-network, infra-cell::permit, infra-cell::resource, infra-network::http]
-//! Called-by: [adapters::projection_worker, adapters::provisioning, adapters::public_projection, adapters::qdrant, adapters::retrieve, admin::cell_resources, admin::ops_status, gateway::bootstrap, gateway::recall, gateway::status, public-worker::main, retrieval-worker::main, tests, xtask::switch_visible]
+//! Called-by: [adapters::projection_worker, adapters::provisioning, adapters::public_projection, adapters::qdrant, adapters::rebuild, adapters::retrieve, admin::cell_resources, admin::ops_status, gateway::bootstrap, gateway::recall, gateway::status, public-worker::main, retrieval-worker::main, tests, xtask::switch_visible]
 //! Invariants: [execute takes a resource-relative path plus a CellAccessPermit, never a URL; paths are validated,
 //!   resolved addresses must be in-Cell and not metadata/link-local, redirects are refused; every failure is a typed
 //!   IntraCellError]

@@ -21,5 +21,5 @@ uuid = "1.25.0"
 # encoding. Same `sha2 = "0.11"` line every other workspace crate already carries
 # (humaux-domain::evidence::payload_sha256, humaux-contracts::config_registry, etc.) — no
 # new crate introduced to the dependency graph.
-# why: sha2 dependency; used-by: [projection::card, projection::fingerprint]
+# why: sha2 dependency; used-by: [projection::card, projection::embedding_fingerprint, projection::fingerprint]
 sha2 = "0.11"

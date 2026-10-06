@@ -1,5 +1,5 @@
 //! `humaux-testkit` — 测试基建：DB fixture、注错（fault injection）夹具、正哨兵样本。
-//! Depends-on: crates=[]; services=[]; env=[HUMAUX_REQUIRE_DASHSCOPE, HUMAUX_REQUIRE_DB, HUMAUX_REQUIRE_MINIMAX,
+//! Depends-on: crates=[]; services=[]; env=[HUMAUX_REQUIRE_DASHSCOPE, HUMAUX_REQUIRE_DB, HUMAUX_REQUIRE_DOCKER, HUMAUX_REQUIRE_MINIMAX,
 //!   HUMAUX_REQUIRE_QDRANT, HUMAUX_ROLE_PASSWORD_ADMIN, HUMAUX_ROLE_PASSWORD_BATCH_ISSUER,
 //!   HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER, HUMAUX_ROLE_PASSWORD_GATEWAY, HUMAUX_ROLE_PASSWORD_MAINTENANCE,
 //!   HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER, HUMAUX_ROLE_PASSWORD_PUBLIC_WORKER, HUMAUX_ROLE_PASSWORD_RETRIEVAL_WORKER];
@@ -119,6 +119,9 @@ pub enum ExternalDep {
     DashScope,
     /// 真 MiniMax 出境（§11 BYOK 域 live 冒烟）。
     MiniMax,
+    /// A reachable Docker engine for test-owned scratch containers `humaux-c37-<purpose>-<pid>` (ADR-0064 D-P:
+    /// the backup / drill suites build the pinned PG image and run pgBackRest against it).
+    Docker,
 }
 
 impl ExternalDep {
@@ -133,6 +136,7 @@ impl ExternalDep {
             Self::Qdrant => std::env::var("HUMAUX_REQUIRE_QDRANT"),
             Self::DashScope => std::env::var("HUMAUX_REQUIRE_DASHSCOPE"),
             Self::MiniMax => std::env::var("HUMAUX_REQUIRE_MINIMAX"),
+            Self::Docker => std::env::var("HUMAUX_REQUIRE_DOCKER"),
         };
         raw.is_ok_and(|v| v == "1")
     }
@@ -145,6 +149,7 @@ impl ExternalDep {
             Self::Qdrant => "HUMAUX_REQUIRE_QDRANT",
             Self::DashScope => "HUMAUX_REQUIRE_DASHSCOPE",
             Self::MiniMax => "HUMAUX_REQUIRE_MINIMAX",
+            Self::Docker => "HUMAUX_REQUIRE_DOCKER",
         }
     }
 }

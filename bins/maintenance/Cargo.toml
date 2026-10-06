@@ -17,8 +17,8 @@ humaux-domain = { path = "../../crates/domain" }
 humaux-protocol = { path = "../../crates/protocol" }
 # why: the §41.2 health families (publish/render), the loopback ops listener and the degrade accessors of /status (ADR-0061 D-B, D-D); used-by: [maintenance::health_serve]
 humaux-telemetry = { path = "../../crates/telemetry" }
-# why: async runtime for the sqlx pool and the Qdrant transport; signal/time/macros for the resident `health serve` loop (ADR-0061 D-D); used-by: [maintenance::main, maintenance::health_serve]
-tokio = { version = "1", features = ["rt-multi-thread", "signal", "time", "macros"] }
+# why: async runtime for the sqlx pool and the Qdrant transport; signal/time/macros for the resident `health serve` loop (ADR-0061 D-D); process for the DR_EVIDENCE `df` children bounded by CYCLE_SECONDS (ADR-0064 10.11 D); used-by: [maintenance::main, maintenance::health_serve, maintenance::serve]
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "time", "macros", "process"] }
 # why: the one JSON receipt printed per subcommand; used-by: [maintenance::main]
 serde_json = "1"
 # why: the Serialize bound of the receipt-to-JSON helper; used-by: [maintenance::main]
@@ -39,3 +39,19 @@ postgres = { version = "0.19", features = ["with-uuid-1", "with-serde_json-1"] }
 serde_json = "1"
 # why: fixture ids; used-by: [tests]
 uuid = { version = "1.25.0", features = ["v4", "v7"] }
+# Card 37 S5 (ADR-0064 D-Q): the drill tests seed the scratch source through the adapters' a2 fixture (remember,
+# the real projector and a deterministic embedder), included by #[path]; these are that fixture's crates.
+# why: async CardEmbedder impls of the included a2 fixture; used-by: [maintenance::tests::drill]
+async-trait = "0.1"
+# why: Qdrant transport and permits of the included a2 fixture; used-by: [maintenance::tests::drill]
+humaux-infra-cell = { path = "../../crates/infra-cell" }
+# why: the pinned scanner of the included a2 fixture; used-by: [maintenance::tests::drill]
+humaux-local-secret-scan = { path = "../../crates/local-secret-scan" }
+# why: stream keys and families of the included a2 fixture; used-by: [maintenance::tests::drill]
+humaux-projection = { path = "../../crates/projection" }
+# why: ledger closure and envelope types of the included a2 fixture; used-by: [maintenance::tests::drill]
+humaux-retrieval = { path = "../../crates/retrieval" }
+# why: the deterministic test embedder of the included a2 fixture; used-by: [maintenance::tests::drill]
+humaux-retrieval-provider = { path = "../../crates/retrieval-provider" }
+# why: sqlx Uuid and rows of the included a2 fixture (same spec as humaux-adapters); used-by: [maintenance::tests::drill]
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "uuid", "time", "json"] }

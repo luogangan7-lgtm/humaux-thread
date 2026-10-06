@@ -1,25 +1,38 @@
 //! `maintenance::tests::support::throwaway` — the resident-mode test kit: a throwaway database migrated from the
 //!   files, the spawned process guard, free loopback ports and a one-shot HTTP GET (moved from
 //!   `health_serve.rs`, card 35 S1), plus the §48.1 fixtures every retention test shares: an owner-made sealed leaf,
-//!   an effective policy and a proposal forged through role_maintenance's column grant (ADR-0063 D-C, D-E, D-J).
+//!   an effective policy and a proposal forged through role_maintenance's column grant (ADR-0063 D-C, D-E, D-J),
+//!   the full `--serve` key set and one production-shaped DR_EVIDENCE pass against any database (ADR-0064 D-K).
 //! Depends-on: crates=[humaux-testkit, postgres]; services=[PostgreSQL(owner) r=[ops.schema_migrations]
 //!   w=[control.retention_policies] x=[control.partition_adopt_leaf], PostgreSQL(role_maintenance)
 //!   w=[control.partition_registry], HTTP(loopback), subprocess(humaux-maintenance), subprocess(kill)]; env=[CARGO_BIN_EXE_humaux-maintenance, CARGO_MANIFEST_DIR,
-//!   HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_TEST_PG_DSN]; modules=[humaux-testkit]
-//! Called-by: [maintenance::tests::health_serve, maintenance::tests::partition_pg_facts,
-//!   maintenance::tests::partitions, maintenance::tests::retention, maintenance::tests::serve]
+//!   HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_MAINTENANCE_DR_PGDATA_FS_PATH, HUMAUX_MAINTENANCE_DR_REPO_FS_PATH,
+//!   HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS, HUMAUX_MAINTENANCE_SERVE_DR_EVIDENCE_EVERY_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_JOBS_DEAD_RETENTION_SECONDS, HUMAUX_MAINTENANCE_SERVE_JOBS_DONE_RETENTION_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS, HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR,
+//!   HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS, HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_IDLE_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_REDRIVE_COOLDOWN_SECONDS, HUMAUX_MAINTENANCE_SERVE_REISSUE_COOLDOWN_SECONDS,
+//!   HUMAUX_MAINTENANCE_SERVE_TENANTS_PER_RUN, HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS, HUMAUX_TEST_PG_DSN];
+//!   modules=[humaux-testkit, testkit::reaped]
+//! Called-by: [maintenance::tests::backup, maintenance::tests::drill, maintenance::tests::health_serve,
+//!   maintenance::tests::measure, maintenance::tests::partition_pg_facts, maintenance::tests::partitions,
+//!   maintenance::tests::rebuild_cli, maintenance::tests::retention, maintenance::tests::serve,
+//!   maintenance::tests::spike]
 //! Invariants: [every database is humaux_thread_<prefix>_<pid>_<n>, created by the fixture and dropped WITH (FORCE)
 //!   by its Drop even on panic, so the shared dev database never sees a fixture row; the spawned process is
-//!   killed by its own Drop; missing env -> §79.2 skip_or_fail]
-//! Spec: Baseline §78.1; §79.2; ADR-0061 D-D; ADR-0062 D-A; ADR-0063 D-E; ADR-0063 D-J
+//!   killed by its own Drop (the DR_EVIDENCE pass holds it as testkit::reaped::Reaped); missing env -> §79.2
+//!   skip_or_fail]
+//! Spec: Baseline §78.1; §79.2; ADR-0061 D-D; ADR-0062 D-A; ADR-0063 D-E; ADR-0063 D-J; ADR-0064 D-K
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::process::{Child, Command, Output};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use humaux_testkit::reaped::SpawnReaped;
 use humaux_testkit::{ExternalDep, skip_or_fail};
 use postgres::{Client, NoTls};
 
@@ -169,6 +182,11 @@ fn migrate(client: &mut Client, through: Option<&str>) {
     }
 }
 
+/// Every migration file applied to `client`'s database (a scratch cluster's, card 37 drill tests).
+pub fn migrate_all(client: &mut Client) {
+    migrate(client, None);
+}
+
 /// A fresh migrated database `humaux_thread_<prefix>_<pid>_<n>`, or `None` after a §79.2 skip.
 pub fn db(test: &str, prefix: &str) -> Option<Db> {
     db_through(test, prefix, None)
@@ -313,4 +331,118 @@ pub fn forge_proposal(c: &mut Client, registry_id: &str, revision: i32, proposed
         .expect("forge proposal");
     assert_eq!(n, 1, "one registry row");
     tx.commit().expect("commit");
+}
+
+/// The nine per-tenant D-C tasks by key stem (each has `_EVERY_SECONDS` and `_LIMIT`, ADR-0062 D-C).
+pub const SERVE_TASKS: [&str; 9] = [
+    "LOST",
+    "QUOTA_RESERVATIONS",
+    "PROVIDER_BUDGETS",
+    "CONFIRM_TOKENS",
+    "SNAPSHOTS",
+    "RATE_BUCKETS",
+    "JOBS",
+    "REISSUE",
+    "REDRIVE",
+];
+
+/// Every key `--serve` requires, valid for `cycle` seconds (EVERY = CYCLE, LIMIT 50, ages one hour, LOST_AFTER >
+/// LAG); the cluster-level PARTITIONS and DR_EVIDENCE cadences, and the two DR `df` paths (`repo_fs`, `/`).
+pub fn serve_keys(
+    addr: SocketAddr,
+    dsn: &str,
+    cycle: u64,
+    tenants_per_run: u32,
+    repo_fs: &Path,
+) -> Vec<(String, String)> {
+    let mut keys = vec![
+        (
+            "HUMAUX_MAINTENANCE_SERVE_METRICS_ADDR".to_owned(),
+            addr.to_string(),
+        ),
+        (
+            "HUMAUX_MAINTENANCE_SERVE_CYCLE_SECONDS".to_owned(),
+            cycle.to_string(),
+        ),
+        (
+            "HUMAUX_MAINTENANCE_SERVE_TENANTS_PER_RUN".to_owned(),
+            tenants_per_run.to_string(),
+        ),
+    ];
+    for task in SERVE_TASKS {
+        keys.push((
+            format!("HUMAUX_MAINTENANCE_SERVE_{task}_EVERY_SECONDS"),
+            cycle.to_string(),
+        ));
+        keys.push((
+            format!("HUMAUX_MAINTENANCE_SERVE_{task}_LIMIT"),
+            "50".to_owned(),
+        ));
+    }
+    for (key, value) in [
+        // ADR-0063 D-K / ADR-0064 D-K: the cluster-level tasks have a cadence and no LIMIT.
+        (
+            "HUMAUX_MAINTENANCE_SERVE_PARTITIONS_EVERY_SECONDS",
+            cycle.to_string(),
+        ),
+        (
+            "HUMAUX_MAINTENANCE_SERVE_DR_EVIDENCE_EVERY_SECONDS",
+            cycle.to_string(),
+        ),
+        // ADR-0064 10.11 J: any existing directory on each filesystem.
+        (
+            "HUMAUX_MAINTENANCE_DR_REPO_FS_PATH",
+            repo_fs.to_string_lossy().into_owned(),
+        ),
+        ("HUMAUX_MAINTENANCE_DR_PGDATA_FS_PATH", "/".to_owned()),
+        (
+            "HUMAUX_MAINTENANCE_SERVE_LOST_AFTER_SECONDS",
+            "120".to_owned(),
+        ),
+        ("HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS", "60".to_owned()),
+    ] {
+        keys.push((key.to_owned(), value));
+    }
+    // ADR-0062 D-G..D-J ages: one hour each, so only rows seeded older than that are purgeable.
+    for age in [
+        "HUMAUX_MAINTENANCE_SERVE_CONFIRM_TOKENS_CONSUMED_RETENTION_SECONDS",
+        "HUMAUX_MAINTENANCE_SERVE_RATE_BUCKETS_IDLE_SECONDS",
+        "HUMAUX_MAINTENANCE_SERVE_JOBS_DONE_RETENTION_SECONDS",
+        "HUMAUX_MAINTENANCE_SERVE_JOBS_DEAD_RETENTION_SECONDS",
+        "HUMAUX_PRIVATE_WORKER_DISTILL_BUDGET_WINDOW_SECS",
+        "HUMAUX_MAINTENANCE_SERVE_REISSUE_COOLDOWN_SECONDS",
+        "HUMAUX_MAINTENANCE_SERVE_REDRIVE_COOLDOWN_SECONDS",
+    ] {
+        keys.push((age.to_owned(), "3600".to_owned()));
+    }
+    keys.push((MAINTENANCE_DSN.to_owned(), dsn.to_owned()));
+    keys
+}
+
+/// ADR-0064 D-K (T-L1 step 5, T-J13): one DR_EVIDENCE pass the way production runs it — `humaux-maintenance
+/// --serve` against `dsn` (role_maintenance) until its first cycle answers `/metrics` 200 (every task runs on the
+/// first cycle), then killed. Returns that exposition.
+pub fn dr_evidence_pass(dsn: &str, repo_fs: &Path) -> String {
+    let addr = free_addr();
+    let env = serve_keys(addr, dsn, 10, 1000, repo_fs);
+    // dep: subprocess(humaux-maintenance) — one resident `--serve`, killed when this pass returns or unwinds
+    let _serve = Command::new(BIN)
+        .arg("--serve")
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn_reaped("spawn humaux-maintenance --serve");
+    let answer = poll(addr, "/metrics", Duration::from_secs(60), |(c, _)| {
+        *c == 200
+    });
+    let (code, body) = answer.expect("--serve answers /metrics");
+    assert_eq!(code, 200, "the first DR_EVIDENCE cycle: {body}");
+    body
+}
+
+/// The value of the exposition sample `series` (name and labels exactly), `None` when it is not rendered.
+pub fn sample_value(body: &str, series: &str) -> Option<f64> {
+    body.lines()
+        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
 }

@@ -116,7 +116,7 @@ tests:
   # backup fire: the timestamp never advances past 0; at 26h1m time() - 0 exceeds 26 h.
   - interval: 1m
     input_series:
-      - series: 'backup_last_success_timestamp_seconds{target="offsite"}'
+      - series: 'backup_last_success_timestamp_seconds{target="local"}'
         values: '0x1600'
     alert_rule_test:
       - eval_time: 26h1m
@@ -124,12 +124,12 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: critical
-              target: offsite
+              target: local
 
   # backup silent: the timestamp tracks time() (test clock starts at 0).
   - interval: 1m
     input_series:
-      - series: 'backup_last_success_timestamp_seconds{target="offsite"}'
+      - series: 'backup_last_success_timestamp_seconds{target="local"}'
         values: '0+60x1600'
     alert_rule_test:
       - eval_time: 26h1m
@@ -424,4 +424,124 @@ tests:
               outcome: failed
       - eval_time: 35m
         alertname: PartitionHorizonAbsent
+        exp_alerts: []
+
+  # backup not offsite (ADR-0064 10.11 F): a standing notice built from no series — firing with no input at all,
+  # from the first evaluation on. It has no silent state in card 37 (two firing checks, like Watchdog).
+  - interval: 1m
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: BackupNotOffsite
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              repo_class: local_only
+            exp_annotations:
+              summary: "card 37 keeps every backup copy on this host; host loss = total loss; card 37d adds the NAS pull mirror (ADR-0064 E17)"
+      - eval_time: 2h
+        alertname: BackupNotOffsite
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              repo_class: local_only
+            exp_annotations:
+              summary: "card 37 keeps every backup copy on this host; host loss = total loss; card 37d adds the NAS pull mirror (ADR-0064 E17)"
+
+  # restore drill fire: the newest succeeded drill finished eight days before the test clock's start (time() = 0 at
+  # 0m), so at 1m time() - (-691200) exceeds the 8-day line by one minute. A negative timestamp keeps the case at 1m
+  # instead of 11k evaluations of every rule (evaluation_interval is file-wide).
+  - interval: 1m
+    input_series:
+      - series: 'restore_drill_last_success_timestamp_seconds{target="local"}'
+        values: '-691200x5'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RestoreDrillFailure
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              target: local
+
+  # restore drill silent: the newest succeeded drill finished a week (604800 s) before the test clock's start.
+  - interval: 1m
+    input_series:
+      - series: 'restore_drill_last_success_timestamp_seconds{target="local"}'
+        values: '-604800x5'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RestoreDrillFailure
+        exp_alerts: []
+
+  # WAL archive failing fire: the latch reads 1 from 5m on; pending inside its 15m, firing at 25m.
+  - interval: 1m
+    input_series:
+      - series: 'wal_archive_failing'
+        values: '0x5 1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: WalArchiveFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # WAL archive failing silent: archiving works, the gauge stays 0.
+  - interval: 1m
+    input_series:
+      - series: 'wal_archive_failing'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: WalArchiveFailing
+        exp_alerts: []
+
+  # backup budget low fire: a refusal row left the repo_max headroom negative for over an hour.
+  - interval: 1m
+    input_series:
+      - series: 'backup_budget_headroom_bytes{limit="repo_max"}'
+        values: '-1500x90'
+      - series: 'backup_budget_headroom_bytes{limit="free_floor"}'
+        values: '2147483648x90'
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: BackupBudgetLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              limit: repo_max
+
+  # backup budget low silent: both headrooms positive (and 0 before the first receipt is not below 0).
+  - interval: 1m
+    input_series:
+      - series: 'backup_budget_headroom_bytes{limit="repo_max"}'
+        values: '0x90'
+      - series: 'backup_budget_headroom_bytes{limit="free_floor"}'
+        values: '2147483648x90'
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: BackupBudgetLow
+        exp_alerts: []
+
+  # disk free low fire: the PGDATA filesystem drops to 7 GiB; the repo volume's own low value does not page.
+  - interval: 1m
+    input_series:
+      - series: 'backup_disk_free_bytes{volume="pgdata"}'
+        values: '7516192768x30'
+      - series: 'backup_disk_free_bytes{volume="repo"}'
+        values: '1073741824x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: DiskFreeLow
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              volume: pgdata
+
+  # disk free low silent: 8 GiB free on PGDATA is above the 7.5 GiB line.
+  - interval: 1m
+    input_series:
+      - series: 'backup_disk_free_bytes{volume="pgdata"}'
+        values: '8589934592x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: DiskFreeLow
         exp_alerts: []

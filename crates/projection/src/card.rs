@@ -1,7 +1,7 @@
 //! `projection::card` — T5.7/T5.8 RetrievalCard deterministic assembly (§18).
 //! Depends-on: crates=[humaux-domain, sha2, uuid]; services=[]; env=[]; modules=[domain::authority,
 //!   domain::dataclass, domain::ids, domain::memory]
-//! Called-by: [adapters::projection_worker, adapters::qdrant, humaux-local-secret-scan, tests, xtask::card_version]
+//! Called-by: [adapters::private_projection_registry, adapters::projection_worker, adapters::qdrant, humaux-local-secret-scan, tests, xtask::card_version]
 //! Invariants: [build_card is a pure, non-async function with no client/key/network handle (§18.1), so identical
 //!   source_hash inputs always produce identical card bytes]
 //! Spec: Baseline §18.1; §16; §3; §78.3; §18.4; §18.2; §22; §22.1

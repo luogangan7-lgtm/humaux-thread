@@ -1,7 +1,8 @@
 //! `humaux-retrieval-provider` — Humaux Thread workspace crate（布局见 §58）。
 //! Depends-on: crates=[]; services=[];
 //!   env=[]; modules=[]
-//! Called-by: [crate(humaux-adapters), crate(humaux-gateway), crate(humaux-retrieval-worker)]
+//! Called-by: [crate(humaux-adapters), crate(humaux-gateway), crate(humaux-maintenance),
+//!   crate(humaux-retrieval-worker)]
 //! Invariants: []
 //! Spec: §58; §3; §78.3
 //!

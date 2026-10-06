@@ -1,0 +1,70 @@
+# §46.1 migration manifest. Card 37 S1 / ADR-0064 D-J, D-K, D-O (section 10.3 as corrected by 10.11 C; ruling E17
+# local_only): ops.backup_sets, ops.backup_receipts, ops.restore_witnesses, ops.wal_archive_failures and the receipt
+# columns + derived-success CHECK of ops.restore_drills. Catalog-only checks through to_regclass text lookups, so
+# migration-rehearsal can EXPLAIN them before and after apply.
+
+migration_id = "0234_dr_receipts"
+class = "FORWARD_ONLY"
+
+# Refuses unless ops.restore_drills still has 0 rows and its 0008 shape, and none of the four new tables exists.
+precheck = """
+select (select count(*) from ops.restore_drills) = 0
+   and not exists (select 1 from pg_attribute a
+                    where a.attrelid = to_regclass('ops.restore_drills') and a.attname = 'repo_intact'
+                      and not a.attisdropped)
+   and to_regclass('ops.backup_sets') is null
+   and to_regclass('ops.backup_receipts') is null
+   and to_regclass('ops.restore_witnesses') is null
+   and to_regclass('ops.wal_archive_failures') is null
+ as precheck_ok
+"""
+
+# Fails on: another owner; any table grant on the four new tables beyond role_maintenance INSERT, SELECT (the 0011
+# ops defaults coming back included); ops.restore_drills with an INSERT or UPDATE for any runtime role but
+# role_maintenance, or without role_maintenance INSERT; the backup_sets FK, backup_receipts_verified_derived,
+# backup_receipts_shape (or it without its verify_exit term) or restore_drills_succeeded_derived missing (or the
+# latter without its repo_intact term).
+postcheck = """
+select
+ (select count(*) = 5 from pg_class c
+   where c.oid in (to_regclass('ops.backup_sets'), to_regclass('ops.backup_receipts'),
+                   to_regclass('ops.restore_witnesses'), to_regclass('ops.wal_archive_failures'),
+                   to_regclass('ops.restore_drills'))
+     and pg_get_userbyid(c.relowner) = 'role_migration_owner')
+ and (select count(*) = 4 from pg_class c
+       where c.oid in (to_regclass('ops.backup_sets'), to_regclass('ops.backup_receipts'),
+                       to_regclass('ops.restore_witnesses'), to_regclass('ops.wal_archive_failures'))
+         and (select coalesce(string_agg(pg_get_userbyid(x.grantee) || ':' || x.privilege_type, ','
+                                         order by pg_get_userbyid(x.grantee) || ':' || x.privilege_type collate "C"), '')
+                from aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+               where x.grantee <> c.relowner)
+             = 'role_maintenance:INSERT,role_maintenance:SELECT')
+ and (select coalesce(string_agg(pg_get_userbyid(x.grantee) || ':' || x.privilege_type, ','
+                                 order by pg_get_userbyid(x.grantee) || ':' || x.privilege_type collate "C"), '')
+        from pg_class c, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+       where c.oid = to_regclass('ops.restore_drills') and x.grantee <> c.relowner)
+     = 'role_consolidation_worker:SELECT,role_gateway:SELECT,role_maintenance:INSERT,role_maintenance:SELECT,role_private_worker:SELECT,role_public_worker:SELECT,role_retrieval_worker:SELECT'
+ and not exists (select 1 from pg_attribute a, aclexplode(a.attacl) x
+                  where a.attrelid in (to_regclass('ops.backup_sets'), to_regclass('ops.backup_receipts'),
+                                       to_regclass('ops.restore_witnesses'), to_regclass('ops.wal_archive_failures'),
+                                       to_regclass('ops.restore_drills')))
+ and exists (select 1 from pg_constraint co
+              where co.conrelid = to_regclass('ops.backup_receipts') and co.contype = 'f'
+                and co.confrelid = to_regclass('ops.backup_sets') and co.confmatchtype = 's')
+ and exists (select 1 from pg_constraint co
+              where co.conrelid = to_regclass('ops.backup_receipts') and co.contype = 'c'
+                and co.conname = 'backup_receipts_verified_derived' and co.convalidated)
+ and exists (select 1 from pg_constraint co
+              where co.conrelid = to_regclass('ops.backup_receipts') and co.contype = 'c'
+                and co.conname = 'backup_receipts_shape' and co.convalidated
+                and pg_get_constraintdef(co.oid) like '%verify_exit IS NOT NULL%')
+ and exists (select 1 from pg_constraint co
+              where co.conrelid = to_regclass('ops.restore_drills') and co.contype = 'c'
+                and co.conname = 'restore_drills_succeeded_derived' and co.convalidated
+                and pg_get_constraintdef(co.oid) like '%repo_intact%'
+                and pg_get_constraintdef(co.oid) like '%isolation_pairs = 2%')
+ as postcheck_ok
+"""
+
+rollback_or_forward_fix = "Forward fix only (FORWARD_ONLY, §46.1; no fake down migration). Before COMMIT any failure rolls the single transaction back and leaves ops.restore_drills as 0008 made it. After COMMIT: the receipts are the record of every backup and drill; a correction is a new forward migration, never a dropped receipt."
+backup_restore_requirement = "none: 0-row table asserted by precheck (ops.restore_drills gains columns and a CHECK while empty); the other four tables are new."
