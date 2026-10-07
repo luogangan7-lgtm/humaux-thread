@@ -113,9 +113,25 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       # --no-fail-fast: one run shows every red binary, not just the first (§57.1 rule 2:
-      # a stop at the first failure hides the rest behind it).
+      # a stop at the first failure hides the rest behind it). Three invocations, not one:
+      #  · humaux-maintenance under `umask 000`: the card-37 scratch sources bind-mount a
+      #    directory the test just created into the postgres container, where pgbackrest
+      #    (uid 999) must create `repo` in it. Docker Desktop on the dev Mac maps the owner
+      #    silently; native Linux does not (run 37620876690: "unable to create path
+      #    '/var/lib/pgbackrest/repo': Permission denied"). World-writable scratch on a
+      #    throwaway runner is the smallest equivalent of that mapping.
+      #  · humaux-gateway with --test-threads=2: its tests spawn the real gateway binary
+      #    under a 5 s listen deadline (mcp_gateway.rs GATEWAY_PROCESS_START_TIMEOUT);
+      #    four concurrent bootstraps on the 4-vCPU arm runner missed it, two do not.
       - name: cargo test
-        run: cargo test --workspace --no-fail-fast
+        shell: bash
+        run: |
+          set -uo pipefail
+          rc=0
+          cargo test --workspace --no-fail-fast --exclude humaux-maintenance --exclude humaux-gateway || rc=1
+          cargo test -p humaux-gateway --no-fail-fast -- --test-threads=2 || rc=1
+          ( umask 000 && cargo test -p humaux-maintenance --no-fail-fast ) || rc=1
+          exit $rc
 
       # The CI twin of the local gate `no_leaked_distill_jobs` (TW c31_leak_check.sh) plus the
       # ADR-0058 §2.1 I-SLOT probe over the whole table: a test binary that leaves claimable
@@ -131,7 +147,7 @@ jobs:
           leaked=$(q "select t.name || ' ' || j.job_type || ' tenants=' || count(distinct j.tenant_id) || ' jobs=' || count(*) from ops.jobs j join control.tenants t using (tenant_id) where j.job_type in ('DERIVED_DISTILL','DERIVED_CONSOLIDATE') and j.status = 'PENDING' and t.name like '%throwaway tenant%' group by t.name, j.job_type order by count(*) desc")
           ckpt=$(q "select c.domain || '/' || c.projection_kind || ' tenants=' || count(distinct c.tenant_id) || ' checkpoints=' || count(*) from projection.stream_checkpoints c where (c.domain, c.projection_kind) not in (('private_memory','PRIVATE_MEMORY')) group by c.domain, c.projection_kind order by count(*) desc")
           islot=$(q "select coalesce(t.name, '<no tenant row>') || ' | ' || j.status || ' | ' || coalesce(j.dispatch_state, '-') || ' | gen=' || j.claim_generation || ' | slots=' || (select count(*) from ops.provider_slots s where s.job_id = j.job_id and s.claim_generation = j.claim_generation) || ' | created=' || j.created_at from ops.jobs j left join control.tenants t using (tenant_id) where j.job_type = 'DERIVED_DISTILL' and j.status = 'PROCESSING' and j.dispatch_state is not null and (select count(*) from ops.provider_slots s where s.job_id = j.job_id and s.claim_generation = j.claim_generation) <> 1 order by j.created_at")
-          slots=$(q "select slot_id || ' job=' || coalesce(job_id::text, '-') || ' gen=' || coalesce(claim_generation::text, '-') from ops.provider_slots order by 1")
+          slots=$(q "select slot_no || ' job=' || coalesce(job_id::text, '-') || ' gen=' || coalesce(claim_generation::text, '-') from ops.provider_slots order by 1")
           echo "provider_slots:"; echo "$slots"
           rc=0
           if [ -n "$leaked" ]; then echo "no_leaked_distill_jobs: FAIL (claimable derived jobs on throwaway tenants)"; echo "$leaked"; rc=1; fi
