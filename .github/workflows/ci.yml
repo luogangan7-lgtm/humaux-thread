@@ -90,42 +90,9 @@ jobs:
           # against at all.
           fetch-depth: 0
 
-      # rust-toolchain.toml pins 1.99.0 (ADR-0050 D-G); install exactly that and prove
-      # it by string comparison, as the toolchain file itself demands.
-      - name: Install pinned Rust toolchain
-        run: |
-          set -euo pipefail
-          rustup toolchain install 1.99.0 --profile minimal -c clippy -c rustfmt
-          rustup default 1.99.0
-          rustc --version | grep -F 'rustc 1.99.0'
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install pinned Gitleaks fixture (v8.30.1)
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive='gitleaks_8.30.1_linux_x64.tar.gz'
-          archive_sha256='551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
-          release='https://github.com/gitleaks/gitleaks/releases/download/v8.30.1'
-          tools_dir="$RUNNER_TEMP/gitleaks-8.30.1"
-          curl --fail --location --silent --show-error "$release/gitleaks_8.30.1_checksums.txt" \
-            -o "$RUNNER_TEMP/gitleaks-checksums.txt"
-          grep -Fqx "$archive_sha256  $archive" "$RUNNER_TEMP/gitleaks-checksums.txt"
-          curl --fail --location --silent --show-error "$release/$archive" -o "$RUNNER_TEMP/$archive"
-          printf '%s  %s\n' "$archive_sha256" "$RUNNER_TEMP/$archive" | sha256sum --check --strict
-          mkdir -p "$tools_dir"
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$tools_dir" gitleaks
-          binary="$tools_dir/gitleaks"
-          test -x "$binary"
-          version="$($binary version | tr -d '\r\n')"
-          test "$version" = '8.30.1'
-          binary_sha256="$(sha256sum "$binary" | awk '{print $1}')"
-          {
-            echo "HUMAUX_TEST_GITLEAKS_BIN=$binary"
-            echo "HUMAUX_TEST_GITLEAKS_VERSION=$version"
-            echo "HUMAUX_TEST_GITLEAKS_SHA256=$binary_sha256"
-          } >> "$GITHUB_ENV"
+      # Toolchain, cache, gitleaks fixture and the runbook §2 cluster provisioning live in one
+      # composite action so the `live` job below provisions its cluster the same way.
+      - uses: ./.github/actions/setup
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -135,46 +102,6 @@ jobs:
 
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
-
-      # 必须在 cargo test 之前：没有 schema 的话，上面声明的 HUMAUX_REQUIRE_DB
-      # 会让每一条 DB 测试都因为「表不存在」而红。
-      #
-      # runbook §2 on a throwaway cluster: (1) `roles rotate --create-missing` creates the
-      # seven 0011 LOGIN roles with generated passwords and the owner NOLOGIN, (2) migrate,
-      # (3) rotate role_admin, which migration 0110 creates without a usable password.
-      # Generated values are read from the once-printed `HUMAUX_ROLE_PASSWORD_<SUFFIX>=`
-      # lines, masked, and exported to the job env (testkit::role_login_dsn and the
-      # process-level DSNs the launchers read); they never reach the log.
-      - name: provision roles (runbook §2) + apply migrations (§46)
-        shell: bash
-        run: |
-          set -euo pipefail
-          rotate() {
-            cargo run -q -p humaux-maintenance -- roles rotate \
-              --roles-sql migrations/0011_roles_and_grants.sql \
-              --actor github-actions --reason "fresh CI cluster" \
-              --ticket "run-${GITHUB_RUN_ID}" --step-up-auth "ci-${GITHUB_RUN_ID}" "$@" \
-              > "$RUNNER_TEMP/rotate.out"
-            while IFS='=' read -r name value; do
-              echo "::add-mask::$value"
-              export "$name=$value"
-              echo "$name=$value" >> "$GITHUB_ENV"
-            done < <(grep '^HUMAUX_ROLE_PASSWORD_' "$RUNNER_TEMP/rotate.out")
-            rm -f "$RUNNER_TEMP/rotate.out"
-          }
-          rotate --create-missing
-          cargo xtask migrate
-          rotate --role role_admin
-          base='127.0.0.1:5432/humaux_thread_ci'
-          {
-            echo "HUMAUX_GATEWAY_PG_DSN=postgres://role_gateway:${HUMAUX_ROLE_PASSWORD_GATEWAY}@${base}"
-            echo "PRIVATE_WORKER_PG_DSN=postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER}@${base}"
-            echo "CONSOLIDATION_WORKER_PG_DSN=postgres://role_consolidation_worker:${HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER}@${base}"
-            echo "HUMAUX_RETRIEVAL_WORKER_PG_DSN=postgres://role_retrieval_worker:${HUMAUX_ROLE_PASSWORD_RETRIEVAL_WORKER}@${base}"
-            echo "HUMAUX_MAINTENANCE_PG_DSN=postgres://role_maintenance:${HUMAUX_ROLE_PASSWORD_MAINTENANCE}@${base}"
-            echo "HUMAUX_ADMIN_PG_DSN=postgres://role_admin:${HUMAUX_ROLE_PASSWORD_ADMIN}@${base}"
-            echo "HUMAUX_PUBLIC_WORKER_PG_DSN=postgres://role_public_worker:${HUMAUX_ROLE_PASSWORD_PUBLIC_WORKER}@${base}"
-          } >> "$GITHUB_ENV"
 
       # --no-fail-fast: one run shows every red binary, not just the first (§57.1 rule 2:
       # a stop at the first failure hides the rest behind it).
@@ -323,3 +250,59 @@ jobs:
 
       - name: container scan (not_applicable — Phase 0)
         run: 'echo "not_applicable (missing object: container image to scan — delivered Phase 14, §57.1 rule 3)"'
+
+  # Real-provider tests (the local chain's distill_hop_live / distill_fairness_live /
+  # distill_poison_live / two_provider_live / consolidation hop / dashscope_live_smoke).
+  # Keys come from the `minimax m3` environment the owner created (ALIBABA_CLOUD_API_KEY,
+  # MINIMAXAPIKEY); they are mapped onto the names the code reads and never printed.
+  # Each run spends provider money, so it runs on pushes to main and on manual dispatch
+  # only, never on PRs or ci/** pushes. DNS pins are omitted: the pins exist for the dev
+  # Mac's proxy fake-IP resolver (ADR-0039 / ADR-0060) and are optional in every test.
+  live:
+    name: live providers (MiniMax + DashScope)
+    needs: ci
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: minimax m3
+    services:
+      postgres:
+        image: postgres:18
+        env:
+      HUMAUX_TEST_PG_DSN: postgres://postgres:ci@127.0.0.1:5432/humaux_thread_ci
+      DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/humaux_thread_ci
+      HUMAUX_MIGRATOR_PG_DSN: postgres://postgres:ci@127.0.0.1:5432/humaux_thread_ci
+      HUMAUX_REQUIRE_DB: "1"
+      HUMAUX_REQUIRE_QDRANT: "1"
+      HUMAUX_TEST_QDRANT_PORT: "6333"
+      HUMAUX_REQUIRE_MINIMAX: "1"
+      HUMAUX_REQUIRE_SECOND_PROVIDER: "1"
+      HUMAUX_REQUIRE_DASHSCOPE: "1"
+      MINIMAX_API_KEY: ${{ secrets.MINIMAXAPIKEY }}
+      DASHSCOPE_API_KEY: ${{ secrets.ALIBABA_CLOUD_API_KEY }}
+      # ADR-0060 canonical second-provider set (values are not secrets; the key is the
+      # variable HUMAUX_LIVE_P2_KEY_ENV names).
+      HUMAUX_LIVE_P2_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+      HUMAUX_LIVE_P2_HOSTS: dashscope.aliyuncs.com
+      HUMAUX_LIVE_P2_MODEL: qwen-plus
+      HUMAUX_LIVE_P2_CAPABILITIES: TEXT,STRUCTURED_OUTPUT,TOOL_CALLS,JSON_OBJECT
+      HUMAUX_LIVE_P2_REQUEST_EXTRAS: '{"enable_thinking":false}'
+      HUMAUX_LIVE_P2_KEY_ENV: DASHSCOPE_API_KEY
+      HUMAUX_LIVE_P2_PROVIDER_ID: dashscope
+      HUMAUX_LIVE_P2_REGION: cn-beijing
+      HUMAUX_LIVE_P2_EGRESS_PROCESSOR_ID: 5cc23460-f4b8-4ca6-8c11-9d5fc4b96cec
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+
+      - name: distill hop (private worker, MiniMax)
+        run: cargo test -p humaux-private-worker --test distill_hop_e2e -- --include-ignored
+
+      - name: derived dispatch live tests (fairness, poison, two providers, channel A/B)
+        run: cargo test -p humaux-private-worker --test derived_dispatch_e2e -- --include-ignored live
+
+      - name: consolidation hop (MiniMax)
+        run: cargo test -p humaux-consolidation-worker --test consolidation_hop_e2e -- --include-ignored
+
+      - name: dashscope live smoke (retrieval provider)
+        run: cargo test -p humaux-retrieval-provider --test dashscope_live_smoke -- --include-ignored
