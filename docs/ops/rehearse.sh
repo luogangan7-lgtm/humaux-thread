@@ -361,6 +361,23 @@ start_rp; RP_PID=$(cat $S/rp.pid)
 # Card 31 (ADR-0057 D-F): the §78 ProjectionLag threshold has no default — boot-fatal when absent.
 # One value, read by start_gw AND by step stall_lag's window, so the assertion grades the deployment.
 LAG_SECS=20
+# The gateway handler deadline, read by start_gw AND by the load step's hang bound (ADR-0065 D-F assertion 2).
+GW_HANDLER_TIMEOUT=20
+# ADR-0065 D-A / D-B (ruling R-5): dev-host start value, A5 re-measure required. Pool max P = C + 2 at C = 16, read by
+# start_gw AND by the load step's backend bound (assertion 6); statement / idle-in-transaction 10 s < the handler 20 s.
+# Cites ADR-0065 "Measurement" AFTER: `LOAD L64 group=LA … failed=0 … drops=0` (P = 18 never waited past the 1 s acquire)
+# and `SWEEP C=16 P=18 …` (C 8 / 16 / 24 move p95, not throughput: the host is CPU-bound near 170 calls/s).
+GW_POOL_MAX=18
+# ADR-0065 D-C (ruling R-5): dev-host start value, A5 re-measure required — the §67.2 admission start values C 16 /
+# Q 64 / W 5 s, B 5 s (≤ the handler 20 s); cites `LOAD BURST …` (queue_full) and `LOAD BURST-W …` (wait_timeout) of
+# ADR-0065 AFTER. W is read by start_gw AND by the load step's BURST bound (assertion 2).
+GW_ADMISSION_MAX_WAIT_MS=5000
+GW_ADMISSION_CONCURRENCY=16; GW_ADMISSION_QUEUE_DEPTH=64
+# K = C / 2, dev-host start value, A5 re-measure required. Measured (ADR-0065 AFTER, `ISO_RATIO` lines): at K = C = 16
+# one key held every permit and tenant B's p95 next to a one-key 64-client burst was 2.4-2.5x its baseline; K = 8 gives
+# 1.8-1.9x. 8 is also the floor this load shape allows (128 clients on 16 keys = 8 per key; assertion 2 wants
+# key_limit = 0 in BURST).
+GW_ADMISSION_PER_KEY_LIMIT=8
 # Arguments (all optional; the main gateway passes none): $1 = bind host:port, $2 = ops port,
 # $3 = pidfile name, $4 = log. Only step alert_drill passes them, for its scratch gateway G'
 # (ADR-0061 D-K): the same configuration on its own listener, origin and ops port.
@@ -369,7 +386,7 @@ local gw_bind=${1:-127.0.0.1:8080} gw_ops=${2:-${OPS_PORTS[humaux-gateway:serve]
 ( export HUMAUX_GATEWAY_PG_DSN="postgres://role_gateway:${HUMAUX_ROLE_PASSWORD_GATEWAY:?}@$PG/$DB" HUMAUX_GATEWAY_BIND_ADDR=$gw_bind \
     HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX=$PEPPER_HEX HUMAUX_GATEWAY_TOKEN_HMAC_KEY=$TOKEN_HMAC_HEX HUMAUX_GATEWAY_ALLOWED_HOSTS=$gw_bind HUMAUX_GATEWAY_ALLOWED_ORIGINS=http://$gw_bind \
     HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES=1048576 HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS= HUMAUX_GATEWAY_MAX_FORWARDED_HOPS=1 HUMAUX_GATEWAY_GLOBAL_DENYLIST= HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST= \
-    HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS=30 HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS=20 HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS=5 HUMAUX_GATEWAY_REPLAY_TTL_SECONDS=60 \
+    HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS=30 HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS=$GW_HANDLER_TIMEOUT HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS=5 HUMAUX_GATEWAY_REPLAY_TTL_SECONDS=60 \
     HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS=300 HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS=86400 HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS=21600 HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS=$LAG_SECS HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS=900 HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP=1000 \
     HUMAUX_GATEWAY_REMEMBER_SCOPE_KIND=workspace \
     HUMAUX_GATEWAY_REMEMBER_DOMAIN=$DOMAIN HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND=$PKIND HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION=$PVER \
@@ -381,7 +398,14 @@ local gw_bind=${1:-127.0.0.1:8080} gw_ops=${2:-${OPS_PORTS[humaux-gateway:serve]
     HUMAUX_GATEWAY_QDRANT_HOST=127.0.0.1 HUMAUX_GATEWAY_QDRANT_PORT=6333 HUMAUX_GATEWAY_QDRANT_CIDR=127.0.0.1/32 HUMAUX_GATEWAY_QDRANT_TLS=false \
     HUMAUX_GATEWAY_CELL_ID=$CELL_ID HUMAUX_GATEWAY_CALLER_ID=gateway \
     HUMAUX_GATEWAY_METRICS_ADDR=127.0.0.1:$gw_ops HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS=2 \
+    HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS=$GW_POOL_MAX HUMAUX_GATEWAY_PG_POOL_MIN_CONNECTIONS=2 HUMAUX_GATEWAY_PG_ACQUIRE_TIMEOUT_MS=1000 HUMAUX_GATEWAY_PG_IDLE_TIMEOUT_SECONDS=300 HUMAUX_GATEWAY_PG_MAX_LIFETIME_SECONDS=1800 \
+    HUMAUX_GATEWAY_PG_STATEMENT_TIMEOUT_MS=10000 HUMAUX_GATEWAY_PG_IDLE_IN_TRANSACTION_TIMEOUT_MS=10000 \
+    HUMAUX_GATEWAY_RATE_LOCK_TIMEOUT_MS=2000 HUMAUX_GATEWAY_RATE_PREAUTH_IPV6_PREFIX_BITS=64 \
+    HUMAUX_GATEWAY_ADMISSION_CONCURRENCY=$GW_ADMISSION_CONCURRENCY HUMAUX_GATEWAY_ADMISSION_QUEUE_DEPTH=$GW_ADMISSION_QUEUE_DEPTH HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS=$GW_ADMISSION_MAX_WAIT_MS \
+    HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT=$GW_ADMISSION_PER_KEY_LIMIT HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS=5000 \
     HUMAUX_GATEWAY_RATE_PREAUTH_IP_CAPACITY=100 HUMAUX_GATEWAY_RATE_PREAUTH_IP_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_CREDENTIAL_CAPACITY=100 HUMAUX_GATEWAY_RATE_CREDENTIAL_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_USER_CAPACITY=100 HUMAUX_GATEWAY_RATE_USER_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_TENANT_CAPACITY=100 HUMAUX_GATEWAY_RATE_TENANT_REFILL_PER_SECOND=100 HUMAUX_GATEWAY_RATE_OPERATION_CAPACITY=100 HUMAUX_GATEWAY_RATE_OPERATION_REFILL_PER_SECOND=100
+  # ADR-0065 D-F: the load step's scratch gateway adds $GW_EXTRA_ENV (set only by gw_load_start); unset elsewhere.
+  [ -n "${GW_EXTRA_ENV:-}" ] && eval "export $GW_EXTRA_ENV"
   exec "$BIN_DIR"/humaux-gateway >> $gw_log 2>&1 ) &
 own_pid $gw_name $!
 }
@@ -690,6 +714,186 @@ wait_ready watchdog-receipt watchdog_receipt && WD_OK=1
 READY_BAD_BEFORE_TRAFFIC=$READY_BAD   # frozen here; step kill9_rotation reuses wait_ready
 echo "readiness: $READY_OK ready, $READY_BAD not ready" | tee -a $EV/rehearsal.log
 [ $READY_BAD -gt 0 ] && echo "readiness gate failed — traffic below is measuring a race" | tee -a $EV/rehearsal.log
+
+# The verdict counters and the one ASSERTION printer, defined before the first step that grades (load, 2d): every
+# graded line of this run reaches A_OK / A_BAD and so REHEARSAL VERDICT and the exit code (header: 1 = an assertion
+# failed). ADR-0065 review: the load step's lines once bypassed them and a red load still exited 0.
+A_OK=0; A_BAD=0
+assertion_line() { echo "ASSERTION $1 $2: $3"; }   # $1=PASS|FAIL $2=label $3=detail; counts nothing
+assert_eq() { # $1=label $2=actual $3=expected
+  if [ "$2" = "$3" ]; then assertion_line PASS "$1" "$2" | tee -a $EV/rehearsal.log; A_OK=$((A_OK+1));
+  else assertion_line FAIL "$1" "got '$2' want '$3'" | tee -a $EV/rehearsal.log; A_BAD=$((A_BAD+1)); fi
+}
+assert_gt() { # $1=label $2=actual $3=floor
+  if [ "$2" -gt "$3" ] 2>/dev/null; then assertion_line PASS "$1" "$2 > $3" | tee -a $EV/rehearsal.log; A_OK=$((A_OK+1));
+  else assertion_line FAIL "$1" "got '$2' want > $3" | tee -a $EV/rehearsal.log; A_BAD=$((A_BAD+1)); fi
+}
+
+# ---------- 2d. load (card 38, ADR-0065 D-F) — only when LOAD_LEVELS is set ----------
+# A scratch gateway G_load (127.0.0.1:18080, ops 19109: not in OPS_PORTS, so Prometheus never scrapes it and the
+# eight-pair `up` assertion stands) runs this rehearsal's gateway configuration plus $LOAD_GW_ENV, which holds ONLY
+# keys the tree under test registers (the gateway refuses an unknown HUMAUX_GATEWAY_* key). `xtask load` drives it with
+# two load tenants seeded and torn down here through e2e-seed only (ruling R-8): LA with 16 workspaces (16
+# workspace-bound keys), LB with one. The mix (memory.enumerate / tools/list) reaches no provider, outbox, job or
+# Qdrant; load_tenants_torn_down reads their outbox / job / memory_evidence / tenant / rate-bucket rows before AND after
+# the teardown. xtask load's ASSERTION lines join A_OK / A_BAD through load_tally.
+# Unset LOAD_LEVELS = this step does not exist (the card-37 chain shape).
+if [ -n "${LOAD_LEVELS:-}" ]; then
+step load
+# Rate buckets out of the way (the load measures admission and the pool, not §72.3) and the loopback peer trusted, so
+# each lane's bare `Forwarded: 2001:db8:<lane>::<n>` keys its own preauth /64 (the prefix pinned here because assertion
+# 8 expects /64; ADR-0065 D-E).
+LOAD_GW_ENV="HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS=127.0.0.1/32 HUMAUX_GATEWAY_RATE_PREAUTH_IPV6_PREFIX_BITS=64 HUMAUX_GATEWAY_RATE_LOCK_TIMEOUT_MS=2000 HUMAUX_GATEWAY_RATE_PREAUTH_IP_CAPACITY=1000000 HUMAUX_GATEWAY_RATE_PREAUTH_IP_REFILL_PER_SECOND=1000000 HUMAUX_GATEWAY_RATE_CREDENTIAL_CAPACITY=1000000 HUMAUX_GATEWAY_RATE_CREDENTIAL_REFILL_PER_SECOND=1000000 HUMAUX_GATEWAY_RATE_USER_CAPACITY=1000000 HUMAUX_GATEWAY_RATE_USER_REFILL_PER_SECOND=1000000 HUMAUX_GATEWAY_RATE_TENANT_CAPACITY=1000000 HUMAUX_GATEWAY_RATE_TENANT_REFILL_PER_SECOND=1000000 HUMAUX_GATEWAY_RATE_OPERATION_CAPACITY=1000000 HUMAUX_GATEWAY_RATE_OPERATION_REFILL_PER_SECOND=1000000"
+# ADR-0065 D-C: G_load's admission bounds, the start values of start_gw stated again so the load measures exactly these.
+LOAD_GW_ENV="$LOAD_GW_ENV HUMAUX_GATEWAY_ADMISSION_CONCURRENCY=$GW_ADMISSION_CONCURRENCY HUMAUX_GATEWAY_ADMISSION_QUEUE_DEPTH=$GW_ADMISSION_QUEUE_DEPTH HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS=$GW_ADMISSION_MAX_WAIT_MS HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT=$GW_ADMISSION_PER_KEY_LIMIT HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS=5000"
+# Pool max the role_gateway backend bound (assertion 6) is graded against: G_load's HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS
+# (start_gw, ADR-0065 D-A). W of BURST (assertion 2): G_load's HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS.
+LOAD_POOL_MAX=$GW_POOL_MAX; LOAD_MAX_WAIT_MS=$GW_ADMISSION_MAX_WAIT_MS
+# BURST-W restarts G_load with W = 1 ms (--burst-w-max-wait-ms 1). xtask load runs the hook with `sh -c`, which has
+# neither start_gw nor this shell's secrets, so the hook only asks: it creates $S/load_burst_w.req and waits up to 120 s
+# for $S/load_burst_w.ack. load_burst_w_listener, a subshell of this script started next to xtask load, stops G_load
+# through its pidfile, starts it again with W = 1 ms and acknowledges; xtask load then waits for /readyz (assertion 0).
+LOAD_BURST_W_RESTART="touch $S/load_burst_w.req; i=0; while [ ! -f $S/load_burst_w.ack ] && [ \$i -lt 120 ]; do sleep 1; i=\$((i+1)); done; test -f $S/load_burst_w.ack"
+load_burst_w_listener() {
+  local i=0
+  while [ ! -f $S/load_burst_w.req ]; do sleep 1; i=$((i+1)); [ $i -ge 3600 ] && return 0; done
+  own_signal $S/gw_load.pid humaux-gateway TERM 30 | tee -a $EV/rehearsal.log
+  gw_load_start HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS=1
+  touch $S/load_burst_w.ack
+}
+LOAD_LISTENER=
+gw_load_start() { local GW_EXTRA_ENV="$LOAD_GW_ENV${1:+ $1}"; start_gw 127.0.0.1:18080 19109 gw_load $EV/gw_load.log; }
+# Every exit path: G_load through its pidfile, then the load tenants still listed in $S/load_tenants. A tenant whose
+# teardown failed stays listed (the c38 wrapper's safety net retries it); the file goes once the list is empty.
+load_cleanup() {
+  local t left=
+  [ -n "$LOAD_LISTENER" ] && kill $LOAD_LISTENER 2>/dev/null; LOAD_LISTENER=; rm -f $S/load_burst_w.req $S/load_burst_w.ack
+  [ -f $S/gw_load.pid ] && own_signal $S/gw_load.pid humaux-gateway TERM 30 | tee -a $EV/rehearsal.log
+  rm -f $S/gw_load.pid
+  for t in $(cat $S/load_tenants 2>/dev/null); do
+    if cargo run -q -p xtask -- e2e-seed --teardown $t >> $EV/load_seed.stderr 2>&1; then echo "load: teardown $t" | tee -a $EV/rehearsal.log
+    else echo "load: teardown $t FAILED (see load_seed.stderr)" | tee -a $EV/rehearsal.log; left="$left $t"; fi
+  done
+  if [ -n "$left" ]; then print -l ${=left} > $S/load_tenants; else rm -f $S/load_tenants; fi
+  return 0
+}
+# xtask load's graded lines into the verdict: one PASS / FAIL each; a non-zero exit with no FAIL line (usage, a report
+# it could not write) is one FAIL of its own.
+load_tally() { # $1 = xtask load's stdout, $2 = its exit code
+  local p f
+  p=$(grep -c '^ASSERTION PASS load_' $1); f=$(grep -c '^ASSERTION FAIL load_' $1)
+  A_OK=$((A_OK+p)); A_BAD=$((A_BAD+f))
+  [ "$2" -ne 0 ] && [ "$f" -eq 0 ] && assert_eq "load_xtask_exit(no FAIL line printed)" "$2" 0
+  return 0
+}
+# Assertion 7 (ruling R-8) on the rows the load really writes: two tenants and their rate buckets (every request takes
+# the post-auth buckets), and none of the rows it must not write (outbox / job / memory_evidence). ok = before the
+# teardown 0/0/0/2/>0, after it 0/0/0/0/0, and no tenant left listed.
+load_rows_sql() { local in="'${LOAD_LA:-none}','${LOAD_LB:-none}'"
+  print -r -- "select (select count(*) from ops.outbox where tenant_id::text in ($in)) || '/' || (select count(*) from ops.jobs where tenant_id::text in ($in)) || '/' || (select count(*) from private.memory_evidence me join private.evidence_objects o on o.evidence_id = me.evidence_id where o.tenant_id::text in ($in)) || '/' || (select count(*) from control.tenants where tenant_id::text in ($in)) || '/' || (select count(*) from control.rate_buckets where tenant_id::text in ($in))"; }
+load_torn_down() { # $1 = rows before the teardown, $2 = rows after it, $3 = tenants still listed
+  { [ "${1%/*}" = 0/0/0/2 ] && [ "${1##*/}" -gt 0 ] 2>/dev/null; } || { echo "before_not_0/0/0/2/>0"; return; }
+  [ "$2" = 0/0/0/0/0 ] || { echo "after_not_0/0/0/0/0"; return; }
+  [ -z "$3" ] || { echo "tenants_left"; return; }
+  echo ok
+}
+rm -f $S/gw_load.pid; : > $S/load_tenants
+trap 'load_cleanup; obs_stop' EXIT
+LOAD_SEED_ARGS=(--pepper-hex $PEPPER_HEX --scopes memory:write,context:read --limit 10000000 --no-lane --processor-id $EGRESS_PROC
+  --collection $COLLECTION --dimension $EMB_DIM --embedding-provider dashscope --embedding-region $EMB_REGION)
+LOAD_SEED_A=$(cargo run -q -p xtask -- e2e-seed "${LOAD_SEED_ARGS[@]}" --workspaces 16 2>>$EV/load_seed.stderr)
+LOAD_LA=$(seedval "$LOAD_SEED_A" tenant_id); [ -n "$LOAD_LA" ] && print -r -- $LOAD_LA >> $S/load_tenants
+LOAD_SEED_B=$(cargo run -q -p xtask -- e2e-seed "${LOAD_SEED_ARGS[@]}" --workspaces 1 2>>$EV/load_seed.stderr)
+LOAD_LB=$(seedval "$LOAD_SEED_B" tenant_id); [ -n "$LOAD_LB" ] && print -r -- $LOAD_LB >> $S/load_tenants
+# Bearers stay in this shell's environment, named by variable; the command line carries the names only.
+typeset -x LOAD_A_BEARER_1="$(print -r -- "$LOAD_SEED_A" | sed -n 's/^Authorization: Bearer //p' | head -1)"
+typeset -x LOAD_B_BEARER_1="$(print -r -- "$LOAD_SEED_B" | sed -n 's/^Authorization: Bearer //p' | head -1)"
+LOAD_LANES=(--lane "a=$(seedval "$LOAD_SEED_A" workspace_id):LOAD_A_BEARER_1" --lane "b=$(seedval "$LOAD_SEED_B" workspace_id):LOAD_B_BEARER_1")
+for k in {2..16}; do
+  typeset -x LOAD_A_BEARER_$k="$(seedval "$LOAD_SEED_A" bearer_$k)"
+  LOAD_LANES+=(--lane "a=$(seedval "$LOAD_SEED_A" workspace_id_$k):LOAD_A_BEARER_$k")
+done
+LOAD_EMPTY=0   # bearers or workspaces the seed output did not carry
+for v in LOAD_A_BEARER_{1..16} LOAD_B_BEARER_1; do [ -n "${(P)v}" ] || LOAD_EMPTY=$((LOAD_EMPTY+1)); done
+for v in "${LOAD_LANES[@]}"; do case $v in [ab]=:*) LOAD_EMPTY=$((LOAD_EMPTY+1));; esac; done
+echo "load: tenants LA=$LOAD_LA (16 workspaces) LB=$LOAD_LB; lanes ${#LOAD_LANES} args; empty: $LOAD_EMPTY" | tee -a $EV/rehearsal.log
+if [ -n "$LOAD_LA" ] && [ -n "$LOAD_LB" ] && [ "$LOAD_EMPTY" = 0 ]; then
+  gw_load_start
+  rm -f $S/load_burst_w.req $S/load_burst_w.ack; load_burst_w_listener & LOAD_LISTENER=$!
+  LOAD_ARGS=(--gateway-url http://127.0.0.1:18080/mcp --ops-url http://127.0.0.1:19109/metrics "${LOAD_LANES[@]}"
+    --levels $LOAD_LEVELS --burst ${LOAD_BURST:?LOAD_BURST is required with LOAD_LEVELS} --warmup-secs 5 --level-secs 45 --burst-secs 20
+    --iso-pairs 3 --iso-secs 20 --iso-base-clients 4 --iso-burst-clients 64 --burst-w-secs 15
+    --max-wait-ms $LOAD_MAX_WAIT_MS --burst-w-max-wait-ms 1 --handler-timeout-secs $GW_HANDLER_TIMEOUT --pool-max $LOAD_POOL_MAX
+    --max-backends 80 --iso-floor-ms ${LOAD_ISO_FLOOR_MS:?LOAD_ISO_FLOOR_MS is required with LOAD_LEVELS} --ready-timeout-secs 90
+    --lock-sample-ms 10 --pg-dsn-env HUMAUX_TEST_PG_DSN --pg-container humaux-thread-pg)
+  # --lock-sample-ms: the LOCKWAIT sampler's interval and so its resolution (ADR-0065 D-D); 10 ms resolves the
+  # 1-2 ms-per-bucket hold the design estimated to within a few holds, at ~100 cheap pg_locks reads/s.
+  "$BIN_DIR"/xtask load "${LOAD_ARGS[@]}" --report $EV/load-report.json \
+    ${LOAD_BURST_W_RESTART:+--restart} ${LOAD_BURST_W_RESTART:+BURST-W=$LOAD_BURST_W_RESTART} 2>>$EV/load.stderr | tee $EV/load_main.log | tee -a $EV/rehearsal.log
+  LOAD_RC=${pipestatus[1]}
+  echo "load: xtask load EXIT $LOAD_RC" | tee -a $EV/rehearsal.log
+  load_tally $EV/load_main.log $LOAD_RC
+  # ADR-0065 S7 measurement-only runs, never in the chain: LOAD_EXTRA_PHASES names them (space-separated), each on
+  # G_load restarted with its own env and a subset of the plan (`--only`; a later flag overrides the shared one). Their
+  # output stays in $EV/load_extra_<run>.log, never in rehearsal.log: a fault's ASSERTION FAIL must not reach this run's
+  # verdict or the rehearse_c38 grep. SWEEP lines go to $EV/load_sweep.log, fault runs to $EV/load_faults.log.
+  #   sweep-c<C>  C = <C>, P = C + 2, L64 only (the C sweep)
+  #   fault-k     K = C + Q, ISO pairs only            -> must FAIL load_tenant_isolation (else K goes, D-C)
+  #   fault-p     P = 2, acquire 100 ms, L64 only (the design's F-P; measured green: admission C keeps the acquire
+  #               queue under 100 ms, ADR-0065 "Measurement"; recorded, not the red)
+  #   fault-p1    P = 1, acquire 100 ms, L64 only      -> must FAIL load_no_pool_or_statement_timeout
+  #   fault-p-c64 P = 2, acquire 100 ms, C = 64, L64 only (admission no longer bounds the pool's waiters) -> must FAIL it
+  #   fault-fwd   lane f (LA's first key) sends the RFC 7239 form, phase FWD (10 s) only -> must FAIL load_forwarded_lanes_keyed
+  #   fault-a3    phase ISO-BURST-1 scraped from the REHEARSAL gateway's ops port (whose counter never moves) -> must
+  #               FAIL load_admission_counter_equals_503s (its 503s are key_limit refusals G_load counted)
+  #   fault-teardown  no gateway run: assertion 7 graded on the live load tenants as if their teardown had not run ->
+  #               must FAIL load_tenants_torn_down (the rows it reads are really there)
+  #   iso-rerun   the ISO pairs again on the run's own configuration (ruling R-10's one rerun, docker stats first)
+  #   iso-c<C>-k<K> the ISO pairs at C = <C>, K = <K>, P = C + 2 (information: where isolation lands)
+  for x in ${=LOAD_EXTRA_PHASES:-}; do
+    case $x in
+      sweep-c<->) xc=${x#sweep-c}; xenv="HUMAUX_GATEWAY_ADMISSION_CONCURRENCY=$xc HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS=$((xc+2))"
+        xflags=(--only L64 --levels 64 --pool-max $((xc+2))) ;;
+      fault-k) xenv="HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT=$((GW_ADMISSION_CONCURRENCY+GW_ADMISSION_QUEUE_DEPTH))"; xflags=(--only ISO) ;;
+      fault-p) xenv="HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS=2 HUMAUX_GATEWAY_PG_ACQUIRE_TIMEOUT_MS=100"; xflags=(--only L64 --levels 64 --pool-max 2) ;;
+      fault-p1) xenv="HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS=1 HUMAUX_GATEWAY_PG_POOL_MIN_CONNECTIONS=1 HUMAUX_GATEWAY_PG_ACQUIRE_TIMEOUT_MS=100"; xflags=(--only L64 --levels 64 --pool-max 1) ;;
+      fault-p-c64) xenv="HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS=2 HUMAUX_GATEWAY_PG_ACQUIRE_TIMEOUT_MS=100 HUMAUX_GATEWAY_ADMISSION_CONCURRENCY=64"; xflags=(--only L64 --levels 64 --pool-max 2) ;;
+      iso-c<->-k<->) xc=${${x#iso-c}%%-*}; xk=${x##*-k}
+        xenv="HUMAUX_GATEWAY_ADMISSION_CONCURRENCY=$xc HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT=$xk HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS=$((xc+2))"
+        xflags=(--only ISO --pool-max $((xc+2))) ;;
+      fault-fwd) xenv=; xflags=(--only FWD --iso-secs 10 --rfc7239-lane f --lane "f=$(seedval "$LOAD_SEED_A" workspace_id):LOAD_A_BEARER_1") ;;
+      fault-a3) xenv=; xflags=(--only ISO-BURST-1 --ops-url http://127.0.0.1:${OPS_PORTS[humaux-gateway:serve]}/metrics) ;;
+      fault-teardown) xr=$(PGQ "$(load_rows_sql)")
+        { echo "### FAULT $x env=[] args=[] (teardown skipped: assertion 7 graded on the rows before it)"
+          xv=$(load_torn_down "$xr" "$xr" "$(cat $S/load_tenants 2>/dev/null | xargs)")
+          assertion_line "$([ "$xv" = ok ] && echo PASS || echo FAIL)" "load_tenants_torn_down(outbox/jobs/memory_evidence/tenants/rate_buckets before=$xr after=$xr)" "$xv"
+        } >> $EV/load_faults.log
+        echo "load: extra $x graded without a gateway run: $(tail -1 $EV/load_faults.log)" | tee -a $EV/rehearsal.log
+        continue ;;
+      iso-rerun) xenv=; xflags=(--only ISO); docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' > $EV/load_extra_$x.docker_stats 2>&1 ;;
+      *) echo "load: extra $x unknown, skipped" | tee -a $EV/rehearsal.log; continue ;;
+    esac
+    own_signal $S/gw_load.pid humaux-gateway TERM 30 >> $EV/load_extra.log
+    gw_load_start "$xenv"
+    "$BIN_DIR"/xtask load "${LOAD_ARGS[@]}" "${xflags[@]}" --report $EV/load-report-$x.json > $EV/load_extra_$x.log 2>>$EV/load.stderr; xrc=$?
+    echo "load: extra $x xtask load EXIT $xrc env=[$xenv] args=[${xflags[*]}] fail_lines=$(grep -c '^ASSERTION FAIL' $EV/load_extra_$x.log)" | tee -a $EV/rehearsal.log
+    case $x in
+      sweep-c*) sed -n "s/^LOAD L64 /SWEEP C=$xc P=$((xc+2)) L64 /p" $EV/load_extra_$x.log >> $EV/load_sweep.log
+        grep -E '^ASSERTION (PASS|FAIL) load_(no_pool|pg_backends)' $EV/load_extra_$x.log | sed "s/^/SWEEP_ASSERT C=$xc /" >> $EV/load_sweep.log ;;
+      fault-*) { echo "### FAULT $x env=[$xenv] args=[${xflags[*]}]"; cat $EV/load_extra_$x.log; } >> $EV/load_faults.log ;;
+    esac
+  done
+else
+  assert_eq "load_gateway_ready(the load tenants were not seeded, see load_seed.stderr)" "LA=$LOAD_LA LB=$LOAD_LB empty=$LOAD_EMPTY" seeded
+fi
+LOAD_ROWS_BEFORE=$(PGQ "$(load_rows_sql)")
+load_cleanup
+LOAD_ROWS_AFTER=$(PGQ "$(load_rows_sql)")
+trap obs_stop EXIT
+LOAD_LEFT=$(cat $S/load_tenants 2>/dev/null | xargs)
+assert_eq "load_tenants_torn_down(outbox/jobs/memory_evidence/tenants/rate_buckets before=$LOAD_ROWS_BEFORE after=$LOAD_ROWS_AFTER left=[$LOAD_LEFT])" \
+  "$(load_torn_down "$LOAD_ROWS_BEFORE" "$LOAD_ROWS_AFTER" "$LOAD_LEFT")" ok
+fi
 
 # ---------- 3. remember ×2 ----------
 step remember
@@ -1290,15 +1494,6 @@ echo "explicit mode literal: code=$LIT_CODE $(tail -1 $EV/recall_mode_literal.js
 
 # ---------- 6b. assertions (ADR-0036 / card 14 witness) ----------
 step assertions
-A_OK=0; A_BAD=0
-assert_eq() { # $1=label $2=actual $3=expected
-  if [ "$2" = "$3" ]; then echo "ASSERTION PASS $1: $2" | tee -a $EV/rehearsal.log; A_OK=$((A_OK+1));
-  else echo "ASSERTION FAIL $1: got '$2' want '$3'" | tee -a $EV/rehearsal.log; A_BAD=$((A_BAD+1)); fi
-}
-assert_gt() { # $1=label $2=actual $3=floor
-  if [ "$2" -gt "$3" ] 2>/dev/null; then echo "ASSERTION PASS $1: $2 > $3" | tee -a $EV/rehearsal.log; A_OK=$((A_OK+1));
-  else echo "ASSERTION FAIL $1: got '$2' want > $3" | tee -a $EV/rehearsal.log; A_BAD=$((A_BAD+1)); fi
-}
 # ADR-0036: neither derived worker may be handed a tenant/domain through the environment.
 assert_eq "no_tenant_env_in_seed_exports" \
   "$(print -r -- "$SEED_OUT" | grep -cE '^export HUMAUX_(CONSOLIDATION_WORKER|PRIVATE_WORKER_DISTILL)_(TENANT_ID|WORKSPACE_ID|REASONING_DOMAIN_ID|BINDING_ID|BINDING_VERSION)=')" 0

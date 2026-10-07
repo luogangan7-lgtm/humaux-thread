@@ -15,6 +15,8 @@
 //!   projection.tenant_placements] x=[control.bump_user_security_epoch, control.onboard_workspace,
 //!   control.set_workspace_membership], PostgreSQL(role_retrieval_worker), Qdrant(*), UDS(retrieval-worker),
 //!   UDS(serve), subprocess(humaux-gateway), subprocess(kill), HTTP(gateway)]; env=[CARGO_BIN_EXE_humaux-gateway,
+//!   HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS, HUMAUX_GATEWAY_ADMISSION_CONCURRENCY,
+//!   HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS, HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT, HUMAUX_GATEWAY_ADMISSION_QUEUE_DEPTH,
 //!   HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS, HUMAUX_GATEWAY_BIND_ADDR,
 //!   HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS, HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS,
 //!   HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX,
@@ -22,7 +24,12 @@
 //!   HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS, HUMAUX_GATEWAY_GLOBAL_DENYLIST,
 //!   HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST, HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS,
 //!   HUMAUX_GATEWAY_MAX_FORWARDED_HOPS, HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES, HUMAUX_GATEWAY_METRICS_ADDR,
-//!   HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS, HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS,
+//!   HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS, HUMAUX_GATEWAY_PG_ACQUIRE_TIMEOUT_MS, HUMAUX_GATEWAY_PG_DSN,
+//!   HUMAUX_GATEWAY_PG_IDLE_IN_TRANSACTION_TIMEOUT_MS, HUMAUX_GATEWAY_PG_IDLE_TIMEOUT_SECONDS,
+//!   HUMAUX_GATEWAY_PG_MAX_LIFETIME_SECONDS, HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS,
+//!   HUMAUX_GATEWAY_PG_POOL_MIN_CONNECTIONS, HUMAUX_GATEWAY_PG_STATEMENT_TIMEOUT_MS,
+//!   HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_GATEWAY_RATE_LOCK_TIMEOUT_MS,
+//!   HUMAUX_GATEWAY_RATE_PREAUTH_IPV6_PREFIX_BITS,
 //!   HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS, HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN,
 //!   HUMAUX_GATEWAY_REMEMBER_EVENT_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND,
 //!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION, HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID,
@@ -202,6 +209,8 @@ fn guard(runtime: RuntimeDbPool) -> Arc<GatewayGuard> {
                     user: rate(),
                     tenant: rate(),
                     operation: rate(),
+                    lock_timeout: Duration::from_secs(2),
+                    preauth_ipv6_prefix_bits: 64,
                 },
                 reservation_ttl: Duration::from_secs(30),
                 handler_timeout: Duration::from_secs(5),
@@ -5555,6 +5564,27 @@ const ENUMERATION_KEYS: [(&str, &str); 2] = [
     ("HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP", "1000"),
 ];
 
+/// ADR-0065 D-A / D-B / D-C / D-D / D-E: the spawned gateway's required card-38 keys — the sqlx 0.8.6 defaults this fixture ran on before
+/// card 38, with both session timeouts below the fixture's 5 s handler timeout (the boot order rule).
+const POOL_KEYS: [(&str, &str); 14] = [
+    ("HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS", "10"),
+    ("HUMAUX_GATEWAY_PG_POOL_MIN_CONNECTIONS", "0"),
+    ("HUMAUX_GATEWAY_PG_ACQUIRE_TIMEOUT_MS", "30000"),
+    ("HUMAUX_GATEWAY_PG_IDLE_TIMEOUT_SECONDS", "600"),
+    ("HUMAUX_GATEWAY_PG_MAX_LIFETIME_SECONDS", "1800"),
+    ("HUMAUX_GATEWAY_PG_STATEMENT_TIMEOUT_MS", "4000"),
+    ("HUMAUX_GATEWAY_PG_IDLE_IN_TRANSACTION_TIMEOUT_MS", "4000"),
+    // ADR-0065 D-D / D-E: the former lock_timeout literal (below statement_timeout) and the /64 SEC-6 prefix.
+    ("HUMAUX_GATEWAY_RATE_LOCK_TIMEOUT_MS", "2000"),
+    ("HUMAUX_GATEWAY_RATE_PREAUTH_IPV6_PREFIX_BITS", "64"),
+    // ADR-0065 D-C: the §67.2 start values; B within the 5 s handler timeout (the boot bound).
+    ("HUMAUX_GATEWAY_ADMISSION_CONCURRENCY", "16"),
+    ("HUMAUX_GATEWAY_ADMISSION_QUEUE_DEPTH", "64"),
+    ("HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS", "5000"),
+    ("HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT", "16"),
+    ("HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS", "5000"),
+];
+
 #[derive(Clone)]
 struct GatewayProcessConfig {
     values: BTreeMap<String, String>,
@@ -5656,6 +5686,7 @@ impl GatewayProcessConfig {
             ),
         ]);
         values.extend(ENUMERATION_KEYS.map(|(key, value)| (key.into(), value.into())));
+        values.extend(POOL_KEYS.map(|(key, value)| (key.into(), value.into())));
         for name in ["PREAUTH_IP", "CREDENTIAL", "USER", "TENANT", "OPERATION"] {
             values.insert(format!("HUMAUX_GATEWAY_RATE_{name}_CAPACITY"), "100".into());
             values.insert(

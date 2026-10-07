@@ -4,6 +4,7 @@
 //! Invariants: []
 //! Spec: none
 
+pub mod admission;
 pub mod auth;
 pub mod bootstrap;
 pub mod context;

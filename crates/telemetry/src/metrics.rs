@@ -3,8 +3,8 @@
 //! Depends-on: crates=[]; services=[HTTP(loopback)]; env=[]; modules=[telemetry::degrade]
 //! Called-by: [admin::cell_resources, admin::ops_status, consolidation-worker::main, gateway::bootstrap,
 //!   gateway::guard, gateway::main, maintenance::health_serve, maintenance::resident, maintenance::serve,
-//!   private-worker::main, retrieval-worker::main, retrieval::completeness, telemetry::degrade, telemetry::dr,
-//!   telemetry::health, tests]
+//!   private-worker::main, retrieval-worker::main, retrieval::completeness, telemetry::admission, telemetry::degrade,
+//!   telemetry::dr, telemetry::health, tests]
 //! Invariants: [every exported family is a `families::*` const and nowhere else; label values are `&'static str`
 //!   from a closed enum; the listener refuses a non-loopback address and names the config key]
 //! Spec: Baseline §41.2; §53.5; ADR-0061 D-A; ADR-0061 D-B
@@ -152,6 +152,14 @@ pub mod families {
         "Rate-limit rejections, by scope.",
         Kind::Counter,
         &["scope"],
+    );
+    // §41.2: §67 admission control 返 503 处 — gateway (ADR-0065 D-C).
+    /// `admission_rejected_total{class,reason}`.
+    pub const ADMISSION_REJECTED_TOTAL: Family = f(
+        "admission_rejected_total",
+        "Requests the admission layer refused with 503, by traffic class and reason.",
+        Kind::Counter,
+        &["class", "reason"],
     );
     // §41.2: §19 provider call end — retrieval worker.
     /// `retrieval_provider_requests_total{provider,purpose,region,result}`.

@@ -551,7 +551,8 @@ fn g23_1c_and_g23_1a_both_red_when_ticket_issuance_moves_into_remembers_transact
             // `.pool()` accessor.
             let raw_gateway = rt
                 // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
-                .block_on(sqlx::postgres::PgPoolOptions::new().connect(&handle.gateway_dsn))
+                // ADR-0065 D-A: `Pool::connect`, so the pool builder keeps its one site in postgres.rs.
+                .block_on(sqlx::Pool::<sqlx::Postgres>::connect(&handle.gateway_dsn))
                 .expect("connect raw role_gateway pool for the merged-transaction counterfactual");
             let mut batch_id: Option<Uuid> = None;
             for i in 0..n {

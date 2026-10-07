@@ -5,7 +5,9 @@
 //!   the process holds no default write pair at all.
 //! Depends-on: crates=[hex, humaux-adapters, humaux-application, humaux-contracts, humaux-domain, humaux-infra-cell,
 //!   humaux-protocol, humaux-telemetry, serde_json, tokio, uuid]; services=[PostgreSQL(role_gateway)];
-//!   env=[HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS, HUMAUX_GATEWAY_BIND_ADDR,
+//!   env=[HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS, HUMAUX_GATEWAY_ADMISSION_CONCURRENCY,
+//!   HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS, HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT, HUMAUX_GATEWAY_ADMISSION_QUEUE_DEPTH,
+//!   HUMAUX_GATEWAY_ALLOWED_HOSTS, HUMAUX_GATEWAY_ALLOWED_ORIGINS, HUMAUX_GATEWAY_BIND_ADDR,
 //!   HUMAUX_GATEWAY_CALLER_ID, HUMAUX_GATEWAY_CELL_ID, HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS,
 //!   HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS, HUMAUX_GATEWAY_CONTEXT_TOTAL_TOKENS,
 //!   HUMAUX_GATEWAY_CREDENTIAL_PEPPER_HEX, HUMAUX_GATEWAY_CREDENTIAL_PEPPER_PREVIOUS_HEX,
@@ -14,8 +16,13 @@
 //!   HUMAUX_GATEWAY_GLOBAL_DENYLIST, HUMAUX_GATEWAY_GLOBAL_EMERGENCY_ALLOWLIST,
 //!   HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS, HUMAUX_GATEWAY_MAX_FORWARDED_HOPS,
 //!   HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES, HUMAUX_GATEWAY_METRICS_ADDR, HUMAUX_GATEWAY_MOOD_HALF_LIFE_SECONDS,
-//!   HUMAUX_GATEWAY_PG_DSN, HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_GATEWAY_QDRANT_CIDR,
+//!   HUMAUX_GATEWAY_PG_ACQUIRE_TIMEOUT_MS, HUMAUX_GATEWAY_PG_DSN,
+//!   HUMAUX_GATEWAY_PG_IDLE_IN_TRANSACTION_TIMEOUT_MS, HUMAUX_GATEWAY_PG_IDLE_TIMEOUT_SECONDS,
+//!   HUMAUX_GATEWAY_PG_MAX_LIFETIME_SECONDS, HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS,
+//!   HUMAUX_GATEWAY_PG_POOL_MIN_CONNECTIONS, HUMAUX_GATEWAY_PG_STATEMENT_TIMEOUT_MS,
+//!   HUMAUX_GATEWAY_PROJECTION_LAG_SECONDS, HUMAUX_GATEWAY_QDRANT_CIDR,
 //!   HUMAUX_GATEWAY_QDRANT_HOST, HUMAUX_GATEWAY_QDRANT_PORT, HUMAUX_GATEWAY_QDRANT_TLS,
+//!   HUMAUX_GATEWAY_RATE_LOCK_TIMEOUT_MS, HUMAUX_GATEWAY_RATE_PREAUTH_IPV6_PREFIX_BITS,
 //!   HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS, HUMAUX_GATEWAY_REMEMBER_DATA_CLASS, HUMAUX_GATEWAY_REMEMBER_DOMAIN,
 //!   HUMAUX_GATEWAY_REMEMBER_EVENT_KIND, HUMAUX_GATEWAY_REMEMBER_PROJECTION_KIND,
 //!   HUMAUX_GATEWAY_REMEMBER_PROJECTION_VERSION, HUMAUX_GATEWAY_REMEMBER_REASONING_DOMAIN_ID,
@@ -28,7 +35,8 @@
 //!   HUMAUX_GATEWAY_TOKEN_HMAC_KEY, HUMAUX_GATEWAY_TOKEN_HMAC_KEY_PREVIOUS, HUMAUX_GATEWAY_TRUSTED_PROXY_CIDRS,
 //!   HUMAUX_GATEWAY_UNDO_WINDOW_SECONDS, HUMAUX_GATEWAY_UNKNOWN]; modules=[adapters::postgres, adapters::quota_repo,
 //!   adapters::retrieve, application::retrieval_embedding_port, contracts::config_registry,
-//!   contracts::retrieval_config, domain::context, domain::dataclass, domain::identity, gateway::context,
+//!   contracts::retrieval_config, domain::context, domain::dataclass, domain::identity, gateway::admission,
+//!   gateway::context,
 //!   gateway::guard, gateway::mcp_application, gateway::recall, gateway::remember,
 //!   gateway::retrieval_embedding_client, gateway::status, infra-cell::permit, infra-cell::resource,
 //!   infra-cell::transport, protocol::edge, protocol::mcp, protocol::mcp_catalog, telemetry::metrics]
@@ -51,7 +59,7 @@ use std::{
 };
 
 use humaux_adapters::{
-    postgres::RuntimeDbPool,
+    postgres::{PoolSettings, RuntimeDbPool},
     quota_repo::RatePolicy,
     retrieve::{TokenKeys, install_token_keys},
 };
@@ -77,6 +85,7 @@ use uuid::Uuid;
 use serde_json::{Map, Value};
 
 use crate::{
+    admission::{Admission, AdmissionSettings},
     context::ContextBootstrap,
     guard::{GatewayGuard, GuardRatePolicies, GuardSettings},
     mcp_application::GatewayMcpApplication,
@@ -89,6 +98,23 @@ use crate::{
 const PREFIX: &str = "HUMAUX_GATEWAY_";
 const ENUMERATION_TTL_KEY: &str = "HUMAUX_GATEWAY_ENUMERATION_TTL_SECONDS";
 const ENUMERATION_MANIFEST_CAP_KEY: &str = "HUMAUX_GATEWAY_ENUMERATION_MANIFEST_CAP";
+/// ADR-0065 D-B: the `application_name` of every gateway session — the process identity in `pg_stat_activity`
+/// (the name `/status` reports), not a tunable.
+const APPLICATION_NAME: &str = "humaux-gateway";
+const PG_POOL_MAX_KEY: &str = "HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS";
+const PG_POOL_MIN_KEY: &str = "HUMAUX_GATEWAY_PG_POOL_MIN_CONNECTIONS";
+const PG_ACQUIRE_TIMEOUT_KEY: &str = "HUMAUX_GATEWAY_PG_ACQUIRE_TIMEOUT_MS";
+const PG_IDLE_TIMEOUT_KEY: &str = "HUMAUX_GATEWAY_PG_IDLE_TIMEOUT_SECONDS";
+const PG_MAX_LIFETIME_KEY: &str = "HUMAUX_GATEWAY_PG_MAX_LIFETIME_SECONDS";
+const PG_STATEMENT_TIMEOUT_KEY: &str = "HUMAUX_GATEWAY_PG_STATEMENT_TIMEOUT_MS";
+const PG_IDLE_IN_TRANSACTION_TIMEOUT_KEY: &str = "HUMAUX_GATEWAY_PG_IDLE_IN_TRANSACTION_TIMEOUT_MS";
+const RATE_LOCK_TIMEOUT_KEY: &str = "HUMAUX_GATEWAY_RATE_LOCK_TIMEOUT_MS";
+const RATE_PREAUTH_IPV6_PREFIX_BITS_KEY: &str = "HUMAUX_GATEWAY_RATE_PREAUTH_IPV6_PREFIX_BITS";
+const ADMISSION_CONCURRENCY_KEY: &str = "HUMAUX_GATEWAY_ADMISSION_CONCURRENCY";
+const ADMISSION_QUEUE_DEPTH_KEY: &str = "HUMAUX_GATEWAY_ADMISSION_QUEUE_DEPTH";
+const ADMISSION_MAX_WAIT_KEY: &str = "HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS";
+const ADMISSION_PER_KEY_LIMIT_KEY: &str = "HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT";
+const ADMISSION_BODY_READ_TIMEOUT_KEY: &str = "HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS";
 
 /// A fail-closed bootstrap error. It intentionally contains configuration keys,
 /// never a DSN, pepper, or another secret value.
@@ -125,6 +151,10 @@ pub struct GatewayBootstrap {
     bind_addr: SocketAddr,
     http: McpHttpConfig,
     pg_dsn: String,
+    /// ADR-0065 D-A / D-B: the `role_gateway` pool's size and session timeouts, from the `PG_*` keys.
+    pool_settings: PoolSettings,
+    /// ADR-0065 D-C: the §67.2 admission bounds, from the five `ADMISSION_*` keys.
+    admission: AdmissionSettings,
     guard: GuardSettings,
     remember_policy: RememberPolicy,
     remember_event_kind: RememberEventKind,
@@ -180,6 +210,7 @@ pub struct GatewayRuntime {
     adapter: McpAdapter,
     config_fingerprint: String,
     guard: Arc<GatewayGuard>,
+    admission: Arc<Admission>,
     readiness: Option<ReadinessProbe>,
     metrics_addr: SocketAddr,
     readiness_refresh: Duration,
@@ -207,6 +238,12 @@ impl GatewayRuntime {
     #[must_use]
     pub fn guard(&self) -> Arc<GatewayGuard> {
         Arc::clone(&self.guard)
+    }
+
+    /// ADR-0065 D-C: the admission state `main` wraps the MCP router with.
+    #[must_use]
+    pub fn admission(&self) -> Arc<Admission> {
+        Arc::clone(&self.admission)
     }
 
     /// The readiness checks, handed once to the refresh task (`None` after the first call).
@@ -264,8 +301,8 @@ impl GatewayBootstrap {
                 "a different key set is already installed",
             )
         })?;
-        // dep: PostgreSQL(role_gateway) — opens the role_gateway pool the rest of bootstrap wires into the app state
-        let pool = RuntimeDbPool::connect(&self.pg_dsn)
+        // dep: PostgreSQL(role_gateway) — opens the sized role_gateway pool the rest of bootstrap wires into the app state
+        let pool = RuntimeDbPool::connect_with(&self.pg_dsn, &self.pool_settings)
             .await
             .map_err(|_| BootstrapError::new("HUMAUX_GATEWAY_PG_DSN", "connection rejected"))?;
         let guard = Arc::new(
@@ -337,6 +374,7 @@ impl GatewayBootstrap {
                 semantic,
             }),
             guard,
+            admission: Arc::new(Admission::new(self.admission)),
             metrics_addr: self.metrics_addr,
             readiness_refresh: self.readiness_refresh,
             effective_config: self.effective_config,
@@ -351,6 +389,8 @@ impl GatewayBootstrap {
         let context_bootstrap = parse_context_bootstrap(&effective, &remember_policy)?;
         let guard = parse_guard(&effective)?;
         let handler_timeout = guard.handler_timeout;
+        let pool_settings = parse_pool(&effective, guard.rates.lock_timeout, handler_timeout)?;
+        let admission = parse_admission(&effective, handler_timeout)?;
         let confirm_token_ttl = seconds(
             required(&effective, "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS")?,
             "HUMAUX_GATEWAY_CONFIRM_TOKEN_TTL_SECONDS",
@@ -382,6 +422,8 @@ impl GatewayBootstrap {
             bind_addr: parse_bind_addr(required(&effective, "HUMAUX_GATEWAY_BIND_ADDR")?)?,
             http: parse_http(&effective)?,
             pg_dsn: required(&effective, "HUMAUX_GATEWAY_PG_DSN")?.to_owned(),
+            pool_settings,
+            admission,
             guard,
             remember_policy,
             remember_event_kind: parse_remember_event_kind(&effective)?,
@@ -541,6 +583,17 @@ fn parse_guard(effective: &BTreeMap<String, String>) -> Result<GuardSettings, Bo
             user: rate(effective, "USER")?,
             tenant: rate(effective, "TENANT")?,
             operation: rate(effective, "OPERATION")?,
+            lock_timeout: millis(
+                required(effective, RATE_LOCK_TIMEOUT_KEY)?,
+                RATE_LOCK_TIMEOUT_KEY,
+            )?,
+            preauth_ipv6_prefix_bits: required(effective, RATE_PREAUTH_IPV6_PREFIX_BITS_KEY)?
+                .parse::<u8>()
+                .ok()
+                .filter(|bits| (1..=128).contains(bits))
+                .ok_or_else(|| {
+                    BootstrapError::new(RATE_PREAUTH_IPV6_PREFIX_BITS_KEY, "must be 1..=128")
+                })?,
         },
         reservation_ttl: seconds(
             required(effective, "HUMAUX_GATEWAY_RESERVATION_TTL_SECONDS")?,
@@ -822,6 +875,7 @@ fn retrieval_env_key(canonical_key: &str) -> String {
 /// fingerprint and the `/status` `effective_config` all derive from this one list. Public so the
 /// ops-listener test derives its secret canaries from it rather than from a hand list.
 #[must_use]
+#[allow(clippy::too_many_lines)] // One flat declaration list per §78.1 key; splitting it would hide a key from review.
 pub fn registry() -> Vec<ConfigEntry> {
     let mut entries = [
         ("BIND_ADDR", "socket_addr", false),
@@ -870,6 +924,24 @@ pub fn registry() -> Vec<ConfigEntry> {
         // ADR-0061 D-B / D-F: no default — boot-fatal when absent.
         ("METRICS_ADDR", "socket_addr", false),
         ("READINESS_REFRESH_SECONDS", "u64", false),
+        // ADR-0065 D-A / D-B (§78.1): no default — boot-fatal when absent; the measured start values live in the
+        // launchers and ADR-0065, never here (ruling R-5).
+        ("PG_POOL_MAX_CONNECTIONS", "u32", false),
+        ("PG_POOL_MIN_CONNECTIONS", "u32", false),
+        ("PG_ACQUIRE_TIMEOUT_MS", "u64", false),
+        ("PG_IDLE_TIMEOUT_SECONDS", "u64", false),
+        ("PG_MAX_LIFETIME_SECONDS", "u64", false),
+        ("PG_STATEMENT_TIMEOUT_MS", "u64", false),
+        ("PG_IDLE_IN_TRANSACTION_TIMEOUT_MS", "u64", false),
+        // ADR-0065 D-D / D-E (§78.1 限流阈值): no default — boot-fatal when absent (ruling R-5).
+        ("RATE_LOCK_TIMEOUT_MS", "u64", false),
+        ("RATE_PREAUTH_IPV6_PREFIX_BITS", "u8", false),
+        // ADR-0065 D-C (§67.2, §78.1): no default — boot-fatal when absent (ruling R-5).
+        ("ADMISSION_CONCURRENCY", "u32", false),
+        ("ADMISSION_QUEUE_DEPTH", "u32", false),
+        ("ADMISSION_MAX_WAIT_MS", "u64", false),
+        ("ADMISSION_PER_KEY_LIMIT", "u32", false),
+        ("ADMISSION_BODY_READ_TIMEOUT_MS", "u64", false),
     ]
     .into_iter()
     .map(|(suffix, type_name, secret)| entry(&format!("{PREFIX}{suffix}"), type_name, secret))
@@ -1020,6 +1092,15 @@ fn seconds(value: &str, key: &str) -> Result<Duration, BootstrapError> {
         .ok_or_else(|| BootstrapError::new(key, "must be positive seconds"))
 }
 
+fn millis(value: &str, key: &str) -> Result<Duration, BootstrapError> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .ok_or_else(|| BootstrapError::new(key, "must be positive milliseconds"))
+}
+
 fn uuid(value: &str, key: &str) -> Result<Uuid, BootstrapError> {
     Uuid::parse_str(value)
         .ok()
@@ -1063,6 +1144,142 @@ fn rate(effective: &BTreeMap<String, String>, name: &str) -> Result<RatePolicy, 
         .parse::<i64>()
         .map_err(|_| BootstrapError::new(&refill_key, "invalid integer"))?;
     RatePolicy::new(capacity, refill).map_err(|_| BootstrapError::new(name, "invalid rate policy"))
+}
+
+/// ADR-0065 D-A / D-B: the gateway pool from its seven `PG_*` keys. Bounds: max ≥ 1, min ≤ max, acquire / idle
+/// timeouts > 0, max lifetime > idle timeout; then [`validate_timeout_order`]. P ≥ C+2 is deliberately not checked
+/// here (D-A rejected b: the S7 fault run boots P = 2); the load measurement asserts it.
+fn parse_pool(
+    effective: &BTreeMap<String, String>,
+    lock_timeout: Duration,
+    handler_timeout: Duration,
+) -> Result<PoolSettings, BootstrapError> {
+    let max_connections = parse_u32(required(effective, PG_POOL_MAX_KEY)?, PG_POOL_MAX_KEY)?;
+    let min_connections = required(effective, PG_POOL_MIN_KEY)?
+        .parse::<u32>()
+        .map_err(|_| BootstrapError::new(PG_POOL_MIN_KEY, "must be a non-negative integer"))?;
+    if min_connections > max_connections {
+        return Err(BootstrapError::new(
+            PG_POOL_MIN_KEY,
+            "must not exceed HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS",
+        ));
+    }
+    let idle_timeout = seconds(
+        required(effective, PG_IDLE_TIMEOUT_KEY)?,
+        PG_IDLE_TIMEOUT_KEY,
+    )?;
+    let max_lifetime = seconds(
+        required(effective, PG_MAX_LIFETIME_KEY)?,
+        PG_MAX_LIFETIME_KEY,
+    )?;
+    if max_lifetime <= idle_timeout {
+        return Err(BootstrapError::new(
+            PG_MAX_LIFETIME_KEY,
+            "must exceed HUMAUX_GATEWAY_PG_IDLE_TIMEOUT_SECONDS",
+        ));
+    }
+    let settings = PoolSettings {
+        max_connections,
+        min_connections,
+        acquire_timeout: millis(
+            required(effective, PG_ACQUIRE_TIMEOUT_KEY)?,
+            PG_ACQUIRE_TIMEOUT_KEY,
+        )?,
+        idle_timeout,
+        max_lifetime,
+        statement_timeout: millis(
+            required(effective, PG_STATEMENT_TIMEOUT_KEY)?,
+            PG_STATEMENT_TIMEOUT_KEY,
+        )?,
+        idle_in_transaction_timeout: millis(
+            required(effective, PG_IDLE_IN_TRANSACTION_TIMEOUT_KEY)?,
+            PG_IDLE_IN_TRANSACTION_TIMEOUT_KEY,
+        )?,
+        application_name: APPLICATION_NAME.to_owned(),
+    };
+    validate_timeout_order(&settings, lock_timeout, handler_timeout)?;
+    Ok(settings)
+}
+
+/// ADR-0065 D-C: the §67.2 admission bounds. C ≥ 1, Q ≥ 0, W > 0, 1 ≤ K ≤ C + Q (a larger K could never decide), and
+/// 0 < B ≤ the handler timeout (B is a protective bound: `MAX_REQUEST_BODY_BYTES` / B is the slowest accepted upload).
+fn parse_admission(
+    effective: &BTreeMap<String, String>,
+    handler_timeout: Duration,
+) -> Result<AdmissionSettings, BootstrapError> {
+    let concurrency = parse_u32(
+        required(effective, ADMISSION_CONCURRENCY_KEY)?,
+        ADMISSION_CONCURRENCY_KEY,
+    )?;
+    let queue_depth = required(effective, ADMISSION_QUEUE_DEPTH_KEY)?
+        .parse::<u32>()
+        .map_err(|_| {
+            BootstrapError::new(ADMISSION_QUEUE_DEPTH_KEY, "must be a non-negative integer")
+        })?;
+    let per_key_limit = parse_u32(
+        required(effective, ADMISSION_PER_KEY_LIMIT_KEY)?,
+        ADMISSION_PER_KEY_LIMIT_KEY,
+    )?;
+    if u64::from(per_key_limit) > u64::from(concurrency) + u64::from(queue_depth) {
+        return Err(BootstrapError::new(
+            ADMISSION_PER_KEY_LIMIT_KEY,
+            "must not exceed HUMAUX_GATEWAY_ADMISSION_CONCURRENCY + HUMAUX_GATEWAY_ADMISSION_QUEUE_DEPTH (ADR-0065 D-C)",
+        ));
+    }
+    let body_read_timeout = millis(
+        required(effective, ADMISSION_BODY_READ_TIMEOUT_KEY)?,
+        ADMISSION_BODY_READ_TIMEOUT_KEY,
+    )?;
+    if body_read_timeout > handler_timeout {
+        return Err(BootstrapError::new(
+            ADMISSION_BODY_READ_TIMEOUT_KEY,
+            "must not exceed HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS (ADR-0065 D-C)",
+        ));
+    }
+    Ok(AdmissionSettings {
+        concurrency,
+        queue_depth,
+        max_wait: millis(
+            required(effective, ADMISSION_MAX_WAIT_KEY)?,
+            ADMISSION_MAX_WAIT_KEY,
+        )?,
+        per_key_limit,
+        body_read_timeout,
+        max_request_body_bytes: parse_usize(
+            required(effective, "HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES")?,
+            "HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES",
+        )?,
+    })
+}
+
+/// ADR-0065 D-B: lock_timeout < statement_timeout < handler timeout, and an idle transaction never outlives the
+/// handler — so the server cancels a statement before the client stops waiting for it (a dropped future sends no
+/// CancelRequest, F19 / L6). A violation refuses to boot naming the key and the order.
+fn validate_timeout_order(
+    pool: &PoolSettings,
+    lock_timeout: Duration,
+    handler_timeout: Duration,
+) -> Result<(), BootstrapError> {
+    // ADR-0065 D-D: a rate-lock wait ends as 55P03 (503) before statement_timeout could end it as 57014.
+    if lock_timeout >= pool.statement_timeout {
+        return Err(BootstrapError::new(
+            RATE_LOCK_TIMEOUT_KEY,
+            "must be below HUMAUX_GATEWAY_PG_STATEMENT_TIMEOUT_MS (ADR-0065 D-B order: lock_timeout < statement_timeout < handler timeout)",
+        ));
+    }
+    if pool.statement_timeout >= handler_timeout {
+        return Err(BootstrapError::new(
+            PG_STATEMENT_TIMEOUT_KEY,
+            "must be below HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS (ADR-0065 D-B order: lock_timeout < statement_timeout < handler timeout)",
+        ));
+    }
+    if pool.idle_in_transaction_timeout > handler_timeout {
+        return Err(BootstrapError::new(
+            PG_IDLE_IN_TRANSACTION_TIMEOUT_KEY,
+            "must not exceed HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS (ADR-0065 D-B)",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_guard(guard: &GuardSettings) -> Result<(), BootstrapError> {
@@ -1178,6 +1395,20 @@ mod tests {
                 "HUMAUX_GATEWAY_CONTEXT_MANDATORY_TOKENS" => "1024".into(),
                 "HUMAUX_GATEWAY_METRICS_ADDR" => "127.0.0.1:9101".into(),
                 "HUMAUX_GATEWAY_READINESS_REFRESH_SECONDS" => "2".into(),
+                "HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS" => "18".into(),
+                "HUMAUX_GATEWAY_PG_POOL_MIN_CONNECTIONS" => "2".into(),
+                "HUMAUX_GATEWAY_PG_ACQUIRE_TIMEOUT_MS" => "1000".into(),
+                "HUMAUX_GATEWAY_PG_IDLE_TIMEOUT_SECONDS" => "300".into(),
+                "HUMAUX_GATEWAY_PG_MAX_LIFETIME_SECONDS" => "1800".into(),
+                "HUMAUX_GATEWAY_PG_STATEMENT_TIMEOUT_MS" => "4000".into(),
+                "HUMAUX_GATEWAY_PG_IDLE_IN_TRANSACTION_TIMEOUT_MS" => "4000".into(),
+                "HUMAUX_GATEWAY_RATE_LOCK_TIMEOUT_MS" => "2000".into(),
+                "HUMAUX_GATEWAY_RATE_PREAUTH_IPV6_PREFIX_BITS" => "64".into(),
+                "HUMAUX_GATEWAY_ADMISSION_CONCURRENCY" => "16".into(),
+                "HUMAUX_GATEWAY_ADMISSION_QUEUE_DEPTH" => "64".into(),
+                "HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS" => "5000".into(),
+                "HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT" => "16".into(),
+                "HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS" => "5000".into(),
                 // Semantic recall stays disabled in this fixture (empty socket path) — every
                 // other key in this group may legitimately be blank when it is.
                 "HUMAUX_GATEWAY_RETRIEVAL_RPC_SOCKET_PATH"
@@ -1212,6 +1443,111 @@ mod tests {
         match GatewayBootstrap::from_raw(values) {
             Ok(_) => panic!("configuration must be rejected"),
             Err(error) => error.key,
+        }
+    }
+
+    /// Every card-38 key (ADR-0065; S3 and S4 append theirs to this one list).
+    const CARD38_KEYS: [&str; 14] = [
+        "HUMAUX_GATEWAY_PG_POOL_MAX_CONNECTIONS",
+        "HUMAUX_GATEWAY_PG_POOL_MIN_CONNECTIONS",
+        "HUMAUX_GATEWAY_PG_ACQUIRE_TIMEOUT_MS",
+        "HUMAUX_GATEWAY_PG_IDLE_TIMEOUT_SECONDS",
+        "HUMAUX_GATEWAY_PG_MAX_LIFETIME_SECONDS",
+        "HUMAUX_GATEWAY_PG_STATEMENT_TIMEOUT_MS",
+        "HUMAUX_GATEWAY_PG_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+        "HUMAUX_GATEWAY_RATE_LOCK_TIMEOUT_MS",
+        "HUMAUX_GATEWAY_RATE_PREAUTH_IPV6_PREFIX_BITS",
+        "HUMAUX_GATEWAY_ADMISSION_CONCURRENCY",
+        "HUMAUX_GATEWAY_ADMISSION_QUEUE_DEPTH",
+        "HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS",
+        "HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT",
+        "HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS",
+    ];
+
+    /// ADR-0065 D-A / ruling R-5 (§78.1): each card-38 key is declared once with no default, and boot without it,
+    /// or with it empty, fails naming exactly that key. Fault: one key moved to `entry_with_default` ⇒ red.
+    #[test]
+    fn every_card38_key_is_required_and_named() {
+        assert!(
+            GatewayBootstrap::from_raw(raw()).is_ok(),
+            "the full fixture boots"
+        );
+        let registry = registry();
+        for key in CARD38_KEYS {
+            let declared: Vec<_> = registry.iter().filter(|e| e.name == key).collect();
+            assert_eq!(declared.len(), 1, "{key} must be declared exactly once");
+            assert!(
+                declared[0].default.is_none(),
+                "{key} must have no default (§78.1, R-5)"
+            );
+            let mut values = raw();
+            values.remove(key);
+            assert_eq!(rejected_key(values), key, "boot without {key}");
+            let mut values = raw();
+            values.insert(key.into(), String::new());
+            assert_eq!(rejected_key(values), key, "boot with {key} empty");
+        }
+        let bits = "HUMAUX_GATEWAY_RATE_PREAUTH_IPV6_PREFIX_BITS";
+        for value in ["0", "129"] {
+            let mut values = raw();
+            values.insert(bits.into(), value.into());
+            assert_eq!(rejected_key(values), bits, "{bits}={value}");
+        }
+        // ADR-0065 D-C bounds (fixture C = 16, Q = 64, handler timeout 5 s): C ≥ 1, W > 0, K ≤ C + Q, B ≤ handler.
+        for (key, value) in [
+            ("HUMAUX_GATEWAY_ADMISSION_CONCURRENCY", "0"),
+            ("HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS", "0"),
+            ("HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT", "0"),
+            ("HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT", "81"),
+            ("HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS", "0"),
+            ("HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS", "5001"),
+        ] {
+            let mut values = raw();
+            values.insert(key.into(), value.into());
+            assert_eq!(rejected_key(values), key, "{key}={value}");
+        }
+        for (key, value) in [
+            ("HUMAUX_GATEWAY_ADMISSION_QUEUE_DEPTH", "0"),
+            ("HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT", "80"),
+        ] {
+            let mut values = raw();
+            values.insert(key.into(), value.into());
+            assert!(
+                GatewayBootstrap::from_raw(values).is_ok(),
+                "{key}={value} boots"
+            );
+        }
+    }
+
+    /// ADR-0065 D-B: statement_timeout < handler timeout, idle-in-transaction ≤ handler timeout; a violation refuses
+    /// to boot naming the key. Fault: the order check removed ⇒ red.
+    #[test]
+    fn timeout_ordering_is_refused_at_boot() {
+        // The fixture's handler timeout is 5 s.
+        let with = |key: &str, value: &str| {
+            let mut values = raw();
+            values.insert(key.into(), value.into());
+            values
+        };
+        let statement = "HUMAUX_GATEWAY_PG_STATEMENT_TIMEOUT_MS";
+        let idle_txn = "HUMAUX_GATEWAY_PG_IDLE_IN_TRANSACTION_TIMEOUT_MS";
+        assert_eq!(rejected_key(with(statement, "5000")), statement);
+        assert_eq!(rejected_key(with(statement, "60000")), statement);
+        assert!(GatewayBootstrap::from_raw(with(statement, "4999")).is_ok());
+        assert_eq!(rejected_key(with(idle_txn, "5001")), idle_txn);
+        assert!(GatewayBootstrap::from_raw(with(idle_txn, "5000")).is_ok());
+        // The fixture's statement_timeout is 4000 ms.
+        let lock = "HUMAUX_GATEWAY_RATE_LOCK_TIMEOUT_MS";
+        assert_eq!(rejected_key(with(lock, "4000")), lock);
+        assert!(GatewayBootstrap::from_raw(with(lock, "3999")).is_ok());
+        match GatewayBootstrap::from_raw(with(statement, "5000")) {
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("lock_timeout < statement_timeout < handler timeout"),
+                "the refusal names the order: {error}"
+            ),
+            Ok(_) => panic!("statement_timeout = handler timeout must be refused"),
         }
     }
 

@@ -572,10 +572,11 @@ fn a_purged_bucket_answers_the_same_rate_decision() {
                 .map(|_| {
                     h.rt.block_on(quota_repo::consume_rate(
                         &h.runtime,
-                        RateSubject::PreauthIp(ip.parse().expect("ip")),
+                        RateSubject::PreauthIp(ip.parse().expect("ip"), 64),
                         "mcp.read",
                         "default",
                         policy,
+                        Duration::from_secs(2),
                     ))
                 })
                 .collect()
@@ -600,10 +601,11 @@ fn an_ipv6_64_preauth_bucket_goes_through_the_purge_door() {
             let consume = |h: &Handle, ip: &str| {
                 h.rt.block_on(quota_repo::consume_rate(
                     &h.runtime,
-                    RateSubject::PreauthIp(ip.parse().expect("ip")),
+                    RateSubject::PreauthIp(ip.parse().expect("ip"), 64),
                     "mcp.read",
                     "default",
                     policy,
+                    Duration::from_secs(2),
                 ))
             };
             assert_eq!(consume(&h, "2001:db8:5:6::1"), Ok(()));

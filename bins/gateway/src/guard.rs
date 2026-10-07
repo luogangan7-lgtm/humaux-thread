@@ -4,10 +4,10 @@
 //!   adapters::operation_receipt, adapters::postgres, adapters::quota_repo, adapters::remember,
 //!   adapters::request_guard_repo, application::supersede, domain::affect, domain::audit, domain::confirm,
 //!   domain::error, domain::identity, domain::ids, domain::selection, domain::subject, gateway::auth,
-//!   protocol::edge, protocol::mcp, protocol::mcp_catalog, telemetry::metrics]
+//!   protocol::edge, protocol::mcp, protocol::mcp_catalog, telemetry::admission, telemetry::metrics]
 //! Called-by: [gateway::bootstrap, gateway::main, gateway::mcp_application, gateway::memory, gateway::status, tests]
 //! Invariants: [transport owns HTTP validation only; this layer is the sole place that authenticates, authorizes and admits a request, so an operation that bypasses it is a bug, not a variant path]
-//! Spec: Baseline §83; §52.1; ADR-0018; ADR-0028; ADR-0030; ADR-0054
+//! Spec: Baseline §83; §52.1; ADR-0018; ADR-0028; ADR-0030; ADR-0054; ADR-0065 D-D
 //!
 //! Transport owns HTTP validation; this layer owns authentication through finalization.
 
@@ -22,7 +22,9 @@ use humaux_adapters::{
     confirm_token_repo::{self, ConfirmationClaim},
     operation_receipt::{self, AtomicRememberRequest, AtomicRememberResult},
     postgres::RuntimeDbPool,
-    quota_repo::{self, QuotaReservation, RatePolicy, RateSubject},
+    quota_repo::{
+        self, QuotaReservation, RateCharge, RatePolicy, RateSubject, SHARED_RATE_OPERATION,
+    },
     remember::RememberCommand,
     request_guard_repo::{self, AuditTenant, EffectiveEntitlementFacts},
 };
@@ -80,6 +82,10 @@ pub struct GuardRatePolicies {
     pub user: RatePolicy,
     pub tenant: RatePolicy,
     pub operation: RatePolicy,
+    /// ADR-0065 D-D: `HUMAUX_GATEWAY_RATE_LOCK_TIMEOUT_MS`, the bound on a rate-bucket lock wait.
+    pub lock_timeout: Duration,
+    /// ADR-0065 D-E: `HUMAUX_GATEWAY_RATE_PREAUTH_IPV6_PREFIX_BITS`, the IPv6 prefix a pre-auth client is keyed by.
+    pub preauth_ipv6_prefix_bits: u8,
 }
 
 /// A handler receives an already narrowed resource route, not credential material.
@@ -186,7 +192,8 @@ impl GuardMetrics {
     }
 
     /// The six guard families seeded over their closed label sets, plus any recorded combination
-    /// outside them, through `write_family` (ADR-0061 D-A, D-C).
+    /// outside them, through `write_family` (ADR-0061 D-A, D-C); then the gateway's admission family, whose one
+    /// counter lives in `telemetry::admission` (ADR-0065 D-C).
     pub fn render(&self, out: &mut String) {
         let counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
         for family in GUARD_FAMILIES {
@@ -205,6 +212,7 @@ impl GuardMetrics {
                 .collect();
             write_family(out, family, &samples);
         }
+        humaux_telemetry::admission::render(out);
     }
 }
 
@@ -331,20 +339,22 @@ impl GatewayGuard {
         )
     }
 
-    async fn rate(
-        &self,
-        subject: RateSubject<'_>,
-        operation: &str,
-        bucket: &str,
-        policy: RatePolicy,
-        scope: &'static str,
-    ) -> Result<(), ErrorCode> {
-        let result = quota_repo::consume_rate(&self.pool, subject, operation, bucket, policy).await;
-        if result == Err(ErrorCode::RateLimited) {
-            self.metrics
-                .increment(&families::RATE_LIMIT_REJECTED_TOTAL, &[scope]);
+    /// ADR-0065 D-D: the post-auth charges of one request in one transaction; a denial counts
+    /// `rate_limit_rejected_total` under the scope of the charge that was denied, as the sequential path did.
+    async fn rate(&self, charges: Vec<(RateCharge<'_>, &'static str)>) -> Result<(), ErrorCode> {
+        let (charges, scopes): (Vec<_>, Vec<_>) = charges.into_iter().unzip();
+        match quota_repo::consume_rate_batch(&self.pool, &charges, self.settings.rates.lock_timeout)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err((code, i)) => {
+                if code == ErrorCode::RateLimited {
+                    self.metrics
+                        .increment(&families::RATE_LIMIT_REJECTED_TOTAL, &[scopes[i]]);
+                }
+                Err(code)
+            }
         }
-        result
     }
 
     async fn authenticate(
@@ -410,14 +420,21 @@ impl GatewayGuard {
         let result = if !self.network_allowed(&network, None) {
             Err(ErrorCode::Forbidden)
         } else {
-            self.rate(
-                RateSubject::PreauthIp(network.client_ip),
-                "mcp",
+            let rates = &self.settings.rates;
+            let result = quota_repo::consume_rate(
+                &self.pool,
+                RateSubject::PreauthIp(network.client_ip, rates.preauth_ipv6_prefix_bits),
+                SHARED_RATE_OPERATION,
                 "preauth",
-                self.settings.rates.preauth_ip,
-                "ip",
+                rates.preauth_ip,
+                rates.lock_timeout,
             )
-            .await
+            .await;
+            if result == Err(ErrorCode::RateLimited) {
+                self.metrics
+                    .increment(&families::RATE_LIMIT_REJECTED_TOTAL, &["ip"]);
+            }
+            result
         };
         if let Err(code) = result {
             self.audit(
@@ -466,51 +483,58 @@ impl GatewayGuard {
         result
     }
 
+    /// ADR-0065 D-D: credential/shared, user (when present), tenant, credential/operation — the evaluation order of
+    /// the former four transactions; the repository takes their locks in tier order.
     async fn postauth_rate(
         &self,
         auth: &AuthorizationScope,
         operation: &str,
     ) -> Result<(), ErrorCode> {
-        self.rate(
-            RateSubject::Credential {
-                auth,
-                credential_id: auth.principal().0,
-            },
-            "mcp",
-            "credential",
-            self.settings.rates.credential,
-            "credential",
-        )
-        .await?;
-        if auth.user_id().is_some() {
-            self.rate(
-                RateSubject::User(auth),
-                "mcp",
-                "user",
-                self.settings.rates.user,
-                "user",
-            )
-            .await?;
-        }
-        self.rate(
-            RateSubject::Tenant(auth),
-            "mcp",
-            "tenant",
-            self.settings.rates.tenant,
-            "tenant",
-        )
-        .await?;
-        self.rate(
-            RateSubject::Credential {
-                auth,
-                credential_id: auth.principal().0,
-            },
+        let rates = &self.settings.rates;
+        let credential = || RateSubject::Credential {
+            auth,
+            credential_id: auth.principal().0,
+        };
+        let charge = |subject, operation, bucket_key, policy| RateCharge {
+            subject,
             operation,
+            bucket_key,
+            policy,
+        };
+        let mut charges = vec![(
+            charge(
+                credential(),
+                SHARED_RATE_OPERATION,
+                "credential",
+                rates.credential,
+            ),
+            "credential",
+        )];
+        if auth.user_id().is_some() {
+            charges.push((
+                charge(
+                    RateSubject::User(auth),
+                    SHARED_RATE_OPERATION,
+                    "user",
+                    rates.user,
+                ),
+                "user",
+            ));
+        }
+        charges.push((
+            charge(
+                RateSubject::Tenant(auth),
+                SHARED_RATE_OPERATION,
+                "tenant",
+                rates.tenant,
+            ),
+            "tenant",
+        ));
+        charges.push((
+            charge(credential(), operation, "operation", rates.operation),
             "operation",
-            self.settings.rates.operation,
-            "operation",
-        )
-        .await
+        ));
+        self.rate(charges).await
     }
 
     /// Only local reads with no external provider cost can use this entry.

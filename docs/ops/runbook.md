@@ -783,6 +783,65 @@ line whenever the provider or model changes** — it is a property of the deploy
 constant. `docs/ops/soak.md` §"Size the load to the distill hop's capacity" has the full rule and
 what it looks like when it is violated.
 
+### 8.1 Gateway admission and pool (dev-host)
+
+ADR-0065. Every key below is required with no default: a gateway without it, or with it empty, refuses
+to boot naming the key. The values are **dev-host start values, A5 re-measure required** (10 CPU,
+PostgreSQL in a 3.8 GiB Docker VM). This table stays titled "(dev-host)" until card 39's gate
+`a5_load_remeasure` has run the same `cargo xtask load` phases on the 4-vCPU / 24 GiB ARM host
+(open item O-1). Each value cites the ADR-0065 line it rests on ("Measurement" → AFTER, run `after-fix` 2026-10-07
+11:12, `host=10cpu-vm3.8`).
+
+| Key (`HUMAUX_GATEWAY_…`) | Start value | Why this value | Boot rule |
+|---|---|---|---|
+| `ADMISSION_CONCURRENCY` (C) | 16 | §67.2; `SWEEP C=8/16/24`: same throughput, C only trades enumerate p95 against tools/list p95 | ≥ 1 |
+| `ADMISSION_QUEUE_DEPTH` (Q) | 64 | §67.2 | ≥ 0 (0 = no waiting) |
+| `ADMISSION_MAX_WAIT_MS` (W) | 5000 | §67.2; `LOAD BURST` 503 p100 within W + 200 ms | > 0 |
+| `ADMISSION_PER_KEY_LIMIT` (K) | 8 | = C / 2, measured: at K = C one key held every permit and tenant B's p95 was 2.5× its baseline; K = 8 gives 1.8× (`ISO_RATIO`); K = C + Q gives 9.4× (F-K) | 1 ≤ K ≤ C + Q |
+| `ADMISSION_BODY_READ_TIMEOUT_MS` (B) | 5000 | protective bound: `MAX_REQUEST_BODY_BYTES` / B is the slowest accepted upload | > 0, ≤ handler timeout |
+| `PG_POOL_MAX_CONNECTIONS` (P) | 18 | P = C·k + 2 + H, k = 1, H = 0: `LOAD L64` 0 drops, 0 acquire timeouts (D-A) | ≥ 1 |
+| `PG_POOL_MIN_CONNECTIONS` | 2 | keeps two connections warm | ≤ max |
+| `PG_ACQUIRE_TIMEOUT_MS` | 1000 | fail as `DEPENDENCY_UNAVAILABLE` long before the handler timeout | > 0 |
+| `PG_IDLE_TIMEOUT_SECONDS` / `PG_MAX_LIFETIME_SECONDS` | 300 / 1800 | sqlx's lifetime default; idle shortened | > 0; lifetime > idle |
+| `PG_STATEMENT_TIMEOUT_MS` | 10000 | below the 20 s handler timeout, so the server cancels first (D-B) | lock < statement < handler |
+| `PG_IDLE_IN_TRANSACTION_TIMEOUT_MS` | 10000 | same scale | > 0, ≤ handler |
+| `RATE_LOCK_TIMEOUT_MS` | 2000 | the former literal (D-D) | > 0, < statement |
+| `RATE_PREAUTH_IPV6_PREFIX_BITS` | 64 | one bucket per IPv6 /64 (D-E) | 1..=128 |
+
+Measured (`LOAD` lines in ADR-0065 "Measurement", each with its n):
+
+| Phase (LA clients) | BEFORE: HEAD, no admission, sqlx pool 10 (2026-10-06, `host=10cpu-vm3.8`) | AFTER: start values above (2026-10-07 `after-fix`, `host=10cpu-vm3.8`) |
+|---|---|---|
+| L8 enumerate p95 | 71.1 ms (n = 4917) | 65.4 ms (n = 5580) |
+| L16 enumerate p95 | 136.8 ms (n = 5076) | 263.1 ms (n = 5658; p50 87.5 ms; not the tenant lock, ADR-0065 L16) |
+| L32 enumerate p95 | 258.4 ms (n = 5029) | 353.2 ms (n = 5666) |
+| L64 enumerate p95 | 488.2 ms (n = 5052), 0 failed, 0 drops | 542.4 ms (n = 5616), 0 failed, 0 drops |
+| L64 tenant-lock wait (`LOCKWAIT`) | not measured | p99 9.7 ms over 8974 takes, longest 100.9 ms (resolution 10 ms) |
+| BURST (128) enumerate p95 | 1067.6 ms (n = 2136), 0 refused: nothing bounds the queue | 607.1 ms (n = 2572) admitted; 960 `queue_full` 503s |
+| BURST-W (W = 1 ms) | not run (no admission) | 1680 `wait_timeout` 503s, 0 failed |
+| tenant B p95 next to a 64-client one-key burst | ≈ 45 ms → ≈ 500 ms, median ratio 11.40 over 3 pairs | 40–41 ms → 71–73 ms, median ratio 1.78 (K = 8) |
+| throughput | flat ≈ 155 calls/s from L8 to BURST | flat ≈ 178 calls/s from L16 up (CPU-bound host) |
+| PG backends peak | 24 client backends, role_gateway 11 | 34 client backends, role_gateway 20 (18 + the rehearsal gateway's 2) |
+
+**Reading a gateway 503.** An MCP request refused by admission gets `503`, an integer `Retry-After`
+(1–30 s) and the text body `RATE_LIMITED`; the process is healthy and full. `/readyz` and `/livez`
+are outside admission, so only `/readyz` → `503` means "do not route here" (`docs/ops/supervision.md`).
+`admission_rejected_total{class="gateway_inbound",reason}` tells which bound refused it; the
+`AdmissionRejected` alert fires on any increase over 5 min:
+
+| `reason` | What filled up | First thing to check |
+|---|---|---|
+| `key_limit` | one credential has K requests in flight or waiting | which client fans out on one key; give it more keys or lower its concurrency |
+| `queue_full` | C requests in flight and Q waiting | service time: `/status`, PG backends of `role_gateway`, slow statements |
+| `wait_timeout` | a waiter got no permit within W | the same, sustained; a provider blip on recall holds permits for one provider timeout each (ADR-0065 L12) |
+
+A `DEPENDENCY_UNAVAILABLE` 503 without `Retry-After` is not admission: it is a pool acquire past
+`PG_ACQUIRE_TIMEOUT_MS`, a statement past `PG_STATEMENT_TIMEOUT_MS`, or a rate-lock wait past
+`RATE_LOCK_TIMEOUT_MS`. Abandoned statements keep their pool slot until statement_timeout ends them
+(ADR-0065 L13), so a burst of handler timeouts can show up as acquire failures for up to that long.
+Re-measure with `LOAD_LEVELS=8,16,32,64 LOAD_BURST=128 zsh docs/ops/rehearse.sh` (the load step seeds and
+tears down its own two tenants, ADR-0065 R-8) whenever the host, PostgreSQL sizing or the op mix changes.
+
 ## 9. Operating rules that outrank convenience
 
 - **Never kill by port.** `lsof -ti :PORT | xargs kill` and `fuser -k` are banned. On 2026-09-09

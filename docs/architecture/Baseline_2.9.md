@@ -342,7 +342,7 @@ precheck -> migrate -> verify -> rollback/forward-fix plan
 剩余空间        召回 34–35 / 排序 6–7 / 交付 5 / 判定分辨率 4
 ```
 
-仍需实测确定的只有四项，且必须在 A5 的同规格单机上测：Qdrant 段内存上限、Postgres pool size、各 worker 并发上限、rerank token budget。
+仍需实测确定的只有四项，且必须在 A5 的同规格单机上测：Qdrant 段内存上限、Postgres pool size、各 worker 并发上限、rerank token budget。Postgres pool size（gateway）：dev-host 起始值（ADR-0065 D-A，P = C·k + 2 + H，起始 C = 16、P = 18；HEAD sqlx 默认 10 连接的 BEFORE 实测 L64 n=7203，measured_at=2026-10-06T20:41:35Z，host=10cpu-vm3.8；起始值的 AFTER `LOAD` 行由 ADR-0065 Measurement 给出）；A5 同规格复测仍必需（card 39 的闸 `a5_load_remeasure`，open item O-1），该闸变绿前本项不算关闭，也不从 dev 主机写 `ops.mechanism_observations` 行。各 worker 池与并发上限归 card 38b（ADR-0065 R-3）。（§78.6：ADR-0065 R-9）
 
 **当时提出的对策 → 现行落点 §1.14 G4**（保鲜闸：runtime Observation `measured_at` 距检查日 >90 天，或 `admin:` 行返回 `scanned_n==0` ⇒ derived_status=`STALE`；相关 DoD 失效）。**§1.14 是本章唯一保留冻结地位的子节**，判据正文在那里，本行只是指针。
 
@@ -9727,7 +9727,7 @@ Trace / logs with protected access
 | `pg_only_objects` / `qdrant_only_objects` | §17 双写对账扫描收尾 · 各 1 | gauge·条 | §65 Repair Jobs |
 | `jobs_pending` / `jobs_processing` / `jobs_waiting_key` / `jobs_dead` | §31 队列：同一次 `ops.health_snapshot()` 采样（`humaux-maintenance health serve`），`telemetry::health::publish` 内四个 `.set()` · 各 1（ADR-0061 D-D / 裁定 E3） | gauge·条 | §42 dead letter increase；§42 health gauges absent（`jobs_dead`） |
 | `oldest_pending_age_seconds` | §31 同一次 `ops.health_snapshot()` 采样取 `now() - min(enqueued_at)`（`ops.jobs` 的入队时刻列名是 `created_at`）· 1（ADR-0061 D-D） | gauge·秒 | §39 NO_OUTPUT；§42 队列停摆（规则未装载，ADR-0061 limits） |
-| `admission_rejected_total{class}` | §67 admission control 返 503 处 · 1 | counter·次 | §67 单机档；§54 |
+| `admission_rejected_total{class, reason}` | §67 admission control 返 503 处 · 1（`class` = `gateway_inbound`；`reason` ∈ {`queue_full`, `wait_timeout`, `key_limit`}；ADR-0065 D-C） | counter·次 | §67 单机档；§54；§42 admission rejected |
 | `private_distill_runs_total` / `private_distill_outputs_total` | §11 每次 run / 每条产出 · 各 1 | counter·次 / counter·条 | §39 Stage Liveness；§42 no-output stage |
 | `public_releases_total` / `public_syntheses_total` / `public_conflicts_total` / `public_provenance_orphans_total` | §12 公共管线各阶段 · 各 1 | counter·条 | §42 public provenance orphan |
 | `private_reasoning_usage_total` / `public_reasoning_usage_total` | §11 / §12 推理调用返回读 usage · 各 1 | counter·token | §35 quota |
@@ -12512,7 +12512,7 @@ OpenBao: dev stub 允许 —— production forbidden
 | PostgreSQL | 必需 | 唯一事实源 |
 | Qdrant | 必需，单节点 | 向量召回不可省 |
 | **Valkey** | **可省** | 单机内不需要第二个跨进程数据库；省 ~1 GB RSS 与一整个故障面 |
-| rate limit | **PG advisory lock + `control.rate_buckets`** | `pg_try_advisory_xact_lock(hashtext(tenant‖bucket))` + 表内令牌桶；单机无竞争节点，PG 本身即串行点 |
+| rate limit | **PG advisory lock + `control.rate_buckets`** | 一个事务内按层级锁序（tenant > user > credential/mcp > credential/op）逐桶阻塞 `pg_advisory_xact_lock(hashtextextended(...))`，`lock_timeout` 取自 `HUMAUX_GATEWAY_RATE_LOCK_TIMEOUT_MS`，+ 表内令牌桶；单机无竞争节点，PG 本身即串行点（ADR-0065 D-D） |
 | 查询/嵌入/rerank 缓存（§51） | 进程内 `moka` LRU | 单进程即全部，Valkey 只多一跳 |
 | OpenBao | 必需，raft 单节点 | 见 67.3，dev stub 在本档仍 forbidden |
 | 对象存储 | 外部 S3-compatible 优先；OSS reference 可选 SeaweedFS | 原件必须有独立/异地副本；**已归档的 MinIO Community 不作为新部署默认** |
@@ -12553,6 +12553,8 @@ retrieval-provider in-flight       # 不写死；由 RPM/TPM + tenant fairness +
                          error code RATE_LIMITED（§52）
                          指标 admission_rejected_total{class}
 ```
+
+gateway 入站的落地形态（ADR-0065 D-C，§78.6）：请求体先在 `HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS`（B）与 `HUMAUX_GATEWAY_MAX_REQUEST_BODY_BYTES` 内整体读完（超大 413、超时 408），读完之前不占任何 admission 状态，慢上传因此占不住并发槽；随后按凭证（`Authorization` 原值 SHA-256 前 8 字节，未鉴权、只决定公平不决定授权）占每凭证上限 K（`HUMAUX_GATEWAY_ADMISSION_PER_KEY_LIMIT`，1 ≤ K ≤ C+Q，比全局上限更严的拒绝），再取全局并发 C、等待者上限 Q、等待上限 W。溢出的 503 带 `Retry-After`（整数秒，下限 1、上限 30）与 pre-parse 文本体 `RATE_LIMITED`（不建 JSON-RPC envelope）；`admission_rejected_total` 的 `class` 取值 `gateway_inbound`，另带 `reason` ∈ {`queue_full`, `wait_timeout`, `key_limit`}，每个 503 恰 +1，不逐条记日志。`/livez`、`/readyz` 不经过 admission。
 
 **本档明确不承诺的 SLO**（写进 §54 与合同，不许被读成"暂时没达标"）：
 

@@ -1,9 +1,9 @@
 //! `gateway::main` — `humaux-gateway` 进程入口（最小必要进程集见 §4.2；admin 探针契约见 §4.4）。
 //! Depends-on: crates=[axum, humaux-telemetry, tokio]; services=[HTTP(loopback)]; env=[]; modules=[gateway::bootstrap,
-//!   gateway::guard, gateway::status, telemetry::metrics]
+//!   gateway::admission, gateway::guard, gateway::status, telemetry::metrics]
 //! Called-by: [process(humaux-gateway)]
 //! Invariants: [/readyz flips to 503 and the accept loop keeps draining for DRAIN_ANNOUNCE_WINDOW before closing, so a k8s readinessProbe never sees ECONNREFUSED confused with a crash; the ops listener stays up through the drain window and closes after it; `--metrics-families` reads no configuration]
-//! Spec: Baseline §4.2; §4.4; ADR-0037; ADR-0061 D-B; ADR-0061 D-F
+//! Spec: Baseline §4.2; §4.4; §67.2; ADR-0037; ADR-0061 D-B; ADR-0061 D-F; ADR-0065 D-C
 //!
 //! ## Supervision surface (card 15, ADR-0037)
 //!
@@ -43,6 +43,7 @@ use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{Router, http::StatusCode, routing::get};
 use humaux_gateway::{
+    admission,
     bootstrap::GatewayBootstrap,
     guard::GuardMetrics,
     status::{METRICS_ADDR_KEY, Readiness, Verdict, render_metrics},
@@ -52,8 +53,8 @@ use humaux_telemetry::metrics::{Routes, serve_loopback};
 /// How long the process keeps accepting connections AFTER readiness has gone false, so a
 /// supervisor that dials a new connection per poll actually observes `503 draining` instead of
 /// the ECONNREFUSED it cannot tell from a crash. Must exceed one readiness poll period; the
-/// supervisor's SIGTERM→SIGKILL grace must exceed it plus the longest in-flight request
-/// (docs/ops/supervision.md §3).
+/// supervisor's SIGTERM→SIGKILL grace must exceed it + the body-read bound B + the admission wait W + the handler and
+/// finalize timeouts (ADR-0065 D-C; docs/ops/supervision.md §3).
 // ponytail: one constant, not a config key — every `HUMAUX_GATEWAY_*` key is declared in
 // `bootstrap::registry()` and feeds the config fingerprint, and a drain window is not a
 // fingerprint input. Promote it there if a deployment's readiness period ever exceeds 5s.
@@ -114,10 +115,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
     let listener = tokio::net::TcpListener::bind(runtime.bind_addr()).await?;
-    let app = runtime
-        .adapter()
-        .router()
-        .merge(supervision_routes(readiness.clone()));
+    // ADR-0065 D-C: admission wraps the MCP router only; /livez and /readyz are merged outside it.
+    let app = admission::wrap(
+        runtime.adapter().router(),
+        supervision_routes(readiness.clone()),
+        runtime.admission(),
+    );
 
     // Both handlers are installed before `axum::serve` exists: `tokio::signal::ctrl_c()` only
     // registers SIGINT on the shutdown future's first poll (inside `serve`), so a Ctrl-C landing

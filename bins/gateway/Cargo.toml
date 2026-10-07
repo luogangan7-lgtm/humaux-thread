@@ -40,7 +40,7 @@ hex = "0.4"
 # why: timestamps (OffsetDateTime, RFC3339); used-by: [gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, tests]
 time = { version = "0.3", features = ["parsing"] }
 # why: async runtime; used-by: [gateway::bootstrap, gateway::guard, gateway::main, gateway::mcp_application, gateway::retrieval_embedding_client, tests]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "signal", "sync"] }
 # why: UUID ids (v7) and parsing; used-by: [gateway::bootstrap, gateway::context, gateway::guard, gateway::mcp_application, gateway::memory, gateway::recall, gateway::remember, gateway::retrieval_embedding_client, tests]
 uuid = { version = "1.25.0", features = ["v7", "serde"] }
 # why: runtime SQL through the typed per-role pools; used-by: [tests]

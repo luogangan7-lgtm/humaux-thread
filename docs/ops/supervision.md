@@ -193,7 +193,7 @@ that path, precisely so a `0` can never be manufactured downstream.
 
 | process | policy | grace period (SIGTERM → SIGKILL) |
 |---|---|---|
-| `humaux-gateway` | always restart | ≥ **5 s drain window** + the longest request timeout |
+| `humaux-gateway` | always restart | > **5 s drain window** + B + W + handler timeout + finalize timeout (ADR-0065 D-C) |
 | `humaux-retrieval-worker --serve-rpc` | always restart | ≥ one embedding call |
 | `humaux-retrieval-worker --serve` | always restart | **≥ one projection pass** = `HUMAUX_RETRIEVAL_WORKER_BATCH` × worst-case ticket time (embed timeout + 3 × the 10 s Qdrant timeout + PG) |
 | `humaux-private-worker --serve-rpc` | always restart | ≥ one inference call |
@@ -249,8 +249,19 @@ Two consequences:
 
 - set the readiness poll period **below** 5 s, or a supervisor can step straight over the
   draining state;
-- size `terminationGracePeriodSeconds` / `TimeoutStopSec` **above** 5 s plus the longest
-  in-flight request, or the SIGKILL lands during the announced drain.
+- size `terminationGracePeriodSeconds` / `TimeoutStopSec` **above**
+  `DRAIN_ANNOUNCE_WINDOW` (5 s) + `HUMAUX_GATEWAY_ADMISSION_BODY_READ_TIMEOUT_MS` (B) +
+  `HUMAUX_GATEWAY_ADMISSION_MAX_WAIT_MS` (W) + `HUMAUX_GATEWAY_HANDLER_TIMEOUT_SECONDS` +
+  `HUMAUX_GATEWAY_FINALIZE_TIMEOUT_SECONDS`, or the SIGKILL lands during the announced drain
+  (ADR-0065 D-C). A request still reading its body is bounded by B, a queued request by W, an
+  admitted one by the handler and finalize timeouts. A connection stalled inside its request
+  headers is not bounded (axum sets no header-read timer; ADR-0065 L14).
+
+**Admission 503 is not `/readyz` 503.** An MCP request refused by the admission layer gets
+`503` + `Retry-After` + body `RATE_LIMITED`: the process is healthy and full, the client should
+back off and retry. `/readyz` and `/livez` sit outside that layer, so a full gateway still
+answers its probes, and only `/readyz` → `503 {"status":…}` means "do not route here"
+(ADR-0065 D-C). Never point a liveness or readiness probe at `/mcp`.
 
 **Probe timeouts.** A down Qdrant fails the readiness probe in well under a second, and so does
 a PostgreSQL whose port actively refuses the connection. A PostgreSQL that is *unreachable*

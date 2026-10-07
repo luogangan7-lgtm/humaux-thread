@@ -45,6 +45,37 @@ pub fn backup_yml() -> PathBuf {
     root().join("deploy/compose/backup.yml")
 }
 
+/// A loopback port nothing on the HOST holds right now. Docker's port allocator is another ledger: a container of
+/// another project may already publish this port, which only `compose up` can tell ([`Source::up`] retries then).
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("a free loopback port")
+        .port()
+}
+
+/// True for Docker's "port is already allocated" refusal on an attempt that still has retries left - the one
+/// failure of `compose up` that a fresh port cures (card-38 chain run 1, 2026-10-07).
+fn port_collision_is_retried(compose_output: &str, attempt: u32, attempts: u32) -> bool {
+    attempt + 1 < attempts && compose_output.contains("port is already allocated")
+}
+
+#[test]
+fn a_port_collision_is_retried_only_for_that_error_and_only_while_attempts_remain() {
+    let busy = "Error response from daemon: ... Bind for 127.0.0.1:55948 failed: port is already allocated";
+    assert!(port_collision_is_retried(busy, 0, 3));
+    assert!(port_collision_is_retried(busy, 1, 3));
+    assert!(
+        !port_collision_is_retried(busy, 2, 3),
+        "the last attempt panics instead of looping"
+    );
+    assert!(!port_collision_is_retried(
+        "Error response from daemon: no such image",
+        0,
+        3
+    ));
+}
+
 fn text(out: &Output) -> String {
     format!(
         "{}{}",
@@ -147,7 +178,7 @@ pub struct Source {
     pub dir: PathBuf,
     /// `HUMAUX_PG_REPO_DIR`: the repository filesystem's mount point (`repo/` lives under it).
     pub repo_dir: PathBuf,
-    env: Vec<(String, String)>,
+    env: std::cell::RefCell<Vec<(String, String)>>,
     oneshots: Vec<String>,
     _one: MutexGuard<'static, ()>,
 }
@@ -210,10 +241,7 @@ impl Source {
         let dir = std::env::temp_dir().join(&name);
         let repo_dir = dir.join("mnt");
         std::fs::create_dir_all(&repo_dir).expect("scratch directory");
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .expect("a free loopback port")
-            .port();
+        let port = free_loopback_port();
         let env = vec![
             ("HUMAUX_PG_IMAGE".to_owned(), IMAGE.to_owned()),
             ("HUMAUX_PG_CONTAINER".to_owned(), name.clone()),
@@ -243,7 +271,7 @@ impl Source {
             name,
             dir,
             repo_dir,
-            env,
+            env: std::cell::RefCell::new(env),
             oneshots: Vec::new(),
             _one: one,
         };
@@ -260,7 +288,12 @@ impl Source {
             cmd.arg("-f").arg(f);
         }
         cmd.args(["-p", &self.name]).args(args);
-        cmd.envs(self.env.iter().map(|(k, v)| (k, v)));
+        cmd.envs(
+            self.env
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
         cmd.output().map_err(|e| format!("docker compose: {e}"))
     }
 
@@ -273,15 +306,27 @@ impl Source {
             std::fs::write(&extra_file, extra).expect("extra override");
             vec![extra_file.as_path()]
         };
-        let out = self
-            .compose(&files, &["up", "-d", "--force-recreate"])
-            .expect("compose up");
-        assert!(
-            out.status.success(),
-            "compose up {}: {}",
-            self.name,
-            text(&out)
-        );
+        const ATTEMPTS: u32 = 3;
+        for attempt in 0..ATTEMPTS {
+            let out = self
+                .compose(&files, &["up", "-d", "--force-recreate"])
+                .expect("compose up");
+            if out.status.success() {
+                return;
+            }
+            let output = text(&out);
+            if port_collision_is_retried(&output, attempt, ATTEMPTS) {
+                // another container already publishes the host port the probe found free (Docker keeps its own ledger)
+                let port = free_loopback_port();
+                self.env
+                    .borrow_mut()
+                    .iter_mut()
+                    .filter(|(k, _)| k == "HUMAUX_PG_PORT")
+                    .for_each(|(_, v)| *v = port.to_string());
+                continue;
+            }
+            panic!("compose up {}: {output}", self.name);
+        }
     }
 
     /// Waits for the entrypoint's first-boot initdb (if any) and then for the final server.
@@ -438,7 +483,12 @@ impl Source {
         ]);
         cmd.args(["-e", "PGBACKREST_REPO1_CIPHER_PASS"]);
         cmd.args(args);
-        cmd.envs(self.env.iter().map(|(k, v)| (k, v)));
+        cmd.envs(
+            self.env
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
         let out = cmd.output().expect("docker run");
         assert!(out.status.success(), "docker run {name}: {}", text(&out));
         name
@@ -500,13 +550,15 @@ impl Source {
     /// Sets one of this source's compose variables (e.g. `HUMAUX_PG_LISTEN_ADDRESSES` = `*` for a TCP source);
     /// takes effect at the next [`Source::restart`].
     pub fn set_env(&mut self, key: &str, value: &str) {
-        self.env.retain(|(k, _)| k != key);
-        self.env.push((key.to_owned(), value.to_owned()));
+        let mut env = self.env.borrow_mut();
+        env.retain(|(k, _)| k != key);
+        env.push((key.to_owned(), value.to_owned()));
     }
 
     /// One of this source's compose variables (throwaway values only; never printed by the support module).
     pub fn env_value(&self, key: &str) -> String {
         self.env
+            .borrow()
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.clone())

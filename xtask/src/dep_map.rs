@@ -5247,11 +5247,13 @@ mod tests {
     #[test]
     fn callsite_patterns_each_class_matches_and_channel_send_does_not() {
         let role = format!("\"SET LOCAL {} role_x\"", "ROLE");
+        // Assembled, so this fixture is not a second pool-builder site for the c38_one_pool_options_site gate.
+        let pool_builder = format!("{}::new()", "PgPoolOptions");
         let src = format!(
             "fn f() {{\n\
              Client::connect(&dsn, NoTls);\n\
              RuntimeDbPool::connect(&cfg);\n\
-             PgPoolOptions::new();\n\
+             {pool_builder};\n\
              c.begin();\n\
              c.build_transaction();\n\
              q.execute(&self.pool);\n\

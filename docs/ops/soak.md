@@ -248,6 +248,28 @@ token_malformed | token_not_issued` (the class only, never the token).
   wire latency `search()` itself accounts for; `docs/ops/rehearse.sh` asserts ≥ 90 %
   (`recall_stage_sum_covers_90pct_of_recall_p50`);
 - `tenants` — per lane: ticket census, plus two rates that are metrics rather than assertions.
+- `first_attempt_failure_rate` — `{value, unit, n}`: the fraction of calls whose first attempt
+  failed (a retried call counts here), informational and never graded; see "The retry rule".
+
+### The retry rule (ADR-0065 D-G)
+
+The soak client is a well-behaved MCP client. A call answered HTTP 503, or failed with a wire code
+in {`DEPENDENCY_UNAVAILABLE`, `PROVIDER_TRANSIENT`, `RATE_LIMITED`}, is sent **once** more: after
+the answer's `Retry-After` seconds when it carries one (the §67.2 admission refusal does), else
+after a uniform 500–1500 ms jitter. Never a second retry, and a transport error or any other
+code (`INVALID_INPUT` included) is not retried. The answer after the retry is the call's answer:
+
+- `op_failure_rate` scores calls still failed after the retry; the 1 % bound is unchanged;
+- `ryw_replay_answered` counts a replay as answered if its retry answered;
+- `latency[].retried_calls` counts, per operation, the calls that were retried; a retried call's
+  latency includes the pause (it is what the client waited);
+- a run whose `first_attempt_failure_rate` is above 0.05 prints
+  `soak: WARN first_attempt_failure_rate = … (n=…) above 0.05` — a finding to explain, not a red.
+
+What the retry does not cover: a correlated provider blip (card 31: about an hour) still fails
+recalls on both attempts, and that `op_failure_rate` red is correct — recall really was
+unavailable. The retry covers uncorrelated single failures only (ADR-0065 Debt A, L12). Each
+retry prints `soak: <op> retried once on lane <sentinel> (ADR-0065 D-G)` on stderr.
 
 ### The two rates that are metrics, not failures
 

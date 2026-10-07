@@ -10,8 +10,11 @@
 //! Invariants: [the only file that names sqlx::PgPool: eight typed pools, one per role (§6.2.3), each connect checks
 //!   current_user and fails with PoolInitError::RoleMismatch on a wrong role; no raw-pool accessor leaves the crate;
 //!   the ninth, MigratorDbPool, refuses every §6.2.0 role and any principal without CREATEROLE (ADR-0059 D-E);
-//!   RetentionExecutor wraps it and also refuses a non-SUPERUSER session_user (ADR-0063 D-H)]
-//! Spec: Baseline §58; §6.2.3; §15.4; §15.2; §6.2.2; ADR-0059; ADR-0063 D-H
+//!   RetentionExecutor wraps it and also refuses a non-SUPERUSER session_user (ADR-0063 D-H); `open` holds the
+//!   workspace's one pool-builder site: PoolSettings (only RuntimeDbPool::connect_with today) sizes the pool and sets
+//!   statement_timeout / idle_in_transaction_session_timeout as startup options (pg_settings source = client), never a
+//!   role GUC (ADR-0065 D-A / D-B); every other pool keeps the sqlx defaults until card 38b]
+//! Spec: Baseline §58; §6.2.3; §15.4; §15.2; §6.2.2; ADR-0059; ADR-0063 D-H; ADR-0065 D-A / D-B
 //!
 //! Spec canonical path is `crates/adapters/postgres/src/pools.rs`; this repo's crate layout
 //! (§58) flattens adapters into `crates/adapters/src/<name>.rs` modules, so **this file IS
@@ -40,9 +43,11 @@
 //! compile-pass ports; all eight wrappers use the same `connect_checked` construction path.
 
 use std::fmt;
+use std::str::FromStr;
+use std::time::Duration;
 
 use humaux_domain::error::ErrorCode;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
 /// Literal `current_user` a [`RuntimeDbPool`] connection must report (§6.2.3 assertion E).
@@ -97,20 +102,74 @@ impl std::error::Error for PoolInitError {
     }
 }
 
-/// The *only* place in the crate that constructs a bare [`PgPool`]; every wrapper's `connect`
-/// calls through here and then checks the connected identity before handing the pool out.
-async fn open(dsn: &str) -> Result<PgPool, PoolInitError> {
-    // dep: PostgreSQL(any) — connects to PostgreSQL
-    PgPoolOptions::new()
-        .connect(dsn)
+/// ADR-0065 D-A / D-B: one process's sized pool, every field from that process's registered keys (§78.1; the
+/// caller validates the bounds and the order lock_timeout < statement_timeout < handler timeout at boot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolSettings {
+    /// Pool ceiling P (ADR-0065 D-A: P = C·k + 2 + H).
+    pub max_connections: u32,
+    /// Connections the pool keeps open while idle.
+    pub min_connections: u32,
+    /// How long `acquire` waits for a free connection before `PoolTimedOut`.
+    pub acquire_timeout: Duration,
+    /// An idle connection above `min_connections` is closed after this long.
+    pub idle_timeout: Duration,
+    /// Every connection is closed after this age.
+    pub max_lifetime: Duration,
+    /// Server-side `statement_timeout` of every session of this pool (a startup option, `pg_settings.source =
+    /// client`).
+    pub statement_timeout: Duration,
+    /// Server-side `idle_in_transaction_session_timeout` of every session of this pool (a startup option).
+    pub idle_in_transaction_timeout: Duration,
+    /// `application_name` of every session, so `pg_stat_activity` names the process.
+    pub application_name: String,
+}
+
+/// The *only* place in the workspace that constructs a bare [`PgPool`]; every wrapper's `connect`
+/// calls through here and then checks the connected identity before handing the pool out. `None` keeps the sqlx
+/// defaults (every pool but the gateway's until card 38b; ADR-0065 L1).
+async fn open(dsn: &str, settings: Option<&PoolSettings>) -> Result<PgPool, PoolInitError> {
+    // dep: PostgreSQL(any) — ADR-0065 D-A: the workspace's one pool builder; `settings` sizes it, `None` keeps sqlx defaults
+    let builder = PgPoolOptions::new();
+    let Some(s) = settings else {
+        // dep: PostgreSQL(any) — connects to PostgreSQL
+        return builder.connect(dsn).await.map_err(PoolInitError::Connect);
+    };
+    // ADR-0065 D-B: libpq startup options, applied once per session and kept across pooled reuse (sqlx issues no
+    // DISCARD ALL); never ALTER ROLE (pg_db_role_setting stays empty) and never an after_connect SET.
+    let options = PgConnectOptions::from_str(dsn)
+        .map_err(PoolInitError::Connect)?
+        .application_name(&s.application_name)
+        .options([
+            (
+                "statement_timeout",
+                s.statement_timeout.as_millis().to_string(),
+            ),
+            (
+                "idle_in_transaction_session_timeout",
+                s.idle_in_transaction_timeout.as_millis().to_string(),
+            ),
+        ]);
+    builder
+        .max_connections(s.max_connections)
+        .min_connections(s.min_connections)
+        .acquire_timeout(s.acquire_timeout)
+        .idle_timeout(Some(s.idle_timeout))
+        .max_lifetime(Some(s.max_lifetime))
+        // dep: PostgreSQL(any) — connects to PostgreSQL with the sized pool and its startup options
+        .connect_with(options)
         .await
         .map_err(PoolInitError::Connect)
 }
 
 /// Connects `dsn` and asserts `SELECT current_user` equals `expected_role` literally before
 /// handing back a pool (§6.2.3 assertion E).
-async fn connect_checked(dsn: &str, expected_role: &'static str) -> Result<PgPool, PoolInitError> {
-    let pool = open(dsn).await?;
+async fn connect_checked(
+    dsn: &str,
+    expected_role: &'static str,
+    settings: Option<&PoolSettings>,
+) -> Result<PgPool, PoolInitError> {
+    let pool = open(dsn, settings).await?;
     let row = sqlx::query("SELECT current_user")
         // dep: PostgreSQL(any) — executes a query against the pool
         .fetch_one(&pool)
@@ -132,7 +191,15 @@ pub struct RuntimeDbPool(PgPool);
 impl RuntimeDbPool {
     /// §6.2.3 assertion E: connects and verifies `current_user == "role_gateway"`.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
-        connect_checked(dsn, ROLE_GATEWAY).await.map(Self)
+        connect_checked(dsn, ROLE_GATEWAY, None).await.map(Self)
+    }
+
+    /// ADR-0065 D-A / D-B: [`Self::connect`] with the gateway's sized pool and its session timeouts as startup
+    /// options. The gateway's production bootstrap opens its pool only through here.
+    pub async fn connect_with(dsn: &str, settings: &PoolSettings) -> Result<Self, PoolInitError> {
+        connect_checked(dsn, ROLE_GATEWAY, Some(settings))
+            .await
+            .map(Self)
     }
 
     /// ADR-0061 D-F readiness: one `SELECT 1` through the checked pool. A pool that can no longer open or
@@ -163,7 +230,9 @@ pub struct BatchIssuerDbPool(PgPool);
 impl BatchIssuerDbPool {
     /// §6.2.3 assertion E: connects and verifies `current_user == "role_batch_issuer"`.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
-        connect_checked(dsn, ROLE_BATCH_ISSUER).await.map(Self)
+        connect_checked(dsn, ROLE_BATCH_ISSUER, None)
+            .await
+            .map(Self)
     }
 
     /// T3.2 `batch::begin_batch`'s pool accessor — see [`RuntimeDbPool::pool`]'s doc for why
@@ -181,7 +250,7 @@ pub struct ConsolidationDbPool(PgPool);
 impl ConsolidationDbPool {
     /// §6.2.3 assertion E: connects and verifies `current_user == "role_consolidation_worker"`.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
-        connect_checked(dsn, ROLE_CONSOLIDATION_WORKER)
+        connect_checked(dsn, ROLE_CONSOLIDATION_WORKER, None)
             .await
             .map(Self)
     }
@@ -200,7 +269,9 @@ pub struct PrivateWorkerDbPool(PgPool);
 impl PrivateWorkerDbPool {
     /// §6.2.3 assertion E: connects and verifies `current_user == "role_private_worker"`.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
-        connect_checked(dsn, ROLE_PRIVATE_WORKER).await.map(Self)
+        connect_checked(dsn, ROLE_PRIVATE_WORKER, None)
+            .await
+            .map(Self)
     }
 
     /// H3 (§74.6) outbox worker's pool accessor — see [`RuntimeDbPool::pool`]'s doc for why
@@ -222,7 +293,9 @@ pub struct RetrievalWorkerDbPool(PgPool);
 impl RetrievalWorkerDbPool {
     /// §6.2.3 assertion E: connects and verifies `current_user == "role_retrieval_worker"`.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
-        connect_checked(dsn, ROLE_RETRIEVAL_WORKER).await.map(Self)
+        connect_checked(dsn, ROLE_RETRIEVAL_WORKER, None)
+            .await
+            .map(Self)
     }
 
     /// T3.3 `humaux_adapters::stream_repo`'s pool accessor — see [`RuntimeDbPool::pool`]'s
@@ -246,7 +319,7 @@ pub struct AdminDbPool(PgPool);
 impl AdminDbPool {
     /// Connect and verify the actual database role before exposing any admin query.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
-        connect_checked(dsn, ROLE_ADMIN).await.map(Self)
+        connect_checked(dsn, ROLE_ADMIN, None).await.map(Self)
     }
 
     /// Internal access only; callers cannot use an admin handle as a writer pool.
@@ -258,7 +331,7 @@ impl AdminDbPool {
 impl MaintenanceDbPool {
     /// §6.2.3 assertion E: connects and verifies `current_user == "role_maintenance"`.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
-        connect_checked(dsn, ROLE_MAINTENANCE).await.map(Self)
+        connect_checked(dsn, ROLE_MAINTENANCE, None).await.map(Self)
     }
 
     /// T3.4 `humaux_adapters::stream_repo`'s pool accessor — see [`RuntimeDbPool::pool`]'s
@@ -274,7 +347,9 @@ pub struct PublicWorkerDbPool(PgPool);
 impl PublicWorkerDbPool {
     /// §6.2.3 assertion E: connects and verifies `current_user == "role_public_worker"`.
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
-        connect_checked(dsn, ROLE_PUBLIC_WORKER).await.map(Self)
+        connect_checked(dsn, ROLE_PUBLIC_WORKER, None)
+            .await
+            .map(Self)
     }
 
     /// Public contribution worker queries stay inside this crate so the checked role wrapper
@@ -298,7 +373,7 @@ impl MigratorDbPool {
     /// and is a superuser or holds CREATEROLE. Anything else is [`PoolInitError::RoleMismatch`].
     pub async fn connect(dsn: &str) -> Result<Self, PoolInitError> {
         const EXPECTED: &str = "a superuser or CREATEROLE principal outside the §6.2.0 role set";
-        let pool = open(dsn).await?;
+        let pool = open(dsn, None).await?;
         let row = sqlx::query(
             "SELECT current_user::text, rolsuper OR rolcreaterole FROM pg_roles \
              WHERE rolname = current_user",
@@ -481,9 +556,11 @@ mod tests {
             for wrong_role in [ROLE_BATCH_ISSUER, ROLE_PUBLIC_WORKER] {
                 rt.block_on(async {
                     let scoped = dsn_as_role(&dsn, wrong_role);
-                    let err = connect_checked(&scoped, ROLE_GATEWAY).await.expect_err(
-                        "a non-gateway current_user must not literally be role_gateway",
-                    );
+                    let err = connect_checked(&scoped, ROLE_GATEWAY, None)
+                        .await
+                        .expect_err(
+                            "a non-gateway current_user must not literally be role_gateway",
+                        );
                     match err {
                         PoolInitError::RoleMismatch { expected, actual } => {
                             assert_eq!(expected, ROLE_GATEWAY);
@@ -562,9 +639,11 @@ mod tests {
                     }
                     let scoped = dsn_as_role(&dsn, role);
                     rt.block_on(async {
-                        let pool = connect_checked(&scoped, role).await.unwrap_or_else(|e| {
-                            panic!("role {role} exists but connect_checked failed: {e}")
-                        });
+                        let pool = connect_checked(&scoped, role, None)
+                            .await
+                            .unwrap_or_else(|e| {
+                                panic!("role {role} exists but connect_checked failed: {e}")
+                            });
                         pool.close().await;
                     });
                 }
@@ -974,6 +1053,274 @@ mod tests {
                 update_column_probe_ok(&pool.0, "projection.stream_log", "state").await;
                 insert_probe_denied(&pool.0, "projection.stream_log").await;
             });
+        });
+    }
+
+    // ---- ADR-0065 D-A / D-B: PoolSettings on a throwaway database ------------------------------------------------
+
+    /// `postgres://user:pass@host:port/<db>?query` with the database replaced.
+    fn with_db(dsn: &str, db: &str) -> String {
+        let (head, tail) = dsn.split_at(dsn.rfind('/').expect("dsn has a database path") + 1);
+        let query = tail.find('?').map_or("", |i| &tail[i..]);
+        format!("{head}{db}{query}")
+    }
+
+    /// An empty database `humaux_thread_c38_<purpose>_<pid>` (role_gateway is cluster-wide, so no migration is
+    /// needed): created here, dropped WITH (FORCE) by `Drop` even on panic, which also ends a backend a fault left
+    /// sleeping. Declared before the runtime in each test so the runtime (and every pool) goes first.
+    struct C38Db {
+        admin_dsn: String,
+        name: String,
+    }
+
+    impl C38Db {
+        /// `None` after the §79.2 SKIP line (a failure under `HUMAUX_REQUIRE_DB=1`).
+        fn create(purpose: &str) -> Option<Self> {
+            let test = format!("c38_{purpose}");
+            let Ok(admin_dsn) = std::env::var("HUMAUX_TEST_PG_DSN") else {
+                humaux_testkit::skip_or_fail(
+                    &test,
+                    "HUMAUX_TEST_PG_DSN unset",
+                    humaux_testkit::ExternalDep::Postgres,
+                );
+                return None;
+            };
+            let name = format!("humaux_thread_c38_{purpose}_{}", std::process::id());
+            // dep: PostgreSQL(owner) — create this test's throwaway database
+            let created =
+                Client::connect(&with_db(&admin_dsn, "postgres"), NoTls).and_then(|mut admin| {
+                    admin.batch_execute(&format!("CREATE DATABASE {name} TEMPLATE template0"))
+                });
+            if let Err(e) = created {
+                humaux_testkit::skip_or_fail(
+                    &test,
+                    &format!("CREATE DATABASE {name} failed: {e}"),
+                    humaux_testkit::ExternalDep::Postgres,
+                );
+                return None;
+            }
+            Some(Self { admin_dsn, name })
+        }
+
+        /// The superuser DSN on this database; [`dsn_as_role`] narrows it to `role_gateway`.
+        fn dsn(&self) -> String {
+            with_db(&self.admin_dsn, &self.name)
+        }
+    }
+
+    impl Drop for C38Db {
+        fn drop(&mut self) {
+            let drop_db = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name);
+            // dep: PostgreSQL(owner) — drop this test's throwaway database
+            match Client::connect(&with_db(&self.admin_dsn, "postgres"), NoTls) {
+                Ok(mut admin) => {
+                    if let Err(e) = admin.batch_execute(&drop_db) {
+                        eprintln!("c38 throwaway cleanup: {drop_db} failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("c38 throwaway cleanup: cannot reach postgres for {drop_db}: {e}")
+                }
+            }
+        }
+    }
+
+    fn c38_settings(
+        app: &str,
+        max: u32,
+        acquire_ms: u64,
+        statement_ms: u64,
+        idle_txn_ms: u64,
+    ) -> PoolSettings {
+        PoolSettings {
+            max_connections: max,
+            min_connections: 0,
+            acquire_timeout: Duration::from_millis(acquire_ms),
+            idle_timeout: Duration::from_secs(300),
+            max_lifetime: Duration::from_secs(1800),
+            statement_timeout: Duration::from_millis(statement_ms),
+            idle_in_transaction_timeout: Duration::from_millis(idle_txn_ms),
+            application_name: app.to_owned(),
+        }
+    }
+
+    async fn gateway_pool(db: &C38Db, settings: &PoolSettings) -> RuntimeDbPool {
+        // dep: PostgreSQL(role_gateway) — the sized pool under test, on the throwaway database
+        RuntimeDbPool::connect_with(&dsn_as_role(&db.dsn(), ROLE_GATEWAY), settings)
+            .await
+            .unwrap_or_else(|e| panic!("role_gateway connect_with on {}: {e}", db.name))
+    }
+
+    /// Backends of `app` running a statement right now, read on a separate superuser pool.
+    async fn active_backends(observer: &PgPool, app: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND state = 'active'",
+        )
+        .bind(app)
+        // dep: PostgreSQL(owner) — read-only pg_stat_activity probe of the throwaway database's backends
+        .fetch_one(observer)
+        .await
+        .expect("pg_stat_activity probe")
+    }
+
+    /// ADR-0065 D-B (W-3): both timeouts and the application name reach the session as `source = client`, i.e. as
+    /// startup options of the pool's own sessions, not a role GUC. Fault: the `.options(..)` call removed ⇒ red.
+    #[test]
+    fn pool_settings_reach_the_session_as_client_settings() {
+        let Some(db) = C38Db::create("settings") else {
+            return;
+        };
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let pool = gateway_pool(&db, &c38_settings("humaux-gateway", 2, 1000, 1234, 2345)).await;
+            let rows: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT name, setting, source FROM pg_settings WHERE name IN \
+                 ('application_name', 'idle_in_transaction_session_timeout', 'statement_timeout') ORDER BY name",
+            )
+            // dep: PostgreSQL(role_gateway) — reads the session's own settings through the pool
+            .fetch_all(&pool.0)
+            .await
+            .expect("pg_settings through the pool");
+            let row = |n: &str, v: &str| (n.to_owned(), v.to_owned(), "client".to_owned());
+            assert_eq!(
+                rows,
+                vec![
+                    row("application_name", "humaux-gateway"),
+                    row("idle_in_transaction_session_timeout", "2345"),
+                    row("statement_timeout", "1234"),
+                ],
+                "ADR-0065 D-B: the pool's session settings must arrive as startup options (source = client)"
+            );
+            pool.0.close().await;
+        });
+    }
+
+    /// ADR-0065 D-B / F19 (W-1): sqlx sends no CancelRequest for a dropped future, so the server statement runs on
+    /// until statement_timeout cancels it. Fault: the statement_timeout option removed ⇒ still active ⇒ red.
+    #[test]
+    fn a_dropped_query_runs_on_until_statement_timeout_cancels_it() {
+        let Some(db) = C38Db::create("cancel") else {
+            return;
+        };
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let app = format!("c38-cancel-{}", std::process::id());
+            let pool = gateway_pool(&db, &c38_settings(&app, 2, 1000, 500, 10_000)).await;
+            // dep: PostgreSQL(owner) — the superuser observer pool on the throwaway database
+            let observer = open(&db.dsn(), None).await.expect("observer pool");
+            let dropped = tokio::time::timeout(
+                Duration::from_millis(100),
+                // dep: PostgreSQL(role_gateway) — the statement whose future is dropped
+                sqlx::query("SELECT pg_sleep(5)").execute(&pool.0),
+            )
+            .await;
+            assert!(dropped.is_err(), "pg_sleep(5) must outlive the 100 ms client timeout");
+            let dropped_at = tokio::time::Instant::now();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                active_backends(&observer, &app).await,
+                1,
+                "F19: the dropped statement must still run server-side 50 ms after the drop"
+            );
+            tokio::time::sleep_until(dropped_at + Duration::from_millis(1000)).await;
+            assert_eq!(
+                active_backends(&observer, &app).await,
+                0,
+                "ADR-0065 D-B: statement_timeout (500 ms) must have cancelled the dropped statement server-side"
+            );
+            observer.close().await;
+            pool.0.close().await;
+        });
+    }
+
+    /// ADR-0065 D-A / F19 (W-1, L13): the dropped statement's connection stays checked out (`return_to_pool`
+    /// pings, which waits for its ReadyForQuery) until statement_timeout ends it. Fault: the statement_timeout
+    /// option removed ⇒ the second acquire still times out ⇒ red.
+    #[test]
+    fn a_dropped_query_holds_its_pool_slot_until_statement_timeout() {
+        let Some(db) = C38Db::create("slot") else {
+            return;
+        };
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let app = format!("c38-slot-{}", std::process::id());
+            let pool = gateway_pool(&db, &c38_settings(&app, 1, 200, 1000, 10_000)).await;
+            let dropped = tokio::time::timeout(
+                Duration::from_millis(100),
+                // dep: PostgreSQL(role_gateway) — the statement whose future is dropped
+                sqlx::query("SELECT pg_sleep(5)").execute(&pool.0),
+            )
+            .await;
+            assert!(dropped.is_err(), "pg_sleep(5) must outlive the 100 ms client timeout");
+            let dropped_at = tokio::time::Instant::now();
+            let held = pool.0.acquire().await;
+            assert!(
+                matches!(held, Err(sqlx::Error::PoolTimedOut)),
+                "F19: the only slot must still be held by the draining statement, got {:?}",
+                held.map(|_| "a connection")
+            );
+            tokio::time::sleep_until(dropped_at + Duration::from_millis(1300)).await;
+            let freed = pool.0.acquire().await;
+            assert!(
+                freed.is_ok(),
+                "ADR-0065 D-A: statement_timeout (1000 ms) must have released the slot by +1300 ms, got {:?}",
+                freed.map(|_| "a connection")
+            );
+            drop(freed);
+            pool.0.close().await;
+        });
+    }
+
+    /// ADR-0065 D-B (W-4): an awaited statement past statement_timeout fails with SQLSTATE 57014.
+    /// Fault: the statement_timeout option removed ⇒ the statement succeeds ⇒ red.
+    #[test]
+    fn an_awaited_query_past_statement_timeout_is_57014() {
+        let Some(db) = C38Db::create("timeout") else {
+            return;
+        };
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let pool = gateway_pool(&db, &c38_settings("c38-57014", 2, 1000, 200, 10_000)).await;
+            // dep: PostgreSQL(role_gateway) — a statement longer than the session's statement_timeout
+            let result = sqlx::query("SELECT pg_sleep(2)").execute(&pool.0).await;
+            let code = match &result {
+                Err(sqlx::Error::Database(e)) => e.code().map(|c| c.into_owned()),
+                _ => None,
+            };
+            assert_eq!(
+                code.as_deref(),
+                Some("57014"),
+                "ADR-0065 D-B: statement_timeout must cancel it server-side, got {:?}",
+                result.map(|_| "success")
+            );
+            pool.0.close().await;
+        });
+    }
+
+    /// ADR-0065 D-B (W-4): a transaction left idle past idle_in_transaction_session_timeout loses its session
+    /// (FATAL 25P03), so the next statement on it fails. Fault: that option removed ⇒ the statement succeeds ⇒ red.
+    #[test]
+    fn an_idle_transaction_past_its_timeout_loses_its_session() {
+        let Some(db) = C38Db::create("idletxn") else {
+            return;
+        };
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let pool = gateway_pool(&db, &c38_settings("c38-idle-txn", 2, 1000, 10_000, 300)).await;
+            // dep: PostgreSQL(role_gateway) — opens the transaction left idle below
+            let mut tx = pool.0.begin().await.expect("begin");
+            // dep: PostgreSQL(role_gateway) — the first statement of the idle transaction
+            sqlx::query("SELECT 1").execute(&mut *tx).await.expect("first statement");
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            // dep: PostgreSQL(role_gateway) — the statement after the idle period
+            let after = sqlx::query("SELECT 1").execute(&mut *tx).await;
+            assert!(
+                after.is_err(),
+                "ADR-0065 D-B: idle_in_transaction_session_timeout (300 ms) must have ended the session"
+            );
+            eprintln!("an_idle_transaction_past_its_timeout_loses_its_session: next statement = {after:?}");
+            drop(tx);
+            pool.0.close().await;
         });
     }
 }

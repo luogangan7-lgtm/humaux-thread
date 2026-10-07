@@ -694,6 +694,9 @@ partitions with a pre-created horizon and three horizon alerts, and retention dr
 superuser executor's database chokepoint, with holds, an export and a receipt.
 Card 37 (ADR-0064, §6.25) closes P1-10 for the go-live class `local_only`: verified nightly backups, PITR, a
 weekly restore drill and a provider-free Qdrant rebuild; offsite is NOT YET (host loss = total loss, card 37d).
+Card 38 (ADR-0065, §6.26) closes P1-13 on the gateway: §67.2 admission with a per-credential limit and a
+body-read bound, sized pool and startup-option timeouts, one-transaction rate buckets; the numbers are dev-host start
+values until card 39's `a5_load_remeasure` (open item O-1), and the other processes' pools are card 38b.
 
 ### 6.11 Folded debts closed by card 26 (ADR-0051 D-L)
 
@@ -1105,6 +1108,23 @@ weekly restore drill and a provider-free Qdrant rebuild; offsite is NOT YET (hos
 - **Open (ADR-0064 known limits):** host loss = total loss until 37d (L37, L25); a compromised server can wipe the
   repository and forge receipts (L21); the PITR window is 24–48 h and only while `pitr_window_unbroken_since` says so
   (L15, L31); RTO/RPO are measured on dev-sized data (L13); losing the cipher pass loses every backup (L14).
+
+### 6.26 Closed by card 38 (ADR-0065) — gateway only, dev-host numbers
+
+| Audit row | Before | After | Gate / witness |
+|---|---|---|---|
+| **P1-13**: pools and timeouts on defaults, no §67.2 admission control | gateway pool = sqlx 0.8.6 default 10, acquire 30 s; `statement_timeout` / `idle_in_transaction_session_timeout` 0; one preflight + 4 post-auth bucket transactions per request; no concurrency limit. Measured on HEAD `ed3ab0c` (2026-10-06, `host=10cpu-vm3.8`): throughput flat at ≈ 155 calls/s from 8 to 128 clients, L64 enumerate p95 488.2 ms (n = 5052), BURST 128 p95 1067.6 ms (n = 2136) with 0 refusals, tenant B's p95 ≈ 45 → ≈ 500 ms next to a one-key burst (median ratio 11.40, 3 pairs) | admission layer (body read under B first: 413 / 408 before any admission state; per-credential K; C / Q / W; 503 + integer `Retry-After` 1–30 + `RATE_LIMITED`; `admission_rejected_total{class, reason}`; `/livez` `/readyz` outside); gateway pool from seven required keys (`PoolSettings`, P = C·k + 2 + H); statement and idle-in-transaction timeouts as startup options (`source = client`, `pg_db_role_setting` = 0 rows), boot refuses unless lock < statement < handler; the post-auth buckets in ONE transaction in tier lock order with `lock_timeout` from a key, 55P03 / 57014 / 40P01 → `DEPENDENCY_UNAVAILABLE` on the rate path. AFTER numbers: ADR-0065 "Measurement" (S7) | `c38_*` (28 single-fault tests, `c38_red_recorded`); rehearsal `load_gateway_ready`, `load_no_pool_or_statement_timeout`, `load_overflow_503_within_max_wait`, `load_admission_counter_equals_503s`, `load_p95_recorded`, `load_tenant_isolation`, `load_pg_backends_bounded`, `load_tenants_torn_down`, `load_forwarded_lanes_keyed`; load faults F-K / F-P / F-FWD (`c38_load_faults_recorded`) |
+| **SEC-6**: IPv6 pre-auth keying | /64 keying shipped by card 35 (ADR-0062 E5) with the `64` as a literal | ADR-0062 E5 + the key `HUMAUX_GATEWAY_RATE_PREAUTH_IPV6_PREFIX_BITS` (1..=128); IPv4-mapped keys as IPv4, loopback and link-local as themselves (/128); load lanes read back server side as `2001:db8:<lane>::/64` | `c38_ipv6_prefix_named`, `c38_no_rate_literals`, rehearsal `load_forwarded_lanes_keyed` |
+| §42 admission rejected | the family existed in Baseline text only | `AdmissionRejected` (`increase(admission_rejected_total[5m]) > 0`, WARNING), promtool-tested, one mutation added; witness `crates/testkit/tests/metrics/admission_rejected_total.rs` | `c38_rule_loaded`, `c38_family_exported`, `c38_witness_admission`, `promtool_mutations` |
+| Debt A (card 31: transient query-embedding failure) | recall folded the failure into `DEPENDENCY_UNAVAILABLE`; the soak client counted it failed | ruled fail fast on the server (stub-RPC test), one jittered retry in the soak client, `retried_calls` and `first_attempt_failure_rate` in the report; Debts B (distill breaker) and C (route-health prober) ruled deferred with reopening signals | `c38_fail_fast_named`, `c38_soak_retry_named`, `c38_debts_ruled` |
+
+- **Not done here:** worker / maintenance / admin pools stay on sqlx defaults, 57014 still maps to `INTERNAL`
+  outside the rate path, and `tools/call` still spends the shared buckets twice — card 38b (R-3, R-7, R-12).
+- **Open item O-1:** every value is a dev-host start value (10 CPU, PG in a 3.8 GiB VM); card 39 may not freeze its
+  compose values until `a5_load_remeasure` is green on the A5-spec host. Baseline:345 says so.
+- **Open (ADR-0065 known limits):** the fairness key is per credential, not per tenant (L3); a dropped request's PG
+  slot is held up to statement_timeout (L13); a connection stalled inside its headers is unbounded (L14); writes and
+  recall are not load-measured (L15); a correlated provider blip still fills C through recall (L12).
 
 ## 7. Housekeeping — done on 2026-09-26 with the user's approval
 

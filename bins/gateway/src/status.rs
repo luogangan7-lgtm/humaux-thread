@@ -483,6 +483,7 @@ mod tests {
                 "mcp_quota_reservations_total",
                 "mcp_bmo_consumed_total",
                 "rate_limit_rejected_total",
+                "admission_rejected_total",
             ]
         );
         for family in families {

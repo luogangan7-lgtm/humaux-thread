@@ -2,8 +2,9 @@
 //! Depends-on: crates=[async-trait, axum, humaux-adapters, humaux-application, humaux-contracts, humaux-domain,
 //!   humaux-infra-cell, humaux-local-secret-scan, humaux-projection, humaux-protocol, humaux-retrieval-provider,
 //!   humaux-retrieval-worker, humaux-testkit, postgres, serde_json, time, tokio, uuid];
-//!   services=[PostgreSQL(role_gateway) r=[private.memory_records] w=[projection.private_memory_points,
-//!   projection.stream_checkpoints, projection.tenant_placements], PostgreSQL(role_retrieval_worker), Qdrant(*),
+//!   services=[PostgreSQL(role_gateway) r=[private.memory_records] w=[ops.retrieval_embedding_rpc_calls,
+//!   projection.private_memory_points, projection.stream_checkpoints, projection.tenant_placements],
+//!   PostgreSQL(role_retrieval_worker), Qdrant(*),
 //!   UDS(retrieval-worker), UDS(serve)]; env=[CARGO_MANIFEST_DIR, HUMAUX_GATEWAY_PG_DSN,
 //!   HUMAUX_RETRIEVAL_WORKER_PG_DSN, HUMAUX_TEST_GITLEAKS_BIN, HUMAUX_TEST_GITLEAKS_SHA256,
 //!   HUMAUX_TEST_GITLEAKS_VERSION, HUMAUX_TEST_QDRANT_PORT]; modules=[adapters::postgres, adapters::qdrant,
@@ -15,7 +16,7 @@
 //!   retrieval-provider::adapters, retrieval-provider::contract, retrieval-worker::rpc]
 //! Called-by: [cargo-test]
 //! Invariants: [each test wires its own PostgreSQL/Qdrant/UDS fixtures; a missing fixture fails the test rather than skipping it]
-//! Spec: ADR-0012; ADR-0014; ADR-0055
+//! Spec: ADR-0012; ADR-0014; ADR-0055; ADR-0065
 //!
 //! Drives `humaux_gateway::recall::search` directly (no HTTP/MCP layer — that surface is
 //! already covered by `tests/mcp_gateway.rs`'s native MCP acceptance tests) against a real
@@ -26,7 +27,8 @@
 //! row degrades closed, never onto another tenant's collection; (3) a dead RPC socket degrades
 //! closed without hanging or panicking; (4) `HttpIntraCellTransport` really denies a write under
 //! a `QdrantReadOnly` permit (ADR-0014); (5) a wrong-dimension vector from the embedding port
-//! never gets hydrated; (6) `bootstrap.rs` wires `with_semantic_recall` exactly once.
+//! never gets hydrated; (6) `bootstrap.rs` wires `with_semantic_recall` exactly once; (8) a
+//! transient query-embedding failure fails fast after one worker call (ADR-0065 D-G).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1057,4 +1059,210 @@ fn bootstrap_wires_semantic_recall_exactly_once() {
         count, 1,
         "bootstrap.rs must call with_semantic_recall exactly once, found {count}"
     );
+}
+
+/// A stub of the retrieval-worker RPC (ADR-0012 wire shape): the first call answers a transient
+/// provider failure, every later call a fixed-vector `EMBEDDED`; `calls` counts what reached it.
+async fn spawn_flaky_worker(calls: Arc<AtomicUsize>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let socket_path = temp_socket_path("flaky");
+    // dep: UDS(serve) — test serves a stub retrieval-worker RPC on a temp socket
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind stub rpc socket");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body = loop {
+                    let n = stream.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= end + 4 + len {
+                        break raw[end + 4..end + 4 + len].to_vec();
+                    }
+                };
+                let wire: serde_json::Value =
+                    serde_json::from_slice(&body).expect("stub rpc request json");
+                let envelope = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    serde_json::json!({"schema_version": 1, "call_id": wire["call_id"],
+                        "outcome": "UNAVAILABLE", "failure_code": "PROVIDER_TRANSIENT"})
+                } else {
+                    serde_json::json!({"schema_version": 1, "call_id": wire["call_id"],
+                        "outcome": "EMBEDDED",
+                        "vector": fixed_vector(wire["query"].as_str().unwrap_or_default()),
+                        "provider_id": "wiring-test-provider", "model_id": "wiring-test-embedding",
+                        "model_revision": "v1", "dimension": DIMENSION})
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{envelope}",
+                    envelope.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    socket_path.to_string_lossy().into_owned()
+}
+
+/// (8) ADR-0065 D-G (Debt A): a transient query-embedding failure fails fast — the recall is
+/// `DependencyUnavailable` well inside its handler deadline after exactly ONE worker call, so the
+/// admission permit it holds is released at once; the next recall answers. Fault: a retry loop in
+/// `retrieval_embedding_client` ⇒ the stub sees 2 calls and the first recall answers ⇒ red.
+#[test]
+#[allow(clippy::too_many_lines)] // one fixture: placement → point → failing recall → answering recall.
+fn a_transient_query_embedding_failure_fails_fast_with_one_worker_call() {
+    run_db_fixture::<Fixture, _>("semantic_recall_wiring_fail_fast", |mut handle| {
+        handle.assert_gateway_login();
+        let context_row = handle.seed_workspace_visible_context_record();
+        let point_id = Uuid::new_v4();
+        let rt = handle.rt.handle().clone();
+        let mut admin = handle.owner_client().expect("owner client for setup");
+        seed_registry_row(
+            &mut admin,
+            handle.tenant_id,
+            handle.workspace_id,
+            context_row.memory_id,
+            point_id,
+        );
+        seed_checkpoint(&mut admin, handle.tenant_id, handle.workspace_id);
+        let source_updated_at = time::OffsetDateTime::now_utc();
+        let collection = format!("wiring_fail_fast_{}", Uuid::now_v7().simple());
+        let cell = CellId(Uuid::now_v7());
+        let caller = CallerId("gateway-wiring-test".to_owned());
+        let setup_registry = setup_registry(cell, caller.clone());
+        let setup_transport = qdrant_transport(&setup_registry);
+        let registry = cell_registry(cell, caller);
+        let transport = qdrant_transport(&registry);
+        seed_tenant_placement(&mut admin, handle.tenant_id, &collection);
+        let query = "operation receipt scoped context";
+        let handler_timeout = Duration::from_secs(10);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        rt.block_on(async {
+            create_collection(&setup_transport, &setup_registry, &collection).await;
+            let permit = authorize_cell_access(
+                &setup_registry,
+                IntraCellResource::QDRANT_REST,
+                Duration::from_secs(60),
+            )
+            .expect("setup upsert permit");
+            let point_payload = payload(handle.tenant_id, handle.workspace_id, source_updated_at);
+            upsert(
+                setup_transport.as_ref(),
+                &permit,
+                &collection,
+                &[(PointId::Uuid(point_id), &point_payload, fixed_vector(query))],
+                ha_profile_for(QdrantOperation::NormalImmutableUpsert),
+            )
+            .await
+            .expect("real Qdrant upsert");
+
+            let socket_path = spawn_flaky_worker(calls.clone()).await;
+            let stub_socket = socket_path.clone();
+            let pool = Arc::new(
+                // dep: PostgreSQL(role_gateway) — test fixture pool for the semantic recall wiring suite
+                humaux_adapters::postgres::RuntimeDbPool::connect(&required(
+                    "HUMAUX_GATEWAY_PG_DSN",
+                ))
+                .await
+                .expect("real role_gateway pool"),
+            );
+            let embedding_port: Arc<dyn RetrievalEmbeddingPort> =
+                Arc::new(GatewayRetrievalEmbeddingClient::new(
+                    pool.clone(),
+                    socket_path,
+                    registry.clone(),
+                    Duration::from_secs(30),
+                ));
+            let runtime = Arc::new(
+                SemanticRecallRuntime::new(
+                    embedding_port,
+                    transport,
+                    registry,
+                    SemanticRecallVersions {
+                        embedding_version: EMBEDDING_VERSION.to_owned(),
+                        dimension: DIMENSION,
+                    },
+                    handler_timeout,
+                )
+                .expect("trusted semantic runtime"),
+            );
+            let catalog = Arc::new(CanonicalCatalog::load().expect("catalog"));
+            let search = || {
+                recall::search(
+                    pool.clone(),
+                    runtime.clone(),
+                    catalog.clone(),
+                    handle.auth.clone(),
+                    Uuid::now_v7(),
+                    context_bootstrap(&handle),
+                    recall_request(query, handle.workspace_id),
+                )
+            };
+
+            let started = std::time::Instant::now();
+            let first = search().await;
+            let first_elapsed = started.elapsed();
+            assert_eq!(
+                first.err(),
+                Some(ErrorCode::DependencyUnavailable),
+                "ADR-0065 D-G: a transient embedding failure must fail fast, not be retried"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "ADR-0065 D-G: the failing recall must reach the worker exactly once"
+            );
+            assert!(
+                first_elapsed < handler_timeout / 2,
+                "the failing recall must return well inside its handler deadline (held its \
+                 permit {first_elapsed:?})"
+            );
+
+            let started = std::time::Instant::now();
+            let second = search().await.expect("the next recall answers").finish();
+            // Evidence line for ADR-0065 Debt A (the first recall also pays the cold pool's connects).
+            eprintln!(
+                "fail-fast recall {first_elapsed:?}; answering recall {:?}",
+                started.elapsed()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let items = second.structured_content["items"]
+                .as_array()
+                .expect("items array");
+            assert!(
+                items.iter().any(
+                    |item| item["memory_id"] == context_row.memory_id.to_string()
+                        || item["memory_id"] == serde_json::json!(context_row.memory_id)
+                ),
+                "expected the seeded memory in the second recall: {items:?}"
+            );
+            delete_collection(&setup_transport, &setup_registry, &collection).await;
+            let _ = std::fs::remove_file(&stub_socket);
+        });
+        // Same FK cleanup as the happy path; the stub never claims the registrations, so they
+        // are removed here instead of waiting out their TTL.
+        for sql in [
+            "DELETE FROM projection.tenant_placements WHERE tenant_id=$1",
+            "DELETE FROM ops.retrieval_embedding_rpc_calls WHERE tenant_id=$1",
+        ] {
+            admin
+                .execute(sql, &[&handle.tenant_id])
+                .expect("cleanup seeded fail-fast rows");
+        }
+    });
 }

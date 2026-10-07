@@ -545,3 +545,38 @@ tests:
       - eval_time: 20m
         alertname: DiskFreeLow
         exp_alerts: []
+
+  # admission rejected fire (§42 injection: admission capped at 1, two concurrent requests ⇒ one 503): the gateway
+  # exports the seeded zero series; one queue_full refusal at 10m fires the row with that reason's labels, and the
+  # other reasons stay silent.
+  - interval: 1m
+    input_series:
+      - series: 'admission_rejected_total{job="humaux-gateway",class="gateway_inbound",reason="queue_full"}'
+        values: '0x9 1x20'
+      - series: 'admission_rejected_total{job="humaux-gateway",class="gateway_inbound",reason="wait_timeout"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: AdmissionRejected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: humaux-gateway
+              class: gateway_inbound
+              reason: queue_full
+
+  # admission rejected silent: no 503 at all (every series flat at its seeded 0), and 5 minutes after the last
+  # refusal the increase is 0 again.
+  - interval: 1m
+    input_series:
+      - series: 'admission_rejected_total{job="humaux-gateway",class="gateway_inbound",reason="queue_full"}'
+        values: '0x9 1x30'
+      - series: 'admission_rejected_total{job="humaux-gateway",class="gateway_inbound",reason="key_limit"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AdmissionRejected
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: AdmissionRejected
+        exp_alerts: []

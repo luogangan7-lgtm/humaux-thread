@@ -48,7 +48,7 @@ use public_anonymous_seam::{
     evaluate_anonymous_supported, finalize_assessed_release, grant_moderator, job_status,
     prepare_assessed_candidate, seed_project_job,
 };
-use sqlx::{Row, postgres::PgPoolOptions};
+use sqlx::Row;
 use uuid::Uuid;
 
 struct RecordingProjector {
@@ -651,12 +651,12 @@ fn assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_c
         .rt
         .block_on(
             // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
-            PgPoolOptions::new()
-                .max_connections(1)
-                .connect(&dsn_as_role(
-                    &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
-                    "role_public_worker",
-                )),
+            // ADR-0065 D-A: a deliberately raw pool spelled through `Pool<Postgres>` (the G80-40 precedent of
+            // outbox_batch_remember.rs), so the pool builder keeps its one site in postgres.rs.
+            sqlx::Pool::<sqlx::Postgres>::connect(&dsn_as_role(
+                &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
+                "role_public_worker",
+            )),
         )
         .expect("raw public-role pool for dispatch authority negative control");
 
@@ -1019,12 +1019,12 @@ fn assessed_revoke_reaches_anonymous_under_review_claim_once() {
         .rt
         .block_on(
             // dep: PostgreSQL(any) — open a role-scoped PG connection/pool for this test
-            PgPoolOptions::new()
-                .max_connections(1)
-                .connect(&dsn_as_role(
-                    &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
-                    "role_public_worker",
-                )),
+            // ADR-0065 D-A: a deliberately raw pool spelled through `Pool<Postgres>` (the G80-40 precedent of
+            // outbox_batch_remember.rs), so the pool builder keeps its one site in postgres.rs.
+            sqlx::Pool::<sqlx::Postgres>::connect(&dsn_as_role(
+                &std::env::var("HUMAUX_TEST_PG_DSN").expect("isolated PG"),
+                "role_public_worker",
+            )),
         )
         .expect("raw public-role pool for revoke authority checks");
     let leased = fixture

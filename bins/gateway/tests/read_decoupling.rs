@@ -110,6 +110,8 @@ fn guard(runtime: RuntimeDbPool) -> Arc<GatewayGuard> {
                     user: rate(),
                     tenant: rate(),
                     operation: rate(),
+                    lock_timeout: Duration::from_secs(2),
+                    preauth_ipv6_prefix_bits: 64,
                 },
                 reservation_ttl: Duration::from_secs(30),
                 handler_timeout: Duration::from_secs(5),

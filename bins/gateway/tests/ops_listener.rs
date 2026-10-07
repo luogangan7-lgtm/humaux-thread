@@ -34,7 +34,7 @@ const METRICS_ADDR: &str = "HUMAUX_GATEWAY_METRICS_ADDR";
 /// The test's refresh interval; every "within" bound below is derived from it.
 const INTERVAL: Duration = Duration::from_secs(1);
 const START: Duration = Duration::from_secs(15);
-const GATEWAY_FAMILIES: [&str; 9] = [
+const GATEWAY_FAMILIES: [&str; 10] = [
     "degrade_total",
     "humaux_retrieval_requests_total",
     "retrieval_completeness_total",
@@ -44,6 +44,7 @@ const GATEWAY_FAMILIES: [&str; 9] = [
     "mcp_quota_reservations_total",
     "mcp_bmo_consumed_total",
     "rate_limit_rejected_total",
+    "admission_rejected_total",
 ];
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -146,6 +147,24 @@ fn base_env(pg_dsn: &str, bind: SocketAddr, ops: SocketAddr) -> BTreeMap<String,
         ("CONTEXT_MANDATORY_TOKENS", "1024".into()),
         ("METRICS_ADDR", ops.to_string()),
         ("READINESS_REFRESH_SECONDS", INTERVAL.as_secs().to_string()),
+        // ADR-0065 D-A / D-B: the sqlx 0.8.6 defaults this fixture ran on before card 38; both session timeouts
+        // below the 5 s handler timeout (the boot order rule).
+        ("PG_POOL_MAX_CONNECTIONS", "10".into()),
+        ("PG_POOL_MIN_CONNECTIONS", "0".into()),
+        ("PG_ACQUIRE_TIMEOUT_MS", "30000".into()),
+        ("PG_IDLE_TIMEOUT_SECONDS", "600".into()),
+        ("PG_MAX_LIFETIME_SECONDS", "1800".into()),
+        ("PG_STATEMENT_TIMEOUT_MS", "4000".into()),
+        ("PG_IDLE_IN_TRANSACTION_TIMEOUT_MS", "4000".into()),
+        // ADR-0065 D-D / D-E: the former lock_timeout literal (below statement_timeout) and the /64 SEC-6 prefix.
+        ("RATE_LOCK_TIMEOUT_MS", "2000".into()),
+        ("RATE_PREAUTH_IPV6_PREFIX_BITS", "64".into()),
+        // ADR-0065 D-C: the §67.2 start values; B within the 5 s handler timeout (the boot bound).
+        ("ADMISSION_CONCURRENCY", "16".into()),
+        ("ADMISSION_QUEUE_DEPTH", "64".into()),
+        ("ADMISSION_MAX_WAIT_MS", "5000".into()),
+        ("ADMISSION_PER_KEY_LIMIT", "16".into()),
+        ("ADMISSION_BODY_READ_TIMEOUT_MS", "5000".into()),
     ]
     .into_iter()
     .map(|(k, v)| (format!("{PREFIX}{k}"), v))

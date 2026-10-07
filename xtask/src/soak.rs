@@ -4,9 +4,9 @@
 //!   projection.processing_gaps, projection.stream_checkpoints, projection.stream_log], Qdrant(*), subprocess(ps),
 //!   subprocess(sh), HTTP(gateway)]; env=[CARGO_MANIFEST_DIR, HUMAUX_MAINTENANCE_PG_DSN, HUMAUX_SOAK_TEST_BEARER];
 //!   modules=[domain::ids, projection::serving, xtask::switch_visible]
-//! Called-by: [xtask::e2e_onboard, xtask::main]
+//! Called-by: [xtask::e2e_onboard, xtask::load, xtask::main]
 //! Invariants: [continuous concurrent load against the real four-process deployment while a chaos hook kills/restarts a worker; every read is asserted live against the database]
-//! Spec: Baseline §15.1; §15.3; §15.5; §31; §61; §6.1; ADR-0037; ADR-0050; ADR-0052; ADR-0055
+//! Spec: Baseline §15.1; §15.3; §15.5; §31; §61; §6.1; ADR-0037; ADR-0050; ADR-0052; ADR-0055; ADR-0065
 //!
 //! `cargo xtask soak` — the endurance + crash-recovery harness (card 16).
 //!
@@ -38,7 +38,8 @@
 //!   (reported, not a failure); any other absence is a probe failure. A `ps` that cannot run,
 //!   exits non-zero or returns an empty table is an assertion failure (`ps_observed`), never an
 //!   RSS of 0;
-//! * per-operation failure rate at most `--max-op-failure-rate` (`op_failure_rate`);
+//! * per-operation failure rate at most `--max-op-failure-rate` (`op_failure_rate`), scored on
+//!   the answer after the client's one retry of a 503 or a transient wire code (ADR-0065 D-G);
 //! * bounded RSS (only real readings are scored) and bounded PostgreSQL connection count.
 //!
 //! §78.1: **no literal thresholds and no defaults.** Every duration, ceiling and endpoint is a
@@ -387,7 +388,23 @@ pub fn mcp_request(host_port: &str, path: &str, origin: &str, tool: &str, args: 
     )
 }
 
-fn call(cfg: &Config, lane: &TenantLane, tool: &str, args: &str) -> Result<(u16, String), String> {
+/// One attempt's answer: status, body and the integer `Retry-After` seconds when present.
+type Answer = Result<(u16, String, Option<u64>), String>;
+
+/// `Retry-After` as the integer seconds RFC 9110 §10.2.3 allows; `None` when absent or not one.
+fn retry_after_secs(raw: &[u8]) -> Option<u64> {
+    let head_end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    String::from_utf8_lossy(&raw[..head_end])
+        .split("\r\n")
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("retry-after")
+                .then(|| value.trim().parse().ok())?
+        })
+}
+
+fn call(cfg: &Config, lane: &TenantLane, tool: &str, args: &str) -> Answer {
     let wire = mcp_request(&cfg.host_port, &cfg.path, &cfg.origin, tool, args)
         .replace("{BEARER}", &lane.bearer);
     // dep: HTTP(gateway) — cfg.host_port, one soak op on a fresh loopback socket.
@@ -400,7 +417,77 @@ fn call(cfg: &Config, lane: &TenantLane, tool: &str, args: &str) -> Result<(u16,
     let mut raw = Vec::new();
     sock.read_to_end(&mut raw)
         .map_err(|e| format!("read: {e}"))?;
-    parse_http(&raw)
+    let (status, body) = parse_http(&raw)?;
+    Ok((status, body, retry_after_secs(&raw)))
+}
+
+/// ADR-0065 D-G: wire codes a well-behaved MCP client retries once (as it does any 503).
+const RETRYABLE_WIRE_CODES: [&str; 3] = [
+    "DEPENDENCY_UNAVAILABLE",
+    "PROVIDER_TRANSIENT",
+    "RATE_LIMITED",
+];
+/// ADR-0065 D-G: the jittered pause before the retry when the answer names no `Retry-After`.
+const RETRY_JITTER_MS: (u64, u64) = (500, 1500);
+/// ADR-0065 D-G: first attempts failing above this fraction print a WARN line — informational,
+/// never graded (`op_failure_rate` stays the graded bound).
+const FIRST_ATTEMPT_WARN_RATE: f64 = 0.05;
+
+fn answered(status: u16, body: &str) -> bool {
+    status == 200 && !body.contains("\"isError\":true")
+}
+
+/// ADR-0065 D-G: one attempt, plus ONE retry when it was a 503 or a retryable wire code — after
+/// `Retry-After` when the answer carries one, else a uniform 500-1500 ms jitter. Never a second
+/// retry: a failure after the retry is the call's answer. Returns that answer and whether it
+/// retried. A transport error is not retried (no wire code, nothing says it is transient).
+fn with_one_retry(
+    mut attempt: impl FnMut() -> Answer,
+    pause: impl FnOnce(Duration),
+) -> (Result<(u16, String), String>, bool) {
+    let first = attempt();
+    let pause_for = match &first {
+        Ok((status, body, retry_after))
+            if !answered(*status, body)
+                && (*status == 503 || RETRYABLE_WIRE_CODES.iter().any(|c| body.contains(c))) =>
+        {
+            retry_after.map_or_else(
+                || {
+                    let (lo, hi) = RETRY_JITTER_MS;
+                    let spread = u64::try_from(Uuid::new_v4().as_u128() % u128::from(hi - lo + 1))
+                        .unwrap_or(0);
+                    Duration::from_millis(lo + spread)
+                },
+                Duration::from_secs,
+            )
+        }
+        _ => return (first.map(|(status, body, _)| (status, body)), false),
+    };
+    pause(pause_for);
+    (attempt().map(|(status, body, _)| (status, body)), true)
+}
+
+/// `(fraction, n)` of calls whose FIRST attempt failed — a retried call's first attempt failed
+/// by definition (ADR-0065 D-G); derived `recall.stage*` samples are not calls.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "counts feed a report field, not an equality test"
+)]
+pub fn first_attempt_failure_rate(samples: &[Sample]) -> (f64, i64) {
+    let calls: Vec<&Sample> = samples
+        .iter()
+        .filter(|s| !s.op.starts_with(RECALL_STAGE_PREFIX))
+        .collect();
+    let failed = calls.iter().filter(|s| s.retried || !s.ok).count();
+    let n = calls.len();
+    (
+        if n == 0 {
+            0.0
+        } else {
+            failed as f64 / n as f64
+        },
+        n as i64,
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -454,7 +541,10 @@ pub struct Observation {
 pub struct Sample {
     pub op: String,
     pub ms: f64,
+    /// The answer that counts: after the one retry when there was one (ADR-0065 D-G).
     pub ok: bool,
+    /// The first attempt failed retryably and was sent once more (ADR-0065 D-G).
+    pub retried: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1041,7 +1131,9 @@ pub fn report_json(
 ) -> serde_json::Value {
     let mut by_op: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
     let mut fails: BTreeMap<&str, i64> = BTreeMap::new();
+    let mut retried: BTreeMap<&str, i64> = BTreeMap::new();
     for s in &series.samples {
+        *retried.entry(&s.op).or_default() += i64::from(s.retried);
         // Seed the entry either way: an operation whose calls ALL failed must not vanish from
         // the report (it did, in this harness's own first live run — the least visible shape a
         // total failure can take).
@@ -1060,9 +1152,11 @@ pub fn report_json(
                 "operation": op, "unit": "ms", "n": v.len(),
                 "p50": percentile(v, 0.50), "p95": percentile(v, 0.95),
                 "failed_calls": fails.get(op).copied().unwrap_or(0),
+                "retried_calls": retried.get(op).copied().unwrap_or(0),
             })
         })
         .collect();
+    let first_attempt = first_attempt_failure_rate(&series.samples);
     let tenants: Vec<serde_json::Value> = series
         .finals
         .iter()
@@ -1120,6 +1214,11 @@ pub fn report_json(
             "detail": a.detail,
         })).collect::<Vec<_>>(),
         "latency": latency,
+        // ADR-0065 D-G: informational, never graded; `op_failure_rate` scores after the retry.
+        "first_attempt_failure_rate": {
+            "value": first_attempt.0, "unit": "fraction of calls whose first attempt failed",
+            "n": first_attempt.1,
+        },
         "tenants": tenants,
         // An `EXPECTED-RED` assertion does not fail the run: the card that owns the gap is
         // named on the row, and the run's verdict must not become a permanent red that
@@ -1626,28 +1725,18 @@ const RECALL_STAGES: [&str; 8] = [
 
 /// `op` is the latency bucket, `tool` the MCP tool dialed — they differ for the `memory` tool,
 /// whose two actions are bucketed separately.
+/// `ms` is the client-observed time, the retry pause included.
 fn timed(cfg: &Config, lane: &TenantLane, op: &str, tool: &str, args: &str) -> (Sample, String) {
     let started = Instant::now();
-    let result = call(cfg, lane, tool, args);
+    let (result, retried) = with_one_retry(|| call(cfg, lane, tool, args), std::thread::sleep);
     let ms = started.elapsed().as_secs_f64() * 1000.0;
-    let (sample, body) = match result {
-        Ok((status, body)) => (
-            Sample {
-                op: op.to_string(),
-                ms,
-                ok: status == 200 && !body.contains("\"isError\":true"),
-            },
-            body,
-        ),
-        Err(e) => (
-            Sample {
-                op: op.to_string(),
-                ms,
-                ok: false,
-            },
-            format!("{{\"transport_error\":\"{e}\"}}"),
-        ),
-    };
+    let (sample, body) = sample_of(op, ms, result, retried);
+    if retried {
+        eprintln!(
+            "soak: {op} retried once on lane {} (ADR-0065 D-G)",
+            lane.sentinel
+        );
+    }
     // Card 24 rehearsal4 run 1: `remember failed_calls = 1` with nothing anywhere saying
     // what the reply was. A failed call is a finding; a finding without its shape is
     // uninvestigable, so the head of the reply goes to stderr (the soak's own log), never
@@ -1659,6 +1748,26 @@ fn timed(cfg: &Config, lane: &TenantLane, op: &str, tool: &str, args: &str) -> (
             lane.sentinel
         );
     }
+    (sample, body)
+}
+
+/// One call's sample from its final answer.
+fn sample_of(
+    op: &str,
+    ms: f64,
+    result: Result<(u16, String), String>,
+    retried: bool,
+) -> (Sample, String) {
+    let (ok, body) = match result {
+        Ok((status, body)) => (answered(status, &body), body),
+        Err(e) => (false, format!("{{\"transport_error\":\"{e}\"}}")),
+    };
+    let sample = Sample {
+        op: op.to_string(),
+        ms,
+        ok,
+        retried,
+    };
     (sample, body)
 }
 
@@ -1764,7 +1873,12 @@ fn recall_stage_samples(recall: &Sample, body: &str) -> Vec<Sample> {
     else {
         return Vec::new();
     };
-    let sample = |op: String, ms: f64| Sample { op, ms, ok: true };
+    let sample = |op: String, ms: f64| Sample {
+        op,
+        ms,
+        ok: true,
+        retried: false,
+    };
     let mut out: Vec<Sample> = RECALL_STAGES
         .iter()
         .zip(&values)
@@ -2021,6 +2135,13 @@ pub fn run(args: &[String]) -> i32 {
         cfg.max_op_failure_rate,
     );
     let report = report_json(&series, &assertions, config_summary(&cfg));
+    let (first_rate, first_n) = first_attempt_failure_rate(&series.samples);
+    if first_rate > FIRST_ATTEMPT_WARN_RATE {
+        println!(
+            "soak: WARN first_attempt_failure_rate = {first_rate} (n={first_n}) above \
+             {FIRST_ATTEMPT_WARN_RATE} (ADR-0065 D-G; informational, not graded)"
+        );
+    }
     series.samples.clear();
     let rendered = serde_json::to_string_pretty(&report)
         .unwrap_or_else(|e| format!("{{\"serialize_error\":\"{e}\"}}"));
@@ -2338,11 +2459,13 @@ mod tests {
                     op: "remember".into(),
                     ms: 120.0,
                     ok: true,
+                    retried: false,
                 },
                 Sample {
                     op: "remember".into(),
                     ms: 300.0,
                     ok: true,
+                    retried: false,
                 },
             ],
             finals: vec![TenantFinal {
@@ -2807,6 +2930,7 @@ mod tests {
             op: "recall.ryw_replay".into(),
             ms: 9.0,
             ok: false,
+            retried: false,
         });
         let report = report_json(
             &series,
@@ -3051,7 +3175,73 @@ mod tests {
             op: op.into(),
             ms: 1.0,
             ok,
+            retried: false,
         }
+    }
+
+    const ENVELOPE_OK: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"isError":false}}"#;
+    const DEP_UNAVAILABLE: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"isError":true,"structuredContent":{"code":"DEPENDENCY_UNAVAILABLE"}}}"#;
+
+    /// ADR-0065 D-G: a 503 refusal followed by an answer is ONE call, answered, retried after the
+    /// refusal's own `Retry-After`. Fault: retry removed ⇒ the call counts failed ⇒ red.
+    #[test]
+    fn a_transient_failure_retried_once_counts_as_one_ok_call() {
+        let mut answers = vec![
+            Ok((200, ENVELOPE_OK.to_string(), None)),
+            Ok((503, "RATE_LIMITED".to_string(), Some(2))),
+        ];
+        let mut paused = Vec::new();
+        let (result, retried) =
+            with_one_retry(|| answers.pop().expect("attempt"), |d| paused.push(d));
+        let (s, _) = sample_of("recall", 1.0, result, retried);
+        assert!(s.ok && s.retried, "{s:?}");
+        assert_eq!(paused, [Duration::from_secs(2)], "Retry-After is honoured");
+        let a = op_failure_rate(std::slice::from_ref(&s), 0.0);
+        assert!(a.pass && a.n == 1, "{a:?}");
+        let mut series = healthy();
+        series.samples = vec![s];
+        let report = report_json(&series, &[], serde_json::json!({}));
+        assert_eq!(report["latency"][0]["retried_calls"], 1);
+        assert_eq!(report["latency"][0]["failed_calls"], 0);
+        assert_eq!(report["first_attempt_failure_rate"]["n"], 1);
+        assert_eq!(report["first_attempt_failure_rate"]["value"], 1.0);
+    }
+
+    /// ADR-0065 D-G: the retry is sent once, after a 500-1500 ms jitter when no `Retry-After` came
+    /// back; a failure after it still counts failed, and nothing is sent a third time.
+    #[test]
+    fn a_failure_after_the_retry_still_counts_failed() {
+        let mut attempts = 0;
+        let mut paused = Vec::new();
+        let (result, retried) = with_one_retry(
+            || {
+                attempts += 1;
+                Ok((200, DEP_UNAVAILABLE.to_string(), None))
+            },
+            |d| paused.push(d),
+        );
+        assert_eq!(attempts, 2, "exactly one retry");
+        assert!(
+            paused.len() == 1
+                && (Duration::from_millis(500)..=Duration::from_millis(1500)).contains(&paused[0]),
+            "{paused:?}"
+        );
+        let (s, _) = sample_of("recall", 1.0, result, retried);
+        assert!(!s.ok && s.retried, "{s:?}");
+        let a = op_failure_rate(&[s], 0.0);
+        assert!(!a.pass && a.n == 1, "{a:?}");
+        // A caller-fault answer is never retried.
+        let (_, retried) = with_one_retry(
+            || {
+                Ok((
+                    200,
+                    r#"{"result":{"isError":true,"code":"INVALID_INPUT"}}"#.to_string(),
+                    None,
+                ))
+            },
+            |_| panic!("no pause for a non-retryable answer"),
+        );
+        assert!(!retried);
     }
 
     #[test]

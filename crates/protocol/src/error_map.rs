@@ -111,11 +111,11 @@ pub const fn lookup(code: ErrorCode) -> ErrorMapping {
         // One `ErrorCode` cannot carry two HTTP statuses through a single-
         // valued table, and this table has no `Retry-After` field at all —
         // so the §67.2 contract cannot be emitted through `lookup` today.
-        // ponytail: left as the §72.3 value only; giving §67.2 its own
-        // code/row (or adding a retry-hint field and a caller-supplied
-        // status) is an architecture-semantics choice that needs an ADR
-        // (§78.6) and touches files outside this fix's scope — not decided
-        // silently here.
+        // ponytail: left as the §72.3 value only. ADR-0065 D-C emits the
+        // §67.2 503 + Retry-After as a pre-parse response in the gateway's
+        // admission layer (body `RATE_LIMITED`, no JSON-RPC envelope), so
+        // this table keeps one row per code; a second status for one code
+        // would need its own ADR (§78.6).
         ErrorCode::RateLimited => {
             http_status = 429;
             mcp_error = protocol(-32004);

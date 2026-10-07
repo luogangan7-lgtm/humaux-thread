@@ -11,8 +11,10 @@
 //! Invariants: [needs the dedicated RequestGuard fixture after migration 0113 (gateway + maintenance DSNs); exhausted
 //!   windows are QuotaExhausted/RateLimited, never an allow; the fixture tests are #[ignore] lane tests; the SEC-6
 //!   pre-auth IP tests are not ignored and own a throwaway database each, because pre-auth buckets live under the
-//!   system tenant, which no fixture Drop on the shared database may clean]
-//! Spec: Baseline §72.2.1; §73.2; §79.2; ADR-0062 E5
+//!   system tenant, which no fixture Drop on the shared database may clean; the c38 batch tests (lock order under
+//!   contention, parity, lock_timeout, statement_timeout, deadlock victim) likewise own a humaux_thread_c38_rate_*
+//!   database each, so their holder sessions and deadlock experiments never touch the shared one]
+//! Spec: Baseline §72.2.1; §73.2; §79.2; ADR-0062 E5; ADR-0065 D-D
 //!
 //! These tests intentionally require the dedicated RequestGuard fixture after migration 0113.
 
@@ -22,8 +24,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use humaux_adapters::{
-    postgres::{MaintenanceDbPool, RuntimeDbPool},
-    quota_repo::{self, RatePolicy, RateSubject, ReservationStatus, ReserveResult},
+    postgres::{MaintenanceDbPool, PoolSettings, RuntimeDbPool},
+    quota_repo::{self, RateCharge, RatePolicy, RateSubject, ReservationStatus, ReserveResult},
 };
 use humaux_domain::{
     error::ErrorCode,
@@ -45,6 +47,8 @@ const TENANT_ID: Uuid = Uuid::from_u128(0x0bad_cafe_0000_4000_8000_0000_0000_010
 const USER_ID: Uuid = Uuid::from_u128(0x0bad_cafe_0000_4000_8000_0000_0000_0102);
 const PRINCIPAL_ID: Uuid = Uuid::from_u128(0x0bad_cafe_0000_4000_8000_0000_0000_0103);
 const TENANT2_ID: Uuid = Uuid::from_u128(0x0bad_cafe_0000_4000_8000_0000_0000_0111);
+/// ADR-0065 D-D: the former `SET LOCAL lock_timeout` literal, now the registered key's fixture value.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Handle {
     rt: tokio::runtime::Runtime,
@@ -54,7 +58,14 @@ struct Handle {
     gateway: Client,
     auth: AuthorizationScope,
     auth2: AuthorizationScope,
+    /// Last field: released only after `Drop` has deleted the fixture rows.
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
+
+/// Every `Fixture` test seeds and (in `Drop`) deletes the same TENANT_ID / TENANT2_ID rows, so two of them in one
+/// process must not overlap: under the default parallel harness one test's Drop deleted the tenant another was using
+/// (`TenantBoundary`, card 38 S3 run of `--include-ignored`). The serial lane ran them one at a time anyway.
+static SHARED_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Fixture;
 
@@ -81,6 +92,9 @@ impl DbIntegrationFixture for Fixture {
 
     #[allow(clippy::too_many_lines)] // One isolated fixture validates the complete role and schema preflight before tests run.
     fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
+        let serial = SHARED_FIXTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let owner_dsn =
             std::env::var("HUMAUX_TEST_PG_DSN").map_err(|_| DbFixtureSkipReason::NoDatabaseUrl)?;
         let options = PgConnectOptions::from_str(&owner_dsn).map_err(setup_failed)?;
@@ -184,6 +198,7 @@ impl DbIntegrationFixture for Fixture {
             gateway,
             auth,
             auth2,
+            _serial: serial,
         })
     }
 }
@@ -587,7 +602,8 @@ fn mismatched_replay_and_invalid_inputs_fail_closed() {
                 RateSubject::User(&h.auth),
                 "MCP",
                 "bucket",
-                RatePolicy::new(1, 1).unwrap()
+                RatePolicy::new(1, 1).unwrap(),
+                LOCK_TIMEOUT
             )),
             Err(ErrorCode::InvalidInput)
         );
@@ -606,7 +622,8 @@ fn rate_buckets_are_subject_scoped_and_quota_failure_does_not_refund_rate() {
                 RateSubject::User(&h.auth),
                 "mcp.read",
                 "default",
-                policy
+                policy,
+                LOCK_TIMEOUT
             )),
             Ok(())
         );
@@ -616,7 +633,8 @@ fn rate_buckets_are_subject_scoped_and_quota_failure_does_not_refund_rate() {
                 RateSubject::User(&h.auth),
                 "mcp.read",
                 "default",
-                policy
+                policy,
+                LOCK_TIMEOUT
             )),
             Err(ErrorCode::RateLimited)
         );
@@ -637,7 +655,8 @@ fn rate_buckets_are_subject_scoped_and_quota_failure_does_not_refund_rate() {
                 RateSubject::Tenant(&h.auth),
                 "mcp.read",
                 "default",
-                policy
+                policy,
+                LOCK_TIMEOUT
             )),
             Ok(())
         );
@@ -778,6 +797,7 @@ fn a_contended_rate_bucket_waits_for_its_holder_instead_of_answering_rate_limite
             "mcp.read",
             "default",
             policy,
+            LOCK_TIMEOUT,
         ));
         let held_for = started.elapsed();
         holder.join().expect("holder thread");
@@ -831,10 +851,11 @@ impl PreauthHandle {
     fn consume(&self, ip: &str) -> Result<(), ErrorCode> {
         self.rt.block_on(quota_repo::consume_rate(
             &self.runtime,
-            RateSubject::PreauthIp(ip.parse().expect("ip literal")),
+            RateSubject::PreauthIp(ip.parse().expect("ip literal"), 64),
             "mcp.read",
             "default",
             RatePolicy::new(1, 1).expect("policy"),
+            LOCK_TIMEOUT,
         ))
     }
 
@@ -888,4 +909,462 @@ fn ipv4_keeps_its_full_address_key() {
         assert_eq!(h.consume("::ffff:203.0.113.9"), Err(ErrorCode::RateLimited));
         assert_eq!(h.ip_buckets(), ["203.0.113.10", "203.0.113.9"]);
     });
+}
+
+/// Fields drop in order: the pool and the owner connection close before `_db` drops the database.
+struct BatchHandle {
+    rt: tokio::runtime::Runtime,
+    runtime: Arc<RuntimeDbPool>,
+    admin: Client,
+    owner_dsn: String,
+    auth: AuthorizationScope,
+    auth2: AuthorizationScope,
+    _db: throwaway_db::ThrowawayDb,
+}
+
+/// ADR-0065 D-D: one throwaway `humaux_thread_c38_rate_*` database per test with the two fixture tenants — the
+/// lock-wait and deadlock experiments never touch the shared request-guard database.
+struct BatchFixture;
+
+impl DbIntegrationFixture for BatchFixture {
+    type Handle = BatchHandle;
+
+    fn isolate() -> Result<Self::Handle, DbFixtureSkipReason> {
+        let setup = |e: String| DbFixtureSkipReason::IsolationSetupFailed(e);
+        let db = throwaway_db::create("c38_rate")?;
+        let owner_dsn = db.dsn();
+        // dep: PostgreSQL(any) — owner connection: tenant rows, bucket reads and pg_locks of this throwaway database
+        let mut admin = Client::connect(&owner_dsn, NoTls)
+            .map_err(|e| DbFixtureSkipReason::ConnectFailed(e.to_string()))?;
+        admin
+            .execute(
+                "INSERT INTO control.tenants(tenant_id,name,state) VALUES($1,'c38 batch','ACTIVE'),($2,'c38 batch two','ACTIVE')",
+                &[&TENANT_ID, &TENANT2_ID],
+            )
+            .map_err(|e| setup(e.to_string()))?;
+        let rt = tokio::runtime::Runtime::new().map_err(|e| setup(e.to_string()))?;
+        let sep = if owner_dsn.contains('?') { '&' } else { '?' };
+        // dep: PostgreSQL(role_gateway) — the batch rate consumer
+        let runtime = rt
+            .block_on(RuntimeDbPool::connect(&format!(
+                "{owner_dsn}{sep}options=-c%20role%3Drole_gateway"
+            )))
+            .map_err(|e| setup(e.to_string()))?;
+        let scope = |tenant| {
+            BoundedSet::new([]).map(|set| {
+                AuthorizationScope::new(
+                    TenantId(tenant),
+                    PrincipalId(PRINCIPAL_ID),
+                    Some(UserId(USER_ID)),
+                    set,
+                )
+            })
+        };
+        Ok(BatchHandle {
+            rt,
+            runtime: Arc::new(runtime),
+            admin,
+            owner_dsn,
+            auth: scope(TENANT_ID).map_err(|e| setup(format!("{e:?}")))?,
+            auth2: scope(TENANT2_ID).map_err(|e| setup(format!("{e:?}")))?,
+            _db: db,
+        })
+    }
+}
+
+/// The guard's post-auth shape: credential/shared, user, tenant, credential/operation (`mcp.read`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Charge {
+    Credential,
+    User,
+    Tenant,
+    Operation,
+}
+
+fn charge(auth: &AuthorizationScope, which: Charge, policy: RatePolicy) -> RateCharge<'_> {
+    let credential = RateSubject::Credential {
+        auth,
+        credential_id: auth.principal().0,
+    };
+    let shared = quota_repo::SHARED_RATE_OPERATION;
+    let (subject, operation, bucket_key) = match which {
+        Charge::Credential => (credential, shared, "credential"),
+        Charge::User => (RateSubject::User(auth), shared, "user"),
+        Charge::Tenant => (RateSubject::Tenant(auth), shared, "tenant"),
+        Charge::Operation => (credential, "mcp.read", "operation"),
+    };
+    RateCharge {
+        subject,
+        operation,
+        bucket_key,
+        policy,
+    }
+}
+
+/// The advisory-lock key `consume_rate_batch` takes for a tenant-scope or user-scope shared bucket.
+fn lock_key(auth: &AuthorizationScope, which: Charge) -> String {
+    let tenant = auth.tenant_id().0;
+    let user = auth.user_id().expect("fixture auth carries a user").0;
+    match which {
+        Charge::Tenant => format!("rate:{tenant}:tenant:{tenant}:mcp:tenant"),
+        Charge::User => format!("rate:{tenant}:user:{user}:mcp:user"),
+        other => unreachable!("no holder for {other:?}"),
+    }
+}
+
+impl BatchHandle {
+    /// A separate session holding `key`'s advisory lock until `release` fires (or `hold` elapses).
+    fn hold(
+        &self,
+        key: String,
+        release: std::sync::mpsc::Receiver<()>,
+        hold: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let dsn = self.owner_dsn.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            // dep: PostgreSQL(any) — the holder session of this throwaway database
+            let mut client = Client::connect(&dsn, NoTls).expect("holder connects");
+            let mut txn = client.transaction().expect("holder txn");
+            txn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&key],
+            )
+            .expect("hold the bucket lock");
+            held_tx.send(()).expect("signal the lock is held");
+            let _ = release.recv_timeout(hold);
+            txn.commit().expect("release the bucket lock");
+        });
+        held_rx.recv().expect("holder took the lock");
+        holder
+    }
+
+    /// Advisory-lock requests of this database still waiting.
+    fn waiting(&mut self) -> i64 {
+        self.admin
+            .query_one(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+                &[],
+            )
+            .expect("read pg_locks")
+            .get(0)
+    }
+
+    fn await_waiting(&mut self, n: i64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.waiting() < n {
+            assert!(Instant::now() < deadline, "{n} lock waiters never queued");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn batch(
+        &self,
+        auth: &AuthorizationScope,
+        input: &[Charge],
+        policy: RatePolicy,
+        lock_timeout: Duration,
+    ) -> tokio::task::JoinHandle<Result<(), (ErrorCode, usize)>> {
+        let (pool, auth, input) = (Arc::clone(&self.runtime), auth.clone(), input.to_vec());
+        self.rt.spawn(async move {
+            let charges: Vec<_> = input.iter().map(|&c| charge(&auth, c, policy)).collect();
+            quota_repo::consume_rate_batch(&pool, &charges, lock_timeout).await
+        })
+    }
+
+    /// Tokens spent per non-empty `(kind, operation, bucket_key)` of `tenant`; an absent row spent nothing.
+    fn spent(&mut self, tenant: Uuid) -> Vec<(String, String, String, i64)> {
+        self.admin
+            .query(
+                "SELECT subject_kind, operation, bucket_key, round(capacity - tokens)::bigint FROM control.rate_buckets \
+                 WHERE tenant_id = $1 AND round(capacity - tokens) > 0 ORDER BY 1, 2, 3",
+                &[&tenant],
+            )
+            .expect("read buckets")
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .collect()
+    }
+}
+
+/// ADR-0065 D-D (W-5): two batches with opposite input orders and a third session queued ahead of them. Holder H
+/// takes the user lock; B (user, tenant) queues; A (tenant, user) queues; H commits; both batches finish Ok inside
+/// 3 s. Fault: the sort in `lock_order` removed ⇒ B holds user and waits tenant while A holds tenant and waits
+/// user ⇒ 40P01 after deadlock_timeout (or 55P03) ⇒ DependencyUnavailable ⇒ red.
+#[test]
+fn c38_reversed_batches_with_a_queued_waiter_do_not_deadlock() {
+    run_db_fixture::<BatchFixture, _>(
+        "c38_reversed_batches_with_a_queued_waiter_do_not_deadlock",
+        |mut h| {
+            let policy = RatePolicy::new(100, 100).expect("policy");
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let holder = h.hold(
+                lock_key(&h.auth, Charge::User),
+                released,
+                Duration::from_secs(10),
+            );
+            let b = h.batch(
+                &h.auth,
+                &[Charge::User, Charge::Tenant],
+                policy,
+                Duration::from_secs(2),
+            );
+            h.await_waiting(1);
+            let a = h.batch(
+                &h.auth,
+                &[Charge::Tenant, Charge::User],
+                policy,
+                Duration::from_secs(2),
+            );
+            h.await_waiting(2);
+            release.send(()).expect("release the holder");
+            holder.join().expect("holder thread");
+            let results = h.rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    (
+                        b.await.expect("batch B task"),
+                        a.await.expect("batch A task"),
+                    )
+                })
+                .await
+                .expect("both batches finish within 3 s")
+            });
+            assert_eq!(
+                results,
+                (Ok(()), Ok(())),
+                "opposite input orders never deadlock"
+            );
+        },
+    );
+}
+
+/// ADR-0065 D-D parity: a denial at input index 2 (the tenant bucket) spends exactly what four sequential
+/// transactions in input order spent — credential and user taken, tenant refused, operation untouched. Fault: the
+/// batch evaluates in tier order (tenant first) ⇒ credential and user are not spent ⇒ red.
+#[test]
+fn c38_batch_denial_spends_exactly_what_the_sequential_path_spent() {
+    run_db_fixture::<BatchFixture, _>(
+        "c38_batch_denial_spends_exactly_what_the_sequential_path_spent",
+        |mut h| {
+            let roomy = RatePolicy::new(5, 1).expect("policy");
+            let single = RatePolicy::new(1, 1).expect("policy");
+            let policy_of = |c| if c == Charge::Tenant { single } else { roomy };
+            let input = [
+                Charge::Credential,
+                Charge::User,
+                Charge::Tenant,
+                Charge::Operation,
+            ];
+            for auth in [&h.auth, &h.auth2] {
+                let drain = charge(auth, Charge::Tenant, single);
+                assert_eq!(
+                    h.rt.block_on(quota_repo::consume_rate_batch(
+                        &h.runtime,
+                        &[drain],
+                        LOCK_TIMEOUT
+                    )),
+                    Ok(()),
+                    "drain the tenant bucket"
+                );
+            }
+            // The sequential path: one transaction per bucket, stopping at the first denial.
+            let mut sequential = Ok(());
+            for (i, &c) in input.iter().enumerate() {
+                let one = charge(&h.auth, c, policy_of(c));
+                let r = h.rt.block_on(quota_repo::consume_rate(
+                    &h.runtime,
+                    one.subject,
+                    one.operation,
+                    one.bucket_key,
+                    one.policy,
+                    LOCK_TIMEOUT,
+                ));
+                if let Err(code) = r {
+                    sequential = Err((code, i));
+                    break;
+                }
+            }
+            let charges: Vec<_> = input
+                .iter()
+                .map(|&c| charge(&h.auth2, c, policy_of(c)))
+                .collect();
+            let batch = h.rt.block_on(quota_repo::consume_rate_batch(
+                &h.runtime,
+                &charges,
+                LOCK_TIMEOUT,
+            ));
+            assert_eq!(sequential, Err((ErrorCode::RateLimited, 2)));
+            assert_eq!(batch, sequential, "the same verdict at the same index");
+            let (seq, bat) = (h.spent(TENANT_ID), h.spent(TENANT2_ID));
+            assert_eq!(
+                bat, seq,
+                "the batch spends exactly what the sequential path spent"
+            );
+            assert_eq!(
+                seq.iter().map(|r| (r.0.as_str(), r.3)).collect::<Vec<_>>(),
+                [("credential", 1), ("tenant", 1), ("user", 1)]
+            );
+        },
+    );
+}
+
+/// ADR-0065 D-D (W-4): a rate-lock wait past the registered lock_timeout is 55P03, answered DependencyUnavailable
+/// (503) — never RATE_LIMITED, never Conflict — and well before the holder lets go. Fault: the 55P03 arm of
+/// `rate_db_error` removed ⇒ `db_error` ⇒ Conflict ⇒ red.
+#[test]
+fn c38_a_rate_lock_wait_past_lock_timeout_is_dependency_unavailable() {
+    run_db_fixture::<BatchFixture, _>(
+        "c38_a_rate_lock_wait_past_lock_timeout_is_dependency_unavailable",
+        |h| {
+            let policy = RatePolicy::new(100, 100).expect("policy");
+            let (_release, released) = std::sync::mpsc::channel::<()>();
+            let holder = h.hold(
+                lock_key(&h.auth, Charge::Tenant),
+                released,
+                Duration::from_millis(400),
+            );
+            let started = Instant::now();
+            let result = h.rt.block_on(h.batch(
+                &h.auth,
+                &[Charge::Credential, Charge::User, Charge::Tenant],
+                policy,
+                Duration::from_millis(100),
+            ));
+            let waited = started.elapsed();
+            holder.join().expect("holder thread");
+            assert_eq!(
+                result.expect("batch task"),
+                Err((ErrorCode::DependencyUnavailable, 2)),
+                "a lock_timeout is the store being unavailable"
+            );
+            assert!(
+                waited < Duration::from_millis(400),
+                "lock_timeout ended the wait before the holder did: {waited:?}"
+            );
+        },
+    );
+}
+
+/// ADR-0065 D-B / D-D: a rate-lock wait ended by the session's statement_timeout is SQLSTATE 57014, answered
+/// DependencyUnavailable (503) — never Internal. The pool is the gateway's production shape (`connect_with`,
+/// statement_timeout 150 ms as a startup option) and lock_timeout (5 s) is far above it, so the cancel is the
+/// statement timeout's. Fault: 57014 dropped from `rate_db_error`'s arm ⇒ `db_error` ⇒ Internal ⇒ red.
+#[test]
+fn c38_a_rate_statement_timeout_is_dependency_unavailable() {
+    run_db_fixture::<BatchFixture, _>(
+        "c38_a_rate_statement_timeout_is_dependency_unavailable",
+        |h| {
+            let policy = RatePolicy::new(100, 100).expect("policy");
+            let settings = PoolSettings {
+                max_connections: 2,
+                min_connections: 0,
+                acquire_timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(60),
+                max_lifetime: Duration::from_secs(600),
+                statement_timeout: Duration::from_millis(150),
+                idle_in_transaction_timeout: Duration::from_secs(5),
+                application_name: "c38_rate_57014".to_owned(),
+            };
+            let sep = if h.owner_dsn.contains('?') { '&' } else { '?' };
+            // dep: PostgreSQL(role_gateway) — the gateway's sized pool shape on this throwaway database
+            let pool =
+                h.rt.block_on(RuntimeDbPool::connect_with(
+                    &format!("{}{sep}options=-c%20role%3Drole_gateway", h.owner_dsn),
+                    &settings,
+                ))
+                .expect("sized role_gateway pool");
+            let (_release, released) = std::sync::mpsc::channel::<()>();
+            let holder = h.hold(
+                lock_key(&h.auth, Charge::Tenant),
+                released,
+                Duration::from_secs(2),
+            );
+            let charges = [
+                charge(&h.auth, Charge::Credential, policy),
+                charge(&h.auth, Charge::Tenant, policy),
+            ];
+            let started = Instant::now();
+            let result = h.rt.block_on(quota_repo::consume_rate_batch(
+                &pool,
+                &charges,
+                Duration::from_secs(5),
+            ));
+            let waited = started.elapsed();
+            drop(pool);
+            holder.join().expect("holder thread");
+            assert_eq!(
+                result,
+                Err((ErrorCode::DependencyUnavailable, 1)),
+                "a statement_timeout is the store being unavailable"
+            );
+            assert!(
+                waited < Duration::from_secs(2),
+                "statement_timeout ended the wait before the holder did: {waited:?}"
+            );
+        },
+    );
+}
+
+/// ADR-0065 D-D (W-5): a wait cycle the server's deadlock detector breaks is SQLSTATE 40P01, answered
+/// DependencyUnavailable (503) — never Conflict. Holder H takes the user lock; the batch (user, tenant) takes the
+/// tenant lock and queues on the user lock; 200 ms later H asks for the tenant lock, closing the cycle. The batch
+/// waited first, so its deadlock_timeout fires first and it is the victim; H then gets the tenant lock. Fault: 40P01
+/// dropped from `rate_db_error`'s arm ⇒ `db_error` ⇒ Conflict ⇒ red.
+#[test]
+fn c38_a_rate_deadlock_victim_is_dependency_unavailable() {
+    run_db_fixture::<BatchFixture, _>(
+        "c38_a_rate_deadlock_victim_is_dependency_unavailable",
+        |mut h| {
+            let policy = RatePolicy::new(100, 100).expect("policy");
+            let dsn = h.owner_dsn.clone();
+            let (user_key, tenant_key) = (
+                lock_key(&h.auth, Charge::User),
+                lock_key(&h.auth, Charge::Tenant),
+            );
+            let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || -> Result<(), String> {
+                // dep: PostgreSQL(any) — the holder session of this throwaway database
+                let mut client = Client::connect(&dsn, NoTls).map_err(|e| e.to_string())?;
+                let mut txn = client.transaction().map_err(|e| e.to_string())?;
+                let lock = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
+                txn.execute(lock, &[&user_key]).map_err(|e| e.to_string())?;
+                held_tx.send(()).map_err(|e| e.to_string())?;
+                go_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|e| e.to_string())?;
+                txn.execute(lock, &[&tenant_key])
+                    .map_err(|e| format!("the holder lost the cycle: {e}"))?;
+                txn.commit().map_err(|e| e.to_string())
+            });
+            held_rx.recv().expect("holder took the user lock");
+            let batch = h.batch(
+                &h.auth,
+                &[Charge::User, Charge::Tenant],
+                policy,
+                Duration::from_secs(5),
+            );
+            h.await_waiting(1);
+            std::thread::sleep(Duration::from_millis(200));
+            go_tx.send(()).expect("close the cycle");
+            let result = h.rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), batch)
+                    .await
+                    .expect("the detector ends the cycle within 5 s")
+                    .expect("batch task")
+            });
+            let holder = holder.join().expect("holder thread");
+            assert_eq!(
+                result,
+                Err((ErrorCode::DependencyUnavailable, 0)),
+                "a deadlock victim is the store being unavailable"
+            );
+            assert_eq!(
+                holder,
+                Ok(()),
+                "the holder got the tenant lock after the abort"
+            );
+        },
+    );
 }

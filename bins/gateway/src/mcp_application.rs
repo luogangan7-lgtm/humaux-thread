@@ -2006,6 +2006,8 @@ mod tests {
                         user: rate(),
                         tenant: rate(),
                         operation: rate(),
+                        lock_timeout: Duration::from_secs(2),
+                        preauth_ipv6_prefix_bits: 64,
                     },
                     reservation_ttl: Duration::from_secs(30),
                     handler_timeout: Duration::from_secs(5),
@@ -2604,7 +2606,7 @@ mod tests {
                 if let Some(forwarded) = forwarded {
                     // Baseline §73.2 / ADR-0062 E5: the pre-auth bucket of an IPv6 client is its /64.
                     handle.seed_legacy_system_preauth_bucket(
-                        humaux_adapters::quota_repo::preauth_ip_subject(forwarded.into()),
+                        humaux_adapters::quota_repo::preauth_ip_subject(forwarded.into(), 64),
                     );
                 }
                 let runtime_handle = handle.rt.handle().clone();
@@ -2642,6 +2644,7 @@ mod tests {
                            AND operation='mcp' AND bucket_key='preauth'",
                             &[&humaux_adapters::quota_repo::preauth_ip_subject(
                                 forwarded.into(),
+                                64,
                             )],
                         )
                         .unwrap();
