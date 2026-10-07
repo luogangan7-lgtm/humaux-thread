@@ -131,26 +131,27 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          set -uo pipefail
+          set +e +o pipefail
           out="$RUNNER_TEMP/diag.txt"; : > "$out"
           cargo build -q -p humaux-gateway --bin humaux-gateway
           bin="$PWD/target/debug/humaux-gateway"
-          # full syscall trace of one spawning test: the child made no write/connect/bind in
-          # 15 s under the filtered trace (run 9), so this time every syscall, child + threads.
-          strace -f -tt -s 120 -o "$RUNNER_TEMP/gw.strace" \
+          strace -f -tt -s 60 -o "$RUNNER_TEMP/gw.strace" \
             cargo test -q -p humaux-gateway --test ops_listener status_never_carries_a_secret_value -- --exact --nocapture \
-            > "$RUNNER_TEMP/test.out" 2>&1 || true
-          { echo "--- test output (last 12)"; tail -12 "$RUNNER_TEMP/test.out" | cut -c1-200
-            pid=$(grep -m1 "execve(\"$bin\"" "$RUNNER_TEMP/gw.strace" | cut -d' ' -f1)
-            echo "--- gateway child pid=$pid lines=$(grep -c "^$pid " "$RUNNER_TEMP/gw.strace")"
-            echo "--- child: first 80"; grep -E "^$pid " "$RUNNER_TEMP/gw.strace" | head -80 | cut -c1-200
-            echo "--- child: last 40"; grep -E "^$pid " "$RUNNER_TEMP/gw.strace" | tail -40 | cut -c1-200
-            tids=$(grep -E "^$pid .*clone3?\(" "$RUNNER_TEMP/gw.strace" | grep -oE '= [0-9]+$' | cut -c3- | tr '\n' ' ')
-            echo "--- child's threads: $tids"
-            for t in $tids; do echo "--- tid $t: last 25"; grep -E "^$t " "$RUNNER_TEMP/gw.strace" | tail -25 | cut -c1-200; done
-            echo "--- whole trace: last 60 lines excluding the test's /livez polling"; grep -vE 'connect\(|ECONNREFUSED|nanosleep|clock_nanosleep' "$RUNNER_TEMP/gw.strace" | tail -60 | cut -c1-200
+            > "$RUNNER_TEMP/test.out" 2>&1
+          pid=$(grep -m1 "execve(\"$bin\"" "$RUNNER_TEMP/gw.strace" | cut -d' ' -f1)
+          grep -E "^$pid " "$RUNNER_TEMP/gw.strace" > "$RUNNER_TEMP/child.trace"
+          tids=$(grep -oE 'clone3?\(.*\) = [0-9]+$' "$RUNNER_TEMP/child.trace" | grep -oE '[0-9]+$' | tr '\n' ' ')
+          {
+            echo "--- test output (last 6)"; tail -6 "$RUNNER_TEMP/test.out" | cut -c1-160
+            echo "--- child pid=$pid lines=$(wc -l < "$RUNNER_TEMP/child.trace") threads: $tids"
+            echo "--- child syscall histogram"; sed -E 's/^[0-9]+ [0-9:.]+ (<\.\.\. )?([a-z0-9_]+).*/\2/' "$RUNNER_TEMP/child.trace" | sort | uniq -c | sort -rn | head -15
+            echo "--- child syscalls per second"; awk '{split($2,t,"."); print t[1]}' "$RUNNER_TEMP/child.trace" | sort | uniq -c
+            echo "--- child: lines 80-140"; sed -n '80,140p' "$RUNNER_TEMP/child.trace" | cut -c1-170
+            echo "--- child: last 40"; tail -40 "$RUNNER_TEMP/child.trace" | cut -c1-170
+            for t in $tids; do echo "--- tid $t: histogram + last 15"; grep -E "^$t " "$RUNNER_TEMP/gw.strace" | sed -E 's/^[0-9]+ [0-9:.]+ (<\.\.\. )?([a-z0-9_]+).*/\2/' | sort | uniq -c | sort -rn | head -6; grep -E "^$t " "$RUNNER_TEMP/gw.strace" | tail -15 | cut -c1-170; done
           } >> "$out" 2>&1
-          wc -l "$RUNNER_TEMP/gw.strace" >> "$out"
+          echo "diag lines: $(wc -l < "$out")"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
