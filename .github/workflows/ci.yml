@@ -123,6 +123,30 @@ jobs:
       #  · humaux-gateway with --test-threads=2: its tests spawn the real gateway binary
       #    under a 5 s listen deadline (mcp_gateway.rs GATEWAY_PROCESS_START_TIMEOUT);
       #    four concurrent bootstraps on the 4-vCPU arm runner missed it, two do not.
+      # DIAGNOSTIC (temporary, run 8): on the arm runner the spawned gateway answers neither
+      # /livez within 15 s (ops_listener.rs) nor prints its start line; x64 passes. Time the
+      # bare binary and strace one spawning test to see where the child spends its first
+      # seconds. Removed once the cause is known.
+      - name: gateway start diagnostic
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo build -q -p humaux-gateway --bin humaux-gateway
+          bin=target/debug/humaux-gateway
+          ls -la "$bin"; file "$bin" | cut -c1-200
+          /usr/bin/time -v "$bin" --version 2>&1 | grep -E 'humaux-gateway|Elapsed|Maximum resident' || true
+          /usr/bin/time -v "$bin" --metrics-families 2>&1 >/dev/null | grep -E 'Elapsed|Maximum resident' || true
+          which strace >/dev/null && strace -f -tt -o "$RUNNER_TEMP/gw.strace" -e trace=execve,connect,bind,listen,exit_group \
+            cargo test -q -p humaux-gateway --test ops_listener status_never_carries_a_secret_value -- --exact --nocapture 2>&1 | tail -5 || true
+          if [ -f "$RUNNER_TEMP/gw.strace" ]; then
+            echo "--- strace: execve/bind/listen/connect/exit of the humaux-gateway child (first 60)"
+            pid=$(grep -m1 'execve(".*humaux-gateway"' "$RUNNER_TEMP/gw.strace" | cut -d' ' -f1)
+            echo "gateway pid=$pid"
+            grep -E "^$pid " "$RUNNER_TEMP/gw.strace" | head -60 | cut -c1-200
+            echo "--- all execve lines"; grep 'execve(' "$RUNNER_TEMP/gw.strace" | cut -c1-160 | head -20
+          fi
+
       - name: cargo test
         shell: bash
         run: |
@@ -130,7 +154,16 @@ jobs:
           rc=0
           cargo test --workspace --no-fail-fast --exclude humaux-maintenance --exclude humaux-gateway || rc=1
           cargo test -p humaux-gateway --no-fail-fast -- --test-threads=2 || rc=1
-          ( umask 000 && cargo test -p humaux-maintenance --no-fail-fast ) || rc=1
+          # 10.11 A: the pgbackrest repository must sit on its own filesystem (backup.rs
+          # `stat -c %d` of the bind target vs PGDATA refuses `repo_shares_pgdata_fs`). The
+          # dev Mac gets that for free (virtiofs); on the runner a loop-mounted ext4 image
+          # under TMPDIR is the equivalent of the runbook's loop-mounted repository filesystem.
+          truncate -s 12G "$RUNNER_TEMP/scratch.img"
+          mkfs.ext4 -q -F "$RUNNER_TEMP/scratch.img"
+          mkdir -p "$RUNNER_TEMP/scratch"
+          sudo mount -o loop "$RUNNER_TEMP/scratch.img" "$RUNNER_TEMP/scratch"
+          sudo chmod 1777 "$RUNNER_TEMP/scratch"
+          ( umask 000 && TMPDIR="$RUNNER_TEMP/scratch" cargo test -p humaux-maintenance --no-fail-fast ) || rc=1
           exit $rc
 
       # The CI twin of the local gate `no_leaked_distill_jobs` (TW c31_leak_check.sh) plus the
