@@ -338,7 +338,7 @@ jobs:
         if: ${{ !cancelled() }}
         continue-on-error: true
         run: |
-          cargo install cargo-deny --version 0.18.9 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
           cargo deny --workspace --all-features check
 
       # §46 Day-1 list / §57.1 Phase-0 gate row require SBOM to PASS (not
