@@ -37,8 +37,11 @@ jobs:
   ci:
     name: fmt + check + clippy + test + gates
     # Pinned image, not ubuntu-latest: a runner image upgrade must not change what
-    # the chain proves. 4 vCPU / 16 GB on public repositories.
-    runs-on: ubuntu-24.04
+    # the chain proves. linux/arm64 because §67.2 freezes the production host on ARM and
+    # the card-37 scratch images (deploy/images/postgres, qdrant by digest) are pinned
+    # --platform linux/arm64: on an x64 runner their builds fail with exit 255 (run
+    # 37615291083). 4 vCPU / 16 GB, free on public repositories.
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 150
 
     # 被测对象。版本与本机开发环境逐一对齐（postgres:18 / qdrant v1.19.0）——
@@ -83,6 +86,12 @@ jobs:
       HUMAUX_TEST_QDRANT_PORT: "6333"
 
     steps:
+      # partitions.rs::registry_survives_a_logical_dump_and_restore execs pg_dump / pg_restore
+      # inside the container named `humaux-thread-pg` (the dev container); the service
+      # container gets a generated name, so it is renamed once it is up.
+      - name: name the postgres service like the dev container
+        run: docker rename "${{ job.services.postgres.id }}" humaux-thread-pg
+
       - uses: actions/checkout@v4
         with:
           # contract-impact needs `git diff --name-only <base>` against the PR's real merge
@@ -121,7 +130,7 @@ jobs:
           q() { docker exec "${{ job.services.postgres.id }}" psql -U postgres -d humaux_thread_ci -Atc "$1"; }
           leaked=$(q "select t.name || ' ' || j.job_type || ' tenants=' || count(distinct j.tenant_id) || ' jobs=' || count(*) from ops.jobs j join control.tenants t using (tenant_id) where j.job_type in ('DERIVED_DISTILL','DERIVED_CONSOLIDATE') and j.status = 'PENDING' and t.name like '%throwaway tenant%' group by t.name, j.job_type order by count(*) desc")
           ckpt=$(q "select c.domain || '/' || c.projection_kind || ' tenants=' || count(distinct c.tenant_id) || ' checkpoints=' || count(*) from projection.stream_checkpoints c where (c.domain, c.projection_kind) not in (('private_memory','PRIVATE_MEMORY')) group by c.domain, c.projection_kind order by count(*) desc")
-          islot=$(q "select coalesce(t.name, '<no tenant row>') || ' | ' || j.status || ' | ' || coalesce(j.dispatch_state, '-') || ' | gen=' || j.claim_generation || ' | slots=' || (select count(*) from ops.provider_slots s where s.job_id = j.job_id and s.claim_generation = j.claim_generation) || ' | created=' || j.created_at || ' | updated=' || j.updated_at from ops.jobs j left join control.tenants t using (tenant_id) where j.job_type = 'DERIVED_DISTILL' and j.status = 'PROCESSING' and j.dispatch_state is not null and (select count(*) from ops.provider_slots s where s.job_id = j.job_id and s.claim_generation = j.claim_generation) <> 1 order by j.created_at")
+          islot=$(q "select coalesce(t.name, '<no tenant row>') || ' | ' || j.status || ' | ' || coalesce(j.dispatch_state, '-') || ' | gen=' || j.claim_generation || ' | slots=' || (select count(*) from ops.provider_slots s where s.job_id = j.job_id and s.claim_generation = j.claim_generation) || ' | created=' || j.created_at from ops.jobs j left join control.tenants t using (tenant_id) where j.job_type = 'DERIVED_DISTILL' and j.status = 'PROCESSING' and j.dispatch_state is not null and (select count(*) from ops.provider_slots s where s.job_id = j.job_id and s.claim_generation = j.claim_generation) <> 1 order by j.created_at")
           slots=$(q "select slot_id || ' job=' || coalesce(job_id::text, '-') || ' gen=' || coalesce(claim_generation::text, '-') from ops.provider_slots order by 1")
           echo "provider_slots:"; echo "$slots"
           rc=0
@@ -153,20 +162,22 @@ jobs:
       - name: cargo xtask config-check
         run: cargo xtask config-check
 
-      # §80.3: the base is the PR merge base, or the previous head on a push. A
-      # branch's first push has no previous head (all-zero sha): run without --base,
-      # which xtask reports as its own tri-state verdict (contract_impact.rs, §57.1).
-      - name: cargo xtask contract-impact
+      # §80.3: the base is the PR merge base, or on a push the merge base with main
+      # (`github.event.before` is all zeros on a branch's first push). Computed in its own
+      # step because contract_impact.rs's unit test pins the shape of the next line:
+      # one `run: cargo xtask contract-impact … --base` line, never a multi-line script.
+      - name: contract-impact base
         shell: bash
         run: |
           set -euo pipefail
-          base='${{ github.event.pull_request.base.sha || github.event.before }}'
-          if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$base^{commit}" 2>/dev/null; then
-            cargo xtask contract-impact --base "$base"
-          else
-            echo "contract-impact: no reachable base commit for this event (first push / dispatch); running without --base"
-            cargo xtask contract-impact
+          base='${{ github.event.pull_request.base.sha }}'
+          if [ -z "$base" ]; then
+            git fetch -q origin main
+            base="$(git merge-base origin/main HEAD)"
           fi
+          echo "CONTRACT_IMPACT_BASE=$base" >> "$GITHUB_ENV"
+      - name: cargo xtask contract-impact
+        run: cargo xtask contract-impact --base ${{ env.CONTRACT_IMPACT_BASE }}
 
       - name: cargo xtask migration-rehearsal
         run: cargo xtask migration-rehearsal
@@ -262,7 +273,7 @@ jobs:
     name: live providers (MiniMax + DashScope)
     needs: ci
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     environment: minimax m3
     services:
