@@ -91,6 +91,8 @@ jobs:
       # 声明「本次运行有这两个依赖」⇒ 此后任何跳过都是环境故障（见头部注释）。
       HUMAUX_REQUIRE_DB: "1"
       HUMAUX_REQUIRE_QDRANT: "1"
+      # The runner has Docker, so the card-37 scratch-source tests must run, never skip (§79.2).
+      HUMAUX_REQUIRE_DOCKER: "1"
       # REST port of the qdrant service above (tests default to 6333; stated here so
       # the service block and the tests cannot drift apart silently).
       HUMAUX_TEST_QDRANT_PORT: "6333"
@@ -221,7 +223,14 @@ jobs:
         run: |
           set -euo pipefail
           base='${{ github.event.pull_request.base.sha }}'
-          if [ -z "$base" ]; then
+          before='${{ github.event.before }}'
+          # Independent review of PR #1: on a push to main, merge-base(origin/main, HEAD) IS HEAD,
+          # so the diff was empty and the gate vacuous. A push compares against the previous
+          # head (github.event.before); only a branch's first push (all-zero before) and a
+          # dispatch fall back to the merge base with main.
+          if [ -z "$base" ] && [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$before^{commit}" 2>/dev/null; then
+            base="$before"
+          elif [ -z "$base" ]; then
             git fetch -q origin main
             base="$(git merge-base origin/main HEAD)"
           fi
@@ -329,7 +338,7 @@ jobs:
         if: ${{ !cancelled() }}
         continue-on-error: true
         run: |
-          cargo install cargo-deny --locked
+          cargo install cargo-deny --version 0.18.9 --locked
           cargo deny --workspace --all-features check
 
       # §46 Day-1 list / §57.1 Phase-0 gate row require SBOM to PASS (not
@@ -339,12 +348,22 @@ jobs:
       - name: SBOM (cargo-sbom, §46)
         if: ${{ !cancelled() }}
         run: |
-          cargo install cargo-sbom --locked
+          cargo install cargo-sbom --version 0.10.0 --locked
           cargo sbom --output-format=spdx_json_2_3 > sbom.spdx.json
 
       # §57.1 第3条: 依赖运行时基础设施（vector store / mutation harness / live
       # deploy target / image registry），Phase 0 尚无被测对象。按三态输出
       # not_applicable 并点名缺失对象，不是注释掉这些步骤、也不是假装它们通过。
+      # §57.1 rule 2: the two gates the comment above explains are printed as tri-state
+      # lines naming the missing object, not left as prose.
+      - name: dod-check (not_applicable — verifiers unregistered)
+        if: ${{ !cancelled() }}
+        run: 'echo "not_applicable (missing object: DoD verifiers — 94 DoD rows, 5 registered in crates/testkit/src/dod.rs; §69 three-way binding pending)"'
+
+      - name: benchset-declaration (not_applicable — benchsets undeclared)
+        if: ${{ !cancelled() }}
+        run: 'echo "not_applicable (missing object: measured declarations for continuation_198_v2 / longmemeval_style / agent_workflow_outcome / project_continuity / memory_security_lifecycle)"'
+
       - name: retrieval benchmark (not_applicable — Phase 0)
         if: ${{ !cancelled() }}
         run: 'echo "not_applicable (missing object: retrieval benchmark corpus / embedding index — delivered Phase 6, §57.1 rule 3)"'
@@ -409,8 +428,6 @@ jobs:
       HUMAUX_REQUIRE_MINIMAX: "1"
       HUMAUX_REQUIRE_SECOND_PROVIDER: "1"
       HUMAUX_REQUIRE_DASHSCOPE: "1"
-      MINIMAX_API_KEY: ${{ secrets.MINIMAXAPIKEY }}
-      DASHSCOPE_API_KEY: ${{ secrets.ALIBABA_CLOUD_API_KEY }}
       # ADR-0060 canonical second-provider set (values are not secrets; the key is the
       # variable HUMAUX_LIVE_P2_KEY_ENV names).
       HUMAUX_LIVE_P2_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
@@ -427,13 +444,25 @@ jobs:
       - uses: ./.github/actions/setup
 
       - name: distill hop (private worker, MiniMax)
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAXAPIKEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.ALIBABA_CLOUD_API_KEY }}
         run: cargo test -p humaux-private-worker --test distill_hop_e2e -- --include-ignored
 
       - name: derived dispatch live tests (fairness, poison, two providers, channel A/B)
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAXAPIKEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.ALIBABA_CLOUD_API_KEY }}
         run: cargo test -p humaux-private-worker --test derived_dispatch_e2e -- --include-ignored live
 
       - name: consolidation hop (MiniMax)
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAXAPIKEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.ALIBABA_CLOUD_API_KEY }}
         run: cargo test -p humaux-consolidation-worker --test consolidation_hop_e2e -- --include-ignored
 
       - name: dashscope live smoke (retrieval provider)
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAXAPIKEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.ALIBABA_CLOUD_API_KEY }}
         run: cargo test -p humaux-retrieval-provider --test dashscope_live_smoke -- --include-ignored
