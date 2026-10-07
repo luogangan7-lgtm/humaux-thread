@@ -133,19 +133,17 @@ jobs:
         run: |
           set -uo pipefail
           cargo build -q -p humaux-gateway --bin humaux-gateway
-          bin=target/debug/humaux-gateway
-          ls -la "$bin"; file "$bin" | cut -c1-200
-          /usr/bin/time -v "$bin" --version 2>&1 | grep -E 'humaux-gateway|Elapsed|Maximum resident' || true
-          /usr/bin/time -v "$bin" --metrics-families 2>&1 >/dev/null | grep -E 'Elapsed|Maximum resident' || true
-          which strace >/dev/null && strace -f -tt -o "$RUNNER_TEMP/gw.strace" -e trace=execve,connect,bind,listen,exit_group \
-            cargo test -q -p humaux-gateway --test ops_listener status_never_carries_a_secret_value -- --exact --nocapture 2>&1 | tail -5 || true
-          if [ -f "$RUNNER_TEMP/gw.strace" ]; then
-            echo "--- strace: execve/bind/listen/connect/exit of the humaux-gateway child (first 60)"
-            pid=$(grep -m1 'execve(".*humaux-gateway"' "$RUNNER_TEMP/gw.strace" | cut -d' ' -f1)
-            echo "gateway pid=$pid"
-            grep -E "^$pid " "$RUNNER_TEMP/gw.strace" | head -60 | cut -c1-200
-            echo "--- all execve lines"; grep 'execve(' "$RUNNER_TEMP/gw.strace" | cut -c1-160 | head -20
-          fi
+          bin="$PWD/target/debug/humaux-gateway"
+          strace -f -tt -s 160 -o "$RUNNER_TEMP/gw.strace" -e trace=execve,connect,bind,listen,exit_group,write \
+            cargo test -q -p humaux-gateway --test ops_listener status_never_carries_a_secret_value -- --exact --nocapture \
+            > "$RUNNER_TEMP/test.out" 2>&1 || true
+          echo "--- test output (last 40 lines)"; tail -40 "$RUNNER_TEMP/test.out" | cut -c1-200
+          pid=$(grep -m1 "execve(\"$bin\"" "$RUNNER_TEMP/gw.strace" | cut -d' ' -f1)
+          echo "--- gateway child pid=$pid; its trace lines=$(grep -c "^$pid " "$RUNNER_TEMP/gw.strace")"
+          echo "--- first 40"; grep -E "^$pid " "$RUNNER_TEMP/gw.strace" | head -40 | cut -c1-220
+          echo "--- last 40"; grep -E "^$pid " "$RUNNER_TEMP/gw.strace" | tail -40 | cut -c1-220
+          echo "--- child's children (clone'd threads excluded): execve lines after the child"
+          grep 'execve(' "$RUNNER_TEMP/gw.strace" | grep -v rustc | cut -c1-200 | tail -8
 
       - name: cargo test
         shell: bash
