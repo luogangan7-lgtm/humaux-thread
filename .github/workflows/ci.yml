@@ -14,8 +14,21 @@ name: CI
 # 则是防复发的那一半：**声明**了有依赖之后，任何一次跳过都是环境故障、当场变红。
 # 删掉 services 段的那次提交会立刻红，而不是三个月后有人发现 RLS 从没被测过。
 
+# Triggers (main line 2026-10-07): the repository went public on GitHub so the
+# RAM-heavy part of the gate chain (cargo test --workspace + xtask gates) runs on a
+# 16 GB hosted runner instead of the shared 6 GiB Docker VM on the dev Mac. Pushes
+# to main and ci/** branches run it; workflow_dispatch is for re-runs.
 on:
+  push:
+    branches: [main, 'ci/**']
   pull_request:
+  workflow_dispatch:
+
+# One run per ref: a newer push supersedes the one still queued (free-tier
+# concurrency is shared with the owner's other repositories).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,7 +36,10 @@ env:
 jobs:
   ci:
     name: fmt + check + clippy + test + gates
-    runs-on: ubuntu-latest
+    # Pinned image, not ubuntu-latest: a runner image upgrade must not change what
+    # the chain proves. 4 vCPU / 16 GB on public repositories.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
 
     # 被测对象。版本与本机开发环境逐一对齐（postgres:18 / qdrant v1.19.0）——
     # 版本漂移会让 CI 证明的东西和开发机证明的东西不是同一个。
@@ -55,6 +71,9 @@ jobs:
       # 声明「本次运行有这两个依赖」⇒ 此后任何跳过都是环境故障（见头部注释）。
       HUMAUX_REQUIRE_DB: "1"
       HUMAUX_REQUIRE_QDRANT: "1"
+      # REST port of the qdrant service above (tests default to 6333; stated here so
+      # the service block and the tests cannot drift apart silently).
+      HUMAUX_TEST_QDRANT_PORT: "6333"
 
     steps:
       - uses: actions/checkout@v4
@@ -64,10 +83,14 @@ jobs:
           # against at all.
           fetch-depth: 0
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # rust-toolchain.toml pins 1.99.0 (ADR-0050 D-G); install exactly that and prove
+      # it by string comparison, as the toolchain file itself demands.
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.0 --profile minimal -c clippy -c rustfmt
+          rustup default 1.99.0
+          rustc --version | grep -F 'rustc 1.99.0'
 
       - uses: Swatinem/rust-cache@v2
 
@@ -136,8 +159,20 @@ jobs:
       - name: cargo xtask config-check
         run: cargo xtask config-check
 
+      # §80.3: the base is the PR merge base, or the previous head on a push. A
+      # branch's first push has no previous head (all-zero sha): run without --base,
+      # which xtask reports as its own tri-state verdict (contract_impact.rs, §57.1).
       - name: cargo xtask contract-impact
-        run: cargo xtask contract-impact --base ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base='${{ github.event.pull_request.base.sha || github.event.before }}'
+          if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            cargo xtask contract-impact --base "$base"
+          else
+            echo "contract-impact: no reachable base commit for this event (first push / dispatch); running without --base"
+            cargo xtask contract-impact
+          fi
 
       - name: cargo xtask migration-rehearsal
         run: cargo xtask migration-rehearsal
