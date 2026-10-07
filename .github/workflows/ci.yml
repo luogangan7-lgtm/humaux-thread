@@ -216,6 +216,7 @@ jobs:
       # step because contract_impact.rs's unit test pins the shape of the next line:
       # one `run: cargo xtask contract-impact … --base` line, never a multi-line script.
       - name: contract-impact base
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -euo pipefail
@@ -226,38 +227,60 @@ jobs:
           fi
           echo "CONTRACT_IMPACT_BASE=$base" >> "$GITHUB_ENV"
       - name: cargo xtask contract-impact
+        if: ${{ !cancelled() }}
         run: cargo xtask contract-impact --base ${{ env.CONTRACT_IMPACT_BASE }}
 
       - name: cargo xtask migration-rehearsal
+        if: ${{ !cancelled() }}
         run: cargo xtask migration-rehearsal
 
       # 以下六道此前一道都没接进 CI —— 它们本地全绿，但「本地绿」不是判据，
       # 没在 CI 跑过的闸等于没有人在看。rls-check 需要真库，上面的 services 已提供。
       - name: cargo xtask metrics-registry
+        if: ${{ !cancelled() }}
         run: cargo xtask metrics-registry
+      # DIAGNOSTIC (run 15): D2 reported every witness as missing/not passed after 6 s — the
+      # probe package under target/metrics-witness-probe did not compile or run here. Show
+      # cargo's own words for it.
+      - name: witness probe diagnostic
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          ls -la target/metrics-witness-probe 2>&1 | head -8
+          cat target/metrics-witness-probe/Cargo.toml 2>/dev/null | head -40
+          cargo test --manifest-path target/metrics-witness-probe/Cargo.toml --offline 2>&1 | tail -60 | cut -c1-220
 
       - name: cargo xtask gate-registry
+        if: ${{ !cancelled() }}
         run: cargo xtask gate-registry
 
       - name: cargo xtask r4-fault-manifest
+        if: ${{ !cancelled() }}
         run: cargo xtask r4-fault-manifest
 
       - name: cargo xtask threshold-shape
+        if: ${{ !cancelled() }}
         run: cargo xtask threshold-shape
 
       - name: cargo xtask direction-table
+        if: ${{ !cancelled() }}
         run: cargo xtask direction-table
 
       - name: cargo xtask card-version
+        if: ${{ !cancelled() }}
         run: cargo xtask card-version
 
       - name: cargo xtask rls-check
+        if: ${{ !cancelled() }}
         run: cargo xtask rls-check
 
       # PHASE 真源的过期闸：下一相位的交付物 marker 已非占位而 PHASE 未前进 ⇒ 红。
       # 「当前状态」型常量写进静态文件的那天就开始腐烂，除非配一道会红的过期闸——
       # PHASE 文件正是那种常量（审计结论，见 xtask/src/phase.rs 模块 doc）。
       - name: cargo xtask phase-check
+        if: ${{ !cancelled() }}
         run: cargo xtask phase-check
 
       # ---------------------------------------------------------------------
@@ -283,6 +306,7 @@ jobs:
       # ---------------------------------------------------------------------
 
       - name: cargo-deny check (§78.5)
+        if: ${{ !cancelled() }}
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           arguments: --workspace --all-features
@@ -292,6 +316,7 @@ jobs:
       # infrastructure needed, so it does not qualify for the tri-state
       # not_applicable exception in §57.1 rule 3.
       - name: SBOM (cargo-sbom, §46)
+        if: ${{ !cancelled() }}
         run: |
           cargo install cargo-sbom --locked
           cargo sbom --output-format=spdx_json_2_3 > sbom.spdx.json
@@ -300,15 +325,19 @@ jobs:
       # deploy target / image registry），Phase 0 尚无被测对象。按三态输出
       # not_applicable 并点名缺失对象，不是注释掉这些步骤、也不是假装它们通过。
       - name: retrieval benchmark (not_applicable — Phase 0)
+        if: ${{ !cancelled() }}
         run: 'echo "not_applicable (missing object: retrieval benchmark corpus / embedding index — delivered Phase 6, §57.1 rule 3)"'
 
       - name: mutation tests (not_applicable — Phase 0)
+        if: ${{ !cancelled() }}
         run: 'echo "not_applicable (missing object: mutation harness / testkit fault targets — delivered Phase 1, §57.1 rule 3)"'
 
       - name: deploy smoke (not_applicable — Phase 0)
+        if: ${{ !cancelled() }}
         run: 'echo "not_applicable (missing object: live deploy target with /live /ready /status — delivered Phase 14, §57.1 rule 3)"'
 
       - name: container scan (not_applicable — Phase 0)
+        if: ${{ !cancelled() }}
         run: 'echo "not_applicable (missing object: container image to scan — delivered Phase 14, §57.1 rule 3)"'
 
   # Real-provider tests (the local chain's distill_hop_live / distill_fairness_live /
