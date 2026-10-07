@@ -237,16 +237,26 @@ jobs:
       # 以下六道此前一道都没接进 CI —— 它们本地全绿，但「本地绿」不是判据，
       # 没在 CI 跑过的闸等于没有人在看。rls-check 需要真库，上面的 services 已提供。
       # metrics-registry D2/D6 compile and RUN every witness file as a throwaway probe
-      # package with its own `--target-dir target/metrics-witness-probe-out`, `--offline`,
-      # 120 s per family (xtask/src/metrics_registry.rs run_witness_probe). On the dev Mac
-      # that target dir is warm; on a fresh runner the first families spend their whole
-      # budget compiling the dependency tree and count as "not passed" (run 37650850876).
-      # Progress survives each timeout, so one bounded warm-up pass fills the dir and the
-      # real gate below then only compiles the tiny per-family probe binaries.
-      - name: warm the metrics witness probe target dir
+      # package (target/metrics-witness-probe, its own --target-dir
+      # target/metrics-witness-probe-out, `--offline`, 120 s per family —
+      # xtask/src/metrics_registry.rs run_witness_probe). On the dev Mac the probe's lockfile,
+      # registry cache and target dir are warm; on a fresh runner the gate finished in 6 s
+      # with every witness "missing" (run 37656756823): the probe resolves its dependencies
+      # from scratch and `--offline` cannot. This step lets the xtask write the probe
+      # manifest once, resolves and fetches the probe's dependencies ONLINE, pre-compiles
+      # them, and prints cargo's own words if any of that fails. The real gate follows.
+      - name: warm the metrics witness probe (lockfile, fetch, deps)
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: timeout 1500 cargo xtask metrics-registry > /dev/null 2>&1 || true
+        shell: bash
+        run: |
+          set +e
+          cargo xtask metrics-registry > /dev/null 2>&1
+          m=target/metrics-witness-probe/Cargo.toml
+          test -f "$m" || { echo "no probe manifest written"; exit 0; }
+          cargo generate-lockfile --manifest-path "$m" 2>&1 | tail -5
+          cargo fetch --manifest-path "$m" 2>&1 | tail -3
+          cargo test --manifest-path "$m" --target-dir target/metrics-witness-probe-out --offline --no-run 2>&1 | tail -15 | cut -c1-200
 
       - name: cargo xtask metrics-registry
         if: ${{ !cancelled() }}
@@ -305,11 +315,14 @@ jobs:
       # 从一处真源读取而不是写死在这个文件里。
       # ---------------------------------------------------------------------
 
+      # EmbarkStudios/cargo-deny-action runs an x86_64 binary in a container: "Exec format
+      # error" on the arm64 runner (run 37656756823). The crate installs natively instead;
+      # rust-cache keeps ~/.cargo/bin across runs.
       - name: cargo-deny check (§78.5)
         if: ${{ !cancelled() }}
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          arguments: --workspace --all-features
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny --workspace --all-features check
 
       # §46 Day-1 list / §57.1 Phase-0 gate row require SBOM to PASS (not
       # not_applicable): it is generated statically from Cargo.lock, no live
