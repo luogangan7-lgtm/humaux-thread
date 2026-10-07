@@ -236,21 +236,21 @@ jobs:
 
       # 以下六道此前一道都没接进 CI —— 它们本地全绿，但「本地绿」不是判据，
       # 没在 CI 跑过的闸等于没有人在看。rls-check 需要真库，上面的 services 已提供。
+      # metrics-registry D2/D6 compile and RUN every witness file as a throwaway probe
+      # package with its own `--target-dir target/metrics-witness-probe-out`, `--offline`,
+      # 120 s per family (xtask/src/metrics_registry.rs run_witness_probe). On the dev Mac
+      # that target dir is warm; on a fresh runner the first families spend their whole
+      # budget compiling the dependency tree and count as "not passed" (run 37650850876).
+      # Progress survives each timeout, so one bounded warm-up pass fills the dir and the
+      # real gate below then only compiles the tiny per-family probe binaries.
+      - name: warm the metrics witness probe target dir
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: timeout 1500 cargo xtask metrics-registry > /dev/null 2>&1 || true
+
       - name: cargo xtask metrics-registry
         if: ${{ !cancelled() }}
         run: cargo xtask metrics-registry
-      # DIAGNOSTIC (run 15): D2 reported every witness as missing/not passed after 6 s — the
-      # probe package under target/metrics-witness-probe did not compile or run here. Show
-      # cargo's own words for it.
-      - name: witness probe diagnostic
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        shell: bash
-        run: |
-          set +e
-          ls -la target/metrics-witness-probe 2>&1 | head -8
-          cat target/metrics-witness-probe/Cargo.toml 2>/dev/null | head -40
-          cargo test --manifest-path target/metrics-witness-probe/Cargo.toml --offline 2>&1 | tail -60 | cut -c1-220
 
       - name: cargo xtask gate-registry
         if: ${{ !cancelled() }}
