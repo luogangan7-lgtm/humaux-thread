@@ -171,8 +171,33 @@ jobs:
             echo "HUMAUX_PUBLIC_WORKER_PG_DSN=postgres://role_public_worker:${HUMAUX_ROLE_PASSWORD_PUBLIC_WORKER}@${base}"
           } >> "$GITHUB_ENV"
 
+      # --no-fail-fast: one run shows every red binary, not just the first (§57.1 rule 2:
+      # a stop at the first failure hides the rest behind it).
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
+
+      # The CI twin of the local gate `no_leaked_distill_jobs` (TW c31_leak_check.sh) plus the
+      # ADR-0058 §2.1 I-SLOT probe over the whole table: a test binary that leaves claimable
+      # or half-claimed DERIVED_* jobs behind breaks every later binary that asserts the
+      # invariant, and the leak must be named by tenant, not guessed. Always runs so a red
+      # `cargo test` still gets its diagnosis.
+      - name: no_leaked_distill_jobs + I-SLOT probe
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          q() { docker exec "${{ job.services.postgres.id }}" psql -U postgres -d postgres -Atc "$1"; }
+          leaked=$(q "select t.name || ' ' || j.job_type || ' tenants=' || count(distinct j.tenant_id) || ' jobs=' || count(*) from ops.jobs j join control.tenants t using (tenant_id) where j.job_type in ('DERIVED_DISTILL','DERIVED_CONSOLIDATE') and j.status = 'PENDING' and t.name like '%throwaway tenant%' group by t.name, j.job_type order by count(*) desc")
+          ckpt=$(q "select c.domain || '/' || c.projection_kind || ' tenants=' || count(distinct c.tenant_id) || ' checkpoints=' || count(*) from projection.stream_checkpoints c where (c.domain, c.projection_kind) not in (('private_memory','PRIVATE_MEMORY')) group by c.domain, c.projection_kind order by count(*) desc")
+          islot=$(q "select coalesce(t.name, '<no tenant row>') || ' | ' || j.status || ' | ' || coalesce(j.dispatch_state, '-') || ' | gen=' || j.claim_generation || ' | slots=' || (select count(*) from ops.provider_slots s where s.job_id = j.job_id and s.claim_generation = j.claim_generation) || ' | created=' || j.created_at || ' | updated=' || j.updated_at from ops.jobs j left join control.tenants t using (tenant_id) where j.job_type = 'DERIVED_DISTILL' and j.status = 'PROCESSING' and j.dispatch_state is not null and (select count(*) from ops.provider_slots s where s.job_id = j.job_id and s.claim_generation = j.claim_generation) <> 1 order by j.created_at")
+          slots=$(q "select slot_id || ' job=' || coalesce(job_id::text, '-') || ' gen=' || coalesce(claim_generation::text, '-') from ops.provider_slots order by 1")
+          echo "provider_slots:"; echo "$slots"
+          rc=0
+          if [ -n "$leaked" ]; then echo "no_leaked_distill_jobs: FAIL (claimable derived jobs on throwaway tenants)"; echo "$leaked"; rc=1; fi
+          if [ -n "$ckpt" ]; then echo "no_leaked_distill_jobs: FAIL (stream_checkpoints outside the registered pair)"; echo "$ckpt"; rc=1; fi
+          if [ -n "$islot" ]; then echo "i_slot: FAIL (PROCESSING DERIVED_DISTILL rows without exactly one slot)"; echo "$islot"; rc=1; fi
+          [ $rc -eq 0 ] && echo "no_leaked_distill_jobs: pass; i_slot: pass"
+          exit $rc
 
       - name: contribution ignored integration tests
         run: |
