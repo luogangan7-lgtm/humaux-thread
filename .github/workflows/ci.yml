@@ -192,18 +192,15 @@ jobs:
           [ $rc -eq 0 ] && echo "no_leaked_distill_jobs: pass; i_slot: pass"
           exit $rc
 
-      - name: contribution ignored integration tests
-        run: |
-          cargo test -p humaux-adapters --test contribution_scan -- --ignored --test-threads=1
-          cargo test -p humaux-adapters --test contribution_pipeline -- --ignored --test-threads=1
-          cargo test -p humaux-adapters --test contribution_authorization -- --ignored --test-threads=1
-          cargo test -p humaux-adapters --test contribution_reasoner -- --ignored --test-threads=1
-          cargo test -p humaux-adapters --test public_provenance -- --ignored --test-threads=1
-          cargo test -p humaux-adapters --test public_trust -- --ignored --test-threads=1
-          cargo test -p humaux-adapters --test public_provenance_revocation_eval -- --ignored --test-threads=1
-
-      - name: G80-45/DOD-054 public anonymous topology
-        run: cargo test -p humaux-adapters --test public_runtime assessed_anonymous_lifecycle_tracks_supported_revision_and_revocation_fails_closed -- --ignored --exact --test-threads=1
+      # The #[ignore = "lane(...)"] tier (§79.2 / ADR-0047, docs/ops/serial-lane.md): the
+      # two hand-listed `--ignored` steps that stood here since Phase 0 ran lane tests
+      # without the lane's resources (run 37646055641: public_provenance's mutation tests
+      # expect HUMAUX_PUBLIC_PROVENANCE_FAULT_DB on a dedicated database — "refusing to
+      # alter source guards outside the dedicated mutation database"). The lane runner
+      # provisions each resource (per-run databases, the gitleaks fixture, humaux-admin)
+      # and runs lane(a)/lane(b) serially after a warm-up; lane(c) is reported, not run.
+      - name: cargo xtask serial-lane (the ignored tier)
+        run: cargo xtask serial-lane
 
       - name: cargo xtask architecture-check
         run: cargo xtask architecture-check
