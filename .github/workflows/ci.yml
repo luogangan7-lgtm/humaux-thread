@@ -48,6 +48,11 @@ jobs:
         image: postgres:18
         env:
           POSTGRES_PASSWORD: ci
+          # testkit::fixture_purge refuses any database whose name does not start with
+          # `humaux_thread_` (the local-disposable predicate the e2e-seed binding rule uses).
+          # On `postgres` every fixture tenant stayed behind and the I-SLOT probe of
+          # distill_dispatch_v2 grew red with each test (run 37613916837).
+          POSTGRES_DB: humaux_thread_ci
         ports:
           - 5432:5432
         # 没有 health check 的话，migrate 会在库还没起来时抢跑，红得莫名其妙。
@@ -67,9 +72,9 @@ jobs:
       # placeholder password, so a fresh cluster is provisioned the way production is
       # (runbook §2) in the step below. The migrate principal is the service superuser:
       # outside the §6.2.0 role set, which is what MigratorDbPool::connect requires.
-      HUMAUX_TEST_PG_DSN: postgres://postgres:ci@127.0.0.1:5432/postgres
-      DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres
-      HUMAUX_MIGRATOR_PG_DSN: postgres://postgres:ci@127.0.0.1:5432/postgres
+      HUMAUX_TEST_PG_DSN: postgres://postgres:ci@127.0.0.1:5432/humaux_thread_ci
+      DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/humaux_thread_ci
+      HUMAUX_MIGRATOR_PG_DSN: postgres://postgres:ci@127.0.0.1:5432/humaux_thread_ci
       # 声明「本次运行有这两个依赖」⇒ 此后任何跳过都是环境故障（见头部注释）。
       HUMAUX_REQUIRE_DB: "1"
       HUMAUX_REQUIRE_QDRANT: "1"
@@ -160,7 +165,7 @@ jobs:
           rotate --create-missing
           cargo xtask migrate
           rotate --role role_admin
-          base='127.0.0.1:5432/postgres'
+          base='127.0.0.1:5432/humaux_thread_ci'
           {
             echo "HUMAUX_GATEWAY_PG_DSN=postgres://role_gateway:${HUMAUX_ROLE_PASSWORD_GATEWAY}@${base}"
             echo "PRIVATE_WORKER_PG_DSN=postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER}@${base}"
@@ -186,7 +191,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          q() { docker exec "${{ job.services.postgres.id }}" psql -U postgres -d postgres -Atc "$1"; }
+          q() { docker exec "${{ job.services.postgres.id }}" psql -U postgres -d humaux_thread_ci -Atc "$1"; }
           leaked=$(q "select t.name || ' ' || j.job_type || ' tenants=' || count(distinct j.tenant_id) || ' jobs=' || count(*) from ops.jobs j join control.tenants t using (tenant_id) where j.job_type in ('DERIVED_DISTILL','DERIVED_CONSOLIDATE') and j.status = 'PENDING' and t.name like '%throwaway tenant%' group by t.name, j.job_type order by count(*) desc")
           ckpt=$(q "select c.domain || '/' || c.projection_kind || ' tenants=' || count(distinct c.tenant_id) || ' checkpoints=' || count(*) from projection.stream_checkpoints c where (c.domain, c.projection_kind) not in (('private_memory','PRIVATE_MEMORY')) group by c.domain, c.projection_kind order by count(*) desc")
           islot=$(q "select coalesce(t.name, '<no tenant row>') || ' | ' || j.status || ' | ' || coalesce(j.dispatch_state, '-') || ' | gen=' || j.claim_generation || ' | slots=' || (select count(*) from ops.provider_slots s where s.job_id = j.job_id and s.claim_generation = j.claim_generation) || ' | created=' || j.created_at || ' | updated=' || j.updated_at from ops.jobs j left join control.tenants t using (tenant_id) where j.job_type = 'DERIVED_DISTILL' and j.status = 'PROCESSING' and j.dispatch_state is not null and (select count(*) from ops.provider_slots s where s.job_id = j.job_id and s.claim_generation = j.claim_generation) <> 1 order by j.created_at")
