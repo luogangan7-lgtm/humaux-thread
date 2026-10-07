@@ -32,6 +32,16 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Finding (runs 9-12, strace): gateway/context.rs `executable_fingerprint()` sha256-hashes
+  # the WHOLE running executable once per process (OnceLock) — the gateway at startup and
+  # every test binary that assembles context. A 272 MiB debug binary on this runner's
+  # cold disk took ~20 s, past the 5 s / 15 s listen deadlines of mcp_gateway.rs and
+  # ops_listener.rs (x64 runner ~8 s, the dev Mac's SSD well under 1 s). Debuginfo off
+  # shrinks dev-profile binaries several-fold; `panicked at file:line` is unaffected
+  # (it is a panic location, not debuginfo). The product-side fix — fingerprint at build
+  # time instead of hashing the binary at runtime — is a card-39 finding, not CI's call.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   ci:
@@ -123,42 +133,6 @@ jobs:
       #  · humaux-gateway with --test-threads=2: its tests spawn the real gateway binary
       #    under a 5 s listen deadline (mcp_gateway.rs GATEWAY_PROCESS_START_TIMEOUT);
       #    four concurrent bootstraps on the 4-vCPU arm runner missed it, two do not.
-      # DIAGNOSTIC (temporary, run 8): on the arm runner the spawned gateway answers neither
-      # /livez within 15 s (ops_listener.rs) nor prints its start line; x64 passes. Time the
-      # bare binary and strace one spawning test to see where the child spends its first
-      # seconds. Removed once the cause is known.
-      - name: gateway start diagnostic
-        continue-on-error: true
-        shell: bash
-        run: |
-          set +e +o pipefail
-          out="$RUNNER_TEMP/diag.txt"; : > "$out"
-          cargo build -q -p humaux-gateway --bin humaux-gateway
-          bin="$PWD/target/debug/humaux-gateway"
-          strace -f -tt -s 60 -o "$RUNNER_TEMP/gw.strace" \
-            cargo test -q -p humaux-gateway --test ops_listener status_never_carries_a_secret_value -- --exact --nocapture \
-            > "$RUNNER_TEMP/test.out" 2>&1
-          pid=$(grep -m1 "execve(\"$bin\"" "$RUNNER_TEMP/gw.strace" | cut -d' ' -f1)
-          grep -E "^$pid " "$RUNNER_TEMP/gw.strace" > "$RUNNER_TEMP/child.trace"
-          tids=$(grep -oE 'clone3?\(.*\) = [0-9]+$' "$RUNNER_TEMP/child.trace" | grep -oE '[0-9]+$' | tr '\n' ' ')
-          {
-            echo "--- test output (last 6)"; tail -6 "$RUNNER_TEMP/test.out" | cut -c1-160
-            echo "--- child pid=$pid lines=$(wc -l < "$RUNNER_TEMP/child.trace") threads: $tids"
-            echo "--- child syscall histogram"; sed -E 's/^[0-9]+ [0-9:.]+ (<\.\.\. )?([a-z0-9_]+).*/\2/' "$RUNNER_TEMP/child.trace" | sort | uniq -c | sort -rn | head -15
-            echo "--- child syscalls per second"; awk '{split($2,t,"."); print t[1]}' "$RUNNER_TEMP/child.trace" | sort | uniq -c
-            echo "--- child: lines 80-140"; sed -n '80,140p' "$RUNNER_TEMP/child.trace" | cut -c1-170
-            echo "--- child: last 40"; tail -40 "$RUNNER_TEMP/child.trace" | cut -c1-170
-            for t in $tids; do echo "--- tid $t: histogram + last 15"; grep -E "^$t " "$RUNNER_TEMP/gw.strace" | sed -E 's/^[0-9]+ [0-9:.]+ (<\.\.\. )?([a-z0-9_]+).*/\2/' | sort | uniq -c | sort -rn | head -6; grep -E "^$t " "$RUNNER_TEMP/gw.strace" | tail -15 | cut -c1-170; done
-          } >> "$out" 2>&1
-          echo "diag lines: $(wc -l < "$out")"
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: gateway-diag
-          path: ${{ runner.temp }}/diag.txt
-          retention-days: 3
-
       - name: cargo test
         shell: bash
         run: |
