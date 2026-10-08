@@ -4253,6 +4253,32 @@ fn warm_binary() {
 /// A non-forbidden IP LITERAL endpoint (`ssrf::validate_custom_endpoint` accepts it without a DNS
 /// round trip; F25: no loopback stub is reachable from the subprocess).
 const LITERAL_CHAT_URL: &str = "https://192.88.99.1/v1/chat/completions";
+/// The literal endpoint's socket address (same host as [`LITERAL_CHAT_URL`]), for the black-hole probe.
+const LITERAL_CHAT_ADDR: &str = "192.88.99.1:443";
+
+/// True when the literal endpoint gives no byte back within 2 s — the only way a call can still be
+/// open while a worker is stopped (F25 forbids a loopback stub). Two shapes count: the TCP connect
+/// itself times out, or it succeeds (a TUN proxy on the dev host accepts every connect and then
+/// relays nothing) and the first read times out. CI finding (PR #1, 2026-10-08): on some hosts
+/// 192.88.99.1 answers a connection error at once, every attempt then dies TRANSPORT inside the
+/// sample window and E10 is inconclusive by its own assert; §57.1 makes that a named missing object,
+/// not a red.
+fn literal_endpoint_black_holes() -> bool {
+    use std::io::{ErrorKind, Read, Write};
+    let addr = LITERAL_CHAT_ADDR.parse().expect("literal socket address");
+    let mut stream = match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+        Ok(stream) => stream,
+        Err(e) => return e.kind() == ErrorKind::TimedOut,
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    let _ = stream.write_all(b"\r\n");
+    matches!(
+        stream.read(&mut [0_u8; 1]),
+        Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+    )
+}
 
 /// The `--distill-serve` environment: every required key of `bootstrap()`. ADR-0060 D-C: no
 /// provider, model, endpoint or capability — each route names its own; the recipient list lets
@@ -4514,6 +4540,14 @@ fn two_resident_workers_never_overlap_calls_for_one_evidence() {
     run(
         "two_resident_workers_never_overlap_calls_for_one_evidence",
         |mut handle| {
+            if !literal_endpoint_black_holes() {
+                println!(
+                    "not_applicable: missing object = a black-holing literal endpoint \
+                     ({LITERAL_CHAT_ADDR} answers or refuses within 2 s on this host; E10 needs an \
+                     open call while worker 1 is stopped)"
+                );
+                return;
+            }
             warm_binary();
             let mut evidence = Vec::new();
             for n in 0..4 {

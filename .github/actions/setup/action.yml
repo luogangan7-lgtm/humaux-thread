@@ -1,0 +1,87 @@
+name: humaux-thread setup
+# Shared by the `ci` and `live` jobs of ci.yml: pinned toolchain, cargo cache, the gitleaks
+# fixture the tests pin, and the runbook §2 provisioning of the throwaway postgres service
+# (roles rotate --create-missing → migrate → rotate role_admin). The caller sets the DB env
+# (HUMAUX_TEST_PG_DSN / HUMAUX_MIGRATOR_PG_DSN) and declares the services; this action
+# only runs steps against them.
+description: Pinned Rust toolchain, cache, gitleaks fixture, runbook §2 cluster provisioning
+runs:
+  using: composite
+  steps:
+    # rust-toolchain.toml pins 1.99.0 (ADR-0050 D-G); install exactly that and prove
+    # it by string comparison, as the toolchain file itself demands.
+    - name: Install pinned Rust toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustup toolchain install 1.99.0 --profile minimal -c clippy -c rustfmt
+        rustup default 1.99.0
+        rustc --version | grep -F 'rustc 1.99.0'
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install pinned Gitleaks fixture (v8.30.1, linux/arm64)
+      shell: bash
+      run: |
+        set -euo pipefail
+        archive='gitleaks_8.30.1_linux_arm64.tar.gz'
+        archive_sha256='e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080'
+        release='https://github.com/gitleaks/gitleaks/releases/download/v8.30.1'
+        tools_dir="$RUNNER_TEMP/gitleaks-8.30.1"
+        curl --fail --location --silent --show-error "$release/gitleaks_8.30.1_checksums.txt" \
+          -o "$RUNNER_TEMP/gitleaks-checksums.txt"
+        grep -Fqx "$archive_sha256  $archive" "$RUNNER_TEMP/gitleaks-checksums.txt"
+        curl --fail --location --silent --show-error "$release/$archive" -o "$RUNNER_TEMP/$archive"
+        printf '%s  %s\n' "$archive_sha256" "$RUNNER_TEMP/$archive" | sha256sum --check --strict
+        mkdir -p "$tools_dir"
+        tar -xzf "$RUNNER_TEMP/$archive" -C "$tools_dir" gitleaks
+        binary="$tools_dir/gitleaks"
+        test -x "$binary"
+        version="$($binary version | tr -d '\r\n')"
+        test "$version" = '8.30.1'
+        binary_sha256="$(sha256sum "$binary" | awk '{print $1}')"
+        {
+          echo "HUMAUX_TEST_GITLEAKS_BIN=$binary"
+          echo "HUMAUX_TEST_GITLEAKS_VERSION=$version"
+          echo "HUMAUX_TEST_GITLEAKS_SHA256=$binary_sha256"
+        } >> "$GITHUB_ENV"
+
+    # 必须在 cargo test 之前：没有 schema 的话，上面声明的 HUMAUX_REQUIRE_DB
+    # 会让每一条 DB 测试都因为「表不存在」而红。
+    #
+    # runbook §2 on a throwaway cluster: (1) `roles rotate --create-missing` creates the
+    # seven 0011 LOGIN roles with generated passwords and the owner NOLOGIN, (2) migrate,
+    # (3) rotate role_admin, which migration 0110 creates without a usable password.
+    # Generated values are read from the once-printed `HUMAUX_ROLE_PASSWORD_<SUFFIX>=`
+    # lines, masked, and exported to the job env (testkit::role_login_dsn and the
+    # process-level DSNs the launchers read); they never reach the log.
+    - name: provision roles (runbook §2) + apply migrations (§46)
+      shell: bash
+      run: |
+        set -euo pipefail
+        rotate() {
+          cargo run -q -p humaux-maintenance -- roles rotate \
+            --roles-sql migrations/0011_roles_and_grants.sql \
+            --actor github-actions --reason "fresh CI cluster" \
+            --ticket "run-${GITHUB_RUN_ID}" --step-up-auth "ci-${GITHUB_RUN_ID}" "$@" \
+            > "$RUNNER_TEMP/rotate.out"
+          while IFS='=' read -r name value; do
+            echo "::add-mask::$value"
+            export "$name=$value"
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done < <(grep '^HUMAUX_ROLE_PASSWORD_' "$RUNNER_TEMP/rotate.out")
+          rm -f "$RUNNER_TEMP/rotate.out"
+        }
+        rotate --create-missing
+        cargo xtask migrate
+        rotate --role role_admin
+        base='127.0.0.1:5432/humaux_thread_ci'
+        {
+          echo "HUMAUX_GATEWAY_PG_DSN=postgres://role_gateway:${HUMAUX_ROLE_PASSWORD_GATEWAY}@${base}"
+          echo "PRIVATE_WORKER_PG_DSN=postgres://role_private_worker:${HUMAUX_ROLE_PASSWORD_PRIVATE_WORKER}@${base}"
+          echo "CONSOLIDATION_WORKER_PG_DSN=postgres://role_consolidation_worker:${HUMAUX_ROLE_PASSWORD_CONSOLIDATION_WORKER}@${base}"
+          echo "HUMAUX_RETRIEVAL_WORKER_PG_DSN=postgres://role_retrieval_worker:${HUMAUX_ROLE_PASSWORD_RETRIEVAL_WORKER}@${base}"
+          echo "HUMAUX_MAINTENANCE_PG_DSN=postgres://role_maintenance:${HUMAUX_ROLE_PASSWORD_MAINTENANCE}@${base}"
+          echo "HUMAUX_ADMIN_PG_DSN=postgres://role_admin:${HUMAUX_ROLE_PASSWORD_ADMIN}@${base}"
+          echo "HUMAUX_PUBLIC_WORKER_PG_DSN=postgres://role_public_worker:${HUMAUX_ROLE_PASSWORD_PUBLIC_WORKER}@${base}"
+        } >> "$GITHUB_ENV"

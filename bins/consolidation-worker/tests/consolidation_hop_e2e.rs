@@ -1040,9 +1040,22 @@ fn t2_wrong_peer_uid_rejected_before_body() {
             body.len()
         );
         stream.write_all(head.as_bytes()).await.unwrap();
-        stream.write_all(body).await.unwrap();
+        // The server rejects on the peer uid as soon as the head is in and closes the connection; whether the
+        // body write still lands or gets EPIPE is a race the test must not care about (GitHub arm runner: red
+        // twice with BrokenPipe, 2026-10-08). The assertion below is on the 403, not on the write.
+        match stream.write_all(body).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("body write failed with something other than EPIPE: {e}"),
+        }
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await.unwrap();
+        // Same race on the read side (review P2, 2026-10-08): the server may close with our body still unread,
+        // which a Linux unix socket reports as ECONNRESET after the 403 bytes; the bytes already read decide.
+        match stream.read_to_end(&mut raw).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("response read failed with something other than ECONNRESET: {e}"),
+        }
         let text = String::from_utf8_lossy(&raw);
         assert!(
             text.starts_with("HTTP/1.1 403"),
