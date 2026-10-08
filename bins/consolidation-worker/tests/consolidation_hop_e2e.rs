@@ -1049,7 +1049,13 @@ fn t2_wrong_peer_uid_rejected_before_body() {
             Err(e) => panic!("body write failed with something other than EPIPE: {e}"),
         }
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await.unwrap();
+        // Same race on the read side (review P2, 2026-10-08): the server may close with our body still unread,
+        // which a Linux unix socket reports as ECONNRESET after the 403 bytes; the bytes already read decide.
+        match stream.read_to_end(&mut raw).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("response read failed with something other than ECONNRESET: {e}"),
+        }
         let text = String::from_utf8_lossy(&raw);
         assert!(
             text.starts_with("HTTP/1.1 403"),
